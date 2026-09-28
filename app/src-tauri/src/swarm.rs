@@ -40,6 +40,7 @@ use std::{
 };
 
 pub const POST_FLAG: &str = "--swarm-post";
+pub const START_FLAG: &str = "--swarm-start";
 /// A post is a message, not a document: longer text goes in a file in the
 /// swarm's folder and the post names it.
 const MAX_POST: usize = 16 * 1024;
@@ -878,18 +879,72 @@ pub async fn unplace(swarm: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// What a new swarm is. The page picks its name and each agent's row of
-/// the mix, since it shows those counts before you start.
+/// What a new swarm is. Its name comes from its goal, and its agents are
+/// dealt to the rows of its mix (see `deal`).
 pub struct Start {
     pub project: String,
-    pub name: String,
     pub folder: PathBuf,
     pub goal: String,
     pub shared: bool,
     pub mix: Vec<Mix>,
-    pub rows: Vec<usize>,
+    pub agents: usize,
     pub budget_tokens: u64,
     pub council: usize,
+}
+
+/// Each agent's row of the mix: dealt one at a time, each to the row
+/// furthest below its share of the agents so far, so any prefix of them is
+/// as close to the mix as whole agents allow. The council's seats (its first
+/// agents) mix too. The page counts the rows with the same rule.
+pub fn deal(mix: &[Mix], agents: usize) -> Vec<usize> {
+    let mut counts = vec![0i64; mix.len()];
+    let mut rows = Vec::with_capacity(agents);
+    for k in 1..=agents as i64 {
+        let below = |i: usize| i64::from(mix[i].share) * k - 100 * counts[i];
+        let best = (0..mix.len()).fold(0, |best, i| if below(i) > below(best) { i } else { best });
+        counts[best] += 1;
+        rows.push(best);
+    }
+    rows
+}
+
+/// Words that say little about a goal. `lock` too: Git refuses a branch
+/// named `agent/PROJECT.lock`.
+const PLAIN: [&str; 21] = [
+    "the", "and", "for", "with", "that", "this", "from", "into", "make", "keep", "cut", "all",
+    "our", "its", "half", "every", "each", "add", "fix", "get", "lock",
+];
+
+/// A swarm's name from its goal: the longest of its first few words that
+/// say something, or `swarm`.
+pub fn goal_name(goal: &str) -> String {
+    let lower = goal.to_ascii_lowercase();
+    let words = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| w.len() >= 3 && !PLAIN.contains(w))
+        .take(6);
+    let longest = words.fold("", |a, w| if w.len() > a.len() { w } else { a });
+    let base = if longest.is_empty() { "swarm" } else { longest };
+    base[..base.len().min(24)].to_owned()
+}
+
+/// Names a swarm is tried under before the start gives up.
+const NAME_TRIES: usize = 9;
+
+/// Whether a bot has this swarm's name or one of its agents' names: a
+/// task's worktree, or strays from a swarm that went.
+async fn named_already(client: &Client, full: &str) -> Result<bool, String> {
+    match client.request("resume", json!({"bot": full})).await {
+        Ok(_) => return Ok(true),
+        Err(error) if error.code == "bot_not_found" => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    let page = client
+        .request("bots", json!({"after": full, "limit": 1}))
+        .await
+        .map_err(|e| e.to_string())?;
+    let next = page["bots"][0]["name"].as_str().unwrap_or_default();
+    Ok(next.starts_with(&format!("{full}-")))
 }
 
 /// Start a swarm: take its name, make the place its agents share, write its
@@ -905,19 +960,46 @@ pub async fn start(
 ) -> Result<Value, String> {
     valid_goal(&start.goal)?;
     valid_mix(&start.mix)?;
-    let n = start.rows.len();
-    if n == 0 || n > MAX_START || start.rows.iter().any(|row| *row >= start.mix.len()) {
+    let n = start.agents;
+    if n == 0 || n > MAX_START {
         return Err(format!(
-            "invalid_agents: a swarm starts with 1 to {MAX_START} agents, each from a row of its mix"
+            "invalid_agents: a swarm starts with 1 to {MAX_START} agents"
         ));
     }
-    let full = format!("{}.{}", start.project, start.name);
-    let dir = claim(root, &full)?;
-    let workspace = match place(&start.folder, &full, start.shared).await {
-        Ok(workspace) => workspace,
-        Err(error) => {
-            let _ = std::fs::remove_dir_all(&dir);
-            return Err(error);
+    if start.council > n {
+        return Err(format!(
+            "invalid_council: a council of {} needs as many agents",
+            start.council
+        ));
+    }
+    let rows = deal(&start.mix, n);
+    // The goal's name, then -2, -3 ... past names held here or, as a
+    // worktree or branch, by another store.
+    let base = goal_name(&start.goal);
+    let mut tries = 0;
+    let (full, dir, workspace) = loop {
+        tries += 1;
+        let full = match tries {
+            1 => format!("{}.{base}", start.project),
+            k => format!("{}.{base}-{k}", start.project),
+        };
+        let taken = |error: &str| error.starts_with("swarm_exists") && tries < NAME_TRIES;
+        if tries < NAME_TRIES && named_already(client, &full).await? {
+            continue;
+        }
+        let dir = match claim(root, &full) {
+            Ok(dir) => dir,
+            Err(error) if taken(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        match place(&start.folder, &full, start.shared).await {
+            Ok(workspace) => break (full, dir, workspace),
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                if !taken(&error) {
+                    return Err(error);
+                }
+            }
         }
     };
     let swarm = Swarm {
@@ -940,7 +1022,7 @@ pub async fn start(
         return Err(error);
     }
     // A folder whose instructions cannot compose gets no agents.
-    let policies = match policies(&swarm, start.rows.iter().copied()) {
+    let policies = match policies(&swarm, rows.iter().copied()) {
         Ok(policies) => policies,
         Err(error) => {
             let _ = discard(&dir, &swarm, start.shared).await;
@@ -948,7 +1030,7 @@ pub async fn start(
         }
     };
     let each = (swarm.budget_tokens / n as u64).max(1);
-    let agents: Vec<(String, usize)> = (start.rows.iter().enumerate())
+    let agents: Vec<(String, usize)> = (rows.iter().enumerate())
         .map(|(i, row)| (format!("{}-{}", swarm.name, i + 1), *row))
         .collect();
     let (made, mut failed) = create(client, &swarm, &agents, &policies, each).await;
@@ -2232,6 +2314,205 @@ pub fn cli(args: &[String]) -> i32 {
     }
 }
 
+/// What `start` takes from a coordinator's shell, besides the goal after `--`.
+const START_USAGE: &str = "usage: start [--agents N] [--budget MILLIONS] [--council 3] [--in-project] [--row MODEL,SHARE[,IDENTITY]]... -- GOAL";
+
+/// Agents, budget in millions of tokens and organization when not given:
+/// what the page's sheet offers first.
+const START_AGENTS: usize = 4;
+const START_BUDGET_M: f64 = 3.0;
+const MAX_BUDGET_M: f64 = 1000.0;
+
+/// A swarm as a coordinator asks for one. Without rows, every agent runs
+/// the coordinator's own model as a plain agent.
+#[derive(Debug, PartialEq)]
+struct Asked {
+    agents: usize,
+    budget_tokens: u64,
+    council: usize,
+    shared: bool,
+    mix: Vec<Mix>,
+    goal: String,
+}
+
+fn parse_start(args: &[String]) -> Result<Asked, String> {
+    let bad = |what: String| format!("{what}\n{START_USAGE}");
+    let (flags, goal) = match args.iter().position(|a| a == "--") {
+        Some(at) => (&args[..at], args[at + 1..].join(" ")),
+        None => return Err(bad("invalid_start: the goal follows --".into())),
+    };
+    let mut asked = Asked {
+        agents: START_AGENTS,
+        budget_tokens: (START_BUDGET_M * 1e6) as u64,
+        council: 0,
+        shared: true,
+        mix: Vec::new(),
+        goal,
+    };
+    let mut flags = flags.iter();
+    while let Some(flag) = flags.next() {
+        let mut value = || {
+            flags
+                .next()
+                .cloned()
+                .ok_or_else(|| bad(format!("invalid_start: {flag} needs a value")))
+        };
+        match flag.as_str() {
+            "--agents" => {
+                asked.agents = value()?
+                    .parse()
+                    .map_err(|_| bad("invalid_agents: --agents is a whole number".into()))?;
+            }
+            "--budget" => {
+                let m: f64 = value()?.parse().unwrap_or(f64::NAN);
+                if !(0.1..=MAX_BUDGET_M).contains(&m) {
+                    return Err(bad(format!(
+                        "invalid_budget: --budget is 0.1 to {MAX_BUDGET_M} million tokens"
+                    )));
+                }
+                asked.budget_tokens = (m * 1e6).round() as u64;
+            }
+            "--council" => {
+                asked.council = match value()?.as_str() {
+                    "3" => 3,
+                    _ => return Err(bad("invalid_council: a council has 3 seats".into())),
+                };
+            }
+            "--in-project" => asked.shared = false,
+            "--row" => {
+                let row = value()?;
+                let mut parts = row.splitn(3, ',');
+                let (model, share, identity) = (parts.next(), parts.next(), parts.next());
+                let share = share.and_then(|s| s.trim().trim_end_matches('%').parse().ok());
+                let (Some(model), Some(share)) = (model, share) else {
+                    return Err(bad(format!(
+                        "invalid_mix: {row} is not MODEL,SHARE[,IDENTITY]"
+                    )));
+                };
+                asked.mix.push(Mix {
+                    identity: identity.unwrap_or_default().trim().to_owned(),
+                    model: model.trim().to_owned(),
+                    share,
+                });
+            }
+            _ => return Err(bad(format!("invalid_start: {flag}"))),
+        }
+    }
+    Ok(asked)
+}
+
+/// `APP --swarm-start ...`, run by a project's coordinator (`PROJECT.lead`)
+/// from its shell: a swarm in its project, started as the page starts one,
+/// working in its folder or a worktree of it. Prints the swarm and its
+/// board's path.
+pub fn start_cli(args: &[String]) -> i32 {
+    let fail = |message: String| {
+        eprintln!("{}", json!({"error": message}));
+        1
+    };
+    let asked = match parse_start(args) {
+        Ok(asked) => asked,
+        Err(error) => return fail(error),
+    };
+    let lead = std::env::var("AGENT_BOT").unwrap_or_default();
+    let id = std::env::var("AGENT_BOT_ID")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok());
+    let (Some(project), Some(id)) = (lead.strip_suffix(".lead"), id) else {
+        return fail("start runs in a project coordinator's shell, which names AGENT_BOT (PROJECT.lead) and AGENT_BOT_ID".into());
+    };
+    let (socket, app) = match (socket(), std::env::current_exe()) {
+        (Ok(socket), Ok(app)) => (socket, app),
+        (Err(error), _) => return fail(error),
+        (_, Err(error)) => return fail(error.to_string()),
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => return fail(error.to_string()),
+    };
+    let result = runtime.block_on(async {
+        let (client, _events) = Client::connect(&socket).await.map_err(|e| e.to_string())?;
+        let client = Arc::new(client);
+        let started = async {
+            let root = root(client.store().ok_or("the daemon named no store")?)?;
+            let me = client
+                .request("resume", json!({"bot": lead}))
+                .await
+                .map_err(|e| e.to_string())?;
+            let (Some(folder), Some(provider), Some(model)) = (
+                me["workspace"].as_str(),
+                me["provider"].as_str(),
+                me["model"].as_str(),
+            ) else {
+                return Err(format!("{lead} has no folder or model"));
+            };
+            if me["id"].as_i64() != Some(id) {
+                return Err(format!("{lead} is not this shell's bot any more"));
+            }
+            let mix = if asked.mix.is_empty() {
+                vec![Mix {
+                    identity: String::new(),
+                    model: format!("{provider}/{model}"),
+                    share: 100,
+                }]
+            } else {
+                asked.mix
+            };
+            let start = Start {
+                project: project.to_owned(),
+                folder: folder.into(),
+                goal: asked.goal,
+                shared: asked.shared,
+                mix,
+                agents: asked.agents,
+                budget_tokens: asked.budget_tokens,
+                council: asked.council,
+            };
+            let mut out = self::start(&client, &root, &app, start).await?;
+            let dir = out["swarm"]["dir"]
+                .as_str()
+                .map(|d| Path::new(d).join("board.jsonl"));
+            out["board"] = json!(dir);
+            // The records are the page's to seat; the coordinator needs names.
+            let names: Vec<Value> = (out["bots"].as_array().into_iter().flatten())
+                .map(|b| b["name"].clone())
+                .collect();
+            out["bots"] = json!(names);
+            Ok(out)
+        }
+        .await;
+        client.close().await;
+        started
+    });
+    match result {
+        Ok(value) => {
+            println!("{value}");
+            0
+        }
+        Err(error) => fail(error),
+    }
+}
+
+/// The script a coordinator runs, `~/.agent/swarms/start`, written again
+/// whenever the app starts from somewhere else.
+pub fn write_start_script(home: &Path, app: &Path) -> Result<(), String> {
+    let quote = |p: &Path| format!("'{}'", p.to_string_lossy().replace('\'', r"'\''"));
+    let text = format!(
+        "#!/bin/sh\n# {START_USAGE}\nexec {} {START_FLAG} \"$@\"\n",
+        quote(app)
+    );
+    let path = home.join("start");
+    if std::fs::read_to_string(&path).is_ok_and(|have| have == text) {
+        return Ok(());
+    }
+    std::fs::create_dir_all(home).map_err(|e| format!("{}: {e}", home.display()))?;
+    let temporary = home.join(format!(".start.{}", std::process::id()));
+    replace(&temporary, &path, text.as_bytes(), 0o755)
+}
+
 /// The daemon a bot's shell belongs to: its socket when the daemon was given
 /// one, else the one beside its store, as the CLI finds it.
 fn socket() -> Result<PathBuf, String> {
@@ -2994,6 +3275,8 @@ mod tests {
                 }
                 "create" => Ok(made(request)),
                 "submit" => Ok(json!({"status": "running"})),
+                "resume" => Err("bot_not_found".into()),
+                "bots" => Ok(json!({"bots": []})),
                 _ => Err("unexpected".into()),
             }),
         );
@@ -3011,14 +3294,14 @@ mod tests {
                 share: 50,
             },
         ];
-        let start = |name: &str, rows: Vec<usize>, mix: Vec<Mix>| Start {
+        // The goal names the swarm; its agents are dealt to the mix's rows.
+        let start = |goal: &str, agents: usize, mix: Vec<Mix>| Start {
             project: "p".into(),
-            name: name.into(),
             folder: project.clone(),
-            goal: "Ship it.".into(),
+            goal: goal.into(),
             shared: false,
             mix,
-            rows,
+            agents,
             budget_tokens: 4_000,
             council: 0,
         };
@@ -3027,7 +3310,7 @@ mod tests {
                 &client,
                 &root,
                 Path::new("/app"),
-                start("goal", vec![0, 1, 0, 1], mix.clone()),
+                start("goal", 4, mix.clone()),
             ))
             .unwrap();
         // Each agent has its row's model and identity, and a quarter of the budget.
@@ -3091,7 +3374,7 @@ mod tests {
             &client,
             &root,
             Path::new("/app"),
-            start("fail", vec![0], mix.clone()),
+            start("fail", 1, mix.clone()),
         ));
         assert_eq!(out.unwrap_err(), "provider_unknown (fake)");
         assert!(!root.join("p.fail").exists());
@@ -3112,12 +3395,168 @@ mod tests {
                 &client,
                 &root,
                 Path::new("/app"),
-                start("read", vec![0], reader),
+                start("read", 1, reader),
             ))
             .unwrap_err();
         assert!(error.starts_with("identity_without_shell"), "{error}");
         assert_eq!(fake.ops("create").len(), before);
         assert!(!root.join("p.read").exists());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn agents_are_dealt_to_the_rows_furthest_below_their_shares() {
+        let row = |share| Mix {
+            identity: String::new(),
+            model: "a/x".into(),
+            share,
+        };
+        assert_eq!(deal(&[row(50), row(50)], 4), [0, 1, 0, 1]);
+        assert_eq!(deal(&[row(75), row(25)], 4), [0, 0, 1, 0]);
+        assert_eq!(deal(&[row(60), row(30), row(10)], 5), [0, 1, 0, 0, 1]);
+        assert_eq!(deal(&[row(100)], 3), [0, 0, 0]);
+    }
+
+    #[test]
+    fn a_swarm_is_named_after_its_goal() {
+        assert_eq!(goal_name("Halve the daemon's p99 latency"), "latency");
+        assert_eq!(goal_name("Fix all the things"), "things");
+        assert_eq!(goal_name("?"), "swarm");
+        assert_eq!(goal_name("lock it"), "swarm");
+        assert_eq!(goal_name(&"x".repeat(40)), "x".repeat(24));
+    }
+
+    #[test]
+    fn a_coordinator_asks_for_a_swarm_with_flags_and_a_goal() {
+        let args = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        let asked = parse_start(&args(
+            "--agents 6 --budget 12.5 --council 3 --in-project --row openai/gpt-6-luna,70 --row b/y,30,reviewer -- Halve p99.",
+        ))
+        .unwrap();
+        assert_eq!(
+            asked,
+            Asked {
+                agents: 6,
+                budget_tokens: 12_500_000,
+                council: 3,
+                shared: false,
+                mix: vec![
+                    Mix {
+                        identity: String::new(),
+                        model: "openai/gpt-6-luna".into(),
+                        share: 70
+                    },
+                    Mix {
+                        identity: "reviewer".into(),
+                        model: "b/y".into(),
+                        share: 30
+                    },
+                ],
+                goal: "Halve p99.".into(),
+            }
+        );
+        // What the sheet offers first, and the coordinator's model once its rows are known.
+        let plain = parse_start(&args("-- Ship it.")).unwrap();
+        assert_eq!(
+            (
+                plain.agents,
+                plain.budget_tokens,
+                plain.council,
+                plain.shared
+            ),
+            (4, 3_000_000, 0, true)
+        );
+        assert!(plain.mix.is_empty());
+        for bad in [
+            "Ship it.",
+            "--budget 5000 -- x",
+            "--council 2 -- x",
+            "--row a/x -- x",
+            "--agents -- x",
+            "--swarm -- x",
+        ] {
+            let error = parse_start(&args(bad)).unwrap_err();
+            assert!(error.ends_with(START_USAGE), "{bad}: {error}");
+        }
+    }
+
+    #[test]
+    fn the_start_script_names_this_executable() {
+        let home = scratch("start-script");
+        write_start_script(&home, Path::new("/Apps/It's/agent-app")).unwrap();
+        let text = std::fs::read_to_string(home.join("start")).unwrap();
+        assert!(
+            text.ends_with("exec '/Apps/It'\\''s/agent-app' --swarm-start \"$@\"\n"),
+            "{text}"
+        );
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            home.join("start").metadata().unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        // Other swarms' scripts are refreshed around it.
+        refresh_scripts(&home, Path::new("/Apps/agent-app"));
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_name_a_bot_or_another_swarm_holds_is_passed_over() {
+        let home = scratch("names");
+        let (root, project) = (home.join("swarms"), home.join("project"));
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(root.join("p.ship-3")).unwrap();
+        let fake = Fake::start(
+            "names",
+            Box::new(|op, request| match op {
+                // A task is named p.ship; strays of an old p.ship-2 are left.
+                "resume" if request["bot"] == "p.ship" => Ok(json!({"id": 7})),
+                "resume" => Err("bot_not_found".into()),
+                "bots" if request["after"] == "p.ship-2" => {
+                    Ok(json!({"bots": [{"name": "p.ship-2-1"}]}))
+                }
+                "bots" => Ok(json!({"bots": [{"name": "q.lead"}]})),
+                "create" => Ok(made(request)),
+                "submit" => Ok(json!({"status": "running"})),
+                _ => Err("unexpected".into()),
+            }),
+        );
+        let rt = runtime();
+        let (client, _events) = rt.block_on(Client::connect(&fake.socket)).unwrap();
+        let start = Start {
+            project: "p".into(),
+            folder: project,
+            goal: "Ship it".into(),
+            shared: false,
+            mix: vec![Mix {
+                identity: String::new(),
+                model: "a/x".into(),
+                share: 100,
+            }],
+            agents: 2,
+            budget_tokens: 2_000,
+            council: 3,
+        };
+        let refused = rt.block_on(super::start(&client, &root, Path::new("/app"), start));
+        assert!(refused.unwrap_err().starts_with("invalid_council"));
+        let start = Start {
+            project: "p".into(),
+            folder: home.join("project"),
+            goal: "Ship it".into(),
+            shared: false,
+            mix: vec![Mix {
+                identity: String::new(),
+                model: "a/x".into(),
+                share: 100,
+            }],
+            agents: 2,
+            budget_tokens: 2_000,
+            council: 0,
+        };
+        let out = rt
+            .block_on(super::start(&client, &root, Path::new("/app"), start))
+            .unwrap();
+        assert_eq!(out["swarm"]["swarm"], "p.ship-4");
+        assert_eq!(out["swarm"]["members"], json!(["p.ship-4-1", "p.ship-4-2"]));
         std::fs::remove_dir_all(home).unwrap();
     }
 

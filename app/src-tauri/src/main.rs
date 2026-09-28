@@ -235,6 +235,77 @@ const BUILT_IN: [(&str, &str); 2] = [
     ("swarm", include_str!("../../agents/swarm.md")),
 ];
 
+/// The file a role of the app's is read from in every project: yours,
+/// `~/.agents/agents/NAME.md`, which a project's own file of that name
+/// overrides. Where you have none yet, it starts as the app's text.
+fn own_role(home: &std::path::Path, name: &str) -> Result<PathBuf, String> {
+    let (_, text) = BUILT_IN
+        .iter()
+        .find(|(built, _)| *built == name)
+        .ok_or_else(|| format!("profile_not_found: the app has no {name} role"))?;
+    let dir = home.join(".agents/agents");
+    let path = dir.join(format!("{name}.md"));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            use std::io::Write;
+            file.write_all(text.as_bytes())
+                .and_then(|()| file.sync_all())
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    }
+    Ok(path)
+}
+
+/// Open your file for one of the app's roles in your text editor, made
+/// from the app's text first when you have none.
+#[tauri::command]
+async fn edit_role(name: String) -> Result<String, String> {
+    let home = std::env::var_os("HOME").ok_or("no HOME for ~/.agents")?;
+    let path = own_role(std::path::Path::new(&home), &name)?;
+    let mut open = if cfg!(target_os = "macos") {
+        let mut open = tokio::process::Command::new("open");
+        open.arg("-t");
+        open
+    } else {
+        tokio::process::Command::new("xdg-open")
+    };
+    let status = open
+        .arg(&path)
+        .stdin(std::process::Stdio::null())
+        .status()
+        .await
+        .map_err(|e| format!("open: {e}"))?;
+    if !status.success() {
+        return Err(format!("open: {} could not be opened", path.display()));
+    }
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// Which of the app's roles you have your own file for.
+#[tauri::command]
+fn roles() -> Value {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let own = |name: &str| {
+        home.as_ref()
+            .map(|h| h.join(format!(".agents/agents/{name}.md")))
+            .filter(|p| p.is_file())
+            .map(|p| p.to_string_lossy().into_owned())
+    };
+    Value::Array(
+        BUILT_IN
+            .iter()
+            .map(|(name, _)| json!({"name": name, "file": own(name)}))
+            .collect(),
+    )
+}
+
 /// The project in a folder: its `.agents/project.toml`, or the defaults a
 /// new project there would take.
 #[tauri::command]
@@ -430,7 +501,7 @@ fn compose(
 
 #[cfg(test)]
 mod policy_tests {
-    use super::compose;
+    use super::{BUILT_IN, compose, own_role};
 
     #[test]
     fn a_workspace_policy_that_cannot_compose_is_an_error_not_the_preamble() {
@@ -452,6 +523,28 @@ mod policy_tests {
         assert!(error.starts_with("instructions_unreadable: "), "{error}");
         assert!(error.contains(file.to_str().unwrap()), "{error}");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn your_role_file_starts_as_the_apps_text_and_is_then_yours() {
+        let home = std::env::temp_dir().join(format!("agent-app-own-role-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let path = own_role(&home, "coordinator").unwrap();
+        assert_eq!(path, home.join(".agents/agents/coordinator.md"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), BUILT_IN[0].1);
+        std::fs::write(&path, "---\nname: coordinator\n---\nDelegate more.").unwrap();
+        own_role(&home, "coordinator").unwrap();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .ends_with("Delegate more.")
+        );
+        assert!(
+            own_role(&home, "reviewer")
+                .unwrap_err()
+                .starts_with("profile_not_found")
+        );
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
@@ -590,18 +683,17 @@ async fn blocking<T: Send + 'static>(
 }
 
 /// Start a swarm in a project folder, agents and all (see `swarm::start`).
-/// `mix` is its rows of identity, model and share; `rows` is each agent's.
+/// `mix` is its rows of identity, model and share.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn swarm_start(
     state: State<'_, Shared>,
     project: String,
-    name: String,
     folder: String,
     goal: String,
     shared: bool,
     mix: Vec<Value>,
-    rows: Vec<usize>,
+    agents: usize,
     budget_tokens: u64,
     council: usize,
 ) -> Result<Value, String> {
@@ -612,12 +704,11 @@ async fn swarm_start(
         .ok_or("invalid_mix: each row is an identity, a model and a share")?;
     let start = swarm::Start {
         project,
-        name,
         folder: workspace_path(std::path::Path::new(&folder))?.into(),
         goal,
         shared,
         mix,
-        rows,
+        agents,
         budget_tokens,
         council,
     };
@@ -716,14 +807,19 @@ async fn request(state: State<'_, Shared>, op: String, params: Value) -> Result<
 }
 
 fn main() {
-    // A swarm's `post` script runs this executable; it posts and exits
-    // without a window.
+    // A swarm's `post` script and a coordinator's `start` run this
+    // executable; each acts and exits without a window.
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) == Some(swarm::POST_FLAG) {
-        std::process::exit(swarm::cli(&args[2..]));
+    match args.get(1).map(String::as_str) {
+        Some(swarm::POST_FLAG) => std::process::exit(swarm::cli(&args[2..])),
+        Some(swarm::START_FLAG) => std::process::exit(swarm::start_cli(&args[2..])),
+        _ => {}
     }
     if let (Ok(home), Ok(app)) = (swarm::home(), std::env::current_exe()) {
         swarm::refresh_scripts(&home, &app);
+        if let Err(error) = swarm::write_start_script(&home, &app) {
+            eprintln!("agent-app: {error}");
+        }
     }
     let config = match config() {
         Ok(config) => config,
@@ -746,6 +842,8 @@ fn main() {
             setup,
             policy,
             profiles,
+            roles,
+            edit_role,
             branch,
             models,
             project,

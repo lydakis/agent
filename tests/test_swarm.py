@@ -150,5 +150,38 @@ class SwarmPostTests(ModelFixture):
         self.assertEqual(kinds, ['propose', 'vote', 'vote', 'decision', 'join', 'post'])
 
 
+    def test_a_coordinator_starts_a_swarm_from_its_shell(self):
+        # What the coordinator's role tells it to run: the app, without a window, from its shell.
+        self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
+        home = self.path / 'home'
+        out = self.path / 'started.json'
+        self.agent('run', '--store', str(self.store), '--bot', 'p.lead',
+                   f"shell:HOME='{home}' '{APP}' --swarm-start --agents 2 --budget 0.5 --in-project"
+                   f" -- Ship the widget > '{out}' 2>&1")
+        started = json.loads(out.read_text())
+        self.assertIn('swarm', started, started)
+        self.assertEqual((started['swarm']['swarm'], started['bots']), ('p.widget', ['p.widget-1', 'p.widget-2']))
+        self.assertEqual(started['failed'], [])
+        # Every agent runs the coordinator's model, in its folder, with half the budget.
+        ids = self.ids()
+        self.assertEqual(started['swarm']['ids'], {'p.widget-1': ids['p.widget-1'], 'p.widget-2': ids['p.widget-2']})
+        self.assertEqual(started['swarm']['mix'], [{'identity': '', 'model': 'openai/synthetic-model', 'share': 100}])
+        self.assertEqual(started['swarm']['workspace'], str(self.path))
+        listed = {b['name']: b for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout)}
+        self.assertEqual(listed['p.widget-1']['budget_tokens'], 250000)
+        # Its folder is the one a window on this store reads, and the goal opens the board.
+        board = Path(started['board'])
+        self.assertEqual(board.parent.parent.parent, home / '.agent/swarms')
+        self.assertEqual(json.loads(board.read_text().splitlines()[0])['text'], 'Ship the widget')
+        # Each agent got its brief.
+        for bot in started['bots']:
+            self.assertIn('Ship the widget', self.turns(bot)[0]['prompt_preview'])
+        # Only a coordinator starts one.
+        refused = self.path / 'refused.json'
+        self.agent('run', *self.common, '--new', '--bot', 'q',
+                   f"shell:HOME='{home}' '{APP}' --swarm-start -- x > '{refused}' 2>&1")
+        self.assertIn("coordinator's shell", refused.read_text())
+
+
 if __name__ == '__main__':
     unittest.main()
