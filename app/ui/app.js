@@ -335,9 +335,14 @@ function indexMembers() {
   S.memberOf = new Map(); for (const sw of S.swarms.values()) for (const m of sw.members) S.memberOf.set(m, sw.name);
   S.shapeGen += 1;
 }
+// Reads can overlap; only the newest one's answer is kept, so an older snapshot never removes a swarm a
+// newer read found.
+let swarmsRead = 0;
 async function loadSwarms() {
   if (!Daemon.swarms) return;
+  const read = ++swarmsRead;
   const { swarms = [], broken = [] } = await Daemon.swarms();
+  if (read !== swarmsRead) return;
   const seen = new Set(swarms.map((r) => r.swarm));
   for (const name of [...S.swarms.keys()]) if (!seen.has(name)) S.swarms.delete(name);
   for (const r of swarms) learnSwarm(r, true);

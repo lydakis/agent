@@ -642,7 +642,7 @@ async fn worktree(trees: &Path, project: &Path, swarm: &str) -> Result<String, S
                 .arg(&tree)
                 .output()
                 .await;
-            let _ = git(&["branch", "-D", &branch]).output().await;
+            let _ = git(&["update-ref", "-d", &branch, &head]).output().await;
             return Err(failed);
         }
     }
@@ -4626,6 +4626,26 @@ mod tests {
             .status
             .success()
         );
+        // A setup that fails takes the worktree and its branch with it.
+        let setup = repo.join(".agents/setup");
+        std::fs::create_dir_all(setup.parent().unwrap()).unwrap();
+        std::fs::write(&setup, "#!/bin/sh\nexit 3\n").unwrap();
+        std::fs::set_permissions(&setup, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let failed = rt.block_on(worktree(&trees, &repo, "p.setup")).unwrap_err();
+        assert!(failed.starts_with("setup_failed"), "{failed}");
+        assert!(!trees.join("p.setup").exists());
+        assert!(
+            !run(&[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "refs/heads/agent/p.setup"
+            ])
+            .status
+            .success()
+        );
+        std::fs::remove_file(&setup).unwrap();
         let made = rt.block_on(worktree(&trees, &repo, "p.fix")).unwrap();
         assert!(Path::new(&made).join(".git").exists());
         std::fs::remove_dir_all(home).unwrap();

@@ -1362,6 +1362,19 @@ test('a swarm a coordinator started from its shell shows once its first agent ta
   await q.tick();
   assert.deepEqual([...q.S.swarms.keys()], ['app.latency']);
   assert.equal(p.S.memberOf.get('app.latency-2'), 'app.latency');
+  // Two reads at once: an older answer arriving last never removes a swarm the newer one found.
+  const answers = [];
+  const r = shell({ swarms: () => new Promise((resolve) => answers.push(resolve)), request: async () => ({ bots: [], next_after: null, nodes: [], next_from: null }) });
+  r.S.live = true;
+  for (const [name, id] of [['app.fix-1', 2], ['app.latency-1', 3]]) r.upsert({ name, id, provider: 'alpha', model: 'one' });
+  await r.handle({ event: 'accepted', bot: 'app.fix-1', turn: 1, durable: true }, 1);
+  await r.tick();
+  await r.handle({ event: 'accepted', bot: 'app.latency-1', turn: 1, durable: true }, 1);
+  await r.tick();
+  assert.equal(answers.length, 2);
+  answers[1]({ swarms: listed, broken: [] }); await r.tick();
+  answers[0]({ swarms: [], broken: [] }); await r.tick();
+  assert.deepEqual([...r.S.swarms.keys()], ['app.latency']);
 });
 
 test('a helper finishing a turn has its swarm check its budget, and only current seats are tallied', async () => {
