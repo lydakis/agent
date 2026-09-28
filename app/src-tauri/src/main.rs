@@ -183,6 +183,8 @@ fn setup(state: State<'_, Shared>) -> Result<Value, String> {
     Ok(json!({
         "socket": state.config.socket.to_string_lossy(),
         "workspace": state.config.workspace,
+        // Whether this window starts the daemon for its store, and so may replace it.
+        "managed": state.agent.is_some() && state.config.store.is_some(),
         "tools": ["shell", "read", "write", "edit", "wait", "history"],
     }))
 }

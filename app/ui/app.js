@@ -921,7 +921,8 @@ async function attachOnce() {
   }
 }
 // No provider to run: starting again cannot help until Settings changes, which attaches itself.
-function idle() { return /^no_provider/.test(S.lastReason ?? ''); }
+// Attaching again cannot help until something changes: a provider in Settings, or a newer app.
+function idle() { return /^no_provider/.test(S.lastReason ?? '') || olderDaemon(S.lastReason) === 'newer'; }
 // A daemon from before an upgrade still owns the socket: it speaks an older protocol, and the app can
 // stop it and start its own. One newer than the app is left alone.
 function olderDaemon(reason) {
@@ -930,12 +931,18 @@ function olderDaemon(reason) {
 }
 function showDetached(reason) {
   S.attached = false;
-  const age = Daemon.replaceDaemon ? olderDaemon(reason) : null;
-  const what = age === 'older' ? `<div class="why">A daemon from before this update is still running.</div><div style="margin-top:12px"><button type="button" class="sbtn primary" data-act="replace-daemon">Restart the daemon</button> <button type="button" class="sbtn" data-act="settings">Open Settings</button></div><div class="hint">Turns it is running end as interrupted. Every chat is kept.</div>`
-    : `${age === 'newer' ? '<div class="why">The daemon is newer than this app: update the app.</div>' : ''}<div style="margin-top:12px"><button type="button" class="sbtn" data-act="settings">Open Settings</button></div>`;
-  $('detached').innerHTML = `<div><b>not attached</b></div><div>${esc(reason)}</div><div style="margin-top:8px">daemon at <span class="k">${esc(S.config?.socket ?? '?')}</span> · ${idle() ? 'waiting for a provider' : 'retrying'}</div>${what}`;
+  // Only a daemon this window starts for its store can be replaced; one on a socket it was given is
+  // stopped with its own agent, and the window attaches once it is gone.
+  const age = olderDaemon(reason), ours = !!Daemon.replaceDaemon && S.config?.managed !== false;
+  const settings = '<button type="button" class="sbtn" data-act="settings">Open Settings</button>';
+  const what = age === 'older' && ours ? `<div class="why">A daemon from before this update is still running.</div><div style="margin-top:12px"><button type="button" class="sbtn primary" data-act="replace-daemon">Restart the daemon</button> ${settings}</div><div class="hint">Turns it is running end as interrupted. Every chat is kept.</div>`
+    : age === 'older' ? `<div class="why">A daemon from before this update holds this socket, and this window did not start it: stop it with its own agent (agent shutdown).</div><div style="margin-top:12px">${settings}</div>`
+    : `${age === 'newer' ? '<div class="why">The daemon is newer than this app: update the app.</div>' : ''}<div style="margin-top:12px">${settings}</div>`;
+  const state = age === 'newer' ? 'stopped' : idle() ? 'waiting for a provider' : 'retrying';
+  $('detached').innerHTML = `<div><b>not attached</b></div><div>${esc(reason)}</div><div style="margin-top:8px">daemon at <span class="k">${esc(S.config?.socket ?? '?')}</span> · ${state}</div>${what}`;
   $('detached').classList.add('on');
   if (!idle()) retryAttach();
+  else { clearTimeout(retryTimer); retryTimer = null; }
 }
 function restore() {
   let saved = null; try { saved = JSON.parse(localStorage.getItem(sessionKey()) || 'null'); } catch (_) {}

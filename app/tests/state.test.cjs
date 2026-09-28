@@ -1593,7 +1593,18 @@ test('an older daemon on the socket is replaced from the detached screen; a newe
   await p.tick(); assert.equal(attaches, 0); assert.equal(button.textContent, 'Restarting…');
   stopping.resolve(); await pressed; await settle();
   assert.equal(replaced, 1); assert.equal(attaches, 1);
+  // A newer daemon is not attached to again and again: only a newer app helps.
+  await p.tick();
+  const before = attaches;
   p.lost('daemon_protocol_mismatch (the daemon speaks protocol 5, this client 4)');
   assert.doesNotMatch(screen.innerHTML, /replace-daemon/);
   assert.match(screen.innerHTML, /newer than this app: update the app/);
+  assert.match(screen.innerHTML, /· stopped/);
+  await p.tick(); await p.tick();
+  assert.equal(attaches, before);
+  // A window given a socket did not start that daemon, so it offers no restart.
+  p.S.config = { managed: false, socket: '/synthetic/agent.sock' };
+  p.lost('daemon_protocol_mismatch (the daemon speaks protocol 3, this client 4)');
+  assert.doesNotMatch(screen.innerHTML, /replace-daemon/);
+  assert.match(screen.innerHTML, /this window did not start it: stop it with its own agent/);
 });

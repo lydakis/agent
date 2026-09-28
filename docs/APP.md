@@ -200,10 +200,14 @@ A daemon that survived an upgrade anyway, and speaks an older protocol than
 the app, leaves the window detached with **Restart the daemon**: the app
 sends SIGTERM to the process that daemon named in its `ready` line (running
 turns end as interrupted; the store keeps every chat), waits up to 30 seconds
-for it to exit, and attaches, which starts the bundled daemon. Reattaching
-pauses meanwhile, so nothing starts a daemon while the old one closes its
-store. A daemon newer than the app is left alone and the page says to update
-the app; a window given `--socket` or `AGENT_SOCKET` stops nothing.
+for it to exit (an exited process nobody has reaped yet counts as gone), and
+attaches, which starts the bundled daemon. Only a daemon whose greeting names
+a protocol strictly older than the app's is signalled. Reattaching pauses
+meanwhile, so nothing starts a daemon while the old one closes its store. A
+daemon newer than the app is left alone: the page says to update the app and
+stops trying to attach. A window given `--socket` or `AGENT_SOCKET` did not
+start that daemon, so it offers no restart and says to stop the daemon with
+its own agent; it attaches once that daemon is gone.
 
 ![An older daemon still owns the socket after an upgrade](app/daemon-replace.png)
 
