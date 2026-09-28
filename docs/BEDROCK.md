@@ -1,7 +1,8 @@
 # Amazon Bedrock as a provider
 
 Surveyed 2026-09-22 and revised 2026-09-25 against AWS, Anthropic and OpenAI
-documentation, then run live on 2026-09-25. Facts are labelled: **documented**
+documentation, then run live on 2026-09-25; the AWS CLI version the
+credential export needs was checked 2026-09-28. Facts are labelled: **documented**
 cites a page, **source** cites this repository, **observed** comes from the
 [live run](#the-live-run), **unverified** is a hypothesis still open.
 
@@ -50,7 +51,10 @@ same requests. The AWS SDK's signer and credential chain (`aws-sigv4`,
 `aws-config`) measured 39 more crates, before the HTTP client its SSO and
 instance-role providers need; instead,
 credentials resolve in the chain's own order: static environment keys first,
-then the AWS CLI's `configure export-credentials`, which is the chain itself
+then the AWS CLI's `configure export-credentials` (**documented**: added in
+AWS CLI 2.9.0 and absent from version 1's changelog; an older CLI answers
+with its usage text, so the reason names its version and what to install
+instead), which is the chain itself
 (profiles, SSO, assumed roles, container and instance roles) in the standard
 `credential_process` format. Temporary keys are re-resolved five minutes before
 expiry by one background run while they keep signing, so no call waits on the
@@ -203,3 +207,7 @@ Observed 2026-09-22 to 2026-09-25.
 - [OpenAI models in Amazon Bedrock](https://developers.openai.com/api/docs/guides/amazon-bedrock)
 - botocore 1.43.102 `auth.py` and the bedrock-runtime service model, read for
   how it signs payloads.
+- AWS CLI changelogs, read 2026-09-28: [version 2 at 488c6ee](https://github.com/aws/aws-cli/blob/488c6eeeb0e307bf3ec52c68f28ecc34b97b7cfa/CHANGELOG.rst)
+  lists "Add `aws configure export-credentials` command" under 2.9.0;
+  [version 1 at 4a54791](https://github.com/aws/aws-cli/blob/4a54791df2da35778bca1325f71b1cb0b4ba770a/CHANGELOG.rst)
+  never mentions it.

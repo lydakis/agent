@@ -64,6 +64,12 @@ one provider.
 
 ![Connecting Amazon Bedrock](app/setup-bedrock.png)
 
+AWS login takes AWS CLI version 2 (2.9 or later), whose `aws configure
+export-credentials` hands the profile's keys to the daemon. An older CLI cannot,
+and Setup says so with the version it found.
+
+![Bedrock with an AWS CLI that is too old](app/setup-bedrock-old-cli.png)
+
 Once a provider answers, the first project takes a folder and a model, listed
 under its provider; nothing is chosen for you.
 
