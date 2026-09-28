@@ -414,7 +414,8 @@ daemon learns nothing about projects; everything here is client work.
   holds is skipped for the next. Setup gets ten minutes and the login
   shell's ordinary variables (PATH, HOME, USER, LOGNAME, SHELL, LANG, LC_*,
   TMPDIR, TERM) and no others, so no provider or cloud keys (as do the
-  swarm's git commands, whose hooks run too); past its time
+  swarm's git commands, whose hooks run too; this process's own variables
+  stand in only when there is no login shell); past its time
   its whole process group is killed, and its output is kept only to its
   last 64 KiB. A failed start removes a worktree and branch only when it
   made them, never the project folder. The mix is up to eight rows of an identity, a model and a
@@ -440,15 +441,17 @@ daemon learns nothing about projects; everything here is client work.
   under the board's lock, synced, and replaced whole; written last when
   a swarm is made, so a folder without it is not listed), `board.jsonl` (one
   line a post or act, appended under a lock and synced, your goal first;
-  each line says how many agents it `reached`, so what a
-  swarm's posts cost in deliveries can be read off its board), `state.json` (what the board adds up to: roles, open and approved
-  proposals with their votes, the last 16 denied ones, a count that numbers
-  the next, who is in which stream; a decided proposal's vote reasons stay
-  on the board only). A change to it commits with its lines: the new state
+  each line says how many agents it was `sent` to, so what a
+  swarm's posts cost in deliveries can be read off its board; the line is
+  written before the sends, and a send that failed is in the poster's answer), `state.json` (what the board adds up to: roles, open and approved
+  proposals with their votes (at most 16 open at once, and an approved
+  stream closes when nobody is in it any more), the last 16 denied ones, a
+  count that numbers the next, who is in which stream; a decided proposal's
+  vote reasons stay on the board only). A change to it commits with its lines: the new state
   is written beside it as `state.pending.json` with the board's length
   before and after the lines, the lines are appended and synced, and the
-  file then replaces `state.json`; the next act under the lock finishes a
-  change whose lines are all on the board and otherwise cuts the board back
+  file then replaces `state.json`; the next act under the lock, or the
+  next read of the board, finishes a change whose lines are all on the board and otherwise cuts the board back
   to where it was and drops the change. Then scripts that run the app's own
   executable with `--swarm-post`: `post` and `role`, and with a council
   `propose`, `vote` and `join` (replaced whole when the app moves). Its agents
@@ -475,7 +478,9 @@ daemon learns nothing about projects; everything here is client work.
   names its member's bot id, so a bot deleted and made again under a
   member's name is not a member: a post misses it, and the app keeps it in
   the sidebar and out of the swarm's cards and counts; a deleted agent
-  leaves its swarm when the app sees it go. A swarm is one sidebar row
+  leaves its swarm when the app sees it go, and its role, stream and votes
+  on open proposals go with it, so an agent later made under its name
+  starts fresh. A swarm is one sidebar row
   under its project (⁂, working while any agent works); its agents are not
   in the sidebar. Its view has two tabs: **Board**, read from where the
   last read ended whenever one of its agents does something durable, and
@@ -484,7 +489,8 @@ daemon learns nothing about projects; everything here is client work.
   beside. The head counts working agents and tokens used against the
   budget, its helpers' tokens included. Its composer posts to the board.
   Its ⋯ menu stops every agent and helper
-  (every unfinished turn, queued ones first, of each member that is still
+  (agents first, then the helpers they made, looked for again until a look
+  finds none it has not stopped; every unfinished turn, queued ones first, of each member that is still
   the bot that joined; a name now held by another bot leaves instead; and
   the swarm refuses its agents' posts until your next one is on the board)
   or, unless it is stopped, adds one from the row furthest below its share, told to read the board first,
@@ -506,7 +512,8 @@ daemon learns nothing about projects; everything here is client work.
   keeps the last), and in the answer of the act that passed it.
 - **Swarm councils.** The sheet's "Organized as" picks one board (every
   agent takes a piece) or a council of 3, which needs at least three
-  agents. With a council, the seats are the swarm's first three agents; when
+  agents; a start that made fewer than three deletes them and starts
+  nothing. With a council, the seats are the swarm's first three agents; when
   a seat is deleted the next agent takes it, and only the votes of the seats
   as they are now count. An agent proposes a stream of work with
   `propose STREAM WHY`, which wakes the other seats; a seat votes with
@@ -634,13 +641,14 @@ bot that is not a member or while the swarm is stopped. A council swarm's
 proposal wakes its three seats, a second yes opens the stream and wakes the
 proposer, a non-seat's vote is refused, and a post from a stream carries its
 tag and reaches nobody outside it (same test file), and each post's line
-records how many agents it reached. Start, Add and Stop are tested in
+records how many agents it was sent to. Start, Add and Stop are tested in
 `app/src-tauri/src/swarm.rs` against a stand-in daemon: each agent gets its
 row's model, identity and share of the budget, one that fails is reported
 while the rest start, a start with no agent leaves nothing behind, an
 identity without `shell` is refused before any agent exists, Add skips a
 name another bot holds, and Stop ends unfinished turns newest first,
-its helpers' and their helpers' too but not a bot no agent made, and
+its helpers' and their helpers' too, one made after its first look
+included, but not a bot no agent made, and
 lets a reused name leave; the board says 50% and then, past 90% at once,
 only 90%, each once, counting a helper's tokens. The council was also
 driven in demo mode: roles, two proposals, one approved by the seats, a

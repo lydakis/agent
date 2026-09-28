@@ -1245,6 +1245,11 @@ test('the board shows roles, proposals, votes and decisions, and a stream tag fi
   await act({ act: 'swarm-tab', v: 'streams' });
   assert.match(log.innerHTML, /#conn-pool<\/button> <span class="dim">2 agents<\/span>/);
   assert.match(log.innerHTML, /data-task="app.latency-4">latency-4 <span class="dim">lead<\/span>/);
+  // A seat that leaves while the Council tab is open shows gone at once, with no board change.
+  await act({ act: 'swarm-tab', v: 'council' });
+  p.learnSwarm(swarmRecord(['app.latency-2', 'app.latency-3', 'app.latency-4'], { council: 3, seats: ['app.latency-2', 'app.latency-3', 'app.latency-4'] }));
+  p.renderSwarm(log, sw);
+  assert.match(log.innerHTML, /Seats: latency-2, latency-3, latency-4\./);
 });
 
 test('a flat swarm has no Council or Streams tab', async () => {
