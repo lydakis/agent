@@ -1369,8 +1369,9 @@ async function createProject(dir, picked = null) {
     await openOnly(info.coordinator); return;
   }
   const policy = await Daemon.policy(info.dir, 'coordinator');
-  // The model picked when the project was made, else the folder's, its profile's, or the app's --model.
-  const model = picked || info.model || policy.model;
+  // A folder that already has a project file keeps its model; a new one takes the model picked for it,
+  // else its coordinator profile's.
+  const model = (info.file && info.model) || picked || policy.model;
   if (!model) throw new Error('model_required: choose a model');
   if (picked) try { localStorage.setItem('agent:model', picked); } catch (_) {}
   const session = S.session;
@@ -1572,7 +1573,7 @@ function setupHTML() {
   };
   const errorsHTML = (names) => names.filter((n) => st.status[n]?.error).map((n) => { const s = st.status[n]; return `<div class="perr">${names.length > 1 ? `${esc(n)}: ` : ''}${esc(s.error)}${s.detail ? `: ${esc(String(s.detail).slice(0, 300))}` : ''}</div>`; }).join('');
   const entries = []; for (const spec of specs) { const n = specName(spec), c = catalogOf(n), key = c?.id ?? n; if (!entries.some((e) => e.key === key)) entries.push({ key, label: c?.label ?? n, names: specs.map(specName).filter((m) => (catalogOf(m)?.id ?? m) === key) }); }
-  const rows = entries.map(({ key, label, names }) => { const failed = names.some((n) => st.status[n]?.error); return `<div class="prow"><span class="pn">${esc(label)}</span>${statusHTML(names)}<span class="acts">${failed ? `<button type="button" class="sbtn" data-act="setup-retry"${busy}>Retry</button>` : ''}<button type="button" class="sbtn${st.confirm === key ? ' danger' : ''}" data-act="setup-remove" data-v="${esc(key)}"${busy}>${st.confirm === key ? 'Remove anyway' : 'Remove'}</button></span>${errorsHTML(names)}${st.confirm === key ? '<div class="perr warn">Agents are working. Removing restarts the daemon, which stops them.</div>' : ''}</div>`; }).join('');
+  const rows = entries.map(({ key, label, names }) => { const failed = names.some((n) => st.status[n]?.error); return `<div class="prow"><span class="pn">${esc(label)}</span>${statusHTML(names)}<span class="acts">${failed ? `<button type="button" class="sbtn" data-act="setup-retry"${busy}>Retry</button>` : ''}${catalogOf(key) ? `<button type="button" class="sbtn" data-act="setup-pick" data-v="${esc(key)}"${busy}>Edit</button>` : ''}<button type="button" class="sbtn${st.confirm === key ? ' danger' : ''}" data-act="setup-remove" data-v="${esc(key)}"${busy}>${st.confirm === key ? 'Remove anyway' : 'Remove'}</button></span>${errorsHTML(names)}${st.confirm === key ? '<div class="perr warn">Agents are working. Removing restarts the daemon, which stops them.</div>' : ''}</div>`; }).join('');
   let add = '';
   if (st.adding === null) add = `<button type="button" class="sbtn" data-act="setup-add"${busy}>＋ Add a provider</button>`;
   else if (st.adding === '') add = `<div class="choices">${CATALOG.filter((c) => !specs.some((s) => catalogOf(specName(s)) === c)).map((c) => `<button type="button" class="choice" data-act="setup-pick" data-v="${c.id}"${busy}>${esc(c.label)}</button>`).join('')}</div>${specs.length ? `<button type="button" class="sbtn" data-act="setup-cancel">Cancel</button>` : ''}`;

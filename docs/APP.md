@@ -175,8 +175,7 @@ quits the app and runs the bundled `agent shutdown --store
 ~/.agent/state.sqlite --grace 30`, so the default store's daemon, whoever
 started it, lets running turns finish and exits before its binary is replaced.
 The store is named so the uninstalling shell's `AGENT_STORE` or `AGENT_SOCKET`
-cannot point the shutdown elsewhere. A default model that appears only after
-launch, from a repaired `~/.agent/env`, is picked up on the next attach.
+cannot point the shutdown elsewhere.
 
 Releases follow Errand's: pushing a `vX.Y.Z` tag on `main` whose version both
 `Cargo.toml` and `app/src-tauri/Cargo.toml` carry runs

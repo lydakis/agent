@@ -1279,6 +1279,21 @@ test('a change another window saved is kept when this one connects a provider', 
   assert.equal(calls.find(([c]) => c === 'save')[1].AGENT_PROVIDER, 'openai chatgpt anthropic');
 });
 
+test('a folder with a project file keeps its model when its coordinator is made again', async () => {
+  const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: 'openai', OPENAI_API_KEY: 'k' }, lists: { openai: { models: [{ id: 'gpt' }, { id: 'mini' }] } } });
+  p.context.Daemon.project = async (dir) => ({ dir, name: 'weather', coordinator: 'weather.lead', model: 'openai/gpt', file: true });
+  await p.createProject('/synthetic/weather', 'openai/mini');
+  assert.deepEqual(calls.filter(([c]) => c === 'create' || c === 'write'), [['create', 'weather.lead', 'openai/gpt']]);
+});
+
+test('a connected provider can be edited in place', async () => {
+  const { p } = settingsShell({ env: { AGENT_PROVIDER: 'bedrock bedrock-openai', AWS_REGION: 'us-west-2' }, lists: { bedrock: { models: [{ id: 'claude' }] }, 'bedrock-openai': { models: [{ id: 'grok' }] } } });
+  await p.openSetup();
+  assert.match(p.setupHTML(), /data-act="setup-pick" data-v="bedrock"[^>]*>Edit</);
+  p.S.setup.adding = 'bedrock';
+  assert.match(p.setupHTML(), /name="AWS_REGION"[^>]*value="us-west-2"/);
+});
+
 test('a project starts on the model picked for it, and the pick is offered first next time', async () => {
   const storage = new Map();
   const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: 'openai bedrock bedrock-openai', OPENAI_API_KEY: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] }, bedrock: { models: [{ id: 'claude' }] }, 'bedrock-openai': { models: [{ id: 'grok' }] } } });

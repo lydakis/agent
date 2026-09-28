@@ -1006,7 +1006,10 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     waits until restarts prove a cost. Follow-up: Settings shows the providers
     the app would start a daemon with; a daemon started from a terminal with
     other `--provider` flags runs providers it does not list until the app
-    restarts it.
+    restarts it, and so does a second window on another store after the first
+    changes settings. Asking the attached daemon instead means a
+    `provider_models` call, which asks every provider, on each open; that
+    waits for a cheap way to ask a daemon what it runs.
 
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.
