@@ -33,7 +33,7 @@ function page(daemon = {}, storage = null) {
   });
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -1339,6 +1339,23 @@ test('a swarm a coordinator started from its shell shows once its first agent ta
   assert.equal(reads, 2, 'one read for the burst');
   assert.deepEqual([...p.S.swarms.keys()], ['app.latency']);
   assert.equal(p.S.memberOf.get('app.latency-2'), 'app.latency');
+});
+
+test('a helper finishing a turn has its swarm check its budget, and only current seats are tallied', async () => {
+  const checks = [];
+  const p = shell({ swarmCheck: async (swarm) => { checks.push(swarm); return {}; }, request: async () => ({ bots: [], next_after: null, nodes: [], next_from: null }) });
+  for (const [name, id] of [['app.latency-1', 3], ['app.latency-2', 4]]) p.upsert({ name, id, provider: 'alpha', model: 'one' });
+  // A helper of latency-1, and a helper of that helper.
+  p.upsert({ name: 'app.latency-1.fix', id: 7, provider: 'alpha', model: 'one', created_by: 'app.latency-1', created_by_id: 3 });
+  p.upsert({ name: 'app.latency-1.fix.deep', id: 8, provider: 'alpha', model: 'one', created_by: 'app.latency-1.fix', created_by_id: 7 });
+  p.upsert({ name: 'app.other', id: 9, provider: 'alpha', model: 'one' });
+  const sw = p.learnSwarm(swarmRecord(['app.latency-1', 'app.latency-2'], { ids: { 'app.latency-1': 3, 'app.latency-2': 4 }, council: 3, seats: ['app.latency-1', 'app.latency-2'] }));
+  await p.handle({ event: 'turn_finished', bot: 'app.latency-1.fix.deep', turn: 1, durable: true }, 1);
+  await p.handle({ event: 'turn_finished', bot: 'app.other', turn: 1, durable: true }, 1);
+  await p.tick();
+  assert.deepEqual(checks, ['app.latency']);
+  // A seat that left keeps no say: latency-9's yes is not counted.
+  assert.equal(p.tally(sw, { votes: { 'latency-1': { yes: true }, 'latency-9': { yes: true } } }), '1 yes of 2');
 });
 
 test('a deleted agent leaves its swarm', async () => {
