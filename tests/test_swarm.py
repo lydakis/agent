@@ -46,6 +46,7 @@ class SwarmPostTests(ModelFixture):
         (folder / 'swarm.toml').write_text(
             f'project = "p"\ngoal = "g"\nworkspace = "{self.path}"\n'
             f'budget_tokens = 1000000\nmembers = [{listed}]\nstopped = false\ncouncil = {council}\n'
+            f'made = {len(members)}\nleft = []\n'
             f'[[mix]]\nidentity = ""\nmodel = "openai/synthetic-model"\nshare = 100\n'
             f'[ids]\n{pinned}[rows]\n{rows}')
         (folder / 'board.jsonl').write_text('')

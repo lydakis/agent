@@ -1350,8 +1350,8 @@ test('a helper finishing a turn has its swarm check its budget, and only current
   await p.handle({ event: 'turn_finished', bot: 'app.other', turn: 1, durable: true }, 1);
   await p.tick();
   assert.deepEqual(checks, ['app.latency']);
-  // A seat that left keeps no say: latency-9's yes is not counted.
-  assert.equal(p.tally(sw, { votes: { 'latency-1': { yes: true }, 'latency-9': { yes: true } } }), '1 yes of 2');
+  // A seat that left keeps no say: latency-9's yes is not counted, and the majority is still of the council's three.
+  assert.equal(p.tally(sw, { votes: { 'latency-1': { yes: true }, 'latency-9': { yes: true } } }), '1 yes of 3');
 });
 
 test('a deleted agent leaves its swarm', async () => {
