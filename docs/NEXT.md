@@ -989,9 +989,21 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     `.agents/agents/ROLE.md` with optional `description`, `model` and
     `tools`, both indexed for every composed bot; `--profile ROLE` starts a
     bot in one; the app's coordinator text is its shipped `coordinator`
-    profile ([CLIENT.md](CLIENT.md)). Next, in order: swarms as the v12
-    prototype draws them (board, council, streams), measured against simpler
-    setups; Keep. Approvals in the app wait: George runs with full access.
+    profile ([CLIENT.md](CLIENT.md)). Done (2026-09-28): swarms, first
+    part ([APP.md](APP.md#projects-and-panes)): New swarm in a project's
+    menu, a swarm folder in `~/.agent/swarms` with its board, its agents as
+    ordinary bots with a budget share in the app's `swarm` profile, and a
+    `post` tool (the app's executable) that steers a post into the agents
+    working now and wakes only those it names; a Board and an Agents tab,
+    stop and add. Follow-up: a post's author is the `AGENT_BOT` its shell
+    names, which the daemon checks only as far as that bot having the named
+    turn; a model could still post as another member, so the board should
+    show a post as its author's only when the author's own tool call ran
+    it. Deleting a swarm is not built. Next, in order: roles, the council
+    and streams as the v12 prototype draws them; then the same goal three
+    ways (a flat board, council and streams, one lead) with equal models and
+    budget, on George's Mac; Keep. Approvals in the app wait: George runs
+    with full access.
     A fork into another provider stays out: history is provider-native.
     Done (2026-09-28): setup and settings, the first items of an app audit
     (Sol, 2026-09-28) George put before swarms. A draft stays with the bot

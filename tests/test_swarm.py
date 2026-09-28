@@ -1,0 +1,118 @@
+"""A swarm's post tool against a real daemon: the board, and who hears a post."""
+import json
+import os
+import threading
+import time
+import unittest
+from pathlib import Path
+
+import subprocess
+
+from bench.targets import clean_env
+from tests.test_runtime import ModelFixture
+
+ROOT = Path(__file__).resolve().parent.parent
+APP = next((p for p in (ROOT / '.local/target/debug/agent-app', ROOT / '.local/target/release/agent-app') if p.exists()), None)
+
+
+@unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
+@unittest.skipUnless(APP, 'build the app first: cargo build -p agent-app')
+class SwarmPostTests(ModelFixture):
+    def setUp(self):
+        super().setUp()
+        self.store = self.path / 'state.sqlite'
+        self.common = ['--store', str(self.store), '--provider', f'openai=responses,{self.url}',
+                       '--model', 'openai/synthetic-model', '--tools', 'echo,shell']
+        self.addCleanup(lambda: subprocess.run([str(self.binary), 'shutdown', '--store', str(self.store)],
+                                               env=clean_env(), capture_output=True, timeout=35))
+
+    def agent(self, *args):
+        result = subprocess.run([str(self.binary), *args], env=clean_env(), capture_output=True, text=True,
+                                timeout=30, cwd=self.path)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        return result
+
+    def ids(self):
+        return {b['name']: b['id'] for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout)}
+
+    def swarm(self, members):
+        # The folder the app writes for a swarm, by hand: each member pinned to its bot's id.
+        folder = self.path / 'swarms' / 'p.s'
+        folder.mkdir(parents=True)
+        listed = ', '.join(json.dumps(m) for m in members)
+        ids = self.ids()
+        pinned = ''.join(f'{json.dumps(m)} = {ids[m]}\n' for m in members)
+        (folder / 'swarm.toml').write_text(
+            f'project = "p"\ngoal = "g"\nworkspace = "{self.path}"\nmodel = "openai/synthetic-model"\n'
+            f'budget_tokens = 1000000\nmembers = [{listed}]\nstopped = false\n[ids]\n{pinned}')
+        (folder / 'board.jsonl').write_text('')
+        post = folder / 'post'
+        post.write_text(f'#!/bin/sh\nexec \'{APP}\' --swarm-post \'{folder}\' "$@"\n')
+        post.chmod(0o755)
+        return folder
+
+    def turns(self, bot):
+        return json.loads(self.agent('turns', '--store', str(self.store), '--bot', bot).stdout)
+
+    def post_from(self, bot, folder, text):
+        # The agent runs the script from its shell tool; its output is kept for the test.
+        out = self.path / f'posted-{bot}.json'
+        ran = self.agent('run', '--store', str(self.store), '--bot', bot,
+                         f'shell:"{folder}/post" {text} > "{out}" 2>&1')
+        self.assertTrue(out.exists(), ran.stdout)
+        return json.loads(out.read_text() or '{}')
+
+    def test_a_post_reaches_working_agents_and_wakes_only_named_idle_ones(self):
+        self.model.release_headers = threading.Event()
+        self.model.all_streaming = self.model.release_headers
+        self.addCleanup(self.model.release_headers.set)
+        members = ['p.s-1', 'p.s-2', 'p.s-3', 'p.s-4']
+        for bot in members:
+            self.agent('run', *self.common, '--new', '--bot', bot, 'hello')
+        folder = self.swarm(members)
+        # s-2 works on a turn that waits on the model; s-3 and s-4 are idle.
+        self.agent('run', '--store', str(self.store), '--bot', 'p.s-2', '--detach', 'gate')
+        for _ in range(200):
+            if self.turns('p.s-2')[-1]['status'] == 'running':
+                break
+            time.sleep(.02)
+        posted = self.post_from('p.s-1', folder, '"@s-3 take the tests"')
+        self.assertEqual((posted['steered'], posted['woke'], posted['missed']), (['s-2'], ['s-3'], []))
+        board = [json.loads(line) for line in (folder / 'board.jsonl').read_text().splitlines()]
+        self.assertEqual(len(board), 1)
+        self.assertEqual((board[0]['from'], board[0]['bot'], board[0]['text']), ('s-1', 'p.s-1', '@s-3 take the tests'))
+        self.assertEqual(board[0]['turn'], self.turns('p.s-1')[-1]['turn'])
+        # The named idle agent got a turn of its own; the other idle one heard nothing.
+        woken = self.turns('p.s-3')[-1]
+        self.assertEqual((woken['prompt_preview'], woken['delivery']), ('[board] s-1: @s-3 take the tests', 'steer'))
+        self.assertEqual(len(self.turns('p.s-4')), 1)
+        # A post naming nobody goes only to the turns running now.
+        quiet = self.post_from('p.s-4', folder, 'profile is up')
+        self.assertIn('s-2', quiet['steered'])
+        self.assertEqual((quiet['woke'], quiet['missed']), ([], []))
+        self.model.release_headers.set()
+        self.agent('wait', '--store', str(self.store), f"turn:p.s-2/{self.turns('p.s-2')[-1]['turn']}")
+        # Posting is for members, and a stopped swarm takes no posts from its agents.
+        outsider = self.path / 'outsider.json'
+        self.agent('run', *self.common, '--new', '--bot', 'q', f'shell:"{folder}/post" hi > "{outsider}" 2>&1')
+        self.assertIn('not_a_member', outsider.read_text())
+        # A member deleted and made again under its name is another bot: it cannot post, and a
+        # post naming it misses it rather than waking the new bot.
+        self.agent('rm', '--store', str(self.store), '--bot', 'p.s-4')
+        self.agent('run', *self.common, '--new', '--bot', 'p.s-4', 'hello')
+        again = self.path / 'again.json'
+        self.agent('run', '--store', str(self.store), '--bot', 'p.s-4', f'shell:"{folder}/post" hi > "{again}" 2>&1')
+        self.assertIn('not_a_member', again.read_text())
+        named = self.post_from('p.s-1', folder, '"@s-4 you there?"')
+        self.assertEqual(([m['agent'] for m in named['missed']], named['woke']), (['s-4'], []))
+        self.assertEqual(len(self.turns('p.s-4')), 2)
+        toml = folder / 'swarm.toml'
+        toml.write_text(toml.read_text().replace('stopped = false', 'stopped = true'))
+        stopped = self.path / 'stopped.json'
+        self.agent('run', '--store', str(self.store), '--bot', 'p.s-1', f'shell:"{folder}/post" hi > "{stopped}" 2>&1')
+        self.assertIn('swarm_stopped', stopped.read_text())
+        self.assertEqual(len((folder / 'board.jsonl').read_text().splitlines()), 3)
+
+
+if __name__ == '__main__':
+    unittest.main()

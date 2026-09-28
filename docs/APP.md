@@ -74,6 +74,25 @@ says why beside those that answered.
 
 ![Settings with one provider failing](app/settings.png)
 
+A project's ⋯ menu starts a swarm: a goal, how many agents, their model,
+where they work, and the tokens they share. Captured 2026-09-28.
+
+![The new swarm sheet](app/new-swarm.png)
+
+The swarm's board: your goal first, then its agents' posts, the ones they
+name marked. Its row in the sidebar is working while any agent works.
+
+![A swarm's board while three of four agents work](app/swarm-board.png)
+
+Its agents as cards, each with its newest line.
+
+![A swarm's agents](app/swarm-agents.png)
+
+Your post naming `@latency-3` woke that agent alone; clicking a name opens
+the agent beside, with the board's posts it heard.
+
+![An agent beside the board](app/swarm-beside.png)
+
 ## What the daemon speaks, and why the client speaks it directly
 
 The daemon's contract is JSONL over a Unix socket: requests with an `id`,
@@ -363,8 +382,61 @@ daemon learns nothing about projects; everything here is client work.
   turn where the bot is, or where a message moves it. A bot in a
   linked worktree shows its branch after its name in the head, read once
   from the worktree's files when the head is first drawn.
+- **Swarms.** Also the app's opinion; the daemon learns nothing new. A
+  project's ⋯ menu has **New swarm**: a goal, 2 to 16 agents, a model, where
+  they work (one worktree they share, `~/.agent/worktrees/PROJECT.NAME` on
+  `agent/PROJECT.NAME` with the folder's `.agents/setup` run in it, or the
+  project folder), and a token budget split evenly among them. A goal is
+  at most 16 KiB. A name whose worktree or branch another store's swarm
+  holds is skipped for the next. Setup gets ten minutes and the login
+  shell's ordinary variables (PATH, HOME, USER, LOGNAME, SHELL, LANG, LC_*,
+  TMPDIR, TERM) and no others, so no provider or cloud keys; past its time
+  its whole process group is killed, and its output is kept only to its
+  last 64 KiB. A swarm whose files or policy cannot be made is removed with
+  its worktree and branch.
+  The swarm is a folder, `~/.agent/swarms/STORE/PROJECT.NAME/`, where
+  STORE is the store identity the daemon announces when a window attaches,
+  so a window sees only its store's swarms, whatever socket reaches it:
+  `swarm.toml` (its project, goal, folder, model, budget, members with each
+  one's bot id, and whether you stopped it; at most 1 MiB, read only when
+  every member has an id, changed only under the board's lock, synced, and
+  replaced whole), `board.jsonl` (one post a line, appended under a lock
+  and synced, your goal first), and `post`, a script that runs the app's own executable with
+  `--swarm-post` (replaced whole when the app moves). Its agents
+  are ordinary bots named `PROJECT.NAME-N`, each created with its share of
+  the budget and started in the `swarm` profile (the folder's, the user's,
+  or the one the app ships, [swarm.md](../app/agents/swarm.md)); each joins
+  the swarm once created, and then gets a first message naming it, the
+  goal, the others and the board's two paths. A post is written to the board, then
+  steered into the agents it reaches over one daemon connection: an
+  agent's post reaches the agents working now, strictly into their running
+  turns (a turn that ended meanwhile is skipped; the post waits on the
+  board), and wakes an idle agent only when it names it with `@NAME`; your
+  post wakes every agent, or only the ones it names. A post holds the
+  board's lock until its steers are sent, so Stop either refuses it or
+  ends what it started. So agents talking
+  never wake a swarm that went quiet. A post is at most 16 KiB and comes
+  only from a member, named by its shell's `AGENT_BOT`, `AGENT_BOT_ID` and
+  `AGENT_TURN`; the daemon records it as each steer's author. Every steer
+  names its member's bot id, so a bot deleted and made again under a
+  member's name is not a member: a post misses it, and the app keeps it in
+  the sidebar and out of the swarm's cards and counts; a deleted agent
+  leaves its swarm when the app sees it go. A swarm is one sidebar row
+  under its project (⁂, working while any agent works); its agents are not
+  in the sidebar. Its view has two tabs: **Board**, read from where the
+  last read ended whenever one of its agents does something durable, and
+  only while it is on screen (more than 256 KiB behind, it reads the
+  board's last 256 KiB instead); and **Agents**, their cards, which open
+  beside. The head counts working agents and tokens used against the
+  budget. Its composer posts to the board. Its ⋯ menu stops every agent
+  (every unfinished turn, queued ones first, of each member that is still
+  the bot that joined; a name now held by another bot leaves instead; and
+  the swarm refuses its agents' posts until your next one) or adds one,
+  told to read the board first, whose share of tokens the swarm's budget
+  grows by.
 - **Not built yet.** Keep, which turns a side chat into a task, removing a
-  deleted task's worktree, swarms and approvals are later steps of item 47.
+  deleted task's worktree, a swarm's roles, council and streams, and
+  approvals are later steps of item 47.
 
 `python3 app/playground.py` starts a daemon on a synthetic streaming model
 and opens the app on it; prompt prefixes (`shell:`, `bg:`, `delegate:`,
@@ -466,6 +538,13 @@ bot without it. It also supplies the same default compaction
 instructions as the CLI, so app-created bots can summarize older context.
 Completed thoughts retain locally observed thinking time; historical thoughts
 without a recorded duration show no invented time.
+
+On 2026-09-28 a swarm was started from the sheet in demo mode in headless
+Chromium: its agents posted, a post naming one woke it alone, and an agent
+opened beside from the board, with no page errors. The post tool itself runs
+against a real daemon in `tests/test_swarm.py`: an agent's post reaches the
+agent working, wakes the idle one it names and no other, and is refused for a
+bot that is not a member or while the swarm is stopped.
 
 On 2026-09-27 the shell was driven in demo mode in headless Chromium:
 projects and tasks in the sidebar, a card opened beside and swapped, the three

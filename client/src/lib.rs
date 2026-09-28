@@ -130,6 +130,9 @@ pub struct Client {
     /// Set by the reader on its way out. A request made after it can still
     /// be written, but nothing would ever answer; it fails here instead.
     closed: Arc<std::sync::atomic::AtomicBool>,
+    /// The store's identity from `ready`: the same file under the same
+    /// lineage, whichever socket its daemon listens on.
+    store: Option<String>,
 }
 
 impl Client {
@@ -165,6 +168,7 @@ impl Client {
         if ready["event"] != "ready" || ready["protocol"].as_u64() != Some(PROTOCOL) {
             return Err(Error::new("daemon_protocol_mismatch"));
         }
+        let store = ready["store"]["identity"].as_str().map(str::to_owned);
         let pending: Pending = Arc::default();
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (events, receiver) = mpsc::channel(QUEUE);
@@ -230,6 +234,7 @@ impl Client {
                 pending,
                 next: std::sync::atomic::AtomicU64::new(0),
                 closed,
+                store,
             }),
             Events(receiver),
         ))
@@ -240,6 +245,10 @@ impl Client {
     /// waiting on the notifications sees them close.
     pub async fn close(&self) {
         let _ = self.writer.lock().await.shutdown().await;
+    }
+
+    pub fn store(&self) -> Option<&str> {
+        self.store.as_deref()
     }
 
     pub async fn request(&self, op: &str, mut params: Value) -> Result<Value> {
@@ -304,6 +313,7 @@ mod tests {
             pending: Arc::default(),
             next: std::sync::atomic::AtomicU64::new(0),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            store: None,
         });
         let mut lines = BufReader::new(peer).lines();
         for _ in 0..20 {
@@ -332,6 +342,7 @@ mod tests {
             pending: Arc::default(),
             next: std::sync::atomic::AtomicU64::new(0),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            store: None,
         });
         let mut lines = BufReader::new(peer).lines();
         let request = tokio::spawn({
@@ -368,6 +379,7 @@ mod tests {
             pending: Arc::default(),
             next: std::sync::atomic::AtomicU64::new(0),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            store: None,
         });
         let request = tokio::spawn({
             let client = client.clone();

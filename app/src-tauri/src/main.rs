@@ -1,13 +1,16 @@
 //! The desktop client's Rust core: a transport between the page and the
 //! daemon. The page owns the state model and the protocol logic, exactly as
 //! the prototype did; this side connects, forwards notifications as window
-//! events, and relays requests. Nothing else lives here.
+//! events, and relays requests. Beside that it reads the files the app owns
+//! (projects, profiles, swarms) and makes a swarm's shared worktree; run
+//! with `--swarm-post` it is a swarm's post tool (see `swarm`).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod daemon;
 mod project;
 mod session;
 mod settings;
+mod swarm;
 mod worktree;
 
 use agent_client::Client;
@@ -37,6 +40,8 @@ struct Shared {
     /// The attached session's notifications. `pull` takes the receiver out
     /// while it waits and puts it back, so an attach never waits on a pull.
     events: Mutex<SessionSlot<agent_client::Events>>,
+    /// The attached daemon's store identity, which names its swarms' folder.
+    store: std::sync::Mutex<Option<String>>,
 }
 
 /// Notifications handed to the page per pull. Small enough that the page
@@ -200,7 +205,10 @@ fn policy(
 
 /// The roles the app ships, used where neither the folder nor the user has
 /// a file of that name.
-const BUILT_IN: [(&str, &str); 1] = [("coordinator", include_str!("../../agents/coordinator.md"))];
+const BUILT_IN: [(&str, &str); 2] = [
+    ("coordinator", include_str!("../../agents/coordinator.md")),
+    ("swarm", include_str!("../../agents/swarm.md")),
+];
 
 /// The project in a folder: its `.agents/project.toml`, or the defaults a
 /// new project there would take.
@@ -485,6 +493,7 @@ async fn attach(state: State<'_, Shared>, after: i64) -> Result<Value, String> {
         .request("follow", json!({"bot": "*", "after": after}))
         .await
         .map_err(|e| e.to_string())?;
+    *state.store.lock().unwrap() = client.store().map(str::to_owned);
     *state.client.lock().await = Some(client);
     state.events.lock().await.replace(session, events);
     Ok(json!({"session": session}))
@@ -520,6 +529,138 @@ async fn pull(state: State<'_, Shared>, session: u64) -> Result<Value, String> {
 }
 
 /// Page diagnostics land on stderr, where a terminal can see them.
+/// Every swarm in `~/.agent/swarms`, and the folders there that are not
+/// readable swarms.
+#[tauri::command]
+fn swarms(state: State<'_, Shared>) -> Result<Value, String> {
+    swarm::list(&swarms_of(&state)?)
+}
+
+/// The swarms of the store this window's daemon runs.
+fn swarms_of(state: &Shared) -> Result<PathBuf, String> {
+    let store = state.store.lock().unwrap().clone();
+    swarm::root(&store.ok_or("detached: swarms are read once the window is attached")?)
+}
+
+/// A change to a swarm's files waits for its board's lock, which an agent's
+/// post holds while it sends; it waits on the blocking pool, never on the
+/// window's thread or the async workers.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// A new swarm in a project folder: its name taken, the place its agents
+/// share made (a worktree, unless they work in the project folder), and its
+/// folder written. The page then creates the agents and has them join.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn swarm_create(
+    state: State<'_, Shared>,
+    project: String,
+    name: String,
+    folder: String,
+    goal: String,
+    shared: bool,
+    model: String,
+    budget_tokens: u64,
+) -> Result<Value, String> {
+    let root = swarms_of(&state)?;
+    let folder = workspace_path(std::path::Path::new(&folder))?;
+    let full = format!("{project}.{name}");
+    swarm::valid_goal(&goal)?;
+    let dir = swarm::claim(&root, &full)?;
+    let workspace = match swarm::place(std::path::Path::new(&folder), &full, shared).await {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(error);
+        }
+    };
+    let s = swarm::Swarm {
+        name: full,
+        project,
+        goal: goal.trim().to_owned(),
+        workspace,
+        model,
+        budget_tokens,
+        members: Vec::new(),
+        ids: Default::default(),
+        stopped: false,
+    };
+    let filled = std::env::current_exe()
+        .map_err(|e| e.to_string())
+        .and_then(|app| swarm::fill(&dir, &s, &app));
+    if let Err(error) = filled {
+        if shared {
+            let _ = swarm::unplace(&s.name).await;
+        }
+        return Err(error);
+    }
+    Ok(s.json(&dir))
+}
+
+/// Agents the daemon made, by name and bot id, and the tokens their
+/// budgets add to the swarm's.
+#[tauri::command]
+async fn swarm_join(
+    state: State<'_, Shared>,
+    swarm: String,
+    members: Vec<(String, i64)>,
+    added_budget: u64,
+) -> Result<Value, String> {
+    let root = swarms_of(&state)?;
+    blocking(move || swarm::join(&root, &swarm, &members, added_budget)).await
+}
+
+#[tauri::command]
+async fn swarm_leave(
+    state: State<'_, Shared>,
+    swarm: String,
+    member: String,
+) -> Result<Value, String> {
+    let root = swarms_of(&state)?;
+    blocking(move || swarm::leave(&root, &swarm, &member)).await
+}
+
+#[tauri::command]
+async fn swarm_discard(state: State<'_, Shared>, swarm: String) -> Result<(), String> {
+    swarm::discard(&swarms_of(&state)?, &swarm).await
+}
+
+#[tauri::command]
+async fn swarm_stop(
+    state: State<'_, Shared>,
+    swarm: String,
+    stopped: bool,
+) -> Result<Value, String> {
+    let root = swarms_of(&state)?;
+    blocking(move || swarm::set_stopped(&root, &swarm, stopped)).await
+}
+
+#[tauri::command]
+fn swarm_board(
+    state: State<'_, Shared>,
+    swarm: String,
+    offset: Option<u64>,
+) -> Result<Value, String> {
+    swarm::board(&swarms_of(&state)?, &swarm, offset)
+}
+
+/// Your post, over the window's own connection.
+#[tauri::command]
+async fn swarm_post(
+    state: State<'_, Shared>,
+    swarm: String,
+    text: String,
+) -> Result<Value, String> {
+    let client = state.client.lock().await.clone().ok_or("detached")?;
+    swarm::post(&client, &swarms_of(&state)?, &swarm, None, &text).await
+}
+
 #[tauri::command]
 fn log(message: String) {
     eprintln!("agent-app page: {message}");
@@ -533,6 +674,15 @@ async fn request(state: State<'_, Shared>, op: String, params: Value) -> Result<
 }
 
 fn main() {
+    // A swarm's `post` script runs this executable; it posts and exits
+    // without a window.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some(swarm::POST_FLAG) {
+        std::process::exit(swarm::cli(&args[2..]));
+    }
+    if let (Ok(home), Ok(app)) = (swarm::home(), std::env::current_exe()) {
+        swarm::refresh_scripts(&home, &app);
+    }
     let config = match config() {
         Ok(config) => config,
         Err(message) => {
@@ -548,6 +698,7 @@ fn main() {
             starts: Mutex::new(daemon::Starts::default()),
             session: std::sync::atomic::AtomicU64::new(0),
             events: Mutex::new(SessionSlot::default()),
+            store: std::sync::Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             setup,
@@ -563,7 +714,15 @@ fn main() {
             attach,
             pull,
             request,
-            log
+            log,
+            swarms,
+            swarm_create,
+            swarm_join,
+            swarm_leave,
+            swarm_discard,
+            swarm_stop,
+            swarm_board,
+            swarm_post
         ])
         .setup(|app| {
             let _ = app.get_webview_window("main");
