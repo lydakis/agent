@@ -505,6 +505,11 @@ pub async fn place(project: &Path, swarm: &str, shared: bool) -> Result<String, 
     if !shared {
         return Ok(project.to_string_lossy().into_owned());
     }
+    worktree(&worktrees()?, project, swarm).await
+}
+
+/// `place`'s worktree, made under `trees`.
+async fn worktree(trees: &Path, project: &Path, swarm: &str) -> Result<String, String> {
     let env = clean_env().await;
     let git = |args: &[&str]| {
         let mut command = git(&env);
@@ -526,38 +531,49 @@ pub async fn place(project: &Path, swarm: &str, shared: bool) -> Result<String, 
         ));
     }
     let prefix = String::from_utf8_lossy(&prefix.stdout).trim().to_owned();
-    let tree = worktrees()?.join(swarm);
+    let tree = trees.join(swarm);
     let branch = format!("agent/{swarm}");
     // Worktrees and branches are shared by every store: a name another
     // store's swarm holds is taken here too, and the page picks another.
-    let held = || async {
-        let branched = git(&[
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("refs/heads/{branch}"),
-        ])
-        .output()
-        .await
-        .is_ok_and(|out| out.status.success());
-        tree.exists() || branched
-    };
     let exists = || format!("swarm_exists: {swarm} has a worktree or branch already");
-    if held().await {
+    let branched = git(&[
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        &format!("refs/heads/{branch}"),
+    ])
+    .output()
+    .await
+    .is_ok_and(|out| out.status.success());
+    if branched {
         return Err(exists());
+    }
+    // The worktree's folder is made first, empty and alone: of two starts
+    // racing for one name, one makes it and the other hears the name is
+    // taken. What a failed add leaves behind is then this start's own.
+    std::fs::create_dir_all(trees).map_err(|e| format!("{}: {e}", trees.display()))?;
+    match std::fs::create_dir(&tree) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(exists()),
+        Err(e) => return Err(format!("{}: {e}", tree.display())),
     }
     let added = git(&["worktree", "add", "-b", &branch])
         .arg(&tree)
         .arg("HEAD")
         .output()
         .await
-        .map_err(|e| format!("git: {e}"))?;
-    if !added.status.success() {
-        // Another store's start may have claimed the name in between.
-        return Err(if held().await {
-            exists()
-        } else {
-            format!("worktree_failed: {}", tail(&added.stderr))
+        .map_err(|e| format!("git: {e}"));
+    if !added.as_ref().is_ok_and(|out| out.status.success()) {
+        // A hook can fail after the worktree and branch were made.
+        let _ = git(&["worktree", "remove", "--force"])
+            .arg(&tree)
+            .output()
+            .await;
+        let _ = git(&["branch", "-D", &branch]).output().await;
+        let _ = std::fs::remove_dir_all(&tree);
+        return Err(match added {
+            Ok(out) => format!("worktree_failed: {}", tail(&out.stderr)),
+            Err(error) => error,
         });
     }
     let workspace = tree.join(&prefix);
@@ -4267,6 +4283,51 @@ mod tests {
         assert!(seen.lines().any(|l| l.starts_with("PATH=")), "{seen}");
         assert!(!seen.contains("CARGO_MANIFEST_DIR="), "{seen}");
         std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn a_worktree_name_is_claimed_by_its_folder_and_a_failed_add_leaves_nothing() {
+        let home = scratch("trees");
+        let (repo, trees) = (home.join("repo"), home.join("trees"));
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(run(&["init", "-q"]).status.success());
+        assert!(
+            run(&["commit", "-q", "--allow-empty", "-m", "first"])
+                .status
+                .success()
+        );
+        let hook = repo.join(".git/hooks/post-checkout");
+        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let rt = runtime();
+        // A hook failing after the add made the worktree and branch: both go.
+        let failed = rt.block_on(worktree(&trees, &repo, "p.fix")).unwrap_err();
+        assert!(failed.starts_with("worktree_failed"), "{failed}");
+        assert!(!trees.join("p.fix").exists());
+        assert!(
+            !run(&["rev-parse", "--verify", "--quiet", "refs/heads/agent/p.fix"])
+                .status
+                .success()
+        );
+        // A folder another start made first means the name is taken.
+        std::fs::remove_file(&hook).unwrap();
+        std::fs::create_dir_all(trees.join("p.held")).unwrap();
+        let held = rt.block_on(worktree(&trees, &repo, "p.held")).unwrap_err();
+        assert!(held.starts_with("swarm_exists"), "{held}");
+        assert!(trees.join("p.held").exists());
+        let made = rt.block_on(worktree(&trees, &repo, "p.fix")).unwrap();
+        assert!(Path::new(&made).join(".git").exists());
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
