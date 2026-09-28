@@ -1350,6 +1350,21 @@ test('a helper finishing a turn has its swarm check its budget, and only current
   await p.handle({ event: 'turn_finished', bot: 'app.other', turn: 1, durable: true }, 1);
   await p.tick();
   assert.deepEqual(checks, ['app.latency']);
+  // A helper whose maker left and is gone still has its swarm check, by the maker's id; a check that
+  // passed a share reads the board, which no agent's event may do.
+  let reads = 0; p.context.Daemon.swarmBoard = async () => { reads += 1; return { lines: [], offset: 0, more: false, reset: true, state: sw.state }; };
+  let passed = null;
+  p.context.Daemon.swarmCheck = async (swarm) => { checks.push(swarm); return { budget: passed }; };
+  sw.left = [11]; p.S.selected = '⁂app.latency';
+  p.upsert({ name: 'app.latency-5.fix', id: 12, provider: 'alpha', model: 'one', created_by: 'app.latency-5', created_by_id: 11 });
+  await p.handle({ event: 'turn_finished', bot: 'app.latency-5.fix', turn: 1, durable: true }, 1);
+  await p.tick(); await p.tick();
+  assert.deepEqual(checks, ['app.latency', 'app.latency']);
+  const quiet = reads;
+  passed = 'the swarm has used 50% of its budget';
+  await p.handle({ event: 'turn_finished', bot: 'app.latency-5.fix', turn: 2, durable: true }, 1);
+  await p.tick(); await p.tick();
+  assert.equal(reads, 2 * quiet + 1, 'the same reads again, and one more for the budget line');
   // A seat that left keeps no say: latency-9's yes is not counted, and the majority is still of the council's three.
   assert.equal(p.tally(sw, { votes: { 'latency-1': { yes: true }, 'latency-9': { yes: true } } }), '1 yes of 3');
 });

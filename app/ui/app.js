@@ -409,13 +409,17 @@ async function readUsage(sw) {
 const checkTimers = new Map();
 function checkSoon(sw) {
   if (sw.stopped || checkTimers.has(sw.name) || !Daemon.swarmCheck) return;
-  checkTimers.set(sw.name, setTimeout(() => { checkTimers.delete(sw.name); Daemon.swarmCheck(sw.name).catch((e) => Daemon.log?.(`budget check ${sw.name}: ${e?.message ?? e}`)); }, 5000));
+  // A share it passed is a new board line, which no agent's event may follow: the board is read for it.
+  checkTimers.set(sw.name, setTimeout(() => { checkTimers.delete(sw.name); Daemon.swarmCheck(sw.name).then((r) => { if (r?.budget) boardSoon(sw); }, (e) => Daemon.log?.(`budget check ${sw.name}: ${e?.message ?? e}`)); }, 5000));
 }
 // A helper's tokens count in its swarm's, so its finished turn is accounted as a member's is: its maker,
-// or its maker's maker, is a member.
+// or its maker's maker, is a member, or a member that left, known by its bot id once it is gone.
 function swarmOfHelper(name) {
   let b = bot(name);
-  for (let depth = 0; b && depth < 16; depth++) { const maker = creatorOf(b); if (!maker) return null; const sw = swarmOfBot(maker.name); if (sw) return sw; b = maker; }
+  for (let depth = 0; b && depth < 16; depth++) {
+    for (const sw of S.swarms.values()) if (b.parentId != null && sw.left?.includes(b.parentId)) return sw;
+    const maker = creatorOf(b); if (!maker) return null; const sw = swarmOfBot(maker.name); if (sw) return sw; b = maker;
+  }
   return null;
 }
 const boardTimers = new Map();

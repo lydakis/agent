@@ -908,6 +908,7 @@ async fn enlist(
         }
     }
     let path = dir.to_path_buf();
+    let gone = dropped.clone();
     let joined = tokio::task::spawn_blocking(move || {
         let mut s = Swarm::read(&path)?;
         let gone = |m: &String| dropped.contains(m);
@@ -921,6 +922,23 @@ async fn enlist(
     })
     .await
     .map_err(|e| e.to_string())??;
+    // The agents briefed with them among "the others" hear they are not.
+    if !gone.is_empty() {
+        let left: Vec<&str> = gone.iter().map(|m| joined.short(m)).collect();
+        let others: Vec<&str> = joined.members.iter().map(|m| joined.short(m)).collect();
+        let prompt = format!(
+            "[board] {} did not get the brief and left the swarm; its agents are {}",
+            left.join(", "),
+            others.join(", ")
+        );
+        let told = (made.iter()).filter(|(name, _, _)| joined.members.contains(name));
+        for (name, _, _) in told {
+            let params = json!({
+                "bot": name, "bot_id": joined.ids.get(name), "prompt": prompt, "delivery": "steer",
+            });
+            let _ = client.request("submit", params).await;
+        }
+    }
     Ok((joined, failed))
 }
 
@@ -932,6 +950,29 @@ async fn update_async(
     tokio::task::spawn_blocking(move || update(&dir, change))
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// Delete agents no swarm will hold; the ones that could not be deleted,
+/// each with why.
+async fn strays(client: &Client, made: &[Made]) -> Vec<String> {
+    let mut kept = Vec::new();
+    for (name, _, _) in made {
+        if let Err(error) = client.request("delete", json!({"bot": name})).await {
+            kept.push(format!("{name} ({})", error.code));
+        }
+    }
+    kept
+}
+
+/// Said, not hidden: a bot that outlived its swarm is the user's to delete.
+fn said(mut error: String, kept: &[String]) -> String {
+    if !kept.is_empty() {
+        error.push_str(&format!(
+            "; not deleted, delete by hand: {}",
+            kept.join(", ")
+        ));
+    }
+    error
 }
 
 /// The records of the agents made that are members: one whose brief
@@ -1102,17 +1143,12 @@ pub async fn start(
     // A council fills its seats or does not start: fewer agents than seats
     // would change the majority it was started with.
     if made.len() < swarm.council.max(1) {
-        let mut kept = Vec::new();
-        for (name, _, _) in &made {
-            if let Err(error) = client.request("delete", json!({"bot": name})).await {
-                kept.push(format!("{name} ({})", error.code));
-            }
-        }
+        let kept = strays(client, &made).await;
         let _ = discard(&dir, &swarm, start.shared).await;
         let why = failed
             .first()
             .map_or_else(String::new, |(_, e)| e.to_string());
-        let mut error = if made.is_empty() {
+        let error = if made.is_empty() {
             why
         } else {
             format!(
@@ -1121,14 +1157,7 @@ pub async fn start(
                 swarm.council
             )
         };
-        // Said, not hidden: a bot that outlived its swarm is the user's to delete.
-        if !kept.is_empty() {
-            error.push_str(&format!(
-                "; not deleted, delete by hand: {}",
-                kept.join(", ")
-            ));
-        }
-        return Err(error);
+        return Err(said(error, &kept));
     }
     // The budget is what the agents made were given, not what was asked.
     let total = each.saturating_mul(made.len() as u64);
@@ -1146,11 +1175,9 @@ pub async fn start(
         }
         Err(error) => {
             // Agents no swarm holds would be strays: they go with it.
-            for (name, _, _) in &made {
-                let _ = client.request("delete", json!({"bot": name})).await;
-            }
+            let kept = strays(client, &made).await;
             let _ = discard(&dir, &swarm, start.shared).await;
-            return Err(error);
+            return Err(said(error, &kept));
         }
     };
     Ok(json!({
@@ -1178,8 +1205,12 @@ pub async fn add(
     if row >= s.mix.len() {
         return Err(format!("invalid_agents: the mix has no row {row}"));
     }
+    // Its agents' share of the budget went with them.
+    if s.members.is_empty() {
+        return Err("swarm_empty: every agent left this swarm; start a new one".into());
+    }
     let policies = policies(&s, std::iter::once(row))?;
-    let each = (s.budget_tokens / s.members.len().max(1) as u64).max(1);
+    let each = s.budget_tokens / s.members.len() as u64;
     let mut n = s.made + 1;
     let made = loop {
         let name = format!("{}-{n}", s.name);
@@ -1196,10 +1227,8 @@ pub async fn add(
         Ok(enlisted) => enlisted,
         Err(error) => {
             // Stopped meanwhile: the agent it was made for would be a stray.
-            for (name, _, _) in &made {
-                let _ = client.request("delete", json!({"bot": name})).await;
-            }
-            return Err(error);
+            let kept = strays(client, &made).await;
+            return Err(said(error, &kept));
         }
     };
     Ok(json!({
@@ -1531,13 +1560,20 @@ fn brief(swarm: &Swarm, dir: &Path, member: &str, late: bool) -> String {
 /// vanishing.
 pub fn board(root: &Path, swarm: &str, offset: Option<u64>) -> Result<Value, String> {
     let dir = folder(root, swarm)?;
-    // A change a crash cut short is settled before its lines or state are read.
-    if dir.join(PENDING).exists() {
+    let path = dir.join("board.jsonl");
+    let mut file = std::fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    // The state and the lines are read under a shared lock, which no change
+    // holds while it writes them, so they always agree. A change a crash cut
+    // short is settled first.
+    loop {
+        file.lock_shared().map_err(|e| e.to_string())?;
+        if !dir.join(PENDING).exists() {
+            break;
+        }
+        file.unlock().map_err(|e| e.to_string())?;
         recover(&lock_board(&dir)?, &dir)?;
     }
     let state = State::read(&dir)?;
-    let path = dir.join("board.jsonl");
-    let mut file = std::fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let size = file.metadata().map_err(|e| e.to_string())?.len();
     // Shorter than we read before means someone rewrote it: read it again.
     let (mut start, reset) = match offset {
@@ -2422,6 +2458,10 @@ pub async fn act(
     }
     // Your post resumes a stopped swarm, once it is on the board.
     let resumed = author.is_none() && s.stopped && matches!(act, Act::Post { .. });
+    if resumed {
+        // One the board would refuse leaves it stopped.
+        plan(&s, &mut State::read(&dir)?, None, act.clone(), now_ms())?;
+    }
     s.stopped &= !resumed;
     let bot = author.as_ref().map(|a| a.bot.as_str());
     // A swarm you stopped keeps what you decided on the board, and tells
@@ -3730,6 +3770,13 @@ mod tests {
             .collect();
         assert_eq!(shown, [&json!("p.brief-1")]);
         assert!(fake.ops("delete").iter().any(|d| d["bot"] == "p.brief-2"));
+        // The agent briefed with it among the others hears that it left.
+        let told = fake.ops("submit").pop().unwrap();
+        assert_eq!(told["bot"], "p.brief-1");
+        assert_eq!(
+            told["prompt"],
+            "[board] brief-2 did not get the brief and left the swarm; its agents are brief-1"
+        );
         // A council that cannot fill its three seats does not start, and its agents go.
         let mut council = start("seat", vec![0, 0, 0], mix.clone());
         council.council = 3;
@@ -3821,6 +3868,12 @@ mod tests {
             json!([agent(1), agent(2), agent(5)])
         );
         assert_eq!(out["swarm"]["budget_tokens"], 4_500_000);
+        // A swarm every agent left has no share to give a new one.
+        for n in [1, 2, 5] {
+            leave(&root, &s.name, &agent(n)).unwrap();
+        }
+        let empty = rt.block_on(add(&client, &root, &s.name, 0)).unwrap_err();
+        assert!(empty.starts_with("swarm_empty"), "{empty}");
         std::fs::remove_dir_all(home).unwrap();
     }
 
@@ -4127,6 +4180,16 @@ mod tests {
         );
         assert!(Swarm::read(&dir).unwrap().stopped);
         listing.store(true, std::sync::atomic::Ordering::Relaxed);
+        // So does one the board refuses.
+        let empty = Act::Post {
+            text: " ".into(),
+            all: true,
+        };
+        let refused = rt
+            .block_on(act(&client, &root, &s.name, None, empty))
+            .unwrap_err();
+        assert!(refused.starts_with("post_empty"), "{refused}");
+        assert!(Swarm::read(&dir).unwrap().stopped);
         rt.block_on(act(&client, &root, &s.name, None, post()))
             .unwrap();
         assert!(!Swarm::read(&dir).unwrap().stopped);

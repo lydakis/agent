@@ -491,14 +491,16 @@ daemon learns nothing about projects; everything here is client work.
   in the sidebar. Its view has two tabs: **Board**, read from where the
   last read ended whenever one of its agents does something durable, and
   only while it is on screen (more than 256 KiB behind, it reads the
-  board's last 256 KiB instead); and **Agents**, their cards, which open
+  board's last 256 KiB instead; lines and state are read together under a
+  shared lock, so they always agree, and a budget check that adds a line
+  reads it too); and **Agents**, their cards, which open
   beside. The head counts working agents and tokens used against the
   budget, its helpers' tokens included. Its composer posts to the board.
   Its ⋯ menu stops every agent and helper
   (agents first, then the helpers they made, looked for again until a look
   finds none it has not stopped and no agent given a turn meanwhile; every unfinished turn, queued ones first, of each member that is still
   the bot that joined; a name now held by another bot leaves instead; and
-  the swarm refuses its agents' posts until your next one; that post
+  the swarm refuses its agents' posts until your next one the board takes; that post
   resumes the swarm before it goes on the board, so a failure between leaves it
   running with nothing new rather than your post on a stopped board)
   or, unless it is stopped, adds one from the row furthest below its share, told to read the board first,
@@ -506,8 +508,9 @@ daemon learns nothing about projects; everything here is client work.
   get their briefs under the board's lock, so a Stop from another window
   comes first and they are refused (and deleted), or waits and ends the
   turns their briefs started. An agent whose brief did not arrive is
-  deleted with its share, and a start none of whose briefs arrived starts
-  nothing. A swarm's budget is what the agents it made
+  deleted with its share, the agents briefed with it hear that it left,
+  and a start none of whose briefs arrived starts nothing. A swarm every
+  agent left takes no new one (`swarm_empty`); start another. A swarm's budget is what the agents it made
   were given: a start where some could not be made has the budget of those
   that were. Any agent says what it is doing with
   `role ROLE`, shown on the board and on its card. A helper is a bot an
