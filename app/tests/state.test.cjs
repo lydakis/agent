@@ -1283,13 +1283,14 @@ test('a member\'s durable event reads the board only while the swarm is on scree
 test('Stop and Add are one call each; an added agent comes from the row furthest below its share', async () => {
   const calls = [];
   const mix = [{ identity: '', model: 'alpha/one', share: 50 }, { identity: 'reviewer', model: 'beta/two', share: 50 }];
+  const ids = { 'app.latency-1': 3, 'app.latency-2': 4, 'app.latency-3': 5, 'app.latency-4': 9 };
   const members = ['app.latency-1', 'app.latency-2', 'app.latency-3'], rows = { 'app.latency-1': 0, 'app.latency-2': 1, 'app.latency-3': 0 };
   const p = shell({
-    swarmStop: async (swarm) => { calls.push(['stop', swarm]); return { swarm: swarmRecord(members.slice(0, 2), { stopped: true, mix, rows }), failed: [] }; },
-    swarmAdd: async (swarm, row) => { calls.push(['add', swarm, row]); return { swarm: swarmRecord([...members.slice(0, 2), 'app.latency-4'], { mix, rows: { ...rows, 'app.latency-4': row } }), bots: [{ name: 'app.latency-4', id: 9, provider: 'beta', model: 'two' }], failed: [] }; },
+    swarmStop: async (swarm) => { calls.push(['stop', swarm]); return { swarm: swarmRecord(members.slice(0, 2), { stopped: true, mix, rows, ids }), failed: [] }; },
+    swarmAdd: async (swarm, row) => { calls.push(['add', swarm, row]); return { swarm: swarmRecord([...members.slice(0, 2), 'app.latency-4'], { mix, rows: { ...rows, 'app.latency-4': row }, ids }), bots: [{ name: 'app.latency-4', id: 9, provider: 'beta', model: 'two' }], failed: [] }; },
     request: async () => ({ bots: [], next_after: null }),
   });
-  const sw = p.learnSwarm(swarmRecord(members, { mix, rows }));
+  const sw = p.learnSwarm(swarmRecord(members, { mix, rows, ids }));
   await p.stopSwarm(sw);
   assert.equal(sw.stopped, true);
   assert.deepEqual(sw.members, ['app.latency-1', 'app.latency-2']);

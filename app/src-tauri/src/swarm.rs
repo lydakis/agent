@@ -3126,7 +3126,7 @@ mod tests {
         let s = swarm(&[]);
         let dir = claim(&root, &s.name).unwrap();
         fill(&dir, &s, Path::new("/app")).unwrap();
-        join(&root, &s.name, &[("agent.latency-1".into(), 1)], 0).unwrap();
+        enrol(&root, &s.name, &[("agent.latency-1".into(), 1)], 0).unwrap();
         let path = dir.join("swarm.toml");
         let text = std::fs::read_to_string(&path).unwrap();
         std::fs::write(&path, text.replace("\"agent.latency-1\" = 1", "")).unwrap();
