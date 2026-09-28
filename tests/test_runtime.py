@@ -1,4 +1,5 @@
 """Actual Rust process, disk recovery, provider transport, and tool loop."""
+from contextlib import closing
 import hashlib
 import http.server
 import json
@@ -642,7 +643,7 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class AnthropicRuntimeTests(unittest.TestCase):
-    def start(self, extra=()):
+    def start(self, extra=(), settings=None):
         root = Path(__file__).resolve().parent.parent
         temp = tempfile.TemporaryDirectory(dir=root / '.local')
         self.addCleanup(temp.cleanup)
@@ -657,12 +658,12 @@ class AnthropicRuntimeTests(unittest.TestCase):
         client = Client(root / '.local/target/release/agent', path / 'state.sqlite',
                         f'http://127.0.0.1:{model.server_port}/v1', 'echo,shell', model='synthetic-claude',
                         key_env='ANTHROPIC_TEST_KEY', env=env, provider='anthropic', family='anthropic',
-                        extra=extra)
+                        extra=extra, settings=settings)
         self.addCleanup(client.close)
         return client, model, path
 
     def test_a_long_tool_call_keeps_the_prompt_cache_warm(self):
-        client, model, path = self.start(extra=('--keep-warm', '1'))
+        client, model, path = self.start(settings={'keep_warm': 1})
         client.request('create', bot='Bob', workspace=str(path), reasoning='low')
         turn = client.request('submit', bot='Bob', request_id='w1', prompt='shell:sleep 2.5')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
@@ -688,7 +689,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertGreaterEqual(sent[2] - sent[1], 900)
 
     def test_a_long_reply_keeps_its_own_prompt_cache_warm(self):
-        client, model, path = self.start(extra=('--keep-warm', '1'))
+        client, model, path = self.start(settings={'keep_warm': 1})
         model.generate_delay = 2.5
         client.request('create', bot='Bob', workspace=str(path), reasoning='low')
         turn = client.request('submit', bot='Bob', request_id='g1', prompt='long')['result']['turn']
@@ -706,7 +707,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertEqual([u.get('purpose') for u in usage], ['keep_warm', 'keep_warm', None])
 
     def test_a_refresh_in_flight_when_the_reply_ends_carries_into_the_tool(self):
-        client, model, path = self.start(extra=('--keep-warm', '1'))
+        client, model, path = self.start(settings={'keep_warm': 1})
         model.generate_delay = 1.5
         model.warm_delay = 1
         client.request('create', bot='Bob', workspace=str(path), reasoning='low')
@@ -723,7 +724,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertEqual([u.get('purpose') for u in usage], [None, 'keep_warm', None])
 
     def test_the_last_replys_refresh_counts_before_a_steer_joins_the_turn(self):
-        client, model, path = self.start(extra=('--keep-warm', '1'))
+        client, model, path = self.start(settings={'keep_warm': 1})
         model.generate_delay = 1.5
         model.warm_delay = 1
         # The call bills 14 tokens (5 + 2 cached in, 7 out) and its refresh 9.
@@ -744,7 +745,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
     def test_a_call_waiting_to_be_sent_is_refreshed_only_from_its_send(self):
         # One request may start at a time and Ann's waits for its headers,
         # so Bob's call waits to be sent; its cache exists only from then.
-        client, model, path = self.start(extra=('--keep-warm', '1', '--max-connecting', '1'))
+        client, model, path = self.start(extra=('--max-connecting', '1'), settings={'keep_warm': 1})
         model.hold_delay = 2.5
         model.generate_delay = 1.5
         model.arrivals = []
@@ -763,7 +764,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertGreaterEqual(warms[0][0] - sent, 0.9)
 
     def test_a_refused_refresh_ends_the_refreshes_but_not_the_turn(self):
-        client, model, path = self.start(extra=('--keep-warm', '1'))
+        client, model, path = self.start(settings={'keep_warm': 1})
         model.refuse_warm = True
         client.request('create', bot='Bob', workspace=str(path), reasoning='low')
         turn = client.request('submit', bot='Bob', request_id='w1', prompt='shell:sleep 2.5')['result']['turn']
@@ -776,7 +777,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertEqual(len(warms), 1)
 
     def test_a_refresh_sent_before_the_tool_ends_is_still_recorded(self):
-        client, model, path = self.start(extra=('--keep-warm', '1'))
+        client, model, path = self.start(settings={'keep_warm': 1})
         model.warm_delay = 1
         client.request('create', bot='Bob', workspace=str(path), reasoning='low')
         turn = client.request('submit', bot='Bob', request_id='w1', prompt='shell:sleep 1.5')['result']['turn']
@@ -785,7 +786,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertEqual([u.get('purpose') for u in usage], [None, 'keep_warm', None])
 
     def test_an_interrupt_still_records_a_refresh_already_sent(self):
-        client, model, path = self.start(extra=('--keep-warm', '1'))
+        client, model, path = self.start(settings={'keep_warm': 1})
         model.warm_delay = 1.5
         client.request('create', bot='Bob', workspace=str(path), reasoning='low')
         turn = client.request('submit', bot='Bob', request_id='i1', prompt='shell:sleep 10')['result']['turn']
@@ -798,7 +799,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertEqual(call['max_tokens'] > 0, True)
 
     def test_an_hour_long_cache_is_marked_priced_apart_and_not_refreshed(self):
-        client, model, path = self.start(extra=('--keep-warm', '1', '--cache-ttl', '1h'))
+        client, model, path = self.start(settings={'keep_warm': 1, 'cache_ttl': '1h'})
         model.cache_control = {'type': 'ephemeral', 'ttl': '1h'}
         # A report without the per-lifetime split: every write is an hour's.
         model.start_usage = {'cache_creation_input_tokens': 3}
@@ -923,8 +924,8 @@ class ModelFixture(unittest.TestCase):
         self.binary = root / '.local/target/release/agent'
         self.url = f'http://127.0.0.1:{self.model.server_port}/v1'
 
-    def client(self, tools="echo", extra=()):
-        client = Client(self.binary, self.path / 'state.sqlite', self.url, tools, extra=extra)
+    def client(self, tools="echo", extra=(), settings=None):
+        client = Client(self.binary, self.path / 'state.sqlite', self.url, tools, extra=extra, settings=settings)
         self.addCleanup(client.close)
         return client
 
@@ -1649,7 +1650,7 @@ class RuntimeTests(ModelFixture):
         self.assertTrue(all(self.model.auth_checks))
 
     def test_history_pages_recover_an_omitted_long_message(self):
-        client = self.client(tools='echo,history', extra=('--context-items', '6'))
+        client = self.client(tools='echo,history', settings={'context_items': 6})
         client.request('create', bot='Bob', workspace=str(self.path))
         prompt = 'é🦀"\\' * 9000 + ' final fact'
         reasoning = {'type': 'reasoning', 'id': 'rs_history',
@@ -1665,7 +1666,11 @@ class RuntimeTests(ModelFixture):
         self.assertIn(reasoning, seed_requests[1]['input'])
         client.request('shutdown')
         client.close()
-        client = self.client(tools='echo,history', extra=('--context-items', '6', '--context-bytes', '65536'))
+        # Cut Bob's stored budget below the long message; settings are fixed
+        # at creation, so the test edits the store.
+        with closing(sqlite3.connect(self.path / 'state.sqlite')) as db, db:
+            db.execute('''UPDATE bots SET settings='{"context_items":6,"context_bytes":65536}' WHERE name='Bob' ''')
+        client = self.client(tools='echo,history')
         offset, pieces, completed_items = 0, [], 0
         while True:
             while not self.model.requests.empty():
@@ -1702,7 +1707,7 @@ class RuntimeTests(ModelFixture):
         self.assertEqual(records[2]['content'][0]['text'], 'reply:' + prompt)
 
     def test_long_history_is_windowed_at_turn_boundaries_and_readable_by_ordinal(self):
-        client = self.client(tools='echo,history', extra=('--context-items', '6'))
+        client = self.client(tools='echo,history', settings={'context_items': 6})
         client.request('create', bot='Bob', workspace=str(self.path))
         for n in range(1, 6):
             turn = client.request('submit', bot='Bob', request_id=f'p{n}', prompt=f'p{n}')['result']['turn']
@@ -1743,7 +1748,7 @@ class RuntimeTests(ModelFixture):
         self.assertTrue(requests[-2]['input'][0]['content'][0]['text'].startswith('[context note]'))
 
     def test_retention_prunes_records_and_deletes_idle_bots(self):
-        client = self.client(extra=('--retain-turns', '2'))
+        client = self.client(settings={'retain_turns': 2})
         client.request('create', bot='Bob', workspace=str(self.path))
         for n in range(4):
             turn = client.request('submit', bot='Bob', request_id=str(n), prompt=f'p{n}')['result']['turn']
@@ -1777,7 +1782,7 @@ class RuntimeTests(ModelFixture):
         self.assertEqual(client.request('bots')['result']['bots'], [])
 
     def test_retention_preserves_background_completion_and_stale_turn_identity(self):
-        client = self.client(tools='shell,wait', extra=('--retain-turns', '1'))
+        client = self.client(tools='shell,wait', settings={'retain_turns': 1})
         client.request('create', bot='Bob', workspace=str(self.path))
         old = client.request('submit', bot='Bob', request_id='bg',
                              prompt='bg:while [ ! -f release ]; do sleep .01; done; printf done')['result']['turn']
@@ -1796,7 +1801,7 @@ class RuntimeTests(ModelFixture):
         self.assertIn('result', client.request('delete', bot='Bob'))
         client.request('shutdown')
         client.close()
-        client = self.client(tools='shell,wait', extra=('--retain-turns', '1'))
+        client = self.client(tools='shell,wait', settings={'retain_turns': 1})
         for index in range(10):
             client.request('create', bot='Bob', workspace=str(self.path))
             new = client.request('submit', bot='Bob', request_id='r', prompt='replacement')['result']['turn']

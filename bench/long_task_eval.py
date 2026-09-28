@@ -962,7 +962,7 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
     budget = context_bytes or budget
     root = Path(tempfile.mkdtemp(prefix=f'long-task-{condition}-', dir=out_dir))
     client = Client(binary, root / 'state.sqlite', url, tools=tools, model=model, key_env=key_env, env=env,
-                    provider=provider, family=family, extra=('--context-bytes', str(budget)))
+                    provider=provider, family=family, settings={'context_bytes': budget})
     results = {}
     try:
         names = [f'{condition}-{n}' for n in range(trials)]

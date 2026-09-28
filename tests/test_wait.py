@@ -34,7 +34,7 @@ class WaitTests(ModelFixture):
         client.request('interrupt', bot='Alice', turn=slow['turn'])
 
     def test_retention_applies_when_parked_turns_are_interrupted(self):
-        client = self.client('wait', extra=('--retain-turns', '1'))
+        client = self.client('wait', settings={'retain_turns': 1})
         for bot in ('Alice', 'Bob'):
             client.request('create', bot=bot, workspace=str(self.path))
         alice = client.request('submit', bot='Alice', request_id='a', prompt='wait')['result']['turn']

@@ -348,7 +348,7 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   approver's text, or null. The model sees it and the turn continues, as
   with any tool failure. The daemon writes the code and nothing else.
 - **A short wait stays live; a long one parks.** A gated call whose verdict
-  has not arrived waits in memory for `--approval-hold-ms` (proposed default
+  has not arrived waits in memory for its bot's `approval_hold_ms` (default
   2,000). After that the turn parks the way `wait` does: one `suspend`
   commit, no task, no active slot, restart-safe. A verdict for a parked turn
   is committed when it arrives, and resumes the turn only if the turn is
@@ -904,7 +904,7 @@ as one.
    [`bench.approval_overhead`](../bench/approval_overhead.py), before the
    rules approver exists, so with no path resolution: the approver is the
    screen itself, answering `allow` as soon as a call is announced
-   (`held`) or, with `--approval-hold-ms 0`, after the turn parks
+   (`held`) or, with an `approval_hold_ms` of 0, after the turn parks
    (`parked`). Each turn is one synthetic `shell` call (`true`) and a
    reply, on a fresh store, against the same turn ungated and against
    main at `ddf3f8b`, with within-turn compaction; the build measured is

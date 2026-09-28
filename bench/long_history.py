@@ -72,10 +72,10 @@ def run(binary, out, items, context_bytes, context_items):
     server.seen, server.daemon_threads = [], True
     threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f'http://127.0.0.1:{server.server_port}/v1'
-    extra = ('--context-bytes', str(context_bytes), '--context-items', str(context_items))
+    settings = {'context_bytes': context_bytes, 'context_items': context_items}
 
     def client():
-        return Client(binary, store, url, 'echo,history', extra=extra)
+        return Client(binary, store, url, 'echo,history', settings=settings)
 
     def turn(c, bot, request_id, prompt):
         turn_id = c.request('submit', bot=bot, request_id=request_id, prompt=prompt, workspace=str(out))['result']['turn']

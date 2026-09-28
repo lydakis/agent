@@ -26,8 +26,7 @@ def run(binary, out, boundaries):
     completed, samples = 0, []
     try:
         for boundary in boundaries:
-            client = Client(binary, store, url, 'shell', extra=(
-                '--retain-turns', '4', '--context-bytes', '524288'))
+            client = Client(binary, store, url, 'shell', settings={'retain_turns': 4, 'context_bytes': 524288})
             if completed == 0:
                 for n in range(16):
                     response = client.request('create', bot=f'b{n}', workspace=str(out))

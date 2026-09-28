@@ -75,8 +75,7 @@ class Soak:
 
     # ---- daemon ----
     def daemon(self):
-        extra = ('--socket', str(self.socket), '--max-active', '256', '--context-bytes', str(512 * 1024),
-                 '--compact-at', '50', '--compact-keep', '25', '--retain-turns', '12')
+        extra = ('--socket', str(self.socket), '--max-active', '256')
         # A socket daemon answers on the socket; the stdio handle only owns the process.
         self.client = Client(self.binary, self.store, self.url, 'shell,read,write,edit,wait,history',
                              extra=extra)
@@ -84,6 +83,9 @@ class Soak:
         self.control = Connection(self.socket, retain_durable=False)
         self.connections.append(self.control)
         self.control.tools = ['shell', 'read', 'write', 'edit', 'wait', 'history']
+        # Every bot's context, compaction and retention.
+        self.control.settings = {'context_bytes': 512 * 1024, 'compact_at': 50, 'compact_keep': 25,
+                                 'retain_turns': 12}
         self.events = Connection(self.socket, retain_durable=False)
         self.connections.append(self.events)
         return self.control

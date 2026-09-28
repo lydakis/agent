@@ -301,7 +301,7 @@ The UI bounds payload buffering, history decoding, and rendered fleet rows:
 
 - **Attach** replays events from the page's cursor, which on a first start is
   the beginning of the daemon's retained log. That log is bounded by the
-  daemon's retention (`--retain-turns`, `prune`), and a `pruned` notice marks
+  daemon's retention (each bot's `retain_turns`, `prune`), and a `pruned` notice marks
   the gap. Nothing is staged on the way: the page pulls the replay a batch
   at a time and applies each before the next, so the transport's 4,096-event / 8 MiB encoded
   queue is the buffer between the daemon and the screen, and pulls also stop at 1 MiB (plus one event). A page
@@ -439,7 +439,7 @@ This measures the ancestry-walk reduction, not an end-to-end fleet capacity clai
 Pulled event batches apply in order, with one visible-history load and render
 per batch. Creation/fork bursts rebuild the fleet tree at most once per pull,
 while retaining the 300-row rail window. The shared client rejects a ready
-handshake unless its protocol is exactly 3.
+handshake unless its protocol is exactly `agent_client::PROTOCOL`, now 4.
 
 The lifecycle regression suite compares committed thinking/answer transcripts
 between live delivery and replay, reconciles fork snapshot/replay ordering,

@@ -18,6 +18,10 @@ from bench.socket_client import Connection, SocketClient
 from bench.targets import clean_env
 from tests.test_runtime import Model, ModelFixture
 
+# The socket protocol version a daemon of this build announces in `ready`.
+PROTOCOL = int(re.search(r'pub const PROTOCOL: u64 = (\d+);',
+                         (Path(__file__).parent.parent/'client/src/lib.rs').read_text()).group(1))
+
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class SocketAndCliTests(ModelFixture):
@@ -329,13 +333,16 @@ class SocketAndCliTests(ModelFixture):
                              (('--provider', f'openai=responses-ws,{self.url}'), 'over websocket but daemon has'),
                              (('--max-processes', '3'), '--max-processes'),
                              (('--max-detached', '2'), '--max-detached'),
-                             (('--max-pending', '5'), '--max-pending'),
-                             (('--note-turns', '5'), '--note-turns'),
-                             (('--retain-turns', '2'), '--retain-turns')):
+                             (('--max-pending', '5'), '--max-pending')):
             refused = attempt(*flags)
             self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
             self.assertIn('daemon_configuration_mismatch', refused.stderr)
             self.assertIn(named, refused.stderr)
+        # A bot's settings are its own, chosen when it is made.
+        kept = attempt('--note-turns', '5', '--retain-turns', '2')
+        self.assertEqual(kept.returncode, 2, kept.stdout + kept.stderr)
+        self.assertIn("--note-turns, --retain-turns set a new bot's settings; an existing bot keeps its own",
+                      kept.stderr)
         # The daemon has no model of its own: --model belongs to run alone.
         stats = self.agent('stats', '--store', str(self.store), '--model', 'openai/other', check=False)
         self.assertEqual(stats.returncode, 2)
@@ -351,21 +358,31 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual(json.loads(self.agent('turns', '--store', str(self.store), '--bot', 'Bob').stdout)[0]['status'],
                          'completed')
 
-    def test_normalized_daemon_limits_match_on_startup_and_attach(self):
-        flags = ['--idle-exit', '0', '--context-bytes', '512', '--context-items', '1', '--stall-timeout', '30',
-                 '--keep-warm', '0', '--cache-ttl', '1h']
-        self.agent('run', *self.common, *flags, '--new', '--bot', 'Bob', 'hi')
+    def test_daemon_limits_match_on_startup_and_attach_and_bots_keep_their_settings(self):
+        flags = ['--idle-exit', '0', '--stall-timeout', '30']
+        self.agent('run', *self.common, *flags, '--context-bytes', '1024', '--context-items', '2',
+                   '--keep-warm', '0', '--cache-ttl', '1h', '--new', '--bot', 'Bob', 'hi')
         self.agent('run', *self.again, *flags, '--bot', 'Bob', 'again')
-        self.agent('run', *self.again, '--context-bytes', '1024', '--context-items', '2',
-                   '--bot', 'Bob', 'effective')
+        control = Connection(self.socket)
+        self.addCleanup(control.close)
+        settings = control.request('resume', bot='Bob')['result']['settings']
+        self.assertEqual((settings['context_bytes'], settings['context_items'], settings['compact_at'],
+                          settings['keep_warm'], settings['cache_ttl'], settings['max_output_tokens']),
+                         (1024, 2, 75, 0, '1h', None))
+        # The daemon checks each setting's range and creates nothing it refuses.
+        small = self.agent('run', *self.common, '--context-bytes', '512', '--new', '--bot', 'Small', 'hi', check=False)
+        self.assertEqual(small.returncode, 1)
+        self.assertIn('invalid_setting: context_bytes is at least 1024', small.stderr)
+        self.assertEqual(control.request('resume', bot='Small')['error'], 'bot_not_found')
         refused = self.agent('stats', '--store', str(self.store), '--idle-exit', '1', check=False)
         self.assertIn('daemon_configuration_mismatch', refused.stderr)
         refused = self.agent('stats', '--store', str(self.store), '--stall-timeout', '120', check=False)
         self.assertIn('--stall-timeout: requested 120 but daemon has 30', refused.stderr)
-        refused = self.agent('stats', '--store', str(self.store), '--keep-warm', '240', check=False)
-        self.assertIn('--keep-warm: requested 240 but daemon has 0', refused.stderr)
-        refused = self.agent('stats', '--store', str(self.store), '--cache-ttl', '5m', check=False)
-        self.assertIn('--cache-ttl: requested 5m but daemon has 1h', refused.stderr)
+        # How a bot calls its model is chosen when it is made, not by the daemon.
+        for flag, value in (('--keep-warm', '240'), ('--cache-ttl', '5m'), ('--max-output-tokens', '4096')):
+            refused = self.agent('stats', '--store', str(self.store), flag, value, check=False)
+            self.assertEqual(refused.returncode, 2)
+            self.assertIn(f'does not accept {flag}', refused.stderr)
 
     def test_help_and_invalid_flags_do_not_start_a_daemon(self):
         for args in [('--help',), ('-h',), ('help', 'run')]+[(c, '--help') for c in
@@ -387,7 +404,7 @@ class SocketAndCliTests(ModelFixture):
             ('run', '--stall-timeout', '86401', 'hi'),
             ('run', '--keep-warm', '300', 'hi'),
             ('run', '--cache-ttl', '2h', 'hi'),
-            ('serve', '--context-items', '0'),
+            ('run', '--new', '--context-items', '0', 'hi'),
             ('follow', '--after=-1', '--all'),
         ]
         for args in invalid:
@@ -554,10 +571,10 @@ class SocketAndCliTests(ModelFixture):
         with sockets.socket(sockets.AF_UNIX) as sock:
             sock.connect(str(self.socket))
             ready = json.loads(sock.makefile('r').readline())
-        self.assertTrue({'processes', 'active', 'connecting', 'connections', 'output_tokens', 'idle_exit_seconds'} <= set(ready['limits']))
+        self.assertTrue({'processes', 'active', 'connecting', 'connections', 'idle_exit_seconds'} <= set(ready['limits']))
         self.assertEqual(ready['limits']['stall_timeout_seconds'], 120)
-        self.assertEqual(ready['limits']['keep_warm_seconds'], 240)
-        self.assertEqual(ready['limits']['cache_ttl'], '5m')
+        # How a bot calls its model is its own setting, not the daemon's.
+        self.assertFalse({'output_tokens', 'keep_warm_seconds', 'cache_ttl'} & set(ready['limits']))
         self.assertEqual(ready['limits']['connections'], -(-ready['limits']['active'] // 64))
 
     def test_burst_eviction_exits_client_and_replay_recovers_terminal_event(self):
@@ -789,7 +806,7 @@ class CliTests(ModelFixture):
                                 with peer.makefile('rb') as reader:
                                     def send(*events):
                                         peer.sendall(b''.join((json.dumps(event)+'\n').encode() for event in events))
-                                    send(dict(event='ready', protocol=3))
+                                    send(dict(event='ready', protocol=PROTOCOL))
                                     request = json.loads(reader.readline())
                                     if request['op'] == 'resume':
                                         # Snapshot while active, then finish before subscription.
@@ -931,6 +948,29 @@ class CliTests(ModelFixture):
         # bytes must not reset the overall deadline like an idle timeout would.
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             list(pool.map(lambda args: check(*args), [('run', False), ('ls', True)]))
+
+    def test_cli_refuses_a_daemon_of_another_protocol(self):
+        # `start` and `run` would otherwise start a daemon of their own
+        # beside the one that answered.
+        for command in (['ls'], ['start', '--provider', 'openai=responses,http://127.0.0.1:9/v1']):
+            with self.subTest(command=command[0]), tempfile.TemporaryDirectory(dir='/tmp') as directory:
+                path = Path(directory)/'daemon.sock'
+                with socket.socket(socket.AF_UNIX) as listener:
+                    listener.bind(str(path))
+                    listener.listen(1)
+                    listener.settimeout(3)
+                    process = subprocess.Popen([str(self.binary), *command, '--store', str(Path(directory)/'state.db'),
+                                                '--socket', str(path)],
+                                               env=clean_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    try:
+                        with listener.accept()[0] as peer:
+                            peer.sendall((json.dumps(dict(event='ready', protocol=PROTOCOL - 1))+'\n').encode())
+                            _, stderr = process.communicate(timeout=5)
+                        self.assertEqual(process.returncode, 1)
+                        self.assertIn(b'daemon_protocol_mismatch', stderr)
+                        self.assertFalse((Path(directory)/'state.db').exists())
+                    finally:
+                        self.stop_process(process)
 
     def test_explicit_store_overrides_inherited_socket(self):
         client = SocketClient(self.binary, self.path/'first.db', self.url, 'echo')

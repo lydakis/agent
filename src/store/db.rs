@@ -104,6 +104,9 @@ pub struct Bot {
     /// refusal reports it.
     #[serde(skip)]
     pub fork_point: Option<i64>,
+    /// Its context, history and approval settings, reported as they apply.
+    #[serde(serialize_with = "resolved_settings")]
+    pub settings: Settings,
 }
 /// A bot's denials under one gate tag: how many in a row, reset when a call
 /// every gate allowed starts, and how many in the turn that gave the last.
@@ -120,6 +123,144 @@ impl Denials {
         let in_turn = if self.turn == turn { self.in_turn } else { 0 };
         json!({"in_row":self.in_row,"in_turn":in_turn})
     }
+}
+/// What a bot chose at creation about its model context, its history and
+/// its approvals. `None` takes the runtime's default; a fork keeps its
+/// source's. Stored as given, so a bot that chose nothing follows the
+/// defaults.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Settings {
+    /// Model context per request: the newest turns within these bounds, in
+    /// encoded bytes and items, pinned context included. Stored history
+    /// itself is unbounded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_items: Option<usize>,
+    /// Omitted turns the context note lists, newest first; zero lists none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note_turns: Option<usize>,
+    /// Compaction threshold and verbatim tail, as percentages of the context.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compact_at: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compact_keep: Option<usize>,
+    /// After each of its turns finishes, prune the bot to this many turns'
+    /// records; none keeps them until an explicit `prune`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retain_turns: Option<usize>,
+    /// Milliseconds a gated call waits live for its verdict before its turn
+    /// parks; zero parks at once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_hold_ms: Option<u64>,
+    /// Generated tokens per model call, reasoning included; none takes the
+    /// model's own limit on Anthropic and sends no bound on Responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    /// Seconds an Anthropic prompt cache may sit unread during a tool call
+    /// before it is refreshed; zero never refreshes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_warm: Option<u64>,
+    /// Anthropic prompt-cache lifetime.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_ttl: Option<CacheTtl>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Serialize)]
+pub enum CacheTtl {
+    #[serde(rename = "5m")]
+    Minutes,
+    #[serde(rename = "1h")]
+    Hour,
+}
+const MIN_CONTEXT_BYTES: usize = 1024;
+const MIN_CONTEXT_ITEMS: usize = 2;
+impl Settings {
+    pub fn context_bytes(&self) -> usize {
+        self.context_bytes.unwrap_or(8 << 20)
+    }
+    pub fn context_items(&self) -> usize {
+        self.context_items.unwrap_or(4096)
+    }
+    pub fn note_turns(&self) -> usize {
+        self.note_turns.unwrap_or(48)
+    }
+    pub fn compact_at(&self) -> usize {
+        self.compact_at.unwrap_or(75)
+    }
+    pub fn compact_keep(&self) -> usize {
+        self.compact_keep.unwrap_or(25)
+    }
+    pub fn approval_hold_ms(&self) -> u64 {
+        self.approval_hold_ms.unwrap_or(2000)
+    }
+    /// How long a cache may sit unread before a refresh; `None` never.
+    pub fn keep_warm(&self) -> Option<std::time::Duration> {
+        match self.keep_warm {
+            Some(0) => None,
+            Some(seconds) => Some(std::time::Duration::from_secs(seconds)),
+            None => Some(crate::provider::KEEP_WARM),
+        }
+    }
+    pub fn cache_hour(&self) -> bool {
+        self.cache_ttl == Some(CacheTtl::Hour)
+    }
+    /// Refuses a value outside its range, naming the setting and the range.
+    pub fn validate(&self) -> Result<()> {
+        let refuse = |detail: &str| fail_with("invalid_setting", detail);
+        if self.context_bytes.is_some_and(|n| n < MIN_CONTEXT_BYTES) {
+            return refuse("context_bytes is at least 1024");
+        }
+        if self.context_items.is_some_and(|n| n < MIN_CONTEXT_ITEMS) {
+            return refuse("context_items is at least 2");
+        }
+        if self.note_turns.is_some_and(|n| n > 1024) {
+            return refuse("note_turns is at most 1024; 0 lists none");
+        }
+        let percent = |n: Option<usize>| n.is_some_and(|n| !(1..=99).contains(&n));
+        if percent(self.compact_at) || percent(self.compact_keep) {
+            return refuse("compact_at and compact_keep are percentages from 1 to 99");
+        }
+        if self.compact_keep() >= self.compact_at() {
+            return refuse("compact_keep is below compact_at");
+        }
+        if self.retain_turns == Some(0) {
+            return refuse("retain_turns is at least 1");
+        }
+        if self.approval_hold_ms.is_some_and(|n| n > 3_600_000) {
+            return refuse("approval_hold_ms is at most 3600000; 0 parks at once");
+        }
+        if self.max_output_tokens == Some(0) {
+            return refuse("max_output_tokens is at least 1");
+        }
+        if self
+            .keep_warm
+            .is_some_and(|n| n >= crate::provider::CACHE_LIFETIME.as_secs())
+        {
+            return refuse("keep_warm is below 300 seconds; 0 never refreshes");
+        }
+        Ok(())
+    }
+    /// Every setting as it applies, defaults included, for clients.
+    pub fn resolved(&self) -> Value {
+        json!({"context_bytes":self.context_bytes(),"context_items":self.context_items(),
+            "note_turns":self.note_turns(),"compact_at":self.compact_at(),
+            "compact_keep":self.compact_keep(),"retain_turns":self.retain_turns,
+            "approval_hold_ms":self.approval_hold_ms(),"max_output_tokens":self.max_output_tokens,
+            "keep_warm":self.keep_warm().map_or(0, |after| after.as_secs()),
+            "cache_ttl":self.cache_ttl.unwrap_or(CacheTtl::Minutes)})
+    }
+    fn stored(&self) -> Result<Option<String>> {
+        Ok((*self != Self::default())
+            .then(|| serde_json::to_string(self))
+            .transpose()?)
+    }
+}
+fn resolved_settings<S: serde::Serializer>(
+    settings: &Settings,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    settings.resolved().serialize(serializer)
 }
 impl Bot {
     /// Whether a call of this tool waits for a verdict. A call the bot may
@@ -174,6 +315,7 @@ pub struct Binding<'a> {
     pub fallbacks: bool,
     /// The bot's own gate; its creator's, if any, is added by the store.
     pub gate: Option<&'a Gate>,
+    pub settings: Settings,
 }
 #[derive(Debug)]
 pub struct Started {
@@ -267,21 +409,16 @@ pub struct Waiting {
     pub handles: Vec<String>,
     pub deadline_ms: Option<u64>,
     /// Resume on the first resolved handle rather than all of them.
-    #[serde(default)]
     pub any: bool,
     /// Tool calls from the same model response that follow the wait.
     pub pending: Vec<ToolCall>,
     /// A rate-limit park's start time. Its deadline is only a wake-up hint;
     /// elapsed waiting is charged when resumed or finished, even after restart.
-    #[serde(default)]
     pub paced_since_ms: Option<i64>,
     /// Retry state of the unfinished model call, separate from turn totals.
-    #[serde(default)]
     pub call_attempts: u32,
-    #[serde(default)]
     pub call_spent_ms: u64,
     /// Which model call to resume; ordinary calls bypass compaction once.
-    #[serde(default)]
     pub compaction: bool,
     /// The provider's sticky-routing token for the turn, so its calls after
     /// the park keep going to the server that holds its cache.
@@ -843,7 +980,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 39;
+    pub const SCHEMA: i32 = 40;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -973,7 +1110,7 @@ impl Database {
                 thinking_from INTEGER NOT NULL DEFAULT 0,
                 thinking_to INTEGER NOT NULL DEFAULT 0,
                 thinking_elided INTEGER NOT NULL DEFAULT 0, gates TEXT, denials TEXT,
-                closed INTEGER, open_calls INTEGER, allowed TEXT);
+                closed INTEGER, open_calls INTEGER, allowed TEXT, settings TEXT);
             CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
             CREATE INDEX IF NOT EXISTS bots_note ON bots(note);
             CREATE INDEX IF NOT EXISTS bots_compaction ON bots(compaction);
@@ -1337,9 +1474,19 @@ impl Database {
                 Some(_) => r.get(33)?,
                 None => r.get(1)?,
             },
+            settings: match r.get::<_, Option<String>>(34)? {
+                None => Settings::default(),
+                Some(text) => serde_json::from_str(&text).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        34,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+            },
         })
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings";
     /// Validate the caller's captured identity in the same transaction that
     /// creates the child. Never resolve a stale shell's name to a new bot.
     fn creator_id(
@@ -1454,6 +1601,7 @@ impl Database {
         {
             return fail("approve_not_in_tools");
         }
+        binding.settings.validate()?;
         let tx = self.conn.savepoint()?;
         let id = identity(&tx)?;
         let created_by_id = Self::creator_id(&tx, binding.created_by, binding.created_by_id)?;
@@ -1463,7 +1611,7 @@ impl Database {
             binding.tools,
         ))?;
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,fallbacks,gates) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,fallbacks,gates,settings) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?)",
             params![
                 name,
                 id,
@@ -1480,7 +1628,8 @@ impl Database {
                 binding.compaction_instructions,
                 binding.compaction_model,
                 binding.fallbacks,
-                gates
+                gates,
+                binding.settings.stored()?
             ],
         )?;
         // The event carries the list record's fields, so a follower can
@@ -5428,7 +5577,7 @@ impl Database {
             &parent.tools,
         ))?;
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,thinking_from,thinking_to,thinking_elided,gates,allowed) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,thinking_from,thinking_to,thinking_elided,gates,allowed,settings) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 name,
                 id,
@@ -5458,7 +5607,8 @@ impl Database {
                 thinking.1.to,
                 thinking.2,
                 gates,
-                allowed.as_ref().map(|allowed| allowed.join(","))
+                allowed.as_ref().map(|allowed| allowed.join(",")),
+                parent.settings.stored()?
             ],
         )?;
         if let Some(node) = checkpoint {
@@ -5778,6 +5928,24 @@ impl Database {
             return fail("bot_not_found");
         }
         self.prune_records(name, keep_turns, protect, 0, Some(Self::RETENTION_PIECE))
+    }
+    /// The bot's own retention, as it chose at creation: after one of its
+    /// turns ends, prune it to its `retain_turns`, if it set one.
+    pub fn retain(&mut self, name: &str, protect: Option<i64>) -> Result<()> {
+        let stored: Option<String> = self
+            .conn
+            .prepare_cached("SELECT settings FROM bots WHERE name=?")?
+            .query_row([name], |r| r.get(0))
+            .optional()?
+            .ok_or(Error::new("bot_not_found"))?;
+        let keep = match stored {
+            Some(text) => serde_json::from_str::<Settings>(&text)?.retain_turns,
+            None => None,
+        };
+        if let Some(keep) = keep {
+            self.prune_records(name, keep, protect, 0, Some(Self::RETENTION_PIECE))?;
+        }
+        Ok(())
     }
     /// One identity-bound piece: the records of up to `limit` prunable turns
     /// after `after`, oldest first. `next_after` names where the next piece
@@ -7246,6 +7414,24 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
                     WHERE e.turn=turns.id AND e.kind='turn_finished');
              UPDATE turns SET workspace=(SELECT workspace FROM bots WHERE name=turns.bot)
              WHERE workspace IS NULL;",
+        )?;
+    }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='settings')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 39 -> 40: a bot's own settings. These were the daemon's flags
+        // before; an existing bot takes the defaults.
+        conn.execute_batch("ALTER TABLE bots ADD COLUMN settings TEXT;")?;
+    }
+    if from < 40 {
+        // A turn parked by an earlier daemon may lack fields added to its
+        // record since; each gets the value that daemon ran it with.
+        conn.execute_batch(
+            "UPDATE turns SET waiting=json_insert(waiting,'$.any',json('false'),
+                '$.call_attempts',0,'$.call_spent_ms',0,'$.compaction',json('false'))
+             WHERE waiting IS NOT NULL;",
         )?;
     }
     Ok(())

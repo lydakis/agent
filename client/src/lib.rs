@@ -60,6 +60,10 @@ impl From<serde_json::Error> for Error {
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// The socket protocol's version in `ready`. The daemon and its clients ship
+/// together, so a client refuses a daemon of any other version.
+pub const PROTOCOL: u64 = 4;
+
 // No await occurs while this lock is held. Synchronous removal makes dropping
 // a request release its registration immediately, without a cleanup task.
 type Pending = Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>>;
@@ -158,7 +162,7 @@ impl Client {
             Some(line) => serde_json::from_str::<Value>(&line)?,
             None => return Err(Error::new("daemon_disconnected")),
         };
-        if ready["event"] != "ready" || ready["protocol"].as_u64() != Some(3) {
+        if ready["event"] != "ready" || ready["protocol"].as_u64() != Some(PROTOCOL) {
             return Err(Error::new("daemon_protocol_mismatch"));
         }
         let pending: Pending = Arc::default();

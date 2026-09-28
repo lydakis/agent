@@ -1,7 +1,9 @@
 """Compaction inside a running turn: one long task summarizes its own
 earlier rounds and finishes, its prompt kept whole."""
+from contextlib import closing
 import json
 import os
+import sqlite3
 from unittest import skipUnless
 from tests.test_runtime import AnthropicModel, ModelFixture, is_summary
 from tests.test_elision import drain, encoded
@@ -24,7 +26,7 @@ class TurnCompactionTests(ModelFixture):
     def test_one_long_turn_crosses_several_compactions_and_finishes(self):
         # Forty rounds in 24 KiB: even as stubs, the turn's own calls and
         # stubs outgrow the budget several times over.
-        client = self.client(tools='shell,read', extra=('--context-bytes', '24576'))
+        client = self.client(tools='shell,read', settings={'context_bytes': 24576})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read'],
                        compaction_instructions='Summarize.')
         turn = client.request('submit', bot='Bob', request_id='1', prompt='long:40')['result']['turn']
@@ -63,7 +65,7 @@ class TurnCompactionTests(ModelFixture):
         # before compaction is due. Without read nothing is elided, so the
         # runtime summarizes the earlier rounds, keeping the prompt, and the
         # turn goes on; with no summarizer instructions it fails.
-        client = self.client(tools='shell', extra=('--context-bytes', '24576', '--compact-at', '99'))
+        client = self.client(tools='shell', settings={'context_bytes': 24576, 'compact_at': 99})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
                        compaction_instructions='Summarize.')
         turn = client.request('submit', bot='Bob', request_id='1', prompt='long:4x250,1x600')['result']['turn']
@@ -95,11 +97,12 @@ class TurnCompactionTests(ModelFixture):
 
     def test_a_turn_resumed_under_a_smaller_budget_takes_several_summary_steps(self):
         # Twelve rounds of about 3 KiB fit 64 KiB; the call after them is
-        # paced, and the daemon restarts at 12 KiB. The resumed turn cannot
-        # fit, and one summarizer budget covers only a few of its rounds:
-        # the steps go on at that head, extending one version, until the
-        # view fits.
-        client = self.client(tools='shell', extra=('--context-bytes', '65536'))
+        # paced, and the daemon restarts with Bob's stored budget cut to
+        # 12 KiB (settings are fixed at creation, so the test edits the
+        # store). The resumed turn cannot fit, and one summarizer budget
+        # covers only a few of its rounds: the steps go on at that head,
+        # extending one version, until the view fits.
+        client = self.client(tools='shell', settings={'context_bytes': 65536})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
                        compaction_instructions='Summarize.')
         self.model.pace_at = 12
@@ -107,8 +110,9 @@ class TurnCompactionTests(ModelFixture):
         client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn, timeout=30)
         client.close(kill=True)
         drain(self.model)
-        client = Client(self.binary, self.path / 'state.sqlite', self.url,
-                        extra=('--context-bytes', '12288'), tools='shell')
+        with closing(sqlite3.connect(self.path / 'state.sqlite')) as db, db:
+            db.execute('''UPDATE bots SET settings='{"context_bytes":12288}' WHERE name='Bob' ''')
+        client = Client(self.binary, self.path / 'state.sqlite', self.url, tools='shell')
         self.addCleanup(client.close)
         ended = client.finished(turn)
         self.assertEqual(ended['data']['status'], 'completed', ended)
@@ -133,7 +137,7 @@ class AnthropicTurnCompactionTests(ModelFixture):
                         tools='echo,shell,read', provider='anthropic', family='anthropic',
                         model='synthetic-claude', key_env='ANTHROPIC_TEST_KEY',
                         env={**clean_env(), 'ANTHROPIC_TEST_KEY': 'synthetic-anthropic-key'},
-                        extra=('--context-bytes', '24576'))
+                        settings={'context_bytes': 24576})
         self.addCleanup(client.close)
         self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path), reasoning='low',
                                                compaction_instructions='Summarize.'))

@@ -1,6 +1,14 @@
 use agent_client::Client;
 use tokio::{io::AsyncWriteExt, net::UnixListener};
 
+/// The line a daemon of this build opens a session with.
+fn ready_line() -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({"event":"ready","protocol":agent_client::PROTOCOL})
+    )
+}
+
 #[tokio::test]
 async fn readiness_has_a_deadline_and_accepts_a_ready_peer() {
     let path = std::env::temp_dir().join(format!("ac-{}.sock", std::process::id()));
@@ -26,9 +34,7 @@ async fn readiness_has_a_deadline_and_accepts_a_ready_peer() {
         async move { Client::connect(&path).await }
     });
     let (mut peer, _) = listener.accept().await.unwrap();
-    peer.write_all(b"{\"event\":\"ready\",\"protocol\":3}\n")
-        .await
-        .unwrap();
+    peer.write_all(ready_line().as_bytes()).await.unwrap();
     let (client, _) = ready.await.unwrap().unwrap();
     client.close().await;
     std::fs::remove_file(path).unwrap();
@@ -43,9 +49,7 @@ async fn large_event_burst_lags_by_bytes_before_the_count_limit() {
         async move { Client::connect(&path).await }
     });
     let (mut peer, _) = listener.accept().await.unwrap();
-    peer.write_all(b"{\"event\":\"ready\",\"protocol\":3}\n")
-        .await
-        .unwrap();
+    peer.write_all(ready_line().as_bytes()).await.unwrap();
     let (client, mut events) = connecting.await.unwrap().unwrap();
     let writer = tokio::spawn(async move {
         let line = format!(
@@ -111,9 +115,9 @@ async fn readiness_rejects_missing_or_mismatched_protocol_versions() {
     let listener = UnixListener::bind(&path).unwrap();
     for protocol in [
         serde_json::Value::Null,
-        serde_json::json!(2),
-        serde_json::json!(4),
-        serde_json::json!("3"),
+        serde_json::json!(agent_client::PROTOCOL - 1),
+        serde_json::json!(agent_client::PROTOCOL + 1),
+        serde_json::json!(agent_client::PROTOCOL.to_string()),
     ] {
         let connecting = tokio::spawn({
             let path = path.clone();

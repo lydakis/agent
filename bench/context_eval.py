@@ -118,11 +118,11 @@ def run_condition(binary, provider, family, url, key_env, env, model, condition,
         context_bytes = str(omitted_bytes)
     root = Path(tempfile.mkdtemp(prefix=f'context-eval-{condition}-', dir=out_dir))
     store = root / 'state.sqlite'
-    extra = ['--context-bytes', context_bytes, '--context-items', context_items]
+    settings = {'context_bytes': int(context_bytes), 'context_items': int(context_items)}
     if compact_at:
-        extra += ['--compact-at', str(compact_at)]
+        settings['compact_at'] = compact_at
     client = Client(binary, store, url, tools=tools, model=model, key_env=key_env,
-                    env=env, provider=provider, family=family, extra=tuple(extra))
+                    env=env, provider=provider, family=family, settings=settings)
     names = [f'{condition}-{i}' for i in range(bots)]
     results = {name: {'files': [], 'final': None, 'history_calls_final': 0, 'history_calls': 0,
                       'omitted_turns_after_final': None}
@@ -241,7 +241,7 @@ def main():
     parser.add_argument('--tools', default='shell,read,write,edit,history',
                         help='the bots\' tool selection; add note to offer the carry-forward note')
     parser.add_argument('--compaction', action='store_true', help='create bots with the CLI default compaction text')
-    parser.add_argument('--compact-at', type=int, default=None, help='daemon compaction threshold, percent of the context budget')
+    parser.add_argument('--compact-at', type=int, default=None, help="each bot's compaction threshold, percent of its context budget")
     args = parser.parse_args()
     if args.bots < 1 or args.fillers < 0:
         parser.error('--bots must be positive and --fillers nonnegative')

@@ -90,7 +90,7 @@ class ProviderPacingTests(unittest.TestCase):
     def client(self, suffix='', extra=()):
         client = Client(self.binary, self.path/f'store{suffix}.sqlite',
                         f'http://127.0.0.1:{self.server.server_port}/v1',
-                        extra=('--max-output-tokens', '800') + extra)
+                        extra=extra, settings={'max_output_tokens': 800})
         self.addCleanup(client.close, kill=True)
         return client
 

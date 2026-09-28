@@ -135,7 +135,7 @@ bytes per parked turn versus per live process, on the lifecycle screen.
    memory, threads, or open files and no provider rate limit; the store grew
    2.8 KB per turn. Retention is now explicit: `delete` frees a bot and its
    exclusive history, `prune` keeps the newest N turns' records, and
-   `--retain-turns N` applies prune after every turn; see
+   a bot's `retain_turns` setting applies prune after every turn; see
    [RUST_PROTOTYPE.md](RUST_PROTOTYPE.md#retention) and the measured growth in
    [LIVE_FLEET.md](LIVE_FLEET.md#retention-under-sustained-load). What still
    grows per turn is the original transcript. Context compaction does not
@@ -484,7 +484,7 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     - Slice two, done: the [legible omission
       note](DAEMON_MEASUREMENTS.md#the-legible-omission-note). The request
       lists the omitted turns, ordinal and the first line of each prompt,
-      newest first up to `--note-turns`. Data, not an instruction. With the
+      newest first up to `note_turns`. Data, not an instruction. With the
       rule omitted, luna's final file went from 0/6 to 7/7 and half the
       conversations read turn 1 through `history`; the rest acted on the
       examples still in view, which the bare count had not made them do.
@@ -501,7 +501,7 @@ bytes per parked turn versus per live process, on the lifecycle screen.
       would cost prompt-cache prefix stability.
     - Slice four, done: [compaction](DAEMON_MEASUREMENTS.md#compaction).
       Harness-triggered once the turns since the last summary hold
-      `--compact-at` percent of the context budget, at a round boundary: one summarizer call under the client's compaction
+      `compact_at` percent of the context budget, at a round boundary: one summarizer call under the client's compaction
       instructions, the bot's own model or a client-named one of the same
       family, over everything older than a verbatim tail, the covered turns'
       user prompts kept verbatim within bounds, versioned at the head with a

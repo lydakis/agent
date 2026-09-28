@@ -3,8 +3,8 @@ use agent_runtime::{
     codec::Family,
     provider::{ToolCall, Usage},
     store::{
-        Answered, Binding, Bot, CompactionPlan, ContextUsage, Database, Decision, Delivery, Fork,
-        Gate, Gated, Planning, Strip, TurnOptions, Wake,
+        Answered, Binding, Bot, CacheTtl, CompactionPlan, ContextUsage, Database, Decision,
+        Delivery, Fork, Gate, Gated, Planning, Settings, Strip, TurnOptions, Wake,
     },
     tools::Outcome,
 };
@@ -48,6 +48,7 @@ fn binding() -> Binding<'static> {
         compaction_model: None,
         fallbacks: false,
         gate: None,
+        settings: Default::default(),
     }
 }
 /// Compaction planning as a turn runs it: a catch-up walk goes in pieces.
@@ -1811,6 +1812,173 @@ fn schema_39_records_the_folder_each_earlier_turn_ran_in() {
         .unwrap();
     assert_eq!(version, Database::SCHEMA);
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn schema_40_gives_every_existing_bot_the_defaults_and_completes_parked_turns() {
+    let path = std::env::temp_dir().join(format!("agent-settings-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let turn = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        converse(&mut db, "Bob", 1);
+        let turn = db
+            .begin(
+                "Bob",
+                "r2",
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        let (item, w) = call("w");
+        db.append(turn, vec![item], std::slice::from_ref(&w), None)
+            .unwrap();
+        db.tool_start(turn, &w).unwrap();
+        db.suspend(turn, "w", &["turn:Nobody/1".into()], None, false, &[], None)
+            .unwrap();
+        turn
+    };
+    // An earlier daemon parked it before these fields were recorded.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "ALTER TABLE bots DROP COLUMN settings;
+             UPDATE turns SET waiting=json_remove(waiting,'$.any','$.paced_since_ms',
+                '$.call_attempts','$.call_spent_ms','$.compaction') WHERE waiting IS NOT NULL;
+             PRAGMA user_version=39;",
+        )
+        .unwrap();
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert_eq!(db.inspect("Bob").unwrap().settings, Settings::default());
+    let parked = db.waiting_turns().unwrap();
+    assert_eq!(parked.len(), 1);
+    assert_eq!(
+        (
+            parked[0].turn,
+            parked[0].any,
+            parked[0].paced_since_ms,
+            parked[0].call_attempts,
+            parked[0].call_spent_ms,
+            parked[0].compaction
+        ),
+        (turn, false, None, 0, 0, false)
+    );
+    drop(db);
+    let version: i32 = Connection::open(&path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, Database::SCHEMA);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
+    let mut db = db();
+    let settings = Settings {
+        context_bytes: Some(4096),
+        retain_turns: Some(1),
+        keep_warm: Some(0),
+        cache_ttl: Some(CacheTtl::Hour),
+        ..Settings::default()
+    };
+    let (bob, _) = db
+        .create(
+            "Bob",
+            Some("/synthetic"),
+            Binding {
+                settings,
+                ..binding()
+            },
+        )
+        .unwrap();
+    assert_eq!(bob.settings, settings);
+    // Clients read every setting as it applies, defaults included.
+    assert_eq!(
+        serde_json::to_value(&bob).unwrap()["settings"],
+        json!({"context_bytes":4096,"context_items":4096,"note_turns":48,"compact_at":75,
+            "compact_keep":25,"retain_turns":1,"approval_hold_ms":2000,"max_output_tokens":null,
+            "keep_warm":0,"cache_ttl":"1h"})
+    );
+    // Retention follows the bot's own setting.
+    for n in 1..=3 {
+        converse(&mut db, "Bob", n);
+    }
+    db.retain("Bob", None).unwrap();
+    let finished = |db: &Database, bot: &str| {
+        db.events(bot, 0, 256).unwrap()["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["event"] == "turn_finished")
+            .count()
+    };
+    assert_eq!(finished(&db, "Bob"), 1);
+    // A fork is an exact copy, its settings included.
+    let fork = db.fork("Bob", "Fork", Fork::default()).unwrap().0;
+    assert_eq!(fork.settings, settings);
+    // A bot that chose nothing follows the defaults and keeps every turn.
+    db.create("Plain", Some("/synthetic"), binding()).unwrap();
+    for n in 1..=2 {
+        converse(&mut db, "Plain", n);
+    }
+    db.retain("Plain", None).unwrap();
+    assert_eq!(finished(&db, "Plain"), 2);
+    // A value out of range is refused and creates nothing.
+    for settings in [
+        Settings {
+            context_bytes: Some(1023),
+            ..Settings::default()
+        },
+        Settings {
+            context_items: Some(1),
+            ..Settings::default()
+        },
+        Settings {
+            note_turns: Some(1025),
+            ..Settings::default()
+        },
+        Settings {
+            compact_at: Some(100),
+            ..Settings::default()
+        },
+        Settings {
+            compact_keep: Some(80),
+            ..Settings::default()
+        },
+        Settings {
+            retain_turns: Some(0),
+            ..Settings::default()
+        },
+        Settings {
+            approval_hold_ms: Some(3_600_001),
+            ..Settings::default()
+        },
+        Settings {
+            max_output_tokens: Some(0),
+            ..Settings::default()
+        },
+        Settings {
+            keep_warm: Some(300),
+            ..Settings::default()
+        },
+    ] {
+        let refused = db
+            .create(
+                "Bad",
+                Some("/synthetic"),
+                Binding {
+                    settings,
+                    ..binding()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(refused.code, "invalid_setting", "{settings:?}");
+    }
+    assert_eq!(db.inspect("Bad").unwrap_err().code, "bot_not_found");
 }
 
 #[test]

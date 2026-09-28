@@ -41,7 +41,7 @@ def users(request):
 class TurnCompactionAcceptanceTests(ModelFixture):
     def test_compaction_then_reconnect_and_replay_then_a_historical_fork(self):
         daemon = SocketClient(self.binary, self.path / 'state.sqlite', self.url, 'shell,read,echo',
-                              extra=('--context-bytes', str(BUDGET)))
+                              settings={'context_bytes': BUDGET})
         self.addCleanup(daemon.close)
         control = daemon.control
         control.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read', 'echo'],
@@ -140,7 +140,7 @@ class TurnCompactionAcceptanceTests(ModelFixture):
         # recorded round ran once; the next turn's request carries the
         # compaction the store holds, the task's prompt whole, and every
         # call paired with a result.
-        client = self.client(tools='shell,read,echo', extra=('--context-bytes', str(BUDGET)))
+        client = self.client(tools='shell,read,echo', settings={'context_bytes': BUDGET})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read', 'echo'],
                        compaction_instructions='Summarize.')
         client.request('submit', bot='Bob', request_id='1', prompt='long:40')
@@ -148,7 +148,7 @@ class TurnCompactionAcceptanceTests(ModelFixture):
         client.receive(lambda m: m.get('event') == 'tool_completed', timeout=30)
         client.close(kill=True)
         drain(self.model)
-        client = self.client(tools='shell,read,echo', extra=('--context-bytes', str(BUDGET)))
+        client = self.client(tools='shell,read,echo', settings={'context_bytes': BUDGET})
         resumed = client.request('resume', bot='Bob')['result']
         self.assertEqual(resumed['status'], 'interrupted')
         time.sleep(.2)
