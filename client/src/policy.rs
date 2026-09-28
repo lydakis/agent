@@ -380,7 +380,13 @@ fn search(workspace: &Path, kind: Kind) -> Vec<PathBuf> {
     // Visit the winning directory first, so a later directory can only add
     // entries. A budget failure can never be undone by an override.
     let mut dirs = vec![workspace.join(".agents").join(kind.dir())];
-    if let Some(h) = home() {
+    // A workspace that is the home folder is searched once.
+    if let Some(h) = home()
+        && !matches!(
+            (std::fs::canonicalize(&h), std::fs::canonicalize(workspace)),
+            (Ok(a), Ok(b)) if a == b
+        )
+    {
         dirs.push(h.join(".agents").join(kind.dir()));
     }
     dirs
@@ -522,6 +528,16 @@ pub fn profile(workspace: &Path, name: &str) -> Result<Option<Profile>, Failure>
                 path,
             });
         };
+        // An unclosed head would read the whole role as front matter and
+        // start the bot without it.
+        if (text.starts_with("---\n") || text.starts_with("---\r\n"))
+            && !text[3..].contains("\n---")
+        {
+            return Err(Failure::Unreadable {
+                path,
+                reason: "front matter opened with --- is not closed".into(),
+            });
+        }
         return Ok(Some(Profile::parse(name, Some(path), &text)));
     }
     Ok(None)
@@ -849,6 +865,22 @@ mod tests {
             instructions(&root, None).unwrap_err().code(),
             "instructions_unreadable"
         );
+        std::fs::remove_file(root.join(".agents/skills/review/SKILL.md")).unwrap();
+        std::fs::write(
+            root.join(".agents/agents/half.md"),
+            "---\nmodel: m\nYou review.\n",
+        )
+        .unwrap();
+        assert_eq!(
+            profile(&root, "half").unwrap_err().code(),
+            "instructions_unreadable"
+        );
+        std::fs::remove_file(root.join(".agents/agents/half.md")).unwrap();
+        // A workspace that is the home folder is searched once.
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            assert_eq!(search(&root, Kind::Profiles).len(), 2);
+            assert_eq!(search(&home, Kind::Profiles).len(), 1);
+        }
         // A stray file where a skill folder would be is simply not a skill.
         std::fs::remove_dir_all(root.join(".agents/skills")).unwrap();
         std::fs::create_dir_all(root.join(".agents/skills")).unwrap();
