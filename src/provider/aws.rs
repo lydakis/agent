@@ -390,12 +390,13 @@ pub async fn payload(body: impl Stream<Item = std::io::Result<Bytes>>) -> Result
 /// never becomes a diagnostic; its stderr is the CLI's own explanation.
 async fn resolve(argv: &[String]) -> Result<Keys> {
     let unavailable = |why: String| Error::with("provider_aws_credentials_unavailable", why);
+    let deadline = tokio::time::Instant::now() + RESOLVE_TIMEOUT;
     let mut command = tokio::process::Command::new(&argv[0]);
     command
         .args(&argv[1..])
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
-    let output = tokio::time::timeout(RESOLVE_TIMEOUT, command.output())
+    let output = tokio::time::timeout_at(deadline, command.output())
         .await
         .map_err(|_| unavailable("aws configure export-credentials timed out".into()))?
         .map_err(|error| {
@@ -409,9 +410,14 @@ async fn resolve(argv: &[String]) -> Result<Keys> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         // A CLI without the export (version 1, or 2 before 2.9) answers with
-        // its usage text, which says nothing of what to do.
-        if stderr.contains("Invalid choice") {
-            return Err(unavailable(too_old(version(&argv[0]).await)));
+        // its usage text, which says nothing of what to do. Its version,
+        // asked within the same bound, says whether that is what happened.
+        if stderr.contains("Invalid choice")
+            && let Some(version) = version(&argv[0], deadline).await.filter(|v| too_old(v))
+        {
+            return Err(unavailable(format!(
+                "{version} on PATH cannot export credentials: install AWS CLI version 2 (2.9 or later)"
+            )));
         }
         let reason = stderr.trim();
         return Err(unavailable(if reason.is_empty() {
@@ -424,14 +430,15 @@ async fn resolve(argv: &[String]) -> Result<Keys> {
         .ok_or_else(|| unavailable("aws configure export-credentials printed no keys".into()))
 }
 
-/// What `aws --version` says it is (`aws-cli/1.22.34`), if it says.
-async fn version(aws: &str) -> Option<String> {
+/// What `aws --version` says it is (`aws-cli/1.22.34`), if it says so by
+/// `deadline`.
+async fn version(aws: &str, deadline: tokio::time::Instant) -> Option<String> {
     let mut command = tokio::process::Command::new(aws);
     command
         .arg("--version")
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
-    let output = tokio::time::timeout(Duration::from_secs(5), command.output())
+    let output = tokio::time::timeout_at(deadline, command.output())
         .await
         .ok()?
         .ok()?;
@@ -444,9 +451,15 @@ async fn version(aws: &str) -> Option<String> {
     })
 }
 
-fn too_old(version: Option<String>) -> String {
-    let which = version.unwrap_or_else(|| "the aws CLI".into());
-    format!("{which} on PATH cannot export credentials: install AWS CLI version 2 (2.9 or later)")
+/// Whether `aws-cli/X.Y.Z` predates `aws configure export-credentials`,
+/// which came in 2.9.
+fn too_old(version: &str) -> bool {
+    let mut parts = (version
+        .strip_prefix("aws-cli/")
+        .unwrap_or_default()
+        .split('.'))
+    .map(|part| part.parse::<u32>().ok());
+    matches!((parts.next().flatten(), parts.next().flatten()), (Some(major), Some(minor)) if (major, minor) < (2, 9))
 }
 
 /// The `credential_process` JSON: version 1, the key pair, an optional
@@ -784,6 +797,23 @@ exit 252
                 "aws-cli/1.22.34 on PATH cannot export credentials: install AWS CLI version 2 (2.9 or later)"
             )
         );
+        // A current CLI whose profile's own helper says the same keeps what
+        // it said.
+        let current = std::fs::read_to_string(&aws)
+            .unwrap()
+            .replace("1.22.34", "2.31.4");
+        std::fs::write(&aws, current).unwrap();
+        let error = resolve(&argv).await.unwrap_err();
+        assert!(error.detail.unwrap().starts_with("usage: "));
+        for (version, old) in [
+            ("aws-cli/1.44.2", true),
+            ("aws-cli/2.8.13", true),
+            ("aws-cli/2.9.0", false),
+            ("aws-cli/2.31.4", false),
+            ("aws-cli/x", false),
+        ] {
+            assert_eq!(too_old(version), old, "{version}");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
