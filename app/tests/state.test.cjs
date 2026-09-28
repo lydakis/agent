@@ -33,7 +33,7 @@ function page(daemon = {}, storage = null) {
   });
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, chooseModel, providerSpec, setupHTML, refreshModels };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -1129,4 +1129,93 @@ test('a draft stays with the bot it was typed for, and Enter sends it there even
   await opening;
   assert.deepEqual(sent, [['app.lead', 1, 'Ship it.']]);
   assert.equal(main.value, 'Only for the side chat.');
+});
+
+// A window over settings kept as the app keeps them: saved values, a daemon restarted to apply them,
+// and providers that answer with their models.
+function settingsShell({ env = {}, lists = {} } = {}) {
+  const calls = [];
+  const specs = () => (env.AGENT_PROVIDER ?? '').split(/\s+/).filter(Boolean);
+  const answer = () => Object.fromEntries(specs().map((spec) => { const n = spec.split('=')[0]; return [n, lists[n] ?? { error: 'provider_http_401', detail: 'no' }]; }));
+  const p = shell({
+    settings: async () => ({ providers: specs(), model: env.AGENT_MODEL ?? null, region: env.AWS_REGION ?? null, profile: null, keys: Object.keys(env).filter((k) => k.endsWith('_KEY') || k.startsWith('AWS_BEARER')) }),
+    saveSettings: async (changes) => { calls.push(['save', { ...changes }]); for (const [k, v] of Object.entries(changes)) { if (v) env[k] = v; else delete env[k]; } },
+    restartDaemon: async () => { calls.push(['restart']); },
+    discoverModels: async () => { calls.push(['discover']); const a = answer(); return { providers: Object.fromEntries(Object.entries(a).map(([n, l]) => [n, l.models ? { models: l.models.length } : l])), written: true, error: null }; },
+    models: async () => Object.entries(answer()).flatMap(([n, l]) => (l.models ?? []).map((m) => ({ id: `${n}/${m.id}` }))),
+    attach: async () => { calls.push(['attach']); return { session: 2 }; },
+    pull: () => new Promise(() => {}),
+    project: async (dir) => ({ dir, name: 'weather', coordinator: 'weather.lead', model: null, file: false }),
+    policy: async () => ({ instructions: 'rules', compaction_instructions: 'summary', note: 'test' }),
+    writeProject: async (q) => { calls.push(['write', q.model]); },
+    request: async (op, q) => { if (op === 'provider_models') return { providers: answer() }; if (op === 'bots') return { bots: [], next_after: null }; if (op === 'create') { calls.push(['create', q.bot, q.model]); return { name: q.bot, id: 9, provider: q.model.split('/')[0], model: q.model.split('/')[1], workspace: q.workspace }; } return { nodes: [], next_from: null }; },
+  });
+  p.S.config.model = env.AGENT_MODEL ?? null; p.S.attached = true;
+  return { p, calls, env };
+}
+
+test('a Bedrock provider signs with the AWS login unless a Bedrock API key is given', () => {
+  const p = shell();
+  assert.equal(p.providerSpec('bedrock', { AWS_REGION: 'us-west-2' }), 'bedrock');
+  assert.equal(p.providerSpec('bedrock', { AWS_REGION: 'us-west-2', AWS_BEARER_TOKEN_BEDROCK: 'k' }), 'bedrock=anthropic,https://bedrock-mantle.us-west-2.api.aws/anthropic/v1,AWS_BEARER_TOKEN_BEDROCK');
+  assert.equal(p.providerSpec('bedrock-openai', { AWS_REGION: 'eu-west-1', AWS_BEARER_TOKEN_BEDROCK: 'k' }), 'bedrock-openai=responses,https://bedrock-mantle.eu-west-1.api.aws/openai/v1,AWS_BEARER_TOKEN_BEDROCK');
+  assert.equal(p.providerSpec('anthropic', { ANTHROPIC_API_KEY: 'k' }), 'anthropic');
+});
+
+test('connecting a provider keeps the others, saves only what was typed, restarts the daemon and lists its models', async () => {
+  const { p, calls, env } = settingsShell({ env: { AGENT_PROVIDER: 'openai', OPENAI_API_KEY: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] }, bedrock: { models: [{ id: 'claude' }, { id: 'haiku' }] } } });
+  await p.openSetup();
+  await assert.rejects(p.connectProvider('bedrock', { AWS_REGION: '', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: '' }), /Region is required/);
+  assert.equal(calls.length, 0);
+  await p.connectProvider('bedrock', { AWS_REGION: 'us-east-1', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: '' });
+  // No model is picked for the user; the empty key field keeps whatever key was saved.
+  assert.deepEqual(calls.map(([c]) => c), ['save', 'restart', 'attach', 'discover']);
+  assert.deepEqual({ ...calls[0][1] }, { AGENT_PROVIDER: 'openai bedrock', AWS_REGION: 'us-east-1', AWS_PROFILE: null });
+  assert.equal(env.AGENT_MODEL, undefined);
+  assert.deepEqual(JSON.parse(JSON.stringify(p.S.setup.status)), { openai: { models: 1 }, bedrock: { models: 2 } });
+  assert.deepEqual(p.S.setup.list.map((m) => m.id), ['openai/gpt', 'bedrock/claude', 'bedrock/haiku']);
+  assert.match(p.setupHTML(), /Choose a model/);
+  await p.chooseModel('bedrock/claude');
+  assert.equal(env.AGENT_MODEL, 'bedrock/claude'); assert.equal(p.S.config.model, 'bedrock/claude');
+  // A Bedrock key, once saved, stays in use when the region changes and its field is left empty.
+  await p.connectProvider('bedrock', { AWS_REGION: 'us-east-1', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: 'k' });
+  await p.connectProvider('bedrock', { AWS_REGION: 'us-west-2', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: '' });
+  assert.equal(env.AGENT_PROVIDER, 'openai bedrock=anthropic,https://bedrock-mantle.us-west-2.api.aws/anthropic/v1,AWS_BEARER_TOKEN_BEDROCK');
+  assert.equal(env.AWS_BEARER_TOKEN_BEDROCK, 'k');
+});
+
+test('a provider that fails says why beside the ones that answered', async () => {
+  const { p } = settingsShell({ env: { AGENT_PROVIDER: 'openai openrouter' }, lists: { openai: { models: [{ id: 'gpt' }] } } });
+  await p.openSetup();
+  assert.deepEqual({ ...p.S.setup.status.openrouter }, { error: 'provider_http_401', detail: 'no' });
+  const html = p.setupHTML();
+  assert.match(html, /✘ not ready/); assert.match(html, /provider_http_401: no</); assert.match(html, /✓ 1 model</); assert.match(html, /data-act="setup-retry"/);
+});
+
+test('removing a provider drops its key and a default model on it', async () => {
+  const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: 'openai anthropic', OPENAI_API_KEY: 'k', ANTHROPIC_API_KEY: 'k', AGENT_MODEL: 'anthropic/claude' }, lists: { openai: { models: [{ id: 'gpt' }] }, anthropic: { models: [{ id: 'claude' }] } } });
+  await p.openSetup();
+  await p.removeProvider('anthropic');
+  assert.deepEqual(calls[0], ['save', { AGENT_PROVIDER: 'openai', ANTHROPIC_API_KEY: null, AGENT_MODEL: null }]);
+  assert.equal(p.S.config.model, null);
+});
+
+test('a project with no model to start on asks for one and is created with it, keeping the folder', async () => {
+  const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: 'openai', OPENAI_API_KEY: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] } } });
+  await p.createProject('/synthetic/weather');
+  assert.equal(calls.filter(([c]) => c === 'create').length, 0);
+  assert.equal(p.S.setup.open, true); assert.equal(p.S.setup.pending, '/synthetic/weather');
+  assert.match(p.setupHTML(), /\/synthetic\/weather becomes a project once you choose a model/);
+  await p.chooseModel('openai/gpt');
+  assert.deepEqual(calls.filter(([c]) => c === 'create' || c === 'write'), [['create', 'weather.lead', 'openai/gpt'], ['write', 'openai/gpt']]);
+  assert.equal(p.S.setup.open, false); assert.equal(p.S.setup.pending, null);
+});
+
+test('a daemon with no provider to run opens setup instead of an error', async () => {
+  const p = shell({ attach: async () => { throw new Error('no_provider: connect a provider in Settings'); }, settings: async () => ({ providers: [], model: null, keys: [] }), models: async () => [] });
+  p.S.attached = false;
+  await p.attach();
+  assert.equal(p.S.setup.open, true);
+  assert.equal(p.S.setup.adding, '');
+  assert.match(p.setupHTML(), /Set up Agent/); assert.match(p.setupHTML(), /Amazon Bedrock · Claude/);
 });

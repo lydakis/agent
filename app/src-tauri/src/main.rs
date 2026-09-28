@@ -7,10 +7,11 @@
 mod daemon;
 mod project;
 mod session;
+mod settings;
 mod worktree;
 
 use agent_client::Client;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use session::SessionSlot;
 use std::{path::PathBuf, sync::Arc};
 use tauri::{Manager, State};
@@ -251,6 +252,81 @@ fn models() -> Result<Value, String> {
     Ok(models.iter().map(|model| model.json()).collect())
 }
 
+/// What a daemon this app starts would run with: its providers, the AWS
+/// region and profile, the default model, and which keys are set (never
+/// their values).
+#[tauri::command]
+async fn settings() -> Result<Value, String> {
+    let file = match daemon::env_file() {
+        Some(path) => daemon::read_env_file(&path)?,
+        None => Vec::new(),
+    };
+    Ok(settings::view(&file, daemon::login().await))
+}
+
+/// Set or remove settings in `~/.agent/env`; they reach the daemon when it
+/// restarts.
+#[tauri::command]
+fn save_settings(changes: serde_json::Map<String, Value>) -> Result<(), String> {
+    let path = daemon::env_file().ok_or("no HOME for ~/.agent/env")?;
+    // An unreadable or unsafe file is reported, never replaced.
+    daemon::read_env_file(&path)?;
+    let text = match std::fs::read_to_string(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        read => read.map_err(|e| format!("env_file_unreadable: {}: {e}", path.display()))?,
+    };
+    settings::replace(&path, &settings::edit(&text, &changes)?, 0o600)
+}
+
+/// Stop the store's daemon so the next attach starts one with the current
+/// settings. Only a daemon this app would start can be restarted.
+#[tauri::command]
+async fn restart_daemon(state: State<'_, Shared>) -> Result<(), String> {
+    let (Some(agent), Some(store)) = (&state.agent, &state.config.store) else {
+        return Err("restart_unavailable: this window did not start its daemon".into());
+    };
+    if let Some(old) = state.client.lock().await.take() {
+        old.close().await;
+    }
+    daemon::stop(agent, store).await?;
+    state.starts.lock().await.forget();
+    Ok(())
+}
+
+/// Ask the daemon's providers what they offer and write `~/.agent/models`
+/// from it. A provider that fails keeps its lines from the last list, and a
+/// list with no model at all is not written. Answers per provider.
+#[tauri::command]
+async fn discover_models(state: State<'_, Shared>) -> Result<Value, String> {
+    let client = state.client.lock().await.clone().ok_or("detached")?;
+    let listing = client
+        .request("provider_models", json!({}))
+        .await
+        .map_err(|e| e.to_string())?;
+    let path = agent_client::models::path().ok_or("no HOME for ~/.agent/models")?;
+    let failed = |error: agent_client::Error| {
+        format!("{}: {}", error.code, error.detail.unwrap_or_default())
+    };
+    let kept = agent_client::models::read(&path).map_err(failed)?;
+    let text = agent_client::models::render(&listing, &kept).map_err(failed);
+    if let Ok(text) = &text {
+        settings::replace(&path, text, 0o644)?;
+    }
+    let providers: Map<String, Value> = listing["providers"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(name, listed)| {
+            let answer = match listed["models"].as_array() {
+                Some(models) => json!({"models": models.len()}),
+                None => json!({"error": listed["error"], "detail": listed["detail"]}),
+            };
+            (name.clone(), answer)
+        })
+        .collect();
+    Ok(json!({"providers": providers, "written": text.is_ok(), "error": text.err()}))
+}
+
 /// Too much or unreadable text fails with the CLI's `--agents` code, and
 /// `/new` creates nothing: a bot without its workspace's rules is worse
 /// than no bot.
@@ -467,6 +543,10 @@ fn main() {
             models,
             project,
             write_project,
+            settings,
+            save_settings,
+            restart_daemon,
+            discover_models,
             attach,
             pull,
             request,

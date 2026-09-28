@@ -9,7 +9,7 @@
 <body>
 <div id="app">
   <div class="pane sidebar">
-    <div class="pane-title">projects</div>
+    <div class="pane-title"><span>projects</span><button type="button" class="ibtn" data-act="settings" title="Settings (⌘,)" aria-label="Settings">⚙</button></div>
     <div class="scroll" id="bots"></div>
     <button type="button" class="newproj" id="newproj" data-act="new-project">＋ New project</button>
     <form class="newproj" id="projform" hidden><span>＋</span><input id="projdir" autocomplete="off" spellcheck="false" aria-label="Project folder" placeholder="folder"></form>
@@ -34,6 +34,7 @@
 <div class="overlay" id="pickerwrap"><div class="picker"><div class="q"><span>›</span><input id="pickerq" placeholder="find a bot…" aria-label="Filter bots"></div><div class="list" id="pickerlist"></div></div></div>
 <div class="overlay" id="helpwrap"><div class="helpbox" id="helptext"></div></div>
 <div class="detached" id="detached"></div>
+<div class="setupwrap" id="setupwrap"><div class="setup" id="setup"></div></div>
 <script src="daemon.js"></script>
 <script src="app.js"></script>
 </body>

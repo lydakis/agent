@@ -13,7 +13,7 @@ covered it, so one state model exists, not two.
 
 ## Screenshots
 
-Demo mode in headless Chromium, 1280×780, captured 2026-09-27. The data is
+Demo mode in headless Chromium, 1280×780, captured 2026-09-28. The data is
 the synthetic `demo` project.
 
 The lead splits the work, build opens beside it, then build's ⋯ menu.
@@ -52,6 +52,25 @@ A side chat asked while the lead works: a fork beside it, the lead untouched.
 New project takes a folder.
 
 ![New project](app/new-project.png)
+
+A first run opens setup: connect a provider, choose the model new agents
+start on, open a first project (demo `?first`).
+
+![Setup's provider choices](app/setup-providers.png)
+
+Each provider asks for what it needs to sign in; Bedrock takes a region and an
+AWS profile or a Bedrock API key.
+
+![Connecting Amazon Bedrock](app/setup-bedrock.png)
+
+Once a provider answers, its models are listed and nothing is chosen for you.
+
+![Choosing a model](app/setup-model.png)
+
+Settings (⚙ in the sidebar, or ⌘,) is the same screen. A provider that fails
+says why beside those that answered.
+
+![Settings with one provider failing](app/settings.png)
 
 ## What the daemon speaks, and why the client speaks it directly
 
@@ -94,7 +113,9 @@ client/          agent-client: the socket protocol and the client policy
   `policy` composes the client policy for the workspace; `attach` connects
   and follows `*` from the page's cursor; `pull` hands the page the next
   batch of that session's notifications, at most 256, when it asks;
-  `request` relays any protocol op; `models` reads `~/.agent/models`, and
+  `request` relays any protocol op; `models` reads `~/.agent/models`;
+  `settings`, `save_settings`, `restart_daemon` and `discover_models` back
+  [Setup](#setup-and-settings); and
   `project` and `write_project` read and write a folder's
   `.agents/project.toml` ([project.rs](../app/src-tauri/src/project.rs));
   `policy` composes a folder's client policy, in a profile when named, and
@@ -140,6 +161,7 @@ the environment of the user's login shell (`$SHELL -l -i`), plus
 `~/.agent/env` for keys kept out of shell profiles: `KEY=VALUE` lines
 (`export` and quotes allowed, `#` comments), refused unless it is a regular
 file of at most 64 KiB that only its owner can read. That file is the app's; the CLI and the daemon never read it.
+[Settings](#setup-and-settings) writes it.
 The login shell is read once per app run, and without `--model` or
 `AGENT_MODEL` of its own the app takes its default model from the file, then
 the shell; the shell's is looked up beside the attach, so a slow profile never
@@ -212,12 +234,49 @@ steer pick is remembered for every window. If the daemon is unreachable or close
 and retries every two seconds. Only one attachment runs at a time, including
 the snapshot pages. A connected peer must send its ready line within five seconds.
 
-Keys: `^k` find a bot, `^b` sidebar, `^p` next task beside, `^o` every
+Keys: `^k` find a bot, `^b` sidebar, `^,` settings, `^p` next task beside, `^o` every
 run's thoughts and output, `Esc` close the side pane then stop, `↑` `↓` on an
 empty message to move between bots, `^d` close the window, Enter to send and
 Shift-Enter for a new line, `/new NAME [PROVIDER/MODEL]` to create a bot, `?`
 on an empty message for the list and the models in `~/.agent/models`, read
 each time. `⌘` works where `^` does.
+
+## Setup and settings
+
+What a daemon needs before anything runs is the app's to ask for, not the
+daemon's: it runs whatever providers it is started with and whatever model a
+turn names. One screen covers both a first run and later changes, in three
+steps, each checked once done:
+
+1. **Providers.** Anthropic, OpenAI and OpenRouter take an API key; a ChatGPT
+   plan uses the sign-in Codex saved; Amazon Bedrock (Claude, or its other
+   models over the OpenAI-compatible endpoint) takes a region and signs with
+   the AWS CLI's credentials for an optional profile, or with a Bedrock API
+   key when one is given. Connecting writes `AGENT_PROVIDER` (the providers
+   already running kept, specs as `--provider` takes them) and the provider's
+   fields to `~/.agent/env`, restarts the daemon with `agent shutdown`, which
+   stops running turns and returns once the process is gone, attaches again,
+   which starts a daemon with the new settings, and asks every provider for
+   its models. Each row then shows its model count, or its refusal with a
+   Retry. A key is never read back into the page: the core reports only which
+   keys are set, and a key field left empty keeps the saved one. Removing a
+   provider drops its key (unless another provider uses it) and a default
+   model on it.
+2. **Model.** The list the providers gave, grouped by provider, with no
+   default picked. The choice is `AGENT_MODEL` in `~/.agent/env`: what new
+   projects and `/new` start on. Refresh list asks again. The answer is
+   written to `~/.agent/models`, replacing it: a provider that answers
+   replaces its lines, one that fails keeps the lines it had, one no longer
+   running loses them, and an answer with no usable model leaves the file
+   as it was.
+3. **First project**, shown until one exists: a folder, then New project's
+   path.
+
+It opens on its own when a daemon cannot start for lack of a provider, and
+once when a window attaches to an empty store without a provider or model.
+New project on a folder when no model is set opens it at the model step and
+creates the project in that folder once one is chosen. An `agent` the app did
+not bundle, or an explicit `--socket`, cannot be restarted; Settings says so.
 
 ## Projects and panes
 
