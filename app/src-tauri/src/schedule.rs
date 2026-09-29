@@ -757,17 +757,26 @@ pub fn install(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(format!("{}: {e}", path.display())),
     };
-    swap(
+    // The new schedule has no last time; the one it replaces, or an ended
+    // one's, is not it. It goes first, and comes back if the swap fails.
+    let last = places.last(&schedule.name);
+    let prior = match std::fs::read_to_string(&last) {
+        Ok(prior) => Some(prior),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("{}: {e}", last.display())),
+    };
+    forget(&last)?;
+    let swapped = swap(
         &path,
         &schedule.name,
         old.as_deref(),
         &plist(app, schedule, when, environment),
         launchd,
-    )?;
-    // The new schedule has no last time; the one it replaced, or an ended
-    // one's, is not it.
-    let _ = forget(&places.last(&schedule.name));
-    Ok(())
+    );
+    if let (Err(_), Some(prior)) = (&swapped, prior) {
+        let _ = replace(&last, &prior);
+    }
+    swapped
 }
 
 /// Put `text` in the plist at `path` and load it in place of `old`: when
@@ -877,17 +886,35 @@ pub fn remove(places: &Places, name: &str, launchd: Loader) -> Result<(), String
 /// whose unload ends this process. `keep` leaves its last result, so an
 /// end nobody asked for still shows, and why. A plist that will not go
 /// stays loaded with its result, listed, for `rm`: unloaded, it would load
-/// again at the next login.
+/// again at the next login. An unload launchd refuses writes the plist
+/// back, so the job it left loaded is still listed for `rm`.
 fn end(places: &Places, name: &str, keep: bool, launchd: Loader) {
     let _lock = Lock::take(places);
-    if let Err(error) = forget(&places.plist(name)) {
+    let path = places.plist(name);
+    // A job whose plist is already gone is still unloaded.
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            eprintln!("{}", json!({"error": format!("{}: {e}", path.display())}));
+            return;
+        }
+    };
+    if text.is_some()
+        && let Err(error) = forget(&path)
+    {
         eprintln!("{}", json!({"error": error}));
         return;
     }
     if !keep {
         let _ = forget(&places.last(name));
     }
-    let _ = launchd(Launchd::Unload(&format!("{LABEL}{name}")));
+    if let Err(error) = unload(&format!("{LABEL}{name}"), launchd) {
+        eprintln!("{}", json!({"error": error}));
+        if let Some(text) = text {
+            let _ = replace(&path, &text);
+        }
+    }
 }
 
 /// The app moves when it is updated, so it writes its path into every
@@ -1533,6 +1560,7 @@ mod tests {
             message: "something else".into(),
             ..schedule()
         };
+        record_last(&places, &s, &json!({"outcome": "skipped"})).unwrap();
         let refused = install(&places, app, &changed, &entries, &[], &|what| match what {
             Launchd::Load(_) => {
                 *loads.borrow_mut() += 1;
@@ -1550,6 +1578,8 @@ mod tests {
             std::fs::read_to_string(places.plist(&s.name)).unwrap(),
             before
         );
+        // It keeps its last result too.
+        assert_eq!(list(&places)[0]["last"]["outcome"], "skipped");
         // An old one launchd won't unload is not replaced at all.
         let stuck = |what: Launchd| match what {
             Launchd::Unload(_) => Err("launchctl bootout: busy".to_owned()),
@@ -1594,6 +1624,20 @@ mod tests {
         end(&places, &odd.name, false, &counting);
         assert_eq!(*unloads.borrow(), 0);
         assert!(places.last(&odd.name).exists());
+        // One launchd will not unload gets its plist back, listed for `rm`.
+        let once = Schedule {
+            name: "p.once".into(),
+            at: Some(1_790_000_000),
+            ..schedule()
+        };
+        install(&places, app, &once, &entries, &[], &fine).unwrap();
+        let written = std::fs::read_to_string(places.plist(&once.name)).unwrap();
+        end(&places, &once.name, false, &stuck);
+        assert_eq!(
+            std::fs::read_to_string(places.plist(&once.name)).unwrap(),
+            written
+        );
+        remove(&places, &once.name, &fine).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 

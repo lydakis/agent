@@ -734,7 +734,8 @@ the message. A fire whose daemon announces another store (a reused socket)
 sends nothing and records `store_mismatch`. Replacing one unloads the old
 job first and, if the new plist cannot be written or loaded, writes the old
 one back and loads it; an old plist that cannot be read is not replaced,
-since it could not be put back. A replacement starts with no last result.
+since it could not be put back. A replacement starts with no last result;
+a failed one puts the old result back with its plist.
 A removal launchd refuses keeps the plist, so it can be retried. When it fires, the app's executable runs with `--schedule-fire`
 and those arguments. It connects to the daemon, and when none answers and
 the store is known, starts one for it on that socket as the app does, with
@@ -756,7 +757,8 @@ file, so Settings and `ls` still list it, as not delivered and why, until
 it is removed; when that file cannot be written, the plist stays, still
 listed, rather than ending with no trace. A plist the fire cannot delete
 stays loaded too, listed with its result, for `rm`: unloaded, it would load
-again at the next login. Those files are written, synced, renamed and their folder
+again at the next login. One whose unload launchd refuses gets its plist
+back, so the job still loaded stays listed for `rm`. Those files are written, synced, renamed and their folder
 synced. `add`, `rm`, a fire ending its schedule and the app's refresh take
 a lock (`~/.agent/schedules/.lock`) around their changes, and the refresh
 reads each plist again under it. `~/.agent/schedule` is written with its
