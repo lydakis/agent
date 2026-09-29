@@ -62,7 +62,7 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   `--tools` names them; a missing role is `profile_not_found`. `fork` takes
   none of these: a fork is an exact copy of its source, instructions
   included.
-  With `run`, instructions, reasoning, and token budget apply to new identities;
+  With `run`, instructions and token budget apply to new identities;
   passing them while continuing an existing named bot is an error.
 - `run --new --approval MODE` and `fork --approval MODE` choose whether a
   new bot's tool calls wait for a verdict: `full` runs every allowed call (no
@@ -181,6 +181,15 @@ running daemon is not checked against either.
 daemon has no model of its own, so a new bot needs `--model` or `AGENT_MODEL`.
 `AGENT_MODEL` is only a creation default. An existing bot uses its stored
 model unless `--model` explicitly overrides it for this turn.
+`run --reasoning LEVEL` sets a new bot's effort: `low`,
+`medium`, `high` or `xhigh` on either family, and `max` on Anthropic's; any
+other is refused with `invalid_reasoning_level`. Without it the request carries
+no level and the model uses its own default. On an existing bot it sets this
+turn's effort, as `--model` sets its model, and the bot's own is unchanged. A
+turn with a level sees it in its shell as `AGENT_REASONING`, and a new bot that takes its model
+from `AGENT_MODEL` takes its level from `AGENT_REASONING`, so a peer started
+on its creator's model thinks as hard as its creator; a bot given
+`--model` or a profile's model gets only its own `--reasoning`.
 `run --instructions` and `--instructions-file` set a new bot's instructions,
 with the CLI's built-in text as the default; the daemon has none. `run
 --tools LIST` chooses a new bot's tools from those the daemon registers,

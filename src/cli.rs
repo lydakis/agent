@@ -191,7 +191,10 @@ fn print_flags(flags: &str) {
                 "ROLE",
                 "Compose instructions (as --agents) in the role .agents/agents/ROLE.md, with its model and tools",
             ),
-            "--reasoning" => ("LEVEL", "low, medium, high, xhigh, or max"),
+            "--reasoning" => (
+                "LEVEL",
+                "Effort: low, medium, high, or xhigh; Claude also max. A new bot keeps it (default AGENT_REASONING on AGENT_MODEL, else the model's own); on an existing bot, for this turn",
+            ),
             "--request-id" => ("ID", "Idempotency key for this submission"),
             "--bot-id" => ("N", "Refuse if --bot no longer names this identity"),
             "--budget-tokens" => ("N", "New bot's lifetime input + output token cap"),
@@ -464,7 +467,6 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
             "--instructions-file",
             "--agents",
             "--profile",
-            "--reasoning",
             "--budget-tokens",
             "--fallbacks",
             "--approval",
@@ -475,7 +477,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
     {
         return fail_with(
             "usage",
-            "instructions, reasoning, budget, and approval are creation options; use --new",
+            "instructions, budget, and approval are creation options; use --new",
         );
     }
     Ok(Some(out))

@@ -1240,10 +1240,20 @@ fn run(options: &Options) -> Result<i32> {
         // from the daemon or from whichever client connects later.
         let workspace = workspace.as_deref().expect("a new bot resolves its folder");
         let role = role(options, workspace)?;
-        let model = options
+        let chosen = options
             .model
             .clone()
-            .or_else(|| role.as_ref().and_then(|r| r.model.clone()))
+            .or_else(|| role.as_ref().and_then(|r| r.model.clone()));
+        // A peer on its creator's model takes its creator's effort level too;
+        // a model chosen for it takes its own --reasoning or none.
+        let reasoning = options.reasoning.clone().or_else(|| {
+            chosen
+                .is_none()
+                .then(|| std::env::var("AGENT_REASONING").ok())
+                .flatten()
+                .filter(|level| !level.is_empty())
+        });
+        let model = chosen
             .or_else(|| std::env::var("AGENT_MODEL").ok())
             .ok_or(Error::with(
                 "usage",
@@ -1262,7 +1272,7 @@ fn run(options: &Options) -> Result<i32> {
                 .collect(),
         };
         let mut create = json!({"bot":bot,"workspace":workspace,"model":model,
-            "instructions":instructions,"reasoning":options.reasoning,
+            "instructions":instructions,"reasoning":reasoning,
             "budget_tokens":options.budget_tokens,"tools":tools,
             "created_by":created_by,"created_by_id":created_by_id,
             "compaction_instructions":options.compaction_instructions,
@@ -1285,14 +1295,16 @@ fn run(options: &Options) -> Result<i32> {
         }
     }
     let request_id = options.request_id.clone().unwrap_or_else(|| unique("run"));
-    // Existing bots keep their model unless --model explicitly overrides it.
-    // AGENT_MODEL is only a creation default, including inside a peer's shell.
+    // Existing bots keep their model and effort unless --model or
+    // --reasoning overrides them for this turn. AGENT_MODEL and
+    // AGENT_REASONING are only creation defaults, including in a peer's shell.
     let submitted = connection
         .request(
             "submit",
             json!({"bot":bot,"bot_id":options.bot_id,"request_id":request_id,"prompt":prompt,
                 "workspace":options.workspace.as_ref().and(workspace.as_ref()),
                 "model":if created { Value::Null } else { json!(options.model) },
+                "reasoning":if created { Value::Null } else { json!(options.reasoning) },
                 "delivery":options.delivery,"expected_turn":options.turn,"from":from}),
         )
         .map_err(|error| ways_past_busy(&bot, error))?;

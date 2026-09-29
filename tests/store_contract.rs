@@ -152,6 +152,7 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
     let branch = TurnOptions {
         workspace: Some("/synthetic/alternative".into()),
         model: None,
+        reasoning: None,
         delivery: Delivery::Reject,
         expected_turn: None,
         from: None,
@@ -2189,6 +2190,49 @@ fn schema_40_gives_every_existing_bot_the_defaults_and_completes_parked_turns() 
 }
 
 #[test]
+fn schema_41_turns_ran_at_their_bots_effort() {
+    let path = std::env::temp_dir().join(format!("agent-effort-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create(
+            "Bob",
+            Some("/synthetic"),
+            Binding {
+                reasoning: Some("medium"),
+                ..binding()
+            },
+        )
+        .unwrap();
+        db.begin(
+            "Bob",
+            "r1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap();
+    }
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE turns DROP COLUMN reasoning; PRAGMA user_version=41;")
+        .unwrap();
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert_eq!(
+        db.turns("Bob", 0, 10).unwrap()["turns"][0]["reasoning"],
+        "medium"
+    );
+    drop(db);
+    let version: i32 = Connection::open(&path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, Database::SCHEMA);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
     let mut db = db();
     let settings = Settings {
@@ -2545,6 +2589,103 @@ fn artifacts_are_scoped_to_the_owning_bot_and_lineage_checks_use_depth() {
 }
 
 #[test]
+fn a_turn_runs_at_its_own_effort_or_its_bots() {
+    let mut db = db();
+    db.create(
+        "Bob",
+        Some("/synthetic"),
+        Binding {
+            reasoning: Some("high"),
+            ..binding()
+        },
+    )
+    .unwrap();
+    let at = |level: &str| TurnOptions {
+        reasoning: Some(level.into()),
+        ..TurnOptions::default()
+    };
+    // Only the levels the bot's family takes.
+    assert_eq!(
+        db.begin("Bob", "r0", "work", true, &at("max"), allow_provider)
+            .unwrap_err()
+            .code,
+        "invalid_reasoning_level"
+    );
+    let low = db
+        .begin("Bob", "r1", "work", true, &at("low"), allow_provider)
+        .unwrap();
+    assert_eq!(low.entry.unwrap()["data"]["reasoning"], "low");
+    assert_eq!(
+        db.context(low.turn).unwrap().reasoning.as_deref(),
+        Some("low")
+    );
+    // The level is part of the request: a retry must name the same one.
+    assert!(
+        !db.begin("Bob", "r1", "work", true, &at("low"), allow_provider)
+            .unwrap()
+            .fresh
+    );
+    assert_eq!(
+        db.begin("Bob", "r1", "work", true, &at("xhigh"), allow_provider)
+            .unwrap_err()
+            .code,
+        "idempotency_conflict"
+    );
+    // A steer at another level waits for a turn at its own.
+    let steer = |level: Option<&str>| TurnOptions {
+        reasoning: level.map(Into::into),
+        delivery: Delivery::Steer,
+        ..TurnOptions::default()
+    };
+    db.begin(
+        "Bob",
+        "s1",
+        "same",
+        true,
+        &steer(Some("xhigh")),
+        allow_provider,
+    )
+    .unwrap();
+    db.begin("Bob", "s2", "any", true, &steer(None), allow_provider)
+        .unwrap();
+    let absorbed = db
+        .absorb(
+            low.turn,
+            None,
+            8 << 20,
+            4096,
+            ContextUsage::default(),
+            false,
+        )
+        .unwrap();
+    assert!(absorbed.outcomes.is_empty());
+    db.finish(low.turn, None).unwrap();
+    // Work that names none runs at Bob's own.
+    let plain = db
+        .begin(
+            "Bob",
+            "r2",
+            "work",
+            true,
+            &TurnOptions {
+                delivery: Delivery::Queue,
+                ..TurnOptions::default()
+            },
+            allow_provider,
+        )
+        .unwrap();
+    assert_eq!(plain.entry.unwrap()["data"]["reasoning"], "high");
+    let listed = db.turns("Bob", 0, 10).unwrap();
+    let levels: Vec<&Value> = listed["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| &t["reasoning"])
+        .collect();
+    assert_eq!(levels, ["low", "xhigh", "high", "high"]);
+}
+
+#[test]
 fn turn_options_are_recorded_and_part_of_idempotency() {
     let mut db = db();
     db.create("Bob", Some("/synthetic/default"), binding())
@@ -2552,6 +2693,7 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
     let options = TurnOptions {
         workspace: Some("/synthetic/elsewhere".into()),
         model: Some("openai/other-model".into()),
+        reasoning: None,
         delivery: Delivery::Reject,
         expected_turn: None,
         from: None,
@@ -2679,6 +2821,7 @@ fn a_bot_without_a_default_workspace_needs_one_per_submission() {
     let options = TurnOptions {
         workspace: Some("/synthetic/today".into()),
         model: None,
+        reasoning: None,
         delivery: Delivery::Reject,
         expected_turn: None,
         from: None,
@@ -3319,6 +3462,7 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
             &TurnOptions {
                 workspace: Some("/synthetic/b".into()),
                 model: None,
+                reasoning: None,
                 delivery: Delivery::Reject,
                 expected_turn: None,
                 from: None,

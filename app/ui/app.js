@@ -25,7 +25,7 @@ const S = {
   config: null, ui: { rail: true, side: null, picker: false, pickerSel: 0, help: false, steps: false, toast: null, menu: false, folded: new Set() },
   // How Send reaches a working bot, the last pick from its menu (sticky across windows), and the
   // model each bot's next turns run on when it differs from the one it was created with.
-  send: loadSend(), override: new Map(),
+  send: loadSend(), override: new Map(), effort: new Map(),
   // Each provider's model family, from the bot records that name both; a turn may run on any
   // provider of its bot's family.
   families: new Map(),
@@ -199,12 +199,15 @@ function upsert(record) {
   b.status = record.status === 'completed' ? 'idle' : (record.status || 'idle');
   b.runningTurn = record.running_turn ?? null;
   b.model = `${record.provider ?? '?'}/${record.model ?? '?'}`;
+  learnEffort(b, record);
   learnFamily(b, record);
   learnWorkspace(b, record);
   if (record.created_by) { b.parent = record.created_by; b.parentId = record.created_by_id ?? null; }
   S.bots.set(b.name, b);
   seedHistory(record);
 }
+// A bot's effort level is set when it is made and kept for life; a record that does not name it says nothing.
+function learnEffort(b, record) { if ('reasoning' in record) b.reasoning = record.reasoning ?? null; }
 // A new folder means its branch is read again, when the bot is next shown.
 function learnWorkspace(b, record) {
   const ws = record.workspace ?? null;
@@ -233,7 +236,7 @@ function forgetBot(name) {
   const parent = bot(name) && creatorOf(bot(name));
   const t = parent && S.transcripts.get(parent.name);
   if (t) { t.items = t.items.filter(it => it.kind !== 'peer' || it.who !== name); t.peers = t.peers.filter(who => who !== name); t.gen += 1; }
-  S.bots.delete(name); S.transcripts.delete(name); S.override.delete(name);
+  S.bots.delete(name); S.transcripts.delete(name); S.override.delete(name); S.effort.delete(name);
   // A coordinator gone hears nothing more, and its queued turns never end; a task gone is no news.
   if (S.wakes.has(name)) { clearTimeout(S.wakes.get(name).timer); S.wakes.delete(name); }
   for (const w of S.wakes.values()) if (w.tasks.delete(name) && !w.tasks.size) { clearTimeout(w.timer); w.timer = null; }
@@ -1007,6 +1010,7 @@ function seat(record, session) {
   if (conflict) return;
   if (record.id != null) b.id = record.id;
   b.model = `${record.provider ?? '?'}/${record.model ?? '?'}`;
+  learnEffort(b, record);
   learnFamily(b, record);
   learnWorkspace(b, record);
   if (record.created_by) { b.parent = record.created_by; b.parentId = record.created_by_id ?? null; }
@@ -1092,7 +1096,7 @@ async function attachOnce() {
 }
 // Everything the window learned from one store, dropped before it shows another.
 function forgetStore() {
-  S.cursor = 0; S.bots.clear(); S.transcripts.clear(); S.drafts.clear(); S.override.clear(); S.families.clear();
+  S.cursor = 0; S.bots.clear(); S.transcripts.clear(); S.drafts.clear(); S.override.clear(); S.effort.clear(); S.families.clear();
   S.swarms.clear(); S.memberOf.clear(); S.deleted.clear(); looked.clear();
   for (const w of S.wakes.values()) clearTimeout(w.timer);
   S.wakes.clear(); S.turnFrom.clear(); S.heldNews = [];
@@ -1140,8 +1144,13 @@ function restore() {
     const b = bot(name);
     if (b && b.id != null && b.id === id && typeof model === 'string' && runsOn(b, model)) S.override.set(name, model);
   }
+  if (Array.isArray(saved.effort)) for (const entry of saved.effort) {
+    const [name, id, level] = Array.isArray(entry) ? entry : [];
+    const b = bot(name);
+    if (b && b.id != null && b.id === id && effortsFor(b.model).includes(level) && level !== b.reasoning) S.effort.set(name, level);
+  }
 }
-function save() { const key = sessionKey(); if (!key) return; try { localStorage.setItem(key, JSON.stringify({ selected: S.selected, side: S.ui.side, rail: S.ui.rail, steps: S.ui.steps, folded: [...S.ui.folded], override: [...S.override].map(([name, model]) => [name, bot(name)?.id ?? null, model]) })); } catch (_) {} }
+function save() { const key = sessionKey(); if (!key) return; try { localStorage.setItem(key, JSON.stringify({ selected: S.selected, side: S.ui.side, rail: S.ui.rail, steps: S.ui.steps, folded: [...S.ui.folded], override: [...S.override].map(([name, model]) => [name, bot(name)?.id ?? null, model]), effort: [...S.effort].map(([name, level]) => [name, bot(name)?.id ?? null, level]) })); } catch (_) {} }
 window.addEventListener('beforeunload', save);
 
 // ---------- render ----------
@@ -1424,17 +1433,19 @@ function runsOn(b, model) {
   return fam != null && S.families.get(p) === fam;
 }
 const modelOf = (b) => S.override.get(b.name) ?? b.model;
+// The effort an agent's next turn runs at: one picked for its turns, else its own.
+const effortOf = (b) => S.effort.get(b.name) ?? b.reasoning ?? null;
 function renderComposer(pane, b, sw = null) {
-  const ids = PANE[pane], mode = sendMode(b), model = b ? modelOf(b) : '';
-  const key = sw ? `${SWARM}${sw.name}` : b ? `${b.name}|${mode}|${model}|${b.runningTurn !== null}` : '-';
+  const ids = PANE[pane], mode = sendMode(b), model = b ? modelOf(b) : '', effort = b ? effortOf(b) : null;
+  const key = sw ? `${SWARM}${sw.name}` : b ? `${b.name}|${mode}|${model}|${effort}|${b.runningTurn !== null}` : '-';
   const send = $(ids.send); if (send.dataset.k === key) return; send.dataset.k = key;
   const caret = $(ids.form).querySelector?.('.caret'); if (caret) caret.hidden = !!sw;
   // On a swarm the composer posts to its board: no model, no stop, one way to send.
   if (sw) { send.textContent = 'Post'; $(ids.model).hidden = true; $(ids.stop).hidden = true; $(ids.input).placeholder = 'Post to the board · @name wakes that agent'; return; }
   send.textContent = ACTION[mode];
-  $(ids.model).textContent = b ? `${model.split('/').slice(1).join('/') || model} ▾` : '';
+  $(ids.model).textContent = b ? `${model.split('/').slice(1).join('/') || model}${effort ? ` · ${effort}` : ''} ▾` : '';
   $(ids.model).hidden = !b; $(ids.stop).hidden = !b || b.runningTurn === null;
-  $(ids.input).placeholder = !b ? (pane === 'main' ? '/new NAME PROVIDER/MODEL' : '') : mode === 'queue' ? 'queues after this turn' : mode === 'steer' ? 'steers into this turn' : mode === 'side' ? 'asks a side chat' : '';
+  $(ids.input).placeholder = !b ? (pane === 'main' ? '/new NAME PROVIDER/MODEL [EFFORT]' : '') : mode === 'queue' ? 'queues after this turn' : mode === 'steer' ? 'steers into this turn' : mode === 'side' ? 'asks a side chat' : '';
 }
 
 // ---------- swarm view ----------
@@ -1541,7 +1552,7 @@ function renderSwarm(el, sw) {
 
 // ---------- the new swarm sheet ----------
 // A goal, how many agents, what they are, where they work, and a budget they share. What they are is
-// a mix: rows of an identity (a profile the folder offers, or a plain agent), a model, and a share,
+// a mix: rows of an identity (a profile the folder offers, or a plain agent), a model and its effort, and a share,
 // shown as the whole agents it makes at the size picked.
 // A swarm starts with up to 64 agents, as the app's side takes; Add goes on from there.
 const MAX_AGENTS = 64, MAX_BUDGET_M = 1000;
@@ -1551,18 +1562,19 @@ const sheet = { models: [], profiles: [], mix: [] };
 async function openSwarmSheet(project) {
   closeMenu();
   const lead = bot(project + LEAD); if (!lead) return;
-  // Its agents start on the project's model unless another is picked.
+  // Its agents start on the project's model and effort unless others are picked.
   let models = []; try { models = connected(await Daemon.models(), setupState().settings ?? await loadSettings().catch(() => null)); } catch (_) {}
   let profiles = []; try { profiles = await Daemon.profiles(lead.workspace); } catch (e) { toast(`profiles: ${e?.message ?? e}`, 5000); }
   const first = [lead.model, lastModel()].find((m) => m && models.some((x) => x.id === m)) ?? '';
-  Object.assign(sheet, { models, profiles, mix: [{ identity: '', model: first, share: 100 }] });
+  const effort = first === lead.model ? lead.reasoning ?? '' : '';
+  Object.assign(sheet, { models, profiles, mix: [{ identity: '', model: first, reasoning: effort, share: 100 }] });
   sheetFor = project;
   const sel = (id, opts, on) => `<select id="${id}">${opts.map(([v, l]) => `<option value="${esc(v)}"${String(v) === String(on) ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select>`;
   $('sheet').innerHTML = `<h4>New swarm in ${esc(project)}</h4>
     <label for="sw-goal">Goal</label><textarea id="sw-goal" rows="3" placeholder="What should they get done together?"></textarea>
     <div class="row"><div><label for="sw-n">Agents</label><input id="sw-n" type="number" min="1" max="${MAX_AGENTS}" step="1" value="4"></div><div class="wide"><label for="sw-where">They work in</label>${sel('sw-where', [['shared', 'One shared worktree'], ['project', 'The project folder']], 'shared')}</div><div><label for="sw-budget">Budget (M)</label><input id="sw-budget" type="number" min="0.1" max="${MAX_BUDGET_M}" step="any" value="3" aria-label="Budget in millions of tokens"></div></div>
     <div id="sw-each" class="hint"></div>
-    <label>Made of</label><div id="sw-mix" class="mix"></div>
+    <label>Made of <span class="dim">identity, model, effort and share</span></label><div id="sw-mix" class="mix"></div>
     <label for="sw-org">Organized as</label>${sel('sw-org', [[0, 'One board: each agent takes a piece'], [3, 'A council of 3 approves streams of work']], 0)}
     <div class="foot"><button type="button" class="sbtn" data-act="close-sheet">Cancel</button><button type="submit" class="sbtn primary" id="sw-start">Start swarm</button></div>`;
   renderMix();
@@ -1595,7 +1607,7 @@ function renderMix() {
   renderEach(n);
   const counts = problem ? null : mixCounts(sheet.mix, mixRows(sheet.mix, n));
   const identities = [['', 'Plain agent'], ...sheet.profiles.map((p) => [p.name, p.name])];
-  const row = (r, i) => `<div class="mixrow"><select data-mix="${i}" data-f="identity" aria-label="Identity">${identities.map(([v, l]) => `<option value="${esc(v)}"${v === r.identity ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select>${modelSelectHTML(`sw-model-${i}`, sheet.models, r.model).replace('<select ', `<select data-mix="${i}" data-f="model" `)}<span class="share"><input type="number" min="1" max="100" step="1" value="${esc(r.share)}" data-mix="${i}" data-f="share" aria-label="Share in percent">%</span><span class="count${counts && !counts[i] ? ' none' : ''}">${counts ? `${counts[i]} agent${counts[i] === 1 ? '' : 's'}` : ''}</span>${sheet.mix.length > 1 ? `<button type="button" class="x" data-act="mix-remove" data-v="${i}" title="Remove this row">×</button>` : '<span class="x"></span>'}</div>`;
+  const row = (r, i) => `<div class="mixrow"><select data-mix="${i}" data-f="identity" aria-label="Identity">${identities.map(([v, l]) => `<option value="${esc(v)}"${v === r.identity ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select>${modelSelectHTML(`sw-model-${i}`, sheet.models, r.model).replace('<select ', `<select data-mix="${i}" data-f="model" `)}${effortSelectHTML(`sw-effort-${i}`, r.model, r.reasoning, true).replace('<select ', `<select data-mix="${i}" data-f="reasoning" `)}<span class="share"><input type="number" min="1" max="100" step="1" value="${esc(r.share)}" data-mix="${i}" data-f="share" aria-label="Share in percent">%</span><span class="count${counts && !counts[i] ? ' none' : ''}">${counts ? `${counts[i]} agent${counts[i] === 1 ? '' : 's'}` : ''}</span>${sheet.mix.length > 1 ? `<button type="button" class="x" data-act="mix-remove" data-v="${i}" title="Remove this row">×</button>` : '<span class="x"></span>'}</div>`;
   const add = sheet.mix.length < MIX_ROWS ? '<button type="button" class="sbtn" data-act="mix-add">Add a row</button>' : '';
   const note = problem ?? (counts.some((c) => !c) ? `A row makes no agent at ${n} agents` : '');
   $('sw-mix').innerHTML = `${sheet.mix.map(row).join('')}<div class="mixfoot">${add}<span class="${problem || note ? 'warn' : ''}">${esc(note)}</span></div>`;
@@ -1604,19 +1616,21 @@ function renderMix() {
 function mixAdd() {
   const big = sheet.mix.reduce((b, r, i) => (r.share > sheet.mix[b].share ? i : b), 0), half = Math.floor(sheet.mix[big].share / 2);
   sheet.mix[big].share -= half;
-  sheet.mix.push({ identity: '', model: sheet.mix[big].model, share: half });
+  sheet.mix.push({ identity: '', model: sheet.mix[big].model, reasoning: sheet.mix[big].reasoning, share: half });
   renderMix();
 }
 function mixRemove(i) {
   const [gone] = sheet.mix.splice(i, 1); sheet.mix[0].share += gone.share;
   renderMix();
 }
-// Picking an identity picks the model its profile names, when that model is connected.
+// Picking an identity picks the model its profile names, when that model is connected. A row keeps its
+// effort while its model takes that level.
 function mixChange(el) {
   const i = Number(el.dataset.mix), r = sheet.mix[i]; if (!r) return;
   if (el.dataset.f === 'share') r.share = Math.round(Number(el.value));
   else r[el.dataset.f] = el.value;
   if (el.dataset.f === 'identity') { const m = sheet.profiles.find((p) => p.name === el.value)?.model; if (m && sheet.models.some((x) => x.id === m)) r.model = m; }
+  if (r.reasoning && !effortsFor(r.model).includes(r.reasoning)) r.reasoning = '';
   if (el.dataset.f !== 'share' || el.type !== 'number') renderMix();
 }
 function closeSheet() { if (!S.ui.sheet) return; S.ui.sheet = false; sheetFor = null; $('sheetwrap').classList.remove('on'); focusInput('main'); }
@@ -1629,7 +1643,7 @@ $('sheet').addEventListener('submit', async (e) => {
   start.disabled = true; start.textContent = 'Starting…';
   try {
     const n = agentCount(), problem = sheetProblem(n); if (problem) throw new Error(problem);
-    const mix = sheet.mix.map((r) => ({ identity: r.identity, model: r.model, share: r.share }));
+    const mix = sheet.mix.map((r) => ({ identity: r.identity, model: r.model, reasoning: r.reasoning || null, share: r.share }));
     await createSwarm(project, { goal: $('sw-goal').value, n, mix, shared: $('sw-where').value === 'shared', budget: budgetTokens(), council: Number($('sw-org').value) });
     closeSheet();
   } catch (err) { toast(String(err?.message ?? err), 6000); start.disabled = false; start.textContent = 'Start swarm'; }
@@ -1774,7 +1788,7 @@ let helpPane = 'main';
 async function showHelp(pane = 'main') {
   helpPane = pane;
   // Open at once so Esc closes it; the list is read now, so an edited ~/.agent/models shows without a restart.
-  const shown = S.ui.help = {}; const text = (models) => { $('helptext').innerHTML = `<b>keys</b>\n ^k   find a bot        ^b   sidebar\n ^p   next task beside  Esc  close beside · stop\n ^o   all steps         ^d   detach (close)\n ↑ ↓  previous / next bot   ^,   settings\n Enter sends · Shift-Enter a new line\n\n /new NAME PROVIDER/MODEL     create a bot\n${models}\n<i>any key closes this</i>`; };
+  const shown = S.ui.help = {}; const text = (models) => { $('helptext').innerHTML = `<b>keys</b>\n ^k   find a bot        ^b   sidebar\n ^p   next task beside  Esc  close beside · stop\n ^o   all steps         ^d   detach (close)\n ↑ ↓  previous / next bot   ^,   settings\n Enter sends · Shift-Enter a new line\n\n /new NAME PROVIDER/MODEL [EFFORT]  create a bot\n${models}\n<i>any key closes this</i>`; };
   text('   reading ~/.agent/models'); $('helpwrap').classList.add('on');
   let models; try { const list = await Daemon.models(); models = list.length ? list.map((m) => `   ${esc(m.id)}`).join('\n') : '   none listed: Settings lists your providers\' models'; } catch (e) { models = `   ${esc(String(e?.message ?? e))}`; }
   if (S.ui.help === shown) text(models);
@@ -1849,8 +1863,15 @@ function modelChoices(b, list) {
   return [...mine.map((id) => ({ id, ok: true, on: id === current })), ...others.map((id) => ({ id, ok: false, on: false }))];
 }
 function modelMenuItems(b, list, error) {
+  // Effort first: a few fixed levels above a list that may scroll. An agent made with a level
+  // always sends one; one made without may go back to the model's own.
+  const effort = effortOf(b);
+  const items = [{ head: 'Effort' }];
+  if (!b.reasoning) items.push({ act: 'set-effort', who: b.name, v: '', label: 'default', on: !effort });
+  for (const level of effortsFor(b.model)) items.push({ act: 'set-effort', who: b.name, v: level, label: level, on: level === effort });
+  items.push({ sep: true });
   // Each provider under its own heading, so the menu says where a model comes from.
-  const items = []; let group = null;
+  let group = null;
   for (const c of modelChoices(b, list)) {
     const p = providerOf(c.id);
     if (p !== group) { if (group !== null) items.push({ sep: true }); items.push({ head: providerLabel(p) }); group = p; }
@@ -1872,6 +1893,14 @@ function setModel(name, model) {
   if (model === b.model) S.override.delete(name); else S.override.set(name, model);
   save(); return true;
 }
+// A level for the agent's next turns; its own level, or none when it has none, clears the pick.
+function setEffort(name, level) {
+  const b = bot(name); if (!b) return false;
+  if (!level || level === b.reasoning) S.effort.delete(name);
+  else if (effortsFor(b.model).includes(level)) S.effort.set(name, level);
+  else return false;
+  save(); return true;
+}
 async function modelMenu(pane, anchor) {
   const b = bot(PANE[pane].bot()); if (!b) return;
   // Read now, so an edited ~/.agent/models shows without a restart.
@@ -1891,30 +1920,31 @@ async function modelMenu(pane, anchor) {
 // been pointed at another.
 async function submit(text, pane = 'main', to = PANE[pane].bot()) {
   if (pane === 'main' && text.startsWith('/new ')) {
-    const [name, model] = text.slice(5).trim().split(/\s+/);
+    const [name, model, effort] = text.slice(5).trim().split(/\s+/);
     if (!name) throw new Error('name_required');
-    const m = model; if (!m) throw new Error('model_required: /new NAME PROVIDER/MODEL');
+    const m = model; if (!m) throw new Error('model_required: /new NAME PROVIDER/MODEL [EFFORT]');
+    // The daemon judges the level against the model's family.
     // Composed now, so an AGENTS.md edited since the window opened reaches this bot. One that
     // cannot be composed rejects here and nothing is created, as with the CLI's --agents.
     const policy = await Daemon.policy();
     const session = S.session;
-    const record = await Daemon.request('create', { bot: name, workspace: S.config.workspace, model: m, instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: S.config.tools });
+    const record = await Daemon.request('create', { bot: name, workspace: S.config.workspace, model: m, ...(effort ? { reasoning: effort } : {}), instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: S.config.tools });
     await enqueue(() => { if (S.session === session) seat(record, session); });
     await openOnly(name); toast(`created ${name} · ${policy.note}`); return;
   }
   if (text === '/help' || text === '?') { showHelp(pane); return; }
   const sw = pane === 'main' && swarmOf(to);
   if (sw) { await postToSwarm(sw, text); return; }
-  const b = bot(to); if (!b) throw new Error('no bot selected; /new NAME PROVIDER/MODEL creates one');
+  const b = bot(to); if (!b) throw new Error('no bot selected; /new NAME PROVIDER/MODEL [EFFORT] creates one');
   // An event can seat a bot before its snapshot identity arrives. Never send an unpinned name.
   if (b.id == null) throw new Error('bot_identity_pending: wait for attachment to finish');
-  const mode = sendMode(b), model = S.override.get(b.name), delivery = mode === 'send' ? 'reject' : mode;
+  const mode = sendMode(b), model = S.override.get(b.name), effort = S.effort.get(b.name), delivery = mode === 'send' ? 'reject' : mode;
   if (mode === 'side') { await sideChat(b.name, text); return; }
-  // A steer joins the running turn only on that turn's model and folder, so it names neither.
+  // A steer joins the running turn only on that turn's model, effort and folder, so it names none.
   // It also names the turn on screen, so a turn that ended meanwhile refuses it as stale_turn
   // rather than the message landing in whatever turn runs next. A bot keeps its folder, so a
   // message names one only for a bot that has none.
-  const where = delivery === 'steer' ? (b.runningTurn != null ? { expected_turn: b.runningTurn } : {}) : { ...home(b), ...(model && model !== b.model ? { model } : {}) };
+  const where = delivery === 'steer' ? (b.runningTurn != null ? { expected_turn: b.runningTurn } : {}) : { ...home(b), ...(model && model !== b.model ? { model } : {}), ...(effort && effort !== b.reasoning ? { reasoning: effort } : {}) };
   // The identity on screen, so a name that changed hands in between is refused rather than handed the prompt.
   try { await Daemon.request('submit', { bot: b.name, bot_id: b.id, request_id: `app-${crypto.randomUUID()}`, prompt: text, delivery, ...where }); }
   catch (e) { if (delivery === 'steer' && /stale_turn/.test(String(e?.message ?? e))) throw new Error('that turn ended; not steered'); throw e; }
@@ -1980,24 +2010,27 @@ async function remove(name) { await Daemon.request('delete', { bot: name }); }
 // the file it lacks, with that coordinator's model, so a failed write retries.
 // The app's own opinion of how a coordinator works is its `coordinator` profile: the folder's
 // `.agents/agents/coordinator.md`, the user's, or the one the app ships (app/agents/coordinator.md).
-async function createProject(dir, picked = null) {
+async function createProject(dir, picked = null, effort = null) {
   const info = await Daemon.project(dir);
   const existing = bot(info.coordinator);
   if (existing) {
     if (existing.workspace !== info.dir) throw new Error(`${info.coordinator} already belongs to ${existing.workspace ?? 'another folder'}`);
-    if (!info.file) await Daemon.writeProject({ dir: info.dir, name: info.name, model: existing.model });
+    if (!info.file) await Daemon.writeProject({ dir: info.dir, name: info.name, model: existing.model, reasoning: existing.reasoning ?? null });
     await openOnly(info.coordinator); return;
   }
   const policy = await Daemon.policy(info.dir, 'coordinator');
-  // A folder that already has a project file keeps its model; a new one takes the model picked for it,
-  // else its coordinator profile's.
-  const model = (info.file && info.model) || picked || policy.model;
+  // A folder that already has a project file keeps its model and effort; a new one takes the model
+  // picked for it, else its coordinator profile's, and the effort picked beside it.
+  const kept = !!(info.file && info.model);
+  const model = kept ? info.model : picked || policy.model;
   if (!model) throw new Error('model_required: choose a model');
+  const reasoning = (kept ? info.reasoning : effort) || null;
   if (picked) try { localStorage.setItem('agent:model', picked); } catch (_) {}
+  if (effort !== null) try { localStorage.setItem('agent:effort', effort); } catch (_) {}
   const session = S.session;
-  const record = await Daemon.request('create', { bot: info.coordinator, workspace: info.dir, model, instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: policy.tools ?? S.config.tools });
+  const record = await Daemon.request('create', { bot: info.coordinator, workspace: info.dir, model, ...(reasoning ? { reasoning } : {}), instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: policy.tools ?? S.config.tools });
   await enqueue(() => { if (S.session === session) seat(record, session); });
-  if (!info.file) await Daemon.writeProject({ dir: info.dir, name: info.name, model });
+  if (!info.file) await Daemon.writeProject({ dir: info.dir, name: info.name, model, reasoning });
   await openOnly(info.coordinator); toast(`project ${info.name} · ${policy.note}`);
 }
 function detach() { save(); Daemon.close(); }
@@ -2041,10 +2074,36 @@ const providerLabel = (name) => catalogOf(name)?.label ?? name;
 // would overwrite with the provider's defaults.
 const editable = (spec) => spec === specName(spec) ? !!catalogOf(spec) : !!catalogOf(specName(spec))?.parts
   && providerSpecs(catalogOf(specName(spec)).id, { AWS_REGION: spec.split('.')[1], AWS_BEARER_TOKEN_BEDROCK: 'x' }).includes(spec);
+// Effort: how hard a model thinks, picked beside its model when an agent is made; the model chip
+// changes it for the agent's next turns. Both families take low to xhigh and Anthropic's also max;
+// which of those a model accepts is its provider's to say. No level sends none, and the model uses
+// its own default.
+const EFFORTS = ['low', 'medium', 'high', 'xhigh'];
+// The wire family a provider speaks: what the fleet's records show, what a hand-set spec names, else
+// the catalog's. Anthropic is the only other family.
+function familyOf(provider) {
+  if (S.families.has(provider)) return S.families.get(provider);
+  const spec = ((S.setup?.settings ?? S.seenSettings)?.providers ?? []).find((s) => specName(s) === provider && String(s).includes('='));
+  if (spec) return String(spec).split('=')[1].split(',')[0];
+  const part = catalogOf(provider)?.parts?.find(([name]) => name === provider);
+  return part ? part[1] : provider === 'anthropic' ? 'anthropic' : 'responses';
+}
+const effortsFor = (model) => familyOf(providerOf(model)) === 'anthropic' ? [...EFFORTS, 'max'] : EFFORTS;
+function lastEffort() { try { return localStorage.getItem('agent:effort') ?? ''; } catch (_) { return ''; } }
+// An effort picker for `model`: its levels, `prefer` chosen when the model takes it. Where no label
+// names the field, each level says what it is.
+function effortSelectHTML(id, model, prefer = lastEffort(), labelled = false) {
+  const levels = model ? effortsFor(model) : EFFORTS, pick = levels.includes(prefer) ? prefer : '', word = labelled ? '' : ' effort';
+  return `<select id="${id}" aria-label="Effort" title="How hard the model thinks; the model chip changes it later"><option value=""${pick ? '' : ' selected'}>default${word}</option>${levels.map((l) => `<option value="${l}"${l === pick ? ' selected' : ''}>${l}${word}</option>`).join('')}</select>`;
+}
+// A model picked in a form offers that model's levels, keeping the level chosen when it still applies.
+function followModel(model, effortId, labelled = false) { const el = $(effortId); if (el) el.outerHTML = effortSelectHTML(effortId, model, el.value, labelled); }
 // A model picker: every listed model under its provider's name, the last one picked chosen.
 function lastModel() { try { return localStorage.getItem('agent:model'); } catch (_) { return null; } }
+// The model a picker over `list` starts on.
+const pickedModel = (list, prefer = null) => [prefer, lastModel()].find((m) => m && list.some((x) => x.id === m)) ?? '';
 function modelSelectHTML(id, list, prefer = null) {
-  const pick = [prefer, lastModel()].find((m) => m && list.some((x) => x.id === m)) ?? '';
+  const pick = pickedModel(list, prefer);
   const groups = new Map(); for (const m of list) { const label = providerLabel(providerOf(m.id)); if (!groups.has(label)) groups.set(label, []); groups.get(label).push(m); }
   const options = [...groups].map(([label, ms]) => `<optgroup label="${esc(label)}">${ms.map((m) => `<option value="${esc(m.id)}"${m.id === pick ? ' selected' : ''}>${esc(m.id.slice(providerOf(m.id).length + 1))}${m.note ? ` · ${esc(m.note)}` : ''}</option>`).join('')}</optgroup>`).join('');
   return `<select id="${id}" aria-label="Model">${pick ? '' : '<option value="" selected disabled>Choose a model</option>'}${options}</select>`;
@@ -2230,7 +2289,7 @@ function setupHTML() {
   const project = projects ? '' : S.config?.host
     ? `<p class="dim">A project on ${esc(S.config.host)} is made there for now: the app does not yet read a host's files (AGENTS.md, profiles, .agents/project.toml). Start its lead there with agent run --new --agents --bot NAME.lead; it shows here.</p>`
     : ready && specs.length && st.list.length
-    ? `<form id="setupproj"><label><span>Folder</span><input id="setupdir" autocomplete="off" spellcheck="false" value="${esc(S.config?.workspace ?? '')}"></label><label><span>Model</span>${modelSelectHTML('setupmodel', st.list)}</label><div class="row"><button type="submit" class="sbtn primary"${S.attached ? '' : ' disabled'}${busy}>Create project</button></div><p class="dim">The project's lead runs on this model; every agent you start can use another.</p></form>`
+    ? `<form id="setupproj"><label><span>Folder</span><input id="setupdir" autocomplete="off" spellcheck="false" value="${esc(S.config?.workspace ?? '')}"></label><label><span>Model</span>${modelSelectHTML('setupmodel', st.list)}</label><label><span>Effort</span>${effortSelectHTML('setupeffort', pickedModel(st.list), lastEffort(), true)}</label><div class="row"><button type="submit" class="sbtn primary"${S.attached ? '' : ' disabled'}${busy}>Create project</button></div><p class="dim">The project's lead runs on this model and effort; every agent you start can use others.</p></form>`
     : `<p class="dim">${specs.length ? 'No models listed yet: see the providers above, then Refresh models.' : 'Connect a provider first.'}</p>`;
   const step = (n, title, done, body) => body ? `<section class="${done ? 'done' : ''}"><h3><span class="num">${done ? '✓' : n}</span>${title}</h3>${body}</section>` : '';
   return `<div class="shead"><b>${ready && projects ? 'Settings' : 'Set up Agent'}</b><button type="button" class="ibtn" data-act="setup-close" title="Close" aria-label="Close"${busy}>✕</button></div>`
@@ -2344,7 +2403,7 @@ function showNewProject(on) {
   $('projdir').value = S.config?.workspace ?? ''; $('projdir').focus();
   // The lead's model, from every provider's list, read now so a refreshed list shows.
   $('projmodel').innerHTML = '';
-  Promise.all([Daemon.models(), S.setup?.settings ?? Daemon.settings?.().catch(() => null)]).then(([all, set]) => { const list = connected(all, set?.restartable === false && !S.setup?.settings ? null : set); if (!$('projform').hidden) $('projmodel').innerHTML = list.length ? modelSelectHTML('projsel', list) : '<span class="dim">no models listed: see Settings</span>'; }, (e) => { $('projmodel').textContent = String(e?.message ?? e); });
+  Promise.all([Daemon.models(), S.setup?.settings ?? Daemon.settings?.().catch(() => null)]).then(([all, set]) => { if (set) S.seenSettings = set; const list = connected(all, set?.restartable === false && !S.setup?.settings ? null : set); if (!$('projform').hidden) $('projmodel').innerHTML = list.length ? modelSelectHTML('projsel', list) + effortSelectHTML('projeffort', pickedModel(list)) : '<span class="dim">no models listed: see Settings</span>'; }, (e) => { $('projmodel').textContent = String(e?.message ?? e); });
 }
 
 // ---------- input ----------
@@ -2367,9 +2426,10 @@ for (const [pane, ids] of Object.entries(PANE)) {
 }
 $('projform').addEventListener('submit', async (e) => {
   e.preventDefault(); const dir = $('projdir').value.trim(); if (!dir) return;
-  try { await createProject(dir, $('projsel')?.value || null); showNewProject(false); focusInput('main'); } catch (err) { toast(String(err?.message ?? err), 5000); }
+  try { await createProject(dir, $('projsel')?.value || null, $('projeffort')?.value ?? null); showNewProject(false); focusInput('main'); } catch (err) { toast(String(err?.message ?? err), 5000); }
 });
-$('projform').addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target.id === 'projsel') { e.preventDefault(); $('projform').requestSubmit(); } else if (e.key === 'Escape') { showNewProject(false); focusInput('main'); e.preventDefault(); e.stopPropagation(); } });
+$('projform').addEventListener('change', (e) => { if (e.target.id === 'projsel') followModel(e.target.value, 'projeffort'); });
+$('projform').addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.target.id === 'projsel' || e.target.id === 'projeffort')) { e.preventDefault(); $('projform').requestSubmit(); } else if (e.key === 'Escape') { showNewProject(false); focusInput('main'); e.preventDefault(); e.stopPropagation(); } });
 $('pickerq').addEventListener('input', renderPicker);
 $('pickerq').addEventListener('keydown', async (e) => {
   const rows = pickerRows();
@@ -2386,7 +2446,7 @@ document.addEventListener('keydown', async (e) => {
   if (S.setup?.open) { if (e.key === 'Escape') { closeSetup(); e.preventDefault(); } return; }
   if ((e.ctrlKey || e.metaKey) && e.key === ',') { await openSetup(); e.preventDefault(); return; }
   // The finder and the folder field handle their own keys; Escape there must not stop a turn.
-  if (S.ui.picker || e.target.id === 'projdir' || e.target.id === 'projsel' || e.target.id === 'pickerq') return;
+  if (S.ui.picker || e.target.id === 'projdir' || e.target.id === 'projsel' || e.target.id === 'projeffort' || e.target.id === 'pickerq') return;
   const k = e.key, ctrl = e.ctrlKey || e.metaKey;
   if (S.ui.menu) { if (k === 'Escape') { closeMenu(); e.preventDefault(); } return; }
   if (ctrl && k === 'k') { openPicker(); e.preventDefault(); return; }
@@ -2403,12 +2463,13 @@ function failed(err) {
   const text = String(err?.message ?? err);
   if (S.setup?.open) { S.setup.error = text; renderSetup(); } else toast(text, 4000);
 }
+$('setup').addEventListener('change', (e) => { if (e.target.id === 'setupmodel') followModel(e.target.value, 'setupeffort', true); });
 $('setup').addEventListener('submit', async (e) => {
   e.preventDefault();
   const form = e.target;
   try {
     if (form.id === 'setupform') await connectProvider(S.setup.adding, Object.fromEntries([...form.querySelectorAll('input, select')].map((el) => [el.name, el.value.trim()])));
-    else if (form.id === 'setupproj') { const dir = $('setupdir').value.trim(), model = $('setupmodel').value; if (dir) { await createProject(dir, model); closeSetup(); } }
+    else if (form.id === 'setupproj') { const dir = $('setupdir').value.trim(), model = $('setupmodel').value; if (dir) { await createProject(dir, model, $('setupeffort')?.value ?? null); closeSetup(); } }
   } catch (err) { failed(err); }
 });
 async function act(el) {
@@ -2418,6 +2479,7 @@ async function act(el) {
     case 'model': await modelMenu(pane, { rect, up: true }); return;
     case 'sendmenu': showMenu(sendMenuItems(pane), { rect, up: true }); return;
     case 'set-model': setModel(who, v); render(); focusInput(who === S.ui.side ? 'side' : 'main'); return;
+    case 'set-effort': setEffort(who, v); render(); focusInput(who === S.ui.side ? 'side' : 'main'); return;
     case 'set-send': setSend(v); render(); focusInput(pane); return;
     case 'side-chat': await sideChat(who); return;
     case 'stop': await interrupt(who); return;

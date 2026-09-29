@@ -331,6 +331,8 @@ pub struct Started {
 pub struct TurnOptions {
     pub workspace: Option<String>,
     pub model: Option<String>,
+    /// The effort level this turn runs at; none is the bot's own.
+    pub reasoning: Option<String>,
     pub delivery: Delivery,
     /// A strict steer: for this running turn or nobody. Never absorbed by
     /// another turn, never started as new work; `stale_turn` instead.
@@ -908,6 +910,8 @@ pub struct TurnContext {
     pub created_by_id: Option<i64>,
     pub workspace: String,
     pub model: String,
+    /// The effort level this turn runs at: its own, else the bot's.
+    pub reasoning: Option<String>,
     /// The model of the bot's latest earlier turn that started, when its
     /// calls sent the history this turn starts from: a call sent its view
     /// last, and something follows its prompt. `None` otherwise, as when
@@ -983,7 +987,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 41;
+    pub const SCHEMA: i32 = 42;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1138,7 +1142,7 @@ impl Database {
                 retries INTEGER NOT NULL DEFAULT 0, paced_ms INTEGER NOT NULL DEFAULT 0,
                 delivery TEXT NOT NULL DEFAULT 'reject', expected_turn INTEGER,
                 cached_input_tokens INTEGER NOT NULL DEFAULT 0,
-                from_bot TEXT, from_turn INTEGER, from_id INTEGER, origin TEXT,
+                from_bot TEXT, from_turn INTEGER, from_id INTEGER, origin TEXT, reasoning TEXT,
                 UNIQUE(bot,request_id));
             CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
             CREATE INDEX IF NOT EXISTS turns_started ON turns(bot,id) WHERE started_ms IS NOT NULL;
@@ -1640,7 +1644,7 @@ impl Database {
         // The event carries the list record's fields, so a follower can
         // seat a new bot without a request per creation.
         let mut data = json!({"id":id,"provider":binding.provider,"model":binding.model,
-            "workspace":workspace,"status":"idle","running_turn":null,
+            "reasoning":binding.reasoning,"workspace":workspace,"status":"idle","running_turn":null,
             "created_by":binding.created_by,"created_by_id":created_by_id});
         if let Some(gates) = &gates {
             data["gates"] = serde_json::from_str(gates)?;
@@ -3388,7 +3392,7 @@ impl Database {
         let prior: Option<(i64, String, String, TurnOptions, Option<i64>)> = self
             .conn
             .query_row(
-                "SELECT id,prompt,status,workspace,model,delivery,expected_turn,prompt_node,from_bot,from_turn,origin
+                "SELECT id,prompt,status,workspace,model,delivery,expected_turn,prompt_node,from_bot,from_turn,origin,reasoning
                  FROM turns WHERE bot=? AND request_id=?",
                 params![name, request_id],
                 |r| {
@@ -3399,6 +3403,7 @@ impl Database {
                         TurnOptions {
                             workspace: r.get(3)?,
                             model: r.get(4)?,
+                            reasoning: r.get(11)?,
                             delivery: Delivery::parse(&r.get::<_, String>(5)?).unwrap_or_default(),
                             expected_turn: r.get(6)?,
                             from: match (r.get::<_, Option<String>>(8)?, r.get(9)?) {
@@ -3463,6 +3468,11 @@ impl Database {
             if from_id.is_none() {
                 return fail_with("invalid_from", format!("{from} has no turn {turn}"));
             }
+        }
+        if let Some(level) = &options.reasoning
+            && !bot.family()?.reasoning_levels().contains(&level.as_str())
+        {
+            return fail_with("invalid_reasoning_level", level.as_str());
         }
         if let Err(error) = validate(&bot, options.model.as_deref()) {
             // An omitted steer model inherits the active turn for absorption.
@@ -3561,15 +3571,16 @@ impl Database {
             )?
             .query_row([], |r| r.get(0))?;
         tx.prepare_cached(
-            "INSERT INTO turns(id,bot,request_id,prompt,status,workspace,model,delivery,expected_turn,from_bot,from_turn,from_id,origin)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO turns(id,bot,request_id,prompt,status,workspace,model,delivery,expected_turn,from_bot,from_turn,from_id,origin,reasoning)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         )?.execute(
             // Queued work keeps the folder it was sent to even if the bot
             // moves before it starts; a steer without one joins any turn.
             params![turn, name, request_id, prompt, status,
                 if options.delivery == Delivery::Steer { options.workspace.as_deref() } else { Some(workspace.as_str()) },
                 options.model, options.delivery.name(), options.expected_turn,
-                options.from.as_ref().map(|f| &f.0), options.from.as_ref().map(|f| f.1), from_id, options.origin],
+                options.from.as_ref().map(|f| &f.0), options.from.as_ref().map(|f| f.1), from_id, options.origin,
+                options.reasoning],
         )?;
         if moved {
             tx.prepare_cached("UPDATE bots SET workspace=? WHERE name=?")?
@@ -3581,13 +3592,16 @@ impl Database {
             .model
             .clone()
             .unwrap_or_else(|| format!("{}/{}", bot.provider, bot.model));
+        let reasoning = options.reasoning.as_ref().or(bot.reasoning.as_ref());
         let (kind, data) = if status == "running" {
-            let mut data = json!({"request_id":request_id,"workspace":workspace,"model":model});
+            let mut data = json!({"request_id":request_id,"workspace":workspace,"model":model,
+                "reasoning":reasoning});
             start_locked(&tx, &bot, turn, prompt, &mut data)?;
             ("accepted", data)
         } else {
             let mut data = json!({"request_id":request_id,"status":status,
-                "delivery":options.delivery.name(),"workspace":workspace,"model":model});
+                "delivery":options.delivery.name(),"workspace":workspace,"model":model,
+                "reasoning":reasoning});
             sender_fields(
                 &mut data,
                 options
@@ -3620,7 +3634,8 @@ impl Database {
         turn: i64,
         validate: impl FnOnce(&Bot, Option<&str>) -> Result<()>,
     ) -> Result<(Value, bool)> {
-        let (name, request_id, prompt, status, workspace, model, strict): (
+        // Bot, request, prompt, status, folder, model, strict, effort.
+        type Queued = (
             String,
             String,
             String,
@@ -3628,10 +3643,12 @@ impl Database {
             Option<String>,
             Option<String>,
             bool,
-        ) = self
+            Option<String>,
+        );
+        let (name, request_id, prompt, status, workspace, model, strict, reasoning): Queued = self
             .conn
             .query_row(
-                "SELECT bot,request_id,prompt,status,workspace,model,expected_turn IS NOT NULL FROM turns WHERE id=?",
+                "SELECT bot,request_id,prompt,status,workspace,model,expected_turn IS NOT NULL,reasoning FROM turns WHERE id=?",
                 [turn],
                 |r| {
                     Ok((
@@ -3642,6 +3659,7 @@ impl Database {
                         r.get(4)?,
                         r.get(5)?,
                         r.get(6)?,
+                        r.get(7)?,
                     ))
                 },
             )
@@ -3670,8 +3688,10 @@ impl Database {
             .or(bot.workspace.clone())
             .ok_or(Error::new("workspace_required"))?;
         let model = model.unwrap_or_else(|| format!("{}/{}", bot.provider, bot.model));
+        let reasoning = reasoning.or(bot.reasoning.clone());
         let tx = self.conn.savepoint()?;
-        let mut data = json!({"request_id":request_id,"workspace":workspace,"model":model});
+        let mut data = json!({"request_id":request_id,"workspace":workspace,"model":model,
+            "reasoning":reasoning});
         start_locked(&tx, &bot, turn, &prompt, &mut data)?;
         let cursor = event(&tx, &name, Some(turn), "accepted", data.clone())?;
         tx.commit()?;
@@ -3813,6 +3833,7 @@ impl Database {
                 "SELECT s.id,s.prompt,length(CAST(s.prompt AS BLOB)),
                     (s.workspace IS NULL OR s.workspace=COALESCE(t.workspace,b.workspace))
                     AND (s.model IS NULL OR s.model=COALESCE(t.model,b.provider||'/'||b.model))
+                    AND (s.reasoning IS NULL OR s.reasoning IS COALESCE(t.reasoning,b.reasoning))
                  FROM turns s JOIN turns t ON t.id=?2 JOIN bots b ON b.name=s.bot
                  WHERE s.bot=?1 AND s.status='queued' AND s.delivery='steer' AND s.id<=?4
                    AND (s.expected_turn IS NULL OR s.expected_turn=?2)
@@ -4873,13 +4894,14 @@ impl Database {
     }
     /// The workspace and model reference a running turn must use.
     pub fn context(&self, turn: i64) -> Result<TurnContext> {
-        let (workspace, model, model_rounds, view_sent): (
+        let (workspace, model, model_rounds, view_sent, reasoning): (
             Option<String>,
             Option<String>,
             usize,
             Option<bool>,
+            Option<String>,
         ) = self.conn.query_row(
-            "SELECT workspace,model,model_rounds,view_sent FROM turns WHERE id=?",
+            "SELECT workspace,model,model_rounds,view_sent,reasoning FROM turns WHERE id=?",
             [turn],
             |r| {
                 Ok((
@@ -4887,6 +4909,7 @@ impl Database {
                     r.get(1)?,
                     r.get::<_, u32>(2)? as usize,
                     r.get(3)?,
+                    r.get(4)?,
                 ))
             },
         )?;
@@ -4917,6 +4940,7 @@ impl Database {
                 .or(bot.workspace)
                 .ok_or(Error::new("workspace_required"))?,
             model: model.unwrap_or(default),
+            reasoning: reasoning.or(bot.reasoning),
             previous_model,
             created_by: bot.created_by,
             created_by_id: bot.created_by_id,
@@ -5679,7 +5703,7 @@ impl Database {
             )?;
         }
         let mut data = json!({"id":id,"source":source,"checkpoint":checkpoint,"node":checkpoint,
-            "provider":parent.provider,"model":parent.model,
+            "provider":parent.provider,"model":parent.model,"reasoning":parent.reasoning,
             "workspace":workspace,"status":"idle","running_turn":null,
             "created_by":created_by,"created_by_id":created_by_id});
         if let Some(gates) = &gates {
@@ -6284,7 +6308,7 @@ impl Database {
                     t.model_rounds,t.started_ms,t.finished_ms,
                     substr(CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END,1,200),
                     length(CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END),
-                    t.retries,t.paced_ms,t.delivery,t.cached_input_tokens
+                    t.retries,t.paced_ms,t.delivery,t.cached_input_tokens,COALESCE(t.reasoning,b.reasoning)
              FROM turns t JOIN bots b ON b.name=t.bot LEFT JOIN nodes n ON n.id=t.prompt_node
              WHERE t.bot=? AND t.id>? ORDER BY t.id LIMIT ?",
         )?;
@@ -6300,7 +6324,8 @@ impl Database {
             turns.push(
                 json!({"turn":r.get::<_, i64>(0)?,"request_id":r.get::<_, String>(1)?,
                 "status":r.get::<_, String>(2)?,"workspace":r.get::<_, Option<String>>(3)?,
-                "model":r.get::<_, String>(4)?,"input_tokens":r.get::<_, i64>(5)?,
+                "model":r.get::<_, String>(4)?,"reasoning":r.get::<_, Option<String>>(16)?,
+                "input_tokens":r.get::<_, i64>(5)?,
                 "output_tokens":r.get::<_, i64>(6)?,"model_rounds":r.get::<_, i64>(7)?,
                 "started_ms":r.get::<_, Option<i64>>(8)?,"finished_ms":r.get::<_, Option<i64>>(9)?,
                 "prompt_preview":preview,"prompt_bytes":r.get::<_, i64>(11)?,
@@ -7562,6 +7587,15 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
                 (SELECT from_id FROM turns WHERE id=events.turn))
              WHERE kind IN ('accepted','queued') AND json_type(data,'$.from')='object';",
         )?;
+    }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='reasoning')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 41 -> 42: a turn's own effort level. None was recorded before, so
+        // every stored turn ran at its bot's.
+        conn.execute_batch("ALTER TABLE turns ADD COLUMN reasoning TEXT;")?;
     }
     Ok(())
 }

@@ -1024,6 +1024,8 @@ fn sh(
     // bot must not pass on one the daemon itself was started with.
     process.env_remove("AGENT_PARENT");
     process.env_remove("AGENT_PARENT_ID");
+    // Likewise a set AGENT_REASONING is this bot's own level.
+    process.env_remove("AGENT_REASONING");
     // The automatic approver's key is for the approver alone, however the
     // daemon was started.
     process.env_remove(JUDGE_KEY);

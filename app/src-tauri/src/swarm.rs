@@ -5,9 +5,10 @@
 //! attached to another store never sees them:
 //!
 //! - `swarm.toml`: its project, goal, folder, token budget, its mix (rows
-//!   of an identity, a model and a share of the agents), members with the id
-//!   of the bot each one is and the row it was made from, and whether you
-//!   stopped it. Only the app writes it, under the board's lock.
+//!   of an identity, a model, its effort level and a share of the agents),
+//!   members with the id of the bot each one is and the row it was made
+//!   from, and whether you stopped it. Only the app writes it, under the
+//!   board's lock.
 //! - `board.jsonl`: one post a line, appended under a lock, each saying how
 //!   many agents it was sent to.
 //! - `state.json`: what the board's lines add up to (roles, proposals and
@@ -268,12 +269,14 @@ impl Swarm {
 }
 
 /// A row of a swarm's mix: its agents' identity (a profile, or none for a
-/// plain agent), their model, and their share of the agents in percent.
+/// plain agent), their model and its effort level (none for the model's
+/// own), and their share of the agents in percent.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Mix {
     pub identity: String,
     pub model: String,
     pub share: u32,
+    pub reasoning: Option<String>,
 }
 
 /// Rows of a mix; the page offers fewer.
@@ -287,6 +290,11 @@ impl Mix {
             identity: value["identity"].as_str()?.to_owned(),
             model: value["model"].as_str()?.to_owned(),
             share: u32::try_from(value["share"].as_u64()?).ok()?,
+            reasoning: match &value["reasoning"] {
+                Value::Null => None,
+                level => Some(level.as_str()?.to_owned()),
+            }
+            .filter(|level| !level.is_empty()),
         })
     }
 
@@ -295,6 +303,10 @@ impl Mix {
             identity: value.get("identity")?.as_str()?.to_owned(),
             model: value.get("model")?.as_str()?.to_owned(),
             share: u32::try_from(value.get("share")?.as_integer()?).ok()?,
+            reasoning: match value.get("reasoning") {
+                None => None,
+                Some(level) => Some(level.as_str()?.to_owned()),
+            },
         })
     }
 
@@ -303,11 +315,15 @@ impl Mix {
         row.insert("identity".into(), self.identity.clone().into());
         row.insert("model".into(), self.model.clone().into());
         row.insert("share".into(), i64::from(self.share).into());
+        if let Some(level) = &self.reasoning {
+            row.insert("reasoning".into(), level.clone().into());
+        }
         toml::Value::Table(row)
     }
 
     fn json(&self) -> Value {
-        json!({"identity": self.identity, "model": self.model, "share": self.share})
+        json!({"identity": self.identity, "model": self.model, "share": self.share,
+            "reasoning": self.reasoning})
     }
 }
 
@@ -322,6 +338,14 @@ pub fn valid_mix(mix: &[Mix]) -> Result<(), String> {
     for row in mix {
         if row.model.trim().is_empty() {
             return Err("invalid_mix: every row needs a model".into());
+        }
+        // The daemon judges the level against the model's family.
+        if row
+            .reasoning
+            .as_deref()
+            .is_some_and(|level| level.is_empty() || !level.bytes().all(|b| b.is_ascii_lowercase()))
+        {
+            return Err("invalid_mix: an effort level is a lowercase word".into());
         }
         if row.share == 0 || row.share > 100 {
             return Err(format!(
@@ -1656,7 +1680,7 @@ async fn create(
         };
         let params = json!({
             "bot": name, "workspace": swarm.workspace, "model": mix.model,
-            "instructions": policy["instructions"],
+            "reasoning": mix.reasoning, "instructions": policy["instructions"],
             "compaction_instructions": policy["compaction_instructions"],
             "tools": tools, "budget_tokens": each,
         });
@@ -2975,7 +2999,7 @@ pub fn cli(args: &[String]) -> i32 {
 const ALONE: &str = "AGENT_SWARM_START_ALONE";
 
 /// What `start` takes from a coordinator's shell, besides the goal after `--`.
-const START_USAGE: &str = "usage: start [--agents N] [--budget MILLIONS] [--council 3] [--in-project] [--row MODEL,SHARE[,IDENTITY]]... -- GOAL";
+const START_USAGE: &str = "usage: start [--agents N] [--budget MILLIONS] [--council 3] [--in-project] [--row MODEL,SHARE[,IDENTITY[,EFFORT]]]... -- GOAL";
 
 /// Agents, budget in millions of tokens and organization when not given:
 /// what the page's sheet offers first.
@@ -3041,18 +3065,22 @@ fn parse_start(args: &[String]) -> Result<Asked, String> {
             "--in-project" => asked.shared = false,
             "--row" => {
                 let row = value()?;
-                let mut parts = row.splitn(3, ',');
-                let (model, share, identity) = (parts.next(), parts.next(), parts.next());
+                let mut parts = row.splitn(4, ',');
+                let (model, share, identity, effort) =
+                    (parts.next(), parts.next(), parts.next(), parts.next());
                 let share = share.and_then(|s| s.trim().trim_end_matches('%').parse().ok());
                 let (Some(model), Some(share)) = (model, share) else {
                     return Err(bad(format!(
-                        "invalid_mix: {row} is not MODEL,SHARE[,IDENTITY]"
+                        "invalid_mix: {row} is not MODEL,SHARE[,IDENTITY[,EFFORT]]"
                     )));
                 };
                 asked.mix.push(Mix {
                     identity: identity.unwrap_or_default().trim().to_owned(),
                     model: model.trim().to_owned(),
                     share,
+                    reasoning: effort
+                        .map(|e| e.trim().to_owned())
+                        .filter(|e| !e.is_empty()),
                 });
             }
             _ => return Err(bad(format!("invalid_start: {flag}"))),
@@ -3132,7 +3160,8 @@ pub fn start_cli(args: &[String]) -> i32 {
             if me["id"].as_i64() != Some(id) {
                 return Err(format!("{lead} is not this shell's bot any more"));
             }
-            // This turn's model, which the shell names, else the bot's own.
+            // This turn's model, which the shell names, else the bot's own,
+            // at the lead's own effort level.
             let model = std::env::var("AGENT_MODEL")
                 .ok()
                 .filter(|m| !m.is_empty())
@@ -3142,6 +3171,7 @@ pub fn start_cli(args: &[String]) -> i32 {
                     identity: String::new(),
                     model,
                     share: 100,
+                    reasoning: me["reasoning"].as_str().map(str::to_owned),
                 }]
             } else {
                 asked.mix
@@ -3231,6 +3261,7 @@ mod tests {
                 identity: String::new(),
                 model: "openai/gpt-6-luna".into(),
                 share: 100,
+                reasoning: None,
             }],
             members: members.iter().map(|m| m.to_string()).collect(),
             ids: members
@@ -4012,6 +4043,7 @@ mod tests {
             identity: identity.into(),
             model: model.into(),
             share,
+            reasoning: None,
         };
         assert!(valid_mix(&[row("", "a/x", 60), row("reviewer", "b/y", 40)]).is_ok());
         for (bad, why) in [
@@ -4054,6 +4086,7 @@ mod tests {
             identity: "reviewer".into(),
             model: "b/y".into(),
             share: 0,
+            reasoning: None,
         });
         s.rows.insert(agent(2), 1);
         let dir = Path::new("/h/.agent/swarms/abc/agent.latency");
@@ -4188,11 +4221,13 @@ mod tests {
                 identity: String::new(),
                 model: "a/x".into(),
                 share: 50,
+                reasoning: None,
             },
             Mix {
                 identity: "reviewer".into(),
                 model: "b/y".into(),
                 share: 50,
+                reasoning: Some("xhigh".into()),
             },
         ];
         // The goal names the swarm; its agents are dealt to the mix's rows.
@@ -4214,12 +4249,20 @@ mod tests {
                 start("goal", 4, mix.clone()),
             ))
             .unwrap();
-        // Each agent has its row's model and identity, and a quarter of the budget.
+        // Each agent has its row's model, effort and identity, and a quarter of the budget.
         let creates = fake.ops("create");
         assert_eq!(creates.len(), 4);
         for create in &creates {
             let reviewer = create["bot"] == "p.goal-2" || create["bot"] == "p.goal-4";
             assert_eq!(create["model"], if reviewer { "b/y" } else { "a/x" });
+            assert_eq!(
+                create["reasoning"],
+                if reviewer {
+                    json!("xhigh")
+                } else {
+                    Value::Null
+                }
+            );
             assert_eq!(create["budget_tokens"], 1_000);
             assert_eq!(create["workspace"], project.to_str().unwrap());
             let text = create["instructions"].as_str().unwrap();
@@ -4329,6 +4372,7 @@ mod tests {
             identity: "reader".into(),
             model: "a/x".into(),
             share: 100,
+            reasoning: None,
         }];
         let error = rt
             .block_on(super::start(
@@ -4350,6 +4394,7 @@ mod tests {
             identity: String::new(),
             model: "a/x".into(),
             share,
+            reasoning: None,
         };
         assert_eq!(deal(&[row(50), row(50)], 4), [0, 1, 0, 1]);
         assert_eq!(deal(&[row(75), row(25)], 4), [0, 0, 1, 0]);
@@ -4370,7 +4415,7 @@ mod tests {
     fn a_coordinator_asks_for_a_swarm_with_flags_and_a_goal() {
         let args = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
         let asked = parse_start(&args(
-            "--agents 6 --budget 12.5 --council 3 --in-project --row openai/gpt-6-luna,70 --row b/y,30,reviewer -- Halve p99.",
+            "--agents 6 --budget 12.5 --council 3 --in-project --row openai/gpt-6-luna,70,,high --row b/y,30,reviewer -- Halve p99.",
         ))
         .unwrap();
         assert_eq!(
@@ -4384,12 +4429,14 @@ mod tests {
                     Mix {
                         identity: String::new(),
                         model: "openai/gpt-6-luna".into(),
-                        share: 70
+                        share: 70,
+                        reasoning: Some("high".into()),
                     },
                     Mix {
                         identity: "reviewer".into(),
                         model: "b/y".into(),
-                        share: 30
+                        share: 30,
+                        reasoning: None,
                     },
                 ],
                 goal: "Halve p99.".into(),
@@ -4462,6 +4509,7 @@ mod tests {
                 identity: String::new(),
                 model: "a/x".into(),
                 share: 100,
+                reasoning: None,
             }],
             agents: 1,
             budget_tokens: 1_000,
@@ -4507,6 +4555,7 @@ mod tests {
                 identity: String::new(),
                 model: "a/x".into(),
                 share: 100,
+                reasoning: None,
             }],
             agents: 2,
             budget_tokens: 2_000,
@@ -4523,6 +4572,7 @@ mod tests {
                 identity: String::new(),
                 model: "a/x".into(),
                 share: 100,
+                reasoning: None,
             }],
             agents: 2,
             budget_tokens: 2_000,

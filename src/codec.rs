@@ -28,6 +28,16 @@ impl Family {
             _ => None,
         }
     }
+    /// The effort levels a bot of this family may be created with: the
+    /// Responses `reasoning.effort` values and Anthropic's
+    /// `output_config.effort` ones. Which of them a model takes is the
+    /// provider's to say.
+    pub fn reasoning_levels(self) -> &'static [&'static str] {
+        match self {
+            Family::Responses => &["low", "medium", "high", "xhigh"],
+            Family::Anthropic => &["low", "medium", "high", "xhigh", "max"],
+        }
+    }
     /// The quota a model draws on. Dated snapshots and their alias share one
     /// allowance at both providers, so they share one pool: `gpt-5.6-luna`
     /// and `gpt-5.6-luna-2026-05-01`, `claude-sonnet-5` and

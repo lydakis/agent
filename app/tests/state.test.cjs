@@ -33,7 +33,7 @@ function page(daemon = {}, storage = null) {
   });
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -710,6 +710,52 @@ test('the model chip offers every provider of the bot\'s family and keeps unknow
   assert.equal(p.S.bots.get('late').family, 'anthropic');
 });
 
+test('New project offers max to a hand-set Claude provider before Settings has been opened', async () => {
+  const p = shell({ models: async () => [{ id: 'mine/claude' }], settings: async () => ({ providers: ['mine=anthropic,https://synthetic.invalid/v1'], keys: [] }) }, new Map([['agent:model', 'mine/claude']]));
+  p.showNewProject(true);
+  await settle();
+  assert.equal(p.S.setup?.settings ?? null, null, 'Settings was never opened');
+  assert.match(p.elements.get('projmodel').innerHTML, /<option value="max">max effort<\/option>/);
+});
+
+test('the model chip changes the effort of an agent\'s next turns and never of a steer', async () => {
+  const sent = []; const storage = new Map();
+  const p = shell({ request: async (op, q) => { sent.push(q); } }, storage);
+  p.upsert({ name: 'lead', id: 1, provider: 'openai', family: 'responses', model: 'gpt-6-luna', reasoning: 'high', status: 'idle', running_turn: null });
+  p.upsert({ name: 'plain', id: 2, provider: 'openai', family: 'responses', model: 'gpt-6-luna', status: 'idle', running_turn: null });
+  p.S.selected = 'lead';
+  const lead = p.S.bots.get('lead');
+  const levels = (b) => Array.from(p.modelMenuItems(b, []).filter((i) => i.act === 'set-effort'), (i) => [i.label, !!i.on]);
+  // An agent made with a level always sends one; Claude's max is not offered to OpenAI's.
+  assert.deepEqual(levels(lead), [['low', false], ['medium', false], ['high', true], ['xhigh', false]]);
+  assert.equal(p.setEffort('lead', 'max'), false);
+  assert.equal(p.setEffort('lead', 'xhigh'), true);
+  assert.deepEqual(levels(lead).find(([, on]) => on), ['xhigh', true]);
+  await p.submit('think harder'); assert.equal(sent.at(-1).reasoning, 'xhigh');
+  // A steer joins the running turn at that turn's level, so it names none.
+  p.upsert({ name: 'lead', id: 1, provider: 'openai', model: 'gpt-6-luna', status: 'running', running_turn: 5 });
+  p.setSend('queue'); await p.submit('next'); assert.equal(sent.at(-1).reasoning, 'xhigh', 'queued work runs at the pick');
+  p.setSend('steer'); await p.submit('also'); assert.equal(sent.at(-1).delivery, 'steer'); assert.equal('reasoning' in sent.at(-1), false);
+  p.upsert({ name: 'lead', id: 1, provider: 'openai', model: 'gpt-6-luna', status: 'idle', running_turn: null });
+  // Its own level again sends none: the agent's own applies.
+  p.setEffort('lead', 'high');
+  await p.submit('back'); assert.equal('reasoning' in sent.at(-1), false);
+  // An agent made without a level can go back to the model's own.
+  const plain = p.S.bots.get('plain');
+  assert.deepEqual(levels(plain)[0], ['default', true]);
+  p.setEffort('plain', 'low'); p.S.selected = 'plain';
+  await p.submit('quick'); assert.equal(sent.at(-1).reasoning, 'low');
+  // The pick comes back for the same identity only.
+  p.setEffort('lead', 'medium'); p.save();
+  const q = shell({}, storage);
+  q.upsert({ name: 'lead', id: 1, provider: 'openai', family: 'responses', model: 'gpt-6-luna', reasoning: 'high' });
+  q.upsert({ name: 'plain', id: 9, provider: 'openai', family: 'responses', model: 'gpt-6-luna' });
+  q.restore();
+  assert.equal(q.S.effort.get('lead'), 'medium');
+  assert.equal(q.S.effort.has('plain'), false);
+  p.setEffort('plain', ''); assert.equal(p.S.effort.has('plain'), false);
+});
+
 test('a saved model pick comes back only for the same bot identity', () => {
   const storage = new Map();
   const p = shell({}, storage);
@@ -882,11 +928,43 @@ test('a new project creates its coordinator in the folder, in its role, writes i
   // The coordinator profile composes the whole text; its model and tools apply when the project names none.
   assert.deepEqual(calls.find(([op]) => op === 'policy').slice(1), ['/synthetic/weather', 'coordinator']);
   assert.deepEqual([create.bot, create.workspace, create.model, create.instructions, Array.from(create.tools)], ['weather.lead', '/synthetic/weather', 'alpha/role', 'rules', ['shell', 'wait']]);
-  assert.deepEqual({ ...calls.find(([op]) => op === 'write')[1] }, { dir: '/synthetic/weather', name: 'weather', model: 'alpha/role' });
+  assert.deepEqual({ ...calls.find(([op]) => op === 'write')[1] }, { dir: '/synthetic/weather', name: 'weather', model: 'alpha/role', reasoning: null });
+  assert.equal('reasoning' in create, false, 'no effort picked sends none: the model uses its own');
   assert.equal(p.S.selected, 'weather.lead');
   const before = calls.length;
   await p.createProject('/synthetic/weather');
   assert.equal(calls.filter(([op]) => op === 'create').length, 1); assert.equal(calls.length, before);
+});
+
+test('an agent\'s effort is picked beside its model, kept in the project file, and shown with its model', async () => {
+  const sent = []; const storage = new Map(); let file = null;
+  const p = shell({
+    project: async (dir) => ({ dir, name: 'weather', coordinator: 'weather.lead', model: file?.model ?? null, reasoning: file?.reasoning ?? null, file: !!file }),
+    policy: async () => ({ instructions: 'rules', compaction_instructions: 'summary', note: 'test' }),
+    writeProject: async (q) => { sent.push(['write', { ...q }]); },
+    request: async (op, q) => { sent.push([op, { ...q }]); return op === 'create' ? { name: q.bot, id: sent.length, provider: q.model.split('/')[0], model: q.model.split('/')[1], reasoning: q.reasoning ?? null, workspace: q.workspace ?? '/synthetic' } : { nodes: [], next_from: null }; },
+  }, storage);
+  await p.createProject('/synthetic/weather', 'anthropic/claude-x', 'max');
+  const creates = () => sent.filter(([op]) => op === 'create').map(([, q]) => q);
+  assert.equal(creates()[0].reasoning, 'max');
+  assert.deepEqual(sent.find(([op]) => op === 'write')[1], { dir: '/synthetic/weather', name: 'weather', model: 'anthropic/claude-x', reasoning: 'max' });
+  assert.equal(p.S.bots.get('weather.lead').reasoning, 'max');
+  assert.equal(storage.get('agent:effort'), 'max', 'the last pick is offered next time, as the model is');
+  // A folder whose file names a model keeps that model's effort, whatever was picked.
+  p.S.bots.clear(); file = { model: 'alpha/one', reasoning: 'low' };
+  await p.createProject('/synthetic/weather', 'anthropic/claude-x', 'high');
+  assert.deepEqual([creates()[1].model, creates()[1].reasoning], ['alpha/one', 'low']);
+  // /new takes an effort after the model.
+  await p.submit('/new Bob anthropic/claude-x max');
+  await p.submit('/new Ann openai/gpt-6-luna xhigh');
+  await p.submit('/new Cy openai/gpt-6-luna');
+  assert.deepEqual(creates().slice(2).map((q) => [q.bot, q.reasoning]), [['Bob', 'max'], ['Ann', 'xhigh'], ['Cy', undefined]]);
+  // A creation event from another client carries the level, as the list does.
+  await p.onEvent({ event: 'created', bot: 'Eve', cursor: 900, data: { id: 90, provider: 'openai', model: 'gpt-6-luna', reasoning: 'high', status: 'idle', running_turn: null } });
+  assert.equal(p.S.bots.get('Eve').reasoning, 'high');
+  // An event that does not name the level leaves the one known.
+  p.upsert({ name: 'Eve', id: 90, provider: 'openai', model: 'gpt-6-luna', status: 'running' });
+  assert.equal(p.S.bots.get('Eve').reasoning, 'high');
 });
 
 test('the coordinator the app ships gives editing tasks worktrees and cleans up failed starts', () => {
@@ -1198,10 +1276,12 @@ test('the sheet offers the folder\'s profiles as identities and shows each row\'
     settings: async () => ({ providers: ['alpha', 'beta'] }),
     profiles: async (dir) => { assert.equal(dir, '/synthetic/app'); return [{ name: 'reviewer', summary: 'Reviews', model: 'beta/two' }]; },
   });
-  p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', workspace: '/synthetic/app' });
+  p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', reasoning: 'high', workspace: '/synthetic/app' });
   const el = (id) => p.context.document.getElementById(id);
   el('sw-n').value = '4'; el('sw-n').id = 'sw-n'; el('sw-budget').value = '3'; el('sw-budget').id = 'sw-budget';
   await p.openSwarmSheet('app');
+  // Its agents start on the lead's model and effort.
+  assert.match(el('sw-mix').innerHTML, /data-mix="0" data-f="reasoning"[^>]*>[\s\S]*?<option value="high" selected>high<\/option>/);
   assert.match(el('sw-mix').innerHTML, /<option value="" selected>Plain agent<\/option><option value="reviewer">reviewer<\/option>/);
   assert.match(el('sw-mix').innerHTML, /4 agents/);
   assert.equal(el('sw-each').textContent, 'about 750k tokens each');
@@ -1762,7 +1842,7 @@ test('the model chip names each provider above its models', () => {
   const p = shell();
   p.upsert({ name: 'lead', id: 1, provider: 'bedrock', family: 'anthropic', model: 'claude' });
   const items = p.modelMenuItems(p.S.bots.get('lead'), [{ id: 'bedrock/claude' }, { id: 'openai/gpt' }]);
-  assert.deepEqual(Array.from(items, (i) => i.head ?? (i.sep ? '—' : i.label)), ['Amazon Bedrock', 'claude', '—', 'OpenAI', 'gpt']);
+  assert.deepEqual(Array.from(items, (i) => i.head ?? (i.sep ? '—' : i.label)), ['Effort', 'default', 'low', 'medium', 'high', 'xhigh', 'max', '—', 'Amazon Bedrock', 'claude', '—', 'OpenAI', 'gpt']);
 });
 
 test('a daemon with no provider to run opens setup instead of an error', async () => {
