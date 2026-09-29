@@ -50,13 +50,20 @@ pub struct Starts {
 }
 
 impl Starts {
-    pub async fn start(&mut self, agent: &Path, store: &Path) -> Result<(), String> {
+    /// Start the store's daemon, on `socket` when it listens somewhere other
+    /// than the store's own rendezvous.
+    pub async fn start(
+        &mut self,
+        agent: &Path,
+        store: &Path,
+        socket: Option<&Path>,
+    ) -> Result<(), String> {
         if let Some((at, reason)) = &self.failed
             && at.elapsed() < RETRY_AFTER
         {
             return Err(reason.clone());
         }
-        let result = start(agent, store).await;
+        let result = start(agent, store, socket).await;
         self.failed = result.as_ref().err().map(|e| (Instant::now(), e.clone()));
         result
     }
@@ -213,7 +220,7 @@ fn cli_reason(stderr: &[u8]) -> Option<String> {
         .map(str::to_owned)
 }
 
-async fn start(agent: &Path, store: &Path) -> Result<(), String> {
+async fn start(agent: &Path, store: &Path, socket: Option<&Path>) -> Result<(), String> {
     let mut command = Command::new(agent);
     if let Some(environment) = login().await {
         command.env_clear().envs(environment.iter().cloned());
@@ -229,6 +236,9 @@ async fn start(agent: &Path, store: &Path) -> Result<(), String> {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if let Some(socket) = socket {
+        command.arg("--socket").arg(socket);
+    }
     let output = tokio::time::timeout(START_TIMEOUT, command.output())
         .await
         .map_err(|_| "daemon_start_timeout: agent start did not return".to_owned())?
@@ -636,12 +646,21 @@ mod tests {
         let mut starts = Starts::default();
         let store = root.join("state.sqlite");
         let reason = "no_provider: connect a provider in Settings";
-        assert_eq!(starts.start(&agent, &store).await.unwrap_err(), reason);
-        assert_eq!(starts.start(&agent, &store).await.unwrap_err(), reason);
+        assert_eq!(
+            starts.start(&agent, &store, None).await.unwrap_err(),
+            reason
+        );
+        assert_eq!(
+            starts.start(&agent, &store, None).await.unwrap_err(),
+            reason
+        );
         assert_eq!(std::fs::read_to_string(&calls).unwrap(), "started\n");
         // Changed settings try again at once.
         starts.forget();
-        assert_eq!(starts.start(&agent, &store).await.unwrap_err(), reason);
+        assert_eq!(
+            starts.start(&agent, &store, None).await.unwrap_err(),
+            reason
+        );
         assert_eq!(
             std::fs::read_to_string(&calls).unwrap(),
             "started\nstarted\n"

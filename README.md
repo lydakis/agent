@@ -169,7 +169,9 @@ brew install --cask lydakis/agent/agent
 ```
 
 The app carries its own copy of the runtime, which the cask also puts on
-`PATH` as `agent`, and starts the daemon when none is running. See [desktop client](docs/APP.md) to build and run it from
+`PATH` as `agent`, and starts the daemon when none is running. A window can
+also run its agents on a machine you reach over SSH, which needs its own Linux
+`agent` ([hosts over SSH](docs/APP.md#hosts-over-ssh)). See [desktop client](docs/APP.md) to build and run it from
 source.
 
 ## How fast is it?

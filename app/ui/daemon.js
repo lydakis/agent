@@ -29,6 +29,10 @@ window.Daemon = (() => {
       profiles: (dir) => invoke('profiles', { dir }),
       roles: () => invoke('roles'),
       editRole: (name) => invoke('edit_role', { name }),
+      schedules: (after = null) => invoke('schedules', { after }),
+      removeSchedule: (name) => invoke('schedule_remove', { name }),
+      hosts: () => invoke('hosts'),
+      openHost: (host) => invoke('open_host', { host }),
       swarmStart: ({ project, folder, goal, shared, mix, agents, budgetTokens, council }) => invoke('swarm_start', { project, folder, goal, shared, mix, agents, budgetTokens, council: council ?? 0 }),
       swarmAdd: (swarm, row) => invoke('swarm_add', { swarm, row }),
       swarmLeave: (swarm, member) => invoke('swarm_leave', { swarm, member }),
@@ -160,6 +164,18 @@ window.Daemon = (() => {
     if (turn === null) return;
     await wait(250);
     if (/scenario|ship|split/i.test(prompt)) { await scenario(name, turn); return; }
+    // The app telling a coordinator its tasks moved: it reads one, and passes on what another needs.
+    if (prompt.startsWith('Task updates: ')) {
+      const handle = /turn:[\w.-]+\/\d+/.exec(prompt)?.[0] ?? 'turn:demo.build/5';
+      const wid = `call_${++calls}`;
+      emit({ event: 'tool_started', bot: name, turn, data: { call_id: wid, name: 'wait', arguments: JSON.stringify({ handles: [handle], timeout_ms: 0 }), arguments_truncated: false } });
+      await wait(400);
+      emit({ event: 'tool_completed', bot: name, turn, data: { call_id: wid, node: node({ type: 'function_call_output', call_id: wid, output: JSON.stringify({ pending: [], results: { [handle]: { status: 'completed', text: 'Moved the cookie reissue into refresh_session, so rotate() no longer writes it. Tests that call rotate() directly now need a session.' } } }) }), artifacts: [] } });
+      await tool(name, turn, 'shell', { command: `"$AGENT_BIN" run --detach --delivery queue --bot demo.test -- 'build moved the cookie reissue into refresh_session: tests calling rotate() directly now need a session first.'` }, JSON.stringify({ exit_code: 0, stderr: '', stdout: '{"bot":"demo.test","status":"queued"}\n', success: true }), 500);
+      await stream(name, turn, 'Passed build\'s cookie change on to test, whose rotate() tests depend on it.');
+      if (!(S.bots.get(name) ?? GONE).interrupted) finish(name, turn);
+      return;
+    }
     const sw = memberOf(name);
     if (sw && prompt.startsWith('You are ')) { await member(sw, name, turn); return; }
     if (sw && prompt.startsWith('[board]')) {
@@ -378,7 +394,9 @@ window.Daemon = (() => {
   }
 
   const api = {
-    setup: async () => ({ socket: 'demo', workspace: '/workspace', tools: ['shell', 'read', 'write', 'edit', 'wait', 'history'] }),
+    setup: async () => ({ socket: 'demo', host: null, workspace: '/workspace', tools: ['shell', 'read', 'write', 'edit', 'wait', 'history'] }),
+    hosts: async () => [{ alias: 'box', to: { user: 'you', hostname: 'box.example', port: '22' } }],
+    openHost: async () => { throw new Error('demo mode opens no windows'); },
     settings: async () => ({ providers: specs(), region: ENV.AWS_REGION ?? null, profile: ENV.AWS_PROFILE ?? null, keys: ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'AWS_BEARER_TOKEN_BEDROCK'].filter((k) => ENV[k]) }),
     saveSettings: async (changes) => { for (const [k, v] of Object.entries(changes)) { if (v) ENV[k] = v; else delete ENV[k]; } },
     restartDaemon: async () => { await wait(400); },
@@ -398,6 +416,14 @@ window.Daemon = (() => {
     // The demo has no editor to open: Edit only says your copy is now the one read.
     roles: async () => [{ name: 'coordinator', file: S.ownRoles?.has('coordinator') ? '/home/you/.agents/agents/coordinator.md' : null }, { name: 'swarm', file: S.ownRoles?.has('swarm') ? '/home/you/.agents/agents/swarm.md' : null }],
     editRole: async (name) => { (S.ownRoles ??= new Set()).add(name); return `/home/you/.agents/agents/${name}.md`; },
+    // Schedules a coordinator made: a task that checks its PR, a one-off for itself, and one whose
+    // agent was deleted before its time came.
+    schedules: async () => ({ schedules: (S.schedules ??= [
+      { name: 'demo.build', bot: 'demo.build', bot_id: 3, when: 'every 30m', once: false, message: "Check the login PR: fix a red CI run and answer new review comments. When it is merged, remove this schedule.", last: { outcome: 'sent', turn: 4, fired_ms: Date.now() - 12 * 60000 } },
+      { name: 'demo.lead', bot: 'demo.lead', bot_id: 1, when: 'at 2026-09-30 09:07', once: true, message: 'Summarize what the tasks finished overnight.', last: null },
+      { name: 'demo.docs', bot: 'demo.docs', bot_id: 6, when: 'in 2h', once: true, ended: true, message: 'Check whether the docs preview deployed.', last: { outcome: 'gone', fired_ms: Date.now() - 95 * 60000 } },
+    ]).map((x) => ({ ...x })), next_after: null }),
+    removeSchedule: async (name) => { S.schedules = (S.schedules ?? []).filter((x) => x.name !== name); },
     profiles: async () => [{ name: 'reviewer', summary: 'Reviews changes and reports bugs only', model: 'anthropic/claude-sonnet-5' }, { name: 'tester', summary: 'Keeps the test suite green', model: null }],
     // Named from the goal's longest word and dealt as the app's side does it.
     swarmStart: async ({ project, folder, goal, shared, mix, agents, budgetTokens, council = 0 }) => {
@@ -457,7 +483,7 @@ window.Daemon = (() => {
         setTimeout(() => reply('demo.lead', 'ship the login fix; split the work and wait for it'), 900);
       }
       setTimeout(() => emit({ event: 'follow_live', durable: false, cursor: S.cursor }), 0);
-      return { session: ++S.session };
+      return { session: ++S.session, store: 'demo', workspace: '/workspace' };
     },
     pull: async () => {
       if (!S.queue.length) await new Promise((resolve) => { S.waiter = resolve; });
