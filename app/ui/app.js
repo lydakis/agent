@@ -2083,7 +2083,7 @@ const EFFORTS = ['low', 'medium', 'high', 'xhigh'];
 // the catalog's. Anthropic is the only other family.
 function familyOf(provider) {
   if (S.families.has(provider)) return S.families.get(provider);
-  const spec = (S.setup?.settings?.providers ?? []).find((s) => specName(s) === provider && String(s).includes('='));
+  const spec = ((S.setup?.settings ?? S.seenSettings)?.providers ?? []).find((s) => specName(s) === provider && String(s).includes('='));
   if (spec) return String(spec).split('=')[1].split(',')[0];
   const part = catalogOf(provider)?.parts?.find(([name]) => name === provider);
   return part ? part[1] : provider === 'anthropic' ? 'anthropic' : 'responses';
@@ -2403,7 +2403,7 @@ function showNewProject(on) {
   $('projdir').value = S.config?.workspace ?? ''; $('projdir').focus();
   // The lead's model, from every provider's list, read now so a refreshed list shows.
   $('projmodel').innerHTML = '';
-  Promise.all([Daemon.models(), S.setup?.settings ?? Daemon.settings?.().catch(() => null)]).then(([all, set]) => { const list = connected(all, set?.restartable === false && !S.setup?.settings ? null : set); if (!$('projform').hidden) $('projmodel').innerHTML = list.length ? modelSelectHTML('projsel', list) + effortSelectHTML('projeffort', pickedModel(list)) : '<span class="dim">no models listed: see Settings</span>'; }, (e) => { $('projmodel').textContent = String(e?.message ?? e); });
+  Promise.all([Daemon.models(), S.setup?.settings ?? Daemon.settings?.().catch(() => null)]).then(([all, set]) => { if (set) S.seenSettings = set; const list = connected(all, set?.restartable === false && !S.setup?.settings ? null : set); if (!$('projform').hidden) $('projmodel').innerHTML = list.length ? modelSelectHTML('projsel', list) + effortSelectHTML('projeffort', pickedModel(list)) : '<span class="dim">no models listed: see Settings</span>'; }, (e) => { $('projmodel').textContent = String(e?.message ?? e); });
 }
 
 // ---------- input ----------
