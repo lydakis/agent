@@ -929,7 +929,10 @@ function attach() {
 async function attachOnce() {
   try {
     if (!S.config) S.config = await Daemon.setup();
-    const { session, store, workspace } = await Daemon.attach(S.cursor);
+    let { session, store, workspace } = await Daemon.attach(S.cursor);
+    // Another store answers where the last one did: its cursor, bot ids and names mean other things,
+    // so nothing learned from the last one is kept, and its log is followed from the start.
+    if (S.store && store && store !== S.store) { forgetStore(); ({ session, store, workspace } = await Daemon.attach(0)); }
     S.session = session; S.store = store ?? null;
     // A window on a host starts in the home the host named, unless it was given a folder there.
     if (!S.config.workspace && workspace) S.config.workspace = workspace;
@@ -982,6 +985,13 @@ async function attachOnce() {
     if (S.lastReason.startsWith('no_provider') && !S.setupSeen) openSetup();
     return false;
   }
+}
+// Everything the window learned from one store, dropped before it shows another.
+function forgetStore() {
+  S.cursor = 0; S.bots.clear(); S.transcripts.clear(); S.drafts.clear(); S.override.clear(); S.families.clear();
+  S.swarms.clear(); S.memberOf.clear(); S.deleted.clear(); looked.clear();
+  S.selected = ''; S.autoSelect = true; S.ui.side = null; S.ui.folded = new Set();
+  S.botsGen += 1; S.shapeGen += 1;
 }
 // No provider to run: starting again cannot help until Settings changes, which attaches itself.
 // Attaching again cannot help until something changes: a provider in Settings, or a newer app.

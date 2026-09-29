@@ -148,6 +148,13 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual(Path(started['socket']).resolve(), self.socket.resolve())
         self.assertTrue(self.store.exists())
         self.assertTrue(self.socket.exists())
+        # A relative socket is printed as the absolute path a caller elsewhere must name.
+        relative = subprocess.run([*self.base, 'start'], env={**clean_env(), 'AGENT_STORE': str(self.store), 'AGENT_SOCKET': 'state.sqlite.sock'},
+                                  capture_output=True, text=True, timeout=30, cwd=self.path)
+        self.assertEqual(relative.returncode, 0, relative.stderr)
+        printed = json.loads(relative.stdout)['socket']
+        self.assertTrue(printed.startswith('/'), printed)
+        self.assertEqual(Path(printed).resolve(), self.socket.resolve())
         # A running daemon answers again; nothing new starts.
         again = json.loads(self.agent('start', '--store', str(self.store)).stdout)
         self.assertEqual(again['pid'], started['pid'])
@@ -981,11 +988,14 @@ class CliTests(ModelFixture):
                         self.stop_process(process)
 
     def test_shutdown_stops_an_older_daemon_by_its_pid_and_leaves_a_newer_one(self):
-        # An upgraded agent on a host replaces the daemon an older one started.
-        for protocol, stopped in ((PROTOCOL - 1, True), (PROTOCOL + 1, False)):
-            with self.subTest(protocol=protocol), tempfile.TemporaryDirectory(dir='/tmp') as directory:
+        # An upgraded agent on a host replaces the daemon an older one started;
+        # one that exited after it greeted is already stopped.
+        for protocol, stopped, gone in ((PROTOCOL - 1, True, False), (PROTOCOL - 1, True, True), (PROTOCOL + 1, False, False)):
+            with self.subTest(protocol=protocol, gone=gone), tempfile.TemporaryDirectory(dir='/tmp') as directory:
                 path = Path(directory)/'daemon.sock'
-                daemon = subprocess.Popen(['sleep', '30'])
+                daemon = subprocess.Popen(['true' if gone else 'sleep', *([] if gone else ['30'])])
+                if gone:
+                    daemon.wait(timeout=3)
                 self.addCleanup(self.stop_process, daemon)
                 with socket.socket(socket.AF_UNIX) as listener:
                     listener.bind(str(path))
@@ -1002,7 +1012,7 @@ class CliTests(ModelFixture):
                         self.stop_process(process)
                 if stopped:
                     self.assertEqual(process.returncode, 0, stderr)
-                    self.assertEqual(daemon.wait(timeout=3), -15)
+                    self.assertEqual(daemon.wait(timeout=3), 0 if gone else -15)
                 else:
                     self.assertEqual(process.returncode, 1)
                     self.assertIn(b'daemon_protocol_mismatch', stderr)

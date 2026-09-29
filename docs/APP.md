@@ -323,7 +323,10 @@ projects, model picks and the steps fold per store and workspace in the
 webview's local storage, and restores them on the next start. The store is
 the identity the daemon announces when the window attaches, so two hosts, or
 a host and this machine, never share what a window remembers, whatever socket
-reaches them. Send's queue or
+reaches them. When the socket a window reattaches to answers with another
+store than before (the host's daemon replaced by one on another store), the
+window drops the last store's bots, threads and drafts and follows the new
+one from its start. Send's queue or
 steer pick is remembered for every window. If the daemon is unreachable or closes the session, the page shows why
 and retries every two seconds. Only one attachment runs at a time, including
 the snapshot pages. A connected peer must send its ready line within five seconds.
@@ -390,7 +393,9 @@ A window can attach to the daemon on a machine you reach over SSH, so long
 work runs there while the app runs here. Settings lists **Hosts**: the
 concrete `Host` aliases in `~/.ssh/config` (not patterns or negations),
 following `Include` with a relative path from `~/.ssh`, a `~/` path, or
-wildcards in the last component only, and beside each what `ssh -G` says it
+wildcards in the last component only (an `Include` inside a `Host` or
+`Match` block is followed only under `Host *` or `Match all`; one that
+applies to some hosts is skipped), and beside each what `ssh -G` says it
 connects to. **Open window** opens a window on that host; `agent-app --host
 box` opens the first one there. The window's title names the host. Nothing
 about SSH is reimplemented: every connection is `ssh box` with your own
@@ -402,7 +407,8 @@ with `BatchMode=yes` (never a prompt), `ServerAliveInterval=15` and
 `LocalForward` of your own cannot stop it), `ExitOnForwardFailure=yes`,
 `StreamLocalBindUnlink=yes` and `StreamLocalBindMask=0177`. Its control
 socket and the forwarded daemon socket are in `~/.agent/hosts/`, made
-owner-only, beside a lock only one app process may hold per host. Over that
+owner-only and named by a hash of the exact alias (so `Box` and `box` never
+share them on a case-insensitive disk), beside a lock only one app process may hold per host. Over that
 master the app runs `agent start` in the remote user's login shell
 (`exec "$SHELL" -l -i -c ...`, so the `agent` and provider keys a terminal
 there would have), which prints the daemon's ready line and the socket it
@@ -412,7 +418,9 @@ against the local socket. An attach tries the forward first; when the daemon
 or the link has gone, it runs `agent start` again, starting a new master
 first if the old one exited. A failure is not tried again for a backoff that
 doubles from one second to thirty, so a window retrying every two seconds
-does not open a connection each time. The last window on a host closing ends
+does not open a connection each time. Each ssh command's stdout and stderr
+are read up to 1 MiB each; a login shell that prints more is killed and
+reported as `host_output_too_large`. The last window on a host closing ends
 its master and removes its files; so does quitting the app. The daemon on the
 host keeps running.
 
@@ -449,7 +457,8 @@ a shell on the host) shows in the window.
 
 Not built: reading a host's files (step 2, in [NEXT item
 41](NEXT.md)); an app-level heartbeat beyond SSH keepalives; `Include` with
-wildcards in a directory; a login shell that takes `-l` only alone (tcsh).
+wildcards in a directory; a conditional `Include` (under a `Host` or
+`Match` that is not every host); a login shell that takes `-l` only alone (tcsh).
 
 ## Projects and panes
 
@@ -889,11 +898,12 @@ daemon's steer delivery, and runs folded with failures on their line.
 neither a partial file nor a temporary, and hosts over SSH against a stand-in
 `ssh` that runs the remote command here and forwards by linking: `~/.ssh/config`
 aliases and includes, the ssh arguments, `agent start`'s answers, attaching
-through the master and again after it is killed, a refused login and a
+through the master and again after it is killed, a host printing without end
+cut off at 1 MiB, a refused login and a
 missing `agent` reported and backed off, an older daemon replaced through the
 host's own `agent shutdown`, one app process per host, and a window on a host
 never starting a local daemon. The page tests cover saved state keyed by
-store, a host window's home and what it leaves out, and the Hosts list.
+store, another store answering on reattach followed from its start, a host window's home and what it leaves out, and the Hosts list.
 `cargo test --workspace` includes the silent-listener readiness deadline,
 fork workspace parity between durable records, live events, and replay, and
 the app's policy errors for oversized and unreadable AGENTS.md files.

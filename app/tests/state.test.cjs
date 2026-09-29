@@ -1930,3 +1930,25 @@ test('Settings lists the hosts in the ssh config and opens a window on one', asy
   await p.act({ dataset: { act: 'open-host', v: 'box' } });
   assert.deepEqual(opened, ['box']);
 });
+
+test('another store answering on reattach is followed from its start, with nothing kept from the last', async () => {
+  const stores = ['store-1', 'store-2', 'store-2'], afters = [];
+  let at = 0;
+  const p = page({
+    setup: async () => ({ socket: '/synthetic.sock', workspace: '/synthetic', tools: [] }),
+    attach: async (after) => { afters.push(after); return { session: afters.length, store: stores[Math.min(at++, stores.length - 1)] }; },
+    pull: () => new Promise(() => {}),
+    request: async (op) => (op === 'bots' ? { bots: [] } : {}),
+  });
+  p.setRender(() => {});
+  await p.attach(); await settle();
+  p.upsert({ name: 'Bob', id: 7, provider: 'alpha', model: 'one' });
+  p.transcript('Bob').items.push({ kind: 'note', text: 'from the first store' });
+  p.S.cursor = 50; p.S.drafts.set('Bob', 'unsent');
+  p.lost('closed'); await p.tick(); await settle();
+  assert.deepEqual(afters, [0, 50, 0], 'the new store is followed from cursor zero');
+  assert.equal(p.S.store, 'store-2');
+  assert.equal(p.S.bots.has('Bob'), false);
+  assert.equal(p.S.transcripts.has('Bob'), false);
+  assert.equal(p.S.drafts.size, 0);
+});

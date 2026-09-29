@@ -68,7 +68,10 @@ pub fn valid_alias(alias: &str) -> bool {
 /// without patterns (`*`, `?`) or negations (`!`), which are not hosts one
 /// can open. `Include` is followed as OpenSSH does for a user config: a
 /// relative path from `~/.ssh`, `~/` from home, and wildcards in the last
-/// component only; wildcards in a directory are not expanded.
+/// component only; wildcards in a directory are not expanded. An `Include`
+/// applies only where it stands, so one inside a `Host` or `Match` block is
+/// followed only when that block applies to every host (`Host *`, `Match
+/// all`); any other is conditional and skipped.
 pub fn aliases(config: &Path, home: &Path) -> Vec<String> {
     let mut out = Vec::new();
     read_config(config, home, 0, &mut out);
@@ -80,16 +83,19 @@ fn read_config(path: &Path, home: &Path, depth: usize, out: &mut Vec<String>) {
     if depth > MAX_INCLUDE_DEPTH {
         return;
     }
+    // Checked before opening: opening a FIFO would block.
+    if !std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
+        return;
+    }
     let mut text = String::new();
     let Ok(file) = std::fs::File::open(path) else {
         return;
     };
-    if !file.metadata().is_ok_and(|m| m.is_file()) {
-        return;
-    }
     if file.take(MAX_CONFIG).read_to_string(&mut text).is_err() {
         return;
     }
+    // Whether the block this line is in applies to every host.
+    let mut everywhere = true;
     for line in text.lines() {
         let words = words(line);
         let Some((keyword, args)) = words.split_first() else {
@@ -97,13 +103,17 @@ fn read_config(path: &Path, home: &Path, depth: usize, out: &mut Vec<String>) {
         };
         match keyword.to_ascii_lowercase().as_str() {
             "host" => {
+                everywhere = args.len() == 1 && args[0] == "*";
                 for alias in args {
                     if valid_alias(alias) && !out.contains(alias) {
                         out.push(alias.clone());
                     }
                 }
             }
-            "include" => {
+            "match" => {
+                everywhere = args.len() == 1 && args[0].eq_ignore_ascii_case("all");
+            }
+            "include" if everywhere => {
                 for pattern in args {
                     for included in expand(pattern, home) {
                         read_config(&included, home, depth + 1, out);
@@ -246,23 +256,16 @@ pub struct Paths {
 const CTL_SUFFIX: usize = 17;
 
 fn paths(dir: &Path, alias: &str) -> Result<Paths, String> {
-    // A plain short alias names its files; any other is hashed, so no alias
-    // can reach outside the directory or collide with another.
-    let plain = alias.len() <= 32
-        && !alias.starts_with('.')
-        && alias
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-    let name = if plain {
-        alias.to_owned()
-    } else {
-        let mut hash = 0xcbf29ce484222325u64;
-        for byte in alias.bytes() {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        format!("h-{hash:016x}")
-    };
+    // Named by a hash of the exact alias, so no alias can reach outside the
+    // directory, and two that differ only in case (`Box`, `box`) do not
+    // share files on a case-insensitive file system. Short, for the socket
+    // address limit.
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in alias.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let name = format!("h-{hash:016x}");
     let paths = Paths {
         ctl: dir.join(format!("{name}.ctl")),
         socket: dir.join(format!("{name}.sock")),
@@ -831,19 +834,57 @@ impl Host {
         ))
     }
 
+    /// Run ssh with its output bounded, in time and in bytes: a login
+    /// shell that prints without end is killed, not buffered.
     async fn run(&self, args: &[OsString]) -> Result<Output, String> {
-        let mut command = Command::new(&self.ssh);
-        command
+        let mut child = Command::new(&self.ssh)
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        tokio::time::timeout(COMMAND_TIMEOUT, command.output())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| format!("host_unreachable: {}: {e}", self.ssh.display()))?;
+        let (out, err) = (child.stdout.take(), child.stderr.take());
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        let work = async {
+            let read = tokio::try_join!(capped(out, &mut stdout), capped(err, &mut stderr));
+            if read.is_err() {
+                let _ = child.kill().await;
+                return Err(format!(
+                    "host_output_too_large: ssh {} printed more than {MAX_OUTPUT} bytes",
+                    self.alias
+                ));
+            }
+            (child.wait().await).map_err(|e| format!("host_unreachable: ssh {}: {e}", self.alias))
+        };
+        let status = tokio::time::timeout(COMMAND_TIMEOUT, work)
             .await
-            .map_err(|_| format!("host_timeout: ssh {} did not answer", self.alias))?
-            .map_err(|e| format!("host_unreachable: {}: {e}", self.ssh.display()))
+            .map_err(|_| format!("host_timeout: ssh {} did not answer", self.alias))??;
+        Ok(Output {
+            status,
+            stdout,
+            stderr,
+        })
     }
+}
+
+/// What a command on a host may print on each of stdout and stderr.
+const MAX_OUTPUT: u64 = 1024 * 1024;
+
+/// Read a pipe to its end, refusing more than `MAX_OUTPUT` bytes.
+async fn capped(
+    pipe: Option<impl tokio::io::AsyncRead + Unpin>,
+    into: &mut Vec<u8>,
+) -> Result<(), ()> {
+    use tokio::io::AsyncReadExt;
+    let Some(pipe) = pipe else { return Ok(()) };
+    // A read error ends the output; the exit status says the rest.
+    let _ = pipe.take(MAX_OUTPUT + 1).read_to_end(into).await;
+    if into.len() as u64 > MAX_OUTPUT {
+        return Err(());
+    }
+    Ok(())
 }
 
 /// SIGTERM, so ssh removes its control socket, then SIGKILL if it lingers.
@@ -1057,10 +1098,10 @@ mod tests {
         std::fs::create_dir_all(home.join("other")).unwrap();
         std::fs::write(
             home.join(".ssh/config"),
-            "# hosts\nHost box build-1 *.internal !gone\n  HostName 10.0.0.5\n\
+            "# hosts\nInclude config.d/*.conf\nHost box build-1 *.internal !gone\n  HostName 10.0.0.5\n\
              Host=eq\nhost \"quoted\" # trailing\nHost ?x -oProxyCommand=x a/b\n\
-             Include config.d/*.conf ~/other/extra\nInclude missing\nMatch host box\nHost box\n\
-             Include config\n",
+             Host *\n  Include ~/other/extra missing\nMatch host box\n  Include ~/other/only-box\n\
+             Host box\n  Include ~/other/only-box config\nMatch all\n  Include ~/other/all\n",
         )
         .unwrap();
         std::fs::write(home.join(".ssh/config.d/b.conf"), "Host second\n").unwrap();
@@ -1068,9 +1109,14 @@ mod tests {
         std::fs::write(home.join(".ssh/config.d/.hidden.conf"), "Host hidden\n").unwrap();
         std::fs::write(home.join(".ssh/config.d/c.txt"), "Host notconf\n").unwrap();
         std::fs::write(home.join("other/extra"), "Host extra\n").unwrap();
+        std::fs::write(home.join("other/all"), "Host every\n").unwrap();
+        // Only where it applies to one host: not followed.
+        std::fs::write(home.join("other/only-box"), "Host conditional\n").unwrap();
         assert_eq!(
             aliases(&home.join(".ssh/config"), &home),
-            ["box", "build-1", "eq", "quoted", "first", "second", "extra"]
+            [
+                "first", "second", "box", "build-1", "eq", "quoted", "extra", "every"
+            ]
         );
         assert!(aliases(&home.join("none"), &home).is_empty());
         std::fs::remove_dir_all(home).unwrap();
@@ -1100,8 +1146,18 @@ mod tests {
     fn ssh_is_asked_for_one_master_that_never_prompts_and_forwards_the_socket() {
         let dir = Path::new("/tmp/agent-hosts");
         let p = paths(dir, "box").unwrap();
-        assert_eq!(p.ctl, dir.join("box.ctl"));
-        assert_eq!(p.socket, dir.join("box.sock"));
+        assert_eq!(p.ctl.parent(), Some(dir));
+        let name = p.ctl.file_stem().unwrap().to_str().unwrap().to_owned();
+        assert!(name.starts_with("h-") && name.len() == 18, "{name}");
+        assert_eq!(p.socket, dir.join(format!("{name}.sock")));
+        assert_eq!(p.lock, dir.join(format!("{name}.lock")));
+        // Aliases differing only in case get their own files, even where
+        // the file system does not tell `Box` from `box`.
+        let upper = paths(dir, "Box").unwrap();
+        assert_ne!(
+            upper.ctl.to_str().unwrap().to_lowercase(),
+            p.ctl.to_str().unwrap().to_lowercase()
+        );
         // An alias that is not a plain name cannot reach outside the directory.
         let odd = paths(dir, "user@box.example:22").unwrap();
         assert_eq!(odd.ctl.parent(), Some(dir));
@@ -1136,7 +1192,7 @@ mod tests {
         assert_eq!(&master[..2], ["-M", "-N"]);
         assert_eq!(&master[master.len() - 2..], ["--", "box"]);
         let at = master.iter().position(|a| a == "-S").unwrap();
-        assert_eq!(master[at + 1], "/tmp/agent-hosts/box.ctl");
+        assert_eq!(master[at + 1], p.ctl.to_str().unwrap());
         let exec = text(exec_args(&p, "box", "agent start"));
         assert!(
             exec.contains(&"ControlMaster=no".to_owned())
@@ -1152,11 +1208,11 @@ mod tests {
             )),
             [
                 "-S",
-                "/tmp/agent-hosts/box.ctl",
+                p.ctl.to_str().unwrap(),
                 "-O",
                 "forward",
                 "-L",
-                "/tmp/agent-hosts/box.sock:/home/u/.agent/state.sqlite.sock",
+                format!("{}:/home/u/.agent/state.sqlite.sock", p.socket.display()).as_str(),
                 "--",
                 "box"
             ]
@@ -1268,7 +1324,8 @@ mod tests {
         let host = hosts.acquire("box").unwrap();
         assert_eq!(host.reached().await, None);
         let local = host.connect().await.unwrap();
-        assert_eq!(local, shim.root.join("hosts/box.sock"));
+        let files = paths(&shim.root.join("hosts"), "box").unwrap();
+        assert_eq!(local, files.socket);
         let (client, _events) = agent_client::Client::connect(&local).await.unwrap();
         assert_eq!(client.store(), Some("s1"));
         assert_eq!(host.home().await.as_deref(), shim.remote.to_str());
@@ -1284,7 +1341,7 @@ mod tests {
         }
         // The master dies without cleaning up, as after a crash: the next
         // connect finds it gone, starts another and forwards again.
-        let pid: i32 = std::fs::read_to_string(shim.root.join("hosts/box.ctl"))
+        let pid: i32 = std::fs::read_to_string(&files.ctl)
             .unwrap()
             .trim()
             .parse()
@@ -1302,8 +1359,8 @@ mod tests {
         assert_eq!(shim.count("forward"), 2);
         // The last window closes the connection and its files; the daemon stays.
         hosts.release(&host).await;
-        assert!(!shim.root.join("hosts/box.ctl").exists());
-        assert!(std::fs::symlink_metadata(shim.root.join("hosts/box.sock")).is_err());
+        assert!(!files.ctl.exists());
+        assert!(std::fs::symlink_metadata(&files.socket).is_err());
         assert_eq!(host.reached().await, None);
         assert_eq!(shim.count("agent shutdown"), 0);
     }
@@ -1337,6 +1394,23 @@ mod tests {
             missing.contains("Install the Linux agent there"),
             "{missing}"
         );
+        assert_eq!(shim.count("forward"), 0);
+        hosts.close_all().await;
+    }
+
+    #[tokio::test]
+    async fn a_host_that_prints_without_end_is_cut_off_not_buffered() {
+        let shim = Shim::new("host-flood");
+        super::shim::script(&shim.remote.join("bin/agent"), "#!/bin/sh\nexec yes\n");
+        let hosts = shim.hosts();
+        let host = hosts.acquire("box").unwrap();
+        let begun = std::time::Instant::now();
+        let flood = host.connect().await.unwrap_err();
+        assert!(
+            flood.starts_with("host_output_too_large: ssh box printed more than 1048576 bytes"),
+            "{flood}"
+        );
+        assert!(begun.elapsed() < std::time::Duration::from_secs(5));
         assert_eq!(shim.count("forward"), 0);
         hosts.close_all().await;
     }

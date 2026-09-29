@@ -980,7 +980,10 @@ pub fn main(args: Vec<String>) -> Result<i32> {
                     None => return Err(error),
                 },
             };
-            ready["socket"] = json!(options.socket.to_str());
+            // Absolute, as a caller elsewhere must name it: a relative
+            // AGENT_SOCKET is relative to this command's directory.
+            let socket = std::path::absolute(&options.socket)?;
+            ready["socket"] = json!(socket.to_str());
             print_json(&ready, options.pretty)?;
             refused.map_or(Ok(0), Err)
         }
@@ -1026,10 +1029,12 @@ fn stop_older(error: Error) -> Result<i32> {
     };
     // SAFETY: a signal to the process the daemon named as itself.
     if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
-        return fail_with(
-            "daemon_stop_failed",
-            std::io::Error::last_os_error().to_string(),
-        );
+        let error = std::io::Error::last_os_error();
+        // It exited after it greeted: it is stopped.
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(0);
+        }
+        return fail_with("daemon_stop_failed", error.to_string());
     }
     await_exit(pid, SHUTDOWN_TIMEOUT)?;
     Ok(0)
