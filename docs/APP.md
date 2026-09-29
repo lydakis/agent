@@ -263,11 +263,15 @@ on Linux from `/proc` and on macOS from `proc_pidinfo`.
 
 Releases follow Errand's: pushing a `vX.Y.Z` tag on `main` whose version both
 `Cargo.toml` and `app/src-tauri/Cargo.toml` carry runs
-[release.yml](../.github/workflows/release.yml) on a macOS runner. The tag
+[release.yml](../.github/workflows/release.yml) on a macOS 26 runner. The app
+must link the macOS 26 SDK: one built with an older SDK keeps the separate,
+pre-26 title bar on macOS 26. The tag
 itself only starts [release-request.yml](../.github/workflows/release-request.yml),
 which holds no secrets; release.yml and publish-homebrew.yml run after it from
 `main`'s own definitions, so code at a tag never sees the signing secrets or
-the tap token. A failed run is re-run from its own page. It runs
+the tap token. A failed run is re-run from its own page, but a re-run keeps
+the workflow file it first ran; to pick up a fix merged to `main`, re-run the
+release's Release request run instead. It runs
 the tests, installs the Tauri CLI from
 [app/release/package-lock.json](../app/release/package-lock.json) before any
 signing material exists, builds a universal `agent` and app, and has Tauri sign both with
@@ -282,7 +286,8 @@ resolves the tag to a commit on `main` before running any of its code,
 refuses assets built from any other commit (a draft's tag can move) or
 lacking release.yml's build attestation (a draft's assets can be replaced),
 checks them against their checksums and the tag's cask generator,
-installs and audits the cask, and writes `Casks/agent.rb` to
+installs and audits the cask, and writes `Casks/agent.rb`, rendered by
+`main`'s generator, to
 [lydakis/homebrew-agent](https://github.com/lydakis/homebrew-agent). It never
 downgrades the tap or replaces a different cask of the same version. The
 helpers and their tests are in [app/release](../app/release)
