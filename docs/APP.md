@@ -33,6 +33,7 @@ One menu per agent: side chat, stop, fork, delete, show all.
 ![The agent menu](app/menu.png)
 
 The model chip: models under their provider; other families need a new agent.
+The chip also names the agent's effort level when it has one (here `high`).
 
 ![The model chip's menu](app/model-chip.png)
 
@@ -63,7 +64,14 @@ A side chat asked while the lead works: a fork beside it, the lead untouched.
 
 ![A side chat beside the running lead](app/side-chat.png)
 
-New project takes a folder and the model its lead starts on.
+New project takes a folder, the model its lead starts on, and that model's
+effort. Effort is how hard the model thinks: every provider offers low,
+medium, high and xhigh, Claude also max, and "default effort" sends no level,
+so the model uses its own default. It is picked with the model, stays with the
+agent for its life, and is kept in `.agents/project.toml` as `reasoning`
+beside `model`; `/new NAME PROVIDER/MODEL [EFFORT]` takes one too. A task the
+coordinator starts on its own model takes its effort as well
+(`AGENT_REASONING`, see [CLI.md](CLI.md)).
 
 ![New project](app/new-project.png)
 
@@ -108,9 +116,9 @@ A project's ⋯ menu starts a swarm: a goal, how many agents, where they work,
 the tokens they share, what they are made of, and how they organize: one
 board, or a council of three that approves streams of work. What they are
 made of is a mix: rows of an identity (a plain agent, or a profile the
-folder offers, such as a reviewer), a model from any connected provider, and
-a share, each shown as the agents it makes at the size picked. Captured
-2026-09-28.
+folder offers, such as a reviewer), a model from any connected provider, its
+effort, and a share, each shown as the agents it makes at the size picked. The
+first row starts on the lead's model and effort. Captured 2026-09-29.
 
 ![The new swarm sheet](app/new-swarm.png)
 

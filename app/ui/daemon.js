@@ -19,7 +19,7 @@ window.Daemon = (() => {
       restartDaemon: () => invoke('restart_daemon'),
       discoverModels: () => invoke('discover_models'),
       project: (dir) => invoke('project', { dir }),
-      writeProject: ({ dir, name, model }) => invoke('write_project', { dir, name, model }),
+      writeProject: ({ dir, name, model, reasoning = null }) => invoke('write_project', { dir, name, model, reasoning }),
       branch: (dir) => invoke('branch', { dir }),
       attach: (after) => invoke('attach', { after }),
       replaceDaemon: () => invoke('replace_daemon'),
@@ -70,12 +70,12 @@ window.Daemon = (() => {
   const emit = (event) => { if (event.data?.node != null) { if (!S.lineages.has(event.bot)) S.lineages.set(event.bot, []); S.lineages.get(event.bot).push({node:event.data.node,turn:event.turn ?? null,...authorOf(event)}); } if (event.durable !== false) event.cursor = ++S.cursor; S.queue.push(event); if (S.waiter) { const w = S.waiter; S.waiter = null; w(); } };
   const node = (item) => { const id = S.nextNode++; S.nodes.set(id, item); return id; };
   const wait = (ms) => new Promise((r) => { const t = setTimeout(() => { S.timers.delete(t); r(); }, ms); S.timers.add(t); });
-  const record = (name, model) => ({ name, status: 'idle', running_turn: null, provider: model.split('/')[0], model: model.split('/').slice(1).join('/'), workspace: '/workspace', input_tokens: 0, cached_input_tokens: 0, tokens_used: 0 });
+  const record = (name, model, reasoning = null) => ({ name, status: 'idle', running_turn: null, provider: model.split('/')[0], model: model.split('/').slice(1).join('/'), reasoning, workspace: '/workspace', input_tokens: 0, cached_input_tokens: 0, tokens_used: 0 });
 
-  async function create(name, model, createdBy = null, source = null, workspace = null, allowed = null) {
+  async function create(name, model, createdBy = null, source = null, workspace = null, allowed = null, reasoning = null) {
     if (S.bots.has(name)) throw new Error('bot_exists');
     // Lineage is pinned to the creator's identity, and the event carries the record's list fields, as the daemon's does.
-    const b = { ...record(name, model), ...(workspace ? { workspace } : {}), id: S.nextId++, created_by: createdBy, created_by_id: createdBy ? S.bots.get(createdBy)?.id ?? null : null, turns: 0, interrupted: false, ...(allowed ? { allowed } : {}) };
+    const b = { ...record(name, model, source ? S.bots.get(source)?.reasoning ?? null : reasoning), ...(workspace ? { workspace } : {}), id: S.nextId++, created_by: createdBy, created_by_id: createdBy ? S.bots.get(createdBy)?.id ?? null : null, turns: 0, interrupted: false, ...(allowed ? { allowed } : {}) };
     S.bots.set(name, b);
     // A fork shares its source's history up to its newest finished round. The demo keeps no call
     // nodes, only their results, so that is its newest node that is not a tool result.
@@ -85,7 +85,7 @@ window.Daemon = (() => {
       S.lineages.set(name, all.slice(0, end));
     }
     const checkpoint = source ? S.lineages.get(source)?.at(-1)?.node ?? null : undefined;
-    emit({ event: source ? 'forked' : 'created', bot: name, turn: null, data: { id: b.id, provider: b.provider, model: b.model, workspace: b.workspace, status: 'idle', running_turn: null, created_by: createdBy, created_by_id: b.created_by_id, ...(allowed ? { allowed } : {}), ...(source ? { source, checkpoint } : {}) } });
+    emit({ event: source ? 'forked' : 'created', bot: name, turn: null, data: { id: b.id, provider: b.provider, model: b.model, reasoning: b.reasoning, workspace: b.workspace, status: 'idle', running_turn: null, created_by: createdBy, created_by_id: b.created_by_id, ...(allowed ? { allowed } : {}), ...(source ? { source, checkpoint } : {}) } });
     return b;
   }
   // Scripted work outlives a stop; a bot deleted meanwhile reads as interrupted, so it ends quietly.
@@ -294,7 +294,7 @@ window.Daemon = (() => {
   async function enlist(sw, rows, each, late = false) {
     const bots = [];
     for (const [name, row] of rows) {
-      const b = await api.request('create', { bot: name, model: sw.mix[row].model, workspace: sw.workspace, budget_tokens: each });
+      const b = await api.request('create', { bot: name, model: sw.mix[row].model, reasoning: sw.mix[row].reasoning ?? null, workspace: sw.workspace, budget_tokens: each });
       sw.members.push(name); sw.ids[name] = b.id; sw.rows[name] = row; bots.push(b);
       sw.made = Math.max(sw.made ?? 0, Number(name.split('-').pop()) || 0);
     }
@@ -472,7 +472,7 @@ window.Daemon = (() => {
       if (!S.bots.size && !FIRST) {
         // Two projects: a coordinator is a bot named `<project>.lead`, and its tasks nest under it.
         const model = 'openai/gpt-6-luna';
-        await create('demo.lead', model);
+        await create('demo.lead', model, null, null, null, null, 'high');
         const t = start('demo.lead', 'what does the daemon do when a bot is busy?');
         emit({ event: 'message', bot: 'demo.lead', turn: t, data: { node: node({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Three answers, chosen per submission: reject it, queue it behind the running turn, or steer it into that turn as a mid-flight message. The client sends the mode every time; the daemon has no default of its own.' }] }) } });
         finish('demo.lead', t);
@@ -513,7 +513,7 @@ window.Daemon = (() => {
         // A demo bot's only unfinished turn is the one it runs.
         case 'turns': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); return { turns: b.running_turn != null && params.after < b.running_turn ? [{ turn: b.running_turn, status: b.status }] : [], next_after: null }; }
         case 'resume': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); return { ...b }; }
-        case 'create': { await create(params.bot, params.model, params.created_by ?? null, null, params.workspace); return { ...S.bots.get(params.bot) }; }
+        case 'create': { await create(params.bot, params.model, params.created_by ?? null, null, params.workspace, null, params.reasoning ?? null); return { ...S.bots.get(params.bot) }; }
         case 'submit': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); if (b.status !== 'idle' && params.delivery === 'reject') throw new Error('bot_busy');
           if (params.delivery === 'steer' && params.expected_turn != null && params.expected_turn !== b.running_turn) throw new Error('stale_turn');
           const by = params.from ?? (params.origin ? { origin: params.origin } : null);

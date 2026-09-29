@@ -191,7 +191,10 @@ fn print_flags(flags: &str) {
                 "ROLE",
                 "Compose instructions (as --agents) in the role .agents/agents/ROLE.md, with its model and tools",
             ),
-            "--reasoning" => ("LEVEL", "low, medium, high, xhigh, or max"),
+            "--reasoning" => (
+                "LEVEL",
+                "A new bot's effort: low, medium, high, or xhigh; Claude also max. Default AGENT_REASONING on AGENT_MODEL, else the model's own",
+            ),
             "--request-id" => ("ID", "Idempotency key for this submission"),
             "--bot-id" => ("N", "Refuse if --bot no longer names this identity"),
             "--budget-tokens" => ("N", "New bot's lifetime input + output token cap"),

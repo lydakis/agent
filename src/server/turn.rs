@@ -1483,7 +1483,8 @@ impl Turn {
         let provider: &Provider = &shaped;
         let workspace = PathBuf::from(&context.workspace);
         // What this turn's children inherit: the CLI a bot runs to delegate
-        // needs a model for the peer (its own by default), the bot's own name
+        // needs a model for the peer (its own by default) and its effort
+        // level when it has one, the bot's own name
         // so a created peer records who created it, this turn so a prompt it
         // submits records whose model wrote it, and its creator so a peer
         // can address the bot that spawned it.
@@ -1493,6 +1494,9 @@ impl Turn {
             ("AGENT_BOT_ID".to_owned(), context.bot_id.to_string()),
             ("AGENT_TURN".to_owned(), turn.to_string()),
         ];
+        if let Some(level) = &record.reasoning {
+            environment.push(("AGENT_REASONING".to_owned(), level.clone()));
+        }
         if let (Some(parent), Some(id)) = (&context.created_by, context.created_by_id) {
             environment.push(("AGENT_PARENT".to_owned(), parent.clone()));
             environment.push(("AGENT_PARENT_ID".to_owned(), id.to_string()));

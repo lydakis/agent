@@ -1839,7 +1839,7 @@ impl Service {
                 settings.validate()?;
                 turn::shaped(served, &settings)?;
                 if let Some(level) = &reasoning
-                    && !matches!(level.as_str(), "low" | "medium" | "high" | "xhigh" | "max")
+                    && !family.reasoning_levels().contains(&level.as_str())
                 {
                     return fail("invalid_reasoning_level");
                 }

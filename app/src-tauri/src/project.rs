@@ -1,6 +1,6 @@
 //! A project is a folder, its coordinator bot `NAME.lead`, and
 //! `.agents/project.toml` in that folder. The file holds mechanics only (the
-//! name and the coordinator's model); how the coordinator behaves stays in
+//! name and the coordinator's model and effort level); how the coordinator behaves stays in
 //! AGENTS.md. The project list itself comes from the coordinator bots in the
 //! store, so this file is read when a project is opened and written once
 //! when the app creates one. The daemon knows nothing of projects.
@@ -11,7 +11,7 @@ use std::path::Path;
 pub const FILE: &str = ".agents/project.toml";
 const LIMIT: u64 = 64 * 1024;
 /// Every key the file may hold; anything else is a mistake, not ignored.
-const KEYS: [&str; 3] = ["name", "coordinator", "model"];
+const KEYS: [&str; 4] = ["name", "coordinator", "model", "reasoning"];
 
 /// A name that is also a bot-name prefix: the daemon's name characters,
 /// short enough that `NAME.lead` and its task names fit.
@@ -76,7 +76,7 @@ pub fn read(dir: &Path) -> Result<Value, String> {
         let name = default_name(dir);
         return Ok(json!({
             "dir": dir, "name": name, "coordinator": format!("{name}.lead"),
-            "model": null, "file": false,
+            "model": null, "reasoning": null, "file": false,
         }));
     };
     let table: toml::Table = text
@@ -102,25 +102,34 @@ pub fn read(dir: &Path) -> Result<Value, String> {
     if model.as_deref() == Some("") {
         return Err(invalid("model must not be empty"));
     }
+    // The daemon judges the level when the coordinator is made.
+    let reasoning = field("reasoning")?;
+    if reasoning.as_deref() == Some("") {
+        return Err(invalid("reasoning must not be empty"));
+    }
     Ok(json!({
-        "dir": dir, "name": name, "coordinator": coordinator, "model": model, "file": true,
+        "dir": dir, "name": name, "coordinator": coordinator, "model": model,
+        "reasoning": reasoning, "file": true,
     }))
 }
 
 /// Write a new project's file. An existing file is the user's and is kept:
 /// one that appeared since the folder was read is refused, to be read again.
-pub fn write(dir: &Path, name: &str, model: &str) -> Result<(), String> {
+pub fn write(dir: &Path, name: &str, model: &str, reasoning: Option<&str>) -> Result<(), String> {
     if !valid_name(name) {
         return Err("project_invalid: name must be 1-64 of A-Z a-z 0-9 - _ .".into());
     }
     let path = dir.join(FILE);
     let quote = |s: &str| toml::Value::String(s.to_owned()).to_string();
-    let text = format!(
+    let mut text = format!(
         "name = {}\ncoordinator = {}\nmodel = {}\n",
         quote(name),
         quote(&format!("{name}.lead")),
         quote(model)
     );
+    if let Some(level) = reasoning.filter(|level| !level.is_empty()) {
+        text.push_str(&format!("reasoning = {}\n", quote(level)));
+    }
     let failed = |e: std::io::Error| match e.kind() {
         std::io::ErrorKind::AlreadyExists => {
             format!(
@@ -198,16 +207,17 @@ mod tests {
     #[test]
     fn a_written_file_reads_back_and_is_never_overwritten() {
         let dir = root("write");
-        write(&dir, "demo", "alpha/one").unwrap();
+        write(&dir, "demo", "alpha/one", Some("high")).unwrap();
         // One that appeared since the folder was read is kept and reported.
-        let refused = write(&dir, "other", "beta/two").unwrap_err();
+        let refused = write(&dir, "other", "beta/two", None).unwrap_err();
         assert!(refused.starts_with("project_changed: "), "{refused}");
         let project = read(&dir).unwrap();
         assert_eq!(project["name"], "demo");
         assert_eq!(project["coordinator"], "demo.lead");
         assert_eq!(project["model"], "alpha/one");
+        assert_eq!(project["reasoning"], "high");
         assert_eq!(project["file"], true);
-        assert!(write(&dir, "bad name", "alpha/one").is_err());
+        assert!(write(&dir, "bad name", "alpha/one", None).is_err());
         std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 
@@ -223,8 +233,12 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.to_string(), "synthetic disk full");
         assert!(!path.exists(), "no partial project file");
-        write(&dir, "demo", "alpha/one").unwrap();
-        assert_eq!(read(&dir).unwrap()["name"], "demo");
+        write(&dir, "demo", "alpha/one", None).unwrap();
+        let project = read(&dir).unwrap();
+        assert_eq!(
+            (&project["name"], &project["reasoning"]),
+            (&json!("demo"), &Value::Null)
+        );
         let left: Vec<_> = std::fs::read_dir(dir.join(".agents"))
             .unwrap()
             .map(|e| e.unwrap().file_name())
@@ -260,6 +274,12 @@ mod tests {
         assert!(error.ends_with("unknown key role"), "{error}");
         std::fs::write(dir.join(FILE), "name = \"demo\"\nmodel = \"\"\n").unwrap();
         assert!(read(&dir).unwrap_err().ends_with("model must not be empty"));
+        std::fs::write(dir.join(FILE), "name = \"demo\"\nreasoning = \"\"\n").unwrap();
+        assert!(
+            read(&dir)
+                .unwrap_err()
+                .ends_with("reasoning must not be empty")
+        );
         std::fs::write(
             dir.join(FILE),
             "name = \"demo\"\ncoordinator = \"demo.lead\"\nmodel = \"alpha/one\"\n",

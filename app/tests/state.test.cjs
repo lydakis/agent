@@ -882,11 +882,43 @@ test('a new project creates its coordinator in the folder, in its role, writes i
   // The coordinator profile composes the whole text; its model and tools apply when the project names none.
   assert.deepEqual(calls.find(([op]) => op === 'policy').slice(1), ['/synthetic/weather', 'coordinator']);
   assert.deepEqual([create.bot, create.workspace, create.model, create.instructions, Array.from(create.tools)], ['weather.lead', '/synthetic/weather', 'alpha/role', 'rules', ['shell', 'wait']]);
-  assert.deepEqual({ ...calls.find(([op]) => op === 'write')[1] }, { dir: '/synthetic/weather', name: 'weather', model: 'alpha/role' });
+  assert.deepEqual({ ...calls.find(([op]) => op === 'write')[1] }, { dir: '/synthetic/weather', name: 'weather', model: 'alpha/role', reasoning: null });
+  assert.equal('reasoning' in create, false, 'no effort picked sends none: the model uses its own');
   assert.equal(p.S.selected, 'weather.lead');
   const before = calls.length;
   await p.createProject('/synthetic/weather');
   assert.equal(calls.filter(([op]) => op === 'create').length, 1); assert.equal(calls.length, before);
+});
+
+test('an agent\'s effort is picked beside its model, kept in the project file, and shown with its model', async () => {
+  const sent = []; const storage = new Map(); let file = null;
+  const p = shell({
+    project: async (dir) => ({ dir, name: 'weather', coordinator: 'weather.lead', model: file?.model ?? null, reasoning: file?.reasoning ?? null, file: !!file }),
+    policy: async () => ({ instructions: 'rules', compaction_instructions: 'summary', note: 'test' }),
+    writeProject: async (q) => { sent.push(['write', { ...q }]); },
+    request: async (op, q) => { sent.push([op, { ...q }]); return op === 'create' ? { name: q.bot, id: sent.length, provider: q.model.split('/')[0], model: q.model.split('/')[1], reasoning: q.reasoning ?? null, workspace: q.workspace ?? '/synthetic' } : { nodes: [], next_from: null }; },
+  }, storage);
+  await p.createProject('/synthetic/weather', 'anthropic/claude-x', 'max');
+  const creates = () => sent.filter(([op]) => op === 'create').map(([, q]) => q);
+  assert.equal(creates()[0].reasoning, 'max');
+  assert.deepEqual(sent.find(([op]) => op === 'write')[1], { dir: '/synthetic/weather', name: 'weather', model: 'anthropic/claude-x', reasoning: 'max' });
+  assert.equal(p.S.bots.get('weather.lead').reasoning, 'max');
+  assert.equal(storage.get('agent:effort'), 'max', 'the last pick is offered next time, as the model is');
+  // A folder whose file names a model keeps that model's effort, whatever was picked.
+  p.S.bots.clear(); file = { model: 'alpha/one', reasoning: 'low' };
+  await p.createProject('/synthetic/weather', 'anthropic/claude-x', 'high');
+  assert.deepEqual([creates()[1].model, creates()[1].reasoning], ['alpha/one', 'low']);
+  // /new takes an effort after the model.
+  await p.submit('/new Bob anthropic/claude-x max');
+  await p.submit('/new Ann openai/gpt-6-luna xhigh');
+  await p.submit('/new Cy openai/gpt-6-luna');
+  assert.deepEqual(creates().slice(2).map((q) => [q.bot, q.reasoning]), [['Bob', 'max'], ['Ann', 'xhigh'], ['Cy', undefined]]);
+  // A creation event from another client carries the level, as the list does.
+  await p.onEvent({ event: 'created', bot: 'Eve', cursor: 900, data: { id: 90, provider: 'openai', model: 'gpt-6-luna', reasoning: 'high', status: 'idle', running_turn: null } });
+  assert.equal(p.S.bots.get('Eve').reasoning, 'high');
+  // An event that does not name the level leaves the one known.
+  p.upsert({ name: 'Eve', id: 90, provider: 'openai', model: 'gpt-6-luna', status: 'running' });
+  assert.equal(p.S.bots.get('Eve').reasoning, 'high');
 });
 
 test('the coordinator the app ships gives editing tasks worktrees and cleans up failed starts', () => {
@@ -1198,10 +1230,12 @@ test('the sheet offers the folder\'s profiles as identities and shows each row\'
     settings: async () => ({ providers: ['alpha', 'beta'] }),
     profiles: async (dir) => { assert.equal(dir, '/synthetic/app'); return [{ name: 'reviewer', summary: 'Reviews', model: 'beta/two' }]; },
   });
-  p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', workspace: '/synthetic/app' });
+  p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', reasoning: 'high', workspace: '/synthetic/app' });
   const el = (id) => p.context.document.getElementById(id);
   el('sw-n').value = '4'; el('sw-n').id = 'sw-n'; el('sw-budget').value = '3'; el('sw-budget').id = 'sw-budget';
   await p.openSwarmSheet('app');
+  // Its agents start on the lead's model and effort.
+  assert.match(el('sw-mix').innerHTML, /data-mix="0" data-f="reasoning"[^>]*>[\s\S]*?<option value="high" selected>high<\/option>/);
   assert.match(el('sw-mix').innerHTML, /<option value="" selected>Plain agent<\/option><option value="reviewer">reviewer<\/option>/);
   assert.match(el('sw-mix').innerHTML, /4 agents/);
   assert.equal(el('sw-each').textContent, 'about 750k tokens each');

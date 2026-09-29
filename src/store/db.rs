@@ -1640,7 +1640,7 @@ impl Database {
         // The event carries the list record's fields, so a follower can
         // seat a new bot without a request per creation.
         let mut data = json!({"id":id,"provider":binding.provider,"model":binding.model,
-            "workspace":workspace,"status":"idle","running_turn":null,
+            "reasoning":binding.reasoning,"workspace":workspace,"status":"idle","running_turn":null,
             "created_by":binding.created_by,"created_by_id":created_by_id});
         if let Some(gates) = &gates {
             data["gates"] = serde_json::from_str(gates)?;
@@ -5679,7 +5679,7 @@ impl Database {
             )?;
         }
         let mut data = json!({"id":id,"source":source,"checkpoint":checkpoint,"node":checkpoint,
-            "provider":parent.provider,"model":parent.model,
+            "provider":parent.provider,"model":parent.model,"reasoning":parent.reasoning,
             "workspace":workspace,"status":"idle","running_turn":null,
             "created_by":created_by,"created_by_id":created_by_id});
         if let Some(gates) = &gates {

@@ -467,6 +467,7 @@ fn write_project(
     dir: String,
     name: String,
     model: String,
+    reasoning: Option<String>,
 ) -> Result<(), String> {
     windows
         .of(&window)?
@@ -475,6 +476,7 @@ fn write_project(
         std::path::Path::new(&workspace_path(std::path::Path::new(&dir))?),
         &name,
         &model,
+        reasoning.as_deref(),
     )
 }
 
