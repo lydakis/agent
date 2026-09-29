@@ -74,7 +74,9 @@ jobs:
 
   package:
     needs: resolve
-    runs-on: macos-15
+    # The SDK an app links against picks its window chrome on macOS 26: one
+    # built with an older SDK keeps the separate, pre-26 title bar.
+    runs-on: macos-26
     timeout-minutes: 90
     permissions:
       contents: write
@@ -102,6 +104,14 @@ jobs:
             echo 'Release tag changed after approval' >&2
             exit 1
           fi
+      - name: Check the macOS SDK
+        run: |
+          sdk=$(xcrun --sdk macosx --show-sdk-version)
+          if [ "${sdk%%.*}" -lt 26 ]; then
+            echo "Release builds need the macOS 26 SDK or later; found $sdk" >&2
+            exit 1
+          fi
+          echo "macOS SDK $sdk"
       - name: Install Rust targets
         # rust-toolchain.toml pins the toolchain; both Mac architectures ship.
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin

@@ -48,6 +48,25 @@ class TriggerTest(unittest.TestCase):
                 self.assertIn("github.event.workflow_run.conclusion == 'success'", text)
 
 
+class SdkTest(unittest.TestCase):
+    def run_check(self, version):
+        with tempfile.TemporaryDirectory() as bin_dir:
+            xcrun = Path(bin_dir) / "xcrun"
+            xcrun.write_text(f"#!/bin/sh\necho {version}\n")
+            xcrun.chmod(0o755)
+            env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+            return subprocess.run(["bash", "-euo", "pipefail", "-c",
+                                   workflow_step("Check the macOS SDK")],
+                                  env=env, capture_output=True, text=True)
+
+    def test_the_app_is_built_with_the_macos_26_sdk_or_later(self):
+        # An older SDK gives the app the pre-26 separate title bar.
+        self.assertIn("runs-on: macos-26", (WORKFLOWS / "release.yml").read_text())
+        for version, ok in [("15.5", False), ("26.0", True), ("26.2", True), ("27.0", True)]:
+            with self.subTest(sdk=version):
+                self.assertEqual(self.run_check(version).returncode == 0, ok)
+
+
 class ReleaseWorkflowTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
