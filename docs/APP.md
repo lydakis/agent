@@ -670,7 +670,7 @@ the bot is the coordinator's own fork or side chat (`PROJECT.lead-…`). A
 steer's turn is part of the turn it joined. Turns replayed on attach are
 history, not news; one that ends live while the window is still reading the
 list of bots is held until the list says who made its bot, and dropped if the bot is
-deleted meanwhile. A queued turn's
+deleted meanwhile or the window detaches first. A queued turn's
 `accepted` names its author again, so a window attached after the `queued`
 event was pruned still knows the coordinator asked for it. The coordinator is told only while it rests (nothing is armed while it
 works), at most
@@ -772,7 +772,8 @@ anything else a failure can leave is listed and removable:
   written, the plist stays, listed, rather than ending with no trace. The
   plist goes before the unload, since the unload ends the fire's own
   process; a plist that cannot be deleted keeps its job loaded, and an
-  unload launchd refuses writes the plist back, so either stays listed. A
+  unload launchd refuses writes the plist and the result back, so either
+  stays listed with what its fire did. A
   job left loaded after its plist went (an end cut short) is unloaded by
   its next fire.
 - **Removing** unloads the job by its label whether or not its plist is

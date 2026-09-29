@@ -1003,7 +1003,8 @@ async function attachOnce() {
     if (!S.config) S.config = await Daemon.setup();
     const { session } = await Daemon.attach(S.cursor);
     S.session = session;
-    S.deleted = new Set(); S.snapshot = true;
+    // News held by a session that was lost names bots this one has not seen; its bot may be another by now.
+    S.deleted = new Set(); S.snapshot = true; S.heldNews = [];
     pump(session);
     // The snapshot, a page at a time, applied as it arrives while the replay flows.
     const listed = new Set(); let after = null;

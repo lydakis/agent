@@ -975,13 +975,25 @@ fn end(places: &Places, name: &str, path: &Path, text: &str, keep: bool, launchd
     if let Err(error) = forget(path) {
         return log(error);
     }
-    if !keep && let Err(error) = forget(&places.last(name)) {
-        log(error);
-    }
+    let last = places.last(name);
+    let result = if keep {
+        None
+    } else {
+        let result = std::fs::read_to_string(&last).ok();
+        if let Err(error) = forget(&last) {
+            log(error);
+        }
+        result
+    };
     if let Err(error) = unload(&format!("{LABEL}{name}"), launchd) {
         log(error);
-        if let Err(error) = replace(path, text) {
-            log(error);
+        // Still loaded, it is still this schedule, with what its fire did.
+        for (path, text) in [(path, Some(text)), (&last, result.as_deref())] {
+            if let Some(text) = text
+                && let Err(error) = replace(path, text)
+            {
+                log(error);
+            }
         }
     }
 }
@@ -1835,13 +1847,16 @@ mod tests {
         w.fake.refuse_unload.set(true);
         w.settle(&replacement, json!({"outcome": "sent", "turn": 4}));
         w.fake.refuse_unload.set(false);
-        assert_eq!(w.state(&one.name), (true, true, false));
+        assert_eq!(w.state(&one.name), (true, true, true));
         assert_eq!(schedules(&w.places)[0].0, replacement);
+        assert_eq!(list(&w.places)[0]["last"]["turn"], 4);
         // A job left loaded without its plist (an end cut short) is unloaded
-        // by its next fire, and records nothing.
+        // by its next fire, which records nothing over the result there was.
         std::fs::remove_file(w.places.plist(&one.name)).unwrap();
         w.settle(&replacement, json!({"outcome": "missed"}));
-        assert_eq!(w.state(&one.name), (false, false, false));
+        assert_eq!(w.state(&one.name), (false, false, true));
+        assert_eq!(list(&w.places)[0]["last"]["turn"], 4);
+        w.remove(&one.name).unwrap();
         // A plist that will not go keeps its job loaded and its result.
         let stuck = w.places.plist("p.stuck");
         std::fs::create_dir_all(stuck.join("x")).unwrap();
