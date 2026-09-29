@@ -731,37 +731,64 @@ and that file is its only record: its program arguments carry the bot, its
 id, the store and the socket of the shell it was made from (an agent's shell
 has both), the store identity its daemon announced, the one-off's time and
 the message. A fire whose daemon announces another store (a reused socket)
-sends nothing and records `store_mismatch`. Replacing one unloads the old
-job first and, if the new plist cannot be written or loaded, writes the old
-one back and loads it; an old plist that cannot be read is not replaced,
-since it could not be put back. A replacement starts with no last result;
-a failed one puts the old result back with its plist.
-A removal launchd refuses keeps the plist, so it can be retried. When it fires, the app's executable runs with `--schedule-fire`
-and those arguments. It connects to the daemon, and when none answers and
-the store is known, starts one for it on that socket as the app does, with
-the login shell's environment and `~/.agent/env`. A repeating schedule
-submits with `delivery: reject`: a bot that is working, or has work
-waiting, skips that time rather than having it cut in or pile up. A one-off
-submits with `delivery: queue`, so a working bot gets it after its turn. A
-bot deleted since, or a new bot under its name, is not reached
-(`bot_not_found`), and the schedule ends. A one-off's calendar entry has no
-year, so a fire more than two days before its time does nothing; the slack
-keeps a one-off whose Mac changed time zone since, since launchd follows the
-new zone's clock. What
-the fire did (`sent` with the turn, `skipped`, `gone` or `failed` with why)
-is kept with the schedule's row in `~/.agent/schedules/NAME.json`, which
-Settings shows beside each schedule with its message and a Remove button. A
-one-off that delivered leaves nothing; one that ends without delivering
-(its agent gone, the daemon unreachable) loses its plist but keeps that
-file, so Settings and `ls` still list it, as not delivered and why, until
-it is removed; when that file cannot be written, the plist stays, still
-listed, rather than ending with no trace. A plist the fire cannot delete
-stays loaded too, listed with its result, for `rm`: unloaded, it would load
-again at the next login. One whose unload launchd refuses gets its plist
-back, so the job still loaded stays listed for `rm`. Those files are written, synced, renamed and their folder
-synced. `add`, `rm`, a fire ending its schedule and the app's refresh take
-a lock (`~/.agent/schedules/.lock`) around their changes, and the refresh
-reads each plist again under it. `~/.agent/schedule` is written with its
+sends nothing and records `store_mismatch`. When it fires, the app's
+executable runs with `--schedule-fire` and those arguments. It connects to
+the daemon, and when none answers and the store is known, starts one for it
+on that socket as the app does, with the login shell's environment and
+`~/.agent/env`. A repeating schedule submits with `delivery: reject`: a bot
+that is working, or has work waiting, skips that time rather than having it
+cut in or pile up. A one-off submits with `delivery: queue`, so a working
+bot gets it after its turn. A bot deleted since, or a new bot under its
+name, is not reached (`bot_not_found`), and the schedule ends. A one-off's
+calendar entry has no year, so a fire more than two days before its time
+does nothing (the slack keeps a one-off whose Mac changed time zone since,
+since launchd follows the new zone's clock), and one more than half a year
+after it is that entry's next year: it sends nothing and ends as `missed`.
+What the fire did (`sent` with the turn, `skipped`, `gone`, `missed` or
+`failed` with why) is kept with the schedule's row in
+`~/.agent/schedules/NAME.json`, which Settings shows beside each schedule
+with its message and a Remove button.
+
+A schedule's state is three things: its plist, launchd's loaded copy, and
+that last result. Every change keeps them either whole or as they were, and
+anything else a failure can leave is listed and removable:
+
+- **Adding** writes the plist and loads it. A load launchd refuses removes
+  the plist again.
+- **Replacing** (a name in use) clears the old last result, unloads the old
+  job, writes the new plist and loads it. An old job launchd will not
+  unload, an old plist that cannot be read (it could not be put back) or a
+  last result that cannot be cleared refuses the replacement before
+  anything changes. A new plist that cannot be written or loaded puts the
+  old plist and result back and loads it; if launchd refuses that too, the
+  old plist is listed and loads at the next login.
+- **Firing** records its result and ends a schedule that is over, both
+  under the lock and only while the plist is still the one it fired for: a
+  schedule replaced or removed while its message went out is left as it now
+  is. A one-off that delivered leaves nothing. One that ends without
+  delivering (its agent gone, the daemon unreachable, `missed`) loses its
+  plist but keeps its last result, so Settings and `ls` list it as not
+  delivered, and why, until it is removed. When that result cannot be
+  written, the plist stays, listed, rather than ending with no trace. The
+  plist goes before the unload, since the unload ends the fire's own
+  process; a plist that cannot be deleted keeps its job loaded, and an
+  unload launchd refuses writes the plist back, so either stays listed. A
+  job left loaded after its plist went (an end cut short) is unloaded by
+  its next fire.
+- **Removing** unloads the job by its label whether or not its plist is
+  there, then deletes the plist and the last result, so it reaches an
+  ended row, a plist launchd no longer has, and a job loaded without its
+  plist alike. An unload launchd refuses keeps everything, to be tried
+  again.
+- **Listing** shows a one-off still there two days after its time as
+  `missed: true` (launchd did not run it, as when the Mac was off, or its
+  end was cut short), and a plist that cannot be read as a row with its
+  `problem`, which `rm` removes.
+
+The files are written, synced, renamed and their folder synced; deletions
+sync their folder too. `add`, `rm`, a fire's result and end, and the app's
+refresh take a lock (`~/.agent/schedules/.lock`) around their changes, and
+the refresh reads each plist again under it. `~/.agent/schedule` is written with its
 executable mode from the start. When the
 app starts from a new place, as after an update, it writes its path into
 every schedule and loads it again, on a thread of its own so the window does
@@ -900,10 +927,11 @@ turn, skipped the bot while a turn held it, gave a one-off to a working bot
 after its turn, started a stopped daemon on the socket the schedule was made
 with, ended with a visible row when its bot was made again under the same
 name, and did nothing a year early; `add` from an agent's shell was refused
-without launchd and left no plist. The plist, calendar expansion, replace
-(and restoring the old one when launchd refuses the new), remove (kept when
-launchd refuses the unload), ended rows and the app's move are tested in
-`app/src-tauri/src/schedule.rs` with launchd stood in for. The coordinator's
+without launchd and left no plist. The plist, calendar expansion and the
+app's move are tested in `app/src-tauri/src/schedule.rs`, and so is each
+lifecycle step above against a stand-in launchd that tracks which labels
+are loaded and refuses loads and unloads on demand: after every refusal the
+plist, the loaded job and the last result are checked together. The coordinator's
 task updates are tested in `app/tests/state.test.cjs` and were driven in demo
 mode in headless Chromium. Not verified: launchd itself, which needs a Mac.
 
@@ -940,7 +968,7 @@ coordinator's task updates (one batched message when it rests, never for
 turns it asked for or replayed ones, kept when a send fails).
 `cargo test -p agent-app` includes a failed project-file write leaving
 neither a partial file nor a temporary, and schedules' calendars, plists,
-replace, remove and move. With `AGENT_TEST_RUNTIME=1` after a release build
+move, and each lifecycle step with launchd refusing. With `AGENT_TEST_RUNTIME=1` after a release build
 and `cargo build -p agent-app`, `python3 -m unittest tests.test_schedule`
 fires schedules against a real daemon.
 `cargo test --workspace` includes the silent-listener readiness deadline,

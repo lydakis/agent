@@ -2189,12 +2189,16 @@ function rolesHTML(st, busy) {
 }
 // Agents wake at set times from schedules they or their coordinator made; the Mac keeps the time.
 // Each shows who it wakes, when, what its last time did, and the message it sends.
-// A schedule that ended on its own without delivering stays listed, saying why, until it is removed.
-const LAST = { sent: 'sent', skipped: 'skipped, it was working', gone: 'its agent is gone', failed: 'failed' };
+// A schedule that ended on its own without delivering stays listed, saying why, until it is removed; so do a
+// one-off still there after its time and a plist that cannot be read.
+const LAST = { sent: 'sent', skipped: 'skipped, it was working', gone: 'its agent is gone', failed: 'failed', missed: 'missed, its time passed long ago' };
 function schedulesHTML(st, busy) {
   const at = (ms) => new Date(ms).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
   const last = (l, ended) => l ? `${ended ? 'ended' : 'last'} ${at(l.fired_ms)}: ${LAST[l.outcome] ?? l.outcome}${l.outcome === 'failed' && l.detail ? ` (${String(l.detail).slice(0, 120)})` : ''}` : 'not run yet';
-  const rows = (st.schedules ?? []).map((x) => `<div class="prow"><span class="pn">${esc(x.bot)}</span><span class="st${x.ended ? ' bad' : ''}">${x.ended ? 'not delivered' : esc(x.when)}</span><span class="acts"><button type="button" class="sbtn" data-act="schedule-remove" data-v="${esc(x.name)}"${busy}>Remove</button></span><div class="sub dim">${esc(last(x.last, x.ended))}${x.name !== x.bot ? ` · ${esc(x.name)}` : ''}</div><div class="sub dim">${esc(x.message.length > 240 ? `${x.message.slice(0, 240)}…` : x.message)}</div></div>`).join('');
+  const remove = (x) => `<span class="acts"><button type="button" class="sbtn" data-act="schedule-remove" data-v="${esc(x.name)}"${busy}>Remove</button></span>`;
+  const rows = (st.schedules ?? []).map((x) => x.problem
+    ? `<div class="prow"><span class="pn">${esc(x.name)}</span><span class="st bad">unreadable</span>${remove(x)}<div class="sub dim">${esc(x.problem)}</div></div>`
+    : `<div class="prow"><span class="pn">${esc(x.bot)}</span><span class="st${x.ended || x.missed ? ' bad' : ''}">${x.ended ? 'not delivered' : x.missed ? 'missed its time' : esc(x.when)}</span>${remove(x)}<div class="sub dim">${esc(last(x.last, x.ended))}${x.name !== x.bot ? ` · ${esc(x.name)}` : ''}</div><div class="sub dim">${esc(x.message.length > 240 ? `${x.message.slice(0, 240)}…` : x.message)}</div></div>`).join('');
   const none = st.schedulesError ? `<p class="bad">${esc(st.schedulesError)}</p>` : rows ? '' : '<p class="dim">None yet. Ask a coordinator, for example "have build check its PR every 30 minutes".</p>';
   return `<section><h3>Schedules</h3>${rows}${none}<p class="dim">Each time, the agent gets its message in its own chat. A repeating one skips a time its agent is working; a one-off waits for it. They run with the app closed; a time the Mac slept through runs once when it wakes.</p></section>`;
 }

@@ -6,6 +6,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from xml.sax.saxutils import escape as xml_escape
 
 from bench.targets import clean_env
 from tests.test_runtime import ModelFixture
@@ -53,6 +54,11 @@ class ScheduleFireTests(ModelFixture):
                 *(['--socket', str(socket)] if socket else []),
                 '--store-id', store_id, '--', message]
         env = {**clean_env(), 'HOME': str(self.home), **(env or {})}
+        # A fire records and ends only the schedule its plist still holds.
+        plist = self.home / 'Library/LaunchAgents' / f'me.lydakis.agent.schedule.{name}.plist'
+        plist.parent.mkdir(parents=True, exist_ok=True)
+        strings = ''.join(f'<string>{xml_escape(a)}</string>' for a in args)
+        plist.write_text(f'<plist><dict><key>ProgramArguments</key><array>{strings}</array></dict></plist>')
         result = subprocess.run(args, env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
         last = self.home / '.agent/schedules' / f'{name}.json'
@@ -142,6 +148,28 @@ class ScheduleFireTests(ModelFixture):
         early = self.fire('p.task', 'p.task', self.bot_id('p.task'), 'x', at=int(time.time()) + 10 * 86400)
         self.assertIsNone(early)
         self.assertEqual(len(self.turns('p.task')), 1)
+
+    def test_a_one_off_months_late_is_its_next_year_and_not_sent(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        late = self.fire('p.task', 'p.task', self.bot_id('p.task'), 'x', at=int(time.time()) - 200 * 86400)
+        self.assertEqual(late['last']['outcome'], 'missed', late)
+        self.assertEqual(len(self.turns('p.task')), 1)
+
+    def test_a_fire_records_nothing_for_a_schedule_replaced_or_removed_meanwhile(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        bot_id = self.bot_id('p.task')
+        self.fire('p.task', 'p.task', bot_id, 'first')
+        # The plist now holds another message: the old job's fire leaves its result alone.
+        plist = self.home / 'Library/LaunchAgents/me.lydakis.agent.schedule.p.task.plist'
+        plist.write_text(plist.read_text().replace('first', 'second'))
+        last = self.home / '.agent/schedules/p.task.json'
+        last.unlink()
+        args = [str(APP), '--schedule-fire', '--name', 'p.task', '--bot', 'p.task', '--bot-id', str(bot_id),
+                '--when', 'every 30m', '--store', str(self.store), '--store-id', self.store_identity(), '--', 'first']
+        result = subprocess.run(args, env={**clean_env(), 'HOME': str(self.home)}, capture_output=True, text=True,
+                                timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(last.exists())
 
     def test_add_from_an_agents_shell_needs_launchd(self):
         # Here there is no launchd: the schedule is refused and nothing is left behind.

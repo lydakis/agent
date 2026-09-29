@@ -29,6 +29,12 @@ const MAX_MESSAGE: usize = 16 * 1024;
 const MAX_ENTRIES: usize = 1024;
 /// launchd's calendar has no year, so a one-off time must fall within one.
 const MAX_AHEAD: i64 = 364 * 24 * 3600;
+/// How far from its time a one-off's fire may be and still be its own: a
+/// time zone changed since it was made moves launchd's clock by up to a day.
+const SLACK: i64 = 2 * 24 * 3600;
+/// A one-off's calendar entry comes again a year later; a fire this late
+/// is that, not a wake after a long sleep.
+const STALE: i64 = 182 * 24 * 3600;
 const USAGE: &str = "usage: schedule add [--bot NAME] [--name NAME] (--every N{m,h,d} | --in N{m,h} | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY') -- MESSAGE\n       schedule ls\n       schedule rm NAME";
 
 /// Where schedules live: the LaunchAgents folder holds their plists, and
@@ -610,45 +616,70 @@ fn program(text: &str) -> Option<Vec<String>> {
     Some(args)
 }
 
-/// Every schedule, in name order, with its plist's program and what its
-/// last fire did.
-fn read_all(places: &Places) -> Vec<(Schedule, PathBuf)> {
+/// The schedule a plist runs, and the app it runs it with.
+fn read_plist(text: &str) -> Option<(Schedule, PathBuf)> {
+    let args = program(text)?;
+    let (app, rest) = args.split_first()?;
+    let schedule = Schedule::parse(rest.strip_prefix(&[FIRE_FLAG.to_owned()])?).ok()?;
+    Some((schedule, PathBuf::from(app)))
+}
+
+/// A plist's schedule and app, or why it could not be read.
+type Read = Result<(Schedule, PathBuf), String>;
+
+/// Every schedule's plist, in name order.
+fn read_all(places: &Places) -> Vec<(String, Read)> {
     let Ok(dir) = std::fs::read_dir(&places.agents) else {
         return Vec::new();
     };
-    let mut out: Vec<(Schedule, PathBuf)> = dir
+    let mut out: Vec<_> = dir
         .flatten()
-        .filter(|e| {
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            name.starts_with(LABEL) && name.ends_with(".plist")
-        })
         .filter_map(|e| {
-            let text = std::fs::read_to_string(e.path()).ok()?;
-            let args = program(&text)?;
-            let (app, rest) = args.split_first()?;
-            let schedule = Schedule::parse(rest.strip_prefix(&[FIRE_FLAG.to_owned()])?).ok()?;
-            Some((schedule, PathBuf::from(app)))
+            let file = e.file_name().into_string().ok()?;
+            let name = file.strip_prefix(LABEL)?.strip_suffix(".plist")?.to_owned();
+            let read = std::fs::read_to_string(e.path())
+                .map_err(|e| format!("unreadable: {e}"))
+                .and_then(|text| {
+                    read_plist(&text).ok_or_else(|| "unreadable: not a schedule's plist".into())
+                });
+            Some((name, read))
         })
         .collect();
-    out.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+    out.sort_by(|a, b| a.0.cmp(&b.0));
     out
 }
 
+/// Every schedule that can be read, with its app.
+fn schedules(places: &Places) -> Vec<(Schedule, PathBuf)> {
+    read_all(places)
+        .into_iter()
+        .filter_map(|(_, read)| read.ok())
+        .collect()
+}
+
 /// Every schedule, then every one that ended on its own without delivering
-/// its message, until it is removed.
+/// its message, until it is removed. A one-off still there two days after
+/// its time is `missed`: launchd did not run it, or its end was cut short.
+/// A plist that cannot be read is a row with its `problem`, for `rm`.
 pub fn list(places: &Places) -> Value {
     let read = |path: &Path| -> Option<Value> {
         serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
     };
-    let schedules = read_all(places);
-    let mut rows: Vec<Value> = schedules
+    let all = read_all(places);
+    let now = now();
+    let mut rows: Vec<Value> = all
         .iter()
-        .map(|(s, _)| {
-            let last = read(&places.last(&s.name)).map(|row| row["last"].clone());
-            let mut row = s.json(last);
-            row["ended"] = json!(false);
-            row
+        .map(|(name, plist)| match plist {
+            Ok((s, _)) => {
+                let last = read(&places.last(&s.name)).map(|row| row["last"].clone());
+                let mut row = s.json(last);
+                row["ended"] = json!(false);
+                if s.at.is_some_and(|at| now > at + SLACK) {
+                    row["missed"] = json!(true);
+                }
+                row
+            }
+            Err(problem) => json!({"name": name, "ended": false, "problem": problem}),
         })
         .collect();
     let mut ended: Vec<Value> = std::fs::read_dir(&places.state)
@@ -658,7 +689,7 @@ pub fn list(places: &Places) -> Value {
         .filter_map(|e| {
             let file = e.file_name().into_string().ok()?;
             let name = file.strip_suffix(".json")?;
-            if valid_name(name).is_err() || schedules.iter().any(|(s, _)| s.name == name) {
+            if valid_name(name).is_err() || all.iter().any(|(listed, _)| listed == name) {
                 return None;
             }
             let mut row = read(&e.path()).filter(|row| row["name"] == name)?;
@@ -735,16 +766,23 @@ pub fn install(
 ) -> Result<(), String> {
     valid_name(&schedule.name)?;
     let _lock = Lock::take(places)?;
-    // macOS folders ignore case: `Build` would overwrite `build`'s files.
-    let file = format!("{LABEL}{}.plist", schedule.name);
-    let taken = std::fs::read_dir(&places.agents)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| e.file_name().into_string().ok())
-        .find(|f| *f != file && f.eq_ignore_ascii_case(&file));
-    if let Some(taken) = taken {
-        let other = &taken[LABEL.len()..taken.len() - ".plist".len()];
+    // macOS folders ignore case: `Build` would overwrite `build`'s files,
+    // its plist or an ended one's last result.
+    let taken = |dir: &Path, file: &str| {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .find(|f| f != file && f.eq_ignore_ascii_case(file))
+    };
+    let taken = taken(&places.agents, &format!("{LABEL}{}.plist", schedule.name))
+        .map(|f| f[LABEL.len()..f.len() - ".plist".len()].to_owned())
+        .or_else(|| {
+            taken(&places.state, &format!("{}.json", schedule.name))
+                .map(|f| f[..f.len() - ".json".len()].to_owned())
+        });
+    if let Some(other) = taken {
         return Err(format!(
             "name_taken: {}: schedule {other} differs only in case; pass --name",
             schedule.name
@@ -854,7 +892,7 @@ fn forget(path: &Path) -> Result<(), String> {
 
 /// Remove a schedule: launchd's copy, then its plist and last result. An
 /// unload launchd refuses keeps the plist, so the removal can be retried.
-/// An ended schedule is only its last result, which goes.
+/// Whatever is left of it goes, a job loaded without its plist included.
 pub fn remove(places: &Places, name: &str, launchd: Loader) -> Result<(), String> {
     valid_name(name)?;
     let _lock = Lock::take(places)?;
@@ -871,48 +909,79 @@ pub fn remove(places: &Places, name: &str, launchd: Loader) -> Result<(), String
             .any(|e| Some(e.file_name().as_os_str()) == want)
     };
     let (path_here, last_here) = (stored(&places.agents, &path), stored(&places.state, &last));
-    if !path_here {
-        if !last_here {
-            return Err(format!("schedule_not_found: {name}"));
-        }
-        return forget(&last);
+    // launchd's labels keep their case, so this reaches only this name's job.
+    let loaded = match launchd(Launchd::Unload(&format!("{LABEL}{name}"))) {
+        Ok(()) => true,
+        Err(error) if error.starts_with(NOT_LOADED) => false,
+        Err(error) => return Err(error),
+    };
+    if !path_here && !last_here && !loaded {
+        return Err(format!("schedule_not_found: {name}"));
     }
-    unload(&format!("{LABEL}{name}"), launchd)?;
-    forget(&path)?;
-    forget(&last)
+    if path_here {
+        forget(&path)?;
+    }
+    if last_here {
+        forget(&last)?;
+    }
+    Ok(())
 }
 
-/// A firing schedule ends itself: its plist first, then launchd's copy,
-/// whose unload ends this process. `keep` leaves its last result, so an
-/// end nobody asked for still shows, and why. A plist that will not go
-/// stays loaded with its result, listed, for `rm`: unloaded, it would load
-/// again at the next login. An unload launchd refuses writes the plist
-/// back, so the job it left loaded is still listed for `rm`.
-fn end(places: &Places, name: &str, keep: bool, launchd: Loader) {
-    let _lock = Lock::take(places);
-    let path = places.plist(name);
-    // A job whose plist is already gone is still unloaded.
+/// What a fire did goes on disk, and a schedule that is over ends: both
+/// under the lock, and only while the plist is still this schedule's. One
+/// replaced or removed while its message went out is left as it now is; a
+/// job left loaded after its plist went (an end cut short) is unloaded.
+fn settle(places: &Places, schedule: &Schedule, outcome: &Value, launchd: Loader) {
+    let log = |error: String| eprintln!("{}", json!({"error": error}));
+    let _lock = match Lock::take(places) {
+        Ok(lock) => lock,
+        Err(error) => return log(error),
+    };
+    let path = places.plist(&schedule.name);
     let text = match std::fs::read_to_string(&path) {
-        Ok(text) => Some(text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => {
-            eprintln!("{}", json!({"error": format!("{}: {e}", path.display())}));
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Under the lock no `add` is between writing and loading one.
+            if let Err(error) = unload(&format!("{LABEL}{}", schedule.name), launchd) {
+                log(error);
+            }
             return;
         }
+        Err(e) => return log(format!("{}: {e}", path.display())),
     };
-    if text.is_some()
-        && let Err(error) = forget(&path)
-    {
-        eprintln!("{}", json!({"error": error}));
+    if read_plist(&text).is_none_or(|(now, _)| now != *schedule) {
         return;
     }
-    if !keep {
-        let _ = forget(&places.last(name));
+    let recorded = record_last(places, schedule, outcome);
+    if let Err(error) = &recorded {
+        log(error.clone());
+    }
+    let sent = outcome["outcome"] == "sent";
+    // One that did not deliver ends only once why is on disk; else its plist
+    // stays, listed.
+    if (schedule.at.is_some() || outcome["outcome"] == "gone") && (sent || recorded.is_ok()) {
+        end(places, &schedule.name, &path, &text, !sent, launchd);
+    }
+}
+
+/// A schedule ends itself: its plist first, then launchd's copy, whose
+/// unload ends this process. `keep` leaves its last result, so an end nobody
+/// asked for still shows, and why. A plist that will not go stays loaded,
+/// listed, for `rm`: unloaded, it would load again at the next login. An
+/// unload launchd refuses writes the plist back, so the job still loaded
+/// stays listed for `rm`. Called under the lock.
+fn end(places: &Places, name: &str, path: &Path, text: &str, keep: bool, launchd: Loader) {
+    let log = |error: String| eprintln!("{}", json!({"error": error}));
+    if let Err(error) = forget(path) {
+        return log(error);
+    }
+    if !keep && let Err(error) = forget(&places.last(name)) {
+        log(error);
     }
     if let Err(error) = unload(&format!("{LABEL}{name}"), launchd) {
-        eprintln!("{}", json!({"error": error}));
-        if let Some(text) = text {
-            let _ = replace(&path, &text);
+        log(error);
+        if let Err(error) = replace(path, text) {
+            log(error);
         }
     }
 }
@@ -921,7 +990,7 @@ fn end(places: &Places, name: &str, keep: bool, launchd: Loader) {
 /// schedule again when it starts from somewhere else. One that fails keeps
 /// the old path, so the next start tries it again.
 pub fn refresh(places: &Places, app: &Path, launchd: Loader) {
-    for (schedule, _) in read_all(places) {
+    for (schedule, _) in schedules(places) {
         let Ok(_lock) = Lock::take(places) else {
             return;
         };
@@ -1162,7 +1231,15 @@ pub fn fire_cli(args: &[String]) -> i32 {
     // A one-off's calendar entry has no year: the same date a year early is
     // not its time. A day's slack keeps its time when the Mac's time zone
     // changed since it was made, which launchd follows and `at` does not.
-    if schedule.at.is_some_and(|at| now < at - 2 * 24 * 3600) {
+    if schedule.at.is_some_and(|at| now < at - SLACK) {
+        return 0;
+    }
+    // Months late is the entry's next year: the Mac was off at its time, or
+    // its end was cut short. It is not sent; if it is still listed, it ends
+    // saying so.
+    if schedule.at.is_some_and(|at| now > at + STALE) {
+        let missed = json!({"outcome": "missed", "detail": "its time passed long ago"});
+        settle(&places, &schedule, &missed, &launchctl);
         return 0;
     }
     let outcome = match runtime() {
@@ -1187,12 +1264,7 @@ pub fn fire_cli(args: &[String]) -> i32 {
         }),
         Err(error) => json!({"outcome": "failed", "detail": error}),
     };
-    let recorded = record_last(&places, &schedule, &outcome);
-    let sent = outcome["outcome"] == "sent";
-    // One that did not deliver ends only once why is on disk; else its plist stays, listed.
-    if (schedule.at.is_some() || outcome["outcome"] == "gone") && (sent || recorded.is_ok()) {
-        end(&places, &schedule.name, !sent, &launchctl);
-    }
+    settle(&places, &schedule, &outcome, &launchctl);
     0
 }
 
@@ -1423,13 +1495,22 @@ mod tests {
         };
         let asked = RefCell::new(Vec::new());
         let launchd = |what: Launchd| {
-            asked.borrow_mut().push(match what {
+            let unloading = match what {
                 Launchd::Load(path) => {
-                    format!("load {}", path.file_name().unwrap().to_string_lossy())
+                    asked.borrow_mut().push(format!(
+                        "load {}",
+                        path.file_name().unwrap().to_string_lossy()
+                    ));
+                    return Ok(());
                 }
-                Launchd::Unload(label) => format!("unload {label}"),
-            });
-            Ok(())
+                Launchd::Unload(label) => label.to_owned(),
+            };
+            asked.borrow_mut().push(format!("unload {unloading}"));
+            // launchd's labels keep their case.
+            match unloading.ends_with("p.fix-login") {
+                true => Ok(()),
+                false => Err(format!("{NOT_LOADED}no such process")),
+            }
         };
         let app = Path::new("/A/agent-app");
         let s = schedule();
@@ -1473,7 +1554,7 @@ mod tests {
             _ => Ok(()),
         };
         refresh(&places, Path::new("/B/agent-app"), &refused);
-        assert_eq!(read_all(&places)[0].1, Path::new("/A/agent-app"));
+        assert_eq!(schedules(&places)[0].1, Path::new("/A/agent-app"));
         // A name differing only in case would share its files on macOS.
         let cased = Schedule {
             name: "P.Fix-Login".into(),
@@ -1493,19 +1574,14 @@ mod tests {
         // A move of the app is written into every schedule and reloaded.
         asked.borrow_mut().clear();
         refresh(&places, Path::new("/B/agent-app"), &launchd);
-        assert_eq!(read_all(&places)[0].1, Path::new("/B/agent-app"));
-        assert_eq!(read_all(&places)[0].0, s);
+        assert_eq!(schedules(&places)[0].1, Path::new("/B/agent-app"));
+        assert_eq!(schedules(&places)[0].0, s);
         assert_eq!(asked.borrow().len(), 2);
         refresh(&places, Path::new("/B/agent-app"), &launchd);
         assert_eq!(asked.borrow().len(), 2, "an unmoved app changes nothing");
         remove(&places, &s.name, &launchd).unwrap();
         assert_eq!(list(&places), json!([]));
         assert!(!places.last(&s.name).exists());
-        assert!(
-            remove(&places, &s.name, &launchd)
-                .unwrap_err()
-                .starts_with("schedule_not_found")
-        );
         assert!(
             install(
                 &places,
@@ -1540,158 +1616,298 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// launchd as schedules see it: which labels are loaded, and what it
+    /// refuses.
+    #[derive(Default)]
+    struct Fake {
+        loaded: RefCell<std::collections::BTreeSet<String>>,
+        refuse_load: std::cell::Cell<bool>,
+        refuse_unload: std::cell::Cell<bool>,
+        unloads: std::cell::Cell<usize>,
+    }
+
+    impl Fake {
+        fn call(&self, what: Launchd) -> Result<(), String> {
+            match what {
+                Launchd::Load(path) => {
+                    if self.refuse_load.get() {
+                        return Err("launchctl bootstrap: refused".into());
+                    }
+                    let label = path.file_stem().unwrap().to_string_lossy().into_owned();
+                    self.loaded
+                        .borrow_mut()
+                        .insert(label)
+                        .then_some(())
+                        .ok_or_else(|| "launchctl bootstrap: already loaded".into())
+                }
+                Launchd::Unload(label) => {
+                    self.unloads.set(self.unloads.get() + 1);
+                    if self.refuse_unload.get() {
+                        return Err("launchctl bootout: busy".into());
+                    }
+                    self.loaded
+                        .borrow_mut()
+                        .remove(label)
+                        .then_some(())
+                        .ok_or_else(|| format!("{NOT_LOADED}launchctl bootout: no such process"))
+                }
+            }
+        }
+    }
+
+    struct World {
+        root: PathBuf,
+        places: Places,
+        fake: Fake,
+    }
+
+    impl World {
+        fn new(tag: &str) -> Self {
+            let root = std::env::temp_dir().join(format!("agent-app-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let places = Places {
+                agents: root.join("LaunchAgents"),
+                state: root.join("schedules"),
+            };
+            Self {
+                root,
+                places,
+                fake: Fake::default(),
+            }
+        }
+        fn install(&self, s: &Schedule) -> Result<(), String> {
+            let entries = every("1d", clock(2026, 9, 28, 9, 7)).unwrap().entries;
+            install(
+                &self.places,
+                Path::new("/A/agent-app"),
+                s,
+                &entries,
+                &[],
+                &|w| self.fake.call(w),
+            )
+        }
+        fn settle(&self, s: &Schedule, outcome: Value) {
+            settle(&self.places, s, &outcome, &|w| self.fake.call(w));
+        }
+        fn remove(&self, name: &str) -> Result<(), String> {
+            remove(&self.places, name, &|w| self.fake.call(w))
+        }
+        /// Its plist, launchd's copy, and its last result.
+        fn state(&self, name: &str) -> (bool, bool, bool) {
+            (
+                self.places.plist(name).exists(),
+                self.fake
+                    .loaded
+                    .borrow()
+                    .contains(&format!("{LABEL}{name}")),
+                self.places.last(name).exists(),
+            )
+        }
+        fn plist(&self, name: &str) -> String {
+            std::fs::read_to_string(self.places.plist(name)).unwrap()
+        }
+    }
+
+    impl Drop for World {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn once() -> Schedule {
+        Schedule {
+            name: "p.once".into(),
+            when: "in 2h".into(),
+            at: Some(1_790_000_000),
+            ..schedule()
+        }
+    }
+
     #[test]
-    fn a_failed_replace_or_unload_keeps_the_schedule_there_was() {
-        let root = std::env::temp_dir().join(format!("agent-app-keep-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let places = Places {
-            agents: root.join("LaunchAgents"),
-            state: root.join("schedules"),
-        };
-        let fine = |_: Launchd| Ok(());
-        let app = Path::new("/A/agent-app");
+    fn creating_and_replacing_leave_a_schedule_whole_or_as_it_was() {
+        let w = World::new("create");
         let s = schedule();
-        let entries = every("1d", clock(2026, 9, 28, 9, 7)).unwrap().entries;
-        install(&places, app, &s, &entries, &[], &fine).unwrap();
-        let before = std::fs::read_to_string(places.plist(&s.name)).unwrap();
-        // launchd refuses the new one: the old one is written back and loaded.
-        let loads = RefCell::new(0);
+        // A load launchd refuses leaves nothing.
+        w.fake.refuse_load.set(true);
+        assert!(w.install(&s).unwrap_err().contains("refused"));
+        assert_eq!(w.state(&s.name), (false, false, false));
+        w.fake.refuse_load.set(false);
+        w.install(&s).unwrap();
+        assert_eq!(w.state(&s.name), (true, true, false));
+        // A replacement starts with no last result.
+        record_last(&w.places, &s, &json!({"outcome": "skipped"})).unwrap();
         let changed = Schedule {
             message: "something else".into(),
             ..schedule()
         };
-        record_last(&places, &s, &json!({"outcome": "skipped"})).unwrap();
-        let refused = install(&places, app, &changed, &entries, &[], &|what| match what {
-            Launchd::Load(_) => {
-                *loads.borrow_mut() += 1;
-                if *loads.borrow() == 1 {
-                    Err("launchctl bootstrap: refused".into())
-                } else {
-                    Ok(())
-                }
-            }
-            Launchd::Unload(_) => Ok(()),
-        });
-        assert!(refused.is_err());
-        assert_eq!(*loads.borrow(), 2);
-        assert_eq!(
-            std::fs::read_to_string(places.plist(&s.name)).unwrap(),
-            before
-        );
-        // It keeps its last result too.
-        assert_eq!(list(&places)[0]["last"]["outcome"], "skipped");
-        // An old one launchd won't unload is not replaced at all.
-        let stuck = |what: Launchd| match what {
-            Launchd::Unload(_) => Err("launchctl bootout: busy".to_owned()),
-            Launchd::Load(_) => Ok(()),
-        };
-        assert!(install(&places, app, &changed, &entries, &[], &stuck).is_err());
-        assert_eq!(
-            std::fs::read_to_string(places.plist(&s.name)).unwrap(),
-            before
-        );
-        // Nor removed: the removal can be tried again.
-        assert!(
-            remove(&places, &s.name, &stuck)
-                .unwrap_err()
-                .contains("busy")
-        );
-        assert!(places.plist(&s.name).exists());
-        // A label launchd no longer has is already unloaded.
-        let gone = |what: Launchd| match what {
-            Launchd::Unload(_) => Err(format!("{NOT_LOADED}launchctl bootout: no such process")),
-            Launchd::Load(_) => Ok(()),
-        };
-        remove(&places, &s.name, &gone).unwrap();
-        assert!(!places.plist(&s.name).exists());
-        // An old one that cannot be read could not be put back: not unloaded, not replaced.
+        w.install(&changed).unwrap();
+        assert_eq!(w.state(&s.name), (true, true, false));
+        assert_eq!(schedules(&w.places)[0].0, changed);
+        // One launchd will not load puts the old one back, loaded, with its result.
+        record_last(&w.places, &changed, &json!({"outcome": "skipped"})).unwrap();
+        let before = w.plist(&s.name);
+        w.fake.refuse_load.set(true);
+        assert!(w.install(&s).is_err());
+        w.fake.refuse_load.set(false);
+        // The fake refused the old one's load too; launchd loads it at the next login.
+        assert_eq!(w.plist(&s.name), before);
+        assert_eq!(list(&w.places)[0]["last"]["outcome"], "skipped");
+        w.fake
+            .loaded
+            .borrow_mut()
+            .insert(format!("{LABEL}{}", s.name));
+        // An old job launchd will not unload is not replaced at all.
+        w.fake.refuse_unload.set(true);
+        assert!(w.install(&s).unwrap_err().contains("busy"));
+        w.fake.refuse_unload.set(false);
+        assert_eq!(w.plist(&s.name), before);
+        assert_eq!(w.state(&s.name), (true, true, true));
+        // An old plist that cannot be read could not be put back: nothing is touched.
         let odd = Schedule {
             name: "p.odd".into(),
-            at: Some(1_790_000_000),
             ..schedule()
         };
-        std::fs::create_dir_all(places.plist(&odd.name).join("x")).unwrap();
-        let unloads = RefCell::new(0);
-        let counting = |what: Launchd| {
-            if let Launchd::Unload(_) = what {
-                *unloads.borrow_mut() += 1;
-            }
-            Ok(())
-        };
-        assert!(install(&places, app, &odd, &entries, &[], &counting).is_err());
-        // A one-off whose plist will not go stays loaded, its result kept, for `rm`.
-        record_last(&places, &odd, &json!({"outcome": "sent", "turn": 2})).unwrap();
-        end(&places, &odd.name, false, &counting);
-        assert_eq!(*unloads.borrow(), 0);
-        assert!(places.last(&odd.name).exists());
-        // One launchd will not unload gets its plist back, listed for `rm`.
-        let once = Schedule {
-            name: "p.once".into(),
-            at: Some(1_790_000_000),
+        std::fs::create_dir_all(w.places.plist(&odd.name).join("x")).unwrap();
+        let unloads = w.fake.unloads.get();
+        assert!(w.install(&odd).is_err());
+        assert_eq!(w.fake.unloads.get(), unloads);
+        // It is listed, saying why, and `rm` cannot take a folder away.
+        let row = list(&w.places)
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == "p.odd")
+            .cloned()
+            .unwrap();
+        assert!(row["problem"].as_str().unwrap().starts_with("unreadable"));
+        std::fs::remove_dir_all(w.places.plist(&odd.name)).unwrap();
+        // Nor may a name differing only in case take an ended one's result.
+        record_last(&w.places, &once(), &json!({"outcome": "failed"})).unwrap();
+        let cased = Schedule {
+            name: "P.Once".into(),
             ..schedule()
         };
-        install(&places, app, &once, &entries, &[], &fine).unwrap();
-        let written = std::fs::read_to_string(places.plist(&once.name)).unwrap();
-        end(&places, &once.name, false, &stuck);
-        assert_eq!(
-            std::fs::read_to_string(places.plist(&once.name)).unwrap(),
-            written
-        );
-        remove(&places, &once.name, &fine).unwrap();
-        std::fs::remove_dir_all(root).unwrap();
+        assert!(w.install(&cased).unwrap_err().starts_with("name_taken"));
+        // A creation over a job loaded without its plist replaces that job.
+        w.fake
+            .loaded
+            .borrow_mut()
+            .insert(format!("{LABEL}{}", odd.name));
+        w.install(&odd).unwrap();
+        assert_eq!(w.state(&odd.name), (true, true, false));
     }
 
     #[test]
-    fn a_schedule_that_ends_undelivered_still_shows_until_removed() {
-        let root = std::env::temp_dir().join(format!("agent-app-ended-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let places = Places {
-            agents: root.join("LaunchAgents"),
-            state: root.join("schedules"),
-        };
-        let fine = |_: Launchd| Ok(());
-        let entries = every("1d", clock(2026, 9, 28, 9, 7)).unwrap().entries;
-        let once = Schedule {
-            at: Some(1_790_000_000),
-            ..schedule()
-        };
-        install(
-            &places,
-            Path::new("/A/agent-app"),
-            &once,
-            &entries,
-            &[],
-            &fine,
-        )
-        .unwrap();
-        record_last(
-            &places,
-            &once,
-            &json!({"outcome": "failed", "detail": "daemon_unavailable"}),
-        )
-        .unwrap();
-        end(&places, &once.name, true, &fine);
-        let listed = list(&places);
+    fn a_fire_ends_only_the_schedule_it_ran_for() {
+        let w = World::new("fire");
+        let one = once();
+        // Delivered: nothing is left.
+        w.install(&one).unwrap();
+        w.settle(&one, json!({"outcome": "sent", "turn": 2}));
+        assert_eq!(w.state(&one.name), (false, false, false));
+        // Not delivered: it ends, and its row says why until it is removed.
+        w.install(&one).unwrap();
+        w.settle(
+            &one,
+            json!({"outcome": "failed", "detail": "daemon_unavailable"}),
+        );
+        assert_eq!(w.state(&one.name), (false, false, true));
+        let listed = list(&w.places);
         assert_eq!(listed.as_array().unwrap().len(), 1);
-        assert_eq!(listed[0]["ended"], true);
-        assert_eq!(listed[0]["message"], once.message);
-        assert_eq!(listed[0]["last"]["outcome"], "failed");
-        remove(&places, &once.name, &fine).unwrap();
-        assert_eq!(list(&places), json!([]));
-        // One that delivered leaves nothing.
-        install(
-            &places,
-            Path::new("/A/agent-app"),
-            &once,
-            &entries,
-            &[],
-            &fine,
-        )
-        .unwrap();
-        record_last(&places, &once, &json!({"outcome": "sent", "turn": 2})).unwrap();
-        end(&places, &once.name, false, &fine);
-        assert_eq!(list(&places), json!([]));
-        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            (&listed[0]["ended"], &listed[0]["last"]["outcome"]),
+            (&json!(true), &json!("failed"))
+        );
+        assert_eq!(listed[0]["message"], one.message);
+        w.remove(&one.name).unwrap();
+        assert_eq!(list(&w.places), json!([]));
+        // Replaced while its message went out: the new one is left alone.
+        w.install(&one).unwrap();
+        let replacement = Schedule {
+            message: "a new reminder".into(),
+            ..once()
+        };
+        w.install(&replacement).unwrap();
+        w.settle(&one, json!({"outcome": "sent", "turn": 3}));
+        assert_eq!(w.state(&one.name), (true, true, false));
+        assert_eq!(schedules(&w.places)[0].0, replacement);
+        // An unload launchd refuses puts the plist back, listed for `rm`.
+        w.fake.refuse_unload.set(true);
+        w.settle(&replacement, json!({"outcome": "sent", "turn": 4}));
+        w.fake.refuse_unload.set(false);
+        assert_eq!(w.state(&one.name), (true, true, false));
+        assert_eq!(schedules(&w.places)[0].0, replacement);
+        // A job left loaded without its plist (an end cut short) is unloaded
+        // by its next fire, and records nothing.
+        std::fs::remove_file(w.places.plist(&one.name)).unwrap();
+        w.settle(&replacement, json!({"outcome": "missed"}));
+        assert_eq!(w.state(&one.name), (false, false, false));
+        // A plist that will not go keeps its job loaded and its result.
+        let stuck = w.places.plist("p.stuck");
+        std::fs::create_dir_all(stuck.join("x")).unwrap();
+        record_last(&w.places, &once(), &json!({"outcome": "sent"})).unwrap();
+        w.fake.loaded.borrow_mut().insert(format!("{LABEL}p.stuck"));
+        end(&w.places, "p.stuck", &stuck, "", false, &|x| w.fake.call(x));
+        assert!(w.fake.loaded.borrow().contains(&format!("{LABEL}p.stuck")));
+        std::fs::remove_dir_all(&stuck).unwrap();
+        // A repeating one ends only when its agent is gone, keeping why.
+        let s = schedule();
+        w.install(&s).unwrap();
+        w.settle(&s, json!({"outcome": "skipped"}));
+        assert_eq!(w.state(&s.name), (true, true, true));
+        w.settle(&s, json!({"outcome": "gone", "detail": "bot_not_found"}));
+        assert_eq!(w.state(&s.name), (false, false, true));
+    }
+
+    #[test]
+    fn removal_reaches_whatever_is_left_of_a_schedule() {
+        let w = World::new("remove");
+        let s = schedule();
+        w.install(&s).unwrap();
+        record_last(&w.places, &s, &json!({"outcome": "sent"})).unwrap();
+        // An unload launchd refuses keeps everything, to be tried again.
+        w.fake.refuse_unload.set(true);
+        assert!(w.remove(&s.name).unwrap_err().contains("busy"));
+        assert_eq!(w.state(&s.name), (true, true, true));
+        w.fake.refuse_unload.set(false);
+        w.remove(&s.name).unwrap();
+        assert_eq!(w.state(&s.name), (false, false, false));
+        assert!(
+            w.remove(&s.name)
+                .unwrap_err()
+                .starts_with("schedule_not_found")
+        );
+        // A plist launchd no longer has, as after a failed reload.
+        w.install(&s).unwrap();
+        w.fake.loaded.borrow_mut().clear();
+        w.remove(&s.name).unwrap();
+        assert_eq!(w.state(&s.name), (false, false, false));
+        // A job loaded without its plist.
+        w.fake
+            .loaded
+            .borrow_mut()
+            .insert(format!("{LABEL}{}", s.name));
+        w.remove(&s.name).unwrap();
+        assert_eq!(w.state(&s.name), (false, false, false));
+        // A one-off still there two days after its time is listed as missed.
+        let late = Schedule {
+            at: Some(now() - 3 * 24 * 3600),
+            ..once()
+        };
+        w.install(&late).unwrap();
+        assert_eq!(list(&w.places)[0]["missed"], true);
+        // Its fire the next year does not send it; it ends, saying so.
+        let stale = Schedule {
+            at: Some(now() - STALE - 3600),
+            ..once()
+        };
+        w.install(&stale).unwrap();
+        w.settle(
+            &stale,
+            json!({"outcome": "missed", "detail": "its time passed long ago"}),
+        );
+        assert_eq!(w.state(&stale.name), (false, false, true));
+        assert_eq!(list(&w.places)[0]["last"]["outcome"], "missed");
     }
 
     #[test]

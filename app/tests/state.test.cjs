@@ -1993,6 +1993,12 @@ test('Settings lists schedules with no project, and only then when there are som
   assert.doesNotMatch(p.setupHTML(), /Schedules/);
   st.schedules = [{ name: 'loose', bot: 'loose', bot_id: 3, when: 'in 2h', once: true, ended: true, message: 'x', last: { outcome: 'failed', fired_ms: 0, detail: 'daemon_unavailable' } }];
   assert.match(p.setupHTML(), /<h3>Schedules<\/h3>.*not delivered/s);
+  // A one-off past its time and a plist that cannot be read are listed too, each removable.
+  st.schedules.push({ name: 'late', bot: 'late', bot_id: 4, when: 'at 2026-09-01 09:00', once: true, ended: false, missed: true, message: 'y', last: null },
+    { name: 'odd', ended: false, problem: 'unreadable: not a schedule\'s plist' });
+  const html = p.setupHTML();
+  assert.match(html, /missed its time/);
+  assert.match(html, /unreadable<\/span>.*data-v="odd"/s);
 });
 
 test('a coordinator\'s backlog stays small however much its tasks do, and what one message leaves out comes next', async () => {
