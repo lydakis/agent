@@ -1588,10 +1588,18 @@ impl Turn {
         // its newest boundary, and its cache as still held, when that call
         // was on this turn's model: this turn's own before a wait, unless
         // a summary or elision rewrote the view after it, else the
-        // previous turn's.
-        let mut inherited = context
-            .view_sent
-            .unwrap_or(context.previous_model.as_deref() == Some(called));
+        // previous turn's. Claude also keeps a history's cache only at
+        // the effort that wrote it.
+        let mut inherited = context.view_sent.unwrap_or_else(|| {
+            context
+                .previous_call
+                .as_ref()
+                .is_some_and(|(model, effort)| {
+                    model == called
+                        && (provider.family() != agent_runtime::codec::Family::Anthropic
+                            || *effort == record.reasoning)
+                })
+        });
         while model_rounds < MAX_ROUNDS {
             // A refresh the last call left in flight ends here: the next call
             // reads the cache itself, and the budget counts what it billed.

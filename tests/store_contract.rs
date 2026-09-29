@@ -2204,23 +2204,44 @@ fn schema_41_turns_ran_at_their_bots_effort() {
             },
         )
         .unwrap();
+        let running = db
+            .begin(
+                "Bob",
+                "r1",
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
         db.begin(
             "Bob",
-            "r1",
-            "work",
+            "steer",
+            "join",
             true,
-            &TurnOptions::default(),
+            &TurnOptions {
+                delivery: Delivery::Steer,
+                ..TurnOptions::default()
+            },
             allow_provider,
         )
         .unwrap();
+        db.absorb(running, None, 8 << 20, 4096, ContextUsage::default(), false)
+            .unwrap();
+        db.finish(running, None).unwrap();
     }
     Connection::open(&path)
         .unwrap()
-        .execute_batch("ALTER TABLE turns DROP COLUMN reasoning; PRAGMA user_version=41;")
+        .execute_batch("ALTER TABLE turns DROP COLUMN reasoning; ALTER TABLE turns DROP COLUMN inherited_reasoning; DELETE FROM events; PRAGMA user_version=41;")
         .unwrap();
     let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     assert_eq!(
         db.turns("Bob", 0, 10).unwrap()["turns"][0]["reasoning"],
+        "medium"
+    );
+    assert_eq!(
+        db.turns("Bob", 0, 10).unwrap()["turns"][1]["reasoning"],
         "medium"
     );
     drop(db);
@@ -2230,6 +2251,166 @@ fn schema_41_turns_ran_at_their_bots_effort() {
         .unwrap();
     assert_eq!(version, Database::SCHEMA);
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn schema_42_backfills_absorbed_effort_or_rolls_back_when_history_is_missing() {
+    for missing in [None, Some("event"), Some("turn")] {
+        let path = std::env::temp_dir().join(format!(
+            "agent-effort-backfill-{}-{}.sqlite",
+            std::process::id(),
+            missing.unwrap_or("complete")
+        ));
+        let _ = std::fs::remove_file(&path);
+        let (running, first_steer, long_steer);
+        {
+            let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+            db.create(
+                "Bob",
+                Some("/synthetic"),
+                Binding {
+                    reasoning: Some("high"),
+                    ..binding()
+                },
+            )
+            .unwrap();
+            running = db
+                .begin(
+                    "Bob",
+                    "run",
+                    "work",
+                    true,
+                    &TurnOptions {
+                        reasoning: Some("low".into()),
+                        ..TurnOptions::default()
+                    },
+                    allow_provider,
+                )
+                .unwrap()
+                .turn;
+            let steer = TurnOptions {
+                delivery: Delivery::Steer,
+                ..TurnOptions::default()
+            };
+            first_steer = db
+                .begin("Bob", "short", "join", true, &steer, allow_provider)
+                .unwrap()
+                .turn;
+            long_steer = db
+                .begin(
+                    "Bob",
+                    "long",
+                    &"x".repeat(4096),
+                    true,
+                    &steer,
+                    allow_provider,
+                )
+                .unwrap()
+                .turn;
+            db.begin(
+                "Bob",
+                "explicit",
+                "join",
+                true,
+                &TurnOptions {
+                    reasoning: Some("low".into()),
+                    ..steer.clone()
+                },
+                allow_provider,
+            )
+            .unwrap();
+            assert_eq!(
+                db.absorb(running, None, 8 << 20, 4096, ContextUsage::default(), false)
+                    .unwrap()
+                    .outcomes
+                    .len(),
+                3
+            );
+            db.finish(running, None).unwrap();
+            // A source without an override is known too: its bot's default applies.
+            let default = db
+                .begin(
+                    "Bob",
+                    "default",
+                    "work",
+                    true,
+                    &TurnOptions::default(),
+                    allow_provider,
+                )
+                .unwrap()
+                .turn;
+            db.begin("Bob", "default-steer", "join", true, &steer, allow_provider)
+                .unwrap();
+            db.absorb(default, None, 8 << 20, 4096, ContextUsage::default(), false)
+                .unwrap();
+            db.finish(default, None).unwrap();
+        }
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE turns DROP COLUMN inherited_reasoning; PRAGMA user_version=42;",
+        )
+        .unwrap();
+        match missing {
+            Some("event") => {
+                conn.execute(
+                    "DELETE FROM events WHERE turn=? AND kind='turn_finished'",
+                    [long_steer],
+                )
+                .unwrap();
+            }
+            Some("turn") => {
+                conn.execute("DELETE FROM retained_turns WHERE turn=?", [running])
+                    .unwrap();
+                conn.execute("DELETE FROM turns WHERE id=?", [running])
+                    .unwrap();
+            }
+            _ => {}
+        }
+        drop(conn);
+        let opened = Database::initialize(Connection::open(&path).unwrap());
+        if missing.is_some() {
+            let error = match opened {
+                Ok(_) => panic!("missing history must not silently change effort"),
+                Err(e) => e,
+            };
+            assert_eq!(error.code, "store_migration_effort_unavailable");
+            let conn = Connection::open(&path).unwrap();
+            assert_eq!(
+                conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
+                    .unwrap(),
+                42
+            );
+            assert!(!conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='inherited_reasoning')", [], |r| r.get::<_, bool>(0)).unwrap());
+        } else {
+            let db = opened.unwrap();
+            let listed = db.turns("Bob", 0, 10).unwrap();
+            let levels: Vec<_> = listed["turns"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["reasoning"].as_str().unwrap())
+                .collect();
+            assert_eq!(levels, ["low", "low", "low", "low", "high", "high"]);
+            drop(db);
+            let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+            let retry = db
+                .begin(
+                    "Bob",
+                    "short",
+                    "join",
+                    true,
+                    &TurnOptions {
+                        delivery: Delivery::Steer,
+                        ..TurnOptions::default()
+                    },
+                    allow_provider,
+                )
+                .unwrap();
+            assert_eq!(retry.turn, first_steer);
+            assert!(!retry.fresh);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 }
 
 #[test]
@@ -2631,12 +2812,29 @@ fn a_turn_runs_at_its_own_effort_or_its_bots() {
             .code,
         "idempotency_conflict"
     );
-    // A steer at another level waits for a turn at its own.
     let steer = |level: Option<&str>| TurnOptions {
         reasoning: level.map(Into::into),
         delivery: Delivery::Steer,
         ..TurnOptions::default()
     };
+    // A steer at the turn's level, or at none, joins it and records the
+    // level it ran at.
+    for (id, level) in [("s0", None), ("s0b", Some("low"))] {
+        db.begin("Bob", id, "join", true, &steer(level), allow_provider)
+            .unwrap();
+    }
+    let joined = db
+        .absorb(
+            low.turn,
+            None,
+            8 << 20,
+            4096,
+            ContextUsage::default(),
+            false,
+        )
+        .unwrap();
+    assert_eq!(joined.outcomes.len(), 2);
+    // A steer at another level waits for a turn at its own.
     db.begin(
         "Bob",
         "s1",
@@ -2682,7 +2880,128 @@ fn a_turn_runs_at_its_own_effort_or_its_bots() {
         .iter()
         .map(|t| &t["reasoning"])
         .collect();
-    assert_eq!(levels, ["low", "xhigh", "high", "high"]);
+    assert_eq!(levels, ["low", "low", "low", "xhigh", "high", "high"]);
+}
+
+#[test]
+fn absorbed_effort_does_not_change_the_submitted_request() {
+    for size in [4, 4096] {
+        for level in [None, Some("low")] {
+            let mut db = db();
+            db.create(
+                "Bob",
+                Some("/synthetic"),
+                Binding {
+                    reasoning: Some("high"),
+                    ..binding()
+                },
+            )
+            .unwrap();
+            let running = db
+                .begin(
+                    "Bob",
+                    "run",
+                    "work",
+                    true,
+                    &TurnOptions {
+                        reasoning: Some("low".into()),
+                        ..TurnOptions::default()
+                    },
+                    allow_provider,
+                )
+                .unwrap()
+                .turn;
+            let prompt = "x".repeat(size);
+            let options = TurnOptions {
+                reasoning: level.map(Into::into),
+                delivery: Delivery::Steer,
+                expected_turn: Some(running),
+                ..TurnOptions::default()
+            };
+            let steer = db
+                .begin("Bob", "steer", &prompt, true, &options, allow_provider)
+                .unwrap()
+                .turn;
+            assert!(
+                !db.begin("Bob", "steer", &prompt, true, &options, allow_provider)
+                    .unwrap()
+                    .fresh
+            );
+            let absorbed = db
+                .absorb(running, None, 8 << 20, 4096, ContextUsage::default(), false)
+                .unwrap();
+            assert_eq!(absorbed.outcomes.len(), 1);
+            db.finish(running, None).unwrap();
+            // Both the inline and shared-prompt paths report the effective effort,
+            // but retries still compare the original omission or explicit level.
+            assert_eq!(
+                db.turns("Bob", 0, 10).unwrap()["turns"][1]["reasoning"],
+                "low"
+            );
+            let retry = db
+                .begin("Bob", "steer", &prompt, true, &options, allow_provider)
+                .unwrap();
+            assert_eq!(retry.turn, steer);
+            assert!(!retry.fresh);
+            for changed in [None, Some("low"), Some("high")]
+                .into_iter()
+                .filter(|v| *v != level)
+            {
+                let other = TurnOptions {
+                    reasoning: changed.map(Into::into),
+                    ..options.clone()
+                };
+                assert_eq!(
+                    db.begin("Bob", "steer", &prompt, true, &other, allow_provider)
+                        .unwrap_err()
+                        .code,
+                    "idempotency_conflict"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn the_next_turn_knows_the_effort_its_history_was_sent_at() {
+    let mut db = db();
+    db.create(
+        "Bob",
+        Some("/synthetic"),
+        Binding {
+            reasoning: Some("high"),
+            ..binding()
+        },
+    )
+    .unwrap();
+    let mut previous = Vec::new();
+    for (n, level) in [(1, Some("low")), (2, None), (3, None)] {
+        let options = TurnOptions {
+            reasoning: level.map(Into::into),
+            ..TurnOptions::default()
+        };
+        let turn = db
+            .begin(
+                "Bob",
+                &format!("r{n}"),
+                "work",
+                true,
+                &options,
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        let context = db.context(turn).unwrap();
+        previous.push(context.previous_call.map(|(_, effort)| effort));
+        db.append(turn, vec![assistant(&format!("a{n}"))], &[], None)
+            .unwrap();
+        db.finish(turn, None).unwrap();
+    }
+    // A cache written at one effort is not one written at another.
+    assert_eq!(
+        previous,
+        [None, Some(Some("low".into())), Some(Some("high".into()))]
+    );
 }
 
 #[test]
@@ -9192,7 +9511,7 @@ fn schema_34_records_whether_a_call_or_a_summary_changed_the_view_last() {
     // sent the view the next turn starts from.
     let turn = begin(&mut db, 7);
     let context = db.context(turn).unwrap();
-    assert_eq!((context.view_sent, context.previous_model), (None, None));
+    assert_eq!((context.view_sent, context.previous_call), (None, None));
     // A call sends the view; a summary after it rewrites the view.
     db.append(turn, vec![assistant("r7")], &[], None).unwrap();
     assert_eq!(db.context(turn).unwrap().view_sent, Some(true));
@@ -9215,12 +9534,12 @@ fn schema_34_records_whether_a_call_or_a_summary_changed_the_view_last() {
     assert_eq!(db.context(turn).unwrap().view_sent, Some(false));
     db.finish(turn, None).unwrap();
     let next = begin(&mut db, 8);
-    assert_eq!(db.context(next).unwrap().previous_model, None);
+    assert_eq!(db.context(next).unwrap().previous_call, None);
     db.append(next, vec![assistant("r8")], &[], None).unwrap();
     db.finish(next, None).unwrap();
     let after = begin(&mut db, 9);
     let context = db.context(after).unwrap();
-    assert_eq!(context.previous_model, Some(context.model));
+    assert_eq!(context.previous_call, Some((context.model, None)));
     drop(db);
     let version: i32 = Connection::open(&path)
         .unwrap()

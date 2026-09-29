@@ -912,12 +912,12 @@ pub struct TurnContext {
     pub model: String,
     /// The effort level this turn runs at: its own, else the bot's.
     pub reasoning: Option<String>,
-    /// The model of the bot's latest earlier turn that started, when its
-    /// calls sent the history this turn starts from: a call sent its view
-    /// last, and something follows its prompt. `None` otherwise, as when
-    /// it failed before a call or after a summary, or on a fork's first
-    /// turn.
-    pub previous_model: Option<String>,
+    /// The model and effort of the bot's latest earlier turn that started,
+    /// when its calls sent the history this turn starts from: a call sent
+    /// its view last, and something follows its prompt. `None` otherwise,
+    /// as when it failed before a call or after a summary, or on a fork's
+    /// first turn.
+    pub previous_call: Option<(String, Option<String>)>,
 }
 pub struct Database {
     conn: Connection,
@@ -987,7 +987,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 42;
+    pub const SCHEMA: i32 = 43;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1142,7 +1142,7 @@ impl Database {
                 retries INTEGER NOT NULL DEFAULT 0, paced_ms INTEGER NOT NULL DEFAULT 0,
                 delivery TEXT NOT NULL DEFAULT 'reject', expected_turn INTEGER,
                 cached_input_tokens INTEGER NOT NULL DEFAULT 0,
-                from_bot TEXT, from_turn INTEGER, from_id INTEGER, origin TEXT, reasoning TEXT,
+                from_bot TEXT, from_turn INTEGER, from_id INTEGER, origin TEXT, reasoning TEXT, inherited_reasoning TEXT,
                 UNIQUE(bot,request_id));
             CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
             CREATE INDEX IF NOT EXISTS turns_started ON turns(bot,id) WHERE started_ms IS NOT NULL;
@@ -3877,19 +3877,24 @@ impl Database {
         let tx = self.conn.savepoint()?;
         let mut head = bot.head;
         let mut steered = Vec::with_capacity(steers.len());
+        // Preserve the submitted effort for exact retries; only omitted effort
+        // needs a separate execution value when the running turn overrides it.
         for (steer, item, size) in steers {
             let id = node(&tx, head, &item)?;
             head = Some(id);
             if size >= PROMPT_SHARE_BYTES {
                 tx.execute("UPDATE turns SET status='steered',finished_ms=?1,prompt='',prompt_node=?2,
-                    (workspace,model)=(SELECT COALESCE(s.workspace,t.workspace),COALESCE(s.model,t.model)
+                    (workspace,model,inherited_reasoning)=(SELECT COALESCE(s.workspace,t.workspace),COALESCE(s.model,t.model),
+                        CASE WHEN s.reasoning IS NULL THEN t.reasoning END
                         FROM turns s, turns t WHERE s.id=?4 AND t.id=?3) WHERE id=?4",
                     params![epoch_ms(), id, turn, steer])?;
             } else {
-                // A steer that named no folder or model records the ones it ran with.
+                // A steer that named no folder, model or effort records the
+                // ones it ran with.
                 tx.execute(
                     "UPDATE turns SET status='steered',finished_ms=?1,
-                        (workspace,model)=(SELECT COALESCE(s.workspace,t.workspace),COALESCE(s.model,t.model)
+                        (workspace,model,inherited_reasoning)=(SELECT COALESCE(s.workspace,t.workspace),COALESCE(s.model,t.model),
+                            CASE WHEN s.reasoning IS NULL THEN t.reasoning END
                             FROM turns s, turns t WHERE s.id=?3 AND t.id=?2) WHERE id=?3",
                     params![epoch_ms(), turn, steer],
                 )?;
@@ -4920,16 +4925,18 @@ impl Database {
         // them in one probe. One that stored its prompt and failed before a
         // call recorded no call, or left its prompt, a prompt node, right
         // before this one.
-        let previous_model = self
+        let previous_call = self
             .conn
             .prepare_cached(
-                "SELECT COALESCE(t.model,?3),t.view_sent IS 1 AND p.turn IS NULL
+                "SELECT COALESCE(t.model,?3),t.view_sent IS 1 AND p.turn IS NULL,COALESCE(t.reasoning,?4)
                    FROM turns t,nodes s LEFT JOIN nodes p ON p.id=s.parent
                   WHERE t.bot=?1 AND t.id<?2 AND t.started_ms IS NOT NULL AND s.turn=?2
                   ORDER BY t.id DESC LIMIT 1",
             )?
-            .query_row(params![bot.name, turn, default], |r| {
-                r.get::<_, bool>(1)?.then(|| r.get(0)).transpose()
+            .query_row(params![bot.name, turn, default, bot.reasoning], |r| {
+                r.get::<_, bool>(1)?
+                    .then(|| Ok((r.get(0)?, r.get(2)?)))
+                    .transpose()
             })
             .optional()?
             .flatten();
@@ -4941,7 +4948,7 @@ impl Database {
                 .ok_or(Error::new("workspace_required"))?,
             model: model.unwrap_or(default),
             reasoning: reasoning.or(bot.reasoning),
-            previous_model,
+            previous_call,
             created_by: bot.created_by,
             created_by_id: bot.created_by_id,
             bot: bot.name,
@@ -6308,7 +6315,7 @@ impl Database {
                     t.model_rounds,t.started_ms,t.finished_ms,
                     substr(CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END,1,200),
                     length(CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END),
-                    t.retries,t.paced_ms,t.delivery,t.cached_input_tokens,COALESCE(t.reasoning,b.reasoning)
+                    t.retries,t.paced_ms,t.delivery,t.cached_input_tokens,COALESCE(t.reasoning,t.inherited_reasoning,b.reasoning)
              FROM turns t JOIN bots b ON b.name=t.bot LEFT JOIN nodes n ON n.id=t.prompt_node
              WHERE t.bot=? AND t.id>? ORDER BY t.id LIMIT ?",
         )?;
@@ -7596,6 +7603,47 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         // 41 -> 42: a turn's own effort level. None was recorded before, so
         // every stored turn ran at its bot's.
         conn.execute_batch("ALTER TABLE turns ADD COLUMN reasoning TEXT;")?;
+    }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='inherited_reasoning')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 42 -> 43: keep absorbed effort separate from submitted options.
+        // Before per-turn effort (schema 42), every steer used its bot's level.
+        conn.execute_batch("ALTER TABLE turns ADD COLUMN inherited_reasoning TEXT;")?;
+        if from == 42 {
+            migrate_absorbed_effort(conn)?;
+        }
+    }
+    Ok(())
+}
+/// Recover an omitted steer's effort from the turn its completion names.
+/// Stream retained rows and probe the event index once each; never load history.
+/// Missing provenance aborts the opening transaction, including the new column.
+fn migrate_absorbed_effort(conn: &Connection) -> Result<()> {
+    let mut steers = conn.prepare(
+        "SELECT s.id,t.id,t.reasoning FROM turns s
+         LEFT JOIN events e ON e.turn=s.id AND e.kind='turn_finished'
+         LEFT JOIN turns t ON t.id=json_extract(e.data,'$.into') AND t.bot=s.bot
+         WHERE s.status='steered' AND s.reasoning IS NULL",
+    )?;
+    let mut update = conn.prepare("UPDATE turns SET inherited_reasoning=? WHERE id=?")?;
+    let mut rows = steers.query([])?;
+    while let Some(row) = rows.next()? {
+        let steer: i64 = row.get(0)?;
+        if row.get::<_, Option<i64>>(1)?.is_none() {
+            return fail_with(
+                "store_migration_effort_unavailable",
+                format!(
+                    "steer {steer} has no retained absorption turn; keep this store and use a new store path"
+                ),
+            );
+        }
+        // A known source without an override used the immutable bot default.
+        if let Some(level) = row.get::<_, Option<String>>(2)? {
+            update.execute(params![level, steer])?;
+        }
     }
     Ok(())
 }
