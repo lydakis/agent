@@ -970,7 +970,10 @@ turns it asked for or replayed ones, kept when a send fails).
 neither a partial file nor a temporary, and schedules' calendars, plists,
 move, and each lifecycle step with launchd refusing. With `AGENT_TEST_RUNTIME=1` after a release build
 and `cargo build -p agent-app`, `python3 -m unittest tests.test_schedule`
-fires schedules against a real daemon.
+fires schedules against a real daemon; on a Mac, `AGENT_TEST_LAUNCHD=1`
+adds its one launchd test, which loads real jobs (under a scratch `HOME`, so
+nothing loads at the next login) and checks that launchd fires a one-off,
+which ends itself, and that replace and `rm` work on real jobs.
 `cargo test --workspace` includes the silent-listener readiness deadline,
 fork workspace parity between durable records, live events, and replay, and
 the app's policy errors for oversized and unreadable AGENTS.md files.

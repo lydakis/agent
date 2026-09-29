@@ -2,6 +2,7 @@
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 import unittest
@@ -182,6 +183,58 @@ class ScheduleFireTests(ModelFixture):
         text = out.read_text()
         self.assertIn('schedules_unsupported', text)
         self.assertEqual(list((self.home / 'Library/LaunchAgents').glob('*.plist')), [])
+
+    @unittest.skipUnless(sys.platform == 'darwin' and os.environ.get('AGENT_TEST_LAUNCHD') == '1',
+                         'real launchd: macOS with AGENT_TEST_LAUNCHD=1')
+    def test_real_launchd_fires_replaces_and_removes(self):
+        # The plists live under this test's HOME, so nothing loads at the next login.
+        name = f'ztest-{os.getpid()}'
+        label = f'me.lydakis.agent.schedule.{name}'
+        target = f'gui/{os.getuid()}/{label}'
+        plist = self.home / f'Library/LaunchAgents/{label}.plist'
+        self.addCleanup(lambda: subprocess.run(['/bin/launchctl', 'bootout', target], capture_output=True))
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        env = {**clean_env(), 'HOME': str(self.home), 'AGENT_STORE': str(self.store)}
+
+        def schedule(*args, ok=True):
+            result = subprocess.run([str(APP), '--schedule', *args], env=env, capture_output=True, text=True,
+                                    timeout=60)
+            if ok:
+                self.assertEqual(result.returncode, 0, result.stderr)
+            return result
+
+        def loaded():
+            return subprocess.run(['/bin/launchctl', 'print', target], capture_output=True).returncode == 0
+
+        def until(check, seconds):
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline and not check():
+                time.sleep(1)
+            return check()
+
+        # A one-off: launchd runs it at its minute, the bot gets the message, and it ends itself.
+        schedule('add', '--bot', 'p.task', '--name', name, '--in', '1m', '--', 'launchd says hi')
+        self.assertTrue(loaded())
+        self.assertTrue(until(lambda: len(self.turns('p.task')) == 2, 150), 'launchd did not fire it')
+        self.assertTrue(until(lambda: not loaded() and not plist.exists(), 30), 'it did not end itself')
+        self.assertEqual(json.loads(schedule('ls').stdout), [])
+        # A repeating one, replaced: one job, the new one.
+        schedule('add', '--bot', 'p.task', '--name', name, '--every', '30m', '--', 'a')
+        schedule('add', '--bot', 'p.task', '--name', name, '--every', '1h', '--', 'b')
+        self.assertTrue(loaded())
+        rows = json.loads(schedule('ls').stdout)
+        self.assertEqual([(r['name'], r['when'], r['message']) for r in rows], [(name, 'every 1h', 'b')])
+        # A plist launchd no longer has, as after a failed reload: rm still removes it.
+        subprocess.run(['/bin/launchctl', 'bootout', target], check=True, capture_output=True)
+        schedule('rm', name)
+        self.assertFalse(plist.exists())
+        # A job loaded without its plist, as after an end cut short: rm reaches it by name.
+        schedule('add', '--bot', 'p.task', '--name', name, '--every', '30m', '--', 'c')
+        plist.unlink()
+        schedule('rm', name)
+        self.assertFalse(loaded())
+        # Nothing left: bootout's not-loaded answer reads as that.
+        self.assertIn('schedule_not_found', schedule('rm', name, ok=False).stderr)
 
 
 if __name__ == '__main__':
