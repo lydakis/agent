@@ -487,11 +487,15 @@ to recognize arbitrary encodings of secrets or unknown credentials.
 History items are stored in the family's native encoding and streamed into
 requests by reference, without translation. A bot is therefore bound to its
 provider family at creation; `create` accepts `model`, `instructions`, and
-`reasoning` (`low`, `medium`, `high`), and a fork inherits its source's binding.
+`reasoning` (`low`, `medium`, `high`, `xhigh`, and on Anthropic `max`), and a
+fork inherits its source's binding.
 A turn may override the model within the same family (`submit` with `model`, or
 `run --model` on an existing bot); a different family is rejected with
-`provider_family_mismatch`. The override is recorded on the turn and in its
-`accepted` event, and the bot's default is unchanged. Cross-family handoff of a
+`provider_family_mismatch`. A turn may likewise run at another effort level
+(`submit` with `reasoning`, or `run --reasoning` on an existing bot); a level
+the family does not take is `invalid_reasoning_level`. Each override is recorded
+on the turn and in its `accepted` event, and the bot's default is unchanged. A
+steer that names a level joins only a running turn at that level. Cross-family handoff of a
 conversation is not implemented; it would be an explicit lossy fork that
 discards provider-specific state such as thinking signatures.
 

@@ -25,7 +25,7 @@ const S = {
   config: null, ui: { rail: true, side: null, picker: false, pickerSel: 0, help: false, steps: false, toast: null, menu: false, folded: new Set() },
   // How Send reaches a working bot, the last pick from its menu (sticky across windows), and the
   // model each bot's next turns run on when it differs from the one it was created with.
-  send: loadSend(), override: new Map(),
+  send: loadSend(), override: new Map(), effort: new Map(),
   // Each provider's model family, from the bot records that name both; a turn may run on any
   // provider of its bot's family.
   families: new Map(),
@@ -236,7 +236,7 @@ function forgetBot(name) {
   const parent = bot(name) && creatorOf(bot(name));
   const t = parent && S.transcripts.get(parent.name);
   if (t) { t.items = t.items.filter(it => it.kind !== 'peer' || it.who !== name); t.peers = t.peers.filter(who => who !== name); t.gen += 1; }
-  S.bots.delete(name); S.transcripts.delete(name); S.override.delete(name);
+  S.bots.delete(name); S.transcripts.delete(name); S.override.delete(name); S.effort.delete(name);
   // A coordinator gone hears nothing more, and its queued turns never end; a task gone is no news.
   if (S.wakes.has(name)) { clearTimeout(S.wakes.get(name).timer); S.wakes.delete(name); }
   for (const w of S.wakes.values()) if (w.tasks.delete(name) && !w.tasks.size) { clearTimeout(w.timer); w.timer = null; }
@@ -1096,7 +1096,7 @@ async function attachOnce() {
 }
 // Everything the window learned from one store, dropped before it shows another.
 function forgetStore() {
-  S.cursor = 0; S.bots.clear(); S.transcripts.clear(); S.drafts.clear(); S.override.clear(); S.families.clear();
+  S.cursor = 0; S.bots.clear(); S.transcripts.clear(); S.drafts.clear(); S.override.clear(); S.effort.clear(); S.families.clear();
   S.swarms.clear(); S.memberOf.clear(); S.deleted.clear(); looked.clear();
   for (const w of S.wakes.values()) clearTimeout(w.timer);
   S.wakes.clear(); S.turnFrom.clear(); S.heldNews = [];
@@ -1144,8 +1144,13 @@ function restore() {
     const b = bot(name);
     if (b && b.id != null && b.id === id && typeof model === 'string' && runsOn(b, model)) S.override.set(name, model);
   }
+  if (Array.isArray(saved.effort)) for (const entry of saved.effort) {
+    const [name, id, level] = Array.isArray(entry) ? entry : [];
+    const b = bot(name);
+    if (b && b.id != null && b.id === id && effortsFor(b.model).includes(level) && level !== b.reasoning) S.effort.set(name, level);
+  }
 }
-function save() { const key = sessionKey(); if (!key) return; try { localStorage.setItem(key, JSON.stringify({ selected: S.selected, side: S.ui.side, rail: S.ui.rail, steps: S.ui.steps, folded: [...S.ui.folded], override: [...S.override].map(([name, model]) => [name, bot(name)?.id ?? null, model]) })); } catch (_) {} }
+function save() { const key = sessionKey(); if (!key) return; try { localStorage.setItem(key, JSON.stringify({ selected: S.selected, side: S.ui.side, rail: S.ui.rail, steps: S.ui.steps, folded: [...S.ui.folded], override: [...S.override].map(([name, model]) => [name, bot(name)?.id ?? null, model]), effort: [...S.effort].map(([name, level]) => [name, bot(name)?.id ?? null, level]) })); } catch (_) {} }
 window.addEventListener('beforeunload', save);
 
 // ---------- render ----------
@@ -1428,15 +1433,17 @@ function runsOn(b, model) {
   return fam != null && S.families.get(p) === fam;
 }
 const modelOf = (b) => S.override.get(b.name) ?? b.model;
+// The effort an agent's next turn runs at: one picked for its turns, else its own.
+const effortOf = (b) => S.effort.get(b.name) ?? b.reasoning ?? null;
 function renderComposer(pane, b, sw = null) {
-  const ids = PANE[pane], mode = sendMode(b), model = b ? modelOf(b) : '';
-  const key = sw ? `${SWARM}${sw.name}` : b ? `${b.name}|${mode}|${model}|${b.reasoning}|${b.runningTurn !== null}` : '-';
+  const ids = PANE[pane], mode = sendMode(b), model = b ? modelOf(b) : '', effort = b ? effortOf(b) : null;
+  const key = sw ? `${SWARM}${sw.name}` : b ? `${b.name}|${mode}|${model}|${effort}|${b.runningTurn !== null}` : '-';
   const send = $(ids.send); if (send.dataset.k === key) return; send.dataset.k = key;
   const caret = $(ids.form).querySelector?.('.caret'); if (caret) caret.hidden = !!sw;
   // On a swarm the composer posts to its board: no model, no stop, one way to send.
   if (sw) { send.textContent = 'Post'; $(ids.model).hidden = true; $(ids.stop).hidden = true; $(ids.input).placeholder = 'Post to the board · @name wakes that agent'; return; }
   send.textContent = ACTION[mode];
-  $(ids.model).textContent = b ? `${model.split('/').slice(1).join('/') || model}${b.reasoning ? ` · ${b.reasoning}` : ''} ▾` : '';
+  $(ids.model).textContent = b ? `${model.split('/').slice(1).join('/') || model}${effort ? ` · ${effort}` : ''} ▾` : '';
   $(ids.model).hidden = !b; $(ids.stop).hidden = !b || b.runningTurn === null;
   $(ids.input).placeholder = !b ? (pane === 'main' ? '/new NAME PROVIDER/MODEL [EFFORT]' : '') : mode === 'queue' ? 'queues after this turn' : mode === 'steer' ? 'steers into this turn' : mode === 'side' ? 'asks a side chat' : '';
 }
@@ -1856,8 +1863,15 @@ function modelChoices(b, list) {
   return [...mine.map((id) => ({ id, ok: true, on: id === current })), ...others.map((id) => ({ id, ok: false, on: false }))];
 }
 function modelMenuItems(b, list, error) {
+  // Effort first: a few fixed levels above a list that may scroll. An agent made with a level
+  // always sends one; one made without may go back to the model's own.
+  const effort = effortOf(b);
+  const items = [{ head: 'Effort' }];
+  if (!b.reasoning) items.push({ act: 'set-effort', who: b.name, v: '', label: 'default', on: !effort });
+  for (const level of effortsFor(b.model)) items.push({ act: 'set-effort', who: b.name, v: level, label: level, on: level === effort });
+  items.push({ sep: true });
   // Each provider under its own heading, so the menu says where a model comes from.
-  const items = []; let group = null;
+  let group = null;
   for (const c of modelChoices(b, list)) {
     const p = providerOf(c.id);
     if (p !== group) { if (group !== null) items.push({ sep: true }); items.push({ head: providerLabel(p) }); group = p; }
@@ -1877,6 +1891,14 @@ function setSend(mode) { S.send = mode === 'steer' || mode === 'side' ? mode : '
 function setModel(name, model) {
   const b = bot(name); if (!b || !runsOn(b, model)) return false;
   if (model === b.model) S.override.delete(name); else S.override.set(name, model);
+  save(); return true;
+}
+// A level for the agent's next turns; its own level, or none when it has none, clears the pick.
+function setEffort(name, level) {
+  const b = bot(name); if (!b) return false;
+  if (!level || level === b.reasoning) S.effort.delete(name);
+  else if (effortsFor(b.model).includes(level)) S.effort.set(name, level);
+  else return false;
   save(); return true;
 }
 async function modelMenu(pane, anchor) {
@@ -1916,13 +1938,13 @@ async function submit(text, pane = 'main', to = PANE[pane].bot()) {
   const b = bot(to); if (!b) throw new Error('no bot selected; /new NAME PROVIDER/MODEL [EFFORT] creates one');
   // An event can seat a bot before its snapshot identity arrives. Never send an unpinned name.
   if (b.id == null) throw new Error('bot_identity_pending: wait for attachment to finish');
-  const mode = sendMode(b), model = S.override.get(b.name), delivery = mode === 'send' ? 'reject' : mode;
+  const mode = sendMode(b), model = S.override.get(b.name), effort = S.effort.get(b.name), delivery = mode === 'send' ? 'reject' : mode;
   if (mode === 'side') { await sideChat(b.name, text); return; }
-  // A steer joins the running turn only on that turn's model and folder, so it names neither.
+  // A steer joins the running turn only on that turn's model, effort and folder, so it names none.
   // It also names the turn on screen, so a turn that ended meanwhile refuses it as stale_turn
   // rather than the message landing in whatever turn runs next. A bot keeps its folder, so a
   // message names one only for a bot that has none.
-  const where = delivery === 'steer' ? (b.runningTurn != null ? { expected_turn: b.runningTurn } : {}) : { ...home(b), ...(model && model !== b.model ? { model } : {}) };
+  const where = delivery === 'steer' ? (b.runningTurn != null ? { expected_turn: b.runningTurn } : {}) : { ...home(b), ...(model && model !== b.model ? { model } : {}), ...(effort && effort !== b.reasoning ? { reasoning: effort } : {}) };
   // The identity on screen, so a name that changed hands in between is refused rather than handed the prompt.
   try { await Daemon.request('submit', { bot: b.name, bot_id: b.id, request_id: `app-${crypto.randomUUID()}`, prompt: text, delivery, ...where }); }
   catch (e) { if (delivery === 'steer' && /stale_turn/.test(String(e?.message ?? e))) throw new Error('that turn ended; not steered'); throw e; }
@@ -2052,9 +2074,10 @@ const providerLabel = (name) => catalogOf(name)?.label ?? name;
 // would overwrite with the provider's defaults.
 const editable = (spec) => spec === specName(spec) ? !!catalogOf(spec) : !!catalogOf(specName(spec))?.parts
   && providerSpecs(catalogOf(specName(spec)).id, { AWS_REGION: spec.split('.')[1], AWS_BEARER_TOKEN_BEDROCK: 'x' }).includes(spec);
-// Effort: how hard a model thinks, picked beside its model when an agent is made and kept for the
-// agent's life. Both families take low to xhigh and Anthropic's also max; which of those a model
-// accepts is its provider's to say. No level sends none, and the model uses its own default.
+// Effort: how hard a model thinks, picked beside its model when an agent is made; the model chip
+// changes it for the agent's next turns. Both families take low to xhigh and Anthropic's also max;
+// which of those a model accepts is its provider's to say. No level sends none, and the model uses
+// its own default.
 const EFFORTS = ['low', 'medium', 'high', 'xhigh'];
 // The wire family a provider speaks: what the fleet's records show, what a hand-set spec names, else
 // the catalog's. Anthropic is the only other family.
@@ -2071,7 +2094,7 @@ function lastEffort() { try { return localStorage.getItem('agent:effort') ?? '';
 // names the field, each level says what it is.
 function effortSelectHTML(id, model, prefer = lastEffort(), labelled = false) {
   const levels = model ? effortsFor(model) : EFFORTS, pick = levels.includes(prefer) ? prefer : '', word = labelled ? '' : ' effort';
-  return `<select id="${id}" aria-label="Effort" title="How hard the model thinks, kept for the agent's life"><option value=""${pick ? '' : ' selected'}>default${word}</option>${levels.map((l) => `<option value="${l}"${l === pick ? ' selected' : ''}>${l}${word}</option>`).join('')}</select>`;
+  return `<select id="${id}" aria-label="Effort" title="How hard the model thinks; the model chip changes it later"><option value=""${pick ? '' : ' selected'}>default${word}</option>${levels.map((l) => `<option value="${l}"${l === pick ? ' selected' : ''}>${l}${word}</option>`).join('')}</select>`;
 }
 // A model picked in a form offers that model's levels, keeping the level chosen when it still applies.
 function followModel(model, effortId, labelled = false) { const el = $(effortId); if (el) el.outerHTML = effortSelectHTML(effortId, model, el.value, labelled); }
@@ -2456,6 +2479,7 @@ async function act(el) {
     case 'model': await modelMenu(pane, { rect, up: true }); return;
     case 'sendmenu': showMenu(sendMenuItems(pane), { rect, up: true }); return;
     case 'set-model': setModel(who, v); render(); focusInput(who === S.ui.side ? 'side' : 'main'); return;
+    case 'set-effort': setEffort(who, v); render(); focusInput(who === S.ui.side ? 'side' : 'main'); return;
     case 'set-send': setSend(v); render(); focusInput(pane); return;
     case 'side-chat': await sideChat(who); return;
     case 'stop': await interrupt(who); return;

@@ -1466,6 +1466,8 @@ impl Turn {
         let mut record = self.store.op("inspect", move |db| db.inspect(&bot)).await?;
         self.settings.get_or_init(|| record.settings);
         let context = self.store.op("context", move |db| db.context(turn)).await?;
+        // A turn may run at its own effort; everything after reads the record.
+        record.reasoning = context.reasoning.clone();
         let (provider, model) = split_model(&context.model)?;
         let provider = self
             .providers

@@ -193,7 +193,7 @@ fn print_flags(flags: &str) {
             ),
             "--reasoning" => (
                 "LEVEL",
-                "A new bot's effort: low, medium, high, or xhigh; Claude also max. Default AGENT_REASONING on AGENT_MODEL, else the model's own",
+                "Effort: low, medium, high, or xhigh; Claude also max. A new bot keeps it (default AGENT_REASONING on AGENT_MODEL, else the model's own); on an existing bot, for this turn",
             ),
             "--request-id" => ("ID", "Idempotency key for this submission"),
             "--bot-id" => ("N", "Refuse if --bot no longer names this identity"),
@@ -467,7 +467,6 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
             "--instructions-file",
             "--agents",
             "--profile",
-            "--reasoning",
             "--budget-tokens",
             "--fallbacks",
             "--approval",
@@ -478,7 +477,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
     {
         return fail_with(
             "usage",
-            "instructions, reasoning, budget, and approval are creation options; use --new",
+            "instructions, budget, and approval are creation options; use --new",
         );
     }
     Ok(Some(out))

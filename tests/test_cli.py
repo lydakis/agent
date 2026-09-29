@@ -301,6 +301,25 @@ class SocketAndCliTests(ModelFixture):
         refused = self.agent('run', *self.common, '--reasoning', 'max', '--new', '--bot', 'Max', 'hi', check=False)
         self.assertEqual(refused.returncode, 1)
         self.assertIn('invalid_reasoning_level', refused.stderr + refused.stdout)
+        # On an existing bot a level is that turn's alone, as --model is.
+        for name in ('Alice', 'Carol', 'Dan'):
+            turn = json.loads(self.agent('turns', '--store', str(self.store), '--bot', name).stdout)[-1]['turn']
+            self.agent('wait', '--store', str(self.store), f'turn:{name}/{turn}')
+        while not self.model.requests.empty():
+            self.model.requests.get_nowait()
+        again = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--reasoning', 'low',
+                           'shell:printf "$AGENT_REASONING" > effort')
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual((self.path / 'effort').read_text(), 'low')
+        sent = []
+        while not self.model.requests.empty():
+            sent.append(self.model.requests.get_nowait()['reasoning'])
+        self.assertTrue(sent)
+        self.assertEqual(sent, [{'effort': 'low', 'summary': 'auto'}] * len(sent))
+        turns = json.loads(self.agent('turns', '--store', str(self.store), '--bot', 'Bob').stdout)
+        self.assertEqual([t['reasoning'] for t in turns], ['xhigh', 'low'])
+        listed = {b['name']: b['reasoning'] for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout)}
+        self.assertEqual(listed['Bob'], 'xhigh')
 
     def test_new_bots_get_the_cli_compaction_text_unless_declined(self):
         env = dict(clean_env(), AGENT_MODEL='openai/synthetic-model')

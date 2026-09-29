@@ -126,10 +126,11 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
             bot,
             request_id,
             model,
+            reasoning,
             delivery,
             ..
         } => (
-            output::encoded_len(&(id, bot, bot, request_id, model, delivery)),
+            output::encoded_len(&(id, bot, bot, request_id, model, reasoning, delivery)),
             output::encoded_len(&(bot, request_id)),
             0,
             Ok(0),
@@ -244,6 +245,8 @@ enum Command {
         prompt: String,
         workspace: Option<String>,
         model: Option<String>,
+        /// This turn's effort level; absent is the bot's own.
+        reasoning: Option<String>,
         /// `reject` (default), `queue`, or `steer`.
         delivery: Option<String>,
         /// With `steer`: the running turn this message is for, or `stale_turn`.
@@ -2403,6 +2406,7 @@ impl Service {
                 prompt,
                 workspace: path,
                 model,
+                reasoning,
                 delivery,
                 expected_turn,
                 from,
@@ -2431,6 +2435,7 @@ impl Service {
                 let options = TurnOptions {
                     workspace: path.as_deref().map(workspace).transpose()?,
                     model,
+                    reasoning,
                     delivery,
                     expected_turn,
                     from: from.map(|author| (author.bot, author.turn)),
@@ -3332,6 +3337,7 @@ mod tests {
             prompt: "work".into(),
             workspace: None,
             model: None,
+            reasoning: None,
             delivery: None,
             expected_turn: None,
             from: None,

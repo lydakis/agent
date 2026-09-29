@@ -1295,14 +1295,16 @@ fn run(options: &Options) -> Result<i32> {
         }
     }
     let request_id = options.request_id.clone().unwrap_or_else(|| unique("run"));
-    // Existing bots keep their model unless --model explicitly overrides it.
-    // AGENT_MODEL is only a creation default, including inside a peer's shell.
+    // Existing bots keep their model and effort unless --model or
+    // --reasoning overrides them for this turn. AGENT_MODEL and
+    // AGENT_REASONING are only creation defaults, including in a peer's shell.
     let submitted = connection
         .request(
             "submit",
             json!({"bot":bot,"bot_id":options.bot_id,"request_id":request_id,"prompt":prompt,
                 "workspace":options.workspace.as_ref().and(workspace.as_ref()),
                 "model":if created { Value::Null } else { json!(options.model) },
+                "reasoning":if created { Value::Null } else { json!(options.reasoning) },
                 "delivery":options.delivery,"expected_turn":options.turn,"from":from}),
         )
         .map_err(|error| ways_past_busy(&bot, error))?;

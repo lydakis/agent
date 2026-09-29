@@ -33,7 +33,7 @@ function page(daemon = {}, storage = null) {
   });
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -708,6 +708,44 @@ test('the model chip offers every provider of the bot\'s family and keeps unknow
   // A creation event carries no family; the bot takes its provider's.
   await p.onEvent({ event: 'created', bot: 'late', data: { id: 4, provider: 'alpha', model: 'one' } });
   assert.equal(p.S.bots.get('late').family, 'anthropic');
+});
+
+test('the model chip changes the effort of an agent\'s next turns and never of a steer', async () => {
+  const sent = []; const storage = new Map();
+  const p = shell({ request: async (op, q) => { sent.push(q); } }, storage);
+  p.upsert({ name: 'lead', id: 1, provider: 'openai', family: 'responses', model: 'gpt-6-luna', reasoning: 'high', status: 'idle', running_turn: null });
+  p.upsert({ name: 'plain', id: 2, provider: 'openai', family: 'responses', model: 'gpt-6-luna', status: 'idle', running_turn: null });
+  p.S.selected = 'lead';
+  const lead = p.S.bots.get('lead');
+  const levels = (b) => Array.from(p.modelMenuItems(b, []).filter((i) => i.act === 'set-effort'), (i) => [i.label, !!i.on]);
+  // An agent made with a level always sends one; Claude's max is not offered to OpenAI's.
+  assert.deepEqual(levels(lead), [['low', false], ['medium', false], ['high', true], ['xhigh', false]]);
+  assert.equal(p.setEffort('lead', 'max'), false);
+  assert.equal(p.setEffort('lead', 'xhigh'), true);
+  assert.deepEqual(levels(lead).find(([, on]) => on), ['xhigh', true]);
+  await p.submit('think harder'); assert.equal(sent.at(-1).reasoning, 'xhigh');
+  // A steer joins the running turn at that turn's level, so it names none.
+  p.upsert({ name: 'lead', id: 1, provider: 'openai', model: 'gpt-6-luna', status: 'running', running_turn: 5 });
+  p.setSend('queue'); await p.submit('next'); assert.equal(sent.at(-1).reasoning, 'xhigh', 'queued work runs at the pick');
+  p.setSend('steer'); await p.submit('also'); assert.equal(sent.at(-1).delivery, 'steer'); assert.equal('reasoning' in sent.at(-1), false);
+  p.upsert({ name: 'lead', id: 1, provider: 'openai', model: 'gpt-6-luna', status: 'idle', running_turn: null });
+  // Its own level again sends none: the agent's own applies.
+  p.setEffort('lead', 'high');
+  await p.submit('back'); assert.equal('reasoning' in sent.at(-1), false);
+  // An agent made without a level can go back to the model's own.
+  const plain = p.S.bots.get('plain');
+  assert.deepEqual(levels(plain)[0], ['default', true]);
+  p.setEffort('plain', 'low'); p.S.selected = 'plain';
+  await p.submit('quick'); assert.equal(sent.at(-1).reasoning, 'low');
+  // The pick comes back for the same identity only.
+  p.setEffort('lead', 'medium'); p.save();
+  const q = shell({}, storage);
+  q.upsert({ name: 'lead', id: 1, provider: 'openai', family: 'responses', model: 'gpt-6-luna', reasoning: 'high' });
+  q.upsert({ name: 'plain', id: 9, provider: 'openai', family: 'responses', model: 'gpt-6-luna' });
+  q.restore();
+  assert.equal(q.S.effort.get('lead'), 'medium');
+  assert.equal(q.S.effort.has('plain'), false);
+  p.setEffort('plain', ''); assert.equal(p.S.effort.has('plain'), false);
 });
 
 test('a saved model pick comes back only for the same bot identity', () => {
@@ -1796,7 +1834,7 @@ test('the model chip names each provider above its models', () => {
   const p = shell();
   p.upsert({ name: 'lead', id: 1, provider: 'bedrock', family: 'anthropic', model: 'claude' });
   const items = p.modelMenuItems(p.S.bots.get('lead'), [{ id: 'bedrock/claude' }, { id: 'openai/gpt' }]);
-  assert.deepEqual(Array.from(items, (i) => i.head ?? (i.sep ? '—' : i.label)), ['Amazon Bedrock', 'claude', '—', 'OpenAI', 'gpt']);
+  assert.deepEqual(Array.from(items, (i) => i.head ?? (i.sep ? '—' : i.label)), ['Effort', 'default', 'low', 'medium', 'high', 'xhigh', 'max', '—', 'Amazon Bedrock', 'claude', '—', 'OpenAI', 'gpt']);
 });
 
 test('a daemon with no provider to run opens setup instead of an error', async () => {

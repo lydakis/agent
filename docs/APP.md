@@ -32,8 +32,13 @@ One menu per agent: side chat, stop, fork, delete, show all.
 
 ![The agent menu](app/menu.png)
 
-The model chip: models under their provider; other families need a new agent.
-The chip also names the agent's effort level when it has one (here `high`).
+The model chip: the agent's effort on top, then models under their provider;
+other families need a new agent. The chip names the effort its next turn runs
+at (here `xhigh`, picked in this menu for an agent made at `high`). A level or
+model picked here applies to the agent's next turns and leaves the one it was
+made with unchanged; picking that one again goes back to it. "default"
+appears only for an agent made without a level. A steer names neither, so it
+joins the running turn at that turn's model and effort.
 
 ![The model chip's menu](app/model-chip.png)
 
@@ -67,8 +72,8 @@ A side chat asked while the lead works: a fork beside it, the lead untouched.
 New project takes a folder, the model its lead starts on, and that model's
 effort. Effort is how hard the model thinks: every provider offers low,
 medium, high and xhigh, Claude also max, and "default effort" sends no level,
-so the model uses its own default. It is picked with the model, stays with the
-agent for its life, and is kept in `.agents/project.toml` as `reasoning`
+so the model uses its own default. It is picked with the model, the model chip
+changes it later, and it is kept in `.agents/project.toml` as `reasoning`
 beside `model`; `/new NAME PROVIDER/MODEL [EFFORT]` takes one too. A task the
 coordinator starts on its own model takes its effort as well
 (`AGENT_REASONING`, see [CLI.md](CLI.md)).
