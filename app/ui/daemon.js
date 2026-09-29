@@ -400,7 +400,16 @@ window.Daemon = (() => {
       const bots = await enlist(sw, [[`${swarm}-${i}`, row]], each, true); sw.budget += each;
       return { swarm: swarmRecord(sw), bots, failed: [] };
     },
-    swarmLeave: async (swarm, member) => { const sw = S.swarms.get(swarm); if (sw.members.includes(member)) sw.budget -= Math.floor(sw.budget / sw.members.length); sw.members = sw.members.filter((m) => m !== member); delete sw.ids[member]; delete sw.rows[member]; return swarmRecord(sw); },
+    // A stream the leaver led goes to the first agent left in it, as the app's does.
+    swarmLeave: async (swarm, member) => {
+      const sw = S.swarms.get(swarm); if (sw.members.includes(member)) sw.budget -= Math.floor(sw.budget / sw.members.length); sw.members = sw.members.filter((m) => m !== member); delete sw.ids[member]; delete sw.rows[member];
+      const st = sw.state, was = short(sw, member); delete st.roles[was]; delete st.streams[was];
+      for (const p of st.proposals.filter((x) => x.status === 'approved' && (x.lead ?? x.by) === was)) {
+        const next = Object.keys(st.streams).sort().find((m) => st.streams[m] === p.stream);
+        if (next) { p.lead = next; sw.board.push({ at: Date.now(), from: 'council', kind: 'lead', stream: p.stream, lead: next, was }); }
+      }
+      return swarmRecord(sw);
+    },
     swarmStop: async (swarm) => {
       const sw = S.swarms.get(swarm); sw.stopped = true;
       for (const m of sw.members) { const b = S.bots.get(m); if (b?.running_turn != null) { b.interrupted = true; finish(m, b.running_turn, 'interrupted'); } }
