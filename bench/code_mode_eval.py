@@ -292,6 +292,7 @@ def main():
     for name in arms:
         if name not in ARMS:
             parser.error(f'unknown arm {name}')
+    args.out = args.out.resolve()  # runs change directory, so every path they get is absolute
     root = args.out.with_suffix('')
     root.mkdir(parents=True, exist_ok=False)
     skill = mcpx_skill(args.mcpx)
