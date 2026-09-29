@@ -45,6 +45,18 @@ build works in its own worktree: its branch follows its name in the head.
 
 ![build on its own branch, beside the lead](app/worktree.png)
 
+A message another agent sent shows who sent it where yours has `›`: the
+coordinator starting or steering a task, a task's answer, a swarm post. The
+name opens that agent beside the chat. The daemon records a prompt's author
+when a bot's turn sent it (`from`, which the CLI fills from `AGENT_BOT` and
+`AGENT_TURN`), and `history_items` returns it with each prompt, so a chat
+read back after a restart keeps the names. Messages the app sends on its own
+are tagged by the request ids it gives them: `tasks` for a coordinator's
+task updates (`app-wake-`) and `schedule` for a scheduled message
+(`schedule-`).
+
+![A task's chat: the coordinator's messages tagged](app/agent-message.png)
+
 A side chat asked while the lead works: a fork beside it, the lead untouched.
 
 ![A side chat beside the running lead](app/side-chat.png)
@@ -198,9 +210,11 @@ client/          agent-client: the socket protocol and the client policy
   mutation queue, so a pending read cannot splice over a newer snapshot.
 - **Demo mode.** In a plain browser there is no Rust core, so `daemon.js`
   becomes a simulated daemon that emits the same protocol shapes and answers
-  `history_items`, `submit`, `create`, `fork`, `delete`, `interrupt`. A steer joins
-  the running turn at its next round boundary as a user message, and the
-  scripted reply acknowledges it. The scenario
+  `history_items`, `submit`, `create`, `fork`, `delete`, `interrupt`. A steer is
+  queued as its own turn and joins the running turn at its next round
+  boundary as a user message (`steered`), and the scripted reply
+  acknowledges it. The coordinator's tasks and swarm posts name the agent
+  that sent them, as the daemon's history does. The scenario
   plays on load in two projects: `demo.lead` thinks, starts a release build
   in the background, spawns its tasks plan, build and test, build spawns
   review, and the coordinator waits on all of it. Serve `app/ui` with any
@@ -776,7 +790,9 @@ fork naming and placement, side chats (a running source, the allowed list,
 the first message going to the copy), a worktree bot's branch in its head,
 project creation (no file for a refused model),
 steers pinned to their turn, model picks pinned to identity, the demo
-daemon's steer delivery, and runs folded with failures on their line.
+daemon's steer delivery, a message's sender (another agent's, live, steered
+in and read back, and the app's own task updates and schedules), and runs
+folded with failures on their line.
 `cargo test -p agent-app` includes a failed project-file write leaving
 neither a partial file nor a temporary.
 `cargo test --workspace` includes the silent-listener readiness deadline,

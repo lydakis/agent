@@ -44,6 +44,10 @@ button:focus-visible,[tabindex]:focus-visible{outline:1px solid var(--amber);out
 .line{white-space:pre-wrap;word-break:break-word}
 .line.user{color:var(--user);margin-top:12px}
 .line.user:first-child{margin-top:0}
+/* A message another agent sent: its sender's name where yours has `›`. */
+.line.user.agent{color:var(--t-ink)}
+.line.user .by{font:inherit;font-size:12px;color:var(--t-dim);background:var(--t-raised);border-radius:4px;padding:0 5px;margin-right:2px;vertical-align:1px}
+.line.user .by:hover{color:var(--t-ink)}
 .line.text{margin-top:4px}
 .line.tool{color:var(--amber)}
 .line.tool b{font-weight:600}

@@ -3846,20 +3846,16 @@ impl Database {
         for (steer, item, size) in steers {
             let id = node(&tx, head, &item)?;
             head = Some(id);
-            if size >= PROMPT_SHARE_BYTES {
-                tx.execute("UPDATE turns SET status='steered',finished_ms=?1,prompt='',prompt_node=?2,
+            // A steer always shares its node, whatever its size: a steer
+            // has no turn of its own on the lineage, so this is how its
+            // node names who sent it. A steer that named no folder or model
+            // records the ones it ran with.
+            tx.execute(
+                "UPDATE turns SET status='steered',finished_ms=?1,prompt='',prompt_node=?2,
                     (workspace,model)=(SELECT COALESCE(s.workspace,t.workspace),COALESCE(s.model,t.model)
                         FROM turns s, turns t WHERE s.id=?4 AND t.id=?3) WHERE id=?4",
-                    params![epoch_ms(), id, turn, steer])?;
-            } else {
-                // A steer that named no folder or model records the ones it ran with.
-                tx.execute(
-                    "UPDATE turns SET status='steered',finished_ms=?1,
-                        (workspace,model)=(SELECT COALESCE(s.workspace,t.workspace),COALESCE(s.model,t.model)
-                            FROM turns s, turns t WHERE s.id=?3 AND t.id=?2) WHERE id=?3",
-                    params![epoch_ms(), turn, steer],
-                )?;
-            }
+                params![epoch_ms(), id, turn, steer],
+            )?;
             let data = json!({"status":"steered","into":turn,"node":id,"checkpoint":Value::Null,
                 "error":Value::Null,"detail":Value::Null});
             let cursor = event(&tx, &bot.name, Some(steer), "turn_finished", data.clone())?;
@@ -6174,17 +6170,42 @@ impl Database {
         let maximum = crate::output::MAX_EVENT - 1024;
         // Check the encoded blob length in SQLite before allocating it. An
         // unrenderable item gets its own error; adjacent items remain readable.
-        let mut query = self
-            .conn
-            .prepare_cached("SELECT item FROM nodes WHERE id=? AND length(item)<=?")?;
+        // A prompt names the request that sent it, and the bot's turn that
+        // wrote it when a bot did: a turn's first node, and a steer's, which
+        // points at its node.
+        let mut query = self.conn.prepare_cached(
+            "SELECT CASE WHEN length(n.item)<=?2 THEN n.item END,n.turn IS NULL,
+                t.request_id,t.from_bot,t.from_turn
+             FROM nodes n LEFT JOIN turns t ON t.id=n.turn WHERE n.id=?1",
+        )?;
+        let mut steer = self.conn.prepare_cached(
+            "SELECT request_id,from_bot,from_turn FROM turns
+             WHERE prompt_node=? AND status='steered'",
+        )?;
         for &node in wanted {
-            let raw: Option<Vec<u8>> = query
-                .query_row(params![node, maximum as i64], |r| r.get(0))
-                .optional()?;
+            type Sent = (Option<String>, Option<String>, Option<i64>);
+            let (raw, inside, mut sent): (Option<Vec<u8>>, bool, Sent) = query
+                .query_row(params![node, maximum as i64], |r| {
+                    Ok((r.get(0)?, r.get(1)?, (r.get(2)?, r.get(3)?, r.get(4)?)))
+                })?;
             let mut entry = match raw {
                 Some(raw) => json!({"node":node,"item":serde_json::from_slice::<Value>(&raw)?}),
                 None => json!({"node":node,"error":"item_too_large"}),
             };
+            // Only a user message inside a turn can be a steer.
+            if inside && entry["item"]["role"] == "user" {
+                sent = steer
+                    .query_row([node], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                    .optional()?
+                    .unwrap_or_default();
+            }
+            let (request_id, from, from_turn) = sent;
+            if let Some(request_id) = request_id {
+                entry["request_id"] = json!(request_id);
+            }
+            if let (Some(bot), Some(turn)) = (from, from_turn) {
+                entry["from"] = json!({"bot":bot,"turn":turn});
+            }
             let mut size = serde_json::to_vec(&entry)?.len();
             // Leave room for the protocol envelope, including extra escaping
             // or wrapper bytes beyond the stored representation.

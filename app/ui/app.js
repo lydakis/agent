@@ -63,7 +63,7 @@ function decodeAt(t, at, entries) {
   const bare = t.items[at]; if (bare.kind !== 'node') return;
   if (!entries.length) entries = [{kind:'backing',turn:bare.turn}];
   count(t, bare, -1);
-  for (const e of entries) { e.from = bare.node; e.fromCall = bare.callId; count(t, e, 1); }
+  for (const e of entries) { e.from = bare.node; e.fromCall = bare.callId; if (bare.by && e.kind === 'user') e.by = bare.by; count(t, e, 1); }
   t.items.splice(at, 1, ...entries);
   t.gen += 1;
 }
@@ -238,6 +238,17 @@ const isActive = (status) => ACTIVE.has(status);
 // coordinator's lineage, and any root bot named `<project>.<task>`.
 const LEAD = '.lead';
 const leadProject = (name) => name.length > LEAD.length && name.endsWith(LEAD) ? name.slice(0, -LEAD.length) : null;
+// Who sent a prompt that is not yours: another agent's turn, as the daemon records it, or the app
+// on its own, known by the request ids it gives what it sends for the task updates and schedules.
+const APP_SENDERS = [['app-wake-', 'tasks'], ['schedule-', 'schedule']];
+function senderOf(p) {
+  if (p.from?.bot) return { bot: p.from.bot, turn: p.from.turn };
+  const id = typeof p.request_id === 'string' ? p.request_id : '';
+  const app = APP_SENDERS.find(([prefix]) => id.startsWith(prefix));
+  return app ? { app: app[1] } : null;
+}
+// Who another agent is, as a message it sent names it: a coordinator by its role.
+const agentName = (name) => leadProject(name) ? 'coordinator' : bot(name) ? shortName(bot(name)) : name;
 function shortName(b) {
   const p = b?.project; if (!p) return b?.name ?? '';
   if (b.name === p + LEAD) return p;
@@ -556,14 +567,18 @@ async function onEvent(ev) {
     }
     case 'accepted': {
       const b = bot(name); if (b) { b.status = 'running'; b.runningTurn = turn; b.waitingOn = []; b.turnStarted = S.live ? Date.now() : 0; b.elapsed = 0; }
-      if (typeof data.node === 'number') pushNode(transcript(name), { kind: 'node', node: data.node, turn });
+      const t = transcript(name), by = senderOf(data); t.authors?.delete(turn);
+      if (typeof data.node === 'number') pushNode(t, { kind: 'node', node: data.node, turn, ...(by ? { by } : {}) });
       break;
     }
     case 'queued': {
       // `ready` waits for a daemon-wide slot with nothing else running on the bot; `queued` sits behind its own turn.
       const b = bot(name); const behindOwn = !!b && (b.runningTurn !== null || isActive(b.status));
       if (b && !behindOwn) { b.status = data.status ?? 'queued'; b.runningTurn = turn; }
-      addItem(transcript(name), { kind: 'note', text: behindOwn ? 'queued behind the running turn' : 'queued for a slot', turn });
+      const t = transcript(name);
+      // Who wrote it waits with it: the prompt reaches the lineage when the turn starts or steers in.
+      const by = senderOf(data); if (by) (t.authors ??= new Map()).set(turn, by);
+      addItem(t, { kind: 'note', text: data.delivery === 'steer' ? 'steers in at the running turn\'s next step' : behindOwn ? 'queued behind the running turn' : 'queued for a slot', turn });
       break;
     }
     case 'message': {
@@ -613,13 +628,19 @@ async function onEvent(ev) {
     case 'turn_waiting': { const b = bot(name); if (b) { b.status = 'waiting'; b.waitingOn = data.handles ?? []; } break; }
     case 'turn_paced': { const b = bot(name); if (b) b.status = 'paced'; break; }
     case 'turn_resumed': { const b = bot(name); if (b) { b.status = 'running'; b.waitingOn = []; } break; }
-    case 'steered': addItem(transcript(name), { kind: 'note', text: 'steered into the running turn', turn }); break;
+    case 'steered': {
+      // The steer's message joins this turn; `from` is the steer's own turn.
+      const t = transcript(name), by = t.authors?.get(data.from); t.authors?.delete(data.from);
+      if (typeof data.node === 'number') pushNode(t, { kind: 'node', node: data.node, turn, ...(by ? { by } : {}) });
+      else addItem(t, { kind: 'note', text: 'steered into the running turn', turn });
+      break;
+    }
     case 'turn_finished': {
       const status = data.status ?? '?';
       const b = bot(name);
       // A steer absorbed into a running turn finishes as its own turn while that turn goes on.
       if (b && (b.runningTurn === null || b.runningTurn === turn)) { b.runningTurn = null; b.waitingOn = []; if (b.turnStarted) b.elapsed = Date.now() - b.turnStarted; b.turnStarted = 0; b.status = status === 'completed' || status === 'steered' ? 'idle' : status; }
-      const t = transcript(name);
+      const t = transcript(name); t.authors?.delete(turn);
       if (t.streamingTurn === turn) { t.text = ''; t.thinking = ''; t.thinkingSince = 0; t.thinkingMs = 0; t.streamingTurn = null; t.streamGen += 1; }
       if (status !== 'completed' && status !== 'steered') addItem(t, { kind: 'note', text: data.error ? `${status}: ${data.error}${data.detail ? ': ' + data.detail : ''}` : status, turn });
       // A background command may outlive its turn; only a wait result says how it ended.
@@ -775,6 +796,8 @@ async function loadBatch(name) {
     const index = t.items.indexOf(it); if (index < 0) continue;
     if (it.kind !== 'tool_stub' && !failure && !fetched.has(it.node)) continue;
     const row = fetched.get(it.node);
+    // The daemon names who sent a prompt with its item.
+    if (row && !it.by) { const by = senderOf(row); if (by) it.by = by; }
     const r = it.kind === 'tool_stub' ? {stub:true} : failure ? {err:failure} : row.error ? {err:row.error} : {ok:row.item};
     if (S.transcripts.get(name) !== t || S.session !== session) return false;
     if (r.stub) { count(t, it, -1); it.kind = 'tool'; t.gen += 1; progressed = true; continue; }
@@ -1137,7 +1160,11 @@ function toggleStep(target) {
 
 function itemHTML(it) {
   switch (it.kind) {
-    case 'user': return `<div class="line user">› ${esc(it.text)}</div>`;
+    case 'user': {
+      if (!it.by) return `<div class="line user">› ${esc(it.text)}</div>`;
+      const tag = it.by.bot ? `<button type="button" class="by" data-task="${esc(it.by.bot)}" title="Sent by ${esc(it.by.bot)}, turn ${esc(it.by.turn)}">${esc(agentName(it.by.bot))}</button>` : `<span class="by">${esc(it.by.app)}</span>`;
+      return `<div class="line user agent">${tag} ${esc(it.text)}</div>`;
+    }
     case 'text': return markdown(it.text);
     case 'note': return `<div class="line note">${esc(it.text)}</div>`;
     case 'note_gap': return `<div class="line note">${it.total} ${it.later ? 'later' : 'earlier'} activity notes summarized · durable messages remain available</div>`;

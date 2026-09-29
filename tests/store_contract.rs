@@ -1514,6 +1514,92 @@ fn served_announcements_carry_each_call_and_the_denials_so_far() {
 }
 
 #[test]
+fn history_items_name_the_request_and_author_of_each_prompt() {
+    let mut db = db();
+    for bot in ["Bob", "Carol"] {
+        db.create(bot, Some("/synthetic"), binding()).unwrap();
+    }
+    let person = db
+        .begin(
+            "Bob",
+            "p1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let by_bob = |delivery| TurnOptions {
+        delivery,
+        from: Some(("Bob".into(), person)),
+        ..TurnOptions::default()
+    };
+    let turn = db
+        .begin(
+            "Carol",
+            "b1",
+            "delegated work",
+            true,
+            &by_bob(Delivery::Reject),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    // A short steer Bob wrote, and one from a person: each is its own
+    // turn, taken into Carol's.
+    db.begin(
+        "Carol",
+        "b2",
+        "also the docs",
+        true,
+        &by_bob(Delivery::Steer),
+        allow_provider,
+    )
+    .unwrap();
+    let steer = TurnOptions {
+        delivery: Delivery::Steer,
+        ..TurnOptions::default()
+    };
+    db.begin("Carol", "p2", "and the tests", true, &steer, allow_provider)
+        .unwrap();
+    db.absorb(turn, None, 8 << 20, 4096, ContextUsage::default(), false)
+        .unwrap();
+    db.append(turn, vec![assistant("done")], &[], None).unwrap();
+    let page = db.history_nodes("Carol", None, 400, None, false).unwrap();
+    let ids: Vec<i64> = page["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["node"].as_i64().unwrap())
+        .collect();
+    let read = db.history_items("Carol", &ids).unwrap();
+    let sent: Vec<Value> = read["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| json!([n["item"]["content"][0]["text"], n["request_id"], n["from"]]))
+        .collect();
+    let bob = json!({"bot":"Bob","turn":person});
+    assert_eq!(
+        sent,
+        [
+            json!(["done", null, null]),
+            json!(["and the tests", "p2", null]),
+            json!(["also the docs", "b2", bob]),
+            json!(["delegated work", "b1", bob]),
+        ]
+    );
+    // The author's own prompt was a person's.
+    let bob = db.history_nodes("Bob", None, 400, None, false).unwrap();
+    let node = bob["nodes"][0]["node"].as_i64().unwrap();
+    assert_eq!(
+        db.history_items("Bob", &[node]).unwrap()["items"][0]["request_id"],
+        "p1"
+    );
+}
+
+#[test]
 fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
     let mut db = db();
     let person = gated_turn(&mut db, None);

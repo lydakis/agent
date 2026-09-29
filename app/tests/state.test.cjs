@@ -37,6 +37,8 @@ function page(daemon = {}, storage = null) {
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
+// A turn that ran ended: a steer finishes too, as its own turn taken into another.
+const ended = (e) => e.event === 'turn_finished' && e.data?.status !== 'steered';
 const settle = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
 
@@ -945,14 +947,17 @@ test('the demo daemon delivers a steer at the next round boundary and refuses a 
   await assert.rejects(d.request('submit', { bot: 'solo', prompt: 'x', delivery: 'steer', expected_turn: turn + 1 }), /stale_turn/);
   await d.request('submit', { bot: 'solo', prompt: 'mention the wait op too', delivery: 'steer', expected_turn: turn });
   const events = [];
-  while (!events.some((e) => e.event === 'turn_finished')) events.push(...(await d.pull()).events);
-  const nodes = events.filter((e) => e.event === 'message').map((e) => e.data.node);
+  while (!events.some(ended)) events.push(...(await d.pull()).events);
+  const nodes = events.filter((e) => e.event === 'message' || e.event === 'steered').map((e) => e.data.node);
   const { items: read } = await d.request('history_items', { bot: 'solo', nodes });
   const items = read.map((entry) => entry.item);
   const user = items.findIndex((i) => i.role === 'user');
   assert.equal(items[user].content[0].text, 'mention the wait op too');
   assert.match(items[user + 1].content[0].text, /^Noted: mention the wait op too\./);
-  assert.equal(events.filter((e) => e.event === 'turn_finished').length, 1, 'the steer joined the running turn');
+  assert.equal(events.filter(ended).length, 1, 'the steer joined the running turn');
+  const steer = events.find((e) => e.event === 'queued');
+  assert.equal(steer.data.delivery, 'steer');
+  assert.deepEqual(events.filter((e) => e.event === 'turn_finished' && e.turn === steer.turn).map((e) => [e.data.status, e.data.into]), [['steered', turn]]);
   d.close();
 });
 
@@ -1033,7 +1038,7 @@ test('the demo daemon answers as a side chat only for a fork nested under its so
   const texts = async (bot) => {
     await d.request('submit', { bot, prompt: 'run the tests', delivery: 'reject' });
     const events = [];
-    while (!events.some((e) => e.event === 'turn_finished' && e.bot === bot)) events.push(...(await d.pull()).events);
+    while (!events.some((e) => ended(e) && e.bot === bot)) events.push(...(await d.pull()).events);
     return events.filter((e) => e.bot === bot && e.event === 'tool_started').map((e) => e.data.name);
   };
   try {
@@ -1432,12 +1437,12 @@ test('the demo daemon\'s swarm: agents post, working ones hear it, and an idle o
   assert.equal(sw.workspace, '~/.agent/worktrees/demo.latency');
   // Their briefs start them; the swarm is quiet again once both are done.
   const done = new Set();
-  while (done.size < 2) for (const e of (await d.pull()).events) if (e.event === 'turn_finished') done.add(e.bot);
+  while (done.size < 2) for (const e of (await d.pull()).events) if (ended(e)) done.add(e.bot);
   const before = (await d.swarmBoard('demo.latency', null)).lines.length;
   // Your post naming nobody wakes both; one naming latency-2 wakes only it.
   await d.swarmPost('demo.latency', '@latency-2 look at fsync');
   const events = [];
-  while (!events.some((e) => e.event === 'turn_finished')) events.push(...(await d.pull()).events);
+  while (!events.some(ended)) events.push(...(await d.pull()).events);
   assert.deepEqual([...new Set(events.filter((e) => e.event === 'accepted').map((e) => e.bot))], ['demo.latency-2']);
   const board = (await d.swarmBoard('demo.latency', null)).lines.slice(before);
   assert.deepEqual(Array.from(board, (l) => l.from), ['user', 'latency-2']);
@@ -1453,7 +1458,7 @@ test('the demo daemon\'s council opens a stream by the seats\' majority and leav
   const { swarm: sw } = await d.swarmStart({ project: 'demo', folder: '/workspace', goal: 'Halve p99 latency.', shared: true, mix: [{ identity: '', model: 'alpha/one', share: 100 }], agents: 4, budgetTokens: 1000, council: 3 });
   assert.deepEqual([sw.council, Array.from(sw.seats)], [3, names.slice(0, 3)]);
   const done = new Set();
-  while (done.size < 4) for (const e of (await d.pull()).events) if (e.event === 'turn_finished') done.add(e.bot);
+  while (done.size < 4) for (const e of (await d.pull()).events) if (ended(e)) done.add(e.bot);
   const { state, lines } = await d.swarmBoard('demo.latency', null);
   assert.deepEqual(state.proposals.map((p) => [p.id, p.stream, p.status]), [['P1', 'conn-pool', 'approved'], ['P2', 'batch-commits', 'open']]);
   assert.deepEqual({ ...state.streams }, { 'latency-1': 'conn-pool', 'latency-2': 'conn-pool', 'latency-4': 'conn-pool' });
@@ -1833,4 +1838,60 @@ test('an older daemon on the socket is replaced from the detached screen; a newe
   p.lost('daemon_protocol_mismatch: the daemon speaks protocol "4", this client 4');
   assert.doesNotMatch(screen.innerHTML, /replace-daemon|update the app/);
   assert.match(screen.innerHTML, /· retrying/);
+});
+
+test('a message another agent sent names its sender, live, steered in, and read back from history', async () => {
+  const items = { 1: { role: 'user', content: [{ type: 'input_text', text: 'fix the login bug' }] }, 2: { role: 'user', content: [{ type: 'input_text', text: 'also check the refresh path' }] },
+    3: { role: 'user', content: [{ type: 'input_text', text: 'what changed?' }] } };
+  // The daemon names who sent each prompt with its item.
+  const sent = { 1: { request_id: 'run-1', from: { bot: 'demo.lead', turn: 4 } }, 2: { request_id: 'run-2', from: { bot: 'demo.lead', turn: 5 } }, 3: { request_id: 'app-3' } };
+  const batch = async ({ nodes }) => ({ items: nodes.map((node) => ({ node, item: items[node], ...sent[node] })) });
+  const history = async (op) => {
+    if (op === 'history_nodes') return { nodes: [{ node: 3, turn: 9 }, { node: 2, turn: 7 }, { node: 1, turn: 7 }], next_from: null, next_newer: null };
+    throw new Error(op);
+  };
+  const p = page({ request: history, batch });
+  p.upsert({ name: 'demo.lead', id: 1 }); p.upsert({ name: 'demo.build', id: 2, created_by: 'demo.lead', created_by_id: 1 }); p.tree();
+  // The coordinator starts a task, then steers a second message into its running turn; you ask something.
+  await p.onEvent({ event: 'accepted', bot: 'demo.build', turn: 7, data: { node: 1, from: { bot: 'demo.lead', turn: 4 } } });
+  await p.onEvent({ event: 'queued', bot: 'demo.build', turn: 8, data: { delivery: 'steer', from: { bot: 'demo.lead', turn: 5 } } });
+  await p.onEvent({ event: 'steered', bot: 'demo.build', turn: 7, data: { from: 8, node: 2 } });
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 8, data: { status: 'steered', into: 7 } });
+  await p.onEvent({ event: 'accepted', bot: 'demo.build', turn: 9, data: { node: 3 } });
+  const t = p.transcript('demo.build');
+  await p.loadBatch('demo.build');
+  const html = p.itemsHTML(t);
+  assert.equal((html.match(/class="line user agent"><button type="button" class="by" data-task="demo.lead"[^>]*>coordinator<\/button> /g) || []).length, 2, html);
+  assert.match(html, /coordinator<\/button> also check the refresh path/);
+  assert.match(html, /<div class="line user">› what changed\?<\/div>/, 'yours keep their mark');
+  assert.equal(t.authors.size, 0, 'an author is forgotten once its prompt is on the lineage');
+  // Read back from the daemon's history, as after a restart.
+  const q = page({ request: history, batch });
+  q.upsert({ name: 'demo.lead', id: 1 }); q.tree();
+  const r = q.transcript('demo.build'); r.items = [{ kind: 'history', next: 3, seed: true }]; r.history = r.items[0]; r.seed = r.items[0];
+  await q.load('demo.build');
+  const read = q.itemsHTML(r);
+  assert.equal((read.match(/class="by" data-task="demo.lead"/g) || []).length, 2, read);
+  assert.match(read, /› what changed\?/);
+});
+
+test('the app\'s own task updates and scheduled messages are tagged by the ids it sent them with', async () => {
+  const items = { 1: { role: 'user', content: [{ type: 'input_text', text: 'Task updates: build ended' }] }, 2: { role: 'user', content: [{ type: 'input_text', text: 'check the nightly run' }] },
+    3: { role: 'user', content: [{ type: 'input_text', text: 'thanks' }] } };
+  const ids = { 1: 'app-wake-9a2e', 2: 'schedule-nightly-1790000000-42', 3: 'app-6f1c' };
+  const p = page({ request: async (op) => {
+    if (op === 'history_nodes') return { nodes: [{ node: 3, turn: 3 }, { node: 2, turn: 2 }, { node: 1, turn: 1 }], next_from: null, next_newer: null };
+    throw new Error(op);
+  }, batch: async ({ nodes }) => ({ items: nodes.map((node) => ({ node, item: items[node], request_id: ids[node] })) }) });
+  const t = p.transcript('demo.lead'); t.items = [{ kind: 'history', next: 3, seed: true }]; t.history = t.items[0]; t.seed = t.items[0];
+  await p.load('demo.lead');
+  let html = p.itemsHTML(t);
+  assert.match(html, /<span class="by">tasks<\/span> Task updates: build ended/);
+  assert.match(html, /<span class="by">schedule<\/span> check the nightly run/);
+  assert.match(html, /<div class="line user">› thanks<\/div>/);
+  // Live, the ids come with the turn's start.
+  const q = page({ request: async (op, r) => items[r.node] });
+  await q.onEvent({ event: 'accepted', bot: 'demo.lead', turn: 2, data: { node: 2, request_id: 'schedule-nightly-1790000000-42' } });
+  await q.loadBatch('demo.lead');
+  assert.match(q.itemsHTML(q.transcript('demo.lead')), /<span class="by">schedule<\/span> check the nightly run/);
 });

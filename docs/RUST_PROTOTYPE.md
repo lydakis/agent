@@ -902,7 +902,10 @@ The fork can read its shared prefix after its source is deleted.
 
 `history_items` accepts `bot` and 1–400 distinct `nodes`. It validates all IDs
 against that bot's lineage with one ancestry walk and returns a prefix as
-`items: [{node: ID, item: VALUE}, ...]` in request order. The reply targets
+`items: [{node: ID, item: VALUE}, ...]` in request order. A prompt's item, a
+turn's first or a steer's, also names the `request_id` that sent it and, when a
+bot's turn wrote it, `from: {bot, turn}`, so a client can say who each message
+came from without reading every turn. The reply targets
 768 KiB; one larger item may be returned alone if it fits the 1 MiB frame limit.
 An item exceeding that limit returns `{node: ID, error: "item_too_large"}`;
 other items remain readable. Callers request remaining IDs in their next batch.
@@ -1299,9 +1302,11 @@ identity sequence above the highest assigned ID (zero for an empty store).
 Schema 26 shares started prompts of at least 4 KiB with their immutable user
 node; queued prompts remain inline until start, and small prompts stay inline
 to avoid reference/index overhead. Idempotency and turn listings resolve the
-same original text. Absorbed steers share their own user node. Migration shares
+same original text. Absorbed steers share their own user node whatever their
+size: a steer has no turn of its own on the lineage, so the reference is how
+`history_items` names who sent it. Migration shares
 exact indexed matches; older steers without that mapping keep their inline
-text. The prompt-node foreign key has a partial index for deletion checks.
+text, and history names no sender for them. The prompt-node foreign key has a partial index for deletion checks.
 Schema 29 adds [tool-result elision](#tool-result-elision) without reading
 stored items: results recorded before it have no stub and are always sent
 whole. A backfilled saving would change the cumulative savings of every
