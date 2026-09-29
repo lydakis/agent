@@ -39,11 +39,12 @@ class ScheduleFireTests(ModelFixture):
     def bot_id(self, bot):
         return next(b['id'] for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout) if b['name'] == bot)
 
-    def fire(self, name, bot, bot_id, message, at=None, app=APP, socket=None, env=None):
+    def fire(self, name, bot, bot_id, message, at=None, app=APP, socket=None, env=None, store_id=None):
         # What a schedule's plist has launchd run.
         args = [str(app), '--schedule-fire', '--name', name, '--bot', bot, '--bot-id', str(bot_id),
                 '--when', 'every 30m', *(['--at', str(at)] if at else []), '--store', str(self.store),
-                *(['--socket', str(socket)] if socket else []), '--', message]
+                *(['--socket', str(socket)] if socket else []),
+                *(['--store-id', store_id] if store_id else []), '--', message]
         env = {**clean_env(), 'HOME': str(self.home), **(env or {})}
         result = subprocess.run(args, env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -109,6 +110,13 @@ class ScheduleFireTests(ModelFixture):
         self.assertTrue(socket.exists())
         turns = json.loads(self.agent('turns', '--store', str(self.store), '--socket', str(socket), '--bot', 'p.task').stdout)
         self.assertEqual(turns[-1]['prompt_preview'], 'Morning check.')
+
+    def test_a_fire_never_reaches_another_stores_daemon(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        other = self.fire('p.task', 'p.task', self.bot_id('p.task'), 'x', store_id='0' * 32)
+        self.assertEqual(other['last']['outcome'], 'failed', other)
+        self.assertIn('store_mismatch', other['last']['detail'])
+        self.assertEqual(len(self.turns('p.task')), 1)
 
     def test_a_fire_never_reaches_a_bot_made_again_under_the_name(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')

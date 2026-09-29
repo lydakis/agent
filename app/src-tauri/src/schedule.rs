@@ -157,6 +157,9 @@ pub struct Schedule {
     /// A one-off's time; it fires once, then removes itself.
     pub at: Option<i64>,
     pub daemon: Daemon,
+    /// The store identity its daemon announced when it was made; a daemon
+    /// on that socket serving another store is not its daemon.
+    pub store_id: Option<String>,
     pub message: String,
 }
 
@@ -183,6 +186,9 @@ impl Schedule {
         if let Some(socket) = &self.daemon.socket {
             args.extend(["--socket".into(), socket.to_string_lossy().into()]);
         }
+        if let Some(id) = &self.store_id {
+            args.extend(["--store-id".into(), id.clone()]);
+        }
         args.extend(["--".into(), self.message.clone()]);
         args
     }
@@ -190,7 +196,8 @@ impl Schedule {
     /// Read back from a fire's arguments, after the flag.
     fn parse(args: &[String]) -> Result<Self, String> {
         let bad = |what: &str| format!("invalid_schedule: {what}");
-        let (mut name, mut bot, mut id, mut when, mut at) = (None, None, None, None, None);
+        let (mut name, mut bot, mut id, mut when, mut at, mut store_id) =
+            (None, None, None, None, None, None);
         let mut daemon = Daemon {
             store: None,
             socket: None,
@@ -214,6 +221,7 @@ impl Schedule {
                 "--at" => at = Some(value.parse().map_err(|_| bad("--at"))?),
                 "--store" => daemon.store = Some(value.into()),
                 "--socket" => daemon.socket = Some(value.into()),
+                "--store-id" => store_id = Some(value.clone()),
                 other => return Err(bad(other)),
             }
         };
@@ -226,6 +234,7 @@ impl Schedule {
             daemon: (daemon.store.is_some() || daemon.socket.is_some())
                 .then_some(daemon)
                 .ok_or_else(|| bad("no --store or --socket"))?,
+            store_id,
             message,
         })
     }
@@ -469,6 +478,18 @@ pub fn cron(expression: &str) -> Result<When, String> {
         None => vec![None],
         Some(values) => values.iter().copied().map(Some).collect(),
     };
+    // Counted before any is made: a broad expression is refused, not built.
+    let count = |f: &Option<Vec<u8>>| f.as_ref().map_or(1, Vec::len);
+    let each = count(&months) * count(&hours) * count(&minutes);
+    let needed = match (&days, &weekdays) {
+        (Some(_), Some(_)) => each * (count(&days) + count(&weekdays)),
+        _ => each * count(&days) * count(&weekdays),
+    };
+    if needed > MAX_ENTRIES {
+        return Err(format!(
+            "invalid_cron: {expression} needs more than {MAX_ENTRIES} calendar entries; narrow it"
+        ));
+    }
     let product = |days: &Option<Vec<u8>>, weekdays: &Option<Vec<u8>>| {
         let mut out = Vec::new();
         for month in any(&months) {
@@ -498,11 +519,6 @@ pub fn cron(expression: &str) -> Result<When, String> {
         }
         _ => product(&days, &weekdays),
     };
-    if entries.len() > MAX_ENTRIES {
-        return Err(format!(
-            "invalid_cron: {expression} needs more than {MAX_ENTRIES} calendar entries; narrow it"
-        ));
-    }
     Ok(When {
         text: format!("cron {expression}"),
         entries,
@@ -820,8 +836,19 @@ pub fn remove(places: &Places, name: &str, launchd: Loader) -> Result<(), String
     let _lock = Lock::take(places)?;
     let path = places.plist(name);
     let last = places.last(name);
-    if !path.exists() {
-        if !last.exists() {
+    // A folder that ignores case finds `build`'s files for `Build`, whose
+    // label launchd does not have: only the name as stored is that schedule.
+    let stored = |dir: &Path, file: &Path| {
+        let want = file.file_name();
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|e| Some(e.file_name().as_os_str()) == want)
+    };
+    let (path_here, last_here) = (stored(&places.agents, &path), stored(&places.state, &last));
+    if !path_here {
+        if !last_here {
             return Err(format!("schedule_not_found: {name}"));
         }
         forget(&last);
@@ -995,11 +1022,12 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
     let daemon = Daemon::current()?;
     let socket = daemon.socket()?;
     // The bot must exist now; the schedule is pinned to this identity.
-    let record = runtime()?.block_on(async {
+    let (record, store_id) = runtime()?.block_on(async {
         let client = connect(&socket, &daemon).await?;
         let record = client.request("resume", json!({"bot": bot})).await;
+        let store_id = client.store().map(str::to_owned);
         client.close().await;
-        record.map_err(|e| e.to_string())
+        record.map(|r| (r, store_id)).map_err(|e| e.to_string())
     })?;
     let bot_id = record["id"].as_i64().ok_or("the daemon named no bot id")?;
     let schedule = Schedule {
@@ -1009,6 +1037,7 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
         when: asked.when.text,
         at: asked.when.at,
         daemon,
+        store_id,
         message: asked.message,
     };
     let app = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -1099,6 +1128,14 @@ pub fn fire_cli(args: &[String]) -> i32 {
                 Ok(client) => client,
                 Err(error) => return json!({"outcome": "failed", "detail": error}),
             };
+            // The socket may now be another store's daemon's; its bot ids are its own.
+            if let Some(want) = &schedule.store_id
+                && client.store() != Some(want.as_str())
+            {
+                client.close().await;
+                return json!({"outcome": "failed", "detail": format!(
+                    "store_mismatch: the daemon at {} serves another store", socket.display())});
+            }
             let outcome = send(&client, &schedule).await;
             client.close().await;
             outcome
@@ -1275,6 +1312,12 @@ mod tests {
         assert!(cron("5-1 * * * *").is_err());
         assert!(cron("* * * * *").is_ok());
         assert!(cron("0-59 0-23 * * *").unwrap_err().contains("narrow"));
+        // Refused before it is built: this one would be 656,208 entries.
+        assert!(
+            cron("0-59 0-23 1-31 1-12 0-6")
+                .unwrap_err()
+                .contains("narrow")
+        );
     }
 
     fn schedule() -> Schedule {
@@ -1288,6 +1331,7 @@ mod tests {
                 store: Some("/Users/a/.agent/state.sqlite".into()),
                 socket: Some("/tmp/s".into()),
             },
+            store_id: Some("00ab".into()),
             message: "Check the PR's CI & reviews; <fix> what's \"red\".\nThen say so.".into(),
         }
     }
@@ -1389,6 +1433,12 @@ mod tests {
         assert!(
             taken.starts_with("name_taken: P.Fix-Login: schedule p.fix-login"),
             "{taken}"
+        );
+        // Nor does `rm` of that other case reach it, even where the folder would alias it.
+        assert!(
+            remove(&places, "P.Fix-Login", &launchd)
+                .unwrap_err()
+                .starts_with("schedule_not_found")
         );
         // A move of the app is written into every schedule and reloaded.
         asked.borrow_mut().clear();

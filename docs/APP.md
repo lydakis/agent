@@ -690,12 +690,15 @@ minutes; `--at` refuses a part out of range or extra parts); `--cron` is read as
 given, up to 1,024 calendar entries. A message is at most 16 KiB. A schedule
 is named after its bot unless `--name` says otherwise, and one added under a
 name in use replaces it. A name differing from another only in case is
-refused (`name_taken`), since macOS folders would give both one file.
+refused (`name_taken`), since macOS folders would give both one file, and
+`rm` finds a schedule only by the name as stored.
 
 Each is one LaunchAgent, `~/Library/LaunchAgents/me.lydakis.agent.schedule.NAME.plist`,
 and that file is its only record: its program arguments carry the bot, its
 id, the store and the socket of the shell it was made from (an agent's shell
-has both), the one-off's time and the message. Replacing one unloads the old
+has both), the store identity its daemon announced, the one-off's time and
+the message. A fire whose daemon announces another store (a reused socket)
+sends nothing and records `store_mismatch`. Replacing one unloads the old
 job first and, if the new plist cannot be written or loaded, writes the old
 one back and loads it; a removal launchd refuses keeps the plist, so it can
 be retried. When it fires, the app's executable runs with `--schedule-fire`
