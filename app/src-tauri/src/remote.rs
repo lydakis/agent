@@ -125,8 +125,12 @@ fn read_config(path: &Path, home: &Path, depth: usize, out: &mut Vec<String>) {
     }
 }
 
-/// A config line's words: the keyword may end at `=`, a double-quoted word
-/// keeps its spaces, and a `#` starting a word starts a comment.
+/// A config line's words: the keyword may end at `=`, and the rest is split
+/// as OpenSSH's `argv_split` does. Words part at spaces and tabs; `"` and `'`
+/// quote spaces, even mid-word; `\` escapes a quote, a backslash, or (outside
+/// quotes) a space, and is kept before anything else; a `#` starting a word
+/// starts a comment. A line with an open quote, which OpenSSH rejects, has
+/// no words.
 fn words(line: &str) -> Vec<String> {
     let line = line.trim();
     let (keyword, rest) = match line.find(|c: char| c.is_whitespace() || c == '=') {
@@ -140,24 +144,32 @@ fn words(line: &str) -> Vec<String> {
     let mut out = vec![keyword.to_owned()];
     let mut chars = rest.chars().peekable();
     loop {
-        while chars.next_if(|c| c.is_whitespace()).is_some() {}
-        let Some(first) = chars.next() else { break };
-        if first == '#' {
+        while chars.next_if(|c| matches!(c, ' ' | '\t')).is_some() {}
+        if matches!(chars.peek(), None | Some('#')) {
             break;
         }
-        let mut word = String::new();
-        if first == '"' {
-            for c in chars.by_ref() {
-                if c == '"' {
-                    break;
-                }
-                word.push(c);
+        let (mut word, mut quote) = (String::new(), None);
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => match chars.peek() {
+                    Some(&next @ ('\'' | '"' | '\\')) => {
+                        word.push(next);
+                        chars.next();
+                    }
+                    Some(' ') if quote.is_none() => {
+                        word.push(' ');
+                        chars.next();
+                    }
+                    _ => word.push('\\'),
+                },
+                ' ' | '\t' if quote.is_none() => break,
+                '"' | '\'' if quote.is_none() => quote = Some(c),
+                _ if quote == Some(c) => quote = None,
+                _ => word.push(c),
             }
-        } else {
-            word.push(first);
-            while let Some(c) = chars.next_if(|c| !c.is_whitespace()) {
-                word.push(c);
-            }
+        }
+        if quote.is_some() {
+            return Vec::new();
         }
         out.push(word);
     }
@@ -219,21 +231,26 @@ fn glob(pattern: &str, name: &str) -> bool {
 /// What OpenSSH says an alias connects to, from `ssh -G`: its user, host
 /// name and port. None when ssh cannot say.
 pub async fn resolve(ssh: &Path, alias: &str) -> Option<Value> {
-    let mut command = Command::new(ssh);
-    command
+    let mut child = Command::new(ssh)
         .args(["-G", "--", alias])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .kill_on_drop(true);
-    let output = tokio::time::timeout(Duration::from_secs(5), command.output())
-        .await
-        .ok()?
+        .kill_on_drop(true)
+        .spawn()
         .ok()?;
-    if !output.status.success() {
+    let (out, mut stdout) = (child.stdout.take(), Vec::new());
+    // Its whole config is a few KiB; past the bound ssh is killed on drop.
+    let status = tokio::time::timeout(Duration::from_secs(5), async {
+        capped(out, MAX_RESOLVED, &mut stdout).await.ok()?;
+        child.wait().await.ok()
+    })
+    .await
+    .ok()??;
+    if !status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&output.stdout);
+    let text = String::from_utf8_lossy(&stdout);
     let field = |key: &str| {
         text.lines()
             .find_map(|line| line.strip_prefix(key)?.strip_prefix(' '))
@@ -848,7 +865,10 @@ impl Host {
         let (out, err) = (child.stdout.take(), child.stderr.take());
         let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
         let work = async {
-            let read = tokio::try_join!(capped(out, &mut stdout), capped(err, &mut stderr));
+            let read = tokio::try_join!(
+                capped(out, MAX_OUTPUT, &mut stdout),
+                capped(err, MAX_OUTPUT, &mut stderr)
+            );
             if read.is_err() {
                 let _ = child.kill().await;
                 return Err(format!(
@@ -872,16 +892,20 @@ impl Host {
 /// What a command on a host may print on each of stdout and stderr.
 const MAX_OUTPUT: u64 = 1024 * 1024;
 
-/// Read a pipe to its end, refusing more than `MAX_OUTPUT` bytes.
+/// What `ssh -G` may print for one alias.
+const MAX_RESOLVED: u64 = 64 * 1024;
+
+/// Read a pipe to its end, refusing more than `limit` bytes.
 async fn capped(
     pipe: Option<impl tokio::io::AsyncRead + Unpin>,
+    limit: u64,
     into: &mut Vec<u8>,
 ) -> Result<(), ()> {
     use tokio::io::AsyncReadExt;
     let Some(pipe) = pipe else { return Ok(()) };
     // A read error ends the output; the exit status says the rest.
-    let _ = pipe.take(MAX_OUTPUT + 1).read_to_end(into).await;
-    if into.len() as u64 > MAX_OUTPUT {
+    let _ = pipe.take(limit + 1).read_to_end(into).await;
+    if into.len() as u64 > limit {
         return Err(());
     }
     Ok(())
@@ -1396,6 +1420,43 @@ mod tests {
         );
         assert_eq!(shim.count("forward"), 0);
         hosts.close_all().await;
+    }
+
+    #[test]
+    fn config_words_split_as_openssh_splits_them() {
+        let split = |line: &str| words(line);
+        assert_eq!(
+            split("Host 'single' \"double\""),
+            ["Host", "single", "double"]
+        );
+        // Quotes open mid-word and keep spaces; the other quote is literal.
+        assert_eq!(split("Host a'b c'd \"it's\""), ["Host", "ab cd", "it's"]);
+        // `\` escapes a quote, a backslash, or a space outside quotes, and
+        // is kept before anything else.
+        assert_eq!(
+            split(r#"Host a\ b \'q\' "x\ y" c\d e\\f"#),
+            ["Host", "a b", "'q'", r"x\ y", r"c\d", r"e\f"]
+        );
+        assert_eq!(split("Host=box\t# note"), ["Host", "box"]);
+        assert_eq!(split("Host a#b #c"), ["Host", "a#b"]);
+        // OpenSSH rejects a line with an open quote; it names no hosts.
+        assert!(split("Host 'open box").is_empty());
+        assert!(split("Host \"open").is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolving_an_alias_reads_what_ssh_says_and_no_more() {
+        let shim = Shim::new("host-resolve");
+        let answer = resolve(&shim.ssh, "box").await.unwrap();
+        assert_eq!(
+            answer,
+            json!({"user": "someone", "hostname": "box.example", "port": "22"})
+        );
+        let flood = shim.root.join("bin/flood");
+        super::shim::script(&flood, "#!/bin/sh\nexec yes user\n");
+        let begun = std::time::Instant::now();
+        assert_eq!(resolve(&flood, "box").await, None);
+        assert!(begun.elapsed() < std::time::Duration::from_secs(4));
     }
 
     #[tokio::test]

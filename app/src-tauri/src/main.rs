@@ -1238,15 +1238,27 @@ fn state_title(config: &Config) -> String {
 async fn hosts(windows: State<'_, Windows>) -> Result<Value, String> {
     let home = PathBuf::from(std::env::var_os("HOME").ok_or("no HOME for ~/.ssh/config")?);
     let aliases = remote::aliases(&home.join(".ssh/config"), &home);
+    // Each `ssh -G` is a process of a few milliseconds, or longer when a
+    // `Match exec` or canonicalization runs: a few at a time keeps the
+    // list quick without a burst of processes. A long list names the rest only.
+    const PROBES: usize = 8;
+    let mut pending = aliases.iter().take(64).cloned().enumerate();
     let mut asked = tokio::task::JoinSet::new();
-    // Each `ssh -G` is a few milliseconds; a long list names the rest only.
-    for (at, alias) in aliases.iter().take(64).enumerate() {
-        let (ssh, alias) = (windows.hosts.ssh().to_owned(), alias.clone());
-        asked.spawn(async move { (at, remote::resolve(&ssh, &alias).await) });
-    }
     let mut resolved = vec![Value::Null; aliases.len()];
-    while let Some(Ok((at, answer))) = asked.join_next().await {
-        resolved[at] = answer.unwrap_or(Value::Null);
+    loop {
+        while asked.len() < PROBES {
+            let Some((at, alias)) = pending.next() else {
+                break;
+            };
+            let ssh = windows.hosts.ssh().to_owned();
+            asked.spawn(async move { (at, remote::resolve(&ssh, &alias).await) });
+        }
+        let Some(done) = asked.join_next().await else {
+            break;
+        };
+        if let Ok((at, Some(answer))) = done {
+            resolved[at] = answer;
+        }
     }
     Ok(aliases
         .iter()

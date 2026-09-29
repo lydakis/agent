@@ -396,7 +396,11 @@ following `Include` with a relative path from `~/.ssh`, a `~/` path, or
 wildcards in the last component only (an `Include` inside a `Host` or
 `Match` block is followed only under `Host *` or `Match all`; one that
 applies to some hosts is skipped), and beside each what `ssh -G` says it
-connects to. **Open window** opens a window on that host; `agent-app --host
+connects to. Words are split as OpenSSH splits them (either quote, and `\`
+escapes), and a line with an open quote, which OpenSSH rejects, names no
+host. The `ssh -G` probes run eight at a time, for the first 64 aliases,
+each read to at most 64 KiB and five seconds.
+**Open window** opens a window on that host; `agent-app --host
 box` opens the first one there. The window's title names the host. Nothing
 about SSH is reimplemented: every connection is `ssh box` with your own
 config, keys and agent.
@@ -897,7 +901,7 @@ daemon's steer delivery, and runs folded with failures on their line.
 `cargo test -p agent-app` includes a failed project-file write leaving
 neither a partial file nor a temporary, and hosts over SSH against a stand-in
 `ssh` that runs the remote command here and forwards by linking: `~/.ssh/config`
-aliases and includes, the ssh arguments, `agent start`'s answers, attaching
+aliases, includes and quoting, `ssh -G` read to its bound, the ssh arguments, `agent start`'s answers, attaching
 through the master and again after it is killed, a host printing without end
 cut off at 1 MiB, a refused login and a
 missing `agent` reported and backed off, an older daemon replaced through the
