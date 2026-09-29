@@ -777,7 +777,8 @@ async fn swarm_leave(
     member: String,
 ) -> Result<Value, String> {
     let root = swarms_of(&state)?;
-    blocking(move || swarm::leave(&root, &swarm, &member)).await
+    let client = state.client.lock().await.clone().ok_or("detached")?;
+    swarm::leave(&client, &root, &swarm, &member).await
 }
 
 #[tauri::command]

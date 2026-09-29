@@ -64,6 +64,12 @@ one provider.
 
 ![Connecting Amazon Bedrock](app/setup-bedrock.png)
 
+AWS login takes AWS CLI version 2 (2.9 or later), whose `aws configure
+export-credentials` hands the profile's keys to the daemon. An older CLI cannot,
+and Setup says so with the version it found.
+
+![Bedrock with an AWS CLI that is too old](app/setup-bedrock-old-cli.png)
+
 Once a provider answers, the first project takes a folder and a model, listed
 under its provider; nothing is chosen for you.
 
@@ -123,6 +129,11 @@ approve or deny yourself, then the ones decided.
 Streams: the approved proposals, each with its lead and the agents in it.
 
 ![Streams](app/swarm-streams.png)
+
+When a stream's lead leaves, the first agent left in it leads it, and the
+board says so.
+
+![A stream handed on when its lead left](app/swarm-lead.png)
 
 You can also ask a project's coordinator for one ("start a swarm of six, two
 of them reviewers, to halve the p99"). Its role tells it to run
@@ -266,11 +277,15 @@ on Linux from `/proc` and on macOS from `proc_pidinfo`.
 
 Releases follow Errand's: pushing a `vX.Y.Z` tag on `main` whose version both
 `Cargo.toml` and `app/src-tauri/Cargo.toml` carry runs
-[release.yml](../.github/workflows/release.yml) on a macOS runner. The tag
+[release.yml](../.github/workflows/release.yml) on a macOS 26 runner. The app
+must link the macOS 26 SDK: one built with an older SDK keeps the separate,
+pre-26 title bar on macOS 26. The tag
 itself only starts [release-request.yml](../.github/workflows/release-request.yml),
 which holds no secrets; release.yml and publish-homebrew.yml run after it from
 `main`'s own definitions, so code at a tag never sees the signing secrets or
-the tap token. A failed run is re-run from its own page. It runs
+the tap token. A failed run is re-run from its own page, but a re-run keeps
+the workflow file it first ran; to pick up a fix merged to `main`, re-run the
+release's Release request run instead. It runs
 the tests, installs the Tauri CLI from
 [app/release/package-lock.json](../app/release/package-lock.json) before any
 signing material exists, builds a universal `agent` and app, and has Tauri sign both with
@@ -285,7 +300,8 @@ resolves the tag to a commit on `main` before running any of its code,
 refuses assets built from any other commit (a draft's tag can move) or
 lacking release.yml's build attestation (a draft's assets can be replaced),
 checks them against their checksums and the tag's cask generator,
-installs and audits the cask, and writes `Casks/agent.rb` to
+installs and audits the cask, and writes `Casks/agent.rb`, rendered by
+`main`'s generator, to
 [lydakis/homebrew-agent](https://github.com/lydakis/homebrew-agent). It never
 downgrades the tap or replaces a different cask of the same version. The
 helpers and their tests are in [app/release](../app/release)
@@ -488,7 +504,8 @@ daemon learns nothing about projects; everything here is client work.
   one's bot id and row of the mix, whether you stopped it, the highest
   number an agent of it was made under, and the bot ids of members that
   left; at most
-  1 MiB, read only when every member has an id and a row, changed only
+  1 MiB, never written past it (an Add that would is refused and its agent
+  deleted), read only when every member has an id and a row, changed only
   under the board's lock, synced, and replaced whole; written last when
   a swarm is made, so a folder without it is not listed), `board.jsonl` (one
   line a post or act, appended under a lock and synced, your goal first;
@@ -521,8 +538,9 @@ daemon learns nothing about projects; everything here is client work.
   turns (a turn that ended meanwhile is skipped; the post waits on the
   board), and wakes an idle agent only when it names it with `@NAME`; your
   post wakes every agent, or only the ones it names. A post holds the
-  board's lock until its steers are sent, so Stop either refuses it or
-  ends what it started. So agents talking
+  board's lock until its steers are sent, and Stop holds it throughout, so
+  a post either comes first and Stop ends what it started, or waits for
+  Stop: an agent's is then refused, and yours resumes the swarm. So agents talking
   never wake a swarm that went quiet. A post is at most 16 KiB and comes
   only from a member, named by its shell's `AGENT_BOT`, `AGENT_BOT_ID` and
   `AGENT_TURN`; the daemon records it as each steer's author. Every steer
@@ -533,7 +551,12 @@ daemon learns nothing about projects; everything here is client work.
   its role, its stream, its votes on open proposals and the open proposals
   it made (the board keeps them all); its helpers still count in the
   swarm's tokens and Stop still ends them (`swarm.toml` keeps its bot id
-  in `left` until a look at the daemon's list finds nothing it made). A new agent always takes a
+  in `left` until a look at the daemon's list finds nothing it made). A
+  stream it led goes to the first agent left in it (a `lead` line on the
+  board, and that agent is told, never one leaving with it); an agent that
+  moves up into its council seat is named on the board (a `seat` line) and,
+  when proposals are open, told it holds one, with them. A stopped swarm
+  tells neither, and a send that fails is shown. A new agent always takes a
   number no agent of the swarm had, so a name on the board is only ever
   one agent's. A swarm is one sidebar row
   under its project (⁂, working while any agent works); its agents are not
@@ -570,7 +593,11 @@ daemon learns nothing about projects; everything here is client work.
   cannot post. The daemon forgets a deleted bot's tokens, so each act that
   reads its list keeps each helper's tokens in `state.json` (`helpers`), and
   a helper deleted since counts on (`gone`) with what that look saw it use;
-  what it used after that look is not counted. Each act that reads the daemon's list, and a check the page
+  what it used after that look is not counted. It keeps where each helper
+  comes from too (`roots`), so a helper whose maker was deleted still
+  counts and still stops, as long as a look saw its maker first; Stop keeps
+  what each of its looks saw, so a Stop tried again after one that failed
+  still finds such a helper. Each act that reads the daemon's list, and a check the page
   asks for at most every five seconds a swarm as its agents finish turns,
   tells the working agents when the swarm passes 50%, 75% or 90% of its
   budget: a `budget` line on the board, each share once (`state.json`
