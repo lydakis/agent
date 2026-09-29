@@ -14,6 +14,8 @@ const DECODE_BYTES = 8 * 1024 * 1024;
 
 const S = {
   bots: new Map(), transcripts: new Map(), selected: '', cursor: 0, live: false, attached: false, autoSelect: true,
+  // The store identity the attached daemon announced; what the window remembers is saved under it.
+  store: null,
   // Bumped whenever a bot is added, removed or changes status (botsGen), and when one is added or
   // removed (shapeGen), so the activity check and the rail's tree rebuild once per change instead of
   // scanning the fleet on every event.
@@ -32,7 +34,9 @@ const S = {
   drafts: new Map(),
 };
 function loadSend() { try { const v = localStorage.getItem('agent:send'); return v === 'steer' || v === 'side' ? v : 'queue'; } catch (_) { return 'queue'; } }
-const sessionKey = () => `agent:${S.config?.socket}|${S.config?.workspace}`;
+// What a window remembers belongs to the store it shows and its folder, not to the socket that reached
+// it: two hosts, or a host and this machine, never share it. Nothing is saved before the store is known.
+const sessionKey = () => (S.store ? `agent:${S.store}|${S.config?.workspace}` : null);
 const bot = (name) => S.bots.get(name);
 const transcript = (name) => { if (!S.transcripts.has(name)) S.transcripts.set(name, { items: [], nodes: 0, thoughts: 0, longOut: 0, peers: [], anchor: 'end', gen: 0, text: '', thinking: '', thinkingSince: 0, thinkingMs: 0, streamingTurn: null, streamGen: 0 }); return S.transcripts.get(name); };
 // Counters kept in step with the items, so the key bar never scans the history.
@@ -208,7 +212,8 @@ function readBranch(b) {
   if (b.branch !== undefined) return;
   b.branch = null;
   const ws = b.workspace;
-  if (!ws || !Daemon.branch) return;
+  // A host's folders are its own; the app does not read them yet.
+  if (!ws || !Daemon.branch || S.config?.host) return;
   Daemon.branch(ws).then((branch) => { if (branch && b.workspace === ws && bot(b.name) === b) { b.branch = branch; render(); } }, () => {});
 }
 // Records carry the family; creation events do not, so a bot seated from one takes its provider's.
@@ -354,7 +359,8 @@ function leave(swarm, name) {
 // newer read found.
 let swarmsRead = 0;
 async function loadSwarms() {
-  if (!Daemon.swarms) return;
+  // Swarms live on this machine; a window on a host has none.
+  if (!Daemon.swarms || S.config?.host) return;
   const read = ++swarmsRead;
   const { swarms = [], broken = [] } = await Daemon.swarms();
   if (read !== swarmsRead) return;
@@ -923,8 +929,10 @@ function attach() {
 async function attachOnce() {
   try {
     if (!S.config) S.config = await Daemon.setup();
-    const { session } = await Daemon.attach(S.cursor);
-    S.session = session;
+    const { session, store, workspace } = await Daemon.attach(S.cursor);
+    S.session = session; S.store = store ?? null;
+    // A window on a host starts in the home the host named, unless it was given a folder there.
+    if (!S.config.workspace && workspace) S.config.workspace = workspace;
     S.deleted = new Set(); S.snapshot = true;
     pump(session);
     // The snapshot, a page at a time, applied as it arrives while the replay flows.
@@ -994,13 +1002,15 @@ function showDetached(reason) {
     : age === 'older' ? `<div class="why">A daemon from before this update holds this socket, and this window did not start it: stop it with its own agent (agent shutdown), then start one from this update's agent. The window attaches when it answers.</div><div style="margin-top:12px">${settings}</div>`
     : `${age === 'newer' ? '<div class="why">The daemon is newer than this app: update the app.</div>' : ''}<div style="margin-top:12px">${settings}</div>`;
   const state = age === 'newer' ? 'stopped' : idle() ? 'waiting for a provider' : 'retrying';
-  $('detached').innerHTML = `<div><b>not attached</b></div><div>${esc(reason)}</div><div style="margin-top:8px">daemon at <span class="k">${esc(S.config?.socket ?? '?')}</span> · ${state}</div>${what}`;
+  const where = S.config?.host ? `daemon on <span class="k">${esc(S.config.host)}</span>` : `daemon at <span class="k">${esc(S.config?.socket ?? '?')}</span>`;
+  $('detached').innerHTML = `<div><b>not attached</b></div><div>${esc(reason)}</div><div style="margin-top:8px">${where} · ${state}</div>${what}`;
   $('detached').classList.add('on');
   if (!idle()) retryAttach();
   else { clearTimeout(retryTimer); retryTimer = null; }
 }
 function restore() {
-  let saved = null; try { saved = JSON.parse(localStorage.getItem(sessionKey()) || 'null'); } catch (_) {}
+  const key = sessionKey(); if (!key) return;
+  let saved = null; try { saved = JSON.parse(localStorage.getItem(key) || 'null'); } catch (_) {}
   if (!saved) return;
   if (saved.selected && isOpen(saved.selected)) { S.selected = saved.selected; S.autoSelect = false; }
   if (saved.side && S.bots.has(saved.side) && saved.side !== S.selected) S.ui.side = saved.side;
@@ -1013,7 +1023,7 @@ function restore() {
     if (b && b.id != null && b.id === id && typeof model === 'string' && runsOn(b, model)) S.override.set(name, model);
   }
 }
-function save() { try { localStorage.setItem(sessionKey(), JSON.stringify({ selected: S.selected, side: S.ui.side, rail: S.ui.rail, steps: S.ui.steps, folded: [...S.ui.folded], override: [...S.override].map(([name, model]) => [name, bot(name)?.id ?? null, model]) })); } catch (_) {} }
+function save() { const key = sessionKey(); if (!key) return; try { localStorage.setItem(key, JSON.stringify({ selected: S.selected, side: S.ui.side, rail: S.ui.rail, steps: S.ui.steps, folded: [...S.ui.folded], override: [...S.override].map(([name, model]) => [name, bot(name)?.id ?? null, model]) })); } catch (_) {} }
 window.addEventListener('beforeunload', save);
 
 // ---------- render ----------
@@ -1695,7 +1705,8 @@ function botMenuItems(name) {
   const b = bot(name); if (!b) return [];
   const busy = isActive(b.status);
   return [
-    ...(leadProject(name) ? [{ act: 'new-swarm', who: name, label: 'New swarm', hint: '⁂' }, { sep: true }] : []),
+    // A swarm runs on this machine: its board is the app's files and its agents run the app's scripts.
+    ...(leadProject(name) ? [{ act: 'new-swarm', who: name, label: 'New swarm', hint: S.config?.host ? 'local only' : '⁂', disabled: !!S.config?.host }, { sep: true }] : []),
     { act: 'side-chat', who: name, label: 'Side chat', hint: '⑂', disabled: b.id == null },
     { act: 'stop', who: name, label: 'Stop', disabled: b.runningTurn === null },
     { act: 'fork', who: name, label: 'Fork', hint: busy ? 'when idle' : '', disabled: busy },
@@ -1935,6 +1946,8 @@ async function openSetup() {
   const st = setupState();
   st.open = true; st.error = null;
   $('setupwrap').classList.add('on'); renderSetup();
+  // The hosts come as OpenSSH resolves them, beside the rest.
+  Daemon.hosts?.().then((hosts) => { st.hosts = hosts; st.hostsError = null; renderSetup(); }, (e) => { st.hosts = []; st.hostsError = String(e?.message ?? e); renderSetup(); });
   try { await loadSettings(); } catch (e) { st.error = String(e?.message ?? e); }
   try { st.roles = await Daemon.roles?.(); } catch (_) {}
   if (!st.settings?.providers?.length) st.adding = st.adding ?? '';
@@ -2046,6 +2059,8 @@ async function removeProvider(name) {
 }
 // A window attached through a socket it did not start cannot apply a change, so none is saved.
 function unrestartable() {
+  const host = setupState().settings?.host;
+  if (host) throw new Error(`restart_unavailable: this window's daemon runs on ${host} with the providers its login shell there exports; change them there`);
   if (setupState().settings?.restartable === false) throw new Error('restart_unavailable: this window did not start its daemon, so it cannot apply provider changes');
 }
 async function applySettings(changes) {
@@ -2086,15 +2101,28 @@ function setupHTML() {
   const refresh = specs.length && S.attached ? `<button type="button" class="sbtn" data-act="setup-refresh"${busy}>Refresh models</button>` : '';
   const listed = st.listError ? `<p class="bad">${esc(st.listError)}</p>` : '';
   const projects = hasProject();
-  const project = projects ? '' : ready && specs.length && st.list.length
+  // Making a project reads its folder, which on a host is the host's.
+  const project = projects ? '' : S.config?.host
+    ? `<p class="dim">A project on ${esc(S.config.host)} is made there for now: the app does not yet read a host's files (AGENTS.md, profiles, .agents/project.toml). Start its lead there with agent run --new --agents --bot NAME.lead; it shows here.</p>`
+    : ready && specs.length && st.list.length
     ? `<form id="setupproj"><label><span>Folder</span><input id="setupdir" autocomplete="off" spellcheck="false" value="${esc(S.config?.workspace ?? '')}"></label><label><span>Model</span>${modelSelectHTML('setupmodel', st.list)}</label><div class="row"><button type="submit" class="sbtn primary"${S.attached ? '' : ' disabled'}${busy}>Create project</button></div><p class="dim">The project's lead runs on this model; every agent you start can use another.</p></form>`
     : `<p class="dim">${specs.length ? 'No models listed yet: see the providers above, then Refresh models.' : 'Connect a provider first.'}</p>`;
   const step = (n, title, done, body) => body ? `<section class="${done ? 'done' : ''}"><h3><span class="num">${done ? '✓' : n}</span>${title}</h3>${body}</section>` : '';
   return `<div class="shead"><b>${ready && projects ? 'Settings' : 'Set up Agent'}</b><button type="button" class="ibtn" data-act="setup-close" title="Close" aria-label="Close"${busy}>✕</button></div>`
-    + step(1, 'Providers', ready, `${rows}<div class="row">${set?.restartable === false ? '<p class="dim">This window uses a daemon it did not start, so it cannot apply provider changes.</p>' : add}${st.adding === null ? refresh : ''}</div>${listed}`)
+    + step(1, 'Providers', ready, `${rows}<div class="row">${set?.host ? `<p class="dim">This window's daemon runs on ${esc(set.host)}, with the providers its login shell there exports; change them there.</p>` : set?.restartable === false ? '<p class="dim">This window uses a daemon it did not start, so it cannot apply provider changes.</p>' : add}${st.adding === null && !set?.host ? refresh : ''}</div>${listed}`)
     + step(2, 'First project', projects, project)
-    + (projects ? rolesHTML(st, busy) : '')
+    + (projects && !S.config?.host ? rolesHTML(st, busy) : '')
+    + hostsHTML(st, busy)
     + (st.busy ? `<p class="busy">${esc(st.busy)}</p>` : '') + (st.error ? `<p class="bad">${esc(st.error)}</p>` : '');
+}
+// The hosts in ~/.ssh/config, each of which a window can be opened on. That window's agents run on
+// the host, through the app's own ssh connection to it.
+function hostsHTML(st, busy) {
+  if (!Daemon.openHost) return '';
+  const where = (to) => (to ? `${to.user ? `${to.user}@` : ''}${to.hostname ?? ''}${to.port && to.port !== '22' ? `:${to.port}` : ''}` : '');
+  const rows = (st.hosts ?? []).map((h) => `<div class="prow"><span class="pn">${esc(h.alias)}</span><span class="st dim">${esc(where(h.to))}</span><span class="acts"><button type="button" class="sbtn" data-act="open-host" data-v="${esc(h.alias)}"${busy}>Open window</button></span></div>`).join('');
+  const none = st.hostsError ? `<p class="bad">${esc(st.hostsError)}</p>` : rows ? '' : '<p class="dim">No hosts in ~/.ssh/config.</p>';
+  return `<section><h3>Hosts</h3>${rows}${none}<p class="dim">A window on a host runs its agents there, over ssh with your keys. The host needs its own Linux agent on its login shell's PATH, and its own providers.</p></section>`;
 }
 // The app's roles, each read from your own file in every project once you have one. Edit makes that
 // file from the app's text the first time and opens it in your editor.
@@ -2274,6 +2302,7 @@ async function act(el) {
     case 'setup-remove': { const st = setupState(); if (anyActive() && st.confirm !== v) { st.confirm = v; renderSetup(); return; } st.confirm = null; await removeProvider(v); return; }
     case 'setup-retry': case 'setup-refresh': await refreshModels(); return;
     case 'edit-role': await editRole(v); return;
+    case 'open-host': await Daemon.openHost(v); return;
     default: return;
   }
 }

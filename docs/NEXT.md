@@ -785,6 +785,20 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     provisional phases. Their open design questions do not block observation.
     One daemon per user stays the default until a matched screen supports
     changing it. Placement, file copying, and transport remain with callers.
+    Done (2026-09-29): step 1 of remote daemons (George approved the
+    proposal's first step; the daemon is unchanged): a desktop window on a
+    host from `~/.ssh/config`, through one ControlMaster per host that the
+    app supervises, the host's own `agent start` over it, and its socket
+    forwarded into `~/.agent/hosts/` ([APP.md](APP.md#hosts-over-ssh)).
+    `agent start` now prints the socket it answered on and, for a daemon of
+    another protocol, its ready line before failing; `agent shutdown` stops
+    an older daemon by its pid. What reads files is refused by name on a
+    host window, and swarms stay on this machine. Next: step 2, remote
+    workspace reads: the client library's reads (policy compose, project
+    file, branch, model list) as `agent` subcommands printing JSON, run over
+    the host's master, so `/new`, New project and branches work on a host.
+    Then step 3, several daemons in one window, with the phase 3 contract
+    above. Not measured: the app over a real network link.
 42. Done: three follow-ups from the review of the 2026-09-25 merges. The
     Responses prompt-cache key uses a store-instance namespace plus the
     bot's id, not a per-daemon nonce. The durable lineage is drawn once at

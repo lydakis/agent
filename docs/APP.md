@@ -162,10 +162,12 @@ Two alternatives were considered for the client path and rejected for now:
   does; the JSON line protocol stays.
 
 Remote use needs no transport work either: the protocol assumes nothing about
-the stream, so `ssh -L` forwarding of the daemon's socket to a local one runs
-the app locally at full speed against a daemon elsewhere. The client is built
-to tolerate that latency anyway: one `follow *`, item loads pipelined per bot,
-nothing polled.
+the stream, so the daemon's socket forwarded over SSH to a local one serves a
+window exactly as a local socket does, with the link's latency added to each
+request. The app does that forwarding itself for a window on a host
+([Hosts over SSH](#hosts-over-ssh)). The client is built to tolerate that
+latency: one `follow *`, item loads pipelined per bot, nothing polled. Nothing
+has measured the app over a real network link yet.
 
 ## Shape
 
@@ -178,7 +180,8 @@ client/          agent-client: the socket protocol and the client policy
 ```
 
 - **Rust core** ([app/src-tauri/src/main.rs](../app/src-tauri/src/main.rs)) is a
-  transport. `setup` returns the socket, model and workspace defaults;
+  transport, with one attachment per window. `setup` returns the socket or
+  host, model and workspace defaults;
   `policy` composes the client policy for the workspace; `attach` connects
   and follows `*` from the page's cursor; `pull` hands the page the next
   batch of that session's notifications, at most 256, when it asks;
@@ -187,6 +190,8 @@ client/          agent-client: the socket protocol and the client policy
   [Setup](#setup-and-settings); and
   `project` and `write_project` read and write a folder's
   `.agents/project.toml` ([project.rs](../app/src-tauri/src/project.rs));
+  `hosts` lists `~/.ssh/config`'s hosts and `open_host` opens a window on one
+  ([remote.rs](../app/src-tauri/src/remote.rs));
   `policy` composes a folder's client policy, in a profile when named, and
   falls back to the profiles the app ships for `coordinator`.
   When nothing listens on a store's socket, `attach` starts a daemon first
@@ -304,7 +309,9 @@ cargo build --release -p agent-app
 ```
 
 Without `--workspace` the workspace is the launching directory, or home when
-that is `/`, as for a window opened from the Dock. Arguments and environment
+that is `/`, as for a window opened from the Dock. `--host ALIAS` opens the
+window on that SSH host instead ([Hosts over SSH](#hosts-over-ssh)), with
+`--workspace` then a path on the host. Arguments and environment
 are the CLI's: `--socket`, `--store`, `--workspace`, `AGENT_SOCKET`,
 `AGENT_STORE`, and a store's
 socket is resolved the way the CLI and the daemon resolve it (the shared
@@ -312,8 +319,11 @@ client crate's rendezvous), so a deep store path meets the same short socket.
 The page draws with the machine's own monospace face and fetches nothing.
 Closing the window is detaching; the daemon and its bots continue. The page
 remembers the thread on screen, the one beside it, the sidebar, folded
-projects, model picks and the steps fold per socket and workspace in the
-webview's local storage, and restores them on the next start. Send's queue or
+projects, model picks and the steps fold per store and workspace in the
+webview's local storage, and restores them on the next start. The store is
+the identity the daemon announces when the window attaches, so two hosts, or
+a host and this machine, never share what a window remembers, whatever socket
+reaches them. Send's queue or
 steer pick is remembered for every window. If the daemon is unreachable or closes the session, the page shows why
 and retries every two seconds. Only one attachment runs at a time, including
 the snapshot pages. A connected peer must send its ready line within five seconds.
@@ -373,6 +383,73 @@ once when a window first attaches to a store with no agents. An
 `agent` the app did not bundle, or an explicit `--socket`, cannot be
 restarted, so Settings saves no provider change there and says why; it
 shows that daemon's providers instead of the ones this machine would start.
+
+## Hosts over SSH
+
+A window can attach to the daemon on a machine you reach over SSH, so long
+work runs there while the app runs here. Settings lists **Hosts**: the
+concrete `Host` aliases in `~/.ssh/config` (not patterns or negations),
+following `Include` with a relative path from `~/.ssh`, a `~/` path, or
+wildcards in the last component only, and beside each what `ssh -G` says it
+connects to. **Open window** opens a window on that host; `agent-app --host
+box` opens the first one there. The window's title names the host. Nothing
+about SSH is reimplemented: every connection is `ssh box` with your own
+config, keys and agent.
+
+Per host, the app owns one `ssh` process, a ControlMaster in the foreground
+with `BatchMode=yes` (never a prompt), `ServerAliveInterval=15` and
+`ServerAliveCountMax=3`, `ControlPersist=no`, `ClearAllForwardings=yes` (a
+`LocalForward` of your own cannot stop it), `ExitOnForwardFailure=yes`,
+`StreamLocalBindUnlink=yes` and `StreamLocalBindMask=0177`. Its control
+socket and the forwarded daemon socket are in `~/.agent/hosts/`, made
+owner-only, beside a lock only one app process may hold per host. Over that
+master the app runs `agent start` in the remote user's login shell
+(`exec "$SHELL" -l -i -c ...`, so the `agent` and provider keys a terminal
+there would have), which prints the daemon's ready line and the socket it
+answered on, then asks the master to forward that socket (`-O forward -L
+LOCAL:REMOTE`). The page's attach, cursor and pulls then run unchanged
+against the local socket. An attach tries the forward first; when the daemon
+or the link has gone, it runs `agent start` again, starting a new master
+first if the old one exited. A failure is not tried again for a backoff that
+doubles from one second to thirty, so a window retrying every two seconds
+does not open a connection each time. The last window on a host closing ends
+its master and removes its files; so does quitting the app. The daemon on the
+host keeps running.
+
+A window on a host never starts or replaces a daemon on this machine, and
+never signals a process on the host itself. What stops it says why:
+
+- No `agent` on the host's login PATH: `agent_missing`, which says to install
+  the Linux `agent` there (the app bundles a macOS one and copies nothing).
+- A refused login, an unknown host key, or an unreachable host:
+  `host_auth_failed` (load a key into ssh-agent so `ssh box` needs no
+  password), `host_key_unverified` (run `ssh box` once in a terminal), or
+  `host_unreachable`, each with ssh's own last line.
+- No provider there: `host_no_provider`; the host's daemon runs the providers
+  its login shell exports, and Settings shows them without offering a change.
+- Versions: the host's `agent start` prints the daemon's ready line even when
+  that `agent` refuses it. A daemon older than the app that the host's
+  `agent` refused is `daemon_older`, and **Restart the daemon** runs the
+  host's own `agent shutdown` (which stops an older daemon by the pid it
+  announced) and then `agent start`. A daemon the host's `agent` accepted but
+  that is older than the app means that `agent` is old: `host_agent_older`
+  says to install this version there. A newer one is `daemon_newer`.
+
+The app does not read a host's files yet, and never reads this machine's in
+their place. On a host window these are refused by name
+(`remote_unsupported`) rather than answered from this machine: composing
+instructions from AGENTS.md, skills and profiles (so `/new` and New project),
+a project's `.agents/project.toml`, the model list in `~/.agent/models`, the
+roles in `~/.agents/agents`, provider settings in `~/.agent/env`, and a
+folder's branch, which is not shown. Swarms stay on this machine: their board
+is the app's files and their agents run the app's scripts, so New swarm is
+disabled on a host. Chat, follow, steer, stop, fork, side chats and delete
+work on the host's bots, and a bot made there (`agent run --new --agents` in
+a shell on the host) shows in the window.
+
+Not built: reading a host's files (step 2, in [NEXT item
+41](NEXT.md)); an app-level heartbeat beyond SSH keepalives; `Include` with
+wildcards in a directory; a login shell that takes `-l` only alone (tcsh).
 
 ## Projects and panes
 
@@ -759,6 +836,17 @@ only 90%, each once, counting a helper's tokens. The council was also
 driven in demo mode: roles, two proposals, one approved by the seats, a
 stream two more agents joined, and the other left open for you.
 
+On 2026-09-29 the host connection ran against real OpenSSH 9.6 on Linux,
+with `sshd` on the same machine and a synthetic account holding a release
+`agent`: an unknown host key, a refused key, no `agent` on PATH and no
+provider each gave their reason; then the master connected, `agent start`
+ran in the login shell and named the socket and home, the forward carried a
+`bots` request, a killed master was replaced on the next connect, a daemon
+shut down on the host was started again through the same forward, and
+closing removed the control and forwarded sockets. The Tauri crate built and
+its tests ran on Linux; the macOS app was not run, so no window on a host has
+been seen by eye.
+
 On 2026-09-27 the shell was driven in demo mode in headless Chromium:
 projects and tasks in the sidebar, a card opened beside and swapped, the three
 menus, fork, confirmed delete, folding and a new project, with no page errors.
@@ -774,6 +862,10 @@ A task's runs rendered while it worked matched a full redraw of the same pane.
    the cask is uninstalled; the uninstall hook stops only the default one.
 4. The rest of the projects design (the "Agent App Concepts" prototype), in
    the order [NEXT item 47](NEXT.md) gives.
+5. Remote workspace reads, step 2 of [Hosts over SSH](#hosts-over-ssh):
+   the client library's reads (policy compose, project file, branch, model
+   list) as `agent` subcommands that print JSON, run over the host's
+   ControlMaster, so `/new`, New project and branches work on a host.
 
 ## Regression checks
 
@@ -794,7 +886,14 @@ project creation (no file for a refused model),
 steers pinned to their turn, model picks pinned to identity, the demo
 daemon's steer delivery, and runs folded with failures on their line.
 `cargo test -p agent-app` includes a failed project-file write leaving
-neither a partial file nor a temporary.
+neither a partial file nor a temporary, and hosts over SSH against a stand-in
+`ssh` that runs the remote command here and forwards by linking: `~/.ssh/config`
+aliases and includes, the ssh arguments, `agent start`'s answers, attaching
+through the master and again after it is killed, a refused login and a
+missing `agent` reported and backed off, an older daemon replaced through the
+host's own `agent shutdown`, one app process per host, and a window on a host
+never starting a local daemon. The page tests cover saved state keyed by
+store, a host window's home and what it leaves out, and the Hosts list.
 `cargo test --workspace` includes the silent-listener readiness deadline,
 fork workspace parity between durable records, live events, and replay, and
 the app's policy errors for oversized and unreadable AGENTS.md files.

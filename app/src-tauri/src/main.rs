@@ -4,10 +4,15 @@
 //! events, and relays requests. Beside that it reads the files the app owns
 //! (projects, profiles, swarms) and makes a swarm's shared worktree; run
 //! with `--swarm-post` it is a swarm's post tool (see `swarm`).
+//!
+//! Each window attaches to one daemon: this machine's, or a host's reached
+//! over SSH (see `remote`). A window on a host never reads or writes this
+//! machine's files on the host's behalf; what would is refused by name.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod daemon;
 mod project;
+mod remote;
 mod session;
 mod settings;
 mod swarm;
@@ -16,18 +21,51 @@ mod worktree;
 use agent_client::Client;
 use serde_json::{Map, Value, json};
 use session::SessionSlot;
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, atomic::AtomicU64},
+};
 use tauri::{Manager, State};
 use tokio::sync::Mutex;
 
-struct Config {
-    socket: PathBuf,
-    /// The store the socket was derived from; a daemon is started only for
-    /// a store, never behind an explicit socket.
-    store: Option<PathBuf>,
-    workspace: String,
+/// The daemon a window attaches to.
+enum Target {
+    /// This machine's, on `socket`. `store` is the store the socket was
+    /// derived from; a daemon is started only for a store, never behind an
+    /// explicit socket.
+    Local {
+        socket: PathBuf,
+        store: Option<PathBuf>,
+    },
+    /// A host's, reached over SSH; the host's own `agent` starts it.
+    Host(Arc<remote::Host>),
 }
 
+struct Config {
+    target: Target,
+    /// The folder new agents start in: here, a canonical local directory;
+    /// on a host, a path there, or none until the host says its home.
+    workspace: Option<String>,
+}
+
+/// Every window's state, by its label, and the SSH connections they share.
+struct Windows {
+    open: std::sync::Mutex<HashMap<String, Arc<Shared>>>,
+    hosts: remote::Hosts,
+    /// The `agent` packaged beside the app, which starts a missing daemon.
+    agent: Option<PathBuf>,
+    next: AtomicU64,
+}
+
+impl Windows {
+    fn of(&self, window: &tauri::WebviewWindow) -> Result<Arc<Shared>, String> {
+        (self.open.lock().unwrap().get(window.label()).cloned())
+            .ok_or_else(|| format!("window_unknown: {}", window.label()))
+    }
+}
+
+/// One window's attachment.
 struct Shared {
     config: Config,
     client: Mutex<Option<Arc<Client>>>,
@@ -44,6 +82,48 @@ struct Shared {
     store: std::sync::Mutex<Option<String>>,
 }
 
+impl Shared {
+    fn new(config: Config, agent: Option<PathBuf>) -> Self {
+        Self {
+            config,
+            client: Mutex::new(None),
+            agent,
+            starts: Mutex::new(daemon::Starts::default()),
+            session: AtomicU64::new(0),
+            events: Mutex::new(SessionSlot::default()),
+            store: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn host(&self) -> Option<&remote::Host> {
+        match &self.config.target {
+            Target::Host(host) => Some(host),
+            Target::Local { .. } => None,
+        }
+    }
+
+    /// Refuse, by name, what would read or write this machine's files for
+    /// a window whose agents run on a host: those files are the host's.
+    fn here(&self, what: &str) -> Result<(), String> {
+        match self.host() {
+            Some(host) => Err(format!(
+                "remote_unsupported: {what} reads files, and this window's agents run on {}; reading them there is not built yet",
+                host.alias
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// The folder new agents start in, once known.
+    async fn workspace(&self) -> Option<String> {
+        match (&self.config.workspace, self.host()) {
+            (Some(workspace), _) => Some(workspace.clone()),
+            (None, Some(host)) => host.home().await,
+            (None, None) => None,
+        }
+    }
+}
+
 /// Notifications handed to the page per pull. Small enough that the page
 /// applies a batch and asks again before the transport's queue matters.
 const PULL: usize = 256;
@@ -51,10 +131,11 @@ const PULL: usize = 256;
 /// Socket selection matches the CLI: --socket, then AGENT_SOCKET, then the
 /// daemon's rendezvous for --store, AGENT_STORE, or ~/.agent/state.sqlite,
 /// resolved by the shared client crate so a deep store path finds the same
-/// short socket the daemon listens on.
-fn config() -> Result<Config, String> {
+/// short socket the daemon listens on. `--host ALIAS` instead attaches to
+/// the daemon on that SSH host, and `--workspace` is then a path there.
+fn config(hosts: &remote::Hosts) -> Result<Config, String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (mut socket, mut store, mut workspace) = (None, None, None);
+    let (mut socket, mut store, mut workspace, mut host) = (None, None, None, None);
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         let (flag, inline) = match arg.split_once('=') {
@@ -76,8 +157,18 @@ fn config() -> Result<Config, String> {
             "--socket" => socket = Some(PathBuf::from(value()?)),
             "--store" => store = Some(PathBuf::from(value()?)),
             "--workspace" => workspace = Some(value()?),
+            "--host" => host = Some(value()?),
             other => return Err(format!("unknown argument {other}")),
         }
+    }
+    if let Some(host) = host {
+        if socket.is_some() || store.is_some() {
+            return Err("--host names its daemon; it takes no --socket or --store".into());
+        }
+        return Ok(Config {
+            target: Target::Host(hosts.acquire(&host)?),
+            workspace: workspace.map(|dir| remote_path(&dir)).transpose()?,
+        });
     }
     let (socket, store) = match socket {
         Some(socket) => (socket, None),
@@ -105,10 +196,20 @@ fn config() -> Result<Config, String> {
         ),
     })?;
     Ok(Config {
-        socket,
-        store,
-        workspace,
+        target: Target::Local { socket, store },
+        workspace: Some(workspace),
     })
+}
+
+/// A folder on a host: the daemon there checks that it exists, so only its
+/// form is checked here, and nothing on this machine is looked at.
+fn remote_path(dir: &str) -> Result<String, String> {
+    if !dir.starts_with('/') {
+        return Err(format!(
+            "--workspace {dir}: a folder on a host is an absolute path"
+        ));
+    }
+    Ok(dir.to_owned())
 }
 
 /// The launching directory, except the root a window opened from the Dock or
@@ -182,12 +283,22 @@ const TOOLS: [&str; 6] = ["shell", "read", "write", "edit", "wait", "history"];
 /// What the page needs to create bots and to say where it is. There is no
 /// default model: each project and agent is given its own.
 #[tauri::command]
-fn setup(state: State<'_, Shared>) -> Result<Value, String> {
+fn setup(windows: State<'_, Windows>, window: tauri::WebviewWindow) -> Result<Value, String> {
+    let state = windows.of(&window)?;
+    let (socket, managed) = match &state.config.target {
+        Target::Local { socket, store } => (
+            Some(socket.to_string_lossy().into_owned()),
+            state.agent.is_some() && store.is_some(),
+        ),
+        // A host's daemon is started, and replaced, by the host's own agent.
+        Target::Host(_) => (None, true),
+    };
     Ok(json!({
-        "socket": state.config.socket.to_string_lossy(),
+        "socket": socket,
+        "host": state.host().map(|host| &host.alias),
         "workspace": state.config.workspace,
-        // Whether this window starts the daemon for its store, and so may replace it.
-        "managed": state.agent.is_some() && state.config.store.is_some(),
+        // Whether this window starts the daemon it attaches to, and so may replace it.
+        "managed": managed,
         "tools": TOOLS,
     }))
 }
@@ -197,13 +308,16 @@ fn setup(state: State<'_, Shared>) -> Result<Value, String> {
 /// AGENTS.md files, skills and profiles, and the role `profile` names.
 #[tauri::command]
 fn policy(
-    state: State<'_, Shared>,
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
     workspace: Option<String>,
     profile: Option<String>,
 ) -> Result<Value, String> {
-    let dir = match workspace {
+    let state = windows.of(&window)?;
+    state.here("Composing an agent's instructions (AGENTS.md, skills, profiles)")?;
+    let dir = match workspace.or_else(|| state.config.workspace.clone()) {
         Some(dir) => workspace_path(std::path::Path::new(&dir))?,
-        None => state.config.workspace.clone(),
+        None => return Err("no workspace".into()),
     };
     compose(std::path::Path::new(&dir), profile.as_deref(), None)
 }
@@ -212,7 +326,12 @@ fn policy(
 /// what each says it is and the model it names: the folder's and the
 /// user's, not the roles the app gives a coordinator and a swarm's agents.
 #[tauri::command]
-fn profiles(dir: String) -> Result<Value, String> {
+fn profiles(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    dir: String,
+) -> Result<Value, String> {
+    windows.of(&window)?.here("Listing a folder's profiles")?;
     let dir = workspace_path(std::path::Path::new(&dir))?;
     let failed = |error: agent_client::policy::Failure| format!("{}: {error}", error.code());
     let workspace = std::path::Path::new(&dir);
@@ -275,7 +394,12 @@ fn own_role(home: &std::path::Path, name: &str) -> Result<PathBuf, String> {
 /// Open your file for one of the app's roles in your text editor, made
 /// from the app's text first when you have none.
 #[tauri::command]
-async fn edit_role(name: String) -> Result<String, String> {
+async fn edit_role(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    name: String,
+) -> Result<String, String> {
+    windows.of(&window)?.here("Your roles (~/.agents/agents)")?;
     let home = std::env::var_os("HOME").ok_or("no HOME for ~/.agents")?;
     let path = own_role(std::path::Path::new(&home), &name)?;
     let mut open = if cfg!(target_os = "macos") {
@@ -299,7 +423,8 @@ async fn edit_role(name: String) -> Result<String, String> {
 
 /// Which of the app's roles you have your own file for.
 #[tauri::command]
-fn roles() -> Value {
+fn roles(windows: State<'_, Windows>, window: tauri::WebviewWindow) -> Result<Value, String> {
+    windows.of(&window)?.here("Your roles (~/.agents/agents)")?;
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let own = |name: &str| {
         home.as_ref()
@@ -307,18 +432,25 @@ fn roles() -> Value {
             .filter(|p| p.is_file())
             .map(|p| p.to_string_lossy().into_owned())
     };
-    Value::Array(
+    Ok(Value::Array(
         BUILT_IN
             .iter()
             .map(|(name, _)| json!({"name": name, "file": own(name)}))
             .collect(),
-    )
+    ))
 }
 
 /// The project in a folder: its `.agents/project.toml`, or the defaults a
 /// new project there would take.
 #[tauri::command]
-fn project(dir: String) -> Result<Value, String> {
+fn project(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    dir: String,
+) -> Result<Value, String> {
+    windows
+        .of(&window)?
+        .here("A project's .agents/project.toml")?;
     project::read(std::path::Path::new(&workspace_path(
         std::path::Path::new(&dir),
     )?))
@@ -326,7 +458,16 @@ fn project(dir: String) -> Result<Value, String> {
 
 /// Write a new project's `.agents/project.toml`; an existing one is kept.
 #[tauri::command]
-fn write_project(dir: String, name: String, model: String) -> Result<(), String> {
+fn write_project(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    dir: String,
+    name: String,
+    model: String,
+) -> Result<(), String> {
+    windows
+        .of(&window)?
+        .here("A project's .agents/project.toml")?;
     project::write(
         std::path::Path::new(&workspace_path(std::path::Path::new(&dir))?),
         &name,
@@ -339,12 +480,20 @@ fn write_project(dir: String, name: String, model: String) -> Result<(), String>
 /// The branch a bot's folder has checked out when it is a linked git
 /// worktree; read from files, no git run.
 #[tauri::command]
-fn branch(dir: String) -> Option<String> {
-    worktree::linked_branch(std::path::Path::new(&dir))
+fn branch(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    dir: String,
+) -> Result<Option<String>, String> {
+    windows.of(&window)?.here("A folder's git branch")?;
+    Ok(worktree::linked_branch(std::path::Path::new(&dir)))
 }
 
 #[tauri::command]
-fn models() -> Result<Value, String> {
+fn models(windows: State<'_, Windows>, window: tauri::WebviewWindow) -> Result<Value, String> {
+    windows
+        .of(&window)?
+        .here("The model list (~/.agent/models)")?;
     let path = agent_client::models::path().ok_or("no HOME for ~/.agent/models")?;
     let models = agent_client::models::read(&path)
         .map_err(|error| format!("{}: {}", error.code, error.detail.unwrap_or_default()))?;
@@ -355,12 +504,19 @@ fn models() -> Result<Value, String> {
 /// region and profile, and which keys are set (never their values), and
 /// whether this window can restart its daemon to apply a change.
 #[tauri::command]
-async fn settings(state: State<'_, Shared>) -> Result<Value, String> {
-    // A daemon this window did not start runs its own settings: the page asks
-    // it for its providers, and this machine's shell is not read at all.
-    if state.agent.is_none() || state.config.store.is_none() {
+async fn settings(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+) -> Result<Value, String> {
+    let state = windows.of(&window)?;
+    // A daemon this window did not start, or one on a host, runs its own
+    // settings: the page asks it for its providers, and this machine's shell
+    // is not read at all.
+    if !matches!(state.config.target, Target::Local { store: Some(_), .. }) || state.agent.is_none()
+    {
         return Ok(
-            json!({"providers": [], "region": null, "profile": null, "keys": [], "restartable": false}),
+            json!({"providers": [], "region": null, "profile": null, "keys": [], "restartable": false,
+                "host": state.host().map(|host| &host.alias)}),
         );
     }
     let file = match daemon::env_file() {
@@ -384,7 +540,14 @@ async fn settings(state: State<'_, Shared>) -> Result<Value, String> {
 /// Set or remove settings in `~/.agent/env`; they reach the daemon when it
 /// restarts.
 #[tauri::command]
-fn save_settings(changes: serde_json::Map<String, Value>) -> Result<(), String> {
+fn save_settings(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    changes: serde_json::Map<String, Value>,
+) -> Result<(), String> {
+    windows
+        .of(&window)?
+        .here("Provider settings (~/.agent/env)")?;
     let path = daemon::env_file().ok_or("no HOME for ~/.agent/env")?;
     // An unreadable or unsafe file is reported, never replaced.
     daemon::read_env_file(&path)?;
@@ -407,9 +570,25 @@ fn save_settings(changes: serde_json::Map<String, Value>) -> Result<(), String> 
 /// Stop the store's daemon so the next attach starts one with the current
 /// settings. Only a daemon this app would start can be restarted.
 #[tauri::command]
-async fn restart_daemon(state: State<'_, Shared>) -> Result<(), String> {
-    let (Some(agent), Some(store)) = (&state.agent, &state.config.store) else {
-        return Err("restart_unavailable: this window did not start its daemon".into());
+async fn restart_daemon(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    let state = windows.of(&window)?;
+    let (
+        Some(agent),
+        Target::Local {
+            store: Some(store), ..
+        },
+    ) = (&state.agent, &state.config.target)
+    else {
+        return Err(match state.host() {
+            Some(host) => format!(
+                "restart_unavailable: this window's daemon runs on {} with the providers its login shell there exports",
+                host.alias
+            ),
+            None => "restart_unavailable: this window did not start its daemon".into(),
+        });
     };
     if let Some(old) = state.client.lock().await.take() {
         old.close().await;
@@ -423,7 +602,12 @@ async fn restart_daemon(state: State<'_, Shared>) -> Result<(), String> {
 /// from it. A provider that fails keeps its lines from the last list, and a
 /// list with no model at all is not written. Answers per provider.
 #[tauri::command]
-async fn discover_models(state: State<'_, Shared>) -> Result<Value, String> {
+async fn discover_models(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+) -> Result<Value, String> {
+    let state = windows.of(&window)?;
+    state.here("The model list (~/.agent/models)")?;
     let client = state.client.lock().await.clone().ok_or("detached")?;
     let listing = client
         .request("provider_models", json!({}))
@@ -623,29 +807,18 @@ mod policy_tests {
 /// snapshot itself through `request` while it pulls the replay, so nothing
 /// is staged here: the transport's bounded queue is the only buffer.
 #[tauri::command]
-async fn attach(state: State<'_, Shared>, after: i64) -> Result<Value, String> {
+async fn attach(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    after: i64,
+) -> Result<Value, String> {
+    let state = windows.of(&window)?;
     // Let the previous session go first: its socket closes, its reader ends,
     // and a pull still waiting on it comes back closed.
     if let Some(old) = state.client.lock().await.take() {
         old.close().await;
     }
-    let (client, events) = match Client::connect(&state.config.socket).await {
-        Ok(connected) => connected,
-        // Nothing listens: start the daemon for the store, then connect.
-        Err(error) if error.code == "daemon_unavailable" => {
-            let (Some(agent), Some(store)) = (&state.agent, &state.config.store) else {
-                return Err(error.to_string());
-            };
-            state.starts.lock().await.start(agent, store).await?;
-            Client::connect(&state.config.socket)
-                .await
-                .map_err(|e| e.to_string())?
-        }
-        Err(error) if error.code == "daemon_protocol_mismatch" => {
-            return Err(daemon::age(&error));
-        }
-        Err(error) => return Err(error.to_string()),
-    };
+    let (client, events) = connect(&state).await?;
     let session = state
         .session
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -654,21 +827,73 @@ async fn attach(state: State<'_, Shared>, after: i64) -> Result<Value, String> {
         .request("follow", json!({"bot": "*", "after": after}))
         .await
         .map_err(|e| e.to_string())?;
-    *state.store.lock().unwrap() = client.store().map(str::to_owned);
+    let store = client.store().map(str::to_owned);
+    *state.store.lock().unwrap() = store.clone();
     *state.client.lock().await = Some(client);
     state.events.lock().await.replace(session, events);
-    Ok(json!({"session": session}))
+    // The store names the page's saved state; a window on a host learns its
+    // folder from the host.
+    Ok(json!({"session": session, "store": store, "workspace": state.workspace().await}))
+}
+
+/// Connect to the window's daemon. This machine's is started for its store
+/// when nothing answers; a host's is reached over its SSH connection, whose
+/// forward is tried first, and started there by the host's own agent. A
+/// window on a host never starts a daemon here.
+async fn connect(state: &Shared) -> Result<(Arc<Client>, agent_client::Events), String> {
+    let refused = |error: agent_client::Error| match error.code.as_str() {
+        "daemon_protocol_mismatch" => daemon::age(&error),
+        _ => error.to_string(),
+    };
+    match &state.config.target {
+        Target::Local { socket, store } => match Client::connect(socket).await {
+            Ok(connected) => Ok(connected),
+            // Nothing listens: start the daemon for the store, then connect.
+            Err(error) if error.code == "daemon_unavailable" => {
+                let (Some(agent), Some(store)) = (&state.agent, store) else {
+                    return Err(error.to_string());
+                };
+                state.starts.lock().await.start(agent, store).await?;
+                Client::connect(socket).await.map_err(|e| e.to_string())
+            }
+            Err(error) => Err(refused(error)),
+        },
+        Target::Host(host) => {
+            if let Some(socket) = host.reached().await {
+                match Client::connect(&socket).await {
+                    Ok(connected) => return Ok(connected),
+                    Err(error) if error.code == "daemon_protocol_mismatch" => {
+                        return Err(refused(error));
+                    }
+                    // The daemon there, or the link, went away: reach it again.
+                    Err(_) => {}
+                }
+            }
+            let socket = host.connect().await?;
+            Client::connect(&socket).await.map_err(refused)
+        }
+    }
 }
 
 /// An older daemon owns the store's socket, as after an upgrade: stop it so
 /// the next attach starts the one this app carries. Only for a store this
 /// app starts daemons for; a daemon it was pointed at is its owner's.
 #[tauri::command]
-async fn replace_daemon(state: State<'_, Shared>) -> Result<(), String> {
-    if state.agent.is_none() || state.config.store.is_none() {
-        return Err("daemon_not_ours: this window was given a daemon's socket; stop that daemon with its own agent".into());
+async fn replace_daemon(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    let state = windows.of(&window)?;
+    match &state.config.target {
+        // The host's own `agent shutdown`; the next attach runs its `agent start`.
+        Target::Host(host) => host.replace().await?,
+        Target::Local { socket, store } => {
+            if state.agent.is_none() || store.is_none() {
+                return Err("daemon_not_ours: this window was given a daemon's socket; stop that daemon with its own agent".into());
+            }
+            daemon::replace_older(socket).await?;
+        }
     }
-    daemon::replace_older(&state.config.socket).await?;
     state.starts.lock().await.forget();
     Ok(())
 }
@@ -678,7 +903,12 @@ async fn replace_daemon(state: State<'_, Shared>) -> Result<(), String> {
 /// has applied them, so the pipeline from the daemon to the screen is
 /// bounded end to end. `closed` is the daemon gone, or the session let go.
 #[tauri::command]
-async fn pull(state: State<'_, Shared>, session: u64) -> Result<Value, String> {
+async fn pull(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    session: u64,
+) -> Result<Value, String> {
+    let state = windows.of(&window)?;
     let closed = json!({"events": [], "closed": true});
     let taken = state.events.lock().await.take(session);
     let Some(mut events) = taken else {
@@ -705,12 +935,20 @@ async fn pull(state: State<'_, Shared>, session: u64) -> Result<Value, String> {
 /// Every swarm in `~/.agent/swarms`, and the folders there that are not
 /// readable swarms.
 #[tauri::command]
-fn swarms(state: State<'_, Shared>) -> Result<Value, String> {
-    swarm::list(&swarms_of(&state)?)
+fn swarms(windows: State<'_, Windows>, window: tauri::WebviewWindow) -> Result<Value, String> {
+    swarm::list(&swarms_of(&*windows.of(&window)?)?)
 }
 
-/// The swarms of the store this window's daemon runs.
+/// The swarms of the store this window's daemon runs. A swarm lives on one
+/// machine, this one: its board is in this machine's files and its agents'
+/// scripts run this app.
 fn swarms_of(state: &Shared) -> Result<PathBuf, String> {
+    if let Some(host) = state.host() {
+        return Err(format!(
+            "remote_unsupported: swarms run on this machine only, and this window's agents run on {}; open a local window for swarms",
+            host.alias
+        ));
+    }
     let store = state.store.lock().unwrap().clone();
     swarm::root(&store.ok_or("detached: swarms are read once the window is attached")?)
 }
@@ -731,7 +969,8 @@ async fn blocking<T: Send + 'static>(
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn swarm_start(
-    state: State<'_, Shared>,
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
     project: String,
     folder: String,
     goal: String,
@@ -741,6 +980,8 @@ async fn swarm_start(
     budget_tokens: u64,
     council: usize,
 ) -> Result<Value, String> {
+    let state = windows.of(&window)?;
+    let root = swarms_of(&state)?;
     let client = state.client.lock().await.clone().ok_or("detached")?;
     let mix = (mix.iter())
         .map(swarm::Mix::from_json)
@@ -757,39 +998,54 @@ async fn swarm_start(
         council,
     };
     let app = std::env::current_exe().map_err(|e| e.to_string())?;
-    swarm::start(&client, &swarms_of(&state)?, &app, start).await
+    swarm::start(&client, &root, &app, start).await
 }
 
 /// One more agent, from `row` of the swarm's mix.
 #[tauri::command]
-async fn swarm_add(state: State<'_, Shared>, swarm: String, row: usize) -> Result<Value, String> {
+async fn swarm_add(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    swarm: String,
+    row: usize,
+) -> Result<Value, String> {
+    let state = windows.of(&window)?;
     let client = state.client.lock().await.clone().ok_or("detached")?;
     swarm::add(&client, &swarms_of(&state)?, &swarm, row).await
 }
 
 #[tauri::command]
 async fn swarm_leave(
-    state: State<'_, Shared>,
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
     swarm: String,
     member: String,
 ) -> Result<Value, String> {
+    let state = windows.of(&window)?;
     let root = swarms_of(&state)?;
     let client = state.client.lock().await.clone().ok_or("detached")?;
     swarm::leave(&client, &root, &swarm, &member).await
 }
 
 #[tauri::command]
-async fn swarm_stop(state: State<'_, Shared>, swarm: String) -> Result<Value, String> {
+async fn swarm_stop(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    swarm: String,
+) -> Result<Value, String> {
+    let state = windows.of(&window)?;
     let client = state.client.lock().await.clone().ok_or("detached")?;
     swarm::stop(&client, &swarms_of(&state)?, &swarm).await
 }
 
 #[tauri::command]
 async fn swarm_board(
-    state: State<'_, Shared>,
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
     swarm: String,
     offset: Option<u64>,
 ) -> Result<Value, String> {
+    let state = windows.of(&window)?;
     let root = swarms_of(&state)?;
     // It may wait on the board's lock to settle a change a crash cut short.
     blocking(move || swarm::board(&root, &swarm, offset)).await
@@ -798,10 +1054,12 @@ async fn swarm_board(
 /// Your post, over the window's own connection.
 #[tauri::command]
 async fn swarm_post(
-    state: State<'_, Shared>,
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
     swarm: String,
     text: String,
 ) -> Result<Value, String> {
+    let state = windows.of(&window)?;
     let client = state.client.lock().await.clone().ok_or("detached")?;
     let act = swarm::Act::Post { text, all: true };
     swarm::act(&client, &swarms_of(&state)?, &swarm, None, act).await
@@ -810,7 +1068,12 @@ async fn swarm_post(
 /// Tell the swarm's working agents when it has passed a share of its
 /// budget, once each; the page asks as its agents finish turns.
 #[tauri::command]
-async fn swarm_check(state: State<'_, Shared>, swarm: String) -> Result<Value, String> {
+async fn swarm_check(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    swarm: String,
+) -> Result<Value, String> {
+    let state = windows.of(&window)?;
     let client = state.client.lock().await.clone().ok_or("detached")?;
     swarm::act(
         &client,
@@ -825,12 +1088,14 @@ async fn swarm_check(state: State<'_, Shared>, swarm: String) -> Result<Value, S
 /// You approve or deny an open proposal, which decides it.
 #[tauri::command]
 async fn swarm_decide(
-    state: State<'_, Shared>,
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
     swarm: String,
     id: String,
     approve: bool,
     reason: String,
 ) -> Result<Value, String> {
+    let state = windows.of(&window)?;
     let client = state.client.lock().await.clone().ok_or("detached")?;
     let act = swarm::Act::Vote {
         id,
@@ -848,7 +1113,13 @@ fn log(message: String) {
 
 /// Any protocol op, relayed as is. The page decides what to ask for.
 #[tauri::command]
-async fn request(state: State<'_, Shared>, op: String, params: Value) -> Result<Value, String> {
+async fn request(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    op: String,
+    params: Value,
+) -> Result<Value, String> {
+    let state = windows.of(&window)?;
     let client = state.client.lock().await.clone().ok_or("detached")?;
     client.request(&op, params).await.map_err(|e| e.to_string())
 }
@@ -868,25 +1139,31 @@ fn main() {
             eprintln!("agent-app: {error}");
         }
     }
-    let config = match config() {
+    let links = remote::Hosts::new(
+        std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent/hosts")),
+        PathBuf::from("ssh"),
+    );
+    let config = match config(&links) {
         Ok(config) => config,
         Err(message) => {
             eprintln!("agent-app: {message}");
             std::process::exit(2);
         }
     };
-    tauri::Builder::default()
-        .manage(Shared {
-            config,
-            client: Mutex::new(None),
-            agent: daemon::bundled(),
-            starts: Mutex::new(daemon::Starts::default()),
-            session: std::sync::atomic::AtomicU64::new(0),
-            events: Mutex::new(SessionSlot::default()),
-            store: std::sync::Mutex::new(None),
+    let title = state_title(&config);
+    let agent = daemon::bundled();
+    let first = Arc::new(Shared::new(config, agent.clone()));
+    let app = tauri::Builder::default()
+        .manage(Windows {
+            open: std::sync::Mutex::new(HashMap::from([("main".to_owned(), first)])),
+            hosts: links,
+            agent,
+            next: AtomicU64::new(1),
         })
         .invoke_handler(tauri::generate_handler![
             setup,
+            hosts,
+            open_host,
             replace_daemon,
             policy,
             profiles,
@@ -914,10 +1191,159 @@ fn main() {
             swarm_check,
             swarm_decide
         ])
-        .setup(|app| {
-            let _ = app.get_webview_window("main");
+        .setup(move |app| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_title(&title);
+            }
             Ok(())
         })
-        .run(tauri::generate_context!())
+        // A closed window detaches; the last window on a host closes its
+        // SSH connection. The daemons keep running.
+        .on_window_event(|window, event| {
+            if !matches!(event, tauri::WindowEvent::Destroyed) {
+                return;
+            }
+            let app = window.app_handle().clone();
+            let gone = (app.state::<Windows>().open.lock().unwrap()).remove(window.label());
+            let Some(state) = gone else { return };
+            tauri::async_runtime::spawn(async move {
+                if let Some(client) = state.client.lock().await.take() {
+                    client.close().await;
+                }
+                if let Target::Host(host) = &state.config.target {
+                    app.state::<Windows>().hosts.release(host).await;
+                }
+            });
+        })
+        .build(tauri::generate_context!())
         .expect("agent-app: window failed");
+    app.run(|app, event| {
+        if let tauri::RunEvent::Exit = event {
+            tauri::async_runtime::block_on(app.state::<Windows>().hosts.close_all());
+        }
+    });
+}
+
+/// A window's title names the host its agents run on.
+fn state_title(config: &Config) -> String {
+    match &config.target {
+        Target::Host(host) => format!("Agent · {}", host.alias),
+        Target::Local { .. } => "Agent".into(),
+    }
+}
+
+/// The hosts a window can be opened on: the concrete aliases in
+/// `~/.ssh/config` and what OpenSSH says each connects to.
+#[tauri::command]
+async fn hosts(windows: State<'_, Windows>) -> Result<Value, String> {
+    let home = PathBuf::from(std::env::var_os("HOME").ok_or("no HOME for ~/.ssh/config")?);
+    let aliases = remote::aliases(&home.join(".ssh/config"), &home);
+    let mut asked = tokio::task::JoinSet::new();
+    // Each `ssh -G` is a few milliseconds; a long list names the rest only.
+    for (at, alias) in aliases.iter().take(64).enumerate() {
+        let (ssh, alias) = (windows.hosts.ssh().to_owned(), alias.clone());
+        asked.spawn(async move { (at, remote::resolve(&ssh, &alias).await) });
+    }
+    let mut resolved = vec![Value::Null; aliases.len()];
+    while let Some(Ok((at, answer))) = asked.join_next().await {
+        resolved[at] = answer.unwrap_or(Value::Null);
+    }
+    Ok(aliases
+        .iter()
+        .zip(resolved)
+        .map(|(alias, to)| json!({"alias": alias, "to": to}))
+        .collect())
+}
+
+/// Open a window whose agents run on `host`. Every window on a host shares
+/// its one SSH connection.
+#[tauri::command]
+async fn open_host(
+    app: tauri::AppHandle,
+    windows: State<'_, Windows>,
+    host: String,
+) -> Result<(), String> {
+    let link = windows.hosts.acquire(&host)?;
+    let label = format!(
+        "w{}",
+        windows
+            .next
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let config = Config {
+        target: Target::Host(link.clone()),
+        workspace: None,
+    };
+    let title = state_title(&config);
+    let state = Arc::new(Shared::new(config, windows.agent.clone()));
+    windows.open.lock().unwrap().insert(label.clone(), state);
+    let url = tauri::WebviewUrl::App("index.html".into());
+    let built = tauri::WebviewWindowBuilder::new(&app, &label, url)
+        .title(title)
+        .inner_size(1100.0, 760.0)
+        .min_inner_size(640.0, 420.0)
+        .build();
+    if let Err(error) = built {
+        windows.open.lock().unwrap().remove(&label);
+        windows.hosts.release(&link).await;
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod host_tests {
+    use super::*;
+    use remote::shim::{Shim, daemon, ready, script};
+
+    /// A window on a host reaches the daemon there and never starts one
+    /// here, whether the host answers or not.
+    #[tokio::test]
+    async fn a_window_on_a_host_attaches_there_and_never_starts_a_local_daemon() {
+        let shim = Shim::new("window-host");
+        let local = shim.root.join("local-agent");
+        let started = shim.root.join("local-started");
+        script(
+            &local,
+            &format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\nexit 1\n",
+                started.display()
+            ),
+        );
+        let hosts = shim.hosts();
+        let window = Shared::new(
+            Config {
+                target: Target::Host(hosts.acquire("box").unwrap()),
+                workspace: None,
+            },
+            Some(local),
+        );
+        // No agent on the host: the reason names the fix, and nothing runs here.
+        let missing = connect(&window).await.err().unwrap();
+        assert!(missing.starts_with("agent_missing: box"), "{missing}");
+        assert!(
+            window
+                .here("A project's .agents/project.toml")
+                .unwrap_err()
+                .starts_with("remote_unsupported: ")
+        );
+        assert!(
+            swarms_of(&window)
+                .unwrap_err()
+                .contains("open a local window for swarms")
+        );
+        let socket = shim.remote.join("daemon.sock");
+        daemon(&socket, "s1");
+        shim.agent(&ready(&socket, agent_client::PROTOCOL), 0);
+        // Past the missing agent's backoff, the host answers.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let (client, _events) = connect(&window).await.unwrap();
+        assert_eq!(client.store(), Some("s1"));
+        assert_eq!(window.workspace().await.as_deref(), shim.remote.to_str());
+        // The forward is tried before the host is asked again.
+        connect(&window).await.unwrap();
+        assert_eq!(shim.count("agent start"), 1);
+        assert!(!started.exists(), "a local daemon was started for a host");
+        hosts.close_all().await;
+    }
 }

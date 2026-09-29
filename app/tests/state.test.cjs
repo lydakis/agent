@@ -598,7 +598,7 @@ test('completed Responses and Anthropic thoughts retain observed thinking durati
 });
 
 // ---------- the app shell: projects, panes, composers, menus, runs ----------
-const shell = (daemon = {}, storage = null) => { const p = page(daemon, storage); p.setRender(() => {}); p.S.session = 1; p.S.config = { workspace: '/synthetic', model: 'alpha/one', tools: [] }; return p; };
+const shell = (daemon = {}, storage = null) => { const p = page(daemon, storage); p.setRender(() => {}); p.S.session = 1; p.S.store = 'store-1'; p.S.config = { workspace: '/synthetic', model: 'alpha/one', tools: [] }; return p; };
 // A window whose renders move drafts, as the real render does.
 const drafting = (daemon = {}) => { const p = shell(daemon); p.setRender(() => p.followDrafts()); return p; };
 const names = (rows) => Array.from(rows, (r) => r.label ?? r.b.name);
@@ -1863,4 +1863,70 @@ test('an older daemon on the socket is replaced from the detached screen; a newe
   p.lost('daemon_protocol_mismatch: the daemon speaks protocol "4", this client 4');
   assert.doesNotMatch(screen.innerHTML, /replace-daemon|update the app/);
   assert.match(screen.innerHTML, /· retrying/);
+});
+
+test('what a window remembers belongs to its store, so two hosts, or a host and this machine, never share it', () => {
+  const storage = new Map();
+  const p = shell({}, storage);
+  p.upsert({ name: 'lead', id: 1, provider: 'alpha', model: 'one' });
+  p.S.selected = 'lead'; p.S.ui.rail = false; p.save();
+  const other = shell({}, storage); other.S.store = 'store-2';
+  other.upsert({ name: 'lead', id: 1, provider: 'alpha', model: 'one' });
+  other.restore();
+  assert.equal(other.S.ui.rail, true, 'another store with the same folder starts fresh');
+  const same = shell({}, storage);
+  same.upsert({ name: 'lead', id: 1, provider: 'alpha', model: 'one' });
+  same.restore();
+  assert.equal(same.S.ui.rail, false);
+  // Before a daemon has said which store it is, nothing is saved.
+  const unknown = shell({}, storage); unknown.S.store = null; unknown.S.ui.rail = false;
+  const before = storage.size; unknown.save();
+  assert.equal(storage.size, before);
+});
+
+test('a window on a host takes the home the host names and leaves out what reads this machine', async () => {
+  const calls = [];
+  const p = page({
+    setup: async () => ({ socket: null, host: 'box', workspace: null, managed: true, tools: [] }),
+    attach: async () => ({ session: 1, store: 'store-box', workspace: '/home/someone' }),
+    pull: () => new Promise(() => {}),
+    request: async (op) => (op === 'bots' ? { bots: [{ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', workspace: '/home/someone/app', status: 'idle' }] } : {}),
+    swarms: async () => { calls.push('swarms'); return { swarms: [], broken: [] }; },
+    branch: async () => { calls.push('branch'); return null; },
+    settings: async () => ({ providers: [], keys: [], restartable: false, host: 'box' }),
+    models: async () => { throw new Error('remote_unsupported: The model list (~/.agent/models) reads files, and this window\'s agents run on box; reading them there is not built yet'); },
+  });
+  p.setRender(() => {});
+  await p.attach(); await settle();
+  assert.equal(p.S.attached, true);
+  assert.equal(p.S.store, 'store-box');
+  assert.equal(p.S.config.workspace, '/home/someone');
+  p.renderHead(p.context.document.getElementById('title'), p.S.bots.get('app.lead'), 'main'); await settle();
+  assert.deepEqual(calls, [], 'no swarm or branch is read from this machine for a host');
+  const swarm = p.botMenuItems('app.lead').find((i) => i.act === 'new-swarm');
+  assert.equal(swarm.disabled, true);
+  await p.openSetup(); await settle();
+  const html = p.setupHTML();
+  assert.match(html, /runs on box, with the providers its login shell there exports/);
+  assert.match(html, /remote_unsupported: The model list/);
+  assert.doesNotMatch(html, /Roles/);
+  assert.doesNotMatch(html, /Add a provider/);
+  p.lost('agent_missing: box has no agent on its login shell\'s PATH');
+  assert.match(p.elements.get('detached').innerHTML, /daemon on <span class="k">box<\/span>/);
+});
+
+test('Settings lists the hosts in the ssh config and opens a window on one', async () => {
+  const opened = [];
+  const p = shell({
+    settings: async () => ({ providers: [], keys: [], restartable: true }),
+    models: async () => [],
+    hosts: async () => [{ alias: 'box', to: { user: 'someone', hostname: 'box.example', port: '2200' } }, { alias: 'build', to: null }],
+    openHost: async (host) => { opened.push(host); },
+  });
+  await p.openSetup(); await settle();
+  const html = p.setupHTML();
+  assert.match(html, /<span class="pn">box<\/span><span class="st dim">someone@box\.example:2200<\/span>/);
+  assert.match(html, /data-act="open-host" data-v="build"/);
+  await p.act({ dataset: { act: 'open-host', v: 'box' } });
+  assert.deepEqual(opened, ['box']);
 });

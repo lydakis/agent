@@ -29,6 +29,8 @@ window.Daemon = (() => {
       profiles: (dir) => invoke('profiles', { dir }),
       roles: () => invoke('roles'),
       editRole: (name) => invoke('edit_role', { name }),
+      hosts: () => invoke('hosts'),
+      openHost: (host) => invoke('open_host', { host }),
       swarmStart: ({ project, folder, goal, shared, mix, agents, budgetTokens, council }) => invoke('swarm_start', { project, folder, goal, shared, mix, agents, budgetTokens, council: council ?? 0 }),
       swarmAdd: (swarm, row) => invoke('swarm_add', { swarm, row }),
       swarmLeave: (swarm, member) => invoke('swarm_leave', { swarm, member }),
@@ -361,7 +363,9 @@ window.Daemon = (() => {
   }
 
   const api = {
-    setup: async () => ({ socket: 'demo', workspace: '/workspace', tools: ['shell', 'read', 'write', 'edit', 'wait', 'history'] }),
+    setup: async () => ({ socket: 'demo', host: null, workspace: '/workspace', tools: ['shell', 'read', 'write', 'edit', 'wait', 'history'] }),
+    hosts: async () => [{ alias: 'box', to: { user: 'you', hostname: 'box.example', port: '22' } }],
+    openHost: async () => { throw new Error('demo mode opens no windows'); },
     settings: async () => ({ providers: specs(), region: ENV.AWS_REGION ?? null, profile: ENV.AWS_PROFILE ?? null, keys: ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'AWS_BEARER_TOKEN_BEDROCK'].filter((k) => ENV[k]) }),
     saveSettings: async (changes) => { for (const [k, v] of Object.entries(changes)) { if (v) ENV[k] = v; else delete ENV[k]; } },
     restartDaemon: async () => { await wait(400); },
@@ -440,7 +444,7 @@ window.Daemon = (() => {
         setTimeout(() => reply('demo.lead', 'ship the login fix; split the work and wait for it'), 900);
       }
       setTimeout(() => emit({ event: 'follow_live', durable: false, cursor: S.cursor }), 0);
-      return { session: ++S.session };
+      return { session: ++S.session, store: 'demo', workspace: '/workspace' };
     },
     pull: async () => {
       if (!S.queue.length) await new Promise((resolve) => { S.waiter = resolve; });
