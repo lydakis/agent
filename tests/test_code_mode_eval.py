@@ -217,7 +217,8 @@ class Arms(unittest.TestCase):
         # The script, and the shell command it ran from inside it.
         self.assertEqual(len(through['commands']), 2)
         self.assertTrue(any(c.startswith('[functions.exec]') for c in through['commands']), through['commands'])
-        self.assertTrue(any('bash' in c and 'mcpx shop get_product --sku=P17' in c for c in through['commands']))
+        self.assertTrue(any(not c.startswith('[functions.exec]') and 'mcpx shop get_product --sku=P17' in c
+                            for c in through['commands']))  # wrapped in the user's login shell, bash or zsh
 
 
 if __name__ == '__main__':
