@@ -639,7 +639,7 @@ async fn attach(state: State<'_, Shared>, after: i64) -> Result<Value, String> {
             let (Some(agent), Some(store)) = (&state.agent, &state.config.store) else {
                 return Err(error.to_string());
             };
-            state.starts.lock().await.start(agent, store).await?;
+            state.starts.lock().await.start(agent, store, None).await?;
             Client::connect(&state.config.socket)
                 .await
                 .map_err(|e| e.to_string())?

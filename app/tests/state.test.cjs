@@ -1861,7 +1861,7 @@ test('a coordinator hears once, when it rests, of turns its tasks ended that it 
   assert.equal(sent.length, 1, 'one message for the whole batch');
   assert.equal(sent[0].bot, 'demo.lead'); assert.equal(sent[0].bot_id, 1); assert.equal(sent[0].delivery, 'queue');
   assert.match(sent[0].prompt, /^Task updates: /);
-  assert.match(sent[0].prompt, /\n- demo\.build: turn:demo\.build\/2 completed, turn:demo\.build\/4 completed\n- demo\.test: turn:demo\.test\/1 failed$/);
+  assert.match(sent[0].prompt, /\n- demo\.build: turn:demo\.build\/4 completed, and 1 earlier since turn:demo\.build\/2\n- demo\.test: turn:demo\.test\/1 failed$/);
   // Within the window, while it works: nothing until its turn ends and the window allows.
   p.S.bots.get('demo.lead').status = 'running';
   await turn('demo.test', 2);
@@ -1897,5 +1897,32 @@ test('a coordinator wake that fails is kept for the next one, and replayed turns
   await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 3, data: { status: 'completed' } });
   await p.tick();
   assert.equal(sent.length, 1);
-  assert.match(sent[0].prompt, /turn:demo\.build\/2 completed, turn:demo\.build\/3 completed$/);
+  assert.match(sent[0].prompt, /turn:demo\.build\/3 completed, and 1 earlier since turn:demo\.build\/2$/);
+});
+
+test('a coordinator\'s backlog stays small however much its tasks do, and what one message leaves out comes next', async () => {
+  const sent = [];
+  const p = page({ request: async (op, params) => { if (op === 'submit') sent.push(params); return {}; }, log() {} });
+  p.S.live = true; p.S.attached = true;
+  p.upsert({ name: 'demo.lead', id: 1, status: 'running' });
+  for (let i = 0; i < 40; i++) p.upsert({ name: `demo.t${i}`, id: 10 + i, status: 'idle', created_by: 'demo.lead', created_by_id: 1 });
+  // A long coordinator turn: every task ends many turns meanwhile.
+  for (let n = 1; n <= 50; n++) for (let i = 0; i < 40; i++) await p.onEvent({ event: 'turn_finished', bot: `demo.t${i}`, turn: n, data: { status: 'completed' } });
+  const w = p.S.wakes.get('demo.lead');
+  assert.equal(w.tasks.size, 40);
+  assert.deepEqual({ ...w.tasks.get('demo.t0') }, { first: 1, turn: 50, status: 'completed', count: 50 });
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.lead', turn: 2, data: { status: 'completed' } });
+  await p.tick();
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].prompt.split('\n').length, 1 + 32 + 1);
+  assert.match(sent[0].prompt, /\n- demo\.t0: turn:demo\.t0\/50 completed, and 49 earlier since turn:demo\.t0\/1\n/);
+  assert.match(sent[0].prompt, /\n- 8 more tasks in the next update$/);
+  assert.equal(w.tasks.size, 8);
+  // Its next rest brings the rest.
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.lead', turn: 3, data: { status: 'completed' } });
+  await p.tick();
+  assert.equal(sent.length, 2);
+  assert.match(sent[1].prompt, /\n- demo\.t32: turn:demo\.t32\/50 completed/);
+  assert.doesNotMatch(sent[1].prompt, /more tasks/);
+  assert.equal(w.tasks.size, 0);
 });

@@ -852,15 +852,20 @@ function enqueue(job) { chain = chain.then(job, job); return chain; }
 // ended turns since it last heard, by the handles its wait tool reads them with, and its role says what
 // to do with that. The turns it asked for itself are not news, so it never wakes itself; nor is its own
 // fork or side chat. Only live turns count, while this window is attached.
-const WAKE_MS = 10 * 60 * 1000, WAKE_TASKS = 32, WAKE_TURNS = 8;
+// Each task keeps its first and latest turn and a count, whatever the backlog; one message names at most
+// WAKE_TASKS tasks, and the rest wait for the next.
+const WAKE_MS = 10 * 60 * 1000, WAKE_TASKS = 32;
 function tellLead(name, turn, status, from) {
   const b = bot(name), lead = b && creatorOf(b);
   if (!lead || !leadProject(lead.name) || from === lead.name || name.startsWith(`${lead.name}-`)) return;
   let w = S.wakes.get(lead.name);
   if (!w) { w = { tasks: new Map(), last: 0, timer: null }; S.wakes.set(lead.name, w); }
-  if (!w.tasks.has(name)) w.tasks.set(name, []);
-  w.tasks.get(name).push({ turn, status });
+  merge(w.tasks, name, { first: turn, turn, status, count: 1 });
   wakeSoon(lead.name);
+}
+function merge(tasks, name, t) {
+  const had = tasks.get(name);
+  tasks.set(name, had ? { ...(t.turn >= had.turn ? t : had), first: Math.min(had.first, t.first), count: had.count + t.count } : t);
 }
 function wakeSoon(lead) {
   const w = S.wakes.get(lead);
@@ -871,23 +876,22 @@ function wakeSoon(lead) {
 async function wake(lead) {
   const w = S.wakes.get(lead), l = bot(lead);
   if (!w || !w.tasks.size || !S.attached || !l || l.id == null || isActive(l.status)) return;
-  const tasks = w.tasks;
-  w.tasks = new Map(); w.last = Date.now();
-  try { await Daemon.request('submit', { bot: lead, bot_id: l.id, request_id: `app-wake-${crypto.randomUUID()}`, prompt: wakeText(tasks), delivery: 'queue' }); }
+  const sent = [...w.tasks].slice(0, WAKE_TASKS);
+  for (const [name] of sent) w.tasks.delete(name);
+  w.last = Date.now();
+  try { await Daemon.request('submit', { bot: lead, bot_id: l.id, request_id: `app-wake-${crypto.randomUUID()}`, prompt: wakeText(sent, w.tasks.size), delivery: 'queue' }); }
   catch (e) {
     if (/^bot_not_found/.test(e?.message ?? '')) { S.wakes.delete(lead); return; }
-    for (const [name, turns] of w.tasks) { if (tasks.has(name)) tasks.get(name).push(...turns); else tasks.set(name, turns); }
-    w.tasks = tasks;
+    const later = w.tasks;
+    w.tasks = new Map(sent);
+    for (const [name, t] of later) merge(w.tasks, name, t);
     Daemon.log?.(`wake ${lead}: ${e?.message ?? e}`);
     wakeSoon(lead);
   }
 }
-function wakeText(tasks) {
-  const lines = [...tasks].slice(0, WAKE_TASKS).map(([name, turns]) => {
-    const shown = turns.slice(-WAKE_TURNS).map((t) => `turn:${name}/${t.turn} ${t.status}`).join(', ');
-    return `- ${name}: ${turns.length > WAKE_TURNS ? `${turns.length - WAKE_TURNS} earlier turns, then ` : ''}${shown}`;
-  });
-  if (tasks.size > WAKE_TASKS) lines.push(`- and ${tasks.size - WAKE_TASKS} more tasks`);
+function wakeText(tasks, more) {
+  const lines = tasks.map(([name, t]) => `- ${name}: turn:${name}/${t.turn} ${t.status}${t.count > 1 ? `, and ${t.count - 1} earlier since turn:${name}/${t.first}` : ''}`);
+  if (more) lines.push(`- ${more} more tasks in the next update`);
   return `Task updates: since you last heard, tasks you started ended turns someone else asked for. The wait tool reads each one's final reply by its handle.\n${lines.join('\n')}`;
 }
 
@@ -2149,13 +2153,14 @@ function rolesHTML(st, busy) {
 }
 // Agents wake at set times from schedules they or their coordinator made; the Mac keeps the time.
 // Each shows who it wakes, when, what its last time did, and the message it sends.
+// A schedule that ended on its own without delivering stays listed, saying why, until it is removed.
 const LAST = { sent: 'sent', skipped: 'skipped, it was working', gone: 'its agent is gone', failed: 'failed' };
 function schedulesHTML(st, busy) {
   const at = (ms) => new Date(ms).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-  const last = (l) => l ? `last ${at(l.fired_ms)}: ${LAST[l.outcome] ?? l.outcome}${l.outcome === 'failed' && l.detail ? ` (${String(l.detail).slice(0, 120)})` : ''}` : 'not run yet';
-  const rows = (st.schedules ?? []).map((x) => `<div class="prow"><span class="pn">${esc(x.bot)}</span><span class="st">${esc(x.when)}</span><span class="acts"><button type="button" class="sbtn" data-act="schedule-remove" data-v="${esc(x.name)}"${busy}>Remove</button></span><div class="sub dim">${esc(last(x.last))}${x.name !== x.bot ? ` · ${esc(x.name)}` : ''}</div><div class="sub dim">${esc(x.message.length > 240 ? `${x.message.slice(0, 240)}…` : x.message)}</div></div>`).join('');
+  const last = (l, ended) => l ? `${ended ? 'ended' : 'last'} ${at(l.fired_ms)}: ${LAST[l.outcome] ?? l.outcome}${l.outcome === 'failed' && l.detail ? ` (${String(l.detail).slice(0, 120)})` : ''}` : 'not run yet';
+  const rows = (st.schedules ?? []).map((x) => `<div class="prow"><span class="pn">${esc(x.bot)}</span><span class="st${x.ended ? ' bad' : ''}">${x.ended ? 'not delivered' : esc(x.when)}</span><span class="acts"><button type="button" class="sbtn" data-act="schedule-remove" data-v="${esc(x.name)}"${busy}>Remove</button></span><div class="sub dim">${esc(last(x.last, x.ended))}${x.name !== x.bot ? ` · ${esc(x.name)}` : ''}</div><div class="sub dim">${esc(x.message.length > 240 ? `${x.message.slice(0, 240)}…` : x.message)}</div></div>`).join('');
   const none = st.schedulesError ? `<p class="bad">${esc(st.schedulesError)}</p>` : rows ? '' : '<p class="dim">None yet. Ask a coordinator, for example "have build check its PR every 30 minutes".</p>';
-  return `<section><h3>Schedules</h3>${rows}${none}<p class="dim">Each time, the agent gets its message in its own chat, unless it is working then. They run with the app closed; a time the Mac slept through runs once when it wakes.</p></section>`;
+  return `<section><h3>Schedules</h3>${rows}${none}<p class="dim">Each time, the agent gets its message in its own chat. A repeating one skips a time its agent is working; a one-off waits for it. They run with the app closed; a time the Mac slept through runs once when it wakes.</p></section>`;
 }
 async function removeSchedule(name) {
   const st = setupState();

@@ -69,6 +69,7 @@ pub fn launchctl(what: Launchd) -> Result<(), String> {
         return Err("schedules_unsupported: schedules use launchd, which only macOS has".into());
     }
     let domain = format!("gui/{}", unsafe { libc::getuid() });
+    let unloading = matches!(what, Launchd::Unload(_));
     let args = match what {
         Launchd::Load(path) => vec![
             "bootstrap".into(),
@@ -85,42 +86,62 @@ pub fn launchctl(what: Launchd) -> Result<(), String> {
     if out.status.success() {
         return Ok(());
     }
+    // bootout's ESRCH and "no such service": nothing by that label is loaded.
+    let missing = unloading && matches!(out.status.code(), Some(3 | 113));
     Err(format!(
-        "launchctl {}: {}",
+        "{}launchctl {}: {}",
+        if missing { NOT_LOADED } else { "" },
         args[0],
         String::from_utf8_lossy(&out.stderr).trim()
     ))
 }
 
-/// Which daemon a schedule reaches: the store's, which a fire may start,
-/// or a socket it was given, which it never starts.
+/// How a loader says the label it was asked to unload is not loaded.
+const NOT_LOADED: &str = "not_loaded: ";
+
+/// Unload a label; one launchd does not have is already unloaded.
+fn unload(label: &str, launchd: Loader) -> Result<(), String> {
+    match launchd(Launchd::Unload(label)) {
+        Err(error) if !error.starts_with(NOT_LOADED) => Err(error),
+        _ => Ok(()),
+    }
+}
+
+/// Which daemon a schedule reaches: its store, which a fire may start the
+/// daemon of, and the socket that daemon listens on, when it was given one.
+/// A socket without its store is reached but never started.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Daemon {
-    Store(PathBuf),
-    Socket(PathBuf),
+pub struct Daemon {
+    pub store: Option<PathBuf>,
+    pub socket: Option<PathBuf>,
 }
 
 impl Daemon {
     /// The daemon of the shell the schedule is made from, found as the CLI
-    /// finds it.
+    /// finds it. An agent's shell has both its daemon's store and socket.
     fn current() -> Result<Self, String> {
-        if let Some(socket) = std::env::var_os("AGENT_SOCKET") {
-            return Ok(Self::Socket(socket.into()));
-        }
-        std::env::var_os("AGENT_STORE")
+        let socket = std::env::var_os("AGENT_SOCKET").map(PathBuf::from);
+        let store = std::env::var_os("AGENT_STORE")
             .map(PathBuf::from)
             .or_else(|| {
-                std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".agent/state.sqlite"))
-            })
-            .map(Self::Store)
-            .ok_or_else(|| "no AGENT_STORE or HOME to find the daemon".into())
+                socket
+                    .is_none()
+                    .then(|| std::env::var_os("HOME"))
+                    .flatten()
+                    .map(|h| PathBuf::from(h).join(".agent/state.sqlite"))
+            });
+        if store.is_none() && socket.is_none() {
+            return Err("no AGENT_STORE or HOME to find the daemon".into());
+        }
+        Ok(Self { store, socket })
     }
     fn socket(&self) -> Result<PathBuf, String> {
-        match self {
-            Self::Socket(socket) => Ok(socket.clone()),
-            Self::Store(store) => {
+        match (&self.socket, &self.store) {
+            (Some(socket), _) => Ok(socket.clone()),
+            (None, Some(store)) => {
                 agent_client::socket::default_socket(store).map_err(|e| e.to_string())
             }
+            (None, None) => Err("no --store or --socket".into()),
         }
     }
 }
@@ -156,11 +177,11 @@ impl Schedule {
         if let Some(at) = self.at {
             args.extend(["--at".into(), at.to_string()]);
         }
-        match &self.daemon {
-            Daemon::Store(store) => args.extend(["--store".into(), store.to_string_lossy().into()]),
-            Daemon::Socket(socket) => {
-                args.extend(["--socket".into(), socket.to_string_lossy().into()])
-            }
+        if let Some(store) = &self.daemon.store {
+            args.extend(["--store".into(), store.to_string_lossy().into()]);
+        }
+        if let Some(socket) = &self.daemon.socket {
+            args.extend(["--socket".into(), socket.to_string_lossy().into()]);
         }
         args.extend(["--".into(), self.message.clone()]);
         args
@@ -169,8 +190,11 @@ impl Schedule {
     /// Read back from a fire's arguments, after the flag.
     fn parse(args: &[String]) -> Result<Self, String> {
         let bad = |what: &str| format!("invalid_schedule: {what}");
-        let (mut name, mut bot, mut id, mut when, mut at, mut daemon) =
-            (None, None, None, None, None, None);
+        let (mut name, mut bot, mut id, mut when, mut at) = (None, None, None, None, None);
+        let mut daemon = Daemon {
+            store: None,
+            socket: None,
+        };
         let mut iter = args.iter();
         let message = loop {
             let Some(flag) = iter.next() else {
@@ -188,8 +212,8 @@ impl Schedule {
                 "--bot-id" => id = value.parse().ok(),
                 "--when" => when = Some(value.clone()),
                 "--at" => at = Some(value.parse().map_err(|_| bad("--at"))?),
-                "--store" => daemon = Some(Daemon::Store(value.into())),
-                "--socket" => daemon = Some(Daemon::Socket(value.into())),
+                "--store" => daemon.store = Some(value.into()),
+                "--socket" => daemon.socket = Some(value.into()),
                 other => return Err(bad(other)),
             }
         };
@@ -199,7 +223,9 @@ impl Schedule {
             bot_id: id.ok_or_else(|| bad("no --bot-id"))?,
             when: when.ok_or_else(|| bad("no --when"))?,
             at,
-            daemon: daemon.ok_or_else(|| bad("no --store or --socket"))?,
+            daemon: (daemon.store.is_some() || daemon.socket.is_some())
+                .then_some(daemon)
+                .ok_or_else(|| bad("no --store or --socket"))?,
             message,
         })
     }
@@ -581,18 +607,40 @@ fn read_all(places: &Places) -> Vec<(Schedule, PathBuf)> {
     out
 }
 
+/// Every schedule, then every one that ended on its own without delivering
+/// its message, until it is removed.
 pub fn list(places: &Places) -> Value {
-    Value::Array(
-        read_all(places)
-            .into_iter()
-            .map(|(s, _)| {
-                let last = std::fs::read_to_string(places.last(&s.name))
-                    .ok()
-                    .and_then(|t| serde_json::from_str(&t).ok());
-                s.json(last)
-            })
-            .collect(),
-    )
+    let read = |path: &Path| -> Option<Value> {
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+    };
+    let schedules = read_all(places);
+    let mut rows: Vec<Value> = schedules
+        .iter()
+        .map(|(s, _)| {
+            let last = read(&places.last(&s.name)).map(|row| row["last"].clone());
+            let mut row = s.json(last);
+            row["ended"] = json!(false);
+            row
+        })
+        .collect();
+    let mut ended: Vec<Value> = std::fs::read_dir(&places.state)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let file = e.file_name().into_string().ok()?;
+            let name = file.strip_suffix(".json")?;
+            if valid_name(name).is_err() || schedules.iter().any(|(s, _)| s.name == name) {
+                return None;
+            }
+            let mut row = read(&e.path()).filter(|row| row["name"] == name)?;
+            row["ended"] = json!(true);
+            Some(row)
+        })
+        .collect();
+    ended.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    rows.extend(ended);
+    Value::Array(rows)
 }
 
 /// Write a file whole beside its place, then rename it there.
@@ -608,7 +656,9 @@ fn replace(path: &Path, text: &str) -> Result<(), String> {
         let mut file = std::fs::File::create(&temporary)?;
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
-        std::fs::rename(&temporary, path)
+        std::fs::rename(&temporary, path)?;
+        // The new name is durable only once its folder is.
+        std::fs::File::open(dir)?.sync_all()
     })();
     if written.is_err() {
         let _ = std::fs::remove_file(&temporary);
@@ -629,6 +679,7 @@ fn valid_name(name: &str) -> Result<(), String> {
 }
 
 /// Write the schedule's plist and load it, replacing one of the same name.
+/// A replacement that fails puts the old one back as it was.
 pub fn install(
     places: &Places,
     app: &Path,
@@ -640,27 +691,58 @@ pub fn install(
     valid_name(&schedule.name)?;
     let path = places.plist(&schedule.name);
     let label = format!("{LABEL}{}", schedule.name);
-    let _ = launchd(Launchd::Unload(&label));
-    replace(&path, &plist(app, schedule, when, environment))?;
-    if let Err(error) = launchd(Launchd::Load(&path)) {
-        let _ = std::fs::remove_file(&path);
+    let old = std::fs::read_to_string(&path).ok();
+    unload(&label, launchd)?;
+    let loaded = replace(&path, &plist(app, schedule, when, environment))
+        .and_then(|()| launchd(Launchd::Load(&path)));
+    if let Err(error) = loaded {
+        match old {
+            Some(old) => {
+                if replace(&path, &old).is_ok() {
+                    let _ = launchd(Launchd::Load(&path));
+                }
+            }
+            None => {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
         return Err(error);
+    }
+    // A new schedule has no last time; an ended one's record is not it.
+    if old.is_none() {
+        let _ = std::fs::remove_file(places.last(&schedule.name));
     }
     Ok(())
 }
 
-/// Remove a schedule: its plist, launchd's copy and its last result.
+/// Remove a schedule: launchd's copy, then its plist and last result. An
+/// unload launchd refuses keeps the plist, so the removal can be retried.
+/// An ended schedule is only its last result, which goes.
 pub fn remove(places: &Places, name: &str, launchd: Loader) -> Result<(), String> {
     valid_name(name)?;
     let path = places.plist(name);
+    let last = places.last(name);
     if !path.exists() {
-        return Err(format!("schedule_not_found: {name}"));
+        return match std::fs::remove_file(&last) {
+            Ok(()) => Ok(()),
+            Err(_) => Err(format!("schedule_not_found: {name}")),
+        };
     }
+    unload(&format!("{LABEL}{name}"), launchd)?;
     std::fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let _ = std::fs::remove_file(places.last(name));
-    // Last: a schedule removing itself as it fires is ended by this.
-    let _ = launchd(Launchd::Unload(&format!("{LABEL}{name}")));
+    let _ = std::fs::remove_file(last);
     Ok(())
+}
+
+/// A firing schedule ends itself: its plist first, then launchd's copy,
+/// whose unload ends this process. `keep` leaves its last result, so an
+/// end nobody asked for still shows, and why.
+fn end(places: &Places, name: &str, keep: bool, launchd: Loader) {
+    let _ = std::fs::remove_file(places.plist(name));
+    if !keep {
+        let _ = std::fs::remove_file(places.last(name));
+    }
+    let _ = launchd(Launchd::Unload(&format!("{LABEL}{name}")));
 }
 
 /// The app moves when it is updated, so it writes its path into every
@@ -840,21 +922,30 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
 }
 
 /// What a fire did, kept for the app to show.
-fn record_last(places: &Places, name: &str, outcome: &Value) {
+/// It is the schedule's whole row, which Settings still shows once the
+/// schedule has ended on its own.
+fn record_last(places: &Places, schedule: &Schedule, outcome: &Value) {
     let mut outcome = outcome.clone();
     outcome["fired_ms"] = json!(now() * 1000);
-    let _ = replace(&places.last(name), &outcome.to_string());
+    let row = schedule.json(Some(outcome));
+    let _ = replace(&places.last(&schedule.name), &row.to_string());
 }
 
 /// Send the message: a new turn when the bot is resting; a working bot, or
-/// one with work waiting, skips this time. A deleted bot's schedule goes.
+/// one with work waiting, skips this time of a repeating schedule, and gets
+/// a one-off's message after its work. A deleted bot's schedule goes.
 pub async fn send(client: &Client, schedule: &Schedule) -> Value {
+    let delivery = if schedule.at.is_some() {
+        "queue"
+    } else {
+        "reject"
+    };
     let submitted = client
         .request(
             "submit",
             json!({"bot": schedule.bot, "bot_id": schedule.bot_id,
                 "request_id": format!("schedule-{}-{}-{}", schedule.name, now(), std::process::id()),
-                "prompt": schedule.message, "delivery": "reject"}),
+                "prompt": schedule.message, "delivery": delivery}),
         )
         .await;
     match submitted {
@@ -907,24 +998,25 @@ pub fn fire_cli(args: &[String]) -> i32 {
         }),
         Err(error) => json!({"outcome": "failed", "detail": error}),
     };
-    record_last(&places, &schedule.name, &outcome);
+    record_last(&places, &schedule, &outcome);
+    let sent = outcome["outcome"] == "sent";
     if schedule.at.is_some() || outcome["outcome"] == "gone" {
-        let _ = remove(&places, &schedule.name, &launchctl);
+        end(&places, &schedule.name, !sent, &launchctl);
     }
     0
 }
 
 /// The daemon, started the way the app starts one when none answers and
-/// the schedule names its store.
+/// the schedule names its store, on the socket the schedule was made with.
 async fn connect(socket: &Path, daemon: &Daemon) -> Result<std::sync::Arc<Client>, String> {
     match Client::connect(socket).await {
         Ok((client, _events)) => Ok(client),
         Err(error) if error.code == "daemon_unavailable" => {
-            let (Daemon::Store(store), Some(agent)) = (daemon, crate::daemon::bundled()) else {
+            let (Some(store), Some(agent)) = (&daemon.store, crate::daemon::bundled()) else {
                 return Err(error.to_string());
             };
             crate::daemon::Starts::default()
-                .start(&agent, store)
+                .start(&agent, store, daemon.socket.as_deref())
                 .await?;
             let (client, _events) = Client::connect(socket).await.map_err(|e| e.to_string())?;
             Ok(client)
@@ -1079,7 +1171,10 @@ mod tests {
             bot_id: 42,
             when: "every 30m".into(),
             at: None,
-            daemon: Daemon::Store("/Users/a/.agent/state.sqlite".into()),
+            daemon: Daemon {
+                store: Some("/Users/a/.agent/state.sqlite".into()),
+                socket: Some("/tmp/s".into()),
+            },
             message: "Check the PR's CI & reviews; <fix> what's \"red\".\nThen say so.".into(),
         }
     }
@@ -1105,7 +1200,10 @@ mod tests {
         assert_eq!(Schedule::parse(&args[2..]).unwrap(), s);
         let once = Schedule {
             at: Some(1_790_000_000),
-            daemon: Daemon::Socket("/tmp/s".into()),
+            daemon: Daemon {
+                store: None,
+                socket: Some("/tmp/s".into()),
+            },
             ..s
         };
         assert_eq!(Schedule::parse(&once.args()[1..]).unwrap(), once);
@@ -1143,7 +1241,7 @@ mod tests {
                 "load me.lydakis.agent.schedule.p.fix-login.plist",
             ]
         );
-        record_last(&places, &s.name, &json!({"outcome": "skipped"}));
+        record_last(&places, &s, &json!({"outcome": "skipped"}));
         let listed = list(&places);
         assert_eq!(listed.as_array().unwrap().len(), 1);
         assert_eq!(listed[0]["bot"], "p.fix-login");
@@ -1190,6 +1288,122 @@ mod tests {
             )
             .is_err()
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_failed_replace_or_unload_keeps_the_schedule_there_was() {
+        let root = std::env::temp_dir().join(format!("agent-app-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let places = Places {
+            agents: root.join("LaunchAgents"),
+            state: root.join("schedules"),
+        };
+        let fine = |_: Launchd| Ok(());
+        let app = Path::new("/A/agent-app");
+        let s = schedule();
+        let entries = every("1d", clock(2026, 9, 28, 9, 7)).unwrap().entries;
+        install(&places, app, &s, &entries, &[], &fine).unwrap();
+        let before = std::fs::read_to_string(places.plist(&s.name)).unwrap();
+        // launchd refuses the new one: the old one is written back and loaded.
+        let loads = RefCell::new(0);
+        let changed = Schedule {
+            message: "something else".into(),
+            ..schedule()
+        };
+        let refused = install(&places, app, &changed, &entries, &[], &|what| match what {
+            Launchd::Load(_) => {
+                *loads.borrow_mut() += 1;
+                if *loads.borrow() == 1 {
+                    Err("launchctl bootstrap: refused".into())
+                } else {
+                    Ok(())
+                }
+            }
+            Launchd::Unload(_) => Ok(()),
+        });
+        assert!(refused.is_err());
+        assert_eq!(*loads.borrow(), 2);
+        assert_eq!(
+            std::fs::read_to_string(places.plist(&s.name)).unwrap(),
+            before
+        );
+        // An old one launchd won't unload is not replaced at all.
+        let stuck = |what: Launchd| match what {
+            Launchd::Unload(_) => Err("launchctl bootout: busy".to_owned()),
+            Launchd::Load(_) => Ok(()),
+        };
+        assert!(install(&places, app, &changed, &entries, &[], &stuck).is_err());
+        assert_eq!(
+            std::fs::read_to_string(places.plist(&s.name)).unwrap(),
+            before
+        );
+        // Nor removed: the removal can be tried again.
+        assert!(
+            remove(&places, &s.name, &stuck)
+                .unwrap_err()
+                .contains("busy")
+        );
+        assert!(places.plist(&s.name).exists());
+        // A label launchd no longer has is already unloaded.
+        let gone = |what: Launchd| match what {
+            Launchd::Unload(_) => Err(format!("{NOT_LOADED}launchctl bootout: no such process")),
+            Launchd::Load(_) => Ok(()),
+        };
+        remove(&places, &s.name, &gone).unwrap();
+        assert!(!places.plist(&s.name).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_schedule_that_ends_undelivered_still_shows_until_removed() {
+        let root = std::env::temp_dir().join(format!("agent-app-ended-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let places = Places {
+            agents: root.join("LaunchAgents"),
+            state: root.join("schedules"),
+        };
+        let fine = |_: Launchd| Ok(());
+        let entries = every("1d", clock(2026, 9, 28, 9, 7)).unwrap().entries;
+        let once = Schedule {
+            at: Some(1_790_000_000),
+            ..schedule()
+        };
+        install(
+            &places,
+            Path::new("/A/agent-app"),
+            &once,
+            &entries,
+            &[],
+            &fine,
+        )
+        .unwrap();
+        record_last(
+            &places,
+            &once,
+            &json!({"outcome": "failed", "detail": "daemon_unavailable"}),
+        );
+        end(&places, &once.name, true, &fine);
+        let listed = list(&places);
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+        assert_eq!(listed[0]["ended"], true);
+        assert_eq!(listed[0]["message"], once.message);
+        assert_eq!(listed[0]["last"]["outcome"], "failed");
+        remove(&places, &once.name, &fine).unwrap();
+        assert_eq!(list(&places), json!([]));
+        // One that delivered leaves nothing.
+        install(
+            &places,
+            Path::new("/A/agent-app"),
+            &once,
+            &entries,
+            &[],
+            &fine,
+        )
+        .unwrap();
+        record_last(&places, &once, &json!({"outcome": "sent", "turn": 2}));
+        end(&places, &once.name, false, &fine);
+        assert_eq!(list(&places), json!([]));
         std::fs::remove_dir_all(root).unwrap();
     }
 

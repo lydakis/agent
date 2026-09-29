@@ -643,9 +643,13 @@ the bot is the coordinator's own fork or side chat (`PROJECT.lead-…`). A
 steer's turn is part of the turn it joined. Turns replayed on attach are
 history, not news. The coordinator is told only while it rests, at most
 once every ten minutes, in one message queued to it: `Task updates:`, then
-one line per task with each ended turn's handle and status (at most 32 tasks
-and the last 8 turns of each). The handles are what its `wait` tool reads a
-final reply by, so the message stays small however much was said. The
+one line per task with its latest ended turn's handle and status, and how
+many turns ended before it since which handle. The handles are what its
+`wait` tool reads a final reply by, so the message stays small however much
+was said. The page keeps only that per task (first and latest turn, a
+count), so a long coordinator turn or a failing daemon cannot grow it. One
+message names at most 32 tasks; the rest wait for the next, and it says how
+many. The
 [coordinator role](../app/agents/coordinator.md) says what to do with it:
 send another task only what it needs, with `agent run --detach --delivery
 queue`, which it reads at its next turn without being interrupted, and
@@ -680,18 +684,28 @@ name in use replaces it.
 
 Each is one LaunchAgent, `~/Library/LaunchAgents/me.lydakis.agent.schedule.NAME.plist`,
 and that file is its only record: its program arguments carry the bot, its
-id, the store (or an explicit socket), the one-off's time and the message.
-When it fires, the app's executable runs with `--schedule-fire` and those
-arguments. It connects to the daemon, starting one for the store as the app
-does, with the login shell's environment and `~/.agent/env` (never for an
-explicit socket), and submits the message with `delivery: reject`: a bot
-that is working, or has work waiting, skips that time rather than having it
-cut in or pile up. A bot deleted since, or a new bot under its name, is not
-reached (`bot_not_found`), and the schedule removes itself. A one-off's
-calendar entry has no year, so a fire more than two minutes before its time
-does nothing. What the fire did (`sent` with the turn, `skipped`, `gone` or
-`failed` with why) is kept in `~/.agent/schedules/NAME.json`, which Settings
-shows beside each schedule with its message and a Remove button. When the
+id, the store and the socket of the shell it was made from (an agent's shell
+has both), the one-off's time and the message. Replacing one unloads the old
+job first and, if the new plist cannot be written or loaded, writes the old
+one back and loads it; a removal launchd refuses keeps the plist, so it can
+be retried. When it fires, the app's executable runs with `--schedule-fire`
+and those arguments. It connects to the daemon, and when none answers and
+the store is known, starts one for it on that socket as the app does, with
+the login shell's environment and `~/.agent/env`. A repeating schedule
+submits with `delivery: reject`: a bot that is working, or has work
+waiting, skips that time rather than having it cut in or pile up. A one-off
+submits with `delivery: queue`, so a working bot gets it after its turn. A
+bot deleted since, or a new bot under its name, is not reached
+(`bot_not_found`), and the schedule ends. A one-off's calendar entry has no
+year, so a fire more than two minutes before its time does nothing. What
+the fire did (`sent` with the turn, `skipped`, `gone` or `failed` with why)
+is kept with the schedule's row in `~/.agent/schedules/NAME.json`, which
+Settings shows beside each schedule with its message and a Remove button. A
+one-off that delivered leaves nothing; one that ends without delivering
+(its agent gone, the daemon unreachable) loses its plist but keeps that
+file, so Settings and `ls` still list it, as not delivered and why, until
+it is removed. Those files are written, synced, renamed and their folder
+synced. When the
 app starts from a new place, as after an update, it writes its path into
 every schedule and loads it again. Only macOS has launchd; elsewhere `add`
 refuses with `schedules_unsupported`.
@@ -823,10 +837,13 @@ A task's runs rendered while it worked matched a full redraw of the same pane.
 
 On 2026-09-29 (Linux container) a schedule's fire ran against a real daemon
 in `tests/test_schedule.py`: it sent its message to its resting bot as a new
-turn, skipped the bot while a turn held it, never reached a bot made again
-under the same name, and did nothing a year early; `add` from an agent's
-shell was refused without launchd and left no plist. The plist, calendar
-expansion, replace, remove and the app's move are tested in
+turn, skipped the bot while a turn held it, gave a one-off to a working bot
+after its turn, started a stopped daemon on the socket the schedule was made
+with, ended with a visible row when its bot was made again under the same
+name, and did nothing a year early; `add` from an agent's shell was refused
+without launchd and left no plist. The plist, calendar expansion, replace
+(and restoring the old one when launchd refuses the new), remove (kept when
+launchd refuses the unload), ended rows and the app's move are tested in
 `app/src-tauri/src/schedule.rs` with launchd stood in for. The coordinator's
 task updates are tested in `app/tests/state.test.cjs` and were driven in demo
 mode in headless Chromium. Not verified: launchd itself, which needs a Mac.

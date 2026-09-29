@@ -39,12 +39,13 @@ class ScheduleFireTests(ModelFixture):
     def bot_id(self, bot):
         return next(b['id'] for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout) if b['name'] == bot)
 
-    def fire(self, name, bot, bot_id, message, at=None):
+    def fire(self, name, bot, bot_id, message, at=None, app=APP, socket=None, env=None):
         # What a schedule's plist has launchd run.
-        args = [str(APP), '--schedule-fire', '--name', name, '--bot', bot, '--bot-id', str(bot_id),
-                '--when', 'every 30m', *(['--at', str(at)] if at else []), '--store', str(self.store), '--', message]
-        env = {**clean_env(), 'HOME': str(self.home)}
-        result = subprocess.run(args, env=env, capture_output=True, text=True, timeout=30)
+        args = [str(app), '--schedule-fire', '--name', name, '--bot', bot, '--bot-id', str(bot_id),
+                '--when', 'every 30m', *(['--at', str(at)] if at else []), '--store', str(self.store),
+                *(['--socket', str(socket)] if socket else []), '--', message]
+        env = {**clean_env(), 'HOME': str(self.home), **(env or {})}
+        result = subprocess.run(args, env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
         last = self.home / '.agent/schedules' / f'{name}.json'
         return json.loads(last.read_text()) if last.exists() else None
@@ -56,7 +57,7 @@ class ScheduleFireTests(ModelFixture):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
         bot_id = self.bot_id('p.task')
         sent = self.fire('p.task', 'p.task', bot_id, 'Check the PR again.')
-        self.assertEqual(sent['outcome'], 'sent', sent)
+        self.assertEqual(sent['last']['outcome'], 'sent', sent)
         self.settle('p.task')
         self.assertEqual(self.turns('p.task')[-1]['prompt_preview'], 'Check the PR again.')
         # A working bot is not interrupted or queued behind: that time is skipped.
@@ -66,10 +67,48 @@ class ScheduleFireTests(ModelFixture):
         self.agent('run', '--store', str(self.store), '--bot', 'p.task', '--detach', 'gate')
         time.sleep(0.5)
         skipped = self.fire('p.task', 'p.task', bot_id, 'Check the PR again.')
-        self.assertEqual(skipped['outcome'], 'skipped', skipped)
+        self.assertEqual(skipped['last']['outcome'], 'skipped', skipped)
         self.model.release_headers.set()
         self.settle('p.task')
         self.assertEqual(len(self.turns('p.task')), 3)
+
+    def test_a_one_off_waits_for_a_working_bot_instead_of_skipping(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        bot_id = self.bot_id('p.task')
+        self.model.release_headers = threading.Event()
+        self.model.all_streaming = self.model.release_headers
+        self.addCleanup(self.model.release_headers.set)
+        self.agent('run', '--store', str(self.store), '--bot', 'p.task', '--detach', 'gate')
+        time.sleep(0.5)
+        # Delivered, it leaves no row behind.
+        self.assertIsNone(self.fire('p.task', 'p.task', bot_id, 'Look again.', at=int(time.time())))
+        self.model.release_headers.set()
+        self.settle('p.task')
+        self.assertEqual([t['prompt_preview'] for t in self.turns('p.task')][1:], ['gate', 'Look again.'])
+
+    def test_a_fire_starts_its_stopped_daemon_on_the_socket_it_was_made_with(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        bot_id = self.bot_id('p.task')
+        self.agent('shutdown', '--store', str(self.store))
+        # The app starts a daemon with the `agent` it ships beside it.
+        bundle = self.path / 'bundle'
+        bundle.mkdir()
+        app = bundle / 'agent-app'
+        try:
+            os.link(APP, app)
+        except OSError:
+            import shutil
+            shutil.copy2(APP, app)
+        (bundle / 'agent').symlink_to(self.binary)
+        socket = self.path / 'own.sock'
+        self.addCleanup(lambda: subprocess.run([str(self.binary), 'shutdown', '--store', str(self.store),
+                                                '--socket', str(socket)], env=clean_env(), capture_output=True, timeout=35))
+        sent = self.fire('p.task', 'p.task', bot_id, 'Morning check.', app=app, socket=socket,
+                         env={'AGENT_PROVIDER': f'openai=responses,{self.url}', 'SHELL': '/bin/sh'})
+        self.assertEqual(sent['last']['outcome'], 'sent', sent)
+        self.assertTrue(socket.exists())
+        turns = json.loads(self.agent('turns', '--store', str(self.store), '--socket', str(socket), '--bot', 'p.task').stdout)
+        self.assertEqual(turns[-1]['prompt_preview'], 'Morning check.')
 
     def test_a_fire_never_reaches_a_bot_made_again_under_the_name(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
@@ -77,7 +116,9 @@ class ScheduleFireTests(ModelFixture):
         self.agent('rm', '--store', str(self.store), '--bot', 'p.task')
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello again')
         gone = self.fire('p.task', 'p.task', old, 'Check the PR again.')
-        self.assertEqual(gone['outcome'], 'gone', gone)
+        self.assertEqual(gone['last']['outcome'], 'gone', gone)
+        # The schedule ended on its own, and says why until it is removed.
+        self.assertEqual(gone['message'], 'Check the PR again.')
         self.assertEqual(len(self.turns('p.task')), 1)
 
     def test_a_one_off_ignores_its_date_a_year_early(self):

@@ -396,10 +396,12 @@ window.Daemon = (() => {
     // The demo has no editor to open: Edit only says your copy is now the one read.
     roles: async () => [{ name: 'coordinator', file: S.ownRoles?.has('coordinator') ? '/home/you/.agents/agents/coordinator.md' : null }, { name: 'swarm', file: S.ownRoles?.has('swarm') ? '/home/you/.agents/agents/swarm.md' : null }],
     editRole: async (name) => { (S.ownRoles ??= new Set()).add(name); return `/home/you/.agents/agents/${name}.md`; },
-    // Two schedules a coordinator made: a task that checks its PR, and a one-off for itself.
+    // Schedules a coordinator made: a task that checks its PR, a one-off for itself, and one whose
+    // agent was deleted before its time came.
     schedules: async () => (S.schedules ??= [
       { name: 'demo.build', bot: 'demo.build', bot_id: 3, when: 'every 30m', once: false, message: "Check the login PR: fix a red CI run and answer new review comments. When it is merged, remove this schedule.", last: { outcome: 'sent', turn: 4, fired_ms: Date.now() - 12 * 60000 } },
       { name: 'demo.lead', bot: 'demo.lead', bot_id: 1, when: 'at 2026-09-30 09:07', once: true, message: 'Summarize what the tasks finished overnight.', last: null },
+      { name: 'demo.docs', bot: 'demo.docs', bot_id: 6, when: 'in 2h', once: true, ended: true, message: 'Check whether the docs preview deployed.', last: { outcome: 'gone', fired_ms: Date.now() - 95 * 60000 } },
     ]).map((x) => ({ ...x })),
     removeSchedule: async (name) => { S.schedules = (S.schedules ?? []).filter((x) => x.name !== name); },
     profiles: async () => [{ name: 'reviewer', summary: 'Reviews changes and reports bugs only', model: 'anthropic/claude-sonnet-5' }, { name: 'tester', summary: 'Keeps the test suite green', model: null }],
