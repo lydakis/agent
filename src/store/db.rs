@@ -987,7 +987,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 42;
+    pub const SCHEMA: i32 = 43;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1142,7 +1142,7 @@ impl Database {
                 retries INTEGER NOT NULL DEFAULT 0, paced_ms INTEGER NOT NULL DEFAULT 0,
                 delivery TEXT NOT NULL DEFAULT 'reject', expected_turn INTEGER,
                 cached_input_tokens INTEGER NOT NULL DEFAULT 0,
-                from_bot TEXT, from_turn INTEGER, from_id INTEGER, origin TEXT, reasoning TEXT,
+                from_bot TEXT, from_turn INTEGER, from_id INTEGER, origin TEXT, reasoning TEXT, inherited_reasoning TEXT,
                 UNIQUE(bot,request_id));
             CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
             CREATE INDEX IF NOT EXISTS turns_started ON turns(bot,id) WHERE started_ms IS NOT NULL;
@@ -3877,13 +3877,15 @@ impl Database {
         let tx = self.conn.savepoint()?;
         let mut head = bot.head;
         let mut steered = Vec::with_capacity(steers.len());
+        // Preserve the submitted effort for exact retries; only omitted effort
+        // needs a separate execution value when the running turn overrides it.
         for (steer, item, size) in steers {
             let id = node(&tx, head, &item)?;
             head = Some(id);
             if size >= PROMPT_SHARE_BYTES {
                 tx.execute("UPDATE turns SET status='steered',finished_ms=?1,prompt='',prompt_node=?2,
-                    (workspace,model,reasoning)=(SELECT COALESCE(s.workspace,t.workspace),COALESCE(s.model,t.model),
-                        COALESCE(s.reasoning,t.reasoning)
+                    (workspace,model,inherited_reasoning)=(SELECT COALESCE(s.workspace,t.workspace),COALESCE(s.model,t.model),
+                        CASE WHEN s.reasoning IS NULL THEN t.reasoning END
                         FROM turns s, turns t WHERE s.id=?4 AND t.id=?3) WHERE id=?4",
                     params![epoch_ms(), id, turn, steer])?;
             } else {
@@ -3891,8 +3893,8 @@ impl Database {
                 // ones it ran with.
                 tx.execute(
                     "UPDATE turns SET status='steered',finished_ms=?1,
-                        (workspace,model,reasoning)=(SELECT COALESCE(s.workspace,t.workspace),COALESCE(s.model,t.model),
-                            COALESCE(s.reasoning,t.reasoning)
+                        (workspace,model,inherited_reasoning)=(SELECT COALESCE(s.workspace,t.workspace),COALESCE(s.model,t.model),
+                            CASE WHEN s.reasoning IS NULL THEN t.reasoning END
                             FROM turns s, turns t WHERE s.id=?3 AND t.id=?2) WHERE id=?3",
                     params![epoch_ms(), turn, steer],
                 )?;
@@ -6313,7 +6315,7 @@ impl Database {
                     t.model_rounds,t.started_ms,t.finished_ms,
                     substr(CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END,1,200),
                     length(CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END),
-                    t.retries,t.paced_ms,t.delivery,t.cached_input_tokens,COALESCE(t.reasoning,b.reasoning)
+                    t.retries,t.paced_ms,t.delivery,t.cached_input_tokens,COALESCE(t.reasoning,t.inherited_reasoning,b.reasoning)
              FROM turns t JOIN bots b ON b.name=t.bot LEFT JOIN nodes n ON n.id=t.prompt_node
              WHERE t.bot=? AND t.id>? ORDER BY t.id LIMIT ?",
         )?;
@@ -7601,6 +7603,15 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         // 41 -> 42: a turn's own effort level. None was recorded before, so
         // every stored turn ran at its bot's.
         conn.execute_batch("ALTER TABLE turns ADD COLUMN reasoning TEXT;")?;
+    }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='inherited_reasoning')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 42 -> 43: keep absorbed effort separate from submitted options.
+        // Existing recorded levels stay intact; new steers preserve omissions.
+        conn.execute_batch("ALTER TABLE turns ADD COLUMN inherited_reasoning TEXT;")?;
     }
     Ok(())
 }

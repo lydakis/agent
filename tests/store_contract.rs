@@ -2233,6 +2233,95 @@ fn schema_41_turns_ran_at_their_bots_effort() {
 }
 
 #[test]
+fn schema_42_preserves_effort_and_new_steer_retries_survive_reopen() {
+    let path = std::env::temp_dir().join(format!(
+        "agent-inherited-effort-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create(
+            "Bob",
+            Some("/synthetic"),
+            Binding {
+                reasoning: Some("high"),
+                ..binding()
+            },
+        )
+        .unwrap();
+        let turn = db
+            .begin(
+                "Bob",
+                "run",
+                "work",
+                true,
+                &TurnOptions {
+                    reasoning: Some("low".into()),
+                    ..TurnOptions::default()
+                },
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        db.finish(turn, None).unwrap();
+    }
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE turns DROP COLUMN inherited_reasoning; PRAGMA user_version=42;")
+        .unwrap();
+    let options = TurnOptions {
+        delivery: Delivery::Steer,
+        ..TurnOptions::default()
+    };
+    let steer;
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        assert_eq!(
+            db.turns("Bob", 0, 10).unwrap()["turns"][0]["reasoning"],
+            "low"
+        );
+        let running = db
+            .begin(
+                "Bob",
+                "run2",
+                "work",
+                true,
+                &TurnOptions {
+                    reasoning: Some("low".into()),
+                    ..TurnOptions::default()
+                },
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        assert_eq!(
+            db.inspect("Bob").unwrap().reasoning.as_deref(),
+            Some("high")
+        );
+        steer = db
+            .begin("Bob", "steer", "join", true, &options, allow_provider)
+            .unwrap()
+            .turn;
+        db.absorb(running, None, 8 << 20, 4096, ContextUsage::default(), false)
+            .unwrap();
+        db.finish(running, None).unwrap();
+    }
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let retry = db
+        .begin("Bob", "steer", "join", true, &options, allow_provider)
+        .unwrap();
+    assert!(!retry.fresh);
+    assert_eq!(retry.turn, steer);
+    assert_eq!(
+        db.turns("Bob", 0, 10).unwrap()["turns"][2]["reasoning"],
+        "low"
+    );
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
     let mut db = db();
     let settings = Settings {
@@ -2700,6 +2789,85 @@ fn a_turn_runs_at_its_own_effort_or_its_bots() {
         .map(|t| &t["reasoning"])
         .collect();
     assert_eq!(levels, ["low", "low", "low", "xhigh", "high", "high"]);
+}
+
+#[test]
+fn absorbed_effort_does_not_change_the_submitted_request() {
+    for size in [4, 4096] {
+        for level in [None, Some("low")] {
+            let mut db = db();
+            db.create(
+                "Bob",
+                Some("/synthetic"),
+                Binding {
+                    reasoning: Some("high"),
+                    ..binding()
+                },
+            )
+            .unwrap();
+            let running = db
+                .begin(
+                    "Bob",
+                    "run",
+                    "work",
+                    true,
+                    &TurnOptions {
+                        reasoning: Some("low".into()),
+                        ..TurnOptions::default()
+                    },
+                    allow_provider,
+                )
+                .unwrap()
+                .turn;
+            let prompt = "x".repeat(size);
+            let options = TurnOptions {
+                reasoning: level.map(Into::into),
+                delivery: Delivery::Steer,
+                expected_turn: Some(running),
+                ..TurnOptions::default()
+            };
+            let steer = db
+                .begin("Bob", "steer", &prompt, true, &options, allow_provider)
+                .unwrap()
+                .turn;
+            assert!(
+                !db.begin("Bob", "steer", &prompt, true, &options, allow_provider)
+                    .unwrap()
+                    .fresh
+            );
+            let absorbed = db
+                .absorb(running, None, 8 << 20, 4096, ContextUsage::default(), false)
+                .unwrap();
+            assert_eq!(absorbed.outcomes.len(), 1);
+            db.finish(running, None).unwrap();
+            // Both the inline and shared-prompt paths report the effective effort,
+            // but retries still compare the original omission or explicit level.
+            assert_eq!(
+                db.turns("Bob", 0, 10).unwrap()["turns"][1]["reasoning"],
+                "low"
+            );
+            let retry = db
+                .begin("Bob", "steer", &prompt, true, &options, allow_provider)
+                .unwrap();
+            assert_eq!(retry.turn, steer);
+            assert!(!retry.fresh);
+            for changed in [None, Some("low"), Some("high")]
+                .into_iter()
+                .filter(|v| *v != level)
+            {
+                let other = TurnOptions {
+                    reasoning: changed.map(Into::into),
+                    ..options.clone()
+                };
+                assert_eq!(
+                    db.begin("Bob", "steer", &prompt, true, &other, allow_provider)
+                        .unwrap_err()
+                        .code,
+                    "idempotency_conflict"
+                );
+            }
+        }
+    }
 }
 
 #[test]
