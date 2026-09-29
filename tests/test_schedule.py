@@ -123,19 +123,19 @@ class ScheduleFireTests(ModelFixture):
 
     def test_a_one_off_ignores_its_date_a_year_early(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
-        early = self.fire('p.task', 'p.task', self.bot_id('p.task'), 'x', at=int(time.time()) + 3600)
+        early = self.fire('p.task', 'p.task', self.bot_id('p.task'), 'x', at=int(time.time()) + 10 * 86400)
         self.assertIsNone(early)
         self.assertEqual(len(self.turns('p.task')), 1)
 
     def test_add_from_an_agents_shell_needs_launchd(self):
         # Here there is no launchd: the schedule is refused and nothing is left behind.
+        if os.uname().sysname == 'Darwin':
+            self.skipTest('would add a real LaunchAgent on macOS')
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
         out = self.path / 'added.json'
         self.agent('run', '--store', str(self.store), '--bot', 'p.task',
                    f"shell:HOME='{self.home}' '{APP}' --schedule add --every 30m -- check > '{out}' 2>&1")
         text = out.read_text()
-        if os.uname().sysname == 'Darwin':
-            self.skipTest('adds a real LaunchAgent on macOS')
         self.assertIn('schedules_unsupported', text)
         self.assertEqual(list((self.home / 'Library/LaunchAgents').glob('*.plist')), [])
 

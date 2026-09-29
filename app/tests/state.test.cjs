@@ -1900,20 +1900,36 @@ test('a coordinator wake that fails is kept for the next one, and replayed turns
   assert.match(sent[0].prompt, /turn:demo\.build\/3 completed, and 1 earlier since turn:demo\.build\/2$/);
 });
 
-test('two windows telling a coordinator the same news send one request, and a bot gone while detached leaves nothing behind', async () => {
-  const ids = [];
-  const pages = [0, 1].map(() => page({ request: async (op, params) => { if (op === 'submit') ids.push(params.request_id); return {}; }, log() {} }));
-  for (const p of pages) {
+test('two windows telling a coordinator the same news make one turn, and a bot gone while detached leaves nothing behind', async () => {
+  // One window attached earlier and also saw turn 2; both have turn 3 as the newest.
+  const told = new Map(), asked = [];
+  const submit = async (op, params) => {
+    if (op !== 'submit') return {};
+    asked.push(params.request_id);
+    if (told.has(params.request_id) && told.get(params.request_id) !== params.prompt) throw new Error('idempotency_conflict: ');
+    told.set(params.request_id, params.prompt); return {};
+  };
+  const pages = [0, 1].map(() => page({ request: submit, log() {} }));
+  for (const [i, p] of pages.entries()) {
     p.S.live = true; p.S.attached = true;
-    p.upsert({ name: 'demo.lead', id: 1, status: 'idle' });
+    p.upsert({ name: 'demo.lead', id: 1, status: 'running' });
     p.upsert({ name: 'demo.build', id: 2, status: 'idle', created_by: 'demo.lead', created_by_id: 1 });
-    await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 3, data: { status: 'completed' } });
-    await p.tick();
+    for (const turn of i === 0 ? [2, 3] : [3]) await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn, data: { status: 'completed' } });
   }
-  assert.equal(ids.length, 2);
-  assert.equal(ids[0], ids[1]);
-  assert.match(ids[0], /^app-wake-1-[0-9a-f]{16}$/);
+  for (const p of pages) { await p.onEvent({ event: 'turn_finished', bot: 'demo.lead', turn: 5, data: { status: 'completed' } }); await p.tick(); }
+  assert.equal(asked.length, 2);
+  assert.equal(asked[0], asked[1]);
+  assert.match(asked[0], /^app-wake-1-[0-9a-f]{16}$/);
+  assert.equal(told.size, 1, 'one turn');
+  assert.equal(pages[1].S.wakes.get('demo.lead').tasks.size, 0, 'the refused window does not try again');
   const [p] = pages;
+  // A task deleted before its news goes out is no news.
+  p.upsert({ name: 'demo.test', id: 3, status: 'idle', created_by: 'demo.lead', created_by_id: 1 });
+  p.S.bots.get('demo.lead').status = 'running';
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.test', turn: 1, data: { status: 'completed' } });
+  assert.equal(p.S.wakes.get('demo.lead').tasks.size, 1);
+  p.forgetBot('demo.test');
+  assert.equal(p.S.wakes.get('demo.lead').tasks.size, 0);
   await p.onEvent({ event: 'queued', bot: 'demo.lead', turn: 9, data: { from: { bot: 'demo.build', turn: 3 } } });
   await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 4, data: { status: 'completed' } });
   assert.equal(p.S.turnFrom.size, 1); assert.ok(p.S.wakes.has('demo.lead'));

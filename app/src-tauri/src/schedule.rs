@@ -653,6 +653,13 @@ pub fn list(places: &Places) -> Value {
 
 /// Write a file whole beside its place, then rename it there.
 fn replace(path: &Path, text: &str) -> Result<(), String> {
+    replace_mode(path, text, 0o644)
+}
+
+/// `replace` with the file's mode set from creation, so the new name never
+/// has any other.
+fn replace_mode(path: &Path, text: &str, mode: u32) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
     let dir = path.parent().ok_or("no folder")?;
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let temporary = dir.join(format!(
@@ -661,7 +668,17 @@ fn replace(path: &Path, text: &str) -> Result<(), String> {
         std::process::id()
     ));
     let written = (|| {
-        let mut file = std::fs::File::create(&temporary)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(mode)
+            .open(&temporary)?;
+        // An old temporary of this pid may carry another mode.
+        std::fs::set_permissions(
+            &temporary,
+            std::os::unix::fs::PermissionsExt::from_mode(mode),
+        )?;
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
         std::fs::rename(&temporary, path)?;
@@ -697,6 +714,7 @@ pub fn install(
     launchd: Loader,
 ) -> Result<(), String> {
     valid_name(&schedule.name)?;
+    let _lock = Lock::take(places)?;
     // macOS folders ignore case: `Build` would overwrite `build`'s files.
     let file = format!("{LABEL}{}.plist", schedule.name);
     let taken = std::fs::read_dir(&places.agents)
@@ -754,6 +772,37 @@ fn swap(
     Ok(())
 }
 
+/// Held while a schedule's files or launchd's job change, so `add`, `rm`,
+/// a fire ending its schedule and the app's refresh never interleave. The
+/// lock goes with the process, also when a fire's own unload ends it.
+struct Lock {
+    _held: std::fs::File,
+}
+
+impl Lock {
+    fn take(places: &Places) -> Result<Self, String> {
+        std::fs::create_dir_all(&places.state)
+            .map_err(|e| format!("{}: {e}", places.state.display()))?;
+        let path = places.state.join(".lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        use std::os::fd::AsRawFd;
+        // SAFETY: flock on a descriptor this struct owns.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(format!(
+                "{}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(Self { _held: file })
+    }
+}
+
 /// Delete a file for good: gone from its folder once that folder is synced.
 fn forget(path: &Path) {
     if std::fs::remove_file(path).is_ok()
@@ -768,6 +817,7 @@ fn forget(path: &Path) {
 /// An ended schedule is only its last result, which goes.
 pub fn remove(places: &Places, name: &str, launchd: Loader) -> Result<(), String> {
     valid_name(name)?;
+    let _lock = Lock::take(places)?;
     let path = places.plist(name);
     let last = places.last(name);
     if !path.exists() {
@@ -788,6 +838,7 @@ pub fn remove(places: &Places, name: &str, launchd: Loader) -> Result<(), String
 /// whose unload ends this process. `keep` leaves its last result, so an
 /// end nobody asked for still shows, and why.
 fn end(places: &Places, name: &str, keep: bool, launchd: Loader) {
+    let _lock = Lock::take(places);
     forget(&places.plist(name));
     if !keep {
         forget(&places.last(name));
@@ -799,14 +850,22 @@ fn end(places: &Places, name: &str, keep: bool, launchd: Loader) {
 /// schedule again when it starts from somewhere else. One that fails keeps
 /// the old path, so the next start tries it again.
 pub fn refresh(places: &Places, app: &Path, launchd: Loader) {
-    for (schedule, was) in read_all(places) {
-        if was == app {
-            continue;
-        }
+    for (schedule, _) in read_all(places) {
+        let Ok(_lock) = Lock::take(places) else {
+            return;
+        };
+        // Read again under the lock: an `rm`, `add` or fire may have come first.
         let path = places.plist(&schedule.name);
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
+        let Some(was) = program(&text).and_then(|args| args.into_iter().next()) else {
+            continue;
+        };
+        let was = PathBuf::from(was);
+        if was == app {
+            continue;
+        }
         let moved = text.replacen(
             &format!("<string>{}</string>", escape(&was.to_string_lossy())),
             &format!("<string>{}</string>", escape(&app.to_string_lossy())),
@@ -937,7 +996,7 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
     let socket = daemon.socket()?;
     // The bot must exist now; the schedule is pinned to this identity.
     let record = runtime()?.block_on(async {
-        let (client, _events) = Client::connect(&socket).await.map_err(|e| e.to_string())?;
+        let client = connect(&socket, &daemon).await?;
         let record = client.request("resume", json!({"bot": bot})).await;
         client.close().await;
         record.map_err(|e| e.to_string())
@@ -1025,8 +1084,9 @@ pub fn fire_cli(args: &[String]) -> i32 {
     };
     let now = now();
     // A one-off's calendar entry has no year: the same date a year early is
-    // not its time.
-    if schedule.at.is_some_and(|at| now < at - 120) {
+    // not its time. A day's slack keeps its time when the Mac's time zone
+    // changed since it was made, which launchd follows and `at` does not.
+    if schedule.at.is_some_and(|at| now < at - 2 * 24 * 3600) {
         return 0;
     }
     let outcome = match runtime() {
@@ -1079,13 +1139,12 @@ pub fn write_script(home: &Path, app: &Path) -> Result<(), String> {
     let usage = USAGE.replace('\n', "\n# ");
     let text = format!("#!/bin/sh\n# {usage}\nexec {} {FLAG} \"$@\"\n", quote(app));
     let path = home.join("schedule");
-    if std::fs::read_to_string(&path).is_ok_and(|have| have == text) {
+    use std::os::unix::fs::PermissionsExt;
+    let runnable = std::fs::metadata(&path).is_ok_and(|m| m.permissions().mode() & 0o777 == 0o755);
+    if runnable && std::fs::read_to_string(&path).is_ok_and(|have| have == text) {
         return Ok(());
     }
-    replace(&path, &text)?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("{}: {e}", path.display()))
+    replace_mode(&path, &text, 0o755)
 }
 
 #[cfg(test)]
@@ -1361,6 +1420,23 @@ mod tests {
             )
             .is_err()
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_script_is_runnable_even_when_its_text_was_already_there() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("agent-app-script-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let app = Path::new("/A/agent-app");
+        write_script(&root, app).unwrap();
+        let path = root.join("schedule");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o755);
+        // Its text survived a crash before its mode did.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_script(&root, app).unwrap();
+        assert_eq!(mode(&path), 0o755);
         std::fs::remove_dir_all(root).unwrap();
     }
 

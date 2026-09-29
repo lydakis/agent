@@ -227,8 +227,9 @@ function forgetBot(name) {
   const t = parent && S.transcripts.get(parent.name);
   if (t) { t.items = t.items.filter(it => it.kind !== 'peer' || it.who !== name); t.peers = t.peers.filter(who => who !== name); t.gen += 1; }
   S.bots.delete(name); S.transcripts.delete(name); S.override.delete(name);
-  // A coordinator gone hears nothing more, and its queued turns never end.
+  // A coordinator gone hears nothing more, and its queued turns never end; a task gone is no news.
   if (S.wakes.has(name)) { clearTimeout(S.wakes.get(name).timer); S.wakes.delete(name); }
+  for (const w of S.wakes.values()) if (w.tasks.delete(name) && !w.tasks.size) { clearTimeout(w.timer); w.timer = null; }
   for (const key of S.turnFrom.keys()) if (key.startsWith(`${name}\u0000`)) S.turnFrom.delete(key);
   // A draft belongs to its bot, so it goes with it.
   if (S.ui.side === name) S.ui.side = null;
@@ -879,11 +880,15 @@ async function wake(lead) {
   const sent = [...w.tasks].slice(0, WAKE_TASKS);
   for (const [name] of sent) w.tasks.delete(name);
   w.last = Date.now();
-  // Named by what it says, so another window sending the same news is the same request, not a second turn.
+  // Named by the newest turn of each task it covers: another window with the same news, even counted from
+  // an earlier turn, asks for the same request, which the daemon answers once and refuses as different.
   const prompt = wakeText(sent, w.tasks.size);
-  try { await Daemon.request('submit', { bot: lead, bot_id: l.id, request_id: `app-wake-${l.id}-${digest(prompt)}`, prompt, delivery: 'queue' }); }
+  const id = `app-wake-${l.id}-${digest(sent.map(([name, t]) => `${name}/${t.turn}`).sort().join('\n'))}`;
+  try { await Daemon.request('submit', { bot: lead, bot_id: l.id, request_id: id, prompt, delivery: 'queue' }); }
   catch (e) {
     if (/^bot_not_found/.test(e?.message ?? '')) { S.wakes.delete(lead); return; }
+    // Another window told it first.
+    if (/^idempotency_conflict/.test(e?.message ?? '')) return;
     const later = w.tasks;
     w.tasks = new Map(sent);
     for (const [name, t] of later) merge(w.tasks, name, t);

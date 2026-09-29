@@ -657,8 +657,11 @@ otherwise answer in one line. A message that fails is kept for the next
 one, and one due while the window was detached goes out when it attaches
 again; a coordinator deleted, or gone when the window reattaches, has its
 dropped. The window must be open for it. The message's `request_id` is made
-from the coordinator's id and a hash of its text, so two windows sending
-the same news make one turn.
+from the coordinator's id and a hash of the newest turn of each task it
+covers, so two windows with the same news make one turn: the daemon answers
+the second with the first, or with `idempotency_conflict` when that window
+counted from an earlier turn, which it takes as told. A task deleted before
+its news goes out is dropped from it.
 
 ## Schedules
 
@@ -678,7 +681,8 @@ executable with `--schedule`:
 ```
 
 `add` defaults to the agent whose shell runs it (`AGENT_BOT`), reaches that
-shell's daemon, and pins the schedule to the bot's id. `--every` counts from
+shell's daemon (starting it, as a fire does, when none answers), and pins
+the schedule to the bot's id. `--every` counts from
 now in minutes that divide an hour, hours that divide a day, or `1d`;
 `--in` and `--at` are one-offs within a year, which remove themselves once
 fired (`--in` rounds up to the next whole minute, since launchd keeps
@@ -703,7 +707,9 @@ waiting, skips that time rather than having it cut in or pile up. A one-off
 submits with `delivery: queue`, so a working bot gets it after its turn. A
 bot deleted since, or a new bot under its name, is not reached
 (`bot_not_found`), and the schedule ends. A one-off's calendar entry has no
-year, so a fire more than two minutes before its time does nothing. What
+year, so a fire more than two days before its time does nothing; the slack
+keeps a one-off whose Mac changed time zone since, since launchd follows the
+new zone's clock. What
 the fire did (`sent` with the turn, `skipped`, `gone` or `failed` with why)
 is kept with the schedule's row in `~/.agent/schedules/NAME.json`, which
 Settings shows beside each schedule with its message and a Remove button. A
@@ -711,7 +717,10 @@ one-off that delivered leaves nothing; one that ends without delivering
 (its agent gone, the daemon unreachable) loses its plist but keeps that
 file, so Settings and `ls` still list it, as not delivered and why, until
 it is removed. Those files are written, synced, renamed and their folder
-synced. When the
+synced. `add`, `rm`, a fire ending its schedule and the app's refresh take
+a lock (`~/.agent/schedules/.lock`) around their changes, and the refresh
+reads each plist again under it. `~/.agent/schedule` is written with its
+executable mode from the start. When the
 app starts from a new place, as after an update, it writes its path into
 every schedule and loads it again, on a thread of its own so the window does
 not wait; one launchd refuses keeps its old path and is tried again at the
