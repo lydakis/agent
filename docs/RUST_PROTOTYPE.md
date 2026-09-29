@@ -1343,7 +1343,7 @@ it with, so every parked record has one shape. Schema 41 adds `turns.origin` and
 wrote is found by its first node, a steer by the node it shares or the one its
 `steered` finish recorded, with the sender's identity where its turn is still
 stored. A steer whose finish event was pruned names no sender. Stored `steered`
-events name the steer's turn as `steer`, leaving `from` for the sender, and
+events name the steer's turn as `steer` and gain its sender as `from`, and
 stored `accepted` and `queued` senders gain their `id`, so a replay reads as
 live events do.
 

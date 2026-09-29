@@ -1990,13 +1990,23 @@ fn schema_40_keeps_each_bot_written_prompts_sender_with_its_node() {
     // Stored events name the sender as new ones do.
     let events: Vec<Value> = Connection::open(&path)
         .unwrap()
-        .prepare("SELECT json_extract(data,'$.from') FROM events WHERE kind IN ('accepted','queued') AND bot='Carol' ORDER BY id")
+        .prepare("SELECT json_extract(data,'$.from') FROM events WHERE kind IN ('accepted','queued','steered') AND bot='Carol' ORDER BY id")
         .unwrap()
         .query_map([], |r| r.get::<_, Option<String>>(0))
         .unwrap()
         .map(|from| from.unwrap().map_or(Value::Null, |f| serde_json::from_str(&f).unwrap()))
         .collect();
-    assert_eq!(events, [bob.clone(), bob.clone(), Value::Null]);
+    // accepted, the two steers queued, then each taken in.
+    assert_eq!(
+        events,
+        [
+            bob.clone(),
+            bob.clone(),
+            Value::Null,
+            bob.clone(),
+            Value::Null
+        ]
+    );
     // The turn still reads the steers it took in, now named as `steer`.
     let texts: Vec<Value> = db.prompts("Carol", turn, 1024).unwrap()["prompts"]
         .as_array()

@@ -7534,7 +7534,8 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         // first node; a steer by the node it shares, or else the one its
         // finish recorded. A steer whose events were pruned names no sender.
         // A `steered` event names the steer's turn as `steer`, leaving `from`
-        // for its sender as on `accepted`; a stored sender gains its identity.
+        // for its sender, which stored `steered` events gain as new ones carry
+        // it; a stored `accepted` or `queued` sender gains its identity.
         conn.execute_batch(
             "ALTER TABLE turns ADD COLUMN origin TEXT;
              ALTER TABLE turns ADD COLUMN from_id INTEGER;
@@ -7553,6 +7554,10 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
              WHERE t.from_bot IS NOT NULL;
              UPDATE events SET data=json_set(json_remove(data,'$.from'),'$.steer',json_extract(data,'$.from'))
              WHERE kind='steered';
+             UPDATE events SET data=json_set(data,'$.from',
+                json_object('bot',t.from_bot,'turn',t.from_turn,'id',t.from_id))
+             FROM turns t WHERE events.kind='steered'
+                AND t.id=json_extract(events.data,'$.steer') AND t.from_bot IS NOT NULL;
              UPDATE events SET data=json_set(data,'$.from.id',
                 (SELECT from_id FROM turns WHERE id=events.turn))
              WHERE kind IN ('accepted','queued') AND json_type(data,'$.from')='object';",
