@@ -130,6 +130,17 @@ of them reviewers, to halve the p99"). Its role tells it to run
 way the sheet does; the swarm shows under the project once its agents take
 their briefs.
 
+A coordinator hears when you work in a task it started: once it rests, one
+message lists the turns its tasks ended, and it passes on what another task
+needs.
+
+![A coordinator reads a task update and passes build's change on to test](app/coordinator-wake.png)
+
+Agents can be woken at set times. Settings lists the schedules, what each one
+last did, and the message it sends.
+
+![Schedules in Settings](app/settings-schedules.png)
+
 ## What the daemon speaks, and why the client speaks it directly
 
 The daemon's contract is JSONL over a Unix socket: requests with an `id`,
@@ -177,7 +188,9 @@ client/          agent-client: the socket protocol and the client policy
   `project` and `write_project` read and write a folder's
   `.agents/project.toml` ([project.rs](../app/src-tauri/src/project.rs));
   `policy` composes a folder's client policy, in a profile when named, and
-  falls back to the profiles the app ships for `coordinator`.
+  falls back to the profiles the app ships for `coordinator`;
+  `schedules` and `schedule_remove` list and remove
+  [schedules](#schedules) ([schedule.rs](../app/src-tauri/src/schedule.rs)).
   When nothing listens on a store's socket, `attach` starts a daemon first
   ([daemon.rs](../app/src-tauri/src/daemon.rs)); see
   [Installing](#installing).
@@ -197,7 +210,8 @@ client/          agent-client: the socket protocol and the client policy
   scripted reply acknowledges it. The scenario
   plays on load in two projects: `demo.lead` thinks, starts a release build
   in the background, spawns its tasks plan, build and test, build spawns
-  review, and the coordinator waits on all of it. Serve `app/ui` with any
+  review, and the coordinator waits on all of it. A message to one of its
+  tasks brings the coordinator a task update it answers. Serve `app/ui` with any
   static server to work on the design without a daemon.
 
 ## Installing
@@ -617,6 +631,71 @@ and opens the app on it; prompt prefixes (`shell:`, `bg:`, `delegate:`,
 waits and pacing with no provider. `--no-app` prints the attach command
 instead.
 
+## Coordinators hear from their tasks
+
+Work goes on in the tasks a coordinator started, mostly by you working in
+them directly, and the coordinator should hear about it. The page already
+follows every bot, so it tells it; the daemon has no part in this beyond
+recording who asked for each turn (`from` on `accepted` and `queued`).
+A turn counts when it ends in a bot the project's `PROJECT.lead` created,
+unless the coordinator asked for it itself (its `from` names the lead) or
+the bot is the coordinator's own fork or side chat (`PROJECT.lead-…`). A
+steer's turn is part of the turn it joined. Turns replayed on attach are
+history, not news. The coordinator is told only while it rests, at most
+once every ten minutes, in one message queued to it: `Task updates:`, then
+one line per task with each ended turn's handle and status (at most 32 tasks
+and the last 8 turns of each). The handles are what its `wait` tool reads a
+final reply by, so the message stays small however much was said. The
+[coordinator role](../app/agents/coordinator.md) says what to do with it:
+send another task only what it needs, with `agent run --detach --delivery
+queue`, which it reads at its next turn without being interrupted, and
+otherwise answer in one line. A message that fails is kept for the next
+one; a deleted coordinator's is dropped. The window must be open for it.
+
+## Schedules
+
+A schedule wakes an agent at set times with a message: a new turn in its
+own conversation, never a new agent. launchd keeps the time, so a schedule
+fires with the app closed, and a time the Mac slept through fires once when
+it wakes (`StartCalendarInterval` coalesces missed times; `StartInterval`
+and cron skip them). The daemon has no clock for this.
+
+The app writes `~/.agent/schedule` each time it opens, a script that runs its
+executable with `--schedule`:
+
+```sh
+~/.agent/schedule add [--bot NAME] [--name NAME] (--every 30m | --in 45m | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY') -- MESSAGE
+~/.agent/schedule ls
+~/.agent/schedule rm NAME
+```
+
+`add` defaults to the agent whose shell runs it (`AGENT_BOT`), reaches that
+shell's daemon, and pins the schedule to the bot's id. `--every` counts from
+now in minutes that divide an hour, hours that divide a day, or `1d`;
+`--in` and `--at` are one-offs within a year, which remove themselves once
+fired; `--cron` is read as cron reads it, a day or a weekday when both are
+given, up to 1,024 calendar entries. A message is at most 16 KiB. A schedule
+is named after its bot unless `--name` says otherwise, and one added under a
+name in use replaces it.
+
+Each is one LaunchAgent, `~/Library/LaunchAgents/me.lydakis.agent.schedule.NAME.plist`,
+and that file is its only record: its program arguments carry the bot, its
+id, the store (or an explicit socket), the one-off's time and the message.
+When it fires, the app's executable runs with `--schedule-fire` and those
+arguments. It connects to the daemon, starting one for the store as the app
+does, with the login shell's environment and `~/.agent/env` (never for an
+explicit socket), and submits the message with `delivery: reject`: a bot
+that is working, or has work waiting, skips that time rather than having it
+cut in or pile up. A bot deleted since, or a new bot under its name, is not
+reached (`bot_not_found`), and the schedule removes itself. A one-off's
+calendar entry has no year, so a fire more than two minutes before its time
+does nothing. What the fire did (`sent` with the turn, `skipped`, `gone` or
+`failed` with why) is kept in `~/.agent/schedules/NAME.json`, which Settings
+shows beside each schedule with its message and a Remove button. When the
+app starts from a new place, as after an update, it writes its path into
+every schedule and loads it again. Only macOS has launchd; elsewhere `add`
+refuses with `schedules_unsupported`.
+
 ## What it costs, and where the bounds are
 
 The UI bounds payload buffering, history decoding, and rendered fleet rows:
@@ -742,6 +821,16 @@ projects and tasks in the sidebar, a card opened beside and swapped, the three
 menus, fork, confirmed delete, folding and a new project, with no page errors.
 A task's runs rendered while it worked matched a full redraw of the same pane.
 
+On 2026-09-29 (Linux container) a schedule's fire ran against a real daemon
+in `tests/test_schedule.py`: it sent its message to its resting bot as a new
+turn, skipped the bot while a turn held it, never reached a bot made again
+under the same name, and did nothing a year early; `add` from an agent's
+shell was refused without launchd and left no plist. The plist, calendar
+expansion, replace, remove and the app's move are tested in
+`app/src-tauri/src/schedule.rs` with launchd stood in for. The coordinator's
+task updates are tested in `app/tests/state.test.cjs` and were driven in demo
+mode in headless Chromium. Not verified: launchd itself, which needs a Mac.
+
 ## Next
 
 1. Run it against a real daemon and model by eye; fix what the screenshot
@@ -770,9 +859,14 @@ fork naming and placement, side chats (a running source, the allowed list,
 the first message going to the copy), a worktree bot's branch in its head,
 project creation (no file for a refused model),
 steers pinned to their turn, model picks pinned to identity, the demo
-daemon's steer delivery, and runs folded with failures on their line.
+daemon's steer delivery, runs folded with failures on their line, and a
+coordinator's task updates (one batched message when it rests, never for
+turns it asked for or replayed ones, kept when a send fails).
 `cargo test -p agent-app` includes a failed project-file write leaving
-neither a partial file nor a temporary.
+neither a partial file nor a temporary, and schedules' calendars, plists,
+replace, remove and move. With `AGENT_TEST_RUNTIME=1` after a release build
+and `cargo build -p agent-app`, `python3 -m unittest tests.test_schedule`
+fires schedules against a real daemon.
 `cargo test --workspace` includes the silent-listener readiness deadline,
 fork workspace parity between durable records, live events, and replay, and
 the app's policy errors for oversized and unreadable AGENTS.md files.

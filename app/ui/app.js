@@ -27,6 +27,9 @@ const S = {
   families: new Map(),
   // Swarms, from their folders in ~/.agent/swarms, and the swarm each agent belongs to.
   swarms: new Map(), memberOf: new Map(),
+  // Who asked for each turn another bot asked for, until it ends, and what each coordinator has yet to
+  // hear about its tasks (see `wake`).
+  turnFrom: new Map(), wakes: new Map(),
   // Unsent text for each bot not on screen. A composer's text is its bot's own: when a pane shows
   // another bot, the text stays behind with the one it was typed for (see `followDrafts`).
   drafts: new Map(),
@@ -555,11 +558,13 @@ async function onEvent(ev) {
       break;
     }
     case 'accepted': {
+      if (data.from?.bot) S.turnFrom.set(`${name}\u0000${turn}`, data.from.bot);
       const b = bot(name); if (b) { b.status = 'running'; b.runningTurn = turn; b.waitingOn = []; b.turnStarted = S.live ? Date.now() : 0; b.elapsed = 0; }
       if (typeof data.node === 'number') pushNode(transcript(name), { kind: 'node', node: data.node, turn });
       break;
     }
     case 'queued': {
+      if (data.from?.bot) S.turnFrom.set(`${name}\u0000${turn}`, data.from.bot);
       // `ready` waits for a daemon-wide slot with nothing else running on the bot; `queued` sits behind its own turn.
       const b = bot(name); const behindOwn = !!b && (b.runningTurn !== null || isActive(b.status));
       if (b && !behindOwn) { b.status = data.status ?? 'queued'; b.runningTurn = turn; }
@@ -622,6 +627,11 @@ async function onEvent(ev) {
       const t = transcript(name);
       if (t.streamingTurn === turn) { t.text = ''; t.thinking = ''; t.thinkingSince = 0; t.thinkingMs = 0; t.streamingTurn = null; t.streamGen += 1; }
       if (status !== 'completed' && status !== 'steered') addItem(t, { kind: 'note', text: data.error ? `${status}: ${data.error}${data.detail ? ': ' + data.detail : ''}` : status, turn });
+      const key = `${name}\u0000${turn}`, from = S.turnFrom.get(key); S.turnFrom.delete(key);
+      // A steer's turn is part of the turn it joined, whose end is the news.
+      if (S.live && status !== 'steered') tellLead(name, turn, status, from);
+      // A coordinator coming to rest hears what waited for it.
+      if (S.wakes.has(name)) wakeSoon(name);
       // A background command may outlive its turn; only a wait result says how it ended.
       break;
     }
@@ -631,6 +641,9 @@ async function onEvent(ev) {
       looked.delete(name);
       const p = bot(name)?.project;
       forgetBot(name);
+      if (S.wakes.has(name)) { clearTimeout(S.wakes.get(name).timer); S.wakes.delete(name); }
+      // Its queued turns never end.
+      for (const key of S.turnFrom.keys()) if (key.startsWith(`${name}\u0000`)) S.turnFrom.delete(key);
       if (S.selected === name) S.selected = p && S.bots.has(p + LEAD) ? p + LEAD : S.bots.keys().next().value ?? '';
       // A deleted agent leaves its swarm, which stops counting it and posting to it.
       if (S.memberOf.has(name)) {
@@ -833,6 +846,51 @@ async function loadVisible() {
 let chain = Promise.resolve();
 function enqueue(job) { chain = chain.then(job, job); return chain; }
 
+// ---------- coordinator wake ----------
+// Work goes on in tasks a project's coordinator started, mostly you working in them directly. The
+// coordinator hears of it: once it rests, and at most every WAKE_MS, one message lists the tasks that
+// ended turns since it last heard, by the handles its wait tool reads them with, and its role says what
+// to do with that. The turns it asked for itself are not news, so it never wakes itself; nor is its own
+// fork or side chat. Only live turns count, while this window is attached.
+const WAKE_MS = 10 * 60 * 1000, WAKE_TASKS = 32, WAKE_TURNS = 8;
+function tellLead(name, turn, status, from) {
+  const b = bot(name), lead = b && creatorOf(b);
+  if (!lead || !leadProject(lead.name) || from === lead.name || name.startsWith(`${lead.name}-`)) return;
+  let w = S.wakes.get(lead.name);
+  if (!w) { w = { tasks: new Map(), last: 0, timer: null }; S.wakes.set(lead.name, w); }
+  if (!w.tasks.has(name)) w.tasks.set(name, []);
+  w.tasks.get(name).push({ turn, status });
+  wakeSoon(lead.name);
+}
+function wakeSoon(lead) {
+  const w = S.wakes.get(lead);
+  if (!w || w.timer || !w.tasks.size) return;
+  w.timer = setTimeout(() => { w.timer = null; wake(lead); }, Math.max(0, w.last + WAKE_MS - Date.now()));
+}
+// A working coordinator is told when its turn ends, which calls this again.
+async function wake(lead) {
+  const w = S.wakes.get(lead), l = bot(lead);
+  if (!w || !w.tasks.size || !S.attached || !l || l.id == null || isActive(l.status)) return;
+  const tasks = w.tasks;
+  w.tasks = new Map(); w.last = Date.now();
+  try { await Daemon.request('submit', { bot: lead, bot_id: l.id, request_id: `app-wake-${crypto.randomUUID()}`, prompt: wakeText(tasks), delivery: 'queue' }); }
+  catch (e) {
+    if (/^bot_not_found/.test(e?.message ?? '')) { S.wakes.delete(lead); return; }
+    for (const [name, turns] of w.tasks) { if (tasks.has(name)) tasks.get(name).push(...turns); else tasks.set(name, turns); }
+    w.tasks = tasks;
+    Daemon.log?.(`wake ${lead}: ${e?.message ?? e}`);
+    wakeSoon(lead);
+  }
+}
+function wakeText(tasks) {
+  const lines = [...tasks].slice(0, WAKE_TASKS).map(([name, turns]) => {
+    const shown = turns.slice(-WAKE_TURNS).map((t) => `turn:${name}/${t.turn} ${t.status}`).join(', ');
+    return `- ${name}: ${turns.length > WAKE_TURNS ? `${turns.length - WAKE_TURNS} earlier turns, then ` : ''}${shown}`;
+  });
+  if (tasks.size > WAKE_TASKS) lines.push(`- and ${tasks.size - WAKE_TASKS} more tasks`);
+  return `Task updates: since you last heard, tasks you started ended turns someone else asked for. The wait tool reads each one's final reply by its handle.\n${lines.join('\n')}`;
+}
+
 // ---------- lifecycle ----------
 // Events are pulled from the core a batch at a time and applied before the next pull, so the pipeline
 // from the daemon to the screen is bounded end to end: the transport's queue, then one batch here.
@@ -937,6 +995,8 @@ async function attachOnce() {
       }
       S.snapshot = false; S.deleted.clear();
       S.attached = true;
+      // What waited while detached goes out now, each window permitting.
+      for (const lead of S.wakes.keys()) wakeSoon(lead);
       try { await loadSwarms(); } catch (e) { toast(`swarms: ${e?.message ?? e}`, 5000); }
       restore();
       // A selection deleted while detached had no `deleted` event to replay; show a surviving bot.
@@ -1920,6 +1980,7 @@ async function openSetup() {
   try { await loadSettings(); } catch (e) { st.error = String(e?.message ?? e); }
   try { st.roles = await Daemon.roles?.(); } catch (_) {}
   if (!st.settings?.providers?.length) st.adding = st.adding ?? '';
+  try { st.schedules = await Daemon.schedules?.(); st.schedulesError = null; } catch (e) { st.schedules = null; st.schedulesError = String(e?.message ?? e); }
   renderSetup();
   await Promise.all([checkProviders(st.settings?.listing), readList()]);
 }
@@ -2075,7 +2136,7 @@ function setupHTML() {
   return `<div class="shead"><b>${ready && projects ? 'Settings' : 'Set up Agent'}</b><button type="button" class="ibtn" data-act="setup-close" title="Close" aria-label="Close"${busy}>✕</button></div>`
     + step(1, 'Providers', ready, `${rows}<div class="row">${set?.restartable === false ? '<p class="dim">This window uses a daemon it did not start, so it cannot apply provider changes.</p>' : add}${st.adding === null ? refresh : ''}</div>${listed}`)
     + step(2, 'First project', projects, project)
-    + (projects ? rolesHTML(st, busy) : '')
+    + (projects ? rolesHTML(st, busy) + schedulesHTML(st, busy) : '')
     + (st.busy ? `<p class="busy">${esc(st.busy)}</p>` : '') + (st.error ? `<p class="bad">${esc(st.error)}</p>` : '');
 }
 // The app's roles, each read from your own file in every project once you have one. Edit makes that
@@ -2085,6 +2146,22 @@ function rolesHTML(st, busy) {
   const own = new Map((st.roles ?? []).map((r) => [r.name, r.file]));
   const rows = ROLES.map(([name, label]) => `<div class="prow"><span class="pn">${label}</span><span class="st${own.get(name) ? '' : ' dim'}">${own.get(name) ? `~/.agents/agents/${name}.md` : 'the app\'s own'}</span><span class="acts"><button type="button" class="sbtn" data-act="edit-role" data-v="${name}"${busy}>Edit</button></span></div>`).join('');
   return `<section><h3>Roles</h3>${rows}<p class="dim">A project's coordinator and a swarm's agents follow these in every project; a project's own .agents/agents file of that name comes first. An agent keeps the text it started with, so an edit reaches new projects and swarms.</p></section>`;
+}
+// Agents wake at set times from schedules they or their coordinator made; the Mac keeps the time.
+// Each shows who it wakes, when, what its last time did, and the message it sends.
+const LAST = { sent: 'sent', skipped: 'skipped, it was working', gone: 'its agent is gone', failed: 'failed' };
+function schedulesHTML(st, busy) {
+  const at = (ms) => new Date(ms).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  const last = (l) => l ? `last ${at(l.fired_ms)}: ${LAST[l.outcome] ?? l.outcome}${l.outcome === 'failed' && l.detail ? ` (${String(l.detail).slice(0, 120)})` : ''}` : 'not run yet';
+  const rows = (st.schedules ?? []).map((x) => `<div class="prow"><span class="pn">${esc(x.bot)}</span><span class="st">${esc(x.when)}</span><span class="acts"><button type="button" class="sbtn" data-act="schedule-remove" data-v="${esc(x.name)}"${busy}>Remove</button></span><div class="sub dim">${esc(last(x.last))}${x.name !== x.bot ? ` · ${esc(x.name)}` : ''}</div><div class="sub dim">${esc(x.message.length > 240 ? `${x.message.slice(0, 240)}…` : x.message)}</div></div>`).join('');
+  const none = st.schedulesError ? `<p class="bad">${esc(st.schedulesError)}</p>` : rows ? '' : '<p class="dim">None yet. Ask a coordinator, for example "have build check its PR every 30 minutes".</p>';
+  return `<section><h3>Schedules</h3>${rows}${none}<p class="dim">Each time, the agent gets its message in its own chat, unless it is working then. They run with the app closed; a time the Mac slept through runs once when it wakes.</p></section>`;
+}
+async function removeSchedule(name) {
+  const st = setupState();
+  try { await Daemon.removeSchedule(name); } catch (e) { toast(`remove ${name}: ${e?.message ?? e}`, 5000); }
+  try { st.schedules = await Daemon.schedules(); } catch (_) {}
+  renderSetup();
 }
 async function editRole(name) {
   const st = setupState();
@@ -2256,6 +2333,7 @@ async function act(el) {
     case 'setup-remove': { const st = setupState(); if (anyActive() && st.confirm !== v) { st.confirm = v; renderSetup(); return; } st.confirm = null; await removeProvider(v); return; }
     case 'setup-retry': case 'setup-refresh': await refreshModels(); return;
     case 'edit-role': await editRole(v); return;
+    case 'schedule-remove': await removeSchedule(v); return;
     default: return;
   }
 }

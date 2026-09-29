@@ -2,12 +2,15 @@
 //! daemon. The page owns the state model and the protocol logic, exactly as
 //! the prototype did; this side connects, forwards notifications as window
 //! events, and relays requests. Beside that it reads the files the app owns
-//! (projects, profiles, swarms) and makes a swarm's shared worktree; run
-//! with `--swarm-post` it is a swarm's post tool (see `swarm`).
+//! (projects, profiles, swarms, schedules) and makes a swarm's shared
+//! worktree; run with `--swarm-post` it is a swarm's post tool (see
+//! `swarm`), and with `--schedule` or `--schedule-fire` it adds, lists,
+//! removes or fires schedules (see `schedule`).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod daemon;
 mod project;
+mod schedule;
 mod session;
 mod settings;
 mod swarm;
@@ -839,6 +842,17 @@ async fn swarm_decide(
     swarm::act(&client, &swarms_of(&state)?, &swarm, None, act).await
 }
 
+/// Every schedule, with what its last fire did.
+#[tauri::command]
+fn schedules() -> Result<Value, String> {
+    Ok(schedule::list(&schedule::Places::home()?))
+}
+
+#[tauri::command]
+fn schedule_remove(name: String) -> Result<(), String> {
+    schedule::remove(&schedule::Places::home()?, &name, &schedule::launchctl)
+}
+
 /// Page diagnostics land on stderr, where a terminal can see them.
 #[tauri::command]
 fn log(message: String) {
@@ -853,18 +867,31 @@ async fn request(state: State<'_, Shared>, op: String, params: Value) -> Result<
 }
 
 fn main() {
-    // A swarm's `post` script and a coordinator's `start` run this
-    // executable; each acts and exits without a window.
+    // A swarm's `post` script, a coordinator's `start`, `~/.agent/schedule`
+    // and launchd's fires run this executable; each acts and exits without
+    // a window.
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some(swarm::POST_FLAG) => std::process::exit(swarm::cli(&args[2..])),
         Some(swarm::START_FLAG) => std::process::exit(swarm::start_cli(&args[2..])),
+        Some(schedule::FLAG) => std::process::exit(schedule::cli(&args[2..])),
+        Some(schedule::FIRE_FLAG) => std::process::exit(schedule::fire_cli(&args[2..])),
         _ => {}
     }
     if let (Ok(home), Ok(app)) = (swarm::home(), std::env::current_exe()) {
         swarm::refresh_scripts(&home, &app);
         if let Err(error) = swarm::write_start_script(&home, &app) {
             eprintln!("agent-app: {error}");
+        }
+        if let Some(state) = home.parent()
+            && let Err(error) = schedule::write_script(state, &app)
+        {
+            eprintln!("agent-app: {error}");
+        }
+        if cfg!(target_os = "macos")
+            && let Ok(places) = schedule::Places::home()
+        {
+            schedule::refresh(&places, &app, &schedule::launchctl);
         }
     }
     let config = match config() {
@@ -911,7 +938,9 @@ fn main() {
             swarm_board,
             swarm_post,
             swarm_check,
-            swarm_decide
+            swarm_decide,
+            schedules,
+            schedule_remove
         ])
         .setup(|app| {
             let _ = app.get_webview_window("main");

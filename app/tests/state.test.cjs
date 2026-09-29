@@ -1834,3 +1834,68 @@ test('an older daemon on the socket is replaced from the detached screen; a newe
   assert.doesNotMatch(screen.innerHTML, /replace-daemon|update the app/);
   assert.match(screen.innerHTML, /· retrying/);
 });
+
+test('a coordinator hears once, when it rests, of turns its tasks ended that it did not ask for', async () => {
+  const sent = [];
+  const p = page({ request: async (op, params) => { if (op === 'submit') sent.push(params); return { turn: 9 }; }, log() {} });
+  p.S.live = true; p.S.attached = true;
+  p.upsert({ name: 'demo.lead', id: 1, status: 'idle' });
+  for (const [name, id] of [['demo.build', 2], ['demo.test', 3], ['demo.lead-side', 4]]) p.upsert({ name, id, status: 'idle', created_by: 'demo.lead', created_by_id: 1 });
+  p.upsert({ name: 'demo.build.helper', id: 5, status: 'idle', created_by: 'demo.build', created_by_id: 2 });
+  const turn = async (bot, n, status = 'completed', from = null) => {
+    await p.onEvent({ event: 'accepted', bot, turn: n, data: { node: 1, ...(from ? { from: { bot: from, turn: 1 } } : {}) } });
+    await p.onEvent({ event: 'turn_finished', bot, turn: n, data: { status } });
+  };
+  await turn('demo.build', 1, 'completed', 'demo.lead'); // the coordinator's own ask
+  await turn('demo.lead-side', 1); // a side chat of the coordinator
+  await turn('demo.build.helper', 1); // not the coordinator's task
+  await p.tick();
+  assert.equal(sent.length, 0);
+  // You, working in two tasks; one turn was a steer that joined another.
+  await turn('demo.build', 2);
+  await turn('demo.build', 3, 'steered');
+  await turn('demo.test', 1, 'failed');
+  await turn('demo.build', 4, 'completed', 'demo.test');
+  assert.equal(p.S.turnFrom.size, 0, 'authors are forgotten as turns end');
+  await p.tick();
+  assert.equal(sent.length, 1, 'one message for the whole batch');
+  assert.equal(sent[0].bot, 'demo.lead'); assert.equal(sent[0].bot_id, 1); assert.equal(sent[0].delivery, 'queue');
+  assert.match(sent[0].prompt, /^Task updates: /);
+  assert.match(sent[0].prompt, /\n- demo\.build: turn:demo\.build\/2 completed, turn:demo\.build\/4 completed\n- demo\.test: turn:demo\.test\/1 failed$/);
+  // Within the window, while it works: nothing until its turn ends and the window allows.
+  p.S.bots.get('demo.lead').status = 'running';
+  await turn('demo.test', 2);
+  await p.tick();
+  assert.equal(sent.length, 1);
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.lead', turn: 7, data: { status: 'completed' } });
+  await p.tick();
+  assert.equal(sent.length, 2);
+  assert.match(sent[1].prompt, /\n- demo\.test: turn:demo\.test\/2 completed$/);
+  // Nothing new: nothing sent. A deleted coordinator hears nothing more.
+  await p.tick();
+  assert.equal(sent.length, 2);
+  await p.onEvent({ event: 'deleted', bot: 'demo.lead' });
+  await turn('demo.test', 3);
+  await p.tick();
+  assert.equal(sent.length, 2);
+});
+
+test('a coordinator wake that fails is kept for the next one, and replayed turns are not news', async () => {
+  let fail = true; const sent = [];
+  const p = page({ request: async (op, params) => { if (op === 'submit') { if (fail) throw new Error('daemon_draining'); sent.push(params); } return {}; }, log() {} });
+  p.S.attached = true;
+  p.upsert({ name: 'demo.lead', id: 1, status: 'idle' });
+  p.upsert({ name: 'demo.build', id: 2, status: 'idle', created_by: 'demo.lead', created_by_id: 1 });
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 1, data: { status: 'completed' } });
+  await p.tick();
+  assert.equal(p.S.wakes.size, 0, 'the replay is history, not news');
+  p.S.live = true;
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 2, data: { status: 'completed' } });
+  await p.tick();
+  assert.equal(sent.length, 0);
+  fail = false;
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 3, data: { status: 'completed' } });
+  await p.tick();
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].prompt, /turn:demo\.build\/2 completed, turn:demo\.build\/3 completed$/);
+});

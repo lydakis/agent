@@ -29,6 +29,8 @@ window.Daemon = (() => {
       profiles: (dir) => invoke('profiles', { dir }),
       roles: () => invoke('roles'),
       editRole: (name) => invoke('edit_role', { name }),
+      schedules: () => invoke('schedules'),
+      removeSchedule: (name) => invoke('schedule_remove', { name }),
       swarmStart: ({ project, folder, goal, shared, mix, agents, budgetTokens, council }) => invoke('swarm_start', { project, folder, goal, shared, mix, agents, budgetTokens, council: council ?? 0 }),
       swarmAdd: (swarm, row) => invoke('swarm_add', { swarm, row }),
       swarmLeave: (swarm, member) => invoke('swarm_leave', { swarm, member }),
@@ -126,12 +128,13 @@ window.Daemon = (() => {
     emit({ event: 'tool_completed', bot: name, turn, data: { call_id, node: node({ type: 'function_call_output', call_id, output }), artifacts: [] } });
     await steerIn(name, turn);
   }
-  function start(name, prompt) {
+  // `from` is the bot and turn that asked, as a shell's `agent run` names them.
+  function start(name, prompt, from = null) {
     const b = S.bots.get(name);
-    if (b.status !== 'idle') { emit({ event: 'queued', bot: name, turn: S.nextTurn, data: { delivery: 'queue' } }); return null; }
+    if (b.status !== 'idle') { emit({ event: 'queued', bot: name, turn: S.nextTurn, data: { delivery: 'queue', ...(from ? { from } : {}) } }); return null; }
     const turn = S.nextTurn++;
     b.turns++; b.running_turn = turn; b.status = 'running'; b.interrupted = false; b.steers = [];
-    emit({ event: 'accepted', bot: name, turn, data: { request_id: `demo-${turn}`, node: node({ role: 'user', content: [{ type: 'input_text', text: prompt }] }), workspace: b.workspace, model: `${b.provider}/${b.model}` } });
+    emit({ event: 'accepted', bot: name, turn, data: { request_id: `demo-${turn}`, node: node({ role: 'user', content: [{ type: 'input_text', text: prompt }] }), workspace: b.workspace, model: `${b.provider}/${b.model}`, ...(from ? { from } : {}) } });
     return turn;
   }
   function finish(name, turn, status = 'completed') {
@@ -144,6 +147,18 @@ window.Daemon = (() => {
     if (turn === null) return;
     await wait(250);
     if (/scenario|ship|split/i.test(prompt)) { await scenario(name, turn); return; }
+    // The app telling a coordinator its tasks moved: it reads one, and passes on what another needs.
+    if (prompt.startsWith('Task updates: ')) {
+      const handle = /turn:[\w.-]+\/\d+/.exec(prompt)?.[0] ?? 'turn:demo.build/5';
+      const wid = `call_${++calls}`;
+      emit({ event: 'tool_started', bot: name, turn, data: { call_id: wid, name: 'wait', arguments: JSON.stringify({ handles: [handle], timeout_ms: 0 }), arguments_truncated: false } });
+      await wait(400);
+      emit({ event: 'tool_completed', bot: name, turn, data: { call_id: wid, node: node({ type: 'function_call_output', call_id: wid, output: JSON.stringify({ pending: [], results: { [handle]: { status: 'completed', text: 'Moved the cookie reissue into refresh_session, so rotate() no longer writes it. Tests that call rotate() directly now need a session.' } } }) }), artifacts: [] } });
+      await tool(name, turn, 'shell', { command: `"$AGENT_BIN" run --detach --delivery queue --bot demo.test -- 'build moved the cookie reissue into refresh_session: tests calling rotate() directly now need a session first.'` }, JSON.stringify({ exit_code: 0, stderr: '', stdout: '{"bot":"demo.test","status":"queued"}\n', success: true }), 500);
+      await stream(name, turn, 'Passed build\'s cookie change on to test, whose rotate() tests depend on it.');
+      if (!(S.bots.get(name) ?? GONE).interrupted) finish(name, turn);
+      return;
+    }
     const sw = memberOf(name);
     if (sw && prompt.startsWith('You are ')) { await member(sw, name, turn); return; }
     if (sw && prompt.startsWith('[board]')) {
@@ -196,7 +211,7 @@ window.Daemon = (() => {
       emit({ event: 'tool_started', bot: name, turn, data: { call_id, name: 'shell', arguments: JSON.stringify({ command: cmd }), arguments_truncated: false } });
       await wait(250);
       await create(n, `${m.provider}/${m.model}`, name, null, tree ? `~/.agent/worktrees/${n}` : m.workspace);
-      const t = start(n, tasks[n]);
+      const t = start(n, tasks[n], { bot: name, turn });
       handles.push(`turn:${n}/${t}`);
       emit({ event: 'tool_completed', bot: name, turn, data: { call_id, node: node({ type: 'function_call_output', call_id, output: JSON.stringify({ exit_code: 0, stderr: '', stdout: JSON.stringify({ bot: n, handle: `turn:${n}/${t}`, status: 'running', turn: t }) + '\n', success: true }) }), artifacts: [] } });
       work(n, t, replies[n]);
@@ -381,6 +396,12 @@ window.Daemon = (() => {
     // The demo has no editor to open: Edit only says your copy is now the one read.
     roles: async () => [{ name: 'coordinator', file: S.ownRoles?.has('coordinator') ? '/home/you/.agents/agents/coordinator.md' : null }, { name: 'swarm', file: S.ownRoles?.has('swarm') ? '/home/you/.agents/agents/swarm.md' : null }],
     editRole: async (name) => { (S.ownRoles ??= new Set()).add(name); return `/home/you/.agents/agents/${name}.md`; },
+    // Two schedules a coordinator made: a task that checks its PR, and a one-off for itself.
+    schedules: async () => (S.schedules ??= [
+      { name: 'demo.build', bot: 'demo.build', bot_id: 3, when: 'every 30m', once: false, message: "Check the login PR: fix a red CI run and answer new review comments. When it is merged, remove this schedule.", last: { outcome: 'sent', turn: 4, fired_ms: Date.now() - 12 * 60000 } },
+      { name: 'demo.lead', bot: 'demo.lead', bot_id: 1, when: 'at 2026-09-30 09:07', once: true, message: 'Summarize what the tasks finished overnight.', last: null },
+    ]).map((x) => ({ ...x })),
+    removeSchedule: async (name) => { S.schedules = (S.schedules ?? []).filter((x) => x.name !== name); },
     profiles: async () => [{ name: 'reviewer', summary: 'Reviews changes and reports bugs only', model: 'anthropic/claude-sonnet-5' }, { name: 'tester', summary: 'Keeps the test suite green', model: null }],
     // Named from the goal's longest word and dealt as the app's side does it.
     swarmStart: async ({ project, folder, goal, shared, mix, agents, budgetTokens, council = 0 }) => {
