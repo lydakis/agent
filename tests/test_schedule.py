@@ -39,12 +39,19 @@ class ScheduleFireTests(ModelFixture):
     def bot_id(self, bot):
         return next(b['id'] for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout) if b['name'] == bot)
 
+    def store_identity(self):
+        # What the daemon announces in `ready`, and `add` keeps.
+        if not hasattr(self, '_store_id'):
+            self._store_id = json.loads(self.agent('start', '--store', str(self.store)).stdout)['store']['identity']
+        return self._store_id
+
     def fire(self, name, bot, bot_id, message, at=None, app=APP, socket=None, env=None, store_id=None):
         # What a schedule's plist has launchd run.
+        store_id = store_id or self.store_identity()
         args = [str(app), '--schedule-fire', '--name', name, '--bot', bot, '--bot-id', str(bot_id),
                 '--when', 'every 30m', *(['--at', str(at)] if at else []), '--store', str(self.store),
                 *(['--socket', str(socket)] if socket else []),
-                *(['--store-id', store_id] if store_id else []), '--', message]
+                '--store-id', store_id, '--', message]
         env = {**clean_env(), 'HOME': str(self.home), **(env or {})}
         result = subprocess.run(args, env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -90,6 +97,7 @@ class ScheduleFireTests(ModelFixture):
     def test_a_fire_starts_its_stopped_daemon_on_the_socket_it_was_made_with(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
         bot_id = self.bot_id('p.task')
+        self.store_identity()
         self.agent('shutdown', '--store', str(self.store))
         # The app starts a daemon with the `agent` it ships beside it.
         bundle = self.path / 'bundle'

@@ -120,9 +120,14 @@ impl Daemon {
     /// The daemon of the shell the schedule is made from, found as the CLI
     /// finds it. An agent's shell has both its daemon's store and socket.
     fn current() -> Result<Self, String> {
-        let socket = std::env::var_os("AGENT_SOCKET").map(PathBuf::from);
+        // A launchd job has no working folder: paths are kept absolute.
+        let absolute = |p: PathBuf| std::path::absolute(&p).unwrap_or(p);
+        let socket = std::env::var_os("AGENT_SOCKET")
+            .map(PathBuf::from)
+            .map(absolute);
         let store = std::env::var_os("AGENT_STORE")
             .map(PathBuf::from)
+            .map(absolute)
             .or_else(|| {
                 socket
                     .is_none()
@@ -159,7 +164,7 @@ pub struct Schedule {
     pub daemon: Daemon,
     /// The store identity its daemon announced when it was made; a daemon
     /// on that socket serving another store is not its daemon.
-    pub store_id: Option<String>,
+    pub store_id: String,
     pub message: String,
 }
 
@@ -186,9 +191,7 @@ impl Schedule {
         if let Some(socket) = &self.daemon.socket {
             args.extend(["--socket".into(), socket.to_string_lossy().into()]);
         }
-        if let Some(id) = &self.store_id {
-            args.extend(["--store-id".into(), id.clone()]);
-        }
+        args.extend(["--store-id".into(), self.store_id.clone()]);
         args.extend(["--".into(), self.message.clone()]);
         args
     }
@@ -234,7 +237,7 @@ impl Schedule {
             daemon: (daemon.store.is_some() || daemon.socket.is_some())
                 .then_some(daemon)
                 .ok_or_else(|| bad("no --store or --socket"))?,
-            store_id,
+            store_id: store_id.ok_or_else(|| bad("no --store-id"))?,
             message,
         })
     }
@@ -318,8 +321,8 @@ fn amount(value: &str) -> Option<(u32, char)> {
     (n > 0).then_some((n, unit))
 }
 
-/// `--every N{m,h,d}`: counted from now, so the first time is one interval
-/// away. Minutes divide an hour and hours a day, which is what a calendar
+/// `--every N{m,h,d}`: counted from the next whole minute, so the first
+/// time is one interval after it. Minutes divide an hour and hours a day, which is what a calendar
 /// can repeat; anything else is a `--cron`.
 pub fn every(value: &str, now: i64) -> Result<When, String> {
     let bad = || {
@@ -328,7 +331,8 @@ pub fn every(value: &str, now: i64) -> Result<When, String> {
         )
     };
     let (n, unit) = amount(value).ok_or_else(bad)?;
-    let from = local(now);
+    // From the next whole minute: launchd keeps minutes, and a time never comes early.
+    let from = local(now + (60 - now.rem_euclid(60)) % 60);
     let entries = match unit {
         'm' if 60 % n == 0 => (0..60 / n)
             .map(|k| Entry {
@@ -1025,9 +1029,12 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
     let (record, store_id) = runtime()?.block_on(async {
         let client = connect(&socket, &daemon).await?;
         let record = client.request("resume", json!({"bot": bot})).await;
-        let store_id = client.store().map(str::to_owned);
+        let store_id = client
+            .store()
+            .map(str::to_owned)
+            .ok_or_else(|| "the daemon announced no store identity".to_owned());
         client.close().await;
-        record.map(|r| (r, store_id)).map_err(|e| e.to_string())
+        Ok::<_, String>((record.map_err(|e| e.to_string())?, store_id?))
     })?;
     let bot_id = record["id"].as_i64().ok_or("the daemon named no bot id")?;
     let schedule = Schedule {
@@ -1059,11 +1066,11 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
 /// What a fire did, kept for the app to show.
 /// It is the schedule's whole row, which Settings still shows once the
 /// schedule has ended on its own.
-fn record_last(places: &Places, schedule: &Schedule, outcome: &Value) {
+fn record_last(places: &Places, schedule: &Schedule, outcome: &Value) -> Result<(), String> {
     let mut outcome = outcome.clone();
     outcome["fired_ms"] = json!(now() * 1000);
     let row = schedule.json(Some(outcome));
-    let _ = replace(&places.last(&schedule.name), &row.to_string());
+    replace(&places.last(&schedule.name), &row.to_string())
 }
 
 /// Send the message: a new turn when the bot is resting; a working bot, or
@@ -1129,9 +1136,7 @@ pub fn fire_cli(args: &[String]) -> i32 {
                 Err(error) => return json!({"outcome": "failed", "detail": error}),
             };
             // The socket may now be another store's daemon's; its bot ids are its own.
-            if let Some(want) = &schedule.store_id
-                && client.store() != Some(want.as_str())
-            {
+            if client.store() != Some(schedule.store_id.as_str()) {
                 client.close().await;
                 return json!({"outcome": "failed", "detail": format!(
                     "store_mismatch: the daemon at {} serves another store", socket.display())});
@@ -1142,9 +1147,10 @@ pub fn fire_cli(args: &[String]) -> i32 {
         }),
         Err(error) => json!({"outcome": "failed", "detail": error}),
     };
-    record_last(&places, &schedule, &outcome);
+    let recorded = record_last(&places, &schedule, &outcome);
     let sent = outcome["outcome"] == "sent";
-    if schedule.at.is_some() || outcome["outcome"] == "gone" {
+    // One that did not deliver ends only once why is on disk; else its plist stays, listed.
+    if (schedule.at.is_some() || outcome["outcome"] == "gone") && (sent || recorded.is_ok()) {
         end(&places, &schedule.name, !sent, &launchctl);
     }
     0
@@ -1206,10 +1212,11 @@ mod tests {
     }
 
     #[test]
-    fn every_counts_from_now() {
+    fn every_counts_from_the_next_whole_minute() {
         let now = clock(2026, 9, 28, 23, 52) + 30;
+        // Half a minute in: 23:53 is the start, never 23:52 already gone.
         let half = every("30m", now).unwrap();
-        assert_eq!(minutes(&half), [22, 52]);
+        assert_eq!(minutes(&half), [23, 53]);
         assert_eq!(half.text, "every 30m");
         assert!(
             half.entries
@@ -1224,13 +1231,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23]
         );
-        assert!(two.entries.iter().all(|e| e.minute == Some(52)));
+        assert!(two.entries.iter().all(|e| e.minute == Some(53)));
         let daily = every("1d", now).unwrap();
         assert_eq!(
             daily.entries,
             [Entry {
                 hour: Some(23),
-                minute: Some(52),
+                minute: Some(53),
                 ..Entry::default()
             }]
         );
@@ -1331,7 +1338,7 @@ mod tests {
                 store: Some("/Users/a/.agent/state.sqlite".into()),
                 socket: Some("/tmp/s".into()),
             },
-            store_id: Some("00ab".into()),
+            store_id: "00ab".into(),
             message: "Check the PR's CI & reviews; <fix> what's \"red\".\nThen say so.".into(),
         }
     }
@@ -1398,7 +1405,7 @@ mod tests {
                 "load me.lydakis.agent.schedule.p.fix-login.plist",
             ]
         );
-        record_last(&places, &s, &json!({"outcome": "skipped"}));
+        record_last(&places, &s, &json!({"outcome": "skipped"})).unwrap();
         let listed = list(&places);
         assert_eq!(listed.as_array().unwrap().len(), 1);
         assert_eq!(listed[0]["bot"], "p.fix-login");
@@ -1581,7 +1588,8 @@ mod tests {
             &places,
             &once,
             &json!({"outcome": "failed", "detail": "daemon_unavailable"}),
-        );
+        )
+        .unwrap();
         end(&places, &once.name, true, &fine);
         let listed = list(&places);
         assert_eq!(listed.as_array().unwrap().len(), 1);
@@ -1600,7 +1608,7 @@ mod tests {
             &fine,
         )
         .unwrap();
-        record_last(&places, &once, &json!({"outcome": "sent", "turn": 2}));
+        record_last(&places, &once, &json!({"outcome": "sent", "turn": 2})).unwrap();
         end(&places, &once.name, false, &fine);
         assert_eq!(list(&places), json!([]));
         std::fs::remove_dir_all(root).unwrap();

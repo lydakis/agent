@@ -682,8 +682,9 @@ executable with `--schedule`:
 
 `add` defaults to the agent whose shell runs it (`AGENT_BOT`), reaches that
 shell's daemon (starting it, as a fire does, when none answers), and pins
-the schedule to the bot's id. `--every` counts from
-now in minutes that divide an hour, hours that divide a day, or `1d`;
+the schedule to the bot's id and its daemon's store identity, with the
+store and socket paths made absolute. `--every` counts from the next whole
+minute in minutes that divide an hour, hours that divide a day, or `1d`;
 `--in` and `--at` are one-offs within a year, which remove themselves once
 fired (`--in` rounds up to the next whole minute, since launchd keeps
 minutes; `--at` refuses a part out of range or extra parts); `--cron` is read as cron reads it, a day or a weekday when both are
@@ -719,7 +720,8 @@ Settings shows beside each schedule with its message and a Remove button. A
 one-off that delivered leaves nothing; one that ends without delivering
 (its agent gone, the daemon unreachable) loses its plist but keeps that
 file, so Settings and `ls` still list it, as not delivered and why, until
-it is removed. Those files are written, synced, renamed and their folder
+it is removed; when that file cannot be written, the plist stays, still
+listed, rather than ending with no trace. Those files are written, synced, renamed and their folder
 synced. `add`, `rm`, a fire ending its schedule and the app's refresh take
 a lock (`~/.agent/schedules/.lock`) around their changes, and the refresh
 reads each plist again under it. `~/.agent/schedule` is written with its
