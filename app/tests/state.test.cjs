@@ -33,7 +33,7 @@ function page(daemon = {}, storage = null) {
   });
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -1898,6 +1898,36 @@ test('a coordinator wake that fails is kept for the next one, and replayed turns
   await p.tick();
   assert.equal(sent.length, 1);
   assert.match(sent[0].prompt, /turn:demo\.build\/3 completed, and 1 earlier since turn:demo\.build\/2$/);
+});
+
+test('two windows telling a coordinator the same news send one request, and a bot gone while detached leaves nothing behind', async () => {
+  const ids = [];
+  const pages = [0, 1].map(() => page({ request: async (op, params) => { if (op === 'submit') ids.push(params.request_id); return {}; }, log() {} }));
+  for (const p of pages) {
+    p.S.live = true; p.S.attached = true;
+    p.upsert({ name: 'demo.lead', id: 1, status: 'idle' });
+    p.upsert({ name: 'demo.build', id: 2, status: 'idle', created_by: 'demo.lead', created_by_id: 1 });
+    await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 3, data: { status: 'completed' } });
+    await p.tick();
+  }
+  assert.equal(ids.length, 2);
+  assert.equal(ids[0], ids[1]);
+  assert.match(ids[0], /^app-wake-1-[0-9a-f]{16}$/);
+  const [p] = pages;
+  await p.onEvent({ event: 'queued', bot: 'demo.lead', turn: 9, data: { from: { bot: 'demo.build', turn: 3 } } });
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 4, data: { status: 'completed' } });
+  assert.equal(p.S.turnFrom.size, 1); assert.ok(p.S.wakes.has('demo.lead'));
+  p.forgetBot('demo.lead');
+  assert.equal(p.S.turnFrom.size, 0); assert.equal(p.S.wakes.size, 0);
+});
+
+test('Settings lists schedules with no project, and only then when there are some', async () => {
+  const p = page({});
+  const st = p.setupState();
+  p.S.bots.clear();
+  assert.doesNotMatch(p.setupHTML(), /Schedules/);
+  st.schedules = [{ name: 'loose', bot: 'loose', bot_id: 3, when: 'in 2h', once: true, ended: true, message: 'x', last: { outcome: 'failed', fired_ms: 0, detail: 'daemon_unavailable' } }];
+  assert.match(p.setupHTML(), /<h3>Schedules<\/h3>.*not delivered/s);
 });
 
 test('a coordinator\'s backlog stays small however much its tasks do, and what one message leaves out comes next', async () => {

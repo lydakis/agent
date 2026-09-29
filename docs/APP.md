@@ -654,7 +654,11 @@ many. The
 send another task only what it needs, with `agent run --detach --delivery
 queue`, which it reads at its next turn without being interrupted, and
 otherwise answer in one line. A message that fails is kept for the next
-one; a deleted coordinator's is dropped. The window must be open for it.
+one, and one due while the window was detached goes out when it attaches
+again; a coordinator deleted, or gone when the window reattaches, has its
+dropped. The window must be open for it. The message's `request_id` is made
+from the coordinator's id and a hash of its text, so two windows sending
+the same news make one turn.
 
 ## Schedules
 
@@ -677,10 +681,12 @@ executable with `--schedule`:
 shell's daemon, and pins the schedule to the bot's id. `--every` counts from
 now in minutes that divide an hour, hours that divide a day, or `1d`;
 `--in` and `--at` are one-offs within a year, which remove themselves once
-fired; `--cron` is read as cron reads it, a day or a weekday when both are
+fired (`--in` rounds up to the next whole minute, since launchd keeps
+minutes; `--at` refuses a part out of range or extra parts); `--cron` is read as cron reads it, a day or a weekday when both are
 given, up to 1,024 calendar entries. A message is at most 16 KiB. A schedule
 is named after its bot unless `--name` says otherwise, and one added under a
-name in use replaces it.
+name in use replaces it. A name differing from another only in case is
+refused (`name_taken`), since macOS folders would give both one file.
 
 Each is one LaunchAgent, `~/Library/LaunchAgents/me.lydakis.agent.schedule.NAME.plist`,
 and that file is its only record: its program arguments carry the bot, its
@@ -707,7 +713,9 @@ file, so Settings and `ls` still list it, as not delivered and why, until
 it is removed. Those files are written, synced, renamed and their folder
 synced. When the
 app starts from a new place, as after an update, it writes its path into
-every schedule and loads it again. Only macOS has launchd; elsewhere `add`
+every schedule and loads it again, on a thread of its own so the window does
+not wait; one launchd refuses keeps its old path and is tried again at the
+next start. Settings lists schedules also when no project exists. Only macOS has launchd; elsewhere `add`
 refuses with `schedules_unsupported`.
 
 ## What it costs, and where the bounds are

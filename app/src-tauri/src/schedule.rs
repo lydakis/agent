@@ -382,22 +382,30 @@ pub fn after(value: &str, now: i64) -> Result<When, String> {
         'h' => n as i64 * 3600,
         _ => return Err(bad()),
     };
-    once(now + seconds, now)
+    // launchd keeps whole minutes: the next one at or after the delay, never before it.
+    let epoch = now + seconds;
+    once(epoch + (60 - epoch.rem_euclid(60)) % 60, now)
 }
 
 /// `--at 'YYYY-MM-DD HH:MM'`, local time.
 pub fn at(value: &str, now: i64) -> Result<When, String> {
     let bad = || format!("invalid_at: {value}: YYYY-MM-DD HH:MM");
     let (date, time) = value.trim().split_once([' ', 'T']).ok_or_else(bad)?;
-    let mut date = date.split('-').map(str::parse::<u32>);
-    let mut time = time.split(':').map(str::parse::<u32>);
-    let next = |part: Option<Result<u32, _>>| part.and_then(Result::ok).ok_or_else(bad);
+    let parts =
+        |text: &str, sep| -> Option<Vec<u32>> { text.split(sep).map(|p| p.parse().ok()).collect() };
+    let (Some(date), Some(time)) = (parts(date, '-'), parts(time, ':')) else {
+        return Err(bad());
+    };
+    let (&[year, month, day], &[hour, minute]) = (&date[..], &time[..]) else {
+        return Err(bad());
+    };
+    let small = |v: u32, high: u32| (v <= high).then_some(v as u8).ok_or_else(bad);
     let wanted = Local {
-        year: next(date.next())? as i32,
-        month: next(date.next())? as u8,
-        day: next(date.next())? as u8,
-        hour: next(time.next())? as u8,
-        minute: next(time.next())? as u8,
+        year: i32::try_from(year).map_err(|_| bad())?,
+        month: small(month, 12)?,
+        day: small(day, 31)?,
+        hour: small(hour, 23)?,
+        minute: small(minute, 59)?,
     };
     let epoch = epoch_of(wanted).ok_or_else(bad)?;
     once(epoch, now)
@@ -689,30 +697,70 @@ pub fn install(
     launchd: Loader,
 ) -> Result<(), String> {
     valid_name(&schedule.name)?;
+    // macOS folders ignore case: `Build` would overwrite `build`'s files.
+    let file = format!("{LABEL}{}.plist", schedule.name);
+    let taken = std::fs::read_dir(&places.agents)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .find(|f| *f != file && f.eq_ignore_ascii_case(&file));
+    if let Some(taken) = taken {
+        let other = &taken[LABEL.len()..taken.len() - ".plist".len()];
+        return Err(format!(
+            "name_taken: {}: schedule {other} differs only in case; pass --name",
+            schedule.name
+        ));
+    }
     let path = places.plist(&schedule.name);
-    let label = format!("{LABEL}{}", schedule.name);
     let old = std::fs::read_to_string(&path).ok();
-    unload(&label, launchd)?;
-    let loaded = replace(&path, &plist(app, schedule, when, environment))
-        .and_then(|()| launchd(Launchd::Load(&path)));
+    swap(
+        &path,
+        &schedule.name,
+        old.as_deref(),
+        &plist(app, schedule, when, environment),
+        launchd,
+    )?;
+    // A new schedule has no last time; an ended one's record is not it.
+    if old.is_none() {
+        forget(&places.last(&schedule.name));
+    }
+    Ok(())
+}
+
+/// Put `text` in the plist at `path` and load it in place of `old`: when
+/// launchd will not unload the old job nothing changes, and when the new
+/// one cannot be written or loaded the old one is written back and loaded.
+fn swap(
+    path: &Path,
+    name: &str,
+    old: Option<&str>,
+    text: &str,
+    launchd: Loader,
+) -> Result<(), String> {
+    unload(&format!("{LABEL}{name}"), launchd)?;
+    let loaded = replace(path, text).and_then(|()| launchd(Launchd::Load(path)));
     if let Err(error) = loaded {
         match old {
             Some(old) => {
-                if replace(&path, &old).is_ok() {
-                    let _ = launchd(Launchd::Load(&path));
+                if replace(path, old).is_ok() {
+                    let _ = launchd(Launchd::Load(path));
                 }
             }
-            None => {
-                let _ = std::fs::remove_file(&path);
-            }
+            None => forget(path),
         }
         return Err(error);
     }
-    // A new schedule has no last time; an ended one's record is not it.
-    if old.is_none() {
-        let _ = std::fs::remove_file(places.last(&schedule.name));
-    }
     Ok(())
+}
+
+/// Delete a file for good: gone from its folder once that folder is synced.
+fn forget(path: &Path) {
+    if std::fs::remove_file(path).is_ok()
+        && let Some(dir) = path.parent()
+    {
+        let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
+    }
 }
 
 /// Remove a schedule: launchd's copy, then its plist and last result. An
@@ -723,14 +771,16 @@ pub fn remove(places: &Places, name: &str, launchd: Loader) -> Result<(), String
     let path = places.plist(name);
     let last = places.last(name);
     if !path.exists() {
-        return match std::fs::remove_file(&last) {
-            Ok(()) => Ok(()),
-            Err(_) => Err(format!("schedule_not_found: {name}")),
-        };
+        if !last.exists() {
+            return Err(format!("schedule_not_found: {name}"));
+        }
+        forget(&last);
+        return Ok(());
     }
     unload(&format!("{LABEL}{name}"), launchd)?;
     std::fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let _ = std::fs::remove_file(last);
+    let _ = std::fs::File::open(&places.agents).and_then(|d| d.sync_all());
+    forget(&last);
     Ok(())
 }
 
@@ -738,21 +788,23 @@ pub fn remove(places: &Places, name: &str, launchd: Loader) -> Result<(), String
 /// whose unload ends this process. `keep` leaves its last result, so an
 /// end nobody asked for still shows, and why.
 fn end(places: &Places, name: &str, keep: bool, launchd: Loader) {
-    let _ = std::fs::remove_file(places.plist(name));
+    forget(&places.plist(name));
     if !keep {
-        let _ = std::fs::remove_file(places.last(name));
+        forget(&places.last(name));
     }
     let _ = launchd(Launchd::Unload(&format!("{LABEL}{name}")));
 }
 
 /// The app moves when it is updated, so it writes its path into every
-/// schedule again when it starts from somewhere else.
+/// schedule again when it starts from somewhere else. One that fails keeps
+/// the old path, so the next start tries it again.
 pub fn refresh(places: &Places, app: &Path, launchd: Loader) {
     for (schedule, was) in read_all(places) {
         if was == app {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(places.plist(&schedule.name)) else {
+        let path = places.plist(&schedule.name);
+        let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
         let moved = text.replacen(
@@ -760,12 +812,7 @@ pub fn refresh(places: &Places, app: &Path, launchd: Loader) {
             &format!("<string>{}</string>", escape(&app.to_string_lossy())),
             1,
         );
-        let path = places.plist(&schedule.name);
-        let label = format!("{LABEL}{}", schedule.name);
-        if replace(&path, &moved).is_ok() {
-            let _ = launchd(Launchd::Unload(&label));
-            let _ = launchd(Launchd::Load(&path));
-        }
+        let _ = swap(&path, &schedule.name, Some(&text), &moved, launchd);
     }
 }
 
@@ -944,7 +991,7 @@ pub async fn send(client: &Client, schedule: &Schedule) -> Value {
         .request(
             "submit",
             json!({"bot": schedule.bot, "bot_id": schedule.bot_id,
-                "request_id": format!("schedule-{}-{}-{}", schedule.name, now(), std::process::id()),
+                "request_id": format!("schedule-{}-{}-{}", schedule.bot_id, now(), std::process::id()),
                 "prompt": schedule.message, "delivery": delivery}),
         )
         .await;
@@ -1127,6 +1174,13 @@ mod tests {
         assert!(at("2026-02-30 09:00", now).is_err());
         assert!(at("tomorrow", now).is_err());
         assert!(after("2d", now).is_err());
+        // A part out of range is refused, not wrapped; nothing after the minute.
+        assert!(at("2027-257-29 09:07", now).is_err());
+        assert!(at("2026-10-01 09:07:99", now).is_err());
+        assert!(at("2026-10-01-5 09:07", now).is_err());
+        // A delay is never cut short to the start of its minute.
+        let late = after("1m", now + 59).unwrap();
+        assert_eq!(late.at, Some(clock(2026, 9, 28, 23, 54)));
     }
 
     #[test]
@@ -1258,6 +1312,25 @@ mod tests {
         });
         assert!(refused.unwrap_err().contains("refused"));
         assert_eq!(list(&places).as_array().unwrap().len(), 1);
+        // A move launchd refuses to load keeps the old path, to be tried again.
+        let refused = |what: Launchd| match what {
+            Launchd::Load(path) if std::fs::read_to_string(path).unwrap().contains("/B/") => {
+                Err("launchctl bootstrap: refused".to_owned())
+            }
+            _ => Ok(()),
+        };
+        refresh(&places, Path::new("/B/agent-app"), &refused);
+        assert_eq!(read_all(&places)[0].1, Path::new("/A/agent-app"));
+        // A name differing only in case would share its files on macOS.
+        let cased = Schedule {
+            name: "P.Fix-Login".into(),
+            ..schedule()
+        };
+        let taken = install(&places, app, &cased, &entries, &[], &launchd).unwrap_err();
+        assert!(
+            taken.starts_with("name_taken: P.Fix-Login: schedule p.fix-login"),
+            "{taken}"
+        );
         // A move of the app is written into every schedule and reloaded.
         asked.borrow_mut().clear();
         refresh(&places, Path::new("/B/agent-app"), &launchd);

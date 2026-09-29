@@ -227,6 +227,9 @@ function forgetBot(name) {
   const t = parent && S.transcripts.get(parent.name);
   if (t) { t.items = t.items.filter(it => it.kind !== 'peer' || it.who !== name); t.peers = t.peers.filter(who => who !== name); t.gen += 1; }
   S.bots.delete(name); S.transcripts.delete(name); S.override.delete(name);
+  // A coordinator gone hears nothing more, and its queued turns never end.
+  if (S.wakes.has(name)) { clearTimeout(S.wakes.get(name).timer); S.wakes.delete(name); }
+  for (const key of S.turnFrom.keys()) if (key.startsWith(`${name}\u0000`)) S.turnFrom.delete(key);
   // A draft belongs to its bot, so it goes with it.
   if (S.ui.side === name) S.ui.side = null;
   S.drafts.delete(name);
@@ -641,9 +644,6 @@ async function onEvent(ev) {
       looked.delete(name);
       const p = bot(name)?.project;
       forgetBot(name);
-      if (S.wakes.has(name)) { clearTimeout(S.wakes.get(name).timer); S.wakes.delete(name); }
-      // Its queued turns never end.
-      for (const key of S.turnFrom.keys()) if (key.startsWith(`${name}\u0000`)) S.turnFrom.delete(key);
       if (S.selected === name) S.selected = p && S.bots.has(p + LEAD) ? p + LEAD : S.bots.keys().next().value ?? '';
       // A deleted agent leaves its swarm, which stops counting it and posting to it.
       if (S.memberOf.has(name)) {
@@ -879,7 +879,9 @@ async function wake(lead) {
   const sent = [...w.tasks].slice(0, WAKE_TASKS);
   for (const [name] of sent) w.tasks.delete(name);
   w.last = Date.now();
-  try { await Daemon.request('submit', { bot: lead, bot_id: l.id, request_id: `app-wake-${crypto.randomUUID()}`, prompt: wakeText(sent, w.tasks.size), delivery: 'queue' }); }
+  // Named by what it says, so another window sending the same news is the same request, not a second turn.
+  const prompt = wakeText(sent, w.tasks.size);
+  try { await Daemon.request('submit', { bot: lead, bot_id: l.id, request_id: `app-wake-${l.id}-${digest(prompt)}`, prompt, delivery: 'queue' }); }
   catch (e) {
     if (/^bot_not_found/.test(e?.message ?? '')) { S.wakes.delete(lead); return; }
     const later = w.tasks;
@@ -888,6 +890,12 @@ async function wake(lead) {
     Daemon.log?.(`wake ${lead}: ${e?.message ?? e}`);
     wakeSoon(lead);
   }
+}
+// FNV-1a over the text's UTF-16 units, 64 bits as hex.
+function digest(text) {
+  let h = 0xcbf29ce484222325n;
+  for (let i = 0; i < text.length; i++) h = BigInt.asUintN(64, (h ^ BigInt(text.charCodeAt(i))) * 0x100000001b3n);
+  return h.toString(16).padStart(16, '0');
 }
 function wakeText(tasks, more) {
   const lines = tasks.map(([name, t]) => `- ${name}: turn:${name}/${t.turn} ${t.status}${t.count > 1 ? `, and ${t.count - 1} earlier since turn:${name}/${t.first}` : ''}`);
@@ -2140,7 +2148,8 @@ function setupHTML() {
   return `<div class="shead"><b>${ready && projects ? 'Settings' : 'Set up Agent'}</b><button type="button" class="ibtn" data-act="setup-close" title="Close" aria-label="Close"${busy}>✕</button></div>`
     + step(1, 'Providers', ready, `${rows}<div class="row">${set?.restartable === false ? '<p class="dim">This window uses a daemon it did not start, so it cannot apply provider changes.</p>' : add}${st.adding === null ? refresh : ''}</div>${listed}`)
     + step(2, 'First project', projects, project)
-    + (projects ? rolesHTML(st, busy) + schedulesHTML(st, busy) : '')
+    // Schedules can outlive every project, and an agent outside one can have them.
+    + (projects ? rolesHTML(st, busy) : '') + (projects || st.schedules?.length ? schedulesHTML(st, busy) : '')
     + (st.busy ? `<p class="busy">${esc(st.busy)}</p>` : '') + (st.error ? `<p class="bad">${esc(st.error)}</p>` : '');
 }
 // The app's roles, each read from your own file in every project once you have one. Edit makes that

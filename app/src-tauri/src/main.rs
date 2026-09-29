@@ -888,10 +888,12 @@ fn main() {
         {
             eprintln!("agent-app: {error}");
         }
+        // Off the window's way: a moved app reloads every schedule, each a launchctl run.
         if cfg!(target_os = "macos")
             && let Ok(places) = schedule::Places::home()
         {
-            schedule::refresh(&places, &app, &schedule::launchctl);
+            let app = app.clone();
+            std::thread::spawn(move || schedule::refresh(&places, &app, &schedule::launchctl));
         }
     }
     let config = match config() {
