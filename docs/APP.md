@@ -669,9 +669,11 @@ unless the coordinator asked for it itself (its `from` names the lead) or
 the bot is the coordinator's own fork or side chat (`PROJECT.lead-…`). A
 steer's turn is part of the turn it joined. Turns replayed on attach are
 history, not news; one that ends live while the window is still reading the
-list of bots is held until the list says who made its bot. A queued turn's
+list of bots is held until the list says who made its bot, and dropped if the bot is
+deleted meanwhile. A queued turn's
 `accepted` names its author again, so a window attached after the `queued`
-event was pruned still knows the coordinator asked for it. The coordinator is told only while it rests, at most
+event was pruned still knows the coordinator asked for it. The coordinator is told only while it rests (nothing is armed while it
+works), at most
 once every ten minutes, in one message queued to it: `Task updates:`, then
 one line per task with its latest ended turn's handle and status, and how
 many turns ended before it since which handle. The handles are what its
@@ -731,8 +733,9 @@ has both), the store identity its daemon announced, the one-off's time and
 the message. A fire whose daemon announces another store (a reused socket)
 sends nothing and records `store_mismatch`. Replacing one unloads the old
 job first and, if the new plist cannot be written or loaded, writes the old
-one back and loads it; a removal launchd refuses keeps the plist, so it can
-be retried. When it fires, the app's executable runs with `--schedule-fire`
+one back and loads it; an old plist that cannot be read is not replaced,
+since it could not be put back. A replacement starts with no last result.
+A removal launchd refuses keeps the plist, so it can be retried. When it fires, the app's executable runs with `--schedule-fire`
 and those arguments. It connects to the daemon, and when none answers and
 the store is known, starts one for it on that socket as the app does, with
 the login shell's environment and `~/.agent/env`. A repeating schedule
@@ -751,7 +754,9 @@ one-off that delivered leaves nothing; one that ends without delivering
 (its agent gone, the daemon unreachable) loses its plist but keeps that
 file, so Settings and `ls` still list it, as not delivered and why, until
 it is removed; when that file cannot be written, the plist stays, still
-listed, rather than ending with no trace. Those files are written, synced, renamed and their folder
+listed, rather than ending with no trace. A plist the fire cannot delete
+stays loaded too, listed with its result, for `rm`: unloaded, it would load
+again at the next login. Those files are written, synced, renamed and their folder
 synced. `add`, `rm`, a fire ending its schedule and the app's refresh take
 a lock (`~/.agent/schedules/.lock`) around their changes, and the refresh
 reads each plist again under it. `~/.agent/schedule` is written with its

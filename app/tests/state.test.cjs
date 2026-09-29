@@ -555,6 +555,9 @@ test('a task that ends live before the snapshot names its creator still reaches 
   await attaching;
   assert.deepEqual({...p.S.wakes.get('demo.lead').tasks.get('demo.build')},{first:4,turn:4,status:'completed',count:1});
   assert.equal(p.S.heldNews.length,0);
+  // News held for a bot deleted meanwhile is not a later same-named bot's.
+  p.S.heldNews.push(['demo.build',5,'completed',undefined]);p.forgetBot('demo.build');
+  assert.equal(p.S.heldNews.length,0);
 });
 
 test('submissions wait for a known bot identity instead of sending an unpinned name', async () => {
@@ -2002,6 +2005,7 @@ test('a coordinator\'s backlog stays small however much its tasks do, and what o
   for (let n = 1; n <= 50; n++) for (let i = 0; i < 40; i++) await p.onEvent({ event: 'turn_finished', bot: `demo.t${i}`, turn: n, data: { status: 'completed' } });
   const w = p.S.wakes.get('demo.lead');
   assert.equal(w.tasks.size, 40);
+  assert.equal(w.timer, null, 'nothing is armed while the coordinator works');
   assert.deepEqual({ ...w.tasks.get('demo.t0') }, { first: 1, turn: 50, status: 'completed', count: 50 });
   await p.onEvent({ event: 'turn_finished', bot: 'demo.lead', turn: 2, data: { status: 'completed' } });
   await p.tick();

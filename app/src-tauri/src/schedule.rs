@@ -751,7 +751,12 @@ pub fn install(
         ));
     }
     let path = places.plist(&schedule.name);
-    let old = std::fs::read_to_string(&path).ok();
+    // One that cannot be read cannot be put back, so it is not replaced.
+    let old = match std::fs::read_to_string(&path) {
+        Ok(old) => Some(old),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
     swap(
         &path,
         &schedule.name,
@@ -759,10 +764,9 @@ pub fn install(
         &plist(app, schedule, when, environment),
         launchd,
     )?;
-    // A new schedule has no last time; an ended one's record is not it.
-    if old.is_none() {
-        forget(&places.last(&schedule.name));
-    }
+    // The new schedule has no last time; the one it replaced, or an ended
+    // one's, is not it.
+    let _ = forget(&places.last(&schedule.name));
     Ok(())
 }
 
@@ -785,7 +789,9 @@ fn swap(
                     let _ = launchd(Launchd::Load(path));
                 }
             }
-            None => forget(path),
+            None => {
+                let _ = forget(path);
+            }
         }
         return Err(error);
     }
@@ -824,12 +830,17 @@ impl Lock {
 }
 
 /// Delete a file for good: gone from its folder once that folder is synced.
-fn forget(path: &Path) {
-    if std::fs::remove_file(path).is_ok()
-        && let Some(dir) = path.parent()
-    {
-        let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
-    }
+/// One already gone is fine.
+fn forget(path: &Path) -> Result<(), String> {
+    let gone = match std::fs::remove_file(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        gone => gone,
+    };
+    gone.and_then(|()| match path.parent() {
+        Some(dir) => std::fs::File::open(dir).and_then(|d| d.sync_all()),
+        None => Ok(()),
+    })
+    .map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Remove a schedule: launchd's copy, then its plist and last result. An
@@ -855,24 +866,26 @@ pub fn remove(places: &Places, name: &str, launchd: Loader) -> Result<(), String
         if !last_here {
             return Err(format!("schedule_not_found: {name}"));
         }
-        forget(&last);
-        return Ok(());
+        return forget(&last);
     }
     unload(&format!("{LABEL}{name}"), launchd)?;
-    std::fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let _ = std::fs::File::open(&places.agents).and_then(|d| d.sync_all());
-    forget(&last);
-    Ok(())
+    forget(&path)?;
+    forget(&last)
 }
 
 /// A firing schedule ends itself: its plist first, then launchd's copy,
 /// whose unload ends this process. `keep` leaves its last result, so an
-/// end nobody asked for still shows, and why.
+/// end nobody asked for still shows, and why. A plist that will not go
+/// stays loaded with its result, listed, for `rm`: unloaded, it would load
+/// again at the next login.
 fn end(places: &Places, name: &str, keep: bool, launchd: Loader) {
     let _lock = Lock::take(places);
-    forget(&places.plist(name));
+    if let Err(error) = forget(&places.plist(name)) {
+        eprintln!("{}", json!({"error": error}));
+        return;
+    }
     if !keep {
-        forget(&places.last(name));
+        let _ = forget(&places.last(name));
     }
     let _ = launchd(Launchd::Unload(&format!("{LABEL}{name}")));
 }
@@ -1411,6 +1424,9 @@ mod tests {
         assert_eq!(listed[0]["bot"], "p.fix-login");
         assert_eq!(listed[0]["message"], s.message);
         assert_eq!(listed[0]["last"]["outcome"], "skipped");
+        // A replacement starts with no last time of its own.
+        install(&places, app, &s, &entries, &[], &launchd).unwrap();
+        assert!(list(&places)[0]["last"].is_null());
         // A load launchd refuses leaves nothing behind.
         let other = Schedule {
             name: "p.other".into(),
@@ -1558,6 +1574,26 @@ mod tests {
         };
         remove(&places, &s.name, &gone).unwrap();
         assert!(!places.plist(&s.name).exists());
+        // An old one that cannot be read could not be put back: not unloaded, not replaced.
+        let odd = Schedule {
+            name: "p.odd".into(),
+            at: Some(1_790_000_000),
+            ..schedule()
+        };
+        std::fs::create_dir_all(places.plist(&odd.name).join("x")).unwrap();
+        let unloads = RefCell::new(0);
+        let counting = |what: Launchd| {
+            if let Launchd::Unload(_) = what {
+                *unloads.borrow_mut() += 1;
+            }
+            Ok(())
+        };
+        assert!(install(&places, app, &odd, &entries, &[], &counting).is_err());
+        // A one-off whose plist will not go stays loaded, its result kept, for `rm`.
+        record_last(&places, &odd, &json!({"outcome": "sent", "turn": 2})).unwrap();
+        end(&places, &odd.name, false, &counting);
+        assert_eq!(*unloads.borrow(), 0);
+        assert!(places.last(&odd.name).exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 

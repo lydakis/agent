@@ -231,6 +231,8 @@ function forgetBot(name) {
   if (S.wakes.has(name)) { clearTimeout(S.wakes.get(name).timer); S.wakes.delete(name); }
   for (const w of S.wakes.values()) if (w.tasks.delete(name) && !w.tasks.size) { clearTimeout(w.timer); w.timer = null; }
   for (const key of S.turnFrom.keys()) if (key.startsWith(`${name}\u0000`)) S.turnFrom.delete(key);
+  // Held news is this bot's; a later bot of the same name is another.
+  S.heldNews = S.heldNews.filter(([held]) => held !== name);
   // A draft belongs to its bot, so it goes with it.
   if (S.ui.side === name) S.ui.side = null;
   S.drafts.delete(name);
@@ -885,12 +887,12 @@ function merge(tasks, name, t) {
   const had = tasks.get(name);
   tasks.set(name, had ? { ...(t.turn >= had.turn ? t : had), first: Math.min(had.first, t.first), count: had.count + t.count } : t);
 }
+// A working coordinator waits for its turn to end, which calls this again.
 function wakeSoon(lead) {
-  const w = S.wakes.get(lead);
-  if (!w || w.timer || !w.tasks.size) return;
+  const w = S.wakes.get(lead), l = bot(lead);
+  if (!w || w.timer || !w.tasks.size || !l || isActive(l.status)) return;
   w.timer = setTimeout(() => { w.timer = null; wake(lead); }, Math.max(0, w.last + WAKE_MS - Date.now()));
 }
-// A working coordinator is told when its turn ends, which calls this again.
 async function wake(lead) {
   const w = S.wakes.get(lead), l = bot(lead);
   if (!w || !w.tasks.size || !S.attached || !l || l.id == null || isActive(l.status)) return;
