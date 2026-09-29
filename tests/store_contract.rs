@@ -1687,6 +1687,36 @@ fn history_items_name_who_sent_each_prompt_after_its_turns_are_gone() {
 }
 
 #[test]
+fn a_turn_started_from_the_line_names_its_author_again() {
+    let mut db = db();
+    let person = gated_turn(&mut db, None);
+    db.create("Carol", Some("/synthetic"), binding()).unwrap();
+    let by_bob = TurnOptions {
+        from: Some(("Bob".into(), person)),
+        delivery: Delivery::Queue,
+        ..TurnOptions::default()
+    };
+    // No slot: the turn waits, and its `accepted` comes later from the line.
+    let waiting = db
+        .begin(
+            "Carol",
+            "r1",
+            "delegated work",
+            false,
+            &by_bob,
+            allow_provider,
+        )
+        .unwrap();
+    assert_eq!(waiting.entry.unwrap()["event"], "queued");
+    let (accepted, _) = db.start(waiting.turn, allow_provider).unwrap();
+    assert_eq!(accepted["event"], "accepted");
+    assert_eq!(
+        accepted["data"]["from"],
+        json!({"bot":"Bob","turn":person,"id":1})
+    );
+}
+
+#[test]
 fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
     let mut db = db();
     let person = gated_turn(&mut db, None);

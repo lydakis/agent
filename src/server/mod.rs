@@ -2409,6 +2409,9 @@ impl Service {
                 origin,
             } => {
                 name(&request_id)?;
+                if origin.is_some() && from.is_some() {
+                    return fail_with("invalid_origin", "from and origin are mutually exclusive");
+                }
                 if let Some(origin) = &origin {
                     name(origin).map_err(|_| Error::with("invalid_origin", origin.as_str()))?;
                 }

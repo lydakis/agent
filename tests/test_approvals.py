@@ -559,6 +559,8 @@ class PromptReadTests(ModelFixture):
         # What sent a prompt when no bot's turn did is a name the client picks.
         self.assertEqual(client.request('submit', bot='Bob', request_id='o', prompt='hi',
                                         origin='not a name')['error'], 'invalid_origin')
+        self.assertEqual(client.request('submit', bot='Bob', request_id='both', prompt='hi',
+                                        origin='tasks', **{'from': {'bot': 'Bob', 'turn': first}})['error'], 'invalid_origin')
         second = client.request('submit', bot='Bob', request_id='c', prompt='done',
                                 **{'from': {'bot': 'Bob', 'turn': first}})['result']['turn']
         self.assertEqual(client.finished(second)['data']['status'], 'completed')
@@ -947,13 +949,14 @@ class AutoApproverTests(ModelFixture):
         daemon = self.daemon()
         self.approver(daemon)
         # A scheduled message is no person's word: like a model's, it is shown but grants nothing.
-        turn = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf DANGER',
-                              origin='schedule')['result']['turn']
-        daemon.finished(turn)
-        request = self.judge.requests.get(timeout=5)['body']['state']['request']
-        self.assertEqual(request, [{'by': 'model', 'text': 'shell:printf DANGER'}])
-        self.assertEqual(daemon.request('prompts', bot='Bob', turn=turn)['result']['prompts'],
-                         [{'turn': turn, 'text': 'shell:printf DANGER', 'origin': 'schedule'}])
+        for origin in ('tasks', 'schedule'):
+            turn = daemon.request('submit', bot='Bob', request_id=origin, prompt='shell:printf DANGER',
+                                  origin=origin)['result']['turn']
+            daemon.finished(turn)
+            request = self.judge.requests.get(timeout=5)['body']['state']['request']
+            self.assertEqual(request, [{'by': 'model', 'text': 'shell:printf DANGER'}])
+            self.assertEqual(daemon.request('prompts', bot='Bob', turn=turn)['result']['prompts'],
+                             [{'turn': turn, 'text': 'shell:printf DANGER', 'origin': origin}])
 
     def test_a_call_is_judged_with_the_files_it_runs_that_the_turn_wrote(self):
         def shell_danger(body, id):

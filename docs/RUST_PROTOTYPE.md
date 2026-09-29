@@ -1083,7 +1083,7 @@ included, counts it in the request's idempotency, and reports it on
 `accepted`, `queued` and `steered`, with the sender's identity as `from.id`. Like the
 creator, it is declared, not verified. A client that sends a prompt on its own,
 not from a bot's turn, may name itself with `origin` (a name's characters,
-else `invalid_origin`), stored and reported the same way; the daemon gives it
+else `invalid_origin`), mutually exclusive with `from`, stored and reported the same way; the daemon gives it
 no meaning, but a prompt with an `origin` is no person's word to the
 approver. The sender's identity is resolved at submit and kept on the turn
 (`turns.from_id`), so a queued message whose sender is deleted before it
