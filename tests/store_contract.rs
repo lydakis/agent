@@ -1959,6 +1959,7 @@ fn schema_40_keeps_each_bot_written_prompts_sender_with_its_node() {
              ALTER TABLE turns DROP COLUMN from_id;
              UPDATE events SET data=json_object('from',json_extract(data,'$.steer'),
                 'node',json_extract(data,'$.node')) WHERE kind='steered';
+             UPDATE events SET data=json_remove(data,'$.from.id') WHERE kind IN ('accepted','queued');
              PRAGMA user_version=40;",
         )
         .unwrap();
@@ -1986,6 +1987,16 @@ fn schema_40_keeps_each_bot_written_prompts_sender_with_its_node() {
             json!(["work", bob])
         ]
     );
+    // Stored events name the sender as new ones do.
+    let events: Vec<Value> = Connection::open(&path)
+        .unwrap()
+        .prepare("SELECT json_extract(data,'$.from') FROM events WHERE kind IN ('accepted','queued') AND bot='Carol' ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get::<_, Option<String>>(0))
+        .unwrap()
+        .map(|from| from.unwrap().map_or(Value::Null, |f| serde_json::from_str(&f).unwrap()))
+        .collect();
+    assert_eq!(events, [bob.clone(), bob.clone(), Value::Null]);
     // The turn still reads the steers it took in, now named as `steer`.
     let texts: Vec<Value> = db.prompts("Carol", turn, 1024).unwrap()["prompts"]
         .as_array()

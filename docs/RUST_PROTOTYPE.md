@@ -1343,7 +1343,9 @@ it with, so every parked record has one shape. Schema 41 adds `turns.origin` and
 wrote is found by its first node, a steer by the node it shares or the one its
 `steered` finish recorded, with the sender's identity where its turn is still
 stored. A steer whose finish event was pruned names no sender. Stored `steered`
-events name the steer's turn as `steer`, leaving `from` for the sender.
+events name the steer's turn as `steer`, leaving `from` for the sender, and
+stored `accepted` and `queued` senders gain their `id`, so a replay reads as
+live events do.
 
 New artifacts larger than 64 KiB, up to the existing 1 MiB output bound, may
 use lossless LZ4 blocks. Each remains one SQLite BLOB with a small offset
