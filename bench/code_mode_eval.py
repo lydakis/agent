@@ -32,7 +32,8 @@ harness reads the person's own AGENTS.md, skills, MCP servers or mcpx
 configuration. The arms of one task and trial start together.
 
 Recorded per run: the answer and whether it is right, input (and cached
-input) and output tokens, the tool calls the model issued, the shop calls
+input) and output tokens (for Agent, of every bot in the run, since a bot
+may delegate to peers it starts), the tool calls the model issued, the shop calls
 the server served, the shell commands, and wall time. Codex's wall time
 includes its process start; Agent's daemon is started before the clock.
 
@@ -212,6 +213,9 @@ def run_agent(arm, task, work, run_dir, env, args):
         except subprocess.TimeoutExpired as error:
             stdout, stderr = _text(error.stdout), 'timeout'
         wall = time.monotonic() - started
+        # A bot may delegate to peers it starts; their tokens are the task's too.
+        listed = subprocess.run([args.agent, 'ls', '--socket', str(socket)], env=env, capture_output=True, text=True)
+        bots = json.loads(listed.stdout) if listed.returncode == 0 else None
     finally:
         daemon.terminate()
         try:
@@ -247,8 +251,17 @@ def run_agent(arm, task, work, run_dir, env, args):
             text.append('\n')
         elif kind == 'turn_finished':
             status = data.get('status')
-    return dict(status=status, answer=''.join(text), usage=usage, tools=tools, commands=commands,
-                model_requests=requests, wall_s=round(wall, 1))
+    record = dict(status=status, answer=''.join(text), usage=usage, tools=tools, commands=commands,
+                  model_requests=requests, wall_s=round(wall, 1))
+    if bots is None:
+        record['status'] = f'{status}; bot listing failed'
+    elif len(bots) > 1:
+        record['task_bot_usage'] = usage
+        record['bots'] = len(bots)
+        record['usage'] = {'input_tokens': sum(b['input_tokens'] for b in bots),
+                           'cached_input_tokens': sum(b['cached_input_tokens'] for b in bots),
+                           'output_tokens': sum(b['tokens_used'] - b['input_tokens'] for b in bots)}
+    return record
 
 
 def run_one(arm, task, trial, root, args, skill):
