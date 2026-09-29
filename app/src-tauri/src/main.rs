@@ -1195,6 +1195,12 @@ fn main() {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_title(&title);
             }
+            // What a crash left for hosts (a master still connected, its
+            // files) is retired now, not when that host is next opened.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                handle.state::<Windows>().hosts.prepare().await;
+            });
             Ok(())
         })
         // A closed window detaches; the last window on a host closes its
@@ -1250,8 +1256,8 @@ async fn hosts(windows: State<'_, Windows>) -> Result<Value, String> {
             let Some((at, alias)) = pending.next() else {
                 break;
             };
-            let ssh = windows.hosts.ssh().to_owned();
-            asked.spawn(async move { (at, remote::resolve(&ssh, &alias).await) });
+            let resolving = windows.hosts.resolve(alias);
+            asked.spawn(async move { (at, resolving.await) });
         }
         let Some(done) = asked.join_next().await else {
             break;

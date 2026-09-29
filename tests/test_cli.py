@@ -155,6 +155,13 @@ class SocketAndCliTests(ModelFixture):
         printed = json.loads(relative.stdout)['socket']
         self.assertTrue(printed.startswith('/'), printed)
         self.assertEqual(Path(printed).resolve(), self.socket.resolve())
+        # A path JSON cannot carry is refused before any daemon starts.
+        odd = os.fsdecode(bytes(self.path) + b'/odd-\xff.sock')
+        refused = subprocess.run([*self.base, 'start'], env={**clean_env(), 'AGENT_STORE': str(self.path/'odd.sqlite'), 'AGENT_SOCKET': odd},
+                                 capture_output=True, text=True, timeout=30, cwd=self.path)
+        self.assertEqual(refused.returncode, 1, refused.stderr)
+        self.assertIn('socket_path_unsupported', refused.stderr)
+        self.assertFalse((self.path/'odd.sqlite').exists())
         # A running daemon answers again; nothing new starts.
         again = json.loads(self.agent('start', '--store', str(self.store)).stdout)
         self.assertEqual(again['pid'], started['pid'])

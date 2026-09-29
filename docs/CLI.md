@@ -161,7 +161,8 @@ socket override, the socket is derived from the selected store.
 `run` may start the daemon. `start` starts it if none is running, with the
 same startup as `run`, and prints the running daemon's ready line with
 `socket`, the absolute path it answered on, added; a caller that ran `start` over SSH
-forwards that path. When the daemon holding the socket speaks another
+forwards that path. A socket path that is not UTF-8, which the ready line
+cannot carry, is refused before anything starts (`socket_path_unsupported`). When the daemon holding the socket speaks another
 protocol, `start` still prints its ready line and then fails with
 `daemon_protocol_mismatch`, so a caller can tell an older daemon from a newer
 one. `stats`,

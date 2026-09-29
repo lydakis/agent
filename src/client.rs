@@ -973,6 +973,19 @@ pub fn main(args: Vec<String>) -> Result<i32> {
         // command over SSH knows what to forward. A daemon of another
         // protocol is printed too, then refused.
         "start" => {
+            // Absolute, as a caller elsewhere must name it: a relative
+            // AGENT_SOCKET is relative to this command's directory. A path
+            // JSON cannot carry is refused before anything starts.
+            let socket = std::path::absolute(&options.socket)?;
+            let Some(socket) = socket.to_str().map(str::to_owned) else {
+                return fail_with(
+                    "socket_path_unsupported",
+                    format!(
+                        "{} is not UTF-8, so the ready line cannot name it",
+                        socket.display()
+                    ),
+                );
+            };
             let (mut ready, refused) = match ensure_daemon(&options) {
                 Ok(connection) => (connection.ready, None),
                 Err(error) => match error.facts.as_ref().and_then(|facts| facts.get("ready")) {
@@ -980,10 +993,7 @@ pub fn main(args: Vec<String>) -> Result<i32> {
                     None => return Err(error),
                 },
             };
-            // Absolute, as a caller elsewhere must name it: a relative
-            // AGENT_SOCKET is relative to this command's directory.
-            let socket = std::path::absolute(&options.socket)?;
-            ready["socket"] = json!(socket.to_str());
+            ready["socket"] = json!(socket);
             print_json(&ready, options.pretty)?;
             refused.map_or(Ok(0), Err)
         }

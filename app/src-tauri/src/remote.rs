@@ -22,17 +22,12 @@ use std::{
     process::{Output, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
-use tokio::process::{Child, Command};
+use tokio::process::{Child, ChildStderr, Command};
 
-/// OpenSSH's own bound on reaching the host, in seconds.
-const CONNECT_TIMEOUT: u64 = 10;
-/// Keepalives, so a link that died without a word is noticed within a minute.
-const ALIVE_INTERVAL: u64 = 15;
-const ALIVE_COUNT: u64 = 3;
 /// Connecting and authenticating, beyond which the master is given up.
 const MASTER_TIMEOUT: Duration = Duration::from_secs(30);
 /// `agent start` bounds itself at 10 s and `agent shutdown` at 30 s; a
@@ -45,6 +40,13 @@ const BACKOFF_FIRST: Duration = Duration::from_secs(1);
 const BACKOFF_LAST: Duration = Duration::from_secs(30);
 /// What a master's stderr keeps for its reason: the end of it.
 const STDERR_KEPT: usize = 4096;
+/// How long an ssh the app ends is given to close its connection and remove
+/// its control socket before it is killed.
+const STOP_GRACE: Duration = Duration::from_secs(2);
+/// How long a master an earlier run left is given to exit when asked.
+const RETIRE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Quitting: every host closes at once, within this.
+const QUIT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Bounds on reading `~/.ssh/config` and what it includes.
 const MAX_CONFIG: u64 = 1024 * 1024;
 /// How much config is read in all, across includes.
@@ -253,10 +255,10 @@ fn glob(pattern: &str, name: &str) -> bool {
 
 /// What OpenSSH says an alias connects to, from `ssh -G`: its user, host
 /// name and port. None when ssh cannot say.
-pub async fn resolve(ssh: &Path, alias: &str) -> Option<Value> {
+async fn resolve(ssh: &Path, alias: &str, registry: &Registry) -> Option<Value> {
     let args = ["-G", "--", alias].map(OsString::from);
     // Its whole config is a few KiB.
-    let output = bounded(ssh, &args, MAX_RESOLVED, Duration::from_secs(5))
+    let output = bounded(ssh, &args, MAX_RESOLVED, Duration::from_secs(5), registry)
         .await
         .ok()?;
     if !output.status.success() {
@@ -281,6 +283,16 @@ pub struct Paths {
     pub lock: PathBuf,
 }
 
+impl Paths {
+    fn named(dir: &Path, name: &str) -> Self {
+        Self {
+            ctl: dir.join(format!("{name}.ctl")),
+            socket: dir.join(format!("{name}.sock")),
+            lock: dir.join(format!("{name}.lock")),
+        }
+    }
+}
+
 /// OpenSSH binds a control socket under a temporary name this much longer.
 const CTL_SUFFIX: usize = 17;
 
@@ -294,12 +306,22 @@ fn paths(dir: &Path, alias: &str) -> Result<Paths, String> {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    let name = format!("h-{hash:016x}");
-    let paths = Paths {
-        ctl: dir.join(format!("{name}.ctl")),
-        socket: dir.join(format!("{name}.sock")),
-        lock: dir.join(format!("{name}.lock")),
-    };
+    let paths = Paths::named(dir, &format!("h-{hash:016x}"));
+    // ssh expands `%` and `${` in a control path, and `%` in a forward's.
+    {
+        use std::os::unix::ffi::OsStrExt;
+        if dir
+            .as_os_str()
+            .as_bytes()
+            .iter()
+            .any(|b| matches!(b, b'%' | b'$'))
+        {
+            return Err(format!(
+                "host_path_unusable: {} has a % or $, which ssh would expand",
+                dir.display()
+            ));
+        }
+    }
     // Unix socket addresses are short (104 bytes on macOS).
     let fits = |path: &Path, extra: usize| {
         let mut probe = path.as_os_str().to_owned();
@@ -315,74 +337,143 @@ fn paths(dir: &Path, alias: &str) -> Result<Paths, String> {
     Ok(paths)
 }
 
-/// Options every ssh the app runs takes: never a prompt, the app's control
-/// socket whatever the user's config says about multiplexing, no
-/// `RemoteCommand` from it, and never backgrounding itself
-/// (`ForkAfterAuthentication`), so the process the app started is the one
-/// that does the work.
-fn common(paths: &Paths) -> Vec<OsString> {
-    let mut args: Vec<OsString> = [
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        &format!("ConnectTimeout={CONNECT_TIMEOUT}"),
-        "-o",
-        "RemoteCommand=none",
-        "-o",
-        "ForkAfterAuthentication=no",
-    ]
-    .map(OsString::from)
-    .into();
-    args.push("-S".into());
-    args.push(paths.ctl.clone().into());
+/// Every option the app forces on the ssh processes that connect, all here:
+/// `(option, master, exec, probed)`. A `-o` on the command line is read
+/// before any config file and OpenSSH keeps an option's first value, so
+/// `~/.ssh/config` cannot change these; the one exception is noted below.
+/// `probed` marks an option only newer OpenSSH knows: an ssh that does not
+/// know it cannot be told otherwise by its config either, so there it is
+/// left out (see `Features`).
+///
+/// Not forced, as the user's own: how the host is reached (`ProxyCommand`,
+/// `ProxyJump`, `Match exec`, `KnownHostsCommand`), keys and agents, and
+/// environment (`SetEnv`, `SendEnv`). What those start here runs in the
+/// ssh's process group and ends with it. `StdinNull` and `EscapeChar` need
+/// nothing: stdin is `/dev/null` and there is no terminal. The control
+/// socket is always `-S`, which the command line also decides.
+const FORCED: &[(&str, bool, bool, bool)] = &[
+    // No terminal here to answer a prompt.
+    ("BatchMode=yes", true, true, false),
+    ("ConnectTimeout=10", true, true, false),
+    // Reasons are read from ssh's error lines: `QUIET` would hide them and
+    // a debug level would bury them.
+    ("LogLevel=ERROR", true, true, false),
+    ("RequestTTY=no", true, true, false),
+    // The exec's command is the app's; the master runs none (`-N`).
+    ("RemoteCommand=none", true, true, false),
+    // The ssh the app started is the one that does the work: it never
+    // backgrounds itself, and no master outlives it.
+    ("ForkAfterAuthentication=no", true, true, true),
+    ("ControlPersist=no", true, true, false),
+    // One master per host, the app's. A command uses it, or, if it has just
+    // gone, connects on its own for that command alone.
+    ("ControlMaster=yes", true, false, false),
+    ("ControlMaster=no", false, true, false),
+    // A command runs even on a host kept for forwarding (`SessionType none`).
+    ("SessionType=default", false, true, true),
+    // Forwards, tunnels, agents and X11 from a config are not the app's: a
+    // forward bound elsewhere would end the master, and the daemon an exec
+    // starts must not inherit a forwarded agent or display.
+    ("ClearAllForwardings=yes", true, true, false),
+    ("Tunnel=no", true, true, false),
+    ("ForwardAgent=no", true, true, false),
+    ("ForwardX11=no", true, true, false),
+    // Nothing runs here on a config's say beyond reaching the host: no
+    // `LocalCommand`, no `ssh-askpass` for `AddKeysToAgent ask`.
+    ("PermitLocalCommand=no", true, true, false),
+    ("AddKeysToAgent=no", true, true, false),
+    // A link that died without a word is noticed within a minute, and an
+    // idle forwarded connection is never closed for idling.
+    ("ServerAliveInterval=15", true, false, false),
+    ("ServerAliveCountMax=3", true, false, false),
+    ("ChannelTimeout=global=0 *=0", true, false, true),
+    // The daemon's forward: one that cannot bind ends the master, a socket
+    // an earlier master left is replaced, and only this user may connect.
+    // OpenSSH takes the last `StreamLocalBindMask` it reads, so a config can
+    // loosen it; the owner-only directory the socket is in keeps others out.
+    ("ExitOnForwardFailure=yes", true, false, false),
+    ("StreamLocalBindUnlink=yes", true, false, false),
+    ("StreamLocalBindMask=0177", true, false, false),
+];
+
+/// Which of the probed options (see `FORCED`) this ssh does not know.
+#[derive(Debug, Default)]
+pub struct Features {
+    unknown: Vec<&'static str>,
+}
+
+impl Features {
+    fn knows(&self, option: &str) -> bool {
+        !self.unknown.contains(&option)
+    }
+}
+
+/// Ask this ssh which probed options it knows. `-F none -G` reads no config
+/// and connects to nothing.
+async fn probe(ssh: &Path, registry: &Registry) -> Features {
+    let mut unknown = Vec::new();
+    for (option, .., probed) in FORCED {
+        if !probed {
+            continue;
+        }
+        let args = ["-F", "none", "-G", "-o", option, "--", "probe"].map(OsString::from);
+        let known = bounded(ssh, &args, MAX_RESOLVED, Duration::from_secs(5), registry)
+            .await
+            .is_ok_and(|output| output.status.success());
+        if !known {
+            unknown.push(*option);
+        }
+    }
+    Features { unknown }
+}
+
+fn forced(master: bool, features: &Features) -> Vec<OsString> {
+    let mut args = Vec::new();
+    for (option, for_master, for_exec, _) in FORCED {
+        if (if master { *for_master } else { *for_exec }) && features.knows(option) {
+            args.extend(["-o".into(), (*option).into()]);
+        }
+    }
     args
 }
 
 /// The one long-lived ssh per host: a ControlMaster in the foreground, with
-/// keepalives, that the app supervises. Forwards from the user's config are
-/// cleared, so one already bound elsewhere cannot stop it; the daemon's
-/// forward is added once the host says where its socket is.
-pub fn master_args(paths: &Paths, alias: &str) -> Vec<OsString> {
-    let mut args: Vec<OsString> = [
-        "-M",
-        "-N",
-        "-o",
-        "ControlPersist=no",
-        "-o",
-        &format!("ServerAliveInterval={ALIVE_INTERVAL}"),
-        "-o",
-        &format!("ServerAliveCountMax={ALIVE_COUNT}"),
-        "-o",
-        "ClearAllForwardings=yes",
-        "-o",
-        "ExitOnForwardFailure=yes",
-        "-o",
-        "StreamLocalBindUnlink=yes",
-        "-o",
-        "StreamLocalBindMask=0177",
-    ]
-    .map(OsString::from)
-    .into();
-    args.extend(common(paths));
-    args.extend(["--".into(), alias.into()]);
+/// keepalives and no session, that the app supervises. The daemon's forward
+/// is added once the host says where its socket is.
+pub fn master_args(paths: &Paths, alias: &str, features: &Features) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec!["-N".into()];
+    args.extend(forced(true, features));
+    args.extend([
+        "-S".into(),
+        paths.ctl.clone().into(),
+        "--".into(),
+        alias.into(),
+    ]);
     args
 }
 
-/// A command on the host over the master, never becoming a master itself,
-/// and run even for a host whose config says `SessionType none`.
-pub fn exec_args(paths: &Paths, alias: &str, command: &str) -> Vec<OsString> {
-    let mut args: Vec<OsString> = ["-T", "-o", "ControlMaster=no", "-o", "SessionType=default"]
-        .map(OsString::from)
-        .into();
-    args.extend(common(paths));
-    args.extend(["--".into(), alias.into(), command.into()]);
+/// A command on the host over the master, never becoming a master itself.
+pub fn exec_args(paths: &Paths, alias: &str, command: &str, features: &Features) -> Vec<OsString> {
+    let mut args = forced(false, features);
+    args.extend([
+        "-S".into(),
+        paths.ctl.clone().into(),
+        "--".into(),
+        alias.into(),
+        command.into(),
+    ]);
     args
 }
 
 /// A request to the running master: `forward` or `cancel` the daemon's
-/// socket to the local one, or `exit`.
+/// socket to the local one, or `exit`. It reads no config at all
+/// (`-F none`): the control socket is all it needs, so no `Match exec` runs
+/// and no option changes it (a config's `ClearAllForwardings` would drop
+/// the `-L` it carries).
 pub fn control_args(paths: &Paths, alias: &str, op: &str, remote: Option<&str>) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec![
+        "-F".into(),
+        "none".into(),
         "-S".into(),
         paths.ctl.clone().into(),
         "-O".into(),
@@ -512,8 +603,8 @@ pub fn started(alias: &str, output: &Output) -> Result<Remote, String> {
             "host_agent_older: the agent on {alias} does not say its daemon's socket; install this version's Linux agent there"
         ));
     };
-    // `-L LOCAL:REMOTE` has no quoting for a colon.
-    if socket.contains(':') {
+    // `-L LOCAL:REMOTE` has no quoting for a colon, and ssh expands `%` in it.
+    if socket.contains([':', '%']) {
         return Err(format!(
             "host_socket_unsupported: {alias}'s daemon listens on {socket}, which ssh cannot forward"
         ));
@@ -531,10 +622,55 @@ fn backoff(failures: u32) -> Duration {
 /// Every host a window of this app has opened, and how many windows each
 /// has open. A host keeps its entry once opened, so its connection's lock
 /// orders a close against a later open.
+///
+/// Every process the app starts for a host is an ssh leading a process group
+/// of its own, owned by exactly one thing that ends it on every path:
+///
+/// - `ssh -G` (the Hosts list): the list's request, bounded in time and bytes.
+/// - The master: its host's `Link`, until the last window closes, the app
+///   quits, or it exits (then the next attach starts another).
+/// - `agent start` and `agent shutdown` on the host, and `-O forward`,
+///   `cancel` and `exit` to the master: the attach or restart that ran
+///   them, bounded in time and bytes.
+///
+/// What OpenSSH starts under one (`Match exec`, `ProxyCommand`,
+/// `KnownHostsCommand`) is in its group and ends with it. Quitting ends
+/// every group still running. A crash leaves them; the next launch retires
+/// a master left behind and removes its files (`sweep`).
 pub struct Hosts {
+    env: Arc<Env>,
+    open: std::sync::Mutex<HashMap<String, Arc<Host>>>,
+}
+
+/// What every host shares: where their files are, the ssh run, the process
+/// groups started and not yet reaped, and what is done once.
+struct Env {
     dir: Option<PathBuf>,
     ssh: PathBuf,
-    open: std::sync::Mutex<HashMap<String, Arc<Host>>>,
+    registry: Registry,
+    swept: tokio::sync::OnceCell<()>,
+    features: tokio::sync::OnceCell<Features>,
+}
+
+impl Env {
+    /// Once per launch: what an earlier run left is retired and removed.
+    async fn swept(&self) {
+        self.swept
+            .get_or_init(|| async {
+                if let Some(dir) = &self.dir {
+                    sweep(dir, &self.ssh, &self.registry).await;
+                }
+            })
+            .await;
+    }
+
+    /// Before any host connects: swept, and this ssh's options probed.
+    async fn ready(&self) -> &Features {
+        self.swept().await;
+        self.features
+            .get_or_init(|| probe(&self.ssh, &self.registry))
+            .await
+    }
 }
 
 impl Hosts {
@@ -542,14 +678,27 @@ impl Hosts {
     /// and is made private; `ssh` is the program run.
     pub fn new(dir: Option<PathBuf>, ssh: PathBuf) -> Self {
         Self {
-            dir,
-            ssh,
+            env: Arc::new(Env {
+                dir,
+                ssh,
+                registry: Registry::default(),
+                swept: Default::default(),
+                features: Default::default(),
+            }),
             open: Default::default(),
         }
     }
 
-    pub fn ssh(&self) -> &Path {
-        &self.ssh
+    /// At launch, so a crash's leftovers do not wait for their host to be
+    /// opened again.
+    pub async fn prepare(&self) {
+        self.env.swept().await;
+    }
+
+    /// What OpenSSH says `alias` connects to.
+    pub fn resolve(&self, alias: String) -> impl Future<Output = Option<Value>> + Send + 'static {
+        let env = self.env.clone();
+        async move { resolve(&env.ssh, &alias, &env.registry).await }
     }
 
     /// A window opens `alias`: its host, with one more window.
@@ -561,11 +710,11 @@ impl Hosts {
         let host = match open.get(alias) {
             Some(host) => host.clone(),
             None => {
-                let dir =
-                    (self.dir.clone()).ok_or("host_files_unusable: no HOME for ~/.agent/hosts")?;
+                let dir = (self.env.dir.clone())
+                    .ok_or("host_files_unusable: no HOME for ~/.agent/hosts")?;
                 let host = Arc::new(Host {
                     alias: alias.to_owned(),
-                    ssh: self.ssh.clone(),
+                    env: self.env.clone(),
                     paths: paths(&dir, alias)?,
                     dir,
                     windows: AtomicUsize::new(0),
@@ -589,22 +738,32 @@ impl Hosts {
         }
     }
 
-    /// The app is quitting: every connection closes. A host still
-    /// connecting gets a few seconds; after that the app exits anyway, and
-    /// a master it leaves behind is asked to exit when a window next opens
-    /// that host.
+    /// The app is quitting: every connection closes, all at once. Every ssh
+    /// still running is asked to end first, so a host busy connecting gives
+    /// up its link at once rather than at its own timeout. What has not
+    /// ended by the deadline is killed; files a close could not remove are
+    /// swept at the next launch.
     pub async fn close_all(&self) {
         let hosts: Vec<_> = self.open.lock().unwrap().values().cloned().collect();
-        for host in hosts {
+        for host in &hosts {
             host.windows.store(0, Ordering::SeqCst);
-            let _ = tokio::time::timeout(Duration::from_secs(3), host.close()).await;
         }
+        self.env.registry.signal_all(libc::SIGTERM);
+        let mut closing = tokio::task::JoinSet::new();
+        for host in hosts {
+            closing.spawn(async move { host.close().await });
+        }
+        let _ = tokio::time::timeout(QUIT_TIMEOUT, async {
+            while closing.join_next().await.is_some() {}
+        })
+        .await;
+        self.env.registry.signal_all(libc::SIGKILL);
     }
 }
 
 pub struct Host {
     pub alias: String,
-    ssh: PathBuf,
+    env: Arc<Env>,
     dir: PathBuf,
     paths: Paths,
     windows: AtomicUsize,
@@ -623,22 +782,43 @@ struct Link {
     failed: Option<(Instant, String)>,
 }
 
+/// A host's master: its process group, the end of what it printed, and
+/// whether it was ended for printing too much.
 struct Master {
-    child: Child,
+    group: Group,
     stderr: Arc<std::sync::Mutex<String>>,
+    flooded: Arc<AtomicBool>,
     reader: tokio::task::JoinHandle<()>,
 }
 
 impl Link {
     /// Whether the master still runs; one that exited takes its forward.
-    fn alive(&mut self) -> bool {
-        let alive = (self.master.as_mut()).is_some_and(|m| matches!(m.child.try_wait(), Ok(None)));
-        if !alive {
-            self.master = None;
+    /// One ended for flooding its stderr counts as a failure, so it is not
+    /// started again at once.
+    fn alive(&mut self, alias: &str) -> bool {
+        let Some(master) = self.master.as_mut() else {
             self.forwarded = None;
+            return false;
+        };
+        if !master.group.exited() {
+            return true;
         }
-        alive
+        if master.flooded.load(Ordering::SeqCst) {
+            self.failures += 1;
+            self.failed = Some((
+                Instant::now() + backoff(self.failures),
+                flooded_reason(alias),
+            ));
+        }
+        master.reader.abort();
+        self.master = None;
+        self.forwarded = None;
+        false
     }
+}
+
+fn flooded_reason(alias: &str) -> String {
+    format!("host_output_too_large: ssh {alias} printed more than {MAX_OUTPUT} bytes of errors")
 }
 
 impl Host {
@@ -646,7 +826,7 @@ impl Host {
     /// attach tries it before asking the host anything.
     pub async fn reached(&self) -> Option<PathBuf> {
         let mut link = self.link.lock().await;
-        (link.alive() && link.forwarded.is_some()).then(|| self.paths.socket.clone())
+        (link.alive(&self.alias) && link.forwarded.is_some()).then(|| self.paths.socket.clone())
     }
 
     /// The remote home, once `agent start` has said it.
@@ -655,17 +835,28 @@ impl Host {
         link.remote.as_ref().and_then(|r| r.home.clone())
     }
 
+    /// Nothing starts for a host no window has open: a window closed while
+    /// an attach of its waited, or the app is quitting.
+    fn still_open(&self) -> Result<(), String> {
+        if self.windows.load(Ordering::SeqCst) == 0 {
+            return Err(format!("host_closed: no window has {} open", self.alias));
+        }
+        Ok(())
+    }
+
     /// Reach the host's daemon: the master connected (again, after it
     /// exited), `agent start` there, and its socket forwarded here. A
     /// failure stands, and is returned again, until its backoff has passed.
     pub async fn connect(&self) -> Result<PathBuf, String> {
+        let features = self.env.ready().await;
         let mut link = self.link.lock().await;
+        self.still_open()?;
         if let Some((until, reason)) = &link.failed
             && Instant::now() < *until
         {
             return Err(reason.clone());
         }
-        let result = self.establish(&mut link).await;
+        let result = self.establish(&mut link, features).await;
         match &result {
             Ok(_) => {
                 link.failures = 0;
@@ -679,20 +870,23 @@ impl Host {
         result
     }
 
-    async fn establish(&self, link: &mut Link) -> Result<PathBuf, String> {
+    async fn establish(&self, link: &mut Link, features: &Features) -> Result<PathBuf, String> {
         self.own(link)?;
-        if !link.alive() {
-            self.start_master(link).await?;
+        if !link.alive(&self.alias) {
+            self.start_master(link, features).await?;
         }
+        self.still_open()?;
         let output = self
             .run(&exec_args(
                 &self.paths,
                 &self.alias,
                 &remote_command("start"),
+                features,
             ))
             .await?;
         let remote = started(&self.alias, &output)?;
         if link.forwarded.as_deref() != Some(remote.socket.as_str()) {
+            self.still_open()?;
             if let Some(old) = link.forwarded.take() {
                 let _ = self.control("cancel", Some(&old)).await;
             }
@@ -707,18 +901,21 @@ impl Host {
     /// attach starts one with its own `agent start`. Nothing on this machine
     /// signals a process there.
     pub async fn replace(&self) -> Result<(), String> {
+        let features = self.env.ready().await;
         let mut link = self.link.lock().await;
+        self.still_open()?;
         link.failures = 0;
         link.failed = None;
         self.own(&mut link)?;
-        if !link.alive() {
-            self.start_master(&mut link).await?;
+        if !link.alive(&self.alias) {
+            self.start_master(&mut link, features).await?;
         }
         let output = self
             .run(&exec_args(
                 &self.paths,
                 &self.alias,
                 &remote_command("shutdown"),
+                features,
             ))
             .await?;
         match output.status.code() {
@@ -739,8 +936,9 @@ impl Host {
         }
     }
 
-    /// No window needs the host any more: its master ends, which ends the
-    /// forward, and its files and lock go. The daemon there keeps running.
+    /// No window needs the host any more: its master ends (closing the
+    /// connection and the forward), and its files and lock go. The daemon
+    /// there keeps running.
     pub async fn close(&self) {
         let mut link = self.link.lock().await;
         // A window opened again while this waited for the lock keeps it.
@@ -748,89 +946,61 @@ impl Host {
             return;
         }
         if let Some(mut master) = link.master.take() {
-            stop(&mut master.child).await;
+            master.group.end(STOP_GRACE).await;
             master.reader.abort();
         }
         link.forwarded = None;
         link.remote = None;
         link.failures = 0;
         link.failed = None;
-        if link.lock.is_some() {
-            let _ = std::fs::remove_file(&self.paths.ctl);
-            let _ = std::fs::remove_file(&self.paths.socket);
+        if let Some(lock) = link.lock.take() {
+            remove_files(&self.paths, lock);
         }
-        link.lock = None;
     }
 
     /// Only one app process may own a host's files: another's master would
     /// have its forwarded socket unlinked from under it.
     fn own(&self, link: &mut Link) -> Result<(), String> {
-        use std::os::unix::{fs::OpenOptionsExt, io::AsRawFd};
         if link.lock.is_some() {
             return Ok(());
         }
         private_dir(&self.dir)?;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .mode(0o600)
-            .open(&self.paths.lock)
-            .map_err(|e| format!("host_files_unusable: {}: {e}", self.paths.lock.display()))?;
-        // SAFETY: an advisory lock on a descriptor this function owns.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(format!(
+        link.lock = Some(lock_file(&self.paths.lock)?.ok_or_else(|| {
+            format!(
                 "host_busy: another Agent process has {} open; use its window or quit it",
                 self.alias
-            ));
-        }
-        link.lock = Some(file);
+            )
+        })?);
         Ok(())
     }
 
-    async fn start_master(&self, link: &mut Link) -> Result<(), String> {
-        use tokio::io::AsyncReadExt;
-        // A control socket left by an app that did not close it: that master
-        // is asked to exit, and whatever it left is removed.
-        if std::fs::symlink_metadata(&self.paths.ctl).is_ok() {
-            let _ = self.control("exit", None).await;
-            let _ = std::fs::remove_file(&self.paths.ctl);
-        }
+    async fn start_master(&self, link: &mut Link, features: &Features) -> Result<(), String> {
+        // A master an earlier run left is gone, control socket and all,
+        // before its paths are used again.
+        retire(&self.env.ssh, &self.env.registry, &self.paths, &self.alias).await?;
         let _ = std::fs::remove_file(&self.paths.socket);
         link.forwarded = None;
-        let mut child = Command::new(&self.ssh)
-            .args(master_args(&self.paths, &self.alias))
+        let mut command = Command::new(&self.env.ssh);
+        command
+            .args(master_args(&self.paths, &self.alias, features))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            // Its own group, so stopping it stops what it started too.
-            .process_group(0)
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| format!("host_unreachable: {}: {e}", self.ssh.display()))?;
+            .stderr(Stdio::piped());
+        let mut group = Group::spawn(&mut command, &self.env.registry)
+            .map_err(|e| format!("host_unreachable: {}: {e}", self.env.ssh.display()))?;
         let stderr = Arc::new(std::sync::Mutex::new(String::new()));
-        let mut pipe = child.stderr.take().expect("piped");
-        let kept = stderr.clone();
-        let reader = tokio::spawn(async move {
-            let mut buffer = [0u8; 1024];
-            while let Ok(read) = pipe.read(&mut buffer).await {
-                if read == 0 {
-                    break;
-                }
-                let mut text = kept.lock().unwrap();
-                text.push_str(&String::from_utf8_lossy(&buffer[..read]));
-                if text.len() > STDERR_KEPT {
-                    let cut = text.len() - STDERR_KEPT;
-                    let cut = (cut..text.len())
-                        .find(|at| text.is_char_boundary(*at))
-                        .unwrap_or(text.len());
-                    text.drain(..cut);
-                }
-            }
-        });
+        let flooded = Arc::new(AtomicBool::new(false));
+        let reader = tokio::spawn(read_stderr(
+            group.child.stderr.take().expect("piped"),
+            stderr.clone(),
+            flooded.clone(),
+            self.env.registry.clone(),
+            group.pgid,
+        ));
         let mut master = Master {
-            child,
+            group,
             stderr,
+            flooded,
             reader,
         };
         let deadline = Instant::now() + MASTER_TIMEOUT;
@@ -839,14 +1009,18 @@ impl Host {
                 link.master = Some(master);
                 return Ok(());
             }
-            if let Ok(Some(_)) = master.child.try_wait() {
+            if master.group.exited() {
                 // Everything it printed, before reading why.
                 let _ = tokio::time::timeout(Duration::from_secs(1), &mut master.reader).await;
+                if master.flooded.load(Ordering::SeqCst) {
+                    return Err(flooded_reason(&self.alias));
+                }
                 let text = master.stderr.lock().unwrap().clone();
                 return Err(ssh_reason(&self.alias, &text));
             }
             if Instant::now() > deadline {
-                stop(&mut master.child).await;
+                master.group.end(STOP_GRACE).await;
+                master.reader.abort();
                 return Err(format!(
                     "host_unreachable: ssh {} did not connect within {} seconds",
                     self.alias,
@@ -875,24 +1049,294 @@ impl Host {
     /// Run ssh with its output bounded, in time and in bytes: a login
     /// shell that prints without end is killed, not buffered.
     async fn run(&self, args: &[OsString]) -> Result<Output, String> {
-        bounded(&self.ssh, args, MAX_OUTPUT, COMMAND_TIMEOUT)
-            .await
-            .map_err(|cut| match cut {
-                Cut::Failed(e) => format!("host_unreachable: {}: {e}", self.ssh.display()),
-                Cut::TimedOut => format!("host_timeout: ssh {} did not answer", self.alias),
-                Cut::TooLarge => format!(
-                    "host_output_too_large: ssh {} printed more than {MAX_OUTPUT} bytes",
-                    self.alias
-                ),
-            })
+        bounded(
+            &self.env.ssh,
+            args,
+            MAX_OUTPUT,
+            COMMAND_TIMEOUT,
+            &self.env.registry,
+        )
+        .await
+        .map_err(|cut| match cut {
+            Cut::Failed(e) => format!("host_unreachable: {}: {e}", self.env.ssh.display()),
+            Cut::TimedOut => format!("host_timeout: ssh {} did not answer", self.alias),
+            Cut::TooLarge => format!(
+                "host_output_too_large: ssh {} printed more than {MAX_OUTPUT} bytes",
+                self.alias
+            ),
+        })
     }
 }
 
-/// What a command on a host may print on each of stdout and stderr.
+/// A master's stderr: its end kept for a reason, read to a bound past which
+/// the master is ended rather than read on.
+async fn read_stderr(
+    mut pipe: ChildStderr,
+    kept: Arc<std::sync::Mutex<String>>,
+    flooded: Arc<AtomicBool>,
+    registry: Registry,
+    pgid: libc::pid_t,
+) {
+    use tokio::io::AsyncReadExt;
+    let mut buffer = [0u8; 1024];
+    let mut total = 0u64;
+    while let Ok(read) = pipe.read(&mut buffer).await {
+        if read == 0 {
+            break;
+        }
+        total += read as u64;
+        if total > MAX_OUTPUT {
+            flooded.store(true, Ordering::SeqCst);
+            registry.signal(pgid, libc::SIGKILL);
+            break;
+        }
+        let mut text = kept.lock().unwrap();
+        text.push_str(&String::from_utf8_lossy(&buffer[..read]));
+        if text.len() > STDERR_KEPT {
+            let cut = text.len() - STDERR_KEPT;
+            let cut = (cut..text.len())
+                .find(|at| text.is_char_boundary(*at))
+                .unwrap_or(text.len());
+            text.drain(..cut);
+        }
+    }
+}
+
+/// What an earlier run of the app left, as after a crash: for each host
+/// whose lock no process holds, a master still answering on its control
+/// socket is retired, and its control socket, forwarded socket and lock are
+/// removed. Nothing found is used.
+async fn sweep(dir: &Path, ssh: &Path, registry: &Registry) {
+    if !dir.is_dir() || private_dir(dir).is_err() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut stems: Vec<String> = entries
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().into_string().ok()?;
+            let (stem, kind) = name.rsplit_once('.')?;
+            (stem.len() == 18 && stem.starts_with("h-") && matches!(kind, "lock" | "ctl" | "sock"))
+                .then(|| stem.to_owned())
+        })
+        .collect();
+    stems.sort();
+    stems.dedup();
+    for stem in stems {
+        let files = Paths::named(dir, &stem);
+        // Held: a running app's.
+        let Ok(Some(lock)) = lock_file(&files.lock) else {
+            continue;
+        };
+        if retire(ssh, registry, &files, "stale").await.is_ok() {
+            remove_files(&files, lock);
+        }
+    }
+}
+
+/// Retire a master an earlier run left on `files.ctl`: asked to exit, and
+/// waited for until it has removed its control socket itself, as a master
+/// does on exiting, so it cannot remove a new master's later. A socket
+/// nothing answers on is only a file, and is removed.
+async fn retire(ssh: &Path, registry: &Registry, files: &Paths, alias: &str) -> Result<(), String> {
+    if std::fs::symlink_metadata(&files.ctl).is_err() {
+        return Ok(());
+    }
+    let asked = bounded(
+        ssh,
+        &control_args(files, alias, "exit", None),
+        MAX_OUTPUT,
+        RETIRE_TIMEOUT,
+        registry,
+    )
+    .await;
+    let busy = || {
+        format!(
+            "host_busy: an ssh an earlier run of the app left for {alias} did not exit when asked"
+        )
+    };
+    match asked {
+        Ok(output) if output.status.success() => {
+            let deadline = Instant::now() + RETIRE_TIMEOUT;
+            while std::fs::symlink_metadata(&files.ctl).is_ok() {
+                if Instant::now() > deadline {
+                    return Err(busy());
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Ok(())
+        }
+        Ok(_) => {
+            let _ = std::fs::remove_file(&files.ctl);
+            Ok(())
+        }
+        Err(_) => Err(busy()),
+    }
+}
+
+/// Take a host's lock, or None while another process holds it. A lock file
+/// removed and made again while this opened it is taken again, so two
+/// processes never each hold a lock on a different file of one name.
+fn lock_file(path: &Path) -> Result<Option<std::fs::File>, String> {
+    use std::os::unix::{
+        fs::{MetadataExt, OpenOptionsExt},
+        io::AsRawFd,
+    };
+    let unusable = |e: std::io::Error| format!("host_files_unusable: {}: {e}", path.display());
+    for _ in 0..8 {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(unusable)?;
+        // SAFETY: an advisory lock on a descriptor this function owns.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Ok(None);
+        }
+        let held = file.metadata().map_err(unusable)?;
+        if std::fs::symlink_metadata(path)
+            .is_ok_and(|now| now.dev() == held.dev() && now.ino() == held.ino())
+        {
+            return Ok(Some(file));
+        }
+    }
+    Ok(None)
+}
+
+/// Remove a host's files, its lock last and while still held.
+fn remove_files(paths: &Paths, lock: std::fs::File) {
+    let _ = std::fs::remove_file(&paths.ctl);
+    let _ = std::fs::remove_file(&paths.socket);
+    let _ = std::fs::remove_file(&paths.lock);
+    drop(lock);
+}
+
+/// What a command on a host may print on each of stdout and stderr, and a
+/// master on stderr over its life.
 const MAX_OUTPUT: u64 = 1024 * 1024;
 
 /// What `ssh -G` may print for one alias.
 const MAX_RESOLVED: u64 = 64 * 1024;
+
+/// The process groups the app has started and not yet reaped. A group is
+/// signalled only while registered, and leaves before its leader is reaped,
+/// so a registered id always names the app's own group.
+#[derive(Clone, Default)]
+struct Registry(Arc<std::sync::Mutex<HashSet<libc::pid_t>>>);
+
+impl Registry {
+    fn signal(&self, pgid: libc::pid_t, signal: libc::c_int) {
+        let groups = self.0.lock().unwrap();
+        if groups.contains(&pgid) {
+            // SAFETY: a process group this app leads and has not reaped.
+            unsafe { libc::kill(-pgid, signal) };
+        }
+    }
+
+    fn signal_all(&self, signal: libc::c_int) {
+        let groups = self.0.lock().unwrap();
+        for pgid in groups.iter() {
+            // SAFETY: as in `signal`.
+            unsafe { libc::kill(-pgid, signal) };
+        }
+    }
+}
+
+/// An ssh the app started, leading a process group of its own, so what
+/// OpenSSH starts under it ends with it. Its exit is found without reaping
+/// it; then the rest of its group is killed, the group leaves the registry,
+/// and only then is the leader reaped.
+struct Group {
+    child: Child,
+    pgid: libc::pid_t,
+    registry: Registry,
+}
+
+impl Group {
+    fn spawn(command: &mut Command, registry: &Registry) -> std::io::Result<Self> {
+        let mut groups = registry.0.lock().unwrap();
+        let child = command.process_group(0).kill_on_drop(true).spawn()?;
+        let pgid = (child.id().and_then(|pid| libc::pid_t::try_from(pid).ok()))
+            .ok_or_else(|| std::io::Error::other("ssh started without a pid"))?;
+        groups.insert(pgid);
+        drop(groups);
+        Ok(Self {
+            child,
+            pgid,
+            registry: registry.clone(),
+        })
+    }
+
+    fn signal(&self, signal: libc::c_int) {
+        self.registry.signal(self.pgid, signal);
+    }
+
+    /// Whether the leader has exited; once it has, its group is ended and
+    /// the leader reaped (see `Group`).
+    fn exited(&mut self) -> bool {
+        if self.child.id().is_none() {
+            return true;
+        }
+        // SAFETY: a zeroed siginfo_t is valid; WNOWAIT only reports.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let found = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.pgid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if found == 0 && info.si_signo == 0 {
+            return false;
+        }
+        if found != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            return false;
+        }
+        {
+            let mut groups = self.registry.0.lock().unwrap();
+            // SAFETY: the leader is not reaped, so the id is still its group's.
+            unsafe { libc::kill(-self.pgid, libc::SIGKILL) };
+            groups.remove(&self.pgid);
+        }
+        let _ = self.child.try_wait();
+        true
+    }
+
+    async fn exit(&mut self) {
+        let mut pause = Duration::from_millis(1);
+        while !self.exited() {
+            tokio::time::sleep(pause).await;
+            pause = (pause * 2).min(Duration::from_millis(50));
+        }
+    }
+
+    /// SIGTERM, so ssh closes its connection and removes its control
+    /// socket, then SIGKILL after `grace`.
+    async fn end(&mut self, grace: Duration) {
+        self.signal(libc::SIGTERM);
+        if tokio::time::timeout(grace, self.exit()).await.is_err() {
+            self.signal(libc::SIGKILL);
+            self.exit().await;
+        }
+    }
+}
+
+impl Drop for Group {
+    /// Dropped before it ended (its owner was cancelled): killed, group and
+    /// all; tokio then reaps the leader (`kill_on_drop`).
+    fn drop(&mut self) {
+        if self.child.id().is_some() {
+            let mut groups = self.registry.0.lock().unwrap();
+            // SAFETY: the leader is not reaped, so the id is still its group's.
+            unsafe { libc::kill(-self.pgid, libc::SIGKILL) };
+            groups.remove(&self.pgid);
+        }
+    }
+}
 
 /// Why a bounded ssh gave no output.
 enum Cut {
@@ -901,38 +1345,50 @@ enum Cut {
     TooLarge,
 }
 
-/// Run ssh in a process group of its own, reading at most `limit` bytes from
-/// each of stdout and stderr, within `within`. Past either bound the whole
-/// group is killed: ssh and what it started (a `Match exec`, a
-/// `ProxyCommand`), which killing ssh alone would leave running.
+/// Run ssh as a `Group`, reading at most `limit` bytes from each of stdout
+/// and stderr, within `within`. Past either bound its whole group is
+/// killed. When it exits, the rest of its group is killed too, so a
+/// descendant holding its pipes cannot keep this waiting.
 async fn bounded(
     ssh: &Path,
     args: &[OsString],
     limit: u64,
     within: Duration,
+    registry: &Registry,
 ) -> Result<Output, Cut> {
-    let mut child = Command::new(ssh)
+    let mut command = Command::new(ssh);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(Cut::Failed)?;
-    let (out, err) = (child.stdout.take(), child.stderr.take());
+        .stderr(Stdio::piped());
+    let mut group = Group::spawn(&mut command, registry).map_err(Cut::Failed)?;
+    let (out, err) = (group.child.stdout.take(), group.child.stderr.take());
     let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-    let read = tokio::time::timeout(within, async {
+    let ran = tokio::time::timeout(within, async {
         tokio::try_join!(
-            capped(out, limit, &mut stdout),
-            capped(err, limit, &mut stderr)
+            async {
+                capped(out, limit, &mut stdout)
+                    .await
+                    .map_err(|()| Cut::TooLarge)
+            },
+            async {
+                capped(err, limit, &mut stderr)
+                    .await
+                    .map_err(|()| Cut::TooLarge)
+            },
+            async {
+                group.exit().await;
+                Ok::<(), Cut>(())
+            },
         )
-        .map_err(|()| Cut::TooLarge)?;
-        child.wait().await.map_err(Cut::Failed)
     })
     .await;
-    let cut = match read {
-        Ok(Ok(status)) => {
+    let cut = match ran {
+        Ok(Ok(_)) => {
+            let status = (group.child.try_wait().ok().flatten()).ok_or_else(|| {
+                Cut::Failed(std::io::Error::other("ssh's exit was not collected"))
+            })?;
             return Ok(Output {
                 status,
                 stdout,
@@ -942,12 +1398,8 @@ async fn bounded(
         Ok(Err(cut)) => cut,
         Err(_) => Cut::TimedOut,
     };
-    // Not yet reaped, so its pid is still its group's.
-    if let Some(pid) = child.id().and_then(|pid| libc::pid_t::try_from(pid).ok()) {
-        // SAFETY: a signal to the process group this process started.
-        unsafe { libc::kill(-pid, libc::SIGKILL) };
-    }
-    let _ = child.wait().await;
+    group.signal(libc::SIGKILL);
+    group.exit().await;
     Err(cut)
 }
 
@@ -965,27 +1417,6 @@ async fn capped(
         return Err(());
     }
     Ok(())
-}
-
-/// SIGTERM to the master's process group, so ssh removes its control socket
-/// and what it started (a `ProxyCommand`) ends with it, then SIGKILL if it
-/// lingers.
-async fn stop(child: &mut Child) {
-    // Only while not yet reaped is its pid still its group's.
-    let Some(pid) = child.id().and_then(|pid| libc::pid_t::try_from(pid).ok()) else {
-        return;
-    };
-    // SAFETY: a signal to the process group this process started.
-    unsafe { libc::kill(-pid, libc::SIGTERM) };
-    if tokio::time::timeout(Duration::from_secs(2), child.wait())
-        .await
-        .is_ok()
-    {
-        return;
-    }
-    // SAFETY: as above; the master is still not reaped.
-    unsafe { libc::kill(-pid, libc::SIGKILL) };
-    let _ = child.wait().await;
 }
 
 /// The directory for hosts' sockets: made owner-only, and refused if it is
@@ -1063,11 +1494,11 @@ root='{r}'
 master= ctl= op= fwd= resolve= host=
 while [ $# -gt 0 ]; do
   case "$1" in
-    -M) master=1 ;;
     -N|-T|-n) ;;
     -G) resolve=1 ;;
+    -F) shift ;;
     -S) ctl=$2; shift ;;
-    -o) shift ;;
+    -o) [ "$2" = ControlMaster=yes ] && master=1; shift ;;
     -O) op=$2; shift ;;
     -L) fwd=$2; shift ;;
     --) host=$2; shift 2; break ;;
@@ -1078,11 +1509,16 @@ done
 mode=$(cat "$root/mode" 2>/dev/null)
 if [ -n "$resolve" ]; then printf 'user someone\nhostname %s.example\nport 22\n' "$host"; exit 0; fi
 refuse() {{ echo "someone@$host: Permission denied (publickey)." >&2; exit 255; }}
-cleanup() {{ [ -f "$ctl.fwd" ] && rm -f $(cat "$ctl.fwd") "$ctl.fwd"; rm -f "$ctl"; }}
+fwds="$root/fwd-$(basename "$ctl")"
+cleanup() {{ [ -f "$fwds" ] && rm -f $(cat "$fwds") "$fwds"; rm -f "$ctl"; }}
 if [ -n "$master" ]; then
   echo master >> "$root/log"
   [ "$mode" = auth ] && refuse
-  trap 'cleanup; exit 0' TERM INT HUP
+  [ "$mode" = noisy ] && exec yes 'channel error' >&2
+  # As a real master: its control socket goes a moment after it is told
+  # to exit, once its connection has closed.
+  trap 'sleep 0.2; cleanup; exit 0' TERM INT HUP
+  [ "$mode" = stubborn ] && trap '' TERM
   echo $$ > "$ctl"
   while [ -e "$ctl" ]; do sleep 0.05; done
   cleanup; exit 255
@@ -1091,9 +1527,9 @@ if [ -n "$op" ]; then
   echo "$op" >> "$root/log"
   [ -e "$ctl" ] || {{ echo "Control socket connect($ctl): No such file or directory" >&2; exit 255; }}
   case "$op" in
-    forward) ln -sfn "${{fwd#*:}}" "${{fwd%%:*}}" && echo "${{fwd%%:*}}" >> "$ctl.fwd" ;;
+    forward) ln -sfn "${{fwd#*:}}" "${{fwd%%:*}}" && echo "${{fwd%%:*}}" >> "$fwds" ;;
     cancel) rm -f "${{fwd%%:*}}" ;;
-    exit) kill "$(cat "$ctl")" 2>/dev/null; rm -f "$ctl" ;;
+    exit) kill "$(cat "$ctl")" 2>/dev/null || {{ echo "Control socket connect($ctl): Connection refused" >&2; exit 255; }} ;;
   esac
   exit 0
 fi
@@ -1148,6 +1584,44 @@ cd "$root/remote" && HOME="$root/remote" SHELL=/bin/sh PATH="$root/remote/bin:/u
     }
 
     /// A daemon's greeting on `socket`, for every connection, held open.
+    /// The processes still running (zombies aside) whose command line names
+    /// `needle`, from the process table.
+    pub fn running(needle: &str) -> Vec<String> {
+        let table = std::process::Command::new("ps")
+            .args(["-ax", "-o", "pid=,stat=,command="])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&table.stdout)
+            .lines()
+            .filter(|line| line.contains(needle))
+            .filter(|line| {
+                !(line.split_whitespace().nth(1)).is_some_and(|stat| stat.starts_with('Z'))
+            })
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Whether process `pid` has ended (or is only a zombie).
+    pub fn ended(pid: &str) -> bool {
+        let table = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", pid.trim()])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&table.stdout);
+        stat.trim().is_empty() || stat.trim().starts_with('Z')
+    }
+
+    /// Wait up to three seconds for `check`, then fail naming `what`.
+    pub async fn eventually(what: &str, check: impl Fn() -> bool) {
+        for _ in 0..150 {
+            if check() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("{what}");
+    }
+
     pub fn daemon(socket: &Path, store: &str) {
         use std::io::Write;
         let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
@@ -1286,36 +1760,42 @@ mod tests {
                 .map(|a| a.to_str().unwrap().to_owned())
                 .collect::<Vec<_>>()
         };
-        let master = text(master_args(&p, "box"));
-        for option in [
-            "BatchMode=yes",
-            "ControlPersist=no",
-            "ServerAliveInterval=15",
-            "ServerAliveCountMax=3",
-            "ExitOnForwardFailure=yes",
-            "StreamLocalBindUnlink=yes",
-            "ClearAllForwardings=yes",
-            "RemoteCommand=none",
-            "ForkAfterAuthentication=no",
-        ] {
-            let at = master.iter().position(|a| a == option).expect(option);
-            assert_eq!(master[at - 1], "-o");
+        // Every forced option, on the roles it is for, as `-o`; the
+        // master has no session, and neither a prompt nor a fork.
+        let all = Features::default();
+        let master = text(master_args(&p, "box", &all));
+        let exec = text(exec_args(&p, "box", "agent start", &all));
+        for (option, for_master, for_exec, _) in FORCED {
+            for (args, wanted) in [(&master, for_master), (&exec, for_exec)] {
+                let at = args.iter().position(|a| a == option);
+                assert_eq!(at.is_some(), *wanted, "{option}");
+                if let Some(at) = at {
+                    assert_eq!(args[at - 1], "-o");
+                }
+            }
         }
-        assert_eq!(&master[..2], ["-M", "-N"]);
-        assert_eq!(&master[master.len() - 2..], ["--", "box"]);
-        let at = master.iter().position(|a| a == "-S").unwrap();
-        assert_eq!(master[at + 1], p.ctl.to_str().unwrap());
-        let exec = text(exec_args(&p, "box", "agent start"));
-        for option in [
-            "ControlMaster=no",
-            "BatchMode=yes",
-            "SessionType=default",
-            "ForkAfterAuthentication=no",
-        ] {
-            let at = exec.iter().position(|a| a == option).expect(option);
-            assert_eq!(exec[at - 1], "-o");
-        }
-        assert_eq!(&exec[exec.len() - 3..], ["--", "box", "agent start"]);
+        assert_eq!(master[0], "-N");
+        assert_eq!(
+            &master[master.len() - 4..],
+            ["-S", p.ctl.to_str().unwrap(), "--", "box"]
+        );
+        assert_eq!(
+            &exec[exec.len() - 5..],
+            ["-S", p.ctl.to_str().unwrap(), "--", "box", "agent start"]
+        );
+        // An option this ssh does not know is left out, not sent to fail.
+        let old = Features {
+            unknown: vec!["ForkAfterAuthentication=no", "SessionType=default"],
+        };
+        let exec_old = text(exec_args(&p, "box", "agent start", &old));
+        assert!(
+            !exec_old
+                .iter()
+                .any(|a| a.starts_with("ForkAfterAuthentication"))
+        );
+        assert!(!exec_old.iter().any(|a| a.starts_with("SessionType")));
+        assert!(exec_old.contains(&"ControlPersist=no".to_owned()));
+        // A request to the master reads no config.
         assert_eq!(
             text(control_args(
                 &p,
@@ -1324,6 +1804,8 @@ mod tests {
                 Some("/home/u/.agent/state.sqlite.sock")
             )),
             [
+                "-F",
+                "none",
                 "-S",
                 p.ctl.to_str().unwrap(),
                 "-O",
@@ -1334,6 +1816,11 @@ mod tests {
                 "box"
             ]
         );
+        // ssh would expand these in a control path.
+        for odd in ["/tmp/a%b", "/tmp/a$b"] {
+            let refused = paths(Path::new(odd), "box").unwrap_err();
+            assert!(refused.starts_with("host_path_unusable: "), "{refused}");
+        }
         let command = remote_command("start");
         assert!(
             command.starts_with(r#"exec "$SHELL" -l -i -c '"#),
@@ -1540,7 +2027,8 @@ mod tests {
     #[tokio::test]
     async fn resolving_an_alias_reads_what_ssh_says_and_no_more() {
         let shim = Shim::new("host-resolve");
-        let answer = resolve(&shim.ssh, "box").await.unwrap();
+        let registry = Registry::default();
+        let answer = resolve(&shim.ssh, "box", &registry).await.unwrap();
         assert_eq!(
             answer,
             json!({"user": "someone", "hostname": "box.example", "port": "22"})
@@ -1552,22 +2040,453 @@ mod tests {
             "#!/bin/sh\nsleep 30 &\necho $! > \"$0.pid\"\nexec yes user\n",
         );
         let begun = std::time::Instant::now();
-        assert_eq!(resolve(&flood, "box").await, None);
+        assert_eq!(resolve(&flood, "box", &registry).await, None);
         assert!(begun.elapsed() < std::time::Duration::from_secs(4));
         let pid = std::fs::read_to_string(shim.root.join("bin/flood.pid")).unwrap();
-        let stat = format!("/proc/{}/stat", pid.trim());
-        let ended = || {
-            std::fs::read_to_string(&stat).map_or(true, |s| {
-                s.rsplit(") ").next().is_some_and(|s| s.starts_with('Z'))
-            })
+        super::shim::eventually("the probe's descendant ends", || super::shim::ended(&pid)).await;
+        assert!(registry.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_ssh_that_does_not_finish_in_time_is_ended_with_what_it_started() {
+        let shim = Shim::new("host-slow");
+        let registry = Registry::default();
+        let slow = shim.root.join("bin/slow");
+        super::shim::script(
+            &slow,
+            "#!/bin/sh\nsleep 30 &\necho $! > \"$0.pid\"\nexec sleep 30\n",
+        );
+        let begun = std::time::Instant::now();
+        let ran = bounded(&slow, &[], 1024, Duration::from_millis(300), &registry).await;
+        assert!(matches!(ran, Err(Cut::TimedOut)));
+        assert!(begun.elapsed() < Duration::from_secs(2));
+        let pid = std::fs::read_to_string(shim.root.join("bin/slow.pid")).unwrap();
+        super::shim::eventually("the timed-out ssh's descendant ends", || {
+            super::shim::ended(&pid)
+        })
+        .await;
+        // One that exits leaves nothing either: the rest of its group goes.
+        let quick = shim.root.join("bin/quick");
+        super::shim::script(
+            &quick,
+            "#!/bin/sh\nsleep 30 > /dev/null 2>&1 &\necho $! > \"$0.pid\"\necho done\n",
+        );
+        let ran = bounded(&quick, &[], 1024, Duration::from_secs(5), &registry)
+            .await
+            .ok()
+            .unwrap();
+        assert_eq!(ran.stdout, b"done\n");
+        let pid = std::fs::read_to_string(shim.root.join("bin/quick.pid")).unwrap();
+        super::shim::eventually("the exited ssh's descendant ends", || {
+            super::shim::ended(&pid)
+        })
+        .await;
+        assert!(registry.0.lock().unwrap().is_empty());
+    }
+
+    /// Every step of a host's connection, and after each, the process table
+    /// and the hosts directory hold only what that step should leave.
+    #[tokio::test]
+    async fn a_hosts_connection_leaves_nothing_behind_on_any_path() {
+        use super::shim::{eventually, running};
+        let shim = Shim::new("host-life");
+        let root = shim.root.to_str().unwrap().to_owned();
+        let dir = shim.root.join("hosts");
+        let files = paths(&dir, "box").unwrap();
+        let socket = shim.remote.join("daemon.sock");
+        daemon(&socket, "s1");
+        shim.agent(&ready(&socket, agent_client::PROTOCOL), 0);
+        let masters = || {
+            (running(&root).into_iter())
+                .filter(|line| line.contains("ControlMaster=yes"))
+                .count()
         };
-        for _ in 0..100 {
-            if ended() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let left = || {
+            let mut names: Vec<String> = std::fs::read_dir(&dir)
+                .map(|d| {
+                    d.filter_map(|e| e.ok()?.file_name().into_string().ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            names
+        };
+        let hosts = shim.hosts();
+        let host = hosts.acquire("box").unwrap();
+        // Open: one master, its sockets and lock.
+        let local = host.connect().await.unwrap();
+        agent_client::Client::connect(&local).await.unwrap();
+        assert_eq!(masters(), 1);
+        for file in [&files.ctl, &files.socket, &files.lock] {
+            assert!(
+                std::fs::symlink_metadata(file).is_ok(),
+                "{}",
+                file.display()
+            );
         }
-        assert!(ended(), "{stat} still runs");
+        // The master is killed from outside: the next attach starts another.
+        let pid = std::fs::read_to_string(&files.ctl).unwrap();
+        // SAFETY: the stand-in master this test started.
+        unsafe { libc::kill(pid.trim().parse().unwrap(), libc::SIGKILL) };
+        eventually("the dead master is noticed", || {
+            futures_now(host.reached()).is_none()
+        })
+        .await;
+        let local = host.connect().await.unwrap();
+        agent_client::Client::connect(&local).await.unwrap();
+        assert_eq!(masters(), 1);
+        // The store is replaced there: the host's own shutdown, then another
+        // store answers on the same socket, through the same master.
+        host.replace().await.unwrap();
+        std::fs::remove_file(&socket).unwrap();
+        daemon(&socket, "s2");
+        let local = host.connect().await.unwrap();
+        let (client, _events) = agent_client::Client::connect(&local).await.unwrap();
+        assert_eq!(client.store(), Some("s2"));
+        assert_eq!(masters(), 1);
+        drop(client);
+        // The last window closes: no process, no file.
+        hosts.release(&host).await;
+        assert_eq!(running(&root), Vec::<String>::new());
+        assert_eq!(left(), Vec::<String>::new());
+        // An attach that was waiting when it closed starts nothing.
+        let closed = host.connect().await.unwrap_err();
+        assert!(closed.starts_with("host_closed: "), "{closed}");
+        assert_eq!(running(&root), Vec::<String>::new());
+        // Opened again, then the app quits.
+        let host = hosts.acquire("box").unwrap();
+        host.connect().await.unwrap();
+        assert_eq!(masters(), 1);
+        hosts.close_all().await;
+        assert_eq!(running(&root), Vec::<String>::new());
+        assert_eq!(left(), Vec::<String>::new());
+        assert_eq!(shim.count("master"), 3);
+    }
+
+    /// Poll a future once: `reached` answers at once.
+    fn futures_now<T>(future: impl Future<Output = T>) -> T {
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        let mut future = std::pin::pin!(future);
+        match future.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(value) => value,
+            std::task::Poll::Pending => panic!("pending"),
+        }
+    }
+
+    /// A crash leaves a master connected and its files. The next launch
+    /// retires that master, waiting until it has removed its own control
+    /// socket, so it cannot remove the new master's, and uses nothing it left.
+    #[tokio::test]
+    async fn a_crash_leaves_nothing_the_next_launch_keeps() {
+        use super::shim::{eventually, running};
+        let shim = Shim::new("host-crash");
+        let root = shim.root.to_str().unwrap().to_owned();
+        let dir = shim.root.join("hosts");
+        let files = paths(&dir, "box").unwrap();
+        let socket = shim.remote.join("daemon.sock");
+        daemon(&socket, "s1");
+        shim.agent(&ready(&socket, agent_client::PROTOCOL), 0);
+        // What the crashed run left: its master, still connected, in a group
+        // of its own; its forwarded socket; its lock, held by no one.
+        private_dir(&dir).unwrap();
+        let mut orphan = std::process::Command::new(&shim.ssh);
+        std::os::unix::process::CommandExt::process_group(&mut orphan, 0);
+        let orphan = orphan
+            .args(master_args(&files, "box", &Features::default()))
+            .spawn()
+            .unwrap();
+        let old = orphan.id().to_string();
+        eventually("the orphan master is up", || files.ctl.exists()).await;
+        std::fs::write(&files.lock, "").unwrap();
+        std::os::unix::fs::symlink("/nonexistent", &files.socket).unwrap();
+        // The next launch.
+        let hosts = shim.hosts();
+        hosts.prepare().await;
+        assert!(super::shim::ended(&old) || !running(&root).iter().any(|l| l.contains(&old)));
+        assert!(std::fs::read_dir(&dir).unwrap().next().is_none());
+        let host = hosts.acquire("box").unwrap();
+        let local = host.connect().await.unwrap();
+        // Past when the old master's cleanup would have run: the new one's
+        // control socket and forward stand.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(files.ctl.exists());
+        agent_client::Client::connect(&local).await.unwrap();
+        hosts.close_all().await;
+        assert_eq!(running(&root), Vec::<String>::new());
+        drop(orphan);
+    }
+
+    /// A config that says the opposite of everything the app forces, and
+    /// sets up what the app clears.
+    const HOSTILE: &str = "IgnoreUnknown ForkAfterAuthentication,SessionType,ChannelTimeout
+Host *
+  BatchMode no
+  ConnectTimeout 1
+  LogLevel QUIET
+  RequestTTY force
+  RemoteCommand echo hostile
+  ForkAfterAuthentication yes
+  ControlPersist yes
+  ControlMaster autoask
+  ControlPath /tmp/hostile-%C
+  SessionType none
+  ClearAllForwardings no
+  LocalForward 5999 localhost:22
+  RemoteForward 5998 localhost:22
+  DynamicForward 1080
+  Tunnel yes
+  ForwardAgent yes
+  ForwardX11 yes
+  PermitLocalCommand yes
+  LocalCommand touch /tmp/hostile-local
+  AddKeysToAgent ask
+  ServerAliveInterval 0
+  ServerAliveCountMax 100
+  ChannelTimeout global=10s direct-streamlocal@openssh.com=5s
+  ExitOnForwardFailure no
+  StreamLocalBindUnlink no
+";
+
+    /// Real OpenSSH (`ssh` on PATH): with the hostile config, what `ssh -G`
+    /// says takes effect for every forced option is what it says with no
+    /// config at all. `StreamLocalBindMask` is the one OpenSSH lets a config
+    /// override (see `FORCED`), so it is not asserted here.
+    #[tokio::test]
+    async fn no_ssh_config_changes_what_the_app_forces() {
+        let shim = Shim::new("host-hostile");
+        let hostile = shim.root.join("hostile");
+        std::fs::write(&hostile, HOSTILE).unwrap();
+        let ssh = Path::new("ssh");
+        let features = probe(ssh, &Registry::default()).await;
+        let p = paths(&shim.root.join("hosts"), "box").unwrap();
+        let effective = |config: &Path, args: &[OsString]| {
+            let out = std::process::Command::new(ssh)
+                .arg("-F")
+                .arg(config)
+                .arg("-G")
+                .args(args)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(out.status.success(), "{stderr}");
+            let mut said: HashMap<String, Vec<String>> = HashMap::new();
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let (key, value) = line.split_once(' ').unwrap_or((line, ""));
+                said.entry(key.to_owned())
+                    .or_default()
+                    .push(value.to_owned());
+            }
+            said
+        };
+        let none = Path::new("none");
+        for (master, args) in [
+            (true, master_args(&p, "box", &features)),
+            (false, exec_args(&p, "box", "agent start", &features)),
+        ] {
+            let (hostile, plain) = (effective(&hostile, &args), effective(none, &args));
+            let mut keys = vec![
+                "controlpath",
+                "localforward",
+                "remoteforward",
+                "dynamicforward",
+            ];
+            for (option, for_master, for_exec, _) in FORCED {
+                if (if master { *for_master } else { *for_exec }) && features.knows(option) {
+                    keys.push(option.split('=').next().unwrap());
+                }
+            }
+            for key in keys {
+                let key = key.to_ascii_lowercase();
+                if key == "streamlocalbindmask" {
+                    continue;
+                }
+                assert_eq!(
+                    hostile.get(&key),
+                    plain.get(&key),
+                    "master: {master}, {key}"
+                );
+            }
+        }
+        // A request to the master names `-F none` first, so a config given
+        // before it is not read.
+        let control = control_args(&p, "box", "exit", None);
+        assert_eq!(control[..2], ["-F", "none"]);
+        let quiet = ["-F", "none", "--", "box"].map(OsString::from);
+        assert_eq!(effective(&hostile, &quiet), effective(none, &quiet[2..]));
+    }
+
+    /// The same lifecycle against a real host, run by hand:
+    /// `AGENT_TEST_SSH_HOST` names an alias whose login shell has this
+    /// version's `agent` on its PATH. The test replaces that account's agent
+    /// store (moved aside to `~/.agent/replaced-*`, not deleted), so it must
+    /// be a disposable account. `AGENT_TEST_SSH` may name the ssh to run (a
+    /// wrapper adding `-F` with a hostile config, say), and
+    /// `AGENT_TEST_SSH_AFTER` a shell command run after each step with the
+    /// step's name as `$1`, which must succeed. After each step, no process
+    /// naming this test's hosts directory runs that the step should not
+    /// leave.
+    #[tokio::test]
+    #[ignore = "needs AGENT_TEST_SSH_HOST, a disposable account running this agent"]
+    async fn a_real_hosts_connection_leaves_nothing_behind() {
+        use super::shim::{eventually, running};
+        let alias = std::env::var("AGENT_TEST_SSH_HOST").expect("AGENT_TEST_SSH_HOST");
+        let ssh = PathBuf::from(std::env::var_os("AGENT_TEST_SSH").unwrap_or("ssh".into()));
+        let root = PathBuf::from(format!("/tmp/agent-app-real-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("hosts");
+        let ours = dir.to_str().unwrap().to_owned();
+        let files = paths(&dir, &alias).unwrap();
+        let masters = || -> Vec<String> {
+            (running(&ours).into_iter())
+                .filter(|line| line.contains("ControlMaster=yes"))
+                .collect()
+        };
+        let left = || std::fs::read_dir(&dir).map_or(0, |d| d.count());
+        let after = |step: &str| {
+            if let Ok(hook) = std::env::var("AGENT_TEST_SSH_AFTER") {
+                let status = std::process::Command::new("sh")
+                    .args(["-c", &hook, "hook", step])
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "after {step}");
+            }
+        };
+        let hosts = Hosts::new(Some(dir.clone()), ssh.clone());
+        // Open.
+        let host = hosts.acquire(&alias).unwrap();
+        let local = host.connect().await.unwrap();
+        let (client, _events) = agent_client::Client::connect(&local).await.unwrap();
+        let first = client.store().map(str::to_owned);
+        drop(client);
+        assert_eq!(masters().len(), 1, "{:?}", masters());
+        after("open");
+        // The master is killed from outside; the next attach starts another.
+        let old = masters()[0].split_whitespace().next().unwrap().to_owned();
+        // SAFETY: the master this test's Hosts started.
+        unsafe { libc::kill(old.parse().unwrap(), libc::SIGKILL) };
+        eventually("the dead master is noticed", || {
+            futures_now(host.reached()).is_none()
+        })
+        .await;
+        let local = host.connect().await.unwrap();
+        agent_client::Client::connect(&local).await.unwrap();
+        assert_eq!(masters().len(), 1, "{:?}", masters());
+        assert!(super::shim::ended(&old));
+        after("reattach");
+        // The store is replaced there: the host's own shutdown, the store
+        // moved aside, and the next attach meets a new one.
+        host.replace().await.unwrap();
+        let features = hosts.env.ready().await;
+        let moved = bounded(
+            &ssh,
+            &exec_args(
+                &files,
+                &alias,
+                "mkdir -p ~/.agent/replaced-$$ && mv ~/.agent/state.sqlite* ~/.agent/replaced-$$/",
+                features,
+            ),
+            MAX_OUTPUT,
+            COMMAND_TIMEOUT,
+            &hosts.env.registry,
+        )
+        .await
+        .ok()
+        .unwrap();
+        assert!(
+            moved.status.success(),
+            "{}",
+            String::from_utf8_lossy(&moved.stderr)
+        );
+        let local = host.connect().await.unwrap();
+        let (client, _events) = agent_client::Client::connect(&local).await.unwrap();
+        assert_ne!(client.store().map(str::to_owned), first);
+        drop(client);
+        assert_eq!(masters().len(), 1, "{:?}", masters());
+        after("replaced");
+        // The last window closes.
+        hosts.release(&host).await;
+        assert_eq!(running(&ours), Vec::<String>::new());
+        assert_eq!(left(), 0);
+        after("closed");
+        // Opened again, then the app quits.
+        let host = hosts.acquire(&alias).unwrap();
+        host.connect().await.unwrap();
+        hosts.close_all().await;
+        assert_eq!(running(&ours), Vec::<String>::new());
+        assert_eq!(left(), 0);
+        after("quit");
+        // A crash: a master left connected, its lock held by no one. The
+        // next launch retires it and keeps nothing it left.
+        let mut orphan = std::process::Command::new(&ssh);
+        std::os::unix::process::CommandExt::process_group(&mut orphan, 0);
+        let orphan = orphan
+            .args(master_args(&files, &alias, features))
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        eventually("the orphan master connects", || files.ctl.exists()).await;
+        std::fs::write(&files.lock, "").unwrap();
+        let old = orphan.id().to_string();
+        let hosts = Hosts::new(Some(dir.clone()), ssh.clone());
+        hosts.prepare().await;
+        eventually("the orphan master exits", || super::shim::ended(&old)).await;
+        assert_eq!(left(), 0);
+        let host = hosts.acquire(&alias).unwrap();
+        let local = host.connect().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(files.ctl.exists());
+        agent_client::Client::connect(&local).await.unwrap();
+        hosts.close_all().await;
+        assert_eq!(running(&ours), Vec::<String>::new());
+        assert_eq!(left(), 0);
+        after("crash");
+        drop(orphan);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A master that prints errors without end is ended, group and all, not
+    /// read forever.
+    #[tokio::test]
+    async fn a_master_that_prints_without_end_is_ended() {
+        let shim = Shim::new("host-noisy");
+        let root = shim.root.to_str().unwrap().to_owned();
+        shim.mode("noisy");
+        let hosts = shim.hosts();
+        let host = hosts.acquire("box").unwrap();
+        let noisy = host.connect().await.unwrap_err();
+        assert!(
+            noisy.starts_with("host_output_too_large: ssh box"),
+            "{noisy}"
+        );
+        assert_eq!(super::shim::running(&root), Vec::<String>::new());
+        hosts.close_all().await;
+    }
+
+    /// Quitting closes every host at once, under one deadline, even when
+    /// each master ignores SIGTERM for its whole grace.
+    #[tokio::test]
+    async fn quitting_closes_every_host_at_once() {
+        use super::shim::running;
+        let shim = Shim::new("host-quit");
+        let root = shim.root.to_str().unwrap().to_owned();
+        let socket = shim.remote.join("daemon.sock");
+        daemon(&socket, "s1");
+        shim.agent(&ready(&socket, agent_client::PROTOCOL), 0);
+        shim.mode("stubborn");
+        let hosts = shim.hosts();
+        for alias in ["box1", "box2", "box3"] {
+            hosts.acquire(alias).unwrap().connect().await.unwrap();
+        }
+        assert_eq!(running(&root).len(), 3, "{:?}", running(&root));
+        let begun = Instant::now();
+        hosts.close_all().await;
+        assert!(begun.elapsed() < QUIT_TIMEOUT, "{:?}", begun.elapsed());
+        assert_eq!(running(&root), Vec::<String>::new());
+        let left: Vec<_> = (std::fs::read_dir(shim.root.join("hosts")).unwrap())
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
     }
 
     #[tokio::test]

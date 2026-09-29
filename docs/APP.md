@@ -400,28 +400,18 @@ wildcards in the last component only (an `Include` inside a `Host` or
 applies to some hosts is skipped), and beside each what `ssh -G` says it
 connects to. Words are split as OpenSSH splits them (either quote, and `\`
 escapes), and a line with an open quote, which OpenSSH rejects, names no
-host. The `ssh -G` probes run eight at a time, for the first 64 aliases,
-each read to at most 64 KiB and five seconds. Every ssh the app starts
-runs in a process group of its own, and one cut off at a bound is killed
-with its group, so a `Match exec` or `ProxyCommand` it started ends too.
+host. The `ssh -G` answers run eight at a time, for the first 64 aliases.
 **Open window** opens a window on that host; `agent-app --host
 box` opens the first one there. The window's title names the host. Nothing
 about SSH is reimplemented: every connection is `ssh box` with your own
 config, keys and agent.
 
 Per host, the app owns one `ssh` process, a ControlMaster in the foreground
-with `BatchMode=yes` (never a prompt), `ServerAliveInterval=15` and
-`ServerAliveCountMax=3`, `ControlPersist=no`, `ForkAfterAuthentication=no`
-(it never backgrounds itself, so the process the app supervises is the
-master), `ClearAllForwardings=yes` (a
-`LocalForward` of your own cannot stop it), `ExitOnForwardFailure=yes`,
-`StreamLocalBindUnlink=yes` and `StreamLocalBindMask=0177`. Its control
-socket and the forwarded daemon socket are in `~/.agent/hosts/`, made
-owner-only and named by a hash of the exact alias (so `Box` and `box` never
-share them on a case-insensitive disk), beside a lock only one app process may hold per host. Over that
-master the app runs `agent start` (with `SessionType=default`, so a host
-kept for forwarding with `SessionType none` still runs it) in the remote
-user's login shell
+with keepalives and no session. Its control socket and the forwarded daemon
+socket are in `~/.agent/hosts/`, made owner-only and named by a hash of the
+exact alias (so `Box` and `box` never share them on a case-insensitive
+disk), beside a lock only one app process may hold per host. Over that
+master the app runs `agent start` in the remote user's login shell
 (`exec "$SHELL" -l -i -c ...`, so the `agent` and provider keys a terminal
 there would have), which prints the daemon's ready line and the socket it
 answered on, then asks the master to forward that socket (`-O forward -L
@@ -430,11 +420,83 @@ against the local socket. An attach tries the forward first; when the daemon
 or the link has gone, it runs `agent start` again, starting a new master
 first if the old one exited. A failure is not tried again for a backoff that
 doubles from one second to thirty, so a window retrying every two seconds
-does not open a connection each time. Each ssh command's stdout and stderr
-are read up to 1 MiB each; a login shell that prints more is killed and
-reported as `host_output_too_large`. The last window on a host closing ends
-its master and removes its files; so does quitting the app. The daemon on the
-host keeps running.
+does not open a connection each time. The daemon on the host keeps running
+when the app lets go of it.
+
+### Connection lifecycle
+
+Every process the app starts for a host is an `ssh` that leads a process
+group of its own. It has exactly one owner, which ends it, group and all, on
+every path. What OpenSSH starts under it (`Match exec`, `ProxyCommand`,
+`KnownHostsCommand`) is in its group. When the `ssh` exits, the rest of its
+group is killed before the `ssh` is reaped, so a group is signalled only
+while its id is still the app's.
+
+| Process | Owner | Ends when |
+| --- | --- | --- |
+| `ssh -G ALIAS` (Hosts list) | the list request | it answers, or after 5 s or 64 KiB of output |
+| `ssh -F none -G -o OPTION` (once per launch) | the first attach | it answers, or after 5 s |
+| The master (`-N`, `ControlMaster=yes`) | the host's link | the last window closes, the app quits, it prints 1 MiB of errors, or it exits (the next attach starts another) |
+| `agent start`, `agent shutdown` on the host | the attach or restart that ran it | it exits, or after 60 s or 1 MiB on stdout or stderr |
+| `-O forward`, `cancel`, `exit` to the master | the attach, close or cleanup that ran it | as above |
+
+The last window on a host closing sends SIGTERM to the master's group (ssh
+closes the connection and removes its control socket), then SIGKILL after
+two seconds, and removes the host's files, its lock last and while still
+held. Quitting ends every group still running, then closes every host
+concurrently under one three-second deadline, then kills what is left. An
+attach that finishes after its window closed starts nothing
+(`host_closed`). A crash leaves its groups running. On the next launch, the
+app sweeps `~/.agent/hosts/`. For each host whose lock no process holds, it
+asks a master still answering on the control socket to exit, waits until
+that master has removed its control socket itself, and removes the files.
+It never trusts or reuses any of them. The same retirement runs before any
+master starts, so an old master cannot remove a new one's socket on its way
+out. A lock file is taken only when it is still the file at its path, so two
+processes never hold locks on different files of one name.
+
+Every option the app depends on is forced on the command line, in one table
+in `remote.rs` (`FORCED`). OpenSSH keeps an option's first value, and the
+command line is read before any config, so `~/.ssh/config` cannot change
+them:
+
+| Option | Master | Exec | Why |
+| --- | --- | --- | --- |
+| `BatchMode=yes`, `ConnectTimeout=10` | yes | yes | no terminal to answer a prompt |
+| `LogLevel=ERROR` | yes | yes | reasons come from ssh's error lines; `QUIET` hides them |
+| `RequestTTY=no`, `RemoteCommand=none` | yes | yes | the command is the app's, with no terminal |
+| `ForkAfterAuthentication=no`, `ControlPersist=no` | yes | yes | the supervised ssh is the one doing the work; no master outlives it |
+| `ControlMaster=yes` / `no` | yes | no | one master per host; a command only uses it |
+| `SessionType=default` | no (`-N`) | yes | runs on a host kept for forwarding (`SessionType none`) |
+| `ClearAllForwardings=yes`, `Tunnel=no`, `ForwardAgent=no`, `ForwardX11=no` | yes | yes | a config's forwards cannot stop the master; the daemon inherits no agent or display |
+| `PermitLocalCommand=no`, `AddKeysToAgent=no` | yes | yes | no `LocalCommand` and no `ssh-askpass` here |
+| `ServerAliveInterval=15`, `ServerAliveCountMax=3` | yes | no | a dead link is noticed within a minute |
+| `ChannelTimeout=global=0 *=0` | yes | no | an idle forwarded connection is not closed |
+| `ExitOnForwardFailure=yes`, `StreamLocalBindUnlink=yes`, `StreamLocalBindMask=0177` | yes | no | the daemon's forward binds or fails, replaces a stale socket, and is owner-only |
+
+The control socket is always `-S`, which the command line also decides.
+`-O` requests read no config at all (`-F none`): a config's
+`ClearAllForwardings yes` would otherwise make `-O forward -L` succeed while
+creating no listener. Two caveats:
+
+- `StreamLocalBindMask` is last-value-wins in OpenSSH, so a config can loosen
+  it. The owner-only directory is what keeps other users out.
+- `ForkAfterAuthentication`, `SessionType` and `ChannelTimeout` are unknown to
+  OpenSSH before 8.7 (macOS 12 ships 8.6), which rejects them as bad options.
+  The app asks its `ssh` once which it knows and leaves out the ones it
+  doesn't; a config for that ssh cannot set them either.
+
+Not forced, as the user's own: how the host is reached (`ProxyCommand`,
+`ProxyJump`, `Match exec`, `KnownHostsCommand`), keys and agents, and
+environment (`SetEnv`, `SendEnv`). `StdinNull` and `EscapeChar` need
+nothing: stdin is `/dev/null` and there is no terminal. A `ProxyJump` host
+whose own config says `ControlPersist` backgrounds a master of the user's
+own with `setsid`. That master leaves the app's group and is not the app's
+to end.
+
+A path containing `%` or `$` is refused (`host_path_unusable`), because ssh
+expands both in control and forward paths. So is a remote socket with `:`
+or `%`.
 
 A window on a host never starts or replaces a daemon on this machine, and
 never signals a process on the host itself. What stops it says why:
@@ -470,7 +532,9 @@ a shell on the host) shows in the window.
 Not built: reading a host's files (step 2, in [NEXT item
 41](NEXT.md)); an app-level heartbeat beyond SSH keepalives; `Include` with
 wildcards in a directory; a conditional `Include` (under a `Host` or
-`Match` that is not every host); a login shell that takes `-l` only alone (tcsh).
+`Match` that is not every host); a login shell that takes `-l` only alone
+(tcsh); ending what a crash left before the next launch (macOS has no
+parent-death signal for the master to follow).
 
 ## Projects and panes
 
@@ -913,8 +977,16 @@ aliases, includes and quoting, `ssh -G` read to its bound, the ssh arguments, `a
 through the master and again after it is killed, a host printing without end
 cut off at 1 MiB, an `ssh -G` cut off with what it started, a refused login and a
 missing `agent` reported and backed off, an older daemon replaced through the
-host's own `agent shutdown`, one app process per host, and a window on a host
-never starting a local daemon. The page tests cover saved state keyed by
+host's own `agent shutdown`, one app process per host, a window on a host
+never starting a local daemon, and the connection lifecycle: after opening, a
+master killed from outside, a store replaced, the last window closing and
+quitting, the process table and `~/.agent/hosts/` hold only what that step
+leaves; a crash's master is retired, and its files swept, by the next launch;
+quitting closes every host at once; a master flooding its stderr, and an ssh
+that times out or exits, end with their groups. A test runs the real `ssh -G`
+with a config that sets the opposite of every forced option and checks each
+still takes effect. `a_real_hosts_connection_leaves_nothing_behind`
+(ignored; `AGENT_TEST_SSH_HOST`) runs the same lifecycle against a real host. The page tests cover saved state keyed by
 store, another store answering on reattach followed from its start (with
 the new host's home replacing the last one's), a host window's home and what it leaves out, and the Hosts list.
 `cargo test --workspace` includes the silent-listener readiness deadline,
