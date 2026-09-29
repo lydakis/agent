@@ -1,9 +1,11 @@
 """A schedule's fire against a real daemon: what launchd runs, sent to the bot it was made for."""
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -95,8 +97,13 @@ class ScheduleFireTests(ModelFixture):
         self.addCleanup(self.model.release_headers.set)
         self.agent('run', '--store', str(self.store), '--bot', 'p.task', '--detach', 'gate')
         time.sleep(0.5)
-        # Delivered, it leaves no row behind.
-        self.assertIsNone(self.fire('p.task', 'p.task', bot_id, 'Look again.', at=int(time.time())))
+        fired = self.fire('p.task', 'p.task', bot_id, 'Look again.', at=int(time.time()))
+        if sys.platform == 'darwin':
+            # Delivered, it leaves no row behind.
+            self.assertIsNone(fired)
+        else:
+            # No launchd to unload it: it stays, with what it did.
+            self.assertEqual(fired['last']['outcome'], 'sent', fired)
         self.model.release_headers.set()
         self.settle('p.task')
         self.assertEqual([t['prompt_preview'] for t in self.turns('p.task')][1:], ['gate', 'Look again.'])
@@ -113,10 +120,12 @@ class ScheduleFireTests(ModelFixture):
         try:
             os.link(APP, app)
         except OSError:
-            import shutil
             shutil.copy2(APP, app)
         (bundle / 'agent').symlink_to(self.binary)
-        socket = self.path / 'own.sock'
+        # A deep checkout's path would pass macOS's 104-byte limit for a socket's.
+        short = Path(tempfile.mkdtemp(prefix='ag', dir='/tmp'))
+        self.addCleanup(shutil.rmtree, short, True)
+        socket = short / 'own.sock'
         self.addCleanup(lambda: subprocess.run([str(self.binary), 'shutdown', '--store', str(self.store),
                                                 '--socket', str(socket)], env=clean_env(), capture_output=True, timeout=35))
         sent = self.fire('p.task', 'p.task', bot_id, 'Morning check.', app=app, socket=socket,

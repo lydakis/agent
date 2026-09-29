@@ -934,7 +934,10 @@ lifecycle step above against a stand-in launchd that tracks which labels
 are loaded and refuses loads and unloads on demand: after every refusal the
 plist, the loaded job and the last result are checked together. The coordinator's
 task updates are tested in `app/tests/state.test.cjs` and were driven in demo
-mode in headless Chromium. Not verified: launchd itself, which needs a Mac.
+mode in headless Chromium. The real-launchd test passed on a Mac (2026-09-29, at 2e484ed): launchd
+fired the one-off at its minute and it ended itself; replace, `rm` of a
+plist launchd had dropped, `rm` of a job without its plist, and a last `rm`
+answering `schedule_not_found` all held.
 
 ## Next
 
