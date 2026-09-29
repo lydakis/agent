@@ -391,7 +391,9 @@ shows that daemon's providers instead of the ones this machine would start.
 
 A window can attach to the daemon on a machine you reach over SSH, so long
 work runs there while the app runs here. Settings lists **Hosts**: the
-concrete `Host` aliases in `~/.ssh/config` (not patterns or negations),
+concrete `Host` aliases in `~/.ssh/config` (not patterns, negations, or
+`user@host`, which ssh reads as a user and a host), at most 1024 of them
+from at most 4 MiB of config across includes,
 following `Include` with a relative path from `~/.ssh`, a `~/` path, or
 wildcards in the last component only (an `Include` inside a `Host` or
 `Match` block is followed only under `Host *` or `Match all`; one that
@@ -399,7 +401,9 @@ applies to some hosts is skipped), and beside each what `ssh -G` says it
 connects to. Words are split as OpenSSH splits them (either quote, and `\`
 escapes), and a line with an open quote, which OpenSSH rejects, names no
 host. The `ssh -G` probes run eight at a time, for the first 64 aliases,
-each read to at most 64 KiB and five seconds.
+each read to at most 64 KiB and five seconds. Every ssh the app starts
+runs in a process group of its own, and one cut off at a bound is killed
+with its group, so a `Match exec` or `ProxyCommand` it started ends too.
 **Open window** opens a window on that host; `agent-app --host
 box` opens the first one there. The window's title names the host. Nothing
 about SSH is reimplemented: every connection is `ssh box` with your own
@@ -407,13 +411,17 @@ config, keys and agent.
 
 Per host, the app owns one `ssh` process, a ControlMaster in the foreground
 with `BatchMode=yes` (never a prompt), `ServerAliveInterval=15` and
-`ServerAliveCountMax=3`, `ControlPersist=no`, `ClearAllForwardings=yes` (a
+`ServerAliveCountMax=3`, `ControlPersist=no`, `ForkAfterAuthentication=no`
+(it never backgrounds itself, so the process the app supervises is the
+master), `ClearAllForwardings=yes` (a
 `LocalForward` of your own cannot stop it), `ExitOnForwardFailure=yes`,
 `StreamLocalBindUnlink=yes` and `StreamLocalBindMask=0177`. Its control
 socket and the forwarded daemon socket are in `~/.agent/hosts/`, made
 owner-only and named by a hash of the exact alias (so `Box` and `box` never
 share them on a case-insensitive disk), beside a lock only one app process may hold per host. Over that
-master the app runs `agent start` in the remote user's login shell
+master the app runs `agent start` (with `SessionType=default`, so a host
+kept for forwarding with `SessionType none` still runs it) in the remote
+user's login shell
 (`exec "$SHELL" -l -i -c ...`, so the `agent` and provider keys a terminal
 there would have), which prints the daemon's ready line and the socket it
 answered on, then asks the master to forward that socket (`-O forward -L
@@ -903,11 +911,12 @@ neither a partial file nor a temporary, and hosts over SSH against a stand-in
 `ssh` that runs the remote command here and forwards by linking: `~/.ssh/config`
 aliases, includes and quoting, `ssh -G` read to its bound, the ssh arguments, `agent start`'s answers, attaching
 through the master and again after it is killed, a host printing without end
-cut off at 1 MiB, a refused login and a
+cut off at 1 MiB, an `ssh -G` cut off with what it started, a refused login and a
 missing `agent` reported and backed off, an older daemon replaced through the
 host's own `agent shutdown`, one app process per host, and a window on a host
 never starting a local daemon. The page tests cover saved state keyed by
-store, another store answering on reattach followed from its start, a host window's home and what it leaves out, and the Hosts list.
+store, another store answering on reattach followed from its start (with
+the new host's home replacing the last one's), a host window's home and what it leaves out, and the Hosts list.
 `cargo test --workspace` includes the silent-listener readiness deadline,
 fork workspace parity between durable records, live events, and replay, and
 the app's policy errors for oversized and unreadable AGENTS.md files.

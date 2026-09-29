@@ -14,6 +14,8 @@ const DECODE_BYTES = 8 * 1024 * 1024;
 
 const S = {
   bots: new Map(), transcripts: new Map(), selected: '', cursor: 0, live: false, attached: false, autoSelect: true,
+  // Whether the workspace is the home a host named, not a folder the window was given.
+  homeWorkspace: false,
   // The store identity the attached daemon announced; what the window remembers is saved under it.
   store: null,
   // Bumped whenever a bot is added, removed or changes status (botsGen), and when one is added or
@@ -935,7 +937,7 @@ async function attachOnce() {
     if (S.store && store && store !== S.store) { forgetStore(); ({ session, store, workspace } = await Daemon.attach(0)); }
     S.session = session; S.store = store ?? null;
     // A window on a host starts in the home the host named, unless it was given a folder there.
-    if (!S.config.workspace && workspace) S.config.workspace = workspace;
+    if (!S.config.workspace && workspace) { S.config.workspace = workspace; S.homeWorkspace = true; }
     S.deleted = new Set(); S.snapshot = true;
     pump(session);
     // The snapshot, a page at a time, applied as it arrives while the replay flows.
@@ -992,6 +994,8 @@ function forgetStore() {
   S.swarms.clear(); S.memberOf.clear(); S.deleted.clear(); looked.clear();
   S.selected = ''; S.autoSelect = true; S.ui.side = null; S.ui.folded = new Set();
   S.botsGen += 1; S.shapeGen += 1;
+  // A home the last host named is not this one's.
+  if (S.homeWorkspace) { S.config.workspace = null; S.homeWorkspace = false; }
 }
 // No provider to run: starting again cannot help until Settings changes, which attaches itself.
 // Attaching again cannot help until something changes: a provider in Settings, or a newer app.

@@ -1951,4 +1951,22 @@ test('another store answering on reattach is followed from its start, with nothi
   assert.equal(p.S.bots.has('Bob'), false);
   assert.equal(p.S.transcripts.has('Bob'), false);
   assert.equal(p.S.drafts.size, 0);
+  assert.equal(p.S.config.workspace, '/synthetic', 'a folder the window was given is kept');
+});
+
+test('a home the last host named is replaced by the one the new store names', async () => {
+  const answers = [['store-1', '/home/a'], ['store-2', '/home/b'], ['store-2', '/home/b']];
+  let at = 0;
+  const p = page({
+    setup: async () => ({ socket: '/synthetic.sock', workspace: null, tools: [] }),
+    attach: async () => { const [store, workspace] = answers[Math.min(at++, answers.length - 1)]; return { session: at, store, workspace }; },
+    pull: () => new Promise(() => {}),
+    request: async (op) => (op === 'bots' ? { bots: [] } : {}),
+  });
+  p.setRender(() => {});
+  await p.attach(); await settle();
+  assert.equal(p.S.config.workspace, '/home/a');
+  p.lost('closed'); await p.tick(); await settle();
+  assert.equal(p.S.store, 'store-2');
+  assert.equal(p.S.config.workspace, '/home/b');
 });

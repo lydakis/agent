@@ -16,7 +16,7 @@
 //! with the host's own `agent shutdown`, then `agent start`.
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::OsString,
     path::{Path, PathBuf},
     process::{Output, Stdio},
@@ -47,13 +47,18 @@ const BACKOFF_LAST: Duration = Duration::from_secs(30);
 const STDERR_KEPT: usize = 4096;
 /// Bounds on reading `~/.ssh/config` and what it includes.
 const MAX_CONFIG: u64 = 1024 * 1024;
+/// How much config is read in all, across includes.
+const MAX_CONFIG_TOTAL: u64 = 4 * MAX_CONFIG;
+/// How many hosts the list names.
+const MAX_ALIASES: usize = 1024;
 const MAX_INCLUDE_DEPTH: usize = 16;
 /// Printed before `agent start`, so the app learns the remote home, the
 /// folder a window on the host starts in, whatever a profile prints.
 const HOME_MARK: &str = "__agent_app_home__";
 
 /// Whether `alias` is a name to hand `ssh` as its destination: one concrete
-/// host, never an option or a pattern.
+/// host, never an option or a pattern. Not `user@host`, which ssh reads as a
+/// user and a host rather than matching a `Host` entry of that name.
 pub fn valid_alias(alias: &str) -> bool {
     !alias.is_empty()
         && alias.len() <= 255
@@ -61,7 +66,7 @@ pub fn valid_alias(alias: &str) -> bool {
         && !alias.starts_with('!')
         && !alias
             .chars()
-            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '*' | '?' | '/'))
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '*' | '?' | '/' | '@'))
 }
 
 /// The concrete `Host` aliases of an OpenSSH client config, in file order,
@@ -72,15 +77,28 @@ pub fn valid_alias(alias: &str) -> bool {
 /// applies only where it stands, so one inside a `Host` or `Match` block is
 /// followed only when that block applies to every host (`Host *`, `Match
 /// all`); any other is conditional and skipped.
+/// At most `MAX_ALIASES` are listed, from at most `MAX_CONFIG_TOTAL` bytes
+/// of config across every included file.
 pub fn aliases(config: &Path, home: &Path) -> Vec<String> {
-    let mut out = Vec::new();
-    read_config(config, home, 0, &mut out);
-    out
+    let mut found = Found {
+        list: Vec::new(),
+        seen: HashSet::new(),
+        budget: MAX_CONFIG_TOTAL,
+    };
+    read_config(config, home, 0, &mut found);
+    found.list
 }
 
-fn read_config(path: &Path, home: &Path, depth: usize, out: &mut Vec<String>) {
+/// The aliases found so far, in order, and the config bytes left to read.
+struct Found {
+    list: Vec<String>,
+    seen: HashSet<String>,
+    budget: u64,
+}
+
+fn read_config(path: &Path, home: &Path, depth: usize, found: &mut Found) {
     use std::io::Read;
-    if depth > MAX_INCLUDE_DEPTH {
+    if depth > MAX_INCLUDE_DEPTH || found.budget == 0 || found.list.len() >= MAX_ALIASES {
         return;
     }
     // Checked before opening: opening a FIFO would block.
@@ -91,9 +109,11 @@ fn read_config(path: &Path, home: &Path, depth: usize, out: &mut Vec<String>) {
     let Ok(file) = std::fs::File::open(path) else {
         return;
     };
-    if file.take(MAX_CONFIG).read_to_string(&mut text).is_err() {
+    let allowed = found.budget.min(MAX_CONFIG);
+    if file.take(allowed).read_to_string(&mut text).is_err() {
         return;
     }
+    found.budget -= text.len() as u64;
     // Whether the block this line is in applies to every host.
     let mut everywhere = true;
     for line in text.lines() {
@@ -105,8 +125,11 @@ fn read_config(path: &Path, home: &Path, depth: usize, out: &mut Vec<String>) {
             "host" => {
                 everywhere = args.len() == 1 && args[0] == "*";
                 for alias in args {
-                    if valid_alias(alias) && !out.contains(alias) {
-                        out.push(alias.clone());
+                    if found.list.len() >= MAX_ALIASES {
+                        return;
+                    }
+                    if valid_alias(alias) && found.seen.insert(alias.clone()) {
+                        found.list.push(alias.clone());
                     }
                 }
             }
@@ -116,7 +139,7 @@ fn read_config(path: &Path, home: &Path, depth: usize, out: &mut Vec<String>) {
             "include" if everywhere => {
                 for pattern in args {
                     for included in expand(pattern, home) {
-                        read_config(&included, home, depth + 1, out);
+                        read_config(&included, home, depth + 1, found);
                     }
                 }
             }
@@ -231,26 +254,15 @@ fn glob(pattern: &str, name: &str) -> bool {
 /// What OpenSSH says an alias connects to, from `ssh -G`: its user, host
 /// name and port. None when ssh cannot say.
 pub async fn resolve(ssh: &Path, alias: &str) -> Option<Value> {
-    let mut child = Command::new(ssh)
-        .args(["-G", "--", alias])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
+    let args = ["-G", "--", alias].map(OsString::from);
+    // Its whole config is a few KiB.
+    let output = bounded(ssh, &args, MAX_RESOLVED, Duration::from_secs(5))
+        .await
         .ok()?;
-    let (out, mut stdout) = (child.stdout.take(), Vec::new());
-    // Its whole config is a few KiB; past the bound ssh is killed on drop.
-    let status = tokio::time::timeout(Duration::from_secs(5), async {
-        capped(out, MAX_RESOLVED, &mut stdout).await.ok()?;
-        child.wait().await.ok()
-    })
-    .await
-    .ok()??;
-    if !status.success() {
+    if !output.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&stdout);
+    let text = String::from_utf8_lossy(&output.stdout);
     let field = |key: &str| {
         text.lines()
             .find_map(|line| line.strip_prefix(key)?.strip_prefix(' '))
@@ -304,8 +316,10 @@ fn paths(dir: &Path, alias: &str) -> Result<Paths, String> {
 }
 
 /// Options every ssh the app runs takes: never a prompt, the app's control
-/// socket whatever the user's config says about multiplexing, and no
-/// `RemoteCommand` from it.
+/// socket whatever the user's config says about multiplexing, no
+/// `RemoteCommand` from it, and never backgrounding itself
+/// (`ForkAfterAuthentication`), so the process the app started is the one
+/// that does the work.
 fn common(paths: &Paths) -> Vec<OsString> {
     let mut args: Vec<OsString> = [
         "-o",
@@ -314,6 +328,8 @@ fn common(paths: &Paths) -> Vec<OsString> {
         &format!("ConnectTimeout={CONNECT_TIMEOUT}"),
         "-o",
         "RemoteCommand=none",
+        "-o",
+        "ForkAfterAuthentication=no",
     ]
     .map(OsString::from)
     .into();
@@ -352,9 +368,12 @@ pub fn master_args(paths: &Paths, alias: &str) -> Vec<OsString> {
     args
 }
 
-/// A command on the host over the master, never becoming a master itself.
+/// A command on the host over the master, never becoming a master itself,
+/// and run even for a host whose config says `SessionType none`.
 pub fn exec_args(paths: &Paths, alias: &str, command: &str) -> Vec<OsString> {
-    let mut args: Vec<OsString> = ["-T", "-o", "ControlMaster=no"].map(OsString::from).into();
+    let mut args: Vec<OsString> = ["-T", "-o", "ControlMaster=no", "-o", "SessionType=default"]
+        .map(OsString::from)
+        .into();
     args.extend(common(paths));
     args.extend(["--".into(), alias.into(), command.into()]);
     args
@@ -784,6 +803,8 @@ impl Host {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
+            // Its own group, so stopping it stops what it started too.
+            .process_group(0)
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| format!("host_unreachable: {}: {e}", self.ssh.display()))?;
@@ -854,38 +875,16 @@ impl Host {
     /// Run ssh with its output bounded, in time and in bytes: a login
     /// shell that prints without end is killed, not buffered.
     async fn run(&self, args: &[OsString]) -> Result<Output, String> {
-        let mut child = Command::new(&self.ssh)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| format!("host_unreachable: {}: {e}", self.ssh.display()))?;
-        let (out, err) = (child.stdout.take(), child.stderr.take());
-        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-        let work = async {
-            let read = tokio::try_join!(
-                capped(out, MAX_OUTPUT, &mut stdout),
-                capped(err, MAX_OUTPUT, &mut stderr)
-            );
-            if read.is_err() {
-                let _ = child.kill().await;
-                return Err(format!(
+        bounded(&self.ssh, args, MAX_OUTPUT, COMMAND_TIMEOUT)
+            .await
+            .map_err(|cut| match cut {
+                Cut::Failed(e) => format!("host_unreachable: {}: {e}", self.ssh.display()),
+                Cut::TimedOut => format!("host_timeout: ssh {} did not answer", self.alias),
+                Cut::TooLarge => format!(
                     "host_output_too_large: ssh {} printed more than {MAX_OUTPUT} bytes",
                     self.alias
-                ));
-            }
-            (child.wait().await).map_err(|e| format!("host_unreachable: ssh {}: {e}", self.alias))
-        };
-        let status = tokio::time::timeout(COMMAND_TIMEOUT, work)
-            .await
-            .map_err(|_| format!("host_timeout: ssh {} did not answer", self.alias))??;
-        Ok(Output {
-            status,
-            stdout,
-            stderr,
-        })
+                ),
+            })
     }
 }
 
@@ -894,6 +893,63 @@ const MAX_OUTPUT: u64 = 1024 * 1024;
 
 /// What `ssh -G` may print for one alias.
 const MAX_RESOLVED: u64 = 64 * 1024;
+
+/// Why a bounded ssh gave no output.
+enum Cut {
+    Failed(std::io::Error),
+    TimedOut,
+    TooLarge,
+}
+
+/// Run ssh in a process group of its own, reading at most `limit` bytes from
+/// each of stdout and stderr, within `within`. Past either bound the whole
+/// group is killed: ssh and what it started (a `Match exec`, a
+/// `ProxyCommand`), which killing ssh alone would leave running.
+async fn bounded(
+    ssh: &Path,
+    args: &[OsString],
+    limit: u64,
+    within: Duration,
+) -> Result<Output, Cut> {
+    let mut child = Command::new(ssh)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(Cut::Failed)?;
+    let (out, err) = (child.stdout.take(), child.stderr.take());
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    let read = tokio::time::timeout(within, async {
+        tokio::try_join!(
+            capped(out, limit, &mut stdout),
+            capped(err, limit, &mut stderr)
+        )
+        .map_err(|()| Cut::TooLarge)?;
+        child.wait().await.map_err(Cut::Failed)
+    })
+    .await;
+    let cut = match read {
+        Ok(Ok(status)) => {
+            return Ok(Output {
+                status,
+                stdout,
+                stderr,
+            });
+        }
+        Ok(Err(cut)) => cut,
+        Err(_) => Cut::TimedOut,
+    };
+    // Not yet reaped, so its pid is still its group's.
+    if let Some(pid) = child.id().and_then(|pid| libc::pid_t::try_from(pid).ok()) {
+        // SAFETY: a signal to the process group this process started.
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+    }
+    let _ = child.wait().await;
+    Err(cut)
+}
 
 /// Read a pipe to its end, refusing more than `limit` bytes.
 async fn capped(
@@ -911,19 +967,25 @@ async fn capped(
     Ok(())
 }
 
-/// SIGTERM, so ssh removes its control socket, then SIGKILL if it lingers.
+/// SIGTERM to the master's process group, so ssh removes its control socket
+/// and what it started (a `ProxyCommand`) ends with it, then SIGKILL if it
+/// lingers.
 async fn stop(child: &mut Child) {
-    if let Some(pid) = child.id().and_then(|pid| libc::pid_t::try_from(pid).ok()) {
-        // SAFETY: a signal to the ssh this process started and has not reaped.
-        unsafe { libc::kill(pid, libc::SIGTERM) };
-        if tokio::time::timeout(Duration::from_secs(2), child.wait())
-            .await
-            .is_ok()
-        {
-            return;
-        }
+    // Only while not yet reaped is its pid still its group's.
+    let Some(pid) = child.id().and_then(|pid| libc::pid_t::try_from(pid).ok()) else {
+        return;
+    };
+    // SAFETY: a signal to the process group this process started.
+    unsafe { libc::kill(-pid, libc::SIGTERM) };
+    if tokio::time::timeout(Duration::from_secs(2), child.wait())
+        .await
+        .is_ok()
+    {
+        return;
     }
-    let _ = child.kill().await;
+    // SAFETY: as above; the master is still not reaped.
+    unsafe { libc::kill(-pid, libc::SIGKILL) };
+    let _ = child.wait().await;
 }
 
 /// The directory for hosts' sockets: made owner-only, and refused if it is
@@ -1143,12 +1205,35 @@ mod tests {
             ]
         );
         assert!(aliases(&home.join("none"), &home).is_empty());
+        // Many hosts, each named many times: listed once, in order, up to
+        // the bound, in linear time.
+        let many: String = (0..4 * MAX_ALIASES)
+            .map(|n| format!("Host h{n} h{n} h0\n"))
+            .collect();
+        std::fs::write(home.join(".ssh/many"), many).unwrap();
+        let listed = aliases(&home.join(".ssh/many"), &home);
+        assert_eq!(listed.len(), MAX_ALIASES);
+        assert_eq!(listed[..3], ["h0", "h1", "h2"]);
+        assert_eq!(listed[MAX_ALIASES - 1], format!("h{}", MAX_ALIASES - 1));
+        // Includes share one budget of bytes read.
+        let big = format!("# {}\n", "x".repeat(MAX_CONFIG as usize - 16));
+        for n in 0..5 {
+            std::fs::write(
+                home.join(format!(".ssh/big{n}")),
+                format!("Host big{n}\n{big}"),
+            )
+            .unwrap();
+        }
+        std::fs::write(home.join(".ssh/bigs"), "Include big*\n").unwrap();
+        let listed = aliases(&home.join(".ssh/bigs"), &home);
+        // Four fit; the fifth is past the budget.
+        assert_eq!(listed, ["big0", "big1", "big2", "big3"]);
         std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
     fn an_alias_is_one_concrete_destination_never_an_option() {
-        for good in ["box", "build-1.example", "user@box", "[::1]"] {
+        for good in ["box", "build-1.example", "[::1]"] {
             assert!(valid_alias(good), "{good}");
         }
         for bad in [
@@ -1160,6 +1245,8 @@ mod tests {
             "a b",
             "a/b",
             "a\nb",
+            // ssh reads this as user `user` at host `box`.
+            "user@box",
         ] {
             assert!(!valid_alias(bad), "{bad:?}");
         }
@@ -1209,6 +1296,7 @@ mod tests {
             "StreamLocalBindUnlink=yes",
             "ClearAllForwardings=yes",
             "RemoteCommand=none",
+            "ForkAfterAuthentication=no",
         ] {
             let at = master.iter().position(|a| a == option).expect(option);
             assert_eq!(master[at - 1], "-o");
@@ -1218,10 +1306,15 @@ mod tests {
         let at = master.iter().position(|a| a == "-S").unwrap();
         assert_eq!(master[at + 1], p.ctl.to_str().unwrap());
         let exec = text(exec_args(&p, "box", "agent start"));
-        assert!(
-            exec.contains(&"ControlMaster=no".to_owned())
-                && exec.contains(&"BatchMode=yes".to_owned())
-        );
+        for option in [
+            "ControlMaster=no",
+            "BatchMode=yes",
+            "SessionType=default",
+            "ForkAfterAuthentication=no",
+        ] {
+            let at = exec.iter().position(|a| a == option).expect(option);
+            assert_eq!(exec[at - 1], "-o");
+        }
         assert_eq!(&exec[exec.len() - 3..], ["--", "box", "agent start"]);
         assert_eq!(
             text(control_args(
@@ -1452,11 +1545,29 @@ mod tests {
             answer,
             json!({"user": "someone", "hostname": "box.example", "port": "22"})
         );
+        // What ssh started (a `Match exec`, say) ends with it.
         let flood = shim.root.join("bin/flood");
-        super::shim::script(&flood, "#!/bin/sh\nexec yes user\n");
+        super::shim::script(
+            &flood,
+            "#!/bin/sh\nsleep 30 &\necho $! > \"$0.pid\"\nexec yes user\n",
+        );
         let begun = std::time::Instant::now();
         assert_eq!(resolve(&flood, "box").await, None);
         assert!(begun.elapsed() < std::time::Duration::from_secs(4));
+        let pid = std::fs::read_to_string(shim.root.join("bin/flood.pid")).unwrap();
+        let stat = format!("/proc/{}/stat", pid.trim());
+        let ended = || {
+            std::fs::read_to_string(&stat).map_or(true, |s| {
+                s.rsplit(") ").next().is_some_and(|s| s.starts_with('Z'))
+            })
+        };
+        for _ in 0..100 {
+            if ended() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(ended(), "{stat} still runs");
     }
 
     #[tokio::test]
