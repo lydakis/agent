@@ -618,8 +618,10 @@ environment gains `AGENT_TURN` next to `AGENT_BOT`, the CLI run from that
 shell sends `from: {bot, turn}` with `submit`, `create`, and `fork`, and
 the daemon stores it on the prompt item that `submit` writes, whether it
 opens a turn or is absorbed as a steer, and reports it in
-`approval_requested`. A prompt item without `from` is a person's words; one
-with `from` was written by the model of the turn it names, and the
+`approval_requested`. A prompt item without `from` is a person's words,
+unless a client sent it on its own and said so with `origin` (the app's task
+updates and schedules): those, like a model's, are shown marked `model` and
+never consent. One with `from` was written by the model of the turn it names, and the
 approver follows it back to that turn's own person-written items. So a
 bot that steers a person's turn does not speak for the person, and a
 person who steers a delegated turn does. If the chain cannot be followed

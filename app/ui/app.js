@@ -655,7 +655,8 @@ async function onEvent(ev) {
       const b = bot(name);
       // A steer absorbed into a running turn finishes as its own turn while that turn goes on.
       if (b && (b.runningTurn === null || b.runningTurn === turn)) { b.runningTurn = null; b.waitingOn = []; if (b.turnStarted) b.elapsed = Date.now() - b.turnStarted; b.turnStarted = 0; b.status = status === 'completed' || status === 'steered' ? 'idle' : status; }
-      const t = transcript(name); t.authors?.delete(turn);
+      // A steer finishes before its `steered` event, which takes its author.
+      const t = transcript(name); if (status !== 'steered') t.authors?.delete(turn);
       if (t.streamingTurn === turn) { t.text = ''; t.thinking = ''; t.thinkingSince = 0; t.thinkingMs = 0; t.streamingTurn = null; t.streamGen += 1; }
       if (status !== 'completed' && status !== 'steered') addItem(t, { kind: 'note', text: data.error ? `${status}: ${data.error}${data.detail ? ': ' + data.detail : ''}` : status, turn });
       // A background command may outlive its turn; only a wait result says how it ended.

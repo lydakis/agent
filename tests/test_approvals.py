@@ -943,6 +943,18 @@ class AutoApproverTests(ModelFixture):
         self.assertEqual(request, [{'by': 'person', 'text': 'delete the build directory'},
                                    {'by': 'model', 'text': 'shell:printf DANGER'}])
 
+    def test_a_message_a_client_sent_on_its_own_asks_for_nothing(self):
+        daemon = self.daemon()
+        self.approver(daemon)
+        # A scheduled message is no person's word: like a model's, it is shown but grants nothing.
+        turn = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf DANGER',
+                              origin='schedule')['result']['turn']
+        daemon.finished(turn)
+        request = self.judge.requests.get(timeout=5)['body']['state']['request']
+        self.assertEqual(request, [{'by': 'model', 'text': 'shell:printf DANGER'}])
+        self.assertEqual(daemon.request('prompts', bot='Bob', turn=turn)['result']['prompts'],
+                         [{'turn': turn, 'text': 'shell:printf DANGER', 'origin': 'schedule'}])
+
     def test_a_call_is_judged_with_the_files_it_runs_that_the_turn_wrote(self):
         def shell_danger(body, id):
             call, _, question = id.partition('_')

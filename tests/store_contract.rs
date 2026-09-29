@@ -1586,6 +1586,19 @@ fn history_items_name_who_sent_each_prompt_after_its_turns_are_gone() {
         .unwrap();
     db.absorb(turn, None, 8 << 20, 4096, ContextUsage::default(), false)
         .unwrap();
+    // Bob's next message waits in line, and Bob is gone before it starts:
+    // it still names the identity that sent it. A scheduled one follows.
+    let waiting = db
+        .begin(
+            "Carol",
+            "b3",
+            "then the changelog",
+            true,
+            &by_bob(Delivery::Queue),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
     let later = db
         .begin(
             "Carol",
@@ -1597,8 +1610,18 @@ fn history_items_name_who_sent_each_prompt_after_its_turns_are_gone() {
         )
         .unwrap()
         .turn;
+    db.finish(person, None).unwrap();
+    db.delete_bot("Bob").unwrap();
     db.append(turn, vec![assistant("done")], &[], None).unwrap();
     db.finish(turn, None).unwrap();
+    let (accepted, _) = db.start(waiting, allow_provider).unwrap();
+    assert_eq!(
+        (&accepted["data"]["from"], &accepted["data"]["origin"]),
+        (&bob, &Value::Null)
+    );
+    db.append(waiting, vec![assistant("noted")], &[], None)
+        .unwrap();
+    db.finish(waiting, None).unwrap();
     let (accepted, _) = db.start(later, allow_provider).unwrap();
     assert_eq!(
         (&accepted["data"]["from"], &accepted["data"]["origin"]),
@@ -1624,6 +1647,8 @@ fn history_items_name_who_sent_each_prompt_after_its_turns_are_gone() {
     let expected = [
         json!(["ran", null, null]),
         json!(["nightly", null, "schedule"]),
+        json!(["noted", null, null]),
+        json!(["then the changelog", bob, null]),
         json!(["done", null, null]),
         json!(["and the tests", null, null]),
         json!(["task update", null, "tasks"]),
@@ -1632,12 +1657,9 @@ fn history_items_name_who_sent_each_prompt_after_its_turns_are_gone() {
     ];
     assert_eq!(senders(&db, "Carol"), expected);
     // A fork shares the nodes; the sender outlives the source's turns and
-    // the sender itself, and names the identity it had then, not whoever
-    // takes the name next.
+    // names the identity it had then, not whoever takes the name next.
     db.fork("Carol", "Branch", Fork::default()).unwrap();
     db.delete_bot("Carol").unwrap();
-    db.finish(person, None).unwrap();
-    db.delete_bot("Bob").unwrap();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
     assert_eq!(senders(&db, "Branch"), expected);
 }
@@ -1910,7 +1932,8 @@ fn schema_40_keeps_each_bot_written_prompts_sender_with_its_node() {
     Connection::open(&path)
         .unwrap()
         .execute_batch(
-            "DROP TABLE senders; ALTER TABLE turns DROP COLUMN origin; PRAGMA user_version=40;",
+            "DROP TABLE senders; ALTER TABLE turns DROP COLUMN origin;
+             ALTER TABLE turns DROP COLUMN from_id; PRAGMA user_version=40;",
         )
         .unwrap();
     let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();

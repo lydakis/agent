@@ -980,7 +980,7 @@ async fn intent(
         let text = prompt["text"].as_str().unwrap_or_default().to_owned();
         match prompt.get("from") {
             None => request.push(Words {
-                by: By::Person,
+                by: by_origin(prompt),
                 text,
             }),
             Some(from) => {
@@ -1135,7 +1135,7 @@ async fn intent(
         .map(|prompt| Words {
             by: match prompt.get("from") {
                 Some(_) => By::Model,
-                None => By::Person,
+                None => by_origin(prompt),
             },
             text: prompt["text"].as_str().unwrap_or_default().to_owned(),
         })
@@ -1149,6 +1149,16 @@ async fn intent(
         allowed_cut,
         earlier,
     })
+}
+
+/// Who wrote a prompt no bot's turn wrote: a person, unless a client sent it
+/// on its own (`origin`), whose words ask for nothing either.
+fn by_origin(prompt: &Value) -> By {
+    if prompt.get("origin").is_some() {
+        By::Model
+    } else {
+        By::Person
+    }
 }
 
 /// The person-written prompts above a model-written one: the turn that
@@ -1189,7 +1199,7 @@ async fn persons_above(
         match prompt.get("from") {
             Some(above) => next = Some(above.clone()),
             None => request.push(Words {
-                by: By::Person,
+                by: by_origin(&prompt),
                 text: prompt["text"].as_str().unwrap_or_default().to_owned(),
             }),
         }

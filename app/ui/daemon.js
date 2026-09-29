@@ -103,8 +103,9 @@ window.Daemon = (() => {
     const b = S.bots.get(name) ?? GONE;
     while (b.steers?.length && !b.interrupted) {
       const { prompt, turn: steer } = b.steers.shift();
-      emit({ event: 'steered', bot: name, turn, data: { from: steer, node: node({ role: 'user', content: [{ type: 'input_text', text: prompt }] }) } });
+      // The store's order: the steer's own turn finishes, then the running turn takes its message.
       emit({ event: 'turn_finished', bot: name, turn: steer, data: { status: 'steered', into: turn } });
+      emit({ event: 'steered', bot: name, turn, data: { from: steer, node: node({ role: 'user', content: [{ type: 'input_text', text: prompt }] }) } });
       S.authors.delete(steer);
       await wait(200);
       // A board post is read and carried on from; only a person's steer gets an answer.

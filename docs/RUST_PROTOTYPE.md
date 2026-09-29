@@ -1083,11 +1083,14 @@ included, counts it in the request's idempotency, and reports it on
 creator, it is declared, not verified. A client that sends a prompt on its own,
 not from a bot's turn, may name itself with `origin` (a name's characters,
 else `invalid_origin`), stored and reported the same way; the daemon gives it
-no meaning.
+no meaning, but a prompt with an `origin` is no person's word to the
+approver. The sender's identity is resolved at submit and kept on the turn
+(`turns.from_id`), so a queued message whose sender is deleted before it
+starts still names it.
 `{"op":"prompts","bot","turn","bytes"?}` reads a turn's words and calls
 as an approver judges them, within `bytes` of text (default 64 KiB, at most
 256 KiB): the turn's prompt and each steer it absorbed, in order, with
-`from`, and `prompts_more` when steers were left out; the calls it started, each with its argument preview,
+`from` or `origin`, and `prompts_more` when steers were left out; the calls it started, each with its argument preview,
 `done`, `failed` when it failed, and `node`, with `calls_more` when some
 were left out; and the bot's earlier prompts, newest first, with `more`
 when some were left out. Text that does not fit is cut and marked
@@ -1334,8 +1337,8 @@ Schema 39 records the folder each earlier turn ran in. Schema 40 adds each
 bot's own [settings](#bot-settings), the daemon's flags before it, so an
 existing bot takes the defaults; it also gives a turn an earlier daemon
 parked the fields added to its record since, with the values that daemon ran
-it with, so every parked record has one shape. Schema 41 adds `turns.origin`
-and keeps each prompt's sender with its node (`senders`): a turn another bot
+it with, so every parked record has one shape. Schema 41 adds `turns.origin` and
+`turns.from_id`, and keeps each prompt's sender with its node (`senders`): a turn another bot
 wrote is found by its first node, a steer by the node it shares or the one its
 `steered` finish recorded, with the sender's identity where its turn is still
 stored. A steer whose finish event was pruned names no sender.

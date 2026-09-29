@@ -1887,13 +1887,16 @@ test('a message another agent sent names its sender, live, steered in, and read 
   // something; a third message from it waits in line and starts later.
   await p.onEvent({ event: 'accepted', bot: 'demo.build', turn: 7, data: { node: 1, ...lead(4) } });
   await p.onEvent({ event: 'queued', bot: 'demo.build', turn: 8, data: { delivery: 'steer', ...lead(5) } });
+  // The store finishes the steer's own turn first, then its message joins the running turn.
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 8, data: { status: 'steered', into: 7, node: 2 } });
   await p.onEvent({ event: 'steered', bot: 'demo.build', turn: 7, data: { from: 8, node: 2 } });
-  await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 8, data: { status: 'steered', into: 7 } });
   await p.onEvent({ event: 'accepted', bot: 'demo.build', turn: 9, data: { node: 3 } });
   await p.onEvent({ event: 'queued', bot: 'demo.build', turn: 10, data: { delivery: 'queue', ...lead(6) } });
   await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 9, data: { status: 'completed' } });
   await p.onEvent({ event: 'accepted', bot: 'demo.build', turn: 10, data: { node: 4 } });
   const t = p.transcript('demo.build');
+  // Live, before any history read: each prompt already knows its sender.
+  assert.equal(JSON.stringify([1, 2, 4].map((node) => t.items.find((it) => it.node === node)?.by)), JSON.stringify([lead(4).from, lead(5).from, lead(6).from]));
   await p.loadBatch('demo.build');
   const html = p.itemsHTML(t);
   assert.equal((html.match(/class="line user agent"><button type="button" class="by" data-task="demo.lead"[^>]*>coordinator<\/button> /g) || []).length, 3, html);
