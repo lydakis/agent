@@ -2204,23 +2204,44 @@ fn schema_41_turns_ran_at_their_bots_effort() {
             },
         )
         .unwrap();
+        let running = db
+            .begin(
+                "Bob",
+                "r1",
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
         db.begin(
             "Bob",
-            "r1",
-            "work",
+            "steer",
+            "join",
             true,
-            &TurnOptions::default(),
+            &TurnOptions {
+                delivery: Delivery::Steer,
+                ..TurnOptions::default()
+            },
             allow_provider,
         )
         .unwrap();
+        db.absorb(running, None, 8 << 20, 4096, ContextUsage::default(), false)
+            .unwrap();
+        db.finish(running, None).unwrap();
     }
     Connection::open(&path)
         .unwrap()
-        .execute_batch("ALTER TABLE turns DROP COLUMN reasoning; PRAGMA user_version=41;")
+        .execute_batch("ALTER TABLE turns DROP COLUMN reasoning; ALTER TABLE turns DROP COLUMN inherited_reasoning; DELETE FROM events; PRAGMA user_version=41;")
         .unwrap();
     let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     assert_eq!(
         db.turns("Bob", 0, 10).unwrap()["turns"][0]["reasoning"],
+        "medium"
+    );
+    assert_eq!(
+        db.turns("Bob", 0, 10).unwrap()["turns"][1]["reasoning"],
         "medium"
     );
     drop(db);
@@ -2233,92 +2254,163 @@ fn schema_41_turns_ran_at_their_bots_effort() {
 }
 
 #[test]
-fn schema_42_preserves_effort_and_new_steer_retries_survive_reopen() {
-    let path = std::env::temp_dir().join(format!(
-        "agent-inherited-effort-{}.sqlite",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&path);
-    {
-        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
-        db.create(
-            "Bob",
-            Some("/synthetic"),
-            Binding {
-                reasoning: Some("high"),
-                ..binding()
-            },
+fn schema_42_backfills_absorbed_effort_or_rolls_back_when_history_is_missing() {
+    for missing in [None, Some("event"), Some("turn")] {
+        let path = std::env::temp_dir().join(format!(
+            "agent-effort-backfill-{}-{}.sqlite",
+            std::process::id(),
+            missing.unwrap_or("complete")
+        ));
+        let _ = std::fs::remove_file(&path);
+        let (running, first_steer, long_steer);
+        {
+            let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+            db.create(
+                "Bob",
+                Some("/synthetic"),
+                Binding {
+                    reasoning: Some("high"),
+                    ..binding()
+                },
+            )
+            .unwrap();
+            running = db
+                .begin(
+                    "Bob",
+                    "run",
+                    "work",
+                    true,
+                    &TurnOptions {
+                        reasoning: Some("low".into()),
+                        ..TurnOptions::default()
+                    },
+                    allow_provider,
+                )
+                .unwrap()
+                .turn;
+            let steer = TurnOptions {
+                delivery: Delivery::Steer,
+                ..TurnOptions::default()
+            };
+            first_steer = db
+                .begin("Bob", "short", "join", true, &steer, allow_provider)
+                .unwrap()
+                .turn;
+            long_steer = db
+                .begin(
+                    "Bob",
+                    "long",
+                    &"x".repeat(4096),
+                    true,
+                    &steer,
+                    allow_provider,
+                )
+                .unwrap()
+                .turn;
+            db.begin(
+                "Bob",
+                "explicit",
+                "join",
+                true,
+                &TurnOptions {
+                    reasoning: Some("low".into()),
+                    ..steer.clone()
+                },
+                allow_provider,
+            )
+            .unwrap();
+            assert_eq!(
+                db.absorb(running, None, 8 << 20, 4096, ContextUsage::default(), false)
+                    .unwrap()
+                    .outcomes
+                    .len(),
+                3
+            );
+            db.finish(running, None).unwrap();
+            // A source without an override is known too: its bot's default applies.
+            let default = db
+                .begin(
+                    "Bob",
+                    "default",
+                    "work",
+                    true,
+                    &TurnOptions::default(),
+                    allow_provider,
+                )
+                .unwrap()
+                .turn;
+            db.begin("Bob", "default-steer", "join", true, &steer, allow_provider)
+                .unwrap();
+            db.absorb(default, None, 8 << 20, 4096, ContextUsage::default(), false)
+                .unwrap();
+            db.finish(default, None).unwrap();
+        }
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE turns DROP COLUMN inherited_reasoning; PRAGMA user_version=42;",
         )
         .unwrap();
-        let turn = db
-            .begin(
-                "Bob",
-                "run",
-                "work",
-                true,
-                &TurnOptions {
-                    reasoning: Some("low".into()),
-                    ..TurnOptions::default()
-                },
-                allow_provider,
-            )
-            .unwrap()
-            .turn;
-        db.finish(turn, None).unwrap();
+        match missing {
+            Some("event") => {
+                conn.execute(
+                    "DELETE FROM events WHERE turn=? AND kind='turn_finished'",
+                    [long_steer],
+                )
+                .unwrap();
+            }
+            Some("turn") => {
+                conn.execute("DELETE FROM retained_turns WHERE turn=?", [running])
+                    .unwrap();
+                conn.execute("DELETE FROM turns WHERE id=?", [running])
+                    .unwrap();
+            }
+            _ => {}
+        }
+        drop(conn);
+        let opened = Database::initialize(Connection::open(&path).unwrap());
+        if missing.is_some() {
+            let error = match opened {
+                Ok(_) => panic!("missing history must not silently change effort"),
+                Err(e) => e,
+            };
+            assert_eq!(error.code, "store_migration_effort_unavailable");
+            let conn = Connection::open(&path).unwrap();
+            assert_eq!(
+                conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
+                    .unwrap(),
+                42
+            );
+            assert!(!conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='inherited_reasoning')", [], |r| r.get::<_, bool>(0)).unwrap());
+        } else {
+            let db = opened.unwrap();
+            let listed = db.turns("Bob", 0, 10).unwrap();
+            let levels: Vec<_> = listed["turns"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["reasoning"].as_str().unwrap())
+                .collect();
+            assert_eq!(levels, ["low", "low", "low", "low", "high", "high"]);
+            drop(db);
+            let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+            let retry = db
+                .begin(
+                    "Bob",
+                    "short",
+                    "join",
+                    true,
+                    &TurnOptions {
+                        delivery: Delivery::Steer,
+                        ..TurnOptions::default()
+                    },
+                    allow_provider,
+                )
+                .unwrap();
+            assert_eq!(retry.turn, first_steer);
+            assert!(!retry.fresh);
+        }
+        std::fs::remove_file(path).unwrap();
     }
-    Connection::open(&path)
-        .unwrap()
-        .execute_batch("ALTER TABLE turns DROP COLUMN inherited_reasoning; PRAGMA user_version=42;")
-        .unwrap();
-    let options = TurnOptions {
-        delivery: Delivery::Steer,
-        ..TurnOptions::default()
-    };
-    let steer;
-    {
-        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
-        assert_eq!(
-            db.turns("Bob", 0, 10).unwrap()["turns"][0]["reasoning"],
-            "low"
-        );
-        let running = db
-            .begin(
-                "Bob",
-                "run2",
-                "work",
-                true,
-                &TurnOptions {
-                    reasoning: Some("low".into()),
-                    ..TurnOptions::default()
-                },
-                allow_provider,
-            )
-            .unwrap()
-            .turn;
-        assert_eq!(
-            db.inspect("Bob").unwrap().reasoning.as_deref(),
-            Some("high")
-        );
-        steer = db
-            .begin("Bob", "steer", "join", true, &options, allow_provider)
-            .unwrap()
-            .turn;
-        db.absorb(running, None, 8 << 20, 4096, ContextUsage::default(), false)
-            .unwrap();
-        db.finish(running, None).unwrap();
-    }
-    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
-    let retry = db
-        .begin("Bob", "steer", "join", true, &options, allow_provider)
-        .unwrap();
-    assert!(!retry.fresh);
-    assert_eq!(retry.turn, steer);
-    assert_eq!(
-        db.turns("Bob", 0, 10).unwrap()["turns"][2]["reasoning"],
-        "low"
-    );
-    drop(db);
-    std::fs::remove_file(path).unwrap();
 }
 
 #[test]

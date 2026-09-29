@@ -7610,8 +7610,40 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         |r| r.get::<_, bool>(0),
     )? {
         // 42 -> 43: keep absorbed effort separate from submitted options.
-        // Existing recorded levels stay intact; new steers preserve omissions.
+        // Before per-turn effort (schema 42), every steer used its bot's level.
         conn.execute_batch("ALTER TABLE turns ADD COLUMN inherited_reasoning TEXT;")?;
+        if from == 42 {
+            migrate_absorbed_effort(conn)?;
+        }
+    }
+    Ok(())
+}
+/// Recover an omitted steer's effort from the turn its completion names.
+/// Stream retained rows and probe the event index once each; never load history.
+/// Missing provenance aborts the opening transaction, including the new column.
+fn migrate_absorbed_effort(conn: &Connection) -> Result<()> {
+    let mut steers = conn.prepare(
+        "SELECT s.id,t.id,t.reasoning FROM turns s
+         LEFT JOIN events e ON e.turn=s.id AND e.kind='turn_finished'
+         LEFT JOIN turns t ON t.id=json_extract(e.data,'$.into') AND t.bot=s.bot
+         WHERE s.status='steered' AND s.reasoning IS NULL",
+    )?;
+    let mut update = conn.prepare("UPDATE turns SET inherited_reasoning=? WHERE id=?")?;
+    let mut rows = steers.query([])?;
+    while let Some(row) = rows.next()? {
+        let steer: i64 = row.get(0)?;
+        if row.get::<_, Option<i64>>(1)?.is_none() {
+            return fail_with(
+                "store_migration_effort_unavailable",
+                format!(
+                    "steer {steer} has no retained absorption turn; keep this store and use a new store path"
+                ),
+            );
+        }
+        // A known source without an override used the immutable bot default.
+        if let Some(level) = row.get::<_, Option<String>>(2)? {
+            update.execute(params![level, steer])?;
+        }
     }
     Ok(())
 }
