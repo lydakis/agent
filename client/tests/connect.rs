@@ -134,5 +134,18 @@ async fn readiness_rejects_missing_or_mismatched_protocol_versions() {
             Some("daemon_protocol_mismatch")
         );
     }
+    // A greeting that is not `ready` is not a daemon's, whatever it names.
+    let connecting = tokio::spawn({
+        let path = path.clone();
+        async move { Client::connect(&path).await }
+    });
+    let (mut peer, _) = listener.accept().await.unwrap();
+    let hello = serde_json::json!({"event":"hello","protocol":agent_client::PROTOCOL - 1,"pid":2});
+    peer.write_all(format!("{hello}\n").as_bytes())
+        .await
+        .unwrap();
+    let error = connecting.await.unwrap().err().unwrap();
+    assert_eq!(error.code, "daemon_greeting_invalid");
+    assert!(error.facts.is_none());
     std::fs::remove_file(path).unwrap();
 }

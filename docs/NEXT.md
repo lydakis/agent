@@ -999,10 +999,35 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     names, which the daemon checks only as far as that bot having the named
     turn; a model could still post as another member, so the board should
     show a post as its author's only when the author's own tool call ran
-    it. Deleting a swarm is not built. Next, in order: roles, the council
-    and streams as the v12 prototype draws them; then the same goal three
-    ways (a flat board, council and streams, one lead) with equal models and
-    budget, on George's Mac; Keep. Approvals in the app wait: George runs
+    it. Deleting a swarm is not built. Done (2026-09-28): roles, the
+    council and streams ([APP.md](APP.md#projects-and-panes)): a swarm is
+    one board or a council of 3 (its first agents) that votes on proposed
+    streams; you can decide any proposal; a stream's posts reach its own
+    agents unless posted to everyone. Not built: curator digests, ✓ checks
+    from real results, and ⚠ same-file edits from the v12 prototype. Done
+    (2026-09-28): a swarm's mix, rows of an identity (a profile, such as a
+    reviewer), a model and a share, dealt to whole agents; Start, Add and
+    Stop as one call each to the app's Rust side, which undoes a failed
+    start (Astra's review of #60); and each board line's `sent` count.
+    Also: the agent count and the budget (in millions) typed; helpers an
+    agent forks, named after it, counted in the swarm's tokens and stopped
+    with it; the board saying 50%, 75% and 90% of the budget; and
+    `swarm.md` telling agents how to ask a peer's fork and check their
+    usage. Also: a project's coordinator starts a swarm when asked, through
+    a script the app writes (`~/.agent/swarms/start`), and Settings opens
+    the coordinator's and swarm agents' roles as your own files. An edit
+    reaches coordinators made afterwards; changing an existing bot's
+    instructions would be a daemon operation, not built. Also: a helper
+    whose maker was deleted still counts and stops, Stop holds the board
+    so a post during it cannot leave the swarm half resumed, an agent that
+    moves up into a council seat or a stream's lead is told, and
+    `swarm.toml` is never written past its 1 MiB cap. A deleted helper's
+    tokens used after the last look at the daemon's list are still lost;
+    counting them needs the daemon to keep deleted bots' usage. Next: the same goal three ways (a flat board, council and streams, one
+    lead) with equal models and budget, on George's Mac, comparing tokens,
+    wall time, result, and deliveries from the board (Astra: in a flat
+    swarm every post reaches every working agent, so 16 posting once each
+    is 240 deliveries, each re-read as context); Keep. Approvals in the app wait: George runs
     with full access.
     A fork into another provider stays out: history is provider-native.
     Done (2026-09-28): setup and settings, the first items of an app audit
