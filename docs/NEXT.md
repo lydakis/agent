@@ -1017,7 +1017,13 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     a script the app writes (`~/.agent/swarms/start`), and Settings opens
     the coordinator's and swarm agents' roles as your own files. An edit
     reaches coordinators made afterwards; changing an existing bot's
-    instructions would be a daemon operation, not built. Next: the same goal three ways (a flat board, council and streams, one
+    instructions would be a daemon operation, not built. Also: a helper
+    whose maker was deleted still counts and stops, Stop holds the board
+    so a post during it cannot leave the swarm half resumed, an agent that
+    moves up into a council seat or a stream's lead is told, and
+    `swarm.toml` is never written past its 1 MiB cap. A deleted helper's
+    tokens used after the last look at the daemon's list are still lost;
+    counting them needs the daemon to keep deleted bots' usage. Next: the same goal three ways (a flat board, council and streams, one
     lead) with equal models and budget, on George's Mac, comparing tokens,
     wall time, result, and deliveries from the board (Astra: in a flat
     swarm every post reaches every working agent, so 16 posting once each
