@@ -1006,7 +1006,7 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     profile ([CLIENT.md](CLIENT.md)). Done (2026-09-28): swarms, first
     part ([APP.md](APP.md#projects-and-panes)): New swarm in a project's
     menu, a swarm folder in `~/.agent/swarms` with its board, its agents as
-    ordinary bots with a budget share in the app's `swarm` profile, and a
+    ordinary bots with a budget share in the app's mode-specific profile, and a
     `post` tool (the app's executable) that steers a post into the agents
     working now and wakes only those it names; a Board and an Agents tab,
     stop and add. Follow-up: a post's author is the `AGENT_BOT` its shell
@@ -1026,7 +1026,7 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     Also: the agent count and the budget (in millions) typed; helpers an
     agent forks, named after it, counted in the swarm's tokens and stopped
     with it; the board saying 50%, 75% and 90% of the budget; and
-    `swarm.md` telling agents how to ask a peer's fork and check their
+    `swarm-flat.md` and `swarm-council.md` telling agents how to ask a peer's fork and check their
     usage. Also: a project's coordinator starts a swarm when asked, through
     a script the app writes (`~/.agent/swarms/start`), and Settings opens
     the coordinator's and swarm agents' roles as your own files. An edit
@@ -1037,7 +1037,17 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     moves up into a council seat or a stream's lead is told, and
     `swarm.toml` is never written past its 1 MiB cap. A deleted helper's
     tokens used after the last look at the daemon's list are still lost;
-    counting them needs the daemon to keep deleted bots' usage. Next: the same goal three ways (a flat board, council and streams, one
+    counting them needs the daemon to keep deleted bots' usage. Done (2026-09-29): explicit assignments and atomic claims, council approval
+    before task execution, independent review records, stream departure and
+    final handoff; publication is silent unless targeted or explicitly
+    broadcast. Both modes decide their deliverable and completion criteria on
+    the board, guided by the independently editable flat or council profile rather than task-type
+    templates or a separate planning file. Peers can register assignments; council assignments still
+    need votes. A final result records achieved, partial or failed separately
+    from handoff publication, with evidence judged by the swarm. A read-only `status` operation exposes partial results and
+    exhaustion. Budgets default to 10M per agent; usage events check member
+    allowances during work at 50/65/80%, with reporting reserve in the role.
+    No tool or filesystem restriction is added. Next: the same goal three ways (a flat board, council and streams, one
     lead) with equal models and budget, on George's Mac, comparing tokens,
     wall time, result, and deliveries from the board (Astra: in a flat
     swarm every post reaches every working agent, so 16 posting once each

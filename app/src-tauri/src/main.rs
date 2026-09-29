@@ -354,9 +354,13 @@ fn profiles(
 
 /// The roles the app ships, used where neither the folder nor the user has
 /// a file of that name.
-const BUILT_IN: [(&str, &str); 2] = [
+const BUILT_IN: [(&str, &str); 3] = [
     ("coordinator", include_str!("../../agents/coordinator.md")),
-    ("swarm", include_str!("../../agents/swarm.md")),
+    ("swarm-flat", include_str!("../../agents/swarm-flat.md")),
+    (
+        "swarm-council",
+        include_str!("../../agents/swarm-council.md"),
+    ),
 ];
 
 /// The file a role of the app's is read from in every project: yours,
@@ -746,21 +750,33 @@ mod policy_tests {
         let calls: Vec<_> = (0..8)
             .map(|_| {
                 let home = home.clone();
-                std::thread::spawn(move || own_role(&home, "swarm"))
+                std::thread::spawn(move || own_role(&home, "swarm-flat"))
             })
             .collect();
         for call in calls {
             call.join().unwrap().unwrap();
         }
-        let swarm = home.join(".agents/agents/swarm.md");
-        assert_eq!(std::fs::read_to_string(swarm).unwrap(), BUILT_IN[1].1);
+        let swarm = home.join(".agents/agents/swarm-flat.md");
+        assert_eq!(std::fs::read_to_string(&swarm).unwrap(), BUILT_IN[1].1);
+        let council = own_role(&home, "swarm-council").unwrap();
+        assert_eq!(std::fs::read_to_string(&council).unwrap(), BUILT_IN[2].1);
+        std::fs::write(&council, "Custom council rules.").unwrap();
+        own_role(&home, "swarm-council").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(council).unwrap(),
+            "Custom council rules."
+        );
+        assert_eq!(std::fs::read_to_string(&swarm).unwrap(), BUILT_IN[1].1);
         // Nothing but the roles is left beside them.
         let mut names: Vec<_> = std::fs::read_dir(home.join(".agents/agents"))
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
         names.sort();
-        assert_eq!(names, ["coordinator.md", "swarm.md"]);
+        assert_eq!(
+            names,
+            ["coordinator.md", "swarm-council.md", "swarm-flat.md"]
+        );
         std::fs::remove_dir_all(home).unwrap();
     }
 
@@ -1001,6 +1017,7 @@ async fn swarm_start(
         agents,
         budget_tokens,
         council,
+        coordinator: None,
     };
     let app = std::env::current_exe().map_err(|e| e.to_string())?;
     swarm::start(&client, &root, &app, start).await
