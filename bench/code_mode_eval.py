@@ -2,28 +2,39 @@
 
 Four tasks against one synthetic shop MCP server (bench/code_mode_shop.py),
 each with one checkable answer: a fan-out aggregation over dozens of
-customers, a count over a 100 KB log, a four-step lookup chain, and a single
-lookup as the control. The same model runs every task in five arms:
+customers, a count over a 100 KB log the tool cannot filter, a four-step
+lookup chain, and a single lookup as the control. The same model runs every
+task in seven arms:
 
-  codex-native  Codex with the shop server configured as an MCP server: the
-                model calls each tool as a native tool call.
+  codex-native  Codex with the shop server configured as an MCP server. On
+                models where Codex runs its code mode (GPT-6 Luna in 0.158),
+                the model's only tool is a JavaScript `exec` whose scripts call
+                the MCP tools, so this arm is Codex's own code mode.
+  codex-direct  codex-native plus one paragraph asking for one tool call per
+                step, each result read whole: the one-by-one baseline.
   codex-mcpx    Codex with no MCP server; the shop is reachable through mcpx
                 from the shell, and the workspace AGENTS.md holds mcpx's own
                 skill text (`mcpx skill install`).
   codex-code    codex-mcpx plus one paragraph asking the model to combine
                 calls in a script and print only what it needs.
-  agent-mcpx    Agent with the same mcpx skill text, composed with --agents.
-  agent-code    agent-mcpx plus the same paragraph.
+  agent-direct  Agent with the mcpx skill text, composed with --agents, plus
+                the one-call-per-step paragraph.
+  agent-mcpx    Agent with the mcpx skill text alone.
+  agent-code    agent-mcpx plus the combine-in-a-script paragraph.
 
-Native versus mcpx compares the call styles inside one harness; the Codex
-and Agent mcpx arms compare harnesses on the same call style. Each run gets
+Direct versus the others compares call styles inside one harness; the Codex
+and Agent mcpx arms compare harnesses on the same call style. The shop
+server logs every tool call it serves, so calls made inside scripts are
+counted too. Each run gets
 a fresh workspace outside any repository, a fresh HOME, its own mcpx state
 and, for Codex, its own CODEX_HOME holding a copy of the login, so neither
 harness reads the person's own AGENTS.md, skills, MCP servers or mcpx
 configuration. The arms of one task and trial start together.
 
 Recorded per run: the answer and whether it is right, input (and cached
-input) and output tokens, tool calls and the shell commands, and wall time.
+input) and output tokens, the tool calls the model issued, the shop calls
+the server served, the shell commands, and wall time. Codex's wall time
+includes its process start; Agent's daemon is started before the clock.
 
 Real model, real spend. Run it on the ChatGPT plan with Codex's login
 (`codex login`), naming the model as Codex's /model picker shows it:
@@ -47,11 +58,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bench.code_mode_shop import ANSWER_FORMAT, TASKS, answer_of, expected  # noqa: E402
 
 SHOP = Path(__file__).resolve().with_name('code_mode_shop.py')
-ARMS = ('codex-native', 'codex-mcpx', 'codex-code', 'agent-mcpx', 'agent-code')
+ARMS = ('codex-native', 'codex-direct', 'codex-mcpx', 'codex-code', 'agent-direct', 'agent-mcpx', 'agent-code')
+NATIVE = ('codex-native', 'codex-direct')
 AGENT_TOOLS = 'shell,read,write,edit,wait,history'
 CODE_HINT = ('When a task needs several tool calls or a large tool output, write one short script (shell, '
              'Python or jq) that makes the mcpx calls and prints only what you need, instead of calling '
              'tools one at a time and reading every result.')
+DIRECT_HINT = ('Make one tool call per step and read its full result before deciding the next call. Do not '
+               'write loops, scripts or pipelines that make several calls or filter their results.')
 _auth_lock = threading.Lock()
 
 
@@ -75,10 +89,18 @@ def mcpx_skill(mcpx):
 
 
 def guidance(arm, skill):
-    if arm == 'codex-native':
-        return None
-    text = skill.split('\n---\n', 1)[-1].strip() if skill.startswith('---') else skill
-    return text + ('\n\n' + CODE_HINT if arm.endswith('-code') else '') + '\n'
+    parts = []
+    if arm not in NATIVE:
+        parts.append(skill.split('\n---\n', 1)[-1].strip() if skill.startswith('---') else skill.strip())
+    if arm.endswith('-code'):
+        parts.append(CODE_HINT)
+    if arm.endswith('-direct'):
+        parts.append(DIRECT_HINT)
+    return '\n\n'.join(parts) + '\n' if parts else None
+
+
+def shop_args(run_dir):
+    return f'args = ["{SHOP}", "--log", "{run_dir / "calls.log"}"]'
 
 
 def isolated(run_dir, mcpx, with_shop):
@@ -87,7 +109,7 @@ def isolated(run_dir, mcpx, with_shop):
     config = run_dir / 'xdg/config/mcpx'
     config.mkdir(parents=True)
     home.mkdir()
-    servers = (f'[servers.shop]\ncommand = "{sys.executable}"\nargs = ["{SHOP}"]\n' if with_shop else '')
+    servers = (f'[servers.shop]\ncommand = "{sys.executable}"\n{shop_args(run_dir)}\n' if with_shop else '')
     # No fallback discovery: never import the person's Claude or Codex servers.
     (config / 'config.toml').write_text('fallback_sources = []\n' + servers)
     runtime = Path(tempfile.mkdtemp(prefix='cm-', dir='/tmp'))  # Unix socket paths are length-limited
@@ -106,8 +128,8 @@ def run_codex(arm, task, work, run_dir, env, args):
     real = Path(os.environ.get('CODEX_HOME', Path.home() / '.codex')) / 'auth.json'
     shutil.copy2(real, codex_home / 'auth.json')
     config = [f'model = "{args.model}"', f'model_reasoning_effort = "{args.reasoning}"', *args.codex_config]
-    if arm == 'codex-native':
-        config += ['[mcp_servers.shop]', f'command = "{sys.executable}"', f'args = ["{SHOP}"]']
+    if arm in NATIVE:
+        config += ['[mcp_servers.shop]', f'command = "{sys.executable}"', shop_args(run_dir)]
     (codex_home / 'config.toml').write_text('\n'.join(config) + '\n')
     last = run_dir / 'last.txt'
     command = [args.codex, 'exec', '--json', '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox',
@@ -129,7 +151,10 @@ def run_codex(arm, task, work, run_dir, env, args):
             shutil.copy2(copy, real)
     (run_dir / 'events.jsonl').write_text(stdout)
     (run_dir / 'stderr.txt').write_text(stderr[-20000:])
+    # Tool calls made inside code mode's scripts, MCP and shell alike, come
+    # as items of their own.
     usage = {'input_tokens': 0, 'cached_input_tokens': 0, 'output_tokens': 0}
+    commands = []
     for line in stdout.splitlines():
         try:
             event = json.loads(line)
@@ -138,9 +163,12 @@ def run_codex(arm, task, work, run_dir, env, args):
         if event.get('type') == 'turn.completed':
             for key in usage:
                 usage[key] += (event.get('usage') or {}).get(key, 0) or 0
-    # `exec --json` does not report native MCP calls, so tools and model
-    # requests come from the session's own record.
-    tools, commands, requests = {}, [], 0
+        item = event.get('item') or {}
+        if event.get('type') == 'item.completed' and item.get('type') == 'command_execution':
+            commands.append(str(item.get('command', ''))[:300])
+    # The calls the model itself issued, and its model requests, come from
+    # the session's own record.
+    tools, requests = {}, 0
     for rollout in sorted(codex_home.glob('sessions/**/*.jsonl')):
         for line in rollout.read_text().splitlines():
             record = json.loads(line)
@@ -153,11 +181,8 @@ def run_codex(arm, task, work, run_dir, env, args):
             if payload.get('namespace'):
                 name = f"{payload['namespace']}.{name}"
             tools[name] = tools.get(name, 0) + 1
-            if name == 'exec_command':
-                try:
-                    commands.append(str(json.loads(payload.get('arguments') or '{}').get('cmd', ''))[:300])
-                except json.JSONDecodeError:
-                    commands.append(str(payload.get('arguments'))[:300])
+            if payload.get('type') == 'custom_tool_call':
+                commands.append(f"[{name}] {payload.get('input', '')}"[:600])
         shutil.copy2(rollout, run_dir / 'rollout.jsonl')
     answer = last.read_text() if last.exists() else ''
     return dict(status=status, answer=answer, usage=usage, tools=tools, commands=commands,
@@ -244,10 +269,13 @@ def run_one(arm, task, trial, root, args, skill):
         # mcpx's daemon and the shop server exit on their own after mcpx's idle keepalive.
         shutil.rmtree(runtime, ignore_errors=True)
         shutil.rmtree(work, ignore_errors=True)
+    served = (run_dir / 'calls.log').read_text().split() if (run_dir / 'calls.log').exists() else []
+    record['shop_calls'] = {name: served.count(name) for name in sorted(set(served))}
     got = answer_of(record['answer'])
     record.update(arm=arm, task=task, trial=trial, got=got, want=expected()[task],
                   correct=got is not None and got.lower() == expected()[task].lower(),
-                  tool_calls=sum(record['tools'].values()), answer=record['answer'][-2000:])
+                  tool_calls=sum(record['tools'].values()), shop_call_count=len(served),
+                  answer=record['answer'][-2000:])
     return record
 
 
@@ -267,6 +295,7 @@ def summarize(records):
                              cached_input_tokens=med([r['usage'].get('cached_input_tokens') for r in mine]),
                              output_tokens=med([r['usage'].get('output_tokens') for r in mine]),
                              tool_calls=med([r['tool_calls'] for r in mine]),
+                             shop_calls=med([r['shop_call_count'] for r in mine]),
                              wall_s=med([r['wall_s'] for r in mine])))
     return rows
 
@@ -316,7 +345,7 @@ def main():
                 r = results[arm]
                 records.append(r)
                 print(json.dumps({k: r[k] for k in ('arm', 'task', 'trial', 'status', 'correct', 'got', 'tool_calls',
-                                                     'wall_s')} | {'usage': r['usage']}), flush=True)
+                                                     'shop_call_count', 'wall_s')} | {'usage': r['usage']}), flush=True)
             args.out.write_text(json.dumps({'model': args.model, 'reasoning': args.reasoning, 'versions': versions,
                                             'started': started, 'summary': summarize(records),
                                             'runs': records}, indent=1))

@@ -1,10 +1,11 @@
 """A synthetic shop behind a stdio MCP server, for the code-mode evaluation.
 
 Customers, products, orders, support tickets, staff and service logs are
-generated from a fixed seed, so every task has one checkable answer. Run as a
-module to serve MCP on stdin/stdout (newline-delimited JSON-RPC 2.0):
+generated from a fixed seed, so every task has one checkable answer. Run it to serve MCP on stdin/stdout (newline-delimited JSON-RPC 2.0);
+`--log FILE` appends one line per tool call, so every harness's calls are
+counted at the server, however the model made them:
 
-    python3 -m bench.code_mode_shop
+    python3 bench/code_mode_shop.py --log calls.log
 
 Standard library only, so the same file runs under Codex and under mcpx.
 """
@@ -164,9 +165,9 @@ TOOLS = [
      _schema({'customer_id': STR}, ['customer_id'])),
     ('get_ticket', 'Get one support ticket by id.', _schema({'ticket_id': STR}, ['ticket_id'])),
     ('get_employee', 'Get one employee by id: name and manager_id.', _schema({'employee_id': STR}, ['employee_id'])),
-    ('search_logs', 'Return every log line a service (billing, auth, search) wrote on a day (YYYY-MM-DD), '
-     'optionally only one level (INFO, WARN, ERROR, DEBUG). Lines are "TIME LEVEL SERVICE MESSAGE".',
-     _schema({'service': STR, 'date': STR, 'level': STR}, ['service', 'date'])),
+    ('search_logs', 'Return every log line a service (billing, auth, search) wrote on a day (YYYY-MM-DD). '
+     'Lines are "TIME LEVEL SERVICE MESSAGE".',
+     _schema({'service': STR, 'date': STR}, ['service', 'date'])),
 ]
 
 
@@ -210,12 +211,11 @@ def call(name, args, shop=SHOP):
         lines = shop['logs'].get((args.get('service'), args.get('date')))
         if lines is None:
             raise ToolError('no logs for that service and date')
-        level = args.get('level')
-        return '\n'.join(line for line in lines if level is None or line.split(' ', 2)[1] == level)
+        return '\n'.join(lines)
     raise ToolError(f'unknown tool: {name}')
 
 
-def respond(message):
+def respond(message, log=None):
     method, mid = message.get('method'), message.get('id')
     if mid is None:
         return None
@@ -227,6 +227,9 @@ def respond(message):
         result = {'tools': [{'name': n, 'description': d, 'inputSchema': s} for n, d, s in TOOLS]}
     elif method == 'tools/call':
         params = message.get('params') or {}
+        if log:
+            with open(log, 'a') as f:
+                f.write(f"{params.get('name')}\n")
         try:
             value = call(params.get('name'), params.get('arguments') or {})
             text = value if isinstance(value, str) else json.dumps(value, separators=(',', ':'))
@@ -240,15 +243,15 @@ def respond(message):
     return {'jsonrpc': '2.0', 'id': mid, 'result': result}
 
 
-def serve(read=sys.stdin, write=sys.stdout):
+def serve(read=sys.stdin, write=sys.stdout, log=None):
     for line in read:
         if not line.strip():
             continue
-        reply = respond(json.loads(line))
+        reply = respond(json.loads(line), log)
         if reply is not None:
             write.write(json.dumps(reply) + '\n')
             write.flush()
 
 
 if __name__ == '__main__':
-    serve()
+    serve(log=sys.argv[sys.argv.index('--log') + 1] if '--log' in sys.argv else None)
