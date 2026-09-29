@@ -248,7 +248,8 @@ pub fn tripped(in_row: u64, in_turn: u64) -> Option<Verdict> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum By {
     Person,
-    /// A bot's model; consent never comes from these words.
+    /// A bot's model, or a client sending on its own (`origin`); consent
+    /// never comes from these words.
     Model,
 }
 

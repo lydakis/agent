@@ -14,6 +14,10 @@ const DECODE_BYTES = 8 * 1024 * 1024;
 
 const S = {
   bots: new Map(), transcripts: new Map(), selected: '', cursor: 0, live: false, attached: false, autoSelect: true,
+  // Whether the workspace is the home a host named, not a folder the window was given.
+  homeWorkspace: false,
+  // The store identity the attached daemon announced; what the window remembers is saved under it.
+  store: null,
   // Bumped whenever a bot is added, removed or changes status (botsGen), and when one is added or
   // removed (shapeGen), so the activity check and the rail's tree rebuild once per change instead of
   // scanning the fleet on every event.
@@ -27,12 +31,17 @@ const S = {
   families: new Map(),
   // Swarms, from their folders in ~/.agent/swarms, and the swarm each agent belongs to.
   swarms: new Map(), memberOf: new Map(),
+  // Who asked for each turn another bot asked for, until it ends, and what each coordinator has yet to
+  // hear about its tasks (see `wake`), and turns that ended live before the snapshot said who made their bot.
+  turnFrom: new Map(), wakes: new Map(), heldNews: [],
   // Unsent text for each bot not on screen. A composer's text is its bot's own: when a pane shows
   // another bot, the text stays behind with the one it was typed for (see `followDrafts`).
   drafts: new Map(),
 };
 function loadSend() { try { const v = localStorage.getItem('agent:send'); return v === 'steer' || v === 'side' ? v : 'queue'; } catch (_) { return 'queue'; } }
-const sessionKey = () => `agent:${S.config?.socket}|${S.config?.workspace}`;
+// What a window remembers belongs to the store it shows and its folder, not to the socket that reached
+// it: two hosts, or a host and this machine, never share it. Nothing is saved before the store is known.
+const sessionKey = () => (S.store ? `agent:${S.store}|${S.config?.workspace}` : null);
 const bot = (name) => S.bots.get(name);
 const transcript = (name) => { if (!S.transcripts.has(name)) S.transcripts.set(name, { items: [], nodes: 0, thoughts: 0, longOut: 0, peers: [], anchor: 'end', gen: 0, text: '', thinking: '', thinkingSince: 0, thinkingMs: 0, streamingTurn: null, streamGen: 0 }); return S.transcripts.get(name); };
 // Counters kept in step with the items, so the key bar never scans the history.
@@ -63,7 +72,7 @@ function decodeAt(t, at, entries) {
   const bare = t.items[at]; if (bare.kind !== 'node') return;
   if (!entries.length) entries = [{kind:'backing',turn:bare.turn}];
   count(t, bare, -1);
-  for (const e of entries) { e.from = bare.node; e.fromCall = bare.callId; count(t, e, 1); }
+  for (const e of entries) { e.from = bare.node; e.fromCall = bare.callId; if (bare.by && e.kind === 'user') e.by = bare.by; count(t, e, 1); }
   t.items.splice(at, 1, ...entries);
   t.gen += 1;
 }
@@ -208,7 +217,8 @@ function readBranch(b) {
   if (b.branch !== undefined) return;
   b.branch = null;
   const ws = b.workspace;
-  if (!ws || !Daemon.branch) return;
+  // A host's folders are its own; the app does not read them yet.
+  if (!ws || !Daemon.branch || S.config?.host) return;
   Daemon.branch(ws).then((branch) => { if (branch && b.workspace === ws && bot(b.name) === b) { b.branch = branch; render(); } }, () => {});
 }
 // Records carry the family; creation events do not, so a bot seated from one takes its provider's.
@@ -224,6 +234,12 @@ function forgetBot(name) {
   const t = parent && S.transcripts.get(parent.name);
   if (t) { t.items = t.items.filter(it => it.kind !== 'peer' || it.who !== name); t.peers = t.peers.filter(who => who !== name); t.gen += 1; }
   S.bots.delete(name); S.transcripts.delete(name); S.override.delete(name);
+  // A coordinator gone hears nothing more, and its queued turns never end; a task gone is no news.
+  if (S.wakes.has(name)) { clearTimeout(S.wakes.get(name).timer); S.wakes.delete(name); }
+  for (const w of S.wakes.values()) if (w.tasks.delete(name) && !w.tasks.size) { clearTimeout(w.timer); w.timer = null; }
+  for (const key of S.turnFrom.keys()) if (key.startsWith(`${name}\u0000`)) S.turnFrom.delete(key);
+  // Held news is this bot's; a later bot of the same name is another.
+  S.heldNews = S.heldNews.filter(([held]) => held !== name);
   // A draft belongs to its bot, so it goes with it.
   if (S.ui.side === name) S.ui.side = null;
   S.drafts.delete(name);
@@ -238,6 +254,16 @@ const isActive = (status) => ACTIVE.has(status);
 // coordinator's lineage, and any root bot named `<project>.<task>`.
 const LEAD = '.lead';
 const leadProject = (name) => name.length > LEAD.length && name.endsWith(LEAD) ? name.slice(0, -LEAD.length) : null;
+// Who sent a prompt that is not yours: another agent's turn, or the app on its own (`origin`), as
+// the daemon keeps them with the prompt.
+function senderOf(p) {
+  if (p.from?.bot) return { bot: p.from.bot, turn: p.from.turn, id: p.from.id };
+  return typeof p.origin === 'string' ? { app: p.origin } : null;
+}
+// The agent that sent it, while its name still holds the identity it had then.
+const senderBot = (by) => { const b = bot(by.bot); return b && b.id != null && b.id === by.id ? b : null; };
+// Who another agent is, as a message it sent names it: a coordinator by its role.
+const agentName = (name, b = bot(name)) => leadProject(name) ? 'coordinator' : b ? shortName(b) : name;
 function shortName(b) {
   const p = b?.project; if (!p) return b?.name ?? '';
   if (b.name === p + LEAD) return p;
@@ -354,7 +380,8 @@ function leave(swarm, name) {
 // newer read found.
 let swarmsRead = 0;
 async function loadSwarms() {
-  if (!Daemon.swarms) return;
+  // Swarms live on this machine; a window on a host has none.
+  if (!Daemon.swarms || S.config?.host) return;
   const read = ++swarmsRead;
   const { swarms = [], broken = [] } = await Daemon.swarms();
   if (read !== swarmsRead) return;
@@ -571,15 +598,20 @@ async function onEvent(ev) {
       break;
     }
     case 'accepted': {
+      if (data.from?.bot) S.turnFrom.set(`${name}\u0000${turn}`, data.from.bot);
       const b = bot(name); if (b) { b.status = 'running'; b.runningTurn = turn; b.waitingOn = []; b.turnStarted = S.live ? Date.now() : 0; b.elapsed = 0; }
-      if (typeof data.node === 'number') pushNode(transcript(name), { kind: 'node', node: data.node, turn });
+      // The event that puts a prompt on the lineage names who sent it, here and on `steered`.
+      const t = transcript(name), by = senderOf(data);
+      if (typeof data.node === 'number') pushNode(t, { kind: 'node', node: data.node, turn, ...(by ? { by } : {}) });
       break;
     }
     case 'queued': {
+      if (data.from?.bot) S.turnFrom.set(`${name}\u0000${turn}`, data.from.bot);
       // `ready` waits for a daemon-wide slot with nothing else running on the bot; `queued` sits behind its own turn.
       const b = bot(name); const behindOwn = !!b && (b.runningTurn !== null || isActive(b.status));
       if (b && !behindOwn) { b.status = data.status ?? 'queued'; b.runningTurn = turn; }
-      addItem(transcript(name), { kind: 'note', text: behindOwn ? 'queued behind the running turn' : 'queued for a slot', turn });
+      const t = transcript(name);
+      addItem(t, { kind: 'note', text: data.delivery === 'steer' ? 'steers in at the running turn\'s next step' : behindOwn ? 'queued behind the running turn' : 'queued for a slot', turn });
       break;
     }
     case 'message': {
@@ -629,7 +661,13 @@ async function onEvent(ev) {
     case 'turn_waiting': { const b = bot(name); if (b) { b.status = 'waiting'; b.waitingOn = data.handles ?? []; } break; }
     case 'turn_paced': { const b = bot(name); if (b) b.status = 'paced'; break; }
     case 'turn_resumed': { const b = bot(name); if (b) { b.status = 'running'; b.waitingOn = []; } break; }
-    case 'steered': addItem(transcript(name), { kind: 'note', text: 'steered into the running turn', turn }); break;
+    case 'steered': {
+      // The steer's message joins this turn; `steer` is the steer's own turn.
+      const t = transcript(name), by = senderOf(data);
+      if (typeof data.node === 'number') pushNode(t, { kind: 'node', node: data.node, turn, ...(by ? { by } : {}) });
+      else addItem(t, { kind: 'note', text: 'steered into the running turn', turn });
+      break;
+    }
     case 'turn_finished': {
       const status = data.status ?? '?';
       const b = bot(name);
@@ -638,6 +676,12 @@ async function onEvent(ev) {
       const t = transcript(name);
       if (t.streamingTurn === turn) { t.text = ''; t.thinking = ''; t.thinkingSince = 0; t.thinkingMs = 0; t.streamingTurn = null; t.streamGen += 1; }
       if (status !== 'completed' && status !== 'steered') addItem(t, { kind: 'note', text: data.error ? `${status}: ${data.error}${data.detail ? ': ' + data.detail : ''}` : status, turn });
+      const key = `${name}\u0000${turn}`, from = S.turnFrom.get(key); S.turnFrom.delete(key);
+      // A steer's turn is part of the turn it joined, whose end is the news.
+      // A task's creator may still be on a snapshot page to come; its news waits for the whole snapshot.
+      if (S.live && status !== 'steered') { if (S.snapshot) S.heldNews.push([name, turn, status, from]); else tellLead(name, turn, status, from); }
+      // A coordinator coming to rest hears what waited for it.
+      if (S.wakes.has(name)) wakeSoon(name);
       // A background command may outlive its turn; only a wait result says how it ended.
       break;
     }
@@ -791,6 +835,8 @@ async function loadBatch(name) {
     const index = t.items.indexOf(it); if (index < 0) continue;
     if (it.kind !== 'tool_stub' && !failure && !fetched.has(it.node)) continue;
     const row = fetched.get(it.node);
+    // The daemon names who sent a prompt with its item.
+    if (row && !it.by) { const by = senderOf(row); if (by) it.by = by; }
     const r = it.kind === 'tool_stub' ? {stub:true} : failure ? {err:failure} : row.error ? {err:row.error} : {ok:row.item};
     if (S.transcripts.get(name) !== t || S.session !== session) return false;
     if (r.stub) { count(t, it, -1); it.kind = 'tool'; t.gen += 1; progressed = true; continue; }
@@ -848,6 +894,67 @@ async function loadVisible() {
 // a pending history read, and an old reply must not mutate a new session.
 let chain = Promise.resolve();
 function enqueue(job) { chain = chain.then(job, job); return chain; }
+
+// ---------- coordinator wake ----------
+// Work goes on in tasks a project's coordinator started, mostly you working in them directly. The
+// coordinator hears of it: once it rests, and at most every WAKE_MS, one message lists the tasks that
+// ended turns since it last heard, by the handles its wait tool reads them with, and its role says what
+// to do with that. The turns it asked for itself are not news, so it never wakes itself; nor is its own
+// fork or side chat. Only live turns count, while this window is attached.
+// Each task keeps its first and latest turn and a count, whatever the backlog; one message names at most
+// WAKE_TASKS tasks, and the rest wait for the next.
+const WAKE_MS = 10 * 60 * 1000, WAKE_TASKS = 32;
+function tellLead(name, turn, status, from) {
+  const b = bot(name), lead = b && creatorOf(b);
+  if (!lead || !leadProject(lead.name) || from === lead.name || name.startsWith(`${lead.name}-`)) return;
+  let w = S.wakes.get(lead.name);
+  if (!w) { w = { tasks: new Map(), last: 0, timer: null }; S.wakes.set(lead.name, w); }
+  merge(w.tasks, name, { first: turn, turn, status, count: 1 });
+  wakeSoon(lead.name);
+}
+function merge(tasks, name, t) {
+  const had = tasks.get(name);
+  tasks.set(name, had ? { ...(t.turn >= had.turn ? t : had), first: Math.min(had.first, t.first), count: had.count + t.count } : t);
+}
+// A working coordinator waits for its turn to end, which calls this again.
+function wakeSoon(lead) {
+  const w = S.wakes.get(lead), l = bot(lead);
+  if (!w || w.timer || !w.tasks.size || !l || isActive(l.status)) return;
+  w.timer = setTimeout(() => { w.timer = null; wake(lead); }, Math.max(0, w.last + WAKE_MS - Date.now()));
+}
+async function wake(lead) {
+  const w = S.wakes.get(lead), l = bot(lead);
+  if (!w || !w.tasks.size || !S.attached || !l || l.id == null || isActive(l.status)) return;
+  const sent = [...w.tasks].slice(0, WAKE_TASKS);
+  for (const [name] of sent) w.tasks.delete(name);
+  w.last = Date.now();
+  // Named by the newest turn of each task it covers: another window with the same news, even counted from
+  // an earlier turn, asks for the same request, which the daemon answers once and refuses as different.
+  const prompt = wakeText(sent, w.tasks.size);
+  const id = `app-wake-${l.id}-${digest(sent.map(([name, t]) => `${name}/${t.turn}`).sort().join('\n'))}`;
+  try { await Daemon.request('submit', { bot: lead, bot_id: l.id, request_id: id, prompt, delivery: 'queue', origin: 'tasks' }); }
+  catch (e) {
+    if (/^bot_not_found/.test(e?.message ?? '')) { S.wakes.delete(lead); return; }
+    // Another window told it first.
+    if (/^idempotency_conflict/.test(e?.message ?? '')) return;
+    const later = w.tasks;
+    w.tasks = new Map(sent);
+    for (const [name, t] of later) merge(w.tasks, name, t);
+    Daemon.log?.(`wake ${lead}: ${e?.message ?? e}`);
+    wakeSoon(lead);
+  }
+}
+// FNV-1a over the text's UTF-16 units, 64 bits as hex.
+function digest(text) {
+  let h = 0xcbf29ce484222325n;
+  for (let i = 0; i < text.length; i++) h = BigInt.asUintN(64, (h ^ BigInt(text.charCodeAt(i))) * 0x100000001b3n);
+  return h.toString(16).padStart(16, '0');
+}
+function wakeText(tasks, more) {
+  const lines = tasks.map(([name, t]) => `- ${name}: turn:${name}/${t.turn} ${t.status}${t.count > 1 ? `, and ${t.count - 1} earlier since turn:${name}/${t.first}` : ''}`);
+  if (more) lines.push(`- ${more} more tasks in the next update`);
+  return `Task updates: since you last heard, tasks you started ended turns someone else asked for. The wait tool reads each one's final reply by its handle.\n${lines.join('\n')}`;
+}
 
 // ---------- lifecycle ----------
 // Events are pulled from the core a batch at a time and applied before the next pull, so the pipeline
@@ -923,9 +1030,14 @@ function attach() {
 async function attachOnce() {
   try {
     if (!S.config) S.config = await Daemon.setup();
-    const { session } = await Daemon.attach(S.cursor);
-    S.session = session;
-    S.deleted = new Set(); S.snapshot = true;
+    let { session, store, workspace } = await Daemon.attach(S.cursor);
+    // Another store answers where the last one did: its cursor, bot ids and names mean other things,
+    // so nothing learned from the last one is kept, and its log is followed from the start.
+    if (S.store && store && store !== S.store) { forgetStore(); ({ session, store, workspace } = await Daemon.attach(0)); }
+    S.session = session; S.store = store ?? null;
+    // A window on a host starts in the home the host named, unless it was given a folder there.
+    if (!S.config.workspace && workspace) { S.config.workspace = workspace; S.homeWorkspace = true; }
+    S.deleted = new Set(); S.snapshot = true; S.heldNews = [];
     pump(session);
     // The snapshot, a page at a time, applied as it arrives while the replay flows.
     const listed = new Set(); let after = null;
@@ -952,7 +1064,10 @@ async function attachOnce() {
         if (parent) addItem(transcript(parent.name), {kind:'peer',who:b.name,turn:null});
       }
       S.snapshot = false; S.deleted.clear();
+      for (const news of S.heldNews.splice(0)) tellLead(...news);
       S.attached = true;
+      // What waited while detached goes out now, each window permitting.
+      for (const lead of S.wakes.keys()) wakeSoon(lead);
       try { await loadSwarms(); } catch (e) { toast(`swarms: ${e?.message ?? e}`, 5000); }
       restore();
       // A selection deleted while detached had no `deleted` event to replay; show a surviving bot.
@@ -975,6 +1090,17 @@ async function attachOnce() {
     return false;
   }
 }
+// Everything the window learned from one store, dropped before it shows another.
+function forgetStore() {
+  S.cursor = 0; S.bots.clear(); S.transcripts.clear(); S.drafts.clear(); S.override.clear(); S.families.clear();
+  S.swarms.clear(); S.memberOf.clear(); S.deleted.clear(); looked.clear();
+  for (const w of S.wakes.values()) clearTimeout(w.timer);
+  S.wakes.clear(); S.turnFrom.clear(); S.heldNews = [];
+  S.selected = ''; S.autoSelect = true; S.ui.side = null; S.ui.folded = new Set();
+  S.botsGen += 1; S.shapeGen += 1;
+  // A home the last host named is not this one's.
+  if (S.homeWorkspace) { S.config.workspace = null; S.homeWorkspace = false; }
+}
 // No provider to run: starting again cannot help until Settings changes, which attaches itself.
 // Attaching again cannot help until something changes: a provider in Settings, or a newer app.
 function idle() { return /^no_provider/.test(S.lastReason ?? '') || olderDaemon(S.lastReason) === 'newer'; }
@@ -994,13 +1120,15 @@ function showDetached(reason) {
     : age === 'older' ? `<div class="why">A daemon from before this update holds this socket, and this window did not start it: stop it with its own agent (agent shutdown), then start one from this update's agent. The window attaches when it answers.</div><div style="margin-top:12px">${settings}</div>`
     : `${age === 'newer' ? '<div class="why">The daemon is newer than this app: update the app.</div>' : ''}<div style="margin-top:12px">${settings}</div>`;
   const state = age === 'newer' ? 'stopped' : idle() ? 'waiting for a provider' : 'retrying';
-  $('detached').innerHTML = `<div><b>not attached</b></div><div>${esc(reason)}</div><div style="margin-top:8px">daemon at <span class="k">${esc(S.config?.socket ?? '?')}</span> · ${state}</div>${what}`;
+  const where = S.config?.host ? `daemon on <span class="k">${esc(S.config.host)}</span>` : `daemon at <span class="k">${esc(S.config?.socket ?? '?')}</span>`;
+  $('detached').innerHTML = `<div><b>not attached</b></div><div>${esc(reason)}</div><div style="margin-top:8px">${where} · ${state}</div>${what}`;
   $('detached').classList.add('on');
   if (!idle()) retryAttach();
   else { clearTimeout(retryTimer); retryTimer = null; }
 }
 function restore() {
-  let saved = null; try { saved = JSON.parse(localStorage.getItem(sessionKey()) || 'null'); } catch (_) {}
+  const key = sessionKey(); if (!key) return;
+  let saved = null; try { saved = JSON.parse(localStorage.getItem(key) || 'null'); } catch (_) {}
   if (!saved) return;
   if (saved.selected && isOpen(saved.selected)) { S.selected = saved.selected; S.autoSelect = false; }
   if (saved.side && S.bots.has(saved.side) && saved.side !== S.selected) S.ui.side = saved.side;
@@ -1013,7 +1141,7 @@ function restore() {
     if (b && b.id != null && b.id === id && typeof model === 'string' && runsOn(b, model)) S.override.set(name, model);
   }
 }
-function save() { try { localStorage.setItem(sessionKey(), JSON.stringify({ selected: S.selected, side: S.ui.side, rail: S.ui.rail, steps: S.ui.steps, folded: [...S.ui.folded], override: [...S.override].map(([name, model]) => [name, bot(name)?.id ?? null, model]) })); } catch (_) {} }
+function save() { const key = sessionKey(); if (!key) return; try { localStorage.setItem(key, JSON.stringify({ selected: S.selected, side: S.ui.side, rail: S.ui.rail, steps: S.ui.steps, folded: [...S.ui.folded], override: [...S.override].map(([name, model]) => [name, bot(name)?.id ?? null, model]) })); } catch (_) {} }
 window.addEventListener('beforeunload', save);
 
 // ---------- render ----------
@@ -1153,7 +1281,13 @@ function toggleStep(target) {
 
 function itemHTML(it) {
   switch (it.kind) {
-    case 'user': return `<div class="line user">› ${esc(it.text)}</div>`;
+    case 'user': {
+      if (!it.by) return `<div class="line user">› ${esc(it.text)}</div>`;
+      const sender = it.by.bot ? senderBot(it.by) : null;
+      const tag = sender ? `<button type="button" class="by" data-task="${esc(it.by.bot)}" title="Sent by ${esc(it.by.bot)}, turn ${esc(it.by.turn)}">${esc(agentName(it.by.bot, sender))}</button>`
+        : `<span class="by"${it.by.bot ? ` title="Sent by ${esc(it.by.bot)}, turn ${esc(it.by.turn)}, since deleted"` : ''}>${esc(it.by.bot ? agentName(it.by.bot, null) : it.by.app)}</span>`;
+      return `<div class="line user agent">${tag} ${esc(it.text)}</div>`;
+    }
     case 'text': return markdown(it.text);
     case 'note': return `<div class="line note">${esc(it.text)}</div>`;
     case 'note_gap': return `<div class="line note">${it.total} ${it.later ? 'later' : 'earlier'} activity notes summarized · durable messages remain available</div>`;
@@ -1695,7 +1829,8 @@ function botMenuItems(name) {
   const b = bot(name); if (!b) return [];
   const busy = isActive(b.status);
   return [
-    ...(leadProject(name) ? [{ act: 'new-swarm', who: name, label: 'New swarm', hint: '⁂' }, { sep: true }] : []),
+    // A swarm runs on this machine: its board is the app's files and its agents run the app's scripts.
+    ...(leadProject(name) ? [{ act: 'new-swarm', who: name, label: 'New swarm', hint: S.config?.host ? 'local only' : '⁂', disabled: !!S.config?.host }, { sep: true }] : []),
     { act: 'side-chat', who: name, label: 'Side chat', hint: '⑂', disabled: b.id == null },
     { act: 'stop', who: name, label: 'Stop', disabled: b.runningTurn === null },
     { act: 'fork', who: name, label: 'Fork', hint: busy ? 'when idle' : '', disabled: busy },
@@ -1935,9 +2070,12 @@ async function openSetup() {
   const st = setupState();
   st.open = true; st.error = null;
   $('setupwrap').classList.add('on'); renderSetup();
+  // The hosts come as OpenSSH resolves them, beside the rest.
+  Daemon.hosts?.().then((hosts) => { st.hosts = hosts; st.hostsError = null; renderSetup(); }, (e) => { st.hosts = []; st.hostsError = String(e?.message ?? e); renderSetup(); });
   try { await loadSettings(); } catch (e) { st.error = String(e?.message ?? e); }
   try { st.roles = await Daemon.roles?.(); } catch (_) {}
   if (!st.settings?.providers?.length) st.adding = st.adding ?? '';
+  await readSchedules();
   renderSetup();
   await Promise.all([checkProviders(st.settings?.listing), readList()]);
 }
@@ -2046,6 +2184,8 @@ async function removeProvider(name) {
 }
 // A window attached through a socket it did not start cannot apply a change, so none is saved.
 function unrestartable() {
+  const host = setupState().settings?.host;
+  if (host) throw new Error(`restart_unavailable: this window's daemon runs on ${host} with the providers its login shell there exports; change them there`);
   if (setupState().settings?.restartable === false) throw new Error('restart_unavailable: this window did not start its daemon, so it cannot apply provider changes');
 }
 async function applySettings(changes) {
@@ -2086,15 +2226,29 @@ function setupHTML() {
   const refresh = specs.length && S.attached ? `<button type="button" class="sbtn" data-act="setup-refresh"${busy}>Refresh models</button>` : '';
   const listed = st.listError ? `<p class="bad">${esc(st.listError)}</p>` : '';
   const projects = hasProject();
-  const project = projects ? '' : ready && specs.length && st.list.length
+  // Making a project reads its folder, which on a host is the host's.
+  const project = projects ? '' : S.config?.host
+    ? `<p class="dim">A project on ${esc(S.config.host)} is made there for now: the app does not yet read a host's files (AGENTS.md, profiles, .agents/project.toml). Start its lead there with agent run --new --agents --bot NAME.lead; it shows here.</p>`
+    : ready && specs.length && st.list.length
     ? `<form id="setupproj"><label><span>Folder</span><input id="setupdir" autocomplete="off" spellcheck="false" value="${esc(S.config?.workspace ?? '')}"></label><label><span>Model</span>${modelSelectHTML('setupmodel', st.list)}</label><div class="row"><button type="submit" class="sbtn primary"${S.attached ? '' : ' disabled'}${busy}>Create project</button></div><p class="dim">The project's lead runs on this model; every agent you start can use another.</p></form>`
     : `<p class="dim">${specs.length ? 'No models listed yet: see the providers above, then Refresh models.' : 'Connect a provider first.'}</p>`;
   const step = (n, title, done, body) => body ? `<section class="${done ? 'done' : ''}"><h3><span class="num">${done ? '✓' : n}</span>${title}</h3>${body}</section>` : '';
   return `<div class="shead"><b>${ready && projects ? 'Settings' : 'Set up Agent'}</b><button type="button" class="ibtn" data-act="setup-close" title="Close" aria-label="Close"${busy}>✕</button></div>`
-    + step(1, 'Providers', ready, `${rows}<div class="row">${set?.restartable === false ? '<p class="dim">This window uses a daemon it did not start, so it cannot apply provider changes.</p>' : add}${st.adding === null ? refresh : ''}</div>${listed}`)
+    + step(1, 'Providers', ready, `${rows}<div class="row">${set?.host ? `<p class="dim">This window's daemon runs on ${esc(set.host)}, with the providers its login shell there exports; change them there.</p>` : set?.restartable === false ? '<p class="dim">This window uses a daemon it did not start, so it cannot apply provider changes.</p>' : add}${st.adding === null && !set?.host ? refresh : ''}</div>${listed}`)
     + step(2, 'First project', projects, project)
-    + (projects ? rolesHTML(st, busy) : '')
+    + (projects && !S.config?.host ? rolesHTML(st, busy) : '')
+    + hostsHTML(st, busy)
+    + (!S.config?.host && (projects || st.schedules?.length || st.schedulesAfter || st.schedulesError) ? schedulesHTML(st, busy) : '')
     + (st.busy ? `<p class="busy">${esc(st.busy)}</p>` : '') + (st.error ? `<p class="bad">${esc(st.error)}</p>` : '');
+}
+// The hosts in ~/.ssh/config, each of which a window can be opened on. That window's agents run on
+// the host, through the app's own ssh connection to it.
+function hostsHTML(st, busy) {
+  if (!Daemon.openHost) return '';
+  const where = (to) => (to ? `${to.user ? `${to.user}@` : ''}${to.hostname ?? ''}${to.port && to.port !== '22' ? `:${to.port}` : ''}` : '');
+  const rows = (st.hosts ?? []).map((h) => `<div class="prow"><span class="pn">${esc(h.alias)}</span><span class="st dim">${esc(where(h.to))}</span><span class="acts"><button type="button" class="sbtn" data-act="open-host" data-v="${esc(h.alias)}"${busy}>Open window</button></span></div>`).join('');
+  const none = st.hostsError ? `<p class="bad">${esc(st.hostsError)}</p>` : rows ? '' : '<p class="dim">No hosts in ~/.ssh/config.</p>';
+  return `<section><h3>Hosts</h3>${rows}${none}<p class="dim">A window on a host runs its agents there, over ssh with your keys. The host needs its own Linux agent on its login shell's PATH, and its own providers.</p></section>`;
 }
 // The app's roles, each read from your own file in every project once you have one. Edit makes that
 // file from the app's text the first time and opens it in your editor.
@@ -2103,6 +2257,35 @@ function rolesHTML(st, busy) {
   const own = new Map((st.roles ?? []).map((r) => [r.name, r.file]));
   const rows = ROLES.map(([name, label]) => `<div class="prow"><span class="pn">${label}</span><span class="st${own.get(name) ? '' : ' dim'}">${own.get(name) ? `~/.agents/agents/${name}.md` : 'the app\'s own'}</span><span class="acts"><button type="button" class="sbtn" data-act="edit-role" data-v="${name}"${busy}>Edit</button></span></div>`).join('');
   return `<section><h3>Roles</h3>${rows}<p class="dim">A project's coordinator and a swarm's agents follow these in every project; a project's own .agents/agents file of that name comes first. An agent keeps the text it started with, so an edit reaches new projects and swarms.</p></section>`;
+}
+// Agents wake at set times from schedules they or their coordinator made; the Mac keeps the time.
+// Each shows who it wakes, when, what its last time did, and the message it sends.
+// A schedule that ended on its own without delivering stays listed, saying why, until it is removed; so do a
+// one-off still there after its time and a plist that cannot be read.
+async function readSchedules(after = null) {
+  const st = setupState();
+  st.schedulesAfter = after;
+  try {
+    const page = S.config?.host ? null : await Daemon.schedules?.(after);
+    st.schedules = page?.schedules ?? null; st.schedulesNext = page?.next_after ?? null; st.schedulesError = null;
+  } catch (e) { st.schedules = null; st.schedulesNext = null; st.schedulesError = String(e?.message ?? e); }
+}
+const LAST = { sent: 'sent', skipped: 'skipped, it was working', gone: 'its agent is gone', failed: 'failed', missed: 'missed, its time passed long ago' };
+function schedulesHTML(st, busy) {
+  const at = (ms) => new Date(ms).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  const last = (l, ended) => l ? `${ended ? 'ended' : 'last'} ${at(l.fired_ms)}: ${LAST[l.outcome] ?? l.outcome}${l.outcome === 'failed' && l.detail ? ` (${String(l.detail).slice(0, 120)})` : ''}` : 'not run yet';
+  const remove = (x) => `<span class="acts"><button type="button" class="sbtn" data-act="schedule-remove" data-v="${esc(x.name)}"${busy}>Remove</button></span>`;
+  const rows = (st.schedules ?? []).map((x) => x.problem
+    ? `<div class="prow"><span class="pn">${esc(x.name)}</span><span class="st bad">unreadable</span>${remove(x)}<div class="sub dim">${esc(x.problem)}</div></div>`
+    : `<div class="prow"><span class="pn">${esc(x.bot)}</span><span class="st${x.ended || x.missed ? ' bad' : ''}">${x.ended ? 'not delivered' : x.missed ? 'missed its time' : esc(x.when)}</span>${remove(x)}<div class="sub dim">${esc(last(x.last, x.ended))}${x.name !== x.bot ? ` · ${esc(x.name)}` : ''}</div><div class="sub dim">${esc(x.message.length > 240 ? `${x.message.slice(0, 240)}…` : x.message)}</div></div>`).join('');
+  const none = st.schedulesError ? `<p class="bad">${esc(st.schedulesError)}</p>` : rows ? '' : '<p class="dim">None yet. Ask a coordinator, for example "have build check its PR every 30 minutes".</p>';
+  return `<section><h3>Schedules</h3>${rows}${none}${st.schedulesAfter ? '<button class="sbtn" data-act="schedules-first">First page</button>' : ''}${st.schedulesNext ? '<button class="sbtn" data-act="schedules-next">Next page</button>' : ''}<p class="dim">Each time, the agent gets its message in its own chat. A repeating one skips a time its agent is working; a one-off waits for it. They run with the app closed; a time the Mac slept through runs once when it wakes.</p></section>`;
+}
+async function removeSchedule(name) {
+  const st = setupState();
+  try { await Daemon.removeSchedule(name); } catch (e) { toast(`remove ${name}: ${e?.message ?? e}`, 5000); }
+  await readSchedules(st.schedulesAfter);
+  renderSetup();
 }
 async function editRole(name) {
   const st = setupState();
@@ -2274,6 +2457,10 @@ async function act(el) {
     case 'setup-remove': { const st = setupState(); if (anyActive() && st.confirm !== v) { st.confirm = v; renderSetup(); return; } st.confirm = null; await removeProvider(v); return; }
     case 'setup-retry': case 'setup-refresh': await refreshModels(); return;
     case 'edit-role': await editRole(v); return;
+    case 'schedules-first': await readSchedules(); renderSetup(); return;
+    case 'schedules-next': await readSchedules(setupState().schedulesNext); renderSetup(); return;
+    case 'schedule-remove': await removeSchedule(v); return;
+    case 'open-host': await Daemon.openHost(v); return;
     default: return;
   }
 }

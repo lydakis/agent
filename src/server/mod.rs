@@ -250,6 +250,9 @@ enum Command {
         expected_turn: Option<i64>,
         /// The bot turn whose model wrote this prompt; absent for a person.
         from: Option<Author>,
+        /// What sent it when no bot's turn did, as the client names itself
+        /// (a name's characters); absent for a person.
+        origin: Option<String>,
     },
     Interrupt {
         bot: String,
@@ -2403,8 +2406,15 @@ impl Service {
                 delivery,
                 expected_turn,
                 from,
+                origin,
             } => {
                 name(&request_id)?;
+                if origin.is_some() && from.is_some() {
+                    return fail_with("invalid_origin", "from and origin are mutually exclusive");
+                }
+                if let Some(origin) = &origin {
+                    name(origin).map_err(|_| Error::with("invalid_origin", origin.as_str()))?;
+                }
                 if prompt.len() > 256 * 1024 {
                     return fail("prompt_limit");
                 }
@@ -2424,6 +2434,7 @@ impl Service {
                     delivery,
                     expected_turn,
                     from: from.map(|author| (author.bot, author.turn)),
+                    origin,
                 };
                 // A slot is promised before the commit that may take it, so
                 // admissions queued together cannot start more turns than
@@ -3324,6 +3335,7 @@ mod tests {
             delivery: None,
             expected_turn: None,
             from: None,
+            origin: None,
         }
     }
     /// Take requests the way the run loop does: an admission with room joins

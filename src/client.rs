@@ -410,10 +410,19 @@ impl Connection {
             ready: Value::Null,
         };
         connection.ready = connection.read_ready(deadline)?;
-        if connection.ready["event"] != "ready"
-            || connection.ready["protocol"].as_u64() != Some(agent_client::PROTOCOL)
-        {
+        if connection.ready["event"] != "ready" {
             return fail("daemon_protocol_mismatch");
+        }
+        if connection.ready["protocol"].as_u64() != Some(agent_client::PROTOCOL) {
+            // The greeting goes with the error: `start` shows which daemon
+            // holds the socket, and `shutdown` may stop an older one.
+            let detail = format!(
+                "the daemon speaks protocol {}, this agent {}",
+                connection.ready["protocol"],
+                agent_client::PROTOCOL
+            );
+            return Err(Error::with("daemon_protocol_mismatch", detail)
+                .facts(json!({"ready": connection.ready})));
         }
         Ok(connection)
     }
@@ -959,11 +968,34 @@ pub fn main(args: Vec<String>) -> Result<i32> {
         "answer" => answer(&options),
         "approver" => approver(&options),
         "models" => models(&options),
-        // The daemon's ready line, from the running one or one started now.
+        // The daemon's ready line, from the running one or one started now,
+        // with the socket it answered on, so a caller that reached this
+        // command over SSH knows what to forward. A daemon of another
+        // protocol is printed too, then refused.
         "start" => {
-            let connection = ensure_daemon(&options)?;
-            print_json(&connection.ready, options.pretty)?;
-            Ok(0)
+            // Absolute, as a caller elsewhere must name it: a relative
+            // AGENT_SOCKET is relative to this command's directory. A path
+            // JSON cannot carry is refused before anything starts.
+            let socket = std::path::absolute(&options.socket)?;
+            let Some(socket) = socket.to_str().map(str::to_owned) else {
+                return fail_with(
+                    "socket_path_unsupported",
+                    format!(
+                        "{} is not UTF-8, so the ready line cannot name it",
+                        socket.display()
+                    ),
+                );
+            };
+            let (mut ready, refused) = match ensure_daemon(&options) {
+                Ok(connection) => (connection.ready, None),
+                Err(error) => match error.facts.as_ref().and_then(|facts| facts.get("ready")) {
+                    Some(ready) => (ready.clone(), Some(error)),
+                    None => return Err(error),
+                },
+            };
+            ready["socket"] = json!(socket);
+            print_json(&ready, options.pretty)?;
+            refused.map_or(Ok(0), Err)
         }
         "stats" => {
             let mut connection = ensure_existing_daemon(&options)?;
@@ -973,7 +1005,10 @@ pub fn main(args: Vec<String>) -> Result<i32> {
         }
         "ls" => list(&options),
         "shutdown" => {
-            let mut connection = Connection::connect(&options.socket)?;
+            let mut connection = match Connection::connect(&options.socket) {
+                Ok(connection) => connection,
+                Err(error) => return stop_older(error),
+            };
             let pid = connection.ready["pid"]
                 .as_u64()
                 .and_then(|pid| i32::try_from(pid).ok())
@@ -986,6 +1021,35 @@ pub fn main(args: Vec<String>) -> Result<i32> {
     }
 }
 
+/// A daemon older than this agent cannot be asked to shut down in this
+/// protocol, but every protocol honours SIGTERM: running turns end as
+/// interrupted and the store keeps every chat. This is how an upgrade on a
+/// host replaces its daemon. A newer daemon, or a listener that did not greet
+/// as a daemon, is left alone and the error stands.
+fn stop_older(error: Error) -> Result<i32> {
+    let ready = (error.facts.as_ref()).and_then(|facts| facts.get("ready"));
+    let older = ready
+        .and_then(|ready| ready["protocol"].as_u64())
+        .is_some_and(|protocol| protocol < agent_client::PROTOCOL);
+    let pid = (ready.and_then(|ready| ready["pid"].as_u64()))
+        .and_then(|pid| i32::try_from(pid).ok())
+        .filter(|pid| *pid > 1);
+    let (true, Some(pid)) = (older, pid) else {
+        return Err(error);
+    };
+    // SAFETY: a signal to the process the daemon named as itself.
+    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+        let error = std::io::Error::last_os_error();
+        // It exited after it greeted: it is stopped.
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(0);
+        }
+        return fail_with("daemon_stop_failed", error.to_string());
+    }
+    await_exit(pid, SHUTDOWN_TIMEOUT)?;
+    Ok(0)
+}
+
 /// Return once the daemon process is gone, so a caller may copy or reopen
 /// the store: it answers shutdown before it lets running turns finish within
 /// the grace period, cancels the rest, commits their records and closes the
@@ -996,11 +1060,33 @@ fn await_exit(pid: i32, timeout: Duration) -> Result<()> {
         // SAFETY: signal 0 only checks that the process exists.
         let exists = unsafe { libc::kill(pid, 0) } == 0
             || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-        exists
-            && std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
-                stat.rsplit_once(") ")
-                    .is_none_or(|(_, state)| !state.starts_with('Z'))
-            })
+        if !exists {
+            return false;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // SAFETY: proc_pidinfo fills this fixed-size process record.
+            let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+            let size = std::mem::size_of_val(&info) as i32;
+            let read = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDTBSDINFO,
+                    0,
+                    (&mut info as *mut libc::proc_bsdinfo).cast(),
+                    size,
+                )
+            };
+            if read == size {
+                return info.pbi_status != libc::SZOMB;
+            }
+            std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+        }
+        #[cfg(not(target_os = "macos"))]
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+            stat.rsplit_once(") ")
+                .is_none_or(|(_, state)| !state.starts_with('Z'))
+        })
     };
     while running() {
         if Instant::now() >= deadline {

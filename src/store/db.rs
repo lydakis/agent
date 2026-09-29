@@ -338,6 +338,9 @@ pub struct TurnOptions {
     /// The bot turn whose model wrote this prompt, as the submitter
     /// declared it; none for a person's words.
     pub from: Option<(String, i64)>,
+    /// What sent this prompt when no bot's turn did, in the submitting
+    /// client's own words (an app's scheduler, say); none for a person's.
+    pub origin: Option<String>,
 }
 /// What a submission does when the bot is busy or the daemon is full.
 /// `Reject` answers `bot_busy` or `active_agent_limit`. `Queue` records the
@@ -980,7 +983,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 40;
+    pub const SCHEMA: i32 = 41;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1080,6 +1083,8 @@ impl Database {
             CREATE INDEX IF NOT EXISTS compactions_pinned ON compactions(pinned) WHERE pinned IS NOT NULL;
             CREATE TABLE IF NOT EXISTS stubs(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 item BLOB NOT NULL);
+            CREATE TABLE IF NOT EXISTS senders(node INTEGER PRIMARY KEY REFERENCES nodes(id),
+                bot TEXT, bot_id INTEGER, turn INTEGER, origin TEXT);
             CREATE TABLE IF NOT EXISTS elisions(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 previous INTEGER REFERENCES elisions(node), through INTEGER NOT NULL,
                 saved INTEGER NOT NULL);
@@ -1133,7 +1138,7 @@ impl Database {
                 retries INTEGER NOT NULL DEFAULT 0, paced_ms INTEGER NOT NULL DEFAULT 0,
                 delivery TEXT NOT NULL DEFAULT 'reject', expected_turn INTEGER,
                 cached_input_tokens INTEGER NOT NULL DEFAULT 0,
-                from_bot TEXT, from_turn INTEGER,
+                from_bot TEXT, from_turn INTEGER, from_id INTEGER, origin TEXT,
                 UNIQUE(bot,request_id));
             CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
             CREATE INDEX IF NOT EXISTS turns_started ON turns(bot,id) WHERE started_ms IS NOT NULL;
@@ -3383,7 +3388,7 @@ impl Database {
         let prior: Option<(i64, String, String, TurnOptions, Option<i64>)> = self
             .conn
             .query_row(
-                "SELECT id,prompt,status,workspace,model,delivery,expected_turn,prompt_node,from_bot,from_turn
+                "SELECT id,prompt,status,workspace,model,delivery,expected_turn,prompt_node,from_bot,from_turn,origin
                  FROM turns WHERE bot=? AND request_id=?",
                 params![name, request_id],
                 |r| {
@@ -3400,6 +3405,7 @@ impl Database {
                                 (Some(bot), Some(turn)) => Some((bot, turn)),
                                 _ => None,
                             },
+                            origin: r.get(10)?,
                         },
                         r.get(7)?,
                     ))
@@ -3445,13 +3451,18 @@ impl Database {
             return fail("stale_turn");
         }
         // Declared, not verified: the named turn exists and is that bot's.
-        if let Some((from, turn)) = &options.from
-            && !self
+        let mut from_id = None;
+        if let Some((from, turn)) = &options.from {
+            from_id = self
                 .conn
-                .prepare_cached("SELECT 1 FROM turns WHERE id=? AND bot=?")?
-                .exists(params![turn, from])?
-        {
-            return fail_with("invalid_from", format!("{from} has no turn {turn}"));
+                .prepare_cached(
+                    "SELECT b.id FROM turns t JOIN bots b ON b.name=t.bot WHERE t.id=? AND t.bot=?",
+                )?
+                .query_row(params![turn, from], |r| r.get::<_, i64>(0))
+                .optional()?;
+            if from_id.is_none() {
+                return fail_with("invalid_from", format!("{from} has no turn {turn}"));
+            }
         }
         if let Err(error) = validate(&bot, options.model.as_deref()) {
             // An omitted steer model inherits the active turn for absorption.
@@ -3550,15 +3561,15 @@ impl Database {
             )?
             .query_row([], |r| r.get(0))?;
         tx.prepare_cached(
-            "INSERT INTO turns(id,bot,request_id,prompt,status,workspace,model,delivery,expected_turn,from_bot,from_turn)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO turns(id,bot,request_id,prompt,status,workspace,model,delivery,expected_turn,from_bot,from_turn,from_id,origin)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
         )?.execute(
             // Queued work keeps the folder it was sent to even if the bot
             // moves before it starts; a steer without one joins any turn.
             params![turn, name, request_id, prompt, status,
                 if options.delivery == Delivery::Steer { options.workspace.as_deref() } else { Some(workspace.as_str()) },
                 options.model, options.delivery.name(), options.expected_turn,
-                options.from.as_ref().map(|f| &f.0), options.from.as_ref().map(|f| f.1)],
+                options.from.as_ref().map(|f| &f.0), options.from.as_ref().map(|f| f.1), from_id, options.origin],
         )?;
         if moved {
             tx.prepare_cached("UPDATE bots SET workspace=? WHERE name=?")?
@@ -3570,22 +3581,24 @@ impl Database {
             .model
             .clone()
             .unwrap_or_else(|| format!("{}/{}", bot.provider, bot.model));
-        let (kind, mut data) = if status == "running" {
-            let head = start_locked(&tx, &bot, turn, prompt)?;
-            (
-                "accepted",
-                json!({"request_id":request_id,"node":head,"workspace":workspace,"model":model}),
-            )
+        let (kind, data) = if status == "running" {
+            let mut data = json!({"request_id":request_id,"workspace":workspace,"model":model});
+            start_locked(&tx, &bot, turn, prompt, &mut data)?;
+            ("accepted", data)
         } else {
-            (
-                "queued",
-                json!({"request_id":request_id,"status":status,"delivery":options.delivery.name(),
-                    "workspace":workspace,"model":model}),
-            )
+            let mut data = json!({"request_id":request_id,"status":status,
+                "delivery":options.delivery.name(),"workspace":workspace,"model":model});
+            sender_fields(
+                &mut data,
+                options
+                    .from
+                    .as_ref()
+                    .map(|(bot, turn)| (bot.as_str(), *turn)),
+                from_id,
+                options.origin.as_deref(),
+            );
+            ("queued", data)
         };
-        if let Some((from, from_turn)) = &options.from {
-            data["from"] = json!({"bot":from,"turn":from_turn});
-        }
         let cursor = event(&tx, name, Some(turn), kind, data.clone())?;
         tx.commit()?;
         if status != "running" {
@@ -3658,8 +3671,8 @@ impl Database {
             .ok_or(Error::new("workspace_required"))?;
         let model = model.unwrap_or_else(|| format!("{}/{}", bot.provider, bot.model));
         let tx = self.conn.savepoint()?;
-        let head = start_locked(&tx, &bot, turn, &prompt)?;
-        let data = json!({"request_id":request_id,"node":head,"workspace":workspace,"model":model});
+        let mut data = json!({"request_id":request_id,"workspace":workspace,"model":model});
+        start_locked(&tx, &bot, turn, &prompt, &mut data)?;
         let cursor = event(&tx, &name, Some(turn), "accepted", data.clone())?;
         tx.commit()?;
         self.pending_left(prompt.len());
@@ -3860,13 +3873,17 @@ impl Database {
                     params![epoch_ms(), turn, steer],
                 )?;
             }
+            // The running turn's `steered` event names who sent the message
+            // it takes in, as `accepted` does for a turn's first.
+            let mut taken = json!({"steer":steer,"node":id});
+            keep_sender(&tx, steer, id, &mut taken)?;
             let data = json!({"status":"steered","into":turn,"node":id,"checkpoint":Value::Null,
                 "error":Value::Null,"detail":Value::Null});
             let cursor = event(&tx, &bot.name, Some(steer), "turn_finished", data.clone())?;
             absorbed
                 .entries
                 .push(entry(cursor, &bot.name, Some(steer), "turn_finished", data));
-            let data = json!({"from":steer,"node":id});
+            let data = taken;
             let cursor = event(&tx, &bot.name, Some(turn), "steered", data.clone())?;
             absorbed
                 .entries
@@ -4724,7 +4741,7 @@ impl Database {
             .prepare_cached(
                 "SELECT t.status,COALESCE(t.workspace,b.workspace),
                     CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END,
-                    t.from_bot,t.from_turn
+                    t.from_bot,t.from_turn,t.origin
                  FROM turns t JOIN bots b ON b.name=t.bot LEFT JOIN nodes n ON n.id=t.prompt_node
                  WHERE t.id=? AND t.bot=?",
             )?
@@ -4735,31 +4752,33 @@ impl Database {
                     r.get::<_, Option<String>>(2)?,
                     r.get::<_, Option<String>>(3)?,
                     r.get::<_, Option<i64>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
                 ))
             })
             .optional()?;
-        let Some((status, workspace, text, from, from_turn)) = row else {
+        let Some((status, workspace, text, from, from_turn, origin)) = row else {
             self.inspect(name)?;
             return fail("turn_not_found");
         };
         let mut left = bytes;
-        let mut prompts = vec![prompt_entry(turn, text, from, from_turn, &mut left)];
+        let mut prompts = vec![prompt_entry(turn, text, from, from_turn, origin, &mut left)];
         let mut prompts_more = false;
         let mut steers = self.conn.prepare_cached(
-            "SELECT json_extract(data,'$.from') FROM events WHERE turn=? AND kind='steered' ORDER BY id",
+            "SELECT json_extract(data,'$.steer') FROM events WHERE turn=? AND kind='steered' ORDER BY id",
         )?;
         let mut steer = self.conn.prepare_cached(
             "SELECT CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END,
-                t.from_bot,t.from_turn
+                t.from_bot,t.from_turn,t.origin
              FROM turns t LEFT JOIN nodes n ON n.id=t.prompt_node WHERE t.id=?",
         )?;
         for id in steers.query_map([turn], |r| r.get::<_, i64>(0))? {
             let id = id?;
-            let (text, from, from_turn) = steer.query_row([id], |r| {
+            let (text, from, from_turn, origin) = steer.query_row([id], |r| {
                 Ok((
                     r.get::<_, Option<String>>(0)?,
                     r.get::<_, Option<String>>(1)?,
                     r.get::<_, Option<i64>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
                 ))
             })?;
             if left < Self::PROMPTS_ENTRY {
@@ -4767,7 +4786,7 @@ impl Database {
                 break;
             }
             left -= Self::PROMPTS_ENTRY;
-            let mut entry = prompt_entry(id, text, from, from_turn, &mut left);
+            let mut entry = prompt_entry(id, text, from, from_turn, origin, &mut left);
             entry["steer"] = json!(true);
             prompts.push(entry);
         }
@@ -4818,7 +4837,7 @@ impl Database {
         let mut more = false;
         let mut statement = self.conn.prepare_cached(
             "SELECT t.id,CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END,
-                t.from_bot,t.from_turn,t.status='steered'
+                t.from_bot,t.from_turn,t.status='steered',t.origin
              FROM turns t LEFT JOIN nodes n ON n.id=t.prompt_node
              WHERE t.bot=? AND t.id<? AND (t.started_ms IS NOT NULL OR t.status='steered')
              ORDER BY t.id DESC",
@@ -4830,7 +4849,14 @@ impl Database {
                 break;
             }
             left -= Self::PROMPTS_ENTRY;
-            let mut entry = prompt_entry(r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, &mut left);
+            let mut entry = prompt_entry(
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(5)?,
+                &mut left,
+            );
             if r.get::<_, bool>(4)? {
                 entry["steer"] = json!(true);
             }
@@ -5889,6 +5915,7 @@ impl Database {
             tx.execute("DELETE FROM compactions WHERE node=?", [id])?;
             tx.execute("DELETE FROM elisions WHERE node=?", [id])?;
             tx.execute("DELETE FROM stubs WHERE node=?", [id])?;
+            tx.execute("DELETE FROM senders WHERE node=?", [id])?;
             tx.execute("DELETE FROM nodes WHERE id=?", [id])?;
             freed += 1;
             node = parent;
@@ -6174,17 +6201,33 @@ impl Database {
         let maximum = crate::output::MAX_EVENT - 1024;
         // Check the encoded blob length in SQLite before allocating it. An
         // unrenderable item gets its own error; adjacent items remain readable.
-        let mut query = self
-            .conn
-            .prepare_cached("SELECT item FROM nodes WHERE id=? AND length(item)<=?")?;
+        // A prompt another bot's turn or a named client sent says so.
+        let mut query = self.conn.prepare_cached(
+            "SELECT CASE WHEN length(n.item)<=?2 THEN n.item END,s.bot,s.turn,s.bot_id,s.origin
+             FROM nodes n LEFT JOIN senders s ON s.node=n.id WHERE n.id=?1",
+        )?;
         for &node in wanted {
-            let raw: Option<Vec<u8>> = query
-                .query_row(params![node, maximum as i64], |r| r.get(0))
-                .optional()?;
+            type Row = (
+                Option<Vec<u8>>,
+                Option<String>,
+                Option<i64>,
+                Option<i64>,
+                Option<String>,
+            );
+            let (raw, from, from_turn, bot_id, origin): Row = query
+                .query_row(params![node, maximum as i64], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })?;
             let mut entry = match raw {
                 Some(raw) => json!({"node":node,"item":serde_json::from_slice::<Value>(&raw)?}),
                 None => json!({"node":node,"error":"item_too_large"}),
             };
+            sender_fields(
+                &mut entry,
+                from.as_deref().zip(from_turn),
+                bot_id,
+                origin.as_deref(),
+            );
             let mut size = serde_json::to_vec(&entry)?.len();
             // Leave room for the protocol envelope, including extra escaping
             // or wrapper bytes beyond the stored representation.
@@ -6861,10 +6904,56 @@ fn event(conn: &Connection, bot: &str, turn: Option<i64>, kind: &str, data: Valu
 /// Append an item. Stored history has no lifetime cap; the per-request
 /// context window is bounded separately. `turn` marks a turn's first item
 /// (its user prompt) and receives the next ordinal along the lineage.
-/// Put a turn's user item on the lineage and mark the bot busy with it.
-fn start_locked(tx: &Connection, bot: &Bot, turn: i64, prompt: &str) -> Result<Option<i64>> {
+/// Keep who sent a turn's prompt with the prompt's node, where it outlives
+/// the turn's row: a fork keeps it after its source is deleted. The sending
+/// bot's id is its id while the turn it wrote from still exists, so a later
+/// bot of that name is not taken for it.
+/// Keep who sent a turn's prompt with the node it became, and add the
+/// sender to `data`, the event that puts the node on the lineage.
+fn keep_sender(tx: &Connection, turn: i64, node: i64, data: &mut Value) -> Result<()> {
+    tx.prepare_cached(
+        "INSERT INTO senders(node,bot,bot_id,turn,origin)
+         SELECT ?2,t.from_bot,t.from_id,t.from_turn,t.origin
+         FROM turns t WHERE t.id=?1 AND (t.from_bot IS NOT NULL OR t.origin IS NOT NULL)
+         RETURNING bot,turn,bot_id,origin",
+    )?
+    .query_row(params![turn, node], |r| {
+        let (from, origin): (Option<String>, Option<String>) = (r.get(0)?, r.get(3)?);
+        let from = from.as_deref().zip(r.get::<_, Option<i64>>(1)?);
+        sender_fields(data, from, r.get(2)?, origin.as_deref());
+        Ok(())
+    })
+    .optional()?;
+    Ok(())
+}
+/// Who sent a prompt, as events and reads name it: another bot's turn, or
+/// what the submitting client called itself.
+fn sender_fields(
+    data: &mut Value,
+    from: Option<(&str, i64)>,
+    bot_id: Option<i64>,
+    origin: Option<&str>,
+) {
+    if let Some((bot, turn)) = from {
+        data["from"] = json!({"bot":bot,"turn":turn,"id":bot_id});
+    }
+    if let Some(origin) = origin {
+        data["origin"] = json!(origin);
+    }
+}
+/// Put a turn's user item on the lineage and mark the bot busy with it,
+/// adding who sent it to `data`, the turn's `accepted` event.
+fn start_locked(
+    tx: &Connection,
+    bot: &Bot,
+    turn: i64,
+    prompt: &str,
+    data: &mut Value,
+) -> Result<Option<i64>> {
     let item = bot.family()?.user_item(prompt)?;
     let head = node_with_turn(tx, bot.head, &item, Some(turn))?;
+    data["node"] = json!(head);
+    keep_sender(tx, turn, head, data)?;
     if prompt.len() >= PROMPT_SHARE_BYTES {
         tx.execute(
             "UPDATE turns SET status='running',started_ms=?,prompt='',prompt_node=? WHERE id=?",
@@ -7434,6 +7523,46 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
              WHERE waiting IS NOT NULL;",
         )?;
     }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='origin')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 40 -> 41: who sent a prompt is kept with its node, where it
+        // outlives the turn's row, with the sender's identity where its turn
+        // is still stored. A turn another bot wrote is found by its
+        // first node; a steer by the node it shares, or else the one its
+        // finish recorded. A steer whose events were pruned names no sender.
+        // A `steered` event names the steer's turn as `steer`, leaving `from`
+        // for its sender, which stored `steered` events gain as new ones carry
+        // it; a stored `accepted` or `queued` sender gains its identity.
+        conn.execute_batch(
+            "ALTER TABLE turns ADD COLUMN origin TEXT;
+             ALTER TABLE turns ADD COLUMN from_id INTEGER;
+             UPDATE turns SET from_id=(SELECT b.id FROM turns a JOIN bots b ON b.name=a.bot
+                WHERE a.id=turns.from_turn AND a.bot=turns.from_bot)
+             WHERE from_bot IS NOT NULL;
+             CREATE TABLE IF NOT EXISTS senders(node INTEGER PRIMARY KEY REFERENCES nodes(id),
+                bot TEXT, bot_id INTEGER, turn INTEGER, origin TEXT);
+             INSERT OR IGNORE INTO senders(node,bot,bot_id,turn)
+             SELECT n.id,t.from_bot,t.from_id,t.from_turn
+             FROM turns t JOIN nodes n ON n.id=COALESCE(t.prompt_node,
+                (SELECT m.id FROM nodes m WHERE m.turn=t.id),
+                (SELECT json_extract(e.data,'$.node') FROM events e
+                    WHERE e.turn=t.id AND e.kind='turn_finished'
+                    AND json_extract(e.data,'$.status')='steered'))
+             WHERE t.from_bot IS NOT NULL;
+             UPDATE events SET data=json_set(json_remove(data,'$.from'),'$.steer',json_extract(data,'$.from'))
+             WHERE kind='steered';
+             UPDATE events SET data=json_set(data,'$.from',
+                json_object('bot',t.from_bot,'turn',t.from_turn,'id',t.from_id))
+             FROM turns t WHERE events.kind='steered'
+                AND t.id=json_extract(events.data,'$.steer') AND t.from_bot IS NOT NULL;
+             UPDATE events SET data=json_set(data,'$.from.id',
+                (SELECT from_id FROM turns WHERE id=events.turn))
+             WHERE kind IN ('accepted','queued') AND json_type(data,'$.from')='object';",
+        )?;
+    }
     Ok(())
 }
 /// Keep the oldest and newest excerpts within the text/metadata budget.
@@ -7491,6 +7620,7 @@ fn prompt_entry(
     text: Option<String>,
     from: Option<String>,
     from_turn: Option<i64>,
+    origin: Option<String>,
     left: &mut usize,
 ) -> Value {
     let mut text = text.unwrap_or_default();
@@ -7501,6 +7631,8 @@ fn prompt_entry(
     }
     if let (Some(bot), Some(turn)) = (from, from_turn) {
         entry["from"] = json!({"bot":bot,"turn":turn});
+    } else if let Some(origin) = origin {
+        entry["origin"] = json!(origin);
     }
     entry
 }

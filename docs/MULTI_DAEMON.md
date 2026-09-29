@@ -265,7 +265,9 @@ without clearing another's state. A lost `wait` request must be reissued
 using its handle; replay cursors do not resume requests.
 
 Keep remote access on SSH-forwarded Unix sockets in a private directory.
-The operator starts remote daemons. A forwarded full-access socket grants
+The operator installs `agent` on the remote host; the desktop app starts its
+daemon there with that `agent start` over SSH and forwards the socket it
+names ([APP.md](APP.md#hosts-over-ssh)). A forwarded full-access socket grants
 the daemon user's tool authority. Cross-daemon creators/parents remain an
 explicitly unsupported relationship until their identity and routing
 contract exists; never resolve them by a same-named local bot.

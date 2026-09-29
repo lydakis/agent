@@ -556,6 +556,11 @@ class PromptReadTests(ModelFixture):
         # be one of that bot's.
         self.assertEqual(client.request('submit', bot='Bob', request_id='b', prompt='hi',
                                         **{'from': {'bot': 'Bob', 'turn': first + 99}})['error'], 'invalid_from')
+        # What sent a prompt when no bot's turn did is a name the client picks.
+        self.assertEqual(client.request('submit', bot='Bob', request_id='o', prompt='hi',
+                                        origin='not a name')['error'], 'invalid_origin')
+        self.assertEqual(client.request('submit', bot='Bob', request_id='both', prompt='hi',
+                                        origin='tasks', **{'from': {'bot': 'Bob', 'turn': first}})['error'], 'invalid_origin')
         second = client.request('submit', bot='Bob', request_id='c', prompt='done',
                                 **{'from': {'bot': 'Bob', 'turn': first}})['result']['turn']
         self.assertEqual(client.finished(second)['data']['status'], 'completed')
@@ -939,6 +944,19 @@ class AutoApproverTests(ModelFixture):
         request = self.judge.requests.get(timeout=5)['body']['state']['request']
         self.assertEqual(request, [{'by': 'person', 'text': 'delete the build directory'},
                                    {'by': 'model', 'text': 'shell:printf DANGER'}])
+
+    def test_a_message_a_client_sent_on_its_own_asks_for_nothing(self):
+        daemon = self.daemon()
+        self.approver(daemon)
+        # A scheduled message is no person's word: like a model's, it is shown but grants nothing.
+        for origin in ('tasks', 'schedule'):
+            turn = daemon.request('submit', bot='Bob', request_id=origin, prompt='shell:printf DANGER',
+                                  origin=origin)['result']['turn']
+            daemon.finished(turn)
+            request = self.judge.requests.get(timeout=5)['body']['state']['request']
+            self.assertEqual(request, [{'by': 'model', 'text': 'shell:printf DANGER'}])
+            self.assertEqual(daemon.request('prompts', bot='Bob', turn=turn)['result']['prompts'],
+                             [{'turn': turn, 'text': 'shell:printf DANGER', 'origin': origin}])
 
     def test_a_call_is_judged_with_the_files_it_runs_that_the_turn_wrote(self):
         def shell_danger(body, id):

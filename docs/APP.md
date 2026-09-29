@@ -45,6 +45,20 @@ build works in its own worktree: its branch follows its name in the head.
 
 ![build on its own branch, beside the lead](app/worktree.png)
 
+A message another agent sent shows who sent it where yours has `›`: the
+coordinator starting or steering a task, a task's answer, a swarm post. The
+name opens that agent beside the chat. The daemon records a prompt's author
+when a bot's turn sent it (`from`, which the CLI fills from `AGENT_BOT` and
+`AGENT_TURN`), and `history_items` returns it with each prompt, so a chat
+read back after a restart keeps the names. Messages the app sends on its own
+name their `origin` and are tagged with it: `tasks` for a coordinator's task
+updates and `schedule` for a scheduled message. The daemon keeps the sender
+with the message, so a fork keeps it after its source is deleted; the name
+links to the agent only while that name still holds the identity (`from.id`)
+that sent it.
+
+![A task's chat: the coordinator's messages tagged](app/agent-message.png)
+
 A side chat asked while the lead works: a fork beside it, the lead untouched.
 
 ![A side chat beside the running lead](app/side-chat.png)
@@ -141,6 +155,17 @@ of them reviewers, to halve the p99"). Its role tells it to run
 way the sheet does; the swarm shows under the project once its agents take
 their briefs.
 
+A coordinator hears when you work in a task it started: once it rests, one
+message lists the turns its tasks ended, and it passes on what another task
+needs.
+
+![A coordinator reads a task update and passes build's change on to test](app/coordinator-wake.png)
+
+Agents can be woken at set times. Settings lists the schedules, what each one
+last did, and the message it sends.
+
+![Schedules in Settings](app/settings-schedules.png)
+
 ## What the daemon speaks, and why the client speaks it directly
 
 The daemon's contract is JSONL over a Unix socket: requests with an `id`,
@@ -162,10 +187,12 @@ Two alternatives were considered for the client path and rejected for now:
   does; the JSON line protocol stays.
 
 Remote use needs no transport work either: the protocol assumes nothing about
-the stream, so `ssh -L` forwarding of the daemon's socket to a local one runs
-the app locally at full speed against a daemon elsewhere. The client is built
-to tolerate that latency anyway: one `follow *`, item loads pipelined per bot,
-nothing polled.
+the stream, so the daemon's socket forwarded over SSH to a local one serves a
+window exactly as a local socket does, with the link's latency added to each
+request. The app does that forwarding itself for a window on a host
+([Hosts over SSH](#hosts-over-ssh)). The client is built to tolerate that
+latency: one `follow *`, item loads pipelined per bot, nothing polled. Nothing
+has measured the app over a real network link yet.
 
 ## Shape
 
@@ -178,7 +205,8 @@ client/          agent-client: the socket protocol and the client policy
 ```
 
 - **Rust core** ([app/src-tauri/src/main.rs](../app/src-tauri/src/main.rs)) is a
-  transport. `setup` returns the socket, model and workspace defaults;
+  transport, with one attachment per window. `setup` returns the socket or
+  host, model and workspace defaults;
   `policy` composes the client policy for the workspace; `attach` connects
   and follows `*` from the page's cursor; `pull` hands the page the next
   batch of that session's notifications, at most 256, when it asks;
@@ -187,8 +215,12 @@ client/          agent-client: the socket protocol and the client policy
   [Setup](#setup-and-settings); and
   `project` and `write_project` read and write a folder's
   `.agents/project.toml` ([project.rs](../app/src-tauri/src/project.rs));
+  `hosts` lists `~/.ssh/config`'s hosts and `open_host` opens a window on one
+  ([remote.rs](../app/src-tauri/src/remote.rs));
   `policy` composes a folder's client policy, in a profile when named, and
-  falls back to the profiles the app ships for `coordinator`.
+  falls back to the profiles the app ships for `coordinator`;
+  `schedules` and `schedule_remove` list and remove
+  [schedules](#schedules) ([schedule.rs](../app/src-tauri/src/schedule.rs)).
   When nothing listens on a store's socket, `attach` starts a daemon first
   ([daemon.rs](../app/src-tauri/src/daemon.rs)); see
   [Installing](#installing).
@@ -203,12 +235,15 @@ client/          agent-client: the socket protocol and the client policy
   mutation queue, so a pending read cannot splice over a newer snapshot.
 - **Demo mode.** In a plain browser there is no Rust core, so `daemon.js`
   becomes a simulated daemon that emits the same protocol shapes and answers
-  `history_items`, `submit`, `create`, `fork`, `delete`, `interrupt`. A steer joins
-  the running turn at its next round boundary as a user message, and the
-  scripted reply acknowledges it. The scenario
+  `history_items`, `submit`, `create`, `fork`, `delete`, `interrupt`. A steer is
+  queued as its own turn and joins the running turn at its next round
+  boundary as a user message (`steered`), and the scripted reply
+  acknowledges it. The coordinator's tasks and swarm posts name the agent
+  that sent them, as the daemon's history does. The scenario
   plays on load in two projects: `demo.lead` thinks, starts a release build
   in the background, spawns its tasks plan, build and test, build spawns
-  review, and the coordinator waits on all of it. Serve `app/ui` with any
+  review, and the coordinator waits on all of it. A message to one of its
+  tasks brings the coordinator a task update it answers. Serve `app/ui` with any
   static server to work on the design without a daemon.
 
 ## Installing
@@ -309,7 +344,9 @@ cargo build --release -p agent-app
 ```
 
 Without `--workspace` the workspace is the launching directory, or home when
-that is `/`, as for a window opened from the Dock. Arguments and environment
+that is `/`, as for a window opened from the Dock. `--host ALIAS` opens the
+window on that SSH host instead ([Hosts over SSH](#hosts-over-ssh)), with
+`--workspace` then a path on the host. Arguments and environment
 are the CLI's: `--socket`, `--store`, `--workspace`, `AGENT_SOCKET`,
 `AGENT_STORE`, and a store's
 socket is resolved the way the CLI and the daemon resolve it (the shared
@@ -317,8 +354,14 @@ client crate's rendezvous), so a deep store path meets the same short socket.
 The page draws with the machine's own monospace face and fetches nothing.
 Closing the window is detaching; the daemon and its bots continue. The page
 remembers the thread on screen, the one beside it, the sidebar, folded
-projects, model picks and the steps fold per socket and workspace in the
-webview's local storage, and restores them on the next start. Send's queue or
+projects, model picks and the steps fold per store and workspace in the
+webview's local storage, and restores them on the next start. The store is
+the identity the daemon announces when the window attaches, so two hosts, or
+a host and this machine, never share what a window remembers, whatever socket
+reaches them. When the socket a window reattaches to answers with another
+store than before (the host's daemon replaced by one on another store), the
+window drops the last store's bots, threads and drafts and follows the new
+one from its start. Send's queue or
 steer pick is remembered for every window. If the daemon is unreachable or closes the session, the page shows why
 and retries every two seconds. Only one attachment runs at a time, including
 the snapshot pages. A connected peer must send its ready line within five seconds.
@@ -378,6 +421,155 @@ once when a window first attaches to a store with no agents. An
 `agent` the app did not bundle, or an explicit `--socket`, cannot be
 restarted, so Settings saves no provider change there and says why; it
 shows that daemon's providers instead of the ones this machine would start.
+
+## Hosts over SSH
+
+A window can attach to the daemon on a machine you reach over SSH, so long
+work runs there while the app runs here. Settings lists **Hosts**: the
+concrete `Host` aliases in `~/.ssh/config` (not patterns, negations, or
+`user@host`, which ssh reads as a user and a host), at most 1024 of them
+from at most 4 MiB of config across includes,
+following `Include` with a relative path from `~/.ssh`, a `~/` path, or
+wildcards in the last component only (an `Include` inside a `Host` or
+`Match` block is followed only under `Host *` or `Match all`; one that
+applies to some hosts is skipped), and beside each what `ssh -G` says it
+connects to. Words are split as OpenSSH splits them (either quote, and `\`
+escapes), and a line with an open quote, which OpenSSH rejects, names no
+host. The `ssh -G` answers run eight at a time, for the first 64 aliases.
+**Open window** opens a window on that host; `agent-app --host
+box` opens the first one there. The window's title names the host. Nothing
+about SSH is reimplemented: every connection is `ssh box` with your own
+config, keys and agent.
+
+Per host, the app owns one `ssh` process, a ControlMaster in the foreground
+with keepalives and no session. Its control socket and the forwarded daemon
+socket are in `~/.agent/hosts/`, made owner-only and named by a hash of the
+exact alias (so `Box` and `box` never share them on a case-insensitive
+disk), beside a lock only one app process may hold per host. Over that
+master the app runs `agent start` in the remote user's login shell
+(`exec "$SHELL" -l -i -c ...`, so the `agent` and provider keys a terminal
+there would have), which prints the daemon's ready line and the socket it
+answered on, then asks the master to forward that socket (`-O forward -L
+LOCAL:REMOTE`). The page's attach, cursor and pulls then run unchanged
+against the local socket. An attach tries the forward first; when the daemon
+or the link has gone, it runs `agent start` again, starting a new master
+first if the old one exited. A failure is not tried again for a backoff that
+doubles from one second to thirty, so a window retrying every two seconds
+does not open a connection each time. The daemon on the host keeps running
+when the app lets go of it.
+
+### Connection lifecycle
+
+Every process the app starts for a host is an `ssh` that leads a process
+group of its own. It has exactly one owner, which ends it, group and all, on
+every path. What OpenSSH starts under it (`Match exec`, `ProxyCommand`,
+`KnownHostsCommand`) is in its group. When the `ssh` exits, the rest of its
+group is killed before the `ssh` is reaped, so a group is signalled only
+while its id is still the app's.
+
+| Process | Owner | Ends when |
+| --- | --- | --- |
+| `ssh -G ALIAS` (Hosts list) | the list request | it answers, or after 5 s or 64 KiB of output |
+| `ssh -F none -G -o OPTION` (once per launch) | the first attach | it answers, or after 5 s |
+| The master (`-N`, `ControlMaster=yes`) | the host's link | the last window closes, the app quits, it prints over 1 MiB of errors in one second, or it exits (the next attach starts another) |
+| `agent start`, `agent shutdown` on the host | the attach or restart that ran it | it exits, or after 60 s or 1 MiB on stdout or stderr |
+| `-O forward`, `cancel`, `exit` to the master | the attach, close or cleanup that ran it | as above |
+
+The last window on a host closing sends SIGTERM to the master's group (ssh
+closes the connection and removes its control socket), then SIGKILL after
+two seconds, and removes the host's files, its lock last and while still
+held. Quitting ends every group still running, then closes every host
+concurrently under one three-second deadline, then kills what is left. An
+attach that finishes after its window closed starts nothing
+(`host_closed`). A crash leaves its groups running. On the next launch, the
+app sweeps `~/.agent/hosts/`. For each host whose lock no process holds, it
+asks a master still answering on the control socket to exit, waits until
+that master has removed its control socket itself, and removes the files.
+It never trusts or reuses any of them. The same retirement runs before any
+master starts, so an old master cannot remove a new one's socket on its way
+out. A lock file is taken only when it is still the file at its path, so two
+processes never hold locks on different files of one name.
+
+Every option the app depends on is forced on the command line, in one table
+in `remote.rs` (`FORCED`). OpenSSH keeps an option's first value, and the
+command line is read before any config, so `~/.ssh/config` cannot change
+them:
+
+| Option | Master | Exec | Why |
+| --- | --- | --- | --- |
+| `BatchMode=yes`, `ConnectTimeout=10` | yes | yes | no terminal to answer a prompt |
+| `LogLevel=ERROR` | yes | yes | reasons come from ssh's error lines; `QUIET` hides them |
+| `RequestTTY=no`, `RemoteCommand=none` | yes | yes | the command is the app's, with no terminal |
+| `ForkAfterAuthentication=no`, `ControlPersist=no` | yes | yes | the supervised ssh is the one doing the work; no master outlives it |
+| `ControlMaster=yes` / `no` | yes | no | one master per host; a command only uses it |
+| `SessionType=default` | no (`-N`) | yes | runs on a host kept for forwarding (`SessionType none`) |
+| `ClearAllForwardings=yes`, `Tunnel=no`, `ForwardAgent=no`, `ForwardX11=no` | yes | yes | a config's forwards cannot stop the master; the daemon inherits no agent or display |
+| `PermitLocalCommand=no`, `AddKeysToAgent=no` | yes | yes | no `LocalCommand` and no `ssh-askpass` here |
+| `ServerAliveInterval=15`, `ServerAliveCountMax=3` | yes | no | a dead link is noticed within a minute |
+| `ChannelTimeout=global=0 *=0` | yes | no | an idle forwarded connection is not closed |
+| `ExitOnForwardFailure=yes`, `StreamLocalBindUnlink=yes`, `StreamLocalBindMask=0177` | yes | no | the daemon's forward binds or fails, replaces a stale socket, and is owner-only |
+
+The control socket is always `-S`, which the command line also decides.
+`-O` requests read no config at all (`-F none`): a config's
+`ClearAllForwardings yes` would otherwise make `-O forward -L` succeed while
+creating no listener. Two caveats:
+
+- `StreamLocalBindMask` is last-value-wins in OpenSSH, so a config can loosen
+  it. The owner-only directory is what keeps other users out.
+- `ForkAfterAuthentication`, `SessionType` and `ChannelTimeout` are unknown to
+  OpenSSH before 8.7 (macOS 12 ships 8.6), which rejects them as bad options.
+  The app asks its `ssh` once which it knows and leaves out the ones it
+  doesn't; a config for that ssh cannot set them either.
+
+Not forced, as the user's own: how the host is reached (`ProxyCommand`,
+`ProxyJump`, `Match exec`, `KnownHostsCommand`), keys and agents, and
+environment (`SetEnv`, `SendEnv`). `StdinNull` and `EscapeChar` need
+nothing: stdin is `/dev/null` and there is no terminal. A `ProxyJump` host
+whose own config says `ControlPersist` backgrounds a master of the user's
+own with `setsid`. That master leaves the app's group and is not the app's
+to end.
+
+A path containing `%` or `$` is refused (`host_path_unusable`), because ssh
+expands both in control and forward paths. So is a remote socket with `:`
+or `%`.
+
+A window on a host never starts or replaces a daemon on this machine, and
+never signals a process on the host itself. What stops it says why:
+
+- No `agent` on the host's login PATH: `agent_missing`, which says to install
+  the Linux `agent` there (the app bundles a macOS one and copies nothing).
+- A refused login, an unknown host key, or an unreachable host:
+  `host_auth_failed` (load a key into ssh-agent so `ssh box` needs no
+  password), `host_key_unverified` (run `ssh box` once in a terminal), or
+  `host_unreachable`, each with ssh's own last line.
+- No provider there: `host_no_provider`; the host's daemon runs the providers
+  its login shell exports, and Settings shows them without offering a change.
+- Versions: the host's `agent start` prints the daemon's ready line even when
+  that `agent` refuses it. A daemon older than the app that the host's
+  `agent` refused is `daemon_older`, and **Restart the daemon** runs the
+  host's own `agent shutdown` (which stops an older daemon by the pid it
+  announced) and then `agent start`. A daemon the host's `agent` accepted but
+  that is older than the app means that `agent` is old: `host_agent_older`
+  says to install this version there. A newer one is `daemon_newer`.
+
+The app does not read a host's files yet, and never reads this machine's in
+their place. On a host window these are refused by name
+(`remote_unsupported`) rather than answered from this machine: composing
+instructions from AGENTS.md, skills and profiles (so `/new` and New project),
+a project's `.agents/project.toml`, the model list in `~/.agent/models`, the
+roles in `~/.agents/agents`, provider settings in `~/.agent/env`, and a
+folder's branch, which is not shown. Swarms stay on this machine: their board
+is the app's files and their agents run the app's scripts, so New swarm is
+disabled on a host. Chat, follow, steer, stop, fork, side chats and delete
+work on the host's bots, and a bot made there (`agent run --new --agents` in
+a shell on the host) shows in the window.
+
+Not built: reading a host's files (step 2, in [NEXT item
+41](NEXT.md)); an app-level heartbeat beyond SSH keepalives; `Include` with
+wildcards in a directory; a conditional `Include` (under a `Host` or
+`Match` that is not every host); a login shell that takes `-l` only alone
+(tcsh); ending what a crash left before the next launch (macOS has no
+parent-death signal for the master to follow).
 
 ## Projects and panes
 
@@ -644,6 +836,160 @@ and opens the app on it; prompt prefixes (`shell:`, `bg:`, `delegate:`,
 waits and pacing with no provider. `--no-app` prints the attach command
 instead.
 
+## Coordinators hear from their tasks
+
+Work goes on in the tasks a coordinator started, mostly by you working in
+them directly, and the coordinator should hear about it. The page already
+follows every bot, so it tells it; the daemon has no part in this beyond
+recording who asked for each turn (`from` on `accepted` and `queued`).
+A turn counts when it ends in a bot the project's `PROJECT.lead` created,
+unless the coordinator asked for it itself (its `from` names the lead) or
+the bot is the coordinator's own fork or side chat (`PROJECT.lead-…`). A
+steer's turn is part of the turn it joined. Turns replayed on attach are
+history, not news; one that ends live while the window is still reading the
+list of bots is held until the list says who made its bot, and dropped if the bot is
+deleted meanwhile or the window detaches first. A queued turn's
+`accepted` names its author again, so a window attached after the `queued`
+event was pruned still knows the coordinator asked for it. The coordinator is told only while it rests (nothing is armed while it
+works), at most
+once every ten minutes, in one message queued to it: `Task updates:`, then
+one line per task with its latest ended turn's handle and status, and how
+many turns ended before it since which handle. The handles are what its
+`wait` tool reads a final reply by, so the message stays small however much
+was said. The page keeps only that per task (first and latest turn, a
+count), so a long coordinator turn or a failing daemon cannot grow it. One
+message names at most 32 tasks; the rest wait for the next, and it says how
+many. The
+[coordinator role](../app/agents/coordinator.md) says what to do with it:
+send another task only what it needs, with `agent run --detach --delivery
+queue`, which it reads at its next turn without being interrupted, and
+otherwise answer in one line. A message that fails is kept for the next
+one, and one due while the window was detached goes out when it attaches
+again; a coordinator deleted, or gone when the window reattaches, has its
+dropped. The window must be open for it. The message's `request_id` is made
+from the coordinator's id and a hash of the newest turn of each task it
+covers, so two windows with the same news make one turn: the daemon answers
+the second with the first, or with `idempotency_conflict` when that window
+counted from an earlier turn, which it takes as told. A task deleted before
+its news goes out is dropped from it.
+
+## Schedules
+
+Listings return 64 schedules per page, with `next_after` for `schedule ls
+--after NAME` or the next page in Settings. Only the current page's messages
+are retained. `--every` waits at least one full interval before the first
+submission; calendar ticks before that earliest time do nothing. An implicit
+bot from an agent shell must still match `AGENT_BOT_ID`.
+
+Schedules are local to this machine. Remote windows neither list nor remove
+local schedules. Scheduled submissions carry `origin: "schedule"`; coordinator
+updates carry `origin: "tasks"`. Both are automated input, not human consent
+for the approver.
+
+A schedule wakes an agent at set times with a message: a new turn in its
+own conversation, never a new agent. launchd keeps the time, so a schedule
+fires with the app closed, and a time the Mac slept through fires once when
+it wakes (`StartCalendarInterval` coalesces missed times; `StartInterval`
+and cron skip them). The daemon has no clock for this.
+
+The app writes `~/.agent/schedule` each time it opens, a script that runs its
+executable with `--schedule`:
+
+```sh
+~/.agent/schedule add [--bot NAME] [--name NAME] (--every 30m | --in 45m | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY') -- MESSAGE
+~/.agent/schedule ls
+~/.agent/schedule rm NAME
+```
+
+`add` defaults to the agent whose shell runs it (`AGENT_BOT`), reaches that
+shell's daemon (starting it, as a fire does, when none answers), and pins
+the schedule to the bot's id and its daemon's store identity, with the
+store and socket paths made absolute. `--every` counts from the next whole
+minute in minutes that divide an hour, hours that divide a day, or `1d`;
+`--in` and `--at` are one-offs within a year, which remove themselves once
+fired (`--in` rounds up to the next whole minute, since launchd keeps
+minutes; `--at` refuses a part out of range or extra parts); `--cron` is read as cron reads it, a day or a weekday when both are
+given, up to 1,024 calendar entries. A message is at most 16 KiB. The serialized
+plist must also fit the 128 KiB record-read limit, including XML escaping; an
+oversized definition fails with `invalid_schedule` before changing a job or its
+saved plist. Narrow the cron expression or shorten the message. A schedule
+is named after its bot unless `--name` says otherwise, and one added under a
+name in use replaces it. A name differing from another only in case is
+refused (`name_taken`), since macOS folders would give both one file, and
+`rm` finds a schedule only by the name as stored.
+
+Each is one LaunchAgent, `~/Library/LaunchAgents/me.lydakis.agent.schedule.NAME.plist`,
+and that file is its only record: its program arguments carry the bot, its
+id, the store and the socket of the shell it was made from (an agent's shell
+has both), the store identity its daemon announced, the one-off's time and
+the message. A fire whose daemon announces another store (a reused socket)
+sends nothing and records `store_mismatch`. When it fires, the app's
+executable runs with `--schedule-fire` and those arguments. It connects to
+the daemon, and when none answers and the store is known, starts one for it
+on that socket as the app does, with the login shell's environment and
+`~/.agent/env`. A repeating schedule submits with `delivery: reject`: a bot
+that is working, or has work waiting, skips that time rather than having it
+cut in or pile up. A one-off submits with `delivery: queue`, so a working
+bot gets it after its turn. A bot deleted since, or a new bot under its
+name, is not reached (`bot_not_found`), and the schedule ends. A one-off's
+calendar entry has no year, so a fire more than two days before its time
+does nothing (the slack keeps a one-off whose Mac changed time zone since,
+since launchd follows the new zone's clock), and one more than half a year
+after it is that entry's next year: it sends nothing and ends as `missed`.
+What the fire did (`sent` with the turn, `skipped`, `gone`, `missed` or
+`failed` with why) is kept with the schedule's row in
+`~/.agent/schedules/NAME.json`, which Settings shows beside each schedule
+with its message and a Remove button.
+
+A schedule's state is three things: its plist, launchd's loaded copy, and
+that last result. Every change keeps them either whole or as they were, and
+anything else a failure can leave is listed and removable:
+
+- **Adding** writes the plist and loads it. A load launchd refuses removes
+  the plist again.
+- **Replacing** (a name in use) unloads the old job, writes the new plist
+  and loads it. Each installation has a generation ID. The previous result
+  stays on disk until the next fire replaces it; listing only shows a result
+  from the current generation, so an interrupted replacement loses no result. An old job launchd will not
+  unload, an old plist that cannot be read (it could not be put back) refuses the replacement before
+  anything changes. A new plist that cannot be written or loaded puts the
+  old plist back and loads it; if launchd refuses that too, the
+  old plist is listed and loads at the next login.
+- **Firing** records its result and ends a schedule that is over, both
+  under the lock and only while the plist is still the one it fired for: a
+  schedule replaced or removed while its message went out is left as it now
+  is. A one-off that delivered leaves nothing. One that ends without
+  delivering (its agent gone, the daemon unreachable, `missed`) loses its
+  plist but keeps its last result, so Settings and `ls` list it as not
+  delivered, and why, until it is removed. When that result cannot be
+  written, the plist stays, listed, rather than ending with no trace. The
+  plist goes before the unload, since the unload ends the fire's own
+  process; a plist that cannot be deleted keeps its job loaded, and an
+  unload launchd refuses writes the plist and the result back, so either
+  stays listed with what its fire did. A
+  job left loaded after its plist went (an end cut short) is unloaded by
+  its next fire.
+- **Removing** unloads the job by its label whether or not its plist is
+  there, then deletes the plist and the last result, so it reaches an
+  ended row, a plist launchd no longer has, and a job loaded without its
+  plist alike. An unload launchd refuses keeps everything, to be tried
+  again.
+- **Listing** shows a one-off still there two days after its time as
+  `missed: true` (launchd did not run it, as when the Mac was off, or its
+  end was cut short), and a plist that cannot be read as a row with its
+  `problem`, which `rm` removes.
+
+The files are written, synced, renamed and their folder synced; deletions
+sync their folder too. `add`, `rm`, a fire's result and end, and the app's
+refresh take a lock (`~/.agent/schedules/.lock`) around their changes, and
+the refresh reads each plist again under it. `~/.agent/schedule` is written with its
+executable mode from the start. When the
+app starts from a new place, as after an update, it writes its path into
+every schedule and loads it again, on a thread of its own so the window does
+not wait; one launchd refuses keeps its old path and is tried again at the
+next start. Settings lists schedules also when no project exists. Only macOS has launchd; elsewhere `add`
+refuses with `schedules_unsupported`.
+
 ## What it costs, and where the bounds are
 
 The UI bounds payload buffering, history decoding, and rendered fleet rows:
@@ -764,10 +1110,38 @@ only 90%, each once, counting a helper's tokens. The council was also
 driven in demo mode: roles, two proposals, one approved by the seats, a
 stream two more agents joined, and the other left open for you.
 
+On 2026-09-29 the host connection ran against real OpenSSH 9.6 on Linux,
+with `sshd` on the same machine and a synthetic account holding a release
+`agent`: an unknown host key, a refused key, no `agent` on PATH and no
+provider each gave their reason; then the master connected, `agent start`
+ran in the login shell and named the socket and home, the forward carried a
+`bots` request, a killed master was replaced on the next connect, a daemon
+shut down on the host was started again through the same forward, and
+closing removed the control and forwarded sockets. The Tauri crate built and
+its tests ran on Linux; the macOS app was not run, so no window on a host has
+been seen by eye.
+
 On 2026-09-27 the shell was driven in demo mode in headless Chromium:
 projects and tasks in the sidebar, a card opened beside and swapped, the three
 menus, fork, confirmed delete, folding and a new project, with no page errors.
 A task's runs rendered while it worked matched a full redraw of the same pane.
+
+On 2026-09-29 (Linux container) a schedule's fire ran against a real daemon
+in `tests/test_schedule.py`: it sent its message to its resting bot as a new
+turn, skipped the bot while a turn held it, gave a one-off to a working bot
+after its turn, started a stopped daemon on the socket the schedule was made
+with, ended with a visible row when its bot was made again under the same
+name, and did nothing a year early; `add` from an agent's shell was refused
+without launchd and left no plist. The plist, calendar expansion and the
+app's move are tested in `app/src-tauri/src/schedule.rs`, and so is each
+lifecycle step above against a stand-in launchd that tracks which labels
+are loaded and refuses loads and unloads on demand: after every refusal the
+plist, the loaded job and the last result are checked together. The coordinator's
+task updates are tested in `app/tests/state.test.cjs` and were driven in demo
+mode in headless Chromium. The real-launchd test passed on a Mac (2026-09-29, at 2e484ed): launchd
+fired the one-off at its minute and it ended itself; replace, `rm` of a
+plist launchd had dropped, `rm` of a job without its plist, and a last `rm`
+answering `schedule_not_found` all held.
 
 ## Next
 
@@ -779,6 +1153,10 @@ A task's runs rendered while it worked matched a full redraw of the same pane.
    the cask is uninstalled; the uninstall hook stops only the default one.
 4. The rest of the projects design (the "Agent App Concepts" prototype), in
    the order [NEXT item 47](NEXT.md) gives.
+5. Remote workspace reads, step 2 of [Hosts over SSH](#hosts-over-ssh):
+   the client library's reads (policy compose, project file, branch, model
+   list) as `agent` subcommands that print JSON, run over the host's
+   ControlMaster, so `/new`, New project and branches work on a host.
 
 ## Regression checks
 
@@ -797,9 +1175,39 @@ fork naming and placement, side chats (a running source, the allowed list,
 the first message going to the copy), a worktree bot's branch in its head,
 project creation (no file for a refused model),
 steers pinned to their turn, model picks pinned to identity, the demo
-daemon's steer delivery, and runs folded with failures on their line.
+daemon's steer delivery, a message's sender (another agent's, live, steered
+in, queued and read back, unlinked once its name holds a new agent, and the
+app's own task updates and schedules by origin), and runs
+folded with failures on their line. Also covers coordinator task updates: batched at rest, excluding requested and replayed turns, retained after send failures.
 `cargo test -p agent-app` includes a failed project-file write leaving
-neither a partial file nor a temporary.
+neither a partial file nor a temporary, and schedules' calendars, plists,
+move, and each lifecycle step with launchd refusing. With `AGENT_TEST_RUNTIME=1` after a release build
+and `cargo build -p agent-app`, `python3 -m unittest tests.test_schedule`
+fires schedules against a real daemon; on a Mac, `AGENT_TEST_LAUNCHD=1`
+adds its one launchd test, which loads real jobs (under a scratch `HOME`, so
+nothing loads at the next login) and checks that launchd fires a one-off,
+which ends itself, and that replace and `rm` work on real jobs.
+App tests also cover hosts over SSH against a stand-in
+`ssh` that runs the remote command here and forwards by linking: `~/.ssh/config`
+aliases, includes and quoting, `ssh -G` read to its bound, the ssh arguments, `agent start`'s answers, attaching
+through the master and again after it is killed, a host printing without end
+cut off at 1 MiB, an `ssh -G` cut off with what it started, a refused login and a
+missing `agent` reported and backed off, an older daemon replaced through the
+host's own `agent shutdown`, one app process per host, a window on a host
+never starting a local daemon, and the connection lifecycle: after opening, a
+master killed from outside, a store replaced, the last window closing and
+quitting, the process table and `~/.agent/hosts/` hold only what that step
+leaves; a crash's master is retired, and its files swept, by the next launch;
+quitting closes every host at once; a master flooding its stderr, and an ssh
+that times out or exits, end with their groups. Discovery bounds cumulative directory entries as well as bytes, and discards
+truncated config lines. Option probes only omit explicitly unknown options;
+other failures are retried instead of cached. Stale hosts retire with bounded
+concurrency under one deadline. A test runs the real `ssh -G`
+with a config that sets the opposite of every forced option and checks each
+still takes effect. `a_real_hosts_connection_leaves_nothing_behind`
+(ignored; `AGENT_TEST_SSH_HOST`) runs the same lifecycle against a real host. The page tests cover saved state keyed by
+store, another store answering on reattach followed from its start (with
+the new host's home replacing the last one's), a host window's home and what it leaves out, and the Hosts list.
 `cargo test --workspace` includes the silent-listener readiness deadline,
 fork workspace parity between durable records, live events, and replay, and
 the app's policy errors for oversized and unreadable AGENTS.md files.
@@ -812,7 +1220,7 @@ This measures the ancestry-walk reduction, not an end-to-end fleet capacity clai
 Pulled event batches apply in order, with one visible-history load and render
 per batch. Creation/fork bursts rebuild the fleet tree at most once per pull,
 while retaining the 300-row rail window. The shared client rejects a ready
-handshake unless its protocol is exactly `agent_client::PROTOCOL`, now 4.
+handshake unless its protocol is exactly `agent_client::PROTOCOL`, now 5.
 
 The lifecycle regression suite compares committed thinking/answer transcripts
 between live delivery and replay, reconciles fork snapshot/replay ordering,

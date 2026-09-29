@@ -123,7 +123,13 @@ return arrays. `interrupt` and `shutdown` return no stdout on success.
 `shutdown` returns once the daemon process has exited and its store is closed.
 `shutdown --grace SECONDS` first lets running turns finish for up to that long
 while starting none; turns still running then end `interrupted` with
-`daemon_shutdown`.
+`daemon_shutdown`. A daemon whose ready line announces an older protocol than
+this `agent`'s cannot be asked in this protocol, so `shutdown` sends SIGTERM to
+the process that ready line names (a process already gone counts as stopped)
+and waits for it the same way: its running
+turns end interrupted and the store keeps every chat. That is how an upgrade on
+a machine replaces the daemon an older `agent` started. A newer daemon is left
+running and `shutdown` fails with `daemon_protocol_mismatch`.
 
 `--pretty` is an explicit human view: rendered streams, tables for lists, and
 indented JSON for other results, including detached submission handles. It is
@@ -153,7 +159,13 @@ wins; otherwise `AGENT_SOCKET` applies unless `--store` was explicit. Without a
 socket override, the socket is derived from the selected store.
 
 `run` may start the daemon. `start` starts it if none is running, with the
-same startup as `run`, and prints the running daemon's ready line. `stats`,
+same startup as `run`, and prints the running daemon's ready line with
+`socket`, the absolute path it answered on, added; a caller that ran `start` over SSH
+forwards that path. A socket path that is not UTF-8, which the ready line
+cannot carry, is refused before anything starts (`socket_path_unsupported`). When the daemon holding the socket speaks another
+protocol, `start` still prints its ready line and then fails with
+`daemon_protocol_mismatch`, so a caller can tell an older daemon from a newer
+one. `stats`,
 `turns`, `rm`, `prune`, `approvals`, and `answer` may restart it only for an
 existing store. These commands accept the startup
 provider/limit flags shown in help and `--no-spawn` to require an

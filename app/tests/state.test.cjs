@@ -33,10 +33,12 @@ function page(daemon = {}, storage = null) {
   });
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
+// A turn that ran ended: a steer finishes too, as its own turn taken into another.
+const ended = (e) => e.event === 'turn_finished' && e.data?.status !== 'steered';
 const settle = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
 
@@ -541,6 +543,25 @@ test('snapshot reconciliation cannot splice over an in-flight history page', asy
   assert.deepEqual(Array.from(ids).sort((a,b)=>a-b),Array.from({length:10},(_,i)=>i+1));
 });
 
+test('a task that ends live before the snapshot names its creator still reaches the coordinator', async () => {
+  const snapshot=deferred();let firstPull=true;
+  const base=historyDaemon();
+  const p=page({setup:async()=>({}),attach:async()=>({session:2}),
+    pull:()=>{if(firstPull){firstPull=false;return Promise.resolve({events:[{event:'follow_live'},{event:'turn_finished',bot:'demo.build',turn:4,data:{status:'completed'}}]});}return new Promise(()=>{});},
+    request:async(op,q)=>op==='bots'?snapshot.promise:base.request(op,q)});
+  p.setRender(() => {});
+  p.S.session=1;p.lost('offline');
+  const attaching=p.attach();await settle();
+  assert.equal(p.S.live,true);assert.equal(p.S.wakes.size,0,'no creator known yet');
+  snapshot.resolve({bots:[{name:'demo.lead',id:1,provider:'openai',model:'m'},{name:'demo.build',id:2,provider:'openai',model:'m',created_by:'demo.lead',created_by_id:1}],next_after:null});
+  await attaching;
+  assert.deepEqual({...p.S.wakes.get('demo.lead').tasks.get('demo.build')},{first:4,turn:4,status:'completed',count:1});
+  assert.equal(p.S.heldNews.length,0);
+  // News held for a bot deleted meanwhile is not a later same-named bot's.
+  p.S.heldNews.push(['demo.build',5,'completed',undefined]);p.forgetBot('demo.build');
+  assert.equal(p.S.heldNews.length,0);
+});
+
 test('submissions wait for a known bot identity instead of sending an unpinned name', async () => {
   const sent=[];const p=page({request:async(op,q)=>{sent.push([op,q]);}});
   p.S.session=1;p.S.config={workspace:'/synthetic'};
@@ -598,7 +619,7 @@ test('completed Responses and Anthropic thoughts retain observed thinking durati
 });
 
 // ---------- the app shell: projects, panes, composers, menus, runs ----------
-const shell = (daemon = {}, storage = null) => { const p = page(daemon, storage); p.setRender(() => {}); p.S.session = 1; p.S.config = { workspace: '/synthetic', model: 'alpha/one', tools: [] }; return p; };
+const shell = (daemon = {}, storage = null) => { const p = page(daemon, storage); p.setRender(() => {}); p.S.session = 1; p.S.store = 'store-1'; p.S.config = { workspace: '/synthetic', model: 'alpha/one', tools: [] }; return p; };
 // A window whose renders move drafts, as the real render does.
 const drafting = (daemon = {}) => { const p = shell(daemon); p.setRender(() => p.followDrafts()); return p; };
 const names = (rows) => Array.from(rows, (r) => r.label ?? r.b.name);
@@ -945,14 +966,17 @@ test('the demo daemon delivers a steer at the next round boundary and refuses a 
   await assert.rejects(d.request('submit', { bot: 'solo', prompt: 'x', delivery: 'steer', expected_turn: turn + 1 }), /stale_turn/);
   await d.request('submit', { bot: 'solo', prompt: 'mention the wait op too', delivery: 'steer', expected_turn: turn });
   const events = [];
-  while (!events.some((e) => e.event === 'turn_finished')) events.push(...(await d.pull()).events);
-  const nodes = events.filter((e) => e.event === 'message').map((e) => e.data.node);
+  while (!events.some(ended)) events.push(...(await d.pull()).events);
+  const nodes = events.filter((e) => e.event === 'message' || e.event === 'steered').map((e) => e.data.node);
   const { items: read } = await d.request('history_items', { bot: 'solo', nodes });
   const items = read.map((entry) => entry.item);
   const user = items.findIndex((i) => i.role === 'user');
   assert.equal(items[user].content[0].text, 'mention the wait op too');
   assert.match(items[user + 1].content[0].text, /^Noted: mention the wait op too\./);
-  assert.equal(events.filter((e) => e.event === 'turn_finished').length, 1, 'the steer joined the running turn');
+  assert.equal(events.filter(ended).length, 1, 'the steer joined the running turn');
+  const steer = events.find((e) => e.event === 'queued');
+  assert.equal(steer.data.delivery, 'steer');
+  assert.deepEqual(events.filter((e) => e.event === 'turn_finished' && e.turn === steer.turn).map((e) => [e.data.status, e.data.into]), [['steered', turn]]);
   d.close();
 });
 
@@ -1033,7 +1057,7 @@ test('the demo daemon answers as a side chat only for a fork nested under its so
   const texts = async (bot) => {
     await d.request('submit', { bot, prompt: 'run the tests', delivery: 'reject' });
     const events = [];
-    while (!events.some((e) => e.event === 'turn_finished' && e.bot === bot)) events.push(...(await d.pull()).events);
+    while (!events.some((e) => ended(e) && e.bot === bot)) events.push(...(await d.pull()).events);
     return events.filter((e) => e.bot === bot && e.event === 'tool_started').map((e) => e.data.name);
   };
   try {
@@ -1432,12 +1456,12 @@ test('the demo daemon\'s swarm: agents post, working ones hear it, and an idle o
   assert.equal(sw.workspace, '~/.agent/worktrees/demo.latency');
   // Their briefs start them; the swarm is quiet again once both are done.
   const done = new Set();
-  while (done.size < 2) for (const e of (await d.pull()).events) if (e.event === 'turn_finished') done.add(e.bot);
+  while (done.size < 2) for (const e of (await d.pull()).events) if (ended(e)) done.add(e.bot);
   const before = (await d.swarmBoard('demo.latency', null)).lines.length;
   // Your post naming nobody wakes both; one naming latency-2 wakes only it.
   await d.swarmPost('demo.latency', '@latency-2 look at fsync');
   const events = [];
-  while (!events.some((e) => e.event === 'turn_finished')) events.push(...(await d.pull()).events);
+  while (!events.some(ended)) events.push(...(await d.pull()).events);
   assert.deepEqual([...new Set(events.filter((e) => e.event === 'accepted').map((e) => e.bot))], ['demo.latency-2']);
   const board = (await d.swarmBoard('demo.latency', null)).lines.slice(before);
   assert.deepEqual(Array.from(board, (l) => l.from), ['user', 'latency-2']);
@@ -1453,7 +1477,7 @@ test('the demo daemon\'s council opens a stream by the seats\' majority and leav
   const { swarm: sw } = await d.swarmStart({ project: 'demo', folder: '/workspace', goal: 'Halve p99 latency.', shared: true, mix: [{ identity: '', model: 'alpha/one', share: 100 }], agents: 4, budgetTokens: 1000, council: 3 });
   assert.deepEqual([sw.council, Array.from(sw.seats)], [3, names.slice(0, 3)]);
   const done = new Set();
-  while (done.size < 4) for (const e of (await d.pull()).events) if (e.event === 'turn_finished') done.add(e.bot);
+  while (done.size < 4) for (const e of (await d.pull()).events) if (ended(e)) done.add(e.bot);
   const { state, lines } = await d.swarmBoard('demo.latency', null);
   assert.deepEqual(state.proposals.map((p) => [p.id, p.stream, p.status]), [['P1', 'conn-pool', 'approved'], ['P2', 'batch-commits', 'open']]);
   assert.deepEqual({ ...state.streams }, { 'latency-1': 'conn-pool', 'latency-2': 'conn-pool', 'latency-4': 'conn-pool' });
@@ -1863,4 +1887,353 @@ test('an older daemon on the socket is replaced from the detached screen; a newe
   p.lost('daemon_protocol_mismatch: the daemon speaks protocol "4", this client 4');
   assert.doesNotMatch(screen.innerHTML, /replace-daemon|update the app/);
   assert.match(screen.innerHTML, /· retrying/);
+});
+
+test('a message another agent sent names its sender, live, steered in, and read back from history', async () => {
+  const items = { 1: { role: 'user', content: [{ type: 'input_text', text: 'fix the login bug' }] }, 2: { role: 'user', content: [{ type: 'input_text', text: 'also check the refresh path' }] },
+    3: { role: 'user', content: [{ type: 'input_text', text: 'what changed?' }] }, 4: { role: 'user', content: [{ type: 'input_text', text: 'then the docs' }] } };
+  // The daemon names who sent each prompt with its item: the bot, its turn, and the identity its name held.
+  const lead = (turn) => ({ from: { bot: 'demo.lead', turn, id: 1 } });
+  const sent = { 1: lead(4), 2: lead(5), 4: lead(6) };
+  const batch = async ({ nodes }) => ({ items: nodes.map((node) => ({ node, item: items[node], ...sent[node] })) });
+  const history = async (op) => {
+    if (op === 'history_nodes') return { nodes: [{ node: 4, turn: 10 }, { node: 3, turn: 9 }, { node: 2, turn: 7 }, { node: 1, turn: 7 }], next_from: null, next_newer: null };
+    throw new Error(op);
+  };
+  const p = page({ request: history, batch });
+  p.upsert({ name: 'demo.lead', id: 1 }); p.upsert({ name: 'demo.build', id: 2, created_by: 'demo.lead', created_by_id: 1 }); p.tree();
+  // The coordinator starts a task, then steers a second message into its running turn; you ask
+  // something; a third message from it waits in line and starts later. Each event that puts a
+  // prompt on the lineage names its sender, in the order the store writes them.
+  await p.onEvent({ event: 'accepted', bot: 'demo.build', turn: 7, data: { node: 1, ...lead(4) } });
+  await p.onEvent({ event: 'queued', bot: 'demo.build', turn: 8, data: { delivery: 'steer', ...lead(5) } });
+  // The store finishes the steer's own turn first, then its message joins the running turn.
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 8, data: { status: 'steered', into: 7, node: 2 } });
+  await p.onEvent({ event: 'steered', bot: 'demo.build', turn: 7, data: { steer: 8, node: 2, ...lead(5) } });
+  await p.onEvent({ event: 'accepted', bot: 'demo.build', turn: 9, data: { node: 3 } });
+  await p.onEvent({ event: 'queued', bot: 'demo.build', turn: 10, data: { delivery: 'queue', ...lead(6) } });
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 9, data: { status: 'completed' } });
+  await p.onEvent({ event: 'accepted', bot: 'demo.build', turn: 10, data: { node: 4, ...lead(6) } });
+  const t = p.transcript('demo.build');
+  // Live, before any history read: each prompt already knows its sender.
+  assert.equal(JSON.stringify([1, 2, 4].map((node) => t.items.find((it) => it.node === node)?.by)), JSON.stringify([lead(4).from, lead(5).from, lead(6).from]));
+  await p.loadBatch('demo.build');
+  const html = p.itemsHTML(t);
+  assert.equal((html.match(/class="line user agent"><button type="button" class="by" data-task="demo.lead"[^>]*>coordinator<\/button> /g) || []).length, 3, html);
+  assert.match(html, /coordinator<\/button> also check the refresh path/);
+  assert.match(html, /coordinator<\/button> then the docs/);
+  assert.match(html, /<div class="line user">› what changed\?<\/div>/, 'yours keep their mark');
+  // Read back from the daemon's history, as after a restart.
+  const q = page({ request: history, batch });
+  q.upsert({ name: 'demo.lead', id: 1 }); q.tree();
+  const r = q.transcript('demo.build'); r.items = [{ kind: 'history', next: 4, seed: true }]; r.history = r.items[0]; r.seed = r.items[0];
+  await q.load('demo.build');
+  const read = q.itemsHTML(r);
+  assert.equal((read.match(/class="by" data-task="demo.lead"/g) || []).length, 3, read);
+  assert.match(read, /› what changed\?/);
+  // A new agent under the sender's name is not who sent them: the tag stays, with no link to it.
+  const u = page({ request: history, batch });
+  u.upsert({ name: 'demo.lead', id: 5 }); u.tree();
+  const v = u.transcript('demo.build'); v.items = [{ kind: 'history', next: 4, seed: true }]; v.history = v.items[0]; v.seed = v.items[0];
+  await u.load('demo.build');
+  const reused = u.itemsHTML(v);
+  assert.doesNotMatch(reused, /data-task="demo.lead"/);
+  assert.equal((reused.match(/<span class="by" title="Sent by demo.lead, turn \d, since deleted">coordinator<\/span>/g) || []).length, 3, reused);
+});
+
+test('the app\'s own task updates and scheduled messages are tagged by the origin it sent them with', async () => {
+  const items = { 1: { role: 'user', content: [{ type: 'input_text', text: 'Task updates: build ended' }] }, 2: { role: 'user', content: [{ type: 'input_text', text: 'check the nightly run' }] },
+    3: { role: 'user', content: [{ type: 'input_text', text: 'thanks' }] } };
+  const origins = { 1: { origin: 'tasks' }, 2: { origin: 'schedule' } };
+  const p = page({ request: async (op) => {
+    if (op === 'history_nodes') return { nodes: [{ node: 3, turn: 3 }, { node: 2, turn: 2 }, { node: 1, turn: 1 }], next_from: null, next_newer: null };
+    throw new Error(op);
+  }, batch: async ({ nodes }) => ({ items: nodes.map((node) => ({ node, item: items[node], ...origins[node] })) }) });
+  const t = p.transcript('demo.lead'); t.items = [{ kind: 'history', next: 3, seed: true }]; t.history = t.items[0]; t.seed = t.items[0];
+  await p.load('demo.lead');
+  let html = p.itemsHTML(t);
+  assert.match(html, /<span class="by">tasks<\/span> Task updates: build ended/);
+  assert.match(html, /<span class="by">schedule<\/span> check the nightly run/);
+  assert.match(html, /<div class="line user">› thanks<\/div>/);
+  // Live, the origin comes with the turn's start.
+  const q = page({ request: async (op, r) => items[r.node] });
+  await q.onEvent({ event: 'accepted', bot: 'demo.lead', turn: 2, data: { node: 2, origin: 'schedule' } });
+  await q.loadBatch('demo.lead');
+  assert.match(q.itemsHTML(q.transcript('demo.lead')), /<span class="by">schedule<\/span> check the nightly run/);
+});
+
+test('a coordinator hears once, when it rests, of turns its tasks ended that it did not ask for', async () => {
+  const sent = [];
+  const p = page({ request: async (op, params) => { if (op === 'submit') sent.push(params); return { turn: 9 }; }, log() {} });
+  p.S.live = true; p.S.attached = true;
+  p.upsert({ name: 'demo.lead', id: 1, status: 'idle' });
+  for (const [name, id] of [['demo.build', 2], ['demo.test', 3], ['demo.lead-side', 4]]) p.upsert({ name, id, status: 'idle', created_by: 'demo.lead', created_by_id: 1 });
+  p.upsert({ name: 'demo.build.helper', id: 5, status: 'idle', created_by: 'demo.build', created_by_id: 2 });
+  const turn = async (bot, n, status = 'completed', from = null) => {
+    await p.onEvent({ event: 'accepted', bot, turn: n, data: { node: 1, ...(from ? { from: { bot: from, turn: 1 } } : {}) } });
+    await p.onEvent({ event: 'turn_finished', bot, turn: n, data: { status } });
+  };
+  await turn('demo.build', 1, 'completed', 'demo.lead'); // the coordinator's own ask
+  await turn('demo.lead-side', 1); // a side chat of the coordinator
+  await turn('demo.build.helper', 1); // not the coordinator's task
+  await p.tick();
+  assert.equal(sent.length, 0);
+  // You, working in two tasks; one turn was a steer that joined another.
+  await turn('demo.build', 2);
+  await turn('demo.build', 3, 'steered');
+  await turn('demo.test', 1, 'failed');
+  await turn('demo.build', 4, 'completed', 'demo.test');
+  assert.equal(p.S.turnFrom.size, 0, 'authors are forgotten as turns end');
+  await p.tick();
+  assert.equal(sent.length, 1, 'one message for the whole batch');
+  assert.equal(sent[0].bot, 'demo.lead'); assert.equal(sent[0].bot_id, 1); assert.equal(sent[0].delivery, 'queue'); assert.equal(sent[0].origin, 'tasks');
+  assert.match(sent[0].prompt, /^Task updates: /);
+  assert.match(sent[0].prompt, /\n- demo\.build: turn:demo\.build\/4 completed, and 1 earlier since turn:demo\.build\/2\n- demo\.test: turn:demo\.test\/1 failed$/);
+  // Within the window, while it works: nothing until its turn ends and the window allows.
+  p.S.bots.get('demo.lead').status = 'running';
+  await turn('demo.test', 2);
+  await p.tick();
+  assert.equal(sent.length, 1);
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.lead', turn: 7, data: { status: 'completed' } });
+  await p.tick();
+  assert.equal(sent.length, 2);
+  assert.match(sent[1].prompt, /\n- demo\.test: turn:demo\.test\/2 completed$/);
+  // Nothing new: nothing sent. A deleted coordinator hears nothing more.
+  await p.tick();
+  assert.equal(sent.length, 2);
+  await p.onEvent({ event: 'deleted', bot: 'demo.lead' });
+  await turn('demo.test', 3);
+  await p.tick();
+  assert.equal(sent.length, 2);
+});
+
+test('a coordinator wake that fails is kept for the next one, and replayed turns are not news', async () => {
+  let fail = true; const sent = [];
+  const p = page({ request: async (op, params) => { if (op === 'submit') { if (fail) throw new Error('daemon_draining'); sent.push(params); } return {}; }, log() {} });
+  p.S.attached = true;
+  p.upsert({ name: 'demo.lead', id: 1, status: 'idle' });
+  p.upsert({ name: 'demo.build', id: 2, status: 'idle', created_by: 'demo.lead', created_by_id: 1 });
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 1, data: { status: 'completed' } });
+  await p.tick();
+  assert.equal(p.S.wakes.size, 0, 'the replay is history, not news');
+  p.S.live = true;
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 2, data: { status: 'completed' } });
+  await p.tick();
+  assert.equal(sent.length, 0);
+  fail = false;
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 3, data: { status: 'completed' } });
+  await p.tick();
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].prompt, /turn:demo\.build\/3 completed, and 1 earlier since turn:demo\.build\/2$/);
+});
+
+test('two windows telling a coordinator the same news make one turn, and a bot gone while detached leaves nothing behind', async () => {
+  // One window attached earlier and also saw turn 2; both have turn 3 as the newest.
+  const told = new Map(), asked = [];
+  const submit = async (op, params) => {
+    if (op !== 'submit') return {};
+    asked.push(params.request_id);
+    if (told.has(params.request_id) && told.get(params.request_id) !== params.prompt) throw new Error('idempotency_conflict: ');
+    told.set(params.request_id, params.prompt); return {};
+  };
+  const pages = [0, 1].map(() => page({ request: submit, log() {} }));
+  for (const [i, p] of pages.entries()) {
+    p.S.live = true; p.S.attached = true;
+    p.upsert({ name: 'demo.lead', id: 1, status: 'running' });
+    p.upsert({ name: 'demo.build', id: 2, status: 'idle', created_by: 'demo.lead', created_by_id: 1 });
+    for (const turn of i === 0 ? [2, 3] : [3]) await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn, data: { status: 'completed' } });
+  }
+  for (const p of pages) { await p.onEvent({ event: 'turn_finished', bot: 'demo.lead', turn: 5, data: { status: 'completed' } }); await p.tick(); }
+  assert.equal(asked.length, 2);
+  assert.equal(asked[0], asked[1]);
+  assert.match(asked[0], /^app-wake-1-[0-9a-f]{16}$/);
+  assert.equal(told.size, 1, 'one turn');
+  assert.equal(pages[1].S.wakes.get('demo.lead').tasks.size, 0, 'the refused window does not try again');
+  const [p] = pages;
+  // A task deleted before its news goes out is no news.
+  p.upsert({ name: 'demo.test', id: 3, status: 'idle', created_by: 'demo.lead', created_by_id: 1 });
+  p.S.bots.get('demo.lead').status = 'running';
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.test', turn: 1, data: { status: 'completed' } });
+  assert.equal(p.S.wakes.get('demo.lead').tasks.size, 1);
+  p.forgetBot('demo.test');
+  assert.equal(p.S.wakes.get('demo.lead').tasks.size, 0);
+  await p.onEvent({ event: 'queued', bot: 'demo.lead', turn: 9, data: { from: { bot: 'demo.build', turn: 3 } } });
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 4, data: { status: 'completed' } });
+  assert.equal(p.S.turnFrom.size, 1); assert.ok(p.S.wakes.has('demo.lead'));
+  p.forgetBot('demo.lead');
+  assert.equal(p.S.turnFrom.size, 0); assert.equal(p.S.wakes.size, 0);
+});
+
+test('Settings lists schedules with no project, and only then when there are some', async () => {
+  const p = page({});
+  const st = p.setupState();
+  p.S.bots.clear();
+  assert.doesNotMatch(p.setupHTML(), /Schedules/);
+  st.schedules = [{ name: 'loose', bot: 'loose', bot_id: 3, when: 'in 2h', once: true, ended: true, message: 'x', last: { outcome: 'failed', fired_ms: 0, detail: 'daemon_unavailable' } }];
+  assert.match(p.setupHTML(), /<h3>Schedules<\/h3>.*not delivered/s);
+  // A one-off past its time and a plist that cannot be read are listed too, each removable.
+  st.schedules.push({ name: 'late', bot: 'late', bot_id: 4, when: 'at 2026-09-01 09:00', once: true, ended: false, missed: true, message: 'y', last: null },
+    { name: 'odd', ended: false, problem: 'unreadable: not a schedule\'s plist' });
+  const html = p.setupHTML();
+  assert.match(html, /missed its time/);
+  assert.match(html, /unreadable<\/span>.*data-v="odd"/s);
+});
+
+test('a coordinator\'s backlog stays small however much its tasks do, and what one message leaves out comes next', async () => {
+  const sent = [];
+  const p = page({ request: async (op, params) => { if (op === 'submit') sent.push(params); return {}; }, log() {} });
+  p.S.live = true; p.S.attached = true;
+  p.upsert({ name: 'demo.lead', id: 1, status: 'running' });
+  for (let i = 0; i < 40; i++) p.upsert({ name: `demo.t${i}`, id: 10 + i, status: 'idle', created_by: 'demo.lead', created_by_id: 1 });
+  // A long coordinator turn: every task ends many turns meanwhile.
+  for (let n = 1; n <= 50; n++) for (let i = 0; i < 40; i++) await p.onEvent({ event: 'turn_finished', bot: `demo.t${i}`, turn: n, data: { status: 'completed' } });
+  const w = p.S.wakes.get('demo.lead');
+  assert.equal(w.tasks.size, 40);
+  assert.equal(w.timer, null, 'nothing is armed while the coordinator works');
+  assert.deepEqual({ ...w.tasks.get('demo.t0') }, { first: 1, turn: 50, status: 'completed', count: 50 });
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.lead', turn: 2, data: { status: 'completed' } });
+  await p.tick();
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].prompt.split('\n').length, 1 + 32 + 1);
+  assert.match(sent[0].prompt, /\n- demo\.t0: turn:demo\.t0\/50 completed, and 49 earlier since turn:demo\.t0\/1\n/);
+  assert.match(sent[0].prompt, /\n- 8 more tasks in the next update$/);
+  assert.equal(w.tasks.size, 8);
+  // Its next rest brings the rest.
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.lead', turn: 3, data: { status: 'completed' } });
+  await p.tick();
+  assert.equal(sent.length, 2);
+  assert.match(sent[1].prompt, /\n- demo\.t32: turn:demo\.t32\/50 completed/);
+  assert.doesNotMatch(sent[1].prompt, /more tasks/);
+  assert.equal(w.tasks.size, 0);
+});
+
+test('what a window remembers belongs to its store, so two hosts, or a host and this machine, never share it', () => {
+  const storage = new Map();
+  const p = shell({}, storage);
+  p.upsert({ name: 'lead', id: 1, provider: 'alpha', model: 'one' });
+  p.S.selected = 'lead'; p.S.ui.rail = false; p.save();
+  const other = shell({}, storage); other.S.store = 'store-2';
+  other.upsert({ name: 'lead', id: 1, provider: 'alpha', model: 'one' });
+  other.restore();
+  assert.equal(other.S.ui.rail, true, 'another store with the same folder starts fresh');
+  const same = shell({}, storage);
+  same.upsert({ name: 'lead', id: 1, provider: 'alpha', model: 'one' });
+  same.restore();
+  assert.equal(same.S.ui.rail, false);
+  // Before a daemon has said which store it is, nothing is saved.
+  const unknown = shell({}, storage); unknown.S.store = null; unknown.S.ui.rail = false;
+  const before = storage.size; unknown.save();
+  assert.equal(storage.size, before);
+});
+
+test('a window on a host takes the home the host names and leaves out what reads this machine', async () => {
+  const calls = [];
+  const p = page({
+    setup: async () => ({ socket: null, host: 'box', workspace: null, managed: true, tools: [] }),
+    attach: async () => ({ session: 1, store: 'store-box', workspace: '/home/someone' }),
+    pull: () => new Promise(() => {}),
+    request: async (op) => (op === 'bots' ? { bots: [{ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', workspace: '/home/someone/app', status: 'idle' }] } : {}),
+    schedules: async () => { calls.push('schedules'); return []; },
+    swarms: async () => { calls.push('swarms'); return { swarms: [], broken: [] }; },
+    branch: async () => { calls.push('branch'); return null; },
+    settings: async () => ({ providers: [], keys: [], restartable: false, host: 'box' }),
+    models: async () => { throw new Error('remote_unsupported: The model list (~/.agent/models) reads files, and this window\'s agents run on box; reading them there is not built yet'); },
+  });
+  p.setRender(() => {});
+  await p.attach(); await settle();
+  assert.equal(p.S.attached, true);
+  assert.equal(p.S.store, 'store-box');
+  assert.equal(p.S.config.workspace, '/home/someone');
+  p.renderHead(p.context.document.getElementById('title'), p.S.bots.get('app.lead'), 'main'); await settle();
+  assert.deepEqual(calls, [], 'no swarm or branch is read from this machine for a host');
+  const swarm = p.botMenuItems('app.lead').find((i) => i.act === 'new-swarm');
+  assert.equal(swarm.disabled, true);
+  await p.openSetup(); await settle();
+  const html = p.setupHTML();
+  assert.match(html, /runs on box, with the providers its login shell there exports/);
+  assert.match(html, /remote_unsupported: The model list/);
+  assert.doesNotMatch(html, /Roles/);
+  assert.doesNotMatch(html, /<h3>Schedules<\/h3>/);
+  assert.ok(!calls.includes('schedules'), 'remote Settings never reads local schedules');
+  assert.doesNotMatch(html, /Add a provider/);
+  p.lost('agent_missing: box has no agent on its login shell\'s PATH');
+  assert.match(p.elements.get('detached').innerHTML, /daemon on <span class="k">box<\/span>/);
+});
+
+test('Settings lists the hosts in the ssh config and opens a window on one', async () => {
+  const opened = [];
+  const p = shell({
+    settings: async () => ({ providers: [], keys: [], restartable: true }),
+    models: async () => [],
+    hosts: async () => [{ alias: 'box', to: { user: 'someone', hostname: 'box.example', port: '2200' } }, { alias: 'build', to: null }],
+    openHost: async (host) => { opened.push(host); },
+  });
+  await p.openSetup(); await settle();
+  const html = p.setupHTML();
+  assert.match(html, /<span class="pn">box<\/span><span class="st dim">someone@box\.example:2200<\/span>/);
+  assert.match(html, /data-act="open-host" data-v="build"/);
+  await p.act({ dataset: { act: 'open-host', v: 'box' } });
+  assert.deepEqual(opened, ['box']);
+});
+
+test('another store answering on reattach is followed from its start, with nothing kept from the last', async () => {
+  const stores = ['store-1', 'store-2', 'store-2'], afters = [];
+  let at = 0;
+  const p = page({
+    setup: async () => ({ socket: '/synthetic.sock', workspace: '/synthetic', tools: [] }),
+    attach: async (after) => { afters.push(after); return { session: afters.length, store: stores[Math.min(at++, stores.length - 1)] }; },
+    pull: () => new Promise(() => {}),
+    request: async (op) => (op === 'bots' ? { bots: [] } : {}),
+  });
+  p.setRender(() => {});
+  await p.attach(); await settle();
+  p.upsert({ name: 'Bob', id: 7, provider: 'alpha', model: 'one' });
+  p.transcript('Bob').items.push({ kind: 'note', text: 'from the first store' });
+  p.S.cursor = 50; p.S.drafts.set('Bob', 'unsent');
+  p.S.turnFrom.set(42, 'Bob');
+  p.S.wakes.set('Bob', { tasks: new Map([['old-task', { turn: 42 }]]), timer: null, last: 0 });
+  p.lost('closed'); await p.tick(); await settle();
+  assert.deepEqual(afters, [0, 50, 0], 'the new store is followed from cursor zero');
+  assert.equal(p.S.store, 'store-2');
+  assert.equal(p.S.bots.has('Bob'), false);
+  assert.equal(p.S.transcripts.has('Bob'), false);
+  assert.equal(p.S.drafts.size, 0);
+  assert.equal(p.S.wakes.size, 0, 'wake backlogs belong to the old store');
+  assert.equal(p.S.turnFrom.size, 0, 'turn authors belong to the old store');
+  assert.equal(p.S.config.workspace, '/synthetic', 'a folder the window was given is kept');
+});
+
+test('a home the last host named is replaced by the one the new store names', async () => {
+  const answers = [['store-1', '/home/a'], ['store-2', '/home/b'], ['store-2', '/home/b']];
+  let at = 0;
+  const p = page({
+    setup: async () => ({ socket: '/synthetic.sock', workspace: null, tools: [] }),
+    attach: async () => { const [store, workspace] = answers[Math.min(at++, answers.length - 1)]; return { session: at, store, workspace }; },
+    pull: () => new Promise(() => {}),
+    request: async (op) => (op === 'bots' ? { bots: [] } : {}),
+  });
+  p.setRender(() => {});
+  await p.attach(); await settle();
+  assert.equal(p.S.config.workspace, '/home/a');
+  p.lost('closed'); await p.tick(); await settle();
+  assert.equal(p.S.store, 'store-2');
+  assert.equal(p.S.config.workspace, '/home/b');
+});
+
+test('schedule pages replace the previous messages and remote windows do not fetch them', async () => {
+  const calls = [];
+  const p = page({ schedules: async (after) => {
+    calls.push(after);
+    return { schedules: [{ name: after ? 'second' : 'first' }], next_after: after ? null : 'first' };
+  } });
+  await p.readSchedules();
+  assert.equal(p.setupState().schedules[0].name, 'first');
+  await p.readSchedules(p.setupState().schedulesNext);
+  assert.equal(p.setupState().schedules.length, 1);
+  assert.equal(p.setupState().schedules[0].name, 'second');
+  assert.equal(p.setupState().schedulesNext, null);
+  p.S.config = { host: 'remote' };
+  await p.readSchedules();
+  assert.deepEqual(calls, [null, 'first']);
+  assert.equal(p.setupState().schedules, null);
 });

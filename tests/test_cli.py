@@ -144,8 +144,24 @@ class SocketAndCliTests(ModelFixture):
         self.assertFalse(self.store.exists())
         started = json.loads(self.agent('start', *self.common[:4]).stdout)
         self.assertEqual(started['event'], 'ready')
+        # The socket it answered on, for a caller that reached `start` over SSH.
+        self.assertEqual(Path(started['socket']).resolve(), self.socket.resolve())
         self.assertTrue(self.store.exists())
         self.assertTrue(self.socket.exists())
+        # A relative socket is printed as the absolute path a caller elsewhere must name.
+        relative = subprocess.run([*self.base, 'start'], env={**clean_env(), 'AGENT_STORE': str(self.store), 'AGENT_SOCKET': 'state.sqlite.sock'},
+                                  capture_output=True, text=True, timeout=30, cwd=self.path)
+        self.assertEqual(relative.returncode, 0, relative.stderr)
+        printed = json.loads(relative.stdout)['socket']
+        self.assertTrue(printed.startswith('/'), printed)
+        self.assertEqual(Path(printed).resolve(), self.socket.resolve())
+        # A path JSON cannot carry is refused before any daemon starts.
+        odd = os.fsdecode(bytes(self.path) + b'/odd-\xff.sock')
+        refused = subprocess.run([*self.base, 'start'], env={**clean_env(), 'AGENT_STORE': str(self.path/'odd.sqlite'), 'AGENT_SOCKET': odd},
+                                 capture_output=True, text=True, timeout=30, cwd=self.path)
+        self.assertEqual(refused.returncode, 1, refused.stderr)
+        self.assertIn('socket_path_unsupported', refused.stderr)
+        self.assertFalse((self.path/'odd.sqlite').exists())
         # A running daemon answers again; nothing new starts.
         again = json.loads(self.agent('start', '--store', str(self.store)).stdout)
         self.assertEqual(again['pid'], started['pid'])
@@ -670,7 +686,8 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual((self.path / 'lineage').read_text(),
                          f"Bob/{by_name['Bob']['id']}/Alice/{events[1]['turn']}")
         bob_turn = json.loads(self.agent('turns', '--store', str(self.store), '--bot', 'Bob').stdout)
-        self.assertEqual(events[1]['data']['from'], {'bot': 'Bob', 'turn': bob_turn[0]['turn']})
+        self.assertEqual(events[1]['data']['from'], {'bot': 'Bob', 'turn': bob_turn[0]['turn'],
+                                                     'id': by_name['Bob']['id']})
         self.assertEqual(events[-1]['event'], 'follow_live')
         self.assertTrue(all(e['cursor'] < f['cursor'] for e, f in zip(events[:-2], events[1:-1])))
         # A follower attached while a turn runs replays, then sees live deltas and the end.
@@ -965,12 +982,49 @@ class CliTests(ModelFixture):
                     try:
                         with listener.accept()[0] as peer:
                             peer.sendall((json.dumps(dict(event='ready', protocol=PROTOCOL - 1))+'\n').encode())
-                            _, stderr = process.communicate(timeout=5)
+                            stdout, stderr = process.communicate(timeout=5)
                         self.assertEqual(process.returncode, 1)
                         self.assertIn(b'daemon_protocol_mismatch', stderr)
                         self.assertFalse((Path(directory)/'state.db').exists())
+                        if command[0] == 'start':
+                            # Which daemon holds the socket, so a caller can tell an older one from a newer.
+                            held = json.loads(stdout)
+                            self.assertEqual((held['protocol'], held['socket']), (PROTOCOL - 1, str(path)))
+                        else:
+                            self.assertEqual(stdout, b'')
                     finally:
                         self.stop_process(process)
+
+    def test_shutdown_stops_an_older_daemon_by_its_pid_and_leaves_a_newer_one(self):
+        # An upgraded agent on a host replaces the daemon an older one started;
+        # one that exited after it greeted is already stopped.
+        for protocol, stopped, gone in ((PROTOCOL - 1, True, False), (PROTOCOL - 1, True, True), (PROTOCOL + 1, False, False)):
+            with self.subTest(protocol=protocol, gone=gone), tempfile.TemporaryDirectory(dir='/tmp') as directory:
+                path = Path(directory)/'daemon.sock'
+                daemon = subprocess.Popen(['true' if gone else 'sleep', *([] if gone else ['30'])])
+                if gone:
+                    daemon.wait(timeout=3)
+                self.addCleanup(self.stop_process, daemon)
+                with socket.socket(socket.AF_UNIX) as listener:
+                    listener.bind(str(path))
+                    listener.listen(1)
+                    listener.settimeout(3)
+                    process = subprocess.Popen([str(self.binary), 'shutdown', '--store', str(Path(directory)/'state.db'),
+                                                '--socket', str(path)],
+                                               env=clean_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    try:
+                        with listener.accept()[0] as peer:
+                            peer.sendall((json.dumps(dict(event='ready', protocol=protocol, pid=daemon.pid))+'\n').encode())
+                            _, stderr = process.communicate(timeout=10)
+                    finally:
+                        self.stop_process(process)
+                if stopped:
+                    self.assertEqual(process.returncode, 0, stderr)
+                    self.assertEqual(daemon.wait(timeout=3), 0 if gone else -15)
+                else:
+                    self.assertEqual(process.returncode, 1)
+                    self.assertIn(b'daemon_protocol_mismatch', stderr)
+                    self.assertIsNone(daemon.poll())
 
     def test_explicit_store_overrides_inherited_socket(self):
         client = SocketClient(self.binary, self.path/'first.db', self.url, 'echo')
