@@ -14,22 +14,12 @@
 //! - `state.json`: what the board's lines add up to (roles, proposals and
 //!   their votes, who is in which stream), rewritten under the board's lock
 //!   with each line that changes it.
-//! - `post` and `role`, and with a council `propose`, `vote` and `join`: the
-//!   scripts its agents run. Each runs this executable with `--swarm-post`,
-//!   so they need nothing else installed and cost one daemon connection
-//!   whatever the swarm's size.
+//! - scripts for publication, assignments, claims, independent review,
+//!   final results and status; council swarms also expose proposals/votes.
 //!
-//! A post reaches the others as a steer, so a working agent reads it at its
-//! next step. An agent's post goes to the agents working now and wakes only
-//! the ones it names with @NAME; your post wakes everyone, or only the ones
-//! it names. Agents talking among themselves never wake a swarm that has
-//! gone quiet.
-//!
-//! A swarm with a council organizes itself: an agent proposes a stream of
-//! work, the council's seats (its first agents) vote, and a majority opens
-//! the stream with its proposer as lead; you can approve or deny any open
-//! proposal yourself. Once an agent joins a stream, its posts reach that
-//! stream's agents unless it posts to everyone.
+//! Publication is durable and silent; @mentions deliver only to those
+//! named, and --all explicitly wakes peers. The app owns the work ledger,
+//! review contract and budget notices. The daemon remains ordinary bots.
 use agent_client::Client;
 use serde_json::{Value, json};
 use std::{
@@ -39,6 +29,9 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+
+mod budget;
+mod work;
 
 pub const POST_FLAG: &str = "--swarm-post";
 pub const START_FLAG: &str = "--swarm-start";
@@ -83,6 +76,10 @@ pub struct Swarm {
     /// The bot ids of members that left: helpers they made still count in
     /// its tokens, and Stop still ends them.
     pub left: Vec<i64>,
+    /// The coordinator that started it, by name and bot id: told of its
+    /// final result, or that it went quiet without one. None when you
+    /// started it from the page.
+    pub coordinator: Option<(String, i64)>,
 }
 
 impl Swarm {
@@ -168,6 +165,15 @@ impl Swarm {
                 .and_then(toml::Value::as_array)
                 .and_then(|ids| ids.iter().map(toml::Value::as_integer).collect())
                 .ok_or_else(|| format!("{}: left is missing or not bot ids", path.display()))?,
+            coordinator: table
+                .get("coordinator")
+                .and_then(toml::Value::as_str)
+                .zip(
+                    table
+                        .get("coordinator_id")
+                        .and_then(toml::Value::as_integer),
+                )
+                .map(|(bot, id)| (bot.to_owned(), id)),
         };
         // Every member is pinned to its bot: a post never steers a name.
         if !swarm.members.iter().all(|m| swarm.ids.contains_key(m)) {
@@ -223,6 +229,10 @@ impl Swarm {
             "left".into(),
             toml::Value::Array(self.left.iter().map(|id| (*id).into()).collect()),
         );
+        if let Some((bot, id)) = &self.coordinator {
+            table.insert("coordinator".into(), bot.clone().into());
+            table.insert("coordinator_id".into(), (*id).into());
+        }
         let text = toml::to_string(&table).map_err(|e| e.to_string())?;
         // What `read` would refuse is never written: the swarm stays as it was.
         if text.len() as u64 > MAX_SETTINGS {
@@ -357,7 +367,7 @@ pub fn valid_mix(mix: &[Mix]) -> Result<(), String> {
         let word = name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b));
-        if name.starts_with('.') || !word || ["swarm", "coordinator"].contains(&name) {
+        if name.starts_with('.') || !word || crate::BUILT_IN.iter().any(|(role, _)| *role == name) {
             return Err(format!("invalid_mix: {name} is not an identity"));
         }
     }
@@ -802,16 +812,51 @@ pub struct Tool {
     usage: &'static str,
 }
 
-const TOOLS: [Tool; 5] = [
+const TOOLS: [Tool; 12] = [
     Tool {
         name: "post",
         flag: "",
-        usage: "post [--all] TEXT: post to this swarm's board; @NAME wakes that agent; --all reaches everyone, not only your stream.",
+        usage: "post [--all] TEXT: publish without interrupting peers; @NAME delivers only to named agents; --all explicitly notifies all members.",
     },
     Tool {
         name: "role",
         flag: "--role",
         usage: "role ROLE: say what you are doing here, in a few words.",
+    },
+    Tool {
+        name: "assign",
+        flag: "--assign",
+        usage: "assign TASK OWNER REVIEWER BRIEF: register distinct work and its independent reviewer; council approves before work.",
+    },
+    Tool {
+        name: "claim",
+        flag: "--claim",
+        usage: "claim TASK: atomically start your assigned task.",
+    },
+    Tool {
+        name: "submit",
+        flag: "--submit",
+        usage: "submit TASK RESULT: hand your result to its assigned reviewer and leave the stream.",
+    },
+    Tool {
+        name: "review",
+        flag: "--review",
+        usage: "review TASK supported|conditional|rejected EVIDENCE: independently verify an assigned result.",
+    },
+    Tool {
+        name: "finish",
+        flag: "--finish",
+        usage: "finish achieved|partial|failed SUMMARY: record the swarm's final handoff and declared outcome on the board.",
+    },
+    Tool {
+        name: "leave",
+        flag: "--leave",
+        usage: "leave: leave your current stream; a claimed task returns to assigned.",
+    },
+    Tool {
+        name: "status",
+        flag: "--status",
+        usage: "status: read assignments, partial results, member budgets and the swarm outcome as JSON.",
     },
     Tool {
         name: "propose",
@@ -826,14 +871,14 @@ const TOOLS: [Tool; 5] = [
     Tool {
         name: "join",
         flag: "--join",
-        usage: "join STREAM: work in an approved stream; your posts then reach its agents.",
+        usage: "join STREAM: enter an approved stream you own; review does not require joining.",
     },
 ];
 
 /// A flat board has no council, so nothing to propose, vote on or join.
 fn tools(swarm: &Swarm) -> &'static [Tool] {
     if swarm.council == 0 {
-        &TOOLS[..2]
+        &TOOLS[..9]
     } else {
         &TOOLS
     }
@@ -1222,6 +1267,8 @@ pub struct Start {
     pub agents: usize,
     pub budget_tokens: u64,
     pub council: usize,
+    /// The coordinator asking for it, if one is.
+    pub coordinator: Option<(String, i64)>,
 }
 
 /// Each agent's row of the mix: dealt one at a time, each to the row
@@ -1349,6 +1396,7 @@ pub async fn start(
         council: start.council,
         made: n,
         left: Vec::new(),
+        coordinator: start.coordinator,
     };
     if let Err(error) = fill(&dir, &swarm, app) {
         if start.shared {
@@ -1623,13 +1671,18 @@ async fn end_turns(client: &Client, member: &str, id: Option<i64>) -> Result<boo
 }
 
 /// Each identity's instructions for the swarm's folder, composed once: a
-/// plain agent's are the `swarm` role's, and an identity's are its profile's
-/// with the `swarm` role's after them. The board is scripts its agents run,
+/// plain agent's use the mode's role, and an identity's use its profile
+/// with that mode's role after it. The board is scripts its agents run,
 /// so an identity limited to tools without `shell` could not take part.
 fn policies(
     swarm: &Swarm,
     rows: impl Iterator<Item = usize>,
 ) -> Result<BTreeMap<String, Value>, String> {
+    let role = if swarm.council == 0 {
+        "swarm-flat"
+    } else {
+        "swarm-council"
+    };
     let mut out = BTreeMap::new();
     for row in rows {
         let identity = &swarm.mix[row].identity;
@@ -1638,19 +1691,15 @@ fn policies(
         }
         let workspace = Path::new(&swarm.workspace);
         let policy = if identity.is_empty() {
-            crate::compose(workspace, Some("swarm"), None)?
+            crate::compose(workspace, Some(role), None)?
         } else {
-            crate::compose(workspace, Some(identity), Some("swarm"))?
+            crate::compose(workspace, Some(identity), Some(role))?
         };
         if policy["tools"]
             .as_array()
             .is_some_and(|tools| !tools.iter().any(|tool| tool == "shell"))
         {
-            let who = if identity.is_empty() {
-                "swarm"
-            } else {
-                identity
-            };
+            let who = if identity.is_empty() { role } else { identity };
             return Err(format!(
                 "identity_without_shell: the {who} profile's tools leave out shell, which the board's scripts run in"
             ));
@@ -1808,6 +1857,24 @@ fn brief(swarm: &Swarm, dir: &Path, member: &str, late: bool) -> String {
             others.join(", ")
         }
     ));
+    if let Some(first) = swarm.members.first() {
+        lines.push(format!("First member: {}", swarm.short(first)));
+    }
+    lines.push(tool("assign", "TASK OWNER REVIEWER BRIEF"));
+    for (name, args) in [
+        ("claim", "TASK"),
+        ("submit", "TASK RESULT"),
+        ("review", "TASK supported|conditional|rejected EVIDENCE"),
+        ("finish", "achieved|partial|failed SUMMARY"),
+        ("leave", ""),
+        ("status", ""),
+    ] {
+        lines.push(tool(name, args));
+    }
+    lines.push(format!(
+        "Your lifetime allowance: {} tokens, including cached input on every call.",
+        swarm.budget_tokens / swarm.members.len().max(1) as u64
+    ));
     if late {
         lines.push("You joined after the others started, so read the board first.".into());
     }
@@ -1882,6 +1949,12 @@ pub fn board(root: &Path, swarm: &str, offset: Option<u64>) -> Result<Value, Str
 /// project.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct State {
+    pub tasks: BTreeMap<String, Value>,
+    pub result: Option<Value>,
+    pub warned: BTreeMap<String, u8>,
+    /// The coordinator was told the swarm went quiet without a result, and
+    /// nothing has run since.
+    pub told: bool,
     pub roles: BTreeMap<String, String>,
     pub streams: BTreeMap<String, String>,
     /// Open proposals (at most `MAX_OPEN`), approved ones whose stream
@@ -1987,6 +2060,20 @@ impl State {
                 let value: Value = serde_json::from_slice(&bytes)
                     .map_err(|e| format!("{}: {e}", path.display()))?;
                 Ok(Self {
+                    tasks: value["tasks"]
+                        .as_object()
+                        .into_iter()
+                        .flatten()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                    result: value["result"].as_object().map(|_| value["result"].clone()),
+                    warned: value["warned"]
+                        .as_object()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|(k, v)| Some((k.clone(), u8::try_from(v.as_u64()?).ok()?)))
+                        .collect(),
+                    told: value["told"].as_bool().unwrap_or_default(),
                     roles: strings(&value["roles"]),
                     streams: strings(&value["streams"]),
                     proposals: value["proposals"]
@@ -2019,6 +2106,7 @@ impl State {
 
     pub fn json(&self) -> Value {
         json!({
+            "tasks": self.tasks, "result": self.result, "warned": self.warned, "told": self.told,
             "roles": self.roles, "streams": self.streams,
             "proposals": self.proposals.iter().map(Proposal::json).collect::<Vec<_>>(),
             "made": self.made, "spent": self.spent, "helpers": self.helpers, "gone": self.gone,
@@ -2049,14 +2137,15 @@ impl State {
     }
 
     /// A member that left takes its role, its place in a stream, its votes
-    /// on open proposals and the open proposals it made with it; the board
-    /// keeps all of them. A stream it led goes to the first agent left in
-    /// it: each stream handed on, with its new lead.
+    /// on open proposals and the open proposals it made with it, except
+    /// proposals backing assigned tasks; the board keeps all of them. A
+    /// stream it led goes to the first agent left in it: each stream handed
+    /// on, with its new lead.
     fn forget(&mut self, member: &str) -> Vec<(String, String)> {
         self.roles.remove(member);
         self.streams.remove(member);
         self.proposals
-            .retain(|p| p.status != "open" || p.by != member);
+            .retain(|p| p.status != "open" || p.by != member || self.tasks.contains_key(&p.stream));
         for p in self.proposals.iter_mut().filter(|p| p.status == "open") {
             p.votes.remove(member);
         }
@@ -2085,7 +2174,9 @@ impl State {
         let mut drop = denied.saturating_sub(KEEP_DENIED);
         let streams = &self.streams;
         self.proposals.retain(|p| match p.status.as_str() {
-            "approved" => streams.values().any(|st| *st == p.stream),
+            "approved" => {
+                self.tasks.contains_key(&p.stream) || streams.values().any(|st| *st == p.stream)
+            }
             "denied" if drop > 0 => {
                 drop -= 1;
                 false
@@ -2123,8 +2214,12 @@ fn locked_with<T>(
     // The lines and the state they change commit together: the new state
     // waits beside the old one, naming the board's length before and after
     // the lines, until they are on the board (see `recover`).
-    let from = board.metadata().map_err(|e| e.to_string())?.len();
     let changed = state != before;
+    // A check that found nothing to say touches no file.
+    if lines.is_empty() && !changed {
+        return Ok(out);
+    }
+    let from = board.metadata().map_err(|e| e.to_string())?.len();
     if changed {
         // The state as it will be read, with where its lines go on the board.
         let mut pending = state.json();
@@ -2266,7 +2361,7 @@ fn readers(
         }
         let reach = if is_named(member) || (author.is_none() && named.is_empty()) {
             Some(Reach::Wake)
-        } else if scope.is_none_or(|scope| scope.contains(member)) {
+        } else if named.is_empty() && scope.is_none_or(|scope| scope.contains(member)) {
             running(member).map(Reach::Running)
         } else {
             None
@@ -2299,11 +2394,20 @@ pub enum Act {
     Join(String),
     /// Nothing but the budget check every act ends with.
     Check,
+    Status,
+    Work(work::Action),
 }
 
 /// Who hears a line the board gained.
 #[derive(Debug, PartialEq)]
 enum Audience {
+    /// The coordinator that started the swarm, if one did: queued after
+    /// what it is doing, never into it.
+    Coordinator,
+    Budget {
+        member: String,
+        turn: i64,
+    },
     /// A post: see `readers`.
     Post {
         scope: Option<Vec<String>>,
@@ -2311,7 +2415,10 @@ enum Audience {
     },
     /// These members, woken if idle; with `working`, every other working
     /// member hears it too.
-    Wake { who: Vec<String>, working: bool },
+    Wake {
+        who: Vec<String>,
+        working: bool,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -2365,6 +2472,7 @@ fn plan(
         line
     };
     match act {
+        Act::Work(action) => work::apply(swarm, state, author, action, at),
         Act::Post { text, all } => {
             let text = words(&text, "post", MAX_POST)?;
             let stream = match author {
@@ -2389,7 +2497,21 @@ fn plan(
             }
             let notice = Notice {
                 prompt,
-                audience: Audience::Post { scope, text },
+                audience: if author.is_some() && all {
+                    Audience::Wake {
+                        who: swarm.members.clone(),
+                        working: false,
+                    }
+                } else {
+                    Audience::Post {
+                        scope: if author.is_some() && !all {
+                            Some(Vec::new())
+                        } else {
+                            scope
+                        },
+                        text,
+                    }
+                },
             };
             Ok((vec![posted], vec![notice], json!({"stream": stream})))
         }
@@ -2537,6 +2659,20 @@ fn plan(
                 for (_, reason) in proposal.votes.values_mut() {
                     reason.clear();
                 }
+                // An assignment's stream is led by its owner; a denied one
+                // releases the owner, and its proposer hears why.
+                let proposer = by;
+                let owner = (state.tasks.get(&stream))
+                    .filter(|t| t["status"] == "assigned")
+                    .and_then(|t| t["owner"].as_str())
+                    .map(str::to_owned);
+                let by = owner.clone().unwrap_or_else(|| proposer.clone());
+                if let Some(p) = state.proposals.iter_mut().find(|p| p.id == pid) {
+                    p.lead = Some(by.clone());
+                }
+                if !approved && owner.is_some() {
+                    state.tasks.remove(&stream);
+                }
                 // Its lead is in it, unless the lead has left; a stream
                 // nobody is in closes.
                 if approved && full(&by).is_some() {
@@ -2548,20 +2684,30 @@ fn plan(
                 );
                 decision["from"] = json!(by_whom);
                 lines.push(decision);
-                let prompt = if approved {
-                    format!(
+                let prompt = match (approved, owner.is_some()) {
+                    (true, true) => format!(
+                        "[board] {pid} #{stream} approved{who}: {by} owns it. Claim the assigned task before starting; reviewers do not join it."
+                    ),
+                    (true, false) => format!(
                         "[board] {pid} #{stream} approved{who}: {by} leads it and is in it. Others join with: join {stream}"
-                    )
-                } else {
-                    format!(
+                    ),
+                    (false, true) => format!(
+                        "[board] {pid} #{stream} denied{who}: the assignment is withdrawn and {by} is free. Read the votes on the board before assigning again."
+                    ),
+                    (false, false) => format!(
                         "[board] {pid} #{stream} denied{who}. Read the votes on the board before proposing again."
-                    )
+                    ),
                 };
+                let mut wake: Vec<String> = full(&by).into_iter().collect();
+                if !approved {
+                    let proposer = full(&proposer).filter(|p| !wake.contains(p));
+                    wake.extend(proposer);
+                }
                 notices.push(Notice {
                     prompt,
                     audience: Audience::Wake {
-                        who: full(&by).into_iter().collect(),
-                        working: approved,
+                        who: wake,
+                        working: false,
                     },
                 });
             }
@@ -2577,6 +2723,13 @@ fn plan(
                     "no_stream: #{stream} is not an approved stream; the board lists the proposals"
                 ));
             }
+            if let Some(task) = state.tasks.get(&stream)
+                && (task["owner"] != me
+                    || !["assigned", "working"]
+                        .contains(&task["status"].as_str().unwrap_or_default()))
+            {
+                return Err("task_owner_only: use review for independent review, not join".into());
+            }
             state.streams.insert(me.clone(), stream.clone());
             // The stream it left closes if nobody else is in it.
             state.prune();
@@ -2586,12 +2739,12 @@ fn plan(
                 json!({"stream": stream}),
             ))
         }
-        Act::Check => Ok((vec![], vec![], json!({}))),
+        Act::Check | Act::Status => Ok((vec![], vec![], json!({}))),
     }
 }
 
 /// The shares of its budget a swarm is told it has spent.
-const SPENT: [u8; 3] = [50, 75, 90];
+const SPENT: [u8; 3] = [50, 65, 80];
 
 /// A line for the highest share of the budget `used` has passed that the
 /// board has not announced yet: once each, however many windows check.
@@ -2635,6 +2788,7 @@ fn millions(tokens: u64) -> String {
 /// in that range no member or helper made.
 #[derive(Debug, Default)]
 struct Scan {
+    members: Vec<Value>,
     turns: Vec<(String, Option<i64>)>,
     helpers: Vec<(String, i64)>,
     used: u64,
@@ -2715,6 +2869,7 @@ async fn scan(client: &Client, swarm: &Swarm, roots: &BTreeMap<i64, i64>) -> Res
                 if swarm.ids.get(name) == Some(&id) {
                     out.turns
                         .push((name.to_owned(), bot["running_turn"].as_i64()));
+                    out.members.push(budget::member(bot));
                     out.used += used.unwrap_or(0);
                 }
             } else if let Some(root) = (bot["created_by_id"].as_i64())
@@ -2731,6 +2886,9 @@ async fn scan(client: &Client, swarm: &Swarm, roots: &BTreeMap<i64, i64>) -> Res
                     out.roots.insert(by, root);
                 }
                 out.rooted.insert(root);
+                let mut member = budget::member(bot);
+                member["helper"] = json!(true);
+                out.members.push(member);
                 out.helpers.push((name.to_owned(), id));
                 out.spent.insert(id, used.unwrap_or(0));
                 out.used += used.unwrap_or(0);
@@ -2779,11 +2937,22 @@ pub async fn act(
     let bot = author.as_ref().map(|a| a.bot.as_str());
     // A swarm you stopped keeps what you decided on the board, and tells
     // nobody; a role or a join tells nobody either.
-    let seen = if s.stopped || matches!(act, Act::Role(_) | Act::Join(_)) {
+    let seen = if (s.stopped && !matches!(act, Act::Status))
+        || matches!(act, Act::Role(_) | Act::Join(_))
+    {
         Scan::default()
     } else {
         scan(client, &s, &state.roots).await?
     };
+    if matches!(act, Act::Status) {
+        let last = board
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64);
+        return Ok(budget::status(&s, &state, &seen, last));
+    }
     // A member that left stops being a maker once nothing it made is left.
     let rooted = &seen.rooted;
     let before = s.left.len();
@@ -2801,12 +2970,26 @@ pub async fn act(
     // Each line says how many agents it is sent to, so what a swarm's posts
     // cost in deliveries is on its board. The line is written before the
     // sends; a send that failed, or found its turn over, is in the answer.
+    let status = format!(
+        "'{}'",
+        dir.join("status").to_string_lossy().replace('\'', r"'\''")
+    );
     let (sends, mut answer) = locked_with(&mut board, &dir, |state| {
         seen.record(state);
         let checked = !matches!(act, Act::Role(_) | Act::Join(_));
         let (mut lines, notices, mut answer) = plan(&s, state, bot, act, now_ms())?;
         let reach = |notice: &Notice| -> Vec<(String, Reach)> {
             match &notice.audience {
+                Audience::Coordinator => (s.coordinator.iter())
+                    .map(|(bot, _)| (bot.clone(), Reach::Wake))
+                    .collect(),
+                Audience::Budget { member, turn } => {
+                    if Some(member.as_str()) == bot {
+                        vec![]
+                    } else {
+                        vec![(member.clone(), Reach::Running(*turn))]
+                    }
+                }
                 Audience::Post { scope, text } => {
                     readers(&s, bot, text, scope.as_deref(), &running)
                 }
@@ -2825,7 +3008,11 @@ pub async fn act(
         let told = !notices.is_empty() && !s.stopped;
         for notice in notices.iter().filter(|_| !s.stopped) {
             let to = reach(notice).into_iter();
-            sends.extend(to.map(|(m, r)| (m, r, notice.prompt.clone(), true)));
+            let prompt = match notice.audience {
+                Audience::Coordinator => format!("{}\nStatus: {status}", notice.prompt),
+                _ => notice.prompt.clone(),
+            };
+            sends.extend(to.map(|(m, r)| (m, r, prompt.clone(), true)));
         }
         if let Some(first) = lines.first_mut().filter(|_| told) {
             first["sent"] = json!(sends.len());
@@ -2852,14 +3039,54 @@ pub async fn act(
                     .map(|(m, r)| (m, r, notice.prompt.clone(), false)),
             );
         }
+        if checked && !s.stopped {
+            let warnings = budget::warnings(state, &seen.members, now_ms());
+            for (mut line, notice) in warnings {
+                let to = reach(&notice);
+                line["sent"] = json!(to.len());
+                answer["budget"] = line["text"].clone();
+                lines.push(line);
+                sends.extend(
+                    to.into_iter()
+                        .map(|(m, r)| (m, r, notice.prompt.clone(), false)),
+                );
+            }
+            if let Some(member) = seen.members.iter().find(|m| m["name"].as_str() == bot) {
+                answer["allowance"] = member.clone();
+            }
+            answer["remaining_tokens"] = json!(s.budget_tokens.saturating_sub(seen.used(state)));
+            // The scan predates these sends. A member being woken is not
+            // evidence of a stalled swarm; let the next check observe it.
+            // Reset even if that turn ends before the next scan, or fails
+            // to start, so a later genuine stall can still be reported.
+            let waking = sends
+                .iter()
+                .any(|(m, r, _, _)| *r == Reach::Wake && s.members.contains(m));
+            if waking {
+                state.told = false;
+            } else if let Some((line, notice)) = budget::quiet(&s, state, &seen, now_ms()) {
+                let prompt = format!("{}\nStatus: {status}", notice.prompt);
+                lines.push(line);
+                sends.extend(
+                    reach(&notice)
+                        .into_iter()
+                        .map(|(m, r)| (m, r, prompt.clone(), false)),
+                );
+            }
+        }
+        // Let clients refresh for any appended notice without another read
+        // just to discover whether this act changed the board.
+        answer["board_changed"] = json!(!lines.is_empty());
         Ok((lines, (sends, answer)))
     })?;
     let stamp = stamp();
     let mut submits = tokio::task::JoinSet::new();
     for (i, (member, reach, prompt, authored)) in sends.into_iter().enumerate() {
+        let coordinator = s.coordinator.as_ref().filter(|(bot, _)| *bot == member);
         let mut params = json!({
-            "bot": member, "bot_id": s.ids.get(&member), "request_id": format!("{stamp}-{i}"),
-            "prompt": prompt, "delivery": "steer",
+            "bot": member, "request_id": format!("{stamp}-{i}"), "prompt": prompt,
+            "bot_id": coordinator.map(|(_, id)| id).or(s.ids.get(&member)),
+            "delivery": if coordinator.is_some() { "queue" } else { "steer" },
         });
         if let Reach::Running(turn) = reach {
             params["expected_turn"] = json!(turn);
@@ -2905,6 +3132,10 @@ fn parse(words: &[String]) -> Result<Act, String> {
         format!("usage: {}", tool.usage)
     };
     match words.first().map(String::as_str) {
+        Some("--status") => Ok(Act::Status),
+        Some("--assign" | "--claim" | "--submit" | "--review" | "--finish" | "--leave") => {
+            work::parse(words).map(Act::Work)
+        }
         Some("--role") => Ok(Act::Role(rest(1))),
         Some("--propose") => match words.get(1) {
             Some(stream) => Ok(Act::Propose {
@@ -2956,18 +3187,24 @@ pub fn cli(args: &[String]) -> i32 {
         return fail(format!("not a swarm folder: {}", dir.display()));
     };
     let number = |key: &str| std::env::var(key).ok().and_then(|v| v.parse::<i64>().ok());
-    let author = match (
-        std::env::var("AGENT_BOT"),
-        number("AGENT_BOT_ID"),
-        number("AGENT_TURN"),
-    ) {
-        (Ok(bot), Some(id), Some(turn)) if !bot.is_empty() => Author { bot, id, turn },
-        _ => {
-            return fail(
+    let author = if matches!(action, Act::Status) {
+        None
+    } else {
+        Some(
+            match (
+                std::env::var("AGENT_BOT"),
+                number("AGENT_BOT_ID"),
+                number("AGENT_TURN"),
+            ) {
+                (Ok(bot), Some(id), Some(turn)) if !bot.is_empty() => Author { bot, id, turn },
+                _ => {
+                    return fail(
                 "post runs in a swarm agent's shell, which names AGENT_BOT, AGENT_BOT_ID and AGENT_TURN"
                     .into(),
             );
-        }
+                }
+            },
+        )
     };
     let socket = match socket() {
         Ok(socket) => socket,
@@ -2982,7 +3219,7 @@ pub fn cli(args: &[String]) -> i32 {
     };
     let result = runtime.block_on(async {
         let (client, _events) = Client::connect(&socket).await.map_err(|e| e.to_string())?;
-        let posted = act(&client, root, swarm, Some(author), action).await;
+        let posted = act(&client, root, swarm, author, action).await;
         client.close().await;
         posted
     });
@@ -3004,7 +3241,7 @@ const START_USAGE: &str = "usage: start [--agents N] [--budget MILLIONS] [--coun
 /// Agents, budget in millions of tokens and organization when not given:
 /// what the page's sheet offers first.
 const START_AGENTS: usize = 4;
-const START_BUDGET_M: f64 = 3.0;
+const BUDGET_PER_AGENT: u64 = 10_000_000;
 const MAX_BUDGET_M: f64 = 1000.0;
 
 /// A swarm as a coordinator asks for one. Without rows, every agent runs
@@ -3027,7 +3264,7 @@ fn parse_start(args: &[String]) -> Result<Asked, String> {
     };
     let mut asked = Asked {
         agents: START_AGENTS,
-        budget_tokens: (START_BUDGET_M * 1e6) as u64,
+        budget_tokens: 0,
         council: 0,
         shared: true,
         mix: Vec::new(),
@@ -3085,6 +3322,9 @@ fn parse_start(args: &[String]) -> Result<Asked, String> {
             }
             _ => return Err(bad(format!("invalid_start: {flag}"))),
         }
+    }
+    if asked.budget_tokens == 0 {
+        asked.budget_tokens = BUDGET_PER_AGENT.saturating_mul(asked.agents as u64);
     }
     Ok(asked)
 }
@@ -3190,6 +3430,7 @@ pub fn start_cli(args: &[String]) -> i32 {
                 agents: asked.agents,
                 budget_tokens: asked.budget_tokens,
                 council: asked.council,
+                coordinator: Some((lead.clone(), id)),
             };
             let mut out = self::start(&client, &root, &app, start).await?;
             let dir = out["swarm"]["dir"]
@@ -3255,7 +3496,7 @@ mod tests {
         locked(dir, |_| Ok((vec![line.clone()], ())))
     }
 
-    fn swarm(members: &[&str]) -> Swarm {
+    pub(super) fn swarm(members: &[&str]) -> Swarm {
         Swarm {
             name: "agent.latency".into(),
             project: "agent".into(),
@@ -3275,6 +3516,7 @@ mod tests {
                 .map(|(m, id)| (m.to_string(), id))
                 .collect(),
             rows: members.iter().map(|m| (m.to_string(), 0)).collect(),
+            coordinator: None,
             stopped: false,
             council: 0,
             made: members.len(),
@@ -3309,7 +3551,7 @@ mod tests {
     }
 
     #[test]
-    fn agents_reach_whoever_is_working_and_wake_only_whom_they_name() {
+    fn directed_posts_reach_only_named_members() {
         let s = swarm(&[
             "agent.latency-1",
             "agent.latency-2",
@@ -3327,25 +3569,13 @@ mod tests {
             None,
             &running,
         );
-        assert_eq!(
-            reach,
-            vec![
-                ("agent.latency-2".into(), Reach::Running(7)),
-                ("agent.latency-4".into(), Reach::Wake)
-            ]
-        );
+        assert_eq!(reach, vec![("agent.latency-4".into(), Reach::Wake)]);
         // Your post wakes everyone, or only the ones it names; nobody hears their own post.
         let reach = readers(&s, None, "Keep cargo test green.", None, &running);
         assert_eq!(reach.len(), 4);
         assert!(reach.iter().all(|(_, r)| *r == Reach::Wake));
         let reach = readers(&s, None, "@agent.latency-3, stop.", None, &running);
-        assert_eq!(
-            reach,
-            vec![
-                ("agent.latency-2".into(), Reach::Running(7)),
-                ("agent.latency-3".into(), Reach::Wake)
-            ]
-        );
+        assert_eq!(reach, vec![("agent.latency-3".into(), Reach::Wake)]);
         let reach = readers(
             &s,
             Some("agent.latency-2"),
@@ -3356,14 +3586,14 @@ mod tests {
         assert!(reach.is_empty());
     }
 
-    fn council(members: &[&str]) -> Swarm {
+    pub(super) fn council(members: &[&str]) -> Swarm {
         Swarm {
             council: 3,
             ..swarm(members)
         }
     }
 
-    fn agent(n: usize) -> String {
+    pub(super) fn agent(n: usize) -> String {
         format!("agent.latency-{n}")
     }
 
@@ -3421,7 +3651,7 @@ mod tests {
             notices[0].audience,
             Audience::Wake {
                 who: vec![agent(4)],
-                working: true
+                working: false
             }
         );
         assert_eq!(
@@ -3617,6 +3847,73 @@ mod tests {
     }
 
     #[test]
+    fn an_assignment_can_be_approved_and_claimed_after_its_proposer_leaves() {
+        let root = scratch("assignment-departure");
+        let s = council(&[&agent(1), &agent(2), &agent(3), &agent(4)]);
+        let dir = claim(&root, &s.name).unwrap();
+        fill(&dir, &s, Path::new("/app")).unwrap();
+        let vote = || Act::Vote {
+            id: "P1".into(),
+            yes: true,
+            reason: "Distinct scope and independent reviewer.".into(),
+        };
+        locked(&dir, |state| {
+            let (mut lines, _, _) = plan(
+                &s,
+                state,
+                Some(&agent(1)),
+                Act::Work(work::Action::Assign {
+                    task: "waits".into(),
+                    owner: "latency-2".into(),
+                    reviewer: "latency-3".into(),
+                    brief: "Measure wait latency.".into(),
+                }),
+                1,
+            )?;
+            lines.extend(plan(&s, state, Some(&agent(1)), vote(), 2)?.0);
+            Ok((lines, ()))
+        })
+        .unwrap();
+        let (_, notices) = depart(&mut lock_board(&dir).unwrap(), &dir, &[agent(1)]).unwrap();
+        assert!(
+            notices
+                .iter()
+                .any(|(member, prompt)| { member == &agent(4) && prompt.contains("P1 #waits") })
+        );
+        let remaining = Swarm::read(&dir).unwrap();
+        let state = State::read(&dir).unwrap();
+        assert_eq!(state.tasks["waits"]["status"], "assigned");
+        assert_eq!(state.proposals[0].status, "open");
+        assert!(!state.proposals[0].votes.contains_key("latency-1"));
+        locked(&dir, |state| {
+            let (mut lines, _, answer) = plan(&remaining, state, Some(&agent(4)), vote(), 3)?;
+            assert_eq!(
+                answer["decided"],
+                Value::Null,
+                "the departed vote no longer counts"
+            );
+            lines.extend(plan(&remaining, state, Some(&agent(2)), vote(), 4)?.0);
+            lines.extend(
+                plan(
+                    &remaining,
+                    state,
+                    Some(&agent(2)),
+                    Act::Work(work::Action::Claim("waits".into())),
+                    5,
+                )?
+                .0,
+            );
+            Ok((lines, ()))
+        })
+        .unwrap();
+        assert_eq!(
+            State::read(&dir).unwrap().tasks["waits"]["status"],
+            "working"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn a_change_cut_short_is_finished_or_undone_at_the_next_lock() {
         let root = scratch("pending");
         let s = swarm(&[]);
@@ -3666,7 +3963,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stream_member_posts_to_its_stream_unless_it_posts_to_everyone() {
+    fn publication_is_silent_and_notifications_are_explicit() {
         let s = council(&["agent.latency-1", "agent.latency-2", "agent.latency-3"]);
         let mut state = State::default();
         let join = |stream: &str| Act::Join(stream.into());
@@ -3709,12 +4006,12 @@ mod tests {
         let Audience::Post { scope, text } = &notices[0].audience else {
             panic!()
         };
-        assert_eq!(scope.as_deref(), Some(&[agent(1), agent(2)][..]));
+        assert_eq!(scope.as_deref(), Some(&[][..]));
         // 1 and 3 both work; only 1 is in the stream, so only 1 hears it, unless 3 is named.
         let running = |_: &str| Some(9);
         assert_eq!(
             readers(&s, Some(&agent(2)), text, scope.as_deref(), &running),
-            vec![(agent(1), Reach::Running(9))]
+            vec![]
         );
         assert_eq!(
             readers(
@@ -3725,13 +4022,13 @@ mod tests {
                 &running
             )
             .len(),
-            2
+            1
         );
         let (lines, notices, _) = plan(&s, &mut state, Some(&agent(2)), post(true), 5).unwrap();
         assert!(lines[0].get("stream").is_none());
         assert!(matches!(
             &notices[0].audience,
-            Audience::Post { scope: None, .. }
+            Audience::Wake { working: false, .. }
         ));
         plan(
             &s,
@@ -3859,6 +4156,10 @@ mod tests {
         let dir = claim(&root, &flat.name).unwrap();
         fill(&dir, &flat, Path::new("/app")).unwrap();
         assert!(dir.join("role").exists() && !dir.join("vote").exists());
+        assert!(
+            !dir.join("plan.md").exists(),
+            "coordination belongs on the board"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -4043,6 +4344,55 @@ mod tests {
     }
 
     #[test]
+    fn each_mode_uses_its_own_editable_profile_with_or_without_an_identity() {
+        let root = scratch("mode-profiles");
+        let roles = root.join(".agents/agents");
+        std::fs::create_dir_all(&roles).unwrap();
+        for (name, body) in [
+            ("swarm-flat", "Flat-only coordination."),
+            ("swarm-council", "Council-only coordination."),
+            ("reviewer", "Reviewer identity."),
+        ] {
+            std::fs::write(
+                roles.join(format!("{name}.md")),
+                format!("---\nname: {name}\ndescription: Synthetic role\n---\n{body}\n"),
+            )
+            .unwrap();
+        }
+        let mut s = swarm(&[]);
+        s.workspace = root.to_string_lossy().into_owned();
+        s.mix.push(Mix {
+            identity: "reviewer".into(),
+            model: "a/x".into(),
+            reasoning: None,
+            share: 0,
+        });
+        for (seats, selected, other) in [
+            (0, "Flat-only coordination.", "Council-only coordination."),
+            (3, "Council-only coordination.", "Flat-only coordination."),
+        ] {
+            s.council = seats;
+            let composed = policies(&s, 0..2).unwrap();
+            for identity in ["", "reviewer"] {
+                let text = composed[identity]["instructions"].as_str().unwrap();
+                assert!(text.contains(selected));
+                assert!(!text.contains(other));
+                assert_eq!(text.contains("Reviewer identity."), identity == "reviewer");
+            }
+        }
+        // Later additions recompose the selected file, including edits since launch.
+        std::fs::write(roles.join("swarm-council.md"), "Revised council behavior.").unwrap();
+        let updated = policies(&s, std::iter::once(1)).unwrap();
+        assert!(
+            updated["reviewer"]["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("Revised council behavior.")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn a_mix_is_rows_of_an_identity_a_model_and_shares_that_make_100() {
         let row = |identity: &str, model: &str, share| Mix {
             identity: identity.into(),
@@ -4057,7 +4407,8 @@ mod tests {
             (vec![row("", " ", 100)], "model"),
             (vec![row("", "a/x", 0), row("", "a/x", 100)], "share"),
             (vec![row("../x", "a/x", 100)], "identity"),
-            (vec![row("swarm", "a/x", 100)], "identity"),
+            (vec![row("swarm-flat", "a/x", 100)], "identity"),
+            (vec![row("swarm-council", "a/x", 100)], "identity"),
             (vec![row("coordinator", "a/x", 100)], "identity"),
             ((0..9).map(|_| row("", "a/x", 1)).collect(), "rows"),
         ] {
@@ -4097,7 +4448,7 @@ mod tests {
         let dir = Path::new("/h/.agent/swarms/abc/agent.latency");
         let brief = brief(&s, dir, &agent(1), false);
         assert_eq!(
-            brief,
+            brief.split("\nFirst member:").next().unwrap(),
             [
                 "You are latency-1, one of 4 agents in the swarm latency, all working in this folder.",
                 "Goal: Halve p99.",
@@ -4112,11 +4463,177 @@ mod tests {
             ]
             .join("\n")
         );
+        assert!(brief.contains("First member: latency-1"));
+        assert!(brief.contains("Your lifetime allowance: 750000 tokens"));
         let late = super::brief(&swarm(&[&agent(1)]), Path::new("/it's"), &agent(1), true);
         assert!(late.contains(r"Post: '/it'\''s/post' TEXT"), "{late}");
-        assert!(late.ends_with(
-            "The others: none yet\nYou joined after the others started, so read the board first."
+        assert!(late.ends_with("You joined after the others started, so read the board first."));
+    }
+
+    #[test]
+    fn the_coordinator_hears_the_final_result_and_a_swarm_gone_quiet_once() {
+        let root = scratch("coordinator");
+        let s = Swarm {
+            coordinator: Some(("agent.lead".into(), 90)),
+            ..swarm(&[&agent(1), &agent(2)])
+        };
+        let dir = claim(&root, &s.name).unwrap();
+        fill(&dir, &s, Path::new("/app")).unwrap();
+        assert_eq!(Swarm::read(&dir).unwrap().coordinator, s.coordinator);
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let on = running.clone();
+        let fake = Fake::start(
+            "coordinator",
+            Box::new(move |op, _| match op {
+                "bots" => {
+                    let turn = on.load(std::sync::atomic::Ordering::Relaxed).then_some(7);
+                    Ok(json!({"bots": [
+                        {"name": agent(1), "id": 1, "tokens_used": 10, "budget_tokens": 1000},
+                        {"name": agent(2), "id": 2, "tokens_used": 10, "budget_tokens": 1000, "running_turn": turn},
+                    ], "next_after": null}))
+                }
+                "submit" => Ok(json!({"status": "queued"})),
+                _ => Err("unexpected".into()),
+            }),
+        );
+        let rt = runtime();
+        let (client, _events) = rt.block_on(Client::connect(&fake.socket)).unwrap();
+        let client = Arc::new(client);
+        let check = || {
+            rt.block_on(act(&client, &root, &s.name, None, Act::Check))
+                .unwrap()
+        };
+        let told = || {
+            fake.ops("submit")
+                .into_iter()
+                .filter(|p| p["bot"] == "agent.lead")
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(check()["board_changed"], false);
+        assert!(told().is_empty(), "a working swarm is not reported");
+        running.store(false, std::sync::atomic::Ordering::Relaxed);
+        let changed = check();
+        assert_eq!(changed["board_changed"], true);
+        assert!(
+            changed.get("budget").is_none(),
+            "a stall alone changes the board"
+        );
+        assert_eq!(check()["board_changed"], false);
+        let quiet = told();
+        assert_eq!(quiet.len(), 1, "told once while it stays quiet");
+        assert_eq!(
+            (quiet[0]["delivery"].as_str(), quiet[0]["bot_id"].as_i64()),
+            (Some("queue"), Some(90))
+        );
+        let prompt = quiet[0]["prompt"].as_str().unwrap();
+        assert!(
+            prompt.contains("no final result (partial)") && prompt.ends_with("/status'"),
+            "{prompt}"
+        );
+        let author = Author {
+            bot: agent(1),
+            id: 1,
+            turn: 3,
+        };
+        let finish = Act::Work(work::Action::Finish {
+            outcome: "partial".into(),
+            summary: "Two of three pieces reviewed.".into(),
+        });
+        rt.block_on(act(&client, &root, &s.name, Some(author), finish))
+            .unwrap();
+        let done = told().pop().unwrap();
+        assert!(done["prompt"].as_str().unwrap().starts_with(
+            "[swarm agent.latency] final result from latency-1: partial. Two of three"
         ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn waking_members_defers_quiet_notification_until_the_next_check() {
+        for stopped in [false, true] {
+            for failed in [false, true] {
+                let tag = format!("wake-quiet-{stopped}-{failed}");
+                let root = scratch(&tag);
+                let s = Swarm {
+                    coordinator: Some(("agent.lead".into(), 90)),
+                    ..swarm(&[&agent(1), &agent(2)])
+                };
+                let dir = claim(&root, &s.name).unwrap();
+                fill(&dir, &s, Path::new("/app")).unwrap();
+                let fake = Fake::start(
+                    &tag,
+                    Box::new(move |op, request| match op {
+                        "bots" => Ok(json!({"bots": [
+                        {"name": agent(1), "id": 1, "tokens_used": 10, "budget_tokens": 1000},
+                        {"name": agent(2), "id": 2, "tokens_used": 10, "budget_tokens": 1000},
+                    ], "next_after": null})),
+                        "submit" if failed && request["bot"] != "agent.lead" => {
+                            Err("cannot_start".into())
+                        }
+                        "submit" => Ok(json!({"status": "queued"})),
+                        _ => Err("unexpected".into()),
+                    }),
+                );
+                let rt = runtime();
+                let (client, _events) = rt.block_on(Client::connect(&fake.socket)).unwrap();
+                let check = || {
+                    rt.block_on(act(&client, &root, &s.name, None, Act::Check))
+                        .unwrap()
+                };
+                let told = || {
+                    fake.ops("submit")
+                        .iter()
+                        .filter(|p| p["bot"] == "agent.lead")
+                        .count()
+                };
+                // Cover the first wake and a later wake after reporting a
+                // stall, including turns that end between scans.
+                for previous in 0..2 {
+                    update(&dir, |s| {
+                        s.stopped = stopped;
+                        Ok(())
+                    })
+                    .unwrap();
+                    let answer = rt
+                        .block_on(act(
+                            &client,
+                            &root,
+                            &s.name,
+                            None,
+                            Act::Post {
+                                text: "Continue the work".into(),
+                                all: false,
+                            },
+                        ))
+                        .unwrap();
+                    assert_eq!(
+                        fake.ops("submit")
+                            .iter()
+                            .filter(|p| p["bot"] != "agent.lead")
+                            .count(),
+                        2 * (previous + 1)
+                    );
+                    assert_eq!(
+                        answer["missed"].as_array().unwrap().len(),
+                        if failed { 2 } else { 0 }
+                    );
+                    assert_eq!(
+                        told(),
+                        previous,
+                        "a post waking members must not report a stall"
+                    );
+                    assert!(!Swarm::read(&dir).unwrap().stopped);
+                    check();
+                    check();
+                    assert_eq!(
+                        told(),
+                        previous + 1,
+                        "a later idle scan reports quiet once, even after failed delivery"
+                    );
+                }
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
     }
 
     /// A daemon that answers each request with `answer`, and keeps them.
@@ -4245,6 +4762,7 @@ mod tests {
             agents,
             budget_tokens: 4_000,
             council: 0,
+            coordinator: None,
         };
         let out = rt
             .block_on(super::start(
@@ -4418,6 +4936,18 @@ mod tests {
 
     #[test]
     fn a_coordinator_asks_for_a_swarm_with_flags_and_a_goal() {
+        assert_eq!(
+            parse_start(&["--agents", "8", "--", "Audit"].map(str::to_owned))
+                .unwrap()
+                .budget_tokens,
+            80_000_000
+        );
+        assert_eq!(
+            parse_start(&["--agents", "8", "--budget", "12", "--", "Audit"].map(str::to_owned))
+                .unwrap()
+                .budget_tokens,
+            12_000_000
+        );
         let args = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
         let asked = parse_start(&args(
             "--agents 6 --budget 12.5 --council 3 --in-project --row openai/gpt-6-luna,70,,high --row b/y,30,reviewer -- Halve p99.",
@@ -4456,7 +4986,7 @@ mod tests {
                 plain.council,
                 plain.shared
             ),
-            (4, 3_000_000, 0, true)
+            (4, 40_000_000, 0, true)
         );
         assert!(plain.mix.is_empty());
         for bad in [
@@ -4519,6 +5049,7 @@ mod tests {
             agents: 1,
             budget_tokens: 1_000,
             council: 0,
+            coordinator: None,
         };
         let error = rt
             .block_on(super::start(&client, &root, Path::new("/app"), start))
@@ -4565,6 +5096,7 @@ mod tests {
             agents: 2,
             budget_tokens: 2_000,
             council: 3,
+            coordinator: None,
         };
         let refused = rt.block_on(super::start(&client, &root, Path::new("/app"), start));
         assert!(refused.unwrap_err().starts_with("invalid_council"));
@@ -4582,6 +5114,7 @@ mod tests {
             agents: 2,
             budget_tokens: 2_000,
             council: 0,
+            coordinator: None,
         };
         let out = rt
             .block_on(super::start(&client, &root, Path::new("/app"), start))
@@ -5151,7 +5684,7 @@ mod tests {
         used.store(2_200_000, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
             check()["budget"],
-            "the swarm has used 90% of its budget (2.8M of 3M tokens)"
+            "the swarm has used 80% of its budget (2.8M of 3M tokens)"
         );
         let steers = fake.ops("submit");
         assert_eq!(steers.len(), 2);
@@ -5166,11 +5699,11 @@ mod tests {
             .filter(|l| l["from"] == "budget")
             .map(|l| json!([l["spent"], l["sent"]]))
             .collect();
-        assert_eq!(spent, vec![json!([50, 1]), json!([90, 1])]);
+        assert_eq!(spent, vec![json!([50, 1]), json!([80, 1])]);
         let state = State::read(&dir).unwrap();
         assert_eq!(
             (state.spent, state.helpers.len(), state.gone),
-            (90, 0, 600_000)
+            (80, 0, 600_000)
         );
         assert_eq!(Swarm::read(&dir).unwrap().left, Vec::<i64>::new());
         std::fs::remove_dir_all(root).unwrap();

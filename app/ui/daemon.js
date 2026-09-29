@@ -330,7 +330,7 @@ window.Daemon = (() => {
       const b = S.bots.get(m); if (!b || m === from) continue;
       const isNamed = named.includes(short(sw, m)) || named.includes(m);
       const prompt = `[board] ${from ? short(sw, from) : 'user'}: ${text}`;
-      if (stream && !isNamed && sw.state.streams[short(sw, m)] !== stream) continue;
+      if (from ? !isNamed : named.length && !isNamed) continue;
       if (b.status !== 'idle') steer(m, prompt, by);
       else if (isNamed || (!from && !named.length)) reply(m, prompt, by);
     }
@@ -414,7 +414,7 @@ window.Daemon = (() => {
     branch: async (dir) => { const m = /\/worktrees\/([^/]+)$/.exec(dir ?? ''); return m ? `agent/${m[1]}` : null; },
     swarms: async () => ({ swarms: [...S.swarms.values()].map(swarmRecord), broken: [] }),
     // The demo has no editor to open: Edit only says your copy is now the one read.
-    roles: async () => [{ name: 'coordinator', file: S.ownRoles?.has('coordinator') ? '/home/you/.agents/agents/coordinator.md' : null }, { name: 'swarm', file: S.ownRoles?.has('swarm') ? '/home/you/.agents/agents/swarm.md' : null }],
+    roles: async () => ['coordinator', 'swarm-flat', 'swarm-council'].map(name => ({ name, file: S.ownRoles?.has(name) ? `/home/you/.agents/agents/${name}.md` : null })),
     editRole: async (name) => { (S.ownRoles ??= new Set()).add(name); return `/home/you/.agents/agents/${name}.md`; },
     // Schedules a coordinator made: a task that checks its PR, a one-off for itself, and one whose
     // agent was deleted before its time came.

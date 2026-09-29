@@ -662,7 +662,10 @@ daemon learns nothing about projects; everything here is client work.
   they work (one worktree they share, `~/.agent/worktrees/PROJECT.NAME` on
   `agent/PROJECT.NAME` with the folder's `.agents/setup` run in it, or the
   project folder), and a token budget typed in millions (0.1 to 1,000),
-  split evenly among them, each agent's share shown beside it. A goal is
+  split evenly among them, each agent's share shown beside it. The default is
+  **10 million per agent** (40 million for four), scaling with the agent count
+  until the user edits the total. Input is counted again on every call,
+  including cached input. Smaller explicit totals remain allowed. A goal is
   at most 16 KiB. The swarm is named after the goal's longest telling word
   among its first six; a name a bot holds (or its agents' names), or whose
   folder, worktree or branch another swarm or store holds, is skipped for
@@ -712,30 +715,30 @@ daemon learns nothing about projects; everything here is client work.
   file then replaces `state.json`; the next act under the lock, or the
   next read of the board, finishes a change whose lines are all on the board and otherwise cuts the board back
   to where it was and drops the change. Then scripts that run the app's own
-  executable with `--swarm-post`: `post` and `role`, and with a council
+  executable with `--swarm-post`: `post`, `role`, `assign`, `claim`,
+  `submit`, `review`, `finish`, `leave`, `status`, and with a council
   `propose`, `vote` and `join` (replaced whole when the app moves). Its agents
   are ordinary bots named `PROJECT.NAME-N`, each created with its row's
-  model and its share of the budget, and started in the `swarm` profile
-  (the folder's, the user's, or the one the app ships,
-  [swarm.md](../app/agents/swarm.md)); an agent with an identity starts in
-  that profile, with the `swarm` profile's text after its own and the
+  model and its share of the budget, and started in the mode's profile:
+  [swarm-flat.md](../app/agents/swarm-flat.md) or
+  [swarm-council.md](../app/agents/swarm-council.md). Each uses the folder's
+  override, then the user's, then the shipped file. An agent with an identity
+  starts in that profile, with the selected mode's text after its own and the
   identity's tools, which must include `shell` since the board's scripts
   run in it. Each joins the swarm once created, and then gets a first
   message naming it, the goal, the others with their identities, the board
   and its scripts (and, with a council, the seats). A card and a post show
   an agent's identity, and its model when the swarm has more than one. A post is written to the board, then
   steered into the agents it reaches over one daemon connection: an
-  agent's post reaches the agents working now, strictly into their running
-  turns (a turn that ended meanwhile is skipped; the post waits on the
-  board), and wakes an idle agent only when it names it with `@NAME`; your
-  post wakes every agent, or only the ones it names. A post holds the
-  board's lock until its steers are sent, and Stop holds it throughout, so
-  a post either comes first and Stop ends what it started, or waits for
-  Stop: an agent's is then refused, and yours resumes the swarm. So agents talking
-  never wake a swarm that went quiet. A post is at most 16 KiB and comes
-  only from a member, named by its shell's `AGENT_BOT`, `AGENT_BOT_ID` and
-  `AGENT_TURN`; the daemon records it as each steer's author. Every steer
-  names its member's bot id, so a bot deleted and made again under a
+  ordinary publication does not interrupt anyone. `@NAME` delivers only to
+  named members, waking them if idle. `post --all` explicitly wakes all other
+  members. Your post wakes everyone, or only the agents it names. A post holds
+  the board lock until delivery completes, and Stop holds the same lock, so a
+  post either precedes Stop or is refused afterwards; your post resumes a
+  stopped swarm. A post is at most 16 KiB and comes only from a member, named
+  by its shell's `AGENT_BOT`, `AGENT_BOT_ID` and `AGENT_TURN`; the daemon records
+  it as each steer's author. Every steer pins the member's bot id, so a bot
+  deleted and recreated under a
   member's name is not a member: a post misses it, and the app keeps it in
   the sidebar and out of the swarm's cards and counts; a deleted agent
   leaves its swarm when the app sees it go, taking its share of the budget,
@@ -789,14 +792,89 @@ daemon learns nothing about projects; everything here is client work.
   counts and still stops, as long as a look saw its maker first; Stop keeps
   what each of its looks saw, so a Stop tried again after one that failed
   still finds such a helper. Each act that reads the daemon's list, and a check the page
-  asks for at most every five seconds a swarm as its agents finish turns,
-  tells the working agents when the swarm passes 50%, 75% or 90% of its
-  budget: a `budget` line on the board, each share once (`state.json`
-  keeps the last), and in the answer of the act that passed it.
+  asks for on **usage events during model/tool work**, tell the working agents
+  at 50%, 65% and 80% of their allowances. A check lists the swarm's bots and
+  takes its board lock, so the page asks for one only once the tokens its
+  usage events report (input, cached included, plus output) since the last
+  check reach a twentieth of a member's allowance, or when a turn finishes;
+  each warning lands within five points of its mark. Checks are coalesced
+  over 250 ms with one in flight per swarm, including offscreen swarms and
+  descendants, and a check with nothing to say writes nothing.
+  Both total and individual allowances are checked: idle peers cannot hide
+  a worker running out. Individual notices name exact used/remaining tokens
+  and target the observed running turn; a stale notice cannot wake a finished
+  agent. The role starts reporting at 65% and keeps the final 20% for review
+  and synthesis. This reserve is a work instruction, not a second allowance
+  or a relaxation of the runtime cap. Checks require an attached app or a
+  board operation; `status` also exposes remaining allowances. Checks return
+  `board_changed` when they append an entry, so the open board refreshes for
+  budget and stall notices without extra reads after unchanged checks. A call can
+  cross a threshold before delivery, and the runtime's existing admission
+  check can allow one call to overshoot its token limit.
+- **Work and results.** The board is the shared place for deliverable decisions,
+  changes of approach, progress and results, all visible in the app. There is
+  no separate planning file. The separately editable `swarm-flat` and
+  `swarm-council` Markdown profiles define how agents derive the deliverable, completion evidence, work split and handoff
+  owner from the request. It asks for a concise board agreement before work,
+  revised through board posts as agents learn. No task-type enum or output
+  template is prescribed. Under the default profiles, the first member posts
+  the agreement with every piece's owner and reviewer and registers those
+  assignments itself, so peers wake to work already theirs; other members
+  explore briefly and wait for it. Council votes on those assignments assess
+  the agreement with its pieces. These work
+  habits live in the profile, not in generated launch or budget messages.
+  `assign TASK OWNER REVIEWER BRIEF` is available to every member and records
+  distinct work with an independent reviewer. Each owner has at most one
+  unfinished task. `claim TASK` checks ownership atomically under the board
+  lock. In council mode each assignment becomes a proposal and the owner
+  cannot claim it until approved. `submit TASK RESULT` preserves evidence,
+  leaves the owner's stream and wakes its reviewer. `review TASK
+  supported|conditional|rejected EVIDENCE` is accepted only from that reviewer
+  and closes the stream. The profile requires checking the actual output
+  against the board agreement, including integration when relevant.
+  The swarm chooses its handoff owner on the board; any member can publish
+  `finish achieved|partial|failed SUMMARY`. It records one current final result with
+  `outcome`, `summary`, `by` and `at`. The summary can contain outputs or point
+  to them, with evidence and remaining gaps. The profile asks agents to review
+  the work before claiming `achieved`; `finish` records their judgment without
+  enforcing that workflow. It accepts a handoff with unfinished work or no
+  assignments. A rejected hypothesis might still satisfy an investigation,
+  so verdicts do not mechanically determine task success.
+  The swarm judges completion against the request; the harness records that
+  assessment, not automatic certification. An updated `finish` replaces the
+  current result when its outcome or summary changes; earlier handoffs remain
+  on the board. An identical repeat is refused without another notification
+  or write. Continued work can therefore turn a partial handoff into an
+  achieved one without creating another assignment. Finish does not cancel running
+  turns. The profile asks the handoff owner to coordinate before finalizing.
+  These checks establish authorship and lifecycle, not truth or sufficiency
+  of evidence. `leave` releases actual membership; a working task becomes
+  assigned again. Members can revise released assignments or recover a
+  departed member's task; council revisions require fresh approval. A
+  submitted task whose reviewer departed keeps its result: assigning a new
+  reviewer hands it over for review without new work or approval, even if
+  its original owner also left. Keep that original owner in the assignment;
+  authorship and the submitted result are preserved. A new
+  assignment clears the current final result, retaining its board history.
+  A swarm with one member needs another for independent review.
+  The Work/Streams view shows partial results, verdicts and the final outcome.
+  The `status` script is callable by the coordinator or a terminal without
+  impersonating a member. Its JSON includes member states,
+  remaining budgets, tasks, partial results, `result`, last board activity and
+  the top-level `outcome`: `running`, `partial`, `blocked`, `failed`, `stopped`,
+  `budget_exhausted` or `completed`. `budget_exhausted` means the swarm's
+  total is spent or every member is at its cap; a helper at its own cap, or
+  one member out while others work, is not, and `exhausted_members` names
+  members at their caps. Here `completed` means a final handoff was
+  published, regardless of whether agents still run; `result.outcome` states
+  whether the goal was achieved, partial or failed. Without a handoff, `result`
+  is null and task outputs remain available. Finished bot turns alone never
+  establish task success. Task constraints remain instructions; no
+  write-prevention policy is introduced.
 - **Swarms a coordinator starts.** The app writes `~/.agent/swarms/start`
   each time it opens, a script that runs the app's executable with
   `--swarm-start` and no window, as the board's scripts do. It takes
-  `--agents N` (4), `--budget MILLIONS` (3), `--council 3`, `--in-project`
+  `--agents N` (4), `--budget MILLIONS` (an explicit total; otherwise 10 per agent), `--council 3`, `--in-project`
   (else one shared worktree) and any number of `--row MODEL,SHARE[,IDENTITY]`,
   then `-- GOAL`; without rows every agent is a plain agent on the
   coordinator's own model. It runs only in a coordinator's shell (its bot is
@@ -813,16 +891,27 @@ daemon learns nothing about projects; everything here is client work.
   it. A window learns of a swarm it did not start when an agent it does
   not know, named like an agent (`-N`), takes a turn: it reads the swarms
   again once for a burst of those, and at most once for each such name.
-- **The roles as files.** Settings lists the app's `coordinator` and
-  `swarm` roles and whether you have your own file for each. Edit writes
+  `swarm.toml` keeps the starting coordinator's name and bot id, and the
+  coordinator hears from its swarm by a queued message starting
+  `[swarm NAME]`, which never interrupts its running turn and names the
+  status script: `finish` sends the final result, and a check that finds
+  nothing running (helpers included) and no final result says so once,
+  again only after something has run since. Only the page's budget checks
+  can find a swarm quiet (an agent acting is running), so a quiet swarm is
+  reported only while the app is attached. A swarm you start from
+  the sheet has no coordinator and tells nobody.
+- **The roles as files.** Settings lists the app's `coordinator`, `swarm-flat` and
+  `swarm-council` roles and whether you have your own file for each. Edit writes
   `~/.agents/agents/NAME.md` from the app's text only when it is missing
   (whole beside it, then linked into place),
   then opens it with `open -t` (`xdg-open` elsewhere). The file is the
   user's profile of that name, read in every folder that has none of its
   own. A bot's instructions are fixed when it is made, so an edit applies
-  to coordinators and swarm agents made afterwards.
-- **Swarm councils.** The sheet's "Organized as" picks one board (every
-  agent takes a piece) or a council of 3, which needs at least three
+  to coordinators and swarm agents made afterwards, including members added
+  to an existing swarm. Flat and council roles are independent files; neither
+  appends the other mode's instructions.
+- **Swarm councils.** The sheet's "Organized as" picks one board (peer-owned
+  pieces with independent review) or a council of 3, which needs at least three
   agents; a start that made fewer than three deletes them (naming any it
   could not) and starts nothing. With a council, the seats are the swarm's
   first three agents; when a seat is deleted the next agent takes it, and
@@ -830,13 +919,15 @@ daemon learns nothing about projects; everything here is client work.
   council's 3 however many seats are filled. An agent proposes a stream of work with
   `propose STREAM WHY`, which wakes the other seats; a seat votes with
   `vote ID yes|no REASON`, once. A majority of the seats (2 of 3) approves or
-  denies; an approved proposal opens its stream with the proposer as lead
-  and in it, and wakes the proposer while the working agents hear it; a
-  denied one wakes only the proposer. You decide any open proposal alone
+  denies; an approved assignment puts its owner in the stream and wakes that
+  owner. A standalone proposal uses its proposer as lead. A denied proposal
+  wakes only the proposer; a denied assignment is withdrawn, freeing its
+  owner for other work, and wakes both its owner and its proposer. You decide any open proposal alone
   from the **Council** tab. `join STREAM` puts an agent in an approved
   stream (one at a time). An agent in a stream posts to that stream: the
-  post carries its tag and reaches the stream's working agents and whoever
-  it names; `post --all` reaches everyone. Your posts reach everyone. The
+  post carries its tag but is silent unless it names a recipient;
+  `post --all` explicitly notifies all peers. Reviewers do not join the task
+  they review. Your untargeted posts reach everyone. The
   head gains **Council**, with the open count, and **Streams**, the approved
   ones with their lead and agents and their roles; a tag filters the board.
 - **Not built yet.** Keep, which turns a side chat into a task, removing a
@@ -851,13 +942,17 @@ instead.
 
 ## Coordinators hear from their tasks
 
-Work goes on in the tasks a coordinator started, mostly by you working in
-them directly, and the coordinator should hear about it. The page already
+Work goes on in the tasks a coordinator started, by its own asks and by you
+working in them directly, and the coordinator should hear about it. The page already
 follows every bot, so it tells it; the daemon has no part in this beyond
 recording who asked for each turn (`from` on `accepted` and `queued`).
 A turn counts when it ends in a bot the project's `PROJECT.lead` created,
-unless the coordinator asked for it itself (its `from` names the lead) or
-the bot is the coordinator's own fork or side chat (`PROJECT.lead-…`). A
+unless the coordinator is waiting on that very turn (its `turn_waiting`
+names the handle, so its `wait` reads the reply) or the bot is the
+coordinator's own fork or side chat (`PROJECT.lead-…`). A turn of such a
+task that starts waiting for an approval (`turn_waiting` with `approval`)
+counts too, since only you can give it; the coordinator's role raises it
+to you. A
 steer's turn is part of the turn it joined. Turns replayed on attach are
 history, not news; one that ends live while the window is still reading the
 list of bots is held until the list says who made its bot, and dropped if the bot is
@@ -866,8 +961,10 @@ deleted meanwhile or the window detaches first. A queued turn's
 event was pruned still knows the coordinator asked for it. The coordinator is told only while it rests (nothing is armed while it
 works), at most
 once every ten minutes, in one message queued to it: `Task updates:`, then
-one line per task with its latest ended turn's handle and status, and how
-many turns ended before it since which handle. The handles are what its
+one line per task with its latest ended turn's handle and status (or
+`waiting for approval`), who asked for it (`you` for the coordinator's own
+ask, a bot's name, or `the person`), and how many turns ended before it
+since which handle. The handles are what its
 `wait` tool reads a final reply by, so the message stays small however much
 was said. The page keeps only that per task (first and latest turn, a
 count), so a long coordinator turn or a failing daemon cannot grow it. One
@@ -880,8 +977,9 @@ otherwise answer in one line. A message that fails is kept for the next
 one, and one due while the window was detached goes out when it attaches
 again; a coordinator deleted, or gone when the window reattaches, has its
 dropped. The window must be open for it. The message's `request_id` is made
-from the coordinator's id and a hash of the newest turn of each task it
-covers, so two windows with the same news make one turn: the daemon answers
+from the coordinator's id and a hash of each task's newest turn, status and
+approval call ID. Separate approvals and completion in one turn are distinct,
+while two windows with the same news make one turn: the daemon answers
 the second with the first, or with `idempotency_conflict` when that window
 counted from an earlier turn, which it takes as told. A task deleted before
 its news goes out is dropped from it.
@@ -1071,6 +1169,16 @@ The UI bounds payload buffering, history decoding, and rendered fleet rows:
   a partial socket write closes the session before another request can write.
 
 ## Verified
+
+2026-09-29 swarm coordination update: the UI state suite covers budget defaults,
+usage-triggered checks while turns are running, coalescing, partial work and
+review rendering. Rust tests cover exclusive claims, durable partial results,
+council approval, separate authorship for review, and completion. Synthetic
+real-daemon tests exercise targeted delivery and the `assign` → `claim` →
+`submit` → `review` → `finish` lifecycle, including external `status` reads.
+These validate the contracts, not the quality of real-model collaboration;
+a matched real-provider comparison remains in the queue. No installed app or
+existing bot instructions were changed by this source update.
 
 2026-09-19. Demo mode in a browser: the scenario renders as the concept
 (cards with elapsed at the right edge, thought fold, wait line), `^p` opens a

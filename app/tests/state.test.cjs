@@ -33,7 +33,7 @@ function page(daemon = {}, storage = null) {
   });
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules, tellLead };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -555,7 +555,7 @@ test('a task that ends live before the snapshot names its creator still reaches 
   assert.equal(p.S.live,true);assert.equal(p.S.wakes.size,0,'no creator known yet');
   snapshot.resolve({bots:[{name:'demo.lead',id:1,provider:'openai',model:'m'},{name:'demo.build',id:2,provider:'openai',model:'m',created_by:'demo.lead',created_by_id:1}],next_after:null});
   await attaching;
-  assert.deepEqual({...p.S.wakes.get('demo.lead').tasks.get('demo.build')},{first:4,turn:4,status:'completed',count:1});
+  assert.deepEqual({...p.S.wakes.get('demo.lead').tasks.get('demo.build')},{first:4,turn:4,status:'completed',by:'the person',count:1});
   assert.equal(p.S.heldNews.length,0);
   // News held for a bot deleted meanwhile is not a later same-named bot's.
   p.S.heldNews.push(['demo.build',5,'completed',undefined]);p.forgetBot('demo.build');
@@ -1284,17 +1284,22 @@ test('the sheet offers the folder\'s profiles as identities and shows each row\'
   assert.match(el('sw-mix').innerHTML, /data-mix="0" data-f="reasoning"[^>]*>[\s\S]*?<option value="high" selected>high<\/option>/);
   assert.match(el('sw-mix').innerHTML, /<option value="" selected>Plain agent<\/option><option value="reviewer">reviewer<\/option>/);
   assert.match(el('sw-mix').innerHTML, /4 agents/);
-  assert.equal(el('sw-each').textContent, 'about 750k tokens each');
+  assert.match(el('sw-each').textContent, /^10M tokens per agent/);
+  assert.equal(el('sw-budget').value, '40');
   // Any whole number of agents can be typed; anything else says what it takes.
   el('sw-n').value = '23'; el('sheet').listeners.input({ target: el('sw-n') });
   assert.match(el('sw-mix').innerHTML, /23 agents/);
-  assert.match(el('sw-each').textContent, /past 16 agents/);
+  assert.equal(el('sw-budget').value, '230');
+  assert.match(el('sw-each').textContent, /^10M tokens per agent/);
   el('sw-n').value = '2.5'; el('sheet').listeners.input({ target: el('sw-n') });
   assert.match(el('sw-mix').innerHTML, /Agents is a whole number from 1 to 64/);
   el('sw-n').value = '4'; el('sheet').listeners.input({ target: el('sw-n') });
   // The budget is typed in millions, and each agent's share follows it.
   el('sw-budget').value = '12'; el('sheet').listeners.input({ target: el('sw-budget') });
-  assert.equal(el('sw-each').textContent, 'about 3M tokens each');
+  assert.match(el('sw-each').textContent, /^3M tokens per agent/);
+  el('sw-n').value = '6'; el('sheet').listeners.input({ target: el('sw-n') });
+  assert.equal(el('sw-budget').value, '12', 'an explicitly entered total is preserved');
+  el('sw-n').value = '4'; el('sheet').listeners.input({ target: el('sw-n') });
   el('sw-budget').value = '0'; el('sheet').listeners.input({ target: el('sw-budget') });
   assert.match(el('sw-mix').innerHTML, /Budget is 0.1 to 1000 million tokens/);
   el('sw-budget').value = '3'; el('sheet').listeners.input({ target: el('sw-budget') });
@@ -1498,7 +1503,7 @@ test('a helper finishing a turn has its swarm check its budget, and only current
   // passed a share reads the board, which no agent's event may do.
   let reads = 0; p.context.Daemon.swarmBoard = async () => { reads += 1; return { lines: [], offset: 0, more: false, reset: true, state: sw.state }; };
   let passed = null;
-  p.context.Daemon.swarmCheck = async (swarm) => { checks.push(swarm); return { budget: passed }; };
+  p.context.Daemon.swarmCheck = async (swarm) => { checks.push(swarm); return { budget: passed, board_changed: !!passed }; };
   sw.left = [11]; p.S.selected = '⁂app.latency';
   p.upsert({ name: 'app.latency-5.fix', id: 12, provider: 'alpha', model: 'one', created_by: 'app.latency-5', created_by_id: 11 });
   await p.handle({ event: 'turn_finished', bot: 'app.latency-5.fix', turn: 1, durable: true }, 1);
@@ -1511,6 +1516,31 @@ test('a helper finishing a turn has its swarm check its budget, and only current
   assert.equal(reads, 2 * quiet + 1, 'the same reads again, and one more for the budget line');
   // A seat that left keeps no say: latency-9's yes is not counted, and the majority is still of the council's three.
   assert.equal(p.tally(sw, { votes: { 'latency-1': { yes: true }, 'latency-9': { yes: true } } }), '1 yes of 3');
+});
+
+test('a stall notice refreshes the open board, while an unchanged check adds no read', async () => {
+  const persisted = [], checks = [];
+  let reads = 0;
+  const p = shell({
+    swarmBoard: async (_, offset) => { reads++; return { lines: persisted.slice(offset ?? 0), offset: persisted.length }; },
+    swarmCheck: async () => { const pending = deferred(); checks.push(pending); return pending.promise; },
+    request: async () => ({ bots: [], nodes: [], next_after: null }),
+  });
+  p.upsert({ name: 'app.latency-1', id: 3, status: 'running' });
+  const sw = p.learnSwarm(swarmRecord(['app.latency-1'], { ids: { 'app.latency-1': 3 } }));
+  p.S.selected = '⁂app.latency';
+  for (const changed of [true, false]) {
+    const before = reads;
+    await p.handle({ event: 'turn_finished', bot: 'app.latency-1', turn: changed ? 1 : 2, data: { status: 'completed' } }, 1);
+    await p.tick();
+    assert.equal(reads, before + 1, 'the event reads the board before the check completes');
+    if (changed) persisted.push({ at: 1, from: 'swarm', kind: 'quiet', text: 'nothing is running and there is no final result (partial)' });
+    checks.at(-1).resolve({ board_changed: changed });
+    await settle(); await p.tick();
+    assert.equal(reads, before + (changed ? 2 : 1), 'only an appended entry causes a follow-up read');
+    assert.equal(sw.lines.length, 1);
+    assert.equal(sw.lines[0].kind, 'quiet');
+  }
 });
 
 test('a deleted agent leaves its swarm', async () => {
@@ -1668,13 +1698,13 @@ test('a provider that fails says why beside the ones that answered', async () =>
   assert.match(row, /✓ 1 model</); assert.match(row, /bedrock-openai: provider_http_401: no</); assert.match(row, /data-act="setup-retry"/);
 });
 
-test('Settings edits the coordinator and swarm roles as your own files', async () => {
+test('Settings edits flat and council profiles independently', async () => {
   const edited = [], own = new Set();
   const p = shell({
     settings: async () => ({ providers: ['openai'], region: null, profile: null, keys: [] }),
     request: async () => ({ providers: { openai: { models: [{ id: 'gpt' }] } } }),
     models: async () => [{ id: 'openai/gpt' }],
-    roles: async () => ['coordinator', 'swarm'].map((name) => ({ name, file: own.has(name) ? `/home/u/.agents/agents/${name}.md` : null })),
+    roles: async () => ['coordinator', 'swarm-flat', 'swarm-council'].map((name) => ({ name, file: own.has(name) ? `/home/u/.agents/agents/${name}.md` : null })),
     editRole: async (name) => { edited.push(name); own.add(name); return `/home/u/.agents/agents/${name}.md`; },
   });
   // Onboarding has no roles to show; Settings, once a project exists, does.
@@ -1688,7 +1718,15 @@ test('Settings edits the coordinator and swarm roles as your own files', async (
   assert.deepEqual(edited, ['coordinator']);
   html = p.setupHTML();
   assert.match(html, /Coordinator<\/span><span class="st">~\/.agents\/agents\/coordinator.md/);
-  assert.match(html, /Swarm agent<\/span><span class="st dim">the app's own/);
+  assert.match(html, /Flat swarm<\/span><span class="st dim">the app's own/);
+  assert.match(html, /Council swarm<\/span><span class="st dim">the app's own/);
+  await p.act({ dataset: { act: 'edit-role', v: 'swarm-flat' } });
+  html = p.setupHTML();
+  assert.match(html, /Flat swarm<\/span><span class="st">~\/.agents\/agents\/swarm-flat.md/);
+  assert.match(html, /Council swarm<\/span><span class="st dim">the app's own/);
+  await p.act({ dataset: { act: 'edit-role', v: 'swarm-council' } });
+  assert.deepEqual(edited, ['coordinator', 'swarm-flat', 'swarm-council']);
+  assert.match(p.setupHTML(), /Council swarm<\/span><span class="st">~\/.agents\/agents\/swarm-council.md/);
 });
 
 test('removing a provider drops its key unless another provider uses it', async () => {
@@ -2072,7 +2110,10 @@ test('a coordinator hears once, when it rests, of turns its tasks ended that it 
     await p.onEvent({ event: 'accepted', bot, turn: n, data: { node: 1, ...(from ? { from: { bot: from, turn: 1 } } : {}) } });
     await p.onEvent({ event: 'turn_finished', bot, turn: n, data: { status } });
   };
-  await turn('demo.build', 1, 'completed', 'demo.lead'); // the coordinator's own ask
+  // The coordinator's own ask that it is waiting on: its wait reads the reply.
+  p.S.bots.get('demo.lead').waitingOn = ['turn:demo.build/1'];
+  await turn('demo.build', 1, 'completed', 'demo.lead');
+  p.S.bots.get('demo.lead').waitingOn = [];
   await turn('demo.lead-side', 1); // a side chat of the coordinator
   await turn('demo.build.helper', 1); // not the coordinator's task
   await p.tick();
@@ -2087,23 +2128,30 @@ test('a coordinator hears once, when it rests, of turns its tasks ended that it 
   assert.equal(sent.length, 1, 'one message for the whole batch');
   assert.equal(sent[0].bot, 'demo.lead'); assert.equal(sent[0].bot_id, 1); assert.equal(sent[0].delivery, 'queue'); assert.equal(sent[0].origin, 'tasks');
   assert.match(sent[0].prompt, /^Task updates: /);
-  assert.match(sent[0].prompt, /\n- demo\.build: turn:demo\.build\/4 completed, and 1 earlier since turn:demo\.build\/2\n- demo\.test: turn:demo\.test\/1 failed$/);
-  // Within the window, while it works: nothing until its turn ends and the window allows.
+  assert.match(sent[0].prompt, /\n- demo\.build: turn:demo\.build\/4 completed, asked by demo\.test, and 1 earlier since turn:demo\.build\/2\n- demo\.test: turn:demo\.test\/1 failed, asked by the person$/);
+  // Within the window, while it works: nothing until its turn ends and the window allows. An ask of its
+  // own that it did not wait for is news too.
   p.S.bots.get('demo.lead').status = 'running';
-  await turn('demo.test', 2);
+  await turn('demo.test', 2, 'completed', 'demo.lead');
   await p.tick();
   assert.equal(sent.length, 1);
   await p.onEvent({ event: 'turn_finished', bot: 'demo.lead', turn: 7, data: { status: 'completed' } });
   await p.tick();
   assert.equal(sent.length, 2);
-  assert.match(sent[1].prompt, /\n- demo\.test: turn:demo\.test\/2 completed$/);
-  // Nothing new: nothing sent. A deleted coordinator hears nothing more.
+  assert.match(sent[1].prompt, /\n- demo\.test: turn:demo\.test\/2 completed, asked by you$/);
+  // Nothing new: nothing sent.
   await p.tick();
   assert.equal(sent.length, 2);
+  // An approval only the person can give is news, naming no asker.
+  await p.onEvent({ event: 'turn_waiting', bot: 'demo.build', turn: 5, data: { call_id: 'c1', approval: true } });
+  await p.tick();
+  assert.equal(sent.length, 3);
+  assert.match(sent[2].prompt, /\n- demo\.build: turn:demo\.build\/5 waiting for approval$/);
+  // A deleted coordinator hears nothing more.
   await p.onEvent({ event: 'deleted', bot: 'demo.lead' });
   await turn('demo.test', 3);
   await p.tick();
-  assert.equal(sent.length, 2);
+  assert.equal(sent.length, 3);
 });
 
 test('a coordinator wake that fails is kept for the next one, and replayed turns are not news', async () => {
@@ -2123,7 +2171,7 @@ test('a coordinator wake that fails is kept for the next one, and replayed turns
   await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 3, data: { status: 'completed' } });
   await p.tick();
   assert.equal(sent.length, 1);
-  assert.match(sent[0].prompt, /turn:demo\.build\/3 completed, and 1 earlier since turn:demo\.build\/2$/);
+  assert.match(sent[0].prompt, /turn:demo\.build\/3 completed, asked by the person, and 1 earlier since turn:demo\.build\/2$/);
 });
 
 test('two windows telling a coordinator the same news make one turn, and a bot gone while detached leaves nothing behind', async () => {
@@ -2163,6 +2211,38 @@ test('two windows telling a coordinator the same news make one turn, and a bot g
   assert.equal(p.S.turnFrom.size, 0); assert.equal(p.S.wakes.size, 0);
 });
 
+test('approval calls and completion in one turn each reach the coordinator once across windows', async () => {
+  const delivered = new Map(), attempts = [];
+  const pages = [0, 1].map(() => page({ request: async (op, params) => {
+    if (op !== 'submit') return {};
+    attempts.push(params);
+    if (delivered.has(params.request_id) && delivered.get(params.request_id) !== params.prompt) throw new Error('idempotency_conflict: ');
+    delivered.set(params.request_id, params.prompt); return {};
+  }, log() {} }));
+  for (const p of pages) {
+    p.setRender(() => {}); p.S.live = true; p.S.attached = true;
+    p.upsert({ name: 'demo.lead', id: 1, status: 'idle' });
+    p.upsert({ name: 'demo.build', id: 2, status: 'running', created_by: 'demo.lead', created_by_id: 1 });
+    await p.onEvent({ event: 'accepted', bot: 'demo.build', turn: 1, data: { node: 1 } });
+  }
+  for (const [i, call] of ['c1', 'c2', null].entries()) {
+    for (const [j, p] of pages.entries()) {
+      // One window holds the first approval until its snapshot completes.
+      p.S.snapshot = i === 0 && j === 1;
+      await p.onEvent({ event: call ? 'turn_waiting' : 'turn_finished', bot: 'demo.build', turn: 1,
+        data: call ? { approval: true, call_id: call } : { status: 'completed' } });
+      if (p.S.snapshot) {
+        p.S.snapshot = false;
+        vm.runInContext('for (const news of app.S.heldNews.splice(0)) app.tellLead(...news)', p.context);
+      }
+      await p.tick();
+    }
+    assert.equal(attempts.at(-1).request_id, attempts.at(-2).request_id, 'windows deduplicate the same update');
+    assert.equal(delivered.size, i + 1, 'each approval call and the completion is distinct');
+  }
+  assert.match([...delivered.values()].at(-1), /completed, asked by the person$/);
+});
+
 test('Settings lists schedules with no project, and only then when there are some', async () => {
   const p = page({});
   const st = p.setupState();
@@ -2189,12 +2269,12 @@ test('a coordinator\'s backlog stays small however much its tasks do, and what o
   const w = p.S.wakes.get('demo.lead');
   assert.equal(w.tasks.size, 40);
   assert.equal(w.timer, null, 'nothing is armed while the coordinator works');
-  assert.deepEqual({ ...w.tasks.get('demo.t0') }, { first: 1, turn: 50, status: 'completed', count: 50 });
+  assert.deepEqual({ ...w.tasks.get('demo.t0') }, { first: 1, turn: 50, status: 'completed', by: 'the person', count: 50 });
   await p.onEvent({ event: 'turn_finished', bot: 'demo.lead', turn: 2, data: { status: 'completed' } });
   await p.tick();
   assert.equal(sent.length, 1);
   assert.equal(sent[0].prompt.split('\n').length, 1 + 32 + 1);
-  assert.match(sent[0].prompt, /\n- demo\.t0: turn:demo\.t0\/50 completed, and 49 earlier since turn:demo\.t0\/1\n/);
+  assert.match(sent[0].prompt, /\n- demo\.t0: turn:demo\.t0\/50 completed, asked by the person, and 49 earlier since turn:demo\.t0\/1\n/);
   assert.match(sent[0].prompt, /\n- 8 more tasks in the next update$/);
   assert.equal(w.tasks.size, 8);
   // Its next rest brings the rest.
@@ -2335,4 +2415,43 @@ test('schedule pages replace the previous messages and remote windows do not fet
   await p.readSchedules();
   assert.deepEqual(calls, [null, 'first']);
   assert.equal(p.setupState().schedules, null);
+});
+
+test('usage checks member and descendant budgets before any turn ends, once enough tokens could move a share', async () => {
+  const checks = [], pending = deferred();
+  const p = shell({ swarmCheck: async name => { checks.push(name); return pending.promise; }, request: async () => ({ bots: [], nodes: [], next_after: null }) });
+  p.upsert({name:'app.latency-1',id:3,provider:'alpha',model:'one'});
+  p.upsert({name:'app.latency-1.helper',id:4,provider:'alpha',model:'one',created_by:'app.latency-1',created_by_id:3});
+  const sw = p.learnSwarm(swarmRecord(['app.latency-1'], {ids:{'app.latency-1':3}}));
+  // One member of 3M: a check is due every 150k tokens, input (cached included) plus output.
+  const usage = (name, input) => p.handle({event:'usage',bot:name,turn:1,data:{input_tokens:input,output_tokens:20}},1);
+  await usage('app.latency-1', 5000); await p.tick(); assert.deepEqual(checks,[],'a small call reads nothing');
+  await usage('app.latency-1.helper', 145000); await p.tick(); assert.deepEqual(checks,['app.latency'],'a descendant\'s tokens count');
+  await usage('app.latency-1', 150000); await p.tick(); assert.equal(checks.length,1,'no overlapping scan');
+  pending.resolve({}); await settle();
+  await p.tick(); assert.equal(checks.length,2,'usage arriving during a scan causes a follow-up, without waiting for another round');
+  sw.stopped = true; await usage('app.latency-1', 300000); await p.tick(); assert.equal(checks.length,2,'a stopped swarm stays quiet');
+});
+
+test('work view retains partial findings and independent verdicts without calling a turn complete', () => {
+  const p = shell();
+  const sw = p.learnSwarm(swarmRecord(['app.latency-1','app.latency-2']));
+  sw.tab = 'streams'; sw.state.tasks = { waits: {owner:'latency-1',reviewer:'latency-2',brief:'Check wait cleanup',status:'reviewing',result:'Source evidence; measurement missing'} };
+  const el = p.context.document.getElementById('main');
+  p.renderSwarm(el,sw);
+  assert.match(el.innerHTML,/reviewing/); assert.match(el.innerHTML,/measurement missing/); assert.doesNotMatch(el.innerHTML,/Final result/);
+  sw.state.tasks.waits.status = 'reviewed'; sw.state.tasks.waits.verdict = 'conditional'; sw.state.tasks.waits.evidence = 'Only active for helper waits'; sw.state.result = {outcome:'partial',summary:'Conditional bottleneck'}; sw.stateGen = 2;
+  p.renderSwarm(el,sw); assert.match(el.innerHTML,/conditional/); assert.match(el.innerHTML,/Only active for helper waits/); assert.match(el.innerHTML,/Final result · partial/);
+  sw.state.tasks = {}; sw.state.result = {outcome:'failed',summary:'Could not access the inputs'}; sw.stateGen++;
+  p.renderSwarm(el,sw); assert.match(el.innerHTML,/Final result · failed/); assert.match(el.innerHTML,/Could not access the inputs/);
+
+  // A council's plain streams stay beside its assigned tasks; an empty flat view names its own tool.
+  sw.council = 3; sw.state.tasks = { waits: {owner:'latency-1',reviewer:'latency-2',brief:'Check wait cleanup',status:'working'} };
+  sw.state.proposals = [{id:'P1',stream:'waits',why:'w',by:'latency-1',status:'approved',votes:{}},{id:'P2',stream:'profile',why:'Profile the store',by:'latency-2',status:'approved',votes:{}}]; sw.stateGen++;
+  p.renderSwarm(el,sw); assert.match(el.innerHTML,/#waits/); assert.match(el.innerHTML,/Profile the store/);
+  sw.council = 0; sw.state.tasks = {}; sw.state.proposals = []; sw.state.result = null; sw.stateGen++;
+  p.renderSwarm(el,sw); assert.match(el.innerHTML,/no tasks yet: an agent registers one with assign/);
+  // The swarm's own notices are system lines, not a member to open.
+  sw.tab = 'board'; sw.lines = [{at:1,from:'swarm',kind:'quiet',text:'nothing is running and there is no final result (partial)'}];
+  p.renderSwarm(el,sw); assert.match(el.innerHTML,/<span class="who council">swarm<\/span>/); assert.doesNotMatch(el.innerHTML,/data-task="app\.swarm"/);
 });

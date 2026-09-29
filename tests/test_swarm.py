@@ -50,7 +50,7 @@ class SwarmPostTests(ModelFixture):
             f'[[mix]]\nidentity = ""\nmodel = "openai/synthetic-model"\nshare = 100\n'
             f'[ids]\n{pinned}[rows]\n{rows}')
         (folder / 'board.jsonl').write_text('')
-        for tool, flag in [('post', ''), ('propose', ' --propose'), ('vote', ' --vote'), ('join', ' --join')]:
+        for tool, flag in [('post', ''), ('propose', ' --propose'), ('vote', ' --vote'), ('join', ' --join'), ('status', ' --status'), ('assign', ' --assign'), ('claim', ' --claim'), ('submit', ' --submit'), ('review', ' --review'), ('finish', ' --finish')]:
             script = folder / tool
             script.write_text(f'#!/bin/sh\nexec \'{APP}\' --swarm-post \'{folder}\'{flag} "$@"\n')
             script.chmod(0o755)
@@ -70,7 +70,7 @@ class SwarmPostTests(ModelFixture):
     def settle(self, bot):
         self.agent('wait', '--store', str(self.store), f"turn:{bot}/{self.turns(bot)[-1]['turn']}")
 
-    def test_a_post_reaches_working_agents_and_wakes_only_named_idle_ones(self):
+    def test_publication_is_silent_and_mentions_deliver_only_to_named_members(self):
         self.model.release_headers = threading.Event()
         self.model.all_streaming = self.model.release_headers
         self.addCleanup(self.model.release_headers.set)
@@ -85,20 +85,20 @@ class SwarmPostTests(ModelFixture):
                 break
             time.sleep(.02)
         posted = self.post_from('p.s-1', folder, '"@s-3 take the tests"')
-        self.assertEqual((posted['steered'], posted['woke'], posted['missed']), (['s-2'], ['s-3'], []))
+        self.assertEqual((posted['steered'], posted['woke'], posted['missed']), ([], ['s-3'], []))
         board = [json.loads(line) for line in (folder / 'board.jsonl').read_text().splitlines()]
         self.assertEqual(len(board), 1)
         self.assertEqual((board[0]['from'], board[0]['bot'], board[0]['text']), ('s-1', 'p.s-1', '@s-3 take the tests'))
         self.assertEqual(board[0]['turn'], self.turns('p.s-1')[-1]['turn'])
         # The line says how many agents it was sent to: what a swarm's posts cost is on its board.
-        self.assertEqual(board[0]['sent'], 2)
+        self.assertEqual(board[0]['sent'], 1)
         # The named idle agent got a turn of its own; the other idle one heard nothing.
         woken = self.turns('p.s-3')[-1]
         self.assertEqual((woken['prompt_preview'], woken['delivery']), ('[board] s-1: @s-3 take the tests', 'steer'))
         self.assertEqual(len(self.turns('p.s-4')), 1)
-        # A post naming nobody goes only to the turns running now.
+        # A routine publication does not interrupt even a working peer.
         quiet = self.post_from('p.s-4', folder, 'profile is up')
-        self.assertIn('s-2', quiet['steered'])
+        self.assertEqual(quiet['steered'], [])
         self.assertEqual((quiet['woke'], quiet['missed']), ([], []))
         self.model.release_headers.set()
         self.agent('wait', '--store', str(self.store), f"turn:p.s-2/{self.turns('p.s-2')[-1]['turn']}")
@@ -122,6 +122,35 @@ class SwarmPostTests(ModelFixture):
         self.agent('run', '--store', str(self.store), '--bot', 'p.s-1', f'shell:"{folder}/post" hi > "{stopped}" 2>&1')
         self.assertIn('swarm_stopped', stopped.read_text())
         self.assertEqual(len((folder / 'board.jsonl').read_text().splitlines()), 3)
+
+    def test_board_decisions_and_reviewed_results_are_readable_outside_a_member(self):
+        members = ['p.s-1', 'p.s-2']
+        for bot in members:
+            self.agent('run', *self.common, '--new', '--bot', bot, 'hello')
+        folder = self.swarm(members)
+        self.post_from('p.s-1', folder, '"Deliverable: source evidence. Completion: independently checked findings."')
+        self.assertIn('Deliverable: source evidence', (folder / 'board.jsonl').read_text())
+        self.post_from('p.s-1', folder, 'waits s-1 s-2 "Inspect cleanup; report evidence"', 'assign')
+        self.post_from('p.s-1', folder, 'waits', 'claim')
+        self.post_from('p.s-1', folder, 'waits "Source inspected; no measured latency"', 'submit')
+        def status():
+            env = clean_env()
+            env['AGENT_SOCKET'] = str(self.store) + '.sock'
+            result = subprocess.run([str(folder / 'status')], env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout)
+        partial = status()
+        self.assertIsNone(partial['result'])
+        self.assertEqual(partial['tasks']['waits']['status'], 'reviewing')
+        self.assertIn('no measured latency', partial['tasks']['waits']['result'])
+        self.post_from('p.s-2', folder, 'waits conditional "Verified source; only helper-heavy workloads exercise it"', 'review')
+        self.post_from('p.s-1', folder, 'partial "One conditional finding, no measured speedup"', 'finish')
+        done = status()
+        self.assertEqual(done['outcome'], 'completed')
+        self.assertEqual(done['result']['outcome'], 'partial')
+        self.assertNotIn('plan_path', done)
+        self.assertEqual(done['tasks']['waits']['verdict'], 'conditional')
+        self.assertEqual(len(done['members']), 2)
 
     def test_a_proposal_wakes_the_seats_and_their_majority_opens_a_stream(self):
         members = ['p.s-1', 'p.s-2', 'p.s-3', 'p.s-4']
