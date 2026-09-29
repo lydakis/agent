@@ -33,7 +33,7 @@ function page(daemon = {}, storage = null) {
   });
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -1714,6 +1714,25 @@ test('a key a custom provider names stays when the catalog provider that shares 
   await p.openSetup();
   await p.removeProvider('openai');
   assert.deepEqual({ ...calls[0][1] }, { AGENT_PROVIDER: 'corp=responses,https://corp.example/v1,OPENAI_API_KEY' });
+});
+
+test('setup refresh keeps effort options tied to the current model selection', () => {
+  for (const [remembered, model, effort, max] of [
+    ['openai/gpt', 'anthropic/claude', 'max', true],
+    ['anthropic/claude', 'openai/gpt', 'high', false],
+  ]) {
+    const p = page({}, new Map([['agent:model', remembered]]));
+    p.S.config = { workspace: '/synthetic' };
+    Object.assign(p.setupState(), { open: true, settings: { providers: ['openai', 'anthropic'] },
+      list: [{ id: 'openai/gpt' }, { id: 'anthropic/claude' }] });
+    const box = p.context.document.getElementById('setup');
+    box.querySelectorAll = () => [{ id: 'setupmodel', value: model }, { id: 'setupeffort', value: effort }];
+    p.renderSetup();
+    const choices = /<select id="setupeffort"[^>]*>(.*?)<\/select>/.exec(box.innerHTML)[1];
+    assert.equal(choices.includes('value="max"'), max);
+    assert.ok(choices.includes(`value="${effort}" selected`), 'the current effort survives a refresh');
+    assert.ok(box.innerHTML.includes(`value="${model}" selected`), 'the current model survives a refresh');
+  }
 });
 
 test('a first launch with a provider but no agents opens setup on the first project', async () => {

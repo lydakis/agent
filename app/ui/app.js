@@ -2253,7 +2253,7 @@ async function applySettings(changes) {
   try { await Daemon.saveSettings(changes); st.settings = await Daemon.settings(); } finally { st.busy = null; }
   await restartDaemon();
 }
-function setupHTML() {
+function setupHTML(kept = new Map()) {
   const st = setupState(), set = st.settings, specs = set?.providers ?? [];
   const busy = st.busy ? ' disabled' : '';
   // One row per entry: an entry of several daemon providers counts their models together and names
@@ -2285,11 +2285,13 @@ function setupHTML() {
   const refresh = specs.length && S.attached ? `<button type="button" class="sbtn" data-act="setup-refresh"${busy}>Refresh models</button>` : '';
   const listed = st.listError ? `<p class="bad">${esc(st.listError)}</p>` : '';
   const projects = hasProject();
+  const model = pickedModel(st.list, kept.get('setupmodel'));
+  const effort = kept.get('setupeffort') ?? lastEffort();
   // Making a project reads its folder, which on a host is the host's.
   const project = projects ? '' : S.config?.host
     ? `<p class="dim">A project on ${esc(S.config.host)} is made there for now: the app does not yet read a host's files (AGENTS.md, profiles, .agents/project.toml). Start its lead there with agent run --new --agents --bot NAME.lead; it shows here.</p>`
     : ready && specs.length && st.list.length
-    ? `<form id="setupproj"><label><span>Folder</span><input id="setupdir" autocomplete="off" spellcheck="false" value="${esc(S.config?.workspace ?? '')}"></label><label><span>Model</span>${modelSelectHTML('setupmodel', st.list)}</label><label><span>Effort</span>${effortSelectHTML('setupeffort', pickedModel(st.list), lastEffort(), true)}</label><div class="row"><button type="submit" class="sbtn primary"${S.attached ? '' : ' disabled'}${busy}>Create project</button></div><p class="dim">The project's lead runs on this model and effort; every agent you start can use others.</p></form>`
+    ? `<form id="setupproj"><label><span>Folder</span><input id="setupdir" autocomplete="off" spellcheck="false" value="${esc(S.config?.workspace ?? '')}"></label><label><span>Model</span>${modelSelectHTML('setupmodel', st.list, model)}</label><label><span>Effort</span>${effortSelectHTML('setupeffort', model, effort, true)}</label><div class="row"><button type="submit" class="sbtn primary"${S.attached ? '' : ' disabled'}${busy}>Create project</button></div><p class="dim">The project's lead runs on this model and effort; every agent you start can use others.</p></form>`
     : `<p class="dim">${specs.length ? 'No models listed yet: see the providers above, then Refresh models.' : 'Connect a provider first.'}</p>`;
   const step = (n, title, done, body) => body ? `<section class="${done ? 'done' : ''}"><h3><span class="num">${done ? '✓' : n}</span>${title}</h3>${body}</section>` : '';
   return `<div class="shead"><b>${ready && projects ? 'Settings' : 'Set up Agent'}</b><button type="button" class="ibtn" data-act="setup-close" title="Close" aria-label="Close"${busy}>✕</button></div>`
@@ -2358,7 +2360,7 @@ function renderSetup() {
   const box = $('setup'), kept = new Map();
   for (const el of box.querySelectorAll('input, select')) kept.set(el.name || el.id, el.value);
   const focused = box.contains?.(document.activeElement) ? document.activeElement.name || document.activeElement.id : null;
-  box.innerHTML = setupHTML();
+  box.innerHTML = setupHTML(kept);
   for (const el of box.querySelectorAll('input, select')) { const v = kept.get(el.name || el.id); if (v !== undefined) el.value = v; if (focused && (el.name || el.id) === focused) el.focus(); }
 }
 
