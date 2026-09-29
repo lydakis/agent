@@ -1584,8 +1584,30 @@ fn history_items_name_who_sent_each_prompt_after_its_turns_are_gone() {
     };
     db.begin("Carol", "p2", "and the tests", true, &steer, allow_provider)
         .unwrap();
-    db.absorb(turn, None, 8 << 20, 4096, ContextUsage::default(), false)
+    let absorbed = db
+        .absorb(turn, None, 8 << 20, 4096, ContextUsage::default(), false)
         .unwrap();
+    // Each `steered` event names the steer's turn and who sent its message.
+    let taken: Vec<Value> = absorbed
+        .entries
+        .iter()
+        .filter(|e| e["event"] == "steered")
+        .map(|e| {
+            json!([
+                e["data"]["steer"].is_i64(),
+                e["data"]["from"],
+                e["data"]["origin"]
+            ])
+        })
+        .collect();
+    assert_eq!(
+        taken,
+        [
+            json!([true, bob, null]),
+            json!([true, null, "tasks"]),
+            json!([true, null, null])
+        ]
+    );
     // Bob's next message waits in line, and Bob is gone before it starts:
     // it still names the identity that sent it. A scheduled one follows.
     let waiting = db
@@ -1891,7 +1913,7 @@ fn schema_38_reads_every_stored_prompt_as_a_persons() {
 fn schema_40_keeps_each_bot_written_prompts_sender_with_its_node() {
     let path = std::env::temp_dir().join(format!("agent-senders-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
-    let person = {
+    let (person, turn) = {
         let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
         let person = gated_turn(&mut db, None);
         db.create("Carol", Some("/synthetic"), binding()).unwrap();
@@ -1927,13 +1949,17 @@ fn schema_40_keeps_each_bot_written_prompts_sender_with_its_node() {
         }
         db.absorb(turn, None, 8 << 20, 4096, ContextUsage::default(), false)
             .unwrap();
-        person
+        (person, turn)
     };
+    // Before 41 a `steered` event named the steer's turn as `from`.
     Connection::open(&path)
         .unwrap()
         .execute_batch(
             "DROP TABLE senders; ALTER TABLE turns DROP COLUMN origin;
-             ALTER TABLE turns DROP COLUMN from_id; PRAGMA user_version=40;",
+             ALTER TABLE turns DROP COLUMN from_id;
+             UPDATE events SET data=json_object('from',json_extract(data,'$.steer'),
+                'node',json_extract(data,'$.node')) WHERE kind='steered';
+             PRAGMA user_version=40;",
         )
         .unwrap();
     let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
@@ -1960,6 +1986,14 @@ fn schema_40_keeps_each_bot_written_prompts_sender_with_its_node() {
             json!(["work", bob])
         ]
     );
+    // The turn still reads the steers it took in, now named as `steer`.
+    let texts: Vec<Value> = db.prompts("Carol", turn, 1024).unwrap()["prompts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["text"].clone())
+        .collect();
+    assert_eq!(texts, [json!("work"), json!("also"), json!("mine")]);
     drop(db);
     std::fs::remove_file(path).unwrap();
 }

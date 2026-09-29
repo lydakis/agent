@@ -1045,7 +1045,8 @@ for a call that failed, `denied` for a denied one),
 verdict it waits for, and its wake-up), `turn_paced` (a turn parked at its model-call boundary because its
 provider's pool is closed by a rate limit, with `resume_at_ms`; it resumes
 through `turn_resumed` like a parked wait), `steered` (a steer's item joining
-the running turn), and
+the running turn: `steer` names the steer's turn, `node` its item, and `from`
+or `origin` its sender as on `accepted`), and
 `turn_finished` (with status, checkpoint, error code, and detail; a steered
 turn's carries `into` and `node`). A `submit` response includes the turn's
 `handle`, `turn:BOT/N`, and its `status`.
@@ -1079,7 +1080,7 @@ that turn; a prompt without it is a person's. The CLI sends it from
 without the other (`author_turn_required`). The store checks that the turn
 is the bot's (`invalid_from`), keeps it on the new turn's row, a steer's
 included, counts it in the request's idempotency, and reports it on
-`accepted` and `queued`, with the sender's identity as `from.id`. Like the
+`accepted`, `queued` and `steered`, with the sender's identity as `from.id`. Like the
 creator, it is declared, not verified. A client that sends a prompt on its own,
 not from a bot's turn, may name itself with `origin` (a name's characters,
 else `invalid_origin`), stored and reported the same way; the daemon gives it
@@ -1181,7 +1182,7 @@ the turn's id and handle at once, and `wait`, `turns`, and
   the next model call, a snapshot of queued steers joins the lineage as
   user items, in submission order, and each delivered steer finishes as `steered`
   with `into` naming the turn that took it and `node` its item; the absorbing
-  turn records a `steered` event. A steer that arrives while the final model
+  turn then records a `steered` event. A steer that arrives while the final model
   call is in flight keeps that turn going for one more round rather than
   going unheard; one that arrives after the last boundary starts as an
   ordinary turn when its place in the line comes, as does a steer on an idle
@@ -1341,7 +1342,8 @@ it with, so every parked record has one shape. Schema 41 adds `turns.origin` and
 `turns.from_id`, and keeps each prompt's sender with its node (`senders`): a turn another bot
 wrote is found by its first node, a steer by the node it shares or the one its
 `steered` finish recorded, with the sender's identity where its turn is still
-stored. A steer whose finish event was pruned names no sender.
+stored. A steer whose finish event was pruned names no sender. Stored `steered`
+events name the steer's turn as `steer`, leaving `from` for the sender.
 
 New artifacts larger than 64 KiB, up to the existing 1 MiB output bound, may
 use lossless LZ4 blocks. Each remains one SQLite BLOB with a small offset

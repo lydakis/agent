@@ -582,7 +582,8 @@ async function onEvent(ev) {
     }
     case 'accepted': {
       const b = bot(name); if (b) { b.status = 'running'; b.runningTurn = turn; b.waitingOn = []; b.turnStarted = S.live ? Date.now() : 0; b.elapsed = 0; }
-      const t = transcript(name), by = senderOf(data) ?? t.authors?.get(turn); t.authors?.delete(turn);
+      // The event that puts a prompt on the lineage names who sent it, here and on `steered`.
+      const t = transcript(name), by = senderOf(data);
       if (typeof data.node === 'number') pushNode(t, { kind: 'node', node: data.node, turn, ...(by ? { by } : {}) });
       break;
     }
@@ -591,8 +592,6 @@ async function onEvent(ev) {
       const b = bot(name); const behindOwn = !!b && (b.runningTurn !== null || isActive(b.status));
       if (b && !behindOwn) { b.status = data.status ?? 'queued'; b.runningTurn = turn; }
       const t = transcript(name);
-      // Who wrote it waits with it: the prompt reaches the lineage when the turn starts or steers in.
-      const by = senderOf(data); if (by) (t.authors ??= new Map()).set(turn, by);
       addItem(t, { kind: 'note', text: data.delivery === 'steer' ? 'steers in at the running turn\'s next step' : behindOwn ? 'queued behind the running turn' : 'queued for a slot', turn });
       break;
     }
@@ -644,8 +643,8 @@ async function onEvent(ev) {
     case 'turn_paced': { const b = bot(name); if (b) b.status = 'paced'; break; }
     case 'turn_resumed': { const b = bot(name); if (b) { b.status = 'running'; b.waitingOn = []; } break; }
     case 'steered': {
-      // The steer's message joins this turn; `from` is the steer's own turn.
-      const t = transcript(name), by = t.authors?.get(data.from); t.authors?.delete(data.from);
+      // The steer's message joins this turn; `steer` is the steer's own turn.
+      const t = transcript(name), by = senderOf(data);
       if (typeof data.node === 'number') pushNode(t, { kind: 'node', node: data.node, turn, ...(by ? { by } : {}) });
       else addItem(t, { kind: 'note', text: 'steered into the running turn', turn });
       break;
@@ -655,8 +654,7 @@ async function onEvent(ev) {
       const b = bot(name);
       // A steer absorbed into a running turn finishes as its own turn while that turn goes on.
       if (b && (b.runningTurn === null || b.runningTurn === turn)) { b.runningTurn = null; b.waitingOn = []; if (b.turnStarted) b.elapsed = Date.now() - b.turnStarted; b.turnStarted = 0; b.status = status === 'completed' || status === 'steered' ? 'idle' : status; }
-      // A steer finishes before its `steered` event, which takes its author.
-      const t = transcript(name); if (status !== 'steered') t.authors?.delete(turn);
+      const t = transcript(name);
       if (t.streamingTurn === turn) { t.text = ''; t.thinking = ''; t.thinkingSince = 0; t.thinkingMs = 0; t.streamingTurn = null; t.streamGen += 1; }
       if (status !== 'completed' && status !== 'steered') addItem(t, { kind: 'note', text: data.error ? `${status}: ${data.error}${data.detail ? ': ' + data.detail : ''}` : status, turn });
       // A background command may outlive its turn; only a wait result says how it ended.

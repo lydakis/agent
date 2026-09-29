@@ -3581,28 +3581,24 @@ impl Database {
             .model
             .clone()
             .unwrap_or_else(|| format!("{}/{}", bot.provider, bot.model));
-        let (kind, mut data) = if status == "running" {
-            let head = start_locked(&tx, &bot, turn, prompt)?;
-            (
-                "accepted",
-                json!({"request_id":request_id,"node":head,"workspace":workspace,"model":model}),
-            )
+        let (kind, data) = if status == "running" {
+            let mut data = json!({"request_id":request_id,"workspace":workspace,"model":model});
+            start_locked(&tx, &bot, turn, prompt, &mut data)?;
+            ("accepted", data)
         } else {
-            (
-                "queued",
-                json!({"request_id":request_id,"status":status,"delivery":options.delivery.name(),
-                    "workspace":workspace,"model":model}),
-            )
+            let mut data = json!({"request_id":request_id,"status":status,
+                "delivery":options.delivery.name(),"workspace":workspace,"model":model});
+            sender_fields(
+                &mut data,
+                options
+                    .from
+                    .as_ref()
+                    .map(|(bot, turn)| (bot.as_str(), *turn)),
+                from_id,
+                options.origin.as_deref(),
+            );
+            ("queued", data)
         };
-        sender_fields(
-            &mut data,
-            options
-                .from
-                .as_ref()
-                .map(|(bot, turn)| (bot.as_str(), *turn)),
-            from_id,
-            options.origin.as_deref(),
-        );
         let cursor = event(&tx, name, Some(turn), kind, data.clone())?;
         tx.commit()?;
         if status != "running" {
@@ -3675,27 +3671,8 @@ impl Database {
             .ok_or(Error::new("workspace_required"))?;
         let model = model.unwrap_or_else(|| format!("{}/{}", bot.provider, bot.model));
         let tx = self.conn.savepoint()?;
-        let head = start_locked(&tx, &bot, turn, &prompt)?;
-        let mut data =
-            json!({"request_id":request_id,"node":head,"workspace":workspace,"model":model});
-        if let Some(node) = head {
-            let (from, from_turn, bot_id, origin): (
-                Option<String>,
-                Option<i64>,
-                Option<i64>,
-                Option<String>,
-            ) = tx
-                .prepare_cached("SELECT bot,turn,bot_id,origin FROM senders WHERE node=?")?
-                .query_row([node], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
-                .optional()?
-                .unwrap_or_default();
-            sender_fields(
-                &mut data,
-                from.as_deref().zip(from_turn),
-                bot_id,
-                origin.as_deref(),
-            );
-        }
+        let mut data = json!({"request_id":request_id,"workspace":workspace,"model":model});
+        start_locked(&tx, &bot, turn, &prompt, &mut data)?;
         let cursor = event(&tx, &name, Some(turn), "accepted", data.clone())?;
         tx.commit()?;
         self.pending_left(prompt.len());
@@ -3896,14 +3873,17 @@ impl Database {
                     params![epoch_ms(), turn, steer],
                 )?;
             }
-            keep_sender(&tx, steer, id)?;
+            // The running turn's `steered` event names who sent the message
+            // it takes in, as `accepted` does for a turn's first.
+            let mut taken = json!({"steer":steer,"node":id});
+            keep_sender(&tx, steer, id, &mut taken)?;
             let data = json!({"status":"steered","into":turn,"node":id,"checkpoint":Value::Null,
                 "error":Value::Null,"detail":Value::Null});
             let cursor = event(&tx, &bot.name, Some(steer), "turn_finished", data.clone())?;
             absorbed
                 .entries
                 .push(entry(cursor, &bot.name, Some(steer), "turn_finished", data));
-            let data = json!({"from":steer,"node":id});
+            let data = taken;
             let cursor = event(&tx, &bot.name, Some(turn), "steered", data.clone())?;
             absorbed
                 .entries
@@ -4784,7 +4764,7 @@ impl Database {
         let mut prompts = vec![prompt_entry(turn, text, from, from_turn, origin, &mut left)];
         let mut prompts_more = false;
         let mut steers = self.conn.prepare_cached(
-            "SELECT json_extract(data,'$.from') FROM events WHERE turn=? AND kind='steered' ORDER BY id",
+            "SELECT json_extract(data,'$.steer') FROM events WHERE turn=? AND kind='steered' ORDER BY id",
         )?;
         let mut steer = self.conn.prepare_cached(
             "SELECT CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END,
@@ -6928,13 +6908,22 @@ fn event(conn: &Connection, bot: &str, turn: Option<i64>, kind: &str, data: Valu
 /// the turn's row: a fork keeps it after its source is deleted. The sending
 /// bot's id is its id while the turn it wrote from still exists, so a later
 /// bot of that name is not taken for it.
-fn keep_sender(tx: &Connection, turn: i64, node: i64) -> Result<()> {
+/// Keep who sent a turn's prompt with the node it became, and add the
+/// sender to `data`, the event that puts the node on the lineage.
+fn keep_sender(tx: &Connection, turn: i64, node: i64, data: &mut Value) -> Result<()> {
     tx.prepare_cached(
         "INSERT INTO senders(node,bot,bot_id,turn,origin)
          SELECT ?2,t.from_bot,t.from_id,t.from_turn,t.origin
-         FROM turns t WHERE t.id=?1 AND (t.from_bot IS NOT NULL OR t.origin IS NOT NULL)",
+         FROM turns t WHERE t.id=?1 AND (t.from_bot IS NOT NULL OR t.origin IS NOT NULL)
+         RETURNING bot,turn,bot_id,origin",
     )?
-    .execute(params![turn, node])?;
+    .query_row(params![turn, node], |r| {
+        let (from, origin): (Option<String>, Option<String>) = (r.get(0)?, r.get(3)?);
+        let from = from.as_deref().zip(r.get::<_, Option<i64>>(1)?);
+        sender_fields(data, from, r.get(2)?, origin.as_deref());
+        Ok(())
+    })
+    .optional()?;
     Ok(())
 }
 /// Who sent a prompt, as events and reads name it: another bot's turn, or
@@ -6952,11 +6941,19 @@ fn sender_fields(
         data["origin"] = json!(origin);
     }
 }
-/// Put a turn's user item on the lineage and mark the bot busy with it.
-fn start_locked(tx: &Connection, bot: &Bot, turn: i64, prompt: &str) -> Result<Option<i64>> {
+/// Put a turn's user item on the lineage and mark the bot busy with it,
+/// adding who sent it to `data`, the turn's `accepted` event.
+fn start_locked(
+    tx: &Connection,
+    bot: &Bot,
+    turn: i64,
+    prompt: &str,
+    data: &mut Value,
+) -> Result<Option<i64>> {
     let item = bot.family()?.user_item(prompt)?;
     let head = node_with_turn(tx, bot.head, &item, Some(turn))?;
-    keep_sender(tx, turn, head)?;
+    data["node"] = json!(head);
+    keep_sender(tx, turn, head, data)?;
     if prompt.len() >= PROMPT_SHARE_BYTES {
         tx.execute(
             "UPDATE turns SET status='running',started_ms=?,prompt='',prompt_node=? WHERE id=?",
@@ -7536,6 +7533,8 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         // is still stored. A turn another bot wrote is found by its
         // first node; a steer by the node it shares, or else the one its
         // finish recorded. A steer whose events were pruned names no sender.
+        // A `steered` event names the steer's turn as `steer`, leaving `from`
+        // for its sender as on `accepted`.
         conn.execute_batch(
             "ALTER TABLE turns ADD COLUMN origin TEXT;
              ALTER TABLE turns ADD COLUMN from_id INTEGER;
@@ -7551,7 +7550,9 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
                 (SELECT json_extract(e.data,'$.node') FROM events e
                     WHERE e.turn=t.id AND e.kind='turn_finished'
                     AND json_extract(e.data,'$.status')='steered'))
-             WHERE t.from_bot IS NOT NULL;",
+             WHERE t.from_bot IS NOT NULL;
+             UPDATE events SET data=json_set(json_remove(data,'$.from'),'$.steer',json_extract(data,'$.from'))
+             WHERE kind='steered';",
         )?;
     }
     Ok(())

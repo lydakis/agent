@@ -62,7 +62,7 @@ window.Daemon = (() => {
   // Who sent a prompt, as the daemon keeps it with the node: another bot's turn, with the identity
   // its name held then, or what the client named as its origin.
   const senderOf = (by) => by?.origin ? { origin: by.origin } : by ? { from: { bot: by.bot, turn: by.turn, id: S.bots.get(by.bot)?.id ?? null } } : {};
-  const authorOf = (event) => event.event === 'accepted' ? { ...(event.data.from ? { from: event.data.from } : {}), ...(event.data.origin ? { origin: event.data.origin } : {}) } : event.event === 'steered' ? S.authors.get(event.data.from) ?? {} : {};
+  const authorOf = (event) => ({ ...(event.data.from ? { from: event.data.from } : {}), ...(event.data.origin ? { origin: event.data.origin } : {}) });
   const emit = (event) => { if (event.data?.node != null) { if (!S.lineages.has(event.bot)) S.lineages.set(event.bot, []); S.lineages.get(event.bot).push({node:event.data.node,turn:event.turn ?? null,...authorOf(event)}); } if (event.durable !== false) event.cursor = ++S.cursor; S.queue.push(event); if (S.waiter) { const w = S.waiter; S.waiter = null; w(); } };
   const node = (item) => { const id = S.nextNode++; S.nodes.set(id, item); return id; };
   const wait = (ms) => new Promise((r) => { const t = setTimeout(() => { S.timers.delete(t); r(); }, ms); S.timers.add(t); });
@@ -105,7 +105,7 @@ window.Daemon = (() => {
       const { prompt, turn: steer } = b.steers.shift();
       // The store's order: the steer's own turn finishes, then the running turn takes its message.
       emit({ event: 'turn_finished', bot: name, turn: steer, data: { status: 'steered', into: turn } });
-      emit({ event: 'steered', bot: name, turn, data: { from: steer, node: node({ role: 'user', content: [{ type: 'input_text', text: prompt }] }) } });
+      emit({ event: 'steered', bot: name, turn, data: { steer, node: node({ role: 'user', content: [{ type: 'input_text', text: prompt }] }), ...S.authors.get(steer) } });
       S.authors.delete(steer);
       await wait(200);
       // A board post is read and carried on from; only a person's steer gets an answer.

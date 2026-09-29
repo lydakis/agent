@@ -1884,16 +1884,17 @@ test('a message another agent sent names its sender, live, steered in, and read 
   const p = page({ request: history, batch });
   p.upsert({ name: 'demo.lead', id: 1 }); p.upsert({ name: 'demo.build', id: 2, created_by: 'demo.lead', created_by_id: 1 }); p.tree();
   // The coordinator starts a task, then steers a second message into its running turn; you ask
-  // something; a third message from it waits in line and starts later.
+  // something; a third message from it waits in line and starts later. Each event that puts a
+  // prompt on the lineage names its sender, in the order the store writes them.
   await p.onEvent({ event: 'accepted', bot: 'demo.build', turn: 7, data: { node: 1, ...lead(4) } });
   await p.onEvent({ event: 'queued', bot: 'demo.build', turn: 8, data: { delivery: 'steer', ...lead(5) } });
   // The store finishes the steer's own turn first, then its message joins the running turn.
   await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 8, data: { status: 'steered', into: 7, node: 2 } });
-  await p.onEvent({ event: 'steered', bot: 'demo.build', turn: 7, data: { from: 8, node: 2 } });
+  await p.onEvent({ event: 'steered', bot: 'demo.build', turn: 7, data: { steer: 8, node: 2, ...lead(5) } });
   await p.onEvent({ event: 'accepted', bot: 'demo.build', turn: 9, data: { node: 3 } });
   await p.onEvent({ event: 'queued', bot: 'demo.build', turn: 10, data: { delivery: 'queue', ...lead(6) } });
   await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 9, data: { status: 'completed' } });
-  await p.onEvent({ event: 'accepted', bot: 'demo.build', turn: 10, data: { node: 4 } });
+  await p.onEvent({ event: 'accepted', bot: 'demo.build', turn: 10, data: { node: 4, ...lead(6) } });
   const t = p.transcript('demo.build');
   // Live, before any history read: each prompt already knows its sender.
   assert.equal(JSON.stringify([1, 2, 4].map((node) => t.items.find((it) => it.node === node)?.by)), JSON.stringify([lead(4).from, lead(5).from, lead(6).from]));
@@ -1903,7 +1904,6 @@ test('a message another agent sent names its sender, live, steered in, and read 
   assert.match(html, /coordinator<\/button> also check the refresh path/);
   assert.match(html, /coordinator<\/button> then the docs/);
   assert.match(html, /<div class="line user">› what changed\?<\/div>/, 'yours keep their mark');
-  assert.equal(t.authors.size, 0, 'an author is forgotten once its prompt is on the lineage');
   // Read back from the daemon's history, as after a restart.
   const q = page({ request: history, batch });
   q.upsert({ name: 'demo.lead', id: 1 }); q.tree();
