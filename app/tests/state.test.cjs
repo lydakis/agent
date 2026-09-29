@@ -541,6 +541,22 @@ test('snapshot reconciliation cannot splice over an in-flight history page', asy
   assert.deepEqual(Array.from(ids).sort((a,b)=>a-b),Array.from({length:10},(_,i)=>i+1));
 });
 
+test('a task that ends live before the snapshot names its creator still reaches the coordinator', async () => {
+  const snapshot=deferred();let firstPull=true;
+  const base=historyDaemon();
+  const p=page({setup:async()=>({}),attach:async()=>({session:2}),
+    pull:()=>{if(firstPull){firstPull=false;return Promise.resolve({events:[{event:'follow_live'},{event:'turn_finished',bot:'demo.build',turn:4,data:{status:'completed'}}]});}return new Promise(()=>{});},
+    request:async(op,q)=>op==='bots'?snapshot.promise:base.request(op,q)});
+  p.setRender(() => {});
+  p.S.session=1;p.lost('offline');
+  const attaching=p.attach();await settle();
+  assert.equal(p.S.live,true);assert.equal(p.S.wakes.size,0,'no creator known yet');
+  snapshot.resolve({bots:[{name:'demo.lead',id:1,provider:'openai',model:'m'},{name:'demo.build',id:2,provider:'openai',model:'m',created_by:'demo.lead',created_by_id:1}],next_after:null});
+  await attaching;
+  assert.deepEqual({...p.S.wakes.get('demo.lead').tasks.get('demo.build')},{first:4,turn:4,status:'completed',count:1});
+  assert.equal(p.S.heldNews.length,0);
+});
+
 test('submissions wait for a known bot identity instead of sending an unpinned name', async () => {
   const sent=[];const p=page({request:async(op,q)=>{sent.push([op,q]);}});
   p.S.session=1;p.S.config={workspace:'/synthetic'};

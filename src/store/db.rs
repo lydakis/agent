@@ -3607,7 +3607,8 @@ impl Database {
         turn: i64,
         validate: impl FnOnce(&Bot, Option<&str>) -> Result<()>,
     ) -> Result<(Value, bool)> {
-        let (name, request_id, prompt, status, workspace, model, strict): (
+        #[allow(clippy::type_complexity)]
+        let (name, request_id, prompt, status, workspace, model, strict, from, from_turn): (
             String,
             String,
             String,
@@ -3615,10 +3616,12 @@ impl Database {
             Option<String>,
             Option<String>,
             bool,
+            Option<String>,
+            Option<i64>,
         ) = self
             .conn
             .query_row(
-                "SELECT bot,request_id,prompt,status,workspace,model,expected_turn IS NOT NULL FROM turns WHERE id=?",
+                "SELECT bot,request_id,prompt,status,workspace,model,expected_turn IS NOT NULL,from_bot,from_turn FROM turns WHERE id=?",
                 [turn],
                 |r| {
                     Ok((
@@ -3629,6 +3632,8 @@ impl Database {
                         r.get(4)?,
                         r.get(5)?,
                         r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
                     ))
                 },
             )
@@ -3659,7 +3664,12 @@ impl Database {
         let model = model.unwrap_or_else(|| format!("{}/{}", bot.provider, bot.model));
         let tx = self.conn.savepoint()?;
         let head = start_locked(&tx, &bot, turn, &prompt)?;
-        let data = json!({"request_id":request_id,"node":head,"workspace":workspace,"model":model});
+        let mut data =
+            json!({"request_id":request_id,"node":head,"workspace":workspace,"model":model});
+        // The same author the `queued` event named, for a reader that attaches after it was pruned.
+        if let (Some(from), Some(from_turn)) = (from, from_turn) {
+            data["from"] = json!({"bot":from,"turn":from_turn});
+        }
         let cursor = event(&tx, &name, Some(turn), "accepted", data.clone())?;
         tx.commit()?;
         self.pending_left(prompt.len());

@@ -28,8 +28,8 @@ const S = {
   // Swarms, from their folders in ~/.agent/swarms, and the swarm each agent belongs to.
   swarms: new Map(), memberOf: new Map(),
   // Who asked for each turn another bot asked for, until it ends, and what each coordinator has yet to
-  // hear about its tasks (see `wake`).
-  turnFrom: new Map(), wakes: new Map(),
+  // hear about its tasks (see `wake`), and turns that ended live before the snapshot said who made their bot.
+  turnFrom: new Map(), wakes: new Map(), heldNews: [],
   // Unsent text for each bot not on screen. A composer's text is its bot's own: when a pane shows
   // another bot, the text stays behind with the one it was typed for (see `followDrafts`).
   drafts: new Map(),
@@ -633,7 +633,8 @@ async function onEvent(ev) {
       if (status !== 'completed' && status !== 'steered') addItem(t, { kind: 'note', text: data.error ? `${status}: ${data.error}${data.detail ? ': ' + data.detail : ''}` : status, turn });
       const key = `${name}\u0000${turn}`, from = S.turnFrom.get(key); S.turnFrom.delete(key);
       // A steer's turn is part of the turn it joined, whose end is the news.
-      if (S.live && status !== 'steered') tellLead(name, turn, status, from);
+      // A task's creator may still be on a snapshot page to come; its news waits for the whole snapshot.
+      if (S.live && status !== 'steered') { if (S.snapshot) S.heldNews.push([name, turn, status, from]); else tellLead(name, turn, status, from); }
       // A coordinator coming to rest hears what waited for it.
       if (S.wakes.has(name)) wakeSoon(name);
       // A background command may outlive its turn; only a wait result says how it ended.
@@ -1011,6 +1012,7 @@ async function attachOnce() {
         if (parent) addItem(transcript(parent.name), {kind:'peer',who:b.name,turn:null});
       }
       S.snapshot = false; S.deleted.clear();
+      for (const news of S.heldNews.splice(0)) tellLead(...news);
       S.attached = true;
       // What waited while detached goes out now, each window permitting.
       for (const lead of S.wakes.keys()) wakeSoon(lead);

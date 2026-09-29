@@ -1073,7 +1073,8 @@ that turn; a prompt without it is a person's. The CLI sends it from
 without the other (`author_turn_required`). The store checks that the turn
 is the bot's (`invalid_from`), keeps it on the new turn's row, a steer's
 included, counts it in the request's idempotency, and reports it on
-`accepted` and `queued`. Like the creator, it is declared, not verified.
+`queued` and on `accepted`, including the one a queued turn gets when it
+starts. Like the creator, it is declared, not verified.
 `{"op":"prompts","bot","turn","bytes"?}` reads a turn's words and calls
 as an approver judges them, within `bytes` of text (default 64 KiB, at most
 256 KiB): the turn's prompt and each steer it absorbed, in order, with

@@ -641,7 +641,10 @@ A turn counts when it ends in a bot the project's `PROJECT.lead` created,
 unless the coordinator asked for it itself (its `from` names the lead) or
 the bot is the coordinator's own fork or side chat (`PROJECT.lead-…`). A
 steer's turn is part of the turn it joined. Turns replayed on attach are
-history, not news. The coordinator is told only while it rests, at most
+history, not news; one that ends live while the window is still reading the
+list of bots is held until the list says who made its bot. A queued turn's
+`accepted` names its author again, so a window attached after the `queued`
+event was pruned still knows the coordinator asked for it. The coordinator is told only while it rests, at most
 once every ten minutes, in one message queued to it: `Task updates:`, then
 one line per task with its latest ended turn's handle and status, and how
 many turns ended before it since which handle. The handles are what its
