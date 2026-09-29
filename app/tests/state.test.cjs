@@ -1842,56 +1842,70 @@ test('an older daemon on the socket is replaced from the detached screen; a newe
 
 test('a message another agent sent names its sender, live, steered in, and read back from history', async () => {
   const items = { 1: { role: 'user', content: [{ type: 'input_text', text: 'fix the login bug' }] }, 2: { role: 'user', content: [{ type: 'input_text', text: 'also check the refresh path' }] },
-    3: { role: 'user', content: [{ type: 'input_text', text: 'what changed?' }] } };
-  // The daemon names who sent each prompt with its item.
-  const sent = { 1: { request_id: 'run-1', from: { bot: 'demo.lead', turn: 4 } }, 2: { request_id: 'run-2', from: { bot: 'demo.lead', turn: 5 } }, 3: { request_id: 'app-3' } };
+    3: { role: 'user', content: [{ type: 'input_text', text: 'what changed?' }] }, 4: { role: 'user', content: [{ type: 'input_text', text: 'then the docs' }] } };
+  // The daemon names who sent each prompt with its item: the bot, its turn, and the identity its name held.
+  const lead = (turn) => ({ from: { bot: 'demo.lead', turn, id: 1 } });
+  const sent = { 1: lead(4), 2: lead(5), 4: lead(6) };
   const batch = async ({ nodes }) => ({ items: nodes.map((node) => ({ node, item: items[node], ...sent[node] })) });
   const history = async (op) => {
-    if (op === 'history_nodes') return { nodes: [{ node: 3, turn: 9 }, { node: 2, turn: 7 }, { node: 1, turn: 7 }], next_from: null, next_newer: null };
+    if (op === 'history_nodes') return { nodes: [{ node: 4, turn: 10 }, { node: 3, turn: 9 }, { node: 2, turn: 7 }, { node: 1, turn: 7 }], next_from: null, next_newer: null };
     throw new Error(op);
   };
   const p = page({ request: history, batch });
   p.upsert({ name: 'demo.lead', id: 1 }); p.upsert({ name: 'demo.build', id: 2, created_by: 'demo.lead', created_by_id: 1 }); p.tree();
-  // The coordinator starts a task, then steers a second message into its running turn; you ask something.
-  await p.onEvent({ event: 'accepted', bot: 'demo.build', turn: 7, data: { node: 1, from: { bot: 'demo.lead', turn: 4 } } });
-  await p.onEvent({ event: 'queued', bot: 'demo.build', turn: 8, data: { delivery: 'steer', from: { bot: 'demo.lead', turn: 5 } } });
+  // The coordinator starts a task, then steers a second message into its running turn; you ask
+  // something; a third message from it waits in line and starts later.
+  await p.onEvent({ event: 'accepted', bot: 'demo.build', turn: 7, data: { node: 1, ...lead(4) } });
+  await p.onEvent({ event: 'queued', bot: 'demo.build', turn: 8, data: { delivery: 'steer', ...lead(5) } });
   await p.onEvent({ event: 'steered', bot: 'demo.build', turn: 7, data: { from: 8, node: 2 } });
   await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 8, data: { status: 'steered', into: 7 } });
   await p.onEvent({ event: 'accepted', bot: 'demo.build', turn: 9, data: { node: 3 } });
+  await p.onEvent({ event: 'queued', bot: 'demo.build', turn: 10, data: { delivery: 'queue', ...lead(6) } });
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 9, data: { status: 'completed' } });
+  await p.onEvent({ event: 'accepted', bot: 'demo.build', turn: 10, data: { node: 4 } });
   const t = p.transcript('demo.build');
   await p.loadBatch('demo.build');
   const html = p.itemsHTML(t);
-  assert.equal((html.match(/class="line user agent"><button type="button" class="by" data-task="demo.lead"[^>]*>coordinator<\/button> /g) || []).length, 2, html);
+  assert.equal((html.match(/class="line user agent"><button type="button" class="by" data-task="demo.lead"[^>]*>coordinator<\/button> /g) || []).length, 3, html);
   assert.match(html, /coordinator<\/button> also check the refresh path/);
+  assert.match(html, /coordinator<\/button> then the docs/);
   assert.match(html, /<div class="line user">› what changed\?<\/div>/, 'yours keep their mark');
   assert.equal(t.authors.size, 0, 'an author is forgotten once its prompt is on the lineage');
   // Read back from the daemon's history, as after a restart.
   const q = page({ request: history, batch });
   q.upsert({ name: 'demo.lead', id: 1 }); q.tree();
-  const r = q.transcript('demo.build'); r.items = [{ kind: 'history', next: 3, seed: true }]; r.history = r.items[0]; r.seed = r.items[0];
+  const r = q.transcript('demo.build'); r.items = [{ kind: 'history', next: 4, seed: true }]; r.history = r.items[0]; r.seed = r.items[0];
   await q.load('demo.build');
   const read = q.itemsHTML(r);
-  assert.equal((read.match(/class="by" data-task="demo.lead"/g) || []).length, 2, read);
+  assert.equal((read.match(/class="by" data-task="demo.lead"/g) || []).length, 3, read);
   assert.match(read, /› what changed\?/);
+  // A new agent under the sender's name is not who sent them: the tag stays, with no link to it.
+  const u = page({ request: history, batch });
+  u.upsert({ name: 'demo.lead', id: 5 }); u.tree();
+  const v = u.transcript('demo.build'); v.items = [{ kind: 'history', next: 4, seed: true }]; v.history = v.items[0]; v.seed = v.items[0];
+  await u.load('demo.build');
+  const reused = u.itemsHTML(v);
+  assert.doesNotMatch(reused, /data-task="demo.lead"/);
+  assert.equal((reused.match(/<span class="by" title="Sent by demo.lead, turn \d, since deleted">coordinator<\/span>/g) || []).length, 3, reused);
 });
 
-test('the app\'s own task updates and scheduled messages are tagged by the ids it sent them with', async () => {
+test('the app\'s own task updates and scheduled messages are tagged by the origin it sent them with', async () => {
   const items = { 1: { role: 'user', content: [{ type: 'input_text', text: 'Task updates: build ended' }] }, 2: { role: 'user', content: [{ type: 'input_text', text: 'check the nightly run' }] },
     3: { role: 'user', content: [{ type: 'input_text', text: 'thanks' }] } };
-  const ids = { 1: 'app-wake-9a2e', 2: 'schedule-nightly-1790000000-42', 3: 'app-6f1c' };
+  const origins = { 1: { origin: 'tasks' }, 2: { origin: 'schedule' } };
   const p = page({ request: async (op) => {
     if (op === 'history_nodes') return { nodes: [{ node: 3, turn: 3 }, { node: 2, turn: 2 }, { node: 1, turn: 1 }], next_from: null, next_newer: null };
     throw new Error(op);
-  }, batch: async ({ nodes }) => ({ items: nodes.map((node) => ({ node, item: items[node], request_id: ids[node] })) }) });
+  }, batch: async ({ nodes }) => ({ items: nodes.map((node) => ({ node, item: items[node], ...origins[node] })) }) });
   const t = p.transcript('demo.lead'); t.items = [{ kind: 'history', next: 3, seed: true }]; t.history = t.items[0]; t.seed = t.items[0];
   await p.load('demo.lead');
   let html = p.itemsHTML(t);
   assert.match(html, /<span class="by">tasks<\/span> Task updates: build ended/);
   assert.match(html, /<span class="by">schedule<\/span> check the nightly run/);
   assert.match(html, /<div class="line user">› thanks<\/div>/);
-  // Live, the ids come with the turn's start.
+  // Live, the origin comes with the turn's start.
   const q = page({ request: async (op, r) => items[r.node] });
-  await q.onEvent({ event: 'accepted', bot: 'demo.lead', turn: 2, data: { node: 2, request_id: 'schedule-nightly-1790000000-42' } });
+  await q.onEvent({ event: 'accepted', bot: 'demo.lead', turn: 2, data: { node: 2, origin: 'schedule' } });
   await q.loadBatch('demo.lead');
   assert.match(q.itemsHTML(q.transcript('demo.lead')), /<span class="by">schedule<\/span> check the nightly run/);
 });

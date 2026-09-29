@@ -155,6 +155,7 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
         delivery: Delivery::Reject,
         expected_turn: None,
         from: None,
+        origin: None,
     };
     let alt = db
         .begin("Alternative", "r1", "different", true, &branch, |_, _| {
@@ -1514,7 +1515,7 @@ fn served_announcements_carry_each_call_and_the_denials_so_far() {
 }
 
 #[test]
-fn history_items_name_the_request_and_author_of_each_prompt() {
+fn history_items_name_who_sent_each_prompt_after_its_turns_are_gone() {
     let mut db = db();
     for bot in ["Bob", "Carol"] {
         db.create(bot, Some("/synthetic"), binding()).unwrap();
@@ -1530,12 +1531,18 @@ fn history_items_name_the_request_and_author_of_each_prompt() {
         )
         .unwrap()
         .turn;
+    let bob = json!({"bot":"Bob","turn":person,"id":1});
     let by_bob = |delivery| TurnOptions {
         delivery,
         from: Some(("Bob".into(), person)),
         ..TurnOptions::default()
     };
-    let turn = db
+    let by_app = |delivery, origin: &str| TurnOptions {
+        delivery,
+        origin: Some(origin.into()),
+        ..TurnOptions::default()
+    };
+    let started = db
         .begin(
             "Carol",
             "b1",
@@ -1544,16 +1551,30 @@ fn history_items_name_the_request_and_author_of_each_prompt() {
             &by_bob(Delivery::Reject),
             allow_provider,
         )
-        .unwrap()
-        .turn;
-    // A short steer Bob wrote, and one from a person: each is its own
-    // turn, taken into Carol's.
+        .unwrap();
+    let turn = started.turn;
+    let accepted = &started.entry.unwrap()["data"];
+    assert_eq!(
+        (&accepted["from"], &accepted["origin"]),
+        (&bob, &Value::Null)
+    );
+    // Short steers from Bob, from the app and from a person each keep
+    // their own node; a queued message from the app starts later.
     db.begin(
         "Carol",
         "b2",
         "also the docs",
         true,
         &by_bob(Delivery::Steer),
+        allow_provider,
+    )
+    .unwrap();
+    db.begin(
+        "Carol",
+        "a1",
+        "task update",
+        true,
+        &by_app(Delivery::Steer, "tasks"),
         allow_provider,
     )
     .unwrap();
@@ -1565,38 +1586,60 @@ fn history_items_name_the_request_and_author_of_each_prompt() {
         .unwrap();
     db.absorb(turn, None, 8 << 20, 4096, ContextUsage::default(), false)
         .unwrap();
+    let later = db
+        .begin(
+            "Carol",
+            "s1",
+            "nightly",
+            true,
+            &by_app(Delivery::Queue, "schedule"),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
     db.append(turn, vec![assistant("done")], &[], None).unwrap();
-    let page = db.history_nodes("Carol", None, 400, None, false).unwrap();
-    let ids: Vec<i64> = page["nodes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|n| n["node"].as_i64().unwrap())
-        .collect();
-    let read = db.history_items("Carol", &ids).unwrap();
-    let sent: Vec<Value> = read["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|n| json!([n["item"]["content"][0]["text"], n["request_id"], n["from"]]))
-        .collect();
-    let bob = json!({"bot":"Bob","turn":person});
+    db.finish(turn, None).unwrap();
+    let (accepted, _) = db.start(later, allow_provider).unwrap();
     assert_eq!(
-        sent,
-        [
-            json!(["done", null, null]),
-            json!(["and the tests", "p2", null]),
-            json!(["also the docs", "b2", bob]),
-            json!(["delegated work", "b1", bob]),
-        ]
+        (&accepted["data"]["from"], &accepted["data"]["origin"]),
+        (&Value::Null, &json!("schedule"))
     );
-    // The author's own prompt was a person's.
-    let bob = db.history_nodes("Bob", None, 400, None, false).unwrap();
-    let node = bob["nodes"][0]["node"].as_i64().unwrap();
-    assert_eq!(
-        db.history_items("Bob", &[node]).unwrap()["items"][0]["request_id"],
-        "p1"
-    );
+    db.append(later, vec![assistant("ran")], &[], None).unwrap();
+    db.finish(later, None).unwrap();
+    let senders = |db: &Database, name: &str| -> Vec<Value> {
+        let page = db.history_nodes(name, None, 400, None, false).unwrap();
+        let ids: Vec<i64> = page["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["node"].as_i64().unwrap())
+            .collect();
+        db.history_items(name, &ids).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| json!([n["item"]["content"][0]["text"], n["from"], n["origin"]]))
+            .collect()
+    };
+    let expected = [
+        json!(["ran", null, null]),
+        json!(["nightly", null, "schedule"]),
+        json!(["done", null, null]),
+        json!(["and the tests", null, null]),
+        json!(["task update", null, "tasks"]),
+        json!(["also the docs", bob, null]),
+        json!(["delegated work", bob, null]),
+    ];
+    assert_eq!(senders(&db, "Carol"), expected);
+    // A fork shares the nodes; the sender outlives the source's turns and
+    // the sender itself, and names the identity it had then, not whoever
+    // takes the name next.
+    db.fork("Carol", "Branch", Fork::default()).unwrap();
+    db.delete_bot("Carol").unwrap();
+    db.finish(person, None).unwrap();
+    db.delete_bot("Bob").unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    assert_eq!(senders(&db, "Branch"), expected);
 }
 
 #[test]
@@ -1628,7 +1671,7 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
     let turn = started.turn;
     assert_eq!(
         started.entry.unwrap()["data"]["from"],
-        json!({"bot":"Bob","turn":person})
+        json!({"bot":"Bob","turn":person,"id":1})
     );
     // The same request from someone else is not a retry of it.
     let conflict = db.begin(
@@ -1819,6 +1862,82 @@ fn schema_38_reads_every_stored_prompt_as_a_persons() {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(version, Database::SCHEMA);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn schema_40_keeps_each_bot_written_prompts_sender_with_its_node() {
+    let path = std::env::temp_dir().join(format!("agent-senders-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let person = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        let person = gated_turn(&mut db, None);
+        db.create("Carol", Some("/synthetic"), binding()).unwrap();
+        let by_bob = |delivery| TurnOptions {
+            delivery,
+            from: Some(("Bob".into(), person)),
+            ..TurnOptions::default()
+        };
+        let turn = db
+            .begin(
+                "Carol",
+                "b1",
+                "work",
+                true,
+                &by_bob(Delivery::Reject),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        for (id, text, options) in [
+            ("b2", "also", by_bob(Delivery::Steer)),
+            (
+                "p1",
+                "mine",
+                TurnOptions {
+                    delivery: Delivery::Steer,
+                    ..TurnOptions::default()
+                },
+            ),
+        ] {
+            db.begin("Carol", id, text, true, &options, allow_provider)
+                .unwrap();
+        }
+        db.absorb(turn, None, 8 << 20, 4096, ContextUsage::default(), false)
+            .unwrap();
+        person
+    };
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "DROP TABLE senders; ALTER TABLE turns DROP COLUMN origin; PRAGMA user_version=40;",
+        )
+        .unwrap();
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let page = db.history_nodes("Carol", None, 400, None, false).unwrap();
+    let ids: Vec<i64> = page["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["node"].as_i64().unwrap())
+        .collect();
+    let read = db.history_items("Carol", &ids).unwrap();
+    let sent: Vec<Value> = read["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| json!([n["item"]["content"][0]["text"], n["from"]]))
+        .collect();
+    let bob = json!({"bot":"Bob","turn":person,"id":1});
+    assert_eq!(
+        sent,
+        [
+            json!(["mine", null]),
+            json!(["also", bob]),
+            json!(["work", bob])
+        ]
+    );
+    drop(db);
     std::fs::remove_file(path).unwrap();
 }
 
@@ -2328,6 +2447,7 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
         delivery: Delivery::Reject,
         expected_turn: None,
         from: None,
+        origin: None,
     };
     let started = db
         .begin("Bob", "r1", "work", true, &options, allow_provider)
@@ -2454,6 +2574,7 @@ fn a_bot_without_a_default_workspace_needs_one_per_submission() {
         delivery: Delivery::Reject,
         expected_turn: None,
         from: None,
+        origin: None,
     };
     let turn = db
         .begin("Nomad", "r1", "work", true, &options, allow_provider)
@@ -3093,6 +3214,7 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
                 delivery: Delivery::Reject,
                 expected_turn: None,
                 from: None,
+                origin: None,
             },
             allow_provider,
         )

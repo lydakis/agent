@@ -59,8 +59,11 @@ window.Daemon = (() => {
   const S = { swarms: new Map(), bots: new Map(), nodes: new Map(), lineages: new Map(), nextNode: 1, nextTurn: 1, nextProc: 1, nextId: 1, cursor: 0, session: 0, queue: [], waiter: null, timers: new Set(), sides: new Set(), authors: new Map() };
   // Notifications wait in a queue for the page's next pull, as the core's transport holds them.
   // A prompt another bot wrote names it with its item, as the daemon's `history_items` does.
-  const authorOf = (event) => event.event === 'accepted' ? event.data.from : event.event === 'steered' ? S.authors.get(event.data.from) : null;
-  const emit = (event) => { if (event.data?.node != null) { if (!S.lineages.has(event.bot)) S.lineages.set(event.bot, []); const from = authorOf(event); S.lineages.get(event.bot).push({node:event.data.node,turn:event.turn ?? null,...(from ? {from} : {})}); } if (event.durable !== false) event.cursor = ++S.cursor; S.queue.push(event); if (S.waiter) { const w = S.waiter; S.waiter = null; w(); } };
+  // Who sent a prompt, as the daemon keeps it with the node: another bot's turn, with the identity
+  // its name held then, or what the client named as its origin.
+  const senderOf = (by) => by?.origin ? { origin: by.origin } : by ? { from: { bot: by.bot, turn: by.turn, id: S.bots.get(by.bot)?.id ?? null } } : {};
+  const authorOf = (event) => event.event === 'accepted' ? { ...(event.data.from ? { from: event.data.from } : {}), ...(event.data.origin ? { origin: event.data.origin } : {}) } : event.event === 'steered' ? S.authors.get(event.data.from) ?? {} : {};
+  const emit = (event) => { if (event.data?.node != null) { if (!S.lineages.has(event.bot)) S.lineages.set(event.bot, []); S.lineages.get(event.bot).push({node:event.data.node,turn:event.turn ?? null,...authorOf(event)}); } if (event.durable !== false) event.cursor = ++S.cursor; S.queue.push(event); if (S.waiter) { const w = S.waiter; S.waiter = null; w(); } };
   const node = (item) => { const id = S.nextNode++; S.nodes.set(id, item); return id; };
   const wait = (ms) => new Promise((r) => { const t = setTimeout(() => { S.timers.delete(t); r(); }, ms); S.timers.add(t); });
   const record = (name, model) => ({ name, status: 'idle', running_turn: null, provider: model.split('/')[0], model: model.split('/').slice(1).join('/'), workspace: '/workspace', input_tokens: 0, cached_input_tokens: 0, tokens_used: 0 });
@@ -132,10 +135,10 @@ window.Daemon = (() => {
   }
   function start(name, prompt, from = null) {
     const b = S.bots.get(name);
-    if (b.status !== 'idle') { emit({ event: 'queued', bot: name, turn: S.nextTurn, data: { delivery: 'queue', ...(from ? { from } : {}) } }); return null; }
+    if (b.status !== 'idle') { emit({ event: 'queued', bot: name, turn: S.nextTurn, data: { delivery: 'queue', ...senderOf(from) } }); return null; }
     const turn = S.nextTurn++;
     b.turns++; b.running_turn = turn; b.status = 'running'; b.interrupted = false; b.steers = [];
-    emit({ event: 'accepted', bot: name, turn, data: { request_id: `demo-${turn}`, node: node({ role: 'user', content: [{ type: 'input_text', text: prompt }] }), workspace: b.workspace, model: `${b.provider}/${b.model}`, ...(from ? { from } : {}) } });
+    emit({ event: 'accepted', bot: name, turn, data: { request_id: `demo-${turn}`, node: node({ role: 'user', content: [{ type: 'input_text', text: prompt }] }), workspace: b.workspace, model: `${b.provider}/${b.model}`, ...senderOf(from) } });
     return turn;
   }
   function finish(name, turn, status = 'completed') {
@@ -146,9 +149,9 @@ window.Daemon = (() => {
   // A steer is a turn of its own, queued until the running turn's next step takes it in.
   function steer(name, prompt, from = null) {
     const b = S.bots.get(name), turn = S.nextTurn++;
-    if (from) S.authors.set(turn, from);
+    const sender = senderOf(from); S.authors.set(turn, sender);
     (b.steers ??= []).push({ prompt, turn });
-    emit({ event: 'queued', bot: name, turn, data: { delivery: 'steer', status: 'queued', ...(from ? { from } : {}) } });
+    emit({ event: 'queued', bot: name, turn, data: { delivery: 'steer', status: 'queued', ...sender } });
     return turn;
   }
   async function reply(name, prompt, from = null) {
@@ -467,8 +470,8 @@ window.Daemon = (() => {
           const items=[];let bytes=0;
           const lineage=new Set((S.lineages.get(params.bot) ?? []).map(n=>n.node));
           if(params.nodes.some(node=>!lineage.has(node))) throw new Error('item_not_in_bot_history');
-          const sent=new Map((S.lineages.get(params.bot) ?? []).filter(n=>n.from).map(n=>[n.node,n.from]));
-          for(const node of params.nodes) {const item=S.nodes.get(node),size=JSON.stringify(item).length*2;if(items.length && bytes+size>768*1024)break;items.push({node,item,...(sent.has(node)?{from:sent.get(node)}:{})});bytes+=size;}
+          const sent=new Map((S.lineages.get(params.bot) ?? []).map(({node,from,origin})=>[node,{...(from?{from}:{}),...(origin?{origin}:{})}]));
+          for(const node of params.nodes) {const item=S.nodes.get(node),size=JSON.stringify(item).length*2;if(items.length && bytes+size>768*1024)break;items.push({node,item,...sent.get(node)});bytes+=size;}
           return {items};
         }
         // A demo bot's only unfinished turn is the one it runs.
@@ -477,9 +480,10 @@ window.Daemon = (() => {
         case 'create': { await create(params.bot, params.model, params.created_by ?? null, null, params.workspace); return { ...S.bots.get(params.bot) }; }
         case 'submit': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); if (b.status !== 'idle' && params.delivery === 'reject') throw new Error('bot_busy');
           if (params.delivery === 'steer' && params.expected_turn != null && params.expected_turn !== b.running_turn) throw new Error('stale_turn');
-          if (b.status !== 'idle' && params.delivery === 'steer') { const turn = steer(params.bot, params.prompt, params.from ?? null); return { bot: params.bot, turn, status: 'queued' }; }
+          const by = params.from ?? (params.origin ? { origin: params.origin } : null);
+          if (b.status !== 'idle' && params.delivery === 'steer') { const turn = steer(params.bot, params.prompt, by); return { bot: params.bot, turn, status: 'queued' }; }
           if (params.workspace) b.workspace = params.workspace; // a message that names a folder moves the bot there
-          const turn = S.nextTurn; reply(params.bot, params.prompt, params.from ?? null); return { bot: params.bot, turn, status: 'running', handle: `turn:${params.bot}/${turn}` }; }
+          const turn = S.nextTurn; reply(params.bot, params.prompt, by); return { bot: params.bot, turn, status: 'running', handle: `turn:${params.bot}/${turn}` }; }
         case 'interrupt': { const b = S.bots.get(params.bot); if (!b || b.running_turn === null) throw new Error('turn_not_running'); b.interrupted = true; finish(params.bot, b.running_turn, 'interrupted'); return { interrupt_requested: true }; }
         // A running source forks too, as the daemon's does from its newest finished round.
         case 'fork': { const src = S.bots.get(params.source); if (!src) throw new Error('bot_not_found'); await create(params.bot, `${src.provider}/${src.model}`, params.created_by ?? null, params.source, params.workspace ?? src.workspace, Array.isArray(params.allow) ? params.allow : src.allowed ?? null); if (params.created_by === params.source) S.sides.add(params.bot); return { ...S.bots.get(params.bot) }; }

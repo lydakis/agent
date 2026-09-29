@@ -670,7 +670,8 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual((self.path / 'lineage').read_text(),
                          f"Bob/{by_name['Bob']['id']}/Alice/{events[1]['turn']}")
         bob_turn = json.loads(self.agent('turns', '--store', str(self.store), '--bot', 'Bob').stdout)
-        self.assertEqual(events[1]['data']['from'], {'bot': 'Bob', 'turn': bob_turn[0]['turn']})
+        self.assertEqual(events[1]['data']['from'], {'bot': 'Bob', 'turn': bob_turn[0]['turn'],
+                                                     'id': by_name['Bob']['id']})
         self.assertEqual(events[-1]['event'], 'follow_live')
         self.assertTrue(all(e['cursor'] < f['cursor'] for e, f in zip(events[:-2], events[1:-1])))
         # A follower attached while a turn runs replays, then sees live deltas and the end.

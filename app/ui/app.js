@@ -238,17 +238,16 @@ const isActive = (status) => ACTIVE.has(status);
 // coordinator's lineage, and any root bot named `<project>.<task>`.
 const LEAD = '.lead';
 const leadProject = (name) => name.length > LEAD.length && name.endsWith(LEAD) ? name.slice(0, -LEAD.length) : null;
-// Who sent a prompt that is not yours: another agent's turn, as the daemon records it, or the app
-// on its own, known by the request ids it gives what it sends for the task updates and schedules.
-const APP_SENDERS = [['app-wake-', 'tasks'], ['schedule-', 'schedule']];
+// Who sent a prompt that is not yours: another agent's turn, or the app on its own (`origin`), as
+// the daemon keeps them with the prompt.
 function senderOf(p) {
-  if (p.from?.bot) return { bot: p.from.bot, turn: p.from.turn };
-  const id = typeof p.request_id === 'string' ? p.request_id : '';
-  const app = APP_SENDERS.find(([prefix]) => id.startsWith(prefix));
-  return app ? { app: app[1] } : null;
+  if (p.from?.bot) return { bot: p.from.bot, turn: p.from.turn, id: p.from.id };
+  return typeof p.origin === 'string' ? { app: p.origin } : null;
 }
+// The agent that sent it, while its name still holds the identity it had then.
+const senderBot = (by) => { const b = bot(by.bot); return b && b.id != null && b.id === by.id ? b : null; };
 // Who another agent is, as a message it sent names it: a coordinator by its role.
-const agentName = (name) => leadProject(name) ? 'coordinator' : bot(name) ? shortName(bot(name)) : name;
+const agentName = (name, b = bot(name)) => leadProject(name) ? 'coordinator' : b ? shortName(b) : name;
 function shortName(b) {
   const p = b?.project; if (!p) return b?.name ?? '';
   if (b.name === p + LEAD) return p;
@@ -567,7 +566,7 @@ async function onEvent(ev) {
     }
     case 'accepted': {
       const b = bot(name); if (b) { b.status = 'running'; b.runningTurn = turn; b.waitingOn = []; b.turnStarted = S.live ? Date.now() : 0; b.elapsed = 0; }
-      const t = transcript(name), by = senderOf(data); t.authors?.delete(turn);
+      const t = transcript(name), by = senderOf(data) ?? t.authors?.get(turn); t.authors?.delete(turn);
       if (typeof data.node === 'number') pushNode(t, { kind: 'node', node: data.node, turn, ...(by ? { by } : {}) });
       break;
     }
@@ -1162,7 +1161,9 @@ function itemHTML(it) {
   switch (it.kind) {
     case 'user': {
       if (!it.by) return `<div class="line user">› ${esc(it.text)}</div>`;
-      const tag = it.by.bot ? `<button type="button" class="by" data-task="${esc(it.by.bot)}" title="Sent by ${esc(it.by.bot)}, turn ${esc(it.by.turn)}">${esc(agentName(it.by.bot))}</button>` : `<span class="by">${esc(it.by.app)}</span>`;
+      const sender = it.by.bot ? senderBot(it.by) : null;
+      const tag = sender ? `<button type="button" class="by" data-task="${esc(it.by.bot)}" title="Sent by ${esc(it.by.bot)}, turn ${esc(it.by.turn)}">${esc(agentName(it.by.bot, sender))}</button>`
+        : `<span class="by"${it.by.bot ? ` title="Sent by ${esc(it.by.bot)}, turn ${esc(it.by.turn)}, since deleted"` : ''}>${esc(it.by.bot ? agentName(it.by.bot, null) : it.by.app)}</span>`;
       return `<div class="line user agent">${tag} ${esc(it.text)}</div>`;
     }
     case 'text': return markdown(it.text);

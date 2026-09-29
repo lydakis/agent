@@ -902,10 +902,13 @@ The fork can read its shared prefix after its source is deleted.
 
 `history_items` accepts `bot` and 1–400 distinct `nodes`. It validates all IDs
 against that bot's lineage with one ancestry walk and returns a prefix as
-`items: [{node: ID, item: VALUE}, ...]` in request order. A prompt's item, a
-turn's first or a steer's, also names the `request_id` that sent it and, when a
-bot's turn wrote it, `from: {bot, turn}`, so a client can say who each message
-came from without reading every turn. The reply targets
+`items: [{node: ID, item: VALUE}, ...]` in request order. A prompt a bot's turn
+wrote also carries `from: {bot, turn, id}`, with `id` the identity the bot's name
+held when it wrote it, and one a client sent with an `origin` carries that, so a
+client can say who each message came from without reading every turn. The store
+keeps both with the prompt's node (`senders`), so they last as long as the item:
+after the turn's rows go with a deleted fork source, and after its sender is
+deleted or its name reused. The reply targets
 768 KiB; one larger item may be returned alone if it fits the 1 MiB frame limit.
 An item exceeding that limit returns `{node: ID, error: "item_too_large"}`;
 other items remain readable. Callers request remaining IDs in their next batch.
@@ -1076,7 +1079,11 @@ that turn; a prompt without it is a person's. The CLI sends it from
 without the other (`author_turn_required`). The store checks that the turn
 is the bot's (`invalid_from`), keeps it on the new turn's row, a steer's
 included, counts it in the request's idempotency, and reports it on
-`accepted` and `queued`. Like the creator, it is declared, not verified.
+`accepted` and `queued`, with the sender's identity as `from.id`. Like the
+creator, it is declared, not verified. A client that sends a prompt on its own,
+not from a bot's turn, may name itself with `origin` (a name's characters,
+else `invalid_origin`), stored and reported the same way; the daemon gives it
+no meaning.
 `{"op":"prompts","bot","turn","bytes"?}` reads a turn's words and calls
 as an approver judges them, within `bytes` of text (default 64 KiB, at most
 256 KiB): the turn's prompt and each steer it absorbed, in order, with
@@ -1302,11 +1309,9 @@ identity sequence above the highest assigned ID (zero for an empty store).
 Schema 26 shares started prompts of at least 4 KiB with their immutable user
 node; queued prompts remain inline until start, and small prompts stay inline
 to avoid reference/index overhead. Idempotency and turn listings resolve the
-same original text. Absorbed steers share their own user node whatever their
-size: a steer has no turn of its own on the lineage, so the reference is how
-`history_items` names who sent it. Migration shares
+same original text. Absorbed steers share their own user node. Migration shares
 exact indexed matches; older steers without that mapping keep their inline
-text, and history names no sender for them. The prompt-node foreign key has a partial index for deletion checks.
+text. The prompt-node foreign key has a partial index for deletion checks.
 Schema 29 adds [tool-result elision](#tool-result-elision) without reading
 stored items: results recorded before it have no stub and are always sent
 whole. A backfilled saving would change the cumulative savings of every
@@ -1329,7 +1334,11 @@ Schema 39 records the folder each earlier turn ran in. Schema 40 adds each
 bot's own [settings](#bot-settings), the daemon's flags before it, so an
 existing bot takes the defaults; it also gives a turn an earlier daemon
 parked the fields added to its record since, with the values that daemon ran
-it with, so every parked record has one shape.
+it with, so every parked record has one shape. Schema 41 adds `turns.origin`
+and keeps each prompt's sender with its node (`senders`): a turn another bot
+wrote is found by its first node, a steer by the node it shares or the one its
+`steered` finish recorded, with the sender's identity where its turn is still
+stored. A steer whose finish event was pruned names no sender.
 
 New artifacts larger than 64 KiB, up to the existing 1 MiB output bound, may
 use lossless LZ4 blocks. Each remains one SQLite BLOB with a small offset

@@ -51,9 +51,11 @@ name opens that agent beside the chat. The daemon records a prompt's author
 when a bot's turn sent it (`from`, which the CLI fills from `AGENT_BOT` and
 `AGENT_TURN`), and `history_items` returns it with each prompt, so a chat
 read back after a restart keeps the names. Messages the app sends on its own
-are tagged by the request ids it gives them: `tasks` for a coordinator's
-task updates (`app-wake-`) and `schedule` for a scheduled message
-(`schedule-`).
+name their `origin` and are tagged with it: `tasks` for a coordinator's task
+updates and `schedule` for a scheduled message. The daemon keeps the sender
+with the message, so a fork keeps it after its source is deleted; the name
+links to the agent only while that name still holds the identity (`from.id`)
+that sent it.
 
 ![A task's chat: the coordinator's messages tagged](app/agent-message.png)
 
@@ -791,7 +793,8 @@ the first message going to the copy), a worktree bot's branch in its head,
 project creation (no file for a refused model),
 steers pinned to their turn, model picks pinned to identity, the demo
 daemon's steer delivery, a message's sender (another agent's, live, steered
-in and read back, and the app's own task updates and schedules), and runs
+in, queued and read back, unlinked once its name holds a new agent, and the
+app's own task updates and schedules by origin), and runs
 folded with failures on their line.
 `cargo test -p agent-app` includes a failed project-file write leaving
 neither a partial file nor a temporary.
@@ -807,7 +810,7 @@ This measures the ancestry-walk reduction, not an end-to-end fleet capacity clai
 Pulled event batches apply in order, with one visible-history load and render
 per batch. Creation/fork bursts rebuild the fleet tree at most once per pull,
 while retaining the 300-row rail window. The shared client rejects a ready
-handshake unless its protocol is exactly `agent_client::PROTOCOL`, now 4.
+handshake unless its protocol is exactly `agent_client::PROTOCOL`, now 5.
 
 The lifecycle regression suite compares committed thinking/answer transcripts
 between live delivery and replay, reconciles fork snapshot/replay ordering,

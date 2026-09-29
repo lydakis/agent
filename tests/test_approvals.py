@@ -556,6 +556,9 @@ class PromptReadTests(ModelFixture):
         # be one of that bot's.
         self.assertEqual(client.request('submit', bot='Bob', request_id='b', prompt='hi',
                                         **{'from': {'bot': 'Bob', 'turn': first + 99}})['error'], 'invalid_from')
+        # What sent a prompt when no bot's turn did is a name the client picks.
+        self.assertEqual(client.request('submit', bot='Bob', request_id='o', prompt='hi',
+                                        origin='not a name')['error'], 'invalid_origin')
         second = client.request('submit', bot='Bob', request_id='c', prompt='done',
                                 **{'from': {'bot': 'Bob', 'turn': first}})['result']['turn']
         self.assertEqual(client.finished(second)['data']['status'], 'completed')
