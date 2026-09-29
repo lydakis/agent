@@ -2631,12 +2631,29 @@ fn a_turn_runs_at_its_own_effort_or_its_bots() {
             .code,
         "idempotency_conflict"
     );
-    // A steer at another level waits for a turn at its own.
     let steer = |level: Option<&str>| TurnOptions {
         reasoning: level.map(Into::into),
         delivery: Delivery::Steer,
         ..TurnOptions::default()
     };
+    // A steer at the turn's level, or at none, joins it and records the
+    // level it ran at.
+    for (id, level) in [("s0", None), ("s0b", Some("low"))] {
+        db.begin("Bob", id, "join", true, &steer(level), allow_provider)
+            .unwrap();
+    }
+    let joined = db
+        .absorb(
+            low.turn,
+            None,
+            8 << 20,
+            4096,
+            ContextUsage::default(),
+            false,
+        )
+        .unwrap();
+    assert_eq!(joined.outcomes.len(), 2);
+    // A steer at another level waits for a turn at its own.
     db.begin(
         "Bob",
         "s1",
@@ -2682,7 +2699,49 @@ fn a_turn_runs_at_its_own_effort_or_its_bots() {
         .iter()
         .map(|t| &t["reasoning"])
         .collect();
-    assert_eq!(levels, ["low", "xhigh", "high", "high"]);
+    assert_eq!(levels, ["low", "low", "low", "xhigh", "high", "high"]);
+}
+
+#[test]
+fn the_next_turn_knows_the_effort_its_history_was_sent_at() {
+    let mut db = db();
+    db.create(
+        "Bob",
+        Some("/synthetic"),
+        Binding {
+            reasoning: Some("high"),
+            ..binding()
+        },
+    )
+    .unwrap();
+    let mut previous = Vec::new();
+    for (n, level) in [(1, Some("low")), (2, None), (3, None)] {
+        let options = TurnOptions {
+            reasoning: level.map(Into::into),
+            ..TurnOptions::default()
+        };
+        let turn = db
+            .begin(
+                "Bob",
+                &format!("r{n}"),
+                "work",
+                true,
+                &options,
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        let context = db.context(turn).unwrap();
+        previous.push(context.previous_call.map(|(_, effort)| effort));
+        db.append(turn, vec![assistant(&format!("a{n}"))], &[], None)
+            .unwrap();
+        db.finish(turn, None).unwrap();
+    }
+    // A cache written at one effort is not one written at another.
+    assert_eq!(
+        previous,
+        [None, Some(Some("low".into())), Some(Some("high".into()))]
+    );
 }
 
 #[test]
@@ -9192,7 +9251,7 @@ fn schema_34_records_whether_a_call_or_a_summary_changed_the_view_last() {
     // sent the view the next turn starts from.
     let turn = begin(&mut db, 7);
     let context = db.context(turn).unwrap();
-    assert_eq!((context.view_sent, context.previous_model), (None, None));
+    assert_eq!((context.view_sent, context.previous_call), (None, None));
     // A call sends the view; a summary after it rewrites the view.
     db.append(turn, vec![assistant("r7")], &[], None).unwrap();
     assert_eq!(db.context(turn).unwrap().view_sent, Some(true));
@@ -9215,12 +9274,12 @@ fn schema_34_records_whether_a_call_or_a_summary_changed_the_view_last() {
     assert_eq!(db.context(turn).unwrap().view_sent, Some(false));
     db.finish(turn, None).unwrap();
     let next = begin(&mut db, 8);
-    assert_eq!(db.context(next).unwrap().previous_model, None);
+    assert_eq!(db.context(next).unwrap().previous_call, None);
     db.append(next, vec![assistant("r8")], &[], None).unwrap();
     db.finish(next, None).unwrap();
     let after = begin(&mut db, 9);
     let context = db.context(after).unwrap();
-    assert_eq!(context.previous_model, Some(context.model));
+    assert_eq!(context.previous_call, Some((context.model, None)));
     drop(db);
     let version: i32 = Connection::open(&path)
         .unwrap()

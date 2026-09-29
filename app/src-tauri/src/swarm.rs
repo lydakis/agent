@@ -3160,18 +3160,23 @@ pub fn start_cli(args: &[String]) -> i32 {
             if me["id"].as_i64() != Some(id) {
                 return Err(format!("{lead} is not this shell's bot any more"));
             }
-            // This turn's model, which the shell names, else the bot's own,
-            // at the lead's own effort level.
-            let model = std::env::var("AGENT_MODEL")
-                .ok()
-                .filter(|m| !m.is_empty())
-                .unwrap_or_else(|| format!("{provider}/{model}"));
+            // This turn's model and effort, which the shell names, else the
+            // bot's own. A shell that names a model names its turn's effort
+            // whenever it has one.
+            let turn = |name| std::env::var(name).ok().filter(|v: &String| !v.is_empty());
+            let (model, reasoning) = match turn("AGENT_MODEL") {
+                Some(model) => (model, turn("AGENT_REASONING")),
+                None => (
+                    format!("{provider}/{model}"),
+                    me["reasoning"].as_str().map(str::to_owned),
+                ),
+            };
             let mix = if asked.mix.is_empty() {
                 vec![Mix {
                     identity: String::new(),
                     model,
                     share: 100,
-                    reasoning: me["reasoning"].as_str().map(str::to_owned),
+                    reasoning,
                 }]
             } else {
                 asked.mix

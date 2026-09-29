@@ -912,12 +912,12 @@ pub struct TurnContext {
     pub model: String,
     /// The effort level this turn runs at: its own, else the bot's.
     pub reasoning: Option<String>,
-    /// The model of the bot's latest earlier turn that started, when its
-    /// calls sent the history this turn starts from: a call sent its view
-    /// last, and something follows its prompt. `None` otherwise, as when
-    /// it failed before a call or after a summary, or on a fork's first
-    /// turn.
-    pub previous_model: Option<String>,
+    /// The model and effort of the bot's latest earlier turn that started,
+    /// when its calls sent the history this turn starts from: a call sent
+    /// its view last, and something follows its prompt. `None` otherwise,
+    /// as when it failed before a call or after a summary, or on a fork's
+    /// first turn.
+    pub previous_call: Option<(String, Option<String>)>,
 }
 pub struct Database {
     conn: Connection,
@@ -3882,14 +3882,17 @@ impl Database {
             head = Some(id);
             if size >= PROMPT_SHARE_BYTES {
                 tx.execute("UPDATE turns SET status='steered',finished_ms=?1,prompt='',prompt_node=?2,
-                    (workspace,model)=(SELECT COALESCE(s.workspace,t.workspace),COALESCE(s.model,t.model)
+                    (workspace,model,reasoning)=(SELECT COALESCE(s.workspace,t.workspace),COALESCE(s.model,t.model),
+                        COALESCE(s.reasoning,t.reasoning)
                         FROM turns s, turns t WHERE s.id=?4 AND t.id=?3) WHERE id=?4",
                     params![epoch_ms(), id, turn, steer])?;
             } else {
-                // A steer that named no folder or model records the ones it ran with.
+                // A steer that named no folder, model or effort records the
+                // ones it ran with.
                 tx.execute(
                     "UPDATE turns SET status='steered',finished_ms=?1,
-                        (workspace,model)=(SELECT COALESCE(s.workspace,t.workspace),COALESCE(s.model,t.model)
+                        (workspace,model,reasoning)=(SELECT COALESCE(s.workspace,t.workspace),COALESCE(s.model,t.model),
+                            COALESCE(s.reasoning,t.reasoning)
                             FROM turns s, turns t WHERE s.id=?3 AND t.id=?2) WHERE id=?3",
                     params![epoch_ms(), turn, steer],
                 )?;
@@ -4920,16 +4923,18 @@ impl Database {
         // them in one probe. One that stored its prompt and failed before a
         // call recorded no call, or left its prompt, a prompt node, right
         // before this one.
-        let previous_model = self
+        let previous_call = self
             .conn
             .prepare_cached(
-                "SELECT COALESCE(t.model,?3),t.view_sent IS 1 AND p.turn IS NULL
+                "SELECT COALESCE(t.model,?3),t.view_sent IS 1 AND p.turn IS NULL,COALESCE(t.reasoning,?4)
                    FROM turns t,nodes s LEFT JOIN nodes p ON p.id=s.parent
                   WHERE t.bot=?1 AND t.id<?2 AND t.started_ms IS NOT NULL AND s.turn=?2
                   ORDER BY t.id DESC LIMIT 1",
             )?
-            .query_row(params![bot.name, turn, default], |r| {
-                r.get::<_, bool>(1)?.then(|| r.get(0)).transpose()
+            .query_row(params![bot.name, turn, default, bot.reasoning], |r| {
+                r.get::<_, bool>(1)?
+                    .then(|| Ok((r.get(0)?, r.get(2)?)))
+                    .transpose()
             })
             .optional()?
             .flatten();
@@ -4941,7 +4946,7 @@ impl Database {
                 .ok_or(Error::new("workspace_required"))?,
             model: model.unwrap_or(default),
             reasoning: reasoning.or(bot.reasoning),
-            previous_model,
+            previous_call,
             created_by: bot.created_by,
             created_by_id: bot.created_by_id,
             bot: bot.name,

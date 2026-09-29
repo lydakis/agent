@@ -166,7 +166,7 @@ class SwarmPostTests(ModelFixture):
         # Every agent runs the coordinator's model, in its folder, with half the budget.
         ids = self.ids()
         self.assertEqual(started['swarm']['ids'], {'p.widget-1': ids['p.widget-1'], 'p.widget-2': ids['p.widget-2']})
-        self.assertEqual(started['swarm']['mix'], [{'identity': '', 'model': 'openai/synthetic-model', 'share': 100}])
+        self.assertEqual(started['swarm']['mix'], [{'identity': '', 'model': 'openai/synthetic-model', 'reasoning': None, 'share': 100}])
         self.assertEqual(started['swarm']['workspace'], str(self.path))
         listed = {b['name']: b for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout)}
         self.assertEqual(listed['p.widget-1']['budget_tokens'], 250000)
@@ -177,6 +177,17 @@ class SwarmPostTests(ModelFixture):
         # Each agent got its brief.
         for bot in started['bots']:
             self.assertIn('Ship the widget', self.turns(bot)[0]['prompt_preview'])
+        # A turn run at another effort starts its swarm at that effort.
+        again = self.path / 'again.json'
+        self.agent('run', '--store', str(self.store), '--bot', 'p.lead', '--reasoning', 'xhigh',
+                   f"shell:HOME='{home}' '{APP}' --swarm-start --agents 1 --budget 0.5 --in-project"
+                   f" -- Ship the gadget > '{again}' 2>&1")
+        gadget = json.loads(again.read_text())
+        self.assertIn('swarm', gadget, gadget)
+        self.assertEqual(gadget['swarm']['mix'][0]['reasoning'], 'xhigh')
+        listed = {b['name']: b for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout)}
+        self.assertEqual([listed[b]['reasoning'] for b in gadget['bots']], ['xhigh'])
+        self.assertIsNone(listed['p.lead']['reasoning'])
         # Only a coordinator starts one.
         refused = self.path / 'refused.json'
         self.agent('run', *self.common, '--new', '--bot', 'q',
