@@ -1375,26 +1375,39 @@ impl Turn {
     /// Before the turn parks, a summary beside it lands and is installed,
     /// so a turn resumed from the park never races its install. What it
     /// spent is counted when the calls return. Until when one that parked
-    /// on its pool is not tried again, for the park to keep.
-    async fn settle_beside(&self, settle: Option<&Settle>) -> Result<Option<u64>> {
+    /// on its pool is not tried again, for the park to keep; `None` when
+    /// `unless` came first and the turn no longer parks, which leaves the
+    /// summary running beside the calls.
+    async fn settle_beside(
+        &self,
+        settle: Option<&Settle>,
+        unless: impl std::future::Future<Output = ()>,
+    ) -> Result<Option<Option<u64>>> {
         let Some(settle) = settle else {
             // Calls a resumed turn runs before its rounds: no summary ran
             // beside them, and the park they resumed from says when one may.
             let retry = self.resumed.as_ref().and_then(|w| w.summary_retry_ms);
-            return Ok(retry.filter(|at| now_ms() < *at));
+            return Ok(Some(retry.filter(|at| now_ms() < *at)));
         };
         let (ask, answer) = tokio::sync::oneshot::channel();
         if settle.asks.send(ask).is_err() {
-            return Ok(None);
+            return Ok(Some(None));
         }
-        let Ok((landed, retry)) = answer.await else {
-            return Ok(None);
+        let waited = std::time::Instant::now();
+        let answer = tokio::select! {
+            biased;
+            answer = answer => answer,
+            () = unless => return Ok(None),
+        };
+        let Ok((landed, retry)) = answer else {
+            return Ok(Some(None));
         };
         if let Some(landed) = landed {
-            let installed = self.install_landed(landed.result, landed.waited_ms).await?;
+            let waited_ms = waited.elapsed().as_millis() as u64;
+            let installed = self.install_landed(landed.result, waited_ms).await?;
             *settle.spent.lock().expect("settle lock") = Some((landed.spent, installed));
         }
-        Ok(retry)
+        Ok(Some(retry))
     }
 
     /// Record a summary as the new context start, at a boundary: the view
@@ -3055,7 +3068,22 @@ impl Turn {
             if lapse.is_some_and(|lapse| tokio::time::Instant::now() >= lapse) {
                 continue;
             }
-            let summary_retry_ms = self.settle_beside(settle).await?;
+            // A verdict or a lapse while the summary lands means the call
+            // no longer parks; the summary goes on beside it.
+            let decided = async {
+                tokio::select! {
+                    () = notify.notified() => {}
+                    () = async {
+                        match lapse {
+                            Some(lapse) => tokio::time::sleep_until(lapse).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {}
+                }
+            };
+            let Some(summary_retry_ms) = self.settle_beside(settle, decided).await? else {
+                continue;
+            };
             let pending: Vec<ToolCall> = std::iter::once(call.clone())
                 .chain(calls.as_slice().iter().cloned())
                 .collect();
@@ -3233,7 +3261,10 @@ impl Turn {
                 return Ok(ControlFlow::Continue(failure(error)));
             }
         }
-        let summary_retry_ms = self.settle_beside(settle).await?;
+        let summary_retry_ms = self
+            .settle_beside(settle, std::future::pending())
+            .await?
+            .flatten();
         // Only move the remaining calls once this wait can actually park.
         let pending: Vec<ToolCall> = calls.collect();
         let deadline_ms = timeout_ms.map(|t| now_ms() + t);
@@ -3560,6 +3591,9 @@ impl Beside<'_> {
             Asked(Option<Ask>),
         }
         tokio::pin!(main);
+        // An ask made while the summary runs, answered when it lands; `main`
+        // runs on meanwhile and may stop waiting for it.
+        let mut held_ask = None;
         loop {
             if self.running.is_none() && asks.is_none() {
                 return main.await;
@@ -3589,13 +3623,22 @@ impl Beside<'_> {
                 Next::Landed(landed) => {
                     self.running = None;
                     self.finish(landed);
+                    if let Some(ask) = held_ask.take() {
+                        self.answer(ask);
+                    }
                 }
-                Next::Asked(Some(ask)) => {
-                    let landed = self.land().await;
-                    let _ = ask.send((landed, self.retry_after()));
-                }
+                Next::Asked(Some(ask)) if self.running() => held_ask = Some(ask),
+                Next::Asked(Some(ask)) => self.answer(ask),
                 Next::Asked(None) => asks = None,
             }
+        }
+    }
+
+    /// Hand how the summary ended to an ask; one no longer waiting leaves
+    /// it here for a boundary to install.
+    fn answer(&mut self, ask: Ask) {
+        if let Err((landed, _)) = ask.send((self.landed.take(), self.retry_after())) {
+            self.landed = landed;
         }
     }
 
@@ -4043,6 +4086,49 @@ mod tests {
         assert_eq!(landed.spent.rounds, 1);
         // The wait that took it is what the turn waited.
         assert!(landed.waited_ms >= 30, "{}", landed.waited_ms);
+    }
+
+    #[tokio::test]
+    async fn a_call_that_stops_waiting_for_the_summary_runs_on_beside_it() {
+        let mut beside = Beside {
+            running: Some(Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Landed {
+                    result: Ok(Summary::Skipped),
+                    spent: Spent {
+                        rounds: 1,
+                        ..Spent::default()
+                    },
+                    waited_ms: 0,
+                }
+            })),
+            ..Beside::default()
+        };
+        // The calls ask, then a verdict lets them run: they stop waiting,
+        // and go on while the summary still runs.
+        let (asks, mut asked) = tokio::sync::mpsc::unbounded_channel::<Ask>();
+        let started = std::time::Instant::now();
+        let calls = async move {
+            let (ask, answer) = tokio::sync::oneshot::channel();
+            asks.send(ask).expect("asked");
+            let waited = tokio::time::timeout(Duration::from_millis(5), answer).await;
+            assert!(waited.is_err());
+            started.elapsed()
+        };
+        let ran = beside.drive(calls, Some(&mut asked)).await;
+        assert!(ran < Duration::from_millis(50), "{ran:?}");
+        assert!(beside.running());
+        // Once it lands, the ask no one waits on leaves it for a boundary.
+        let (asks, mut asked) = tokio::sync::mpsc::unbounded_channel::<Ask>();
+        let calls = async move {
+            let (ask, answer) = tokio::sync::oneshot::channel();
+            asks.send(ask).expect("asked");
+            drop(answer);
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        };
+        beside.drive(calls, Some(&mut asked)).await;
+        assert!(!beside.running());
+        assert_eq!(beside.landed.take().expect("kept").spent.rounds, 1);
     }
 
     #[tokio::test]

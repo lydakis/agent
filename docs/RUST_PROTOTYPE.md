@@ -2160,7 +2160,9 @@ turn waits for it only when its view no longer fits the input limit, or
 when the turn ends or parks. A call that parks the turn, a wait or an
 approval still pending, first waits for it and installs it, so a turn
 resumed from that park never races its install; the calls before it, and
-an approval that arrives in time, run beside it as any call does. An interrupt drops one still running like the
+an approval that arrives in time, run beside it as any call does. A verdict
+or lapse that comes while the call waits for it ends that wait: the call no
+longer parks, and the summary runs on beside it. An interrupt drops one still running like the
 turn's own call; one that has landed is billed and installed as the turn
 ends. It runs beside only while the view and the reply's estimated size
 still fit the input limit and, beside what it holds, two model rounds (a

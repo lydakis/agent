@@ -55,7 +55,9 @@ class Model(http.server.BaseHTTPRequestHandler):
                 # after `summary_delay`.
                 started = time.monotonic()
                 if is_summary(request):
+                    self.server.summarizing = True
                     time.sleep(getattr(self.server, 'summary_delay', 0))
+                    self.server.summarizing = False
                 self.server.timeline.append((is_summary(request), started, time.monotonic()))
             if hasattr(self.server, 'request_gates'):
                 try:
