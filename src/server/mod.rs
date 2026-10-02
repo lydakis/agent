@@ -3014,6 +3014,7 @@ mod tests {
                     false,
                     &[],
                     None,
+                    None,
                 )?;
                 Ok(turn)
             })
@@ -3843,7 +3844,7 @@ mod tests {
                 .into();
                 db.append(bob, vec![item], std::slice::from_ref(&call), None)?;
                 db.tool_start(bob, &call)?;
-                db.suspend(bob, &call.call_id, &[parked], None, false, &[], None)
+                db.suspend(bob, &call.call_id, &[parked], None, false, &[], None, None)
                     .map(|_| ())
             })
             .await
@@ -3938,7 +3939,7 @@ mod tests {
         let bob = running(&store, &["Bob".into()]).await[0].1;
         store
             .call(move |db| {
-                db.suspend_paced(bob, 0, 0, 0, 0, 0, false, None, None)
+                db.suspend_paced(bob, 0, 0, 0, 0, 0, false, None, None, None)
                     .map(|_| ())
             })
             .await
@@ -4806,6 +4807,7 @@ mod tests {
                     false,
                     &[],
                     None,
+                    None,
                 )
                 .map(|_| ())
             })
@@ -4864,7 +4866,7 @@ mod tests {
                 "call_id":call.call_id,"arguments":call.arguments}))?
                 .into();
                 db.append(turn, vec![item], std::slice::from_ref(&call), None)?;
-                db.suspend_approval(turn, std::slice::from_ref(&call), now_ms(), None)?;
+                db.suspend_approval(turn, std::slice::from_ref(&call), now_ms(), None, None)?;
                 let answered = db.answer(agent_runtime::store::Decision {
                     bot: "Bob",
                     turn,

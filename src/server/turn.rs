@@ -397,6 +397,7 @@ impl Turn {
         {
             result = Err(error);
         }
+        let summary_retry_ms = beside.retry_after();
         drop(beside);
         let (retries, paced_ms) = accounting.totals();
         let turn = self.turn;
@@ -418,6 +419,7 @@ impl Turn {
                         compaction,
                         copied,
                         route.as_deref(),
+                        summary_retry_ms,
                     )
                     .map(|_| ())
                 })
@@ -822,7 +824,7 @@ impl Turn {
         context: &mut Context,
         (last, inherited, model): (Option<&LastCall>, bool, &str),
         output_bytes: Option<usize>,
-        beside: Option<&mut Beside<'a>>,
+        (beside, retry_at): (Option<&mut Beside<'a>>, u64),
     ) -> Result<Compaction> {
         if record.compaction_instructions.is_none() {
             return Ok(Compaction::Skipped);
@@ -871,10 +873,11 @@ impl Turn {
         // of the view.
         let held = (2, context.usage().bytes as u64 / 2);
         // One that parked on its pool is not tried again before the pool
-        // reopens; a view that outgrows the limit still summarizes first.
-        if beside
-            .as_ref()
-            .is_some_and(|beside| now_ms() < beside.retry_at)
+        // reopens, behind a call of this task or not, while the view and
+        // the reply still fit; one that outgrows the limit summarizes first.
+        if now_ms() < retry_at
+            && pressure.bytes + reserve < limit.bytes
+            && pressure.items < limit.items
         {
             return Ok(Compaction::Skipped);
         }
@@ -928,6 +931,7 @@ impl Turn {
                         retries,
                         paced_ms,
                     },
+                    waited_ms: 0,
                 }
             }));
             return Ok(Compaction::Skipped);
@@ -1347,14 +1351,21 @@ impl Turn {
         model_rounds: &mut usize,
         accounting: &mut Accounting,
     ) -> Result<bool> {
-        landed.spent.count(tokens_used, model_rounds, accounting);
-        self.install_landed(landed.result).await
+        let Landed {
+            result,
+            spent,
+            waited_ms,
+        } = landed;
+        spent.count(tokens_used, model_rounds, accounting);
+        self.install_landed(result, waited_ms).await
     }
 
-    /// Install what a summary beside the turn wrote; whether it was.
-    async fn install_landed(&self, result: Result<Summary>) -> Result<bool> {
+    /// Install what a summary beside the turn wrote, recording how long
+    /// the turn waited for it; whether it was installed.
+    async fn install_landed(&self, result: Result<Summary>, waited_ms: u64) -> Result<bool> {
         match result? {
-            Summary::Written(written) => {
+            Summary::Written(mut written) => {
+                written.request["waited_ms"] = waited_ms.into();
                 Ok(matches!(self.install(*written).await?, Compaction::Done))
             }
             Summary::Parked(_) | Summary::Skipped => Ok(false),
@@ -1363,21 +1374,27 @@ impl Turn {
 
     /// Before the turn parks, a summary beside it lands and is installed,
     /// so a turn resumed from the park never races its install. What it
-    /// spent is counted when the calls return.
-    async fn settle_beside(&self, settle: Option<&Settle>) -> Result<()> {
+    /// spent is counted when the calls return. Until when one that parked
+    /// on its pool is not tried again, for the park to keep.
+    async fn settle_beside(&self, settle: Option<&Settle>) -> Result<Option<u64>> {
         let Some(settle) = settle else {
-            return Ok(());
+            // Calls a resumed turn runs before its rounds: no summary ran
+            // beside them, and the park they resumed from says when one may.
+            let retry = self.resumed.as_ref().and_then(|w| w.summary_retry_ms);
+            return Ok(retry.filter(|at| now_ms() < *at));
         };
         let (ask, answer) = tokio::sync::oneshot::channel();
         if settle.asks.send(ask).is_err() {
-            return Ok(());
+            return Ok(None);
         }
-        let Ok(Some(landed)) = answer.await else {
-            return Ok(());
+        let Ok((landed, retry)) = answer.await else {
+            return Ok(None);
         };
-        let installed = self.install_landed(landed.result).await?;
-        *settle.spent.lock().expect("settle lock") = Some((landed.spent, installed));
-        Ok(())
+        if let Some(landed) = landed {
+            let installed = self.install_landed(landed.result, landed.waited_ms).await?;
+            *settle.spent.lock().expect("settle lock") = Some((landed.spent, installed));
+        }
+        Ok(retry)
     }
 
     /// Record a summary as the new context start, at a boundary: the view
@@ -1746,10 +1763,12 @@ impl Turn {
         // What a summary that parked had copied, for its retry to copy.
         let mut copied = None;
         if let Some(waiting) = &self.resumed {
-            // The park did not end the turn, so neither does its route.
+            // The park did not end the turn, so neither does its route, nor
+            // the wait for a summary's pool to reopen.
             if let Some(route) = &waiting.route {
                 let _ = accounting.route.set(route.clone());
             }
+            beside.retry_at = waiting.summary_retry_ms.unwrap_or(0);
             // Only a pool park continues the same model call's retry budget.
             if waiting.paced_since_ms.is_some() {
                 accounting.call_attempts = waiting.call_attempts;
@@ -1979,6 +1998,7 @@ impl Turn {
                 // call reads: at a turn's start, or as a turn resumes, the
                 // cache may have lapsed, and a summary first keeps that call
                 // small.
+                let retry_at = beside.retry_at;
                 let beside = sent_here.then_some(&mut *beside);
                 match self
                     .compact_if_due(
@@ -1990,7 +2010,7 @@ impl Turn {
                         &mut context,
                         (last.as_ref(), inherited, called),
                         output_bytes,
-                        beside,
+                        (beside, retry_at),
                     )
                     .await?
                 {
@@ -3035,7 +3055,7 @@ impl Turn {
             if lapse.is_some_and(|lapse| tokio::time::Instant::now() >= lapse) {
                 continue;
             }
-            self.settle_beside(settle).await?;
+            let summary_retry_ms = self.settle_beside(settle).await?;
             let pending: Vec<ToolCall> = std::iter::once(call.clone())
                 .chain(calls.as_slice().iter().cloned())
                 .collect();
@@ -3043,7 +3063,13 @@ impl Turn {
             let parked = self
                 .store
                 .op("suspend_approval", move |db| {
-                    db.suspend_approval(turn, &pending, now_ms(), route.as_deref())
+                    db.suspend_approval(
+                        turn,
+                        &pending,
+                        now_ms(),
+                        route.as_deref(),
+                        summary_retry_ms,
+                    )
                 })
                 .await?;
             match parked {
@@ -3207,7 +3233,7 @@ impl Turn {
                 return Ok(ControlFlow::Continue(failure(error)));
             }
         }
-        self.settle_beside(settle).await?;
+        let summary_retry_ms = self.settle_beside(settle).await?;
         // Only move the remaining calls once this wait can actually park.
         let pending: Vec<ToolCall> = calls.collect();
         let deadline_ms = timeout_ms.map(|t| now_ms() + t);
@@ -3226,6 +3252,7 @@ impl Turn {
                     any,
                     &pending,
                     route.as_deref(),
+                    summary_retry_ms,
                 )?;
                 db.next_lapse(turn)
             })
@@ -3475,7 +3502,7 @@ struct Settle {
     asks: tokio::sync::mpsc::UnboundedSender<Ask>,
     spent: std::sync::Mutex<Option<(Spent, bool)>>,
 }
-type Ask = tokio::sync::oneshot::Sender<Option<Landed>>;
+type Ask = tokio::sync::oneshot::Sender<(Option<Landed>, Option<u64>)>;
 
 impl Beside<'_> {
     fn running(&self) -> bool {
@@ -3504,6 +3531,12 @@ impl Beside<'_> {
             self.finish(landed);
         }
         self.landed.take()
+    }
+
+    /// Until when one that parked on its pool is not tried again, if later
+    /// than now.
+    fn retry_after(&self) -> Option<u64> {
+        Some(self.retry_at).filter(|at| now_ms() < *at)
     }
 
     /// Keep how the summary ended, and when one that parked may run again.
@@ -3558,7 +3591,8 @@ impl Beside<'_> {
                     self.finish(landed);
                 }
                 Next::Asked(Some(ask)) => {
-                    let _ = ask.send(self.land().await);
+                    let landed = self.land().await;
+                    let _ = ask.send((landed, self.retry_after()));
                 }
                 Next::Asked(None) => asks = None,
             }
@@ -3569,7 +3603,9 @@ impl Beside<'_> {
     /// stays here while it runs, so a turn cancelled meanwhile still holds it.
     async fn land(&mut self) -> Option<Landed> {
         if let Some(running) = self.running.as_mut() {
-            let landed = running.await;
+            let waited = std::time::Instant::now();
+            let mut landed = running.await;
+            landed.waited_ms = waited.elapsed().as_millis() as u64;
             self.running = None;
             self.finish(landed);
         }
@@ -3577,10 +3613,12 @@ impl Beside<'_> {
     }
 }
 
-/// How a summary beside the turn ended, and what it spent.
+/// How a summary beside the turn ended, what it spent, and how long the
+/// turn waited for it.
 struct Landed {
     result: Result<Summary>,
     spent: Spent,
+    waited_ms: u64,
 }
 
 /// A summary call's outcome: written, to install at a boundary; parked on
@@ -3955,6 +3993,7 @@ mod tests {
                 Landed {
                     result: Ok(Summary::Parked(42)),
                     spent: Spent::default(),
+                    waited_ms: 0,
                 }
             })),
             ..Beside::default()
@@ -3962,6 +4001,24 @@ mod tests {
         let landed = beside.land().await.expect("landed");
         assert!(matches!(landed.result, Ok(Summary::Parked(42))));
         assert_eq!(beside.retry_at, 42);
+        // A pool that has reopened holds nothing for a park to keep; one
+        // still closed does, and calls about to park are told until when.
+        assert_eq!(beside.retry_after(), None);
+        let until = now_ms() + 60_000;
+        beside.running = Some(Box::pin(async move {
+            Landed {
+                result: Ok(Summary::Parked(until)),
+                spent: Spent::default(),
+                waited_ms: 0,
+            }
+        }));
+        let (asks, mut asked) = tokio::sync::mpsc::unbounded_channel::<Ask>();
+        let calls = async move {
+            let (ask, answer) = tokio::sync::oneshot::channel();
+            asks.send(ask).expect("asked");
+            answer.await.expect("answered").1
+        };
+        assert_eq!(beside.drive(calls, Some(&mut asked)).await, Some(until));
     }
 
     #[tokio::test]
@@ -3975,6 +4032,7 @@ mod tests {
                         rounds: 1,
                         ..Spent::default()
                     },
+                    waited_ms: 0,
                 }
             })),
             ..Beside::default()
@@ -3983,6 +4041,8 @@ mod tests {
         assert!(cancelled.is_err() && beside.running());
         let landed = beside.land().await.expect("landed");
         assert_eq!(landed.spent.rounds, 1);
+        // The wait that took it is what the turn waited.
+        assert!(landed.waited_ms >= 30, "{}", landed.waited_ms);
     }
 
     #[tokio::test]
@@ -3997,6 +4057,7 @@ mod tests {
                         rounds: 1,
                         ..Spent::default()
                     },
+                    waited_ms: 0,
                 }
             })),
             ..Beside::default()
@@ -4008,6 +4069,7 @@ mod tests {
             answer
                 .await
                 .expect("answered")
+                .0
                 .map(|landed| landed.spent.rounds)
         };
         assert_eq!(beside.drive(calls, Some(&mut asked)).await, Some(1));
@@ -4017,7 +4079,7 @@ mod tests {
         let calls = async move {
             let (ask, answer) = tokio::sync::oneshot::channel();
             asks.send(ask).expect("asked");
-            answer.await.expect("answered").is_none()
+            answer.await.expect("answered").0.is_none()
         };
         assert!(beside.drive(calls, Some(&mut asked)).await);
     }

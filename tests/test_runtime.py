@@ -84,7 +84,8 @@ class Model(http.server.BaseHTTPRequestHandler):
                 self.send_response(429)
                 self.send_header('Content-Length', str(len(body)))
                 # Exhaust retries quickly, then force the ordinary call to park.
-                self.send_header('Retry-After', '0.4' if self.server.compaction_refusals == 0 else '0.001')
+                last = getattr(self.server, 'compaction_retry_after', '0.4')
+                self.send_header('Retry-After', last if self.server.compaction_refusals == 0 else '0.001')
                 self.end_headers()
                 self.wfile.write(body)
                 self.wfile.flush()
@@ -513,7 +514,8 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                 body = b'{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}'
                 self.send_response(429)
                 self.send_header('Content-Length', str(len(body)))
-                self.send_header('Retry-After', '0.4' if self.server.compaction_refusals == 0 else '0.001')
+                last = getattr(self.server, 'compaction_retry_after', '0.4')
+                self.send_header('Retry-After', last if self.server.compaction_refusals == 0 else '0.001')
                 self.end_headers()
                 self.wfile.write(body)
                 self.wfile.flush()

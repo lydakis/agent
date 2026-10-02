@@ -94,7 +94,7 @@ class TurnCompactionTests(ModelFixture):
         events = all_events(client, 'Bob')
         compacted = [e['data'] for e in events if e['event'] == 'compacted']
         self.assertEqual(len(compacted), len(summaries))
-        self.assertTrue(all(c['request']['beside'] for c in compacted))
+        self.assertTrue(all(c['request']['beside'] and c['request']['waited_ms'] >= 0 for c in compacted))
         self.assertFalse([e for e in events if e['event'] == 'compaction_failed'])
         # Each summary's call says it ran beside the turn's calls.
         spent = [e['data'] for e in events if e['event'] == 'usage' and e['data'].get('purpose') == 'compaction']
@@ -173,6 +173,28 @@ class TurnCompactionTests(ModelFixture):
         self.assertEqual(billed, [turn])
         kinds = [e['event'] for e in events]
         self.assertLess(kinds.index('compacted'), kinds.index('turn_waiting'))
+        # The turn waited for the summary before it parked, and says so.
+        self.assertGreater(compacted[0]['data']['request']['waited_ms'], 1000)
+
+    def test_a_turn_resumed_before_its_summary_pool_reopens_does_not_wait_for_it(self):
+        # The turn runs on another model than its summarizer. Its summary
+        # beside it is turned away until its pool reopens three seconds
+        # later; meanwhile the turn parks on a wait and resumes. Its own
+        # model's pool is open, so it goes on rather than waiting for the
+        # summarizer's.
+        self.model.models = ('synthetic-model', 'synthetic-large')
+        self.model.compaction_refusals, self.model.compaction_retry_after = 1, '3'
+        self.model.long_wait = 'sleep .5'
+        client = self.client(tools='shell,wait', settings={'context_bytes': 65536})
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'wait'],
+                       compaction_instructions='Summarize.')
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:160x1',
+                              model='openai/synthetic-large')['result']['turn']
+        ended = client.finished(turn, timeout=60)
+        self.assertEqual(ended['data']['status'], 'completed', ended)
+        kinds = [e['event'] for e in all_events(client, 'Bob')]
+        self.assertIn('turn_waiting', kinds)
+        self.assertNotIn('turn_paced', kinds)
 
     def test_a_round_that_overflows_before_compaction_is_due_forces_a_summary(self):
         # Four small rounds, then one that takes the turn past its budget

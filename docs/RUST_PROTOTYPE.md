@@ -2173,7 +2173,10 @@ own connection rather than the bot's WebSocket, which the turn's calls hold,
 and counts toward the turn's rounds, budget, and retries when it lands. A
 summary beside the turn that parks on a closed pool parks nothing; a later
 boundary summarizes again once the pool's retry time has passed, unless the
-view outgrows the limit first, which summarizes before the call as above. Because the plan is a boundary or more older than
+view outgrows the limit first, which summarizes before the call as above.
+A park keeps that retry time, so a turn resumed before it goes on with its
+calls rather than parking on the summarizer's pool. Its `compacted` event's
+`request` carries `waited_ms`, how long the turn waited for it. Because the plan is a boundary or more older than
 its installation, the view it leaves also holds the rounds since, which can
 take it past the limit, for the next boundary to summarize again before its
 call. While it runs, it holds those rounds and tokens against the turn's

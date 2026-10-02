@@ -376,8 +376,10 @@ class LongTaskScoreTests(unittest.TestCase):
         def usage(cursor, sent, purpose=None, beside=False):
             data = {'sent_ms': sent, 'purpose': purpose}
             return {'cursor': cursor, 'event': 'usage', 'data': {**data, 'beside': True} if beside else data}
-        compacted = lambda cursor, beside: {'cursor': cursor, 'event': 'compacted', 'data': {
-            'version': cursor, 'cut': cursor, 'request': {'beside': beside}}}
+        def compacted(cursor, beside, waited_ms=None):
+            request = {'beside': beside} if waited_ms is None else {'beside': beside, 'waited_ms': waited_ms}
+            return {'cursor': cursor, 'event': 'compacted', 'data': {'version': cursor, 'cut': cursor,
+                                                                     'request': request}}
         # A summary sent just after the call it ran beside, installed after
         # that call was recorded, held none back; a later summary holds the
         # call after it back.
@@ -395,6 +397,12 @@ class LongTaskScoreTests(unittest.TestCase):
                   usage(10, 3200, 'keep_warm'), usage(11, 3300, 'compaction'), usage(12, 3900)]
         result = score(self.root, self.facts, events, '')
         self.assertEqual(result['summarizer_ms'], 800)
+        # One the turn waited for, as it outgrew the limit or was about to
+        # park, held it back that long.
+        events = [usage(1, 1000), usage(2, 1100, 'compaction', True), usage(3, 1200),
+                  compacted(4, True, 250), usage(5, 1600)]
+        result = score(self.root, self.facts, events, '')
+        self.assertEqual(result['summarizer_ms'], 250)
 
     def test_each_call_is_scored_under_the_view_it_was_made_under(self):
         usage = lambda cursor: {'cursor': cursor, 'event': 'usage', 'data': {'sent_ms': cursor}}
