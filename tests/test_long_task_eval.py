@@ -380,6 +380,14 @@ class LongTaskScoreTests(unittest.TestCase):
                   usage(5, 6000), usage(6, 7000, 'compaction'), usage(7, 8500)]
         result = score(self.root, self.facts, events, '')
         self.assertEqual(result['summarizer_ms'], 1500)
+        # Sent just after the call it ran beside, and installed beside the
+        # turn after that call was recorded: still none held back.
+        compacted = lambda cursor, beside: {'cursor': cursor, 'event': 'compacted', 'data': {
+            'version': cursor, 'cut': cursor, 'request': {'beside': beside}}}
+        events = [usage(1, 1000), usage(2, 1050), usage(3, 1100, 'compaction'), compacted(4, True),
+                  usage(5, 3000), usage(6, 3500, 'compaction'), compacted(7, False), usage(8, 4000)]
+        result = score(self.root, self.facts, events, '')
+        self.assertEqual(result['summarizer_ms'], 500)
 
     def test_each_call_is_scored_under_the_view_it_was_made_under(self):
         usage = lambda cursor: {'cursor': cursor, 'event': 'usage', 'data': {'sent_ms': cursor}}

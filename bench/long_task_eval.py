@@ -888,20 +888,28 @@ def score(root, facts, events, answer, corrected_at=None):
     # A summary's latency: from its send to the send of the model call it
     # held back, which also counts recording the compaction. Attempts in a
     # row, such as a retry after one that failed, are one interval. One
-    # sent before a call recorded ahead of it ran beside that call and held
-    # nothing back.
-    held, start, last = 0, None, 0
-    for row in usage:
-        if not row.get('sent_ms'):
+    # installed beside the turn's calls held none back; one never installed
+    # held the next call only if it was sent after the last call recorded
+    # ahead of it.
+    held, start, last, attempts = 0, None, 0, []
+    for event in events:
+        data = event['data']
+        if event['event'] == 'compacted':
+            if attempts and start is None and not (data.get('request') or {}).get('beside'):
+                start = attempts[0]
+            attempts = []
+        elif event['event'] != 'usage' or not data.get('sent_ms'):
             continue
-        if row.get('purpose') == 'compaction':
-            if start is None and row['sent_ms'] > last:
-                start = row['sent_ms']
+        elif data.get('purpose') == 'compaction':
+            attempts.append(data['sent_ms'])
         else:
+            if attempts and start is None and attempts[0] > last:
+                start = attempts[0]
+            attempts = []
             if start is not None:
-                held += row['sent_ms'] - start
+                held += data['sent_ms'] - start
                 start = None
-            last = row['sent_ms']
+            last = data['sent_ms']
 
     return {
         'hidden_tests': f'{passed}/{cases}', 'hidden_failure': failure,

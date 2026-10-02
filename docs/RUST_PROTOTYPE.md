@@ -2175,7 +2175,7 @@ view outgrows the limit first, which summarizes before the call as above. Becaus
 its installation, the view it leaves also holds the rounds since, which can
 take it past the limit, for the next boundary to summarize again before its
 call. While it runs, it holds those rounds and tokens against the turn's
-calls: a call they would take past the round limit or the budget waits for
+calls, and its own calls and retries stop at them: a call they would take past the round limit or the budget waits for
 it, and is checked against what it spent.
 
 The result is recorded in one transaction: the summary, the covered turns'

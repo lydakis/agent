@@ -905,10 +905,17 @@ impl Turn {
             else {
                 return Ok(Compaction::Skipped);
             };
+            // It spends only what it holds: its calls and their retries
+            // count from the rounds left after its share, and a bot's
+            // budget ends at its share.
             let (mut record, tools) = (record.clone(), tools.clone());
+            if let Some(budget) = &mut record.budget_tokens {
+                *budget = (*budget).min(record.tokens_used.saturating_add(held.1));
+            }
             beside.held = held;
             beside.running = Some(Box::pin(async move {
-                let (before, mut rounds) = (record.tokens_used, 0);
+                let (before, start) = (record.tokens_used, MAX_ROUNDS - held.0);
+                let mut rounds = start;
                 let result = self
                     .summarize(planned, &mut record, &mut rounds, turn, &mut spent, &tools)
                     .await;
@@ -917,7 +924,7 @@ impl Turn {
                     result,
                     spent: Spent {
                         tokens: record.tokens_used.saturating_sub(before),
-                        rounds,
+                        rounds: rounds - start,
                         retries,
                         paced_ms,
                     },
