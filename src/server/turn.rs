@@ -1392,22 +1392,32 @@ impl Turn {
     }
 
     /// Install what a summary beside the turn wrote, recording when the
-    /// turn began to wait for it and how long it waited, if it did; whether
-    /// it was installed.
+    /// turn began to wait for it and how long it waited, if it did, even
+    /// when it installed nothing; whether it was installed.
     async fn install_landed(
         &self,
         result: Result<Summary>,
         waited: Option<(u64, u64)>,
     ) -> Result<bool> {
-        match result? {
+        let installed = match result? {
             Summary::Written(mut written) => {
                 let (from_ms, ms) = waited.map_or((None, 0), |(from, ms)| (Some(from), ms));
                 written.request["waited_ms"] = ms.into();
                 written.request["waited_from_ms"] = from_ms.into();
-                Ok(matches!(self.install(*written).await?, Compaction::Done))
+                matches!(self.install(*written).await?, Compaction::Done)
             }
-            Summary::Parked(_) | Summary::Skipped => Ok(false),
+            Summary::Parked(_) | Summary::Skipped => false,
+        };
+        // One that installed nothing has no `compacted` to say so.
+        if let (false, Some((from_ms, ms))) = (installed, waited) {
+            let turn = self.turn;
+            self.store
+                .op("compaction_waited", move |db| {
+                    db.compaction_waited(turn, from_ms, ms)
+                })
+                .await?;
         }
+        Ok(installed)
     }
 
     /// Before the turn parks, a summary beside it lands and is installed,

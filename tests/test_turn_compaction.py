@@ -191,6 +191,27 @@ class TurnCompactionTests(ModelFixture):
         self.assertGreater(compacted[0]['data']['request']['waited_ms'], 1000)
         self.assertIsInstance(compacted[0]['data']['request']['waited_from_ms'], int)
 
+    def test_a_failed_summary_the_turn_waited_for_records_the_wait(self):
+        # As above, but the summary comes back empty: nothing is installed,
+        # and the wait before the park is recorded on its own.
+        self.model.timeline, self.model.summary_delay = [], 2.5
+        self.model.empty_compaction, self.model.long_wait = True, 'sleep .5'
+        client = self.client(tools='shell,wait', settings={'context_bytes': 65536})
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'wait'],
+                       compaction_instructions='Summarize.')
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:160x1')['result']['turn']
+        ended = client.finished(turn, timeout=60)
+        self.assertEqual(ended['data']['status'], 'completed', ended)
+        events = all_events(client, 'Bob')
+        self.assertNotIn('compacted', [e['event'] for e in events])
+        waits = [e for e in events if e['event'] == 'compaction_waited']
+        parked = next(i for i, e in enumerate(events) if e['event'] == 'turn_waiting')
+        before = [e for e in waits if events.index(e) < parked]
+        self.assertTrue(before, [e['event'] for e in events][parked - 8:parked + 1])
+        self.assertEqual(before[-1]['turn'], turn)
+        self.assertGreater(before[-1]['data']['waited_ms'], 1000)
+        self.assertIsInstance(before[-1]['data']['waited_from_ms'], int)
+
     def test_a_turn_resumed_before_its_summary_pool_reopens_does_not_wait_for_it(self):
         # The turn runs on another model than its summarizer. Its summary
         # beside it is turned away until its pool reopens three seconds

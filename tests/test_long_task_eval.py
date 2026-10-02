@@ -408,6 +408,25 @@ class LongTaskScoreTests(unittest.TestCase):
                   {'cursor': 8, 'event': 'turn_waiting', 'data': {}}, usage(9, 5000)]
         result = score(self.root, self.facts, events, '')
         self.assertEqual(result['summarizer_ms'], 350 + 300)
+        # One the turn waited for that installed nothing records its wait
+        # on its own, counted the same way.
+        waited = lambda cursor, start, ms: {'cursor': cursor, 'event': 'compaction_waited',
+                                             'data': {'waited_from_ms': start, 'waited_ms': ms}}
+        events = [usage(1, 1000), usage(2, 1100, 'compaction', True), waited(3, 1300, 400), usage(4, 1900),
+                  usage(5, 2000, 'compaction', True), waited(6, 2100, 200),
+                  {'cursor': 7, 'event': 'turn_paced', 'data': {}}, usage(8, 9000)]
+        result = score(self.root, self.facts, events, '')
+        self.assertEqual(result['summarizer_ms'], 600 + 200)
+
+    def test_a_summary_the_turn_ended_on_counts_to_its_end(self):
+        usage = lambda cursor, sent, purpose=None: {
+            'cursor': cursor, 'event': 'usage', 'data': {'sent_ms': sent, 'purpose': purpose}}
+        # The last summary attempt spends the budget, and the turn ends
+        # with no call after it.
+        events = [usage(1, 1000), usage(2, 2000, 'compaction'),
+                  {'cursor': 3, 'turn': 7, 'event': 'turn_finished', 'data': {'status': 'failed'}}]
+        result = score(self.root, self.facts, events, '', finished_ms={7: 2600})
+        self.assertEqual(result['summarizer_ms'], 600)
 
     def test_each_call_is_scored_under_the_view_it_was_made_under(self):
         usage = lambda cursor: {'cursor': cursor, 'event': 'usage', 'data': {'sent_ms': cursor}}

@@ -4118,6 +4118,19 @@ impl Database {
         tx.commit()?;
         Ok(())
     }
+    /// A summary beside the turn that the turn waited for but that
+    /// installed nothing: when the wait began and how long it lasted.
+    pub fn compaction_waited(&mut self, turn: i64, from_ms: u64, waited_ms: u64) -> Result<()> {
+        let bot = self.active(turn)?;
+        event(
+            &self.conn,
+            &bot.name,
+            Some(turn),
+            "compaction_waited",
+            json!({"waited_ms": waited_ms, "waited_from_ms": from_ms}),
+        )?;
+        Ok(())
+    }
     pub fn tool_start(&mut self, turn: i64, call: &ToolCall) -> Result<Value> {
         let bot = self.active(turn)?;
         // Every call before it is done, so a gate still undecided is a later

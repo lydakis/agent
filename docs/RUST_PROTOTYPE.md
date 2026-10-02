@@ -2182,7 +2182,9 @@ view outgrows the limit first, which summarizes before the call as above.
 A park keeps that retry time, so a turn resumed before it goes on with its
 calls rather than parking on the summarizer's pool. Its `compacted` event's
 `request` carries `waited_ms`, how long the turn waited for it, and
-`waited_from_ms`, when it began to (null when it never did). Because the plan is a boundary or more older than
+`waited_from_ms`, when it began to (null when it never did). One the turn
+waited for that installed nothing, because it failed or parked, records the
+same two fields in a durable `compaction_waited` event. Because the plan is a boundary or more older than
 its installation, the view it leaves also holds the rounds since, which can
 take it past the limit, for the next boundary to summarize again before its
 call. While it runs, it holds those rounds and tokens against the turn's
