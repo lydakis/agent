@@ -870,6 +870,14 @@ impl Turn {
         // call and a request of its own, and a token for every two bytes
         // of the view.
         let held = (2, context.usage().bytes as u64 / 2);
+        // One that parked on its pool is not tried again before the pool
+        // reopens; a view that outgrows the limit still summarizes first.
+        if beside
+            .as_ref()
+            .is_some_and(|beside| now_ms() < beside.retry_at)
+        {
+            return Ok(Compaction::Skipped);
+        }
         if let Some(beside) = beside
             && pressure.bytes + reserve < limit.bytes
             && pressure.items < limit.items
@@ -907,10 +915,12 @@ impl Turn {
                 let (retries, paced_ms) = spent.totals();
                 Landed {
                     result,
-                    tokens: record.tokens_used.saturating_sub(before),
-                    rounds,
-                    retries,
-                    paced_ms,
+                    spent: Spent {
+                        tokens: record.tokens_used.saturating_sub(before),
+                        rounds,
+                        retries,
+                        paced_ms,
+                    },
                 }
             }));
             return Ok(Compaction::Skipped);
@@ -1330,16 +1340,37 @@ impl Turn {
         model_rounds: &mut usize,
         accounting: &mut Accounting,
     ) -> Result<bool> {
-        *tokens_used = tokens_used.saturating_add(landed.tokens);
-        *model_rounds += landed.rounds;
-        accounting.retries += landed.retries;
-        accounting.paced_ms += landed.paced_ms;
-        match landed.result? {
+        landed.spent.count(tokens_used, model_rounds, accounting);
+        self.install_landed(landed.result).await
+    }
+
+    /// Install what a summary beside the turn wrote; whether it was.
+    async fn install_landed(&self, result: Result<Summary>) -> Result<bool> {
+        match result? {
             Summary::Written(written) => {
                 Ok(matches!(self.install(*written).await?, Compaction::Done))
             }
             Summary::Parked(_) | Summary::Skipped => Ok(false),
         }
+    }
+
+    /// Before the turn parks, a summary beside it lands and is installed,
+    /// so a turn resumed from the park never races its install. What it
+    /// spent is counted when the calls return.
+    async fn settle_beside(&self, settle: Option<&Settle>) -> Result<()> {
+        let Some(settle) = settle else {
+            return Ok(());
+        };
+        let (ask, answer) = tokio::sync::oneshot::channel();
+        if settle.asks.send(ask).is_err() {
+            return Ok(());
+        }
+        let Ok(Some(landed)) = answer.await else {
+            return Ok(());
+        };
+        let installed = self.install_landed(landed.result).await?;
+        *settle.spent.lock().expect("settle lock") = Some((landed.spent, installed));
+        Ok(())
     }
 
     /// Record a summary as the new context start, at a boundary: the view
@@ -1762,6 +1793,7 @@ impl Turn {
                         &record,
                         None,
                         accounting.route.get().map(String::as_str),
+                        None,
                     )
                     .await?
                 {
@@ -1787,6 +1819,12 @@ impl Turn {
         // Whether this task has made a call, whose cache a summary beside
         // the next one reads.
         let mut sent_here = false;
+        // How the calls ask a summary beside them to land before they park.
+        let (asks, mut asked) = tokio::sync::mpsc::unbounded_channel();
+        let settle = Settle {
+            asks,
+            spent: std::sync::Mutex::new(None),
+        };
         // Until this task calls or changes the view, the view is taken as
         // the bot's call before a new prompt or a wait sent it, through
         // its newest boundary, and its cache as still held, when that call
@@ -2023,16 +2061,19 @@ impl Turn {
             drop(last.take());
             inherited = false;
             let Some(response) = beside
-                .drive(self.call(
-                    provider,
-                    model,
-                    &tools,
-                    &context,
-                    &mut record,
-                    &mut model_rounds,
-                    turn,
-                    accounting,
-                ))
+                .drive(
+                    self.call(
+                        provider,
+                        model,
+                        &tools,
+                        &context,
+                        &mut record,
+                        &mut model_rounds,
+                        turn,
+                        accounting,
+                    ),
+                    None,
+                )
                 .await?
             else {
                 return Ok(Round::Paced(accounting.parked_until));
@@ -2091,32 +2132,6 @@ impl Turn {
                 }
                 return Ok(Round::Finished);
             }
-            // A wait or a gate may park the turn, and a turn resumed from
-            // a park must not race the install of a summary beside it:
-            // one is waited for and installed before such calls run.
-            let parks = response
-                .calls
-                .iter()
-                .any(|call| call.name == "wait" || record.gated(&call.name));
-            let mut installed = false;
-            if parks {
-                if beside.running() {
-                    beside.landed = beside.land().await;
-                }
-                if let Some(landed) = beside.landed.take() {
-                    installed = self
-                        .landed(
-                            landed,
-                            &mut record.tokens_used,
-                            &mut model_rounds,
-                            accounting,
-                        )
-                        .await?;
-                    if installed && capped.is_some() {
-                        self.steers.store(true, Relaxed);
-                    }
-                }
-            }
             // The cache's lifetime runs from the sending of the call that
             // read it, or of a refresh sent while its reply streamed.
             let read_at = accounting
@@ -2141,19 +2156,33 @@ impl Turn {
                     pending,
                 });
             let stop = beside
-                .drive(self.execute_calls(
-                    response.calls,
-                    announced,
-                    &workspace,
-                    &environment,
-                    &record,
-                    warm.as_mut(),
-                    accounting.route.get().map(String::as_str),
-                ))
-                .await?;
+                .drive(
+                    self.execute_calls(
+                        response.calls,
+                        announced,
+                        &workspace,
+                        &environment,
+                        &record,
+                        warm.as_mut(),
+                        accounting.route.get().map(String::as_str),
+                        Some(&settle),
+                    ),
+                    Some(&mut asked),
+                )
+                .await;
             let refreshed = warm.map_or(0, |warm| warm.tokens);
             record.tokens_used = record.tokens_used.saturating_add(refreshed);
-            if let Some(stop) = stop {
+            // A summary the calls installed before the turn would park
+            // counts toward the turn, and may make a capped steer room.
+            let settled = settle.spent.lock().expect("settle lock").take();
+            let installed = settled.is_some_and(|(spent, installed)| {
+                spent.count(&mut record.tokens_used, &mut model_rounds, accounting);
+                installed
+            });
+            if installed && capped.is_some() {
+                self.steers.store(true, Relaxed);
+            }
+            if let Some(stop) = stop? {
                 return Ok(stop.round());
             }
             // A summary installed since the call replaced the view it sent.
@@ -2758,13 +2787,14 @@ impl Turn {
         record: &Bot,
         mut warm: Option<&mut Warm<'_>>,
         route: Option<&str>,
+        settle: Option<&Settle>,
     ) -> Result<Option<Stop>> {
         let (turn, allowed) = (self.turn, record.callable());
         let mut calls = calls.into_iter();
         while let Some(call) = calls.next() {
             if record.gated(&call.name) {
                 match self
-                    .approve(&call, &mut calls, announced.take(), record, route)
+                    .approve(&call, &mut calls, announced.take(), record, route, settle)
                     .await?
                 {
                     Approval::Run => {}
@@ -2792,7 +2822,15 @@ impl Turn {
                     any,
                 }) => {
                     match self
-                        .park(&call.call_id, handles, timeout_ms, any, &mut calls, route)
+                        .park(
+                            &call.call_id,
+                            handles,
+                            timeout_ms,
+                            any,
+                            &mut calls,
+                            route,
+                            settle,
+                        )
                         .await?
                     {
                         ControlFlow::Continue(outcome) => outcome,
@@ -2916,6 +2954,7 @@ impl Turn {
         announced: Option<(Arc<Notify>, tokio::time::Instant)>,
         record: &Bot,
         route: Option<&str>,
+        settle: Option<&Settle>,
     ) -> Result<Approval> {
         let turn = self.turn;
         let hold =
@@ -2984,6 +3023,7 @@ impl Turn {
             if lapse.is_some_and(|lapse| tokio::time::Instant::now() >= lapse) {
                 continue;
             }
+            self.settle_beside(settle).await?;
             let pending: Vec<ToolCall> = std::iter::once(call.clone())
                 .chain(calls.as_slice().iter().cloned())
                 .collect();
@@ -3115,6 +3155,7 @@ impl Turn {
 
     /// Make the turn durable as waiting, then register its handles. Returns
     /// an immediate result only for arguments that can never resolve.
+    #[allow(clippy::too_many_arguments)]
     async fn park(
         &self,
         call_id: &str,
@@ -3123,6 +3164,7 @@ impl Turn {
         any: bool,
         calls: &mut std::vec::IntoIter<ToolCall>,
         route: Option<&str>,
+        settle: Option<&Settle>,
     ) -> Result<ControlFlow<Stop, Outcome>> {
         let mut processes = Vec::new();
         for text in &handles {
@@ -3153,6 +3195,7 @@ impl Turn {
                 return Ok(ControlFlow::Continue(failure(error)));
             }
         }
+        self.settle_beside(settle).await?;
         // Only move the remaining calls once this wait can actually park.
         let pending: Vec<ToolCall> = calls.collect();
         let deadline_ms = timeout_ms.map(|t| now_ms() + t);
@@ -3393,7 +3436,34 @@ struct Beside<'a> {
     landed: Option<Landed>,
     /// The model rounds and tokens the running summary may spend.
     held: (usize, u64),
+    /// Until when a summary that parked on its pool is not tried again.
+    retry_at: u64,
 }
+
+/// What a summary beside the turn spent, counted toward the turn.
+#[derive(Default)]
+struct Spent {
+    tokens: u64,
+    rounds: usize,
+    retries: u64,
+    paced_ms: u64,
+}
+impl Spent {
+    fn count(self, tokens_used: &mut u64, model_rounds: &mut usize, accounting: &mut Accounting) {
+        *tokens_used = tokens_used.saturating_add(self.tokens);
+        *model_rounds += self.rounds;
+        accounting.retries += self.retries;
+        accounting.paced_ms += self.paced_ms;
+    }
+}
+
+/// A summary beside the turn's calls asked to land before they park it,
+/// and, once the calls installed it, what it spent.
+struct Settle {
+    asks: tokio::sync::mpsc::UnboundedSender<Ask>,
+    spent: std::sync::Mutex<Option<(Spent, bool)>>,
+}
+type Ask = tokio::sync::oneshot::Sender<Option<Landed>>;
 
 impl Beside<'_> {
     fn running(&self) -> bool {
@@ -3419,25 +3489,66 @@ impl Beside<'_> {
             && let Some(landed) = running.now_or_never()
         {
             self.running = None;
-            self.landed = Some(landed);
+            self.finish(landed);
         }
         self.landed.take()
     }
 
-    /// Run `main` to its end, and the summary alongside it until it lands.
-    async fn drive<T>(&mut self, main: impl std::future::Future<Output = T>) -> T {
+    /// Keep how the summary ended, and when one that parked may run again.
+    fn finish(&mut self, landed: Landed) {
+        if let Ok(Summary::Parked(until)) = &landed.result {
+            self.retry_at = *until;
+        }
+        self.landed = Some(landed);
+    }
+
+    /// Run `main` to its end, and the summary alongside it until it lands,
+    /// answering each of `main`'s asks for it with how it ended.
+    async fn drive<T>(
+        &mut self,
+        main: impl std::future::Future<Output = T>,
+        mut asks: Option<&mut tokio::sync::mpsc::UnboundedReceiver<Ask>>,
+    ) -> T {
+        enum Next<T> {
+            Out(T),
+            Landed(Landed),
+            Asked(Option<Ask>),
+        }
         tokio::pin!(main);
         loop {
-            let Some(running) = self.running.as_mut() else {
+            if self.running.is_none() && asks.is_none() {
                 return main.await;
-            };
-            tokio::select! {
-                biased;
-                out = &mut main => return out,
-                landed = running => {
-                    self.running = None;
-                    self.landed = Some(landed);
+            }
+            let next = {
+                let running = self.running.as_mut();
+                let asked = asks.as_deref_mut();
+                tokio::select! {
+                    biased;
+                    out = &mut main => Next::Out(out),
+                    landed = async move {
+                        match running {
+                            Some(running) => running.await,
+                            None => std::future::pending().await,
+                        }
+                    } => Next::Landed(landed),
+                    ask = async move {
+                        match asked {
+                            Some(asked) => asked.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => Next::Asked(ask),
                 }
+            };
+            match next {
+                Next::Out(out) => return out,
+                Next::Landed(landed) => {
+                    self.running = None;
+                    self.finish(landed);
+                }
+                Next::Asked(Some(ask)) => {
+                    let _ = ask.send(self.land().await);
+                }
+                Next::Asked(None) => asks = None,
             }
         }
     }
@@ -3445,7 +3556,8 @@ impl Beside<'_> {
     /// Wait for the summary, if one is running, and take how it ended.
     async fn land(&mut self) -> Option<Landed> {
         if let Some(running) = self.running.take() {
-            self.landed = Some(running.await);
+            let landed = running.await;
+            self.finish(landed);
         }
         self.landed.take()
     }
@@ -3454,10 +3566,7 @@ impl Beside<'_> {
 /// How a summary beside the turn ended, and what it spent.
 struct Landed {
     result: Result<Summary>,
-    tokens: u64,
-    rounds: usize,
-    retries: u64,
-    paced_ms: u64,
+    spent: Spent,
 }
 
 /// A summary call's outcome: written, to install at a boundary; parked on
@@ -3822,6 +3931,59 @@ mod tests {
     }
     use super::*;
     use serde_json::Value;
+
+    #[tokio::test]
+    async fn a_summary_that_parks_holds_off_the_next_until_its_pool_reopens() {
+        let mut beside = Beside {
+            running: Some(Box::pin(async {
+                Landed {
+                    result: Ok(Summary::Parked(42)),
+                    spent: Spent::default(),
+                }
+            })),
+            ..Beside::default()
+        };
+        let landed = beside.land().await.expect("landed");
+        assert!(matches!(landed.result, Ok(Summary::Parked(42))));
+        assert_eq!(beside.retry_at, 42);
+    }
+
+    #[tokio::test]
+    async fn a_call_about_to_park_waits_for_the_summary_beside_it() {
+        let (asks, mut asked) = tokio::sync::mpsc::unbounded_channel::<Ask>();
+        let mut beside = Beside {
+            running: Some(Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Landed {
+                    result: Ok(Summary::Skipped),
+                    spent: Spent {
+                        rounds: 1,
+                        ..Spent::default()
+                    },
+                }
+            })),
+            ..Beside::default()
+        };
+        // The calls ask before the summary has landed, and get it.
+        let calls = async move {
+            let (ask, answer) = tokio::sync::oneshot::channel();
+            asks.send(ask).expect("asked");
+            answer
+                .await
+                .expect("answered")
+                .map(|landed| landed.spent.rounds)
+        };
+        assert_eq!(beside.drive(calls, Some(&mut asked)).await, Some(1));
+        assert!(!beside.running() && beside.landed.is_none());
+        // With none running and none landed, the answer is none.
+        let (asks, mut asked) = tokio::sync::mpsc::unbounded_channel::<Ask>();
+        let calls = async move {
+            let (ask, answer) = tokio::sync::oneshot::channel();
+            asks.send(ask).expect("asked");
+            answer.await.expect("answered").is_none()
+        };
+        assert!(beside.drive(calls, Some(&mut asked)).await);
+    }
 
     #[tokio::test]
     async fn interrupt_finishes_a_committed_steer_batch_and_wakes_waiters() {

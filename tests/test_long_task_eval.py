@@ -667,14 +667,15 @@ class LongTaskRunnerTests(ModelFixture):
                 # and what it cost.
                 self.assertEqual(len(result['summaries']), result['compactions'])
                 # A summary installed a boundary after its plan also holds
-                # the round that ran beside it, which can take the view past
+                # the rounds that ran beside it, which can take the view past
                 # the limit, for the next summary to catch up.
-                beside = any(summary['beside'] for summary in result['summaries'])
+                after_beside = False
                 for summary in result['summaries']:
                     self.assertEqual(summary['calls'], 1)
                     self.assertGreater(summary['span_bytes'], 0)
-                    if not beside:
+                    if not (summary['beside'] or after_beside):
                         self.assertLessEqual(summary['view_bytes'], summary['limit_bytes'])
+                    after_beside = summary['beside']
                     self.assertIn(summary['form'], ('copy', 'own'))
                     self.assertEqual(summary['copied_items'] is None, summary['form'] == 'own')
                     self.assertGreater(summary['estimate']['own'], 0)

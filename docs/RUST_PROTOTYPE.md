@@ -2155,9 +2155,10 @@ view as it is. The first boundary after it lands installs it, after the
 results of the rounds it ran beside, so the view still changes only between
 calls. Until then neither stubs nor another summary change the view. The
 turn waits for it only when its view no longer fits the input limit, or
-when the turn ends or parks. Calls that may park the turn, a wait or a
-gated call, wait for it and install it before they run, so a turn resumed
-from that park never races its install. An interrupt drops one still running like the
+when the turn ends or parks. A call that parks the turn, a wait or an
+approval still pending, first waits for it and installs it, so a turn
+resumed from that park never races its install; the calls before it, and
+an approval that arrives in time, run beside it as any call does. An interrupt drops one still running like the
 turn's own call; one that has landed is billed and installed as the turn
 ends. It runs beside only while the view and the reply's estimated size
 still fit the input limit and, beside what it holds, two model rounds (a
@@ -2169,7 +2170,8 @@ summary goes before the call. A summary beside the turn uses its
 own connection rather than the bot's WebSocket, which the turn's calls hold,
 and counts toward the turn's rounds, budget, and retries when it lands. A
 summary beside the turn that parks on a closed pool parks nothing; a later
-boundary summarizes again. Because the plan is a boundary or more older than
+boundary summarizes again once the pool's retry time has passed, unless the
+view outgrows the limit first, which summarizes before the call as above. Because the plan is a boundary or more older than
 its installation, the view it leaves also holds the rounds since, which can
 take it past the limit, for the next boundary to summarize again before its
 call. While it runs, it holds those rounds and tokens against the turn's
