@@ -887,29 +887,27 @@ def score(root, facts, events, answer, corrected_at=None):
 
     # A summary's latency: from its send to the send of the model call it
     # held back, which also counts recording the compaction. Attempts in a
-    # row, such as a retry after one that failed, are one interval. One
-    # installed beside the turn's calls held none back; one never installed
-    # held the next call only if it was sent after the last call recorded
-    # ahead of it.
-    held, start, last, attempts = 0, None, 0, []
+    # row, such as a retry after one that failed, are one interval, kept
+    # until the summary is installed or fails for good. One that ran beside
+    # the turn's calls held none back: its compaction says so, and a failed
+    # one had a call recorded among its attempts.
+    held, start, attempts, overlapped = 0, None, [], False
     for event in events:
         data = event['data']
-        if event['event'] == 'compacted':
-            if attempts and start is None and not (data.get('request') or {}).get('beside'):
+        if event['event'] in ('compacted', 'compaction_failed'):
+            beside = (data.get('request') or {}).get('beside')
+            if attempts and start is None and not (beside or overlapped):
                 start = attempts[0]
-            attempts = []
+            attempts, overlapped = [], False
         elif event['event'] != 'usage' or not data.get('sent_ms'):
             continue
         elif data.get('purpose') == 'compaction':
             attempts.append(data['sent_ms'])
         else:
-            if attempts and start is None and attempts[0] > last:
-                start = attempts[0]
-            attempts = []
+            overlapped = overlapped or bool(attempts)
             if start is not None:
                 held += data['sent_ms'] - start
                 start = None
-            last = data['sent_ms']
 
     return {
         'hidden_tests': f'{passed}/{cases}', 'hidden_failure': failure,

@@ -363,31 +363,37 @@ class LongTaskScoreTests(unittest.TestCase):
     def test_summary_time_counts_retried_attempts_once(self):
         usage = lambda cursor, sent, purpose=None: {
             'cursor': cursor, 'event': 'usage', 'data': {'sent_ms': sent, 'purpose': purpose}}
+        compacted = lambda cursor: {'cursor': cursor, 'event': 'compacted', 'data': {
+            'version': cursor, 'cut': cursor, 'request': {'beside': False}}}
         # A failed summary retried before the call it held back, then a
         # second summary later in the task.
-        events = [usage(1, 1000), usage(2, 2000, 'compaction'), usage(3, 5000, 'compaction'),
-                  usage(4, 9000), usage(5, 10000, 'compaction'), usage(6, 12000)]
+        events = [usage(1, 1000), usage(2, 2000, 'compaction'), usage(3, 5000, 'compaction'), compacted(4),
+                  usage(5, 9000), usage(6, 10000, 'compaction'), compacted(7), usage(8, 12000)]
         result = score(self.root, self.facts, events, '')
         self.assertEqual(result['summarizer_ms'], 7000 + 2000)
 
     def test_a_summary_beside_the_calls_holds_none_of_them_back(self):
         usage = lambda cursor, sent, purpose=None: {
             'cursor': cursor, 'event': 'usage', 'data': {'sent_ms': sent, 'purpose': purpose}}
-        # A summary sent at 2000 lands after two calls sent beside it;
-        # the call after its landing waited on nothing. A later summary
-        # holds the call after it back.
-        events = [usage(1, 1000), usage(2, 3000), usage(3, 4000), usage(4, 2000, 'compaction'),
-                  usage(5, 6000), usage(6, 7000, 'compaction'), usage(7, 8500)]
-        result = score(self.root, self.facts, events, '')
-        self.assertEqual(result['summarizer_ms'], 1500)
-        # Sent just after the call it ran beside, and installed beside the
-        # turn after that call was recorded: still none held back.
         compacted = lambda cursor, beside: {'cursor': cursor, 'event': 'compacted', 'data': {
             'version': cursor, 'cut': cursor, 'request': {'beside': beside}}}
+        failed = lambda cursor: {'cursor': cursor, 'event': 'compaction_failed', 'data': {}}
+        # A summary sent just after the call it ran beside, installed after
+        # that call was recorded, held none back; a later summary holds the
+        # call after it back.
         events = [usage(1, 1000), usage(2, 1050), usage(3, 1100, 'compaction'), compacted(4, True),
                   usage(5, 3000), usage(6, 3500, 'compaction'), compacted(7, False), usage(8, 4000)]
         result = score(self.root, self.facts, events, '')
         self.assertEqual(result['summarizer_ms'], 500)
+        # A failed attempt beside the turn is recorded among its calls, and
+        # its summary installed later still held none back; nor did one that
+        # failed for good with calls recorded among its attempts. One that
+        # failed for good before the next call held that call back.
+        events = [usage(1, 1000), usage(2, 900, 'compaction'), usage(3, 1200), usage(4, 1500, 'compaction'),
+                  compacted(5, True), usage(6, 2000), usage(7, 2100, 'compaction'), usage(8, 2200),
+                  failed(9), usage(10, 3000), usage(11, 3100, 'compaction'), failed(12), usage(13, 3900)]
+        result = score(self.root, self.facts, events, '')
+        self.assertEqual(result['summarizer_ms'], 800)
 
     def test_each_call_is_scored_under_the_view_it_was_made_under(self):
         usage = lambda cursor: {'cursor': cursor, 'event': 'usage', 'data': {'sent_ms': cursor}}

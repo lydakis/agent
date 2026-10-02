@@ -390,9 +390,9 @@ impl Turn {
             result = Err(error);
         }
         // So is a summary beside the turn that landed before the rounds
-        // ended, and it is installed as they would have; one still running
-        // is cancelled with them, as a call is.
-        if let Some(landed) = beside.landed.take()
+        // ended, or has its reply now, and it is installed as they would
+        // have; one still running is cancelled with them, as a call is.
+        if let Some(landed) = beside.try_land()
             && let Err(error) = self.landed(landed, &mut 0, &mut 0, &mut accounting).await
         {
             result = Err(error);
@@ -3560,10 +3560,12 @@ impl Beside<'_> {
         }
     }
 
-    /// Wait for the summary, if one is running, and take how it ended.
+    /// Wait for the summary, if one is running, and take how it ended. It
+    /// stays here while it runs, so a turn cancelled meanwhile still holds it.
     async fn land(&mut self) -> Option<Landed> {
-        if let Some(running) = self.running.take() {
+        if let Some(running) = self.running.as_mut() {
             let landed = running.await;
+            self.running = None;
             self.finish(landed);
         }
         self.landed.take()
@@ -3953,6 +3955,27 @@ mod tests {
         let landed = beside.land().await.expect("landed");
         assert!(matches!(landed.result, Ok(Summary::Parked(42))));
         assert_eq!(beside.retry_at, 42);
+    }
+
+    #[tokio::test]
+    async fn a_summary_being_waited_for_survives_a_cancelled_wait() {
+        let mut beside = Beside {
+            running: Some(Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Landed {
+                    result: Ok(Summary::Skipped),
+                    spent: Spent {
+                        rounds: 1,
+                        ..Spent::default()
+                    },
+                }
+            })),
+            ..Beside::default()
+        };
+        let cancelled = tokio::time::timeout(Duration::from_millis(1), beside.land()).await;
+        assert!(cancelled.is_err() && beside.running());
+        let landed = beside.land().await.expect("landed");
+        assert_eq!(landed.spent.rounds, 1);
     }
 
     #[tokio::test]
