@@ -60,6 +60,43 @@ class TurnCompactionTests(ModelFixture):
             self.assertEqual(asked[:len(answered)], answered)
             self.assertLessEqual(len(asked) - len(answered), 1)
 
+    def test_a_summary_inside_a_turn_runs_beside_its_calls(self):
+        # Each summary takes a second. Inside the turn, the calls go on
+        # while it runs, sending the view as it is, and a later boundary
+        # installs it.
+        self.model.timeline, self.model.summary_delay = [], 1.0
+        client = self.client(tools='shell', settings={'context_bytes': 65536})
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
+                       compaction_instructions='Summarize.')
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:150x40')['result']['turn']
+        ended = client.finished(turn, timeout=60)
+        self.assertEqual(ended['data']['status'], 'completed', ended)
+        answer = node_item(client, 'Bob', ended['data']['checkpoint'])['result']
+        self.assertIn('done after 150 rounds', json.dumps(answer))
+        requests = drain(self.model)
+        self.assertTrue(all(encoded(r['input']) <= 65536 for r in requests))
+        summaries = [(start, end) for summary, start, end in self.model.timeline if summary]
+        calls = [start for summary, start, _ in self.model.timeline if not summary]
+        self.assertGreaterEqual(len(summaries), 2)
+        for start, end in summaries:
+            self.assertGreaterEqual(sum(start < call < end for call in calls), 2)
+        events = all_events(client, 'Bob')
+        compacted = [e['data'] for e in events if e['event'] == 'compacted']
+        self.assertEqual(len(compacted), len(summaries))
+        self.assertTrue(all(c['request']['beside'] for c in compacted))
+        self.assertFalse([e for e in events if e['event'] == 'compaction_failed'])
+        # Each round ran once, and the turn's calls and results stay paired.
+        ran = [e['data']['call_id'] for e in events if e['event'] == 'tool_completed']
+        self.assertEqual(ran, [f'long-{n}' for n in range(150)])
+        for request in requests:
+            if is_summary(request):
+                continue
+            items = request['input']
+            asked = [i['call_id'] for i in items if i.get('type') == 'function_call']
+            answered = [i['call_id'] for i in items if i.get('type') == 'function_call_output']
+            self.assertEqual(asked[:len(answered)], answered)
+
+
     def test_a_round_that_overflows_before_compaction_is_due_forces_a_summary(self):
         # Four small rounds, then one that takes the turn past its budget
         # before compaction is due. Without read nothing is elided, so the

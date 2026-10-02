@@ -21,6 +21,7 @@ impl ContextUsage {
     }
 }
 
+#[derive(Clone)]
 pub struct ContextPrefix {
     /// Every prefix item includes its separating comma before the tail.
     pub bytes: bytes::Bytes,

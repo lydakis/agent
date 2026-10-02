@@ -878,6 +878,7 @@ def score(root, facts, events, answer, corrected_at=None):
                               'view_bytes': (data.get('context_before') or {}).get('bytes'),
                               'limit_bytes': (data.get('input_limit') or {}).get('bytes'),
                               'form': request.get('form'), 'copied_items': request.get('items'),
+                              'beside': request.get('beside'),
                               'estimate': request.get('estimate'),
                               'calls': len(spent), 'input_tokens': total(spent, 'input_tokens'),
                               'cached_input_tokens': total(spent, 'cached_input_tokens'),

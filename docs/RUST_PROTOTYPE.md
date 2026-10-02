@@ -2104,7 +2104,7 @@ ends at its span. The estimate takes the call to be in cache; it does not
 model a cache that expired while a tool ran or the bot sat idle. The
 `compacted` event's `request` says which way went (`form`, `copy` or `own`,
 and `items`, the window items copied) with both estimates, `null` where a
-way could not be sent. A summary that parks on a rate limit
+way could not be sent, and whether the summary ran `beside` the turn (below). A summary that parks on a rate limit
 keeps in its park record the floor that window was read under, where it
 starts, where it ends when the copy had the call's window whole, and that
 prefix when the view no longer sends it, so its retry, after a restart
@@ -2133,8 +2133,8 @@ borrows the already encoded tool selection. Responses requests of this form
 send an empty tool list, which that family permits with historical calls.
 
 Either way the call is paced, retried, billed against the bot's budget, and
-counted as a model round like any other; if it parks on a closed pool, the
-turn parks. Stored history is not rewritten for summarization.
+counted as a model round like any other; if a summary before the call parks
+on a closed pool, the turn parks. Stored history is not rewritten for summarization.
 The park record identifies the unfinished call as summary or ordinary model
 work. Resumption, including after restart, continues that call. Once a summary
 exhausts its retries, parking the following ordinary call does not restart the
@@ -2144,12 +2144,39 @@ charged durably before continuing. Usage events identify `purpose: compaction`;
 `compaction_text_delta` and `compaction_thinking_delta` are separate from answer
 streams. Budget and round limits are checked again before the normal call.
 
+#### Summaries beside the turn
+
+Inside a turn, behind a call this task made, a due summary does not hold
+up the turn, as in Pi Durable
+([announcement](https://earendil.com/posts/pi-durable/), 2026-10-01). At the
+boundary it is planned, its copy chosen and the view it copies read, as
+above; then its call runs beside the turn's calls and tools, which send the
+view as it is. The first boundary after it lands installs it, after the
+results of the rounds it ran beside, so the view still changes only between
+calls. Until then neither stubs nor another summary change the view. The
+turn waits for it only when its view no longer fits the input limit, or
+when the turn ends or parks; an interrupt drops it like the turn's own call. It
+runs beside only while the view and the reply's estimated size still fit
+the input limit, three model rounds remain, and the bot's token budget has
+room for half the view's bytes again; otherwise, and at a turn's start or as
+a parked turn resumes, when the cache the copy reads may have lapsed, the
+summary goes before the call. A summary beside the turn uses its
+own connection rather than the bot's WebSocket, which the turn's calls hold,
+and counts toward the turn's rounds, budget, and retries when it lands. A
+summary beside the turn that parks on a closed pool parks nothing; a later
+boundary summarizes again. Because the plan is a boundary or more older than
+its installation, the view it leaves also holds the rounds since, which can
+take it past the limit, for the next boundary to summarize again before its
+call. The budget check before each call does not see a summary still
+running, so a summary beside the turn can overshoot the budget by one
+summary call.
+
 The result is recorded in one transaction: the summary, the covered turns'
 user prompts verbatim (each up to 2 KiB, with a 16 KiB budget for text plus
 entry metadata, the oldest and newest kept when there are more), and the cut, the prompt node the verbatim
 tail starts at, which becomes the context start. A compaction stands for
 everything since the first: its coverage starts at turn 1 and the kept
-prompts carry over. Its version is anchored to the head at which it was generated, separately
+prompts carry over. Its version is anchored to the head at which it was installed, separately
 from the cut: forks can summarize the same cut independently. A historical
 fork inherits the newest version at or before its checkpoint and restores
 that version's context start, preserving its cached prefix. Deleting a bot

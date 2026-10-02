@@ -3498,6 +3498,39 @@ strict Clippy. The statement-cache experiment was separately checked with all
 55 store tests and ten compaction/evaluator tests before measurement. The earlier
 paid evaluation's totals remain incomplete until rerun with corrected accounting.
 
+### Summaries beside the turn
+
+2026-10-02. A summary due inside a turn, behind a call the turn made, now
+runs beside the turn's calls and tools and is installed at the first
+boundary after it lands ([design](RUST_PROTOTYPE.md#summaries-beside-the-turn)).
+Measured with `bench/summary_beside.py` on a shared 4-vCPU Linux 6.18 cloud
+container: the runtime tests' synthetic Responses fixture, every work call
+delayed by a fixed time and every summary by a longer one, one bot with
+`shell` and `read`, one turn. Before is `0a6f2b2` (summaries before the
+call); after is this change on top of it. Synthetic delays, no model calls.
+
+| Turn | Delays (work / summary) | Summaries | Wall time before | Wall time after | Work input bytes before → after | Largest request before → after |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `long:150x40`, 64 KiB budget, 1 run | 1.0 s / 4.0 s | 4 | 168.27 s | 152.49 s | 4.46 M → 4.98 M | 49.3 K → 53.6 K |
+| `long:40`, 24 KiB budget, 3 runs | 0.15 s / 0.6 s | 5 | 9.76 s (9.74–9.90) | 8.96 s (8.96–8.97) | 620 K → 655 K | 18.4 K → 19.3 K |
+
+```sh
+.local/venv/bin/python -m bench.summary_beside BEFORE_BINARY AFTER_BINARY \
+  --work 1.0 --summary 4.0 --prompt long:150x40 --context-bytes 65536
+.local/venv/bin/python -m bench.summary_beside BEFORE_BINARY AFTER_BINARY \
+  --work 0.15 --summary 0.6 --prompt long:40 --context-bytes 24576 --runs 3
+```
+
+At 64 KiB the turn saved 15.8 s, the four summaries' whole 16 s: each ran
+beside later rounds and landed before the view needed it. At 24 KiB each
+round's results fill the remaining room, so the next boundary's view no
+longer fits and waits: the saving is about one round per summary (0.8 s of
+3.0 s). The cost is input: the calls made while a summary runs still send
+the longer view, 12% more work-call input bytes at 64 KiB and 6% at 24 KiB.
+On a provider cache most of that is a cached prefix; this screen has no
+cache, and no paid run measured the price. Request sizes stay within the
+budget in both.
+
 ## Compaction retry resumption
 
 Local synthetic screen, 2026-09-19: the park record now identifies which

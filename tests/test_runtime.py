@@ -44,6 +44,13 @@ class Model(http.server.BaseHTTPRequestHandler):
             self.server.requests.put(request)
             if hasattr(self.server, 'bodies'):
                 self.server.bodies.append(body)
+            if hasattr(self.server, 'timeline'):
+                # When each request arrived, and for a summary, when it ended
+                # after `summary_delay`.
+                started = time.monotonic()
+                if is_summary(request):
+                    time.sleep(getattr(self.server, 'summary_delay', 0))
+                self.server.timeline.append((is_summary(request), started, time.monotonic()))
             if hasattr(self.server, 'request_gates'):
                 try:
                     gate = self.server.request_gates.get_nowait()

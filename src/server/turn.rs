@@ -260,6 +260,8 @@ struct Accounting {
     /// The provider's sticky-routing token for this turn's model calls,
     /// kept in the park record while the turn waits.
     route: std::sync::OnceLock<String>,
+    /// A summary's own, running beside the turn's calls and tools.
+    beside: bool,
 }
 impl Accounting {
     fn totals(&self) -> (u64, u64) {
@@ -791,17 +793,26 @@ impl Turn {
     /// leaves the context view unchanged and is reported live; the turn goes on
     /// with the window as it is. Returns a park time if the summarizer's
     /// call parked the turn.
+    ///
+    /// While the view and the reply still fit the input limit, with room in
+    /// the round limit and the budget for both calls, the summary runs
+    /// `beside` the turn's calls and tools: they send the view as it is,
+    /// the first boundary after it lands installs it, and the turn waits
+    /// for it only when its view outgrows the limit or the turn ends. Its
+    /// plan and the view it copies are read here, at the boundary, as a
+    /// summary before the call reads them.
     #[allow(clippy::too_many_arguments)]
-    async fn compact_if_due(
-        &self,
+    async fn compact_if_due<'a>(
+        &'a self,
         record: &mut agent_runtime::store::Bot,
         model_rounds: &mut usize,
         turn: i64,
         accounting: &mut Accounting,
-        tools: &serde_json::value::RawValue,
+        tools: &Arc<serde_json::value::RawValue>,
         context: &mut Context,
         (last, inherited, model): (Option<&LastCall>, bool, &str),
         output_bytes: Option<usize>,
+        beside: Option<&mut Beside<'a>>,
     ) -> Result<Compaction> {
         if record.compaction_instructions.is_none() {
             return Ok(Compaction::Skipped);
@@ -845,6 +856,51 @@ impl Turn {
             }),
             None => None,
         };
+        let view = context.usage();
+        if let Some(beside) = beside
+            && pressure.bytes + reserve < limit.bytes
+            && pressure.items < limit.items
+            && *model_rounds + 3 < MAX_ROUNDS
+            && record.budget_tokens.is_none_or(|budget| {
+                budget.saturating_sub(record.tokens_used) > view.bytes as u64 / 2
+            })
+        {
+            let mut spent = Accounting {
+                route: accounting.route.clone(),
+                beside: true,
+                ..Accounting::default()
+            };
+            let Some(planned) = self
+                .plan(
+                    record,
+                    turn,
+                    &mut spent,
+                    tools,
+                    (keep, keep_items),
+                    false,
+                    sent,
+                )
+                .await?
+            else {
+                return Ok(Compaction::Skipped);
+            };
+            let (mut record, tools) = (record.clone(), tools.clone());
+            beside.running = Some(Box::pin(async move {
+                let (before, mut rounds) = (record.tokens_used, 0);
+                let result = self
+                    .summarize(planned, &mut record, &mut rounds, turn, &mut spent, &tools)
+                    .await;
+                let (retries, paced_ms) = spent.totals();
+                Landed {
+                    result,
+                    tokens: record.tokens_used.saturating_sub(before),
+                    rounds,
+                    retries,
+                    paced_ms,
+                }
+            }));
+            return Ok(Compaction::Skipped);
+        }
         let compaction = self
             .compact(
                 record,
@@ -958,10 +1014,41 @@ impl Turn {
         turn: i64,
         accounting: &mut Accounting,
         tools: &serde_json::value::RawValue,
-        (keep, keep_items): (i64, i64),
+        keeps: (i64, i64),
         again: bool,
         sent: Option<Sent<'_>>,
     ) -> Result<Compaction> {
+        match self
+            .plan(record, turn, accounting, tools, keeps, again, sent)
+            .await?
+        {
+            Some(planned) => match self
+                .summarize(planned, record, model_rounds, turn, accounting, tools)
+                .await?
+            {
+                Summary::Written(written) => self.install(*written).await,
+                Summary::Parked(until) => Ok(Compaction::Parked(until)),
+                Summary::Skipped => Ok(Compaction::Skipped),
+            },
+            None => Ok(Compaction::Skipped),
+        }
+    }
+
+    /// Everything a summary does before its call, at the boundary: plan
+    /// the span, pick the summarizer, and choose between a copy of the
+    /// view a call sent and a request of its own. `None` when there is
+    /// nothing to summarize or the summarizer is not served, reported live.
+    #[allow(clippy::too_many_arguments)]
+    async fn plan(
+        &self,
+        record: &mut agent_runtime::store::Bot,
+        turn: i64,
+        accounting: &mut Accounting,
+        tools: &serde_json::value::RawValue,
+        (keep, keep_items): (i64, i64),
+        again: bool,
+        sent: Option<Sent<'_>>,
+    ) -> Result<Option<Planned<'_>>> {
         let limit = self.input_limit();
         let (max_bytes, max_items) = (limit.bytes as i64, limit.items as i64);
         // Nodes are immutable and only this turn moves the bot's head, so
@@ -973,15 +1060,15 @@ impl Turn {
             .await
         {
             Ok(Some(plan)) => plan,
-            Ok(None) => return Ok(Compaction::Skipped),
+            Ok(None) => return Ok(None),
             Err(error) if error.code == "compaction_span_limit" => {
                 self.compaction_failed(turn, &error).await?;
-                return Ok(Compaction::Skipped);
+                return Ok(None);
             }
             Err(error) => return Err(error),
         };
         let reference = summarizer(record);
-        let (name, model) = split_model(&reference)?;
+        let (name, _) = split_model(&reference)?;
         // The span goes to the summarizer as stored, so it must speak the
         // bot's family, as creation checked; a provider name can be bound to
         // another since.
@@ -1001,7 +1088,7 @@ impl Turn {
                             "error":error,"detail":detail}),
                     )
                     .await?;
-                return Ok(Compaction::Skipped);
+                return Ok(None);
             }
         };
         // A turn may run on another model than the bot's, and then the
@@ -1010,48 +1097,84 @@ impl Turn {
         // tool call or no text, is asked again as a request of its own.
         let sent = sent.filter(|sent| sent.model == reference);
         // A call's view is read again only now that a summary may copy it.
-        let read;
-        let mut sent = match sent {
+        let sent = match sent {
             Some(Sent {
                 view: SentView::Call(call),
                 ahead,
                 ..
-            }) => {
-                read = self.view_of(call).await?;
-                read.as_ref().map(|(view, whole)| (view, *whole, ahead))
-            }
+            }) => self
+                .view_of(call)
+                .await?
+                .map(|(view, whole)| (view, whole, ahead)),
             Some(Sent {
                 view: SentView::Current(view),
                 ahead,
                 ..
-            }) => Some((view, false, ahead)),
+            }) => Some((view.clone(), false, ahead)),
             None => None,
         };
         let mut choice = Choice::default();
+        accounting.copied = None;
+        let mut copy = None;
+        if let Some((view, whole, ahead)) = sent {
+            let instructions = record.compaction_instructions.clone().unwrap();
+            let (made, made_copy) = self
+                .summary_copy(
+                    record,
+                    (&view, whole),
+                    ahead.as_ref(),
+                    &plan,
+                    summarizer.family(),
+                    &instructions,
+                    tools,
+                    accounting,
+                )
+                .await?;
+            choice = made;
+            let made_copy = made_copy.map(|(_, len, thinking, request)| (len, thinking, request));
+            copy = made_copy.map(|(len, thinking, request)| (view, len, thinking, request));
+        }
+        Ok(Some(Planned {
+            plan,
+            reference,
+            summarizer,
+            copy,
+            choice,
+        }))
+    }
+
+    /// The summary's call, asked again as a request of its own when a
+    /// copy's reply is no summary; `install` records what it wrote. A
+    /// failed summary leaves the view unchanged and is reported live.
+    async fn summarize(
+        &self,
+        planned: Planned<'_>,
+        record: &mut agent_runtime::store::Bot,
+        model_rounds: &mut usize,
+        turn: i64,
+        accounting: &mut Accounting,
+        tools: &serde_json::value::RawValue,
+    ) -> Result<Summary> {
+        let Planned {
+            plan,
+            reference,
+            summarizer,
+            copy: mut made,
+            mut choice,
+        } = planned;
+        let (name, model) = split_model(&reference)?;
         let (summary, usage) = loop {
             let mut instructions = record.compaction_instructions.clone().unwrap();
-            accounting.copied = None;
-            let copy = match sent.take() {
-                Some((view, whole, ahead)) => {
-                    let (made, copy) = self
-                        .summary_copy(
-                            record,
-                            (view, whole),
-                            ahead.as_ref(),
-                            &plan,
-                            summarizer.family(),
-                            &instructions,
-                            tools,
-                            accounting,
-                        )
-                        .await?;
-                    choice = made;
-                    copy.map(|(window, len, thinking, request)| {
-                        (&view.prefix.bytes, window, len, thinking, request)
-                    })
-                }
-                None => None,
-            };
+            // Only the first attempt copies; what a park record keeps of
+            // the copy goes with it.
+            let current = made.take();
+            if current.is_none() {
+                accounting.copied = None;
+            }
+            let copy = current.as_ref().map(|(view, len, thinking, request)| {
+                let window = view.window.as_ref().expect("a copy reads a window");
+                (&view.prefix.bytes, window, *len, *thinking, request.clone())
+            });
             let copied = copy.is_some();
             if !copied {
                 choice.copy = None;
@@ -1116,7 +1239,7 @@ impl Turn {
                     accounting.copied = None;
                     completion
                 }
-                Ok(None) => return Ok(Compaction::Parked(accounting.parked_until)),
+                Ok(None) => return Ok(Summary::Parked(accounting.parked_until)),
                 Err(error) => {
                     accounting.copied = None;
                     self.hub
@@ -1126,7 +1249,7 @@ impl Turn {
                                 "error":error.code,"detail":error.detail}),
                         )
                         .await?;
-                    return Ok(Compaction::Skipped);
+                    return Ok(Summary::Skipped);
                 }
             };
             // Success is billable even if its text is empty or too large to use.
@@ -1163,7 +1286,7 @@ impl Turn {
                 || *model_rounds >= MAX_ROUNDS
             {
                 self.compaction_failed(turn, &invalid).await?;
-                return Ok(Compaction::Skipped);
+                return Ok(Summary::Skipped);
             }
             self.hub
                 .live(
@@ -1173,11 +1296,51 @@ impl Turn {
                 )
                 .await?;
         };
-        let bot = self.bot.clone();
+        let mut request = choice.event();
+        request["beside"] = accounting.beside.into();
+        Ok(Summary::Written(Box::new(Written {
+            plan,
+            summary,
+            usage,
+            request,
+        })))
+    }
+
+    /// Count what a summary beside the turn spent toward the turn, and
+    /// install what it wrote; whether a new view was installed. One that
+    /// parked on its pool parks nothing: a later boundary summarizes again.
+    async fn landed(
+        &self,
+        landed: Landed,
+        tokens_used: &mut u64,
+        model_rounds: &mut usize,
+        accounting: &mut Accounting,
+    ) -> Result<bool> {
+        *tokens_used = tokens_used.saturating_add(landed.tokens);
+        *model_rounds += landed.rounds;
+        accounting.retries += landed.retries;
+        accounting.paced_ms += landed.paced_ms;
+        match landed.result? {
+            Summary::Written(written) => {
+                Ok(matches!(self.install(*written).await?, Compaction::Done))
+            }
+            Summary::Parked(_) | Summary::Skipped => Ok(false),
+        }
+    }
+
+    /// Record a summary as the new context start, at a boundary: the view
+    /// changes only between calls.
+    async fn install(&self, written: Written) -> Result<Compaction> {
+        let Written {
+            plan,
+            summary,
+            usage,
+            request,
+        } = written;
+        let (bot, turn) = (self.bot.clone(), self.turn);
         let billed = usage.clone();
         let note_turns = self.settings().note_turns();
         let input_limit = self.input_limit();
-        let request = choice.event();
         if let Err(error) = self
             .store
             .op("compact", move |db| {
@@ -1461,7 +1624,28 @@ impl Turn {
         }))
     }
 
+    /// The turn's rounds. A summary still running beside them when they end
+    /// lands first, so its call is billed and its view installed before the
+    /// turn finishes or parks.
     async fn rounds(&self, accounting: &mut Accounting) -> Result<Round> {
+        let mut beside = Beside::default();
+        let round = self.rounds_beside(accounting, &mut beside).await;
+        let (mut tokens_used, mut model_rounds) = (0, 0);
+        let landed = match beside.land().await {
+            Some(landed) => {
+                self.landed(landed, &mut tokens_used, &mut model_rounds, accounting)
+                    .await
+            }
+            None => Ok(false),
+        };
+        round.and_then(|round| landed.map(|_| round))
+    }
+
+    async fn rounds_beside<'a>(
+        &'a self,
+        accounting: &mut Accounting,
+        beside: &mut Beside<'a>,
+    ) -> Result<Round> {
         let (bot, turn) = (self.bot.clone(), self.turn);
         let mut record = self.store.op("inspect", move |db| db.inspect(&bot)).await?;
         self.settings.get_or_init(|| record.settings);
@@ -1583,6 +1767,9 @@ impl Turn {
         let mut steer_first = false;
         // The view this task's last call sent, for a summary to copy.
         let mut last: Option<LastCall> = None;
+        // Whether this task has made a call, whose cache a summary beside
+        // the next one reads.
+        let mut sent_here = false;
         // Until this task calls or changes the view, the view is taken as
         // the bot's call before a new prompt or a wait sent it, through
         // its newest boundary, and its cache as still held, when that call
@@ -1604,6 +1791,26 @@ impl Turn {
             // A refresh the last call left in flight ends here: the next call
             // reads the cache itself, and the budget counts what it billed.
             self.settle_refresh(&mut record, accounting).await?;
+            // A summary that ran beside the turn and has landed is counted
+            // and installed here, after the results of the rounds it ran
+            // beside. Its view replaces the one the last call sent, which a
+            // later summary no longer copies, and may make a capped steer
+            // room.
+            if let Some(landed) = beside.try_land()
+                && self
+                    .landed(
+                        landed,
+                        &mut record.tokens_used,
+                        &mut model_rounds,
+                        accounting,
+                    )
+                    .await?
+            {
+                (last, inherited) = (None, false);
+                if capped.is_some() {
+                    self.steers.store(true, Relaxed);
+                }
+            }
             // The budget is checked before each call, so one call may overshoot.
             if let Some(error) = budget_error(record.budget_tokens, record.tokens_used) {
                 return Err(error);
@@ -1629,6 +1836,13 @@ impl Turn {
                 .await
             {
                 Ok(context) => context,
+                // The view outgrew the limit: a summary running beside the
+                // turn lands first, and the boundary starts over with it.
+                Err(error) if error.code == "context_limit" && beside.running() => {
+                    beside.landed = beside.land().await;
+                    resume_window = resuming;
+                    continue;
+                }
                 Err(error) if error.code == "context_limit" => match self
                     .overflow(
                         &mut record,
@@ -1670,8 +1884,11 @@ impl Turn {
             }
             // A summary copies the view a call sent, from before this
             // boundary's stubs.
+            // While a summary runs beside the turn, the view stays as it is
+            // until it lands: neither stubs nor another summary.
             if elides
                 && !resuming
+                && !beside.running()
                 && self.elision_due(&context, output_bytes)
                 && self.elide(context.prefix.bytes.len(), false).await?
             {
@@ -1688,7 +1905,12 @@ impl Turn {
                     last = LastCall::of(&sent, false);
                 }
             }
-            if !resuming && !std::mem::take(&mut steer_first) {
+            if !resuming && !std::mem::take(&mut steer_first) && !beside.running() {
+                // Only behind a call this task made, whose cache the next
+                // call reads: at a turn's start, or as a turn resumes, the
+                // cache may have lapsed, and a summary first keeps that call
+                // small.
+                let beside = sent_here.then_some(&mut *beside);
                 match self
                     .compact_if_due(
                         &mut record,
@@ -1699,6 +1921,7 @@ impl Turn {
                         &mut context,
                         (last.as_ref(), inherited, called),
                         output_bytes,
+                        beside,
                     )
                     .await?
                 {
@@ -1740,6 +1963,11 @@ impl Turn {
             // of it: the same forced recovery, then the steps again.
             let mut context = match self.fit_context(context, self.input_limit()).await {
                 Ok(context) => context,
+                Err(error) if error.code == "context_limit" && beside.running() => {
+                    beside.landed = beside.land().await;
+                    resume_window = resuming;
+                    continue;
+                }
                 Err(error) if error.code == "context_limit" => match self
                     .overflow(
                         &mut record,
@@ -1770,8 +1998,8 @@ impl Turn {
             // the call streams.
             drop(last.take());
             inherited = false;
-            let Some(response) = self
-                .call(
+            let Some(response) = beside
+                .drive(self.call(
                     provider,
                     model,
                     &tools,
@@ -1780,11 +2008,12 @@ impl Turn {
                     &mut model_rounds,
                     turn,
                     accounting,
-                )
+                ))
                 .await?
             else {
                 return Ok(Round::Paced(accounting.parked_until));
             };
+            sent_here = true;
             model_rounds += 1;
             if let Some(usage) = &response.usage {
                 record.tokens_used = record
@@ -1861,8 +2090,8 @@ impl Turn {
                     tokens: 0,
                     pending,
                 });
-            let stop = self
-                .execute_calls(
+            let stop = beside
+                .drive(self.execute_calls(
                     response.calls,
                     announced,
                     &workspace,
@@ -1870,7 +2099,7 @@ impl Turn {
                     &record,
                     warm.as_mut(),
                     accounting.route.get().map(String::as_str),
-                )
+                ))
                 .await?;
             let refreshed = warm.map_or(0, |warm| warm.tokens);
             record.tokens_used = record.tokens_used.saturating_add(refreshed);
@@ -2043,7 +2272,9 @@ impl Turn {
                         fallbacks: record.fallbacks,
                         cache_key: Some(&cache_key),
                         items,
-                        chain: Some(self.chain(body)),
+                        // A summary beside the turn's call keeps off the
+                        // bot's connection, which that call holds.
+                        chain: (!accounting.beside).then(|| self.chain(body)),
                         // A summary of its own goes off the turn's route; a
                         // copy follows it to the server that holds its cache.
                         route: (!matches!(body, Body::Span(..))).then_some(&accounting.route),
@@ -3063,6 +3294,7 @@ fn annotate(mut outcome: Outcome, turn: i64, call_id: &str) -> Outcome {
 #[cfg(test)]
 use agent_runtime::store::pinned_item;
 
+#[derive(Clone)]
 struct Context {
     window: Option<Window>,
     prefix: ContextPrefix,
@@ -3095,6 +3327,85 @@ impl Context {
             w.unsummarized.with_prefix(&self.prefix)
         })
     }
+}
+
+/// A summary running beside the turn's calls and tools, from the boundary
+/// that planned it until the turn needs its view or ends, then how it
+/// ended until a boundary installs it.
+#[derive(Default)]
+struct Beside<'a> {
+    running: Option<std::pin::Pin<Box<dyn std::future::Future<Output = Landed> + Send + 'a>>>,
+    landed: Option<Landed>,
+}
+
+impl Beside<'_> {
+    fn running(&self) -> bool {
+        self.running.is_some()
+    }
+
+    /// How the summary ended, if it has, without waiting for it.
+    fn try_land(&mut self) -> Option<Landed> {
+        use futures_util::FutureExt;
+        if let Some(running) = self.running.as_mut()
+            && let Some(landed) = running.now_or_never()
+        {
+            self.running = None;
+            self.landed = Some(landed);
+        }
+        self.landed.take()
+    }
+
+    /// Run `main` to its end, and the summary alongside it until it lands.
+    async fn drive<T>(&mut self, main: impl std::future::Future<Output = T>) -> T {
+        tokio::pin!(main);
+        loop {
+            let Some(running) = self.running.as_mut() else {
+                return main.await;
+            };
+            tokio::select! {
+                biased;
+                out = &mut main => return out,
+                landed = running => {
+                    self.running = None;
+                    self.landed = Some(landed);
+                }
+            }
+        }
+    }
+
+    /// Wait for the summary, if one is running, and take how it ended.
+    async fn land(&mut self) -> Option<Landed> {
+        if let Some(running) = self.running.take() {
+            self.landed = Some(running.await);
+        }
+        self.landed.take()
+    }
+}
+
+/// How a summary beside the turn ended, and what it spent.
+struct Landed {
+    result: Result<Summary>,
+    tokens: u64,
+    rounds: usize,
+    retries: u64,
+    paced_ms: u64,
+}
+
+/// A summary call's outcome: written, to install at a boundary; parked on
+/// its pool until the time given; or not made, reported live.
+enum Summary {
+    Written(Box<Written>),
+    Parked(u64),
+    Skipped,
+}
+
+/// A summary written for `plan`, what its call billed, and how it was
+/// requested, for the `compacted` event.
+struct Written {
+    plan: agent_runtime::store::CompactionPlan,
+    summary: String,
+    usage: Option<agent_runtime::provider::Usage>,
+    request: Value,
 }
 
 /// How a summary attempt ended: recorded, parked on its pool until the
@@ -3234,6 +3545,17 @@ fn own_items(
 /// the provider's cache.
 fn input_cost(bytes: usize, cached: usize) -> usize {
     bytes - cached + cached / CACHED_SHARE
+}
+
+/// A summary planned at a boundary and ready to call: its span, its
+/// summarizer, and, when it copies a call, the view that call sent with
+/// the items it copies, their thinking strip, and the compaction request.
+struct Planned<'p> {
+    plan: agent_runtime::store::CompactionPlan,
+    reference: String,
+    summarizer: std::borrow::Cow<'p, Provider>,
+    copy: Option<(Context, usize, Strip, Bytes)>,
+    choice: Choice,
 }
 
 /// How a summary goes out: a copy of the call's first `copy` window

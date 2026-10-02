@@ -694,7 +694,7 @@ fn planned_calls(item: &[u8]) -> Vec<Cow<'_, str>> {
         .collect()
 }
 /// The bounded request context: ordered node ids and exact item bytes.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Window {
     pub family: Family,
     pub ids: Vec<i64>,
