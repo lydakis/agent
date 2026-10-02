@@ -370,6 +370,17 @@ class LongTaskScoreTests(unittest.TestCase):
         result = score(self.root, self.facts, events, '')
         self.assertEqual(result['summarizer_ms'], 7000 + 2000)
 
+    def test_a_summary_beside_the_calls_holds_none_of_them_back(self):
+        usage = lambda cursor, sent, purpose=None: {
+            'cursor': cursor, 'event': 'usage', 'data': {'sent_ms': sent, 'purpose': purpose}}
+        # A summary sent at 2000 lands after two calls sent beside it;
+        # the call after its landing waited on nothing. A later summary
+        # holds the call after it back.
+        events = [usage(1, 1000), usage(2, 3000), usage(3, 4000), usage(4, 2000, 'compaction'),
+                  usage(5, 6000), usage(6, 7000, 'compaction'), usage(7, 8500)]
+        result = score(self.root, self.facts, events, '')
+        self.assertEqual(result['summarizer_ms'], 1500)
+
     def test_each_call_is_scored_under_the_view_it_was_made_under(self):
         usage = lambda cursor: {'cursor': cursor, 'event': 'usage', 'data': {'sent_ms': cursor}}
         # A call, a stub pass, a call, a summary and a second step at the

@@ -4,6 +4,8 @@ from contextlib import closing
 import json
 import os
 import sqlite3
+import threading
+import time
 from unittest import skipUnless
 from tests.test_runtime import AnthropicModel, ModelFixture, is_summary
 from tests.test_elision import drain, encoded
@@ -96,6 +98,46 @@ class TurnCompactionTests(ModelFixture):
             answered = [i['call_id'] for i in items if i.get('type') == 'function_call_output']
             self.assertEqual(asked[:len(answered)], answered)
 
+    def test_an_interrupt_still_installs_a_summary_that_landed_beside_a_call(self):
+        # The summary lands while the call sent beside it is still held;
+        # the interrupt then drops the turn's rounds before a boundary.
+        self.model.timeline, self.model.summary_delay = [], 0.5
+        self.model.hold_after_summary = threading.Event()
+        self.addCleanup(self.model.hold_after_summary.set)
+        client = self.client(tools='shell', settings={'context_bytes': 65536})
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
+                       compaction_instructions='Summarize.')
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:150x40')['result']['turn']
+        deadline = time.monotonic() + 30
+        while not any(summary for summary, *_ in self.model.timeline):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.05)
+        time.sleep(.5)
+        client.request('interrupt', bot='Bob', turn=turn)
+        self.assertEqual(client.finished(turn)['data']['status'], 'interrupted')
+        self.model.hold_after_summary.set()
+        events = all_events(client, 'Bob')
+        compacted = [e['data'] for e in events if e['event'] == 'compacted']
+        self.assertEqual(len(compacted), 1)
+        self.assertTrue(compacted[0]['request']['beside'])
+        billed = [e['data'] for e in events if e['event'] == 'usage' and e['data'].get('purpose') == 'compaction']
+        self.assertEqual(len(billed), 1)
+
+    def test_a_summary_beside_the_turn_holds_its_calls_to_the_round_limit(self):
+        # Small rounds: compaction comes due past round 150, and the view
+        # would not outgrow the limit until well past 200, so the summary
+        # is still running as the turn nears its round limit. The turn
+        # waits for it there, and fails with it counted among its rounds.
+        self.model.timeline, self.model.summary_delay = [], 5.0
+        client = self.client(tools='shell', settings={'context_bytes': 65536})
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
+                       compaction_instructions='Summarize.')
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:250x1')['result']['turn']
+        ended = client.finished(turn, timeout=90)
+        self.assertEqual((ended['data']['status'], ended['data']['error']), ('failed', 'tool_round_limit'))
+        requests = drain(self.model)
+        self.assertEqual(len(requests), 200)
+        self.assertEqual(sum(map(is_summary, requests)), 1)
 
     def test_a_round_that_overflows_before_compaction_is_due_forces_a_summary(self):
         # Four small rounds, then one that takes the turn past its budget

@@ -44,6 +44,12 @@ class Model(http.server.BaseHTTPRequestHandler):
             self.server.requests.put(request)
             if hasattr(self.server, 'bodies'):
                 self.server.bodies.append(body)
+            if hasattr(self.server, 'hold_after_summary'):
+                # Work calls sent after the first summary wait for the test.
+                if is_summary(request):
+                    self.server.summarized = True
+                elif getattr(self.server, 'summarized', False):
+                    self.server.hold_after_summary.wait(timeout=10)
             if hasattr(self.server, 'timeline'):
                 # When each request arrived, and for a summary, when it ended
                 # after `summary_delay`.

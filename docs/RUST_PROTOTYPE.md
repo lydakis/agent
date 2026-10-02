@@ -2155,10 +2155,13 @@ view as it is. The first boundary after it lands installs it, after the
 results of the rounds it ran beside, so the view still changes only between
 calls. Until then neither stubs nor another summary change the view. The
 turn waits for it only when its view no longer fits the input limit, or
-when the turn ends or parks; an interrupt drops it like the turn's own call. It
-runs beside only while the view and the reply's estimated size still fit
-the input limit, three model rounds remain, and the bot's token budget has
-room for half the view's bytes again; otherwise, and at a turn's start or as
+when the turn ends or parks. An interrupt drops one still running like the
+turn's own call; one that has landed is billed and installed as the turn
+ends. It runs beside only while the view and the reply's estimated size
+still fit the input limit and, beside what it holds, two model rounds (a
+copy and a request of its own) and a token for every two bytes of the view,
+the round limit and the bot's token budget leave room for the turn's next
+call; otherwise, and at a turn's start or as
 a parked turn resumes, when the cache the copy reads may have lapsed, the
 summary goes before the call. A summary beside the turn uses its
 own connection rather than the bot's WebSocket, which the turn's calls hold,
@@ -2167,9 +2170,9 @@ summary beside the turn that parks on a closed pool parks nothing; a later
 boundary summarizes again. Because the plan is a boundary or more older than
 its installation, the view it leaves also holds the rounds since, which can
 take it past the limit, for the next boundary to summarize again before its
-call. The budget check before each call does not see a summary still
-running, so a summary beside the turn can overshoot the budget by one
-summary call.
+call. While it runs, it holds those rounds and tokens against the turn's
+calls: a call they would take past the round limit or the budget waits for
+it, and is checked against what it spent.
 
 The result is recorded in one transaction: the summary, the covered turns'
 user prompts verbatim (each up to 2 KiB, with a 16 KiB budget for text plus

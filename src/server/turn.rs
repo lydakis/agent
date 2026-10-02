@@ -374,12 +374,13 @@ impl Turn {
             }
         };
         let mut accounting = Accounting::default();
+        let mut beside = Beside::default();
         // Cancelling mid-job loses nothing: a job the worker has taken runs
         // to its commit, and the worker publishes whatever committed.
         let mut result = tokio::select! {
             biased;
             code = interrupt => fail(code),
-            result = self.rounds(&mut accounting) => result,
+            result = self.rounds(&mut accounting, &mut beside) => result,
         };
         // The rounds future is gone, so cancellation cannot discard this flush.
         // A refresh it had already sent is billed: record what it cost.
@@ -388,6 +389,15 @@ impl Turn {
         {
             result = Err(error);
         }
+        // So is a summary beside the turn that landed before the rounds
+        // ended, and it is installed as they would have; one still running
+        // is cancelled with them, as a call is.
+        if let Some(landed) = beside.landed.take()
+            && let Err(error) = self.landed(landed, &mut 0, &mut 0, &mut accounting).await
+        {
+            result = Err(error);
+        }
+        drop(beside);
         let (retries, paced_ms) = accounting.totals();
         let turn = self.turn;
         let flushed = if let Ok(Round::Paced(at)) = &result {
@@ -856,14 +866,17 @@ impl Turn {
             }),
             None => None,
         };
-        let view = context.usage();
+        // What a summary beside the turn holds while it runs: a copy's
+        // call and a request of its own, and a token for every two bytes
+        // of the view.
+        let held = (2, context.usage().bytes as u64 / 2);
         if let Some(beside) = beside
             && pressure.bytes + reserve < limit.bytes
             && pressure.items < limit.items
-            && *model_rounds + 3 < MAX_ROUNDS
-            && record.budget_tokens.is_none_or(|budget| {
-                budget.saturating_sub(record.tokens_used) > view.bytes as u64 / 2
-            })
+            && *model_rounds + held.0 < MAX_ROUNDS
+            && record
+                .budget_tokens
+                .is_none_or(|budget| record.tokens_used.saturating_add(held.1) < budget)
         {
             let mut spent = Accounting {
                 route: accounting.route.clone(),
@@ -885,6 +898,7 @@ impl Turn {
                 return Ok(Compaction::Skipped);
             };
             let (mut record, tools) = (record.clone(), tools.clone());
+            beside.held = held;
             beside.running = Some(Box::pin(async move {
                 let (before, mut rounds) = (record.tokens_used, 0);
                 let result = self
@@ -1627,9 +1641,12 @@ impl Turn {
     /// The turn's rounds. A summary still running beside them when they end
     /// lands first, so its call is billed and its view installed before the
     /// turn finishes or parks.
-    async fn rounds(&self, accounting: &mut Accounting) -> Result<Round> {
-        let mut beside = Beside::default();
-        let round = self.rounds_beside(accounting, &mut beside).await;
+    async fn rounds<'a>(
+        &'a self,
+        accounting: &mut Accounting,
+        beside: &mut Beside<'a>,
+    ) -> Result<Round> {
+        let round = self.rounds_beside(accounting, beside).await;
         let (mut tokens_used, mut model_rounds) = (0, 0);
         let landed = match beside.land().await {
             Some(landed) => {
@@ -1791,6 +1808,13 @@ impl Turn {
             // A refresh the last call left in flight ends here: the next call
             // reads the cache itself, and the budget counts what it billed.
             self.settle_refresh(&mut record, accounting).await?;
+            // A summary running beside the turn holds what it may spend
+            // against the round limit and the budget: a call that would
+            // reach either waits for it, and is checked against what it
+            // spent.
+            if !beside.leaves_room(&record, model_rounds) {
+                beside.landed = beside.land().await;
+            }
             // A summary that ran beside the turn and has landed is counted
             // and installed here, after the results of the rounds it ran
             // beside. Its view replaces the one the last call sent, which a
@@ -3336,11 +3360,25 @@ impl Context {
 struct Beside<'a> {
     running: Option<std::pin::Pin<Box<dyn std::future::Future<Output = Landed> + Send + 'a>>>,
     landed: Option<Landed>,
+    /// The model rounds and tokens the running summary may spend.
+    held: (usize, u64),
 }
 
 impl Beside<'_> {
     fn running(&self) -> bool {
         self.running.is_some()
+    }
+
+    /// Whether the turn's next call fits the round limit and the budget
+    /// beside what the running summary may spend.
+    fn leaves_room(&self, record: &agent_runtime::store::Bot, model_rounds: usize) -> bool {
+        let (rounds, tokens) = if self.running() { self.held } else { (0, 0) };
+        model_rounds + rounds < MAX_ROUNDS
+            && budget_error(
+                record.budget_tokens,
+                record.tokens_used.saturating_add(tokens),
+            )
+            .is_none()
     }
 
     /// How the summary ended, if it has, without waiting for it.
