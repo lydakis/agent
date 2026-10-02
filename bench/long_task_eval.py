@@ -889,20 +889,30 @@ def score(root, facts, events, answer, corrected_at=None):
     # held back, which also counts recording the compaction. Attempts in a
     # row, such as a retry after one that failed, are one interval. A
     # summary's own call that ran beside the turn's calls says so; it held
-    # the turn back only while the turn waited for it, which its compaction
-    # records. One that failed beside the turn is not recorded at all.
-    held, start = 0, None
+    # the turn back only from when the turn began to wait for it, which its
+    # compaction records, to the next call, or for the wait alone when the
+    # turn parked or ended next. One that failed beside the turn is not
+    # recorded at all.
+    held, start, joined = 0, None, None
     for event in events:
         data = event['data']
-        if event['event'] == 'compacted' and (data.get('request') or {}).get('beside'):
-            held += data['request'].get('waited_ms', 0)
+        request = data.get('request') or {}
+        if event['event'] == 'compacted' and request.get('beside') and request.get('waited_from_ms'):
+            joined = request
+        elif event['event'] in ('turn_waiting', 'turn_paced', 'turn_finished') and joined:
+            held += joined['waited_ms']
+            joined = None
         if event['event'] != 'usage' or not data.get('sent_ms') or data.get('beside'):
             continue
         if data.get('purpose') == 'compaction':
             start = data['sent_ms'] if start is None else start
-        elif data.get('purpose') is None and start is not None:
-            held += data['sent_ms'] - start
-            start = None
+        elif data.get('purpose') is None:
+            if start is not None:
+                held += data['sent_ms'] - start
+                start = None
+            if joined:
+                held += data['sent_ms'] - joined['waited_from_ms']
+                joined = None
 
     return {
         'hidden_tests': f'{passed}/{cases}', 'hidden_failure': failure,

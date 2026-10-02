@@ -869,9 +869,9 @@ impl Turn {
             None => None,
         };
         // What a summary beside the turn holds while it runs: a copy's
-        // call and a request of its own, and a token for every two bytes
-        // of the view.
-        let held = (2, context.usage().bytes as u64 / 2);
+        // call and a request of its own, and under a budget the most they
+        // may bill.
+        let held = (2, self.summary_bound(record, context, tools));
         // One that parked on its pool is not tried again before the pool
         // reopens, behind a call of this task or not, while the view and
         // the reply still fit; one that outgrows the limit summarizes first.
@@ -885,10 +885,12 @@ impl Turn {
             && pressure.bytes + reserve < limit.bytes
             && pressure.items < limit.items
             && *model_rounds + held.0 < MAX_ROUNDS
+            && let Some(tokens) = held.1
             && record
                 .budget_tokens
-                .is_none_or(|budget| record.tokens_used.saturating_add(held.1) < budget)
+                .is_none_or(|budget| record.tokens_used.saturating_add(tokens) < budget)
         {
+            let held = (held.0, tokens);
             let mut spent = Accounting {
                 route: accounting.route.clone(),
                 beside: true,
@@ -931,7 +933,7 @@ impl Turn {
                         retries,
                         paced_ms,
                     },
-                    waited_ms: 0,
+                    waited: None,
                 }
             }));
             return Ok(Compaction::Skipped);
@@ -958,6 +960,35 @@ impl Turn {
                 .await?;
         }
         Ok(compaction)
+    }
+
+    /// The most a summary's two calls may bill toward a bot's token budget:
+    /// each sends at most the view, the tools and both instructions, a
+    /// token to a byte at most, and generates at most the summarizer's
+    /// output bound. Nothing without a budget; `None` when that bound is
+    /// unknown, and then the summary goes before the call.
+    fn summary_bound(
+        &self,
+        record: &agent_runtime::store::Bot,
+        context: &Context,
+        tools: &serde_json::value::RawValue,
+    ) -> Option<u64> {
+        if record.budget_tokens.is_none() {
+            return Some(0);
+        }
+        let reference = summarizer(record);
+        let (name, model) = split_model(&reference).ok()?;
+        let provider = shaped(self.providers.get(name)?, self.settings()).ok()?;
+        let output = provider.output_byte_estimate(model)? / 4;
+        let input = context.usage().bytes
+            + tools.get().len()
+            + record.instructions.len()
+            + record
+                .compaction_instructions
+                .as_deref()
+                .map_or(0, str::len)
+            + SUMMARY_REQUEST_BYTES;
+        Some(2 * (input + output) as u64)
     }
 
     /// The current turn cannot fit the budget, alone or beside what goes
@@ -1354,18 +1385,25 @@ impl Turn {
         let Landed {
             result,
             spent,
-            waited_ms,
+            waited,
         } = landed;
         spent.count(tokens_used, model_rounds, accounting);
-        self.install_landed(result, waited_ms).await
+        self.install_landed(result, waited).await
     }
 
-    /// Install what a summary beside the turn wrote, recording how long
-    /// the turn waited for it; whether it was installed.
-    async fn install_landed(&self, result: Result<Summary>, waited_ms: u64) -> Result<bool> {
+    /// Install what a summary beside the turn wrote, recording when the
+    /// turn began to wait for it and how long it waited, if it did; whether
+    /// it was installed.
+    async fn install_landed(
+        &self,
+        result: Result<Summary>,
+        waited: Option<(u64, u64)>,
+    ) -> Result<bool> {
         match result? {
             Summary::Written(mut written) => {
-                written.request["waited_ms"] = waited_ms.into();
+                let (from_ms, ms) = waited.map_or((None, 0), |(from, ms)| (Some(from), ms));
+                written.request["waited_ms"] = ms.into();
+                written.request["waited_from_ms"] = from_ms.into();
                 Ok(matches!(self.install(*written).await?, Compaction::Done))
             }
             Summary::Parked(_) | Summary::Skipped => Ok(false),
@@ -1393,7 +1431,7 @@ impl Turn {
         if settle.asks.send(ask).is_err() {
             return Ok(Some(None));
         }
-        let waited = std::time::Instant::now();
+        let (waited, from_ms) = (std::time::Instant::now(), now_ms());
         let answer = tokio::select! {
             biased;
             answer = answer => answer,
@@ -1403,8 +1441,8 @@ impl Turn {
             return Ok(Some(None));
         };
         if let Some(landed) = landed {
-            let waited_ms = waited.elapsed().as_millis() as u64;
-            let installed = self.install_landed(landed.result, waited_ms).await?;
+            let waited = Some((from_ms, waited.elapsed().as_millis() as u64));
+            let installed = self.install_landed(landed.result, waited).await?;
             *settle.spent.lock().expect("settle lock") = Some((landed.spent, installed));
         }
         Ok(Some(retry))
@@ -3497,6 +3535,10 @@ impl Context {
     }
 }
 
+/// A bound on what a summary's request adds to what it summarizes: the
+/// request after a copy, or the frame of a request of its own.
+const SUMMARY_REQUEST_BYTES: usize = 16 * 1024;
+
 /// A summary running beside the turn's calls and tools, from the boundary
 /// that planned it until the turn needs its view or ends, then how it
 /// ended until a boundary installs it.
@@ -3646,9 +3688,9 @@ impl Beside<'_> {
     /// stays here while it runs, so a turn cancelled meanwhile still holds it.
     async fn land(&mut self) -> Option<Landed> {
         if let Some(running) = self.running.as_mut() {
-            let waited = std::time::Instant::now();
+            let (waited, from_ms) = (std::time::Instant::now(), now_ms());
             let mut landed = running.await;
-            landed.waited_ms = waited.elapsed().as_millis() as u64;
+            landed.waited = Some((from_ms, waited.elapsed().as_millis() as u64));
             self.running = None;
             self.finish(landed);
         }
@@ -3661,7 +3703,8 @@ impl Beside<'_> {
 struct Landed {
     result: Result<Summary>,
     spent: Spent,
-    waited_ms: u64,
+    /// When the turn began to wait for it and how long, if it did.
+    waited: Option<(u64, u64)>,
 }
 
 /// A summary call's outcome: written, to install at a boundary; parked on
@@ -4036,7 +4079,7 @@ mod tests {
                 Landed {
                     result: Ok(Summary::Parked(42)),
                     spent: Spent::default(),
-                    waited_ms: 0,
+                    waited: None,
                 }
             })),
             ..Beside::default()
@@ -4052,7 +4095,7 @@ mod tests {
             Landed {
                 result: Ok(Summary::Parked(until)),
                 spent: Spent::default(),
-                waited_ms: 0,
+                waited: None,
             }
         }));
         let (asks, mut asked) = tokio::sync::mpsc::unbounded_channel::<Ask>();
@@ -4075,7 +4118,7 @@ mod tests {
                         rounds: 1,
                         ..Spent::default()
                     },
-                    waited_ms: 0,
+                    waited: None,
                 }
             })),
             ..Beside::default()
@@ -4085,7 +4128,11 @@ mod tests {
         let landed = beside.land().await.expect("landed");
         assert_eq!(landed.spent.rounds, 1);
         // The wait that took it is what the turn waited.
-        assert!(landed.waited_ms >= 30, "{}", landed.waited_ms);
+        assert!(
+            landed.waited.is_some_and(|(_, ms)| ms >= 30),
+            "{:?}",
+            landed.waited
+        );
     }
 
     #[tokio::test]
@@ -4099,7 +4146,7 @@ mod tests {
                         rounds: 1,
                         ..Spent::default()
                     },
-                    waited_ms: 0,
+                    waited: None,
                 }
             })),
             ..Beside::default()
@@ -4143,7 +4190,7 @@ mod tests {
                         rounds: 1,
                         ..Spent::default()
                     },
-                    waited_ms: 0,
+                    waited: None,
                 }
             })),
             ..Beside::default()

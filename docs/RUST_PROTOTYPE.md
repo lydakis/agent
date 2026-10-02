@@ -2165,10 +2165,13 @@ or lapse that comes while the call waits for it ends that wait: the call no
 longer parks, and the summary runs on beside it. An interrupt drops one still running like the
 turn's own call; one that has landed is billed and installed as the turn
 ends. It runs beside only while the view and the reply's estimated size
-still fit the input limit and, beside what it holds, two model rounds (a
-copy and a request of its own) and a token for every two bytes of the view,
-the round limit and the bot's token budget leave room for the turn's next
-call; otherwise, and at a turn's start or as
+still fit the input limit and, beside what it holds, the round limit and
+the bot's token budget leave room for the turn's next call. It holds two
+model rounds (a copy and a request of its own) and, under a budget, the most
+those two may bill: each sending at most the view, the tools and both
+instructions at a token to a byte, and generating at most the summarizer's
+output bound; with no known output bound (a Responses provider without
+`max_output_tokens`) a budgeted bot's summary does not run beside. Otherwise, and at a turn's start or as
 a parked turn resumes, when the cache the copy reads may have lapsed, the
 summary goes before the call. A summary beside the turn uses its
 own connection rather than the bot's WebSocket, which the turn's calls hold,
@@ -2178,7 +2181,8 @@ boundary summarizes again once the pool's retry time has passed, unless the
 view outgrows the limit first, which summarizes before the call as above.
 A park keeps that retry time, so a turn resumed before it goes on with its
 calls rather than parking on the summarizer's pool. Its `compacted` event's
-`request` carries `waited_ms`, how long the turn waited for it. Because the plan is a boundary or more older than
+`request` carries `waited_ms`, how long the turn waited for it, and
+`waited_from_ms`, when it began to (null when it never did). Because the plan is a boundary or more older than
 its installation, the view it leaves also holds the rounds since, which can
 take it past the limit, for the next boundary to summarize again before its
 call. While it runs, it holds those rounds and tokens against the turn's

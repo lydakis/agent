@@ -111,6 +111,20 @@ class TurnCompactionTests(ModelFixture):
             answered = [i['call_id'] for i in items if i.get('type') == 'function_call_output']
             self.assertEqual(asked[:len(answered)], answered)
 
+    def test_under_a_budget_a_summary_runs_beside_only_when_its_spend_is_bounded(self):
+        # Under a token budget, a summary runs beside the turn only when the
+        # most it may bill is known: here, when its output is bounded.
+        client = self.client(tools='shell')
+        for bot, bounded in (('Bob', {}), ('Ann', {'max_output_tokens': 512})):
+            client.request('create', bot=bot, workspace=str(self.path), tools=['shell'],
+                           compaction_instructions='Summarize.', budget_tokens=10 ** 9,
+                           settings={'context_bytes': 65536, **bounded})
+            turn = client.request('submit', bot=bot, request_id='1', prompt='long:150x40')['result']['turn']
+            ended = client.finished(turn, timeout=60)
+            self.assertEqual(ended['data']['status'], 'completed', ended)
+            beside = {e['data']['request']['beside'] for e in all_events(client, bot) if e['event'] == 'compacted'}
+            self.assertEqual(beside, {bool(bounded)}, bot)
+
     def test_an_interrupt_still_installs_a_summary_that_landed_beside_a_call(self):
         # The summary lands while the call sent beside it is still held;
         # the interrupt then drops the turn's rounds before a boundary.
@@ -175,6 +189,7 @@ class TurnCompactionTests(ModelFixture):
         self.assertLess(kinds.index('compacted'), kinds.index('turn_waiting'))
         # The turn waited for the summary before it parked, and says so.
         self.assertGreater(compacted[0]['data']['request']['waited_ms'], 1000)
+        self.assertIsInstance(compacted[0]['data']['request']['waited_from_ms'], int)
 
     def test_a_turn_resumed_before_its_summary_pool_reopens_does_not_wait_for_it(self):
         # The turn runs on another model than its summarizer. Its summary

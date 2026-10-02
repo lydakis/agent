@@ -376,8 +376,10 @@ class LongTaskScoreTests(unittest.TestCase):
         def usage(cursor, sent, purpose=None, beside=False):
             data = {'sent_ms': sent, 'purpose': purpose}
             return {'cursor': cursor, 'event': 'usage', 'data': {**data, 'beside': True} if beside else data}
-        def compacted(cursor, beside, waited_ms=None):
-            request = {'beside': beside} if waited_ms is None else {'beside': beside, 'waited_ms': waited_ms}
+        def compacted(cursor, beside, waited=None):
+            request = {'beside': beside, 'waited_ms': 0, 'waited_from_ms': None}
+            if waited:
+                request['waited_from_ms'], request['waited_ms'] = waited
             return {'cursor': cursor, 'event': 'compacted', 'data': {'version': cursor, 'cut': cursor,
                                                                      'request': request}}
         # A summary sent just after the call it ran beside, installed after
@@ -397,12 +399,15 @@ class LongTaskScoreTests(unittest.TestCase):
                   usage(10, 3200, 'keep_warm'), usage(11, 3300, 'compaction'), usage(12, 3900)]
         result = score(self.root, self.facts, events, '')
         self.assertEqual(result['summarizer_ms'], 800)
-        # One the turn waited for, as it outgrew the limit or was about to
-        # park, held it back that long.
+        # One the turn waited for as its view outgrew the limit held the
+        # next call back from when the wait began, recording included; one
+        # it waited for before it parked, for the wait.
         events = [usage(1, 1000), usage(2, 1100, 'compaction', True), usage(3, 1200),
-                  compacted(4, True, 250), usage(5, 1600)]
+                  compacted(4, True, (1350, 250)), usage(5, 1700),
+                  usage(6, 1800, 'compaction', True), compacted(7, True, (1900, 300)),
+                  {'cursor': 8, 'event': 'turn_waiting', 'data': {}}, usage(9, 5000)]
         result = score(self.root, self.facts, events, '')
-        self.assertEqual(result['summarizer_ms'], 250)
+        self.assertEqual(result['summarizer_ms'], 350 + 300)
 
     def test_each_call_is_scored_under_the_view_it_was_made_under(self):
         usage = lambda cursor: {'cursor': cursor, 'event': 'usage', 'data': {'sent_ms': cursor}}
