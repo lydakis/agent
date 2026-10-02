@@ -1293,7 +1293,7 @@ impl Turn {
             }
             let usage = completion
                 .usage
-                .map(|usage| summarizer_usage(usage, name, model));
+                .map(|usage| summarizer_usage(usage, name, model, accounting.beside));
             let summary = completion_text(&completion.items);
             // A copy offers the bot's tools; a call there is not a summary.
             let invalid = if !completion.calls.is_empty() {
@@ -2470,7 +2470,12 @@ impl Turn {
             if summary {
                 if let Some(usage) = usage {
                     let reference = summarizer(record);
-                    let usage = summarizer_usage(usage, split_model(&reference)?.0, model);
+                    let usage = summarizer_usage(
+                        usage,
+                        split_model(&reference)?.0,
+                        model,
+                        accounting.beside,
+                    );
                     self.store
                         .op("compaction_usage", move |db| {
                             db.compaction_usage(turn, Some(&usage))
@@ -3903,7 +3908,9 @@ fn summarizer_usage(
     mut usage: agent_runtime::provider::Usage,
     provider: &str,
     model: &str,
+    beside: bool,
 ) -> agent_runtime::provider::Usage {
+    usage.beside = beside;
     if usage.models.is_empty() {
         usage.models.push(agent_runtime::provider::ModelTokens {
             model: model.to_owned(),

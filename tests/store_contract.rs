@@ -3200,6 +3200,7 @@ fn budgets_count_tokens_and_turn_listings_carry_accounting() {
         cache_write_tokens: 0,
         cache_write_1h_tokens: 0,
         sent_ms: 0,
+        beside: false,
         models: Vec::new(),
         served_model: String::new(),
     };
@@ -5942,6 +5943,7 @@ fn cached_input_tokens_are_kept_per_turn_and_per_bot_with_their_ratio() {
         cache_write_tokens: 0,
         cache_write_1h_tokens: 0,
         sent_ms: 0,
+        beside: false,
         models: Vec::new(),
         served_model: String::new(),
     };
@@ -5952,6 +5954,7 @@ fn cached_input_tokens_are_kept_per_turn_and_per_bot_with_their_ratio() {
         cache_write_tokens: 0,
         cache_write_1h_tokens: 0,
         sent_ms: 0,
+        beside: false,
         models: Vec::new(),
         served_model: String::new(),
     };
@@ -6015,6 +6018,7 @@ fn cache_migration_rebuilds_retained_usage_or_rolls_back_when_pruned() {
                         cache_write_tokens: 0,
                         cache_write_1h_tokens: 0,
                         sent_ms: 0,
+                        beside: false,
                         output_tokens: 10,
                         models: Vec::new(),
                         served_model: String::new(),
@@ -6051,6 +6055,7 @@ fn cache_migration_rebuilds_retained_usage_or_rolls_back_when_pruned() {
                     cache_write_tokens: 0,
                     cache_write_1h_tokens: 0,
                     sent_ms: 0,
+                    beside: false,
                     output_tokens: 10,
                     models: Vec::new(),
                     served_model: String::new(),

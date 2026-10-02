@@ -265,7 +265,9 @@ milliseconds, so a cache miss can be set against the gap since the call before
 it; `served_model`, the model the provider named in its response, which can
 differ from the one requested (a dated snapshot, a reroute, and after a
 fallback the last attempt's); a prompt-cache refresh's event carries
-`purpose: "keep_warm"` and is not a model round), and the store keeps running
+`purpose: "keep_warm"` and is not a model round; a summarizer call's carries
+`purpose: "compaction"`, and `beside: true` when it ran beside the turn's calls
+and tools, which it held none of), and the store keeps running
 totals: per turn (`input_tokens`, `output_tokens`, `cached_input_tokens`,
 `model_rounds`, `started_ms`, `finished_ms`) and per bot (`tokens_used`,
 `input_tokens`, `cached_input_tokens`). Both report `cache_hit`, the share of

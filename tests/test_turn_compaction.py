@@ -47,6 +47,15 @@ class TurnCompactionTests(ModelFixture):
         compacted = [e['data'] for e in events if e['event'] == 'compacted']
         self.assertGreaterEqual(len(compacted), 3)
         self.assertFalse([e for e in events if e['event'] == 'compaction_failed'])
+        # A summary's call says whether it ran beside the turn's calls, as
+        # its compaction does.
+        spent = []
+        for event in events:
+            if event['event'] == 'usage' and event['data'].get('purpose') == 'compaction':
+                spent.append(event['data'].get('beside', False))
+            elif event['event'] == 'compacted':
+                self.assertEqual(spent, [event['data']['request']['beside']])
+                spent = []
         # Every cut is inside the turn and keeps its prompt, which each
         # later request carries whole after the summary of the turn's start.
         prompt = compacted[0]['pinned']
@@ -87,6 +96,10 @@ class TurnCompactionTests(ModelFixture):
         self.assertEqual(len(compacted), len(summaries))
         self.assertTrue(all(c['request']['beside'] for c in compacted))
         self.assertFalse([e for e in events if e['event'] == 'compaction_failed'])
+        # Each summary's call says it ran beside the turn's calls.
+        spent = [e['data'] for e in events if e['event'] == 'usage' and e['data'].get('purpose') == 'compaction']
+        self.assertEqual(len(spent), len(summaries))
+        self.assertTrue(all(usage.get('beside') is True for usage in spent))
         # Each round ran once, and the turn's calls and results stay paired.
         ran = [e['data']['call_id'] for e in events if e['event'] == 'tool_completed']
         self.assertEqual(ran, [f'long-{n}' for n in range(150)])

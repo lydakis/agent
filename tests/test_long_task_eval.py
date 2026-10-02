@@ -373,25 +373,26 @@ class LongTaskScoreTests(unittest.TestCase):
         self.assertEqual(result['summarizer_ms'], 7000 + 2000)
 
     def test_a_summary_beside_the_calls_holds_none_of_them_back(self):
-        usage = lambda cursor, sent, purpose=None: {
-            'cursor': cursor, 'event': 'usage', 'data': {'sent_ms': sent, 'purpose': purpose}}
+        def usage(cursor, sent, purpose=None, beside=False):
+            data = {'sent_ms': sent, 'purpose': purpose}
+            return {'cursor': cursor, 'event': 'usage', 'data': {**data, 'beside': True} if beside else data}
         compacted = lambda cursor, beside: {'cursor': cursor, 'event': 'compacted', 'data': {
             'version': cursor, 'cut': cursor, 'request': {'beside': beside}}}
-        failed = lambda cursor: {'cursor': cursor, 'event': 'compaction_failed', 'data': {}}
         # A summary sent just after the call it ran beside, installed after
         # that call was recorded, held none back; a later summary holds the
         # call after it back.
-        events = [usage(1, 1000), usage(2, 1050), usage(3, 1100, 'compaction'), compacted(4, True),
+        events = [usage(1, 1000), usage(2, 1050), usage(3, 1100, 'compaction', True), compacted(4, True),
                   usage(5, 3000), usage(6, 3500, 'compaction'), compacted(7, False), usage(8, 4000)]
         result = score(self.root, self.facts, events, '')
         self.assertEqual(result['summarizer_ms'], 500)
-        # A failed attempt beside the turn is recorded among its calls, and
-        # its summary installed later still held none back; nor did one that
-        # failed for good with calls recorded among its attempts. One that
-        # failed for good before the next call held that call back.
-        events = [usage(1, 1000), usage(2, 900, 'compaction'), usage(3, 1200), usage(4, 1500, 'compaction'),
-                  compacted(5, True), usage(6, 2000), usage(7, 2100, 'compaction'), usage(8, 2200),
-                  failed(9), usage(10, 3000), usage(11, 3100, 'compaction'), failed(12), usage(13, 3900)]
+        # Failed attempts beside the turn, recorded among its calls before
+        # and after them, held none back, nor did a keep-warm read during a
+        # summary end its interval. A summary that failed for good, which
+        # the recorded events never say, held the next call back.
+        events = [usage(1, 1000), usage(2, 900, 'compaction', True), usage(3, 1200),
+                  usage(4, 1500, 'compaction', True), compacted(5, True), usage(6, 2000),
+                  usage(7, 2100, 'compaction', True), usage(8, 2200), usage(9, 3100, 'compaction'),
+                  usage(10, 3200, 'keep_warm'), usage(11, 3300, 'compaction'), usage(12, 3900)]
         result = score(self.root, self.facts, events, '')
         self.assertEqual(result['summarizer_ms'], 800)
 
