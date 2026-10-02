@@ -298,15 +298,25 @@ class ElisionTests(ModelFixture):
         work = [r for r in drain(self.model) if not is_summary(r)]
         self.assertTrue(all(encoded(r['input']) <= 24576 for r in work))
         # Each cut left the turn room for the steer on its own, but for the
-        # round, under 1 KiB here, that ran beside the summary before it was
-        # installed.
+        # rounds, each under 1 KiB here, that ran beside the summary before
+        # it was installed: those whose calls were sent once it was, and
+        # the one before, which may have been recorded after the plan.
         events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
-        compacted = [e['data'] for e in events if e['event'] == 'compacted']
+        compacted, sent = [], []
+        for event in events:
+            data = event['data']
+            if event['event'] == 'usage' and data.get('purpose') is None:
+                sent.append(data['sent_ms'])
+            elif event['event'] == 'usage':
+                summary_sent = data['sent_ms']
+            elif event['event'] == 'compacted':
+                before = [n for n, at in enumerate(sent) if at < summary_sent]
+                compacted.append((data, len(sent) - (before[-1] if before else 0)))
         self.assertGreaterEqual(len(compacted), 2)
-        for data in compacted:
+        for data, beside in compacted:
             self.assertEqual(data['summary_bytes'], 7800)
             self.assertTrue(data['request']['beside'])
-            self.assertLessEqual(data['context_after']['bytes'] - 7800 + 17000, 24576 + 1024)
+            self.assertLessEqual(data['context_after']['bytes'] - 7800 + 17000, 24576 + 1024 * beside)
 
     def test_a_steer_goes_in_at_the_whole_budget_when_the_newest_result_fills_the_turn(self):
         # One result of about 15 KiB, the newest round, leaves the turn no
