@@ -373,6 +373,34 @@ class ApprovalTests(ModelFixture):
         self.assertEqual(sum(is_summary(r) for r in requests), len(cursors))
         self.assertEqual(client.request('approvals')['result']['approvals'], [])
 
+    def test_a_verdict_runs_its_call_without_waiting_for_the_summary_beside_it(self):
+        # Each summary takes three seconds beside the turn. A verdict comes
+        # within the hold, unless a summary is running: then it comes just
+        # after the hold, while the turn waits for the summary to park. The
+        # call runs on its verdict; the summary goes on beside it.
+        self.model.timeline, self.model.summary_delay = [], 3.0
+        client = self.client('shell,read', settings={'approval_hold_ms': 500, 'context_bytes': 24576})
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read'],
+                       approve=['shell'], approver='manual', compaction_instructions='Summarize.')
+        rounds = 24
+        turn = client.request('submit', bot='Bob', request_id='1', prompt=f'long:{rounds}')['result']['turn']
+        lags = []
+        for n in range(rounds):
+            call_id = f'long-{n}'
+            self.announced(client, turn)
+            late = getattr(self.model, 'summarizing', False)
+            time.sleep(0.8 if late else 0.05)
+            answered = time.monotonic()
+            self.assertEqual(self.answer(client, turn, call_id)['result']['pending'], [])
+            client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn
+                           and m['data']['call_id'] == call_id, timeout=30)
+            if late:
+                lags.append(time.monotonic() - answered)
+        ended = client.finished(turn, timeout=30)
+        self.assertEqual(ended['data']['status'], 'completed', ended)
+        self.assertTrue(lags)
+        self.assertLess(max(lags), 1.0, lags)
+
     def test_a_parked_calls_result_that_overflows_forces_a_summary_after_restart(self):
         # Four small rounds, then a call whose result takes the turn past its
         # budget. That call parks, the daemon restarts, and once allowed its

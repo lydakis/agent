@@ -903,7 +903,7 @@ fn a_turn_parked_on_one_verdict_ends_when_a_later_call_lapses_first() {
     };
     // Parked on the first call, the turn wakes when the second one lapses.
     assert_eq!(
-        db.suspend_approval(turn, &round, epoch_now(), None)
+        db.suspend_approval(turn, &round, epoch_now(), None, None)
             .unwrap(),
         Some(Some(lapse))
     );
@@ -950,7 +950,7 @@ fn every_parked_turns_lapse_is_read_at_once() {
     let next = db.next_lapse(turn).unwrap().expect("w1 lapses");
     // A running turn's lapse is its task's to watch.
     assert!(db.lapses().unwrap().is_empty());
-    db.suspend_approval(turn, &round, epoch_now(), None)
+    db.suspend_approval(turn, &round, epoch_now(), None, None)
         .unwrap();
     assert_eq!(db.lapses().unwrap(), [(turn, next)].into());
     // An allow decides the only call that can lapse.
@@ -1114,7 +1114,7 @@ fn a_tag_listing_reads_no_call_that_tag_answered() {
     assert_eq!(rest["next_after"], Value::Null);
     // They leave the index when the turn parks.
     assert_eq!(
-        db.suspend_approval(turn, &round, epoch_now(), None)
+        db.suspend_approval(turn, &round, epoch_now(), None, None)
             .unwrap(),
         Some(None)
     );
@@ -1347,7 +1347,7 @@ fn the_announced_call_count_follows_the_rows() {
     ));
     assert_eq!((db.approval_requests(), rows()), (1, 1));
     // A parked turn's call is counted again when the store opens.
-    db.suspend_approval(turn, &round[2..], epoch_now(), None)
+    db.suspend_approval(turn, &round[2..], epoch_now(), None, None)
         .unwrap();
     drop(db);
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
@@ -2151,8 +2151,17 @@ fn schema_40_gives_every_existing_bot_the_defaults_and_completes_parked_turns() 
         db.append(turn, vec![item], std::slice::from_ref(&w), None)
             .unwrap();
         db.tool_start(turn, &w).unwrap();
-        db.suspend(turn, "w", &["turn:Nobody/1".into()], None, false, &[], None)
-            .unwrap();
+        db.suspend(
+            turn,
+            "w",
+            &["turn:Nobody/1".into()],
+            None,
+            false,
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
         turn
     };
     // An earlier daemon parked it before these fields were recorded.
@@ -3200,6 +3209,7 @@ fn budgets_count_tokens_and_turn_listings_carry_accounting() {
         cache_write_tokens: 0,
         cache_write_1h_tokens: 0,
         sent_ms: 0,
+        beside: false,
         models: Vec::new(),
         served_model: String::new(),
     };
@@ -3924,8 +3934,17 @@ fn a_running_turn_forks_at_its_newest_finished_round() {
     db.append(turn, vec![w_item], std::slice::from_ref(&w), None)
         .unwrap();
     db.tool_start(turn, &w).unwrap();
-    db.suspend(turn, "w", &["turn:Nobody/1".into()], None, false, &[], None)
-        .unwrap();
+    db.suspend(
+        turn,
+        "w",
+        &["turn:Nobody/1".into()],
+        None,
+        false,
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
     assert_eq!(fork_point(&mut db, "Bob", "f5").unwrap(), answered);
 
     // A forking bot's own fork: the round before the running one.
@@ -4124,8 +4143,17 @@ fn schema_36_ends_a_turn_in_flight_and_keeps_its_history() {
         db.append(turn, vec![item], std::slice::from_ref(&w), None)
             .unwrap();
         db.tool_start(turn, &w).unwrap();
-        db.suspend(turn, "w", &["turn:Nobody/1".into()], None, false, &[], None)
-            .unwrap();
+        db.suspend(
+            turn,
+            "w",
+            &["turn:Nobody/1".into()],
+            None,
+            false,
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
         (turn, stored(&mut db, "Bob"))
     };
     Connection::open(&path)
@@ -5942,6 +5970,7 @@ fn cached_input_tokens_are_kept_per_turn_and_per_bot_with_their_ratio() {
         cache_write_tokens: 0,
         cache_write_1h_tokens: 0,
         sent_ms: 0,
+        beside: false,
         models: Vec::new(),
         served_model: String::new(),
     };
@@ -5952,6 +5981,7 @@ fn cached_input_tokens_are_kept_per_turn_and_per_bot_with_their_ratio() {
         cache_write_tokens: 0,
         cache_write_1h_tokens: 0,
         sent_ms: 0,
+        beside: false,
         models: Vec::new(),
         served_model: String::new(),
     };
@@ -6015,6 +6045,7 @@ fn cache_migration_rebuilds_retained_usage_or_rolls_back_when_pruned() {
                         cache_write_tokens: 0,
                         cache_write_1h_tokens: 0,
                         sent_ms: 0,
+                        beside: false,
                         output_tokens: 10,
                         models: Vec::new(),
                         served_model: String::new(),
@@ -6051,6 +6082,7 @@ fn cache_migration_rebuilds_retained_usage_or_rolls_back_when_pruned() {
                     cache_write_tokens: 0,
                     cache_write_1h_tokens: 0,
                     sent_ms: 0,
+                    beside: false,
                     output_tokens: 10,
                     models: Vec::new(),
                     served_model: String::new(),

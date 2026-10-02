@@ -44,6 +44,21 @@ class Model(http.server.BaseHTTPRequestHandler):
             self.server.requests.put(request)
             if hasattr(self.server, 'bodies'):
                 self.server.bodies.append(body)
+            if hasattr(self.server, 'hold_after_summary'):
+                # Work calls sent after the first summary wait for the test.
+                if is_summary(request):
+                    self.server.summarized = True
+                elif getattr(self.server, 'summarized', False):
+                    self.server.hold_after_summary.wait(timeout=10)
+            if hasattr(self.server, 'timeline'):
+                # When each request arrived, and for a summary, when it ended
+                # after `summary_delay`.
+                started = time.monotonic()
+                if is_summary(request):
+                    self.server.summarizing = True
+                    time.sleep(getattr(self.server, 'summary_delay', 0))
+                    self.server.summarizing = False
+                self.server.timeline.append((is_summary(request), started, time.monotonic()))
             if hasattr(self.server, 'request_gates'):
                 try:
                     gate = self.server.request_gates.get_nowait()
@@ -71,7 +86,8 @@ class Model(http.server.BaseHTTPRequestHandler):
                 self.send_response(429)
                 self.send_header('Content-Length', str(len(body)))
                 # Exhaust retries quickly, then force the ordinary call to park.
-                self.send_header('Retry-After', '0.4' if self.server.compaction_refusals == 0 else '0.001')
+                last = getattr(self.server, 'compaction_retry_after', '0.4')
+                self.send_header('Retry-After', last if self.server.compaction_refusals == 0 else '0.001')
                 self.end_headers()
                 self.wfile.write(body)
                 self.wfile.flush()
@@ -194,7 +210,17 @@ class Model(http.server.BaseHTTPRequestHandler):
                          [int(lines) for part in spec.split(',')
                           for count, lines in [part.split('x')] for _ in range(int(count))])
                 text = ''
-                if done < len(sizes):
+                # With `long_wait`, the rounds end by starting that command
+                # in the background and waiting on it.
+                waited = getattr(self.server, 'long_wait', None)
+                named = {c['call_id'] for c in calls}
+                if done >= len(sizes) and waited and 'long-bg' not in named:
+                    output = [{'type': 'function_call', 'name': 'shell', 'call_id': 'long-bg',
+                               'arguments': json.dumps({'command': waited, 'timeout_ms': 5000, 'background': True})}]
+                elif done >= len(sizes) and waited and 'long-wait' not in named:
+                    output = [{'type': 'function_call', 'name': 'wait', 'call_id': 'long-wait',
+                               'arguments': json.dumps({'handles': [json.loads(last['output'])['handle']]})}]
+                elif done < len(sizes):
                     output = [{'type': 'function_call', 'name': 'shell', 'call_id': f'long-{done}',
                                'arguments': json.dumps({'command': f"seq -f 'round {done} line %g' 1 {sizes[done]}; echo {done} >> rounds.log",
                                                         'timeout_ms': 5000})}]
@@ -490,7 +516,8 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                 body = b'{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}'
                 self.send_response(429)
                 self.send_header('Content-Length', str(len(body)))
-                self.send_header('Retry-After', '0.4' if self.server.compaction_refusals == 0 else '0.001')
+                last = getattr(self.server, 'compaction_retry_after', '0.4')
+                self.send_header('Retry-After', last if self.server.compaction_refusals == 0 else '0.001')
                 self.end_headers()
                 self.wfile.write(body)
                 self.wfile.flush()

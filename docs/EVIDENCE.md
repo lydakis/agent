@@ -9,7 +9,9 @@ request of its own, at `cd1d45f` for the fix to run 5's lost steers, at
 `7061fab` and `7c1904d` for the sustained task's runs, at `ea82f7a` for
 serving a gate tag to one approver, at `74f726b` and `aed1669` for
 the automatic approver's own cost, at `81458d2` for the judges
-compared, and at `7a66687` for the finish cost of per-bot settings.
+compared, at `7a66687` for the finish cost of per-bot settings, and at
+the change that runs summaries beside the turn and adds the Pi Durable
+baseline, on `0a6f2b2`.
 This is the one place that says what is currently
 known. The documents it links to
 keep the method, the raw tables and superseded runs. When a history document's
@@ -129,6 +131,15 @@ more turns is not here, because its work changes with its speed; it is under
   Exploratory, not a ranking: the harnesses do unequal work. Linux VM,
   `8ebbc44`, 2026-09-23, before group commit and before macOS full flushing;
   not rerun since. [Record](HARNESS_MEASUREMENTS.md).
+- **Pi Durable on the durable lifecycle.** 32 named conversations, three
+  turns each, both engines syncing every commit (`synchronous=FULL`, which
+  the adapter sets; Pi's default is NORMAL): text turns took Agent 21.0 MiB
+  peak, 0.82 s CPU and 521/528 ms p50/p99, Pi Durable 1.0.0 138.0 MiB,
+  2.38 s and 525/651 ms; with shell tools 134.3 against 253.2 MiB, 0.97
+  against 3.86 s. Exploratory, not a ranking: Pi has no event log to
+  replay, commits partial answers, and delivers events per commit. Shared
+  4-vCPU Linux container, 2026-10-02, medians of three runs.
+  [Record](LIFECYCLE_MEASUREMENTS.md#pi-durable-baseline).
 - **Storage size.** A 1,024-turn conversation fell from 79.23 to 45.68 MiB with
   LZ4-compressed artifacts and prompts shared with their user node, node
   payloads unchanged. This reduces growth; retained history is still
@@ -339,6 +350,14 @@ Reconnects, retention, overload, compaction and recovery.
   took 541 s at the median, and their summarizer wrote 113k
   output tokens that the token-equivalents leave out. `7c1904d`,
   2026-09-27. [Record](LONG_TASK_EVAL.md#live-run-9).
+- **Summaries beside the turn.** A summary due inside a turn runs beside
+  its calls and tools and is installed at a later boundary. On the
+  synthetic fixture (work calls 1 s, summaries 4 s, 150 rounds, 64 KiB),
+  the turn took 152.5 s against 168.5 s before, all four summaries hidden,
+  for 12% more work-call input bytes; at 24 KiB, where each round fills
+  the room left, it saved about one round per summary (8.95 against
+  9.76 s). Linux cloud container, 2026-10-02, `f05caa3` against `0a6f2b2`.
+  [Record](DAEMON_MEASUREMENTS.md#summaries-beside-the-turn).
 - **Reconnects.** HTTP is the default transport. Live fleets saw transport
   failures (54 turns lost to connection failures in one 256-bot run, clean on
   rerun), retried per [the retry policy](RUST_PROTOTYPE.md). The WebSocket
@@ -389,6 +408,9 @@ the 10 focused hub tests, Clippy, formatting, and diff checks also passed.
   less on the shorter task (runs 4 and 5), and when the prompt let it,
   the model kept its own context under the budget (run 8). Neither
   prices the summarizer's output.
+- Whether summaries beside the turn save time on a live model, and what
+  the larger requests sent meanwhile cost there: the screen has synthetic
+  delays and no prompt cache.
 - Admission batching on macOS.
 - Enqueue-to-answer latency for small control operations: `stats` reports
   it per operation, but no run has recorded it.

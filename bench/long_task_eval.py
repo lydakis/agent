@@ -798,7 +798,7 @@ def reported_closes(answer, numbers):
     return reported
 
 
-def score(root, facts, events, answer, corrected_at=None):
+def score(root, facts, events, answer, corrected_at=None, finished_ms=None):
     """Outcomes from the workspace and the bot's events. For the sustained
     task, `corrected_at` is how many steps the record held when the turn
     took in the correction."""
@@ -878,6 +878,7 @@ def score(root, facts, events, answer, corrected_at=None):
                               'view_bytes': (data.get('context_before') or {}).get('bytes'),
                               'limit_bytes': (data.get('input_limit') or {}).get('bytes'),
                               'form': request.get('form'), 'copied_items': request.get('items'),
+                              'beside': request.get('beside'),
                               'estimate': request.get('estimate'),
                               'calls': len(spent), 'input_tokens': total(spent, 'input_tokens'),
                               'cached_input_tokens': total(spent, 'cached_input_tokens'),
@@ -886,16 +887,38 @@ def score(root, facts, events, answer, corrected_at=None):
 
     # A summary's latency: from its send to the send of the model call it
     # held back, which also counts recording the compaction. Attempts in a
-    # row, such as a retry after one that failed, are one interval.
-    held, start = 0, None
-    for row in usage:
-        if not row.get('sent_ms'):
-            continue
-        if row.get('purpose') == 'compaction':
-            start = row['sent_ms'] if start is None else start
-        elif start is not None:
-            held += row['sent_ms'] - start
+    # row, such as a retry after one that failed, are one interval. A
+    # summary's own call that ran beside the turn's calls says so; it held
+    # the turn back only from when the turn began to wait for it, which its
+    # compaction records, or the wait itself when it installed nothing, to
+    # the next call, or for the wait alone when the turn parked or ended
+    # next. One the turn ended on before another call held it back to the
+    # turn's end, which `finished_ms` gives by turn.
+    held, start, joined = 0, None, None
+    for event in events:
+        data = event['data']
+        request = data.get('request') or {}
+        if event['event'] == 'compacted' and request.get('beside') and request.get('waited_from_ms'):
+            joined = request
+        elif event['event'] == 'compaction_waited':
+            joined = data
+        elif event['event'] in ('turn_waiting', 'turn_paced', 'turn_finished') and joined:
+            held += joined['waited_ms']
+            joined = None
+        if event['event'] == 'turn_finished' and start is not None:
+            held += (finished_ms or {})[event['turn']] - start
             start = None
+        if event['event'] != 'usage' or not data.get('sent_ms') or data.get('beside'):
+            continue
+        if data.get('purpose') == 'compaction':
+            start = data['sent_ms'] if start is None else start
+        elif data.get('purpose') is None:
+            if start is not None:
+                held += data['sent_ms'] - start
+                start = None
+            if joined:
+                held += data['sent_ms'] - joined['waited_from_ms']
+                joined = None
 
     return {
         'hidden_tests': f'{passed}/{cases}', 'hidden_failure': failure,
@@ -1025,6 +1048,7 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
                 marks[name] = steps_before(root / name, steered['finished_ms'])
         for name in names:
             events = list(page_rows(client, 'events', name))
+            finished_ms = {t['turn']: t['finished_ms'] for t in page_rows(client, 'turns', name)}
             checkpoint = done[name]['data'].get('checkpoint')
             answer = ''
             if checkpoint:
@@ -1034,7 +1058,7 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
                              'wall_s': finished[name],
                              'steer': steer_outcome(steers.get(name), ends.get(name)),
                              'answer': answer[:2000], 'compaction_failures': failures[name],
-                             **score(root / name, facts[name], events, answer, marks.get(name))}
+                             **score(root / name, facts[name], events, answer, marks.get(name), finished_ms)}
         client.request('shutdown')
     finally:
         client.close(kill=True)

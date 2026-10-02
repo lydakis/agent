@@ -4,6 +4,8 @@ from contextlib import closing
 import json
 import os
 import sqlite3
+import threading
+import time
 from unittest import skipUnless
 from tests.test_runtime import AnthropicModel, ModelFixture, is_summary
 from tests.test_elision import drain, encoded
@@ -45,6 +47,15 @@ class TurnCompactionTests(ModelFixture):
         compacted = [e['data'] for e in events if e['event'] == 'compacted']
         self.assertGreaterEqual(len(compacted), 3)
         self.assertFalse([e for e in events if e['event'] == 'compaction_failed'])
+        # A summary's call says whether it ran beside the turn's calls, as
+        # its compaction does.
+        spent = []
+        for event in events:
+            if event['event'] == 'usage' and event['data'].get('purpose') == 'compaction':
+                spent.append(event['data'].get('beside', False))
+            elif event['event'] == 'compacted':
+                self.assertEqual(spent, [event['data']['request']['beside']])
+                spent = []
         # Every cut is inside the turn and keeps its prompt, which each
         # later request carries whole after the summary of the turn's start.
         prompt = compacted[0]['pinned']
@@ -59,6 +70,167 @@ class TurnCompactionTests(ModelFixture):
             answered = [i['call_id'] for i in items if i.get('type') == 'function_call_output']
             self.assertEqual(asked[:len(answered)], answered)
             self.assertLessEqual(len(asked) - len(answered), 1)
+
+    def test_a_summary_inside_a_turn_runs_beside_its_calls(self):
+        # Each summary takes a second. Inside the turn, the calls go on
+        # while it runs, sending the view as it is, and a later boundary
+        # installs it.
+        self.model.timeline, self.model.summary_delay = [], 1.0
+        client = self.client(tools='shell', settings={'context_bytes': 65536})
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
+                       compaction_instructions='Summarize.')
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:150x40')['result']['turn']
+        ended = client.finished(turn, timeout=60)
+        self.assertEqual(ended['data']['status'], 'completed', ended)
+        answer = node_item(client, 'Bob', ended['data']['checkpoint'])['result']
+        self.assertIn('done after 150 rounds', json.dumps(answer))
+        requests = drain(self.model)
+        self.assertTrue(all(encoded(r['input']) <= 65536 for r in requests))
+        summaries = [(start, end) for summary, start, end in self.model.timeline if summary]
+        calls = [start for summary, start, _ in self.model.timeline if not summary]
+        self.assertGreaterEqual(len(summaries), 2)
+        for start, end in summaries:
+            self.assertGreaterEqual(sum(start < call < end for call in calls), 2)
+        events = all_events(client, 'Bob')
+        compacted = [e['data'] for e in events if e['event'] == 'compacted']
+        self.assertEqual(len(compacted), len(summaries))
+        self.assertTrue(all(c['request']['beside'] and c['request']['waited_ms'] >= 0 for c in compacted))
+        self.assertFalse([e for e in events if e['event'] == 'compaction_failed'])
+        # Each summary's call says it ran beside the turn's calls.
+        spent = [e['data'] for e in events if e['event'] == 'usage' and e['data'].get('purpose') == 'compaction']
+        self.assertEqual(len(spent), len(summaries))
+        self.assertTrue(all(usage.get('beside') is True for usage in spent))
+        # Each round ran once, and the turn's calls and results stay paired.
+        ran = [e['data']['call_id'] for e in events if e['event'] == 'tool_completed']
+        self.assertEqual(ran, [f'long-{n}' for n in range(150)])
+        for request in requests:
+            if is_summary(request):
+                continue
+            items = request['input']
+            asked = [i['call_id'] for i in items if i.get('type') == 'function_call']
+            answered = [i['call_id'] for i in items if i.get('type') == 'function_call_output']
+            self.assertEqual(asked[:len(answered)], answered)
+
+    def test_under_a_budget_a_summary_runs_beside_only_when_its_spend_is_bounded(self):
+        # Under a token budget, a summary runs beside the turn only when the
+        # most it may bill is known: here, when its output is bounded.
+        client = self.client(tools='shell')
+        for bot, bounded in (('Bob', {}), ('Ann', {'max_output_tokens': 512})):
+            client.request('create', bot=bot, workspace=str(self.path), tools=['shell'],
+                           compaction_instructions='Summarize.', budget_tokens=10 ** 9,
+                           settings={'context_bytes': 65536, **bounded})
+            turn = client.request('submit', bot=bot, request_id='1', prompt='long:150x40')['result']['turn']
+            ended = client.finished(turn, timeout=60)
+            self.assertEqual(ended['data']['status'], 'completed', ended)
+            beside = {e['data']['request']['beside'] for e in all_events(client, bot) if e['event'] == 'compacted'}
+            self.assertEqual(beside, {bool(bounded)}, bot)
+
+    def test_an_interrupt_still_installs_a_summary_that_landed_beside_a_call(self):
+        # The summary lands while the call sent beside it is still held;
+        # the interrupt then drops the turn's rounds before a boundary.
+        self.model.timeline, self.model.summary_delay = [], 0.5
+        self.model.hold_after_summary = threading.Event()
+        self.addCleanup(self.model.hold_after_summary.set)
+        client = self.client(tools='shell', settings={'context_bytes': 65536})
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
+                       compaction_instructions='Summarize.')
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:150x40')['result']['turn']
+        deadline = time.monotonic() + 30
+        while not any(summary for summary, *_ in self.model.timeline):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.05)
+        time.sleep(.5)
+        client.request('interrupt', bot='Bob', turn=turn)
+        self.assertEqual(client.finished(turn)['data']['status'], 'interrupted')
+        self.model.hold_after_summary.set()
+        events = all_events(client, 'Bob')
+        compacted = [e['data'] for e in events if e['event'] == 'compacted']
+        self.assertEqual(len(compacted), 1)
+        self.assertTrue(compacted[0]['request']['beside'])
+        billed = [e['data'] for e in events if e['event'] == 'usage' and e['data'].get('purpose') == 'compaction']
+        self.assertEqual(len(billed), 1)
+
+    def test_a_summary_beside_the_turn_holds_its_calls_to_the_round_limit(self):
+        # Small rounds: compaction comes due past round 150, and the view
+        # would not outgrow the limit until well past 200, so the summary
+        # is still running as the turn nears its round limit. The turn
+        # waits for it there, and fails with it counted among its rounds.
+        self.model.timeline, self.model.summary_delay = [], 5.0
+        client = self.client(tools='shell', settings={'context_bytes': 65536})
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
+                       compaction_instructions='Summarize.')
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:250x1')['result']['turn']
+        ended = client.finished(turn, timeout=90)
+        self.assertEqual((ended['data']['status'], ended['data']['error']), ('failed', 'tool_round_limit'))
+        requests = drain(self.model)
+        self.assertEqual(len(requests), 200)
+        self.assertEqual(sum(map(is_summary, requests)), 1)
+
+    def test_a_summary_beside_a_call_that_parks_the_turn_lands_before_it_parks(self):
+        # Compaction comes due past round 150 and the summary takes five
+        # seconds; at round 160 the turn starts a command and waits on it,
+        # which parks the turn well before the summary would land. The
+        # summary is installed before the park, in this turn, and the turn
+        # resumed from the park finishes with it.
+        self.model.timeline, self.model.summary_delay = [], 5.0
+        self.model.long_wait = 'sleep .5'
+        client = self.client(tools='shell,wait', settings={'context_bytes': 65536})
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'wait'],
+                       compaction_instructions='Summarize.')
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:160x1')['result']['turn']
+        ended = client.finished(turn, timeout=60)
+        self.assertEqual(ended['data']['status'], 'completed', ended)
+        events = all_events(client, 'Bob')
+        compacted = [e for e in events if e['event'] == 'compacted']
+        self.assertEqual([(e['turn'], e['data']['request']['beside']) for e in compacted], [(turn, True)])
+        billed = [e['turn'] for e in events if e['event'] == 'usage' and e['data'].get('purpose') == 'compaction']
+        self.assertEqual(billed, [turn])
+        kinds = [e['event'] for e in events]
+        self.assertLess(kinds.index('compacted'), kinds.index('turn_waiting'))
+        # The turn waited for the summary before it parked, and says so.
+        self.assertGreater(compacted[0]['data']['request']['waited_ms'], 1000)
+        self.assertIsInstance(compacted[0]['data']['request']['waited_from_ms'], int)
+
+    def test_a_failed_summary_the_turn_waited_for_records_the_wait(self):
+        # As above, but the summary comes back empty: nothing is installed,
+        # and the wait before the park is recorded on its own.
+        self.model.timeline, self.model.summary_delay = [], 2.5
+        self.model.empty_compaction, self.model.long_wait = True, 'sleep .5'
+        client = self.client(tools='shell,wait', settings={'context_bytes': 65536})
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'wait'],
+                       compaction_instructions='Summarize.')
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:160x1')['result']['turn']
+        ended = client.finished(turn, timeout=60)
+        self.assertEqual(ended['data']['status'], 'completed', ended)
+        events = all_events(client, 'Bob')
+        self.assertNotIn('compacted', [e['event'] for e in events])
+        waits = [e for e in events if e['event'] == 'compaction_waited']
+        parked = next(i for i, e in enumerate(events) if e['event'] == 'turn_waiting')
+        before = [e for e in waits if events.index(e) < parked]
+        self.assertTrue(before, [e['event'] for e in events][parked - 8:parked + 1])
+        self.assertEqual(before[-1]['turn'], turn)
+        self.assertGreater(before[-1]['data']['waited_ms'], 1000)
+        self.assertIsInstance(before[-1]['data']['waited_from_ms'], int)
+
+    def test_a_turn_resumed_before_its_summary_pool_reopens_does_not_wait_for_it(self):
+        # The turn runs on another model than its summarizer. Its summary
+        # beside it is turned away until its pool reopens three seconds
+        # later; meanwhile the turn parks on a wait and resumes. Its own
+        # model's pool is open, so it goes on rather than waiting for the
+        # summarizer's.
+        self.model.models = ('synthetic-model', 'synthetic-large')
+        self.model.compaction_refusals, self.model.compaction_retry_after = 1, '3'
+        self.model.long_wait = 'sleep .5'
+        client = self.client(tools='shell,wait', settings={'context_bytes': 65536})
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'wait'],
+                       compaction_instructions='Summarize.')
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:160x1',
+                              model='openai/synthetic-large')['result']['turn']
+        ended = client.finished(turn, timeout=60)
+        self.assertEqual(ended['data']['status'], 'completed', ended)
+        kinds = [e['event'] for e in all_events(client, 'Bob')]
+        self.assertIn('turn_waiting', kinds)
+        self.assertNotIn('turn_paced', kinds)
 
     def test_a_round_that_overflows_before_compaction_is_due_forces_a_summary(self):
         # Four small rounds, then one that takes the turn past its budget

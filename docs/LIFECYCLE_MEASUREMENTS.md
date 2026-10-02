@@ -1,8 +1,10 @@
 # Rust lifecycle, feature costs, and regression checks
 
 Measured 2026-09-07 evening America/New_York (capture timestamps are UTC).
-These are **Rust-only** results. Pi/Codex lifecycle adapters with matching
-semantics do not exist yet. The earlier cross-engine streaming figures remain
+The sections up to the post-review checkpoint are **Rust-only** results. The
+[Pi Durable baseline](#pi-durable-baseline) of 2026-10-02 is the first other
+engine on this workload; it is an exploratory screen, not a ranking. The
+earlier cross-engine streaming figures remain
 [exploratory observations](COMPARISON_CONTRACT.md), not harness-efficiency rankings.
 
 ## Durable service and tools
@@ -147,3 +149,91 @@ The earlier 1,000-stream screen was not repeated for this checkpoint.
   in `.local/bench/feature-ladder-final/shell/`.
 - Checkpoint validation: 16 Rust tests, 34 Python tests including real-process
   synthetic engine checks, formatting, strict Clippy, and a release build passed.
+
+## Pi Durable baseline
+
+Measured 2026-10-02 UTC (captures 06:06–06:09). **Exploratory, single host,
+no ranking.** Agent and Pi Durable 1.0.0 ran the durable lifecycle workload
+above through the same observer and provider; the
+[adapter](BENCHMARKS.md#pi-durable-adapter) and the
+[contract notes](COMPARISON_CONTRACT.md#pi-durable-lifecycle-comparison)
+describe how. Each case: 32 bots in separate workspaces, three turns per bot
+with 4 KiB of new user text and twenty 256-byte deltas 25 ms apart, full
+history validated on every request, then kill, reopen, resume, re-read,
+per-item reads, duplicate submission, and a fork at each bot's first answer.
+One excluded warmup and three measured fresh-process runs; medians with
+ranges.
+
+Host: a shared 4-vCPU Intel Xeon (2.1 GHz) Linux 6.18 cloud container with
+15 GiB RAM, not otherwise controlled; numbers from other hosts in these docs
+are not comparable. Agent `agent-runtime 0.1.3` at `0a6f2b2`, release binary
+`cbc4bdbb…`, rustc 1.98.0, bundled SQLite from `libsqlite3-sys` 0.38.2. Pi
+Durable 1.0.0 (source `a13d35a7`), pi-ai 1.0.0, chord 1.0.0, Node v22.22.0
+with its SQLite 3.50.4, lockfile `c1ae3871…`. Python 3.11.15, psutil 7.2.2.
+Observer fingerprint `cf1c3756923e…`; sampling, guards and timeouts as in the
+Rust lifecycle screen (200 ms samples, 512 MiB, 30 s, 48 or 65 processes).
+
+Peak memory is summed sampled RSS of the charged tree: Agent's daemon and its
+tool children; Node with Pi Durable and its tool children.
+
+| Case | Engine, durability | Peak RSS, MiB | CPU s | Turn p50 / p99, ms | Restart to ready, ms | Resume, re-read, items, duplicate, fork (all 32), ms |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Text | Agent, FULL | 21.0 (21.0–21.1) | 0.82 (0.80–0.82) | 521 / 528 | 210 (205–226) | 133 (115–139) |
+| Text | Pi Durable, FULL | 138.0 (137.4–139.1) | 2.38 (2.38–2.49) | 525 / 651 | 243 (237–250) | 203 (166–216) |
+| Echo round trip | Agent, FULL | 21.3 (21.3–21.4) | 0.95 (0.95–0.99) | 576 / 585 | 226 (206–230) | 170 (164–189) |
+| Echo round trip | Pi Durable, FULL | 149.0 (148.3–150.2) | 3.51 (3.39–3.52) | 635 / 836 | 246 (238–264) | 240 (228–272) |
+| Echo round trip | Pi Durable, NORMAL (package default) | 150.0 (148.9–152.6) | 3.12 (3.06–3.29) | 628 / 800 | 226 (224–251) | 198 (195–218) |
+| Shell round trip | Agent, FULL | 134.3 (134.2–134.3) | 0.97 (0.97–1.00) | 831 / 856 | 255 (202–255) | 170 (161–178) |
+| Shell round trip | Pi Durable, FULL | 253.2 (253.1–289.8) | 3.86 (3.86–3.96) | 923 / 1,070 | 254 (249–255) | 238 (220–255) |
+
+Turn latencies are medians of each run's p50 and p99; the scripted stream
+alone takes 500 ms, and a tool round trip adds the provider's 50 ms before
+the call plus the tool's own time (250 ms of sleep in shell mode). Every
+measured run completed all 96 turns with 32 of 32 provider requests in
+flight, no invalid provider request, every tool result, and no quality
+warning. Peak processes: Agent 1, 1, and 65 (shell); Pi Durable 1, 1, and
+45–62 (shell). Peak threads: Agent 5 without tools running, Pi Durable 11.
+Idle RSS after the turns equalled the peak except in shell mode (Agent 21.6,
+Pi Durable 153.5 MiB). Retained store files at the end, WAL included, were
+about 5.2–5.6 MiB for both; Agent's ranged from 1.3 MiB because its WAL size
+at the kill varied.
+
+What this shows, and what it does not:
+
+- On this host, for this bounded workload, Pi Durable's Node process used
+  about 117–128 MiB more sampled RSS than Agent's daemon before any tool
+  process, and 2.9 to 4.0 times its observed CPU. Its turn p99 was 120–250 ms
+  longer at 32 concurrent conversations; p50 differed by 4 to 92 ms.
+- The two engines did not do the same internal work. Pi Durable commits
+  partial answers every 100 ms and serializes every conversation's commits
+  on one line, one transaction each; Agent writes completed items. With one
+  bot and the same streaming, strace counted 9.0 syncs per turn for Pi
+  Durable at FULL and 3.1 for Agent ([adapter notes](BENCHMARKS.md#pi-durable-adapter)).
+  Its events arrive per commit and its "replay" is a transcript re-read, a
+  smaller result than Agent's event-log replay. These differences are not
+  attributed to CPU or memory here; no profile was taken.
+- FULL against NORMAL inside Pi Durable: CPU 3.51 against 3.12 s and create
+  59 against 36 ms on this host's virtual disk. That is one bounded
+  observation of the sync cost on this storage, not a general figure.
+- Nothing here measures crash during a turn, cancellation, slow consumers,
+  retention, long histories, compaction, more than 32 conversations, or power
+  loss. Node's heap is mostly runtime and package baseline at this scale;
+  per-conversation growth was not separated.
+
+Commands, run sequentially from the repository root after
+`pnpm --dir bench/adapters install --frozen-lockfile --ignore-scripts` and
+`CARGO_TARGET_DIR=.local/target cargo build --release --locked`:
+
+```sh
+.local/venv/bin/python -m bench.lifecycle --engine rust --agents 32 --mode text --tools echo --out .local/bench/pi-durable-2026-10-02/rust-text
+.local/venv/bin/python -m bench.lifecycle --engine pi-durable --agents 32 --mode text --tools echo --out .local/bench/pi-durable-2026-10-02/pi-full-text
+.local/venv/bin/python -m bench.lifecycle --engine pi-durable --agents 32 --mode echo --tools echo --out .local/bench/pi-durable-2026-10-02/pi-full-echo
+.local/venv/bin/python -m bench.lifecycle --engine rust --agents 32 --mode echo --tools echo --out .local/bench/pi-durable-2026-10-02/rust-echo
+.local/venv/bin/python -m bench.lifecycle --engine rust --agents 32 --mode shell --tools echo,shell --out .local/bench/pi-durable-2026-10-02/rust-shell
+.local/venv/bin/python -m bench.lifecycle --engine pi-durable --agents 32 --mode shell --tools echo,shell --out .local/bench/pi-durable-2026-10-02/pi-full-shell
+.local/venv/bin/python -m bench.lifecycle --engine pi-durable --synchronous normal --agents 32 --mode echo --tools echo --out .local/bench/pi-durable-2026-10-02/pi-normal-echo
+```
+
+Raw captures are in the ignored `.local/bench/pi-durable-2026-10-02/`. The
+v3 echo and shell rows use streamed tool-call items, so they are not the same
+workload as the 2026-09-07 Rust rows above (which were also on another host).

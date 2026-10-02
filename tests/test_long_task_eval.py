@@ -363,12 +363,70 @@ class LongTaskScoreTests(unittest.TestCase):
     def test_summary_time_counts_retried_attempts_once(self):
         usage = lambda cursor, sent, purpose=None: {
             'cursor': cursor, 'event': 'usage', 'data': {'sent_ms': sent, 'purpose': purpose}}
+        compacted = lambda cursor: {'cursor': cursor, 'event': 'compacted', 'data': {
+            'version': cursor, 'cut': cursor, 'request': {'beside': False}}}
         # A failed summary retried before the call it held back, then a
         # second summary later in the task.
-        events = [usage(1, 1000), usage(2, 2000, 'compaction'), usage(3, 5000, 'compaction'),
-                  usage(4, 9000), usage(5, 10000, 'compaction'), usage(6, 12000)]
+        events = [usage(1, 1000), usage(2, 2000, 'compaction'), usage(3, 5000, 'compaction'), compacted(4),
+                  usage(5, 9000), usage(6, 10000, 'compaction'), compacted(7), usage(8, 12000)]
         result = score(self.root, self.facts, events, '')
         self.assertEqual(result['summarizer_ms'], 7000 + 2000)
+
+    def test_a_summary_beside_the_calls_holds_none_of_them_back(self):
+        def usage(cursor, sent, purpose=None, beside=False):
+            data = {'sent_ms': sent, 'purpose': purpose}
+            return {'cursor': cursor, 'event': 'usage', 'data': {**data, 'beside': True} if beside else data}
+        def compacted(cursor, beside, waited=None):
+            request = {'beside': beside, 'waited_ms': 0, 'waited_from_ms': None}
+            if waited:
+                request['waited_from_ms'], request['waited_ms'] = waited
+            return {'cursor': cursor, 'event': 'compacted', 'data': {'version': cursor, 'cut': cursor,
+                                                                     'request': request}}
+        # A summary sent just after the call it ran beside, installed after
+        # that call was recorded, held none back; a later summary holds the
+        # call after it back.
+        events = [usage(1, 1000), usage(2, 1050), usage(3, 1100, 'compaction', True), compacted(4, True),
+                  usage(5, 3000), usage(6, 3500, 'compaction'), compacted(7, False), usage(8, 4000)]
+        result = score(self.root, self.facts, events, '')
+        self.assertEqual(result['summarizer_ms'], 500)
+        # Failed attempts beside the turn, recorded among its calls before
+        # and after them, held none back, nor did a keep-warm read during a
+        # summary end its interval. A summary that failed for good, which
+        # the recorded events never say, held the next call back.
+        events = [usage(1, 1000), usage(2, 900, 'compaction', True), usage(3, 1200),
+                  usage(4, 1500, 'compaction', True), compacted(5, True), usage(6, 2000),
+                  usage(7, 2100, 'compaction', True), usage(8, 2200), usage(9, 3100, 'compaction'),
+                  usage(10, 3200, 'keep_warm'), usage(11, 3300, 'compaction'), usage(12, 3900)]
+        result = score(self.root, self.facts, events, '')
+        self.assertEqual(result['summarizer_ms'], 800)
+        # One the turn waited for as its view outgrew the limit held the
+        # next call back from when the wait began, recording included; one
+        # it waited for before it parked, for the wait.
+        events = [usage(1, 1000), usage(2, 1100, 'compaction', True), usage(3, 1200),
+                  compacted(4, True, (1350, 250)), usage(5, 1700),
+                  usage(6, 1800, 'compaction', True), compacted(7, True, (1900, 300)),
+                  {'cursor': 8, 'event': 'turn_waiting', 'data': {}}, usage(9, 5000)]
+        result = score(self.root, self.facts, events, '')
+        self.assertEqual(result['summarizer_ms'], 350 + 300)
+        # One the turn waited for that installed nothing records its wait
+        # on its own, counted the same way.
+        waited = lambda cursor, start, ms: {'cursor': cursor, 'event': 'compaction_waited',
+                                             'data': {'waited_from_ms': start, 'waited_ms': ms}}
+        events = [usage(1, 1000), usage(2, 1100, 'compaction', True), waited(3, 1300, 400), usage(4, 1900),
+                  usage(5, 2000, 'compaction', True), waited(6, 2100, 200),
+                  {'cursor': 7, 'event': 'turn_paced', 'data': {}}, usage(8, 9000)]
+        result = score(self.root, self.facts, events, '')
+        self.assertEqual(result['summarizer_ms'], 600 + 200)
+
+    def test_a_summary_the_turn_ended_on_counts_to_its_end(self):
+        usage = lambda cursor, sent, purpose=None: {
+            'cursor': cursor, 'event': 'usage', 'data': {'sent_ms': sent, 'purpose': purpose}}
+        # The last summary attempt spends the budget, and the turn ends
+        # with no call after it.
+        events = [usage(1, 1000), usage(2, 2000, 'compaction'),
+                  {'cursor': 3, 'turn': 7, 'event': 'turn_finished', 'data': {'status': 'failed'}}]
+        result = score(self.root, self.facts, events, '', finished_ms={7: 2600})
+        self.assertEqual(result['summarizer_ms'], 600)
 
     def test_each_call_is_scored_under_the_view_it_was_made_under(self):
         usage = lambda cursor: {'cursor': cursor, 'event': 'usage', 'data': {'sent_ms': cursor}}
@@ -655,10 +713,16 @@ class LongTaskRunnerTests(ModelFixture):
                 # Each installed summary names its span, how it was sent,
                 # and what it cost.
                 self.assertEqual(len(result['summaries']), result['compactions'])
+                # A summary installed a boundary after its plan also holds
+                # the rounds that ran beside it, which can take the view past
+                # the limit, for the next summary to catch up.
+                after_beside = False
                 for summary in result['summaries']:
                     self.assertEqual(summary['calls'], 1)
                     self.assertGreater(summary['span_bytes'], 0)
-                    self.assertLessEqual(summary['view_bytes'], summary['limit_bytes'])
+                    if not (summary['beside'] or after_beside):
+                        self.assertLessEqual(summary['view_bytes'], summary['limit_bytes'])
+                    after_beside = summary['beside']
                     self.assertIn(summary['form'], ('copy', 'own'))
                     self.assertEqual(summary['copied_items'] is None, summary['form'] == 'own')
                     self.assertGreater(summary['estimate']['own'], 0)

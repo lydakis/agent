@@ -265,7 +265,9 @@ milliseconds, so a cache miss can be set against the gap since the call before
 it; `served_model`, the model the provider named in its response, which can
 differ from the one requested (a dated snapshot, a reroute, and after a
 fallback the last attempt's); a prompt-cache refresh's event carries
-`purpose: "keep_warm"` and is not a model round), and the store keeps running
+`purpose: "keep_warm"` and is not a model round; a summarizer call's carries
+`purpose: "compaction"`, and `beside: true` when it ran beside the turn's calls
+and tools, which it held none of), and the store keeps running
 totals: per turn (`input_tokens`, `output_tokens`, `cached_input_tokens`,
 `model_rounds`, `started_ms`, `finished_ms`) and per bot (`tokens_used`,
 `input_tokens`, `cached_input_tokens`). Both report `cache_hit`, the share of
@@ -2104,7 +2106,7 @@ ends at its span. The estimate takes the call to be in cache; it does not
 model a cache that expired while a tool ran or the bot sat idle. The
 `compacted` event's `request` says which way went (`form`, `copy` or `own`,
 and `items`, the window items copied) with both estimates, `null` where a
-way could not be sent. A summary that parks on a rate limit
+way could not be sent, and whether the summary ran `beside` the turn (below). A summary that parks on a rate limit
 keeps in its park record the floor that window was read under, where it
 starts, where it ends when the copy had the call's window whole, and that
 prefix when the view no longer sends it, so its retry, after a restart
@@ -2133,8 +2135,8 @@ borrows the already encoded tool selection. Responses requests of this form
 send an empty tool list, which that family permits with historical calls.
 
 Either way the call is paced, retried, billed against the bot's budget, and
-counted as a model round like any other; if it parks on a closed pool, the
-turn parks. Stored history is not rewritten for summarization.
+counted as a model round like any other; if a summary before the call parks
+on a closed pool, the turn parks. Stored history is not rewritten for summarization.
 The park record identifies the unfinished call as summary or ordinary model
 work. Resumption, including after restart, continues that call. Once a summary
 exhausts its retries, parking the following ordinary call does not restart the
@@ -2144,12 +2146,57 @@ charged durably before continuing. Usage events identify `purpose: compaction`;
 `compaction_text_delta` and `compaction_thinking_delta` are separate from answer
 streams. Budget and round limits are checked again before the normal call.
 
+#### Summaries beside the turn
+
+Inside a turn, behind a call this task made, a due summary does not hold
+up the turn, as in Pi Durable
+([announcement](https://earendil.com/posts/pi-durable/), 2026-10-01). At the
+boundary it is planned, its copy chosen and the view it copies read, as
+above; then its call runs beside the turn's calls and tools, which send the
+view as it is. The first boundary after it lands installs it, after the
+results of the rounds it ran beside, so the view still changes only between
+calls. Until then neither stubs nor another summary change the view. The
+turn waits for it only when its view no longer fits the input limit, or
+when the turn ends or parks. A call that parks the turn, a wait or an
+approval still pending, first waits for it and installs it, so a turn
+resumed from that park never races its install; the calls before it, and
+an approval that arrives in time, run beside it as any call does. A verdict
+or lapse that comes while the call waits for it ends that wait: the call no
+longer parks, and the summary runs on beside it. An interrupt drops one still running like the
+turn's own call; one that has landed is billed and installed as the turn
+ends. It runs beside only while the view and the reply's estimated size
+still fit the input limit and, beside what it holds, the round limit and
+the bot's token budget leave room for the turn's next call. It holds two
+model rounds (a copy and a request of its own) and, under a budget, the most
+those two may bill: each sending at most the view, the tools and both
+instructions at a token to a byte, and generating at most the summarizer's
+output bound; with no known output bound (a Responses provider without
+`max_output_tokens`) a budgeted bot's summary does not run beside. Otherwise, and at a turn's start or as
+a parked turn resumes, when the cache the copy reads may have lapsed, the
+summary goes before the call. A summary beside the turn uses its
+own connection rather than the bot's WebSocket, which the turn's calls hold,
+and counts toward the turn's rounds, budget, and retries when it lands. A
+summary beside the turn that parks on a closed pool parks nothing; a later
+boundary summarizes again once the pool's retry time has passed, unless the
+view outgrows the limit first, which summarizes before the call as above.
+A park keeps that retry time, so a turn resumed before it goes on with its
+calls rather than parking on the summarizer's pool. Its `compacted` event's
+`request` carries `waited_ms`, how long the turn waited for it, and
+`waited_from_ms`, when it began to (null when it never did). One the turn
+waited for that installed nothing, because it failed or parked, records the
+same two fields in a durable `compaction_waited` event. Because the plan is a boundary or more older than
+its installation, the view it leaves also holds the rounds since, which can
+take it past the limit, for the next boundary to summarize again before its
+call. While it runs, it holds those rounds and tokens against the turn's
+calls, and its own calls and retries stop at them: a call they would take past the round limit or the budget waits for
+it, and is checked against what it spent.
+
 The result is recorded in one transaction: the summary, the covered turns'
 user prompts verbatim (each up to 2 KiB, with a 16 KiB budget for text plus
 entry metadata, the oldest and newest kept when there are more), and the cut, the prompt node the verbatim
 tail starts at, which becomes the context start. A compaction stands for
 everything since the first: its coverage starts at turn 1 and the kept
-prompts carry over. Its version is anchored to the head at which it was generated, separately
+prompts carry over. Its version is anchored to the head at which it was installed, separately
 from the cut: forks can summarize the same cut independently. A historical
 fork inherits the newest version at or before its checkpoint and restores
 that version's context start, preserving its cached prefix. Deleting a bot

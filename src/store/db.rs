@@ -437,6 +437,10 @@ pub struct Waiting {
     /// sends the same request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copied: Option<CopiedCall>,
+    /// Until when a summary beside the turn that parked on its pool is not
+    /// tried again, so the turn resumed before then does not wait on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_retry_ms: Option<u64>,
 }
 /// The call a summary copies: the elision floor its window was read under,
 /// the node that window starts at, the node it ends at when the copy had
@@ -694,7 +698,7 @@ fn planned_calls(item: &[u8]) -> Vec<Cow<'_, str>> {
         .collect()
 }
 /// The bounded request context: ordered node ids and exact item bytes.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Window {
     pub family: Family,
     pub ids: Vec<i64>,
@@ -4114,6 +4118,19 @@ impl Database {
         tx.commit()?;
         Ok(())
     }
+    /// A summary beside the turn that the turn waited for but that
+    /// installed nothing: when the wait began and how long it lasted.
+    pub fn compaction_waited(&mut self, turn: i64, from_ms: u64, waited_ms: u64) -> Result<()> {
+        let bot = self.active(turn)?;
+        event(
+            &self.conn,
+            &bot.name,
+            Some(turn),
+            "compaction_waited",
+            json!({"waited_ms": waited_ms, "waited_from_ms": from_ms}),
+        )?;
+        Ok(())
+    }
     pub fn tool_start(&mut self, turn: i64, call: &ToolCall) -> Result<Value> {
         let bot = self.active(turn)?;
         // Every call before it is done, so a gate still undecided is a later
@@ -4425,6 +4442,7 @@ impl Database {
         pending: &[ToolCall],
         now_ms: u64,
         route: Option<&str>,
+        summary_retry_ms: Option<u64>,
     ) -> Result<Option<Option<u64>>> {
         let bot = self.active(turn)?;
         let call = pending.first().ok_or(Error::new("invalid_tool_state"))?;
@@ -4457,6 +4475,7 @@ impl Database {
             route: route.map(str::to_owned),
             approval: true,
             copied: None,
+            summary_retry_ms,
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
@@ -5084,6 +5103,7 @@ impl Database {
         any: bool,
         pending: &[ToolCall],
         route: Option<&str>,
+        summary_retry_ms: Option<u64>,
     ) -> Result<Value> {
         let bot = self.active(turn)?;
         let executing: bool = self.conn.query_row(
@@ -5109,6 +5129,7 @@ impl Database {
             route: route.map(str::to_owned),
             approval: false,
             copied: None,
+            summary_retry_ms,
         };
         let tx = self.conn.savepoint()?;
         // A verdict for a later call of the round waits in the store.
@@ -5139,6 +5160,7 @@ impl Database {
         compaction: bool,
         copied: Option<CopiedCall>,
         route: Option<&str>,
+        summary_retry_ms: Option<u64>,
     ) -> Result<Value> {
         let bot = self.active(turn)?;
         if bot.status != "running" {
@@ -5159,6 +5181,7 @@ impl Database {
             route: route.map(str::to_owned),
             approval: false,
             copied,
+            summary_retry_ms,
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
