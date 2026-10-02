@@ -3507,12 +3507,15 @@ Measured with `bench/summary_beside.py` on a shared 4-vCPU Linux 6.18 cloud
 container: the runtime tests' synthetic Responses fixture, every work call
 delayed by a fixed time and every summary by a longer one, one bot with
 `shell` and `read`, one turn. Before is `0a6f2b2` (summaries before the
-call); after is this change on top of it. Synthetic delays, no model calls.
+call; release binary sha256 `18e3f59f287a9d6a…`); after is `f05caa3`, the
+change with its review fixes (sha256 `cbc4bdbbf694bb28…`). Synthetic delays,
+no model calls. A first run of the change alone (`8e80ef6`) measured within
+0.1 s of these on both rows.
 
 | Turn | Delays (work / summary) | Summaries | Wall time before | Wall time after | Work input bytes before → after | Largest request before → after |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| `long:150x40`, 64 KiB budget, 1 run | 1.0 s / 4.0 s | 4 | 168.27 s | 152.49 s | 4.46 M → 4.98 M | 49.3 K → 53.6 K |
-| `long:40`, 24 KiB budget, 3 runs | 0.15 s / 0.6 s | 5 | 9.76 s (9.74–9.90) | 8.96 s (8.96–8.97) | 620 K → 655 K | 18.4 K → 19.3 K |
+| `long:150x40`, 64 KiB budget, 1 run | 1.0 s / 4.0 s | 4 | 168.45 s | 152.54 s | 4.46 M → 4.98 M | 49.3 K → 53.6 K |
+| `long:40`, 24 KiB budget, 3 runs | 0.15 s / 0.6 s | 5 | 9.76 s (9.75–9.78) | 8.95 s (8.95–8.96) | 620 K → 655 K | 18.4 K → 19.3 K |
 
 ```sh
 .local/venv/bin/python -m bench.summary_beside BEFORE_BINARY AFTER_BINARY \
@@ -3521,7 +3524,7 @@ call); after is this change on top of it. Synthetic delays, no model calls.
   --work 0.15 --summary 0.6 --prompt long:40 --context-bytes 24576 --runs 3
 ```
 
-At 64 KiB the turn saved 15.8 s, the four summaries' whole 16 s: each ran
+At 64 KiB the turn saved 15.9 s, the four summaries' whole 16 s: each ran
 beside later rounds and landed before the view needed it. At 24 KiB each
 round's results fill the remaining room, so the next boundary's view no
 longer fits and waits: the saving is about one round per summary (0.8 s of

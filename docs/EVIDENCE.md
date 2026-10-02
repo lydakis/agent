@@ -353,10 +353,10 @@ Reconnects, retention, overload, compaction and recovery.
 - **Summaries beside the turn.** A summary due inside a turn runs beside
   its calls and tools and is installed at a later boundary. On the
   synthetic fixture (work calls 1 s, summaries 4 s, 150 rounds, 64 KiB),
-  the turn took 152.5 s against 168.3 s before, all four summaries hidden,
+  the turn took 152.5 s against 168.5 s before, all four summaries hidden,
   for 12% more work-call input bytes; at 24 KiB, where each round fills
-  the room left, it saved about one round per summary (8.96 against
-  9.76 s). Linux cloud container, 2026-10-02, against `0a6f2b2`.
+  the room left, it saved about one round per summary (8.95 against
+  9.76 s). Linux cloud container, 2026-10-02, `f05caa3` against `0a6f2b2`.
   [Record](DAEMON_MEASUREMENTS.md#summaries-beside-the-turn).
 - **Reconnects.** HTTP is the default transport. Live fleets saw transport
   failures (54 turns lost to connection failures in one 256-bot run, clean on
