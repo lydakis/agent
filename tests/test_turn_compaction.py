@@ -139,6 +139,28 @@ class TurnCompactionTests(ModelFixture):
         self.assertEqual(len(requests), 200)
         self.assertEqual(sum(map(is_summary, requests)), 1)
 
+    def test_a_summary_beside_a_call_that_parks_the_turn_lands_before_it_parks(self):
+        # Compaction comes due past round 150 and the summary takes five
+        # seconds; at round 160 the turn starts a command and waits on it,
+        # which parks the turn well before the summary would land. The
+        # summary is installed before the park, in this turn, and the turn
+        # resumed from the park finishes with it.
+        self.model.timeline, self.model.summary_delay = [], 5.0
+        self.model.long_wait = 'sleep .5'
+        client = self.client(tools='shell,wait', settings={'context_bytes': 65536})
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'wait'],
+                       compaction_instructions='Summarize.')
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:160x1')['result']['turn']
+        ended = client.finished(turn, timeout=60)
+        self.assertEqual(ended['data']['status'], 'completed', ended)
+        events = all_events(client, 'Bob')
+        compacted = [e for e in events if e['event'] == 'compacted']
+        self.assertEqual([(e['turn'], e['data']['request']['beside']) for e in compacted], [(turn, True)])
+        billed = [e['turn'] for e in events if e['event'] == 'usage' and e['data'].get('purpose') == 'compaction']
+        self.assertEqual(billed, [turn])
+        kinds = [e['event'] for e in events]
+        self.assertLess(kinds.index('compacted'), kinds.index('turn_waiting'))
+
     def test_a_round_that_overflows_before_compaction_is_due_forces_a_summary(self):
         # Four small rounds, then one that takes the turn past its budget
         # before compaction is due. Without read nothing is elided, so the

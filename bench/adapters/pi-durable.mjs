@@ -106,19 +106,37 @@ async function create(bot, workspace, parent) {
   return parent ? parent.handle.fork(parent.at, options, context) : harness.createConversation(options, context);
 }
 
+// Submissions in flight, by bot and request ID.
+const submitting = new Map();
+
+async function submit(bot, requestId, prompt) {
+  const handle = await conversation(bot);
+  const existing = await handle.commit(tx => tx.submissionByRequest(handle.id, requestId), context);
+  const submission = await handle.submit({ type: 'input', content: prompt, requestId }, context);
+  if (!existing) {
+    submission.wait(context).then(settled => emit({ event: 'turn_finished', turn: submission.id, data: {
+      status: settled.status === 'done' ? 'completed' : 'failed', checkpoint: settled.answer ?? null } }));
+  }
+  return { turn: submission.id, duplicate: existing?.id === submission.id };
+}
+
 const operations = {
   async create({ bot, workspace }) {
     return { conversation: (await create(bot, workspace)).id };
   },
   async submit({ bot, request_id, prompt }) {
-    const handle = await conversation(bot);
-    const existing = await handle.commit(tx => tx.submissionByRequest(handle.id, request_id), context);
-    const submission = await handle.submit({ type: 'input', content: prompt, requestId: request_id }, context);
-    if (!existing) {
-      submission.wait(context).then(settled => emit({ event: 'turn_finished', turn: submission.id, data: {
-        status: settled.status === 'done' ? 'completed' : 'failed', checkpoint: settled.answer ?? null } }));
+    // Requests run concurrently: a repeat of one still being submitted is
+    // its duplicate, and waits for it rather than racing its lookup.
+    const key = JSON.stringify([bot, request_id]);
+    const first = submitting.get(key);
+    if (first) return { turn: (await first).turn, duplicate: true };
+    const started = submit(bot, request_id, prompt);
+    submitting.set(key, started);
+    try {
+      return await started;
+    } finally {
+      submitting.delete(key);
     }
-    return { turn: submission.id, duplicate: existing?.id === submission.id };
   },
   async resume({ bot }) {
     const handle = await conversation(bot);

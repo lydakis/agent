@@ -2155,7 +2155,9 @@ view as it is. The first boundary after it lands installs it, after the
 results of the rounds it ran beside, so the view still changes only between
 calls. Until then neither stubs nor another summary change the view. The
 turn waits for it only when its view no longer fits the input limit, or
-when the turn ends or parks. An interrupt drops one still running like the
+when the turn ends or parks. Calls that may park the turn, a wait or a
+gated call, wait for it and install it before they run, so a turn resumed
+from that park never races its install. An interrupt drops one still running like the
 turn's own call; one that has landed is billed and installed as the turn
 ends. It runs beside only while the view and the reply's estimated size
 still fit the input limit and, beside what it holds, two model rounds (a

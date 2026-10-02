@@ -2091,6 +2091,32 @@ impl Turn {
                 }
                 return Ok(Round::Finished);
             }
+            // A wait or a gate may park the turn, and a turn resumed from
+            // a park must not race the install of a summary beside it:
+            // one is waited for and installed before such calls run.
+            let parks = response
+                .calls
+                .iter()
+                .any(|call| call.name == "wait" || record.gated(&call.name));
+            let mut installed = false;
+            if parks {
+                if beside.running() {
+                    beside.landed = beside.land().await;
+                }
+                if let Some(landed) = beside.landed.take() {
+                    installed = self
+                        .landed(
+                            landed,
+                            &mut record.tokens_used,
+                            &mut model_rounds,
+                            accounting,
+                        )
+                        .await?;
+                    if installed && capped.is_some() {
+                        self.steers.store(true, Relaxed);
+                    }
+                }
+            }
             // The cache's lifetime runs from the sending of the call that
             // read it, or of a refresh sent while its reply streamed.
             let read_at = accounting
@@ -2130,7 +2156,12 @@ impl Turn {
             if let Some(stop) = stop {
                 return Ok(stop.round());
             }
-            last = LastCall::of(&context, true);
+            // A summary installed since the call replaced the view it sent.
+            last = if installed {
+                None
+            } else {
+                LastCall::of(&context, true)
+            };
         }
         fail("tool_round_limit")
     }

@@ -207,7 +207,17 @@ class Model(http.server.BaseHTTPRequestHandler):
                          [int(lines) for part in spec.split(',')
                           for count, lines in [part.split('x')] for _ in range(int(count))])
                 text = ''
-                if done < len(sizes):
+                # With `long_wait`, the rounds end by starting that command
+                # in the background and waiting on it.
+                waited = getattr(self.server, 'long_wait', None)
+                named = {c['call_id'] for c in calls}
+                if done >= len(sizes) and waited and 'long-bg' not in named:
+                    output = [{'type': 'function_call', 'name': 'shell', 'call_id': 'long-bg',
+                               'arguments': json.dumps({'command': waited, 'timeout_ms': 5000, 'background': True})}]
+                elif done >= len(sizes) and waited and 'long-wait' not in named:
+                    output = [{'type': 'function_call', 'name': 'wait', 'call_id': 'long-wait',
+                               'arguments': json.dumps({'handles': [json.loads(last['output'])['handle']]})}]
+                elif done < len(sizes):
                     output = [{'type': 'function_call', 'name': 'shell', 'call_id': f'long-{done}',
                                'arguments': json.dumps({'command': f"seq -f 'round {done} line %g' 1 {sizes[done]}; echo {done} >> rounds.log",
                                                         'timeout_ms': 5000})}]

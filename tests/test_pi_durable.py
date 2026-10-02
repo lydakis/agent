@@ -3,6 +3,7 @@ serialization, pin checks, and (with the pinned adapter installed,
 AGENT_BENCH_TEST_PI_DURABLE=1) the adapter itself."""
 import json
 import os
+import queue
 from pathlib import Path
 import shutil
 import tempfile
@@ -113,6 +114,21 @@ class AdapterTests(unittest.TestCase):
             created_again = client.request('create', bot='alice', workspace=directory)['result']
             self.assertNotEqual(created_again['conversation'], created['conversation'])
             self.assertEqual(client.request('entry', bot='bob', entry=10**9)['error'], {'code': 'entry_not_found'})
+
+    def test_a_request_id_sent_twice_at_once_is_one_turn(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / '.local') as directory:
+            client = self.start(Path(directory) / 'state.sqlite')
+            client.request('create', bot='bob', workspace=directory)
+            for id in (101, 102):
+                client.process.stdin.write(json.dumps({'id': id, 'op': 'submit', 'bot': 'bob',
+                                                       'request_id': 'r1', 'prompt': 'hi'}) + '\n')
+            client.process.stdin.flush()
+            replies = [client.receive(lambda m, id=id: m.get('id') == id)['result'] for id in (101, 102)]
+            self.assertEqual(replies[0]['turn'], replies[1]['turn'])
+            self.assertEqual(sorted(r['duplicate'] for r in replies), [False, True])
+            client.finished(replies[0]['turn'])
+            with self.assertRaises(queue.Empty):
+                client.finished(replies[0]['turn'], timeout=1)
 
     def test_lifecycle_with_tools_restart_replay_duplicates_and_forks(self):
         config = dict(version=1, concurrency=2, turns=2, history_bytes=4096, chunks=4, chunk_bytes=256, chunk_delay_ms=25)
