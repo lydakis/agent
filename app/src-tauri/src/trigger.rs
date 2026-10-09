@@ -1084,15 +1084,17 @@ pub fn refresh(places: &Places, app: &Path, launchd: Loader) {
 /// results in `~/.agent/schedules`, added through `~/.agent/schedule`. Each
 /// becomes the trigger of its name once, its result kept; the old folder
 /// and script go. A schedule that cannot be read or whose name a trigger
-/// has is left where it is and said so. `running` is the schedule whose
-/// fire runs this, unloaded last since that ends this process.
-pub fn migrate(places: &Places, running: Option<&str>, launchd: Loader) {
+/// has is left where it is and said so. An old job's plist goes only once
+/// it is unloaded, so a failed unload is tried again. `running` is the
+/// schedule whose fire runs this: its unload ends this process, so it is
+/// left to the caller. Whether it was converted just now.
+pub fn migrate(places: &Places, running: Option<&str>, launchd: Loader) -> bool {
     let log = |error: String| eprintln!("{}", error_json(&error));
     let Some(home) = places.state.parent() else {
-        return;
+        return false;
     };
     let old_state = home.join("schedules");
-    let mut names: Vec<String> = std::fs::read_dir(&places.agents)
+    let names: Vec<String> = std::fs::read_dir(&places.agents)
         .into_iter()
         .flatten()
         .flatten()
@@ -1106,12 +1108,12 @@ pub fn migrate(places: &Places, running: Option<&str>, launchd: Loader) {
         })
         .filter(|name| valid_name(name).is_ok())
         .collect();
-    // The running one last: its unload ends this process.
-    names.sort_by_key(|name| Some(name.as_str()) == running);
     let Ok(_lock) = Lock::take(places) else {
-        return log("migration_failed: no trigger lock".into());
+        log("migration_failed: no trigger lock".into());
+        return false;
     };
     let mut done = Vec::new();
+    let mut converted_running = false;
     for name in names {
         let old = places.agents.join(format!("{SCHEDULE_LABEL}{name}.plist"));
         let Ok(text) = read_record(&old) else {
@@ -1128,7 +1130,10 @@ pub fn migrate(places: &Places, running: Option<&str>, launchd: Loader) {
                 &format!("<string>{FIRE_FLAG}</string>"),
                 1,
             );
-        if read_plist(&converted).is_none() {
+        // A plist renamed by hand names another trigger, or another job.
+        let names_it = read_plist(&converted).is_some_and(|(t, _)| t.name == name)
+            && converted.contains(&format!("<string>{LABEL}{name}</string>"));
+        if !names_it {
             log(format!(
                 "unconvertible: schedule {name} is left at {}",
                 old.display()
@@ -1151,6 +1156,7 @@ pub fn migrate(places: &Places, running: Option<&str>, launchd: Loader) {
                 log(error);
                 continue;
             }
+            converted_running |= Some(name.as_str()) == running;
         }
         let result = old_state.join(format!("{name}.json"));
         if result.exists()
@@ -1159,19 +1165,22 @@ pub fn migrate(places: &Places, running: Option<&str>, launchd: Loader) {
         {
             log(format!("{}: {e}", result.display()));
         }
-        if let Err(error) = forget(&old) {
-            log(error);
-        }
-        done.push(name);
+        done.push((name, old));
     }
     // Results of schedules that had ended, then the old folder and script.
+    // A schedule still there keeps its result.
     for e in std::fs::read_dir(&old_state)
         .into_iter()
         .flatten()
         .flatten()
     {
-        let to = places.state.join(e.file_name());
-        if e.file_name().to_string_lossy().ends_with(".json") && !to.exists() {
+        let file = e.file_name().to_string_lossy().into_owned();
+        let Some(name) = file.strip_suffix(".json") else {
+            continue;
+        };
+        let to = places.state.join(&file);
+        let kept = places.agents.join(format!("{SCHEDULE_LABEL}{name}.plist"));
+        if !to.exists() && !kept.exists() {
             let _ = std::fs::rename(e.path(), to);
         }
     }
@@ -1181,24 +1190,48 @@ pub fn migrate(places: &Places, running: Option<&str>, launchd: Loader) {
     if std::fs::read_to_string(&script).is_ok_and(|t| t.contains(" --schedule \"$@\"")) {
         let _ = forget(&script);
     }
-    for name in done {
-        if let Err(error) = unload(&format!("{SCHEDULE_LABEL}{name}"), launchd) {
+    for (name, old) in done {
+        let unloaded = Some(name.as_str()) == running
+            || unload(&format!("{SCHEDULE_LABEL}{name}"), launchd)
+                .map_err(log)
+                .is_ok();
+        if unloaded && let Err(error) = forget(&old) {
             log(error);
         }
     }
+    converted_running
 }
 
 /// `APP --schedule-fire ...`: a schedule an earlier app made fired before
-/// this app converted them. Its time is not sent; its trigger fires at the
-/// next one.
+/// this app converted them. Converted now, its trigger fires in its place;
+/// then its old job is unloaded, which ends this process.
 pub fn migrate_cli(args: &[String]) -> i32 {
-    let running = args
+    let Some(running) = args
         .iter()
         .position(|a| a == "--name")
-        .and_then(|i| args.get(i + 1));
-    match Places::home() {
-        Ok(places) => migrate(&places, running.map(String::as_str), &launchctl),
-        Err(error) => eprintln!("{}", error_json(&error)),
+        .and_then(|i| args.get(i + 1))
+    else {
+        return 0;
+    };
+    let places = match Places::home() {
+        Ok(places) => places,
+        Err(error) => {
+            eprintln!("{}", error_json(&error));
+            return 0;
+        }
+    };
+    let converted = migrate(&places, Some(running), &launchctl);
+    if converted {
+        fire_cli(args);
+    }
+    // Its plist gone, it is a trigger's now, or one it never was: it stops.
+    let old = places
+        .agents
+        .join(format!("{SCHEDULE_LABEL}{running}.plist"));
+    if !old.exists()
+        && let Err(error) = unload(&format!("{SCHEDULE_LABEL}{running}"), &launchctl)
+    {
+        eprintln!("{}", error_json(&error));
     }
     0
 }
@@ -2360,14 +2393,8 @@ mod tests {
             "#!/bin/sh\nexec '/A/agent-app' --schedule \"$@\"\n",
         )
         .unwrap();
-        // Run by p.b's own fire, whose unload is last: it ends the process.
-        let order = RefCell::new(Vec::new());
-        migrate(&places, Some("p.b"), &|x| {
-            if let Launchd::Unload(label) = &x {
-                order.borrow_mut().push(label.to_string());
-            }
-            w.fake.call(x)
-        });
+        // Run by p.b's own fire, whose unload ends the process: its caller's.
+        assert!(migrate(&places, Some("p.b"), &|x| w.fake.call(x)));
         assert_eq!(
             triggers(&places)
                 .into_iter()
@@ -2375,14 +2402,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             [b.clone(), a.clone()]
         );
-        assert_eq!(
-            w.fake.loaded.borrow().iter().cloned().collect::<Vec<_>>(),
-            [format!("{LABEL}p.b"), format!("{LABEL}p.fix-login")]
-        );
-        assert_eq!(
-            order.borrow().last().unwrap(),
-            &format!("{SCHEDULE_LABEL}p.b")
-        );
+        let loaded = |label: String| w.fake.loaded.borrow().contains(&label);
+        assert!(loaded(format!("{LABEL}p.b")) && loaded(format!("{LABEL}p.fix-login")));
+        assert!(!loaded(format!("{SCHEDULE_LABEL}p.fix-login")));
+        assert!(loaded(format!("{SCHEDULE_LABEL}p.b")));
         let rows = list(&places, None)["triggers"].clone();
         assert_eq!(rows.as_array().unwrap().len(), 3);
         assert_eq!(rows[0]["name"], "p.b");
@@ -2472,6 +2495,61 @@ mod tests {
                 .join(format!("{SCHEDULE_LABEL}p.ended.plist"))
                 .exists()
         );
+    }
+
+    #[test]
+    fn an_old_job_goes_only_once_unloaded_and_a_renamed_one_stays() {
+        let w = World::new("migrate-unload");
+        let home = w.root.join(".agent");
+        let places = Places {
+            agents: w.places.agents.clone(),
+            state: home.join("triggers"),
+        };
+        let old_state = home.join("schedules");
+        std::fs::create_dir_all(&old_state).unwrap();
+        std::fs::create_dir_all(&places.agents).unwrap();
+        let entries = every("1d", clock(2026, 9, 28, 9, 7)).unwrap().entries;
+        let old_plist = |s: &Trigger| {
+            plist(Path::new("/A/agent-app"), s, &entries, &[])
+                .replace(LABEL, SCHEDULE_LABEL)
+                .replace(FIRE_FLAG, SCHEDULE_FIRE_FLAG)
+        };
+        let old = |name: &str| places.agents.join(format!("{SCHEDULE_LABEL}{name}.plist"));
+        let a = trigger();
+        std::fs::write(old(&a.name), old_plist(&a)).unwrap();
+        w.fake
+            .loaded
+            .borrow_mut()
+            .insert(format!("{SCHEDULE_LABEL}{}", a.name));
+        // A plist renamed by hand: its file says p.renamed, its job p.other.
+        let other = Trigger {
+            name: "p.other".into(),
+            ..trigger()
+        };
+        std::fs::write(old("p.renamed"), old_plist(&other)).unwrap();
+        std::fs::write(old_state.join("p.renamed.json"), "{}").unwrap();
+        // The old job's unload fails: its plist stays for the next run.
+        migrate(&places, None, &|x| match x {
+            Launchd::Unload(label) if label.starts_with(SCHEDULE_LABEL) => {
+                Err("launchctl bootout: busy".into())
+            }
+            x => w.fake.call(x),
+        });
+        assert!(old(&a.name).exists());
+        assert_eq!(triggers(&places)[0].0, a);
+        migrate(&places, None, &|x| w.fake.call(x));
+        assert!(!old(&a.name).exists());
+        assert!(
+            !w.fake
+                .loaded
+                .borrow()
+                .contains(&format!("{SCHEDULE_LABEL}{}", a.name))
+        );
+        // The renamed one is no trigger and keeps its result.
+        assert!(old("p.renamed").exists());
+        assert!(!places.plist("p.renamed").exists() && !places.plist("p.other").exists());
+        assert!(old_state.join("p.renamed.json").exists());
+        assert!(!places.last("p.renamed").exists());
     }
 
     #[test]
