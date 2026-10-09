@@ -149,14 +149,26 @@ fn read(path: &Path) -> Result<Option<Vec<u8>>, String> {
 fn install_one(home: &Path, name: &str, files: &[(&str, &str)]) -> Result<(), String> {
     let dir = home.join(".agents/skills").join(name);
     let record = home.join(".agent/skills").join(name);
-    let mut stale = Vec::new();
+    // A folder of the skill's that is a link leads somewhere the app did not
+    // write, such as a checkout of yours, so the skill is yours.
+    let linked = |file: &Path, top: &Path| {
+        file.ancestors()
+            .skip(1)
+            .take_while(|folder| folder.starts_with(top))
+            .any(|folder| std::fs::symlink_metadata(folder).is_ok_and(|m| m.is_symlink()))
+    };
+    let (mut stale, mut repair) = (Vec::new(), Vec::new());
     for (file, text) in files {
         let (path, written) = (dir.join(file), record.join(file));
+        if linked(&path, &dir) || linked(&written, &record) {
+            return Ok(());
+        }
         let have = read(&path)?;
         if have.as_deref() == Some(text.as_bytes()) {
-            // Current already; a start that ended before the record still owns it.
+            // Current already; a start that ended before the record still
+            // owns it, once the rest of the skill proves to be the app's.
             if read(&written)?.as_deref() != Some(text.as_bytes()) {
-                crate::schedule::replace(&written, text)?;
+                repair.push((written, text));
             }
             continue;
         }
@@ -174,12 +186,19 @@ fn install_one(home: &Path, name: &str, files: &[(&str, &str)]) -> Result<(), St
     for file in recorded_files(&record)? {
         if files.iter().all(|(shipped, _)| *shipped != file) {
             let (path, written) = (dir.join(&file), record.join(&file));
+            if linked(&path, &dir) || linked(&written, &record) {
+                return Ok(());
+            }
             let have = read(&path)?;
             if have != read(&written)? {
                 return Ok(());
             }
             dropped.push((path, written));
         }
+    }
+    for (written, text) in repair {
+        crate::schedule::replace(&written, text)?;
+        settle(&written, home)?;
     }
     // Mine first, then the record, so a crash between them is fixed above.
     for (path, written, text) in stale {
@@ -387,6 +406,35 @@ mod tests {
         let error = install_one(&home, "x", &[]).unwrap_err();
         assert!(error.contains("more than"), "{error}");
         assert_eq!(std::fs::read_dir(&record).unwrap().count(), ENTRIES + 1);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_skill_folder_that_is_a_link_is_yours() {
+        let home = home("linked");
+        install_one(&home, "x", &[("SKILL.md", "old")]).unwrap();
+        let (dir, checkout) = (home.join(".agents/skills/x"), home.join("checkout"));
+        std::fs::rename(&dir, &checkout).unwrap();
+        std::os::unix::fs::symlink(&checkout, &dir).unwrap();
+        install_one(&home, "x", &[("SKILL.md", "new")]).unwrap();
+        install_one(&home, "x", &[]).unwrap();
+        let text = std::fs::read_to_string(checkout.join("SKILL.md")).unwrap();
+        assert_eq!(text, "old");
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_record_is_repaired_only_for_a_skill_that_is_still_the_apps() {
+        let home = home("repair");
+        let files = [("SKILL.md", "old"), ("run.py", "old")];
+        install_one(&home, "x", &files).unwrap();
+        let dir = home.join(".agents/skills/x");
+        // An update replaced SKILL.md and stopped; then you edited run.py.
+        std::fs::write(dir.join("SKILL.md"), "new").unwrap();
+        std::fs::write(dir.join("run.py"), "mine").unwrap();
+        install_one(&home, "x", &[("SKILL.md", "new"), ("run.py", "new")]).unwrap();
+        let record = home.join(".agent/skills/x/SKILL.md");
+        assert_eq!(std::fs::read_to_string(record).unwrap(), "old");
         std::fs::remove_dir_all(home).unwrap();
     }
 
