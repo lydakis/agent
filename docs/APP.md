@@ -1357,7 +1357,9 @@ and `cargo build -p agent-app`, `python3 -m unittest tests.test_trigger`
 fires triggers against a real daemon; on a Mac, `AGENT_TEST_LAUNCHD=1`
 adds its one launchd test, which loads real jobs (under a scratch `HOME`, so
 nothing loads at the next login) and checks that launchd fires a one-off,
-which ends itself, and that replace and `rm` work on real jobs.
+which ends itself, fires a file trigger on a write (the same `add` again
+being that trigger, a different one refused naming `when`), runs `fire`
+by name, and that `rm` removes a job whose plist or load is already gone.
 App tests also cover hosts over SSH against a stand-in
 `ssh` that runs the remote command here and forwards by linking: `~/.ssh/config`
 aliases, includes and quoting, `ssh -G` read to its bound, the ssh arguments, `agent start`'s answers, attaching
