@@ -582,8 +582,9 @@ class SocketAndCliTests(ModelFixture):
         kept = fork[:-4] + ['--bot', 'Kept', '--request-id', 'kept']
         made = json.loads(self.agent(*kept).stdout)
         self.agent('rm', '--store', str(self.store), '--bot', 'Once')
-        resent = json.loads(self.agent(*kept).stdout)
-        self.assertEqual((resent['id'], resent['duplicate']), (made['id'], True))
+        for flags in ([], ['--approval', 'full']):
+            resent = json.loads(self.agent(*kept, *flags).stdout)
+            self.assertEqual((resent['id'], resent['duplicate']), (made['id'], True))
 
     def test_retry_of_pruned_turn_exits_and_retained_retry_still_replays(self):
         self.agent('run', *self.common, '--new', '--bot', 'Bob', '--request-id', 'old', 'first')
