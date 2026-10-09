@@ -304,6 +304,15 @@ pub type Skill = Entry;
 /// and the Profiles index leaves it out.
 pub const CLIENT_ROLES: [&str; 3] = ["coordinator", "swarm-flat", "swarm-council"];
 
+/// Whether a profile file's stem is a client role. Case is ignored: on a
+/// case-insensitive filesystem (macOS's default) `Coordinator.md` is the
+/// file `profile(_, "coordinator")` reads.
+fn client_role(stem: &str) -> bool {
+    CLIENT_ROLES
+        .iter()
+        .any(|role| role.eq_ignore_ascii_case(stem))
+}
+
 /// Skills are folders `<name>/SKILL.md` in `<workspace>/.agents/skills`, then
 /// `~/.agents/skills`, the layout agentskills.io describes. Profiles are
 /// `<name>.md` files in `.agents/agents` in the same two places. The
@@ -338,7 +347,7 @@ impl Kind {
             Kind::Skills => Some(name.to_owned()),
             Kind::Profiles => name
                 .strip_suffix(".md")
-                .filter(|stem| profile_name(stem) && !CLIENT_ROLES.contains(stem))
+                .filter(|stem| profile_name(stem) && !client_role(stem))
                 .map(str::to_owned),
         }
     }
@@ -820,7 +829,7 @@ mod tests {
     fn a_clients_own_roles_are_read_but_not_offered_as_peer_roles() {
         let root = temp("client-roles");
         std::fs::create_dir_all(root.join(".agents/agents")).unwrap();
-        for name in CLIENT_ROLES.iter().chain(["reviewer"].iter()) {
+        for name in ["coordinator", "swarm-flat", "Swarm-Council", "reviewer"] {
             std::fs::write(
                 root.join(".agents/agents").join(format!("{name}.md")),
                 format!("---\ndescription: the {name}\n---\nBe the {name}.\n"),

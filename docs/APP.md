@@ -976,10 +976,12 @@ once every ten minutes, in one message queued to it: `Task updates:`, then
 one line per task with its latest ended turn's handle and status (or
 `waiting for approval`), who asked for it (`you` for the coordinator's own
 ask, a bot's name, or `the person`), and how many turns ended before it
-since which handle. Tasks whose turns only you asked for since the last
-message are listed last, under a line saying they are yours; the role tells
-the coordinator to leave them to you rather than check or correct them.
-A task with any other ask, or an approval, is listed first. The handles are what its
+since which handle. Turns you asked for in a task yourself are listed
+last, under a line saying they are yours; the role tells the coordinator to
+leave them to you rather than check or correct them. Turns anyone else asked
+for, and approvals, are listed first. Each list keeps its own first and
+latest handle and count per task, so a task in both is named in both, each
+time by the handle that list needs. The handles are what its
 `wait` tool reads a final reply by, so the message stays small however much
 was said. The page keeps only that per task (first and latest turn, a
 count), so a long coordinator turn or a failing daemon cannot grow it. One
@@ -992,8 +994,8 @@ otherwise answer in one line. A message that fails is kept for the next
 one, and one due while the window was detached goes out when it attaches
 again; a coordinator deleted, or gone when the window reattaches, has its
 dropped. The window must be open for it. The message's `request_id` is made
-from the coordinator's id and a hash of each task's newest turn, status and
-approval call ID. Separate approvals and completion in one turn are distinct,
+from the coordinator's id and a hash of each task's newest turn in each
+list, its status and approval call ID. Separate approvals and completion in one turn are distinct,
 while two windows with the same news make one turn: the daemon answers
 the second with the first, or with `idempotency_conflict` when that window
 counted from an earlier turn, which it takes as told. A task deleted before

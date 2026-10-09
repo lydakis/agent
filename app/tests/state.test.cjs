@@ -555,7 +555,7 @@ test('a task that ends live before the snapshot names its creator still reaches 
   assert.equal(p.S.live,true);assert.equal(p.S.wakes.size,0,'no creator known yet');
   snapshot.resolve({bots:[{name:'demo.lead',id:1,provider:'openai',model:'m'},{name:'demo.build',id:2,provider:'openai',model:'m',created_by:'demo.lead',created_by_id:1}],next_after:null});
   await attaching;
-  assert.deepEqual({...p.S.wakes.get('demo.lead').tasks.get('demo.build')},{first:4,turn:4,status:'completed',by:'the person',count:1});
+  assert.deepEqual({...p.S.wakes.get('demo.lead').tasks.get('demo.build').theirs},{first:4,turn:4,status:'completed',by:'the person',count:1});
   assert.equal(p.S.heldNews.length,0);
   // News held for a bot deleted meanwhile is not a later same-named bot's.
   p.S.heldNews.push(['demo.build',5,'completed',undefined]);p.forgetBot('demo.build');
@@ -2128,8 +2128,9 @@ test('a coordinator hears once, when it rests, of turns its tasks ended that it 
   assert.equal(sent.length, 1, 'one message for the whole batch');
   assert.equal(sent[0].bot, 'demo.lead'); assert.equal(sent[0].bot_id, 1); assert.equal(sent[0].delivery, 'queue'); assert.equal(sent[0].origin, 'tasks');
   assert.match(sent[0].prompt, /^Task updates: /);
-  // A task another bot asked of is the coordinator's; one only you worked in is listed last, as yours.
-  assert.match(sent[0].prompt, /\n- demo\.build: turn:demo\.build\/4 completed, asked by demo\.test, and 1 earlier since turn:demo\.build\/2\nThe person asked for these turns in the task themselves, so they are theirs:\n- demo\.test: turn:demo\.test\/1 failed, asked by the person$/);
+  // What another bot asked of a task is the coordinator's; what you asked is listed last, as yours,
+  // each by its own handle.
+  assert.match(sent[0].prompt, /\n- demo\.build: turn:demo\.build\/4 completed, asked by demo\.test\nThe person asked for these turns in the task themselves, so they are theirs:\n- demo\.build: turn:demo\.build\/2 completed, asked by the person\n- demo\.test: turn:demo\.test\/1 failed, asked by the person$/);
   // Within the window, while it works: nothing until its turn ends and the window allows. An ask of its
   // own that it did not wait for is news too.
   p.S.bots.get('demo.lead').status = 'running';
@@ -2148,18 +2149,18 @@ test('a coordinator hears once, when it rests, of turns its tasks ended that it 
   await p.tick();
   assert.equal(sent.length, 3);
   assert.match(sent[2].prompt, /\n- demo\.build: turn:demo\.build\/5 waiting for approval$/);
-  // Your later turn in a task the coordinator asked of keeps it the coordinator's.
+  // A coordinator's ask between two of yours keeps its own handle, in the list to act on.
   p.S.bots.get('demo.lead').status = 'running';
-  await turn('demo.test', 3, 'completed', 'demo.lead');
-  await turn('demo.test', 4);
+  await turn('demo.test', 3);
+  await turn('demo.test', 4, 'completed', 'demo.lead');
+  await turn('demo.test', 5);
   await p.onEvent({ event: 'turn_finished', bot: 'demo.lead', turn: 8, data: { status: 'completed' } });
   await p.tick();
   assert.equal(sent.length, 4);
-  assert.match(sent[3].prompt, /\n- demo\.test: turn:demo\.test\/4 completed, asked by the person, and 1 earlier since turn:demo\.test\/3$/);
-  assert.doesNotMatch(sent[3].prompt, /theirs/);
+  assert.match(sent[3].prompt, /\n- demo\.test: turn:demo\.test\/4 completed, asked by you\nThe person asked for these turns in the task themselves, so they are theirs:\n- demo\.test: turn:demo\.test\/5 completed, asked by the person, and 1 earlier since turn:demo\.test\/3$/);
   // A deleted coordinator hears nothing more.
   await p.onEvent({ event: 'deleted', bot: 'demo.lead' });
-  await turn('demo.test', 5);
+  await turn('demo.test', 6);
   await p.tick();
   assert.equal(sent.length, 4);
 });
@@ -2221,6 +2222,31 @@ test('two windows telling a coordinator the same news make one turn, and a bot g
   assert.equal(p.S.turnFrom.size, 0); assert.equal(p.S.wakes.size, 0);
 });
 
+test('a window that saw news to act on never defers to one that saw only yours', async () => {
+  const told = new Map();
+  const submit = async (op, params) => {
+    if (op !== 'submit') return {};
+    if (told.has(params.request_id) && told.get(params.request_id) !== params.prompt) throw new Error('idempotency_conflict: ');
+    told.set(params.request_id, params.prompt); return {};
+  };
+  const pages = [0, 1].map(() => page({ request: submit, log() {} }));
+  for (const [i, p] of pages.entries()) {
+    p.S.live = true; p.S.attached = true;
+    p.upsert({ name: 'demo.lead', id: 1, status: 'running' });
+    p.upsert({ name: 'demo.build', id: 2, status: 'idle', created_by: 'demo.lead', created_by_id: 1 });
+    // Only the first window saw the coordinator's ask; both see yours after it.
+    if (i === 0) {
+      await p.onEvent({ event: 'accepted', bot: 'demo.build', turn: 2, data: { node: 1, from: { bot: 'demo.lead', turn: 1 } } });
+      await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 2, data: { status: 'completed' } });
+    }
+    await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 3, data: { status: 'completed' } });
+    await p.onEvent({ event: 'turn_finished', bot: 'demo.lead', turn: 5, data: { status: 'completed' } });
+    await p.tick();
+  }
+  assert.equal(told.size, 2, 'different news, different turns');
+  assert.ok([...told.values()].some((prompt) => /\n- demo\.build: turn:demo\.build\/2 completed, asked by you\n/.test(prompt)));
+});
+
 test('approval calls and completion in one turn each reach the coordinator once across windows', async () => {
   const delivered = new Map(), attempts = [];
   const pages = [0, 1].map(() => page({ request: async (op, params) => {
@@ -2279,7 +2305,7 @@ test('a coordinator\'s backlog stays small however much its tasks do, and what o
   const w = p.S.wakes.get('demo.lead');
   assert.equal(w.tasks.size, 40);
   assert.equal(w.timer, null, 'nothing is armed while the coordinator works');
-  assert.deepEqual({ ...w.tasks.get('demo.t0') }, { first: 1, turn: 50, status: 'completed', by: 'the person', count: 50 });
+  assert.deepEqual({ ...w.tasks.get('demo.t0').theirs }, { first: 1, turn: 50, status: 'completed', by: 'the person', count: 50 });
   await p.onEvent({ event: 'turn_finished', bot: 'demo.lead', turn: 2, data: { status: 'completed' } });
   await p.tick();
   assert.equal(sent.length, 1);

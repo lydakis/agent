@@ -963,11 +963,12 @@ function enqueue(job) { chain = chain.then(job, job); return chain; }
 // tasks that ended turns or wait for an approval since it last heard, by the handles its wait tool reads
 // them with, and its role says what to do with that. A turn it is waiting on is not news, since its wait
 // reads it; nor is its own fork or side chat. Only live turns count, while this window is attached.
-// A task you alone asked for turns in is listed apart, as yours: the coordinator hears of it but is not
-// asked to act on it. Any other ask, or an approval, makes the task the coordinator's (`act`).
-// Each task keeps its first and latest turn and a count, whatever the backlog; one message names at most
-// WAKE_TASKS tasks, the coordinator's first, and the rest wait for the next.
-const WAKE_MS = 10 * 60 * 1000, WAKE_TASKS = 32;
+// Turns you asked for in a task yourself are its `theirs` news, listed apart: the coordinator hears of
+// them but is not asked to act on them. Turns anyone else asked for, and approvals, are its `act` news.
+// Each kind keeps its own first and latest turn and a count, whatever the backlog, so a task can be in
+// both lists with the handles each one needs; one message names at most WAKE_TASKS tasks, those with
+// news to act on first, and the rest wait for the next.
+const WAKE_MS = 10 * 60 * 1000, WAKE_TASKS = 32, KINDS = ['act', 'theirs'];
 function tellLead(name, turn, status, from, approval) {
   const b = bot(name), lead = b && creatorOf(b);
   if (!lead || !leadProject(lead.name) || name.startsWith(`${lead.name}-`)) return;
@@ -975,12 +976,17 @@ function tellLead(name, turn, status, from, approval) {
   let w = S.wakes.get(lead.name);
   if (!w) { w = { tasks: new Map(), last: 0, timer: null }; S.wakes.set(lead.name, w); }
   const by = status === 'waiting for approval' ? null : from === lead.name ? 'you' : from ?? 'the person';
-  merge(w.tasks, name, { first: turn, turn, status, by, count: 1, ...(approval ? { approval } : {}), ...(by === 'the person' ? {} : { act: true }) });
+  merge(w.tasks, name, { [by === 'the person' ? 'theirs' : 'act']: { first: turn, turn, status, by, count: 1, ...(approval ? { approval } : {}) } });
   wakeSoon(lead.name);
 }
-function merge(tasks, name, t) {
-  const had = tasks.get(name);
-  tasks.set(name, had ? { ...(t.turn >= had.turn ? t : had), first: Math.min(had.first, t.first), count: had.count + t.count, ...(had.act || t.act ? { act: true } : {}) } : t);
+function merge(tasks, name, news) {
+  const had = tasks.get(name) ?? {}, out = {};
+  for (const k of KINDS) {
+    const [a, t] = [had[k], news[k]];
+    const v = a && t ? { ...(t.turn >= a.turn ? t : a), first: Math.min(a.first, t.first), count: a.count + t.count } : a ?? t;
+    if (v) out[k] = v;
+  }
+  tasks.set(name, out);
 }
 // A working coordinator waits for its turn to end, which calls this again.
 function wakeSoon(lead) {
@@ -992,13 +998,16 @@ async function wake(lead) {
   const w = S.wakes.get(lead), l = bot(lead);
   if (!w || !w.tasks.size || !S.attached || !l || l.id == null || isActive(l.status)) return;
   const sent = [...w.tasks].sort(([, a], [, b]) => (b.act ? 1 : 0) - (a.act ? 1 : 0)).slice(0, WAKE_TASKS);
+  const items = sent.flatMap(([name, n]) => KINDS.filter((k) => n[k]).map((k) => [name, k, n[k]]));
   for (const [name] of sent) w.tasks.delete(name);
   w.last = Date.now();
-  // Key the latest notification per task, including its phase and approval
-  // call: one turn can need several approvals before its completion. Windows
-  // with the same news still deduplicate, regardless of earlier turn counts.
-  const prompt = wakeText(sent, w.tasks.size);
-  const id = `app-wake-${l.id}-${digest(JSON.stringify(sent.map(([name, t]) => [name, t.turn, t.status, t.approval ?? null]).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)))}`;
+  // Key the latest notification per task and kind, including its phase and
+  // approval call: one turn can need several approvals before its completion.
+  // Windows with the same news still deduplicate, regardless of earlier turn
+  // counts; a window that saw news of another kind sends its own message.
+  const prompt = wakeText(items, w.tasks.size);
+  const key = ([name, k]) => `${name}\u0000${k}`;
+  const id = `app-wake-${l.id}-${digest(JSON.stringify(items.map(([name, k, t]) => [name, k, t.turn, t.status, t.approval ?? null]).sort((a, b) => key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0)))}`;
   try { await Daemon.request('submit', { bot: lead, bot_id: l.id, request_id: id, prompt, delivery: 'queue', origin: 'tasks' }); }
   catch (e) {
     if (/^bot_not_found/.test(e?.message ?? '')) { S.wakes.delete(lead); return; }
@@ -1017,9 +1026,9 @@ function digest(text) {
   for (let i = 0; i < text.length; i++) h = BigInt.asUintN(64, (h ^ BigInt(text.charCodeAt(i))) * 0x100000001b3n);
   return h.toString(16).padStart(16, '0');
 }
-function wakeText(tasks, more) {
-  const line = ([name, t]) => `- ${name}: turn:${name}/${t.turn} ${t.status}${t.by ? `, asked by ${t.by}` : ''}${t.count > 1 ? `, and ${t.count - 1} earlier since turn:${name}/${t.first}` : ''}`;
-  const lines = tasks.filter(([, t]) => t.act).map(line), theirs = tasks.filter(([, t]) => !t.act).map(line);
+function wakeText(items, more) {
+  const line = ([name, , t]) => `- ${name}: turn:${name}/${t.turn} ${t.status}${t.by ? `, asked by ${t.by}` : ''}${t.count > 1 ? `, and ${t.count - 1} earlier since turn:${name}/${t.first}` : ''}`;
+  const lines = items.filter(([, k]) => k === 'act').map(line), theirs = items.filter(([, k]) => k === 'theirs').map(line);
   if (theirs.length) lines.push('The person asked for these turns in the task themselves, so they are theirs:', ...theirs);
   if (more) lines.push(`- ${more} more tasks in the next update`);
   return `Task updates: since you last heard, tasks you started ended turns or wait for an approval. The wait tool reads each one's final reply by its handle.\n${lines.join('\n')}`;
