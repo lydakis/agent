@@ -1427,7 +1427,21 @@ fn fork(options: &Options) -> Result<i32> {
     }
     // A fork keeps its source's tools and gates; its own gate adds to them.
     // Its approver starts first, so a missing judge leaves no fork behind.
-    let state = connection.request("resume", json!({"bot":source}))?;
+    let state = match connection.request("resume", json!({"bot":source})) {
+        // A keyed fork outlives its source: its resend is answered from the
+        // fork, so it needs nothing from the source.
+        Err(error)
+            if error.code == "bot_not_found"
+                && options.request_id.is_some()
+                && options.approval.is_none()
+                && options.approve.is_none() =>
+        {
+            let result = connection.request("fork", request)?;
+            print_json(&result, options.pretty)?;
+            return Ok(0);
+        }
+        state => state?,
+    };
     let mut auto = answered_by_auto(&state);
     if options.approval.as_deref().unwrap_or("full") != "full" || options.approve.is_some() {
         let tools: Vec<String> = serde_json::from_value(state["tools"].clone())

@@ -1951,9 +1951,15 @@ impl Service {
                 let name = bot.clone();
                 // Capture identity before spawning, but leave artifact deletion
                 // off the dispatch path so other clients are not held behind it.
-                let bot_id = store
-                    .op("inspect", move |db| Ok(db.inspect(&name)?.id))
-                    .await?;
+                // A named identity was just found under this name.
+                let bot_id = match bot_id {
+                    Some(id) => id,
+                    None => {
+                        store
+                            .op("inspect", move |db| Ok(db.inspect(&name)?.id))
+                            .await?
+                    }
+                };
                 let (store, hub, output) = (store.clone(), self.hub.clone(), output.clone());
                 let providers = self.providers.clone();
                 self.retention.spawn(async move {
@@ -1970,7 +1976,20 @@ impl Service {
                                         agent_runtime::store::Database::RETENTION_PIECE,
                                     )
                                 })
-                                .await?;
+                                .await;
+                            // A resent delete runs beside the first; whichever
+                            // takes the last piece, the other has nothing left.
+                            let piece = match piece {
+                                Err(error) if error.code == "bot_not_found" => {
+                                    let name = bot.clone();
+                                    if !store.op("gone", move |db| db.gone(&name, bot_id)).await? {
+                                        return Err(error);
+                                    }
+                                    deleted["duplicate"] = json!(true);
+                                    break;
+                                }
+                                piece => piece?,
+                            };
                             for key in ["turns", "events", "nodes"] {
                                 deleted[key] = json!(
                                     deleted[key].as_i64().unwrap_or(0)

@@ -1145,6 +1145,7 @@ impl Database {
             CREATE TABLE IF NOT EXISTS bot_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                 last_id INTEGER NOT NULL CHECK(last_id>=0));
             INSERT OR IGNORE INTO bot_sequence VALUES (1,0);
+            CREATE TABLE IF NOT EXISTS deleted_bots(id INTEGER PRIMARY KEY, name TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS store(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                 identity INTEGER NOT NULL);
             INSERT OR IGNORE INTO store VALUES (1,random());
@@ -3437,25 +3438,27 @@ impl Database {
             _ => Ok(id),
         }
     }
-    /// Whether identity `id`, named `name` by a delete, is already gone: it
-    /// was issued and no bot holds it now. Then a resent delete succeeds
-    /// without touching a later bot of the same name. An identity never
-    /// issued, or held by another name, is `bot_not_found`.
+    /// Whether identity `id`, named `name` by a delete, is already gone:
+    /// `name` held it and it was deleted. Then a resent delete succeeds
+    /// without touching a later bot of the same name. An identity `name`
+    /// never held is `bot_not_found`.
     pub fn gone(&self, name: &str, id: i64) -> Result<bool> {
         let held: Option<String> = self
             .conn
             .prepare_cached("SELECT name FROM bots WHERE id=?")?
             .query_row([id], |r| r.get(0))
             .optional()?;
-        let issued: i64 = self
-            .conn
-            .prepare_cached("SELECT last_id FROM bot_sequence WHERE singleton=1")?
-            .query_row([], |r| r.get(0))?;
-        match held {
-            Some(holder) if holder == name => Ok(false),
-            None if (1..=issued).contains(&id) => Ok(true),
-            _ => fail_with("bot_not_found", format!("{name} is not identity {id}")),
+        if held.as_deref() == Some(name) {
+            return Ok(false);
         }
+        let deleted: bool = self
+            .conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM deleted_bots WHERE id=? AND name=?)")?
+            .query_row(params![id, name], |r| r.get(0))?;
+        if deleted {
+            return Ok(true);
+        }
+        fail_with("bot_not_found", format!("{name} is not identity {id}"))
     }
     pub fn begin(
         &mut self,
@@ -6051,6 +6054,12 @@ impl Database {
             node = parent;
         }
         tx.execute("DELETE FROM events WHERE bot=?", [name])?;
+        // The identity's name outlives it, so a resent delete is told apart
+        // from a delete of some other identity.
+        tx.execute(
+            "INSERT INTO deleted_bots SELECT id,name FROM bots WHERE name=?",
+            [name],
+        )?;
         tx.execute("DELETE FROM bots WHERE name=?", [name])?;
         out["nodes"] = json!(freed);
         out["done"] = json!(true);

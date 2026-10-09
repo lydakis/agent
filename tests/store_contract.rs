@@ -10067,10 +10067,18 @@ fn a_deleted_identity_is_gone_and_a_later_namesake_is_not() {
     assert!(!db.gone("Bob", first.id).unwrap());
     while db.delete_bot_piece("Bob", first.id, 4).unwrap()["done"] != true {}
     let (second, _) = db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let (alice, _) = db.create("Alice", Some("/synthetic"), binding()).unwrap();
     assert!(db.gone("Bob", first.id).unwrap());
     assert!(!db.gone("Bob", second.id).unwrap());
-    // An identity never issued, or another bot's, is not this name's.
-    for (name, id) in [("Bob", second.id + 1), ("Other", second.id), ("Bob", 0)] {
+    // An identity never issued, another bot's, or one deleted under another
+    // name is not this name's.
+    for (name, id) in [
+        ("Bob", alice.id + 1),
+        ("Other", second.id),
+        ("Bob", 0),
+        ("Alice", first.id),
+        ("Other", first.id),
+    ] {
         assert_eq!(db.gone(name, id).unwrap_err().code, "bot_not_found");
     }
 }
@@ -10085,7 +10093,10 @@ fn schema_43_bots_were_made_without_a_key() {
     }
     Connection::open(&path)
         .unwrap()
-        .execute_batch("ALTER TABLE bots DROP COLUMN creation; PRAGMA user_version=43;")
+        .execute_batch(
+            "ALTER TABLE bots DROP COLUMN creation; DROP TABLE deleted_bots;
+             PRAGMA user_version=43;",
+        )
         .unwrap();
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     let keyed = || Binding {

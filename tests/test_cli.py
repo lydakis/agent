@@ -578,6 +578,12 @@ class SocketAndCliTests(ModelFixture):
         self.agent('fork', '--store', str(self.store), '--source', 'Once', '--bot', 'Side')
         self.assertTrue(json.loads(self.agent(*rm).stdout)['duplicate'])
         self.assertIn('Side', self.agent('ls', '--store', str(self.store), '--pretty').stdout)
+        # A keyed fork resent after its source is gone still gets the fork.
+        kept = fork[:-4] + ['--bot', 'Kept', '--request-id', 'kept']
+        made = json.loads(self.agent(*kept).stdout)
+        self.agent('rm', '--store', str(self.store), '--bot', 'Once')
+        resent = json.loads(self.agent(*kept).stdout)
+        self.assertEqual((resent['id'], resent['duplicate']), (made['id'], True))
 
     def test_retry_of_pruned_turn_exits_and_retained_retry_still_replays(self):
         self.agent('run', *self.common, '--new', '--bot', 'Bob', '--request-id', 'old', 'first')
