@@ -1141,16 +1141,24 @@ it tries again, backing off to once a minute. `add` finds the agent's
 newest event cursor without a daemon change by bisecting `events {bot,
 after, limit: 1}` (an indexed lookup each, about 2·log2 of the cursor), and
 the watcher keeps where it is per trigger in `~/.agent/triggers/NAME.watch`,
-written only when that agent ends a turn: a restart replays from there, so
-no turn end is missed or counted twice. A turn end that counts writes the
-`fire` note with why and starts the trigger's own fire, the arguments its
-plist holds, in its own process group (and the job abandons its group), so restarting the watcher never
-ends a fire still waiting on `--reply-to`; one whose last fire still runs
-is skipped and logged. A turn a trigger sent says so in its `request_id`
+written only when that agent ends a turn, and for one that fires only once
+the fire is handed over: a restart replays from there, so no turn end is
+missed. A turn end that counts writes the `fire` note with why and starts
+the trigger's own fire, the arguments its plist holds, in its own process
+group (and the job abandons its group), so restarting the watcher never
+ends a fire still waiting on `--reply-to`. A fire holds a lock on its own
+plist while it runs; another fire of it waits for that one, and the one
+running sends once more for a note left while it ran, so a turn end during
+a long fire is sent after it, and several are sent once. A trigger a fire
+ended itself (its runs, its agent gone) is no longer followed once that
+fire exits. Events retention removed before the watcher read them are
+turn ends not counted; the trigger's last result says so
+(`events_pruned`). A turn a trigger sent says so in its `request_id`
 (`trigger_GENERATION_...`, a name's characters, so the generation and not
 the trigger's name), which is how the watcher tells its own turns apart.
-An agent deleted, or its name now another agent's (a `created` event with
-another id), ends its turn-end triggers as `gone`. Once none is left the
+An agent deleted (the `deleted` event, or found gone on connecting), or its
+name now another agent's (a `created` event with another id), ends its
+turn-end triggers as `gone`. Once none is left the
 watcher exits 0 and launchd leaves it stopped. A turn-end trigger's own
 plist has no calendar or watched path, so launchd runs it only for `fire`.
 

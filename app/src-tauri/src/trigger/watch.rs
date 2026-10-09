@@ -41,6 +41,9 @@ enum Step {
     Fire(usize, String),
     /// Its agent is gone: it ends.
     Gone(usize, String),
+    /// Retention removed events it had not read: turn ends went uncounted,
+    /// which its last result says.
+    Gap(usize, String),
 }
 
 /// The `request_id`s of turns triggers sent, by agent and turn, from their
@@ -60,10 +63,35 @@ fn step(watched: &mut [Watched], sent: &mut Sent, event: &Value) -> Vec<Step> {
                 (event["turn"].as_i64(), event["data"]["request_id"].as_str())
                 && id.starts_with("trigger_")
             {
+                // An agent runs one turn at a time, so this holds about one
+                // per agent followed; past the bound, the oldest turns go,
+                // whose ends were lost with a connection.
                 if sent.len() >= MAX_SENT {
-                    sent.clear();
+                    let mut turns: Vec<i64> = sent.keys().map(|(_, t)| *t).collect();
+                    turns.sort_unstable();
+                    let oldest = turns[MAX_SENT / 2];
+                    sent.retain(|(_, t), _| *t >= oldest);
                 }
                 sent.insert((bot.to_owned(), turn), id.to_owned());
+            }
+        }
+        // Deleted while followed: its triggers end.
+        "deleted" => {
+            for (i, w) in watched.iter_mut().enumerate() {
+                if !w.done && w.source() == bot {
+                    w.done = true;
+                    steps.push(Step::Gone(i, format!("bot_not_found: {bot} was deleted")));
+                }
+            }
+        }
+        "pruned" => {
+            let before = event["before"].as_i64().unwrap_or(0);
+            for (i, w) in watched.iter().enumerate() {
+                if !w.done && w.source() == bot && w.cursor.is_none_or(|c| c + 1 < before) {
+                    steps.push(Step::Gap(i, format!(
+                        "events_pruned: turn ends of {bot} before event {before} were removed before they were read, and not counted"
+                    )));
+                }
             }
         }
         // The name is another agent's now: the one it was made for is gone.
@@ -171,7 +199,10 @@ pub fn watch_cli() -> i32 {
 async fn follow(places: Places, socket: PathBuf, store: String, mut watched: Vec<Watched>) {
     let log = |error: String| eprintln!("{}", error_json(&error));
     let mut sent = Sent::new();
-    let mut fires = HashMap::<String, tokio::task::JoinHandle<()>>::new();
+    let mut fires = Fires::new();
+    // A fire that ended its own trigger (its runs, its agent gone) says so
+    // here when it exits, so nothing is followed for it after.
+    let (exited, mut exits) = tokio::sync::mpsc::unbounded_channel::<String>();
     let mut wait = Duration::from_secs(1);
     loop {
         if watched.iter().all(|w| w.done) {
@@ -200,9 +231,20 @@ async fn follow(places: Places, socket: PathBuf, store: String, mut watched: Vec
             tokio::time::sleep(MAX_WAIT).await;
             continue;
         }
-        while let Some(event) = events.recv().await {
-            for step in step(&mut watched, &mut sent, &event) {
-                act(&places, &mut watched, &mut fires, step);
+        loop {
+            tokio::select! {
+                event = events.recv() => {
+                    let Some(event) = event else { break };
+                    for step in step(&mut watched, &mut sent, &event) {
+                        act(&places, &mut watched, &mut fires, &exited, step);
+                    }
+                }
+                Some(name) = exits.recv() => {
+                    for w in watched.iter_mut().filter(|w| !w.done && w.trigger.name == name) {
+                        let there = read_trigger(&places.plist(&name)).ok().map(|(t, _)| t);
+                        w.done = there.as_ref() != Some(&w.trigger);
+                    }
+                }
             }
             if watched.iter().all(|w| w.done) {
                 break;
@@ -255,10 +297,14 @@ async fn begin(places: &Places, client: &Client, watched: &mut [Watched]) -> Res
     Ok(())
 }
 
+/// The fire each trigger last started, until it exits.
+type Fires = HashMap<String, tokio::task::JoinHandle<()>>;
+
 fn act(
     places: &Places,
     watched: &mut [Watched],
-    fires: &mut HashMap<String, tokio::task::JoinHandle<()>>,
+    fires: &mut Fires,
+    exited: &tokio::sync::mpsc::UnboundedSender<String>,
     step: Step,
 ) {
     let log = |error: String| eprintln!("{}", error_json(&error));
@@ -275,9 +321,19 @@ fn act(
                 &launchctl,
             );
         }
+        Step::Gap(i, detail) => {
+            let trigger = &watched[i].trigger;
+            let gap = json!({"outcome": "failed", "detail": detail});
+            settle(
+                places,
+                trigger,
+                &gap,
+                &Kept::of(&state(places, trigger)),
+                &launchctl,
+            );
+        }
         Step::Fire(i, why) => {
             let w = &mut watched[i];
-            save(places, w);
             let name = w.trigger.name.clone();
             // Ended, by its runs or `rm`, or replaced: no longer this trigger.
             let there = read_trigger(&places.plist(&name)).ok().map(|(t, _)| t);
@@ -285,14 +341,15 @@ fn act(
                 w.done = true;
                 return;
             }
-            // Its last fire still runs, as on a long `--reply-to` wait.
-            if fires.get(&name).is_some_and(|fire| !fire.is_finished()) {
-                return log(format!(
-                    "trigger_busy: {name}: its last fire still runs; {why} skipped"
-                ));
-            }
+            // Where it is goes on disk only once the fire is handed over: a
+            // watcher stopped before then reads this turn end again.
             if let Err(error) = replace(&places.asked(&name), &format!("{}\n{why}", now())) {
                 return log(error);
+            }
+            // Its last fire still runs, as on a long `--reply-to` wait: it
+            // finds the note when it is done, or the fire waiting on it does.
+            if fires.get(&name).is_some_and(|fire| !fire.is_finished()) {
+                return save(places, w);
             }
             // Its own process group: restarting the watcher leaves it running.
             let spawned = tokio::process::Command::new(&w.app)
@@ -303,10 +360,13 @@ fn act(
                 .spawn();
             match spawned {
                 Ok(mut child) => {
+                    save(places, w);
+                    let exited = exited.clone();
                     fires.insert(
-                        name,
+                        name.clone(),
                         tokio::spawn(async move {
                             let _ = child.wait().await;
+                            let _ = exited.send(name);
                         }),
                     );
                 }
@@ -585,6 +645,63 @@ mod tests {
         );
         assert!(w[0].done);
         assert_eq!(step(&mut w, &mut sent, &ended("p.task", 1, 31)), vec![]);
+    }
+
+    #[test]
+    fn its_agent_deleted_while_followed_ends_it() {
+        let mut w = vec![
+            watched("t", "p.task", None, 0),
+            watched("u", "p.other", None, 0),
+        ];
+        let mut sent = Sent::new();
+        let deleted = json!({"bot": "p.task", "event": "deleted", "durable": false});
+        assert_eq!(
+            step(&mut w, &mut sent, &deleted),
+            vec![Step::Gone(0, "bot_not_found: p.task was deleted".into())]
+        );
+        assert!(w[0].done && !w[1].done);
+    }
+
+    #[test]
+    fn events_pruned_before_it_read_them_are_said_not_counted() {
+        let mut w = vec![
+            watched("t", "p.task", None, 10),
+            watched("u", "p.task", None, 40),
+        ];
+        let mut sent = Sent::new();
+        let pruned = json!({"bot": "p.task", "event": "pruned", "before": 30, "durable": false});
+        let steps = step(&mut w, &mut sent, &pruned);
+        assert!(matches!(&steps[..], [Step::Gap(0, why)] if why.starts_with("events_pruned:")));
+    }
+
+    #[test]
+    fn its_own_turns_stay_its_own_however_many_turns_run() {
+        let mut w = vec![watched("t", "p.task", None, 0)];
+        let mut sent = Sent::new();
+        let own = sent_by(&w[0].trigger);
+        step(
+            &mut w,
+            &mut sent,
+            &accepted("p.task", 1, 1, &format!("{own}x")),
+        );
+        // Many other agents' turns, whose ends were lost, come and go.
+        for turn in 2..(MAX_SENT as i64 * 3) {
+            step(
+                &mut w,
+                &mut sent,
+                &accepted("p.other", turn, turn, "trigger_other_x"),
+            );
+            assert!(sent.len() <= MAX_SENT);
+        }
+        step(
+            &mut w,
+            &mut sent,
+            &accepted("p.task", 5000, 5000, &format!("{own}y")),
+        );
+        assert_eq!(
+            step(&mut w, &mut sent, &ended("p.task", 5000, 5001)),
+            vec![Step::Save(0)]
+        );
     }
 
     #[test]

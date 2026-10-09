@@ -1330,26 +1330,29 @@ pub fn fire_now(places: &Places, name: &str, launchd: Loader) -> Result<Value, S
 /// (empty for `fire`); the note goes either way. It is `EPOCH`, then the why
 /// on the next line.
 fn take_asked(places: &Places, name: &str) -> Option<String> {
+    take_note(places, name, |at| (now() - at).abs() <= ASKED_WITHIN)
+}
+
+/// The note, gone once read, and its why, when `fresh` takes its time.
+fn take_note(places: &Places, name: &str, fresh: impl Fn(i64) -> bool) -> Option<String> {
     let path = places.asked(name);
     let text = std::fs::read_to_string(&path).ok();
     let _ = forget(&path);
     let text = text?;
     let (at, why) = text.split_once('\n').unwrap_or((&text, ""));
     let at = at.trim().parse::<i64>().ok()?;
-    ((now() - at).abs() <= ASKED_WITHIN).then(|| why.trim().to_owned())
+    fresh(at).then(|| why.trim().to_owned())
 }
 
 /// Held by a fire while it runs, on its own plist: a second fire of the
-/// same trigger, from launchd or the watcher, does nothing. A fire without
-/// a plist (a test's) runs unheld.
-fn running(places: &Places, name: &str) -> Option<Option<std::fs::File>> {
-    let Ok(file) = std::fs::File::open(places.plist(name)) else {
-        return Some(None);
-    };
+/// same trigger, from launchd or the watcher, waits for it, and then finds
+/// only what that one's own loop left. A fire without a plist (a test's)
+/// runs unheld.
+fn running(places: &Places, name: &str) -> Option<std::fs::File> {
+    let file = std::fs::File::open(places.plist(name)).ok()?;
     use std::os::fd::AsRawFd;
     // SAFETY: flock on a descriptor this function owns.
-    let held = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
-    held.then_some(Some(file))
+    (unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0).then_some(file)
 }
 
 /// What a fire leaves for the next: messages sent, the agent it started,
@@ -2273,22 +2276,22 @@ pub fn fire_cli(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let Some(_running) = running(&places, &trigger.name) else {
-        return 0;
-    };
+    let _running = running(&places, &trigger.name);
     fires(&places, &trigger.name, |asked| {
         fire(&places, &trigger, asked)
     });
     0
 }
 
-/// Fire, and again for each `fire NAME`, or turn end, asked while it ran:
-/// a second fire finds this one's lock and leaves the note to it.
+/// Fire, and again for each `fire NAME`, or turn end, asked while it ran.
+/// One asked while it ran is this fire's however long it ran (a fire can
+/// wait a day); one asked before it started was read at its start.
 fn fires(places: &Places, name: &str, mut fire: impl FnMut(Option<String>)) {
     let mut asked = take_asked(places, name);
     loop {
+        let started = now();
         fire(asked);
-        asked = take_asked(places, name);
+        asked = take_note(places, name, |at| at >= started);
         if asked.is_none() {
             return;
         }
@@ -3220,6 +3223,17 @@ mod tests {
         fires(&w.places, &s.name, |asked| {
             if seen.is_empty() {
                 fire_now(&w.places, &s.name, &|x| w.fake.call(x)).unwrap();
+            }
+            seen.push(asked);
+        });
+        assert_eq!(seen, [None, Some(String::new())]);
+        // However long that fire ran; but not one older than its start.
+        let mut seen = Vec::new();
+        fires(&w.places, &s.name, |asked| {
+            if seen.is_empty() {
+                replace(&w.places.asked(&s.name), &(now() + 3600).to_string()).unwrap();
+            } else if seen.len() == 1 {
+                replace(&w.places.asked(&s.name), &(now() - 3600).to_string()).unwrap();
             }
             seen.push(asked);
         });
