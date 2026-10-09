@@ -1405,7 +1405,10 @@ class RuntimeTests(ModelFixture):
         client.process.stdin.write(json.dumps({'id': 'copy', 'op': 'fork', 'source': 'Bob', 'bot': 'other',
                                                'instructions': 'Other.'}) + '\n')
         client.process.stdin.flush()
-        self.assertEqual(client.receive(lambda m: 'error' in m and m.get('id') is None)['error'], 'invalid_json')
+        # Valid JSON of the wrong shape names its field and keeps its id.
+        refused = client.receive(lambda m: 'error' in m and m.get('id') == 'copy')
+        self.assertEqual(refused['error'], 'invalid_request')
+        self.assertIn('instructions', refused['detail'])
         self.assertEqual(client.request('resume', bot='other')['error'], 'bot_not_found')
 
     def test_a_running_bot_forks_at_its_newest_finished_round(self):

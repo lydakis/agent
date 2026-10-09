@@ -3001,9 +3001,10 @@ fn calls_left(record: &agent_runtime::store::Bot, model_rounds: usize) -> bool {
 }
 
 fn budget_error(budget: Option<u64>, used: u64) -> Option<Error> {
-    budget
-        .filter(|&cap| used >= cap)
-        .map(|cap| Error::with("budget_exhausted", format!("{used} of {cap} tokens used")))
+    budget.filter(|&cap| used >= cap).map(|cap| {
+        Error::with("budget_exhausted", format!("{used} of {cap} tokens used"))
+            .facts(json!({"budget_tokens":cap,"tokens_used":used}))
+    })
 }
 
 /// Failures of the provider's pace, capacity, or transport, none of which say

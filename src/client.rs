@@ -511,9 +511,15 @@ impl Connection {
 }
 
 fn ensure_existing_daemon(options: &Options) -> Result<Connection> {
-    // Inspection must never initialize a replacement store for a missing one.
+    // A command on existing bots must never initialize a replacement store.
     if !options.store.is_file() {
-        return fail("store_not_found");
+        return fail_with(
+            "store_not_found",
+            format!(
+                "no store at {}; this command never creates one",
+                options.store.display()
+            ),
+        );
     }
     ensure_daemon(options)
 }
@@ -1360,12 +1366,21 @@ fn ways_past_busy(bot: &str, error: Error) -> Error {
     };
     let fork =
         format!("; to ask without interrupting, fork --source {bot} --bot NEW and send it to NEW");
-    // The daemon's own detail names request fields; this says the same in flags.
+    // The daemon's own detail names request fields; at the CLI the detail
+    // states the refusal and the hint gives the ways past it in flags.
     let stated = match running {
         Some(turn) => format!("turn {turn} is running"),
         None => "earlier work is waiting".to_owned(),
     };
-    Error::with("bot_busy", format!("{stated}; {join}{fork}"))
+    let mut error = Error {
+        detail: Some(stated),
+        ..error
+    };
+    error
+        .facts
+        .get_or_insert_default()
+        .insert("hint".into(), json!(format!("{join}{fork}")));
+    error
 }
 
 fn follow(options: &Options) -> Result<i32> {
@@ -1465,8 +1480,7 @@ fn interrupt(options: &Options) -> Result<i32> {
     let mut connection = Connection::connect(&options.socket)?;
     let state = connection.request("resume", json!({"bot":bot}))?;
     let Some(turn) = state["running_turn"].as_i64() else {
-        eprintln!("agent: {bot} has no running turn");
-        return Ok(1);
+        return fail_with("no_active_turn", format!("{bot} has no running turn"));
     };
     connection.request("interrupt", json!({"bot":bot,"turn":turn}))?;
     Ok(0)
@@ -1852,8 +1866,12 @@ impl Renderer {
             // Retained and running turns still finish through normal events.
             let handle = format!("turn:{}/{turn}", event["bot"].as_str().unwrap_or(""));
             let found = connection.request("wait", json!({"handles":[&handle],"timeout_ms":0}))?;
-            if let Some(code) = found["results"][&handle]["error"].as_str() {
-                return Err(Error::new(code));
+            let result = &found["results"][&handle];
+            if let Some(code) = result["error"].as_str() {
+                return Err(Error {
+                    detail: result["detail"].as_str().map(Into::into),
+                    ..Error::new(code)
+                });
             }
         }
         let finished =

@@ -284,20 +284,20 @@ fn admission_reconciles_retries_without_accepting_fresh_work_at_capacity() {
         .unwrap();
     assert!(!retry.fresh);
     assert_eq!(retry.turn, turn);
-    assert_eq!(
-        db.begin(
+    // The refusal names the field that differs from the first request.
+    let changed = db
+        .begin(
             "Bob",
             "same",
             "changed",
             false,
             &TurnOptions::default(),
-            allow_provider
+            allow_provider,
         )
         .err()
-        .unwrap()
-        .code,
-        "idempotency_conflict"
-    );
+        .unwrap();
+    assert_eq!(changed.code, "idempotency_conflict");
+    assert_eq!(changed.facts.unwrap()["field"], "prompt");
     assert_eq!(
         db.begin(
             "Other",
@@ -811,10 +811,9 @@ fn a_deny_decides_the_call_and_later_answers_are_refused() {
     // Neither verdict nor reason is kept once the call is denied.
     for (allow, reason) in [(true, None), (false, Some(long.as_str()))] {
         let late = answer(&mut db, "second", allow, reason);
-        assert_eq!(
-            late.err().map(|e| e.to_string()).as_deref(),
-            Some("approval_already_answered")
-        );
+        let late = late.err().unwrap();
+        assert_eq!(late.code, "approval_already_answered");
+        assert_eq!(late.facts.unwrap()["decision"], "deny");
     }
     assert!(matches!(
         db.approval_start(turn, &call, 0).unwrap(),

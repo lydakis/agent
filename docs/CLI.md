@@ -147,7 +147,7 @@ running and `shutdown` fails with `daemon_protocol_mismatch`.
 
 `--pretty` is an explicit human view: rendered streams, tables for lists, and
 indented JSON for other results, including detached submission handles. It is
-rejected on commands with no output. Diagnostics go to stderr. Rendered model
+rejected on commands with no output. Diagnostics and failures go to stderr. Rendered model
 text and tool output keep their line breaks and tabs; any other character a
 terminal would act on is printed escaped, so a stream cannot hide or restyle a
 call waiting for approval.
@@ -169,6 +169,19 @@ stdout is not a terminal.
 
 The recording is `run --pretty` against the offline playground, replayed in
 xterm.js with a small OSC 7501 handler that draws the tab's mark.
+
+A failure prints one JSON object on stderr, the shape the daemon answers with:
+`error` is the code, `detail` states the rule that was broken, and any other
+field is a fact about the current state, named as a request field (such as
+`running_turn`, `bot_id`, `levels` or `field`). When the CLI can say how to get
+past the refusal in its own flags, it adds `hint`. With `--pretty` the failure
+is one line instead: `agent: CODE: DETAIL`, followed by `; HINT` when there is
+one. Usage errors use the same object with `error` set to `usage`.
+
+```json
+{"error":"bot_busy","detail":"turn 4 is running","running_turn":4,"fork_point":9,
+ "hint":"resend with --delivery steer --turn 4 to add this to it, or --delivery queue to run it afterwards; ..."}
+```
 
 | Exit | Meaning |
 | --- | --- |

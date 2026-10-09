@@ -4,7 +4,7 @@
 //! from a store-wide cursor, so a fleet controller needs one subscription.
 //! A session serving a gate tag receives only the calls announced for it.
 use agent_runtime::{
-    Result, fail,
+    Error, Result, fail,
     output::Output,
     store::{Served, Store},
 };
@@ -303,7 +303,14 @@ impl Hub {
         if let Some(held) = inner.approvers.get(tag) {
             let held = held.lock().unwrap();
             if !held.expired(now) {
-                return fail("approvals_served");
+                // Only a started lease that is not mid-answer runs out.
+                let left = (held.started && !held.answering)
+                    .then(|| held.deadline.saturating_duration_since(now).as_millis() as u64);
+                return Err(Error::with(
+                    "approvals_served",
+                    format!("another session serves {tag} until it lets go or its lease runs out"),
+                )
+                .facts(json!({"tag":tag,"lease_left_ms":left})));
             }
         }
         // Leases that ran out go now, whichever tag they held, so tags

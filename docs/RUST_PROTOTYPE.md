@@ -847,7 +847,11 @@ remain available through replay if the drain deadline is reached.
 Requests include a string or nonnegative integer `id`. Responses carry the same
 `id` and either `result` or an explicit `error` code with optional `detail`.
 A refusal a program acts on also carries its facts as fields beside them:
-`bot_busy` from `submit` reports `running_turn` and `fork_point`.
+`bot_busy` from `submit` reports `running_turn` and `fork_point`, and
+`invalid_reasoning_level` lists the model's `levels`. A line that is not JSON
+is `invalid_json` with a null `id`; JSON of the wrong shape is
+`invalid_request`, answered with its `id` when that parses, and its detail
+names the unknown or ill-typed field.
 Notifications carry `event`; durable ones carry `cursor`, `bot`, `turn`, and
 `data`, in exactly the shape `events` replays them. Durable events reach
 followers in commit order: the storage worker itself hands each group's
@@ -1153,9 +1157,10 @@ fields returns the bot it made, with `duplicate: true` and no `cursor`, and
 writes nothing; a fork's resend is answered from the fork even after its source
 moved or was deleted. The same key with any field changed is
 `idempotency_conflict`, naming the field in `detail` and `field`. A name taken
-by an unkeyed creation or another key is `bot_exists`. Once the bot a key made
-is deleted, any request with that name and key is `bot_deleted`, with the
-deleted bot's `bot_id`, and never makes the bot again. Their replies are the
+by an unkeyed creation or another key is `bot_exists`, with the holder's
+`bot_id`. Once the bot a key made is deleted, any request with that name and
+key is `bot_deleted`, with the deleted bot's `bot_id`, and never makes the bot
+again. Their replies are the
 bot record (`name`, `id`, ...) plus `duplicate`. `delete` takes an optional
 `bot_id`: resent while the first deletion runs or after it finished, it
 succeeds with `duplicate: true`, and an identity that name never held is

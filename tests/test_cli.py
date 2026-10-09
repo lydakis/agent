@@ -73,7 +73,8 @@ class SocketAndCliTests(ModelFixture):
         self.assertIn('openai/synthetic-model', listing)
         duplicate = self.agent('run', *self.common, '--new', '--bot', 'Bob', 'hello', check=False)
         self.assertEqual(duplicate.returncode, 1)
-        self.assertIn('bot_exists', duplicate.stderr)
+        exists = json.loads(duplicate.stderr)
+        self.assertEqual((exists['error'], exists['bot_id']), ('bot_exists', 1))
         # A bot keeps its folder wherever it is invoked from; --workspace moves it.
         elsewhere = self.path / 'elsewhere'
         elsewhere.mkdir()
@@ -133,6 +134,7 @@ class SocketAndCliTests(ModelFixture):
         for bad in ('-1', '86401', 'soon'):
             usage = self.agent('shutdown', '--store', str(self.store), '--grace', bad, check=False)
             self.assertEqual(usage.returncode, 2, usage.stderr)
+            self.assertEqual(json.loads(usage.stderr)['error'], 'usage')
         threading.Timer(.3, self.model.release_headers.set).start()
         self.agent('shutdown', '--store', str(self.store), '--grace', '5')
         self.assertFalse(self.socket.exists())
@@ -199,7 +201,14 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual(busy['status'], 'running')
         refused = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', 'never', check=False)
         self.assertEqual(refused.returncode, 1)
-        self.assertIn('bot_busy', refused.stderr + refused.stdout)
+        # A failure is one JSON object on stderr: the daemon's fields, and a
+        # hint in flags.
+        busy_error = json.loads(refused.stderr)
+        self.assertEqual((busy_error['error'], busy_error['running_turn']), ('bot_busy', busy['turn']))
+        self.assertIn('hint', busy_error)
+        pretty = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', '--pretty', 'never',
+                            check=False)
+        self.assertRegex(pretty.stderr, r'^agent: bot_busy: turn \d+ is running; resend with --delivery')
         # The refusal gives flags to copy, not a description of them, and the
         # fork it offers works while the turn runs.
         for flags in (f"--delivery steer --turn {busy['turn']}", '--delivery queue'):
@@ -300,7 +309,9 @@ class SocketAndCliTests(ModelFixture):
         # A level the model's family does not take is refused before the bot exists.
         refused = self.agent('run', *self.common, '--reasoning', 'max', '--new', '--bot', 'Max', 'hi', check=False)
         self.assertEqual(refused.returncode, 1)
-        self.assertIn('invalid_reasoning_level', refused.stderr + refused.stdout)
+        level = json.loads(refused.stderr)
+        self.assertEqual(level['error'], 'invalid_reasoning_level')
+        self.assertIn('xhigh', level['levels'])
         # On an existing bot a level is that turn's alone, as --model is.
         for name in ('Alice', 'Carol', 'Dan'):
             turn = json.loads(self.agent('turns', '--store', str(self.store), '--bot', name).stdout)[-1]['turn']
@@ -429,7 +440,8 @@ class SocketAndCliTests(ModelFixture):
         # The daemon checks each setting's range and creates nothing it refuses.
         small = self.agent('run', *self.common, '--context-bytes', '512', '--new', '--bot', 'Small', 'hi', check=False)
         self.assertEqual(small.returncode, 1)
-        self.assertIn('invalid_setting: context_bytes is at least 1024', small.stderr)
+        self.assertEqual(json.loads(small.stderr), {'error': 'invalid_setting',
+                                                    'detail': 'context_bytes is at least 1024'})
         self.assertEqual(control.request('resume', bot='Small')['error'], 'bot_not_found')
         refused = self.agent('stats', '--store', str(self.store), '--idle-exit', '1', check=False)
         self.assertIn('daemon_configuration_mismatch', refused.stderr)
@@ -564,7 +576,8 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual((again['bot_id'], again['turn'], again['duplicate']),
                          (first['bot_id'], first['turn'], True))
         changed = self.agent(*run[:-1], 'goodbye', check=False)
-        self.assertIn('idempotency_conflict', changed.stderr)
+        self.assertEqual(json.loads(changed.stderr)['error'], 'idempotency_conflict')
+        self.assertEqual(json.loads(changed.stderr)['field'], 'prompt')
         other = self.agent(*run[:-4], '--request-id', 'twice', '--detach', 'hello', check=False)
         self.assertIn('bot_exists', other.stderr)
         self.agent('wait', '--store', str(self.store), first['handle'])
