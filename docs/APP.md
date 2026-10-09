@@ -962,7 +962,9 @@ names the handle, so its `wait` reads the reply) or the bot is the
 coordinator's own fork or side chat (`PROJECT.lead-…`). A turn of such a
 task that starts waiting for an approval (`turn_waiting` with `approval`)
 counts too, since only you can give it; the coordinator's role raises it
-to you. A
+to you. The agents of a [workflow](WORKFLOWS.md) the coordinator runs are
+named `PROJECT.lead-RUN.LABEL`, so they count as its own too: the run
+reports to it once, when it ends. A
 steer's turn is part of the turn it joined. Turns replayed on attach are
 history, not news; one that ends live while the window is still reading the
 list of bots is held until the list says who made its bot, and dropped if the bot is
@@ -993,6 +995,17 @@ while two windows with the same news make one turn: the daemon answers
 the second with the first, or with `idempotency_conflict` when that window
 counted from an earlier turn, which it takes as told. A task deleted before
 its news goes out is dropped from it.
+
+## Skills the app ships
+
+Each start writes the skills the app ships into `~/.agents/skills`, where
+every agent composed with its policy finds them: today
+[workflow](../app/skills/workflow/SKILL.md), which runs many fresh agents
+from a plan script ([WORKFLOWS.md](WORKFLOWS.md)). A `.shipped` file in the
+folder records a hash of what the app wrote. A newer app replaces the
+folder only while that hash still matches, so an edited skill is yours and
+stays as you left it; a folder of the same name the app did not write is
+never touched, and a deleted one comes back at the next start.
 
 ## Schedules
 
@@ -1311,10 +1324,14 @@ in, queued and read back, unlinked once its name holds a new agent, and the
 app's own task updates and schedules by origin), and runs
 folded with failures on their line. Also covers coordinator task updates: batched at rest, excluding requested and replayed turns, retained after send failures.
 `cargo test -p agent-app` includes a failed project-file write leaving
-neither a partial file nor a temporary, and schedules' calendars, plists,
+neither a partial file nor a temporary, a shipped skill written, updated and
+left alone once edited, and schedules' calendars, plists,
 move, and each lifecycle step with launchd refusing. With `AGENT_TEST_RUNTIME=1` after a release build
 and `cargo build -p agent-app`, `python3 -m unittest tests.test_schedule`
-fires schedules against a real daemon; on a Mac, `AGENT_TEST_LAUNCHD=1`
+fires schedules against a real daemon and `python3 -m unittest
+tests.test_workflow` runs workflows (fan-out, schema retries, resuming,
+stopping, a daemon restart, and a lead that starts a run detached and hears
+back once); on a Mac, `AGENT_TEST_LAUNCHD=1`
 adds its one launchd test, which loads real jobs (under a scratch `HOME`, so
 nothing loads at the next login) and checks that launchd fires a one-off,
 which ends itself, and that replace and `rm` work on real jobs.

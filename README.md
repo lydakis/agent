@@ -132,6 +132,12 @@ up to the filesystem root, plus `~/.agents/AGENTS.md`, and indexes of skills
 in `.agents/skills/` and profiles in `.agents/agents/`. `--profile ROLE`
 starts a bot in one of those roles. See [client policy](docs/CLIENT.md).
 
+For work with many pieces, a bot can write a plan script instead: the
+[workflow skill](app/skills/workflow/SKILL.md) runs it outside the bot's turn,
+starts a fresh bot per piece, combines their replies in code, and reports
+back once. The app installs it; elsewhere, copy `app/skills/workflow` into
+`~/.agents/skills/`. See [workflows](docs/WORKFLOWS.md).
+
 ## Fork from an earlier point
 
 Try an alternative without losing the original conversation:

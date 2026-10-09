@@ -1,0 +1,113 @@
+# Workflows
+
+A workflow is a plan script an agent writes and a runner executes outside the
+agent's turn. Each `agent()` call in the plan starts a fresh bot with a clean
+context, the plan passes what they return from one to the next in code, and
+the agent that started the run hears back once, when the plan ends. It ships
+as a skill, [app/skills/workflow](../app/skills/workflow/SKILL.md), with no
+daemon or CLI change.
+
+## Why
+
+Claude Managed Agents put the same idea in public beta as "dynamic workflows"
+(Claude Devs on X, 2026-10-09; docs read the same day:
+`platform.claude.com/docs/en/managed-agents/workflow-runs`). A lead writes a
+program that runs many agents in phases; results move between them
+programmatically, and the lead is not woken per worker. Anthropic reports a
+planted-bug test where a single agent found 14 to 27 of 70 bugs and a
+workflow found 66 in each of three runs. That is their claim, with no
+published method; nothing here reproduces it.
+
+Two findings in this project point the same way. Scripting tool calls cut
+input tokens 10 to 17 times against one model call per step (the code-mode
+evaluation, 2026-09-29, on George's Mac). And a coordinator is woken for
+every task that ends a turn, which costs it a turn each time. A workflow
+moves fan-out, routing and counting into code the model writes once.
+
+## How it works
+
+`workflow.py start PLAN.py --name NAME` runs the plan with these defined:
+`agent()`, `parallel()`, `pipeline()`, `phase()`, `log()`; the plan sets
+`result`. SKILL.md is the reference an agent reads.
+
+- **An agent is a bot.** `agent()` runs `agent run --new --detach --no-spawn`
+  with the prompt on stdin, composed with `--agents` unless the plan names a
+  profile or instructions. Inside a bot's shell the CLI declares that bot as
+  the creator and its turn as the prompt's author, as it does for any peer.
+  A lead's agents are named `LEAD-NAME.LABEL`, under the lead's name like its
+  forks and side chats, which the app leaves out of a coordinator's task
+  updates (the run reports instead). Without a lead, `NAME.LABEL`.
+- **One connection waits for all of them.** The runner reads the daemon's
+  socket from `agent start` and sends one `wait` request per agent's turn on
+  a single connection; the daemon answers each when that turn ends, with its
+  status and final text (16 KiB at most). A connection lost to a daemon
+  restart is reopened and the pending waits sent again, since handles are
+  durable; meanwhile commands wait for the daemon instead of starting one.
+- **Detached, and only detached.** A bot starts a run with the shell tool's
+  `detach: true`, so the run outlives the call and holds a detached slot,
+  not a process slot. The runner refuses to start in a bot's foreground or
+  background shell (`detach_required`): the daemon would kill it when the
+  call returns. The CLI refuses a blocking `wait` anywhere in a tool shell,
+  detached ones included, because in the foreground it would hold a process
+  slot; the runner sends the protocol's `wait` itself, which holds only its
+  connection.
+- **Reporting once.** At the end the runner queues one message to the lead
+  (`run --detach --delivery queue`, pinned by `--bot-id`): status, counts,
+  tokens used, the result up to 8 KiB, and the run folder.
+- **Schemas.** With `schema`, the prompt asks for a bare JSON value; the
+  reply is parsed and checked (type, enum, required, properties, items) and
+  sent back to the same bot with what was wrong, `retries` times.
+- **Failures stay in place.** An agent that fails returns a `Result` with
+  `ok` false; an exception inside `parallel` or `pipeline` becomes one. Only
+  a stop, the timeout or `--max-agents` ends a run early, as a
+  `BaseException` a plan's `except Exception` does not catch.
+- **The record.** `~/.agent/workflows/NAME/` holds `run.json` (state now,
+  written at most every 250 ms), `events.jsonl` (an event per phase, agent
+  start and end, and log line), `result.json` and `log`.
+- **Resuming.** Starting the same plan with the same `--name` reads
+  `events.jsonl`: a labelled agent whose prompt and settings hash the same
+  and finished `ok` is reused without a model call, one still running when
+  the last runner ended is waited on again, and others get a new bot
+  (`LABEL.2`). Labels made up by the runner follow call order, which threads
+  make unstable, so only labelled agents are reliably reused.
+- **Stopping.** `workflow.py stop NAME` sends the runner SIGTERM; it
+  interrupts every running agent and ends `stopped`. The timeout (default
+  24 h) does the same, ending `failed` with `timeout`.
+- **No nesting.** An agent of a running run cannot start one.
+
+## Cost
+
+Synthetic Responses model (`bench/synthetic_model.py`), release build,
+Linux container, 4 x86_64 cores, Python 3.13, 2026-10-09, `python3 -m
+bench.workflow_overhead`. The `workflow` arm runs the plan; the `direct` arm
+does the same commands from a bare loop with one connection, so the
+difference is the runner's own bookkeeping. Two rounds each, order
+alternated.
+
+| Agents, at once, reply delay | Arm | Wall | Runner CPU | `agent` CLI CPU | Runner peak RSS | Daemon CPU |
+| --- | --- | --- | --- | --- | --- | --- |
+| 200, 64, 500 ms | workflow | 2.19, 2.28 s | 0.37, 0.39 s | 0.56, 0.54 s | 23.2, 23.7 MiB | 0.47, 0.48 s |
+| 200, 64, 500 ms | direct | 2.17, 2.17 s | 0.30, 0.31 s | 0.51, 0.53 s | 23.4, 23.6 MiB | 0.48, 0.46 s |
+| 1,000, 64, none | workflow | 2.64, 2.86 s | 1.69, 1.82 s | 2.62, 2.63 s | 36.9, 37.0 MiB | 1.91, 2.07 s |
+| 1,000, 64, none | direct | 2.56, 2.55 s | 1.14, 1.17 s | 2.64, 2.62 s | 35.3, 35.5 MiB | 1.89, 1.84 s |
+
+Per agent, the runner adds about 0.6 ms of CPU over the bare loop; the
+`agent run` process it starts costs about 2.6 ms, and the daemon about 2 ms.
+With 200 agents of 500 ms in waves of 64, the run finished 0.19 to 0.28 s
+after the 2.0 s the waves alone take. Peak RSS is the Python process with a
+thread per item, 37 MiB at 1,000. These hold for this workload and host
+only; macOS is not measured.
+
+## Gaps
+
+- **No run-wide token budget.** Each agent can have one (`budget_tokens`,
+  `--agent-budget-tokens`), which the daemon enforces. A run total needs each
+  agent's usage while it runs; the turn view in the CLI plan (C3) brings it.
+- **The app lists each agent under its lead.** A run is one row with phases
+  in the new UI's plans, not yet.
+- **A process per agent.** `agent run` composes instructions client-side,
+  which the runner reuses rather than reimplementing; it is the largest
+  per-agent cost above.
+- **Text only, 16 KiB.** Larger outputs go to files named in the reply.
+- **Real-model value is unmeasured.** The swarm comparison (flat, council,
+  single lead, workflow) on George's Mac is where that gets measured.

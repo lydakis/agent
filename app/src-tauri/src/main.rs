@@ -18,6 +18,7 @@ mod remote;
 mod schedule;
 mod session;
 mod settings;
+mod skills;
 mod swarm;
 mod worktree;
 
@@ -1199,6 +1200,11 @@ fn main() {
         }
         if let Some(state) = home.parent()
             && let Err(error) = schedule::write_script(state, &app)
+        {
+            eprintln!("agent-app: {error}");
+        }
+        if let Some(user) = std::env::var_os("HOME")
+            && let Err(error) = skills::install(std::path::Path::new(&user))
         {
             eprintln!("agent-app: {error}");
         }
