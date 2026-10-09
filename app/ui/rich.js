@@ -74,13 +74,14 @@ window.Rich = (() => {
         // A table past 256 columns or 10,000 cells shows as its source: a short row is padded to
         // the header's width, so a few bytes a row can ask for millions of cells.
         table(token) { return token.header.length > COLUMNS || token.header.length * (token.rows.length + 1) > CELLS ? block(token.raw.replace(/\n+$/, ''), '') : false; },
-        // A link to a path opens that file beside, from the agent's folder.
-        link({ href, title, tokens }) { const inner = this.parser.parseInline(tokens), t = title ? ` title="${esc(title)}"` : ''; return linkable(href) ? `<a href="${esc(href)}"${t}>${inner}</a>` : filePath(href) ? `<a class="file" data-file="${esc(filePath(href))}"${t}>${inner}</a>` : inner; },
+        // A link to a path opens that file beside, from the agent's folder; its `#` href lets Tab and
+        // Enter reach it, and the click handler keeps it from navigating.
+        link({ href, title, tokens }) { const inner = this.parser.parseInline(tokens), t = title ? ` title="${esc(title)}"` : ''; return linkable(href) ? `<a href="${esc(href)}"${t}>${inner}</a>` : filePath(href) ? `<a class="file" href="#" data-file="${esc(filePath(href))}"${t}>${inner}</a>` : inner; },
         // An image draws only from data the message carries, and only on a click: a small PNG can
         // decode to hundreds of megabytes and an animated one takes CPU for as long as it shows.
         // A remote image is a link and a local one opens beside, so drawing a message fetches
         // nothing a model chose.
-        image: ({ href, text }) => /^data:image\/(png|gif|jpe?g|webp)[;,]/i.test(href ?? '') ? `<button type="button" class="img" data-img="${esc(href)}" title="${esc(text)}">image${text ? `: ${esc(text)}` : ''}</button>` : linkable(href) ? `<a href="${esc(href)}">${esc(text || href)}</a>` : filePath(href) ? `<a class="file" data-file="${esc(filePath(href))}">${esc(text || href)}</a>` : esc(text),
+        image: ({ href, text }) => /^data:image\/(png|gif|jpe?g|webp)[;,]/i.test(href ?? '') ? `<button type="button" class="img" data-img="${esc(href)}" title="${esc(text)}">image${text ? `: ${esc(text)}` : ''}</button>` : linkable(href) ? `<a href="${esc(href)}">${esc(text || href)}</a>` : filePath(href) ? `<a class="file" href="#" data-file="${esc(filePath(href))}">${esc(text || href)}</a>` : esc(text),
       },
     });
     return md;
@@ -318,8 +319,9 @@ window.Rich = (() => {
     const cell = (tag) => (c) => `<${tag}>${esc(c)}</${tag}>`;
     return `${rows.more ? `<div class="line note">showing the first ${rows.length - 1} rows</div>` : ''}<div class="md"><table><thead><tr>${(rows[0] ?? []).map(cell('th')).join('')}</tr></thead><tbody>${rows.slice(1).map((r) => `<tr>${r.map(cell('td')).join('')}</tr>`).join('')}</tbody></table></div>`;
   }
+  // `waited` says the view is code that highlighting, once loaded, would draw differently.
   function file(path, bytes, more = false) {
-    spent = 0;
+    spent = 0; waited = false;
     const ext = extOf(path), note = more ? `<div class="line note">showing the first ${Math.round(bytes.length / 1048576)} MiB</div>` : '';
     if (IMAGE[ext]) {
       if (more) return { html: '<div class="line note">image too large to show</div>' };
@@ -328,10 +330,11 @@ window.Rich = (() => {
     }
     if (bytes.subarray(0, 8000).includes(0)) return { html: `<div class="line note">binary file · ${bytes.length}${more ? '+' : ''} bytes</div>` };
     const text = new TextDecoder().decode(bytes);
-    if (ext === 'md' || ext === 'markdown') return { html: `${note}<div class="md">${html(text)}</div>` };
+    if (ext === 'md' || ext === 'markdown') return { html: `${note}<div class="md">${html(text)}</div>`, waited };
     if (ext === 'csv' || ext === 'tsv') return { html: note + table(text, ext === 'csv' ? ',' : '\t') };
     const lang = { mmd: 'mermaid', mermaid: 'mermaid', vl: 'vega-lite', vg: 'vega', htm: 'html', html: 'html', svg: 'svg' }[ext] ?? ext;
-    return { html: note + `<div class="md">${block(text, lang, true)}</div>` };
+    const out = block(text, lang, true);
+    return { html: note + `<div class="md">${out}</div>`, waited: waited && out.startsWith('<div class="rc" data-kind="code"') };
   }
   let openFile = () => {}, failed = () => {};
 

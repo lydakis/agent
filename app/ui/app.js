@@ -1543,16 +1543,19 @@ function dropFile() {
 // The chat it covered is on screen again, and what it finished meanwhile is seen.
 function closeFile() { if (dropFile()) { render(); markSeen(); focusInput(S.ui.side ? 'side' : 'main'); } }
 function renderFile() {
-  const f = S.ui.file, key = `file|${f.full}|${f.gen}|${Rich.version}`, el = $('side');
+  const f = S.ui.file, el = $('side');
+  // Drawn when read, and again when highlighting arrives for code that waited for it; a page,
+  // diagram or chart beside keeps running as it is.
+  if (f.state === 'ok' && (f.at !== f.gen || (f.waited && f.ver !== Rich.version))) {
+    if (f.url) URL.revokeObjectURL(f.url);
+    const shown = Rich.file(f.full, f.bytes, f.more);
+    Object.assign(f, { view: shown.html, url: shown.url ?? null, waited: shown.waited, at: f.gen, ver: Rich.version });
+  }
+  const key = `file|${f.full}|${f.gen}|${f.ver}`;
   if (el.dataset.key === key) return;
   const name = f.full.split('/').pop(), where = dirOf(f.full).replace(/^\/(Users|home)\/[^/]+/, '~');
   $('sidetitle').dataset.k = key;
   $('sidetitle').innerHTML = `<div class="crumbs"><b>${esc(name)}</b><span class="branch" title="${esc(f.full)}">${esc(where)}</span></div><div class="tools"><button type="button" class="ibtn" data-act="close-file" title="Close (Esc)" aria-label="Close">✕</button></div>`;
-  // Drawn when read, and again when highlighting arrives.
-  if (f.state === 'ok' && f.at !== `${f.gen}|${Rich.version}`) {
-    if (f.url) URL.revokeObjectURL(f.url);
-    const shown = Rich.file(f.full, f.bytes, f.more); f.view = shown.html; f.url = shown.url ?? null; f.at = `${f.gen}|${Rich.version}`;
-  }
   el.innerHTML = `<div class="fview">${f.state === 'loading' ? '<div class="line pending">reading…</div>' : f.state === 'error' ? `<div class="line out bad">${esc(f.error)}</div>` : f.view}</div>`;
   el.dataset.key = key; el.dataset.who = ''; el.scrollTop = 0;
   // A chart fills the pane's width, so it is measured once the pane has finished opening.

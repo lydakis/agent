@@ -169,7 +169,7 @@ test('fenced blocks become code, previews, diagrams and images by their language
   const png = Rich.html('![dot](data:image/png;base64,iVBORw0KGgo=)');
   assert.doesNotMatch(png, /<img/);
   assert.match(png, /<button type="button" class="img" data-img="data:image\/png;base64,iVBORw0KGgo=" title="dot">image: dot<\/button>/);
-  assert.match(Rich.html('![flow](docs/flow.png)'), /<a class="file" data-file="docs\/flow.png">flow<\/a>/);
+  assert.match(Rich.html('![flow](docs/flow.png)'), /<a class="file" href="#" data-file="docs\/flow.png">flow<\/a>/);
   assert.match(Rich.html('![r](https://example.com/r.png)'), /<a href="https:\/\/example.com\/r.png">r<\/a>/);
 });
 
@@ -256,6 +256,16 @@ test('a file opened while the side pane opens is drawn once the pane has its wid
   assert.equal(hydrated, 1);
 });
 
+test('highlighting arriving redraws a file beside only when its code waited for it', () => {
+  const p = page(), c = p.context, R = c.Rich, enc = (s) => new TextEncoder().encode(s); let v = 0, files = 0;
+  c.Rich = { file: (...a) => { files++; return R.file(...a); }, get version() { return v; }, hydrate() {} };
+  const show = (full, text) => { p.S.ui.file = { bot: 'Bob', full, gen: 2, state: 'ok', bytes: enc(text), more: false, url: null }; p.renderFile(); };
+  show('/w/page.html', '<p>hi</p>'); assert.equal(files, 1);
+  v = 1; p.renderFile(); assert.equal(files, 1);
+  show('/w/a.rs', 'fn a() {}'); assert.equal(files, 2);
+  v = 2; p.renderFile(); assert.equal(files, 3);
+});
+
 test('a name starting with a tilde is the folder\'s; only ~/ is home', () => {
   const p = page();
   assert.equal(p.joinPath('/w', '~notes.md'), '/w/~notes.md');
@@ -280,7 +290,7 @@ test('charts, file links and opened files draw by kind', () => {
   assert.match(Rich.file('/w/c.vl.json', new TextEncoder().encode('{}')).html, /data-kind="chart" data-lang="vega-lite" data-lazy data-run/);
   assert.match(Rich.html('```vega\n{}\n```'), /data-lang="vega"/);
   const links = Rich.html('[plan](PLAN.md) [code](src/a.rs:12) [line](src/b.rs#L4-L9) [web](https://example.com) [here](#top)');
-  assert.match(links, /<a class="file" data-file="PLAN.md">plan<\/a>/);
+  assert.match(links, /<a class="file" href="#" data-file="PLAN.md">plan<\/a>/);
   assert.match(links, /data-file="src\/a.rs">code/);
   assert.match(links, /data-file="src\/b.rs">line/);
   // A section of another file opens that file; a `#` in a name is written `%23`.
