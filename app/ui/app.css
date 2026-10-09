@@ -103,6 +103,8 @@ button:focus-visible,[tabindex]:focus-visible{outline:1px solid var(--amber);out
 .md th,.md td{border:1px solid var(--t-line);padding:2px 1ch;text-align:left;vertical-align:top}
 .md th{background:var(--t-panel);font-weight:600}
 .md img{max-width:100%}
+.md button.img{font:inherit;color:var(--user);background:none;border:1px dashed var(--t-faint);border-radius:3px;padding:0 6px;cursor:pointer}
+.md button.img:hover{color:var(--amber);border-color:var(--amber)}
 /* A fenced block: its language and actions above, then the code, or what the code draws. */
 .rc{margin:6px 0 10px;border:1px solid var(--t-line);border-radius:6px;background:var(--t-panel);overflow:hidden}
 .pane.side .rc{background:var(--t-bg)}

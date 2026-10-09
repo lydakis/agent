@@ -64,9 +64,11 @@ window.Rich = (() => {
         code: ({ text, lang }) => block(text, lang),
         // A link to a path opens that file beside, from the agent's folder.
         link({ href, title, tokens }) { const inner = this.parser.parseInline(tokens), t = title ? ` title="${esc(title)}"` : ''; return linkable(href) ? `<a href="${esc(href)}"${t}>${inner}</a>` : filePath(href) ? `<a class="file" data-file="${esc(filePath(href))}"${t}>${inner}</a>` : inner; },
-        // Images in the page itself only from data the message carries; a remote one is a link,
-        // so nothing a model writes fetches a URL when it is drawn.
-        image: ({ href, text }) => /^data:image\/(png|gif|jpe?g|webp)[;,]/i.test(href ?? '') ? `<img src="${esc(href)}" alt="${esc(text)}">` : linkable(href) ? `<a href="${esc(href)}">${esc(text || href)}</a>` : esc(text),
+        // An image draws only from data the message carries, and only on a click: a small PNG can
+        // decode to hundreds of megabytes and an animated one takes CPU for as long as it shows.
+        // A remote image is a link and a local one opens beside, so drawing a message fetches
+        // nothing a model chose.
+        image: ({ href, text }) => /^data:image\/(png|gif|jpe?g|webp)[;,]/i.test(href ?? '') ? `<button type="button" class="img" data-img="${esc(href)}" title="${esc(text)}">image${text ? `: ${esc(text)}` : ''}</button>` : linkable(href) ? `<a href="${esc(href)}">${esc(text || href)}</a>` : filePath(href) ? `<a class="file" data-file="${esc(filePath(href))}">${esc(text || href)}</a>` : esc(text),
       },
     });
     return md;
@@ -231,6 +233,8 @@ window.Rich = (() => {
   function click(e) {
     const f = e.target.closest?.('[data-file]');
     if (f) { e.preventDefault(); openFile(f.dataset.file, f); return true; }
+    const im = e.target.closest?.('button.img[data-img]');
+    if (im) { const img = document.createElement('img'); img.src = im.dataset.img; img.alt = im.title; im.replaceWith(img); return true; }
     const a = e.target.closest?.('.md a[href]');
     if (a) { e.preventDefault(); if (linkable(a.getAttribute('href'))) open(a.getAttribute('href')); return true; }
     const b = e.target.closest?.('[data-rich]'); if (!b) return false;

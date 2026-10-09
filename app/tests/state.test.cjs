@@ -165,6 +165,12 @@ test('fenced blocks become code, previews, diagrams and images by their language
   assert.doesNotMatch(svg.split('<pre')[0], /<svg/);
   assert.match(Rich.file('/w/a.svg', new TextEncoder().encode('<svg/>')).html, /data-kind="svg" data-view="view"/);
   assert.doesNotMatch(Rich.html('![x](data:image/svg+xml,%3Csvg%2F%3E)'), /<img/);
+  // A raster image the message carries draws on a click; a local one opens beside; a remote one is a link.
+  const png = Rich.html('![dot](data:image/png;base64,iVBORw0KGgo=)');
+  assert.doesNotMatch(png, /<img/);
+  assert.match(png, /<button type="button" class="img" data-img="data:image\/png;base64,iVBORw0KGgo=" title="dot">image: dot<\/button>/);
+  assert.match(Rich.html('![flow](docs/flow.png)'), /<a class="file" data-file="docs\/flow.png">flow<\/a>/);
+  assert.match(Rich.html('![r](https://example.com/r.png)'), /<a href="https:\/\/example.com\/r.png">r<\/a>/);
 });
 
 test('charts, file links and opened files draw by kind', () => {
