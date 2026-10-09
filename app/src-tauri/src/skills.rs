@@ -21,25 +21,33 @@ pub fn install(home: &Path) -> Vec<String> {
         .collect()
 }
 
+/// More than any skill the app ships; a longer file is not one of its copies.
+const MAX: u64 = 256 * 1024;
+
 fn install_one(home: &Path, name: &str, text: &str) -> Result<(), String> {
     let path = home.join(".agents/skills").join(name).join("SKILL.md");
     let written = home.join(".agent/skills").join(format!("{name}.md"));
-    let read = |path: &Path| match std::fs::read_to_string(path) {
-        Ok(text) => Ok(Some(text)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("{}: {error}", path.display())),
+    // At most MAX + 1 bytes, so a huge file costs no more than a mismatch.
+    let read = |path: &Path| {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        match std::fs::File::open(path).and_then(|f| f.take(MAX + 1).read_to_end(&mut bytes)) {
+            Ok(_) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("{}: {error}", path.display())),
+        }
     };
     let have = read(&path)?;
-    if have.as_deref() == Some(text) {
+    if have.as_deref() == Some(text.as_bytes()) {
         // Current already; a start that ended before the record still owns it.
-        if read(&written)?.as_deref() != Some(text) {
+        if read(&written)?.as_deref() != Some(text.as_bytes()) {
             crate::schedule::replace(&written, text)?;
         }
         return Ok(());
     }
-    let last = read(&written)?;
-    // Removed or edited since the app wrote it: yours.
-    if last.is_some() && have != last {
+    // Only a file the app wrote and nobody changed since is the app's: one
+    // that was there first, was edited, or was removed is yours.
+    if have != read(&written)? {
         return Ok(());
     }
     // Mine first, then the record, so a crash between them is fixed above.
@@ -92,6 +100,37 @@ mod tests {
         install_one(&home, "x", "newest").unwrap();
         assert!(!path.exists(), "a skill you removed stays removed");
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_skill_that_was_there_first_is_yours() {
+        let home = home("first");
+        let path = home.join(".agents/skills/x/SKILL.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "from another harness").unwrap();
+        install_one(&home, "x", "app").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "from another harness"
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_huge_file_is_read_no_further_than_needed_and_stays() {
+        let home = home("huge");
+        install_one(&home, "x", "app").unwrap();
+        let path = home.join(".agents/skills/x/SKILL.md");
+        let huge = vec![b'a'; MAX as usize * 4];
+        std::fs::write(&path, &huge).unwrap();
+        install_one(&home, "x", "newer").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), huge.len() as u64);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn every_shipped_skill_fits_the_read_bound() {
+        assert!(BUILT_IN.iter().all(|(_, text)| (text.len() as u64) <= MAX));
     }
 
     #[test]

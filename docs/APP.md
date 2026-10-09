@@ -1125,9 +1125,9 @@ Agents read only skills that are files in a folder's `.agents/skills` or in
 writes each skill it ships, from `app/skills/NAME/SKILL.md`, to
 `~/.agents/skills/NAME/SKILL.md`, and keeps what it wrote in
 `~/.agent/skills/NAME.md` ([skills.rs](../app/src-tauri/src/skills.rs)). A
-newer app replaces the file only while it still matches that copy: one you
-edited or removed stays as you left it, and a folder's own skill of the same
-name wins over it. Agents already running keep the index they were created
+newer app replaces the file only while it still matches that copy: one that
+was there before the app, or that you edited or removed, stays as it is, and
+a folder's own skill of the same name wins over it. Agents already running keep the index they were created
 with.
 
 ## What it costs, and where the bounds are

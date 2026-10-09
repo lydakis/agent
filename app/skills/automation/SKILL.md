@@ -12,7 +12,9 @@ the job keeps its state in files in its folder and reads them each run.
 
 ## Setting one up
 
-Give the job its own agent and folder, then schedule it:
+Give the job its own agent and folder, then schedule it. Schedules need the
+app on macOS, where launchd keeps the time; elsewhere `add` refuses with
+`schedules_unsupported`, so say so rather than presenting a job as set up.
 
 ```
 "$HOME/.agent/schedule" add --bot NAME --cron 'MIN HOUR DAY MONTH WEEKDAY' -- MESSAGE
@@ -61,9 +63,13 @@ cap is reached its turns fail with `budget_exhausted`.
    confirmed, listing it in the run record. State a status or leave the item
    out; do not hedge. Copy links from the source's own link field, never
    build them by hand.
-7. **Post once.** First look for today's post at the destination and skip if
-   it is there. A post counts as sent only when the destination confirms it,
-   for example a response with `"ok": true` and a message id.
+7. **Post once.** Give each run's post a key that names its run, such as the
+   date in a daily job's title or the date and hour in an hourly one, and
+   record the key in the run record before posting. First look for that key
+   at the destination and skip if it is there: a rerun of the same run
+   skips, and a later run still posts. A post counts as sent only when the
+   destination confirms it, for example a response with `"ok": true` and a
+   message id.
 8. **Record after the confirmation, not before.** Then move the bookmarks,
    update the ledger, and finish the run record as posted with the message
    id. If the outcome is unclear, mark the run "maybe posted" and change
