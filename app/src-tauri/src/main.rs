@@ -18,6 +18,7 @@ mod remote;
 mod schedule;
 mod session;
 mod settings;
+mod skills;
 mod swarm;
 mod worktree;
 
@@ -1208,6 +1209,11 @@ fn main() {
         {
             let app = app.clone();
             std::thread::spawn(move || schedule::refresh(&places, &app, &schedule::launchctl));
+        }
+    }
+    if let Some(user) = std::env::var_os("HOME") {
+        for error in skills::install(std::path::Path::new(&user)) {
+            eprintln!("agent-app: {error}");
         }
     }
     let links = remote::Hosts::new(

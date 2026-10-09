@@ -759,7 +759,7 @@ pub fn list(places: &Places, after: Option<&str>) -> Value {
 }
 
 /// Write a file whole beside its place, then rename it there.
-fn replace(path: &Path, text: &str) -> Result<(), String> {
+pub(crate) fn replace(path: &Path, text: &str) -> Result<(), String> {
     replace_mode(path, text, 0o644)
 }
 

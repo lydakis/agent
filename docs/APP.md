@@ -1111,6 +1111,25 @@ not wait; one launchd refuses keeps its old path and is tried again at the
 next start. Settings lists schedules also when no project exists. Only macOS has launchd; elsewhere `add`
 refuses with `schedules_unsupported`.
 
+The app ships an `automation` skill
+([SKILL.md](../app/skills/automation/SKILL.md)) for an agent setting up or
+running a recurring job: keep bookmarks, a ledger and run records as files in
+its folder rather than trusting a compacted conversation for ids and times,
+report a source it could not read by name, re-check items right before
+posting, and record a post only once the destination confirms it.
+
+## Skills the app ships
+
+Agents read only skills that are files in a folder's `.agents/skills` or in
+`~/.agents/skills` ([client policy](CLIENT.md)). So on every start the app
+writes each skill it ships, from `app/skills/NAME/SKILL.md`, to
+`~/.agents/skills/NAME/SKILL.md`, and keeps what it wrote in
+`~/.agent/skills/NAME.md` ([skills.rs](../app/src-tauri/src/skills.rs)). A
+newer app replaces the file only while it still matches that copy: one you
+edited or removed stays as you left it, and a folder's own skill of the same
+name wins over it. Agents already running keep the index they were created
+with.
+
 ## What it costs, and where the bounds are
 
 The UI bounds payload buffering, history decoding, and rendered fleet rows:
