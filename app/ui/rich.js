@@ -82,11 +82,12 @@ window.Rich = (() => {
     return md;
   }
   // A link's target as a path, without its fragment (`a.md#install`, `a.rs#L12`) or a line suffix
-  // (`a.rs:12`); null for a URL or anchor. A `#` in a file's name is written `%23`.
+  // (`a.rs:12`); null for a URL or anchor. A `#` or `:` in a file's name is written `%23` or `%3A`.
   function filePath(href) {
-    let p = (href ?? '').replace(/#.*$/s, ''); try { p = decodeURIComponent(p); } catch (_) {}
-    if (!p || /^[a-z][a-z0-9+.-]*:/i.test(p.replace(/^file:\/\//i, ''))) return null;
-    return p.replace(/^file:\/\//i, '').replace(/:\d+(:\d+)?$/, '') || null;
+    let p = (href ?? '').replace(/#.*$/s, '').replace(/^file:\/\//i, '');
+    if (!p || /^[a-z][a-z0-9+.-]*:/i.test(p)) return null;
+    p = p.replace(/:\d+(:\d+)?$/, ''); try { p = decodeURIComponent(p); } catch (_) {}
+    return p || null;
   }
   // A message's HTML, inside the caller's `.md` box. One that would draw past 100,000 tags (about
   // 50,000 elements) shows as its text: a line of `- x` or a `*x*` makes an element from a few

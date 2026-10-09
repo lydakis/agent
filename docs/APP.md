@@ -1223,17 +1223,18 @@ What a model writes never becomes the app's markup unparsed. Raw HTML inside
 Markdown shows as text. Links open in the default browser and only for `http`,
 `https` and `mailto` (the core's `open_link` refuses anything else); other
 links show as their text. A link inside a drawn diagram (a Mermaid `click`
-link) goes the same way and never navigates the window; a chart's `href` is
-dropped, as Vega's loader refuses every URL. Images draw only from raster
-`data:` URLs the message carries, and only on a click, as a small image can
-decode to far more than its bytes; a remote image is a link and a local one
-opens beside, so drawing a message makes no request a model chose. An HTML
-preview runs scripts in a frame sandboxed without same-origin access: it
-cannot read the app or its storage, cannot navigate the window, and the app's
-script globals are injected into the main frame only. Its page carries a
-policy that loads nothing from the network (no fetch, scripts, styles, images
-or fonts but its own inline ones and `data:`), and the window's policy
-(`frame-src about:`) stops a preview from navigating its own frame to a
+link) goes the same way and never navigates the window. A chart's `href` drew
+no link in Chromium, as Vega's string renderer passes it through the loader,
+which refuses every URL; one that did draw would go the same way. Images draw
+only from raster `data:` URLs the message carries, and only on a click, as a
+small image can decode to far more than its bytes; a remote image is a link
+and a local one opens beside, so drawing a message makes no request a model
+chose. An HTML preview runs scripts in a frame sandboxed without same-origin
+access: it cannot read the app or its storage, cannot navigate the window, and
+the app's script globals are injected into the main frame only. Its page
+carries a policy that loads nothing from the network (no fetch, scripts,
+styles, images or fonts but its own inline ones and `data:`), and the window's
+policy (`frame-src about:`) stops a preview from navigating its own frame to a
 website. A preview runs only once asked, so a long transcript holds no idle
 pages. The window's policy also takes images, fonts, media and stylesheets
 only from the app itself, `data:` and `blob:`, so a library drawing a message

@@ -245,6 +245,9 @@ test('charts, file links and opened files draw by kind', () => {
   // A section of another file opens that file; a `#` in a name is written `%23`.
   assert.match(Rich.html('[install](README.md#install)'), /data-file="README.md">install/);
   assert.match(Rich.html('[odd](notes/a%23b.md)'), /data-file="notes\/a#b.md">odd/);
+  // The line suffix is read before decoding, so `%3A` is a colon in the name.
+  assert.match(Rich.html('[log](logs/build%3A2026)'), /data-file="logs\/build:2026">log/);
+  assert.match(Rich.html('[log](a%3A2026)'), /data-file="a:2026">log/);
   assert.match(links, /<a href="https:\/\/example.com">web<\/a>/);
   assert.doesNotMatch(links, /data-file="#top"/);
   const enc = (text) => new TextEncoder().encode(text);
