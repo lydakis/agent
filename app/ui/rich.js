@@ -30,7 +30,7 @@ window.Rich = (() => {
 
   // ---------- Markdown ----------
   // Past this a block is shown as plain text: highlighting is linear but not free.
-  // A message or file highlights at most 256 KiB of code in all (`spent`, reset by `html` and
+  // A message or file highlights at most 256 KiB of code in all (`spent`, set by `html` and
   // `file`); past that its blocks are plain, so a file of many fences costs no more than one.
   const HIGHLIGHT_MAX = 64 * 1024, HIGHLIGHT_TOTAL = 256 * 1024;
   let spent = 0;
@@ -91,19 +91,24 @@ window.Rich = (() => {
   }
   // A message's HTML, inside the caller's `.md` box. One that would draw past 100,000 tags (about
   // 50,000 elements) shows as its text: a line of `- x` or a `*x*` makes an element from a few
-  // bytes, and the window pays for every element it holds. Past 50,000 lines it is not parsed.
+  // bytes, and the window pays for every element it holds. It is not parsed past 50,000 lines or
+  // 100,000 marks that open an inline element (`*`, `_`, a backtick, `[`, `<`, `~`, `|`, `@`,
+  // `www.`, `://`), since the parser's tokens cost more than the HTML they become.
   const TAGS = 100000, LINES = 50000;
   const count = (s, c, max) => { let n = 0, i = -1; while (n <= max && (i = s.indexOf(c, i + 1)) !== -1) n++; return n; };
+  const MARK = /[*_`[<~|@]|www\.|:\/\//g;
+  const marks = (s, max) => { let n = 0; MARK.lastIndex = 0; while (n <= max && MARK.exec(s)) n++; return n; };
   const asText = (text) => `<div class="rc" data-kind="code">${head('text', '')}<pre class="code"><code>${esc(text)}</code></pre></div>`;
   // `used` carries the bounds across the pieces of one message drawn apart, as a streamed reply's
   // blocks are; once over, `used.over` is set and that piece is text.
-  function html(text, used = { lines: 0, tags: 0 }) {
-    waited = false; spent = 0;
+  function html(text, used = { lines: 0, tags: 0, code: 0 }) {
+    waited = false; spent = used.code ?? 0;
     const p = parser();
     if (!p) return `<p>${esc(text)}</p>`;
     const lines = count(text, '\n', LINES - used.lines);
-    if (used.lines + lines > LINES) { used.over = true; return asText(text); }
+    if (used.lines + lines > LINES || used.tags + marks(text, TAGS - used.tags) > TAGS) { used.over = true; return asText(text); }
     let out; try { out = p.parse(text); } catch (_) { return `<p>${esc(text)}</p>`; }
+    used.code = spent;
     const tags = count(out, '<', TAGS - used.tags);
     if (used.tags + tags > TAGS) { waited = false; used.over = true; return asText(text); }
     used.lines += lines; used.tags += tags;
@@ -281,13 +286,14 @@ window.Rich = (() => {
   // table, or code. `bytes` is what was read (at most `cap`); `more` says the file goes on.
   const IMAGE = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', avif: 'image/avif', bmp: 'image/bmp', ico: 'image/x-icon' };
   const extOf = (path) => { const n = path.split('/').pop().toLowerCase(); return /\.(vl|vg)\.json$/.test(n) ? n.slice(-7, -5) : n.includes('.') ? n.split('.').pop() : n; };
-  // The first `max` rows of a CSV or TSV, at most 256 columns each: a quoted field may hold the
-  // separator, a line break or a doubled quote.
+  // The first `max` rows of a CSV or TSV, at most 256 columns each, ending with the row that
+  // reaches 10,000 cells: a quoted field may hold the separator, a line break or a doubled quote.
+  // `more` says rows were left out.
   const COLUMNS = 256, CELLS = 10000;
   function csv(text, sep, max) {
-    const out = []; let row = [], cell = '', quoted = false, i = 0;
-    const end = () => { if (row.length < COLUMNS) row.push(cell); cell = ''; if (row.length > 1 || row[0]) out.push(row); row = []; };
-    for (; i < text.length && out.length < max; i++) {
+    const out = []; let row = [], cell = '', quoted = false, i = 0, cells = 0;
+    const end = () => { if (row.length < COLUMNS) row.push(cell); cell = ''; if (row.length > 1 || row[0]) { out.push(row); cells += row.length; } row = []; };
+    for (; i < text.length && out.length < max && cells < CELLS; i++) {
       const c = text[i];
       if (quoted) { if (c !== '"') cell += c; else if (text[i + 1] === '"') { cell += c; i++; } else quoted = false; }
       else if (c === '"' && !cell) quoted = true;
@@ -295,13 +301,14 @@ window.Rich = (() => {
       else if (c === '\n') end();
       else if (c !== '\r') cell += c;
     }
-    if (out.length < max && (cell || row.length)) end();
+    if (out.length < max && cells < CELLS && (cell || row.length)) end();
+    out.more = /\S/.test(text.slice(i));
     return out;
   }
   function table(text, sep) {
     const rows = csv(text, sep, 1001);
     const cell = (tag) => (c) => `<${tag}>${esc(c)}</${tag}>`;
-    return `<div class="md"><table><thead><tr>${(rows[0] ?? []).map(cell('th')).join('')}</tr></thead><tbody>${rows.slice(1).map((r) => `<tr>${r.map(cell('td')).join('')}</tr>`).join('')}</tbody></table></div>`;
+    return `${rows.more ? `<div class="line note">showing the first ${rows.length - 1} rows</div>` : ''}<div class="md"><table><thead><tr>${(rows[0] ?? []).map(cell('th')).join('')}</tr></thead><tbody>${rows.slice(1).map((r) => `<tr>${r.map(cell('td')).join('')}</tr>`).join('')}</tbody></table></div>`;
   }
   function file(path, bytes, more = false) {
     spent = 0;

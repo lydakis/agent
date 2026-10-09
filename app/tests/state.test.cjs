@@ -190,6 +190,10 @@ test('a message highlights at most 256 KiB of code in all', () => {
   Rich.html(fence.repeat(10));
   assert.equal(calls, 4); assert.ok(bytes <= 256 * 1024);
   Rich.html(fence); assert.equal(calls, 5);
+  // A streamed reply's blocks share one budget.
+  calls = 0; const used = { lines: 0, tags: 0 };
+  Rich.html(fence.repeat(3), used); Rich.html(fence.repeat(3), used);
+  assert.equal(calls, 4);
 });
 
 test('a message past 100,000 tags shows as its text', () => {
@@ -199,6 +203,12 @@ test('a message past 100,000 tags shows as its text', () => {
   assert.match(Rich.html(list), /data-kind="code"/);
   assert.match(Rich.html('- x\n'.repeat(100)), /<li>/);
   assert.doesNotMatch(Rich.html('x\n'.repeat(60000)), /<br>/);
+  // One long line of inline marks is not parsed: emphasis, links written bare.
+  for (const line of ['*x* '.repeat(60000), 'www.a.io '.repeat(120000)]) {
+    const out = Rich.html(line);
+    assert.doesNotMatch(out, /<em>|<a /); assert.match(out, /data-kind="code"/);
+  }
+  assert.match(Rich.html('*x* '.repeat(100)), /<em>/);
   // A streamed reply's blocks share the bounds: each piece alone would draw, together they are text.
   const used = { lines: 0, tags: 0 }, piece = '- x\n'.repeat(30000);
   assert.match(Rich.html(piece, used), /<li>/);
@@ -263,6 +273,11 @@ test('charts, file links and opened files draw by kind', () => {
   assert.match(Rich.file('/w/t.tsv', enc('a\tb\n1\t2')).html, /<td>1<\/td><td>2<\/td>/);
   // Columns are capped as well as rows, so a line of separators costs no more than a wide table.
   assert.equal(Rich.file('/w/wide.csv', enc(','.repeat(100000))).html.match(/<th>/g).length, 256);
+  // Rows stop at the one reaching 10,000 cells, and the view says rows were left out.
+  const many = Rich.file('/w/many.csv', enc((','.repeat(255) + '\n').repeat(1001))).html;
+  assert.ok(many.match(/<t[hd]>/g).length <= 10000 + 256);
+  assert.match(many, /showing the first 39 rows/);
+  assert.doesNotMatch(Rich.file('/w/t.csv', enc('a,b\n1,2\n')).html, /showing/);
   assert.match(Rich.file('/w/blob.bin', new Uint8Array([1, 0, 2])).html, /binary file · 3 bytes/);
   assert.match(Rich.file('/w/big.log', enc('x'), true).html, /showing the first/);
   assert.match(Rich.file('/w/<i>.md', enc('<script>alert(1)</script>')).html, /&lt;script&gt;/);
