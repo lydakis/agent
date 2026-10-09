@@ -791,6 +791,7 @@ fn replace_mode(path: &Path, text: &str, mode: u32) -> Result<(), String> {
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
         std::fs::rename(&temporary, path)?;
+        reap(dir, path);
         // The new name is durable only once its folder is.
         std::fs::File::open(dir)?.sync_all()
     })();
@@ -798,6 +799,36 @@ fn replace_mode(path: &Path, text: &str, mode: u32) -> Result<(), String> {
         let _ = std::fs::remove_file(&temporary);
     }
     written.map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Remove the temporaries of `path` that processes now gone left behind,
+/// such as one killed between its write and its rename.
+fn reap(dir: &Path, path: &Path) {
+    let prefix = format!(
+        ".{}.",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    );
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(&prefix))
+            .filter(|pid| pid.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        // SAFETY: signal 0 sends nothing; it only asks whether pid exists.
+        let gone = pid > 0
+            && unsafe { libc::kill(pid, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if gone {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// A name is part of a launchd label and a file name.
@@ -1411,6 +1442,23 @@ mod tests {
             minute: mi,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn a_temporary_a_gone_process_left_is_reaped() {
+        let dir = std::env::temp_dir().join(format!("agent-app-reap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let gone = child.id();
+        child.wait().unwrap();
+        let (dead, live) = (dir.join(format!(".x.{gone}")), dir.join(".x.1"));
+        std::fs::write(&dead, "").unwrap();
+        std::fs::write(&live, "").unwrap();
+        replace(&dir.join("x"), "text").unwrap();
+        assert!(!dead.exists());
+        assert!(live.exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn minutes(when: &When) -> Vec<u8> {
