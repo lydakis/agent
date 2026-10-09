@@ -1703,6 +1703,54 @@ function renderSwarm(el, sw) {
   if (atBottom && sw.tab === 'board') el.scrollTop = el.scrollHeight;
 }
 
+// ---------- the new project sheet ----------
+// Only the fundamentals: a folder (the system's picker, which can also make a new one), the lead's model
+// and effort, the threads' model and effort (none: the lead's), and where threads work. The models are
+// read when it opens, so a list edited since shows.
+const np = { models: [], in: 'worktree' };
+async function openProjectSheet() {
+  closeMenu();
+  // Read without opening Settings: a daemon that cannot restart lists what it was started with.
+  let models = []; try { const [all, set] = await Promise.all([Daemon.models(), S.setup?.settings ?? Daemon.settings?.().catch(() => null)]); if (set) S.seenSettings = set; models = connected(all, set?.restartable === false && !S.setup?.settings ? null : set); } catch (e) { toast(`models: ${e?.message ?? e}`, 5000); }
+  Object.assign(np, { models, in: 'worktree' });
+  sheetFor = null; sheetKind = 'project';
+  const list = models, none = !list.length ? '<p class="hint warn">No models listed: connect a provider in Settings.</p>' : '';
+  $('sheet').innerHTML = `<h4>New project</h4>
+    <label for="np-dir">Folder</label><div class="pick"><input id="np-dir" autocomplete="off" spellcheck="false" placeholder="Choose a folder, or type its path" value="${esc(S.config?.workspace ?? '')}"><button type="button" class="sbtn" data-act="np-choose">Choose…</button></div>
+    <label for="np-model">Lead</label><div class="pair">${modelSelectHTML('np-model', list)}${effortSelectHTML('np-effort', pickedModel(list))}</div>
+    <label for="np-tmodel">Threads</label><div class="pair">${modelSelectHTML('np-tmodel', list, null, 'Same as the lead')}${effortSelectHTML('np-teffort', '', '').replace('<select ', '<select disabled ')}</div>
+    <div class="opts" id="np-in"></div>${none}
+    <div class="foot"><button type="button" class="sbtn" data-act="close-sheet">Cancel</button><button type="submit" class="sbtn primary" id="np-create">Create</button></div>`;
+  renderProjectSheet();
+  $('sheetwrap').classList.add('on'); S.ui.sheet = true;
+  setTimeout(() => $('np-dir').focus?.(), 0);
+}
+function renderProjectSheet() {
+  const opt = (v, l) => `<button type="button" class="opt${np.in === v ? ' on' : ''}" data-act="np-in" data-v="${v}" aria-pressed="${np.in === v}">${l}</button>`;
+  $('np-in').innerHTML = `${opt('worktree', 'Own worktree')}${opt('project', 'Project folder')}<span class="hint">${np.in === 'worktree' ? 'Threads that change files each get a git worktree of their own.' : 'Every thread works in the project folder.'}</span>`;
+  projectReady();
+}
+function projectReady() { const go = $('np-create'); if (go) go.disabled = !$('np-dir').value.trim() || !$('np-model').value; }
+// The threads' effort follows their model, and with none it is the lead's.
+function projectChange(el) {
+  if (el.id === 'np-model') followModel(el.value, 'np-effort');
+  if (el.id === 'np-tmodel') { followModel(el.value, 'np-teffort'); if (!el.value) $('np-teffort').outerHTML = effortSelectHTML('np-teffort', '', '').replace('<select ', '<select disabled '); }
+  projectReady();
+}
+async function chooseProjectFolder() {
+  const dir = await Daemon.chooseFolder($('np-dir').value.trim() || S.config?.workspace || null).catch((e) => { toast(String(e?.message ?? e), 5000); return null; });
+  if (dir && S.ui.sheet && sheetKind === 'project') { $('np-dir').value = dir; projectReady(); }
+}
+async function submitProject() {
+  const go = $('np-create'), dir = $('np-dir').value.trim(), model = $('np-model').value, tmodel = $('np-tmodel').value;
+  if (!dir || !model || go.disabled) return;
+  go.disabled = true; go.textContent = 'Creating…';
+  try {
+    await createProject(dir, model, $('np-effort').value, { model: tmodel || null, reasoning: (tmodel && $('np-teffort').value) || null, inProject: np.in === 'project' });
+    closeSheet();
+  } catch (err) { toast(String(err?.message ?? err), 6000); go.disabled = false; go.textContent = 'Create'; }
+}
+
 // ---------- the new swarm sheet ----------
 // A goal, how many agents, what they are, where they work, and a budget they share. What they are is
 // a mix: rows of an identity (a profile the folder offers, or a plain agent), a model and its effort, and a share,
@@ -1710,7 +1758,7 @@ function renderSwarm(el, sw) {
 // A swarm starts with up to 64 agents, as the app's side takes; Add goes on from there.
 const MAX_AGENTS = 64, MAX_BUDGET_M = 1000, BUDGET_PER_AGENT_M = 10;
 const MIX_ROWS = 8;
-let sheetFor = null;
+let sheetFor = null, sheetKind = null;
 const sheet = { models: [], profiles: [], mix: [] };
 async function openSwarmSheet(project) {
   closeMenu();
@@ -1721,7 +1769,7 @@ async function openSwarmSheet(project) {
   const first = [lead.model, lastModel()].find((m) => m && models.some((x) => x.id === m)) ?? '';
   const effort = first === lead.model ? lead.reasoning ?? '' : '';
   Object.assign(sheet, { models, profiles, mix: [{ identity: '', model: first, reasoning: effort, share: 100 }], budgetEdited: false });
-  sheetFor = project;
+  sheetFor = project; sheetKind = 'swarm';
   const sel = (id, opts, on) => `<select id="${id}">${opts.map(([v, l]) => `<option value="${esc(v)}"${String(v) === String(on) ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select>`;
   $('sheet').innerHTML = `<h4>New swarm in ${esc(project)}</h4>
     <label for="sw-goal">Goal</label><textarea id="sw-goal" rows="3" placeholder="What should they get done together?"></textarea>
@@ -1790,12 +1838,13 @@ function mixChange(el) {
   if (r.reasoning && !effortsFor(r.model).includes(r.reasoning)) r.reasoning = '';
   if (el.dataset.f !== 'share' || el.type !== 'number') renderMix();
 }
-function closeSheet() { if (!S.ui.sheet) return; S.ui.sheet = false; sheetFor = null; $('sheetwrap').classList.remove('on'); markSeen(); focusInput('main'); }
-$('sheet').addEventListener('change', (e) => { if (e.target.dataset?.mix != null) mixChange(e.target); else if (e.target.id === 'sw-n' || e.target.id === 'sw-budget' || e.target.id === 'sw-org') { updateSwarmBudget(e.target.id); renderMix(); } });
+function closeSheet() { if (!S.ui.sheet) return; S.ui.sheet = false; sheetFor = null; sheetKind = null; $('sheetwrap').classList.remove('on'); markSeen(); focusInput('main'); }
+$('sheet').addEventListener('change', (e) => { if (sheetKind === 'project') { projectChange(e.target); return; } if (e.target.dataset?.mix != null) mixChange(e.target); else if (e.target.id === 'sw-n' || e.target.id === 'sw-budget' || e.target.id === 'sw-org') { updateSwarmBudget(e.target.id); renderMix(); } });
 // A share typed updates the counts once it is a number, without redrawing the field being typed in.
-$('sheet').addEventListener('input', (e) => { if (e.target.id === 'sw-n' || e.target.id === 'sw-budget') { updateSwarmBudget(e.target.id); renderMix(); return; } if (e.target.dataset?.f !== 'share') return; mixChange(e.target); const n = agentCount(), problem = sheetProblem(n), counts = problem ? null : mixCounts(sheet.mix, mixRows(sheet.mix, n)); $('sw-mix').querySelectorAll('.count').forEach((c, i) => { c.textContent = counts ? `${counts[i]} agent${counts[i] === 1 ? '' : 's'}` : ''; c.classList.toggle('none', !!counts && !counts[i]); }); const w = $('sw-mix').querySelector('.mixfoot span'); if (w) { w.textContent = problem ?? (counts.some((c) => !c) ? `A row makes no agent at ${n} agents` : ''); w.className = w.textContent ? 'warn' : ''; } });
+$('sheet').addEventListener('input', (e) => { if (sheetKind === 'project') { projectReady(); return; } if (e.target.id === 'sw-n' || e.target.id === 'sw-budget') { updateSwarmBudget(e.target.id); renderMix(); return; } if (e.target.dataset?.f !== 'share') return; mixChange(e.target); const n = agentCount(), problem = sheetProblem(n), counts = problem ? null : mixCounts(sheet.mix, mixRows(sheet.mix, n)); $('sw-mix').querySelectorAll('.count').forEach((c, i) => { c.textContent = counts ? `${counts[i]} agent${counts[i] === 1 ? '' : 's'}` : ''; c.classList.toggle('none', !!counts && !counts[i]); }); const w = $('sw-mix').querySelector('.mixfoot span'); if (w) { w.textContent = problem ?? (counts.some((c) => !c) ? `A row makes no agent at ${n} agents` : ''); w.className = w.textContent ? 'warn' : ''; } });
 $('sheet').addEventListener('submit', async (e) => {
   e.preventDefault();
+  if (sheetKind === 'project') { await submitProject(); return; }
   const project = sheetFor, start = $('sw-start'); if (!project || start.disabled) return;
   start.disabled = true; start.textContent = 'Starting…';
   try {
@@ -1946,8 +1995,7 @@ function render() {
   if (sw) { renderSwarmHead($('title'), sw); renderSwarm($('log'), sw); }
   else { renderHead($('title'), b, 'main'); if (b) renderTranscript($('log'), b.name); else renderHome($('log')); }
   // New project belongs to Home's list.
-  const home = !S.selected; if (!home && !$('projform').hidden) showNewProject(false);
-  $('newproj').hidden = !home || !$('projform').hidden;
+  $('newproj').hidden = !!S.selected;
   if (S.ui.rail) renderRail();
   if (S.ui.file) renderFile();
   else if (side) { renderHead($('sidetitle'), side, 'side'); renderTranscript($('side'), side.name); }
@@ -2218,7 +2266,9 @@ async function remove(name) { await Daemon.request('delete', { bot: name }); }
 // the file it lacks, with that coordinator's model, so a failed write retries.
 // The app's own opinion of how a coordinator works is its `coordinator` profile: the folder's
 // `.agents/agents/coordinator.md`, the user's, or the one the app ships (app/agents/coordinator.md).
-async function createProject(dir, picked = null, effort = null) {
+// `threads` is what its threads run on and where they work: their model and effort, when not the lead's,
+// and whether all work in the project folder rather than their own worktrees.
+async function createProject(dir, picked = null, effort = null, threads = null) {
   const info = await Daemon.project(dir);
   const existing = bot(info.coordinator);
   if (existing) {
@@ -2238,7 +2288,7 @@ async function createProject(dir, picked = null, effort = null) {
   const session = S.session;
   const record = await Daemon.request('create', { bot: info.coordinator, workspace: info.dir, model, ...(reasoning ? { reasoning } : {}), instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: policy.tools ?? S.config.tools });
   await enqueue(() => { if (S.session === session) seat(record, session); });
-  if (!info.file) await Daemon.writeProject({ dir: info.dir, name: info.name, model, reasoning });
+  if (!info.file) await Daemon.writeProject({ dir: info.dir, name: info.name, model, reasoning, threads });
   await openOnly(info.coordinator); toast(`project ${info.name} · ${policy.note}`);
 }
 function detach() { save(); Daemon.close(); }
@@ -2310,11 +2360,13 @@ function followModel(model, effortId, labelled = false) { const el = $(effortId)
 function lastModel() { try { return localStorage.getItem('agent:model'); } catch (_) { return null; } }
 // The model a picker over `list` starts on.
 const pickedModel = (list, prefer = null) => [prefer, lastModel()].find((m) => m && list.some((x) => x.id === m)) ?? '';
-function modelSelectHTML(id, list, prefer = null) {
-  const pick = pickedModel(list, prefer);
+// With `none`, the first choice is no model, under that label, and only `prefer` is picked.
+function modelSelectHTML(id, list, prefer = null, none = null) {
+  const pick = none === null ? pickedModel(list, prefer) : list.some((x) => x.id === prefer) ? prefer : '';
   const groups = new Map(); for (const m of list) { const label = providerLabel(providerOf(m.id)); if (!groups.has(label)) groups.set(label, []); groups.get(label).push(m); }
   const options = [...groups].map(([label, ms]) => `<optgroup label="${esc(label)}">${ms.map((m) => `<option value="${esc(m.id)}"${m.id === pick ? ' selected' : ''}>${esc(m.id.slice(providerOf(m.id).length + 1))}${m.note ? ` · ${esc(m.note)}` : ''}</option>`).join('')}</optgroup>`).join('');
-  return `<select id="${id}" aria-label="Model">${pick ? '' : '<option value="" selected disabled>Choose a model</option>'}${options}</select>`;
+  const first = none !== null ? `<option value=""${pick ? '' : ' selected'}>${esc(none)}</option>` : pick ? '' : '<option value="" selected disabled>Choose a model</option>';
+  return `<select id="${id}" aria-label="Model">${first}${options}</select>`;
 }
 // An entry's `--provider` specs. Bedrock with an API key names each endpoint so the key can be named
 // after it; without one it signs with the AWS CLI's credentials in the region.
@@ -2617,14 +2669,6 @@ async function full() { if (S.ui.side) { await openOnly(S.ui.side); focusInput('
 function closeSide() { if (!S.ui.side) return; S.ui.side = null; render(); save(); focusInput('main'); }
 // Late, after a load: by then the finder or a sheet may have opened, and it keeps the keyboard.
 function focusInput(pane) { const el = $(PANE[pane].input); if (el) setTimeout(() => { if (!covered()) el.focus({ preventScroll: true }); }, 0); }
-function showNewProject(on) {
-  $('projform').hidden = !on; $('newproj').hidden = on;
-  if (!on) return;
-  $('projdir').value = S.config?.workspace ?? ''; $('projdir').focus();
-  // The lead's model, from every provider's list, read now so a refreshed list shows.
-  $('projmodel').innerHTML = '';
-  Promise.all([Daemon.models(), S.setup?.settings ?? Daemon.settings?.().catch(() => null)]).then(([all, set]) => { if (set) S.seenSettings = set; const list = connected(all, set?.restartable === false && !S.setup?.settings ? null : set); if (!$('projform').hidden) $('projmodel').innerHTML = list.length ? modelSelectHTML('projsel', list) + effortSelectHTML('projeffort', pickedModel(list)) : '<span class="dim">no models listed: see Settings</span>'; }, (e) => { $('projmodel').textContent = String(e?.message ?? e); });
-}
 
 // ---------- input ----------
 function grow(el) { if (!el.style) return; el.style.height = 'auto'; el.style.height = `${Math.min(160, el.scrollHeight)}px`; }
@@ -2644,12 +2688,6 @@ for (const [pane, ids] of Object.entries(PANE)) {
   $(ids.input).addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); $(ids.form).requestSubmit(); } });
   $(ids.input).addEventListener('input', () => { const input = $(ids.input); grow(input); if (pane === 'main' && input.value === '?') { input.value = ''; showHelp(); } });
 }
-$('projform').addEventListener('submit', async (e) => {
-  e.preventDefault(); const dir = $('projdir').value.trim(); if (!dir) return;
-  try { await createProject(dir, $('projsel')?.value || null, $('projeffort')?.value ?? null); showNewProject(false); focusInput('main'); } catch (err) { toast(String(err?.message ?? err), 5000); }
-});
-$('projform').addEventListener('change', (e) => { if (e.target.id === 'projsel') followModel(e.target.value, 'projeffort'); });
-$('projform').addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.target.id === 'projsel' || e.target.id === 'projeffort')) { e.preventDefault(); $('projform').requestSubmit(); } else if (e.key === 'Escape') { showNewProject(false); focusInput('main'); e.preventDefault(); e.stopPropagation(); } });
 $('pickerq').addEventListener('input', renderPicker);
 $('pickerq').addEventListener('keydown', async (e) => {
   const rows = pickerRows();
@@ -2659,14 +2697,14 @@ $('pickerq').addEventListener('keydown', async (e) => {
   else if (e.key === 'Enter') { const r = rows[S.ui.pickerSel]; closePicker('main'); if (r) await openTab(r.b.name); e.preventDefault(); }
 });
 $('pickerlist').addEventListener('click', async (e) => { const r = e.target.closest('[data-pick]'); if (r) { closePicker('main'); await openTab(r.dataset.pick); } });
-const inputIds = new Set(['input', 'sideinput', 'projdir', 'pickerq']);
+const inputIds = new Set(['input', 'sideinput', 'pickerq']);
 document.addEventListener('keydown', async (e) => {
   if (S.ui.help) { hideHelp(); e.preventDefault(); return; }
   if (S.ui.sheet) { if (e.key === 'Escape') { closeSheet(); e.preventDefault(); } return; }
   if (S.setup?.open) { if (e.key === 'Escape') { closeSetup(); e.preventDefault(); } return; }
   if ((e.ctrlKey || e.metaKey) && e.key === ',') { await openSetup(); e.preventDefault(); return; }
   // The finder and the folder field handle their own keys; Escape there must not stop a turn.
-  if (S.ui.picker || e.target.id === 'projdir' || e.target.id === 'projsel' || e.target.id === 'projeffort' || e.target.id === 'pickerq') return;
+  if (S.ui.picker || e.target.id === 'pickerq') return;
   const k = e.key, ctrl = e.ctrlKey || e.metaKey;
   if (S.ui.menu) { if (k === 'Escape') { closeMenu(); e.preventDefault(); } return; }
   if (ctrl && k === 'k') { openPicker(); e.preventDefault(); return; }
@@ -2717,7 +2755,9 @@ async function act(el) {
     case 'full': await full(); return;
     case 'close-side': closeSide(); return;
     case 'close-file': closeFile(); return;
-    case 'new-project': showNewProject(true); return;
+    case 'new-project': await openProjectSheet(); return;
+    case 'np-choose': await chooseProjectFolder(); return;
+    case 'np-in': np.in = v; renderProjectSheet(); return;
     case 'new-swarm': await openSwarmSheet(leadProject(who)); return;
     case 'close-sheet': closeSheet(); return;
     case 'mix-add': mixAdd(); return;

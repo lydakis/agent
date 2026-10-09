@@ -131,13 +131,19 @@ place.
 
 ![PLAN.md open beside the reply that links it](app/file-beside.png)
 
-New project takes a folder, the model its lead starts on, and that model's
-effort. Effort is how hard the model thinks: every provider offers low,
+New project is a sheet with the fundamentals only: a folder, typed or
+chosen with the system's picker (which can make a new one), the lead's model
+and effort, the threads' model and effort ("Same as the lead" by default),
+and where threads work: each in its own worktree, or all in the project
+folder. Effort is how hard the model thinks: every provider offers low,
 medium, high and xhigh, Claude also max, and "default effort" sends no level,
 so the model uses its own default. It is picked with the model, the model chip
 changes it later, and it is kept in `.agents/project.toml` as `reasoning`
-beside `model`; `/new NAME PROVIDER/MODEL [EFFORT]` takes one too. A task the
-coordinator starts on its own model takes its effort as well
+beside `model`; `/new NAME PROVIDER/MODEL [EFFORT]` takes one too. The
+threads' picks are kept there as `threads_model`, `threads_reasoning` and
+`threads_in` (`worktree` or `project`), and the coordinator profile has the
+lead read them when it starts a task. Without a threads' model, a task the
+coordinator starts runs on its model and takes its effort as well
 (`AGENT_REASONING`, see [CLI.md](CLI.md)).
 
 ![New project](app/new-project.png)
@@ -652,13 +658,15 @@ The shell follows the "Agent App Concepts" prototype (NEXT item 47). The
 daemon learns nothing about projects; everything here is client work.
 
 - **Projects.** A project is a folder, its coordinator bot `<project>.lead`,
-  and `.agents/project.toml` (name, coordinator, model; mechanics only). The
+  and `.agents/project.toml` (name, coordinator, model and effort, the
+  threads' model and effort and where they work; mechanics only). The
   sidebar lists every coordinator in the store as a project, with its tasks
   under it: the coordinator's `created_by` lineage, plus any root bot named
   `<project>.<task>`. Bots in no project follow. **＋ New project**, under
-  Home's list, takes a
-  folder and a model from `~/.agent/models` under its provider's name (the
-  last one picked comes first), reads its `project.toml` (unknown keys are refused) or names the
+  Home's list, opens the sheet: a folder, which **Choose…** picks with the
+  system's folder panel (`NSOpenPanel` through `rfd`, with New Folder), and
+  models from `~/.agent/models` under their providers' names (the last one
+  picked comes first). Creating reads its `project.toml` (unknown keys are refused) or names the
   project after the folder, creates the coordinator there with the folder's
   own client policy, and then writes the file if there was none, so a model
   the daemon refuses is never saved. The file goes in through a temporary
