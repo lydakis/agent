@@ -986,8 +986,10 @@ fn split_tools(joined: &str) -> Vec<String> {
 }
 /// What a keyed creation stores to know its resend: the key and the
 /// request as sent. Without a key there is nothing to recognize.
-fn creation(request_id: Option<&str>, request: Value) -> Option<String> {
-    request_id.map(|key| json!({"request_id":key,"request":request}).to_string())
+fn creation(request_id: Option<&str>, request: Option<Value>) -> Option<String> {
+    request_id
+        .zip(request)
+        .map(|(key, request)| json!({"request_id":key,"request":request}).to_string())
 }
 fn conflict(name: &str, field: &str) -> Error {
     Error::with(
@@ -1619,7 +1621,14 @@ impl Database {
     /// request with this key and these fields. A name made otherwise is
     /// `bot_exists`; the same key with other fields names the first field
     /// that differs. `None` means the name is free.
-    fn resent(&self, name: &str, request_id: Option<&str>, request: &Value) -> Result<Option<Bot>> {
+    /// `request` is built only for a keyed creation; an unkeyed one pays
+    /// for nothing but the name lookup it always made.
+    fn resent(
+        &self,
+        name: &str,
+        request_id: Option<&str>,
+        request: Option<&Value>,
+    ) -> Result<Option<Bot>> {
         let creation: Option<Option<String>> = self
             .conn
             .prepare_cached("SELECT creation FROM bots WHERE name=?")?
@@ -1634,7 +1643,9 @@ impl Database {
         else {
             return fail("bot_exists");
         };
-        let fields = request.as_object().expect("a request is an object");
+        let fields = request
+            .and_then(Value::as_object)
+            .expect("a keyed request is an object");
         if let Some(field) = fields
             .keys()
             .find(|f| creation["request"][f.as_str()] != fields[*f])
@@ -1657,12 +1668,12 @@ impl Database {
     ) -> Result<(Bot, Option<Value>)> {
         // As sent, so a resend compares equal whatever has happened since;
         // the instructions are compared with the bot's own, never copied.
-        let request = json!({"op":"create","workspace":workspace,"provider":binding.provider,
-            "model":binding.model,"reasoning":binding.reasoning,"budget_tokens":binding.budget_tokens,
-            "tools":binding.tools,"created_by":binding.created_by,"created_by_id":binding.created_by_id,
-            "compaction_model":binding.compaction_model,"fallbacks":binding.fallbacks,
-            "gate":binding.gate,"settings":binding.settings});
-        if let Some(bot) = self.resent(name, binding.request_id, &request)? {
+        let request = binding.request_id.map(|_| json!({"op":"create","workspace":workspace,
+            "provider":binding.provider,"model":binding.model,"reasoning":binding.reasoning,
+            "budget_tokens":binding.budget_tokens,"tools":binding.tools,"created_by":binding.created_by,
+            "created_by_id":binding.created_by_id,"compaction_model":binding.compaction_model,
+            "fallbacks":binding.fallbacks,"gate":binding.gate,"settings":binding.settings}));
+        if let Some(bot) = self.resent(name, binding.request_id, request.as_ref())? {
             if bot.instructions != binding.instructions {
                 return Err(conflict(name, "instructions"));
             }
@@ -5647,10 +5658,12 @@ impl Database {
             allow,
             request_id,
         } = fork;
-        let request = json!({"op":"fork","source":source,"checkpoint":node,"workspace":workspace,
-            "budget_tokens":budget_tokens,"created_by":created_by,"created_by_id":created_by_id,
-            "gate":gate,"allow":allow});
-        if let Some(bot) = self.resent(name, request_id, &request)? {
+        let request = request_id.map(|_| {
+            json!({"op":"fork","source":source,"checkpoint":node,
+            "workspace":workspace,"budget_tokens":budget_tokens,"created_by":created_by,
+            "created_by_id":created_by_id,"gate":gate,"allow":allow})
+        });
+        if let Some(bot) = self.resent(name, request_id, request.as_ref())? {
             return Ok((bot, None));
         }
         let parent = self.inspect(source)?;
