@@ -41,23 +41,30 @@ const MAX: u64 = 256 * 1024;
 fn install_one(home: &Path, name: &str, files: &[(&str, &str)]) -> Result<(), String> {
     let dir = home.join(".agents/skills").join(name);
     let record = home.join(".agent/skills").join(name);
-    // A regular file only, at most MAX + 1 bytes of it, so a huge file costs
-    // no more than a mismatch and a pipe never holds up the window.
+    // Nothing at the path is None. Anything else must open, without
+    // waiting, as a regular file: a dangling link or a pipe is an error, so
+    // it is left alone and never holds up the window. At most MAX + 1 bytes
+    // are read, so a huge file costs no more than a mismatch.
     let read = |path: &Path| {
-        use std::io::Read;
-        let opened = std::fs::metadata(path).and_then(|m| {
-            if m.is_file() {
-                std::fs::File::open(path)
-            } else {
-                Err(std::io::Error::other("not a regular file"))
-            }
-        });
-        let mut bytes = Vec::new();
-        match opened.and_then(|f| f.take(MAX + 1).read_to_end(&mut bytes)) {
-            Ok(_) => Ok(Some(bytes)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(format!("{}: {error}", path.display())),
+        use std::{io::Read, os::unix::fs::OpenOptionsExt};
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("{}: {error}", path.display())),
+            Ok(_) => {}
         }
+        let mut bytes = Vec::new();
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .and_then(|file| {
+                if !file.metadata()?.is_file() {
+                    return Err(std::io::Error::other("not a regular file"));
+                }
+                file.take(MAX + 1).read_to_end(&mut bytes)
+            })
+            .map(|_| Some(bytes))
+            .map_err(|error| format!("{}: {error}", path.display()))
     };
     let mut stale = Vec::new();
     for (file, text) in files {
@@ -198,6 +205,17 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
         let error = install_one(&home, "x", &[("SKILL.md", "app")]).unwrap_err();
         assert!(error.contains("not a regular file"), "{error}");
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_dangling_link_of_yours_stays() {
+        let home = home("dangling");
+        let path = home.join(".agents/skills/x/SKILL.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(home.join("gone"), &path).unwrap();
+        assert!(install_one(&home, "x", &[("SKILL.md", "app")]).is_err());
+        assert!(std::fs::symlink_metadata(&path).unwrap().is_symlink());
         std::fs::remove_dir_all(home).unwrap();
     }
 

@@ -36,14 +36,18 @@ MESSAGE says to follow this skill and names the folder. The folder holds:
   goes. Closed items need no record here.
 - `runs/KEY.md`, one per run, named by its post's key (step 8): what it
   read, reported, left out and why, its plan, and how the post ended. Delete
-  records older than a month, or what `preferences.md` says to keep.
+  records marked done that are older than a month, or than what
+  `preferences.md` says to keep; one still open stays until it is settled.
 
 Replace a state file whole: write `FILE.tmp`, then `mv` it over `FILE`, so a
 run cut off mid-write leaves the old file and never half of one.
 
-Give it credentials that can only read wherever it only reads, such as a
-read-only token in its environment. Leaving write tools out of its list does
-not make it read-only: its shell can still change things.
+Agent cannot give one job its own credentials: every agent's shell sees
+the daemon's environment and your files, and a schedule passes only `HOME`
+and `SHELL`. So wherever the job only reads, use credentials that can only
+read, such as a read-only token, knowing other agents can use them too.
+Leaving write tools out of its list does not make it read-only either: its
+shell can still change things.
 
 Its `--budget-tokens` is a lifetime cap, so size it for many runs. When the
 cap is reached its turns fail with `budget_exhausted`.
@@ -87,8 +91,9 @@ cap is reached its turns fail with `budget_exhausted`.
 8. **Write the plan, then post once.** Before posting, write into the run
    record the post's key, the new bookmark of each source read
    successfully, and the ledger lines to add, change or remove. The key
-   names the run: the time it started (step 3) to the minute, with the UTC
-   offset, for example `2026-01-05 07:30 -0500`. Put it in the post, so
+   names the job and the run: the agent's name and the time the run started
+   (step 3) to the minute, with the UTC offset, for example
+   `brief 2026-01-05 07:30 -0500`. Put it in the post, so
    step 2 of the next run can find it. A post counts as sent only when the
    destination confirms it, for example a response with `"ok": true` and a
    message id.
