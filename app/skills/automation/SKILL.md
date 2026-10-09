@@ -49,9 +49,11 @@ index lacks it. The folder holds:
   records marked done that are older than a month, or than what
   `preferences.md` says to keep; one still open stays until it is settled.
 
-Replace a state file whole: write `FILE.tmp`, `mv` it over `FILE`, then run
-`sync`, so a run cut off mid-write or by a power loss leaves the old file or
-the new one, never half of one.
+Replace a state file whole: write a new file from `mktemp FILE.XXXXXX` in
+the same folder, `mv` it over `FILE`, then run `sync`, so a run cut off
+mid-write or by a power loss leaves the old file or the new one, never half
+of one. `mktemp` creates a file nobody else named, so a link left at a
+fixed name cannot redirect the write.
 
 Agent cannot give one job its own credentials: every agent's shell sees
 the daemon's environment and your files, and a schedule passes only `HOME`
