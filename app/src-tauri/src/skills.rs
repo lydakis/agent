@@ -146,10 +146,12 @@ fn read(path: &Path, budget: &mut Budget) -> Result<Option<Vec<u8>>, String> {
             file.take(MAX + 1).read_to_end(&mut bytes)
         })
         .map_err(|error| format!("{}: {error}", path.display()))?;
-    budget.bytes = budget
-        .bytes
-        .checked_sub(bytes.len() as u64)
-        .ok_or_else(|| format!("{}: more than {BYTES} bytes", path.display()))?;
+    let Some(left) = budget.bytes.checked_sub(bytes.len() as u64) else {
+        // All of it is spent, so the start stops here, not a skill later.
+        budget.bytes = 0;
+        return Err(format!("{}: more than {BYTES} bytes", path.display()));
+    };
+    budget.bytes = left;
     Ok(Some(bytes))
 }
 
@@ -455,8 +457,10 @@ mod tests {
                 std::fs::write(path, text).unwrap();
             }
         }
-        let error = one(&home, "x", &[]).unwrap_err();
+        let mut budget = BUDGET;
+        let error = install_one(&home, "x", &[], &mut budget).unwrap_err();
         assert!(error.contains("more than"), "{error}");
+        assert_eq!(budget.bytes, 0);
         assert!(
             files
                 .iter()

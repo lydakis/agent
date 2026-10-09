@@ -49,8 +49,9 @@ index lacks it. The folder holds:
   An item reported or left unconfirmed stays until it closes, then its line
   goes. One still open after the tracking limit `preferences.md` sets, or 30
   days, gets a last line in the next post saying it is no longer followed,
-  then its line goes too, so the ledger and each run's re-checks stay
-  small.
+  then its line goes too. So does the oldest whenever the ledger would pass
+  the item limit `preferences.md` sets, or 200 lines, so the ledger and each
+  run's re-checks stay small however busy a source is.
 - `runs/KEY.md`, one per run, named by its post's key (step 8): what it
   read, reported, left out and why, its plan, and how the post ended. Delete
   records marked done that are older than a month, or than what
