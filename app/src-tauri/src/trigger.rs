@@ -1,16 +1,16 @@
-//! Schedules: an agent woken at set times with a message it wrote for
-//! itself, or one written for it. launchd keeps the time, so a schedule
+//! Triggers: an agent woken at set times with a message it wrote for
+//! itself, or one written for it. launchd keeps the time, so a trigger
 //! fires with the app closed, and once on waking for times the Mac slept
 //! through. The daemon has no clock of its own.
 //!
-//! A schedule is one LaunchAgent, `~/Library/LaunchAgents/LABEL.plist`,
-//! which runs this executable with `--schedule-fire` and everything the fire
+//! A trigger is one LaunchAgent, `~/Library/LaunchAgents/LABEL.plist`,
+//! which runs this executable with `--trigger-fire` and everything the fire
 //! needs as its arguments: the plist is the only record. A fire sends the
-//! message as a new turn of the bot the schedule was made for, pinned by its
+//! message as a new turn of the bot the trigger was made for, pinned by its
 //! id, and never to a bot that is working: that time is skipped. It never
-//! creates a bot. A bot deleted since takes its schedules with it.
+//! creates a bot. A bot deleted since takes its triggers with it.
 //!
-//! `~/.agent/schedule`, a script the app writes, is how agents and people
+//! `~/.agent/trigger`, a script the app writes, is how agents and people
 //! add, list and remove them.
 use agent_client::Client;
 use serde_json::{Value, json};
@@ -19,13 +19,16 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const FLAG: &str = "--schedule";
-pub const FIRE_FLAG: &str = "--schedule-fire";
-/// Every schedule's launchd label starts with this; the rest is its name.
-const LABEL: &str = "me.lydakis.agent.schedule.";
+pub const FLAG: &str = "--trigger";
+pub const FIRE_FLAG: &str = "--trigger-fire";
+/// What an earlier app's schedules run; such a run converts them (`migrate`).
+pub const SCHEDULE_FIRE_FLAG: &str = "--schedule-fire";
+/// Every trigger's launchd label starts with this; the rest is its name.
+const LABEL: &str = "me.lydakis.agent.trigger.";
+const SCHEDULE_LABEL: &str = "me.lydakis.agent.schedule.";
 /// A message is a reminder of what to do, not a document.
 const MAX_MESSAGE: usize = 16 * 1024;
-/// Calendar entries one schedule may expand to.
+/// Calendar entries one trigger may expand to.
 const MAX_ENTRIES: usize = 1024;
 /// launchd's calendar has no year, so a one-off time must fall within one.
 const MAX_AHEAD: i64 = 364 * 24 * 3600;
@@ -35,10 +38,10 @@ const SLACK: i64 = 2 * 24 * 3600;
 /// A one-off's calendar entry comes again a year later; a fire this late
 /// is that, not a wake after a long sleep.
 const STALE: i64 = 182 * 24 * 3600;
-const USAGE: &str = "usage: schedule add [--bot NAME] [--name NAME] (--every N{m,h,d} | --in N{m,h} | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY') -- MESSAGE\n       schedule ls [--after NAME]\n       schedule rm NAME";
+const USAGE: &str = "usage: trigger add [--bot NAME] [--name NAME] (--every N{m,h,d} | --in N{m,h} | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY') -- MESSAGE\n       trigger ls [--after NAME]\n       trigger rm NAME";
 
-/// Where schedules live: the LaunchAgents folder holds their plists, and
-/// `~/.agent/schedules` what each one's last fire did.
+/// Where triggers live: the LaunchAgents folder holds their plists, and
+/// `~/.agent/triggers` what each one's last fire did.
 pub struct Places {
     pub agents: PathBuf,
     pub state: PathBuf,
@@ -46,10 +49,10 @@ pub struct Places {
 
 impl Places {
     pub fn home() -> Result<Self, String> {
-        let home = PathBuf::from(std::env::var_os("HOME").ok_or("no HOME for schedules")?);
+        let home = PathBuf::from(std::env::var_os("HOME").ok_or("no HOME for triggers")?);
         Ok(Self {
             agents: home.join("Library/LaunchAgents"),
-            state: home.join(".agent/schedules"),
+            state: home.join(".agent/triggers"),
         })
     }
     fn plist(&self, name: &str) -> PathBuf {
@@ -69,10 +72,10 @@ pub enum Launchd<'a> {
 pub type Loader<'a> = &'a dyn Fn(Launchd) -> Result<(), String>;
 
 /// `launchctl` in the logged-in user's domain. Other systems have no
-/// launchd, and schedules are refused there.
+/// launchd, and triggers are refused there.
 pub fn launchctl(what: Launchd) -> Result<(), String> {
     if !cfg!(target_os = "macos") {
-        return Err("schedules_unsupported: schedules use launchd, which only macOS has".into());
+        return Err("triggers_unsupported: triggers use launchd, which only macOS has".into());
     }
     let domain = format!("gui/{}", unsafe { libc::getuid() });
     let unloading = matches!(what, Launchd::Unload(_));
@@ -113,7 +116,7 @@ fn unload(label: &str, launchd: Loader) -> Result<(), String> {
     }
 }
 
-/// Which daemon a schedule reaches: its store, which a fire may start the
+/// Which daemon a trigger reaches: its store, which a fire may start the
 /// daemon of, and the socket that daemon listens on, when it was given one.
 /// A socket without its store is reached but never started.
 #[derive(Debug, Clone, PartialEq)]
@@ -123,7 +126,7 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    /// The daemon of the shell the schedule is made from, found as the CLI
+    /// The daemon of the shell the trigger is made from, found as the CLI
     /// finds it. An agent's shell has both its daemon's store and socket.
     fn current() -> Result<Self, String> {
         // A launchd job has no working folder: paths are kept absolute.
@@ -157,9 +160,9 @@ impl Daemon {
     }
 }
 
-/// One schedule, as its plist's arguments carry it.
+/// One trigger, as its plist's arguments carry it.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Schedule {
+pub struct Trigger {
     pub name: String,
     pub generation: String,
     pub not_before: Option<i64>,
@@ -176,7 +179,7 @@ pub struct Schedule {
     pub message: String,
 }
 
-impl Schedule {
+impl Trigger {
     /// The fire's arguments, after the executable.
     fn args(&self) -> Vec<String> {
         let mut args = vec![
@@ -211,7 +214,7 @@ impl Schedule {
 
     /// Read back from a fire's arguments, after the flag.
     fn parse(args: &[String]) -> Result<Self, String> {
-        let bad = |what: &str| format!("invalid_schedule: {what}");
+        let bad = |what: &str| format!("invalid_trigger: {what}");
         let (mut name, mut bot, mut id, mut when, mut at, mut store_id) =
             (None, None, None, None, None, None);
         let (mut generation, mut not_before) = (None, None);
@@ -578,12 +581,12 @@ fn unescape(text: &str) -> String {
         .replace("&amp;", "&")
 }
 
-/// The LaunchAgent for a schedule. `environment` is what the fire starts
+/// The LaunchAgent for a trigger. `environment` is what the fire starts
 /// with besides launchd's own: the shell whose login environment starts a
 /// daemon with your keys, as the app starts one.
 pub fn plist(
     app: &Path,
-    schedule: &Schedule,
+    trigger: &Trigger,
     when: &[Entry],
     environment: &[(&str, String)],
 ) -> String {
@@ -593,10 +596,10 @@ pub fn plist(
     let string = |s: &str| format!("<string>{}</string>", escape(s));
     out += &format!(
         "  <key>Label</key>\n  {}\n",
-        string(&format!("{LABEL}{}", schedule.name))
+        string(&format!("{LABEL}{}", trigger.name))
     );
     out += "  <key>ProgramArguments</key>\n  <array>\n";
-    for arg in std::iter::once(app.to_string_lossy().into_owned()).chain(schedule.args()) {
+    for arg in std::iter::once(app.to_string_lossy().into_owned()).chain(trigger.args()) {
         out += &format!("    {}\n", string(&arg));
     }
     out += "  </array>\n  <key>StartCalendarInterval</key>\n  <array>\n";
@@ -642,16 +645,16 @@ fn program(text: &str) -> Option<Vec<String>> {
     Some(args)
 }
 
-/// The schedule a plist runs, and the app it runs it with.
-fn read_plist(text: &str) -> Option<(Schedule, PathBuf)> {
+/// The trigger a plist runs, and the app it runs it with.
+fn read_plist(text: &str) -> Option<(Trigger, PathBuf)> {
     let args = program(text)?;
     let (app, rest) = args.split_first()?;
-    let schedule = Schedule::parse(rest.strip_prefix(&[FIRE_FLAG.to_owned()])?).ok()?;
-    Some((schedule, PathBuf::from(app)))
+    let trigger = Trigger::parse(rest.strip_prefix(&[FIRE_FLAG.to_owned()])?).ok()?;
+    Some((trigger, PathBuf::from(app)))
 }
 
-/// A plist's schedule and app, or why it could not be read.
-type Read = Result<(Schedule, PathBuf), String>;
+/// A plist's trigger and app, or why it could not be read.
+type Read = Result<(Trigger, PathBuf), String>;
 
 const PAGE_SIZE: usize = 64;
 // Shared by plist writes and record reads; oversized definitions never replace a job.
@@ -664,7 +667,7 @@ fn read_record(path: &Path) -> Result<String, String> {
         .and_then(|file| file.take(MAX_RECORD + 1).read_to_string(&mut text))
         .map_err(|e| format!("unreadable: {e}"))?;
     if text.len() as u64 > MAX_RECORD {
-        return Err("unreadable: schedule record too large".into());
+        return Err("unreadable: trigger record too large".into());
     }
     Ok(text)
 }
@@ -679,14 +682,14 @@ fn read_all(places: &Places) -> impl Iterator<Item = (String, Read)> {
             let file = e.file_name().into_string().ok()?;
             let name = file.strip_prefix(LABEL)?.strip_suffix(".plist")?.to_owned();
             let read = read_record(&e.path()).and_then(|text| {
-                read_plist(&text).ok_or_else(|| "unreadable: not a schedule's plist".into())
+                read_plist(&text).ok_or_else(|| "unreadable: not a trigger's plist".into())
             });
             Some((name, read))
         })
 }
 
 #[cfg(test)]
-fn schedules(places: &Places) -> Vec<(Schedule, PathBuf)> {
+fn triggers(places: &Places) -> Vec<(Trigger, PathBuf)> {
     read_all(places).filter_map(|(_, r)| r.ok()).collect()
 }
 
@@ -738,7 +741,7 @@ pub fn list(places: &Places, after: Option<&str>) -> Value {
                 return row;
             }
             match read_record(&path).and_then(|text| {
-                read_plist(&text).ok_or_else(|| "unreadable: not a schedule's plist".into())
+                read_plist(&text).ok_or_else(|| "unreadable: not a trigger's plist".into())
             }) {
                 Ok((s, _)) => {
                     let last = read(&places.last(&name))
@@ -755,7 +758,7 @@ pub fn list(places: &Places, after: Option<&str>) -> Value {
             }
         })
         .collect();
-    json!({"schedules": rows, "next_after": next})
+    json!({"triggers": rows, "next_after": next})
 }
 
 /// Write a file whole beside its place, then rename it there.
@@ -810,17 +813,17 @@ fn valid_name(name: &str) -> Result<(), String> {
         .ok_or_else(|| format!("invalid_name: {name}: letters, digits, '.', '-' and '_'"))
 }
 
-/// Write the schedule's plist and load it, replacing one of the same name.
+/// Write the trigger's plist and load it, replacing one of the same name.
 /// A replacement that fails puts the old one back as it was.
 pub fn install(
     places: &Places,
     app: &Path,
-    schedule: &Schedule,
+    trigger: &Trigger,
     when: &[Entry],
     environment: &[(&str, String)],
     launchd: Loader,
 ) -> Result<(), String> {
-    valid_name(&schedule.name)?;
+    valid_name(&trigger.name)?;
     let _lock = Lock::take(places)?;
     // macOS folders ignore case: `Build` would overwrite `build`'s files,
     // its plist or an ended one's last result.
@@ -832,19 +835,19 @@ pub fn install(
             .filter_map(|e| e.file_name().into_string().ok())
             .find(|f| f != file && f.eq_ignore_ascii_case(file))
     };
-    let taken = taken(&places.agents, &format!("{LABEL}{}.plist", schedule.name))
+    let taken = taken(&places.agents, &format!("{LABEL}{}.plist", trigger.name))
         .map(|f| f[LABEL.len()..f.len() - ".plist".len()].to_owned())
         .or_else(|| {
-            taken(&places.state, &format!("{}.json", schedule.name))
+            taken(&places.state, &format!("{}.json", trigger.name))
                 .map(|f| f[..f.len() - ".json".len()].to_owned())
         });
     if let Some(other) = taken {
         return Err(format!(
-            "name_taken: {}: schedule {other} differs only in case; pass --name",
-            schedule.name
+            "name_taken: {}: trigger {other} differs only in case; pass --name",
+            trigger.name
         ));
     }
-    let path = places.plist(&schedule.name);
+    let path = places.plist(&trigger.name);
     // One that cannot be read cannot be put back, so it is not replaced.
     let old = match std::fs::read_to_string(&path) {
         Ok(old) => Some(old),
@@ -853,9 +856,9 @@ pub fn install(
     };
     swap(
         &path,
-        &schedule.name,
+        &trigger.name,
         old.as_deref(),
-        &plist(app, schedule, when, environment),
+        &plist(app, trigger, when, environment),
         launchd,
     )
 }
@@ -873,7 +876,7 @@ fn swap(
     // Check the serialized bytes once, before touching the job or its files.
     if text.len() as u64 > MAX_RECORD {
         return Err(format!(
-            "invalid_schedule: serialized plist exceeds {MAX_RECORD} bytes; narrow --cron or shorten the message"
+            "invalid_trigger: serialized plist exceeds {MAX_RECORD} bytes; narrow --cron or shorten the message"
         ));
     }
     unload(&format!("{LABEL}{name}"), launchd)?;
@@ -894,8 +897,8 @@ fn swap(
     Ok(())
 }
 
-/// Held while a schedule's files or launchd's job change, so `add`, `rm`,
-/// a fire ending its schedule and the app's refresh never interleave. The
+/// Held while a trigger's files or launchd's job change, so `add`, `rm`,
+/// a fire ending its trigger and the app's refresh never interleave. The
 /// lock goes with the process, also when a fire's own unload ends it.
 struct Lock {
     _held: std::fs::File,
@@ -939,7 +942,7 @@ fn forget(path: &Path) -> Result<(), String> {
     .map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Remove a schedule: launchd's copy, then its plist and last result. An
+/// Remove a trigger: launchd's copy, then its plist and last result. An
 /// unload launchd refuses keeps the plist, so the removal can be retried.
 /// Whatever is left of it goes, a job loaded without its plist included.
 pub fn remove(places: &Places, name: &str, launchd: Loader) -> Result<(), String> {
@@ -948,7 +951,7 @@ pub fn remove(places: &Places, name: &str, launchd: Loader) -> Result<(), String
     let path = places.plist(name);
     let last = places.last(name);
     // A folder that ignores case finds `build`'s files for `Build`, whose
-    // label launchd does not have: only the name as stored is that schedule.
+    // label launchd does not have: only the name as stored is that trigger.
     let stored = |dir: &Path, file: &Path| {
         let want = file.file_name();
         std::fs::read_dir(dir)
@@ -965,7 +968,7 @@ pub fn remove(places: &Places, name: &str, launchd: Loader) -> Result<(), String
         Err(error) => return Err(error),
     };
     if !path_here && !last_here && !loaded {
-        return Err(format!("schedule_not_found: {name}"));
+        return Err(format!("trigger_not_found: {name}"));
     }
     if path_here {
         forget(&path)?;
@@ -976,51 +979,51 @@ pub fn remove(places: &Places, name: &str, launchd: Loader) -> Result<(), String
     Ok(())
 }
 
-/// What a fire did goes on disk, and a schedule that is over ends: both
-/// under the lock, and only while the plist is still this schedule's. One
+/// What a fire did goes on disk, and a trigger that is over ends: both
+/// under the lock, and only while the plist is still this trigger's. One
 /// replaced or removed while its message went out is left as it now is; a
 /// job left loaded after its plist went (an end cut short) is unloaded.
-fn settle(places: &Places, schedule: &Schedule, outcome: &Value, launchd: Loader) {
-    let log = |error: String| eprintln!("{}", json!({"error": error}));
+fn settle(places: &Places, trigger: &Trigger, outcome: &Value, launchd: Loader) {
+    let log = |error: String| eprintln!("{}", error_json(&error));
     let _lock = match Lock::take(places) {
         Ok(lock) => lock,
         Err(error) => return log(error),
     };
-    let path = places.plist(&schedule.name);
+    let path = places.plist(&trigger.name);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Under the lock no `add` is between writing and loading one.
-            if let Err(error) = unload(&format!("{LABEL}{}", schedule.name), launchd) {
+            if let Err(error) = unload(&format!("{LABEL}{}", trigger.name), launchd) {
                 log(error);
             }
             return;
         }
         Err(e) => return log(format!("{}: {e}", path.display())),
     };
-    if read_plist(&text).is_none_or(|(now, _)| now != *schedule) {
+    if read_plist(&text).is_none_or(|(now, _)| now != *trigger) {
         return;
     }
-    let recorded = record_last(places, schedule, outcome);
+    let recorded = record_last(places, trigger, outcome);
     if let Err(error) = &recorded {
         log(error.clone());
     }
     let sent = outcome["outcome"] == "sent";
     // One that did not deliver ends only once why is on disk; else its plist
     // stays, listed.
-    if (schedule.at.is_some() || outcome["outcome"] == "gone") && (sent || recorded.is_ok()) {
-        end(places, &schedule.name, &path, &text, !sent, launchd);
+    if (trigger.at.is_some() || outcome["outcome"] == "gone") && (sent || recorded.is_ok()) {
+        end(places, &trigger.name, &path, &text, !sent, launchd);
     }
 }
 
-/// A schedule ends itself: its plist first, then launchd's copy, whose
+/// A trigger ends itself: its plist first, then launchd's copy, whose
 /// unload ends this process. `keep` leaves its last result, so an end nobody
 /// asked for still shows, and why. A plist that will not go stays loaded,
 /// listed, for `rm`: unloaded, it would load again at the next login. An
 /// unload launchd refuses writes the plist back, so the job still loaded
 /// stays listed for `rm`. Called under the lock.
 fn end(places: &Places, name: &str, path: &Path, text: &str, keep: bool, launchd: Loader) {
-    let log = |error: String| eprintln!("{}", json!({"error": error}));
+    let log = |error: String| eprintln!("{}", error_json(&error));
     if let Err(error) = forget(path) {
         return log(error);
     }
@@ -1036,7 +1039,7 @@ fn end(places: &Places, name: &str, path: &Path, text: &str, keep: bool, launchd
     };
     if let Err(error) = unload(&format!("{LABEL}{name}"), launchd) {
         log(error);
-        // Still loaded, it is still this schedule, with what its fire did.
+        // Still loaded, it is still this trigger, with what its fire did.
         for (path, text) in [(path, Some(text)), (&last, result.as_deref())] {
             if let Some(text) = text
                 && let Err(error) = replace(path, text)
@@ -1048,15 +1051,15 @@ fn end(places: &Places, name: &str, path: &Path, text: &str, keep: bool, launchd
 }
 
 /// The app moves when it is updated, so it writes its path into every
-/// schedule again when it starts from somewhere else. One that fails keeps
+/// trigger again when it starts from somewhere else. One that fails keeps
 /// the old path, so the next start tries it again.
 pub fn refresh(places: &Places, app: &Path, launchd: Loader) {
-    for (schedule, _) in read_all(places).filter_map(|(_, r)| r.ok()) {
+    for (trigger, _) in read_all(places).filter_map(|(_, r)| r.ok()) {
         let Ok(_lock) = Lock::take(places) else {
             return;
         };
         // Read again under the lock: an `rm`, `add` or fire may have come first.
-        let path = places.plist(&schedule.name);
+        let path = places.plist(&trigger.name);
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
@@ -1072,11 +1075,129 @@ pub fn refresh(places: &Places, app: &Path, launchd: Loader) {
             &format!("<string>{}</string>", escape(&app.to_string_lossy())),
             1,
         );
-        let _ = swap(&path, &schedule.name, Some(&text), &moved, launchd);
+        let _ = swap(&path, &trigger.name, Some(&text), &moved, launchd);
     }
 }
 
-/// What `schedule add` was asked.
+/// Earlier apps called triggers schedules: jobs labelled
+/// `me.lydakis.agent.schedule.NAME` that ran `--schedule-fire`, with their
+/// results in `~/.agent/schedules`, added through `~/.agent/schedule`. Each
+/// becomes the trigger of its name once, its result kept; the old folder
+/// and script go. A schedule that cannot be read or whose name a trigger
+/// has is left where it is and said so. `running` is the schedule whose
+/// fire runs this, unloaded last since that ends this process.
+pub fn migrate(places: &Places, running: Option<&str>, launchd: Loader) {
+    let log = |error: String| eprintln!("{}", error_json(&error));
+    let Some(home) = places.state.parent() else {
+        return;
+    };
+    let old_state = home.join("schedules");
+    let mut names: Vec<String> = std::fs::read_dir(&places.agents)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let file = e.file_name().into_string().ok()?;
+            Some(
+                file.strip_prefix(SCHEDULE_LABEL)?
+                    .strip_suffix(".plist")?
+                    .to_owned(),
+            )
+        })
+        .filter(|name| valid_name(name).is_ok())
+        .collect();
+    // The running one last: its unload ends this process.
+    names.sort_by_key(|name| Some(name.as_str()) == running);
+    let Ok(_lock) = Lock::take(places) else {
+        return log("migration_failed: no trigger lock".into());
+    };
+    let mut done = Vec::new();
+    for name in names {
+        let old = places.agents.join(format!("{SCHEDULE_LABEL}{name}.plist"));
+        let Ok(text) = read_record(&old) else {
+            continue;
+        };
+        let converted = text
+            .replacen(
+                &format!("<string>{SCHEDULE_LABEL}{name}</string>"),
+                &format!("<string>{LABEL}{name}</string>"),
+                1,
+            )
+            .replacen(
+                &format!("<string>{SCHEDULE_FIRE_FLAG}</string>"),
+                &format!("<string>{FIRE_FLAG}</string>"),
+                1,
+            );
+        if read_plist(&converted).is_none() {
+            log(format!(
+                "unconvertible: schedule {name} is left at {}",
+                old.display()
+            ));
+            continue;
+        }
+        let path = places.plist(&name);
+        if path.exists() {
+            log(format!(
+                "name_taken: schedule {name} is left at {}: a trigger has its name",
+                old.display()
+            ));
+            continue;
+        }
+        let result = old_state.join(format!("{name}.json"));
+        if result.exists()
+            && let Err(e) = std::fs::rename(&result, places.last(&name))
+        {
+            log(format!("{}: {e}", result.display()));
+        }
+        if let Err(error) = swap(&path, &name, None, &converted, launchd) {
+            log(error);
+            continue;
+        }
+        if let Err(error) = forget(&old) {
+            log(error);
+        }
+        done.push(name);
+    }
+    // Results of schedules that had ended, then the old folder and script.
+    for e in std::fs::read_dir(&old_state)
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let to = places.state.join(e.file_name());
+        if e.file_name().to_string_lossy().ends_with(".json") && !to.exists() {
+            let _ = std::fs::rename(e.path(), to);
+        }
+    }
+    let _ = std::fs::remove_file(old_state.join(".lock"));
+    let _ = std::fs::remove_dir(&old_state);
+    let script = home.join("schedule");
+    if std::fs::read_to_string(&script).is_ok_and(|t| t.contains(" --schedule \"$@\"")) {
+        let _ = forget(&script);
+    }
+    for name in done {
+        if let Err(error) = unload(&format!("{SCHEDULE_LABEL}{name}"), launchd) {
+            log(error);
+        }
+    }
+}
+
+/// `APP --schedule-fire ...`: a schedule an earlier app made fired before
+/// this app converted them. Its time is not sent; its trigger fires at the
+/// next one.
+pub fn migrate_cli(args: &[String]) -> i32 {
+    let running = args
+        .iter()
+        .position(|a| a == "--name")
+        .and_then(|i| args.get(i + 1));
+    match Places::home() {
+        Ok(places) => migrate(&places, running.map(String::as_str), &launchctl),
+        Err(error) => eprintln!("{}", error_json(&error)),
+    }
+    0
+}
+
+/// What `trigger add` was asked.
 #[derive(Debug, PartialEq)]
 struct Add {
     bot: Option<String>,
@@ -1091,14 +1212,14 @@ fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
     let mut iter = args.iter();
     let message = loop {
         let Some(flag) = iter.next() else {
-            return Err(bad("invalid_schedule: a message goes after --".into()));
+            return Err(bad("invalid_trigger: a message goes after --".into()));
         };
         if flag == "--" {
             break iter.cloned().collect::<Vec<_>>().join(" ");
         }
         let value = iter
             .next()
-            .ok_or_else(|| bad(format!("invalid_schedule: {flag} needs a value")))?;
+            .ok_or_else(|| bad(format!("invalid_trigger: {flag} needs a value")))?;
         let asked = match flag.as_str() {
             "--bot" => {
                 bot = Some(value.clone());
@@ -1112,21 +1233,21 @@ fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
             "--in" => after(value, now)?,
             "--at" => at(value, now)?,
             "--cron" => cron(value)?,
-            other => return Err(bad(format!("invalid_schedule: {other}"))),
+            other => return Err(bad(format!("invalid_trigger: {other}"))),
         };
         if when.replace(asked).is_some() {
             return Err(bad(
-                "invalid_schedule: one of --every, --in, --at or --cron".into(),
+                "invalid_trigger: one of --every, --in, --at or --cron".into()
             ));
         }
     };
-    let when = when.ok_or_else(|| bad("invalid_schedule: --every, --in, --at or --cron".into()))?;
+    let when = when.ok_or_else(|| bad("invalid_trigger: --every, --in, --at or --cron".into()))?;
     if message.trim().is_empty() {
-        return Err(bad("invalid_schedule: a message goes after --".into()));
+        return Err(bad("invalid_trigger: a message goes after --".into()));
     }
     if message.len() > MAX_MESSAGE {
         return Err(format!(
-            "invalid_schedule: a message is at most {MAX_MESSAGE} bytes"
+            "invalid_trigger: a message is at most {MAX_MESSAGE} bytes"
         ));
     }
     // XML 1.0 has no place for other control characters.
@@ -1134,7 +1255,7 @@ fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
         .chars()
         .any(|c| c.is_control() && !matches!(c, '\n' | '\t' | '\r'))
     {
-        return Err("invalid_schedule: the message has control characters".into());
+        return Err("invalid_trigger: the message has control characters".into());
     }
     Ok(Add {
         bot,
@@ -1151,10 +1272,24 @@ fn runtime() -> Result<tokio::runtime::Runtime, String> {
         .map_err(|e| e.to_string())
 }
 
-/// `APP --schedule add|ls|rm`, from `~/.agent/schedule`.
+/// One error shape, `{"error": CODE, "detail": ...}`, from the
+/// `CODE: detail` this module's errors are.
+fn error_json(message: &str) -> Value {
+    let (code, detail) = match message.split_once(": ") {
+        Some((code, detail))
+            if !code.is_empty() && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') =>
+        {
+            (code, detail)
+        }
+        _ => ("trigger_failed", message),
+    };
+    json!({"error": code, "detail": detail})
+}
+
+/// `APP --trigger add|ls|rm`, from `~/.agent/trigger`.
 pub fn cli(args: &[String]) -> i32 {
     let fail = |message: String| {
-        eprintln!("{}", json!({"error": message}));
+        eprintln!("{}", error_json(&message));
         1
     };
     let places = match Places::home() {
@@ -1197,7 +1332,7 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
             std::env::var("AGENT_BOT_ID")
                 .ok()
                 .and_then(|v| v.parse::<i64>().ok())
-                .ok_or("invalid_schedule: implicit --bot needs AGENT_BOT_ID")?,
+                .ok_or("invalid_trigger: implicit --bot needs AGENT_BOT_ID")?,
         )
     } else {
         None
@@ -1207,11 +1342,11 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
         None => std::env::var("AGENT_BOT")
             .ok()
             .filter(|b| !b.is_empty())
-            .ok_or("invalid_schedule: --bot NAME, or run it from an agent's shell")?,
+            .ok_or("invalid_trigger: --bot NAME, or run it from an agent's shell")?,
     };
     let daemon = Daemon::current()?;
     let socket = daemon.socket()?;
-    // The bot must exist now; the schedule is pinned to this identity.
+    // The bot must exist now; the trigger is pinned to this identity.
     let (record, store_id) = runtime()?.block_on(async {
         let client = connect(&socket, &daemon).await?;
         let record = client.request("resume", json!({"bot": bot})).await;
@@ -1226,7 +1361,7 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
     if expected_id.is_some_and(|id| id != bot_id) {
         return Err("bot_not_found: the shell's bot identity no longer exists".into());
     }
-    let schedule = Schedule {
+    let trigger = Trigger {
         generation: format!(
             "{}-{}",
             std::process::id(),
@@ -1253,29 +1388,29 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
     install(
         places,
         &app,
-        &schedule,
+        &trigger,
         &asked.when.entries,
         &environment,
         &launchctl,
     )?;
-    Ok(schedule.json(None))
+    Ok(trigger.json(None))
 }
 
 /// What a fire did, kept for the app to show.
-/// It is the schedule's whole row, which Settings still shows once the
-/// schedule has ended on its own.
-fn record_last(places: &Places, schedule: &Schedule, outcome: &Value) -> Result<(), String> {
+/// It is the trigger's whole row, which Settings still shows once the
+/// trigger has ended on its own.
+fn record_last(places: &Places, trigger: &Trigger, outcome: &Value) -> Result<(), String> {
     let mut outcome = outcome.clone();
     outcome["fired_ms"] = json!(now() * 1000);
-    let row = schedule.json(Some(outcome));
-    replace(&places.last(&schedule.name), &row.to_string())
+    let row = trigger.json(Some(outcome));
+    replace(&places.last(&trigger.name), &row.to_string())
 }
 
 /// Send the message: a new turn when the bot is resting; a working bot, or
-/// one with work waiting, skips this time of a repeating schedule, and gets
-/// a one-off's message after its work. A deleted bot's schedule goes.
-pub async fn send(client: &Client, schedule: &Schedule) -> Value {
-    let delivery = if schedule.at.is_some() {
+/// one with work waiting, skips this time of a repeating trigger, and gets
+/// a one-off's message after its work. A deleted bot's trigger goes.
+pub async fn send(client: &Client, trigger: &Trigger) -> Value {
+    let delivery = if trigger.at.is_some() {
         "queue"
     } else {
         "reject"
@@ -1283,9 +1418,9 @@ pub async fn send(client: &Client, schedule: &Schedule) -> Value {
     let submitted = client
         .request(
             "submit",
-            json!({"bot": schedule.bot, "bot_id": schedule.bot_id,
-                "request_id": format!("schedule-{}-{}-{}", schedule.bot_id, now(), std::process::id()),
-                "prompt": schedule.message, "delivery": delivery, "origin": "schedule"}),
+            json!({"bot": trigger.bot, "bot_id": trigger.bot_id,
+                "request_id": format!("trigger-{}-{}-{}", trigger.bot_id, now(), std::process::id()),
+                "prompt": trigger.message, "delivery": delivery, "origin": "trigger"}),
         )
         .await;
     match submitted {
@@ -1300,19 +1435,19 @@ pub async fn send(client: &Client, schedule: &Schedule) -> Value {
     }
 }
 
-/// `APP --schedule-fire ...`, run by launchd.
+/// `APP --trigger-fire ...`, run by launchd.
 pub fn fire_cli(args: &[String]) -> i32 {
-    let schedule = match Schedule::parse(args) {
-        Ok(schedule) => schedule,
+    let trigger = match Trigger::parse(args) {
+        Ok(trigger) => trigger,
         Err(error) => {
-            eprintln!("{}", json!({"error": error}));
+            eprintln!("{}", error_json(&error));
             return 1;
         }
     };
     let places = match Places::home() {
         Ok(places) => places,
         Err(error) => {
-            eprintln!("{}", json!({"error": error}));
+            eprintln!("{}", error_json(&error));
             return 1;
         }
     };
@@ -1320,48 +1455,48 @@ pub fn fire_cli(args: &[String]) -> i32 {
     // A one-off's calendar entry has no year: the same date a year early is
     // not its time. A day's slack keeps its time when the Mac's time zone
     // changed since it was made, which launchd follows and `at` does not.
-    if schedule.at.is_some_and(|at| now < at - SLACK) {
+    if trigger.at.is_some_and(|at| now < at - SLACK) {
         return 0;
     }
     // Months late is the entry's next year: the Mac was off at its time, or
     // its end was cut short. It is not sent; if it is still listed, it ends
     // saying so.
-    if schedule.not_before.is_some_and(|first| now < first) {
+    if trigger.not_before.is_some_and(|first| now < first) {
         return 0;
     }
-    if schedule.at.is_some_and(|at| now > at + STALE) {
+    if trigger.at.is_some_and(|at| now > at + STALE) {
         let missed = json!({"outcome": "missed", "detail": "its time passed long ago"});
-        settle(&places, &schedule, &missed, &launchctl);
+        settle(&places, &trigger, &missed, &launchctl);
         return 0;
     }
     let outcome = match runtime() {
         Ok(runtime) => runtime.block_on(async {
-            let socket = match schedule.daemon.socket() {
+            let socket = match trigger.daemon.socket() {
                 Ok(socket) => socket,
                 Err(error) => return json!({"outcome": "failed", "detail": error}),
             };
-            let client = match connect(&socket, &schedule.daemon).await {
+            let client = match connect(&socket, &trigger.daemon).await {
                 Ok(client) => client,
                 Err(error) => return json!({"outcome": "failed", "detail": error}),
             };
             // The socket may now be another store's daemon's; its bot ids are its own.
-            if client.store() != Some(schedule.store_id.as_str()) {
+            if client.store() != Some(trigger.store_id.as_str()) {
                 client.close().await;
                 return json!({"outcome": "failed", "detail": format!(
                     "store_mismatch: the daemon at {} serves another store", socket.display())});
             }
-            let outcome = send(&client, &schedule).await;
+            let outcome = send(&client, &trigger).await;
             client.close().await;
             outcome
         }),
         Err(error) => json!({"outcome": "failed", "detail": error}),
     };
-    settle(&places, &schedule, &outcome, &launchctl);
+    settle(&places, &trigger, &outcome, &launchctl);
     0
 }
 
 /// The daemon, started the way the app starts one when none answers and
-/// the schedule names its store, on the socket the schedule was made with.
+/// the trigger names its store, on the socket the trigger was made with.
 async fn connect(socket: &Path, daemon: &Daemon) -> Result<std::sync::Arc<Client>, String> {
     match Client::connect(socket).await {
         Ok((client, _events)) => Ok(client),
@@ -1379,13 +1514,13 @@ async fn connect(socket: &Path, daemon: &Daemon) -> Result<std::sync::Arc<Client
     }
 }
 
-/// `~/.agent/schedule`, written again whenever the app starts from
+/// `~/.agent/trigger`, written again whenever the app starts from
 /// somewhere else.
 pub fn write_script(home: &Path, app: &Path) -> Result<(), String> {
     let quote = |p: &Path| format!("'{}'", p.to_string_lossy().replace('\'', r"'\''"));
     let usage = USAGE.replace('\n', "\n# ");
     let text = format!("#!/bin/sh\n# {usage}\nexec {} {FLAG} \"$@\"\n", quote(app));
-    let path = home.join("schedule");
+    let path = home.join("trigger");
     use std::os::unix::fs::PermissionsExt;
     let runnable = std::fs::metadata(&path).is_ok_and(|m| m.permissions().mode() & 0o777 == 0o755);
     if runnable && std::fs::read_to_string(&path).is_ok_and(|have| have == text) {
@@ -1531,8 +1666,8 @@ mod tests {
         );
     }
 
-    fn schedule() -> Schedule {
-        Schedule {
+    fn trigger() -> Trigger {
+        Trigger {
             generation: "test-1".into(),
             not_before: None,
             name: "p.fix-login".into(),
@@ -1551,7 +1686,7 @@ mod tests {
 
     #[test]
     fn a_plist_carries_everything_a_fire_needs() {
-        let s = schedule();
+        let s = trigger();
         let when = every("30m", clock(2026, 9, 28, 23, 52)).unwrap();
         let text = plist(
             Path::new("/Applications/Agent.app/Contents/MacOS/agent-app"),
@@ -1559,16 +1694,18 @@ mod tests {
             &when.entries,
             &[("SHELL", "/bin/zsh".into())],
         );
-        assert!(text.contains(
-            "<key>Label</key>\n  <string>me.lydakis.agent.schedule.p.fix-login</string>"
-        ));
+        assert!(
+            text.contains(
+                "<key>Label</key>\n  <string>me.lydakis.agent.trigger.p.fix-login</string>"
+            )
+        );
         assert!(text.contains("<dict><key>Minute</key><integer>22</integer></dict>"));
         assert!(text.contains("<key>SHELL</key><string>/bin/zsh</string>"));
         let args = program(&text).unwrap();
         assert_eq!(args[0], "/Applications/Agent.app/Contents/MacOS/agent-app");
         assert_eq!(args[1], FIRE_FLAG);
-        assert_eq!(Schedule::parse(&args[2..]).unwrap(), s);
-        let once = Schedule {
+        assert_eq!(Trigger::parse(&args[2..]).unwrap(), s);
+        let once = Trigger {
             at: Some(1_790_000_000),
             daemon: Daemon {
                 store: None,
@@ -1576,16 +1713,16 @@ mod tests {
             },
             ..s
         };
-        assert_eq!(Schedule::parse(&once.args()[1..]).unwrap(), once);
+        assert_eq!(Trigger::parse(&once.args()[1..]).unwrap(), once);
     }
 
     #[test]
     fn add_replaces_and_rm_removes_through_launchd() {
-        let root = std::env::temp_dir().join(format!("agent-app-schedule-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("agent-app-trigger-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let places = Places {
             agents: root.join("LaunchAgents"),
-            state: root.join("schedules"),
+            state: root.join("triggers"),
         };
         let asked = RefCell::new(Vec::new());
         let launchd = |what: Launchd| {
@@ -1607,37 +1744,37 @@ mod tests {
             }
         };
         let app = Path::new("/A/agent-app");
-        let s = schedule();
+        let s = trigger();
         let entries = every("1d", clock(2026, 9, 28, 9, 7)).unwrap().entries;
         install(&places, app, &s, &entries, &[], &launchd).unwrap();
         install(&places, app, &s, &entries, &[], &launchd).unwrap();
         assert_eq!(
             *asked.borrow(),
             [
-                "unload me.lydakis.agent.schedule.p.fix-login",
-                "load me.lydakis.agent.schedule.p.fix-login.plist",
-                "unload me.lydakis.agent.schedule.p.fix-login",
-                "load me.lydakis.agent.schedule.p.fix-login.plist",
+                "unload me.lydakis.agent.trigger.p.fix-login",
+                "load me.lydakis.agent.trigger.p.fix-login.plist",
+                "unload me.lydakis.agent.trigger.p.fix-login",
+                "load me.lydakis.agent.trigger.p.fix-login.plist",
             ]
         );
         record_last(&places, &s, &json!({"outcome": "skipped"})).unwrap();
-        let listed = list(&places, None)["schedules"].clone();
+        let listed = list(&places, None)["triggers"].clone();
         assert_eq!(listed.as_array().unwrap().len(), 1);
         assert_eq!(listed[0]["bot"], "p.fix-login");
         assert_eq!(listed[0]["message"], s.message);
         assert_eq!(listed[0]["last"]["outcome"], "skipped");
         // A replacement starts with no last time of its own, while retaining
         // the prior result for a rolled-back plist after interruption.
-        let s = Schedule {
+        let s = Trigger {
             generation: "test-2".into(),
             ..s
         };
         install(&places, app, &s, &entries, &[], &launchd).unwrap();
-        assert!(list(&places, None)["schedules"].clone()[0]["last"].is_null());
+        assert!(list(&places, None)["triggers"].clone()[0]["last"].is_null());
         // A load launchd refuses leaves nothing behind.
-        let other = Schedule {
+        let other = Trigger {
             name: "p.other".into(),
-            ..schedule()
+            ..trigger()
         };
         let refused = install(&places, app, &other, &entries, &[], &|what| match what {
             Launchd::Load(_) => Err("launchctl bootstrap: refused".into()),
@@ -1645,7 +1782,7 @@ mod tests {
         });
         assert!(refused.unwrap_err().contains("refused"));
         assert_eq!(
-            list(&places, None)["schedules"]
+            list(&places, None)["triggers"]
                 .clone()
                 .as_array()
                 .unwrap()
@@ -1660,41 +1797,41 @@ mod tests {
             _ => Ok(()),
         };
         refresh(&places, Path::new("/B/agent-app"), &refused);
-        assert_eq!(schedules(&places)[0].1, Path::new("/A/agent-app"));
+        assert_eq!(triggers(&places)[0].1, Path::new("/A/agent-app"));
         // A name differing only in case would share its files on macOS.
-        let cased = Schedule {
+        let cased = Trigger {
             name: "P.Fix-Login".into(),
-            ..schedule()
+            ..trigger()
         };
         let taken = install(&places, app, &cased, &entries, &[], &launchd).unwrap_err();
         assert!(
-            taken.starts_with("name_taken: P.Fix-Login: schedule p.fix-login"),
+            taken.starts_with("name_taken: P.Fix-Login: trigger p.fix-login"),
             "{taken}"
         );
         // Nor does `rm` of that other case reach it, even where the folder would alias it.
         assert!(
             remove(&places, "P.Fix-Login", &launchd)
                 .unwrap_err()
-                .starts_with("schedule_not_found")
+                .starts_with("trigger_not_found")
         );
-        // A move of the app is written into every schedule and reloaded.
+        // A move of the app is written into every trigger and reloaded.
         asked.borrow_mut().clear();
         refresh(&places, Path::new("/B/agent-app"), &launchd);
-        assert_eq!(schedules(&places)[0].1, Path::new("/B/agent-app"));
-        assert_eq!(schedules(&places)[0].0, s);
+        assert_eq!(triggers(&places)[0].1, Path::new("/B/agent-app"));
+        assert_eq!(triggers(&places)[0].0, s);
         assert_eq!(asked.borrow().len(), 2);
         refresh(&places, Path::new("/B/agent-app"), &launchd);
         assert_eq!(asked.borrow().len(), 2, "an unmoved app changes nothing");
         remove(&places, &s.name, &launchd).unwrap();
-        assert_eq!(list(&places, None)["schedules"].clone(), json!([]));
+        assert_eq!(list(&places, None)["triggers"].clone(), json!([]));
         assert!(!places.last(&s.name).exists());
         assert!(
             install(
                 &places,
                 app,
-                &Schedule {
+                &Trigger {
                     name: "../x".into(),
-                    ..schedule()
+                    ..trigger()
                 },
                 &entries,
                 &[],
@@ -1712,7 +1849,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let app = Path::new("/A/agent-app");
         write_script(&root, app).unwrap();
-        let path = root.join("schedule");
+        let path = root.join("trigger");
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&path), 0o755);
         // Its text survived a crash before its mode did.
@@ -1722,7 +1859,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// launchd as schedules see it: which labels are loaded, and what it
+    /// launchd as triggers see it: which labels are loaded, and what it
     /// refuses.
     #[derive(Default)]
     struct Fake {
@@ -1773,7 +1910,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
             let places = Places {
                 agents: root.join("LaunchAgents"),
-                state: root.join("schedules"),
+                state: root.join("triggers"),
             };
             Self {
                 root,
@@ -1781,7 +1918,7 @@ mod tests {
                 fake: Fake::default(),
             }
         }
-        fn install(&self, s: &Schedule) -> Result<(), String> {
+        fn install(&self, s: &Trigger) -> Result<(), String> {
             let entries = every("1d", clock(2026, 9, 28, 9, 7)).unwrap().entries;
             install(
                 &self.places,
@@ -1792,7 +1929,7 @@ mod tests {
                 &|w| self.fake.call(w),
             )
         }
-        fn settle(&self, s: &Schedule, outcome: Value) {
+        fn settle(&self, s: &Trigger, outcome: Value) {
             settle(&self.places, s, &outcome, &|w| self.fake.call(w));
         }
         fn remove(&self, name: &str) -> Result<(), String> {
@@ -1820,22 +1957,22 @@ mod tests {
         }
     }
 
-    fn once() -> Schedule {
-        Schedule {
+    fn once() -> Trigger {
+        Trigger {
             name: "p.once".into(),
             when: "in 2h".into(),
             at: Some(1_790_000_000),
-            ..schedule()
+            ..trigger()
         }
     }
 
     #[test]
-    fn oversized_plists_are_refused_before_installing_or_replacing_a_schedule() {
+    fn oversized_plists_are_refused_before_installing_or_replacing_a_trigger() {
         let w = World::new("record-limit");
         let broad = cron("0-7 0-7 1-4 1-4 *").unwrap();
-        let s = Schedule {
+        let s = Trigger {
             when: broad.text,
-            ..schedule()
+            ..trigger()
         };
         let app = Path::new("/A/agent-app");
         let oversized = plist(app, &s, &broad.entries, &[]);
@@ -1845,18 +1982,14 @@ mod tests {
                 w.fake.call(what)
             })
         };
-        assert!(
-            install_broad()
-                .unwrap_err()
-                .starts_with("invalid_schedule:")
-        );
+        assert!(install_broad().unwrap_err().starts_with("invalid_trigger:"));
         assert_eq!(w.state(&s.name), (false, false, false));
         assert_eq!(w.fake.unloads.get(), 0);
 
         // A large readable plist, including XML expansion, still lists and
         // follows an app move. The limit is serialized bytes, not message bytes.
         let when = cron("0-7 0-7 1-2 1-4 *").unwrap();
-        let kept = Schedule {
+        let kept = Trigger {
             when: when.text,
             message: "&".repeat(MAX_MESSAGE / 2),
             ..s.clone()
@@ -1869,7 +2002,7 @@ mod tests {
         assert!(text.len() as u64 > MAX_RECORD * 9 / 10);
         assert!(text.len() as u64 <= MAX_RECORD);
         assert_eq!(
-            list(&w.places, None)["schedules"][0]["message"],
+            list(&w.places, None)["triggers"][0]["message"],
             kept.message
         );
         refresh(&w.places, Path::new("/B/agent-app"), &|what| {
@@ -1880,25 +2013,21 @@ mod tests {
         record_last(&w.places, &kept, &json!({"outcome": "sent", "turn": 7})).unwrap();
         let unloads = w.fake.unloads.get();
 
-        assert!(
-            install_broad()
-                .unwrap_err()
-                .starts_with("invalid_schedule:")
-        );
+        assert!(install_broad().unwrap_err().starts_with("invalid_trigger:"));
         assert_eq!(w.fake.unloads.get(), unloads);
         assert_eq!(w.plist(&s.name), before);
         assert_eq!(w.state(&s.name), (true, true, true));
-        assert_eq!(list(&w.places, None)["schedules"][0]["last"]["turn"], 7);
+        assert_eq!(list(&w.places, None)["triggers"][0]["last"]["turn"], 7);
     }
 
     #[test]
     fn pages_bound_messages_and_keep_replacement_results_with_their_generation() {
         let w = World::new("pages");
-        let s = schedule();
+        let s = trigger();
         w.install(&s).unwrap();
         record_last(&w.places, &s, &json!({"outcome": "sent", "turn": 7})).unwrap();
         let prior = std::fs::read_to_string(w.places.last(&s.name)).unwrap();
-        let changed = Schedule {
+        let changed = Trigger {
             generation: "test-next".into(),
             ..s.clone()
         };
@@ -1911,16 +2040,16 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert!(list(&w.places, None)["schedules"][0]["last"].is_null());
+        assert!(list(&w.places, None)["triggers"][0]["last"].is_null());
         // A restored old plist sees its own result, without a result rollback.
         std::fs::write(
             w.places.plist(&s.name),
             plist(Path::new("/A/app"), &s, &[], &[]),
         )
         .unwrap();
-        assert_eq!(list(&w.places, None)["schedules"][0]["last"]["turn"], 7);
+        assert_eq!(list(&w.places, None)["triggers"][0]["last"]["turn"], 7);
         for i in 0..PAGE_SIZE + 2 {
-            let item = Schedule {
+            let item = Trigger {
                 name: format!("task-{i:03}"),
                 message: "x".repeat(MAX_MESSAGE),
                 ..s.clone()
@@ -1932,13 +2061,13 @@ mod tests {
             .unwrap();
         }
         let first = list(&w.places, None);
-        assert_eq!(first["schedules"].as_array().unwrap().len(), PAGE_SIZE);
+        assert_eq!(first["triggers"].as_array().unwrap().len(), PAGE_SIZE);
         let second = list(&w.places, first["next_after"].as_str());
-        assert_eq!(second["schedules"].as_array().unwrap().len(), 3);
+        assert_eq!(second["triggers"].as_array().unwrap().len(), 3);
         assert!(second["next_after"].is_null());
         let before = first["next_after"].as_str().unwrap();
         assert!(
-            second["schedules"]
+            second["triggers"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -1947,26 +2076,26 @@ mod tests {
     }
 
     #[test]
-    fn recurring_schedules_wait_a_full_interval_before_the_first_fire() {
+    fn recurring_triggers_wait_a_full_interval_before_the_first_fire() {
         let now = clock(2026, 9, 28, 23, 52) + 30;
         for (value, seconds) in [("30m", 1800), ("2h", 7200), ("1d", 86400)] {
             let when = every(value, now).unwrap();
             assert_eq!(when.not_before, Some(now + 30 + seconds));
-            let s = Schedule {
+            let s = Trigger {
                 not_before: when.not_before,
-                ..schedule()
+                ..trigger()
             };
             assert_eq!(
-                Schedule::parse(&s.args()[1..]).unwrap().not_before,
+                Trigger::parse(&s.args()[1..]).unwrap().not_before,
                 when.not_before
             );
         }
     }
 
     #[test]
-    fn creating_and_replacing_leave_a_schedule_whole_or_as_it_was() {
+    fn creating_and_replacing_leave_a_trigger_whole_or_as_it_was() {
         let w = World::new("create");
-        let s = schedule();
+        let s = trigger();
         // A load launchd refuses leaves nothing.
         w.fake.refuse_load.set(true);
         assert!(w.install(&s).unwrap_err().contains("refused"));
@@ -1976,15 +2105,15 @@ mod tests {
         assert_eq!(w.state(&s.name), (true, true, false));
         // A replacement starts with no last result.
         record_last(&w.places, &s, &json!({"outcome": "skipped"})).unwrap();
-        let changed = Schedule {
+        let changed = Trigger {
             generation: "test-2".into(),
             message: "something else".into(),
-            ..schedule()
+            ..trigger()
         };
         w.install(&changed).unwrap();
         assert_eq!(w.state(&s.name), (true, true, true));
-        assert!(list(&w.places, None)["schedules"][0]["last"].is_null());
-        assert_eq!(schedules(&w.places)[0].0, changed);
+        assert!(list(&w.places, None)["triggers"][0]["last"].is_null());
+        assert_eq!(triggers(&w.places)[0].0, changed);
         // One launchd will not load puts the old one back, loaded, with its result.
         record_last(&w.places, &changed, &json!({"outcome": "skipped"})).unwrap();
         let before = w.plist(&s.name);
@@ -1994,7 +2123,7 @@ mod tests {
         // The fake refused the old one's load too; launchd loads it at the next login.
         assert_eq!(w.plist(&s.name), before);
         assert_eq!(
-            list(&w.places, None)["schedules"].clone()[0]["last"]["outcome"],
+            list(&w.places, None)["triggers"].clone()[0]["last"]["outcome"],
             "skipped"
         );
         w.fake
@@ -2008,16 +2137,16 @@ mod tests {
         assert_eq!(w.plist(&s.name), before);
         assert_eq!(w.state(&s.name), (true, true, true));
         // An old plist that cannot be read could not be put back: nothing is touched.
-        let odd = Schedule {
+        let odd = Trigger {
             name: "p.odd".into(),
-            ..schedule()
+            ..trigger()
         };
         std::fs::create_dir_all(w.places.plist(&odd.name).join("x")).unwrap();
         let unloads = w.fake.unloads.get();
         assert!(w.install(&odd).is_err());
         assert_eq!(w.fake.unloads.get(), unloads);
         // It is listed, saying why, and `rm` cannot take a folder away.
-        let row = list(&w.places, None)["schedules"]
+        let row = list(&w.places, None)["triggers"]
             .clone()
             .as_array()
             .unwrap()
@@ -2029,9 +2158,9 @@ mod tests {
         std::fs::remove_dir_all(w.places.plist(&odd.name)).unwrap();
         // Nor may a name differing only in case take an ended one's result.
         record_last(&w.places, &once(), &json!({"outcome": "failed"})).unwrap();
-        let cased = Schedule {
+        let cased = Trigger {
             name: "P.Once".into(),
-            ..schedule()
+            ..trigger()
         };
         assert!(w.install(&cased).unwrap_err().starts_with("name_taken"));
         // A creation over a job loaded without its plist replaces that job.
@@ -2044,7 +2173,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fire_ends_only_the_schedule_it_ran_for() {
+    fn a_fire_ends_only_the_trigger_it_ran_for() {
         let w = World::new("fire");
         let one = once();
         // Delivered: nothing is left.
@@ -2058,7 +2187,7 @@ mod tests {
             json!({"outcome": "failed", "detail": "daemon_unavailable"}),
         );
         assert_eq!(w.state(&one.name), (false, false, true));
-        let listed = list(&w.places, None)["schedules"].clone();
+        let listed = list(&w.places, None)["triggers"].clone();
         assert_eq!(listed.as_array().unwrap().len(), 1);
         assert_eq!(
             (&listed[0]["ended"], &listed[0]["last"]["outcome"]),
@@ -2066,25 +2195,25 @@ mod tests {
         );
         assert_eq!(listed[0]["message"], one.message);
         w.remove(&one.name).unwrap();
-        assert_eq!(list(&w.places, None)["schedules"].clone(), json!([]));
+        assert_eq!(list(&w.places, None)["triggers"].clone(), json!([]));
         // Replaced while its message went out: the new one is left alone.
         w.install(&one).unwrap();
-        let replacement = Schedule {
+        let replacement = Trigger {
             message: "a new reminder".into(),
             ..once()
         };
         w.install(&replacement).unwrap();
         w.settle(&one, json!({"outcome": "sent", "turn": 3}));
         assert_eq!(w.state(&one.name), (true, true, false));
-        assert_eq!(schedules(&w.places)[0].0, replacement);
+        assert_eq!(triggers(&w.places)[0].0, replacement);
         // An unload launchd refuses puts the plist back, listed for `rm`.
         w.fake.refuse_unload.set(true);
         w.settle(&replacement, json!({"outcome": "sent", "turn": 4}));
         w.fake.refuse_unload.set(false);
         assert_eq!(w.state(&one.name), (true, true, true));
-        assert_eq!(schedules(&w.places)[0].0, replacement);
+        assert_eq!(triggers(&w.places)[0].0, replacement);
         assert_eq!(
-            list(&w.places, None)["schedules"].clone()[0]["last"]["turn"],
+            list(&w.places, None)["triggers"].clone()[0]["last"]["turn"],
             4
         );
         // A job left loaded without its plist (an end cut short) is unloaded
@@ -2093,7 +2222,7 @@ mod tests {
         w.settle(&replacement, json!({"outcome": "missed"}));
         assert_eq!(w.state(&one.name), (false, false, true));
         assert_eq!(
-            list(&w.places, None)["schedules"].clone()[0]["last"]["turn"],
+            list(&w.places, None)["triggers"].clone()[0]["last"]["turn"],
             4
         );
         w.remove(&one.name).unwrap();
@@ -2106,7 +2235,7 @@ mod tests {
         assert!(w.fake.loaded.borrow().contains(&format!("{LABEL}p.stuck")));
         std::fs::remove_dir_all(&stuck).unwrap();
         // A repeating one ends only when its agent is gone, keeping why.
-        let s = schedule();
+        let s = trigger();
         w.install(&s).unwrap();
         w.settle(&s, json!({"outcome": "skipped"}));
         assert_eq!(w.state(&s.name), (true, true, true));
@@ -2115,9 +2244,9 @@ mod tests {
     }
 
     #[test]
-    fn removal_reaches_whatever_is_left_of_a_schedule() {
+    fn removal_reaches_whatever_is_left_of_a_trigger() {
         let w = World::new("remove");
-        let s = schedule();
+        let s = trigger();
         w.install(&s).unwrap();
         record_last(&w.places, &s, &json!({"outcome": "sent"})).unwrap();
         // An unload launchd refuses keeps everything, to be tried again.
@@ -2130,7 +2259,7 @@ mod tests {
         assert!(
             w.remove(&s.name)
                 .unwrap_err()
-                .starts_with("schedule_not_found")
+                .starts_with("trigger_not_found")
         );
         // A plist launchd no longer has, as after a failed reload.
         w.install(&s).unwrap();
@@ -2145,17 +2274,14 @@ mod tests {
         w.remove(&s.name).unwrap();
         assert_eq!(w.state(&s.name), (false, false, false));
         // A one-off still there two days after its time is listed as missed.
-        let late = Schedule {
+        let late = Trigger {
             at: Some(now() - 3 * 24 * 3600),
             ..once()
         };
         w.install(&late).unwrap();
-        assert_eq!(
-            list(&w.places, None)["schedules"].clone()[0]["missed"],
-            true
-        );
+        assert_eq!(list(&w.places, None)["triggers"].clone()[0]["missed"], true);
         // Its fire the next year does not send it; it ends, saying so.
-        let stale = Schedule {
+        let stale = Trigger {
             at: Some(now() - STALE - 3600),
             ..once()
         };
@@ -2166,9 +2292,114 @@ mod tests {
         );
         assert_eq!(w.state(&stale.name), (false, false, true));
         assert_eq!(
-            list(&w.places, None)["schedules"].clone()[0]["last"]["outcome"],
+            list(&w.places, None)["triggers"].clone()[0]["last"]["outcome"],
             "missed"
         );
+    }
+
+    #[test]
+    fn earlier_schedules_become_triggers_once() {
+        let w = World::new("migrate");
+        let home = w.root.join(".agent");
+        let places = Places {
+            agents: w.places.agents.clone(),
+            state: home.join("triggers"),
+        };
+        let old_state = home.join("schedules");
+        std::fs::create_dir_all(&old_state).unwrap();
+        std::fs::create_dir_all(&places.agents).unwrap();
+        // What an earlier app wrote for two schedules, an ended one's result,
+        // and one that is not a schedule's plist.
+        let entries = every("1d", clock(2026, 9, 28, 9, 7)).unwrap().entries;
+        let old = |s: &Trigger| {
+            plist(Path::new("/A/agent-app"), s, &entries, &[])
+                .replace(LABEL, SCHEDULE_LABEL)
+                .replace(FIRE_FLAG, SCHEDULE_FIRE_FLAG)
+        };
+        let (a, b) = (
+            trigger(),
+            Trigger {
+                name: "p.b".into(),
+                ..trigger()
+            },
+        );
+        for s in [&a, &b] {
+            let path = places
+                .agents
+                .join(format!("{SCHEDULE_LABEL}{}.plist", s.name));
+            std::fs::write(&path, old(s)).unwrap();
+            w.fake
+                .loaded
+                .borrow_mut()
+                .insert(format!("{SCHEDULE_LABEL}{}", s.name));
+        }
+        let result = a.json(Some(json!({"outcome": "sent", "turn": 3})));
+        std::fs::write(old_state.join("p.fix-login.json"), result.to_string()).unwrap();
+        std::fs::write(
+            old_state.join("p.ended.json"),
+            json!({"name": "p.ended", "message": "m"}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(old_state.join(".lock"), "").unwrap();
+        let odd = places.agents.join(format!("{SCHEDULE_LABEL}p.odd.plist"));
+        std::fs::write(&odd, "<plist/>").unwrap();
+        std::fs::write(
+            home.join("schedule"),
+            "#!/bin/sh\nexec '/A/agent-app' --schedule \"$@\"\n",
+        )
+        .unwrap();
+        // Run by p.b's own fire, whose unload is last: it ends the process.
+        let order = RefCell::new(Vec::new());
+        migrate(&places, Some("p.b"), &|x| {
+            if let Launchd::Unload(label) = &x {
+                order.borrow_mut().push(label.to_string());
+            }
+            w.fake.call(x)
+        });
+        assert_eq!(
+            triggers(&places)
+                .into_iter()
+                .map(|t| t.0)
+                .collect::<Vec<_>>(),
+            [b.clone(), a.clone()]
+        );
+        assert_eq!(
+            w.fake.loaded.borrow().iter().cloned().collect::<Vec<_>>(),
+            [format!("{LABEL}p.b"), format!("{LABEL}p.fix-login")]
+        );
+        assert_eq!(
+            order.borrow().last().unwrap(),
+            &format!("{SCHEDULE_LABEL}p.b")
+        );
+        let rows = list(&places, None)["triggers"].clone();
+        assert_eq!(rows.as_array().unwrap().len(), 3);
+        assert_eq!(rows[0]["name"], "p.b");
+        assert_eq!(
+            (&rows[1]["name"], &rows[1]["ended"]),
+            (&json!("p.ended"), &json!(true))
+        );
+        assert_eq!(rows[2]["last"]["turn"], 3);
+        // What could not be read stays where it was; the rest is gone.
+        assert!(odd.exists());
+        assert!(!old_state.exists());
+        assert!(!home.join("schedule").exists());
+        // Run again, there is nothing more to do.
+        let unloads = w.fake.unloads.get();
+        migrate(&places, None, &|x| w.fake.call(x));
+        assert_eq!(w.fake.unloads.get(), unloads);
+    }
+
+    #[test]
+    fn errors_have_one_shape() {
+        assert_eq!(
+            error_json("trigger_not_found: x"),
+            json!({"error": "trigger_not_found", "detail": "x"})
+        );
+        assert_eq!(
+            error_json("/a/b: no such file"),
+            json!({"error": "trigger_failed", "detail": "/a/b: no such file"})
+        );
+        assert_eq!(error_json("usage: trigger ls")["error"], "usage");
     }
 
     #[test]

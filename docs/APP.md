@@ -58,7 +58,7 @@ when a bot's turn sent it (`from`, which the CLI fills from `AGENT_BOT` and
 `AGENT_TURN`), and `history_items` returns it with each prompt, so a chat
 read back after a restart keeps the names. Messages the app sends on its own
 name their `origin` and are tagged with it: `tasks` for a coordinator's task
-updates and `schedule` for a scheduled message. The daemon keeps the sender
+updates and `trigger` for a triggered message. The daemon keeps the sender
 with the message, so a fork keeps it after its source is deleted; the name
 links to the agent only while that name still holds the identity (`from.id`)
 that sent it.
@@ -69,7 +69,7 @@ A side chat asked while the lead works: a fork beside it, the lead untouched.
 
 ![A side chat beside the running lead](app/side-chat.png)
 
-A turn you or the app asked for (a scheduled message, a coordinator's task
+A turn you or the app asked for (a triggered message, a coordinator's task
 update) that finishes while its agent is off screen shows ✔ instead of ○
 until you open that agent; a swarm's row shows it for its agents until you
 open the swarm. Settings, help, the finder and the swarm sheet count as off
@@ -184,10 +184,10 @@ needs.
 
 ![A coordinator reads a task update and passes build's change on to test](app/coordinator-wake.png)
 
-Agents can be woken at set times. Settings lists the schedules, what each one
+Agents can be woken at set times. Settings lists the triggers, what each one
 last did, and the message it sends.
 
-![Schedules in Settings](app/settings-schedules.png)
+![Triggers in Settings](app/settings-triggers.png)
 
 ## What the daemon speaks, and why the client speaks it directly
 
@@ -242,8 +242,8 @@ client/          agent-client: the socket protocol and the client policy
   ([remote.rs](../app/src-tauri/src/remote.rs));
   `policy` composes a folder's client policy, in a profile when named, and
   falls back to the profiles the app ships for `coordinator`;
-  `schedules` and `schedule_remove` list and remove
-  [schedules](#schedules) ([schedule.rs](../app/src-tauri/src/schedule.rs)).
+  `triggers` and `trigger_remove` list and remove
+  [triggers](#triggers) ([trigger.rs](../app/src-tauri/src/trigger.rs)).
   When nothing listens on a store's socket, `attach` starts a daemon first
   ([daemon.rs](../app/src-tauri/src/daemon.rs)); see
   [Installing](#installing).
@@ -994,37 +994,37 @@ the second with the first, or with `idempotency_conflict` when that window
 counted from an earlier turn, which it takes as told. A task deleted before
 its news goes out is dropped from it.
 
-## Schedules
+## Triggers
 
-Listings return 64 schedules per page, with `next_after` for `schedule ls
+Listings return 64 triggers per page, with `next_after` for `trigger ls
 --after NAME` or the next page in Settings. Only the current page's messages
 are retained. `--every` waits at least one full interval before the first
 submission; calendar ticks before that earliest time do nothing. An implicit
 bot from an agent shell must still match `AGENT_BOT_ID`.
 
-Schedules are local to this machine. Remote windows neither list nor remove
-local schedules. Scheduled submissions carry `origin: "schedule"`; coordinator
+Triggers are local to this machine. Remote windows neither list nor remove
+local triggers. Triggered submissions carry `origin: "trigger"`; coordinator
 updates carry `origin: "tasks"`. Both are automated input, not human consent
 for the approver.
 
-A schedule wakes an agent at set times with a message: a new turn in its
-own conversation, never a new agent. launchd keeps the time, so a schedule
+A trigger wakes an agent at set times with a message: a new turn in its
+own conversation, never a new agent. launchd keeps the time, so a trigger
 fires with the app closed, and a time the Mac slept through fires once when
 it wakes (`StartCalendarInterval` coalesces missed times; `StartInterval`
 and cron skip them). The daemon has no clock for this.
 
-The app writes `~/.agent/schedule` each time it opens, a script that runs its
-executable with `--schedule`:
+The app writes `~/.agent/trigger` each time it opens, a script that runs its
+executable with `--trigger`:
 
 ```sh
-~/.agent/schedule add [--bot NAME] [--name NAME] (--every 30m | --in 45m | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY') -- MESSAGE
-~/.agent/schedule ls
-~/.agent/schedule rm NAME
+~/.agent/trigger add [--bot NAME] [--name NAME] (--every 30m | --in 45m | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY') -- MESSAGE
+~/.agent/trigger ls
+~/.agent/trigger rm NAME
 ```
 
 `add` defaults to the agent whose shell runs it (`AGENT_BOT`), reaches that
 shell's daemon (starting it, as a fire does, when none answers), and pins
-the schedule to the bot's id and its daemon's store identity, with the
+the trigger to the bot's id and its daemon's store identity, with the
 store and socket paths made absolute. `--every` counts from the next whole
 minute in minutes that divide an hour, hours that divide a day, or `1d`;
 `--in` and `--at` are one-offs within a year, which remove themselves once
@@ -1032,37 +1032,37 @@ fired (`--in` rounds up to the next whole minute, since launchd keeps
 minutes; `--at` refuses a part out of range or extra parts); `--cron` is read as cron reads it, a day or a weekday when both are
 given, up to 1,024 calendar entries. A message is at most 16 KiB. The serialized
 plist must also fit the 128 KiB record-read limit, including XML escaping; an
-oversized definition fails with `invalid_schedule` before changing a job or its
-saved plist. Narrow the cron expression or shorten the message. A schedule
+oversized definition fails with `invalid_trigger` before changing a job or its
+saved plist. Narrow the cron expression or shorten the message. A trigger
 is named after its bot unless `--name` says otherwise, and one added under a
 name in use replaces it. A name differing from another only in case is
 refused (`name_taken`), since macOS folders would give both one file, and
-`rm` finds a schedule only by the name as stored.
+`rm` finds a trigger only by the name as stored.
 
-Each is one LaunchAgent, `~/Library/LaunchAgents/me.lydakis.agent.schedule.NAME.plist`,
+Each is one LaunchAgent, `~/Library/LaunchAgents/me.lydakis.agent.trigger.NAME.plist`,
 and that file is its only record: its program arguments carry the bot, its
 id, the store and the socket of the shell it was made from (an agent's shell
 has both), the store identity its daemon announced, the one-off's time and
 the message. A fire whose daemon announces another store (a reused socket)
 sends nothing and records `store_mismatch`. When it fires, the app's
-executable runs with `--schedule-fire` and those arguments. It connects to
+executable runs with `--trigger-fire` and those arguments. It connects to
 the daemon, and when none answers and the store is known, starts one for it
 on that socket as the app does, with the login shell's environment and
-`~/.agent/env`. A repeating schedule submits with `delivery: reject`: a bot
+`~/.agent/env`. A repeating trigger submits with `delivery: reject`: a bot
 that is working, or has work waiting, skips that time rather than having it
 cut in or pile up. A one-off submits with `delivery: queue`, so a working
 bot gets it after its turn. A bot deleted since, or a new bot under its
-name, is not reached (`bot_not_found`), and the schedule ends. A one-off's
+name, is not reached (`bot_not_found`), and the trigger ends. A one-off's
 calendar entry has no year, so a fire more than two days before its time
 does nothing (the slack keeps a one-off whose Mac changed time zone since,
 since launchd follows the new zone's clock), and one more than half a year
 after it is that entry's next year: it sends nothing and ends as `missed`.
 What the fire did (`sent` with the turn, `skipped`, `gone`, `missed` or
-`failed` with why) is kept with the schedule's row in
-`~/.agent/schedules/NAME.json`, which Settings shows beside each schedule
+`failed` with why) is kept with the trigger's row in
+`~/.agent/triggers/NAME.json`, which Settings shows beside each trigger
 with its message and a Remove button.
 
-A schedule's state is three things: its plist, launchd's loaded copy, and
+A trigger's state is three things: its plist, launchd's loaded copy, and
 that last result. Every change keeps them either whole or as they were, and
 anything else a failure can leave is listed and removable:
 
@@ -1076,9 +1076,9 @@ anything else a failure can leave is listed and removable:
   anything changes. A new plist that cannot be written or loaded puts the
   old plist back and loads it; if launchd refuses that too, the
   old plist is listed and loads at the next login.
-- **Firing** records its result and ends a schedule that is over, both
+- **Firing** records its result and ends a trigger that is over, both
   under the lock and only while the plist is still the one it fired for: a
-  schedule replaced or removed while its message went out is left as it now
+  trigger replaced or removed while its message went out is left as it now
   is. A one-off that delivered leaves nothing. One that ends without
   delivering (its agent gone, the daemon unreachable, `missed`) loses its
   plist but keeps its last result, so Settings and `ls` list it as not
@@ -1102,14 +1102,26 @@ anything else a failure can leave is listed and removable:
 
 The files are written, synced, renamed and their folder synced; deletions
 sync their folder too. `add`, `rm`, a fire's result and end, and the app's
-refresh take a lock (`~/.agent/schedules/.lock`) around their changes, and
-the refresh reads each plist again under it. `~/.agent/schedule` is written with its
+refresh take a lock (`~/.agent/triggers/.lock`) around their changes, and
+the refresh reads each plist again under it. `~/.agent/trigger` is written with its
 executable mode from the start. When the
 app starts from a new place, as after an update, it writes its path into
-every schedule and loads it again, on a thread of its own so the window does
+every trigger and loads it again, on a thread of its own so the window does
 not wait; one launchd refuses keeps its old path and is tried again at the
-next start. Settings lists schedules also when no project exists. Only macOS has launchd; elsewhere `add`
-refuses with `schedules_unsupported`.
+next start. Settings lists triggers also when no project exists. Only macOS has launchd; elsewhere `add`
+refuses with `triggers_unsupported`.
+
+Every reply of `~/.agent/trigger` is one JSON value on stdout; a failure is
+one `{"error": CODE, "detail": ...}` on stderr with exit 1.
+
+Earlier apps called these schedules (`~/.agent/schedule`, jobs labelled
+`me.lydakis.agent.schedule.NAME` running `--schedule-fire`, results in
+`~/.agent/schedules`). The first start of this app, or the first fire of
+such a job before it, converts each once: the same definition under the
+trigger label, its last result moved, the old job unloaded and its plist,
+folder and script removed. A fire that converts sends nothing; its trigger
+fires at its next time. A schedule plist that cannot be read, or whose
+name a trigger has, is left where it is and logged.
 
 ## What it costs, and where the bounds are
 
@@ -1272,7 +1284,12 @@ task updates are tested in `app/tests/state.test.cjs` and were driven in demo
 mode in headless Chromium. The real-launchd test passed on a Mac (2026-09-29, at 2e484ed): launchd
 fired the one-off at its minute and it ended itself; replace, `rm` of a
 plist launchd had dropped, `rm` of a job without its plist, and a last `rm`
-answering `schedule_not_found` all held.
+answering `schedule_not_found` all held. Schedules have since become
+triggers: that module and test are now `trigger.rs` and `tests/test_trigger.py`. After the
+rename (2026-10-09, Linux container) the same real-daemon tests passed under
+the new names, and the conversion of earlier schedules passed against the
+stand-in launchd: both converted, the running one's old job unloaded last,
+its result and an ended one's moved, an unreadable plist left in place.
 
 ## Next
 
@@ -1308,13 +1325,13 @@ project creation (no file for a refused model),
 steers pinned to their turn, model picks pinned to identity, the demo
 daemon's steer delivery, a message's sender (another agent's, live, steered
 in, queued and read back, unlinked once its name holds a new agent, and the
-app's own task updates and schedules by origin), and runs
+app's own task updates and triggers by origin), and runs
 folded with failures on their line. Also covers coordinator task updates: batched at rest, excluding requested and replayed turns, retained after send failures.
 `cargo test -p agent-app` includes a failed project-file write leaving
-neither a partial file nor a temporary, and schedules' calendars, plists,
-move, and each lifecycle step with launchd refusing. With `AGENT_TEST_RUNTIME=1` after a release build
-and `cargo build -p agent-app`, `python3 -m unittest tests.test_schedule`
-fires schedules against a real daemon; on a Mac, `AGENT_TEST_LAUNCHD=1`
+neither a partial file nor a temporary, and triggers' calendars, plists,
+move, the conversion of earlier schedules, and each lifecycle step with launchd refusing. With `AGENT_TEST_RUNTIME=1` after a release build
+and `cargo build -p agent-app`, `python3 -m unittest tests.test_trigger`
+fires triggers against a real daemon; on a Mac, `AGENT_TEST_LAUNCHD=1`
 adds its one launchd test, which loads real jobs (under a scratch `HOME`, so
 nothing loads at the next login) and checks that launchd fires a one-off,
 which ends itself, and that replace and `rm` work on real jobs.

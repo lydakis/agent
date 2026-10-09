@@ -2,10 +2,10 @@
 //! daemon. The page owns the state model and the protocol logic, exactly as
 //! the prototype did; this side connects, forwards notifications as window
 //! events, and relays requests. Beside that it reads the files the app owns
-//! (projects, profiles, swarms, schedules) and makes a swarm's shared
+//! (projects, profiles, swarms, triggers) and makes a swarm's shared
 //! worktree; run with `--swarm-post` it is a swarm's post tool (see
-//! `swarm`), and with `--schedule` or `--schedule-fire` it adds, lists,
-//! removes or fires schedules (see `schedule`).
+//! `swarm`), and with `--trigger` or `--trigger-fire` it adds, lists,
+//! removes or fires triggers (see `trigger`).
 //!
 //! Each window attaches to one daemon: this machine's, or a host's reached
 //! over SSH (see `remote`). A window on a host never reads or writes this
@@ -15,10 +15,10 @@
 mod daemon;
 mod project;
 mod remote;
-mod schedule;
 mod session;
 mod settings;
 mod swarm;
+mod trigger;
 mod worktree;
 
 use agent_client::Client;
@@ -1127,37 +1127,37 @@ async fn swarm_decide(
     swarm::act(&client, &swarms_of(&state)?, &swarm, None, act).await
 }
 
-/// Schedules use this machine's launchd, never a remote window's agents.
-fn schedules_of(state: &Shared) -> Result<schedule::Places, String> {
+/// Triggers use this machine's launchd, never a remote window's agents.
+fn triggers_of(state: &Shared) -> Result<trigger::Places, String> {
     if state.host().is_some() {
-        return Err("remote_unsupported: schedules run on this machine only; open a local window for schedules".into());
+        return Err("remote_unsupported: triggers run on this machine only; open a local window for triggers".into());
     }
-    schedule::Places::home()
+    trigger::Places::home()
 }
 
-/// Every schedule, with what its last fire did.
+/// Every trigger, with what its last fire did.
 #[tauri::command]
-fn schedules(
+fn triggers(
     windows: State<'_, Windows>,
     window: tauri::WebviewWindow,
     after: Option<String>,
 ) -> Result<Value, String> {
-    Ok(schedule::list(
-        &schedules_of(&*windows.of(&window)?)?,
+    Ok(trigger::list(
+        &triggers_of(&*windows.of(&window)?)?,
         after.as_deref(),
     ))
 }
 
 #[tauri::command]
-fn schedule_remove(
+fn trigger_remove(
     windows: State<'_, Windows>,
     window: tauri::WebviewWindow,
     name: String,
 ) -> Result<(), String> {
-    schedule::remove(
-        &schedules_of(&*windows.of(&window)?)?,
+    trigger::remove(
+        &triggers_of(&*windows.of(&window)?)?,
         &name,
-        &schedule::launchctl,
+        &trigger::launchctl,
     )
 }
 
@@ -1181,15 +1181,16 @@ async fn request(
 }
 
 fn main() {
-    // A swarm's `post` script, a coordinator's `start`, `~/.agent/schedule`
+    // A swarm's `post` script, a coordinator's `start`, `~/.agent/trigger`
     // and launchd's fires run this executable; each acts and exits without
     // a window.
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some(swarm::POST_FLAG) => std::process::exit(swarm::cli(&args[2..])),
         Some(swarm::START_FLAG) => std::process::exit(swarm::start_cli(&args[2..])),
-        Some(schedule::FLAG) => std::process::exit(schedule::cli(&args[2..])),
-        Some(schedule::FIRE_FLAG) => std::process::exit(schedule::fire_cli(&args[2..])),
+        Some(trigger::FLAG) => std::process::exit(trigger::cli(&args[2..])),
+        Some(trigger::FIRE_FLAG) => std::process::exit(trigger::fire_cli(&args[2..])),
+        Some(trigger::SCHEDULE_FIRE_FLAG) => std::process::exit(trigger::migrate_cli(&args[2..])),
         _ => {}
     }
     if let (Ok(home), Ok(app)) = (swarm::home(), std::env::current_exe()) {
@@ -1198,16 +1199,20 @@ fn main() {
             eprintln!("agent-app: {error}");
         }
         if let Some(state) = home.parent()
-            && let Err(error) = schedule::write_script(state, &app)
+            && let Err(error) = trigger::write_script(state, &app)
         {
             eprintln!("agent-app: {error}");
         }
-        // Off the window's way: a moved app reloads every schedule, each a launchctl run.
+        // Off the window's way: earlier schedules become triggers, and a
+        // moved app reloads every trigger, each a launchctl run.
         if cfg!(target_os = "macos")
-            && let Ok(places) = schedule::Places::home()
+            && let Ok(places) = trigger::Places::home()
         {
             let app = app.clone();
-            std::thread::spawn(move || schedule::refresh(&places, &app, &schedule::launchctl));
+            std::thread::spawn(move || {
+                trigger::migrate(&places, None, &trigger::launchctl);
+                trigger::refresh(&places, &app, &trigger::launchctl);
+            });
         }
     }
     let links = remote::Hosts::new(
@@ -1261,8 +1266,8 @@ fn main() {
             swarm_post,
             swarm_check,
             swarm_decide,
-            schedules,
-            schedule_remove
+            triggers,
+            trigger_remove
         ])
         .setup(move |app| {
             if let Some(window) = app.get_webview_window("main") {
@@ -1436,7 +1441,7 @@ mod host_tests {
         assert_eq!(shim.count("agent start"), 1);
         assert!(!started.exists(), "a local daemon was started for a host");
         assert!(
-            schedules_of(&window)
+            triggers_of(&window)
                 .err()
                 .unwrap()
                 .starts_with("remote_unsupported:")
