@@ -1221,9 +1221,9 @@ other links show as their text. A link inside a drawn diagram (a Mermaid
 raster `data:` URLs the message carries, and only on a click, as a small
 image can decode to far more than its bytes; a remote image is a link and a
 local one opens beside, so drawing a message makes no request a model chose.
-An HTML preview runs scripts in a frame sandboxed without same-origin access: it cannot read the app or its storage, cannot
-navigate the window, and the app's script globals are injected into the main
-frame only. Its page carries a policy that loads nothing from the network (no
+An HTML preview runs scripts in a frame sandboxed without same-origin access:
+it cannot read the app or its storage, cannot navigate the window, and the
+app's script globals are injected into the main frame only. Its page carries a policy that loads nothing from the network (no
 fetch, scripts, styles, images or fonts but its own inline ones and `data:`),
 and the window's policy (`frame-src about:`) stops a preview from navigating
 its own frame to a website. A preview runs only once asked, so a long
