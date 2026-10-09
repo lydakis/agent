@@ -975,11 +975,12 @@ works), at most
 once every ten minutes, in one message queued to it: `Task updates:`, then
 one line per task with its latest ended turn's handle and status (or
 `waiting for approval`), who asked for it (`you` for the coordinator's own
-ask, a bot's name, or `the person`), and how many turns ended before it
+ask, a bot's name, the app's `origin` such as `schedule`, or `the person`), and how many turns ended before it
 since which handle. Turns you asked for in a task yourself are listed
 last, under a line saying they are yours; the role tells the coordinator to
 leave them to you rather than check or correct them. Turns anyone else asked
-for, and approvals, are listed first. Each list keeps its own first and
+for, and approvals, are listed first; a turn's end is listed with its
+pending approval, so an approval you already answered is not raised. Each list keeps its own first and
 latest handle and count per task, so a task in both is named in both, each
 time by the handle that list needs. The handles are what its
 `wait` tool reads a final reply by, so the message stays small however much

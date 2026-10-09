@@ -33,7 +33,7 @@ const S = {
   swarms: new Map(), memberOf: new Map(),
   // Who asked for each turn another bot asked for, until it ends, and what each coordinator has yet to
   // hear about its tasks (see `wake`), and turns that ended live before the snapshot said who made their bot.
-  turnFrom: new Map(), wakes: new Map(), heldNews: [],
+  turnFrom: new Map(), turnOrigin: new Map(), wakes: new Map(), heldNews: [],
   // Bots whose finished turn the person has not looked at yet (see `shownStatus`), and turns another
   // bot asked for that the person steered into, whose end is theirs to see too.
   unseen: new Set(), wanted: new Set(),
@@ -270,7 +270,7 @@ function forgetBot(name) {
   // A coordinator gone hears nothing more, and its queued turns never end; a task gone is no news.
   if (S.wakes.has(name)) { clearTimeout(S.wakes.get(name).timer); S.wakes.delete(name); }
   for (const w of S.wakes.values()) if (w.tasks.delete(name) && !w.tasks.size) { clearTimeout(w.timer); w.timer = null; }
-  for (const key of S.turnFrom.keys()) if (key.startsWith(`${name}\u0000`)) S.turnFrom.delete(key);
+  for (const map of [S.turnFrom, S.turnOrigin]) for (const key of map.keys()) if (key.startsWith(`${name}\u0000`)) map.delete(key);
   for (const key of S.wanted) if (key.startsWith(`${name}\u0000`)) S.wanted.delete(key);
   // Held news is this bot's; a later bot of the same name is another.
   S.heldNews = S.heldNews.filter(([held]) => held !== name);
@@ -652,6 +652,7 @@ async function onEvent(ev) {
     }
     case 'accepted': {
       if (data.from?.bot) S.turnFrom.set(`${name}\u0000${turn}`, data.from.bot);
+      else if (typeof data.origin === 'string') S.turnOrigin.set(`${name}\u0000${turn}`, data.origin);
       const b = bot(name); if (b) { b.status = 'running'; b.runningTurn = turn; b.waitingOn = []; b.turnStarted = S.live ? Date.now() : 0; b.elapsed = 0; }
       // The event that puts a prompt on the lineage names who sent it, here and on `steered`.
       const t = transcript(name), by = senderOf(data);
@@ -660,6 +661,7 @@ async function onEvent(ev) {
     }
     case 'queued': {
       if (data.from?.bot) S.turnFrom.set(`${name}\u0000${turn}`, data.from.bot);
+      else if (typeof data.origin === 'string') S.turnOrigin.set(`${name}\u0000${turn}`, data.origin);
       // `ready` waits for a daemon-wide slot with nothing else running on the bot; `queued` sits behind its own turn.
       const b = bot(name); const behindOwn = !!b && (b.runningTurn !== null || isActive(b.status));
       if (b && !behindOwn) { b.status = data.status ?? 'queued'; b.runningTurn = turn; }
@@ -730,7 +732,7 @@ async function onEvent(ev) {
     case 'turn_finished': {
       const status = data.status ?? '?';
       const b = bot(name);
-      const key = `${name}\u0000${turn}`, from = S.turnFrom.get(key); S.turnFrom.delete(key);
+      const key = `${name}\u0000${turn}`, from = S.turnFrom.get(key), origin = S.turnOrigin.get(key); S.turnFrom.delete(key); S.turnOrigin.delete(key);
       // A steer absorbed into a running turn finishes as its own turn while that turn goes on.
       if (b && (b.runningTurn === null || b.runningTurn === turn)) { b.runningTurn = null; b.waitingOn = []; if (b.turnStarted) b.elapsed = Date.now() - b.turnStarted; b.turnStarted = 0; b.status = status === 'completed' || status === 'steered' ? 'idle' : status; }
       const t = transcript(name);
@@ -741,7 +743,7 @@ async function onEvent(ev) {
       if (b && S.live && status === 'completed' && (!from || wanted) && !onScreen(name) && !S.unseen.has(name)) { S.unseen.add(name); patchUnseen([name]); }
       // A steer's turn is part of the turn it joined, whose end is the news.
       // A task's creator may still be on a snapshot page to come; its news waits for the whole snapshot.
-      if (S.live && status !== 'steered') { if (S.snapshot) S.heldNews.push([name, turn, status, from]); else tellLead(name, turn, status, from); }
+      if (S.live && status !== 'steered') { if (S.snapshot) S.heldNews.push([name, turn, status, from, undefined, origin]); else tellLead(name, turn, status, from, undefined, origin); }
       // A coordinator coming to rest hears what waited for it.
       if (S.wakes.has(name)) wakeSoon(name);
       // A background command may outlive its turn; only a wait result says how it ended.
@@ -964,19 +966,21 @@ function enqueue(job) { chain = chain.then(job, job); return chain; }
 // them with, and its role says what to do with that. A turn it is waiting on is not news, since its wait
 // reads it; nor is its own fork or side chat. Only live turns count, while this window is attached.
 // Turns you asked for in a task yourself are its `theirs` news, listed apart: the coordinator hears of
-// them but is not asked to act on them. Turns anyone else asked for, and approvals, are its `act` news.
+// them but is not asked to act on them. Turns another agent or the app (a schedule, by its `origin`)
+// asked for, and approvals, are its `act` news; a turn's end goes where its pending approval is.
 // Each kind keeps its own first and latest turn and a count, whatever the backlog, so a task can be in
 // both lists with the handles each one needs; one message names at most WAKE_TASKS tasks, those with
 // news to act on first, and the rest wait for the next.
 const WAKE_MS = 10 * 60 * 1000, WAKE_TASKS = 32, KINDS = ['act', 'theirs'];
-function tellLead(name, turn, status, from, approval) {
+function tellLead(name, turn, status, from, approval, origin) {
   const b = bot(name), lead = b && creatorOf(b);
   if (!lead || !leadProject(lead.name) || name.startsWith(`${lead.name}-`)) return;
   if (lead.waitingOn?.includes(`turn:${name}/${turn}`)) return;
   let w = S.wakes.get(lead.name);
   if (!w) { w = { tasks: new Map(), last: 0, timer: null }; S.wakes.set(lead.name, w); }
-  const by = status === 'waiting for approval' ? null : from === lead.name ? 'you' : from ?? 'the person';
-  merge(w.tasks, name, { [by === 'the person' ? 'theirs' : 'act']: { first: turn, turn, status, by, count: 1, ...(approval ? { approval } : {}) } });
+  const by = status === 'waiting for approval' ? null : from === lead.name ? 'you' : from ?? origin ?? 'the person';
+  const asked = w.tasks.get(name)?.act, answered = asked?.turn === turn && asked.status === 'waiting for approval';
+  merge(w.tasks, name, { [by === 'the person' && !answered ? 'theirs' : 'act']: { first: turn, turn, status, by, count: 1, ...(approval ? { approval } : {}) } });
   wakeSoon(lead.name);
 }
 function merge(tasks, name, news) {
@@ -1174,7 +1178,7 @@ function forgetStore() {
   S.cursor = 0; S.bots.clear(); S.transcripts.clear(); S.drafts.clear(); S.override.clear(); S.effort.clear(); S.families.clear();
   S.swarms.clear(); S.memberOf.clear(); S.deleted.clear(); looked.clear();
   for (const w of S.wakes.values()) clearTimeout(w.timer);
-  S.wakes.clear(); S.turnFrom.clear(); S.heldNews = []; S.unseen.clear(); S.wanted.clear();
+  S.wakes.clear(); S.turnFrom.clear(); S.turnOrigin.clear(); S.heldNews = []; S.unseen.clear(); S.wanted.clear();
   S.selected = ''; S.autoSelect = true; S.ui.side = null; S.ui.folded = new Set();
   S.botsGen += 1; S.shapeGen += 1;
   // A home the last host named is not this one's.

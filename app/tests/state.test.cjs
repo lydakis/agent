@@ -2247,6 +2247,28 @@ test('a window that saw news to act on never defers to one that saw only yours',
   assert.ok([...told.values()].some((prompt) => /\n- demo\.build: turn:demo\.build\/2 completed, asked by you\n/.test(prompt)));
 });
 
+test('an approval answered before the coordinator hears of it is not raised, and a schedule\'s turn is the coordinator\'s', async () => {
+  const sent = [];
+  const p = page({ request: async (op, params) => { if (op === 'submit') sent.push(params); return {}; }, log() {} });
+  p.S.live = true; p.S.attached = true;
+  p.upsert({ name: 'demo.lead', id: 1, status: 'running' });
+  for (const [name, id] of [['demo.build', 2], ['demo.nightly', 3]]) p.upsert({ name, id, status: 'idle', created_by: 'demo.lead', created_by_id: 1 });
+  // Your turn waits for your approval, which you give before the coordinator rests.
+  await p.onEvent({ event: 'accepted', bot: 'demo.build', turn: 1, data: { node: 1 } });
+  await p.onEvent({ event: 'turn_waiting', bot: 'demo.build', turn: 1, data: { call_id: 'c1', approval: true } });
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 1, data: { status: 'completed' } });
+  // A schedule asks a task for a check.
+  await p.onEvent({ event: 'accepted', bot: 'demo.nightly', turn: 4, data: { node: 2, origin: 'schedule' } });
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.nightly', turn: 4, data: { status: 'completed' } });
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.lead', turn: 2, data: { status: 'completed' } });
+  await p.tick();
+  assert.equal(sent.length, 1);
+  assert.doesNotMatch(sent[0].prompt, /waiting for approval/);
+  assert.doesNotMatch(sent[0].prompt, /theirs/);
+  assert.match(sent[0].prompt, /\n- demo\.build: turn:demo\.build\/1 completed, asked by the person, and 1 earlier since turn:demo\.build\/1\n- demo\.nightly: turn:demo\.nightly\/4 completed, asked by schedule$/);
+  assert.equal(p.S.turnOrigin.size, 0, 'origins are forgotten as turns end');
+});
+
 test('approval calls and completion in one turn each reach the coordinator once across windows', async () => {
   const delivered = new Map(), attempts = [];
   const pages = [0, 1].map(() => page({ request: async (op, params) => {
