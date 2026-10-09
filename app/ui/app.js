@@ -3,8 +3,8 @@
 (() => {
 'use strict';
 const $ = (id) => document.getElementById(id);
-const GLYPH = { running: '●', waiting: '◐', paced: '◔', failed: '✘', idle: '○', queued: '◌', ready: '◌', interrupted: '✘' };
-const LABEL = { running: 'working', waiting: 'waiting', paced: 'rate limited', failed: 'failed', idle: 'idle', queued: 'queued', ready: 'queued', interrupted: 'interrupted' };
+const GLYPH = { running: '●', waiting: '◐', paced: '◔', failed: '✘', idle: '○', done: '✔', queued: '◌', ready: '◌', interrupted: '✘' };
+const LABEL = { running: 'working', waiting: 'waiting', paced: 'rate limited', failed: 'failed', idle: 'idle', done: 'done', queued: 'queued', ready: 'queued', interrupted: 'interrupted' };
 const LAZY_ITEMS = 400;
 // Decoded items kept around the reader's end of a transcript; bodies beyond it fold back into their
 // nodes and a scroll toward them loads them again.
@@ -34,6 +34,9 @@ const S = {
   // Who asked for each turn another bot asked for, until it ends, and what each coordinator has yet to
   // hear about its tasks (see `wake`), and turns that ended live before the snapshot said who made their bot.
   turnFrom: new Map(), wakes: new Map(), heldNews: [],
+  // Bots whose finished turn the person has not looked at yet (see `shownStatus`), and turns another
+  // bot asked for that the person steered into, whose end is theirs to see too.
+  unseen: new Set(), wanted: new Set(),
   // Unsent text for each bot not on screen. A composer's text is its bot's own: when a pane shows
   // another bot, the text stays behind with the one it was typed for (see `followDrafts`).
   drafts: new Map(),
@@ -181,6 +184,33 @@ function seedHistory(record) {
 }
 const glyphOf = (status) => GLYPH[status] || '✘';
 const labelOf = (status) => LABEL[status] || 'failed';
+// A turn the person or the app asked for that finished while its bot was off screen shows as done,
+// not idle, until the person looks at that bot. A failure already shows until the next turn.
+const shownStatus = (b) => S.unseen.has(b.name) && b.status === 'idle' ? 'done' : b.status;
+// Settings, help, the picker and the swarm sheet cover the thread. A swarm's view shows its agents.
+const covered = () => S.ui.help || S.ui.picker || S.ui.sheet || S.setup?.open;
+const looking = () => !covered() && document.visibilityState !== 'hidden' && document.hasFocus?.() !== false;
+const onScreen = (name) => {
+  if (!looking()) return false;
+  const sw = swarmOfBot(name);
+  return S.selected === name || S.ui.side === name || (!!sw && S.selected === swarmKey(sw.name));
+};
+// Each row a change touches is drawn once, however many of a swarm's agents it covers.
+function patchUnseen(names) {
+  const rows = new Set();
+  for (const name of names) { rows.add(name); const sw = swarmOfBot(name); if (sw) rows.add(swarmKey(sw.name)); }
+  for (const row of rows) patchRailRow(row);
+}
+// Only what the panes show can become seen: the bots in them, or the selected swarm's agents.
+function markSeen() {
+  if (!S.unseen.size || !looking()) return;
+  const sw = swarmOf(S.selected);
+  const seen = [...new Set([S.selected, S.ui.side, ...(sw ? sw.members : [])])].filter((name) => name && S.unseen.has(name));
+  if (!seen.length) return;
+  for (const name of seen) S.unseen.delete(name);
+  patchUnseen(seen);
+  refreshLive($('log')); if (S.ui.side) refreshLive($('side'));
+}
 const fmt = (ms) => { const s = Math.max(0, Math.round(ms / 1000)); return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`; };
 // Safe in text and inside a quoted attribute alike: names and call ids come from providers and land in both.
 const esc = (s) => String(s).replace(/[&<>"'\r]/g, (c) => ({ '\r': '&#13;', '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -236,11 +266,12 @@ function forgetBot(name) {
   const parent = bot(name) && creatorOf(bot(name));
   const t = parent && S.transcripts.get(parent.name);
   if (t) { t.items = t.items.filter(it => it.kind !== 'peer' || it.who !== name); t.peers = t.peers.filter(who => who !== name); t.gen += 1; }
-  S.bots.delete(name); S.transcripts.delete(name); S.override.delete(name); S.effort.delete(name);
+  S.bots.delete(name); S.transcripts.delete(name); S.override.delete(name); S.effort.delete(name); S.unseen.delete(name);
   // A coordinator gone hears nothing more, and its queued turns never end; a task gone is no news.
   if (S.wakes.has(name)) { clearTimeout(S.wakes.get(name).timer); S.wakes.delete(name); }
   for (const w of S.wakes.values()) if (w.tasks.delete(name) && !w.tasks.size) { clearTimeout(w.timer); w.timer = null; }
   for (const key of S.turnFrom.keys()) if (key.startsWith(`${name}\u0000`)) S.turnFrom.delete(key);
+  for (const key of S.wanted) if (key.startsWith(`${name}\u0000`)) S.wanted.delete(key);
   // Held news is this bot's; a later bot of the same name is another.
   S.heldNews = S.heldNews.filter(([held]) => held !== name);
   // A draft belongs to its bot, so it goes with it.
@@ -395,9 +426,10 @@ async function loadSwarms() {
   if (broken.length) toast(`not a readable swarm: ${broken[0]}`, 5000);
 }
 // A swarm works while any agent works, waits while any waits, and is otherwise at rest.
+// At rest, it is done while an agent's finished turn is unseen, even if a later turn of it failed.
 function swarmStatus(sw) {
   let out = 'idle';
-  for (const m of sw.members) { const st = memberBot(sw, m)?.status; if (st === 'running') return 'running'; if (st === 'waiting' || st === 'paced') out = 'waiting'; }
+  for (const m of sw.members) { const b = memberBot(sw, m), st = b?.status; if (st === 'running') return 'running'; if (st === 'waiting' || st === 'paced') out = 'waiting'; else if (out === 'idle' && b && S.unseen.has(m)) out = 'done'; }
   return out;
 }
 const BOARD_LINES = 500;
@@ -692,17 +724,21 @@ async function onEvent(ev) {
       const t = transcript(name), by = senderOf(data);
       if (typeof data.node === 'number') pushNode(t, { kind: 'node', node: data.node, turn, ...(by ? { by } : {}) });
       else addItem(t, { kind: 'note', text: 'steered into the running turn', turn });
+      if (!data.from?.bot) S.wanted.add(`${name}\u0000${turn}`);
       break;
     }
     case 'turn_finished': {
       const status = data.status ?? '?';
       const b = bot(name);
+      const key = `${name}\u0000${turn}`, from = S.turnFrom.get(key); S.turnFrom.delete(key);
       // A steer absorbed into a running turn finishes as its own turn while that turn goes on.
       if (b && (b.runningTurn === null || b.runningTurn === turn)) { b.runningTurn = null; b.waitingOn = []; if (b.turnStarted) b.elapsed = Date.now() - b.turnStarted; b.turnStarted = 0; b.status = status === 'completed' || status === 'steered' ? 'idle' : status; }
       const t = transcript(name);
       if (t.streamingTurn === turn) { t.text = ''; t.thinking = ''; t.thinkingSince = 0; t.thinkingMs = 0; t.streamingTurn = null; t.streamGen += 1; }
       if (status !== 'completed' && status !== 'steered') addItem(t, { kind: 'note', text: data.error ? `${status}: ${data.error}${data.detail ? ': ' + data.detail : ''}` : status, turn });
-      const key = `${name}\u0000${turn}`, from = S.turnFrom.get(key); S.turnFrom.delete(key);
+      // A turn another bot asked for is that bot's news, not the person's, unless the person steered into it.
+      const wanted = S.wanted.delete(key);
+      if (b && S.live && status === 'completed' && (!from || wanted) && !onScreen(name) && !S.unseen.has(name)) { S.unseen.add(name); patchUnseen([name]); }
       // A steer's turn is part of the turn it joined, whose end is the news.
       // A task's creator may still be on a snapshot page to come; its news waits for the whole snapshot.
       if (S.live && status !== 'steered') { if (S.snapshot) S.heldNews.push([name, turn, status, from]); else tellLead(name, turn, status, from); }
@@ -1125,7 +1161,7 @@ function forgetStore() {
   S.cursor = 0; S.bots.clear(); S.transcripts.clear(); S.drafts.clear(); S.override.clear(); S.effort.clear(); S.families.clear();
   S.swarms.clear(); S.memberOf.clear(); S.deleted.clear(); looked.clear();
   for (const w of S.wakes.values()) clearTimeout(w.timer);
-  S.wakes.clear(); S.turnFrom.clear(); S.heldNews = [];
+  S.wakes.clear(); S.turnFrom.clear(); S.heldNews = []; S.unseen.clear(); S.wanted.clear();
   S.selected = ''; S.autoSelect = true; S.ui.side = null; S.ui.folded = new Set();
   S.botsGen += 1; S.shapeGen += 1;
   // A home the last host named is not this one's.
@@ -1178,6 +1214,7 @@ function restore() {
 }
 function save() { const key = sessionKey(); if (!key) return; try { localStorage.setItem(key, JSON.stringify({ selected: S.selected, side: S.ui.side, rail: S.ui.rail, steps: S.ui.steps, folded: [...S.ui.folded], override: [...S.override].map(([name, model]) => [name, bot(name)?.id ?? null, model]), effort: [...S.effort].map(([name, level]) => [name, bot(name)?.id ?? null, level]) })); } catch (_) {} }
 window.addEventListener('beforeunload', save);
+window.addEventListener('focus', markSeen);
 
 // ---------- render ----------
 function inline(text) {
@@ -1207,7 +1244,7 @@ const cssEsc = (s) => String(s).replace(/[\x00-\x1f\x7f"\\]/g, (c) => c === '\0'
 function taskCard(who) {
   const p = bot(who); if (!p) return null;
   const el = p.turnStarted ? fmt(Date.now() - p.turnStarted) : p.elapsed ? fmt(p.elapsed) : '';
-  return { attr: `data-task="${esc(p.name)}"`, task: p.name, status: p.status, name: shortName(p), last: lastLine(transcript(who)), elapsed: el, sel: S.ui.side === who || S.selected === who };
+  return { attr: `data-task="${esc(p.name)}"`, task: p.name, status: shownStatus(p), name: shortName(p), last: lastLine(transcript(who)), elapsed: el, sel: S.ui.side === who || S.selected === who };
 }
 // The two panes that show a transcript: the main thread and the one beside it.
 const PANES = [['log', () => S.selected], ['side', () => S.ui.side]];
@@ -1669,7 +1706,7 @@ function mixChange(el) {
   if (r.reasoning && !effortsFor(r.model).includes(r.reasoning)) r.reasoning = '';
   if (el.dataset.f !== 'share' || el.type !== 'number') renderMix();
 }
-function closeSheet() { if (!S.ui.sheet) return; S.ui.sheet = false; sheetFor = null; $('sheetwrap').classList.remove('on'); focusInput('main'); }
+function closeSheet() { if (!S.ui.sheet) return; S.ui.sheet = false; sheetFor = null; $('sheetwrap').classList.remove('on'); markSeen(); focusInput('main'); }
 $('sheet').addEventListener('change', (e) => { if (e.target.dataset?.mix != null) mixChange(e.target); else if (e.target.id === 'sw-n' || e.target.id === 'sw-budget' || e.target.id === 'sw-org') { updateSwarmBudget(e.target.id); renderMix(); } });
 // A share typed updates the counts once it is a number, without redrawing the field being typed in.
 $('sheet').addEventListener('input', (e) => { if (e.target.id === 'sw-n' || e.target.id === 'sw-budget') { updateSwarmBudget(e.target.id); renderMix(); return; } if (e.target.dataset?.f !== 'share') return; mixChange(e.target); const n = agentCount(), problem = sheetProblem(n), counts = problem ? null : mixCounts(sheet.mix, mixRows(sheet.mix, n)); $('sw-mix').querySelectorAll('.count').forEach((c, i) => { c.textContent = counts ? `${counts[i]} agent${counts[i] === 1 ? '' : 's'}` : ''; c.classList.toggle('none', !!counts && !counts[i]); }); const w = $('sw-mix').querySelector('.mixfoot span'); if (w) { w.textContent = problem ?? (counts.some((c) => !c) ? `A row makes no agent at ${n} agents` : ''); w.className = w.textContent ? 'warn' : ''; } });
@@ -1744,7 +1781,7 @@ function botRowHTML(n, sel) {
     return `<div class="botrow${sel ? ' sel' : ''}" data-bot="${esc(n.key)}" role="button" tabindex="0"><span class="tree">${n.prefix}</span><span class="glyph ${st}">${glyphOf(st)}</span><span class="n">⁂ ${esc(memberShort(sw, sw.name))}</span><span class="meta">${sw.members.length}</span><span class="acts">${moreButton(n.key)}</span></div>`;
   }
   const b = n.b, acts = `<span class="acts">${moreButton(b.name)}</span>`;
-  const glyph = `<span class="glyph ${b.status}">${glyphOf(b.status)}</span>`;
+  const st = shownStatus(b), glyph = `<span class="glyph ${st}">${glyphOf(st)}</span>`;
   if (n.head != null) {
     const folded = S.ui.folded.has(n.head);
     const chev = n.tasks ? `<button type="button" class="chev" data-act="fold" data-v="${esc(n.head)}" aria-label="${folded ? 'Show' : 'Hide'} tasks">${folded ? '▸' : '▾'}</button>` : '<span class="chev"></span>';
@@ -1784,6 +1821,7 @@ function render() {
   const side = S.ui.side ? bot(S.ui.side) : null;
   app.classList.toggle('rail', S.ui.rail); app.classList.toggle('side', !!side);
   followDrafts();
+  markSeen();
   if (sw) { renderSwarmHead($('title'), sw); renderSwarm($('log'), sw); }
   else { renderHead($('title'), b, 'main'); if (b) renderTranscript($('log'), b.name); else { $('log').innerHTML = ''; $('log').dataset.key = ''; } }
   if (S.ui.rail) renderRail();
@@ -1811,9 +1849,9 @@ function renderPicker() {
   const more = all.length > rows.length ? `<div class="empty">${all.length - rows.length} more; type to narrow</div>` : '';
   $('pickerlist').innerHTML = (rows.length ? rows.map((r, idx) => {
     const n = r.b.name; const hit = r.i >= 0 ? `${esc(n.slice(0, r.i))}<span class="hit">${esc(n.slice(r.i, r.i + q.length))}</span>${esc(n.slice(r.i + q.length))}` : esc(n);
-    const state = r.b.status === 'idle' ? '' : labelOf(r.b.status);
+    const st = shownStatus(r.b), state = st === 'idle' ? '' : labelOf(st);
     const hint = q ? [creatorOf(r.b) ? `↳ ${r.b.parent}` : '', state].filter(Boolean).join(' · ') : state;
-    return `<div class="row${idx === S.ui.pickerSel ? ' sel' : ''}" data-pick="${esc(n)}">${q ? '' : `<span class="tree">${r.prefix}</span>`}<span class="glyph ${r.b.status}">${glyphOf(r.b.status)}</span><span class="n">${hit}</span><span class="h">${esc(hint)}</span></div>`;
+    return `<div class="row${idx === S.ui.pickerSel ? ' sel' : ''}" data-pick="${esc(n)}">${q ? '' : `<span class="tree">${r.prefix}</span>`}<span class="glyph ${st}">${glyphOf(st)}</span><span class="n">${hit}</span><span class="h">${esc(hint)}</span></div>`;
   }).join('') : '<div class="empty">no bot matches</div>') + more;
 }
 let pickerPane = 'main';
@@ -1829,7 +1867,7 @@ async function showHelp(pane = 'main') {
   let models; try { const list = await Daemon.models(); models = list.length ? list.map((m) => `   ${esc(m.id)}`).join('\n') : '   none listed: Settings lists your providers\' models'; } catch (e) { models = `   ${esc(String(e?.message ?? e))}`; }
   if (S.ui.help === shown) text(models);
 }
-function hideHelp() { S.ui.help = false; $('helpwrap').classList.remove('on'); $(PANE[S.ui.side ? helpPane : 'main'].input).focus(); }
+function hideHelp() { S.ui.help = false; $('helpwrap').classList.remove('on'); markSeen(); $(PANE[S.ui.side ? helpPane : 'main'].input).focus(); }
 
 // ---------- menus ----------
 // One menu at a time: an agent's ⋯ (from its head, its sidebar row, its card, or a right-click), the
@@ -2488,7 +2526,8 @@ document.addEventListener('keydown', async (e) => {
   const k = e.key, ctrl = e.ctrlKey || e.metaKey;
   if (S.ui.menu) { if (k === 'Escape') { closeMenu(); e.preventDefault(); } return; }
   if (ctrl && k === 'k') { openPicker(); e.preventDefault(); return; }
-  if (ctrl && k === 'b') { S.ui.rail = !S.ui.rail; render(); save(); e.preventDefault(); return; }
+  // A hidden sidebar patches no rows, so it draws them all again when it opens.
+  if (ctrl && k === 'b') { S.ui.rail = !S.ui.rail; if (S.ui.rail) rail.key = ''; render(); save(); e.preventDefault(); return; }
   if (ctrl && k === 'd') { detach(); e.preventDefault(); return; }
   if (ctrl && k === 'o') { S.ui.steps = !S.ui.steps; render(); save(); e.preventDefault(); return; }
   if (ctrl && k === 'p') { await nextBeside(); e.preventDefault(); return; }
