@@ -1031,17 +1031,22 @@ launchd keeps minutes; `--at` refuses a part out of range or extra parts);
 `--cron` is read as cron reads it, a day or a weekday when both are given,
 up to 1,024 calendar entries. `--file PATH` fires when the file is written,
 or a file is added to or removed from it when it is a folder (launchd's
-`WatchPaths`); it need not exist yet. `--commit REPO` watches the
+`WatchPaths`); it need not exist yet, and it may not be in
+`~/.agent/triggers`, which every fire writes. `--commit REPO` watches the
 repository's own HEAD log, which git writes on every move of HEAD, and sends
 only when HEAD names a commit other than the one the trigger last saw
 (`add` records the one there now), so a checkout back and forth or a write
-that moved nothing sends nothing. `--turn-end BOT` fires each time BOT,
+that moved nothing sends nothing. A repository where git keeps no HEAD log
+(`core.logAllRefUpdates` false, or a bare one by default) is refused, and
+adding the same trigger again watches the git folder the repository has
+now. `--turn-end BOT` fires each time BOT,
 pinned by its id, ends a turn that ends after `add` (completed, failed or
 interrupted); `--count N` only every Nth, a count of the messages BOT
 answered. A turn the trigger itself sent BOT, its message or an answer
 `--reply-to` passed on, is not counted, so `--turn-end lead --reply-to lead`
 does not wake itself (two triggers that wake each other are bounded only by
-`--runs`). With no WHEN, only `fire` runs it.
+`--runs`). With no WHEN, only `fire` runs it; `fire`, or a turn end, while
+a fire still runs is sent by that fire once it is done.
 
 **Whom.** `add` defaults to the agent whose shell runs it (`AGENT_BOT`,
 which must still match `AGENT_BOT_ID`); `--bot` names another. Either is
@@ -1052,25 +1057,32 @@ the first fire makes it as the app makes an agent (the daemon's `create`,
 in the folder `add` ran in, with that folder's composed policy and the
 default tools), made by the agent that added the trigger when one did, so
 it shows under that agent, and gives it the fire's message. Its id is kept with the trigger's
-state and later fires message it. A name an agent already has is refused at
+state as soon as it is made, before any wait, and later fires message it. A name an agent already has is refused at
 `add` (`bot_exists`), and an agent of that name made before the first fire
 makes that fire fail, naming it.
 
 **What else.** `--reply-to BOT` keeps the fire's process until the turn it
 sent ends (the daemon's `wait`, up to a day), then queues that turn's
 answer to BOT, pinned by id; launchd starts no second fire of the trigger
-meanwhile, so a repeating one skips the times that turn spans. `--if CMD`
-runs `sh -c CMD` in the folder `add` ran in before anything else, for up to
-60 s; any exit but 0 skips that fire and records nothing, so a heartbeat
-whose check finds nothing to do costs one process and no model call.
+meanwhile, so a repeating one skips the times that turn spans. The fire's
+request id then ends `.to.ID`, BOT's id, so the app does not also tell
+that agent of the turn as a task update; an answer the daemon cut short is
+marked so in its first line, and one that does not get through keeps an
+ended trigger listed, saying so. `--if CMD` runs `sh -c CMD` in the folder
+`add` ran in, with the `PATH` `add` ran with, before anything else, for up
+to 60 s, in its own process group, which ends with it; any exit but 0
+skips that fire and records nothing, so a heartbeat whose check finds
+nothing to do costs one process and no model call. A one-off whose check
+says no ends, listed as not sent.
 `--runs N` ends the trigger once N messages went out. Each message the
 agent gets starts with one line, `[trigger NAME · YYYY-MM-DD HH:MM · why]`,
 the local fire time and what fired it (its time, `file PATH`, `commit REPO
 at SHA`, `turn end of BOT: turn:BOT/N completed`, or `fired`), so a
 catch-up fire after sleep reads as late; an
 answer passed on by `--reply-to` starts with the agent and turn it is from.
-Submissions carry `origin: "trigger"`; coordinator updates carry `origin:
-"tasks"`. Both are automated input, not human consent for the approver.
+Submissions carry `origin: "trigger"`, and a passed-on answer carries
+`from: {bot, turn}`, the turn it is; coordinator updates carry `origin:
+"tasks"`. All are automated input, not human consent for the approver.
 
 **Adding again.** A trigger is named after its agent unless `--name` says
 otherwise. `add` with a name in use and the same definition changes nothing

@@ -333,7 +333,7 @@ pub(super) fn save_watched(
 }
 
 /// Where the watcher is for this trigger, when it is this trigger's.
-fn read_watched(places: &Places, trigger: &Trigger) -> Option<(i64, u64)> {
+pub(super) fn read_watched(places: &Places, trigger: &Trigger) -> Option<(i64, u64)> {
     let kept = read_json(&places.watched(&trigger.name))?;
     (kept["generation"] == trigger.generation)
         .then(|| {

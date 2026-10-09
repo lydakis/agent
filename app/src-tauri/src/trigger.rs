@@ -29,7 +29,7 @@ use std::{
 
 mod watch;
 pub use watch::watch_cli;
-use watch::{newest_cursor, rewatch, save_watched};
+use watch::{newest_cursor, read_watched, rewatch, save_watched};
 
 pub const FLAG: &str = "--trigger";
 pub const FIRE_FLAG: &str = "--trigger-fire";
@@ -831,6 +831,21 @@ pub fn commit(value: &str) -> Result<(When, PathBuf), String> {
     let repo = std::path::absolute(value).map_err(|e| format!("invalid_commit: {value}: {e}"))?;
     let git_dir = git(&repo, &["rev-parse", "--absolute-git-dir"])
         .ok_or_else(|| format!("invalid_commit: {value}: not a git repository"))?;
+    // git keeps the HEAD log only where core.logAllRefUpdates says so, which
+    // a bare repository does not by default: there it would never fire.
+    let logs = match git(&repo, &["config", "core.logAllRefUpdates"]) {
+        Some(set) => !matches!(
+            set.to_ascii_lowercase().as_str(),
+            "false" | "no" | "off" | "0" | ""
+        ),
+        None => git(&repo, &["rev-parse", "--is-bare-repository"]).as_deref() != Some("true"),
+    };
+    if !logs {
+        return Err(format!(
+            "invalid_commit: {value}: git keeps no HEAD log here; git -C {} config core.logAllRefUpdates true",
+            repo.display()
+        ));
+    }
     Ok((
         When {
             text: format!("commit {}", repo.display()),
@@ -910,6 +925,13 @@ fn program(text: &str) -> Option<Vec<String>> {
         at = &body[end + "</string>".len()..];
     }
     Some(args)
+}
+
+/// The path a plist has launchd watch, as the app writes it.
+fn watched(text: &str) -> Option<PathBuf> {
+    let rest = &text[text.find("<key>WatchPaths</key>")?..];
+    let body = &rest[rest.find("<string>")? + "<string>".len()..];
+    Some(PathBuf::from(unescape(&body[..body.find("</string>")?])))
 }
 
 /// The trigger a plist runs, and the app it runs it with.
@@ -1125,14 +1147,23 @@ pub fn install(
     let path = places.plist(&trigger.name);
     match std::fs::read_to_string(&path) {
         Ok(text) => {
-            let (there, _) = read_plist(&text).ok_or_else(|| {
+            let (there, there_app) = read_plist(&text).ok_or_else(|| {
                 format!(
                     "trigger_exists: definition: {} is there but cannot be read; rm it first",
                     trigger.name
                 )
             })?;
             return match there.differs(trigger) {
-                None => Ok(Some(there)),
+                None => {
+                    // The same definition can watch another path: a
+                    // repository made again at its path has another git
+                    // folder. launchd is made to watch the one it is now.
+                    if watched(&text) != when.watch {
+                        let want = plist(&there_app, &there, when, environment);
+                        swap(&path, &there.name, Some(&text), &want, launchd)?;
+                    }
+                    Ok(Some(there))
+                }
                 Some(field) => Err(format!(
                     "trigger_exists: {field}: {} is a trigger with another {field}; rm it first or pass another --name",
                     trigger.name
@@ -1276,9 +1307,10 @@ pub fn remove(places: &Places, name: &str, launchd: Loader) -> Result<(), String
     Ok(())
 }
 
-/// `fire NAME`: launchd runs the trigger's job now, which it does not while
-/// one of its fires still runs. The note it leaves tells that fire it was
-/// asked for, so it sends whatever the time or its watched path.
+/// `fire NAME`: launchd runs the trigger's job now. The note it leaves tells
+/// that fire it was asked for, so it sends whatever the time or its watched
+/// path. While one of its fires still runs launchd starts no other: that
+/// fire finds the note when it is done and sends once more.
 pub fn fire_now(places: &Places, name: &str, launchd: Loader) -> Result<Value, String> {
     valid_name(name)?;
     let _lock = Lock::take(places)?;
@@ -1378,8 +1410,10 @@ fn settle(places: &Places, trigger: &Trigger, outcome: &Value, kept: &Kept, laun
         || trigger.runs.is_some_and(|runs| kept.sent >= runs);
     // One that did not deliver ends only once why is on disk; else its plist
     // stays, listed.
+    // An answer that did not get through keeps its row, saying so.
+    let kept_row = !sent || outcome["reply"]["outcome"] == "failed";
     if over && (sent || recorded.is_ok()) {
-        end(places, &trigger.name, &path, &text, !sent, launchd);
+        end(places, &trigger.name, &path, &text, kept_row, launchd);
     }
 }
 
@@ -1709,7 +1743,8 @@ fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
 /// What a trigger's job starts with besides launchd's own: the shell whose
 /// login environment starts a daemon with your keys, as the app starts one.
 fn environment() -> Vec<(&'static str, String)> {
-    ["HOME", "SHELL"]
+    // PATH too: an `--if` command runs with the adder's, as typed there.
+    ["HOME", "SHELL", "PATH"]
         .into_iter()
         .filter_map(|key| std::env::var(key).ok().map(|v| (key, v)))
         .collect()
@@ -1767,6 +1802,40 @@ pub fn cli(args: &[String]) -> i32 {
     1
 }
 
+/// A trigger that watched the triggers' own folder would fire itself: each
+/// fire writes its result there. Folders on a Mac ignore case, and a link
+/// is followed as far as the path exists.
+fn watches_state(places: &Places, watch: &Path) -> Result<(), String> {
+    let real = |path: &Path| {
+        let mut at = path.to_path_buf();
+        let mut rest = Vec::new();
+        loop {
+            if let Ok(found) = at.canonicalize() {
+                return rest
+                    .iter()
+                    .rev()
+                    .fold(found, |p: PathBuf, part: &std::ffi::OsString| p.join(part));
+            }
+            match (at.file_name().map(|f| f.to_owned()), at.parent()) {
+                (Some(part), Some(up)) => {
+                    rest.push(part);
+                    at = up.to_path_buf();
+                }
+                _ => return path.to_path_buf(),
+            }
+        }
+    };
+    let lower = |path: PathBuf| path.to_string_lossy().to_lowercase();
+    let (real_watch, state) = (lower(real(watch)), lower(real(&places.state)));
+    if real_watch == state || real_watch.starts_with(&format!("{state}/")) {
+        return Err(format!(
+            "invalid_file: {}: the triggers' own folder changes on every fire; watch another path",
+            watch.display()
+        ));
+    }
+    Ok(())
+}
+
 /// An agent's id by its name, now.
 async fn bot_id(client: &Client, name: &str) -> Result<i64, String> {
     let record = client
@@ -1790,6 +1859,9 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
         )),
         _ => None,
     };
+    if let Some(watch) = &asked.when.watch {
+        watches_state(places, watch)?;
+    }
     let daemon = Daemon::current()?;
     let socket = daemon.socket()?;
     let name = asked
@@ -1901,18 +1973,30 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
         &launchctl,
     )? {
         Some(there) => {
+            // An add that failed after its plist went in left the watcher
+            // without it: the same add again makes it whole.
+            if let (Some(_), Some((_, _, cursor))) = (&there.turn_end, turn_end) {
+                if read_watched(places, &there).is_none() {
+                    save_watched(places, &there, cursor, 0)?;
+                }
+                rewatch(places, &app, &environment, true, &launchctl)?;
+            }
             let mut row = there.json(&state(places, &there));
             row["duplicate"] = json!(true);
             Ok(row)
         }
         None => {
-            // The commit there now is seen: only the next one fires.
+            // The commit there now is seen: only the next one fires. A
+            // trigger without it would take that commit for news, so it goes.
             if let Some(head) = trigger.commit.as_deref().and_then(head) {
                 let kept = Kept {
                     head: Some(head),
                     ..Kept::default()
                 };
-                record_last(places, &trigger, &Value::Null, &kept)?;
+                if let Err(error) = record_last(places, &trigger, &Value::Null, &kept) {
+                    let _ = remove(places, &trigger.name, &launchctl);
+                    return Err(error);
+                }
             }
             if let Some((_, _, cursor)) = turn_end {
                 save_watched(places, &trigger, cursor, 0)?;
@@ -1936,12 +2020,30 @@ fn record_last(
     if !outcome.is_null() {
         outcome["fired_ms"] = json!(now() * 1000);
     }
-    let state = json!({"generation": trigger.generation, "last": outcome, "sent": kept.sent,
+    write_row(places, trigger, &outcome, kept)
+}
+
+fn write_row(places: &Places, trigger: &Trigger, last: &Value, kept: &Kept) -> Result<(), String> {
+    let state = json!({"generation": trigger.generation, "last": last, "sent": kept.sent,
         "started_id": kept.started_id, "head": kept.head});
     let mut row = trigger.json(&state);
     row["started_id"] = json!(kept.started_id);
     row["head"] = json!(kept.head);
     replace(&places.last(&trigger.name), &row.to_string())
+}
+
+/// A `--start` agent's id goes on disk once it is made, with the last fire
+/// as it was: a fire cut short before it settles (its answer can take a
+/// day) must not leave the next to make it again, which its name refuses.
+/// Only while the plist is still this trigger's, as `settle` writes.
+fn keep_started(places: &Places, trigger: &Trigger, kept: &Kept) -> Result<(), String> {
+    let _lock = Lock::take(places)?;
+    let path = places.plist(&trigger.name);
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if read_plist(&text).is_none_or(|(now, _)| now != *trigger) {
+        return Ok(());
+    }
+    write_row(places, trigger, &state(places, trigger)["last"], kept)
 }
 
 /// `YYYY-MM-DD HH:MM`, local.
@@ -1964,20 +2066,32 @@ fn gate(command: &str, dir: Option<&Path>) -> Result<(), String> {
     if let Some(dir) = dir {
         sh.current_dir(dir);
     }
+    // Its own process group: whatever it started goes with it, whatever it
+    // says, so nothing it forked outlives the check.
+    use std::os::unix::process::CommandExt;
+    sh.process_group(0);
     let mut child = sh.spawn().map_err(|e| format!("--if: {e}"))?;
+    let group = child.id() as libc::pid_t;
+    // SAFETY: a signal to the process group this function made.
+    let end_group = || unsafe {
+        libc::kill(-group, libc::SIGKILL);
+    };
     let until = std::time::Instant::now() + GATE_TIMEOUT;
-    loop {
-        match child.try_wait().map_err(|e| format!("--if: {e}"))? {
-            Some(status) if status.success() => return Ok(()),
-            Some(status) => return Err(format!("--if: {status}")),
-            None if std::time::Instant::now() > until => {
-                let _ = child.kill();
+    let said = loop {
+        match child.try_wait() {
+            Err(e) => break Err(format!("--if: {e}")),
+            Ok(Some(status)) if status.success() => break Ok(()),
+            Ok(Some(status)) => break Err(format!("--if: {status}")),
+            Ok(None) if std::time::Instant::now() > until => {
+                end_group();
                 let _ = child.wait();
-                return Err(format!("--if: ran past {}s", GATE_TIMEOUT.as_secs()));
+                break Err(format!("--if: ran past {}s", GATE_TIMEOUT.as_secs()));
             }
-            None => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
         }
-    }
+    };
+    end_group();
+    said
 }
 
 /// The first fire of a `--start` trigger: the agent is made as the app
@@ -2029,6 +2143,7 @@ fn sent_by(trigger: &Trigger) -> String {
 /// and gets any other's after its work. A deleted agent's trigger goes.
 async fn deliver(
     client: &Client,
+    places: &Places,
     trigger: &Trigger,
     kept: &mut Kept,
     why: &str,
@@ -2046,6 +2161,9 @@ async fn deliver(
         (Target::Start { name, .. }, None) => match start(client, trigger).await {
             Ok(id) => {
                 kept.started_id = Some(id);
+                if let Err(error) = keep_started(places, trigger, kept) {
+                    eprintln!("{}", error_json(&error));
+                }
                 (name, id, true)
             }
             Err(error) => return json!({"outcome": "failed", "detail": error}),
@@ -2061,7 +2179,7 @@ async fn deliver(
         .request(
             "submit",
             json!({"bot": bot, "bot_id": id,
-                "request_id": format!("{}{id}.{}.{}", sent_by(trigger), now(), std::process::id()),
+                "request_id": request_id(trigger, id),
                 "prompt": prompt, "delivery": delivery, "origin": "trigger"}),
         )
         .await;
@@ -2077,6 +2195,17 @@ async fn deliver(
         Err(error) => json!({"outcome": "failed", "detail": error.to_string()}),
     };
     reply(client, trigger, bot, outcome).await
+}
+
+/// A fire's request id. With `--reply-to` it ends `.to.ID`, the agent its
+/// answer goes to: the app tells a coordinator of its task's turn only
+/// when the answer does not reach it already.
+fn request_id(trigger: &Trigger, id: i64) -> String {
+    let base = format!("{}{id}.{}.{}", sent_by(trigger), now(), std::process::id());
+    match &trigger.reply_to {
+        Some((_, to)) => format!("{base}.to.{to}"),
+        None => base,
+    }
 }
 
 /// With `--reply-to`, wait for the turn a fire sent and queue its answer
@@ -2109,8 +2238,14 @@ async fn reply(client: &Client, trigger: &Trigger, bot: &str, mut outcome: Value
         Some(text) if !text.is_empty() => text.to_owned(),
         _ => result["error"].to_string(),
     };
+    // The daemon hands a long answer over cut short, and says so.
+    let cut = if result["text_truncated"] == true {
+        " · cut short"
+    } else {
+        ""
+    };
     let prompt = format!(
-        "[trigger {} · {} · {bot} turn {turn} {status}]\n{answer}",
+        "[trigger {} · {} · {bot} turn {turn} {status}{cut}]\n{answer}",
         trigger.name,
         stamp(now())
     );
@@ -2119,7 +2254,7 @@ async fn reply(client: &Client, trigger: &Trigger, bot: &str, mut outcome: Value
             "submit",
             json!({"bot": to, "bot_id": to_id,
                 "request_id": format!("{}reply.{to_id}.{turn}", sent_by(trigger)),
-                "prompt": prompt, "delivery": "queue", "origin": "trigger"}),
+                "prompt": prompt, "delivery": "queue", "from": {"bot": bot, "turn": turn}}),
         )
         .await;
     outcome["reply"] = match sent {
@@ -2141,32 +2276,53 @@ pub fn fire_cli(args: &[String]) -> i32 {
     let Some(_running) = running(&places, &trigger.name) else {
         return 0;
     };
-    let now = now();
-    let asked_why = take_asked(&places, &trigger.name);
+    fires(&places, &trigger.name, |asked| {
+        fire(&places, &trigger, asked)
+    });
+    0
+}
+
+/// Fire, and again for each `fire NAME`, or turn end, asked while it ran:
+/// a second fire finds this one's lock and leaves the note to it.
+fn fires(places: &Places, name: &str, mut fire: impl FnMut(Option<String>)) {
+    let mut asked = take_asked(places, name);
+    loop {
+        fire(asked);
+        asked = take_asked(places, name);
+        if asked.is_none() {
+            return;
+        }
+    }
+}
+
+/// One fire: send the message when it is time, or when it was asked for,
+/// saying why when the note does.
+fn fire(places: &Places, trigger: &Trigger, asked_why: Option<String>) {
     let asked = asked_why.is_some();
     // Only the watcher, or `fire`, has news of a turn end.
     if trigger.turn_end.is_some() && !asked {
-        return 0;
+        return;
     }
-    let mut kept = Kept::of(&state(&places, &trigger));
+    let now = now();
+    let mut kept = Kept::of(&state(places, trigger));
     if !asked {
         // A one-off's calendar entry has no year: the same date a year early
         // is not its time. A day's slack keeps its time when the Mac's time
         // zone changed since it was made, which launchd follows and `at`
         // does not.
         if trigger.at.is_some_and(|at| now < at - SLACK) {
-            return 0;
+            return;
         }
         if trigger.not_before.is_some_and(|first| now < first) {
-            return 0;
+            return;
         }
         // Months late is the entry's next year: the Mac was off at its time,
         // or its end was cut short. It is not sent; if it is still listed, it
         // ends saying so.
         if trigger.at.is_some_and(|at| now > at + STALE) {
             let missed = json!({"outcome": "missed", "detail": "its time passed long ago"});
-            settle(&places, &trigger, &missed, &kept, &launchctl);
-            return 0;
+            settle(places, trigger, &missed, &kept, &launchctl);
+            return;
         }
     }
     let mut why = match asked_why {
@@ -2178,18 +2334,24 @@ pub fn fire_cli(args: &[String]) -> i32 {
     if let Some(repo) = &trigger.commit {
         let seen = head(repo);
         if !asked && (seen.is_none() || seen == kept.head) {
-            return 0;
+            return;
         }
-        if let Some(sha) = &seen {
+        // A HEAD that cannot be read now keeps the last one seen.
+        if let Some(sha) = seen {
             why = format!("{why} at {}", &sha[..sha.len().min(12)]);
+            kept.head = Some(sha);
         }
-        kept.head = seen;
     }
-    // A gate that says no costs this process and nothing else.
+    // A gate that says no costs this process and nothing else; a one-off
+    // had its one time, and ends saying so.
     if let Some(command) = &trigger.gate
-        && gate(command, trigger.dir.as_deref()).is_err()
+        && let Err(no) = gate(command, trigger.dir.as_deref())
     {
-        return 0;
+        if trigger.at.is_some() {
+            let declined = json!({"outcome": "declined", "detail": no});
+            settle(places, trigger, &declined, &kept, &launchctl);
+        }
+        return;
     }
     let outcome = match runtime() {
         Ok(runtime) => runtime.block_on(async {
@@ -2207,14 +2369,13 @@ pub fn fire_cli(args: &[String]) -> i32 {
                 return json!({"outcome": "failed", "detail": format!(
                     "store_mismatch: the daemon at {} serves another store", socket.display())});
             }
-            let outcome = deliver(&client, &trigger, &mut kept, &why, asked).await;
+            let outcome = deliver(&client, places, trigger, &mut kept, &why, asked).await;
             client.close().await;
             outcome
         }),
         Err(error) => json!({"outcome": "failed", "detail": error}),
     };
-    settle(&places, &trigger, &outcome, &kept, &launchctl);
-    0
+    settle(places, trigger, &outcome, &kept, &launchctl);
 }
 
 /// The daemon, started the way the app starts one when none answers and
@@ -3054,6 +3215,15 @@ mod tests {
             take_asked(&w.places, &s.name).as_deref(),
             Some("turn end of p: turn:p/3 completed")
         );
+        // One asked while a fire runs is sent once that fire is done.
+        let mut seen = Vec::new();
+        fires(&w.places, &s.name, |asked| {
+            if seen.is_empty() {
+                fire_now(&w.places, &s.name, &|x| w.fake.call(x)).unwrap();
+            }
+            seen.push(asked);
+        });
+        assert_eq!(seen, [None, Some(String::new())]);
         // One launchd will not run leaves no note behind.
         w.fake.loaded.borrow_mut().clear();
         assert!(fire_now(&w.places, &s.name, &|x| w.fake.call(x)).is_err());
@@ -3171,6 +3341,21 @@ mod tests {
     fn a_gate_says_no_with_any_exit_but_zero() {
         assert!(gate("true", None).is_ok());
         assert!(gate("exit 3", None).unwrap_err().contains('3'));
+        // What it started in the background ends with it.
+        let pid = std::env::temp_dir().join(format!("agent-app-gate-{}", std::process::id()));
+        let command = format!("sleep 30 & echo $! > {}", pid.display());
+        assert!(gate(&command, None).is_ok());
+        let pid: libc::pid_t = std::fs::read_to_string(&pid)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        // SAFETY: signal 0 only asks whether the process is there.
+        let alive = unsafe { libc::kill(pid, 0) } == 0
+            && std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .map_or(true, |stat| !stat.contains(") Z "));
+        assert!(!alive, "the gate's background sleep outlived it");
         let dir = std::env::temp_dir();
         assert!(
             gate(
@@ -3190,6 +3375,26 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn a_file_trigger_cannot_watch_the_triggers_own_folder() {
+        let w = World::new("own-state");
+        std::fs::create_dir_all(&w.places.state).unwrap();
+        for own in [
+            w.places.state.clone(),
+            w.places.last("p.x"),
+            w.root.join(".agent/Triggers/p.x.json"),
+            w.root.join(".agent/./triggers/new/file"),
+        ] {
+            let refused = watches_state(&w.places, &own).unwrap_err();
+            assert!(refused.starts_with("invalid_file:"), "{own:?}: {refused}");
+        }
+        std::os::unix::fs::symlink(&w.places.state, w.root.join("link")).unwrap();
+        assert!(watches_state(&w.places, &w.root.join("link/p.x.json")).is_err());
+        for other in [w.root.join(".agent"), w.root.join(".agent/triggers-not")] {
+            assert_eq!(watches_state(&w.places, &other), Ok(()), "{other:?}");
+        }
     }
 
     #[test]
@@ -3218,7 +3423,7 @@ mod tests {
         let (when, repo) = commit(root.to_str().unwrap()).unwrap();
         assert_eq!(repo, root);
         assert_eq!(when.text, format!("commit {}", root.display()));
-        let log = when.watch.unwrap();
+        let log = when.watch.clone().unwrap();
         assert!(log.ends_with(".git/logs/HEAD") && log.exists());
         let first = head(&root).unwrap();
         git(&["commit", "-q", "--allow-empty", "-m", "two"]);
@@ -3228,6 +3433,32 @@ mod tests {
                 .unwrap_err()
                 .starts_with("invalid_commit")
         );
+        // Where git keeps no HEAD log, nothing would ever fire it.
+        git(&["config", "core.logAllRefUpdates", "false"]);
+        let none = commit(root.to_str().unwrap()).unwrap_err();
+        assert!(none.contains("git keeps no HEAD log here"), "{none}");
+        git(&["config", "core.logAllRefUpdates", "always"]);
+        assert!(commit(root.to_str().unwrap()).is_ok());
+        let bare = root.join("bare.git");
+        git(&["init", "-q", "--bare", bare.to_str().unwrap()]);
+        assert!(commit(bare.to_str().unwrap()).is_err());
+        // A repository made again at its path is watched where it is now.
+        let w = World::new("commit-again");
+        let s = Trigger {
+            when: when.text.clone(),
+            commit: Some(root.clone()),
+            ..trigger()
+        };
+        let app = Path::new("/A/agent-app");
+        install(&w.places, app, &s, &when, &[], &|x| w.fake.call(x)).unwrap();
+        let moved = When {
+            watch: Some(root.join("elsewhere/logs/HEAD")),
+            ..commit(root.to_str().unwrap()).unwrap().0
+        };
+        let again = install(&w.places, app, &s, &moved, &[], &|x| w.fake.call(x));
+        assert_eq!(again.unwrap(), Some(s.clone()));
+        assert_eq!(watched(&w.plist(&s.name)), moved.watch);
+        assert_eq!(w.state(&s.name), (true, true, false));
         std::fs::remove_dir_all(root).unwrap();
     }
 
