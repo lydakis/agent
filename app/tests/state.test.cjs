@@ -177,6 +177,9 @@ test('charts, file links and opened files draw by kind', () => {
   assert.match(links, /<a class="file" data-file="PLAN.md">plan<\/a>/);
   assert.match(links, /data-file="src\/a.rs">code/);
   assert.match(links, /data-file="src\/b.rs">line/);
+  // A section of another file opens that file; a `#` in a name is written `%23`.
+  assert.match(Rich.html('[install](README.md#install)'), /data-file="README.md">install/);
+  assert.match(Rich.html('[odd](notes/a%23b.md)'), /data-file="notes\/a#b.md">odd/);
   assert.match(links, /<a href="https:\/\/example.com">web<\/a>/);
   assert.doesNotMatch(links, /data-file="#top"/);
   const enc = (text) => new TextEncoder().encode(text);
@@ -376,6 +379,11 @@ test('truncated tool previews preserve decoded flags and tool failures stay visi
   await p.onEvent({event:'message',bot:'Bob',turn:1,data:{node:1}}); await p.loadBatch('Bob');
   await p.onEvent({event:'tool_started',bot:'Bob',turn:1,data:{call_id:'call',name:'shell',arguments:JSON.stringify(input).slice(0,2048),arguments_truncated:true}});
   assert.equal(t.items.find(it=>it.kind==='tool').background,true);
+  // A path longer than the preview keeps the one decoded from the committed call.
+  const path='/w/'+'d/'.repeat(1100)+'f.md'; output={type:'function_call',call_id:'read',name:'read',arguments:JSON.stringify({path})};
+  await p.onEvent({event:'message',bot:'Bob',turn:1,data:{node:4}}); await p.loadBatch('Bob');
+  await p.onEvent({event:'tool_started',bot:'Bob',turn:1,data:{call_id:'read',name:'read',arguments:JSON.stringify({path}).slice(0,2048),arguments_truncated:true}});
+  assert.equal(t.items.find(it=>it.callId==='read').path,path);
   output={type:'function_call_output',output:'{"error":"spawn_failed"}'};
   await p.onEvent({event:'tool_completed',bot:'Bob',turn:1,data:{call_id:'call',node:2}});
   await p.loadBatch('Bob'); assert.match(p.itemsHTML(t),/spawn_failed/);

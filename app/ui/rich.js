@@ -71,11 +71,12 @@ window.Rich = (() => {
     });
     return md;
   }
-  // A link's target as a path, without a line suffix (`a.rs:12`, `a.rs#L12`); null for a URL or anchor.
+  // A link's target as a path, without its fragment (`a.md#install`, `a.rs#L12`) or a line suffix
+  // (`a.rs:12`); null for a URL or anchor. A `#` in a file's name is written `%23`.
   function filePath(href) {
-    let p = href ?? ''; try { p = decodeURI(p); } catch (_) {}
-    if (!p || p.startsWith('#') || /^[a-z][a-z0-9+.-]*:/i.test(p.replace(/^file:\/\//i, ''))) return null;
-    return p.replace(/^file:\/\//i, '').replace(/(#L\d+(-L?\d+)?|:\d+(:\d+)?)$/, '') || null;
+    let p = (href ?? '').replace(/#.*$/s, ''); try { p = decodeURIComponent(p); } catch (_) {}
+    if (!p || /^[a-z][a-z0-9+.-]*:/i.test(p.replace(/^file:\/\//i, ''))) return null;
+    return p.replace(/^file:\/\//i, '').replace(/:\d+(:\d+)?$/, '') || null;
   }
   // A message's HTML, inside the caller's `.md` box.
   function html(text) {

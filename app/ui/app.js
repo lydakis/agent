@@ -698,7 +698,7 @@ async function onEvent(ev) {
       }
       if (existing) {
         row.from = existing.from ?? row.from;
-        if (data.arguments_truncated) { row.summary = existing.summary; row.background = existing.background; }
+        if (data.arguments_truncated) { row.summary = existing.summary; row.path = existing.path; row.background = existing.background; }
         Object.assign(existing, row); t.gen += 1; } else addItem(t, row);
       break;
     }
