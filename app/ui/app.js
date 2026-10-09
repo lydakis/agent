@@ -3,8 +3,8 @@
 (() => {
 'use strict';
 const $ = (id) => document.getElementById(id);
-const GLYPH = { running: '●', waiting: '◐', paced: '◔', failed: '✘', idle: '○', queued: '◌', ready: '◌', interrupted: '✘' };
-const LABEL = { running: 'working', waiting: 'waiting', paced: 'rate limited', failed: 'failed', idle: 'idle', queued: 'queued', ready: 'queued', interrupted: 'interrupted' };
+const GLYPH = { running: '●', waiting: '◐', paced: '◔', failed: '✘', idle: '○', done: '✔', queued: '◌', ready: '◌', interrupted: '✘' };
+const LABEL = { running: 'working', waiting: 'waiting', paced: 'rate limited', failed: 'failed', idle: 'idle', done: 'done', queued: 'queued', ready: 'queued', interrupted: 'interrupted' };
 const LAZY_ITEMS = 400;
 // Decoded items kept around the reader's end of a transcript; bodies beyond it fold back into their
 // nodes and a scroll toward them loads them again.
@@ -181,6 +181,13 @@ function seedHistory(record) {
 }
 const glyphOf = (status) => GLYPH[status] || '✘';
 const labelOf = (status) => LABEL[status] || 'failed';
+// A turn the person asked for that finished while its bot was off screen shows as done, not idle,
+// until the person looks at that bot. A failure already shows until the next turn.
+const shownStatus = (b) => b.unseen && b.status === 'idle' ? 'done' : b.status;
+const onScreen = (name) => (S.selected === name || S.ui.side === name) && document.visibilityState !== 'hidden' && document.hasFocus?.() !== false;
+function markSeen() {
+  for (const name of [S.selected, S.ui.side]) { const b = name && S.bots.get(name); if (b?.unseen && onScreen(name)) { b.unseen = false; patchRailRow(name); } }
+}
 const fmt = (ms) => { const s = Math.max(0, Math.round(ms / 1000)); return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`; };
 // Safe in text and inside a quoted attribute alike: names and call ids come from providers and land in both.
 const esc = (s) => String(s).replace(/[&<>"'\r]/g, (c) => ({ '\r': '&#13;', '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -697,12 +704,14 @@ async function onEvent(ev) {
     case 'turn_finished': {
       const status = data.status ?? '?';
       const b = bot(name);
+      const key = `${name}\u0000${turn}`, from = S.turnFrom.get(key); S.turnFrom.delete(key);
       // A steer absorbed into a running turn finishes as its own turn while that turn goes on.
       if (b && (b.runningTurn === null || b.runningTurn === turn)) { b.runningTurn = null; b.waitingOn = []; if (b.turnStarted) b.elapsed = Date.now() - b.turnStarted; b.turnStarted = 0; b.status = status === 'completed' || status === 'steered' ? 'idle' : status; }
       const t = transcript(name);
       if (t.streamingTurn === turn) { t.text = ''; t.thinking = ''; t.thinkingSince = 0; t.thinkingMs = 0; t.streamingTurn = null; t.streamGen += 1; }
       if (status !== 'completed' && status !== 'steered') addItem(t, { kind: 'note', text: data.error ? `${status}: ${data.error}${data.detail ? ': ' + data.detail : ''}` : status, turn });
-      const key = `${name}\u0000${turn}`, from = S.turnFrom.get(key); S.turnFrom.delete(key);
+      // A turn another bot asked for is that bot's news, not the person's.
+      if (b && S.live && status === 'completed' && !from && !onScreen(name)) b.unseen = true;
       // A steer's turn is part of the turn it joined, whose end is the news.
       // A task's creator may still be on a snapshot page to come; its news waits for the whole snapshot.
       if (S.live && status !== 'steered') { if (S.snapshot) S.heldNews.push([name, turn, status, from]); else tellLead(name, turn, status, from); }
@@ -1178,6 +1187,7 @@ function restore() {
 }
 function save() { const key = sessionKey(); if (!key) return; try { localStorage.setItem(key, JSON.stringify({ selected: S.selected, side: S.ui.side, rail: S.ui.rail, steps: S.ui.steps, folded: [...S.ui.folded], override: [...S.override].map(([name, model]) => [name, bot(name)?.id ?? null, model]), effort: [...S.effort].map(([name, level]) => [name, bot(name)?.id ?? null, level]) })); } catch (_) {} }
 window.addEventListener('beforeunload', save);
+window.addEventListener('focus', markSeen);
 
 // ---------- render ----------
 function inline(text) {
@@ -1207,7 +1217,7 @@ const cssEsc = (s) => String(s).replace(/[\x00-\x1f\x7f"\\]/g, (c) => c === '\0'
 function taskCard(who) {
   const p = bot(who); if (!p) return null;
   const el = p.turnStarted ? fmt(Date.now() - p.turnStarted) : p.elapsed ? fmt(p.elapsed) : '';
-  return { attr: `data-task="${esc(p.name)}"`, task: p.name, status: p.status, name: shortName(p), last: lastLine(transcript(who)), elapsed: el, sel: S.ui.side === who || S.selected === who };
+  return { attr: `data-task="${esc(p.name)}"`, task: p.name, status: shownStatus(p), name: shortName(p), last: lastLine(transcript(who)), elapsed: el, sel: S.ui.side === who || S.selected === who };
 }
 // The two panes that show a transcript: the main thread and the one beside it.
 const PANES = [['log', () => S.selected], ['side', () => S.ui.side]];
@@ -1744,7 +1754,7 @@ function botRowHTML(n, sel) {
     return `<div class="botrow${sel ? ' sel' : ''}" data-bot="${esc(n.key)}" role="button" tabindex="0"><span class="tree">${n.prefix}</span><span class="glyph ${st}">${glyphOf(st)}</span><span class="n">⁂ ${esc(memberShort(sw, sw.name))}</span><span class="meta">${sw.members.length}</span><span class="acts">${moreButton(n.key)}</span></div>`;
   }
   const b = n.b, acts = `<span class="acts">${moreButton(b.name)}</span>`;
-  const glyph = `<span class="glyph ${b.status}">${glyphOf(b.status)}</span>`;
+  const st = shownStatus(b), glyph = `<span class="glyph ${st}">${glyphOf(st)}</span>`;
   if (n.head != null) {
     const folded = S.ui.folded.has(n.head);
     const chev = n.tasks ? `<button type="button" class="chev" data-act="fold" data-v="${esc(n.head)}" aria-label="${folded ? 'Show' : 'Hide'} tasks">${folded ? '▸' : '▾'}</button>` : '<span class="chev"></span>';
@@ -1784,6 +1794,7 @@ function render() {
   const side = S.ui.side ? bot(S.ui.side) : null;
   app.classList.toggle('rail', S.ui.rail); app.classList.toggle('side', !!side);
   followDrafts();
+  markSeen();
   if (sw) { renderSwarmHead($('title'), sw); renderSwarm($('log'), sw); }
   else { renderHead($('title'), b, 'main'); if (b) renderTranscript($('log'), b.name); else { $('log').innerHTML = ''; $('log').dataset.key = ''; } }
   if (S.ui.rail) renderRail();
@@ -1811,9 +1822,9 @@ function renderPicker() {
   const more = all.length > rows.length ? `<div class="empty">${all.length - rows.length} more; type to narrow</div>` : '';
   $('pickerlist').innerHTML = (rows.length ? rows.map((r, idx) => {
     const n = r.b.name; const hit = r.i >= 0 ? `${esc(n.slice(0, r.i))}<span class="hit">${esc(n.slice(r.i, r.i + q.length))}</span>${esc(n.slice(r.i + q.length))}` : esc(n);
-    const state = r.b.status === 'idle' ? '' : labelOf(r.b.status);
+    const st = shownStatus(r.b), state = st === 'idle' ? '' : labelOf(st);
     const hint = q ? [creatorOf(r.b) ? `↳ ${r.b.parent}` : '', state].filter(Boolean).join(' · ') : state;
-    return `<div class="row${idx === S.ui.pickerSel ? ' sel' : ''}" data-pick="${esc(n)}">${q ? '' : `<span class="tree">${r.prefix}</span>`}<span class="glyph ${r.b.status}">${glyphOf(r.b.status)}</span><span class="n">${hit}</span><span class="h">${esc(hint)}</span></div>`;
+    return `<div class="row${idx === S.ui.pickerSel ? ' sel' : ''}" data-pick="${esc(n)}">${q ? '' : `<span class="tree">${r.prefix}</span>`}<span class="glyph ${st}">${glyphOf(st)}</span><span class="n">${hit}</span><span class="h">${esc(hint)}</span></div>`;
   }).join('') : '<div class="empty">no bot matches</div>') + more;
 }
 let pickerPane = 'main';

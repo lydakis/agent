@@ -33,7 +33,7 @@ function page(daemon = {}, storage = null) {
   });
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules, tellLead };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules, tellLead, markSeen };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -2454,4 +2454,31 @@ test('work view retains partial findings and independent verdicts without callin
   // The swarm's own notices are system lines, not a member to open.
   sw.tab = 'board'; sw.lines = [{at:1,from:'swarm',kind:'quiet',text:'nothing is running and there is no final result (partial)'}];
   p.renderSwarm(el,sw); assert.match(el.innerHTML,/<span class="who council">swarm<\/span>/); assert.doesNotMatch(el.innerHTML,/data-task="app\.swarm"/);
+});
+
+test('a turn the person asked for that ends off screen shows done until its bot is looked at', async () => {
+  const p = page();
+  for (const [name, id] of [['Ann', 1], ['Bob', 2], ['Cy', 3]]) p.upsert({ name, id });
+  p.S.selected = 'Ann'; p.S.live = true;
+  const glyph = (name) => /class="glyph (\w+)"/.exec(p.botRowHTML({ b: p.S.bots.get(name), prefix: '' }, false))[1];
+  const run = async (name, turn, status, from) => {
+    await p.onEvent({ event: 'accepted', bot: name, turn, data: from ? { from: { bot: from } } : {} });
+    await p.onEvent({ event: 'turn_finished', bot: name, turn, data: { status } });
+  };
+  await run('Bob', 1, 'completed');
+  await run('Cy', 1, 'completed', 'Ann');
+  await run('Ann', 1, 'completed');
+  // Another bot's ask is that bot's news; the bot on screen was seen as it finished.
+  assert.deepEqual(['Bob', 'Cy', 'Ann'].map(glyph), ['done', 'idle', 'idle']);
+  // Still done after a turn that failed and one more that completed.
+  await run('Bob', 2, 'failed');
+  assert.equal(glyph('Bob'), 'failed');
+  await run('Bob', 3, 'completed');
+  assert.equal(glyph('Bob'), 'done');
+  p.S.ui.side = 'Bob'; p.markSeen();
+  assert.equal(glyph('Bob'), 'idle');
+  // A replayed snapshot is history, not news.
+  p.S.ui.side = null; p.S.live = false;
+  await run('Bob', 4, 'completed');
+  assert.equal(glyph('Bob'), 'idle');
 });

@@ -69,6 +69,13 @@ A side chat asked while the lead works: a fork beside it, the lead untouched.
 
 ![A side chat beside the running lead](app/side-chat.png)
 
+A turn you asked for that finishes while its agent is off screen shows ✔
+instead of ○ until you open that agent. A turn another agent asked for is
+that agent's news, so the tasks stay ○; a failure already shows ✘ until the
+next turn. The mark lives in the window and does not survive a restart.
+
+![demo finished while notes was open](app/done-unseen.png)
+
 New project takes a folder, the model its lead starts on, and that model's
 effort. Effort is how hard the model thinks: every provider offers low,
 medium, high and xhigh, Claude also max, and "default effort" sends no level,
