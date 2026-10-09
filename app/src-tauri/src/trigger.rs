@@ -790,6 +790,21 @@ pub fn commit(value: &str) -> Result<(When, PathBuf), String> {
     let repo = std::path::absolute(value).map_err(|e| format!("invalid_commit: {value}: {e}"))?;
     let git_dir = git(&repo, &["rev-parse", "--absolute-git-dir"])
         .ok_or_else(|| format!("invalid_commit: {value}: not a git repository"))?;
+    // git keeps the HEAD log only where core.logAllRefUpdates says so, which
+    // a bare repository does not by default: there it would never fire.
+    let logs = match git(&repo, &["config", "core.logAllRefUpdates"]) {
+        Some(set) => !matches!(
+            set.to_ascii_lowercase().as_str(),
+            "false" | "no" | "off" | "0" | ""
+        ),
+        None => git(&repo, &["rev-parse", "--is-bare-repository"]).as_deref() != Some("true"),
+    };
+    if !logs {
+        return Err(format!(
+            "invalid_commit: {value}: git keeps no HEAD log here; git -C {} config core.logAllRefUpdates true",
+            repo.display()
+        ));
+    }
     Ok((
         When {
             text: format!("commit {}", repo.display()),
@@ -869,6 +884,13 @@ fn program(text: &str) -> Option<Vec<String>> {
         at = &body[end + "</string>".len()..];
     }
     Some(args)
+}
+
+/// The path a plist has launchd watch, as the app writes it.
+fn watched(text: &str) -> Option<PathBuf> {
+    let rest = &text[text.find("<key>WatchPaths</key>")?..];
+    let body = &rest[rest.find("<string>")? + "<string>".len()..];
+    Some(PathBuf::from(unescape(&body[..body.find("</string>")?])))
 }
 
 /// The trigger a plist runs, and the app it runs it with.
@@ -1084,14 +1106,23 @@ pub fn install(
     let path = places.plist(&trigger.name);
     match std::fs::read_to_string(&path) {
         Ok(text) => {
-            let (there, _) = read_plist(&text).ok_or_else(|| {
+            let (there, there_app) = read_plist(&text).ok_or_else(|| {
                 format!(
                     "trigger_exists: definition: {} is there but cannot be read; rm it first",
                     trigger.name
                 )
             })?;
             return match there.differs(trigger) {
-                None => Ok(Some(there)),
+                None => {
+                    // The same definition can watch another path: a
+                    // repository made again at its path has another git
+                    // folder. launchd is made to watch the one it is now.
+                    if watched(&text) != when.watch {
+                        let want = plist(&there_app, &there, when, environment);
+                        swap(&path, &there.name, Some(&text), &want, launchd)?;
+                    }
+                    Ok(Some(there))
+                }
                 Some(field) => Err(format!(
                     "trigger_exists: {field}: {} is a trigger with another {field}; rm it first or pass another --name",
                     trigger.name
@@ -1228,9 +1259,10 @@ pub fn remove(places: &Places, name: &str, launchd: Loader) -> Result<(), String
     Ok(())
 }
 
-/// `fire NAME`: launchd runs the trigger's job now, which it does not while
-/// one of its fires still runs. The note it leaves tells that fire it was
-/// asked for, so it sends whatever the time or its watched path.
+/// `fire NAME`: launchd runs the trigger's job now. The note it leaves tells
+/// that fire it was asked for, so it sends whatever the time or its watched
+/// path. While one of its fires still runs launchd starts no other: that
+/// fire finds the note when it is done and sends once more.
 pub fn fire_now(places: &Places, name: &str, launchd: Loader) -> Result<Value, String> {
     valid_name(name)?;
     let _lock = Lock::take(places)?;
@@ -1663,6 +1695,40 @@ pub fn cli(args: &[String]) -> i32 {
     1
 }
 
+/// A trigger that watched the triggers' own folder would fire itself: each
+/// fire writes its result there. Folders on a Mac ignore case, and a link
+/// is followed as far as the path exists.
+fn watches_state(places: &Places, watch: &Path) -> Result<(), String> {
+    let real = |path: &Path| {
+        let mut at = path.to_path_buf();
+        let mut rest = Vec::new();
+        loop {
+            if let Ok(found) = at.canonicalize() {
+                return rest
+                    .iter()
+                    .rev()
+                    .fold(found, |p: PathBuf, part: &std::ffi::OsString| p.join(part));
+            }
+            match (at.file_name().map(|f| f.to_owned()), at.parent()) {
+                (Some(part), Some(up)) => {
+                    rest.push(part);
+                    at = up.to_path_buf();
+                }
+                _ => return path.to_path_buf(),
+            }
+        }
+    };
+    let lower = |path: PathBuf| path.to_string_lossy().to_lowercase();
+    let (real_watch, state) = (lower(real(watch)), lower(real(&places.state)));
+    if real_watch == state || real_watch.starts_with(&format!("{state}/")) {
+        return Err(format!(
+            "invalid_file: {}: the triggers' own folder changes on every fire; watch another path",
+            watch.display()
+        ));
+    }
+    Ok(())
+}
+
 /// An agent's id by its name, now.
 async fn bot_id(client: &Client, name: &str) -> Result<i64, String> {
     let record = client
@@ -1686,6 +1752,9 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
         )),
         _ => None,
     };
+    if let Some(watch) = &asked.when.watch {
+        watches_state(places, watch)?;
+    }
     let daemon = Daemon::current()?;
     let socket = daemon.socket()?;
     let name = asked
@@ -1794,13 +1863,17 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
             Ok(row)
         }
         None => {
-            // The commit there now is seen: only the next one fires.
+            // The commit there now is seen: only the next one fires. A
+            // trigger without it would take that commit for news, so it goes.
             if let Some(head) = trigger.commit.as_deref().and_then(head) {
                 let kept = Kept {
                     head: Some(head),
                     ..Kept::default()
                 };
-                record_last(places, &trigger, &Value::Null, &kept)?;
+                if let Err(error) = record_last(places, &trigger, &Value::Null, &kept) {
+                    let _ = remove(places, &trigger.name, &launchctl);
+                    return Err(error);
+                }
             }
             Ok(trigger.json(&state(places, &trigger)))
         }
@@ -2014,27 +2087,46 @@ pub fn fire_cli(args: &[String]) -> i32 {
             return 1;
         }
     };
+    fires(&places, &trigger.name, |asked| {
+        fire(&places, &trigger, asked)
+    });
+    0
+}
+
+/// Fire, and again for each `fire NAME` asked while it ran.
+fn fires(places: &Places, name: &str, mut fire: impl FnMut(bool)) {
+    let mut asked = take_asked(places, name);
+    loop {
+        fire(asked);
+        if !take_asked(places, name) {
+            return;
+        }
+        asked = true;
+    }
+}
+
+/// One fire: send the message when it is time, or when it was asked for.
+fn fire(places: &Places, trigger: &Trigger, asked: bool) {
     let now = now();
-    let asked = take_asked(&places, &trigger.name);
-    let mut kept = Kept::of(&state(&places, &trigger));
+    let mut kept = Kept::of(&state(places, trigger));
     if !asked {
         // A one-off's calendar entry has no year: the same date a year early
         // is not its time. A day's slack keeps its time when the Mac's time
         // zone changed since it was made, which launchd follows and `at`
         // does not.
         if trigger.at.is_some_and(|at| now < at - SLACK) {
-            return 0;
+            return;
         }
         if trigger.not_before.is_some_and(|first| now < first) {
-            return 0;
+            return;
         }
         // Months late is the entry's next year: the Mac was off at its time,
         // or its end was cut short. It is not sent; if it is still listed, it
         // ends saying so.
         if trigger.at.is_some_and(|at| now > at + STALE) {
             let missed = json!({"outcome": "missed", "detail": "its time passed long ago"});
-            settle(&places, &trigger, &missed, &kept, &launchctl);
-            return 0;
+            settle(places, trigger, &missed, &kept, &launchctl);
+            return;
         }
     }
     let mut why = if asked {
@@ -2046,18 +2138,19 @@ pub fn fire_cli(args: &[String]) -> i32 {
     if let Some(repo) = &trigger.commit {
         let seen = head(repo);
         if !asked && (seen.is_none() || seen == kept.head) {
-            return 0;
+            return;
         }
-        if let Some(sha) = &seen {
+        // A HEAD that cannot be read now keeps the last one seen.
+        if let Some(sha) = seen {
             why = format!("{why} at {}", &sha[..sha.len().min(12)]);
+            kept.head = Some(sha);
         }
-        kept.head = seen;
     }
     // A gate that says no costs this process and nothing else.
     if let Some(command) = &trigger.gate
         && gate(command, trigger.dir.as_deref()).is_err()
     {
-        return 0;
+        return;
     }
     let outcome = match runtime() {
         Ok(runtime) => runtime.block_on(async {
@@ -2075,14 +2168,13 @@ pub fn fire_cli(args: &[String]) -> i32 {
                 return json!({"outcome": "failed", "detail": format!(
                     "store_mismatch: the daemon at {} serves another store", socket.display())});
             }
-            let outcome = deliver(&client, &trigger, &mut kept, &why, asked).await;
+            let outcome = deliver(&client, trigger, &mut kept, &why, asked).await;
             client.close().await;
             outcome
         }),
         Err(error) => json!({"outcome": "failed", "detail": error}),
     };
-    settle(&places, &trigger, &outcome, &kept, &launchctl);
-    0
+    settle(places, trigger, &outcome, &kept, &launchctl);
 }
 
 /// The daemon, started the way the app starts one when none answers and
@@ -2908,6 +3000,15 @@ mod tests {
         // One asked for long ago is not this fire's.
         replace(&w.places.asked(&s.name), &(now() - 3600).to_string()).unwrap();
         assert!(!take_asked(&w.places, &s.name));
+        // One asked while a fire runs is sent once that fire is done.
+        let mut seen = Vec::new();
+        fires(&w.places, &s.name, |asked| {
+            if seen.is_empty() {
+                fire_now(&w.places, &s.name, &|x| w.fake.call(x)).unwrap();
+            }
+            seen.push(asked);
+        });
+        assert_eq!(seen, [false, true]);
         // One launchd will not run leaves no note behind.
         w.fake.loaded.borrow_mut().clear();
         assert!(fire_now(&w.places, &s.name, &|x| w.fake.call(x)).is_err());
@@ -3047,6 +3148,26 @@ mod tests {
     }
 
     #[test]
+    fn a_file_trigger_cannot_watch_the_triggers_own_folder() {
+        let w = World::new("own-state");
+        std::fs::create_dir_all(&w.places.state).unwrap();
+        for own in [
+            w.places.state.clone(),
+            w.places.last("p.x"),
+            w.root.join(".agent/Triggers/p.x.json"),
+            w.root.join(".agent/./triggers/new/file"),
+        ] {
+            let refused = watches_state(&w.places, &own).unwrap_err();
+            assert!(refused.starts_with("invalid_file:"), "{own:?}: {refused}");
+        }
+        std::os::unix::fs::symlink(&w.places.state, w.root.join("link")).unwrap();
+        assert!(watches_state(&w.places, &w.root.join("link/p.x.json")).is_err());
+        for other in [w.root.join(".agent"), w.root.join(".agent/triggers-not")] {
+            assert_eq!(watches_state(&w.places, &other), Ok(()), "{other:?}");
+        }
+    }
+
+    #[test]
     fn a_commit_trigger_watches_the_head_log_and_names_the_commit() {
         let root = std::env::temp_dir().join(format!("agent-app-commit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -3072,7 +3193,7 @@ mod tests {
         let (when, repo) = commit(root.to_str().unwrap()).unwrap();
         assert_eq!(repo, root);
         assert_eq!(when.text, format!("commit {}", root.display()));
-        let log = when.watch.unwrap();
+        let log = when.watch.clone().unwrap();
         assert!(log.ends_with(".git/logs/HEAD") && log.exists());
         let first = head(&root).unwrap();
         git(&["commit", "-q", "--allow-empty", "-m", "two"]);
@@ -3082,6 +3203,32 @@ mod tests {
                 .unwrap_err()
                 .starts_with("invalid_commit")
         );
+        // Where git keeps no HEAD log, nothing would ever fire it.
+        git(&["config", "core.logAllRefUpdates", "false"]);
+        let none = commit(root.to_str().unwrap()).unwrap_err();
+        assert!(none.contains("git keeps no HEAD log here"), "{none}");
+        git(&["config", "core.logAllRefUpdates", "always"]);
+        assert!(commit(root.to_str().unwrap()).is_ok());
+        let bare = root.join("bare.git");
+        git(&["init", "-q", "--bare", bare.to_str().unwrap()]);
+        assert!(commit(bare.to_str().unwrap()).is_err());
+        // A repository made again at its path is watched where it is now.
+        let w = World::new("commit-again");
+        let s = Trigger {
+            when: when.text.clone(),
+            commit: Some(root.clone()),
+            ..trigger()
+        };
+        let app = Path::new("/A/agent-app");
+        install(&w.places, app, &s, &when, &[], &|x| w.fake.call(x)).unwrap();
+        let moved = When {
+            watch: Some(root.join("elsewhere/logs/HEAD")),
+            ..commit(root.to_str().unwrap()).unwrap().0
+        };
+        let again = install(&w.places, app, &s, &moved, &[], &|x| w.fake.call(x));
+        assert_eq!(again.unwrap(), Some(s.clone()));
+        assert_eq!(watched(&w.plist(&s.name)), moved.watch);
+        assert_eq!(w.state(&s.name), (true, true, false));
         std::fs::remove_dir_all(root).unwrap();
     }
 

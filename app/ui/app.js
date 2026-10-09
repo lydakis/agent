@@ -2417,11 +2417,23 @@ function triggersHTML(st, busy) {
   const none = st.triggersError ? `<p class="bad">${esc(st.triggersError)}</p>` : rows ? '' : '<p class="dim">None yet. Ask a coordinator, for example "have build check its PR every 30 minutes".</p>';
   return `<section><h3>Triggers</h3>${rows}${none}${st.triggersAfter ? '<button class="sbtn" data-act="triggers-first">First page</button>' : ''}${st.triggersNext ? '<button class="sbtn" data-act="triggers-next">Next page</button>' : ''}<p class="dim">Each fire, the agent gets its message in its own chat. A repeating one skips a fire while its agent is working; a one-off, or Run now, waits for it. They run with the app closed; a time the Mac slept through runs once when it wakes.</p></section>`;
 }
+// Run now returns once launchd starts the fire, before it has sent anything: the row is read again, a little
+// later each time, until its last fire changes or it ends, while Settings stays open.
+const RUN_NOW_LOOKS = [500, 1000, 2000, 4000, 8000];
 async function triggerAct(act, name) {
   const st = setupState();
-  try { await (act === 'fire' ? Daemon.fireTrigger(name) : Daemon.removeTrigger(name)); } catch (e) { toast(`${act === 'fire' ? 'run' : 'remove'} ${name}: ${e?.message ?? e}`, 5000); }
+  const lastOf = () => st.triggers?.find((x) => x.name === name)?.last?.fired_ms ?? null;
+  const before = lastOf();
+  let fired = act === 'fire';
+  try { await (act === 'fire' ? Daemon.fireTrigger(name) : Daemon.removeTrigger(name)); } catch (e) { fired = false; toast(`${act === 'fire' ? 'run' : 'remove'} ${name}: ${e?.message ?? e}`, 5000); }
   await readTriggers(st.triggersAfter);
   renderSetup();
+  for (const ms of fired ? RUN_NOW_LOOKS : []) {
+    if (!st.open || !st.triggers?.some((x) => x.name === name) || lastOf() !== before) return;
+    await new Promise((done) => setTimeout(done, ms));
+    await readTriggers(st.triggersAfter);
+    renderSetup();
+  }
 }
 async function editRole(name) {
   const st = setupState();

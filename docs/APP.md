@@ -1030,11 +1030,16 @@ launchd keeps minutes; `--at` refuses a part out of range or extra parts);
 `--cron` is read as cron reads it, a day or a weekday when both are given,
 up to 1,024 calendar entries. `--file PATH` fires when the file is written,
 or a file is added to or removed from it when it is a folder (launchd's
-`WatchPaths`); it need not exist yet. `--commit REPO` watches the
+`WatchPaths`); it need not exist yet, and it may not be in
+`~/.agent/triggers`, which every fire writes. `--commit REPO` watches the
 repository's own HEAD log, which git writes on every move of HEAD, and sends
 only when HEAD names a commit other than the one the trigger last saw
 (`add` records the one there now), so a checkout back and forth or a write
-that moved nothing sends nothing. With no WHEN, only `fire` runs it.
+that moved nothing sends nothing. A repository where git keeps no HEAD log
+(`core.logAllRefUpdates` false, or a bare one by default) is refused, and
+adding the same trigger again watches the git folder the repository has
+now. With no WHEN, only `fire` runs it; `fire` while a fire still runs is
+sent by that fire once it is done.
 
 **Whom.** `add` defaults to the agent whose shell runs it (`AGENT_BOT`,
 which must still match `AGENT_BOT_ID`); `--bot` names another. Either is
