@@ -1285,11 +1285,11 @@ test('the coordinator the app ships gives editing tasks worktrees and cleans up 
 });
 
 test('a project name taken by another folder\'s coordinator is refused, and a refused model is never written', async () => {
-  const calls = []; let fail = true, failWrite = false;
+  const calls = []; let fail = true, failWrite = false, threads;
   const p = shell({
     project: async (dir) => ({ dir, name: dir.endsWith('taken') ? 'demo' : 'weather', coordinator: dir.endsWith('taken') ? 'demo.lead' : 'weather.lead', model: null, file: false }),
     policy: async () => ({ instructions: 'rules', compaction_instructions: 'summary', note: 'test' }),
-    writeProject: async (q) => { calls.push(['write', q.dir, q.model]); if (failWrite) throw new Error('project_unwritable'); },
+    writeProject: async (q) => { calls.push(['write', q.dir, q.model]); threads = q.threads; if (failWrite) throw new Error('project_unwritable'); },
     request: async (op, q) => { calls.push([op, q.bot]); if (op === 'create' && fail) throw new Error('create_failed'); return op === 'create' ? { name: q.bot, id: 7, provider: 'alpha', model: 'one', workspace: q.workspace } : { nodes: [], next_from: null }; },
   });
   p.upsert({ name: 'demo.lead', id: 1, provider: 'alpha', model: 'one', workspace: '/synthetic/first' });
@@ -1303,8 +1303,9 @@ test('a project name taken by another folder\'s coordinator is refused, and a re
   fail = false; failWrite = true;
   await assert.rejects(p.createProject('/synthetic/weather', 'alpha/one'), /project_unwritable/);
   assert.deepEqual(calls.map(([op]) => op), ['create', 'create', 'write'], 'the file follows an accepted coordinator');
-  failWrite = false; await p.createProject('/synthetic/weather', 'alpha/one');
+  failWrite = false; await p.createProject('/synthetic/weather', 'alpha/one', null, { model: 'beta/two', reasoning: 'low', inProject: true });
   assert.deepEqual(calls.at(-1), ['write', '/synthetic/weather', 'alpha/one'], 'a retry writes the missing file with the coordinator\'s model');
+  assert.deepEqual({ ...threads }, { model: 'beta/two', reasoning: 'low', inProject: true }, 'and with the threads picked for it');
   assert.equal(calls.filter(([op]) => op === 'create').length, 2);
   assert.equal(p.S.selected, 'weather.lead');
 });

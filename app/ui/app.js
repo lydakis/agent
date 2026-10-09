@@ -2331,7 +2331,7 @@ async function remove(name) { await Daemon.request('delete', { bot: name }); }
 // and its coordinator is `<name>.lead` working there. An existing coordinator is opened, not made
 // twice, unless it works in another folder. The file is written only once the daemon has accepted
 // the coordinator, so a model it refuses is never saved; a folder whose coordinator exists gets
-// the file it lacks, with that coordinator's model, so a failed write retries.
+// the file it lacks, with that coordinator's model and the threads picked now, so a failed write retries.
 // The app's own opinion of how a coordinator works is its `coordinator` profile: the folder's
 // `.agents/agents/coordinator.md`, the user's, or the one the app ships (app/agents/coordinator.md).
 // `threads` is what its threads run on and where they work: their model and effort, when not the lead's,
@@ -2341,7 +2341,7 @@ async function createProject(dir, picked = null, effort = null, threads = null) 
   const existing = bot(info.coordinator);
   if (existing) {
     if (existing.workspace !== info.dir) throw new Error(`${info.coordinator} already belongs to ${existing.workspace ?? 'another folder'}`);
-    if (!info.file) await Daemon.writeProject({ dir: info.dir, name: info.name, model: existing.model, reasoning: existing.reasoning ?? null });
+    if (!info.file) await Daemon.writeProject({ dir: info.dir, name: info.name, model: existing.model, reasoning: existing.reasoning ?? null, threads });
     await openOnly(info.coordinator); return;
   }
   const policy = await Daemon.policy(info.dir, 'coordinator');
