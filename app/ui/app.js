@@ -189,21 +189,23 @@ const labelOf = (status) => LABEL[status] || 'failed';
 const shownStatus = (b) => S.unseen.has(b.name) && b.status === 'idle' ? 'done' : b.status;
 // Settings, help, the picker and the swarm sheet cover the thread. A swarm's view shows its agents.
 const covered = () => S.ui.help || S.ui.picker || S.ui.sheet || S.setup?.open;
+const looking = () => !covered() && document.visibilityState !== 'hidden' && document.hasFocus?.() !== false;
 const onScreen = (name) => {
-  if (covered() || document.visibilityState === 'hidden' || document.hasFocus?.() === false) return false;
+  if (!looking()) return false;
   const sw = swarmOfBot(name);
   return S.selected === name || S.ui.side === name || (!!sw && S.selected === swarmKey(sw.name));
 };
 // Each row a change touches is drawn once, however many of a swarm's agents it covers.
 function patchUnseen(names) {
-  // A hidden sidebar draws its rows again when it opens.
-  rail.key = '';
   const rows = new Set();
   for (const name of names) { rows.add(name); const sw = swarmOfBot(name); if (sw) rows.add(swarmKey(sw.name)); }
   for (const row of rows) patchRailRow(row);
 }
+// Only what the panes show can become seen: the bots in them, or the selected swarm's agents.
 function markSeen() {
-  const seen = [...S.unseen].filter(onScreen);
+  if (!S.unseen.size || !looking()) return;
+  const sw = swarmOf(S.selected);
+  const seen = [...new Set([S.selected, S.ui.side, ...(sw ? sw.members : [])])].filter((name) => name && S.unseen.has(name));
   if (!seen.length) return;
   for (const name of seen) S.unseen.delete(name);
   patchUnseen(seen);
@@ -2524,7 +2526,8 @@ document.addEventListener('keydown', async (e) => {
   const k = e.key, ctrl = e.ctrlKey || e.metaKey;
   if (S.ui.menu) { if (k === 'Escape') { closeMenu(); e.preventDefault(); } return; }
   if (ctrl && k === 'k') { openPicker(); e.preventDefault(); return; }
-  if (ctrl && k === 'b') { S.ui.rail = !S.ui.rail; render(); save(); e.preventDefault(); return; }
+  // A hidden sidebar patches no rows, so it draws them all again when it opens.
+  if (ctrl && k === 'b') { S.ui.rail = !S.ui.rail; if (S.ui.rail) rail.key = ''; render(); save(); e.preventDefault(); return; }
   if (ctrl && k === 'd') { detach(); e.preventDefault(); return; }
   if (ctrl && k === 'o') { S.ui.steps = !S.ui.steps; render(); save(); e.preventDefault(); return; }
   if (ctrl && k === 'p') { await nextBeside(); e.preventDefault(); return; }
