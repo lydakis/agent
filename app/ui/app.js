@@ -35,7 +35,7 @@ const S = {
   swarms: new Map(), memberOf: new Map(),
   // Who asked for each turn another bot asked for, until it ends, and what each coordinator has yet to
   // hear about its tasks (see `wake`), and turns that ended live before the snapshot said who made their bot.
-  turnFrom: new Map(), wakes: new Map(), heldNews: [],
+  turnFrom: new Map(), turnOrigin: new Map(), wakes: new Map(), heldNews: [],
   // Bots whose finished turn the person has not looked at yet (see `shownStatus`), and turns another
   // bot asked for that the person steered into, whose end is theirs to see too.
   unseen: new Set(), wanted: new Set(),
@@ -195,23 +195,26 @@ const looking = () => !covered() && document.visibilityState !== 'hidden' && doc
 const onScreen = (name) => {
   if (!looking()) return false;
   const sw = swarmOfBot(name);
-  return S.selected === name || S.ui.side === name || (!!sw && S.selected === swarmKey(sw.name));
+  // A file open beside covers the chat that was there.
+  return S.selected === name || (S.ui.side === name && !S.ui.file) || (!!sw && S.selected === swarmKey(sw.name));
 };
 // Each row a change touches is drawn once, however many of a swarm's agents it covers.
 function patchUnseen(names) {
   const rows = new Set();
   for (const name of names) { rows.add(name); const sw = swarmOfBot(name); if (sw) rows.add(swarmKey(sw.name)); }
   for (const row of rows) patchRailRow(row);
+  // A tab's glyph says done too; the bar redraws only when a tab's state changed.
+  renderTabs();
 }
 // Only what the panes show can become seen: the bots in them, or the selected swarm's agents.
 function markSeen() {
   if (!S.unseen.size || !looking()) return;
   const sw = swarmOf(S.selected);
-  const seen = [...new Set([S.selected, S.ui.side, ...(sw ? sw.members : [])])].filter((name) => name && S.unseen.has(name));
+  const seen = [...new Set([S.selected, S.ui.file ? null : S.ui.side, ...(sw ? sw.members : [])])].filter((name) => name && S.unseen.has(name));
   if (!seen.length) return;
   for (const name of seen) S.unseen.delete(name);
   patchUnseen(seen);
-  refreshLive($('log')); if (S.ui.side) refreshLive($('side'));
+  refreshLive($('log')); if (S.ui.side && !S.ui.file) refreshLive($('side'));
 }
 const fmt = (ms) => { const s = Math.max(0, Math.round(ms / 1000)); return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`; };
 // Safe in text and inside a quoted attribute alike: names and call ids come from providers and land in both.
@@ -272,12 +275,13 @@ function forgetBot(name) {
   // A coordinator gone hears nothing more, and its queued turns never end; a task gone is no news.
   if (S.wakes.has(name)) { clearTimeout(S.wakes.get(name).timer); S.wakes.delete(name); }
   for (const w of S.wakes.values()) if (w.tasks.delete(name) && !w.tasks.size) { clearTimeout(w.timer); w.timer = null; }
-  for (const key of S.turnFrom.keys()) if (key.startsWith(`${name}\u0000`)) S.turnFrom.delete(key);
+  for (const map of [S.turnFrom, S.turnOrigin]) for (const key of map.keys()) if (key.startsWith(`${name}\u0000`)) map.delete(key);
   for (const key of S.wanted) if (key.startsWith(`${name}\u0000`)) S.wanted.delete(key);
   // Held news is this bot's; a later bot of the same name is another.
   S.heldNews = S.heldNews.filter(([held]) => held !== name);
   // A draft belongs to its bot, so it goes with it.
   if (S.ui.side === name) S.ui.side = null;
+  if (S.ui.file?.bot === name) dropFile();
   S.drafts.delete(name);
   for (const ids of Object.values(PANE)) { const input = $(ids.input); if (input.dataset.for === name) { input.value = ''; input.dataset.for = ''; } }
 }
@@ -365,6 +369,9 @@ function tree() {
   if (projects.size && out.length > loose) out.splice(loose, 0, { label: 'bots' });
   return out;
 }
+// The path a read, write or edit names, whole (the summary is cut for display); none when it cannot be one.
+const FILE_TOOLS = new Set(['read', 'write', 'edit']);
+const toolPath = (name, parsed) => FILE_TOOLS.has(name) && typeof parsed?.path === 'string' && parsed.path && parsed.path.length <= 4096 ? parsed.path : undefined;
 function callSummary(name, args) {
   let a = {}; try { a = JSON.parse(args) ?? {}; } catch (_) {}
   let s = name === 'shell' ? a.command ?? '' : ['read', 'write', 'edit'].includes(name) ? a.path ?? '' : name === 'wait' ? (Array.isArray(a.handles) ? a.handles : []).filter((h) => typeof h === 'string').map((h) => h.replace(/^turn:/, '')).join(', ') : args;
@@ -647,6 +654,7 @@ async function onEvent(ev) {
     }
     case 'accepted': {
       if (data.from?.bot) S.turnFrom.set(`${name}\u0000${turn}`, data.from.bot);
+      else if (typeof data.origin === 'string') S.turnOrigin.set(`${name}\u0000${turn}`, data.origin);
       const b = bot(name); if (b) { b.status = 'running'; b.runningTurn = turn; b.waitingOn = []; b.turnStarted = S.live ? Date.now() : 0; b.elapsed = 0; }
       // The event that puts a prompt on the lineage names who sent it, here and on `steered`.
       const t = transcript(name), by = senderOf(data);
@@ -655,6 +663,7 @@ async function onEvent(ev) {
     }
     case 'queued': {
       if (data.from?.bot) S.turnFrom.set(`${name}\u0000${turn}`, data.from.bot);
+      else if (typeof data.origin === 'string') S.turnOrigin.set(`${name}\u0000${turn}`, data.origin);
       // `ready` waits for a daemon-wide slot with nothing else running on the bot; `queued` sits behind its own turn.
       const b = bot(name); const behindOwn = !!b && (b.runningTurn !== null || isActive(b.status));
       if (b && !behindOwn) { b.status = data.status ?? 'queued'; b.runningTurn = turn; }
@@ -678,7 +687,7 @@ async function onEvent(ev) {
       let parsed = {}; try { parsed = JSON.parse(args) ?? {}; } catch (_) {}
       const tname = data.name ?? 'tool';
       const t = transcript(name);
-      const row = { kind: 'tool', from: t.callNode, callId: data.call_id, name: tname, summary: callSummary(tname, args), background: tname === 'shell' && parsed.background === true, done: false, started: S.live ? Date.now() : 0, took: 0, turn };
+      const row = { kind: 'tool', from: t.callNode, callId: data.call_id, name: tname, summary: callSummary(tname, args), path: toolPath(tname, parsed), background: tname === 'shell' && parsed.background === true, done: false, started: S.live ? Date.now() : 0, took: 0, turn };
       let existing = null;
       for (let i = t.items.length - 1; i >= 0; i--) {
         const it = t.items[i]; if (it.turn !== turn) break;
@@ -686,7 +695,7 @@ async function onEvent(ev) {
       }
       if (existing) {
         row.from = existing.from ?? row.from;
-        if (data.arguments_truncated) { row.summary = existing.summary; row.background = existing.background; }
+        if (data.arguments_truncated) { row.summary = existing.summary; row.path = existing.path; row.background = existing.background; }
         Object.assign(existing, row); t.gen += 1; } else addItem(t, row);
       break;
     }
@@ -696,7 +705,7 @@ async function onEvent(ev) {
       for (let i = t.items.length - 1; i >= 0; i--) { const it = t.items[i]; if ((it.kind === 'tool' || it.kind === 'tool_stub') && it.turn === turn && it.callId === data.call_id) { call = it; break; } }
       if (call) { call.done = true; if (call.started) call.took = Date.now() - call.started; call.started = 0; patchRun(name, call); }
       const shown = S.ui.file;
-      if (shown && (call?.name === 'write' || call?.name === 'edit') && joinPath(bot(name)?.workspace ?? S.config?.workspace ?? '', call.summary) === shown.full) openFile(shown.bot, shown.full);
+      if (shown && call?.path && (call.name === 'write' || call.name === 'edit') && joinPath(bot(name)?.workspace ?? S.config?.workspace ?? '', call.path) === shown.full) openFile(shown.bot, shown.full);
       if (typeof data.node === 'number') {
         pushNode(t, { kind: 'node', node: data.node, callId: data.call_id, turn });
         if (call && (call.background || call.name === 'wait') && await loadWaitOrProc(name, data.node, call)) {
@@ -727,7 +736,7 @@ async function onEvent(ev) {
     case 'turn_finished': {
       const status = data.status ?? '?';
       const b = bot(name);
-      const key = `${name}\u0000${turn}`, from = S.turnFrom.get(key); S.turnFrom.delete(key);
+      const key = `${name}\u0000${turn}`, from = S.turnFrom.get(key), origin = S.turnOrigin.get(key); S.turnFrom.delete(key); S.turnOrigin.delete(key);
       // A steer absorbed into a running turn finishes as its own turn while that turn goes on.
       if (b && (b.runningTurn === null || b.runningTurn === turn)) { b.runningTurn = null; b.waitingOn = []; if (b.turnStarted) b.elapsed = Date.now() - b.turnStarted; b.turnStarted = 0; b.status = status === 'completed' || status === 'steered' ? 'idle' : status; }
       const t = transcript(name);
@@ -738,7 +747,7 @@ async function onEvent(ev) {
       if (b && S.live && status === 'completed' && (!from || wanted) && !onScreen(name) && !S.unseen.has(name)) { S.unseen.add(name); patchUnseen([name]); }
       // A steer's turn is part of the turn it joined, whose end is the news.
       // A task's creator may still be on a snapshot page to come; its news waits for the whole snapshot.
-      if (S.live && status !== 'steered') { if (S.snapshot) S.heldNews.push([name, turn, status, from]); else tellLead(name, turn, status, from); }
+      if (S.live && status !== 'steered') { if (S.snapshot) S.heldNews.push([name, turn, status, from, undefined, origin]); else tellLead(name, turn, status, from, undefined, origin); }
       // A coordinator coming to rest hears what waited for it.
       if (S.wakes.has(name)) wakeSoon(name);
       // A background command may outlive its turn; only a wait result says how it ended.
@@ -819,7 +828,7 @@ function applyWaitOrProc(name, item, call, node) {
 }
 function storedTool(name, callId, args) {
   let parsed = {}; try { parsed = JSON.parse(args) ?? {}; } catch (_) {}
-  return { kind: 'tool', name, callId, summary: callSummary(name, args), background: name === 'shell' && parsed.background === true, done: true, started: 0, took: 0 };
+  return { kind: 'tool', name, callId, summary: callSummary(name, args), path: toolPath(name, parsed), background: name === 'shell' && parsed.background === true, done: true, started: 0, took: 0 };
 }
 function entries(item) {
   const out = [];
@@ -961,22 +970,32 @@ function enqueue(job) { chain = chain.then(job, job); return chain; }
 // tasks that ended turns or wait for an approval since it last heard, by the handles its wait tool reads
 // them with, and its role says what to do with that. A turn it is waiting on is not news, since its wait
 // reads it; nor is its own fork or side chat. Only live turns count, while this window is attached.
-// Each task keeps its first and latest turn and a count, whatever the backlog; one message names at most
-// WAKE_TASKS tasks, and the rest wait for the next.
-const WAKE_MS = 10 * 60 * 1000, WAKE_TASKS = 32;
-function tellLead(name, turn, status, from, approval) {
+// Turns you asked for in a task yourself are its `theirs` news, listed apart: the coordinator hears of
+// them but is not asked to act on them. Turns another agent or the app (a schedule, by its `origin`)
+// asked for, and approvals, are its `act` news; a turn's end goes where its pending approval is.
+// Each kind keeps its own first and latest turn and a count, whatever the backlog, so a task can be in
+// both lists with the handles each one needs; one message names at most WAKE_TASKS tasks, those with
+// news to act on first, and the rest wait for the next.
+const WAKE_MS = 10 * 60 * 1000, WAKE_TASKS = 32, KINDS = ['act', 'theirs'];
+function tellLead(name, turn, status, from, approval, origin) {
   const b = bot(name), lead = b && creatorOf(b);
   if (!lead || !leadProject(lead.name) || name.startsWith(`${lead.name}-`)) return;
   if (lead.waitingOn?.includes(`turn:${name}/${turn}`)) return;
   let w = S.wakes.get(lead.name);
   if (!w) { w = { tasks: new Map(), last: 0, timer: null }; S.wakes.set(lead.name, w); }
-  const by = status === 'waiting for approval' ? null : from === lead.name ? 'you' : from ?? 'the person';
-  merge(w.tasks, name, { first: turn, turn, status, by, count: 1, ...(approval ? { approval } : {}) });
+  const by = status === 'waiting for approval' ? null : from === lead.name ? 'you' : from ?? origin ?? 'the person';
+  const asked = w.tasks.get(name)?.act, answered = asked?.turn === turn && asked.status === 'waiting for approval';
+  merge(w.tasks, name, { [by === 'the person' && !answered ? 'theirs' : 'act']: { first: turn, turn, status, by, count: 1, ...(approval ? { approval } : {}) } });
   wakeSoon(lead.name);
 }
-function merge(tasks, name, t) {
-  const had = tasks.get(name);
-  tasks.set(name, had ? { ...(t.turn >= had.turn ? t : had), first: Math.min(had.first, t.first), count: had.count + t.count } : t);
+function merge(tasks, name, news) {
+  const had = tasks.get(name) ?? {}, out = {};
+  for (const k of KINDS) {
+    const [a, t] = [had[k], news[k]];
+    const v = a && t ? { ...(t.turn >= a.turn ? t : a), first: Math.min(a.first, t.first), count: a.count + t.count } : a ?? t;
+    if (v) out[k] = v;
+  }
+  tasks.set(name, out);
 }
 // A working coordinator waits for its turn to end, which calls this again.
 function wakeSoon(lead) {
@@ -987,14 +1006,17 @@ function wakeSoon(lead) {
 async function wake(lead) {
   const w = S.wakes.get(lead), l = bot(lead);
   if (!w || !w.tasks.size || !S.attached || !l || l.id == null || isActive(l.status)) return;
-  const sent = [...w.tasks].slice(0, WAKE_TASKS);
+  const sent = [...w.tasks].sort(([, a], [, b]) => (b.act ? 1 : 0) - (a.act ? 1 : 0)).slice(0, WAKE_TASKS);
+  const items = sent.flatMap(([name, n]) => KINDS.filter((k) => n[k]).map((k) => [name, k, n[k]]));
   for (const [name] of sent) w.tasks.delete(name);
   w.last = Date.now();
-  // Key the latest notification per task, including its phase and approval
-  // call: one turn can need several approvals before its completion. Windows
-  // with the same news still deduplicate, regardless of earlier turn counts.
-  const prompt = wakeText(sent, w.tasks.size);
-  const id = `app-wake-${l.id}-${digest(JSON.stringify(sent.map(([name, t]) => [name, t.turn, t.status, t.approval ?? null]).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)))}`;
+  // Key the latest notification per task and kind, including its phase and
+  // approval call: one turn can need several approvals before its completion.
+  // Windows with the same news still deduplicate, regardless of earlier turn
+  // counts; a window that saw news of another kind sends its own message.
+  const prompt = wakeText(items, w.tasks.size);
+  const key = ([name, k]) => `${name}\u0000${k}`;
+  const id = `app-wake-${l.id}-${digest(JSON.stringify(items.map(([name, k, t]) => [name, k, t.turn, t.status, t.approval ?? null]).sort((a, b) => key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0)))}`;
   try { await Daemon.request('submit', { bot: lead, bot_id: l.id, request_id: id, prompt, delivery: 'queue', origin: 'tasks' }); }
   catch (e) {
     if (/^bot_not_found/.test(e?.message ?? '')) { S.wakes.delete(lead); return; }
@@ -1013,8 +1035,10 @@ function digest(text) {
   for (let i = 0; i < text.length; i++) h = BigInt.asUintN(64, (h ^ BigInt(text.charCodeAt(i))) * 0x100000001b3n);
   return h.toString(16).padStart(16, '0');
 }
-function wakeText(tasks, more) {
-  const lines = tasks.map(([name, t]) => `- ${name}: turn:${name}/${t.turn} ${t.status}${t.by ? `, asked by ${t.by}` : ''}${t.count > 1 ? `, and ${t.count - 1} earlier since turn:${name}/${t.first}` : ''}`);
+function wakeText(items, more) {
+  const line = ([name, , t]) => `- ${name}: turn:${name}/${t.turn} ${t.status}${t.by ? `, asked by ${t.by}` : ''}${t.count > 1 ? `, and ${t.count - 1} earlier since turn:${name}/${t.first}` : ''}`;
+  const lines = items.filter(([, k]) => k === 'act').map(line), theirs = items.filter(([, k]) => k === 'theirs').map(line);
+  if (theirs.length) lines.push('The person asked for these turns in the task themselves, so they are theirs:', ...theirs);
   if (more) lines.push(`- ${more} more tasks in the next update`);
   return `Task updates: since you last heard, tasks you started ended turns or wait for an approval. The wait tool reads each one's final reply by its handle.\n${lines.join('\n')}`;
 }
@@ -1120,7 +1144,14 @@ async function attachOnce() {
       if (S.session !== session) return;
       // Gone from the store while this page had no session: its live-only `deleted` notice cannot be
       // replayed. A bot this session's events mentioned was born after its page was listed, not deleted.
-      for (const [name, b] of [...S.bots]) if (!listed.has(name) && b.touched !== session) { forgetBot(name); }
+      // Its tab goes up a level, as a live `deleted` moves it, and is saved so restore keeps the move.
+      let moved = false;
+      for (const [name, b] of [...S.bots]) if (!listed.has(name) && b.touched !== session) {
+        const up = upOf(name);
+        forgetBot(name);
+        if (S.ui.tabs.includes(name)) { retab(name, isOpen(up) ? up : ''); moved = true; }
+      }
+      if (moved) save();
       // Resolve lineage only after all pages are seated: a child can sort before
       // its parent, and retention may have removed both creation events.
       for (const b of S.bots.values()) {
@@ -1159,8 +1190,8 @@ function forgetStore() {
   S.cursor = 0; S.bots.clear(); S.transcripts.clear(); S.drafts.clear(); S.override.clear(); S.effort.clear(); S.families.clear();
   S.swarms.clear(); S.memberOf.clear(); S.deleted.clear(); looked.clear();
   for (const w of S.wakes.values()) clearTimeout(w.timer);
-  S.wakes.clear(); S.turnFrom.clear(); S.heldNews = []; S.unseen.clear(); S.wanted.clear();
-  S.selected = ''; S.ui.tabs = []; S.ui.side = null;
+  S.wakes.clear(); S.turnFrom.clear(); S.turnOrigin.clear(); S.heldNews = []; S.unseen.clear(); S.wanted.clear();
+  S.selected = ''; S.ui.tabs = []; S.ui.side = null; dropFile();
   S.botsGen += 1; S.shapeGen += 1;
   // A home the last host named is not this one's.
   if (S.homeWorkspace) { S.config.workspace = null; S.homeWorkspace = false; }
@@ -1194,10 +1225,11 @@ function restore() {
   const key = sessionKey(); if (!key) return;
   let saved = null; try { saved = JSON.parse(localStorage.getItem(key) || 'null'); } catch (_) {}
   if (!saved) return;
-  // Tabs come back like a browser's, less any agent gone since.
-  if (Array.isArray(saved.tabs)) S.ui.tabs = [...new Set(saved.tabs)].filter((k) => typeof k === 'string' && isOpen(k));
+  // Tabs come back like a browser's, less any agent gone since or made again under its name.
+  if (Array.isArray(saved.tabs)) S.ui.tabs = [...new Set(saved.tabs.map(sameKey).filter(Boolean))];
   S.selected = S.ui.tabs.includes(saved.selected) ? saved.selected : '';
-  if (saved.side && S.bots.has(saved.side) && saved.side !== S.selected) S.ui.side = saved.side;
+  const side = sameKey(saved.side);
+  if (side && S.bots.has(side) && side !== S.selected) S.ui.side = side;
   S.ui.rail = saved.rail !== false; S.ui.steps = !!saved.steps;
   // A model pick belongs to the identity it was made for, not to whichever bot holds the name now.
   if (Array.isArray(saved.override)) for (const entry of saved.override) {
@@ -1211,7 +1243,15 @@ function restore() {
     if (b && b.id != null && b.id === id && effortsFor(b.model).includes(level) && level !== b.reasoning) S.effort.set(name, level);
   }
 }
-function save() { const key = sessionKey(); if (!key) return; try { localStorage.setItem(key, JSON.stringify({ selected: S.selected, tabs: S.ui.tabs, side: S.ui.side, rail: S.ui.rail, steps: S.ui.steps, override: [...S.override].map(([name, model]) => [name, bot(name)?.id ?? null, model]), effort: [...S.effort].map(([name, level]) => [name, bot(name)?.id ?? null, level]) })); } catch (_) {} }
+// A tab, or the agent beside, is saved with the identity it shows; a swarm is its key.
+const keyIdentity = (k) => [k, bot(k)?.id ?? null];
+const sameKey = (entry) => {
+  const [k, id] = Array.isArray(entry) ? entry : [];
+  if (typeof k !== 'string') return null;
+  if (swarmOf(k)) return k;
+  const b = bot(k); return b && b.id != null && b.id === id ? k : null;
+};
+function save() { const key = sessionKey(); if (!key) return; try { localStorage.setItem(key, JSON.stringify({ selected: S.selected, tabs: S.ui.tabs.map(keyIdentity), side: S.ui.side ? keyIdentity(S.ui.side) : null, rail: S.ui.rail, steps: S.ui.steps, override: [...S.override].map(([name, model]) => [name, bot(name)?.id ?? null, model]), effort: [...S.effort].map(([name, level]) => [name, bot(name)?.id ?? null, level]) })); } catch (_) {} }
 window.addEventListener('beforeunload', save);
 window.addEventListener('focus', markSeen);
 
@@ -1220,13 +1260,14 @@ function inline(text) {
   return esc(text).replace(/\*\*(.+?)\*\*/g, '<h>$1</h>').replace(/`([^`]+)`/g, '<code>$1</code>');
 }
 // A message's Markdown, drawn once and kept with the item: a pane drawn again reuses it, and it is
-// drawn anew only when its text changes or highlighting arrives (see `Rich.onReady`). What it keeps
-// counts toward the transcript's decoded bytes, so the window's bound holds.
+// drawn anew only when its text changes or, for one whose code waited, highlighting arrives (see
+// `Rich.onReady`). What it keeps counts toward the transcript's decoded bytes, so the window's bound
+// holds.
 function textHTML(it, t) {
-  if (it.htmlOf !== it.text || it.htmlAt !== Rich.version) {
+  if (it.htmlOf !== it.text || (it.htmlWaited && it.htmlAt !== Rich.version)) {
     const html = `<div class="md">${Rich.html(it.text)}</div>`;
     const d = 2 * (html.length - (it.html?.length ?? 0)); it.bytes = (it.bytes || 0) + d; if (t) t.bytes = Math.max(0, (t.bytes || 0) + d);
-    it.html = html; it.htmlOf = it.text; it.htmlAt = Rich.version;
+    it.html = html; it.htmlOf = it.text; it.htmlAt = Rich.version; it.htmlWaited = Rich.waited;
   }
   return it.html;
 }
@@ -1325,8 +1366,7 @@ function runHTML(t, s, limit = t.items.length) {
   return { html: `<div class="steps" data-i="${s}"><div class="sum" data-run="${s}" role="button" tabindex="0">${open ? '▾' : '▸'} ${head}</div>${body}</div>`, end };
 }
 // A read, write or edit names its path; it opens that file beside.
-const FILE_TOOLS = new Set(['read', 'write', 'edit']);
-const summaryHTML = (it) => FILE_TOOLS.has(it.name) && it.summary ? `<span class="fpath" data-file="${esc(it.summary)}">${esc(it.summary)}</span>` : esc(it.summary);
+const summaryHTML = (it) => it.path ? `<span class="fpath" data-file="${esc(it.path)}">${esc(it.summary)}</span>` : esc(it.summary);
 function stepHTML(it, i) {
   switch (it.kind) {
     case 'thought': return `<div class="line think">${esc(it.text)}</div>`;
@@ -1430,22 +1470,32 @@ function renderTranscript(el, name) {
   const key = paneKey(name, t);
   const rendered = el.dataset.key === key ? Number(el.dataset.len) : -1;
   let tail = el.lastElementChild;
-  if (rendered < 0 || rendered > t.items.length || !tail || !tail.classList.contains('tail')) {
-    el.innerHTML = itemsHTML(t) + '<div class="tail"></div>';
-    el.dataset.key = key;
+  const rebuild = rendered < 0 || rendered > t.items.length || !tail || !tail.classList.contains('tail');
+  let added = '', from = rendered, old = null; const was = t.bytes || 0;
+  if (!rebuild && rendered < t.items.length) {
+    const next = t.items[rendered], prev = t.items[rendered - 1];
+    if (prev && inRun(prev, next.turn) && inRun(next, next.turn)) {
+      const s = runStart(t, rendered - 1);
+      old = STEP.has(t.items[s].kind) ? el.querySelector(`.steps[data-i="${s}"]`) : null;
+      if (old) from = s;
+    }
+    added = itemsHTML(t, from);
+  }
+  // Drawn messages count toward the transcript's bytes, so drawing can pass the bound: the window then
+  // folds what it lets go, and the pane is drawn from what is left (kept messages reuse their HTML).
+  const over = () => t.bytes > DECODE_BYTES && t.bytes > was;
+  if (rebuild || over()) {
+    let html = itemsHTML(t);
+    if (over()) { evict(t); html = itemsHTML(t); }
+    el.innerHTML = html + '<div class="tail"></div>';
+    el.dataset.key = paneKey(name, t);
     Rich.hydrate(el);
     tail = el.lastElementChild;
     // History loaded above the reader keeps their place instead of shoving it down.
     if (!atBottom) el.scrollTop += el.scrollHeight - before;
-  } else if (rendered < t.items.length) {
-    let from = rendered;
-    const next = t.items[rendered], prev = t.items[rendered - 1];
-    if (prev && inRun(prev, next.turn) && inRun(next, next.turn)) {
-      const s = runStart(t, rendered - 1);
-      const old = STEP.has(t.items[s].kind) ? el.querySelector(`.steps[data-i="${s}"]`) : null;
-      if (old) { const sep = old.previousElementSibling; if (sep?.dataset?.sep === String(s)) sep.remove(); old.remove(); from = s; }
-    }
-    tail.insertAdjacentHTML('beforebegin', itemsHTML(t, from));
+  } else if (added) {
+    if (old) { const sep = old.previousElementSibling; if (sep?.dataset?.sep === String(from)) sep.remove(); old.remove(); }
+    tail.insertAdjacentHTML('beforebegin', added);
     Rich.hydrate(el);
   }
   el.dataset.len = String(t.items.length);
@@ -1468,9 +1518,10 @@ for (const [id, who] of PANES) {
 // folder by the core, drawn by its kind (see `Rich.file`). It takes the place of the pane beside
 // until closed, and is read again when a step of the agent it came from writes or edits it.
 const FILE_CAP = 4 * 1024 * 1024;
+// `~/` is the home folder, as the core reads it; any other name, `~notes.md` too, is the folder's.
 function joinPath(dir, path) {
   const parts = [];
-  for (const seg of (path.startsWith('/') || path.startsWith('~') || !dir ? path : `${dir.replace(/\/+$/, '')}/${path}`).split('/')) {
+  for (const seg of (path.startsWith('/') || path.startsWith('~/') || !dir ? path : `${dir.replace(/\/+$/, '')}/${path}`).split('/')) {
     if (seg === '..' && parts.length && parts.at(-1) !== '..' && parts.at(-1) !== '') parts.pop(); else if (seg !== '.' && (seg || !parts.length)) parts.push(seg);
   }
   return parts.join('/') || '/';
@@ -1495,12 +1546,15 @@ async function openFile(who, full) {
   } catch (e) { if (S.ui.file !== f) return; Object.assign(f, { state: 'error', error: String(e?.message ?? e), gen: f.gen + 1 }); }
   render();
 }
-function closeFile() {
-  const f = S.ui.file; if (!f) return;
+// A file opened from an agent goes with that agent, and with the store it came from.
+function dropFile() {
+  const f = S.ui.file; if (!f) return false;
   if (f.url) URL.revokeObjectURL(f.url);
   S.ui.file = null; $('side').dataset.key = ''; $('side').dataset.who = ''; $('sidetitle').dataset.k = '';
-  render(); focusInput(S.ui.side ? 'side' : 'main');
+  return true;
 }
+// The chat it covered is on screen again, and what it finished meanwhile is seen.
+function closeFile() { if (dropFile()) { render(); markSeen(); focusInput(S.ui.side ? 'side' : 'main'); } }
 function renderFile() {
   const f = S.ui.file, key = `file|${f.full}|${f.gen}|${Rich.version}`, el = $('side');
   if (el.dataset.key === key) return;
@@ -1880,9 +1934,9 @@ function railRows() {
 // depth. Each counts the rows one further down, so the list says which go deeper.
 function levelOf(open) {
   const sw = swarmOf(open);
-  if (sw) return sw.members.map((m) => memberBot(sw, m)).filter(Boolean).map((b) => ({ b, depth: 0, kids: 0 }));
+  if (sw) return countMade(sw.members.map((m) => memberBot(sw, m)).filter(Boolean).map((b) => ({ b, depth: 0, kids: 0 })));
   const all = rail.all, at = open ? rail.at.get(open) : -1;
-  if (at === undefined) return [];
+  if (at === undefined) return S.bots.has(open) ? madeBy(open) : [];
   const depth = open ? all[at].depth : -1, out = [];
   for (let i = at + 1; i < all.length; i++) {
     const n = all[i];
@@ -1890,6 +1944,20 @@ function levelOf(open) {
     if (n.depth <= depth) break;
     if (n.depth === depth + 1) out.push({ ...n, kids: 0 }); else if (n.depth === depth + 2) out.at(-1).kids += 1;
   }
+  return out;
+}
+// A swarm's agents, and what they made, are left out of the tree: their level is read from who made
+// whom, in one pass over the fleet when one of them is opened.
+function madeBy(open) {
+  const out = [];
+  for (const b of S.bots.values()) if (!leadProject(b.name) && creatorOf(b)?.name === open) out.push({ b, depth: 0, kids: 0 });
+  return countMade(out);
+}
+// Each row counts the agents its bot made, in one pass over the fleet.
+function countMade(out) {
+  if (!out.length) return out;
+  const at = new Map(out.map((n, i) => [n.b.name, i]));
+  for (const b of S.bots.values()) { const i = leadProject(b.name) ? undefined : at.get(creatorOf(b)?.name); if (i !== undefined) out[i].kids += 1; }
   return out;
 }
 const levelName = () => !S.selected ? (rail.rows.some((n) => n.head != null) ? 'projects' : 'agents') : swarmOf(S.selected) ? 'agents' : leadProject(S.selected) ? 'threads' : 'helpers';
@@ -1946,15 +2014,15 @@ function botRowHTML(n) {
 }
 // ---------- tabs ----------
 // Home, then a tab for each agent opened full screen. They are redrawn only when one opens, closes,
-// is chosen, or changes state.
+// is chosen, or changes state or name (a task whose coordinator is gone is named in full).
 const tabState = (k) => { const sw = swarmOf(k); return sw ? swarmStatus(sw) : shownStatus(bot(k)); };
 function renderTabs() {
-  const tabs = S.ui.tabs.filter(isOpen), states = tabs.map(tabState);
-  const key = `${S.selected}|${tabs.map((k, i) => `${k}\u0000${states[i]}`).join('\u0000')}`;
+  const tabs = S.ui.tabs.filter(isOpen), states = tabs.map(tabState), labels = tabs.map(keyLabel);
+  const key = `${S.selected}|${tabs.map((k, i) => `${k}\u0000${states[i]}\u0000${labels[i]}`).join('\u0000')}`;
   const el = $('tabs'); if (el.dataset.k === key) return; el.dataset.k = key;
   const home = `<button type="button" class="homebtn${S.selected ? '' : ' on'}" data-act="home" title="Home">⌂ Home</button>`;
   el.innerHTML = home + (tabs.length ? '<span class="tabsep"></span>' : '') + tabs.map((k, i) => {
-    const on = k === S.selected, label = esc(keyLabel(k));
+    const on = k === S.selected, label = esc(labels[i]);
     return `<div class="wtab${on ? ' on' : ''}" role="tab" aria-selected="${on}" tabindex="0" data-tab="${esc(k)}" title="${esc(k)}"><span class="glyph ${states[i]}">${glyphOf(states[i])}</span><span class="tl">${label}</span><button type="button" class="x" data-act="close-tab" data-who="${esc(k)}" aria-label="Close ${label}">×</button></div>`;
   }).join('');  // Past the bar's width the tabs scroll, and the one on screen stays in view.
   el.querySelector('.wtab.on')?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
@@ -2637,11 +2705,11 @@ async function openOnly(name, tab = false) {
   await enqueue(loadVisible); render(); save();
 }
 const openTab = (name) => openOnly(name, true);
-// A closed tab hands the window to the one before it, or Home.
+// A closed tab hands the window to the one before it; before the first is Home.
 async function closeTab(name) {
   const tabs = S.ui.tabs, i = tabs.indexOf(name); if (i < 0) return;
   tabs.splice(i, 1);
-  if (S.selected === name) { await openOnly(tabs[i - 1] ?? tabs[i] ?? ''); return; }
+  if (S.selected === name) { await openOnly(i > 0 ? tabs[i - 1] : ''); return; }
   render(); save();
 }
 // A tab whose agent is gone shows `to` instead, or closes when that is Home or already a tab.
@@ -2707,6 +2775,9 @@ document.addEventListener('keydown', async (e) => {
   if (S.ui.picker || e.target.id === 'pickerq') return;
   const k = e.key, ctrl = e.ctrlKey || e.metaKey;
   if (S.ui.menu) { if (k === 'Escape') { closeMenu(); e.preventDefault(); } return; }
+  // A tab is chosen with Enter or Space, as a button is; its close button keeps its own keys.
+  const tab = e.target.closest?.('[data-tab]');
+  if (tab && (k === 'Enter' || k === ' ') && !e.target.closest('[data-act]')) { await openOnly(tab.dataset.tab); e.preventDefault(); return; }
   if (ctrl && k === 'k') { openPicker(); e.preventDefault(); return; }
   // A hidden sidebar patches no rows, so it draws them all again when it opens.
   if (ctrl && k === 'b') { S.ui.rail = !S.ui.rail; if (S.ui.rail) rail.key = ''; render(); save(); e.preventDefault(); return; }
@@ -2715,7 +2786,14 @@ document.addEventListener('keydown', async (e) => {
   if (ctrl && k === 'p') { await nextBeside(); e.preventDefault(); return; }
   if (k === 'Escape') { if (S.ui.file) closeFile(); else if (S.ui.side) closeSide(); else await interrupt(); e.preventDefault(); return; }
   const empty = e.target.id === 'input' && $('input').value === '';
-  if (empty && (k === 'ArrowUp' || k === 'ArrowDown')) { const names = tree().filter((n) => n.b).map((n) => n.b.name); let i = names.indexOf(S.selected); if (i >= 0) { i = (i + (k === 'ArrowDown' ? 1 : names.length - 1)) % names.length; await openOnly(names[i]); } e.preventDefault(); return; }
+  // Up and down step through every agent in order; from Home, down is the first and up the last.
+  if (empty && (k === 'ArrowUp' || k === 'ArrowDown')) {
+    railRows(); const names = rail.all.filter((n) => n.b).map((n) => n.b.name), down = k === 'ArrowDown';
+    let i = names.indexOf(S.selected);
+    i = i >= 0 ? (i + (down ? 1 : names.length - 1)) % names.length : S.selected ? -1 : down ? 0 : names.length - 1;
+    if (i >= 0) await openOnly(names[i]);
+    e.preventDefault(); return;
+  }
   if (!inputIds.has(e.target.id) && k.length === 1 && !ctrl && !e.altKey) $('input').focus();
 });
 function failed(err) {
@@ -2792,9 +2870,13 @@ async function act(el) {
   }
 }
 document.addEventListener('click', async (e) => {
+  // The system counts a double-click by place and time, not by what is under the pointer: when the
+  // first click's look already covers the list, the second lands on the look and still opens the row.
+  const first = lastRow; lastRow = null;
   if (S.ui.help) { hideHelp(); return; }
   if (e.target.closest?.('#sheetwrap') && !e.target.closest('#sheet')) { closeSheet(); return; }
   if (e.target.closest('#pickerwrap') && !e.target.closest('.picker')) { closePicker(); return; }
+  if (e.detail === 2 && first) { closeMenu(); try { await rowTwice(first); } catch (err) { failed(err); } focusInput('main'); return; }
   if (Rich.click(e)) { closeMenu(); return; }
   const button = e.target.closest('[data-act]');
   closeMenu();
@@ -2806,23 +2888,36 @@ document.addEventListener('click', async (e) => {
   // Opening a task beside puts the keyboard where openBeside chose.
   else if (task) { await openBeside(task.dataset.task); return; }
   // A row looks in beside, a beat later, so a double-click can claim it before the list turns into
-  // the look; a swarm has no place beside, so it opens.
+  // the look; a swarm has no place beside, so it opens, as late. The second click opens a tab: the system
+  // counts it, so it holds even when a slower double-click lands on a row the look redrew.
   else if (row) {
-    clearTimeout(rowClick); if (e.detail > 1) return;
+    clearTimeout(rowClick);
     const who = row.dataset.bot;
-    if (swarmOf(who)) await openOnly(who); else { rowClick = setTimeout(() => openBeside(who, false).catch(failed), DOUBLE_CLICK_MS); return; }
+    if (e.detail === 2) { try { await openTab(who); } catch (err) { failed(err); } }
+    else if (e.detail > 2) return;
+    else {
+      const look = lastRow = { who, was: null };
+      rowClick = setTimeout(() => {
+        // A swarm opens in place; a double-click finishing late gives back the tab it took.
+        if (swarmOf(who)) { if (!S.ui.tabs.includes(who)) look.was = S.selected; openOnly(who).then(() => focusInput('main')).catch(failed); }
+        else openBeside(who, false).catch(failed);
+      }, DOUBLE_CLICK_MS);
+      return;
+    }
   }
   else if (tab) await openOnly(tab.dataset.tab);
   // Clicks return the keyboard to the pane's composer, unless they selected text to copy.
   if (!e.target.closest('input, textarea, form') && window.getSelection?.()?.isCollapsed !== false) focusInput(e.target.closest('.pane.side') ? 'side' : 'main');
 });
 const DOUBLE_CLICK_MS = 230;
-let rowClick = null;
-document.addEventListener('dblclick', async (e) => {
-  const row = e.target.closest?.('[data-bot]'); if (!row || e.target.closest('[data-act]')) return;
+let rowClick = null, lastRow = null;
+// The second click of a row's double-click: its tab, beside the one in view.
+async function rowTwice({ who, was }) {
   clearTimeout(rowClick);
-  try { await openTab(row.dataset.bot); } catch (err) { failed(err); }
-});
+  const i = S.ui.tabs.indexOf(who);
+  if (was && i >= 0 && S.selected === who && !S.ui.tabs.includes(was)) S.ui.tabs[i] = was;
+  await openTab(who);
+}
 document.addEventListener('contextmenu', (e) => {
   const t = e.target.closest('[data-bot], [data-task], [data-tab]'); if (!t) return;
   const who = t.dataset.bot ?? t.dataset.task ?? t.dataset.tab;
@@ -2832,6 +2927,7 @@ document.addEventListener('contextmenu', (e) => {
 // Highlighting arrived: messages drawn without it are drawn again.
 Rich.onReady = () => { for (const [id] of PANES) $(id).dataset.key = ''; render(); };
 Rich.onFile = openFileFrom;
+Rich.onError = (text) => toast(text, 4000);
 
 // ---------- boot ----------
 render();

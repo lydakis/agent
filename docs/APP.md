@@ -120,8 +120,8 @@ See [Messages](#messages).
 ![A finished reply: heading, list, table and a highlighted code block](app/rich.png)
 
 Further down the same reply: a ```` ```vega-lite ```` block drawn as a chart
-in the window's colors, and an ```` ```html ```` block, which opens as a page
-preview because it is a whole page.
+in the window's colors and an ```` ```html ```` block's preview, each shown
+with a click.
 
 ![A Vega-Lite chart and an HTML preview](app/rich-preview.png)
 
@@ -449,7 +449,8 @@ the snapshot pages. A connected peer must send its ready line within five second
 
 Keys: `^k` find an agent and open it as a tab, `^b` sidebar, `^,` settings, `^p` next task beside, `^o` every
 run's thoughts and output, `Esc` close the side pane then stop, `↑` `↓` on an
-empty message to move between bots, `^d` close the window, Enter to send and
+empty message to move between bots (from Home, `↓` opens the first and `↑` the
+last), Enter or Space on a focused tab to choose it, `^d` close the window, Enter to send and
 Shift-Enter for a new line, `/new NAME PROVIDER/MODEL` to create a bot, `?`
 on an empty message for the list and the models in `~/.agent/models`, read
 each time. `⌘` works where `^` does.
@@ -677,15 +678,20 @@ daemon learns nothing about projects; everything here is client work.
 - **Navigation.** Home, then a tab for each agent opened full screen, on a
   bar of floating tabs. The list on the right holds one level below what is
   open: at Home the projects and the bots in none, in a project its threads
-  and swarms, in a thread what it made, in a swarm its agents; each row
+  and swarms, in a thread what it made, in a swarm its agents, and in a swarm
+  agent what it made; each row
   counts the rows one further down. A click on a row looks in beside, in
   place of the list, with its own composer (a beat later, so a double-click
-  can claim it); a double-click, or "Open as tab" in its ⋯, opens a tab. A
+  can claim it); a double-click, or "Open as tab" in its ⋯, opens a tab. The
+  double-click is the click the system counts as second, so it holds when the
+  look has already redrawn the row. A
   task card in a chat opens beside the same way. ⤢ Full screen takes the tab
   on screen a level down; from Home it opens a tab. The crumbs in the head
   (Home › project › thread) go back up, and the window's title says the same.
   An agent already in a tab is that tab. A closed tab hands the window to the
-  one before it; a deleted agent's tab goes up to what made it. ← or `Esc`
+  one before it, and the first to Home; a deleted agent's tab goes up to what made it. Tabs, and the
+  agent beside, are saved with the bot's id and come back only for that
+  identity, never for a new bot under the old name. ← or `Esc`
   closes what is beside. The list draws a window of rows cut from the fleet's
   tree in one pass over the open agent's subtree, so a large level costs a
   screenful of rows.
@@ -726,7 +732,9 @@ daemon learns nothing about projects; everything here is client work.
   profile: the folder's `.agents/agents/coordinator.md`, the user's, or the
   one the app ships ([coordinator.md](../app/agents/coordinator.md)), whose
   model and tools apply when the project names none. The shipped text
-  says: a task that changes files, named with the
+  says: the coordinator makes a small, quick change itself (a few lines it
+  can check at a glance) and sends work in an area an existing task owns to
+  that task with `--delivery queue`; a new task that changes files, named with the
   project's prefix so projects do not collide, gets
   `git worktree add -b agent/NAME ~/.agent/worktrees/NAME HEAD`, the
   folder's `.agents/setup` run inside it, and `agent run --new --agents
@@ -1045,8 +1053,14 @@ works), at most
 once every ten minutes, in one message queued to it: `Task updates:`, then
 one line per task with its latest ended turn's handle and status (or
 `waiting for approval`), who asked for it (`you` for the coordinator's own
-ask, a bot's name, or `the person`), and how many turns ended before it
-since which handle. The handles are what its
+ask, a bot's name, the app's `origin` such as `schedule`, or `the person`), and how many turns ended before it
+since which handle. Turns you asked for in a task yourself are listed
+last, under a line saying they are yours; the role tells the coordinator to
+leave them to you rather than check or correct them. Turns anyone else asked
+for, and approvals, are listed first; a turn's end is listed with its
+pending approval, so an approval you already answered is not raised. Each list keeps its own first and
+latest handle and count per task, so a task in both is named in both, each
+time by the handle that list needs. The handles are what its
 `wait` tool reads a final reply by, so the message stays small however much
 was said. The page keeps only that per task (first and latest turn, a
 count), so a long coordinator turn or a failing daemon cannot grow it. One
@@ -1059,8 +1073,8 @@ otherwise answer in one line. A message that fails is kept for the next
 one, and one due while the window was detached goes out when it attaches
 again; a coordinator deleted, or gone when the window reattaches, has its
 dropped. The window must be open for it. The message's `request_id` is made
-from the coordinator's id and a hash of each task's newest turn, status and
-approval call ID. Separate approvals and completion in one turn are distinct,
+from the coordinator's id and a hash of each task's newest turn in each
+list, its status and approval call ID. Separate approvals and completion in one turn are distinct,
 while two windows with the same news make one turn: the daemon answers
 the second with the first, or with `idempotency_conflict` when that window
 counted from an earlier turn, which it takes as told. A task deleted before
@@ -1188,25 +1202,41 @@ refuses with `schedules_unsupported`.
 What a model writes is drawn the way a page would draw it. A message is
 Markdown (GitHub's flavour, with a line break wherever the model wrote one),
 parsed by [marked](https://marked.js.org) once and kept with the item, so a
-pane drawn again reuses it. Fenced blocks are drawn by their language:
+pane drawn again reuses it; when highlighting loads, only messages whose code
+waited for it are drawn again. A table past 256 columns or 10,000 cells shows
+as its source, as a short row is padded to the header's width and a few bytes
+a row could ask for millions of cells. A message past 50,000 lines, or one
+that would draw past 100,000 tags, shows as its text, as a `- x` line makes
+an element from four bytes. Fenced blocks are drawn by their language:
 
 - **Code** is highlighted with [highlight.js](https://highlightjs.org) (its
   common languages) in the window's own colors, with a copy button. A block
   names its language or is left plain; nothing guesses. Blocks over 64 KiB
   stay plain.
 - **`mermaid`** draws as a diagram with [Mermaid](https://mermaid.js.org),
-  themed to the window, with its source a click away. A diagram that does not
-  parse stays as its source with the parser's message in the block's head.
+  themed to the window. In a message it opens as its source and draws with a
+  click on **diagram**: Mermaid lays out on the window's thread, and a few
+  characters (`block-beta` with `space:500000`) can hold it for minutes. A
+  diagram that does not parse stays as its source with the parser's message
+  in the block's head.
 - **`vega-lite`** (or `vl`, or `vega` for a full Vega spec) draws as a chart
   with [Vega](https://vega.github.io), as static SVG in the window's colors:
   an eight-hue categorical order validated for color-vision deficiency
   against the panel, a single-hue ramp, recessive axes. A single view without
   a width fills the block. The spec is its only data: the loader refuses every
   URL (data and images alike), and expressions run in Vega's interpreter, not
-  as generated code.
-- **`html`** runs as a preview in a sandboxed frame. A whole page (one with a
-  doctype, `<html>` or `<body>`) opens as its preview; a fragment opens as
-  code, its preview a click away. **`svg`** draws as an image.
+  as generated code. A chart in a message opens as its spec and draws with a
+  click on **chart**: Vega draws on the window's thread, and a few characters
+  of spec (a `sequence` transform to a billion, a billion ticks) can ask it
+  for more than it can draw. One drawn shows again when its pane is redrawn.
+- **`html`** opens as code, and runs as a preview in a sandboxed frame only
+  when asked: a click on **preview** runs it, a click on **code** stops it.
+  A preview's scripts share the window's thread (a frame is not a process),
+  so a page a model wrote never runs merely by being in a reply. Running is
+  asked of one block, once: a preview is code again when its pane is drawn
+  anew. **`svg`** likewise opens as code and draws as an image (no script, no
+  network) with a click, as its filters and animations also take the
+  window's thread; a `data:` SVG image in Markdown shows as its text.
 
 Charts are a block of their own because a preview cannot load a charting
 library: models reach for one from a CDN, and a preview fetches nothing.
@@ -1216,47 +1246,69 @@ also draw, and an HTML preview can still draw a chart with its own inline
 SVG or canvas.
 
 Highlighting, Mermaid and Vega load the first time something needs them;
-marked loads with the page. All are vendored under `app/ui/vendor` (versions
+marked loads with the page. Nothing in a message draws until asked, so
+opening a long chat draws nothing, and a reader below a block that draws
+keeps their place. Mermaid's own limits (50,000 characters, 500 edges) do
+not bound its layout work, which is why a diagram waits for a click. Drawn
+diagrams and charts are kept by source (a chart also by its width) and show
+again when their pane is redrawn: at most 64 and 8 MiB. A
+message's drawn HTML counts toward the chat's 8 MiB of decoded bodies, and
+drawing past that folds the oldest bodies as a load would. All are vendored
+under `app/ui/vendor` (versions
 and licenses in `LICENSES.txt`), so drawing a message fetches nothing.
 
 A file opens beside the chat, in the pane a task opens in, from a path a step
 read, wrote or edited (the path in its line) or a message's link to a path
-(`[plan](PLAN.md)`, `src/a.rs:12`, `src/a.rs#L4`; the line is dropped). A
-path is the agent's folder's, and a link inside an open file is relative to
-that file. The core reads the first 4 MiB (`read_file`; a window on a host
-is refused by name, as its files are the host's). The file draws by its
-kind: Markdown, a diagram (`.mmd`, `.mermaid`), a chart (`.vl.json`,
-`.vg.json`), a page (`.html`, always as its preview), an SVG or image, a
-CSV or TSV as a table of its first 1,000 rows, a binary file as its size,
+(`[plan](PLAN.md)`, `src/a.rs:12`, `src/a.rs#L4`, `README.md#install`; the
+line or section is dropped). A path is the agent's folder's, and a link
+inside an open file is relative to that file. The core reads the first 4 MiB of a regular file (`read_file`; a
+FIFO or device is refused, as reading one need not end, and a window on a
+host is refused by name, as its files are the host's). The file draws by its
+kind: Markdown, a diagram (`.mmd`, `.mermaid`) or a chart (`.vl.json`,
+`.vg.json`), drawn at once, a page (`.html`, opened as its preview), an SVG
+or image (opening the file is the asking), a CSV or TSV as a table of its
+first 1,000 rows and 256 columns (quoted fields kept whole), a binary file
+as its size,
 anything else as code highlighted by its extension. Esc or ✕ closes it and
 brings back the task that was beside, if any. A write or edit to the open
-file by the agent it came from reads it again. Searching a project's files
+file reads it again; deleting the agent it came from, or attaching to another
+store, closes it. Searching a project's files
 (from ^k or elsewhere) is not built.
 
 What a model writes never becomes the app's markup unparsed. Raw HTML inside
-Markdown shows as text. Links open in the default browser and only for
-`http`, `https` and `mailto` (the core's `open_link` refuses anything else);
-other links show as their text. Images draw only from `data:` URLs the
-message carries; a remote image is a link, so drawing a message makes no
-request a model chose. An HTML preview runs scripts in a frame sandboxed
-without same-origin access: it cannot read the app or its storage, cannot
-navigate the window, and the app's script globals are injected into the main
-frame only. Its page carries a policy that loads nothing from the network (no
-fetch, scripts, styles, images or fonts but its own inline ones and `data:`),
-and the window's policy (`frame-src about:`) stops a preview from navigating
-its own frame to a website. Previews start only when they come near the
-screen, so a long transcript holds no idle pages.
+Markdown shows as text. Links open in the default browser and only for `http`,
+`https` and `mailto` (the core's `open_link` refuses anything else); other
+links show as their text. A link inside a drawn diagram (a Mermaid `click`
+link) goes the same way and never navigates the window; a chart's `href` is
+dropped, as Vega's loader refuses every URL. Images draw only from raster
+`data:` URLs the message carries, and only on a click, as a small image can
+decode to far more than its bytes; a remote image is a link and a local one
+opens beside, so drawing a message makes no request a model chose. An HTML
+preview runs scripts in a frame sandboxed without same-origin access: it
+cannot read the app or its storage, cannot navigate the window, and the app's
+script globals are injected into the main frame only. Its page carries a
+policy that loads nothing from the network (no fetch, scripts, styles, images
+or fonts but its own inline ones and `data:`), and the window's policy
+(`frame-src about:`) stops a preview from navigating its own frame to a
+website. A preview runs only once asked, so a long transcript holds no idle
+pages. The window's policy also takes images, fonts, media and stylesheets
+only from the app itself, `data:` and `blob:`, so a library drawing a message
+cannot fetch one either: a Mermaid node's `img:` URL or a `url()` in its theme
+CSS is refused, and the diagram names the failure in its head.
 
-Measured 2026-10-09 in headless Chromium 141 on a 4-core cloud container,
-medians of nine runs, three runs each (synthetic messages: prose, lists, a
-table, and Rust in every third one). Drawing 400 messages (292 KiB) costs
-72 to 87 ms of parsing the first time, against 6 to 7 ms for the line
-renderer this replaced; drawn again, a message costs no parsing. Putting
-those 400 into the page and laying them out takes 207 to 228 ms, against 127
-to 135 ms before, because the HTML is larger (654 KiB against 421 KiB) and
-code is highlighted. A 9 KiB reply streamed in 8-character deltas (1,121 of
-them, 44 finished blocks) costs 17 ms in all, against 2 to 4 ms for plain
-text; parsing the whole reply again on each delta would cost 1.2 to 1.4 s.
+Measured 2026-10-09 at 4dc1751 with `node app/bench/render.cjs`, in headless
+Chromium 141.0.7390.37 on a 4-core cloud container: seven runs, each the
+median of nine (synthetic messages: prose, lists, a table, and Rust in every
+third one). Drawing 400 messages (292 KiB) costs 45 to 84 ms of parsing the
+first time, against 4 to 7 ms for the line renderer this replaced; drawn
+again, a message costs no parsing, as its HTML is kept on its item. Putting
+those 400 into the page and laying them out takes 165 to 422 ms, against 88
+to 235 ms before (this container's layout times vary widely; in each run the
+new page took 1.3 to 3.3 times the old), because the HTML is larger (654 KiB
+against 421 KiB) and code is highlighted. A 9 KiB reply streamed in
+8-character deltas (1,121 of them, 44 finished blocks) costs 7 to 12 ms in
+all, against 1 to 2 ms for plain text; parsing the whole reply again on each
+delta would cost 0.7 to 1.2 s.
 
 While a reply streams, each block that has ended (a paragraph after its blank
 line, a fence once it closes) is drawn once and appended; only the block still
@@ -1272,7 +1324,15 @@ data from a URL, one drawing a remote image and one whose expression reached
 for `constructor`, made no request; the third did not draw and named the
 interpreter's refusal in its head. That the Tauri core injects its
 scripts into the main frame only was read from tauri 2.11.5's source
-(`for_main_frame_only: true`), not observed in the macOS webview.
+(`for_main_frame_only: true`), not observed in the macOS webview. A page
+whose script loops forever left the window responsive while it was not
+asked to run, and so did a `block-beta` diagram with `space:500000` until
+its **diagram** was clicked (drawn, it held Chromium past 110 s even at
+`space:1000`). A Mermaid image node and a theme `url()` pointing at a
+website were refused by the window's policy and made no request. A Vega
+spec with a `sequence` transform to a billion left the window responsive in
+view, as it draws only when asked. A diagram fenced inside an opened
+Markdown file still waits for its click.
 
 ## What it costs, and where the bounds are
 
@@ -1423,8 +1483,9 @@ A task's runs rendered while it worked matched a full redraw of the same pane.
 
 On 2026-10-09 the navigation shell was driven in demo mode in headless
 Chromium (Home, a look beside, a project and a thread in tabs, the finder,
-crumbs back up) with no page errors, and measured against main (169cf40) on
-one synthetic fleet: 40 projects of 25 threads, one thread each with 120
+crumbs back up) with no page errors, and measured ("here": the tree committed as
+49c1ca6, which records these numbers) against main (169cf40) on one synthetic
+fleet: 40 projects of 25 threads, one thread each with 120
 rounds, five page loads per build, the same machine. Window ready (attached,
 rows drawn): p50 802 ms on main, 198 ms here, since Home draws 40 rows where
 the tree drew a 300-row window; DOM nodes after load 3155 and 572; JS heap
