@@ -55,9 +55,12 @@ cap is reached its turns fail with `budget_exhausted`.
 2. **Finish the last run.** If the newest run record is not marked done:
    when it says posted or nothing to post, apply the bookmarks and ledger
    lines it lists and mark it done. Otherwise the post may or may not have
-   gone out, so look for its key at the destination (step 8): if it is
-   there, treat the run as posted; if not, mark the run done without
-   applying anything, and this run reads those items again.
+   gone out, so look for its key at the destination (step 8). If it is
+   there, treat the run as posted. If a lookup the destination guarantees
+   is complete does not find it, mark the run done without applying
+   anything, and this run reads those items again. If the lookup fails or
+   may miss recent posts, leave the run open, do not post this run, and
+   tell the person which post needs checking.
 3. **Find now.** The message carries no time. Run `date` and use the local
    date and time; a run that fires late, after the computer slept, is still
    about today.
@@ -83,7 +86,7 @@ cap is reached its turns fail with `budget_exhausted`.
    never build them by hand.
 8. **Write the plan, then post once.** Before posting, write into the run
    record the post's key, the new bookmark of each source read
-   successfully, and the ledger lines to add or change. The key names the
+   successfully, and the ledger lines to add, change or remove. The key names the
    run: the time it started (step 3) to the minute, with the UTC offset, for
    example `2026-01-05 07:30 -0500`. Put it in the post, so step 2 of the
    next run can find it. A post counts as sent only when the destination
