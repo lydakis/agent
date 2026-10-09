@@ -203,6 +203,8 @@ function patchUnseen(names) {
   const rows = new Set();
   for (const name of names) { rows.add(name); const sw = swarmOfBot(name); if (sw) rows.add(swarmKey(sw.name)); }
   for (const row of rows) patchRailRow(row);
+  // A tab's glyph says done too; the bar redraws only when a tab's state changed.
+  renderTabs();
 }
 // Only what the panes show can become seen: the bots in them, or the selected swarm's agents.
 function markSeen() {
@@ -1876,7 +1878,7 @@ function railRows() {
 // depth. Each counts the rows one further down, so the list says which go deeper.
 function levelOf(open) {
   const sw = swarmOf(open);
-  if (sw) return sw.members.map((m) => memberBot(sw, m)).filter(Boolean).map((b) => ({ b, depth: 0, kids: 0 }));
+  if (sw) return countMade(sw.members.map((m) => memberBot(sw, m)).filter(Boolean).map((b) => ({ b, depth: 0, kids: 0 })));
   const all = rail.all, at = open ? rail.at.get(open) : -1;
   if (at === undefined) return S.bots.has(open) ? madeBy(open) : [];
   const depth = open ? all[at].depth : -1, out = [];
@@ -1891,9 +1893,15 @@ function levelOf(open) {
 // A swarm's agents, and what they made, are left out of the tree: their level is read from who made
 // whom, in one pass over the fleet when one of them is opened.
 function madeBy(open) {
-  const out = [], at = new Map();
-  for (const b of S.bots.values()) if (!leadProject(b.name) && creatorOf(b)?.name === open) { at.set(b.name, out.length); out.push({ b, depth: 0, kids: 0 }); }
-  if (out.length) for (const b of S.bots.values()) { const i = leadProject(b.name) ? undefined : at.get(creatorOf(b)?.name); if (i !== undefined) out[i].kids += 1; }
+  const out = [];
+  for (const b of S.bots.values()) if (!leadProject(b.name) && creatorOf(b)?.name === open) out.push({ b, depth: 0, kids: 0 });
+  return countMade(out);
+}
+// Each row counts the agents its bot made, in one pass over the fleet.
+function countMade(out) {
+  if (!out.length) return out;
+  const at = new Map(out.map((n, i) => [n.b.name, i]));
+  for (const b of S.bots.values()) { const i = leadProject(b.name) ? undefined : at.get(creatorOf(b)?.name); if (i !== undefined) out[i].kids += 1; }
   return out;
 }
 const levelName = () => !S.selected ? (rail.rows.some((n) => n.head != null) ? 'projects' : 'agents') : swarmOf(S.selected) ? 'agents' : leadProject(S.selected) ? 'threads' : 'helpers';
@@ -2638,11 +2646,11 @@ async function openOnly(name, tab = false) {
   await enqueue(loadVisible); render(); save();
 }
 const openTab = (name) => openOnly(name, true);
-// A closed tab hands the window to the one before it, or Home.
+// A closed tab hands the window to the one before it; before the first is Home.
 async function closeTab(name) {
   const tabs = S.ui.tabs, i = tabs.indexOf(name); if (i < 0) return;
   tabs.splice(i, 1);
-  if (S.selected === name) { await openOnly(tabs[i - 1] ?? tabs[i] ?? ''); return; }
+  if (S.selected === name) { await openOnly(i > 0 ? tabs[i - 1] : ''); return; }
   render(); save();
 }
 // A tab whose agent is gone shows `to` instead, or closes when that is Home or already a tab.
@@ -2829,14 +2837,14 @@ document.addEventListener('click', async (e) => {
   // Opening a task beside puts the keyboard where openBeside chose.
   else if (task) { await openBeside(task.dataset.task); return; }
   // A row looks in beside, a beat later, so a double-click can claim it before the list turns into
-  // the look; a swarm has no place beside, so it opens. The second click opens a tab: the system
+  // the look; a swarm has no place beside, so it opens, as late. The second click opens a tab: the system
   // counts it, so it holds even when a slower double-click lands on a row the look redrew.
   else if (row) {
     clearTimeout(rowClick);
     const who = row.dataset.bot;
     if (e.detail === 2) { try { await openTab(who); } catch (err) { failed(err); } }
     else if (e.detail > 2) return;
-    else if (swarmOf(who)) await openOnly(who); else { rowClick = setTimeout(() => openBeside(who, false).catch(failed), DOUBLE_CLICK_MS); return; }
+    else { rowClick = setTimeout(() => (swarmOf(who) ? openOnly(who).then(() => focusInput('main')) : openBeside(who, false)).catch(failed), DOUBLE_CLICK_MS); return; }
   }
   else if (tab) await openOnly(tab.dataset.tab);
   // Clicks return the keyboard to the pane's composer, unless they selected text to copy.

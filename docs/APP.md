@@ -681,7 +681,7 @@ daemon learns nothing about projects; everything here is client work.
   on screen a level down; from Home it opens a tab. The crumbs in the head
   (Home › project › thread) go back up, and the window's title says the same.
   An agent already in a tab is that tab. A closed tab hands the window to the
-  one before it; a deleted agent's tab goes up to what made it. Tabs, and the
+  one before it, and the first to Home; a deleted agent's tab goes up to what made it. Tabs, and the
   agent beside, are saved with the bot's id and come back only for that
   identity, never for a new bot under the old name. ← or `Esc`
   closes what is beside. The list draws a window of rows cut from the fleet's

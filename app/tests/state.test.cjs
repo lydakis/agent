@@ -877,6 +877,9 @@ test('a card looks in beside, full screen takes the tab, and Home and the finder
   await p.openTab('app.lead'); assert.deepEqual([...p.S.ui.tabs], ['app.build', 'app.test', 'app.lead']); assert.equal(p.S.selected, 'app.lead');
   await p.closeTab('app.lead'); assert.equal(p.S.selected, 'app.test', 'a closed tab hands over to the one before');
   await p.closeTab('app.build'); assert.equal(p.S.selected, 'app.test'); assert.deepEqual([...p.S.ui.tabs], ['app.test']);
+  await p.openTab('app.build'); await p.openOnly('app.test');
+  await p.closeTab('app.test'); assert.equal(p.S.selected, '', 'before the first tab is Home'); assert.deepEqual([...p.S.ui.tabs], ['app.build']);
+  await p.openOnly('app.test'); await p.closeTab('app.build'); assert.deepEqual([...p.S.ui.tabs], ['app.test']); assert.equal(p.S.selected, 'app.test');
   // A deleted agent's tab goes up a level; one whose way up is Home closes.
   await p.onEvent({ event: 'deleted', bot: 'app.test' });
   assert.deepEqual([...p.S.ui.tabs], ['app.lead']); assert.equal(p.S.selected, 'app.lead');
@@ -1503,7 +1506,7 @@ test('a swarm is one row under its project; its agents and what they made stay i
   assert.match(html, /data-act="more" data-who="⁂app.latency"/);
   // A swarm open in the window lists its agents; its agent's way up is the swarm.
   p.S.selected = '⁂app.latency';
-  assert.deepEqual(Array.from(p.railRows(), (r) => r.b.name), ['app.latency-1', 'app.latency-2']);
+  assert.deepEqual(Array.from(p.railRows(), (r) => [r.b.name, r.kids]), [['app.latency-1', 1], ['app.latency-2', 0]], 'each agent counts what it made');
   assert.equal(p.upOf('app.latency-1'), '⁂app.latency'); assert.equal(p.upOf('⁂app.latency'), 'app.lead');
   // An agent of the swarm open in a tab lists its helpers, and they theirs.
   const level = (open) => { p.S.selected = open; return Array.from(p.railRows(), (r) => [r.b.name, r.kids]); };
@@ -1642,6 +1645,35 @@ test('the board shows roles, proposals, votes and decisions, and a stream tag fi
   p.learnSwarm(swarmRecord(['app.latency-2', 'app.latency-3', 'app.latency-4'], { council: 3, seats: ['app.latency-2', 'app.latency-3', 'app.latency-4'] }));
   p.renderSwarm(log, sw);
   assert.match(log.innerHTML, /Seats: latency-2, latency-3, latency-4\./);
+});
+
+test('a swarm row opens a beat later, so a double-click opens it as a new tab', async () => {
+  const p = shell({ swarmBoard: async () => ({ lines: [], offset: 0, more: false }), request: async () => ({ bots: [], next_after: null, nodes: [], next_from: null }) });
+  p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one' });
+  p.upsert({ name: 'app.latency-1', id: 3, provider: 'alpha', model: 'one' });
+  p.learnSwarm(swarmRecord(['app.latency-1'], { ids: { 'app.latency-1': 3 } }));
+  await p.openOnly('app.lead');
+  const doc = p.context.document, row = { dataset: { bot: '⁂app.latency' } }, at = (sel) => (sel === '[data-bot]' ? row : null);
+  await doc.listeners.click({ detail: 1, target: { closest: at } });
+  assert.equal(p.S.selected, 'app.lead', 'the first click waits');
+  await doc.listeners.click({ detail: 2, target: { closest: at } }); await p.tick();
+  assert.deepEqual([...p.S.ui.tabs], ['app.lead', '⁂app.latency'], 'a double-click opens a new tab'); assert.equal(p.S.selected, '⁂app.latency');
+  await p.openOnly('app.lead');
+  await doc.listeners.click({ detail: 1, target: { closest: at } }); await p.tick();
+  assert.equal(p.S.selected, '⁂app.latency'); assert.deepEqual([...p.S.ui.tabs], ['app.lead', '⁂app.latency'], 'a click goes to its tab');
+});
+
+test('looking at an agent clears the done glyph on its tab', async () => {
+  const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
+  p.context.document.hasFocus = () => true;
+  for (const [name, id] of [['lead', 1], ['task', 2]]) p.upsert({ name, id, provider: 'alpha', model: 'one' });
+  p.S.ui.tabs = ['lead', 'task']; p.S.selected = 'lead'; p.S.unseen.add('task');
+  p.renderTabs();
+  const tabs = p.elements.get('tabs');
+  assert.match(tabs.innerHTML, /data-tab="task"/); assert.match(tabs.innerHTML, /glyph done/);
+  p.S.selected = 'task'; p.markSeen();
+  assert.equal(p.S.unseen.has('task'), false);
+  assert.doesNotMatch(tabs.innerHTML, /glyph done/, 'the tab redraws with the agent seen');
 });
 
 test('a flat swarm has no Council or Streams tab', async () => {
