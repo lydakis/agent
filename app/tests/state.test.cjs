@@ -36,7 +36,7 @@ function page(daemon = {}, storage = null) {
   context.Rich = context.window.Rich;
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, openOnly, openBeside, openTab, closeTab, full, upOf, crumbsHTML, railRows, renderTabs, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules, tellLead, markSeen };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, openOnly, openBeside, openTab, closeTab, full, upOf, crumbsHTML, railRows, renderTabs, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules, tellLead, markSeen };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -151,22 +151,86 @@ test('messages draw as Markdown with raw HTML, scripts and remote fetches kept o
 test('fenced blocks become code, previews, diagrams and images by their language', () => {
   const p = page(), Rich = p.context.Rich;
   assert.match(Rich.html('```rust\nfn main() {}\n```'), /data-kind="code".*<span class="lang">rust<\/span>.*fn main\(\) \{\}/s);
-  assert.match(Rich.html('```html\n<!doctype html><body><b>hi</b></body>\n```'), /data-kind="html" data-view="view".*&lt;b&gt;hi&lt;\/b&gt;/s);
+  // A page in a message runs only when asked: its scripts would share the window's thread.
+  assert.match(Rich.html('```html\n<!doctype html><body><b>hi</b></body>\n```'), /data-kind="html" data-view="code".*&lt;b&gt;hi&lt;\/b&gt;/s);
   assert.match(Rich.html('```html\n<b>hi</b>\n```'), /data-kind="html" data-view="code"/);
   assert.match(Rich.html('```mermaid\ngraph TD\nA-->B\n```'), /data-kind="mermaid".*A--&gt;B/s);
+  // A diagram in a message draws when asked; one in a file someone opened draws at once.
+  assert.match(Rich.html('```mermaid\ngraph TD\n```'), /data-kind="mermaid" data-lazy data-view="code"/);
+  assert.match(Rich.file('/w/flow.mmd', new TextEncoder().encode('graph TD')).html, /data-kind="mermaid" data-lazy data-run/);
   const svg = Rich.html('```svg\n<svg xmlns="http://www.w3.org/2000/svg"><circle r="4"/></svg>\n```');
-  assert.match(svg, /<img alt="" src="data:image\/svg\+xml;charset=utf-8,%3Csvg/);
+  // An SVG draws as an image, and in a message only when asked: its filters and animations take CPU.
+  assert.match(svg, /data-kind="svg" data-view="code"/);
+  assert.doesNotMatch(svg, /<img/);
   assert.doesNotMatch(svg.split('<pre')[0], /<svg/);
+  assert.match(Rich.file('/w/a.svg', new TextEncoder().encode('<svg/>')).html, /data-kind="svg" data-view="view"/);
+  assert.doesNotMatch(Rich.html('![x](data:image/svg+xml,%3Csvg%2F%3E)'), /<img/);
+  // A raster image the message carries draws on a click; a local one opens beside; a remote one is a link.
+  const png = Rich.html('![dot](data:image/png;base64,iVBORw0KGgo=)');
+  assert.doesNotMatch(png, /<img/);
+  assert.match(png, /<button type="button" class="img" data-img="data:image\/png;base64,iVBORw0KGgo=" title="dot">image: dot<\/button>/);
+  assert.match(Rich.html('![flow](docs/flow.png)'), /<a class="file" data-file="docs\/flow.png">flow<\/a>/);
+  assert.match(Rich.html('![r](https://example.com/r.png)'), /<a href="https:\/\/example.com\/r.png">r<\/a>/);
+});
+
+test('a table too wide or too large shows as its source; a modest one draws', () => {
+  const Rich = page().context.Rich;
+  assert.match(Rich.html('| a | b |\n|---|---|\n| 1 | 2 |'), /<table>/);
+  const wide = '|' + 'a|'.repeat(300) + '\n|' + '-|'.repeat(300) + '\n|1|';
+  assert.doesNotMatch(Rich.html(wide), /<table>|<th>/);
+  assert.match(Rich.html(wide), /data-kind="code"/);
+  const tall = '| a | b | c | d |\n|---|---|---|---|\n' + 'x\n'.repeat(3000);
+  assert.doesNotMatch(Rich.html(tall), /<td>/);
+});
+
+test('a message past 100,000 tags shows as its text', () => {
+  const Rich = page().context.Rich;
+  const list = '- *x*\n'.repeat(30000);
+  assert.doesNotMatch(Rich.html(list), /<li>/);
+  assert.match(Rich.html(list), /data-kind="code"/);
+  assert.match(Rich.html('- x\n'.repeat(100)), /<li>/);
+  assert.doesNotMatch(Rich.html('x\n'.repeat(60000)), /<br>/);
+});
+
+test('highlighting arriving redraws only messages whose code waited for it', () => {
+  const p = page(), R = p.context.Rich; let v = 0, calls = 0;
+  p.context.Rich = { html: (x) => { calls++; return R.html(x); }, get version() { return v; }, get waited() { return R.waited; } };
+  const prose = { text: 'just words' }, code = { text: '```rust\nfn a() {}\n```' };
+  p.textHTML(prose); p.textHTML(code); assert.equal(calls, 2);
+  v = 1; p.textHTML(prose); p.textHTML(code);
+  assert.equal(calls, 3);
+});
+
+test('a name starting with a tilde is the folder\'s; only ~/ is home', () => {
+  const p = page();
+  assert.equal(p.joinPath('/w', '~notes.md'), '/w/~notes.md');
+  assert.equal(p.joinPath('/w', '~/notes.md'), '~/notes.md');
+});
+
+test('a link in a drawn diagram opens through the guarded opener', () => {
+  const p = page(), Rich = p.context.Rich, opened = [];
+  p.context.__TAURI__ = { core: { invoke: (cmd, args) => { opened.push([cmd, args.url]); return Promise.resolve(); } } };
+  const click = (attrs) => { let prevented = false; const a = { getAttribute: (k) => attrs[k] ?? null };
+    const handled = Rich.click({ target: { closest: (sel) => sel.includes('.rc a') ? a : null }, preventDefault: () => { prevented = true; } });
+    return handled && prevented; };
+  assert.equal(click({ 'xlink:href': 'https://example.com/m' }), true);
+  assert.equal(click({ href: 'javascript:alert(1)' }), true);
+  assert.deepEqual(opened, [['open_link', 'https://example.com/m']]);
 });
 
 test('charts, file links and opened files draw by kind', () => {
   const p = page(), Rich = p.context.Rich;
+  // A chart in a message draws when asked; one in a file someone opened draws at once.
   assert.match(Rich.html('```vega-lite\n{"mark":"bar"}\n```'), /data-kind="chart" data-lang="vega-lite" data-lazy data-view="code"/);
+  assert.match(Rich.file('/w/c.vl.json', new TextEncoder().encode('{}')).html, /data-kind="chart" data-lang="vega-lite" data-lazy data-run/);
   assert.match(Rich.html('```vega\n{}\n```'), /data-lang="vega"/);
   const links = Rich.html('[plan](PLAN.md) [code](src/a.rs:12) [line](src/b.rs#L4-L9) [web](https://example.com) [here](#top)');
   assert.match(links, /<a class="file" data-file="PLAN.md">plan<\/a>/);
   assert.match(links, /data-file="src\/a.rs">code/);
   assert.match(links, /data-file="src\/b.rs">line/);
+  // A section of another file opens that file; a `#` in a name is written `%23`.
+  assert.match(Rich.html('[install](README.md#install)'), /data-file="README.md">install/);
+  assert.match(Rich.html('[odd](notes/a%23b.md)'), /data-file="notes\/a#b.md">odd/);
   assert.match(links, /<a href="https:\/\/example.com">web<\/a>/);
   assert.doesNotMatch(links, /data-file="#top"/);
   const enc = (text) => new TextEncoder().encode(text);
@@ -176,6 +240,12 @@ test('charts, file links and opened files draw by kind', () => {
   assert.match(Rich.file('/w/flow.mmd', enc('graph TD')).html, /data-kind="mermaid"/);
   assert.match(Rich.file('/w/frag.html', enc('<b>x</b>')).html, /data-kind="html" data-view="view"/);
   assert.match(Rich.file('/w/t.csv', enc('a,b\n1,"2"')).html, /<th>a<\/th><th>b<\/th>.*<td>1<\/td><td>2<\/td>/s);
+  // A quoted field keeps its separators, line breaks and doubled quotes.
+  assert.match(Rich.file('/w/q.csv', enc('name,note\r\nAlice,"a,b"\nBob,"say ""hi""\nthen go"\n')).html,
+    /<td>Alice<\/td><td>a,b<\/td><\/tr><tr><td>Bob<\/td><td>say &quot;hi&quot;\nthen go<\/td><\/tr><\/tbody>/);
+  assert.match(Rich.file('/w/t.tsv', enc('a\tb\n1\t2')).html, /<td>1<\/td><td>2<\/td>/);
+  // Columns are capped as well as rows, so a line of separators costs no more than a wide table.
+  assert.equal(Rich.file('/w/wide.csv', enc(','.repeat(100000))).html.match(/<th>/g).length, 256);
   assert.match(Rich.file('/w/blob.bin', new Uint8Array([1, 0, 2])).html, /binary file · 3 bytes/);
   assert.match(Rich.file('/w/big.log', enc('x'), true).html, /showing the first/);
   assert.match(Rich.file('/w/<i>.md', enc('<script>alert(1)</script>')).html, /&lt;script&gt;/);
@@ -189,6 +259,57 @@ test('a message is parsed once and drawn again from what it kept', () => {
   assert.equal(parsed, 50); assert.equal(first, again);
   assert.ok(t.bytes > 0);
   t.items[3].text = 'changed'; p.itemsHTML(t); assert.equal(parsed, 51);
+});
+
+test('drawing messages past the byte bound folds the oldest instead of keeping them', () => {
+  const p = page(), t = p.transcript('Bob'), el = p.context.document.getElementById('log');
+  const DECODE_BYTES = 8 * 1024 * 1024, text = 'word '.repeat(40000);
+  t.items = Array.from({ length: 20 }, (_, i) => ({ kind: 'text', turn: i, from: i, text, bytes: text.length * 2 }));
+  t.bytes = t.items.reduce((n, it) => n + it.bytes, 0);
+  assert.ok(t.bytes < DECODE_BYTES);
+  el.lastElementChild = p.context.document.createElement('div');
+  p.renderTranscript(el, 'Bob');
+  assert.ok(t.bytes <= DECODE_BYTES, `${t.bytes} bytes kept`);
+  assert.equal(t.items[0].kind, 'history');
+  assert.ok(t.items.some((it) => it.kind === 'text' && it.html));
+  assert.match(el.innerHTML, /earlier history/);
+});
+
+test('a step links the whole path it named, not its shortened summary', async () => {
+  const p = page(), long = `/w/${'d/'.repeat(200)}a.md`;
+  await p.onEvent({ event: 'tool_started', bot: 'Bob', turn: 1, data: { call_id: 'c1', name: 'read', arguments: JSON.stringify({ path: long }) } });
+  await p.onEvent({ event: 'tool_started', bot: 'Bob', turn: 1, data: { call_id: 'c2', name: 'shell', arguments: JSON.stringify({ command: 'ls', path: '/w/x' }) } });
+  const [read, shell] = p.transcript('Bob').items.filter((it) => it.kind === 'tool');
+  assert.equal(read.path, long); assert.ok(read.summary.length < long.length);
+  assert.equal(shell.path, undefined);
+  p.S.ui.steps = true;
+  assert.match(p.runHTML(p.transcript('Bob'), 0).html, new RegExp(`data-file="${long}"`));
+});
+
+test('a chat covered by a file beside is not seen until the file closes', () => {
+  const p = page();
+  p.S.ui.side = 'Bob'; p.S.ui.file = { bot: 'Ann', full: '/w/a.md', url: null }; p.S.unseen.add('Bob');
+  p.markSeen(); assert.ok(p.S.unseen.has('Bob'));
+  p.S.ui.file = null; p.markSeen(); assert.ok(!p.S.unseen.has('Bob'));
+});
+
+test('a file opened from an agent closes when that agent is forgotten', () => {
+  const p = page();
+  p.S.ui.file = { bot: 'Bob', full: '/w/a.md', url: null };
+  p.forgetBot('Carol'); assert.ok(p.S.ui.file);
+  p.forgetBot('Bob'); assert.equal(p.S.ui.file, null);
+});
+
+test('a long streamed line is searched for its end once, not on every delta', () => {
+  const p = page(), Rich = p.context.Rich, st = {};
+  const line = 'x'.repeat(200000); let searched = 0;
+  for (let i = 1000; i <= line.length; i += 1000) {
+    const text = 'para\n\n' + line.slice(0, i);
+    const from = Math.max(st.scan ?? 0, st.seen ?? 0); searched += text.length - from;
+    assert.equal(Rich.cut(st, text), 6);
+  }
+  assert.ok(searched < 210000, `searched ${searched} characters`);
+  assert.equal(Rich.cut(st, 'para\n\n' + line + '\n\nnext'), 6 + line.length + 2);
 });
 
 test('streamed Markdown draws each finished block once and keeps fences whole', () => {
@@ -309,6 +430,11 @@ test('truncated tool previews preserve decoded flags and tool failures stay visi
   await p.onEvent({event:'message',bot:'Bob',turn:1,data:{node:1}}); await p.loadBatch('Bob');
   await p.onEvent({event:'tool_started',bot:'Bob',turn:1,data:{call_id:'call',name:'shell',arguments:JSON.stringify(input).slice(0,2048),arguments_truncated:true}});
   assert.equal(t.items.find(it=>it.kind==='tool').background,true);
+  // A path longer than the preview keeps the one decoded from the committed call.
+  const path='/w/'+'d/'.repeat(1100)+'f.md'; output={type:'function_call',call_id:'read',name:'read',arguments:JSON.stringify({path})};
+  await p.onEvent({event:'message',bot:'Bob',turn:1,data:{node:4}}); await p.loadBatch('Bob');
+  await p.onEvent({event:'tool_started',bot:'Bob',turn:1,data:{call_id:'read',name:'read',arguments:JSON.stringify({path}).slice(0,2048),arguments_truncated:true}});
+  assert.equal(t.items.find(it=>it.callId==='read').path,path);
   output={type:'function_call_output',output:'{"error":"spawn_failed"}'};
   await p.onEvent({event:'tool_completed',bot:'Bob',turn:1,data:{call_id:'call',node:2}});
   await p.loadBatch('Bob'); assert.match(p.itemsHTML(t),/spawn_failed/);
@@ -637,7 +763,7 @@ test('a task that ends live before the snapshot names its creator still reaches 
   assert.equal(p.S.live,true);assert.equal(p.S.wakes.size,0,'no creator known yet');
   snapshot.resolve({bots:[{name:'demo.lead',id:1,provider:'openai',model:'m'},{name:'demo.build',id:2,provider:'openai',model:'m',created_by:'demo.lead',created_by_id:1}],next_after:null});
   await attaching;
-  assert.deepEqual({...p.S.wakes.get('demo.lead').tasks.get('demo.build')},{first:4,turn:4,status:'completed',by:'the person',count:1});
+  assert.deepEqual({...p.S.wakes.get('demo.lead').tasks.get('demo.build').theirs},{first:4,turn:4,status:'completed',by:'the person',count:1});
   assert.equal(p.S.heldNews.length,0);
   // News held for a bot deleted meanwhile is not a later same-named bot's.
   p.S.heldNews.push(['demo.build',5,'completed',undefined]);p.forgetBot('demo.build');
@@ -2236,7 +2362,9 @@ test('a coordinator hears once, when it rests, of turns its tasks ended that it 
   assert.equal(sent.length, 1, 'one message for the whole batch');
   assert.equal(sent[0].bot, 'demo.lead'); assert.equal(sent[0].bot_id, 1); assert.equal(sent[0].delivery, 'queue'); assert.equal(sent[0].origin, 'tasks');
   assert.match(sent[0].prompt, /^Task updates: /);
-  assert.match(sent[0].prompt, /\n- demo\.build: turn:demo\.build\/4 completed, asked by demo\.test, and 1 earlier since turn:demo\.build\/2\n- demo\.test: turn:demo\.test\/1 failed, asked by the person$/);
+  // What another bot asked of a task is the coordinator's; what you asked is listed last, as yours,
+  // each by its own handle.
+  assert.match(sent[0].prompt, /\n- demo\.build: turn:demo\.build\/4 completed, asked by demo\.test\nThe person asked for these turns in the task themselves, so they are theirs:\n- demo\.build: turn:demo\.build\/2 completed, asked by the person\n- demo\.test: turn:demo\.test\/1 failed, asked by the person$/);
   // Within the window, while it works: nothing until its turn ends and the window allows. An ask of its
   // own that it did not wait for is news too.
   p.S.bots.get('demo.lead').status = 'running';
@@ -2255,11 +2383,20 @@ test('a coordinator hears once, when it rests, of turns its tasks ended that it 
   await p.tick();
   assert.equal(sent.length, 3);
   assert.match(sent[2].prompt, /\n- demo\.build: turn:demo\.build\/5 waiting for approval$/);
+  // A coordinator's ask between two of yours keeps its own handle, in the list to act on.
+  p.S.bots.get('demo.lead').status = 'running';
+  await turn('demo.test', 3);
+  await turn('demo.test', 4, 'completed', 'demo.lead');
+  await turn('demo.test', 5);
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.lead', turn: 8, data: { status: 'completed' } });
+  await p.tick();
+  assert.equal(sent.length, 4);
+  assert.match(sent[3].prompt, /\n- demo\.test: turn:demo\.test\/4 completed, asked by you\nThe person asked for these turns in the task themselves, so they are theirs:\n- demo\.test: turn:demo\.test\/5 completed, asked by the person, and 1 earlier since turn:demo\.test\/3$/);
   // A deleted coordinator hears nothing more.
   await p.onEvent({ event: 'deleted', bot: 'demo.lead' });
-  await turn('demo.test', 3);
+  await turn('demo.test', 6);
   await p.tick();
-  assert.equal(sent.length, 3);
+  assert.equal(sent.length, 4);
 });
 
 test('a coordinator wake that fails is kept for the next one, and replayed turns are not news', async () => {
@@ -2317,6 +2454,53 @@ test('two windows telling a coordinator the same news make one turn, and a bot g
   assert.equal(p.S.turnFrom.size, 1); assert.ok(p.S.wakes.has('demo.lead'));
   p.forgetBot('demo.lead');
   assert.equal(p.S.turnFrom.size, 0); assert.equal(p.S.wakes.size, 0);
+});
+
+test('a window that saw news to act on never defers to one that saw only yours', async () => {
+  const told = new Map();
+  const submit = async (op, params) => {
+    if (op !== 'submit') return {};
+    if (told.has(params.request_id) && told.get(params.request_id) !== params.prompt) throw new Error('idempotency_conflict: ');
+    told.set(params.request_id, params.prompt); return {};
+  };
+  const pages = [0, 1].map(() => page({ request: submit, log() {} }));
+  for (const [i, p] of pages.entries()) {
+    p.S.live = true; p.S.attached = true;
+    p.upsert({ name: 'demo.lead', id: 1, status: 'running' });
+    p.upsert({ name: 'demo.build', id: 2, status: 'idle', created_by: 'demo.lead', created_by_id: 1 });
+    // Only the first window saw the coordinator's ask; both see yours after it.
+    if (i === 0) {
+      await p.onEvent({ event: 'accepted', bot: 'demo.build', turn: 2, data: { node: 1, from: { bot: 'demo.lead', turn: 1 } } });
+      await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 2, data: { status: 'completed' } });
+    }
+    await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 3, data: { status: 'completed' } });
+    await p.onEvent({ event: 'turn_finished', bot: 'demo.lead', turn: 5, data: { status: 'completed' } });
+    await p.tick();
+  }
+  assert.equal(told.size, 2, 'different news, different turns');
+  assert.ok([...told.values()].some((prompt) => /\n- demo\.build: turn:demo\.build\/2 completed, asked by you\n/.test(prompt)));
+});
+
+test('an approval answered before the coordinator hears of it is not raised, and a schedule\'s turn is the coordinator\'s', async () => {
+  const sent = [];
+  const p = page({ request: async (op, params) => { if (op === 'submit') sent.push(params); return {}; }, log() {} });
+  p.S.live = true; p.S.attached = true;
+  p.upsert({ name: 'demo.lead', id: 1, status: 'running' });
+  for (const [name, id] of [['demo.build', 2], ['demo.nightly', 3]]) p.upsert({ name, id, status: 'idle', created_by: 'demo.lead', created_by_id: 1 });
+  // Your turn waits for your approval, which you give before the coordinator rests.
+  await p.onEvent({ event: 'accepted', bot: 'demo.build', turn: 1, data: { node: 1 } });
+  await p.onEvent({ event: 'turn_waiting', bot: 'demo.build', turn: 1, data: { call_id: 'c1', approval: true } });
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 1, data: { status: 'completed' } });
+  // A schedule asks a task for a check.
+  await p.onEvent({ event: 'accepted', bot: 'demo.nightly', turn: 4, data: { node: 2, origin: 'schedule' } });
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.nightly', turn: 4, data: { status: 'completed' } });
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.lead', turn: 2, data: { status: 'completed' } });
+  await p.tick();
+  assert.equal(sent.length, 1);
+  assert.doesNotMatch(sent[0].prompt, /waiting for approval/);
+  assert.doesNotMatch(sent[0].prompt, /theirs/);
+  assert.match(sent[0].prompt, /\n- demo\.build: turn:demo\.build\/1 completed, asked by the person, and 1 earlier since turn:demo\.build\/1\n- demo\.nightly: turn:demo\.nightly\/4 completed, asked by schedule$/);
+  assert.equal(p.S.turnOrigin.size, 0, 'origins are forgotten as turns end');
 });
 
 test('approval calls and completion in one turn each reach the coordinator once across windows', async () => {
@@ -2377,11 +2561,11 @@ test('a coordinator\'s backlog stays small however much its tasks do, and what o
   const w = p.S.wakes.get('demo.lead');
   assert.equal(w.tasks.size, 40);
   assert.equal(w.timer, null, 'nothing is armed while the coordinator works');
-  assert.deepEqual({ ...w.tasks.get('demo.t0') }, { first: 1, turn: 50, status: 'completed', by: 'the person', count: 50 });
+  assert.deepEqual({ ...w.tasks.get('demo.t0').theirs }, { first: 1, turn: 50, status: 'completed', by: 'the person', count: 50 });
   await p.onEvent({ event: 'turn_finished', bot: 'demo.lead', turn: 2, data: { status: 'completed' } });
   await p.tick();
   assert.equal(sent.length, 1);
-  assert.equal(sent[0].prompt.split('\n').length, 1 + 32 + 1);
+  assert.equal(sent[0].prompt.split('\n').length, 1 + 1 + 32 + 1);
   assert.match(sent[0].prompt, /\n- demo\.t0: turn:demo\.t0\/50 completed, asked by the person, and 49 earlier since turn:demo\.t0\/1\n/);
   assert.match(sent[0].prompt, /\n- 8 more tasks in the next update$/);
   assert.equal(w.tasks.size, 8);

@@ -35,7 +35,7 @@ const S = {
   swarms: new Map(), memberOf: new Map(),
   // Who asked for each turn another bot asked for, until it ends, and what each coordinator has yet to
   // hear about its tasks (see `wake`), and turns that ended live before the snapshot said who made their bot.
-  turnFrom: new Map(), wakes: new Map(), heldNews: [],
+  turnFrom: new Map(), turnOrigin: new Map(), wakes: new Map(), heldNews: [],
   // Bots whose finished turn the person has not looked at yet (see `shownStatus`), and turns another
   // bot asked for that the person steered into, whose end is theirs to see too.
   unseen: new Set(), wanted: new Set(),
@@ -195,7 +195,8 @@ const looking = () => !covered() && document.visibilityState !== 'hidden' && doc
 const onScreen = (name) => {
   if (!looking()) return false;
   const sw = swarmOfBot(name);
-  return S.selected === name || S.ui.side === name || (!!sw && S.selected === swarmKey(sw.name));
+  // A file open beside covers the chat that was there.
+  return S.selected === name || (S.ui.side === name && !S.ui.file) || (!!sw && S.selected === swarmKey(sw.name));
 };
 // Each row a change touches is drawn once, however many of a swarm's agents it covers.
 function patchUnseen(names) {
@@ -207,11 +208,11 @@ function patchUnseen(names) {
 function markSeen() {
   if (!S.unseen.size || !looking()) return;
   const sw = swarmOf(S.selected);
-  const seen = [...new Set([S.selected, S.ui.side, ...(sw ? sw.members : [])])].filter((name) => name && S.unseen.has(name));
+  const seen = [...new Set([S.selected, S.ui.file ? null : S.ui.side, ...(sw ? sw.members : [])])].filter((name) => name && S.unseen.has(name));
   if (!seen.length) return;
   for (const name of seen) S.unseen.delete(name);
   patchUnseen(seen);
-  refreshLive($('log')); if (S.ui.side) refreshLive($('side'));
+  refreshLive($('log')); if (S.ui.side && !S.ui.file) refreshLive($('side'));
 }
 const fmt = (ms) => { const s = Math.max(0, Math.round(ms / 1000)); return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`; };
 // Safe in text and inside a quoted attribute alike: names and call ids come from providers and land in both.
@@ -272,12 +273,13 @@ function forgetBot(name) {
   // A coordinator gone hears nothing more, and its queued turns never end; a task gone is no news.
   if (S.wakes.has(name)) { clearTimeout(S.wakes.get(name).timer); S.wakes.delete(name); }
   for (const w of S.wakes.values()) if (w.tasks.delete(name) && !w.tasks.size) { clearTimeout(w.timer); w.timer = null; }
-  for (const key of S.turnFrom.keys()) if (key.startsWith(`${name}\u0000`)) S.turnFrom.delete(key);
+  for (const map of [S.turnFrom, S.turnOrigin]) for (const key of map.keys()) if (key.startsWith(`${name}\u0000`)) map.delete(key);
   for (const key of S.wanted) if (key.startsWith(`${name}\u0000`)) S.wanted.delete(key);
   // Held news is this bot's; a later bot of the same name is another.
   S.heldNews = S.heldNews.filter(([held]) => held !== name);
   // A draft belongs to its bot, so it goes with it.
   if (S.ui.side === name) S.ui.side = null;
+  if (S.ui.file?.bot === name) dropFile();
   S.drafts.delete(name);
   for (const ids of Object.values(PANE)) { const input = $(ids.input); if (input.dataset.for === name) { input.value = ''; input.dataset.for = ''; } }
 }
@@ -365,6 +367,9 @@ function tree() {
   if (projects.size && out.length > loose) out.splice(loose, 0, { label: 'bots' });
   return out;
 }
+// The path a read, write or edit names, whole (the summary is cut for display); none when it cannot be one.
+const FILE_TOOLS = new Set(['read', 'write', 'edit']);
+const toolPath = (name, parsed) => FILE_TOOLS.has(name) && typeof parsed?.path === 'string' && parsed.path && parsed.path.length <= 4096 ? parsed.path : undefined;
 function callSummary(name, args) {
   let a = {}; try { a = JSON.parse(args) ?? {}; } catch (_) {}
   let s = name === 'shell' ? a.command ?? '' : ['read', 'write', 'edit'].includes(name) ? a.path ?? '' : name === 'wait' ? (Array.isArray(a.handles) ? a.handles : []).filter((h) => typeof h === 'string').map((h) => h.replace(/^turn:/, '')).join(', ') : args;
@@ -647,6 +652,7 @@ async function onEvent(ev) {
     }
     case 'accepted': {
       if (data.from?.bot) S.turnFrom.set(`${name}\u0000${turn}`, data.from.bot);
+      else if (typeof data.origin === 'string') S.turnOrigin.set(`${name}\u0000${turn}`, data.origin);
       const b = bot(name); if (b) { b.status = 'running'; b.runningTurn = turn; b.waitingOn = []; b.turnStarted = S.live ? Date.now() : 0; b.elapsed = 0; }
       // The event that puts a prompt on the lineage names who sent it, here and on `steered`.
       const t = transcript(name), by = senderOf(data);
@@ -655,6 +661,7 @@ async function onEvent(ev) {
     }
     case 'queued': {
       if (data.from?.bot) S.turnFrom.set(`${name}\u0000${turn}`, data.from.bot);
+      else if (typeof data.origin === 'string') S.turnOrigin.set(`${name}\u0000${turn}`, data.origin);
       // `ready` waits for a daemon-wide slot with nothing else running on the bot; `queued` sits behind its own turn.
       const b = bot(name); const behindOwn = !!b && (b.runningTurn !== null || isActive(b.status));
       if (b && !behindOwn) { b.status = data.status ?? 'queued'; b.runningTurn = turn; }
@@ -678,7 +685,7 @@ async function onEvent(ev) {
       let parsed = {}; try { parsed = JSON.parse(args) ?? {}; } catch (_) {}
       const tname = data.name ?? 'tool';
       const t = transcript(name);
-      const row = { kind: 'tool', from: t.callNode, callId: data.call_id, name: tname, summary: callSummary(tname, args), background: tname === 'shell' && parsed.background === true, done: false, started: S.live ? Date.now() : 0, took: 0, turn };
+      const row = { kind: 'tool', from: t.callNode, callId: data.call_id, name: tname, summary: callSummary(tname, args), path: toolPath(tname, parsed), background: tname === 'shell' && parsed.background === true, done: false, started: S.live ? Date.now() : 0, took: 0, turn };
       let existing = null;
       for (let i = t.items.length - 1; i >= 0; i--) {
         const it = t.items[i]; if (it.turn !== turn) break;
@@ -686,7 +693,7 @@ async function onEvent(ev) {
       }
       if (existing) {
         row.from = existing.from ?? row.from;
-        if (data.arguments_truncated) { row.summary = existing.summary; row.background = existing.background; }
+        if (data.arguments_truncated) { row.summary = existing.summary; row.path = existing.path; row.background = existing.background; }
         Object.assign(existing, row); t.gen += 1; } else addItem(t, row);
       break;
     }
@@ -696,7 +703,7 @@ async function onEvent(ev) {
       for (let i = t.items.length - 1; i >= 0; i--) { const it = t.items[i]; if ((it.kind === 'tool' || it.kind === 'tool_stub') && it.turn === turn && it.callId === data.call_id) { call = it; break; } }
       if (call) { call.done = true; if (call.started) call.took = Date.now() - call.started; call.started = 0; patchRun(name, call); }
       const shown = S.ui.file;
-      if (shown && (call?.name === 'write' || call?.name === 'edit') && joinPath(bot(name)?.workspace ?? S.config?.workspace ?? '', call.summary) === shown.full) openFile(shown.bot, shown.full);
+      if (shown && call?.path && (call.name === 'write' || call.name === 'edit') && joinPath(bot(name)?.workspace ?? S.config?.workspace ?? '', call.path) === shown.full) openFile(shown.bot, shown.full);
       if (typeof data.node === 'number') {
         pushNode(t, { kind: 'node', node: data.node, callId: data.call_id, turn });
         if (call && (call.background || call.name === 'wait') && await loadWaitOrProc(name, data.node, call)) {
@@ -727,7 +734,7 @@ async function onEvent(ev) {
     case 'turn_finished': {
       const status = data.status ?? '?';
       const b = bot(name);
-      const key = `${name}\u0000${turn}`, from = S.turnFrom.get(key); S.turnFrom.delete(key);
+      const key = `${name}\u0000${turn}`, from = S.turnFrom.get(key), origin = S.turnOrigin.get(key); S.turnFrom.delete(key); S.turnOrigin.delete(key);
       // A steer absorbed into a running turn finishes as its own turn while that turn goes on.
       if (b && (b.runningTurn === null || b.runningTurn === turn)) { b.runningTurn = null; b.waitingOn = []; if (b.turnStarted) b.elapsed = Date.now() - b.turnStarted; b.turnStarted = 0; b.status = status === 'completed' || status === 'steered' ? 'idle' : status; }
       const t = transcript(name);
@@ -738,7 +745,7 @@ async function onEvent(ev) {
       if (b && S.live && status === 'completed' && (!from || wanted) && !onScreen(name) && !S.unseen.has(name)) { S.unseen.add(name); patchUnseen([name]); }
       // A steer's turn is part of the turn it joined, whose end is the news.
       // A task's creator may still be on a snapshot page to come; its news waits for the whole snapshot.
-      if (S.live && status !== 'steered') { if (S.snapshot) S.heldNews.push([name, turn, status, from]); else tellLead(name, turn, status, from); }
+      if (S.live && status !== 'steered') { if (S.snapshot) S.heldNews.push([name, turn, status, from, undefined, origin]); else tellLead(name, turn, status, from, undefined, origin); }
       // A coordinator coming to rest hears what waited for it.
       if (S.wakes.has(name)) wakeSoon(name);
       // A background command may outlive its turn; only a wait result says how it ended.
@@ -819,7 +826,7 @@ function applyWaitOrProc(name, item, call, node) {
 }
 function storedTool(name, callId, args) {
   let parsed = {}; try { parsed = JSON.parse(args) ?? {}; } catch (_) {}
-  return { kind: 'tool', name, callId, summary: callSummary(name, args), background: name === 'shell' && parsed.background === true, done: true, started: 0, took: 0 };
+  return { kind: 'tool', name, callId, summary: callSummary(name, args), path: toolPath(name, parsed), background: name === 'shell' && parsed.background === true, done: true, started: 0, took: 0 };
 }
 function entries(item) {
   const out = [];
@@ -961,22 +968,32 @@ function enqueue(job) { chain = chain.then(job, job); return chain; }
 // tasks that ended turns or wait for an approval since it last heard, by the handles its wait tool reads
 // them with, and its role says what to do with that. A turn it is waiting on is not news, since its wait
 // reads it; nor is its own fork or side chat. Only live turns count, while this window is attached.
-// Each task keeps its first and latest turn and a count, whatever the backlog; one message names at most
-// WAKE_TASKS tasks, and the rest wait for the next.
-const WAKE_MS = 10 * 60 * 1000, WAKE_TASKS = 32;
-function tellLead(name, turn, status, from, approval) {
+// Turns you asked for in a task yourself are its `theirs` news, listed apart: the coordinator hears of
+// them but is not asked to act on them. Turns another agent or the app (a schedule, by its `origin`)
+// asked for, and approvals, are its `act` news; a turn's end goes where its pending approval is.
+// Each kind keeps its own first and latest turn and a count, whatever the backlog, so a task can be in
+// both lists with the handles each one needs; one message names at most WAKE_TASKS tasks, those with
+// news to act on first, and the rest wait for the next.
+const WAKE_MS = 10 * 60 * 1000, WAKE_TASKS = 32, KINDS = ['act', 'theirs'];
+function tellLead(name, turn, status, from, approval, origin) {
   const b = bot(name), lead = b && creatorOf(b);
   if (!lead || !leadProject(lead.name) || name.startsWith(`${lead.name}-`)) return;
   if (lead.waitingOn?.includes(`turn:${name}/${turn}`)) return;
   let w = S.wakes.get(lead.name);
   if (!w) { w = { tasks: new Map(), last: 0, timer: null }; S.wakes.set(lead.name, w); }
-  const by = status === 'waiting for approval' ? null : from === lead.name ? 'you' : from ?? 'the person';
-  merge(w.tasks, name, { first: turn, turn, status, by, count: 1, ...(approval ? { approval } : {}) });
+  const by = status === 'waiting for approval' ? null : from === lead.name ? 'you' : from ?? origin ?? 'the person';
+  const asked = w.tasks.get(name)?.act, answered = asked?.turn === turn && asked.status === 'waiting for approval';
+  merge(w.tasks, name, { [by === 'the person' && !answered ? 'theirs' : 'act']: { first: turn, turn, status, by, count: 1, ...(approval ? { approval } : {}) } });
   wakeSoon(lead.name);
 }
-function merge(tasks, name, t) {
-  const had = tasks.get(name);
-  tasks.set(name, had ? { ...(t.turn >= had.turn ? t : had), first: Math.min(had.first, t.first), count: had.count + t.count } : t);
+function merge(tasks, name, news) {
+  const had = tasks.get(name) ?? {}, out = {};
+  for (const k of KINDS) {
+    const [a, t] = [had[k], news[k]];
+    const v = a && t ? { ...(t.turn >= a.turn ? t : a), first: Math.min(a.first, t.first), count: a.count + t.count } : a ?? t;
+    if (v) out[k] = v;
+  }
+  tasks.set(name, out);
 }
 // A working coordinator waits for its turn to end, which calls this again.
 function wakeSoon(lead) {
@@ -987,14 +1004,17 @@ function wakeSoon(lead) {
 async function wake(lead) {
   const w = S.wakes.get(lead), l = bot(lead);
   if (!w || !w.tasks.size || !S.attached || !l || l.id == null || isActive(l.status)) return;
-  const sent = [...w.tasks].slice(0, WAKE_TASKS);
+  const sent = [...w.tasks].sort(([, a], [, b]) => (b.act ? 1 : 0) - (a.act ? 1 : 0)).slice(0, WAKE_TASKS);
+  const items = sent.flatMap(([name, n]) => KINDS.filter((k) => n[k]).map((k) => [name, k, n[k]]));
   for (const [name] of sent) w.tasks.delete(name);
   w.last = Date.now();
-  // Key the latest notification per task, including its phase and approval
-  // call: one turn can need several approvals before its completion. Windows
-  // with the same news still deduplicate, regardless of earlier turn counts.
-  const prompt = wakeText(sent, w.tasks.size);
-  const id = `app-wake-${l.id}-${digest(JSON.stringify(sent.map(([name, t]) => [name, t.turn, t.status, t.approval ?? null]).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)))}`;
+  // Key the latest notification per task and kind, including its phase and
+  // approval call: one turn can need several approvals before its completion.
+  // Windows with the same news still deduplicate, regardless of earlier turn
+  // counts; a window that saw news of another kind sends its own message.
+  const prompt = wakeText(items, w.tasks.size);
+  const key = ([name, k]) => `${name}\u0000${k}`;
+  const id = `app-wake-${l.id}-${digest(JSON.stringify(items.map(([name, k, t]) => [name, k, t.turn, t.status, t.approval ?? null]).sort((a, b) => key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0)))}`;
   try { await Daemon.request('submit', { bot: lead, bot_id: l.id, request_id: id, prompt, delivery: 'queue', origin: 'tasks' }); }
   catch (e) {
     if (/^bot_not_found/.test(e?.message ?? '')) { S.wakes.delete(lead); return; }
@@ -1013,8 +1033,10 @@ function digest(text) {
   for (let i = 0; i < text.length; i++) h = BigInt.asUintN(64, (h ^ BigInt(text.charCodeAt(i))) * 0x100000001b3n);
   return h.toString(16).padStart(16, '0');
 }
-function wakeText(tasks, more) {
-  const lines = tasks.map(([name, t]) => `- ${name}: turn:${name}/${t.turn} ${t.status}${t.by ? `, asked by ${t.by}` : ''}${t.count > 1 ? `, and ${t.count - 1} earlier since turn:${name}/${t.first}` : ''}`);
+function wakeText(items, more) {
+  const line = ([name, , t]) => `- ${name}: turn:${name}/${t.turn} ${t.status}${t.by ? `, asked by ${t.by}` : ''}${t.count > 1 ? `, and ${t.count - 1} earlier since turn:${name}/${t.first}` : ''}`;
+  const lines = items.filter(([, k]) => k === 'act').map(line), theirs = items.filter(([, k]) => k === 'theirs').map(line);
+  if (theirs.length) lines.push('The person asked for these turns in the task themselves, so they are theirs:', ...theirs);
   if (more) lines.push(`- ${more} more tasks in the next update`);
   return `Task updates: since you last heard, tasks you started ended turns or wait for an approval. The wait tool reads each one's final reply by its handle.\n${lines.join('\n')}`;
 }
@@ -1159,8 +1181,8 @@ function forgetStore() {
   S.cursor = 0; S.bots.clear(); S.transcripts.clear(); S.drafts.clear(); S.override.clear(); S.effort.clear(); S.families.clear();
   S.swarms.clear(); S.memberOf.clear(); S.deleted.clear(); looked.clear();
   for (const w of S.wakes.values()) clearTimeout(w.timer);
-  S.wakes.clear(); S.turnFrom.clear(); S.heldNews = []; S.unseen.clear(); S.wanted.clear();
-  S.selected = ''; S.ui.tabs = []; S.ui.side = null;
+  S.wakes.clear(); S.turnFrom.clear(); S.turnOrigin.clear(); S.heldNews = []; S.unseen.clear(); S.wanted.clear();
+  S.selected = ''; S.ui.tabs = []; S.ui.side = null; dropFile();
   S.botsGen += 1; S.shapeGen += 1;
   // A home the last host named is not this one's.
   if (S.homeWorkspace) { S.config.workspace = null; S.homeWorkspace = false; }
@@ -1220,13 +1242,14 @@ function inline(text) {
   return esc(text).replace(/\*\*(.+?)\*\*/g, '<h>$1</h>').replace(/`([^`]+)`/g, '<code>$1</code>');
 }
 // A message's Markdown, drawn once and kept with the item: a pane drawn again reuses it, and it is
-// drawn anew only when its text changes or highlighting arrives (see `Rich.onReady`). What it keeps
-// counts toward the transcript's decoded bytes, so the window's bound holds.
+// drawn anew only when its text changes or, for one whose code waited, highlighting arrives (see
+// `Rich.onReady`). What it keeps counts toward the transcript's decoded bytes, so the window's bound
+// holds.
 function textHTML(it, t) {
-  if (it.htmlOf !== it.text || it.htmlAt !== Rich.version) {
+  if (it.htmlOf !== it.text || (it.htmlWaited && it.htmlAt !== Rich.version)) {
     const html = `<div class="md">${Rich.html(it.text)}</div>`;
     const d = 2 * (html.length - (it.html?.length ?? 0)); it.bytes = (it.bytes || 0) + d; if (t) t.bytes = Math.max(0, (t.bytes || 0) + d);
-    it.html = html; it.htmlOf = it.text; it.htmlAt = Rich.version;
+    it.html = html; it.htmlOf = it.text; it.htmlAt = Rich.version; it.htmlWaited = Rich.waited;
   }
   return it.html;
 }
@@ -1325,8 +1348,7 @@ function runHTML(t, s, limit = t.items.length) {
   return { html: `<div class="steps" data-i="${s}"><div class="sum" data-run="${s}" role="button" tabindex="0">${open ? '▾' : '▸'} ${head}</div>${body}</div>`, end };
 }
 // A read, write or edit names its path; it opens that file beside.
-const FILE_TOOLS = new Set(['read', 'write', 'edit']);
-const summaryHTML = (it) => FILE_TOOLS.has(it.name) && it.summary ? `<span class="fpath" data-file="${esc(it.summary)}">${esc(it.summary)}</span>` : esc(it.summary);
+const summaryHTML = (it) => it.path ? `<span class="fpath" data-file="${esc(it.path)}">${esc(it.summary)}</span>` : esc(it.summary);
 function stepHTML(it, i) {
   switch (it.kind) {
     case 'thought': return `<div class="line think">${esc(it.text)}</div>`;
@@ -1430,22 +1452,32 @@ function renderTranscript(el, name) {
   const key = paneKey(name, t);
   const rendered = el.dataset.key === key ? Number(el.dataset.len) : -1;
   let tail = el.lastElementChild;
-  if (rendered < 0 || rendered > t.items.length || !tail || !tail.classList.contains('tail')) {
-    el.innerHTML = itemsHTML(t) + '<div class="tail"></div>';
-    el.dataset.key = key;
+  const rebuild = rendered < 0 || rendered > t.items.length || !tail || !tail.classList.contains('tail');
+  let added = '', from = rendered, old = null; const was = t.bytes || 0;
+  if (!rebuild && rendered < t.items.length) {
+    const next = t.items[rendered], prev = t.items[rendered - 1];
+    if (prev && inRun(prev, next.turn) && inRun(next, next.turn)) {
+      const s = runStart(t, rendered - 1);
+      old = STEP.has(t.items[s].kind) ? el.querySelector(`.steps[data-i="${s}"]`) : null;
+      if (old) from = s;
+    }
+    added = itemsHTML(t, from);
+  }
+  // Drawn messages count toward the transcript's bytes, so drawing can pass the bound: the window then
+  // folds what it lets go, and the pane is drawn from what is left (kept messages reuse their HTML).
+  const over = () => t.bytes > DECODE_BYTES && t.bytes > was;
+  if (rebuild || over()) {
+    let html = itemsHTML(t);
+    if (over()) { evict(t); html = itemsHTML(t); }
+    el.innerHTML = html + '<div class="tail"></div>';
+    el.dataset.key = paneKey(name, t);
     Rich.hydrate(el);
     tail = el.lastElementChild;
     // History loaded above the reader keeps their place instead of shoving it down.
     if (!atBottom) el.scrollTop += el.scrollHeight - before;
-  } else if (rendered < t.items.length) {
-    let from = rendered;
-    const next = t.items[rendered], prev = t.items[rendered - 1];
-    if (prev && inRun(prev, next.turn) && inRun(next, next.turn)) {
-      const s = runStart(t, rendered - 1);
-      const old = STEP.has(t.items[s].kind) ? el.querySelector(`.steps[data-i="${s}"]`) : null;
-      if (old) { const sep = old.previousElementSibling; if (sep?.dataset?.sep === String(s)) sep.remove(); old.remove(); from = s; }
-    }
-    tail.insertAdjacentHTML('beforebegin', itemsHTML(t, from));
+  } else if (added) {
+    if (old) { const sep = old.previousElementSibling; if (sep?.dataset?.sep === String(from)) sep.remove(); old.remove(); }
+    tail.insertAdjacentHTML('beforebegin', added);
     Rich.hydrate(el);
   }
   el.dataset.len = String(t.items.length);
@@ -1468,9 +1500,10 @@ for (const [id, who] of PANES) {
 // folder by the core, drawn by its kind (see `Rich.file`). It takes the place of the pane beside
 // until closed, and is read again when a step of the agent it came from writes or edits it.
 const FILE_CAP = 4 * 1024 * 1024;
+// `~/` is the home folder, as the core reads it; any other name, `~notes.md` too, is the folder's.
 function joinPath(dir, path) {
   const parts = [];
-  for (const seg of (path.startsWith('/') || path.startsWith('~') || !dir ? path : `${dir.replace(/\/+$/, '')}/${path}`).split('/')) {
+  for (const seg of (path.startsWith('/') || path.startsWith('~/') || !dir ? path : `${dir.replace(/\/+$/, '')}/${path}`).split('/')) {
     if (seg === '..' && parts.length && parts.at(-1) !== '..' && parts.at(-1) !== '') parts.pop(); else if (seg !== '.' && (seg || !parts.length)) parts.push(seg);
   }
   return parts.join('/') || '/';
@@ -1495,12 +1528,15 @@ async function openFile(who, full) {
   } catch (e) { if (S.ui.file !== f) return; Object.assign(f, { state: 'error', error: String(e?.message ?? e), gen: f.gen + 1 }); }
   render();
 }
-function closeFile() {
-  const f = S.ui.file; if (!f) return;
+// A file opened from an agent goes with that agent, and with the store it came from.
+function dropFile() {
+  const f = S.ui.file; if (!f) return false;
   if (f.url) URL.revokeObjectURL(f.url);
   S.ui.file = null; $('side').dataset.key = ''; $('side').dataset.who = ''; $('sidetitle').dataset.k = '';
-  render(); focusInput(S.ui.side ? 'side' : 'main');
+  return true;
 }
+// The chat it covered is on screen again, and what it finished meanwhile is seen.
+function closeFile() { if (dropFile()) { render(); markSeen(); focusInput(S.ui.side ? 'side' : 'main'); } }
 function renderFile() {
   const f = S.ui.file, key = `file|${f.full}|${f.gen}|${Rich.version}`, el = $('side');
   if (el.dataset.key === key) return;
@@ -2792,6 +2828,7 @@ document.addEventListener('contextmenu', (e) => {
 // Highlighting arrived: messages drawn without it are drawn again.
 Rich.onReady = () => { for (const [id] of PANES) $(id).dataset.key = ''; render(); };
 Rich.onFile = openFileFrom;
+Rich.onError = (text) => toast(text, 4000);
 
 // ---------- boot ----------
 render();

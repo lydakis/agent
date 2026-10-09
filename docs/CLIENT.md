@@ -20,10 +20,13 @@ Implemented 2026-09-19.
    results: `wait` already hands the creator the bot's final reply. The tool descriptions the daemon sends
    carry the rest. It gives the bot no role and no way of working; a caller
    that wants one passes it. This is the CLI's default and only instruction text.
-2. **AGENTS.md files.** `~/.agents/AGENTS.md` first, then every `AGENTS.md`
-   from the filesystem root down to the workspace, so the nearest file is
-   read last and wins where they disagree. Each is appended under a heading
-   naming its path. Empty files are skipped.
+2. **AGENTS.md files.** `~/.agents/AGENTS.md` first, then, in each folder
+   from the filesystem root down to the workspace, its `AGENTS.md` and then
+   its `.agents/AGENTS.md`, so the nearest file is read last and wins where
+   they disagree. A file reached twice, such as the home folder's
+   `.agents/AGENTS.md` (that first file) or a link to its folder's
+   `AGENTS.md`, is read once. Each is appended under a heading naming its
+   path. Empty files are skipped.
 3. **Skills.** Folders `<name>/SKILL.md` in `<workspace>/.agents/skills` and
    `~/.agents/skills` (the workspace's winning on a name clash), the layout
    of [agentskills.io](https://agentskills.io/specification), become an
@@ -35,7 +38,11 @@ Implemented 2026-09-19.
    peer in a role. A profile is markdown with optional YAML front matter:
    `description`, `model`, and `tools` (a list of this runtime's tool
    names) are read, any other key is ignored, so an agent file written for
-   another harness loads as it is. The body is the role.
+   another harness loads as it is. The body is the role. The app's own
+   roles (`coordinator`, `swarm-flat`, `swarm-council`, the client roles in
+   `policy.rs`) are left out of the index: a file of that name replaces the
+   app's text for that role, not a role to start a peer in, so no agent is
+   offered a nested coordinator or a swarm member outside a swarm.
 5. **Role.** A bot started in a profile (`--profile ROLE`, or the app's
    coordinator) gets that body last, under `# Role: ROLE`. The app ships a
    `coordinator` profile ([app/agents/coordinator.md](../app/agents/coordinator.md));

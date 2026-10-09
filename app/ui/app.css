@@ -41,7 +41,7 @@ html,body{height:100%;margin:0;background:var(--t-bg);color:var(--t-ink);font-fa
 .home{color:var(--t-dim);margin-top:24px;white-space:pre-wrap}
 .pnote{padding:8px 12px;color:var(--t-faint);font-size:12px}
 .pane-title{display:flex;align-items:center;justify-content:space-between;padding:6px 6px 0 12px;color:var(--t-faint);font-size:12px;white-space:nowrap}
-.scroll{flex:1;overflow-y:auto;overflow-x:hidden;padding:10px 12px;scrollbar-width:thin;scrollbar-color:var(--t-line) transparent}
+.scroll{flex:1;overflow-y:auto;overflow-x:hidden;overflow-anchor:none;padding:10px 12px;scrollbar-width:thin;scrollbar-color:var(--t-line) transparent}
 .sidebar .scroll{padding:2px 0 8px}
 .main .scroll,.main .composer{padding-inline:max(16px,calc(50% - 42ch))}
 button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:pointer}
@@ -124,6 +124,8 @@ button:focus-visible,[tabindex]:focus-visible{outline:1px solid var(--amber);out
 .md th,.md td{border:1px solid var(--t-line);padding:2px 1ch;text-align:left;vertical-align:top}
 .md th{background:var(--t-panel);font-weight:600}
 .md img{max-width:100%}
+.md button.img{font:inherit;color:var(--user);background:none;border:1px dashed var(--t-faint);border-radius:3px;padding:0 6px;cursor:pointer}
+.md button.img:hover{color:var(--amber);border-color:var(--amber)}
 /* A fenced block: its language and actions above, then the code, or what the code draws. */
 .rc{margin:6px 0 10px;border:1px solid var(--t-line);border-radius:6px;background:var(--t-panel);overflow:hidden}
 .pane.side .rc{background:var(--t-bg)}
@@ -136,7 +138,7 @@ button:focus-visible,[tabindex]:focus-visible{outline:1px solid var(--amber);out
 .rc:not([data-view=view]) [data-rich=view]::after{content:'preview'}
 .rc[data-kind=mermaid]:not([data-view=view]) [data-rich=view]::after{content:'diagram'}
 .rc[data-kind=chart]:not([data-view=view]) [data-rich=view]::after{content:'chart'}
-.rc[data-lazy]:not([data-drawn]) [data-rich=view]{display:none}
+.rc[data-asked]:not([data-drawn]) [data-rich=view]::after{content:'drawing…'}
 .rc pre.code{margin:0;padding:6px 10px;white-space:pre;overflow-x:auto;font:inherit;scrollbar-width:thin;scrollbar-color:var(--t-line) transparent}
 .rc[data-view=view]>pre,.rc:not([data-view=view])>.view{display:none}
 .rc .view{padding:12px;overflow:auto;text-align:center}

@@ -340,10 +340,8 @@ fn profiles(
     let workspace = std::path::Path::new(&dir);
     let listed = agent_client::policy::instructions(workspace, None).map_err(failed)?;
     let mut out = Vec::new();
+    // The app's own roles are client roles, which the index leaves out.
     for entry in listed.profiles {
-        if BUILT_IN.iter().any(|(name, _)| *name == entry.name) {
-            continue;
-        }
         let model = agent_client::policy::profile(workspace, &entry.name)
             .map_err(failed)?
             .and_then(|p| p.model);
@@ -353,7 +351,8 @@ fn profiles(
 }
 
 /// The roles the app ships, used where neither the folder nor the user has
-/// a file of that name.
+/// a file of that name. They are `policy::CLIENT_ROLES`, so no agent is
+/// offered one as a role to start a peer in.
 const BUILT_IN: [(&str, &str); 3] = [
     ("coordinator", include_str!("../../agents/coordinator.md")),
     ("swarm-flat", include_str!("../../agents/swarm-flat.md")),
@@ -488,10 +487,16 @@ fn file_path(path: &str, home: Option<std::ffi::OsString>) -> Result<std::path::
 fn read_head(path: &std::path::Path, limit: u64) -> Result<Vec<u8>, String> {
     use std::io::Read;
     let shown = |e: std::io::Error| format!("{}: {e}", path.display());
+    // Only a regular file: opening a FIFO waits for a writer, and a device never ends. Checked again
+    // once open, as the path may have changed in between.
+    let plain = |meta: std::fs::Metadata| match meta.is_file() {
+        true => Ok(()),
+        false if meta.is_dir() => Err(format!("{}: is a folder", path.display())),
+        false => Err(format!("{}: not a regular file", path.display())),
+    };
+    plain(std::fs::metadata(path).map_err(shown)?)?;
     let file = std::fs::File::open(path).map_err(shown)?;
-    if file.metadata().map_err(shown)?.is_dir() {
-        return Err(format!("{}: is a folder", path.display()));
-    }
+    plain(file.metadata().map_err(shown)?)?;
     let mut bytes = Vec::new();
     file.take(limit).read_to_end(&mut bytes).map_err(shown)?;
     Ok(bytes)
@@ -805,6 +810,12 @@ mod policy_tests {
         assert!(error.starts_with("instructions_unreadable: "), "{error}");
         assert!(error.contains(file.to_str().unwrap()), "{error}");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_apps_roles_are_the_client_roles_the_index_leaves_out() {
+        let names: Vec<&str> = BUILT_IN.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, agent_client::policy::CLIENT_ROLES);
     }
 
     #[test]
@@ -1478,6 +1489,12 @@ mod link_tests {
         assert_eq!(read_head(&file, 64).unwrap(), b"0123456789");
         assert!(read_head(&dir, 64).unwrap_err().contains("is a folder"));
         assert!(read_head(&dir.join("missing"), 64).is_err());
+        #[cfg(unix)]
+        assert!(
+            read_head(std::path::Path::new("/dev/zero"), 64)
+                .unwrap_err()
+                .contains("not a regular file")
+        );
         std::fs::remove_dir_all(&dir).unwrap();
         let home = Some(std::ffi::OsString::from("/home/someone"));
         assert_eq!(
