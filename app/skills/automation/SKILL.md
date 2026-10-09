@@ -35,8 +35,11 @@ index lacks it. The folder holds:
   next run reads from that timestamp inclusive and skips those ids, since
   several items can share a timestamp. If the source can list an item late
   with an earlier time, read from a margin before the timestamp, such as an
-  hour, and keep the ids of everything read within that margin instead. An
-  id alone is a bookmark only when the source orders by it. At setup, set
+  hour, and keep the ids of everything read within that margin instead.
+  Keep at most 1,000 ids per source: a source that needs more is too busy
+  for a timestamp bookmark, so treat it as a failed read and tell the person
+  it needs a cursor from the source or a smaller margin. An id alone is
+  a bookmark only when the source orders by it. At setup, set
   each to the source's newest item now, or to the start of a backfill
   `preferences.md` names, so the first run does not report the whole
   history. A source added to `preferences.md` later gets its bookmark the
