@@ -1149,8 +1149,12 @@ waited for it are drawn again. A table past 256 columns or 10,000 cells shows
 as its source, as a short row is padded to the header's width and a few bytes
 a row could ask for millions of cells. A message past 50,000 lines, or one
 that would draw past 100,000 tags, shows as its text, as a `- x` line makes
-an element from four bytes; a streamed reply's blocks share those bounds, and
-past them the rest streams as text. Fenced blocks are drawn by their language:
+an element from four bytes. One with more than 100,000 marks that open an
+inline element (`*`, `_`, a backtick, `[`, `<`, `~`, `|`, `@`, `www.`,
+`://`) is not parsed either: the parser's tokens for a single line of `*x*`
+cost far more than the HTML they become. A streamed reply's blocks share
+those bounds and the highlighting budget below, and past them the rest
+streams as text. Fenced blocks are drawn by their language:
 
 - **Code** is highlighted with [highlight.js](https://highlightjs.org) (its
   common languages) in the window's own colors, with a copy button. A block
@@ -1211,13 +1215,13 @@ host is refused by name, as its files are the host's). The file draws by its
 kind: Markdown, a diagram (`.mmd`, `.mermaid`) or a chart (`.vl.json`,
 `.vg.json`), drawn at once, a page (`.html`, opened as its preview), an SVG
 or image (opening the file is the asking), a CSV or TSV as a table of its
-first 1,000 rows and 256 columns (quoted fields kept whole), a binary file
-as its size,
-anything else as code highlighted by its extension. Esc or ✕ closes it and
-brings back the task that was beside, if any. A write or edit to the open
-file reads it again; deleting the agent it came from, or attaching to another
-store, closes it. Searching a project's files
-(from ^k or elsewhere) is not built.
+first 1,000 rows and 256 columns, ending with the row that reaches 10,000
+cells (quoted fields kept whole, and the view says when rows were left out),
+a binary file as its size, anything else as code highlighted by its
+extension. Esc or ✕ closes it and brings back the task that was beside, if
+any. A write or edit to the open file reads it again; deleting the agent it
+came from, or attaching to another store, closes it. Searching a project's
+files (from ^k or elsewhere) is not built.
 
 What a model writes never becomes the app's markup unparsed. Raw HTML inside
 Markdown shows as text. Links open in the default browser and only for `http`,
@@ -1241,19 +1245,20 @@ only from the app itself, `data:` and `blob:`, so a library drawing a message
 cannot fetch one either: a Mermaid node's `img:` URL or a `url()` in its theme
 CSS is refused, and the diagram names the failure in its head.
 
-Measured 2026-10-09 at 4dc1751 with `node app/bench/render.cjs`, in headless
+Measured 2026-10-09 at a038530 with `node app/bench/render.cjs`, in headless
 Chromium 141.0.7390.37 on a 4-core cloud container: seven runs, each the
 median of nine (synthetic messages: prose, lists, a table, and Rust in every
-third one). Drawing 400 messages (292 KiB) costs 45 to 84 ms of parsing the
-first time, against 4 to 7 ms for the line renderer this replaced; drawn
+third one). Drawing 400 messages (292 KiB) costs 61 to 71 ms of parsing the
+first time, against 5.5 to 6.4 ms for the line renderer this replaced; drawn
 again, a message costs no parsing, as its HTML is kept on its item. Putting
-those 400 into the page and laying them out takes 165 to 422 ms, against 88
-to 235 ms before (this container's layout times vary widely; in each run the
-new page took 1.3 to 3.3 times the old), because the HTML is larger (654 KiB
-against 421 KiB) and code is highlighted. A 9 KiB reply streamed in
-8-character deltas (1,121 of them, 44 finished blocks) costs 7 to 12 ms in
-all, against 1 to 2 ms for plain text; parsing the whole reply again on each
-delta would cost 0.7 to 1.2 s.
+those 400 into the page and laying them out takes 187 to 472 ms, against 120
+to 337 ms for the old renderer's markup under its own stylesheet (read from
+b7bdfe4). This container's layout times vary widely: within a run the new
+page took 0.55 to 3.6 times the old, 1.3 times at the median, as its HTML is
+larger (654 KiB against 425 KiB) and its code highlighted. A 9 KiB reply
+streamed in 8-character deltas (1,121 of them, 44 finished blocks) costs 9.6
+to 18 ms in all, against 1.4 to 1.7 ms for plain text; parsing the whole
+reply again on each delta would cost 1.0 to 1.1 s.
 
 While a reply streams, each block that has ended (a paragraph after its blank
 line, a fence once it closes) is drawn once and appended; only the block still
