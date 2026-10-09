@@ -1147,7 +1147,10 @@ impl Database {
             CREATE TABLE IF NOT EXISTS bot_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                 last_id INTEGER NOT NULL CHECK(last_id>=0));
             INSERT OR IGNORE INTO bot_sequence VALUES (1,0);
-            CREATE TABLE IF NOT EXISTS deleted_bots(id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS deleted_bots(id INTEGER PRIMARY KEY, name TEXT NOT NULL,
+                request_id TEXT);
+            CREATE INDEX IF NOT EXISTS deleted_bots_key ON deleted_bots(name,request_id)
+                WHERE request_id IS NOT NULL;
             CREATE TABLE IF NOT EXISTS store(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                 identity INTEGER NOT NULL);
             INSERT OR IGNORE INTO store VALUES (1,random());
@@ -1635,7 +1638,22 @@ impl Database {
             .query_row([name], |r| r.get(0))
             .optional()?;
         let Some(creation) = creation else {
-            return Ok(None);
+            let Some(key) = request_id else {
+                return Ok(None);
+            };
+            let deleted: Option<i64> = self
+                .conn
+                .prepare_cached("SELECT id FROM deleted_bots WHERE name=? AND request_id=?")?
+                .query_row([name, key], |r| r.get(0))
+                .optional()?;
+            return match deleted {
+                Some(id) => Err(Error::with(
+                    "bot_deleted",
+                    format!("the {name} this request made was deleted"),
+                )
+                .facts(json!({"bot_id":id}))),
+                None => Ok(None),
+            };
         };
         let creation: Option<Value> = creation.map(|c| serde_json::from_str(&c)).transpose()?;
         let Some(creation) =
@@ -6067,10 +6085,12 @@ impl Database {
             node = parent;
         }
         tx.execute("DELETE FROM events WHERE bot=?", [name])?;
-        // The identity's name outlives it, so a resent delete is told apart
-        // from a delete of some other identity.
+        // The identity's name and creation key outlive it, so a resent
+        // delete is told apart from a delete of some other identity, and a
+        // resent creation never makes the bot again.
         tx.execute(
-            "INSERT INTO deleted_bots SELECT id,name FROM bots WHERE name=?",
+            "INSERT INTO deleted_bots
+             SELECT id,name,json_extract(creation,'$.request_id') FROM bots WHERE name=?",
             [name],
         )?;
         tx.execute("DELETE FROM bots WHERE name=?", [name])?;

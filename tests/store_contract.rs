@@ -10081,6 +10081,17 @@ fn a_deleted_identity_is_gone_and_a_later_namesake_is_not() {
     ] {
         assert_eq!(db.gone(name, id).unwrap_err().code, "bot_not_found");
     }
+    // A keyed creation resent after its bot was deleted does not make it again.
+    let keyed = || Binding {
+        request_id: Some("once"),
+        ..binding()
+    };
+    let (kay, _) = db.create("Kay", Some("/synthetic"), keyed()).unwrap();
+    while db.delete_bot_piece("Kay", kay.id, 4).unwrap()["done"] != true {}
+    let error = db.create("Kay", Some("/synthetic"), keyed()).unwrap_err();
+    assert_eq!(error.code, "bot_deleted");
+    assert_eq!(error.facts.unwrap()["bot_id"], kay.id);
+    db.create("Kay", Some("/synthetic"), binding()).unwrap();
 }
 
 #[test]

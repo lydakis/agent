@@ -1978,7 +1978,9 @@ impl Service {
                                 })
                                 .await;
                             // A resent delete runs beside the first; whichever
-                            // takes the last piece, the other has nothing left.
+                            // takes the last piece finishes the deletion, and
+                            // the other only reports the pieces it took, since
+                            // the name may already hold a later bot.
                             let piece = match piece {
                                 Err(error) if error.code == "bot_not_found" => {
                                     let name = bot.clone();
@@ -1986,7 +1988,7 @@ impl Service {
                                         return Err(error);
                                     }
                                     deleted["duplicate"] = json!(true);
-                                    break;
+                                    return Ok(deleted);
                                 }
                                 piece => piece?,
                             };
