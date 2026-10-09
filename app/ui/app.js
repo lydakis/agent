@@ -1144,7 +1144,14 @@ async function attachOnce() {
       if (S.session !== session) return;
       // Gone from the store while this page had no session: its live-only `deleted` notice cannot be
       // replayed. A bot this session's events mentioned was born after its page was listed, not deleted.
-      for (const [name, b] of [...S.bots]) if (!listed.has(name) && b.touched !== session) { forgetBot(name); }
+      // Its tab goes up a level, as a live `deleted` moves it, and is saved so restore keeps the move.
+      let moved = false;
+      for (const [name, b] of [...S.bots]) if (!listed.has(name) && b.touched !== session) {
+        const up = upOf(name);
+        forgetBot(name);
+        if (S.ui.tabs.includes(name)) { retab(name, isOpen(up) ? up : ''); moved = true; }
+      }
+      if (moved) save();
       // Resolve lineage only after all pages are seated: a child can sort before
       // its parent, and retention may have removed both creation events.
       for (const b of S.bots.values()) {
@@ -1958,15 +1965,15 @@ function botRowHTML(n) {
 }
 // ---------- tabs ----------
 // Home, then a tab for each agent opened full screen. They are redrawn only when one opens, closes,
-// is chosen, or changes state.
+// is chosen, or changes state or name (a task whose coordinator is gone is named in full).
 const tabState = (k) => { const sw = swarmOf(k); return sw ? swarmStatus(sw) : shownStatus(bot(k)); };
 function renderTabs() {
-  const tabs = S.ui.tabs.filter(isOpen), states = tabs.map(tabState);
-  const key = `${S.selected}|${tabs.map((k, i) => `${k}\u0000${states[i]}`).join('\u0000')}`;
+  const tabs = S.ui.tabs.filter(isOpen), states = tabs.map(tabState), labels = tabs.map(keyLabel);
+  const key = `${S.selected}|${tabs.map((k, i) => `${k}\u0000${states[i]}\u0000${labels[i]}`).join('\u0000')}`;
   const el = $('tabs'); if (el.dataset.k === key) return; el.dataset.k = key;
   const home = `<button type="button" class="homebtn${S.selected ? '' : ' on'}" data-act="home" title="Home">⌂ Home</button>`;
   el.innerHTML = home + (tabs.length ? '<span class="tabsep"></span>' : '') + tabs.map((k, i) => {
-    const on = k === S.selected, label = esc(keyLabel(k));
+    const on = k === S.selected, label = esc(labels[i]);
     return `<div class="wtab${on ? ' on' : ''}" role="tab" aria-selected="${on}" tabindex="0" data-tab="${esc(k)}" title="${esc(k)}"><span class="glyph ${states[i]}">${glyphOf(states[i])}</span><span class="tl">${label}</span><button type="button" class="x" data-act="close-tab" data-who="${esc(k)}" aria-label="Close ${label}">×</button></div>`;
   }).join('');  // Past the bar's width the tabs scroll, and the one on screen stays in view.
   el.querySelector('.wtab.on')?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
@@ -2823,9 +2830,13 @@ async function act(el) {
   }
 }
 document.addEventListener('click', async (e) => {
+  // The system counts a double-click by place and time, not by what is under the pointer: when the
+  // first click's look already covers the list, the second lands on the look and still opens the row.
+  const first = lastRow; lastRow = null;
   if (S.ui.help) { hideHelp(); return; }
   if (e.target.closest?.('#sheetwrap') && !e.target.closest('#sheet')) { closeSheet(); return; }
   if (e.target.closest('#pickerwrap') && !e.target.closest('.picker')) { closePicker(); return; }
+  if (e.detail === 2 && first) { closeMenu(); try { await rowTwice(first); } catch (err) { failed(err); } focusInput('main'); return; }
   if (Rich.click(e)) { closeMenu(); return; }
   const button = e.target.closest('[data-act]');
   closeMenu();
@@ -2844,14 +2855,29 @@ document.addEventListener('click', async (e) => {
     const who = row.dataset.bot;
     if (e.detail === 2) { try { await openTab(who); } catch (err) { failed(err); } }
     else if (e.detail > 2) return;
-    else { rowClick = setTimeout(() => (swarmOf(who) ? openOnly(who).then(() => focusInput('main')) : openBeside(who, false)).catch(failed), DOUBLE_CLICK_MS); return; }
+    else {
+      const look = lastRow = { who, was: null };
+      rowClick = setTimeout(() => {
+        // A swarm opens in place; a double-click finishing late gives back the tab it took.
+        if (swarmOf(who)) { if (!S.ui.tabs.includes(who)) look.was = S.selected; openOnly(who).then(() => focusInput('main')).catch(failed); }
+        else openBeside(who, false).catch(failed);
+      }, DOUBLE_CLICK_MS);
+      return;
+    }
   }
   else if (tab) await openOnly(tab.dataset.tab);
   // Clicks return the keyboard to the pane's composer, unless they selected text to copy.
   if (!e.target.closest('input, textarea, form') && window.getSelection?.()?.isCollapsed !== false) focusInput(e.target.closest('.pane.side') ? 'side' : 'main');
 });
 const DOUBLE_CLICK_MS = 230;
-let rowClick = null;
+let rowClick = null, lastRow = null;
+// The second click of a row's double-click: its tab, beside the one in view.
+async function rowTwice({ who, was }) {
+  clearTimeout(rowClick);
+  const i = S.ui.tabs.indexOf(who);
+  if (was && i >= 0 && S.selected === who && !S.ui.tabs.includes(was)) S.ui.tabs[i] = was;
+  await openTab(who);
+}
 document.addEventListener('contextmenu', (e) => {
   const t = e.target.closest('[data-bot], [data-task], [data-tab]'); if (!t) return;
   const who = t.dataset.bot ?? t.dataset.task ?? t.dataset.tab;

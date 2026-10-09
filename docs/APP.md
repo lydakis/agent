@@ -1475,8 +1475,9 @@ A task's runs rendered while it worked matched a full redraw of the same pane.
 
 On 2026-10-09 the navigation shell was driven in demo mode in headless
 Chromium (Home, a look beside, a project and a thread in tabs, the finder,
-crumbs back up) with no page errors, and measured against main (169cf40) on
-one synthetic fleet: 40 projects of 25 threads, one thread each with 120
+crumbs back up) with no page errors, and measured ("here": the tree committed as
+49c1ca6, which records these numbers) against main (169cf40) on one synthetic
+fleet: 40 projects of 25 threads, one thread each with 120
 rounds, five page loads per build, the same machine. Window ready (attached,
 rows drawn): p50 802 ms on main, 198 ms here, since Home draws 40 rows where
 the tree drew a 300-row window; DOM nodes after load 3155 and 572; JS heap

@@ -1428,8 +1428,9 @@ test('a task card leaves the keyboard beside; a row looks in, and a double-click
   const row = { dataset: { bot: 'app.lead' } }, at = (sel) => (sel === '[data-bot]' ? row : null);
   await doc.listeners.click({ detail: 1, target: { closest: at } }); await p.tick();
   assert.equal(p.S.ui.side, 'app.lead'); assert.equal(p.S.selected, '', 'a click on a row looks in beside');
-  // The second click opens the tab by its count, even when the look already redrew the row.
-  await doc.listeners.click({ detail: 2, target: { closest: at } }); await p.tick();
+  // The second click opens the tab by its count, even when the look already covers the list and the
+  // click lands on it.
+  await doc.listeners.click({ detail: 2, target: { closest: (sel) => (sel === '.pane.side' ? {} : null) } }); await p.tick();
   assert.equal(p.S.selected, 'app.lead'); assert.deepEqual([...p.S.ui.tabs], ['app.lead']); assert.equal(p.S.ui.side, null);
   assert.equal(doc.listeners.dblclick, undefined, 'no dblclick handler to miss a redrawn row');
   // A fast double-click takes the tab before the look fires.
@@ -1661,6 +1662,25 @@ test('a swarm row opens a beat later, so a double-click opens it as a new tab', 
   await p.openOnly('app.lead');
   await doc.listeners.click({ detail: 1, target: { closest: at } }); await p.tick();
   assert.equal(p.S.selected, '⁂app.latency'); assert.deepEqual([...p.S.ui.tabs], ['app.lead', '⁂app.latency'], 'a click goes to its tab');
+  // A slow double-click: the swarm already took the tab in view, and the second click, landing on what
+  // replaced the row, gives that tab back and opens the swarm beside it.
+  p.S.ui.tabs = ['app.lead']; await p.openOnly('app.lead');
+  await doc.listeners.click({ detail: 1, target: { closest: at } }); await p.tick();
+  assert.deepEqual([...p.S.ui.tabs], ['⁂app.latency']);
+  await doc.listeners.click({ detail: 2, target: { closest: () => null } }); await p.tick();
+  assert.deepEqual([...p.S.ui.tabs], ['app.lead', '⁂app.latency']); assert.equal(p.S.selected, '⁂app.latency');
+});
+
+test('a tab is renamed when what it belongs to changes, with no change of state', async () => {
+  const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
+  p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one' });
+  p.upsert({ name: 'app.build', id: 2, provider: 'alpha', model: 'one', created_by: 'app.lead', created_by_id: 1 });
+  p.S.ui.tabs = ['app.build']; p.S.selected = 'app.build'; p.railRows(); p.renderTabs();
+  const tabs = p.context.document.getElementById('tabs');
+  assert.match(tabs.innerHTML, /<span class="tl">build<\/span>/);
+  await p.handle({ event: 'deleted', bot: 'app.lead' }, p.S.session);
+  p.railRows(); p.renderTabs();
+  assert.match(tabs.innerHTML, /<span class="tl">app\.build<\/span>/, 'a task whose coordinator is gone is named in full');
 });
 
 test('looking at an agent clears the done glyph on its tab', async () => {
@@ -2678,6 +2698,23 @@ test('what a window remembers belongs to its store, so two hosts, or a host and 
   const unknown = shell({}, storage); unknown.S.store = null; unknown.S.ui.rail = false;
   const before = storage.size; unknown.save();
   assert.equal(storage.size, before);
+});
+
+test('a tab deleted while detached goes up to what made it on reconnect, as a live delete moves it', async () => {
+  const storage = new Map();
+  const p = page({
+    attach: async () => ({ session: 2, store: 'store-1' }),
+    pull: () => new Promise(() => {}),
+    request: async (op) => (op === 'bots' ? { bots: [{ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', status: 'idle' }] } : { nodes: [], next_from: null }),
+  }, storage);
+  p.setRender(() => {}); p.S.store = 'store-1'; p.S.config = { workspace: '/synthetic', tools: [] };
+  p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one' });
+  p.upsert({ name: 'app.build', id: 2, provider: 'alpha', model: 'one', created_by: 'app.lead', created_by_id: 1 });
+  p.tree(); p.S.ui.tabs = ['app.build']; p.S.selected = 'app.build'; p.save();
+  await p.attach(); await settle();
+  assert.equal(p.S.attached, true);
+  assert.equal(p.S.bots.has('app.build'), false);
+  assert.deepEqual([...p.S.ui.tabs], ['app.lead'], 'the tab shows what made it'); assert.equal(p.S.selected, 'app.lead');
 });
 
 test('a window on a host takes the home the host names and leaves out what reads this machine', async () => {
