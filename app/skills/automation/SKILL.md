@@ -96,7 +96,12 @@ cap is reached its turns fail with `budget_exhausted`.
    read only partway is a failed read. When more is new than one run can
    take, after an outage or a busy day, take the oldest part in order, move
    the bookmark only to its end, and say that more is waiting; later runs
-   catch up. Then look up each open item in the ledger again, since nothing
+   catch up. Ask for items after the bookmark, oldest first, where the
+   source allows. One that lists only newest first: save each page read
+   under `backlog/SOURCE/`, with the next page's cursor beside them, so the
+   next run goes on from there instead of from the newest page; once the
+   bookmark is reached, report from the saved pages oldest first, removing
+   each page once the bookmark has moved past it. Then look up each open item in the ledger again, since nothing
    new may have arrived about it.
 5. **A failed read is not a quiet day.** When a source errors, times out or
    its tool is missing, leave its bookmark where it is, write the rest from

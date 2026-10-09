@@ -36,16 +36,19 @@ pub fn install(home: &Path) -> Vec<String> {
         ),
         Err(error) => errors.push(error),
     }
-    errors.extend(
-        skills
-            .iter()
-            .filter_map(|(name, files)| install_one(home, name, files).err()),
-    );
+    for (name, files) in &skills {
+        if let Err(error) = install_one(home, name, files, &mut budget) {
+            errors.push(error);
+        }
+        if budget == 0 {
+            break;
+        }
+    }
     errors
 }
 
-/// More entries than any record of the app's holds. A larger one is not its
-/// own, so it is left alone and never makes a start walk it.
+/// More entries than all the app's records hold together. Past it, what is
+/// left is not the app's, so a start walks no further.
 const ENTRIES: usize = 1024;
 
 /// The names in a record folder, its temporaries aside; none when it is
@@ -86,10 +89,10 @@ fn settle(path: &Path, home: &Path) -> Result<(), String> {
 }
 
 /// Every file under a skill's record, as a path relative to it.
-fn recorded_files(record: &Path) -> Result<Vec<String>, String> {
-    let (mut files, mut folders, mut budget) = (Vec::new(), vec![String::new()], ENTRIES);
+fn recorded_files(record: &Path, budget: &mut usize) -> Result<Vec<String>, String> {
+    let (mut files, mut folders) = (Vec::new(), vec![String::new()]);
     while let Some(folder) = folders.pop() {
-        for name in recorded(&record.join(&folder), &mut budget)? {
+        for name in recorded(&record.join(&folder), budget)? {
             let file = match folder.as_str() {
                 "" => name,
                 folder => format!("{folder}/{name}"),
@@ -134,7 +137,14 @@ fn read(path: &Path) -> Result<Option<Vec<u8>>, String> {
         .map_err(|error| format!("{}: {error}", path.display()))
 }
 
-fn install_one(home: &Path, name: &str, files: &[(&str, &str)]) -> Result<(), String> {
+/// `budget` is shared by every record a start walks, so the whole walk is
+/// bounded, not each record.
+fn install_one(
+    home: &Path,
+    name: &str,
+    files: &[(&str, &str)],
+    budget: &mut usize,
+) -> Result<(), String> {
     let dir = home.join(".agents/skills").join(name);
     let record = home.join(".agent/skills").join(name);
     // A file or folder of the skill's that is a link leads somewhere the app
@@ -170,7 +180,7 @@ fn install_one(home: &Path, name: &str, files: &[(&str, &str)]) -> Result<(), St
     // A file the app no longer ships goes too, unless you changed or removed
     // it, which makes the skill yours like any other file.
     let mut dropped = Vec::new();
-    for file in recorded_files(&record)? {
+    for file in recorded_files(&record, budget)? {
         if files.iter().all(|(shipped, _)| *shipped != file) {
             let (path, written) = (dir.join(&file), record.join(&file));
             if linked(&path, &dir) || linked(&written, &record) {
@@ -219,6 +229,10 @@ fn install_one(home: &Path, name: &str, files: &[(&str, &str)]) -> Result<(), St
 mod tests {
     use super::*;
 
+    fn one(home: &Path, name: &str, files: &[(&str, &str)]) -> Result<(), String> {
+        install_one(home, name, files, &mut { ENTRIES })
+    }
+
     fn home(tag: &str) -> std::path::PathBuf {
         let home =
             std::env::temp_dir().join(format!("agent-app-skills-{tag}-{}", std::process::id()));
@@ -250,17 +264,17 @@ mod tests {
     #[test]
     fn newer_text_replaces_the_apps_copy_and_never_yours() {
         let home = home("update");
-        install_one(&home, "x", &[("SKILL.md", "old")]).unwrap();
+        one(&home, "x", &[("SKILL.md", "old")]).unwrap();
         let path = home.join(".agents/skills/x/SKILL.md");
-        install_one(&home, "x", &[("SKILL.md", "new")]).unwrap();
+        one(&home, "x", &[("SKILL.md", "new")]).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
 
         std::fs::write(&path, "mine").unwrap();
-        install_one(&home, "x", &[("SKILL.md", "newer")]).unwrap();
+        one(&home, "x", &[("SKILL.md", "newer")]).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine");
 
         std::fs::remove_file(&path).unwrap();
-        install_one(&home, "x", &[("SKILL.md", "newest")]).unwrap();
+        one(&home, "x", &[("SKILL.md", "newest")]).unwrap();
         assert!(!path.exists(), "a skill you removed stays removed");
         std::fs::remove_dir_all(home).unwrap();
     }
@@ -271,7 +285,7 @@ mod tests {
         let path = home.join(".agents/skills/x/SKILL.md");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "from another harness").unwrap();
-        install_one(&home, "x", &[("SKILL.md", "app")]).unwrap();
+        one(&home, "x", &[("SKILL.md", "app")]).unwrap();
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "from another harness"
@@ -284,8 +298,8 @@ mod tests {
         let home = home("files");
         let dir = home.join(".agents/skills/x");
         let read = |file: &str| std::fs::read_to_string(dir.join(file)).unwrap();
-        install_one(&home, "x", &[("SKILL.md", "old"), ("run.py", "old")]).unwrap();
-        install_one(&home, "x", &[("SKILL.md", "new"), ("run.py", "new")]).unwrap();
+        one(&home, "x", &[("SKILL.md", "old"), ("run.py", "old")]).unwrap();
+        one(&home, "x", &[("SKILL.md", "new"), ("run.py", "new")]).unwrap();
         assert_eq!(
             (read("SKILL.md"), read("run.py")),
             ("new".into(), "new".into())
@@ -293,11 +307,11 @@ mod tests {
 
         // A file a newer version adds is written with the rest.
         let three = [("SKILL.md", "new"), ("run.py", "new"), ("lib.py", "new")];
-        install_one(&home, "x", &three).unwrap();
+        one(&home, "x", &three).unwrap();
         assert_eq!(read("lib.py"), "new");
 
         std::fs::write(dir.join("run.py"), "mine").unwrap();
-        install_one(&home, "x", &[("SKILL.md", "newer"), ("run.py", "newer")]).unwrap();
+        one(&home, "x", &[("SKILL.md", "newer"), ("run.py", "newer")]).unwrap();
         assert_eq!(
             (read("SKILL.md"), read("run.py")),
             ("new".into(), "mine".into())
@@ -308,11 +322,11 @@ mod tests {
     #[test]
     fn a_huge_file_is_read_no_further_than_needed_and_stays() {
         let home = home("huge");
-        install_one(&home, "x", &[("SKILL.md", "app")]).unwrap();
+        one(&home, "x", &[("SKILL.md", "app")]).unwrap();
         let path = home.join(".agents/skills/x/SKILL.md");
         let huge = vec![b'a'; MAX as usize * 4];
         std::fs::write(&path, &huge).unwrap();
-        install_one(&home, "x", &[("SKILL.md", "newer")]).unwrap();
+        one(&home, "x", &[("SKILL.md", "newer")]).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), huge.len() as u64);
         std::fs::remove_dir_all(home).unwrap();
     }
@@ -325,7 +339,7 @@ mod tests {
         let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
         // SAFETY: mkfifo reads the NUL-terminated path it is given.
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
-        let error = install_one(&home, "x", &[("SKILL.md", "app")]).unwrap_err();
+        let error = one(&home, "x", &[("SKILL.md", "app")]).unwrap_err();
         assert!(error.contains("not a regular file"), "{error}");
         std::fs::remove_dir_all(home).unwrap();
     }
@@ -336,7 +350,7 @@ mod tests {
         let path = home.join(".agents/skills/x/SKILL.md");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(home.join("gone"), &path).unwrap();
-        install_one(&home, "x", &[("SKILL.md", "app")]).unwrap();
+        one(&home, "x", &[("SKILL.md", "app")]).unwrap();
         assert!(std::fs::symlink_metadata(&path).unwrap().is_symlink());
         std::fs::remove_dir_all(home).unwrap();
     }
@@ -345,20 +359,20 @@ mod tests {
     fn what_the_app_stops_shipping_goes_unless_you_changed_it() {
         let home = home("dropped");
         let dir = home.join(".agents/skills/x");
-        install_one(&home, "x", &[("SKILL.md", "v1"), ("run.py", "v1")]).unwrap();
-        install_one(&home, "x", &[("SKILL.md", "v2")]).unwrap();
+        one(&home, "x", &[("SKILL.md", "v1"), ("run.py", "v1")]).unwrap();
+        one(&home, "x", &[("SKILL.md", "v2")]).unwrap();
         assert!(!dir.join("run.py").exists());
         assert!(!home.join(".agent/skills/x/run.py").exists());
 
         // A file in a folder of its own updates, and goes with its folder.
         let nested = [("SKILL.md", "v2"), ("scripts/run.py", "v1")];
-        install_one(&home, "x", &nested).unwrap();
-        install_one(&home, "x", &[("SKILL.md", "v2"), ("scripts/run.py", "v2")]).unwrap();
+        one(&home, "x", &nested).unwrap();
+        one(&home, "x", &[("SKILL.md", "v2"), ("scripts/run.py", "v2")]).unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.join("scripts/run.py")).unwrap(),
             "v2"
         );
-        install_one(&home, "x", &[("SKILL.md", "v2")]).unwrap();
+        one(&home, "x", &[("SKILL.md", "v2")]).unwrap();
         assert!(!dir.join("scripts").exists());
         assert!(!home.join(".agent/skills/x/scripts").exists());
 
@@ -366,7 +380,7 @@ mod tests {
         install(&home);
         assert!(!dir.exists() && !home.join(".agent/skills/x").exists());
 
-        install_one(&home, "y", &[("SKILL.md", "v1"), ("run.py", "v1")]).unwrap();
+        one(&home, "y", &[("SKILL.md", "v1"), ("run.py", "v1")]).unwrap();
         let mine = home.join(".agents/skills/y/run.py");
         std::fs::write(&mine, "mine").unwrap();
         install(&home);
@@ -374,7 +388,7 @@ mod tests {
         assert!(home.join(".agents/skills/y/SKILL.md").exists());
 
         // One you removed makes the rest yours too.
-        install_one(&home, "z", &[("SKILL.md", "v1"), ("run.py", "v1")]).unwrap();
+        one(&home, "z", &[("SKILL.md", "v1"), ("run.py", "v1")]).unwrap();
         std::fs::remove_file(home.join(".agents/skills/z/run.py")).unwrap();
         install(&home);
         assert!(home.join(".agents/skills/z/SKILL.md").exists());
@@ -390,21 +404,36 @@ mod tests {
             // Hidden or not, every entry counts.
             std::fs::write(record.join(format!(".{n}")), "").unwrap();
         }
-        let error = install_one(&home, "x", &[]).unwrap_err();
+        let error = one(&home, "x", &[]).unwrap_err();
         assert!(error.contains("more than"), "{error}");
         assert_eq!(std::fs::read_dir(&record).unwrap().count(), ENTRIES + 1);
         std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
+    fn one_bound_covers_every_record_a_start_walks() {
+        let home = home("aggregate");
+        for skill in 0..4 {
+            let record = home.join(".agent/skills").join(format!("s{skill}"));
+            std::fs::create_dir_all(&record).unwrap();
+            for n in 0..ENTRIES / 3 {
+                std::fs::write(record.join(format!(".{n}")), "").unwrap();
+            }
+        }
+        let errors = install(&home);
+        assert!(errors.iter().any(|e| e.contains("more than")), "{errors:?}");
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn a_skill_folder_that_is_a_link_is_yours() {
         let home = home("linked");
-        install_one(&home, "x", &[("SKILL.md", "old")]).unwrap();
+        one(&home, "x", &[("SKILL.md", "old")]).unwrap();
         let (dir, checkout) = (home.join(".agents/skills/x"), home.join("checkout"));
         std::fs::rename(&dir, &checkout).unwrap();
         std::os::unix::fs::symlink(&checkout, &dir).unwrap();
-        install_one(&home, "x", &[("SKILL.md", "new")]).unwrap();
-        install_one(&home, "x", &[]).unwrap();
+        one(&home, "x", &[("SKILL.md", "new")]).unwrap();
+        one(&home, "x", &[]).unwrap();
         let text = std::fs::read_to_string(checkout.join("SKILL.md")).unwrap();
         assert_eq!(text, "old");
         std::fs::remove_dir_all(home).unwrap();
@@ -413,13 +442,13 @@ mod tests {
     #[test]
     fn a_file_you_linked_stays_a_link() {
         let home = home("file-link");
-        install_one(&home, "x", &[("SKILL.md", "old")]).unwrap();
+        one(&home, "x", &[("SKILL.md", "old")]).unwrap();
         let path = home.join(".agents/skills/x/SKILL.md");
         let mine = home.join("mine.md");
         std::fs::write(&mine, "old").unwrap();
         std::fs::remove_file(&path).unwrap();
         std::os::unix::fs::symlink(&mine, &path).unwrap();
-        install_one(&home, "x", &[("SKILL.md", "new")]).unwrap();
+        one(&home, "x", &[("SKILL.md", "new")]).unwrap();
         assert!(std::fs::symlink_metadata(&path).unwrap().is_symlink());
         assert_eq!(std::fs::read_to_string(&mine).unwrap(), "old");
         std::fs::remove_dir_all(home).unwrap();
@@ -428,13 +457,13 @@ mod tests {
     #[test]
     fn a_temporary_left_as_a_link_is_never_written_through() {
         let home = home("temp-link");
-        install_one(&home, "x", &[("SKILL.md", "old")]).unwrap();
+        one(&home, "x", &[("SKILL.md", "old")]).unwrap();
         let dir = home.join(".agents/skills/x");
         let victim = home.join("victim");
         std::fs::write(&victim, "keep").unwrap();
         let temporary = dir.join(format!(".SKILL.md.{}", std::process::id()));
         std::os::unix::fs::symlink(&victim, &temporary).unwrap();
-        install_one(&home, "x", &[("SKILL.md", "new")]).unwrap();
+        one(&home, "x", &[("SKILL.md", "new")]).unwrap();
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
         assert_eq!(
             std::fs::read_to_string(dir.join("SKILL.md")).unwrap(),
@@ -447,12 +476,12 @@ mod tests {
     fn a_record_is_repaired_only_for_a_skill_that_is_still_the_apps() {
         let home = home("repair");
         let files = [("SKILL.md", "old"), ("run.py", "old")];
-        install_one(&home, "x", &files).unwrap();
+        one(&home, "x", &files).unwrap();
         let dir = home.join(".agents/skills/x");
         // An update replaced SKILL.md and stopped; then you edited run.py.
         std::fs::write(dir.join("SKILL.md"), "new").unwrap();
         std::fs::write(dir.join("run.py"), "mine").unwrap();
-        install_one(&home, "x", &[("SKILL.md", "new"), ("run.py", "new")]).unwrap();
+        one(&home, "x", &[("SKILL.md", "new"), ("run.py", "new")]).unwrap();
         let record = home.join(".agent/skills/x/SKILL.md");
         assert_eq!(std::fs::read_to_string(record).unwrap(), "old");
         std::fs::remove_dir_all(home).unwrap();
@@ -467,12 +496,12 @@ mod tests {
     #[test]
     fn a_start_that_ended_before_its_record_still_updates_later() {
         let home = home("crash");
-        install_one(&home, "x", &[("SKILL.md", "old")]).unwrap();
+        one(&home, "x", &[("SKILL.md", "old")]).unwrap();
         let path = home.join(".agents/skills/x/SKILL.md");
         // The file was replaced, then the app stopped before the record.
         std::fs::write(&path, "new").unwrap();
-        install_one(&home, "x", &[("SKILL.md", "new")]).unwrap();
-        install_one(&home, "x", &[("SKILL.md", "newer")]).unwrap();
+        one(&home, "x", &[("SKILL.md", "new")]).unwrap();
+        one(&home, "x", &[("SKILL.md", "newer")]).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "newer");
         std::fs::remove_dir_all(home).unwrap();
     }
