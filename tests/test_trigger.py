@@ -244,6 +244,19 @@ class TriggerFireTests(ModelFixture):
         subprocess.run([*git, 'commit', '-q', '--allow-empty', '-m', 'two'], check=True)
         news = self.fire('p.task', 'Look at it.', when=when, extra=extra, generation='g')
         self.assertNotEqual(news['last']['turn'], first['last']['turn'])
+        self.settle('p.task')
+        # Run now while the repository is away sends, and keeps the commit last seen.
+        moved = self.path / 'away'
+        repo.rename(moved)
+        (self.home / '.agent/triggers/p.task.fire').write_text(str(int(time.time())))
+        asked = self.fire('p.task', 'Look at it.', when=when, extra=extra, generation='g')
+        self.assertEqual(asked['last']['outcome'], 'sent', asked)
+        self.assertEqual(asked['head'], news['head'])
+        self.settle('p.task')
+        moved.rename(repo)
+        count = len(self.turns('p.task'))
+        self.fire('p.task', 'Look at it.', when=when, extra=extra, generation='g')
+        self.assertEqual(len(self.turns('p.task')), count, 'its return is no new commit')
 
     def test_add_from_an_agents_shell_needs_launchd(self):
         # Here there is no launchd: the trigger is refused and nothing is left behind.
