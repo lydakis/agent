@@ -124,9 +124,10 @@ const MAX: u64 = 256 * 1024;
 
 // Nothing at the path is None. Anything else must open, without waiting,
 // as a regular file: a dangling link or a pipe is an error, so it is left
-// alone and never holds up the window. At most MAX + 1 bytes are read, so
-// a huge file costs no more than a mismatch, and what is read spends
-// `budget`'s bytes; running out is an error.
+// alone and never holds up the window. At most MAX + 1 bytes are read, and
+// reading more than MAX is an error too, since two long files may differ
+// past what was read. What is read spends `budget`'s bytes; running out is
+// an error.
 fn read(path: &Path, budget: &mut Budget) -> Result<Option<Vec<u8>>, String> {
     use std::{io::Read, os::unix::fs::OpenOptionsExt};
     match std::fs::symlink_metadata(path) {
@@ -152,6 +153,9 @@ fn read(path: &Path, budget: &mut Budget) -> Result<Option<Vec<u8>>, String> {
         return Err(format!("{}: more than {BYTES} bytes", path.display()));
     };
     budget.bytes = left;
+    if bytes.len() as u64 > MAX {
+        return Err(format!("{}: longer than {MAX} bytes", path.display()));
+    }
     Ok(Some(bytes))
 }
 
@@ -344,8 +348,15 @@ mod tests {
         let path = home.join(".agents/skills/x/SKILL.md");
         let huge = vec![b'a'; MAX as usize * 4];
         std::fs::write(&path, &huge).unwrap();
-        one(&home, "x", &[("SKILL.md", "newer")]).unwrap();
+        let error = one(&home, "x", &[("SKILL.md", "newer")]).unwrap_err();
+        assert!(error.contains("longer than"), "{error}");
         assert_eq!(std::fs::metadata(&path).unwrap().len(), huge.len() as u64);
+        // The same start as the record, with a different end, is not a match.
+        let mut record = huge.clone();
+        *record.last_mut().unwrap() = b'b';
+        std::fs::write(home.join(".agent/skills/x/SKILL.md"), &record).unwrap();
+        one(&home, "x", &[]).unwrap_err();
+        assert_eq!(std::fs::read(&path).unwrap(), huge);
         std::fs::remove_dir_all(home).unwrap();
     }
 

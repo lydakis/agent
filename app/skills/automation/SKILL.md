@@ -59,13 +59,14 @@ index lacks it. The folder holds:
   job that runs every minute keeps a short folder; one still open stays
   until it is settled.
 
-Replace a state file whole: write a new file from `mktemp FILE.tmp.XXXXXX`
-in the same folder, run `sync`, `mv` it over `FILE`, then run `sync` again,
-so a run cut off mid-write or by a power loss leaves the old file or the new
-one, never half of one. `mktemp` creates a file nobody else named, so a link
-left at a fixed name cannot redirect the write. An agent runs one turn at a
-time, so any `*.tmp.*` in the folder when a run starts was left by a run cut
-off before its `mv`; delete those first.
+Replace a state file whole: write a new file from `mktemp tmp/XXXXXX`,
+inside the job folder's own `tmp/`, run `sync`, `mv` it over `FILE`, then
+run `sync` again, so a run cut off mid-write or by a power loss leaves the
+old file or the new one, never half of one. `mktemp` creates a file nobody
+else named, so a link left at a fixed name cannot redirect the write. Only
+the job writes in `tmp/` and an agent runs one turn at a time, so anything
+there when a run starts was left by a run cut off before its `mv`; empty it
+first.
 
 Agent cannot give one job its own credentials: every agent's shell sees
 the daemon's environment and your files, and a schedule passes only `HOME`
