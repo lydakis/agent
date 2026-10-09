@@ -996,17 +996,6 @@ the second with the first, or with `idempotency_conflict` when that window
 counted from an earlier turn, which it takes as told. A task deleted before
 its news goes out is dropped from it.
 
-## Skills the app ships
-
-Each start writes the skills the app ships into `~/.agents/skills`, where
-every agent composed with its policy finds them: today
-[workflow](../app/skills/workflow/SKILL.md), which runs many fresh agents
-from a plan script ([WORKFLOWS.md](WORKFLOWS.md)). A `.shipped` file in the
-folder records a hash of what the app wrote. A newer app replaces the
-folder only while that hash still matches, so an edited skill is yours and
-stays as you left it; a folder of the same name the app did not write is
-never touched, and a deleted one comes back at the next start.
-
 ## Schedules
 
 Listings return 64 schedules per page, with `next_after` for `schedule ls
@@ -1123,6 +1112,29 @@ every schedule and loads it again, on a thread of its own so the window does
 not wait; one launchd refuses keeps its old path and is tried again at the
 next start. Settings lists schedules also when no project exists. Only macOS has launchd; elsewhere `add`
 refuses with `schedules_unsupported`.
+
+The app ships an `automation` skill
+([SKILL.md](../app/skills/automation/SKILL.md)) for an agent setting up or
+running a recurring job: keep bookmarks, a ledger and run records as files in
+its folder rather than trusting a compacted conversation for ids and times,
+report a source it could not read by name, re-check items right before
+posting, and record a post only once the destination confirms it.
+
+## Skills the app ships
+
+Agents read only skills that are files in a folder's `.agents/skills` or in
+`~/.agents/skills` ([client policy](CLIENT.md)). So on every start the app
+writes each skill it ships, from `app/skills/NAME/`, to
+`~/.agents/skills/NAME/`, and keeps what it wrote in `~/.agent/skills/NAME/`
+([skills.rs](../app/src-tauri/src/skills.rs)). A newer app replaces a skill's
+files only while every one still matches that copy: a skill with a file that
+was there before the app, or that you edited or removed, stays as it is, and
+a folder's own skill of the same name wins over it. Agents already running
+keep the index they were created with.
+
+It also ships [workflow](../app/skills/workflow/SKILL.md), a SKILL.md and the
+`workflow.py` runner it starts, for running many fresh agents from a plan
+script ([WORKFLOWS.md](WORKFLOWS.md)).
 
 ## What it costs, and where the bounds are
 
@@ -1324,8 +1336,7 @@ in, queued and read back, unlinked once its name holds a new agent, and the
 app's own task updates and schedules by origin), and runs
 folded with failures on their line. Also covers coordinator task updates: batched at rest, excluding requested and replayed turns, retained after send failures.
 `cargo test -p agent-app` includes a failed project-file write leaving
-neither a partial file nor a temporary, a shipped skill written, updated and
-left alone once edited, and schedules' calendars, plists,
+neither a partial file nor a temporary, and schedules' calendars, plists,
 move, and each lifecycle step with launchd refusing. With `AGENT_TEST_RUNTIME=1` after a release build
 and `cargo build -p agent-app`, `python3 -m unittest tests.test_schedule`
 fires schedules against a real daemon and `python3 -m unittest

@@ -1203,17 +1203,17 @@ fn main() {
         {
             eprintln!("agent-app: {error}");
         }
-        if let Some(user) = std::env::var_os("HOME")
-            && let Err(error) = skills::install(std::path::Path::new(&user))
-        {
-            eprintln!("agent-app: {error}");
-        }
         // Off the window's way: a moved app reloads every schedule, each a launchctl run.
         if cfg!(target_os = "macos")
             && let Ok(places) = schedule::Places::home()
         {
             let app = app.clone();
             std::thread::spawn(move || schedule::refresh(&places, &app, &schedule::launchctl));
+        }
+    }
+    if let Some(user) = std::env::var_os("HOME") {
+        for error in skills::install(std::path::Path::new(&user)) {
+            eprintln!("agent-app: {error}");
         }
     }
     let links = remote::Hosts::new(
