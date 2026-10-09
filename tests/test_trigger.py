@@ -67,6 +67,15 @@ class TriggerFireTests(ModelFixture):
 
     def fire(self, name, message, target=None, when='every 30m', extra=(), at=None, app=APP, socket=None,
              env=None, store_id=None, not_before=None, generation=None):
+        args, env = self.write_trigger(name, message, target, when, extra, at, app, socket, env, store_id,
+                                       not_before, generation)
+        result = subprocess.run(args, env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        last = self.home / '.agent/triggers' / f'{name}.json'
+        return json.loads(last.read_text()) if last.exists() else None
+
+    def write_trigger(self, name, message, target=None, when='every 30m', extra=(), at=None, app=APP, socket=None,
+                      env=None, store_id=None, not_before=None, generation=None):
         # What a trigger's plist has launchd run.
         target = target or ['--bot', name, '--bot-id', str(self.bot_id(name))]
         args = [str(app), '--trigger-fire', '--name', name, *target,
@@ -80,10 +89,7 @@ class TriggerFireTests(ModelFixture):
         plist.parent.mkdir(parents=True, exist_ok=True)
         strings = ''.join(f'<string>{xml_escape(a)}</string>' for a in args)
         plist.write_text(f'<plist><dict><key>ProgramArguments</key><array>{strings}</array></dict></plist>')
-        result = subprocess.run(args, env=env, capture_output=True, text=True, timeout=60)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        last = self.home / '.agent/triggers' / f'{name}.json'
-        return json.loads(last.read_text()) if last.exists() else None
+        return args, env
 
     def settle(self, bot):
         self.agent('wait', '--store', str(self.store), f"turn:{bot}/{self.turns(bot)[-1]['turn']}")
@@ -272,6 +278,55 @@ class TriggerFireTests(ModelFixture):
         yes = self.fire('p.task', 'x', extra=['--if', 'test -d .', '--dir', str(self.path)])
         self.assertEqual(yes['last']['outcome'], 'sent', yes)
 
+    def test_the_watcher_fires_on_turn_ends_but_not_its_own_and_misses_none(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        task, lead = self.bot_id('p.task'), self.bot_id('p.lead')
+        # Each turn p.task ends wakes p.lead, whose answer goes back to p.task.
+        when = 'turn end of p.task'
+        args, env = self.write_trigger(
+            'ends', 'Review what p.task did.', target=['--bot', 'p.lead', '--bot-id', str(lead)], when=when,
+            extra=['--turn-end', 'p.task', '--turn-end-id', str(task), '--reply-to', 'p.task',
+                   '--reply-to-id', str(task)], generation='g')
+        watched = self.home / '.agent/triggers/ends.watch'
+
+        def watcher():
+            process = subprocess.Popen([str(APP), '--trigger-watch'], env=env, stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.PIPE, text=True)
+            self.addCleanup(lambda: process.poll() is None and process.kill())
+            return process
+
+        def until(check, seconds=30):
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline and not check():
+                time.sleep(0.1)
+            return check()
+
+        process = watcher()
+        # It starts after p.task's events so far: only later turn ends count.
+        self.assertTrue(until(watched.exists), 'the watcher found no place to start')
+        self.assertEqual(len(self.turns('p.lead')), 1)
+        self.agent('run', '--store', str(self.store), '--bot', 'p.task', 'next')
+        self.assertTrue(until(lambda: len(self.turns('p.lead')) == 2), 'the turn end did not fire')
+        ended = next(t['turn'] for t in self.turns('p.task') if t['prompt_preview'] == 'next')
+        self.assertRegex(self.turns('p.lead')[-1]['prompt_preview'],
+                         '^' + LINE.format('ends', re.escape(f'{when}: turn:p.task/{ended} completed')) + 'Review')
+        # The answer queued back to p.task is that trigger's own turn: it wakes nothing.
+        self.assertTrue(until(lambda: len(self.turns('p.task')) == 3 and self.turns('p.task')[-1]['status'] == 'completed'))
+        time.sleep(1)
+        self.assertEqual(len(self.turns('p.lead')), 2)
+        # A turn that ends while no watcher runs fires when one runs again.
+        process.kill()
+        process.wait()
+        self.agent('run', '--store', str(self.store), '--bot', 'p.task', 'again')
+        watcher()
+        self.assertTrue(until(lambda: len(self.turns('p.lead')) == 3), 'the missed turn end did not fire')
+        missed = next(t['turn'] for t in self.turns('p.task') if t['prompt_preview'] == 'again')
+        self.assertRegex(self.turns('p.lead')[-1]['prompt_preview'], re.escape(f'turn:p.task/{missed} completed'))
+        # Ended, it leaves the watcher nothing to do: that one exits 0.
+        (self.home / 'Library/LaunchAgents/me.lydakis.agent.trigger.ends.plist').unlink()
+        self.assertEqual(subprocess.run([str(APP), '--trigger-watch'], env=env, timeout=30).returncode, 0)
+
     def test_a_commit_trigger_sends_only_for_a_new_commit(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
         repo = self.path / 'repo'
@@ -362,6 +417,22 @@ class TriggerFireTests(ModelFixture):
         self.assertFalse(loaded())
         # Nothing left: bootout's not-loaded answer reads as that.
         self.assertEqual(json.loads(trigger('rm', name, ok=False).stderr)['error'], 'trigger_not_found')
+        # A turn-end trigger: launchd runs the one watcher, which fires it, and goes with the last.
+        watcher = f'gui/{os.getuid()}/me.lydakis.agent.trigger-watch'
+        if subprocess.run(['/bin/launchctl', 'print', watcher], capture_output=True).returncode == 0:
+            self.skipTest('a real trigger watcher is loaded; this test would replace it')
+        self.addCleanup(lambda: subprocess.run(['/bin/launchctl', 'bootout', watcher], capture_output=True))
+        self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
+        self.assertTrue(json.loads(trigger('add', '--bot', 'p.lead', '--name', name, '--turn-end', 'p.task',
+                                           '--', 'p.task ended a turn').stdout)['when'] == 'turn end of p.task')
+        self.assertTrue((self.home / 'Library/LaunchAgents/me.lydakis.agent.trigger-watch.plist').exists())
+        self.assertTrue(until(lambda: (self.home / f'.agent/triggers/{name}.watch').exists(), 30))
+        self.agent('run', '--store', str(self.store), '--bot', 'p.task', 'more')
+        self.assertTrue(until(lambda: len(self.turns('p.lead')) == 2, 60), 'the watcher did not fire it')
+        self.assertIn('turn end of p.task: turn:p.task/', self.turns('p.lead')[-1]['prompt_preview'])
+        trigger('rm', name)
+        self.assertFalse((self.home / 'Library/LaunchAgents/me.lydakis.agent.trigger-watch.plist').exists())
+        self.assertNotEqual(subprocess.run(['/bin/launchctl', 'print', watcher], capture_output=True).returncode, 0)
 
 
 if __name__ == '__main__':
