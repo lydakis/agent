@@ -255,7 +255,10 @@ def main():
                   observer_sha256=digest(sources),workload=config,toolset=args.tools,mode=args.mode,
                   transport=args.transport,followers_per_bot=1 if args.transport == 'socket' else 0,
                   memory_detail=args.memory_detail,
-                  contract=f'{durability}; exact resume/replay; historical completed fork; no repeated tools',
+                  contract=f'{durability}; '
+                           + ('exact resume; committed transcript re-read, no event replay' if args.engine == 'pi-durable'
+                              else 'exact resume/replay')
+                           + '; historical completed fork; no repeated tools',
                   host=dict(system=platform.system(),architecture=platform.machine(),host_id=digest(platform.node()),
                             python=platform.python_version(),psutil=psutil.__version__,external_power=battery.power_plugged if battery else None),
                   sampling=dict(idle_seconds=.45,interval_seconds=.2,group_discovery_seconds=.5,timeout_seconds=30,rss_limit_mib=512,process_limit=process_limit(config, args.mode)),runs=[])

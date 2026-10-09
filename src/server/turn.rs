@@ -264,6 +264,8 @@ struct Accounting {
     beside: bool,
     /// How long summaries held the turn, kept with its record.
     summary_ms: u64,
+    /// The tokens a summary beside the turn's call holds of its budget.
+    summary_held: u64,
     /// Until when a summary that parked on its pool is not tried again
     /// while the view fits, kept in the park record.
     summary_retry_at: u64,
@@ -932,6 +934,7 @@ impl Turn {
                             *budget = (*budget).min(record.tokens_used.saturating_add(tokens));
                         }
                         spent.beside = true;
+                        accounting.summary_held = tokens;
                         *slot = Some(Box::pin(async move {
                             let (before, start) = (record.tokens_used, MAX_ROUNDS - 2);
                             let mut rounds = start;
@@ -2070,6 +2073,15 @@ impl Turn {
             inherited = false;
             // A summary planned at this boundary runs beside the call.
             let running = beside.take();
+            // The call and its retries count from what is left after the
+            // summary's share: its two rounds and the tokens it holds.
+            let held = running
+                .as_ref()
+                .map(|_| (2, std::mem::take(&mut accounting.summary_held)));
+            if let Some((rounds, tokens)) = held {
+                model_rounds += rounds;
+                record.tokens_used = record.tokens_used.saturating_add(tokens);
+            }
             let called = {
                 let call = self.call(
                     provider,
@@ -2099,6 +2111,10 @@ impl Turn {
                 }
             };
             let (called, running) = called;
+            if let Some((rounds, tokens)) = held {
+                model_rounds -= rounds;
+                record.tokens_used = record.tokens_used.saturating_sub(tokens);
+            }
             let response = match called {
                 Ok(Some(response)) => response,
                 // It lands before the turn parks or fails.
@@ -2170,6 +2186,22 @@ impl Turn {
             if installed && capped.is_some() {
                 self.steers.store(true, Relaxed);
             }
+            if installed && response.calls.is_empty() {
+                // A steer that came during the call is weighed against the
+                // view the summary left.
+                context = match self
+                    .context(
+                        self.settings().context_bytes(),
+                        self.settings().context_items(),
+                        self.settings().context_bytes() * 2 / 3,
+                    )
+                    .await
+                {
+                    Ok(context) => context,
+                    Err(error) if error.code == "context_limit" => return Ok(Round::Finished),
+                    Err(error) => return Err(error),
+                };
+            }
             if response.calls.is_empty() {
                 // A steer that arrived during the final call keeps the turn
                 // going for one more round rather than ending it unheard,
@@ -2199,8 +2231,11 @@ impl Turn {
             let stopped = accounting.warm_stopped;
             let summary_retry = accounting.summary_retry();
             let pending = &mut accounting.refresh;
+            // No call has sent the view a summary installed here, so there
+            // is no cache of it to keep warm.
             let mut warm = provider
                 .keep_warm_after(model, record.reasoning.as_deref())
+                .filter(|_| !installed)
                 .map(|after| Warm {
                     provider,
                     model,
