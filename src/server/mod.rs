@@ -1732,6 +1732,7 @@ impl Service {
             steers,
             tokens: self.tokens.clone(),
             read_results: Default::default(),
+            side: Default::default(),
         };
         self.jobs.spawn(async move {
             let (bot, id) = (task.bot.clone(), task.turn);

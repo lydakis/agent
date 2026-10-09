@@ -1503,7 +1503,8 @@ additional attempts that entered HTTP dispatch; cancelling during backoff or
 pacing does not count an unsent retry. `paced_ms` includes a partially elapsed
 pool wait on interruption. `summary_ms` is how long the turn waited on
 summaries: one before its call from planning to install, and one beside a
-call from the call's end to its install. Counters flush once per execution segment, on
+call from the call's end to its install, including a wait an interrupt
+cut short. Counters flush once per execution segment, on
 completion, failure, explicit interruption, or parking, and accumulate across
 resumption. A hard process kill can lose the current segment's unflushed
 counters. Retries are on by default because they cannot repeat an effect; what they can repeat is
@@ -2172,7 +2173,8 @@ output bound; with no known output bound (a Responses provider without
 `max_output_tokens`), or with server-side fallbacks on, which may bill any
 number of attempts per request, a budgeted bot's summary does not run
 beside. A summary beside the call that an interrupt cancels still adds its
-retries and pacing to the turn's.
+retries and pacing to the turn's. A refresh does not keep warm the view of
+a call whose summary has written its replacement.
 Otherwise, and at a turn's start or as a parked turn resumes, when the
 cache the copy reads may have lapsed, the summary goes before the call. A
 summary beside the turn uses its own connection rather than the bot's

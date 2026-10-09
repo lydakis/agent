@@ -176,6 +176,8 @@ pub struct Turn {
     pub tokens: Arc<TokenTotals>,
     /// Results this turn's `read` found on the bot's lineage.
     pub read_results: std::sync::Mutex<Vec<i64>>,
+    /// What summaries held and spent beside the turn's own accounting.
+    pub side: SideCounts,
 }
 
 /// Provider-reported tokens across every turn since the daemon started:
@@ -262,13 +264,8 @@ struct Accounting {
     route: std::sync::OnceLock<String>,
     /// A summary's own, running beside the turn's call.
     beside: bool,
-    /// How long summaries held the turn, kept with its record.
-    summary_ms: u64,
     /// The tokens a summary beside the turn's call holds of its budget.
     summary_held: u64,
-    /// The call's view is to be replaced by a summary beside it, so no
-    /// refresh keeps its cache warm while it streams.
-    replaced: bool,
     /// Until when a summary that parked on its pool is not tried again
     /// while the view fits, kept in the park record.
     summary_retry_at: u64,
@@ -388,13 +385,13 @@ impl Turn {
             }
         };
         let mut accounting = Accounting::default();
-        let (mut landed, side) = (None, SideCounts::default());
+        let mut landed = None;
         // Cancelling mid-job loses nothing: a job the worker has taken runs
         // to its commit, and the worker publishes whatever committed.
         let mut result = tokio::select! {
             biased;
             code = interrupt => fail(code),
-            result = self.rounds(&mut accounting, &mut landed, &side) => result,
+            result = self.rounds(&mut accounting, &mut landed) => result,
         };
         // The rounds future is gone, so cancellation cannot discard this flush.
         // A refresh it had already sent is billed: record what it cost.
@@ -412,11 +409,11 @@ impl Turn {
         {
             result = Err(error);
         }
-        accounting.retries += side.retries.load(Relaxed);
-        accounting.paced_ms += side.paced_ms.load(Relaxed);
+        accounting.retries += self.side.retries.swap(0, Relaxed);
+        accounting.paced_ms += self.side.paced_ms.swap(0, Relaxed);
         let summary_retry_ms = accounting.summary_retry();
         let (retries, paced_ms) = accounting.totals();
-        let summary_ms = accounting.summary_ms;
+        let summary_ms = self.side.summary_ms.swap(0, Relaxed);
         let turn = self.turn;
         let flushed = if let Ok(Round::Paced(at)) = &result {
             let (at, attempts, spent) = (*at, accounting.call_attempts, accounting.call_spent_ms);
@@ -842,7 +839,7 @@ impl Turn {
         context: &mut Context,
         (last, inherited, model): (Option<&LastCall>, bool, &str),
         output_bytes: Option<usize>,
-        beside: Option<(&mut Option<Beside<'a>>, &'a SideCounts)>,
+        beside: Option<&mut Option<Beside<'a>>>,
     ) -> Result<Compaction> {
         if record.compaction_instructions.is_none() {
             return Ok(Compaction::Skipped);
@@ -893,7 +890,7 @@ impl Turn {
         if fits && now_ms() < accounting.summary_retry_at {
             return Ok(Compaction::Skipped);
         }
-        let started = std::time::Instant::now();
+        let _held = Held::from_now(&self.side.summary_ms);
         // Beside the call, a summary holds a copy's call and a request of
         // its own against the round limit.
         let beside = beside.filter(|_| fits && *model_rounds + 2 < MAX_ROUNDS);
@@ -930,7 +927,7 @@ impl Turn {
                         })
                 });
                 match (beside, held) {
-                    (Some((slot, side)), Some(tokens)) => {
+                    (Some(slot), Some(tokens)) => {
                         // It spends only what it holds: its calls and their
                         // retries count from the rounds left after its
                         // share, and a bot's budget ends at its share.
@@ -943,7 +940,10 @@ impl Turn {
                         *slot = Some(Box::pin(async move {
                             let (before, start) = (record.tokens_used, MAX_ROUNDS - 2);
                             let mut rounds = start;
-                            let mut spent = Counted { spent, into: side };
+                            let mut spent = Counted {
+                                spent,
+                                into: &self.side,
+                            };
                             let result = self
                                 .summarize(
                                     planned,
@@ -974,7 +974,6 @@ impl Turn {
                 }
             }
         };
-        accounting.summary_ms += elapsed_ms(started);
         if let Compaction::Done = compaction {
             *context = self
                 .context(
@@ -1113,8 +1112,8 @@ impl Turn {
         again: bool,
         sent: Option<Sent<'_>>,
     ) -> Result<Compaction> {
-        let started = std::time::Instant::now();
-        let compaction = match self
+        let _held = Held::from_now(&self.side.summary_ms);
+        match self
             .plan(record, turn, accounting, tools, keeps, again, sent)
             .await?
         {
@@ -1123,9 +1122,7 @@ impl Turn {
                     .await
             }
             None => Ok(Compaction::Skipped),
-        };
-        accounting.summary_ms += elapsed_ms(started);
-        compaction
+        }
     }
 
     /// A planned summary's call, then its install, before the turn's call.
@@ -1433,7 +1430,7 @@ impl Turn {
         model_rounds: &mut usize,
         accounting: &mut Accounting,
     ) -> Result<bool> {
-        let started = std::time::Instant::now();
+        let _held = Held::from_now(&self.side.summary_ms);
         if let Some(running) = running {
             *landed = Some(running.await);
         }
@@ -1450,7 +1447,6 @@ impl Turn {
             Ok(Summary::Skipped) => Ok(Compaction::Skipped),
             Err(error) => Err(error),
         };
-        accounting.summary_ms += elapsed_ms(started);
         Ok(matches!(installed?, Compaction::Done))
     }
 
@@ -1754,7 +1750,6 @@ impl Turn {
         &self,
         accounting: &mut Accounting,
         landed: &mut Option<Landed>,
-        side: &SideCounts,
     ) -> Result<Round> {
         let (bot, turn) = (self.bot.clone(), self.turn);
         let mut record = self.store.op("inspect", move |db| db.inspect(&bot)).await?;
@@ -2007,7 +2002,7 @@ impl Turn {
                         &mut context,
                         (last.as_ref(), inherited, called),
                         output_bytes,
-                        sent_here.then_some((&mut beside, side)),
+                        sent_here.then_some(&mut beside),
                     )
                     .await?
                 {
@@ -2090,7 +2085,6 @@ impl Turn {
                 model_rounds += rounds;
                 record.tokens_used = record.tokens_used.saturating_add(tokens);
             }
-            accounting.replaced = held.is_some();
             let called = {
                 let call = self.call(
                     provider,
@@ -2112,6 +2106,9 @@ impl Turn {
                             // It waits outside the rounds once landed, so
                             // an interrupt still installs it.
                             done = summary.as_mut() => {
+                                if let Ok(Summary::Written(_)) = &done.result {
+                                    self.side.replaced.store(true, Relaxed);
+                                }
                                 *landed = Some(done);
                                 (call.await, None)
                             }
@@ -2120,7 +2117,7 @@ impl Turn {
                 }
             };
             let (called, running) = called;
-            accounting.replaced = false;
+            self.side.replaced.store(false, Relaxed);
             if let Some((rounds, tokens)) = held {
                 model_rounds -= rounds;
                 record.tokens_used = record.tokens_used.saturating_sub(tokens);
@@ -2426,10 +2423,7 @@ impl Turn {
         // A summary's view is replaced once it lands; only the turn's call
         // is refreshed while it streams.
         let warm_after = match body {
-            Body::Window(_) if !accounting.replaced => {
-                provider.keep_warm_after(model, record.reasoning.as_deref())
-            }
-            Body::Window(_) => None,
+            Body::Window(_) => provider.keep_warm_after(model, record.reasoning.as_deref()),
             Body::Copied(_) | Body::Span(..) => None,
         };
         loop {
@@ -2701,6 +2695,11 @@ impl Turn {
                 warm.read_at = warm.read_at.max(at);
                 if warm.read_at + warm.after > tokio::time::Instant::now() {
                     continue;
+                }
+                // A summary beside the call has written the view that
+                // replaces this one: its cache is not read again.
+                if self.side.replaced.load(Relaxed) {
+                    return Ok(call.await);
                 }
                 *warm.pending = Some(self.refresh(warm));
             }
@@ -3554,13 +3553,36 @@ impl Spent {
     }
 }
 
-/// The retries and pacing of summaries beside the turn's calls, kept
-/// outside the rounds so one an interrupt cancels still counts toward the
-/// turn's.
+/// How long summaries held the turn, and the retries and pacing of those
+/// beside its calls, kept outside the rounds so what an interrupt cuts
+/// short still counts toward the turn's.
 #[derive(Default)]
-struct SideCounts {
+pub struct SideCounts {
+    summary_ms: AtomicU64,
     retries: AtomicU64,
     paced_ms: AtomicU64,
+    /// A summary beside the turn's call wrote its replacement for the view
+    /// the call sent, so no refresh keeps that view's cache warm.
+    replaced: AtomicBool,
+}
+
+/// Time from now until dropped, added to a summary counter.
+struct Held<'a> {
+    started: std::time::Instant,
+    into: &'a AtomicU64,
+}
+impl<'a> Held<'a> {
+    fn from_now(into: &'a AtomicU64) -> Self {
+        Held {
+            started: std::time::Instant::now(),
+            into,
+        }
+    }
+}
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        self.into.fetch_add(elapsed_ms(self.started), Relaxed);
+    }
 }
 
 /// A summary's own accounting, added to its [`SideCounts`] when it ends or
@@ -4068,6 +4090,7 @@ mod tests {
             steers: Arc::new(AtomicBool::new(true)),
             tokens: Arc::default(),
             read_results: Default::default(),
+            side: Default::default(),
         };
         let running = tokio::spawn(async move { task.execute(cancelled).await });
         let last = steers[31];
