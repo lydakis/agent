@@ -34,8 +34,9 @@ const S = {
   // Who asked for each turn another bot asked for, until it ends, and what each coordinator has yet to
   // hear about its tasks (see `wake`), and turns that ended live before the snapshot said who made their bot.
   turnFrom: new Map(), wakes: new Map(), heldNews: [],
-  // Bots whose finished turn the person has not looked at yet (see `shownStatus`).
-  unseen: new Set(),
+  // Bots whose finished turn the person has not looked at yet (see `shownStatus`), and turns another
+  // bot asked for that the person steered into, whose end is theirs to see too.
+  unseen: new Set(), wanted: new Set(),
   // Unsent text for each bot not on screen. A composer's text is its bot's own: when a pane shows
   // another bot, the text stays behind with the one it was typed for (see `followDrafts`).
   drafts: new Map(),
@@ -193,17 +194,20 @@ const onScreen = (name) => {
   const sw = swarmOfBot(name);
   return S.selected === name || S.ui.side === name || (!!sw && S.selected === swarmKey(sw.name));
 };
-function setUnseen(name, on) {
-  if (S.unseen.has(name) === on) return;
-  if (on) S.unseen.add(name); else S.unseen.delete(name);
+// Each row a change touches is drawn once, however many of a swarm's agents it covers.
+function patchUnseen(names) {
   // A hidden sidebar draws its rows again when it opens.
-  rail.key = ''; patchRailRow(name);
-  const sw = swarmOfBot(name); if (sw) patchRailRow(swarmKey(sw.name));
+  rail.key = '';
+  const rows = new Set();
+  for (const name of names) { rows.add(name); const sw = swarmOfBot(name); if (sw) rows.add(swarmKey(sw.name)); }
+  for (const row of rows) patchRailRow(row);
 }
 function markSeen() {
-  let seen = false;
-  for (const name of S.unseen) if (onScreen(name)) { setUnseen(name, false); seen = true; }
-  if (seen) { refreshLive($('log')); if (S.ui.side) refreshLive($('side')); }
+  const seen = [...S.unseen].filter(onScreen);
+  if (!seen.length) return;
+  for (const name of seen) S.unseen.delete(name);
+  patchUnseen(seen);
+  refreshLive($('log')); if (S.ui.side) refreshLive($('side'));
 }
 const fmt = (ms) => { const s = Math.max(0, Math.round(ms / 1000)); return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`; };
 // Safe in text and inside a quoted attribute alike: names and call ids come from providers and land in both.
@@ -265,6 +269,7 @@ function forgetBot(name) {
   if (S.wakes.has(name)) { clearTimeout(S.wakes.get(name).timer); S.wakes.delete(name); }
   for (const w of S.wakes.values()) if (w.tasks.delete(name) && !w.tasks.size) { clearTimeout(w.timer); w.timer = null; }
   for (const key of S.turnFrom.keys()) if (key.startsWith(`${name}\u0000`)) S.turnFrom.delete(key);
+  for (const key of S.wanted) if (key.startsWith(`${name}\u0000`)) S.wanted.delete(key);
   // Held news is this bot's; a later bot of the same name is another.
   S.heldNews = S.heldNews.filter(([held]) => held !== name);
   // A draft belongs to its bot, so it goes with it.
@@ -419,10 +424,10 @@ async function loadSwarms() {
   if (broken.length) toast(`not a readable swarm: ${broken[0]}`, 5000);
 }
 // A swarm works while any agent works, waits while any waits, and is otherwise at rest.
-// At rest, it is done while an agent's finished turn is unseen.
+// At rest, it is done while an agent's finished turn is unseen, even if a later turn of it failed.
 function swarmStatus(sw) {
   let out = 'idle';
-  for (const m of sw.members) { const b = memberBot(sw, m), st = b?.status; if (st === 'running') return 'running'; if (st === 'waiting' || st === 'paced') out = 'waiting'; else if (out === 'idle' && b && shownStatus(b) === 'done') out = 'done'; }
+  for (const m of sw.members) { const b = memberBot(sw, m), st = b?.status; if (st === 'running') return 'running'; if (st === 'waiting' || st === 'paced') out = 'waiting'; else if (out === 'idle' && b && S.unseen.has(m)) out = 'done'; }
   return out;
 }
 const BOARD_LINES = 500;
@@ -717,6 +722,7 @@ async function onEvent(ev) {
       const t = transcript(name), by = senderOf(data);
       if (typeof data.node === 'number') pushNode(t, { kind: 'node', node: data.node, turn, ...(by ? { by } : {}) });
       else addItem(t, { kind: 'note', text: 'steered into the running turn', turn });
+      if (!data.from?.bot) S.wanted.add(`${name}\u0000${turn}`);
       break;
     }
     case 'turn_finished': {
@@ -728,8 +734,9 @@ async function onEvent(ev) {
       const t = transcript(name);
       if (t.streamingTurn === turn) { t.text = ''; t.thinking = ''; t.thinkingSince = 0; t.thinkingMs = 0; t.streamingTurn = null; t.streamGen += 1; }
       if (status !== 'completed' && status !== 'steered') addItem(t, { kind: 'note', text: data.error ? `${status}: ${data.error}${data.detail ? ': ' + data.detail : ''}` : status, turn });
-      // A turn another bot asked for is that bot's news, not the person's.
-      if (b && S.live && status === 'completed' && !from && !onScreen(name)) setUnseen(name, true);
+      // A turn another bot asked for is that bot's news, not the person's, unless the person steered into it.
+      const wanted = S.wanted.delete(key);
+      if (b && S.live && status === 'completed' && (!from || wanted) && !onScreen(name) && !S.unseen.has(name)) { S.unseen.add(name); patchUnseen([name]); }
       // A steer's turn is part of the turn it joined, whose end is the news.
       // A task's creator may still be on a snapshot page to come; its news waits for the whole snapshot.
       if (S.live && status !== 'steered') { if (S.snapshot) S.heldNews.push([name, turn, status, from]); else tellLead(name, turn, status, from); }
@@ -1152,7 +1159,7 @@ function forgetStore() {
   S.cursor = 0; S.bots.clear(); S.transcripts.clear(); S.drafts.clear(); S.override.clear(); S.effort.clear(); S.families.clear();
   S.swarms.clear(); S.memberOf.clear(); S.deleted.clear(); looked.clear();
   for (const w of S.wakes.values()) clearTimeout(w.timer);
-  S.wakes.clear(); S.turnFrom.clear(); S.heldNews = []; S.unseen.clear();
+  S.wakes.clear(); S.turnFrom.clear(); S.heldNews = []; S.unseen.clear(); S.wanted.clear();
   S.selected = ''; S.autoSelect = true; S.ui.side = null; S.ui.folded = new Set();
   S.botsGen += 1; S.shapeGen += 1;
   // A home the last host named is not this one's.

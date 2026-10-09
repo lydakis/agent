@@ -74,7 +74,7 @@ update) that finishes while its agent is off screen shows ✔ instead of ○
 until you open that agent; a swarm's row shows it for its agents until you
 open the swarm. Settings, help, the finder and the swarm sheet count as off
 screen. A turn another agent asked for is that agent's news, so the tasks stay
-○; a failure already shows ✘ until the next turn. The mark lives in the
+○ unless you steered into the turn; a failure already shows ✘ until the next turn. The mark lives in the
 window and does not survive a restart.
 
 ![demo finished while notes was open](app/done-unseen.png)

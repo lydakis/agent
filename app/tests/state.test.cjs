@@ -2485,7 +2485,12 @@ test('a turn the person asked for that ends off screen shows done until its bot 
   assert.equal(glyph('Ann'), 'done');
   p.S.setup.open = false; p.markSeen();
   assert.equal(glyph('Ann'), 'idle');
-  // A deleted bot's mark goes with it.
+  // A turn another bot asked for is the person's to see once they steer into it.
+  await p.onEvent({ event: 'accepted', bot: 'Cy', turn: 3, data: { from: { bot: 'Ann' } } });
+  await p.onEvent({ event: 'steered', bot: 'Cy', turn: 3, data: {} });
+  await p.onEvent({ event: 'turn_finished', bot: 'Cy', turn: 3, data: { status: 'completed' } });
+  assert.equal(glyph('Cy'), 'done');
+  p.S.selected = 'Cy'; p.markSeen(); p.S.selected = 'Ann';
   await run('Cy', 2, 'completed');
   await p.onEvent({ event: 'deleted', bot: 'Cy', data: {} });
   assert.equal(p.S.unseen.has('Cy'), false);
@@ -2508,6 +2513,10 @@ test('a swarm row shows done while one of its agents has an unseen result, until
   await p.onEvent({ event: 'accepted', bot: 'app.latency-2', turn: 1, data: {} });
   assert.equal(row(), 'running');
   p.S.bots.get('app.latency-2').status = 'idle';
+  // A later failure does not hide the unseen result.
+  await p.onEvent({ event: 'accepted', bot: 'app.latency-1', turn: 2, data: {} });
+  await p.onEvent({ event: 'turn_finished', bot: 'app.latency-1', turn: 2, data: { status: 'failed' } });
+  assert.equal(row(), 'done');
   p.S.selected = '⁂app.latency'; p.markSeen();
   assert.equal(row(), 'idle');
 });
