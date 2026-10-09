@@ -1144,10 +1144,12 @@ refuses with `schedules_unsupported`.
 What a model writes is drawn the way a page would draw it. A message is
 Markdown (GitHub's flavour, with a line break wherever the model wrote one),
 parsed by [marked](https://marked.js.org) once and kept with the item, so a
-pane drawn again reuses it. A table past 256 columns or 10,000 cells shows as
-its source, as a short row is padded to the header's width and a few bytes a
-row could ask for millions of cells. Fenced blocks are drawn by their
-language:
+pane drawn again reuses it; when highlighting loads, only messages whose code
+waited for it are drawn again. A table past 256 columns or 10,000 cells shows
+as its source, as a short row is padded to the header's width and a few bytes
+a row could ask for millions of cells. A message past 50,000 lines, or one
+that would draw past 100,000 tags, shows as its text, as a `- x` line makes
+an element from four bytes. Fenced blocks are drawn by their language:
 
 - **Code** is highlighted with [highlight.js](https://highlightjs.org) (its
   common languages) in the window's own colors, with a copy button. A block

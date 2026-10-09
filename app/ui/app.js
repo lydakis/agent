@@ -1245,13 +1245,14 @@ function inline(text) {
   return esc(text).replace(/\*\*(.+?)\*\*/g, '<h>$1</h>').replace(/`([^`]+)`/g, '<code>$1</code>');
 }
 // A message's Markdown, drawn once and kept with the item: a pane drawn again reuses it, and it is
-// drawn anew only when its text changes or highlighting arrives (see `Rich.onReady`). What it keeps
-// counts toward the transcript's decoded bytes, so the window's bound holds.
+// drawn anew only when its text changes or, for one whose code waited, highlighting arrives (see
+// `Rich.onReady`). What it keeps counts toward the transcript's decoded bytes, so the window's bound
+// holds.
 function textHTML(it, t) {
-  if (it.htmlOf !== it.text || it.htmlAt !== Rich.version) {
+  if (it.htmlOf !== it.text || (it.htmlWaited && it.htmlAt !== Rich.version)) {
     const html = `<div class="md">${Rich.html(it.text)}</div>`;
     const d = 2 * (html.length - (it.html?.length ?? 0)); it.bytes = (it.bytes || 0) + d; if (t) t.bytes = Math.max(0, (t.bytes || 0) + d);
-    it.html = html; it.htmlOf = it.text; it.htmlAt = Rich.version;
+    it.html = html; it.htmlOf = it.text; it.htmlAt = Rich.version; it.htmlWaited = Rich.waited;
   }
   return it.html;
 }

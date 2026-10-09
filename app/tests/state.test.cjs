@@ -36,7 +36,7 @@ function page(daemon = {}, storage = null) {
   context.Rich = context.window.Rich;
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules, tellLead, markSeen };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules, tellLead, markSeen };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -181,6 +181,24 @@ test('a table too wide or too large shows as its source; a modest one draws', ()
   assert.match(Rich.html(wide), /data-kind="code"/);
   const tall = '| a | b | c | d |\n|---|---|---|---|\n' + 'x\n'.repeat(3000);
   assert.doesNotMatch(Rich.html(tall), /<td>/);
+});
+
+test('a message past 100,000 tags shows as its text', () => {
+  const Rich = page().context.Rich;
+  const list = '- *x*\n'.repeat(30000);
+  assert.doesNotMatch(Rich.html(list), /<li>/);
+  assert.match(Rich.html(list), /data-kind="code"/);
+  assert.match(Rich.html('- x\n'.repeat(100)), /<li>/);
+  assert.doesNotMatch(Rich.html('x\n'.repeat(60000)), /<br>/);
+});
+
+test('highlighting arriving redraws only messages whose code waited for it', () => {
+  const p = page(), R = p.context.Rich; let v = 0, calls = 0;
+  p.context.Rich = { html: (x) => { calls++; return R.html(x); }, get version() { return v; }, get waited() { return R.waited; } };
+  const prose = { text: 'just words' }, code = { text: '```rust\nfn a() {}\n```' };
+  p.textHTML(prose); p.textHTML(code); assert.equal(calls, 2);
+  v = 1; p.textHTML(prose); p.textHTML(code);
+  assert.equal(calls, 3);
 });
 
 test('a name starting with a tilde is the folder\'s; only ~/ is home', () => {

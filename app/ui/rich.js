@@ -8,7 +8,9 @@ window.Rich = (() => {
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const linkable = (href) => /^(https?:|mailto:)/i.test(href ?? '');
   // Bumped when highlighting arrives, so HTML drawn without it is drawn again (see `ready`).
-  let version = 0, ready = () => {};
+  // `waited` says the last `html` drew code plain while highlighting loads, so only such a
+  // message needs drawing again once it arrives.
+  let version = 0, ready = () => {}, waited = false;
 
   // ---------- lazy scripts ----------
   const loading = new Map();
@@ -33,7 +35,7 @@ window.Rich = (() => {
     const h = hl();
     if (lang && text.length <= HIGHLIGHT_MAX) {
       if (h?.getLanguage(lang)) { try { return h.highlight(text, { language: lang, ignoreIllegals: true }).value; } catch (_) {} }
-      else if (!h) wantHighlight();
+      else if (!h) { waited = true; wantHighlight(); }
     }
     return esc(text);
   }
@@ -83,11 +85,20 @@ window.Rich = (() => {
     if (!p || /^[a-z][a-z0-9+.-]*:/i.test(p.replace(/^file:\/\//i, ''))) return null;
     return p.replace(/^file:\/\//i, '').replace(/:\d+(:\d+)?$/, '') || null;
   }
-  // A message's HTML, inside the caller's `.md` box.
+  // A message's HTML, inside the caller's `.md` box. One that would draw past 100,000 tags (about
+  // 50,000 elements) shows as its text: a line of `- x` or a `*x*` makes an element from a few
+  // bytes, and the window pays for every element it holds. Past 50,000 lines it is not parsed.
+  const TAGS = 100000, LINES = 50000;
+  const count = (s, c, max) => { let n = 0, i = -1; while (n <= max && (i = s.indexOf(c, i + 1)) !== -1) n++; return n; };
+  const asText = (text) => `<div class="rc" data-kind="code">${head('text', '')}<pre class="code"><code>${esc(text)}</code></pre></div>`;
   function html(text) {
+    waited = false;
     const p = parser();
     if (!p) return `<p>${esc(text)}</p>`;
-    try { return p.parse(text); } catch (_) { return `<p>${esc(text)}</p>`; }
+    if (count(text, '\n', LINES) > LINES) return asText(text);
+    let out; try { out = p.parse(text); } catch (_) { return `<p>${esc(text)}</p>`; }
+    if (count(out, '<', TAGS) > TAGS) { waited = false; return asText(text); }
+    return out;
   }
 
   // ---------- streaming ----------
@@ -302,5 +313,5 @@ window.Rich = (() => {
   // A middle click on a link would open it in a new app window.
   document.addEventListener?.('auxclick', (e) => { if (e.target.closest?.('.md a, .rc a')) e.preventDefault(); });
 
-  return { html, cut, hydrate, click, file, filePath, esc, get version() { return version; }, set onReady(fn) { ready = fn; }, set onFile(fn) { openFile = fn; }, set onError(fn) { failed = fn; } };
+  return { html, cut, hydrate, click, file, filePath, esc, get version() { return version; }, get waited() { return waited; }, set onReady(fn) { ready = fn; }, set onFile(fn) { openFile = fn; }, set onError(fn) { failed = fn; } };
 })();
