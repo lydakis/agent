@@ -137,11 +137,10 @@ fn read(path: &Path) -> Result<Option<Vec<u8>>, String> {
 fn install_one(home: &Path, name: &str, files: &[(&str, &str)]) -> Result<(), String> {
     let dir = home.join(".agents/skills").join(name);
     let record = home.join(".agent/skills").join(name);
-    // A folder of the skill's that is a link leads somewhere the app did not
-    // write, such as a checkout of yours, so the skill is yours.
+    // A file or folder of the skill's that is a link leads somewhere the app
+    // did not write, such as a checkout of yours, so the skill is yours.
     let linked = |file: &Path, top: &Path| {
         file.ancestors()
-            .skip(1)
             .take_while(|folder| folder.starts_with(top))
             .any(|folder| std::fs::symlink_metadata(folder).is_ok_and(|m| m.is_symlink()))
     };
@@ -337,7 +336,7 @@ mod tests {
         let path = home.join(".agents/skills/x/SKILL.md");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(home.join("gone"), &path).unwrap();
-        assert!(install_one(&home, "x", &[("SKILL.md", "app")]).is_err());
+        install_one(&home, "x", &[("SKILL.md", "app")]).unwrap();
         assert!(std::fs::symlink_metadata(&path).unwrap().is_symlink());
         std::fs::remove_dir_all(home).unwrap();
     }
@@ -408,6 +407,39 @@ mod tests {
         install_one(&home, "x", &[]).unwrap();
         let text = std::fs::read_to_string(checkout.join("SKILL.md")).unwrap();
         assert_eq!(text, "old");
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_file_you_linked_stays_a_link() {
+        let home = home("file-link");
+        install_one(&home, "x", &[("SKILL.md", "old")]).unwrap();
+        let path = home.join(".agents/skills/x/SKILL.md");
+        let mine = home.join("mine.md");
+        std::fs::write(&mine, "old").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&mine, &path).unwrap();
+        install_one(&home, "x", &[("SKILL.md", "new")]).unwrap();
+        assert!(std::fs::symlink_metadata(&path).unwrap().is_symlink());
+        assert_eq!(std::fs::read_to_string(&mine).unwrap(), "old");
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_temporary_left_as_a_link_is_never_written_through() {
+        let home = home("temp-link");
+        install_one(&home, "x", &[("SKILL.md", "old")]).unwrap();
+        let dir = home.join(".agents/skills/x");
+        let victim = home.join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        let temporary = dir.join(format!(".SKILL.md.{}", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &temporary).unwrap();
+        install_one(&home, "x", &[("SKILL.md", "new")]).unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("SKILL.md")).unwrap(),
+            "new"
+        );
         std::fs::remove_dir_all(home).unwrap();
     }
 

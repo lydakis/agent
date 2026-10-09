@@ -775,17 +775,19 @@ fn replace_mode(path: &Path, text: &str, mode: u32) -> Result<(), String> {
         std::process::id()
     ));
     let written = (|| {
+        // Created anew, never opened through whatever an old temporary of
+        // this pid left at the name, a link included.
+        match std::fs::remove_file(&temporary) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
         let mut file = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(mode)
             .open(&temporary)?;
-        // An old temporary of this pid may carry another mode.
-        std::fs::set_permissions(
-            &temporary,
-            std::os::unix::fs::PermissionsExt::from_mode(mode),
-        )?;
+        // The umask may have narrowed the mode.
+        file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode))?;
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
         std::fs::rename(&temporary, path)?;
