@@ -258,6 +258,16 @@ class TriggerFireTests(ModelFixture):
         self.fire('p.task', 'Look at it.', when=when, extra=extra, generation='g')
         self.assertEqual(len(self.turns('p.task')), count, 'its return is no new commit')
 
+    def test_a_file_trigger_whose_path_became_its_own_state_ends_without_sending(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        state = self.home / '.agent/triggers'
+        state.mkdir(parents=True)
+        # Made for a folder a link pointed elsewhere; the link now points at the triggers' own.
+        link = self.path / 'watched'
+        link.symlink_to(state)
+        self.assertIsNone(self.fire('p.task', 'x', when=f'file {link}', extra=['--file', str(link / 'p.task.json')]))
+        self.assertEqual(len(self.turns('p.task')), 1)
+
     def test_add_from_an_agents_shell_needs_launchd(self):
         # Here there is no launchd: the trigger is refused and nothing is left behind.
         if os.uname().sysname == 'Darwin':
