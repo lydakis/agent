@@ -557,6 +557,28 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual(result['pending'], [])
         self.assertEqual(client.process.wait(timeout=2), 0)
 
+    def test_the_same_command_resent_gets_what_it_made(self):
+        run = ['run', *self.common, '--new', '--bot', 'Once', '--request-id', 'once', '--detach', 'hello']
+        first = json.loads(self.agent(*run).stdout)
+        again = json.loads(self.agent(*run).stdout)
+        self.assertEqual((again['bot_id'], again['turn'], again['duplicate']),
+                         (first['bot_id'], first['turn'], True))
+        changed = self.agent(*run[:-1], 'goodbye', check=False)
+        self.assertIn('idempotency_conflict', changed.stderr)
+        other = self.agent(*run[:-4], '--request-id', 'twice', '--detach', 'hello', check=False)
+        self.assertIn('bot_exists', other.stderr)
+        self.agent('wait', '--store', str(self.store), first['handle'])
+        fork = ['fork', '--store', str(self.store), '--source', 'Once', '--bot', 'Side', '--request-id', 'side']
+        forked, refork = (json.loads(self.agent(*fork).stdout) for _ in range(2))
+        self.assertEqual((refork['id'], refork['duplicate']), (forked['id'], True))
+        # A delete resent once its bot is gone succeeds, and never reaches a
+        # later bot of the same name.
+        rm = ['rm', '--store', str(self.store), '--bot', 'Side', '--bot-id', str(forked['id'])]
+        self.assertFalse(json.loads(self.agent(*rm).stdout)['duplicate'])
+        self.agent('fork', '--store', str(self.store), '--source', 'Once', '--bot', 'Side')
+        self.assertTrue(json.loads(self.agent(*rm).stdout)['duplicate'])
+        self.assertIn('Side', self.agent('ls', '--store', str(self.store), '--pretty').stdout)
+
     def test_retry_of_pruned_turn_exits_and_retained_retry_still_replays(self):
         self.agent('run', *self.common, '--new', '--bot', 'Bob', '--request-id', 'old', 'first')
         retry = ['run', '--store', str(self.store), '--bot', 'Bob', '--request-id', 'old', 'first']

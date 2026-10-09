@@ -5115,3 +5115,28 @@ and none in 1; per-bot settings read one tick in 6 runs and two in 9. So this
 screen neither shows nor rules out a CPU difference. It measures bots on the
 defaults; a bot with its own model-call settings also clones the provider for
 its calls, which this screen does not cover.
+
+## Keyed creation cost
+
+A creation may carry a `request_id`, stored with the bot, so a resend gets
+the bot it made. The key is compared in the lookup `create` already made to
+refuse a taken name, so an unkeyed creation should cost what it did, and a
+keyed one only the stored request. This screen checks that.
+
+Method: a local script over the `bench.admission_burst` helpers writes 64
+`create` requests at once on one connection to a fresh store, against the
+synthetic model, and reads daemon CPU from per-thread scheduler time. A
+keyed run then resends the same 64. Release builds of `169cf40` (main) and
+this change, ten rounds of the three cases in the same order, the first
+round excluded. Linux x86_64 container, 2026-10-09.
+
+| Build and requests | Daemon CPU per 64 | Reply p50 | Last reply |
+| --- | ---: | ---: | ---: |
+| `169cf40`, unkeyed | 11.61 ms | 7.05 ms | 11.68 ms |
+| this change, unkeyed | 11.45 ms | 6.45 ms | 12.96 ms |
+| this change, keyed | 10.78 ms | 6.20 ms | 10.96 ms |
+| this change, keyed resend | 5.61 ms | 3.00 ms | 5.16 ms |
+
+Cells are medians of nine rounds. The three creating cases are within each
+other's round-to-round spread; a resend writes no bot or event and costs
+about half a creation. macOS is not measured.

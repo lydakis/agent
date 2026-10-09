@@ -196,6 +196,9 @@ enum Command {
         /// takes the default. Forks keep their source's.
         #[serde(default)]
         settings: Box<Settings>,
+        /// An idempotency key: resending the request with it gets the bot
+        /// it made, `duplicate: true`, instead of `bot_exists`.
+        request_id: Option<String>,
     },
     Resume {
         bot: String,
@@ -218,10 +221,15 @@ enum Command {
         /// the source's list, `[]` allows none, and `null` is refused.
         #[serde(default, deserialize_with = "present")]
         allow: Option<Option<Vec<String>>>,
+        /// An idempotency key, as on `create`.
+        request_id: Option<String>,
     },
     /// Remove an idle bot and everything only it owns.
     Delete {
         bot: String,
+        /// The identity to delete. A resend after it is gone succeeds as a
+        /// duplicate and never reaches a later bot of the same name.
+        bot_id: Option<i64>,
     },
     /// Drop events, tool intents, processes, and artifacts of all but the
     /// newest `keep_turns` turns; the transcript and turn rows stay.
@@ -1813,9 +1821,13 @@ impl Service {
                 approver,
                 approve_expire_ms,
                 settings,
+                request_id,
             } => {
                 if budget_tokens == Some(0) {
                     return fail("invalid_budget");
+                }
+                if let Some(key) = &request_id {
+                    name(key)?;
                 }
                 let gate = gate(
                     approve,
@@ -1892,9 +1904,13 @@ impl Service {
                                 fallbacks,
                                 gate: gate.as_ref(),
                                 settings: *settings,
+                                request_id: request_id.as_deref(),
                             },
                         )?;
-                        Ok((serde_json::to_value(created)?, event["cursor"].as_i64()))
+                        let cursor = event.as_ref().and_then(|e| e["cursor"].as_i64());
+                        let mut created = serde_json::to_value(created)?;
+                        created["duplicate"] = json!(event.is_none());
+                        Ok((created, cursor))
                     })
                     .await?;
                 self.admissions.push_back(Admission {
@@ -1917,7 +1933,14 @@ impl Service {
                     })
                     .await
             }
-            Command::Delete { bot } => {
+            Command::Delete { bot, bot_id } => {
+                if let Some(id) = bot_id {
+                    let name = bot.clone();
+                    if store.op("gone", move |db| db.gone(&name, id)).await? {
+                        return Ok(json!({"bot":bot,"bot_id":id,"duplicate":true,
+                            "turns":0,"events":0,"nodes":0}));
+                    }
+                }
                 if self.active.contains_key(&bot) {
                     return fail("bot_busy");
                 }
@@ -1935,7 +1958,8 @@ impl Service {
                 let providers = self.providers.clone();
                 self.retention.spawn(async move {
                     let result = async {
-                        let mut deleted = json!({"turns":0,"events":0,"nodes":0});
+                        let mut deleted = json!({"bot":bot,"bot_id":bot_id,"duplicate":false,
+                            "turns":0,"events":0,"nodes":0});
                         loop {
                             let name = bot.clone();
                             let piece = store
@@ -2267,9 +2291,13 @@ impl Service {
                 approver,
                 approve_expire_ms,
                 allow,
+                request_id,
             } => {
                 if budget_tokens == Some(0) {
                     return fail("invalid_budget");
+                }
+                if let Some(key) = &request_id {
+                    name(key)?;
                 }
                 let allow = match allow {
                     None => None,
@@ -2320,12 +2348,14 @@ impl Service {
                                 created_by_id,
                                 gate: gate.as_ref(),
                                 allow: allow.as_deref(),
+                                request_id: request_id.as_deref(),
                             },
                         )
                     })
                     .await?;
-                let _ = event;
-                Ok(serde_json::to_value(created)?)
+                let mut created = serde_json::to_value(created)?;
+                created["duplicate"] = json!(event.is_none());
+                Ok(created)
             }
             Command::Events { bot, after, limit } => {
                 store
@@ -2984,6 +3014,7 @@ mod tests {
                         fallbacks: false,
                         gate: None,
                         settings: Default::default(),
+                        request_id: None,
                     },
                 )?;
                 let turn = db
@@ -3188,6 +3219,7 @@ mod tests {
             fallbacks: false,
             gate: None,
             settings: Default::default(),
+            request_id: None,
         };
         let turn = store
             .op("create", move |db| {
@@ -3419,6 +3451,7 @@ mod tests {
                                 fallbacks: false,
                                 gate: None,
                                 settings: Default::default(),
+                                request_id: None,
                             },
                         )?;
                         let turn = db
@@ -3711,6 +3744,7 @@ mod tests {
                         fallbacks: false,
                         gate: None,
                         settings: Default::default(),
+                        request_id: None,
                     },
                 )?;
                 // No slot was free when it was accepted, so it queued.
@@ -3796,6 +3830,7 @@ mod tests {
                         fallbacks: false,
                         gate: None,
                         settings: Default::default(),
+                        request_id: None,
                     },
                 )
                 .map(|_| ())
@@ -4038,6 +4073,7 @@ mod tests {
             approver: None,
             approve_expire_ms: None,
             settings: Box::default(),
+            request_id: None,
         }
     }
     fn scratch(name: &str) -> std::path::PathBuf {
@@ -4137,6 +4173,46 @@ mod tests {
             "one turn started per fresh submission"
         );
         assert_eq!(service.reserved, 0);
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_resent_creation_is_answered_with_its_bot_and_writes_nothing() {
+        let dir = scratch("admit-resend");
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = admitting(&store, 1024);
+        let (output, _writer) = Output::stdout();
+        let keyed = || {
+            let mut command = create("A", &dir);
+            if let Command::Create { request_id, .. } = &mut command {
+                *request_id = Some("once".into());
+            }
+            command
+        };
+        let answers = requests(&mut service, vec![keyed(), keyed()], &output).await;
+        let (first, again) = (
+            answers[0].1.as_ref().unwrap(),
+            answers[1].1.as_ref().unwrap(),
+        );
+        assert_eq!(
+            (&first["duplicate"], &again["duplicate"]),
+            (&json!(false), &json!(true))
+        );
+        assert_eq!(first["id"], again["id"]);
+        let events = store.call(|db| db.events("A", 0, 10)).await.unwrap();
+        assert_eq!(
+            events["events"].as_array().unwrap().len(),
+            1,
+            "one created event"
+        );
+        let mut other = keyed();
+        if let Command::Create { request_id, .. } = &mut other {
+            *request_id = Some("bad key".into());
+        }
+        let refused = request(&mut service, other, &output).await.unwrap_err();
+        assert_eq!(refused.code, "invalid_name");
         drop(service);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
@@ -4277,7 +4353,10 @@ mod tests {
         // Deleting a bot keeps its followers for a bot of the same name.
         let deletes = names
             .iter()
-            .map(|bot| Command::Delete { bot: bot.clone() })
+            .map(|bot| Command::Delete {
+                bot: bot.clone(),
+                bot_id: None,
+            })
             .collect();
         for (_, deleted) in requests(&mut service, deletes, &sink).await {
             deleted.unwrap();
@@ -4566,6 +4645,7 @@ mod tests {
                             fallbacks: false,
                             gate: Some(&gate),
                             settings: Default::default(),
+                            request_id: None,
                         },
                     )?;
                     creator = Some(bot);
@@ -4843,6 +4923,7 @@ mod tests {
                         fallbacks: false,
                         gate: Some(&gate),
                         settings: Default::default(),
+                        request_id: None,
                     },
                 )?;
                 let turn = db
