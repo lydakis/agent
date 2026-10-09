@@ -193,7 +193,8 @@ const looking = () => !covered() && document.visibilityState !== 'hidden' && doc
 const onScreen = (name) => {
   if (!looking()) return false;
   const sw = swarmOfBot(name);
-  return S.selected === name || S.ui.side === name || (!!sw && S.selected === swarmKey(sw.name));
+  // A file open beside covers the chat that was there.
+  return S.selected === name || (S.ui.side === name && !S.ui.file) || (!!sw && S.selected === swarmKey(sw.name));
 };
 // Each row a change touches is drawn once, however many of a swarm's agents it covers.
 function patchUnseen(names) {
@@ -205,11 +206,11 @@ function patchUnseen(names) {
 function markSeen() {
   if (!S.unseen.size || !looking()) return;
   const sw = swarmOf(S.selected);
-  const seen = [...new Set([S.selected, S.ui.side, ...(sw ? sw.members : [])])].filter((name) => name && S.unseen.has(name));
+  const seen = [...new Set([S.selected, S.ui.file ? null : S.ui.side, ...(sw ? sw.members : [])])].filter((name) => name && S.unseen.has(name));
   if (!seen.length) return;
   for (const name of seen) S.unseen.delete(name);
   patchUnseen(seen);
-  refreshLive($('log')); if (S.ui.side) refreshLive($('side'));
+  refreshLive($('log')); if (S.ui.side && !S.ui.file) refreshLive($('side'));
 }
 const fmt = (ms) => { const s = Math.max(0, Math.round(ms / 1000)); return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`; };
 // Safe in text and inside a quoted attribute alike: names and call ids come from providers and land in both.
@@ -1518,7 +1519,8 @@ function dropFile() {
   S.ui.file = null; $('side').dataset.key = ''; $('side').dataset.who = ''; $('sidetitle').dataset.k = '';
   return true;
 }
-function closeFile() { if (dropFile()) { render(); focusInput(S.ui.side ? 'side' : 'main'); } }
+// The chat it covered is on screen again, and what it finished meanwhile is seen.
+function closeFile() { if (dropFile()) { render(); markSeen(); focusInput(S.ui.side ? 'side' : 'main'); } }
 function renderFile() {
   const f = S.ui.file, key = `file|${f.full}|${f.gen}|${Rich.version}`, el = $('side');
   if (el.dataset.key === key) return;

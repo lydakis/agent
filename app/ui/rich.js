@@ -41,10 +41,10 @@ window.Rich = (() => {
   const pre = (text, lang) => `<pre class="code"><code>${codeHTML(text, lang)}</code></pre>`;
   const CHART = new Set(['vega-lite', 'vegalite', 'vl', 'vega']);
   const toggle = '<button type="button" data-rich="view"></button>';
-  // A diagram or chart shows its source until it is drawn. HTML and charts in a message open as code,
-  // their preview a click away: both run on the window's thread, and a page's script or a chart's
-  // transforms (a `sequence` of a billion rows, a tick count of a billion) can take it over, so they
-  // run only when asked. Mermaid bounds itself (`maxTextSize`, `maxEdges`) and draws on its own.
+  // A diagram or chart shows its source until it is drawn. HTML, SVG and charts in a message open as
+  // code, their preview a click away: all draw on the window's thread, and a page's script, an SVG's
+  // filters and animations or a chart's transforms (a `sequence` of a billion rows, a tick count of a
+  // billion) can take it over, so they run only when asked, block by block. Mermaid bounds itself (`maxTextSize`, `maxEdges`) and draws on its own.
   // `page` runs it at once, for a file someone opened.
   function block(text, info, page = false) {
     const lang = (info ?? '').trim().split(/\s+/)[0].toLowerCase();
@@ -52,7 +52,7 @@ window.Rich = (() => {
     if (CHART.has(lang)) return `<div class="rc" data-kind="chart" data-lang="${lang === 'vega' ? 'vega' : 'vega-lite'}" data-lazy${page ? ' data-run' : ''} data-view="code">${head(lang, toggle)}<div class="view"></div>${pre(text, 'json')}</div>`;
     if (lang === 'html' || lang === 'htm') return `<div class="rc" data-kind="html" data-view="${page ? 'view' : 'code'}">${head(lang, '<button type="button" data-rich="view"></button>')}<div class="view frame"></div>${pre(text, 'xml')}</div>`;
     // An SVG draws as an image, which runs no script and loads nothing.
-    if (lang === 'svg' && /^\s*(<\?xml[^>]*>\s*)?<svg\b/i.test(text)) return `<div class="rc" data-kind="svg" data-view="view">${head(lang, '<button type="button" data-rich="view"></button>')}<div class="view"><img alt="" src="data:image/svg+xml;charset=utf-8,${esc(encodeURIComponent(text))}"></div>${pre(text, 'xml')}</div>`;
+    if (lang === 'svg' && /^\s*(<\?xml[^>]*>\s*)?<svg\b/i.test(text)) return `<div class="rc" data-kind="svg" data-view="${page ? 'view' : 'code'}">${head(lang, '<button type="button" data-rich="view"></button>')}<div class="view"></div>${pre(text, 'xml')}</div>`;
     return `<div class="rc" data-kind="code">${head(lang, '')}${pre(text, lang)}</div>`;
   }
   let md = null;
@@ -67,7 +67,7 @@ window.Rich = (() => {
         link({ href, title, tokens }) { const inner = this.parser.parseInline(tokens), t = title ? ` title="${esc(title)}"` : ''; return linkable(href) ? `<a href="${esc(href)}"${t}>${inner}</a>` : filePath(href) ? `<a class="file" data-file="${esc(filePath(href))}"${t}>${inner}</a>` : inner; },
         // Images in the page itself only from data the message carries; a remote one is a link,
         // so nothing a model writes fetches a URL when it is drawn.
-        image: ({ href, text }) => /^data:image\/(png|gif|jpe?g|webp|svg\+xml)[;,]/i.test(href ?? '') ? `<img src="${esc(href)}" alt="${esc(text)}">` : linkable(href) ? `<a href="${esc(href)}">${esc(text || href)}</a>` : esc(text),
+        image: ({ href, text }) => /^data:image\/(png|gif|jpe?g|webp)[;,]/i.test(href ?? '') ? `<img src="${esc(href)}" alt="${esc(text)}">` : linkable(href) ? `<a href="${esc(href)}">${esc(text || href)}</a>` : esc(text),
       },
     });
     return md;
@@ -187,16 +187,17 @@ window.Rich = (() => {
   const FRAME_HEAD = '<!doctype html><meta charset="utf-8">'
     + `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; media-src data: blob:; base-uri 'none'; form-action 'none'">`
     + '<script>(()=>{const post=()=>parent.postMessage({rich:"height",h:document.documentElement.scrollHeight},"*");addEventListener("load",post);new ResizeObserver(post).observe(document.documentElement);addEventListener("click",e=>{if(e.target.closest&&e.target.closest("a[href]"))e.preventDefault()},true)})()</script>';
-  // Previews a reader ran, by source, so a pane drawn again runs them again; at most 16.
-  const ran = new Set();
+  // A preview shown: a page in its frame, an SVG as an image (which runs no script and loads nothing).
   function mount(box) {
-    const host = box.querySelector('.frame'); if (!host || host.firstChild) return;
+    const host = box.querySelector('.view'); if (!host || host.firstChild) return;
+    const src = box.querySelector('pre').textContent;
+    if (box.dataset.kind === 'svg') { host.innerHTML = `<img alt="" src="data:image/svg+xml;charset=utf-8,${esc(encodeURIComponent(src))}">`; return; }
     const f = document.createElement('iframe');
     f.setAttribute('sandbox', 'allow-scripts'); f.setAttribute('referrerpolicy', 'no-referrer'); f.title = 'HTML preview';
-    f.srcdoc = FRAME_HEAD + box.querySelector('pre').textContent.replace(/^\s*<!doctype[^>]*>/i, '');
+    f.srcdoc = FRAME_HEAD + src.replace(/^\s*<!doctype[^>]*>/i, '');
     host.append(f);
   }
-  function unmount(box) { box.querySelector('.frame')?.replaceChildren(); }
+  function unmount(box) { box.querySelector('.view')?.replaceChildren(); }
   // Diagrams and charts draw when they come near the screen, so opening a long transcript draws only
   // what is read. The pane is the root: a margin around the window would be clipped by the pane's own
   // scrolling. Blocks a redraw took out of the pane are let go on the pane's next hydrate.
@@ -218,14 +219,15 @@ window.Rich = (() => {
     for (const b of w.boxes) if (!b.isConnected) { w.o.unobserve(b); w.boxes.delete(b); }
     w.boxes.add(box); w.o.observe(box);
   }
-  // After HTML from `html` is in the document: diagrams start, and charts and previews someone asked
-  // for show again.
+  // After HTML from `html` is in the document: diagrams start, a chart already drawn shows again, and
+  // a file's page or SVG shows. A preview someone ran in a message is code again once its pane is drawn
+  // anew: running it is asked of one block, once.
   function hydrate(root) {
-    for (const box of root.querySelectorAll('.rc[data-lazy]:not([data-on]), .rc[data-kind="html"]:not([data-on])')) {
+    for (const box of root.querySelectorAll('.rc[data-lazy]:not([data-on]), .rc[data-kind="html"]:not([data-on]), .rc[data-kind="svg"]:not([data-on])')) {
       box.dataset.on = '';
       if (box.dataset.kind === 'mermaid' || 'run' in box.dataset) watch(box);
       else if (box.dataset.kind === 'chart') draw(box, true);
-      else if (box.dataset.view === 'view' || ran.has(box.querySelector('pre').textContent)) { box.dataset.view = 'view'; mount(box); }
+      else if (box.dataset.view === 'view') mount(box);
     }
   }
   if (typeof window.addEventListener === 'function') window.addEventListener('message', (e) => {
@@ -252,12 +254,8 @@ window.Rich = (() => {
       draw(box);
     } else if (b.dataset.rich === 'view' && (!('lazy' in box.dataset) || 'drawn' in box.dataset)) {
       box.dataset.view = box.dataset.view === 'view' ? 'code' : 'view';
-      // A preview shown runs; one hidden stops, scripts and all.
-      if (box.dataset.kind === 'html') {
-        const src = box.querySelector('pre').textContent;
-        if (box.dataset.view === 'view') { mount(box); ran.delete(src); ran.add(src); if (ran.size > 16) ran.delete(ran.values().next().value); }
-        else { unmount(box); ran.delete(src); }
-      }
+      // A preview shown runs; one hidden stops, scripts, filters and all.
+      if (box.dataset.kind === 'html' || box.dataset.kind === 'svg') { if (box.dataset.view === 'view') mount(box); else unmount(box); }
     }
     return true;
   }
@@ -267,16 +265,17 @@ window.Rich = (() => {
   // table, or code. `bytes` is what was read (at most `cap`); `more` says the file goes on.
   const IMAGE = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', avif: 'image/avif', bmp: 'image/bmp', ico: 'image/x-icon' };
   const extOf = (path) => { const n = path.split('/').pop().toLowerCase(); return /\.(vl|vg)\.json$/.test(n) ? n.slice(-7, -5) : n.includes('.') ? n.split('.').pop() : n; };
-  // The first `max` rows of a CSV or TSV: a quoted field may hold the separator, a line break or a
-  // doubled quote.
+  // The first `max` rows of a CSV or TSV, at most 256 columns each: a quoted field may hold the
+  // separator, a line break or a doubled quote.
+  const COLUMNS = 256;
   function csv(text, sep, max) {
     const out = []; let row = [], cell = '', quoted = false, i = 0;
-    const end = () => { row.push(cell); cell = ''; if (row.length > 1 || row[0]) out.push(row); row = []; };
+    const end = () => { if (row.length < COLUMNS) row.push(cell); cell = ''; if (row.length > 1 || row[0]) out.push(row); row = []; };
     for (; i < text.length && out.length < max; i++) {
       const c = text[i];
       if (quoted) { if (c !== '"') cell += c; else if (text[i + 1] === '"') { cell += c; i++; } else quoted = false; }
       else if (c === '"' && !cell) quoted = true;
-      else if (c === sep) { row.push(cell); cell = ''; }
+      else if (c === sep) { if (row.length < COLUMNS) row.push(cell); cell = ''; }
       else if (c === '\n') end();
       else if (c !== '\r') cell += c;
     }

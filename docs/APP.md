@@ -1158,9 +1158,11 @@ pane drawn again reuses it. Fenced blocks are drawn by their language:
 - **`html`** opens as code, and runs as a preview in a sandboxed frame only
   when asked: a click on **preview** runs it, a click on **code** stops it.
   A preview's scripts share the window's thread (a frame is not a process),
-  so a page a model wrote never runs merely by being in a reply. A preview
-  someone ran runs again when its pane is drawn again (the last 16).
-  **`svg`** draws as an image.
+  so a page a model wrote never runs merely by being in a reply. Running is
+  asked of one block, once: a preview is code again when its pane is drawn
+  anew. **`svg`** likewise opens as code and draws as an image (no script, no
+  network) with a click, as its filters and animations also take the
+  window's thread; a `data:` SVG image in Markdown shows as its text.
 
 Charts are a block of their own because a preview cannot load a charting
 library: models reach for one from a CDN, and a preview fetches nothing.
@@ -1189,7 +1191,7 @@ FIFO or device is refused, as reading one need not end, and a window on a
 host is refused by name, as its files are the host's). The file draws by its
 kind: Markdown, a diagram (`.mmd`, `.mermaid`), a chart (`.vl.json`,
 `.vg.json`, drawn at once), a page (`.html`, opened as its preview; opening
-the file is the asking), an SVG or image, a CSV or TSV as a table of its first 1,000 rows
+the file is the asking), an SVG or image, a CSV or TSV as a table of its first 1,000 rows and 256 columns
 (quoted fields kept whole), a binary file as its size,
 anything else as code highlighted by its extension. Esc or ✕ closes it and
 brings back the task that was beside, if any. A write or edit to the open
@@ -1200,7 +1202,7 @@ store, closes it. Searching a project's files
 What a model writes never becomes the app's markup unparsed. Raw HTML inside
 Markdown shows as text. Links open in the default browser and only for
 `http`, `https` and `mailto` (the core's `open_link` refuses anything else);
-other links show as their text. Images draw only from `data:` URLs the
+other links show as their text. Images draw only from raster `data:` URLs the
 message carries; a remote image is a link, so drawing a message makes no
 request a model chose. An HTML preview runs scripts in a frame sandboxed
 without same-origin access: it cannot read the app or its storage, cannot

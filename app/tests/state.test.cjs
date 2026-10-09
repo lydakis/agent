@@ -156,8 +156,12 @@ test('fenced blocks become code, previews, diagrams and images by their language
   assert.match(Rich.html('```html\n<b>hi</b>\n```'), /data-kind="html" data-view="code"/);
   assert.match(Rich.html('```mermaid\ngraph TD\nA-->B\n```'), /data-kind="mermaid".*A--&gt;B/s);
   const svg = Rich.html('```svg\n<svg xmlns="http://www.w3.org/2000/svg"><circle r="4"/></svg>\n```');
-  assert.match(svg, /<img alt="" src="data:image\/svg\+xml;charset=utf-8,%3Csvg/);
+  // An SVG draws as an image, and in a message only when asked: its filters and animations take CPU.
+  assert.match(svg, /data-kind="svg" data-view="code"/);
+  assert.doesNotMatch(svg, /<img/);
   assert.doesNotMatch(svg.split('<pre')[0], /<svg/);
+  assert.match(Rich.file('/w/a.svg', new TextEncoder().encode('<svg/>')).html, /data-kind="svg" data-view="view"/);
+  assert.doesNotMatch(Rich.html('![x](data:image/svg+xml,%3Csvg%2F%3E)'), /<img/);
 });
 
 test('charts, file links and opened files draw by kind', () => {
@@ -183,6 +187,8 @@ test('charts, file links and opened files draw by kind', () => {
   assert.match(Rich.file('/w/q.csv', enc('name,note\r\nAlice,"a,b"\nBob,"say ""hi""\nthen go"\n')).html,
     /<td>Alice<\/td><td>a,b<\/td><\/tr><tr><td>Bob<\/td><td>say &quot;hi&quot;\nthen go<\/td><\/tr><\/tbody>/);
   assert.match(Rich.file('/w/t.tsv', enc('a\tb\n1\t2')).html, /<td>1<\/td><td>2<\/td>/);
+  // Columns are capped as well as rows, so a line of separators costs no more than a wide table.
+  assert.equal(Rich.file('/w/wide.csv', enc(','.repeat(100000))).html.match(/<th>/g).length, 256);
   assert.match(Rich.file('/w/blob.bin', new Uint8Array([1, 0, 2])).html, /binary file · 3 bytes/);
   assert.match(Rich.file('/w/big.log', enc('x'), true).html, /showing the first/);
   assert.match(Rich.file('/w/<i>.md', enc('<script>alert(1)</script>')).html, /&lt;script&gt;/);
@@ -221,6 +227,13 @@ test('a step links the whole path it named, not its shortened summary', async ()
   assert.equal(shell.path, undefined);
   p.S.ui.steps = true;
   assert.match(p.runHTML(p.transcript('Bob'), 0).html, new RegExp(`data-file="${long}"`));
+});
+
+test('a chat covered by a file beside is not seen until the file closes', () => {
+  const p = page();
+  p.S.ui.side = 'Bob'; p.S.ui.file = { bot: 'Ann', full: '/w/a.md', url: null }; p.S.unseen.add('Bob');
+  p.markSeen(); assert.ok(p.S.unseen.has('Bob'));
+  p.S.ui.file = null; p.markSeen(); assert.ok(!p.S.unseen.has('Bob'));
 });
 
 test('a file opened from an agent closes when that agent is forgotten', () => {
