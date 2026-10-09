@@ -1121,8 +1121,8 @@ posting, and record a post only once the destination confirms it.
 ## Skills the app ships
 
 Agents read only skills that are files in a folder's `.agents/skills` or in
-`~/.agents/skills` ([client policy](CLIENT.md)). So on every start the app
-writes each skill it ships, from `app/skills/NAME/`, to
+`~/.agents/skills` ([client policy](CLIENT.md)). So on every start, and before
+each schedule fire, the app writes each skill it ships, from `app/skills/NAME/`, to
 `~/.agents/skills/NAME/`, and keeps what it wrote in
 `~/.agent/skills/NAME/` ([skills.rs](../app/src-tauri/src/skills.rs)). A
 newer app replaces a skill's files only while every one still matches that

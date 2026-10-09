@@ -36,9 +36,11 @@ index lacks it. The folder holds:
   several items can share a timestamp. If the source can list an item late
   with an earlier time, read from a margin before the timestamp, such as an
   hour, and keep the ids of everything read within that margin instead. An
-  id alone is a bookmark only when the source orders by it. At setup, set each to the source's newest item
-  now, or to the start of a backfill `preferences.md` names, so the first
-  run does not report the whole history.
+  id alone is a bookmark only when the source orders by it. At setup, set
+  each to the source's newest item now, or to the start of a backfill
+  `preferences.md` names, so the first run does not report the whole
+  history. A source added to `preferences.md` later gets its bookmark the
+  same way, in the first run that finds it without one.
 - `ledger.md`: one line per open item: date, source, the source's stable id,
   last known status, for example `2026-01-05 issues 481 waiting on review`.
   An item reported or left unconfirmed stays until it closes, then its line
@@ -49,13 +51,17 @@ index lacks it. The folder holds:
 - `runs/KEY.md`, one per run, named by its post's key (step 8): what it
   read, reported, left out and why, its plan, and how the post ended. Delete
   records marked done that are older than a month, or than what
-  `preferences.md` says to keep; one still open stays until it is settled.
+  `preferences.md` says to keep, and any beyond the newest 100 done, so a
+  job that runs every minute keeps a short folder; one still open stays
+  until it is settled.
 
-Replace a state file whole: write a new file from `mktemp FILE.XXXXXX` in
-the same folder, run `sync`, `mv` it over `FILE`, then run `sync` again, so a
-run cut off mid-write or by a power loss leaves the old file or the new one,
-never half of one. `mktemp` creates a file nobody else named, so a link left at a
-fixed name cannot redirect the write.
+Replace a state file whole: write a new file from `mktemp FILE.tmp.XXXXXX`
+in the same folder, run `sync`, `mv` it over `FILE`, then run `sync` again,
+so a run cut off mid-write or by a power loss leaves the old file or the new
+one, never half of one. `mktemp` creates a file nobody else named, so a link
+left at a fixed name cannot redirect the write. An agent runs one turn at a
+time, so any `*.tmp.*` in the folder when a run starts was left by a run cut
+off before its `mv`; delete those first.
 
 Agent cannot give one job its own credentials: every agent's shell sees
 the daemon's environment and your files, and a schedule passes only `HOME`
@@ -100,13 +106,15 @@ cap is reached its turns fail with `budget_exhausted`.
    the bookmark only to its end, and say that more is waiting; later runs
    catch up. Ask for items after the bookmark, oldest first, where the
    source allows. One that lists only newest first: save each page read
-   under `backlog/SOURCE/`, with the next page's cursor beside them, so the
-   next run goes on from there instead of from the newest page; once the
+   under `backlog/SOURCE/` as one file holding its items and the next
+   page's cursor, replaced whole like any state file, so the next run goes
+   on from there instead of from the newest page; once the
    bookmark is reached, report from the saved pages oldest first, removing
    each page once the bookmark has moved past it. Keep at most the number of
    pages `preferences.md` allows, or 50; a source further behind than that
-   is a failed read, with the person told it cannot catch up. Then look up each open item in the ledger again, since nothing
-   new may have arrived about it.
+   is a failed read, with the person told it cannot catch up. Then look up
+   each open item in the ledger again, since nothing new may have arrived
+   about it.
 5. **A failed read is not a quiet day.** When a source errors, times out or
    its tool is missing, leave its bookmark where it is, write the rest from
    the other sources, and end with a line naming what could not be read, such

@@ -25,7 +25,7 @@ pub fn install(home: &Path) -> Vec<String> {
         .map(|(name, files)| (name.to_string(), *files))
         .collect();
     let records = home.join(".agent/skills");
-    let mut budget = ENTRIES;
+    let mut budget = BUDGET;
     match recorded(&records, &mut budget) {
         Ok(names) => skills.extend(
             names
@@ -40,21 +40,32 @@ pub fn install(home: &Path) -> Vec<String> {
         if let Err(error) = install_one(home, name, files, &mut budget) {
             errors.push(error);
         }
-        if budget == 0 {
+        if budget.entries == 0 || budget.bytes == 0 {
             break;
         }
     }
     errors
 }
 
-/// More entries than all the app's records hold together. Past it, what is
-/// left is not the app's, so a start walks no further.
+/// What one start may list and read across the app's records and your
+/// copies: more than all of them hold together while they are the app's.
+/// Past it, what is left is not the app's, so a start goes no further.
+struct Budget {
+    entries: usize,
+    bytes: u64,
+}
+
 const ENTRIES: usize = 1024;
+const BYTES: u64 = 4 * 1024 * 1024;
+const BUDGET: Budget = Budget {
+    entries: ENTRIES,
+    bytes: BYTES,
+};
 
 /// The names in a record folder, its temporaries aside; none when it is
-/// absent. Every entry, listed or not, spends one of `budget`; running out
-/// is an error.
-fn recorded(folder: &Path, budget: &mut usize) -> Result<Vec<String>, String> {
+/// absent. Every entry, listed or not, spends one of `budget`'s entries;
+/// running out is an error.
+fn recorded(folder: &Path, budget: &mut Budget) -> Result<Vec<String>, String> {
     let entries = match std::fs::read_dir(folder) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         entries => entries.map_err(|error| format!("{}: {error}", folder.display()))?,
@@ -62,10 +73,10 @@ fn recorded(folder: &Path, budget: &mut usize) -> Result<Vec<String>, String> {
     let mut names = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| format!("{}: {error}", folder.display()))?;
-        if *budget == 0 {
+        if budget.entries == 0 {
             return Err(format!("{}: more than {ENTRIES} entries", folder.display()));
         }
-        *budget -= 1;
+        budget.entries -= 1;
         if let Some(name) = entry
             .file_name()
             .to_str()
@@ -89,7 +100,7 @@ fn settle(path: &Path, home: &Path) -> Result<(), String> {
 }
 
 /// Every file under a skill's record, as a path relative to it.
-fn recorded_files(record: &Path, budget: &mut usize) -> Result<Vec<String>, String> {
+fn recorded_files(record: &Path, budget: &mut Budget) -> Result<Vec<String>, String> {
     let (mut files, mut folders) = (Vec::new(), vec![String::new()]);
     while let Some(folder) = folders.pop() {
         for name in recorded(&record.join(&folder), budget)? {
@@ -114,8 +125,9 @@ const MAX: u64 = 256 * 1024;
 // Nothing at the path is None. Anything else must open, without waiting,
 // as a regular file: a dangling link or a pipe is an error, so it is left
 // alone and never holds up the window. At most MAX + 1 bytes are read, so
-// a huge file costs no more than a mismatch.
-fn read(path: &Path) -> Result<Option<Vec<u8>>, String> {
+// a huge file costs no more than a mismatch, and what is read spends
+// `budget`'s bytes; running out is an error.
+fn read(path: &Path, budget: &mut Budget) -> Result<Option<Vec<u8>>, String> {
     use std::{io::Read, os::unix::fs::OpenOptionsExt};
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -133,8 +145,12 @@ fn read(path: &Path) -> Result<Option<Vec<u8>>, String> {
             }
             file.take(MAX + 1).read_to_end(&mut bytes)
         })
-        .map(|_| Some(bytes))
-        .map_err(|error| format!("{}: {error}", path.display()))
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    budget.bytes = budget
+        .bytes
+        .checked_sub(bytes.len() as u64)
+        .ok_or_else(|| format!("{}: more than {BYTES} bytes", path.display()))?;
+    Ok(Some(bytes))
 }
 
 /// `budget` is shared by every record a start walks, so the whole walk is
@@ -143,7 +159,7 @@ fn install_one(
     home: &Path,
     name: &str,
     files: &[(&str, &str)],
-    budget: &mut usize,
+    budget: &mut Budget,
 ) -> Result<(), String> {
     let dir = home.join(".agents/skills").join(name);
     let record = home.join(".agent/skills").join(name);
@@ -160,11 +176,11 @@ fn install_one(
         if linked(&path, &dir) || linked(&written, &record) {
             return Ok(());
         }
-        let have = read(&path)?;
+        let have = read(&path, budget)?;
         if have.as_deref() == Some(text.as_bytes()) {
             // Current already; a start that ended before the record still
             // owns it, once the rest of the skill proves to be the app's.
-            if read(&written)?.as_deref() != Some(text.as_bytes()) {
+            if read(&written, budget)?.as_deref() != Some(text.as_bytes()) {
                 repair.push((written, text));
             }
             continue;
@@ -172,7 +188,7 @@ fn install_one(
         // Only a file the app wrote and nobody changed since is the app's: one
         // that was there first, was edited, or was removed is yours, and so is
         // the rest of its skill, which may depend on it.
-        if have != read(&written)? {
+        if have != read(&written, budget)? {
             return Ok(());
         }
         stale.push((path, written, text));
@@ -186,8 +202,8 @@ fn install_one(
             if linked(&path, &dir) || linked(&written, &record) {
                 return Ok(());
             }
-            let have = read(&path)?;
-            if have != read(&written)? {
+            let have = read(&path, budget)?;
+            if have != read(&written, budget)? {
                 return Ok(());
             }
             dropped.push((path, written));
@@ -230,7 +246,7 @@ mod tests {
     use super::*;
 
     fn one(home: &Path, name: &str, files: &[(&str, &str)]) -> Result<(), String> {
-        install_one(home, name, files, &mut { ENTRIES })
+        install_one(home, name, files, &mut { BUDGET })
     }
 
     fn home(tag: &str) -> std::path::PathBuf {
@@ -422,6 +438,30 @@ mod tests {
         }
         let errors = install(&home);
         assert!(errors.iter().any(|e| e.contains("more than")), "{errors:?}");
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn one_byte_bound_covers_every_file_a_start_reads() {
+        let home = home("bytes");
+        let text = "a".repeat(MAX as usize);
+        let files: Vec<(String, String)> = (0..BYTES / MAX)
+            .map(|n| (format!("f{n}"), text.clone()))
+            .collect();
+        for (file, text) in &files {
+            for top in [".agents/skills/x", ".agent/skills/x"] {
+                let path = home.join(top).join(file);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, text).unwrap();
+            }
+        }
+        let error = one(&home, "x", &[]).unwrap_err();
+        assert!(error.contains("more than"), "{error}");
+        assert!(
+            files
+                .iter()
+                .all(|(file, _)| home.join(".agents/skills/x").join(file).exists())
+        );
         std::fs::remove_dir_all(home).unwrap();
     }
 

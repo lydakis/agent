@@ -1181,6 +1181,14 @@ async fn request(
     client.request(&op, params).await.map_err(|e| e.to_string())
 }
 
+fn install_skills() {
+    if let Some(user) = std::env::var_os("HOME") {
+        for error in skills::install(std::path::Path::new(&user)) {
+            eprintln!("agent-app: {error}");
+        }
+    }
+}
+
 fn main() {
     // A swarm's `post` script, a coordinator's `start`, `~/.agent/schedule`
     // and launchd's fires run this executable; each acts and exits without
@@ -1190,7 +1198,12 @@ fn main() {
         Some(swarm::POST_FLAG) => std::process::exit(swarm::cli(&args[2..])),
         Some(swarm::START_FLAG) => std::process::exit(swarm::start_cli(&args[2..])),
         Some(schedule::FLAG) => std::process::exit(schedule::cli(&args[2..])),
-        Some(schedule::FIRE_FLAG) => std::process::exit(schedule::fire_cli(&args[2..])),
+        Some(schedule::FIRE_FLAG) => {
+            // A fire may be the first run of an updated app, and the job it
+            // wakes reads the shipped skills.
+            install_skills();
+            std::process::exit(schedule::fire_cli(&args[2..]))
+        }
         _ => {}
     }
     if let (Ok(home), Ok(app)) = (swarm::home(), std::env::current_exe()) {
@@ -1211,11 +1224,7 @@ fn main() {
             std::thread::spawn(move || schedule::refresh(&places, &app, &schedule::launchctl));
         }
     }
-    if let Some(user) = std::env::var_os("HOME") {
-        for error in skills::install(std::path::Path::new(&user)) {
-            eprintln!("agent-app: {error}");
-        }
-    }
+    install_skills();
     let links = remote::Hosts::new(
         std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent/hosts")),
         PathBuf::from("ssh"),
