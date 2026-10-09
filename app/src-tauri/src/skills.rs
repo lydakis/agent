@@ -27,11 +27,19 @@ const MAX: u64 = 256 * 1024;
 fn install_one(home: &Path, name: &str, text: &str) -> Result<(), String> {
     let path = home.join(".agents/skills").join(name).join("SKILL.md");
     let written = home.join(".agent/skills").join(format!("{name}.md"));
-    // At most MAX + 1 bytes, so a huge file costs no more than a mismatch.
+    // A regular file only, at most MAX + 1 bytes of it, so a huge file costs
+    // no more than a mismatch and a pipe never holds up the window.
     let read = |path: &Path| {
         use std::io::Read;
+        let opened = std::fs::metadata(path).and_then(|m| {
+            if m.is_file() {
+                std::fs::File::open(path)
+            } else {
+                Err(std::io::Error::other("not a regular file"))
+            }
+        });
         let mut bytes = Vec::new();
-        match std::fs::File::open(path).and_then(|f| f.take(MAX + 1).read_to_end(&mut bytes)) {
+        match opened.and_then(|f| f.take(MAX + 1).read_to_end(&mut bytes)) {
             Ok(_) => Ok(Some(bytes)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(format!("{}: {error}", path.display())),
@@ -125,6 +133,19 @@ mod tests {
         std::fs::write(&path, &huge).unwrap();
         install_one(&home, "x", "newer").unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), huge.len() as u64);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_special_file_is_left_alone_without_being_opened() {
+        let home = home("fifo");
+        let path = home.join(".agents/skills/x/SKILL.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: mkfifo reads the NUL-terminated path it is given.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        let error = install_one(&home, "x", "app").unwrap_err();
+        assert!(error.contains("not a regular file"), "{error}");
         std::fs::remove_dir_all(home).unwrap();
     }
 
