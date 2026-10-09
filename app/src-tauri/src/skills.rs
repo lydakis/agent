@@ -4,7 +4,8 @@
 //! finds it. Those files are yours to edit or remove: the app keeps what it
 //! last wrote there in `~/.agent/skills/NAME/`, and replaces a skill's files
 //! with newer ones only while every one of them still matches. A folder's own
-//! skill of the same name wins over it.
+//! skill of the same name wins over it. What the app stops shipping goes on
+//! the same terms.
 use std::path::Path;
 
 type Files = &'static [(&'static str, &'static str)];
@@ -26,46 +27,87 @@ pub const BUILT_IN: [(&str, Files); 2] = [
     ),
 ];
 
-/// Install or update every shipped skill under `home`; one that fails does
-/// not stop the others.
+/// Install or update every shipped skill under `home`, and take away what
+/// the app wrote of one it no longer ships; one that fails does not stop
+/// the others.
 pub fn install(home: &Path) -> Vec<String> {
-    BUILT_IN
+    let mut errors = Vec::new();
+    let mut skills: Vec<(String, Files)> = BUILT_IN
         .iter()
-        .filter_map(|(name, files)| install_one(home, name, files).err())
-        .collect()
+        .map(|(name, files)| (name.to_string(), *files))
+        .collect();
+    let records = home.join(".agent/skills");
+    match recorded(&records) {
+        Ok(names) => skills.extend(
+            names
+                .into_iter()
+                .filter(|name| BUILT_IN.iter().all(|(shipped, _)| shipped != name))
+                .filter(|name| records.join(name).is_dir())
+                .map(|name| (name, &[][..])),
+        ),
+        Err(error) => errors.push(error),
+    }
+    errors.extend(
+        skills
+            .iter()
+            .filter_map(|(name, files)| install_one(home, name, files).err()),
+    );
+    errors
+}
+
+/// The names in a record folder, its temporaries aside; none when it is
+/// absent.
+fn recorded(folder: &Path) -> Result<Vec<String>, String> {
+    let entries = match std::fs::read_dir(folder) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        entries => entries.map_err(|error| format!("{}: {error}", folder.display()))?,
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("{}: {error}", folder.display()))?;
+        if let Some(name) = entry
+            .file_name()
+            .to_str()
+            .filter(|name| !name.starts_with('.'))
+        {
+            names.push(name.to_owned());
+        }
+    }
+    Ok(names)
 }
 
 /// More than any skill the app ships; a longer file is not one of its copies.
 const MAX: u64 = 256 * 1024;
 
+// Nothing at the path is None. Anything else must open, without waiting,
+// as a regular file: a dangling link or a pipe is an error, so it is left
+// alone and never holds up the window. At most MAX + 1 bytes are read, so
+// a huge file costs no more than a mismatch.
+fn read(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    use std::{io::Read, os::unix::fs::OpenOptionsExt};
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+        Ok(_) => {}
+    }
+    let mut bytes = Vec::new();
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .and_then(|file| {
+            if !file.metadata()?.is_file() {
+                return Err(std::io::Error::other("not a regular file"));
+            }
+            file.take(MAX + 1).read_to_end(&mut bytes)
+        })
+        .map(|_| Some(bytes))
+        .map_err(|error| format!("{}: {error}", path.display()))
+}
+
 fn install_one(home: &Path, name: &str, files: &[(&str, &str)]) -> Result<(), String> {
     let dir = home.join(".agents/skills").join(name);
     let record = home.join(".agent/skills").join(name);
-    // Nothing at the path is None. Anything else must open, without
-    // waiting, as a regular file: a dangling link or a pipe is an error, so
-    // it is left alone and never holds up the window. At most MAX + 1 bytes
-    // are read, so a huge file costs no more than a mismatch.
-    let read = |path: &Path| {
-        use std::{io::Read, os::unix::fs::OpenOptionsExt};
-        match std::fs::symlink_metadata(path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(format!("{}: {error}", path.display())),
-            Ok(_) => {}
-        }
-        let mut bytes = Vec::new();
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(path)
-            .and_then(|file| {
-                if !file.metadata()?.is_file() {
-                    return Err(std::io::Error::other("not a regular file"));
-                }
-                file.take(MAX + 1).read_to_end(&mut bytes)
-            })
-            .map(|_| Some(bytes))
-            .map_err(|error| format!("{}: {error}", path.display()))
-    };
     let mut stale = Vec::new();
     for (file, text) in files {
         let (path, written) = (dir.join(file), record.join(file));
@@ -85,10 +127,38 @@ fn install_one(home: &Path, name: &str, files: &[(&str, &str)]) -> Result<(), St
         }
         stale.push((path, written, text));
     }
+    // A file the app no longer ships goes too, unless you changed it. One
+    // already gone counts as taken, so a start that ended partway finishes.
+    let mut dropped = Vec::new();
+    for file in recorded(&record)? {
+        if files.iter().all(|(shipped, _)| *shipped != file) {
+            let (path, written) = (dir.join(&file), record.join(&file));
+            let have = read(&path)?;
+            if have.is_some() && have != read(&written)? {
+                return Ok(());
+            }
+            dropped.push((path, written));
+        }
+    }
     // Mine first, then the record, so a crash between them is fixed above.
     for (path, written, text) in stale {
         crate::schedule::replace(&path, text)?;
         crate::schedule::replace(&written, text)?;
+    }
+    let remove = |path: &Path| match std::fs::remove_file(path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            Err(format!("{}: {error}", path.display()))
+        }
+        _ => Ok(()),
+    };
+    for (path, written) in dropped {
+        remove(&path)?;
+        remove(&written)?;
+    }
+    if files.is_empty() {
+        // Only if empty: a file you added keeps the folder.
+        let _ = std::fs::remove_dir(&dir);
+        let _ = std::fs::remove_dir(&record);
     }
     Ok(())
 }
@@ -216,6 +286,28 @@ mod tests {
         std::os::unix::fs::symlink(home.join("gone"), &path).unwrap();
         assert!(install_one(&home, "x", &[("SKILL.md", "app")]).is_err());
         assert!(std::fs::symlink_metadata(&path).unwrap().is_symlink());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn what_the_app_stops_shipping_goes_unless_you_changed_it() {
+        let home = home("dropped");
+        let dir = home.join(".agents/skills/x");
+        install_one(&home, "x", &[("SKILL.md", "v1"), ("run.py", "v1")]).unwrap();
+        install_one(&home, "x", &[("SKILL.md", "v2")]).unwrap();
+        assert!(!dir.join("run.py").exists());
+        assert!(!home.join(".agent/skills/x/run.py").exists());
+
+        // A skill the app no longer ships at all; `install` finds it by its record.
+        install(&home);
+        assert!(!dir.exists() && !home.join(".agent/skills/x").exists());
+
+        install_one(&home, "y", &[("SKILL.md", "v1"), ("run.py", "v1")]).unwrap();
+        let mine = home.join(".agents/skills/y/run.py");
+        std::fs::write(&mine, "mine").unwrap();
+        install(&home);
+        assert_eq!(std::fs::read_to_string(&mine).unwrap(), "mine");
+        assert!(home.join(".agents/skills/y/SKILL.md").exists());
         std::fs::remove_dir_all(home).unwrap();
     }
 
