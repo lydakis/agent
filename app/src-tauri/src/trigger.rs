@@ -653,8 +653,22 @@ pub fn file(value: &str) -> Result<When, String> {
     })
 }
 
+/// git about `repo` alone: a hook's `GIT_DIR` and the like would name
+/// another repository than the one launchd's fire, which has none, reads.
 fn git(repo: &Path, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+    ] {
+        command.env_remove(key);
+    }
+    let out = command
         .arg("-C")
         .arg(repo)
         .args(args)
@@ -662,8 +676,11 @@ fn git(repo: &Path, args: &[&str]) -> Option<String> {
         .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
-    let text = String::from_utf8(out.stdout).ok()?;
-    out.status.success().then(|| text.trim().to_owned())
+    // Commit titles in a legacy encoding are not UTF-8; the hashes and
+    // actions read here are ASCII either way.
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
 /// Whether HEAD moved by more than checkouts and resets since it named
@@ -674,7 +691,12 @@ fn committed(repo: &Path, since: &Option<String>) -> bool {
     let Some(since) = since else {
         return true;
     };
-    let Some(log) = git(repo, &["reflog", "-n", "256", "--format=%H %gs", "HEAD"]) else {
+    // Only each entry's action is read: subjects are cut to 32 columns, so
+    // the log is at most about 20 KB however long its commit titles.
+    let Some(log) = git(
+        repo,
+        &["reflog", "-n", "256", "--format=%H %<(32,trunc)%gs", "HEAD"],
+    ) else {
         return true;
     };
     for line in log.lines() {
@@ -1197,11 +1219,17 @@ fn take_asked(places: &Places, name: &str) -> bool {
 
 /// The `fire NAME` note, gone once read, when `fresh` takes its time.
 fn take_note(places: &Places, name: &str, fresh: impl Fn(i64) -> bool) -> bool {
+    // Moved aside first: a note written while this one is read is the
+    // next one, not lost with it.
     let path = places.asked(name);
-    let at = std::fs::read_to_string(&path)
+    let taken = path.with_extension("fire.taken");
+    if std::fs::rename(&path, &taken).is_err() {
+        return false;
+    }
+    let at = std::fs::read_to_string(&taken)
         .ok()
         .and_then(|t| t.trim().parse::<i64>().ok());
-    let _ = forget(&path);
+    let _ = forget(&taken);
     at.is_some_and(fresh)
 }
 
@@ -1748,6 +1776,9 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
         store_id,
         message: asked.message,
     };
+    // The commit there now is seen: only the next one fires. It is read
+    // before launchd watches, so a commit after it is news.
+    let seen = trigger.commit.as_deref().and_then(head);
     let app = std::env::current_exe().map_err(|e| e.to_string())?;
     let environment: Vec<(&str, String)> = ["HOME", "SHELL"]
         .into_iter()
@@ -1767,11 +1798,19 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
             Ok(row)
         }
         None => {
-            // The commit there now is seen: only the next one fires. A
-            // trigger without it would take that commit for news, so it goes.
-            if let Some(head) = trigger.commit.as_deref().and_then(head) {
+            // Under the lock, and only while no fire has written its own: a
+            // fire's head is newer. A trigger without either would take the
+            // commit there for news, so it goes.
+            if let Some(head) = seen {
                 let kept = Kept { head: Some(head) };
-                if let Err(error) = record_last(places, &trigger, &Value::Null, &kept) {
+                let recorded = Lock::take(places).and_then(|_lock| {
+                    if state(places, &trigger).is_null() {
+                        record_last(places, &trigger, &Value::Null, &kept)
+                    } else {
+                        Ok(())
+                    }
+                });
+                if let Err(error) = recorded {
                     let _ = remove(places, &trigger.name, &launchctl);
                     return Err(error);
                 }
@@ -2798,7 +2837,20 @@ mod tests {
         let log = when.watch.clone().unwrap();
         assert!(log.ends_with(".git/logs/HEAD") && log.exists());
         let first = head(&root).unwrap();
-        git(&["commit", "-q", "--allow-empty", "-m", "two"]);
+        // A long title in a legacy encoding: its log is not UTF-8.
+        let message = root.join("message");
+        let mut title = b"caf\xe9 ".to_vec();
+        title.extend([b'x'; 4096]);
+        std::fs::write(&message, title).unwrap();
+        git(&[
+            "-c",
+            "i18n.commitEncoding=ISO-8859-1",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-F",
+            message.to_str().unwrap(),
+        ]);
         let two = head(&root);
         assert_ne!(two.as_deref().unwrap(), first);
         // Checking out a commit that was there is a move, not a commit.

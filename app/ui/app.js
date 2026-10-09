@@ -2418,7 +2418,8 @@ function triggersHTML(st, busy) {
 }
 // Run now returns once launchd starts the fire, before it has sent anything: the row is read again, a little
 // later each time, until its last fire changes or it ends, while Settings stays open.
-const RUN_NOW_LOOKS = [500, 1000, 2000, 4000, 8000];
+// Waits between reads after Run now: it looks at 0.5, 1, 2, 4 and 8 s.
+const RUN_NOW_LOOKS = [500, 500, 1000, 2000, 4000];
 async function triggerAct(act, name) {
   const st = setupState();
   const lastOf = () => st.triggers?.find((x) => x.name === name)?.last?.fired_ms ?? null;
