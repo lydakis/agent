@@ -81,8 +81,10 @@ cap is reached its turns fail with `budget_exhausted`.
 2. **Finish the last run.** If the newest run record is not marked done:
    when it says posted or nothing to post, apply the bookmarks and ledger
    lines it lists and mark it done. Otherwise the post may or may not have
-   gone out, so look for its key at the destination (step 8). If it is
-   there, treat the run as posted. If a lookup the destination guarantees
+   gone out, so look for its key at the destination (step 8). If a post
+   with it is there, from the job's own account and with the text the
+   record planned, treat the run as posted; one from anyone else proves
+   nothing. If a lookup the destination guarantees
    is complete does not find it, mark the run done without applying
    anything, and this run reads those items again. If the lookup fails or
    may miss recent posts, leave the run open, do not post this run, and
@@ -101,7 +103,9 @@ cap is reached its turns fail with `budget_exhausted`.
    under `backlog/SOURCE/`, with the next page's cursor beside them, so the
    next run goes on from there instead of from the newest page; once the
    bookmark is reached, report from the saved pages oldest first, removing
-   each page once the bookmark has moved past it. Then look up each open item in the ledger again, since nothing
+   each page once the bookmark has moved past it. Keep at most the number of
+   pages `preferences.md` allows, or 50; a source further behind than that
+   is a failed read, with the person told it cannot catch up. Then look up each open item in the ledger again, since nothing
    new may have arrived about it.
 5. **A failed read is not a quiet day.** When a source errors, times out or
    its tool is missing, leave its bookmark where it is, write the rest from
@@ -119,7 +123,7 @@ cap is reached its turns fail with `budget_exhausted`.
    item out; do not hedge. Copy links from the source's own link field,
    never build them by hand.
 8. **Write the plan, then post once.** Before posting, write into the run
-   record the post's key, the new bookmark of each source read
+   record the post's key and text, the new bookmark of each source read
    successfully, and the ledger lines to add, change or remove. The key
    names the job and the run: the agent's name and the time the run started
    (step 3) to the minute, with the UTC offset, for example
