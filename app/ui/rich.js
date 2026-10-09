@@ -41,13 +41,15 @@ window.Rich = (() => {
   const pre = (text, lang) => `<pre class="code"><code>${codeHTML(text, lang)}</code></pre>`;
   const CHART = new Set(['vega-lite', 'vegalite', 'vl', 'vega']);
   const toggle = '<button type="button" data-rich="view"></button>';
-  // A diagram or chart shows its source until it is drawn. HTML in a message opens as code, its
-  // preview a click away: its scripts share the window's thread, so a page runs only when asked.
-  // `page` opens it as its preview, for a file someone opened.
+  // A diagram or chart shows its source until it is drawn. HTML and charts in a message open as code,
+  // their preview a click away: both run on the window's thread, and a page's script or a chart's
+  // transforms (a `sequence` of a billion rows, a tick count of a billion) can take it over, so they
+  // run only when asked. Mermaid bounds itself (`maxTextSize`, `maxEdges`) and draws on its own.
+  // `page` runs it at once, for a file someone opened.
   function block(text, info, page = false) {
     const lang = (info ?? '').trim().split(/\s+/)[0].toLowerCase();
     if (lang === 'mermaid' || lang === 'mmd') return `<div class="rc" data-kind="mermaid" data-lazy data-view="code">${head('mermaid', toggle)}<div class="view"></div>${pre(text, '')}</div>`;
-    if (CHART.has(lang)) return `<div class="rc" data-kind="chart" data-lang="${lang === 'vega' ? 'vega' : 'vega-lite'}" data-lazy data-view="code">${head(lang, toggle)}<div class="view"></div>${pre(text, 'json')}</div>`;
+    if (CHART.has(lang)) return `<div class="rc" data-kind="chart" data-lang="${lang === 'vega' ? 'vega' : 'vega-lite'}" data-lazy${page ? ' data-run' : ''} data-view="code">${head(lang, toggle)}<div class="view"></div>${pre(text, 'json')}</div>`;
     if (lang === 'html' || lang === 'htm') return `<div class="rc" data-kind="html" data-view="${page ? 'view' : 'code'}">${head(lang, '<button type="button" data-rich="view"></button>')}<div class="view frame"></div>${pre(text, 'xml')}</div>`;
     // An SVG draws as an image, which runs no script and loads nothing.
     if (lang === 'svg' && /^\s*(<\?xml[^>]*>\s*)?<svg\b/i.test(text)) return `<div class="rc" data-kind="svg" data-view="view">${head(lang, '<button type="button" data-rich="view"></button>')}<div class="view"><img alt="" src="data:image/svg+xml;charset=utf-8,${esc(encodeURIComponent(text))}"></div>${pre(text, 'xml')}</div>`;
@@ -130,17 +132,20 @@ window.Rich = (() => {
   }
   // A diagram or chart drawn to SVG once per source; one at a time, as Mermaid measures in a shared
   // scratch element. A source that does not draw keeps showing as code, the error in its head.
-  function drawLazy(box, src, make) {
+  // With `cached`, only one already drawn is shown: a chart drawn once, when asked, shows again.
+  function drawLazy(box, src, make, cached = false) {
     const key = `${box.dataset.kind}|${box.dataset.lang ?? ''}|${box.dataset.kind === 'chart' ? box.clientWidth : ''}|${src}`;
     const show = (svg) => settle(box, () => { box.querySelector('.view').innerHTML = svg; box.dataset.view = 'view'; box.dataset.drawn = ''; });
     if (diagrams.has(key)) { show(diagrams.get(key)); return; }
+    if (cached || 'asked' in box.dataset) return;
+    box.dataset.asked = '';
     mermaidChain = mermaidChain.then(() => make(src, box)).then((svg) => {
       if (!diagrams.has(key)) { diagrams.set(key, svg); diagramBytes += 2 * (key.length + svg.length); }
       while (diagrams.size > DIAGRAMS || (diagramBytes > DIAGRAM_BYTES && diagrams.size > 1)) {
         const [k, v] = diagrams.entries().next().value; diagrams.delete(k); diagramBytes -= 2 * (k.length + v.length);
       }
       show(svg);
-    }, (e) => { const l = box.querySelector('.rh .lang'); l.textContent = `${l.textContent.split(' · ')[0]} · ${String(e?.message ?? e).split('\n')[0].slice(0, 80)}`; });
+    }, (e) => { delete box.dataset.asked; const l = box.querySelector('.rh .lang'); l.textContent = `${l.textContent.split(' · ')[0]} · ${String(e?.message ?? e).split('\n')[0].slice(0, 80)}`; });
   }
   const mermaidSVG = (src) => mermaidReady().then((m) => m.render(`rich-mmd-${++diagramId}`, src)).then(({ svg }) => svg);
 
@@ -196,9 +201,9 @@ window.Rich = (() => {
   // what is read. The pane is the root: a margin around the window would be clipped by the pane's own
   // scrolling. Blocks a redraw took out of the pane are let go on the pane's next hydrate.
   const watchers = new Map();
-  function draw(box) {
+  function draw(box, cached = false) {
     const src = box.querySelector('pre').textContent;
-    drawLazy(box, src, box.dataset.kind === 'mermaid' ? mermaidSVG : chartSVG);
+    drawLazy(box, src, box.dataset.kind === 'mermaid' ? mermaidSVG : chartSVG, cached);
   }
   function watch(box) {
     const pane = box.closest('.scroll');
@@ -213,11 +218,13 @@ window.Rich = (() => {
     for (const b of w.boxes) if (!b.isConnected) { w.o.unobserve(b); w.boxes.delete(b); }
     w.boxes.add(box); w.o.observe(box);
   }
-  // After HTML from `html` is in the document: diagrams and charts start, and previews already open.
+  // After HTML from `html` is in the document: diagrams start, and charts and previews someone asked
+  // for show again.
   function hydrate(root) {
     for (const box of root.querySelectorAll('.rc[data-lazy]:not([data-on]), .rc[data-kind="html"]:not([data-on])')) {
       box.dataset.on = '';
-      if (box.dataset.kind !== 'html') watch(box);
+      if (box.dataset.kind === 'mermaid' || 'run' in box.dataset) watch(box);
+      else if (box.dataset.kind === 'chart') draw(box, true);
       else if (box.dataset.view === 'view' || ran.has(box.querySelector('pre').textContent)) { box.dataset.view = 'view'; mount(box); }
     }
   }
@@ -241,6 +248,8 @@ window.Rich = (() => {
     const box = b.closest('.rc');
     if (b.dataset.rich === 'copy') {
       navigator.clipboard?.writeText(box.querySelector('pre').textContent).then(() => { b.textContent = 'copied'; setTimeout(() => { b.textContent = 'copy'; }, 1200); }, () => {});
+    } else if (b.dataset.rich === 'view' && box.dataset.kind === 'chart' && !('drawn' in box.dataset)) {
+      draw(box);
     } else if (b.dataset.rich === 'view' && (!('lazy' in box.dataset) || 'drawn' in box.dataset)) {
       box.dataset.view = box.dataset.view === 'view' ? 'code' : 'view';
       // A preview shown runs; one hidden stops, scripts and all.

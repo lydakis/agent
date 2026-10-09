@@ -162,7 +162,9 @@ test('fenced blocks become code, previews, diagrams and images by their language
 
 test('charts, file links and opened files draw by kind', () => {
   const p = page(), Rich = p.context.Rich;
+  // A chart in a message draws when asked; one in a file someone opened draws at once.
   assert.match(Rich.html('```vega-lite\n{"mark":"bar"}\n```'), /data-kind="chart" data-lang="vega-lite" data-lazy data-view="code"/);
+  assert.match(Rich.file('/w/c.vl.json', new TextEncoder().encode('{}')).html, /data-kind="chart" data-lang="vega-lite" data-lazy data-run/);
   assert.match(Rich.html('```vega\n{}\n```'), /data-lang="vega"/);
   const links = Rich.html('[plan](PLAN.md) [code](src/a.rs:12) [line](src/b.rs#L4-L9) [web](https://example.com) [here](#top)');
   assert.match(links, /<a class="file" data-file="PLAN.md">plan<\/a>/);
@@ -208,6 +210,17 @@ test('drawing messages past the byte bound folds the oldest instead of keeping t
   assert.equal(t.items[0].kind, 'history');
   assert.ok(t.items.some((it) => it.kind === 'text' && it.html));
   assert.match(el.innerHTML, /earlier history/);
+});
+
+test('a step links the whole path it named, not its shortened summary', async () => {
+  const p = page(), long = `/w/${'d/'.repeat(200)}a.md`;
+  await p.onEvent({ event: 'tool_started', bot: 'Bob', turn: 1, data: { call_id: 'c1', name: 'read', arguments: JSON.stringify({ path: long }) } });
+  await p.onEvent({ event: 'tool_started', bot: 'Bob', turn: 1, data: { call_id: 'c2', name: 'shell', arguments: JSON.stringify({ command: 'ls', path: '/w/x' }) } });
+  const [read, shell] = p.transcript('Bob').items.filter((it) => it.kind === 'tool');
+  assert.equal(read.path, long); assert.ok(read.summary.length < long.length);
+  assert.equal(shell.path, undefined);
+  p.S.ui.steps = true;
+  assert.match(p.runHTML(p.transcript('Bob'), 0).html, new RegExp(`data-file="${long}"`));
 });
 
 test('a file opened from an agent closes when that agent is forgotten', () => {

@@ -366,6 +366,9 @@ function tree(all = false) {
   if (projects.size && out.length > loose) out.splice(loose, 0, { label: 'bots' });
   return out;
 }
+// The path a read, write or edit names, whole (the summary is cut for display); none when it cannot be one.
+const FILE_TOOLS = new Set(['read', 'write', 'edit']);
+const toolPath = (name, parsed) => FILE_TOOLS.has(name) && typeof parsed?.path === 'string' && parsed.path && parsed.path.length <= 4096 ? parsed.path : undefined;
 function callSummary(name, args) {
   let a = {}; try { a = JSON.parse(args) ?? {}; } catch (_) {}
   let s = name === 'shell' ? a.command ?? '' : ['read', 'write', 'edit'].includes(name) ? a.path ?? '' : name === 'wait' ? (Array.isArray(a.handles) ? a.handles : []).filter((h) => typeof h === 'string').map((h) => h.replace(/^turn:/, '')).join(', ') : args;
@@ -684,7 +687,7 @@ async function onEvent(ev) {
       let parsed = {}; try { parsed = JSON.parse(args) ?? {}; } catch (_) {}
       const tname = data.name ?? 'tool';
       const t = transcript(name);
-      const row = { kind: 'tool', from: t.callNode, callId: data.call_id, name: tname, summary: callSummary(tname, args), background: tname === 'shell' && parsed.background === true, done: false, started: S.live ? Date.now() : 0, took: 0, turn };
+      const row = { kind: 'tool', from: t.callNode, callId: data.call_id, name: tname, summary: callSummary(tname, args), path: toolPath(tname, parsed), background: tname === 'shell' && parsed.background === true, done: false, started: S.live ? Date.now() : 0, took: 0, turn };
       let existing = null;
       for (let i = t.items.length - 1; i >= 0; i--) {
         const it = t.items[i]; if (it.turn !== turn) break;
@@ -702,7 +705,7 @@ async function onEvent(ev) {
       for (let i = t.items.length - 1; i >= 0; i--) { const it = t.items[i]; if ((it.kind === 'tool' || it.kind === 'tool_stub') && it.turn === turn && it.callId === data.call_id) { call = it; break; } }
       if (call) { call.done = true; if (call.started) call.took = Date.now() - call.started; call.started = 0; patchRun(name, call); }
       const shown = S.ui.file;
-      if (shown && (call?.name === 'write' || call?.name === 'edit') && joinPath(bot(name)?.workspace ?? S.config?.workspace ?? '', call.summary) === shown.full) openFile(shown.bot, shown.full);
+      if (shown && call?.path && (call.name === 'write' || call.name === 'edit') && joinPath(bot(name)?.workspace ?? S.config?.workspace ?? '', call.path) === shown.full) openFile(shown.bot, shown.full);
       if (typeof data.node === 'number') {
         pushNode(t, { kind: 'node', node: data.node, callId: data.call_id, turn });
         if (call && (call.background || call.name === 'wait') && await loadWaitOrProc(name, data.node, call)) {
@@ -824,7 +827,7 @@ function applyWaitOrProc(name, item, call, node) {
 }
 function storedTool(name, callId, args) {
   let parsed = {}; try { parsed = JSON.parse(args) ?? {}; } catch (_) {}
-  return { kind: 'tool', name, callId, summary: callSummary(name, args), background: name === 'shell' && parsed.background === true, done: true, started: 0, took: 0 };
+  return { kind: 'tool', name, callId, summary: callSummary(name, args), path: toolPath(name, parsed), background: name === 'shell' && parsed.background === true, done: true, started: 0, took: 0 };
 }
 function entries(item) {
   const out = [];
@@ -1329,8 +1332,7 @@ function runHTML(t, s, limit = t.items.length) {
   return { html: `<div class="steps" data-i="${s}"><div class="sum" data-run="${s}" role="button" tabindex="0">${open ? '▾' : '▸'} ${head}</div>${body}</div>`, end };
 }
 // A read, write or edit names its path; it opens that file beside.
-const FILE_TOOLS = new Set(['read', 'write', 'edit']);
-const summaryHTML = (it) => FILE_TOOLS.has(it.name) && it.summary ? `<span class="fpath" data-file="${esc(it.summary)}">${esc(it.summary)}</span>` : esc(it.summary);
+const summaryHTML = (it) => it.path ? `<span class="fpath" data-file="${esc(it.path)}">${esc(it.summary)}</span>` : esc(it.summary);
 function stepHTML(it, i) {
   switch (it.kind) {
     case 'thought': return `<div class="line think">${esc(it.text)}</div>`;

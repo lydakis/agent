@@ -115,7 +115,8 @@ button:focus-visible,[tabindex]:focus-visible{outline:1px solid var(--amber);out
 .rc:not([data-view=view]) [data-rich=view]::after{content:'preview'}
 .rc[data-kind=mermaid]:not([data-view=view]) [data-rich=view]::after{content:'diagram'}
 .rc[data-kind=chart]:not([data-view=view]) [data-rich=view]::after{content:'chart'}
-.rc[data-lazy]:not([data-drawn]) [data-rich=view]{display:none}
+.rc[data-kind=mermaid]:not([data-drawn]) [data-rich=view]{display:none}
+.rc[data-asked]:not([data-drawn]) [data-rich=view]::after{content:'drawing…'}
 .rc pre.code{margin:0;padding:6px 10px;white-space:pre;overflow-x:auto;font:inherit;scrollbar-width:thin;scrollbar-color:var(--t-line) transparent}
 .rc[data-view=view]>pre,.rc:not([data-view=view])>.view{display:none}
 .rc .view{padding:12px;overflow:auto;text-align:center}
