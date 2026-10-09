@@ -26,7 +26,8 @@ for each agent.
    ```
 
    Options: `--parallel N` agents at once (default 16, at most 64),
-   `--max-agents N` for the whole run (default 100, at most 1000), `--timeout`
+   `--max-agents N` for the whole run, resumes included (default 100, at
+   most 1000), `--timeout`
    (default `24h`), `--agent-budget-tokens N` for any agent without its own.
 3. Carry on or end your turn. The result arrives as a new message, sent from
    the turn that started the run, that begins `Workflow run audit-api ended`,
@@ -34,7 +35,8 @@ for each agent.
    `result.json`, `events.jsonl` and `log`.
 
 `workflow.py status [NAME] [--agents] [--pretty]` shows progress and
-`workflow.py stop NAME` stops a run, interrupting its agents.
+`workflow.py stop NAME` stops a run, interrupting its agents; a plan busy
+outside `agent()` gets 5 seconds before the run ends without it.
 
 ## The plan
 
@@ -90,8 +92,9 @@ result = {"real": [c for c, v in zip(claims, checks) if v.ok and v.text.startswi
 - Routing, filtering, deduplicating and counting are plain Python, which
   costs nothing. Keep them out of prompts.
 - Label every agent when a run may need resuming. Starting the plan again with
-  the same `--name` reuses finished agents whose label and prompt match,
-  waits again for ones still running and reruns the rest.
+  the same `--name` from the same folder and model reuses finished agents
+  whose label and settings match, waits again for ones still running and
+  reruns the rest. It does not notice edited AGENTS.md or skill files.
 - Runs do not nest: an agent of a run cannot start one.
 - Every agent costs tokens. Try a small run first and set budgets.
 - Each agent stays a bot, named `YOU-NAME.LABEL` after you, the run and its

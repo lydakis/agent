@@ -120,6 +120,29 @@ class Pieces(unittest.TestCase):
         with self.assertRaises(workflow.Refused):
             workflow.flags(['--nope'], ())
 
+    def test_history_waits_on_the_latest_reply_asked_for(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            started = {'event': 'agent_started', 'label': 'x', 'bot': 'r.x', 'bot_id': 7, 'key': 'k'}
+            lines = [{**started, 'handle': 'turn:r.x/1', 'attempts': 0},
+                     {**started, 'handle': 'turn:r.x/2', 'attempts': 1}]
+            (folder / 'events.jsonl').write_text(''.join(json.dumps(line) + '\n' for line in lines) + '{"cut')
+            records, bots = workflow.history(folder)
+            self.assertEqual((records['x']['handle'], records['x']['attempts']), ('turn:r.x/2', 1))
+            self.assertEqual(bots, {'r.x': 7})
+
+    def test_one_runner_holds_a_run(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            self.assertIsNone(workflow.runner(folder))
+            held = workflow.claim(folder)
+            self.assertEqual(workflow.runner(folder), os.getpid())
+            # flock is per open file, so a second claim in this process is refused like another's.
+            self.assertIsNone(workflow.claim(folder))
+            held.close()
+            self.assertIsNone(workflow.runner(folder))
+            workflow.claim(folder).close()
+
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class Runs(unittest.TestCase):
@@ -168,11 +191,11 @@ class Runs(unittest.TestCase):
         path.write_text(text)
         return path
 
-    def start(self, plan, *args, background=False):
+    def start(self, plan, *args, background=False, cwd=None):
         command = [sys.executable, str(RUNNER), 'start', str(plan), *args]
         if background:
             return subprocess.Popen(command, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        done = subprocess.run(command, env=self.env, capture_output=True, text=True, timeout=60)
+        done = subprocess.run(command, env=self.env, capture_output=True, text=True, timeout=60, cwd=cwd)
         return done.returncode, json.loads(done.stdout) if done.stdout.strip() else json.loads(done.stderr)
 
     def folder(self, name):
@@ -235,6 +258,9 @@ result = [first.text, second.ok]
         self.assertEqual(self.result('again'), ['one', True])
         self.assertEqual(self.model.prompts[asked:], ['say:two'])
         self.assertIn('again.two.2', {b['name'] for b in self.agent('ls')})
+        # From another folder an agent would work elsewhere, so none is reused.
+        status, summary = self.start(plan, '--name', 'again', cwd=self.home)
+        self.assertEqual((status, summary['agents']['reused'], summary['agents']['started']), (0, 0, 2))
 
     def test_stop_interrupts_running_agents_and_ends_the_run_stopped(self):
         plan = self.plan('''
@@ -259,6 +285,22 @@ result = "unreachable"
         statuses = {e['label']: e['status'] for e in self.events('halt') if e['event'] == 'agent_finished'}
         self.assertEqual(statuses, {'hold-a': 'interrupted', 'hold-b': 'interrupted'})
         self.assertNotIn('say:never', self.model.prompts)
+
+    def test_a_plan_busy_outside_agent_is_stopped_and_one_runner_holds_a_run(self):
+        plan = self.plan('import time\ntime.sleep(600)\nresult = 1\n')
+        runner = self.start(plan, '--name', 'busy', background=True)
+        self.addCleanup(runner.kill)
+        for _ in range(200):
+            if workflow.runner(self.folder('busy')):
+                break
+            time.sleep(.05)
+        status, refused = self.start(plan, '--name', 'busy')
+        self.assertEqual((status, refused['error']), (1, 'run_running'))
+        subprocess.run([sys.executable, str(RUNNER), 'stop', 'busy'], env=self.env, timeout=30, check=True,
+                       capture_output=True)
+        out, _ = runner.communicate(timeout=30)
+        self.assertEqual(json.loads(out)['status'], 'stopped')
+        self.assertIsNone(workflow.runner(self.folder('busy')))
 
     def test_a_daemon_restart_mid_run_is_waited_through(self):
         plan = self.plan('''
@@ -291,6 +333,12 @@ while True:
         status, summary = self.start(plan, '--name', 'loop', '--max-agents', '3')
         self.assertEqual((status, summary['status'], summary['error']), (1, 'failed', 'max_agents'))
         self.assertEqual(summary['agents']['started'], 3)
+        # The bound is the run's: resumed, it reuses the three and starts no more.
+        asked = len(self.model.prompts)
+        status, summary = self.start(plan, '--name', 'loop', '--max-agents', '3')
+        self.assertEqual((summary['error'], summary['agents']['reused'], summary['agents']['started']),
+                         ('max_agents', 3, 0))
+        self.assertEqual(len(self.model.prompts), asked)
         status, summary = self.start(self.plan('x = 1\n', 'empty.py'), '--name', 'empty')
         self.assertEqual((summary['status'], summary['error']), ('failed', 'no_result'))
         status, refused = self.start(self.plan('def (', 'broken.py'))

@@ -16,6 +16,7 @@ one process however many agents it waits for.
 
 Standard library only, and Python 3.9 (the macOS Command Line Tools').
 """
+import fcntl
 import hashlib
 import json
 import os
@@ -37,6 +38,7 @@ REPORT_BYTES = 8 * 1024
 # A run past this many agents is a runaway loop, whatever --max-agents says.
 AGENT_CEILING = 1000
 SUMMARY_INTERVAL = 0.25
+STOP_GRACE = 5  # seconds a stopped plan has to reach its next agent()
 USAGE = __doc__.split('\n\n')[1]
 
 
@@ -99,7 +101,7 @@ class Waiter:
     def __init__(self, path, ended):
         self.path, self.ended = path, ended
         self.lock = threading.Lock()
-        self.pending, self.next, self.file = {}, 0, None
+        self.pending, self.next, self.file, self.gone = {}, 0, None, False
         self.attach(self.connect())
 
     def connect(self):
@@ -116,15 +118,15 @@ class Waiter:
             self.file = file
             again = [(id, entry[0]) for id, entry in self.pending.items()]
         threading.Thread(target=self.read, args=(file,), daemon=True).start()
-        for id, handle in again:
-            self.send(id, handle)
+        for id, body in again:
+            self.send(id, body)
 
-    def send(self, id, handle):
+    def send(self, id, body):
         with self.lock:
             if self.file is None:
                 return  # asked again once the connection is back
             try:
-                self.file.write(json.dumps({'id': id, 'op': 'wait', 'handles': [handle]}) + '\n')
+                self.file.write(json.dumps({'id': id, **body}) + '\n')
                 self.file.flush()
             except OSError:
                 pass  # the reader sees the same failure and reconnects
@@ -156,28 +158,35 @@ class Waiter:
 
     def abandon(self):
         with self.lock:
-            entries, self.pending = list(self.pending.values()), {}
+            entries, self.pending, self.gone = list(self.pending.values()), {}, True
         for entry in entries:
             entry[2] = {'error': 'daemon_unreachable', 'detail': f'lost {self.path}'}
             entry[1].set()
 
-    def wait(self, handle):
-        entry = [handle, threading.Event(), None]
+    def request(self, body):
+        """One protocol request; its result, or Refused."""
+        entry = [body, threading.Event(), None]
         with self.lock:
+            if self.gone:
+                raise Refused('daemon_unreachable', f'lost {self.path}')
             self.next += 1
             id = self.next
             self.pending[id] = entry
-        self.send(id, handle)
-        # Timed, so a stop signal reaches the main thread while it waits.
-        while not entry[1].wait(1):
-            pass
+        self.send(id, body)
+        entry[1].wait()
         reply = entry[2]
-        if 'error' in reply:
-            error = reply['error']
+        error = reply.get('error')
+        if error is not None:
             if isinstance(error, dict):
-                return {'error': error.get('error', 'wait_failed'), 'detail': error.get('detail')}
-            return {'error': error, 'detail': reply.get('detail')}
-        return reply['result']['results'][handle]
+                raise Refused(error.get('error', 'request_failed'), error.get('detail'))
+            raise Refused(error, reply.get('detail'))
+        return reply['result']
+
+    def wait(self, handle):
+        try:
+            return self.request({'op': 'wait', 'handles': [handle]})['results'][handle]
+        except Refused as refused:
+            return {'error': refused.body['error'], 'detail': refused.body['detail']}
 
 
 class Result:
@@ -261,7 +270,9 @@ class Run:
         # What an earlier runner of this run recorded: the last record of
         # each label, and every bot it made, whose names stay taken.
         self.earlier, self.earlier_bots = earlier, earlier_bots
-        self.bot_ids = set(earlier_bots.values())
+        self.bots = dict(earlier_bots)
+        # --max-agents bounds the run, so the agents earlier runners made count.
+        self.made = len(earlier_bots)
         self.counts = {'started': 0, 'running': 0, 'completed': 0, 'failed': 0, 'reused': 0}
         self.phases, self.phase_now = [], None
         self.started_ms, self.ended_ms = now_ms(), None
@@ -269,7 +280,7 @@ class Run:
         self.end = None  # RunEnded once stopping
         self.events = open(folder / 'events.jsonl', 'a', encoding='utf-8')
         self.logfile = open(folder / 'log', 'a', encoding='utf-8')
-        self.dirty = threading.Event()
+        self.dirty, self.writing = threading.Event(), threading.Lock()
         self.waiter = Waiter(socket_path, lambda: self.end is not None)
 
     # The record of the run: an event per change, and the summary now.
@@ -294,11 +305,14 @@ class Run:
                     'phases': [dict(p) for p in self.phases], 'agents': dict(self.counts),
                     'tokens_used': self.tokens, 'options': self.options}
 
-    def write_summary(self):
-        target = self.dir / 'run.json'
-        temporary = self.dir / f'.run.json.{os.getpid()}'
-        temporary.write_text(json.dumps(self.summary(), indent=1) + '\n')
-        os.replace(temporary, target)
+    def write_summary(self, final=False):
+        with self.writing:
+            # The end's summary is the last; a periodic one after it would be stale.
+            if not final and self.status != 'running':
+                return
+            temporary = self.dir / f'.run.json.{os.getpid()}'
+            temporary.write_text(json.dumps(self.summary(), indent=1) + '\n')
+            os.replace(temporary, self.dir / 'run.json')
 
     def summaries(self):
         # At most one summary write per interval, however many agents finish.
@@ -358,16 +372,20 @@ class Run:
             self.labels.add(label)
             phase = phase or self.phase_now
         budget_tokens = budget_tokens or self.options['agent_budget_tokens']
+        # What a new agent would get, defaults included: a run resumed from
+        # another folder or model starts its agents afresh.
+        context = [os.getcwd(), os.environ.get('AGENT_MODEL'), os.environ.get('AGENT_REASONING')]
         key = hashlib.sha256(json.dumps([prompt, schema, model, effort, budget_tokens, profile, instructions,
-                                         workspace, tools], sort_keys=True).encode()).hexdigest()[:16]
+                                         workspace, tools, context], sort_keys=True).encode()).hexdigest()[:16]
         before = self.earlier.get(label)
         if before and before.get('key') == key and before.get('ok'):
             result = Result(**{**before, 'reused': True, 'phase': phase})
             self.finished(result, key)
             return result
-        self.admit()
+        waiting = before and before.get('key') == key and before.get('handle') and before.get('ok') is None
+        self.admit(new=not waiting)
         try:
-            if before and before.get('key') == key and before.get('handle') and before.get('ok') is None:
+            if waiting:
                 # Still running when an earlier runner ended: wait for that turn again.
                 result = self.follow(label, phase, before, schema, retries, key)
             else:
@@ -379,11 +397,12 @@ class Run:
         self.finished(result, key)
         return result
 
-    def admit(self):
+    def admit(self, new):
         with self.lock:
-            if self.counts['started'] >= self.options['max_agents']:
-                raise RunEnded('failed', 'max_agents',
-                               f'the plan started more than {self.options["max_agents"]} agents (--max-agents)')
+            if new and self.made >= self.options['max_agents']:
+                raise RunEnded('failed', 'max_agents', f'the run started more than {self.options["max_agents"]} '
+                               'agents (--max-agents), counting those of earlier runners of it')
+            self.made += new
             self.counts['started'] += 1
         while not self.slots.acquire(timeout=1):
             if self.end:
@@ -428,15 +447,16 @@ class Run:
         bot, bot_id, handle = worker['bot'], worker['bot_id'], worker['handle']
         with self.lock:
             self.running[bot] = bot_id
-            self.bot_ids.add(bot_id)
+            self.bots[bot] = bot_id
             self.counts['running'] += 1
             self.phase_of(phase)['agents'] += 1
             # Made while the run was stopping, after stop() listed the running.
             late = self.end is not None
-        self.record('agent_started', label=label, bot=bot, bot_id=bot_id, handle=handle, phase=phase, key=key)
+        attempts = worker.get('attempts') or 0
+        self.record('agent_started', label=label, bot=bot, bot_id=bot_id, handle=handle, phase=phase, key=key,
+                    attempts=attempts)
         if late:
             self.interrupt(bot)
-        attempts = 0
         try:
             while True:
                 attempts += 1
@@ -466,6 +486,9 @@ class Run:
                     result.detail += f'; asking again failed: {refused.body["detail"]}'
                     return result
                 handle = again['handle']
+                # So a resumed run waits for this reply rather than asking again.
+                self.record('agent_started', label=label, bot=bot, bot_id=bot_id, handle=handle, phase=phase,
+                            key=key, attempts=attempts)
         finally:
             with self.lock:
                 self.running.pop(bot, None)
@@ -553,19 +576,39 @@ class Run:
                 time.sleep(self.options['timeout'])
                 self.stop('failed', 'timeout', f'the run passed --timeout {self.options["timeout_text"]}')
             threading.Thread(target=deadline, daemon=True).start()
+        raised = []
+
+        def body():
+            try:
+                exec(code, namespace)
+            except BaseException as caught:  # RunEnded, and a plan's sys.exit() too
+                raised.append(caught)
+                if not isinstance(caught, RunEnded):
+                    self.log(traceback.format_exc())
+        # The plan runs on its own thread, so a stop ends the run even while
+        # the plan is busy outside agent(): it gets STOP_GRACE to get there.
+        plan = threading.Thread(target=body, daemon=True)
+        plan.start()
+        given_up = None
+        while plan.is_alive():
+            plan.join(.25)
+            if self.end and given_up is None:
+                given_up = time.monotonic() + STOP_GRACE
+            if given_up and time.monotonic() > given_up:
+                self.log(f'the plan did not stop within {STOP_GRACE}s; ending without it')
+                break
         result, status, error, detail = None, 'completed', None, None
-        try:
-            exec(code, namespace)
-            if 'result' not in namespace:
-                status, error, detail = 'failed', 'no_result', 'the plan ended without setting `result`'
-            else:
-                result = namespace['result']
-        except RunEnded as end:
-            status, error, detail = end.status, end.error, end.detail
-        except Exception as caught:
+        if plan.is_alive():
+            pass  # ended by self.end below
+        elif raised and isinstance(raised[0], RunEnded):
+            status, error, detail = raised[0].status, raised[0].error, raised[0].detail
+        elif raised:
             status, error = 'failed', 'plan_error'
-            detail = ''.join(traceback.format_exception_only(type(caught), caught)).strip()
-            self.log(traceback.format_exc())
+            detail = ''.join(traceback.format_exception_only(type(raised[0]), raised[0])).strip()
+        elif 'result' not in namespace:
+            status, error, detail = 'failed', 'no_result', 'the plan ended without setting `result`'
+        else:
+            result = namespace['result']
         if self.end and status == 'completed':
             status, error, detail = self.end.status, self.end.error, self.end.detail
         return self.finish(result, status, error, detail)
@@ -576,20 +619,31 @@ class Run:
         except (TypeError, ValueError) as unfit:
             text, status, error, detail = 'null', 'failed', 'result_not_json', str(unfit)
         (self.dir / 'result.json').write_text(text + '\n')
-        try:
-            self.tokens = sum(b.get('tokens_used') or 0 for b in self.send('ls') if b['id'] in self.bot_ids)
-        except (Refused, ValueError, OSError) as unread:
-            self.log(f'tokens: {unread}')
+        self.tokens = self.usage()
         with self.lock:
             self.status, self.error, self.detail, self.ended_ms = status, error, detail, now_ms()
             if self.phases and self.phases[-1].get('ended_ms') is None:
                 self.phases[-1]['ended_ms'] = self.ended_ms
         self.end = self.end or RunEnded(status)
         self.record('run_ended', status=status, error=error, detail=detail, tokens_used=self.tokens)
-        self.write_summary()
+        self.write_summary(final=True)
         self.dirty.set()
         self.report(text)
         return self.summary()
+
+    def usage(self):
+        """Tokens the run's agents used, asked of each by name, so the cost
+        follows the run's size rather than the store's."""
+        total = 0
+        for bot, bot_id in list(self.bots.items()):
+            try:
+                found = self.waiter.request({'op': 'resume', 'bot': bot})
+            except Refused as unread:
+                self.log(f'tokens of {bot}: {unread}')
+                continue
+            if found.get('id') == bot_id:  # else deleted, and the name reused
+                total += found.get('tokens_used') or 0
+        return total
 
     def report(self, text):
         if not self.lead:
@@ -633,21 +687,52 @@ def history(folder):
         if event['event'] == 'agent_started':
             bots[event['bot']] = event['bot_id']
             records[event['label']] = {name: event.get(name) for name in
-                                       ('label', 'bot', 'bot_id', 'handle', 'key')}
+                                       ('label', 'bot', 'bot_id', 'handle', 'key', 'attempts')}
         elif event['event'] == 'agent_finished':
             records[event['label']] = {name: event.get(name) for name in (*Result.FIELDS, 'key')
                                        if name in event}
     return records, bots
 
 
-def alive(pid):
+def claim(folder):
+    """Lock the run for this process's life: one runner per run, and the
+    proof `status` and `stop` read that it is still this runner. The file
+    holds its pid. None when another runner holds it."""
+    held = open(folder / 'lock', 'a+', encoding='utf-8')
+    for _ in range(10):  # past a `runner()` look at the same moment
+        try:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            time.sleep(.02)
+    else:
+        held.close()
+        return None
+    held.truncate(0)
+    held.write(str(os.getpid()))
+    held.flush()
+    return held
+
+
+def runner(folder):
+    """The pid of the runner holding a run, or None when none does."""
     try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
+        lock = open(folder / 'lock', encoding='utf-8')
+    except FileNotFoundError:
+        return None
+    with lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            return None
+        except BlockingIOError:
+            pass
+        for _ in range(50):  # a runner that has just taken the lock writes its pid next
+            pid = lock.read().strip()
+            if pid.isdigit():
+                return int(pid)
+            lock.seek(0)
+            time.sleep(.01)
+        return None
 
 
 def read_summary(folder):
@@ -714,24 +799,22 @@ def start(argv):
                           hint='start it with the shell tool\'s detach: true; its result arrives as a message')
         lead = {'bot': os.environ['AGENT_BOT'], 'bot_id': int(os.environ['AGENT_BOT_ID'])}
         nested(lead['bot_id'])
-    name = found.get('--name') or time.strftime('wf-%Y%m%d-%H%M%S')
+    name = found.get('--name') or time.strftime('wf-%Y%m%d-%H%M%S-') + str(os.getpid())
     if not NAME.fullmatch(name):
         raise Refused('usage', f'run name {name!r}: use 1-48 of A-Z a-z 0-9 _ -', 2)
     if len(worker_prefix(name, lead)) > 60:
         raise Refused('usage', f'agent names start {worker_prefix(name, lead)!r}, which leaves too little of '
                       'the 128 a name may have for labels', 2, hint='pick a shorter --name')
     folder = home() / name
-    earlier, earlier_bots = {}, {}
-    try:
-        folder.mkdir(parents=True)
-    except FileExistsError:
-        before = read_summary(folder) or {}
-        if before.get('status') == 'running' and alive(before.get('pid', 0)):
-            raise Refused('run_running', f'run {name} is running (pid {before["pid"]})',
-                          hint=f'workflow.py stop {name}, or pick another --name')
-        earlier, earlier_bots = history(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    held = claim(folder)
+    if held is None:
+        raise Refused('run_running', f'run {name} is running (pid {runner(folder)})',
+                      hint=f'workflow.py stop {name}, or pick another --name')
+    earlier, earlier_bots = history(folder)
     socket_path = cli('start')['socket']
     run = Run(name, folder, plan, options, socket_path, lead, earlier, earlier_bots)
+    run.held = held
     # Off the handler: it interrupts the main thread, which may hold the lock.
     signal.signal(signal.SIGTERM, lambda *_: threading.Thread(
         target=run.stop, args=('stopped', None, 'stopped by request'), daemon=True).start())
@@ -740,8 +823,7 @@ def start(argv):
 
 def nested(bot_id):
     for folder in home().iterdir() if home().is_dir() else ():
-        before = read_summary(folder)
-        if before and before.get('status') == 'running' and alive(before.get('pid', 0)):
+        if runner(folder):
             _, bots = history(folder)
             if bot_id in bots.values():
                 raise Refused('nested_run', f'this bot is an agent of run {folder.name}; runs do not nest',
@@ -752,19 +834,22 @@ def status(argv):
     found, positional = flags(argv, (), ('--agents', '--pretty'))
     if len(positional) > 1:
         raise Refused('usage', 'status takes at most one run name', 2)
-    if positional:
-        folder = home() / positional[0]
+    def current(folder):
         summary = read_summary(folder)
-        if summary is None:
-            raise Refused('run_not_found', f'no run {positional[0]} in {home()}')
-        if summary['status'] == 'running' and not alive(summary['pid']):
+        if summary and summary['status'] == 'running' and not runner(folder):
             summary['status'], summary['error'] = 'failed', 'runner_gone'
             summary['detail'] = 'its runner exited without recording an end; start the plan again to resume it'
+        return summary
+    if positional:
+        folder = home() / positional[0]
+        summary = current(folder)
+        if summary is None:
+            raise Refused('run_not_found', f'no run {positional[0]} in {home()}')
         if '--agents' in found:
             summary['agent_records'] = list(history(folder)[0].values())
         runs = [summary]
     else:
-        runs = [s for s in (read_summary(f) for f in sorted(home().iterdir())) if s] if home().is_dir() else []
+        runs = [s for s in map(current, sorted(home().iterdir())) if s] if home().is_dir() else []
     if '--pretty' not in found:
         print(json.dumps(runs[0] if positional else runs, indent=1))
         return 0
@@ -785,13 +870,14 @@ def stop(argv):
     _, positional = flags(argv, ())
     if len(positional) != 1:
         raise Refused('usage', 'stop takes one run name', 2)
-    summary = read_summary(home() / positional[0])
+    folder = home() / positional[0]
+    summary = read_summary(folder)
     if summary is None:
         raise Refused('run_not_found', f'no run {positional[0]} in {home()}')
-    stopping = summary['status'] == 'running' and alive(summary['pid'])
-    if stopping:
-        os.kill(summary['pid'], signal.SIGTERM)
-    print(json.dumps({'run': positional[0], 'stopping': stopping, 'status': summary['status']}))
+    pid = runner(folder)
+    if pid:
+        os.kill(pid, signal.SIGTERM)
+    print(json.dumps({'run': positional[0], 'stopping': bool(pid), 'status': summary['status']}))
     return 0
 
 

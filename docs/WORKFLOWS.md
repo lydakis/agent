@@ -63,16 +63,31 @@ moves fan-out, routing and counting into code the model writes once.
   `BaseException` a plan's `except Exception` does not catch.
 - **The record.** `~/.agent/workflows/NAME/` holds `run.json` (state now,
   written at most every 250 ms), `events.jsonl` (an event per phase, agent
-  start and end, and log line), `result.json` and `log`.
+  start and end, reply asked for again, and log line), `result.json`, `log`
+  and `lock`. The runner holds `lock` (an flock, with its pid) while it
+  runs, so a second runner of the same run is refused (`run_running`), and
+  `status` and `stop` know the runner from the lock, never from a pid alone
+  that the system may have reused.
+- **Tokens.** At the end the runner asks the daemon for each of its agents
+  by name and sums their `tokens_used`: one small request per agent, not a
+  listing of the store.
 - **Resuming.** Starting the same plan with the same `--name` reads
   `events.jsonl`: a labelled agent whose prompt and settings hash the same
   and finished `ok` is reused without a model call, one still running when
-  the last runner ended is waited on again, and others get a new bot
-  (`LABEL.2`). Labels made up by the runner follow call order, which threads
-  make unstable, so only labelled agents are reliably reused.
+  the last runner ended is waited on again (the latest reply asked for, so a
+  schema retry is not asked twice), and others get a new bot (`LABEL.2`).
+  The settings include the defaults a new agent would take: the folder the
+  runner starts in, `AGENT_MODEL` and `AGENT_REASONING`. The contents of
+  AGENTS.md and skills are not hashed. Labels made up by the runner follow
+  call order, which threads make unstable, so only labelled agents are
+  reliably reused. `--max-agents` counts every agent the run has made,
+  earlier runners' included, so resuming a failing plan does not start
+  another hundred.
 - **Stopping.** `workflow.py stop NAME` sends the runner SIGTERM; it
   interrupts every running agent and ends `stopped`. The timeout (default
-  24 h) does the same, ending `failed` with `timeout`.
+  24 h) does the same, ending `failed` with `timeout`. The plan runs on its
+  own thread; one busy outside `agent()` gets 5 s to reach it, and then the
+  run ends without it.
 - **No nesting.** An agent of a running run cannot start one.
 
 ## Cost
