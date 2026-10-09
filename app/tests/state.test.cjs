@@ -155,6 +155,9 @@ test('fenced blocks become code, previews, diagrams and images by their language
   assert.match(Rich.html('```html\n<!doctype html><body><b>hi</b></body>\n```'), /data-kind="html" data-view="code".*&lt;b&gt;hi&lt;\/b&gt;/s);
   assert.match(Rich.html('```html\n<b>hi</b>\n```'), /data-kind="html" data-view="code"/);
   assert.match(Rich.html('```mermaid\ngraph TD\nA-->B\n```'), /data-kind="mermaid".*A--&gt;B/s);
+  // A diagram in a message draws when asked; one in a file someone opened draws at once.
+  assert.match(Rich.html('```mermaid\ngraph TD\n```'), /data-kind="mermaid" data-lazy data-view="code"/);
+  assert.match(Rich.file('/w/flow.mmd', new TextEncoder().encode('graph TD')).html, /data-kind="mermaid" data-lazy data-run/);
   const svg = Rich.html('```svg\n<svg xmlns="http://www.w3.org/2000/svg"><circle r="4"/></svg>\n```');
   // An SVG draws as an image, and in a message only when asked: its filters and animations take CPU.
   assert.match(svg, /data-kind="svg" data-view="code"/);

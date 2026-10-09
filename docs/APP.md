@@ -1143,8 +1143,11 @@ pane drawn again reuses it. Fenced blocks are drawn by their language:
   names its language or is left plain; nothing guesses. Blocks over 64 KiB
   stay plain.
 - **`mermaid`** draws as a diagram with [Mermaid](https://mermaid.js.org),
-  themed to the window, with its source a click away. A diagram that does not
-  parse stays as its source with the parser's message in the block's head.
+  themed to the window. In a message it opens as its source and draws with a
+  click on **diagram**: Mermaid lays out on the window's thread, and a few
+  characters (`block-beta` with `space:500000`) can hold it for minutes. A
+  diagram that does not parse stays as its source with the parser's message
+  in the block's head.
 - **`vega-lite`** (or `vl`, or `vega` for a full Vega spec) draws as a chart
   with [Vega](https://vega.github.io), as static SVG in the window's colors:
   an eight-hue categorical order validated for color-vision deficiency
@@ -1172,11 +1175,12 @@ also draw, and an HTML preview can still draw a chart with its own inline
 SVG or canvas.
 
 Highlighting, Mermaid and Vega load the first time something needs them;
-marked loads with the page. A diagram draws when it comes within 400 px of
-the screen, so opening a long chat draws only what is read, and a reader
-below one that draws keeps their place. Mermaid bounds its own work (50,000
-characters and 500 edges by default). Drawn diagrams and charts are kept by
-source (a chart also by its width) for redraws: at most 64 and 8 MiB. A
+marked loads with the page. Nothing in a message draws until asked, so
+opening a long chat draws nothing, and a reader below a block that draws
+keeps their place. Mermaid's own limits (50,000 characters, 500 edges) do
+not bound its layout work, which is why a diagram waits for a click. Drawn
+diagrams and charts are kept by source (a chart also by its width) and show
+again when their pane is redrawn: at most 64 and 8 MiB. A
 message's drawn HTML counts toward the chat's 8 MiB of decoded bodies, and
 drawing past that folds the oldest bodies as a load would. All are vendored
 under `app/ui/vendor` (versions
@@ -1189,10 +1193,11 @@ path is the agent's folder's, and a link inside an open file is relative to
 that file. The core reads the first 4 MiB of a regular file (`read_file`; a
 FIFO or device is refused, as reading one need not end, and a window on a
 host is refused by name, as its files are the host's). The file draws by its
-kind: Markdown, a diagram (`.mmd`, `.mermaid`), a chart (`.vl.json`,
-`.vg.json`, drawn at once), a page (`.html`, opened as its preview; opening
-the file is the asking), an SVG or image, a CSV or TSV as a table of its first 1,000 rows and 256 columns
-(quoted fields kept whole), a binary file as its size,
+kind: Markdown, a diagram (`.mmd`, `.mermaid`) or a chart (`.vl.json`,
+`.vg.json`), drawn at once, a page (`.html`, opened as its preview), an SVG
+or image (opening the file is the asking), a CSV or TSV as a table of its
+first 1,000 rows and 256 columns (quoted fields kept whole), a binary file
+as its size,
 anything else as code highlighted by its extension. Esc or ✕ closes it and
 brings back the task that was beside, if any. A write or edit to the open
 file reads it again; deleting the agent it came from, or attaching to another
@@ -1244,11 +1249,13 @@ interpreter's refusal in its head. That the Tauri core injects its
 scripts into the main frame only was read from tauri 2.11.5's source
 (`for_main_frame_only: true`), not observed in the macOS webview. A page
 whose script loops forever left the window responsive while it was not
-asked to run; twelve diagrams in a chat opened at its end drew one, and a
-diagram drawing just above the visible top left the paragraph below it at the
-same screen position. A Mermaid image node and a theme `url()` pointing at a
-website were refused by the window's policy and made no request. A Vega spec with a `sequence` transform to a billion
-left the window responsive in view, as it draws only when asked.
+asked to run, and so did a `block-beta` diagram with `space:500000` until
+its **diagram** was clicked (drawn, it held Chromium past 110 s even at
+`space:1000`). A Mermaid image node and a theme `url()` pointing at a
+website were refused by the window's policy and made no request. A Vega
+spec with a `sequence` transform to a billion left the window responsive in
+view, as it draws only when asked. A diagram fenced inside an opened
+Markdown file still waits for its click.
 
 ## What it costs, and where the bounds are
 

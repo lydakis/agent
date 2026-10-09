@@ -41,14 +41,13 @@ window.Rich = (() => {
   const pre = (text, lang) => `<pre class="code"><code>${codeHTML(text, lang)}</code></pre>`;
   const CHART = new Set(['vega-lite', 'vegalite', 'vl', 'vega']);
   const toggle = '<button type="button" data-rich="view"></button>';
-  // A diagram or chart shows its source until it is drawn. HTML, SVG and charts in a message open as
-  // code, their preview a click away: all draw on the window's thread, and a page's script, an SVG's
-  // filters and animations or a chart's transforms (a `sequence` of a billion rows, a tick count of a
-  // billion) can take it over, so they run only when asked, block by block. Mermaid bounds itself (`maxTextSize`, `maxEdges`) and draws on its own.
-  // `page` runs it at once, for a file someone opened.
+  // A diagram, chart, page or SVG in a message opens as code, drawn a click away. All draw on the
+  // window's thread, and a few characters can ask for more than it can do (a page's loop, an SVG's
+  // filters, a chart's `sequence` to a billion, a Mermaid `space:500000`), so each runs only when
+  // asked, block by block. `page` draws it at once, for a file someone opened.
   function block(text, info, page = false) {
     const lang = (info ?? '').trim().split(/\s+/)[0].toLowerCase();
-    if (lang === 'mermaid' || lang === 'mmd') return `<div class="rc" data-kind="mermaid" data-lazy data-view="code">${head('mermaid', toggle)}<div class="view"></div>${pre(text, '')}</div>`;
+    if (lang === 'mermaid' || lang === 'mmd') return `<div class="rc" data-kind="mermaid" data-lazy${page ? ' data-run' : ''} data-view="code">${head('mermaid', toggle)}<div class="view"></div>${pre(text, '')}</div>`;
     if (CHART.has(lang)) return `<div class="rc" data-kind="chart" data-lang="${lang === 'vega' ? 'vega' : 'vega-lite'}" data-lazy${page ? ' data-run' : ''} data-view="code">${head(lang, toggle)}<div class="view"></div>${pre(text, 'json')}</div>`;
     if (lang === 'html' || lang === 'htm') return `<div class="rc" data-kind="html" data-view="${page ? 'view' : 'code'}">${head(lang, '<button type="button" data-rich="view"></button>')}<div class="view frame"></div>${pre(text, 'xml')}</div>`;
     // An SVG draws as an image, which runs no script and loads nothing.
@@ -203,35 +202,17 @@ window.Rich = (() => {
     host.append(f);
   }
   function unmount(box) { box.querySelector('.view')?.replaceChildren(); }
-  // Diagrams and charts draw when they come near the screen, so opening a long transcript draws only
-  // what is read. The pane is the root: a margin around the window would be clipped by the pane's own
-  // scrolling. Blocks a redraw took out of the pane are let go on the pane's next hydrate.
-  const watchers = new Map();
   function draw(box, cached = false) {
     const src = box.querySelector('pre').textContent;
     drawLazy(box, src, box.dataset.kind === 'mermaid' ? mermaidSVG : chartSVG, cached);
   }
-  function watch(box) {
-    const pane = box.closest('.scroll');
-    if (typeof IntersectionObserver !== 'function' || !pane) { draw(box); return; }
-    if (!watchers.has(pane)) {
-      const boxes = new Set(), o = new IntersectionObserver((seen) => {
-        for (const e of seen) if (e.isIntersecting) { o.unobserve(e.target); boxes.delete(e.target); draw(e.target); }
-      }, { root: pane, rootMargin: '400px 0px' });
-      watchers.set(pane, { o, boxes });
-    }
-    const w = watchers.get(pane);
-    for (const b of w.boxes) if (!b.isConnected) { w.o.unobserve(b); w.boxes.delete(b); }
-    w.boxes.add(box); w.o.observe(box);
-  }
-  // After HTML from `html` is in the document: diagrams start, a chart already drawn shows again, and
-  // a file's page or SVG shows. A preview someone ran in a message is code again once its pane is drawn
-  // anew: running it is asked of one block, once.
+  // After HTML from `html` is in the document: a file's drawing starts, and a diagram or chart already
+  // drawn shows again from the cache. A page or SVG someone ran in a message is code again once its
+  // pane is drawn anew: running it is asked of one block, once.
   function hydrate(root) {
     for (const box of root.querySelectorAll('.rc[data-lazy]:not([data-on]), .rc[data-kind="html"]:not([data-on]), .rc[data-kind="svg"]:not([data-on])')) {
       box.dataset.on = '';
-      if (box.dataset.kind === 'mermaid' || 'run' in box.dataset) watch(box);
-      else if (box.dataset.kind === 'chart') draw(box, true);
+      if ('lazy' in box.dataset) draw(box, !('run' in box.dataset));
       else if (box.dataset.view === 'view') mount(box);
     }
   }
@@ -255,7 +236,7 @@ window.Rich = (() => {
     const box = b.closest('.rc');
     if (b.dataset.rich === 'copy') {
       navigator.clipboard?.writeText(box.querySelector('pre').textContent).then(() => { b.textContent = 'copied'; setTimeout(() => { b.textContent = 'copy'; }, 1200); }, () => {});
-    } else if (b.dataset.rich === 'view' && box.dataset.kind === 'chart' && !('drawn' in box.dataset)) {
+    } else if (b.dataset.rich === 'view' && 'lazy' in box.dataset && !('drawn' in box.dataset)) {
       draw(box);
     } else if (b.dataset.rich === 'view' && (!('lazy' in box.dataset) || 'drawn' in box.dataset)) {
       box.dataset.view = box.dataset.view === 'view' ? 'code' : 'view';
