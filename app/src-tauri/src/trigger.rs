@@ -1136,22 +1136,28 @@ pub fn migrate(places: &Places, running: Option<&str>, launchd: Loader) {
             continue;
         }
         let path = places.plist(&name);
-        if path.exists() {
-            log(format!(
-                "name_taken: schedule {name} is left at {}: a trigger has its name",
-                old.display()
-            ));
-            continue;
+        // A conversion cut short left its trigger in: it is finished.
+        let resumed = std::fs::read_to_string(&path).is_ok_and(|t| t == converted);
+        if !resumed {
+            // A trigger of that name, or one that ended and is still listed.
+            if path.exists() || places.last(&name).exists() {
+                log(format!(
+                    "name_taken: schedule {name} is left at {}: a trigger has its name",
+                    old.display()
+                ));
+                continue;
+            }
+            if let Err(error) = swap(&path, &name, None, &converted, launchd) {
+                log(error);
+                continue;
+            }
         }
         let result = old_state.join(format!("{name}.json"));
         if result.exists()
+            && !places.last(&name).exists()
             && let Err(e) = std::fs::rename(&result, places.last(&name))
         {
             log(format!("{}: {e}", result.display()));
-        }
-        if let Err(error) = swap(&path, &name, None, &converted, launchd) {
-            log(error);
-            continue;
         }
         if let Err(error) = forget(&old) {
             log(error);
@@ -1272,6 +1278,12 @@ fn runtime() -> Result<tokio::runtime::Runtime, String> {
         .map_err(|e| e.to_string())
 }
 
+/// A daemon's error as this module's: `CODE: detail`, its code kept for
+/// software to branch on.
+fn coded(error: agent_client::Error) -> String {
+    format!("{}: {}", error.code, error.detail.unwrap_or_default())
+}
+
 /// One error shape, `{"error": CODE, "detail": ...}`, from the
 /// `CODE: detail` this module's errors are.
 fn error_json(message: &str) -> Value {
@@ -1355,7 +1367,7 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
             .map(str::to_owned)
             .ok_or_else(|| "the daemon announced no store identity".to_owned());
         client.close().await;
-        Ok::<_, String>((record.map_err(|e| e.to_string())?, store_id?))
+        Ok::<_, String>((record.map_err(coded)?, store_id?))
     })?;
     let bot_id = record["id"].as_i64().ok_or("the daemon named no bot id")?;
     if expected_id.is_some_and(|id| id != bot_id) {
@@ -1502,15 +1514,15 @@ async fn connect(socket: &Path, daemon: &Daemon) -> Result<std::sync::Arc<Client
         Ok((client, _events)) => Ok(client),
         Err(error) if error.code == "daemon_unavailable" => {
             let (Some(store), Some(agent)) = (&daemon.store, crate::daemon::bundled()) else {
-                return Err(error.to_string());
+                return Err(coded(error));
             };
             crate::daemon::Starts::default()
                 .start(&agent, store, daemon.socket.as_deref())
                 .await?;
-            let (client, _events) = Client::connect(socket).await.map_err(|e| e.to_string())?;
+            let (client, _events) = Client::connect(socket).await.map_err(coded)?;
             Ok(client)
         }
-        Err(error) => Err(error.to_string()),
+        Err(error) => Err(coded(error)),
     }
 }
 
@@ -2390,6 +2402,79 @@ mod tests {
     }
 
     #[test]
+    fn a_conversion_cut_short_finishes_and_an_ended_trigger_keeps_its_name() {
+        let w = World::new("migrate-again");
+        let home = w.root.join(".agent");
+        let places = Places {
+            agents: w.places.agents.clone(),
+            state: home.join("triggers"),
+        };
+        std::fs::create_dir_all(home.join("schedules")).unwrap();
+        std::fs::create_dir_all(&places.agents).unwrap();
+        std::fs::create_dir_all(&places.state).unwrap();
+        let entries = every("1d", clock(2026, 9, 28, 9, 7)).unwrap().entries;
+        let (cut, ended) = (
+            trigger(),
+            Trigger {
+                name: "p.ended".into(),
+                ..trigger()
+            },
+        );
+        for s in [&cut, &ended] {
+            let new = plist(Path::new("/A/agent-app"), s, &entries, &[]);
+            let old = new
+                .replace(LABEL, SCHEDULE_LABEL)
+                .replace(FIRE_FLAG, SCHEDULE_FIRE_FLAG);
+            std::fs::write(
+                places
+                    .agents
+                    .join(format!("{SCHEDULE_LABEL}{}.plist", s.name)),
+                old,
+            )
+            .unwrap();
+            w.fake
+                .loaded
+                .borrow_mut()
+                .insert(format!("{SCHEDULE_LABEL}{}", s.name));
+            // The first was converted, and the app stopped before the old went.
+            if s.name == cut.name {
+                std::fs::write(places.plist(&s.name), new).unwrap();
+                w.fake
+                    .loaded
+                    .borrow_mut()
+                    .insert(format!("{LABEL}{}", s.name));
+            }
+        }
+        // A trigger that ended has the second's name.
+        let kept = json!({"name": "p.ended", "message": "an ended trigger's"}).to_string();
+        std::fs::write(places.last("p.ended"), &kept).unwrap();
+        migrate(&places, None, &|x| w.fake.call(x));
+        assert!(
+            !places
+                .agents
+                .join(format!("{SCHEDULE_LABEL}{}.plist", cut.name))
+                .exists()
+        );
+        assert!(
+            !w.fake
+                .loaded
+                .borrow()
+                .contains(&format!("{SCHEDULE_LABEL}{}", cut.name))
+        );
+        assert_eq!(triggers(&places)[0].0, cut);
+        assert_eq!(
+            std::fs::read_to_string(places.last("p.ended")).unwrap(),
+            kept
+        );
+        assert!(
+            places
+                .agents
+                .join(format!("{SCHEDULE_LABEL}p.ended.plist"))
+                .exists()
+        );
+    }
+
+    #[test]
     fn errors_have_one_shape() {
         assert_eq!(
             error_json("trigger_not_found: x"),
@@ -2400,6 +2485,17 @@ mod tests {
             json!({"error": "trigger_failed", "detail": "/a/b: no such file"})
         );
         assert_eq!(error_json("usage: trigger ls")["error"], "usage");
+        // A daemon's code is kept, with or without a detail.
+        let mut missing = agent_client::Error::new("bot_not_found");
+        assert_eq!(
+            error_json(&coded(missing.clone())),
+            json!({"error": "bot_not_found", "detail": ""})
+        );
+        missing.detail = Some("p.x".into());
+        assert_eq!(
+            error_json(&coded(missing)),
+            json!({"error": "bot_not_found", "detail": "p.x"})
+        );
     }
 
     #[test]
