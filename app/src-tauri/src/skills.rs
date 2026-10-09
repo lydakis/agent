@@ -25,7 +25,8 @@ pub fn install(home: &Path) -> Vec<String> {
         .map(|(name, files)| (name.to_string(), *files))
         .collect();
     let records = home.join(".agent/skills");
-    match recorded(&records, ENTRIES) {
+    let mut budget = ENTRIES;
+    match recorded(&records, &mut budget) {
         Ok(names) => skills.extend(
             names
                 .into_iter()
@@ -48,8 +49,9 @@ pub fn install(home: &Path) -> Vec<String> {
 const ENTRIES: usize = 1024;
 
 /// The names in a record folder, its temporaries aside; none when it is
-/// absent. More than `limit` is an error.
-fn recorded(folder: &Path, limit: usize) -> Result<Vec<String>, String> {
+/// absent. Every entry, listed or not, spends one of `budget`; running out
+/// is an error.
+fn recorded(folder: &Path, budget: &mut usize) -> Result<Vec<String>, String> {
     let entries = match std::fs::read_dir(folder) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         entries => entries.map_err(|error| format!("{}: {error}", folder.display()))?,
@@ -57,9 +59,10 @@ fn recorded(folder: &Path, limit: usize) -> Result<Vec<String>, String> {
     let mut names = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| format!("{}: {error}", folder.display()))?;
-        if names.len() == limit {
-            return Err(format!("{}: more than {limit} entries", folder.display()));
+        if *budget == 0 {
+            return Err(format!("{}: more than {ENTRIES} entries", folder.display()));
         }
+        *budget -= 1;
         if let Some(name) = entry
             .file_name()
             .to_str()
@@ -71,13 +74,22 @@ fn recorded(folder: &Path, limit: usize) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
+/// Sync every folder from `path`'s up to `home`, so folders a first write
+/// created are on disk with it.
+fn settle(path: &Path, home: &Path) -> Result<(), String> {
+    for folder in path.ancestors().skip(1).take_while(|f| f.starts_with(home)) {
+        std::fs::File::open(folder)
+            .and_then(|folder| folder.sync_all())
+            .map_err(|error| format!("{}: {error}", folder.display()))?;
+    }
+    Ok(())
+}
+
 /// Every file under a skill's record, as a path relative to it.
 fn recorded_files(record: &Path) -> Result<Vec<String>, String> {
-    let (mut files, mut folders, mut seen) = (Vec::new(), vec![String::new()], 0);
+    let (mut files, mut folders, mut budget) = (Vec::new(), vec![String::new()], ENTRIES);
     while let Some(folder) = folders.pop() {
-        let names = recorded(&record.join(&folder), ENTRIES - seen)?;
-        seen += names.len();
-        for name in names {
+        for name in recorded(&record.join(&folder), &mut budget)? {
             let file = match folder.as_str() {
                 "" => name,
                 folder => format!("{folder}/{name}"),
@@ -160,7 +172,9 @@ fn install_one(home: &Path, name: &str, files: &[(&str, &str)]) -> Result<(), St
     // Mine first, then the record, so a crash between them is fixed above.
     for (path, written, text) in stale {
         crate::schedule::replace(&path, text)?;
+        settle(&path, home)?;
         crate::schedule::replace(&written, text)?;
+        settle(&written, home)?;
     }
     // Each removal is on disk before its record goes, so a power loss never
     // leaves a file the app no longer knows it wrote. SKILL.md goes first: a
@@ -355,7 +369,8 @@ mod tests {
         let record = home.join(".agent/skills/x");
         std::fs::create_dir_all(&record).unwrap();
         for n in 0..=ENTRIES {
-            std::fs::write(record.join(n.to_string()), "").unwrap();
+            // Hidden or not, every entry counts.
+            std::fs::write(record.join(format!(".{n}")), "").unwrap();
         }
         let error = install_one(&home, "x", &[]).unwrap_err();
         assert!(error.contains("more than"), "{error}");
