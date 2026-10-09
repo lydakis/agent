@@ -36,7 +36,7 @@ function page(daemon = {}, storage = null) {
   context.Rich = context.window.Rich;
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules, tellLead, markSeen };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules, tellLead, markSeen };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -151,7 +151,8 @@ test('messages draw as Markdown with raw HTML, scripts and remote fetches kept o
 test('fenced blocks become code, previews, diagrams and images by their language', () => {
   const p = page(), Rich = p.context.Rich;
   assert.match(Rich.html('```rust\nfn main() {}\n```'), /data-kind="code".*<span class="lang">rust<\/span>.*fn main\(\) \{\}/s);
-  assert.match(Rich.html('```html\n<!doctype html><body><b>hi</b></body>\n```'), /data-kind="html" data-view="view".*&lt;b&gt;hi&lt;\/b&gt;/s);
+  // A page in a message runs only when asked: its scripts would share the window's thread.
+  assert.match(Rich.html('```html\n<!doctype html><body><b>hi</b></body>\n```'), /data-kind="html" data-view="code".*&lt;b&gt;hi&lt;\/b&gt;/s);
   assert.match(Rich.html('```html\n<b>hi</b>\n```'), /data-kind="html" data-view="code"/);
   assert.match(Rich.html('```mermaid\ngraph TD\nA-->B\n```'), /data-kind="mermaid".*A--&gt;B/s);
   const svg = Rich.html('```svg\n<svg xmlns="http://www.w3.org/2000/svg"><circle r="4"/></svg>\n```');
@@ -176,6 +177,10 @@ test('charts, file links and opened files draw by kind', () => {
   assert.match(Rich.file('/w/flow.mmd', enc('graph TD')).html, /data-kind="mermaid"/);
   assert.match(Rich.file('/w/frag.html', enc('<b>x</b>')).html, /data-kind="html" data-view="view"/);
   assert.match(Rich.file('/w/t.csv', enc('a,b\n1,"2"')).html, /<th>a<\/th><th>b<\/th>.*<td>1<\/td><td>2<\/td>/s);
+  // A quoted field keeps its separators, line breaks and doubled quotes.
+  assert.match(Rich.file('/w/q.csv', enc('name,note\r\nAlice,"a,b"\nBob,"say ""hi""\nthen go"\n')).html,
+    /<td>Alice<\/td><td>a,b<\/td><\/tr><tr><td>Bob<\/td><td>say &quot;hi&quot;\nthen go<\/td><\/tr><\/tbody>/);
+  assert.match(Rich.file('/w/t.tsv', enc('a\tb\n1\t2')).html, /<td>1<\/td><td>2<\/td>/);
   assert.match(Rich.file('/w/blob.bin', new Uint8Array([1, 0, 2])).html, /binary file · 3 bytes/);
   assert.match(Rich.file('/w/big.log', enc('x'), true).html, /showing the first/);
   assert.match(Rich.file('/w/<i>.md', enc('<script>alert(1)</script>')).html, /&lt;script&gt;/);
@@ -189,6 +194,27 @@ test('a message is parsed once and drawn again from what it kept', () => {
   assert.equal(parsed, 50); assert.equal(first, again);
   assert.ok(t.bytes > 0);
   t.items[3].text = 'changed'; p.itemsHTML(t); assert.equal(parsed, 51);
+});
+
+test('drawing messages past the byte bound folds the oldest instead of keeping them', () => {
+  const p = page(), t = p.transcript('Bob'), el = p.context.document.getElementById('log');
+  const DECODE_BYTES = 8 * 1024 * 1024, text = 'word '.repeat(40000);
+  t.items = Array.from({ length: 20 }, (_, i) => ({ kind: 'text', turn: i, from: i, text, bytes: text.length * 2 }));
+  t.bytes = t.items.reduce((n, it) => n + it.bytes, 0);
+  assert.ok(t.bytes < DECODE_BYTES);
+  el.lastElementChild = p.context.document.createElement('div');
+  p.renderTranscript(el, 'Bob');
+  assert.ok(t.bytes <= DECODE_BYTES, `${t.bytes} bytes kept`);
+  assert.equal(t.items[0].kind, 'history');
+  assert.ok(t.items.some((it) => it.kind === 'text' && it.html));
+  assert.match(el.innerHTML, /earlier history/);
+});
+
+test('a file opened from an agent closes when that agent is forgotten', () => {
+  const p = page();
+  p.S.ui.file = { bot: 'Bob', full: '/w/a.md', url: null };
+  p.forgetBot('Carol'); assert.ok(p.S.ui.file);
+  p.forgetBot('Bob'); assert.equal(p.S.ui.file, null);
 });
 
 test('streamed Markdown draws each finished block once and keeps fences whole', () => {

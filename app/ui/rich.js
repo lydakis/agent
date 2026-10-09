@@ -1,8 +1,8 @@
 // What a model writes, drawn as a page draws it: Markdown, highlighted code, Mermaid diagrams,
 // Vega-Lite charts and HTML previews, in a message or a file opened beside. Markdown is parsed once
 // per message (marked, loaded with the page); highlighting, Mermaid and Vega load the first time
-// something needs them. Raw HTML in Markdown stays text; an ```html block runs only in a sandboxed
-// frame with no network and no way into the app; a chart loads no data from anywhere.
+// something needs them. Raw HTML in Markdown stays text; an ```html block runs only when asked, in a
+// sandboxed frame with no network and no way into the app; a chart loads no data from anywhere.
 window.Rich = (() => {
   'use strict';
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -39,12 +39,12 @@ window.Rich = (() => {
   }
   const head = (lang, acts) => `<div class="rh"><span class="lang">${esc(lang)}</span><span class="ra">${acts}<button type="button" data-rich="copy">copy</button></span></div>`;
   const pre = (text, lang) => `<pre class="code"><code>${codeHTML(text, lang)}</code></pre>`;
-  // A whole page opens as its preview; a fragment opens as code, a click away from its preview.
-  const isPage = (text) => /<(!doctype|html|body)\b/i.test(text.slice(0, 2048));
   const CHART = new Set(['vega-lite', 'vegalite', 'vl', 'vega']);
   const toggle = '<button type="button" data-rich="view"></button>';
-  // A diagram or chart shows its source until it is drawn; `page` opens HTML as its preview.
-  function block(text, info, page = isPage(text)) {
+  // A diagram or chart shows its source until it is drawn. HTML in a message opens as code, its
+  // preview a click away: its scripts share the window's thread, so a page runs only when asked.
+  // `page` opens it as its preview, for a file someone opened.
+  function block(text, info, page = false) {
     const lang = (info ?? '').trim().split(/\s+/)[0].toLowerCase();
     if (lang === 'mermaid' || lang === 'mmd') return `<div class="rc" data-kind="mermaid" data-lazy data-view="code">${head('mermaid', toggle)}<div class="view"></div>${pre(text, '')}</div>`;
     if (CHART.has(lang)) return `<div class="rc" data-kind="chart" data-lang="${lang === 'vega' ? 'vega' : 'vega-lite'}" data-lazy data-view="code">${head(lang, toggle)}<div class="view"></div>${pre(text, 'json')}</div>`;
@@ -102,14 +102,18 @@ window.Rich = (() => {
   }
 
   // ---------- drawn in place ----------
-  // Something drawn later changes a block's height; a reader at the end of the pane stays there.
+  // Something drawn later changes a block's height; a reader at the end of the pane stays there, and
+  // one reading below the block keeps their place (the panes do no scroll anchoring of their own).
   function settle(box, change) {
-    const pane = box.closest('.scroll'), end = pane && pane.scrollHeight - pane.scrollTop - pane.clientHeight < 40;
+    const pane = box.closest('.scroll'); if (!pane) { change(); return; }
+    const end = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 40;
+    const above = !end && box.getBoundingClientRect().bottom <= pane.getBoundingClientRect().top, h = pane.scrollHeight;
     change();
-    if (end) pane.scrollTop = pane.scrollHeight;
+    if (end) pane.scrollTop = pane.scrollHeight; else if (above) pane.scrollTop += pane.scrollHeight - h;
   }
-  // Rendered diagrams by source, so a pane drawn again shows them at once.
-  const diagrams = new Map(); const DIAGRAMS = 64;
+  // Rendered diagrams by source (and a chart by its width), so a pane drawn again shows them at once;
+  // at most 64 of them and 8 MiB of SVG.
+  const diagrams = new Map(), DIAGRAMS = 64, DIAGRAM_BYTES = 8 * 1024 * 1024; let diagramBytes = 0;
   let mermaidChain = Promise.resolve(), diagramId = 0;
   function mermaidReady() {
     return script('vendor/mermaid.js').then(() => {
@@ -127,11 +131,14 @@ window.Rich = (() => {
   // A diagram or chart drawn to SVG once per source; one at a time, as Mermaid measures in a shared
   // scratch element. A source that does not draw keeps showing as code, the error in its head.
   function drawLazy(box, src, make) {
-    const key = `${box.dataset.kind}|${box.dataset.lang ?? ''}|${src}`;
+    const key = `${box.dataset.kind}|${box.dataset.lang ?? ''}|${box.dataset.kind === 'chart' ? box.clientWidth : ''}|${src}`;
     const show = (svg) => settle(box, () => { box.querySelector('.view').innerHTML = svg; box.dataset.view = 'view'; box.dataset.drawn = ''; });
     if (diagrams.has(key)) { show(diagrams.get(key)); return; }
     mermaidChain = mermaidChain.then(() => make(src, box)).then((svg) => {
-      diagrams.set(key, svg); if (diagrams.size > DIAGRAMS) diagrams.delete(diagrams.keys().next().value);
+      if (!diagrams.has(key)) { diagrams.set(key, svg); diagramBytes += 2 * (key.length + svg.length); }
+      while (diagrams.size > DIAGRAMS || (diagramBytes > DIAGRAM_BYTES && diagrams.size > 1)) {
+        const [k, v] = diagrams.entries().next().value; diagrams.delete(k); diagramBytes -= 2 * (k.length + v.length);
+      }
       show(svg);
     }, (e) => { const l = box.querySelector('.rh .lang'); l.textContent = `${l.textContent.split(' · ')[0]} · ${String(e?.message ?? e).split('\n')[0].slice(0, 80)}`; });
   }
@@ -175,6 +182,8 @@ window.Rich = (() => {
   const FRAME_HEAD = '<!doctype html><meta charset="utf-8">'
     + `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; media-src data: blob:; base-uri 'none'; form-action 'none'">`
     + '<script>(()=>{const post=()=>parent.postMessage({rich:"height",h:document.documentElement.scrollHeight},"*");addEventListener("load",post);new ResizeObserver(post).observe(document.documentElement);addEventListener("click",e=>{if(e.target.closest&&e.target.closest("a[href]"))e.preventDefault()},true)})()</script>';
+  // Previews a reader ran, by source, so a pane drawn again runs them again; at most 16.
+  const ran = new Set();
   function mount(box) {
     const host = box.querySelector('.frame'); if (!host || host.firstChild) return;
     const f = document.createElement('iframe');
@@ -182,25 +191,34 @@ window.Rich = (() => {
     f.srcdoc = FRAME_HEAD + box.querySelector('pre').textContent.replace(/^\s*<!doctype[^>]*>/i, '');
     host.append(f);
   }
-  // Previews start when they come near the screen, so a long transcript holds no idle pages. The
-  // pane is the root: a margin around the window would be clipped by the pane's own scrolling.
+  function unmount(box) { box.querySelector('.frame')?.replaceChildren(); }
+  // Diagrams and charts draw when they come near the screen, so opening a long transcript draws only
+  // what is read. The pane is the root: a margin around the window would be clipped by the pane's own
+  // scrolling. Blocks a redraw took out of the pane are let go on the pane's next hydrate.
   const watchers = new Map();
-  function watcher(pane) {
-    if (typeof IntersectionObserver !== 'function') return null;
-    if (!watchers.has(pane)) watchers.set(pane, new IntersectionObserver((seen, o) => {
-      for (const e of seen) if (e.isIntersecting) { o.unobserve(e.target); mount(e.target); }
-    }, { root: pane, rootMargin: '400px 0px' }));
-    return watchers.get(pane);
+  function draw(box) {
+    const src = box.querySelector('pre').textContent;
+    drawLazy(box, src, box.dataset.kind === 'mermaid' ? mermaidSVG : chartSVG);
   }
-  function preview(box) { if (box.dataset.view !== 'view') return; const w = watcher(box.closest('.scroll')); if (w) w.observe(box); else mount(box); }
-  // After HTML from `html` is in the document: diagrams and previews start.
+  function watch(box) {
+    const pane = box.closest('.scroll');
+    if (typeof IntersectionObserver !== 'function' || !pane) { draw(box); return; }
+    if (!watchers.has(pane)) {
+      const boxes = new Set(), o = new IntersectionObserver((seen) => {
+        for (const e of seen) if (e.isIntersecting) { o.unobserve(e.target); boxes.delete(e.target); draw(e.target); }
+      }, { root: pane, rootMargin: '400px 0px' });
+      watchers.set(pane, { o, boxes });
+    }
+    const w = watchers.get(pane);
+    for (const b of w.boxes) if (!b.isConnected) { w.o.unobserve(b); w.boxes.delete(b); }
+    w.boxes.add(box); w.o.observe(box);
+  }
+  // After HTML from `html` is in the document: diagrams and charts start, and previews already open.
   function hydrate(root) {
     for (const box of root.querySelectorAll('.rc[data-lazy]:not([data-on]), .rc[data-kind="html"]:not([data-on])')) {
       box.dataset.on = '';
-      const src = box.querySelector('pre').textContent;
-      if (box.dataset.kind === 'mermaid') drawLazy(box, src, mermaidSVG);
-      else if (box.dataset.kind === 'chart') drawLazy(box, src, chartSVG);
-      else preview(box);
+      if (box.dataset.kind !== 'html') watch(box);
+      else if (box.dataset.view === 'view' || ran.has(box.querySelector('pre').textContent)) { box.dataset.view = 'view'; mount(box); }
     }
   }
   if (typeof window.addEventListener === 'function') window.addEventListener('message', (e) => {
@@ -225,7 +243,12 @@ window.Rich = (() => {
       navigator.clipboard?.writeText(box.querySelector('pre').textContent).then(() => { b.textContent = 'copied'; setTimeout(() => { b.textContent = 'copy'; }, 1200); }, () => {});
     } else if (b.dataset.rich === 'view' && (!('lazy' in box.dataset) || 'drawn' in box.dataset)) {
       box.dataset.view = box.dataset.view === 'view' ? 'code' : 'view';
-      if (box.dataset.kind === 'html') mount(box);
+      // A preview shown runs; one hidden stops, scripts and all.
+      if (box.dataset.kind === 'html') {
+        const src = box.querySelector('pre').textContent;
+        if (box.dataset.view === 'view') { mount(box); ran.delete(src); ran.add(src); if (ran.size > 16) ran.delete(ran.values().next().value); }
+        else { unmount(box); ran.delete(src); }
+      }
     }
     return true;
   }
@@ -235,10 +258,26 @@ window.Rich = (() => {
   // table, or code. `bytes` is what was read (at most `cap`); `more` says the file goes on.
   const IMAGE = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', avif: 'image/avif', bmp: 'image/bmp', ico: 'image/x-icon' };
   const extOf = (path) => { const n = path.split('/').pop().toLowerCase(); return /\.(vl|vg)\.json$/.test(n) ? n.slice(-7, -5) : n.includes('.') ? n.split('.').pop() : n; };
+  // The first `max` rows of a CSV or TSV: a quoted field may hold the separator, a line break or a
+  // doubled quote.
+  function csv(text, sep, max) {
+    const out = []; let row = [], cell = '', quoted = false, i = 0;
+    const end = () => { row.push(cell); cell = ''; if (row.length > 1 || row[0]) out.push(row); row = []; };
+    for (; i < text.length && out.length < max; i++) {
+      const c = text[i];
+      if (quoted) { if (c !== '"') cell += c; else if (text[i + 1] === '"') { cell += c; i++; } else quoted = false; }
+      else if (c === '"' && !cell) quoted = true;
+      else if (c === sep) { row.push(cell); cell = ''; }
+      else if (c === '\n') end();
+      else if (c !== '\r') cell += c;
+    }
+    if (out.length < max && (cell || row.length)) end();
+    return out;
+  }
   function table(text, sep) {
-    const rows = text.split(/\r?\n/).filter((r) => r.length).slice(0, 1001).map((r) => r.split(sep));
-    const cell = (tag) => (c) => `<${tag}>${esc(c.replace(/^"(.*)"$/, '$1'))}</${tag}>`;
-    return `<div class="md"><table><thead><tr>${(rows[0] ?? []).map(cell('th')).join('')}</tr></thead><tbody>${rows.slice(1, 1001).map((r) => `<tr>${r.map(cell('td')).join('')}</tr>`).join('')}</tbody></table></div>`;
+    const rows = csv(text, sep, 1001);
+    const cell = (tag) => (c) => `<${tag}>${esc(c)}</${tag}>`;
+    return `<div class="md"><table><thead><tr>${(rows[0] ?? []).map(cell('th')).join('')}</tr></thead><tbody>${rows.slice(1).map((r) => `<tr>${r.map(cell('td')).join('')}</tr>`).join('')}</tbody></table></div>`;
   }
   function file(path, bytes, more = false) {
     const ext = extOf(path), note = more ? `<div class="line note">showing the first ${Math.round(bytes.length / 1048576)} MiB</div>` : '';

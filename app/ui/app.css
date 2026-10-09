@@ -21,7 +21,7 @@ html,body{height:100%;margin:0;background:var(--t-bg);color:var(--t-ink);font-fa
 .main{grid-row:1;grid-column:2}
 .pane.side{grid-row:1;grid-column:3;overflow:hidden;border-left:1px solid var(--t-line);background:var(--t-panel)}
 .pane-title{display:flex;align-items:center;justify-content:space-between;padding:6px 6px 0 12px;color:var(--t-faint);font-size:12px;white-space:nowrap}
-.scroll{flex:1;overflow-y:auto;overflow-x:hidden;padding:10px 12px;scrollbar-width:thin;scrollbar-color:var(--t-line) transparent}
+.scroll{flex:1;overflow-y:auto;overflow-x:hidden;overflow-anchor:none;padding:10px 12px;scrollbar-width:thin;scrollbar-color:var(--t-line) transparent}
 .sidebar .scroll{padding:2px 0 8px}
 .main .scroll,.main .composer{padding-inline:max(16px,calc(50% - 42ch))}
 button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:pointer}

@@ -88,8 +88,8 @@ See [Messages](#messages).
 ![A finished reply: heading, list, table and a highlighted code block](app/rich.png)
 
 Further down the same reply: a ```` ```vega-lite ```` block drawn as a chart
-in the window's colors, and an ```` ```html ```` block, which opens as a page
-preview because it is a whole page.
+in the window's colors, and an ```` ```html ```` block, its preview shown with
+a click.
 
 ![A Vega-Lite chart and an HTML preview](app/rich-preview.png)
 
@@ -1152,9 +1152,12 @@ pane drawn again reuses it. Fenced blocks are drawn by their language:
   a width fills the block. The spec is its only data: the loader refuses every
   URL (data and images alike), and expressions run in Vega's interpreter, not
   as generated code.
-- **`html`** runs as a preview in a sandboxed frame. A whole page (one with a
-  doctype, `<html>` or `<body>`) opens as its preview; a fragment opens as
-  code, its preview a click away. **`svg`** draws as an image.
+- **`html`** opens as code, and runs as a preview in a sandboxed frame only
+  when asked: a click on **preview** runs it, a click on **code** stops it.
+  A preview's scripts share the window's thread (a frame is not a process),
+  so a page a model wrote never runs merely by being in a reply. A preview
+  someone ran runs again when its pane is drawn again (the last 16).
+  **`svg`** draws as an image.
 
 Charts are a block of their own because a preview cannot load a charting
 library: models reach for one from a CDN, and a preview fetches nothing.
@@ -1164,21 +1167,29 @@ also draw, and an HTML preview can still draw a chart with its own inline
 SVG or canvas.
 
 Highlighting, Mermaid and Vega load the first time something needs them;
-marked loads with the page. All are vendored under `app/ui/vendor` (versions
+marked loads with the page. A diagram or chart draws when it comes within
+400 px of the screen, so opening a long chat draws only what is read, and a
+reader below one that draws keeps their place. Drawn diagrams and charts are
+kept by source (a chart also by its width) for redraws: at most 64 and 8 MiB.
+A message's drawn HTML counts toward the chat's 8 MiB of decoded bodies, and
+drawing past that folds the oldest bodies as a load would. All are vendored under `app/ui/vendor` (versions
 and licenses in `LICENSES.txt`), so drawing a message fetches nothing.
 
 A file opens beside the chat, in the pane a task opens in, from a path a step
 read, wrote or edited (the path in its line) or a message's link to a path
 (`[plan](PLAN.md)`, `src/a.rs:12`, `src/a.rs#L4`; the line is dropped). A
 path is the agent's folder's, and a link inside an open file is relative to
-that file. The core reads the first 4 MiB (`read_file`; a window on a host
-is refused by name, as its files are the host's). The file draws by its
+that file. The core reads the first 4 MiB of a regular file (`read_file`; a
+FIFO or device is refused, as reading one need not end, and a window on a
+host is refused by name, as its files are the host's). The file draws by its
 kind: Markdown, a diagram (`.mmd`, `.mermaid`), a chart (`.vl.json`,
-`.vg.json`), a page (`.html`, always as its preview), an SVG or image, a
-CSV or TSV as a table of its first 1,000 rows, a binary file as its size,
+`.vg.json`), a page (`.html`, opened as its preview, since it was asked
+for), an SVG or image, a CSV or TSV as a table of its first 1,000 rows
+(quoted fields kept whole), a binary file as its size,
 anything else as code highlighted by its extension. Esc or ✕ closes it and
 brings back the task that was beside, if any. A write or edit to the open
-file by the agent it came from reads it again. Searching a project's files
+file reads it again; deleting the agent it came from, or attaching to another
+store, closes it. Searching a project's files
 (from ^k or elsewhere) is not built.
 
 What a model writes never becomes the app's markup unparsed. Raw HTML inside
@@ -1192,8 +1203,8 @@ navigate the window, and the app's script globals are injected into the main
 frame only. Its page carries a policy that loads nothing from the network (no
 fetch, scripts, styles, images or fonts but its own inline ones and `data:`),
 and the window's policy (`frame-src about:`) stops a preview from navigating
-its own frame to a website. Previews start only when they come near the
-screen, so a long transcript holds no idle pages.
+its own frame to a website. A preview runs only once asked, so a long
+transcript holds no idle pages.
 
 Measured 2026-10-09 in headless Chromium 141 on a 4-core cloud container,
 medians of nine runs, three runs each (synthetic messages: prose, lists, a
@@ -1220,7 +1231,11 @@ data from a URL, one drawing a remote image and one whose expression reached
 for `constructor`, made no request; the third did not draw and named the
 interpreter's refusal in its head. That the Tauri core injects its
 scripts into the main frame only was read from tauri 2.11.5's source
-(`for_main_frame_only: true`), not observed in the macOS webview.
+(`for_main_frame_only: true`), not observed in the macOS webview. A page
+whose script loops forever left the window responsive while it was not
+asked to run; twelve diagrams in a chat opened at its end drew one, and a
+diagram drawing just above the visible top left the paragraph below it at the
+same screen position.
 
 ## What it costs, and where the bounds are
 

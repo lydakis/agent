@@ -488,10 +488,16 @@ fn file_path(path: &str, home: Option<std::ffi::OsString>) -> Result<std::path::
 fn read_head(path: &std::path::Path, limit: u64) -> Result<Vec<u8>, String> {
     use std::io::Read;
     let shown = |e: std::io::Error| format!("{}: {e}", path.display());
+    // Only a regular file: opening a FIFO waits for a writer, and a device never ends. Checked again
+    // once open, as the path may have changed in between.
+    let plain = |meta: std::fs::Metadata| match meta.is_file() {
+        true => Ok(()),
+        false if meta.is_dir() => Err(format!("{}: is a folder", path.display())),
+        false => Err(format!("{}: not a regular file", path.display())),
+    };
+    plain(std::fs::metadata(path).map_err(shown)?)?;
     let file = std::fs::File::open(path).map_err(shown)?;
-    if file.metadata().map_err(shown)?.is_dir() {
-        return Err(format!("{}: is a folder", path.display()));
-    }
+    plain(file.metadata().map_err(shown)?)?;
     let mut bytes = Vec::new();
     file.take(limit).read_to_end(&mut bytes).map_err(shown)?;
     Ok(bytes)
@@ -1478,6 +1484,12 @@ mod link_tests {
         assert_eq!(read_head(&file, 64).unwrap(), b"0123456789");
         assert!(read_head(&dir, 64).unwrap_err().contains("is a folder"));
         assert!(read_head(&dir.join("missing"), 64).is_err());
+        #[cfg(unix)]
+        assert!(
+            read_head(std::path::Path::new("/dev/zero"), 64)
+                .unwrap_err()
+                .contains("not a regular file")
+        );
         std::fs::remove_dir_all(&dir).unwrap();
         let home = Some(std::ffi::OsString::from("/home/someone"));
         assert_eq!(

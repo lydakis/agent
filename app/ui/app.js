@@ -276,6 +276,7 @@ function forgetBot(name) {
   S.heldNews = S.heldNews.filter(([held]) => held !== name);
   // A draft belongs to its bot, so it goes with it.
   if (S.ui.side === name) S.ui.side = null;
+  if (S.ui.file?.bot === name) dropFile();
   S.drafts.delete(name);
   for (const ids of Object.values(PANE)) { const input = $(ids.input); if (input.dataset.for === name) { input.value = ''; input.dataset.for = ''; } }
 }
@@ -1164,7 +1165,7 @@ function forgetStore() {
   S.swarms.clear(); S.memberOf.clear(); S.deleted.clear(); looked.clear();
   for (const w of S.wakes.values()) clearTimeout(w.timer);
   S.wakes.clear(); S.turnFrom.clear(); S.heldNews = []; S.unseen.clear(); S.wanted.clear();
-  S.selected = ''; S.autoSelect = true; S.ui.side = null; S.ui.folded = new Set();
+  S.selected = ''; S.autoSelect = true; S.ui.side = null; S.ui.folded = new Set(); dropFile();
   S.botsGen += 1; S.shapeGen += 1;
   // A home the last host named is not this one's.
   if (S.homeWorkspace) { S.config.workspace = null; S.homeWorkspace = false; }
@@ -1433,22 +1434,32 @@ function renderTranscript(el, name) {
   const key = paneKey(name, t);
   const rendered = el.dataset.key === key ? Number(el.dataset.len) : -1;
   let tail = el.lastElementChild;
-  if (rendered < 0 || rendered > t.items.length || !tail || !tail.classList.contains('tail')) {
-    el.innerHTML = itemsHTML(t) + '<div class="tail"></div>';
-    el.dataset.key = key;
+  const rebuild = rendered < 0 || rendered > t.items.length || !tail || !tail.classList.contains('tail');
+  let added = '', from = rendered, old = null; const was = t.bytes || 0;
+  if (!rebuild && rendered < t.items.length) {
+    const next = t.items[rendered], prev = t.items[rendered - 1];
+    if (prev && inRun(prev, next.turn) && inRun(next, next.turn)) {
+      const s = runStart(t, rendered - 1);
+      old = STEP.has(t.items[s].kind) ? el.querySelector(`.steps[data-i="${s}"]`) : null;
+      if (old) from = s;
+    }
+    added = itemsHTML(t, from);
+  }
+  // Drawn messages count toward the transcript's bytes, so drawing can pass the bound: the window then
+  // folds what it lets go, and the pane is drawn from what is left (kept messages reuse their HTML).
+  const over = () => t.bytes > DECODE_BYTES && t.bytes > was;
+  if (rebuild || over()) {
+    let html = itemsHTML(t);
+    if (over()) { evict(t); html = itemsHTML(t); }
+    el.innerHTML = html + '<div class="tail"></div>';
+    el.dataset.key = paneKey(name, t);
     Rich.hydrate(el);
     tail = el.lastElementChild;
     // History loaded above the reader keeps their place instead of shoving it down.
     if (!atBottom) el.scrollTop += el.scrollHeight - before;
-  } else if (rendered < t.items.length) {
-    let from = rendered;
-    const next = t.items[rendered], prev = t.items[rendered - 1];
-    if (prev && inRun(prev, next.turn) && inRun(next, next.turn)) {
-      const s = runStart(t, rendered - 1);
-      const old = STEP.has(t.items[s].kind) ? el.querySelector(`.steps[data-i="${s}"]`) : null;
-      if (old) { const sep = old.previousElementSibling; if (sep?.dataset?.sep === String(s)) sep.remove(); old.remove(); from = s; }
-    }
-    tail.insertAdjacentHTML('beforebegin', itemsHTML(t, from));
+  } else if (added) {
+    if (old) { const sep = old.previousElementSibling; if (sep?.dataset?.sep === String(from)) sep.remove(); old.remove(); }
+    tail.insertAdjacentHTML('beforebegin', added);
     Rich.hydrate(el);
   }
   el.dataset.len = String(t.items.length);
@@ -1498,12 +1509,14 @@ async function openFile(who, full) {
   } catch (e) { if (S.ui.file !== f) return; Object.assign(f, { state: 'error', error: String(e?.message ?? e), gen: f.gen + 1 }); }
   render();
 }
-function closeFile() {
-  const f = S.ui.file; if (!f) return;
+// A file opened from an agent goes with that agent, and with the store it came from.
+function dropFile() {
+  const f = S.ui.file; if (!f) return false;
   if (f.url) URL.revokeObjectURL(f.url);
   S.ui.file = null; $('side').dataset.key = ''; $('side').dataset.who = ''; $('sidetitle').dataset.k = '';
-  render(); focusInput(S.ui.side ? 'side' : 'main');
+  return true;
 }
+function closeFile() { if (dropFile()) { render(); focusInput(S.ui.side ? 'side' : 'main'); } }
 function renderFile() {
   const f = S.ui.file, key = `file|${f.full}|${f.gen}|${Rich.version}`, el = $('side');
   if (el.dataset.key === key) return;
