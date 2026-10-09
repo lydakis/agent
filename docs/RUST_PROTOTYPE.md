@@ -2169,7 +2169,10 @@ rounds (a copy and a request of its own) and, under a budget, the most
 those two may bill: each sending at most the view, the tools and both
 instructions at a token to a byte, and generating at most the summarizer's
 output bound; with no known output bound (a Responses provider without
-`max_output_tokens`) a budgeted bot's summary does not run beside.
+`max_output_tokens`), or with server-side fallbacks on, which may bill any
+number of attempts per request, a budgeted bot's summary does not run
+beside. A summary beside the call that an interrupt cancels still adds its
+retries and pacing to the turn's.
 Otherwise, and at a turn's start or as a parked turn resumes, when the
 cache the copy reads may have lapsed, the summary goes before the call. A
 summary beside the turn uses its own connection rather than the bot's

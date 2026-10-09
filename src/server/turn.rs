@@ -28,7 +28,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
     },
     time::Duration,
 };
@@ -266,6 +266,9 @@ struct Accounting {
     summary_ms: u64,
     /// The tokens a summary beside the turn's call holds of its budget.
     summary_held: u64,
+    /// The call's view is to be replaced by a summary beside it, so no
+    /// refresh keeps its cache warm while it streams.
+    replaced: bool,
     /// Until when a summary that parked on its pool is not tried again
     /// while the view fits, kept in the park record.
     summary_retry_at: u64,
@@ -385,13 +388,13 @@ impl Turn {
             }
         };
         let mut accounting = Accounting::default();
-        let mut landed = None;
+        let (mut landed, side) = (None, SideCounts::default());
         // Cancelling mid-job loses nothing: a job the worker has taken runs
         // to its commit, and the worker publishes whatever committed.
         let mut result = tokio::select! {
             biased;
             code = interrupt => fail(code),
-            result = self.rounds(&mut accounting, &mut landed) => result,
+            result = self.rounds(&mut accounting, &mut landed, &side) => result,
         };
         // The rounds future is gone, so cancellation cannot discard this flush.
         // A refresh it had already sent is billed: record what it cost.
@@ -409,6 +412,8 @@ impl Turn {
         {
             result = Err(error);
         }
+        accounting.retries += side.retries.load(Relaxed);
+        accounting.paced_ms += side.paced_ms.load(Relaxed);
         let summary_retry_ms = accounting.summary_retry();
         let (retries, paced_ms) = accounting.totals();
         let summary_ms = accounting.summary_ms;
@@ -837,7 +842,7 @@ impl Turn {
         context: &mut Context,
         (last, inherited, model): (Option<&LastCall>, bool, &str),
         output_bytes: Option<usize>,
-        beside: Option<&mut Option<Beside<'a>>>,
+        beside: Option<(&mut Option<Beside<'a>>, &'a SideCounts)>,
     ) -> Result<Compaction> {
         if record.compaction_instructions.is_none() {
             return Ok(Compaction::Skipped);
@@ -925,7 +930,7 @@ impl Turn {
                         })
                 });
                 match (beside, held) {
-                    (Some(slot), Some(tokens)) => {
+                    (Some((slot, side)), Some(tokens)) => {
                         // It spends only what it holds: its calls and their
                         // retries count from the rounds left after its
                         // share, and a bot's budget ends at its share.
@@ -938,24 +943,22 @@ impl Turn {
                         *slot = Some(Box::pin(async move {
                             let (before, start) = (record.tokens_used, MAX_ROUNDS - 2);
                             let mut rounds = start;
+                            let mut spent = Counted { spent, into: side };
                             let result = self
                                 .summarize(
                                     planned,
                                     &mut record,
                                     &mut rounds,
                                     turn,
-                                    &mut spent,
+                                    &mut spent.spent,
                                     &tools,
                                 )
                                 .await;
-                            let (retries, paced_ms) = spent.totals();
                             Landed {
                                 result,
                                 spent: Spent {
                                     tokens: record.tokens_used.saturating_sub(before),
                                     rounds: rounds - start,
-                                    retries,
-                                    paced_ms,
                                 },
                             }
                         }));
@@ -988,7 +991,7 @@ impl Turn {
     /// each sends at most `view` bytes, the tools and both instructions, a
     /// token to a byte at most, and generates at most the summarizer's
     /// output bound. Nothing without a budget; `None` when that bound is
-    /// unknown, and then the summary goes before the call.
+    /// unknown, as with fallbacks on, and then the summary goes before the call.
     fn summary_bound(
         &self,
         record: &agent_runtime::store::Bot,
@@ -997,6 +1000,10 @@ impl Turn {
     ) -> Option<u64> {
         if record.budget_tokens.is_none() {
             return Some(0);
+        }
+        // Server-side fallbacks may bill any number of attempts per request.
+        if record.fallbacks {
+            return None;
         }
         let reference = summarizer(record);
         let (name, model) = split_model(&reference).ok()?;
@@ -1433,7 +1440,7 @@ impl Turn {
         let Some(Landed { result, spent }) = landed.take() else {
             return Ok(false);
         };
-        spent.count(tokens_used, model_rounds, accounting);
+        spent.count(tokens_used, model_rounds);
         let installed = match result {
             Ok(Summary::Written(written)) => self.install(*written).await,
             Ok(Summary::Parked(until)) => {
@@ -1747,6 +1754,7 @@ impl Turn {
         &self,
         accounting: &mut Accounting,
         landed: &mut Option<Landed>,
+        side: &SideCounts,
     ) -> Result<Round> {
         let (bot, turn) = (self.bot.clone(), self.turn);
         let mut record = self.store.op("inspect", move |db| db.inspect(&bot)).await?;
@@ -1999,7 +2007,7 @@ impl Turn {
                         &mut context,
                         (last.as_ref(), inherited, called),
                         output_bytes,
-                        sent_here.then_some(&mut beside),
+                        sent_here.then_some((&mut beside, side)),
                     )
                     .await?
                 {
@@ -2082,6 +2090,7 @@ impl Turn {
                 model_rounds += rounds;
                 record.tokens_used = record.tokens_used.saturating_add(tokens);
             }
+            accounting.replaced = held.is_some();
             let called = {
                 let call = self.call(
                     provider,
@@ -2111,6 +2120,7 @@ impl Turn {
                 }
             };
             let (called, running) = called;
+            accounting.replaced = false;
             if let Some((rounds, tokens)) = held {
                 model_rounds -= rounds;
                 record.tokens_used = record.tokens_used.saturating_sub(tokens);
@@ -2416,7 +2426,10 @@ impl Turn {
         // A summary's view is replaced once it lands; only the turn's call
         // is refreshed while it streams.
         let warm_after = match body {
-            Body::Window(_) => provider.keep_warm_after(model, record.reasoning.as_deref()),
+            Body::Window(_) if !accounting.replaced => {
+                provider.keep_warm_after(model, record.reasoning.as_deref())
+            }
+            Body::Window(_) => None,
             Body::Copied(_) | Body::Span(..) => None,
         };
         loop {
@@ -3533,15 +3546,34 @@ type Beside<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Landed> + S
 struct Spent {
     tokens: u64,
     rounds: usize,
-    retries: u64,
-    paced_ms: u64,
 }
 impl Spent {
-    fn count(self, tokens_used: &mut u64, model_rounds: &mut usize, accounting: &mut Accounting) {
+    fn count(self, tokens_used: &mut u64, model_rounds: &mut usize) {
         *tokens_used = tokens_used.saturating_add(self.tokens);
         *model_rounds += self.rounds;
-        accounting.retries += self.retries;
-        accounting.paced_ms += self.paced_ms;
+    }
+}
+
+/// The retries and pacing of summaries beside the turn's calls, kept
+/// outside the rounds so one an interrupt cancels still counts toward the
+/// turn's.
+#[derive(Default)]
+struct SideCounts {
+    retries: AtomicU64,
+    paced_ms: AtomicU64,
+}
+
+/// A summary's own accounting, added to its [`SideCounts`] when it ends or
+/// is cancelled.
+struct Counted<'a> {
+    spent: Accounting,
+    into: &'a SideCounts,
+}
+impl Drop for Counted<'_> {
+    fn drop(&mut self) {
+        let (retries, paced_ms) = self.spent.totals();
+        self.into.retries.fetch_add(retries, Relaxed);
+        self.into.paced_ms.fetch_add(paced_ms, Relaxed);
     }
 }
 

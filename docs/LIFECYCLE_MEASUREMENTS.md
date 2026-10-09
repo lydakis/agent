@@ -166,8 +166,11 @@ ranges.
 
 Host: a shared 4-vCPU Intel Xeon (2.1 GHz) Linux 6.18 cloud container with
 15 GiB RAM, not otherwise controlled; numbers from other hosts in these docs
-are not comparable. Agent `agent-runtime 0.1.3` at `0a6f2b2`, release binary
-`cbc4bdbb…`, rustc 1.98.0, bundled SQLite from `libsqlite3-sys` 0.38.2. Pi
+are not comparable. Agent `agent-runtime 0.1.3`, recorded as `0a6f2b2` with
+release binary `cbc4bdbb…`; that digest is the one recorded the same day
+for a build of `f05caa3`, not `0a6f2b2`, and the raw capture is gone, so
+which source built these Agent rows is uncertain. The [2026-10-09 re-run](#re-run-2026-10-09)
+pins both. rustc 1.98.0, bundled SQLite from `libsqlite3-sys` 0.38.2. Pi
 Durable 1.0.0 (source `a13d35a7`), pi-ai 1.0.0, chord 1.0.0, Node v22.22.0
 with its SQLite 3.50.4, lockfile `c1ae3871…`. Python 3.11.15, psutil 7.2.2.
 Observer fingerprint `cf1c3756923e…`; sampling, guards and timeouts as in the
