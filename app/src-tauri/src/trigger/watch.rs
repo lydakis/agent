@@ -292,7 +292,7 @@ async fn begin(places: &Places, client: &Client, watched: &mut [Watched]) -> Res
         client
             .request("follow", json!({"bot": bot, "after": after}))
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(super::coded)?;
     }
     Ok(())
 }
@@ -414,7 +414,7 @@ pub(super) async fn newest_cursor(client: &Client, bot: &str) -> Result<i64, Str
             .request("events", json!({"bot": bot, "after": after, "limit": 1}))
             .await
             .map(|page| page["events"].as_array().is_none_or(Vec::is_empty))
-            .map_err(|e| e.to_string())
+            .map_err(super::coded)
     };
     let mut high = 1i64;
     while !none_after(high).await? {
@@ -517,6 +517,7 @@ mod tests {
             runs: None,
             turn_end: Some((source.into(), 5)),
             count,
+            file: None,
             daemon: Daemon {
                 store: None,
                 socket: Some("/tmp/s".into()),

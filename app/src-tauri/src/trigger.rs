@@ -245,6 +245,9 @@ pub struct Trigger {
     /// many of them it fires.
     pub turn_end: Option<(String, i64)>,
     pub count: Option<u64>,
+    /// The path `--file` watches, which each fire checks is still not one
+    /// every fire writes.
+    pub file: Option<PathBuf>,
     pub daemon: Daemon,
     /// The store identity its daemon announced when it was made; a daemon
     /// on that socket serving another store is not its daemon.
@@ -323,6 +326,9 @@ impl Trigger {
         if let Some(count) = self.count {
             pair("--count", count.to_string());
         }
+        if let Some(file) = &self.file {
+            pair("--file", path(file));
+        }
         if let Some(store) = &self.daemon.store {
             pair("--store", path(store));
         }
@@ -349,7 +355,7 @@ impl Trigger {
             let value = iter
                 .next()
                 .ok_or_else(|| bad(&format!("{flag} needs a value")))?;
-            const FLAGS: [&str; 23] = [
+            const FLAGS: [&str; 24] = [
                 "--name",
                 "--generation",
                 "--bot",
@@ -371,6 +377,7 @@ impl Trigger {
                 "--turn-end",
                 "--turn-end-id",
                 "--count",
+                "--file",
                 "--store",
                 "--socket",
             ];
@@ -426,6 +433,7 @@ impl Trigger {
             runs: number("--runs")?.map(|n| n.max(1) as u64),
             turn_end: pinned("--turn-end", "--turn-end-id")?,
             count: number("--count")?.map(|n| n.max(1) as u64),
+            file: text("--file").map(PathBuf::from),
             daemon,
             store_id: need("--store-id")?,
             message,
@@ -816,6 +824,29 @@ fn git(repo: &Path, args: &[&str]) -> Option<String> {
         .ok()?;
     let text = String::from_utf8(out.stdout).ok()?;
     out.status.success().then(|| text.trim().to_owned())
+}
+
+/// Whether HEAD moved by more than checkouts and resets since it named
+/// `since`: its log's entries newer than that one, newest first. A move
+/// back and forth between commits there already is not news; one the log
+/// no longer reaches is.
+fn committed(repo: &Path, since: &Option<String>) -> bool {
+    let Some(since) = since else {
+        return true;
+    };
+    let Some(log) = git(repo, &["reflog", "-n", "256", "--format=%H %gs", "HEAD"]) else {
+        return true;
+    };
+    for line in log.lines() {
+        let (sha, what) = line.split_once(' ').unwrap_or((line, ""));
+        if sha == since {
+            return false;
+        }
+        if !what.starts_with("checkout:") && !what.starts_with("reset:") {
+            return true;
+        }
+    }
+    true
 }
 
 /// The commit a repository's HEAD names, when it names one.
@@ -1544,22 +1575,28 @@ pub fn migrate(places: &Places, running: Option<&str>, launchd: Loader) {
             continue;
         }
         let path = places.plist(&name);
-        if path.exists() {
-            log(format!(
-                "name_taken: schedule {name} is left at {}: a trigger has its name",
-                old.display()
-            ));
-            continue;
+        // A conversion cut short left its trigger in: it is finished.
+        let resumed = std::fs::read_to_string(&path).is_ok_and(|t| t == converted);
+        if !resumed {
+            // A trigger of that name, or one that ended and is still listed.
+            if path.exists() || places.last(&name).exists() {
+                log(format!(
+                    "name_taken: schedule {name} is left at {}: a trigger has its name",
+                    old.display()
+                ));
+                continue;
+            }
+            if let Err(error) = swap(&path, &name, None, &converted, launchd) {
+                log(error);
+                continue;
+            }
         }
         let result = old_state.join(format!("{name}.json"));
         if result.exists()
+            && !places.last(&name).exists()
             && let Err(e) = std::fs::rename(&result, places.last(&name))
         {
             log(format!("{}: {e}", result.display()));
-        }
-        if let Err(error) = swap(&path, &name, None, &converted, launchd) {
-            log(error);
-            continue;
         }
         if let Err(error) = forget(&old) {
             log(error);
@@ -1760,6 +1797,12 @@ fn runtime() -> Result<tokio::runtime::Runtime, String> {
         .map_err(|e| e.to_string())
 }
 
+/// A daemon's error as this module's: `CODE: detail`, its code kept for
+/// software to branch on.
+fn coded(error: agent_client::Error) -> String {
+    format!("{}: {}", error.code, error.detail.unwrap_or_default())
+}
+
 /// One error shape, `{"error": CODE, "detail": ...}`, from the
 /// `CODE: detail` this module's errors are; `trigger_exists` also names the
 /// `field` that differs.
@@ -1806,9 +1849,11 @@ pub fn cli(args: &[String]) -> i32 {
 }
 
 /// A trigger that watched the triggers' own folder would fire itself: each
-/// fire writes its result there. Folders on a Mac ignore case, and a link
-/// is followed as far as the path exists.
-fn watches_state(places: &Places, watch: &Path) -> Result<(), String> {
+/// fire writes its result there; so would one watching its daemon's store,
+/// which each message it sends writes, or that store's `-wal` and `-shm`.
+/// Folders on a Mac ignore case, and a link is followed as far as the path
+/// exists.
+fn watches_itself(places: &Places, store: Option<&Path>, watch: &Path) -> Result<(), String> {
     let real = |path: &Path| {
         let mut at = path.to_path_buf();
         let mut rest = Vec::new();
@@ -1836,6 +1881,14 @@ fn watches_state(places: &Places, watch: &Path) -> Result<(), String> {
             watch.display()
         ));
     }
+    if let Some(store) = store.map(|s| lower(real(s)))
+        && (real_watch == store || real_watch.starts_with(&format!("{store}-")))
+    {
+        return Err(format!(
+            "invalid_file: {}: its daemon's store changes with every message; watch another path",
+            watch.display()
+        ));
+    }
     Ok(())
 }
 
@@ -1844,7 +1897,7 @@ async fn bot_id(client: &Client, name: &str) -> Result<i64, String> {
     let record = client
         .request("resume", json!({"bot": name}))
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(coded)?;
     record["id"]
         .as_i64()
         .ok_or_else(|| "the daemon named no bot id".into())
@@ -1862,10 +1915,10 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
         )),
         _ => None,
     };
-    if let Some(watch) = &asked.when.watch {
-        watches_state(places, watch)?;
-    }
     let daemon = Daemon::current()?;
+    if let Some(watch) = &asked.when.watch {
+        watches_itself(places, daemon.store.as_deref(), watch)?;
+    }
     let socket = daemon.socket()?;
     let name = asked
         .name
@@ -1951,6 +2004,11 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
         target,
         when: asked.when.text.clone(),
         at: asked.when.at,
+        file: asked
+            .commit
+            .is_none()
+            .then(|| asked.when.watch.clone())
+            .flatten(),
         commit: asked.commit,
         dir: needs_dir
             .then(std::env::current_dir)
@@ -2127,7 +2185,7 @@ async fn start(client: &Client, trigger: &Trigger) -> Result<i64, String> {
                 "created_by_id": by.as_ref().map(|(_, id)| id)}),
         )
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(coded)?;
     made["id"]
         .as_i64()
         .ok_or_else(|| "create: no bot id".into())
@@ -2204,7 +2262,13 @@ async fn deliver(
 /// answer goes to: the app tells a coordinator of its task's turn only
 /// when the answer does not reach it already.
 fn request_id(trigger: &Trigger, id: i64) -> String {
-    let base = format!("{}{id}.{}.{}", sent_by(trigger), now(), std::process::id());
+    let base = format!(
+        "{}{id}.{}.{}.{}",
+        sent_by(trigger),
+        now(),
+        std::process::id(),
+        sends()
+    );
     match &trigger.reply_to {
         Some((_, to)) => format!("{base}.to.{to}"),
         None => base,
@@ -2298,9 +2362,32 @@ fn fires(places: &Places, name: &str, mut fire: impl FnMut(Option<String>)) {
     }
 }
 
+/// This process's sends so far: one fire can send twice within a second
+/// (`fires`), and each send is its own request.
+fn sends() -> u64 {
+    static SENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    SENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// One fire: send the message when it is time, or when it was asked for,
 /// saying why when the note does.
 fn fire(places: &Places, trigger: &Trigger, asked_why: Option<String>) {
+    // A link moved since `add` can make its path one every fire writes: it
+    // would fire itself for ever. It ends, writing nothing more there.
+    if let Some(file) = &trigger.file
+        && let Err(error) = watches_itself(places, trigger.daemon.store.as_deref(), file)
+    {
+        eprintln!("{}", error_json(&error));
+        if let Ok(_lock) = Lock::take(places) {
+            let path = places.plist(&trigger.name);
+            if let Ok(text) = std::fs::read_to_string(&path)
+                && read_plist(&text).is_some_and(|(now, _)| now == *trigger)
+            {
+                end(places, &trigger.name, &path, &text, true, &launchctl);
+            }
+        }
+        return;
+    }
     let asked = asked_why.is_some();
     // Only the watcher, or `fire`, has news of a turn end.
     if trigger.turn_end.is_some() && !asked {
@@ -2336,7 +2423,7 @@ fn fire(places: &Places, trigger: &Trigger, asked_why: Option<String>) {
     // Any write to the HEAD log wakes it; only another commit is news.
     if let Some(repo) = &trigger.commit {
         let seen = head(repo);
-        if !asked && (seen.is_none() || seen == kept.head) {
+        if !asked && (seen.is_none() || seen == kept.head || !committed(repo, &kept.head)) {
             return;
         }
         // A HEAD that cannot be read now keeps the last one seen.
@@ -2388,15 +2475,15 @@ async fn connect(socket: &Path, daemon: &Daemon) -> Result<std::sync::Arc<Client
         Ok((client, _events)) => Ok(client),
         Err(error) if error.code == "daemon_unavailable" => {
             let (Some(store), Some(agent)) = (&daemon.store, crate::daemon::bundled()) else {
-                return Err(error.to_string());
+                return Err(coded(error));
             };
             crate::daemon::Starts::default()
                 .start(&agent, store, daemon.socket.as_deref())
                 .await?;
-            let (client, _events) = Client::connect(socket).await.map_err(|e| e.to_string())?;
+            let (client, _events) = Client::connect(socket).await.map_err(coded)?;
             Ok(client)
         }
-        Err(error) => Err(error.to_string()),
+        Err(error) => Err(coded(error)),
     }
 }
 
@@ -2570,6 +2657,7 @@ mod tests {
             runs: None,
             turn_end: None,
             count: None,
+            file: None,
             daemon: Daemon {
                 store: Some("/Users/a/.agent/state.sqlite".into()),
                 socket: Some("/tmp/s".into()),
@@ -3401,14 +3489,28 @@ mod tests {
             w.root.join(".agent/Triggers/p.x.json"),
             w.root.join(".agent/./triggers/new/file"),
         ] {
-            let refused = watches_state(&w.places, &own).unwrap_err();
+            let refused = watches_itself(&w.places, None, &own).unwrap_err();
             assert!(refused.starts_with("invalid_file:"), "{own:?}: {refused}");
         }
         std::os::unix::fs::symlink(&w.places.state, w.root.join("link")).unwrap();
-        assert!(watches_state(&w.places, &w.root.join("link/p.x.json")).is_err());
+        assert!(watches_itself(&w.places, None, &w.root.join("link/p.x.json")).is_err());
         for other in [w.root.join(".agent"), w.root.join(".agent/triggers-not")] {
-            assert_eq!(watches_state(&w.places, &other), Ok(()), "{other:?}");
+            assert_eq!(watches_itself(&w.places, None, &other), Ok(()), "{other:?}");
         }
+        // Nor its daemon's store, or what SQLite keeps beside it.
+        let store = w.root.join(".agent/state.sqlite");
+        for own in ["state.sqlite", "state.sqlite-wal", "State.sqlite-shm"] {
+            let refused = watches_itself(&w.places, Some(&store), &w.root.join(".agent").join(own));
+            assert!(refused.unwrap_err().contains("store"), "{own}");
+        }
+        assert_eq!(
+            watches_itself(
+                &w.places,
+                Some(&store),
+                &w.root.join(".agent/state.sqlite.bak")
+            ),
+            Ok(())
+        );
     }
 
     #[test]
@@ -3441,7 +3543,15 @@ mod tests {
         assert!(log.ends_with(".git/logs/HEAD") && log.exists());
         let first = head(&root).unwrap();
         git(&["commit", "-q", "--allow-empty", "-m", "two"]);
-        assert_ne!(head(&root).unwrap(), first);
+        let two = head(&root);
+        assert_ne!(two.as_deref().unwrap(), first);
+        // Checking out a commit that was there is a move, not a commit.
+        assert!(!committed(&root, &two));
+        git(&["checkout", "-q", &first]);
+        assert!(!committed(&root, &two));
+        git(&["commit", "-q", "--allow-empty", "-m", "three"]);
+        assert!(committed(&root, &two));
+        assert!(committed(&root, &None));
         assert!(
             commit(root.join("nope").to_str().unwrap())
                 .unwrap_err()
