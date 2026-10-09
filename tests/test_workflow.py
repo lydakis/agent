@@ -102,6 +102,12 @@ class Pieces(unittest.TestCase):
         self.assertEqual(workflow.mismatch({'items': [], 'kind': 'c'}, schema),
                          "reply.kind is 'c', not one of ['a', 'b']")
         self.assertEqual(workflow.mismatch([], schema), 'reply is list, not object')
+        # Enum members compare as JSON does: true is not 1, though 1 is 1.0.
+        self.assertIsNotNone(workflow.mismatch(True, {'enum': [1]}))
+        self.assertIsNotNone(workflow.mismatch(0, {'enum': [False]}))
+        self.assertIsNotNone(workflow.mismatch([{'a': True}], {'enum': [[{'a': 1}]]}))
+        self.assertIsNone(workflow.mismatch(1.0, {'enum': [1]}))
+        self.assertIsNone(workflow.mismatch({'a': [None, False]}, {'enum': [{'a': [None, False]}]}))
 
     def test_replies_parse_bare_or_fenced(self):
         self.assertEqual(workflow.parse_reply(' {"a": 1} '), {'a': 1})
@@ -128,12 +134,15 @@ class Pieces(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp)
             started = {'event': 'agent_started', 'label': 'x', 'bot': 'r.x', 'bot_id': 7, 'key': 'k'}
-            lines = [{**started, 'handle': 'turn:r.x/1', 'attempts': 0},
-                     {**started, 'handle': 'turn:r.x/2', 'attempts': 1}]
+            lines = [{'event': 'agent_submitting', 'label': 'x', 'bot': 'r.x', 'key': 'k', 'request_id': 'q'},
+                     {**started, 'handle': 'turn:r.x/1', 'attempts': 0},
+                     {**started, 'handle': 'turn:r.x/2', 'attempts': 1},
+                     {'event': 'agent_submitting', 'label': 'y', 'bot': 'r.y', 'key': 'k', 'request_id': 'q'}]
             (folder / 'events.jsonl').write_text(''.join(json.dumps(line) + '\n' for line in lines) + '{"cut')
-            records, bots = workflow.history(folder)
+            records, bots, turns = workflow.history(folder)
             self.assertEqual((records['x']['handle'], records['x']['attempts']), ('turn:r.x/2', 1))
-            self.assertEqual(bots, {'r.x': 7})
+            self.assertEqual(records['y'], {'label': 'y', 'bot': 'r.y', 'key': 'k', 'request_id': 'q'})
+            self.assertEqual((bots, turns), ({'r.x': 7, 'r.y': None}, {'r.x': {1, 2}}))
 
     def test_one_runner_holds_a_run(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -262,9 +271,33 @@ result = [first.text, second.ok]
         self.assertEqual(self.result('again'), ['one', True])
         self.assertEqual(self.model.prompts[asked:], ['say:two'])
         self.assertIn('again.two.2', {b['name'] for b in self.agent('ls')})
+        # A turn given to an agent after its run is not the run's.
+        self.agent('run', '--bot', 'again.one', '--', 'say:more')
+        status, resumed = self.start(plan, '--name', 'again')
+        self.assertEqual((resumed['agents']['reused'], resumed['tokens_used']), (2, summary['tokens_used']))
         # From another folder an agent would work elsewhere, so none is reused.
         status, summary = self.start(plan, '--name', 'again', cwd=self.home)
         self.assertEqual((status, summary['agents']['reused'], summary['agents']['started']), (0, 0, 2))
+
+    def test_a_resumed_run_finds_what_was_asked_for_but_not_recorded(self):
+        plan = self.plan('result = [agent("say:" + x, label=x).text for x in ("x", "y", "z")]\n')
+        self.assertEqual(self.start(plan, '--name', 'lost')[1]['status'], 'completed')
+        # As if the runner had ended right after asking for each: x's turn was
+        # submitted, y's bot was never made, and z's name is now another's.
+        kept = [e for e in self.events('lost') if e['event'] in ('run_started', 'agent_submitting')]
+        (self.folder('lost') / 'events.jsonl').write_text(''.join(json.dumps(e) + '\n' for e in kept))
+        for bot in ('lost.y', 'lost.z'):
+            self.agent('rm', '--bot', bot)
+        self.agent('run', '--new', '--bot', 'lost.z', '--instructions=x', '--', 'say:theirs')
+        asked = len(self.model.prompts)
+        status, summary = self.start(plan, '--name', 'lost')
+        self.assertEqual((status, summary['agents']['reused']), (0, 0), summary)
+        self.assertEqual(self.result('lost'), ['x', 'y', 'z'])
+        self.assertEqual(self.model.prompts[asked:], ['say:y', 'say:z'])
+        started = {e['label']: e['bot'] for e in self.events('lost') if e['event'] == 'agent_started'}
+        self.assertEqual(started, {'x': 'lost.x', 'y': 'lost.y', 'z': 'lost.z.2'})
+        # Three turns of five tokens; not the other bot's.
+        self.assertEqual(summary['tokens_used'], 15)
 
     def test_stop_interrupts_running_agents_and_ends_the_run_stopped(self):
         plan = self.plan('''
@@ -343,6 +376,15 @@ while True:
         self.assertEqual((summary['error'], summary['agents']['reused'], summary['agents']['started']),
                          ('max_agents', 3, 0))
         self.assertEqual(len(self.model.prompts), asked)
+        # Hit in one branch, the limit ends the run while a sibling is busy outside agent().
+        busy = self.plan('import time\nparallel([lambda: [agent("say:%d" % i) for i in range(5)], '
+                         'lambda: time.sleep(600)])\n', 'busy.py')
+        began = time.monotonic()
+        status, summary = self.start(busy, '--name', 'busy', '--max-agents', '2')
+        self.assertEqual((summary['error'], summary['agents']['started']), ('max_agents', 2))
+        self.assertLess(time.monotonic() - began, 30)
+        status, summary = self.start(self.plan('result = [float("nan")]\n', 'nan.py'), '--name', 'nan')
+        self.assertEqual((summary['status'], summary['error']), ('failed', 'result_not_json'))
         status, summary = self.start(self.plan('x = 1\n', 'empty.py'), '--name', 'empty')
         self.assertEqual((summary['status'], summary['error']), ('failed', 'no_result'))
         status, refused = self.start(self.plan('def (', 'broken.py'))

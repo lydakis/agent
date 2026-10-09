@@ -68,14 +68,21 @@ moves fan-out, routing and counting into code the model writes once.
   runs, so a second runner of the same run is refused (`run_running`), and
   `status` and `stop` know the runner from the lock, never from a pid alone
   that the system may have reused.
-- **Tokens.** At the end the runner asks the daemon for each of its agents
-  by name and sums their `tokens_used`: one small request per agent, not a
-  listing of the store.
+- **Tokens.** The runner keeps the turn of every handle it waits on, earlier
+  runners' included. At the end it reads each agent's turns from the first
+  of those (the protocol's `turns`) and sums theirs: one small request per
+  agent, not a listing of the store, and a turn someone gives an agent
+  after the run is not counted.
 - **Resuming.** Starting the same plan with the same `--name` reads
   `events.jsonl`: a labelled agent whose prompt and settings hash the same
   and finished `ok` is reused without a model call, one still running when
   the last runner ended is waited on again (the latest reply asked for, so a
   schema retry is not asked twice), and others get a new bot (`LABEL.2`).
+  Each agent is recorded before it is asked for, with a request id of the
+  run's; if a runner ended between asking and recording the handle, the
+  next one finds the turn as that bot's first with that id and waits on it,
+  takes the name again if the bot was never made, and otherwise leaves the
+  bot alone and makes `LABEL.2`.
   The settings include the defaults a new agent would take: the folder the
   runner starts in, `AGENT_MODEL` and `AGENT_REASONING`. The contents of
   AGENTS.md and skills are not hashed. Labels made up by the runner follow
@@ -87,7 +94,8 @@ moves fan-out, routing and counting into code the model writes once.
   interrupts every running agent and ends `stopped`. The timeout (default
   24 h) does the same, ending `failed` with `timeout`. The plan runs on its
   own thread; one busy outside `agent()` gets 5 s to reach it, and then the
-  run ends without it.
+  run ends without it. Reaching `--max-agents` stops the run the same way,
+  at once, whatever the plan's other branches are doing.
 - **No nesting.** An agent of a running run cannot start one.
 
 ## Cost
@@ -96,7 +104,8 @@ Synthetic Responses model (`bench/synthetic_model.py`), release build at
 `b28a54c`, Linux container, 4 x86_64 cores, Python 3.13, 2026-10-09,
 `python3 -m bench.workflow_overhead --agents N --parallel 64 --delay-ms D`. The `workflow` arm runs the plan; the `direct` arm
 does the same commands from a bare loop with one connection, including the
-runner's one `resume` per bot for its tokens at the end, so the difference
+runner's request ids and its one `turns` read per bot for its tokens at the
+end, so the difference
 is the runner's own bookkeeping. Two rounds each, order
 alternated.
 
@@ -109,7 +118,7 @@ alternated.
 
 Per agent, the runner adds about 0.5 ms of CPU over the bare loop; the
 `agent run` process it starts costs about 2.6 ms, and the daemon about 2 ms,
-of which about 0.2 ms is the `resume` at the end (asking for them all at
+of which about 0.2 ms is the token read at the end (asking for them all at
 once measured no faster). With 200 agents of 500 ms in waves of 64, both
 arms finished 0.2 s after the 2.0 s the waves alone take; at 1,000 instant
 agents the run took 0.1 s longer than the loop. Peak RSS is the Python

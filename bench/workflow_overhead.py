@@ -2,7 +2,7 @@
 
 Two arms do the same work: N fresh bots, at most P at a time, each one
 `agent run --new --detach` and one `wait` on a shared daemon connection,
-then one `resume` per bot for its tokens.
+then one `turns` read per bot for its turn's tokens.
 `workflow` runs it as a plan through app/skills/workflow/workflow.py, with
 its labels, events and summary; `direct` is a bare loop of the same
 commands. Each arm runs as its own process, sampled from /proc for its own
@@ -59,6 +59,7 @@ def direct(agents, parallel, delay, round_):
     file = conn.makefile('rw')
     file.readline()
     lock, waiting, slots = threading.Lock(), {}, threading.BoundedSemaphore(parallel)
+    turns = [0] * agents
 
     def read():
         for line in file:
@@ -80,17 +81,20 @@ def direct(agents, parallel, delay, round_):
     def one(i):
         with slots:
             out = subprocess.run([str(BINARY), 'run', '--new', '--detach', '--no-spawn', '--instructions=x',
-                                  '--bot', f'direct{round_}.w{i}', '--', '-'], input=f'delay:{delay}',
-                                 capture_output=True, text=True, check=True).stdout
-            request(i, {'op': 'wait', 'handles': [json.loads(out)['handle']]})
+                                  '--bot', f'direct{round_}.w{i}', '--request-id', f'direct.{i}', '--', '-'],
+                                 input=f'delay:{delay}', capture_output=True, text=True, check=True).stdout
+            handle = json.loads(out)['handle']
+            turns[i] = int(handle.rsplit('/', 1)[1])
+            request(i, {'op': 'wait', 'handles': [handle]})
     threads = [threading.Thread(target=one, args=(i,)) for i in range(agents)]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
-    # The runner reads each agent's tokens at the end; so does this arm.
-    sum(request(agents + i, {'op': 'resume', 'bot': f'direct{round_}.w{i}'})['result']['tokens_used']
-        for i in range(agents))
+    # The runner reads the tokens of each agent's turns at the end; so does this arm.
+    sum(turn['input_tokens'] + turn['output_tokens'] for i in range(agents)
+        for turn in request(agents + i, {'op': 'turns', 'bot': f'direct{round_}.w{i}', 'after': turns[i] - 1,
+                                         'limit': 256})['result']['turns'] if turn['turn'] == turns[i])
 
 
 def arm(name, env, workdir, agents, parallel, delay, round_):
