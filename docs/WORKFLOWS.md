@@ -92,26 +92,31 @@ moves fan-out, routing and counting into code the model writes once.
 
 ## Cost
 
-Synthetic Responses model (`bench/synthetic_model.py`), release build,
-Linux container, 4 x86_64 cores, Python 3.13, 2026-10-09, `python3 -m
-bench.workflow_overhead`. The `workflow` arm runs the plan; the `direct` arm
+Synthetic Responses model (`bench/synthetic_model.py`), release build at
+`a4b59f5`, Linux container, 4 x86_64 cores, Python 3.13, 2026-10-09,
+`python3 -m bench.workflow_overhead --agents N --parallel 64 --delay-ms D`. The `workflow` arm runs the plan; the `direct` arm
 does the same commands from a bare loop with one connection, so the
 difference is the runner's own bookkeeping. Two rounds each, order
 alternated.
 
 | Agents, at once, reply delay | Arm | Wall | Runner CPU | `agent` CLI CPU | Runner peak RSS | Daemon CPU |
 | --- | --- | --- | --- | --- | --- | --- |
-| 200, 64, 500 ms | workflow | 2.19, 2.28 s | 0.37, 0.39 s | 0.56, 0.54 s | 23.2, 23.7 MiB | 0.47, 0.48 s |
-| 200, 64, 500 ms | direct | 2.17, 2.17 s | 0.30, 0.31 s | 0.51, 0.53 s | 23.4, 23.6 MiB | 0.48, 0.46 s |
-| 1,000, 64, none | workflow | 2.64, 2.86 s | 1.69, 1.82 s | 2.62, 2.63 s | 36.9, 37.0 MiB | 1.91, 2.07 s |
-| 1,000, 64, none | direct | 2.56, 2.55 s | 1.14, 1.17 s | 2.64, 2.62 s | 35.3, 35.5 MiB | 1.89, 1.84 s |
+| 200, 64, 500 ms | workflow | 2.26, 2.26 s | 0.42, 0.42 s | 0.54, 0.52 s | 23.8, 23.9 MiB | 0.53, 0.48 s |
+| 200, 64, 500 ms | direct | 2.21, 2.18 s | 0.34, 0.30 s | 0.54, 0.51 s | 23.7, 23.5 MiB | 0.45, 0.44 s |
+| 1,000, 64, none | workflow | 2.94, 2.93 s | 1.90, 1.80 s | 2.56, 2.53 s | 37.9, 37.6 MiB | 2.07, 2.08 s |
+| 1,000, 64, none | direct | 2.43, 2.47 s | 1.15, 1.14 s | 2.62, 2.59 s | 35.1, 35.2 MiB | 1.81, 1.84 s |
 
-Per agent, the runner adds about 0.6 ms of CPU over the bare loop; the
+Per agent, the runner adds about 0.7 ms of CPU over the bare loop; the
 `agent run` process it starts costs about 2.6 ms, and the daemon about 2 ms.
-With 200 agents of 500 ms in waves of 64, the run finished 0.19 to 0.28 s
-after the 2.0 s the waves alone take. Peak RSS is the Python process with a
-thread per item, 37 MiB at 1,000. These hold for this workload and host
-only; macOS is not measured.
+With 200 agents of 500 ms in waves of 64, the run finished 0.26 s after the
+2.0 s the waves alone take. At 1,000 instant agents the run took about
+0.5 s longer than the loop; about 0.2 s of that is the end, where the
+runner asks the daemon for each agent's tokens one by one (sending them all
+at once measured no faster). The loop reads no tokens. Peak RSS is the
+Python process with a thread per item, 38 MiB at 1,000. An earlier
+measurement, before the review fixes and with tokens read from a listing of
+the whole store, cost 0.6 ms an agent and finished 1,000 in 2.64 and 2.86 s.
+These hold for this workload and host only; macOS is not measured.
 
 ## Gaps
 

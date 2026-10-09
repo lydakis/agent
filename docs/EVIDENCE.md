@@ -9,8 +9,8 @@ request of its own, at `cd1d45f` for the fix to run 5's lost steers, at
 `7061fab` and `7c1904d` for the sustained task's runs, at `ea82f7a` for
 serving a gate tag to one approver, at `74f726b` and `aed1669` for
 the automatic approver's own cost, at `81458d2` for the judges
-compared, at `7a66687` for the finish cost of per-bot settings, and with
-the workflow skill for its runner's overhead.
+compared, at `7a66687` for the finish cost of per-bot settings, and at
+`a4b59f5` for the workflow runner's overhead.
 This is the one place that says what is currently
 known. The documents it links to
 keep the method, the raw tables and superseded runs. When a history document's
@@ -140,11 +140,12 @@ more turns is not here, because its work changes with its speed; it is under
   observations (2026-09-15). [Record](DAEMON_MEASUREMENTS.md#store-scale),
   [long history](DAEMON_MEASUREMENTS.md#long-history).
 - **Workflow runner overhead.** A plan of 1,000 instant agents, 64 at a
-  time, cost the runner 1.69 and 1.82 s of CPU against 1.14 and 1.17 s for a
-  bare loop of the same commands, about 0.6 ms an agent, at 37 MiB peak;
+  time, cost the runner 1.90 and 1.80 s of CPU against 1.15 and 1.14 s for a
+  bare loop of the same commands, about 0.7 ms an agent, at 38 MiB peak;
   each agent's `agent run` process cost about 2.6 ms and the daemon about
-  2 ms. 200 agents of 500 ms finished 0.19 to 0.28 s after their waves'
-  2.0 s. Synthetic model, Linux container, 2026-10-09; macOS not measured.
+  2 ms. 200 agents of 500 ms finished 0.26 s after their waves' 2.0 s.
+  Synthetic model, `a4b59f5`, Linux container, 2026-10-09; macOS not
+  measured.
   [Record](WORKFLOWS.md#cost).
 - **Live fleets.** Short-context turns on real providers: 1,024 overlapping
   turns in 12.5 s at 41 MiB, 64 bots for five minutes without drift, and
