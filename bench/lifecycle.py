@@ -152,6 +152,11 @@ def run_once(binary, directory, config, mode, toolset, transport='stdio', memory
                 assert (directory/f'workspace-{agent}'/'artifact').read_text() == 'tool-ok'
         phase = 'idle'
         time.sleep(.45)
+        if engine == 'pi-durable':
+            # Pi Durable's own event stream, a batch per commit, reached
+            # every conversation.
+            streamed = {m['bot'] for m in list(client.saved) if m.get('event') == 'pi' and m.get('events')}
+            assert streamed == {str(agent) for agent in range(config['concurrency'])}, sorted(streamed)
         pages = {str(agent):replay(client, engine, str(agent)) for agent in range(config['concurrency'])}
         if transport == 'socket':
             client.verify_followers(pages)
