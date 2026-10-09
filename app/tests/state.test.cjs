@@ -2475,10 +2475,39 @@ test('a turn the person asked for that ends off screen shows done until its bot 
   assert.equal(glyph('Bob'), 'failed');
   await run('Bob', 3, 'completed');
   assert.equal(glyph('Bob'), 'done');
-  p.S.ui.side = 'Bob'; p.markSeen();
+  // Help over the thread hides it.
+  p.S.ui.side = 'Bob'; p.S.ui.help = {}; p.markSeen();
+  assert.equal(glyph('Bob'), 'done');
+  p.S.ui.help = false; p.markSeen();
   assert.equal(glyph('Bob'), 'idle');
+  p.S.selected = 'Ann'; p.S.ui.side = null; p.S.setup = { open: true };
+  await run('Ann', 2, 'completed');
+  assert.equal(glyph('Ann'), 'done');
+  p.S.setup.open = false; p.markSeen();
+  assert.equal(glyph('Ann'), 'idle');
+  // A deleted bot's mark goes with it.
+  await run('Cy', 2, 'completed');
+  await p.onEvent({ event: 'deleted', bot: 'Cy', data: {} });
+  assert.equal(p.S.unseen.has('Cy'), false);
   // A replayed snapshot is history, not news.
   p.S.ui.side = null; p.S.live = false;
   await run('Bob', 4, 'completed');
   assert.equal(glyph('Bob'), 'idle');
+});
+
+test('a swarm row shows done while one of its agents has an unseen result, until the swarm is opened', async () => {
+  const p = shell();
+  p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one' });
+  for (const [n, id] of [['app.latency-1', 3], ['app.latency-2', 4]]) p.upsert({ name: n, id, provider: 'alpha', model: 'one' });
+  p.learnSwarm(swarmRecord(['app.latency-1', 'app.latency-2'], { ids: { 'app.latency-1': 3, 'app.latency-2': 4 } }));
+  p.S.selected = 'app.lead'; p.S.live = true;
+  const row = () => /class="glyph (\w+)"/.exec(p.botRowHTML(p.tree().find((n) => n.swarm), false))[1];
+  await p.onEvent({ event: 'accepted', bot: 'app.latency-1', turn: 1, data: {} });
+  await p.onEvent({ event: 'turn_finished', bot: 'app.latency-1', turn: 1, data: { status: 'completed' } });
+  assert.equal(row(), 'done');
+  await p.onEvent({ event: 'accepted', bot: 'app.latency-2', turn: 1, data: {} });
+  assert.equal(row(), 'running');
+  p.S.bots.get('app.latency-2').status = 'idle';
+  p.S.selected = '⁂app.latency'; p.markSeen();
+  assert.equal(row(), 'idle');
 });

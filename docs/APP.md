@@ -69,10 +69,13 @@ A side chat asked while the lead works: a fork beside it, the lead untouched.
 
 ![A side chat beside the running lead](app/side-chat.png)
 
-A turn you asked for that finishes while its agent is off screen shows ✔
-instead of ○ until you open that agent. A turn another agent asked for is
-that agent's news, so the tasks stay ○; a failure already shows ✘ until the
-next turn. The mark lives in the window and does not survive a restart.
+A turn you or the app asked for (a scheduled message, a coordinator's task
+update) that finishes while its agent is off screen shows ✔ instead of ○
+until you open that agent; a swarm's row shows it for its agents until you
+open the swarm. Settings, help, the finder and the swarm sheet count as off
+screen. A turn another agent asked for is that agent's news, so the tasks stay
+○; a failure already shows ✘ until the next turn. The mark lives in the
+window and does not survive a restart.
 
 ![demo finished while notes was open](app/done-unseen.png)
 
