@@ -73,11 +73,11 @@ more turns is not here, because its work changes with its speed; it is under
   284.8 ms to all replies, `7120b48`) has not been rerun.
   [Record](DAEMON_MEASUREMENTS.md#admission-window).
 - **Keyed creation.** 64 creations sent at once cost the same with or
-  without a `request_id` (median daemon CPU 11.73 ms on main, 10.88 unkeyed
-  and 11.86 keyed with the key stored, each inside the others' interquartile
-  range), and resending the 64 took 5.88 ms of CPU. Linux x86_64 container,
-  `68b4c84` against `b7bdfe4`, 2026-10-09; macOS not measured.
-  [Record](DAEMON_MEASUREMENTS.md#keyed-creation-cost).
+  without a `request_id` (median daemon CPU 12.28 ms on main, 10.64 unkeyed
+  and 10.87 keyed with the key stored and the deleted-key lookup, each inside
+  the others' interquartile range), and resending the 64 took 5.87 ms of CPU.
+  Linux x86_64 container, `e1b631d` against `b7bdfe4`, 2026-10-09; macOS not
+  measured. [Record](DAEMON_MEASUREMENTS.md#keyed-creation-cost).
 - **Savepoint journals in memory.** With the writer's journals in memory
   instead of temporary files, a submission's `begin` job ran in a median
   184 µs instead of 416 µs, ranges not overlapping. Its round trip (1.28

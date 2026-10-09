@@ -26,8 +26,8 @@ both the creation and the submission, so `run --new --bot NAME --request-id ID`
 resent gets the bot and the turn it made, with `duplicate: true`, rather than
 `bot_exists`; `fork --request-id ID` does the same for a fork, wherever its
 source has moved since, even once the source is deleted. Once the bot a keyed
-command made is deleted, the same command is `bot_deleted` rather than a new
-bot. The same key with any other field changed is
+command made is deleted, any command with that name and key is `bot_deleted`
+rather than a new bot. The same key with any other field changed is
 `idempotency_conflict`, with the field named in `detail` and `field`, and a
 name taken by any other request is still `bot_exists`. `rm --bot NAME --bot-id
 N` deletes that identity: resent while it runs or once it is gone, it

@@ -1153,13 +1153,14 @@ fields returns the bot it made, with `duplicate: true` and no `cursor`, and
 writes nothing; a fork's resend is answered from the fork even after its source
 moved or was deleted. The same key with any field changed is
 `idempotency_conflict`, naming the field in `detail` and `field`. A name taken
-by an unkeyed creation or another key is `bot_exists` with that bot's `bot_id`.
-A keyed resend whose bot has since been deleted is `bot_deleted` with the
-deleted `bot_id`, and never makes it again. `delete` takes an optional
+by an unkeyed creation or another key is `bot_exists`. Once the bot a key made
+is deleted, any request with that name and key is `bot_deleted`, with the
+deleted bot's `bot_id`, and never makes the bot again. Their replies are the
+bot record (`name`, `id`, ...) plus `duplicate`. `delete` takes an optional
 `bot_id`: resent while the first deletion runs or after it finished, it
 succeeds with `duplicate: true`, and an identity that name never held is
-`bot_not_found`. Replies to `create`, `fork` and `delete` carry `bot`, `bot_id`
-and `duplicate`. Protocol 7 adds these fields.
+`bot_not_found`. Its reply carries `bot`, `bot_id`, `duplicate` and the counts
+it freed. Protocol 7 adds these fields.
 
 ### Delivery modes
 

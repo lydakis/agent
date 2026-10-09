@@ -5127,16 +5127,17 @@ Method: a local script over the `bench.admission_burst` helpers writes 64
 `create` requests at once on one connection to a fresh store, against the
 synthetic model, and reads daemon CPU from per-thread scheduler time. A
 keyed run then resends the same 64. Release builds of `b7bdfe4` (main) and
-`68b4c84` (this change, merged with that main, clean tree), 21 rounds of the
+`e1b631d` (this change, merged with that main, clean tree), 21 rounds of the
 three cases in the same order, the first round excluded. Linux x86_64
-container, 2026-10-09.
+container, 2026-10-09. A keyed creation to a free name here also makes the
+`deleted_bots` lookup that refuses a deleted bot's key.
 
 | Build and requests | Daemon CPU per 64 (IQR) | Reply p50 | Last reply |
 | --- | ---: | ---: | ---: |
-| `b7bdfe4`, unkeyed | 11.73 ms (10.61–13.05) | 6.89 ms | 12.35 ms |
-| `68b4c84`, unkeyed | 10.88 ms (10.18–12.28) | 6.67 ms | 11.27 ms |
-| `68b4c84`, keyed | 11.86 ms (10.86–12.78) | 6.91 ms | 11.66 ms |
-| `68b4c84`, keyed resend | 5.88 ms (5.40–6.52) | 3.14 ms | 5.58 ms |
+| `b7bdfe4`, unkeyed | 12.28 ms (10.83–13.64) | 6.80 ms | 12.19 ms |
+| `e1b631d`, unkeyed | 10.64 ms (10.02–12.48) | 6.56 ms | 11.32 ms |
+| `e1b631d`, keyed | 10.87 ms (10.24–12.99) | 6.04 ms | 11.21 ms |
+| `e1b631d`, keyed resend | 5.87 ms (5.54–6.47) | 3.40 ms | 5.63 ms |
 
 Cells are medians of 20 rounds. The three creating cases are within each
 other's interquartile range; a resend writes no bot or event and costs about
