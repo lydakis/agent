@@ -36,7 +36,8 @@ MESSAGE says to follow this skill and names the folder. The folder holds:
   goes. Closed items need no record here.
 - `runs/KEY.md`, one per run, named by its post's key (step 8): what it
   read, reported, left out and why, its plan, and how the post ended. Delete
-  records older than a month, or what `preferences.md` says to keep.
+  records marked done that are older than a month, or than what
+  `preferences.md` says to keep; one still open stays until it is settled.
 
 Replace a state file whole: write `FILE.tmp`, then `mv` it over `FILE`, so a
 run cut off mid-write leaves the old file and never half of one.
