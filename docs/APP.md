@@ -443,7 +443,8 @@ the snapshot pages. A connected peer must send its ready line within five second
 
 Keys: `^k` find an agent and open it as a tab, `^b` sidebar, `^,` settings, `^p` next task beside, `^o` every
 run's thoughts and output, `Esc` close the side pane then stop, `↑` `↓` on an
-empty message to move between bots, `^d` close the window, Enter to send and
+empty message to move between bots (from Home, `↓` opens the first and `↑` the
+last), Enter or Space on a focused tab to choose it, `^d` close the window, Enter to send and
 Shift-Enter for a new line, `/new NAME PROVIDER/MODEL` to create a bot, `?`
 on an empty message for the list and the models in `~/.agent/models`, read
 each time. `⌘` works where `^` does.
@@ -669,15 +670,20 @@ daemon learns nothing about projects; everything here is client work.
 - **Navigation.** Home, then a tab for each agent opened full screen, on a
   bar of floating tabs. The list on the right holds one level below what is
   open: at Home the projects and the bots in none, in a project its threads
-  and swarms, in a thread what it made, in a swarm its agents; each row
+  and swarms, in a thread what it made, in a swarm its agents, and in a swarm
+  agent what it made; each row
   counts the rows one further down. A click on a row looks in beside, in
   place of the list, with its own composer (a beat later, so a double-click
-  can claim it); a double-click, or "Open as tab" in its ⋯, opens a tab. A
+  can claim it); a double-click, or "Open as tab" in its ⋯, opens a tab. The
+  double-click is the click the system counts as second, so it holds when the
+  look has already redrawn the row. A
   task card in a chat opens beside the same way. ⤢ Full screen takes the tab
   on screen a level down; from Home it opens a tab. The crumbs in the head
   (Home › project › thread) go back up, and the window's title says the same.
   An agent already in a tab is that tab. A closed tab hands the window to the
-  one before it; a deleted agent's tab goes up to what made it. ← or `Esc`
+  one before it; a deleted agent's tab goes up to what made it. Tabs, and the
+  agent beside, are saved with the bot's id and come back only for that
+  identity, never for a new bot under the old name. ← or `Esc`
   closes what is beside. The list draws a window of rows cut from the fleet's
   tree in one pass over the open agent's subtree, so a large level costs a
   screenful of rows.

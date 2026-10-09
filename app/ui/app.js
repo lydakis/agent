@@ -1216,10 +1216,11 @@ function restore() {
   const key = sessionKey(); if (!key) return;
   let saved = null; try { saved = JSON.parse(localStorage.getItem(key) || 'null'); } catch (_) {}
   if (!saved) return;
-  // Tabs come back like a browser's, less any agent gone since.
-  if (Array.isArray(saved.tabs)) S.ui.tabs = [...new Set(saved.tabs)].filter((k) => typeof k === 'string' && isOpen(k));
+  // Tabs come back like a browser's, less any agent gone since or made again under its name.
+  if (Array.isArray(saved.tabs)) S.ui.tabs = [...new Set(saved.tabs.map(sameKey).filter(Boolean))];
   S.selected = S.ui.tabs.includes(saved.selected) ? saved.selected : '';
-  if (saved.side && S.bots.has(saved.side) && saved.side !== S.selected) S.ui.side = saved.side;
+  const side = sameKey(saved.side);
+  if (side && S.bots.has(side) && side !== S.selected) S.ui.side = side;
   S.ui.rail = saved.rail !== false; S.ui.steps = !!saved.steps;
   // A model pick belongs to the identity it was made for, not to whichever bot holds the name now.
   if (Array.isArray(saved.override)) for (const entry of saved.override) {
@@ -1233,7 +1234,15 @@ function restore() {
     if (b && b.id != null && b.id === id && effortsFor(b.model).includes(level) && level !== b.reasoning) S.effort.set(name, level);
   }
 }
-function save() { const key = sessionKey(); if (!key) return; try { localStorage.setItem(key, JSON.stringify({ selected: S.selected, tabs: S.ui.tabs, side: S.ui.side, rail: S.ui.rail, steps: S.ui.steps, override: [...S.override].map(([name, model]) => [name, bot(name)?.id ?? null, model]), effort: [...S.effort].map(([name, level]) => [name, bot(name)?.id ?? null, level]) })); } catch (_) {} }
+// A tab, or the agent beside, is saved with the identity it shows; a swarm is its key.
+const keyIdentity = (k) => [k, bot(k)?.id ?? null];
+const sameKey = (entry) => {
+  const [k, id] = Array.isArray(entry) ? entry : [];
+  if (typeof k !== 'string') return null;
+  if (swarmOf(k)) return k;
+  const b = bot(k); return b && b.id != null && b.id === id ? k : null;
+};
+function save() { const key = sessionKey(); if (!key) return; try { localStorage.setItem(key, JSON.stringify({ selected: S.selected, tabs: S.ui.tabs.map(keyIdentity), side: S.ui.side ? keyIdentity(S.ui.side) : null, rail: S.ui.rail, steps: S.ui.steps, override: [...S.override].map(([name, model]) => [name, bot(name)?.id ?? null, model]), effort: [...S.effort].map(([name, level]) => [name, bot(name)?.id ?? null, level]) })); } catch (_) {} }
 window.addEventListener('beforeunload', save);
 window.addEventListener('focus', markSeen);
 
@@ -1869,7 +1878,7 @@ function levelOf(open) {
   const sw = swarmOf(open);
   if (sw) return sw.members.map((m) => memberBot(sw, m)).filter(Boolean).map((b) => ({ b, depth: 0, kids: 0 }));
   const all = rail.all, at = open ? rail.at.get(open) : -1;
-  if (at === undefined) return [];
+  if (at === undefined) return S.bots.has(open) ? madeBy(open) : [];
   const depth = open ? all[at].depth : -1, out = [];
   for (let i = at + 1; i < all.length; i++) {
     const n = all[i];
@@ -1877,6 +1886,14 @@ function levelOf(open) {
     if (n.depth <= depth) break;
     if (n.depth === depth + 1) out.push({ ...n, kids: 0 }); else if (n.depth === depth + 2) out.at(-1).kids += 1;
   }
+  return out;
+}
+// A swarm's agents, and what they made, are left out of the tree: their level is read from who made
+// whom, in one pass over the fleet when one of them is opened.
+function madeBy(open) {
+  const out = [], at = new Map();
+  for (const b of S.bots.values()) if (!leadProject(b.name) && creatorOf(b)?.name === open) { at.set(b.name, out.length); out.push({ b, depth: 0, kids: 0 }); }
+  if (out.length) for (const b of S.bots.values()) { const i = leadProject(b.name) ? undefined : at.get(creatorOf(b)?.name); if (i !== undefined) out[i].kids += 1; }
   return out;
 }
 const levelName = () => !S.selected ? (rail.rows.some((n) => n.head != null) ? 'projects' : 'agents') : swarmOf(S.selected) ? 'agents' : leadProject(S.selected) ? 'threads' : 'helpers';
@@ -2705,6 +2722,9 @@ document.addEventListener('keydown', async (e) => {
   if (S.ui.picker || e.target.id === 'projdir' || e.target.id === 'projsel' || e.target.id === 'projeffort' || e.target.id === 'pickerq') return;
   const k = e.key, ctrl = e.ctrlKey || e.metaKey;
   if (S.ui.menu) { if (k === 'Escape') { closeMenu(); e.preventDefault(); } return; }
+  // A tab is chosen with Enter or Space, as a button is; its close button keeps its own keys.
+  const tab = e.target.closest?.('[data-tab]');
+  if (tab && (k === 'Enter' || k === ' ') && !e.target.closest('[data-act]')) { await openOnly(tab.dataset.tab); e.preventDefault(); return; }
   if (ctrl && k === 'k') { openPicker(); e.preventDefault(); return; }
   // A hidden sidebar patches no rows, so it draws them all again when it opens.
   if (ctrl && k === 'b') { S.ui.rail = !S.ui.rail; if (S.ui.rail) rail.key = ''; render(); save(); e.preventDefault(); return; }
@@ -2713,7 +2733,14 @@ document.addEventListener('keydown', async (e) => {
   if (ctrl && k === 'p') { await nextBeside(); e.preventDefault(); return; }
   if (k === 'Escape') { if (S.ui.file) closeFile(); else if (S.ui.side) closeSide(); else await interrupt(); e.preventDefault(); return; }
   const empty = e.target.id === 'input' && $('input').value === '';
-  if (empty && (k === 'ArrowUp' || k === 'ArrowDown')) { const names = tree().filter((n) => n.b).map((n) => n.b.name); let i = names.indexOf(S.selected); if (i >= 0) { i = (i + (k === 'ArrowDown' ? 1 : names.length - 1)) % names.length; await openOnly(names[i]); } e.preventDefault(); return; }
+  // Up and down step through every agent in order; from Home, down is the first and up the last.
+  if (empty && (k === 'ArrowUp' || k === 'ArrowDown')) {
+    railRows(); const names = rail.all.filter((n) => n.b).map((n) => n.b.name), down = k === 'ArrowDown';
+    let i = names.indexOf(S.selected);
+    i = i >= 0 ? (i + (down ? 1 : names.length - 1)) % names.length : S.selected ? -1 : down ? 0 : names.length - 1;
+    if (i >= 0) await openOnly(names[i]);
+    e.preventDefault(); return;
+  }
   if (!inputIds.has(e.target.id) && k.length === 1 && !ctrl && !e.altKey) $('input').focus();
 });
 function failed(err) {
@@ -2802,11 +2829,14 @@ document.addEventListener('click', async (e) => {
   // Opening a task beside puts the keyboard where openBeside chose.
   else if (task) { await openBeside(task.dataset.task); return; }
   // A row looks in beside, a beat later, so a double-click can claim it before the list turns into
-  // the look; a swarm has no place beside, so it opens.
+  // the look; a swarm has no place beside, so it opens. The second click opens a tab: the system
+  // counts it, so it holds even when a slower double-click lands on a row the look redrew.
   else if (row) {
-    clearTimeout(rowClick); if (e.detail > 1) return;
+    clearTimeout(rowClick);
     const who = row.dataset.bot;
-    if (swarmOf(who)) await openOnly(who); else { rowClick = setTimeout(() => openBeside(who, false).catch(failed), DOUBLE_CLICK_MS); return; }
+    if (e.detail === 2) { try { await openTab(who); } catch (err) { failed(err); } }
+    else if (e.detail > 2) return;
+    else if (swarmOf(who)) await openOnly(who); else { rowClick = setTimeout(() => openBeside(who, false).catch(failed), DOUBLE_CLICK_MS); return; }
   }
   else if (tab) await openOnly(tab.dataset.tab);
   // Clicks return the keyboard to the pane's composer, unless they selected text to copy.
@@ -2814,11 +2844,6 @@ document.addEventListener('click', async (e) => {
 });
 const DOUBLE_CLICK_MS = 230;
 let rowClick = null;
-document.addEventListener('dblclick', async (e) => {
-  const row = e.target.closest?.('[data-bot]'); if (!row || e.target.closest('[data-act]')) return;
-  clearTimeout(rowClick);
-  try { await openTab(row.dataset.bot); } catch (err) { failed(err); }
-});
 document.addEventListener('contextmenu', (e) => {
   const t = e.target.closest('[data-bot], [data-task], [data-tab]'); if (!t) return;
   const who = t.dataset.bot ?? t.dataset.task ?? t.dataset.tab;

@@ -884,6 +884,42 @@ test('a card looks in beside, full screen takes the tab, and Home and the finder
   assert.deepEqual([...p.S.ui.tabs], []); assert.equal(p.S.selected, '');
 });
 
+test('from Home the arrows open the first or last agent; Enter or Space on a tab chooses it', async () => {
+  const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
+  for (const [name, id] of [['app.lead', 1], ['app.build', 2], ['loose', 3]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id === 2 ? 'app.lead' : null, created_by_id: id === 2 ? 1 : null });
+  const doc = p.context.document, key = (k, target = { id: 'input' }) => doc.listeners.keydown({ key: k, target, preventDefault() {} });
+  await key('ArrowDown'); assert.equal(p.S.selected, 'app.lead', 'down from Home is the first row');
+  await key('ArrowDown'); assert.equal(p.S.selected, 'app.build');
+  await p.openOnly(''); await key('ArrowUp'); assert.equal(p.S.selected, 'loose', 'up from Home is the last row');
+  await key('ArrowUp'); assert.equal(p.S.selected, 'app.build');
+  // A focused tab is a button: Enter or Space opens it, and its close button keeps its own keys.
+  p.S.ui.tabs = ['app.lead', 'app.build']; p.S.selected = 'app.build';
+  const tab = (who, act = false) => ({ id: '', closest: (sel) => (sel === '[data-tab]' ? { dataset: { tab: who } } : sel === '[data-act]' && act ? {} : null) });
+  await key('Enter', tab('app.lead')); assert.equal(p.S.selected, 'app.lead');
+  await key(' ', tab('app.build')); assert.equal(p.S.selected, 'app.build');
+  await key('Enter', tab('app.lead', true)); assert.equal(p.S.selected, 'app.build', 'Enter on × is the close button\'s');
+});
+
+test('a saved tab comes back only for the same bot identity', () => {
+  const storage = new Map();
+  const p = shell({}, storage);
+  for (const [name, id] of [['lead', 1], ['task', 2], ['peek', 3]]) p.upsert({ name, id, provider: 'alpha', model: 'one' });
+  p.S.ui.tabs = ['lead', 'task']; p.S.selected = 'task'; p.S.ui.side = 'peek'; p.save();
+  const q = shell({}, storage);
+  q.upsert({ name: 'lead', id: 1, provider: 'alpha', model: 'one' });
+  q.upsert({ name: 'task', id: 9, provider: 'alpha', model: 'one' }); // deleted and made again
+  q.upsert({ name: 'peek', id: 3, provider: 'alpha', model: 'one' });
+  q.restore();
+  assert.deepEqual([...q.S.ui.tabs], ['lead'], 'a new bot under an old name does not take its tab');
+  assert.equal(q.S.selected, '', 'the dropped tab is not selected');
+  assert.equal(q.S.ui.side, 'peek');
+  const r = shell({}, storage);
+  r.upsert({ name: 'lead', id: 1, provider: 'alpha', model: 'one' }); r.upsert({ name: 'task', id: 2, provider: 'alpha', model: 'one' }); r.upsert({ name: 'peek', id: 8, provider: 'alpha', model: 'one' });
+  r.restore();
+  assert.deepEqual([...r.S.ui.tabs], ['lead', 'task']); assert.equal(r.S.selected, 'task');
+  assert.equal(r.S.ui.side, null, 'nor the agent beside');
+});
+
 test('each composer sends to its own pane, and a working bot gets the sticky queue or steer pick', async () => {
   const sent = [], storage = new Map();
   const p = shell({ request: async (op, q) => { sent.push([op, q]); } }, storage);
@@ -1389,10 +1425,16 @@ test('a task card leaves the keyboard beside; a row looks in, and a double-click
   const row = { dataset: { bot: 'app.lead' } }, at = (sel) => (sel === '[data-bot]' ? row : null);
   await doc.listeners.click({ detail: 1, target: { closest: at } }); await p.tick();
   assert.equal(p.S.ui.side, 'app.lead'); assert.equal(p.S.selected, '', 'a click on a row looks in beside');
+  // The second click opens the tab by its count, even when the look already redrew the row.
   await doc.listeners.click({ detail: 2, target: { closest: at } }); await p.tick();
-  assert.equal(p.S.ui.side, 'app.lead', 'the second click of a double-click does not close it');
-  await doc.listeners.dblclick({ target: { closest: at } }); await p.tick();
   assert.equal(p.S.selected, 'app.lead'); assert.deepEqual([...p.S.ui.tabs], ['app.lead']); assert.equal(p.S.ui.side, null);
+  assert.equal(doc.listeners.dblclick, undefined, 'no dblclick handler to miss a redrawn row');
+  // A fast double-click takes the tab before the look fires.
+  p.S.selected = ''; p.S.ui.tabs = [];
+  const build = { dataset: { bot: 'app.build' } }, atBuild = (sel) => (sel === '[data-bot]' ? build : null);
+  await doc.listeners.click({ detail: 1, target: { closest: atBuild } });
+  await doc.listeners.click({ detail: 2, target: { closest: atBuild } }); await p.tick();
+  assert.equal(p.S.selected, 'app.build'); assert.equal(p.S.ui.side, null, 'the pending look was cancelled');
 });
 
 test('a failed first message waits in the side chat\'s composer', async () => {
@@ -1443,6 +1485,7 @@ test('a swarm is one row under its project; its agents and what they made stay i
   p.upsert({ name: 'app.build', id: 2, provider: 'alpha', model: 'one', created_by: 'app.lead', created_by_id: 1 });
   for (const [n, id] of [['app.latency-1', 3], ['app.latency-2', 4]]) p.upsert({ name: n, id, provider: 'alpha', model: 'one' });
   p.upsert({ name: 'app.latency-1-side', id: 5, provider: 'alpha', model: 'one', created_by: 'app.latency-1', created_by_id: 3 });
+  p.upsert({ name: 'app.latency-1-deep', id: 7, provider: 'alpha', model: 'one', created_by: 'app.latency-1-side', created_by_id: 5 });
   // A bot that took a member's name after the member was deleted is not the swarm's: it stays in the tree.
   p.upsert({ name: 'app.latency-3', id: 9, provider: 'alpha', model: 'one' });
   p.learnSwarm(swarmRecord(['app.latency-1', 'app.latency-2', 'app.latency-3'], { ids: { 'app.latency-1': 3, 'app.latency-2': 4, 'app.latency-3': 6 } }));
@@ -1462,6 +1505,12 @@ test('a swarm is one row under its project; its agents and what they made stay i
   p.S.selected = '⁂app.latency';
   assert.deepEqual(Array.from(p.railRows(), (r) => r.b.name), ['app.latency-1', 'app.latency-2']);
   assert.equal(p.upOf('app.latency-1'), '⁂app.latency'); assert.equal(p.upOf('⁂app.latency'), 'app.lead');
+  // An agent of the swarm open in a tab lists its helpers, and they theirs.
+  const level = (open) => { p.S.selected = open; return Array.from(p.railRows(), (r) => [r.b.name, r.kids]); };
+  assert.deepEqual(level('app.latency-1'), [['app.latency-1-side', 1]]);
+  assert.deepEqual(level('app.latency-1-side'), [['app.latency-1-deep', 0]]);
+  assert.deepEqual(level('app.latency-2'), []);
+  p.S.selected = '⁂app.latency';
   // With no tasks after it, the last swarm closes the branch.
   p.S.bots.delete('app.build'); p.S.bots.delete('app.latency-3'); p.S.shapeGen++;
   assert.equal(p.tree()[1].prefix, '└ ');
