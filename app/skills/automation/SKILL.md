@@ -33,8 +33,10 @@ index lacks it. The folder holds:
   ids of every item read at that timestamp, for example
   `{"issues": {"at": "2026-01-05T13:02:11Z", "ids": ["481", "482"]}}`; the
   next run reads from that timestamp inclusive and skips those ids, since
-  several items can share a timestamp. An id alone is a bookmark only when
-  the source orders by it. At setup, set each to the source's newest item
+  several items can share a timestamp. If the source can list an item late
+  with an earlier time, read from a margin before the timestamp, such as an
+  hour, and keep the ids of everything read within that margin instead. An
+  id alone is a bookmark only when the source orders by it. At setup, set each to the source's newest item
   now, or to the start of a backfill `preferences.md` names, so the first
   run does not report the whole history.
 - `ledger.md`: one line per open item: date, source, the source's stable id,
@@ -91,8 +93,11 @@ cap is reached its turns fail with `budget_exhausted`.
 4. **Read each source from its bookmark,** not from a fixed window like "the
    last 24 hours": a window misses items after a late run and repeats them
    after an early one. Follow every page back to the bookmark; a source
-   read only partway is a failed read. Then look up each open item in the
-   ledger again, since nothing new may have arrived about it.
+   read only partway is a failed read. When more is new than one run can
+   take, after an outage or a busy day, take the oldest part in order, move
+   the bookmark only to its end, and say that more is waiting; later runs
+   catch up. Then look up each open item in the ledger again, since nothing
+   new may have arrived about it.
 5. **A failed read is not a quiet day.** When a source errors, times out or
    its tool is missing, leave its bookmark where it is, write the rest from
    the other sources, and end with a line naming what could not be read, such
