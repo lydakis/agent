@@ -20,10 +20,13 @@ Implemented 2026-09-19.
    results: `wait` already hands the creator the bot's final reply. The tool descriptions the daemon sends
    carry the rest. It gives the bot no role and no way of working; a caller
    that wants one passes it. This is the CLI's default and only instruction text.
-2. **AGENTS.md files.** `~/.agents/AGENTS.md` first, then every `AGENTS.md`
-   from the filesystem root down to the workspace, so the nearest file is
-   read last and wins where they disagree. Each is appended under a heading
-   naming its path. Empty files are skipped.
+2. **AGENTS.md files.** `~/.agents/AGENTS.md` first, then, in each folder
+   from the filesystem root down to the workspace, its `AGENTS.md` and then
+   its `.agents/AGENTS.md`, so the nearest file is read last and wins where
+   they disagree. A file reached twice, such as the home folder's
+   `.agents/AGENTS.md` (that first file) or a link to its folder's
+   `AGENTS.md`, is read once. Each is appended under a heading naming its
+   path. Empty files are skipped.
 3. **Skills.** Folders `<name>/SKILL.md` in `<workspace>/.agents/skills` and
    `~/.agents/skills` (the workspace's winning on a name clash), the layout
    of [agentskills.io](https://agentskills.io/specification), become an
