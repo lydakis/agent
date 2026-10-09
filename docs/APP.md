@@ -1128,7 +1128,8 @@ writes each skill it ships, from `app/skills/NAME/`, to
 newer app replaces a skill's files only while every one still matches that
 copy: a skill with a file that was there before the app, or that you edited
 or removed, stays as it is, and a folder's own skill of the same name wins
-over it. Agents already running keep the index they were created with.
+over it. A skill or file the app no longer ships is removed on the same
+terms. Agents already running keep the index they were created with.
 
 ## What it costs, and where the bounds are
 

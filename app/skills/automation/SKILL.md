@@ -12,7 +12,8 @@ the job keeps its state in files in its folder and reads them each run.
 
 ## Setting one up
 
-Give the job its own agent and folder, then schedule it. Schedules need the
+Give the job its own agent and folder, created with `--agents` so it reads
+the folder's rules and skills, then schedule it. Schedules need the
 app on macOS, where launchd keeps the time; elsewhere `add` refuses with
 `schedules_unsupported`, so say so rather than presenting a job as set up.
 
@@ -20,27 +21,37 @@ app on macOS, where launchd keeps the time; elsewhere `add` refuses with
 "$HOME/.agent/schedule" add --bot NAME --cron 'MIN HOUR DAY MONTH WEEKDAY' -- MESSAGE
 ```
 
-MESSAGE says to follow this skill and names the folder. The folder holds:
+MESSAGE names the folder and says to read and follow this file by its
+path, so every run follows the current text even if the agent's skill
+index lacks it. The folder holds:
 
 - `preferences.md`: what the person wants. Sources, what to leave out, the
   destination, a length limit, when to stop. The person writes it. The job
   reads it and never edits it; changes it would suggest go in `proposals.md`.
-- `bookmarks.json`: per source, the newest item read, as that source's own
-  timestamp or id, for example `{"issues": "2026-01-05T13:02:11Z"}`. At
-  setup, set each to the source's newest item now, or to the start of a
-  backfill `preferences.md` names, so the first run does not report the
-  whole history.
+- `bookmarks.json`: per source, where reading resumes. Use the source's own
+  cursor when it has one. Otherwise store the newest timestamp read and the
+  ids of every item read at that timestamp, for example
+  `{"issues": {"at": "2026-01-05T13:02:11Z", "ids": ["481", "482"]}}`; the
+  next run reads from that timestamp inclusive and skips those ids, since
+  several items can share a timestamp. An id alone is a bookmark only when
+  the source orders by it. At setup, set each to the source's newest item
+  now, or to the start of a backfill `preferences.md` names, so the first
+  run does not report the whole history.
 - `ledger.md`: one line per open item: date, source, the source's stable id,
   last known status, for example `2026-01-05 issues 481 waiting on review`.
   An item reported or left unconfirmed stays until it closes, then its line
-  goes. Closed items need no record here.
+  goes. One still open after the tracking limit `preferences.md` sets, or 30
+  days, gets a last line in the next post saying it is no longer followed,
+  then its line goes too, so the ledger and each run's re-checks stay
+  small.
 - `runs/KEY.md`, one per run, named by its post's key (step 8): what it
   read, reported, left out and why, its plan, and how the post ended. Delete
   records marked done that are older than a month, or than what
   `preferences.md` says to keep; one still open stays until it is settled.
 
-Replace a state file whole: write `FILE.tmp`, then `mv` it over `FILE`, so a
-run cut off mid-write leaves the old file and never half of one.
+Replace a state file whole: write `FILE.tmp`, `mv` it over `FILE`, then run
+`sync`, so a run cut off mid-write or by a power loss leaves the old file or
+the new one, never half of one.
 
 Agent cannot give one job its own credentials: every agent's shell sees
 the daemon's environment and your files, and a schedule passes only `HOME`
