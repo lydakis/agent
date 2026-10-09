@@ -1960,8 +1960,18 @@ impl Renderer {
 struct Status {
     per_bot: bool,
     live: bool,
-    /// Each bot's state, and whether the terminal has it.
-    states: HashMap<String, (&'static str, bool)>,
+    /// Each bot with a turn in flight; an ended turn leaves nothing behind.
+    bots: HashMap<String, Record>,
+}
+
+struct Record {
+    turn: Option<i64>,
+    state: &'static str,
+    /// Whether the terminal has this state.
+    written: bool,
+    /// The turn's announced calls a person answers (the `manual` gate);
+    /// other gates are a program's to answer, so their wait is work.
+    manual: Vec<String>,
 }
 
 impl Status {
@@ -1969,7 +1979,7 @@ impl Status {
         Self {
             per_bot,
             live: false,
-            states: HashMap::new(),
+            bots: HashMap::new(),
         }
     }
 
@@ -1978,49 +1988,110 @@ impl Status {
         if event["event"] == "follow_live" {
             self.live = true;
             let mut out = String::new();
-            for (bot, (state, written)) in &mut self.states {
-                if !*written && matches!(*state, "working" | "blocked") {
-                    out.push_str(&report(self.per_bot, bot, state));
+            for (bot, record) in &mut self.bots {
+                if !record.written {
+                    out.push_str(&report(self.per_bot, bot, record.state));
+                    record.written = true;
                 }
-                *written = true;
             }
             return out;
         }
         let Some(bot) = event["bot"].as_str() else {
             return String::new();
         };
-        let state = match event["event"].as_str().unwrap_or("") {
-            "accepted" | "queued" | "steered" | "tool_started" | "tool_completed"
-            | "turn_paced" | "turn_resumed" | "text_delta" | "thinking_delta" => "working",
-            // A turn waits on a gate's verdict or on other turns and processes.
-            "turn_waiting" if event["data"]["approval"] == true => "blocked",
-            "turn_waiting" => "working",
-            "approval_requested" => "blocked",
-            "turn_finished" => match event["data"]["status"].as_str() {
+        let kind = event["event"].as_str().unwrap_or("");
+        let turn = event["turn"].as_i64();
+        let data = &event["data"];
+        // Only the running turn speaks for its bot: one queued behind it,
+        // or one that ends before it starts, changes nothing.
+        if matches!(kind, "queued" | "turn_finished")
+            && self.bots.get(bot).is_some_and(|known| known.turn != turn)
+        {
+            return String::new();
+        }
+        let ended = match kind {
+            "turn_finished" => Some(match data["status"].as_str() {
                 Some("completed") => "done",
                 Some("interrupted") => "idle",
                 // The steer's message joined a turn that goes on.
                 Some("steered") => return String::new(),
                 _ => "error",
-            },
+            }),
             // Only a bot's own record goes; a clear without an id would
             // remove every record on the terminal.
-            "deleted" if self.per_bot => "clear",
+            "deleted" if self.per_bot => Some("clear"),
+            "accepted" | "queued" | "steered" | "tool_started" | "tool_completed"
+            | "approval_requested" | "turn_waiting" | "turn_paced" | "turn_resumed"
+            | "text_delta" | "thinking_delta" => None,
             _ => return String::new(),
         };
-        if self
-            .states
-            .get(bot)
-            .is_some_and(|(known, _)| *known == state)
-        {
+        if let Some(state) = ended {
+            // A turn that ended before the stream is live is not news.
+            self.bots.remove(bot);
+            return if self.live || !self.per_bot {
+                report(self.per_bot, bot, state)
+            } else {
+                String::new()
+            };
+        }
+        if !self.bots.contains_key(bot) {
+            self.bots.insert(
+                bot.to_owned(),
+                Record {
+                    turn,
+                    state: "",
+                    written: false,
+                    manual: Vec::new(),
+                },
+            );
+        }
+        let Some(record) = self.bots.get_mut(bot) else {
+            return String::new();
+        };
+        if record.turn != turn {
+            record.turn = turn;
+            record.manual.clear();
+        }
+        let state = match kind {
+            "approval_requested" => {
+                for call in data["calls"].as_array().into_iter().flatten() {
+                    let manual = call["gates"]
+                        .as_array()
+                        .is_some_and(|gates| gates.iter().any(|tag| tag == "manual"));
+                    if let Some(id) = call["call_id"].as_str().filter(|_| manual)
+                        && !record.manual.iter().any(|known| known == id)
+                    {
+                        record.manual.push(id.to_owned());
+                    }
+                }
+                if record.manual.is_empty() {
+                    "working"
+                } else {
+                    "blocked"
+                }
+            }
+            // A turn waits on a gate's verdict or on other turns and processes.
+            "turn_waiting"
+                if data["approval"] == true
+                    && record
+                        .manual
+                        .iter()
+                        .any(|id| data["call_id"] == id.as_str()) =>
+            {
+                "blocked"
+            }
+            "tool_started" | "tool_completed" => {
+                record.manual.retain(|id| data["call_id"] != id.as_str());
+                "working"
+            }
+            _ => "working",
+        };
+        if record.state == state {
             return String::new();
         }
-        let write = self.live || !self.per_bot;
-        self.states.insert(bot.to_owned(), (state, write));
-        if state == "clear" {
-            self.states.remove(bot);
-        }
-        if write {
+        record.state = state;
+        record.written = self.live || !self.per_bot;
+        if record.written {
             report(self.per_bot, bot, state)
         } else {
             String::new()
@@ -2030,11 +2101,12 @@ impl Status {
 
 /// One OSC 7501 report. Under `follow --all` the record's id is the bot's
 /// name, which bot names' characters always satisfy; a name past the 32
-/// bytes an id segment allows keeps its start and a hash of the whole.
+/// bytes an id segment allows keeps its start and a 64-bit hash of the
+/// whole, so two such names share an id only by a negligible chance.
 fn report(per_bot: bool, bot: &str, state: &str) -> String {
     use base64::Engine;
     let mut body = format!("state={state}");
-    // Every block is a gate's verdict to give.
+    // Only a person's gate blocks: a program answers the others.
     if state == "blocked" {
         body.push_str(":kind=permission");
     }
@@ -2042,10 +2114,10 @@ fn report(per_bot: bool, bot: &str, state: &str) -> String {
         let id = if bot.len() <= 32 {
             bot.to_owned()
         } else {
-            let hash = bot.bytes().fold(0x811c_9dc5u32, |h, b| {
-                (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
+            let hash = bot.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+                (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
             });
-            format!("{}.{hash:08x}", &bot[..23])
+            format!("{}.{hash:016x}", &bot[..15])
         };
         body.push_str(&format!(":id={id}"));
     }
@@ -2518,7 +2590,12 @@ mod tests {
 
     #[test]
     fn program_status_reports_each_change_once_and_skips_ended_history() {
-        let ev = |bot: &str, event: &str, status: Option<&str>| json!({"event":event,"bot":bot,"turn":1,"data":{"status":status}});
+        let at = |bot: &str, turn: i64, event: &str, data: Value| json!({"event":event,"bot":bot,"turn":turn,"data":data});
+        let ev = |bot: &str, event: &str, status: Option<&str>| {
+            at(bot, 1, event, json!({"status":status}))
+        };
+        let ask = |gates: Value| json!({"calls":[{"call_id":"c1","request":1,"gates":gates}]});
+        let gate = json!({"call_id":"c1","approval":true});
         let live = json!({"event":"follow_live","bot":"*"});
         // `run`: its own turn as the root record, replayed or live.
         let mut one = Status::new(false);
@@ -2529,14 +2606,13 @@ mod tests {
         assert_eq!(one.event(&live), "");
         assert_eq!(one.event(&ev("demo", "text_delta", None)), "");
         assert!(
-            one.event(&ev("demo", "approval_requested", None))
+            one.event(&at("demo", 1, "approval_requested", ask(json!(["manual"]))))
                 .contains("state=blocked:kind=permission:")
         );
-        // The turn then waits on the gate: still blocked, nothing new to say.
-        let gate = json!({"event":"turn_waiting","bot":"demo","turn":1,"data":{"approval":true}});
-        assert_eq!(one.event(&gate), "");
+        // The turn then waits on the person: still blocked, nothing new to say.
+        assert_eq!(one.event(&at("demo", 1, "turn_waiting", gate.clone())), "");
         assert!(
-            one.event(&ev("demo", "tool_started", None))
+            one.event(&at("demo", 1, "tool_started", json!({"call_id":"c1"})))
                 .contains("state=working:")
         );
         assert!(
@@ -2550,6 +2626,14 @@ mod tests {
             fast.event(&ev("demo", "turn_finished", Some("failed")))
                 .contains("state=error:")
         );
+        // A program's gate is work, not something to ask the person about.
+        let mut auto = Status::new(false);
+        auto.event(&ev("demo", "accepted", None));
+        assert_eq!(
+            auto.event(&at("demo", 1, "approval_requested", ask(json!(["auto"])))),
+            ""
+        );
+        assert_eq!(auto.event(&at("demo", 1, "turn_waiting", gate.clone())), "");
 
         // `follow --all`: one id per bot; only what still runs comes from history.
         let mut all = Status::new(true);
@@ -2560,10 +2644,27 @@ mod tests {
             all.event(&live),
             "\x1b]7501;state=working:id=busy:app=agent:title=YnVzeQ==\x1b\\"
         );
+        // A turn queued behind a blocked one, then cancelled, leaves it blocked.
+        assert!(
+            all.event(&at("busy", 1, "approval_requested", ask(json!(["manual"]))))
+                .contains("state=blocked:kind=permission:id=busy:")
+        );
+        assert_eq!(all.event(&at("busy", 2, "queued", json!({}))), "");
+        assert_eq!(
+            all.event(&at(
+                "busy",
+                2,
+                "turn_finished",
+                json!({"status":"interrupted"})
+            )),
+            ""
+        );
         assert!(
             all.event(&ev("busy", "turn_finished", Some("interrupted")))
                 .contains("state=idle:id=busy:")
         );
+        // An ended turn leaves nothing to remember.
+        assert!(all.bots.is_empty());
         assert_eq!(all.event(&ev("busy", "turn_finished", Some("steered"))), "");
         assert_eq!(
             all.event(&json!({"event":"deleted","bot":"busy"})),
@@ -2571,22 +2672,22 @@ mod tests {
         );
         // Without per-bot ids a delete writes nothing: no id clears every record.
         assert_eq!(one.event(&json!({"event":"deleted","bot":"demo"})), "");
-        // A name longer than an id segment keeps its start and a hash.
-        let long = "a".repeat(40);
-        let id = all.event(&ev(&long, "accepted", None));
-        let id = id.split("id=").nth(1).unwrap().split(':').next().unwrap();
-        assert_eq!(id.len(), 32);
-        assert!(id.starts_with(&"a".repeat(23)));
-        assert_ne!(
-            id,
-            report(true, &"a".repeat(41), "working")
+        // A name longer than an id segment keeps its start and a 64-bit hash.
+        let id = |bot: &str| {
+            let report = report(true, bot, "working");
+            report
                 .split("id=")
                 .nth(1)
                 .unwrap()
                 .split(':')
                 .next()
                 .unwrap()
-        );
+                .to_owned()
+        };
+        let long = id(&"a".repeat(40));
+        assert_eq!(long.len(), 32);
+        assert!(long.starts_with(&format!("{}.", "a".repeat(15))));
+        assert_ne!(long, id(&"a".repeat(41)));
     }
 
     #[test]
