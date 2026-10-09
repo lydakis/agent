@@ -999,8 +999,8 @@ its news goes out is dropped from it.
 
 A trigger wakes an agent with a message when something happens: a time
 comes, a file is written, a repository's HEAD moves, or someone fires it by
-name. The message is a new turn in the agent's own conversation, never a
-new agent. launchd watches, so a
+name. The message is a new turn in the agent's own conversation; a trigger
+may also start the agent it names on its first fire. launchd watches, so a
 trigger fires with the app closed, and a time the Mac slept through fires
 once when it wakes (`StartCalendarInterval` coalesces missed times;
 `StartInterval` and cron skip them). The daemon has no clock or watcher of
@@ -1011,7 +1011,7 @@ The app writes `~/.agent/trigger` each time it opens, a script that runs its
 executable with `--trigger`:
 
 ```sh
-~/.agent/trigger add [--name NAME] [WHEN] [--bot NAME] -- MESSAGE
+~/.agent/trigger add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] -- MESSAGE
   WHEN: --every 30m | --in 45m | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO
 ~/.agent/trigger ls [--after NAME]
 ~/.agent/trigger fire NAME
@@ -1039,11 +1039,28 @@ that moved nothing sends nothing. With no WHEN, only `fire` runs it.
 **Whom.** `add` defaults to the agent whose shell runs it (`AGENT_BOT`,
 which must still match `AGENT_BOT_ID`); `--bot` names another. Either is
 pinned by its id: a bot deleted since, or a new bot under its name, is not
-reached (`bot_not_found`), and the trigger ends.
+reached (`bot_not_found`), and the trigger ends. `--start NAME --model
+PROVIDER/MODEL [--effort LEVEL]` names an agent that does not exist yet:
+the first fire makes it as the app makes an agent (the daemon's `create`,
+in the folder `add` ran in, with that folder's composed policy and the
+default tools), made by the agent that added the trigger when one did, so
+it shows under that agent, and gives it the fire's message. Its id is kept with the trigger's
+state and later fires message it. A name an agent already has is refused at
+`add` (`bot_exists`), and an agent of that name made before the first fire
+makes that fire fail, naming it.
 
-**The message.** Each message the agent gets starts with one line, `[trigger NAME · YYYY-MM-DD HH:MM · why]`,
+**What else.** `--reply-to BOT` keeps the fire's process until the turn it
+sent ends (the daemon's `wait`, up to a day), then queues that turn's
+answer to BOT, pinned by id; launchd starts no second fire of the trigger
+meanwhile, so a repeating one skips the times that turn spans. `--if CMD`
+runs `sh -c CMD` in the folder `add` ran in before anything else, for up to
+60 s; any exit but 0 skips that fire and records nothing, so a heartbeat
+whose check finds nothing to do costs one process and no model call.
+`--runs N` ends the trigger once N messages went out. Each message the
+agent gets starts with one line, `[trigger NAME · YYYY-MM-DD HH:MM · why]`,
 the local fire time and what fired it (its time, `file PATH`, `commit REPO
-at SHA`, or `fired`), so a catch-up fire after sleep reads as late.
+at SHA`, or `fired`), so a catch-up fire after sleep reads as late; an
+answer passed on by `--reply-to` starts with the agent and turn it is from.
 Submissions carry `origin: "trigger"`; coordinator updates carry `origin:
 "tasks"`. Both are automated input, not human consent for the approver.
 
@@ -1051,8 +1068,8 @@ Submissions carry `origin: "trigger"`; coordinator updates carry `origin:
 otherwise. `add` with a name in use and the same definition changes nothing
 and returns that trigger with `"duplicate": true`, so a retried `add` is
 safe; with another definition it is refused as `trigger_exists`, whose
-`field` names the first that differs (`when`, `bot`, `message`, `commit`,
-`daemon`, `store_id`): `rm` it
+`field` names the first that differs (`when`, `bot`, `start`, `message`,
+`reply_to`, `if`, `runs`, `commit`, `dir`, `daemon`, `store_id`): `rm` it
 first. A name differing from another only in case is refused
 (`name_taken`), since macOS folders would give both one file, and `rm` finds
 a trigger only by the name as stored; `rm` of a name not there is
@@ -1066,9 +1083,11 @@ skipping it. launchd runs no second copy of a job still running.
 
 Each is one LaunchAgent, `~/Library/LaunchAgents/me.lydakis.agent.trigger.NAME.plist`,
 and that file is its definition: its program arguments carry the agent and
-its id, the store and the socket of the shell it was made from (an agent's
-shell has both), the store identity its daemon announced, the one-off's time,
-the repository, and the message. A fire whose daemon announces another store (a reused
+its id (or the agent to start, its model and effort, and who added it), the
+store and the socket of the shell it was made from (an agent's shell has
+both), the store identity its daemon announced, the one-off's time, the
+repository, the folder, the reply agent and its id, the gate, the run limit,
+and the message. A fire whose daemon announces another store (a reused
 socket) sends nothing and records `store_mismatch`. When it fires, the app's
 executable runs with `--trigger-fire` and those arguments. It connects to
 the daemon, and when none answers and the store is known, starts one for it
@@ -1081,8 +1100,9 @@ calendar entry has no year, so a fire more than two days before its time
 does nothing (the slack keeps a one-off whose Mac changed time zone since,
 since launchd follows the new zone's clock), and one more than half a year
 after it is that entry's next year: it sends nothing and ends as `missed`.
-What the fire did (`sent` with the turn, `skipped`, `gone`, `missed` or
-`failed` with why), with the commit it saw, is kept in `~/.agent/triggers/NAME.json`,
+What the fire did (`sent` with the turn and any `reply`, `skipped`, `gone`,
+`missed` or `failed` with why), with the messages sent so far, the agent it
+started and the commit it saw, is kept in `~/.agent/triggers/NAME.json`,
 which Settings shows beside each trigger with its message, a Run now button
 and a Remove button. Triggers are local to this machine. Remote windows
 neither list, run nor remove local triggers.
@@ -1097,7 +1117,7 @@ anything else a failure can leave is listed and removable:
   and fires only use a state file of the current generation, so a trigger
   made again under an ended one's name starts afresh.
 - **Firing** records its result and ends a trigger that is over (a one-off,
-  or one whose agent is gone), both under the lock
+  one whose agent is gone, one that reached `--runs`), both under the lock
   and only while the plist is still the one it fired for: a trigger
   removed while its message went out is left as it now is. A one-off that
   delivered leaves nothing. One that ends without delivering (its agent
@@ -1312,6 +1332,11 @@ trigger fired again on the same HEAD sends nothing and on a new commit sends
 again, and `add`'s idempotence, `fire`'s note and the `WatchPaths` plist are
 covered against the stand-in launchd. A file trigger firing on a write and
 `fire` through `launchctl kickstart` need a Mac (`AGENT_TEST_LAUNCHD=1`).
+Then `--start`, `--reply-to`, `--if` and `--runs` passed against a real
+daemon: a started agent made once in the trigger's folder under the agent
+that added it, then messaged; a second trigger for that name refused at its
+fire; a turn's answer queued to the reply agent with its line; a gate that
+exits 1 costing no turn.
 
 ## Next
 
@@ -1351,8 +1376,8 @@ app's own task updates and triggers by origin), and runs
 folded with failures on their line. Also covers coordinator task updates: batched at rest, excluding requested and replayed turns, retained after send failures.
 `cargo test -p agent-app` includes a failed project-file write leaving
 neither a partial file nor a temporary, and triggers' calendars, plists,
-watched paths, idempotent `add`, `fire`, the commit check, move, the
-conversion of earlier schedules, and each lifecycle step with launchd refusing. With `AGENT_TEST_RUNTIME=1` after a release build
+watched paths, idempotent `add`, `fire`, `--runs`, `--if`, the commit check,
+move, the conversion of earlier schedules, and each lifecycle step with launchd refusing. With `AGENT_TEST_RUNTIME=1` after a release build
 and `cargo build -p agent-app`, `python3 -m unittest tests.test_trigger`
 fires triggers against a real daemon; on a Mac, `AGENT_TEST_LAUNCHD=1`
 adds its one launchd test, which loads real jobs (under a scratch `HOME`, so

@@ -92,6 +92,7 @@ class TriggerFireTests(ModelFixture):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
         sent = self.fire('p.task', 'Check the PR again.')
         self.assertEqual(sent['last']['outcome'], 'sent', sent)
+        self.assertEqual(sent['sent'], 1)
         self.settle('p.task')
         # The message, after one line with the local fire time and what fired it.
         self.assertRegex(self.turns('p.task')[-1]['prompt_preview'],
@@ -223,6 +224,54 @@ class TriggerFireTests(ModelFixture):
         self.assertEqual(first['generation'], 'g1')
         self.assertFalse(last.exists())
 
+    def test_a_start_trigger_makes_its_agent_once_and_messages_it_after(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
+        lead = self.bot_id('p.lead')
+        work = self.path / 'work'
+        work.mkdir()
+        (work / 'AGENTS.md').write_text('Synthetic project rule.\n')
+        target = ['--start', 'p.review', '--model', 'openai/synthetic-model', '--by', 'p.lead', '--by-id', str(lead)]
+        extra = ['--dir', str(work)]
+        env = {'AGENT_PROVIDER': f'openai=responses,{self.url}'}
+        first = self.fire('p.review', 'Review the newest commit.', target=target, extra=extra, app=self.bundle(),
+                          env=env, generation='g1')
+        self.assertEqual(first['last']['outcome'], 'sent', first)
+        self.assertTrue(first['last']['started'])
+        review = self.bot_id('p.review')
+        self.assertEqual((first['started_id'], first['bot_id']), (review, review))
+        record = next(b for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout) if b['name'] == 'p.review')
+        # Made in the folder `add` ran in, under the agent that added it.
+        self.assertEqual((record['workspace'], record['created_by']), (str(work), 'p.lead'))
+        self.settle('p.review')
+        again = self.fire('p.review', 'Review the newest commit.', target=target, extra=extra, app=self.bundle(),
+                          env=env, generation='g1')
+        self.assertEqual((again['last']['outcome'], again['sent']), ('sent', 2), again)
+        self.assertNotIn('started', again['last'])
+        self.settle('p.review')
+        self.assertEqual(len(self.turns('p.review')), 2)
+        # A fire of a new trigger for that name finds an agent it did not start.
+        taken = self.fire('p.review', 'x', target=target, extra=extra, app=self.bundle(), env=env, generation='g2')
+        self.assertEqual(taken['last']['outcome'], 'failed', taken)
+        self.assertEqual(len(self.turns('p.review')), 2)
+
+    def test_an_answer_goes_to_the_reply_agent(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        lead = self.bot_id('p.lead')
+        sent = self.fire('p.task', 'Check the PR.', extra=['--reply-to', 'p.lead', '--reply-to-id', str(lead)])
+        self.assertEqual(sent['last']['reply']['outcome'], 'sent', sent)
+        self.settle('p.lead')
+        task_turn = sent['last']['turn']
+        self.assertRegex(self.turns('p.lead')[-1]['prompt_preview'],
+                         '^' + LINE.format('p.task', f'p.task turn {task_turn} completed'))
+
+    def test_a_gate_that_says_no_costs_no_turn(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        self.assertIsNone(self.fire('p.task', 'x', extra=['--if', 'exit 1', '--dir', str(self.path)]))
+        self.assertEqual(len(self.turns('p.task')), 1)
+        yes = self.fire('p.task', 'x', extra=['--if', 'test -d .', '--dir', str(self.path)])
+        self.assertEqual(yes['last']['outcome'], 'sent', yes)
+
     def test_a_commit_trigger_sends_only_for_a_new_commit(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
         repo = self.path / 'repo'
@@ -239,11 +288,9 @@ class TriggerFireTests(ModelFixture):
         self.assertRegex(self.turns('p.task')[-1]['prompt_preview'], '^' + LINE.format('p.task', re.escape(f'{when} at {sha[:12]}')))
         # The same HEAD again (a checkout, a reflog write) is not news.
         again = self.fire('p.task', 'Look at it.', when=when, extra=extra, generation='g')
-        self.assertEqual(again['last'], first['last'])
-        self.assertEqual(len(self.turns('p.task')), 2)
+        self.assertEqual(again['sent'], 1)
         subprocess.run([*git, 'commit', '-q', '--allow-empty', '-m', 'two'], check=True)
-        news = self.fire('p.task', 'Look at it.', when=when, extra=extra, generation='g')
-        self.assertNotEqual(news['last']['turn'], first['last']['turn'])
+        self.assertEqual(self.fire('p.task', 'Look at it.', when=when, extra=extra, generation='g')['sent'], 2)
 
     def test_add_from_an_agents_shell_needs_launchd(self):
         # Here there is no launchd: the trigger is refused and nothing is left behind.
