@@ -1427,16 +1427,17 @@ function renderTail(el, name, t) {
     line.replaceChildren(text, cursor);
     const done = kind === 'text' ? document.createElement('div') : null; if (done) done.className = 'md';
     el.replaceChildren(...(kind || running ? [done, line].filter(Boolean) : []));
-    state = { transcript: t, kind, turn: t.streamingTurn, gen: t.streamGen, offset: 0, text, running, done, cut: {}, drawn: 0 };
+    state = { transcript: t, kind, turn: t.streamingTurn, gen: t.streamGen, offset: 0, text, running, done, cut: {}, drawn: 0, used: { lines: 0, tags: 0 } };
     tails.set(el, state);
   }
   if (value.length <= state.offset) return;
   // Streamed text is drawn block by block: what has ended (a paragraph, a closed fence) is drawn
   // once and appended, and only the block still being written is plain text. Each delta reads its
-  // own characters, never the whole reply, and provider text never becomes markup unparsed.
-  const at = state.done ? Rich.cut(state.cut, value) : 0;
+  // own characters, never the whole reply, and provider text never becomes markup unparsed. The
+  // blocks share one message's bounds (`used`); past them the rest streams as plain text.
+  const at = state.done && !state.used.over ? Rich.cut(state.cut, value) : 0;
   if (at > state.drawn) {
-    const box = document.createElement('div'); box.innerHTML = Rich.html(value.slice(state.drawn, at));
+    const box = document.createElement('div'); box.innerHTML = Rich.html(value.slice(state.drawn, at), state.used);
     state.done.append(...box.childNodes); Rich.hydrate(state.done);
     state.text.data = value.slice(at); state.drawn = at;
   } else state.text.appendData(value.slice(state.offset));

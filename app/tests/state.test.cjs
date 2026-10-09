@@ -199,6 +199,11 @@ test('a message past 100,000 tags shows as its text', () => {
   assert.match(Rich.html(list), /data-kind="code"/);
   assert.match(Rich.html('- x\n'.repeat(100)), /<li>/);
   assert.doesNotMatch(Rich.html('x\n'.repeat(60000)), /<br>/);
+  // A streamed reply's blocks share the bounds: each piece alone would draw, together they are text.
+  const used = { lines: 0, tags: 0 }, piece = '- x\n'.repeat(30000);
+  assert.match(Rich.html(piece, used), /<li>/);
+  assert.doesNotMatch(Rich.html(piece, used), /<li>/);
+  assert.equal(used.over, true);
 });
 
 test('highlighting arriving redraws only messages whose code waited for it', () => {
@@ -339,6 +344,17 @@ test('streamed Markdown draws each finished block once and keeps fences whole', 
   assert.deepEqual(done.children.map((c) => c.html), [real(text.slice(0, 10)), real(text.slice(10, fence)), real(text.slice(fence, para))]);
   assert.match(done.children[1].html, /data-kind="code"/);
   assert.equal(line.children[0].data, '- item');
+});
+
+test('a streamed reply\'s blocks share one message\'s bounds, then stream as text', () => {
+  const p = page(), t = p.transcript('Bob'); t.streamingTurn = 1; t.streamGen = 1; t.text = '';
+  const el = { dataset: {}, children: [], replaceChildren(...nodes) { this.children = nodes; } };
+  const list = '- x\n'.repeat(30000) + '\n';
+  for (const piece of [list, list, 'more\n\n', 'tail']) { t.text += piece; p.renderTail(el, 'Bob', t); }
+  const [done, line] = el.children, html = done.children.map((c) => c.html);
+  assert.equal(html.length, 2);
+  assert.match(html[0], /<li>/); assert.doesNotMatch(html[1], /<li>/);
+  assert.equal(line.children[0].data, 'more\n\ntail');
 });
 
 test('tool-heavy history folds rows and restores their summaries on scroll', async () => {

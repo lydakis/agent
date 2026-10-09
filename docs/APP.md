@@ -1149,7 +1149,8 @@ waited for it are drawn again. A table past 256 columns or 10,000 cells shows
 as its source, as a short row is padded to the header's width and a few bytes
 a row could ask for millions of cells. A message past 50,000 lines, or one
 that would draw past 100,000 tags, shows as its text, as a `- x` line makes
-an element from four bytes. Fenced blocks are drawn by their language:
+an element from four bytes; a streamed reply's blocks share those bounds, and
+past them the rest streams as text. Fenced blocks are drawn by their language:
 
 - **Code** is highlighted with [highlight.js](https://highlightjs.org) (its
   common languages) in the window's own colors, with a copy button. A block

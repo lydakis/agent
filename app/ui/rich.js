@@ -94,13 +94,18 @@ window.Rich = (() => {
   const TAGS = 100000, LINES = 50000;
   const count = (s, c, max) => { let n = 0, i = -1; while (n <= max && (i = s.indexOf(c, i + 1)) !== -1) n++; return n; };
   const asText = (text) => `<div class="rc" data-kind="code">${head('text', '')}<pre class="code"><code>${esc(text)}</code></pre></div>`;
-  function html(text) {
+  // `used` carries the bounds across the pieces of one message drawn apart, as a streamed reply's
+  // blocks are; once over, `used.over` is set and that piece is text.
+  function html(text, used = { lines: 0, tags: 0 }) {
     waited = false; spent = 0;
     const p = parser();
     if (!p) return `<p>${esc(text)}</p>`;
-    if (count(text, '\n', LINES) > LINES) return asText(text);
+    const lines = count(text, '\n', LINES - used.lines);
+    if (used.lines + lines > LINES) { used.over = true; return asText(text); }
     let out; try { out = p.parse(text); } catch (_) { return `<p>${esc(text)}</p>`; }
-    if (count(out, '<', TAGS) > TAGS) { waited = false; return asText(text); }
+    const tags = count(out, '<', TAGS - used.tags);
+    if (used.tags + tags > TAGS) { waited = false; used.over = true; return asText(text); }
+    used.lines += lines; used.tags += tags;
     return out;
   }
 
