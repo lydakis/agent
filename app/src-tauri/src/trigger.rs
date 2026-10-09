@@ -1161,12 +1161,17 @@ pub fn fire_now(places: &Places, name: &str, launchd: Loader) -> Result<Value, S
 
 /// Whether this fire is one `fire NAME` asked for; the note goes either way.
 fn take_asked(places: &Places, name: &str) -> bool {
+    take_note(places, name, |at| (now() - at).abs() <= ASKED_WITHIN)
+}
+
+/// The `fire NAME` note, gone once read, when `fresh` takes its time.
+fn take_note(places: &Places, name: &str, fresh: impl Fn(i64) -> bool) -> bool {
     let path = places.asked(name);
     let at = std::fs::read_to_string(&path)
         .ok()
         .and_then(|t| t.trim().parse::<i64>().ok());
     let _ = forget(&path);
-    at.is_some_and(|at| (now() - at).abs() <= ASKED_WITHIN)
+    at.is_some_and(fresh)
 }
 
 /// What a fire leaves for the next: the commit it saw.
@@ -1763,11 +1768,14 @@ pub fn fire_cli(args: &[String]) -> i32 {
 }
 
 /// Fire, and again for each `fire NAME` asked while it ran.
+/// One asked while it ran is this fire's however long it ran (a fire can
+/// wait a day); one asked before it started was read at its start.
 fn fires(places: &Places, name: &str, mut fire: impl FnMut(bool)) {
     let mut asked = take_asked(places, name);
     loop {
+        let started = now();
         fire(asked);
-        if !take_asked(places, name) {
+        if !take_note(places, name, |at| at >= started) {
             return;
         }
         asked = true;
@@ -2591,6 +2599,17 @@ mod tests {
         fires(&w.places, &s.name, |asked| {
             if seen.is_empty() {
                 fire_now(&w.places, &s.name, &|x| w.fake.call(x)).unwrap();
+            }
+            seen.push(asked);
+        });
+        assert_eq!(seen, [false, true]);
+        // However long that fire ran; but not one older than its start.
+        let mut seen = Vec::new();
+        fires(&w.places, &s.name, |asked| {
+            if seen.is_empty() {
+                replace(&w.places.asked(&s.name), &(now() + 3600).to_string()).unwrap();
+            } else if seen.len() == 1 {
+                replace(&w.places.asked(&s.name), &(now() - 3600).to_string()).unwrap();
             }
             seen.push(asked);
         });
