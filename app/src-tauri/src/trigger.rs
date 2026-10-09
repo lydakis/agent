@@ -1346,8 +1346,10 @@ fn settle(places: &Places, trigger: &Trigger, outcome: &Value, kept: &Kept, laun
         || trigger.runs.is_some_and(|runs| kept.sent >= runs);
     // One that did not deliver ends only once why is on disk; else its plist
     // stays, listed.
+    // An answer that did not get through keeps its row, saying so.
+    let kept_row = !sent || outcome["reply"]["outcome"] == "failed";
     if over && (sent || recorded.is_ok()) {
-        end(places, &trigger.name, &path, &text, !sent, launchd);
+        end(places, &trigger.name, &path, &text, kept_row, launchd);
     }
 }
 
@@ -1845,7 +1847,8 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
         message: asked.message,
     };
     let app = std::env::current_exe().map_err(|e| e.to_string())?;
-    let environment: Vec<(&str, String)> = ["HOME", "SHELL"]
+    // PATH too: an `--if` command runs with the adder's, as typed there.
+    let environment: Vec<(&str, String)> = ["HOME", "SHELL", "PATH"]
         .into_iter()
         .filter_map(|key| std::env::var(key).ok().map(|v| (key, v)))
         .collect();
@@ -1893,12 +1896,30 @@ fn record_last(
     if !outcome.is_null() {
         outcome["fired_ms"] = json!(now() * 1000);
     }
-    let state = json!({"generation": trigger.generation, "last": outcome, "sent": kept.sent,
+    write_row(places, trigger, &outcome, kept)
+}
+
+fn write_row(places: &Places, trigger: &Trigger, last: &Value, kept: &Kept) -> Result<(), String> {
+    let state = json!({"generation": trigger.generation, "last": last, "sent": kept.sent,
         "started_id": kept.started_id, "head": kept.head});
     let mut row = trigger.json(&state);
     row["started_id"] = json!(kept.started_id);
     row["head"] = json!(kept.head);
     replace(&places.last(&trigger.name), &row.to_string())
+}
+
+/// A `--start` agent's id goes on disk once it is made, with the last fire
+/// as it was: a fire cut short before it settles (its answer can take a
+/// day) must not leave the next to make it again, which its name refuses.
+/// Only while the plist is still this trigger's, as `settle` writes.
+fn keep_started(places: &Places, trigger: &Trigger, kept: &Kept) -> Result<(), String> {
+    let _lock = Lock::take(places)?;
+    let path = places.plist(&trigger.name);
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if read_plist(&text).is_none_or(|(now, _)| now != *trigger) {
+        return Ok(());
+    }
+    write_row(places, trigger, &state(places, trigger)["last"], kept)
 }
 
 /// `YYYY-MM-DD HH:MM`, local.
@@ -1921,20 +1942,32 @@ fn gate(command: &str, dir: Option<&Path>) -> Result<(), String> {
     if let Some(dir) = dir {
         sh.current_dir(dir);
     }
+    // Its own process group: whatever it started goes with it, whatever it
+    // says, so nothing it forked outlives the check.
+    use std::os::unix::process::CommandExt;
+    sh.process_group(0);
     let mut child = sh.spawn().map_err(|e| format!("--if: {e}"))?;
+    let group = child.id() as libc::pid_t;
+    // SAFETY: a signal to the process group this function made.
+    let end_group = || unsafe {
+        libc::kill(-group, libc::SIGKILL);
+    };
     let until = std::time::Instant::now() + GATE_TIMEOUT;
-    loop {
-        match child.try_wait().map_err(|e| format!("--if: {e}"))? {
-            Some(status) if status.success() => return Ok(()),
-            Some(status) => return Err(format!("--if: {status}")),
-            None if std::time::Instant::now() > until => {
-                let _ = child.kill();
+    let said = loop {
+        match child.try_wait() {
+            Err(e) => break Err(format!("--if: {e}")),
+            Ok(Some(status)) if status.success() => break Ok(()),
+            Ok(Some(status)) => break Err(format!("--if: {status}")),
+            Ok(None) if std::time::Instant::now() > until => {
+                end_group();
                 let _ = child.wait();
-                return Err(format!("--if: ran past {}s", GATE_TIMEOUT.as_secs()));
+                break Err(format!("--if: ran past {}s", GATE_TIMEOUT.as_secs()));
             }
-            None => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
         }
-    }
+    };
+    end_group();
+    said
 }
 
 /// The first fire of a `--start` trigger: the agent is made as the app
@@ -1978,6 +2011,7 @@ async fn start(client: &Client, trigger: &Trigger) -> Result<i64, String> {
 /// and gets any other's after its work. A deleted agent's trigger goes.
 async fn deliver(
     client: &Client,
+    places: &Places,
     trigger: &Trigger,
     kept: &mut Kept,
     why: &str,
@@ -1995,6 +2029,9 @@ async fn deliver(
         (Target::Start { name, .. }, None) => match start(client, trigger).await {
             Ok(id) => {
                 kept.started_id = Some(id);
+                if let Err(error) = keep_started(places, trigger, kept) {
+                    eprintln!("{}", error_json(&error));
+                }
                 (name, id, true)
             }
             Err(error) => return json!({"outcome": "failed", "detail": error}),
@@ -2010,7 +2047,7 @@ async fn deliver(
         .request(
             "submit",
             json!({"bot": bot, "bot_id": id,
-                "request_id": format!("trigger-{id}-{}-{}", now(), std::process::id()),
+                "request_id": request_id(trigger, id),
                 "prompt": prompt, "delivery": delivery, "origin": "trigger"}),
         )
         .await;
@@ -2026,6 +2063,17 @@ async fn deliver(
         Err(error) => json!({"outcome": "failed", "detail": error.to_string()}),
     };
     reply(client, trigger, bot, outcome).await
+}
+
+/// A fire's request id. With `--reply-to` it ends `-to-ID`, the agent its
+/// answer goes to: the app tells a coordinator of its task's turn only
+/// when the answer does not reach it already.
+fn request_id(trigger: &Trigger, id: i64) -> String {
+    let base = format!("trigger-{id}-{}-{}", now(), std::process::id());
+    match &trigger.reply_to {
+        Some((_, to)) => format!("{base}-to-{to}"),
+        None => base,
+    }
 }
 
 /// With `--reply-to`, wait for the turn a fire sent and queue its answer
@@ -2058,8 +2106,14 @@ async fn reply(client: &Client, trigger: &Trigger, bot: &str, mut outcome: Value
         Some(text) if !text.is_empty() => text.to_owned(),
         _ => result["error"].to_string(),
     };
+    // The daemon hands a long answer over cut short, and says so.
+    let cut = if result["text_truncated"] == true {
+        " · cut short"
+    } else {
+        ""
+    };
     let prompt = format!(
-        "[trigger {} · {} · {bot} turn {turn} {status}]\n{answer}",
+        "[trigger {} · {} · {bot} turn {turn} {status}{cut}]\n{answer}",
         trigger.name,
         stamp(now())
     );
@@ -2068,7 +2122,7 @@ async fn reply(client: &Client, trigger: &Trigger, bot: &str, mut outcome: Value
             "submit",
             json!({"bot": to, "bot_id": to_id,
                 "request_id": format!("trigger-{to_id}-reply-{turn}"),
-                "prompt": prompt, "delivery": "queue", "origin": "trigger"}),
+                "prompt": prompt, "delivery": "queue", "from": {"bot": bot, "turn": turn}}),
         )
         .await;
     outcome["reply"] = match sent {
@@ -2146,10 +2200,15 @@ fn fire(places: &Places, trigger: &Trigger, asked: bool) {
             kept.head = Some(sha);
         }
     }
-    // A gate that says no costs this process and nothing else.
+    // A gate that says no costs this process and nothing else; a one-off
+    // had its one time, and ends saying so.
     if let Some(command) = &trigger.gate
-        && gate(command, trigger.dir.as_deref()).is_err()
+        && let Err(no) = gate(command, trigger.dir.as_deref())
     {
+        if trigger.at.is_some() {
+            let declined = json!({"outcome": "declined", "detail": no});
+            settle(places, trigger, &declined, &kept, &launchctl);
+        }
         return;
     }
     let outcome = match runtime() {
@@ -2168,7 +2227,7 @@ fn fire(places: &Places, trigger: &Trigger, asked: bool) {
                 return json!({"outcome": "failed", "detail": format!(
                     "store_mismatch: the daemon at {} serves another store", socket.display())});
             }
-            let outcome = deliver(&client, trigger, &mut kept, &why, asked).await;
+            let outcome = deliver(&client, places, trigger, &mut kept, &why, asked).await;
             client.close().await;
             outcome
         }),
@@ -3126,6 +3185,21 @@ mod tests {
     fn a_gate_says_no_with_any_exit_but_zero() {
         assert!(gate("true", None).is_ok());
         assert!(gate("exit 3", None).unwrap_err().contains('3'));
+        // What it started in the background ends with it.
+        let pid = std::env::temp_dir().join(format!("agent-app-gate-{}", std::process::id()));
+        let command = format!("sleep 30 & echo $! > {}", pid.display());
+        assert!(gate(&command, None).is_ok());
+        let pid: libc::pid_t = std::fs::read_to_string(&pid)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        // SAFETY: signal 0 only asks whether the process is there.
+        let alive = unsafe { libc::kill(pid, 0) } == 0
+            && std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .map_or(true, |stat| !stat.contains(") Z "));
+        assert!(!alive, "the gate's background sleep outlived it");
         let dir = std::env::temp_dir();
         assert!(
             gate(

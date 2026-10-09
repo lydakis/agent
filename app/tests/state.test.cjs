@@ -2261,6 +2261,30 @@ test('Settings lists triggers with no project, and only then when there are some
   assert.match(html, /commit \/r<\/span>.*data-act="trigger-fire" data-v="review".*review · starts it on a\/m · answer to demo.lead · if git diff --quiet · 1 of 3 runs/s);
 });
 
+test('a task turn whose answer a trigger passes to its coordinator is not news for it again', async () => {
+  const p = page({ request: async () => ({}), log() {} });
+  p.S.live = true; p.S.attached = true;
+  p.upsert({ name: 'demo.lead', id: 1, status: 'idle' });
+  p.upsert({ name: 'demo.review', id: 2, status: 'idle', created_by: 'demo.lead', created_by_id: 1 });
+  await p.onEvent({ event: 'accepted', bot: 'demo.review', turn: 7, data: { request_id: 'trigger-2-1790000000-41-to-1', origin: 'trigger' } });
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.review', turn: 7, data: { status: 'completed' } });
+  assert.equal(p.S.wakes.get('demo.lead')?.tasks.size ?? 0, 0, 'its answer reaches the coordinator already');
+  // One whose answer goes elsewhere, or a plain trigger's, still is.
+  await p.onEvent({ event: 'accepted', bot: 'demo.review', turn: 8, data: { request_id: 'trigger-2-1790000000-42-to-9', origin: 'trigger' } });
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.review', turn: 8, data: { status: 'completed' } });
+  assert.equal(p.S.wakes.get('demo.lead').tasks.get('demo.review').turn, 8);
+});
+
+test('Settings says when a trigger\'s check said no, or its answer did not get through', () => {
+  const p = page({});
+  const st = p.setupState();
+  st.triggers = [{ name: 'a', bot: 'a', bot_id: 1, when: 'in 2h', once: true, ended: true, message: 'x', last: { outcome: 'declined', fired_ms: 0, detail: '--if: exit status: 1' } },
+    { name: 'b', bot: 'b', bot_id: 2, when: 'in 2h', once: true, ended: true, message: 'y', reply_to: 'p.lead', last: { outcome: 'sent', fired_ms: 0, reply: { outcome: 'failed', detail: 'bot_not_found' } } }];
+  const html = p.setupHTML();
+  assert.match(html, /not delivered.*not sent, its check said no \(--if: exit status: 1\)/s);
+  assert.match(html, /answer not passed on.*ended .*: sent, its answer did not get through \(bot_not_found\)/s);
+});
+
 test('Run now looks again until the fire it started has written its result', async () => {
   let fired = null, reads = 0;
   const p = page({ fireTrigger: async () => ({ fired: true }), triggers: async () => { reads++;

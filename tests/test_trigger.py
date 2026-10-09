@@ -66,7 +66,7 @@ class TriggerFireTests(ModelFixture):
         return bundle / 'agent-app'
 
     def fire(self, name, message, target=None, when='every 30m', extra=(), at=None, app=APP, socket=None,
-             env=None, store_id=None, not_before=None, generation=None):
+             env=None, store_id=None, not_before=None, generation=None, wait=True):
         # What a trigger's plist has launchd run.
         target = target or ['--bot', name, '--bot-id', str(self.bot_id(name))]
         args = [str(app), '--trigger-fire', '--name', name, *target,
@@ -80,6 +80,8 @@ class TriggerFireTests(ModelFixture):
         plist.parent.mkdir(parents=True, exist_ok=True)
         strings = ''.join(f'<string>{xml_escape(a)}</string>' for a in args)
         plist.write_text(f'<plist><dict><key>ProgramArguments</key><array>{strings}</array></dict></plist>')
+        if not wait:
+            return subprocess.Popen(args, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         result = subprocess.run(args, env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
         last = self.home / '.agent/triggers' / f'{name}.json'
@@ -254,6 +256,33 @@ class TriggerFireTests(ModelFixture):
         self.assertEqual(taken['last']['outcome'], 'failed', taken)
         self.assertEqual(len(self.turns('p.review')), 2)
 
+    def test_a_start_trigger_cut_short_while_it_waits_messages_the_agent_it_made(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
+        lead = self.bot_id('p.lead')
+        target = ['--start', 'p.review', '--model', 'openai/synthetic-model', '--by', 'p.lead', '--by-id', str(lead)]
+        extra = ['--dir', str(self.path), '--reply-to', 'p.lead', '--reply-to-id', str(lead)]
+        env = {'AGENT_PROVIDER': f'openai=responses,{self.url}'}
+        # Its turn holds, so the fire waits to pass its answer on, and is stopped there.
+        self.model.release_headers = threading.Event()
+        self.model.all_streaming = self.model.release_headers
+        self.addCleanup(self.model.release_headers.set)
+        running = self.fire('p.review', 'Review.', target=target, extra=extra, app=self.bundle(), env=env,
+                            generation='g1', wait=False)
+        last = self.home / '.agent/triggers/p.review.json'
+        deadline = time.time() + 20
+        while time.time() < deadline and not (last.exists() and json.loads(last.read_text()).get('started_id')):
+            time.sleep(0.05)
+        running.kill()
+        running.wait()
+        made = self.bot_id('p.review')
+        self.assertEqual(json.loads(last.read_text())['started_id'], made)
+        self.model.release_headers.set()
+        self.settle('p.review')
+        again = self.fire('p.review', 'Review.', target=target, extra=extra, app=self.bundle(), env=env,
+                          generation='g1')
+        self.assertEqual(again['last']['outcome'], 'sent', again)
+        self.assertEqual(again['bot_id'], made)
+
     def test_an_answer_goes_to_the_reply_agent(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
@@ -262,8 +291,30 @@ class TriggerFireTests(ModelFixture):
         self.assertEqual(sent['last']['reply']['outcome'], 'sent', sent)
         self.settle('p.lead')
         task_turn = sent['last']['turn']
-        self.assertRegex(self.turns('p.lead')[-1]['prompt_preview'],
-                         '^' + LINE.format('p.task', f'p.task turn {task_turn} completed'))
+        answer = self.turns('p.lead')[-1]
+        self.assertRegex(answer['prompt_preview'], '^' + LINE.format('p.task', f'p.task turn {task_turn} completed'))
+        # It is the task's answer, and says so in the protocol, not only in its first line.
+        connection = Connection(str(self.store) + '.sock')
+        try:
+            events = connection.request('events', bot='p.lead', after=0, limit=256)['result']['events']
+            accepted = next(e['data'] for e in events if e['event'] == 'accepted' and e['turn'] == answer['turn'])
+            self.assertEqual(accepted['from'], {'bot': 'p.task', 'turn': task_turn, 'id': self.bot_id('p.task')})
+            self.assertNotIn('origin', accepted)
+            # The task's own turn names where its answer goes.
+            self.assertEqual(self.turns('p.task')[-1]['request_id'].rsplit('-to-', 1)[1], str(lead))
+        finally:
+            connection.close()
+
+    def test_a_one_off_whose_gate_says_no_ends_saying_so(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        no = self.fire('p.task', 'x', at=int(time.time()), extra=['--if', 'exit 1', '--dir', str(self.path)])
+        self.assertEqual(len(self.turns('p.task')), 1)
+        if sys.platform == 'darwin':
+            self.assertEqual(no['last']['outcome'], 'declined', no)
+            self.assertFalse((self.home / 'Library/LaunchAgents/me.lydakis.agent.trigger.p.task.plist').exists())
+        else:
+            # No launchd to unload it: it stays, with why.
+            self.assertEqual(no['last']['outcome'], 'declined', no)
 
     def test_a_gate_that_says_no_costs_no_turn(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
