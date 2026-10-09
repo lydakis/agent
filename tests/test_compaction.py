@@ -737,19 +737,22 @@ class SummaryCopyTests(ModelFixture):
         self.model.routes = []
         client = self.start(tools='shell', budget=8192)
         self.turn(client, 'a', 'first: ' + 'x' * 300)
-        self.model.call_script = [('shell', {'command': 'seq 1 300'})] * 4
+        self.model.call_script = [('shell', {'command': 'seq 1 300'})] * 3
         self.turn(client, 'b', 'script')
-        indices = self.copies(self.requests())
-        # One at the turn's prompt, one inside the turn, each beside a call
-        # and on the turn's first routing token, to the server that holds
-        # the call's cache.
+        requests = self.requests()
+        first, second = [n for n, r in enumerate(requests) if is_summary(r)]
+        self.copies(requests[:second])
+        # One at the turn's prompt, one inside the turn, each beside a call.
+        # The first copies the call before it, on the turn's first routing
+        # token, to the server that holds the call's cache. The second is
+        # due a boundary after the first was installed: the call between
+        # sent the view from before it, so no call sent the view it would
+        # copy, and it is a request of its own.
         compacted = [e['data'] for e in self.events(client, 'compacted')]
-        self.assertEqual([c['pinned'] is not None for c in compacted], [False, True])
-        # The second boundary's view left no room for the reply beside it,
-        # so its summary went before its call.
-        self.assertEqual([c['request']['beside'] for c in compacted], [True, False])
+        self.assertEqual([(c['pinned'] is not None, c['request']['form'], c['request']['beside'])
+                          for c in compacted], [(False, 'copy', True), (True, 'own', True)])
         self.assertIsNone(self.model.routes[1])
-        self.assertEqual([self.model.routes[n] for n in indices], ['route-2', 'route-2'])
+        self.assertEqual(self.model.routes[first], 'route-2')
 
     def test_a_summary_copies_what_the_call_sent_ahead_of_a_note_written_since(self):
         client = self.start(tools='shell,note', budget=8192)

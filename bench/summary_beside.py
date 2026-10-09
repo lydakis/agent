@@ -51,6 +51,7 @@ def run(binary, prompt, context_bytes, work, summary):
                 wall = time.monotonic() - started
                 if ended['data']['status'] != 'completed':
                     raise RuntimeError(ended['data'].get('error'))
+                held = client.request('turns', bot='Bob', after=0, limit=1)['result']['turns'][0].get('summary_ms')
                 events, after = [], 0
                 while page := client.request('events', bot='Bob', after=after, limit=256)['result']['events']:
                     events += page
@@ -66,6 +67,7 @@ def run(binary, prompt, context_bytes, work, summary):
     work_requests = [r for r in requests if not is_summary(r)]
     compacted = [e['data'] for e in events if e['event'] == 'compacted']
     return {'wall_s': wall, 'summaries': len(requests) - len(work_requests), 'calls': len(work_requests),
+            'summary_ms': held,
             'beside': sum(bool((c.get('request') or {}).get('beside')) for c in compacted),
             'max_input_bytes': max(len(json.dumps(r['input'])) for r in work_requests),
             'work_input_bytes': sum(len(json.dumps(r['input'])) for r in work_requests)}

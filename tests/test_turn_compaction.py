@@ -80,10 +80,11 @@ class TurnCompactionTests(ModelFixture):
         summaries = [(start, end) for summary, start, end in self.model.timeline if summary]
         calls = [start for summary, start, _ in self.model.timeline if not summary]
         self.assertGreaterEqual(len(summaries), 2)
-        # Each summary went out with one call, either reaching the model
+        # Each summary went out with a call, either reaching the model
         # first; the next call waited for it.
         for start, end in summaries:
-            self.assertEqual(sum(start - .2 < call < end for call in calls), 1)
+            self.assertLess(min(abs(call - start) for call in calls), .02)
+            self.assertGreaterEqual(min(call for call in calls if call > start + .02), end)
         events = all_events(client, 'Bob')
         compacted = [e['data'] for e in events if e['event'] == 'compacted']
         self.assertEqual(len(compacted), len(summaries))
@@ -184,9 +185,10 @@ class TurnCompactionTests(ModelFixture):
         self.assertGreater(held['summary_ms'], 1000)
 
     def test_a_failed_summary_the_turn_waited_for_counts_the_wait(self):
-        # As above, but the summary comes back empty: nothing is installed,
-        # and the turn still counts the time it held for it.
-        self.model.timeline, self.model.summary_delay = [], 2.5
+        # As above, but each summary comes back empty: nothing is installed,
+        # each later boundary tries again, and the turn still counts the
+        # time it held for them.
+        self.model.timeline, self.model.summary_delay = [], 1.2
         self.model.empty_compaction, self.model.long_wait = True, 'sleep .5'
         client = self.client(tools='shell,wait', settings={'context_bytes': 65536})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'wait'],
