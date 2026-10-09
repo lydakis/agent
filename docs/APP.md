@@ -1125,12 +1125,12 @@ posting, and record a post only once the destination confirms it.
 Agents read only skills that are files in a folder's `.agents/skills` or in
 `~/.agents/skills` ([client policy](CLIENT.md)). So on every start the app
 writes each skill it ships, from `app/skills/NAME/`, to
-`~/.agents/skills/NAME/`, and keeps what it wrote in `~/.agent/skills/NAME/`
-([skills.rs](../app/src-tauri/src/skills.rs)). A newer app replaces a skill's
-files only while every one still matches that copy: a skill with a file that
-was there before the app, or that you edited or removed, stays as it is, and
-a folder's own skill of the same name wins over it. Agents already running
-keep the index they were created with.
+`~/.agents/skills/NAME/`, and keeps what it wrote in
+`~/.agent/skills/NAME/` ([skills.rs](../app/src-tauri/src/skills.rs)). A
+newer app replaces a skill's files only while every one still matches that
+copy: a skill with a file that was there before the app, or that you edited
+or removed, stays as it is, and a folder's own skill of the same name wins
+over it. Agents already running keep the index they were created with.
 
 It also ships [workflow](../app/skills/workflow/SKILL.md), a SKILL.md and the
 `workflow.py` runner it starts, for running many fresh agents from a plan

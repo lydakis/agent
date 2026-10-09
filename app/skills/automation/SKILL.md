@@ -26,11 +26,20 @@ MESSAGE says to follow this skill and names the folder. The folder holds:
   destination, a length limit, when to stop. The person writes it. The job
   reads it and never edits it; changes it would suggest go in `proposals.md`.
 - `bookmarks.json`: per source, the newest item read, as that source's own
-  timestamp or id, for example `{"issues": "2026-01-05T13:02:11Z"}`.
-- `ledger.md`: one line per item reported: date, source, the source's stable
-  id, last known status. For example `2026-01-05 issues 481 waiting on review`.
+  timestamp or id, for example `{"issues": "2026-01-05T13:02:11Z"}`. At
+  setup, set each to the source's newest item now, or to the start of a
+  backfill `preferences.md` names, so the first run does not report the
+  whole history.
+- `ledger.md`: one line per open item: date, source, the source's stable id,
+  last known status, for example `2026-01-05 issues 481 waiting on review`.
+  An item reported or left unconfirmed stays until it closes, then its line
+  goes. Closed items need no record here.
 - `runs/KEY.md`, one per run, named by its post's key (step 8): what it
-  read, reported, left out and why, its plan, and how the post ended.
+  read, reported, left out and why, its plan, and how the post ended. Delete
+  records older than a month, or what `preferences.md` says to keep.
+
+Replace a state file whole: write `FILE.tmp`, then `mv` it over `FILE`, so a
+run cut off mid-write leaves the old file and never half of one.
 
 Give it credentials that can only read wherever it only reads, such as a
 read-only token in its environment. Leaving write tools out of its list does
@@ -46,15 +55,20 @@ cap is reached its turns fail with `budget_exhausted`.
 2. **Finish the last run.** If the newest run record is not marked done:
    when it says posted or nothing to post, apply the bookmarks and ledger
    lines it lists and mark it done. Otherwise the post may or may not have
-   gone out, so look for its key at the destination (step 8): if it is
-   there, treat the run as posted; if not, mark the run done without
-   applying anything, and this run reads those items again.
-3. **Find today.** The message carries no time. Run `date` and use the local
-   date; a run that fires late, after the computer slept, is still about
-   today.
+   gone out, so look for its key at the destination (step 8). If it is
+   there, treat the run as posted. If a lookup the destination guarantees
+   is complete does not find it, mark the run done without applying
+   anything, and this run reads those items again. If the lookup fails or
+   may miss recent posts, leave the run open, do not post this run, and
+   tell the person which post needs checking.
+3. **Find now.** The message carries no time. Run `date` and use the local
+   date and time; a run that fires late, after the computer slept, is still
+   about today.
 4. **Read each source from its bookmark,** not from a fixed window like "the
    last 24 hours": a window misses items after a late run and repeats them
-   after an early one.
+   after an early one. Follow every page back to the bookmark; a source
+   read only partway is a failed read. Then look up each open item in the
+   ledger again, since nothing new may have arrived about it.
 5. **A failed read is not a quiet day.** When a source errors, times out or
    its tool is missing, leave its bookmark where it is, write the rest from
    the other sources, and end with a line naming what could not be read, such
@@ -66,17 +80,18 @@ cap is reached its turns fail with `budget_exhausted`.
    comment.
 7. **Re-check right before posting.** Look up each item's live status again.
    Drop what has resolved, fix what changed, and drop what cannot be
-   confirmed, listing it in the run record. State a status or leave the item
-   out; do not hedge. Copy links from the source's own link field, never
-   build them by hand.
+   confirmed, listing it in the run record and keeping it in the ledger as
+   unconfirmed so the next run checks it again. State a status or leave the
+   item out; do not hedge. Copy links from the source's own link field,
+   never build them by hand.
 8. **Write the plan, then post once.** Before posting, write into the run
    record the post's key, the new bookmark of each source read
-   successfully, and the ledger lines to add or change. The key names the
-   run: the date in a daily job's title, or the date and hour in an hourly
-   one. Look for that key at the destination and skip if it is there, so a
-   rerun of the same run skips and a later run still posts. A post counts as
-   sent only when the destination confirms it, for example a response with
-   `"ok": true` and a message id.
+   successfully, and the ledger lines to add, change or remove. The key
+   names the run: the time it started (step 3) to the minute, with the UTC
+   offset, for example `2026-01-05 07:30 -0500`. Put it in the post, so
+   step 2 of the next run can find it. A post counts as sent only when the
+   destination confirms it, for example a response with `"ok": true` and a
+   message id.
 9. **Record after the confirmation, in order.** Mark the run record posted
    with the message id, apply its ledger lines, move its bookmarks, then
    mark it done; a run cut off partway is finished by the next run's step 2.
