@@ -251,10 +251,6 @@ pub struct Usage {
     /// Set by the caller that knows it; zero when unknown.
     #[serde(skip_serializing_if = "is_zero")]
     pub sent_ms: u64,
-    /// Set on a summary's own call that ran beside the turn's calls and
-    /// tools, so it held none of them back.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub beside: bool,
     /// The billed attempts, when a provider-side fallback ran more than one
     /// model for the call, or the summarizer's model on a compaction call,
     /// so each can be priced at its model's rates. The totals above are

@@ -303,7 +303,6 @@ mod tests {
                 cache_write_tokens: 0,
                 cache_write_1h_tokens: 0,
                 sent_ms: 0,
-                beside: false,
                 models: Vec::new(),
                 served_model: "gpt-test-2026-09-26".to_owned(),
             })

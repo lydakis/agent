@@ -2263,6 +2263,45 @@ fn schema_41_turns_ran_at_their_bots_effort() {
 }
 
 #[test]
+fn schema_43_turns_report_no_summary_time_and_count_it_after() {
+    let path = std::env::temp_dir().join(format!("agent-summary-ms-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let turn = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        db.begin(
+            "Bob",
+            "r1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn
+    };
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE turns DROP COLUMN summary_ms; PRAGMA user_version=43;")
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert_eq!(db.turns("Bob", 0, 10).unwrap()["turns"][0]["summary_ms"], 0);
+    db.note_pacing(turn, 0, 0, 1200).unwrap();
+    db.note_pacing(turn, 0, 0, 300).unwrap();
+    assert_eq!(
+        db.turns("Bob", 0, 10).unwrap()["turns"][0]["summary_ms"],
+        1500
+    );
+    drop(db);
+    let version: i32 = Connection::open(&path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, Database::SCHEMA);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn schema_42_backfills_absorbed_effort_or_rolls_back_when_history_is_missing() {
     for missing in [None, Some("event"), Some("turn")] {
         let path = std::env::temp_dir().join(format!(
@@ -3209,7 +3248,6 @@ fn budgets_count_tokens_and_turn_listings_carry_accounting() {
         cache_write_tokens: 0,
         cache_write_1h_tokens: 0,
         sent_ms: 0,
-        beside: false,
         models: Vec::new(),
         served_model: String::new(),
     };
@@ -5970,7 +6008,6 @@ fn cached_input_tokens_are_kept_per_turn_and_per_bot_with_their_ratio() {
         cache_write_tokens: 0,
         cache_write_1h_tokens: 0,
         sent_ms: 0,
-        beside: false,
         models: Vec::new(),
         served_model: String::new(),
     };
@@ -5981,7 +6018,6 @@ fn cached_input_tokens_are_kept_per_turn_and_per_bot_with_their_ratio() {
         cache_write_tokens: 0,
         cache_write_1h_tokens: 0,
         sent_ms: 0,
-        beside: false,
         models: Vec::new(),
         served_model: String::new(),
     };
@@ -6045,7 +6081,6 @@ fn cache_migration_rebuilds_retained_usage_or_rolls_back_when_pruned() {
                         cache_write_tokens: 0,
                         cache_write_1h_tokens: 0,
                         sent_ms: 0,
-                        beside: false,
                         output_tokens: 10,
                         models: Vec::new(),
                         served_model: String::new(),
@@ -6082,7 +6117,6 @@ fn cache_migration_rebuilds_retained_usage_or_rolls_back_when_pruned() {
                     cache_write_tokens: 0,
                     cache_write_1h_tokens: 0,
                     sent_ms: 0,
-                    beside: false,
                     output_tokens: 10,
                     models: Vec::new(),
                     served_model: String::new(),

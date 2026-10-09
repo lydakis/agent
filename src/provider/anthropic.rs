@@ -511,7 +511,6 @@ mod tests {
                 cache_write_tokens: 5,
                 cache_write_1h_tokens: 0,
                 sent_ms: 0,
-                beside: false,
                 models: Vec::new(),
                 served_model: "claude-test-20260926".to_owned(),
             })

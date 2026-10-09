@@ -47,15 +47,6 @@ class TurnCompactionTests(ModelFixture):
         compacted = [e['data'] for e in events if e['event'] == 'compacted']
         self.assertGreaterEqual(len(compacted), 3)
         self.assertFalse([e for e in events if e['event'] == 'compaction_failed'])
-        # A summary's call says whether it ran beside the turn's calls, as
-        # its compaction does.
-        spent = []
-        for event in events:
-            if event['event'] == 'usage' and event['data'].get('purpose') == 'compaction':
-                spent.append(event['data'].get('beside', False))
-            elif event['event'] == 'compacted':
-                self.assertEqual(spent, [event['data']['request']['beside']])
-                spent = []
         # Every cut is inside the turn and keeps its prompt, which each
         # later request carries whole after the summary of the turn's start.
         prompt = compacted[0]['pinned']
@@ -72,9 +63,9 @@ class TurnCompactionTests(ModelFixture):
             self.assertLessEqual(len(asked) - len(answered), 1)
 
     def test_a_summary_inside_a_turn_runs_beside_its_calls(self):
-        # Each summary takes a second. Inside the turn, the calls go on
-        # while it runs, sending the view as it is, and a later boundary
-        # installs it.
+        # Each summary takes a second. Inside the turn, it runs beside the
+        # call its boundary sends, with the view as it is, and is installed
+        # before that call's tools run.
         self.model.timeline, self.model.summary_delay = [], 1.0
         client = self.client(tools='shell', settings={'context_bytes': 65536})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
@@ -89,17 +80,18 @@ class TurnCompactionTests(ModelFixture):
         summaries = [(start, end) for summary, start, end in self.model.timeline if summary]
         calls = [start for summary, start, _ in self.model.timeline if not summary]
         self.assertGreaterEqual(len(summaries), 2)
+        # Each summary went out with one call, either reaching the model
+        # first; the next call waited for it.
         for start, end in summaries:
-            self.assertGreaterEqual(sum(start < call < end for call in calls), 2)
+            self.assertEqual(sum(start - .2 < call < end for call in calls), 1)
         events = all_events(client, 'Bob')
         compacted = [e['data'] for e in events if e['event'] == 'compacted']
         self.assertEqual(len(compacted), len(summaries))
-        self.assertTrue(all(c['request']['beside'] and c['request']['waited_ms'] >= 0 for c in compacted))
+        self.assertTrue(all(c['request']['beside'] for c in compacted))
         self.assertFalse([e for e in events if e['event'] == 'compaction_failed'])
-        # Each summary's call says it ran beside the turn's calls.
-        spent = [e['data'] for e in events if e['event'] == 'usage' and e['data'].get('purpose') == 'compaction']
-        self.assertEqual(len(spent), len(summaries))
-        self.assertTrue(all(usage.get('beside') is True for usage in spent))
+        # The turn counts the time it held for them.
+        held = client.request('turns', bot='Bob', after=0, limit=10)['result']['turns']
+        self.assertGreater(held[0]['summary_ms'], 0)
         # Each round ran once, and the turn's calls and results stay paired.
         ran = [e['data']['call_id'] for e in events if e['event'] == 'tool_completed']
         self.assertEqual(ran, [f'long-{n}' for n in range(150)])
@@ -127,7 +119,8 @@ class TurnCompactionTests(ModelFixture):
 
     def test_an_interrupt_still_installs_a_summary_that_landed_beside_a_call(self):
         # The summary lands while the call sent beside it is still held;
-        # the interrupt then drops the turn's rounds before a boundary.
+        # the interrupt then drops the turn's rounds before the call ends,
+        # and the summary is installed and billed all the same.
         self.model.timeline, self.model.summary_delay = [], 0.5
         self.model.hold_after_summary = threading.Event()
         self.addCleanup(self.model.hold_after_summary.set)
@@ -150,12 +143,11 @@ class TurnCompactionTests(ModelFixture):
         billed = [e['data'] for e in events if e['event'] == 'usage' and e['data'].get('purpose') == 'compaction']
         self.assertEqual(len(billed), 1)
 
-    def test_a_summary_beside_the_turn_holds_its_calls_to_the_round_limit(self):
-        # Small rounds: compaction comes due past round 150, and the view
-        # would not outgrow the limit until well past 200, so the summary
-        # is still running as the turn nears its round limit. The turn
-        # waits for it there, and fails with it counted among its rounds.
-        self.model.timeline, self.model.summary_delay = [], 5.0
+    def test_a_summary_beside_the_turn_counts_among_its_rounds(self):
+        # Small rounds: compaction comes due past round 150, and the summary
+        # beside that boundary's call is counted among the turn's rounds,
+        # which end at the limit.
+        self.model.timeline, self.model.summary_delay = [], 1.0
         client = self.client(tools='shell', settings={'context_bytes': 65536})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
                        compaction_instructions='Summarize.')
@@ -166,12 +158,12 @@ class TurnCompactionTests(ModelFixture):
         self.assertEqual(len(requests), 200)
         self.assertEqual(sum(map(is_summary, requests)), 1)
 
-    def test_a_summary_beside_a_call_that_parks_the_turn_lands_before_it_parks(self):
+    def test_a_summary_beside_a_call_is_installed_before_the_turn_parks(self):
         # Compaction comes due past round 150 and the summary takes five
         # seconds; at round 160 the turn starts a command and waits on it,
-        # which parks the turn well before the summary would land. The
-        # summary is installed before the park, in this turn, and the turn
-        # resumed from the park finishes with it.
+        # which parks the turn. The summary is installed before its call's
+        # tools run, in this turn, and the turn resumed from the park
+        # finishes with it.
         self.model.timeline, self.model.summary_delay = [], 5.0
         self.model.long_wait = 'sleep .5'
         client = self.client(tools='shell,wait', settings={'context_bytes': 65536})
@@ -187,13 +179,13 @@ class TurnCompactionTests(ModelFixture):
         self.assertEqual(billed, [turn])
         kinds = [e['event'] for e in events]
         self.assertLess(kinds.index('compacted'), kinds.index('turn_waiting'))
-        # The turn waited for the summary before it parked, and says so.
-        self.assertGreater(compacted[0]['data']['request']['waited_ms'], 1000)
-        self.assertIsInstance(compacted[0]['data']['request']['waited_from_ms'], int)
+        # The turn counts the time it held for the summary.
+        held, = client.request('turns', bot='Bob', after=0, limit=10)['result']['turns']
+        self.assertGreater(held['summary_ms'], 1000)
 
-    def test_a_failed_summary_the_turn_waited_for_records_the_wait(self):
+    def test_a_failed_summary_the_turn_waited_for_counts_the_wait(self):
         # As above, but the summary comes back empty: nothing is installed,
-        # and the wait before the park is recorded on its own.
+        # and the turn still counts the time it held for it.
         self.model.timeline, self.model.summary_delay = [], 2.5
         self.model.empty_compaction, self.model.long_wait = True, 'sleep .5'
         client = self.client(tools='shell,wait', settings={'context_bytes': 65536})
@@ -204,13 +196,8 @@ class TurnCompactionTests(ModelFixture):
         self.assertEqual(ended['data']['status'], 'completed', ended)
         events = all_events(client, 'Bob')
         self.assertNotIn('compacted', [e['event'] for e in events])
-        waits = [e for e in events if e['event'] == 'compaction_waited']
-        parked = next(i for i, e in enumerate(events) if e['event'] == 'turn_waiting')
-        before = [e for e in waits if events.index(e) < parked]
-        self.assertTrue(before, [e['event'] for e in events][parked - 8:parked + 1])
-        self.assertEqual(before[-1]['turn'], turn)
-        self.assertGreater(before[-1]['data']['waited_ms'], 1000)
-        self.assertIsInstance(before[-1]['data']['waited_from_ms'], int)
+        held, = client.request('turns', bot='Bob', after=0, limit=10)['result']['turns']
+        self.assertGreater(held['summary_ms'], 1000)
 
     def test_a_turn_resumed_before_its_summary_pool_reopens_does_not_wait_for_it(self):
         # The turn runs on another model than its summarizer. Its summary

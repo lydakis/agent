@@ -991,7 +991,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 43;
+    pub const SCHEMA: i32 = 44;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1144,6 +1144,7 @@ impl Database {
                 input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
                 started_ms INTEGER, finished_ms INTEGER,
                 retries INTEGER NOT NULL DEFAULT 0, paced_ms INTEGER NOT NULL DEFAULT 0,
+                summary_ms INTEGER NOT NULL DEFAULT 0,
                 delivery TEXT NOT NULL DEFAULT 'reject', expected_turn INTEGER,
                 cached_input_tokens INTEGER NOT NULL DEFAULT 0,
                 from_bot TEXT, from_turn INTEGER, from_id INTEGER, origin TEXT, reasoning TEXT, inherited_reasoning TEXT,
@@ -4118,19 +4119,6 @@ impl Database {
         tx.commit()?;
         Ok(())
     }
-    /// A summary beside the turn that the turn waited for but that
-    /// installed nothing: when the wait began and how long it lasted.
-    pub fn compaction_waited(&mut self, turn: i64, from_ms: u64, waited_ms: u64) -> Result<()> {
-        let bot = self.active(turn)?;
-        event(
-            &self.conn,
-            &bot.name,
-            Some(turn),
-            "compaction_waited",
-            json!({"waited_ms": waited_ms, "waited_from_ms": from_ms}),
-        )?;
-        Ok(())
-    }
     pub fn tool_start(&mut self, turn: i64, call: &ToolCall) -> Result<Value> {
         let bot = self.active(turn)?;
         // Every call before it is done, so a gate still undecided is a later
@@ -5157,6 +5145,7 @@ impl Database {
         call_spent_ms: u64,
         retries: u64,
         paced_ms: u64,
+        summary_ms: u64,
         compaction: bool,
         copied: Option<CopiedCall>,
         route: Option<&str>,
@@ -5186,8 +5175,15 @@ impl Database {
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
         tx.execute(
-            "UPDATE turns SET status='paced',waiting=?,retries=retries+?,paced_ms=paced_ms+? WHERE id=?",
-            params![serde_json::to_string(&waiting)?, retries as i64, paced_ms as i64, turn],
+            "UPDATE turns SET status='paced',waiting=?,retries=retries+?,paced_ms=paced_ms+?,
+                summary_ms=summary_ms+? WHERE id=?",
+            params![
+                serde_json::to_string(&waiting)?,
+                retries as i64,
+                paced_ms as i64,
+                summary_ms as i64,
+                turn
+            ],
         )?;
         tx.execute("UPDATE bots SET status='paced' WHERE name=?", [&bot.name])?;
         let data = json!({"resume_at_ms":resume_at_ms});
@@ -6320,10 +6316,16 @@ impl Database {
         let (queued, _) = self.pending()?;
         Ok((waiting, self.running_processes()?, queued, paced))
     }
-    pub fn note_pacing(&mut self, turn: i64, retries: u64, paced_ms: u64) -> Result<()> {
+    pub fn note_pacing(
+        &mut self,
+        turn: i64,
+        retries: u64,
+        paced_ms: u64,
+        summary_ms: u64,
+    ) -> Result<()> {
         self.conn.execute(
-            "UPDATE turns SET retries=retries+?,paced_ms=paced_ms+? WHERE id=?",
-            params![retries as i64, paced_ms as i64, turn],
+            "UPDATE turns SET retries=retries+?,paced_ms=paced_ms+?,summary_ms=summary_ms+? WHERE id=?",
+            params![retries as i64, paced_ms as i64, summary_ms as i64, turn],
         )?;
         Ok(())
     }
@@ -6338,7 +6340,8 @@ impl Database {
                     t.model_rounds,t.started_ms,t.finished_ms,
                     substr(CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END,1,200),
                     length(CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END),
-                    t.retries,t.paced_ms,t.delivery,t.cached_input_tokens,COALESCE(t.reasoning,t.inherited_reasoning,b.reasoning)
+                    t.retries,t.paced_ms,t.delivery,t.cached_input_tokens,COALESCE(t.reasoning,t.inherited_reasoning,b.reasoning),
+                    t.summary_ms
              FROM turns t JOIN bots b ON b.name=t.bot LEFT JOIN nodes n ON n.id=t.prompt_node
              WHERE t.bot=? AND t.id>? ORDER BY t.id LIMIT ?",
         )?;
@@ -6360,6 +6363,7 @@ impl Database {
                 "started_ms":r.get::<_, Option<i64>>(8)?,"finished_ms":r.get::<_, Option<i64>>(9)?,
                 "prompt_preview":preview,"prompt_bytes":r.get::<_, i64>(11)?,
                 "retries":r.get::<_, i64>(12)?,"paced_ms":r.get::<_, i64>(13)?,
+                "summary_ms":r.get::<_, i64>(17)?,
                 "delivery":r.get::<_, String>(14)?,
                 "cached_input_tokens":r.get::<_, i64>(15)?,
                 "cache_hit":cache_hit(r.get::<_, i64>(15)?, r.get::<_, i64>(5)?)}),
@@ -7638,6 +7642,15 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         if from == 42 {
             migrate_absorbed_effort(conn)?;
         }
+    }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='summary_ms')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 43 -> 44: how long summaries held each turn. None was counted
+        // before, so stored turns report zero.
+        conn.execute_batch("ALTER TABLE turns ADD COLUMN summary_ms INTEGER NOT NULL DEFAULT 0;")?;
     }
     Ok(())
 }

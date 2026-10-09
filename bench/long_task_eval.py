@@ -798,10 +798,11 @@ def reported_closes(answer, numbers):
     return reported
 
 
-def score(root, facts, events, answer, corrected_at=None, finished_ms=None):
+def score(root, facts, events, answer, corrected_at=None, summary_ms=0):
     """Outcomes from the workspace and the bot's events. For the sustained
     task, `corrected_at` is how many steps the record held when the turn
-    took in the correction."""
+    took in the correction. `summary_ms` is how long summaries held the
+    bot's turns, as the daemon counted it."""
     passed, cases, failure = hidden_tests(root)
     vendor_intact = vendor_manifest(root) == facts['vendor']
     compactions = [e for e in events if e['event'] == 'compacted']
@@ -885,41 +886,6 @@ def score(root, facts, events, answer, corrected_at=None, finished_ms=None):
                               'output_tokens': total(spent, 'output_tokens')})
             spent = []
 
-    # A summary's latency: from its send to the send of the model call it
-    # held back, which also counts recording the compaction. Attempts in a
-    # row, such as a retry after one that failed, are one interval. A
-    # summary's own call that ran beside the turn's calls says so; it held
-    # the turn back only from when the turn began to wait for it, which its
-    # compaction records, or the wait itself when it installed nothing, to
-    # the next call, or for the wait alone when the turn parked or ended
-    # next. One the turn ended on before another call held it back to the
-    # turn's end, which `finished_ms` gives by turn.
-    held, start, joined = 0, None, None
-    for event in events:
-        data = event['data']
-        request = data.get('request') or {}
-        if event['event'] == 'compacted' and request.get('beside') and request.get('waited_from_ms'):
-            joined = request
-        elif event['event'] == 'compaction_waited':
-            joined = data
-        elif event['event'] in ('turn_waiting', 'turn_paced', 'turn_finished') and joined:
-            held += joined['waited_ms']
-            joined = None
-        if event['event'] == 'turn_finished' and start is not None:
-            held += (finished_ms or {})[event['turn']] - start
-            start = None
-        if event['event'] != 'usage' or not data.get('sent_ms') or data.get('beside'):
-            continue
-        if data.get('purpose') == 'compaction':
-            start = data['sent_ms'] if start is None else start
-        elif data.get('purpose') is None:
-            if start is not None:
-                held += data['sent_ms'] - start
-                start = None
-            if joined:
-                held += data['sent_ms'] - joined['waited_from_ms']
-                joined = None
-
     return {
         'hidden_tests': f'{passed}/{cases}', 'hidden_failure': failure,
         # The sustained task is also its settlements.
@@ -970,7 +936,7 @@ def score(root, facts, events, answer, corrected_at=None, finished_ms=None):
         'summarizer_input_tokens': total(summarizer, 'input_tokens'),
         'summarizer_cached_input_tokens': total(summarizer, 'cached_input_tokens'),
         'summarizer_output_tokens': total(summarizer, 'output_tokens'),
-        'summarizer_ms': held,
+        'summarizer_ms': summary_ms,
         'summaries': summaries,
         # The whole task's input, model and summarizer, with cached tokens
         # at a tenth of the price.
@@ -1048,7 +1014,7 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
                 marks[name] = steps_before(root / name, steered['finished_ms'])
         for name in names:
             events = list(page_rows(client, 'events', name))
-            finished_ms = {t['turn']: t['finished_ms'] for t in page_rows(client, 'turns', name)}
+            summary_ms = sum(t['summary_ms'] for t in page_rows(client, 'turns', name))
             checkpoint = done[name]['data'].get('checkpoint')
             answer = ''
             if checkpoint:
@@ -1058,7 +1024,7 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
                              'wall_s': finished[name],
                              'steer': steer_outcome(steers.get(name), ends.get(name)),
                              'answer': answer[:2000], 'compaction_failures': failures[name],
-                             **score(root / name, facts[name], events, answer, marks.get(name), finished_ms)}
+                             **score(root / name, facts[name], events, answer, marks.get(name), summary_ms)}
         client.request('shutdown')
     finally:
         client.close(kill=True)
