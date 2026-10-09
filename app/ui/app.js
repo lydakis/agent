@@ -963,8 +963,10 @@ function enqueue(job) { chain = chain.then(job, job); return chain; }
 // tasks that ended turns or wait for an approval since it last heard, by the handles its wait tool reads
 // them with, and its role says what to do with that. A turn it is waiting on is not news, since its wait
 // reads it; nor is its own fork or side chat. Only live turns count, while this window is attached.
+// A task you alone asked for turns in is listed apart, as yours: the coordinator hears of it but is not
+// asked to act on it. Any other ask, or an approval, makes the task the coordinator's (`act`).
 // Each task keeps its first and latest turn and a count, whatever the backlog; one message names at most
-// WAKE_TASKS tasks, and the rest wait for the next.
+// WAKE_TASKS tasks, the coordinator's first, and the rest wait for the next.
 const WAKE_MS = 10 * 60 * 1000, WAKE_TASKS = 32;
 function tellLead(name, turn, status, from, approval) {
   const b = bot(name), lead = b && creatorOf(b);
@@ -973,12 +975,12 @@ function tellLead(name, turn, status, from, approval) {
   let w = S.wakes.get(lead.name);
   if (!w) { w = { tasks: new Map(), last: 0, timer: null }; S.wakes.set(lead.name, w); }
   const by = status === 'waiting for approval' ? null : from === lead.name ? 'you' : from ?? 'the person';
-  merge(w.tasks, name, { first: turn, turn, status, by, count: 1, ...(approval ? { approval } : {}) });
+  merge(w.tasks, name, { first: turn, turn, status, by, count: 1, ...(approval ? { approval } : {}), ...(by === 'the person' ? {} : { act: true }) });
   wakeSoon(lead.name);
 }
 function merge(tasks, name, t) {
   const had = tasks.get(name);
-  tasks.set(name, had ? { ...(t.turn >= had.turn ? t : had), first: Math.min(had.first, t.first), count: had.count + t.count } : t);
+  tasks.set(name, had ? { ...(t.turn >= had.turn ? t : had), first: Math.min(had.first, t.first), count: had.count + t.count, ...(had.act || t.act ? { act: true } : {}) } : t);
 }
 // A working coordinator waits for its turn to end, which calls this again.
 function wakeSoon(lead) {
@@ -989,7 +991,7 @@ function wakeSoon(lead) {
 async function wake(lead) {
   const w = S.wakes.get(lead), l = bot(lead);
   if (!w || !w.tasks.size || !S.attached || !l || l.id == null || isActive(l.status)) return;
-  const sent = [...w.tasks].slice(0, WAKE_TASKS);
+  const sent = [...w.tasks].sort(([, a], [, b]) => (b.act ? 1 : 0) - (a.act ? 1 : 0)).slice(0, WAKE_TASKS);
   for (const [name] of sent) w.tasks.delete(name);
   w.last = Date.now();
   // Key the latest notification per task, including its phase and approval
@@ -1016,7 +1018,9 @@ function digest(text) {
   return h.toString(16).padStart(16, '0');
 }
 function wakeText(tasks, more) {
-  const lines = tasks.map(([name, t]) => `- ${name}: turn:${name}/${t.turn} ${t.status}${t.by ? `, asked by ${t.by}` : ''}${t.count > 1 ? `, and ${t.count - 1} earlier since turn:${name}/${t.first}` : ''}`);
+  const line = ([name, t]) => `- ${name}: turn:${name}/${t.turn} ${t.status}${t.by ? `, asked by ${t.by}` : ''}${t.count > 1 ? `, and ${t.count - 1} earlier since turn:${name}/${t.first}` : ''}`;
+  const lines = tasks.filter(([, t]) => t.act).map(line), theirs = tasks.filter(([, t]) => !t.act).map(line);
+  if (theirs.length) lines.push('The person asked for these turns in the task themselves, so they are theirs:', ...theirs);
   if (more) lines.push(`- ${more} more tasks in the next update`);
   return `Task updates: since you last heard, tasks you started ended turns or wait for an approval. The wait tool reads each one's final reply by its handle.\n${lines.join('\n')}`;
 }

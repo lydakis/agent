@@ -298,6 +298,12 @@ pub struct Entry {
 }
 pub type Skill = Entry;
 
+/// Roles a client starts its own bots in: the app's coordinator and its
+/// swarms' members. A `.agents/agents` file of one of these names replaces
+/// the client's text for that role, so it is not a role to start a peer in,
+/// and the Profiles index leaves it out.
+pub const CLIENT_ROLES: [&str; 3] = ["coordinator", "swarm-flat", "swarm-council"];
+
 /// Skills are folders `<name>/SKILL.md` in `<workspace>/.agents/skills`, then
 /// `~/.agents/skills`, the layout agentskills.io describes. Profiles are
 /// `<name>.md` files in `.agents/agents` in the same two places. The
@@ -325,14 +331,14 @@ impl Kind {
         }
     }
     /// The name an entry of this directory would index under. Only a name
-    /// --profile accepts is offered as a role.
+    /// --profile accepts is offered as a role, and never a client's own.
     fn name(self, path: &Path) -> Option<String> {
         let name = path.file_name()?.to_str()?;
         match self {
             Kind::Skills => Some(name.to_owned()),
             Kind::Profiles => name
                 .strip_suffix(".md")
-                .filter(|stem| profile_name(stem))
+                .filter(|stem| profile_name(stem) && !CLIENT_ROLES.contains(stem))
                 .map(str::to_owned),
         }
     }
@@ -807,6 +813,33 @@ mod tests {
         assert_eq!(composed.sources, Vec::new());
         assert!(composed.skills.is_empty() || composed.text.contains("# Skills"));
         assert!(composed.text.starts_with(PREAMBLE));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_clients_own_roles_are_read_but_not_offered_as_peer_roles() {
+        let root = temp("client-roles");
+        std::fs::create_dir_all(root.join(".agents/agents")).unwrap();
+        for name in CLIENT_ROLES.iter().chain(["reviewer"].iter()) {
+            std::fs::write(
+                root.join(".agents/agents").join(format!("{name}.md")),
+                format!("---\ndescription: the {name}\n---\nBe the {name}.\n"),
+            )
+            .unwrap();
+        }
+        let composed = instructions(&root, None).unwrap();
+        let listed: Vec<&str> = composed.profiles.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(listed, ["reviewer"]);
+        assert!(!composed.text.contains("- coordinator:"));
+        // The file still replaces the client's text when it starts a bot in that role.
+        let role = profile(&root, "coordinator").unwrap().unwrap();
+        assert_eq!(role.body, "Be the coordinator.");
+        let composed = instructions(&root, Some(&role)).unwrap();
+        assert!(
+            composed
+                .text
+                .ends_with("# Role: coordinator\n\nBe the coordinator.")
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

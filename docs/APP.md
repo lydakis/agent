@@ -654,7 +654,9 @@ daemon learns nothing about projects; everything here is client work.
   profile: the folder's `.agents/agents/coordinator.md`, the user's, or the
   one the app ships ([coordinator.md](../app/agents/coordinator.md)), whose
   model and tools apply when the project names none. The shipped text
-  says: a task that changes files, named with the
+  says: the coordinator makes a small, quick change itself (a few lines it
+  can check at a glance) and sends work in an area an existing task owns to
+  that task with `--delivery queue`; a new task that changes files, named with the
   project's prefix so projects do not collide, gets
   `git worktree add -b agent/NAME ~/.agent/worktrees/NAME HEAD`, the
   folder's `.agents/setup` run inside it, and `agent run --new --agents
@@ -974,7 +976,10 @@ once every ten minutes, in one message queued to it: `Task updates:`, then
 one line per task with its latest ended turn's handle and status (or
 `waiting for approval`), who asked for it (`you` for the coordinator's own
 ask, a bot's name, or `the person`), and how many turns ended before it
-since which handle. The handles are what its
+since which handle. Tasks whose turns only you asked for since the last
+message are listed last, under a line saying they are yours; the role tells
+the coordinator to leave them to you rather than check or correct them.
+A task with any other ask, or an approval, is listed first. The handles are what its
 `wait` tool reads a final reply by, so the message stays small however much
 was said. The page keeps only that per task (first and latest turn, a
 count), so a long coordinator turn or a failing daemon cannot grow it. One

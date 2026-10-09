@@ -2128,7 +2128,8 @@ test('a coordinator hears once, when it rests, of turns its tasks ended that it 
   assert.equal(sent.length, 1, 'one message for the whole batch');
   assert.equal(sent[0].bot, 'demo.lead'); assert.equal(sent[0].bot_id, 1); assert.equal(sent[0].delivery, 'queue'); assert.equal(sent[0].origin, 'tasks');
   assert.match(sent[0].prompt, /^Task updates: /);
-  assert.match(sent[0].prompt, /\n- demo\.build: turn:demo\.build\/4 completed, asked by demo\.test, and 1 earlier since turn:demo\.build\/2\n- demo\.test: turn:demo\.test\/1 failed, asked by the person$/);
+  // A task another bot asked of is the coordinator's; one only you worked in is listed last, as yours.
+  assert.match(sent[0].prompt, /\n- demo\.build: turn:demo\.build\/4 completed, asked by demo\.test, and 1 earlier since turn:demo\.build\/2\nThe person asked for these turns in the task themselves, so they are theirs:\n- demo\.test: turn:demo\.test\/1 failed, asked by the person$/);
   // Within the window, while it works: nothing until its turn ends and the window allows. An ask of its
   // own that it did not wait for is news too.
   p.S.bots.get('demo.lead').status = 'running';
@@ -2147,11 +2148,20 @@ test('a coordinator hears once, when it rests, of turns its tasks ended that it 
   await p.tick();
   assert.equal(sent.length, 3);
   assert.match(sent[2].prompt, /\n- demo\.build: turn:demo\.build\/5 waiting for approval$/);
+  // Your later turn in a task the coordinator asked of keeps it the coordinator's.
+  p.S.bots.get('demo.lead').status = 'running';
+  await turn('demo.test', 3, 'completed', 'demo.lead');
+  await turn('demo.test', 4);
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.lead', turn: 8, data: { status: 'completed' } });
+  await p.tick();
+  assert.equal(sent.length, 4);
+  assert.match(sent[3].prompt, /\n- demo\.test: turn:demo\.test\/4 completed, asked by the person, and 1 earlier since turn:demo\.test\/3$/);
+  assert.doesNotMatch(sent[3].prompt, /theirs/);
   // A deleted coordinator hears nothing more.
   await p.onEvent({ event: 'deleted', bot: 'demo.lead' });
-  await turn('demo.test', 3);
+  await turn('demo.test', 5);
   await p.tick();
-  assert.equal(sent.length, 3);
+  assert.equal(sent.length, 4);
 });
 
 test('a coordinator wake that fails is kept for the next one, and replayed turns are not news', async () => {
@@ -2273,7 +2283,7 @@ test('a coordinator\'s backlog stays small however much its tasks do, and what o
   await p.onEvent({ event: 'turn_finished', bot: 'demo.lead', turn: 2, data: { status: 'completed' } });
   await p.tick();
   assert.equal(sent.length, 1);
-  assert.equal(sent[0].prompt.split('\n').length, 1 + 32 + 1);
+  assert.equal(sent[0].prompt.split('\n').length, 1 + 1 + 32 + 1);
   assert.match(sent[0].prompt, /\n- demo\.t0: turn:demo\.t0\/50 completed, asked by the person, and 49 earlier since turn:demo\.t0\/1\n/);
   assert.match(sent[0].prompt, /\n- 8 more tasks in the next update$/);
   assert.equal(w.tasks.size, 8);

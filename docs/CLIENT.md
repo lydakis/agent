@@ -35,7 +35,11 @@ Implemented 2026-09-19.
    peer in a role. A profile is markdown with optional YAML front matter:
    `description`, `model`, and `tools` (a list of this runtime's tool
    names) are read, any other key is ignored, so an agent file written for
-   another harness loads as it is. The body is the role.
+   another harness loads as it is. The body is the role. The app's own
+   roles (`coordinator`, `swarm-flat`, `swarm-council`, the client roles in
+   `policy.rs`) are left out of the index: a file of that name replaces the
+   app's text for that role, not a role to start a peer in, so no agent is
+   offered a nested coordinator or a swarm member outside a swarm.
 5. **Role.** A bot started in a profile (`--profile ROLE`, or the app's
    coordinator) gets that body last, under `# Role: ROLE`. The app ships a
    `coordinator` profile ([app/agents/coordinator.md](../app/agents/coordinator.md));
