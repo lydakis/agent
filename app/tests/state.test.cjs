@@ -2250,12 +2250,15 @@ test('Settings lists triggers with no project, and only then when there are some
   assert.doesNotMatch(p.setupHTML(), /Triggers/);
   st.triggers = [{ name: 'loose', bot: 'loose', bot_id: 3, when: 'in 2h', once: true, ended: true, message: 'x', last: { outcome: 'failed', fired_ms: 0, detail: 'daemon_unavailable' } }];
   assert.match(p.setupHTML(), /<h3>Triggers<\/h3>.*not delivered/s);
+  assert.doesNotMatch(p.setupHTML(), /trigger-fire/, 'an ended trigger has nothing to run');
   // A one-off past its time and a plist that cannot be read are listed too, each removable.
   st.triggers.push({ name: 'late', bot: 'late', bot_id: 4, when: 'at 2026-09-01 09:00', once: true, ended: false, missed: true, message: 'y', last: null },
-    { name: 'odd', ended: false, problem: 'unreadable: not a trigger\'s plist' });
+    { name: 'odd', ended: false, problem: 'unreadable: not a trigger\'s plist' },
+    { name: 'review', bot: 'demo.test', bot_id: 5, when: 'commit /r', once: false, ended: false, message: 'z', last: null });
   const html = p.setupHTML();
   assert.match(html, /missed its time/);
   assert.match(html, /unreadable<\/span>.*data-v="odd"/s);
+  assert.match(html, /commit \/r<\/span>.*data-act="trigger-fire" data-v="review".*not run yet · review/s);
 });
 
 test('a coordinator\'s backlog stays small however much its tasks do, and what one message leaves out comes next', async () => {

@@ -5,7 +5,7 @@
 //! (projects, profiles, swarms, triggers) and makes a swarm's shared
 //! worktree; run with `--swarm-post` it is a swarm's post tool (see
 //! `swarm`), and with `--trigger` or `--trigger-fire` it adds, lists,
-//! removes or fires triggers (see `trigger`).
+//! fires or removes triggers (see `trigger`).
 //!
 //! Each window attaches to one daemon: this machine's, or a host's reached
 //! over SSH (see `remote`). A window on a host never reads or writes this
@@ -1161,6 +1161,20 @@ fn trigger_remove(
     )
 }
 
+/// Run a trigger now, as `trigger fire NAME` does.
+#[tauri::command]
+fn trigger_fire(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    name: String,
+) -> Result<Value, String> {
+    trigger::fire_now(
+        &triggers_of(&*windows.of(&window)?)?,
+        &name,
+        &trigger::launchctl,
+    )
+}
+
 /// Page diagnostics land on stderr, where a terminal can see them.
 #[tauri::command]
 fn log(message: String) {
@@ -1267,6 +1281,7 @@ fn main() {
             swarm_check,
             swarm_decide,
             triggers,
+            trigger_fire,
             trigger_remove
         ])
         .setup(move |app| {

@@ -1,17 +1,21 @@
-//! Triggers: an agent woken at set times with a message it wrote for
-//! itself, or one written for it. launchd keeps the time, so a trigger
-//! fires with the app closed, and once on waking for times the Mac slept
-//! through. The daemon has no clock of its own.
+//! Triggers: an agent woken with a message it wrote for itself, or one
+//! written for it, when something happens: a time comes, a file is written,
+//! a repository's HEAD moves, or someone fires it by name. launchd watches,
+//! so a trigger fires with the app closed, and once on waking for times the
+//! Mac slept through. The daemon has no clock or watcher of its own, and no
+//! process of a trigger runs between its fires.
 //!
 //! A trigger is one LaunchAgent, `~/Library/LaunchAgents/LABEL.plist`,
 //! which runs this executable with `--trigger-fire` and everything the fire
-//! needs as its arguments: the plist is the only record. A fire sends the
-//! message as a new turn of the bot the trigger was made for, pinned by its
-//! id, and never to a bot that is working: that time is skipped. It never
-//! creates a bot. A bot deleted since takes its triggers with it.
+//! needs as its arguments: the plist is its definition. What its fires did
+//! and leave for the next (the commit it saw) is
+//! `~/.agent/triggers/NAME.json`. A fire messages the agent the trigger was
+//! made for, pinned by its id, and never a working agent, for a repeating
+//! trigger: that time is skipped. It never creates an agent. A deleted agent
+//! takes its triggers with it.
 //!
 //! `~/.agent/trigger`, a script the app writes, is how agents and people
-//! add, list and remove them.
+//! add, list, fire and remove them.
 use agent_client::Client;
 use serde_json::{Value, json};
 use std::{
@@ -38,10 +42,12 @@ const SLACK: i64 = 2 * 24 * 3600;
 /// A one-off's calendar entry comes again a year later; a fire this late
 /// is that, not a wake after a long sleep.
 const STALE: i64 = 182 * 24 * 3600;
-const USAGE: &str = "usage: trigger add [--bot NAME] [--name NAME] (--every N{m,h,d} | --in N{m,h} | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY') -- MESSAGE\n       trigger ls [--after NAME]\n       trigger rm NAME";
+/// How old a `fire NAME` may be when launchd starts the fire it asked for.
+const ASKED_WITHIN: i64 = 120;
+const USAGE: &str = "usage: trigger add [--name NAME] [WHEN] [--bot NAME] -- MESSAGE\n         WHEN: --every N{m,h,d} | --in N{m,h} | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO; none: only fire runs it\n       trigger ls [--after NAME]\n       trigger fire NAME\n       trigger rm NAME";
 
 /// Where triggers live: the LaunchAgents folder holds their plists, and
-/// `~/.agent/triggers` what each one's last fire did.
+/// `~/.agent/triggers` what each one's fires did.
 pub struct Places {
     pub agents: PathBuf,
     pub state: PathBuf,
@@ -61,12 +67,18 @@ impl Places {
     fn last(&self, name: &str) -> PathBuf {
         self.state.join(format!("{name}.json"))
     }
+    /// Left by `fire NAME` for the fire launchd starts.
+    fn asked(&self, name: &str) -> PathBuf {
+        self.state.join(format!("{name}.fire"))
+    }
 }
 
 /// What launchd is asked to do. Tests stand in for it.
 pub enum Launchd<'a> {
     Load(&'a Path),
     Unload(&'a str),
+    /// Run a loaded job now.
+    Start(&'a str),
 }
 
 pub type Loader<'a> = &'a dyn Fn(Launchd) -> Result<(), String>;
@@ -86,6 +98,7 @@ pub fn launchctl(what: Launchd) -> Result<(), String> {
             path.to_string_lossy().into_owned(),
         ],
         Launchd::Unload(label) => vec!["bootout".into(), format!("{domain}/{label}")],
+        Launchd::Start(label) => vec!["kickstart".into(), format!("{domain}/{label}")],
     };
     let out = std::process::Command::new("/bin/launchctl")
         .args(&args)
@@ -168,10 +181,13 @@ pub struct Trigger {
     pub not_before: Option<i64>,
     pub bot: String,
     pub bot_id: i64,
-    /// How it was asked for, to show: `every 30m`, `at 2026-09-29 09:07`.
+    /// How it was asked for, to show: `every 30m`, `file /a/b`, `fire`.
     pub when: String,
     /// A one-off's time; it fires once, then removes itself.
     pub at: Option<i64>,
+    /// The repository whose HEAD it follows; a fire for any other write to
+    /// its HEAD log sends nothing.
+    pub commit: Option<PathBuf>,
     pub daemon: Daemon,
     /// The store identity its daemon announced when it was made; a daemon
     /// on that socket serving another store is not its daemon.
@@ -188,26 +204,28 @@ impl Trigger {
             self.name.clone(),
             "--generation".into(),
             self.generation.clone(),
-            "--bot".into(),
-            self.bot.clone(),
-            "--bot-id".into(),
-            self.bot_id.to_string(),
-            "--when".into(),
-            self.when.clone(),
         ];
+        let mut pair = |flag: &str, value: String| args.extend([flag.to_owned(), value]);
+        pair("--bot", self.bot.clone());
+        pair("--bot-id", self.bot_id.to_string());
+        pair("--when", self.when.clone());
         if let Some(first) = self.not_before {
-            args.extend(["--not-before".into(), first.to_string()]);
+            pair("--not-before", first.to_string());
         }
         if let Some(at) = self.at {
-            args.extend(["--at".into(), at.to_string()]);
+            pair("--at", at.to_string());
+        }
+        let path = |p: &PathBuf| p.to_string_lossy().into_owned();
+        if let Some(repo) = &self.commit {
+            pair("--commit", path(repo));
         }
         if let Some(store) = &self.daemon.store {
-            args.extend(["--store".into(), store.to_string_lossy().into()]);
+            pair("--store", path(store));
         }
         if let Some(socket) = &self.daemon.socket {
-            args.extend(["--socket".into(), socket.to_string_lossy().into()]);
+            pair("--socket", path(socket));
         }
-        args.extend(["--store-id".into(), self.store_id.clone()]);
+        pair("--store-id", self.store_id.clone());
         args.extend(["--".into(), self.message.clone()]);
         args
     }
@@ -215,13 +233,7 @@ impl Trigger {
     /// Read back from a fire's arguments, after the flag.
     fn parse(args: &[String]) -> Result<Self, String> {
         let bad = |what: &str| format!("invalid_trigger: {what}");
-        let (mut name, mut bot, mut id, mut when, mut at, mut store_id) =
-            (None, None, None, None, None, None);
-        let (mut generation, mut not_before) = (None, None);
-        let mut daemon = Daemon {
-            store: None,
-            socket: None,
-        };
+        let mut v = std::collections::HashMap::<&str, &String>::new();
         let mut iter = args.iter();
         let message = loop {
             let Some(flag) = iter.next() else {
@@ -233,41 +245,76 @@ impl Trigger {
             let value = iter
                 .next()
                 .ok_or_else(|| bad(&format!("{flag} needs a value")))?;
-            match flag.as_str() {
-                "--name" => name = Some(value.clone()),
-                "--generation" => generation = Some(value.clone()),
-                "--not-before" => {
-                    not_before = Some(value.parse().map_err(|_| bad("--not-before"))?)
-                }
-                "--bot" => bot = Some(value.clone()),
-                "--bot-id" => id = value.parse().ok(),
-                "--when" => when = Some(value.clone()),
-                "--at" => at = Some(value.parse().map_err(|_| bad("--at"))?),
-                "--store" => daemon.store = Some(value.into()),
-                "--socket" => daemon.socket = Some(value.into()),
-                "--store-id" => store_id = Some(value.clone()),
-                other => return Err(bad(other)),
-            }
+            const FLAGS: [&str; 11] = [
+                "--name",
+                "--generation",
+                "--bot",
+                "--bot-id",
+                "--when",
+                "--not-before",
+                "--at",
+                "--commit",
+                "--store",
+                "--socket",
+                "--store-id",
+            ];
+            let known = FLAGS
+                .iter()
+                .find(|f| **f == flag)
+                .ok_or_else(|| bad(flag))?;
+            v.insert(*known, value);
         };
+        let text = |flag: &str| v.get(flag).map(|s| s.to_string());
+        let need = |flag: &str| text(flag).ok_or_else(|| bad(&format!("no {flag}")));
+        let number = |flag: &str| -> Result<Option<i64>, String> {
+            text(flag)
+                .map(|s| s.parse().map_err(|_| bad(flag)))
+                .transpose()
+        };
+        let daemon = Daemon {
+            store: text("--store").map(PathBuf::from),
+            socket: text("--socket").map(PathBuf::from),
+        };
+        if daemon.store.is_none() && daemon.socket.is_none() {
+            return Err(bad("no --store or --socket"));
+        }
         Ok(Self {
-            name: name.ok_or_else(|| bad("no --name"))?,
-            generation: generation.ok_or_else(|| bad("no --generation"))?,
-            not_before,
-            bot: bot.ok_or_else(|| bad("no --bot"))?,
-            bot_id: id.ok_or_else(|| bad("no --bot-id"))?,
-            when: when.ok_or_else(|| bad("no --when"))?,
-            at,
-            daemon: (daemon.store.is_some() || daemon.socket.is_some())
-                .then_some(daemon)
-                .ok_or_else(|| bad("no --store or --socket"))?,
-            store_id: store_id.ok_or_else(|| bad("no --store-id"))?,
+            name: need("--name")?,
+            generation: need("--generation")?,
+            not_before: number("--not-before")?,
+            bot: need("--bot")?,
+            bot_id: number("--bot-id")?.ok_or_else(|| bad("no --bot-id"))?,
+            when: need("--when")?,
+            at: number("--at")?,
+            commit: text("--commit").map(PathBuf::from),
+            daemon,
+            store_id: need("--store-id")?,
             message,
         })
     }
 
-    fn json(&self, last: Option<Value>) -> Value {
-        json!({"name": self.name, "generation": self.generation, "bot": self.bot, "bot_id": self.bot_id, "when": self.when,
-            "message": self.message, "once": self.at.is_some(), "last": last})
+    /// Its row, with the last outcome its fires left in `state`.
+    fn json(&self, state: &Value) -> Value {
+        json!({"name": self.name, "generation": self.generation, "when": self.when,
+            "bot": self.bot, "bot_id": self.bot_id, "message": self.message,
+            "once": self.at.is_some(), "last": state["last"]})
+    }
+
+    /// The first field another trigger of its name differs in, to name in
+    /// `trigger_exists`. Its generation and first time are when it was
+    /// made, not what it is.
+    fn differs(&self, other: &Self) -> Option<&'static str> {
+        [
+            ("when", self.when == other.when),
+            ("bot", self.bot == other.bot && self.bot_id == other.bot_id),
+            ("message", self.message == other.message),
+            ("commit", self.commit == other.commit),
+            ("daemon", self.daemon == other.daemon),
+            ("store_id", self.store_id == other.store_id),
+        ]
+        .into_iter()
+        .find(|(_, same)| !same)
+        .map(|(field, _)| field)
     }
 }
 
@@ -329,14 +376,15 @@ pub struct Entry {
     pub minute: Option<u8>,
 }
 
-/// When, as asked for: how to show it, launchd's entries, and a one-off's
-/// time.
+/// When, as asked for: how to show it, launchd's entries, a one-off's
+/// time, and the path launchd watches.
 #[derive(Debug, PartialEq)]
 pub struct When {
     pub text: String,
     pub entries: Vec<Entry>,
     pub not_before: Option<i64>,
     pub at: Option<i64>,
+    pub watch: Option<PathBuf>,
 }
 
 fn amount(value: &str) -> Option<(u32, char)> {
@@ -391,6 +439,7 @@ pub fn every(value: &str, now: i64) -> Result<When, String> {
         ),
         entries,
         at: None,
+        watch: None,
     })
 }
 
@@ -417,6 +466,7 @@ fn once(epoch: i64, now: i64) -> Result<When, String> {
             weekday: None,
         }],
         at: Some(epoch - epoch % 60),
+        watch: None,
     })
 }
 
@@ -562,6 +612,7 @@ pub fn cron(expression: &str) -> Result<When, String> {
         not_before: None,
         entries,
         at: None,
+        watch: None,
     })
 }
 
@@ -581,15 +632,62 @@ fn unescape(text: &str) -> String {
         .replace("&amp;", "&")
 }
 
+/// `--file PATH`: a write to the file, or a file added to or removed from
+/// it when it is a folder. It need not exist yet.
+pub fn file(value: &str) -> Result<When, String> {
+    let path = std::path::absolute(value).map_err(|e| format!("invalid_file: {value}: {e}"))?;
+    Ok(When {
+        text: format!("file {}", path.display()),
+        entries: Vec::new(),
+        not_before: None,
+        at: None,
+        watch: Some(path),
+    })
+}
+
+fn git(repo: &Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let text = String::from_utf8(out.stdout).ok()?;
+    out.status.success().then(|| text.trim().to_owned())
+}
+
+/// The commit a repository's HEAD names, when it names one.
+fn head(repo: &Path) -> Option<String> {
+    git(repo, &["rev-parse", "--verify", "-q", "HEAD"])
+}
+
+/// `--commit REPO`: its HEAD moves to another commit. git writes the HEAD
+/// log, in the repository's own git folder (a worktree has its own), for
+/// every move, so launchd watches that; the fire sends only when the commit
+/// is not the one the trigger last saw.
+pub fn commit(value: &str) -> Result<(When, PathBuf), String> {
+    let repo = std::path::absolute(value).map_err(|e| format!("invalid_commit: {value}: {e}"))?;
+    let git_dir = git(&repo, &["rev-parse", "--absolute-git-dir"])
+        .ok_or_else(|| format!("invalid_commit: {value}: not a git repository"))?;
+    Ok((
+        When {
+            text: format!("commit {}", repo.display()),
+            entries: Vec::new(),
+            not_before: None,
+            at: None,
+            watch: Some(PathBuf::from(git_dir).join("logs/HEAD")),
+        },
+        repo,
+    ))
+}
+
 /// The LaunchAgent for a trigger. `environment` is what the fire starts
 /// with besides launchd's own: the shell whose login environment starts a
-/// daemon with your keys, as the app starts one.
-pub fn plist(
-    app: &Path,
-    trigger: &Trigger,
-    when: &[Entry],
-    environment: &[(&str, String)],
-) -> String {
+/// daemon with your keys, as the app starts one. Without calendar entries
+/// or a watched path, launchd runs it only when asked (`fire`).
+pub fn plist(app: &Path, trigger: &Trigger, when: &When, environment: &[(&str, String)]) -> String {
     let mut out = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n",
     );
@@ -602,23 +700,32 @@ pub fn plist(
     for arg in std::iter::once(app.to_string_lossy().into_owned()).chain(trigger.args()) {
         out += &format!("    {}\n", string(&arg));
     }
-    out += "  </array>\n  <key>StartCalendarInterval</key>\n  <array>\n";
-    for entry in when {
-        out += "    <dict>";
-        for (key, value) in [
-            ("Month", entry.month),
-            ("Day", entry.day),
-            ("Weekday", entry.weekday),
-            ("Hour", entry.hour),
-            ("Minute", entry.minute),
-        ] {
-            if let Some(value) = value {
-                out += &format!("<key>{key}</key><integer>{value}</integer>");
-            }
-        }
-        out += "</dict>\n";
-    }
     out += "  </array>\n";
+    if !when.entries.is_empty() {
+        out += "  <key>StartCalendarInterval</key>\n  <array>\n";
+        for entry in &when.entries {
+            out += "    <dict>";
+            for (key, value) in [
+                ("Month", entry.month),
+                ("Day", entry.day),
+                ("Weekday", entry.weekday),
+                ("Hour", entry.hour),
+                ("Minute", entry.minute),
+            ] {
+                if let Some(value) = value {
+                    out += &format!("<key>{key}</key><integer>{value}</integer>");
+                }
+            }
+            out += "</dict>\n";
+        }
+        out += "  </array>\n";
+    }
+    if let Some(path) = &when.watch {
+        out += &format!(
+            "  <key>WatchPaths</key>\n  <array>\n    {}\n  </array>\n",
+            string(&path.to_string_lossy())
+        );
+    }
     if !environment.is_empty() {
         out += "  <key>EnvironmentVariables</key>\n  <dict>\n";
         for (key, value) in environment {
@@ -672,6 +779,12 @@ fn read_record(path: &Path) -> Result<String, String> {
     Ok(text)
 }
 
+fn read_trigger(path: &Path) -> Read {
+    read_record(path).and_then(|text| {
+        read_plist(&text).ok_or_else(|| "unreadable: not a trigger's plist".into())
+    })
+}
+
 /// Walk one plist at a time when refreshing the app path.
 fn read_all(places: &Places) -> impl Iterator<Item = (String, Read)> {
     std::fs::read_dir(&places.agents)
@@ -681,16 +794,27 @@ fn read_all(places: &Places) -> impl Iterator<Item = (String, Read)> {
         .filter_map(|e| {
             let file = e.file_name().into_string().ok()?;
             let name = file.strip_prefix(LABEL)?.strip_suffix(".plist")?.to_owned();
-            let read = read_record(&e.path()).and_then(|text| {
-                read_plist(&text).ok_or_else(|| "unreadable: not a trigger's plist".into())
-            });
-            Some((name, read))
+            Some((name, read_trigger(&e.path())))
         })
 }
 
 #[cfg(test)]
 fn triggers(places: &Places) -> Vec<(Trigger, PathBuf)> {
     read_all(places).filter_map(|(_, r)| r.ok()).collect()
+}
+
+fn read_json(path: &Path) -> Option<Value> {
+    read_record(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+}
+
+/// What this trigger's fires left: its state file, when it is this
+/// trigger's and not an earlier one's of the same name.
+fn state(places: &Places, trigger: &Trigger) -> Value {
+    read_json(&places.last(&trigger.name))
+        .filter(|r| r["generation"] == trigger.generation)
+        .unwrap_or(Value::Null)
 }
 
 /// A bounded page in name order. Directory scans retain only the next
@@ -724,32 +848,22 @@ pub fn list(places: &Places, after: Option<&str>) -> Value {
         names.pop_last();
     }
     let next = more.then(|| names.last().cloned()).flatten();
-    let read = |path: &Path| {
-        read_record(path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-    };
     let rows: Vec<_> = names
         .into_iter()
         .map(|name| {
             let path = places.plist(&name);
             if !path.exists() {
-                let mut row = read(&places.last(&name))
+                let mut row = read_json(&places.last(&name))
                     .filter(|r| r["name"] == name)
                     .unwrap_or_else(|| json!({"name": name, "problem": "unreadable: result"}));
                 row["ended"] = json!(true);
                 return row;
             }
-            match read_record(&path).and_then(|text| {
-                read_plist(&text).ok_or_else(|| "unreadable: not a trigger's plist".into())
-            }) {
-                Ok((s, _)) => {
-                    let last = read(&places.last(&name))
-                        .filter(|r| r["generation"] == s.generation)
-                        .map(|r| r["last"].clone());
-                    let mut row = s.json(last);
+            match read_trigger(&path) {
+                Ok((t, _)) => {
+                    let mut row = t.json(&state(places, &t));
                     row["ended"] = json!(false);
-                    if s.at.is_some_and(|at| now() > at + SLACK) {
+                    if t.at.is_some_and(|at| now() > at + SLACK) {
                         row["missed"] = json!(true);
                     }
                     row
@@ -813,16 +927,17 @@ fn valid_name(name: &str) -> Result<(), String> {
         .ok_or_else(|| format!("invalid_name: {name}: letters, digits, '.', '-' and '_'"))
 }
 
-/// Write the trigger's plist and load it, replacing one of the same name.
-/// A replacement that fails puts the old one back as it was.
+/// Write the trigger's plist and load it. A trigger of that name already
+/// there is left as it is: the same one is returned, to say so, and another
+/// is `trigger_exists`, naming the first field that differs.
 pub fn install(
     places: &Places,
     app: &Path,
     trigger: &Trigger,
-    when: &[Entry],
+    when: &When,
     environment: &[(&str, String)],
     launchd: Loader,
-) -> Result<(), String> {
+) -> Result<Option<Trigger>, String> {
     valid_name(&trigger.name)?;
     let _lock = Lock::take(places)?;
     // macOS folders ignore case: `Build` would overwrite `build`'s files,
@@ -848,19 +963,33 @@ pub fn install(
         ));
     }
     let path = places.plist(&trigger.name);
-    // One that cannot be read cannot be put back, so it is not replaced.
-    let old = match std::fs::read_to_string(&path) {
-        Ok(old) => Some(old),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            let (there, _) = read_plist(&text).ok_or_else(|| {
+                format!(
+                    "trigger_exists: definition: {} is there but cannot be read; rm it first",
+                    trigger.name
+                )
+            })?;
+            return match there.differs(trigger) {
+                None => Ok(Some(there)),
+                Some(field) => Err(format!(
+                    "trigger_exists: {field}: {} is a trigger with another {field}; rm it first or pass another --name",
+                    trigger.name
+                )),
+            };
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("{}: {e}", path.display())),
-    };
+    }
     swap(
         &path,
         &trigger.name,
-        old.as_deref(),
+        None,
         &plist(app, trigger, when, environment),
         launchd,
-    )
+    )?;
+    Ok(None)
 }
 
 /// Put `text` in the plist at `path` and load it in place of `old`: when
@@ -976,14 +1105,57 @@ pub fn remove(places: &Places, name: &str, launchd: Loader) -> Result<(), String
     if last_here {
         forget(&last)?;
     }
+    let _ = forget(&places.asked(name));
     Ok(())
+}
+
+/// `fire NAME`: launchd runs the trigger's job now, which it does not while
+/// one of its fires still runs. The note it leaves tells that fire it was
+/// asked for, so it sends whatever the time or its watched path.
+pub fn fire_now(places: &Places, name: &str, launchd: Loader) -> Result<Value, String> {
+    valid_name(name)?;
+    let _lock = Lock::take(places)?;
+    if !places.plist(name).exists() {
+        return Err(format!("trigger_not_found: {name}"));
+    }
+    let asked = places.asked(name);
+    replace(&asked, &now().to_string())?;
+    if let Err(error) = launchd(Launchd::Start(&format!("{LABEL}{name}"))) {
+        let _ = forget(&asked);
+        return Err(error);
+    }
+    Ok(json!({"name": name, "fired": true}))
+}
+
+/// Whether this fire is one `fire NAME` asked for; the note goes either way.
+fn take_asked(places: &Places, name: &str) -> bool {
+    let path = places.asked(name);
+    let at = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| t.trim().parse::<i64>().ok());
+    let _ = forget(&path);
+    at.is_some_and(|at| (now() - at).abs() <= ASKED_WITHIN)
+}
+
+/// What a fire leaves for the next: the commit it saw.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct Kept {
+    head: Option<String>,
+}
+
+impl Kept {
+    fn of(state: &Value) -> Self {
+        Self {
+            head: state["head"].as_str().map(str::to_owned),
+        }
+    }
 }
 
 /// What a fire did goes on disk, and a trigger that is over ends: both
 /// under the lock, and only while the plist is still this trigger's. One
 /// replaced or removed while its message went out is left as it now is; a
 /// job left loaded after its plist went (an end cut short) is unloaded.
-fn settle(places: &Places, trigger: &Trigger, outcome: &Value, launchd: Loader) {
+fn settle(places: &Places, trigger: &Trigger, outcome: &Value, kept: &Kept, launchd: Loader) {
     let log = |error: String| eprintln!("{}", error_json(&error));
     let _lock = match Lock::take(places) {
         Ok(lock) => lock,
@@ -1004,7 +1176,7 @@ fn settle(places: &Places, trigger: &Trigger, outcome: &Value, launchd: Loader) 
     if read_plist(&text).is_none_or(|(now, _)| now != *trigger) {
         return;
     }
-    let recorded = record_last(places, trigger, outcome);
+    let recorded = record_last(places, trigger, outcome, kept);
     if let Err(error) = &recorded {
         log(error.clone());
     }
@@ -1200,50 +1372,56 @@ pub fn migrate_cli(args: &[String]) -> i32 {
 /// What `trigger add` was asked.
 #[derive(Debug, PartialEq)]
 struct Add {
-    bot: Option<String>,
     name: Option<String>,
     when: When,
+    commit: Option<PathBuf>,
+    bot: Option<String>,
     message: String,
 }
 
 fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
-    let bad = |what: String| format!("{what}\n{USAGE}");
-    let (mut bot, mut name, mut when) = (None, None, None);
+    let bad = |what: String| format!("invalid_trigger: {what}\n{USAGE}");
+    let mut v = std::collections::HashMap::<String, String>::new();
+    let (mut when, mut commit) = (None, None);
     let mut iter = args.iter();
     let message = loop {
         let Some(flag) = iter.next() else {
-            return Err(bad("invalid_trigger: a message goes after --".into()));
+            return Err(bad("a message goes after --".into()));
         };
         if flag == "--" {
             break iter.cloned().collect::<Vec<_>>().join(" ");
         }
         let value = iter
             .next()
-            .ok_or_else(|| bad(format!("invalid_trigger: {flag} needs a value")))?;
+            .ok_or_else(|| bad(format!("{flag} needs a value")))?;
         let asked = match flag.as_str() {
-            "--bot" => {
-                bot = Some(value.clone());
-                continue;
-            }
-            "--name" => {
-                name = Some(value.clone());
-                continue;
-            }
             "--every" => every(value, now)?,
             "--in" => after(value, now)?,
             "--at" => at(value, now)?,
             "--cron" => cron(value)?,
-            other => return Err(bad(format!("invalid_trigger: {other}"))),
+            "--file" => file(value)?,
+            "--commit" => {
+                let (when, repo) = self::commit(value)?;
+                commit = Some(repo);
+                when
+            }
+            "--name" | "--bot" => {
+                if v.insert(flag.clone(), value.clone()).is_some() {
+                    return Err(bad(format!("{flag} once")));
+                }
+                continue;
+            }
+            other => return Err(bad(other.to_owned())),
         };
         if when.replace(asked).is_some() {
             return Err(bad(
-                "invalid_trigger: one of --every, --in, --at or --cron".into()
+                "one of --every, --in, --at, --cron, --file or --commit".into(),
             ));
         }
     };
-    let when = when.ok_or_else(|| bad("invalid_trigger: --every, --in, --at or --cron".into()))?;
+    let mut take = |flag: &str| v.remove(flag);
     if message.trim().is_empty() {
-        return Err(bad("invalid_trigger: a message goes after --".into()));
+        return Err(bad("a message goes after --".into()));
     }
     if message.len() > MAX_MESSAGE {
         return Err(format!(
@@ -1258,9 +1436,16 @@ fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
         return Err("invalid_trigger: the message has control characters".into());
     }
     Ok(Add {
-        bot,
-        name,
-        when,
+        name: take("--name"),
+        when: when.unwrap_or(When {
+            text: "fire".into(),
+            entries: Vec::new(),
+            not_before: None,
+            at: None,
+            watch: None,
+        }),
+        commit,
+        bot: take("--bot"),
         message,
     })
 }
@@ -1273,7 +1458,8 @@ fn runtime() -> Result<tokio::runtime::Runtime, String> {
 }
 
 /// One error shape, `{"error": CODE, "detail": ...}`, from the
-/// `CODE: detail` this module's errors are.
+/// `CODE: detail` this module's errors are; `trigger_exists` also names the
+/// `field` that differs.
 fn error_json(message: &str) -> Value {
     let (code, detail) = match message.split_once(": ") {
         Some((code, detail))
@@ -1283,84 +1469,100 @@ fn error_json(message: &str) -> Value {
         }
         _ => ("trigger_failed", message),
     };
-    json!({"error": code, "detail": detail})
+    match detail.split_once(": ") {
+        Some((field, detail)) if code == "trigger_exists" => {
+            json!({"error": code, "field": field, "detail": detail})
+        }
+        _ => json!({"error": code, "detail": detail}),
+    }
 }
 
-/// `APP --trigger add|ls|rm`, from `~/.agent/trigger`.
+/// `APP --trigger add|ls|fire|rm`, from `~/.agent/trigger`.
 pub fn cli(args: &[String]) -> i32 {
-    let fail = |message: String| {
-        eprintln!("{}", error_json(&message));
-        1
-    };
-    let places = match Places::home() {
-        Ok(places) => places,
-        Err(error) => return fail(error),
-    };
-    match args.split_first() {
-        Some((verb, rest)) if verb == "ls" => {
-            let after = match rest {
-                [] => None,
-                [flag, name] if flag == "--after" => Some(name.as_str()),
-                _ => return fail(USAGE.into()),
-            };
-            println!("{}", list(&places, after));
-            0
+    let done = match Places::home().and_then(|places| match args.split_first() {
+        Some((verb, rest)) if verb == "ls" => match rest {
+            [] => Ok(list(&places, None)),
+            [flag, name] if flag == "--after" => Ok(list(&places, Some(name))),
+            _ => Err(format!("usage: {USAGE}")),
+        },
+        Some((verb, [name])) if verb == "rm" => {
+            remove(&places, name, &launchctl).map(|()| json!({"removed": name}))
         }
-        Some((verb, [name])) if verb == "rm" => match remove(&places, name, &launchctl) {
-            Ok(()) => {
-                println!("{}", json!({"removed": name}));
-                0
-            }
-            Err(error) => fail(error),
-        },
-        Some((verb, rest)) if verb == "add" => match add(&places, rest) {
-            Ok(value) => {
-                println!("{value}");
-                0
-            }
-            Err(error) => fail(error),
-        },
-        _ => fail(USAGE.into()),
-    }
+        Some((verb, [name])) if verb == "fire" => fire_now(&places, name, &launchctl),
+        Some((verb, rest)) if verb == "add" => add(&places, rest),
+        _ => Err(format!("usage: {USAGE}")),
+    }) {
+        Ok(value) => {
+            println!("{value}");
+            return 0;
+        }
+        Err(error) => error,
+    };
+    eprintln!("{}", error_json(&done));
+    1
+}
+
+/// An agent's id by its name, now.
+async fn bot_id(client: &Client, name: &str) -> Result<i64, String> {
+    let record = client
+        .request("resume", json!({"bot": name}))
+        .await
+        .map_err(|e| e.to_string())?;
+    record["id"]
+        .as_i64()
+        .ok_or_else(|| "the daemon named no bot id".into())
 }
 
 fn add(places: &Places, args: &[String]) -> Result<Value, String> {
     let asked = parse_add(args, now())?;
-    let implicit = asked.bot.is_none();
-    let expected_id = if implicit {
-        Some(
-            std::env::var("AGENT_BOT_ID")
-                .ok()
-                .and_then(|v| v.parse::<i64>().ok())
-                .ok_or("invalid_trigger: implicit --bot needs AGENT_BOT_ID")?,
-        )
-    } else {
-        None
-    };
-    let bot = match asked.bot {
-        Some(bot) => bot,
-        None => std::env::var("AGENT_BOT")
-            .ok()
-            .filter(|b| !b.is_empty())
-            .ok_or("invalid_trigger: --bot NAME, or run it from an agent's shell")?,
+    let env = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
+    // The shell's own agent, when it is an agent's shell.
+    let shell = match (env("AGENT_BOT"), env("AGENT_BOT_ID")) {
+        (Some(bot), Some(id)) => Some((
+            bot,
+            id.parse::<i64>()
+                .map_err(|_| "invalid_trigger: AGENT_BOT_ID is not an id")?,
+        )),
+        _ => None,
     };
     let daemon = Daemon::current()?;
     let socket = daemon.socket()?;
-    // The bot must exist now; the trigger is pinned to this identity.
-    let (record, store_id) = runtime()?.block_on(async {
+    let name = asked
+        .name
+        .clone()
+        .or_else(|| asked.bot.clone())
+        .or_else(|| shell.as_ref().map(|s| s.0.clone()))
+        .ok_or("invalid_trigger: --bot NAME, or run it from an agent's shell")?;
+    let ((bot, bot_id), store_id) = runtime()?.block_on(async {
         let client = connect(&socket, &daemon).await?;
-        let record = client.request("resume", json!({"bot": bot})).await;
-        let store_id = client
-            .store()
-            .map(str::to_owned)
-            .ok_or_else(|| "the daemon announced no store identity".to_owned());
+        let resolved = async {
+            let bot = match (&asked.bot, &shell) {
+                (Some(bot), _) => (bot.clone(), bot_id(&client, bot).await?),
+                (None, Some((bot, id))) => {
+                    // The trigger is pinned to this identity, which must still exist.
+                    if bot_id(&client, bot).await? != *id {
+                        return Err(
+                            "bot_not_found: the shell's bot identity no longer exists".into()
+                        );
+                    }
+                    (bot.clone(), *id)
+                }
+                (None, None) => {
+                    return Err(
+                        "invalid_trigger: --bot NAME, or run it from an agent's shell".into(),
+                    );
+                }
+            };
+            let store_id = client
+                .store()
+                .map(str::to_owned)
+                .ok_or_else(|| "the daemon announced no store identity".to_owned())?;
+            Ok::<_, String>((bot, store_id))
+        }
+        .await;
         client.close().await;
-        Ok::<_, String>((record.map_err(|e| e.to_string())?, store_id?))
+        resolved
     })?;
-    let bot_id = record["id"].as_i64().ok_or("the daemon named no bot id")?;
-    if expected_id.is_some_and(|id| id != bot_id) {
-        return Err("bot_not_found: the shell's bot identity no longer exists".into());
-    }
     let trigger = Trigger {
         generation: format!(
             "{}-{}",
@@ -1371,11 +1573,12 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
                 .as_nanos()
         ),
         not_before: asked.when.not_before,
-        name: asked.name.unwrap_or_else(|| bot.clone()),
+        name,
         bot,
         bot_id,
-        when: asked.when.text,
+        when: asked.when.text.clone(),
         at: asked.when.at,
+        commit: asked.commit,
         daemon,
         store_id,
         message: asked.message,
@@ -1385,32 +1588,68 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
         .into_iter()
         .filter_map(|key| std::env::var(key).ok().map(|v| (key, v)))
         .collect();
-    install(
+    match install(
         places,
         &app,
         &trigger,
-        &asked.when.entries,
+        &asked.when,
         &environment,
         &launchctl,
-    )?;
-    Ok(trigger.json(None))
+    )? {
+        Some(there) => {
+            let mut row = there.json(&state(places, &there));
+            row["duplicate"] = json!(true);
+            Ok(row)
+        }
+        None => {
+            // The commit there now is seen: only the next one fires.
+            if let Some(head) = trigger.commit.as_deref().and_then(head) {
+                let kept = Kept { head: Some(head) };
+                record_last(places, &trigger, &Value::Null, &kept)?;
+            }
+            Ok(trigger.json(&state(places, &trigger)))
+        }
+    }
 }
 
-/// What a fire did, kept for the app to show.
+/// What a fire did, kept for the app to show and the next fire to read.
 /// It is the trigger's whole row, which Settings still shows once the
 /// trigger has ended on its own.
-fn record_last(places: &Places, trigger: &Trigger, outcome: &Value) -> Result<(), String> {
+fn record_last(
+    places: &Places,
+    trigger: &Trigger,
+    outcome: &Value,
+    kept: &Kept,
+) -> Result<(), String> {
     let mut outcome = outcome.clone();
-    outcome["fired_ms"] = json!(now() * 1000);
-    let row = trigger.json(Some(outcome));
+    if !outcome.is_null() {
+        outcome["fired_ms"] = json!(now() * 1000);
+    }
+    let mut row = trigger.json(&json!({"last": outcome}));
+    row["head"] = json!(kept.head);
     replace(&places.last(&trigger.name), &row.to_string())
 }
 
-/// Send the message: a new turn when the bot is resting; a working bot, or
-/// one with work waiting, skips this time of a repeating trigger, and gets
-/// a one-off's message after its work. A deleted bot's trigger goes.
-pub async fn send(client: &Client, trigger: &Trigger) -> Value {
-    let delivery = if trigger.at.is_some() {
+/// `YYYY-MM-DD HH:MM`, local.
+fn stamp(epoch: i64) -> String {
+    let t = local(epoch);
+    format!(
+        "{}-{:02}-{:02} {:02}:{:02}",
+        t.year, t.month, t.day, t.hour, t.minute
+    )
+}
+
+/// Send the fire's message: a new turn when the agent is resting; a working
+/// agent, or one with work waiting, skips this time of a repeating trigger
+/// and gets any other's after its work. A deleted agent's trigger goes.
+async fn deliver(client: &Client, trigger: &Trigger, why: &str, asked: bool) -> Value {
+    let prompt = format!(
+        "[trigger {} · {} · {why}]\n{}",
+        trigger.name,
+        stamp(now()),
+        trigger.message
+    );
+    let delivery = if trigger.at.is_some() || asked {
         "queue"
     } else {
         "reject"
@@ -1420,7 +1659,7 @@ pub async fn send(client: &Client, trigger: &Trigger) -> Value {
             "submit",
             json!({"bot": trigger.bot, "bot_id": trigger.bot_id,
                 "request_id": format!("trigger-{}-{}-{}", trigger.bot_id, now(), std::process::id()),
-                "prompt": trigger.message, "delivery": delivery, "origin": "trigger"}),
+                "prompt": prompt, "delivery": delivery, "origin": "trigger"}),
         )
         .await;
     match submitted {
@@ -1437,37 +1676,51 @@ pub async fn send(client: &Client, trigger: &Trigger) -> Value {
 
 /// `APP --trigger-fire ...`, run by launchd.
 pub fn fire_cli(args: &[String]) -> i32 {
-    let trigger = match Trigger::parse(args) {
-        Ok(trigger) => trigger,
-        Err(error) => {
-            eprintln!("{}", error_json(&error));
-            return 1;
-        }
-    };
-    let places = match Places::home() {
-        Ok(places) => places,
+    let (trigger, places) = match Trigger::parse(args).and_then(|t| Ok((t, Places::home()?))) {
+        Ok(found) => found,
         Err(error) => {
             eprintln!("{}", error_json(&error));
             return 1;
         }
     };
     let now = now();
-    // A one-off's calendar entry has no year: the same date a year early is
-    // not its time. A day's slack keeps its time when the Mac's time zone
-    // changed since it was made, which launchd follows and `at` does not.
-    if trigger.at.is_some_and(|at| now < at - SLACK) {
-        return 0;
+    let asked = take_asked(&places, &trigger.name);
+    let mut kept = Kept::of(&state(&places, &trigger));
+    if !asked {
+        // A one-off's calendar entry has no year: the same date a year early
+        // is not its time. A day's slack keeps its time when the Mac's time
+        // zone changed since it was made, which launchd follows and `at`
+        // does not.
+        if trigger.at.is_some_and(|at| now < at - SLACK) {
+            return 0;
+        }
+        if trigger.not_before.is_some_and(|first| now < first) {
+            return 0;
+        }
+        // Months late is the entry's next year: the Mac was off at its time,
+        // or its end was cut short. It is not sent; if it is still listed, it
+        // ends saying so.
+        if trigger.at.is_some_and(|at| now > at + STALE) {
+            let missed = json!({"outcome": "missed", "detail": "its time passed long ago"});
+            settle(&places, &trigger, &missed, &kept, &launchctl);
+            return 0;
+        }
     }
-    // Months late is the entry's next year: the Mac was off at its time, or
-    // its end was cut short. It is not sent; if it is still listed, it ends
-    // saying so.
-    if trigger.not_before.is_some_and(|first| now < first) {
-        return 0;
-    }
-    if trigger.at.is_some_and(|at| now > at + STALE) {
-        let missed = json!({"outcome": "missed", "detail": "its time passed long ago"});
-        settle(&places, &trigger, &missed, &launchctl);
-        return 0;
+    let mut why = if asked {
+        "fired".to_owned()
+    } else {
+        trigger.when.clone()
+    };
+    // Any write to the HEAD log wakes it; only another commit is news.
+    if let Some(repo) = &trigger.commit {
+        let seen = head(repo);
+        if !asked && (seen.is_none() || seen == kept.head) {
+            return 0;
+        }
+        if let Some(sha) = &seen {
+            why = format!("{why} at {}", &sha[..sha.len().min(12)]);
+        }
+        kept.head = seen;
     }
     let outcome = match runtime() {
         Ok(runtime) => runtime.block_on(async {
@@ -1485,13 +1738,13 @@ pub fn fire_cli(args: &[String]) -> i32 {
                 return json!({"outcome": "failed", "detail": format!(
                     "store_mismatch: the daemon at {} serves another store", socket.display())});
             }
-            let outcome = send(&client, &trigger).await;
+            let outcome = deliver(&client, &trigger, &why, asked).await;
             client.close().await;
             outcome
         }),
         Err(error) => json!({"outcome": "failed", "detail": error}),
     };
-    settle(&places, &trigger, &outcome, &launchctl);
+    settle(&places, &trigger, &outcome, &kept, &launchctl);
     0
 }
 
@@ -1675,12 +1928,24 @@ mod tests {
             bot_id: 42,
             when: "every 30m".into(),
             at: None,
+            commit: None,
             daemon: Daemon {
                 store: Some("/Users/a/.agent/state.sqlite".into()),
                 socket: Some("/tmp/s".into()),
             },
             store_id: "00ab".into(),
             message: "Check the PR's CI & reviews; <fix> what's \"red\".\nThen say so.".into(),
+        }
+    }
+
+    /// Only `fire` runs it.
+    fn fired() -> When {
+        When {
+            text: "fire".into(),
+            entries: Vec::new(),
+            not_before: None,
+            at: None,
+            watch: None,
         }
     }
 
@@ -1691,7 +1956,7 @@ mod tests {
         let text = plist(
             Path::new("/Applications/Agent.app/Contents/MacOS/agent-app"),
             &s,
-            &when.entries,
+            &when,
             &[("SHELL", "/bin/zsh".into())],
         );
         assert!(
@@ -1701,6 +1966,7 @@ mod tests {
         );
         assert!(text.contains("<dict><key>Minute</key><integer>22</integer></dict>"));
         assert!(text.contains("<key>SHELL</key><string>/bin/zsh</string>"));
+        assert!(!text.contains("WatchPaths"));
         let args = program(&text).unwrap();
         assert_eq!(args[0], "/Applications/Agent.app/Contents/MacOS/agent-app");
         assert_eq!(args[1], FIRE_FLAG);
@@ -1711,159 +1977,42 @@ mod tests {
                 store: None,
                 socket: Some("/tmp/s".into()),
             },
-            ..s
+            ..s.clone()
         };
         assert_eq!(Trigger::parse(&once.args()[1..]).unwrap(), once);
-    }
-
-    #[test]
-    fn add_replaces_and_rm_removes_through_launchd() {
-        let root = std::env::temp_dir().join(format!("agent-app-trigger-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let places = Places {
-            agents: root.join("LaunchAgents"),
-            state: root.join("triggers"),
+        // Everything else a trigger may carry comes back as it went.
+        let full = Trigger {
+            when: "commit /r".into(),
+            commit: Some("/r".into()),
+            ..s.clone()
         };
-        let asked = RefCell::new(Vec::new());
-        let launchd = |what: Launchd| {
-            let unloading = match what {
-                Launchd::Load(path) => {
-                    asked.borrow_mut().push(format!(
-                        "load {}",
-                        path.file_name().unwrap().to_string_lossy()
-                    ));
-                    return Ok(());
-                }
-                Launchd::Unload(label) => label.to_owned(),
-            };
-            asked.borrow_mut().push(format!("unload {unloading}"));
-            // launchd's labels keep their case.
-            match unloading.ends_with("p.fix-login") {
-                true => Ok(()),
-                false => Err(format!("{NOT_LOADED}no such process")),
-            }
+        let watched = When {
+            watch: Some("/r/.git/logs/HEAD".into()),
+            ..fired()
         };
-        let app = Path::new("/A/agent-app");
-        let s = trigger();
-        let entries = every("1d", clock(2026, 9, 28, 9, 7)).unwrap().entries;
-        install(&places, app, &s, &entries, &[], &launchd).unwrap();
-        install(&places, app, &s, &entries, &[], &launchd).unwrap();
-        assert_eq!(
-            *asked.borrow(),
-            [
-                "unload me.lydakis.agent.trigger.p.fix-login",
-                "load me.lydakis.agent.trigger.p.fix-login.plist",
-                "unload me.lydakis.agent.trigger.p.fix-login",
-                "load me.lydakis.agent.trigger.p.fix-login.plist",
-            ]
-        );
-        record_last(&places, &s, &json!({"outcome": "skipped"})).unwrap();
-        let listed = list(&places, None)["triggers"].clone();
-        assert_eq!(listed.as_array().unwrap().len(), 1);
-        assert_eq!(listed[0]["bot"], "p.fix-login");
-        assert_eq!(listed[0]["message"], s.message);
-        assert_eq!(listed[0]["last"]["outcome"], "skipped");
-        // A replacement starts with no last time of its own, while retaining
-        // the prior result for a rolled-back plist after interruption.
-        let s = Trigger {
-            generation: "test-2".into(),
-            ..s
-        };
-        install(&places, app, &s, &entries, &[], &launchd).unwrap();
-        assert!(list(&places, None)["triggers"].clone()[0]["last"].is_null());
-        // A load launchd refuses leaves nothing behind.
-        let other = Trigger {
-            name: "p.other".into(),
-            ..trigger()
-        };
-        let refused = install(&places, app, &other, &entries, &[], &|what| match what {
-            Launchd::Load(_) => Err("launchctl bootstrap: refused".into()),
-            Launchd::Unload(_) => Ok(()),
-        });
-        assert!(refused.unwrap_err().contains("refused"));
-        assert_eq!(
-            list(&places, None)["triggers"]
-                .clone()
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
-        // A move launchd refuses to load keeps the old path, to be tried again.
-        let refused = |what: Launchd| match what {
-            Launchd::Load(path) if std::fs::read_to_string(path).unwrap().contains("/B/") => {
-                Err("launchctl bootstrap: refused".to_owned())
-            }
-            _ => Ok(()),
-        };
-        refresh(&places, Path::new("/B/agent-app"), &refused);
-        assert_eq!(triggers(&places)[0].1, Path::new("/A/agent-app"));
-        // A name differing only in case would share its files on macOS.
-        let cased = Trigger {
-            name: "P.Fix-Login".into(),
-            ..trigger()
-        };
-        let taken = install(&places, app, &cased, &entries, &[], &launchd).unwrap_err();
+        let text = plist(Path::new("/A/app"), &full, &watched, &[]);
         assert!(
-            taken.starts_with("name_taken: P.Fix-Login: trigger p.fix-login"),
-            "{taken}"
-        );
-        // Nor does `rm` of that other case reach it, even where the folder would alias it.
-        assert!(
-            remove(&places, "P.Fix-Login", &launchd)
-                .unwrap_err()
-                .starts_with("trigger_not_found")
-        );
-        // A move of the app is written into every trigger and reloaded.
-        asked.borrow_mut().clear();
-        refresh(&places, Path::new("/B/agent-app"), &launchd);
-        assert_eq!(triggers(&places)[0].1, Path::new("/B/agent-app"));
-        assert_eq!(triggers(&places)[0].0, s);
-        assert_eq!(asked.borrow().len(), 2);
-        refresh(&places, Path::new("/B/agent-app"), &launchd);
-        assert_eq!(asked.borrow().len(), 2, "an unmoved app changes nothing");
-        remove(&places, &s.name, &launchd).unwrap();
-        assert_eq!(list(&places, None)["triggers"].clone(), json!([]));
-        assert!(!places.last(&s.name).exists());
-        assert!(
-            install(
-                &places,
-                app,
-                &Trigger {
-                    name: "../x".into(),
-                    ..trigger()
-                },
-                &entries,
-                &[],
-                &launchd
+            text.contains(
+                "<key>WatchPaths</key>\n  <array>\n    <string>/r/.git/logs/HEAD</string>"
             )
-            .is_err()
         );
-        std::fs::remove_dir_all(root).unwrap();
+        assert!(!text.contains("StartCalendarInterval"));
+        assert_eq!(read_plist(&text).unwrap().0, full);
+        // Only `fire` runs one with neither.
+        let text = plist(Path::new("/A/app"), &s, &fired(), &[]);
+        assert!(!text.contains("StartCalendarInterval") && !text.contains("WatchPaths"));
+        let mut args: Vec<String> = s.args()[1..].to_vec();
+        let at = args.iter().position(|a| a == "--bot-id").unwrap();
+        args.drain(at..at + 2);
+        assert!(Trigger::parse(&args).is_err(), "a bot needs its id");
     }
 
-    #[test]
-    fn the_script_is_runnable_even_when_its_text_was_already_there() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = std::env::temp_dir().join(format!("agent-app-script-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let app = Path::new("/A/agent-app");
-        write_script(&root, app).unwrap();
-        let path = root.join("trigger");
-        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(&path), 0o755);
-        // Its text survived a crash before its mode did.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        write_script(&root, app).unwrap();
-        assert_eq!(mode(&path), 0o755);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    /// launchd as triggers see it: which labels are loaded, and what it
-    /// refuses.
+    /// launchd as triggers see it: which labels are loaded, which were run,
+    /// and what it refuses.
     #[derive(Default)]
     struct Fake {
         loaded: RefCell<std::collections::BTreeSet<String>>,
+        started: RefCell<Vec<String>>,
         refuse_load: std::cell::Cell<bool>,
         refuse_unload: std::cell::Cell<bool>,
         unloads: std::cell::Cell<usize>,
@@ -1894,6 +2043,13 @@ mod tests {
                         .then_some(())
                         .ok_or_else(|| format!("{NOT_LOADED}launchctl bootout: no such process"))
                 }
+                Launchd::Start(label) => {
+                    if !self.loaded.borrow().contains(label) {
+                        return Err("launchctl kickstart: no such service".into());
+                    }
+                    self.started.borrow_mut().push(label.to_owned());
+                    Ok(())
+                }
             }
         }
     }
@@ -1910,7 +2066,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
             let places = Places {
                 agents: root.join("LaunchAgents"),
-                state: root.join("triggers"),
+                state: root.join(".agent/triggers"),
             };
             Self {
                 root,
@@ -1918,19 +2074,20 @@ mod tests {
                 fake: Fake::default(),
             }
         }
-        fn install(&self, s: &Trigger) -> Result<(), String> {
-            let entries = every("1d", clock(2026, 9, 28, 9, 7)).unwrap().entries;
+        fn install(&self, s: &Trigger) -> Result<Option<Trigger>, String> {
+            let when = every("1d", clock(2026, 9, 28, 9, 7)).unwrap();
             install(
                 &self.places,
                 Path::new("/A/agent-app"),
                 s,
-                &entries,
+                &when,
                 &[],
                 &|w| self.fake.call(w),
             )
         }
         fn settle(&self, s: &Trigger, outcome: Value) {
-            settle(&self.places, s, &outcome, &|w| self.fake.call(w));
+            let kept = Kept::of(&state(&self.places, s));
+            settle(&self.places, s, &outcome, &kept, &|w| self.fake.call(w));
         }
         fn remove(&self, name: &str) -> Result<(), String> {
             remove(&self.places, name, &|w| self.fake.call(w))
@@ -1948,6 +2105,12 @@ mod tests {
         }
         fn plist(&self, name: &str) -> String {
             std::fs::read_to_string(self.places.plist(name)).unwrap()
+        }
+        fn rows(&self) -> Vec<Value> {
+            list(&self.places, None)["triggers"]
+                .as_array()
+                .unwrap()
+                .clone()
         }
     }
 
@@ -1967,87 +2130,187 @@ mod tests {
     }
 
     #[test]
-    fn oversized_plists_are_refused_before_installing_or_replacing_a_trigger() {
+    fn add_again_is_the_same_trigger_and_rm_removes_through_launchd() {
+        let w = World::new("add");
+        let s = trigger();
+        assert_eq!(w.install(&s).unwrap(), None);
+        // The same again changes nothing and says it was there; its result stays.
+        record_last(
+            &w.places,
+            &s,
+            &json!({"outcome": "skipped"}),
+            &Kept::default(),
+        )
+        .unwrap();
+        let unloads = w.fake.unloads.get();
+        let again = Trigger {
+            generation: "test-2".into(),
+            not_before: Some(1),
+            ..s.clone()
+        };
+        assert_eq!(w.install(&again).unwrap(), Some(s.clone()));
+        assert_eq!(w.fake.unloads.get(), unloads);
+        assert_eq!(w.rows()[0]["last"]["outcome"], "skipped");
+        // Another under its name is refused, naming what differs.
+        let other = Trigger {
+            message: "something else".into(),
+            ..s.clone()
+        };
+        let refused = w.install(&other).unwrap_err();
+        assert_eq!(
+            error_json(&refused),
+            json!({"error": "trigger_exists", "field": "message",
+                "detail": "p.fix-login is a trigger with another message; rm it first or pass another --name"})
+        );
+        let other_bot = Trigger {
+            bot_id: 43,
+            ..s.clone()
+        };
+        assert!(
+            w.install(&other_bot)
+                .unwrap_err()
+                .starts_with("trigger_exists: bot:")
+        );
+        assert_eq!(
+            w.plist(&s.name),
+            plist(
+                Path::new("/A/agent-app"),
+                &s,
+                &every("1d", clock(2026, 9, 28, 9, 7)).unwrap(),
+                &[]
+            )
+        );
+        // A move launchd refuses to load keeps the old path, to be tried again.
+        let refused = |what: Launchd| match what {
+            Launchd::Load(path) if std::fs::read_to_string(path).unwrap().contains("/B/") => {
+                Err("launchctl bootstrap: refused".to_owned())
+            }
+            what => w.fake.call(what),
+        };
+        refresh(&w.places, Path::new("/B/agent-app"), &refused);
+        assert_eq!(triggers(&w.places)[0].1, Path::new("/A/agent-app"));
+        // A name differing only in case would share its files on macOS.
+        let cased = Trigger {
+            name: "P.Fix-Login".into(),
+            ..trigger()
+        };
+        let taken = w.install(&cased).unwrap_err();
+        assert!(
+            taken.starts_with("name_taken: P.Fix-Login: trigger p.fix-login"),
+            "{taken}"
+        );
+        // Nor does `rm` of that other case reach it, even where the folder would alias it.
+        assert!(
+            w.remove("P.Fix-Login")
+                .unwrap_err()
+                .starts_with("trigger_not_found")
+        );
+        // A move of the app is written into every trigger and reloaded.
+        let unloads = w.fake.unloads.get();
+        refresh(&w.places, Path::new("/B/agent-app"), &|x| w.fake.call(x));
+        assert_eq!(triggers(&w.places)[0].1, Path::new("/B/agent-app"));
+        assert_eq!(triggers(&w.places)[0].0, s);
+        assert_eq!(w.fake.unloads.get(), unloads + 1);
+        refresh(&w.places, Path::new("/B/agent-app"), &|x| w.fake.call(x));
+        assert_eq!(
+            w.fake.unloads.get(),
+            unloads + 1,
+            "an unmoved app changes nothing"
+        );
+        w.remove(&s.name).unwrap();
+        assert_eq!(w.rows(), Vec::<Value>::new());
+        assert_eq!(w.state(&s.name), (false, false, false));
+        let bad = Trigger {
+            name: "../x".into(),
+            ..trigger()
+        };
+        assert!(w.install(&bad).is_err());
+    }
+
+    #[test]
+    fn the_script_is_runnable_even_when_its_text_was_already_there() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("agent-app-script-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let app = Path::new("/A/agent-app");
+        write_script(&root, app).unwrap();
+        let path = root.join("trigger");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o755);
+        // Its text survived a crash before its mode did.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_script(&root, app).unwrap();
+        assert_eq!(mode(&path), 0o755);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn oversized_plists_are_refused_before_installing_a_trigger() {
         let w = World::new("record-limit");
         let broad = cron("0-7 0-7 1-4 1-4 *").unwrap();
         let s = Trigger {
-            when: broad.text,
+            when: broad.text.clone(),
             ..trigger()
         };
         let app = Path::new("/A/agent-app");
-        let oversized = plist(app, &s, &broad.entries, &[]);
-        assert!(oversized.len() as u64 > MAX_RECORD);
-        let install_broad = || {
-            install(&w.places, app, &s, &broad.entries, &[], &|what| {
-                w.fake.call(what)
-            })
-        };
-        assert!(install_broad().unwrap_err().starts_with("invalid_trigger:"));
+        assert!(plist(app, &s, &broad, &[]).len() as u64 > MAX_RECORD);
+        let refused = install(&w.places, app, &s, &broad, &[], &|what| w.fake.call(what));
+        assert!(refused.unwrap_err().starts_with("invalid_trigger:"));
         assert_eq!(w.state(&s.name), (false, false, false));
         assert_eq!(w.fake.unloads.get(), 0);
-
         // A large readable plist, including XML expansion, still lists and
         // follows an app move. The limit is serialized bytes, not message bytes.
         let when = cron("0-7 0-7 1-2 1-4 *").unwrap();
         let kept = Trigger {
-            when: when.text,
+            when: when.text.clone(),
             message: "&".repeat(MAX_MESSAGE / 2),
             ..s.clone()
         };
-        install(&w.places, app, &kept, &when.entries, &[], &|what| {
-            w.fake.call(what)
-        })
-        .unwrap();
+        install(&w.places, app, &kept, &when, &[], &|what| w.fake.call(what)).unwrap();
         let text = w.plist(&s.name);
         assert!(text.len() as u64 > MAX_RECORD * 9 / 10);
         assert!(text.len() as u64 <= MAX_RECORD);
-        assert_eq!(
-            list(&w.places, None)["triggers"][0]["message"],
-            kept.message
-        );
+        assert_eq!(w.rows()[0]["message"], kept.message);
         refresh(&w.places, Path::new("/B/agent-app"), &|what| {
             w.fake.call(what)
         });
-        let before = w.plist(&s.name);
-        assert_eq!(read_plist(&before).unwrap().1, Path::new("/B/agent-app"));
-        record_last(&w.places, &kept, &json!({"outcome": "sent", "turn": 7})).unwrap();
-        let unloads = w.fake.unloads.get();
-
-        assert!(install_broad().unwrap_err().starts_with("invalid_trigger:"));
-        assert_eq!(w.fake.unloads.get(), unloads);
-        assert_eq!(w.plist(&s.name), before);
-        assert_eq!(w.state(&s.name), (true, true, true));
-        assert_eq!(list(&w.places, None)["triggers"][0]["last"]["turn"], 7);
+        assert_eq!(
+            read_plist(&w.plist(&s.name)).unwrap().1,
+            Path::new("/B/agent-app")
+        );
     }
 
     #[test]
-    fn pages_bound_messages_and_keep_replacement_results_with_their_generation() {
+    fn pages_bound_messages_and_keep_results_with_their_generation() {
         let w = World::new("pages");
         let s = trigger();
         w.install(&s).unwrap();
-        record_last(&w.places, &s, &json!({"outcome": "sent", "turn": 7})).unwrap();
-        let prior = std::fs::read_to_string(w.places.last(&s.name)).unwrap();
+        record_last(
+            &w.places,
+            &s,
+            &json!({"outcome": "sent", "turn": 7}),
+            &Kept::default(),
+        )
+        .unwrap();
+        assert_eq!(w.rows()[0]["last"]["turn"], 7);
+        // Another of its name made since (an `rm`, then an `add`) does not
+        // take its result; the first one put back sees it again.
         let changed = Trigger {
             generation: "test-next".into(),
             ..s.clone()
         };
-        install(&w.places, Path::new("/A/app"), &changed, &[], &[], &|_| {
-            // A crash at any launchd transition still leaves the prior result.
-            assert_eq!(
-                std::fs::read_to_string(w.places.last(&s.name)).unwrap(),
-                prior
-            );
-            Ok(())
-        })
-        .unwrap();
-        assert!(list(&w.places, None)["triggers"][0]["last"].is_null());
-        // A restored old plist sees its own result, without a result rollback.
         std::fs::write(
             w.places.plist(&s.name),
-            plist(Path::new("/A/app"), &s, &[], &[]),
+            plist(Path::new("/A/app"), &changed, &fired(), &[]),
         )
         .unwrap();
-        assert_eq!(list(&w.places, None)["triggers"][0]["last"]["turn"], 7);
+        assert!(w.rows()[0]["last"].is_null());
+        std::fs::write(
+            w.places.plist(&s.name),
+            plist(Path::new("/A/app"), &s, &fired(), &[]),
+        )
+        .unwrap();
+        assert_eq!(w.rows()[0]["last"]["turn"], 7);
         for i in 0..PAGE_SIZE + 2 {
             let item = Trigger {
                 name: format!("task-{i:03}"),
@@ -2056,7 +2319,7 @@ mod tests {
             };
             std::fs::write(
                 w.places.plist(&item.name),
-                plist(Path::new("/A/app"), &item, &[], &[]),
+                plist(Path::new("/A/app"), &item, &fired(), &[]),
             )
             .unwrap();
         }
@@ -2093,7 +2356,7 @@ mod tests {
     }
 
     #[test]
-    fn creating_and_replacing_leave_a_trigger_whole_or_as_it_was() {
+    fn creating_leaves_a_trigger_whole_or_nothing() {
         let w = World::new("create");
         let s = trigger();
         // A load launchd refuses leaves nothing.
@@ -2103,40 +2366,7 @@ mod tests {
         w.fake.refuse_load.set(false);
         w.install(&s).unwrap();
         assert_eq!(w.state(&s.name), (true, true, false));
-        // A replacement starts with no last result.
-        record_last(&w.places, &s, &json!({"outcome": "skipped"})).unwrap();
-        let changed = Trigger {
-            generation: "test-2".into(),
-            message: "something else".into(),
-            ..trigger()
-        };
-        w.install(&changed).unwrap();
-        assert_eq!(w.state(&s.name), (true, true, true));
-        assert!(list(&w.places, None)["triggers"][0]["last"].is_null());
-        assert_eq!(triggers(&w.places)[0].0, changed);
-        // One launchd will not load puts the old one back, loaded, with its result.
-        record_last(&w.places, &changed, &json!({"outcome": "skipped"})).unwrap();
-        let before = w.plist(&s.name);
-        w.fake.refuse_load.set(true);
-        assert!(w.install(&s).is_err());
-        w.fake.refuse_load.set(false);
-        // The fake refused the old one's load too; launchd loads it at the next login.
-        assert_eq!(w.plist(&s.name), before);
-        assert_eq!(
-            list(&w.places, None)["triggers"].clone()[0]["last"]["outcome"],
-            "skipped"
-        );
-        w.fake
-            .loaded
-            .borrow_mut()
-            .insert(format!("{LABEL}{}", s.name));
-        // An old job launchd will not unload is not replaced at all.
-        w.fake.refuse_unload.set(true);
-        assert!(w.install(&s).unwrap_err().contains("busy"));
-        w.fake.refuse_unload.set(false);
-        assert_eq!(w.plist(&s.name), before);
-        assert_eq!(w.state(&s.name), (true, true, true));
-        // An old plist that cannot be read could not be put back: nothing is touched.
+        // A plist there that cannot be read is not replaced, nor unloaded.
         let odd = Trigger {
             name: "p.odd".into(),
             ..trigger()
@@ -2145,19 +2375,25 @@ mod tests {
         let unloads = w.fake.unloads.get();
         assert!(w.install(&odd).is_err());
         assert_eq!(w.fake.unloads.get(), unloads);
-        // It is listed, saying why, and `rm` cannot take a folder away.
-        let row = list(&w.places, None)["triggers"]
-            .clone()
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|r| r["name"] == "p.odd")
-            .cloned()
-            .unwrap();
+        // It is listed, saying why.
+        let row = w.rows().into_iter().find(|r| r["name"] == "p.odd").unwrap();
         assert!(row["problem"].as_str().unwrap().starts_with("unreadable"));
         std::fs::remove_dir_all(w.places.plist(&odd.name)).unwrap();
+        std::fs::write(w.places.plist(&odd.name), "not a plist").unwrap();
+        assert!(
+            w.install(&odd)
+                .unwrap_err()
+                .starts_with("trigger_exists: definition:")
+        );
+        std::fs::remove_file(w.places.plist(&odd.name)).unwrap();
         // Nor may a name differing only in case take an ended one's result.
-        record_last(&w.places, &once(), &json!({"outcome": "failed"})).unwrap();
+        record_last(
+            &w.places,
+            &once(),
+            &json!({"outcome": "failed"}),
+            &Kept::default(),
+        )
+        .unwrap();
         let cased = Trigger {
             name: "P.Once".into(),
             ..trigger()
@@ -2187,21 +2423,22 @@ mod tests {
             json!({"outcome": "failed", "detail": "daemon_unavailable"}),
         );
         assert_eq!(w.state(&one.name), (false, false, true));
-        let listed = list(&w.places, None)["triggers"].clone();
-        assert_eq!(listed.as_array().unwrap().len(), 1);
+        let listed = w.rows();
+        assert_eq!(listed.len(), 1);
         assert_eq!(
             (&listed[0]["ended"], &listed[0]["last"]["outcome"]),
             (&json!(true), &json!("failed"))
         );
         assert_eq!(listed[0]["message"], one.message);
         w.remove(&one.name).unwrap();
-        assert_eq!(list(&w.places, None)["triggers"].clone(), json!([]));
+        assert_eq!(w.rows(), Vec::<Value>::new());
         // Replaced while its message went out: the new one is left alone.
         w.install(&one).unwrap();
         let replacement = Trigger {
             message: "a new reminder".into(),
             ..once()
         };
+        w.remove(&one.name).unwrap();
         w.install(&replacement).unwrap();
         w.settle(&one, json!({"outcome": "sent", "turn": 3}));
         assert_eq!(w.state(&one.name), (true, true, false));
@@ -2212,24 +2449,17 @@ mod tests {
         w.fake.refuse_unload.set(false);
         assert_eq!(w.state(&one.name), (true, true, true));
         assert_eq!(triggers(&w.places)[0].0, replacement);
-        assert_eq!(
-            list(&w.places, None)["triggers"].clone()[0]["last"]["turn"],
-            4
-        );
+        assert_eq!(w.rows()[0]["last"]["turn"], 4);
         // A job left loaded without its plist (an end cut short) is unloaded
         // by its next fire, which records nothing over the result there was.
         std::fs::remove_file(w.places.plist(&one.name)).unwrap();
         w.settle(&replacement, json!({"outcome": "missed"}));
         assert_eq!(w.state(&one.name), (false, false, true));
-        assert_eq!(
-            list(&w.places, None)["triggers"].clone()[0]["last"]["turn"],
-            4
-        );
+        assert_eq!(w.rows()[0]["last"]["turn"], 4);
         w.remove(&one.name).unwrap();
         // A plist that will not go keeps its job loaded and its result.
         let stuck = w.places.plist("p.stuck");
         std::fs::create_dir_all(stuck.join("x")).unwrap();
-        record_last(&w.places, &once(), &json!({"outcome": "sent"})).unwrap();
         w.fake.loaded.borrow_mut().insert(format!("{LABEL}p.stuck"));
         end(&w.places, "p.stuck", &stuck, "", false, &|x| w.fake.call(x));
         assert!(w.fake.loaded.borrow().contains(&format!("{LABEL}p.stuck")));
@@ -2244,11 +2474,184 @@ mod tests {
     }
 
     #[test]
+    fn fire_asks_launchd_to_run_the_job_now_and_its_fire_knows() {
+        let w = World::new("fire-now");
+        let s = trigger();
+        assert!(
+            fire_now(&w.places, &s.name, &|x| w.fake.call(x))
+                .unwrap_err()
+                .starts_with("trigger_not_found")
+        );
+        w.install(&s).unwrap();
+        assert_eq!(
+            fire_now(&w.places, &s.name, &|x| w.fake.call(x)).unwrap(),
+            json!({"name": s.name, "fired": true})
+        );
+        assert_eq!(*w.fake.started.borrow(), [format!("{LABEL}{}", s.name)]);
+        assert!(take_asked(&w.places, &s.name));
+        // Read once: the next fire is launchd's own.
+        assert!(!take_asked(&w.places, &s.name));
+        // One asked for long ago is not this fire's.
+        replace(&w.places.asked(&s.name), &(now() - 3600).to_string()).unwrap();
+        assert!(!take_asked(&w.places, &s.name));
+        // One launchd will not run leaves no note behind.
+        w.fake.loaded.borrow_mut().clear();
+        assert!(fire_now(&w.places, &s.name, &|x| w.fake.call(x)).is_err());
+        assert!(!w.places.asked(&s.name).exists());
+    }
+
+    #[test]
+    fn earlier_schedules_become_triggers_once() {
+        let w = World::new("migrate");
+        let home = w.places.state.parent().unwrap().to_owned();
+        let old_state = home.join("schedules");
+        std::fs::create_dir_all(&old_state).unwrap();
+        std::fs::create_dir_all(&w.places.agents).unwrap();
+        // What an earlier app wrote for two schedules, an ended one's result,
+        // and one that is not a schedule's plist.
+        let old = |s: &Trigger| {
+            plist(
+                Path::new("/A/agent-app"),
+                s,
+                &every("1d", clock(2026, 9, 28, 9, 7)).unwrap(),
+                &[],
+            )
+            .replace(LABEL, SCHEDULE_LABEL)
+            .replace(FIRE_FLAG, SCHEDULE_FIRE_FLAG)
+        };
+        let (a, b) = (
+            trigger(),
+            Trigger {
+                name: "p.b".into(),
+                ..trigger()
+            },
+        );
+        for s in [&a, &b] {
+            let path = w
+                .places
+                .agents
+                .join(format!("{SCHEDULE_LABEL}{}.plist", s.name));
+            std::fs::write(&path, old(s)).unwrap();
+            w.fake
+                .loaded
+                .borrow_mut()
+                .insert(format!("{SCHEDULE_LABEL}{}", s.name));
+        }
+        let mut result = a.json(&json!({"last": {"outcome": "sent", "turn": 3}}));
+        result["generation"] = json!(a.generation);
+        std::fs::write(old_state.join("p.fix-login.json"), result.to_string()).unwrap();
+        std::fs::write(
+            old_state.join("p.ended.json"),
+            json!({"name": "p.ended", "message": "m"}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(old_state.join(".lock"), "").unwrap();
+        let odd = w.places.agents.join(format!("{SCHEDULE_LABEL}p.odd.plist"));
+        std::fs::write(&odd, "<plist/>").unwrap();
+        std::fs::write(
+            home.join("schedule"),
+            "#!/bin/sh\nexec '/A/agent-app' --schedule \"$@\"\n",
+        )
+        .unwrap();
+        // Run by p.b's own fire, whose unload is last.
+        let order = RefCell::new(Vec::new());
+        migrate(&w.places, Some("p.b"), &|x| {
+            if let Launchd::Unload(label) = &x {
+                order.borrow_mut().push(label.to_string());
+            }
+            w.fake.call(x)
+        });
+        assert_eq!(
+            triggers(&w.places)
+                .into_iter()
+                .map(|t| t.0)
+                .collect::<Vec<_>>(),
+            [b.clone(), a.clone()]
+        );
+        assert_eq!(
+            w.fake.loaded.borrow().iter().cloned().collect::<Vec<_>>(),
+            [format!("{LABEL}p.b"), format!("{LABEL}p.fix-login")]
+        );
+        assert_eq!(
+            order.borrow().last().unwrap(),
+            &format!("{SCHEDULE_LABEL}p.b")
+        );
+        let rows = w.rows();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["name"], "p.b");
+        assert_eq!(
+            (&rows[1]["name"], &rows[1]["ended"]),
+            (&json!("p.ended"), &json!(true))
+        );
+        assert_eq!(rows[2]["last"]["turn"], 3);
+        // What could not be read stays where it was; the rest is gone.
+        assert!(odd.exists());
+        assert!(!old_state.exists());
+        assert!(!home.join("schedule").exists());
+        // Run again, there is nothing more to do.
+        let unloads = w.fake.unloads.get();
+        migrate(&w.places, None, &|x| w.fake.call(x));
+        assert_eq!(w.fake.unloads.get(), unloads);
+    }
+
+    #[test]
+    fn errors_have_one_shape() {
+        assert_eq!(
+            error_json("trigger_not_found: x"),
+            json!({"error": "trigger_not_found", "detail": "x"})
+        );
+        assert_eq!(
+            error_json("/a/b: no such file"),
+            json!({"error": "trigger_failed", "detail": "/a/b: no such file"})
+        );
+        assert_eq!(error_json("usage: trigger ls")["error"], "usage");
+    }
+
+    #[test]
+    fn a_commit_trigger_watches_the_head_log_and_names_the_commit() {
+        let root = std::env::temp_dir().join(format!("agent-app-commit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "{args:?}"
+            );
+        };
+        git(&["init", "-q"]);
+        assert!(commit(root.to_str().unwrap()).is_ok());
+        assert_eq!(head(&root), None, "no commit yet");
+        git(&["commit", "-q", "--allow-empty", "-m", "one"]);
+        let (when, repo) = commit(root.to_str().unwrap()).unwrap();
+        assert_eq!(repo, root);
+        assert_eq!(when.text, format!("commit {}", root.display()));
+        let log = when.watch.unwrap();
+        assert!(log.ends_with(".git/logs/HEAD") && log.exists());
+        let first = head(&root).unwrap();
+        git(&["commit", "-q", "--allow-empty", "-m", "two"]);
+        assert_ne!(head(&root).unwrap(), first);
+        assert!(
+            commit(root.join("nope").to_str().unwrap())
+                .unwrap_err()
+                .starts_with("invalid_commit")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn removal_reaches_whatever_is_left_of_a_trigger() {
         let w = World::new("remove");
         let s = trigger();
         w.install(&s).unwrap();
-        record_last(&w.places, &s, &json!({"outcome": "sent"})).unwrap();
+        record_last(&w.places, &s, &json!({"outcome": "sent"}), &Kept::default()).unwrap();
         // An unload launchd refuses keeps everything, to be tried again.
         w.fake.refuse_unload.set(true);
         assert!(w.remove(&s.name).unwrap_err().contains("busy"));
@@ -2279,8 +2682,9 @@ mod tests {
             ..once()
         };
         w.install(&late).unwrap();
-        assert_eq!(list(&w.places, None)["triggers"].clone()[0]["missed"], true);
+        assert_eq!(w.rows()[0]["missed"], true);
         // Its fire the next year does not send it; it ends, saying so.
+        w.remove(&late.name).unwrap();
         let stale = Trigger {
             at: Some(now() - STALE - 3600),
             ..once()
@@ -2291,119 +2695,11 @@ mod tests {
             json!({"outcome": "missed", "detail": "its time passed long ago"}),
         );
         assert_eq!(w.state(&stale.name), (false, false, true));
-        assert_eq!(
-            list(&w.places, None)["triggers"].clone()[0]["last"]["outcome"],
-            "missed"
-        );
+        assert_eq!(w.rows()[0]["last"]["outcome"], "missed");
     }
 
     #[test]
-    fn earlier_schedules_become_triggers_once() {
-        let w = World::new("migrate");
-        let home = w.root.join(".agent");
-        let places = Places {
-            agents: w.places.agents.clone(),
-            state: home.join("triggers"),
-        };
-        let old_state = home.join("schedules");
-        std::fs::create_dir_all(&old_state).unwrap();
-        std::fs::create_dir_all(&places.agents).unwrap();
-        // What an earlier app wrote for two schedules, an ended one's result,
-        // and one that is not a schedule's plist.
-        let entries = every("1d", clock(2026, 9, 28, 9, 7)).unwrap().entries;
-        let old = |s: &Trigger| {
-            plist(Path::new("/A/agent-app"), s, &entries, &[])
-                .replace(LABEL, SCHEDULE_LABEL)
-                .replace(FIRE_FLAG, SCHEDULE_FIRE_FLAG)
-        };
-        let (a, b) = (
-            trigger(),
-            Trigger {
-                name: "p.b".into(),
-                ..trigger()
-            },
-        );
-        for s in [&a, &b] {
-            let path = places
-                .agents
-                .join(format!("{SCHEDULE_LABEL}{}.plist", s.name));
-            std::fs::write(&path, old(s)).unwrap();
-            w.fake
-                .loaded
-                .borrow_mut()
-                .insert(format!("{SCHEDULE_LABEL}{}", s.name));
-        }
-        let result = a.json(Some(json!({"outcome": "sent", "turn": 3})));
-        std::fs::write(old_state.join("p.fix-login.json"), result.to_string()).unwrap();
-        std::fs::write(
-            old_state.join("p.ended.json"),
-            json!({"name": "p.ended", "message": "m"}).to_string(),
-        )
-        .unwrap();
-        std::fs::write(old_state.join(".lock"), "").unwrap();
-        let odd = places.agents.join(format!("{SCHEDULE_LABEL}p.odd.plist"));
-        std::fs::write(&odd, "<plist/>").unwrap();
-        std::fs::write(
-            home.join("schedule"),
-            "#!/bin/sh\nexec '/A/agent-app' --schedule \"$@\"\n",
-        )
-        .unwrap();
-        // Run by p.b's own fire, whose unload is last: it ends the process.
-        let order = RefCell::new(Vec::new());
-        migrate(&places, Some("p.b"), &|x| {
-            if let Launchd::Unload(label) = &x {
-                order.borrow_mut().push(label.to_string());
-            }
-            w.fake.call(x)
-        });
-        assert_eq!(
-            triggers(&places)
-                .into_iter()
-                .map(|t| t.0)
-                .collect::<Vec<_>>(),
-            [b.clone(), a.clone()]
-        );
-        assert_eq!(
-            w.fake.loaded.borrow().iter().cloned().collect::<Vec<_>>(),
-            [format!("{LABEL}p.b"), format!("{LABEL}p.fix-login")]
-        );
-        assert_eq!(
-            order.borrow().last().unwrap(),
-            &format!("{SCHEDULE_LABEL}p.b")
-        );
-        let rows = list(&places, None)["triggers"].clone();
-        assert_eq!(rows.as_array().unwrap().len(), 3);
-        assert_eq!(rows[0]["name"], "p.b");
-        assert_eq!(
-            (&rows[1]["name"], &rows[1]["ended"]),
-            (&json!("p.ended"), &json!(true))
-        );
-        assert_eq!(rows[2]["last"]["turn"], 3);
-        // What could not be read stays where it was; the rest is gone.
-        assert!(odd.exists());
-        assert!(!old_state.exists());
-        assert!(!home.join("schedule").exists());
-        // Run again, there is nothing more to do.
-        let unloads = w.fake.unloads.get();
-        migrate(&places, None, &|x| w.fake.call(x));
-        assert_eq!(w.fake.unloads.get(), unloads);
-    }
-
-    #[test]
-    fn errors_have_one_shape() {
-        assert_eq!(
-            error_json("trigger_not_found: x"),
-            json!({"error": "trigger_not_found", "detail": "x"})
-        );
-        assert_eq!(
-            error_json("/a/b: no such file"),
-            json!({"error": "trigger_failed", "detail": "/a/b: no such file"})
-        );
-        assert_eq!(error_json("usage: trigger ls")["error"], "usage");
-    }
-
-    #[test]
-    fn add_takes_one_time_and_a_message() {
+    fn add_takes_one_when_and_a_message() {
         let now = clock(2026, 9, 28, 23, 52);
         let words = |s: &str| s.split(' ').map(str::to_owned).collect::<Vec<_>>();
         let asked = parse_add(&words("--every 30m --bot p.x -- check the PR"), now).unwrap();
@@ -2411,14 +2707,30 @@ mod tests {
             (asked.bot.as_deref(), asked.message.as_str()),
             (Some("p.x"), "check the PR")
         );
-        assert!(
-            parse_add(&words("--every 30m --in 5m -- x"), now)
-                .unwrap_err()
-                .contains("one of")
+        let watched = parse_add(&words("--file notes.md -- x"), now).unwrap();
+        assert_eq!(
+            watched.when.watch,
+            Some(std::path::absolute("notes.md").unwrap())
         );
-        assert!(parse_add(&words("--every 30m"), now).is_err());
-        assert!(parse_add(&words("-- x"), now).is_err());
-        assert!(parse_add(&words("--every 30m --"), now).is_err());
+        for bad in [
+            "--every 30m --in 5m -- x",
+            "--every 30m --file x -- x",
+            "--every 30m",
+            "--every 30m --",
+            "--bot a --bot b -- x",
+            "--wat x -- x",
+        ] {
+            assert!(
+                parse_add(&words(bad), now)
+                    .unwrap_err()
+                    .starts_with("invalid_trigger:"),
+                "{bad}"
+            );
+        }
+        assert!(
+            parse_add(&words("-- x"), now).is_ok(),
+            "fire only, for the shell's agent"
+        );
         assert!(
             parse_add(
                 &["--in".into(), "5m".into(), "--".into(), "a\u{7}b".into()],
