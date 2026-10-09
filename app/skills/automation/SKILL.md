@@ -113,13 +113,17 @@ cap is reached its turns fail with `budget_exhausted`.
    source allows. One that lists only newest first: save each page read
    under `backlog/SOURCE/` as one file holding its items and the next
    page's cursor, replaced whole like any state file, so the next run goes
-   on from there instead of from the newest page; once the
-   bookmark is reached, report from the saved pages oldest first, removing
+   on from there instead of from the newest page. Save only a cursor that
+   names a place by item, such as an id or the source's opaque token: a
+   page number or offset shifts as new items arrive, so a source with only
+   those must be read to the bookmark in one run or it is a failed read.
+   Once the bookmark is reached, report from the saved pages oldest first, removing
    each page once the bookmark has moved past it. Keep at most the number of
    pages `preferences.md` allows, or 50; a source further behind than that
-   is a failed read, with the person told it cannot catch up. Then look up
-   each open item in the ledger again, since nothing new may have arrived
-   about it.
+   is a failed read, with the person told it cannot catch up. A source no
+   longer in `preferences.md` is not read: delete its bookmark and backlog,
+   and its ledger items get their last line and go. Then look up each open item
+   in the ledger again, since nothing new may have arrived about it.
 5. **A failed read is not a quiet day.** When a source errors, times out or
    its tool is missing, leave its bookmark where it is, write the rest from
    the other sources, and end with a line naming what could not be read, such

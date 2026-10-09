@@ -169,6 +169,15 @@ fn install_one(
 ) -> Result<(), String> {
     let dir = home.join(".agents/skills").join(name);
     let record = home.join(".agent/skills").join(name);
+    // A record that is the skill's own folder, through a link above both,
+    // always matches and so proves nothing: the skill is yours.
+    let identity = |path: &Path| {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+    };
+    if identity(&dir).is_some() && identity(&dir) == identity(&record) {
+        return Ok(());
+    }
     // A file or folder of the skill's that is a link leads somewhere the app
     // did not write, such as a checkout of yours, so the skill is yours.
     let linked = |file: &Path, top: &Path| {
@@ -477,6 +486,20 @@ mod tests {
                 .iter()
                 .all(|(file, _)| home.join(".agents/skills/x").join(file).exists())
         );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_record_folder_that_is_the_skill_folder_proves_nothing() {
+        let home = home("aliased");
+        one(&home, "x", &[("SKILL.md", "old")]).unwrap();
+        std::fs::remove_dir_all(home.join(".agent/skills")).unwrap();
+        std::os::unix::fs::symlink(home.join(".agents/skills"), home.join(".agent/skills"))
+            .unwrap();
+        let path = home.join(".agents/skills/x/SKILL.md");
+        std::fs::write(&path, "mine").unwrap();
+        one(&home, "x", &[("SKILL.md", "new")]).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine");
         std::fs::remove_dir_all(home).unwrap();
     }
 
