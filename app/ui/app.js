@@ -1438,7 +1438,8 @@ function renderTail(el, name, t) {
   const at = state.done && !state.used.over ? Rich.cut(state.cut, value) : 0;
   if (at > state.drawn) {
     const box = document.createElement('div'); box.innerHTML = Rich.html(value.slice(state.drawn, at), state.used);
-    state.done.append(...box.childNodes); Rich.hydrate(state.done);
+    const added = [...box.childNodes]; state.done.append(...added);
+    for (const n of added) if (n.nodeType === 1) Rich.hydrate(n);
     state.text.data = value.slice(at); state.drawn = at;
   } else state.text.appendData(value.slice(state.offset));
   state.offset = value.length;
@@ -1554,7 +1555,10 @@ function renderFile() {
   }
   el.innerHTML = `<div class="fview">${f.state === 'loading' ? '<div class="line pending">reading…</div>' : f.state === 'error' ? `<div class="line out bad">${esc(f.error)}</div>` : f.view}</div>`;
   el.dataset.key = key; el.dataset.who = ''; el.scrollTop = 0;
-  Rich.hydrate(el);
+  // A chart fills the pane's width, so it is measured once the pane has finished opening.
+  const opening = $('app')?.getAnimations?.() ?? [];
+  if (!opening.length) Rich.hydrate(el);
+  else Promise.all(opening.map((a) => a.finished.catch(() => {}))).then(() => { if (el.dataset.key === key) Rich.hydrate(el); });
 }
 
 // ---------- heads and composers ----------

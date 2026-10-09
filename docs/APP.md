@@ -1176,7 +1176,10 @@ streams as text. Fenced blocks are drawn by their language:
   as generated code. A chart in a message opens as its spec and draws with a
   click on **chart**: Vega draws on the window's thread, and a few characters
   of spec (a `sequence` transform to a billion, a billion ticks) can ask it
-  for more than it can draw. One drawn shows again when its pane is redrawn.
+  for more than it can draw. A diagram or chart drawn shows again when its
+  pane is redrawn, and only that block: an identical one elsewhere still
+  asks, so one click never fills a chat of copies. One in a file opened
+  beside is measured once the pane has finished opening.
 - **`html`** opens as code, and runs as a preview in a sandboxed frame only
   when asked: a click on **preview** runs it, a click on **code** stops it.
   A preview's scripts share the window's thread (a frame is not a process),

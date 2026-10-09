@@ -50,10 +50,14 @@ window.Rich = (() => {
   // window's thread, and a few characters can ask for more than it can do (a page's loop, an SVG's
   // filters, a chart's `sequence` to a billion, a Mermaid `space:500000`), so each runs only when
   // asked, block by block. `page` draws it at once, for a file someone opened.
+  // A diagram or chart in a message carries an id, kept with the message's HTML, so the one someone
+  // asked for shows again when its pane is drawn anew and an identical one elsewhere still asks.
+  let blockId = 0;
+  const lazy = (page) => page ? ' data-run' : ` data-id="${++blockId}"`;
   function block(text, info, page = false) {
     const lang = (info ?? '').trim().split(/\s+/)[0].toLowerCase();
-    if (lang === 'mermaid' || lang === 'mmd') return `<div class="rc" data-kind="mermaid" data-lazy${page ? ' data-run' : ''} data-view="code">${head('mermaid', toggle)}<div class="view"></div>${pre(text, '')}</div>`;
-    if (CHART.has(lang)) return `<div class="rc" data-kind="chart" data-lang="${lang === 'vega' ? 'vega' : 'vega-lite'}" data-lazy${page ? ' data-run' : ''} data-view="code">${head(lang, toggle)}<div class="view"></div>${pre(text, 'json')}</div>`;
+    if (lang === 'mermaid' || lang === 'mmd') return `<div class="rc" data-kind="mermaid" data-lazy${lazy(page)} data-view="code">${head('mermaid', toggle)}<div class="view"></div>${pre(text, '')}</div>`;
+    if (CHART.has(lang)) return `<div class="rc" data-kind="chart" data-lang="${lang === 'vega' ? 'vega' : 'vega-lite'}" data-lazy${lazy(page)} data-view="code">${head(lang, toggle)}<div class="view"></div>${pre(text, 'json')}</div>`;
     if (lang === 'html' || lang === 'htm') return `<div class="rc" data-kind="html" data-view="${page ? 'view' : 'code'}">${head(lang, '<button type="button" data-rich="view"></button>')}<div class="view frame"></div>${pre(text, 'xml')}</div>`;
     // An SVG draws as an image, which runs no script and loads nothing.
     if (lang === 'svg' && /^\s*(<\?xml[^>]*>\s*)?<svg\b/i.test(text)) return `<div class="rc" data-kind="svg" data-view="${page ? 'view' : 'code'}">${head(lang, '<button type="button" data-rich="view"></button>')}<div class="view"></div>${pre(text, 'xml')}</div>`;
@@ -164,10 +168,13 @@ window.Rich = (() => {
   }
   // A diagram or chart drawn to SVG once per source; one at a time, as Mermaid measures in a shared
   // scratch element. A source that does not draw keeps showing as code, the error in its head.
-  // With `cached`, only one already drawn is shown: a chart drawn once, when asked, shows again.
+  // With `cached`, only a block someone asked for (`shown`) that is already drawn is shown again.
+  const shown = new Set();
   function drawLazy(box, src, make, cached = false) {
     const key = `${box.dataset.kind}|${box.dataset.lang ?? ''}|${box.dataset.kind === 'chart' ? box.clientWidth : ''}|${src}`;
     const show = (svg) => settle(box, () => { box.querySelector('.view').innerHTML = svg; box.dataset.view = 'view'; box.dataset.drawn = ''; });
+    if (cached && !shown.has(box.dataset.id)) return;
+    if (!cached && box.dataset.id) shown.add(box.dataset.id);
     if (diagrams.has(key)) { show(diagrams.get(key)); return; }
     if (cached || 'asked' in box.dataset) return;
     box.dataset.asked = '';
@@ -237,11 +244,12 @@ window.Rich = (() => {
     const src = box.querySelector('pre').textContent;
     drawLazy(box, src, box.dataset.kind === 'mermaid' ? mermaidSVG : chartSVG, cached);
   }
-  // After HTML from `html` is in the document: a file's drawing starts, and a diagram or chart already
-  // drawn shows again from the cache. A page or SVG someone ran in a message is code again once its
-  // pane is drawn anew: running it is asked of one block, once.
+  // After HTML from `html` is in the document (`root` and what it holds): a file's drawing starts,
+  // and a diagram or chart someone asked for shows again from the cache. A page or SVG someone ran
+  // in a message is code again once its pane is drawn anew: running it is asked of one block, once.
+  const HYDRATE = '.rc[data-lazy]:not([data-on]), .rc[data-kind="html"]:not([data-on]), .rc[data-kind="svg"]:not([data-on])';
   function hydrate(root) {
-    for (const box of root.querySelectorAll('.rc[data-lazy]:not([data-on]), .rc[data-kind="html"]:not([data-on]), .rc[data-kind="svg"]:not([data-on])')) {
+    for (const box of [...(root.matches?.(HYDRATE) ? [root] : []), ...root.querySelectorAll(HYDRATE)]) {
       box.dataset.on = '';
       if ('lazy' in box.dataset) draw(box, !('run' in box.dataset));
       else if (box.dataset.view === 'view') mount(box);

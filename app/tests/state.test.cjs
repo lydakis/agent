@@ -36,7 +36,7 @@ function page(daemon = {}, storage = null) {
   context.Rich = context.window.Rich;
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules, tellLead, markSeen };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules, tellLead, markSeen, renderFile };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -156,7 +156,7 @@ test('fenced blocks become code, previews, diagrams and images by their language
   assert.match(Rich.html('```html\n<b>hi</b>\n```'), /data-kind="html" data-view="code"/);
   assert.match(Rich.html('```mermaid\ngraph TD\nA-->B\n```'), /data-kind="mermaid".*A--&gt;B/s);
   // A diagram in a message draws when asked; one in a file someone opened draws at once.
-  assert.match(Rich.html('```mermaid\ngraph TD\n```'), /data-kind="mermaid" data-lazy data-view="code"/);
+  assert.match(Rich.html('```mermaid\ngraph TD\n```'), /data-kind="mermaid" data-lazy data-id="\d+" data-view="code"/);
   assert.match(Rich.file('/w/flow.mmd', new TextEncoder().encode('graph TD')).html, /data-kind="mermaid" data-lazy data-run/);
   const svg = Rich.html('```svg\n<svg xmlns="http://www.w3.org/2000/svg"><circle r="4"/></svg>\n```');
   // An SVG draws as an image, and in a message only when asked: its filters and animations take CPU.
@@ -225,6 +225,37 @@ test('highlighting arriving redraws only messages whose code waited for it', () 
   assert.equal(calls, 3);
 });
 
+test('a diagram someone asked for shows again; an identical one elsewhere still asks', async () => {
+  const p = page(), c = p.context, Rich = c.Rich; let renders = 0;
+  c.document.head = { append(s) { s.onload(); } };
+  c.getComputedStyle = () => ({ getPropertyValue: () => '' });
+  c.mermaid = { initialize() {}, render: async (id, src) => { renders++; return { svg: `<svg>${src}</svg>` }; } };
+  const box = (id) => { const view = { innerHTML: '' }, pre = { textContent: 'graph TD' };
+    return { dataset: { kind: 'mermaid', lazy: '', view: 'code', id }, clientWidth: 0, view, closest: () => null, querySelector: (s) => s === 'pre' ? pre : s === '.view' ? view : null }; };
+  const asked = box('1'), button = { dataset: { rich: 'view' }, closest: () => asked };
+  Rich.click({ target: { closest: (s) => s === '[data-rich]' ? button : null }, preventDefault() {} });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(asked.view.innerHTML, '<svg>graph TD</svg>'); assert.equal(renders, 1);
+  // The pane drawn anew: the block asked for shows from the cache, its twin stays code.
+  const again = box('1'), twin = box('2');
+  Rich.hydrate({ querySelectorAll: () => [again, twin] });
+  assert.equal(again.view.innerHTML, '<svg>graph TD</svg>'); assert.equal(twin.view.innerHTML, ''); assert.equal(renders, 1);
+  // A block handed in on its own is hydrated too, as a streamed reply's new blocks are.
+  const alone = box('1'); alone.matches = () => true; alone.querySelectorAll = () => [];
+  Rich.hydrate(alone); assert.equal(alone.view.innerHTML, '<svg>graph TD</svg>');
+});
+
+test('a file opened while the side pane opens is drawn once the pane has its width', async () => {
+  const p = page(), c = p.context, R = c.Rich, opening = deferred(); let hydrated = 0;
+  c.Rich = { file: R.file, get version() { return R.version; }, hydrate: () => { hydrated++; } };
+  p.elements.set('app', { getAnimations: () => [{ finished: opening.promise }] });
+  p.S.ui.file = { bot: 'Bob', full: '/w/c.vl.json', gen: 1, state: 'ok', bytes: new TextEncoder().encode('{}'), more: false, url: null };
+  p.renderFile(); await settle();
+  assert.equal(hydrated, 0);
+  opening.resolve(); await settle();
+  assert.equal(hydrated, 1);
+});
+
 test('a name starting with a tilde is the folder\'s; only ~/ is home', () => {
   const p = page();
   assert.equal(p.joinPath('/w', '~notes.md'), '/w/~notes.md');
@@ -245,7 +276,7 @@ test('a link in a drawn diagram opens through the guarded opener', () => {
 test('charts, file links and opened files draw by kind', () => {
   const p = page(), Rich = p.context.Rich;
   // A chart in a message draws when asked; one in a file someone opened draws at once.
-  assert.match(Rich.html('```vega-lite\n{"mark":"bar"}\n```'), /data-kind="chart" data-lang="vega-lite" data-lazy data-view="code"/);
+  assert.match(Rich.html('```vega-lite\n{"mark":"bar"}\n```'), /data-kind="chart" data-lang="vega-lite" data-lazy data-id="\d+" data-view="code"/);
   assert.match(Rich.file('/w/c.vl.json', new TextEncoder().encode('{}')).html, /data-kind="chart" data-lang="vega-lite" data-lazy data-run/);
   assert.match(Rich.html('```vega\n{}\n```'), /data-lang="vega"/);
   const links = Rich.html('[plan](PLAN.md) [code](src/a.rs:12) [line](src/b.rs#L4-L9) [web](https://example.com) [here](#top)');
