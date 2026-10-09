@@ -243,6 +243,18 @@ test('a file opened from an agent closes when that agent is forgotten', () => {
   p.forgetBot('Bob'); assert.equal(p.S.ui.file, null);
 });
 
+test('a long streamed line is searched for its end once, not on every delta', () => {
+  const p = page(), Rich = p.context.Rich, st = {};
+  const line = 'x'.repeat(200000); let searched = 0;
+  for (let i = 1000; i <= line.length; i += 1000) {
+    const text = 'para\n\n' + line.slice(0, i);
+    const from = Math.max(st.scan ?? 0, st.seen ?? 0); searched += text.length - from;
+    assert.equal(Rich.cut(st, text), 6);
+  }
+  assert.ok(searched < 210000, `searched ${searched} characters`);
+  assert.equal(Rich.cut(st, 'para\n\n' + line + '\n\nnext'), 6 + line.length + 2);
+});
+
 test('streamed Markdown draws each finished block once and keeps fences whole', () => {
   const p = page(), Rich = p.context.Rich;
   const st = {};

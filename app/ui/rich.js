@@ -89,17 +89,19 @@ window.Rich = (() => {
   // Where streamed text can be drawn for good: after a blank line or a closing fence, outside any
   // fence. Only lines not yet scanned are read, so a long reply costs its deltas, not its length
   // on each one. `st` is the caller's, one per stream.
+  // `scan` is where the unfinished line starts, `seen` how far it was searched for its end, so a
+  // long line arriving in pieces is searched once.
   function cut(st, text) {
     let i = st.scan ?? 0;
     for (;;) {
-      const nl = text.indexOf('\n', i); if (nl < 0) break;
+      const nl = text.indexOf('\n', Math.max(i, st.seen ?? 0)); if (nl < 0) break;
       const line = text.slice(i, nl), f = /^\s*(`{3,}|~{3,})(.*)$/.exec(line);
       if (st.fence) { if (f && f[1][0] === st.fence[0] && f[1].length >= st.fence.length && !f[2].trim()) { st.fence = null; st.cut = nl + 1; } }
       else if (f && !(f[1][0] === '`' && f[2].includes('`'))) st.fence = f[1];
       else if (!line.trim()) st.cut = nl + 1;
       i = nl + 1;
     }
-    st.scan = i;
+    st.scan = i; st.seen = text.length;
     return st.cut ?? 0;
   }
 
@@ -139,9 +141,12 @@ window.Rich = (() => {
     if (diagrams.has(key)) { show(diagrams.get(key)); return; }
     if (cached || 'asked' in box.dataset) return;
     box.dataset.asked = '';
-    mermaidChain = mermaidChain.then(() => make(src, box)).then((svg) => {
-      if (!diagrams.has(key)) { diagrams.set(key, svg); diagramBytes += 2 * (key.length + svg.length); }
-      while (diagrams.size > DIAGRAMS || (diagramBytes > DIAGRAM_BYTES && diagrams.size > 1)) {
+    // One queued behind the same source takes its result instead of drawing it again; one larger
+    // than the whole budget is shown but not kept.
+    mermaidChain = mermaidChain.then(() => diagrams.get(key) ?? make(src, box)).then((svg) => {
+      const cost = 2 * (key.length + svg.length);
+      if (!diagrams.has(key) && cost <= DIAGRAM_BYTES) { diagrams.set(key, svg); diagramBytes += cost; }
+      while (diagrams.size > DIAGRAMS || diagramBytes > DIAGRAM_BYTES) {
         const [k, v] = diagrams.entries().next().value; diagrams.delete(k); diagramBytes -= 2 * (k.length + v.length);
       }
       show(svg);
@@ -238,7 +243,7 @@ window.Rich = (() => {
   // ---------- clicks ----------
   function open(url) {
     const invoke = globalThis.__TAURI__?.core?.invoke;
-    if (invoke) invoke('open_link', { url }).catch(() => {}); else window.open(url, '_blank', 'noopener');
+    if (invoke) invoke('open_link', { url }).catch((e) => failed(String(e?.message ?? e))); else window.open(url, '_blank', 'noopener');
   }
   // Handles a click the transcript got; true when it was one of ours.
   function click(e) {
@@ -301,10 +306,10 @@ window.Rich = (() => {
     const lang = { mmd: 'mermaid', mermaid: 'mermaid', vl: 'vega-lite', vg: 'vega', htm: 'html', html: 'html', svg: 'svg' }[ext] ?? ext;
     return { html: note + `<div class="md">${block(text, lang, true)}</div>` };
   }
-  let openFile = () => {};
+  let openFile = () => {}, failed = () => {};
 
   // A middle click on a link would open it in a new app window.
   document.addEventListener?.('auxclick', (e) => { if (e.target.closest?.('.md a[href]')) e.preventDefault(); });
 
-  return { html, cut, hydrate, click, file, filePath, esc, get version() { return version; }, set onReady(fn) { ready = fn; }, set onFile(fn) { openFile = fn; } };
+  return { html, cut, hydrate, click, file, filePath, esc, get version() { return version; }, set onReady(fn) { ready = fn; }, set onFile(fn) { openFile = fn; }, set onError(fn) { failed = fn; } };
 })();

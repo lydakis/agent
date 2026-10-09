@@ -2719,6 +2719,7 @@ document.addEventListener('contextmenu', (e) => {
 // Highlighting arrived: messages drawn without it are drawn again.
 Rich.onReady = () => { for (const [id] of PANES) $(id).dataset.key = ''; render(); };
 Rich.onFile = openFileFrom;
+Rich.onError = (text) => toast(text, 4000);
 
 // ---------- boot ----------
 render();
