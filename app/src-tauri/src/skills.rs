@@ -29,8 +29,6 @@ const MAX: u64 = 256 * 1024;
 fn install_one(home: &Path, name: &str, files: &[(&str, &str)]) -> Result<(), String> {
     let dir = home.join(".agents/skills").join(name);
     let record = home.join(".agent/skills").join(name);
-    // A regular file only, at most MAX + 1 bytes of it, so a huge file costs
-    // no more than a mismatch and a pipe never holds up the window.
     // Nothing at the path is None. Anything else must open, without
     // waiting, as a regular file: a dangling link or a pipe is an error, so
     // it is left alone and never holds up the window. At most MAX + 1 bytes
