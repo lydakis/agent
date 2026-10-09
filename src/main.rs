@@ -43,8 +43,7 @@ fn main() {
 /// the daemon's own fields plus the CLI's `hint` in flags; `--pretty`
 /// asks for a line a person reads instead.
 fn report(error: &Error) {
-    let args: Vec<String> = std::env::args().skip(1).take_while(|a| a != "--").collect();
-    if args.iter().any(|a| a == "--pretty") {
+    if client::PRETTY.load(std::sync::atomic::Ordering::Relaxed) {
         match error
             .facts
             .as_ref()

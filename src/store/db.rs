@@ -1666,12 +1666,12 @@ impl Database {
         request_id: Option<&str>,
         request: Option<&Value>,
     ) -> Result<Option<Bot>> {
-        let creation: Option<Option<String>> = self
+        let holder: Option<(Option<String>, i64, String)> = self
             .conn
-            .prepare_cached("SELECT creation FROM bots WHERE name=?")?
-            .query_row([name], |r| r.get(0))
+            .prepare_cached("SELECT creation,id,status FROM bots WHERE name=?")?
+            .query_row([name], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .optional()?;
-        let Some(creation) = creation else {
+        let Some((creation, id, status)) = holder else {
             let Some(key) = request_id else {
                 return Ok(None);
             };
@@ -1693,10 +1693,12 @@ impl Database {
         let Some(creation) =
             creation.filter(|c| request_id.is_some_and(|key| c["request_id"] == key))
         else {
-            let id = self.identity(name, None).ok();
-            return Err(
-                Error::with("bot_exists", format!("{name} is taken")).facts(json!({"bot_id":id}))
-            );
+            // A name still held by a deletion is taken until it finishes.
+            let detail = match status.as_str() {
+                "deleting" => format!("{name} is taken until its deletion finishes"),
+                _ => format!("{name} is taken"),
+            };
+            return Err(Error::with("bot_exists", detail).facts(json!({"bot_id":id})));
         };
         let fields = request
             .and_then(Value::as_object)
@@ -1707,11 +1709,10 @@ impl Database {
         {
             return Err(conflict(name, field));
         }
-        let bot = self.inspect(name)?;
-        if bot.status == "deleting" {
+        if status == "deleting" {
             return fail_with("bot_not_found", format!("{name} is being deleted"));
         }
-        Ok(Some(bot))
+        Ok(Some(self.inspect(name)?))
     }
     /// A new bot, and its `created` event; a resend of the request that made
     /// it gets the bot and no event.
@@ -3659,10 +3660,8 @@ impl Database {
                 return fail_with("invalid_from", format!("{from} has no turn {turn}"));
             }
         }
-        if let Some(level) = &options.reasoning
-            && !bot.family()?.reasoning_levels().contains(&level.as_str())
-        {
-            return fail_with("invalid_reasoning_level", level.as_str());
+        if let Some(level) = &options.reasoning {
+            bot.family()?.check_reasoning(level)?;
         }
         if let Err(error) = validate(&bot, options.model.as_deref()) {
             // An omitted steer model inherits the active turn for absorption.

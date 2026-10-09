@@ -2785,12 +2785,14 @@ fn a_turn_runs_at_its_own_effort_or_its_bots() {
         reasoning: Some(level.into()),
         ..TurnOptions::default()
     };
-    // Only the levels the bot's family takes.
+    // Only the levels the bot's family takes, named as at creation.
+    let refused = db
+        .begin("Bob", "r0", "work", true, &at("max"), allow_provider)
+        .unwrap_err();
+    assert_eq!(refused.code, "invalid_reasoning_level");
     assert_eq!(
-        db.begin("Bob", "r0", "work", true, &at("max"), allow_provider)
-            .unwrap_err()
-            .code,
-        "invalid_reasoning_level"
+        refused.facts.unwrap()["levels"],
+        json!(["low", "medium", "high", "xhigh"])
     );
     let low = db
         .begin("Bob", "r1", "work", true, &at("low"), allow_provider)
@@ -6338,9 +6340,11 @@ fn deletion_runs_in_pieces_refuses_work_and_resumes_after_interruption() {
                 .code,
             "bot_not_found"
         );
+        // The name is held, by the identity being deleted, until it is gone.
+        let taken = db.create("Bob", None, binding()).unwrap_err();
         assert_eq!(
-            db.create("Bob", None, binding()).unwrap_err().code,
-            "bot_exists"
+            (taken.code.as_str(), taken.facts.unwrap()["bot_id"].as_i64()),
+            ("bot_exists", Some(id))
         );
         assert_eq!(db.delete_bot_piece("Bob", id, 16).unwrap()["done"], false);
     }

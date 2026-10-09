@@ -1872,17 +1872,8 @@ impl Service {
                 // with no room for thinking, is refused before the bot exists.
                 settings.validate()?;
                 turn::shaped(served, &settings)?;
-                if let Some(level) = &reasoning
-                    && !family.reasoning_levels().contains(&level.as_str())
-                {
-                    return Err(Error::with(
-                        "invalid_reasoning_level",
-                        format!(
-                            "{level} is not one of {}",
-                            family.reasoning_levels().join(", ")
-                        ),
-                    )
-                    .facts(json!({"levels":family.reasoning_levels()})));
+                if let Some(level) = &reasoning {
+                    family.check_reasoning(level)?;
                 }
                 let instructions = instructions.ok_or(Error::new("instructions_required"))?;
                 if instructions.len() > 64 * 1024 {

@@ -166,7 +166,10 @@ fn parse(args: &[String]) -> Result<Options> {
     let mut store = None;
     while let Some(arg) = iter.next() {
         match arg.as_str() {
-            "--pretty" => options.pretty = true,
+            "--pretty" => {
+                options.pretty = true;
+                PRETTY.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             "--no-spawn" => options.no_spawn = true,
             "--new" => options.new = true,
             "--agents" => options.agents = true,
@@ -1177,6 +1180,10 @@ fn models(options: &Options) -> Result<i32> {
     }
     Ok(0)
 }
+
+/// Whether the parser accepted `--pretty`, so a failure is reported the way
+/// output was asked for; a `--pretty` it rejected is not a request.
+pub static PRETTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn print_json(value: &Value, pretty: bool) -> Result<()> {
     if pretty {

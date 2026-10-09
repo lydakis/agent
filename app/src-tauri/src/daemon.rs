@@ -212,7 +212,7 @@ fn exited(_pid: libc::pid_t) -> bool {
 }
 
 /// The CLI's failure, one JSON object on stderr, as `CODE: DETAIL`.
-fn cli_reason(stderr: &[u8]) -> Option<String> {
+pub(crate) fn cli_reason(stderr: &[u8]) -> Option<String> {
     String::from_utf8_lossy(stderr)
         .lines()
         .rev()
