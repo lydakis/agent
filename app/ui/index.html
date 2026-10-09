@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="frame-src about:">
 <title>Agent</title>
 <link rel="stylesheet" href="app.css">
 </head>
@@ -37,6 +38,8 @@
 <div class="detached" id="detached"></div>
 <div class="setupwrap" id="setupwrap"><div class="setup" id="setup"></div></div>
 <script src="daemon.js"></script>
+<script src="vendor/marked.js"></script>
+<script src="rich.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

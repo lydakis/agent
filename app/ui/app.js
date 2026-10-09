@@ -700,6 +700,8 @@ async function onEvent(ev) {
       let call = null;
       for (let i = t.items.length - 1; i >= 0; i--) { const it = t.items[i]; if ((it.kind === 'tool' || it.kind === 'tool_stub') && it.turn === turn && it.callId === data.call_id) { call = it; break; } }
       if (call) { call.done = true; if (call.started) call.took = Date.now() - call.started; call.started = 0; patchRun(name, call); }
+      const shown = S.ui.file;
+      if (shown && (call?.name === 'write' || call?.name === 'edit') && joinPath(bot(name)?.workspace ?? S.config?.workspace ?? '', call.summary) === shown.full) openFile(shown.bot, shown.full);
       if (typeof data.node === 'number') {
         pushNode(t, { kind: 'node', node: data.node, callId: data.call_id, turn });
         if (call && (call.background || call.name === 'wait') && await loadWaitOrProc(name, data.node, call)) {
@@ -1220,17 +1222,16 @@ window.addEventListener('focus', markSeen);
 function inline(text) {
   return esc(text).replace(/\*\*(.+?)\*\*/g, '<h>$1</h>').replace(/`([^`]+)`/g, '<code>$1</code>');
 }
-function markdown(text) {
-  const out = []; let fence = null;
-  for (const raw of text.split('\n')) {
-    const m = raw.trimStart().match(/^```(.*)$/);
-    if (m) { if (fence) { out.push(`<pre class="code">${fence.lang ? `<span class="lang">${esc(fence.lang)}</span>` : ''}${esc(fence.body.join('\n'))}</pre>`); fence = null; } else fence = { lang: m[1].trim(), body: [] }; continue; }
-    if (fence) { fence.body.push(raw); continue; }
-    const h = raw.trimStart().match(/^#+\s*(.*)$/);
-    out.push(h ? `<div class="line text"><h>${inline(h[1])}</h></div>` : `<div class="line text">${inline(raw)}</div>`);
+// A message's Markdown, drawn once and kept with the item: a pane drawn again reuses it, and it is
+// drawn anew only when its text changes or highlighting arrives (see `Rich.onReady`). What it keeps
+// counts toward the transcript's decoded bytes, so the window's bound holds.
+function textHTML(it, t) {
+  if (it.htmlOf !== it.text || it.htmlAt !== Rich.version) {
+    const html = `<div class="md">${Rich.html(it.text)}</div>`;
+    const d = 2 * (html.length - (it.html?.length ?? 0)); it.bytes = (it.bytes || 0) + d; if (t) t.bytes = Math.max(0, (t.bytes || 0) + d);
+    it.html = html; it.htmlOf = it.text; it.htmlAt = Rich.version;
   }
-  if (fence) out.push(`<pre class="code">${fence.lang ? `<span class="lang">${esc(fence.lang)}</span>` : ''}${esc(fence.body.join('\n'))}</pre>`);
-  return out.join('');
+  return it.html;
 }
 const moreButton = (name) => `<button type="button" class="ibtn" data-act="more" data-who="${esc(name)}" title="More" aria-label="More">⋯</button>`;
 function cardInner({ status, name, last, elapsed, body }) {
@@ -1247,7 +1248,7 @@ function taskCard(who) {
   return { attr: `data-task="${esc(p.name)}"`, task: p.name, status: shownStatus(p), name: shortName(p), last: lastLine(transcript(who)), elapsed: el, sel: S.ui.side === who || S.selected === who };
 }
 // The two panes that show a transcript: the main thread and the one beside it.
-const PANES = [['log', () => S.selected], ['side', () => S.ui.side]];
+const PANES = [['log', () => S.selected], ['side', () => S.ui.file ? null : S.ui.side]];
 const paneKey = (name, t) => `${name}|${t.gen}|${S.ui.steps}`;
 // Replace one rendered card in place, in whichever pane shows that bot, so a process ending costs the
 // size of its own card, not a rebuild of the window.
@@ -1318,7 +1319,7 @@ function runHTML(t, s, limit = t.items.length) {
   } else {
     const last = tools[tools.length - 1];
     const el = last.started ? ` <span class="el" data-started="${last.started}">${fmt(Date.now() - last.started)}</span>` : last.took >= 1500 ? ` <span class="el">${fmt(last.took)}</span>` : '';
-    const now = n === 1 || last.started ? `<b>${esc(last.name)}</b> ${esc(last.summary)}${el}` : esc([...new Set(tools.map((it) => it.name))].join(' · '));
+    const now = n === 1 || last.started ? `<b>${esc(last.name)}</b> ${summaryHTML(last)}${el}` : esc([...new Set(tools.map((it) => it.name))].join(' · '));
     head = n === 1 ? `<span class="now">${now}</span>` : `${n} steps <span class="now">${now}</span>`;
   }
   let err = null; for (const it of items) if (it.kind === 'out' && it.err) err = it.err;
@@ -1326,10 +1327,13 @@ function runHTML(t, s, limit = t.items.length) {
   const body = open ? `<div class="body">${items.map((it, k) => stepHTML(it, s + k)).join('')}</div>` : '';
   return { html: `<div class="steps" data-i="${s}"><div class="sum" data-run="${s}" role="button" tabindex="0">${open ? '▾' : '▸'} ${head}</div>${body}</div>`, end };
 }
+// A read, write or edit names its path; it opens that file beside.
+const FILE_TOOLS = new Set(['read', 'write', 'edit']);
+const summaryHTML = (it) => FILE_TOOLS.has(it.name) && it.summary ? `<span class="fpath" data-file="${esc(it.summary)}">${esc(it.summary)}</span>` : esc(it.summary);
 function stepHTML(it, i) {
   switch (it.kind) {
     case 'thought': return `<div class="line think">${esc(it.text)}</div>`;
-    case 'tool': { const el = it.started ? `<span class="el" data-started="${it.started}">${fmt(Date.now() - it.started)}</span>` : it.took >= 1500 ? `<span class="el">${fmt(it.took)}</span>` : ''; return `<div class="line tool" data-call="${esc(it.callId)}">▸ <b>${esc(it.name)}</b> ${esc(it.summary)}${el}</div>`; }
+    case 'tool': { const el = it.started ? `<span class="el" data-started="${it.started}">${fmt(Date.now() - it.started)}</span>` : it.took >= 1500 ? `<span class="el">${fmt(it.took)}</span>` : ''; return `<div class="line tool" data-call="${esc(it.callId)}">▸ <b>${esc(it.name)}</b> ${summaryHTML(it)}${el}</div>`; }
     case 'out': {
       const rows = it.text.split('\n').filter((l) => l.trim()); const long = rows.length > 2;
       const shown = long && !S.ui.steps && !it.open ? rows.slice(0, 2) : rows;
@@ -1351,7 +1355,7 @@ function toggleStep(target) {
   const old = pane.querySelector(`.steps[data-i="${s}"]`); if (old) old.outerHTML = runHTML(t, s, len).html;
 }
 
-function itemHTML(it) {
+function itemHTML(it, t = null) {
   switch (it.kind) {
     case 'user': {
       if (!it.by) return `<div class="line user">› ${esc(it.text)}</div>`;
@@ -1360,7 +1364,7 @@ function itemHTML(it) {
         : `<span class="by"${it.by.bot ? ` title="Sent by ${esc(it.by.bot)}, turn ${esc(it.by.turn)}, since deleted"` : ''}>${esc(it.by.bot ? agentName(it.by.bot, null) : it.by.app)}</span>`;
       return `<div class="line user agent">${tag} ${esc(it.text)}</div>`;
     }
-    case 'text': return markdown(it.text);
+    case 'text': return textHTML(it, t);
     case 'note': return `<div class="line note">${esc(it.text)}</div>`;
     case 'note_gap': return `<div class="line note">${it.total} ${it.later ? 'later' : 'earlier'} activity notes summarized · durable messages remain available</div>`;
     case 'peer_gap': return `<div class="line note">${it.total} earlier tasks · ^k finds a bot</div>`;
@@ -1383,7 +1387,7 @@ function itemsHTML(t, from = 0) {
     flush();
     if (it.turn != null && it.turn !== lastTurn) { if (h || from > 0) h += `<div class="line sep" data-sep="${i}"></div>`; lastTurn = it.turn; }
     if (STEP.has(it.kind)) { const run = runHTML(t, i); h += run.html; i = run.end; continue; }
-    h += itemHTML(it); i++;
+    h += itemHTML(it, t); i++;
   }
   flush();
   return h;
@@ -1399,13 +1403,22 @@ function renderTail(el, name, t) {
     const text = document.createTextNode('');
     const cursor = document.createElement('span'); cursor.className = 'cursor';
     line.replaceChildren(text, cursor);
-    el.replaceChildren(...(kind || running ? [line] : []));
-    state = { transcript: t, kind, turn: t.streamingTurn, gen: t.streamGen, offset: 0, text, running };
+    const done = kind === 'text' ? document.createElement('div') : null; if (done) done.className = 'md';
+    el.replaceChildren(...(kind || running ? [done, line].filter(Boolean) : []));
+    state = { transcript: t, kind, turn: t.streamingTurn, gen: t.streamGen, offset: 0, text, running, done, cut: {}, drawn: 0 };
     tails.set(el, state);
   }
-  // Plain text while streaming; the durable message gets Markdown once. No full-prefix parsing
-  // or HTML replacement on each delta, and provider text never becomes markup.
-  if (value.length > state.offset) { state.text.appendData(value.slice(state.offset)); state.offset = value.length; }
+  if (value.length <= state.offset) return;
+  // Streamed text is drawn block by block: what has ended (a paragraph, a closed fence) is drawn
+  // once and appended, and only the block still being written is plain text. Each delta reads its
+  // own characters, never the whole reply, and provider text never becomes markup unparsed.
+  const at = state.done ? Rich.cut(state.cut, value) : 0;
+  if (at > state.drawn) {
+    const box = document.createElement('div'); box.innerHTML = Rich.html(value.slice(state.drawn, at));
+    state.done.append(...box.childNodes); Rich.hydrate(state.done);
+    state.text.data = value.slice(at); state.drawn = at;
+  } else state.text.appendData(value.slice(state.offset));
+  state.offset = value.length;
 }
 // A streamed delta touches only the tail. The items rebuild when a load replaced nodes (gen) or the
 // steps fold changes; items appended since the last render are added on their own, and a step that
@@ -1423,6 +1436,7 @@ function renderTranscript(el, name) {
   if (rendered < 0 || rendered > t.items.length || !tail || !tail.classList.contains('tail')) {
     el.innerHTML = itemsHTML(t) + '<div class="tail"></div>';
     el.dataset.key = key;
+    Rich.hydrate(el);
     tail = el.lastElementChild;
     // History loaded above the reader keeps their place instead of shoving it down.
     if (!atBottom) el.scrollTop += el.scrollHeight - before;
@@ -1435,6 +1449,7 @@ function renderTranscript(el, name) {
       if (old) { const sep = old.previousElementSibling; if (sep?.dataset?.sep === String(s)) sep.remove(); old.remove(); from = s; }
     }
     tail.insertAdjacentHTML('beforebegin', itemsHTML(t, from));
+    Rich.hydrate(el);
   }
   el.dataset.len = String(t.items.length);
   refreshLive(el);
@@ -1449,6 +1464,60 @@ for (const [id, who] of PANES) {
     if (nearTop && !nearEnd) t.anchor = 'top'; else if (nearEnd) t.anchor = 'end';
     if ((nearTop || nearEnd) && (t.nodes > 0 || t.history != null)) enqueue(async () => { await load(name, nearTop); render(); });
   });
+}
+
+// ---------- files ----------
+// A file a message links or a step read, wrote or edited, opened beside: read from the agent's
+// folder by the core, drawn by its kind (see `Rich.file`). It takes the place of the pane beside
+// until closed, and is read again when a step of the agent it came from writes or edits it.
+const FILE_CAP = 4 * 1024 * 1024;
+function joinPath(dir, path) {
+  const parts = [];
+  for (const seg of (path.startsWith('/') || path.startsWith('~') || !dir ? path : `${dir.replace(/\/+$/, '')}/${path}`).split('/')) {
+    if (seg === '..' && parts.length && parts.at(-1) !== '..' && parts.at(-1) !== '') parts.pop(); else if (seg !== '.' && (seg || !parts.length)) parts.push(seg);
+  }
+  return parts.join('/') || '/';
+}
+const dirOf = (path) => path.replace(/\/[^/]*$/, '') || '/';
+// Which agent's folder a click names a path in: the file beside's own folder, or the agent in that pane.
+function openFileFrom(path, el) {
+  const beside = el?.closest?.('.pane.side');
+  if (beside && S.ui.file) return openFile(S.ui.file.bot, joinPath(dirOf(S.ui.file.full), path));
+  const who = beside ? S.ui.side : S.selected, b = bot(who);
+  return openFile(who, joinPath(b?.workspace ?? S.config?.workspace ?? '', path));
+}
+async function openFile(who, full) {
+  const old = S.ui.file;
+  if (old?.url) URL.revokeObjectURL(old.url);
+  const f = S.ui.file = { bot: who, full, gen: (old?.gen ?? 0) + 1, state: 'loading', view: null, url: null };
+  render();
+  try {
+    const bytes = new Uint8Array(await Daemon.readFile(full));
+    if (S.ui.file !== f) return;
+    Object.assign(f, { state: 'ok', bytes: bytes.subarray(0, FILE_CAP), more: bytes.length > FILE_CAP, gen: f.gen + 1 });
+  } catch (e) { if (S.ui.file !== f) return; Object.assign(f, { state: 'error', error: String(e?.message ?? e), gen: f.gen + 1 }); }
+  render();
+}
+function closeFile() {
+  const f = S.ui.file; if (!f) return;
+  if (f.url) URL.revokeObjectURL(f.url);
+  S.ui.file = null; $('side').dataset.key = ''; $('side').dataset.who = ''; $('sidetitle').dataset.k = '';
+  render(); focusInput(S.ui.side ? 'side' : 'main');
+}
+function renderFile() {
+  const f = S.ui.file, key = `file|${f.full}|${f.gen}|${Rich.version}`, el = $('side');
+  if (el.dataset.key === key) return;
+  const name = f.full.split('/').pop(), where = dirOf(f.full).replace(/^\/(Users|home)\/[^/]+/, '~');
+  $('sidetitle').dataset.k = key;
+  $('sidetitle').innerHTML = `<div class="crumbs"><b>${esc(name)}</b><span class="branch" title="${esc(f.full)}">${esc(where)}</span></div><div class="tools"><button type="button" class="ibtn" data-act="close-file" title="Close (Esc)" aria-label="Close">✕</button></div>`;
+  // Drawn when read, and again when highlighting arrives.
+  if (f.state === 'ok' && f.at !== `${f.gen}|${Rich.version}`) {
+    if (f.url) URL.revokeObjectURL(f.url);
+    const shown = Rich.file(f.full, f.bytes, f.more); f.view = shown.html; f.url = shown.url ?? null; f.at = `${f.gen}|${Rich.version}`;
+  }
+  el.innerHTML = `<div class="fview">${f.state === 'loading' ? '<div class="line pending">reading…</div>' : f.state === 'error' ? `<div class="line out bad">${esc(f.error)}</div>` : f.view}</div>`;
+  el.dataset.key = key; el.dataset.who = ''; el.scrollTop = 0;
+  Rich.hydrate(el);
 }
 
 // ---------- heads and composers ----------
@@ -1818,14 +1887,16 @@ function render() {
   railRows();
   const b = bot(S.selected), sw = swarmOf(S.selected);
   if (S.ui.side && (!S.bots.has(S.ui.side) || S.ui.side === S.selected)) S.ui.side = null;
-  const side = S.ui.side ? bot(S.ui.side) : null;
-  app.classList.toggle('rail', S.ui.rail); app.classList.toggle('side', !!side);
+  const side = S.ui.side && !S.ui.file ? bot(S.ui.side) : null;
+  app.classList.toggle('rail', S.ui.rail); app.classList.toggle('side', !!side || !!S.ui.file);
   followDrafts();
   markSeen();
   if (sw) { renderSwarmHead($('title'), sw); renderSwarm($('log'), sw); }
   else { renderHead($('title'), b, 'main'); if (b) renderTranscript($('log'), b.name); else { $('log').innerHTML = ''; $('log').dataset.key = ''; } }
   if (S.ui.rail) renderRail();
-  if (side) { renderHead($('sidetitle'), side, 'side'); renderTranscript($('side'), side.name); }
+  if (S.ui.file) renderFile();
+  else if (side) { renderHead($('sidetitle'), side, 'side'); renderTranscript($('side'), side.name); }
+  $('sideform').hidden = !!S.ui.file;
   renderComposer('main', b, sw); renderComposer('side', side);
   $('keybar').innerHTML = keybarHTML(b);
   if (S.ui.picker) renderPicker();
@@ -2531,7 +2602,7 @@ document.addEventListener('keydown', async (e) => {
   if (ctrl && k === 'd') { detach(); e.preventDefault(); return; }
   if (ctrl && k === 'o') { S.ui.steps = !S.ui.steps; render(); save(); e.preventDefault(); return; }
   if (ctrl && k === 'p') { await nextBeside(); e.preventDefault(); return; }
-  if (k === 'Escape') { if (S.ui.side) closeSide(); else await interrupt(); e.preventDefault(); return; }
+  if (k === 'Escape') { if (S.ui.file) closeFile(); else if (S.ui.side) closeSide(); else await interrupt(); e.preventDefault(); return; }
   const empty = e.target.id === 'input' && $('input').value === '';
   if (empty && (k === 'ArrowUp' || k === 'ArrowDown')) { const names = tree().filter((n) => n.b).map((n) => n.b.name); let i = names.indexOf(S.selected); if (i >= 0) { i = (i + (k === 'ArrowDown' ? 1 : names.length - 1)) % names.length; await openOnly(names[i]); } e.preventDefault(); return; }
   if (!inputIds.has(e.target.id) && k.length === 1 && !ctrl && !e.altKey) $('input').focus();
@@ -2569,6 +2640,7 @@ async function act(el) {
     case 'open': await openOnly(who); return;
     case 'swap': swap(); return;
     case 'close-side': closeSide(); return;
+    case 'close-file': closeFile(); return;
     case 'new-project': showNewProject(true); return;
     case 'new-swarm': await openSwarmSheet(leadProject(who)); return;
     case 'close-sheet': closeSheet(); return;
@@ -2607,6 +2679,7 @@ document.addEventListener('click', async (e) => {
   if (S.ui.help) { hideHelp(); return; }
   if (e.target.closest?.('#sheetwrap') && !e.target.closest('#sheet')) { closeSheet(); return; }
   if (e.target.closest('#pickerwrap') && !e.target.closest('.picker')) { closePicker(); return; }
+  if (Rich.click(e)) { closeMenu(); return; }
   const button = e.target.closest('[data-act]');
   closeMenu();
   if (button) { if (!button.disabled) { try { await act(button); } catch (err) { failed(err); } } return; }
@@ -2625,6 +2698,10 @@ document.addEventListener('contextmenu', (e) => {
   const who = t.dataset.bot ?? t.dataset.task;
   e.preventDefault(); closeMenu(); showMenu(botMenuItems(who), { x: e.clientX, y: e.clientY }, who);
 });
+
+// Highlighting arrived: messages drawn without it are drawn again.
+Rich.onReady = () => { for (const [id] of PANES) $(id).dataset.key = ''; render(); };
+Rich.onFile = openFileFrom;
 
 // ---------- boot ----------
 render();

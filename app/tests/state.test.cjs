@@ -8,7 +8,8 @@ function page(daemon = {}, storage = null) {
   const elements = new Map(), timers = new Map();
   let timer = 0;
   const element = () => ({
-    children: [], replaceChildren(...nodes) { this.children = nodes; }, dataset: {}, style: {}, innerHTML: '', value: '', scrollHeight: 0, scrollTop: 0, clientHeight: 0,
+    children: [], replaceChildren(...nodes) { this.children = nodes; }, append(...nodes) { this.children.push(...nodes); }, get childNodes() { return this.innerHTML ? [{ html: this.innerHTML }] : []; },
+    dataset: {}, style: {}, innerHTML: '', value: '', scrollHeight: 0, scrollTop: 0, clientHeight: 0,
     classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
     listeners: {}, addEventListener(type,fn) { this.listeners[type]=fn; }, querySelector() { return null; }, querySelectorAll() { return []; }, focus() {},
   });
@@ -25,12 +26,14 @@ function page(daemon = {}, storage = null) {
     return {items};
   }};
   const context = vm.createContext({
-    Daemon: transport, console, queueMicrotask, crypto: require('node:crypto').webcrypto,
+    Daemon: transport, console, queueMicrotask, crypto: require('node:crypto').webcrypto, TextDecoder,
     document: { getElementById(id) { if (!elements.has(id)) elements.set(id, element()); return elements.get(id); }, listeners: {}, addEventListener(type, fn) { this.listeners[type] = fn; },
       createElement: element, createTextNode: () => ({ data: '', appended: 0, appendData(s) { this.data += s; this.appended += s.length; } }) },
     window: { addEventListener() {} }, localStorage: storage ? { getItem: k => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, String(v)) } : { getItem() { return null; } },
     setTimeout(fn) { const id = ++timer; timers.set(id, fn); return id; }, clearTimeout(id) { timers.delete(id); }, setInterval() {},
   });
+  for (const file of ['../ui/vendor/marked.js', '../ui/rich.js']) vm.runInContext(fs.readFileSync(require.resolve(file), 'utf8'), context);
+  context.Rich = context.window.Rich;
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
     'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules, tellLead, markSeen };\n})();';
@@ -120,15 +123,93 @@ test('stream rendering appends only new characters and resets between messages',
   for (const field of ['text', 'thinking']) {
     t.text = ''; t.thinking = ''; t.streamGen = (t.streamGen || 0) + 1;
     for (let i = 0; i < 1000; i++) { t[field] += '<& chunk >'; p.renderTail(el, 'Bob', t); }
-    const line = el.children[0], text = line.children[0];
+    const line = el.children.at(-1), text = line.children[0];
     assert.equal(text.data, t[field]);
     assert.equal(text.appended, t[field].length);
     t[field] = 'new'; t.streamGen += 1;
     p.renderTail(el, 'Bob', t);
-    assert.equal(el.children[0].children[0].data, 'new');
+    assert.equal(el.children.at(-1).children[0].data, 'new');
   }
 });
 
+
+test('messages draw as Markdown with raw HTML, scripts and remote fetches kept out', () => {
+  const p = page(), Rich = p.context.Rich;
+  const html = Rich.html('# Title\n\n**bold** <img src=x onerror=alert(1)> [ok](https://example.com) [bad](javascript:alert(1)) ![pic](https://example.com/p.png)\n\n<script>alert(1)</script>\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n- [x] done');
+  assert.match(html, /<h1>Title<\/h1>/);
+  assert.match(html, /<strong>bold<\/strong>/);
+  assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;/);
+  assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+  assert.match(html, /<a href="https:\/\/example.com">ok<\/a>/);
+  assert.doesNotMatch(html, /javascript:/);
+  assert.doesNotMatch(html, /<img/);
+  assert.match(html, /<a href="https:\/\/example.com\/p.png">pic<\/a>/);
+  assert.match(html, /<table>/);
+  assert.match(html, /type="checkbox"/);
+});
+
+test('fenced blocks become code, previews, diagrams and images by their language', () => {
+  const p = page(), Rich = p.context.Rich;
+  assert.match(Rich.html('```rust\nfn main() {}\n```'), /data-kind="code".*<span class="lang">rust<\/span>.*fn main\(\) \{\}/s);
+  assert.match(Rich.html('```html\n<!doctype html><body><b>hi</b></body>\n```'), /data-kind="html" data-view="view".*&lt;b&gt;hi&lt;\/b&gt;/s);
+  assert.match(Rich.html('```html\n<b>hi</b>\n```'), /data-kind="html" data-view="code"/);
+  assert.match(Rich.html('```mermaid\ngraph TD\nA-->B\n```'), /data-kind="mermaid".*A--&gt;B/s);
+  const svg = Rich.html('```svg\n<svg xmlns="http://www.w3.org/2000/svg"><circle r="4"/></svg>\n```');
+  assert.match(svg, /<img alt="" src="data:image\/svg\+xml;charset=utf-8,%3Csvg/);
+  assert.doesNotMatch(svg.split('<pre')[0], /<svg/);
+});
+
+test('charts, file links and opened files draw by kind', () => {
+  const p = page(), Rich = p.context.Rich;
+  assert.match(Rich.html('```vega-lite\n{"mark":"bar"}\n```'), /data-kind="chart" data-lang="vega-lite" data-lazy data-view="code"/);
+  assert.match(Rich.html('```vega\n{}\n```'), /data-lang="vega"/);
+  const links = Rich.html('[plan](PLAN.md) [code](src/a.rs:12) [line](src/b.rs#L4-L9) [web](https://example.com) [here](#top)');
+  assert.match(links, /<a class="file" data-file="PLAN.md">plan<\/a>/);
+  assert.match(links, /data-file="src\/a.rs">code/);
+  assert.match(links, /data-file="src\/b.rs">line/);
+  assert.match(links, /<a href="https:\/\/example.com">web<\/a>/);
+  assert.doesNotMatch(links, /data-file="#top"/);
+  const enc = (text) => new TextEncoder().encode(text);
+  assert.match(Rich.file('/w/PLAN.md', enc('# Plan')).html, /<div class="md"><h1>Plan<\/h1>/);
+  assert.match(Rich.file('/w/x.rs', enc('fn a() {}')).html, /data-kind="code".*<span class="lang">rs<\/span>/s);
+  assert.match(Rich.file('/w/r/latency.vl.json', enc('{}')).html, /data-kind="chart"/);
+  assert.match(Rich.file('/w/flow.mmd', enc('graph TD')).html, /data-kind="mermaid"/);
+  assert.match(Rich.file('/w/frag.html', enc('<b>x</b>')).html, /data-kind="html" data-view="view"/);
+  assert.match(Rich.file('/w/t.csv', enc('a,b\n1,"2"')).html, /<th>a<\/th><th>b<\/th>.*<td>1<\/td><td>2<\/td>/s);
+  assert.match(Rich.file('/w/blob.bin', new Uint8Array([1, 0, 2])).html, /binary file · 3 bytes/);
+  assert.match(Rich.file('/w/big.log', enc('x'), true).html, /showing the first/);
+  assert.match(Rich.file('/w/<i>.md', enc('<script>alert(1)</script>')).html, /&lt;script&gt;/);
+});
+
+test('a message is parsed once and drawn again from what it kept', () => {
+  const p = page(), t = p.transcript('Bob'); let parsed = 0;
+  const real = p.context.Rich.html; p.context.Rich.html = (text) => { parsed++; return real(text); };
+  t.items = Array.from({ length: 50 }, (_, i) => ({ kind: 'text', turn: i, text: `reply **${i}**` }));
+  const first = p.itemsHTML(t), again = p.itemsHTML(t);
+  assert.equal(parsed, 50); assert.equal(first, again);
+  assert.ok(t.bytes > 0);
+  t.items[3].text = 'changed'; p.itemsHTML(t); assert.equal(parsed, 51);
+});
+
+test('streamed Markdown draws each finished block once and keeps fences whole', () => {
+  const p = page(), Rich = p.context.Rich;
+  const st = {};
+  const text = 'para one\n\n```js\nconst a = 1;\n\nconst b = 2;\n```\nafter\n\n- item';
+  const cuts = []; for (let i = 1; i <= text.length; i++) cuts.push(Rich.cut(st, text.slice(0, i)));
+  const fence = text.indexOf('```\nafter') + 4, para = text.indexOf('- item');
+  assert.deepEqual([...new Set(cuts)], [0, 10, fence, para]);
+  assert.equal(text.slice(10, fence), '```js\nconst a = 1;\n\nconst b = 2;\n```\n');
+
+  const t = p.transcript('Bob'); t.streamingTurn = 1; t.streamGen = 1; t.text = '';
+  const el = { dataset: {}, children: [], replaceChildren(...nodes) { this.children = nodes; } };
+  let parsed = 0; const real = Rich.html; Rich.html = (s) => { parsed++; return real(s); };
+  for (const ch of text) { t.text += ch; p.renderTail(el, 'Bob', t); }
+  const [done, line] = el.children;
+  assert.equal(parsed, 3);
+  assert.deepEqual(done.children.map((c) => c.html), [real(text.slice(0, 10)), real(text.slice(10, fence)), real(text.slice(fence, para))]);
+  assert.match(done.children[1].html, /data-kind="code"/);
+  assert.equal(line.children[0].data, '- item');
+});
 
 test('tool-heavy history folds rows and restores their summaries on scroll', async () => {
   const p = page();
@@ -350,7 +431,7 @@ test('answer deltas follow thinking immediately and failed partial text stays ep
   await p.onEvent({event:'thinking_delta',bot:'Bob',turn:1,text:'thinking'});
   p.renderTail(el,'Bob',t);
   await p.onEvent({event:'text_delta',bot:'Bob',turn:1,text:'answer'});
-  p.renderTail(el,'Bob',t);assert.equal(el.children[0].children[0].data,'answer');
+  p.renderTail(el,'Bob',t);assert.equal(el.children.at(-1).children[0].data,'answer');
   await p.onEvent({event:'turn_finished',bot:'Bob',turn:1,data:{status:'interrupted'}});
   assert.equal(t.text,'');assert.equal(t.items.some(it=>it.kind==='text'&&it.text==='answer'),false);
 });

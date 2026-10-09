@@ -79,6 +79,26 @@ window and does not survive a restart.
 
 ![demo finished while notes was open](app/done-unseen.png)
 
+A reply drawn as Markdown, captured 2026-10-09: a heading, a list, a table and
+highlighted Rust, each drawn as soon as its block ends while the rest streams.
+See [Messages](#messages).
+
+![A reply streaming: finished blocks draw as Markdown, the open block stays text](app/rich-stream.gif)
+
+![A finished reply: heading, list, table and a highlighted code block](app/rich.png)
+
+Further down the same reply: a ```` ```vega-lite ```` block drawn as a chart
+in the window's colors, and an ```` ```html ```` block, which opens as a page
+preview because it is a whole page.
+
+![A Vega-Lite chart and an HTML preview](app/rich-preview.png)
+
+A file the reply links, open beside it: `PLAN.md` drawn as Markdown with its
+diagram. Its own link to `report/latency.vl.json` opens that chart file in its
+place.
+
+![PLAN.md open beside the reply that links it](app/file-beside.png)
+
 New project takes a folder, the model its lead starts on, and that model's
 effort. Effort is how hard the model thinks: every provider offers low,
 medium, high and xhigh, Claude also max, and "default effort" sends no level,
@@ -1111,6 +1131,97 @@ not wait; one launchd refuses keeps its old path and is tried again at the
 next start. Settings lists schedules also when no project exists. Only macOS has launchd; elsewhere `add`
 refuses with `schedules_unsupported`.
 
+## Messages
+
+What a model writes is drawn the way a page would draw it. A message is
+Markdown (GitHub's flavour, with a line break wherever the model wrote one),
+parsed by [marked](https://marked.js.org) once and kept with the item, so a
+pane drawn again reuses it. Fenced blocks are drawn by their language:
+
+- **Code** is highlighted with [highlight.js](https://highlightjs.org) (its
+  common languages) in the window's own colors, with a copy button. A block
+  names its language or is left plain; nothing guesses. Blocks over 64 KiB
+  stay plain.
+- **`mermaid`** draws as a diagram with [Mermaid](https://mermaid.js.org),
+  themed to the window, with its source a click away. A diagram that does not
+  parse stays as its source with the parser's message in the block's head.
+- **`vega-lite`** (or `vl`, or `vega` for a full Vega spec) draws as a chart
+  with [Vega](https://vega.github.io), as static SVG in the window's colors:
+  an eight-hue categorical order validated for color-vision deficiency
+  against the panel, a single-hue ramp, recessive axes. A single view without
+  a width fills the block. The spec is its only data: the loader refuses every
+  URL (data and images alike), and expressions run in Vega's interpreter, not
+  as generated code.
+- **`html`** runs as a preview in a sandboxed frame. A whole page (one with a
+  doctype, `<html>` or `<body>`) opens as its preview; a fragment opens as
+  code, its preview a click away. **`svg`** draws as an image.
+
+Charts are a block of their own because a preview cannot load a charting
+library: models reach for one from a CDN, and a preview fetches nothing.
+Vega-Lite is a spec, not a program, so it needs no network and runs no
+model-written script in the window. Mermaid's own `pie` and `xychart-beta`
+also draw, and an HTML preview can still draw a chart with its own inline
+SVG or canvas.
+
+Highlighting, Mermaid and Vega load the first time something needs them;
+marked loads with the page. All are vendored under `app/ui/vendor` (versions
+and licenses in `LICENSES.txt`), so drawing a message fetches nothing.
+
+A file opens beside the chat, in the pane a task opens in, from a path a step
+read, wrote or edited (the path in its line) or a message's link to a path
+(`[plan](PLAN.md)`, `src/a.rs:12`, `src/a.rs#L4`; the line is dropped). A
+path is the agent's folder's, and a link inside an open file is relative to
+that file. The core reads the first 4 MiB (`read_file`; a window on a host
+is refused by name, as its files are the host's). The file draws by its
+kind: Markdown, a diagram (`.mmd`, `.mermaid`), a chart (`.vl.json`,
+`.vg.json`), a page (`.html`, always as its preview), an SVG or image, a
+CSV or TSV as a table of its first 1,000 rows, a binary file as its size,
+anything else as code highlighted by its extension. Esc or ✕ closes it and
+brings back the task that was beside, if any. A write or edit to the open
+file by the agent it came from reads it again. Searching a project's files
+(from ^k or elsewhere) is not built.
+
+What a model writes never becomes the app's markup unparsed. Raw HTML inside
+Markdown shows as text. Links open in the default browser and only for
+`http`, `https` and `mailto` (the core's `open_link` refuses anything else);
+other links show as their text. Images draw only from `data:` URLs the
+message carries; a remote image is a link, so drawing a message makes no
+request a model chose. An HTML preview runs scripts in a frame sandboxed
+without same-origin access: it cannot read the app or its storage, cannot
+navigate the window, and the app's script globals are injected into the main
+frame only. Its page carries a policy that loads nothing from the network (no
+fetch, scripts, styles, images or fonts but its own inline ones and `data:`),
+and the window's policy (`frame-src about:`) stops a preview from navigating
+its own frame to a website. Previews start only when they come near the
+screen, so a long transcript holds no idle pages.
+
+Measured 2026-10-09 in headless Chromium 141 on a 4-core cloud container,
+medians of nine runs, three runs each (synthetic messages: prose, lists, a
+table, and Rust in every third one). Drawing 400 messages (292 KiB) costs
+72 to 87 ms of parsing the first time, against 6 to 7 ms for the line
+renderer this replaced; drawn again, a message costs no parsing. Putting
+those 400 into the page and laying them out takes 207 to 228 ms, against 127
+to 135 ms before, because the HTML is larger (654 KiB against 421 KiB) and
+code is highlighted. A 9 KiB reply streamed in 8-character deltas (1,121 of
+them, 44 finished blocks) costs 17 ms in all, against 2 to 4 ms for plain
+text; parsing the whole reply again on each delta would cost 1.2 to 1.4 s.
+
+While a reply streams, each block that has ended (a paragraph after its blank
+line, a fence once it closes) is drawn once and appended; only the block still
+being written is plain text. Each delta reads only its own characters for
+block ends, so a long reply costs its deltas, never its length on each one.
+The durable message replaces the streamed tail with one parse of the whole.
+
+Verified 2026-10-09 in headless Chromium 141 with the app's page: an
+` ```html ` block whose script tried `parent.document`, `top.location`, a
+`fetch`, a remote image and navigating its own frame got none of them, and
+`window.__TAURI__` was undefined inside it. Three charts, one loading its
+data from a URL, one drawing a remote image and one whose expression reached
+for `constructor`, made no request; the third did not draw and named the
+interpreter's refusal in its head. That the Tauri core injects its
+scripts into the main frame only was read from tauri 2.11.5's source
+(`for_main_frame_only: true`), not observed in the macOS webview.
+
 ## What it costs, and where the bounds are
 
 The UI bounds payload buffering, history decoding, and rendered fleet rows:
@@ -1152,8 +1263,9 @@ The UI bounds payload buffering, history decoding, and rendered fleet rows:
 - **Rendering** rebuilds the window's HTML only on a structural change (a
   load, a fold, another bot). Items appended since the last render are added
   on their own; a tool finishing or a process ending replaces its own line; a
-  streamed delta appends plain text to the tail; Markdown is parsed once the
-  durable message arrives; the once-a-second clock refreshes the
+  streamed delta appends plain text to the tail, and a block it finishes is
+  parsed once and appended; a durable message is parsed once and its HTML kept
+  with the item (counted in the window's decoded bytes); the once-a-second clock refreshes the
   elapsed spans and peer cards in place. The rail shows a window of 300 rows
   around the selection, extended by scrolling to an edge; its tree is rebuilt
   when the fleet's shape changes (a bot created, forked or deleted) and a
@@ -1309,7 +1421,7 @@ steers pinned to their turn, model picks pinned to identity, the demo
 daemon's steer delivery, a message's sender (another agent's, live, steered
 in, queued and read back, unlinked once its name holds a new agent, and the
 app's own task updates and schedules by origin), and runs
-folded with failures on their line. Also covers coordinator task updates: batched at rest, excluding requested and replayed turns, retained after send failures.
+folded with failures on their line. Also covers coordinator task updates: batched at rest, excluding requested and replayed turns, retained after send failures. Messages: Markdown with raw HTML, unsafe links and remote images kept out, fenced blocks drawn by language, charts, file links, files drawn by kind, each message parsed once, and streamed blocks drawn once with fences kept whole. `cargo test -p agent-app link_tests` covers which links the core opens and how it reads a file.
 `cargo test -p agent-app` includes a failed project-file write leaving
 neither a partial file nor a temporary, and schedules' calendars, plists,
 move, and each lifecycle step with launchd refusing. With `AGENT_TEST_RUNTIME=1` after a release build
