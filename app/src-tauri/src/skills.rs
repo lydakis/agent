@@ -76,6 +76,26 @@ fn recorded(folder: &Path) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
+/// Every file under a skill's record, as a path relative to it.
+fn recorded_files(record: &Path) -> Result<Vec<String>, String> {
+    let (mut files, mut folders) = (Vec::new(), vec![String::new()]);
+    while let Some(folder) = folders.pop() {
+        for name in recorded(&record.join(&folder))? {
+            let file = match folder.as_str() {
+                "" => name,
+                folder => format!("{folder}/{name}"),
+            };
+            let path = record.join(&file);
+            match std::fs::symlink_metadata(&path) {
+                Ok(kind) if kind.is_dir() => folders.push(file),
+                Ok(_) => files.push(file),
+                Err(error) => return Err(format!("{}: {error}", path.display())),
+            }
+        }
+    }
+    Ok(files)
+}
+
 /// More than any skill the app ships; a longer file is not one of its copies.
 const MAX: u64 = 256 * 1024;
 
@@ -130,7 +150,7 @@ fn install_one(home: &Path, name: &str, files: &[(&str, &str)]) -> Result<(), St
     // A file the app no longer ships goes too, unless you changed it. One
     // already gone counts as taken, so a start that ended partway finishes.
     let mut dropped = Vec::new();
-    for file in recorded(&record)? {
+    for file in recorded_files(&record)? {
         if files.iter().all(|(shipped, _)| *shipped != file) {
             let (path, written) = (dir.join(&file), record.join(&file));
             let have = read(&path)?;
@@ -145,15 +165,16 @@ fn install_one(home: &Path, name: &str, files: &[(&str, &str)]) -> Result<(), St
         crate::schedule::replace(&path, text)?;
         crate::schedule::replace(&written, text)?;
     }
-    let remove = |path: &Path| match std::fs::remove_file(path) {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-            Err(format!("{}: {error}", path.display()))
-        }
-        _ => Ok(()),
-    };
+    // Each removal is on disk before its record goes, so a power loss never
+    // leaves a file the app no longer knows it wrote.
     for (path, written) in dropped {
-        remove(&path)?;
-        remove(&written)?;
+        crate::schedule::forget(&path)?;
+        crate::schedule::forget(&written)?;
+        for (file, top) in [(&path, &dir), (&written, &record)] {
+            for folder in file.ancestors().skip(1).take_while(|f| f.starts_with(top)) {
+                let _ = std::fs::remove_dir(folder);
+            }
+        }
     }
     if files.is_empty() {
         // Only if empty: a file you added keeps the folder.
@@ -297,6 +318,18 @@ mod tests {
         install_one(&home, "x", &[("SKILL.md", "v2")]).unwrap();
         assert!(!dir.join("run.py").exists());
         assert!(!home.join(".agent/skills/x/run.py").exists());
+
+        // A file in a folder of its own updates, and goes with its folder.
+        let nested = [("SKILL.md", "v2"), ("scripts/run.py", "v1")];
+        install_one(&home, "x", &nested).unwrap();
+        install_one(&home, "x", &[("SKILL.md", "v2"), ("scripts/run.py", "v2")]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("scripts/run.py")).unwrap(),
+            "v2"
+        );
+        install_one(&home, "x", &[("SKILL.md", "v2")]).unwrap();
+        assert!(!dir.join("scripts").exists());
+        assert!(!home.join(".agent/skills/x/scripts").exists());
 
         // A skill the app no longer ships at all; `install` finds it by its record.
         install(&home);

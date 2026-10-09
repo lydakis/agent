@@ -927,7 +927,7 @@ impl Lock {
 
 /// Delete a file for good: gone from its folder once that folder is synced.
 /// One already gone is fine.
-fn forget(path: &Path) -> Result<(), String> {
+pub(crate) fn forget(path: &Path) -> Result<(), String> {
     let gone = match std::fs::remove_file(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         gone => gone,
