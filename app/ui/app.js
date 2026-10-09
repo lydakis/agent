@@ -1502,9 +1502,10 @@ for (const [id, who] of PANES) {
 // folder by the core, drawn by its kind (see `Rich.file`). It takes the place of the pane beside
 // until closed, and is read again when a step of the agent it came from writes or edits it.
 const FILE_CAP = 4 * 1024 * 1024;
+// `~/` is the home folder, as the core reads it; any other name, `~notes.md` too, is the folder's.
 function joinPath(dir, path) {
   const parts = [];
-  for (const seg of (path.startsWith('/') || path.startsWith('~') || !dir ? path : `${dir.replace(/\/+$/, '')}/${path}`).split('/')) {
+  for (const seg of (path.startsWith('/') || path.startsWith('~/') || !dir ? path : `${dir.replace(/\/+$/, '')}/${path}`).split('/')) {
     if (seg === '..' && parts.length && parts.at(-1) !== '..' && parts.at(-1) !== '') parts.pop(); else if (seg !== '.' && (seg || !parts.length)) parts.push(seg);
   }
   return parts.join('/') || '/';

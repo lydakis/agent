@@ -36,7 +36,7 @@ function page(daemon = {}, storage = null) {
   context.Rich = context.window.Rich;
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules, tellLead, markSeen };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules, tellLead, markSeen };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -171,6 +171,22 @@ test('fenced blocks become code, previews, diagrams and images by their language
   assert.match(png, /<button type="button" class="img" data-img="data:image\/png;base64,iVBORw0KGgo=" title="dot">image: dot<\/button>/);
   assert.match(Rich.html('![flow](docs/flow.png)'), /<a class="file" data-file="docs\/flow.png">flow<\/a>/);
   assert.match(Rich.html('![r](https://example.com/r.png)'), /<a href="https:\/\/example.com\/r.png">r<\/a>/);
+});
+
+test('a table too wide or too large shows as its source; a modest one draws', () => {
+  const Rich = page().context.Rich;
+  assert.match(Rich.html('| a | b |\n|---|---|\n| 1 | 2 |'), /<table>/);
+  const wide = '|' + 'a|'.repeat(300) + '\n|' + '-|'.repeat(300) + '\n|1|';
+  assert.doesNotMatch(Rich.html(wide), /<table>|<th>/);
+  assert.match(Rich.html(wide), /data-kind="code"/);
+  const tall = '| a | b | c | d |\n|---|---|---|---|\n' + 'x\n'.repeat(3000);
+  assert.doesNotMatch(Rich.html(tall), /<td>/);
+});
+
+test('a name starting with a tilde is the folder\'s; only ~/ is home', () => {
+  const p = page();
+  assert.equal(p.joinPath('/w', '~notes.md'), '/w/~notes.md');
+  assert.equal(p.joinPath('/w', '~/notes.md'), '~/notes.md');
 });
 
 test('a link in a drawn diagram opens through the guarded opener', () => {

@@ -62,6 +62,9 @@ window.Rich = (() => {
       renderer: {
         html: ({ text }) => esc(text),
         code: ({ text, lang }) => block(text, lang),
+        // A table past 256 columns or 10,000 cells shows as its source: a short row is padded to
+        // the header's width, so a few bytes a row can ask for millions of cells.
+        table(token) { return token.header.length > COLUMNS || token.header.length * (token.rows.length + 1) > CELLS ? block(token.raw.replace(/\n+$/, ''), '') : false; },
         // A link to a path opens that file beside, from the agent's folder.
         link({ href, title, tokens }) { const inner = this.parser.parseInline(tokens), t = title ? ` title="${esc(title)}"` : ''; return linkable(href) ? `<a href="${esc(href)}"${t}>${inner}</a>` : filePath(href) ? `<a class="file" data-file="${esc(filePath(href))}"${t}>${inner}</a>` : inner; },
         // An image draws only from data the message carries, and only on a click: a small PNG can
@@ -260,7 +263,7 @@ window.Rich = (() => {
   const extOf = (path) => { const n = path.split('/').pop().toLowerCase(); return /\.(vl|vg)\.json$/.test(n) ? n.slice(-7, -5) : n.includes('.') ? n.split('.').pop() : n; };
   // The first `max` rows of a CSV or TSV, at most 256 columns each: a quoted field may hold the
   // separator, a line break or a doubled quote.
-  const COLUMNS = 256;
+  const COLUMNS = 256, CELLS = 10000;
   function csv(text, sep, max) {
     const out = []; let row = [], cell = '', quoted = false, i = 0;
     const end = () => { if (row.length < COLUMNS) row.push(cell); cell = ''; if (row.length > 1 || row[0]) out.push(row); row = []; };
@@ -297,7 +300,7 @@ window.Rich = (() => {
   let openFile = () => {}, failed = () => {};
 
   // A middle click on a link would open it in a new app window.
-  document.addEventListener?.('auxclick', (e) => { if (e.target.closest?.('.md a[href]')) e.preventDefault(); });
+  document.addEventListener?.('auxclick', (e) => { if (e.target.closest?.('.md a, .rc a')) e.preventDefault(); });
 
   return { html, cut, hydrate, click, file, filePath, esc, get version() { return version; }, set onReady(fn) { ready = fn; }, set onFile(fn) { openFile = fn; }, set onError(fn) { failed = fn; } };
 })();
