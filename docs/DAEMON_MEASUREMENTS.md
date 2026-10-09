@@ -5126,17 +5126,21 @@ keyed one only the stored request. This screen checks that.
 Method: a local script over the `bench.admission_burst` helpers writes 64
 `create` requests at once on one connection to a fresh store, against the
 synthetic model, and reads daemon CPU from per-thread scheduler time. A
-keyed run then resends the same 64. Release builds of `169cf40` (main) and
-this change, ten rounds of the three cases in the same order, the first
-round excluded. Linux x86_64 container, 2026-10-09.
+keyed run then resends the same 64. Release builds of `b7bdfe4` (main) and
+`68b4c84` (this change, merged with that main, clean tree), 21 rounds of the
+three cases in the same order, the first round excluded. Linux x86_64
+container, 2026-10-09.
 
-| Build and requests | Daemon CPU per 64 | Reply p50 | Last reply |
+| Build and requests | Daemon CPU per 64 (IQR) | Reply p50 | Last reply |
 | --- | ---: | ---: | ---: |
-| `169cf40`, unkeyed | 11.61 ms | 7.05 ms | 11.68 ms |
-| this change, unkeyed | 11.45 ms | 6.45 ms | 12.96 ms |
-| this change, keyed | 10.78 ms | 6.20 ms | 10.96 ms |
-| this change, keyed resend | 5.61 ms | 3.00 ms | 5.16 ms |
+| `b7bdfe4`, unkeyed | 11.73 ms (10.61–13.05) | 6.89 ms | 12.35 ms |
+| `68b4c84`, unkeyed | 10.88 ms (10.18–12.28) | 6.67 ms | 11.27 ms |
+| `68b4c84`, keyed | 11.86 ms (10.86–12.78) | 6.91 ms | 11.66 ms |
+| `68b4c84`, keyed resend | 5.88 ms (5.40–6.52) | 3.14 ms | 5.58 ms |
 
-Cells are medians of nine rounds. The three creating cases are within each
-other's round-to-round spread; a resend writes no bot or event and costs
-about half a creation. macOS is not measured.
+Cells are medians of 20 rounds. The three creating cases are within each
+other's interquartile range; a resend writes no bot or event and costs about
+half a creation. An unkeyed creation builds no stored request: an earlier
+build of this change that built it for every creation measured 10.81 ms
+unkeyed against 10.25 ms on main in a run of the same size, inside the same
+spread. macOS is not measured.
