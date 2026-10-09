@@ -5,7 +5,7 @@
 use agent_runtime::{Error, Result, fail, fail_with};
 use serde_json::{Value, json};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     io::{BufRead, BufReader, IsTerminal, Read, Write},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
@@ -1779,17 +1779,22 @@ struct Renderer {
     usage: (u64, u64, u64),
     /// The daemon's flags for the answer commands it prints.
     target: String,
+    /// Program status for the terminal the human view is written to.
+    status: Option<Status>,
 }
 
 impl Renderer {
     fn new(pretty: bool, turn: Option<i64>, target: &str) -> Self {
+        let terminal = pretty && std::io::stdout().is_terminal();
         Self {
             pretty,
-            color: pretty && std::io::stdout().is_terminal(),
+            color: terminal,
             mode: Mode::Idle,
             turn,
             usage: (0, 0, 0),
             target: target.to_owned(),
+            // Without a selected turn (`follow --all`), one record per bot.
+            status: terminal.then(|| Status::new(turn.is_none())),
         }
     }
     /// Dim text for a terminal. It resets every attribute first, so no
@@ -1850,6 +1855,14 @@ impl Renderer {
                 .is_some_and(|t| !t.is_null() && *t != turn)
         {
             return Ok(None);
+        }
+        if let Some(status) = &mut self.status {
+            let reports = status.event(event);
+            if !reports.is_empty() {
+                let mut stdout = std::io::stdout();
+                let _ = stdout.write_all(reports.as_bytes());
+                let _ = stdout.flush();
+            }
         }
         let data = &event["data"];
         match event["event"].as_str().unwrap_or("") {
@@ -1935,6 +1948,184 @@ impl Renderer {
         }
         Ok(None)
     }
+}
+
+/// Program status (OSC 7501) for a terminal: what the followed turn, or
+/// each bot under `follow --all`, is doing, so a terminal can show a bot
+/// waiting on an approval or done while its tab is in the background. A
+/// state is written only when it changes. A selected turn's every state is
+/// news, replayed or live: `run` may see its turn end before the stream is
+/// live. Under `follow --all`, history replayed before `follow_live` writes
+/// only what is still going on; a turn that ended before is not news.
+struct Status {
+    per_bot: bool,
+    live: bool,
+    /// Each bot with a turn in flight; an ended turn leaves nothing behind.
+    bots: HashMap<String, Record>,
+}
+
+struct Record {
+    turn: Option<i64>,
+    state: &'static str,
+    /// Whether the terminal has this state.
+    written: bool,
+    /// The turn's announced calls a person answers (the `manual` gate);
+    /// other gates are a program's to answer, so their wait is work.
+    manual: Vec<String>,
+}
+
+impl Status {
+    fn new(per_bot: bool) -> Self {
+        Self {
+            per_bot,
+            live: false,
+            bots: HashMap::new(),
+        }
+    }
+
+    /// The reports this event calls for, as escape sequences.
+    fn event(&mut self, event: &Value) -> String {
+        if event["event"] == "follow_live" {
+            self.live = true;
+            let mut out = String::new();
+            for (bot, record) in &mut self.bots {
+                if !record.written {
+                    out.push_str(&report(self.per_bot, bot, record.state));
+                    record.written = true;
+                }
+            }
+            return out;
+        }
+        let Some(bot) = event["bot"].as_str() else {
+            return String::new();
+        };
+        let kind = event["event"].as_str().unwrap_or("");
+        let turn = event["turn"].as_i64();
+        let data = &event["data"];
+        // Only the running turn speaks for its bot: one queued behind it,
+        // or one that ends before it starts, changes nothing.
+        if matches!(kind, "queued" | "turn_finished")
+            && self.bots.get(bot).is_some_and(|known| known.turn != turn)
+        {
+            return String::new();
+        }
+        let ended = match kind {
+            "turn_finished" => Some(match data["status"].as_str() {
+                Some("completed") => "done",
+                Some("interrupted") => "idle",
+                // The steer's message joined a turn that goes on.
+                Some("steered") => return String::new(),
+                _ => "error",
+            }),
+            // Only a bot's own record goes; a clear without an id would
+            // remove every record on the terminal.
+            "deleted" if self.per_bot => Some("clear"),
+            "accepted" | "queued" | "steered" | "tool_started" | "tool_completed"
+            | "approval_requested" | "turn_waiting" | "turn_paced" | "turn_resumed"
+            | "text_delta" | "thinking_delta" => None,
+            _ => return String::new(),
+        };
+        if let Some(state) = ended {
+            // A turn that ended before the stream is live is not news.
+            self.bots.remove(bot);
+            return if self.live || !self.per_bot {
+                report(self.per_bot, bot, state)
+            } else {
+                String::new()
+            };
+        }
+        if !self.bots.contains_key(bot) {
+            self.bots.insert(
+                bot.to_owned(),
+                Record {
+                    turn,
+                    state: "",
+                    written: false,
+                    manual: Vec::new(),
+                },
+            );
+        }
+        let Some(record) = self.bots.get_mut(bot) else {
+            return String::new();
+        };
+        if record.turn != turn {
+            record.turn = turn;
+            record.manual.clear();
+        }
+        let state = match kind {
+            "approval_requested" => {
+                for call in data["calls"].as_array().into_iter().flatten() {
+                    let manual = call["gates"]
+                        .as_array()
+                        .is_some_and(|gates| gates.iter().any(|tag| tag == "manual"));
+                    if let Some(id) = call["call_id"].as_str().filter(|_| manual)
+                        && !record.manual.iter().any(|known| known == id)
+                    {
+                        record.manual.push(id.to_owned());
+                    }
+                }
+                if record.manual.is_empty() {
+                    "working"
+                } else {
+                    "blocked"
+                }
+            }
+            // A turn waits on a gate's verdict or on other turns and processes.
+            "turn_waiting"
+                if data["approval"] == true
+                    && record
+                        .manual
+                        .iter()
+                        .any(|id| data["call_id"] == id.as_str()) =>
+            {
+                "blocked"
+            }
+            "tool_started" | "tool_completed" => {
+                record.manual.retain(|id| data["call_id"] != id.as_str());
+                "working"
+            }
+            _ => "working",
+        };
+        if record.state == state {
+            return String::new();
+        }
+        record.state = state;
+        record.written = self.live || !self.per_bot;
+        if record.written {
+            report(self.per_bot, bot, state)
+        } else {
+            String::new()
+        }
+    }
+}
+
+/// One OSC 7501 report. Under `follow --all` the record's id is the bot's
+/// name, which bot names' characters always satisfy; a name past the 32
+/// bytes an id segment allows keeps its start and a 64-bit hash of the
+/// whole, so two such names share an id only by a negligible chance.
+fn report(per_bot: bool, bot: &str, state: &str) -> String {
+    use base64::Engine;
+    let mut body = format!("state={state}");
+    // Only a person's gate blocks: a program answers the others.
+    if state == "blocked" {
+        body.push_str(":kind=permission");
+    }
+    if per_bot {
+        let id = if bot.len() <= 32 {
+            bot.to_owned()
+        } else {
+            let hash = bot.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+                (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+            });
+            format!("{}.{hash:016x}", &bot[..15])
+        };
+        body.push_str(&format!(":id={id}"));
+    }
+    if state != "clear" {
+        let title = base64::engine::general_purpose::STANDARD.encode(bot);
+        body.push_str(&format!(":app=agent:title={title}"));
+    }
+    format!("\x1b]7501;{body}\x1b\\")
 }
 
 fn exit_code(data: &Value) -> i32 {
@@ -2395,6 +2586,108 @@ mod tests {
         assert_eq!(tool_line(name, "{}"), r"▸ \u{1b}]0;x {}");
         let call = json!({"name": name, "arguments": {"a": 1}});
         assert_eq!(call_line(&call), r#"\u{1b}]0;x {"a":1}"#);
+    }
+
+    #[test]
+    fn program_status_reports_each_change_once_and_skips_ended_history() {
+        let at = |bot: &str, turn: i64, event: &str, data: Value| json!({"event":event,"bot":bot,"turn":turn,"data":data});
+        let ev = |bot: &str, event: &str, status: Option<&str>| {
+            at(bot, 1, event, json!({"status":status}))
+        };
+        let ask = |gates: Value| json!({"calls":[{"call_id":"c1","request":1,"gates":gates}]});
+        let gate = json!({"call_id":"c1","approval":true});
+        let live = json!({"event":"follow_live","bot":"*"});
+        // `run`: its own turn as the root record, replayed or live.
+        let mut one = Status::new(false);
+        assert_eq!(
+            one.event(&ev("demo", "accepted", None)),
+            "\x1b]7501;state=working:app=agent:title=ZGVtbw==\x1b\\"
+        );
+        assert_eq!(one.event(&live), "");
+        assert_eq!(one.event(&ev("demo", "text_delta", None)), "");
+        assert!(
+            one.event(&at("demo", 1, "approval_requested", ask(json!(["manual"]))))
+                .contains("state=blocked:kind=permission:")
+        );
+        // The turn then waits on the person: still blocked, nothing new to say.
+        assert_eq!(one.event(&at("demo", 1, "turn_waiting", gate.clone())), "");
+        assert!(
+            one.event(&at("demo", 1, "tool_started", json!({"call_id":"c1"})))
+                .contains("state=working:")
+        );
+        assert!(
+            one.event(&ev("demo", "turn_finished", Some("completed")))
+                .contains("state=done:")
+        );
+        // A turn that ends before the stream is live is still `run`'s news.
+        let mut fast = Status::new(false);
+        fast.event(&ev("demo", "accepted", None));
+        assert!(
+            fast.event(&ev("demo", "turn_finished", Some("failed")))
+                .contains("state=error:")
+        );
+        // A program's gate is work, not something to ask the person about.
+        let mut auto = Status::new(false);
+        auto.event(&ev("demo", "accepted", None));
+        assert_eq!(
+            auto.event(&at("demo", 1, "approval_requested", ask(json!(["auto"])))),
+            ""
+        );
+        assert_eq!(auto.event(&at("demo", 1, "turn_waiting", gate.clone())), "");
+
+        // `follow --all`: one id per bot; only what still runs comes from history.
+        let mut all = Status::new(true);
+        all.event(&ev("old", "accepted", None));
+        all.event(&ev("old", "turn_finished", Some("completed")));
+        all.event(&ev("busy", "accepted", None));
+        assert_eq!(
+            all.event(&live),
+            "\x1b]7501;state=working:id=busy:app=agent:title=YnVzeQ==\x1b\\"
+        );
+        // A turn queued behind a blocked one, then cancelled, leaves it blocked.
+        assert!(
+            all.event(&at("busy", 1, "approval_requested", ask(json!(["manual"]))))
+                .contains("state=blocked:kind=permission:id=busy:")
+        );
+        assert_eq!(all.event(&at("busy", 2, "queued", json!({}))), "");
+        assert_eq!(
+            all.event(&at(
+                "busy",
+                2,
+                "turn_finished",
+                json!({"status":"interrupted"})
+            )),
+            ""
+        );
+        assert!(
+            all.event(&ev("busy", "turn_finished", Some("interrupted")))
+                .contains("state=idle:id=busy:")
+        );
+        // An ended turn leaves nothing to remember.
+        assert!(all.bots.is_empty());
+        assert_eq!(all.event(&ev("busy", "turn_finished", Some("steered"))), "");
+        assert_eq!(
+            all.event(&json!({"event":"deleted","bot":"busy"})),
+            "\x1b]7501;state=clear:id=busy\x1b\\"
+        );
+        // Without per-bot ids a delete writes nothing: no id clears every record.
+        assert_eq!(one.event(&json!({"event":"deleted","bot":"demo"})), "");
+        // A name longer than an id segment keeps its start and a 64-bit hash.
+        let id = |bot: &str| {
+            let report = report(true, bot, "working");
+            report
+                .split("id=")
+                .nth(1)
+                .unwrap()
+                .split(':')
+                .next()
+                .unwrap()
+                .to_owned()
+        };
+        let long = id(&"a".repeat(40));
+        assert_eq!(long.len(), 32);
+        assert!(long.starts_with(&format!("{}.", "a".repeat(15))));
+        assert_ne!(long, id(&"a".repeat(41)));
     }
 
     #[test]
