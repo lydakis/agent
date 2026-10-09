@@ -30,11 +30,14 @@ window.Rich = (() => {
 
   // ---------- Markdown ----------
   // Past this a block is shown as plain text: highlighting is linear but not free.
-  const HIGHLIGHT_MAX = 64 * 1024;
+  // A message or file highlights at most 256 KiB of code in all (`spent`, reset by `html` and
+  // `file`); past that its blocks are plain, so a file of many fences costs no more than one.
+  const HIGHLIGHT_MAX = 64 * 1024, HIGHLIGHT_TOTAL = 256 * 1024;
+  let spent = 0;
   function codeHTML(text, lang) {
     const h = hl();
-    if (lang && text.length <= HIGHLIGHT_MAX) {
-      if (h?.getLanguage(lang)) { try { return h.highlight(text, { language: lang, ignoreIllegals: true }).value; } catch (_) {} }
+    if (lang && text.length <= HIGHLIGHT_MAX && spent + text.length <= HIGHLIGHT_TOTAL) {
+      if (h?.getLanguage(lang)) { spent += text.length; try { return h.highlight(text, { language: lang, ignoreIllegals: true }).value; } catch (_) {} }
       else if (!h) { waited = true; wantHighlight(); }
     }
     return esc(text);
@@ -92,7 +95,7 @@ window.Rich = (() => {
   const count = (s, c, max) => { let n = 0, i = -1; while (n <= max && (i = s.indexOf(c, i + 1)) !== -1) n++; return n; };
   const asText = (text) => `<div class="rc" data-kind="code">${head('text', '')}<pre class="code"><code>${esc(text)}</code></pre></div>`;
   function html(text) {
-    waited = false;
+    waited = false; spent = 0;
     const p = parser();
     if (!p) return `<p>${esc(text)}</p>`;
     if (count(text, '\n', LINES) > LINES) return asText(text);
@@ -295,6 +298,7 @@ window.Rich = (() => {
     return `<div class="md"><table><thead><tr>${(rows[0] ?? []).map(cell('th')).join('')}</tr></thead><tbody>${rows.slice(1).map((r) => `<tr>${r.map(cell('td')).join('')}</tr>`).join('')}</tbody></table></div>`;
   }
   function file(path, bytes, more = false) {
+    spent = 0;
     const ext = extOf(path), note = more ? `<div class="line note">showing the first ${Math.round(bytes.length / 1048576)} MiB</div>` : '';
     if (IMAGE[ext]) {
       if (more) return { html: '<div class="line note">image too large to show</div>' };

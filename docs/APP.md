@@ -1154,7 +1154,8 @@ an element from four bytes. Fenced blocks are drawn by their language:
 - **Code** is highlighted with [highlight.js](https://highlightjs.org) (its
   common languages) in the window's own colors, with a copy button. A block
   names its language or is left plain; nothing guesses. Blocks over 64 KiB
-  stay plain.
+  stay plain, and a message or file highlights at most 256 KiB of code in
+  all.
 - **`mermaid`** draws as a diagram with [Mermaid](https://mermaid.js.org),
   themed to the window. In a message it opens as its source and draws with a
   click on **diagram**: Mermaid lays out on the window's thread, and a few

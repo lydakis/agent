@@ -183,6 +183,15 @@ test('a table too wide or too large shows as its source; a modest one draws', ()
   assert.doesNotMatch(Rich.html(tall), /<td>/);
 });
 
+test('a message highlights at most 256 KiB of code in all', () => {
+  const p = page(), Rich = p.context.Rich; let calls = 0, bytes = 0;
+  p.context.hljs = { getLanguage: () => true, highlight: (text) => { calls++; bytes += text.length; return { value: text }; } };
+  const fence = '```rust\n' + 'x'.repeat(60 * 1024) + '\n```\n\n';
+  Rich.html(fence.repeat(10));
+  assert.equal(calls, 4); assert.ok(bytes <= 256 * 1024);
+  Rich.html(fence); assert.equal(calls, 5);
+});
+
 test('a message past 100,000 tags shows as its text', () => {
   const Rich = page().context.Rich;
   const list = '- *x*\n'.repeat(30000);
