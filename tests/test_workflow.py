@@ -108,12 +108,16 @@ class Pieces(unittest.TestCase):
         self.assertEqual(workflow.parse_reply('```json\n[1]\n```'), [1])
         with self.assertRaises(ValueError):
             workflow.parse_reply('Here: {"a": 1}')
+        with self.assertRaises(ValueError):
+            workflow.parse_reply('{"score": NaN}')
 
     def test_durations_and_flags(self):
         self.assertEqual(workflow.duration('90s'), 90)
         self.assertEqual(workflow.duration('2h'), 7200)
         with self.assertRaises(workflow.Refused):
             workflow.duration('2 hours')
+        with self.assertRaises(workflow.Refused):
+            workflow.duration('0s')
         found, rest = workflow.flags(['plan.py', '--name=x', '--parallel', '4', '--pretty'],
                                      ('--name', '--parallel'), ('--pretty',))
         self.assertEqual((found, rest), ({'--name': 'x', '--parallel': '4', '--pretty': True}, ['plan.py']))
@@ -343,6 +347,15 @@ while True:
         self.assertEqual((summary['status'], summary['error']), ('failed', 'no_result'))
         status, refused = self.start(self.plan('def (', 'broken.py'))
         self.assertEqual((status, refused['error']), (1, 'plan_invalid'))
+        # Agents refused before a bot exists: an unknown model, and a zero budget kept as zero.
+        refused = self.plan('result = [agent("say:x", label="bad", model="nope/none").ok, '
+                            'agent("say:x", label="zero", budget_tokens=0).ok]\n', 'refused.py')
+        self.assertEqual(self.start(refused, '--name', 'refused')[1]['agents']['failed'], 2)
+        self.assertEqual(self.result('refused'), [False, False])
+        shown = subprocess.run([sys.executable, str(RUNNER), 'status', 'refused', '--agents', '--pretty'],
+                               env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        self.assertIn('  bad  -  ', shown.stdout)
 
     def test_a_lead_starts_a_run_detached_and_hears_back_once(self):
         plan = self.plan('''

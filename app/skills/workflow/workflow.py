@@ -73,6 +73,8 @@ def duration(text):
     if not match:
         raise Refused('usage', f'{text!r} is not a duration such as 30s, 45m or 2h', 2)
     unit = {'ms': .001, 's': 1, 'm': 60, 'h': 3600, 'd': 86400}[match.group(2)]
+    if int(match.group(1)) == 0:
+        raise Refused('usage', f'{text!r}: a duration must be more than zero', 2)
     return int(match.group(1)) * unit
 
 
@@ -220,7 +222,9 @@ def plain(value):
 def parse_reply(text):
     text = (text or '').strip()
     fenced = re.fullmatch(r'```(?:json)?\s*\n(.*)\n```', text, re.S)
-    return json.loads(fenced.group(1) if fenced else text)
+    def finite_only(name):
+        raise ValueError(f'{name} is not JSON')
+    return json.loads(fenced.group(1) if fenced else text, parse_constant=finite_only)
 
 
 TYPES = {'object': dict, 'array': list, 'string': str, 'boolean': bool, 'null': type(None)}
@@ -371,7 +375,8 @@ class Run:
                 raise ValueError(f'label {label!r} is used twice in this run')
             self.labels.add(label)
             phase = phase or self.phase_now
-        budget_tokens = budget_tokens or self.options['agent_budget_tokens']
+        if budget_tokens is None:  # 0 stays 0, which the CLI refuses, rather than no budget
+            budget_tokens = self.options['agent_budget_tokens']
         # What a new agent would get, defaults included: a run resumed from
         # another folder or model starts its agents afresh.
         context = [os.getcwd(), os.environ.get('AGENT_MODEL'), os.environ.get('AGENT_REASONING')]
@@ -862,7 +867,7 @@ def status(argv):
               + f'  {took // 60}m{took % 60:02d}s')
         for record in run.get('agent_records', []):
             state = 'running' if record.get('ok') is None else 'ok' if record['ok'] else record.get('error')
-            print(f'  {record["label"]}  {record["bot"]}  {state}')
+            print(f'  {record["label"]}  {record.get("bot") or "-"}  {state}')
     return 0
 
 

@@ -1,7 +1,8 @@
 """What a workflow run costs per agent, against the synthetic model.
 
 Two arms do the same work: N fresh bots, at most P at a time, each one
-`agent run --new --detach` and one `wait` on a shared daemon connection.
+`agent run --new --detach` and one `wait` on a shared daemon connection,
+then one `resume` per bot for its tokens.
 `workflow` runs it as a plan through app/skills/workflow/workflow.py, with
 its labels, events and summary; `direct` is a bare loop of the same
 commands. Each arm runs as its own process, sampled from /proc for its own
@@ -62,25 +63,34 @@ def direct(agents, parallel, delay, round_):
     def read():
         for line in file:
             reply = json.loads(line)
-            waiting.pop(reply['id']).set()
+            entry = waiting.pop(reply['id'])
+            entry[1] = reply
+            entry[0].set()
     threading.Thread(target=read, daemon=True).start()
+
+    def request(id, body):
+        entry = [threading.Event(), None]
+        with lock:
+            waiting[id] = entry
+            file.write(json.dumps({'id': id, **body}) + '\n')
+            file.flush()
+        entry[0].wait()
+        return entry[1]
 
     def one(i):
         with slots:
             out = subprocess.run([str(BINARY), 'run', '--new', '--detach', '--no-spawn', '--instructions=x',
                                   '--bot', f'direct{round_}.w{i}', '--', '-'], input=f'delay:{delay}',
                                  capture_output=True, text=True, check=True).stdout
-            done = threading.Event()
-            with lock:
-                waiting[i] = done
-                file.write(json.dumps({'id': i, 'op': 'wait', 'handles': [json.loads(out)['handle']]}) + '\n')
-                file.flush()
-            done.wait()
+            request(i, {'op': 'wait', 'handles': [json.loads(out)['handle']]})
     threads = [threading.Thread(target=one, args=(i,)) for i in range(agents)]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
+    # The runner reads each agent's tokens at the end; so does this arm.
+    sum(request(agents + i, {'op': 'resume', 'bot': f'direct{round_}.w{i}'})['result']['tokens_used']
+        for i in range(agents))
 
 
 def arm(name, env, workdir, agents, parallel, delay, round_):
