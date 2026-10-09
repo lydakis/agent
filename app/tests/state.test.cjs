@@ -173,6 +173,17 @@ test('fenced blocks become code, previews, diagrams and images by their language
   assert.match(Rich.html('![r](https://example.com/r.png)'), /<a href="https:\/\/example.com\/r.png">r<\/a>/);
 });
 
+test('a link in a drawn diagram opens through the guarded opener', () => {
+  const p = page(), Rich = p.context.Rich, opened = [];
+  p.context.__TAURI__ = { core: { invoke: (cmd, args) => { opened.push([cmd, args.url]); return Promise.resolve(); } } };
+  const click = (attrs) => { let prevented = false; const a = { getAttribute: (k) => attrs[k] ?? null };
+    const handled = Rich.click({ target: { closest: (sel) => sel.includes('.rc a') ? a : null }, preventDefault: () => { prevented = true; } });
+    return handled && prevented; };
+  assert.equal(click({ 'xlink:href': 'https://example.com/m' }), true);
+  assert.equal(click({ href: 'javascript:alert(1)' }), true);
+  assert.deepEqual(opened, [['open_link', 'https://example.com/m']]);
+});
+
 test('charts, file links and opened files draw by kind', () => {
   const p = page(), Rich = p.context.Rich;
   // A chart in a message draws when asked; one in a file someone opened draws at once.

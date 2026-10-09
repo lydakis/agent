@@ -235,8 +235,10 @@ window.Rich = (() => {
     if (f) { e.preventDefault(); openFile(f.dataset.file, f); return true; }
     const im = e.target.closest?.('button.img[data-img]');
     if (im) { const img = document.createElement('img'); img.src = im.dataset.img; img.alt = im.title; im.replaceWith(img); return true; }
-    const a = e.target.closest?.('.md a[href]');
-    if (a) { e.preventDefault(); if (linkable(a.getAttribute('href'))) open(a.getAttribute('href')); return true; }
+    // Every link in drawn content goes through the guarded opener, or nowhere: a Mermaid `click`
+    // link is an SVG `<a xlink:href>` that would otherwise take over the window.
+    const a = e.target.closest?.('.md a, .rc a');
+    if (a) { e.preventDefault(); const href = a.getAttribute('href') ?? a.getAttribute('xlink:href'); if (linkable(href)) open(href); return true; }
     const b = e.target.closest?.('[data-rich]'); if (!b) return false;
     const box = b.closest('.rc');
     if (b.dataset.rich === 'copy') {
