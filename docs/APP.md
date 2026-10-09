@@ -1209,7 +1209,11 @@ frame only. Its page carries a policy that loads nothing from the network (no
 fetch, scripts, styles, images or fonts but its own inline ones and `data:`),
 and the window's policy (`frame-src about:`) stops a preview from navigating
 its own frame to a website. A preview runs only once asked, so a long
-transcript holds no idle pages.
+transcript holds no idle pages. The window's policy also takes images, fonts,
+media and stylesheets only from the app itself, `data:` and `blob:`, so a
+library drawing a message cannot fetch one either: a Mermaid node's `img:`
+URL or a `url()` in its theme CSS is refused, and the diagram names the
+failure in its head.
 
 Measured 2026-10-09 in headless Chromium 141 on a 4-core cloud container,
 medians of nine runs, three runs each (synthetic messages: prose, lists, a
@@ -1240,7 +1244,8 @@ scripts into the main frame only was read from tauri 2.11.5's source
 whose script loops forever left the window responsive while it was not
 asked to run; twelve diagrams in a chat opened at its end drew one, and a
 diagram drawing just above the visible top left the paragraph below it at the
-same screen position. A Vega spec with a `sequence` transform to a billion
+same screen position. A Mermaid image node and a theme `url()` pointing at a
+website were refused by the window's policy and made no request. A Vega spec with a `sequence` transform to a billion
 left the window responsive in view, as it draws only when asked.
 
 ## What it costs, and where the bounds are
