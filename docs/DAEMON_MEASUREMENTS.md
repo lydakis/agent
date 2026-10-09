@@ -3523,9 +3523,11 @@ release binary sha256 `8c0114d640d46601…`); after is `3ad9e2f` (sha256
   --work 0.15 --summary 0.6 --prompt long:40 --context-bytes 24576 --runs 3
 ```
 
-Each summary hides the call it runs beside, so a turn saves the shorter
-of the two per summary: 4.0 s for four 1 s calls at 64 KiB, and 0.78 s
-for five 0.15 s calls at 24 KiB. The turn's own count of the time it held
+Each summary hides the call it runs beside, so a turn should save the
+shorter of the two per summary: predicted 4.0 s for four 1 s calls at
+64 KiB and 0.75 s for five 0.15 s calls at 24 KiB. The observed wall
+deltas are 3.99 s and 0.78 s; the 0.03 s left over at 24 KiB is noise or
+other overhead, not overlap. The turn's own count of the time it held
 for summaries, `summary_ms`, agrees: the rest of each summary, 12.0 of
 16 s and 2.25 of 3.0 s. The cost is input: the call beside each summary sends the longer
 view, 3% more work-call input bytes at 64 KiB and 6% at 24 KiB. On a

@@ -16,7 +16,9 @@ use agent_runtime::{
     codec::split_model,
     fail,
     provider::{Chain, Delta, Items, Provider, Report, Request as ModelRequest, ToolCall},
-    store::{Bot, ContextPrefix, ContextUsage, Gated, Settings, Store, Strip, Waiting, Window},
+    store::{
+        Bot, ContextPrefix, ContextUsage, Gated, Settings, Slot, Store, Strip, Waiting, Window,
+    },
     tools::{Outcome, Prepared, ReadSource, Registry},
 };
 use bytes::Bytes;
@@ -1139,7 +1141,7 @@ impl Turn {
             .summarize(planned, record, model_rounds, turn, accounting, tools)
             .await?
         {
-            Summary::Written(written) => self.install(*written).await,
+            Summary::Written(written) => self.install(self.store.slot().await?, *written).await,
             Summary::Parked(until) => Ok(Compaction::Parked(until)),
             Summary::Skipped => Ok(Compaction::Skipped),
         }
@@ -1434,12 +1436,19 @@ impl Turn {
         if let Some(running) = running {
             *landed = Some(running.await);
         }
+        if landed.is_none() {
+            return Ok(false);
+        }
+        // The summary leaves the slot only once its install has room on
+        // the store's queue: a cancellation before then leaves it to
+        // `execute`, which installs and bills it.
+        let slot = self.store.slot().await?;
         let Some(Landed { result, spent }) = landed.take() else {
             return Ok(false);
         };
         spent.count(tokens_used, model_rounds);
         let installed = match result {
-            Ok(Summary::Written(written)) => self.install(*written).await,
+            Ok(Summary::Written(written)) => self.install(slot, *written).await,
             Ok(Summary::Parked(until)) => {
                 accounting.summary_retry_at = until;
                 Ok(Compaction::Skipped)
@@ -1451,8 +1460,10 @@ impl Turn {
     }
 
     /// Record a summary as the new context start, at a boundary: the view
-    /// changes only between calls.
-    async fn install(&self, written: Written) -> Result<Compaction> {
+    /// changes only between calls. One job holds the install and, when it
+    /// fails, the summary's bill, so once `slot` sends it no cancellation
+    /// can lose either.
+    async fn install(&self, slot: Slot<'_>, written: Written) -> Result<Compaction> {
         let Written {
             plan,
             summary,
@@ -1460,13 +1471,11 @@ impl Turn {
             request,
         } = written;
         let (bot, turn) = (self.bot.clone(), self.turn);
-        let billed = usage.clone();
         let note_turns = self.settings().note_turns();
         let input_limit = self.input_limit();
-        if let Err(error) = self
-            .store
+        let installed = slot
             .op("compact", move |db| {
-                db.compact(
+                let installed = db.compact(
                     &bot,
                     &plan,
                     &summary,
@@ -1474,15 +1483,14 @@ impl Turn {
                     note_turns,
                     input_limit,
                     request,
-                )
+                );
+                if installed.is_err() {
+                    db.compaction_usage(turn, usage.as_ref())?;
+                }
+                installed
             })
-            .await
-        {
-            self.store
-                .op("compaction_usage", move |db| {
-                    db.compaction_usage(turn, billed.as_ref())
-                })
-                .await?;
+            .await;
+        if let Err(error) = installed {
             if matches!(
                 error.code.as_str(),
                 "compaction_not_smaller" | "compaction_context_limit" | "compaction_version_shared"

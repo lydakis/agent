@@ -2160,8 +2160,9 @@ view still changes only between calls, and a park, an approval, or a
 resumed turn never sees a summary running. The turn saves the shorter of
 the two calls; what it pays is that one call sends the longer view. An
 interrupt cancels a summary still running, like the turn's own call; one
-that has landed waits outside the turn's rounds, and is billed and
-installed as the turn ends.
+that has landed waits outside the turn's rounds until its install is
+queued on the store, and is billed and installed as the turn ends. The
+install and, when it fails, the summary's bill are one store job.
 
 It runs beside only while the view and the reply's estimated size still
 fit the input limit and, beside what it holds, the round limit and the
