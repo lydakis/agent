@@ -86,11 +86,12 @@ cap is reached its turns fail with `budget_exhausted`.
    never build them by hand.
 8. **Write the plan, then post once.** Before posting, write into the run
    record the post's key, the new bookmark of each source read
-   successfully, and the ledger lines to add, change or remove. The key names the
-   run: the time it started (step 3) to the minute, with the UTC offset, for
-   example `2026-01-05 07:30 -0500`. Put it in the post, so step 2 of the
-   next run can find it. A post counts as sent only when the destination
-   confirms it, for example a response with `"ok": true` and a message id.
+   successfully, and the ledger lines to add, change or remove. The key
+   names the run: the time it started (step 3) to the minute, with the UTC
+   offset, for example `2026-01-05 07:30 -0500`. Put it in the post, so
+   step 2 of the next run can find it. A post counts as sent only when the
+   destination confirms it, for example a response with `"ok": true` and a
+   message id.
 9. **Record after the confirmation, in order.** Mark the run record posted
    with the message id, apply its ledger lines, move its bookmarks, then
    mark it done; a run cut off partway is finished by the next run's step 2.
