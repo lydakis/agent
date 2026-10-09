@@ -1196,9 +1196,9 @@ and licenses in `LICENSES.txt`), so drawing a message fetches nothing.
 
 A file opens beside the chat, in the pane a task opens in, from a path a step
 read, wrote or edited (the path in its line) or a message's link to a path
-(`[plan](PLAN.md)`, `src/a.rs:12`, `src/a.rs#L4`, `README.md#install`; the line or section is dropped). A
-path is the agent's folder's, and a link inside an open file is relative to
-that file. The core reads the first 4 MiB of a regular file (`read_file`; a
+(`[plan](PLAN.md)`, `src/a.rs:12`, `src/a.rs#L4`, `README.md#install`; the
+line or section is dropped). A path is the agent's folder's, and a link
+inside an open file is relative to that file. The core reads the first 4 MiB of a regular file (`read_file`; a
 FIFO or device is refused, as reading one need not end, and a window on a
 host is refused by name, as its files are the host's). The file draws by its
 kind: Markdown, a diagram (`.mmd`, `.mermaid`) or a chart (`.vl.json`,
@@ -1216,8 +1216,9 @@ What a model writes never becomes the app's markup unparsed. Raw HTML inside
 Markdown shows as text. Links open in the default browser and only for
 `http`, `https` and `mailto` (the core's `open_link` refuses anything else);
 other links show as their text. Images draw only from raster `data:` URLs the
-message carries; a remote image is a link, so drawing a message makes no
-request a model chose. An HTML preview runs scripts in a frame sandboxed
+message carries, and only on a click, as a small image can decode to far more
+than its bytes; a remote image is a link and a local one opens beside, so
+drawing a message makes no request a model chose. An HTML preview runs scripts in a frame sandboxed
 without same-origin access: it cannot read the app or its storage, cannot
 navigate the window, and the app's script globals are injected into the main
 frame only. Its page carries a policy that loads nothing from the network (no
@@ -1230,16 +1231,19 @@ library drawing a message cannot fetch one either: a Mermaid node's `img:`
 URL or a `url()` in its theme CSS is refused, and the diagram names the
 failure in its head.
 
-Measured 2026-10-09 in headless Chromium 141 on a 4-core cloud container,
-medians of nine runs, three runs each (synthetic messages: prose, lists, a
-table, and Rust in every third one). Drawing 400 messages (292 KiB) costs
-72 to 87 ms of parsing the first time, against 6 to 7 ms for the line
-renderer this replaced; drawn again, a message costs no parsing. Putting
-those 400 into the page and laying them out takes 207 to 228 ms, against 127
-to 135 ms before, because the HTML is larger (654 KiB against 421 KiB) and
-code is highlighted. A 9 KiB reply streamed in 8-character deltas (1,121 of
-them, 44 finished blocks) costs 17 ms in all, against 2 to 4 ms for plain
-text; parsing the whole reply again on each delta would cost 1.2 to 1.4 s.
+Measured 2026-10-09 at 4dc1751 with `node app/bench/render.cjs`, in headless
+Chromium 141.0.7390.37 on a 4-core cloud container: seven runs, each the
+median of nine (synthetic messages: prose, lists, a table, and Rust in every
+third one). Drawing 400 messages (292 KiB) costs 45 to 84 ms of parsing the
+first time, against 4 to 7 ms for the line renderer this replaced; drawn
+again, a message costs no parsing, as its HTML is kept on its item. Putting
+those 400 into the page and laying them out takes 165 to 422 ms, against 88
+to 235 ms before (this container's layout times vary widely; in each run the
+new page took 1.3 to 3.3 times the old), because the HTML is larger (654 KiB
+against 421 KiB) and code is highlighted. A 9 KiB reply streamed in
+8-character deltas (1,121 of them, 44 finished blocks) costs 7 to 12 ms in
+all, against 1 to 2 ms for plain text; parsing the whole reply again on each
+delta would cost 0.7 to 1.2 s.
 
 While a reply streams, each block that has ended (a paragraph after its blank
 line, a fence once it closes) is drawn once and appended; only the block still
