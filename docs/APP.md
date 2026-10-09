@@ -1143,9 +1143,12 @@ Earlier apps called these schedules (`~/.agent/schedule`, jobs labelled
 `~/.agent/schedules`). The first start of this app, or the first fire of
 such a job before it, converts each once: the same definition under the
 trigger label, its last result moved, the old job unloaded and its plist,
-folder and script removed. A fire that converts sends nothing; its trigger
-fires at its next time. A schedule plist that cannot be read, or whose
-name a trigger has, is left where it is and logged.
+folder and script removed. An old plist goes only once its job unloaded,
+so a failed unload is tried again at the next start. A fire that converts
+its own schedule fires the new trigger in its place, then unloads itself.
+A schedule plist that cannot be read, that names another trigger than its
+file does, or whose name a trigger has, is left where it is with its
+result, and logged.
 
 ## What it costs, and where the bounds are
 
