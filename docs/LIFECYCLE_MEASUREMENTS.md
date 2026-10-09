@@ -237,3 +237,28 @@ Commands, run sequentially from the repository root after
 Raw captures are in the ignored `.local/bench/pi-durable-2026-10-02/`. The
 v3 echo and shell rows use streamed tool-call items, so they are not the same
 workload as the 2026-09-07 Rust rows above (which were also on another host).
+
+### Re-run, 2026-10-09
+
+The same seven commands on another container of the same shape (shared
+4-vCPU, 15 GiB, Linux 6.18), Agent at `3ad9e2f` (release binary
+`6a50ffab…`), Pi Durable and its lockfile unchanged, captures under the
+ignored `.local/bench/pi-durable-2026-10-09/`. Pi Durable captures now
+name their contract as a committed-transcript re-read with no event replay.
+Every measured run completed all 96 turns with no invalid request and no
+quality warning.
+
+| Case | Engine, durability | Peak RSS, MiB | CPU s | Turn p50 / p99, ms | Restart to ready, ms | Resume, re-read, items, duplicate, fork (all 32), ms |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Text | Agent, FULL | 22.1 (21.9–22.2) | 0.79 (0.77–0.83) | 521 / 526 | 207 (202–215) | 134 (120–136) |
+| Text | Pi Durable, FULL | 135.9 (135.5–136.5) | 2.22 (2.18–2.37) | 526 / 632 | 224 (222–224) | 161 (159–164) |
+| Echo round trip | Agent, FULL | 22.1 (22.1–22.1) | 0.88 (0.83–0.91) | 573 / 579 | 225 (216–227) | 165 (139–170) |
+| Echo round trip | Pi Durable, FULL | 150.3 (147.7–152.8) | 3.26 (3.19–3.26) | 633 / 813 | 222 (219–240) | 200 (180–207) |
+| Echo round trip | Pi Durable, NORMAL (package default) | 147.5 (146.8–148.1) | 3.11 (3.11–3.12) | 624 / 793 | 231 (224–237) | 192 (190–204) |
+| Shell round trip | Agent, FULL | 135.1 (134.9–135.1) | 0.96 (0.91–1.05) | 830 / 858 | 220 (213–280) | 160 (158–182) |
+| Shell round trip | Pi Durable, FULL | 273.5 (258.0–282.5) | 3.62 (3.61–3.67) | 902 / 1,021 | 228 (226–235) | 206 (196–218) |
+
+The conclusions above hold. Agent's daemon peaked about 1 MiB higher than
+on 2026-10-02 (main moved from `0a6f2b2` to `b026767` in between, and the
+host differs); Pi Durable's shell peak varied most, 253.2 then 273.5 MiB.
+The summary change does not run in this workload, which never compacts.

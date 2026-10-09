@@ -3500,22 +3500,21 @@ paid evaluation's totals remain incomplete until rerun with corrected accounting
 
 ### Summaries beside the turn
 
-2026-10-02. A summary due inside a turn, behind a call the turn made, now
-runs beside the turn's calls and tools and is installed at the first
-boundary after it lands ([design](RUST_PROTOTYPE.md#summaries-beside-the-turn)).
-Measured with `bench/summary_beside.py` on a shared 4-vCPU Linux 6.18 cloud
-container: the runtime tests' synthetic Responses fixture, every work call
-delayed by a fixed time and every summary by a longer one, one bot with
-`shell` and `read`, one turn. Before is `0a6f2b2` (summaries before the
-call; release binary sha256 `18e3f59f287a9d6a…`); after is `f05caa3`, the
-change with its review fixes (sha256 `cbc4bdbbf694bb28…`). Synthetic delays,
-no model calls. A first run of the change alone (`8e80ef6`) measured within
-0.1 s of these on both rows.
+2026-10-09. A summary due inside a turn, behind a call the turn made, now
+runs beside that boundary's call and is installed once the call is
+recorded, before its tools run
+([design](RUST_PROTOTYPE.md#summaries-beside-the-turn)). Measured with
+`bench/summary_beside.py` on a shared 4-vCPU Linux 6.18 cloud container:
+the runtime tests' synthetic Responses fixture, every work call delayed by
+a fixed time and every summary by a longer one, one bot with `shell` and
+`read`, one turn. Before is main at `b026767` (summaries before the call;
+release binary sha256 `8c0114d640d46601…`); after is `3ad9e2f` (sha256
+`6a50ffab902c9147…`), rustc 1.98.0. Synthetic delays, no model calls.
 
-| Turn | Delays (work / summary) | Summaries | Wall time before | Wall time after | Work input bytes before → after | Largest request before → after |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| `long:150x40`, 64 KiB budget, 1 run | 1.0 s / 4.0 s | 4 | 168.45 s | 152.54 s | 4.46 M → 4.98 M | 49.3 K → 53.6 K |
-| `long:40`, 24 KiB budget, 3 runs | 0.15 s / 0.6 s | 5 | 9.76 s (9.75–9.78) | 8.95 s (8.95–8.96) | 620 K → 655 K | 18.4 K → 19.3 K |
+| Turn | Delays (work / summary) | Summaries | Wall time before | Wall time after | Turn's `summary_ms` after | Work input bytes before → after | Largest request before → after |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `long:150x40`, 64 KiB budget, 1 run | 1.0 s / 4.0 s | 4 | 168.18 s | 164.19 s | 12.0 s | 4.46 M → 4.59 M | 49.3 K → 50.4 K |
+| `long:40`, 24 KiB budget, 3 runs | 0.15 s / 0.6 s | 5 | 9.69 s (9.67–9.70) | 8.91 s (8.90–8.92) | 2.25 s | 620 K → 655 K | 18.4 K → 19.3 K |
 
 ```sh
 .local/venv/bin/python -m bench.summary_beside BEFORE_BINARY AFTER_BINARY \
@@ -3524,15 +3523,21 @@ no model calls. A first run of the change alone (`8e80ef6`) measured within
   --work 0.15 --summary 0.6 --prompt long:40 --context-bytes 24576 --runs 3
 ```
 
-At 64 KiB the turn saved 15.9 s, the four summaries' whole 16 s: each ran
-beside later rounds and landed before the view needed it. At 24 KiB each
-round's results fill the remaining room, so the next boundary's view no
-longer fits and waits: the saving is about one round per summary (0.8 s of
-3.0 s). The cost is input: the calls made while a summary runs still send
-the longer view, 12% more work-call input bytes at 64 KiB and 6% at 24 KiB.
-On a provider cache most of that is a cached prefix; this screen has no
+Each summary hides the call it runs beside, so a turn saves the shorter
+of the two per summary: 4.0 s for four 1 s calls at 64 KiB, and 0.78 s
+for five 0.15 s calls at 24 KiB. The turn's own count of the time it held
+for summaries, `summary_ms`, agrees: the rest of each summary, 12.0 of
+16 s and 2.25 of 3.0 s. The cost is input: the call beside each summary sends the longer
+view, 3% more work-call input bytes at 64 KiB and 6% at 24 KiB. On a
+provider cache most of that call is a cached prefix; this screen has no
 cache, and no paid run measured the price. Request sizes stay within the
 budget in both.
+
+The design measured on 2026-10-02 (`f05caa3`) let a summary run on across
+later rounds and tools and saved the whole 16 s at 64 KiB (152.54 s), but
+its summary outlived its round across parks, approvals, interrupts and
+resumes, and each review found another state it mishandled. That result is
+superseded: the code it measured is gone.
 
 ## Compaction retry resumption
 
