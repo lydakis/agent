@@ -37,7 +37,8 @@ pub fn install(home: &Path) -> Vec<String> {
         .map(|(name, files)| (name.to_string(), *files))
         .collect();
     let records = home.join(".agent/skills");
-    match recorded(&records) {
+    let mut budget = ENTRIES;
+    match recorded(&records, &mut budget) {
         Ok(names) => skills.extend(
             names
                 .into_iter()
@@ -55,9 +56,14 @@ pub fn install(home: &Path) -> Vec<String> {
     errors
 }
 
+/// More entries than any record of the app's holds. A larger one is not its
+/// own, so it is left alone and never makes a start walk it.
+const ENTRIES: usize = 1024;
+
 /// The names in a record folder, its temporaries aside; none when it is
-/// absent.
-fn recorded(folder: &Path) -> Result<Vec<String>, String> {
+/// absent. Every entry, listed or not, spends one of `budget`; running out
+/// is an error.
+fn recorded(folder: &Path, budget: &mut usize) -> Result<Vec<String>, String> {
     let entries = match std::fs::read_dir(folder) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         entries => entries.map_err(|error| format!("{}: {error}", folder.display()))?,
@@ -65,6 +71,10 @@ fn recorded(folder: &Path) -> Result<Vec<String>, String> {
     let mut names = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| format!("{}: {error}", folder.display()))?;
+        if *budget == 0 {
+            return Err(format!("{}: more than {ENTRIES} entries", folder.display()));
+        }
+        *budget -= 1;
         if let Some(name) = entry
             .file_name()
             .to_str()
@@ -76,11 +86,22 @@ fn recorded(folder: &Path) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
+/// Sync every folder from `path`'s up to `home`, so folders a first write
+/// created are on disk with it.
+fn settle(path: &Path, home: &Path) -> Result<(), String> {
+    for folder in path.ancestors().skip(1).take_while(|f| f.starts_with(home)) {
+        std::fs::File::open(folder)
+            .and_then(|folder| folder.sync_all())
+            .map_err(|error| format!("{}: {error}", folder.display()))?;
+    }
+    Ok(())
+}
+
 /// Every file under a skill's record, as a path relative to it.
 fn recorded_files(record: &Path) -> Result<Vec<String>, String> {
-    let (mut files, mut folders) = (Vec::new(), vec![String::new()]);
+    let (mut files, mut folders, mut budget) = (Vec::new(), vec![String::new()], ENTRIES);
     while let Some(folder) = folders.pop() {
-        for name in recorded(&record.join(&folder))? {
+        for name in recorded(&record.join(&folder), &mut budget)? {
             let file = match folder.as_str() {
                 "" => name,
                 folder => format!("{folder}/{name}"),
@@ -147,14 +168,14 @@ fn install_one(home: &Path, name: &str, files: &[(&str, &str)]) -> Result<(), St
         }
         stale.push((path, written, text));
     }
-    // A file the app no longer ships goes too, unless you changed it. One
-    // already gone counts as taken, so a start that ended partway finishes.
+    // A file the app no longer ships goes too, unless you changed or removed
+    // it, which makes the skill yours like any other file.
     let mut dropped = Vec::new();
     for file in recorded_files(&record)? {
         if files.iter().all(|(shipped, _)| *shipped != file) {
             let (path, written) = (dir.join(&file), record.join(&file));
             let have = read(&path)?;
-            if have.is_some() && have != read(&written)? {
+            if have != read(&written)? {
                 return Ok(());
             }
             dropped.push((path, written));
@@ -163,10 +184,14 @@ fn install_one(home: &Path, name: &str, files: &[(&str, &str)]) -> Result<(), St
     // Mine first, then the record, so a crash between them is fixed above.
     for (path, written, text) in stale {
         crate::schedule::replace(&path, text)?;
+        settle(&path, home)?;
         crate::schedule::replace(&written, text)?;
+        settle(&written, home)?;
     }
     // Each removal is on disk before its record goes, so a power loss never
-    // leaves a file the app no longer knows it wrote.
+    // leaves a file the app no longer knows it wrote. SKILL.md goes first: a
+    // start that ends partway leaves the rest yours, and unindexed.
+    dropped.sort_by_key(|(path, _)| !path.ends_with("SKILL.md"));
     for (path, written) in dropped {
         crate::schedule::forget(&path)?;
         crate::schedule::forget(&written)?;
@@ -341,6 +366,27 @@ mod tests {
         install(&home);
         assert_eq!(std::fs::read_to_string(&mine).unwrap(), "mine");
         assert!(home.join(".agents/skills/y/SKILL.md").exists());
+
+        // One you removed makes the rest yours too.
+        install_one(&home, "z", &[("SKILL.md", "v1"), ("run.py", "v1")]).unwrap();
+        std::fs::remove_file(home.join(".agents/skills/z/run.py")).unwrap();
+        install(&home);
+        assert!(home.join(".agents/skills/z/SKILL.md").exists());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_record_too_large_to_be_the_apps_is_left_alone() {
+        let home = home("entries");
+        let record = home.join(".agent/skills/x");
+        std::fs::create_dir_all(&record).unwrap();
+        for n in 0..=ENTRIES {
+            // Hidden or not, every entry counts.
+            std::fs::write(record.join(format!(".{n}")), "").unwrap();
+        }
+        let error = install_one(&home, "x", &[]).unwrap_err();
+        assert!(error.contains("more than"), "{error}");
+        assert_eq!(std::fs::read_dir(&record).unwrap().count(), ENTRIES + 1);
         std::fs::remove_dir_all(home).unwrap();
     }
 
