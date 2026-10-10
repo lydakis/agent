@@ -33,7 +33,7 @@ const S = {
   swarms: new Map(), memberOf: new Map(),
   // Who asked for each turn another bot asked for, until it ends, and what each coordinator has yet to
   // hear about its tasks (see `wake`), and turns that ended live before the snapshot said who made their bot.
-  turnFrom: new Map(), answerTo: new Map(), forwarding: new Map(), wakes: new Map(), heldNews: [],
+  turnFrom: new Map(), turnOrigin: new Map(), answerTo: new Map(), forwarding: new Map(), wakes: new Map(), heldNews: [],
   // Bots whose finished turn the person has not looked at yet (see `shownStatus`), and turns another
   // bot asked for that the person steered into, whose end is theirs to see too.
   unseen: new Set(), wanted: new Set(),
@@ -269,12 +269,12 @@ function answerTo(name, turn, data) {
 // A task turn whose answer a trigger passes to the task's coordinator is that answer's news, not
 // news again; only an answer that does not arrive (the fire failed to pass it on) leaves it news.
 const FORWARD_MS = 15000;
-function turnNews(name, turn, status, from, callId, answered) {
+function turnNews(name, turn, status, from, callId, origin, answered) {
   const b = bot(name);
-  if (answered == null || !b || answered !== creatorOf(b)?.id) return tellLead(name, turn, status, from, callId);
+  if (answered == null || !b || answered !== creatorOf(b)?.id) return tellLead(name, turn, status, from, callId, origin);
   const key = `${name}\u0000${turn}`;
   clearTimeout(S.forwarding.get(key));
-  S.forwarding.set(key, setTimeout(() => { S.forwarding.delete(key); tellLead(name, turn, status, from); }, FORWARD_MS));
+  S.forwarding.set(key, setTimeout(() => { S.forwarding.delete(key); tellLead(name, turn, status, from, undefined, origin); }, FORWARD_MS));
 }
 function forwarded(from) {
   const key = `${from.bot}\u0000${from.turn}`;
@@ -289,8 +289,7 @@ function forgetBot(name) {
   // A coordinator gone hears nothing more, and its queued turns never end; a task gone is no news.
   if (S.wakes.has(name)) { clearTimeout(S.wakes.get(name).timer); S.wakes.delete(name); }
   for (const w of S.wakes.values()) if (w.tasks.delete(name) && !w.tasks.size) { clearTimeout(w.timer); w.timer = null; }
-  for (const key of S.turnFrom.keys()) if (key.startsWith(`${name}\u0000`)) S.turnFrom.delete(key);
-  for (const key of S.answerTo.keys()) if (key.startsWith(`${name}\u0000`)) S.answerTo.delete(key);
+  for (const map of [S.turnFrom, S.turnOrigin, S.answerTo]) for (const key of map.keys()) if (key.startsWith(`${name}\u0000`)) map.delete(key);
   for (const [key, timer] of S.forwarding) if (key.startsWith(`${name}\u0000`)) { clearTimeout(timer); S.forwarding.delete(key); }
   for (const key of S.wanted) if (key.startsWith(`${name}\u0000`)) S.wanted.delete(key);
   // Held news is this bot's; a later bot of the same name is another.
@@ -673,6 +672,7 @@ async function onEvent(ev) {
     }
     case 'accepted': {
       if (data.from?.bot) { S.turnFrom.set(`${name}\u0000${turn}`, data.from.bot); forwarded(data.from); }
+      else if (typeof data.origin === 'string') S.turnOrigin.set(`${name}\u0000${turn}`, data.origin);
       answerTo(name, turn, data);
       const b = bot(name); if (b) { b.status = 'running'; b.runningTurn = turn; b.waitingOn = []; b.turnStarted = S.live ? Date.now() : 0; b.elapsed = 0; }
       // The event that puts a prompt on the lineage names who sent it, here and on `steered`.
@@ -682,6 +682,7 @@ async function onEvent(ev) {
     }
     case 'queued': {
       if (data.from?.bot) { S.turnFrom.set(`${name}\u0000${turn}`, data.from.bot); forwarded(data.from); }
+      else if (typeof data.origin === 'string') S.turnOrigin.set(`${name}\u0000${turn}`, data.origin);
       answerTo(name, turn, data);
       // `ready` waits for a daemon-wide slot with nothing else running on the bot; `queued` sits behind its own turn.
       const b = bot(name); const behindOwn = !!b && (b.runningTurn !== null || isActive(b.status));
@@ -753,7 +754,8 @@ async function onEvent(ev) {
     case 'turn_finished': {
       const status = data.status ?? '?';
       const b = bot(name);
-      const key = `${name}\u0000${turn}`, from = S.turnFrom.get(key), answered = S.answerTo.get(key); S.turnFrom.delete(key); S.answerTo.delete(key);
+      const key = `${name}\u0000${turn}`, from = S.turnFrom.get(key), origin = S.turnOrigin.get(key), answered = S.answerTo.get(key);
+      S.turnFrom.delete(key); S.turnOrigin.delete(key); S.answerTo.delete(key);
       // A steer absorbed into a running turn finishes as its own turn while that turn goes on.
       if (b && (b.runningTurn === null || b.runningTurn === turn)) { b.runningTurn = null; b.waitingOn = []; if (b.turnStarted) b.elapsed = Date.now() - b.turnStarted; b.turnStarted = 0; b.status = status === 'completed' || status === 'steered' ? 'idle' : status; }
       const t = transcript(name);
@@ -765,7 +767,7 @@ async function onEvent(ev) {
       // A steer's turn is part of the turn it joined, whose end is the news.
       // A task's creator may still be on a snapshot page to come; its news waits for the whole snapshot.
       // Whether a trigger passes its answer to the coordinator is known once the creator is.
-      if (S.live && status !== 'steered') { if (S.snapshot) S.heldNews.push([name, turn, status, from, undefined, answered]); else turnNews(name, turn, status, from, undefined, answered); }
+      if (S.live && status !== 'steered') { if (S.snapshot) S.heldNews.push([name, turn, status, from, undefined, origin, answered]); else turnNews(name, turn, status, from, undefined, origin, answered); }
       // A coordinator coming to rest hears what waited for it.
       if (S.wakes.has(name)) wakeSoon(name);
       // A background command may outlive its turn; only a wait result says how it ended.
@@ -987,22 +989,32 @@ function enqueue(job) { chain = chain.then(job, job); return chain; }
 // tasks that ended turns or wait for an approval since it last heard, by the handles its wait tool reads
 // them with, and its role says what to do with that. A turn it is waiting on is not news, since its wait
 // reads it; nor is its own fork or side chat. Only live turns count, while this window is attached.
-// Each task keeps its first and latest turn and a count, whatever the backlog; one message names at most
-// WAKE_TASKS tasks, and the rest wait for the next.
-const WAKE_MS = 10 * 60 * 1000, WAKE_TASKS = 32;
-function tellLead(name, turn, status, from, approval) {
+// Turns you asked for in a task yourself are its `theirs` news, listed apart: the coordinator hears of
+// them but is not asked to act on them. Turns another agent or the app (a schedule, by its `origin`)
+// asked for, and approvals, are its `act` news; a turn's end goes where its pending approval is.
+// Each kind keeps its own first and latest turn and a count, whatever the backlog, so a task can be in
+// both lists with the handles each one needs; one message names at most WAKE_TASKS tasks, those with
+// news to act on first, and the rest wait for the next.
+const WAKE_MS = 10 * 60 * 1000, WAKE_TASKS = 32, KINDS = ['act', 'theirs'];
+function tellLead(name, turn, status, from, approval, origin) {
   const b = bot(name), lead = b && creatorOf(b);
   if (!lead || !leadProject(lead.name) || name.startsWith(`${lead.name}-`)) return;
   if (lead.waitingOn?.includes(`turn:${name}/${turn}`)) return;
   let w = S.wakes.get(lead.name);
   if (!w) { w = { tasks: new Map(), last: 0, timer: null }; S.wakes.set(lead.name, w); }
-  const by = status === 'waiting for approval' ? null : from === lead.name ? 'you' : from ?? 'the person';
-  merge(w.tasks, name, { first: turn, turn, status, by, count: 1, ...(approval ? { approval } : {}) });
+  const by = status === 'waiting for approval' ? null : from === lead.name ? 'you' : from ?? origin ?? 'the person';
+  const asked = w.tasks.get(name)?.act, answered = asked?.turn === turn && asked.status === 'waiting for approval';
+  merge(w.tasks, name, { [by === 'the person' && !answered ? 'theirs' : 'act']: { first: turn, turn, status, by, count: 1, ...(approval ? { approval } : {}) } });
   wakeSoon(lead.name);
 }
-function merge(tasks, name, t) {
-  const had = tasks.get(name);
-  tasks.set(name, had ? { ...(t.turn >= had.turn ? t : had), first: Math.min(had.first, t.first), count: had.count + t.count } : t);
+function merge(tasks, name, news) {
+  const had = tasks.get(name) ?? {}, out = {};
+  for (const k of KINDS) {
+    const [a, t] = [had[k], news[k]];
+    const v = a && t ? { ...(t.turn >= a.turn ? t : a), first: Math.min(a.first, t.first), count: a.count + t.count } : a ?? t;
+    if (v) out[k] = v;
+  }
+  tasks.set(name, out);
 }
 // A working coordinator waits for its turn to end, which calls this again.
 function wakeSoon(lead) {
@@ -1013,14 +1025,17 @@ function wakeSoon(lead) {
 async function wake(lead) {
   const w = S.wakes.get(lead), l = bot(lead);
   if (!w || !w.tasks.size || !S.attached || !l || l.id == null || isActive(l.status)) return;
-  const sent = [...w.tasks].slice(0, WAKE_TASKS);
+  const sent = [...w.tasks].sort(([, a], [, b]) => (b.act ? 1 : 0) - (a.act ? 1 : 0)).slice(0, WAKE_TASKS);
+  const items = sent.flatMap(([name, n]) => KINDS.filter((k) => n[k]).map((k) => [name, k, n[k]]));
   for (const [name] of sent) w.tasks.delete(name);
   w.last = Date.now();
-  // Key the latest notification per task, including its phase and approval
-  // call: one turn can need several approvals before its completion. Windows
-  // with the same news still deduplicate, regardless of earlier turn counts.
-  const prompt = wakeText(sent, w.tasks.size);
-  const id = `app-wake-${l.id}-${digest(JSON.stringify(sent.map(([name, t]) => [name, t.turn, t.status, t.approval ?? null]).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)))}`;
+  // Key the latest notification per task and kind, including its phase and
+  // approval call: one turn can need several approvals before its completion.
+  // Windows with the same news still deduplicate, regardless of earlier turn
+  // counts; a window that saw news of another kind sends its own message.
+  const prompt = wakeText(items, w.tasks.size);
+  const key = ([name, k]) => `${name}\u0000${k}`;
+  const id = `app-wake-${l.id}-${digest(JSON.stringify(items.map(([name, k, t]) => [name, k, t.turn, t.status, t.approval ?? null]).sort((a, b) => key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0)))}`;
   try { await Daemon.request('submit', { bot: lead, bot_id: l.id, request_id: id, prompt, delivery: 'queue', origin: 'tasks' }); }
   catch (e) {
     if (/^bot_not_found/.test(e?.message ?? '')) { S.wakes.delete(lead); return; }
@@ -1039,8 +1054,10 @@ function digest(text) {
   for (let i = 0; i < text.length; i++) h = BigInt.asUintN(64, (h ^ BigInt(text.charCodeAt(i))) * 0x100000001b3n);
   return h.toString(16).padStart(16, '0');
 }
-function wakeText(tasks, more) {
-  const lines = tasks.map(([name, t]) => `- ${name}: turn:${name}/${t.turn} ${t.status}${t.by ? `, asked by ${t.by}` : ''}${t.count > 1 ? `, and ${t.count - 1} earlier since turn:${name}/${t.first}` : ''}`);
+function wakeText(items, more) {
+  const line = ([name, , t]) => `- ${name}: turn:${name}/${t.turn} ${t.status}${t.by ? `, asked by ${t.by}` : ''}${t.count > 1 ? `, and ${t.count - 1} earlier since turn:${name}/${t.first}` : ''}`;
+  const lines = items.filter(([, k]) => k === 'act').map(line), theirs = items.filter(([, k]) => k === 'theirs').map(line);
+  if (theirs.length) lines.push('The person asked for these turns in the task themselves, so they are theirs:', ...theirs);
   if (more) lines.push(`- ${more} more tasks in the next update`);
   return `Task updates: since you last heard, tasks you started ended turns or wait for an approval. The wait tool reads each one's final reply by its handle.\n${lines.join('\n')}`;
 }
@@ -1185,7 +1202,7 @@ function forgetStore() {
   S.cursor = 0; S.bots.clear(); S.transcripts.clear(); S.drafts.clear(); S.override.clear(); S.effort.clear(); S.families.clear();
   S.swarms.clear(); S.memberOf.clear(); S.deleted.clear(); looked.clear();
   for (const w of S.wakes.values()) clearTimeout(w.timer);
-  S.wakes.clear(); S.turnFrom.clear(); S.answerTo.clear(); S.heldNews = [];
+  S.wakes.clear(); S.turnFrom.clear(); S.turnOrigin.clear(); S.answerTo.clear(); S.heldNews = [];
   for (const timer of S.forwarding.values()) clearTimeout(timer); S.forwarding.clear(); S.unseen.clear(); S.wanted.clear();
   S.selected = ''; S.autoSelect = true; S.ui.side = null; S.ui.folded = new Set();
   S.botsGen += 1; S.shapeGen += 1;

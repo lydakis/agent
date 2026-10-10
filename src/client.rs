@@ -1235,6 +1235,9 @@ fn run(options: &Options) -> Result<i32> {
         );
     }
     let bot = options.bot.clone().unwrap_or_else(|| unique("bot"));
+    // One key for the creation and the submission, so resending the same
+    // command gets the bot and the turn it made the first time.
+    let request_id = options.request_id.clone().unwrap_or_else(|| unique("run"));
     if created {
         // The client chooses; the bot retains. Nothing about a bot comes
         // from the daemon or from whichever client connects later.
@@ -1277,7 +1280,7 @@ fn run(options: &Options) -> Result<i32> {
             "created_by":created_by,"created_by_id":created_by_id,
             "compaction_instructions":options.compaction_instructions,
             "compaction_model":options.compaction_model,"fallbacks":options.fallbacks,
-            "settings":options.settings});
+            "settings":options.settings,"request_id":request_id});
         if let Value::Object(gate) = requested_gate(options, &tools)? {
             // Its approver first, so a missing judge leaves no bot behind.
             if gate.get("approver").is_some_and(|tag| tag == "auto") {
@@ -1294,7 +1297,6 @@ fn run(options: &Options) -> Result<i32> {
             ensure_approver(options, &mut connection, bot_model(&record))?;
         }
     }
-    let request_id = options.request_id.clone().unwrap_or_else(|| unique("run"));
     // Existing bots keep their model and effort unless --model or
     // --reasoning overrides them for this turn. AGENT_MODEL and
     // AGENT_REASONING are only creation defaults, including in a peer's shell.
@@ -1417,7 +1419,7 @@ fn fork(options: &Options) -> Result<i32> {
     let (created_by, created_by_id) = created_by()?;
     let mut request = json!({"source":source,"checkpoint":checkpoint,"bot":bot,
         "workspace":options.workspace.as_ref().map(|_| workspace(options)).transpose()?,
-        "budget_tokens":options.budget_tokens,
+        "budget_tokens":options.budget_tokens,"request_id":options.request_id,
         "created_by":created_by,"created_by_id":created_by_id});
     if let Some(allow) = &options.allow {
         let allow: Vec<&str> = allow.split(',').filter(|t| !t.is_empty()).collect();
@@ -1425,9 +1427,21 @@ fn fork(options: &Options) -> Result<i32> {
     }
     // A fork keeps its source's tools and gates; its own gate adds to them.
     // Its approver starts first, so a missing judge leaves no fork behind.
-    let state = connection.request("resume", json!({"bot":source}))?;
+    // Only a gate of the fork's own is built from the source's tools.
+    let gated =
+        options.approval.as_deref().unwrap_or("full") != "full" || options.approve.is_some();
+    let state = match connection.request("resume", json!({"bot":source})) {
+        // A keyed fork outlives its source: its resend is answered from the
+        // fork, so it needs nothing from the source.
+        Err(error) if error.code == "bot_not_found" && options.request_id.is_some() && !gated => {
+            let result = connection.request("fork", request)?;
+            print_json(&result, options.pretty)?;
+            return Ok(0);
+        }
+        state => state?,
+    };
     let mut auto = answered_by_auto(&state);
-    if options.approval.as_deref().unwrap_or("full") != "full" || options.approve.is_some() {
+    if gated {
         let tools: Vec<String> = serde_json::from_value(state["tools"].clone())
             .map_err(|_| Error::new("daemon_protocol_mismatch"))?;
         if let Value::Object(gate) = requested_gate(options, &tools)? {
@@ -1466,7 +1480,7 @@ fn remove(options: &Options) -> Result<i32> {
         .ok_or(Error::with("usage", "rm needs --bot"))?;
     let mut connection = ensure_existing_daemon(options)?;
     print_json(
-        &connection.request("delete", json!({"bot":bot}))?,
+        &connection.request("delete", json!({"bot":bot,"bot_id":options.bot_id}))?,
         options.pretty,
     )?;
     Ok(0)
