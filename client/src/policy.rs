@@ -309,11 +309,11 @@ pub struct Entry {
 }
 pub type Skill = Entry;
 
-/// Roles a client starts its own bots in: the app's coordinator and its
-/// swarms' members. A `.agents/agents` file of one of these names replaces
+/// Roles a client starts its own bots in: the app's coordinator, its swarms'
+/// members and its Home. A `.agents/agents` file of one of these names replaces
 /// the client's text for that role, so it is not a role to start a peer in,
 /// and the Profiles index leaves it out.
-pub const CLIENT_ROLES: [&str; 3] = ["coordinator", "swarm-flat", "swarm-council"];
+pub const CLIENT_ROLES: [&str; 4] = ["coordinator", "swarm-flat", "swarm-council", "home"];
 
 /// Whether a profile file's stem is a client role. Case is ignored: on a
 /// case-insensitive filesystem (macOS's default) `Coordinator.md` is the

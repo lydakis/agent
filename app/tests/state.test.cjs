@@ -36,7 +36,7 @@ function page(daemon = {}, storage = null) {
   context.Rich = context.window.Rich;
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, openFileFrom, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, fork, remove, createProject, save, restore, showMenu, refreshMenu, entries, pickerRows, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readTriggers, tellLead, markSeen, renderFile, go, upOf, crumbsHTML, railRows, renderTabs, triggerAct, turnNews, openProjectSheet, parsePlan, loadPlans, renderPlan, taskCard };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, openFileFrom, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, fork, remove, createProject, save, restore, showMenu, refreshMenu, entries, pickerRows, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readTriggers, tellLead, markSeen, renderFile, go, upOf, crumbsHTML, railRows, renderTabs, triggerAct, turnNews, openProjectSheet, parsePlan, loadPlans, renderPlan, taskCard, mainBot, closeSheet };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -1600,6 +1600,56 @@ test('fork names fit the daemon\'s 128-byte limit and forks work in the source\'
   const forks = sent.filter(([op]) => op === 'fork').map(([, q]) => q);
   // The daemon starts a fork where its source is, so the app names no folder.
   assert.deepEqual(forks.map((q) => [q.bot.length, q.bot.slice(-7), 'workspace' in q]), [[128, 'aa-fork', false], [128, '-fork-2', false]]);
+});
+
+test("Home's first message starts its agent in your home folder in the home role, and then goes to it", async () => {
+  const calls = [];
+  const p = shell({
+    models: async () => [{ id: 'alpha/one' }],
+    settings: async () => ({ providers: ['alpha'], keys: [] }),
+    homeDir: async () => '/synthetic/you',
+    policy: async (dir, profile) => { calls.push(['policy', dir, profile]); return { instructions: 'home rules', compaction_instructions: 'summary', note: 'test' }; },
+    request: async (op, q) => { calls.push([op, q]); return op === 'create' ? { name: q.bot, id: 9, provider: 'alpha', model: 'one', workspace: q.workspace } : { nodes: [], workspaces: [], next_from: null }; },
+  });
+  const el = (id) => p.context.document.getElementById(id);
+  assert.equal(p.mainBot(), '');
+  await p.submit('what is running?');
+  assert.equal(calls.length, 0, 'nothing is made before a model is picked');
+  assert.match(el('sheet').innerHTML, /<h4>Start Home<\/h4>/);
+  assert.match(el('sheet').innerHTML, /id="hm-model"/);
+  el('hm-model').value = 'alpha/one'; el('hm-effort').value = 'high';
+  await el('sheet').listeners.submit({ preventDefault() {} }); await settle();
+  assert.deepEqual(calls.find(([op]) => op === 'policy').slice(1), ['/synthetic/you', 'home']);
+  const create = calls.find(([op]) => op === 'create')[1];
+  assert.deepEqual([create.bot, create.workspace, create.model, create.reasoning, create.instructions], ['home', '/synthetic/you', 'alpha/one', 'high', 'home rules']);
+  const sent = () => calls.filter(([op]) => op === 'submit').map(([, q]) => [q.bot, q.bot_id, q.prompt]);
+  assert.deepEqual(sent(), [['home', 9, 'what is running?']]);
+  // At Home its chat is the main pane, so the next message goes straight to it.
+  assert.equal(p.S.selected, ''); assert.equal(p.mainBot(), 'home');
+  await p.submit('and what waits on me?');
+  assert.deepEqual(sent().at(-1), ['home', 9, 'and what waits on me?']);
+  assert.equal(calls.filter(([op]) => op === 'create').length, 1);
+});
+
+test("Home's agent is Home: no row, no tab, no crumb, and a closed Start Home gives the message back", async () => {
+  const p = shell({ models: async () => [], settings: async () => ({ providers: [], keys: [] }) });
+  p.upsert({ name: 'home', id: 1, provider: 'alpha', model: 'one' });
+  p.upsert({ name: 'app.lead', id: 2, provider: 'alpha', model: 'one' });
+  p.upsert({ name: 'home-side', id: 3, provider: 'alpha', model: 'one', created_by: 'home', created_by_id: 1 });
+  p.S.shapeGen += 1;
+  assert.deepEqual(names(p.railRows()), ['app.lead']);
+  await p.go('home');
+  assert.equal(p.S.selected, ''); assert.deepEqual(Array.from(p.S.ui.tabs), []);
+  assert.equal(p.upOf('home-side'), '');
+  const head = p.context.document.getElementById('title');
+  p.renderHead(head, p.S.bots.get('home'), 'main');
+  assert.match(head.innerHTML, /^<div class="crumbs"><b>Home<\/b><span class="glyph/);
+  // Before Home's agent exists, Cancel puts the message back in the composer.
+  const q = shell({ models: async () => [], settings: async () => ({ providers: [], keys: [] }) });
+  await q.submit('hello');
+  assert.match(q.elements.get('sheet').innerHTML, /No models listed/);
+  q.closeSheet();
+  assert.equal(q.context.document.getElementById('input').value, 'hello');
 });
 
 test('a new project creates its coordinator in the folder, in its role, writes its file once, and is not made twice', async () => {
