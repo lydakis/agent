@@ -369,16 +369,14 @@ fn capture(mut command: Command, limit: u64) -> Result<Output, String> {
     })
 }
 
-/// git for the tab: it takes no lock an agent's own git would wait on, and
-/// names paths as they are.
+/// git for the tab: it takes no lock an agent's own git would wait on, fetches
+/// nothing a partial clone left out, and names paths as they are.
 fn run(at: &Path) -> Command {
     let mut command = git(at);
-    command.env("GIT_OPTIONAL_LOCKS", "0").args([
-        "-c",
-        "core.quotePath=false",
-        "-c",
-        "color.ui=false",
-    ]);
+    command
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .args(["-c", "core.quotePath=false", "-c", "color.ui=false"]);
     command
 }
 

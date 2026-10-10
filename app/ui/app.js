@@ -1269,7 +1269,7 @@ function forgetStore() {
   for (const w of S.wakes.values()) clearTimeout(w.timer);
   S.wakes.clear(); S.turnFrom.clear(); S.turnOrigin.clear(); S.answerTo.clear(); S.heldNews = []; S.answered.clear();
   for (const timer of S.forwarding.values()) clearTimeout(timer); S.forwarding.clear(); S.unseen.clear(); S.wanted.clear();
-  S.selected = ''; S.ui.tabs = []; S.ui.side = null; dropFile(); dropTabFile();
+  S.selected = ''; S.ui.tabs = []; S.ui.side = null; S.ui.gitFrom.clear(); dropFile(); dropTabFile();
   S.botsGen += 1; S.shapeGen += 1;
   // A home the last host named is not this one's.
   if (S.homeWorkspace) { S.config.workspace = null; S.homeWorkspace = false; }
@@ -1853,10 +1853,11 @@ async function readDiff(g, fresh = false) {
   if (S.ui.git.get(g.dir) === g) render();
 }
 // A diff as rows, each line numbered on its side: `o` before the change, `n` after. A commit's
-// diff holds several files, each row knowing its own (`p`). Past `DIFF_ROWS` rows only a count is kept.
+// diff holds several files, each row knowing its own (`p`): a removed line the file it was removed
+// from, which a rename names apart from where the file is now. Past `DIFF_ROWS` rows only a count is kept.
 const DIFF_ROWS = 5000;
 function diffRows(text, path) {
-  const rows = []; let o = 0, n = 0, p = path, hunk = false, more = 0, from = null;
+  const rows = []; let o = 0, n = 0, p = path, was = path, hunk = false, more = 0, from = null;
   const lines = text.split('\n'); if (lines.at(-1) === '') lines.pop();
   for (const l of lines) {
     if (rows.length >= DIFF_ROWS) { more += 1; continue; }
@@ -1864,8 +1865,9 @@ function diffRows(text, path) {
     if (!hunk) {
       if (l.startsWith('--- ')) { from = l.slice(4); continue; }
       if (l.startsWith('+++ ')) {
-        const to = l.slice(4), named = to === '/dev/null' ? from : to;
-        p = named && named !== '/dev/null' ? named.replace(/^[ab]\//, '') : p;
+        const to = l.slice(4), named = to === '/dev/null' ? from : to, strip = (x) => x.replace(/^[ab]\//, '');
+        p = named && named !== '/dev/null' ? strip(named) : p;
+        was = from && from !== '/dev/null' ? strip(from) : p;
         rows.push({ k: 'file', t: p ?? '' }); continue;
       }
       if (l.startsWith('index ')) continue;
@@ -1877,7 +1879,7 @@ function diffRows(text, path) {
     if (!hunk) { rows.push({ k: 'meta', t: l }); continue; }
     const c = l[0];
     if (c === '+') rows.push({ k: 'add', t: l, n: n++, p });
-    else if (c === '-') rows.push({ k: 'del', t: l, o: o++, p });
+    else if (c === '-') rows.push({ k: 'del', t: l, o: o++, p: was });
     else if (c === ' ') rows.push({ k: 'ctx', t: l, o: o++, n: n++, p });
     else rows.push({ k: 'meta', t: l });
   }
@@ -1905,8 +1907,10 @@ async function openGit(who) {
   S.ui.gitFrom.set(dir, [who, b.id]);
   await go(GIT + dir, 'tab');
 }
-// A sent note stays under the line it is about, by what the line holds, as lines above it come and go.
+// A sent note stays under the line it is about, by what the line holds and which of the lines
+// holding the same it is, as other lines come and go.
 const noteKey = (of, r) => `${of}\u0000${r.p ?? ''}\u0000${r.k}\u0000${r.t}`;
+function nthSame(rows, at) { const r = rows[at]; let n = 0; for (let i = 0; i < at; i += 1) { const x = rows[i]; if (x.k === r.k && x.p === r.p && x.t === r.t) n += 1; } return n; }
 const NOTE_QUOTE = 300;
 // The note names the file and line as the agent's folder names them, quotes the line, then says
 // what was typed; a commit's names the commit too.
@@ -1934,7 +1938,7 @@ async function sendNote(g, text) {
   try {
     // A note waits for a working agent's turn to end, as a queued message does.
     await submit(noteText(g, r, text), 'main', owner.name, isActive(owner.status) ? 'queue' : 'send');
-    const key = noteKey(d.of, r); g.notes.set(key, [...(g.notes.get(key) ?? []), text]);
+    const key = `${noteKey(d.of, r)}\u0000${at >= 0 ? nthSame(d.rows, at) : 0}`; g.notes.set(key, [...(g.notes.get(key) ?? []), text]);
     toast(`sent to ${shortName(owner)}`);
   } catch (e) { g.note = note; g.draft = text; toast(String(e?.message ?? e), 4000); }
   g.gen += 1; render(); focusInput('main');
@@ -1995,7 +1999,8 @@ function gitDiffHTML(g) {
     : `<div class="ghead"><b>${esc(it.path)}</b> <span class="d">· ${esc(changeWord(it.code))}${it.code.includes('D') || it.path.endsWith('/') ? '' : ' · Enter opens it'}</span></div>`;
   if (!d || (d.state === 'loading' && !d.rows.length)) return `${head}<div class="gnote">reading…</div>`;
   if (d.state === 'error') return `${head}<div class="line out bad">${esc(d.error)}</div>`;
-  const owner = gitOwner(g.dir), sent = (r) => (g.notes.get(noteKey(d.of, r)) ?? []).map((t) => `<div class="dsent">› ${esc(t)}</div>`).join('');
+  const owner = gitOwner(g.dir), seen = new Map();
+  const sent = (r) => { const key = noteKey(d.of, r), n = seen.get(key) ?? 0; seen.set(key, n + 1); return (g.notes.get(`${key}\u0000${n}`) ?? []).map((t) => `<div class="dsent">› ${esc(t)}</div>`).join(''); };
   const at = owner ? noteRow(g) : -1;
   const input = (what) => `<div class="dcm"><input id="gnote" placeholder="Tell ${esc(shortName(owner))} about ${what}…" autocomplete="off" spellcheck="false" aria-label="Note on this line"><span class="to">↵ to ${esc(shortName(owner))} · Esc</span></div>`;
   // A note whose line is gone from the diff stays open above it, on the line as it was clicked.

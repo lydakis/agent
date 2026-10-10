@@ -3946,8 +3946,22 @@ test('a diff is read into numbered rows, each knowing its file, up to a bound', 
     ['meta', null, null, null], ['file', null, null, null], ['hunk', null, null, null], ['del', 1, null, 'y'],
   ]);
   assert.equal(rows[0].t, 'x'); assert.equal(rows[7].t, 'y');
+  // A renamed file's removed lines were in the file it was renamed from.
+  const moved = p.diffRows('diff --git a/old.rs b/new.rs\nsimilarity index 90%\nrename from old.rs\nrename to new.rs\n--- a/old.rs\n+++ b/new.rs\n@@ -1,2 +1,2 @@\n a\n-b\n+c\n', 'new.rs').rows;
+  assert.deepEqual(Array.from(moved.filter((r) => r.p), (r) => [r.k, r.p]), [['ctx', 'new.rs'], ['del', 'old.rs'], ['add', 'new.rs']]);
   const long = p.diffRows(`@@ -1,0 +1,6000 @@\n${'+l\n'.repeat(6000)}`, 'z');
   assert.equal(long.rows.length, 5000); assert.equal(long.more, 1001);
+});
+
+test('a sent note shows under the one line it is about when the diff holds the same line twice', async () => {
+  const { p, doc } = gitPage({ gitDiff: async () => ({ text: 'diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,0 +1,4 @@\n+}\n+x\n+}\n+y\n', cut: false }) });
+  await p.go('⎇/w', 'tab'); await settle();
+  const g = p.S.ui.git.get('/w'), second = g.diff.rows.findLastIndex((r) => r.t === '+}');
+  doc.listeners.click({ detail: 1, target: { closest: (s) => (s === '[data-dl]' ? { dataset: { dl: String(second) } } : s === '#log' ? {} : null) } });
+  await doc.listeners.keydown({ key: 'Enter', target: { id: 'gnote', value: 'this one', closest: () => null }, preventDefault() {} }); await settle();
+  const html = doc.getElementById('log').innerHTML;
+  assert.equal(html.match(/class="dsent"/g).length, 1);
+  assert.match(html, /<span class="no">3<\/span><span class="tx">\+\}<\/span><\/div><div class="dsent">› this one<\/div>/);
 });
 
 test('a note keeps the line it was opened on when the diff is read again under it, and goes to the agent that opened the tab only while it is that agent', async () => {
