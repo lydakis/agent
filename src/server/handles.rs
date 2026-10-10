@@ -361,7 +361,10 @@ impl Handles {
                     .op("process_result", move |db| db.process_result(id))
                     .await
                 {
-                    Ok(None) => Some((json!({"error":"unknown_handle"}), false)),
+                    Ok(None) => Some((
+                        json!({"error":"unknown_handle","detail":format!("no command {id}")}),
+                        false,
+                    )),
                     Ok(Some((_, Some(result)))) => Some((result, true)),
                     Ok(Some((_, None))) => None,
                     Err(error) => Some((json!({"error":error.code,"detail":error.detail}), false)),

@@ -29,14 +29,14 @@ function page(daemon = {}, storage = null) {
     Daemon: transport, console, queueMicrotask, crypto: require('node:crypto').webcrypto, TextDecoder,
     document: { getElementById(id) { if (!elements.has(id)) elements.set(id, element()); return elements.get(id); }, listeners: {}, addEventListener(type, fn) { this.listeners[type] = fn; },
       createElement: element, createTextNode: () => ({ data: '', appended: 0, appendData(s) { this.data += s; this.appended += s.length; } }) },
-    window: { addEventListener() {} }, localStorage: storage ? { getItem: k => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, String(v)) } : { getItem() { return null; } },
+    window: { listeners: {}, addEventListener(type, fn) { this.listeners[type] = fn; } }, localStorage: storage ? { getItem: k => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, String(v)) } : { getItem() { return null; } },
     setTimeout(fn) { const id = ++timer; timers.set(id, fn); return id; }, clearTimeout(id) { timers.delete(id); }, setInterval() {},
   });
-  for (const file of ['../ui/vendor/marked.js', '../ui/rich.js']) vm.runInContext(fs.readFileSync(require.resolve(file), 'utf8'), context);
+  for (const file of ['../ui/vendor/markdown-it.js', '../ui/rich.js']) vm.runInContext(fs.readFileSync(require.resolve(file), 'utf8'), context);
   context.Rich = context.window.Rich;
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, go, upOf, crumbsHTML, railRows, renderTabs, save, restore, showMenu, refreshMenu, entries, pickerRows, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules, tellLead, markSeen, renderFile };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, save, restore, showMenu, refreshMenu, entries, pickerRows, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules, tellLead, markSeen, renderFile, go, upOf, crumbsHTML, railRows, renderTabs };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -140,10 +140,10 @@ test('messages draw as Markdown with raw HTML, scripts and remote fetches kept o
   assert.match(html, /<strong>bold<\/strong>/);
   assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;/);
   assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
-  assert.match(html, /<a href="https:\/\/example.com">ok<\/a>/);
+  assert.match(html, /<a href="#" data-href="https:\/\/example.com">ok<\/a>/);
   assert.doesNotMatch(html, /javascript:/);
   assert.doesNotMatch(html, /<img/);
-  assert.match(html, /<a href="https:\/\/example.com\/p.png">pic<\/a>/);
+  assert.match(html, /<a href="#" data-href="https:\/\/example.com\/p.png">pic<\/a>/);
   assert.match(html, /<table>/);
   assert.match(html, /type="checkbox"/);
 });
@@ -156,8 +156,8 @@ test('fenced blocks become code, previews, diagrams and images by their language
   assert.match(Rich.html('```html\n<b>hi</b>\n```'), /data-kind="html" data-view="code"/);
   assert.match(Rich.html('```mermaid\ngraph TD\nA-->B\n```'), /data-kind="mermaid".*A--&gt;B/s);
   // A diagram in a message draws when asked; one in a file someone opened draws at once.
-  assert.match(Rich.html('```mermaid\ngraph TD\n```'), /data-kind="mermaid" data-lazy data-id="#\d+" data-view="code"/);
-  assert.match(Rich.file('/w/flow.mmd', new TextEncoder().encode('graph TD')).html, /data-kind="mermaid" data-lazy data-run/);
+  assert.match(Rich.html('```mermaid\ngraph TD\n```'), /data-kind="mermaid" data-lazy data-view="code"/);
+  assert.match(Rich.file('/w/flow.mmd', new TextEncoder().encode('graph TD')).html, /data-kind="mermaid" data-lazy data-page/);
   const svg = Rich.html('```svg\n<svg xmlns="http://www.w3.org/2000/svg"><circle r="4"/></svg>\n```');
   // An SVG draws as an image, and in a message only when asked: its filters and animations take CPU.
   assert.match(svg, /data-kind="svg" data-view="code"/);
@@ -170,7 +170,7 @@ test('fenced blocks become code, previews, diagrams and images by their language
   assert.doesNotMatch(png, /<img/);
   assert.match(png, /<button type="button" class="img" data-img="data:image\/png;base64,iVBORw0KGgo=" title="dot">image: dot<\/button>/);
   assert.match(Rich.html('![flow](docs/flow.png)'), /<a class="file" href="#" data-file="docs\/flow.png">flow<\/a>/);
-  assert.match(Rich.html('![r](https://example.com/r.png)'), /<a href="https:\/\/example.com\/r.png">r<\/a>/);
+  assert.match(Rich.html('![r](https://example.com/r.png)'), /<a href="#" data-href="https:\/\/example.com\/r.png">r<\/a>/);
 });
 
 test('a table too wide or too large shows as its source; a modest one draws', () => {
@@ -236,50 +236,96 @@ test('highlighting arriving redraws only messages whose code waited for it', () 
   assert.equal(calls, 3);
 });
 
-test('a diagram someone asked for shows again; an identical one elsewhere still asks', async () => {
+test('a diagram draws when clicked, and a pane drawn anew asks again, drawing from the cache', async () => {
   const p = page(), c = p.context, Rich = c.Rich; let renders = 0;
   c.document.head = { append(s) { s.onload(); } };
   c.getComputedStyle = () => ({ getPropertyValue: () => '' });
   c.mermaid = { initialize() {}, render: async (id, src) => { renders++; return { svg: `<svg>${src}</svg>` }; } };
-  const box = (id, src = 'graph TD') => { const view = { innerHTML: '' }, pre = { textContent: src };
-    return { dataset: { kind: 'mermaid', lazy: '', view: 'code', id }, clientWidth: 0, view, closest: () => null, querySelector: (s) => s === 'pre' ? pre : s === '.view' ? view : null }; };
-  const asked = box('1'), button = { dataset: { rich: 'view' }, closest: () => asked };
-  Rich.click({ target: { closest: (s) => s === '[data-rich]' ? button : null }, preventDefault() {} });
+  const box = (src = 'graph TD') => { const view = { innerHTML: '' }, pre = { textContent: src };
+    return { dataset: { kind: 'mermaid', lazy: '', view: 'code' }, clientWidth: 0, view, closest: () => null, querySelector: (s) => s === 'pre' ? pre : s === '.view' ? view : null }; };
+  const click = (b) => { const btn = { dataset: { rich: 'view' }, closest: () => b }; Rich.click({ target: { closest: (s) => s === '[data-rich]' ? btn : null }, preventDefault() {} }); };
+  const asked = box(); click(asked);
   await new Promise((r) => setImmediate(r));
   assert.equal(asked.view.innerHTML, '<svg>graph TD</svg>'); assert.equal(renders, 1);
-  // The pane drawn anew: the block asked for shows from the cache, its twin stays code.
-  const again = box('1'), twin = box('2');
-  Rich.hydrate({ querySelectorAll: () => [again, twin] });
-  assert.equal(again.view.innerHTML, '<svg>graph TD</svg>'); assert.equal(twin.view.innerHTML, ''); assert.equal(renders, 1);
-  // A block handed in on its own is hydrated too, as a streamed reply's new blocks are.
-  const alone = box('1'); alone.matches = () => true; alone.querySelectorAll = () => [];
-  Rich.hydrate(alone); assert.equal(alone.view.innerHTML, '<svg>graph TD</svg>');
-  // One asked for whose drawing is no longer kept (a chart at a new width) draws anew.
-  const moved = box('1', 'graph LR'); Rich.hydrate({ querySelectorAll: () => [moved] });
+  // The pane drawn anew: nothing remembers the click, so the block is code until clicked again,
+  // which draws it from the cache at once.
+  const again = box(); Rich.hydrate({ querySelectorAll: () => [again] });
+  assert.equal(again.view.innerHTML, '');
+  click(again); assert.equal(again.view.innerHTML, '<svg>graph TD</svg>'); assert.equal(renders, 1);
+  // A file someone opened draws at once.
+  const page_ = box('graph LR'); page_.dataset.page = ''; Rich.hydrate({ querySelectorAll: () => [page_] });
   await new Promise((r) => setImmediate(r));
-  assert.equal(moved.view.innerHTML, '<svg>graph LR</svg>'); assert.equal(renders, 2);
-  // Only the last 1,024 asked for are remembered.
-  for (let i = 3; i <= 1027; i++) { const b = box(String(i)), btn = { dataset: { rich: 'view' }, closest: () => b }; Rich.click({ target: { closest: (s) => s === '[data-rich]' ? btn : null }, preventDefault() {} }); }
-  const old = box('1'), recent = box('1027'); Rich.hydrate({ querySelectorAll: () => [old, recent] });
-  assert.equal(old.view.innerHTML, ''); assert.equal(recent.view.innerHTML, '<svg>graph TD</svg>');
+  assert.equal(page_.view.innerHTML, '<svg>graph LR</svg>'); assert.equal(renders, 2);
+  // A reader below a block that draws keeps their place.
+  let h = 1000; const pane = { scrollTop: 500, clientHeight: 100, get scrollHeight() { return h; }, getBoundingClientRect: () => ({ top: 0 }) };
+  const b = box(); b.closest = (s) => s === '.scroll' ? pane : null; b.getBoundingClientRect = () => ({ bottom: -10 });
+  let html = ''; Object.defineProperty(b.view, 'innerHTML', { get: () => html, set: (v) => { html = v; h += 300; } });
+  click(b); assert.equal(html, '<svg>graph TD</svg>'); assert.equal(pane.scrollTop, 800);
 });
 
-test('a diagram asked for while its reply streamed stays shown once the reply is committed', async () => {
+test('a reply\'s diagram is code while it streams, and can be drawn once it is in', async () => {
   const reply = 'First:\n\n```mermaid\ngraph TD\n```\n\nand on.';
-  const p = page({ request: async () => ({ type: 'message', role: 'assistant', content: [{ type: 'text', text: reply }] }) }), Rich = p.context.Rich, t = p.transcript('Bob');
-  const idOf = (html) => html.match(/data-id="([^"]*)"/)[1];
+  const p = page({ request: async () => ({ type: 'message', role: 'assistant', content: [{ type: 'text', text: reply }] }) }), t = p.transcript('Bob');
   t.streamingTurn = 7; t.streamGen = 1; t.text = '';
   const el = { dataset: {}, children: [], replaceChildren(...nodes) { this.children = nodes; } };
   for (const ch of reply) { t.text += ch; p.renderTail(el, 'Bob', t); }
-  const streamed = idOf(el.children[0].children.map((c) => c.html).join(''));
+  const streamed = el.children[0].children.map((c) => c.html).join('');
+  assert.match(streamed, /data-kind="code"><div class="rh"><span class="lang">mermaid/); assert.doesNotMatch(streamed, /data-lazy|data-rich="view"/);
   await p.onEvent({ event: 'message', bot: 'Bob', turn: 7, data: { node: 3 } }); await p.loadBatch('Bob');
   const text = t.items.find((it) => it.kind === 'text');
-  assert.equal(idOf(p.textHTML(text)), streamed);
-  // Drawn anew when highlighting arrives, it keeps the id; in another turn or file, or changed, it asks.
-  text.htmlOf = null; assert.equal(idOf(p.textHTML(text)), streamed);
-  assert.notEqual(idOf(Rich.html(reply, { lines: 0, tags: 0, code: 0, scope: 'Bob|8' })), streamed);
-  assert.notEqual(idOf(Rich.html(reply.replace('TD', 'LR'), { lines: 0, tags: 0, code: 0, scope: 'Bob|7' })), streamed);
-  assert.notEqual(idOf(Rich.file('/w/d.md', new TextEncoder().encode(reply), false, false).html), streamed);
+  assert.match(p.textHTML(text), /data-kind="mermaid" data-lazy data-view="code">.*data-rich="view"/);
+});
+
+test('a message\'s later blocks are drawn anew when an earlier one\'s share of its bounds changes', () => {
+  const p = page(), list = '- x\n'.repeat(20000);
+  const es = p.entries({ role: 'assistant', content: [{ type: 'text', text: 'short' }, { type: 'tool_use', id: 'c1', name: 'read', input: {} }, { type: 'text', text: list }] });
+  const [first, later] = es.filter((e) => e.kind === 'text');
+  p.textHTML(first); assert.match(p.textHTML(later), /<li>/);
+  // The first block draws again with far more tags (as highlighting arriving can make it): the later one is past the bound.
+  first.text = '- y\n'.repeat(40000); p.textHTML(first);
+  assert.doesNotMatch(p.textHTML(later), /<li>/);
+});
+
+test('Markdown parses in time that grows with its length, for runs of markers too', () => {
+  const p = page(), Rich = p.context.Rich;
+  const took = (s) => { const t0 = process.hrtime.bigint(); Rich.html(s); return Number(process.hrtime.bigint() - t0) / 1e6; };
+  for (const unit of ['!', '![', '[', '*x', '_a', '`a``']) {
+    took(unit.repeat(2000));
+    const small = took(unit.repeat(10000)), large = took(unit.repeat(40000));
+    assert.ok(large < 12 * Math.max(small, 2), `${unit}: ${small.toFixed(1)} ms at 10k, ${large.toFixed(1)} ms at 40k`);
+  }
+  // A line of them past the bound is not parsed at all.
+  assert.match(Rich.html('!'.repeat(200000)), /<span class="lang">text<\/span>/);
+});
+
+test('a message\'s parsing counts toward the window\'s bound', () => {
+  const p = page(), it = { kind: 'text', text: '*x* '.repeat(1000) };
+  p.textHTML(it);
+  assert.ok(it.bytes >= 16 * 2000, `${it.bytes} bytes for 2,000 marks`);
+});
+
+test('a reference used many times copies at most 1 Mi characters of targets into the page', () => {
+  const p = page(), Rich = p.context.Rich, target = 'https://example.com/' + 'a'.repeat(100000);
+  const out = Rich.html(`[x][a] `.repeat(5000) + `\n\n[a]: ${target}`);
+  assert.ok(out.length < 2 * 1024 * 1024, `${out.length} characters`);
+  assert.equal((out.match(/data-href=/g) ?? []).length, 10);
+  // The budget is shared by the pieces of one message, as a streamed reply's are.
+  const used = { lines: 0, tags: 0, code: 0 }, piece = `[x][a]\n\n[a]: ${target}\n\n`;
+  let links = 0; for (let i = 0; i < 20; i++) links += (Rich.html(piece, used).match(/data-href=/g) ?? []).length;
+  assert.equal(links, 10);
+  // Targets are charged as written into the page, escaped.
+  const quoted = Rich.html(`[x][q] `.repeat(10) + `\n\n[q]: https://example.com/${"'".repeat(100000)}`);
+  assert.ok(quoted.length < 2 * 1024 * 1024, `${quoted.length} characters`);
+  assert.equal((quoted.match(/data-href=/g) ?? []).length, 2);
+});
+
+test('the text blocks of one message share the bound on marks parsed', () => {
+  const p = page(), bang = '!'.repeat(99000), content = [];
+  for (let i = 0; i < 7; i++) content.push({ type: 'text', text: bang }, { type: 'tool_use', id: `c${i}`, name: 'read', input: {} });
+  const texts = p.entries({ role: 'assistant', content }).filter((e) => e.kind === 'text');
+  assert.equal(texts.length, 7);
+  assert.doesNotMatch(p.textHTML(texts[0]), /<span class="lang">text<\/span>/);
+  for (const t of texts.slice(1)) assert.match(p.textHTML(t), /<span class="lang">text<\/span>/);
 });
 
 test('a diagram that failed to draw asks again before it is tried again', async () => {
@@ -308,6 +354,42 @@ test('a file opened while the side pane opens is drawn once the pane has its wid
   assert.equal(hydrated, 1);
 });
 
+test('drawn HTML is kept for the transcripts on screen and the most recent others up to 16 MiB', () => {
+  const p = page(), MiB = 1024 * 1024;
+  const fill = (name) => { const t = p.transcript(name), it = { kind: 'text', text: 'x', html: '<p>x</p>', htmlOf: 'x', drawnBytes: 9 * MiB, bytes: 9 * MiB + 1 }; t.items.push(it); t.bytes = it.bytes; return it; };
+  const a = fill('A'), b = fill('B'), c = fill('C');
+  p.releaseDrawn(['A']); p.releaseDrawn(['B']); p.releaseDrawn(['C', 'A']);
+  // A is on screen again, B the most recent other: all kept.
+  assert.ok(a.html && b.html && c.html);
+  p.releaseDrawn(['C']);
+  // Off screen now: A (shown last, kept) and B (past 16 MiB, let go, its bytes returned).
+  assert.ok(a.html && c.html); assert.equal(b.html, undefined);
+  assert.equal(b.bytes, 1); assert.equal(p.transcript('B').bytes, 1);
+  // Shown again, it is drawn anew.
+  assert.match(p.textHTML(b, p.transcript('B')), /<p>x<\/p>/);
+});
+
+test('highlighting arriving redraws only a pane with code waiting for it', () => {
+  const p = page(), t = p.transcript('Bob'), el = { dataset: { who: 'Bob' }, lastElementChild: null };
+  t.items.push({ kind: 'text', text: 'just words' }); p.textHTML(t.items[0]);
+  assert.equal(p.waitsForHighlight(el), false);
+  t.items.push({ kind: 'text', text: '```rust\nfn a() {}\n```' }); p.textHTML(t.items[1]);
+  assert.equal(p.waitsForHighlight(el), true);
+  // A streamed reply's code waits too.
+  const u = p.transcript('Ann'), tail = { dataset: {}, replaceChildren() {} }, side = { dataset: { who: 'Ann' }, lastElementChild: tail };
+  u.streamingTurn = 1; u.streamGen = 1; u.text = 'words\n\n'; p.renderTail(tail, 'Ann', u);
+  assert.equal(p.waitsForHighlight(side), false);
+  u.text += '```rust\nfn a() {}\n```\n\n'; p.renderTail(tail, 'Ann', u);
+  assert.equal(p.waitsForHighlight(side), true);
+});
+
+test('a link\'s own menu is not offered, as it would follow the link in the window', () => {
+  const p = page(); let prevented = 0;
+  const target = { closest: (s) => s === 'a' ? {} : null };
+  p.context.document.listeners.contextmenu({ target, preventDefault() { prevented++; } });
+  assert.equal(prevented, 1);
+});
+
 test('highlighting arriving redraws a file beside only when its code waited for it', () => {
   const p = page(), c = p.context, R = c.Rich, enc = (s) => new TextEncoder().encode(s); let v = 0, files = 0;
   c.Rich = { file: (...a) => { files++; return R.file(...a); }, get version() { return v; }, hydrate() {} };
@@ -318,18 +400,66 @@ test('highlighting arriving redraws a file beside only when its code waited for 
   v = 2; p.renderFile(); assert.equal(files, 3);
 });
 
+test('a file drawn again keeps the reader\'s place; another file starts at its top', () => {
+  const p = page(), enc = (s) => new TextEncoder().encode(s), el = p.elements.get('side') ?? p.context.document.getElementById('side');
+  p.S.ui.file = { bot: 'Bob', full: '/w/a.rs', gen: 2, state: 'ok', bytes: enc('fn a() {}'), more: false, url: null }; p.renderFile();
+  el.scrollTop = 300; p.S.ui.file.gen = 3; p.renderFile();
+  assert.equal(el.scrollTop, 300);
+  p.S.ui.file = { bot: 'Bob', full: '/w/b.rs', gen: 4, state: 'ok', bytes: enc('fn b() {}'), more: false, url: null }; p.renderFile();
+  assert.equal(el.scrollTop, 0);
+});
+
+test('Escape in a preview the reader is in closes the file it shows', async () => {
+  const p = page({ readFile: async () => new TextEncoder().encode('<button>x</button>') }), c = p.context, win = {};
+  p.setRender(() => {}); await p.openFile('Bob', '/w/p.html');
+  const frame = { contentWindow: win, closest: (s) => s === '.fview' ? {} : null };
+  c.document.querySelectorAll = (s) => s === '.rc iframe' ? [frame] : [];
+  // A page the reader is not in cannot close it.
+  c.window.listeners.message({ source: win, data: { rich: 'escape' } });
+  assert.ok(p.S.ui.file);
+  c.document.activeElement = frame;
+  c.window.listeners.message({ source: win, data: { rich: 'escape' } });
+  assert.equal(p.S.ui.file, null);
+});
+
+test('a file closed and opened again never shares a view key with the one before', async () => {
+  const p = page({ readFile: async () => new TextEncoder().encode('{}') });
+  p.setRender(() => {});
+  await p.openFile('Bob', '/w/c.vl.json'); const first = p.S.ui.file.gen;
+  p.dropFile(); const again = p.openFile('Bob', '/w/c.vl.json');
+  assert.ok(p.S.ui.file.gen > first, `${p.S.ui.file.gen} after ${first}`);
+  await again; assert.ok(p.S.ui.file.gen > first + 1);
+});
+
 test('a file an agent rewrote while open waits for a click to run', async () => {
   const enc = (s) => new TextEncoder().encode(s), opened = [];
   const p = page({ readFile: async (full) => { opened.push(full); return enc('<p>hi</p>'); } }), Rich = p.context.Rich;
   assert.match(Rich.file('/w/p.html', enc('<p>hi</p>')).html, /data-kind="html" data-view="view"/);
   assert.match(Rich.file('/w/p.html', enc('<p>hi</p>'), false, false).html, /data-kind="html" data-view="code"/);
-  assert.match(Rich.file('/w/d.mmd', enc('graph TD'), false, false).html, /data-lazy data-id="file \/w\/d\.mmd\|mermaid\|[^"]+"/);
+  assert.match(Rich.file('/w/d.mmd', enc('graph TD'), false, false).html, /data-lazy data-view="code"/);
   p.S.config = { workspace: '/w' };
   p.S.ui.file = { bot: 'Bob', full: '/w/p.html', asked: true, gen: 2, state: 'ok', bytes: enc('<p>hi</p>'), more: false, url: null };
   await p.onEvent({ event: 'tool_started', bot: 'Bob', turn: 1, data: { call_id: 'w1', name: 'write', arguments: JSON.stringify({ path: 'p.html', content: 'x' }) } });
   await p.onEvent({ event: 'tool_completed', bot: 'Bob', turn: 1, data: { call_id: 'w1' } });
   await settle();
   assert.deepEqual(opened, ['/w/p.html']); assert.equal(p.S.ui.file.asked, false);
+  // A write that failed or was refused changed nothing: what is shown stays as it is.
+  for (const [id, extra] of [['w2', { failed: true }], ['w3', { denied: true }]]) {
+    await p.onEvent({ event: 'tool_started', bot: 'Bob', turn: 1, data: { call_id: id, name: 'edit', arguments: JSON.stringify({ path: 'p.html' }) } });
+    await p.onEvent({ event: 'tool_completed', bot: 'Bob', turn: 1, data: { call_id: id, ...extra } });
+  }
+  await settle();
+  assert.deepEqual(opened, ['/w/p.html']);
+});
+
+test('an SVG file is drawn after a declaration, comments and a doctype', () => {
+  const p = page(), Rich = p.context.Rich, enc = (s) => new TextEncoder().encode(s);
+  const svg = '<?xml version="1.0"?>\n<!-- Generator: tool -->\n<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "x.dtd" [ <!ENTITY a "b"> ]>\n<svg xmlns="http://www.w3.org/2000/svg"/>';
+  assert.match(Rich.file('/w/a.svg', enc(svg)).html, /data-kind="svg"/);
+  assert.doesNotMatch(Rich.file('/w/b.svg', enc('<!-- open <svg/>')).html, /data-kind="svg"/);
+  assert.doesNotMatch(Rich.file('/w/c.svg', enc('<svgx/>')).html, /data-kind="svg"/);
+  // Many comments are read in one pass.
+  const t0 = Date.now(); Rich.file('/w/d.svg', enc('<!--a-->'.repeat(100000) + '<p/>')); assert.ok(Date.now() - t0 < 1000);
 });
 
 test('a name starting with a tilde is the folder\'s; only ~/ is home', () => {
@@ -341,23 +471,28 @@ test('a name starting with a tilde is the folder\'s; only ~/ is home', () => {
 test('a link in a drawn diagram opens through the guarded opener', () => {
   const p = page(), Rich = p.context.Rich, opened = [];
   p.context.__TAURI__ = { core: { invoke: (cmd, args) => { opened.push([cmd, args.url]); return Promise.resolve(); } } };
-  const click = (attrs) => { let prevented = false; const a = { getAttribute: (k) => attrs[k] ?? null };
+  const click = (attrs, dataset) => { let prevented = false; const a = { dataset, getAttribute: (k) => attrs[k] ?? null };
     const handled = Rich.click({ target: { closest: (sel) => sel.includes('.rc a') ? a : null }, preventDefault: () => { prevented = true; } });
     return handled && prevented; };
   assert.equal(click({ 'xlink:href': 'https://example.com/m' }), true);
   assert.equal(click({ href: 'javascript:alert(1)' }), true);
-  assert.deepEqual(opened, [['open_link', 'https://example.com/m']]);
+  // A Markdown link is inert, its target data the opener reads.
+  assert.equal(click({ href: '#' }, { href: 'https://example.com/d' }), true);
+  assert.deepEqual(opened, [['open_link', 'https://example.com/m'], ['open_link', 'https://example.com/d']]);
 });
 
 test('charts, file links and opened files draw by kind', () => {
   const p = page(), Rich = p.context.Rich;
   // A chart in a message draws when asked; one in a file someone opened draws at once.
-  assert.match(Rich.html('```vega-lite\n{"mark":"bar"}\n```'), /data-kind="chart" data-lang="vega-lite" data-lazy data-id="#\d+" data-view="code"/);
-  assert.match(Rich.file('/w/c.vl.json', new TextEncoder().encode('{}')).html, /data-kind="chart" data-lang="vega-lite" data-lazy data-run/);
+  assert.match(Rich.html('```vega-lite\n{"mark":"bar"}\n```'), /data-kind="chart" data-lang="vega-lite" data-lazy data-view="code"/);
+  assert.match(Rich.file('/w/c.vl.json', new TextEncoder().encode('{}')).html, /data-kind="chart" data-lang="vega-lite" data-lazy data-page/);
   assert.match(Rich.html('```vega\n{}\n```'), /data-lang="vega"/);
   const links = Rich.html('[plan](PLAN.md) [code](src/a.rs:12) [line](src/b.rs#L4-L9) [web](https://example.com) [here](#top)');
   assert.match(links, /<a class="file" href="#" data-file="PLAN.md">plan<\/a>/);
   assert.match(links, /data-file="src\/a.rs">code/);
+  // A file with no folder takes its line too; a scheme with a number names no file.
+  assert.match(Rich.html('[code](a.rs:12) [doc](README.md:20:4)'), /data-file="a.rs">code.*data-file="README.md">doc/);
+  assert.doesNotMatch(Rich.html('[call](tel:12345)'), /data-file/);
   assert.match(links, /data-file="src\/b.rs">line/);
   // A section of another file opens that file; a `#` in a name is written `%23`.
   assert.match(Rich.html('[install](README.md#install)'), /data-file="README.md">install/);
@@ -365,7 +500,7 @@ test('charts, file links and opened files draw by kind', () => {
   // The line suffix is read before decoding, so `%3A` is a colon in the name.
   assert.match(Rich.html('[log](logs/build%3A2026)'), /data-file="logs\/build:2026">log/);
   assert.match(Rich.html('[log](a%3A2026)'), /data-file="a:2026">log/);
-  assert.match(links, /<a href="https:\/\/example.com">web<\/a>/);
+  assert.match(links, /<a href="#" data-href="https:\/\/example.com">web<\/a>/);
   assert.doesNotMatch(links, /data-file="#top"/);
   const enc = (text) => new TextEncoder().encode(text);
   assert.match(Rich.file('/w/PLAN.md', enc('# Plan')).html, /<div class="md"><h1>Plan<\/h1>/);
@@ -411,6 +546,22 @@ test('drawing messages past the byte bound folds the oldest instead of keeping t
   assert.ok(t.bytes <= DECODE_BYTES, `${t.bytes} bytes kept`);
   assert.equal(t.items[0].kind, 'history');
   assert.ok(t.items.some((it) => it.kind === 'text' && it.html));
+  assert.match(el.innerHTML, /earlier history/);
+});
+
+test('what drawn messages put on the page counts toward the window\'s bound across messages', () => {
+  const p = page(), t = p.transcript('Bob'), el = p.context.document.getElementById('log');
+  const DECODE_BYTES = 8 * 1024 * 1024, list = '- x\n'.repeat(49999);
+  // Five replies, each within its own bounds, with a tool call between them.
+  t.items = Array.from({ length: 5 }, (_, i) => p.entries({ role: 'assistant', content: [{ type: 'text', text: list }, { type: 'tool_use', id: `c${i}`, name: 'read', input: {} }] })
+    .map((e) => ({ ...e, turn: i, from: i, bytes: (e.text ?? '').length * 2 }))).flat();
+  t.bytes = t.items.reduce((n, it) => n + it.bytes, 0);
+  assert.ok(t.bytes < DECODE_BYTES);
+  el.lastElementChild = p.context.document.createElement('div');
+  p.renderTranscript(el, 'Bob');
+  const items = (el.innerHTML.match(/<li>/g) ?? []).length;
+  assert.ok(items > 0 && items <= 100000, `${items} list items drawn`);
+  assert.ok(t.bytes <= DECODE_BYTES, `${t.bytes} bytes kept`);
   assert.match(el.innerHTML, /earlier history/);
 });
 
@@ -1629,6 +1780,17 @@ test('a task card leaves the keyboard beside; a row looks in, and a double-click
   await p.go('app.build');
   await doc.listeners.click({ detail: 2, target: { closest: () => null } }); await p.tick();
   assert.equal(p.S.selected, 'app.build'); assert.deepEqual([...p.S.ui.tabs], ['app.build'], 'the old row did not open');
+});
+
+test('a click in a file beside keeps the keyboard in the visible composer', async () => {
+  const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
+  p.upsert({ name: 'Bob', id: 1, provider: 'alpha', model: 'one' }); p.tree(); p.S.selected = 'Bob';
+  const doc = p.context.document, focused = [];
+  for (const id of ['input', 'sideinput']) doc.getElementById(id).focus = () => focused.push(id);
+  p.S.ui.file = { bot: 'Bob', full: '/w/a.md', gen: 0, state: 'loading' };
+  await doc.listeners.click({ target: { closest: (sel) => (sel === '.pane.side' ? {} : null) } });
+  await p.tick();
+  assert.equal(focused.at(-1), 'input');
 });
 
 test('a failed first message waits in the side chat\'s composer', async () => {

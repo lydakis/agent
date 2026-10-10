@@ -14,7 +14,7 @@ const BASE = 'b7bdfe4';
   const p = await b.newPage({ viewport: { width: 1280, height: 780 } });
   await p.addStyleTag({ content: execFileSync('git', ['show', `${BASE}:app/ui/app.css`], { cwd: ui, encoding: 'utf8' }) });
   await p.addStyleTag({ path: path.join(ui, 'app.css') });
-  for (const f of ['vendor/marked.js', 'rich.js', 'vendor/highlight.js']) await p.addScriptTag({ path: path.join(ui, f) });
+  for (const f of ['vendor/markdown-it.js', 'rich.js', 'vendor/highlight.js']) await p.addScriptTag({ path: path.join(ui, f) });
   const r = await p.evaluate(() => {
     const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
     // The renderer this replaces (`markdown` in BASE's app.js), verbatim.
@@ -47,7 +47,7 @@ const BASE = 'b7bdfe4';
     const H = window.hljs; window.hljs = undefined; out.new_parse_nohl_ms = time(() => msgs.map((m) => Rich.html(m)).join('')); window.hljs = H;
     const codes = msgs.filter((m, i) => !(i % 3)).map((m) => m.split('```rust\n')[1].split('```')[0]);
     out.hl_only_ms = time(() => codes.map((c) => H.highlight(c, { language: 'rust', ignoreIllegals: true }).value));
-    out.marked_plain_ms = time(() => msgs.map((m) => marked.parse(m)));
+    const plain = markdownit({ html: false, linkify: true, breaks: true }); out.markdown_it_plain_ms = time(() => msgs.map((m) => plain.render(m)));
     out.new_parse_again_ms = time(() => msgs.map((m) => `<div class="md">${Rich.html(m)}</div>`).join(''));
     const oldHTML = msgs.map(old).join(''), newHTML = msgs.map((m) => `<div class="md">${Rich.html(m)}</div>`).join('');
     sheet(true); out.old_dom_ms = time(() => draw(oldHTML)); sheet(false); out.new_dom_ms = time(() => draw(newHTML));

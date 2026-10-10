@@ -1,6 +1,6 @@
 // What a model writes, drawn as a page draws it: Markdown, highlighted code, Mermaid diagrams,
 // Vega-Lite charts and HTML previews, in a message or a file opened beside. Markdown is parsed once
-// per message (marked, loaded with the page); highlighting, Mermaid and Vega load the first time
+// per message (markdown-it, loaded with the page); highlighting, Mermaid and Vega load the first time
 // something needs them. Raw HTML in Markdown stays text; an ```html block runs only when asked, in a
 // sandboxed frame with no network and no way into the app; a chart loads no data from anywhere.
 window.Rich = (() => {
@@ -10,7 +10,7 @@ window.Rich = (() => {
   // Bumped when highlighting arrives, so HTML drawn without it is drawn again (see `ready`).
   // `waited` says the last `html` drew code plain while highlighting loads, so only such a
   // message needs drawing again once it arrives.
-  let version = 0, ready = () => {}, waited = false;
+  let version = 0, ready = () => {}, escaped = () => {}, waited = false;
 
   // ---------- lazy scripts ----------
   const loading = new Map();
@@ -50,78 +50,153 @@ window.Rich = (() => {
   // window's thread, and a few characters can ask for more than it can do (a page's loop, an SVG's
   // filters, a chart's `sequence` to a billion, a Mermaid `space:500000`), so each runs only when
   // asked, block by block. `page` draws it at once, for a file someone opened.
-  // A diagram or chart in a message carries an id: where it was drawn (`scope`, its turn or file)
-  // and what it draws. Its streamed draft, the message committed, and the message drawn anew for
-  // highlighting all give it the same id, so the one someone asked for stays shown; an identical one
-  // in another turn or file still asks. Without a scope each block is its own.
-  let scope = null, blockId = 0;
-  const digest = (s) => { let a = 0x811c9dc5, b = 5381; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); a = Math.imul(a ^ c, 0x01000193); b = (Math.imul(b, 33) + c) | 0; } return `${s.length}.${(a >>> 0).toString(36)}.${(b >>> 0).toString(36)}`; };
-  const lazy = (page, kind, text) => page ? ' data-run' : ` data-id="${esc(scope == null ? `#${++blockId}` : `${scope}|${kind}|${digest(text)}`)}"`;
+  // Nothing remembers a click: a block drawn again (its pane redrawn) asks again, and the drawing
+  // cache below makes that click instant. While a reply streams (`draft`), its diagrams, charts and
+  // pages are code; each can be drawn once the reply is in.
+  let draft = false;
+  const lazy = (page) => page ? ' data-page' : '';
+  // Whether text is an SVG document: its root is `<svg>`, after an XML declaration, comments and a
+  // doctype if it has them. Read in one pass, as a generated file can open with many comments.
+  function isSVG(text) {
+    let i = 0;
+    const skip = () => { while (i < text.length && /\s/.test(text[i])) i++; };
+    skip();
+    if (text.startsWith('<?xml', i)) { const j = text.indexOf('?>', i); if (j < 0) return false; i = j + 2; }
+    for (;;) {
+      skip();
+      if (text.startsWith('<!--', i)) { const j = text.indexOf('-->', i + 4); if (j < 0) return false; i = j + 3; }
+      else if (text.slice(i, i + 9).toLowerCase() === '<!doctype') {
+        const b = text.indexOf('[', i), g = text.indexOf('>', i); if (g < 0) return false;
+        if (b >= 0 && b < g) { const e = text.indexOf(']', b); if (e < 0) return false; const k = text.indexOf('>', e); if (k < 0) return false; i = k + 1; } else i = g + 1;
+      } else return /^<svg[\s>/]/i.test(text.slice(i, i + 5));
+    }
+  }
   function block(text, info, page = false) {
     const lang = (info ?? '').trim().split(/\s+/)[0].toLowerCase();
-    if (lang === 'mermaid' || lang === 'mmd') return `<div class="rc" data-kind="mermaid" data-lazy${lazy(page, 'mermaid', text)} data-view="code">${head('mermaid', toggle)}<div class="view"></div>${pre(text, '')}</div>`;
-    if (CHART.has(lang)) return `<div class="rc" data-kind="chart" data-lang="${lang === 'vega' ? 'vega' : 'vega-lite'}" data-lazy${lazy(page, lang, text)} data-view="code">${head(lang, toggle)}<div class="view"></div>${pre(text, 'json')}</div>`;
+    if (draft) return `<div class="rc" data-kind="code">${head(lang, '')}${pre(text, lang)}</div>`;
+    if (lang === 'mermaid' || lang === 'mmd') return `<div class="rc" data-kind="mermaid" data-lazy${lazy(page)} data-view="code">${head('mermaid', toggle)}<div class="view"></div>${pre(text, '')}</div>`;
+    if (CHART.has(lang)) return `<div class="rc" data-kind="chart" data-lang="${lang === 'vega' ? 'vega' : 'vega-lite'}" data-lazy${lazy(page)} data-view="code">${head(lang, toggle)}<div class="view"></div>${pre(text, 'json')}</div>`;
     if (lang === 'html' || lang === 'htm') return `<div class="rc" data-kind="html" data-view="${page ? 'view' : 'code'}">${head(lang, '<button type="button" data-rich="view"></button>')}<div class="view frame"></div>${pre(text, 'xml')}</div>`;
     // An SVG draws as an image, which runs no script and loads nothing.
-    if (lang === 'svg' && /^\s*(<\?xml[^>]*>\s*)?<svg\b/i.test(text)) return `<div class="rc" data-kind="svg" data-view="${page ? 'view' : 'code'}">${head(lang, '<button type="button" data-rich="view"></button>')}<div class="view"></div>${pre(text, 'xml')}</div>`;
+    if (lang === 'svg' && isSVG(text)) return `<div class="rc" data-kind="svg" data-view="${page ? 'view' : 'code'}">${head(lang, '<button type="button" data-rich="view"></button>')}<div class="view"></div>${pre(text, 'xml')}</div>`;
     return `<div class="rc" data-kind="code">${head(lang, '')}${pre(text, lang)}</div>`;
   }
-  let md = null;
+  // A reference defined once can be used thousands of times, and each use copies its target into
+  // the page: a message's links and images carry at most 1 Mi characters of targets and titles in
+  // all (`linkLeft`, shared like the other bounds); past that a link is its text. Each is charged
+  // as written into the page, escaped, and an image's target and text as often as it writes them.
+  const LINK_CHARS = 1 << 20;
+  let linkLeft = LINK_CHARS;
+  // Read no further than the budget left, so a target used past it costs its length, not a scan.
+  const linkCost = (href, title, k = 1) => {
+    href ??= ''; title ??= ''; let n = k * (href.length + title.length);
+    for (const s of [href, title]) for (let i = 0; i < s.length && n <= linkLeft; i++) { const c = s.charCodeAt(i); n += k * (c === 34 ? 5 : c === 38 || c === 39 ? 4 : c === 60 || c === 62 ? 3 : 0); }
+    if (n > linkLeft) return false; linkLeft -= n; return true;
+  };
+  // Markdown is parsed by markdown-it, whose work grows with its input: a hostile reply can make
+  // a parser's time grow faster than its length, and this one runs on the window's thread.
+  let md = null; const closes = [];
   function parser() {
-    if (md || !globalThis.marked) return md;
-    md = new globalThis.marked.Marked({
-      gfm: true, breaks: true,
-      renderer: {
-        html: ({ text }) => esc(text),
-        code: ({ text, lang }) => block(text, lang),
-        // A table past 256 columns or 10,000 cells shows as its source: a short row is padded to
-        // the header's width, so a few bytes a row can ask for millions of cells.
-        table(token) { return token.header.length > COLUMNS || token.header.length * (token.rows.length + 1) > CELLS ? block(token.raw.replace(/\n+$/, ''), '') : false; },
-        // A link to a path opens that file beside, from the agent's folder; its `#` href lets Tab and
-        // Enter reach it, and the click handler keeps it from navigating.
-        link({ href, title, tokens }) { const inner = this.parser.parseInline(tokens), t = title ? ` title="${esc(title)}"` : ''; return linkable(href) ? `<a href="${esc(href)}"${t}>${inner}</a>` : filePath(href) ? `<a class="file" href="#" data-file="${esc(filePath(href))}"${t}>${inner}</a>` : inner; },
-        // An image draws only from data the message carries, and only on a click: a small PNG can
-        // decode to hundreds of megabytes and an animated one takes CPU for as long as it shows.
-        // A remote image is a link and a local one opens beside, so drawing a message fetches
-        // nothing a model chose.
-        image: ({ href, text }) => /^data:image\/(png|gif|jpe?g|webp)[;,]/i.test(href ?? '') ? `<button type="button" class="img" data-img="${esc(href)}" title="${esc(text)}">image${text ? `: ${esc(text)}` : ''}</button>` : linkable(href) ? `<a href="${esc(href)}">${esc(text || href)}</a>` : filePath(href) ? `<a class="file" href="#" data-file="${esc(filePath(href))}">${esc(text || href)}</a>` : esc(text),
-      },
+    if (md || !globalThis.markdownit) return md;
+    md = globalThis.markdownit({ html: false, linkify: true, breaks: true });
+    // Which links open, and how, is decided below; a link the window would not open is its text.
+    md.validateLink = () => true;
+    const r = md.renderer.rules;
+    r.fence = (tokens, i) => block(tokens[i].content.replace(/\n$/, ''), tokens[i].info);
+    r.code_block = (tokens, i) => block(tokens[i].content.replace(/\n$/, ''), '');
+    r.rich_source = (tokens, i) => block(tokens[i].content, '');
+    // Every link drawn is inert: its target is data (`data-href` for a URL, `data-file` for a path,
+    // which opens beside from the agent's folder) and only the click handler acts on it, so no
+    // native path (a context menu, a middle click, a drag) can follow it in the window. The `#`
+    // href lets Tab and Enter reach it.
+    r.link_open = (tokens, i) => {
+      const href = tokens[i].attrGet('href') ?? '', title = tokens[i].attrGet('title'), t = title ? ` title="${esc(title)}"` : '';
+      const open = !linkCost(href, title) ? '' : linkable(href) ? `<a href="#" data-href="${esc(href)}"${t}>` : filePath(href) ? `<a class="file" href="#" data-file="${esc(filePath(href))}"${t}>` : '';
+      closes.push(open ? '</a>' : ''); return open;
+    };
+    r.link_close = () => closes.pop() ?? '';
+    // An image draws only from data the message carries, and only on a click: a small PNG can
+    // decode to hundreds of megabytes and an animated one takes CPU for as long as it shows.
+    // A remote image is a link and a local one opens beside, so drawing a message fetches
+    // nothing a model chose.
+    r.image = (tokens, i, options, env, self) => {
+      const href = tokens[i].attrGet('src') ?? '', text = self.renderInlineAsText(tokens[i].children ?? [], options, env);
+      return !linkCost(href, text, 2) ? esc(text) : /^data:image\/(png|gif|jpe?g|webp)[;,]/i.test(href) ? `<button type="button" class="img" data-img="${esc(href)}" title="${esc(text)}">image${text ? `: ${esc(text)}` : ''}</button>` : linkable(href) ? `<a href="#" data-href="${esc(href)}">${esc(text || href)}</a>` : filePath(href) ? `<a class="file" href="#" data-file="${esc(filePath(href))}">${esc(text || href)}</a>` : esc(text);
+    };
+    // A table past 256 columns or 10,000 cells shows as its source, before its cells are parsed: a
+    // short row is padded to the header's width, so a few bytes a row can ask for millions of cells.
+    md.core.ruler.after('block', 'rich_table', (state) => {
+      const out = []; let starts = null;
+      for (let i = 0; i < state.tokens.length; i++) {
+        const t = state.tokens[i];
+        if (t.type !== 'table_open') { out.push(t); continue; }
+        let end = i, cols = 0, rows = 0, head = true;
+        for (; state.tokens[end].type !== 'table_close'; end++) {
+          const k = state.tokens[end].type;
+          if (k === 'th_open' && head) cols++; else if (k === 'tr_open') rows++; else if (k === 'thead_close') head = false;
+        }
+        if (cols <= COLUMNS && cols * rows <= CELLS) { out.push(...state.tokens.slice(i, end + 1)); i = end; continue; }
+        if (!starts) { starts = [0]; for (let j = state.src.indexOf('\n'); j !== -1; j = state.src.indexOf('\n', j + 1)) starts.push(j + 1); }
+        const src = new state.Token('rich_source', '', 0);
+        src.content = state.src.slice(starts[t.map[0]], t.map[1] < starts.length ? starts[t.map[1]] : state.src.length).replace(/\n+$/, '');
+        out.push(src); i = end;
+      }
+      state.tokens = out;
+    });
+    // `- [ ] item` and `- [x] item` are task boxes, which the window shows but nobody ticks.
+    md.core.ruler.after('inline', 'rich_tasks', (state) => {
+      const ts = state.tokens;
+      for (let i = 2; i < ts.length; i++) {
+        const first = ts[i].type === 'inline' && ts[i - 1].type === 'paragraph_open' && ts[i - 2].type === 'list_item_open' ? ts[i].children?.[0] : null;
+        const m = first?.type === 'text' && /^\[([ xX])\] /.exec(first.content);
+        if (!m) continue;
+        first.content = first.content.slice(4);
+        const box = new state.Token('html_inline', '', 0); box.content = `<input type="checkbox" disabled${m[1] === ' ' ? '' : ' checked'}> `;
+        ts[i].children.unshift(box);
+      }
     });
     return md;
   }
   // A link's target as a path, without its fragment (`a.md#install`, `a.rs#L12`) or a line suffix
   // (`a.rs:12`); null for a URL or anchor. A `#` or `:` in a file's name is written `%23` or `%3A`.
   function filePath(href) {
+    const scheme = /^[a-z][a-z0-9+.-]*:/i;
     let p = (href ?? '').replace(/#.*$/s, '').replace(/^file:\/\//i, '');
-    if (!p || /^[a-z][a-z0-9+.-]*:/i.test(p)) return null;
-    p = p.replace(/:\d+(:\d+)?$/, ''); try { p = decodeURIComponent(p); } catch (_) {}
+    const bare = p.replace(/:\d+(:\d+)?$/, '');
+    // `a.rs:12` is a file and its line; `tel:12345` keeps its scheme, as what precedes the number
+    // names no file.
+    if (!bare || scheme.test(bare) || (bare !== p && !/[./]/.test(bare))) return null;
+    p = bare; try { p = decodeURIComponent(p); } catch (_) {}
     return p || null;
   }
   // A message's HTML, inside the caller's `.md` box. One that would draw past 100,000 tags (about
   // 50,000 elements) shows as its text: a line of `- x` or a `*x*` makes an element from a few
   // bytes, and the window pays for every element it holds. It is not parsed past 50,000 lines or
-  // 100,000 marks that open an inline element (`*`, `_`, a backtick, `[`, `<`, `~`, `|`, `@`,
+  // 100,000 marks that open an inline element (`*`, `_`, a backtick, `[`, `!`, `<`, `~`, `|`, `@`, `\`, `&`,
   // `www.`, `://`), since the parser's tokens cost more than the HTML they become.
   const TAGS = 100000, LINES = 50000;
   const count = (s, c, max) => { let n = 0, i = -1; while (n <= max && (i = s.indexOf(c, i + 1)) !== -1) n++; return n; };
-  const MARK = /[*_`[<~|@]|www\.|:\/\//g;
+  const MARK = /[*_`[<~|@!\\&]|www\.|:\/\//g;
   const marks = (s, max) => { let n = 0; MARK.lastIndex = 0; while (n <= max && MARK.exec(s)) n++; return n; };
   const asText = (text) => `<div class="rc" data-kind="code">${head('text', '')}<pre class="code"><code>${esc(text)}</code></pre></div>`;
   // `used` carries the bounds across the pieces of one message drawn apart, as a streamed reply's
-  // blocks are; once over, `used.over` is set and that piece is text. `used.scope` names where its
-  // diagrams and charts were drawn (see `lazy`).
+  // blocks are; once over, `used.over` is set and that piece is text. `used.marks` counts the marks
+  // parsed, which is what the parsing cost;
+  // `used.draft` marks a reply still streaming.
   function html(text, used = { lines: 0, tags: 0, code: 0 }) {
-    waited = false; spent = used.code ?? 0; scope = used.scope ?? null;
+    waited = false; spent = used.code ?? 0; draft = !!used.draft; linkLeft = LINK_CHARS - (used.links ?? 0);
     const p = parser();
     if (!p) return `<p>${esc(text)}</p>`;
     if (used.over) return asText(text);
     const lines = count(text, '\n', LINES - used.lines);
-    if (used.lines + lines > LINES || used.tags + marks(text, TAGS - used.tags) > TAGS) { used.over = true; return asText(text); }
-    let out; try { out = p.parse(text); } catch (_) { return `<p>${esc(text)}</p>`; }
+    const mk = marks(text, TAGS - Math.max(used.tags, used.marks ?? 0));
+    if (used.lines + lines > LINES || used.tags + mk > TAGS || (used.marks ?? 0) + mk > TAGS) { used.over = true; return asText(text); }
+    closes.length = 0;
+    let out; try { out = p.render(text); } catch (_) { return `<p>${esc(text)}</p>`; }
     used.code = spent;
     const tags = count(out, '<', TAGS - used.tags);
     if (used.tags + tags > TAGS) { waited = false; used.over = true; return asText(text); }
-    used.lines += lines; used.tags += tags;
+    used.lines += lines; used.tags += tags; used.marks = (used.marks ?? 0) + mk; used.links = LINK_CHARS - linkLeft;
     return out;
   }
 
@@ -176,14 +251,9 @@ window.Rich = (() => {
   // A diagram or chart drawn to SVG once per source; one at a time, as Mermaid measures in a shared
   // scratch element. A source that does not draw keeps showing as code, the error in its head,
   // and draws again only when asked again.
-  // With `cached`, only a block someone asked for (`shown`, the last 1,024 asked) draws again,
-  // from the cache or, when a chart's width changed, anew.
-  const shown = new Set(), SHOWN = 1024;
-  function drawLazy(box, src, make, cached = false) {
+  function drawLazy(box, src, make) {
     const key = `${box.dataset.kind}|${box.dataset.lang ?? ''}|${box.dataset.kind === 'chart' ? box.clientWidth : ''}|${src}`;
     const show = (svg) => settle(box, () => { box.querySelector('.view').innerHTML = svg; box.dataset.view = 'view'; box.dataset.drawn = ''; });
-    if (cached && !shown.has(box.dataset.id)) return;
-    if (!cached && box.dataset.id) { shown.delete(box.dataset.id); shown.add(box.dataset.id); if (shown.size > SHOWN) shown.delete(shown.values().next().value); }
     if (diagrams.has(key)) { show(diagrams.get(key)); return; }
     if ('asked' in box.dataset) return;
     box.dataset.asked = '';
@@ -196,7 +266,7 @@ window.Rich = (() => {
         const [k, v] = diagrams.entries().next().value; diagrams.delete(k); diagramBytes -= 2 * (k.length + v.length);
       }
       show(svg);
-    }, (e) => { delete box.dataset.asked; shown.delete(box.dataset.id); const l = box.querySelector('.rh .lang'); l.textContent = `${l.textContent.split(' · ')[0]} · ${String(e?.message ?? e).split('\n')[0].slice(0, 80)}`; });
+    }, (e) => { delete box.dataset.asked; const l = box.querySelector('.rh .lang'); l.textContent = `${l.textContent.split(' · ')[0]} · ${String(e?.message ?? e).split('\n')[0].slice(0, 80)}`; });
   }
   const mermaidSVG = (src) => mermaidReady().then((m) => m.render(`rich-mmd-${++diagramId}`, src)).then(({ svg }) => svg);
 
@@ -234,10 +304,11 @@ window.Rich = (() => {
     try { return await view.toSVG(); } finally { view.finalize(); }
   }
   // The page a preview runs: nothing fetched, no frames, no forms; it reports its height so the
-  // frame fits it, and its links go nowhere.
+  // frame fits it, its links go nowhere, and Escape pressed in it is the window's (a frame's keys
+  // do not reach its parent).
   const FRAME_HEAD = '<!doctype html><meta charset="utf-8">'
     + `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; media-src data: blob:; base-uri 'none'; form-action 'none'">`
-    + '<script>(()=>{const post=()=>parent.postMessage({rich:"height",h:document.documentElement.scrollHeight},"*");addEventListener("load",post);new ResizeObserver(post).observe(document.documentElement);addEventListener("click",e=>{if(e.target.closest&&e.target.closest("a[href]"))e.preventDefault()},true)})()</script>';
+    + '<script>(()=>{const post=()=>parent.postMessage({rich:"height",h:document.documentElement.scrollHeight},"*");addEventListener("load",post);new ResizeObserver(post).observe(document.documentElement);addEventListener("click",e=>{if(e.target.closest&&e.target.closest("a[href]"))e.preventDefault()},true);addEventListener("keydown",e=>{if(e.key==="Escape")parent.postMessage({rich:"escape"},"*")})})()</script>';
   // A preview shown: a page in its frame, an SVG as an image (which runs no script and loads nothing).
   function mount(box) {
     const host = box.querySelector('.view'); if (!host || host.firstChild) return;
@@ -249,22 +320,23 @@ window.Rich = (() => {
     host.append(f);
   }
   function unmount(box) { box.querySelector('.view')?.replaceChildren(); }
-  function draw(box, cached = false) {
+  function draw(box) {
     const src = box.querySelector('pre').textContent;
-    drawLazy(box, src, box.dataset.kind === 'mermaid' ? mermaidSVG : chartSVG, cached);
+    drawLazy(box, src, box.dataset.kind === 'mermaid' ? mermaidSVG : chartSVG);
   }
-  // After HTML from `html` is in the document (`root` and what it holds): a file's drawing starts,
-  // and a diagram or chart someone asked for shows again from the cache. A page or SVG someone ran
-  // in a message is code again once its pane is drawn anew: running it is asked of one block, once.
+  // After HTML from `html` is in the document (`root` and what it holds): a file's drawing starts.
+  // Whatever was drawn in a message is code again once its pane is drawn anew.
   const HYDRATE = '.rc[data-lazy]:not([data-on]), .rc[data-kind="html"]:not([data-on]), .rc[data-kind="svg"]:not([data-on])';
   function hydrate(root) {
     for (const box of [...(root.matches?.(HYDRATE) ? [root] : []), ...root.querySelectorAll(HYDRATE)]) {
       box.dataset.on = '';
-      if ('lazy' in box.dataset) draw(box, !('run' in box.dataset));
+      if ('lazy' in box.dataset) { if ('page' in box.dataset) draw(box); }
       else if (box.dataset.view === 'view') mount(box);
     }
   }
   if (typeof window.addEventListener === 'function') window.addEventListener('message', (e) => {
+    // Only a frame the reader is in can hand the window its Escape.
+    if (e.data?.rich === 'escape') { for (const f of document.querySelectorAll('.rc iframe')) if (f.contentWindow === e.source && document.activeElement === f) { escaped(f); break; } return; }
     if (e.data?.rich !== 'height' || !(e.data.h > 0)) return;
     for (const f of document.querySelectorAll('.rc iframe')) if (f.contentWindow === e.source) { const h = `${Math.min(Math.ceil(e.data.h), Math.round(window.innerHeight * 0.8))}px`; if (f.style.height !== h) settle(f, () => { f.style.height = h; }); break; }
   });
@@ -284,7 +356,7 @@ window.Rich = (() => {
     // Every link in drawn content goes through the guarded opener, or nowhere: a Mermaid `click`
     // link is an SVG `<a xlink:href>` that would otherwise take over the window.
     const a = e.target.closest?.('.md a, .rc a');
-    if (a) { e.preventDefault(); const href = a.getAttribute('href') ?? a.getAttribute('xlink:href'); if (linkable(href)) open(href); return true; }
+    if (a) { e.preventDefault(); const href = a.dataset?.href ?? a.getAttribute('href') ?? a.getAttribute('xlink:href'); if (linkable(href)) open(href); return true; }
     const b = e.target.closest?.('[data-rich]'); if (!b) return false;
     const box = b.closest('.rc');
     if (b.dataset.rich === 'copy') {
@@ -332,7 +404,7 @@ window.Rich = (() => {
   }
   // `waited` says the view is code that highlighting, once loaded, would draw differently.
   function file(path, bytes, more = false, asked = true) {
-    spent = 0; waited = false; scope = `file ${path}`;
+    spent = 0; waited = false; draft = false;
     const ext = extOf(path), note = more ? `<div class="line note">showing the first ${Math.round(bytes.length / 1048576)} MiB</div>` : '';
     if (IMAGE[ext]) {
       if (more) return { html: '<div class="line note">image too large to show</div>' };
@@ -341,7 +413,7 @@ window.Rich = (() => {
     }
     if (bytes.subarray(0, 8000).includes(0)) return { html: `<div class="line note">binary file · ${bytes.length}${more ? '+' : ''} bytes</div>` };
     const text = new TextDecoder().decode(bytes);
-    if (ext === 'md' || ext === 'markdown') return { html: `${note}<div class="md">${html(text, { lines: 0, tags: 0, code: 0, scope })}</div>`, waited };
+    if (ext === 'md' || ext === 'markdown') return { html: `${note}<div class="md">${html(text, { lines: 0, tags: 0, code: 0 })}</div>`, waited };
     if (ext === 'csv' || ext === 'tsv') return { html: note + table(text, ext === 'csv' ? ',' : '\t') };
     const lang = { mmd: 'mermaid', mermaid: 'mermaid', vl: 'vega-lite', vg: 'vega', htm: 'html', html: 'html', svg: 'svg' }[ext] ?? ext;
     const out = block(text, lang, asked);
@@ -352,5 +424,5 @@ window.Rich = (() => {
   // A middle click on a link would open it in a new app window.
   document.addEventListener?.('auxclick', (e) => { if (e.target.closest?.('.md a, .rc a, a[data-file]')) e.preventDefault(); });
 
-  return { html, cut, hydrate, click, file, filePath, esc, get version() { return version; }, get waited() { return waited; }, set onReady(fn) { ready = fn; }, set onFile(fn) { openFile = fn; }, set onError(fn) { failed = fn; } };
+  return { html, cut, hydrate, click, file, filePath, esc, get version() { return version; }, get waited() { return waited; }, set onReady(fn) { ready = fn; }, set onEscape(fn) { escaped = fn; }, set onFile(fn) { openFile = fn; }, set onError(fn) { failed = fn; } };
 })();

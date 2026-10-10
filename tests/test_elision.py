@@ -215,11 +215,12 @@ class ElisionTests(ModelFixture):
         self.assertIn('; continue with offset=', read)
         self.assertNotIn('round 0 line 1200', read)
 
-    def test_a_paced_summary_copies_the_same_call_when_it_resumes(self):
+    def test_a_paced_summary_beside_a_call_is_planned_again_at_a_later_boundary(self):
         # One boundary stubs the first result, then summarizes a copy of the
-        # call made before the stub, and that summary is paced once; the
-        # daemon restarts while it waits. The retry copies the same call,
-        # not the view after the stub.
+        # call made before the stub beside its own call, and that summary is
+        # paced once. It parks nothing; its pool's block parks the call
+        # beside it, and the daemon restarts while the turn waits. A later
+        # boundary summarizes again, after the stub.
         client = self.client(tools='shell,read', settings={'context_bytes': 65536})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read'],
                        compaction_instructions='Summarize.')
@@ -235,14 +236,16 @@ class ElisionTests(ModelFixture):
         self.assertEqual(ended['data']['status'], 'completed', ended)
         events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
         moves = [e['data'] for e in events if e['event'] in ('elided', 'compacted')]
-        self.assertEqual([m['version'] for m in moves[:2]], [moves[0]['version']] * 2)
+        self.assertEqual(len([m for m in moves if 'summary_bytes' in m]), 1)
+        self.assertGreater(moves[1]['version'], moves[0]['version'])
         summaries = [r for r in drain(self.model) if is_summary(r)]
         self.assertEqual(len(summaries), 2)
         first, retry = summaries
         self.assertTrue(first.get('tools'))
-        self.assertFalse(any(i.get('type') == 'function_call_output' and i['output'].startswith(STUB)
-                             for i in first['input']))
-        self.assertEqual((retry['input'], retry.get('tools')), (first['input'], first.get('tools')))
+        stubbed = lambda r: any(i.get('type') == 'function_call_output' and i['output'].startswith(STUB)
+                                for i in r['input'])
+        self.assertFalse(stubbed(first))
+        self.assertTrue(stubbed(retry))
 
     def test_a_steer_the_turn_had_no_room_for_goes_in_once_elision_makes_some(self):
         # At a round's end the turn holds two whole results of about 11 KiB,
@@ -294,13 +297,26 @@ class ElisionTests(ModelFixture):
         self.assertEqual(client.finished(steer)['data']['error'], 'stale_turn')
         work = [r for r in drain(self.model) if not is_summary(r)]
         self.assertTrue(all(encoded(r['input']) <= 24576 for r in work))
-        # Each cut left the turn room for the steer on its own.
+        # Each cut left the turn room for the steer on its own, but for the
+        # rounds, each under 1 KiB here, that ran beside the summary before
+        # it was installed: those whose calls were sent once it was, and
+        # the one before, which may have been recorded after the plan.
         events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
-        compacted = [e['data'] for e in events if e['event'] == 'compacted']
+        compacted, sent = [], []
+        for event in events:
+            data = event['data']
+            if event['event'] == 'usage' and data.get('purpose') is None:
+                sent.append(data['sent_ms'])
+            elif event['event'] == 'usage':
+                summary_sent = data['sent_ms']
+            elif event['event'] == 'compacted':
+                before = [n for n, at in enumerate(sent) if at < summary_sent]
+                compacted.append((data, len(sent) - (before[-1] if before else 0)))
         self.assertGreaterEqual(len(compacted), 2)
-        for data in compacted:
+        for data, beside in compacted:
             self.assertEqual(data['summary_bytes'], 7800)
-            self.assertLessEqual(data['context_after']['bytes'] - 7800 + 17000, 24576)
+            self.assertTrue(data['request']['beside'])
+            self.assertLessEqual(data['context_after']['bytes'] - 7800 + 17000, 24576 + 1024 * beside)
 
     def test_a_steer_goes_in_at_the_whole_budget_when_the_newest_result_fills_the_turn(self):
         # One result of about 15 KiB, the newest round, leaves the turn no

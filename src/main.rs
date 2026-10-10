@@ -29,7 +29,7 @@ fn main() {
     match result {
         Ok(code) => std::process::exit(code),
         Err(error) => {
-            eprintln!("agent: {error}");
+            report(&error);
             std::process::exit(match error.code.as_str() {
                 "usage" => 2,
                 "store_already_owned" | "socket_already_owned" => DAEMON_OWNERSHIP_CONFLICT,
@@ -37,6 +37,35 @@ fn main() {
             });
         }
     }
+}
+
+/// A failure on stderr: one JSON object, `{"error", "detail", ...facts}`,
+/// the daemon's own fields plus the CLI's `hint` in flags; `--pretty`
+/// asks for a line a person reads instead. The detail is bounded as in a
+/// daemon response, since it can echo an argument.
+fn report(error: &Error) {
+    let error = &Error {
+        detail: error.detail.clone().map(agent_runtime::output::bounded),
+        ..error.clone()
+    };
+    if cli::PRETTY.load(std::sync::atomic::Ordering::Relaxed) {
+        match error
+            .facts
+            .as_ref()
+            .and_then(|facts| facts.get("hint")?.as_str())
+        {
+            Some(hint) => eprintln!("agent: {error}; {hint}"),
+            None => eprintln!("agent: {error}"),
+        }
+        return;
+    }
+    let mut report = serde_json::Map::new();
+    report.insert("error".into(), error.code.clone().into());
+    report.insert("detail".into(), error.detail.clone().into());
+    if let Some(facts) = &error.facts {
+        report.extend(facts.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+    eprintln!("{}", serde_json::Value::Object(report));
 }
 
 fn run() -> Result<i32> {
