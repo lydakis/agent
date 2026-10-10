@@ -1200,6 +1200,8 @@ after, limit: 1}` (an indexed lookup each, about 2·log2 of the cursor), and
 the watcher keeps where it is per trigger in `~/.agent/triggers/NAME.watch`,
 written only when that agent ends a turn, and for one that fires only once
 its ask is on disk: a restart replays from there, so no turn end is missed.
+Like every trigger write it is under the lock, and only while the plist is
+still that trigger's, so none is left behind by a trigger that went.
 A place it cannot read (malformed, or not readable) is not a fresh start,
 which would skip every turn end since: the trigger ends, saying so
 (`watch_unreadable`). A place it has never had, or an earlier trigger's of
@@ -1264,7 +1266,9 @@ anything else a failure can leave is listed and removable:
   set aside keeps its job loaded, and an unload launchd refuses renames
   them back, so either stays listed with what its fire did. A fire whose
   unload ends it before it deletes them leaves them aside; the app's next
-  start, or the next `add` or `rm` of that name, finishes that end. A job
+  start, or the next `add` or `rm` of that name, finishes that end. The
+  app's start also removes the temporary of a write that died before its
+  rename: every write takes the lock, so none is under way. A job
   left loaded after its plist went (an end cut short) is unloaded by its
   next fire.
 - **Removing** unloads the job by its label whether or not its plist is

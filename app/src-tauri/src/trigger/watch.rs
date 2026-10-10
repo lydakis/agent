@@ -417,8 +417,15 @@ fn ask_fire(places: &Places, w: &mut Watched, why: &str) -> Result<(), String> {
 
 /// Keep where it is, and where to read again from: before the first event
 /// of a turn a trigger sent that has not ended, whose end would otherwise
-/// be read without knowing whose it was.
+/// be read without knowing whose it was. Under the lock `rm` takes, and
+/// only while its plist is still this trigger's: a place saved after the
+/// trigger went would be left behind.
 fn save(places: &Places, w: &mut Watched, sent: &Sent) -> Result<(), String> {
+    let _lock = Lock::take(places)?;
+    if !ours(places, &w.trigger) {
+        w.done = true;
+        return Ok(());
+    }
     let cursor = w.cursor.unwrap_or(0);
     let from = sent
         .iter()
@@ -854,8 +861,17 @@ mod tests {
             agents: root.join("LaunchAgents"),
             state: root.join("triggers"),
         };
-        std::fs::create_dir_all(&places.state).unwrap();
+        std::fs::create_dir_all(&places.agents).unwrap();
         let mut w = vec![watched("t", "p.task", None, 0)];
+        let when = every("30m", 0).unwrap();
+        let text = super::super::plist(
+            Path::new("/A/agent-app"),
+            &w[0].trigger,
+            &when,
+            &places.asks("t"),
+            &[],
+        );
+        std::fs::write(places.plist("t"), text).unwrap();
         let own = sent_by(&w[0].trigger);
         let mut sent = Sent::new();
         let mut queued = accepted("p.task", 4, 5, &format!("{own}q"));
