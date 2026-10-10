@@ -20,7 +20,7 @@ const COMMANDS: &[Command] = &[
         name: "run",
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
-        flags: "--bot --new --detach --delivery --turn --model --workspace --effort --agents --profile --request-id --bot-id --pretty --no-spawn",
+        flags: "--bot --new --detach --delivery --turn --model --workspace --effort --turn-budget-tokens --agents --profile --request-id --bot-id --pretty --no-spawn",
         settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallbacks --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl",
         startup: true,
     },
@@ -246,6 +246,10 @@ fn print_flags(flags: &str) {
                 "The identity --bot must name; rm then succeeds as a duplicate once it is gone",
             ),
             "--budget-tokens" => ("N", "New bot's lifetime input + output token cap"),
+            "--turn-budget-tokens" => (
+                "N",
+                "This turn's input + output token cap, beside the bot's own budget",
+            ),
             "--pretty" => ("", "Render human-readable output"),
             "--no-spawn" => ("", "Require an already running daemon"),
             "--keep-turns" => (
@@ -521,13 +525,18 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                     | "--keep-turns"
                     | "--max-output-tokens"
                     | "--budget-tokens"
+                    | "--turn-budget-tokens"
                     | "--turn"
                     | "--checkpoint"
                     | "--request"
             ) {
                 let max = match flag {
                     "--max-output-tokens" => u32::MAX as u64,
-                    "--turn" | "--checkpoint" | "--budget-tokens" | "--request" => i64::MAX as u64,
+                    "--turn"
+                    | "--checkpoint"
+                    | "--budget-tokens"
+                    | "--turn-budget-tokens"
+                    | "--request" => i64::MAX as u64,
                     _ => usize::MAX as u64,
                 };
                 if !value.parse::<u64>().is_ok_and(|n| n > 0 && n <= max) {

@@ -1205,7 +1205,7 @@ The app writes `~/.agent/trigger` each time it opens, a script that runs its
 executable with `--trigger`:
 
 ```sh
-~/.agent/trigger add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] -- MESSAGE
+~/.agent/trigger add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--turn-budget-tokens N] -- MESSAGE
   WHEN: --every 30m | --in 45m | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO | --turn-end BOT [--count N]
 ~/.agent/trigger ls [--after NAME]
 ~/.agent/trigger fire NAME
@@ -1291,7 +1291,10 @@ was seen, so a heartbeat whose check finds
 nothing to do costs one process and no model call. A one-off whose check
 says no ends, listed as not sent.
 `--runs N` ends the trigger once N messages went out; a fire after that
-(its end could not unload it) only tries to end it again. Each message the
+(its end could not unload it) only tries to end it again.
+`--turn-budget-tokens N` submits each message with that turn cap, so one
+runaway fire fails with `turn_budget_exhausted` instead of spending the
+agent's whole lifetime budget. Each message the
 agent gets starts with one line, `[trigger NAME · YYYY-MM-DD HH:MM · why]`,
 the local fire time and what fired it (its time, `file PATH`, `commit REPO
 at SHA`, `turn end of BOT: turn:BOT/N completed`, or `fired`), so a
@@ -2063,7 +2066,7 @@ This measures the ancestry-walk reduction, not an end-to-end fleet capacity clai
 Pulled event batches apply in order, with one visible-history load and render
 per batch. Creation/fork bursts rebuild the fleet tree at most once per pull,
 while retaining the 300-row rail window. The shared client rejects a ready
-handshake unless its protocol is exactly `agent_client::PROTOCOL`, now 5.
+handshake unless its protocol is exactly `agent_client::PROTOCOL`, now 11.
 
 The lifecycle regression suite compares committed thinking/answer transcripts
 between live delivery and replay, reconciles fork snapshot/replay ordering,

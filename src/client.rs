@@ -73,6 +73,8 @@ struct Options {
     /// `shutdown --grace`: milliseconds running turns may take to finish.
     grace_ms: u64,
     budget_tokens: Option<u64>,
+    /// `run --turn-budget-tokens`: the submitted turn's own cap.
+    turn_budget_tokens: Option<u64>,
     turn: Option<i64>,
     keep_turns: Option<usize>,
     /// `follow --all`: every bot on one connection.
@@ -137,6 +139,7 @@ fn parse(args: &[String]) -> Result<Options> {
         timeout_ms: None,
         grace_ms: 0,
         budget_tokens: None,
+        turn_budget_tokens: None,
         turn: None,
         keep_turns: None,
         all: false,
@@ -318,6 +321,11 @@ fn parse(args: &[String]) -> Result<Options> {
                     "--budget-tokens" => {
                         options.budget_tokens = Some(value.parse().map_err(|_| {
                             Error::with("usage", "--budget-tokens needs an integer")
+                        })?)
+                    }
+                    "--turn-budget-tokens" => {
+                        options.turn_budget_tokens = Some(value.parse().map_err(|_| {
+                            Error::with("usage", "--turn-budget-tokens needs an integer")
                         })?)
                     }
                     "--turn" => {
@@ -1352,7 +1360,8 @@ fn run(options: &Options) -> Result<i32> {
                 "workspace":options.workspace.as_ref().and(workspace.as_ref()),
                 "model":if created { Value::Null } else { json!(options.model) },
                 "effort":if created { Value::Null } else { json!(options.effort) },
-                "delivery":options.delivery,"expected_turn":options.turn,"from":from}),
+                "delivery":options.delivery,"expected_turn":options.turn,"from":from,
+                "budget_tokens":options.turn_budget_tokens}),
         )
         .map_err(|error| ways_past_busy(&bot, error))?;
     if options.detach {

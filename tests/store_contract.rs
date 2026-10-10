@@ -4,7 +4,7 @@ use agent_runtime::{
     provider::{ToolCall, Usage},
     store::{
         Answered, Binding, Bot, CacheTtl, CompactionPlan, ContextUsage, Database, Decision,
-        Delivery, Fork, Gate, Gated, Planning, Settings, Strip, TurnOptions, Wake,
+        Delivery, Fork, Gate, Gated, Planning, Settings, Strip, TurnBudget, TurnOptions, Wake,
     },
     tools::Outcome,
 };
@@ -158,6 +158,7 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
         expected_turn: None,
         from: None,
         origin: None,
+        budget_tokens: None,
     };
     let alt = db
         .begin("Alternative", "r1", "different", true, &branch, |_, _| {
@@ -3122,6 +3123,7 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
         expected_turn: None,
         from: None,
         origin: None,
+        budget_tokens: None,
     };
     let started = db
         .begin("Bob", "r1", "work", true, &options, allow_provider)
@@ -3250,6 +3252,7 @@ fn a_bot_without_a_default_workspace_needs_one_per_submission() {
         expected_turn: None,
         from: None,
         origin: None,
+        budget_tokens: None,
     };
     let turn = db
         .begin("Nomad", "r1", "work", true, &options, allow_provider)
@@ -3896,6 +3899,7 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
                 expected_turn: None,
                 from: None,
                 origin: None,
+                budget_tokens: None,
             },
             allow_provider,
         )
@@ -6360,6 +6364,100 @@ fn schema_46_settings_keep_turns_as_prune_names_it() {
         .filter(|event| event["event"] == "turn_finished")
         .count();
     assert_eq!(finished, 1);
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn schema_47_turns_take_their_own_token_cap() {
+    let path = std::env::temp_dir().join(format!("agent-schema47-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let usage = |input_tokens, output_tokens| Usage {
+        input_tokens,
+        output_tokens,
+        cached_input_tokens: 0,
+        cache_write_tokens: 0,
+        cache_write_1h_tokens: 0,
+        sent_ms: 0,
+        models: Vec::new(),
+        served_model: String::new(),
+    };
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        let turn = db
+            .begin(
+                "Bob",
+                "r1",
+                "p1",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        db.append(turn, vec![assistant("one")], &[], Some(&usage(100, 20)))
+            .unwrap();
+        db.finish(turn, None).unwrap();
+    }
+    // Before 48 no turn had a cap of its own.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE turns DROP COLUMN budget_tokens; PRAGMA user_version=47;")
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let capped = TurnOptions {
+        budget_tokens: Some(300),
+        ..TurnOptions::default()
+    };
+    let turn = db
+        .begin("Bob", "r2", "p2", true, &capped, allow_provider)
+        .unwrap()
+        .turn;
+    // The cap counts from the bot's total when the turn began, however much
+    // of it the turn has already spent when its engine reloads it.
+    let check = |db: &Database| {
+        let mut bot = db.inspect("Bob").unwrap();
+        bot.turn_budget = db.context(turn).unwrap().budget;
+        bot
+    };
+    db.append(turn, vec![assistant("two")], &[], Some(&usage(100, 20)))
+        .unwrap();
+    let bot = check(&db);
+    let cap = TurnBudget {
+        tokens: 300,
+        until: 420,
+    };
+    assert_eq!((bot.turn_budget, bot.ceiling()), (Some(cap), Some(420)));
+    assert!(bot.exhausted().is_none());
+    db.append(turn, vec![assistant("three")], &[], Some(&usage(180, 20)))
+        .unwrap();
+    let error = check(&db).exhausted().unwrap();
+    assert_eq!(error.code, "turn_budget_exhausted");
+    assert_eq!(
+        error.facts.map(|facts| Value::Object(*facts)),
+        Some(json!({"turn_budget_tokens":300,"turn_tokens_used":320}))
+    );
+    db.finish(turn, None).unwrap();
+    // A resend names the same cap; the earlier turn reports none.
+    let other = TurnOptions {
+        budget_tokens: Some(200),
+        ..TurnOptions::default()
+    };
+    assert_eq!(
+        db.begin("Bob", "r2", "p2", true, &other, allow_provider)
+            .unwrap_err()
+            .code,
+        "idempotency_conflict"
+    );
+    let page = db.turns("Bob", 0, 256).unwrap();
+    let caps: Vec<_> = page["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["budget_tokens"].clone())
+        .collect();
+    assert_eq!(caps, [Value::Null, json!(300)]);
     drop(db);
     std::fs::remove_file(path).unwrap();
 }

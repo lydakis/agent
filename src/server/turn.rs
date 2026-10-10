@@ -924,8 +924,8 @@ impl Turn {
                 let held = beside.as_ref().and_then(|_| {
                     self.summary_bound(record, context.usage().bytes.max(copied), tools)
                         .filter(|tokens| {
-                            record.budget_tokens.is_none_or(|budget| {
-                                record.tokens_used.saturating_add(*tokens) < budget
+                            record.ceiling().is_none_or(|ceiling| {
+                                record.tokens_used.saturating_add(*tokens) < ceiling
                             })
                         })
                 });
@@ -933,10 +933,14 @@ impl Turn {
                     (Some(slot), Some(tokens)) => {
                         // It spends only what it holds: its calls and their
                         // retries count from the rounds left after its
-                        // share, and a bot's budget ends at its share.
+                        // share, and the bot's and turn's caps end at its share.
                         let (mut record, tools) = (record.clone(), tools.clone());
+                        let share = record.tokens_used.saturating_add(tokens);
                         if let Some(budget) = &mut record.budget_tokens {
-                            *budget = (*budget).min(record.tokens_used.saturating_add(tokens));
+                            *budget = (*budget).min(share);
+                        }
+                        if let Some(cap) = &mut record.turn_budget {
+                            cap.until = cap.until.min(share);
                         }
                         spent.beside = true;
                         accounting.summary_held = tokens;
@@ -989,7 +993,7 @@ impl Turn {
         Ok(compaction)
     }
 
-    /// The most a summary's two calls may bill toward a bot's token budget:
+    /// The most a summary's two calls may bill toward a bot's or turn's cap:
     /// each sends at most `view` bytes, the tools and both instructions, a
     /// token to a byte at most, and generates at most the summarizer's
     /// output bound. Nothing without a budget; `None` when that bound is
@@ -1000,7 +1004,7 @@ impl Turn {
         view: usize,
         tools: &serde_json::value::RawValue,
     ) -> Option<u64> {
-        if record.budget_tokens.is_none() {
+        if record.ceiling().is_none() {
             return Some(0);
         }
         // Server-side fallbacks may bill any number of attempts per request.
@@ -1396,7 +1400,7 @@ impl Turn {
             // The request of its own is another call, checked as each is.
             if !copied
                 || invalid.code == "compaction_summary_limit"
-                || budget_error(record.budget_tokens, record.tokens_used).is_some()
+                || record.exhausted().is_some()
                 || *model_rounds >= MAX_ROUNDS
             {
                 self.compaction_failed(turn, &invalid).await?;
@@ -1771,6 +1775,7 @@ impl Turn {
         let context = self.store.op("context", move |db| db.context(turn)).await?;
         // A turn may run at its own effort; everything after reads the record.
         record.effort = context.effort.clone();
+        record.turn_budget = context.budget;
         let (provider, model) = split_model(&context.model)?;
         let provider = self
             .providers
@@ -1918,7 +1923,7 @@ impl Turn {
             // One planned at a boundary that started over has not run.
             beside = None;
             // The budget is checked before each call, so one call may overshoot.
-            if let Some(error) = budget_error(record.budget_tokens, record.tokens_used) {
+            if let Some(error) = record.exhausted() {
                 return Err(error);
             }
             // Past the threshold, the older turns are summarized before this
@@ -2048,7 +2053,7 @@ impl Turn {
                 (resume_window, steer_first) = (resuming, whole);
                 continue;
             }
-            if let Some(error) = budget_error(record.budget_tokens, record.tokens_used) {
+            if let Some(error) = record.exhausted() {
                 return Err(error);
             }
             if model_rounds >= MAX_ROUNDS {
@@ -2592,7 +2597,8 @@ impl Turn {
             // A retry is another billable call. Preserve final provider errors,
             // but stop retrying once failed usage has spent the bot's budget.
             let error = if retryable(&error.code) {
-                budget_error(record.budget_tokens, record.tokens_used)
+                record
+                    .exhausted()
                     .or_else(|| {
                         (*model_rounds >= MAX_ROUNDS).then(|| Error::new("tool_round_limit"))
                     })
@@ -3459,14 +3465,7 @@ fn epoch_ms(at: tokio::time::Instant) -> u64 {
 
 /// Whether the turn may make another model call.
 fn calls_left(record: &agent_runtime::store::Bot, model_rounds: usize) -> bool {
-    model_rounds < MAX_ROUNDS && budget_error(record.budget_tokens, record.tokens_used).is_none()
-}
-
-fn budget_error(budget: Option<u64>, used: u64) -> Option<Error> {
-    budget.filter(|&cap| used >= cap).map(|cap| {
-        Error::with("budget_exhausted", format!("{used} of {cap} tokens used"))
-            .facts(json!({"budget_tokens":cap,"tokens_used":used}))
-    })
+    model_rounds < MAX_ROUNDS && record.exhausted().is_none()
 }
 
 /// Failures of the provider's pace, capacity, or transport, none of which say

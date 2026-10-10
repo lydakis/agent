@@ -59,6 +59,11 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   joined) or when the turn it started completes.
   A steer with an explicit workspace or model that differs from the running
   turn stays queued and runs separately with those choices.
+- `run --turn-budget-tokens N` caps this turn's input plus output tokens,
+  beside the bot's lifetime `--budget-tokens`. The turn fails with
+  `turn_budget_exhausted` before a call once it has spent N; the cap is
+  the turn's own, so the next turn starts from zero. A steer joins a turn
+  that already has its cap, so `steer` with the flag is `invalid_delivery`.
 - `run --workspace DIR` chooses the folder. A new bot starts in it, or in
   the directory `run` was invoked from. A bot keeps its folder: a later
   `run` without the flag runs there wherever it is invoked, and one with it
