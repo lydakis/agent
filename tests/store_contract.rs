@@ -49,6 +49,7 @@ fn binding() -> Binding<'static> {
         fallbacks: false,
         gate: None,
         settings: Default::default(),
+        request_id: None,
     }
 }
 /// Compaction planning as a turn runs it: a catch-up walk goes in pieces.
@@ -2263,7 +2264,7 @@ fn schema_41_turns_ran_at_their_bots_effort() {
 }
 
 #[test]
-fn schema_43_turns_report_no_summary_time_and_count_it_after() {
+fn schema_44_turns_report_no_summary_time_and_count_it_after() {
     let path = std::env::temp_dir().join(format!("agent-summary-ms-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let turn = {
@@ -2282,7 +2283,7 @@ fn schema_43_turns_report_no_summary_time_and_count_it_after() {
     };
     Connection::open(&path)
         .unwrap()
-        .execute_batch("ALTER TABLE turns DROP COLUMN summary_ms; PRAGMA user_version=43;")
+        .execute_batch("ALTER TABLE turns DROP COLUMN summary_ms; PRAGMA user_version=44;")
         .unwrap();
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     assert_eq!(db.turns("Bob", 0, 10).unwrap()["turns"][0]["summary_ms"], 0);
@@ -3679,6 +3680,7 @@ fn fork_events_publish_the_persisted_workspace() {
                 },
             )
             .unwrap();
+        let event = event.unwrap();
         assert_eq!(fork.workspace.as_deref(), Some(kept));
         assert_eq!(event["data"]["workspace"], json!(kept));
         let replay = db.events(name, 0, 10).unwrap();
@@ -3695,6 +3697,7 @@ fn forks_keep_the_binding_and_instructions_and_record_a_creator() {
     created.created_by = Some("Parent");
     created.created_by_id = Some(parent.id);
     let (bot, event) = db.create("Bob", Some("/synthetic"), created).unwrap();
+    let event = event.unwrap();
     assert_eq!(bot.created_by.as_deref(), Some("Parent"));
     assert_eq!(event["data"]["created_by"], "Parent");
     // The event carries the validated creator identity.
@@ -3725,7 +3728,10 @@ fn forks_keep_the_binding_and_instructions_and_record_a_creator() {
     let (changed, forked) = db.fork("Bob", "changed", Fork::default()).unwrap();
     assert_eq!(changed.instructions, "first text");
     assert_eq!(changed.created_by, None);
-    assert_eq!(forked["data"]["created_by"], serde_json::Value::Null);
+    assert_eq!(
+        forked.unwrap()["data"]["created_by"],
+        serde_json::Value::Null
+    );
     assert_eq!(db.inspect("Bob").unwrap().instructions, "first text");
     // Listing carries the creator; a fork keeps the model and tools.
     let page = db.list(None, 64).unwrap();
@@ -3798,7 +3804,7 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
     // round: before any round finishes, the turn's prompt.
     let (live, forked) = db.fork("Bob", "live", Fork { ..Fork::default() }).unwrap();
     assert_eq!(live.head, Some(mid - 2));
-    assert_eq!(forked["data"]["node"], mid - 2);
+    assert_eq!(forked.unwrap()["data"]["node"], mid - 2);
     db.tool_start(turn, &call).unwrap();
     let (_, entry) = db.tool_finish(turn, "c1", &result("hi")).unwrap();
     let answered = entry["data"]["node"].as_i64().unwrap();
@@ -5197,11 +5203,13 @@ fn global_gap_migration_finds_interior_holes_but_not_contiguous_events() {
     {
         let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
         let (_, first) = db.create("First", None, binding()).unwrap();
+        let first = first.unwrap();
         let (_, second) = db.create("Second", None, binding()).unwrap();
+        let second = second.unwrap();
         let (_, third) = db.create("Third", None, binding()).unwrap();
         assert!(first["cursor"].as_i64().unwrap() < second["cursor"].as_i64().unwrap());
         deleted = second["cursor"].as_i64().unwrap();
-        assert_eq!(third["cursor"], deleted + 1);
+        assert_eq!(third.unwrap()["cursor"], deleted + 1);
     }
     for remove in [false, true] {
         {
@@ -6207,7 +6215,10 @@ fn bot_identities_are_assigned_in_creation_order_and_never_reused() {
     {
         let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
         let (bob, event) = db.create("Bob", Some("/synthetic"), binding()).unwrap();
-        assert_eq!((bob.id, event["data"]["id"].as_i64()), (1, Some(1)));
+        assert_eq!(
+            (bob.id, event.unwrap()["data"]["id"].as_i64()),
+            (1, Some(1))
+        );
         converse(&mut db, "Bob", 1);
         let (fork, event) = db
             .fork(
@@ -6219,7 +6230,10 @@ fn bot_identities_are_assigned_in_creation_order_and_never_reused() {
                 },
             )
             .unwrap();
-        assert_eq!((fork.id, event["data"]["id"].as_i64()), (2, Some(2)));
+        assert_eq!(
+            (fork.id, event.unwrap()["data"]["id"].as_i64()),
+            (2, Some(2))
+        );
         assert_eq!(db.identity("Bob", Some(1)).unwrap(), 1);
         let stale = db.identity("Fork", Some(1)).unwrap_err();
         assert_eq!(stale.code, "bot_not_found");
@@ -9894,7 +9908,7 @@ fn a_fork_narrows_what_it_may_call_and_never_widens() {
         (reader.tools.as_slice(), reader.callable()),
         (&tools[..], &read[..])
     );
-    assert_eq!(forked["data"]["allowed"], json!(["read"]));
+    assert_eq!(forked.unwrap()["data"]["allowed"], json!(["read"]));
     // A call it may not make waits for no verdict: it is refused.
     assert!(db.inspect("Bob").unwrap().gated("shell"));
     assert!(!reader.gated("shell"));
@@ -10013,4 +10027,177 @@ fn a_denied_call_closes_its_round() {
     ));
     let denied = head(&db, "Bob");
     assert_eq!(fork_point(&mut db, "Bob", "after").unwrap(), denied);
+}
+
+#[test]
+fn a_resent_keyed_creation_gets_its_bot_and_a_changed_one_names_the_field() {
+    let mut db = db();
+    let keyed = || Binding {
+        request_id: Some("once"),
+        ..binding()
+    };
+    let (bob, event) = db.create("Bob", Some("/synthetic"), keyed()).unwrap();
+    assert!(event.is_some());
+    // The bot has worked since; a resend still gets it, with no new event.
+    converse(&mut db, "Bob", 1);
+    let (again, event) = db.create("Bob", Some("/synthetic"), keyed()).unwrap();
+    assert_eq!((again.id, event), (bob.id, None));
+    assert_eq!(again.head, db.inspect("Bob").unwrap().head);
+    let conflict = |db: &mut Database, binding: Binding<'_>, workspace: &str| {
+        let error = db.create("Bob", Some(workspace), binding).unwrap_err();
+        assert_eq!(error.code, "idempotency_conflict");
+        error.facts.unwrap()["field"].clone()
+    };
+    let other = Binding {
+        model: "other-model",
+        ..keyed()
+    };
+    assert_eq!(conflict(&mut db, other, "/synthetic"), "model");
+    assert_eq!(conflict(&mut db, keyed(), "/elsewhere"), "workspace");
+    let told = Binding {
+        instructions: "other text",
+        ..keyed()
+    };
+    assert_eq!(conflict(&mut db, told, "/synthetic"), "instructions");
+    // Another key, or none, is another creation of a taken name.
+    for request_id in [Some("twice"), None] {
+        let error = db
+            .create(
+                "Bob",
+                Some("/synthetic"),
+                Binding {
+                    request_id,
+                    ..binding()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "bot_exists");
+    }
+    // A bot made without a key is never mistaken for a resend.
+    db.create("Plain", Some("/synthetic"), binding()).unwrap();
+    let error = db.create("Plain", Some("/synthetic"), keyed()).unwrap_err();
+    assert_eq!(error.code, "bot_exists");
+    let created = db.events("Bob", 0, 10).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["event"] == "created")
+        .count();
+    assert_eq!(created, 1);
+}
+
+#[test]
+fn a_resent_keyed_fork_gets_its_fork_wherever_the_source_moved() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    converse(&mut db, "Bob", 1);
+    let keyed = Fork {
+        request_id: Some("branch"),
+        ..Fork::default()
+    };
+    let (fork, event) = db.fork("Bob", "Side", keyed).unwrap();
+    assert!(event.is_some());
+    converse(&mut db, "Bob", 2);
+    let (again, event) = db.fork("Bob", "Side", keyed).unwrap();
+    assert_eq!((again.id, again.head, event), (fork.id, fork.head, None));
+    let error = db
+        .fork(
+            "Bob",
+            "Side",
+            Fork {
+                checkpoint: fork.head,
+                ..keyed
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "idempotency_conflict");
+    assert_eq!(error.facts.unwrap()["field"], "checkpoint");
+    // A bot created under the key is not a fork of it.
+    let made = Binding {
+        request_id: Some("branch"),
+        ..binding()
+    };
+    db.create("Made", Some("/synthetic"), made).unwrap();
+    let error = db.fork("Bob", "Made", keyed).unwrap_err();
+    assert_eq!(error.facts.unwrap()["field"], "op");
+    assert_eq!(
+        db.fork("Bob", "Side", Fork::default()).unwrap_err().code,
+        "bot_exists"
+    );
+}
+
+#[test]
+fn a_deleted_identity_is_gone_and_a_later_namesake_is_not() {
+    let mut db = db();
+    let (first, _) = db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    assert!(!db.gone("Bob", first.id).unwrap());
+    while db.delete_bot_piece("Bob", first.id, 4).unwrap()["done"] != true {}
+    let (second, _) = db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let (alice, _) = db.create("Alice", Some("/synthetic"), binding()).unwrap();
+    assert!(db.gone("Bob", first.id).unwrap());
+    assert!(!db.gone("Bob", second.id).unwrap());
+    // An identity never issued, another bot's, or one deleted under another
+    // name is not this name's.
+    for (name, id) in [
+        ("Bob", alice.id + 1),
+        ("Other", second.id),
+        ("Bob", 0),
+        ("Alice", first.id),
+        ("Other", first.id),
+    ] {
+        assert_eq!(db.gone(name, id).unwrap_err().code, "bot_not_found");
+    }
+    // A keyed creation resent after its bot was deleted does not make it again.
+    let keyed = || Binding {
+        request_id: Some("once"),
+        ..binding()
+    };
+    let (kay, _) = db.create("Kay", Some("/synthetic"), keyed()).unwrap();
+    while db.delete_bot_piece("Kay", kay.id, 4).unwrap()["done"] != true {}
+    let error = db.create("Kay", Some("/synthetic"), keyed()).unwrap_err();
+    assert_eq!(error.code, "bot_deleted");
+    assert_eq!(error.facts.unwrap()["bot_id"], kay.id);
+    db.create("Kay", Some("/synthetic"), binding()).unwrap();
+}
+
+#[test]
+fn schema_43_bots_were_made_without_a_key() {
+    let path = std::env::temp_dir().join(format!("agent-creation-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    }
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "ALTER TABLE bots DROP COLUMN creation; DROP TABLE deleted_bots;
+             PRAGMA user_version=43;",
+        )
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let keyed = || Binding {
+        request_id: Some("once"),
+        ..binding()
+    };
+    assert_eq!(
+        db.create("Bob", Some("/synthetic"), keyed())
+            .unwrap_err()
+            .code,
+        "bot_exists"
+    );
+    db.create("Ann", Some("/synthetic"), keyed()).unwrap();
+    assert!(
+        db.create("Ann", Some("/synthetic"), keyed())
+            .unwrap()
+            .1
+            .is_none()
+    );
+    drop(db);
+    let version: i32 = Connection::open(&path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, Database::SCHEMA);
+    std::fs::remove_file(path).unwrap();
 }

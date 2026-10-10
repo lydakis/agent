@@ -295,6 +295,9 @@ pub struct Fork<'a> {
     /// The tools the fork may call, within its source's; `None` keeps the
     /// source's list.
     pub allow: Option<&'a [String]>,
+    /// The client's idempotency key: a resend with the same key and fields
+    /// gets the fork it made.
+    pub request_id: Option<&'a str>,
 }
 /// Provider binding chosen at creation; immutable for the bot's lifetime.
 pub struct Binding<'a> {
@@ -316,6 +319,9 @@ pub struct Binding<'a> {
     /// The bot's own gate; its creator's, if any, is added by the store.
     pub gate: Option<&'a Gate>,
     pub settings: Settings,
+    /// The client's idempotency key: a resend with the same key and fields
+    /// gets the bot it made.
+    pub request_id: Option<&'a str>,
 }
 #[derive(Debug)]
 pub struct Started {
@@ -982,6 +988,20 @@ fn split_tools(joined: &str) -> Vec<String> {
         .map(str::to_owned)
         .collect()
 }
+/// What a keyed creation stores to know its resend: the key and the
+/// request as sent. Without a key there is nothing to recognize.
+fn creation(request_id: Option<&str>, request: Option<Value>) -> Option<String> {
+    request_id
+        .zip(request)
+        .map(|(key, request)| json!({"request_id":key,"request":request}).to_string())
+}
+fn conflict(name: &str, field: &str) -> Error {
+    Error::with(
+        "idempotency_conflict",
+        format!("{field} differs from the request that made {name}"),
+    )
+    .facts(json!({"field":field}))
+}
 /// Durable events and their live copies share one shape.
 fn entry(cursor: i64, bot: &str, turn: Option<i64>, kind: &str, data: Value) -> Value {
     json!({"cursor":cursor,"bot":bot,"turn":turn,"event":kind,"data":data})
@@ -991,7 +1011,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 44;
+    pub const SCHEMA: i32 = 45;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1123,7 +1143,7 @@ impl Database {
                 thinking_from INTEGER NOT NULL DEFAULT 0,
                 thinking_to INTEGER NOT NULL DEFAULT 0,
                 thinking_elided INTEGER NOT NULL DEFAULT 0, gates TEXT, denials TEXT,
-                closed INTEGER, open_calls INTEGER, allowed TEXT, settings TEXT);
+                closed INTEGER, open_calls INTEGER, allowed TEXT, settings TEXT, creation TEXT);
             CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
             CREATE INDEX IF NOT EXISTS bots_note ON bots(note);
             CREATE INDEX IF NOT EXISTS bots_compaction ON bots(compaction);
@@ -1131,6 +1151,10 @@ impl Database {
             CREATE TABLE IF NOT EXISTS bot_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                 last_id INTEGER NOT NULL CHECK(last_id>=0));
             INSERT OR IGNORE INTO bot_sequence VALUES (1,0);
+            CREATE TABLE IF NOT EXISTS deleted_bots(id INTEGER PRIMARY KEY, name TEXT NOT NULL,
+                request_id TEXT);
+            CREATE INDEX IF NOT EXISTS deleted_bots_key ON deleted_bots(name,request_id)
+                WHERE request_id IS NOT NULL;
             CREATE TABLE IF NOT EXISTS store(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                 identity INTEGER NOT NULL);
             INSERT OR IGNORE INTO store VALUES (1,random());
@@ -1601,14 +1625,85 @@ impl Database {
             .optional()?
             .is_some())
     }
+    /// The bot a resent creation already made, if `name` was made by a
+    /// request with this key and these fields. A name made otherwise is
+    /// `bot_exists`; the same key with other fields names the first field
+    /// that differs. `None` means the name is free.
+    /// `request` is built only for a keyed creation; an unkeyed one pays
+    /// for nothing but the name lookup it always made.
+    fn resent(
+        &self,
+        name: &str,
+        request_id: Option<&str>,
+        request: Option<&Value>,
+    ) -> Result<Option<Bot>> {
+        let creation: Option<Option<String>> = self
+            .conn
+            .prepare_cached("SELECT creation FROM bots WHERE name=?")?
+            .query_row([name], |r| r.get(0))
+            .optional()?;
+        let Some(creation) = creation else {
+            let Some(key) = request_id else {
+                return Ok(None);
+            };
+            let deleted: Option<i64> = self
+                .conn
+                .prepare_cached("SELECT id FROM deleted_bots WHERE name=? AND request_id=?")?
+                .query_row([name, key], |r| r.get(0))
+                .optional()?;
+            return match deleted {
+                Some(id) => Err(Error::with(
+                    "bot_deleted",
+                    format!("the {name} this request made was deleted"),
+                )
+                .facts(json!({"bot_id":id}))),
+                None => Ok(None),
+            };
+        };
+        let creation: Option<Value> = creation.map(|c| serde_json::from_str(&c)).transpose()?;
+        let Some(creation) =
+            creation.filter(|c| request_id.is_some_and(|key| c["request_id"] == key))
+        else {
+            return fail("bot_exists");
+        };
+        let fields = request
+            .and_then(Value::as_object)
+            .expect("a keyed request is an object");
+        if let Some(field) = fields
+            .keys()
+            .find(|f| creation["request"][f.as_str()] != fields[*f])
+        {
+            return Err(conflict(name, field));
+        }
+        let bot = self.inspect(name)?;
+        if bot.status == "deleting" {
+            return fail_with("bot_not_found", format!("{name} is being deleted"));
+        }
+        Ok(Some(bot))
+    }
+    /// A new bot, and its `created` event; a resend of the request that made
+    /// it gets the bot and no event.
     pub fn create(
         &mut self,
         name: &str,
         workspace: Option<&str>,
         binding: Binding<'_>,
-    ) -> Result<(Bot, Value)> {
-        if self.exists(name)? {
-            return fail("bot_exists");
+    ) -> Result<(Bot, Option<Value>)> {
+        // As sent, so a resend compares equal whatever has happened since;
+        // the instructions are compared with the bot's own, never copied.
+        let request = binding.request_id.map(|_| json!({"op":"create","workspace":workspace,
+            "provider":binding.provider,"model":binding.model,"reasoning":binding.reasoning,
+            "budget_tokens":binding.budget_tokens,"tools":binding.tools,"created_by":binding.created_by,
+            "created_by_id":binding.created_by_id,"compaction_model":binding.compaction_model,
+            "fallbacks":binding.fallbacks,"gate":binding.gate,"settings":binding.settings}));
+        if let Some(bot) = self.resent(name, binding.request_id, request.as_ref())? {
+            if bot.instructions != binding.instructions {
+                return Err(conflict(name, "instructions"));
+            }
+            if bot.compaction_instructions.as_deref() != binding.compaction_instructions {
+                return Err(conflict(name, "compaction_instructions"));
+            }
+            return Ok((bot, None));
         }
         if let Some(gate) = binding.gate
             && gate.tools.iter().any(|t| !binding.tools.contains(t))
@@ -1625,7 +1720,7 @@ impl Database {
             binding.tools,
         ))?;
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,fallbacks,gates,settings) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,fallbacks,gates,settings,creation) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?)",
             params![
                 name,
                 id,
@@ -1643,7 +1738,8 @@ impl Database {
                 binding.compaction_model,
                 binding.fallbacks,
                 gates,
-                binding.settings.stored()?
+                binding.settings.stored()?,
+                creation(binding.request_id, request)
             ],
         )?;
         // The event carries the list record's fields, so a follower can
@@ -1658,7 +1754,7 @@ impl Database {
         tx.commit()?;
         Ok((
             self.inspect(name)?,
-            entry(cursor, name, None, "created", data),
+            Some(entry(cursor, name, None, "created", data)),
         ))
     }
     /// Is `node` on the path from `head` back to the root?
@@ -3375,6 +3471,28 @@ impl Database {
             ),
             _ => Ok(id),
         }
+    }
+    /// Whether identity `id`, named `name` by a delete, is already gone:
+    /// `name` held it and it was deleted. Then a resent delete succeeds
+    /// without touching a later bot of the same name. An identity `name`
+    /// never held is `bot_not_found`.
+    pub fn gone(&self, name: &str, id: i64) -> Result<bool> {
+        let held: Option<String> = self
+            .conn
+            .prepare_cached("SELECT name FROM bots WHERE id=?")?
+            .query_row([id], |r| r.get(0))
+            .optional()?;
+        if held.as_deref() == Some(name) {
+            return Ok(false);
+        }
+        let deleted: bool = self
+            .conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM deleted_bots WHERE id=? AND name=?)")?
+            .query_row(params![id, name], |r| r.get(0))?;
+        if deleted {
+            return Ok(true);
+        }
+        fail_with("bot_not_found", format!("{name} is not identity {id}"))
     }
     pub fn begin(
         &mut self,
@@ -5558,7 +5676,15 @@ impl Database {
     /// source itself is never changed. The fork copies the
     /// source's binding, instructions, and tools as they are, so its first
     /// call repeats the source's prefix and can read the source's cache.
-    pub fn fork(&mut self, source: &str, name: &str, fork: Fork<'_>) -> Result<(Bot, Value)> {
+    /// A new bot from `source`'s history, and its `forked` event; a resend
+    /// of the request that made it gets the fork and no event, wherever its
+    /// source has moved since.
+    pub fn fork(
+        &mut self,
+        source: &str,
+        name: &str,
+        fork: Fork<'_>,
+    ) -> Result<(Bot, Option<Value>)> {
         let Fork {
             checkpoint: node,
             workspace,
@@ -5567,7 +5693,16 @@ impl Database {
             created_by_id,
             gate,
             allow,
+            request_id,
         } = fork;
+        let request = request_id.map(|_| {
+            json!({"op":"fork","source":source,"checkpoint":node,
+            "workspace":workspace,"budget_tokens":budget_tokens,"created_by":created_by,
+            "created_by_id":created_by_id,"gate":gate,"allow":allow})
+        });
+        if let Some(bot) = self.resent(name, request_id, request.as_ref())? {
+            return Ok((bot, None));
+        }
         let parent = self.inspect(source)?;
         // A fork starts where its source is unless told otherwise.
         let workspace = workspace.or(parent.workspace.as_deref());
@@ -5610,9 +5745,6 @@ impl Database {
         if let Some(node) = checkpoint.filter(|_| !validated) {
             self.validate_fork_point(node)?;
         }
-        if self.exists(name)? {
-            return fail("bot_exists");
-        }
         if parent.status == "deleting" {
             return fail_with("bot_not_found", format!("{source} is being deleted"));
         }
@@ -5653,7 +5785,7 @@ impl Database {
             &parent.tools,
         ))?;
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,thinking_from,thinking_to,thinking_elided,gates,allowed,settings) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,thinking_from,thinking_to,thinking_elided,gates,allowed,settings,creation) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 name,
                 id,
@@ -5684,7 +5816,8 @@ impl Database {
                 thinking.2,
                 gates,
                 allowed.as_ref().map(|allowed| allowed.join(",")),
-                parent.settings.stored()?
+                parent.settings.stored()?,
+                creation(request_id, request)
             ],
         )?;
         if let Some(node) = checkpoint {
@@ -5742,7 +5875,7 @@ impl Database {
         tx.commit()?;
         Ok((
             self.inspect(name)?,
-            entry(cursor, name, None, "forked", data),
+            Some(entry(cursor, name, None, "forked", data)),
         ))
     }
     pub fn events(&self, name: &str, after: i64, limit: usize) -> Result<Value> {
@@ -5971,6 +6104,14 @@ impl Database {
             node = parent;
         }
         tx.execute("DELETE FROM events WHERE bot=?", [name])?;
+        // The identity's name and creation key outlive it, so a resent
+        // delete is told apart from a delete of some other identity, and a
+        // resent creation never makes the bot again.
+        tx.execute(
+            "INSERT INTO deleted_bots
+             SELECT id,name,json_extract(creation,'$.request_id') FROM bots WHERE name=?",
+            [name],
+        )?;
         tx.execute("DELETE FROM bots WHERE name=?", [name])?;
         out["nodes"] = json!(freed);
         out["done"] = json!(true);
@@ -7644,11 +7785,20 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         }
     }
     if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='creation')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 43 -> 44: a keyed creation's request, to recognize its resend.
+        // Earlier bots were made without a key, so none is recorded.
+        conn.execute_batch("ALTER TABLE bots ADD COLUMN creation TEXT;")?;
+    }
+    if !conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='summary_ms')",
         [],
         |r| r.get::<_, bool>(0),
     )? {
-        // 43 -> 44: how long summaries held each turn. None was counted
+        // 44 -> 45: how long summaries held each turn. None was counted
         // before, so stored turns report zero.
         conn.execute_batch("ALTER TABLE turns ADD COLUMN summary_ms INTEGER NOT NULL DEFAULT 0;")?;
     }

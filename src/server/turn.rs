@@ -4019,6 +4019,7 @@ mod tests {
                             fallbacks: false,
                             gate: None,
                             settings: Default::default(),
+                            request_id: None,
                         },
                     )?;
                     let turn = db

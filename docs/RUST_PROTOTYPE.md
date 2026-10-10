@@ -869,11 +869,11 @@ own path from the turn. Example requests:
 {"id":20,"op":"history_nodes","bot":"Alternative","from":2,"limit":400}
 {"id":6,"op":"history_items","bot":"Bob","nodes":[2]}
 {"id":13,"op":"artifact","bot":"Bob","turn":1,"call_id":"call_1","stream":"stdout","offset":0,"limit":65536}
-{"id":8,"op":"fork","source":"Bob","checkpoint":2,"bot":"Alternative"}
+{"id":8,"op":"fork","source":"Bob","checkpoint":2,"bot":"Alternative","request_id":"alt-1"}
 {"id":9,"op":"interrupt","bot":"Bob","turn":1}
 {"id":11,"op":"bots","after":null,"limit":64}
 {"id":14,"op":"prune","bot":"Bob","keep_turns":8}
-{"id":15,"op":"delete","bot":"Bob"}
+{"id":15,"op":"delete","bot":"Bob","bot_id":1}
 {"id":16,"op":"follow","bot":"*","after":0}
 {"id":17,"op":"wait","handles":["turn:Bob/1","turn:Alice/3"],"any":true,"timeout_ms":60000}
 {"id":18,"op":"stats"}
@@ -1146,6 +1146,21 @@ event records the values actually used. Duplicate reconciliation still works whe
 turn slots are occupied; capacity rejection never writes a fresh submission.
 A bot permits one running turn. Interrupt requires its exact current turn ID.
 A missing bot never creates a replacement implicitly.
+
+`create` and `fork` take an optional `request_id` for the same purpose. The bot
+keeps the key and the request as sent, so a resend with the same key and
+fields returns the bot it made, with `duplicate: true` and no `cursor`, and
+writes nothing; a fork's resend is answered from the fork even after its source
+moved or was deleted. The same key with any field changed is
+`idempotency_conflict`, naming the field in `detail` and `field`. A name taken
+by an unkeyed creation or another key is `bot_exists`. Once the bot a key made
+is deleted, any request with that name and key is `bot_deleted`, with the
+deleted bot's `bot_id`, and never makes the bot again. Their replies are the
+bot record (`name`, `id`, ...) plus `duplicate`. `delete` takes an optional
+`bot_id`: resent while the first deletion runs or after it finished, it
+succeeds with `duplicate: true`, and an identity that name never held is
+`bot_not_found`. Its reply carries `bot`, `bot_id`, `duplicate` and the counts
+it freed. Protocol 7 adds these fields.
 
 ### Delivery modes
 

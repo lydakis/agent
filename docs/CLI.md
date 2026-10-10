@@ -20,6 +20,19 @@ The ID stays pinned after deletion, so a replacement with the same name rejects
 the call instead of receiving the work.
 `run` without `--bot` creates a fresh identity. `run --bot NAME` continues an
 existing bot; add `--new` to create that name. A prompt of `-` reads stdin.
+
+A command that lost its reply is resent unchanged. `run --request-id ID` keys
+both the creation and the submission, so `run --new --bot NAME --request-id ID`
+resent gets the bot and the turn it made, with `duplicate: true`, rather than
+`bot_exists`; `fork --request-id ID` does the same for a fork, wherever its
+source has moved since, even once the source is deleted. Once the bot a keyed
+command made is deleted, any command with that name and key is `bot_deleted`
+rather than a new bot. The same key with any other field changed is
+`idempotency_conflict`, with the field named in `detail` and `field`, and a
+name taken by any other request is still `bot_exists`. `rm --bot NAME --bot-id
+N` deletes that identity: resent while it runs or once it is gone, it
+succeeds as a duplicate and leaves a later bot of the same name alone. An
+identity that name never held is `bot_not_found`.
 `follow --bot NAME` replays and follows the selected current turn to its end;
 an idle bot returns after replay. `follow --all` stays connected for future work.
 
@@ -138,6 +151,24 @@ rejected on commands with no output. Diagnostics go to stderr. Rendered model
 text and tool output keep their line breaks and tabs; any other character a
 terminal would act on is printed escaped, so a stream cannot hide or restyle a
 call waiting for approval.
+
+On a terminal, `run --pretty` and `follow --pretty` also report program status
+([OSC 7501](https://www.superlogical.com/rex/docs/build/program-status)), so a
+terminal that supports it can mark the tab: `working` while the turn runs,
+`blocked` (`kind=permission`) while a call waits for a person's approval (a
+`manual` gate; a program's gate, like `auto`, is still `working`), then `done`,
+`error`, or `idle` when the turn completes, fails, or is interrupted. `follow
+--all --pretty` reports one record per bot, with the bot's name as its id, and
+clears a deleted bot's record; only the bot's running turn moves it, not one
+queued behind. History replayed before the stream goes live reports only turns
+still running. Each report has `app=agent` and the bot's
+name as its title, and is written once per change. Nothing is written when
+stdout is not a terminal.
+
+![A bot waits for approval and its tab says so](demo/program-status.gif)
+
+The recording is `run --pretty` against the offline playground, replayed in
+xterm.js with a small OSC 7501 handler that draws the tab's mark.
 
 | Exit | Meaning |
 | --- | --- |
