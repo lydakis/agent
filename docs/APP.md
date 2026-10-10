@@ -1200,6 +1200,10 @@ after, limit: 1}` (an indexed lookup each, about 2·log2 of the cursor), and
 the watcher keeps where it is per trigger in `~/.agent/triggers/NAME.watch`,
 written only when that agent ends a turn, and for one that fires only once
 its ask is on disk: a restart replays from there, so no turn end is missed.
+A place it cannot read (malformed, or not readable) is not a fresh start,
+which would skip every turn end since: the trigger ends, saying so
+(`watch_unreadable`). A place it has never had, or an earlier trigger's of
+the same name, starts at the agent's newest event.
 A turn end that counts is an ask in the trigger's queue saying why (`turn
 end of BOT: turn:BOT/N completed`), under the lock `rm` takes and only
 while the plist is still that trigger's; launchd runs the fire for it, as
@@ -1212,10 +1216,15 @@ make, sends it back to what is on disk to read those turn ends again. The
 watcher runs nothing itself, so restarting it never ends a fire still
 waiting on `--reply-to`; turn ends during a long fire are each sent after
 it, in order. The `request_id` of a turn is read from its `accepted` or
-`queued` event, since a queued turn can end without starting. On each
+`queued` event, since a queued turn can end without starting; while such a
+turn has not ended, the place kept says to read again from before that
+event, and only turn ends past the last one counted count, so a restart
+still knows whose that turn is. On each
 connection the watcher looks each agent up once however many triggers
 follow it, and reads events while its follows go out, so a long replay
-never fills what the client holds unread. A trigger that goes, by `rm` or
+never fills what the client holds unread. A trigger whose agent is gone
+is done only once that end is on disk and the trigger gone; else it is
+looked at again on the next connection. A trigger that goes, by `rm` or
 its own end (its runs, its agent gone), unloads its own job first and
 then restarts the watcher, which reads the ones left, or unloads it with
 the last; one whose plist cannot be read but whose place is kept does the

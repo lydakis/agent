@@ -8,7 +8,9 @@
 //! (`NAME.watch`), once the ask is on disk, so a restart misses no turn end.
 //! An ask is named by its turn end's place in those events, so one asked
 //! again by a watcher stopped before it saved is the same ask, or one its
-//! fire already took (`take_ask`): none is sent twice.
+//! fire already took (`take_ask`): none is sent twice. A turn a trigger sent
+//! that has not ended keeps the place it is read again from before it, so a
+//! restart still knows it for that trigger's.
 use super::*;
 use std::collections::HashMap;
 
@@ -21,6 +23,9 @@ struct Watched {
     trigger: Trigger,
     /// The last event of its agent it has counted, or passed over.
     cursor: Option<i64>,
+    /// Where its agent's events are read again from after a restart: before
+    /// any turn a trigger sent that has not ended, else its cursor.
+    from: Option<i64>,
     /// Turn ends counted since it last fired.
     count: u64,
     done: bool,
@@ -50,8 +55,9 @@ enum Step {
 }
 
 /// The `request_id`s of turns triggers sent, by agent and turn, from their
-/// `accepted` or `queued` events, until those turns end.
-type Sent = HashMap<(String, i64), String>;
+/// `accepted` or `queued` events, and where the first of those events is,
+/// until those turns end.
+type Sent = HashMap<(String, i64), (String, i64)>;
 
 /// What one event means for the triggers following its agent. Only a turn
 /// that ends after a trigger's cursor counts, and not one the trigger sent.
@@ -77,7 +83,9 @@ fn step(watched: &mut [Watched], sent: &mut Sent, event: &Value) -> Vec<Step> {
                     let oldest = turns[MAX_SENT / 2];
                     sent.retain(|(_, t), _| *t >= oldest);
                 }
-                sent.insert((bot.to_owned(), turn), id.to_owned());
+                let at = event["cursor"].as_i64().unwrap_or(0);
+                sent.entry((bot.to_owned(), turn))
+                    .or_insert_with(|| (id.to_owned(), at));
             }
         }
         // Deleted while followed: its triggers end.
@@ -116,7 +124,7 @@ fn step(watched: &mut [Watched], sent: &mut Sent, event: &Value) -> Vec<Step> {
             else {
                 return steps;
             };
-            let by = sent.remove(&(bot.to_owned(), turn));
+            let by = sent.remove(&(bot.to_owned(), turn)).map(|(id, _)| id);
             for (i, w) in watched.iter_mut().enumerate() {
                 if w.done || w.source() != bot || w.cursor.is_some_and(|c| cursor <= c) {
                     continue;
@@ -165,17 +173,22 @@ pub fn watch_cli() -> i32 {
         let Ok(socket) = trigger.daemon.socket() else {
             continue;
         };
-        let (cursor, count) = match read_watched(&places, &trigger) {
-            Some((cursor, count)) => (Some(cursor), count),
-            None => (None, 0),
+        let place = match read_watched(&places, &trigger) {
+            Ok(place) => place,
+            // Its place lost, it cannot know which turn ends it has counted.
+            Err(error) => {
+                stops(&places, &trigger, error, &launchctl);
+                continue;
+            }
         };
         daemons
             .entry((socket, trigger.store_id.clone()))
             .or_default()
             .push(Watched {
                 trigger,
-                cursor,
-                count,
+                cursor: place.map(|p| p.cursor),
+                from: place.map(|p| p.from),
+                count: place.map_or(0, |p| p.count),
                 done: false,
             });
     }
@@ -262,7 +275,7 @@ async fn follow(places: Places, socket: PathBuf, store: String, mut watched: Vec
                 event = events.recv() => {
                     let Some(event) = event else { break };
                     for step in step(&mut watched, &mut sent, &event) {
-                        kept &= act(&places, &mut watched, step);
+                        kept &= act(&places, &mut watched, &sent, step);
                     }
                     if !kept || watched.iter().all(|w| w.done) {
                         break;
@@ -277,8 +290,16 @@ async fn follow(places: Places, socket: PathBuf, store: String, mut watched: Vec
         // turn ends again.
         if !kept {
             for w in watched.iter_mut().filter(|w| !w.done) {
-                if let Some((cursor, count)) = read_watched(&places, &w.trigger) {
-                    (w.cursor, w.count) = (Some(cursor), count);
+                match read_watched(&places, &w.trigger) {
+                    Ok(Some(place)) => {
+                        (w.cursor, w.from, w.count) =
+                            (Some(place.cursor), Some(place.from), place.count);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        w.done = true;
+                        stops(&places, &w.trigger, error, &launchctl);
+                    }
                 }
             }
             tokio::time::sleep(wait).await;
@@ -311,15 +332,19 @@ async fn begin(
             }
         };
         if now != w.source_id() {
-            w.done = true;
             let gone = json!({"outcome": "gone", "detail": format!("bot_not_found: {} is gone", w.source())});
-            settle(
+            // Done once that is on disk and the trigger gone; else it is
+            // looked at again on the next connection.
+            w.done = settle(
                 places,
                 &w.trigger,
                 &gone,
                 &Kept::of(&state(places, &w.trigger)),
                 &launchctl,
             );
+            if !w.done {
+                return Err(format!("{}: its end was not recorded", w.trigger.name));
+            }
             continue;
         }
         if w.cursor.is_none() {
@@ -330,12 +355,12 @@ async fn begin(
                     .or_insert(newest_cursor(client, &source).await?),
             };
             w.cursor = Some(at);
-            save(places, w)?;
+            save(places, w, &Sent::new())?;
         }
     }
     let mut from = HashMap::<String, i64>::new();
     for w in watched.iter().filter(|w| !w.done) {
-        let at = w.cursor.unwrap_or(0);
+        let at = w.from.or(w.cursor).unwrap_or(0);
         from.entry(w.source().to_owned())
             .and_modify(|c| *c = (*c).min(at))
             .or_insert(at);
@@ -343,49 +368,38 @@ async fn begin(
     Ok(from.into_iter().collect())
 }
 
-/// Do one step; false when an ask could not be made or a place saved, so
-/// the watcher reads those turn ends again from where it last saved.
-fn act(places: &Places, watched: &mut [Watched], step: Step) -> bool {
+/// Do one step; false when an ask could not be made, a place saved, or an
+/// end recorded, so the watcher reads those events again from where it last
+/// saved.
+fn act(places: &Places, watched: &mut [Watched], sent: &Sent, step: Step) -> bool {
     let log = |error: String| {
         eprintln!("{}", error_json(&error));
         false
     };
+    let record = |w: &Watched, outcome: Value| {
+        let kept = Kept::of(&state(places, &w.trigger));
+        settle(places, &w.trigger, &outcome, &kept, &launchctl)
+    };
     match step {
-        Step::Save(i) => return save(places, &watched[i]).map_or_else(log, |()| true),
+        Step::Save(i) => save(places, &mut watched[i], sent).map_or_else(log, |()| true),
+        // Done once its end is on disk and the trigger gone.
         Step::Gone(i, detail) => {
-            let trigger = &watched[i].trigger;
-            let gone = json!({"outcome": "gone", "detail": detail});
-            settle(
-                places,
-                trigger,
-                &gone,
-                &Kept::of(&state(places, trigger)),
-                &launchctl,
-            );
+            let w = &mut watched[i];
+            w.done = record(w, json!({"outcome": "gone", "detail": detail}));
+            w.done
         }
-        Step::Gap(i, detail) => {
-            let trigger = &watched[i].trigger;
-            let gap = json!({"outcome": "failed", "detail": detail});
-            settle(
-                places,
-                trigger,
-                &gap,
-                &Kept::of(&state(places, trigger)),
-                &launchctl,
-            );
-        }
+        Step::Gap(i, detail) => record(&watched[i], json!({"outcome": "failed", "detail": detail})),
         Step::Fire(i, why) => {
             let w = &mut watched[i];
             // Where it is goes on disk only once the ask is: a watcher
             // stopped before then asks again, which is the same ask.
             let asked = ask_fire(places, w, &why).and_then(|()| match w.done {
-                false => save(places, w),
+                false => save(places, w, sent),
                 true => Ok(()),
             });
-            return asked.map_or_else(log, |()| true);
+            asked.map_or_else(log, |()| true)
         }
     }
-    true
 }
 
 /// Ask for the trigger's fire, saying why, under the lock `rm` takes, and
@@ -401,31 +415,68 @@ fn ask_fire(places: &Places, w: &mut Watched, why: &str) -> Result<(), String> {
     ask_turn(places, &w.trigger.name, w.cursor.unwrap_or(0), why)
 }
 
-fn save(places: &Places, w: &Watched) -> Result<(), String> {
-    save_watched(places, &w.trigger, w.cursor.unwrap_or(0), w.count)
+/// Keep where it is, and where to read again from: before the first event
+/// of a turn a trigger sent that has not ended, whose end would otherwise
+/// be read without knowing whose it was.
+fn save(places: &Places, w: &mut Watched, sent: &Sent) -> Result<(), String> {
+    let cursor = w.cursor.unwrap_or(0);
+    let from = sent
+        .iter()
+        .filter(|((bot, _), _)| bot == w.source())
+        .map(|(_, (_, at))| at - 1)
+        .fold(cursor, i64::min);
+    w.from = Some(from);
+    save_watched(
+        places,
+        &w.trigger,
+        Place {
+            cursor,
+            count: w.count,
+            from,
+        },
+    )
 }
 
-pub(super) fn save_watched(
-    places: &Places,
-    trigger: &Trigger,
-    cursor: i64,
-    count: u64,
-) -> Result<(), String> {
-    let kept = json!({"generation": trigger.generation, "cursor": cursor, "count": count});
+/// Where the watcher is for a trigger, as it keeps it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct Place {
+    /// The last event counted or passed over.
+    pub cursor: i64,
+    /// Turn ends counted since it last fired.
+    pub count: u64,
+    /// Where to read its agent's events again from.
+    pub from: i64,
+}
+
+pub(super) fn save_watched(places: &Places, trigger: &Trigger, place: Place) -> Result<(), String> {
+    let kept = json!({"generation": trigger.generation, "cursor": place.cursor,
+        "count": place.count, "from": place.from});
     replace(&places.watched(&trigger.name), &kept.to_string())
 }
 
-/// Where the watcher is for this trigger, when it is this trigger's.
-pub(super) fn read_watched(places: &Places, trigger: &Trigger) -> Option<(i64, u64)> {
-    let kept = read_json(&places.watched(&trigger.name))?;
-    (kept["generation"] == trigger.generation)
-        .then(|| {
-            Some((
-                kept["cursor"].as_i64()?,
-                kept["count"].as_u64().unwrap_or(0),
-            ))
-        })
-        .flatten()
+/// Where the watcher is for this trigger; none for a trigger it has not
+/// started on, or an earlier one's of the same name. One it cannot read is
+/// an error: starting over would skip every turn end since.
+pub(super) fn read_watched(places: &Places, trigger: &Trigger) -> Result<Option<Place>, String> {
+    let path = places.watched(&trigger.name);
+    if let Err(e) = std::fs::symlink_metadata(&path)
+        && e.kind() == std::io::ErrorKind::NotFound
+    {
+        return Ok(None);
+    }
+    let text =
+        read_record(&path).map_err(|e| format!("watch_unreadable: {}: {e}", path.display()))?;
+    let unreadable = || format!("watch_unreadable: {}: not a watcher place", path.display());
+    let kept: Value = serde_json::from_str(&text).map_err(|_| unreadable())?;
+    if kept["generation"] != trigger.generation {
+        return Ok(None);
+    }
+    let cursor = kept["cursor"].as_i64().ok_or_else(unreadable)?;
+    Ok(Some(Place {
+        cursor,
+        count: kept["count"].as_u64().unwrap_or(0),
+        from: kept["from"].as_i64().unwrap_or(cursor).min(cursor),
+    }))
 }
 
 /// An agent's newest event cursor. Its events after a cursor are none from
@@ -561,6 +612,7 @@ mod tests {
         Watched {
             trigger,
             cursor: Some(cursor),
+            from: None,
             count: 0,
             done: false,
         }
@@ -732,13 +784,30 @@ mod tests {
         );
         std::fs::write(places.plist("t"), text).unwrap();
         let why = "turn end of p.task: turn:p.task/3 completed";
-        assert!(act(&places, &mut w, Step::Fire(0, why.into())));
-        assert_eq!(read_watched(&places, &w[0].trigger), Some((7, 0)));
+        assert!(act(
+            &places,
+            &mut w,
+            &Sent::new(),
+            Step::Fire(0, why.into())
+        ));
+        assert_eq!(
+            read_watched(&places, &w[0].trigger),
+            Ok(Some(Place {
+                cursor: 7,
+                count: 0,
+                from: 7
+            }))
+        );
         let asked = take_ask(&places, &w[0].trigger).unwrap().unwrap();
         assert_eq!((asked.why.as_str(), asked.kind), (why, Ask::Turn(7)));
         // A watcher stopped before it saved asks again: the same ask, which
         // the fire holding it takes with it.
-        assert!(act(&places, &mut w, Step::Fire(0, why.into())));
+        assert!(act(
+            &places,
+            &mut w,
+            &Sent::new(),
+            Step::Fire(0, why.into())
+        ));
         assert_eq!(std::fs::read_dir(places.asks("t")).unwrap().count(), 1);
         let again = take_ask(&places, &w[0].trigger).unwrap().unwrap();
         assert_eq!(again.path, asked.path);
@@ -749,14 +818,70 @@ mod tests {
         std::fs::remove_file(places.watched("t")).unwrap();
         std::fs::remove_dir_all(places.asks("t")).unwrap();
         std::fs::write(places.asks("t"), "").unwrap();
-        assert!(!act(&places, &mut w, Step::Fire(0, why.into())));
-        assert_eq!(read_watched(&places, &w[0].trigger), None);
+        assert!(!act(
+            &places,
+            &mut w,
+            &Sent::new(),
+            Step::Fire(0, why.into())
+        ));
+        assert_eq!(read_watched(&places, &w[0].trigger), Ok(None));
         std::fs::remove_file(places.asks("t")).unwrap();
+        // An end it cannot record leaves it watching, to end it again.
+        std::fs::create_dir_all(places.last("t")).unwrap();
+        w[0].done = true;
+        let gone = Step::Gone(0, "bot_not_found: p.task was deleted".into());
+        assert!(!act(&places, &mut w, &Sent::new(), gone));
+        assert!(!w[0].done);
+        std::fs::remove_dir_all(places.last("t")).unwrap();
         // Its trigger gone: done, with nothing asked.
         std::fs::remove_file(places.plist("t")).unwrap();
-        assert!(act(&places, &mut w, Step::Fire(0, why.into())));
+        assert!(act(
+            &places,
+            &mut w,
+            &Sent::new(),
+            Step::Fire(0, why.into())
+        ));
         assert!(w[0].done);
         assert!(take_ask(&places, &w[0].trigger).unwrap().is_none());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_restart_reads_again_from_before_a_turn_it_sent_that_has_not_ended() {
+        let root = std::env::temp_dir().join(format!("agent-watch-from-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let places = Places {
+            agents: root.join("LaunchAgents"),
+            state: root.join("triggers"),
+        };
+        std::fs::create_dir_all(&places.state).unwrap();
+        let mut w = vec![watched("t", "p.task", None, 0)];
+        let own = sent_by(&w[0].trigger);
+        let mut sent = Sent::new();
+        let mut queued = accepted("p.task", 4, 5, &format!("{own}q"));
+        queued["event"] = json!("queued");
+        step(&mut w, &mut sent, &queued);
+        // Another turn ends meanwhile; its place is past that queued turn.
+        let steps = step(&mut w, &mut sent, &ended("p.task", 3, 8));
+        assert!(matches!(steps[..], [Step::Fire(0, _)]));
+        assert!(save(&places, &mut w[0], &sent).is_ok());
+        let place = read_watched(&places, &w[0].trigger).unwrap().unwrap();
+        assert_eq!((place.cursor, place.from), (8, 4));
+        // Restarted, it reads from there: the queued turn is known again,
+        // the turn end it counted is not counted again, and the queued
+        // turn's end is the trigger's own.
+        let mut again = vec![watched("t", "p.task", None, place.cursor)];
+        let mut sent = Sent::new();
+        step(&mut again, &mut sent, &queued);
+        assert_eq!(step(&mut again, &mut sent, &ended("p.task", 3, 8)), vec![]);
+        assert_eq!(
+            step(&mut again, &mut sent, &ended("p.task", 4, 9)),
+            vec![Step::Save(0)]
+        );
+        // Once it ended, the place to read again from is the cursor.
+        assert!(save(&places, &mut again[0], &sent).is_ok());
+        let place = read_watched(&places, &again[0].trigger).unwrap().unwrap();
+        assert_eq!((place.cursor, place.from), (9, 9));
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -890,7 +1015,12 @@ mod tests {
         );
         // The last going, its plist unreadable but its place kept: its own
         // job goes first, then the watcher, which may be what retires it.
-        save_watched(&places, &w.trigger, 3, 0).unwrap();
+        let place = |cursor, count| Place {
+            cursor,
+            count,
+            from: cursor,
+        };
+        save_watched(&places, &w.trigger, place(3, 0)).unwrap();
         std::fs::write(places.plist("t"), "not a plist").unwrap();
         retire(&places, "t", false, &launchd).unwrap();
         assert_eq!(
@@ -899,13 +1029,20 @@ mod tests {
         );
         assert!(!places.watcher().exists() && !places.watched("t").exists());
         // A kept place is this generation's only.
-        save_watched(&places, &w.trigger, 41, 2).unwrap();
-        assert_eq!(read_watched(&places, &w.trigger), Some((41, 2)));
+        save_watched(&places, &w.trigger, place(41, 2)).unwrap();
+        assert_eq!(read_watched(&places, &w.trigger), Ok(Some(place(41, 2))));
         let later = Trigger {
             generation: "h".into(),
             ..w.trigger.clone()
         };
-        assert_eq!(read_watched(&places, &later), None);
+        assert_eq!(read_watched(&places, &later), Ok(None));
+        // One it cannot read is no fresh start: that would skip turn ends.
+        std::fs::write(places.watched("t"), "{\"generation\": \"g\"").unwrap();
+        assert!(
+            read_watched(&places, &w.trigger)
+                .unwrap_err()
+                .starts_with("watch_unreadable")
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

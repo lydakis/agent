@@ -1684,8 +1684,19 @@ impl Kept {
 /// under the lock, and only while the plist is still this trigger's. One
 /// replaced or removed while its message went out is left as it now is; a
 /// job left loaded after its plist went (an end cut short) is unloaded.
-fn settle(places: &Places, trigger: &Trigger, outcome: &Value, kept: &Kept, launchd: Loader) {
-    let log = |error: String| eprintln!("{}", error_json(&error));
+/// Whether that is all done: false when what it did is not on disk, or the
+/// trigger it ends is still there.
+fn settle(
+    places: &Places,
+    trigger: &Trigger,
+    outcome: &Value,
+    kept: &Kept,
+    launchd: Loader,
+) -> bool {
+    let log = |error: String| {
+        eprintln!("{}", error_json(&error));
+        false
+    };
     let _lock = match Lock::take(places) {
         Ok(lock) => lock,
         Err(error) => return log(error),
@@ -1695,15 +1706,12 @@ fn settle(places: &Places, trigger: &Trigger, outcome: &Value, kept: &Kept, laun
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Under the lock no `add` is between writing and loading one.
-            if let Err(error) = retire(places, &trigger.name, true, launchd) {
-                log(error);
-            }
-            return;
+            return retire(places, &trigger.name, true, launchd).map_or_else(log, |_| true);
         }
         Err(e) => return log(format!("{}: {e}", path.display())),
     };
     if read_plist(&text).is_none_or(|(now, _)| now != *trigger) {
-        return;
+        return true;
     }
     let sent = outcome["outcome"] == "sent";
     let kept = Kept {
@@ -1723,12 +1731,10 @@ fn settle(places: &Places, trigger: &Trigger, outcome: &Value, kept: &Kept, laun
     // stays, listed.
     // An answer that did not get through keeps its row, saying so.
     let kept_row = !sent || outcome["reply"]["outcome"] == "failed";
-    if over
-        && (sent || recorded.is_ok())
-        && let Err(error) = retire(places, &trigger.name, kept_row, launchd)
-    {
-        log(error);
+    if over && (sent || recorded.is_ok()) {
+        return retire(places, &trigger.name, kept_row, launchd).map_or_else(log, |_| true);
     }
+    recorded.is_ok()
 }
 
 /// The one way a trigger goes, by `rm` or by its own end, under the lock:
@@ -2556,9 +2562,17 @@ fn start_watch(places: &Places, trigger: &Trigger, cursor: i64) -> Result<(), St
             trigger.name
         ));
     }
-    match read_watched(places, trigger) {
+    match read_watched(places, trigger)? {
         Some(_) => Ok(()),
-        None => save_watched(places, trigger, cursor, 0),
+        None => save_watched(
+            places,
+            trigger,
+            watch::Place {
+                cursor,
+                count: 0,
+                from: cursor,
+            },
+        ),
     }
 }
 
@@ -2968,7 +2982,9 @@ fn fire(places: &Places, trigger: &Trigger, asked: Option<&Asked>) -> bool {
         match with_daemon(trigger, async |client| {
             submit(client, trigger, &sending).await
         }) {
-            Ok(Ok(outcome)) => settle(places, trigger, &outcome, &kept, &launchctl),
+            Ok(Ok(outcome)) => {
+                settle(places, trigger, &outcome, &kept, &launchctl);
+            }
             // A daemon it cannot reach now keeps it for the next fire.
             Ok(Err(failed)) | Err(failed) => {
                 unsettled(places, trigger, &failed, &kept);
@@ -3078,13 +3094,16 @@ fn send(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
         }
         Some(Err(broken)) => {
             let failed = json!({"outcome": "failed", "detail": broken});
-            return settle(places, trigger, &failed, &kept, &launchctl);
+            settle(places, trigger, &failed, &kept, &launchctl);
+            return;
         }
     }
     match with_daemon(trigger, async |client| {
         deliver(client, places, trigger, &mut kept, &why, asked).await
     }) {
-        Ok(Ok(outcome)) | Err(outcome) => settle(places, trigger, &outcome, &kept, &launchctl),
+        Ok(Ok(outcome)) | Err(outcome) => {
+            settle(places, trigger, &outcome, &kept, &launchctl);
+        }
         Ok(Err(failed)) => unsettled(places, trigger, &failed, &kept),
     }
 }
@@ -4191,9 +4210,14 @@ mod tests {
         w.install(&s).unwrap();
         start_watch(&w.places, &s, 9).unwrap();
         // The same add again keeps the place the watcher reached.
-        watch::save_watched(&w.places, &s, 12, 1).unwrap();
+        let place = watch::Place {
+            cursor: 12,
+            count: 1,
+            from: 10,
+        };
+        watch::save_watched(&w.places, &s, place).unwrap();
         start_watch(&w.places, &s, 9).unwrap();
-        assert_eq!(watch::read_watched(&w.places, &s), Some((12, 1)));
+        assert_eq!(watch::read_watched(&w.places, &s), Ok(Some(place)));
     }
 
     #[test]
