@@ -1126,7 +1126,8 @@ async function memoryNews(l, w) {
   const saved = [...now.values()].filter((f) => (seen ? seen.get(f.path) !== f.modified : f.modified > OPENED_AT) && !f.source.startsWith(own)).sort((a, b) => b.modified - a.modified);
   const gone = seen ? [...seen.keys()].filter((p) => !now.has(p) && inRead(p)) : [];
   const told = () => { w.memSeen = new Map([...[...(seen ?? [])].filter(([p]) => !inRead(p)), ...[...now].map(([p, f]) => [p, f.modified])]); };
-  const lines = [...saved.map((f) => `- saved: ${f.path}: ${f.description}`), ...gone.map((p) => `- removed: ${p}`)];
+  // Removals first: past the cap, saved facts are still listed by memory show, removed ones are not.
+  const lines = [...gone.map((p) => `- removed: ${p}`), ...saved.map((f) => `- saved: ${f.path}: ${f.description}`)];
   if (!lines.length) { told(); return null; }
   const more = lines.length - MEMORY_LINES;
   return { told, text: `Memory changed since you last heard; each fact is a file, read before relying on it:\n${lines.slice(0, MEMORY_LINES).join('\n')}${more > 0 ? `\n- ${more} more: ~/.agent/memory show lists every fact` : ''}` };

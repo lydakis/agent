@@ -3201,6 +3201,22 @@ test("a coordinator's task update says what changed in memory since it last hear
   assert.equal(sent.length, 5); assert.doesNotMatch(sent[4].prompt, /Memory/);
 });
 
+test('a removal is named in a task update even past the line cap', async () => {
+  const sent = [], fact = (name, modified) => ({ name, type: 'project', description: name, source: 'turn:demo.build/1', verified: '2026-10-10', path: `/m/projects/demo/${name}.md`, modified });
+  let facts = [fact('old', Date.now() + 60000)];
+  const p = page({ request: async (op, params) => { if (op === 'submit') sent.push(params); return { turn: 9 }; }, memoryView: async () => ({ user: { name: null, dir: '/m', facts: [] }, projects: [{ name: 'demo', dir: '/m/projects/demo', facts }], more: 0 }), log() {} });
+  p.S.live = true; p.S.attached = true;
+  p.upsert({ name: 'demo.lead', bot_id: 1, status: 'idle', workspace: '/w' });
+  p.upsert({ name: 'demo.build', bot_id: 2, status: 'idle', created_by: 'demo.lead', created_by_id: 1 });
+  const turn = async (n) => { await p.onEvent({ event: 'accepted', bot: 'demo.build', turn: n, data: { node: 1 } }); await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: n, data: { status: 'completed' } }); await p.tick(); await settle(); };
+  await turn(1);
+  facts = Array.from({ length: 25 }, (_, i) => fact(`new-${i}`, Date.now() + 60000));
+  p.S.wakes.get('demo.lead').last = 0;
+  await turn(2);
+  assert.match(sent[1].prompt, /\n- removed: \/m\/projects\/demo\/old\.md\n/);
+  assert.match(sent[1].prompt, /\n- 6 more: ~\/\.agent\/memory show lists every fact$/);
+});
+
 test("the Memory sheet lists a project's facts and yours, newest first, and opens one in a tab", async () => {
   const facts = (dir, list) => list.map(([name, modified]) => ({ name, type: 'project', description: `about ${name}`, source: 'the person, 2026-10-01', verified: '2026-10-01', path: `${dir}/${name}.md`, modified }));
   const asked = [];
