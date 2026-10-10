@@ -1,608 +1,180 @@
-//! Skills the app ships. An agent reads only skills that are files in its
-//! folder's `.agents/skills` or in `~/.agents/skills`, so the app puts each of
-//! its own in `~/.agents/skills/NAME/`, where every agent created afterwards
-//! finds it. Those files are yours to edit or remove: the app keeps what it
-//! last wrote there in `~/.agent/skills/NAME/`, and replaces a skill's files
-//! with newer ones only while every one of them still matches. A folder's own
-//! skill of the same name wins over it. What the app stops shipping goes on
-//! the same terms.
-use std::path::Path;
+//! Skills the app ships. An agent reads only skills in its folder's
+//! `.agents/skills` or in `~/.agents/skills`, so the app links each skill in
+//! its bundle's `Contents/Resources/skills/NAME` from `~/.agents/skills/NAME`.
+//! A link is never stale: updating the app updates what it points at, with
+//! nothing copied or recorded. A folder or other file of yours at that name
+//! is left alone, and a folder's own skill of the same name wins over it.
+use std::path::{Path, PathBuf};
 
-type Files = &'static [(&'static str, &'static str)];
+/// Where a bundled app keeps its skills, beside `Contents/MacOS/BINARY`.
+pub fn bundled(exe: &Path) -> Option<PathBuf> {
+    let skills = exe.parent()?.parent()?.join("Resources/skills");
+    skills.is_dir().then_some(skills)
+}
 
-pub const BUILT_IN: [(&str, Files); 1] = [(
-    "automation",
-    &[("SKILL.md", include_str!("../../skills/automation/SKILL.md"))],
-)];
+/// A link the app made: one to `SOMETHING.app/Contents/Resources/skills/NAME`.
+fn ours(target: &Path) -> bool {
+    let mut up = target.ancestors().skip(1).map(Path::file_name);
+    matches!(
+        (up.next(), up.next(), up.next(), up.next()),
+        (Some(Some(a)), Some(Some(b)), Some(Some(c)), Some(Some(app)))
+            if a == "skills" && b == "Resources" && c == "Contents"
+                && app.to_string_lossy().ends_with(".app")
+    )
+}
 
-/// Install or update every shipped skill under `home`, and take away what
-/// the app wrote of one it no longer ships; one that fails does not stop
+/// Link every skill in `shipped` from `home`'s `~/.agents/skills`, point the
+/// app's links that lead elsewhere (an app since moved) here, and remove the
+/// app's links to skills it no longer ships. One that fails does not stop
 /// the others.
-pub fn install(home: &Path) -> Vec<String> {
+pub fn install(home: &Path, shipped: &Path) -> Vec<String> {
+    let dir = home.join(".agents/skills");
     let mut errors = Vec::new();
-    let mut skills: Vec<(String, Files)> = BUILT_IN
-        .iter()
-        .map(|(name, files)| (name.to_string(), *files))
-        .collect();
-    let records = home.join(".agent/skills");
-    let mut budget = BUDGET;
-    match recorded(&records, &mut budget) {
-        Ok(names) => skills.extend(
-            names
-                .into_iter()
-                // A folder that ignores case finds `automation`'s record
-                // under `Automation` too.
-                .filter(|name| {
-                    BUILT_IN
-                        .iter()
-                        .all(|(shipped, _)| !shipped.eq_ignore_ascii_case(name))
-                })
-                .filter(|name| records.join(name).is_dir())
-                .map(|name| (name, &[][..])),
-        ),
-        Err(error) => errors.push(error),
-    }
-    for (name, files) in &skills {
-        if let Err(error) = install_one(home, name, files, &mut budget) {
-            errors.push(error);
+    let mut fail = |path: &Path, error: std::io::Error| {
+        errors.push(format!("{}: {error}", path.display()));
+    };
+    let names: Vec<_> = match std::fs::read_dir(shipped) {
+        Ok(entries) => entries
+            .flatten()
+            .filter(|entry| entry.path().join("SKILL.md").is_file())
+            .map(|entry| entry.file_name())
+            .collect(),
+        Err(error) => {
+            fail(shipped, error);
+            return errors;
         }
-        if budget.entries == 0 || budget.bytes == 0 {
-            break;
+    };
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        fail(&dir, error);
+        return errors;
+    }
+    for name in &names {
+        let (link, target) = (dir.join(name), shipped.join(name));
+        let relink = match std::fs::read_link(&link) {
+            Ok(current) => current != target && ours(&current),
+            // Nothing there: link it. A folder or file of yours: leave it.
+            Err(_) => std::fs::symlink_metadata(&link).is_err(),
+        };
+        if relink {
+            let made = match std::fs::remove_file(&link) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+                _ => std::os::unix::fs::symlink(&target, &link),
+            };
+            if let Err(error) = made {
+                fail(&link, error);
+            }
+        }
+    }
+    // A skill no longer shipped leaves the app's link dangling, and the
+    // skill index refuses a dangling link, so it goes. The index reads no
+    // more of the folder than its own bound, nor does this.
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return errors;
+    };
+    for entry in entries.take(4096).flatten() {
+        let link = entry.path();
+        if names.contains(&entry.file_name()) {
+            continue;
+        }
+        if let Ok(target) = std::fs::read_link(&link)
+            && ours(&target)
+            && std::fs::metadata(&link).is_err()
+            && let Err(error) = std::fs::remove_file(&link)
+        {
+            fail(&link, error);
         }
     }
     errors
-}
-
-/// What one start may list and read across the app's records and your
-/// copies: more than all of them hold together while they are the app's.
-/// Past it, what is left is not the app's, so a start goes no further.
-struct Budget {
-    entries: usize,
-    bytes: u64,
-}
-
-const ENTRIES: usize = 1024;
-const BYTES: u64 = 4 * 1024 * 1024;
-const BUDGET: Budget = Budget {
-    entries: ENTRIES,
-    bytes: BYTES,
-};
-
-/// The names in a record folder, its temporaries aside; none when it is
-/// absent. Every entry, listed or not, spends one of `budget`'s entries;
-/// running out is an error.
-fn recorded(folder: &Path, budget: &mut Budget) -> Result<Vec<String>, String> {
-    let entries = match std::fs::read_dir(folder) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        entries => entries.map_err(|error| format!("{}: {error}", folder.display()))?,
-    };
-    let mut names = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|error| format!("{}: {error}", folder.display()))?;
-        if budget.entries == 0 {
-            return Err(format!("{}: more than {ENTRIES} entries", folder.display()));
-        }
-        budget.entries -= 1;
-        if let Some(name) = entry
-            .file_name()
-            .to_str()
-            .filter(|name| !name.starts_with('.'))
-        {
-            names.push(name.to_owned());
-        }
-    }
-    Ok(names)
-}
-
-/// Sync every folder from `path`'s up to `home`, so folders a first write
-/// created are on disk with it.
-fn settle(path: &Path, home: &Path) -> Result<(), String> {
-    for folder in path.ancestors().skip(1).take_while(|f| f.starts_with(home)) {
-        std::fs::File::open(folder)
-            .and_then(|folder| folder.sync_all())
-            .map_err(|error| format!("{}: {error}", folder.display()))?;
-    }
-    Ok(())
-}
-
-/// Every file under a skill's record, as a path relative to it.
-fn recorded_files(record: &Path, budget: &mut Budget) -> Result<Vec<String>, String> {
-    let (mut files, mut folders) = (Vec::new(), vec![String::new()]);
-    while let Some(folder) = folders.pop() {
-        for name in recorded(&record.join(&folder), budget)? {
-            let file = match folder.as_str() {
-                "" => name,
-                folder => format!("{folder}/{name}"),
-            };
-            let path = record.join(&file);
-            match std::fs::symlink_metadata(&path) {
-                Ok(kind) if kind.is_dir() => folders.push(file),
-                Ok(_) => files.push(file),
-                Err(error) => return Err(format!("{}: {error}", path.display())),
-            }
-        }
-    }
-    Ok(files)
-}
-
-/// More than any skill the app ships; a longer file is not one of its copies.
-const MAX: u64 = 256 * 1024;
-
-// Nothing at the path is None. Anything else must open, without waiting,
-// as a regular file: a dangling link or a pipe is an error, so it is left
-// alone and never holds up the window. At most MAX + 1 bytes are read, and
-// reading more than MAX is an error too, since two long files may differ
-// past what was read. What is read spends `budget`'s bytes; running out is
-// an error.
-fn read(path: &Path, budget: &mut Budget) -> Result<Option<Vec<u8>>, String> {
-    use std::{io::Read, os::unix::fs::OpenOptionsExt};
-    match std::fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("{}: {error}", path.display())),
-        Ok(_) => {}
-    }
-    let mut bytes = Vec::new();
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
-        .and_then(|file| {
-            if !file.metadata()?.is_file() {
-                return Err(std::io::Error::other("not a regular file"));
-            }
-            file.take(MAX + 1).read_to_end(&mut bytes)
-        })
-        .map_err(|error| format!("{}: {error}", path.display()))?;
-    let Some(left) = budget.bytes.checked_sub(bytes.len() as u64) else {
-        // All of it is spent, so the start stops here, not a skill later.
-        budget.bytes = 0;
-        return Err(format!("{}: more than {BYTES} bytes", path.display()));
-    };
-    budget.bytes = left;
-    if bytes.len() as u64 > MAX {
-        return Err(format!("{}: longer than {MAX} bytes", path.display()));
-    }
-    Ok(Some(bytes))
-}
-
-/// `budget` is shared by every record a start walks, so the whole walk is
-/// bounded, not each record.
-fn install_one(
-    home: &Path,
-    name: &str,
-    files: &[(&str, &str)],
-    budget: &mut Budget,
-) -> Result<(), String> {
-    let dir = home.join(".agents/skills").join(name);
-    let record = home.join(".agent/skills").join(name);
-    // A record that is the skill's own folder, through a link above both,
-    // always matches and so proves nothing: the skill is yours.
-    let identity = |path: &Path| {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
-    };
-    if identity(&dir).is_some() && identity(&dir) == identity(&record) {
-        return Ok(());
-    }
-    // A file or folder of the skill's that is a link leads somewhere the app
-    // did not write, such as a checkout of yours, so the skill is yours.
-    let linked = |file: &Path, top: &Path| {
-        file.ancestors()
-            .take_while(|folder| folder.starts_with(top))
-            .any(|folder| std::fs::symlink_metadata(folder).is_ok_and(|m| m.is_symlink()))
-    };
-    let (mut stale, mut repair) = (Vec::new(), Vec::new());
-    for (file, text) in files {
-        let (path, written) = (dir.join(file), record.join(file));
-        if linked(&path, &dir) || linked(&written, &record) {
-            return Ok(());
-        }
-        let have = read(&path, budget)?;
-        if have.as_deref() == Some(text.as_bytes()) {
-            // Current already; a start that ended before the record still
-            // owns it, once the rest of the skill proves to be the app's.
-            if read(&written, budget)?.as_deref() != Some(text.as_bytes()) {
-                repair.push((written, text));
-            }
-            continue;
-        }
-        // Only a file the app wrote and nobody changed since is the app's: one
-        // that was there first, was edited, or was removed is yours, and so is
-        // the rest of its skill, which may depend on it.
-        if have != read(&written, budget)? {
-            return Ok(());
-        }
-        stale.push((path, written, text));
-    }
-    // A file the app no longer ships goes too, unless you changed or removed
-    // it, which makes the skill yours like any other file.
-    let mut dropped = Vec::new();
-    for file in recorded_files(&record, budget)? {
-        if files.iter().all(|(shipped, _)| *shipped != file) {
-            let (path, written) = (dir.join(&file), record.join(&file));
-            if linked(&path, &dir) || linked(&written, &record) {
-                return Ok(());
-            }
-            let have = read(&path, budget)?;
-            if have != read(&written, budget)? {
-                return Ok(());
-            }
-            dropped.push((path, written));
-        }
-    }
-    for (written, text) in repair {
-        crate::schedule::replace(&written, text)?;
-        settle(&written, home)?;
-    }
-    // Mine first, then the record, so a crash between them is fixed above.
-    for (path, written, text) in stale {
-        crate::schedule::replace(&path, text)?;
-        settle(&path, home)?;
-        crate::schedule::replace(&written, text)?;
-        settle(&written, home)?;
-    }
-    // Each removal is on disk before its record goes, so a power loss never
-    // leaves a file the app no longer knows it wrote. SKILL.md goes first: a
-    // start that ends partway leaves the rest yours, and unindexed.
-    dropped.sort_by_key(|(path, _)| !path.ends_with("SKILL.md"));
-    for (path, written) in dropped {
-        crate::schedule::forget(&path)?;
-        crate::schedule::forget(&written)?;
-        for (file, top) in [(&path, &dir), (&written, &record)] {
-            for folder in file.ancestors().skip(1).take_while(|f| f.starts_with(top)) {
-                let _ = std::fs::remove_dir(folder);
-            }
-        }
-    }
-    if files.is_empty() {
-        // Only if empty: a file you added keeps the folder.
-        let _ = std::fs::remove_dir(&dir);
-        let _ = std::fs::remove_dir(&record);
-    }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn one(home: &Path, name: &str, files: &[(&str, &str)]) -> Result<(), String> {
-        install_one(home, name, files, &mut { BUDGET })
-    }
-
-    fn home(tag: &str) -> std::path::PathBuf {
-        let home =
+    /// A home and a bundle `Agent.app` shipping `names`.
+    fn setup(tag: &str, names: &[&str]) -> (PathBuf, PathBuf) {
+        let root =
             std::env::temp_dir().join(format!("agent-app-skills-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&home);
-        home
-    }
-
-    #[test]
-    fn a_shipped_skill_is_written_where_agents_index_it() {
-        let home = home("fresh");
-        assert!(install(&home).is_empty());
-        let path = home.join(".agents/skills/automation/SKILL.md");
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(text, BUILT_IN[0].1[0].1);
-        let skills = agent_client::policy::instructions(&home, None)
-            .unwrap()
-            .skills;
-        for (name, files) in BUILT_IN {
-            let path = home.join(".agents/skills").join(name).join("SKILL.md");
-            assert!(skills.iter().any(|s| s.name == name && s.path == path));
-            for (file, text) in files {
-                let dir = home.join(".agents/skills").join(name);
-                assert_eq!(&std::fs::read_to_string(dir.join(file)).unwrap(), text);
-            }
+        let _ = std::fs::remove_dir_all(&root);
+        let shipped = root.join("Agent.app/Contents/Resources/skills");
+        for name in names {
+            std::fs::create_dir_all(shipped.join(name)).unwrap();
+            std::fs::write(shipped.join(name).join("SKILL.md"), name).unwrap();
         }
-        std::fs::remove_dir_all(home).unwrap();
+        (root.join("home"), shipped)
+    }
+
+    fn read(home: &Path, name: &str) -> String {
+        std::fs::read_to_string(home.join(".agents/skills").join(name).join("SKILL.md")).unwrap()
     }
 
     #[test]
-    fn newer_text_replaces_the_apps_copy_and_never_yours() {
-        let home = home("update");
-        one(&home, "x", &[("SKILL.md", "old")]).unwrap();
-        let path = home.join(".agents/skills/x/SKILL.md");
-        one(&home, "x", &[("SKILL.md", "new")]).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
-
-        std::fs::write(&path, "mine").unwrap();
-        one(&home, "x", &[("SKILL.md", "newer")]).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine");
-
-        std::fs::remove_file(&path).unwrap();
-        one(&home, "x", &[("SKILL.md", "newest")]).unwrap();
-        assert!(!path.exists(), "a skill you removed stays removed");
-        std::fs::remove_dir_all(home).unwrap();
-    }
-
-    #[test]
-    fn a_skill_that_was_there_first_is_yours() {
-        let home = home("first");
-        let path = home.join(".agents/skills/x/SKILL.md");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "from another harness").unwrap();
-        one(&home, "x", &[("SKILL.md", "app")]).unwrap();
+    fn a_bundle_finds_its_skills_beside_its_binary() {
+        let (home, shipped) = setup("bundled", &["automation"]);
+        let exe = shipped.join("../../MacOS/agent-app");
         assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "from another harness"
+            bundled(&exe).unwrap(),
+            shipped.join("../../Resources/skills")
         );
-        std::fs::remove_dir_all(home).unwrap();
+        assert!(bundled(&home.join("agent-app")).is_none());
+        std::fs::remove_dir_all(home.parent().unwrap()).unwrap();
     }
 
     #[test]
-    fn a_skill_with_one_file_of_yours_is_all_yours() {
-        let home = home("files");
-        let dir = home.join(".agents/skills/x");
-        let read = |file: &str| std::fs::read_to_string(dir.join(file)).unwrap();
-        one(&home, "x", &[("SKILL.md", "old"), ("run.py", "old")]).unwrap();
-        one(&home, "x", &[("SKILL.md", "new"), ("run.py", "new")]).unwrap();
+    fn each_shipped_skill_is_linked_and_follows_the_app() {
+        let (home, shipped) = setup("linked", &["automation"]);
+        assert!(install(&home, &shipped).is_empty());
+        assert_eq!(read(&home, "automation"), "automation");
+        // An update changes the bundle in place; the link reads the new text.
+        std::fs::write(shipped.join("automation/SKILL.md"), "newer").unwrap();
+        assert_eq!(read(&home, "automation"), "newer");
+        assert!(install(&home, &shipped).is_empty());
+        std::fs::remove_dir_all(home.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_moved_app_takes_its_links_along() {
+        let (home, shipped) = setup("moved", &["automation"]);
+        install(&home, &shipped);
+        let root = home.parent().unwrap();
+        std::fs::create_dir_all(root.join("Applications")).unwrap();
+        std::fs::rename(root.join("Agent.app"), root.join("Applications/Agent.app")).unwrap();
+        let moved = root.join("Applications/Agent.app/Contents/Resources/skills");
+        assert!(install(&home, &moved).is_empty());
         assert_eq!(
-            (read("SKILL.md"), read("run.py")),
-            ("new".into(), "new".into())
+            std::fs::read_link(home.join(".agents/skills/automation")).unwrap(),
+            moved.join("automation")
         );
-
-        // A file a newer version adds is written with the rest.
-        let three = [("SKILL.md", "new"), ("run.py", "new"), ("lib.py", "new")];
-        one(&home, "x", &three).unwrap();
-        assert_eq!(read("lib.py"), "new");
-
-        std::fs::write(dir.join("run.py"), "mine").unwrap();
-        one(&home, "x", &[("SKILL.md", "newer"), ("run.py", "newer")]).unwrap();
-        assert_eq!(
-            (read("SKILL.md"), read("run.py")),
-            ("new".into(), "mine".into())
-        );
-        std::fs::remove_dir_all(home).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn a_huge_file_is_read_no_further_than_needed_and_stays() {
-        let home = home("huge");
-        one(&home, "x", &[("SKILL.md", "app")]).unwrap();
-        let path = home.join(".agents/skills/x/SKILL.md");
-        let huge = vec![b'a'; MAX as usize * 4];
-        std::fs::write(&path, &huge).unwrap();
-        let error = one(&home, "x", &[("SKILL.md", "newer")]).unwrap_err();
-        assert!(error.contains("longer than"), "{error}");
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), huge.len() as u64);
-        // The same start as the record, with a different end, is not a match.
-        let mut record = huge.clone();
-        *record.last_mut().unwrap() = b'b';
-        std::fs::write(home.join(".agent/skills/x/SKILL.md"), &record).unwrap();
-        one(&home, "x", &[]).unwrap_err();
-        assert_eq!(std::fs::read(&path).unwrap(), huge);
-        std::fs::remove_dir_all(home).unwrap();
+    fn your_folder_or_link_of_the_same_name_stays() {
+        let (home, shipped) = setup("yours", &["automation", "memory"]);
+        let skills = home.join(".agents/skills");
+        std::fs::create_dir_all(skills.join("automation")).unwrap();
+        std::fs::write(skills.join("automation/SKILL.md"), "mine").unwrap();
+        let checkout = home.join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::os::unix::fs::symlink(&checkout, skills.join("memory")).unwrap();
+        assert!(install(&home, &shipped).is_empty());
+        assert_eq!(read(&home, "automation"), "mine");
+        assert_eq!(std::fs::read_link(skills.join("memory")).unwrap(), checkout);
+        std::fs::remove_dir_all(home.parent().unwrap()).unwrap();
     }
 
     #[test]
-    fn a_special_file_is_left_alone_without_being_opened() {
-        let home = home("fifo");
-        let path = home.join(".agents/skills/x/SKILL.md");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
-        // SAFETY: mkfifo reads the NUL-terminated path it is given.
-        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
-        let error = one(&home, "x", &[("SKILL.md", "app")]).unwrap_err();
-        assert!(error.contains("not a regular file"), "{error}");
-        std::fs::remove_dir_all(home).unwrap();
-    }
-
-    #[test]
-    fn a_dangling_link_of_yours_stays() {
-        let home = home("dangling");
-        let path = home.join(".agents/skills/x/SKILL.md");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink(home.join("gone"), &path).unwrap();
-        one(&home, "x", &[("SKILL.md", "app")]).unwrap();
-        assert!(std::fs::symlink_metadata(&path).unwrap().is_symlink());
-        std::fs::remove_dir_all(home).unwrap();
-    }
-
-    #[test]
-    fn what_the_app_stops_shipping_goes_unless_you_changed_it() {
-        let home = home("dropped");
-        let dir = home.join(".agents/skills/x");
-        one(&home, "x", &[("SKILL.md", "v1"), ("run.py", "v1")]).unwrap();
-        one(&home, "x", &[("SKILL.md", "v2")]).unwrap();
-        assert!(!dir.join("run.py").exists());
-        assert!(!home.join(".agent/skills/x/run.py").exists());
-
-        // A file in a folder of its own updates, and goes with its folder.
-        let nested = [("SKILL.md", "v2"), ("scripts/run.py", "v1")];
-        one(&home, "x", &nested).unwrap();
-        one(&home, "x", &[("SKILL.md", "v2"), ("scripts/run.py", "v2")]).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(dir.join("scripts/run.py")).unwrap(),
-            "v2"
-        );
-        one(&home, "x", &[("SKILL.md", "v2")]).unwrap();
-        assert!(!dir.join("scripts").exists());
-        assert!(!home.join(".agent/skills/x/scripts").exists());
-
-        // A skill the app no longer ships at all; `install` finds it by its record.
-        install(&home);
-        assert!(!dir.exists() && !home.join(".agent/skills/x").exists());
-
-        one(&home, "y", &[("SKILL.md", "v1"), ("run.py", "v1")]).unwrap();
-        let mine = home.join(".agents/skills/y/run.py");
-        std::fs::write(&mine, "mine").unwrap();
-        install(&home);
-        assert_eq!(std::fs::read_to_string(&mine).unwrap(), "mine");
-        assert!(home.join(".agents/skills/y/SKILL.md").exists());
-
-        // One you removed makes the rest yours too.
-        one(&home, "z", &[("SKILL.md", "v1"), ("run.py", "v1")]).unwrap();
-        std::fs::remove_file(home.join(".agents/skills/z/run.py")).unwrap();
-        install(&home);
-        assert!(home.join(".agents/skills/z/SKILL.md").exists());
-        std::fs::remove_dir_all(home).unwrap();
-    }
-
-    #[test]
-    fn a_record_too_large_to_be_the_apps_is_left_alone() {
-        let home = home("entries");
-        let record = home.join(".agent/skills/x");
-        std::fs::create_dir_all(&record).unwrap();
-        for n in 0..=ENTRIES {
-            // Hidden or not, every entry counts.
-            std::fs::write(record.join(format!(".{n}")), "").unwrap();
-        }
-        let error = one(&home, "x", &[]).unwrap_err();
-        assert!(error.contains("more than"), "{error}");
-        assert_eq!(std::fs::read_dir(&record).unwrap().count(), ENTRIES + 1);
-        std::fs::remove_dir_all(home).unwrap();
-    }
-
-    #[test]
-    fn one_bound_covers_every_record_a_start_walks() {
-        let home = home("aggregate");
-        for skill in 0..4 {
-            let record = home.join(".agent/skills").join(format!("s{skill}"));
-            std::fs::create_dir_all(&record).unwrap();
-            for n in 0..ENTRIES / 3 {
-                std::fs::write(record.join(format!(".{n}")), "").unwrap();
-            }
-        }
-        let errors = install(&home);
-        assert!(errors.iter().any(|e| e.contains("more than")), "{errors:?}");
-        std::fs::remove_dir_all(home).unwrap();
-    }
-
-    #[test]
-    fn one_byte_bound_covers_every_file_a_start_reads() {
-        let home = home("bytes");
-        let text = "a".repeat(MAX as usize);
-        let files: Vec<(String, String)> = (0..BYTES / MAX)
-            .map(|n| (format!("f{n}"), text.clone()))
-            .collect();
-        for (file, text) in &files {
-            for top in [".agents/skills/x", ".agent/skills/x"] {
-                let path = home.join(top).join(file);
-                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-                std::fs::write(path, text).unwrap();
-            }
-        }
-        let mut budget = BUDGET;
-        let error = install_one(&home, "x", &[], &mut budget).unwrap_err();
-        assert!(error.contains("more than"), "{error}");
-        assert_eq!(budget.bytes, 0);
-        assert!(
-            files
-                .iter()
-                .all(|(file, _)| home.join(".agents/skills/x").join(file).exists())
-        );
-        std::fs::remove_dir_all(home).unwrap();
-    }
-
-    #[test]
-    fn a_record_folder_that_is_the_skill_folder_proves_nothing() {
-        let home = home("aliased");
-        one(&home, "x", &[("SKILL.md", "old")]).unwrap();
-        std::fs::remove_dir_all(home.join(".agent/skills")).unwrap();
-        std::os::unix::fs::symlink(home.join(".agents/skills"), home.join(".agent/skills"))
-            .unwrap();
-        let path = home.join(".agents/skills/x/SKILL.md");
-        std::fs::write(&path, "mine").unwrap();
-        one(&home, "x", &[("SKILL.md", "new")]).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine");
-        std::fs::remove_dir_all(home).unwrap();
-    }
-
-    #[test]
-    fn a_record_named_like_a_shipped_skill_in_other_case_is_left_alone() {
-        let home = home("case");
-        let (name, files) = BUILT_IN[0];
-        let other = name.to_ascii_uppercase();
-        one(&home, &other, files).unwrap();
-        install(&home);
-        assert!(
-            home.join(".agents/skills")
-                .join(&other)
-                .join("SKILL.md")
-                .exists()
-        );
-        std::fs::remove_dir_all(home).unwrap();
-    }
-
-    #[test]
-    fn a_skill_folder_that_is_a_link_is_yours() {
-        let home = home("linked");
-        one(&home, "x", &[("SKILL.md", "old")]).unwrap();
-        let (dir, checkout) = (home.join(".agents/skills/x"), home.join("checkout"));
-        std::fs::rename(&dir, &checkout).unwrap();
-        std::os::unix::fs::symlink(&checkout, &dir).unwrap();
-        one(&home, "x", &[("SKILL.md", "new")]).unwrap();
-        one(&home, "x", &[]).unwrap();
-        let text = std::fs::read_to_string(checkout.join("SKILL.md")).unwrap();
-        assert_eq!(text, "old");
-        std::fs::remove_dir_all(home).unwrap();
-    }
-
-    #[test]
-    fn a_file_you_linked_stays_a_link() {
-        let home = home("file-link");
-        one(&home, "x", &[("SKILL.md", "old")]).unwrap();
-        let path = home.join(".agents/skills/x/SKILL.md");
-        let mine = home.join("mine.md");
-        std::fs::write(&mine, "old").unwrap();
-        std::fs::remove_file(&path).unwrap();
-        std::os::unix::fs::symlink(&mine, &path).unwrap();
-        one(&home, "x", &[("SKILL.md", "new")]).unwrap();
-        assert!(std::fs::symlink_metadata(&path).unwrap().is_symlink());
-        assert_eq!(std::fs::read_to_string(&mine).unwrap(), "old");
-        std::fs::remove_dir_all(home).unwrap();
-    }
-
-    #[test]
-    fn a_temporary_left_as_a_link_is_never_written_through() {
-        let home = home("temp-link");
-        one(&home, "x", &[("SKILL.md", "old")]).unwrap();
-        let dir = home.join(".agents/skills/x");
-        let victim = home.join("victim");
-        std::fs::write(&victim, "keep").unwrap();
-        let temporary = dir.join(format!(".SKILL.md.{}", std::process::id()));
-        std::os::unix::fs::symlink(&victim, &temporary).unwrap();
-        one(&home, "x", &[("SKILL.md", "new")]).unwrap();
-        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
-        assert_eq!(
-            std::fs::read_to_string(dir.join("SKILL.md")).unwrap(),
-            "new"
-        );
-        std::fs::remove_dir_all(home).unwrap();
-    }
-
-    #[test]
-    fn a_record_is_repaired_only_for_a_skill_that_is_still_the_apps() {
-        let home = home("repair");
-        let files = [("SKILL.md", "old"), ("run.py", "old")];
-        one(&home, "x", &files).unwrap();
-        let dir = home.join(".agents/skills/x");
-        // An update replaced SKILL.md and stopped; then you edited run.py.
-        std::fs::write(dir.join("SKILL.md"), "new").unwrap();
-        std::fs::write(dir.join("run.py"), "mine").unwrap();
-        one(&home, "x", &[("SKILL.md", "new"), ("run.py", "new")]).unwrap();
-        let record = home.join(".agent/skills/x/SKILL.md");
-        assert_eq!(std::fs::read_to_string(record).unwrap(), "old");
-        std::fs::remove_dir_all(home).unwrap();
-    }
-
-    #[test]
-    fn every_shipped_skill_fits_the_read_bound() {
-        let mut files = BUILT_IN.iter().flat_map(|(_, files)| files.iter());
-        assert!(files.all(|(_, text)| (text.len() as u64) <= MAX));
-    }
-
-    #[test]
-    fn a_start_that_ended_before_its_record_still_updates_later() {
-        let home = home("crash");
-        one(&home, "x", &[("SKILL.md", "old")]).unwrap();
-        let path = home.join(".agents/skills/x/SKILL.md");
-        // The file was replaced, then the app stopped before the record.
-        std::fs::write(&path, "new").unwrap();
-        one(&home, "x", &[("SKILL.md", "new")]).unwrap();
-        one(&home, "x", &[("SKILL.md", "newer")]).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "newer");
-        std::fs::remove_dir_all(home).unwrap();
+    fn a_skill_no_longer_shipped_loses_only_the_apps_link() {
+        let (home, shipped) = setup("dropped", &["automation", "old"]);
+        install(&home, &shipped);
+        let skills = home.join(".agents/skills");
+        // Yours, dangling too, but not into an app.
+        std::os::unix::fs::symlink(home.join("gone"), skills.join("mine")).unwrap();
+        std::fs::remove_dir_all(shipped.join("old")).unwrap();
+        assert!(install(&home, &shipped).is_empty());
+        assert!(std::fs::symlink_metadata(skills.join("old")).is_err());
+        assert!(std::fs::symlink_metadata(skills.join("mine")).is_ok());
+        assert_eq!(read(&home, "automation"), "automation");
+        std::fs::remove_dir_all(home.parent().unwrap()).unwrap();
     }
 }

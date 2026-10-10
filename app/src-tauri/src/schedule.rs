@@ -759,7 +759,7 @@ pub fn list(places: &Places, after: Option<&str>) -> Value {
 }
 
 /// Write a file whole beside its place, then rename it there.
-pub(crate) fn replace(path: &Path, text: &str) -> Result<(), String> {
+fn replace(path: &Path, text: &str) -> Result<(), String> {
     replace_mode(path, text, 0o644)
 }
 
@@ -775,19 +775,17 @@ fn replace_mode(path: &Path, text: &str, mode: u32) -> Result<(), String> {
         std::process::id()
     ));
     let written = (|| {
-        // Created anew, never opened through whatever an old temporary of
-        // this pid left at the name, a link included.
-        match std::fs::remove_file(&temporary) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-            _ => {}
-        }
         let mut file = std::fs::OpenOptions::new()
             .write(true)
-            .create_new(true)
+            .create(true)
+            .truncate(true)
             .mode(mode)
             .open(&temporary)?;
-        // The umask may have narrowed the mode.
-        file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode))?;
+        // An old temporary of this pid may carry another mode.
+        std::fs::set_permissions(
+            &temporary,
+            std::os::unix::fs::PermissionsExt::from_mode(mode),
+        )?;
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
         std::fs::rename(&temporary, path)?;
@@ -929,7 +927,7 @@ impl Lock {
 
 /// Delete a file for good: gone from its folder once that folder is synced.
 /// One already gone is fine.
-pub(crate) fn forget(path: &Path) -> Result<(), String> {
+fn forget(path: &Path) -> Result<(), String> {
     let gone = match std::fs::remove_file(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         gone => gone,

@@ -1120,16 +1120,18 @@ posting, and record a post only once the destination confirms it.
 
 ## Skills the app ships
 
-Agents read only skills that are files in a folder's `.agents/skills` or in
-`~/.agents/skills` ([client policy](CLIENT.md)). So on every start, and before
-each schedule fire, the app writes each skill it ships, from `app/skills/NAME/`, to
-`~/.agents/skills/NAME/`, and keeps what it wrote in
-`~/.agent/skills/NAME/` ([skills.rs](../app/src-tauri/src/skills.rs)). A
-newer app replaces a skill's files only while every one still matches that
-copy: a skill with a file that was there before the app, or that you edited
-or removed, stays as it is, and a folder's own skill of the same name wins
-over it. A skill or file the app no longer ships is removed on the same
-terms. Agents already running keep the index they were created with.
+Agents read only skills in a folder's `.agents/skills` or in
+`~/.agents/skills` ([client policy](CLIENT.md)). The app bundle carries its
+skills, from `app/skills/NAME/`, in `Contents/Resources/skills/NAME`, and on
+every start the app links each one from `~/.agents/skills/NAME`
+([skills.rs](../app/src-tauri/src/skills.rs)). Updating the app updates what
+the link points at, so nothing is copied or recorded; a moved app re-points
+its links at its next start, and a skill it stops shipping loses its link.
+A folder or file of yours at that name is left alone, and a folder's own
+skill of the same name wins over it. To change a shipped skill, replace the
+link with a folder of your own: the link leads into the signed app, which is
+not yours to edit. Agents already running keep the index they were created
+with.
 
 ## What it costs, and where the bounds are
 
