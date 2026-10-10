@@ -474,6 +474,10 @@ class SwarmRuleTests(unittest.TestCase):
         _, act = self.act('p.w-3', state, live)
         self.s.review(act, 't', 'supported', 'checked')
         self.assertEqual([m for m, *_ in act.sends], ['p.w-2'])
+        # Nothing is sent to a member at its cap, so a post naming it wakes nobody.
+        _, act = self.act(None, state, live)
+        self.s.post(act, '@w-1 carry on', False)
+        self.assertEqual((act.sends, [m['agent'] for m in act.missed]), ([], ['w-1']))
 
     def test_the_coordinator_hears_when_every_member_is_deleted(self):
         folder, act = self.act()

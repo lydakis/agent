@@ -384,7 +384,7 @@ class Act:
         # every turn, so it can no more do or review work than one that left.
         self.able = {short(m, self.swarm) for m in self.live if not live or not spent(live[m])}
         self.me = short(author, self.swarm) if author else 'user'
-        self.lines, self.sends, self.answer = [], [], {}
+        self.lines, self.sends, self.answer, self.missed = [], [], {}, []
 
     def line(self, **fields):
         line = dict(at=self.at, **{'from': self.me})
@@ -393,8 +393,14 @@ class Act:
         return line
 
     def tell(self, members, prompt, how='wake', authored=True):
+        # A member at its cap is refused every turn: nothing is sent to it,
+        # so nothing counts as woken that cannot run.
         for member in members:
-            if member != self.author:
+            if member == self.author:
+                continue
+            if member in self.live and short(member, self.swarm) not in self.able:
+                self.missed.append({'agent': short(member, self.swarm), 'error': 'budget_exhausted: it has used its tokens'})
+            else:
                 self.sends.append((member, how, prompt, authored))
 
     def member(self, name):
@@ -659,7 +665,7 @@ def deliver(daemon, act, folder, members):
         if authored and act.author:
             params['from'] = {'bot': act.author, 'turn': int(os.environ.get('AGENT_TURN') or 0) or None}
         sent[daemon.send('submit', **params)] = (member, how)
-    steered, woke, missed = set(), set(), []
+    steered, woke, missed = set(), set(), list({m['agent']: m for m in act.missed}.values())
     for request, answer in daemon.answers(list(sent)).items():
         member, how = sent[request]
         if 'error' in answer:

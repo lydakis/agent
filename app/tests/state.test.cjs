@@ -2312,6 +2312,26 @@ test('a swarm a coordinator started from its shell shows once its first agent ta
   assert.deepEqual(u.S.swarms.get('app.latency').ids, { 'app.latency-1': 3, 'app.latency-2': 4 });
   await u.tick();
   assert.equal(reads, 64, 'pinned, it is not read again');
+
+  // An agent a coordinator's Add made, briefed before Add named it in the swarm, is waited for the
+  // same way; once known, the swarm is checked, and checked again when one of its agents is deleted.
+  let added = false; reads = 0; const checks = [];
+  const one = swarmRecord(['app.latency-1'], { ids: { 'app.latency-1': 3 } });
+  const two = swarmRecord(['app.latency-1', 'app.latency-2'], { ids: { 'app.latency-1': 3, 'app.latency-2': 4 } });
+  const a = shell({ swarms: async () => { reads += 1; return { swarms: [added ? two : one], broken: [] }; }, swarmCheck: async (name) => { checks.push(name); return {}; }, request: async () => ({ bots: [], next_after: null, nodes: [], workspaces:[],next_from: null }) });
+  a.S.live = true;
+  a.learnSwarm(one); await a.tick(); checks.length = 0;
+  a.upsert({ name: 'app.latency-2', id: 4, provider: 'alpha', model: 'one' });
+  await a.handle({ event: 'accepted', bot: 'app.latency-2', turn: 1, durable: true }, 1);
+  await a.tick(); await a.tick();
+  assert.equal(reads, 2, 'read again while Add has not named it');
+  assert.deepEqual(checks, []);
+  added = true; await a.tick(); await a.tick();
+  assert.equal(a.S.memberOf.get('app.latency-2'), 'app.latency');
+  assert.deepEqual(checks, ['app.latency'], 'a new agent is news for the swarm');
+  await a.tick(); assert.equal(reads, 3, 'known, it is not read again');
+  await a.handle({ event: 'deleted', bot: 'app.latency-2' }, 1); await a.tick();
+  assert.deepEqual(checks, ['app.latency', 'app.latency'], 'a deleted agent may leave the swarm quiet');
 });
 
 test('a helper finishing a turn has its swarm check its budget', async () => {
@@ -3341,18 +3361,21 @@ test('trigger pages replace the previous messages and remote windows do not fetc
 
 test('usage checks member and descendant budgets before any turn ends, once enough tokens could move a share', async () => {
   const checks = [], pending = deferred();
-  const p = shell({ swarmCheck: async name => { checks.push(name); return pending.promise; }, request: async () => ({ bots: [], nodes: [], next_after: null }) });
+  const p = shell({ swarmCheck: async name => { checks.push(name); return checks.length === 1 ? {} : pending.promise; }, request: async () => ({ bots: [], nodes: [], next_after: null }) });
   p.upsert({name:'app.latency-1',id:3,provider:'alpha',model:'one'});
   p.upsert({name:'app.latency-1.helper',id:4,provider:'alpha',model:'one',created_by:'app.latency-1',created_by_id:3});
   const sw = p.learnSwarm(swarmRecord(['app.latency-1'], {ids:{'app.latency-1':3}}));
+  // Its agents' earlier events came before the page knew them, so a swarm it learns is checked once.
+  await p.tick(); await settle(); assert.deepEqual(checks,['app.latency'],'a learned swarm is checked');
+  p.learnSwarm(swarmRecord(['app.latency-1'], {ids:{'app.latency-1':3}})); await p.tick(); assert.equal(checks.length,1,'the same agents again are no news');
   // One member of 3M: a check is due every 150k tokens, input (cached included) plus output.
   const usage = (name, input) => p.handle({event:'usage',bot:name,turn:1,data:{input_tokens:input,output_tokens:20}},1);
-  await usage('app.latency-1', 5000); await p.tick(); assert.deepEqual(checks,[],'a small call reads nothing');
-  await usage('app.latency-1.helper', 145000); await p.tick(); assert.deepEqual(checks,['app.latency'],'a descendant\'s tokens count');
-  await usage('app.latency-1', 150000); await p.tick(); assert.equal(checks.length,1,'no overlapping scan');
+  await usage('app.latency-1', 5000); await p.tick(); assert.equal(checks.length,1,'a small call reads nothing');
+  await usage('app.latency-1.helper', 145000); await p.tick(); assert.equal(checks.length,2,'a descendant\'s tokens count');
+  await usage('app.latency-1', 150000); await p.tick(); assert.equal(checks.length,2,'no overlapping scan');
   pending.resolve({}); await settle();
-  await p.tick(); assert.equal(checks.length,2,'usage arriving during a scan causes a follow-up, without waiting for another round');
-  sw.stopped = true; await usage('app.latency-1', 300000); await p.tick(); assert.equal(checks.length,2,'a stopped swarm stays quiet');
+  await p.tick(); assert.equal(checks.length,3,'usage arriving during a scan causes a follow-up, without waiting for another round');
+  sw.stopped = true; await usage('app.latency-1', 300000); await p.tick(); assert.equal(checks.length,3,'a stopped swarm stays quiet');
 });
 
 test('work view retains partial findings and independent verdicts without calling a turn complete', () => {

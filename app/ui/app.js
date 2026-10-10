@@ -429,10 +429,15 @@ const liveMembers = (sw) => sw.members.filter((m) => memberBot(sw, m));
 const swarmOfBot = (name) => { const sw = S.swarms.get(S.memberOf.get(name)); return sw && memberBot(sw, name) ? sw : null; };
 const memberShort = (sw, name) => (name.startsWith(sw.project + '.') ? name.slice(sw.project.length + 1) : name);
 // `batch` defers the member index to its caller, which builds it once for all the records it learns.
+// Who a swarm's agents are, pinned or not: a change means events of theirs may have come before the
+// page knew them, so the swarm is checked and its board and usage read again.
+const pinsOf = (sw) => sw.members.map((m) => `${m}=${sw.ids[m] ?? ''}`).join(',');
 function learnSwarm(record, batch = false) {
-  const sw = S.swarms.get(record.swarm) ?? { lines: [], offset: null, tab: 'board', used: null, reading: null, again: false, usage: null, state: { roles: {}, streams: {}, tasks: {} }, filter: null };
+  const known = S.swarms.get(record.swarm), was = known && pinsOf(known);
+  const sw = known ?? { lines: [], offset: null, tab: 'board', used: null, reading: null, again: false, usage: null, state: { roles: {}, streams: {}, tasks: {} }, filter: null };
   Object.assign(sw, { name: record.swarm, dir: record.dir, project: record.project, goal: record.goal, workspace: record.workspace, budget: sw.budget ?? record.budget_tokens, mix: record.mix ?? [], members: record.members ?? [], ids: record.ids ?? {}, rows: record.rows ?? {}, stopped: !!record.stopped });
   S.swarms.set(sw.name, sw); if (!batch) indexMembers();
+  if (pinsOf(sw) !== was) { checkSoon(sw); boardSoon(sw, true); }
   return sw;
 }
 function indexMembers() {
@@ -457,10 +462,12 @@ async function loadSwarms() {
 }
 // A swarm read while its start is still making its agents names them before it pins their ids, and
 // their first events have come and gone by then: it is read again, a second apart, until every member
-// is pinned, for at most a minute per swarm, so one left unpinned never holds up the next.
-let pinsTimer = null; const pinTries = new Map();
+// is pinned, for at most a minute per swarm, so one left unpinned never holds up the next. An agent
+// named like a known swarm's, briefed before Add named it in the swarm, is waited for the same way.
+let pinsTimer = null; const pinTries = new Map(), adding = new Map();
 function pinsSoon() {
-  const waiting = [...S.swarms.values()].filter((sw) => sw.members.some((m) => sw.ids[m] == null)).map((sw) => sw.name);
+  for (const [name, of] of [...adding]) if (S.memberOf.has(name) || !S.swarms.has(of) || !bot(name)) adding.delete(name);
+  const waiting = [...new Set([...S.swarms.values()].filter((sw) => sw.members.some((m) => sw.ids[m] == null)).map((sw) => sw.name).concat([...adding.values()]))];
   for (const name of [...pinTries.keys()]) if (!waiting.includes(name)) pinTries.delete(name);
   const due = waiting.filter((name) => (pinTries.get(name) ?? 0) < 60);
   if (pinsTimer || !due.length) return;
@@ -581,6 +588,8 @@ function swarmsSoon(name) {
     swarmsTimer = null; const before = new Set(S.swarms.keys()), names = lookFor; lookFor = [];
     // A read that failed looks again at these names' next turn.
     try { await loadSwarms(); } catch (e) { for (const n of names) looked.delete(n); Daemon.log?.(`swarms: ${e?.message ?? e}`); return; }
+    for (const n of names) { const of = [...S.swarms.keys()].find((s) => n.startsWith(s + '-')); if (of && !S.memberOf.has(n)) adding.set(n, of); }
+    pinsSoon();
     const added = [...S.swarms.keys()].filter((n) => !before.has(n));
     if (added.length) { toast(`swarm ${added.join(', ')} started`, 4000); render(); }
   }, 200);
@@ -800,7 +809,8 @@ async function onEvent(ev) {
       forgetBot(name);
       retab(name, isOpen(up) ? up : ''); save();
       // A deleted agent is no longer its swarm's: the swarm stops counting it and posting to it.
-      if (S.memberOf.has(name)) { const sw = S.swarms.get(S.memberOf.get(name)); patchRailRow(swarmKey(sw.name)); readUsage(sw); }
+      // Its going may leave the swarm quiet with no later event, so the swarm is checked.
+      if (S.memberOf.has(name)) { const sw = S.swarms.get(S.memberOf.get(name)); patchRailRow(swarmKey(sw.name)); readUsage(sw); checkSoon(sw); }
       break;
     }
     case 'pruned': {
