@@ -38,6 +38,7 @@ window.Daemon = (() => {
       editRole: (name) => invoke('edit_role', { name }),
       triggers: (after = null) => invoke('triggers', { after }),
       trigger: (name) => invoke('trigger', { name }),
+      addTrigger: (dir, args) => invoke('trigger_add', { dir, args }),
       fireTrigger: (name) => invoke('trigger_fire', { name }),
       removeTrigger: (name) => invoke('trigger_remove', { name }),
       plans: (ids) => invoke('plans', { ids }),
@@ -559,6 +560,17 @@ window.Daemon = (() => {
       { name: 'notes.digest', bot: 'notes.lead', bot_id: 2, when: 'cron 0 9 * * 1-5', once: false, sent: 6, message: 'Summarize what changed in NOTES.md since yesterday, and list the questions still open.', last: { outcome: 'sent', turn: 6, fired_ms: Date.now() - 20 * 3600000 } },
     ]).map((x) => ({ ...x })), next_after: null }),
     trigger: async (name) => { const x = (S.triggers ?? []).find((t) => t.name === name); return x ? { ...x } : null; },
+    // `add` as the script reads it: flags, then the message after `--`; the same one again changes nothing.
+    addTrigger: async (dir, args) => {
+      const at = args.indexOf('--'), f = {}; for (let i = 0; i < at; i += 2) f[args[i].slice(2)] = args[i + 1];
+      const kind = ['every', 'cron', 'at', 'file', 'commit'].find((k) => f[k] != null);
+      const b = S.bots.get(f.bot); if (!b) throw new Error(`bot_not_found: ${f.bot}`);
+      const name = f.name ?? f.bot, have = (S.triggers ??= []).find((x) => x.name === name);
+      if (have) return { ...have };
+      const x = { name, bot: f.bot, bot_id: b.bot_id, when: kind ? `${kind} ${f[kind]}` : 'fire', reply_to: f['reply-to'] ?? null, if: f.if ?? null, runs: null, sent: 0, once: kind === 'at', ended: false, message: args.slice(at + 1).join(' '), last: null };
+      S.triggers.push(x); S.triggers.sort((a, c) => (a.name < c.name ? -1 : 1));
+      return { ...x };
+    },
     // A fire sends its message after the line saying which trigger, when, and why, as the trigger script does.
     fireTrigger: async (name) => {
       const x = (S.triggers ?? []).find((t) => t.name === name); if (!x) throw new Error(`trigger_not_found: ${name}`);

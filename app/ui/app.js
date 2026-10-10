@@ -2378,6 +2378,8 @@ async function openHomeSheet(text) {
   $('sheet').innerHTML = `<h4>Start Home</h4>
     <p class="hint">Home answers what is running and what waits on you across every project, and hands work to a project's lead. It changes no files itself.</p>
     <label for="hm-model">Model</label><div class="pair">${modelSelectHTML('hm-model', models)}${effortSelectHTML('hm-effort', pickedModel(models))}</div>${none}
+    <label class="check"><input type="checkbox" id="hm-beat" checked> Heartbeat every 30 minutes, when an agent moved since the last</label>
+    <label class="check"><input type="checkbox" id="hm-standup"> Stand-up on weekdays at 9:00</label>
     <div class="foot"><button type="button" class="sbtn" data-act="close-sheet">Cancel</button><button type="submit" class="sbtn primary" id="hm-start"${models.length ? '' : ' disabled'}>Start and send</button></div>`;
   $('sheetwrap').classList.add('on'); S.ui.sheet = true;
   setTimeout(() => $('hm-model').focus?.(), 0);
@@ -2387,8 +2389,11 @@ async function submitHome() {
   if (go.disabled) return;
   if (!model) { toast('model_required: choose a model', 5000); return; }
   go.disabled = true; go.textContent = 'Starting…';
+  const wakes = HOME_TRIGGERS.filter((x) => $(x.box)?.checked);
   try { if (!bot(HOME)) await createHome(model, effort || null); }
   catch (err) { toast(String(err?.message ?? err), 6000); go.disabled = false; go.textContent = 'Start and send'; return; }
+  // Its triggers are added as the New trigger sheet adds them; one refused says why and Home still starts.
+  for (const x of wakes) addTrigger(x.fields).catch((err) => toast(`${x.fields.name}: ${err?.message ?? err}`, 6000));
   // Cancelled while Home was being made: Home exists, and the message is back in the composer, unsent.
   if (sheetKind !== 'home' || homeSheet.text !== text) return;
   homeSheet.text = '';
@@ -2446,19 +2451,22 @@ function whenOf(x, short) {
   if (w.startsWith('file ')) return short ? `file ${base(w.slice(5))}` : `When ${w.slice(5)} is written`;
   if (w.startsWith('commit ')) return short ? `commit ${base(w.slice(7))}` : `A new commit in ${w.slice(7)}`;
   if (w.startsWith('turn end of ')) return short ? 'turn end' : `When ${w.slice(12)} ends a turn`;
+  // The times the sheet offers read as it offers them.
+  const daily = /^cron (\d{1,2}) (\d{1,2}) \* \* (\*|1-5)$/.exec(w);
+  if (daily) { const at = `${daily[2]}:${daily[1].padStart(2, '0')}`; return daily[3] === '*' ? `${short ? 'daily' : 'Every day at'} ${at}` : `${short ? 'weekdays' : 'Weekdays at'} ${at}`; }
   return short ? w.replace(/ of \S+$/, '') : w.charAt(0).toUpperCase() + w.slice(1);
 }
 // Its agent, while the name still holds the one it wakes; a --start one has none until its first fire.
 const triggerBot = (x) => { const b = bot(x.bot); return b && x.bot_id != null && b.id === x.bot_id ? b : null; };
 function renderTriggers() {
-  const el = $('trigs'), t = S.trig, show = !opened() && !S.config?.host && !!(t.list?.length || t.after || t.error);
+  const el = $('trigs'), t = S.trig, show = !opened() && !S.config?.host && (t.list != null || !!t.error);
   el.hidden = !show; if (!show) return;
   const key = `${t.gen}`; if (el.dataset.key === key) return; el.dataset.key = key;
   const row = (x) => x.problem
     ? `<button type="button" class="trow bad" data-act="trigger" data-v="${esc(x.name)}"><span class="r1"><span class="tk">!</span><span class="n">${esc(x.name)}</span><span class="w">unreadable</span></span></button>`
     : `<button type="button" class="trow${x.ended || x.missed ? ' bad' : ''}" data-act="trigger" data-v="${esc(x.name)}"><span class="r1"><span class="tk">${triggerKind(x.when ?? '')}</span><span class="n">${esc(x.name)}</span><span class="w">${esc(whenOf(x, true))}</span></span><span class="r2">→ ${esc(x.bot)}${x.reply_to ? ` · answer to ${esc(x.reply_to)}` : ''}</span></button>`;
   const pages = `${t.after ? '<button type="button" class="ibtn" data-act="triggers-first" title="First page">«</button>' : ''}${t.next ? '<button type="button" class="ibtn" data-act="triggers-next" title="Next page">»</button>' : ''}`;
-  el.innerHTML = `<div class="th"><span>triggers</span><span>${pages}</span></div>${(t.list ?? []).map(row).join('')}${t.error ? `<div class="pnote bad">${esc(t.error)}</div>` : ''}`;
+  el.innerHTML = `<div class="th"><span>triggers</span><span>${pages}</span></div>${(t.list ?? []).map(row).join('')}${t.error ? `<div class="pnote bad">${esc(t.error)}</div>` : ''}<button type="button" class="newproj" data-act="new-trigger">＋ New trigger</button>`;
 }
 // A trigger's sheet: when it fires, what it does, and where the answer goes; its check, its last fire and
 // its message; and Run now, which fires it as `trigger fire` does. It is read again by name on opening, so
@@ -2518,6 +2526,73 @@ async function triggerAct(act, name) {
     await readTrigger(name);
     if (!trigSheet.row || trigSheet.row.ended || (trigSheet.row.last?.fired_ms ?? null) !== before) { readTriggers(); return; }
   }
+}
+
+// The New trigger sheet: whom it wakes, when, an optional check and agent its answer goes to, and the
+// message, added as `~/.agent/trigger add` adds one, from the agent's own folder (where a check runs).
+// Home's heartbeat and stand-up are two it fills in. The heartbeat's check asks the trigger script whether
+// an agent other than Home moved since the last tick, so a quiet tick calls no model.
+const HOME_TRIGGERS = [
+  { box: 'hm-beat', label: 'Heartbeat', fields: { name: 'home.heartbeat', bot: HOME, kind: 'every', when: '30m', if: `"$HOME/.agent/trigger" changed --except ${HOME}`, reply: '', message: 'Heartbeat: agents moved since the last one.' } },
+  { box: 'hm-standup', label: 'Stand-up', fields: { name: 'home.standup', bot: HOME, kind: 'weekdays', when: '09:00', if: '', reply: '', message: 'Stand-up.' } },
+];
+const WHEN_KINDS = [['every', 'Every', '30m, 2h or 1d'], ['weekdays', 'Weekdays at', 'HH:MM'], ['daily', 'Every day at', 'HH:MM'], ['at', 'Once at', 'YYYY-MM-DD HH:MM'], ['cron', 'Cron', 'MIN HOUR DAY MONTH WEEKDAY'], ['file', 'When a file is written', 'its path'], ['commit', 'On a new commit', 'the repository; its folder when empty'], ['fire', 'Only when run', '']];
+function triggerArgs(f) {
+  const a = f.name ? ['--name', f.name] : [];
+  const clock = /^(\d{1,2}):(\d{2})$/.exec(f.when);
+  switch (f.kind) {
+    case 'every': a.push('--every', f.when); break;
+    case 'weekdays': case 'daily': if (!clock) throw new Error('invalid_cron: a time as HH:MM'); a.push('--cron', `${Number(clock[2])} ${Number(clock[1])} * * ${f.kind === 'weekdays' ? '1-5' : '*'}`); break;
+    case 'at': a.push('--at', f.when); break;
+    case 'cron': a.push('--cron', f.when); break;
+    case 'file': a.push('--file', f.when); break;
+    case 'commit': a.push('--commit', f.when || '.'); break;
+    default: break;
+  }
+  a.push('--bot', f.bot);
+  if (f.if) a.push('--if', f.if);
+  if (f.reply) a.push('--reply-to', f.reply);
+  a.push('--', f.message);
+  return a;
+}
+// Run from the agent's folder: a relative path, a commit's repository and a check are its.
+async function addTrigger(f) {
+  const b = bot(f.bot); if (!b) throw new Error(`bot_not_found: ${f.bot}`);
+  const row = await Daemon.addTrigger(b.workspace, triggerArgs(f));
+  readTriggers();
+  return row;
+}
+function openNewTrigger() {
+  closeMenu();
+  if (S.config?.host) return;
+  sheetFor = null; sheetKind = 'newtrig';
+  const names = [...(bot(HOME) ? [HOME] : []), ...[...S.bots.keys()].filter((n) => leadProject(n))];
+  const presets = bot(HOME) ? `<div class="opts">${HOME_TRIGGERS.map((x, i) => `<button type="button" class="opt" data-act="nt-preset" data-v="${i}">${x.label}</button>`).join('')}<span class="hint">Home's own, filled in</span></div>` : '';
+  $('sheet').innerHTML = `<h4>New trigger</h4>${presets}<datalist id="nt-names">${names.map((n) => `<option value="${esc(n)}">`).join('')}</datalist>
+    <label for="nt-bot">Wakes</label><input class="tin" id="nt-bot" list="nt-names" autocomplete="off" spellcheck="false" placeholder="an agent's name">
+    <label for="nt-kind">When</label><div class="pair"><select id="nt-kind">${WHEN_KINDS.map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}</select><input class="tin" id="nt-when" autocomplete="off" spellcheck="false"></div>
+    <label for="nt-if">Checks first</label><input class="tin" id="nt-if" autocomplete="off" spellcheck="false" placeholder="optional: a command; it fires only when this exits 0, so no model is called otherwise">
+    <label for="nt-reply">Answer to</label><input class="tin" id="nt-reply" list="nt-names" autocomplete="off" spellcheck="false" placeholder="optional: the agent its answer goes to">
+    <label for="nt-message">Message</label><textarea id="nt-message" rows="3" placeholder="what to check, and when to stop"></textarea>
+    <label for="nt-name">Name</label><input class="tin" id="nt-name" autocomplete="off" spellcheck="false" placeholder="the agent's name">
+    <div class="foot"><button type="button" class="sbtn" data-act="close-sheet">Cancel</button><button type="submit" class="sbtn primary" id="nt-add">Add</button></div>`;
+  newTriggerWhen();
+  $('sheetwrap').classList.add('on'); S.ui.sheet = true;
+  setTimeout(() => $('nt-bot').focus?.(), 0);
+}
+function newTriggerWhen() { const k = WHEN_KINDS.find(([v]) => v === $('nt-kind').value); $('nt-when').placeholder = k?.[2] ?? ''; $('nt-when').hidden = k?.[0] === 'fire'; }
+function fillNewTrigger(f) {
+  for (const [id, v] of [['nt-bot', f.bot], ['nt-kind', f.kind], ['nt-when', f.when], ['nt-if', f.if], ['nt-reply', f.reply], ['nt-message', f.message], ['nt-name', f.name]]) $(id).value = v;
+  newTriggerWhen();
+}
+async function submitNewTrigger() {
+  const go = $('nt-add'); if (go.disabled) return;
+  const v = (id) => $(id).value.trim();
+  const f = { bot: v('nt-bot'), kind: $('nt-kind').value, when: v('nt-when'), if: v('nt-if'), reply: v('nt-reply'), message: v('nt-message'), name: v('nt-name') };
+  if (!f.bot || !f.message) { toast(`invalid_trigger: ${f.bot ? 'a message' : 'whom it wakes'}`, 5000); return; }
+  go.disabled = true; go.textContent = 'Adding…';
+  try { const row = await addTrigger(f); if (sheetKind === 'newtrig') await openTriggerSheet(row?.name ?? f.name ?? f.bot); }
+  catch (err) { toast(String(err?.message ?? err), 6000); go.disabled = false; go.textContent = 'Add'; }
 }
 
 // ---------- the new swarm sheet ----------
@@ -2612,14 +2687,16 @@ function closeSheet() {
   // A message that would have started Home goes back to the composer, unsent.
   if (sheetKind === 'home' && homeSheet.text && !S.selected && !$('input').value) { $('input').value = homeSheet.text; grow($('input')); }
   homeSheet.text = ''; homeSheet.open = false; S.ui.sheet = false; sheetFor = null; sheetKind = null; $('sheetwrap').classList.remove('on'); markSeen(); focusInput('main'); }
-$('sheet').addEventListener('change', (e) => { if (sheetKind === 'memory') return; if (sheetKind === 'project') { projectChange(e.target); return; } if (sheetKind === 'home') { if (e.target.id === 'hm-model') followModel(e.target.value, 'hm-effort'); return; } if (e.target.dataset?.mix != null) mixChange(e.target); else if (e.target.id === 'sw-n' || e.target.id === 'sw-budget' || e.target.id === 'sw-org') { updateSwarmBudget(e.target.id); renderMix(); } });
+$('sheet').addEventListener('change', (e) => { if (sheetKind === 'memory') return; if (sheetKind === 'newtrig') { if (e.target.id === 'nt-kind') newTriggerWhen(); return; } if (sheetKind === 'project') { projectChange(e.target); return; } if (sheetKind === 'home') { if (e.target.id === 'hm-model') followModel(e.target.value, 'hm-effort'); return; } if (e.target.dataset?.mix != null) mixChange(e.target); else if (e.target.id === 'sw-n' || e.target.id === 'sw-budget' || e.target.id === 'sw-org') { updateSwarmBudget(e.target.id); renderMix(); } });
 // A share typed updates the counts once it is a number, without redrawing the field being typed in.
-$('sheet').addEventListener('input', (e) => { if (sheetKind === 'memory') return; if (sheetKind === 'project') { projectReady(); return; } if (sheetKind === 'home') return; if (e.target.id === 'sw-n' || e.target.id === 'sw-budget') { updateSwarmBudget(e.target.id); renderMix(); return; } if (e.target.dataset?.f !== 'share') return; mixChange(e.target); const n = agentCount(), problem = sheetProblem(n), counts = problem ? null : mixCounts(sheet.mix, mixRows(sheet.mix, n)); $('sw-mix').querySelectorAll('.count').forEach((c, i) => { c.textContent = counts ? `${counts[i]} agent${counts[i] === 1 ? '' : 's'}` : ''; c.classList.toggle('none', !!counts && !counts[i]); }); const w = $('sw-mix').querySelector('.mixfoot span'); if (w) { w.textContent = problem ?? (counts.some((c) => !c) ? `A row makes no agent at ${n} agents` : ''); w.className = w.textContent ? 'warn' : ''; } });
+$('sheet').addEventListener('input', (e) => { if (sheetKind === 'memory') return; if (sheetKind === 'project') { projectReady(); return; } if (sheetKind === 'home' || sheetKind === 'newtrig') return; if (e.target.id === 'sw-n' || e.target.id === 'sw-budget') { updateSwarmBudget(e.target.id); renderMix(); return; } if (e.target.dataset?.f !== 'share') return; mixChange(e.target); const n = agentCount(), problem = sheetProblem(n), counts = problem ? null : mixCounts(sheet.mix, mixRows(sheet.mix, n)); $('sw-mix').querySelectorAll('.count').forEach((c, i) => { c.textContent = counts ? `${counts[i]} agent${counts[i] === 1 ? '' : 's'}` : ''; c.classList.toggle('none', !!counts && !counts[i]); }); const w = $('sw-mix').querySelector('.mixfoot span'); if (w) { w.textContent = problem ?? (counts.some((c) => !c) ? `A row makes no agent at ${n} agents` : ''); w.className = w.textContent ? 'warn' : ''; } });
 $('sheet').addEventListener('submit', async (e) => {
   e.preventDefault();
   if (sheetKind === 'memory') return;
   if (sheetKind === 'project') { await submitProject(); return; }
   if (sheetKind === 'home') { await submitHome(); return; }
+  if (sheetKind === 'newtrig') { await submitNewTrigger(); return; }
+  if (sheetKind !== 'swarm') return;
   const project = sheetFor, start = $('sw-start'); if (!project || start.disabled) return;
   start.disabled = true; start.textContent = 'Starting…';
   try {
@@ -3710,6 +3787,8 @@ async function act(el) {
     case 'triggers-first': S.trig.after = null; await readTriggers(); return;
     case 'triggers-next': S.trig.after = S.trig.next; await readTriggers(); return;
     case 'trigger': await openTriggerSheet(v); return;
+    case 'new-trigger': openNewTrigger(); return;
+    case 'nt-preset': fillNewTrigger(HOME_TRIGGERS[Number(v)].fields); return;
     case 'trigger-fire': await triggerAct('fire', sheetFor); return;
     case 'trigger-remove': await triggerAct('remove', sheetFor); return;
     case 'trigger-open': { const x = trigSheet.row; closeSheet(); if (x && triggerBot(x)) await go(x.bot, 'tab'); return; }

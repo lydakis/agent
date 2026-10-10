@@ -56,7 +56,7 @@ const GATE_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a fire waits for the turn whose answer goes to `--reply-to`:
 /// the longest wait the daemon takes.
 const REPLY_WAIT_MS: u64 = 86_400_000;
-const USAGE: &str = "usage: trigger add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--turn-budget-tokens N] -- MESSAGE\n         WHEN: --every N{m,h,d} | --in N{m,h} | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO | --turn-end BOT [--count N]; none: only fire runs it\n       trigger ls [--after NAME]\n       trigger fire NAME\n       trigger rm NAME";
+const USAGE: &str = "usage: trigger add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--turn-budget-tokens N] -- MESSAGE\n         WHEN: --every N{m,h,d} | --in N{m,h} | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO | --turn-end BOT [--count N]; none: only fire runs it\n       trigger ls [--after NAME]\n       trigger fire NAME\n       trigger rm NAME\n       trigger changed --except BOT";
 
 /// Where triggers live: the LaunchAgents folder holds their plists, and
 /// `~/.agent/triggers` what each one's fires did.
@@ -2138,16 +2138,125 @@ pub fn cli(args: &[String]) -> i32 {
         }
         Some((verb, [name])) if verb == "fire" => fire_now(&places, name),
         Some((verb, rest)) if verb == "add" => add(&places, rest),
+        Some((verb, [flag, bot])) if verb == "changed" && flag == "--except" => {
+            changed(&places, bot).map(|yes| json!({"changed": yes}))
+        }
         _ => Err(format!("usage: {USAGE}")),
     }) {
         Ok(value) => {
             println!("{value}");
-            return 0;
+            // A check's answer is its exit status too: 1 says nothing changed.
+            return i32::from(value["changed"] == false);
         }
         Err(error) => error,
     };
     eprintln!("{}", error_json(&done));
     1
+}
+
+/// `trigger add ARGS` as a window asks for it: run as the script runs it,
+/// in `dir`, where `--if` and `--start` work, on the window's daemon, and as
+/// no agent's shell, so `--bot` or `--start` names whom it wakes.
+pub fn add_for(
+    socket: &Path,
+    store: Option<&Path>,
+    dir: &Path,
+    args: &[String],
+) -> Result<Value, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg(FLAG)
+        .arg("add")
+        .args(args)
+        .current_dir(dir)
+        .env("AGENT_SOCKET", socket)
+        .env_remove("AGENT_BOT")
+        .env_remove("AGENT_BOT_ID")
+        .stdin(std::process::Stdio::null());
+    match store {
+        Some(store) => command.env("AGENT_STORE", store),
+        None => command.env_remove("AGENT_STORE"),
+    };
+    let out = command.output().map_err(|e| e.to_string())?;
+    if out.status.success() {
+        return serde_json::from_slice(&out.stdout).map_err(|e| e.to_string());
+    }
+    let error: Value = serde_json::from_slice(&out.stderr).unwrap_or_default();
+    Err(match (error["error"].as_str(), error["detail"].as_str()) {
+        (Some(code), Some(detail)) => format!("{code}: {detail}"),
+        _ => format!(
+            "trigger_failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+    })
+}
+
+/// Whether an agent other than `except` has a new message or another status
+/// since the last check for `except`: a heartbeat's `--if`, so a quiet tick
+/// costs this process and one `bots` page per 256 agents, and no model call.
+/// The first check, and one with no daemon running, only take note.
+fn changed(places: &Places, except: &str) -> Result<bool, String> {
+    changed_at(places, except, &Daemon::current()?.socket()?)
+}
+
+fn changed_at(places: &Places, except: &str, socket: &Path) -> Result<bool, String> {
+    valid_name(except)?;
+    let now = runtime()?.block_on(async {
+        // No daemon: nothing moved, and none is started to ask.
+        let Ok((client, _events)) = Client::connect(socket).await else {
+            return Ok(None);
+        };
+        let mut hash = Fnv::new(client.store().unwrap_or_default());
+        let mut after = Value::Null;
+        let read = loop {
+            let page = match client
+                .request("bots", json!({"after": after, "limit": 256}))
+                .await
+            {
+                Ok(page) => page,
+                Err(e) => break Err(coded(e)),
+            };
+            for bot in page["bots"].as_array().into_iter().flatten() {
+                if bot["name"] != except {
+                    hash.add(&format!(
+                        "{}|{}|{}|{}",
+                        bot["name"], bot["bot_id"], bot["head"], bot["status"]
+                    ));
+                }
+            }
+            after = page["next_after"].clone();
+            if after.is_null() {
+                break Ok(Some(format!("{:016x}", hash.0)));
+            }
+        };
+        client.close().await;
+        read
+    })?;
+    let Some(now) = now else { return Ok(false) };
+    let seen = places.state.join(format!(".changed.{except}"));
+    let before = std::fs::read_to_string(&seen).ok();
+    if before.as_deref() == Some(now.as_str()) {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(&places.state).map_err(|e| e.to_string())?;
+    replace(&seen, &now)?;
+    Ok(before.is_some())
+}
+
+/// FNV-1a, 64-bit: the same digest from one app version to the next.
+struct Fnv(u64);
+impl Fnv {
+    fn new(seed: &str) -> Self {
+        let mut hash = Self(0xcbf2_9ce4_8422_2325);
+        hash.add(seed);
+        hash
+    }
+    fn add(&mut self, text: &str) {
+        for byte in text.bytes().chain([0]) {
+            self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
 }
 
 /// A trigger that watched the triggers' own folder would fire itself: each
@@ -2513,11 +2622,21 @@ fn stamp(epoch: i64) -> String {
     )
 }
 
-/// `sh -c CMD` in the trigger's folder, given `GATE_TIMEOUT`: whether it
-/// said go, and why not when it said no; why it said nothing when it could
-/// not run or ran past its time, which is the fire failing, not a no.
-fn gate(command: &str, dir: Option<&Path>) -> Result<Result<(), String>, String> {
+/// `sh -c CMD` in the trigger's folder, on its daemon (`AGENT_SOCKET`,
+/// `AGENT_STORE`), given `GATE_TIMEOUT`: whether it said go, and why not when
+/// it said no; why it said nothing when it could not run or ran past its
+/// time, which is the fire failing, not a no.
+fn gate(command: &str, dir: Option<&Path>, daemon: &Daemon) -> Result<Result<(), String>, String> {
     let mut sh = std::process::Command::new("/bin/sh");
+    for (key, value) in [
+        ("AGENT_SOCKET", &daemon.socket),
+        ("AGENT_STORE", &daemon.store),
+    ] {
+        match value {
+            Some(value) => sh.env(key, value),
+            None => sh.env_remove(key),
+        };
+    }
     sh.args(["-c", command])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -2896,7 +3015,7 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
     match trigger
         .gate
         .as_deref()
-        .map(|c| gate(c, trigger.dir.as_deref()))
+        .map(|c| gate(c, trigger.dir.as_deref(), &trigger.daemon))
     {
         None | Some(Ok(Ok(()))) => {}
         Some(Ok(Err(no))) => {
@@ -3641,6 +3760,56 @@ mod tests {
     }
 
     #[test]
+    fn changed_says_when_another_agent_moved() {
+        use std::io::{BufRead, Write};
+        let w = World::new("changed");
+        std::fs::create_dir_all(&w.root).unwrap();
+        let socket = w.root.join("f.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        // The fleet each connection sees: home, and one task on two pages.
+        let fleet = std::sync::Arc::new(std::sync::Mutex::new((1, 1, "idle")));
+        let kept = fleet.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let ready = json!({"event": "ready", "protocol": agent_client::PROTOCOL, "store": {"identity": "s1"}});
+                writeln!(stream, "{ready}").unwrap();
+                for line in reader.lines() {
+                    let Ok(line) = line else { break };
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    let (home, task, status) = *kept.lock().unwrap();
+                    let result = if request["after"].is_null() {
+                        json!({"bots": [{"name": "home", "bot_id": 1, "head": home, "status": "idle"}], "next_after": "home"})
+                    } else {
+                        json!({"bots": [{"name": "p.task", "bot_id": 2, "head": task, "status": status}], "next_after": null})
+                    };
+                    if writeln!(stream, "{}", json!({"id": request["id"], "result": result}))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+        let changed = || changed_at(&w.places, "home", &socket).unwrap();
+        assert!(!changed(), "the first check takes note");
+        assert!(!changed());
+        // Home's own turn is not news for Home.
+        fleet.lock().unwrap().0 = 5;
+        assert!(!changed());
+        fleet.lock().unwrap().1 = 2;
+        assert!(changed(), "another agent's message is");
+        assert!(!changed(), "once");
+        fleet.lock().unwrap().2 = "waiting";
+        assert!(changed(), "so is another status");
+        // No daemon: nothing to tell, and the last digest stays.
+        assert!(!changed_at(&w.places, "home", &w.root.join("none.sock")).unwrap());
+        assert!(!changed());
+        assert!(changed_at(&w.places, "../x", &socket).is_err());
+    }
+
+    #[test]
     fn recurring_triggers_wait_a_full_interval_before_the_first_fire() {
         let now = clock(2026, 9, 28, 23, 52) + 30;
         for (value, seconds) in [("30m", 1800), ("2h", 7200), ("1d", 86400)] {
@@ -4010,7 +4179,19 @@ mod tests {
 
     #[test]
     fn a_gate_says_no_with_any_exit_but_zero() {
+        let none = Daemon {
+            store: None,
+            socket: None,
+        };
+        let gate = |command: &str, dir: Option<&Path>| super::gate(command, dir, &none);
         assert_eq!(gate("true", None), Ok(Ok(())));
+        // It asks its trigger's daemon.
+        let daemon = Daemon {
+            store: Some("/s/state.sqlite".into()),
+            socket: None,
+        };
+        let on = "test \"$AGENT_STORE\" = /s/state.sqlite && test -z \"$AGENT_SOCKET\"";
+        assert_eq!(super::gate(on, None, &daemon), Ok(Ok(())));
         assert!(gate("exit 3", None).unwrap().unwrap_err().contains('3'));
         // One that cannot run says nothing: that is no answer, not a no.
         assert!(gate("true", Some(Path::new("/nonexistent/agent-gate"))).is_err());
