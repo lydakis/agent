@@ -206,7 +206,7 @@ const onScreen = (name) => {
   if (!looking()) return false;
   const sw = swarmOfBot(name);
   // A file open beside covers the chat that was there.
-  return S.selected === name || (S.ui.side === name && !S.ui.file) || (!!sw && S.selected === swarmKey(sw.name));
+  return mainBot() === name || (S.ui.side === name && !S.ui.file) || (!!sw && S.selected === swarmKey(sw.name));
 };
 // Each row a change touches is drawn once, however many of a swarm's agents it covers.
 function patchUnseen(names) {
@@ -220,7 +220,7 @@ function patchUnseen(names) {
 function markSeen() {
   if (!S.unseen.size || !looking()) return;
   const sw = swarmOf(S.selected);
-  const seen = [...new Set([S.selected, S.ui.file ? null : S.ui.side, ...(sw ? sw.members : [])])].filter((name) => name && S.unseen.has(name));
+  const seen = [...new Set([mainBot(), S.ui.file ? null : S.ui.side, ...(sw ? sw.members : [])])].filter((name) => name && S.unseen.has(name));
   if (!seen.length) return;
   for (const name of seen) S.unseen.delete(name);
   patchUnseen(seen);
@@ -326,6 +326,12 @@ const isActive = (status) => ACTIVE.has(status);
 // the coordinator bots in the store, so nothing else can drift from it. A project's tasks are its
 // coordinator's lineage, and any root bot named `<project>.<task>`.
 const LEAD = '.lead';
+// Home's agent: the person's own, across every project, and the chat Home shows. It is never a tab
+// or a row of its own; opening it opens Home.
+const HOME = 'home';
+// The agent the main pane shows: the one open, or at Home Home's agent once it exists.
+// A file tab shows no agent.
+const mainBot = () => fileOf(S.selected) != null ? '' : S.selected || (S.bots.has(HOME) ? HOME : '');
 const leadProject = (name) => name.length > LEAD.length && name.endsWith(LEAD) ? name.slice(0, -LEAD.length) : null;
 // Who sent a prompt that is not yours: another agent's turn, or the app on its own (`origin`), as
 // the daemon keeps them with the prompt.
@@ -404,7 +410,8 @@ function tree() {
   pushSwarms(swarmsOf.get(null), 0);
   // Anything the roots do not reach is rooted where it stands: one pass, nothing hidden.
   for (const b of S.bots.values()) if (!seen.has(b.name)) { stack.push([b, 0, true, '', null]); walk(); }
-  if (projects.size && out.length > loose) out.splice(loose, 0, { label: 'bots' });
+  // Home's agent is Home itself, so it alone heads no list of bots.
+  if (projects.size && out.slice(loose).some((n) => n.depth === 0 && n.b?.name !== HOME)) out.splice(loose, 0, { label: 'bots' });
   return out;
 }
 // The path a read, write or edit names, whole (the summary is cut for display); none when it cannot be one.
@@ -1012,10 +1019,10 @@ async function loadVisible() {
   // A swarm's agents show their last lines on its Agents tab, so the first dozen load.
   const sw = swarmOf(S.selected);
   if (sw) { if (sw.tab === 'agents') for (const m of sw.members.slice(0, 12)) if (memberBot(sw, m) && m !== S.ui.side) await load(m); }
-  else if (fileOf(S.selected) == null) await load(S.selected);
-  if (S.ui.side && S.ui.side !== S.selected) await load(S.ui.side);
+  else await load(mainBot());
+  if (S.ui.side && S.ui.side !== mainBot()) await load(S.ui.side);
   // Cards on screen show their peer's last line, so those peers load too.
-  for (const who of peers().slice(-12)) if (who !== S.selected && who !== S.ui.side) await load(who);
+  for (const who of peers().slice(-12)) if (who !== mainBot() && who !== S.ui.side) await load(who);
 }
 
 // All transcript mutations, including snapshot pages and creation replies,
@@ -1387,7 +1394,7 @@ function taskCard(who) {
   return { attr: `data-task="${esc(p.name)}"`, task: p.name, status: shownStatus(p), name: shortName(p), last: plan?.at ? `${STEP_GLYPH[plan.at.s]} ${plan.at.t}` : lastLine(transcript(who)), elapsed: plan ? [planCount(plan), el].filter(Boolean).join(' · ') : el, sel: S.ui.side === who || S.selected === who };
 }
 // The two panes that show a transcript: the main thread and the one beside it.
-const PANES = [['log', () => S.selected], ['side', () => S.ui.file ? null : S.ui.side]];
+const PANES = [['log', mainBot], ['side', () => S.ui.file ? null : S.ui.side]];
 const paneKey = (name, t) => `${name}|${t.gen}|${S.ui.steps}`;
 // Replace one rendered card in place, in whichever pane shows that bot, so a process ending costs the
 // size of its own card, not a rebuild of the window.
@@ -1534,7 +1541,7 @@ function stepHTML(it, i) {
 // Open or close a run, or unfold one output, and redraw just that run.
 function toggleStep(target) {
   const pane = target.closest('.scroll'); if (!pane) return;
-  const name = pane.id === 'side' ? S.ui.side : S.selected, t = name && S.transcripts.get(name);
+  const name = pane.id === 'side' ? S.ui.side : mainBot(), t = name && S.transcripts.get(name);
   if (!t || pane.dataset.key !== paneKey(name, t)) return;
   const len = Number(pane.dataset.len);
   const i = Number(target.dataset.out ?? target.dataset.run); if (!(i >= 0 && i < len)) return;
@@ -1696,7 +1703,7 @@ function openFileFrom(path, el) {
   const beside = el?.closest?.('.pane.side'), tab = fileOf(S.selected);
   if (beside && S.ui.file) return openFile(S.ui.file.bot, joinPath(dirOf(S.ui.file.full), path));
   if (!beside && tab != null) return openFile(null, joinPath(dirOf(tab), path));
-  const who = beside ? S.ui.side : S.selected;
+  const who = beside ? S.ui.side : mainBot();
   return openFile(who, joinPath(folderOf(who, el?.closest?.('[data-turn]')?.dataset.turn), path));
 }
 // `asked`: someone opened it, so what it holds draws at once. `gen` counts every opening and load
@@ -1772,7 +1779,7 @@ function upOf(key) {
   const sw = swarmOf(key); if (sw) return bot(sw.project + LEAD) ? sw.project + LEAD : '';
   const b = bot(key); if (!b || leadProject(key)) return '';
   const mine = swarmOfBot(key); if (mine) return swarmKey(mine.name);
-  const c = creatorOf(b); if (c) return c.name;
+  const c = creatorOf(b); if (c) return c.name === HOME ? '' : c.name;
   return b.project && bot(b.project + LEAD) ? b.project + LEAD : '';
 }
 const keyLabel = (key) => { const sw = swarmOf(key); if (sw) return `⁂ ${memberShort(sw, sw.name)}`; const full = fileOf(key); if (full != null) return full.split('/').pop() || full; const b = bot(key); return b ? shortName(b) : key; };
@@ -1791,6 +1798,7 @@ function headHTML(b, pane) {
   const waiting = b.waitingOn.length ? ` on ${esc(waitSummary(b))}` : '';
   const state = `<span class="glyph ${b.status}">${glyphOf(b.status)}</span><span class="state">${labelOf(b.status)}${waiting}</span>`;
   // Beside, a look into an agent from the list: back to the list, or full screen.
+  if (pane === 'main' && b.name === HOME) { document.title = 'Agent'; return `<div class="crumbs"><b>Home</b>${state}</div><div class="tools">${moreButton(b.name)}</div>`; }
   if (pane === 'side') return `<div class="crumbs"><button type="button" class="back" data-act="close-side" title="Back to the list (Esc)" aria-label="Back to the list">←</button><b>${esc(shortName(b))}</b>${branchHTML(b)}${state}</div><div class="tools">${moreButton(b.name)}<button type="button" class="ibtn" data-act="full" title="Full screen (or double-click its row)">⤢ Full screen</button></div>`;
   return `<div class="crumbs">${crumbsHTML(b.name)}${branchHTML(b)}${state}</div><div class="tools">${moreButton(b.name)}</div>`;
 }
@@ -1812,7 +1820,7 @@ function renderHead(el, b, pane) {
   el.innerHTML = b ? headHTML(b, pane) : pane === 'main' ? '<div class="crumbs"><b>Home</b></div>' : '';
 }
 const PANE = {
-  main: { form: 'form', input: 'input', model: 'model', send: 'send', stop: 'stop', bot: () => S.selected },
+  main: { form: 'form', input: 'input', model: 'model', send: 'send', stop: 'stop', bot: mainBot },
   side: { form: 'sideform', input: 'sideinput', model: 'sidemodel', send: 'sidesend', stop: 'sidestop', bot: () => S.ui.side },
 };
 const ACTION = { send: 'Send', queue: 'Queue', steer: 'Steer', side: 'Side chat' };
@@ -1833,7 +1841,7 @@ const modelOf = (b) => S.override.get(b.name) ?? b.model;
 const effortOf = (b) => S.effort.get(b.name) ?? b.reasoning ?? null;
 function renderComposer(pane, b, sw = null) {
   const ids = PANE[pane], mode = sendMode(b), model = b ? modelOf(b) : '', effort = b ? effortOf(b) : null;
-  const key = sw ? `${SWARM}${sw.name}` : b ? `${b.name}|${mode}|${model}|${effort}|${b.runningTurn !== null}` : '-';
+  const key = sw ? `${SWARM}${sw.name}` : b ? `${b.name}|${mode}|${model}|${effort}|${b.runningTurn !== null}` : `-${!S.selected}`;
   const send = $(ids.send); if (send.dataset.k === key) return; send.dataset.k = key;
   const caret = $(ids.form).querySelector?.('.caret'); if (caret) caret.hidden = !!sw;
   // On a swarm the composer posts to its board: no model, no stop, one way to send.
@@ -1841,7 +1849,7 @@ function renderComposer(pane, b, sw = null) {
   send.textContent = ACTION[mode];
   $(ids.model).textContent = b ? `${model.split('/').slice(1).join('/') || model}${effort ? ` · ${effort}` : ''} ▾` : '';
   $(ids.model).hidden = !b; $(ids.stop).hidden = !b || b.runningTurn === null;
-  $(ids.input).placeholder = !b ? (pane === 'main' ? '/new NAME PROVIDER/MODEL [EFFORT]' : '') : mode === 'queue' ? 'queues after this turn' : mode === 'steer' ? 'steers into this turn' : mode === 'side' ? 'asks a side chat' : '';
+  $(ids.input).placeholder = !b ? (pane !== 'main' ? '' : S.selected ? '/new NAME PROVIDER/MODEL [EFFORT]' : 'Ask Home about any project, or hand it work') : mode === 'queue' ? 'queues after this turn' : mode === 'steer' ? 'steers into this turn' : mode === 'side' ? 'asks a side chat' : '';
 }
 
 // ---------- swarm view ----------
@@ -2001,6 +2009,50 @@ async function submitProject() {
   } catch (err) { toast(String(err?.message ?? err), 6000); go.disabled = false; go.textContent = 'Create'; }
 }
 
+// ---------- the Start Home sheet ----------
+// Home's agent is made on the first message sent at Home: a model and an effort, as every agent
+// takes, and nothing else. It works in your home folder, in the home role, and the message goes to it
+// once it exists.
+const homeSheet = { text: '', open: false };
+async function openHomeSheet(text) {
+  // One first message starts Home; another sent before it is picked comes back as a draft.
+  if (homeSheet.open) throw new Error('home_starting: choose a model for Home first');
+  homeSheet.open = true;
+  closeMenu();
+  let models = []; try { const [all, set] = await Promise.all([Daemon.models(), S.setup?.settings ?? Daemon.settings?.().catch(() => null)]); if (set) S.seenSettings = set; models = connected(all, set?.restartable === false && !S.setup?.settings ? null : set); } catch (e) { toast(`models: ${e?.message ?? e}`, 5000); }
+  homeSheet.text = text; sheetFor = null; sheetKind = 'home';
+  const none = !models.length ? '<p class="hint warn">No models listed: connect a provider in Settings.</p>' : '';
+  $('sheet').innerHTML = `<h4>Start Home</h4>
+    <p class="hint">Home answers what is running and what waits on you across every project, and hands work to a project's lead. It changes no files itself.</p>
+    <label for="hm-model">Model</label><div class="pair">${modelSelectHTML('hm-model', models)}${effortSelectHTML('hm-effort', pickedModel(models))}</div>${none}
+    <div class="foot"><button type="button" class="sbtn" data-act="close-sheet">Cancel</button><button type="submit" class="sbtn primary" id="hm-start"${models.length ? '' : ' disabled'}>Start and send</button></div>`;
+  $('sheetwrap').classList.add('on'); S.ui.sheet = true;
+  setTimeout(() => $('hm-model').focus?.(), 0);
+}
+async function submitHome() {
+  const go = $('hm-start'), model = $('hm-model').value, effort = $('hm-effort').value, text = homeSheet.text;
+  if (go.disabled) return;
+  if (!model) { toast('model_required: choose a model', 5000); return; }
+  go.disabled = true; go.textContent = 'Starting…';
+  try { if (!bot(HOME)) await createHome(model, effort || null); }
+  catch (err) { toast(String(err?.message ?? err), 6000); go.disabled = false; go.textContent = 'Start and send'; return; }
+  // Cancelled while Home was being made: Home exists, and the message is back in the composer, unsent.
+  if (sheetKind !== 'home' || homeSheet.text !== text) return;
+  homeSheet.text = '';
+  closeSheet();
+  try { await submit(text, 'main', HOME); }
+  catch (err) { toast(String(err?.message ?? err), 6000); const input = $('input'); if (!input.value) { input.value = text; grow(input); } }
+}
+async function createHome(model, effort) {
+  const dir = await Daemon.homeDir();
+  const policy = await Daemon.policy(dir, 'home');
+  try { localStorage.setItem('agent:model', model); if (effort !== null) localStorage.setItem('agent:effort', effort); } catch (_) {}
+  const session = S.session;
+  const record = await Daemon.request('create', { bot: HOME, workspace: dir, model, ...(effort ? { effort } : {}), instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: policy.tools ?? S.config.tools });
+  await enqueue(() => { if (S.session === session) seat(record, session); });
+  render();
+}
+
 // ---------- the new swarm sheet ----------
 // A goal, how many agents, what they are, where they work, and a budget they share. What they are is
 // a mix: rows of an identity (a profile the folder offers, or a plain agent), a model and its effort, and a share,
@@ -2088,13 +2140,18 @@ function mixChange(el) {
   if (r.reasoning && !effortsFor(r.model).includes(r.reasoning)) r.reasoning = '';
   if (el.dataset.f !== 'share' || el.type !== 'number') renderMix();
 }
-function closeSheet() { if (!S.ui.sheet) return; S.ui.sheet = false; sheetFor = null; sheetKind = null; $('sheetwrap').classList.remove('on'); markSeen(); focusInput('main'); }
-$('sheet').addEventListener('change', (e) => { if (sheetKind === 'project') { projectChange(e.target); return; } if (e.target.dataset?.mix != null) mixChange(e.target); else if (e.target.id === 'sw-n' || e.target.id === 'sw-budget' || e.target.id === 'sw-org') { updateSwarmBudget(e.target.id); renderMix(); } });
+function closeSheet() {
+  if (!S.ui.sheet) return;
+  // A message that would have started Home goes back to the composer, unsent.
+  if (sheetKind === 'home' && homeSheet.text && !S.selected && !$('input').value) { $('input').value = homeSheet.text; grow($('input')); }
+  homeSheet.text = ''; homeSheet.open = false; S.ui.sheet = false; sheetFor = null; sheetKind = null; $('sheetwrap').classList.remove('on'); markSeen(); focusInput('main'); }
+$('sheet').addEventListener('change', (e) => { if (sheetKind === 'project') { projectChange(e.target); return; } if (sheetKind === 'home') { if (e.target.id === 'hm-model') followModel(e.target.value, 'hm-effort'); return; } if (e.target.dataset?.mix != null) mixChange(e.target); else if (e.target.id === 'sw-n' || e.target.id === 'sw-budget' || e.target.id === 'sw-org') { updateSwarmBudget(e.target.id); renderMix(); } });
 // A share typed updates the counts once it is a number, without redrawing the field being typed in.
-$('sheet').addEventListener('input', (e) => { if (sheetKind === 'project') { projectReady(); return; } if (e.target.id === 'sw-n' || e.target.id === 'sw-budget') { updateSwarmBudget(e.target.id); renderMix(); return; } if (e.target.dataset?.f !== 'share') return; mixChange(e.target); const n = agentCount(), problem = sheetProblem(n), counts = problem ? null : mixCounts(sheet.mix, mixRows(sheet.mix, n)); $('sw-mix').querySelectorAll('.count').forEach((c, i) => { c.textContent = counts ? `${counts[i]} agent${counts[i] === 1 ? '' : 's'}` : ''; c.classList.toggle('none', !!counts && !counts[i]); }); const w = $('sw-mix').querySelector('.mixfoot span'); if (w) { w.textContent = problem ?? (counts.some((c) => !c) ? `A row makes no agent at ${n} agents` : ''); w.className = w.textContent ? 'warn' : ''; } });
+$('sheet').addEventListener('input', (e) => { if (sheetKind === 'project') { projectReady(); return; } if (sheetKind === 'home') return; if (e.target.id === 'sw-n' || e.target.id === 'sw-budget') { updateSwarmBudget(e.target.id); renderMix(); return; } if (e.target.dataset?.f !== 'share') return; mixChange(e.target); const n = agentCount(), problem = sheetProblem(n), counts = problem ? null : mixCounts(sheet.mix, mixRows(sheet.mix, n)); $('sw-mix').querySelectorAll('.count').forEach((c, i) => { c.textContent = counts ? `${counts[i]} agent${counts[i] === 1 ? '' : 's'}` : ''; c.classList.toggle('none', !!counts && !counts[i]); }); const w = $('sw-mix').querySelector('.mixfoot span'); if (w) { w.textContent = problem ?? (counts.some((c) => !c) ? `A row makes no agent at ${n} agents` : ''); w.className = w.textContent ? 'warn' : ''; } });
 $('sheet').addEventListener('submit', async (e) => {
   e.preventDefault();
   if (sheetKind === 'project') { await submitProject(); return; }
+  if (sheetKind === 'home') { await submitHome(); return; }
   const project = sheetFor, start = $('sw-start'); if (!project || start.disabled) return;
   start.disabled = true; start.textContent = 'Starting…';
   try {
@@ -2139,10 +2196,14 @@ function levelOf(open) {
   const { rows: all } = fleet, at = open ? fleet.at.get(open) : -1;
   if (at === undefined) return [];
   const depth = open ? all[at].depth : -1, out = [];
+  let home = false;
   for (let i = at + 1; i < all.length; i++) {
     const n = all[i];
     if (n.label) { if (open) break; out.push(n); continue; }
     if (n.depth <= depth) break;
+    // Home shows its agent's chat, not its row; what that agent made is a level below it.
+    if (n.depth === depth + 1) home = !open && n.b?.name === HOME;
+    if (home) continue;
     if (n.depth === depth + 1) out.push({ ...n, kids: 0 }); else if (n.depth === depth + 2) out.at(-1).kids += 1;
   }
   return out;
@@ -2207,16 +2268,18 @@ function botRowHTML(n) {
 const tabState = (k) => { if (fileOf(k) != null) return 'file'; const sw = swarmOf(k); return sw ? swarmStatus(sw) : shownStatus(bot(k)); };
 function renderTabs() {
   const tabs = S.ui.tabs.filter(isOpen), states = tabs.map(tabState), labels = tabs.map(keyLabel);
-  const key = `${S.selected}|${tabs.map((k, i) => `${k}\u0000${states[i]}\u0000${labels[i]}`).join('\u0000')}`;
+  // Away from Home, its button carries Home's agent's state, as a tab would: running, waiting, done or failed.
+  const hb = S.selected && bot(HOME), hs = hb ? shownStatus(hb) : 'idle';
+  const key = `${S.selected}|${hs}|${tabs.map((k, i) => `${k}\u0000${states[i]}\u0000${labels[i]}`).join('\u0000')}`;
   const el = $('tabs'); if (el.dataset.k === key) return; el.dataset.k = key;
-  const home = `<button type="button" class="homebtn${S.selected ? '' : ' on'}" data-act="home" title="Home">⌂ Home</button>`;
+  const home = `<button type="button" class="homebtn${S.selected ? '' : ' on'}" data-act="home" title="Home${hs === 'idle' ? '' : ` · ${labelOf(hs)}`}">${hs === 'idle' ? '⌂' : `<span class="glyph ${hs}">${glyphOf(hs)}</span>`} Home</button>`;
   el.innerHTML = home + (tabs.length ? '<span class="tabsep"></span>' : '') + tabs.map((k, i) => {
     const on = k === S.selected, label = esc(labels[i]);
     return `<div class="wtab${on ? ' on' : ''}" role="tab" aria-selected="${on}" tabindex="0" data-tab="${esc(k)}" title="${esc(fileOf(k) ?? k)}"><span class="glyph ${states[i]}">${states[i] === 'file' ? FILE : glyphOf(states[i])}</span><span class="tl">${label}</span><button type="button" class="x" data-act="close-tab" data-who="${esc(k)}" aria-label="Close ${label}">×</button></div>`;
   }).join('');  // Past the bar's width the tabs scroll, and the one on screen stays in view.
   el.querySelector('.wtab.on')?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
 }
-function peers() { return (S.transcripts.get(S.selected)?.peers ?? []).filter((who) => S.bots.has(who)); }
+function peers() { return (S.transcripts.get(mainBot())?.peers ?? []).filter((who) => S.bots.has(who)); }
 function keybarHTML(b) {
   const busy = b && isActive(b.status);
   const dot = `<span><span class="dot${!S.attached ? ' off' : busy ? ' busy' : ''}"></span>${!S.attached ? 'detached' : 'live'}</span>`;
@@ -2234,16 +2297,17 @@ function followDrafts() {
     const input = $(ids.input), who = ids.bot() ?? '';
     if ((input.dataset.for ?? '') === who) continue;
     if (input.dataset.for) { if (input.value) S.drafts.set(input.dataset.for, input.value); else S.drafts.delete(input.dataset.for); }
-    moved.push([input, who]);
+    // What was typed at Home before its agent existed is that agent's once it does.
+    moved.push([input, who, !input.dataset.for && who === HOME ? input.value : '']);
   }
-  for (const [input, who] of moved) { input.value = S.drafts.get(who) ?? ''; S.drafts.delete(who); input.dataset.for = who; grow(input); }
+  for (const [input, who, kept] of moved) { input.value = S.drafts.get(who) ?? kept; S.drafts.delete(who); input.dataset.for = who; grow(input); }
 }
 function render() {
   const app = $('app');
   // The sidebar's rows also stamp each bot's project, which names and crumbs use.
   railRows();
-  const b = bot(S.selected), sw = swarmOf(S.selected);
-  if (S.ui.side && (!S.bots.has(S.ui.side) || S.ui.side === S.selected)) S.ui.side = null;
+  const b = bot(mainBot()), sw = swarmOf(S.selected);
+  if (S.ui.side && (!S.bots.has(S.ui.side) || S.ui.side === mainBot())) S.ui.side = null;
   const side = S.ui.side && !S.ui.file ? bot(S.ui.side) : null;
   app.classList.toggle('rail', S.ui.rail); app.classList.toggle('side', !!side || !!S.ui.file);
   followDrafts();
@@ -2269,10 +2333,10 @@ function render() {
   if (S.ui.picker) renderPicker();
   refreshMenu();
 }
-// Home has no chat of its own yet: it says where things are.
+// Home before its agent exists: what that agent is for, and where things are.
 function renderHome(el) {
-  const key = `home|${S.bots.size > 0}`; if (el.dataset.key === key) return; el.dataset.key = key; el.dataset.who = '';
-  el.innerHTML = `<div class="home">${S.bots.size ? 'Projects and agents are in the list. Click one to look in, double-click to open it as a tab. ⌘K finds any agent.' : 'No agents yet. ＋ New project starts one, or /new NAME PROVIDER/MODEL here.'}</div>`;
+  const host = S.config?.host ?? '', key = `home|${S.bots.size > 0}|${host}`; if (el.dataset.key === key) return; el.dataset.key = key; el.dataset.who = '';
+  el.innerHTML = `<div class="home">Home is your own agent across every project: ask it what is running, what finished and what waits on you, or hand it work and it goes to that project's lead. ${host ? `It runs on this machine, so a window on ${esc(host)} has none; open Home in a window here.` : 'Your first message starts it.'}<br><br>${S.bots.size ? 'Projects and agents are in the list. Click one to look in, double-click to open it as a tab. ⌘K finds any agent.' : 'No projects yet. ＋ New project starts one.'}</div>`;
 }
 // Once a second, while anything runs: the clocks on cards and run lines, in place. The activity
 // check is cached per fleet change, so a quiet fleet of any size costs nothing here.
@@ -2291,8 +2355,9 @@ function pickerRows() {
 // view's, else the agent's or the swarm's.
 function searchFolder() {
   if (pickerPane === 'side' && S.ui.file) return dirOf(S.ui.file.full);
-  const key = pickerPane === 'side' && S.ui.side ? S.ui.side : S.selected;
-  const tab = fileOf(key); if (tab != null) return dirOf(tab);
+  const beside = pickerPane === 'side' && S.ui.side;
+  const tab = beside ? null : fileOf(S.selected); if (tab != null) return dirOf(tab);
+  const key = beside ? S.ui.side : mainBot();
   const sw = swarmOf(key); if (sw) return sw.workspace ?? null;
   return bot(key)?.workspace ?? S.config?.workspace ?? null;
 }
@@ -2430,7 +2495,7 @@ function refreshMenu() {
 // Keep, which turns a side chat into a task, is not built yet.
 function botMenuItems(name) {
   const sw = swarmOf(name);
-  const tab = { act: 'open-tab', who: name, label: 'Open as tab', hint: 'double-click', disabled: S.ui.tabs.includes(name) };
+  const tab = { act: 'open-tab', who: name, label: 'Open as tab', hint: 'double-click', disabled: S.ui.tabs.includes(name) || name === HOME };
   if (sw) return [
     tab, { sep: true },
     { act: 'swarm-stop', who: name, label: 'Stop every agent', disabled: sw.stopped && !sw.members.some((m) => memberBot(sw, m)?.runningTurn != null) },
@@ -2533,6 +2598,11 @@ async function submit(text, pane = 'main', to = PANE[pane].bot()) {
   if (text === '/help' || text === '?') { showHelp(pane); return; }
   const sw = pane === 'main' && swarmOf(to);
   if (sw) { await postToSwarm(sw, text); return; }
+  // At Home before its agent exists, the first message starts it.
+  if (pane === 'main' && !to && !S.selected) {
+    if (S.config?.host) throw new Error(`home_local_only: Home runs on this machine, and this window's agents run on ${S.config.host}`);
+    await openHomeSheet(text); return;
+  }
   const b = bot(to); if (!b) throw new Error('no bot selected; /new NAME PROVIDER/MODEL [EFFORT] creates one');
   // An event can seat a bot before its snapshot identity arrives. Never send an unpinned name.
   if (b.id == null) throw new Error('bot_identity_pending: wait for attachment to finish');
@@ -2547,7 +2617,7 @@ async function submit(text, pane = 'main', to = PANE[pane].bot()) {
   try { await Daemon.request('submit', { bot: b.name, bot_id: b.id, request_id: `app-${crypto.randomUUID()}`, prompt: text, delivery, ...where }); }
   catch (e) { if (delivery === 'steer' && /stale_turn/.test(String(e?.message ?? e))) throw new Error('that turn ended; not steered'); throw e; }
 }
-async function interrupt(name = S.selected) { const b = bot(name); if (!b || b.runningTurn === null) return; try { await Daemon.request('interrupt', { bot: b.name, turn: b.runningTurn }); } catch (e) { toast(`interrupt: ${e?.message ?? e}`); } }
+async function interrupt(name = mainBot()) { const b = bot(name); if (!b || b.runningTurn === null) return; try { await Daemon.request('interrupt', { bot: b.name, turn: b.runningTurn }); } catch (e) { toast(`interrupt: ${e?.message ?? e}`); } }
 // `NAME-fork`, then `NAME-fork-2` on (or `-side`), with NAME cut whole characters short so the
 // daemon's 128-byte name limit holds.
 const NAME_BYTES = 128;
@@ -2912,7 +2982,8 @@ function setupHTML(kept = new Map()) {
   return `<div class="shead"><b>${ready && projects ? 'Settings' : 'Set up Agent'}</b><button type="button" class="ibtn" data-act="setup-close" title="Close" aria-label="Close"${busy}>✕</button></div>`
     + step(1, 'Providers', ready, `${rows}<div class="row">${set?.host ? `<p class="dim">This window's daemon runs on ${esc(set.host)}, with the providers its login shell there exports; change them there.</p>` : set?.restartable === false ? '<p class="dim">This window uses a daemon it did not start, so it cannot apply provider changes.</p>' : add}${st.adding === null && !set?.host ? refresh : ''}</div>${listed}`)
     + step(2, 'First project', projects, project)
-    + (projects && !S.config?.host ? rolesHTML(st, busy) : '')
+    // Onboarding is the fundamentals; the roles show once a project or Home exists.
+    + ((projects || S.bots.has(HOME)) && !S.config?.host ? rolesHTML(st, busy) : '')
     + hostsHTML(st, busy)
     + (!S.config?.host && (projects || st.triggers?.length || st.triggersAfter || st.triggersError) ? triggersHTML(st, busy) : '')
     + (st.busy ? `<p class="busy">${esc(st.busy)}</p>` : '') + (st.error ? `<p class="bad">${esc(st.error)}</p>` : '');
@@ -2928,11 +2999,11 @@ function hostsHTML(st, busy) {
 }
 // The app's roles, each read from your own file in every project once you have one. Edit makes that
 // file from the app's text the first time and opens it in your editor.
-const ROLES = [['coordinator', 'Coordinator'], ['swarm-flat', 'Flat swarm'], ['swarm-council', 'Council swarm']];
+const ROLES = [['coordinator', 'Coordinator'], ['swarm-flat', 'Flat swarm'], ['swarm-council', 'Council swarm'], ['home', 'Home']];
 function rolesHTML(st, busy) {
   const own = new Map((st.roles ?? []).map((r) => [r.name, r.file]));
   const rows = ROLES.map(([name, label]) => `<div class="prow"><span class="pn">${label}</span><span class="st${own.get(name) ? '' : ' dim'}">${own.get(name) ? `~/.agents/agents/${name}.md` : 'the app\'s own'}</span><span class="acts"><button type="button" class="sbtn" data-act="edit-role" data-v="${name}"${busy}>Edit</button></span></div>`).join('');
-  return `<section><h3>Roles</h3>${rows}<p class="dim">A project's coordinator and a swarm's agents follow these in every project; a project's own .agents/agents file of that name comes first. An agent keeps the text it started with, so an edit reaches new projects and swarms.</p></section>`;
+  return `<section><h3>Roles</h3>${rows}<p class="dim">A project's coordinator and a swarm's agents follow these in every project; a project's own .agents/agents file of that name comes first. Home follows its own. An agent keeps the text it started with, so an edit reaches the projects, swarms and Home made after it.</p></section>`;
 }
 // Agents wake from triggers they or their coordinator made: a time, a file written, a commit, or a fire by name.
 // launchd keeps watch. Each shows who it wakes, on what, what its last fire did, and the message it sends.
@@ -3005,6 +3076,7 @@ function renderSetup() {
 // - 'close': its tab closes, and an open one hands the window to the tab before it, or Home.
 async function go(name, how = 'here') {
   clearTimeout(rowLook.timer); rowLook.who = rowLook.before = null;
+  if (name === HOME && how !== 'close') { name = ''; how = 'here'; }
   const tabs = S.ui.tabs;
   if (how === 'close') {
     const i = tabs.indexOf(name); if (i < 0) return;
@@ -3102,7 +3174,7 @@ document.addEventListener('keydown', async (e) => {
   const empty = e.target.id === 'input' && $('input').value === '';
   // Up and down step through every agent in order; from Home, down is the first and up the last.
   if (empty && (k === 'ArrowUp' || k === 'ArrowDown')) {
-    const names = fleetIndex().rows.filter((n) => n.b).map((n) => n.b.name), down = k === 'ArrowDown';
+    const names = fleetIndex().rows.filter((n) => n.b && n.b.name !== HOME).map((n) => n.b.name), down = k === 'ArrowDown';
     let i = names.indexOf(S.selected);
     i = i >= 0 ? (i + (down ? 1 : names.length - 1)) % names.length : S.selected ? -1 : down ? 0 : names.length - 1;
     if (i >= 0) await go(names[i]);

@@ -36,7 +36,7 @@ function page(daemon = {}, storage = null) {
   context.Rich = context.window.Rich;
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, openFileFrom, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, fork, remove, createProject, save, restore, showMenu, refreshMenu, entries, pickerRows, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readTriggers, tellLead, markSeen, renderFile, go, upOf, crumbsHTML, railRows, renderTabs, triggerAct, turnNews, openProjectSheet, parsePlan, loadPlans, renderPlan, taskCard, openPicker, pickerMode, renderPicker, keyLabel };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, openFileFrom, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, fork, remove, createProject, save, restore, showMenu, refreshMenu, entries, pickerRows, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readTriggers, tellLead, markSeen, renderFile, go, upOf, crumbsHTML, railRows, renderTabs, triggerAct, turnNews, openProjectSheet, parsePlan, loadPlans, renderPlan, taskCard, mainBot, closeSheet, openPicker, pickerMode, renderPicker, keyLabel };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -1742,6 +1742,87 @@ test('fork names fit the daemon\'s 128-byte limit and forks work in the source\'
   assert.deepEqual(forks.map((q) => [q.bot.length, q.bot.slice(-7), 'workspace' in q]), [[128, 'aa-fork', false], [128, '-fork-2', false]]);
 });
 
+test("Home's first message starts its agent in your home folder in the home role, and then goes to it", async () => {
+  const calls = [];
+  const p = shell({
+    models: async () => [{ id: 'alpha/one' }],
+    settings: async () => ({ providers: ['alpha'], keys: [] }),
+    homeDir: async () => '/synthetic/you',
+    policy: async (dir, profile) => { calls.push(['policy', dir, profile]); return { instructions: 'home rules', compaction_instructions: 'summary', note: 'test' }; },
+    request: async (op, q) => { calls.push([op, q]); return op === 'create' ? { name: q.bot, bot_id: 9, provider: 'alpha', model: 'one', workspace: q.workspace } : { nodes: [], workspaces: [], next_from: null }; },
+  });
+  const el = (id) => p.context.document.getElementById(id);
+  assert.equal(p.mainBot(), '');
+  await p.submit('what is running?');
+  assert.equal(calls.length, 0, 'nothing is made before a model is picked');
+  assert.match(el('sheet').innerHTML, /<h4>Start Home<\/h4>/);
+  assert.match(el('sheet').innerHTML, /id="hm-model"/);
+  // A second message before Home is picked does not replace the first.
+  await assert.rejects(p.submit('and another'), /home_starting/);
+  el('hm-model').value = 'alpha/one'; el('hm-effort').value = 'high';
+  await el('sheet').listeners.submit({ preventDefault() {} }); await settle();
+  assert.deepEqual(calls.find(([op]) => op === 'policy').slice(1), ['/synthetic/you', 'home']);
+  const create = calls.find(([op]) => op === 'create')[1];
+  assert.deepEqual([create.bot, create.workspace, create.model, create.effort, create.instructions], ['home', '/synthetic/you', 'alpha/one', 'high', 'home rules']);
+  const sent = () => calls.filter(([op]) => op === 'submit').map(([, q]) => [q.bot, q.bot_id, q.prompt]);
+  assert.deepEqual(sent(), [['home', 9, 'what is running?']]);
+  // At Home its chat is the main pane, so the next message goes straight to it.
+  assert.equal(p.S.selected, ''); assert.equal(p.mainBot(), 'home');
+  await p.submit('and what waits on me?');
+  assert.deepEqual(sent().at(-1), ['home', 9, 'and what waits on me?']);
+  assert.equal(calls.filter(([op]) => op === 'create').length, 1);
+  // A window on another host has no Home to start: it says so and asks for nothing.
+  const far = shell({ models: async () => { calls.push(['models']); return []; } });
+  far.S.config.host = 'box'; calls.length = 0;
+  await assert.rejects(far.submit('what is running?'), /home_local_only: .*box/);
+  assert.deepEqual(calls, []);
+  assert.doesNotMatch(far.context.document.getElementById('sheet').innerHTML, /Start Home/);
+});
+
+test("Home's agent is Home: no row, no tab, no crumb, and a closed Start Home gives the message back", async () => {
+  const p = shell({ models: async () => [], settings: async () => ({ providers: [], keys: [] }) });
+  p.upsert({ name: 'home', bot_id: 1, provider: 'alpha', model: 'one' });
+  p.upsert({ name: 'app.lead', bot_id: 2, provider: 'alpha', model: 'one' });
+  p.upsert({ name: 'home-side', bot_id: 3, provider: 'alpha', model: 'one', created_by: 'home', created_by_id: 1 });
+  p.S.shapeGen += 1;
+  assert.deepEqual(names(p.railRows()), ['app.lead']);
+  await p.go('home');
+  assert.equal(p.S.selected, ''); assert.deepEqual(Array.from(p.S.ui.tabs), []);
+  assert.equal(p.upOf('home-side'), '');
+  const head = p.context.document.getElementById('title');
+  p.renderHead(head, p.S.bots.get('home'), 'main');
+  assert.match(head.innerHTML, /^<div class="crumbs"><b>Home<\/b><span class="glyph/);
+  // Away from Home, its button says what Home's agent is doing, and that it finished.
+  const homebtn = () => p.context.document.getElementById('tabs').innerHTML.match(/<button[^>]*class="homebtn[^"]*"[^>]*>.*?<\/button>/)[0];
+  p.S.bots.get('home').status = 'running'; p.renderTabs();
+  assert.doesNotMatch(homebtn(), /glyph/, 'at Home its chat is on screen');
+  p.S.selected = 'app.lead'; p.renderTabs();
+  assert.match(homebtn(), /<span class="glyph running">/);
+  p.S.bots.get('home').status = 'idle'; p.S.unseen.add('home'); p.renderTabs();
+  assert.match(homebtn(), /<span class="glyph done">✔<\/span> Home/);
+  p.S.unseen.delete('home'); p.renderTabs();
+  assert.match(homebtn(), />⌂ Home</);
+  p.S.selected = '';
+  // Before Home's agent exists, Cancel puts the message back in the composer.
+  const q = shell({ models: async () => [], settings: async () => ({ providers: [], keys: [] }) });
+  await q.submit('hello');
+  assert.match(q.elements.get('sheet').innerHTML, /No models listed/);
+  q.closeSheet();
+  assert.equal(q.context.document.getElementById('input').value, 'hello');
+  // Cancelled while Home is being made: Home exists, and nothing is sent.
+  const made = deferred(), sent = [];
+  const r = shell({ models: async () => [{ id: 'alpha/one' }], settings: async () => ({ providers: ['alpha'], keys: [] }), homeDir: async () => '/synthetic/you', policy: async () => ({ instructions: 'home rules', compaction_instructions: 'summary', note: 'test' }),
+    request: async (op, x) => { sent.push(op); if (op === 'create') { await made.promise; return { name: x.bot, bot_id: 9, provider: 'alpha', model: 'one', workspace: x.workspace }; } return { nodes: [], workspaces: [], next_from: null }; } });
+  r.setRender(() => r.followDrafts());
+  await r.submit('status?');
+  r.context.document.getElementById('hm-model').value = 'alpha/one';
+  const starting = r.context.document.getElementById('sheet').listeners.submit({ preventDefault() {} });
+  await settle(); r.closeSheet(); made.resolve(); await starting; await settle();
+  assert.equal(r.S.bots.has('home'), true);
+  assert.deepEqual(sent, ['create']);
+  assert.equal(r.context.document.getElementById('input').value, 'status?');
+});
+
 test('a new project creates its coordinator in the folder, in its role, writes its file once, and is not made twice', async () => {
   const calls = []; let written = false;
   const p = shell({
@@ -2677,9 +2758,11 @@ test('Settings edits flat and council profiles independently', async () => {
     roles: async () => ['coordinator', 'swarm-flat', 'swarm-council'].map((name) => ({ name, file: own.has(name) ? `/home/u/.agents/agents/${name}.md` : null })),
     editRole: async (name) => { edited.push(name); own.add(name); return `/home/u/.agents/agents/${name}.md`; },
   });
-  // Onboarding has no roles to show; Settings, once a project exists, does.
+  // Onboarding has no roles to show; Settings, once Home or a project exists, does.
   await p.openSetup();
   assert.doesNotMatch(p.setupHTML(), /Roles/);
+  p.upsert({ name: 'home', bot_id: 2, provider: 'openai', model: 'gpt' });
+  assert.match(p.setupHTML(), /<h3>Roles<\/h3>/);
   p.upsert({ name: 'app.lead', bot_id: 1, provider: 'openai', model: 'gpt' });
   let html = p.setupHTML();
   assert.match(html, /<h3>Roles<\/h3>/);
