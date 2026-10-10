@@ -1077,11 +1077,11 @@ the first fire makes it as the app makes an agent (the daemon's `create`,
 in the folder `add` ran in, with that folder's composed policy and the
 default tools), made by the agent that added the trigger when one did, so
 it shows under that agent, and gives it the fire's message. Its id is kept with the trigger's
-state as soon as it is made, before any wait, and later fires message it. A name an agent already has is refused at
+state together with that message, before any wait, and later fires message it. A name an agent already has is refused at
 `add` (`bot_exists`), and an agent of that name made before the first fire
-makes that fire fail, naming it, unless that fire's own `create` made it
-and was cut short before it heard so: the trigger marks the name as being
-taken before `create`, and the next fire takes that agent as its own.
+makes that fire fail, naming it. The `create` carries the trigger's own
+request id, so a fire cut short after the daemon made the agent asks again
+and gets that same agent, and no other.
 
 **What else.** `--reply-to BOT` keeps the fire's process until the turn it
 sent ends (the daemon's `wait`, up to a day), then queues that turn's
@@ -1090,22 +1090,27 @@ meanwhile, so a repeating one skips the times that turn spans. The fire's
 request id then ends `-to-ID`, BOT's id, so the app does not also tell
 that agent of the turn as a task update, unless that answer has not
 reached it 15 s after the turn ended. A fire keeps one record with the
-trigger's state, each part on disk before the step it is for: the agent it
-is making, then the message it is about to send, whole (`sending`: agent,
-request id, prompt, delivery), until it settles. A fire cut short anywhere
+trigger's state, each part on disk before the step it is for: the message
+it is about to send, whole (`sending`: agent, request id, prompt,
+delivery), with the agent it made for it, until it settles. A fire cut short anywhere
 (a restart, while it waits a day for an answer) leaves the next fire to send
 that message again first, as the same request: the daemon answers with the
 turn it made, or makes it now, so it goes once, is counted once, and its
-answer is passed on. The app's start asks a trigger with a message begun
+answer is passed on. A connection lost before the daemon answered leaves
+it unknown whether the message went: the fire is shown failed and the
+message stays begun, for the next fire to send as the same request. The app's start asks a trigger with a message begun
 for a fire that only finishes it (a `finish.` ask), so a one-off or a
 trigger whose next time is far off does not wait; a fire of it still
 running settles it first. Only an ask sends anything new after finishing
 one. An answer the daemon cut short is
-marked so in its first line, and one that does not get through keeps an
-ended trigger listed, saying so. `--if CMD` runs `sh -c CMD` in the folder
+marked so in its first line; a turn that ended saying nothing passes on an
+empty answer. One that does not get through keeps an ended trigger listed,
+saying so, and one whose BOT is gone (`bot_not_found`: pinned by id, it
+never comes back) ends the trigger. `--if CMD` runs `sh -c CMD` in the folder
 `add` ran in, with the `PATH` `add` ran with, before anything else, for up
 to 60 s, in its own process group, which ends with it; any exit but 0
-skips that fire and records nothing, so a heartbeat whose check finds
+skips that fire and records nothing but, for `--commit`, that its commit
+was seen, so a heartbeat whose check finds
 nothing to do costs one process and no model call. A one-off whose check
 says no ends, listed as not sent.
 `--runs N` ends the trigger once N messages went out; a fire after that

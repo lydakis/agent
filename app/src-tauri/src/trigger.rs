@@ -1533,15 +1533,14 @@ fn done_with(asked: &Asked) {
 }
 
 /// What a fire leaves for the next, all in one record, each part on disk
-/// before the step it is for: messages sent, the agent it started (or began
-/// to), the commit it saw, and the message it began to send, until it
+/// before the step it is for: messages sent, the agent it started, the
+/// commit it saw, and the message it began to send, until it
 /// settles. A fire cut short anywhere leaves the next one what it needs to
 /// finish, and nothing it could do twice.
 #[derive(Debug, Default, Clone, PartialEq)]
 struct Kept {
     sent: u64,
     started_id: Option<i64>,
-    starting: bool,
     seen: Seen,
     /// `{bot, bot_id, request_id, prompt, delivery, started}`: the submit,
     /// whole, so sending it again is the same request.
@@ -1553,7 +1552,6 @@ impl Kept {
         Self {
             sent: state["sent"].as_u64().unwrap_or(0),
             started_id: state["started_id"].as_i64(),
-            starting: state["starting"] == true,
             seen: Seen {
                 head: state["head"].as_str().map(str::to_owned),
                 log: state["log"].as_u64(),
@@ -1600,6 +1598,7 @@ fn settle(places: &Places, trigger: &Trigger, outcome: &Value, kept: &Kept, laun
     }
     let over = trigger.at.is_some()
         || outcome["outcome"] == "gone"
+        || outcome["reply"]["gone"] == true
         || trigger.runs.is_some_and(|runs| kept.sent >= runs);
     // One that did not deliver ends only once why is on disk; else its plist
     // stays, listed.
@@ -2367,9 +2366,6 @@ fn write_row(places: &Places, trigger: &Trigger, last: &Value, kept: &Kept) -> R
     row["started_id"] = json!(kept.started_id);
     row["head"] = json!(kept.seen.head);
     row["log"] = json!(kept.seen.log);
-    if kept.starting {
-        row["starting"] = json!(true);
-    }
     if !kept.sending.is_null() {
         row["sending"] = kept.sending.clone();
     }
@@ -2444,9 +2440,11 @@ fn gate(command: &str, dir: Option<&Path>) -> Result<Result<(), String>, String>
 
 /// The first fire of a `--start` trigger: the agent is made as the app
 /// makes one, with its folder's composed policy and the default tools, and
-/// shown under the agent that added the trigger. A name already taken
-/// fails, so a trigger never takes over an agent it did not make.
-async fn start(client: &Client, trigger: &Trigger, adopt: bool) -> Result<i64, String> {
+/// shown under the agent that added the trigger. Its request id is the
+/// trigger's: a fire cut short after the daemon made it asks again and gets
+/// the same agent, and a name anyone else took fails, so a trigger never
+/// takes over an agent it did not make.
+async fn start(client: &Client, trigger: &Trigger) -> Result<i64, String> {
     let Target::Start {
         name,
         model,
@@ -2469,51 +2467,21 @@ async fn start(client: &Client, trigger: &Trigger, adopt: bool) -> Result<i64, S
                 "compaction_instructions": policy["compaction_instructions"],
                 "tools": crate::TOOLS,
                 "created_by": by.as_ref().map(|(bot, _)| bot),
-                "created_by_id": by.as_ref().map(|(_, id)| id)}),
+                "created_by_id": by.as_ref().map(|(_, id)| id),
+                "request_id": format!("trigger-{}", trigger.generation)}),
         )
-        .await;
-    match made {
-        Ok(made) => made["id"]
-            .as_i64()
-            .ok_or_else(|| "create: no bot id".into()),
-        // A fire cut short after the daemon made it, before it heard so:
-        // the name was free at `add`, and this trigger began to take it.
-        // Only an agent made as this one is, that has run nothing, is it;
-        // anyone else's under the name is refused.
-        Err(error) if error.code == "bot_exists" && adopt => {
-            let there = client
-                .request("resume", json!({"bot": name}))
-                .await
-                .map_err(coded)?;
-            match made_here(
-                &there,
-                &policy["instructions"],
-                by.as_ref().map(|(_, id)| *id),
-            ) {
-                true => there["id"]
-                    .as_i64()
-                    .ok_or_else(|| "resume: no bot id".into()),
-                false => Err(coded(error)),
-            }
-        }
-        Err(error) => Err(coded(error)),
-    }
-}
-
-/// Whether an agent is the one a `--start` fire made before it was cut
-/// short: its instructions and maker are the trigger's, and it has run no
-/// turn.
-fn made_here(there: &Value, instructions: &Value, by: Option<i64>) -> bool {
-    // The daemon keeps none as "".
-    there["instructions"].as_str() == Some(instructions.as_str().unwrap_or(""))
-        && there["created_by_id"].as_i64() == by
-        && there["tokens_used"] == 0
-        && there["running_turn"].is_null()
+        .await
+        .map_err(coded)?;
+    made["id"]
+        .as_i64()
+        .ok_or_else(|| "create: no bot id".into())
 }
 
 /// Send the fire's message: a new turn when the agent is resting; a working
 /// agent, or one with work waiting, skips this time of a repeating trigger
 /// and gets any other's after its work. A deleted agent's trigger goes.
+/// What came of it, or, when the daemon may have taken the message without
+/// saying so, why that is unknown (`submit`).
 async fn deliver(
     client: &Client,
     places: &Places,
@@ -2521,7 +2489,7 @@ async fn deliver(
     kept: &mut Kept,
     why: &str,
     asked: bool,
-) -> Value {
+) -> Result<Value, Value> {
     let prompt = format!(
         "[trigger {} · {} · {why}]\n{}",
         trigger.name,
@@ -2532,24 +2500,11 @@ async fn deliver(
         (Target::Bot { name, id }, _) => (name, *id, false),
         (Target::Start { name, .. }, Some(id)) => (name, id, false),
         (Target::Start { name, .. }, None) => {
-            let adopt = kept.starting;
-            if let Err(error) = keep(places, trigger, |k| k.starting = true) {
-                return json!({"outcome": "failed", "detail": error});
-            }
-            kept.starting = true;
-            match start(client, trigger, adopt).await {
-                Ok(id) => {
-                    kept.started_id = Some(id);
-                    kept.starting = false;
-                    if let Err(error) = keep(places, trigger, |k| {
-                        k.started_id = Some(id);
-                        k.starting = false;
-                    }) {
-                        eprintln!("{}", error_json(&error));
-                    }
-                    (name, id, true)
-                }
-                Err(error) => return json!({"outcome": "failed", "detail": error}),
+            match start(client, trigger).await {
+                // Its id goes on disk with the message to it, below; a fire
+                // cut short before then gets the same agent again.
+                Ok(id) => (name, id, true),
+                Err(error) => return Ok(json!({"outcome": "failed", "detail": error})),
             }
         }
     };
@@ -2565,17 +2520,25 @@ async fn deliver(
     if let Err(error) = keep(places, trigger, |k| {
         k.sending = sending.clone();
         k.seen = seen;
+        if started {
+            k.started_id = Some(id);
+        }
     }) {
-        return json!({"outcome": "failed", "detail": error});
+        return Ok(json!({"outcome": "failed", "detail": error}));
     }
     kept.sending = sending.clone();
+    if started {
+        kept.started_id = Some(id);
+    }
     submit(client, trigger, &sending).await
 }
 
 /// Send the message a fire began and pass its answer on. Sent again, after
 /// a fire was cut short, it is the same request: the daemon answers with
-/// the turn it made the first time, or makes it now.
-async fn submit(client: &Client, trigger: &Trigger, sending: &Value) -> Value {
+/// the turn it made the first time, or makes it now. The connection lost
+/// with no answer leaves it unknown whether the daemon took it: an error,
+/// and the message stays begun, for the next fire to send again.
+async fn submit(client: &Client, trigger: &Trigger, sending: &Value) -> Result<Value, Value> {
     let bot = sending["bot"].as_str().unwrap_or_default();
     let submitted = client
         .request(
@@ -2596,9 +2559,12 @@ async fn submit(client: &Client, trigger: &Trigger, sending: &Value) -> Value {
         Err(error) if error.code == "bot_not_found" => {
             json!({"outcome": "gone", "detail": error.to_string()})
         }
+        Err(error) if error.code.starts_with("daemon_") => {
+            return Err(json!({"outcome": "failed", "detail": error.to_string()}));
+        }
         Err(error) => json!({"outcome": "failed", "detail": error.to_string()}),
     };
-    reply(client, trigger, bot, outcome).await
+    Ok(reply(client, trigger, bot, outcome).await)
 }
 
 /// A fire's request id. With `--reply-to` it ends `-to-ID`, the agent its
@@ -2638,10 +2604,7 @@ async fn reply(client: &Client, trigger: &Trigger, bot: &str, mut outcome: Value
         return outcome;
     }
     let status = result["status"].as_str().unwrap_or("ended");
-    let answer = match result["text"].as_str() {
-        Some(text) if !text.is_empty() => text.to_owned(),
-        _ => result["error"].to_string(),
-    };
+    let answer = answer(&result);
     // The daemon hands a long answer over cut short, and says so.
     let cut = if result["text_truncated"] == true {
         " · cut short"
@@ -2668,9 +2631,24 @@ async fn reply(client: &Client, trigger: &Trigger, bot: &str, mut outcome: Value
         Err(error) if error.code == "idempotency_conflict" => {
             json!({"outcome": "sent", "bot": to})
         }
+        // Pinned by id, it is never there again: the trigger ends.
+        Err(error) if error.code == "bot_not_found" => {
+            json!({"outcome": "failed", "bot": to, "gone": true, "detail": error.to_string()})
+        }
         Err(error) => json!({"outcome": "failed", "bot": to, "detail": error.to_string()}),
     };
     outcome
+}
+
+/// What a turn's `wait` result says: its text, else its error. A turn that
+/// ended saying nothing passes on nothing, not "null".
+fn answer(result: &Value) -> String {
+    match (result["text"].as_str(), &result["error"]) {
+        (Some(text), _) if !text.is_empty() => text.to_owned(),
+        (_, Value::Null) => String::new(),
+        (_, Value::String(error)) => error.clone(),
+        (_, error) => error.to_string(),
+    }
 }
 
 /// `APP --trigger-fire ...`, run by launchd.
@@ -2689,8 +2667,8 @@ pub fn fire_cli(args: &[String]) -> i32 {
             return 1;
         }
     };
-    fire(&places, &trigger, asked.as_ref().map(|a| a.kind));
-    if let Some(asked) = &asked {
+    let done = fire(&places, &trigger, asked.as_ref().map(|a| a.kind));
+    if let Some(asked) = asked.as_ref().filter(|_| done) {
         done_with(asked);
     }
     0
@@ -2725,42 +2703,51 @@ fn sends() -> u64 {
 }
 
 /// One fire: send the message when it is time, or when it was asked for;
-/// none of launchd's own runs is asked for.
-fn fire(places: &Places, trigger: &Trigger, ask: Option<Ask>) {
-    let asked = ask == Some(Ask::Fire);
+/// none of launchd's own runs is asked for. Whether it got to its ask: a
+/// message a cut-short fire began, which it could not finish, keeps the ask
+/// for the next fire.
+fn fire(places: &Places, trigger: &Trigger, ask: Option<Ask>) -> bool {
     // A link moved since `add` can make its path one every fire writes: it
     // would fire itself for ever. It ends, writing nothing more there.
     if let Some(file) = &trigger.file
         && let Err(error) = watches_itself(places, trigger.daemon.store.as_deref(), file)
     {
         eprintln!("{}", error_json(&error));
-        return ends(places, trigger, true);
+        ends(places, trigger, true);
+        return true;
     }
-    let now = now();
-    let mut durable = state(places, trigger);
-    let mut kept = Kept::of(&durable);
     // A message a fire began and did not settle (the Mac restarted while it
     // waited for the answer): this one finishes it first, as the same
     // request, and sends anything new only when asked to.
+    let kept = Kept::of(&state(places, trigger));
     if !kept.sending.is_null() {
         let sending = kept.sending.clone();
         match with_daemon(trigger, async |client| {
             submit(client, trigger, &sending).await
         }) {
-            Ok(outcome) => settle(places, trigger, &outcome, &kept, &launchctl),
+            Ok(Ok(outcome)) => settle(places, trigger, &outcome, &kept, &launchctl),
             // A daemon it cannot reach now keeps it for the next fire.
-            Err(failed) => return eprintln!("{failed}"),
+            Ok(Err(failed)) | Err(failed) => {
+                unsettled(places, trigger, &failed, &kept);
+                return false;
+            }
         }
-        if !asked || !Lock::take(places).is_ok_and(|_lock| ours(places, trigger)) {
-            return;
+        if ask != Some(Ask::Fire) || !Lock::take(places).is_ok_and(|_lock| ours(places, trigger)) {
+            return true;
         }
-        durable = state(places, trigger);
-        kept = Kept::of(&durable);
     }
     // Asked only to finish one, it sends nothing new, whenever it runs.
-    if ask == Some(Ask::Finish) {
-        return;
+    if ask != Some(Ask::Finish) {
+        send(places, trigger, ask == Some(Ask::Fire));
     }
+    true
+}
+
+/// A fire's own message, when it is time or was asked for.
+fn send(places: &Places, trigger: &Trigger, asked: bool) {
+    let now = now();
+    let durable = state(places, trigger);
+    let mut kept = Kept::of(&durable);
     // Its last run went out but its end did not (launchd would not unload
     // it): it ends now, sending nothing more.
     if trigger.runs.is_some_and(|runs| kept.sent >= runs) {
@@ -2821,6 +2808,12 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<Ask>) {
             if trigger.at.is_some() {
                 let declined = json!({"outcome": "declined", "detail": no});
                 settle(places, trigger, &declined, &kept, &launchctl);
+            } else if trigger.commit.is_some() {
+                // The commit it said no to is not news again.
+                let seen = kept.seen.clone();
+                if let Err(error) = keep(places, trigger, |k| k.seen = seen) {
+                    eprintln!("{}", error_json(&error));
+                }
             }
             return;
         }
@@ -2829,16 +2822,33 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<Ask>) {
             return settle(places, trigger, &failed, &kept, &launchctl);
         }
     }
-    let outcome = with_daemon(trigger, async |client| {
+    match with_daemon(trigger, async |client| {
         deliver(client, places, trigger, &mut kept, &why, asked).await
-    });
-    let outcome = outcome.unwrap_or_else(|failed| failed);
-    settle(places, trigger, &outcome, &kept, &launchctl);
+    }) {
+        Ok(Ok(outcome)) | Err(outcome) => settle(places, trigger, &outcome, &kept, &launchctl),
+        Ok(Err(failed)) => unsettled(places, trigger, &failed, &kept),
+    }
+}
+
+/// A fire that could not tell whether its message went shows that it
+/// failed, and keeps the message begun for the next fire to finish.
+fn unsettled(places: &Places, trigger: &Trigger, failed: &Value, kept: &Kept) {
+    let log = |error: String| eprintln!("{}", error_json(&error));
+    log(failed["detail"].as_str().unwrap_or_default().to_owned());
+    let _lock = match Lock::take(places) {
+        Ok(lock) => lock,
+        Err(error) => return log(error),
+    };
+    if ours(places, trigger)
+        && let Err(error) = record_last(places, trigger, failed, kept)
+    {
+        log(error);
+    }
 }
 
 /// `f` with the trigger's daemon; why not, as a failed outcome, when it
 /// cannot be reached or serves another store.
-fn with_daemon(trigger: &Trigger, f: impl AsyncFnOnce(&Client) -> Value) -> Result<Value, Value> {
+fn with_daemon<T>(trigger: &Trigger, f: impl AsyncFnOnce(&Client) -> T) -> Result<T, Value> {
     let failed = |detail: String| json!({"outcome": "failed", "detail": detail});
     let runtime = runtime().map_err(failed)?;
     runtime.block_on(async {
@@ -3683,6 +3693,12 @@ mod tests {
         assert_eq!(w.state(&s.name), (true, true, true));
         w.settle(&s, json!({"outcome": "gone", "detail": "bot_not_found"}));
         assert_eq!(w.state(&s.name), (false, false, true));
+        // So does one whose answers go to an agent that is gone.
+        w.install(&s).unwrap();
+        let lost = json!({"outcome": "failed", "bot": "p.lead", "gone": true});
+        w.settle(&s, json!({"outcome": "sent", "turn": 2, "reply": lost}));
+        assert_eq!(w.state(&s.name), (false, false, true));
+        assert_eq!(w.rows()[0]["last"]["reply"]["gone"], true);
     }
 
     #[test]
@@ -3833,23 +3849,37 @@ mod tests {
     }
 
     #[test]
-    fn a_cut_short_start_takes_back_only_the_agent_it_made() {
-        let made = json!({"id": 7, "instructions": "be brief", "created_by_id": 3,
-            "tokens_used": 0, "running_turn": null});
-        assert!(made_here(&made, &json!("be brief"), Some(3)));
-        let none = json!({"instructions": "", "tokens_used": 0, "running_turn": null});
-        assert!(made_here(&none, &Value::Null, None));
-        for (key, other) in [
-            ("instructions", json!("someone else's")),
-            ("created_by_id", json!(4)),
-            ("tokens_used", json!(12)),
-            ("running_turn", json!(1)),
-        ] {
-            let mut there = made.clone();
-            there[key] = other;
-            assert!(!made_here(&there, &json!("be brief"), Some(3)), "{key}");
-        }
-        assert!(!made_here(&made, &json!("be brief"), None));
+    fn an_answer_is_the_turns_text_else_its_error_else_nothing() {
+        assert_eq!(answer(&json!({"text": "done", "error": null})), "done");
+        assert_eq!(answer(&json!({"text": "", "error": null})), "");
+        assert_eq!(answer(&json!({"text": ""})), "");
+        assert_eq!(
+            answer(&json!({"text": "", "error": "rate limited"})),
+            "rate limited"
+        );
+        assert_eq!(answer(&json!({"error": {"code": "x"}})), r#"{"code":"x"}"#);
+    }
+
+    #[test]
+    fn a_message_whose_fate_is_unknown_stays_begun() {
+        let w = World::new("unsettled");
+        let s = trigger();
+        w.install(&s).unwrap();
+        let sending = json!({"bot": "p.x", "bot_id": 2, "request_id": "trigger-2-1"});
+        let kept = Kept {
+            sending: sending.clone(),
+            ..Kept::default()
+        };
+        let failed = json!({"outcome": "failed", "detail": "daemon_disconnected"});
+        unsettled(&w.places, &s, &failed, &kept);
+        let row = state(&w.places, &s);
+        assert_eq!(row["last"]["outcome"], "failed");
+        assert_eq!(row["sending"], sending);
+        assert_eq!(w.state(&s.name), (true, true, true));
+        // Not for a trigger removed meanwhile.
+        w.remove(&s.name).unwrap();
+        unsettled(&w.places, &s, &failed, &kept);
+        assert!(!w.places.last(&s.name).exists());
     }
 
     #[test]

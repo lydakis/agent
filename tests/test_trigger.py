@@ -251,10 +251,22 @@ class TriggerFireTests(ModelFixture):
         self.assertNotIn('started', again['last'])
         self.settle('p.review')
         self.assertEqual(len(self.turns('p.review')), 2)
+        # A fire cut short after the daemon made the agent, before its id was
+        # kept, asks again under the trigger's request id and gets that agent.
+        last = self.home / '.agent/triggers/p.review.json'
+        kept = json.loads(last.read_text())
+        del kept['started_id']
+        last.write_text(json.dumps(kept))
+        made = self.fire('p.review', 'Review the newest commit.', target=target, extra=extra, app=self.bundle(),
+                         env=env, generation='g1')
+        self.assertEqual((made['last']['outcome'], made['started_id']), ('sent', review), made)
+        self.settle('p.review')
+        self.assertEqual(len(self.turns('p.review')), 3)
         # A fire of a new trigger for that name finds an agent it did not start.
         taken = self.fire('p.review', 'x', target=target, extra=extra, app=self.bundle(), env=env, generation='g2')
         self.assertEqual(taken['last']['outcome'], 'failed', taken)
-        self.assertEqual(len(self.turns('p.review')), 2)
+        self.assertIn('bot_exists', taken['last']['detail'])
+        self.assertEqual(len(self.turns('p.review')), 3)
 
     def test_a_start_trigger_cut_short_while_it_waits_passes_its_answer_on_next_time(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
@@ -420,6 +432,27 @@ class TriggerFireTests(ModelFixture):
         count = len(self.turns('p.task'))
         self.fire('p.task', 'Look at it.', when=when, extra=extra, generation='g')
         self.assertEqual(len(self.turns('p.task')), count, 'its return is no new commit')
+
+    def test_a_commit_its_gate_said_no_to_is_not_news_again(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        repo = self.path / 'repo'
+        repo.mkdir()
+        git = ['git', '-C', str(repo), '-c', 'user.name=t', '-c', 'user.email=t@example.com']
+        subprocess.run([*git, 'init', '-q'], check=True)
+        subprocess.run([*git, 'commit', '-q', '--allow-empty', '-m', 'one'], check=True)
+        go = self.path / 'go'
+        extra = ['--commit', str(repo), '--if', f"test -f '{go}'", '--dir', str(self.path)]
+        when = f'commit {repo}'
+        self.fire('p.task', 'x', when=when, extra=extra, generation='g')
+        subprocess.run([*git, 'commit', '-q', '--allow-empty', '-m', 'two'], check=True)
+        declined = self.fire('p.task', 'x', when=when, extra=extra, generation='g')
+        sha = subprocess.run([*git, 'rev-parse', 'HEAD'], check=True, capture_output=True, text=True).stdout.strip()
+        self.assertEqual(declined['head'], sha)
+        # A checkout later wakes it with the gate open: the declined commit is not news.
+        go.write_text('')
+        subprocess.run([*git, 'checkout', '-q', 'HEAD~1'], check=True)
+        self.fire('p.task', 'x', when=when, extra=extra, generation='g')
+        self.assertEqual(len(self.turns('p.task')), 1)
 
     def test_a_file_trigger_whose_path_became_its_own_state_ends_without_sending(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
