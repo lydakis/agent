@@ -1168,7 +1168,12 @@ test('the New project sheet asks only for a folder, the lead\'s and threads\' mo
   await p.act({ dataset: { act: 'np-choose' } });
   assert.deepEqual(calls.shift(), ['choose', '/synthetic']);
   assert.equal(el('np-dir').value, '/synthetic/weather');
-  assert.equal(el('np-create').disabled, true, 'no lead model yet');
+  // A folder is enough to try: one already a project needs no pick, and a new one without a model is
+  // refused when it is made.
+  assert.equal(el('np-create').disabled, false);
+  el('np-dir').value = ''; el('sheet').listeners.input({ target: el('np-dir') });
+  assert.equal(el('np-create').disabled, true, 'no folder');
+  el('np-dir').value = '/synthetic/weather';
   el('np-model').value = 'anthropic/claude-x'; el('np-effort').value = 'high';
   el('np-tmodel').value = 'openai/gpt-6-luna'; el('np-teffort').value = 'low';
   el('sheet').listeners.input({ target: el('np-model') });
@@ -1179,7 +1184,7 @@ test('the New project sheet asks only for a folder, the lead\'s and threads\' mo
   const create = calls.find(([op]) => op === 'create')[1];
   assert.deepEqual([create.bot, create.workspace, create.model, create.reasoning], ['weather.lead', '/synthetic/weather', 'anthropic/claude-x', 'high']);
   // The coordinator is told the threads' picks after its role, whichever role that is.
-  assert.equal(create.instructions, 'rules\n\nThis project\'s tasks, as the person set them up: start every new task, in a role (--profile) or not, with --model openai/gpt-6-luna --reasoning low. Every task works in this folder, with no worktree of its own.');
+  assert.equal(create.instructions, 'rules\n\nThis project\'s tasks, as the person set them up: start every new task, in a role (--profile) or not, with --model \'openai/gpt-6-luna\' --reasoning \'low\'. Every task works in this folder, with no worktree of its own.');
   assert.deepEqual(calls.find(([op]) => op === 'write')[1], { dir: '/synthetic/weather', name: 'weather', model: 'anthropic/claude-x', reasoning: 'high', threads: { model: 'openai/gpt-6-luna', reasoning: 'low', inProject: true } });
   assert.equal(p.S.ui.sheet, false, 'the sheet closes once the project is made');
   assert.equal(p.S.selected, 'weather.lead');
@@ -1425,7 +1430,7 @@ test('an agent\'s effort is picked beside its model, kept in the project file, a
   p.S.bots.clear(); file = { model: 'alpha/one', reasoning: 'low', threads_model: 'beta/two', threads_in: 'project' };
   await p.createProject('/synthetic/weather', 'anthropic/claude-x', 'high', { model: 'gamma/three', reasoning: null, inProject: false });
   assert.deepEqual([creates()[1].model, creates()[1].reasoning], ['alpha/one', 'low']);
-  assert.match(creates()[1].instructions, /with --model beta\/two\. Every task works in this folder/, 'and its threads\' picks');
+  assert.match(creates()[1].instructions, /with --model 'beta\/two'\. Every task works in this folder/, 'and its threads\' picks');
   // /new takes an effort after the model.
   await p.submit('/new Bob anthropic/claude-x max');
   await p.submit('/new Ann openai/gpt-6-luna xhigh');
@@ -1473,10 +1478,12 @@ test('a project name taken by another folder\'s coordinator is refused, and a re
   fail = false; failWrite = true;
   await assert.rejects(p.createProject('/synthetic/weather', 'alpha/one'), /project_unwritable/);
   assert.deepEqual(calls.map(([op]) => op), ['create', 'create', 'write'], 'the file follows an accepted coordinator');
-  failWrite = false; await p.createProject('/synthetic/weather', 'alpha/one', null, { model: 'beta/two', reasoning: 'low', inProject: true });
-  assert.deepEqual(calls.at(-1), ['write', '/synthetic/weather', 'alpha/one'], 'a retry writes the missing file with the coordinator\'s model');
-  assert.deepEqual({ ...threads }, { model: 'beta/two', reasoning: 'low', inProject: true }, 'and with the threads picked for it');
-  assert.equal(calls.filter(([op]) => op === 'create').length, 2);
+  // The coordinator made before the failed write keeps what it was told: a retry opens it, writes no
+  // file that would claim other picks, and says the picks were not applied.
+  failWrite = false; const n = calls.length; threads = 'unwritten';
+  await p.createProject('/synthetic/weather', 'alpha/one', null, { model: 'beta/two', reasoning: 'low', inProject: true });
+  assert.equal(calls.length, n, 'no create and no write'); assert.equal(threads, 'unwritten');
+  assert.match(p.S.ui.toast ?? '', /weather\.lead already exists and keeps the settings it was made with/);
   assert.equal(p.S.selected, 'weather.lead');
 });
 

@@ -683,9 +683,14 @@ daemon learns nothing about projects; everything here is client work.
   own client policy, and then writes the file if there was none, so a model
   the daemon refuses is never saved. The file goes in through a temporary
   and a link, so it is never partial and never replaces one. An existing
-  coordinator is opened if it works in that folder (and the file it lacks is
-  written with its model); one in another folder is a name collision,
-  reported and not opened.
+  coordinator is opened if it works in that folder and keeps the settings it
+  was made with, which cannot be read back, so no file is written for it;
+  one in another folder is a name collision, reported and not opened. A
+  folder that is already a project keeps its settings, and the window says
+  when the sheet's picks were not applied. Create needs only a folder: a new
+  project with no model picked, from the sheet or its coordinator profile,
+  is refused with `model_required`. The threads' model and effort reach the
+  coordinator shell-quoted.
 - **Navigation.** Home, then a tab for each agent opened full screen, on a
   bar of floating tabs. The list on the right holds one level below what is
   open: at Home the projects and the bots in none, in a project its threads
