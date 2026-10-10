@@ -43,6 +43,18 @@ made.
 ![The finder](app/nav-find.png)
 ![A third tab from the finder](app/nav-tabs.png)
 
+### Home
+
+Captured 2026-10-10. The first message sent at Home asks for the model and
+effort Home's agent runs on, then starts it and sends the message.
+
+![Start Home: a model and an effort, and Start and send](app/home-start.png)
+
+Home's chat: a status question answered from `agent ls`, and work for the
+demo project handed to its lead. Home's agent is not a row in the list.
+
+![Home's chat with two answers](app/home-chat.png)
+
 ### Plans
 
 Captured 2026-10-10. A task that keeps a plan shows its count and current
@@ -198,13 +210,14 @@ says why beside those that answered.
 
 ![Settings with one provider failing](app/settings.png)
 
-Once a project exists, Settings also lists the app's two roles: the
-coordinator's and a swarm agent's. **Edit** opens your own copy in
+Once Home or a project exists, Settings also lists the app's roles: the
+coordinator's, a flat and a council
+swarm's, and Home's. **Edit** opens your own copy in
 `~/.agents/agents/` in your text editor, made from the app's text the first
 time, and from then on that file is the role in every project (a project's
 own `.agents/agents` file of the same name still comes first). An agent keeps
-the text it started with, so an edit reaches coordinators and swarm agents
-made after it. Captured 2026-09-28.
+the text it started with, so an edit reaches the agents made after it.
+Captured 2026-10-10.
 
 ![Settings with the roles](app/settings-roles.png)
 
@@ -691,6 +704,26 @@ parent-death signal for the master to follow).
 The shell follows the "Agent App Concepts" prototype (NEXT item 47). The
 daemon learns nothing about projects; everything here is client work.
 
+- **Home.** Home is a chat with the person's own agent, the bot `home`,
+  which works in their home folder in the `home` role: the folder's (their
+  own `~/.agents/agents/home.md`) or the one the app ships
+  ([home.md](../app/agents/home.md)). The shipped text has it answer what is
+  running, what finished and what waits on the person from `agent ls`,
+  `approvals`, `turns` and `wait --timeout-ms 0`, filtered to what the
+  question needs (the agents not at rest, the calls waiting on an approval,
+  one project's agents, the leads, an agent's last turns) so a large
+  fleet stays under the shell's output limit, hand a project's work to its lead with
+  `run --detach --delivery queue`, change no files and start no agents of
+  its own. Until it exists, Home says what it is for, and the first message
+  sent there opens **Start Home**, a model and an effort as every agent
+  takes, then creates it and sends that message; Cancel puts the message
+  back in the composer. At Home the main pane is its chat, its head
+  "Home" with its state, and away from Home the Home button shows that
+  state (working, waiting, done, failed); it is never a row in the list or a tab, and
+  opening it by name, from the finder or a crumb, opens Home. What it made
+  sits a level below it, reached from the finder. Home's agent is local
+  only, as projects are. It has no heartbeat or stand-up yet: those come
+  with triggers on Home (T2).
 - **Projects.** A project is a folder, its coordinator bot `<project>.lead`,
   and `.agents/project.toml` (name, coordinator, model and effort, the
   threads' model and effort and where they work; mechanics only). The

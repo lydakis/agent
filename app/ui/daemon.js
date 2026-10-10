@@ -21,6 +21,7 @@ window.Daemon = (() => {
       project: (dir) => invoke('project', { dir }),
       writeProject: ({ dir, name, model, reasoning = null, threads = null }) => invoke('write_project', { dir, name, model, reasoning, threadsModel: threads?.model ?? null, threadsReasoning: threads?.reasoning ?? null, threadsInProject: !!threads?.inProject }),
       chooseFolder: (start = null) => invoke('choose_folder', { start }),
+      homeDir: () => invoke('home_dir'),
       branch: (dir) => invoke('branch', { dir }),
       readFile: (path) => invoke('read_file', { path }),
       attach: (after) => invoke('attach', { after }),
@@ -168,6 +169,7 @@ window.Daemon = (() => {
     const turn = start(name, prompt, from);
     if (turn === null) return;
     await wait(250);
+    if (name === 'home') { await home(name, turn, prompt); return; }
     if (/scenario|ship|split/i.test(prompt)) { await scenario(name, turn); return; }
     // The app telling a coordinator its tasks moved: it reads one, and passes on what another needs.
     if (prompt.startsWith('Task updates: ')) {
@@ -278,12 +280,30 @@ window.Daemon = (() => {
     await stream(name, turn, 'All of it landed. Plan matches the diff, tests are green with one harmless warning, release build finished. Ready for review: two files, 41 lines.');
     finish(name, turn);
   }
+  // Home reads the fleet with `agent ls`, answers what it can, and hands a project's work to its lead.
+  async function home(name, turn, prompt) {
+    const others = [...S.bots.values()].filter((b) => b.name !== name);
+    const ls = others.map((b) => JSON.stringify({ bot: b.name, status: b.status, workspace: b.workspace })).join('\n') + '\n';
+    await tool(name, turn, 'shell', { command: '"$AGENT_BIN" ls' }, JSON.stringify({ exit_code: 0, stderr: '', stdout: ls, success: true }), 400);
+    if ((S.bots.get(name) ?? GONE).interrupted) return;
+    const lead = others.find((b) => b.name.endsWith('.lead') && prompt.toLowerCase().includes(b.name.slice(0, -5)));
+    if (lead) {
+      const brief = prompt.replace(/'/g, '');
+      await tool(name, turn, 'shell', { command: `"$AGENT_BIN" run --detach --delivery queue --bot ${lead.name} -- '${brief}'` }, JSON.stringify({ exit_code: 0, stderr: '', stdout: JSON.stringify({ bot: lead.name, status: 'queued' }) + '\n', success: true }), 400);
+      setTimeout(() => reply(lead.name, brief, { bot: name, turn }), 300);
+      await stream(name, turn, `Sent to ${lead.name.slice(0, -5)}'s lead; it reports back in its own chat.`);
+    } else {
+      const working = others.filter((b) => b.status !== 'idle').map((b) => b.name);
+      await stream(name, turn, `Needs you: nothing right now.\n\n${working.length ? `Working: ${working.join(', ')}.` : 'Nothing is running.'} notes answered its open questions: where worktrees live, and who runs the setup command.`);
+    }
+    if (!(S.bots.get(name) ?? GONE).interrupted) finish(name, turn);
+  }
   // A task keeps its plan with the plan skill's script; the page reads it back by bot id.
   async function plan(name, turn, ...steps) {
     const b = S.bots.get(name); if (!b || b.interrupted) return;
     const text = steps.join('\n') + '\n';
     (S.plans ??= new Map()).set(b.bot_id, text);
-    await tool(name, turn, 'shell', { command: `sh "$HOME/.agents/skills/plan/plan" ${steps.map((x) => `'${x}'`).join(' ')}` }, JSON.stringify({ exit_code: 0, stderr: '', stdout: text, success: true }), 200);
+    await tool(name, turn, 'shell', { command: `sh "$HOME/.agents/skills/plan/plan" ${steps.map((x) => `'${x}'`).join(' ')}` }, JSON.stringify({ exit_code: 0, stderr: "", stdout: `plan saved: ${steps.length} steps\n`, success: true }), 200);
   }
   async function work(n, turn, text) {
     await wait(300);
@@ -450,6 +470,7 @@ window.Daemon = (() => {
     project: async (dir) => { const name = String(dir).split('/').filter(Boolean).pop()?.replace(/[^A-Za-z0-9_-]+/g, '-') || 'project'; return { dir, name, coordinator: `${name}.lead`, model: null, file: false }; },
     writeProject: async () => {},
     chooseFolder: async () => '/Users/you/Developer/weather',
+    homeDir: async () => '/Users/you',
     // A coordinator puts a task that edits in `~/.agent/worktrees/NAME` on branch agent/NAME.
     // The demo's files, by their path under any agent's folder.
     readFile: async (path) => {
@@ -460,7 +481,7 @@ window.Daemon = (() => {
     branch: async (dir) => { const m = /\/worktrees\/([^/]+)$/.exec(dir ?? ''); return m ? `agent/${m[1]}` : null; },
     swarms: async () => ({ swarms: [...S.swarms.values()].map(swarmRecord), broken: [] }),
     // The demo has no editor to open: Edit only says your copy is now the one read.
-    roles: async () => ['coordinator', 'swarm-flat', 'swarm-council'].map(name => ({ name, file: S.ownRoles?.has(name) ? `/home/you/.agents/agents/${name}.md` : null })),
+    roles: async () => ['coordinator', 'swarm-flat', 'swarm-council', 'home'].map(name => ({ name, file: S.ownRoles?.has(name) ? `/home/you/.agents/agents/${name}.md` : null })),
     editRole: async (name) => { (S.ownRoles ??= new Set()).add(name); return `/home/you/.agents/agents/${name}.md`; },
     // Triggers a coordinator made: a task that checks its PR, a reviewer started at the next commit
     // whose answer goes to the lead, a one-off for itself, and one whose agent was deleted before its time came.

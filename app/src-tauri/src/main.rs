@@ -330,6 +330,14 @@ fn policy(
     compose(std::path::Path::new(&dir), profile.as_deref(), None)
 }
 
+/// The folder Home works in: yours. Home reads every project's agents
+/// through `agent`, so it needs no folder of its own.
+#[tauri::command]
+fn home_dir(windows: State<'_, Windows>, window: tauri::WebviewWindow) -> Result<String, String> {
+    windows.of(&window)?.here("Starting Home")?;
+    std::env::var("HOME").map_err(|_| "no HOME for Home to work in".into())
+}
+
 /// The profiles a folder offers as identities for a swarm's agents, with
 /// what each says it is and the model it names: the folder's and the
 /// user's, not the roles the app gives a coordinator and a swarm's agents.
@@ -358,13 +366,14 @@ fn profiles(
 /// The roles the app ships, used where neither the folder nor the user has
 /// a file of that name. They are `policy::CLIENT_ROLES`, so no agent is
 /// offered one as a role to start a peer in.
-const BUILT_IN: [(&str, &str); 3] = [
+const BUILT_IN: [(&str, &str); 4] = [
     ("coordinator", include_str!("../../agents/coordinator.md")),
     ("swarm-flat", include_str!("../../agents/swarm-flat.md")),
     (
         "swarm-council",
         include_str!("../../agents/swarm-council.md"),
     ),
+    ("home", include_str!("../../agents/home.md")),
 ];
 
 /// The file a role of the app's is read from in every project: yours,
@@ -1488,6 +1497,7 @@ fn main() {
             triggers,
             trigger_fire,
             plans,
+            home_dir,
             plan_forget,
             trigger_remove
         ])
