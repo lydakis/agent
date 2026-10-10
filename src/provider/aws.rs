@@ -56,7 +56,7 @@ const ENVIRONMENT: [&str; 3] = [
     "AWS_SESSION_TOKEN",
 ];
 pub const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
-/// Where calls go when nothing names a region, as Claude Code does: a
+/// Where calls go when nothing names a region, as Claude Code does:
 /// a source region for the US and global inference profiles in AWS's
 /// support matrix.
 const DEFAULT_REGION: &str = "us-east-1";
