@@ -1049,29 +1049,22 @@ any name, a hard link included), which every fire writes: `add` refuses one, and
 became one (a link moved) ends the trigger, sending nothing and keeping a
 `failed` row that says why. A shell that
 names its daemon's socket and not its store cannot add one, since its store
-is not known to check. `--commit REPO` watches the
-repository's own HEAD log, which git writes on every move of HEAD, and sends
-only when HEAD names a commit other than the one the trigger last saw and
-the HEAD log's entries past where it was then (git only appends to it; the
-trigger keeps that place in bytes) include more than moves between commits
-already there (`checkout:`, `reset:`, a rebase's start, finish and abort,
-a `merge` that only fast-forwards; a `pull` that fast-forwards brought
-commits, and sends). A fire for moves alone keeps where they took HEAD and
-its log, so the next fire reads only what came after.
-So a checkout back and forth, or a write that moved nothing, sends nothing;
-a commit, even one HEAD left and came back to, sends; a log made again since
-counts as news when HEAD is elsewhere. HEAD and the log's length are read
-together, again until the log stands still around HEAD, and the log is read
-as a stream keeping only the first 320 bytes of each entry's action, so a
-long commit title costs nothing; a fire finds the log once. `add` records
-where HEAD is, a repository with no commit yet included, before
-launchd watches, and when a commit came in between asks for a fire that
-looks as launchd would (a `wake.` ask), so a fire launchd already ran for
-it finds no news and the commit is sent once. A repository where git keeps no HEAD log
-(`core.logAllRefUpdates` false, or a bare one by default) is refused, and
-adding the same trigger again watches the git folder the repository has
-now, recording where its HEAD is in place of the old one's. git is the one
-on the `PATH` `add` ran with, which the plist keeps. With no WHEN, only `fire` runs it; `fire` while a fire still runs is
+is not known to check. `--commit REPO` sends when a commit was made: launchd wakes it on any write
+to the repository's own HEAD log, which git writes on every move of HEAD,
+and the fire asks git one question, `git rev-list -n1 --since=LOOKED NEW
+--not OLD`: whether HEAD now reaches a commit the HEAD it last saw did not,
+committed since it last looked. A commit, an amend, a merge, a cherry-pick,
+a rebase that rewrote commits, or a pull of work committed since sends; a
+checkout, a reset, or a fast-forward to commits that were already there
+sends nothing, and the fire keeps where HEAD went. A HEAD the repository no
+longer has (it was made again) counts as unknown. `add` records where HEAD
+is, a repository with no commit yet included, before launchd watches, and
+when a commit came in between asks for a fire that looks as launchd would
+(a `wake.` ask), so the commit is sent once. A repository where git keeps
+no HEAD log (`core.logAllRefUpdates` false, or a bare one by default) is
+refused, and adding the same trigger again watches the git folder the
+repository has now, recording where its HEAD is in place of the old one's.
+git is the one on the `PATH` `add` ran with, which the plist keeps. With no WHEN, only `fire` runs it; `fire` while a fire still runs is
 sent by that fire once it is done.
 
 **Whom.** `add` defaults to the agent whose shell runs it (`AGENT_BOT`,

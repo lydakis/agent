@@ -1,4 +1,5 @@
 """A trigger's fire against a real daemon: what launchd runs, sent to the bot it was made for."""
+import html
 import json
 import os
 import re
@@ -213,7 +214,8 @@ class TriggerFireTests(ModelFixture):
         first = self.fire('p.task', 'first', generation='g1')
         # The plist now holds another generation of the same message: the old job's fire leaves its result alone.
         plist = self.home / 'Library/LaunchAgents/me.lydakis.agent.trigger.p.task.plist'
-        args = re.findall(r'<string>(.*?)</string>', plist.read_text())
+        program = re.search(r'<key>ProgramArguments</key>\s*<array>(.*?)</array>', plist.read_text(), re.S).group(1)
+        args = [html.unescape(a) for a in re.findall(r'<string>(.*?)</string>', program)]
         plist.write_text(plist.read_text().replace('<string>g1</string>', '<string>g2</string>'))
         last = self.home / '.agent/triggers/p.task.json'
         last.unlink()
@@ -246,11 +248,14 @@ class TriggerFireTests(ModelFixture):
         self.assertNotEqual(news['last']['turn'], first['last']['turn'])
         self.settle('p.task')
         # A move between commits sends nothing, and the next look starts past it.
+        # git's dates are whole seconds; a commit the second before a look is older than it.
+        time.sleep(1.1)
         subprocess.run([*git, 'checkout', '-q', 'HEAD~1'], check=True)
         back = self.fire('p.task', 'Look at it.', when=when, extra=extra, generation='g')
         self.assertEqual(back['last'], news['last'])
         self.assertEqual(back['head'], sha)
-        self.assertGreater(back['log'], news['log'])
+        self.assertIsNotNone(back['seen_at'])
+        time.sleep(1.1)
         subprocess.run([*git, 'checkout', '-q', '-'], check=True)
         news = self.fire('p.task', 'Look at it.', when=when, extra=extra, generation='g')
         self.assertEqual(news['last'], back['last'])
