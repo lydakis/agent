@@ -367,6 +367,11 @@ cargo build --release -p agent-app
   --socket ~/.agent/state.sqlite.sock --workspace "$PWD"
 ```
 
+A source build is not a bundle, so it links no skills: it uses whatever
+`~/.agents/skills` holds. To try the current `app/skills/NAME`, link it there
+yourself (a link of yours stays), or build a bundle as the release does
+([Installing](#installing)).
+
 Without `--workspace` the workspace is the launching directory, or home when
 that is `/`, as for a window opened from the Dock. `--host ALIAS` opens the
 window on that SSH host instead ([Hosts over SSH](#hosts-over-ssh)), with
@@ -655,7 +660,9 @@ daemon learns nothing about projects; everything here is client work.
   profile: the folder's `.agents/agents/coordinator.md`, the user's, or the
   one the app ships ([coordinator.md](../app/agents/coordinator.md)), whose
   model and tools apply when the project names none. The shipped text
-  says: a task that changes files, named with the
+  says: the coordinator makes a small, quick change itself (a few lines it
+  can check at a glance) and sends work in an area an existing task owns to
+  that task with `--delivery queue`; a new task that changes files, named with the
   project's prefix so projects do not collide, gets
   `git worktree add -b agent/NAME ~/.agent/worktrees/NAME HEAD`, the
   folder's `.agents/setup` run inside it, and `agent run --new --agents
@@ -974,8 +981,14 @@ works), at most
 once every ten minutes, in one message queued to it: `Task updates:`, then
 one line per task with its latest ended turn's handle and status (or
 `waiting for approval`), who asked for it (`you` for the coordinator's own
-ask, a bot's name, or `the person`), and how many turns ended before it
-since which handle. The handles are what its
+ask, a bot's name, the app's `origin` such as `schedule`, or `the person`), and how many turns ended before it
+since which handle. Turns you asked for in a task yourself are listed
+last, under a line saying they are yours; the role tells the coordinator to
+leave them to you rather than check or correct them. Turns anyone else asked
+for, and approvals, are listed first; a turn's end is listed with its
+pending approval, so an approval you already answered is not raised. Each list keeps its own first and
+latest handle and count per task, so a task in both is named in both, each
+time by the handle that list needs. The handles are what its
 `wait` tool reads a final reply by, so the message stays small however much
 was said. The page keeps only that per task (first and latest turn, a
 count), so a long coordinator turn or a failing daemon cannot grow it. One
@@ -988,8 +1001,8 @@ otherwise answer in one line. A message that fails is kept for the next
 one, and one due while the window was detached goes out when it attaches
 again; a coordinator deleted, or gone when the window reattaches, has its
 dropped. The window must be open for it. The message's `request_id` is made
-from the coordinator's id and a hash of each task's newest turn, status and
-approval call ID. Separate approvals and completion in one turn are distinct,
+from the coordinator's id and a hash of each task's newest turn in each
+list, its status and approval call ID. Separate approvals and completion in one turn are distinct,
 while two windows with the same news make one turn: the daemon answers
 the second with the first, or with `idempotency_conflict` when that window
 counted from an earlier turn, which it takes as told. A task deleted before
@@ -1032,14 +1045,18 @@ launchd keeps minutes; `--at` refuses a part out of range or extra parts);
 up to 1,024 calendar entries. `--file PATH` fires when the file is written,
 or a file is added to or removed from it when it is a folder (launchd's
 `WatchPaths`); it need not exist yet, and it may not be in
-`~/.agent/triggers` or be its daemon's store (or its `-wal` and `-shm`),
-which every fire writes: `add` refuses one, and a fire that finds its path
+`~/.agent/triggers` or be its daemon's store (or its `-wal` and `-shm`, by
+any name, a hard link included), which every fire writes: `add` refuses one, and a fire that finds its path
 became one (a link moved) ends the trigger and sends nothing. `--commit REPO` watches the
 repository's own HEAD log, which git writes on every move of HEAD, and sends
-only when HEAD names a commit other than the one the trigger last saw
-(`add` records the one there now) and the HEAD log shows more than
-`checkout:` and `reset:` moves since that one, so a checkout of a commit
-already there, back and forth, or a write that moved nothing sends nothing. A repository where git keeps no HEAD log
+only when HEAD names a commit other than the one the trigger last saw and
+the HEAD log's entries past where it was then (git only appends to it; the
+trigger keeps that place in bytes) include more than moves between commits
+already there (`checkout:`, `reset:`, a rebase's start, finish and abort).
+So a checkout back and forth, or a write that moved nothing, sends nothing;
+a commit, even one HEAD left and came back to, sends; a log made again since
+counts as news when HEAD is elsewhere. `add` records where HEAD is before
+launchd watches, and asks for a fire when a commit came in between. A repository where git keeps no HEAD log
 (`core.logAllRefUpdates` false, or a bare one by default) is refused, and
 adding the same trigger again watches the git folder the repository has
 now. `--turn-end BOT` fires each time BOT,
@@ -1237,6 +1254,33 @@ its own schedule fires the new trigger in its place, then unloads itself.
 A schedule plist that cannot be read, that names another trigger than its
 file does, or whose name a trigger has, is left where it is with its
 result, and logged.
+
+The app ships an `automation` skill
+([SKILL.md](../app/skills/automation/SKILL.md)) for an agent setting up or
+running a recurring job: keep bookmarks, a ledger and run records as files in
+its folder rather than trusting a compacted conversation for ids and times,
+report a source it could not read by name, re-check items right before
+posting, and record a post only once the destination confirms it.
+
+## Skills the app ships
+
+Agents read only skills in a folder's `.agents/skills` or in
+`~/.agents/skills` ([client policy](CLIENT.md)). The app bundle carries its
+skills, from `app/skills/NAME/`, in `Contents/Resources/skills/NAME`, and on
+every start the app links each one from `~/.agents/skills/NAME`
+([skills.rs](../app/src-tauri/src/skills.rs)). Updating the app updates what
+the link points at, so nothing is copied or recorded; a moved app re-points
+its links at its next start, and a skill it stops shipping loses its link.
+The Homebrew cask runs `agent-app --setup` after an install or upgrade, which
+writes what a start writes (scripts, `~/.agent/trigger`, these links) before
+the first window, and `agent-app --unlink-skills` before an uninstall, which
+removes this bundle's links and nothing else, so none outlives the app. The app's links are those into a copy of it (a bundle with
+`Contents/MacOS/agent-app`) or into an app since removed; a folder, file or
+link of yours at that name, another app's skills folder included, is left
+alone, and a folder's own skill of the same name wins over it. To change a shipped skill, replace the
+link with a folder of your own: the link leads into the signed app, which is
+not yours to edit. Agents already running keep the index they were created
+with.
 
 ## What it costs, and where the bounds are
 

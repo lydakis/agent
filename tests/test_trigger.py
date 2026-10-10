@@ -377,6 +377,14 @@ class TriggerFireTests(ModelFixture):
             # No launchd to unload it: it stays, with why.
             self.assertEqual(no['last']['outcome'], 'declined', no)
 
+    def test_a_gate_that_cannot_run_is_a_failed_fire(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        gone = self.path / 'gone'
+        failed = self.fire('p.task', 'x', extra=['--if', 'true', '--dir', str(gone)])
+        self.assertEqual(failed['last']['outcome'], 'failed', failed)
+        self.assertIn('--if', failed['last']['detail'])
+        self.assertEqual(len(self.turns('p.task')), 1)
+
     def test_a_gate_that_says_no_costs_no_turn(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
         self.assertIsNone(self.fire('p.task', 'x', extra=['--if', 'exit 1', '--dir', str(self.path)]))

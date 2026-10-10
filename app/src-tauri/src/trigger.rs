@@ -832,39 +832,84 @@ fn git(repo: &Path, args: &[&str]) -> Option<String> {
         .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
-    // Commit titles in a legacy encoding are not UTF-8; the hashes and
-    // actions read here are ASCII either way.
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    // Only the newline git ends its answer with goes: a path may end in
+    // spaces.
+    out.status.success().then(|| {
+        let text = String::from_utf8_lossy(&out.stdout);
+        text.strip_suffix('\n').unwrap_or(&text).to_owned()
+    })
 }
 
-/// Whether HEAD moved by more than checkouts and resets since it named
-/// `since`: its log's entries newer than that one, newest first. A move
-/// back and forth between commits there already is not news; one the log
-/// no longer reaches is.
-fn committed(repo: &Path, since: &Option<String>) -> bool {
-    let Some(since) = since else {
-        return true;
+/// Where a repository's HEAD is: its commit, and how far its HEAD log
+/// went then, in bytes. git only appends to that log, so what moved HEAD
+/// since is the entries past that point, whatever commits they name.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct Seen {
+    head: Option<String>,
+    log: Option<u64>,
+}
+
+/// The repository's HEAD log, in its own git folder (a worktree has its own).
+fn head_log(repo: &Path) -> Option<PathBuf> {
+    git(repo, &["rev-parse", "--absolute-git-dir"]).map(|dir| PathBuf::from(dir).join("logs/HEAD"))
+}
+
+/// Where HEAD is now, and whether getting there made a commit since
+/// `since`: some entry past its place in the log is one that is not only a
+/// move between commits already there (a checkout, a reset, a rebase's
+/// start and end). HEAD back where it was is not news; a log rewritten
+/// since (expired, or made again) is news when HEAD is elsewhere.
+fn moved(repo: &Path, since: &Seen) -> (bool, Seen) {
+    let now = Seen {
+        head: head(repo),
+        log: head_log(repo).and_then(|log| std::fs::metadata(log).ok().map(|m| m.len())),
     };
-    // Only each entry's action is read: subjects are cut to 32 columns, so
-    // the log is at most about 20 KB however long its commit titles.
-    let Some(log) = git(
-        repo,
-        &["reflog", "-n", "256", "--format=%H %<(32,trunc)%gs", "HEAD"],
-    ) else {
-        return true;
+    let news = match (&since.head, since.log) {
+        _ if now.head.is_none() => false,
+        (None, _) => true,
+        (head, _) if *head == now.head => false,
+        (_, Some(at)) if now.log.is_some_and(|len| at <= len) => {
+            entries_since(repo, at).iter().any(|what| makes(what))
+        }
+        _ => true,
     };
-    for line in log.lines() {
-        let (sha, what) = line.split_once(' ').unwrap_or((line, ""));
-        if sha == since {
-            return false;
-        }
-        if !what.starts_with("checkout:") && !what.starts_with("reset:") {
-            return true;
-        }
+    (news, now)
+}
+
+/// The actions of the HEAD log's entries past `at`, each the text after
+/// its tab. Titles in a legacy encoding are not UTF-8; actions are ASCII.
+fn entries_since(repo: &Path, at: u64) -> Vec<String> {
+    use std::io::{Read, Seek};
+    let mut text = Vec::new();
+    let read = head_log(repo)
+        .and_then(|log| std::fs::File::open(log).ok())
+        .map(|mut file| {
+            file.seek(std::io::SeekFrom::Start(at))
+                .and_then(|_| file.read_to_end(&mut text))
+        });
+    if !matches!(read, Some(Ok(_))) {
+        return vec![String::new()];
     }
-    true
+    String::from_utf8_lossy(&text)
+        .lines()
+        .map(|line| {
+            line.split_once('\t')
+                .map_or("", |(_, what)| what)
+                .to_owned()
+        })
+        .collect()
+}
+
+/// Whether a HEAD log entry made a commit, or brought one: anything but a
+/// move between commits there already.
+fn makes(what: &str) -> bool {
+    let rebase_edge = what.starts_with("rebase")
+        && ["(start)", "(finish)", "(abort)"].iter().any(|edge| {
+            what.split(':')
+                .next()
+                .is_some_and(|verb| verb.contains(edge))
+        });
+    !(what.starts_with("checkout:") || what.starts_with("reset:") || rebase_edge)
 }
 
 /// The commit a repository's HEAD names, when it names one.
@@ -1425,7 +1470,7 @@ struct Kept {
     sent: u64,
     started_id: Option<i64>,
     starting: bool,
-    head: Option<String>,
+    seen: Seen,
     /// `{bot, bot_id, request_id, prompt, delivery, started}`: the submit,
     /// whole, so sending it again is the same request.
     sending: Value,
@@ -1437,7 +1482,10 @@ impl Kept {
             sent: state["sent"].as_u64().unwrap_or(0),
             started_id: state["started_id"].as_i64(),
             starting: state["starting"] == true,
-            head: state["head"].as_str().map(str::to_owned),
+            seen: Seen {
+                head: state["head"].as_str().map(str::to_owned),
+                log: state["log"].as_u64(),
+            },
             sending: state["sending"].clone(),
         }
     }
@@ -1630,8 +1678,15 @@ pub fn migrate(places: &Places, running: Option<&str>, launchd: Loader) -> bool 
     let mut converted_running = false;
     for name in names {
         let old = places.agents.join(format!("{SCHEDULE_LABEL}{name}.plist"));
-        let Ok(text) = read_record(&old) else {
-            continue;
+        let text = match read_record(&old) {
+            Ok(text) => text,
+            Err(error) => {
+                log(format!(
+                    "unconvertible: schedule {name} is left at {}: {error}",
+                    old.display()
+                ));
+                continue;
+            }
         };
         let converted = text
             .replacen(
@@ -1657,25 +1712,26 @@ pub fn migrate(places: &Places, running: Option<&str>, launchd: Loader) -> bool 
             continue;
         }
         let path = places.plist(&name);
-        // A conversion cut short left its trigger in: it is finished.
-        let resumed = std::fs::read_to_string(&path).is_ok_and(|t| t == converted);
-        if !resumed {
-            // A trigger of that name, or one that ended and is still listed.
-            if path.exists() || places.last(&name).exists() {
-                log(format!(
-                    "name_taken: schedule {name} is left at {}: a trigger has its name",
-                    old.display()
-                ));
-                continue;
-            }
-            let made =
-                std::fs::create_dir_all(&asks).map_err(|e| format!("{}: {e}", asks.display()));
-            if let Err(error) = made.and_then(|()| swap(&path, &name, None, &converted, launchd)) {
-                log(error);
-                continue;
-            }
-            converted_running |= Some(name.as_str()) == running;
+        let there = std::fs::read_to_string(&path).ok();
+        // A conversion cut short left its trigger in, maybe before launchd
+        // loaded it: it is loaded again, and finished.
+        let resumed = there.as_deref() == Some(converted.as_str());
+        // A trigger of that name, or one that ended and is still listed.
+        if !resumed && (path.exists() || places.last(&name).exists()) {
+            log(format!(
+                "name_taken: schedule {name} is left at {}: a trigger has its name",
+                old.display()
+            ));
+            continue;
         }
+        let made = std::fs::create_dir_all(&asks).map_err(|e| format!("{}: {e}", asks.display()));
+        if let Err(error) =
+            made.and_then(|()| swap(&path, &name, there.as_deref(), &converted, launchd))
+        {
+            log(error);
+            continue;
+        }
+        converted_running |= !resumed && Some(name.as_str()) == running;
         let result = old_state.join(format!("{name}.json"));
         if result.exists()
             && !places.last(&name).exists()
@@ -1698,7 +1754,8 @@ pub fn migrate(places: &Places, running: Option<&str>, launchd: Loader) -> bool 
         };
         let to = places.state.join(&file);
         let kept = places.agents.join(format!("{SCHEDULE_LABEL}{name}.plist"));
-        if !to.exists() && !kept.exists() {
+        // A trigger of that name, even one with no result yet, keeps its own.
+        if !to.exists() && !kept.exists() && !places.plist(name).exists() {
             let _ = std::fs::rename(e.path(), to);
         }
     }
@@ -2002,6 +2059,29 @@ fn watches_itself(places: &Places, store: Option<&Path>, watch: &Path) -> Result
             watch.display()
         ));
     }
+    // A hard link is the store's file by another name: the same file.
+    use std::os::unix::fs::MetadataExt;
+    let same = |other: &Path| match (std::fs::metadata(watch), std::fs::metadata(other)) {
+        (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
+        _ => false,
+    };
+    if let Some(store) = store {
+        let name = store.as_os_str().to_owned();
+        let with = |suffix: &str| {
+            let mut name = name.clone();
+            name.push(suffix);
+            PathBuf::from(name)
+        };
+        if [with(""), with("-wal"), with("-shm")]
+            .iter()
+            .any(|f| same(f))
+        {
+            return Err(format!(
+                "invalid_file: {}: it is its daemon's store by another name, which changes with every message; watch another path",
+                watch.display()
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -2150,9 +2230,12 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
         store_id,
         message: asked.message,
     };
-    // The commit there now is seen: only the next one fires. It is read
-    // before launchd watches, so a commit after it is news.
-    let seen = trigger.commit.as_deref().and_then(head);
+    // Where HEAD is now is seen: only a commit after it fires. It is read
+    // before launchd watches; one made before launchd did is asked for.
+    let seen = trigger
+        .commit
+        .as_deref()
+        .map(|repo| moved(repo, &Seen::default()).1);
     let app = std::env::current_exe().map_err(|e| e.to_string())?;
     let environment = environment();
     match install(
@@ -2180,16 +2263,21 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
             // Under the lock, and only while no fire has written its own: a
             // fire's head is newer. A trigger without either would take the
             // commit there for news, so it goes.
-            if let Some(head) = seen {
-                let kept = Kept {
-                    head: Some(head),
-                    ..Kept::default()
-                };
+            if let Some(seen) = seen.filter(|seen| seen.head.is_some()) {
+                let repo = trigger.commit.as_deref().unwrap_or(Path::new(""));
                 let recorded = Lock::take(places).and_then(|_lock| {
-                    if state(places, &trigger).is_null() {
-                        record_last(places, &trigger, &Value::Null, &kept)
-                    } else {
-                        Ok(())
+                    if !state(places, &trigger).is_null() {
+                        return Ok(());
+                    }
+                    let kept = Kept {
+                        seen: seen.clone(),
+                        ..Kept::default()
+                    };
+                    record_last(places, &trigger, &Value::Null, &kept)?;
+                    // A commit made while launchd began to watch woke nothing.
+                    match moved(repo, &seen).0 {
+                        true => ask(places, &trigger.name, Some("")),
+                        false => Ok(()),
                     }
                 });
                 if let Err(error) = recorded {
@@ -2224,10 +2312,11 @@ fn record_last(
 
 fn write_row(places: &Places, trigger: &Trigger, last: &Value, kept: &Kept) -> Result<(), String> {
     let state = json!({"generation": trigger.generation, "last": last, "sent": kept.sent,
-        "started_id": kept.started_id, "head": kept.head});
+        "started_id": kept.started_id, "head": kept.seen.head, "log": kept.seen.log});
     let mut row = trigger.json(&state);
     row["started_id"] = json!(kept.started_id);
-    row["head"] = json!(kept.head);
+    row["head"] = json!(kept.seen.head);
+    row["log"] = json!(kept.seen.log);
     if kept.starting {
         row["starting"] = json!(true);
     }
@@ -2263,9 +2352,10 @@ fn stamp(epoch: i64) -> String {
     )
 }
 
-/// `sh -c CMD` in the trigger's folder, given `GATE_TIMEOUT`; why not,
-/// when it says no.
-fn gate(command: &str, dir: Option<&Path>) -> Result<(), String> {
+/// `sh -c CMD` in the trigger's folder, given `GATE_TIMEOUT`: whether it
+/// said go, and why not when it said no; why it said nothing when it could
+/// not run or ran past its time, which is the fire failing, not a no.
+fn gate(command: &str, dir: Option<&Path>) -> Result<Result<(), String>, String> {
     let mut sh = std::process::Command::new("/bin/sh");
     sh.args(["-c", command])
         .stdin(std::process::Stdio::null())
@@ -2288,8 +2378,8 @@ fn gate(command: &str, dir: Option<&Path>) -> Result<(), String> {
     let said = loop {
         match child.try_wait() {
             Err(e) => break Err(format!("--if: {e}")),
-            Ok(Some(status)) if status.success() => break Ok(()),
-            Ok(Some(status)) => break Err(format!("--if: {status}")),
+            Ok(Some(status)) if status.success() => break Ok(Ok(())),
+            Ok(Some(status)) => break Ok(Err(format!("--if: {status}"))),
             Ok(None) if std::time::Instant::now() > until => {
                 end_group();
                 let _ = child.wait();
@@ -2338,7 +2428,24 @@ async fn start(client: &Client, trigger: &Trigger, adopt: bool) -> Result<i64, S
             .ok_or_else(|| "create: no bot id".into()),
         // A fire cut short after the daemon made it, before it heard so:
         // the name was free at `add`, and this trigger began to take it.
-        Err(error) if error.code == "bot_exists" && adopt => bot_id(client, name).await,
+        // Only an agent made as this one is, that has run nothing, is it;
+        // anyone else's under the name is refused.
+        Err(error) if error.code == "bot_exists" && adopt => {
+            let there = client
+                .request("resume", json!({"bot": name}))
+                .await
+                .map_err(coded)?;
+            match made_here(
+                &there,
+                &policy["instructions"],
+                by.as_ref().map(|(_, id)| *id),
+            ) {
+                true => there["id"]
+                    .as_i64()
+                    .ok_or_else(|| "resume: no bot id".into()),
+                false => Err(coded(error)),
+            }
+        }
         Err(error) => Err(coded(error)),
     }
 }
@@ -2349,6 +2456,17 @@ async fn start(client: &Client, trigger: &Trigger, adopt: bool) -> Result<i64, S
 /// turn end of a turn its own trigger sent, so a trigger never wakes itself.
 fn sent_by(trigger: &Trigger) -> String {
     format!("trigger_{}_", trigger.generation)
+}
+
+/// Whether an agent is the one a `--start` fire made before it was cut
+/// short: its instructions and maker are the trigger's, and it has run no
+/// turn.
+fn made_here(there: &Value, instructions: &Value, by: Option<i64>) -> bool {
+    // The daemon keeps none as "".
+    there["instructions"].as_str() == Some(instructions.as_str().unwrap_or(""))
+        && there["created_by_id"].as_i64() == by
+        && there["tokens_used"] == 0
+        && there["running_turn"].is_null()
 }
 
 /// Send the fire's message: a new turn when the agent is resting; a working
@@ -2401,10 +2519,10 @@ async fn deliver(
     };
     let sending = json!({"bot": bot, "bot_id": id, "request_id": request_id(trigger, id),
         "prompt": prompt, "delivery": delivery, "started": started});
-    let head = kept.head.clone();
+    let seen = kept.seen.clone();
     if let Err(error) = keep(places, trigger, |k| {
         k.sending = sending.clone();
-        k.head = head;
+        k.seen = seen;
     }) {
         return json!({"outcome": "failed", "detail": error});
     }
@@ -2613,26 +2731,36 @@ fn fire(places: &Places, trigger: &Trigger, asked_why: Option<String>) {
     };
     // Any write to the HEAD log wakes it; only another commit is news.
     if let Some(repo) = &trigger.commit {
-        let seen = head(repo);
-        if !asked && (seen.is_none() || seen == kept.head || !committed(repo, &kept.head)) {
+        let (news, now) = moved(repo, &kept.seen);
+        if !asked && !news {
             return;
         }
         // A HEAD that cannot be read now keeps the last one seen.
-        if let Some(sha) = seen {
+        if let Some(sha) = &now.head {
             why = format!("{why} at {}", &sha[..sha.len().min(12)]);
-            kept.head = Some(sha);
+            kept.seen = now;
         }
     }
     // A gate that says no costs this process and nothing else; a one-off
-    // had its one time, and ends saying so.
-    if let Some(command) = &trigger.gate
-        && let Err(no) = gate(command, trigger.dir.as_deref())
+    // had its one time, and ends saying so. One that could not say is a
+    // failed fire, shown as one.
+    match trigger
+        .gate
+        .as_deref()
+        .map(|c| gate(c, trigger.dir.as_deref()))
     {
-        if trigger.at.is_some() {
-            let declined = json!({"outcome": "declined", "detail": no});
-            settle(places, trigger, &declined, &kept, &launchctl);
+        None | Some(Ok(Ok(()))) => {}
+        Some(Ok(Err(no))) => {
+            if trigger.at.is_some() {
+                let declined = json!({"outcome": "declined", "detail": no});
+                settle(places, trigger, &declined, &kept, &launchctl);
+            }
+            return;
         }
-        return;
+        Some(Err(broken)) => {
+            let failed = json!({"outcome": "failed", "detail": broken});
+            return settle(places, trigger, &failed, &kept, &launchctl);
+        }
     }
     let outcome = with_daemon(trigger, async |client| {
         deliver(client, places, trigger, &mut kept, &why, asked).await
@@ -3591,13 +3719,35 @@ mod tests {
     }
 
     #[test]
+    fn a_cut_short_start_takes_back_only_the_agent_it_made() {
+        let made = json!({"id": 7, "instructions": "be brief", "created_by_id": 3,
+            "tokens_used": 0, "running_turn": null});
+        assert!(made_here(&made, &json!("be brief"), Some(3)));
+        let none = json!({"instructions": "", "tokens_used": 0, "running_turn": null});
+        assert!(made_here(&none, &Value::Null, None));
+        for (key, other) in [
+            ("instructions", json!("someone else's")),
+            ("created_by_id", json!(4)),
+            ("tokens_used", json!(12)),
+            ("running_turn", json!(1)),
+        ] {
+            let mut there = made.clone();
+            there[key] = other;
+            assert!(!made_here(&there, &json!("be brief"), Some(3)), "{key}");
+        }
+        assert!(!made_here(&made, &json!("be brief"), None));
+    }
+
+    #[test]
     fn a_gate_says_no_with_any_exit_but_zero() {
-        assert!(gate("true", None).is_ok());
-        assert!(gate("exit 3", None).unwrap_err().contains('3'));
+        assert_eq!(gate("true", None), Ok(Ok(())));
+        assert!(gate("exit 3", None).unwrap().unwrap_err().contains('3'));
+        // One that cannot run says nothing: that is no answer, not a no.
+        assert!(gate("true", Some(Path::new("/nonexistent/agent-gate"))).is_err());
         // What it started in the background ends with it.
         let pid = std::env::temp_dir().join(format!("agent-app-gate-{}", std::process::id()));
         let command = format!("sleep 30 & echo $! > {}", pid.display());
-        assert!(gate(&command, None).is_ok());
+        assert_eq!(gate(&command, None), Ok(Ok(())));
         let pid: libc::pid_t = std::fs::read_to_string(&pid)
             .unwrap()
             .trim()
@@ -3615,6 +3765,7 @@ mod tests {
                 "test \"$(pwd -P)\" = \"$(cd \"$0\" && pwd -P)\"",
                 Some(&dir)
             )
+            .unwrap()
             .is_err()
         );
         assert!(
@@ -3625,8 +3776,7 @@ mod tests {
                     dir.display()
                 ),
                 Some(&dir)
-            )
-            .is_ok()
+            ) == Ok(Ok(()))
         );
     }
 
@@ -3661,6 +3811,15 @@ mod tests {
                 &w.root.join(".agent/state.sqlite.bak")
             ),
             Ok(())
+        );
+        // Nor the store's file by another name.
+        std::fs::write(store.with_extension("sqlite-wal"), "").unwrap();
+        let alias = w.root.join("elsewhere");
+        std::fs::hard_link(store.with_extension("sqlite-wal"), &alias).unwrap();
+        assert!(
+            watches_itself(&w.places, Some(&store), &alias)
+                .unwrap_err()
+                .contains("store")
         );
     }
 
@@ -3709,13 +3868,47 @@ mod tests {
         ]);
         let two = head(&root);
         assert_ne!(two.as_deref().unwrap(), first);
+        let (news, at_two) = moved(&root, &Seen::default());
+        assert!(news && at_two.head == two && at_two.log.is_some());
+        assert!(!moved(&root, &at_two).0);
         // Checking out a commit that was there is a move, not a commit.
-        assert!(!committed(&root, &two));
         git(&["checkout", "-q", &first]);
-        assert!(!committed(&root, &two));
+        assert!(!moved(&root, &at_two).0);
+        let at_first = moved(&root, &at_two).1;
+        // A commit, then back, then to it again: the commit is in the log
+        // past where it was, though HEAD came back to that commit between.
         git(&["commit", "-q", "--allow-empty", "-m", "three"]);
-        assert!(committed(&root, &two));
-        assert!(committed(&root, &None));
+        let three = head(&root).unwrap();
+        git(&["reset", "-q", "--hard", &first]);
+        assert!(!moved(&root, &at_first).0, "back where it was");
+        git(&["checkout", "-q", &three]);
+        assert!(moved(&root, &at_first).0);
+        // A log made again since is news when HEAD is elsewhere.
+        let rewritten = Seen {
+            log: Some(u64::MAX),
+            ..at_first.clone()
+        };
+        assert!(moved(&root, &rewritten).0);
+        // What only moves HEAD between commits there already.
+        for what in [
+            "checkout: moving from main to x",
+            "reset: moving to HEAD~1",
+            "rebase (start): checkout main",
+            "rebase -i (finish): returning to refs/heads/x",
+            "rebase (abort): returning to refs/heads/x",
+        ] {
+            assert!(!makes(what), "{what}");
+        }
+        for what in [
+            "commit: x",
+            "commit (amend): x",
+            "rebase (pick): checkout: x",
+            "merge x: Fast-forward",
+            "pull: Fast-forward",
+            "cherry-pick: x",
+        ] {
+            assert!(makes(what), "{what}");
+        }
         assert!(
             commit(root.join("nope").to_str().unwrap())
                 .unwrap_err()
@@ -3920,19 +4113,41 @@ mod tests {
                 .loaded
                 .borrow_mut()
                 .insert(format!("{SCHEDULE_LABEL}{}", s.name));
-            // The first was converted, and the app stopped before the old went.
+            // The first was converted, and the app stopped before launchd
+            // loaded it, or before the old went.
             if s.name == cut.name {
                 std::fs::write(places.plist(&s.name), new).unwrap();
-                w.fake
-                    .loaded
-                    .borrow_mut()
-                    .insert(format!("{LABEL}{}", s.name));
             }
         }
         // A trigger that ended has the second's name.
         let kept = json!({"name": "p.ended", "message": "an ended trigger's"}).to_string();
         std::fs::write(places.last("p.ended"), &kept).unwrap();
+        // A live trigger with no result yet has an ended schedule's name.
+        let live = Trigger {
+            name: "p.live".into(),
+            ..trigger()
+        };
+        std::fs::write(
+            places.plist("p.live"),
+            plist(
+                Path::new("/A/agent-app"),
+                &live,
+                &entries,
+                Path::new("/q"),
+                &[],
+            ),
+        )
+        .unwrap();
+        let ended_schedule = home.join("schedules/p.live.json");
+        std::fs::write(&ended_schedule, "{}").unwrap();
         migrate(&places, None, &|x| w.fake.call(x));
+        assert!(
+            w.fake
+                .loaded
+                .borrow()
+                .contains(&format!("{LABEL}{}", cut.name))
+        );
+        assert!(ended_schedule.exists() && !places.last("p.live").exists());
         assert!(
             !places
                 .agents
@@ -3945,7 +4160,7 @@ mod tests {
                 .borrow()
                 .contains(&format!("{SCHEDULE_LABEL}{}", cut.name))
         );
-        assert_eq!(triggers(&places)[0].0, cut);
+        assert!(triggers(&places).iter().any(|t| t.0 == cut));
         assert_eq!(
             std::fs::read_to_string(places.last("p.ended")).unwrap(),
             kept
@@ -4098,6 +4313,7 @@ mod tests {
             "--model a/m -- x",
             "--bot p.x --start p.r --model a/m -- x",
             "--runs 0 -- x",
+            "--runs 9223372036854775808 -- x",
             "--bot a --bot b -- x",
             "--wat x -- x",
         ] {

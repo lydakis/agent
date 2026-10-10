@@ -4,6 +4,7 @@
     "active": true,
     "targets": ["app"],
     "category": "DeveloperTool",
-    "externalBin": ["binaries/agent"]
+    "externalBin": ["binaries/agent"],
+    "resources": { "../skills/": "skills/" }
   }
 }
