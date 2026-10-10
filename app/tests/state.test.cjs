@@ -36,7 +36,7 @@ function page(daemon = {}, storage = null) {
   context.Rich = context.window.Rich;
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, save, restore, showMenu, refreshMenu, entries, pickerRows, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules, tellLead, markSeen, renderFile, go, upOf, crumbsHTML, railRows, renderTabs };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, openFileFrom, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, fork, remove, createProject, save, restore, showMenu, refreshMenu, entries, pickerRows, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readTriggers, tellLead, markSeen, renderFile, go, upOf, crumbsHTML, railRows, renderTabs, triggerAct, turnNews, openProjectSheet };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -590,6 +590,42 @@ test('a step links the whole path it named, not its shortened summary', async ()
   assert.match(p.runHTML(p.transcript('Bob'), 0).html, new RegExp(`<a class="fpath" href="#" data-file="${long}"`));
 });
 
+test('a path a message or step names opens from the folder its turn ran in', async () => {
+  const opened = [];
+  const p = page({ readFile: async (full) => { opened.push(full); return new TextEncoder().encode('x'); } });
+  p.setRender(() => {});
+  p.upsert({ name: 'Bob', id: 7, provider: 'alpha', model: 'one', workspace: '/now' });
+  p.S.selected = 'Bob';
+  await p.onEvent({ event: 'accepted', bot: 'Bob', turn: 1, data: { workspace: '/then' } });
+  const t = p.transcript('Bob');
+  // A message and a step carry their turn; a click inside one opens from that turn's folder.
+  assert.match(p.textHTML({ kind: 'text', text: '[a](a.md)', turn: 1 }, t), /^<div class="md" data-turn="1">/);
+  await p.onEvent({ event: 'tool_started', bot: 'Bob', turn: 1, data: { call_id: 'c1', name: 'read', arguments: JSON.stringify({ path: 'b.md' }) } });
+  p.S.ui.steps = true; assert.match(p.runHTML(t, t.items.findIndex((it) => it.kind === 'tool')).html, /data-file="b.md" data-turn="1"/);
+  const inTurn = (turn) => ({ closest: (s) => s === '[data-turn]' && turn != null ? { dataset: { turn: String(turn) } } : null });
+  await p.openFileFrom('a.md', inTurn(1));
+  // A turn the daemon no longer names, or none, opens from the agent's folder now.
+  await p.openFileFrom('a.md', inTurn(9)); await p.openFileFrom('a.md', inTurn(null));
+  assert.deepEqual(opened, ['/then/a.md', '/now/a.md', '/now/a.md']);
+});
+
+test('a history page records the folder of each turn it lists', async () => {
+  const p = page({ request: async (op) => op === 'history_nodes' ? { nodes: [{ node: 2, turn: 4 }, { node: 1, turn: 3 }], workspaces: [{ folder: '/a', turns: [3] }, { folder: '/b', turns: [4] }], next_from: null, next_newer: null } : { items: [] } });
+  const t = p.transcript('Bob'); t.items.push({ kind: 'history', next: null, min: null, loaded: false });
+  await p.load('Bob', true);
+  assert.deepEqual(new Map(t.folders), new Map([[3, '/a'], [4, '/b']]));
+});
+
+test('folding turns out of the window drops their folders', () => {
+  const p = page(); const t = p.transcript('Bob');
+  t.items = Array.from({ length: 1700 }, (_, i) => ({ kind: 'node', node: i + 1, turn: i + 1 }));
+  for (let turn = 1; turn <= 1700; turn++) t.folders.set(turn, '/w');
+  p.evict(t);
+  assert.equal(t.folders.has(1), false);
+  assert.equal(t.folders.get(1700), '/w');
+  assert.ok(t.folders.size <= 1200);
+});
+
 test('a chat covered by a file beside is not seen until the file closes', () => {
   const p = page();
   p.S.ui.side = 'Bob'; p.S.ui.file = { bot: 'Ann', full: '/w/a.md', url: null }; p.S.unseen.add('Bob');
@@ -686,7 +722,7 @@ test('same-millisecond submissions use distinct idempotency keys across clients'
 test('fork history loads by checkpoint in pages even without its source bot', async () => {
   const pages = [];
   const p = page({request:async (op,params) => {
-    if (op === 'history_nodes') { pages.push(params.from); return params.from === 4 ? {nodes:[{node:4,turn:2},{node:3,turn:2}],next_from:2} : {nodes:[{node:2,turn:1},{node:1,turn:1}],next_from:null}; }
+    if (op === 'history_nodes') { pages.push(params.from); return params.from === 4 ? {nodes:[{node:4,turn:2},{node:3,turn:2}],workspaces:[],next_from:2} : {nodes:[{node:2,turn:1},{node:1,turn:1}],workspaces:[],next_from:null}; }
     assert.equal(op,'item'); return {role:params.node % 2 ? 'user':'assistant',content:[{type:'text',text:`inherited ${params.node}`}]};
   }});
   await p.onEvent({event:'forked',bot:'branch',data:{provider:'test',id:2,source:'deleted-source',checkpoint:4}});
@@ -766,7 +802,7 @@ function historyDaemon(requests = []) {
     const min=q.min_node ?? 1, max=q.from;
     const first=q.oldest_first ? min : Math.max(min,max-q.limit+1);
     const last=q.oldest_first ? Math.min(max,min+q.limit-1) : max;
-    return {nodes:Array.from({length:Math.max(0,last-first+1)},(_,i)=>({node:last-i,turn:Math.ceil((last-i)/2)})),next_from:first>min?first-1:null,next_newer:last<max?last+1:null};
+    return {nodes:Array.from({length:Math.max(0,last-first+1)},(_,i)=>({node:last-i,turn:Math.ceil((last-i)/2)})),workspaces:[],next_from:first>min?first-1:null,next_newer:last<max?last+1:null};
   }};
 }
 
@@ -986,6 +1022,14 @@ test('rail scrolling moves a bounded window both ways independently of what is o
 });
 
 
+test('a reconnect snapshot drops the folders of the nodes it rebuilds', async () => {
+  const p=page({request:async()=>({nodes:[{node:2,turn:1},{node:1,turn:1}],workspaces:[{folder:'/a',turns:[1]}],next_from:null,next_newer:null})});
+  p.S.session=1;p.upsert({name:'Bob',id:1,head:2});await p.load('Bob');
+  const t=p.transcript('Bob');assert.equal(t.folders.get(1),'/a');
+  p.lost('offline');p.S.session=2;p.seat({name:'Bob',id:1,head:10},2);
+  assert.equal(t.folders.has(1),false);
+});
+
 test('a delayed reconnect snapshot preserves newer folded replay ranges', async () => {
   const p=page(historyDaemon());p.S.session=1;p.upsert({name:'Bob',id:1,head:2});await p.load('Bob');
   p.lost('offline');p.S.session=2;
@@ -1061,7 +1105,7 @@ test('snapshot reconciliation cannot splice over an in-flight history page', asy
   p.S.session=1;p.upsert({name:'Bob',id:1,head:2});p.S.selected='Bob';p.lost('offline');
   const attaching=p.attach();await settle();assert.equal(firstHistory,false);
   snapshot.resolve({bots:[{name:'Bob',id:1,head:10}],next_after:null});await settle();
-  history.resolve({nodes:[{node:2,turn:1},{node:1,turn:1}],next_from:null});await attaching;
+  history.resolve({nodes:[{node:2,turn:1},{node:1,turn:1}],workspaces:[],next_from:null});await attaching;
   const ids=p.transcript('Bob').items.filter(it=>it.from!=null).map(it=>it.from);
   assert.deepEqual(Array.from(ids).sort((a,b)=>a-b),Array.from({length:10},(_,i)=>i+1));
 });
@@ -1175,7 +1219,7 @@ test('the sidebar lists one level below what is open, and the crumbs go back up'
 });
 
 test('a card looks in beside, full screen takes the tab, and Home and the finder open tabs', async () => {
-  const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
+  const p = shell({ request: async () => ({ nodes: [], workspaces:[],next_from: null }) });
   for (const [name, id] of [['app.lead', 1], ['app.build', 2], ['app.test', 3]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
   p.tree(); await p.go('app.lead');
   assert.deepEqual([...p.S.ui.tabs], ['app.lead'], 'from Home it opens a tab');
@@ -1203,7 +1247,7 @@ test('a card looks in beside, full screen takes the tab, and Home and the finder
 });
 
 test('from Home the arrows open the first or last agent; Enter or Space on a tab chooses it', async () => {
-  const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
+  const p = shell({ request: async () => ({ nodes: [], workspaces:[],next_from: null }) });
   for (const [name, id] of [['app.lead', 1], ['app.build', 2], ['loose', 3]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id === 2 ? 'app.lead' : null, created_by_id: id === 2 ? 1 : null });
   const doc = p.context.document, key = (k, target = { id: 'input' }) => doc.listeners.keydown({ key: k, target, preventDefault() {} });
   await key('ArrowDown'); assert.equal(p.S.selected, 'app.lead', 'down from Home is the first row');
@@ -1310,10 +1354,54 @@ test('the model chip offers every provider of the bot\'s family and keeps unknow
 
 test('New project offers max to a hand-set Claude provider before Settings has been opened', async () => {
   const p = shell({ models: async () => [{ id: 'mine/claude' }], settings: async () => ({ providers: ['mine=anthropic,https://synthetic.invalid/v1'], keys: [] }) }, new Map([['agent:model', 'mine/claude']]));
-  p.showNewProject(true);
-  await settle();
+  await p.openProjectSheet();
   assert.equal(p.S.setup?.settings ?? null, null, 'Settings was never opened');
-  assert.match(p.elements.get('projmodel').innerHTML, /<option value="max">max effort<\/option>/);
+  assert.match(p.elements.get('sheet').innerHTML, /<option value="max">max effort<\/option>/);
+});
+
+test('the New project sheet asks only for a folder, the lead\'s and threads\' models, and where threads work', async () => {
+  const calls = [];
+  const p = shell({
+    models: async () => [{ id: 'anthropic/claude-x' }, { id: 'openai/gpt-6-luna' }],
+    settings: async () => ({ providers: ['anthropic', 'openai'], keys: [] }),
+    project: async (dir) => ({ dir, name: 'weather', coordinator: 'weather.lead', model: null, file: false }),
+    policy: async () => ({ instructions: 'rules', compaction_instructions: 'summary', note: 'test' }),
+    writeProject: async (q) => { calls.push(['write', { ...q, threads: { ...q.threads } }]); },
+    chooseFolder: async (start) => { calls.push(['choose', start]); return '/synthetic/weather'; },
+    request: async (op, q) => { calls.push([op, q]); return op === 'create' ? { name: q.bot, id: 7, provider: 'anthropic', model: 'claude-x', workspace: q.workspace } : { nodes: [], next_from: null }; },
+  });
+  const el = (id) => p.context.document.getElementById(id);
+  await p.act({ dataset: { act: 'new-project' } });
+  const html = el('sheet').innerHTML;
+  // The threads take the lead's model until one is picked; their effort waits for it.
+  assert.match(html, /<option value="" selected>Same as the lead<\/option>/);
+  assert.match(html, /<select disabled id="np-teffort"/);
+  assert.doesNotMatch(html, /clone|git init|setup command/i, 'basics only');
+  assert.match(el('np-in').innerHTML, /class="opt on" data-act="np-in" data-v="worktree"/);
+  // Choose… is the system's picker, from the folder typed or the window's own.
+  await p.act({ dataset: { act: 'np-choose' } });
+  assert.deepEqual(calls.shift(), ['choose', '/synthetic']);
+  assert.equal(el('np-dir').value, '/synthetic/weather');
+  // A folder is enough to try: one already a project needs no pick, and a new one without a model is
+  // refused when it is made.
+  assert.equal(el('np-create').disabled, false);
+  el('np-dir').value = ''; el('sheet').listeners.input({ target: el('np-dir') });
+  assert.equal(el('np-create').disabled, true, 'no folder');
+  el('np-dir').value = '/synthetic/weather';
+  el('np-model').value = 'anthropic/claude-x'; el('np-effort').value = 'high';
+  el('np-tmodel').value = 'openai/gpt-6-luna'; el('np-teffort').value = 'low';
+  el('sheet').listeners.input({ target: el('np-model') });
+  assert.equal(el('np-create').disabled, false);
+  await p.act({ dataset: { act: 'np-in', v: 'project' } });
+  assert.match(el('np-in').innerHTML, /class="opt on" data-act="np-in" data-v="project"/);
+  await el('sheet').listeners.submit({ preventDefault() {} });
+  const create = calls.find(([op]) => op === 'create')[1];
+  assert.deepEqual([create.bot, create.workspace, create.model, create.effort], ['weather.lead', '/synthetic/weather', 'anthropic/claude-x', 'high']);
+  // The coordinator is told the threads' picks after its role, whichever role that is.
+  assert.equal(create.instructions, 'rules\n\nThis project\'s tasks, as the person set them up: start every new task, in a role (--profile) or not, with --model \'openai/gpt-6-luna\' --effort \'low\'. Every task works in this folder, with no worktree of its own.');
+  assert.deepEqual(calls.find(([op]) => op === 'write')[1], { dir: '/synthetic/weather', name: 'weather', model: 'anthropic/claude-x', reasoning: 'high', threads: { model: 'openai/gpt-6-luna', reasoning: 'low', inProject: true } });
+  assert.equal(p.S.ui.sheet, false, 'the sheet closes once the project is made');
+  assert.equal(p.S.selected, 'weather.lead');
 });
 
 test('the model chip changes the effort of an agent\'s next turns and never of a steer', async () => {
@@ -1423,7 +1511,7 @@ test('one menu per agent: side chat any time, stop while running, fork and delet
 
 test('a side chat forks a running bot under it, beside, with its tools and folder, and takes the first message', async () => {
   const sent = [], storage = new Map(); let sideAtSubmit;
-  const p = shell({ request: async (op, q) => { sent.push([op, q]); if (op === 'submit') sideAtSubmit = p.S.ui.side; return op === 'fork' ? { name: q.bot, id: 10 + sent.length, provider: 'alpha', model: 'one', workspace: q.workspace, created_by: q.created_by, created_by_id: q.created_by_id, allowed: q.allow } : { nodes: [], next_from: null }; } }, storage);
+  const p = shell({ request: async (op, q) => { sent.push([op, q]); if (op === 'submit') sideAtSubmit = p.S.ui.side; return op === 'fork' ? { name: q.bot, id: 10 + sent.length, provider: 'alpha', model: 'one', workspace: q.workspace, created_by: q.created_by, created_by_id: q.created_by_id, allowed: q.allow } : { nodes: [], workspaces:[],next_from: null }; } }, storage);
   p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', workspace: '/synthetic', status: 'running', running_turn: 3, tools: ['shell', 'read', 'write', 'history'] });
   p.S.selected = 'app.lead';
   await p.sideChat('app.lead');
@@ -1463,7 +1551,7 @@ test('an open agent menu is rebuilt when its bot changes status and closed when 
 
 test('fork copies a bot at rest next to it and opens the copy beside', async () => {
   const sent = [];
-  const p = shell({ request: async (op, q) => { sent.push([op, q]); return op === 'fork' ? { name: q.bot, id: 10 + sent.length, provider: 'alpha', model: 'one', created_by: q.created_by, created_by_id: q.created_by_id } : { nodes: [], next_from: null }; } });
+  const p = shell({ request: async (op, q) => { sent.push([op, q]); return op === 'fork' ? { name: q.bot, id: 10 + sent.length, provider: 'alpha', model: 'one', created_by: q.created_by, created_by_id: q.created_by_id } : { nodes: [], workspaces:[],next_from: null }; } });
   p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one' });
   p.upsert({ name: 'app.task', id: 2, provider: 'alpha', model: 'one', created_by: 'app.lead', created_by_id: 1 });
   p.upsert({ name: 'app.busy', id: 3, provider: 'alpha', model: 'one', status: 'running', running_turn: 1 });
@@ -1489,7 +1577,7 @@ test('fork copies a bot at rest next to it and opens the copy beside', async () 
 
 test('a failed send comes back only to the bot it was for', async () => {
   let fail = null;
-  const p = shell({ request: async (op) => { if (op === 'submit') { await new Promise((r) => { fail = r; }); throw new Error('daemon_unavailable'); } return { nodes: [], next_from: null }; } });
+  const p = shell({ request: async (op) => { if (op === 'submit') { await new Promise((r) => { fail = r; }); throw new Error('daemon_unavailable'); } return { nodes: [], workspaces:[],next_from: null }; } });
   for (const [name, id] of [['app.lead', 1], ['app.build', 2], ['app.test', 3]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
   p.tree(); p.S.selected = 'app.lead';
   const doc = p.context.document, side = doc.getElementById('sideinput');
@@ -1504,7 +1592,7 @@ test('a failed send comes back only to the bot it was for', async () => {
 
 test('fork names fit the daemon\'s 128-byte limit and forks work in the source\'s folder', async () => {
   const sent = [];
-  const p = shell({ request: async (op, q) => { sent.push([op, q]); return op === 'fork' ? { name: q.bot, id: 10 + sent.length, provider: 'alpha', model: 'one' } : { nodes: [], next_from: null }; } });
+  const p = shell({ request: async (op, q) => { sent.push([op, q]); return op === 'fork' ? { name: q.bot, id: 10 + sent.length, provider: 'alpha', model: 'one' } : { nodes: [], workspaces:[],next_from: null }; } });
   const long = 'a'.repeat(128);
   p.upsert({ name: long, id: 1, provider: 'alpha', model: 'one', workspace: '/synthetic/elsewhere' });
   p.S.selected = long;
@@ -1520,14 +1608,15 @@ test('a new project creates its coordinator in the folder, in its role, writes i
     project: async (dir) => ({ dir, name: 'weather', coordinator: 'weather.lead', model: null, file: written }),
     policy: async (dir, profile) => { calls.push(['policy', dir, profile]); return { instructions: 'rules', compaction_instructions: 'summary', model: 'alpha/role', tools: ['shell', 'wait'], note: 'test' }; },
     writeProject: async (q) => { calls.push(['write', q]); written = true; },
-    request: async (op, q) => { calls.push([op, q]); return op === 'create' ? { name: q.bot, id: 7, provider: 'alpha', model: 'role', workspace: q.workspace } : { nodes: [], next_from: null }; },
+    request: async (op, q) => { calls.push([op, q]); return op === 'create' ? { name: q.bot, id: 7, provider: 'alpha', model: 'role', workspace: q.workspace } : { nodes: [], workspaces:[],next_from: null }; },
   });
   await p.createProject('/synthetic/weather');
   const create = calls.find(([op]) => op === 'create')[1];
-  // The coordinator profile composes the whole text; its model and tools apply when the project names none.
+  // The coordinator profile composes the text, then the project's task settings follow; its model and
+  // tools apply when the project names none.
   assert.deepEqual(calls.find(([op]) => op === 'policy').slice(1), ['/synthetic/weather', 'coordinator']);
-  assert.deepEqual([create.bot, create.workspace, create.model, create.instructions, Array.from(create.tools)], ['weather.lead', '/synthetic/weather', 'alpha/role', 'rules', ['shell', 'wait']]);
-  assert.deepEqual({ ...calls.find(([op]) => op === 'write')[1] }, { dir: '/synthetic/weather', name: 'weather', model: 'alpha/role', reasoning: null });
+  assert.deepEqual([create.bot, create.workspace, create.model, create.instructions.split('\n\n')[0], Array.from(create.tools)], ['weather.lead', '/synthetic/weather', 'alpha/role', 'rules', ['shell', 'wait']]);
+  assert.deepEqual({ ...calls.find(([op]) => op === 'write')[1] }, { dir: '/synthetic/weather', name: 'weather', model: 'alpha/role', reasoning: null, threads: null });
   assert.equal('effort' in create, false, 'no effort picked sends none: the model uses its own');
   assert.equal(p.S.selected, 'weather.lead');
   const before = calls.length;
@@ -1538,21 +1627,24 @@ test('a new project creates its coordinator in the folder, in its role, writes i
 test('an agent\'s effort is picked beside its model, kept in the project file, and shown with its model', async () => {
   const sent = []; const storage = new Map(); let file = null;
   const p = shell({
-    project: async (dir) => ({ dir, name: 'weather', coordinator: 'weather.lead', model: file?.model ?? null, reasoning: file?.reasoning ?? null, file: !!file }),
+    project: async (dir) => ({ dir, name: 'weather', coordinator: 'weather.lead', model: file?.model ?? null, reasoning: file?.reasoning ?? null, threads_model: file?.threads_model ?? null, threads_reasoning: null, threads_in: file?.threads_in ?? 'worktree', file: !!file }),
     policy: async () => ({ instructions: 'rules', compaction_instructions: 'summary', note: 'test' }),
     writeProject: async (q) => { sent.push(['write', { ...q }]); },
-    request: async (op, q) => { sent.push([op, { ...q }]); return op === 'create' ? { name: q.bot, id: sent.length, provider: q.model.split('/')[0], model: q.model.split('/')[1], effort: q.effort ?? null, workspace: q.workspace ?? '/synthetic' } : { nodes: [], next_from: null }; },
+    request: async (op, q) => { sent.push([op, { ...q }]); return op === 'create' ? { name: q.bot, id: sent.length, provider: q.model.split('/')[0], model: q.model.split('/')[1], effort: q.effort ?? null, workspace: q.workspace ?? '/synthetic' } : { nodes: [], workspaces:[],next_from: null }; },
   }, storage);
   await p.createProject('/synthetic/weather', 'anthropic/claude-x', 'max');
   const creates = () => sent.filter(([op]) => op === 'create').map(([, q]) => q);
   assert.equal(creates()[0].effort, 'max');
-  assert.deepEqual(sent.find(([op]) => op === 'write')[1], { dir: '/synthetic/weather', name: 'weather', model: 'anthropic/claude-x', reasoning: 'max' });
+  // With no threads' model, tasks are started on the lead's own, named so a role's model cannot replace it.
+  assert.match(creates()[0].instructions, /with --model "\$AGENT_MODEL" \$\{AGENT_EFFORT:\+--effort "\$AGENT_EFFORT"\}\. When this folder is a git repository, a task that changes files works in its own worktree/);
+  assert.deepEqual(sent.find(([op]) => op === 'write')[1], { dir: '/synthetic/weather', name: 'weather', model: 'anthropic/claude-x', reasoning: 'max', threads: null });
   assert.equal(p.S.bots.get('weather.lead').reasoning, 'max');
   assert.equal(storage.get('agent:effort'), 'max', 'the last pick is offered next time, as the model is');
   // A folder whose file names a model keeps that model's effort, whatever was picked.
-  p.S.bots.clear(); file = { model: 'alpha/one', reasoning: 'low' };
-  await p.createProject('/synthetic/weather', 'anthropic/claude-x', 'high');
+  p.S.bots.clear(); file = { model: 'alpha/one', reasoning: 'low', threads_model: 'beta/two', threads_in: 'project' };
+  await p.createProject('/synthetic/weather', 'anthropic/claude-x', 'high', { model: 'gamma/three', reasoning: null, inProject: false });
   assert.deepEqual([creates()[1].model, creates()[1].effort], ['alpha/one', 'low']);
+  assert.match(creates()[1].instructions, /with --model 'beta\/two'\. Every task works in this folder/, 'and its threads\' picks');
   // /new takes an effort after the model.
   await p.submit('/new Bob anthropic/claude-x max');
   await p.submit('/new Ann openai/gpt-6-luna xhigh');
@@ -1576,15 +1668,18 @@ test('the coordinator the app ships gives editing tasks worktrees and cleans up 
   assert.match(text, /the start fails and "\$AGENT_BIN" ls does not list NAME, remove the worktree/);
   assert.match(text, /git worktree remove --force, git branch -D/);
   assert.match(text, /when this folder is not a git repository, works in this folder/);
+  // The threads' picks are told to the coordinator by the app, not by this role, which a folder may replace.
+  assert.doesNotMatch(text, /threads_|project\.toml/);
+  assert.match(text, /Unless this project's tasks all work in this folder/);
 });
 
 test('a project name taken by another folder\'s coordinator is refused, and a refused model is never written', async () => {
-  const calls = []; let fail = true, failWrite = false;
+  const calls = []; let fail = true, failWrite = false, threads;
   const p = shell({
     project: async (dir) => ({ dir, name: dir.endsWith('taken') ? 'demo' : 'weather', coordinator: dir.endsWith('taken') ? 'demo.lead' : 'weather.lead', model: null, file: false }),
     policy: async () => ({ instructions: 'rules', compaction_instructions: 'summary', note: 'test' }),
-    writeProject: async (q) => { calls.push(['write', q.dir, q.model]); if (failWrite) throw new Error('project_unwritable'); },
-    request: async (op, q) => { calls.push([op, q.bot]); if (op === 'create' && fail) throw new Error('create_failed'); return op === 'create' ? { name: q.bot, id: 7, provider: 'alpha', model: 'one', workspace: q.workspace } : { nodes: [], next_from: null }; },
+    writeProject: async (q) => { calls.push(['write', q.dir, q.model]); threads = q.threads; if (failWrite) throw new Error('project_unwritable'); },
+    request: async (op, q) => { calls.push([op, q.bot]); if (op === 'create' && fail) throw new Error('create_failed'); return op === 'create' ? { name: q.bot, id: 7, provider: 'alpha', model: 'one', workspace: q.workspace } : { nodes: [], workspaces:[],next_from: null }; },
   });
   p.upsert({ name: 'demo.lead', id: 1, provider: 'alpha', model: 'one', workspace: '/synthetic/first' });
   p.S.selected = '';
@@ -1597,10 +1692,21 @@ test('a project name taken by another folder\'s coordinator is refused, and a re
   fail = false; failWrite = true;
   await assert.rejects(p.createProject('/synthetic/weather', 'alpha/one'), /project_unwritable/);
   assert.deepEqual(calls.map(([op]) => op), ['create', 'create', 'write'], 'the file follows an accepted coordinator');
-  failWrite = false; await p.createProject('/synthetic/weather', 'alpha/one');
-  assert.deepEqual(calls.at(-1), ['write', '/synthetic/weather', 'alpha/one'], 'a retry writes the missing file with the coordinator\'s model');
-  assert.equal(calls.filter(([op]) => op === 'create').length, 2);
+  // The coordinator made before the failed write keeps what it was told: a retry opens it, writes no
+  // file that would claim other picks, and says the picks were not applied.
+  failWrite = false; const n = calls.length; threads = 'unwritten';
+  await p.createProject('/synthetic/weather', 'alpha/one', null, { model: 'beta/two', reasoning: 'low', inProject: true });
+  assert.equal(calls.length, n, 'no create and no write'); assert.equal(threads, 'unwritten');
+  assert.match(p.S.ui.toast ?? '', /weather\.lead already exists and keeps the settings it was made with/);
   assert.equal(p.S.selected, 'weather.lead');
+  // An effort picked on its own is a pick too.
+  p.S.ui.toast = null;
+  await p.createProject('/synthetic/weather', null, 'high');
+  assert.match(p.S.ui.toast ?? '', /keeps the settings it was made with/);
+  // So is the sheet's worktree choice left at its default.
+  p.S.ui.toast = null;
+  await p.createProject('/synthetic/weather', null, null, { model: null, reasoning: null, inProject: false });
+  assert.match(p.S.ui.toast ?? '', /keeps the settings it was made with/);
 });
 
 test('runs fold thinking and tool calls to one line each, keep failures visible, and expand on demand', () => {
@@ -1659,7 +1765,7 @@ test('the demo daemon delivers a steer at the next round boundary and refuses a 
 
 test('Escape in the finder never stops a turn, and a deleted bot takes its draft with it', async () => {
   const sent = [];
-  const p = drafting({ request: async (op, q) => { sent.push(op); return { nodes: [], next_from: null }; } });
+  const p = drafting({ request: async (op, q) => { sent.push(op); return { nodes: [], workspaces:[],next_from: null }; } });
   p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', status: 'running', running_turn: 1 });
   p.upsert({ name: 'app.task', id: 2, provider: 'alpha', model: 'one', created_by: 'app.lead', created_by_id: 1 });
   p.tree(); p.S.selected = 'app.lead'; p.followDrafts();
@@ -1691,7 +1797,7 @@ test('the demo daemon ends a stopped turn quietly when its bot is deleted before
 });
 
 test('a folded run names a timeout or a failed call; the finder reaches any task; a side draft stays with its bot', async () => {
-  const p = drafting({ request: async () => ({ nodes: [], next_from: null }) });
+  const p = drafting({ request: async () => ({ nodes: [], workspaces:[],next_from: null }) });
   for (const [out, want] of [[{ stdout: '', exit_code: null, success: false, timed_out: true }, 'timed out'], [{ stdout: '', exit_code: null, success: false }, 'failed'], [{ stdout: 'ok', exit_code: 0, success: true }, null]])
     assert.equal(p.entries({ type: 'function_call_output', call_id: 'c', output: JSON.stringify(out) })[0].err, want);
   for (const [name, id] of [['app.lead', 1], ['app.build', 2], ['app.test', 3]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
@@ -1708,7 +1814,7 @@ test('a folded run names a timeout or a failed call; the finder reaches any task
 });
 
 test('full screen carries each draft with its bot; a long wait list stays short in the head', async () => {
-  const p = drafting({ request: async () => ({ nodes: [], next_from: null }) });
+  const p = drafting({ request: async () => ({ nodes: [], workspaces:[],next_from: null }) });
   for (const [name, id] of [['app.lead', 1], ['app.build', 2]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
   p.tree(); p.S.selected = 'app.lead'; p.followDrafts();
   const main = p.context.document.getElementById('input'), side = p.context.document.getElementById('sideinput');
@@ -1749,7 +1855,7 @@ test('the demo daemon answers as a side chat only for a fork nested under its so
 });
 
 test('a task card leaves the keyboard beside; a row looks in, and a double-click opens a tab', async () => {
-  const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
+  const p = shell({ request: async () => ({ nodes: [], workspaces:[],next_from: null }) });
   for (const [name, id] of [['app.lead', 1], ['app.build', 2]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
   p.tree(); p.S.selected = 'app.lead';
   const doc = p.context.document, focused = [];
@@ -1783,7 +1889,7 @@ test('a task card leaves the keyboard beside; a row looks in, and a double-click
 });
 
 test('a click in a file beside keeps the keyboard in the visible composer', async () => {
-  const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
+  const p = shell({ request: async () => ({ nodes: [], workspaces:[],next_from: null }) });
   p.upsert({ name: 'Bob', id: 1, provider: 'alpha', model: 'one' }); p.tree(); p.S.selected = 'Bob';
   const doc = p.context.document, focused = [];
   for (const id of ['input', 'sideinput']) doc.getElementById(id).focus = () => focused.push(id);
@@ -1799,7 +1905,7 @@ test('a failed first message waits in the side chat\'s composer', async () => {
     sent.push([op, q]);
     if (op === 'fork') return { name: q.bot, id: 20, provider: 'alpha', model: 'one', created_by: q.created_by, created_by_id: q.created_by_id, allowed: q.allow };
     if (op === 'submit') throw new Error('daemon_gone');
-    return { nodes: [], next_from: null };
+    return { nodes: [], workspaces:[],next_from: null };
   } });
   p.upsert({ name: 'lead', id: 1, provider: 'alpha', model: 'one', status: 'running', running_turn: 3 });
   p.upsert({ name: 'task', id: 2, provider: 'alpha', model: 'one', status: 'running', running_turn: 4, created_by: 'lead', created_by_id: 1 });
@@ -1814,7 +1920,7 @@ test('a failed first message waits in the side chat\'s composer', async () => {
 
 test('a bot in a linked worktree shows its branch in its head, read once per folder', async () => {
   const asked = [];
-  const p = shell({ request: async () => ({ nodes: [], next_from: null }), branch: async (dir) => { asked.push(dir); return dir.endsWith('/worktrees/app.build') ? 'agent/app.build' : null; } });
+  const p = shell({ request: async () => ({ nodes: [], workspaces:[],next_from: null }), branch: async (dir) => { asked.push(dir); return dir.endsWith('/worktrees/app.build') ? 'agent/app.build' : null; } });
   p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', workspace: '/synthetic' });
   p.upsert({ name: 'app.build', id: 2, provider: 'alpha', model: 'one', workspace: '/home/u/.agent/worktrees/app.build', created_by: 'app.lead', created_by_id: 1 });
   p.tree();
@@ -1885,7 +1991,7 @@ test('a new swarm is one call: its agents are dealt from the mix, and the page s
   const p = shell({
     swarmStart: async (q) => { calls.push(q); const members = Array.from({ length: q.agents }, (_, i) => `${q.project}.latency-2-${i + 1}`); return { swarm: swarmRecord(members, { swarm: `${q.project}.latency-2`, mix: q.mix }), bots: members.map((m, i) => ({ name: m, id: 10 + i, provider: 'alpha', model: 'one' })), failed: [{ agent: members[2], error: 'provider_unknown' }] }; },
     swarmBoard: async () => ({ lines: [], offset: 0, more: false }),
-    request: async () => ({ bots: [], next_after: null, nodes: [], next_from: null }),
+    request: async () => ({ bots: [], next_after: null, nodes: [], workspaces:[],next_from: null }),
   });
   p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', workspace: '/synthetic/app' });
   p.upsert({ name: 'app.latency-9', id: 2, provider: 'alpha', model: 'one' });
@@ -2003,7 +2109,7 @@ test('the board shows roles, proposals, votes and decisions, and a stream tag fi
 });
 
 test('a swarm row opens a beat later, so a double-click opens it as a new tab', async () => {
-  const p = shell({ swarmBoard: async () => ({ lines: [], offset: 0, more: false }), request: async () => ({ bots: [], next_after: null, nodes: [], next_from: null }) });
+  const p = shell({ swarmBoard: async () => ({ lines: [], offset: 0, more: false }), request: async () => ({ bots: [], next_after: null, nodes: [], workspaces:[],next_from: null }) });
   p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one' });
   p.upsert({ name: 'app.latency-1', id: 3, provider: 'alpha', model: 'one' });
   p.learnSwarm(swarmRecord(['app.latency-1'], { ids: { 'app.latency-1': 3 } }));
@@ -2026,7 +2132,7 @@ test('a swarm row opens a beat later, so a double-click opens it as a new tab', 
 });
 
 test('a tab is renamed when what it belongs to changes, with no change of state', async () => {
-  const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
+  const p = shell({ request: async () => ({ nodes: [], workspaces:[],next_from: null }) });
   p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one' });
   p.upsert({ name: 'app.build', id: 2, provider: 'alpha', model: 'one', created_by: 'app.lead', created_by_id: 1 });
   p.S.ui.tabs = ['app.build']; p.S.selected = 'app.build'; p.railRows(); p.renderTabs();
@@ -2038,7 +2144,7 @@ test('a tab is renamed when what it belongs to changes, with no change of state'
 });
 
 test('every control is one move: a pending look yields to Home or a tab, a double-click opens a tab, the finder reaches a swarm helper', async () => {
-  const p = shell({ swarmBoard: async () => ({ lines: [], offset: 0, more: false }), request: async () => ({ bots: [], next_after: null, nodes: [], next_from: null }) });
+  const p = shell({ swarmBoard: async () => ({ lines: [], offset: 0, more: false }), request: async () => ({ bots: [], next_after: null, nodes: [], workspaces:[],next_from: null }) });
   p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one' });
   p.upsert({ name: 'app.build', id: 2, provider: 'alpha', model: 'one', created_by: 'app.lead', created_by_id: 1 });
   p.upsert({ name: 'app.latency-1', id: 3, provider: 'alpha', model: 'one' });
@@ -2074,7 +2180,7 @@ test('every control is one move: a pending look yields to Home or a tab, a doubl
 });
 
 test('looking at an agent clears the done glyph on its tab', async () => {
-  const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
+  const p = shell({ request: async () => ({ nodes: [], workspaces:[],next_from: null }) });
   p.context.document.hasFocus = () => true;
   for (const [name, id] of [['lead', 1], ['task', 2]]) p.upsert({ name, id, provider: 'alpha', model: 'one' });
   p.S.ui.tabs = ['lead', 'task']; p.S.selected = 'lead'; p.S.unseen.add('task');
@@ -2161,7 +2267,7 @@ test('Stop and Add are one call each; an added agent comes from the row furthest
 
 test('a swarm a coordinator started from its shell shows once its first agent takes its brief', async () => {
   let reads = 0, listed = [];
-  const p = shell({ swarms: async () => { reads += 1; return { swarms: listed, broken: [] }; }, request: async () => ({ bots: [], next_after: null, nodes: [], next_from: null }) });
+  const p = shell({ swarms: async () => { reads += 1; return { swarms: listed, broken: [] }; }, request: async () => ({ bots: [], next_after: null, nodes: [], workspaces:[],next_from: null }) });
   p.S.live = true;
   p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one' });
   // A task named like an agent is looked for once, however many turns it takes.
@@ -2185,7 +2291,7 @@ test('a swarm a coordinator started from its shell shows once its first agent ta
   assert.deepEqual([...p.S.swarms.keys()], ['app.latency']);
   // A read that failed is tried again at the agent's next turn.
   let failing = true;
-  const q = shell({ swarms: async () => { reads += 1; if (failing) throw new Error('unavailable'); return { swarms: listed, broken: [] }; }, request: async () => ({ bots: [], next_after: null, nodes: [], next_from: null }) });
+  const q = shell({ swarms: async () => { reads += 1; if (failing) throw new Error('unavailable'); return { swarms: listed, broken: [] }; }, request: async () => ({ bots: [], next_after: null, nodes: [], workspaces:[],next_from: null }) });
   q.S.live = true;
   q.upsert({ name: 'app.latency-1', id: 3, provider: 'alpha', model: 'one' });
   await q.handle({ event: 'accepted', bot: 'app.latency-1', turn: 1, durable: true }, 1);
@@ -2198,7 +2304,7 @@ test('a swarm a coordinator started from its shell shows once its first agent ta
   assert.equal(p.S.memberOf.get('app.latency-2'), 'app.latency');
   // Two reads at once: an older answer arriving last never removes a swarm the newer one found.
   const answers = [];
-  const r = shell({ swarms: () => new Promise((resolve) => answers.push(resolve)), request: async () => ({ bots: [], next_after: null, nodes: [], next_from: null }) });
+  const r = shell({ swarms: () => new Promise((resolve) => answers.push(resolve)), request: async () => ({ bots: [], next_after: null, nodes: [], workspaces:[],next_from: null }) });
   r.S.live = true;
   for (const [name, id] of [['app.fix-1', 2], ['app.latency-1', 3]]) r.upsert({ name, id, provider: 'alpha', model: 'one' });
   await r.handle({ event: 'accepted', bot: 'app.fix-1', turn: 1, durable: true }, 1);
@@ -2213,7 +2319,7 @@ test('a swarm a coordinator started from its shell shows once its first agent ta
 
 test('a helper finishing a turn has its swarm check its budget, and only current seats are tallied', async () => {
   const checks = [];
-  const p = shell({ swarmCheck: async (swarm) => { checks.push(swarm); return {}; }, request: async () => ({ bots: [], next_after: null, nodes: [], next_from: null }) });
+  const p = shell({ swarmCheck: async (swarm) => { checks.push(swarm); return {}; }, request: async () => ({ bots: [], next_after: null, nodes: [], workspaces:[],next_from: null }) });
   for (const [name, id] of [['app.latency-1', 3], ['app.latency-2', 4]]) p.upsert({ name, id, provider: 'alpha', model: 'one' });
   // A helper of latency-1, and a helper of that helper.
   p.upsert({ name: 'app.latency-1.fix', id: 7, provider: 'alpha', model: 'one', created_by: 'app.latency-1', created_by_id: 3 });
@@ -2326,7 +2432,7 @@ test('the demo daemon\'s council opens a stream by the seats\' majority and leav
 test('a draft stays with the bot it was typed for, and Enter sends it there even mid-switch', async () => {
   const sent = [];
   let release; const slow = new Promise((r) => { release = r; });
-  const p = drafting({ request: async (op, q) => { if (op === 'history_nodes') await slow; if (op === 'submit') sent.push([q.bot, q.bot_id, q.prompt]); return { nodes: [], next_from: null }; } });
+  const p = drafting({ request: async (op, q) => { if (op === 'history_nodes') await slow; if (op === 'submit') sent.push([q.bot, q.bot_id, q.prompt]); return { nodes: [], workspaces:[],next_from: null }; } });
   for (const [name, id] of [['app.lead', 1], ['app.lead-side', 2]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
   p.S.transcripts.get('app.lead-side') ?? p.transcript('app.lead-side').nodes;
   p.tree(); await p.go('app.lead');
@@ -2363,7 +2469,7 @@ function settingsShell({ env = {}, lists = {} } = {}) {
     project: async (dir) => ({ dir, name: 'weather', coordinator: 'weather.lead', model: null, file: false }),
     policy: async () => ({ instructions: 'rules', compaction_instructions: 'summary', note: 'test' }),
     writeProject: async (q) => { calls.push(['write', q.model]); },
-    request: async (op, q) => { if (op === 'provider_models') return { providers: answer() }; if (op === 'bots') return { bots: [], next_after: null }; if (op === 'create') { calls.push(['create', q.bot, q.model]); return { name: q.bot, id: 9, provider: q.model.split('/')[0], model: q.model.split('/')[1], workspace: q.workspace }; } return { nodes: [], next_from: null }; },
+    request: async (op, q) => { if (op === 'provider_models') return { providers: answer() }; if (op === 'bots') return { bots: [], next_after: null }; if (op === 'create') { calls.push(['create', q.bot, q.model]); return { name: q.bot, id: 9, provider: q.model.split('/')[0], model: q.model.split('/')[1], workspace: q.workspace }; } return { nodes: [], workspaces:[],next_from: null }; },
   });
   p.S.config.model = null; p.S.attached = true;
   return { p, calls, env };
@@ -2759,7 +2865,7 @@ test('a message another agent sent names its sender, live, steered in, and read 
   const sent = { 1: lead(4), 2: lead(5), 4: lead(6) };
   const batch = async ({ nodes }) => ({ items: nodes.map((node) => ({ node, item: items[node], ...sent[node] })) });
   const history = async (op) => {
-    if (op === 'history_nodes') return { nodes: [{ node: 4, turn: 10 }, { node: 3, turn: 9 }, { node: 2, turn: 7 }, { node: 1, turn: 7 }], next_from: null, next_newer: null };
+    if (op === 'history_nodes') return { nodes: [{ node: 4, turn: 10 }, { node: 3, turn: 9 }, { node: 2, turn: 7 }, { node: 1, turn: 7 }], workspaces:[],next_from: null, next_newer: null };
     throw new Error(op);
   };
   const p = page({ request: history, batch });
@@ -2803,25 +2909,25 @@ test('a message another agent sent names its sender, live, steered in, and read 
   assert.equal((reused.match(/<span class="by" title="Sent by demo.lead, turn \d, since deleted">coordinator<\/span>/g) || []).length, 3, reused);
 });
 
-test('the app\'s own task updates and scheduled messages are tagged by the origin it sent them with', async () => {
+test('the app\'s own task updates and triggered messages are tagged by the origin it sent them with', async () => {
   const items = { 1: { role: 'user', content: [{ type: 'input_text', text: 'Task updates: build ended' }] }, 2: { role: 'user', content: [{ type: 'input_text', text: 'check the nightly run' }] },
     3: { role: 'user', content: [{ type: 'input_text', text: 'thanks' }] } };
-  const origins = { 1: { origin: 'tasks' }, 2: { origin: 'schedule' } };
+  const origins = { 1: { origin: 'tasks' }, 2: { origin: 'trigger' } };
   const p = page({ request: async (op) => {
-    if (op === 'history_nodes') return { nodes: [{ node: 3, turn: 3 }, { node: 2, turn: 2 }, { node: 1, turn: 1 }], next_from: null, next_newer: null };
+    if (op === 'history_nodes') return { nodes: [{ node: 3, turn: 3 }, { node: 2, turn: 2 }, { node: 1, turn: 1 }], workspaces:[],next_from: null, next_newer: null };
     throw new Error(op);
   }, batch: async ({ nodes }) => ({ items: nodes.map((node) => ({ node, item: items[node], ...origins[node] })) }) });
   const t = p.transcript('demo.lead'); t.items = [{ kind: 'history', next: 3, seed: true }]; t.history = t.items[0]; t.seed = t.items[0];
   await p.load('demo.lead');
   let html = p.itemsHTML(t);
   assert.match(html, /<span class="by">tasks<\/span> Task updates: build ended/);
-  assert.match(html, /<span class="by">schedule<\/span> check the nightly run/);
+  assert.match(html, /<span class="by">trigger<\/span> check the nightly run/);
   assert.match(html, /<div class="line user">› thanks<\/div>/);
   // Live, the origin comes with the turn's start.
   const q = page({ request: async (op, r) => items[r.node] });
-  await q.onEvent({ event: 'accepted', bot: 'demo.lead', turn: 2, data: { node: 2, origin: 'schedule' } });
+  await q.onEvent({ event: 'accepted', bot: 'demo.lead', turn: 2, data: { node: 2, origin: 'trigger' } });
   await q.loadBatch('demo.lead');
-  assert.match(q.itemsHTML(q.transcript('demo.lead')), /<span class="by">schedule<\/span> check the nightly run/);
+  assert.match(q.itemsHTML(q.transcript('demo.lead')), /<span class="by">trigger<\/span> check the nightly run/);
 });
 
 test('a coordinator hears once, when it rests, of turns its tasks ended that it did not ask for', async () => {
@@ -2972,7 +3078,7 @@ test('a window that saw news to act on never defers to one that saw only yours',
   assert.ok([...told.values()].some((prompt) => /\n- demo\.build: turn:demo\.build\/2 completed, asked by you\n/.test(prompt)));
 });
 
-test('an approval answered before the coordinator hears of it is not raised, and a schedule\'s turn is the coordinator\'s', async () => {
+test('an approval answered before the coordinator hears of it is not raised, and a trigger\'s turn is the coordinator\'s', async () => {
   const sent = [];
   const p = page({ request: async (op, params) => { if (op === 'submit') sent.push(params); return {}; }, log() {} });
   p.S.live = true; p.S.attached = true;
@@ -2982,15 +3088,15 @@ test('an approval answered before the coordinator hears of it is not raised, and
   await p.onEvent({ event: 'accepted', bot: 'demo.build', turn: 1, data: { node: 1 } });
   await p.onEvent({ event: 'turn_waiting', bot: 'demo.build', turn: 1, data: { call_id: 'c1', approval: true } });
   await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 1, data: { status: 'completed' } });
-  // A schedule asks a task for a check.
-  await p.onEvent({ event: 'accepted', bot: 'demo.nightly', turn: 4, data: { node: 2, origin: 'schedule' } });
+  // A trigger asks a task for a check.
+  await p.onEvent({ event: 'accepted', bot: 'demo.nightly', turn: 4, data: { node: 2, origin: 'trigger' } });
   await p.onEvent({ event: 'turn_finished', bot: 'demo.nightly', turn: 4, data: { status: 'completed' } });
   await p.onEvent({ event: 'turn_finished', bot: 'demo.lead', turn: 2, data: { status: 'completed' } });
   await p.tick();
   assert.equal(sent.length, 1);
   assert.doesNotMatch(sent[0].prompt, /waiting for approval/);
   assert.doesNotMatch(sent[0].prompt, /theirs/);
-  assert.match(sent[0].prompt, /\n- demo\.build: turn:demo\.build\/1 completed, asked by the person, and 1 earlier since turn:demo\.build\/1\n- demo\.nightly: turn:demo\.nightly\/4 completed, asked by schedule$/);
+  assert.match(sent[0].prompt, /\n- demo\.build: turn:demo\.build\/1 completed, asked by the person, and 1 earlier since turn:demo\.build\/1\n- demo\.nightly: turn:demo\.nightly\/4 completed, asked by trigger$/);
   assert.equal(p.S.turnOrigin.size, 0, 'origins are forgotten as turns end');
 });
 
@@ -3026,19 +3132,85 @@ test('approval calls and completion in one turn each reach the coordinator once 
   assert.match([...delivered.values()].at(-1), /completed, asked by the person$/);
 });
 
-test('Settings lists schedules with no project, and only then when there are some', async () => {
+test('Settings lists triggers with no project, and only then when there are some', async () => {
   const p = page({});
   const st = p.setupState();
   p.S.bots.clear();
-  assert.doesNotMatch(p.setupHTML(), /Schedules/);
-  st.schedules = [{ name: 'loose', bot: 'loose', bot_id: 3, when: 'in 2h', once: true, ended: true, message: 'x', last: { outcome: 'failed', fired_ms: 0, detail: 'daemon_unavailable' } }];
-  assert.match(p.setupHTML(), /<h3>Schedules<\/h3>.*not delivered/s);
+  assert.doesNotMatch(p.setupHTML(), /Triggers/);
+  st.triggers = [{ name: 'loose', bot: 'loose', bot_id: 3, when: 'in 2h', once: true, ended: true, message: 'x', last: { outcome: 'failed', fired_ms: 0, detail: 'daemon_unavailable' } }];
+  assert.match(p.setupHTML(), /<h3>Triggers<\/h3>.*not delivered/s);
+  assert.doesNotMatch(p.setupHTML(), /trigger-fire/, 'an ended trigger has nothing to run');
   // A one-off past its time and a plist that cannot be read are listed too, each removable.
-  st.schedules.push({ name: 'late', bot: 'late', bot_id: 4, when: 'at 2026-09-01 09:00', once: true, ended: false, missed: true, message: 'y', last: null },
-    { name: 'odd', ended: false, problem: 'unreadable: not a schedule\'s plist' });
+  st.triggers.push({ name: 'late', bot: 'late', bot_id: 4, when: 'at 2026-09-01 09:00', once: true, ended: false, missed: true, message: 'y', last: null },
+    { name: 'odd', ended: false, problem: 'unreadable: not a trigger\'s plist' },
+    { name: 'review', bot: 'demo.review', bot_id: null, start: { model: 'a/m', effort: null }, reply_to: 'demo.lead', if: 'git diff --quiet', runs: 3, sent: 1, when: 'commit /r', once: false, ended: false, message: 'z', last: null });
   const html = p.setupHTML();
   assert.match(html, /missed its time/);
   assert.match(html, /unreadable<\/span>.*data-v="odd"/s);
+  assert.match(html, /commit \/r<\/span>.*data-act="trigger-fire" data-v="review".*review · starts it on a\/m · answer to demo.lead · if git diff --quiet · 1 of 3 runs/s);
+});
+
+test('a task turn whose answer a trigger passes to its coordinator is not news for it again', async () => {
+  const p = page({ request: async () => ({}), log() {} });
+  p.S.live = true; p.S.attached = true;
+  p.upsert({ name: 'demo.lead', id: 1, status: 'idle' });
+  p.upsert({ name: 'demo.review', id: 2, status: 'idle', created_by: 'demo.lead', created_by_id: 1 });
+  await p.onEvent({ event: 'accepted', bot: 'demo.review', turn: 7, data: { request_id: 'trigger-2-1790000000-41-to-1', origin: 'trigger' } });
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.review', turn: 7, data: { status: 'completed' } });
+  await p.onEvent({ event: 'accepted', bot: 'demo.lead', turn: 3, data: { from: { bot: 'demo.review', turn: 7, id: 2 } } });
+  await p.tick();
+  assert.equal(p.S.wakes.get('demo.lead')?.tasks.size ?? 0, 0, 'its answer reaches the coordinator already');
+  // An answer the trigger failed to pass on leaves the turn news after all.
+  await p.onEvent({ event: 'accepted', bot: 'demo.review', turn: 9, data: { request_id: 'trigger-2-1790000000-43-to-1', origin: 'trigger' } });
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.review', turn: 9, data: { status: 'completed' } });
+  assert.equal(p.S.wakes.get('demo.lead')?.tasks.size ?? 0, 0, 'not before the answer had its time');
+  await p.tick();
+  assert.deepEqual({ ...p.S.wakes.get('demo.lead').tasks.get('demo.review').act }, { first: 9, turn: 9, status: 'completed', by: 'trigger', count: 1 });
+  p.S.wakes.get('demo.lead').tasks.clear();
+  // Held while a snapshot loads, the turn keeps where its answer goes.
+  p.S.snapshot = true;
+  await p.onEvent({ event: 'accepted', bot: 'demo.review', turn: 10, data: { request_id: 'trigger-2-1790000000-44-to-1', origin: 'trigger' } });
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.review', turn: 10, data: { status: 'completed' } });
+  assert.equal(p.S.heldNews.at(-1)[6], 1);
+  // Its answer, replayed before the held news goes out, keeps it from being news.
+  await p.onEvent({ event: 'accepted', bot: 'demo.lead', turn: 4, data: { from: { bot: 'demo.review', turn: 10, id: 2 } } });
+  p.S.snapshot = false;
+  for (const news of p.S.heldNews.splice(0)) p.turnNews(...news);
+  await p.tick();
+  assert.equal(p.S.wakes.get('demo.lead')?.tasks.size ?? 0, 0, 'the answer it was held with reached the coordinator');
+  // One whose answer goes elsewhere, or a plain trigger's, still is.
+  await p.onEvent({ event: 'accepted', bot: 'demo.review', turn: 8, data: { request_id: 'trigger-2-1790000000-42-to-9', origin: 'trigger' } });
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.review', turn: 8, data: { status: 'completed' } });
+  assert.equal(p.S.wakes.get('demo.lead').tasks.get('demo.review').act.turn, 8);
+});
+
+test('Settings says when a trigger\'s check said no, or its answer did not get through', () => {
+  const p = page({});
+  const st = p.setupState();
+  st.triggers = [{ name: 'a', bot: 'a', bot_id: 1, when: 'in 2h', once: true, ended: true, message: 'x', last: { outcome: 'declined', fired_ms: 0, detail: '--if: exit status: 1' } },
+    { name: 'b', bot: 'b', bot_id: 2, when: 'in 2h', once: true, ended: true, message: 'y', reply_to: 'p.lead', last: { outcome: 'sent', fired_ms: 0, reply: { outcome: 'failed', detail: 'bot_not_found' } } }];
+  const html = p.setupHTML();
+  assert.match(html, /not delivered.*not sent, its check said no \(--if: exit status: 1\)/s);
+  assert.match(html, /answer not passed on.*ended .*: sent, its answer did not get through \(bot_not_found\)/s);
+});
+
+test('Run now looks again until the fire it started has written its result', async () => {
+  let fired = null, reads = 0;
+  const p = page({ fireTrigger: async () => ({ fired: true }), triggers: async () => { reads++;
+    return { triggers: [{ name: 'r', bot: 'r', bot_id: 1, when: 'every 30m', message: 'x', last: fired && { outcome: 'sent', fired_ms: fired } }] }; } });
+  p.setupState().open = true;
+  await p.readTriggers();
+  const run = p.triggerAct('fire', 'r');
+  await settle();
+  assert.equal(reads, 2, 'read once as launchd starts it');
+  await p.tick();
+  assert.equal(reads, 3, 'and again while it has not written');
+  fired = 5;
+  await p.tick();
+  assert.equal(reads, 4);
+  await p.tick();
+  await run;
+  assert.equal(reads, 4, 'its result ends the looking');
 });
 
 test('a coordinator\'s backlog stays small however much its tasks do, and what one message leaves out comes next', async () => {
@@ -3095,7 +3267,7 @@ test('a tab deleted while detached goes up to what made it on reconnect, as a li
   const p = page({
     attach: async () => ({ session: 2, store: 'store-1' }),
     pull: () => new Promise(() => {}),
-    request: async (op) => (op === 'bots' ? { bots: [{ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', status: 'idle' }] } : { nodes: [], next_from: null }),
+    request: async (op) => (op === 'bots' ? { bots: [{ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', status: 'idle' }] } : { nodes: [], workspaces:[],next_from: null }),
   }, storage);
   p.setRender(() => {}); p.S.store = 'store-1'; p.S.config = { workspace: '/synthetic', tools: [] };
   p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one' });
@@ -3114,7 +3286,7 @@ test('a window on a host takes the home the host names and leaves out what reads
     attach: async () => ({ session: 1, store: 'store-box', workspace: '/home/someone' }),
     pull: () => new Promise(() => {}),
     request: async (op) => (op === 'bots' ? { bots: [{ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', workspace: '/home/someone/app', status: 'idle' }] } : {}),
-    schedules: async () => { calls.push('schedules'); return []; },
+    triggers: async () => { calls.push('triggers'); return []; },
     swarms: async () => { calls.push('swarms'); return { swarms: [], broken: [] }; },
     branch: async () => { calls.push('branch'); return null; },
     settings: async () => ({ providers: [], keys: [], restartable: false, host: 'box' }),
@@ -3134,8 +3306,8 @@ test('a window on a host takes the home the host names and leaves out what reads
   assert.match(html, /runs on box, with the providers its login shell there exports/);
   assert.match(html, /remote_unsupported: The model list/);
   assert.doesNotMatch(html, /Roles/);
-  assert.doesNotMatch(html, /<h3>Schedules<\/h3>/);
-  assert.ok(!calls.includes('schedules'), 'remote Settings never reads local schedules');
+  assert.doesNotMatch(html, /<h3>Triggers<\/h3>/);
+  assert.ok(!calls.includes('triggers'), 'remote Settings never reads local triggers');
   assert.doesNotMatch(html, /Add a provider/);
   p.lost('agent_missing: box has no agent on its login shell\'s PATH');
   assert.match(p.elements.get('detached').innerHTML, /daemon on <span class="k">box<\/span>/);
@@ -3201,22 +3373,22 @@ test('a home the last host named is replaced by the one the new store names', as
   assert.equal(p.S.config.workspace, '/home/b');
 });
 
-test('schedule pages replace the previous messages and remote windows do not fetch them', async () => {
+test('trigger pages replace the previous messages and remote windows do not fetch them', async () => {
   const calls = [];
-  const p = page({ schedules: async (after) => {
+  const p = page({ triggers: async (after) => {
     calls.push(after);
-    return { schedules: [{ name: after ? 'second' : 'first' }], next_after: after ? null : 'first' };
+    return { triggers: [{ name: after ? 'second' : 'first' }], next_after: after ? null : 'first' };
   } });
-  await p.readSchedules();
-  assert.equal(p.setupState().schedules[0].name, 'first');
-  await p.readSchedules(p.setupState().schedulesNext);
-  assert.equal(p.setupState().schedules.length, 1);
-  assert.equal(p.setupState().schedules[0].name, 'second');
-  assert.equal(p.setupState().schedulesNext, null);
+  await p.readTriggers();
+  assert.equal(p.setupState().triggers[0].name, 'first');
+  await p.readTriggers(p.setupState().triggersNext);
+  assert.equal(p.setupState().triggers.length, 1);
+  assert.equal(p.setupState().triggers[0].name, 'second');
+  assert.equal(p.setupState().triggersNext, null);
   p.S.config = { host: 'remote' };
-  await p.readSchedules();
+  await p.readTriggers();
   assert.deepEqual(calls, [null, 'first']);
-  assert.equal(p.setupState().schedules, null);
+  assert.equal(p.setupState().triggers, null);
 });
 
 test('usage checks member and descendant budgets before any turn ends, once enough tokens could move a share', async () => {

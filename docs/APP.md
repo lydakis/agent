@@ -90,7 +90,7 @@ when a bot's turn sent it (`from`, which the CLI fills from `AGENT_BOT` and
 `AGENT_TURN`), and `history_items` returns it with each prompt, so a chat
 read back after a restart keeps the names. Messages the app sends on its own
 name their `origin` and are tagged with it: `tasks` for a coordinator's task
-updates and `schedule` for a scheduled message. The daemon keeps the sender
+updates and `trigger` for a triggered message. The daemon keeps the sender
 with the message, so a fork keeps it after its source is deleted; the name
 links to the agent only while that name still holds the identity (`from.id`)
 that sent it.
@@ -101,7 +101,7 @@ A side chat asked while the lead works: a fork beside it, the lead untouched.
 
 ![A side chat beside the running lead](app/side-chat.png)
 
-A turn you or the app asked for (a scheduled message, a coordinator's task
+A turn you or the app asked for (a triggered message, a coordinator's task
 update) that finishes while its agent is off screen shows ✔ instead of ○
 until you open that agent; a swarm's row shows it for its agents until you
 open the swarm. Settings, help, the finder and the swarm sheet count as off
@@ -131,14 +131,26 @@ place.
 
 ![PLAN.md open beside the reply that links it](app/file-beside.png)
 
-New project takes a folder, the model its lead starts on, and that model's
-effort. Effort is how hard the model thinks: every provider offers low,
+New project is a sheet with the fundamentals only: a folder, typed or
+chosen with the system's picker (which can make a new one), the lead's model
+and effort, the threads' model and effort ("Same as the lead" by default),
+and where threads work: each in its own worktree, or all in the project
+folder. Effort is how hard the model thinks: every provider offers low,
 medium, high and xhigh, Claude also max, and "default effort" sends no level,
 so the model uses its own default. It is picked with the model, the model chip
 changes it later, and it is kept in `.agents/project.toml` as `reasoning`
-beside `model`; `/new NAME PROVIDER/MODEL [EFFORT]` takes one too. A task the
-coordinator starts on its own model takes its effort as well
-(`AGENT_EFFORT`, see [CLI.md](CLI.md)).
+beside `model`; `/new NAME PROVIDER/MODEL [EFFORT]` takes one too. The
+threads' picks are kept there as `threads_model`, `threads_reasoning` and
+`threads_in` (`worktree` or `project`). The app tells them to the coordinator
+when it creates it, as one paragraph after the composed instructions, so a
+folder's or your own `coordinator.md` cannot drop them: start every task, in
+a role (`--profile`) or not, with `--model` and `--effort` named, and say
+whether tasks work in this folder or in their own worktrees. Without a
+threads' model the flags are the lead's own, `--model "$AGENT_MODEL"
+${AGENT_EFFORT:+--effort "$AGENT_EFFORT"}` (see [CLI.md](CLI.md)),
+so a role that names a model of its own does not replace the lead's. A
+coordinator keeps the instructions it was made with: a file written or edited
+later reaches the next coordinator made for the folder.
 
 ![New project](app/new-project.png)
 
@@ -236,10 +248,11 @@ needs.
 
 ![A coordinator reads a task update and passes build's change on to test](app/coordinator-wake.png)
 
-Agents can be woken at set times. Settings lists the schedules, what each one
-last did, and the message it sends.
+Agents can be woken at set times, when a file is written or a repository
+gets a commit, or by name. Settings lists the triggers, what each one last
+did, and the message it sends, with Run now and Remove.
 
-![Schedules in Settings](app/settings-schedules.png)
+![Triggers in Settings](app/settings-triggers.png)
 
 ## What the daemon speaks, and why the client speaks it directly
 
@@ -294,8 +307,8 @@ client/          agent-client: the socket protocol and the client policy
   ([remote.rs](../app/src-tauri/src/remote.rs));
   `policy` composes a folder's client policy, in a profile when named, and
   falls back to the profiles the app ships for `coordinator`;
-  `schedules` and `schedule_remove` list and remove
-  [schedules](#schedules) ([schedule.rs](../app/src-tauri/src/schedule.rs)).
+  `triggers`, `trigger_fire` and `trigger_remove` list, run and remove
+  [triggers](#triggers) ([trigger.rs](../app/src-tauri/src/trigger.rs)).
   When nothing listens on a store's socket, `attach` starts a daemon first
   ([daemon.rs](../app/src-tauri/src/daemon.rs)); see
   [Installing](#installing).
@@ -662,20 +675,27 @@ The shell follows the "Agent App Concepts" prototype (NEXT item 47). The
 daemon learns nothing about projects; everything here is client work.
 
 - **Projects.** A project is a folder, its coordinator bot `<project>.lead`,
-  and `.agents/project.toml` (name, coordinator, model; mechanics only). The
+  and `.agents/project.toml` (name, coordinator, model and effort, the
+  threads' model and effort and where they work; mechanics only). The
   sidebar lists every coordinator in the store as a project, with its tasks
   under it: the coordinator's `created_by` lineage, plus any root bot named
   `<project>.<task>`. Bots in no project follow. **＋ New project**, under
-  Home's list, takes a
-  folder and a model from `~/.agent/models` under its provider's name (the
-  last one picked comes first), reads its `project.toml` (unknown keys are refused) or names the
+  Home's list, opens the sheet: a folder, which **Choose…** picks with the
+  system's folder panel (`NSOpenPanel` through `rfd`, with New Folder), and
+  models from `~/.agent/models` under their providers' names (the last one
+  picked comes first). Creating reads its `project.toml` (unknown keys are refused) or names the
   project after the folder, creates the coordinator there with the folder's
   own client policy, and then writes the file if there was none, so a model
   the daemon refuses is never saved. The file goes in through a temporary
   and a link, so it is never partial and never replaces one. An existing
-  coordinator is opened if it works in that folder (and the file it lacks is
-  written with its model); one in another folder is a name collision,
-  reported and not opened.
+  coordinator is opened if it works in that folder and keeps the settings it
+  was made with, which cannot be read back, so no file is written for it;
+  one in another folder is a name collision, reported and not opened. A
+  folder that is already a project keeps its settings, and the window says
+  when the sheet's picks were not applied. Create needs only a folder: a new
+  project with no model picked, from the sheet or its coordinator profile,
+  is refused with `model_required`. The threads' model and effort reach the
+  coordinator shell-quoted.
 - **Navigation.** Home, then a tab for each agent opened full screen, on a
   bar of floating tabs. The list on the right holds one level below what is
   open: at Home the projects and the bots in none, in a project its threads
@@ -1086,122 +1106,218 @@ the second with the first, or with `idempotency_conflict` when that window
 counted from an earlier turn, which it takes as told. A task deleted before
 its news goes out is dropped from it.
 
-## Schedules
+## Triggers
 
-Listings return 64 schedules per page, with `next_after` for `schedule ls
---after NAME` or the next page in Settings. Only the current page's messages
-are retained. `--every` waits at least one full interval before the first
-submission; calendar ticks before that earliest time do nothing. An implicit
-bot from an agent shell must still match `AGENT_BOT_ID`.
+A trigger wakes an agent with a message when something happens: a time
+comes, a file is written, a repository's HEAD moves, or someone fires it by
+name. The message is a new turn in the agent's own conversation; a trigger
+may also start the agent it names on its first fire. launchd watches, so a
+trigger fires with the app closed, and a time the Mac slept through fires
+once when it wakes (`StartCalendarInterval` coalesces missed times;
+`StartInterval` and cron skip them). The daemon has no clock or watcher of
+its own, and no process of a trigger runs between its fires: while nothing
+happens a trigger costs its plist and launchd's watch, and no model call.
 
-Schedules are local to this machine. Remote windows neither list nor remove
-local schedules. Scheduled submissions carry `origin: "schedule"`; coordinator
-updates carry `origin: "tasks"`. Both are automated input, not human consent
-for the approver.
-
-A schedule wakes an agent at set times with a message: a new turn in its
-own conversation, never a new agent. launchd keeps the time, so a schedule
-fires with the app closed, and a time the Mac slept through fires once when
-it wakes (`StartCalendarInterval` coalesces missed times; `StartInterval`
-and cron skip them). The daemon has no clock for this.
-
-The app writes `~/.agent/schedule` each time it opens, a script that runs its
-executable with `--schedule`:
+The app writes `~/.agent/trigger` each time it opens, a script that runs its
+executable with `--trigger`:
 
 ```sh
-~/.agent/schedule add [--bot NAME] [--name NAME] (--every 30m | --in 45m | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY') -- MESSAGE
-~/.agent/schedule ls
-~/.agent/schedule rm NAME
+~/.agent/trigger add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] -- MESSAGE
+  WHEN: --every 30m | --in 45m | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO
+~/.agent/trigger ls [--after NAME]
+~/.agent/trigger fire NAME
+~/.agent/trigger rm NAME
 ```
 
-`add` defaults to the agent whose shell runs it (`AGENT_BOT`), reaches that
-shell's daemon (starting it, as a fire does, when none answers), and pins
-the schedule to the bot's id and its daemon's store identity, with the
-store and socket paths made absolute. `--every` counts from the next whole
-minute in minutes that divide an hour, hours that divide a day, or `1d`;
-`--in` and `--at` are one-offs within a year, which remove themselves once
-fired (`--in` rounds up to the next whole minute, since launchd keeps
-minutes; `--at` refuses a part out of range or extra parts); `--cron` is read as cron reads it, a day or a weekday when both are
-given, up to 1,024 calendar entries. A message is at most 16 KiB. The serialized
-plist must also fit the 128 KiB record-read limit, including XML escaping; an
-oversized definition fails with `invalid_schedule` before changing a job or its
-saved plist. Narrow the cron expression or shorten the message. A schedule
-is named after its bot unless `--name` says otherwise, and one added under a
-name in use replaces it. A name differing from another only in case is
-refused (`name_taken`), since macOS folders would give both one file, and
-`rm` finds a schedule only by the name as stored.
+Every reply is one JSON value on stdout; a failure is one
+`{"error": CODE, "detail": ...}` on stderr with exit 1.
 
-Each is one LaunchAgent, `~/Library/LaunchAgents/me.lydakis.agent.schedule.NAME.plist`,
-and that file is its only record: its program arguments carry the bot, its
-id, the store and the socket of the shell it was made from (an agent's shell
-has both), the store identity its daemon announced, the one-off's time and
-the message. A fire whose daemon announces another store (a reused socket)
-sends nothing and records `store_mismatch`. When it fires, the app's
-executable runs with `--schedule-fire` and those arguments. It connects to
+**When.** `--every` counts from the next whole minute in minutes that
+divide an hour, hours that divide a day, or `1d`, and waits at least one
+full interval before its first message; calendar ticks before that earliest
+time do nothing. `--in` and `--at` are one-offs within a year, which remove
+themselves once fired (`--in` rounds up to the next whole minute, since
+launchd keeps minutes; `--at` refuses a part out of range or extra parts);
+`--cron` is read as cron reads it, a day or a weekday when both are given,
+up to 1,024 calendar entries. `--file PATH` fires when the file is written,
+or a file is added to or removed from it when it is a folder (launchd's
+`WatchPaths`); it need not exist yet, and it may not be in
+`~/.agent/triggers` or be its daemon's store (or its `-wal` and `-shm`, by
+any name, a hard link included), which every fire writes: `add` refuses one, and a fire that finds its path
+became one (a link moved) ends the trigger, sending nothing and keeping a
+`failed` row that says why. A shell that
+names its daemon's socket and not its store cannot add one, since its store
+is not known to check. `--commit REPO` sends when a commit was made: launchd wakes it on any write
+to the repository's own HEAD log, which git writes on every move of HEAD,
+and the fire asks git one question, `git rev-list -n1 --since=LOOKED NEW
+--not OLD`: whether HEAD now reaches a commit the HEAD it last saw did not,
+committed since it last looked. A commit, an amend, a merge, a cherry-pick,
+a rebase that rewrote commits, or a pull of work committed since sends; a
+checkout, a reset, or a fast-forward to commits that were already there
+sends nothing, and the fire keeps where HEAD went. A HEAD the repository no
+longer has (it was made again) counts as unknown. `add` records where HEAD
+is, a repository with no commit yet included, before launchd watches, and
+when a commit came in between asks for a fire that looks as launchd would
+(a `wake.` ask), so the commit is sent once. A repository where git keeps
+no HEAD log (`core.logAllRefUpdates` false, or a bare one by default) is
+refused, and adding the same trigger again watches the git folder the
+repository has now, recording where its HEAD is in place of the old one's.
+git is the one on the `PATH` `add` ran with, which the plist keeps. With no WHEN, only `fire` runs it; `fire` while a fire still runs is
+sent by that fire once it is done.
+
+**Whom.** `add` defaults to the agent whose shell runs it (`AGENT_BOT`,
+which must still match `AGENT_BOT_ID`); `--bot` names another. Either is
+pinned by its id: a bot deleted since, or a new bot under its name, is not
+reached (`bot_not_found`), and the trigger ends. `--start NAME --model
+PROVIDER/MODEL [--effort LEVEL]` names an agent that does not exist yet:
+the first fire makes it as the app makes an agent (the daemon's `create`,
+in the folder `add` ran in, with that folder's composed policy and the
+default tools), made by the agent that added the trigger when one did, so
+it shows under that agent, and gives it the fire's message. Its id is kept with the trigger's
+state when the fire settles, and later fires message it. A name an agent already has is refused at
+`add` (`bot_exists`), and an agent of that name made before the first fire
+makes that fire fail, naming it. The agent that added it is pinned by its
+id too: once it is deleted, `create` fails with `creator_not_found`, and the
+trigger ends, keeping its row, as when its `--reply-to` agent is gone. The `create` carries the trigger's own
+request id, so a fire cut short after the daemon made the agent asks again
+and gets that same agent, and no other.
+
+**What else.** `--reply-to BOT` keeps the fire's process until the turn it
+sent ends (the daemon's `wait`, up to a day), then queues that turn's
+answer to BOT, pinned by id; launchd starts no second fire of the trigger
+meanwhile, so a repeating one skips the times that turn spans. The fire's
+request id then ends `-to-ID`, BOT's id, so the app does not also tell
+that agent of the turn as a task update, unless that answer has not
+reached it 15 s after the turn ended. A fire cut short while it waits
+(the Mac restarted) passes no answer on: nothing resumes that wait. An
+answer the daemon cut short is
+marked so in its first line; a turn that ended saying nothing passes on an
+empty answer. One that does not get through keeps an ended trigger listed,
+saying so, and one whose BOT is gone (`bot_not_found`: pinned by id, it
+never comes back) ends the trigger. `--if CMD` runs `sh -c CMD` in the folder
+`add` ran in, with the `PATH` `add` ran with, before anything else, for up
+to 60 s, in its own process group, which ends with it; any exit but 0
+skips that fire and records nothing but, for `--commit`, that its commit
+was seen, so a heartbeat whose check finds
+nothing to do costs one process and no model call. A one-off whose check
+says no ends, listed as not sent.
+`--runs N` ends the trigger once N messages went out; a fire after that
+(its end could not unload it) only tries to end it again. Each message the
+agent gets starts with one line, `[trigger NAME · YYYY-MM-DD HH:MM · why]`,
+the local fire time and what fired it (its time, `file PATH`, `commit REPO
+at SHA`, or `fired`), so a catch-up fire after sleep reads as late; an
+answer passed on by `--reply-to` starts with the agent and turn it is from.
+Submissions carry `origin: "trigger"`, and a passed-on answer carries
+`from: {bot, turn}`, the turn it is; coordinator updates carry `origin:
+"tasks"`. All are automated input, not human consent for the approver.
+
+**Adding again.** A trigger is named after its agent unless `--name` says
+otherwise. `add` with a name in use and the same definition changes nothing
+and returns that trigger with `"duplicate": true`, so a retried `add` is
+safe; with another definition it is refused as `trigger_exists`, whose
+`field` names the first that differs (`when`, `bot`, `start`, `message`,
+`reply_to`, `if`, `runs`, `commit`, `dir`, `daemon`, `store_id`): `rm` it
+first. A name differing from another only in case is refused
+(`name_taken`), since macOS folders would give both one file, and `rm` finds
+a trigger only by the name as stored; `rm` of a name not there is
+`trigger_not_found`. `ls` returns 64 triggers per page, with `next_after`
+for `--after NAME` or the next page in Settings; only the current page's
+messages are retained. `fire NAME` asks for a fire and returns
+`{"name", "fired": true}`; what the fire did shows in `ls`. An ask is a file
+in the trigger's queue folder, `~/.agent/triggers/NAME.asks`, which its plist
+names as launchd's `QueueDirectories`: launchd runs the job while an ask is
+there, one run at a time, and runs it again when a run ends with one still
+there. Each ask is one fire: the fire moves the oldest out of the queue into
+`NAME.taking`, which launchd also watches, sends whatever its time or
+watched path, queues behind work rather than skipping it, and removes the
+ask once done; one a fire was cut short on is the next fire's, and its
+message has the same `request_id`, named by the ask, so the daemon takes it
+once. A queue that cannot be read, or an ask that cannot be moved out of it
+or removed once done, would have launchd run the job for ever, so the
+trigger ends, saying why (`asks_stuck`). A trigger that goes sets its asks aside with its files until launchd unloads its
+job, and puts them back when it will not. Nothing else starts a fire:
+launchd is the only thing that runs one.
+
+Each is one LaunchAgent, `~/Library/LaunchAgents/me.lydakis.agent.trigger.NAME.plist`,
+and that file is its definition: its program arguments carry the agent and
+its id (or the agent to start, its model and effort, and who added it), the
+store and the socket of the shell it was made from (an agent's shell has
+both), the store identity its daemon announced, the one-off's time, the
+repository, the folder, the reply agent and its id, the gate, the run limit,
+and the message. A fire whose daemon announces another store (a reused
+socket) sends nothing and records `store_mismatch`. When it fires, the app's
+executable runs with `--trigger-fire` and those arguments. It connects to
 the daemon, and when none answers and the store is known, starts one for it
 on that socket as the app does, with the login shell's environment and
-`~/.agent/env`. A repeating schedule submits with `delivery: reject`: a bot
-that is working, or has work waiting, skips that time rather than having it
-cut in or pile up. A one-off submits with `delivery: queue`, so a working
-bot gets it after its turn. A bot deleted since, or a new bot under its
-name, is not reached (`bot_not_found`), and the schedule ends. A one-off's
+`~/.agent/env`. A repeating trigger submits with `delivery: reject`: a bot
+that is working, or has work waiting, skips that fire rather than having it
+cut in or pile up. A one-off, and a fire `fire` asked for, submits with
+`delivery: queue`, so a working bot gets it after its turn. A one-off's
 calendar entry has no year, so a fire more than two days before its time
 does nothing (the slack keeps a one-off whose Mac changed time zone since,
 since launchd follows the new zone's clock), and one more than half a year
 after it is that entry's next year: it sends nothing and ends as `missed`.
-What the fire did (`sent` with the turn, `skipped`, `gone`, `missed` or
-`failed` with why) is kept with the schedule's row in
-`~/.agent/schedules/NAME.json`, which Settings shows beside each schedule
-with its message and a Remove button.
+What the fire did (`sent` with the turn and any `reply`, `skipped`, `gone`,
+`missed` or `failed` with why), with the messages sent so far, the agent it
+started and the commit it saw, is kept in `~/.agent/triggers/NAME.json`,
+which Settings shows beside each trigger with its message, a Run now button
+and a Remove button. Triggers are local to this machine. Remote windows
+neither list, run nor remove local triggers.
 
-A schedule's state is three things: its plist, launchd's loaded copy, and
-that last result. Every change keeps them either whole or as they were, and
+A trigger's state is three things: its plist, launchd's loaded copy, and
+that state file. Every change keeps them either whole or as they were, and
 anything else a failure can leave is listed and removable:
 
 - **Adding** writes the plist and loads it. A load launchd refuses removes
-  the plist again.
-- **Replacing** (a name in use) unloads the old job, writes the new plist
-  and loads it. Each installation has a generation ID. The previous result
-  stays on disk until the next fire replaces it; listing only shows a result
-  from the current generation, so an interrupted replacement loses no result. An old job launchd will not
-  unload, an old plist that cannot be read (it could not be put back) refuses the replacement before
-  anything changes. A new plist that cannot be written or loaded puts the
-  old plist back and loads it; if launchd refuses that too, the
-  old plist is listed and loads at the next login.
-- **Firing** records its result and ends a schedule that is over, both
-  under the lock and only while the plist is still the one it fired for: a
-  schedule replaced or removed while its message went out is left as it now
-  is. A one-off that delivered leaves nothing. One that ends without
-  delivering (its agent gone, the daemon unreachable, `missed`) loses its
-  plist but keeps its last result, so Settings and `ls` list it as not
-  delivered, and why, until it is removed. When that result cannot be
-  written, the plist stays, listed, rather than ending with no trace. The
-  plist goes before the unload, since the unload ends the fire's own
-  process; a plist that cannot be deleted keeps its job loaded, and an
-  unload launchd refuses writes the plist and the result back, so either
-  stays listed with what its fire did. A
-  job left loaded after its plist went (an end cut short) is unloaded by
-  its next fire.
+  the plist again. A plist there already, readable or not, is never
+  replaced: `rm` first. Each installation has a generation ID, and listing
+  and fires only use a state file of the current generation, so a trigger
+  made again under an ended one's name starts afresh.
+- **Firing** records its result and ends a trigger that is over (a one-off,
+  one whose agent, `--reply-to` agent or, for `--start`, adding agent is
+  gone, one that reached `--runs`), both under the lock
+  and only while the plist is still the one it fired for: a trigger
+  removed while its message went out is left as it now is. A one-off that
+  delivered leaves nothing. One that ends without delivering (its agent
+  gone, the daemon unreachable, `missed`) loses its plist but keeps its
+  last result, so Settings and `ls` list it as not delivered, and why,
+  until it is removed. When that result cannot be written, the plist stays,
+  listed, rather than ending with no trace. The plist goes before the
+  unload, since the unload ends the fire's own process. It and the result
+  are set aside by rename (`.NAME.retiring`), whatever their size or
+  contents, and deleted once launchd lets the job go; a file that cannot be
+  set aside keeps its job loaded, and an unload launchd refuses renames
+  them back, so either stays listed with what its fire did. A fire whose
+  unload ends it before it deletes them leaves them aside; the app's next
+  start, or the next `add` or `rm` of that name, finishes that end. The
+  app's start also removes the temporary of a write that died before its
+  rename: every write takes the lock, so none is under way. A job
+  left loaded after its plist went (an end cut short) is unloaded by its
+  next fire.
 - **Removing** unloads the job by its label whether or not its plist is
-  there, then deletes the plist and the last result, so it reaches an
-  ended row, a plist launchd no longer has, and a job loaded without its
-  plist alike. An unload launchd refuses keeps everything, to be tried
-  again.
+  there, then deletes the plist and the state file, so it reaches an ended
+  row, a plist launchd no longer has, and a job loaded without its plist
+  alike. An unload launchd refuses keeps everything, to be tried again.
 - **Listing** shows a one-off still there two days after its time as
   `missed: true` (launchd did not run it, as when the Mac was off, or its
   end was cut short), and a plist that cannot be read as a row with its
   `problem`, which `rm` removes.
 
 The files are written, synced, renamed and their folder synced; deletions
-sync their folder too. `add`, `rm`, a fire's result and end, and the app's
-refresh take a lock (`~/.agent/schedules/.lock`) around their changes, and
-the refresh reads each plist again under it. `~/.agent/schedule` is written with its
-executable mode from the start. When the
-app starts from a new place, as after an update, it writes its path into
-every schedule and loads it again, on a thread of its own so the window does
+and set-asides sync their folder too. `add`, `rm`, `fire`, a fire's result and end, and
+the app's refresh take a lock (`~/.agent/triggers/.lock`) around their
+changes, and the refresh reads each plist again under it.
+`~/.agent/trigger` is written with its executable mode from the start. When
+the app starts from a new place, as after an update, it writes its path into
+every trigger and loads it again, on a thread of its own so the window does
 not wait; one launchd refuses keeps its old path and is tried again at the
-next start. Settings lists schedules also when no project exists. Only macOS has launchd; elsewhere `add`
-refuses with `schedules_unsupported`.
+next start. Settings lists triggers also when no project exists. Only macOS
+has launchd; elsewhere `add` refuses with `triggers_unsupported`.
+
+Earlier apps called these schedules (`me.lydakis.agent.schedule.NAME`).
+They are not converted: remove them by hand (`launchctl bootout
+gui/$UID/me.lydakis.agent.schedule.NAME`, then delete the plist and
+`~/.agent/schedules`) and add them again as triggers.
 
 The app ships an `automation` skill
 ([SKILL.md](../app/skills/automation/SKILL.md)) for an agent setting up or
@@ -1220,7 +1336,7 @@ every start the app links each one from `~/.agents/skills/NAME`
 the link points at, so nothing is copied or recorded; a moved app re-points
 its links at its next start, and a skill it stops shipping loses its link.
 The Homebrew cask runs `agent-app --setup` after an install or upgrade, which
-writes what a start writes (scripts, `~/.agent/schedule`, these links) before
+writes what a start writes (scripts, `~/.agent/trigger`, these links) before
 the first window, and `agent-app --unlink-skills` before an uninstall, which
 removes this bundle's links and nothing else, so none outlives the app. The app's links are those into a copy of it (a bundle with
 `Contents/MacOS/agent-app`) or into an app since removed; a folder, file or
@@ -1326,8 +1442,13 @@ and licenses in `LICENSES.txt`), so drawing a message fetches nothing.
 A file opens beside the chat, in the pane a task opens in, from a path a step
 read, wrote or edited (the path in its line) or a message's link to a path
 (`[plan](PLAN.md)`, `src/a.rs:12` or `a.rs:12`, `src/a.rs#L4`, `README.md#install`; the
-line or section is dropped). A path is the agent's folder's, and a link
-inside an open file is relative to that file. The core reads the first 4 MiB of a regular file (`read_file`; a
+line or section is dropped). A path is relative to the folder the turn that
+named it ran in (`history_nodes` names each turn's, and `accepted` the
+running one's), so a link an agent wrote before it moved still opens what it
+meant. The app keeps a turn's folder only while the turn is in the window; a
+folded turn's folder returns with the page that reloads it. A turn the store no longer holds, as after its fork source was
+deleted, uses the agent's folder now. A link inside an open file is relative
+to that file. The core reads the first 4 MiB of a regular file (`read_file`; a
 FIFO or device is refused, as reading one need not end, and a window on a
 host is refused by name, as its files are the host's). The file draws by its
 kind: Markdown, a diagram (`.mmd`, `.mermaid`) or a chart (`.vl.json`,
@@ -1593,7 +1714,23 @@ task updates are tested in `app/tests/state.test.cjs` and were driven in demo
 mode in headless Chromium. The real-launchd test passed on a Mac (2026-09-29, at 2e484ed): launchd
 fired the one-off at its minute and it ended itself; replace, `rm` of a
 plist launchd had dropped, `rm` of a job without its plist, and a last `rm`
-answering `schedule_not_found` all held.
+answering `schedule_not_found` all held. Schedules have since become
+triggers: that module and test are now `trigger.rs` and `tests/test_trigger.py`. After the
+rename (2026-10-09, Linux container) the same real-daemon tests passed under
+the new names, and the conversion of earlier schedules passed against the
+stand-in launchd: both converted, the running one's old job unloaded last,
+its result and an ended one's moved, an unreadable plist left in place.
+The same day, file, commit and fire-by-name triggers were added and passed
+the real-daemon tests too: a message starts with its fire line, a commit
+trigger fired again on the same HEAD sends nothing and on a new commit sends
+again, and `add`'s idempotence, `fire`'s ask and the `WatchPaths` plist are
+covered against the stand-in launchd. A file trigger firing on a write and
+`fire` through the `QueueDirectories` queue need a Mac (`AGENT_TEST_LAUNCHD=1`).
+Then `--start`, `--reply-to`, `--if` and `--runs` passed against a real
+daemon: a started agent made once in the trigger's folder under the agent
+that added it, then messaged; a second trigger for that name refused at its
+fire; a turn's answer queued to the reply agent with its line; a gate that
+exits 1 costing no turn.
 
 ## Next
 
@@ -1631,16 +1768,19 @@ project creation (no file for a refused model),
 steers pinned to their turn, model picks pinned to identity, the demo
 daemon's steer delivery, a message's sender (another agent's, live, steered
 in, queued and read back, unlinked once its name holds a new agent, and the
-app's own task updates and schedules by origin), and runs
+app's own task updates and triggers by origin), and runs
 folded with failures on their line. Also covers coordinator task updates: batched at rest, excluding requested and replayed turns, retained after send failures. Messages: Markdown with raw HTML, unsafe links and remote images kept out, fenced blocks drawn by language, charts, file links, files drawn by kind, each message parsed once, and streamed blocks drawn once with fences kept whole. `cargo test -p agent-app link_tests` covers which links the core opens and how it reads a file.
 `cargo test -p agent-app` includes a failed project-file write leaving
-neither a partial file nor a temporary, and schedules' calendars, plists,
+neither a partial file nor a temporary, and triggers' calendars, plists,
+watched paths, idempotent `add`, `fire`, `--runs`, `--if`, the commit check,
 move, and each lifecycle step with launchd refusing. With `AGENT_TEST_RUNTIME=1` after a release build
-and `cargo build -p agent-app`, `python3 -m unittest tests.test_schedule`
-fires schedules against a real daemon; on a Mac, `AGENT_TEST_LAUNCHD=1`
+and `cargo build -p agent-app`, `python3 -m unittest tests.test_trigger`
+fires triggers against a real daemon; on a Mac, `AGENT_TEST_LAUNCHD=1`
 adds its one launchd test, which loads real jobs (under a scratch `HOME`, so
 nothing loads at the next login) and checks that launchd fires a one-off,
-which ends itself, and that replace and `rm` work on real jobs.
+which ends itself, fires a file trigger on a write (the same `add` again
+being that trigger, a different one refused naming `when`), runs `fire`
+by name, and that `rm` removes a job whose plist or load is already gone.
 App tests also cover hosts over SSH against a stand-in
 `ssh` that runs the remote command here and forwards by linking: `~/.ssh/config`
 aliases, includes and quoting, `ssh -G` read to its bound, the ssh arguments, `agent start`'s answers, attaching

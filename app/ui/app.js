@@ -35,7 +35,7 @@ const S = {
   swarms: new Map(), memberOf: new Map(),
   // Who asked for each turn another bot asked for, until it ends, and what each coordinator has yet to
   // hear about its tasks (see `wake`), and turns that ended live before the snapshot said who made their bot.
-  turnFrom: new Map(), turnOrigin: new Map(), wakes: new Map(), heldNews: [],
+  turnFrom: new Map(), turnOrigin: new Map(), answerTo: new Map(), forwarding: new Map(), answered: new Set(), wakes: new Map(), heldNews: [],
   // Bots whose finished turn the person has not looked at yet (see `shownStatus`), and turns another
   // bot asked for that the person steered into, whose end is theirs to see too.
   unseen: new Set(), wanted: new Set(),
@@ -48,7 +48,7 @@ function loadSend() { try { const v = localStorage.getItem('agent:send'); return
 // it: two hosts, or a host and this machine, never share it. Nothing is saved before the store is known.
 const sessionKey = () => (S.store ? `agent:${S.store}|${S.config?.workspace}` : null);
 const bot = (name) => S.bots.get(name);
-const transcript = (name) => { if (!S.transcripts.has(name)) S.transcripts.set(name, { items: [], nodes: 0, thoughts: 0, longOut: 0, peers: [], anchor: 'end', gen: 0, text: '', thinking: '', thinkingSince: 0, thinkingMs: 0, streamingTurn: null, streamGen: 0 }); return S.transcripts.get(name); };
+const transcript = (name) => { if (!S.transcripts.has(name)) S.transcripts.set(name, { items: [], nodes: 0, thoughts: 0, longOut: 0, peers: [], anchor: 'end', gen: 0, text: '', thinking: '', thinkingSince: 0, thinkingMs: 0, streamingTurn: null, streamGen: 0, folders: new Map() }); return S.transcripts.get(name); };
 // Counters kept in step with the items, so the key bar never scans the history.
 function count(t, it, d) {
   t.bytes = Math.max(0, (t.bytes || 0) + d * (it.bytes || 0));
@@ -136,7 +136,13 @@ function evict(t) {
   }
   if (earlierNotes) result.unshift({kind:'note_gap',total:earlierNotes});
   if (laterNotes) result.push({kind:'note_gap',total:laterNotes,later:true});
-  t.items = result; normalizeRanges(t); t.gen += 1;
+  t.items = result; normalizeRanges(t); t.gen += 1; dropFolders(t);
+}
+// Keep only the folders of turns still in the window. A dropped turn's folder
+// comes back with the page that reloads it.
+function dropFolders(t) {
+  const kept = new Set(t.items.map(it => it.turn)); kept.add(t.streamingTurn);
+  for (const turn of t.folders.keys()) if (!kept.has(turn)) t.folders.delete(turn);
 }
 // Ranges may straddle peer cards when one provider node holds several calls.
 // Union overlapping intervals globally, retaining only the first placeholder.
@@ -177,6 +183,7 @@ function seedHistory(record) {
     });
     t.nodes = t.thoughts = t.longOut = t.bytes = 0;
     for (const it of t.items) count(t, it, 1);
+    dropFolders(t);
   }
   t.seeded = true; t.seedSession = S.session; t.seedHead = record.head;
   const ids = t.items.map(it => it.kind === 'node' ? it.node : it.from).filter(id => id != null);
@@ -266,6 +273,28 @@ function learnFamily(b, record) {
 }
 // The creator, when the bot holding that name now is the identity that did the creating. A later
 // bot reusing the name is a stranger, and a creator the store could not resolve links to nothing.
+// A trigger's fire with --reply-to ends its request id `-to-ID`: the agent the turn's answer goes to.
+function answerTo(name, turn, data) {
+  const to = /^trigger-.*-to-(\d+)$/.exec(typeof data.request_id === 'string' ? data.request_id : '');
+  if (to) S.answerTo.set(`${name}\u0000${turn}`, Number(to[1]));
+}
+// A task turn whose answer a trigger passes to the task's coordinator is that answer's news, not
+// news again; only an answer that does not arrive (the fire failed to pass it on) leaves it news.
+const FORWARD_MS = 15000;
+function turnNews(name, turn, status, from, callId, origin, answered) {
+  const b = bot(name);
+  if (answered == null || !b || answered !== creatorOf(b)?.id) return tellLead(name, turn, status, from, callId, origin);
+  const key = `${name}\u0000${turn}`;
+  if (S.answered.delete(key)) return;
+  clearTimeout(S.forwarding.get(key));
+  S.forwarding.set(key, setTimeout(() => { S.forwarding.delete(key); tellLead(name, turn, status, from, undefined, origin); }, FORWARD_MS));
+}
+// An answer replayed while the snapshot holds its turn's news: that news, once let go, is no news.
+function forwarded(from) {
+  const key = `${from.bot}\u0000${from.turn}`;
+  if (S.forwarding.has(key)) { clearTimeout(S.forwarding.get(key)); S.forwarding.delete(key); }
+  else if (S.snapshot) S.answered.add(key);
+}
 function creatorOf(b) { const p = b.parent && b.parentId != null ? S.bots.get(b.parent) : null; return p && p.id === b.parentId ? p : null; }
 function forgetBot(name) {
   const parent = bot(name) && creatorOf(bot(name));
@@ -275,7 +304,8 @@ function forgetBot(name) {
   // A coordinator gone hears nothing more, and its queued turns never end; a task gone is no news.
   if (S.wakes.has(name)) { clearTimeout(S.wakes.get(name).timer); S.wakes.delete(name); }
   for (const w of S.wakes.values()) if (w.tasks.delete(name) && !w.tasks.size) { clearTimeout(w.timer); w.timer = null; }
-  for (const map of [S.turnFrom, S.turnOrigin]) for (const key of map.keys()) if (key.startsWith(`${name}\u0000`)) map.delete(key);
+  for (const map of [S.turnFrom, S.turnOrigin, S.answerTo]) for (const key of map.keys()) if (key.startsWith(`${name}\u0000`)) map.delete(key);
+  for (const [key, timer] of S.forwarding) if (key.startsWith(`${name}\u0000`)) { clearTimeout(timer); S.forwarding.delete(key); }
   for (const key of S.wanted) if (key.startsWith(`${name}\u0000`)) S.wanted.delete(key);
   // Held news is this bot's; a later bot of the same name is another.
   S.heldNews = S.heldNews.filter(([held]) => held !== name);
@@ -658,17 +688,20 @@ async function onEvent(ev) {
       break;
     }
     case 'accepted': {
-      if (data.from?.bot) S.turnFrom.set(`${name}\u0000${turn}`, data.from.bot);
+      if (data.from?.bot) { S.turnFrom.set(`${name}\u0000${turn}`, data.from.bot); forwarded(data.from); }
       else if (typeof data.origin === 'string') S.turnOrigin.set(`${name}\u0000${turn}`, data.origin);
+      answerTo(name, turn, data);
       const b = bot(name); if (b) { b.status = 'running'; b.runningTurn = turn; b.waitingOn = []; b.turnStarted = S.live ? Date.now() : 0; b.elapsed = 0; }
       // The event that puts a prompt on the lineage names who sent it, here and on `steered`.
       const t = transcript(name), by = senderOf(data);
+      if (typeof data.workspace === 'string') t.folders.set(turn, data.workspace);
       if (typeof data.node === 'number') pushNode(t, { kind: 'node', node: data.node, turn, ...(by ? { by } : {}) });
       break;
     }
     case 'queued': {
-      if (data.from?.bot) S.turnFrom.set(`${name}\u0000${turn}`, data.from.bot);
+      if (data.from?.bot) { S.turnFrom.set(`${name}\u0000${turn}`, data.from.bot); forwarded(data.from); }
       else if (typeof data.origin === 'string') S.turnOrigin.set(`${name}\u0000${turn}`, data.origin);
+      answerTo(name, turn, data);
       // `ready` waits for a daemon-wide slot with nothing else running on the bot; `queued` sits behind its own turn.
       const b = bot(name); const behindOwn = !!b && (b.runningTurn !== null || isActive(b.status));
       if (b && !behindOwn) { b.status = data.status ?? 'queued'; b.runningTurn = turn; }
@@ -712,7 +745,7 @@ async function onEvent(ev) {
       const shown = S.ui.file;
       // Read again as the agent left it; what it wrote is new, so a page, diagram or image in it waits for a click.
       // A write or edit that failed or was refused changed nothing, and what is shown keeps running.
-      if (shown && !data.failed && !data.denied && call?.path && (call.name === 'write' || call.name === 'edit') && joinPath(bot(name)?.workspace ?? S.config?.workspace ?? '', call.path) === shown.full) openFile(shown.bot, shown.full, false);
+      if (shown && !data.failed && !data.denied && call?.path && (call.name === 'write' || call.name === 'edit') && joinPath(folderOf(name, turn), call.path) === shown.full) openFile(shown.bot, shown.full, false);
       if (typeof data.node === 'number') {
         pushNode(t, { kind: 'node', node: data.node, callId: data.call_id, turn });
         if (call && (call.background || call.name === 'wait') && await loadWaitOrProc(name, data.node, call)) {
@@ -743,7 +776,8 @@ async function onEvent(ev) {
     case 'turn_finished': {
       const status = data.status ?? '?';
       const b = bot(name);
-      const key = `${name}\u0000${turn}`, from = S.turnFrom.get(key), origin = S.turnOrigin.get(key); S.turnFrom.delete(key); S.turnOrigin.delete(key);
+      const key = `${name}\u0000${turn}`, from = S.turnFrom.get(key), origin = S.turnOrigin.get(key), answered = S.answerTo.get(key);
+      S.turnFrom.delete(key); S.turnOrigin.delete(key); S.answerTo.delete(key);
       // A steer absorbed into a running turn finishes as its own turn while that turn goes on.
       if (b && (b.runningTurn === null || b.runningTurn === turn)) { b.runningTurn = null; b.waitingOn = []; if (b.turnStarted) b.elapsed = Date.now() - b.turnStarted; b.turnStarted = 0; b.status = status === 'completed' || status === 'steered' ? 'idle' : status; }
       const t = transcript(name);
@@ -754,7 +788,8 @@ async function onEvent(ev) {
       if (b && S.live && status === 'completed' && (!from || wanted) && !onScreen(name) && !S.unseen.has(name)) { S.unseen.add(name); patchUnseen([name]); }
       // A steer's turn is part of the turn it joined, whose end is the news.
       // A task's creator may still be on a snapshot page to come; its news waits for the whole snapshot.
-      if (S.live && status !== 'steered') { if (S.snapshot) S.heldNews.push([name, turn, status, from, undefined, origin]); else tellLead(name, turn, status, from, undefined, origin); }
+      // Whether a trigger passes its answer to the coordinator is known once the creator is.
+      if (S.live && status !== 'steered') { if (S.snapshot) S.heldNews.push([name, turn, status, from, undefined, origin, answered]); else turnNews(name, turn, status, from, undefined, origin, answered); }
       // A coordinator coming to rest hears what waited for it.
       if (S.wakes.has(name)) wakeSoon(name);
       // A background command may outlive its turn; only a wait result says how it ended.
@@ -879,6 +914,7 @@ async function loadInherited(name, older) {
   const present = new Set(t.items.map(it => it.kind === 'node' ? it.node : it.from).filter(id => id != null));
   const nodes = page.nodes.slice().reverse().filter(n => !(marker.exclusive && n.node === marker.next) && !present.has(n.node)).map((n) => ({ kind: 'node', node: n.node, turn: n.turn ?? null }));
   for (const it of nodes) count(t, it, 1);
+  for (const { folder, turns } of page.workspaces) for (const turn of turns) t.folders.set(turn, folder);
   let replacement;
   if (marker.forward) replacement = [...nodes, ...(page.next_newer == null ? [] : [{...marker, min: page.next_newer, loaded: true}])];
   else replacement = [...(page.next_from == null ? [] : [{...marker, next: page.next_from, exclusive:false, loaded: true}]), ...nodes];
@@ -980,7 +1016,7 @@ function enqueue(job) { chain = chain.then(job, job); return chain; }
 // them with, and its role says what to do with that. A turn it is waiting on is not news, since its wait
 // reads it; nor is its own fork or side chat. Only live turns count, while this window is attached.
 // Turns you asked for in a task yourself are its `theirs` news, listed apart: the coordinator hears of
-// them but is not asked to act on them. Turns another agent or the app (a schedule, by its `origin`)
+// them but is not asked to act on them. Turns another agent or the app (a trigger, by its `origin`)
 // asked for, and approvals, are its `act` news; a turn's end goes where its pending approval is.
 // Each kind keeps its own first and latest turn and a count, whatever the backlog, so a task can be in
 // both lists with the handles each one needs; one message names at most WAKE_TASKS tasks, those with
@@ -1168,7 +1204,8 @@ async function attachOnce() {
         if (parent) addItem(transcript(parent.name), {kind:'peer',who:b.name,turn:null});
       }
       S.snapshot = false; S.deleted.clear();
-      for (const news of S.heldNews.splice(0)) tellLead(...news);
+      for (const news of S.heldNews.splice(0)) turnNews(...news);
+      S.answered.clear();
       S.attached = true;
       // What waited while detached goes out now, each window permitting.
       for (const lead of S.wakes.keys()) wakeSoon(lead);
@@ -1199,7 +1236,8 @@ function forgetStore() {
   S.cursor = 0; S.bots.clear(); S.transcripts.clear(); S.drafts.clear(); S.override.clear(); S.effort.clear(); S.families.clear();
   S.swarms.clear(); S.memberOf.clear(); S.deleted.clear(); looked.clear();
   for (const w of S.wakes.values()) clearTimeout(w.timer);
-  S.wakes.clear(); S.turnFrom.clear(); S.turnOrigin.clear(); S.heldNews = []; S.unseen.clear(); S.wanted.clear();
+  S.wakes.clear(); S.turnFrom.clear(); S.turnOrigin.clear(); S.answerTo.clear(); S.heldNews = []; S.answered.clear();
+  for (const timer of S.forwarding.values()) clearTimeout(timer); S.forwarding.clear(); S.unseen.clear(); S.wanted.clear();
   S.selected = ''; S.ui.tabs = []; S.ui.side = null; dropFile();
   S.botsGen += 1; S.shapeGen += 1;
   // A home the last host named is not this one's.
@@ -1289,7 +1327,7 @@ function textHTML(it, t) {
   for (const s of it.budget?.spent.slice(0, it.sib) ?? []) if (s) { used.lines += s.lines; used.tags += s.tags; used.code += s.code; used.links += s.links; used.marks += s.marks; used.over ||= s.over; }
   const from = `${used.lines} ${used.tags} ${used.code} ${used.links} ${used.marks} ${used.over}`;
   if (it.htmlOf !== it.text || it.htmlFrom !== from || (it.htmlWaited && it.htmlAt !== Rich.version)) {
-    const start = { ...used }, html = `<div class="md">${Rich.html(it.text, used)}</div>`;
+    const start = { ...used }, html = `<div class="md"${turnAttr(it.turn)}>${Rich.html(it.text, used)}</div>`;
     const tags = used.tags - start.tags, mk = used.marks - start.marks, cost = 2 * html.length + TAG_BYTES * tags + MARK_BYTES * mk;
     if (it.budget) it.budget.spent[it.sib] = { lines: used.lines - start.lines, tags, code: used.code - start.code, links: used.links - start.links, marks: mk, over: !!used.over };
     const d = cost - (it.drawnBytes ?? 0); it.drawnBytes = cost; it.bytes = (it.bytes || 0) + d; if (t) t.bytes = Math.max(0, (t.bytes || 0) + d);
@@ -1412,7 +1450,7 @@ function runHTML(t, s, limit = t.items.length) {
   return { html: `<div class="steps" data-i="${s}"><div class="sum" data-run="${s}" role="button" tabindex="0">${open ? '▾' : '▸'} ${head}</div>${body}</div>`, end };
 }
 // A read, write or edit names its path; it opens that file beside.
-const summaryHTML = (it) => it.path ? `<a class="fpath" href="#" data-file="${esc(it.path)}">${esc(it.summary)}</a>` : esc(it.summary);
+const summaryHTML = (it) => it.path ? `<a class="fpath" href="#" data-file="${esc(it.path)}"${turnAttr(it.turn)}>${esc(it.summary)}</a>` : esc(it.summary);
 function stepHTML(it, i) {
   switch (it.kind) {
     case 'thought': return `<div class="line think">${esc(it.text)}</div>`;
@@ -1486,7 +1524,7 @@ function renderTail(el, name, t) {
     const text = document.createTextNode('');
     const cursor = document.createElement('span'); cursor.className = 'cursor';
     line.replaceChildren(text, cursor);
-    const done = kind === 'text' ? document.createElement('div') : null; if (done) done.className = 'md';
+    const done = kind === 'text' ? document.createElement('div') : null; if (done) { done.className = 'md'; if (t.streamingTurn != null) done.dataset.turn = String(t.streamingTurn); }
     el.replaceChildren(...(kind || running ? [done, line].filter(Boolean) : []));
     state = { transcript: t, kind, turn: t.streamingTurn, gen: t.streamGen, offset: 0, text, running, done, cut: {}, drawn: 0, used: { lines: 0, tags: 0, code: 0, draft: true } };
     tails.set(el, state);
@@ -1576,12 +1614,19 @@ function joinPath(dir, path) {
   return parts.join('/') || '/';
 }
 const dirOf = (path) => path.replace(/\/[^/]*$/, '') || '/';
-// Which agent's folder a click names a path in: the file beside's own folder, or the agent in that pane.
+// The folder a turn ran in, as the daemon reported it; a turn it no longer knows (its rows went with
+// a deleted fork source) or no turn at all is the agent's folder now.
+function folderOf(who, turn) {
+  return (turn != null && S.transcripts.get(who)?.folders.get(Number(turn))) || (bot(who)?.workspace ?? S.config?.workspace ?? '');
+}
+const turnAttr = (turn) => turn != null ? ` data-turn="${esc(turn)}"` : '';
+// Which folder a click names a path in: the file beside's own folder, or the folder of the turn that
+// wrote the message or step, in the agent in that pane.
 function openFileFrom(path, el) {
   const beside = el?.closest?.('.pane.side');
   if (beside && S.ui.file) return openFile(S.ui.file.bot, joinPath(dirOf(S.ui.file.full), path));
-  const who = beside ? S.ui.side : S.selected, b = bot(who);
-  return openFile(who, joinPath(b?.workspace ?? S.config?.workspace ?? '', path));
+  const who = beside ? S.ui.side : S.selected;
+  return openFile(who, joinPath(folderOf(who, el?.closest?.('[data-turn]')?.dataset.turn), path));
 }
 // `asked`: someone opened it, so what it holds draws at once. `gen` counts every opening and load
 // across closes, so a view never shares a key with one before it.
@@ -1817,6 +1862,56 @@ function renderSwarm(el, sw) {
   if (atBottom && sw.tab === 'board') el.scrollTop = el.scrollHeight;
 }
 
+// ---------- the new project sheet ----------
+// Only the fundamentals: a folder (the system's picker, which can also make a new one), the lead's model
+// and effort, the threads' model and effort (none: the lead's), and where threads work. The models are
+// read when it opens, so a list edited since shows.
+const np = { models: [], in: 'worktree' };
+async function openProjectSheet() {
+  closeMenu();
+  // Read without opening Settings: a daemon that cannot restart lists what it was started with.
+  let models = []; try { const [all, set] = await Promise.all([Daemon.models(), S.setup?.settings ?? Daemon.settings?.().catch(() => null)]); if (set) S.seenSettings = set; models = connected(all, set?.restartable === false && !S.setup?.settings ? null : set); } catch (e) { toast(`models: ${e?.message ?? e}`, 5000); }
+  Object.assign(np, { models, in: 'worktree' });
+  sheetFor = null; sheetKind = 'project';
+  const list = models, none = !list.length ? '<p class="hint warn">No models listed: connect a provider in Settings.</p>' : '';
+  $('sheet').innerHTML = `<h4>New project</h4>
+    <label for="np-dir">Folder</label><div class="pick"><input id="np-dir" autocomplete="off" spellcheck="false" placeholder="Choose a folder, or type its path" value="${esc(S.config?.workspace ?? '')}"><button type="button" class="sbtn" data-act="np-choose">Choose…</button></div>
+    <label for="np-model">Lead</label><div class="pair">${modelSelectHTML('np-model', list)}${effortSelectHTML('np-effort', pickedModel(list))}</div>
+    <label for="np-tmodel">Threads</label><div class="pair">${modelSelectHTML('np-tmodel', list, null, 'Same as the lead')}${effortSelectHTML('np-teffort', '', '').replace('<select ', '<select disabled ')}</div>
+    <div class="opts" id="np-in"></div>${none}
+    <div class="foot"><button type="button" class="sbtn" data-act="close-sheet">Cancel</button><button type="submit" class="sbtn primary" id="np-create">Create</button></div>`;
+  renderProjectSheet();
+  $('sheetwrap').classList.add('on'); S.ui.sheet = true;
+  setTimeout(() => $('np-dir').focus?.(), 0);
+}
+function renderProjectSheet() {
+  const opt = (v, l) => `<button type="button" class="opt${np.in === v ? ' on' : ''}" data-act="np-in" data-v="${v}" aria-pressed="${np.in === v}">${l}</button>`;
+  $('np-in').innerHTML = `${opt('worktree', 'Own worktree')}${opt('project', 'Project folder')}<span class="hint">${np.in === 'worktree' ? 'Threads that change files each get a git worktree of their own.' : 'Every thread works in the project folder.'}</span>`;
+  projectReady();
+}
+// A folder is all Create needs: one that is already a project keeps its own settings, and a new one
+// with no model picked, from the sheet or its coordinator profile, is refused as model_required.
+function projectReady() { const go = $('np-create'); if (go) go.disabled = !$('np-dir').value.trim(); }
+// The threads' effort follows their model, and with none it is the lead's.
+function projectChange(el) {
+  if (el.id === 'np-model') followModel(el.value, 'np-effort');
+  if (el.id === 'np-tmodel') { followModel(el.value, 'np-teffort'); if (!el.value) $('np-teffort').outerHTML = effortSelectHTML('np-teffort', '', '').replace('<select ', '<select disabled '); }
+  projectReady();
+}
+async function chooseProjectFolder() {
+  const dir = await Daemon.chooseFolder($('np-dir').value.trim() || S.config?.workspace || null).catch((e) => { toast(String(e?.message ?? e), 5000); return null; });
+  if (dir && S.ui.sheet && sheetKind === 'project') { $('np-dir').value = dir; projectReady(); }
+}
+async function submitProject() {
+  const go = $('np-create'), dir = $('np-dir').value.trim(), model = $('np-model').value, tmodel = $('np-tmodel').value;
+  if (!dir || go.disabled) return;
+  go.disabled = true; go.textContent = 'Creating…';
+  try {
+    await createProject(dir, model, $('np-effort').value, { model: tmodel || null, reasoning: (tmodel && $('np-teffort').value) || null, inProject: np.in === 'project' });
+    closeSheet();
+  } catch (err) { toast(String(err?.message ?? err), 6000); go.disabled = false; go.textContent = 'Create'; }
+}
+
 // ---------- the new swarm sheet ----------
 // A goal, how many agents, what they are, where they work, and a budget they share. What they are is
 // a mix: rows of an identity (a profile the folder offers, or a plain agent), a model and its effort, and a share,
@@ -1824,7 +1919,7 @@ function renderSwarm(el, sw) {
 // A swarm starts with up to 64 agents, as the app's side takes; Add goes on from there.
 const MAX_AGENTS = 64, MAX_BUDGET_M = 1000, BUDGET_PER_AGENT_M = 10;
 const MIX_ROWS = 8;
-let sheetFor = null;
+let sheetFor = null, sheetKind = null;
 const sheet = { models: [], profiles: [], mix: [] };
 async function openSwarmSheet(project) {
   closeMenu();
@@ -1835,7 +1930,7 @@ async function openSwarmSheet(project) {
   const first = [lead.model, lastModel()].find((m) => m && models.some((x) => x.id === m)) ?? '';
   const effort = first === lead.model ? lead.reasoning ?? '' : '';
   Object.assign(sheet, { models, profiles, mix: [{ identity: '', model: first, reasoning: effort, share: 100 }], budgetEdited: false });
-  sheetFor = project;
+  sheetFor = project; sheetKind = 'swarm';
   const sel = (id, opts, on) => `<select id="${id}">${opts.map(([v, l]) => `<option value="${esc(v)}"${String(v) === String(on) ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select>`;
   $('sheet').innerHTML = `<h4>New swarm in ${esc(project)}</h4>
     <label for="sw-goal">Goal</label><textarea id="sw-goal" rows="3" placeholder="What should they get done together?"></textarea>
@@ -1904,12 +1999,13 @@ function mixChange(el) {
   if (r.reasoning && !effortsFor(r.model).includes(r.reasoning)) r.reasoning = '';
   if (el.dataset.f !== 'share' || el.type !== 'number') renderMix();
 }
-function closeSheet() { if (!S.ui.sheet) return; S.ui.sheet = false; sheetFor = null; $('sheetwrap').classList.remove('on'); markSeen(); focusInput('main'); }
-$('sheet').addEventListener('change', (e) => { if (e.target.dataset?.mix != null) mixChange(e.target); else if (e.target.id === 'sw-n' || e.target.id === 'sw-budget' || e.target.id === 'sw-org') { updateSwarmBudget(e.target.id); renderMix(); } });
+function closeSheet() { if (!S.ui.sheet) return; S.ui.sheet = false; sheetFor = null; sheetKind = null; $('sheetwrap').classList.remove('on'); markSeen(); focusInput('main'); }
+$('sheet').addEventListener('change', (e) => { if (sheetKind === 'project') { projectChange(e.target); return; } if (e.target.dataset?.mix != null) mixChange(e.target); else if (e.target.id === 'sw-n' || e.target.id === 'sw-budget' || e.target.id === 'sw-org') { updateSwarmBudget(e.target.id); renderMix(); } });
 // A share typed updates the counts once it is a number, without redrawing the field being typed in.
-$('sheet').addEventListener('input', (e) => { if (e.target.id === 'sw-n' || e.target.id === 'sw-budget') { updateSwarmBudget(e.target.id); renderMix(); return; } if (e.target.dataset?.f !== 'share') return; mixChange(e.target); const n = agentCount(), problem = sheetProblem(n), counts = problem ? null : mixCounts(sheet.mix, mixRows(sheet.mix, n)); $('sw-mix').querySelectorAll('.count').forEach((c, i) => { c.textContent = counts ? `${counts[i]} agent${counts[i] === 1 ? '' : 's'}` : ''; c.classList.toggle('none', !!counts && !counts[i]); }); const w = $('sw-mix').querySelector('.mixfoot span'); if (w) { w.textContent = problem ?? (counts.some((c) => !c) ? `A row makes no agent at ${n} agents` : ''); w.className = w.textContent ? 'warn' : ''; } });
+$('sheet').addEventListener('input', (e) => { if (sheetKind === 'project') { projectReady(); return; } if (e.target.id === 'sw-n' || e.target.id === 'sw-budget') { updateSwarmBudget(e.target.id); renderMix(); return; } if (e.target.dataset?.f !== 'share') return; mixChange(e.target); const n = agentCount(), problem = sheetProblem(n), counts = problem ? null : mixCounts(sheet.mix, mixRows(sheet.mix, n)); $('sw-mix').querySelectorAll('.count').forEach((c, i) => { c.textContent = counts ? `${counts[i]} agent${counts[i] === 1 ? '' : 's'}` : ''; c.classList.toggle('none', !!counts && !counts[i]); }); const w = $('sw-mix').querySelector('.mixfoot span'); if (w) { w.textContent = problem ?? (counts.some((c) => !c) ? `A row makes no agent at ${n} agents` : ''); w.className = w.textContent ? 'warn' : ''; } });
 $('sheet').addEventListener('submit', async (e) => {
   e.preventDefault();
+  if (sheetKind === 'project') { await submitProject(); return; }
   const project = sheetFor, start = $('sw-start'); if (!project || start.disabled) return;
   start.disabled = true; start.textContent = 'Starting…';
   try {
@@ -2065,8 +2161,7 @@ function render() {
   if (sw) { renderSwarmHead($('title'), sw); renderSwarm($('log'), sw); }
   else { renderHead($('title'), b, 'main'); if (b) renderTranscript($('log'), b.name); else renderHome($('log')); }
   // New project belongs to Home's list.
-  const home = !S.selected; if (!home && !$('projform').hidden) showNewProject(false);
-  $('newproj').hidden = !home || !$('projform').hidden;
+  $('newproj').hidden = !!S.selected;
   if (S.ui.rail) renderRail();
   if (S.ui.file) renderFile();
   else if (side) { renderHead($('sidetitle'), side, 'side'); renderTranscript($('side'), side.name); }
@@ -2333,18 +2428,26 @@ async function sideChat(name, text = '') {
 async function remove(name) { await Daemon.request('delete', { bot: name }); }
 // A project in a folder: the folder's `.agents/project.toml` names it, or the folder's own name does,
 // and its coordinator is `<name>.lead` working there. An existing coordinator is opened, not made
-// twice, unless it works in another folder. The file is written only once the daemon has accepted
-// the coordinator, so a model it refuses is never saved; a folder whose coordinator exists gets
-// the file it lacks, with that coordinator's model, so a failed write retries.
+// twice, unless it works in another folder, and keeps the settings it was made with: they were told
+// it then and cannot be read back, so no file is written for it. The file is written only once the
+// daemon has accepted a coordinator the app makes, so a model it refuses is never saved, and it
+// records what that coordinator was told. A folder that is already a project keeps its settings, and
+// the window says the sheet's picks were not applied.
 // The app's own opinion of how a coordinator works is its `coordinator` profile: the folder's
 // `.agents/agents/coordinator.md`, the user's, or the one the app ships (app/agents/coordinator.md).
-async function createProject(dir, picked = null, effort = null) {
+// `threads` is what its threads run on and where they work: their model and effort, when not the lead's,
+// and whether all work in the project folder rather than their own worktrees. A folder's file keeps
+// its own. The coordinator is told them by `tasksRule`, after its role, so a role of one's own keeps them.
+async function createProject(dir, picked = null, effort = null, threads = null) {
   const info = await Daemon.project(dir);
   const existing = bot(info.coordinator);
+  // The sheet's thread settings are picks even at their defaults: "Own worktree" is shown as chosen.
+  const asked = !!(picked || effort || threads);
   if (existing) {
     if (existing.workspace !== info.dir) throw new Error(`${info.coordinator} already belongs to ${existing.workspace ?? 'another folder'}`);
-    if (!info.file) await Daemon.writeProject({ dir: info.dir, name: info.name, model: existing.model, reasoning: existing.reasoning ?? null });
-    await go(info.coordinator); return;
+    await go(info.coordinator);
+    if (asked) toast(`${info.coordinator} already exists and keeps the settings it was made with`, 5000);
+    return;
   }
   const policy = await Daemon.policy(info.dir, 'coordinator');
   // A folder that already has a project file keeps its model and effort; a new one takes the model
@@ -2355,11 +2458,22 @@ async function createProject(dir, picked = null, effort = null) {
   const reasoning = (kept ? info.reasoning : effort) || null;
   if (picked) try { localStorage.setItem('agent:model', picked); } catch (_) {}
   if (effort !== null) try { localStorage.setItem('agent:effort', effort); } catch (_) {}
+  const tasks = info.file ? { model: info.threads_model ?? null, reasoning: info.threads_reasoning ?? null, inProject: info.threads_in === 'project' } : threads;
   const session = S.session;
-  const record = await Daemon.request('create', { bot: info.coordinator, workspace: info.dir, model, ...(reasoning ? { effort: reasoning } : {}), instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: policy.tools ?? S.config.tools });
+  const record = await Daemon.request('create', { bot: info.coordinator, workspace: info.dir, model, ...(reasoning ? { effort: reasoning } : {}), instructions: `${policy.instructions}\n\n${tasksRule(tasks)}`, compaction_instructions: policy.compaction_instructions, tools: policy.tools ?? S.config.tools });
   await enqueue(() => { if (S.session === session) seat(record, session); });
-  if (!info.file) await Daemon.writeProject({ dir: info.dir, name: info.name, model, reasoning });
-  await go(info.coordinator); toast(`project ${info.name} · ${policy.note}`);
+  if (!info.file) await Daemon.writeProject({ dir: info.dir, name: info.name, model, reasoning, threads });
+  await go(info.coordinator); toast(`project ${info.name} · ${policy.note}${info.file && asked ? ' · set up from its project file, not these picks' : ''}`);
+}
+// A project's task settings, said to its coordinator as the flags its starts take. The model is always
+// named, so a role a task starts in (--profile) cannot swap it: the one picked, else the lead's own,
+// which its shell holds as AGENT_MODEL (and its effort as AGENT_EFFORT).
+// A picked model goes in quoted, since a model id may hold characters a shell would act on.
+const shq = (v) => `'${String(v).replaceAll("'", `'\\''`)}'`;
+function tasksRule(t) {
+  const flags = t?.model ? `--model ${shq(t.model)}${t.reasoning ? ` --effort ${shq(t.reasoning)}` : ''}` : '--model "$AGENT_MODEL" ${AGENT_EFFORT:+--effort "$AGENT_EFFORT"}';
+  const where = t?.inProject ? 'Every task works in this folder, with no worktree of its own.' : 'When this folder is a git repository, a task that changes files works in its own worktree, so tasks do not collide.';
+  return `This project's tasks, as the person set them up: start every new task, in a role (--profile) or not, with ${flags}. ${where}`;
 }
 function detach() { save(); Daemon.close(); }
 
@@ -2430,11 +2544,13 @@ function followModel(model, effortId, labelled = false) { const el = $(effortId)
 function lastModel() { try { return localStorage.getItem('agent:model'); } catch (_) { return null; } }
 // The model a picker over `list` starts on.
 const pickedModel = (list, prefer = null) => [prefer, lastModel()].find((m) => m && list.some((x) => x.id === m)) ?? '';
-function modelSelectHTML(id, list, prefer = null) {
-  const pick = pickedModel(list, prefer);
+// With `none`, the first choice is no model, under that label, and only `prefer` is picked.
+function modelSelectHTML(id, list, prefer = null, none = null) {
+  const pick = none === null ? pickedModel(list, prefer) : list.some((x) => x.id === prefer) ? prefer : '';
   const groups = new Map(); for (const m of list) { const label = providerLabel(providerOf(m.id)); if (!groups.has(label)) groups.set(label, []); groups.get(label).push(m); }
   const options = [...groups].map(([label, ms]) => `<optgroup label="${esc(label)}">${ms.map((m) => `<option value="${esc(m.id)}"${m.id === pick ? ' selected' : ''}>${esc(m.id.slice(providerOf(m.id).length + 1))}${m.note ? ` · ${esc(m.note)}` : ''}</option>`).join('')}</optgroup>`).join('');
-  return `<select id="${id}" aria-label="Model">${pick ? '' : '<option value="" selected disabled>Choose a model</option>'}${options}</select>`;
+  const first = none !== null ? `<option value=""${pick ? '' : ' selected'}>${esc(none)}</option>` : pick ? '' : '<option value="" selected disabled>Choose a model</option>';
+  return `<select id="${id}" aria-label="Model">${first}${options}</select>`;
 }
 // An entry's `--provider` specs. Bedrock with an API key names each endpoint so the key can be named
 // after it; without one it signs with the AWS CLI's credentials in the region.
@@ -2462,7 +2578,7 @@ async function openSetup() {
   try { await loadSettings(); } catch (e) { st.error = String(e?.message ?? e); }
   try { st.roles = await Daemon.roles?.(); } catch (_) {}
   if (!st.settings?.providers?.length) st.adding = st.adding ?? '';
-  await readSchedules();
+  await readTriggers();
   renderSetup();
   await Promise.all([checkProviders(st.settings?.listing), readList()]);
 }
@@ -2627,7 +2743,7 @@ function setupHTML(kept = new Map()) {
     + step(2, 'First project', projects, project)
     + (projects && !S.config?.host ? rolesHTML(st, busy) : '')
     + hostsHTML(st, busy)
-    + (!S.config?.host && (projects || st.schedules?.length || st.schedulesAfter || st.schedulesError) ? schedulesHTML(st, busy) : '')
+    + (!S.config?.host && (projects || st.triggers?.length || st.triggersAfter || st.triggersError) ? triggersHTML(st, busy) : '')
     + (st.busy ? `<p class="busy">${esc(st.busy)}</p>` : '') + (st.error ? `<p class="bad">${esc(st.error)}</p>` : '');
 }
 // The hosts in ~/.ssh/config, each of which a window can be opened on. That window's agents run on
@@ -2647,34 +2763,50 @@ function rolesHTML(st, busy) {
   const rows = ROLES.map(([name, label]) => `<div class="prow"><span class="pn">${label}</span><span class="st${own.get(name) ? '' : ' dim'}">${own.get(name) ? `~/.agents/agents/${name}.md` : 'the app\'s own'}</span><span class="acts"><button type="button" class="sbtn" data-act="edit-role" data-v="${name}"${busy}>Edit</button></span></div>`).join('');
   return `<section><h3>Roles</h3>${rows}<p class="dim">A project's coordinator and a swarm's agents follow these in every project; a project's own .agents/agents file of that name comes first. An agent keeps the text it started with, so an edit reaches new projects and swarms.</p></section>`;
 }
-// Agents wake at set times from schedules they or their coordinator made; the Mac keeps the time.
-// Each shows who it wakes, when, what its last time did, and the message it sends.
-// A schedule that ended on its own without delivering stays listed, saying why, until it is removed; so do a
+// Agents wake from triggers they or their coordinator made: a time, a file written, a commit, or a fire by name.
+// launchd keeps watch. Each shows who it wakes, on what, what its last fire did, and the message it sends.
+// A trigger that ended on its own without delivering stays listed, saying why, until it is removed; so do a
 // one-off still there after its time and a plist that cannot be read.
-async function readSchedules(after = null) {
+async function readTriggers(after = null) {
   const st = setupState();
-  st.schedulesAfter = after;
+  st.triggersAfter = after;
   try {
-    const page = S.config?.host ? null : await Daemon.schedules?.(after);
-    st.schedules = page?.schedules ?? null; st.schedulesNext = page?.next_after ?? null; st.schedulesError = null;
-  } catch (e) { st.schedules = null; st.schedulesNext = null; st.schedulesError = String(e?.message ?? e); }
+    const page = S.config?.host ? null : await Daemon.triggers?.(after);
+    st.triggers = page?.triggers ?? null; st.triggersNext = page?.next_after ?? null; st.triggersError = null;
+  } catch (e) { st.triggers = null; st.triggersNext = null; st.triggersError = String(e?.message ?? e); }
 }
-const LAST = { sent: 'sent', skipped: 'skipped, it was working', gone: 'its agent is gone', failed: 'failed', missed: 'missed, its time passed long ago' };
-function schedulesHTML(st, busy) {
+const LAST = { sent: 'sent', skipped: 'skipped, it was working', gone: 'its agent is gone', failed: 'failed', missed: 'missed, its time passed long ago', declined: 'not sent, its check said no' };
+function triggersHTML(st, busy) {
   const at = (ms) => new Date(ms).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-  const last = (l, ended) => l ? `${ended ? 'ended' : 'last'} ${at(l.fired_ms)}: ${LAST[l.outcome] ?? l.outcome}${l.outcome === 'failed' && l.detail ? ` (${String(l.detail).slice(0, 120)})` : ''}` : 'not run yet';
-  const remove = (x) => `<span class="acts"><button type="button" class="sbtn" data-act="schedule-remove" data-v="${esc(x.name)}"${busy}>Remove</button></span>`;
-  const rows = (st.schedules ?? []).map((x) => x.problem
-    ? `<div class="prow"><span class="pn">${esc(x.name)}</span><span class="st bad">unreadable</span>${remove(x)}<div class="sub dim">${esc(x.problem)}</div></div>`
-    : `<div class="prow"><span class="pn">${esc(x.bot)}</span><span class="st${x.ended || x.missed ? ' bad' : ''}">${x.ended ? 'not delivered' : x.missed ? 'missed its time' : esc(x.when)}</span>${remove(x)}<div class="sub dim">${esc(last(x.last, x.ended))}${x.name !== x.bot ? ` · ${esc(x.name)}` : ''}</div><div class="sub dim">${esc(x.message.length > 240 ? `${x.message.slice(0, 240)}…` : x.message)}</div></div>`).join('');
-  const none = st.schedulesError ? `<p class="bad">${esc(st.schedulesError)}</p>` : rows ? '' : '<p class="dim">None yet. Ask a coordinator, for example "have build check its PR every 30 minutes".</p>';
-  return `<section><h3>Schedules</h3>${rows}${none}${st.schedulesAfter ? '<button class="sbtn" data-act="schedules-first">First page</button>' : ''}${st.schedulesNext ? '<button class="sbtn" data-act="schedules-next">Next page</button>' : ''}<p class="dim">Each time, the agent gets its message in its own chat. A repeating one skips a time its agent is working; a one-off waits for it. They run with the app closed; a time the Mac slept through runs once when it wakes.</p></section>`;
+  const why = (o) => o.detail ? ` (${String(o.detail).slice(0, 120)})` : '';
+  const last = (l, ended) => l ? `${ended ? 'ended' : 'last'} ${at(l.fired_ms)}: ${LAST[l.outcome] ?? l.outcome}${l.outcome === 'failed' || l.outcome === 'declined' ? why(l) : ''}${l.reply?.outcome === 'failed' ? `, its answer did not get through${why(l.reply)}` : ''}` : 'not run yet';
+  const acts = (x) => `<span class="acts">${x.problem || x.ended ? '' : `<button type="button" class="sbtn" data-act="trigger-fire" data-v="${esc(x.name)}"${busy}>Run now</button>`}<button type="button" class="sbtn" data-act="trigger-remove" data-v="${esc(x.name)}"${busy}>Remove</button></span>`;
+  const more = (x) => [x.name !== x.bot ? x.name : '', x.start && x.bot_id == null ? `starts it on ${x.start.model}` : '', x.reply_to ? `answer to ${x.reply_to}` : '', x.if ? `if ${x.if}` : '', x.runs ? `${x.sent ?? 0} of ${x.runs} runs` : ''].filter(Boolean).join(' · ');
+  const rows = (st.triggers ?? []).map((x) => x.problem
+    ? `<div class="prow"><span class="pn">${esc(x.name)}</span><span class="st bad">unreadable</span>${acts(x)}<div class="sub dim">${esc(x.problem)}</div></div>`
+    : `<div class="prow"><span class="pn">${esc(x.bot)}</span><span class="st${x.ended || x.missed ? ' bad' : ''}">${x.ended ? (x.last?.outcome === 'sent' ? 'answer not passed on' : 'not delivered') : x.missed ? 'missed its time' : esc(x.when === 'fire' ? 'when run' : x.when)}</span>${acts(x)}<div class="sub dim">${esc([last(x.last, x.ended), more(x)].filter(Boolean).join(' · '))}</div><div class="sub dim">${esc(x.message.length > 240 ? `${x.message.slice(0, 240)}…` : x.message)}</div></div>`).join('');
+  const none = st.triggersError ? `<p class="bad">${esc(st.triggersError)}</p>` : rows ? '' : '<p class="dim">None yet. Ask a coordinator, for example "have build check its PR every 30 minutes".</p>';
+  return `<section><h3>Triggers</h3>${rows}${none}${st.triggersAfter ? '<button class="sbtn" data-act="triggers-first">First page</button>' : ''}${st.triggersNext ? '<button class="sbtn" data-act="triggers-next">Next page</button>' : ''}<p class="dim">Each fire, the agent gets its message in its own chat. A repeating one skips a fire while its agent is working; a one-off, or Run now, waits for it. They run with the app closed; a time the Mac slept through runs once when it wakes.</p></section>`;
 }
-async function removeSchedule(name) {
+// Run now returns once launchd starts the fire, before it has sent anything: the row is read again, a little
+// later each time, until its last fire changes or it ends, while Settings stays open.
+// Waits between reads after Run now: it looks at 0.5, 1, 2, 4, 8, 12 and 16 s. launchd starts a job at most
+// once every 10 s, so a Run now soon after the last fire can start that late.
+const RUN_NOW_LOOKS = [500, 500, 1000, 2000, 4000, 4000, 4000];
+async function triggerAct(act, name) {
   const st = setupState();
-  try { await Daemon.removeSchedule(name); } catch (e) { toast(`remove ${name}: ${e?.message ?? e}`, 5000); }
-  await readSchedules(st.schedulesAfter);
+  const lastOf = () => st.triggers?.find((x) => x.name === name)?.last?.fired_ms ?? null;
+  const before = lastOf();
+  let fired = act === 'fire';
+  try { await (act === 'fire' ? Daemon.fireTrigger(name) : Daemon.removeTrigger(name)); } catch (e) { fired = false; toast(`${act === 'fire' ? 'run' : 'remove'} ${name}: ${e?.message ?? e}`, 5000); }
+  await readTriggers(st.triggersAfter);
   renderSetup();
+  for (const ms of fired ? RUN_NOW_LOOKS : []) {
+    if (!st.open || !st.triggers?.some((x) => x.name === name) || lastOf() !== before) return;
+    await new Promise((done) => setTimeout(done, ms));
+    await readTriggers(st.triggersAfter);
+    renderSetup();
+  }
 }
 async function editRole(name) {
   const st = setupState();
@@ -2735,14 +2867,6 @@ async function nextBeside() {
 }
 // Late, after a load: by then the finder or a sheet may have opened, and it keeps the keyboard.
 function focusInput(pane) { const el = $(PANE[pane].input); if (el) setTimeout(() => { if (!covered()) el.focus({ preventScroll: true }); }, 0); }
-function showNewProject(on) {
-  $('projform').hidden = !on; $('newproj').hidden = on;
-  if (!on) return;
-  $('projdir').value = S.config?.workspace ?? ''; $('projdir').focus();
-  // The lead's model, from every provider's list, read now so a refreshed list shows.
-  $('projmodel').innerHTML = '';
-  Promise.all([Daemon.models(), S.setup?.settings ?? Daemon.settings?.().catch(() => null)]).then(([all, set]) => { if (set) S.seenSettings = set; const list = connected(all, set?.restartable === false && !S.setup?.settings ? null : set); if (!$('projform').hidden) $('projmodel').innerHTML = list.length ? modelSelectHTML('projsel', list) + effortSelectHTML('projeffort', pickedModel(list)) : '<span class="dim">no models listed: see Settings</span>'; }, (e) => { $('projmodel').textContent = String(e?.message ?? e); });
-}
 
 // ---------- input ----------
 function grow(el) { if (!el.style) return; el.style.height = 'auto'; el.style.height = `${Math.min(160, el.scrollHeight)}px`; }
@@ -2762,12 +2886,6 @@ for (const [pane, ids] of Object.entries(PANE)) {
   $(ids.input).addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); $(ids.form).requestSubmit(); } });
   $(ids.input).addEventListener('input', () => { const input = $(ids.input); grow(input); if (pane === 'main' && input.value === '?') { input.value = ''; showHelp(); } });
 }
-$('projform').addEventListener('submit', async (e) => {
-  e.preventDefault(); const dir = $('projdir').value.trim(); if (!dir) return;
-  try { await createProject(dir, $('projsel')?.value || null, $('projeffort')?.value ?? null); showNewProject(false); focusInput('main'); } catch (err) { toast(String(err?.message ?? err), 5000); }
-});
-$('projform').addEventListener('change', (e) => { if (e.target.id === 'projsel') followModel(e.target.value, 'projeffort'); });
-$('projform').addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.target.id === 'projsel' || e.target.id === 'projeffort')) { e.preventDefault(); $('projform').requestSubmit(); } else if (e.key === 'Escape') { showNewProject(false); focusInput('main'); e.preventDefault(); e.stopPropagation(); } });
 $('pickerq').addEventListener('input', renderPicker);
 $('pickerq').addEventListener('keydown', async (e) => {
   const rows = pickerRows();
@@ -2777,14 +2895,14 @@ $('pickerq').addEventListener('keydown', async (e) => {
   else if (e.key === 'Enter') { const r = rows[S.ui.pickerSel]; closePicker('main'); if (r) await go(r.b.name, 'tab'); e.preventDefault(); }
 });
 $('pickerlist').addEventListener('click', async (e) => { const r = e.target.closest('[data-pick]'); if (r) { closePicker('main'); await go(r.dataset.pick, 'tab'); } });
-const inputIds = new Set(['input', 'sideinput', 'projdir', 'pickerq']);
+const inputIds = new Set(['input', 'sideinput', 'pickerq']);
 document.addEventListener('keydown', async (e) => {
   if (S.ui.help) { hideHelp(); e.preventDefault(); return; }
   if (S.ui.sheet) { if (e.key === 'Escape') { closeSheet(); e.preventDefault(); } return; }
   if (S.setup?.open) { if (e.key === 'Escape') { closeSetup(); e.preventDefault(); } return; }
   if ((e.ctrlKey || e.metaKey) && e.key === ',') { await openSetup(); e.preventDefault(); return; }
   // The finder and the folder field handle their own keys; Escape there must not stop a turn.
-  if (S.ui.picker || e.target.id === 'projdir' || e.target.id === 'projsel' || e.target.id === 'projeffort' || e.target.id === 'pickerq') return;
+  if (S.ui.picker || e.target.id === 'pickerq') return;
   const k = e.key, ctrl = e.ctrlKey || e.metaKey;
   if (S.ui.menu) { if (k === 'Escape') { closeMenu(); e.preventDefault(); } return; }
   // A tab is chosen with Enter or Space, as a button is; its close button keeps its own keys.
@@ -2846,7 +2964,9 @@ async function act(el) {
     case 'full': if (S.ui.side) await go(S.ui.side); return;
     case 'close-side': if (S.ui.side) await go(S.ui.side, 'beside'); return;
     case 'close-file': closeFile(); return;
-    case 'new-project': showNewProject(true); return;
+    case 'new-project': await openProjectSheet(); return;
+    case 'np-choose': await chooseProjectFolder(); return;
+    case 'np-in': np.in = v; renderProjectSheet(); return;
     case 'new-swarm': await openSwarmSheet(leadProject(who)); return;
     case 'close-sheet': closeSheet(); return;
     case 'mix-add': mixAdd(); return;
@@ -2873,9 +2993,10 @@ async function act(el) {
     case 'setup-remove': { const st = setupState(); if (anyActive() && st.confirm !== v) { st.confirm = v; renderSetup(); return; } st.confirm = null; await removeProvider(v); return; }
     case 'setup-retry': case 'setup-refresh': await refreshModels(); return;
     case 'edit-role': await editRole(v); return;
-    case 'schedules-first': await readSchedules(); renderSetup(); return;
-    case 'schedules-next': await readSchedules(setupState().schedulesNext); renderSetup(); return;
-    case 'schedule-remove': await removeSchedule(v); return;
+    case 'triggers-first': await readTriggers(); renderSetup(); return;
+    case 'triggers-next': await readTriggers(setupState().triggersNext); renderSetup(); return;
+    case 'trigger-fire': await triggerAct('fire', v); return;
+    case 'trigger-remove': await triggerAct('remove', v); return;
     case 'open-host': await Daemon.openHost(v); return;
     default: return;
   }

@@ -5,7 +5,7 @@ description: Set up or run a recurring job (a daily brief, a watcher, a digest) 
 
 # Recurring jobs
 
-A recurring job is one agent woken by a schedule with the same message each
+A recurring job is one agent woken by a trigger with the same message each
 time. Each wake is a new turn in its own conversation. Over many runs that
 conversation is compacted, and a summary is not exact about ids and times, so
 the job keeps its state in files in its folder and reads them each run.
@@ -13,12 +13,12 @@ the job keeps its state in files in its folder and reads them each run.
 ## Setting one up
 
 Give the job its own agent and folder, created with `--agents` so it reads
-the folder's rules and skills, then schedule it. Schedules need the
+the folder's rules and skills, then add a trigger for it. Triggers need the
 app on macOS, where launchd keeps the time; elsewhere `add` refuses with
-`schedules_unsupported`, so say so rather than presenting a job as set up.
+`triggers_unsupported`, so say so rather than presenting a job as set up.
 
 ```
-"$HOME/.agent/schedule" add --bot NAME --cron 'MIN HOUR DAY MONTH WEEKDAY' -- MESSAGE
+"$HOME/.agent/trigger" add --bot NAME --cron 'MIN HOUR DAY MONTH WEEKDAY' -- MESSAGE
 ```
 
 MESSAGE names the folder and says to read and follow this file by its
@@ -69,7 +69,7 @@ time, so anything there when a run starts was left by a run cut off before
 its `mv`; empty it first.
 
 Agent cannot give one job its own credentials: every agent's shell sees
-the daemon's environment and your files, and a schedule passes only `HOME`
+the daemon's environment and your files, and a trigger passes only `HOME`
 and `SHELL`. So wherever the job only reads, use credentials that can only
 read, such as a read-only token, knowing other agents can use them too.
 Leaving write tools out of its list does not make it read-only either: its
