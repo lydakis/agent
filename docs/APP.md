@@ -1524,7 +1524,7 @@ executable with `--memory` ([memory.rs](../app/src-tauri/src/memory.rs)):
 ~/.agent/memory index [SCOPE]
 ~/.agent/memory check [SCOPE]
 ~/.agent/memory changed | cleanup start | cleanup finish
-~/.agent/memory schedule --model PROVIDER/MODEL [--effort LEVEL] [--cron 'MIN HOUR DAY MONTH WEEKDAY']
+~/.agent/memory schedule [--model PROVIDER/MODEL [--effort LEVEL]] [--cron 'MIN HOUR DAY MONTH WEEKDAY']
   SCOPE: --user | --project NAME; none: the project of this folder
 ```
 
@@ -1577,7 +1577,11 @@ saved or removed costs no turn. Each turn is capped at 1,000,000 tokens:
 the agent keeps one conversation, as every `--start` agent does, so each
 call carries earlier nights up to where compaction summarizes them.
 Nothing is scheduled until the person runs `schedule`, since the app has no
-default model to run it on. The `memory-cleanup` skill
+default model to run it on. To move the time, `~/.agent/trigger rm
+memory-cleanup` and `schedule` again without `--model`: that keeps the
+agent it started, with its model and history. With `--model`, while that
+agent exists, `schedule` is `bot_exists`, since an agent keeps its model
+for life. The `memory-cleanup` skill
 ([SKILL.md](../app/skills/memory-cleanup/SKILL.md)) merges duplicates,
 drops superseded facts and dates relative ones, with `save` and `rm` only,
 and never removes a fact for its age alone.

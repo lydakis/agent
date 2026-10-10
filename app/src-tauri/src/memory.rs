@@ -28,7 +28,7 @@ const LIMIT: usize = 4096;
 const MAX_ENTRIES: usize = 1024;
 const INDEX: &str = "MEMORY.md";
 const TYPES: [&str; 4] = ["user", "feedback", "project", "reference"];
-const USAGE: &str = "usage: memory show [SCOPE]\n       memory save NAME --type user|feedback|project|reference --description TEXT --source TEXT [SCOPE] -- TEXT|-\n       memory rm NAME [SCOPE]\n       memory index [SCOPE]\n       memory check [SCOPE]\n       memory changed | cleanup start | cleanup finish\n       memory schedule --model PROVIDER/MODEL [--effort LEVEL] [--cron 'MIN HOUR DAY MONTH WEEKDAY']\n         SCOPE: --user | --project NAME; none: the project of this folder";
+const USAGE: &str = "usage: memory show [SCOPE]\n       memory save NAME --type user|feedback|project|reference --description TEXT --source TEXT [SCOPE] -- TEXT|-\n       memory rm NAME [SCOPE]\n       memory index [SCOPE]\n       memory check [SCOPE]\n       memory changed | cleanup start | cleanup finish\n       memory schedule [--model PROVIDER/MODEL [--effort LEVEL]] [--cron 'MIN HOUR DAY MONTH WEEKDAY']\n         --model starts the memory-cleanup agent; without it, the existing one\n         SCOPE: --user | --project NAME; none: the project of this folder";
 
 /// `APP --memory show|save|rm|index|check|changed|cleanup|schedule`, from
 /// `~/.agent/memory`.
@@ -518,6 +518,12 @@ fn git(root: &Path, args: &[&str]) -> Result<String, String> {
             "core.autocrlf=false",
             "-c",
             "core.eol=lf",
+            // Nor their ignore or attribute rules: every fact is kept, byte
+            // for byte.
+            "-c",
+            "core.excludesFile=/dev/null",
+            "-c",
+            "core.attributesFile=/dev/null",
         ])
         .args(args)
         .stdin(std::process::Stdio::null())
@@ -740,20 +746,24 @@ fn schedule_args(script: &Path, args: &[String]) -> Result<Vec<String>, String> 
         }
         *slot = Some(it.next().ok_or_else(usage)?.clone());
     }
-    let model = model.ok_or_else(usage)?;
     let quote = format!("'{}'", script.to_string_lossy().replace('\'', r"'\''"));
     let mut add = vec![
         "--name".into(),
         "memory-cleanup".into(),
         "--cron".into(),
         cron.unwrap_or_else(|| "30 3 * * *".into()),
-        "--start".into(),
-        "memory-cleanup".into(),
-        "--model".into(),
-        model,
     ];
-    if let Some(effort) = effort {
-        add.extend(["--effort".into(), effort]);
+    // A first schedule starts the agent; scheduling again, say at another
+    // time, keeps the one it started, its model and its history.
+    match (model, effort) {
+        (Some(model), effort) => {
+            add.extend(["--start".into(), AGENT.into(), "--model".into(), model]);
+            if let Some(effort) = effort {
+                add.extend(["--effort".into(), effort]);
+            }
+        }
+        (None, None) => add.extend(["--bot".into(), AGENT.into()]),
+        (None, Some(_)) => return Err(usage()),
     }
     add.extend([
         "--if".into(),
@@ -766,6 +776,8 @@ fn schedule_args(script: &Path, args: &[String]) -> Result<Vec<String>, String> 
     Ok(add)
 }
 
+const AGENT: &str = "memory-cleanup";
+
 fn schedule(home: &Path, args: &[String]) -> Result<Value, String> {
     let add = schedule_args(&home.join(".agent/memory"), args)?;
     // The agent the trigger starts works in the memory folder.
@@ -773,7 +785,15 @@ fn schedule(home: &Path, args: &[String]) -> Result<Value, String> {
     repo(&root)?;
     std::env::set_current_dir(&root)
         .map_err(|e| format!("memory_failed: {}: {e}", root.display()))?;
-    crate::trigger::add_here(&add)
+    crate::trigger::add_here(&add).map_err(|error| match error.split_once(':') {
+        Some(("bot_exists", _)) => format!(
+            "bot_exists: {AGENT} is an agent already: schedule without --model to keep it, or remove it with agent rm --bot {AGENT} to start it on another model"
+        ),
+        Some(("bot_not_found", _)) if !add.iter().any(|a| a == "--start") => format!(
+            "bot_not_found: there is no {AGENT} agent yet: schedule with --model to start one"
+        ),
+        _ => error,
+    })
 }
 
 /// `~/.agent/memory`, written again whenever the app starts from
@@ -1273,7 +1293,7 @@ mod tests {
     }
 
     #[test]
-    fn the_schedule_is_a_gated_capped_trigger_that_starts_its_own_agent() {
+    fn the_schedule_is_a_gated_capped_trigger_that_starts_or_keeps_its_own_agent() {
         let script = Path::new("/Users/g/.agent/memory");
         let line = |rest: &[&str]| schedule_args(script, &args(rest));
         let add = line(&["--model", "openai/mini"]).unwrap();
@@ -1299,9 +1319,12 @@ mod tests {
         let add = line(&["--model", "m", "--effort", "low", "--cron", "0 4 * * *"]).unwrap();
         assert_eq!(add[3], "0 4 * * *");
         assert_eq!(add[8..10], args(&["--effort", "low"]));
+        // Without a model, the agent it started before.
+        let again = line(&["--cron", "0 5 * * *"]).unwrap();
+        assert_eq!(again[3..6], args(&["0 5 * * *", "--bot", "memory-cleanup"]));
+        assert_eq!(line(&[]).unwrap()[4..6], args(&["--bot", "memory-cleanup"]));
         for bad in [
-            &[][..],
-            &["--effort", "low"],
+            &["--effort", "low"][..],
             &["--model"],
             &["--model", "m", "--model", "n"],
             &["--every", "1d"],
