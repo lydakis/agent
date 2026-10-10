@@ -19,7 +19,8 @@ window.Daemon = (() => {
       restartDaemon: () => invoke('restart_daemon'),
       discoverModels: () => invoke('discover_models'),
       project: (dir) => invoke('project', { dir }),
-      writeProject: ({ dir, name, model, reasoning = null }) => invoke('write_project', { dir, name, model, reasoning }),
+      writeProject: ({ dir, name, model, reasoning = null, threads = null }) => invoke('write_project', { dir, name, model, reasoning, threadsModel: threads?.model ?? null, threadsReasoning: threads?.reasoning ?? null, threadsInProject: !!threads?.inProject }),
+      chooseFolder: (start = null) => invoke('choose_folder', { start }),
       branch: (dir) => invoke('branch', { dir }),
       readFile: (path) => invoke('read_file', { path }),
       attach: (after) => invoke('attach', { after }),
@@ -435,6 +436,7 @@ window.Daemon = (() => {
     policy: async () => ({ instructions: 'demo', compaction_instructions: 'demo summary policy', note: 'demo policy' }),
     project: async (dir) => { const name = String(dir).split('/').filter(Boolean).pop()?.replace(/[^A-Za-z0-9_-]+/g, '-') || 'project'; return { dir, name, coordinator: `${name}.lead`, model: null, file: false }; },
     writeProject: async () => {},
+    chooseFolder: async () => '/Users/you/Developer/weather',
     // A coordinator puts a task that edits in `~/.agent/worktrees/NAME` on branch agent/NAME.
     // The demo's files, by their path under any agent's folder.
     readFile: async (path) => {

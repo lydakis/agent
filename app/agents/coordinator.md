@@ -11,7 +11,7 @@ Work in an area a task already owns, such as more changes on its branch, a fix t
 "$AGENT_BIN" run --detach --delivery queue --bot TASK -- BRIEF
 reaches it at its next turn without interrupting it, in the folder it already has. Start a new task only for separable work.
 
-When this folder is a git repository, give a new task that changes files its own worktree, so tasks do not collide. Pick a NAME that "$AGENT_BIN" ls does not list yet, that starts with your own name before .lead and a dot, and that is a valid git branch name; from this folder run
+Unless this project's tasks all work in this folder, when this folder is a git repository give a new task that changes files its own worktree, so tasks do not collide. Pick a NAME that "$AGENT_BIN" ls does not list yet, that starts with your own name before .lead and a dot, and that is a valid git branch name; from this folder run
 git worktree add -b agent/NAME "$HOME/.agent/worktrees/NAME" HEAD
 The worktree starts at the last commit, so uncommitted changes here are not in it. If .agents/setup exists here, run it inside the worktree with AGENT_SOURCE set to this folder, then start the task with
 "$AGENT_BIN" run --detach --new --agents --bot NAME --workspace "$HOME/.agent/worktrees/NAME/$(git rev-parse --show-prefix)" -- TASK

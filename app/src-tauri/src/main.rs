@@ -553,6 +553,7 @@ fn project(
 
 /// Write a new project's `.agents/project.toml`; an existing one is kept.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn write_project(
     windows: State<'_, Windows>,
     window: tauri::WebviewWindow,
@@ -560,6 +561,9 @@ fn write_project(
     name: String,
     model: String,
     reasoning: Option<String>,
+    threads_model: Option<String>,
+    threads_reasoning: Option<String>,
+    threads_in_project: bool,
 ) -> Result<(), String> {
     windows
         .of(&window)?
@@ -569,7 +573,34 @@ fn write_project(
         &name,
         &model,
         reasoning.as_deref(),
+        &project::Threads {
+            model: threads_model.as_deref(),
+            reasoning: threads_reasoning.as_deref(),
+            in_project: threads_in_project,
+        },
     )
+}
+
+/// The system's folder picker, which can also make a new folder, over the
+/// window it was asked from: the folder chosen, or none when cancelled.
+#[tauri::command]
+async fn choose_folder(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    start: Option<String>,
+) -> Result<Option<String>, String> {
+    windows.of(&window)?.here("The folder picker")?;
+    let mut dialog = rfd::AsyncFileDialog::new()
+        .set_title("Choose the project's folder")
+        .set_can_create_directories(true)
+        .set_parent(&window);
+    if let Some(start) = start.filter(|s| std::path::Path::new(s).is_dir()) {
+        dialog = dialog.set_directory(start);
+    }
+    Ok(dialog
+        .pick_folder()
+        .await
+        .map(|folder| folder.path().to_string_lossy().into_owned()))
 }
 
 /// The models to offer, read from `~/.agent/models` each time, so an edit
@@ -1391,6 +1422,7 @@ fn main() {
             models,
             project,
             write_project,
+            choose_folder,
             settings,
             save_settings,
             restart_daemon,
