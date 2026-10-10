@@ -51,16 +51,16 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "ls",
         about: "List the bots",
-        usage: "ls [OPTIONS]",
-        flags: "--pretty",
+        usage: "ls [--name GLOB] [--active] [--limit N]",
+        flags: "--name --active --limit --pretty",
         settings: "",
         startup: false,
     },
     Command {
         name: "turns",
         about: "A bot's turns and how each ended",
-        usage: "turns --bot NAME [--after TURN]",
-        flags: "--bot --after --pretty --no-spawn",
+        usage: "turns --bot NAME [--after TURN] [--newest] [--limit N]",
+        flags: "--bot --after --newest --limit --pretty --no-spawn",
         settings: "",
         startup: true,
     },
@@ -91,8 +91,8 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "approvals",
         about: "Tool calls waiting for a verdict",
-        usage: "approvals [--bot NAME] [--tag TAG] [--full]",
-        flags: "--bot --tag --full --pretty --no-spawn",
+        usage: "approvals [--bot NAME] [--tag TAG] [--full] [--limit N]",
+        flags: "--bot --tag --full --limit --pretty --no-spawn",
         settings: "",
         startup: true,
     },
@@ -341,6 +341,13 @@ fn print_flags(flags: &str) {
             ),
             "--call" => ("ID", "The tool call to answer"),
             "--full" => ("", "Every call's whole arguments, not their preview"),
+            "--name" => (
+                "GLOB",
+                "Only bots whose name matches, as SQLite GLOB: * any run, ? one byte, [..] a set",
+            ),
+            "--active" => ("", "Only bots with a turn running"),
+            "--newest" => ("", "Newest first, read from the end"),
+            "--limit" => ("N", "List at most N"),
             "--request" => ("N", "The request number the call was announced with"),
             "--tag" => (
                 "TAG",
@@ -495,6 +502,8 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                 | "--all"
                 | "--any"
                 | "--full"
+                | "--active"
+                | "--newest"
                 | "--no-compaction"
                 | "--agents"
                 | "--fallbacks"
@@ -525,6 +534,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                 "--context-bytes"
                     | "--context-items"
                     | "--keep-turns"
+                    | "--limit"
                     | "--max-output-tokens"
                     | "--budget-tokens"
                     | "--turn-budget-tokens"

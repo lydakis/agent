@@ -75,8 +75,8 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   `--agents` composes the shared client policy instead: the harness preamble,
   every AGENTS.md and `.agents/AGENTS.md` from the workspace up to the root
   plus `~/.agents/AGENTS.md`, and indexes of the skills in
-  `.agents/skills/NAME/SKILL.md` and the profiles in `.agents/agents/ROLE.md`
-  ([CLIENT.md](CLIENT.md)). It is
+  `.agents/skills/NAME/SKILL.md` and the profiles in `.agents/agents/ROLE.md`,
+  and the memory indexes in `~/.agents/memory` ([CLIENT.md](CLIENT.md)). It is
   opt-in on the CLI, the default in the app, and exclusive with
   `--instructions`. `--profile ROLE` composes the same text with that role
   last, and takes the role's `model` and `tools` unless `--model` or
@@ -132,6 +132,12 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   wait live for a verdict before the turn parks (default `2s`; `0` parks at
   once). `--after` is an exclusive event cursor for `follow` and an exclusive
   turn ID for `turns`. `--checkpoint` is a history node ID.
+- Listings read only what they print. `--limit N` stops `ls`, `turns` and
+  `approvals` after N entries. `ls --name GLOB` keeps the bots whose name
+  matches (`'project.*'`, `'*.lead'`; SQLite GLOB, case-sensitive) and
+  `ls --active` those with a turn running; the daemon filters, so neither
+  pages through every bot. `turns --newest` lists newest first, read from the
+  end, so `turns --bot NAME --newest --limit 3` is a bot's last three turns.
 - `--keep-turns N` means the same on `prune` and `run`: keep the newest N
   turns' records. `prune` applies it once; on `run --new` it is the bot's
   setting, applied after each of its turns.

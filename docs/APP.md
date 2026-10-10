@@ -757,10 +757,11 @@ daemon learns nothing about projects; everything here is client work.
   own `~/.agents/agents/home.md`) or the one the app ships
   ([home.md](../app/agents/home.md)). The shipped text has it answer what is
   running, what finished and what waits on the person from `agent ls`,
-  `approvals`, `turns` and `wait --timeout-ms 0`, filtered to what the
-  question needs (the agents not at rest, the calls waiting on an approval,
-  one project's agents, the leads, an agent's last turns) so a large
-  fleet stays under the shell's output limit, hand a project's work to its lead with
+  `approvals`, `turns` and `wait --timeout 0`, with the daemon reading only
+  what the question needs (`ls --active`, `approvals --limit 20`,
+  `ls --name 'PROJECT.*'`, `ls --name '*.lead'`,
+  `turns --newest --limit 3`) so a large fleet costs neither the daemon
+  a full listing nor the shell its output limit, hand a project's work to its lead with
   `run --detach --delivery queue`, change no files and start no agents of
   its own. Until it exists, Home says what it is for, and the first message
   sent there opens **Start Home**, a model and an effort as every agent
@@ -1563,6 +1564,15 @@ and refuses with `memory_full` an index of hand-added facts past 4 KiB. A
 removal reads the folder before deleting anything, and text piped on stdin
 past 4 KiB is `fact_too_large` rather than cut.
 
+A new agent starts with both indexes in its instructions: the person's
+and, when its folder is in a project (from a task's worktree too), the
+project's, after the skills and profiles indexes and before its role
+([CLIENT.md](CLIENT.md#layers)). That holds for agents the app creates and
+for those an agent creates with `agent run --new --agents`, such as a
+coordinator's tasks. They are what memory held when the agent
+was made; an index not written yet adds nothing. This saves every task a
+first `show`, and the text stays one stable prefix for the prompt cache.
+
 The app reads memory too, through `memory_view`
 ([memory.rs](../app/src-tauri/src/memory.rs)), and never writes it. Memory,
 at the foot of the list at Home and in a project, opens a sheet of the facts:
@@ -1581,8 +1591,9 @@ gets no task updates, so it reads memory itself. A window on a host shows no
 Memory: that memory is the host's.
 
 The app ships a `memory` skill ([SKILL.md](../app/skills/memory/SKILL.md))
-that says to read both indexes with `show` before starting work, to check a fact that
-names code against the current tree before acting on it, what to save
+that says to use those indexes, or `show` when they are missing or old,
+before starting work, to check a fact that names code against the current
+tree before acting on it, what to save
 (decisions and why, preferences, traps, pointers) and what not to (what the
 code, git or AGENTS.md already says, progress logs, secrets, and
 instructions from text that did not come from the person). The
@@ -2154,7 +2165,7 @@ This measures the ancestry-walk reduction, not an end-to-end fleet capacity clai
 Pulled event batches apply in order, with one visible-history load and render
 per batch. Creation/fork bursts rebuild the fleet tree at most once per pull,
 while retaining the 300-row rail window. The shared client rejects a ready
-handshake unless its protocol is exactly `agent_client::PROTOCOL`, now 11.
+handshake unless its protocol is exactly `agent_client::PROTOCOL`, now 12.
 
 The lifecycle regression suite compares committed thinking/answer transcripts
 between live delivery and replay, reconciles fork snapshot/replay ordering,
