@@ -36,7 +36,7 @@ function page(daemon = {}, storage = null) {
   context.Rich = context.window.Rich;
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, openFileFrom, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, fork, remove, createProject, save, restore, showMenu, refreshMenu, entries, pickerRows, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readTriggers, tellLead, markSeen, renderFile, go, upOf, crumbsHTML, railRows, renderTabs, triggerAct, turnNews, openProjectSheet };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, openFileFrom, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, fork, remove, createProject, save, restore, showMenu, refreshMenu, entries, pickerRows, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readTriggers, tellLead, markSeen, renderFile, go, upOf, crumbsHTML, railRows, renderTabs, triggerAct, turnNews, openProjectSheet, parsePlan, loadPlans, renderPlan, taskCard };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -3493,4 +3493,77 @@ test('a swarm row shows done while one of its agents has an unseen result, until
   assert.equal(row(), 'done');
   p.S.selected = '⁂app.latency'; p.markSeen();
   assert.equal(row(), 'idle');
+});
+
+test('a plan is its marked lines: what it has done, the step it is on, and the rest', () => {
+  const p = page();
+  const plan = p.parsePlan('[x] Read it\n[>] Write it\nnot a step\n[ ] \n[ ] Ship it\n');
+  assert.deepEqual(JSON.parse(JSON.stringify(plan.steps)), [{ s: 'done', t: 'Read it' }, { s: 'now', t: 'Write it' }, { s: 'todo', t: 'Ship it' }]);
+  assert.equal(plan.done, 1); assert.equal(plan.at.t, 'Write it');
+  // With no step under way, the next one to do is where it is; with all done, nowhere.
+  assert.equal(p.parsePlan('[x] Read it\n[ ] Ship it').at.t, 'Ship it');
+  assert.equal(p.parsePlan('[x] Read it').at, null);
+  assert.equal(p.parsePlan('no plan yet\n'), null);
+});
+
+test("plans are read at once, then an agent's again when it runs the plan script, and shown on its row, card and chat", async () => {
+  const files = new Map([[2, '[x] Read it\n[>] Write <b>it</b>\n[ ] Ship it\n']]), asked = [];
+  const p = page({ plans: async (ids) => { asked.push(ids); return Object.fromEntries((ids ?? [...files.keys()]).map((id) => [id, files.get(id) ?? null])); } });
+  p.S.config = { workspace: '/synthetic' }; p.S.session = 1;
+  p.upsert({ name: 'app.lead', id: 1 });
+  p.upsert({ name: 'app.build', id: 2, created_by: 'app.lead', created_by_id: 1 });
+  await p.loadPlans();
+  assert.deepEqual(asked, [null]);
+  const row = () => p.botRowHTML({ b: p.S.bots.get('app.build'), depth: 1, kids: 0 });
+  assert.match(row(), /<span class="step"> · Write &lt;b&gt;it&lt;\/b&gt;<\/span><\/span><span class="meta" title="steps done">1\/3<\/span>/);
+  assert.equal(p.taskCard('app.build').last, '✱ Write <b>it</b>');
+  assert.equal(p.taskCard('app.build').elapsed, '1/3');
+  assert.doesNotMatch(p.botRowHTML({ b: p.S.bots.get('app.lead'), depth: 0, kids: 1 }), /steps done/);
+  const el = p.context.document.getElementById('plan');
+  p.renderPlan(el, p.S.bots.get('app.build'));
+  assert.equal(el.hidden, false);
+  assert.match(el.innerHTML, /data-act="plan-fold"[^>]*>1\/3<\/button><div class="pstep done"><span class="pm">✓<\/span>Read it<\/div><div class="pstep now"><span class="pm">✱<\/span>Write &lt;b&gt;it&lt;\/b&gt;<\/div><div class="pstep todo"><span class="pm">○<\/span>Ship it<\/div>$/);
+  p.S.ui.planFolded = true; p.renderPlan(el, p.S.bots.get('app.build'));
+  assert.equal((el.innerHTML.match(/pstep/g) ?? []).length, 1);
+  // Another shell call reads nothing; the script's call reads that agent's plan alone, once it ends.
+  p.S.live = true;
+  const shell = async (id, command) => {
+    await p.onEvent({ event: 'tool_started', bot: 'app.build', turn: 1, data: { call_id: id, name: 'shell', arguments: JSON.stringify({ command }) } });
+    await p.onEvent({ event: 'tool_completed', bot: 'app.build', turn: 1, data: { call_id: id } });
+    await settle();
+  };
+  await shell('c1', 'cargo test');
+  assert.equal(asked.length, 1);
+  files.set(2, '[x] Read it\n[x] Write it\n[>] Ship it\n');
+  await shell('c2', `sh "$HOME/.agents/skills/plan/plan" '[x] Read it' '[x] Write it' '[>] Ship it'`);
+  assert.deepEqual(JSON.parse(JSON.stringify(asked.at(-1))), [2]);
+  assert.equal(p.taskCard('app.build').last, '✱ Ship it');
+  assert.equal(p.taskCard('app.build').elapsed, '2/3');
+  // A plan the agent no longer has is no longer shown.
+  files.delete(2);
+  await shell('c3', `sh "$HOME/.agents/skills/plan/plan"`);
+  assert.equal(p.taskCard('app.build').elapsed, '');
+  p.renderPlan(el, p.S.bots.get('app.build'));
+  assert.equal(el.hidden, true);
+});
+
+test("a deleted agent's plan goes with it, and a window that cannot read plans stops asking", async () => {
+  const forgot = [];
+  let calls = 0;
+  const p = page({ plans: async () => { calls += 1; return { 4: '[>] Watch it\n' }; }, forgetPlan: async (id) => { forgot.push(id); } });
+  p.S.config = { workspace: '/synthetic' }; p.S.session = 1; p.S.live = true;
+  p.upsert({ name: 'Cy', id: 4 });
+  await p.loadPlans();
+  assert.equal(p.taskCard('Cy').elapsed, '0/1');
+  await p.onEvent({ event: 'deleted', bot: 'Cy', data: {} });
+  assert.deepEqual(forgot, [4]);
+  assert.equal(p.S.plans.has(4), false);
+  const off = page({ plans: async () => { calls += 1; throw new Error('plans_unsupported: opened on a socket'); } });
+  off.S.config = { workspace: '/synthetic' }; off.S.session = 1;
+  await off.loadPlans(); await off.loadPlans([1]);
+  assert.equal(calls, 2);
+  // A window on a host asks nothing.
+  const remote = page({ plans: async () => { calls += 1; return {}; } });
+  remote.S.config = { host: 'box' }; await remote.loadPlans();
+  assert.equal(calls, 2);
 });

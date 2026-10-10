@@ -15,6 +15,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod daemon;
+mod plan;
 mod project;
 mod remote;
 mod session;
@@ -1296,6 +1297,43 @@ fn trigger_fire(
     trigger::fire_now(&triggers_of(&*windows.of(&window)?)?, &name)
 }
 
+/// The folder of plans beside the store this window's daemon runs, where
+/// its agents' `plan` script writes (see `plan`).
+fn plans_of(state: &Shared) -> Result<PathBuf, String> {
+    match &state.config.target {
+        Target::Host(host) => Err(format!(
+            "remote_unsupported: plans are read from this machine's files, and this window's agents run on {}",
+            host.alias
+        )),
+        Target::Local { store: Some(store), .. } => plan::dir(store),
+        Target::Local { store: None, .. } => Err(
+            "plans_unsupported: this window was opened on a socket, so the store its agents' plans sit beside is unknown; open it with --store".into(),
+        ),
+    }
+}
+
+/// The agents' plans by bot id: every one, or `ids`' (null for one with none).
+#[tauri::command]
+async fn plans(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    ids: Option<Vec<i64>>,
+) -> Result<Value, String> {
+    let dir = plans_of(&*windows.of(&window)?)?;
+    blocking(move || plan::read(&dir, ids.as_deref())).await
+}
+
+/// Remove a deleted agent's plan.
+#[tauri::command]
+async fn plan_forget(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    id: i64,
+) -> Result<(), String> {
+    let dir = plans_of(&*windows.of(&window)?)?;
+    blocking(move || plan::forget(&dir, id)).await
+}
+
 /// Page diagnostics land on stderr, where a terminal can see them.
 #[tauri::command]
 fn log(message: String) {
@@ -1442,6 +1480,8 @@ fn main() {
             swarm_decide,
             triggers,
             trigger_fire,
+            plans,
+            plan_forget,
             trigger_remove
         ])
         .setup(move |app| {

@@ -62,6 +62,16 @@ button:focus-visible,[tabindex]:focus-visible{outline:1px solid var(--amber);out
 .crumbs .back:hover{background:var(--t-raised);color:var(--t-ink)}
 .crumbs .glyph,.crumbs .sep{flex-shrink:0}
 .tools{display:flex;gap:2px;align-items:center;flex-shrink:0}
+/* An agent's plan, above its chat: done steps faint, the current one marked. Long plans scroll. */
+.plan{flex-shrink:0;max-height:30%;overflow:auto;padding:5px 12px;border-bottom:1px solid var(--t-line);background:var(--t-panel);line-height:19px}
+.plan[hidden]{display:none}
+.main .plan{padding-inline:max(12px,calc(50% - 42ch))}
+.plan .pcount{float:right;color:var(--t-faint);border-radius:5px;padding:0 6px;margin-right:-6px;font-variant-numeric:tabular-nums}
+.plan .pcount:hover{background:var(--t-raised);color:var(--t-ink)}
+.pstep{color:var(--t-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pstep .pm{display:inline-block;width:2ch}
+.pstep.done{color:var(--t-faint)}.pstep.done .pm{color:var(--run)}
+.pstep.now{color:var(--t-ink)}.pstep.now .pm{color:var(--amber)}
 .line{white-space:pre-wrap;word-break:break-word}
 .line.user{color:var(--user);margin-top:12px}
 .line.user:first-child{margin-top:0}
@@ -178,6 +188,7 @@ button:focus-visible,[tabindex]:focus-visible{outline:1px solid var(--amber);out
 .botrow:hover .acts,.botrow:focus-within .acts{display:flex}
 .botrow .acts .ibtn{height:20px;min-width:20px;padding:0 4px}
 .botrow .meta{color:var(--t-faint);font-size:12px}
+.botrow .step{color:var(--t-faint)}
 .sblabel{padding:12px 12px 2px;color:var(--t-faint);font-size:12px}
 .newproj{display:flex;align-items:center;gap:1ch;margin:4px 8px 8px;height:28px;padding:0 8px;border-radius:6px;color:var(--t-dim);text-align:left}
 button.newproj:hover{background:var(--t-raised);color:var(--t-ink)}

@@ -34,6 +34,8 @@ window.Daemon = (() => {
       triggers: (after = null) => invoke('triggers', { after }),
       fireTrigger: (name) => invoke('trigger_fire', { name }),
       removeTrigger: (name) => invoke('trigger_remove', { name }),
+      plans: (ids = null) => invoke('plans', { ids }),
+      forgetPlan: (id) => invoke('plan_forget', { id }),
       hosts: () => invoke('hosts'),
       openHost: (host) => invoke('open_host', { host }),
       swarmStart: ({ project, folder, goal, shared, mix, agents, budgetTokens, council }) => invoke('swarm_start', { project, folder, goal, shared, mix, agents, budgetTokens, council: council ?? 0 }),
@@ -276,12 +278,22 @@ window.Daemon = (() => {
     await stream(name, turn, 'All of it landed. Plan matches the diff, tests are green with one harmless warning, release build finished. Ready for review: two files, 41 lines.');
     finish(name, turn);
   }
+  // A task keeps its plan with the plan skill's script; the page reads it back by bot id.
+  async function plan(name, turn, ...steps) {
+    const b = S.bots.get(name); if (!b || b.interrupted) return;
+    const text = steps.join('\n') + '\n';
+    (S.plans ??= new Map()).set(b.id, text);
+    await tool(name, turn, 'shell', { command: `sh "$HOME/.agents/skills/plan/plan" ${steps.map((x) => `'${x}'`).join(' ')}` }, JSON.stringify({ exit_code: 0, stderr: '', stdout: text, success: true }), 200);
+  }
   async function work(n, turn, text) {
     await wait(300);
     if (n === 'demo.plan') { await tool(n, turn, 'read', { path: 'src/auth/' }, 'session.rs refresh.rs cookie.rs · 612 lines', 500); await tool(n, turn, 'write', { path: 'PLAN.md' }, '1.2 KiB', 600); }
     if (n === 'demo.build') {
+      await plan(n, turn, '[>] Make rotate() pure', '[ ] Write the cookie once, after the commit', '[ ] Check that it builds', '[ ] Get a review');
       await tool(n, turn, 'edit', { path: 'src/auth/session.rs' }, '+23 −8', 900);
+      await plan(n, turn, '[x] Make rotate() pure', '[x] Write the cookie once, after the commit', '[>] Check that it builds', '[ ] Get a review');
       await tool(n, turn, 'shell', { command: 'cargo check -p auth' }, JSON.stringify({ exit_code: 0, stderr: '', stdout: 'Finished dev profile in 2.1s\n', success: true }), 1100);
+      await plan(n, turn, '[x] Make rotate() pure', '[x] Write the cookie once, after the commit', '[x] Check that it builds', '[>] Get a review');
       // build asks a peer of its own to review, and waits on it: depth two.
       if ((S.bots.get(n) ?? GONE).interrupted) return;
       const cmd = `"$AGENT_BIN" run --new --bot demo.review --model "$AGENT_MODEL" --detach 'Review the auth diff for regressions.'`;
@@ -304,6 +316,7 @@ window.Daemon = (() => {
       emit({ event: 'turn_resumed', bot: n, turn, data: { call_id: wid } });
       emit({ event: 'tool_completed', bot: n, turn, data: { call_id: wid, node: node({ type: 'function_call_output', call_id: wid, output: JSON.stringify({ pending: [], results: { [`turn:demo.review/${rt}`]: { status: 'completed', text: 'Diff is sound.' } } }) }), artifacts: [] } });
       await steerIn(n, turn);
+      await plan(n, turn, '[x] Make rotate() pure', '[x] Write the cookie once, after the commit', '[x] Check that it builds', '[x] Get a review');
     }
     if (n === 'demo.test') { await tool(n, turn, 'shell', { command: 'cargo test -p auth' }, JSON.stringify({ exit_code: 0, stderr: '', stdout: 'test result: ok. 34 passed; 0 failed\n', success: true }), 1600); }
     await stream(n, turn, text, 50);
@@ -459,6 +472,8 @@ window.Daemon = (() => {
     ]).map((x) => ({ ...x })), next_after: null }),
     fireTrigger: async (name) => { const x = (S.triggers ?? []).find((t) => t.name === name); if (x) { x.last = { outcome: 'sent', turn: 1, fired_ms: Date.now() }; x.sent = (x.sent ?? 0) + 1; } return { name, fired: true }; },
     removeTrigger: async (name) => { S.triggers = (S.triggers ?? []).filter((x) => x.name !== name); },
+    plans: async (ids = null) => Object.fromEntries((ids ?? [...(S.plans ?? new Map()).keys()]).map((id) => [id, S.plans?.get(id) ?? null])),
+    forgetPlan: async (id) => { S.plans?.delete(id); },
     profiles: async () => [{ name: 'reviewer', summary: 'Reviews changes and reports bugs only', model: 'anthropic/claude-sonnet-5' }, { name: 'tester', summary: 'Keeps the test suite green', model: null }],
     // Named from the goal's longest word and dealt as the app's side does it.
     swarmStart: async ({ project, folder, goal, shared, mix, agents, budgetTokens, council = 0 }) => {

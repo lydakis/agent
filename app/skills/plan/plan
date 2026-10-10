@@ -1,0 +1,40 @@
+#!/bin/sh
+# Keep this agent's plan where the app shows it: beside the daemon's store,
+# under the agent's bot id, replaced whole on each call. Each step is one
+# argument starting with [x] (done), [>] (doing now) or [ ] (to do). With no
+# arguments it prints the plan as it stands.
+set -eu
+if [ -z "${AGENT_STORE:-}" ] || [ -z "${AGENT_BOT_ID:-}" ]; then
+  echo "plan: run it in an agent's shell (AGENT_STORE and AGENT_BOT_ID are not set)" >&2
+  exit 2
+fi
+dir="$AGENT_STORE-plans"
+file="$dir/$AGENT_BOT_ID"
+if [ "$#" -eq 0 ]; then
+  if [ -f "$file" ]; then cat "$file"; else echo "no plan yet"; fi
+  exit 0
+fi
+if [ "$#" -gt 30 ]; then
+  echo "plan: at most 30 steps; group the small ones" >&2
+  exit 2
+fi
+nl='
+'
+for step in "$@"; do
+  case "$step" in
+    *"$nl"*) echo "plan: one line per step: $step" >&2; exit 2 ;;
+    '[x] '?* | '[>] '?* | '[ ] '?*) ;;
+    *) echo "plan: start each step with [x] , [>]  or [ ] : $step" >&2; exit 2 ;;
+  esac
+  if [ "${#step}" -gt 200 ]; then
+    echo "plan: a step is at most 200 bytes: $step" >&2
+    exit 2
+  fi
+done
+mkdir -p "$dir"
+tmp=$(mktemp "$dir/.plan.XXXXXX")
+trap 'rm -f "$tmp"' EXIT
+printf '%s\n' "$@" > "$tmp"
+mv -f "$tmp" "$file"
+trap - EXIT
+cat "$file"
