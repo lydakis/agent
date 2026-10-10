@@ -280,6 +280,16 @@ test('a diagram asked for while its reply streamed stays shown once the reply is
   assert.notEqual(idOf(Rich.html(reply, { lines: 0, tags: 0, code: 0, scope: 'Bob|8' })), streamed);
   assert.notEqual(idOf(Rich.html(reply.replace('TD', 'LR'), { lines: 0, tags: 0, code: 0, scope: 'Bob|7' })), streamed);
   assert.notEqual(idOf(Rich.file('/w/d.md', new TextEncoder().encode(reply), false, false).html), streamed);
+  // Copies of one diagram, in one reply or in the turn's next message, are each their own.
+  const ids = (html) => [...html.matchAll(/data-id="([^"]*)"/g)].map((m) => m[1]);
+  const twice = ids(Rich.html(`${reply}\n\n${reply}`, { lines: 0, tags: 0, code: 0, scope: text.scope }));
+  assert.equal(twice.length, 2); assert.equal(twice[0], streamed); assert.notEqual(twice[1], streamed);
+  t.streamingTurn = 7; t.streamGen = 2; t.text = '';
+  for (const ch of reply) { t.text += ch; p.renderTail(el, 'Bob', t); }
+  const next = idOf(el.children[0].children.map((c) => c.html).join(''));
+  assert.notEqual(next, streamed);
+  await p.onEvent({ event: 'message', bot: 'Bob', turn: 7, data: { node: 5 } }); await p.loadBatch('Bob');
+  assert.equal(idOf(p.textHTML(t.items.filter((it) => it.kind === 'text')[1])), next);
 });
 
 test('a diagram that failed to draw asks again before it is tried again', async () => {
@@ -323,7 +333,7 @@ test('a file an agent rewrote while open waits for a click to run', async () => 
   const p = page({ readFile: async (full) => { opened.push(full); return enc('<p>hi</p>'); } }), Rich = p.context.Rich;
   assert.match(Rich.file('/w/p.html', enc('<p>hi</p>')).html, /data-kind="html" data-view="view"/);
   assert.match(Rich.file('/w/p.html', enc('<p>hi</p>'), false, false).html, /data-kind="html" data-view="code"/);
-  assert.match(Rich.file('/w/d.mmd', enc('graph TD'), false, false).html, /data-lazy data-id="file \/w\/d\.mmd\|mermaid\|[^"]+"/);
+  assert.match(Rich.file('/w/d.mmd', enc('graph TD'), false, false).html, /data-lazy data-id="file \/w\/d\.mmd\|0\|mermaid\|[^"]+"/);
   p.S.config = { workspace: '/w' };
   p.S.ui.file = { bot: 'Bob', full: '/w/p.html', asked: true, gen: 2, state: 'ok', bytes: enc('<p>hi</p>'), more: false, url: null };
   await p.onEvent({ event: 'tool_started', bot: 'Bob', turn: 1, data: { call_id: 'w1', name: 'write', arguments: JSON.stringify({ path: 'p.html', content: 'x' }) } });

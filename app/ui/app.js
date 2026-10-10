@@ -682,7 +682,10 @@ async function onEvent(ev) {
         // The committed node is the sole transcript source, including thinking.
         t.text = ''; t.thinking = ''; t.thinkingSince = 0; t.thinkingMs = 0; t.streamGen += 1;
       }
-      if (typeof data.node === 'number') pushNode(t, { kind: 'node', node: data.node, turn, thinkingSecs });
+      // Its place among the turn's messages, which the reply streaming before it knows too (see `renderTail`).
+      if (t.seqTurn !== turn) { t.seqTurn = turn; t.seq = 0; }
+      const seq = t.seq++;
+      if (typeof data.node === 'number') pushNode(t, { kind: 'node', node: data.node, turn, seq, thinkingSecs });
       break;
     }
     case 'tool_started': {
@@ -930,8 +933,8 @@ async function loadBatch(name) {
           count(t, live, -1); t.items.splice(t.items.indexOf(live), 1);
         }
       }
-      // A message's diagrams keep the consent given while it streamed: both are scoped to its turn.
-      if (e.kind === 'text') e.scope = `${name}|${it.turn ?? `node ${it.node}`}`;
+      // A message's diagrams keep the consent given while it streamed: both are scoped to its place in its turn.
+      if (e.kind === 'text') e.scope = it.turn != null && it.seq != null ? `${name}|${it.turn}|${it.seq}` : `${name}|node ${it.node}`;
       rep.push({ ...e, callId: e.callId ?? it.callId, turn: it.turn });
     }
     const size = r.ok ? JSON.stringify(r.ok).length * 2 : 0;
@@ -1259,10 +1262,10 @@ function textHTML(it, t) {
   if (it.htmlOf !== it.text || (it.htmlWaited && it.htmlAt !== Rich.version)) {
     // A block after the first of its message starts from what the blocks before it drew.
     const used = { lines: 0, tags: 0, code: 0, scope: it.scope };
-    for (const s of it.budget?.spent.slice(0, it.sib) ?? []) if (s) { used.lines += s.lines; used.tags += s.tags; used.code += s.code; used.over ||= s.over; }
+    for (const s of it.budget?.spent.slice(0, it.sib) ?? []) if (s) { used.lines += s.lines; used.tags += s.tags; used.code += s.code; used.blocks = (used.blocks ?? 0) + s.blocks; used.over ||= s.over; }
     const start = { ...used }, html = `<div class="md">${Rich.html(it.text, used)}</div>`;
     const tags = used.tags - start.tags, cost = 2 * html.length + TAG_BYTES * tags;
-    if (it.budget) it.budget.spent[it.sib] = { lines: used.lines - start.lines, tags, code: used.code - start.code, over: !!used.over };
+    if (it.budget) it.budget.spent[it.sib] = { lines: used.lines - start.lines, tags, code: used.code - start.code, blocks: (used.blocks ?? 0) - (start.blocks ?? 0), over: !!used.over };
     const d = cost - (it.drawnBytes ?? 0); it.drawnBytes = cost; it.bytes = (it.bytes || 0) + d; if (t) t.bytes = Math.max(0, (t.bytes || 0) + d);
     it.html = html; it.htmlOf = it.text; it.htmlAt = Rich.version; it.htmlWaited = Rich.waited;
   }
@@ -1439,7 +1442,7 @@ function renderTail(el, name, t) {
     line.replaceChildren(text, cursor);
     const done = kind === 'text' ? document.createElement('div') : null; if (done) done.className = 'md';
     el.replaceChildren(...(kind || running ? [done, line].filter(Boolean) : []));
-    state = { transcript: t, kind, turn: t.streamingTurn, gen: t.streamGen, offset: 0, text, running, done, cut: {}, drawn: 0, used: { lines: 0, tags: 0, code: 0, scope: `${name}|${t.streamingTurn}` } };
+    state = { transcript: t, kind, turn: t.streamingTurn, gen: t.streamGen, offset: 0, text, running, done, cut: {}, drawn: 0, used: { lines: 0, tags: 0, code: 0, scope: `${name}|${t.streamingTurn}|${t.seqTurn === t.streamingTurn ? t.seq : 0}` } };
     tails.set(el, state);
   }
   if (value.length <= state.offset) return;

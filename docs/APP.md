@@ -1212,10 +1212,11 @@ text. Fenced blocks are drawn by their language:
   of spec (a `sequence` transform to a billion, a billion ticks) can ask it
   for more than it can draw. A diagram or chart drawn shows again when its
   pane is redrawn, when the reply it streamed in is committed, and when its
-  message is drawn anew for highlighting: its id is its turn (or file) and
-  its source. An identical one in another turn or file still asks, so one
-  click never fills a chat of copies; one whose source changed, as in a file
-  an agent rewrote, asks too. One that fails to draw shows its error and
+  message is drawn anew for highlighting: its id is its message (or file),
+  its place among the diagrams and charts there, and its source. Every other
+  block still asks, a copy in the same reply included, so one click never
+  fills a chat of copies; one whose source changed, as in a file an agent
+  rewrote, asks too. One that fails to draw shows its error and
   asks again before it is tried again. One in a file opened beside is
   measured once the pane has finished opening.
 - **`html`** opens as code, and runs as a preview in a sandboxed frame only

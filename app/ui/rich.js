@@ -50,13 +50,14 @@ window.Rich = (() => {
   // window's thread, and a few characters can ask for more than it can do (a page's loop, an SVG's
   // filters, a chart's `sequence` to a billion, a Mermaid `space:500000`), so each runs only when
   // asked, block by block. `page` draws it at once, for a file someone opened.
-  // A diagram or chart in a message carries an id: where it was drawn (`scope`, its turn or file)
-  // and what it draws. Its streamed draft, the message committed, and the message drawn anew for
-  // highlighting all give it the same id, so the one someone asked for stays shown; an identical one
-  // in another turn or file still asks. Without a scope each block is its own.
-  let scope = null, blockId = 0;
+  // A diagram or chart in a message carries an id: where it was drawn (`scope`, its message or
+  // file), which of the diagrams and charts there it is (`nth`), and what it draws. Its streamed
+  // draft, the message committed, and the message drawn anew for highlighting all give it the same
+  // id, so the one someone asked for stays shown; every other block, a copy of it included, still
+  // asks. Without a scope each block is its own.
+  let scope = null, nth = 0, blockId = 0;
   const digest = (s) => { let a = 0x811c9dc5, b = 5381; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); a = Math.imul(a ^ c, 0x01000193); b = (Math.imul(b, 33) + c) | 0; } return `${s.length}.${(a >>> 0).toString(36)}.${(b >>> 0).toString(36)}`; };
-  const lazy = (page, kind, text) => page ? ' data-run' : ` data-id="${esc(scope == null ? `#${++blockId}` : `${scope}|${kind}|${digest(text)}`)}"`;
+  const lazy = (page, kind, text) => page ? ' data-run' : ` data-id="${esc(scope == null ? `#${++blockId}` : `${scope}|${nth++}|${kind}|${digest(text)}`)}"`;
   function block(text, info, page = false) {
     const lang = (info ?? '').trim().split(/\s+/)[0].toLowerCase();
     if (lang === 'mermaid' || lang === 'mmd') return `<div class="rc" data-kind="mermaid" data-lazy${lazy(page, 'mermaid', text)} data-view="code">${head('mermaid', toggle)}<div class="view"></div>${pre(text, '')}</div>`;
@@ -109,9 +110,9 @@ window.Rich = (() => {
   const asText = (text) => `<div class="rc" data-kind="code">${head('text', '')}<pre class="code"><code>${esc(text)}</code></pre></div>`;
   // `used` carries the bounds across the pieces of one message drawn apart, as a streamed reply's
   // blocks are; once over, `used.over` is set and that piece is text. `used.scope` names where its
-  // diagrams and charts were drawn (see `lazy`).
+  // diagrams and charts were drawn and `used.blocks` counts those drawn before it (see `lazy`).
   function html(text, used = { lines: 0, tags: 0, code: 0 }) {
-    waited = false; spent = used.code ?? 0; scope = used.scope ?? null;
+    waited = false; spent = used.code ?? 0; scope = used.scope ?? null; nth = used.blocks ?? 0;
     const p = parser();
     if (!p) return `<p>${esc(text)}</p>`;
     if (used.over) return asText(text);
@@ -121,7 +122,7 @@ window.Rich = (() => {
     used.code = spent;
     const tags = count(out, '<', TAGS - used.tags);
     if (used.tags + tags > TAGS) { waited = false; used.over = true; return asText(text); }
-    used.lines += lines; used.tags += tags;
+    used.lines += lines; used.tags += tags; used.blocks = nth;
     return out;
   }
 
@@ -332,7 +333,7 @@ window.Rich = (() => {
   }
   // `waited` says the view is code that highlighting, once loaded, would draw differently.
   function file(path, bytes, more = false, asked = true) {
-    spent = 0; waited = false; scope = `file ${path}`;
+    spent = 0; waited = false; scope = `file ${path}`; nth = 0;
     const ext = extOf(path), note = more ? `<div class="line note">showing the first ${Math.round(bytes.length / 1048576)} MiB</div>` : '';
     if (IMAGE[ext]) {
       if (more) return { html: '<div class="line note">image too large to show</div>' };
