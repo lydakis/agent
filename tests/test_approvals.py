@@ -320,7 +320,7 @@ class ApprovalTests(ModelFixture):
         self.answer(client, turn, 'shell-1')
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertEqual(self.tool_output(client, 'shell-1')[1]['stdout'], 'restarted')
-        self.assertTrue(client.request('interrupt', bot='Dan', turn=dan)['result']['parked'])
+        self.assertEqual(client.request('interrupt', bot='Dan', turn=dan)['result']['status'], 'interrupted')
         self.assertEqual(client.finished(dan)['data']['status'], 'interrupted')
         self.assertTrue(self.tool_output(client, 'shell-1', bot='Dan')[0]['cancelled'])
         self.assertEqual(client.request('approvals')['result']['approvals'], [])
