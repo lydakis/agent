@@ -45,6 +45,8 @@ const S = {
   // Each agent's plan by bot id, as the plan skill keeps it beside the store (see `loadPlans`), and
   // whether this window can read them at all.
   plans: new Map(), plansOff: false, plansGen: 0,
+  // One page of triggers, as Home's list shows them (see `readTriggers`).
+  trig: { list: null, next: null, after: null, error: null, gen: 0 },
 };
 function loadSend() { try { const v = localStorage.getItem('agent:send'); return v === 'steer' || v === 'side' ? v : 'queue'; } catch (_) { return 'queue'; } }
 // What a window remembers belongs to the store it shows and its folder, not to the socket that reached
@@ -710,6 +712,8 @@ async function onEvent(ev) {
     case 'accepted': {
       if (data.from?.bot) { S.turnFrom.set(`${name}\u0000${turn}`, data.from.bot); forwarded(data.from); }
       else if (typeof data.origin === 'string') S.turnOrigin.set(`${name}\u0000${turn}`, data.origin);
+      // A trigger fired: its row says so once the fire has written what it did.
+      if (data.origin === 'trigger' && S.live) soonTriggers(1500);
       answerTo(name, turn, data);
       const b = bot(name); if (b) { b.status = 'running'; b.runningTurn = turn; b.waitingOn = []; b.turnStarted = S.live ? Date.now() : 0; b.elapsed = 0; }
       // The event that puts a prompt on the lineage names who sent it, here and on `steered`.
@@ -721,6 +725,7 @@ async function onEvent(ev) {
     case 'queued': {
       if (data.from?.bot) { S.turnFrom.set(`${name}\u0000${turn}`, data.from.bot); forwarded(data.from); }
       else if (typeof data.origin === 'string') S.turnOrigin.set(`${name}\u0000${turn}`, data.origin);
+      if (data.origin === 'trigger' && S.live) soonTriggers(1500);
       answerTo(name, turn, data);
       // `ready` waits for a daemon-wide slot with nothing else running on the bot; `queued` sits behind its own turn.
       const b = bot(name); const behindOwn = !!b && (b.runningTurn !== null || isActive(b.status));
@@ -745,7 +750,7 @@ async function onEvent(ev) {
       let parsed = {}; try { parsed = JSON.parse(args) ?? {}; } catch (_) {}
       const tname = data.name ?? 'tool';
       const t = transcript(name);
-      const row = { kind: 'tool', from: t.callNode, callId: data.call_id, name: tname, summary: callSummary(tname, args), path: toolPath(tname, parsed), background: tname === 'shell' && parsed.background === true, plan: tname === 'shell' && (PLAN_CALL.test(parsed.command ?? '') || PLAN_CALL.test(String(data.arguments ?? ''))), done: false, started: S.live ? Date.now() : 0, took: 0, turn };
+      const row = { kind: 'tool', from: t.callNode, callId: data.call_id, name: tname, summary: callSummary(tname, args), path: toolPath(tname, parsed), background: tname === 'shell' && parsed.background === true, plan: tname === 'shell' && (PLAN_CALL.test(parsed.command ?? '') || PLAN_CALL.test(String(data.arguments ?? ''))), trig: tname === 'shell' && TRIGGER_CALL.test(parsed.command ?? String(data.arguments ?? '')), done: false, started: S.live ? Date.now() : 0, took: 0, turn };
       let existing = null;
       for (let i = t.items.length - 1; i >= 0; i--) {
         const it = t.items[i]; if (it.turn !== turn) break;
@@ -753,7 +758,7 @@ async function onEvent(ev) {
       }
       if (existing) {
         row.from = existing.from ?? row.from;
-        if (data.arguments_truncated) { row.summary = existing.summary; row.path = existing.path; row.background = existing.background; row.plan = existing.plan; }
+        if (data.arguments_truncated) { row.summary = existing.summary; row.path = existing.path; row.background = existing.background; row.plan = existing.plan; row.trig = existing.trig; }
         Object.assign(existing, row); t.gen += 1; } else addItem(t, row);
       break;
     }
@@ -764,6 +769,8 @@ async function onEvent(ev) {
       if (call) { call.done = true; if (call.started) call.took = Date.now() - call.started; call.started = 0; patchRun(name, call); }
       // The plan skill's script ran: the plan it left is read back.
       if (call?.plan && S.live && bot(name)?.id != null) loadPlans([bot(name).id]);
+      // So did the trigger script: what it added or removed is listed.
+      if (call?.trig && S.live) soonTriggers(0);
       const shown = S.ui.file;
       // Read again as the agent left it; what it wrote is new, so a page, diagram or image in it waits for a click.
       // A write or edit that failed or was refused changed nothing, and what is shown keeps running.
@@ -804,6 +811,8 @@ async function onEvent(ev) {
       const b = bot(name);
       const key = `${name}\u0000${turn}`, from = S.turnFrom.get(key), origin = S.turnOrigin.get(key), answered = S.answerTo.get(key);
       S.turnFrom.delete(key); S.turnOrigin.delete(key); S.answerTo.delete(key);
+      // A trigger that passes the answer on writes its fire's result once it has.
+      if (origin === 'trigger' && S.live) soonTriggers(1500);
       // A steer absorbed into a running turn finishes as its own turn while that turn goes on.
       if (b && (b.runningTurn === null || b.runningTurn === turn)) { b.runningTurn = null; b.waitingOn = []; if (b.turnStarted) b.elapsed = Date.now() - b.turnStarted; b.turnStarted = 0; b.status = status === 'completed' || status === 'steered' ? 'idle' : status; }
       const t = transcript(name);
@@ -1281,6 +1290,7 @@ async function attachOnce() {
     if (S.session !== session) return false;
     $('detached').classList.remove('on');
     render();
+    readTriggers();
     if (!S.setupSeen && !S.bots.size) { S.setupSeen = true; offerSetup(); }
     return true;
   } catch (e) {
@@ -1595,6 +1605,9 @@ function itemHTML(it, t = null) {
   switch (it.kind) {
     case 'user': {
       if (!it.by) return `<div class="line user">› ${esc(it.text)}</div>`;
+      // A trigger's message says which trigger woke the agent, and why; its name opens the trigger.
+      const fire = it.by.app === 'trigger' ? TRIGGER_LINE.exec(it.text) : null;
+      if (fire) return `<div class="line user agent">${S.config?.host ? `<span class="by">` : `<button type="button" class="by" data-act="trigger" data-v="${esc(fire[1])}" title="Open this trigger">`}${triggerKind(fire[3])} ${esc(fire[1])}${S.config?.host ? '</span>' : '</button>'} <span class="why">${esc(fire[3])} · ${esc(fire[2])}</span>\n${esc(it.text.slice(fire[0].length))}</div>`;
       const sender = it.by.bot ? senderBot(it.by) : null;
       const tag = sender ? `<button type="button" class="by" data-task="${esc(it.by.bot)}" title="Sent by ${esc(it.by.bot)}, turn ${esc(it.by.turn)}">${esc(agentName(it.by.bot, sender))}</button>`
         : `<span class="by"${it.by.bot ? ` title="Sent by ${esc(it.by.bot)}, turn ${esc(it.by.turn)}, since deleted"` : ''}>${esc(it.by.bot ? agentName(it.by.bot, null) : it.by.app)}</span>`;
@@ -2393,6 +2406,120 @@ async function createHome(model, effort) {
   render();
 }
 
+// ---------- triggers ----------
+// Agents wake from triggers they or their coordinator made: a time, a file written, a commit, a turn's end,
+// or a fire by name, with launchd keeping watch. Home's list shows them under the projects, a page at a
+// time, and a row opens the trigger's sheet. One that ended without delivering stays listed, saying why,
+// until it is removed; so do a one-off still there after its time and a plist that cannot be read.
+// The page is read when the window attaches, when an agent's shell call of the trigger script ends, a
+// little after a trigger's message is taken or queued and after its turn ends (its fire writes what it
+// did once the message is in, or once it passed the answer on), and when a sheet opens, so a quiet
+// fleet costs nothing. A window on a host has none: they run on this machine.
+const TRIGGER_CALL = /\.agent\/trigger\b/;
+// The line a fire puts before its message: the trigger, the time, and why it fired.
+const TRIGGER_LINE = /^\[trigger ([\w.-]+) · ([^·\]\n]+) · ([^\]\n]*)\]\n?/;
+const triggerKind = (when) => /^fire/.test(when) ? '▶' : /^file /.test(when) ? '◫' : /^commit /.test(when) ? '⎇' : /\bturns?\b/.test(when) ? '↻' : '⏱';
+const LAST = { sent: 'sent', skipped: 'skipped, it was working', gone: 'its agent is gone', failed: 'failed', missed: 'missed, its time passed long ago', declined: 'not sent, its check said no' };
+let trigReading = null, trigAgain = false, trigSoon = null;
+// Reads one at a time; one asked for while another runs reads once more after it, however many asked.
+function readTriggers() {
+  if (trigReading) { trigAgain = true; return trigReading; }
+  return (trigReading = (async () => { do { trigAgain = false; await listTriggers(); } while (trigAgain); trigReading = null; })());
+}
+async function listTriggers() {
+  const t = S.trig;
+  if (S.config?.host || !Daemon.triggers) { Object.assign(t, { list: null, next: null, after: null, error: null }); return; }
+  try { const page = await Daemon.triggers(t.after); Object.assign(t, { list: page?.triggers ?? [], next: page?.next_after ?? null, error: null }); }
+  catch (e) { Object.assign(t, { list: null, next: null, error: String(e?.message ?? e) }); }
+  t.gen += 1;
+  if (S.attached) renderTriggers();
+  // The open trigger's row; one not on this page, or gone since, is read by name.
+  if (sheetKind === 'trigger' && !trigSheet.busy) { const x = t.list?.find((r) => r.name === sheetFor); if (x) { trigSheet.row = x; renderTriggerSheet(); } else if (t.list) readTrigger(sheetFor); }
+}
+function soonTriggers(ms) { if (trigSoon || S.config?.host) return; trigSoon = setTimeout(() => { trigSoon = null; readTriggers(); }, ms); }
+// What it watches, short for its row and whole for its sheet.
+function whenOf(x, short) {
+  const w = x.when ?? '', base = (p) => short ? p.split('/').filter(Boolean).pop() ?? p : p;
+  if (x.ended) return short ? 'ended' : 'Ended';
+  if (x.missed) return short ? 'missed' : `Missed its time, ${w}`;
+  if (w === 'fire') return short ? 'on Run' : 'Only when run';
+  if (w.startsWith('file ')) return short ? `file ${base(w.slice(5))}` : `When ${w.slice(5)} is written`;
+  if (w.startsWith('commit ')) return short ? `commit ${base(w.slice(7))}` : `A new commit in ${w.slice(7)}`;
+  if (w.startsWith('turn end of ')) return short ? 'turn end' : `When ${w.slice(12)} ends a turn`;
+  return short ? w.replace(/ of \S+$/, '') : w.charAt(0).toUpperCase() + w.slice(1);
+}
+// Its agent, while the name still holds the one it wakes; a --start one has none until its first fire.
+const triggerBot = (x) => { const b = bot(x.bot); return b && x.bot_id != null && b.id === x.bot_id ? b : null; };
+function renderTriggers() {
+  const el = $('trigs'), t = S.trig, show = !opened() && !S.config?.host && !!(t.list?.length || t.after || t.error);
+  el.hidden = !show; if (!show) return;
+  const key = `${t.gen}`; if (el.dataset.key === key) return; el.dataset.key = key;
+  const row = (x) => x.problem
+    ? `<button type="button" class="trow bad" data-act="trigger" data-v="${esc(x.name)}"><span class="r1"><span class="tk">!</span><span class="n">${esc(x.name)}</span><span class="w">unreadable</span></span></button>`
+    : `<button type="button" class="trow${x.ended || x.missed ? ' bad' : ''}" data-act="trigger" data-v="${esc(x.name)}"><span class="r1"><span class="tk">${triggerKind(x.when ?? '')}</span><span class="n">${esc(x.name)}</span><span class="w">${esc(whenOf(x, true))}</span></span><span class="r2">→ ${esc(x.bot)}${x.reply_to ? ` · answer to ${esc(x.reply_to)}` : ''}</span></button>`;
+  const pages = `${t.after ? '<button type="button" class="ibtn" data-act="triggers-first" title="First page">«</button>' : ''}${t.next ? '<button type="button" class="ibtn" data-act="triggers-next" title="Next page">»</button>' : ''}`;
+  el.innerHTML = `<div class="th"><span>triggers</span><span>${pages}</span></div>${(t.list ?? []).map(row).join('')}${t.error ? `<div class="pnote bad">${esc(t.error)}</div>` : ''}`;
+}
+// A trigger's sheet: when it fires, what it does, and where the answer goes; its check, its last fire and
+// its message; and Run now, which fires it as `trigger fire` does. It is read again by name on opening, so
+// one from another page, or named by a message, shows too.
+const trigSheet = { row: null, gone: false, busy: false };
+async function openTriggerSheet(name) {
+  closeMenu();
+  if (S.config?.host) return;
+  sheetFor = name; sheetKind = 'trigger';
+  Object.assign(trigSheet, { row: S.trig.list?.find((x) => x.name === name) ?? null, gone: false, busy: false });
+  renderTriggerSheet();
+  $('sheetwrap').classList.add('on'); S.ui.sheet = true;
+  await readTrigger(name);
+}
+async function readTrigger(name) {
+  let x; try { x = await Daemon.trigger(name); } catch (e) { toast(`trigger ${name}: ${e?.message ?? e}`, 5000); return; }
+  if (sheetKind !== 'trigger' || sheetFor !== name) return;
+  trigSheet.row = x ?? null; trigSheet.gone = !x;
+  renderTriggerSheet();
+}
+function renderTriggerSheet() {
+  const name = sheetFor, x = trigSheet.row, busy = trigSheet.busy ? ' disabled' : '';
+  const close = '<div class="foot"><button type="button" class="sbtn" data-act="close-sheet">Close</button></div>';
+  if (!x) { $('sheet').innerHTML = `<h4>${esc(name)}</h4><p class="hint">${trigSheet.gone ? 'No trigger by this name now: it was removed.' : 'Reading…'}</p>${close}`; return; }
+  if (x.problem) { $('sheet').innerHTML = `<h4>${esc(name)}</h4><p class="hint warn">${esc(x.problem)}</p><div class="foot"><button type="button" class="sbtn" data-act="trigger-remove"${busy}>Remove</button><button type="button" class="sbtn" data-act="close-sheet">Close</button></div>`; return; }
+  const at = (ms) => new Date(ms).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  const why = (o) => o.detail ? ` (${String(o.detail).slice(0, 160)})` : '';
+  const l = x.last;
+  const last = l ? `${at(l.fired_ms)}: ${LAST[l.outcome] ?? l.outcome}${l.outcome === 'failed' || l.outcome === 'declined' ? why(l) : ''}${l.turn != null && l.outcome === 'sent' ? `, turn ${l.turn}` : ''}${l.reply?.outcome === 'failed' ? `; its answer did not get through${why(l.reply)}` : ''}` : 'Not run yet';
+  const does = x.start && x.bot_id == null ? `Start <b>${esc(x.bot)}</b> on ${esc(x.start.model)}${x.start.effort ? ` at ${esc(x.start.effort)}` : ''}` : `Message <b>${esc(x.bot)}</b>`;
+  const b = triggerBot(x), quoted = /^[\w.-]+$/.test(name) ? name : `'${name}'`;
+  $('sheet').innerHTML = `<h4><span class="tk">${triggerKind(x.when ?? '')}</span> ${esc(name)}</h4>
+    <div class="pipe"><div class="st"><span class="lab">When</span>${esc(whenOf(x, false))}</div><span class="ar">→</span><div class="st"><span class="lab">Do</span>${does}</div><span class="ar">→</span><div class="st"><span class="lab">Reply to</span>${x.reply_to ? `<b>${esc(x.reply_to)}</b>` : 'Stays in its chat'}</div></div>
+    <dl>${x.if ? `<dt>checks first</dt><dd><div class="check">${esc(x.if)}</div><span class="hint">It fires only when this exits 0, so a check that finds nothing calls no model.</span></dd>` : ''}<dt>last fire</dt><dd>${esc(last)}</dd><dt>sent</dt><dd>${x.sent ?? 0}${x.runs ? ` of ${x.runs}, then it ends` : ''}</dd><dt>message</dt><dd class="msg">${esc(x.message ?? '')}</dd></dl>
+    <div class="wire"><span class="c">$</span> ~/.agent/trigger fire ${esc(quoted)}</div>
+    <div class="foot"><button type="button" class="sbtn" data-act="trigger-open"${b ? '' : ' disabled'} title="${b ? 'Open its chat' : x.bot_id == null && x.start ? 'Its first fire starts it' : 'Its agent is gone'}">Open ${esc(b ? shortName(b) : x.bot)}</button><button type="button" class="sbtn" data-act="trigger-remove"${busy}>Remove</button><button type="button" class="sbtn primary" data-act="trigger-fire"${x.ended ? ' disabled' : busy}>Run now</button></div>`;
+}
+// Run now returns once launchd starts the fire, before it has sent anything: the trigger is read again,
+// a little later each time, until its last fire changes or it ends, while its sheet stays open.
+// Waits between reads after Run now: it looks at 0.5, 1, 2, 4, 8, 12 and 16 s. launchd starts a job at most
+// once every 10 s, so a Run now soon after the last fire can start that late.
+const RUN_NOW_LOOKS = [500, 500, 1000, 2000, 4000, 4000, 4000];
+async function triggerAct(act, name) {
+  if (!name || trigSheet.busy) return;
+  const before = trigSheet.row?.last?.fired_ms ?? null;
+  trigSheet.busy = true; renderTriggerSheet();
+  let ok = true;
+  try { await (act === 'fire' ? Daemon.fireTrigger(name) : Daemon.removeTrigger(name)); } catch (e) { ok = false; toast(`${act === 'fire' ? 'run' : 'remove'} ${name}: ${e?.message ?? e}`, 5000); }
+  trigSheet.busy = false;
+  const here = () => sheetKind === 'trigger' && sheetFor === name;
+  if (ok && act === 'remove' && here()) closeSheet();
+  else if (here()) renderTriggerSheet();
+  readTriggers();
+  for (const ms of ok && act === 'fire' ? RUN_NOW_LOOKS : []) {
+    await new Promise((done) => setTimeout(done, ms));
+    if (!here()) return;
+    await readTrigger(name);
+    if (!trigSheet.row || trigSheet.row.ended || (trigSheet.row.last?.fired_ms ?? null) !== before) { readTriggers(); return; }
+  }
+}
+
 // ---------- the new swarm sheet ----------
 // A goal, how many agents, what they are, where they work, and a budget they share. What they are is
 // a mix: rows of an identity (a profile the folder offers, or a plain agent), a model and its effort, and a share,
@@ -2671,10 +2798,11 @@ function render() {
   else if (gtab != null) renderGit(gitTab(gtab));
   else { renderHead($('title'), b, 'main'); if (b) renderTranscript($('log'), b.name); else renderHome($('log')); }
   $('form').hidden = pageOf(S.selected);
-  // New project belongs to Home's list, which a file tab shows too.
+  // New project and the triggers belong to Home's list, which a file tab shows too.
   $('newproj').hidden = !!opened();
   // Memory is a project's and yours: at Home and in a project, on this machine.
   const memOf = opened(), mem = $('memory'); mem.hidden = !!S.config?.host || (!!memOf && !leadProject(memOf)); mem.dataset.who = memOf;
+  renderTriggers();
   if (S.ui.rail) renderRail();
   if (S.ui.file) renderFile();
   else if (side) { renderHead($('sidetitle'), side, 'side'); renderTranscript($('side'), side.name); }
@@ -3173,7 +3301,6 @@ async function openSetup() {
   try { await loadSettings(); } catch (e) { st.error = String(e?.message ?? e); }
   try { st.roles = await Daemon.roles?.(); } catch (_) {}
   if (!st.settings?.providers?.length) st.adding = st.adding ?? '';
-  await readTriggers();
   renderSetup();
   await Promise.all([checkProviders(st.settings?.listing), readList()]);
 }
@@ -3340,7 +3467,6 @@ function setupHTML(kept = new Map()) {
     // Onboarding is the fundamentals; the roles show once a project or Home exists.
     + ((projects || S.bots.has(HOME)) && !S.config?.host ? rolesHTML(st, busy) : '')
     + hostsHTML(st, busy)
-    + (!S.config?.host && (projects || st.triggers?.length || st.triggersAfter || st.triggersError) ? triggersHTML(st, busy) : '')
     + (st.busy ? `<p class="busy">${esc(st.busy)}</p>` : '') + (st.error ? `<p class="bad">${esc(st.error)}</p>` : '');
 }
 // The hosts in ~/.ssh/config, each of which a window can be opened on. That window's agents run on
@@ -3359,51 +3485,6 @@ function rolesHTML(st, busy) {
   const own = new Map((st.roles ?? []).map((r) => [r.name, r.file]));
   const rows = ROLES.map(([name, label]) => `<div class="prow"><span class="pn">${label}</span><span class="st${own.get(name) ? '' : ' dim'}">${own.get(name) ? `~/.agents/agents/${name}.md` : 'the app\'s own'}</span><span class="acts"><button type="button" class="sbtn" data-act="edit-role" data-v="${name}"${busy}>Edit</button></span></div>`).join('');
   return `<section><h3>Roles</h3>${rows}<p class="dim">A project's coordinator and a swarm's agents follow these in every project; a project's own .agents/agents file of that name comes first. Home follows its own. An agent keeps the text it started with, so an edit reaches the projects, swarms and Home made after it.</p></section>`;
-}
-// Agents wake from triggers they or their coordinator made: a time, a file written, a commit, or a fire by name.
-// launchd keeps watch. Each shows who it wakes, on what, what its last fire did, and the message it sends.
-// A trigger that ended on its own without delivering stays listed, saying why, until it is removed; so do a
-// one-off still there after its time and a plist that cannot be read.
-async function readTriggers(after = null) {
-  const st = setupState();
-  st.triggersAfter = after;
-  try {
-    const page = S.config?.host ? null : await Daemon.triggers?.(after);
-    st.triggers = page?.triggers ?? null; st.triggersNext = page?.next_after ?? null; st.triggersError = null;
-  } catch (e) { st.triggers = null; st.triggersNext = null; st.triggersError = String(e?.message ?? e); }
-}
-const LAST = { sent: 'sent', skipped: 'skipped, it was working', gone: 'its agent is gone', failed: 'failed', missed: 'missed, its time passed long ago', declined: 'not sent, its check said no' };
-function triggersHTML(st, busy) {
-  const at = (ms) => new Date(ms).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-  const why = (o) => o.detail ? ` (${String(o.detail).slice(0, 120)})` : '';
-  const last = (l, ended) => l ? `${ended ? 'ended' : 'last'} ${at(l.fired_ms)}: ${LAST[l.outcome] ?? l.outcome}${l.outcome === 'failed' || l.outcome === 'declined' ? why(l) : ''}${l.reply?.outcome === 'failed' ? `, its answer did not get through${why(l.reply)}` : ''}` : 'not run yet';
-  const acts = (x) => `<span class="acts">${x.problem || x.ended ? '' : `<button type="button" class="sbtn" data-act="trigger-fire" data-v="${esc(x.name)}"${busy}>Run now</button>`}<button type="button" class="sbtn" data-act="trigger-remove" data-v="${esc(x.name)}"${busy}>Remove</button></span>`;
-  const more = (x) => [x.name !== x.bot ? x.name : '', x.start && x.bot_id == null ? `starts it on ${x.start.model}` : '', x.reply_to ? `answer to ${x.reply_to}` : '', x.if ? `if ${x.if}` : '', x.runs ? `${x.sent ?? 0} of ${x.runs} runs` : ''].filter(Boolean).join(' · ');
-  const rows = (st.triggers ?? []).map((x) => x.problem
-    ? `<div class="prow"><span class="pn">${esc(x.name)}</span><span class="st bad">unreadable</span>${acts(x)}<div class="sub dim">${esc(x.problem)}</div></div>`
-    : `<div class="prow"><span class="pn">${esc(x.bot)}</span><span class="st${x.ended || x.missed ? ' bad' : ''}">${x.ended ? (x.last?.outcome === 'sent' ? 'answer not passed on' : 'not delivered') : x.missed ? 'missed its time' : esc(x.when === 'fire' ? 'when run' : x.when)}</span>${acts(x)}<div class="sub dim">${esc([last(x.last, x.ended), more(x)].filter(Boolean).join(' · '))}</div><div class="sub dim">${esc(x.message.length > 240 ? `${x.message.slice(0, 240)}…` : x.message)}</div></div>`).join('');
-  const none = st.triggersError ? `<p class="bad">${esc(st.triggersError)}</p>` : rows ? '' : '<p class="dim">None yet. Ask a coordinator, for example "have build check its PR every 30 minutes".</p>';
-  return `<section><h3>Triggers</h3>${rows}${none}${st.triggersAfter ? '<button class="sbtn" data-act="triggers-first">First page</button>' : ''}${st.triggersNext ? '<button class="sbtn" data-act="triggers-next">Next page</button>' : ''}<p class="dim">Each fire, the agent gets its message in its own chat. A repeating one skips a fire while its agent is working; a one-off, or Run now, waits for it. They run with the app closed; a time the Mac slept through runs once when it wakes.</p></section>`;
-}
-// Run now returns once launchd starts the fire, before it has sent anything: the row is read again, a little
-// later each time, until its last fire changes or it ends, while Settings stays open.
-// Waits between reads after Run now: it looks at 0.5, 1, 2, 4, 8, 12 and 16 s. launchd starts a job at most
-// once every 10 s, so a Run now soon after the last fire can start that late.
-const RUN_NOW_LOOKS = [500, 500, 1000, 2000, 4000, 4000, 4000];
-async function triggerAct(act, name) {
-  const st = setupState();
-  const lastOf = () => st.triggers?.find((x) => x.name === name)?.last?.fired_ms ?? null;
-  const before = lastOf();
-  let fired = act === 'fire';
-  try { await (act === 'fire' ? Daemon.fireTrigger(name) : Daemon.removeTrigger(name)); } catch (e) { fired = false; toast(`${act === 'fire' ? 'run' : 'remove'} ${name}: ${e?.message ?? e}`, 5000); }
-  await readTriggers(st.triggersAfter);
-  renderSetup();
-  for (const ms of fired ? RUN_NOW_LOOKS : []) {
-    if (!st.open || !st.triggers?.some((x) => x.name === name) || lastOf() !== before) return;
-    await new Promise((done) => setTimeout(done, ms));
-    await readTriggers(st.triggersAfter);
-    renderSetup();
-  }
 }
 async function editRole(name) {
   const st = setupState();
@@ -3626,10 +3707,12 @@ async function act(el) {
     case 'setup-remove': { const st = setupState(); if (anyActive() && st.confirm !== v) { st.confirm = v; renderSetup(); return; } st.confirm = null; await removeProvider(v); return; }
     case 'setup-retry': case 'setup-refresh': await refreshModels(); return;
     case 'edit-role': await editRole(v); return;
-    case 'triggers-first': await readTriggers(); renderSetup(); return;
-    case 'triggers-next': await readTriggers(setupState().triggersNext); renderSetup(); return;
-    case 'trigger-fire': await triggerAct('fire', v); return;
-    case 'trigger-remove': await triggerAct('remove', v); return;
+    case 'triggers-first': S.trig.after = null; await readTriggers(); return;
+    case 'triggers-next': S.trig.after = S.trig.next; await readTriggers(); return;
+    case 'trigger': await openTriggerSheet(v); return;
+    case 'trigger-fire': await triggerAct('fire', sheetFor); return;
+    case 'trigger-remove': await triggerAct('remove', sheetFor); return;
+    case 'trigger-open': { const x = trigSheet.row; closeSheet(); if (x && triggerBot(x)) await go(x.bot, 'tab'); return; }
     case 'open-host': await Daemon.openHost(v); return;
     default: return;
   }
