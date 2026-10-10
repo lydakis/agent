@@ -1312,15 +1312,15 @@ fn plans_of(state: &Shared) -> Result<PathBuf, String> {
     }
 }
 
-/// The agents' plans by bot id: every one, or `ids`' (null for one with none).
+/// The plans of the agents `ids` names, by bot id (null for one with none).
 #[tauri::command]
 async fn plans(
     windows: State<'_, Windows>,
     window: tauri::WebviewWindow,
-    ids: Option<Vec<i64>>,
+    ids: Vec<i64>,
 ) -> Result<Value, String> {
     let dir = plans_of(&*windows.of(&window)?)?;
-    blocking(move || plan::read(&dir, ids.as_deref())).await
+    blocking(move || plan::read(&dir, &ids)).await
 }
 
 /// Remove a deleted agent's plan.

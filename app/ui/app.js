@@ -1444,16 +1444,20 @@ const planCount = (plan) => `${plan.done}/${plan.steps.length}`;
 // read never lands after a newer one. A window on a host, or one opened on a socket alone, cannot read
 // them; it logs why once and stops asking.
 let planReads = Promise.resolve();
+// No ids reads every seated agent's, and those replace what was shown. A plan named for no agent
+// here, such as one deleted from another window, is never read.
 function loadPlans(ids = null) { return (planReads = planReads.then(() => readPlans(ids))); }
 async function readPlans(ids) {
   if (S.config?.host || S.plansOff || !Daemon.plans) return;
   const session = S.session;
-  let got; try { got = await Daemon.plans(ids); } catch (e) {
+  const all = !ids;
+  if (all) ids = [...S.bots.values()].map((b) => b.id).filter((id) => id != null);
+  let got; try { got = ids.length ? await Daemon.plans(ids) : {}; } catch (e) {
     const why = String(e?.message ?? e); if (/^(plans|remote)_unsupported/.test(why)) S.plansOff = true;
     Daemon.log?.(`plans: ${why}`); return;
   }
   if (S.session !== session) return;
-  if (!ids) S.plans.clear();
+  if (all) S.plans.clear();
   for (const [id, text] of Object.entries(got ?? {})) { const plan = parsePlan(text); if (plan) S.plans.set(Number(id), plan); else S.plans.delete(Number(id)); }
   S.plansGen += 1;
   // What shows a plan: the list's rows, task cards, and the plan above a chat.
@@ -2214,9 +2218,10 @@ function render() {
   followDrafts();
   markSeen();
   renderTabs();
+  // Each plan before its chat, so a chat that follows its end measures what is left once the plan is drawn.
+  renderPlan($('plan'), sw ? null : b); renderPlan($('sideplan'), side);
   if (sw) { renderSwarmHead($('title'), sw); renderSwarm($('log'), sw); }
   else { renderHead($('title'), b, 'main'); if (b) renderTranscript($('log'), b.name); else renderHome($('log')); }
-  renderPlan($('plan'), sw ? null : b); renderPlan($('sideplan'), side);
   // New project belongs to Home's list.
   $('newproj').hidden = !!S.selected;
   if (S.ui.rail) renderRail();

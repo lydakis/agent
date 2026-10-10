@@ -2,8 +2,11 @@
 # Keep this agent's plan where the app shows it: beside the daemon's store,
 # under the agent's bot id, replaced whole on each call. Each step is one
 # argument starting with [x] (done), [>] (doing now) or [ ] (to do). With no
-# arguments it prints the plan as it stands.
+# arguments it prints the plan as it stands; --clear removes it.
 set -eu
+# Lengths in bytes, whatever the shell's locale.
+LC_ALL=C
+export LC_ALL
 if [ -z "${AGENT_STORE:-}" ] || [ -z "${AGENT_BOT_ID:-}" ]; then
   echo "plan: run it in an agent's shell (AGENT_STORE and AGENT_BOT_ID are not set)" >&2
   exit 2
@@ -12,6 +15,11 @@ dir="$AGENT_STORE-plans"
 file="$dir/$AGENT_BOT_ID"
 if [ "$#" -eq 0 ]; then
   if [ -f "$file" ]; then cat "$file"; else echo "no plan yet"; fi
+  exit 0
+fi
+if [ "$#" -eq 1 ] && [ "$1" = --clear ]; then
+  rm -f "$file"
+  echo "plan cleared"
   exit 0
 fi
 if [ "$#" -gt 30 ]; then
@@ -37,4 +45,4 @@ trap 'rm -f "$tmp"' EXIT
 printf '%s\n' "$@" > "$tmp"
 mv -f "$tmp" "$file"
 trap - EXIT
-cat "$file"
+echo "plan saved: $# steps"

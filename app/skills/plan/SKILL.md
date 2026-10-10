@@ -22,5 +22,13 @@ changes. Name a step for its outcome, in a few words. Keep it to 30 steps of
 at most 200 bytes each; group small ones. With no arguments it prints the
 plan as it stands.
 
+When the work is done and you have said so, or you turn to something the plan
+does not describe, clear it, so the person does not read an old plan as your
+current one:
+
+```
+sh "$HOME/.agents/skills/plan/plan" --clear
+```
+
 The plan is for the person, not a record: what you found and decided still
 goes in your replies.

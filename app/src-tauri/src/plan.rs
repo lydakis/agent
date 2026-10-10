@@ -2,8 +2,8 @@
 //! `STORE-plans/BOT_ID`, beside the daemon's store, which the agent's shell
 //! names as `AGENT_STORE`; a bot id names one agent in one store, so the
 //! folder is the store's and the file the agent's. The app reads them to show
-//! each agent's steps, and removes one when its agent is deleted. The text is
-//! the script's: one step a line, which the page reads.
+//! the steps of the agents it shows, and removes one when its agent is deleted.
+//! The text is the script's: one step a line, which the page reads.
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 
@@ -20,40 +20,13 @@ pub fn dir(store: &Path) -> Result<PathBuf, String> {
     Ok(PathBuf::from(name))
 }
 
-/// The plans in `dir` by bot id: every one there, or `ids`' with null for
-/// one that has none. A file named for no bot id, or one that is not a
-/// plan's size or not text, is not a plan.
-pub fn read(dir: &Path, ids: Option<&[i64]>) -> Result<Value, String> {
+/// The plans in `dir` of the agents `ids` names, by bot id, with null for one
+/// that has none. A file that is not a plan's size or not text is not a plan.
+pub fn read(dir: &Path, ids: &[i64]) -> Result<Value, String> {
     let mut out = Map::new();
-    let one = |id: i64| plain(&dir.join(id.to_string()));
-    match ids {
-        Some(ids) => {
-            for &id in ids {
-                out.insert(id.to_string(), one(id)?.map_or(Value::Null, Value::String));
-            }
-        }
-        None => {
-            let entries = match std::fs::read_dir(dir) {
-                Ok(entries) => entries,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(Value::Object(out));
-                }
-                Err(e) => return Err(format!("{}: {e}", dir.display())),
-            };
-            for entry in entries {
-                let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
-                let Some(id) = entry
-                    .file_name()
-                    .to_str()
-                    .and_then(|n| n.parse::<i64>().ok())
-                else {
-                    continue;
-                };
-                if let Some(text) = one(id)? {
-                    out.insert(id.to_string(), Value::String(text));
-                }
-            }
-        }
+    for &id in ids {
+        let text = plain(&dir.join(id.to_string()))?;
+        out.insert(id.to_string(), text.map_or(Value::Null, Value::String));
     }
     Ok(Value::Object(out))
 }
@@ -110,31 +83,26 @@ mod tests {
     }
 
     #[test]
-    fn every_plan_is_read_by_bot_id_and_what_is_not_one_is_skipped() {
+    fn plans_are_read_by_bot_id_and_what_is_not_one_is_none() {
         let root = scratch("read");
         let plans = root.join("state.sqlite-plans");
-        assert_eq!(read(&plans, None).unwrap(), serde_json::json!({}));
+        assert_eq!(read(&plans, &[7]).unwrap(), serde_json::json!({"7": null}));
         std::fs::create_dir_all(&plans).unwrap();
         std::fs::write(plans.join("7"), "[x] Read it\n[>] Write it\n").unwrap();
         std::fs::write(plans.join("12"), "[ ] Ship it\n").unwrap();
-        // The script's temporary, a file named for no bot, one too big, and one not text.
-        std::fs::write(plans.join(".plan.ab12cd"), "[ ] half").unwrap();
-        std::fs::write(plans.join("notes"), "[ ] no").unwrap();
+        // One too big, one not text, and a folder.
         std::fs::write(plans.join("13"), vec![b'x'; CAP as usize + 1]).unwrap();
         std::fs::write(plans.join("14"), [0xff, 0xfe]).unwrap();
         std::fs::create_dir_all(plans.join("15")).unwrap();
         assert_eq!(
-            read(&plans, None).unwrap(),
-            serde_json::json!({"7": "[x] Read it\n[>] Write it\n", "12": "[ ] Ship it\n"})
-        );
-        assert_eq!(
-            read(&plans, Some(&[12, 99])).unwrap(),
-            serde_json::json!({"12": "[ ] Ship it\n", "99": null})
+            read(&plans, &[7, 12, 13, 14, 15, 99]).unwrap(),
+            serde_json::json!({"7": "[x] Read it\n[>] Write it\n", "12": "[ ] Ship it\n",
+                "13": null, "14": null, "15": null, "99": null})
         );
         forget(&plans, 12).unwrap();
         forget(&plans, 12).unwrap();
         assert_eq!(
-            read(&plans, Some(&[12])).unwrap(),
+            read(&plans, &[12]).unwrap(),
             serde_json::json!({"12": null})
         );
         std::fs::remove_dir_all(root).unwrap();
@@ -146,15 +114,18 @@ mod tests {
         let store = root.join("state.sqlite");
         std::fs::write(&store, "").unwrap();
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../skills/plan/plan");
-        let run = |args: &[&str]| {
-            std::process::Command::new("sh")
+        // Bash, macOS's sh, counts characters under a UTF-8 locale; dash counts bytes.
+        let run_in = |shell: &str, locale: &str, args: &[&str]| {
+            std::process::Command::new(shell)
                 .arg(&script)
                 .args(args)
+                .env("LC_ALL", locale)
                 .env("AGENT_STORE", std::fs::canonicalize(&store).unwrap())
                 .env("AGENT_BOT_ID", "7")
                 .output()
                 .unwrap()
         };
+        let run = |args: &[&str]| run_in("sh", "C", args);
         let shown = run(&[]);
         assert!(shown.status.success());
         assert_eq!(String::from_utf8_lossy(&shown.stdout), "no plan yet\n");
@@ -165,8 +136,12 @@ mod tests {
             String::from_utf8_lossy(&wrote.stderr)
         );
         assert_eq!(
-            read(&dir(&store).unwrap(), None).unwrap(),
+            read(&dir(&store).unwrap(), &[7]).unwrap(),
             serde_json::json!({"7": "[x] Read it\n[>] Write it\n[ ] Ship it\n"})
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&wrote.stdout),
+            "plan saved: 3 steps\n"
         );
         // A step without its mark, or on two lines, or too long, changes nothing.
         for bad in [
@@ -186,8 +161,27 @@ mod tests {
             Some(2)
         );
         assert_eq!(
-            read(&dir(&store).unwrap(), Some(&[7])).unwrap(),
+            read(&dir(&store).unwrap(), &[7]).unwrap(),
             serde_json::json!({"7": "[x] Read it\n[>] Write it\n[ ] Ship it\n"})
+        );
+        // 200 bytes is the limit whatever the locale counts: 67 three-byte characters are 201.
+        let wide = run_in(
+            "bash",
+            "C.UTF-8",
+            &["[x] Read it", &format!("[ ] {}", "€".repeat(66))],
+        );
+        assert_eq!(wide.status.code(), Some(2));
+        let fits = run_in("bash", "C.UTF-8", &[&format!("[ ] {}", "€".repeat(65))]);
+        assert!(fits.status.success());
+        // --clear removes it, and clearing nothing is fine.
+        for _ in 0..2 {
+            let cleared = run(&["--clear"]);
+            assert!(cleared.status.success());
+            assert_eq!(String::from_utf8_lossy(&cleared.stdout), "plan cleared\n");
+        }
+        assert_eq!(
+            read(&dir(&store).unwrap(), &[7]).unwrap(),
+            serde_json::json!({"7": null})
         );
         // Outside an agent's shell it says so.
         let outside = std::process::Command::new("sh")

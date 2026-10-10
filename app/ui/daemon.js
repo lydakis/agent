@@ -34,7 +34,7 @@ window.Daemon = (() => {
       triggers: (after = null) => invoke('triggers', { after }),
       fireTrigger: (name) => invoke('trigger_fire', { name }),
       removeTrigger: (name) => invoke('trigger_remove', { name }),
-      plans: (ids = null) => invoke('plans', { ids }),
+      plans: (ids) => invoke('plans', { ids }),
       forgetPlan: (id) => invoke('plan_forget', { id }),
       hosts: () => invoke('hosts'),
       openHost: (host) => invoke('open_host', { host }),
@@ -472,7 +472,7 @@ window.Daemon = (() => {
     ]).map((x) => ({ ...x })), next_after: null }),
     fireTrigger: async (name) => { const x = (S.triggers ?? []).find((t) => t.name === name); if (x) { x.last = { outcome: 'sent', turn: 1, fired_ms: Date.now() }; x.sent = (x.sent ?? 0) + 1; } return { name, fired: true }; },
     removeTrigger: async (name) => { S.triggers = (S.triggers ?? []).filter((x) => x.name !== name); },
-    plans: async (ids = null) => Object.fromEntries((ids ?? [...(S.plans ?? new Map()).keys()]).map((id) => [id, S.plans?.get(id) ?? null])),
+    plans: async (ids) => Object.fromEntries(ids.map((id) => [id, S.plans?.get(id) ?? null])),
     forgetPlan: async (id) => { S.plans?.delete(id); },
     profiles: async () => [{ name: 'reviewer', summary: 'Reviews changes and reports bugs only', model: 'anthropic/claude-sonnet-5' }, { name: 'tester', summary: 'Keeps the test suite green', model: null }],
     // Named from the goal's longest word and dealt as the app's side does it.

@@ -3508,12 +3508,15 @@ test('a plan is its marked lines: what it has done, the step it is on, and the r
 
 test("plans are read at once, then an agent's again when it runs the plan script, and shown on its row, card and chat", async () => {
   const files = new Map([[2, '[x] Read it\n[>] Write <b>it</b>\n[ ] Ship it\n']]), asked = [];
-  const p = page({ plans: async (ids) => { asked.push(ids); return Object.fromEntries((ids ?? [...files.keys()]).map((id) => [id, files.get(id) ?? null])); } });
+  const p = page({ plans: async (ids) => { asked.push(ids); return Object.fromEntries(ids.map((id) => [id, files.get(id) ?? null])); } });
   p.S.config = { workspace: '/synthetic' }; p.S.session = 1;
   p.upsert({ name: 'app.lead', id: 1 });
   p.upsert({ name: 'app.build', id: 2, created_by: 'app.lead', created_by_id: 1 });
+  // An agent deleted from another window left a plan behind; only the seated agents' are read.
+  files.set(9, '[>] Gone\n');
   await p.loadPlans();
-  assert.deepEqual(asked, [null]);
+  assert.deepEqual(JSON.parse(JSON.stringify(asked)), [[1, 2]]);
+  assert.equal(p.S.plans.has(9), false);
   const row = () => p.botRowHTML({ b: p.S.bots.get('app.build'), depth: 1, kids: 0 });
   assert.match(row(), /<span class="step"> · Write &lt;b&gt;it&lt;\/b&gt;<\/span><\/span><span class="meta" title="steps done">1\/3<\/span>/);
   assert.equal(p.taskCard('app.build').last, '✱ Write <b>it</b>');
@@ -3541,7 +3544,7 @@ test("plans are read at once, then an agent's again when it runs the plan script
   assert.equal(p.taskCard('app.build').elapsed, '2/3');
   // A plan the agent no longer has is no longer shown.
   files.delete(2);
-  await shell('c3', `sh "$HOME/.agents/skills/plan/plan"`);
+  await shell('c3', `sh "$HOME/.agents/skills/plan/plan" --clear`);
   assert.equal(p.taskCard('app.build').elapsed, '');
   p.renderPlan(el, p.S.bots.get('app.build'));
   assert.equal(el.hidden, true);
@@ -3559,7 +3562,7 @@ test("a deleted agent's plan goes with it, and a window that cannot read plans s
   assert.deepEqual(forgot, [4]);
   assert.equal(p.S.plans.has(4), false);
   const off = page({ plans: async () => { calls += 1; throw new Error('plans_unsupported: opened on a socket'); } });
-  off.S.config = { workspace: '/synthetic' }; off.S.session = 1;
+  off.S.config = { workspace: '/synthetic' }; off.S.session = 1; off.upsert({ name: 'Cy', id: 4 });
   await off.loadPlans(); await off.loadPlans([1]);
   assert.equal(calls, 2);
   // A window on a host asks nothing.

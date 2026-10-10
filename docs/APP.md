@@ -764,9 +764,12 @@ daemon learns nothing about projects; everything here is client work.
   now or `[ ] ` to do (at most 30 steps of 200 bytes), and writes it whole
   through a temporary and a rename to `STORE-plans/BOT_ID`, beside the
   store the agent's shell names as `AGENT_STORE`, so a bot id never names
-  another store's agent. The app reads every plan when a window attaches,
+  another store's agent. It answers a write with one line, not the plan
+  back, and `--clear` removes the plan once the work it describes is done.
+  The app reads the plans of the agents it seats when a window attaches,
   and an agent's again when a shell call of its that ran the script ends:
-  nothing is watched or polled. An agent with a plan shows the step it is
+  nothing is watched or polled, and a plan left by an agent deleted from
+  another window is never read. An agent with a plan shows the step it is
   on and how many are done on its row and its task card, and the whole
   plan above its chat, whose count folds it to the current step. A
   deleted agent's plan is removed. The coordinator's profile has a task of
