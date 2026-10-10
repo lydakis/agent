@@ -264,6 +264,9 @@ enum Command {
         /// What sent it when no bot's turn did, as the client names itself
         /// (a name's characters); absent for a person.
         origin: Option<String>,
+        /// The most input plus output tokens this turn may spend, beside
+        /// the bot's own budget; absent leaves only that.
+        budget_tokens: Option<u64>,
     },
     Interrupt {
         bot: String,
@@ -2533,6 +2536,7 @@ impl Service {
                 expected_turn,
                 from,
                 origin,
+                budget_tokens,
             } => {
                 name("request_id", &request_id)?;
                 if origin.is_some() && from.is_some() {
@@ -2554,6 +2558,19 @@ impl Service {
                 if expected_turn.is_some() && delivery != Delivery::Steer {
                     return fail_with("invalid_delivery", "expected_turn needs delivery steer");
                 }
+                // A steer joins a turn that already has its cap.
+                if budget_tokens.is_some() && delivery == Delivery::Steer {
+                    return fail_with(
+                        "invalid_delivery",
+                        "budget_tokens starts a turn; a steer joins one, so send it with reject or queue",
+                    );
+                }
+                if budget_tokens.is_some_and(|n| n == 0 || n > i64::MAX as u64) {
+                    return fail_with(
+                        "invalid_budget",
+                        format!("budget_tokens must be from 1 to {}", i64::MAX),
+                    );
+                }
                 // A turn may run in another checkout or on another model of
                 // the same family; the conversation encoding never changes.
                 let options = TurnOptions {
@@ -2564,6 +2581,7 @@ impl Service {
                     expected_turn,
                     from: from.map(|author| (author.bot, author.turn)),
                     origin,
+                    budget_tokens,
                 };
                 // A slot is promised before the commit that may take it, so
                 // admissions queued together cannot start more turns than
@@ -3544,6 +3562,7 @@ mod tests {
             expected_turn: None,
             from: None,
             origin: None,
+            budget_tokens: None,
         }
     }
     /// Take requests the way the run loop does: an admission with room joins

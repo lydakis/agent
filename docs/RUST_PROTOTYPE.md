@@ -293,6 +293,16 @@ Cancellation and failures before a usage report is returned can leave usage
 unaccounted for; these totals are not a reconciliation of provider billing.
 Successful calls retain their single atomic transcript/usage commit; budget
 checks use the turn's running total without an extra database read per round.
+`submit` also accepts `budget_tokens`, a cap on the input plus output tokens
+of the turn it starts, checked where the bot's cap is. A turn past it ends as
+`failed` with `turn_budget_exhausted` and the facts `turn_budget_tokens` and
+`turn_tokens_used`; when both caps are reached the bot's `budget_exhausted`
+is named, since it outlasts the turn. The cap is stored on the turn (`turns`
+lists it as `budget_tokens`), so a resumed turn counts what it spent before
+parking, and a resend naming another cap is an `idempotency_conflict`. A
+steer joins a turn that already has its cap: `budget_tokens` with
+`delivery: "steer"` is `invalid_delivery`. A summary held beside a call
+counts toward both caps.
 
 A turn reads the same wherever a client meets it. Its view is `bot`,
 `bot_id`, `turn`, `handle`, `request_id`, `status`, `waiting_on`,

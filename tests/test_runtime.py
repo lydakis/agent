@@ -719,6 +719,27 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertEqual(sent, sorted(sent))
         self.assertGreaterEqual(sent[2] - sent[1], 900)
 
+    def test_refreshes_stop_at_the_turns_cap(self):
+        client, model, path = self.start(settings={'keep_warm': 1})
+        def run(bot, cap):
+            client.request('create', bot=bot, workspace=str(path), effort='low')
+            turn = client.request('submit', bot=bot, request_id='w', prompt='shell:sleep 2.5',
+                                  budget_tokens=cap)['result']['turn']
+            end = client.finished(turn)['data']
+            requests = []
+            while not model.requests.empty():
+                requests.append(model.requests.get())
+            usage = [m['data'] for m in client.saved
+                     if m.get('event') == 'usage' and m.get('bot') == bot]
+            return end, sum(r['max_tokens'] == 0 for r in requests), usage
+        # The call spends the cap: no call follows it, so nothing is refreshed.
+        end, warms, usage = run('Bob', 1)
+        self.assertEqual((end['error'], warms), ('turn_budget_exhausted', 0))
+        call = usage[0]['input_tokens'] + usage[0]['output_tokens']
+        # Room for one refresh: the second would bill past the cap.
+        end, warms, _ = run('Ann', call + 9)
+        self.assertEqual((end['error'], warms), ('turn_budget_exhausted', 1))
+
     def test_a_long_reply_keeps_its_own_prompt_cache_warm(self):
         client, model, path = self.start(settings={'keep_warm': 1})
         model.generate_delay = 2.5
