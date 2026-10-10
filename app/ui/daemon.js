@@ -308,6 +308,14 @@ window.Daemon = (() => {
   }
   // Home reads the fleet with `agent ls`, answers what it can, and hands a project's work to its lead.
   async function home(name, turn, prompt) {
+    // Its threads' news: it reads the one that ended and says what it found.
+    if (prompt.startsWith('Task updates: ')) {
+      const handle = /turn:[\w.-]+\/\d+/.exec(prompt)?.[0] ?? 'turn:home.dotfiles/1';
+      await tool(name, turn, 'wait', { handles: [handle], timeout_ms: 0 }, JSON.stringify({ pending: [], results: { [handle]: { status: 'completed', text: 'Sorted the aliases into four groups and dropped six that nothing calls.' } } }), 400);
+      await stream(name, turn, 'dotfiles is done: the aliases are sorted into four groups, and six that nothing calls are gone. Nothing needs you.');
+      if (!(S.bots.get(name) ?? GONE).interrupted) finish(name, turn);
+      return;
+    }
     const others = [...S.bots.values()].filter((b) => b.name !== name);
     const ls = others.map((b) => JSON.stringify({ bot: b.name, status: b.status, workspace: b.workspace })).join('\n') + '\n';
     await tool(name, turn, 'shell', { command: '"$AGENT_BIN" ls' }, JSON.stringify({ exit_code: 0, stderr: '', stdout: ls, success: true }), 400);
@@ -318,6 +326,13 @@ window.Daemon = (() => {
       await tool(name, turn, 'shell', { command: `"$AGENT_BIN" run --detach --delivery queue --bot ${lead.name} -- '${brief}'` }, JSON.stringify({ exit_code: 0, stderr: '', stdout: JSON.stringify({ bot: lead.name, status: 'queued' }) + '\n', success: true }), 400);
       setTimeout(() => reply(lead.name, brief, { bot: name, turn }), 300);
       await stream(name, turn, `Sent to ${lead.name.slice(0, -5)}'s lead; it reports back in its own chat.`);
+    } else if (/\b(draft|write|tidy|sort|clean)\b/i.test(prompt)) {
+      // Work that fits no project: Home starts a thread of its own, as a lead starts a task.
+      const thread = 'home.dotfiles', brief = prompt.replace(/'/g, ''), b = S.bots.get(name);
+      await tool(name, turn, 'shell', { command: `"$AGENT_BIN" run --detach --new --agents --bot ${thread} --model "$AGENT_MODEL" --workspace "$HOME/dotfiles" -- '${brief}'` }, JSON.stringify({ exit_code: 0, stderr: '', stdout: JSON.stringify({ bot: thread, turn: 1, status: 'running' }) + '\n', success: true }), 400);
+      if (!S.bots.has(thread)) await create(thread, `${b.provider}/${b.model}`, name, null, '/Users/you/dotfiles');
+      setTimeout(() => reply(thread, brief, { bot: name, turn }), 300);
+      await stream(name, turn, 'Started a thread for it, dotfiles, in ~/dotfiles; it reports back here when it is done.');
     } else {
       const working = others.filter((b) => b.status !== 'idle').map((b) => b.name);
       await stream(name, turn, `Needs you: nothing right now.\n\n${working.length ? `Working: ${working.join(', ')}.` : 'Nothing is running.'} notes answered its open questions: where worktrees live, and who runs the setup command.`);

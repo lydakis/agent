@@ -335,6 +335,8 @@ const HOME = 'home';
 // A file or Git tab shows no agent.
 const mainBot = () => pageOf(S.selected) ? '' : S.selected || (S.bots.has(HOME) ? HOME : '');
 const leadProject = (name) => name.length > LEAD.length && name.endsWith(LEAD) ? name.slice(0, -LEAD.length) : null;
+// Who hears of the turns of the tasks they started: a project's lead, and Home for its threads.
+const coordinates = (name) => name === HOME || !!leadProject(name);
 // Who sent a prompt that is not yours: another agent's turn, or the app on its own (`origin`), as
 // the daemon keeps them with the prompt.
 function senderOf(p) {
@@ -412,8 +414,8 @@ function tree() {
   pushSwarms(swarmsOf.get(null), 0);
   // Anything the roots do not reach is rooted where it stands: one pass, nothing hidden.
   for (const b of S.bots.values()) if (!seen.has(b.name)) { stack.push([b, 0, true, '', null]); walk(); }
-  // Home's agent is Home itself, so it alone heads no list of bots.
-  if (projects.size && out.slice(loose).some((n) => n.depth === 0 && n.b?.name !== HOME)) out.splice(loose, 0, { label: 'bots' });
+  // Home's agent is Home itself: its own row heads no list, and its threads are listed at Home.
+  if (projects.size && out.slice(loose).some((n) => n.b?.name !== HOME && (n.depth === 0 || (n.depth === 1 && creatorOf(n.b)?.name === HOME)))) out.splice(loose, 0, { label: 'bots' });
   return out;
 }
 // The path a read, write or edit names, whole (the summary is cut for display); none when it cannot be one.
@@ -1066,7 +1068,8 @@ function enqueue(job) { chain = chain.then(job, job); return chain; }
 const WAKE_MS = 10 * 60 * 1000, WAKE_TASKS = 32, KINDS = ['act', 'theirs'];
 function tellLead(name, turn, status, from, approval, origin) {
   const b = bot(name), lead = b && creatorOf(b);
-  if (!lead || !leadProject(lead.name) || name.startsWith(`${lead.name}-`)) return;
+  // A coordinator heads its own project, whoever made it: its turns are no one's task updates.
+  if (!lead || !coordinates(lead.name) || leadProject(name) || name.startsWith(`${lead.name}-`)) return;
   if (lead.waitingOn?.includes(`turn:${name}/${turn}`)) return;
   let w = S.wakes.get(lead.name);
   if (!w) { w = { tasks: new Map(), last: 0, timer: null }; S.wakes.set(lead.name, w); }
@@ -2714,9 +2717,9 @@ function levelOf(open) {
     const n = all[i];
     if (n.label) { if (open) break; out.push(n); continue; }
     if (n.depth <= depth) break;
-    // Home shows its agent's chat, not its row; what that agent made is a level below it.
+    // Home shows its agent's chat, not its row; the threads that agent made are listed in its place.
     if (n.depth === depth + 1) home = !open && n.b?.name === HOME;
-    if (home) continue;
+    if (home) { if (n.depth === depth + 2) out.push({ ...n, kids: 0 }); else if (n.depth === depth + 3) out.at(-1).kids += 1; continue; }
     if (n.depth === depth + 1) out.push({ ...n, kids: 0 }); else if (n.depth === depth + 2) out.at(-1).kids += 1;
   }
   return out;

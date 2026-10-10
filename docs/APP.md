@@ -105,6 +105,13 @@ demo project handed to its lead. Home's agent is not a row in the list.
 
 ![Home's chat with two answers](app/home-chat.png)
 
+Work that fits no project becomes a thread Home starts itself, here
+`home.dotfiles` in `~/dotfiles`: the thread is listed at Home under the
+projects, and its end comes back to Home as task updates, which it reads
+and reports.
+
+![Home started home.dotfiles, listed under the projects, and reported its end](app/home-thread.png)
+
 ### Plans
 
 Captured 2026-10-10. A task that keeps a plan shows its count and current
@@ -762,15 +769,22 @@ daemon learns nothing about projects; everything here is client work.
   `ls --name 'PROJECT.*'`, `ls --name '*.lead'`,
   `turns --newest --limit 3`) so a large fleet costs neither the daemon
   a full listing nor the shell its output limit, hand a project's work to its lead with
-  `run --detach --delivery queue`, change no files and start no agents of
-  its own. Until it exists, Home says what it is for, and the first message
+  `run --detach --delivery queue`, and change no files itself. Other work
+  goes to a thread it starts as a lead starts a task: `home.NAME`, on
+  Home's model, in the folder the work is about (its own worktree when it
+  changes files in a git repository), and later work in that area goes
+  back to the same thread. Home hears of its threads' turns as a lead
+  does, in task updates, and adds itself triggers to check on things.
+  A project's lead reads the same cross-project listings, so it sees
+  what Home sees and hands another project's work to that project's lead.
+  Until it exists, Home says what it is for, and the first message
   sent there opens **Start Home**, a model and an effort as every agent
   takes, then creates it and sends that message; Cancel puts the message
   back in the composer. At Home the main pane is its chat, its head
   "Home" with its state, and away from Home the Home button shows that
   state (working, waiting, done, failed); it is never a row in the list or a tab, and
-  opening it by name, from the finder or a crumb, opens Home. What it made
-  sits a level below it, reached from the finder. Home's agent is local
+  opening it by name, from the finder or a crumb, opens Home. The threads
+  it started are listed at Home after the projects, with the bots in none. Home's agent is local
   only, as projects are. Start Home also adds its heartbeat, on unless
   unchecked: a trigger (`home.heartbeat`) every 30 minutes whose check,
   `~/.agent/trigger changed --except home`, lets it fire only when an agent
@@ -806,7 +820,7 @@ daemon learns nothing about projects; everything here is client work.
   coordinator shell-quoted.
 - **Navigation.** Home, then a tab for each agent opened full screen, on a
   bar of floating tabs. The list on the right holds one level below what is
-  open: at Home the projects and the bots in none, in a project its threads
+  open: at Home the projects, then Home's threads and the bots in none, in a project its threads
   and swarms, in a thread what it made, in a swarm its agents, and in a swarm
   agent what it made; each row
   counts the rows one further down. A click on a row looks in beside, in
