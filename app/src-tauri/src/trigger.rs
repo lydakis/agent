@@ -4126,12 +4126,18 @@ mod tests {
         };
         git(&["merge", "-q", "--ff-only", &three]);
         assert!(!moved(&root, &looked).0);
-        // A HEAD the repository no longer has (made again) is not known.
+        // A HEAD the repository no longer has (made again) excludes nothing:
+        // what HEAD reaches is news when it was committed since the last look.
         let gone = Seen {
             head: Some("0".repeat(40)),
-            ..at_main
+            ..at_first.clone()
         };
         assert!(moved(&root, &gone).0);
+        let gone_after = Seen {
+            at: looked.at,
+            ..gone
+        };
+        assert!(!moved(&root, &gone_after).0);
         assert!(
             commit(root.join("nope").to_str().unwrap())
                 .unwrap_err()
