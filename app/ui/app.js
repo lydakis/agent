@@ -1269,7 +1269,8 @@ function forgetStore() {
   for (const w of S.wakes.values()) clearTimeout(w.timer);
   S.wakes.clear(); S.turnFrom.clear(); S.turnOrigin.clear(); S.answerTo.clear(); S.heldNews = []; S.answered.clear();
   for (const timer of S.forwarding.values()) clearTimeout(timer); S.forwarding.clear(); S.unseen.clear(); S.wanted.clear();
-  S.selected = ''; S.ui.tabs = []; S.ui.side = null; S.ui.gitFrom.clear(); dropFile(); dropTabFile();
+  for (const g of S.ui.git.values()) clearTimeout(g.timer);
+  S.selected = ''; S.ui.tabs = []; S.ui.side = null; S.ui.git.clear(); S.ui.gitFrom.clear(); dropFile(); dropTabFile();
   S.botsGen += 1; S.shapeGen += 1;
   // A home the last host named is not this one's.
   if (S.homeWorkspace) { S.config.workspace = null; S.homeWorkspace = false; }
@@ -1975,10 +1976,13 @@ function gitPanel(g, panel) { if (g.panel === panel) return; g.panel = panel; g.
 // A change opens its file in a tab; a worktree opens its own Git tab.
 async function gitOpen(g, it) {
   if (!it || !g.view) return;
-  if (g.panel === 'changes' && !it.path.endsWith('/') && !it.code.includes('D')) await go(`${FILE}${trimDir(g.view.root)}/${it.path}`, 'tab');
+  if (g.panel === 'changes' && !it.path.endsWith('/') && !fileGone(it.code)) await go(`${FILE}${trimDir(g.view.root)}/${it.path}`, 'tab');
   else if (g.panel === 'worktrees' && trimDir(it.path) !== trimDir(g.dir)) await go(GIT + it.path, 'tab');
 }
 function scrollGitRow() { $('log').querySelector('.gbox.on .gi.sel')?.scrollIntoView?.({ block: 'nearest' }); }
+// A change whose file is not in the folder: deleted there, or by both sides of a merge. One side's
+// deletion in a conflict (UD, DU) leaves the other side's file to open.
+const fileGone = (code) => code === 'DD' || (!code.includes('U') && code.includes('D'));
 const CHANGE_WORD = { M: 'modified', A: 'added', D: 'deleted', R: 'renamed', C: 'copied', U: 'in conflict', T: 'type changed', '?': 'new, not tracked' };
 const changeWord = (code) => [...new Set([...code.trim()].map((c) => CHANGE_WORD[c]).filter(Boolean))].join(', ');
 function gitRowsHTML(g, panel) {
@@ -1999,7 +2003,7 @@ function gitDiffHTML(g) {
   if (!it) return '';
   const head = g.panel === 'commits'
     ? `<div class="ghead"><span class="sha">${esc(it.sha.slice(0, 12))}</span> <b>${esc(it.subject)}</b><br><span class="d">${esc(it.author)} · ${esc(it.when)}</span></div>`
-    : `<div class="ghead"><b>${esc(it.path)}</b> <span class="d">· ${esc(changeWord(it.code))}${it.code.includes('D') || it.path.endsWith('/') ? '' : ' · Enter opens it'}</span></div>`;
+    : `<div class="ghead"><b>${esc(it.path)}</b> <span class="d">· ${esc(changeWord(it.code))}${fileGone(it.code) || it.path.endsWith('/') ? '' : ' · Enter opens it'}</span></div>`;
   if (!d || (d.state === 'loading' && !d.rows.length)) return `${head}<div class="gnote">reading…</div>`;
   if (d.state === 'error') return `${head}<div class="line out bad">${esc(d.error)}</div>`;
   const owner = gitOwner(g.dir), seen = new Map();
