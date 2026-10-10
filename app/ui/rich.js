@@ -51,15 +51,17 @@ window.Rich = (() => {
   // filters, a chart's `sequence` to a billion, a Mermaid `space:500000`), so each runs only when
   // asked, block by block. `page` draws it at once, for a file someone opened.
   // A diagram or chart in a message carries an id: where it was drawn (`scope`, its message or
-  // file), which of the diagrams and charts there it is (`nth`), and what it draws. Its streamed
-  // draft, the message committed, and the message drawn anew for highlighting all give it the same
-  // id, so the one someone asked for stays shown; every other block, a copy of it included, still
-  // asks. Without a scope each block is its own.
-  let scope = null, nth = 0, blockId = 0;
+  // file), which of the diagrams and charts there it is (`nth`), and what it draws. The message
+  // drawn anew, for highlighting or a pane redrawn, gives it the same id, so the one someone asked
+  // for stays shown; every other block, a copy of it included, still asks. Without a scope each
+  // block is its own. While a reply streams (`draft`), its diagrams, charts and pages are code: one
+  // is drawn once the reply is in and has the id it keeps.
+  let scope = null, nth = 0, blockId = 0, draft = false;
   const digest = (s) => { let a = 0x811c9dc5, b = 5381; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); a = Math.imul(a ^ c, 0x01000193); b = (Math.imul(b, 33) + c) | 0; } return `${s.length}.${(a >>> 0).toString(36)}.${(b >>> 0).toString(36)}`; };
   const lazy = (page, kind, text) => page ? ' data-run' : ` data-id="${esc(scope == null ? `#${++blockId}` : `${scope}|${nth++}|${kind}|${digest(text)}`)}"`;
   function block(text, info, page = false) {
     const lang = (info ?? '').trim().split(/\s+/)[0].toLowerCase();
+    if (draft) return `<div class="rc" data-kind="code">${head(lang, '')}${pre(text, lang)}</div>`;
     if (lang === 'mermaid' || lang === 'mmd') return `<div class="rc" data-kind="mermaid" data-lazy${lazy(page, 'mermaid', text)} data-view="code">${head('mermaid', toggle)}<div class="view"></div>${pre(text, '')}</div>`;
     if (CHART.has(lang)) return `<div class="rc" data-kind="chart" data-lang="${lang === 'vega' ? 'vega' : 'vega-lite'}" data-lazy${lazy(page, lang, text)} data-view="code">${head(lang, toggle)}<div class="view"></div>${pre(text, 'json')}</div>`;
     if (lang === 'html' || lang === 'htm') return `<div class="rc" data-kind="html" data-view="${page ? 'view' : 'code'}">${head(lang, '<button type="button" data-rich="view"></button>')}<div class="view frame"></div>${pre(text, 'xml')}</div>`;
@@ -67,6 +69,12 @@ window.Rich = (() => {
     if (lang === 'svg' && /^\s*(<\?xml[^>]*>\s*)?<svg\b/i.test(text)) return `<div class="rc" data-kind="svg" data-view="${page ? 'view' : 'code'}">${head(lang, '<button type="button" data-rich="view"></button>')}<div class="view"></div>${pre(text, 'xml')}</div>`;
     return `<div class="rc" data-kind="code">${head(lang, '')}${pre(text, lang)}</div>`;
   }
+  // A reference defined once can be used thousands of times, and each use copies its target into
+  // the page: a message's links and images carry at most 1 Mi characters of targets and titles in
+  // all (`linkLeft`, shared like the other bounds); past that a link is its text.
+  const LINK_CHARS = 1 << 20;
+  let linkLeft = LINK_CHARS;
+  const linkCost = (href, title) => { const n = (href?.length ?? 0) + (title?.length ?? 0); if (n > linkLeft) return false; linkLeft -= n; return true; };
   let md = null;
   function parser() {
     if (md || !globalThis.marked) return md;
@@ -80,12 +88,12 @@ window.Rich = (() => {
         table(token) { return token.header.length > COLUMNS || token.header.length * (token.rows.length + 1) > CELLS ? block(token.raw.replace(/\n+$/, ''), '') : false; },
         // A link to a path opens that file beside, from the agent's folder; its `#` href lets Tab and
         // Enter reach it, and the click handler keeps it from navigating.
-        link({ href, title, tokens }) { const inner = this.parser.parseInline(tokens), t = title ? ` title="${esc(title)}"` : ''; return linkable(href) ? `<a href="${esc(href)}"${t}>${inner}</a>` : filePath(href) ? `<a class="file" href="#" data-file="${esc(filePath(href))}"${t}>${inner}</a>` : inner; },
+        link({ href, title, tokens }) { const inner = this.parser.parseInline(tokens); if (!linkCost(href, title)) return inner; const t = title ? ` title="${esc(title)}"` : ''; return linkable(href) ? `<a href="${esc(href)}"${t}>${inner}</a>` : filePath(href) ? `<a class="file" href="#" data-file="${esc(filePath(href))}"${t}>${inner}</a>` : inner; },
         // An image draws only from data the message carries, and only on a click: a small PNG can
         // decode to hundreds of megabytes and an animated one takes CPU for as long as it shows.
         // A remote image is a link and a local one opens beside, so drawing a message fetches
         // nothing a model chose.
-        image: ({ href, text }) => /^data:image\/(png|gif|jpe?g|webp)[;,]/i.test(href ?? '') ? `<button type="button" class="img" data-img="${esc(href)}" title="${esc(text)}">image${text ? `: ${esc(text)}` : ''}</button>` : linkable(href) ? `<a href="${esc(href)}">${esc(text || href)}</a>` : filePath(href) ? `<a class="file" href="#" data-file="${esc(filePath(href))}">${esc(text || href)}</a>` : esc(text),
+        image: ({ href, text }) => !linkCost(href, text) ? esc(text) : /^data:image\/(png|gif|jpe?g|webp)[;,]/i.test(href ?? '') ? `<button type="button" class="img" data-img="${esc(href)}" title="${esc(text)}">image${text ? `: ${esc(text)}` : ''}</button>` : linkable(href) ? `<a href="${esc(href)}">${esc(text || href)}</a>` : filePath(href) ? `<a class="file" href="#" data-file="${esc(filePath(href))}">${esc(text || href)}</a>` : esc(text),
       },
     });
     return md;
@@ -110,9 +118,10 @@ window.Rich = (() => {
   const asText = (text) => `<div class="rc" data-kind="code">${head('text', '')}<pre class="code"><code>${esc(text)}</code></pre></div>`;
   // `used` carries the bounds across the pieces of one message drawn apart, as a streamed reply's
   // blocks are; once over, `used.over` is set and that piece is text. `used.scope` names where its
-  // diagrams and charts were drawn and `used.blocks` counts those drawn before it (see `lazy`).
+  // diagrams and charts were drawn and `used.blocks` counts those drawn before it (see `lazy`);
+  // `used.draft` marks a reply still streaming.
   function html(text, used = { lines: 0, tags: 0, code: 0 }) {
-    waited = false; spent = used.code ?? 0; scope = used.scope ?? null; nth = used.blocks ?? 0;
+    waited = false; spent = used.code ?? 0; scope = used.scope ?? null; nth = used.blocks ?? 0; draft = !!used.draft; linkLeft = LINK_CHARS - (used.links ?? 0);
     const p = parser();
     if (!p) return `<p>${esc(text)}</p>`;
     if (used.over) return asText(text);
@@ -122,7 +131,7 @@ window.Rich = (() => {
     used.code = spent;
     const tags = count(out, '<', TAGS - used.tags);
     if (used.tags + tags > TAGS) { waited = false; used.over = true; return asText(text); }
-    used.lines += lines; used.tags += tags; used.blocks = nth;
+    used.lines += lines; used.tags += tags; used.blocks = nth; used.links = LINK_CHARS - linkLeft;
     return out;
   }
 
@@ -333,7 +342,7 @@ window.Rich = (() => {
   }
   // `waited` says the view is code that highlighting, once loaded, would draw differently.
   function file(path, bytes, more = false, asked = true) {
-    spent = 0; waited = false; scope = `file ${path}`; nth = 0;
+    spent = 0; waited = false; scope = `file ${path}`; nth = 0; draft = false;
     const ext = extOf(path), note = more ? `<div class="line note">showing the first ${Math.round(bytes.length / 1048576)} MiB</div>` : '';
     if (IMAGE[ext]) {
       if (more) return { html: '<div class="line note">image too large to show</div>' };

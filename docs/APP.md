@@ -1185,10 +1185,14 @@ that would draw past 100,000 tags, shows as its text, as a `- x` line makes
 an element from four bytes. One with more than 100,000 marks that open an
 inline element (`*`, `_`, a backtick, `[`, `<`, `~`, `|`, `@`, `www.`,
 `://`) is not parsed either: the parser's tokens for a single line of `*x*`
-cost far more than the HTML they become. A streamed reply's blocks share
-those bounds and the highlighting budget below, as do the text blocks of one
-stored message on either side of its tool calls; past them the rest shows as
-text. Fenced blocks are drawn by their language:
+cost far more than the HTML they become. A link's target and title are
+copied into the page once per use, and a reference defined once can be used
+thousands of times, so a message's links and images carry at most 1 Mi
+characters of targets and titles in all; past that a link is its text. A
+streamed reply's blocks share those bounds and the highlighting budget below,
+as do the text blocks of one stored message on either side of its tool calls,
+and a later block is drawn anew when an earlier one's share changes (as when
+highlighting arrives); past them the rest shows as text. Fenced blocks are drawn by their language:
 
 - **Code** is highlighted with [highlight.js](https://highlightjs.org) (its
   common languages) in the window's own colors, with a copy button. A block
@@ -1210,10 +1214,11 @@ text. Fenced blocks are drawn by their language:
   as generated code. A chart in a message opens as its spec and draws with a
   click on **chart**: Vega draws on the window's thread, and a few characters
   of spec (a `sequence` transform to a billion, a billion ticks) can ask it
-  for more than it can draw. A diagram or chart drawn shows again when its
-  pane is redrawn, when the reply it streamed in is committed, and when its
-  message is drawn anew for highlighting: its id is its message (or file),
-  its place among the diagrams and charts there, and its source. Every other
+  for more than it can draw. While a reply streams, its diagrams and charts
+  (and pages and SVG) show as code; each can be drawn once the reply is in.
+  A diagram or chart drawn shows again when its pane is redrawn and when its
+  message is drawn anew for highlighting: its id is its message's node (or
+  its file), its place among the diagrams and charts there, and its source. Every other
   block still asks, a copy in the same reply included, so one click never
   fills a chat of copies; one whose source changed, as in a file an agent
   rewrote, asks too. One that fails to draw shows its error and

@@ -264,32 +264,47 @@ test('a diagram someone asked for shows again; an identical one elsewhere still 
   assert.equal(old.view.innerHTML, ''); assert.equal(recent.view.innerHTML, '<svg>graph TD</svg>');
 });
 
-test('a diagram asked for while its reply streamed stays shown once the reply is committed', async () => {
+test('a reply\'s diagram is code while it streams, and keeps one id per copy once it is in', async () => {
   const reply = 'First:\n\n```mermaid\ngraph TD\n```\n\nand on.';
   const p = page({ request: async () => ({ type: 'message', role: 'assistant', content: [{ type: 'text', text: reply }] }) }), Rich = p.context.Rich, t = p.transcript('Bob');
-  const idOf = (html) => html.match(/data-id="([^"]*)"/)[1];
+  const ids = (html) => [...html.matchAll(/data-id="([^"]*)"/g)].map((m) => m[1]);
   t.streamingTurn = 7; t.streamGen = 1; t.text = '';
   const el = { dataset: {}, children: [], replaceChildren(...nodes) { this.children = nodes; } };
   for (const ch of reply) { t.text += ch; p.renderTail(el, 'Bob', t); }
-  const streamed = idOf(el.children[0].children.map((c) => c.html).join(''));
+  const streamed = el.children[0].children.map((c) => c.html).join('');
+  assert.match(streamed, /data-kind="code"><div class="rh"><span class="lang">mermaid/); assert.doesNotMatch(streamed, /data-lazy|data-rich="view"/);
   await p.onEvent({ event: 'message', bot: 'Bob', turn: 7, data: { node: 3 } }); await p.loadBatch('Bob');
-  const text = t.items.find((it) => it.kind === 'text');
-  assert.equal(idOf(p.textHTML(text)), streamed);
-  // Drawn anew when highlighting arrives, it keeps the id; in another turn or file, or changed, it asks.
-  text.htmlOf = null; assert.equal(idOf(p.textHTML(text)), streamed);
-  assert.notEqual(idOf(Rich.html(reply, { lines: 0, tags: 0, code: 0, scope: 'Bob|8' })), streamed);
-  assert.notEqual(idOf(Rich.html(reply.replace('TD', 'LR'), { lines: 0, tags: 0, code: 0, scope: 'Bob|7' })), streamed);
-  assert.notEqual(idOf(Rich.file('/w/d.md', new TextEncoder().encode(reply), false, false).html), streamed);
-  // Copies of one diagram, in one reply or in the turn's next message, are each their own.
-  const ids = (html) => [...html.matchAll(/data-id="([^"]*)"/g)].map((m) => m[1]);
-  const twice = ids(Rich.html(`${reply}\n\n${reply}`, { lines: 0, tags: 0, code: 0, scope: text.scope }));
-  assert.equal(twice.length, 2); assert.equal(twice[0], streamed); assert.notEqual(twice[1], streamed);
-  t.streamingTurn = 7; t.streamGen = 2; t.text = '';
-  for (const ch of reply) { t.text += ch; p.renderTail(el, 'Bob', t); }
-  const next = idOf(el.children[0].children.map((c) => c.html).join(''));
-  assert.notEqual(next, streamed);
-  await p.onEvent({ event: 'message', bot: 'Bob', turn: 7, data: { node: 5 } }); await p.loadBatch('Bob');
-  assert.equal(idOf(p.textHTML(t.items.filter((it) => it.kind === 'text')[1])), next);
+  const text = t.items.find((it) => it.kind === 'text'), [id] = ids(p.textHTML(text));
+  assert.match(id, /^Bob\|3\|0\|mermaid\|/);
+  // Drawn anew when highlighting arrives, it keeps the id; in another message or file, or changed, it asks.
+  text.htmlOf = null; assert.deepEqual(ids(p.textHTML(text)), [id]);
+  assert.notEqual(ids(Rich.html(reply, { lines: 0, tags: 0, code: 0, scope: 'Bob|5' }))[0], id);
+  assert.notEqual(ids(Rich.html(reply.replace('TD', 'LR'), { lines: 0, tags: 0, code: 0, scope: 'Bob|3' }))[0], id);
+  assert.notEqual(ids(Rich.file('/w/d.md', new TextEncoder().encode(reply), false, false).html)[0], id);
+  // Copies of one diagram in one reply are each their own.
+  const twice = ids(Rich.html(`${reply}\n\n${reply}`, { lines: 0, tags: 0, code: 0, scope: 'Bob|3' }));
+  assert.equal(twice.length, 2); assert.equal(twice[0], id); assert.notEqual(twice[1], id);
+});
+
+test('a message\'s later blocks are drawn anew when an earlier one\'s share of its bounds changes', () => {
+  const p = page(), list = '- x\n'.repeat(20000);
+  const es = p.entries({ role: 'assistant', content: [{ type: 'text', text: 'short' }, { type: 'tool_use', id: 'c1', name: 'read', input: {} }, { type: 'text', text: list }] });
+  const [first, later] = es.filter((e) => e.kind === 'text');
+  p.textHTML(first); assert.match(p.textHTML(later), /<li>/);
+  // The first block draws again with far more tags (as highlighting arriving can make it): the later one is past the bound.
+  first.text = '- y\n'.repeat(40000); p.textHTML(first);
+  assert.doesNotMatch(p.textHTML(later), /<li>/);
+});
+
+test('a reference used many times copies at most 1 Mi characters of targets into the page', () => {
+  const p = page(), Rich = p.context.Rich, target = 'https://example.com/' + 'a'.repeat(100000);
+  const out = Rich.html(`[x][a] `.repeat(5000) + `\n\n[a]: ${target}`);
+  assert.ok(out.length < 2 * 1024 * 1024, `${out.length} characters`);
+  assert.equal((out.match(/<a href=/g) ?? []).length, 10);
+  // The budget is shared by the pieces of one message, as a streamed reply's are.
+  const used = { lines: 0, tags: 0, code: 0 }, piece = `[x][a]\n\n[a]: ${target}\n\n`;
+  let links = 0; for (let i = 0; i < 20; i++) links += (Rich.html(piece, used).match(/<a href=/g) ?? []).length;
+  assert.equal(links, 10);
 });
 
 test('a diagram that failed to draw asks again before it is tried again', async () => {
