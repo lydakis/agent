@@ -711,7 +711,8 @@ async function onEvent(ev) {
       if (call) { call.done = true; if (call.started) call.took = Date.now() - call.started; call.started = 0; patchRun(name, call); }
       const shown = S.ui.file;
       // Read again as the agent left it; what it wrote is new, so a page, diagram or image in it waits for a click.
-      if (shown && call?.path && (call.name === 'write' || call.name === 'edit') && joinPath(bot(name)?.workspace ?? S.config?.workspace ?? '', call.path) === shown.full) openFile(shown.bot, shown.full, false);
+      // A write or edit that failed or was refused changed nothing, and what is shown keeps running.
+      if (shown && !data.failed && !data.denied && call?.path && (call.name === 'write' || call.name === 'edit') && joinPath(bot(name)?.workspace ?? S.config?.workspace ?? '', call.path) === shown.full) openFile(shown.bot, shown.full, false);
       if (typeof data.node === 'number') {
         pushNode(t, { kind: 'node', node: data.node, callId: data.call_id, turn });
         if (call && (call.background || call.name === 'wait') && await loadWaitOrProc(name, data.node, call)) {
@@ -933,8 +934,6 @@ async function loadBatch(name) {
           count(t, live, -1); t.items.splice(t.items.indexOf(live), 1);
         }
       }
-      // A message's diagrams keep the consent given while it streamed: both are scoped to its turn.
-      if (e.kind === 'text') e.scope = `${name}|${it.turn ?? `node ${it.node}`}`;
       rep.push({ ...e, callId: e.callId ?? it.callId, turn: it.turn });
     }
     const size = r.ok ? JSON.stringify(r.ok).length * 2 : 0;
@@ -1279,18 +1278,44 @@ function inline(text) {
 // A message's Markdown, drawn once and kept with the item: a pane drawn again reuses it, and it is
 // drawn anew only when its text changes or, for one whose code waited, highlighting arrives (see
 // `Rich.onReady`). What it keeps counts toward the transcript's decoded bytes, so the window's bound
-// holds.
+// holds, and so does what it puts on the page and what parsing it cost: each tag it draws counts
+// `TAG_BYTES` and each mark parsed `MARK_BYTES`, so a window holds about 200,000 drawn tags and
+// 500,000 parsed marks however the messages split them, and opening a chat parses a bounded amount.
+const TAG_BYTES = 40, MARK_BYTES = 16;
 function textHTML(it, t) {
-  if (it.htmlOf !== it.text || (it.htmlWaited && it.htmlAt !== Rich.version)) {
-    // A block after the first of its message starts from what the blocks before it drew.
-    const used = { lines: 0, tags: 0, code: 0, scope: it.scope };
-    for (const s of it.budget?.spent.slice(0, it.sib) ?? []) if (s) { used.lines += s.lines; used.tags += s.tags; used.code += s.code; used.over ||= s.over; }
+  // A block after the first of its message starts from what the blocks before it drew, and is drawn
+  // anew when that changes (an earlier block highlighted once highlighting arrived).
+  const used = { lines: 0, tags: 0, code: 0, links: 0, marks: 0, over: false };
+  for (const s of it.budget?.spent.slice(0, it.sib) ?? []) if (s) { used.lines += s.lines; used.tags += s.tags; used.code += s.code; used.links += s.links; used.marks += s.marks; used.over ||= s.over; }
+  const from = `${used.lines} ${used.tags} ${used.code} ${used.links} ${used.marks} ${used.over}`;
+  if (it.htmlOf !== it.text || it.htmlFrom !== from || (it.htmlWaited && it.htmlAt !== Rich.version)) {
     const start = { ...used }, html = `<div class="md">${Rich.html(it.text, used)}</div>`;
-    if (it.budget) it.budget.spent[it.sib] = { lines: used.lines - start.lines, tags: used.tags - start.tags, code: used.code - start.code, over: !!used.over };
-    const d = 2 * (html.length - (it.html?.length ?? 0)); it.bytes = (it.bytes || 0) + d; if (t) t.bytes = Math.max(0, (t.bytes || 0) + d);
-    it.html = html; it.htmlOf = it.text; it.htmlAt = Rich.version; it.htmlWaited = Rich.waited;
+    const tags = used.tags - start.tags, mk = used.marks - start.marks, cost = 2 * html.length + TAG_BYTES * tags + MARK_BYTES * mk;
+    if (it.budget) it.budget.spent[it.sib] = { lines: used.lines - start.lines, tags, code: used.code - start.code, links: used.links - start.links, marks: mk, over: !!used.over };
+    const d = cost - (it.drawnBytes ?? 0); it.drawnBytes = cost; it.bytes = (it.bytes || 0) + d; if (t) t.bytes = Math.max(0, (t.bytes || 0) + d);
+    it.html = html; it.htmlOf = it.text; it.htmlFrom = from; it.htmlAt = Rich.version; it.htmlWaited = Rich.waited;
   }
   return it.html;
+}
+// A transcript's drawn HTML is kept while it is on screen, and for the most recently shown others up
+// to 16 MiB in all, so going back to one is quick; past that the oldest let theirs go and are parsed
+// again when shown. The 8 MiB bound is each transcript's, so this one is the window's.
+const OFF_SCREEN_BYTES = 16 * 1024 * 1024, drawnBy = new Map(); let drawnOn = '';
+function releaseDrawn(shown) {
+  const on = shown.join('\n'); if (on === drawnOn) return; drawnOn = on;
+  for (const name of shown) { const t = S.transcripts.get(name); drawnBy.delete(name); if (t) drawnBy.set(name, t); }
+  let kept = 0;
+  for (const [name, t] of [...drawnBy].reverse()) {
+    if (S.transcripts.get(name) !== t) { drawnBy.delete(name); continue; }
+    if (shown.includes(name)) continue;
+    let bytes = 0; for (const it of t.items) bytes += it.drawnBytes ?? 0;
+    if (kept + bytes <= OFF_SCREEN_BYTES) { kept += bytes; continue; }
+    for (const it of t.items) if (it.drawnBytes) {
+      it.bytes = Math.max(0, (it.bytes || 0) - it.drawnBytes); t.bytes = Math.max(0, (t.bytes || 0) - it.drawnBytes);
+      it.html = it.htmlOf = it.htmlFrom = undefined; it.drawnBytes = 0;
+    }
+    drawnBy.delete(name);
+  }
 }
 const moreButton = (name) => `<button type="button" class="ibtn" data-act="more" data-who="${esc(name)}" title="More" aria-label="More">⋯</button>`;
 function cardInner({ status, name, last, elapsed, body }) {
@@ -1463,7 +1488,7 @@ function renderTail(el, name, t) {
     line.replaceChildren(text, cursor);
     const done = kind === 'text' ? document.createElement('div') : null; if (done) done.className = 'md';
     el.replaceChildren(...(kind || running ? [done, line].filter(Boolean) : []));
-    state = { transcript: t, kind, turn: t.streamingTurn, gen: t.streamGen, offset: 0, text, running, done, cut: {}, drawn: 0, used: { lines: 0, tags: 0, code: 0, scope: `${name}|${t.streamingTurn}` } };
+    state = { transcript: t, kind, turn: t.streamingTurn, gen: t.streamGen, offset: 0, text, running, done, cut: {}, drawn: 0, used: { lines: 0, tags: 0, code: 0, draft: true } };
     tails.set(el, state);
   }
   if (value.length <= state.offset) return;
@@ -1473,7 +1498,7 @@ function renderTail(el, name, t) {
   // blocks share one message's bounds (`used`); past them the rest streams as plain text.
   const at = state.done && !state.used.over ? Rich.cut(state.cut, value) : 0;
   if (at > state.drawn) {
-    const box = document.createElement('div'); box.innerHTML = Rich.html(value.slice(state.drawn, at), state.used);
+    const box = document.createElement('div'); box.innerHTML = Rich.html(value.slice(state.drawn, at), state.used); state.waited ||= Rich.waited;
     const added = [...box.childNodes]; state.done.append(...added);
     for (const n of added) if (n.nodeType === 1) Rich.hydrate(n);
     state.text.data = value.slice(at); state.drawn = at;
@@ -1558,24 +1583,26 @@ function openFileFrom(path, el) {
   const who = beside ? S.ui.side : S.selected, b = bot(who);
   return openFile(who, joinPath(b?.workspace ?? S.config?.workspace ?? '', path));
 }
-// `asked`: someone opened it, so what it holds draws at once.
+// `asked`: someone opened it, so what it holds draws at once. `gen` counts every opening and load
+// across closes, so a view never shares a key with one before it.
+let fileGen = 0;
 async function openFile(who, full, asked = true) {
   const old = S.ui.file;
   if (old?.url) URL.revokeObjectURL(old.url);
-  const f = S.ui.file = { bot: who, full, asked, gen: (old?.gen ?? 0) + 1, state: 'loading', view: null, url: null };
+  const f = S.ui.file = { bot: who, full, asked, gen: ++fileGen, state: 'loading', view: null, url: null };
   render();
   try {
     const bytes = new Uint8Array(await Daemon.readFile(full));
     if (S.ui.file !== f) return;
-    Object.assign(f, { state: 'ok', bytes: bytes.subarray(0, FILE_CAP), more: bytes.length > FILE_CAP, gen: f.gen + 1 });
-  } catch (e) { if (S.ui.file !== f) return; Object.assign(f, { state: 'error', error: String(e?.message ?? e), gen: f.gen + 1 }); }
+    Object.assign(f, { state: 'ok', bytes: bytes.subarray(0, FILE_CAP), more: bytes.length > FILE_CAP, gen: ++fileGen });
+  } catch (e) { if (S.ui.file !== f) return; Object.assign(f, { state: 'error', error: String(e?.message ?? e), gen: ++fileGen }); }
   render();
 }
 // A file opened from an agent goes with that agent, and with the store it came from.
 function dropFile() {
   const f = S.ui.file; if (!f) return false;
   if (f.url) URL.revokeObjectURL(f.url);
-  S.ui.file = null; $('side').dataset.key = ''; $('side').dataset.who = ''; $('sidetitle').dataset.k = '';
+  S.ui.file = null; $('side').dataset.key = ''; $('side').dataset.who = ''; $('side').dataset.shows = ''; $('sidetitle').dataset.k = '';
   return true;
 }
 // The chat it covered is on screen again, and what it finished meanwhile is seen.
@@ -1595,7 +1622,9 @@ function renderFile() {
   $('sidetitle').dataset.k = key;
   $('sidetitle').innerHTML = `<div class="crumbs"><b>${esc(name)}</b><span class="branch" title="${esc(f.full)}">${esc(where)}</span></div><div class="tools"><button type="button" class="ibtn" data-act="close-file" title="Close (Esc)" aria-label="Close">✕</button></div>`;
   el.innerHTML = `<div class="fview">${f.state === 'loading' ? '<div class="line pending">reading…</div>' : f.state === 'error' ? `<div class="line out bad">${esc(f.error)}</div>` : f.view}</div>`;
-  el.dataset.key = key; el.dataset.who = ''; el.scrollTop = 0;
+  // A file drawn again (highlighting arrived, an agent rewrote it) keeps the reader's place.
+  if (el.dataset.shows !== f.full) el.scrollTop = 0;
+  el.dataset.key = key; el.dataset.who = ''; el.dataset.shows = f.full;
   // A chart fills the pane's width, so it is measured once the pane has finished opening.
   const opening = $('app')?.getAnimations?.() ?? [];
   if (!opening.length) Rich.hydrate(el);
@@ -2092,6 +2121,7 @@ function render() {
   if (S.ui.file) renderFile();
   else if (side) { renderHead($('sidetitle'), side, 'side'); renderTranscript($('side'), side.name); }
   $('sideform').hidden = !!S.ui.file;
+  releaseDrawn([!sw && b ? b.name : '', side ? side.name : ''].filter(Boolean));
   renderComposer('main', b, sw); renderComposer('side', side);
   $('keybar').innerHTML = keybarHTML(b);
   if (S.ui.picker) renderPicker();
@@ -2106,7 +2136,7 @@ function renderHome(el) {
 // check is cached per fleet change, so a quiet fleet of any size costs nothing here.
 let activeAt = -1, active = false;
 function anyActive() { if (activeAt !== S.botsGen) { activeAt = S.botsGen; active = [...S.bots.values()].some((b) => isActive(b.status)); } return active; }
-setInterval(() => { if (S.attached && anyActive()) { refreshLive($('log')); if (S.ui.side) refreshLive($('side')); } }, 1000);
+setInterval(() => { if (S.attached && anyActive()) { refreshLive($('log')); if (S.ui.side && !S.ui.file) refreshLive($('side')); } }, 1000);
 
 // ---------- picker ----------
 function pickerRows() {
@@ -2948,21 +2978,32 @@ document.addEventListener('click', async (e) => {
   }
   else if (tab) await go(tab.dataset.tab);
   // Clicks return the keyboard to the pane's composer, unless they selected text to copy.
-  if (!e.target.closest('input, textarea, form') && window.getSelection?.()?.isCollapsed !== false) focusInput(e.target.closest('.pane.side') ? 'side' : 'main');
+  if (!e.target.closest('input, textarea, form') && window.getSelection?.()?.isCollapsed !== false) focusInput(e.target.closest('.pane.side') && !S.ui.file ? 'side' : 'main');
 });
 // A row's pending look: its timer, its row, and once it ran, where the window was before it.
 const DOUBLE_CLICK_MS = 230;
 const rowLook = { timer: null, who: null, before: null };
 document.addEventListener('contextmenu', (e) => {
+  // A link's own menu would follow it in the window, past the opener that sends it to the browser.
+  if (e.target.closest('a')) { e.preventDefault(); return; }
   const t = e.target.closest('[data-bot], [data-task], [data-tab]'); if (!t) return;
   const who = t.dataset.bot ?? t.dataset.task ?? t.dataset.tab;
   e.preventDefault(); closeMenu(); showMenu(botMenuItems(who), { x: e.clientX, y: e.clientY }, who);
 });
 
-// Highlighting arrived: messages drawn without it are drawn again.
-// A file beside decides for itself (`renderFile`), so a page running there keeps running.
-Rich.onReady = () => { for (const [id] of PANES) if (!(id === 'side' && S.ui.file)) $(id).dataset.key = ''; render(); };
+// Highlighting arrived: a pane whose messages were drawn without it is drawn again; one with no
+// code waiting keeps what it drew. A file beside decides for itself (`renderFile`), so a page
+// running there keeps running.
+function waitsForHighlight(el) {
+  if (tails.get(el.lastElementChild)?.waited) return true;
+  const t = S.transcripts.get(el.dataset.who);
+  return !!t?.items.some((it) => it.htmlWaited);
+}
+Rich.onReady = () => { for (const [id] of PANES) if (!(id === 'side' && S.ui.file) && waitsForHighlight($(id))) $(id).dataset.key = ''; render(); };
 Rich.onFile = openFileFrom;
+// Escape in a preview: a file's closes it, as Escape does there; a message's returns the keyboard to
+// its pane, where the next Escape does what it does.
+Rich.onEscape = (frame) => { if (frame.closest('.fview') && S.ui.file) closeFile(); else focusInput(frame.closest('.pane.side') && !S.ui.file ? 'side' : 'main'); };
 Rich.onError = (text) => toast(text, 4000);
 
 // ---------- boot ----------

@@ -479,18 +479,10 @@ impl Connection {
         loop {
             let message = self.read_line()?;
             if message.get("id").is_some_and(|id| *id == json!(self.next)) {
-                let Some(code) = message.get("error").and_then(Value::as_str) else {
-                    return Ok(message["result"].clone());
+                return match Error::reported(&message) {
+                    Some(error) => Err(error),
+                    None => Ok(message["result"].clone()),
                 };
-                let mut error = Error::new(code);
-                error.detail = message["detail"].as_str().map(str::to_owned);
-                if let Value::Object(mut facts) = message {
-                    for key in ["id", "error", "detail"] {
-                        facts.remove(key);
-                    }
-                    error.facts = (!facts.is_empty()).then(|| Box::new(facts));
-                }
-                return Err(error);
             }
             if message.get("id").is_none() {
                 self.pending.push_back(message);
@@ -511,9 +503,15 @@ impl Connection {
 }
 
 fn ensure_existing_daemon(options: &Options) -> Result<Connection> {
-    // Inspection must never initialize a replacement store for a missing one.
+    // A command on existing bots must never initialize a replacement store.
     if !options.store.is_file() {
-        return fail("store_not_found");
+        return fail_with(
+            "store_not_found",
+            format!(
+                "no store at {}; this command never creates one",
+                options.store.display()
+            ),
+        );
     }
     ensure_daemon(options)
 }
@@ -670,10 +668,19 @@ fn ensure_daemon(options: &Options) -> Result<Connection> {
             startup_remaining(deadline)?;
             let mut log = options.store.clone().into_os_string();
             log.push(".log");
-            let detail = std::fs::read_to_string(log)
+            // The child reports its failure as the CLI does, one JSON
+            // object as its last log line; that error is this command's.
+            let last = std::fs::read_to_string(log)
                 .ok()
-                .and_then(|text| text.lines().last().map(str::to_owned))
-                .unwrap_or_else(|| format!("daemon exited with {status}"));
+                .and_then(|text| text.lines().last().map(str::to_owned));
+            if let Some(error) = last
+                .as_deref()
+                .and_then(|line| serde_json::from_str(line).ok())
+                .and_then(|value| Error::reported(&value))
+            {
+                return Err(error);
+            }
+            let detail = last.unwrap_or_else(|| format!("daemon exited with {status}"));
             return fail_with("daemon_start_failed", detail);
         }
         // An ownership-conflict exit only says our child lost. The winner
@@ -1102,11 +1109,6 @@ fn await_exit(pid: i32, timeout: Duration) -> Result<()> {
 /// the daemon runs, and never replaces a list that exists.
 fn models(options: &Options) -> Result<i32> {
     let path = agent_client::models::path().ok_or(Error::with("usage", "set HOME"))?;
-    let client_error = |e: agent_client::Error| Error {
-        code: e.code,
-        detail: e.detail,
-        facts: e.facts,
-    };
     if options.discover {
         if path.exists() {
             return fail_with(
@@ -1119,7 +1121,7 @@ fn models(options: &Options) -> Result<i32> {
         }
         let mut connection = ensure_daemon(options)?;
         let listing = connection.request("provider_models", json!({}))?;
-        let text = agent_client::models::render(&listing, &[]).map_err(client_error)?;
+        let text = agent_client::models::render(&listing, &[]).map_err(Error::from)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -1149,7 +1151,7 @@ fn models(options: &Options) -> Result<i32> {
         }
         eprintln!("wrote {}", path.display());
     }
-    let models = agent_client::models::read(&path).map_err(client_error)?;
+    let models = agent_client::models::read(&path).map_err(Error::from)?;
     if options.pretty {
         for model in &models {
             match &model.note {
@@ -1342,6 +1344,17 @@ fn run(options: &Options) -> Result<i32> {
 /// models included, do not act on a description of them. The daemon names
 /// the same ways as request fields.
 fn ways_past_busy(bot: &str, error: Error) -> Error {
+    if error.code == "active_agent_limit" {
+        let mut error = Error {
+            detail: Some("the daemon runs as many turns as it may".into()),
+            ..error
+        };
+        error.facts.get_or_insert_default().insert(
+            "hint".into(),
+            json!("resend with --delivery queue to run it when there is room"),
+        );
+        return error;
+    }
     if error.code != "bot_busy" {
         return error;
     }
@@ -1359,13 +1372,22 @@ fn ways_past_busy(bot: &str, error: Error) -> Error {
         None => "resend with --delivery queue to run this after it".to_owned(),
     };
     let fork =
-        format!("; to ask without interrupting, fork --source {bot} --bot NEW and send it to NEW");
-    // The daemon's own detail names request fields; this says the same in flags.
+        format!("; to ask without interrupting, fork --source={bot} --bot NEW and send it to NEW");
+    // The daemon's own detail names request fields; at the CLI the detail
+    // states the refusal and the hint gives the ways past it in flags.
     let stated = match running {
         Some(turn) => format!("turn {turn} is running"),
         None => "earlier work is waiting".to_owned(),
     };
-    Error::with("bot_busy", format!("{stated}; {join}{fork}"))
+    let mut error = Error {
+        detail: Some(stated),
+        ..error
+    };
+    error
+        .facts
+        .get_or_insert_default()
+        .insert("hint".into(), json!(format!("{join}{fork}")));
+    error
 }
 
 fn follow(options: &Options) -> Result<i32> {
@@ -1465,8 +1487,7 @@ fn interrupt(options: &Options) -> Result<i32> {
     let mut connection = Connection::connect(&options.socket)?;
     let state = connection.request("resume", json!({"bot":bot}))?;
     let Some(turn) = state["running_turn"].as_i64() else {
-        eprintln!("agent: {bot} has no running turn");
-        return Ok(1);
+        return fail_with("no_active_turn", format!("{bot} has no running turn"));
     };
     connection.request("interrupt", json!({"bot":bot,"turn":turn}))?;
     Ok(0)
@@ -1852,8 +1873,8 @@ impl Renderer {
             // Retained and running turns still finish through normal events.
             let handle = format!("turn:{}/{turn}", event["bot"].as_str().unwrap_or(""));
             let found = connection.request("wait", json!({"handles":[&handle],"timeout_ms":0}))?;
-            if let Some(code) = found["results"][&handle]["error"].as_str() {
-                return Err(Error::new(code));
+            if let Some(error) = Error::reported(&found["results"][&handle]) {
+                return Err(error);
             }
         }
         let finished =
@@ -2556,6 +2577,57 @@ fn preview(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reported_error_keeps_every_fact() {
+        let ended = json!({"status":"failed","turn":3,"error":"budget_exhausted",
+            "detail":"220 of 200 tokens used","budget_tokens":200,"tokens_used":220});
+        let error = Error::reported(&ended).unwrap();
+        assert_eq!(error.detail.as_deref(), Some("220 of 200 tokens used"));
+        let facts = error.facts.unwrap();
+        assert_eq!(
+            (&facts["budget_tokens"], &facts["turn"]),
+            (&json!(200), &json!(3))
+        );
+        assert!(!facts.contains_key("error") && !facts.contains_key("detail"));
+        let served = agent_client::Error {
+            code: "approvals_served".into(),
+            detail: None,
+            facts: json!({"tag":"auto","lease_left_ms":900})
+                .as_object()
+                .cloned()
+                .map(Box::new),
+        };
+        assert_eq!(Error::from(served).facts.unwrap()["lease_left_ms"], 900);
+        assert!(Error::reported(&json!({"result":{}})).is_none());
+    }
+
+    #[test]
+    fn refusals_past_capacity_give_the_flags_that_get_past_them() {
+        let full = ways_past_busy(
+            "Bob",
+            Error::with("active_agent_limit", "delivery queue waits for room"),
+        );
+        assert_eq!(
+            full.facts.unwrap()["hint"],
+            "resend with --delivery queue to run it when there is room"
+        );
+        let busy = ways_past_busy(
+            "Bob",
+            Error::new("bot_busy").facts(json!({"running_turn":4})),
+        );
+        assert_eq!(busy.detail.as_deref(), Some("turn 4 is running"));
+        let hint = busy.facts.unwrap()["hint"].as_str().unwrap().to_owned();
+        assert!(hint.starts_with("resend with --delivery steer --turn 4"));
+        // A name that looks like a flag still parses as the source.
+        let flagged = ways_past_busy("--worker", Error::new("bot_busy"));
+        assert!(
+            flagged.facts.unwrap()["hint"]
+                .as_str()
+                .unwrap()
+                .contains("fork --source=--worker --bot NEW")
+        );
+    }
 
     #[test]
     fn summaries_read_the_field_from_a_cut_preview_and_mark_what_is_hidden() {

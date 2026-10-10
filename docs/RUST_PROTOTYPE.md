@@ -847,7 +847,11 @@ remain available through replay if the drain deadline is reached.
 Requests include a string or nonnegative integer `id`. Responses carry the same
 `id` and either `result` or an explicit `error` code with optional `detail`.
 A refusal a program acts on also carries its facts as fields beside them:
-`bot_busy` from `submit` reports `running_turn` and `fork_point`.
+`bot_busy` from `submit` reports `running_turn` and `fork_point`, and
+`invalid_reasoning_level` lists the model's `levels`. A line that is not JSON
+is `invalid_json` with a null `id`; JSON of the wrong shape is
+`invalid_request`, answered with its `id` when that parses, and its detail
+names the unknown or ill-typed field.
 Notifications carry `event`; durable ones carry `cursor`, `bot`, `turn`, and
 `data`, in exactly the shape `events` replays them. Durable events reach
 followers in commit order: the storage worker itself hands each group's
@@ -1153,9 +1157,10 @@ fields returns the bot it made, with `duplicate: true` and no `cursor`, and
 writes nothing; a fork's resend is answered from the fork even after its source
 moved or was deleted. The same key with any field changed is
 `idempotency_conflict`, naming the field in `detail` and `field`. A name taken
-by an unkeyed creation or another key is `bot_exists`. Once the bot a key made
-is deleted, any request with that name and key is `bot_deleted`, with the
-deleted bot's `bot_id`, and never makes the bot again. Their replies are the
+by an unkeyed creation or another key is `bot_exists`, with the holder's
+`bot_id`. Once the bot a key made is deleted, any request with that name and
+key is `bot_deleted`, with the deleted bot's `bot_id`, and never makes the bot
+again. Their replies are the
 bot record (`name`, `id`, ...) plus `duplicate`. `delete` takes an optional
 `bot_id`: resent while the first deletion runs or after it finished, it
 succeeds with `duplicate: true`, and an identity that name never held is
@@ -1513,10 +1518,13 @@ the pool; other transient failures back off from 250 ms doubling to 30 s with
 a deterministic spread of up to a fifth, which matters only when several
 daemons share one key. A tool is never rerun. Each retry is a non-durable
 `retry` notification (attempt, error, detail, delay) to live followers, and a
-turn's record carries `retries` and `paced_ms` in `turns`. `retries` counts
+turn's record carries `retries`, `paced_ms` and `summary_ms` in `turns`. `retries` counts
 additional attempts that entered HTTP dispatch; cancelling during backoff or
 pacing does not count an unsent retry. `paced_ms` includes a partially elapsed
-pool wait on interruption. Counters flush once per execution segment, on
+pool wait on interruption. `summary_ms` is how long the turn waited on
+summaries: one before its call from planning to install, and one beside a
+call from the call's end to its install, including a wait an interrupt
+cut short. Counters flush once per execution segment, on
 completion, failure, explicit interruption, or parking, and accumulate across
 resumption. A hard process kill can lose the current segment's unflushed
 counters. Retries are on by default because they cannot repeat an effect; what they can repeat is
@@ -2119,7 +2127,7 @@ ends at its span. The estimate takes the call to be in cache; it does not
 model a cache that expired while a tool ran or the bot sat idle. The
 `compacted` event's `request` says which way went (`form`, `copy` or `own`,
 and `items`, the window items copied) with both estimates, `null` where a
-way could not be sent. A summary that parks on a rate limit
+way could not be sent, and whether the summary ran `beside` the turn (below). A summary that parks on a rate limit
 keeps in its park record the floor that window was read under, where it
 starts, where it ends when the copy had the call's window whole, and that
 prefix when the view no longer sends it, so its retry, after a restart
@@ -2148,8 +2156,8 @@ borrows the already encoded tool selection. Responses requests of this form
 send an empty tool list, which that family permits with historical calls.
 
 Either way the call is paced, retried, billed against the bot's budget, and
-counted as a model round like any other; if it parks on a closed pool, the
-turn parks. Stored history is not rewritten for summarization.
+counted as a model round like any other; if a summary before the call parks
+on a closed pool, the turn parks. Stored history is not rewritten for summarization.
 The park record identifies the unfinished call as summary or ordinary model
 work. Resumption, including after restart, continues that call. Once a summary
 exhausts its retries, parking the following ordinary call does not restart the
@@ -2159,12 +2167,53 @@ charged durably before continuing. Usage events identify `purpose: compaction`;
 `compaction_text_delta` and `compaction_thinking_delta` are separate from answer
 streams. Budget and round limits are checked again before the normal call.
 
+#### Summaries beside the turn
+
+Inside a turn, behind a call this task made, a due summary runs beside the
+boundary's own call rather than before it, as in Pi Durable
+([announcement](https://earendil.com/posts/pi-durable/), 2026-10-01). At the
+boundary it is planned, its copy chosen and the view it copies read, as
+above; then its call and the turn's call go out together, the turn's
+sending the view as it is. Once the turn's call is recorded, the round
+waits for the summary and installs it before the call's tools run, so the
+view still changes only between calls, and a park, an approval, or a
+resumed turn never sees a summary running. The turn saves the shorter of
+the two calls; what it pays is that one call sends the longer view. An
+interrupt cancels a summary still running, like the turn's own call; one
+that has landed waits outside the turn's rounds until its install is
+queued on the store, and is billed and installed as the turn ends. The
+install and, when it fails, the summary's bill are one store job.
+
+It runs beside only while the view and the reply's estimated size still
+fit the input limit and, beside what it holds, the round limit and the
+bot's token budget leave room for the turn's call. It holds two model
+rounds (a copy and a request of its own) and, under a budget, the most
+those two may bill: each sending at most the view, the tools and both
+instructions at a token to a byte, and generating at most the summarizer's
+output bound; with no known output bound (a Responses provider without
+`max_output_tokens`), or with server-side fallbacks on, which may bill any
+number of attempts per request, a budgeted bot's summary does not run
+beside. A summary beside the call that an interrupt cancels still adds its
+retries and pacing to the turn's. A refresh does not keep warm the view of
+a call whose summary has written its replacement.
+Otherwise, and at a turn's start or as a parked turn resumes, when the
+cache the copy reads may have lapsed, the summary goes before the call. A
+summary beside the turn uses its own connection rather than the bot's
+WebSocket, which the turn's call holds, and counts toward the turn's
+rounds, budget, and retries when it is joined. One that parks on a closed
+pool parks nothing; a later boundary summarizes again once the pool's
+retry time has passed, unless the view outgrows the limit first, which
+summarizes before the call as above. A park keeps that retry time, so a
+turn resumed before it goes on with its calls rather than parking on the
+summarizer's pool. The time the turn waits for it counts toward the turn's
+`summary_ms`.
+
 The result is recorded in one transaction: the summary, the covered turns'
 user prompts verbatim (each up to 2 KiB, with a 16 KiB budget for text plus
 entry metadata, the oldest and newest kept when there are more), and the cut, the prompt node the verbatim
 tail starts at, which becomes the context start. A compaction stands for
 everything since the first: its coverage starts at turn 1 and the kept
-prompts carry over. Its version is anchored to the head at which it was generated, separately
+prompts carry over. Its version is anchored to the head at which it was installed, separately
 from the cut: forks can summarize the same cut independently. A historical
 fork inherits the newest version at or before its checkpoint and restores
 that version's context start, preserving its cached prefix. Deleting a bot

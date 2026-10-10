@@ -145,6 +145,8 @@ class TurnCompactionAcceptanceTests(ModelFixture):
                        compaction_instructions='Summarize.')
         client.request('submit', bot='Bob', request_id='1', prompt='long:40')
         client.receive(lambda m: m.get('event') == 'compacted', timeout=30)
+        # A tool that completed after the cut, not one held from before it.
+        client.saved.clear()
         client.receive(lambda m: m.get('event') == 'tool_completed', timeout=30)
         client.close(kill=True)
         drain(self.model)
@@ -158,9 +160,11 @@ class TurnCompactionAcceptanceTests(ModelFixture):
         self.assertTrue(compacted)
         self.assertEqual(resumed['compaction'], compacted[-1]['version'])
         completed = [e['data'] for e in events if e['event'] == 'tool_completed']
-        known = [c['call_id'] for c in completed if not c.get('outcome_unknown')]
+        # A call the kill caught before it started is known not to have run.
+        known = [c['call_id'] for c in completed
+                 if not c.get('outcome_unknown') and not c.get('cancelled')]
         self.assertEqual(known, [f'long-{n}' for n in range(len(known))])
-        self.assertLessEqual(len(completed) - len(known), 1)
+        self.assertLessEqual(sum(1 for c in completed if c.get('outcome_unknown')), 1)
         # A call cut short by the kill ran at most once; none ran again.
         ran = len(rounds(self.path))
         self.assertIn(ran, (len(known), len(known) + 1))

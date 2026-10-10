@@ -211,13 +211,19 @@ fn exited(_pid: libc::pid_t) -> bool {
     false
 }
 
-/// The CLI's error line, `agent: CODE: DETAIL`.
-fn cli_reason(stderr: &[u8]) -> Option<String> {
+/// The CLI's failure, one JSON object on stderr, as `CODE: DETAIL`.
+pub(crate) fn cli_reason(stderr: &[u8]) -> Option<String> {
     String::from_utf8_lossy(stderr)
         .lines()
         .rev()
-        .find_map(|line| line.strip_prefix("agent: "))
-        .map(str::to_owned)
+        .find_map(|line| {
+            let failure: serde_json::Value = serde_json::from_str(line).ok()?;
+            let code = failure["error"].as_str()?;
+            Some(match failure["detail"].as_str() {
+                Some(detail) => format!("{code}: {detail}"),
+                None => code.to_owned(),
+            })
+        })
 }
 
 async fn start(agent: &Path, store: &Path, socket: Option<&Path>) -> Result<(), String> {
@@ -639,7 +645,7 @@ mod tests {
         script(
             &agent,
             &format!(
-                "#!/bin/sh\necho started >> '{}'\necho 'agent: usage: no provider' >&2\nexit 2\n",
+                "#!/bin/sh\necho started >> '{}'\necho '{{\"error\":\"usage\",\"detail\":\"no provider\"}}' >&2\nexit 2\n",
                 calls.display()
             ),
         );
@@ -677,9 +683,12 @@ mod tests {
         let store = root.join("state.sqlite");
         for (said, stopped) in [
             ("", Ok(())),
-            ("echo 'agent: daemon_unavailable' >&2; exit 1", Ok(())),
             (
-                "echo 'agent: daemon_shutdown_timeout: 42' >&2; exit 1",
+                r#"echo '{"error":"daemon_unavailable"}' >&2; exit 1"#,
+                Ok(()),
+            ),
+            (
+                r#"echo '{"error":"daemon_shutdown_timeout","detail":"42"}' >&2; exit 1"#,
                 Err("daemon_shutdown_timeout: 42".to_owned()),
             ),
         ] {

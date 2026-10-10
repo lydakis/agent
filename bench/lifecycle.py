@@ -1,9 +1,12 @@
-"""Rust-only durable lifecycle measurements. No cross-engine ranking."""
+"""Durable lifecycle measurements: Agent's daemon, or Pi Durable through its
+adapter, on the same workload and provider. Cross-engine output is exploratory;
+see docs/COMPARISON_CONTRACT.md."""
 import argparse
 from datetime import datetime, timezone
 import json
 from pathlib import Path
 import platform
+import shutil
 import subprocess
 import sys
 import threading
@@ -16,8 +19,10 @@ from .processes import Tree, snapshot
 from .runner import provider_ready, stop
 from .runtime_client import Client, node_item
 from .socket_client import SocketClient
-from .targets import clean_env, file_hash
+from .targets import clean_env, file_hash, pi_durable_metadata
 from .responses import prompt
+
+PI_DURABLE_ADAPTER = Path(__file__).resolve().parent / 'adapters/pi-durable.mjs'
 
 
 def process_limit(config, mode):
@@ -25,12 +30,35 @@ def process_limit(config, mode):
     return max(48, 1 + 2 * config['concurrency']) if mode == 'shell' else 48
 
 
-def run_once(binary, directory, config, mode, toolset, transport='stdio', memory_detail=False):
+def replay(client, engine, bot):
+    """What each engine can give back for a bot after a restart: Agent's
+    durable event page from cursor zero, or Pi Durable's committed transcript
+    (Pi Durable keeps no event log to replay from a cursor)."""
+    if engine == 'rust':
+        return client.request('events', bot=bot, after=0, limit=256)['result']
+    return client.request('transcript', bot=bot)['result']
+
+
+def read_items(client, engine, bot, page):
+    """Read every stored item the page names, one at a time."""
+    if engine == 'rust':
+        for event in page['events']:
+            if 'node' in event['data']:
+                assert 'result' in node_item(client, bot, event['data']['node'])
+        return
+    for entry in page['entries']:
+        assert client.request('entry', bot=bot, entry=entry['id'])['result']['entry'] == entry
+
+
+def run_once(binary, directory, config, mode, toolset, transport='stdio', memory_detail=False,
+             engine='rust', synchronous='full'):
+    if engine != 'rust' and transport != 'stdio':
+        raise ValueError('only Agent has a socket transport')
     workload = directory / 'workload.json'
     workload.write_text(json.dumps(config))
     stats_path = directory / 'provider.json'
     provider = subprocess.Popen([sys.executable, '-m', 'bench.lifecycle_provider',
-        '--workload', str(workload), '--stats', str(stats_path), '--mode', mode],
+        '--workload', str(workload), '--stats', str(stats_path), '--mode', mode, '--engine', engine],
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         start_new_session=True, env=clean_env())
     provider_tree = Tree(provider.pid)
@@ -79,10 +107,18 @@ def run_once(binary, directory, config, mode, toolset, transport='stdio', memory
     sampler = None
     result = {'status':'failed'}
     try:
-        url = f'http://127.0.0.1:{provider_ready(provider)}/v1'
+        port = provider_ready(provider)
+        url = f'http://127.0.0.1:{port}/v1'
         def connect():
-            controller = SocketClient if transport == 'socket' else Client
-            client = controller(binary, directory/'state.sqlite', url, tools=toolset)
+            if engine == 'pi-durable':
+                env = {**clean_env(), 'AGENT_BENCH_PORT': str(port),
+                       'AGENT_BENCH_STORE': str(directory/'state.sqlite'),
+                       'AGENT_BENCH_SYNCHRONOUS': synchronous, 'AGENT_BENCH_TOOLS': toolset}
+                client = Client(None, None, None, env=env,
+                                command=[shutil.which('node'), str(PI_DURABLE_ADAPTER)])
+            else:
+                controller = SocketClient if transport == 'socket' else Client
+                client = controller(binary, directory/'state.sqlite', url, tools=toolset)
             clients.append(client)
             trees.append(Tree(client.process.pid))
             return client
@@ -98,7 +134,7 @@ def run_once(binary, directory, config, mode, toolset, transport='stdio', memory
             assert 'result' in client.request('create', bot=str(agent), workspace=str(workspace))
         create_ms = (time.monotonic()-before)*1000
         phase = 'turns'
-        latencies, checkpoints = [], {}
+        latencies, checkpoints, finals = [], {}, {}
         for turn in range(config['turns']):
             pending = []
             for agent in range(config['concurrency']):
@@ -111,13 +147,20 @@ def run_once(binary, directory, config, mode, toolset, transport='stdio', memory
                 latencies.append((event['_received_at']-before)*1000)
                 if turn == 0:
                     checkpoints[agent] = event['data']['checkpoint']
+                finals[str(agent)] = native
         if mode == 'shell':
             for agent in range(config['concurrency']):
                 assert (directory/f'workspace-{agent}'/'artifact').read_text() == 'tool-ok'
         phase = 'idle'
         time.sleep(.45)
-        pages = {str(agent):client.request('events', bot=str(agent), after=0, limit=256)['result']
-                 for agent in range(config['concurrency'])}
+        if engine == 'pi-durable':
+            # Pi Durable's own event stream, a batch per commit, delivers
+            # every conversation's final turn as done.
+            for bot, native in finals.items():
+                client.receive(lambda m, bot=bot, native=native: m.get('event') == 'pi' and m.get('bot') == bot
+                               and any(e.get('type') == 'submission' and e['record'].get('id') == native
+                                       and e['record'].get('status') == 'done' for e in m['events']))
+        pages = {str(agent):replay(client, engine, str(agent)) for agent in range(config['concurrency'])}
         if transport == 'socket':
             client.verify_followers(pages)
         phase = 'restart_resume_replay_fork'
@@ -128,10 +171,8 @@ def run_once(binary, directory, config, mode, toolset, transport='stdio', memory
         before = time.monotonic()
         for bot, page in pages.items():
             assert client.request('resume', bot=bot)['result']['status'] == 'completed'
-            assert client.request('events', bot=bot, after=0, limit=256)['result'] == page
-            for event in page['events']:
-                if 'node' in event['data']:
-                    assert 'result' in node_item(client, bot, event['data']['node'])
+            assert replay(client, engine, bot) == page
+            read_items(client, engine, bot, page)
             assert client.request('submit', bot=bot, request_id='0', prompt=prompt(config,int(bot),0))['result']['duplicate']
             branch = directory/f'fork-{bot}'
             branch.mkdir()
@@ -191,6 +232,9 @@ def main():
     parser.add_argument('--repeat',type=int,choices=range(1,6),default=3)
     parser.add_argument('--transport', choices=('stdio', 'socket'), default='stdio')
     parser.add_argument('--memory-detail', action='store_true', help='sample PSS/USS where supported; adds observer overhead')
+    parser.add_argument('--engine', choices=('rust', 'pi-durable'), default='rust')
+    parser.add_argument('--synchronous', choices=('full', 'normal'), default='full',
+                        help="Pi Durable's SQLite synchronous setting; Agent always uses FULL")
     args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
     out = args.out.resolve()
@@ -198,24 +242,39 @@ def main():
         parser.error('run from repository root with a new output under .local')
     if args.mode == 'shell' and 'shell' not in args.tools.split(','):
         parser.error('shell workload requires the shell tool')
+    if args.engine == 'rust' and args.synchronous != 'full':
+        parser.error('Agent has one durability setting, synchronous=FULL')
+    if args.engine != 'rust' and args.transport != 'stdio':
+        parser.error('only Agent has a socket transport')
+    try:
+        target = (dict(binary_sha256=file_hash(args.binary)) if args.engine == 'rust'
+                  else pi_durable_metadata(root))
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
     out.mkdir(parents=True,exist_ok=False)
     config = dict(version=1,concurrency=args.agents,turns=3,chunks=20,chunk_bytes=256,
                   chunk_delay_ms=25,history_bytes=4096)
     sources = {str(p.relative_to(root)):file_hash(p) for p in sorted((root/'bench').glob('*.py'))}
+    sources['bench/adapters/pi-durable.mjs'] = file_hash(PI_DURABLE_ADAPTER)
     battery = psutil.sensors_battery()
-    record = dict(schema='rust_lifecycle_v2',binary_sha256=file_hash(args.binary),
+    durability = 'sqlite_full' if args.synchronous == 'full' else 'sqlite_wal_synchronous_normal'
+    record = dict(schema='lifecycle_v3',engine=args.engine,durability=durability,**target,
                   created_at=datetime.now(timezone.utc).isoformat(),
                   observer_sha256=digest(sources),workload=config,toolset=args.tools,mode=args.mode,
                   transport=args.transport,followers_per_bot=1 if args.transport == 'socket' else 0,
                   memory_detail=args.memory_detail,
-                  contract='sqlite_full; exact resume/replay; historical completed fork; no repeated tools',
+                  contract=f'{durability}; '
+                           + ('exact resume; committed transcript re-read, no event replay' if args.engine == 'pi-durable'
+                              else 'exact resume/replay')
+                           + '; historical completed fork; no repeated tools',
                   host=dict(system=platform.system(),architecture=platform.machine(),host_id=digest(platform.node()),
                             python=platform.python_version(),psutil=psutil.__version__,external_power=battery.power_plugged if battery else None),
                   sampling=dict(idle_seconds=.45,interval_seconds=.2,group_discovery_seconds=.5,timeout_seconds=30,rss_limit_mib=512,process_limit=process_limit(config, args.mode)),runs=[])
     for index in range(args.repeat+1):
         directory = out/f'run-{index}'
         directory.mkdir()
-        run = run_once(args.binary.resolve(),directory,config,args.mode,args.tools,args.transport,args.memory_detail)
+        run = run_once(args.binary.resolve(),directory,config,args.mode,args.tools,args.transport,args.memory_detail,
+                       args.engine,args.synchronous)
         run['warmup'] = index == 0
         record['runs'].append(run)
         (out/'result.json').write_text(json.dumps(record,indent=2))
