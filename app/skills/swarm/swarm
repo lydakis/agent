@@ -40,6 +40,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 
 MAX_POST = 16 * 1024
@@ -326,8 +327,11 @@ class Act:
     turn if idle and the line in their turn if working; `steer` members only
     if working, into that turn; the coordinator after what it is doing."""
 
-    def __init__(self, folder, author, at):
+    def __init__(self, folder, author, at, live=None):
         self.swarm, self.state, self.author, self.at = folder.swarm, folder.state, author, at
+        # The members whose bots still exist, in the swarm's order: a deleted
+        # one is out of it, though swarm.json still names it.
+        self.live = [m for m in self.swarm['members'] if live is None or m in live]
         self.me = short(author) if author else 'user'
         self.lines, self.sends, self.answer = [], [], {}
 
@@ -343,7 +347,7 @@ class Act:
                 self.sends.append((member, how, prompt, authored))
 
     def member(self, name):
-        for m in self.swarm['members']:
+        for m in self.live:
             if name in (m, short(m)):
                 return m
         raise Refused('not_a_member', '%s is not in %s; status lists its members' % (name, self.swarm['name']))
@@ -368,11 +372,11 @@ def post(act, text, everyone):
         while end < len(word) and (word[end].isascii() and (word[end].isalnum() or word[end] in '-_.')):
             end += 1
         names.add(word[:end].rstrip('.'))
-    named = [m for m in act.swarm['members'] if m in names or short(m) in names]
+    named = [m for m in act.live if m in names or short(m) in names]
     # A post is stored without interrupting anyone; @NAME wakes that member,
     # and --all, or the person's post that names nobody, wakes everyone.
     if everyone or (not act.author and not named):
-        named = act.swarm['members']
+        named = act.live
     act.tell(named, '[board] %s: %s' % (act.me, text))
 
 
@@ -398,7 +402,7 @@ def assign(act, task, owner, reviewer, brief):
             and all(c in 'abcdefghijklmnopqrstuvwxyz0123456789-' for c in task)):
         raise Refused('invalid_task', 'name a task like conn-pool: lowercase letters, digits and -, at most %d' % MAX_TASK)
     reviewer = short(act.member(reviewer))
-    tasks, current = act.state['tasks'], {short(m) for m in act.swarm['members']}
+    tasks, current = act.state['tasks'], {short(m) for m in act.live}
     old = tasks.get(task)
     # A submitted result outlives its reviewer: one that left is replaced,
     # and the result keeps its author.
@@ -455,7 +459,7 @@ def review(act, task, verdict, evidence):
     if t['reviewer'] != act.me or t['owner'] == act.me or t['status'] != 'reviewing':
         raise Refused('reviewer_only', 'only the assigned independent reviewer reviews a submitted result')
     act.line(kind='review', stream=task, verdict=verdict, evidence=evidence, text='%s: %s' % (verdict, evidence))
-    act.tell(act.swarm['members'][:1], '[board] %s reviewed: %s. %s' % (task, verdict, evidence))
+    act.tell(act.live[:1], '[board] %s reviewed: %s. %s' % (task, verdict, evidence))
 
 
 def finish(act, outcome, summary):
@@ -550,7 +554,7 @@ def status(folder, members, helpers):
         outcome = 'stopped'
     elif (members and len(spent) == len(members)) or used >= total > 0:
         outcome = 'budget_exhausted'
-    elif blocked or missing_members:
+    elif blocked or not members:
         outcome = 'blocked'
     elif any(b.get('status') == 'failed' for b in members.values()):
         outcome = 'failed'
@@ -608,7 +612,13 @@ def run_act(daemon, folder, author, verb, args):
             raise Refused('not_a_member', '%s is not in %s' % (author, swarm['name']))
         if swarm['stopped']:
             raise Refused('swarm_stopped', 'the person stopped this swarm; end your turn')
-    act = Act(folder, author, now_ms())
+    # Who is in the swarm now: the daemon's list, read once, before the rules.
+    # A stopped swarm tells nobody, but your post resumes it.
+    members, helpers = {}, []
+    told = verb != 'role' and (not swarm['stopped'] or (verb == 'post' and not author))
+    if told:
+        members, helpers = scan(daemon, folder)
+    act = Act(folder, author, now_ms(), members if told else None)
     if verb == 'post':
         everyone = bool(args) and args[0] == '--all'
         post(act, ' '.join(args[1:] if everyone else args), everyone)
@@ -642,9 +652,7 @@ def run_act(daemon, folder, author, verb, args):
         for line in act.lines:
             line.update(bot=author, turn=int(os.environ.get('AGENT_TURN') or 0) or None)
     # A stopped swarm keeps what you decided and tells nobody; a role tells nobody either.
-    members, helpers = {}, []
-    if not swarm['stopped'] and verb != 'role':
-        members, helpers = scan(daemon, folder)
+    if told:
         budget(act, folder, members, helpers)
     else:
         act.sends = []
@@ -745,6 +753,36 @@ def number(value, code, detail):
     return int(value)
 
 
+def profile_tools(folder, identity):
+    """The tools an identity's profile lists, the folder's before yours, as
+    `agent` reads them: a `tools` list in its front matter, else every tool.
+    A profile that is not there is left for `agent run` to refuse."""
+    for root in (folder, os.environ['HOME']):
+        try:
+            with open(os.path.join(root, '.agents', 'agents', identity + '.md')) as f:
+                text = f.read(64 * 1024)
+            break
+        except OSError:
+            continue
+    else:
+        return ('shell',)
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != '---':
+        return ('shell',)
+    tools = None
+    for line in lines[1:]:
+        if line.strip() == '---':
+            break
+        if tools is not None and line.lstrip().startswith('- '):
+            tools.append(line.strip()[2:].strip().strip('"\''))
+        elif tools is not None and line.strip():
+            break
+        elif line.startswith('tools:'):
+            value = line[len('tools:'):].strip().strip('[]')
+            tools = [t.strip().strip('"\'') for t in value.split(',') if t.strip()]
+    return ('shell',) if tools is None else tools
+
+
 def valid_mix(mix):
     if not 1 <= len(mix) <= MAX_MIX:
         raise Refused('invalid_mix', 'a mix has 1 to %d rows' % MAX_MIX)
@@ -827,17 +865,27 @@ def worktree(project, name):
     setup = os.path.join(project, '.agents', 'setup')
     if os.path.isfile(setup):
         command = [setup] if os.access(setup, os.X_OK) else ['/bin/sh', setup]
-        child = subprocess.Popen(command, cwd=workspace, env=dict(env, AGENT_SOURCE=project),
-                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                 start_new_session=True)
-        try:
-            out = child.communicate(timeout=SETUP_TIMEOUT)[0].decode(errors='replace')
-            failed = tail(out) or 'exited %d' % child.returncode if child.returncode else None
-        except subprocess.TimeoutExpired:
-            # Its whole process group, so nothing it started outlives it.
-            os.killpg(child.pid, signal.SIGKILL)
-            child.communicate()
-            failed = '.agents/setup ran past %d s and was stopped' % SETUP_TIMEOUT
+        # Its output goes to a file, so a noisy setup costs disk, not this
+        # process's memory; only its end is kept for the refusal.
+        with tempfile.TemporaryFile() as log:
+            try:
+                child = subprocess.Popen(command, cwd=workspace, env=dict(env, AGENT_SOURCE=project),
+                                         stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                         start_new_session=True)
+            except OSError as e:
+                child, failed = None, '.agents/setup could not run: %s' % e
+            if child:
+                try:
+                    child.wait(timeout=SETUP_TIMEOUT)
+                    failed = 'exited %d' % child.returncode if child.returncode else None
+                except subprocess.TimeoutExpired:
+                    # Its whole process group, so nothing it started outlives it.
+                    os.killpg(child.pid, signal.SIGKILL)
+                    child.wait()
+                    failed = '.agents/setup ran past %d s and was stopped' % SETUP_TIMEOUT
+                if failed and child.returncode > 0:
+                    log.seek(max(0, log.seek(0, os.SEEK_END) - 4096))
+                    failed = tail(log.read().decode(errors='replace')) or failed
         if failed is not None:
             unplace(name, project)
             raise Refused('setup_failed', failed)
@@ -851,7 +899,7 @@ def unplace(name, project):
     git(['branch', '-D', 'agent/' + name], project, env)
 
 
-def brief(swarm, folder, member, late=False):
+def brief(swarm, folder, member, each, late=False, roster=None):
     """A member's first message: the member rules, then who it is, the goal,
     the script and who the others are."""
     with open(os.path.join(HERE, 'member.md')) as f:
@@ -859,11 +907,11 @@ def brief(swarm, folder, member, late=False):
     def known(m):
         row = swarm['mix'][swarm['rows'][m]] if m in swarm['rows'] else {}
         return '%s (%s)' % (short(m), row['identity']) if row.get('identity') else short(m)
-    others = [known(m) for m in swarm['members'] if m != member]
-    each = swarm['budget_tokens'] // max(1, len(swarm['members']))
+    roster = roster or swarm['members']
+    others = [known(m) for m in roster if m != member]
     lines = [rules, '',
              'You are %s, one of %d agents in the swarm %s, all working in this folder.'
-             % (short(member), len(swarm['members']), short(swarm['name'])),
+             % (short(member), len(roster), short(swarm['name'])),
              'Goal: ' + swarm['goal'],
              'Script: %s COMMAND ARGS, with these commands: post [--all] TEXT, role ROLE, '
              'assign TASK OWNER REVIEWER BRIEF, claim TASK, submit TASK RESULT, '
@@ -871,14 +919,14 @@ def brief(swarm, folder, member, late=False):
              'leave, status' % quote(SCRIPT),
              'Board: ' + quote(os.path.join(folder, 'board.jsonl')),
              'The others: ' + (', '.join(others) or 'none yet'),
-             'First member: ' + short(swarm['members'][0]),
+             'First member: ' + short(roster[0]),
              'Your lifetime allowance: %d tokens, including cached input on every call.' % each]
     if late:
         lines.append('You joined after the others started, so read the board first.')
     return '\n'.join(lines)
 
 
-def make(swarm, folder, names, rows, each, late=False):
+def make(swarm, folder, names, rows, each, late=False, roster=None):
     """Create these agents at once, each with its row's model, effort and
     identity, its instructions composed by `agent` (--agents, or --profile
     for an identity), and its brief as its first turn. The board is locked
@@ -892,7 +940,7 @@ def make(swarm, folder, names, rows, each, late=False):
         if mix.get('effort'):
             command += ['--effort', mix['effort']]
         command += ['--profile', mix['identity']] if mix['identity'] else ['--agents']
-        running.append((name, row, subprocess.Popen(command + ['--', brief(swarm, folder, name, late)],
+        running.append((name, row, subprocess.Popen(command + ['--', brief(swarm, folder, name, each, late, roster)],
                                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)))
     made, failed = [], []
     for name, row, child in running:
@@ -928,6 +976,10 @@ def start(daemon, args):
     elif not (asked['project'] and asked['folder']):
         raise Refused('usage', 'without an agent shell, name --project and --folder', True)
     valid_mix(asked['mix'])
+    for row in asked['mix']:
+        if row['identity'] and 'shell' not in profile_tools(asked['folder'], row['identity']):
+            raise Refused('identity_without_shell', "%s's tools leave out shell, which runs this script; "
+                          'give it shell or pick another identity' % row['identity'])
     root, base = daemon.root(), goal_name(asked['goal'])
     os.makedirs(root, exist_ok=True)
     for k in range(1, NAME_TRIES + 1):
@@ -970,7 +1022,7 @@ def start(daemon, args):
             raise Refused('start_failed', failed[0]['error'] if failed else 'no agent could be made')
         pin(swarm, made, folder)
     if failed:
-        tell_missing(daemon, swarm, made, failed)
+        tell_missing(daemon, swarm, made, failed, names[0])
     out = {'swarm': record(swarm, folder), 'bots': [m[0] for m in made], 'failed': failed,
            'board': os.path.join(folder, 'board.jsonl')}
     return out
@@ -986,10 +1038,14 @@ def pin(swarm, made, folder):
     write_json(os.path.join(folder, 'swarm.json'), swarm)
 
 
-def tell_missing(daemon, swarm, made, failed):
-    """The agents briefed with the others named hear which could not be made."""
+def tell_missing(daemon, swarm, made, failed, first):
+    """The agents briefed with the others named hear which could not be
+    made, and which is the first member when the one their brief named is
+    among them."""
     names = ', '.join(f['agent'] for f in failed)
     prompt = '[board] %s could not be made; the agents are %s' % (names, ', '.join(short(m) for m in swarm['members']))
+    if short(first) in [f['agent'] for f in failed]:
+        prompt += '. The first member is now %s' % short(swarm['members'][0])
     for name, _, bot_id in made:
         try:
             daemon.call('submit', bot=name, bot_id=bot_id, request_id='swarm-missing-' + name, prompt=prompt, delivery='steer')
@@ -1004,22 +1060,24 @@ def add(daemon, folder, args):
     swarm = folder.swarm
     if swarm['stopped']:
         raise Refused('swarm_stopped', 'post to the board to resume the swarm, then add an agent')
-    if not swarm['members']:
+    members, _ = scan(daemon, folder)
+    if not members:
         raise Refused('swarm_empty', 'every agent left this swarm; start a new one')
+    # The live members' rows and caps: a deleted one took its share with it.
     counts = [0] * len(swarm['mix'])
-    for m in swarm['members']:
+    for m in members:
         counts[swarm['rows'].get(m, 0)] += 1
     row = number(args[1], 'invalid_row', '--row is a row number') if args[:1] == ['--row'] and len(args) > 1 else deal(swarm['mix'], 1, counts)[0]
     if row >= len(swarm['mix']):
         raise Refused('invalid_row', 'the mix has no row %d' % row)
-    each = swarm['budget_tokens'] // len(swarm['members'])
+    each = sum(b.get('budget_tokens') or 0 for b in members.values()) // len(members)
     swarm['made'] += 1
     swarm['budget_tokens'] += each
     name = '%s-%d' % (swarm['name'], swarm['made'])
+    # Saved only once made (by pin), so an add cut short names no member.
     swarm['members'].append(name)
     swarm['rows'][name] = row
-    folder.save()
-    made, failed = make(swarm, folder.dir, [name], [row], each, True)
+    made, failed = make(swarm, folder.dir, [name], [row], each, True, list(members) + [name])
     if failed:
         swarm['budget_tokens'] -= each
     pin(swarm, made, folder.dir)
@@ -1049,6 +1107,11 @@ def stop(daemon, folder):
                 end_turns(daemon, bot)
             except Refused as e:
                 failed.append({'agent': short(bot['name']), 'error': '%s: %s' % (e.code, e.detail)})
+    else:
+        # Still making helpers or turns after every round: say which, not that all stopped.
+        members, helpers = scan(daemon, folder)
+        failed += [{'agent': short(b['name']), 'error': 'still_running: turn %d' % b['running_turn']}
+                   for b in list(members.values()) + helpers if b.get('running_turn')]
     return {'swarm': record(swarm, folder.dir), 'failed': failed}
 
 

@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -126,6 +127,13 @@ class SwarmTests(ModelFixture):
         self.assertEqual(failed['error'], 'setup_failed')
         self.assertFalse((self.home / '.agent/worktrees/r.widget-2').exists())
         self.assertNotIn('agent/r.widget-2', git('branch').stdout.decode())
+        # A setup that cannot even start leaves nothing either.
+        (repo / '.agents/setup').write_text('#!/no/such/shell\n')
+        git('commit', '-qam', 'unrunnable')
+        failed = self.swarm('r.lead', 'start', '--agents', '1', '--', 'Ship the widget')
+        self.assertEqual(failed['error'], 'setup_failed')
+        self.assertIn('could not run', failed['detail'])
+        self.assertFalse((self.home / '.agent/worktrees/r.widget-2').exists())
         self.assertEqual([s['swarm'] for s in self.person('list')['swarms']], ['r.widget'])
 
     def test_publication_is_silent_and_mentions_deliver_only_to_named_members(self):
@@ -160,12 +168,12 @@ class SwarmTests(ModelFixture):
         self.agent('run', *self.common, '--new', '--bot', 'q', 'hello')
         self.assertEqual(self.swarm('q', 'post', '--swarm', 'p.widget', 'hi')['error'], 'not_a_member')
         # A member deleted and made again under its name is another bot: it cannot post, and a
-        # post naming it misses it rather than waking the new bot.
+        # post naming it reaches nobody rather than waking the new bot.
         self.agent('rm', '--store', str(self.store), '--bot', 'p.widget-4')
         self.agent('run', *self.common, '--new', '--bot', 'p.widget-4', 'hello')
         self.assertEqual(self.swarm('p.widget-4', 'post', 'hi')['error'], 'not_a_member')
         named = self.swarm('p.widget-1', 'post', '@widget-4 you there?')
-        self.assertEqual(([m['agent'] for m in named['missed']], named['woke']), (['widget-4'], []))
+        self.assertEqual((named['missed'], named['woke'], named['steered']), ([], [], []))
         self.assertEqual(len(self.turns('p.widget-4')), 2)
         # Stopped, it refuses its agents' posts; the person's post resumes it and wakes everyone.
         stopped = self.person('stop', '--swarm', 'p.widget')
@@ -209,6 +217,16 @@ class SwarmTests(ModelFixture):
         self.assertEqual((again['tasks'], again['result']), (done['tasks'], done['result']))
         kinds = [line.get('kind', 'post') for line in self.board(started)]
         self.assertEqual(kinds, ['post', 'post', 'assign', 'claim', 'submit', 'review', 'finish'])
+
+    def test_an_added_agent_takes_the_row_a_deleted_one_left(self):
+        row = 'openai/synthetic-model,50'
+        started = self.start('--agents', '2', '--row', row, '--row', row)
+        self.assertEqual(started['swarm']['rows'], {'p.widget-1': 0, 'p.widget-2': 1})
+        self.agent('rm', '--store', str(self.store), '--bot', 'p.widget-2')
+        added = self.person('add', '--swarm', 'p.widget')
+        self.assertEqual(added['bots'], ['p.widget-3'])
+        self.assertEqual(added['swarm']['rows']['p.widget-3'], 1)
+        self.assertEqual(self.listed()['p.widget-3']['budget_tokens'], self.listed()['p.widget-1']['budget_tokens'])
 
     def test_two_claims_at_once_have_one_winner(self):
         started = self.start('--agents', '3')
@@ -281,9 +299,9 @@ class SwarmRuleTests(unittest.TestCase):
         self.swarm = {'name': 'p.w', 'members': ['p.w-1', 'p.w-2', 'p.w-3'], 'ids': {'p.w-1': 1, 'p.w-2': 2, 'p.w-3': 3},
                       'coordinator': {'bot': 'p.lead', 'id': 9}, 'stopped': False}
 
-    def act(self, author=None, state=None):
+    def act(self, author=None, state=None, live=None):
         folder = type('Folder', (), {'swarm': self.swarm, 'state': state or self.s.empty_state()})()
-        return folder, self.s.Act(folder, author, 1)
+        return folder, self.s.Act(folder, author, 1, live)
 
     def bot(self, n, used, cap=1000, turn=None):
         return {'name': f'p.w-{n}', 'id': n, 'tokens_used': used, 'budget_tokens': cap, 'running_turn': turn}
@@ -350,6 +368,32 @@ class SwarmRuleTests(unittest.TestCase):
         self.s.apply(state, act.lines[0])
         self.assertEqual((state['tasks']['t']['reviewer'], state['tasks']['t']['result']), ('w-3', 'r'))
         self.assertEqual([m for m, *_ in act.sends], ['p.w-3'])
+
+    def test_a_deleted_member_takes_no_work_and_its_review_is_handed_on(self):
+        state = self.s.empty_state()
+        state['tasks']['t'] = {'owner': 'w-1', 'reviewer': 'w-2', 'brief': 'b', 'status': 'reviewing', 'result': 'r',
+                               'verdict': None, 'evidence': None}
+        live = {'p.w-1', 'p.w-3'}
+        _, act = self.act('p.w-1', state, live)
+        with self.assertRaises(self.s.Refused) as refused:
+            self.s.assign(act, 'u', 'w-3', 'w-2', 'new work')
+        self.assertEqual(refused.exception.code, 'not_a_member')
+        self.s.assign(act, 't', 'w-1', 'w-3', 'please review')
+        self.assertEqual(act.lines[0]['reviewer'], 'w-3')
+
+    def test_an_identity_needs_shell_only_when_its_profile_lists_tools(self):
+        made = tempfile.TemporaryDirectory()
+        self.addCleanup(made.cleanup)
+        folder = Path(made.name)
+        agents = folder / '.agents/agents'
+        agents.mkdir(parents=True)
+        (agents / 'inline.md').write_text('---\ntools: [read, "edit"]\n---\nReviews.\n')
+        (agents / 'block.md').write_text('---\ndescription: x\ntools:\n  - read\n  - shell\nmodel: m\n---\n')
+        (agents / 'open.md').write_text('---\ndescription: x\n---\nAnything.\n')
+        self.assertEqual(self.s.profile_tools(str(folder), 'inline'), ['read', 'edit'])
+        self.assertEqual(self.s.profile_tools(str(folder), 'block'), ['read', 'shell'])
+        self.assertIn('shell', self.s.profile_tools(str(folder), 'open'))
+        self.assertIn('shell', self.s.profile_tools(str(folder), 'missing'))
 
     def test_the_mix_is_dealt_to_the_row_furthest_below_its_share(self):
         mix = [{'share': 50}, {'share': 25}, {'share': 25}]
