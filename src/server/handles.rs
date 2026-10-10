@@ -114,6 +114,9 @@ struct Inner {
     by_process: HashMap<i64, Vec<Waiter>>,
     // Only immutable, durable outcomes, retained while a waiter needs them.
     retained: HashMap<String, Retained>,
+    // Answers still reading their pending turns, each holding its session's
+    // output; shutdown ends them before the outputs close.
+    reads: tokio::task::JoinSet<()>,
 }
 
 #[derive(Clone)]
@@ -252,21 +255,31 @@ impl Handles {
                 }
                 // Pending turns are read in one job on the reader, off the
                 // registry lock, as `wait` reports a turn: one that finished
-                // meanwhile answers with its outcome, and one that vanished
-                // stays pending.
-                tokio::spawn(async move {
+                // meanwhile answers with its outcome, one that vanished stays
+                // pending, and a failed read says so for each.
+                while inner.reads.try_join_next().is_some() {}
+                inner.reads.spawn(async move {
                     let mut results = results;
+                    let texts: Vec<String> =
+                        pending.iter().map(|(text, ..)| text.clone()).collect();
                     let answers = reader
                         .read("turn_answers", move |db| {
                             Ok(pending
                                 .into_iter()
-                                .filter_map(|(text, bot, turn)| {
-                                    Some((text, db.turn_answer(&bot, turn).ok()?))
+                                .filter_map(|(text, bot, turn)| match db.turn_answer(&bot, turn) {
+                                    Ok(answer) => Some((text, answer)),
+                                    Err(error) if error.code == "turn_not_found" => None,
+                                    Err(error) => Some((text, failed(&error))),
                                 })
                                 .collect::<Vec<_>>())
                         })
                         .await
-                        .unwrap_or_default();
+                        .unwrap_or_else(|error| {
+                            texts
+                                .into_iter()
+                                .map(|text| (text, failed(&error)))
+                                .collect()
+                        });
                     for (text, answer) in answers {
                         results.insert(text, Arc::new(answer));
                     }
@@ -384,7 +397,7 @@ impl Handles {
             return Some((cached, true));
         }
         let result = match parsed {
-            Err(error) => Some((json!({"error":error.code,"detail":error.detail}), false)),
+            Err(error) => Some((failed(&error), false)),
             Ok(Handle::Turn { bot, turn }) => {
                 match store
                     .op("turn_answer", move |db| db.turn_answer(&bot, turn))
@@ -395,7 +408,7 @@ impl Handles {
                         let durable = answer["error"] != "turn_result_pruned";
                         Some((answer, durable))
                     }
-                    Err(error) => Some((json!({"error":error.code,"detail":error.detail}), false)),
+                    Err(error) => Some((failed(&error), false)),
                 }
             }
             Ok(Handle::Process(id)) => {
@@ -409,7 +422,7 @@ impl Handles {
                     )),
                     Ok(Some((_, Some(result)))) => Some((result, true)),
                     Ok(Some((_, None))) => None,
-                    Err(error) => Some((json!({"error":error.code,"detail":error.detail}), false)),
+                    Err(error) => Some((failed(&error), false)),
                 }
             }
         };
@@ -500,12 +513,15 @@ impl Handles {
 
     /// Release session outputs and stop deadlines before the stdout worker
     /// is joined. Background completions may retain this registry afterward.
-    pub fn shutdown(&self) {
+    /// Drop every waiter, and hand back the answers still reading, for the
+    /// caller to let finish or end before closing their outputs.
+    pub fn shutdown(&self) -> tokio::task::JoinSet<()> {
         let mut inner = self.inner.lock().unwrap();
         inner.waiters.clear();
         inner.by_turn.clear();
         inner.by_process.clear();
         inner.retained.clear();
+        std::mem::take(&mut inner.reads)
     }
 
     fn detach_locked(inner: &mut Inner, waiter: Waiter) {
@@ -532,6 +548,11 @@ impl Handles {
             .for_each(|v| v.retain(|w| *w != waiter));
         inner.by_process.retain(|_, v| !v.is_empty());
     }
+}
+
+/// A handle's result when reading it failed.
+fn failed(error: &agent_runtime::Error) -> Value {
+    json!({"error":error.code,"detail":error.detail})
 }
 
 fn respond(output: &Output, request: Value, results: BTreeMap<String, Arc<Value>>) {
@@ -600,6 +621,72 @@ mod tests {
             assert!(inner.waiters.is_empty());
             assert!(inner.by_process.is_empty());
         }
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_ends_an_answer_still_reading() {
+        use tokio::io::AsyncReadExt;
+        let dir = std::env::temp_dir().join(format!("agent-wait-read-test-{}", std::process::id()));
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let handles = Handles::new(mpsc::unbounded_channel().0);
+        let (writer, mut written) = tokio::io::duplex(65536);
+        {
+            let mut inner = handles.inner.lock().unwrap();
+            inner.waiters.insert(
+                Waiter::Request(1),
+                Waiting {
+                    generation: 1,
+                    any: true,
+                    remaining: ["proc:2".into()].into(),
+                    results: BTreeMap::from([(
+                        "turn:Bob/1".to_string(),
+                        Arc::new(json!({"pending":true})),
+                    )]),
+                    completion: Completion::Respond {
+                        session: 7,
+                        output: Output::writer(writer),
+                        request: json!(1),
+                        reader: store.reader(),
+                    },
+                    timer: None,
+                },
+            );
+            inner.by_process.insert(2, vec![Waiter::Request(1)]);
+        }
+        // The reader is busy, so the answer's read of its pending turn waits.
+        let (started, busy) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let reader = store.reader();
+        let holder = tokio::spawn(async move {
+            reader
+                .read("hold", move |_| {
+                    started.send(()).unwrap();
+                    let _ = held.recv();
+                    Ok(())
+                })
+                .await
+        });
+        while busy.try_recv().is_err() {
+            tokio::task::yield_now().await;
+        }
+        handles.process_finished(2, json!({"exit_code":0}));
+        let mut reads = handles.shutdown();
+        assert_eq!(reads.len(), 1);
+        // Ended, it drops the session's output, so the output closes.
+        reads.shutdown().await;
+        let mut bytes = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            written.read_to_end(&mut bytes),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(bytes.is_empty());
+        release.send(()).unwrap();
+        holder.await.unwrap().unwrap();
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

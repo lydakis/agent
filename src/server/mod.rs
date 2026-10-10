@@ -1338,15 +1338,19 @@ pub async fn run(config: Configuration) -> Result<()> {
         let _ = publisher.await;
     }
     drop(firehose_hub);
-    handles.shutdown();
+    let mut reads = handles.shutdown();
     // Socket writers need runtime time to flush terminal events and wait
     // results. Drain concurrently under one deadline, so slow clients cannot
     // multiply shutdown latency. Stdout also drains through its worker below.
-    let _ = tokio::time::timeout(
-        Duration::from_secs(5),
-        futures_util::future::join_all(sessions.values().map(Output::drain)),
-    )
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        while reads.join_next().await.is_some() {}
+        futures_util::future::join_all(sessions.values().map(Output::drain)).await;
+    })
     .await;
+    // A wait answer still reading holds its session's output; end it here,
+    // while the runtime can still drop it, or joining stdout below would wait
+    // on it forever.
+    reads.shutdown().await;
     drop(sessions);
     // The stdio firehose's senders went with the service and the publisher;
     // the output worker can now drain and exit, including shutdown without EOF.
