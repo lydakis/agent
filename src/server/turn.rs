@@ -1770,7 +1770,7 @@ impl Turn {
         self.settings.get_or_init(|| record.settings);
         let context = self.store.op("context", move |db| db.context(turn)).await?;
         // A turn may run at its own effort; everything after reads the record.
-        record.reasoning = context.reasoning.clone();
+        record.effort = context.effort.clone();
         let (provider, model) = split_model(&context.model)?;
         let provider = self
             .providers
@@ -1799,8 +1799,8 @@ impl Turn {
             ("AGENT_BOT_ID".to_owned(), context.bot_id.to_string()),
             ("AGENT_TURN".to_owned(), turn.to_string()),
         ];
-        if let Some(level) = &record.reasoning {
-            environment.push(("AGENT_REASONING".to_owned(), level.clone()));
+        if let Some(level) = &record.effort {
+            environment.push(("AGENT_EFFORT".to_owned(), level.clone()));
         }
         if let (Some(parent), Some(id)) = (&context.created_by, context.created_by_id) {
             environment.push(("AGENT_PARENT".to_owned(), parent.clone()));
@@ -1908,7 +1908,7 @@ impl Turn {
                 .is_some_and(|(model, effort)| {
                     model == called
                         && (provider.family() != agent_runtime::codec::Family::Anthropic
-                            || *effort == record.reasoning)
+                            || *effort == record.effort)
                 })
         });
         while model_rounds < MAX_ROUNDS {
@@ -2268,13 +2268,13 @@ impl Turn {
             // No call has sent the view a summary installed here, so there
             // is no cache of it to keep warm.
             let mut warm = provider
-                .keep_warm_after(model, record.reasoning.as_deref())
+                .keep_warm_after(model, record.effort.as_deref())
                 .filter(|_| !installed)
                 .map(|after| Warm {
                     provider,
                     model,
                     instructions: &record.instructions,
-                    reasoning: record.reasoning.as_deref(),
+                    reasoning: record.effort.as_deref(),
                     tools: &tools,
                     context: &context,
                     fallbacks: record.fallbacks,
@@ -2450,7 +2450,7 @@ impl Turn {
         // A summary's view is replaced once it lands; only the turn's call
         // is refreshed while it streams.
         let warm_after = match body {
-            Body::Window(_) => provider.keep_warm_after(model, record.reasoning.as_deref()),
+            Body::Window(_) => provider.keep_warm_after(model, record.effort.as_deref()),
             Body::Copied(_) | Body::Span(..) => None,
         };
         loop {
@@ -2466,7 +2466,7 @@ impl Turn {
                     ModelRequest {
                         model,
                         instructions,
-                        reasoning: record.reasoning.as_deref(),
+                        reasoning: record.effort.as_deref(),
                         tools,
                         allow_tool_calls: !matches!(body, Body::Span(..)),
                         fallbacks: record.fallbacks,
@@ -2498,7 +2498,7 @@ impl Turn {
                         provider,
                         model,
                         instructions,
-                        reasoning: record.reasoning.as_deref(),
+                        reasoning: record.effort.as_deref(),
                         tools,
                         context,
                         fallbacks: record.fallbacks,
@@ -4079,7 +4079,7 @@ mod tests {
                             family: Family::Responses,
                             model: "synthetic",
                             instructions: "",
-                            reasoning: None,
+                            effort: None,
                             budget_tokens: None,
                             tools: &[],
                             created_by: None,

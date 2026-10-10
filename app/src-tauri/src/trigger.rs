@@ -2547,7 +2547,7 @@ async fn start(client: &Client, trigger: &Trigger) -> Result<i64, String> {
     let made = client
         .request(
             "create",
-            json!({"bot": name, "workspace": dir, "model": model, "reasoning": effort,
+            json!({"bot": name, "workspace": dir, "model": model, "effort": effort,
                 "instructions": policy["instructions"],
                 "compaction_instructions": policy["compaction_instructions"],
                 "tools": crate::TOOLS,

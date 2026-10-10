@@ -300,7 +300,7 @@ class AnthropicTurnCompactionTests(ModelFixture):
                         env={**clean_env(), 'ANTHROPIC_TEST_KEY': 'synthetic-anthropic-key'},
                         settings={'context_bytes': 24576})
         self.addCleanup(client.close)
-        self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path), reasoning='low',
+        self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path), effort='low',
                                                compaction_instructions='Summarize.'))
         turn = client.request('submit', bot='Bob', request_id='1', prompt='long:30')['result']['turn']
         ended = client.finished(turn)

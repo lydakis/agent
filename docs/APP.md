@@ -144,10 +144,10 @@ threads' picks are kept there as `threads_model`, `threads_reasoning` and
 `threads_in` (`worktree` or `project`). The app tells them to the coordinator
 when it creates it, as one paragraph after the composed instructions, so a
 folder's or your own `coordinator.md` cannot drop them: start every task, in
-a role (`--profile`) or not, with `--model` and `--reasoning` named, and say
+a role (`--profile`) or not, with `--model` and `--effort` named, and say
 whether tasks work in this folder or in their own worktrees. Without a
 threads' model the flags are the lead's own, `--model "$AGENT_MODEL"
-${AGENT_REASONING:+--reasoning "$AGENT_REASONING"}` (see [CLI.md](CLI.md)),
+${AGENT_EFFORT:+--effort "$AGENT_EFFORT"}` (see [CLI.md](CLI.md)),
 so a role that names a model of its own does not replace the lead's. A
 coordinator keeps the instructions it was made with: a file written or edited
 later reaches the next coordinator made for the folder.

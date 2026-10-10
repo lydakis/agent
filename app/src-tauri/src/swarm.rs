@@ -1729,7 +1729,7 @@ async fn create(
         };
         let params = json!({
             "bot": name, "workspace": swarm.workspace, "model": mix.model,
-            "reasoning": mix.reasoning, "instructions": policy["instructions"],
+            "effort": mix.reasoning, "instructions": policy["instructions"],
             "compaction_instructions": policy["compaction_instructions"],
             "tools": tools, "budget_tokens": each,
         });
@@ -3405,10 +3405,10 @@ pub fn start_cli(args: &[String]) -> i32 {
             // whenever it has one.
             let turn = |name| std::env::var(name).ok().filter(|v: &String| !v.is_empty());
             let (model, reasoning) = match turn("AGENT_MODEL") {
-                Some(model) => (model, turn("AGENT_REASONING")),
+                Some(model) => (model, turn("AGENT_EFFORT")),
                 None => (
                     format!("{provider}/{model}"),
-                    me["reasoning"].as_str().map(str::to_owned),
+                    me["effort"].as_str().map(str::to_owned),
                 ),
             };
             let mix = if asked.mix.is_empty() {
@@ -4779,7 +4779,7 @@ mod tests {
             let reviewer = create["bot"] == "p.goal-2" || create["bot"] == "p.goal-4";
             assert_eq!(create["model"], if reviewer { "b/y" } else { "a/x" });
             assert_eq!(
-                create["reasoning"],
+                create["effort"],
                 if reviewer {
                     json!("xhigh")
                 } else {
