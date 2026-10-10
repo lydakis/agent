@@ -2475,19 +2475,15 @@ function settingsShell({ env = {}, lists = {} } = {}) {
   return { p, calls, env };
 }
 
-test('Bedrock is one provider running both its APIs, signed with the AWS login unless an API key is given', () => {
+test('Bedrock is one provider running both its APIs, named alone whether it signs with the AWS login or a key', () => {
   const p = shell();
-  assert.deepEqual([...p.providerSpecs('bedrock', { AWS_REGION: 'us-west-2' })], ['bedrock', 'bedrock-openai']);
-  assert.deepEqual([...p.providerSpecs('bedrock', { AWS_REGION: 'eu-west-1', AWS_BEARER_TOKEN_BEDROCK: 'k' })], [
-    'bedrock=anthropic,https://bedrock-mantle.eu-west-1.api.aws/anthropic/v1,AWS_BEARER_TOKEN_BEDROCK',
-    'bedrock-openai=responses,https://bedrock-mantle.eu-west-1.api.aws/openai/v1,AWS_BEARER_TOKEN_BEDROCK']);
-  assert.deepEqual([...p.providerSpecs('anthropic', { ANTHROPIC_API_KEY: 'k' })], ['anthropic']);
+  assert.deepEqual([...p.providerSpecs('bedrock')], ['bedrock', 'bedrock-openai']);
+  assert.deepEqual([...p.providerSpecs('anthropic')], ['anthropic']);
 });
 
 test('connecting a provider keeps the others, saves only what was typed, restarts the daemon and lists its models', async () => {
   const { p, calls, env } = settingsShell({ env: { AGENT_PROVIDER: 'openai', OPENAI_API_KEY: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] }, bedrock: { models: [{ id: 'claude' }, { id: 'haiku' }] }, 'bedrock-openai': { models: [{ id: 'grok' }] } } });
   await p.openSetup();
-  await assert.rejects(p.connectProvider('bedrock', { AWS_REGION: '', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: '' }), /Region is required/);
   await assert.rejects(p.connectProvider('bedrock', { AWS_REGION: 'us east-1', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: '' }), /Region must look like us-east-1/);
   assert.equal(calls.length, 0);
   await p.connectProvider('bedrock', { AWS_REGION: 'us-east-1', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: '' });
@@ -2505,11 +2501,14 @@ test('connecting a provider keeps the others, saves only what was typed, restart
   assert.match(html, /Amazon Bedrock<\/span><span class="st ok">✓ 3 models/);
   assert.equal(html.match(/<optgroup label="Amazon Bedrock">/g).length, 1);
   assert.match(html, /<option value="bedrock-openai\/grok">grok<\/option>/);
-  // A Bedrock key, once saved, stays in use when the region changes and its field is left empty.
+  // A Bedrock key, once saved, stays in use when the region changes and its field is left empty;
+  // a key works only in its own region, so it needs one named.
   await p.connectProvider('bedrock', { AWS_REGION: 'us-east-1', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: 'k' });
+  await assert.rejects(p.connectProvider('bedrock', { AWS_REGION: '', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: '' }), /Region is required with a Bedrock API key/);
   await p.connectProvider('bedrock', { AWS_REGION: 'us-west-2', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: '' });
-  assert.equal(env.AGENT_PROVIDER, 'openai bedrock=anthropic,https://bedrock-mantle.us-west-2.api.aws/anthropic/v1,AWS_BEARER_TOKEN_BEDROCK bedrock-openai=responses,https://bedrock-mantle.us-west-2.api.aws/openai/v1,AWS_BEARER_TOKEN_BEDROCK');
+  assert.equal(env.AGENT_PROVIDER, 'openai bedrock bedrock-openai');
   assert.equal(env.AWS_BEARER_TOKEN_BEDROCK, 'k');
+  assert.equal(env.AWS_REGION, 'us-west-2');
   // Removing Bedrock removes both of its APIs, its key, and a default model on either.
   calls.length = 0;
   await p.removeProvider('bedrock');
@@ -2642,19 +2641,23 @@ test('a daemon with no provider is not started again until settings change', asy
 });
 
 test('Bedrock with a saved key switches to the AWS login when asked, and keeps the key otherwise', async () => {
-  const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: 'bedrock=anthropic,https://bedrock-mantle.us-east-1.api.aws/anthropic/v1,AWS_BEARER_TOKEN_BEDROCK bedrock-openai=responses,https://bedrock-mantle.us-east-1.api.aws/openai/v1,AWS_BEARER_TOKEN_BEDROCK', AWS_REGION: 'us-east-1', AWS_BEARER_TOKEN_BEDROCK: 'k' }, lists: { bedrock: { models: [{ id: 'claude' }] }, 'bedrock-openai': { models: [{ id: 'grok' }] } } });
+  const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: 'bedrock bedrock-openai', AWS_REGION: 'us-east-1', AWS_BEARER_TOKEN_BEDROCK: 'k' }, lists: { bedrock: { models: [{ id: 'claude' }] }, 'bedrock-openai': { models: [{ id: 'grok' }] } } });
   await p.openSetup();
   p.S.setup.adding = 'bedrock';
   assert.match(p.setupHTML(), /<option value="key" selected>Bedrock API key/);
   await p.connectProvider('bedrock', { AWS_REGION: 'us-east-1', AUTH: 'key', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: '' });
-  assert.match(calls.filter(([c]) => c === 'save')[0][1].AGENT_PROVIDER, /^bedrock=anthropic,/);
+  assert.deepEqual({ ...calls.filter(([c]) => c === 'save')[0][1] }, { AGENT_PROVIDER: 'bedrock bedrock-openai', AWS_REGION: 'us-east-1', AWS_PROFILE: '' });
   await p.connectProvider('bedrock', { AWS_REGION: 'us-east-1', AUTH: 'aws', AWS_PROFILE: 'work', AWS_BEARER_TOKEN_BEDROCK: '' });
   assert.deepEqual({ ...calls.filter(([c]) => c === 'save')[1][1] }, { AGENT_PROVIDER: 'bedrock bedrock-openai', AWS_REGION: 'us-east-1', AWS_PROFILE: 'work', AWS_BEARER_TOKEN_BEDROCK: '' });
 });
 
-test('Bedrock signing in with AWS stays so while the shell exports a Bedrock key', async () => {
-  const { p } = settingsShell({ env: { AGENT_PROVIDER: 'bedrock bedrock-openai', AWS_REGION: 'us-east-1', AWS_BEARER_TOKEN_BEDROCK: 'shell' }, lists: { bedrock: { models: [{ id: 'claude' }] } } });
+test('Bedrock signs in with any key the daemon would be given, the shell\'s too, until the AWS login empties it', async () => {
+  const { p, env } = settingsShell({ env: { AGENT_PROVIDER: 'bedrock bedrock-openai', AWS_BEARER_TOKEN_BEDROCK: 'shell' }, lists: { bedrock: { models: [{ id: 'claude' }] } } });
   await p.openSetup();
+  p.S.setup.adding = 'bedrock';
+  assert.match(p.setupHTML(), /<option value="key" selected>Bedrock API key/);
+  await p.connectProvider('bedrock', { AWS_REGION: '', AUTH: 'aws', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: '' });
+  assert.equal(env.AWS_BEARER_TOKEN_BEDROCK, undefined);
   p.S.setup.adding = 'bedrock';
   assert.match(p.setupHTML(), /<option value="aws" selected>AWS login/);
 });
@@ -2684,7 +2687,7 @@ test('a connected provider can be edited in place', async () => {
 
 test('a gateway set up by hand under a known name is not offered the catalog form, which would overwrite it', async () => {
   const gateway = 'openai=responses,https://proxy.example/v1,PROXY_KEY';
-  const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: `${gateway} bedrock=anthropic,https://bedrock-mantle.us-east-1.api.aws/anthropic/v1,AWS_BEARER_TOKEN_BEDROCK bedrock-openai=responses,https://bedrock-mantle.us-east-1.api.aws/openai/v1,AWS_BEARER_TOKEN_BEDROCK`, AWS_BEARER_TOKEN_BEDROCK: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] } } });
+  const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: `${gateway} bedrock bedrock-openai`, AWS_BEARER_TOKEN_BEDROCK: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] } } });
   await p.openSetup();
   const html = p.setupHTML();
   assert.doesNotMatch(html, /data-act="setup-pick" data-v="openai"/);

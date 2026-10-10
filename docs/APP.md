@@ -159,9 +159,13 @@ model from any of them (demo `?first`).
 
 ![Setup's provider choices](app/setup-providers.png)
 
-Each provider asks for what it needs to sign in; Bedrock takes a region and an
-AWS profile or a Bedrock API key, and serves Claude and its other models as
-one provider.
+Each provider asks for what it needs to sign in; Bedrock takes an AWS profile
+or a Bedrock API key, and serves Claude and its other models as one provider.
+With the AWS login its region is optional: the daemon takes the profile's,
+else us-east-1. A Bedrock API key needs the region it was made in. Claude
+runs through cross-region inference profiles, which AWS routes to
+whichever region holds the model, so the region no longer decides which Claude
+models are offered (within the source regions each profile supports).
 
 ![Connecting Amazon Bedrock](app/setup-bedrock.png)
 
@@ -481,9 +485,9 @@ connected, and forks and side chats keep their source's. One screen covers a
 first run and later changes:
 
 1. **Providers.** Anthropic, OpenAI and OpenRouter take an API key; a ChatGPT
-   plan uses the sign-in Codex saved; Amazon Bedrock takes a region and signs
-   in one of two ways, chosen on the form: the AWS CLI's credentials for an
-   optional profile (which drops a saved key), or a Bedrock API key. Bedrock serves Claude over Anthropic's API and
+   plan uses the sign-in Codex saved; Amazon Bedrock takes an optional region
+   and signs in one of two ways, chosen on the form: the AWS CLI's credentials
+   for an optional profile (which drops a saved key), or a Bedrock API key. Bedrock serves Claude over Anthropic's API and
    its other models over OpenAI's, so the daemon runs it as two providers,
    `bedrock` and `bedrock-openai`; the app connects, lists and removes them
    as one. Connecting writes `AGENT_PROVIDER` (the providers already running

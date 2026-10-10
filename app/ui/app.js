@@ -2486,7 +2486,7 @@ function detach() { save(); Daemon.close(); }
 const AWS = 'Signs in with your AWS CLI (version 2) login for the profile (aws configure, or aws sso login), or with a Bedrock API key.';
 // A field that is `local` is the form's own choice, never saved.
 const BEDROCK = [
-  { key: 'AWS_REGION', label: 'Region', hint: 'us-east-1', required: true },
+  { key: 'AWS_REGION', label: 'Region', hint: "the key's; with AWS login, optional" },
   { key: 'AUTH', label: 'Sign in with', local: true, choices: [['aws', 'AWS login'], ['key', 'Bedrock API key']] },
   { key: 'AWS_PROFILE', label: 'AWS profile', hint: 'default' },
   { key: 'AWS_BEARER_TOKEN_BEDROCK', label: 'Bedrock API key', hint: 'optional', secret: true },
@@ -2514,8 +2514,7 @@ const keysOf = (spec) => [
 const providerLabel = (name) => catalogOf(name)?.label ?? name;
 // A spec the catalog writes, which its form can edit; any other (a gateway under a known name) it
 // would overwrite with the provider's defaults.
-const editable = (spec) => spec === specName(spec) ? !!catalogOf(spec) : !!catalogOf(specName(spec))?.parts
-  && providerSpecs(catalogOf(specName(spec)).id, { AWS_REGION: spec.split('.')[1], AWS_BEARER_TOKEN_BEDROCK: 'x' }).includes(spec);
+const editable = (spec) => spec === specName(spec) && !!catalogOf(spec);
 // Effort: how hard a model thinks, picked beside its model when an agent is made; the model chip
 // changes it for the agent's next turns. Both families take low to xhigh and Anthropic's also max;
 // which of those a model accepts is its provider's to say. No level sends none, and the model uses
@@ -2552,13 +2551,9 @@ function modelSelectHTML(id, list, prefer = null, none = null) {
   const first = none !== null ? `<option value=""${pick ? '' : ' selected'}>${esc(none)}</option>` : pick ? '' : '<option value="" selected disabled>Choose a model</option>';
   return `<select id="${id}" aria-label="Model">${first}${options}</select>`;
 }
-// An entry's `--provider` specs. Bedrock with an API key names each endpoint so the key can be named
-// after it; without one it signs with the AWS CLI's credentials in the region.
-function providerSpecs(id, values) {
-  const c = catalogOf(id);
-  if (!c?.parts) return [id];
-  return c.parts.map(([name, family, path]) => values.AWS_BEARER_TOKEN_BEDROCK ? `${name}=${family},https://bedrock-mantle.${values.AWS_REGION}.api.aws/${path}/v1,AWS_BEARER_TOKEN_BEDROCK` : name);
-}
+// An entry's `--provider` specs: its daemon providers by name. Bedrock's sign with a Bedrock API key
+// when one is set, else with the AWS CLI's credentials, in the region the AWS tools would use.
+const providerSpecs = (id) => partsOf(catalogOf(id) ?? { id });
 // One screen, one state: `settings` as the app would start a daemon with, each provider's answer
 // (`checking`, a model count, or an error), and the list models are picked from.
 function setupState() { return S.setup ??= { open: false, settings: null, status: {}, list: [], adding: null, busy: null, error: null, listError: null }; }
@@ -2655,11 +2650,12 @@ async function connectProvider(id, values) {
   // Bedrock signs in one way: with the AWS login, which drops a saved key, or with a key, typed or saved.
   const saved = st.settings?.keys?.includes('AWS_BEARER_TOKEN_BEDROCK');
   const aws = values.AUTH ? values.AUTH === 'aws' : !values.AWS_BEARER_TOKEN_BEDROCK && !saved;
-  // The region names the endpoint and sits inside a space-separated provider list.
-  if (c.parts && !/^[a-z]{2}(-[a-z]+)+-\d+$/.test(values.AWS_REGION ?? '')) throw new Error(`Region must look like us-east-1, not "${values.AWS_REGION}"`);
+  // The region names the endpoint; left empty, the daemon takes the profile's, else us-east-1.
+  if (c.parts && values.AWS_REGION && !/^[a-z]{2}(-[a-z]+)+-\d+$/.test(values.AWS_REGION)) throw new Error(`Region must look like us-east-1, not "${values.AWS_REGION}"`);
   if (c.parts && !aws && !values.AWS_BEARER_TOKEN_BEDROCK && !saved) throw new Error('Bedrock API key is required');
-  const keyed = c.parts ? { ...values, AWS_BEARER_TOKEN_BEDROCK: aws ? '' : values.AWS_BEARER_TOKEN_BEDROCK || 'saved' } : values;
-  const changes = { AGENT_PROVIDER: [...specs, ...providerSpecs(c.id, keyed)].join(' ') };
+  // A short-term key works only in the region that made it, so signing in with a key names one.
+  if (c.parts && !aws && !values.AWS_REGION) throw new Error('Region is required with a Bedrock API key');
+  const changes = { AGENT_PROVIDER: [...specs, ...providerSpecs(c.id)].join(' ') };
   // A key left empty keeps the one saved; another field left empty is cleared, the shell's value too.
   for (const f of c.fields) if (!f.local && (!f.secret || values[f.key])) changes[f.key] = values[f.key] || '';
   // Emptied rather than removed, so a key the shell exports stays out of it too.
@@ -2719,8 +2715,8 @@ function setupHTML(kept = new Map()) {
   else {
     const c = catalogOf(st.adding);
     const value = (f) => f.key === 'AWS_REGION' ? set?.region ?? '' : f.key === 'AWS_PROFILE' ? set?.profile ?? '' : '';
-    // How Bedrock signs in now, from its specs: a key only the shell exports does not change it.
-    const choice = (f) => { const on = (set?.providers ?? []).some((s) => catalogOf(specName(s))?.parts && s.endsWith(',AWS_BEARER_TOKEN_BEDROCK')) ? 'key' : 'aws'; return `<label><span>${esc(f.label)}</span><select name="${f.key}">${f.choices.map(([v, l]) => `<option value="${v}"${v === on ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select></label>`; };
+    // How Bedrock signs in now: with its key whenever one is set.
+    const choice = (f) => { const on = set?.keys?.includes('AWS_BEARER_TOKEN_BEDROCK') ? 'key' : 'aws'; return `<label><span>${esc(f.label)}</span><select name="${f.key}">${f.choices.map(([v, l]) => `<option value="${v}"${v === on ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select></label>`; };
     const fields = c.fields.map((f) => f.choices ? choice(f) : `<label><span>${esc(f.label)}</span><input name="${f.key}" type="${f.secret ? 'password' : 'text'}" autocomplete="off" spellcheck="false" value="${esc(value(f))}" placeholder="${esc(f.secret && set?.keys?.includes(f.key) ? 'saved; type to replace' : f.hint ?? '')}"></label>`).join('');
     const working = anyActive() ? `<p class="warn">Agents are working. Connecting restarts the daemon, which stops them.</p>` : '';
     add = `<form class="pform" id="setupform"><b>${esc(c.label)}</b>${c.about ? `<p>${esc(c.about)}</p>` : ''}${fields}${working}<div class="row"><button type="submit" class="sbtn primary"${busy}>Connect</button><button type="button" class="sbtn" data-act="setup-cancel"${busy}>Cancel</button></div></form>`;

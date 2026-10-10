@@ -56,6 +56,86 @@ const ENVIRONMENT: [&str; 3] = [
     "AWS_SESSION_TOKEN",
 ];
 pub const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
+/// Where SigV4 calls go when nothing names a region, as Claude Code does:
+/// a source region for the US and global inference profiles in AWS's
+/// support matrix.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The region Bedrock calls are made in, in Claude Code's order:
+/// `AWS_REGION`, `AWS_DEFAULT_REGION`, the active profile's `region`
+/// (`AWS_PROFILE`, else `default`) in the shared credentials file and then
+/// the config file; `None` when none names one. An empty value is unset; the first one
+/// set must be shaped like a region, or the reason names where it came
+/// from, so a typo never sends signed calls to another region. `read`
+/// reads a file; tests give it their own.
+pub fn region(
+    env: &dyn Fn(&str) -> Option<String>,
+    read: &dyn Fn(&str) -> Option<String>,
+) -> std::result::Result<Option<String>, String> {
+    let profile = env("AWS_PROFILE")
+        .map(|profile| profile.trim().to_owned())
+        .filter(|profile| !profile.is_empty())
+        .unwrap_or_else(|| "default".to_owned());
+    let home = env("HOME");
+    let path = |variable: &str, file: &str| {
+        env(variable)
+            .filter(|path| !path.is_empty())
+            .or_else(|| home.as_ref().map(|home| format!("{home}/.aws/{file}")))
+    };
+    // The credentials file names a profile bare; the config file names
+    // every profile but `default` as `profile NAME`.
+    let config_section = match profile.as_str() {
+        "default" => "default".to_owned(),
+        name => format!("profile {name}"),
+    };
+    let files = [
+        (
+            path("AWS_SHARED_CREDENTIALS_FILE", "credentials"),
+            profile.clone(),
+        ),
+        (path("AWS_CONFIG_FILE", "config"), config_section),
+    ];
+    let named = ["AWS_REGION", "AWS_DEFAULT_REGION"]
+        .into_iter()
+        .map(|name| (name.to_owned(), env(name)));
+    let profiles = files.into_iter().map(|(path, section)| {
+        let value = path
+            .as_ref()
+            .and_then(|path| ini_value(&read(path)?, &section, "region"));
+        (format!("the region of [{section}] in the AWS files"), value)
+    });
+    let Some((source, region)) = named
+        .chain(profiles)
+        .filter_map(|(source, value)| Some((source, value?.trim().to_owned())))
+        .find(|(_, value)| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    match region
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        true => Ok(Some(region)),
+        false => Err(format!("{source} is {region:?}, which is not a region")),
+    }
+}
+
+/// `key` in `[section]` of an AWS shared config or credentials file.
+fn ini_value(text: &str, section: &str, key: &str) -> Option<String> {
+    let mut inside = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            inside = name.split_whitespace().eq(section.split_whitespace());
+        } else if inside
+            && let Some((name, value)) = line.split_once('=')
+            && name.trim() == key
+        {
+            return Some(value.trim().to_owned());
+        }
+    }
+    None
+}
 
 /// The region and signing name of a Bedrock endpoint, from its host:
 /// `bedrock-runtime.{region}.amazonaws.com` signs as `bedrock`,
@@ -579,6 +659,33 @@ fn canonical_path(path: &str) -> String {
     if out.is_empty() { "/".into() } else { out }
 }
 
+/// The query as SigV4 canonicalizes it: each name and value encoded
+/// leaving only unreserved characters bare, sorted by name, then value.
+fn canonical_query(url: &reqwest::Url) -> String {
+    let encode = |text: &str| {
+        let mut out = String::with_capacity(text.len());
+        for byte in text.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    out.push(byte as char)
+                }
+                _ => out.push_str(&format!("%{byte:02X}")),
+            }
+        }
+        out
+    };
+    let mut pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(name, value)| (encode(&name), encode(&value)))
+        .collect();
+    pairs.sort();
+    pairs
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
 /// The request signature: the canonical request's digest in the string to
 /// sign, under the key derived from the secret for this day, region and
 /// service.
@@ -595,9 +702,8 @@ fn signature(secret: &str, stamp: &str, region: &str, service: &str, canonical: 
     hex(mac(key.as_ref(), to_sign.as_bytes()).as_ref())
 }
 
-/// SigV4 header signing for a request with no query string: `host`,
-/// `x-amz-content-sha256`, `x-amz-date` and, with temporary keys,
-/// `x-amz-security-token` are signed.
+/// SigV4 header signing: `host`, `x-amz-content-sha256`, `x-amz-date` and,
+/// with temporary keys, `x-amz-security-token` are signed.
 fn sign(
     keys: &Keys,
     region: &str,
@@ -629,7 +735,7 @@ fn sign(
     let mut canonical = format!(
         "{method}\n{}\n{}\n",
         canonical_path(url.path()),
-        url.query().unwrap_or_default()
+        canonical_query(url)
     );
     for (name, value) in &headers {
         canonical.push_str(name);
@@ -685,6 +791,75 @@ mod tests {
         ] {
             assert_eq!(endpoint(&url(other)), None, "{other}");
         }
+    }
+
+    #[test]
+    fn the_region_comes_from_the_environment_then_the_profile() {
+        let config = "[default]\nregion = eu-west-1\n\n[profile work]\noutput = json\nregion=us-west-2\n[sso-session work]\nregion = ap-south-1\n";
+        let credentials = "[work]\naws_access_key_id = x\nregion = ca-central-1\n";
+        let read = |path: &str| match path {
+            "/h/.aws/config" => Some(config.to_owned()),
+            "/h/.aws/credentials" => Some(credentials.to_owned()),
+            "/elsewhere" => Some("[profile work]\nregion = sa-east-1\n".to_owned()),
+            "/bad" => Some("[profile work]\nregion = us east\n".to_owned()),
+            _ => None,
+        };
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_owned())
+            }
+        };
+        let resolve = |pairs| region(&env(pairs), &read).unwrap().unwrap_or_default();
+        assert_eq!(
+            resolve(&[("AWS_REGION", "us-east-2"), ("HOME", "/h")]),
+            "us-east-2"
+        );
+        assert_eq!(
+            resolve(&[("AWS_DEFAULT_REGION", "eu-north-1")]),
+            "eu-north-1"
+        );
+        // An empty value is unset; one not shaped like a region is refused,
+        // naming where it came from, rather than sending calls elsewhere.
+        assert_eq!(
+            resolve(&[("AWS_REGION", " "), ("AWS_DEFAULT_REGION", "eu-north-1")]),
+            "eu-north-1"
+        );
+        let refused = |pairs| region(&env(pairs), &read).unwrap_err();
+        assert_eq!(
+            refused(&[
+                ("AWS_REGION", "US-EAST-1"),
+                ("AWS_DEFAULT_REGION", "eu-north-1")
+            ]),
+            "AWS_REGION is \"US-EAST-1\", which is not a region"
+        );
+        assert_eq!(
+            refused(&[("AWS_PROFILE", "work"), ("AWS_CONFIG_FILE", "/bad")]),
+            "the region of [profile work] in the AWS files is \"us east\", which is not a region"
+        );
+        assert_eq!(resolve(&[("HOME", "/h")]), "eu-west-1");
+        // The credentials file is read before the config file.
+        assert_eq!(
+            resolve(&[("HOME", "/h"), ("AWS_PROFILE", "work")]),
+            "ca-central-1"
+        );
+        assert_eq!(
+            resolve(&[
+                ("HOME", "/h"),
+                ("AWS_PROFILE", "work"),
+                ("AWS_SHARED_CREDENTIALS_FILE", "/none")
+            ]),
+            "us-west-2"
+        );
+        assert_eq!(
+            resolve(&[("AWS_PROFILE", "work"), ("AWS_CONFIG_FILE", "/elsewhere")]),
+            "sa-east-1"
+        );
+        // Nothing names one: the caller picks the fallback.
+        assert_eq!(resolve(&[("HOME", "/h"), ("AWS_PROFILE", "other")]), "");
+        assert_eq!(resolve(&[]), "");
     }
 
     #[test]
@@ -1035,6 +1210,41 @@ echo '{{"Version":1,"AccessKeyId":"FRESH","SecretAccessKey":"S"}}'"#,
         assert!(keys.stale(at(1_440_938_160 - 299)));
         assert!(!keys.stale(at(1_440_938_160 - 301)));
         assert!(keys.expired(at(1_440_938_160)));
+    }
+
+    /// A paged control-plane listing as botocore 1.43 signs it: the query
+    /// sorted and encoded, a page token's `+`, `/` and `=` included.
+    #[test]
+    fn queries_sign_as_botocore_signs_them() {
+        let mut url = reqwest::Url::parse(
+            "https://bedrock.us-west-2.amazonaws.com/inference-profiles?maxResults=1000&typeEquals=SYSTEM_DEFINED",
+        )
+        .unwrap();
+        url.query_pairs_mut().append_pair("nextToken", "ab+c/==");
+        assert_eq!(
+            canonical_query(&url),
+            "maxResults=1000&nextToken=ab%2Bc%2F%3D%3D&typeEquals=SYSTEM_DEFINED"
+        );
+        let keys = Keys::new(
+            "AKIDEXAMPLE".into(),
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".into(),
+            Some("FQoGZXIvYXdzEXAMPLE+/token=".into()),
+        );
+        let empty = hex(digest::digest(&digest::SHA256, b"").as_ref());
+        let headers = sign(
+            &keys,
+            "us-west-2",
+            "bedrock",
+            "GET",
+            &url,
+            at(1_790_296_697),
+            &empty,
+        );
+        let authorization = headers.iter().find(|(name, _)| *name == "authorization");
+        assert_eq!(
+            authorization.unwrap().1,
+            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260925/us-west-2/bedrock/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token, Signature=648dff91a6248b58017651740431904727f90d8ce10715e01122aa22b4adc439"
+        );
     }
 
     #[test]
