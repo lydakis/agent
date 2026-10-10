@@ -618,10 +618,14 @@ fn ensure_daemon(options: &Options) -> Result<Connection> {
     }
     let mut log = options.store.clone().into_os_string();
     log.push(".log");
+    let log_path = log;
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&log)?;
+        .open(&log_path)?;
+    // Other starts of this store append to the same log; only what follows
+    // this point, from our child, is ours to report.
+    let start = log.metadata()?.len();
     let mut command = Command::new(std::env::current_exe()?);
     command
         .arg("serve")
@@ -666,27 +670,41 @@ fn ensure_daemon(options: &Options) -> Result<Connection> {
                 return Ok(connection);
             }
             startup_remaining(deadline)?;
-            let mut log = options.store.clone().into_os_string();
-            log.push(".log");
-            // The child reports its failure as the CLI does, one JSON
-            // object as its last log line; that error is this command's.
-            let last = std::fs::read_to_string(log)
-                .ok()
-                .and_then(|text| text.lines().last().map(str::to_owned));
-            if let Some(error) = last
-                .as_deref()
-                .and_then(|line| serde_json::from_str(line).ok())
-                .and_then(|value| Error::reported(&value))
-            {
+            // The child reports its failure as the CLI does, one JSON line
+            // carrying its pid; that error is this command's.
+            if let Some(error) = child_failure(&log_path, start, child.id()) {
                 return Err(error);
             }
-            let detail = last.unwrap_or_else(|| format!("daemon exited with {status}"));
-            return fail_with("daemon_start_failed", detail);
+            return fail_with(
+                "daemon_start_failed",
+                format!(
+                    "daemon exited with {status}; its output is in {}",
+                    Path::new(&log_path).display()
+                ),
+            );
         }
         // An ownership-conflict exit only says our child lost. The winner
         // can still be recovering its store before binding the socket.
         std::thread::sleep(Duration::from_millis(50).min(startup_remaining(deadline)?));
     }
+}
+
+/// The last error the daemon `pid` reported in `log` past `start`.
+fn child_failure(log: &std::ffi::OsStr, start: u64, pid: u32) -> Option<Error> {
+    use std::io::{Read, Seek};
+    let mut file = std::fs::File::open(log).ok()?;
+    file.seek(std::io::SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    String::from_utf8_lossy(&bytes)
+        .lines()
+        .rev()
+        .find_map(|line| {
+            let mut value: Value = serde_json::from_str(line).ok()?;
+            (value.get("pid")?.as_u64()? == u64::from(pid)).then_some(())?;
+            value.as_object_mut()?.remove("pid");
+            Error::reported(&value)
+        })
 }
 
 /// Explicit text wins; `--agents` composes the shared policy for the
