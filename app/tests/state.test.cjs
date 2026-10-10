@@ -2292,6 +2292,19 @@ test('a swarm a coordinator started from its shell shows once its first agent ta
   answers[1]({ swarms: listed, broken: [] }); await r.tick();
   answers[0]({ swarms: [], broken: [] }); await r.tick();
   assert.deepEqual([...r.S.swarms.keys()], ['app.latency']);
+  // Read while its start is still making agents, it is read again until they are pinned.
+  let pinned = false; reads = 0;
+  const unpinned = swarmRecord(['app.latency-1', 'app.latency-2'], { ids: {} });
+  const u = shell({ swarms: async () => { reads += 1; return { swarms: [pinned ? listed[0] : unpinned], broken: [] }; }, request: async () => ({ bots: [], next_after: null, nodes: [], workspaces:[],next_from: null }) });
+  u.S.live = true;
+  u.upsert({ name: 'app.latency-1', id: 3, provider: 'alpha', model: 'one' });
+  await u.handle({ event: 'accepted', bot: 'app.latency-1', turn: 1, durable: true }, 1);
+  await u.tick(); await u.tick();
+  assert.equal(reads, 2);
+  pinned = true; await u.tick();
+  assert.deepEqual(u.S.swarms.get('app.latency').ids, { 'app.latency-1': 3, 'app.latency-2': 4 });
+  await u.tick();
+  assert.equal(reads, 3, 'pinned, it is not read again');
 });
 
 test('a helper finishing a turn has its swarm check its budget', async () => {
@@ -2747,6 +2760,7 @@ test('a swarm counts its helpers\' tokens, and the board says when it passes a s
   sw.state = { ...sw.state, gone: { 3: 400, 4: 900 } };
   await p.readUsage(sw);
   assert.equal(sw.used, 1000 + 180 + 30 + 400);
+  assert.match(p.postHTML(sw, { from: 'swarm', kind: 'joined', member: 'latency-3', spent: 0, text: 'latency-3 joined; the budget is now 4.5M tokens' }), /<div class="line post ev"><span class="who council">swarm<\/span><span class="pt">latency-3 joined/);
   assert.match(p.postHTML(sw, { from: 'budget', text: 'the swarm has used 50% of its budget (1.5M of 3M tokens)', spent: 50 }), /<span class="who council">budget<\/span><span class="pt">the swarm has used 50%/);
 });
 

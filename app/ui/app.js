@@ -453,6 +453,20 @@ async function loadSwarms() {
   for (const r of swarms) learnSwarm(r, true);
   indexMembers();
   if (broken.length) toast(`not a readable swarm: ${broken[0]}`, 5000);
+  pinsSoon();
+}
+// A swarm read while its start is still making its agents names them before it pins their ids, and
+// their first events have come and gone by then: it is read again, a second apart, until every member
+// is pinned, for at most a minute.
+let pinsTimer = null, pinsTries = 0;
+function pinsSoon() {
+  if (![...S.swarms.values()].some((sw) => sw.members.some((m) => sw.ids[m] == null))) { pinsTries = 0; return; }
+  if (pinsTimer || pinsTries >= 60) return;
+  pinsTries += 1;
+  pinsTimer = setTimeout(async () => {
+    pinsTimer = null;
+    try { await loadSwarms(); render(); } catch (e) { Daemon.log?.(`swarms: ${e?.message ?? e}`); }
+  }, 1000);
 }
 // A swarm works while any agent works, waits while any waits, and is otherwise at rest.
 // At rest, it is done while an agent's finished turn is unseen, even if a later turn of it failed.
@@ -1762,7 +1776,7 @@ function postHTML(sw, line) {
   switch (line.kind) {
     case 'role': return row('ev', `is now <i>${esc(line.role ?? '')}</i>`);
     case 'assign': case 'claim': case 'submit': case 'review': case 'finish': case 'leave': return row('ev', `${line.stream ? streamTag(line.stream) + ' ' : ''}${line.outcome ? esc(line.outcome) + ': ' : ''}${text}`);
-    case 'quiet': return row('ev', text);
+    case 'quiet': case 'joined': return row('ev', text);
     default: return row(you ? 'mine' : '', `${line.stream ? `${streamTag(line.stream)} ` : ''}${text}`);
   }
 }

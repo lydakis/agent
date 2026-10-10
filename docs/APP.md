@@ -847,6 +847,8 @@ daemon learns nothing about projects; everything here is client work.
     Each act, and a `check` the page runs on usage events and finished
     turns, tells working agents when the swarm passes 50%, 65% and 80% of
     its budget, and each member when it passes those shares of its own.
+    An added agent's `joined` line on the board sets the share passed
+    against the larger budget, so the shares after it are news again.
     The page asks for a check once the tokens its usage events report since
     the last reach a twentieth of a member's allowance, or a turn finishes,
     coalesced over 250 ms with one in flight per swarm; a check that appends

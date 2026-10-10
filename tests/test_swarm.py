@@ -244,6 +244,9 @@ class SwarmTests(ModelFixture):
         self.assertEqual(added['bots'], ['p.widget-3'])
         self.assertEqual(added['swarm']['rows']['p.widget-3'], 1)
         self.assertEqual(self.listed()['p.widget-3']['budget_tokens'], self.listed()['p.widget-1']['budget_tokens'])
+        # The board says who joined, with the share of the new budget used, so later shares are news.
+        joined = self.board(started)[-1]
+        self.assertEqual((joined['kind'], joined['member'], joined['spent']), ('joined', 'widget-3', 0))
         self.assertEqual(self.person('add', '--swarm', 'p.widget', '--row')['error'], 'usage')
 
     def test_two_claims_at_once_have_one_winner(self):
@@ -502,6 +505,10 @@ class SwarmRuleTests(unittest.TestCase):
         self.assertTrue(state['told'])
         self.s.apply(state, {'from': 'user', 'text': 'carry on', 'sent': 3})
         self.assertFalse(state['told'])
+        # Joining resets the share of the budget the swarm was told it passed.
+        state['spent'] = 80
+        self.s.apply(state, {'from': 'swarm', 'kind': 'joined', 'member': 'w-4', 'spent': 50})
+        self.assertEqual(state['spent'], 50)
 
     def test_the_mix_is_dealt_to_the_row_furthest_below_its_share(self):
         mix = [{'share': 50}, {'share': 25}, {'share': 25}]

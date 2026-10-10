@@ -353,6 +353,8 @@ def apply(state, line):
             tasks[task]['status'] = 'assigned'
     elif kind == 'quiet':
         state['told'] = True
+    elif kind == 'joined':
+        state['spent'] = line['spent']
     elif me == 'budget' and 'member' in line:
         state['warned'][str(line['id'])] = line['spent']
     elif me == 'budget':
@@ -702,13 +704,15 @@ def run_act(daemon, folder, author, verb, args):
     if author:
         for line in act.lines:
             line.update(bot=author, turn=int(os.environ.get('AGENT_TURN') or 0) or None)
+    # What the act itself sends, before any budget notice joins it.
+    sent = len(act.sends) if told else 0
     # A stopped swarm keeps what you decided and tells nobody; a role tells nobody either.
     if told:
         budget(act, folder, members, helpers)
     else:
         act.sends = []
     if act.lines:
-        act.lines[0]['sent'] = len(act.sends)
+        act.lines[0]['sent'] = sent
     act.answer['board_changed'] = bool(act.lines)
     folder.append(act.lines)
     if act.answer.get('task'):
@@ -1134,7 +1138,7 @@ def add(daemon, folder, args):
         raise Refused('usage', 'usage: add [--swarm NAME] [--row N]', True)
     if swarm['stopped']:
         raise Refused('swarm_stopped', 'post to the board to resume the swarm, then add an agent')
-    members, _ = scan(daemon, folder)
+    members, helpers = scan(daemon, folder)
     if not members:
         raise Refused('swarm_empty', 'every agent left this swarm; start a new one')
     # The live members' rows and caps: a deleted one took its share with it.
@@ -1160,6 +1164,12 @@ def add(daemon, folder, args):
     pin(swarm, made, folder.dir)
     if failed:
         raise Refused('add_failed', failed[0]['error'])
+    # More budget lowers the share used, so the shares past it are news again.
+    used, total = usage(folder.state, members, helpers)
+    total += each
+    spent = max([p for p in SPENT if used * 100 >= p * max(total, 1)], default=0)
+    folder.append([{'at': now_ms(), 'from': 'swarm', 'kind': 'joined', 'member': short(name, swarm), 'spent': spent,
+                    'text': '%s joined; the budget is now %s tokens' % (short(name, swarm), millions(total))}])
     return {'swarm': record(swarm, folder.dir), 'bots': [name], 'failed': []}
 
 
