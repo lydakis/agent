@@ -1195,10 +1195,12 @@ anything else a failure can leave is listed and removable:
   last result, so Settings and `ls` list it as not delivered, and why,
   until it is removed. When that result cannot be written, the plist stays,
   listed, rather than ending with no trace. The plist goes before the
-  unload, since the unload ends the fire's own process; a plist that cannot
-  be deleted keeps its job loaded, and an unload launchd refuses writes the
-  plist and the result back, so either stays listed with what its fire did.
-  A job left loaded after its plist went (an end cut short) is unloaded by
+  unload, since the unload ends the fire's own process. It and the result
+  are set aside by rename (`.NAME.retiring`), whatever their size or
+  contents, and deleted once launchd lets the job go; a file that cannot be
+  set aside keeps its job loaded, and an unload launchd refuses renames
+  them back, so either stays listed with what its fire did. A job left
+  loaded after its plist went (an end cut short) is unloaded by
   its next fire.
 - **Removing** unloads the job by its label whether or not its plist is
   there, then deletes the plist and the state file, so it reaches an ended
@@ -1210,7 +1212,7 @@ anything else a failure can leave is listed and removable:
   `problem`, which `rm` removes.
 
 The files are written, synced, renamed and their folder synced; deletions
-sync their folder too. `add`, `rm`, `fire`, a fire's result and end, and
+and set-asides sync their folder too. `add`, `rm`, `fire`, a fire's result and end, and
 the app's refresh take a lock (`~/.agent/triggers/.lock`) around their
 changes, and the refresh reads each plist again under it.
 `~/.agent/trigger` is written with its executable mode from the start. When
@@ -1225,8 +1227,9 @@ Earlier apps called these schedules (`~/.agent/schedule`, jobs labelled
 `~/.agent/schedules`). The first start of this app, or the first fire of
 such a job before it, converts each once: the same definition under the
 trigger label, its last result moved, the old job unloaded and its plist,
-folder and script removed. An old plist goes only once its job unloaded,
-so a failed unload is tried again at the next start. A fire that converts
+folder and script removed. An old plist goes only once its result moved
+and its job unloaded, so a failed move or unload is tried again at the next
+start. A fire that converts
 its own schedule fires the new trigger in its place, then unloads itself.
 A schedule plist that cannot be read, that names another trigger than its
 file does, or whose name a trigger has, is left where it is with its
