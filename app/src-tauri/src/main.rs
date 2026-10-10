@@ -430,6 +430,92 @@ async fn edit_role(
     Ok(path.to_string_lossy().into_owned())
 }
 
+/// A link a message showed, opened in the default browser or mail app,
+/// never in the app's window. Only web and mail links open.
+#[tauri::command]
+async fn open_link(url: String) -> Result<(), String> {
+    let url = link_target(&url)?;
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let status = tokio::process::Command::new(opener)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .status()
+        .await
+        .map_err(|e| format!("open: {e}"))?;
+    if !status.success() {
+        return Err(format!("open: {url} could not be opened"));
+    }
+    Ok(())
+}
+
+/// A file a message linked or a step read, wrote or edited, for the page to
+/// draw beside: its first 4 MiB and one byte more, so the page knows when it
+/// goes on. Bytes, not text, so an image arrives whole. Only this machine's
+/// files: a window on a host is refused by name.
+#[tauri::command]
+async fn read_file(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    path: String,
+) -> Result<tauri::ipc::Response, String> {
+    windows.of(&window)?.here("Opening a file")?;
+    let path = file_path(&path, std::env::var_os("HOME"))?;
+    let bytes = tauri::async_runtime::spawn_blocking(move || read_head(&path, FILE_CAP + 1))
+        .await
+        .map_err(|e| e.to_string())??;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+const FILE_CAP: u64 = 4 * 1024 * 1024;
+
+fn file_path(path: &str, home: Option<std::ffi::OsString>) -> Result<std::path::PathBuf, String> {
+    let path = match (path.strip_prefix("~/"), home) {
+        (Some(rest), Some(home)) => std::path::Path::new(&home).join(rest),
+        (Some(_), None) => return Err("no HOME for ~".to_owned()),
+        (None, _) => std::path::PathBuf::from(path),
+    };
+    if !path.is_absolute() {
+        return Err(format!(
+            "{}: not a path in an agent's folder",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+fn read_head(path: &std::path::Path, limit: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let shown = |e: std::io::Error| format!("{}: {e}", path.display());
+    // Only a regular file: opening a FIFO waits for a writer, and a device never ends. Checked again
+    // once open, as the path may have changed in between.
+    let plain = |meta: std::fs::Metadata| match meta.is_file() {
+        true => Ok(()),
+        false if meta.is_dir() => Err(format!("{}: is a folder", path.display())),
+        false => Err(format!("{}: not a regular file", path.display())),
+    };
+    plain(std::fs::metadata(path).map_err(shown)?)?;
+    let file = std::fs::File::open(path).map_err(shown)?;
+    plain(file.metadata().map_err(shown)?)?;
+    let mut bytes = Vec::new();
+    file.take(limit).read_to_end(&mut bytes).map_err(shown)?;
+    Ok(bytes)
+}
+
+fn link_target(url: &str) -> Result<&str, String> {
+    let lower = url.get(..8).unwrap_or(url).to_ascii_lowercase();
+    let web = ["http://", "https://", "mailto:"]
+        .iter()
+        .any(|scheme| lower.starts_with(scheme));
+    if !web || url.len() > 8192 || url.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err("only http, https and mailto links open".to_owned());
+    }
+    Ok(url)
+}
+
 /// Which of the app's roles you have your own file for.
 #[tauri::command]
 fn roles(windows: State<'_, Windows>, window: tauri::WebviewWindow) -> Result<Value, String> {
@@ -1284,6 +1370,8 @@ fn main() {
             profiles,
             roles,
             edit_role,
+            open_link,
+            read_file,
             branch,
             models,
             project,
@@ -1424,6 +1512,58 @@ async fn open_host(
         return Err(error.to_string());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::{file_path, link_target, read_head};
+
+    #[test]
+    fn a_file_is_read_up_to_its_limit_and_a_folder_is_refused() {
+        let dir = std::env::temp_dir().join(format!("agent-app-read-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("notes.md");
+        std::fs::write(&file, b"0123456789").unwrap();
+        assert_eq!(read_head(&file, 4).unwrap(), b"0123");
+        assert_eq!(read_head(&file, 64).unwrap(), b"0123456789");
+        assert!(read_head(&dir, 64).unwrap_err().contains("is a folder"));
+        assert!(read_head(&dir.join("missing"), 64).is_err());
+        #[cfg(unix)]
+        assert!(
+            read_head(std::path::Path::new("/dev/zero"), 64)
+                .unwrap_err()
+                .contains("not a regular file")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        let home = Some(std::ffi::OsString::from("/home/someone"));
+        assert_eq!(
+            file_path("~/x/a.rs", home.clone()).unwrap(),
+            std::path::Path::new("/home/someone/x/a.rs")
+        );
+        assert!(file_path("src/a.rs", home).is_err());
+    }
+
+    #[test]
+    fn only_web_and_mail_links_open() {
+        for ok in [
+            "https://example.com/a?b=c",
+            "HTTP://example.com",
+            "mailto:someone@example.com",
+        ] {
+            assert_eq!(link_target(ok), Ok(ok));
+        }
+        for bad in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "/Applications/Calculator.app",
+            "-a Calculator",
+            "https://example.com/ two",
+            "https://example.com/\nx",
+            "",
+        ] {
+            assert!(link_target(bad).is_err(), "{bad}");
+        }
+    }
 }
 
 #[cfg(test)]
