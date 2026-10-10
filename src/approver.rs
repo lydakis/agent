@@ -39,7 +39,7 @@ pub enum JudgeSpec {
     /// A `provider/model` the daemon serves, with an optional effort.
     Model {
         model: String,
-        reasoning: Option<String>,
+        effort: Option<String>,
     },
 }
 
@@ -252,7 +252,7 @@ impl Model {
         client: &Arc<Client>,
         base: String,
         model: &str,
-        reasoning: Option<&str>,
+        effort: Option<&str>,
     ) -> Result<Model> {
         match client.request("resume", json!({"bot":base})).await {
             Ok(bot) if !judge_bot(&bot) => {
@@ -301,7 +301,7 @@ impl Model {
         let created = client
             .request(
                 "create",
-                json!({"bot":base,"workspace":"/","model":model,"reasoning":reasoning,
+                json!({"bot":base,"workspace":"/","model":model,"effort":effort,
                     "instructions":policy::JUDGE_INSTRUCTIONS,"tools":[]}),
             )
             .await
@@ -521,9 +521,9 @@ async fn serve(settings: Settings) -> Result<i32> {
             }),
             policy::DEADLINE_MS,
         ),
-        JudgeSpec::Model { model, reasoning } => {
+        JudgeSpec::Model { model, effort } => {
             let base = format!("approver.{tag}");
-            let judge = Model::prepare(&client, base, &model, reasoning.as_deref()).await?;
+            let judge = Model::prepare(&client, base, &model, effort.as_deref()).await?;
             (Via::Model(judge), policy::MODEL_DEADLINE_MS)
         }
     };

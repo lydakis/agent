@@ -45,8 +45,8 @@ fn valid_name(name: &str) -> Result<(), String> {
 /// The script: yours in `~/.agents/skills/swarm` (where the app links its
 /// own), else the one this app ships, else this checkout's.
 fn script() -> PathBuf {
-    let linked = std::env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join(".agents/skills/swarm/swarm"));
+    let linked =
+        std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agents/skills/swarm/swarm"));
     let shipped = std::env::current_exe()
         .ok()
         .and_then(|exe| crate::skills::bundled(&exe))
@@ -172,7 +172,10 @@ mod tests {
         assert_eq!(first["lines"][0]["text"], "goal");
         assert_eq!(first["lines"][1]["text"], "not json");
         assert_eq!(first["lines"].as_array().unwrap().len(), 2);
-        assert_eq!((&first["reset"], &first["more"]), (&json!(true), &json!(true)));
+        assert_eq!(
+            (&first["reset"], &first["more"]),
+            (&json!(true), &json!(true))
+        );
         assert_eq!(first["state"], Value::Null);
         // The half line is read once it is whole, with the state beside it.
         let mut text = std::fs::read_to_string(&path).unwrap();
@@ -181,9 +184,15 @@ mod tests {
         std::fs::write(dir.join("state.json"), "{\"offset\":1,\"tasks\":{}}").unwrap();
         let next = board(&root, "p.widget", first["offset"].as_u64()).unwrap();
         assert_eq!(next["lines"], json!([{"from": "widget-1", "text": "hi"}]));
-        assert_eq!((&next["reset"], &next["state"]["tasks"]), (&json!(false), &json!({})));
+        assert_eq!(
+            (&next["reset"], &next["state"]["tasks"]),
+            (&json!(false), &json!({}))
+        );
         // A board shorter than the reader's offset was rewritten: read again.
-        assert_eq!(board(&root, "p.widget", Some(1 << 20)).unwrap()["reset"], true);
+        assert_eq!(
+            board(&root, "p.widget", Some(1 << 20)).unwrap()["reset"],
+            true
+        );
         assert!(
             board(&root, "../x", None)
                 .unwrap_err()

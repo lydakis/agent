@@ -66,7 +66,7 @@ class HarborAgentTest(unittest.TestCase):
             command = self.agent(logs, reasoning='high', max_output_tokens=4096)._command(
                 "it's \"quoted\"; rm -rf /\n$(x)")
         self.assertIn("-- 'it'\"'\"'s \"quoted\"; rm -rf /\n$(x)' < /dev/null", command)
-        self.assertIn('--reasoning high --max-output-tokens 4096 --', command)
+        self.assertIn('--effort high --max-output-tokens 4096 --', command)
         self.assertTrue(command.endswith('| tee /logs/agent/agent.jsonl; exit ${PIPESTATUS[0]}'))
 
     def test_a_provider_spec_forwards_its_named_key(self):

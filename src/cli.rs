@@ -15,7 +15,7 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "run",
         usage: "run [OPTIONS] [--] PROMPT...",
-        flags: "--bot --new --detach --delivery --turn --model --tools --workspace --instructions --instructions-file --reasoning --request-id --bot-id --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallbacks --agents --profile --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --retain-turns --approval-hold-ms --max-output-tokens --keep-warm --cache-ttl --pretty --no-spawn",
+        flags: "--bot --new --detach --delivery --turn --model --tools --workspace --instructions --instructions-file --effort --request-id --bot-id --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallbacks --agents --profile --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --retain-turns --approval-hold-ms --max-output-tokens --keep-warm --cache-ttl --pretty --no-spawn",
         startup: true,
     },
     Command {
@@ -80,8 +80,8 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "approver",
-        usage: "approver [--tag TAG] [--judge PROVIDER/MODEL] [--reasoning LEVEL] [--note FILE] [--judge-url URL]",
-        flags: "--tag --judge --reasoning --note --judge-url",
+        usage: "approver [--tag TAG] [--judge PROVIDER/MODEL] [--effort LEVEL] [--note FILE] [--judge-url URL]",
+        flags: "--tag --judge --effort --note --judge-url",
         startup: false,
     },
     Command {
@@ -191,9 +191,9 @@ fn print_flags(flags: &str) {
                 "ROLE",
                 "Compose instructions (as --agents) in the role .agents/agents/ROLE.md, with its model and tools",
             ),
-            "--reasoning" => (
+            "--effort" => (
                 "LEVEL",
-                "Effort: low, medium, high, or xhigh; Claude also max. A new bot keeps it (default AGENT_REASONING on AGENT_MODEL, else the model's own); on an existing bot, for this turn",
+                "Effort: low, medium, high, or xhigh; Claude also max. A new bot keeps it (default AGENT_EFFORT on AGENT_MODEL, else the model's own); on an existing bot, for this turn",
             ),
             "--request-id" => (
                 "ID",

@@ -14,6 +14,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod daemon;
+mod memory;
 mod project;
 mod remote;
 mod session;
@@ -1069,7 +1070,10 @@ async fn swarm_run(
     let Target::Local { socket, .. } = &state.config.target else {
         return Err("remote_unsupported: swarms run on this machine only".into());
     };
-    let agent = state.agent.clone().unwrap_or_else(|| PathBuf::from("agent"));
+    let agent = state
+        .agent
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("agent"));
     swarm::run(socket, &agent, &args).await
 }
 
@@ -1156,8 +1160,8 @@ async fn request(
 const SETUP_FLAG: &str = "--setup";
 
 /// What the app puts on this machine, written at every start so it all leads
-/// to this copy: `~/.agent/trigger`,
-/// triggers reloaded after a move, and the skills it ships linked from
+/// to this copy: `~/.agent/trigger` and `~/.agent/memory`, triggers
+/// reloaded after a move, and the skills it ships linked from
 /// `~/.agents/skills`. False when any of it failed; each failure is printed
 /// and does not stop the rest. A start reloads triggers off the window's way.
 fn machine_setup(background: bool) -> bool {
@@ -1168,8 +1172,13 @@ fn machine_setup(background: bool) -> bool {
     };
     if let (Some(home), Ok(app)) = (std::env::var_os("HOME"), std::env::current_exe()) {
         let state = PathBuf::from(home).join(".agent");
-        if let Err(error) = trigger::write_script(&state, &app) {
-            report(&error);
+        for written in [
+            trigger::write_script(&state, &app),
+            memory::write_script(&state, &app),
+        ] {
+            if let Err(error) = written {
+                report(&error);
+            }
         }
         // Ends a fire cut short are finished, and a moved app reloads every
         // trigger, each a launchctl run.
@@ -1201,13 +1210,15 @@ fn machine_setup(background: bool) -> bool {
 }
 
 fn main() {
-    // `~/.agent/trigger`, launchd's fires and the Homebrew cask's install
-    // and uninstall run this executable; each acts and exits without a window.
+    // `~/.agent/trigger`, `~/.agent/memory`, launchd's fires and the Homebrew
+    // cask's install and uninstall run this executable; each acts and exits
+    // without a window.
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some(trigger::FLAG) => std::process::exit(trigger::cli(&args[2..])),
         Some(trigger::FIRE_FLAG) => std::process::exit(trigger::fire_cli(&args[2..])),
         Some(trigger::WATCH_FLAG) => std::process::exit(trigger::watch_cli()),
+        Some(memory::FLAG) => std::process::exit(memory::cli(&args[2..])),
         Some(SETUP_FLAG) => std::process::exit(i32::from(!machine_setup(false))),
         Some(skills::UNLINK_FLAG) => std::process::exit(skills::unlink_cli()),
         _ => {}

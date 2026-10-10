@@ -89,14 +89,14 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   picks the gated tools and must name at least one; the default is every
   tool but `history`, `wait`, `note`, and `echo`. A fork keeps its source's gates and a created bot its
   creator's ([APPROVALS.md](APPROVALS.md)).
-- `approver [--tag TAG] [--judge PROVIDER/MODEL] [--reasoning LEVEL]
+- `approver [--tag TAG] [--judge PROVIDER/MODEL] [--effort LEVEL]
   [--note FILE] [--judge-url URL]` serves a gate tag (default `auto`) and
   has a judge decide every call waiting on it, one request per round,
   printing one JSON line per round. The judge is `--judge`, else
   `AGENT_APPROVER_JUDGE`, else `typesafe/jev-latest` when `TYPESAFE_API_KEY`
   is set, else `AGENT_MODEL`; any model but Jev (`typesafe/jev-*`) runs
   through the daemon, with
-  a tag of at most 87 bytes, and `--reasoning` sets its effort. `--note` (default `AGENT_APPROVER_NOTE`)
+  a tag of at most 87 bytes, and `--effort` sets its effort. `--note` (default `AGENT_APPROVER_NOTE`)
   is a regular file of at most 96,000 bytes the judge always sees, such as
   trusted remotes and hosts ([APPROVALS.md](APPROVALS.md#automatic-mode)).
 - `approvals [--bot NAME] [--tag TAG]` lists the calls waiting on a gate.
@@ -174,7 +174,7 @@ xterm.js with a small OSC 7501 handler that draws the tab's mark.
 A failure prints one JSON object on stderr, the shape the daemon answers with:
 `error` is the code, `detail` states the rule that was broken, and any other
 field is a fact about the current state, named as a request field (such as
-`running_turn`, `bot_id`, `levels`, `deliveries` or `field`). When the CLI can say how to get
+`running_turn`, `bot_id`, `efforts`, `deliveries` or `field`). When the CLI can say how to get
 past the refusal in its own flags, it adds `hint`. With `--pretty` the failure
 is one line instead: `agent: CODE: DETAIL`, followed by `; HINT` when there is
 one. Usage errors use the same object with `error` set to `usage`. A detail
@@ -233,15 +233,15 @@ running daemon is not checked against either.
 daemon has no model of its own, so a new bot needs `--model` or `AGENT_MODEL`.
 `AGENT_MODEL` is only a creation default. An existing bot uses its stored
 model unless `--model` explicitly overrides it for this turn.
-`run --reasoning LEVEL` sets a new bot's effort: `low`,
+`run --effort LEVEL` sets a new bot's effort: `low`,
 `medium`, `high` or `xhigh` on either family, and `max` on Anthropic's; any
-other is refused with `invalid_reasoning_level`. Without it the request carries
+other is refused with `invalid_effort`. Without it the request carries
 no level and the model uses its own default. On an existing bot it sets this
 turn's effort, as `--model` sets its model, and the bot's own is unchanged. A
-turn with a level sees it in its shell as `AGENT_REASONING`, and a new bot that takes its model
-from `AGENT_MODEL` takes its level from `AGENT_REASONING`, so a peer started
+turn with a level sees it in its shell as `AGENT_EFFORT`, and a new bot that takes its model
+from `AGENT_MODEL` takes its level from `AGENT_EFFORT`, so a peer started
 on its creator's model thinks as hard as its creator; a bot given
-`--model` or a profile's model gets only its own `--reasoning`.
+`--model` or a profile's model gets only its own `--effort`.
 `run --instructions` and `--instructions-file` set a new bot's instructions,
 with the CLI's built-in text as the default; the daemon has none. `run
 --tools LIST` chooses a new bot's tools from those the daemon registers,

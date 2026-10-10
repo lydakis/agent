@@ -77,7 +77,7 @@ class SwarmTests(ModelFixture):
         listed = self.listed()
         self.assertEqual(started['swarm']['ids'], {m: listed[m]['id'] for m in started['bots']})
         self.assertEqual(started['swarm']['mix'], [{'model': 'openai/synthetic-model', 'share': 100,
-                                                    'identity': '', 'reasoning': None}])
+                                                    'identity': '', 'effort': None}])
         self.assertEqual(started['swarm']['workspace'], str(self.path))
         self.assertEqual(started['swarm']['coordinator'], {'bot': 'p.lead', 'id': listed['p.lead']['id']})
         self.assertEqual(listed['p.widget-1']['budget_tokens'], 250000)
@@ -90,12 +90,12 @@ class SwarmTests(ModelFixture):
         first = self.turns('p.widget-1')[0]['prompt_preview']
         self.assertTrue(first.startswith('You are one of several agents in a flat swarm'), first)
         # A turn run at another effort starts its swarm at that effort.
-        self.agent('run', '--store', str(self.store), '--bot', 'p.lead', '--reasoning', 'xhigh',
+        self.agent('run', '--store', str(self.store), '--bot', 'p.lead', '--effort', 'xhigh',
                    f"shell:HOME='{self.home}' '{SCRIPT}' start --agents 1 --budget 0.5 --in-project -- Ship the gadget"
                    f" > '{self.path}/again.json' 2>&1")
         gadget = json.loads((self.path / 'again.json').read_text())
-        self.assertEqual(gadget['swarm']['mix'][0]['reasoning'], 'xhigh')
-        self.assertEqual(self.listed()['p.gadget-1']['reasoning'], 'xhigh')
+        self.assertEqual(gadget['swarm']['mix'][0]['effort'], 'xhigh')
+        self.assertEqual(self.listed()['p.gadget-1']['effort'], 'xhigh')
         # Only a coordinator starts one, and the app lists both.
         self.agent('run', *self.common, '--new', '--bot', 'q', 'hello')
         self.assertEqual(self.swarm('q', 'start', '--', 'x')['error'], 'coordinators_only')

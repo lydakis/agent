@@ -1396,9 +1396,9 @@ test('the New project sheet asks only for a folder, the lead\'s and threads\' mo
   assert.match(el('np-in').innerHTML, /class="opt on" data-act="np-in" data-v="project"/);
   await el('sheet').listeners.submit({ preventDefault() {} });
   const create = calls.find(([op]) => op === 'create')[1];
-  assert.deepEqual([create.bot, create.workspace, create.model, create.reasoning], ['weather.lead', '/synthetic/weather', 'anthropic/claude-x', 'high']);
+  assert.deepEqual([create.bot, create.workspace, create.model, create.effort], ['weather.lead', '/synthetic/weather', 'anthropic/claude-x', 'high']);
   // The coordinator is told the threads' picks after its role, whichever role that is.
-  assert.equal(create.instructions, 'rules\n\nThis project\'s tasks, as the person set them up: start every new task, in a role (--profile) or not, with --model \'openai/gpt-6-luna\' --reasoning \'low\'. Every task works in this folder, with no worktree of its own.');
+  assert.equal(create.instructions, 'rules\n\nThis project\'s tasks, as the person set them up: start every new task, in a role (--profile) or not, with --model \'openai/gpt-6-luna\' --effort \'low\'. Every task works in this folder, with no worktree of its own.');
   assert.deepEqual(calls.find(([op]) => op === 'write')[1], { dir: '/synthetic/weather', name: 'weather', model: 'anthropic/claude-x', reasoning: 'high', threads: { model: 'openai/gpt-6-luna', reasoning: 'low', inProject: true } });
   assert.equal(p.S.ui.sheet, false, 'the sheet closes once the project is made');
   assert.equal(p.S.selected, 'weather.lead');
@@ -1407,7 +1407,7 @@ test('the New project sheet asks only for a folder, the lead\'s and threads\' mo
 test('the model chip changes the effort of an agent\'s next turns and never of a steer', async () => {
   const sent = []; const storage = new Map();
   const p = shell({ request: async (op, q) => { sent.push(q); } }, storage);
-  p.upsert({ name: 'lead', id: 1, provider: 'openai', family: 'responses', model: 'gpt-6-luna', reasoning: 'high', status: 'idle', running_turn: null });
+  p.upsert({ name: 'lead', id: 1, provider: 'openai', family: 'responses', model: 'gpt-6-luna', effort: 'high', status: 'idle', running_turn: null });
   p.upsert({ name: 'plain', id: 2, provider: 'openai', family: 'responses', model: 'gpt-6-luna', status: 'idle', running_turn: null });
   p.S.selected = 'lead';
   const lead = p.S.bots.get('lead');
@@ -1417,24 +1417,24 @@ test('the model chip changes the effort of an agent\'s next turns and never of a
   assert.equal(p.setEffort('lead', 'max'), false);
   assert.equal(p.setEffort('lead', 'xhigh'), true);
   assert.deepEqual(levels(lead).find(([, on]) => on), ['xhigh', true]);
-  await p.submit('think harder'); assert.equal(sent.at(-1).reasoning, 'xhigh');
+  await p.submit('think harder'); assert.equal(sent.at(-1).effort, 'xhigh');
   // A steer joins the running turn at that turn's level, so it names none.
   p.upsert({ name: 'lead', id: 1, provider: 'openai', model: 'gpt-6-luna', status: 'running', running_turn: 5 });
-  p.setSend('queue'); await p.submit('next'); assert.equal(sent.at(-1).reasoning, 'xhigh', 'queued work runs at the pick');
-  p.setSend('steer'); await p.submit('also'); assert.equal(sent.at(-1).delivery, 'steer'); assert.equal('reasoning' in sent.at(-1), false);
+  p.setSend('queue'); await p.submit('next'); assert.equal(sent.at(-1).effort, 'xhigh', 'queued work runs at the pick');
+  p.setSend('steer'); await p.submit('also'); assert.equal(sent.at(-1).delivery, 'steer'); assert.equal('effort' in sent.at(-1), false);
   p.upsert({ name: 'lead', id: 1, provider: 'openai', model: 'gpt-6-luna', status: 'idle', running_turn: null });
   // Its own level again sends none: the agent's own applies.
   p.setEffort('lead', 'high');
-  await p.submit('back'); assert.equal('reasoning' in sent.at(-1), false);
+  await p.submit('back'); assert.equal('effort' in sent.at(-1), false);
   // An agent made without a level can go back to the model's own.
   const plain = p.S.bots.get('plain');
   assert.deepEqual(levels(plain)[0], ['default', true]);
   p.setEffort('plain', 'low'); p.S.selected = 'plain';
-  await p.submit('quick'); assert.equal(sent.at(-1).reasoning, 'low');
+  await p.submit('quick'); assert.equal(sent.at(-1).effort, 'low');
   // The pick comes back for the same identity only.
   p.setEffort('lead', 'medium'); p.save();
   const q = shell({}, storage);
-  q.upsert({ name: 'lead', id: 1, provider: 'openai', family: 'responses', model: 'gpt-6-luna', reasoning: 'high' });
+  q.upsert({ name: 'lead', id: 1, provider: 'openai', family: 'responses', model: 'gpt-6-luna', effort: 'high' });
   q.upsert({ name: 'plain', id: 9, provider: 'openai', family: 'responses', model: 'gpt-6-luna' });
   q.restore();
   assert.equal(q.S.effort.get('lead'), 'medium');
@@ -1617,7 +1617,7 @@ test('a new project creates its coordinator in the folder, in its role, writes i
   assert.deepEqual(calls.find(([op]) => op === 'policy').slice(1), ['/synthetic/weather', 'coordinator']);
   assert.deepEqual([create.bot, create.workspace, create.model, create.instructions.split('\n\n')[0], Array.from(create.tools)], ['weather.lead', '/synthetic/weather', 'alpha/role', 'rules', ['shell', 'wait']]);
   assert.deepEqual({ ...calls.find(([op]) => op === 'write')[1] }, { dir: '/synthetic/weather', name: 'weather', model: 'alpha/role', reasoning: null, threads: null });
-  assert.equal('reasoning' in create, false, 'no effort picked sends none: the model uses its own');
+  assert.equal('effort' in create, false, 'no effort picked sends none: the model uses its own');
   assert.equal(p.S.selected, 'weather.lead');
   const before = calls.length;
   await p.createProject('/synthetic/weather');
@@ -1630,28 +1630,28 @@ test('an agent\'s effort is picked beside its model, kept in the project file, a
     project: async (dir) => ({ dir, name: 'weather', coordinator: 'weather.lead', model: file?.model ?? null, reasoning: file?.reasoning ?? null, threads_model: file?.threads_model ?? null, threads_reasoning: null, threads_in: file?.threads_in ?? 'worktree', file: !!file }),
     policy: async () => ({ instructions: 'rules', compaction_instructions: 'summary', note: 'test' }),
     writeProject: async (q) => { sent.push(['write', { ...q }]); },
-    request: async (op, q) => { sent.push([op, { ...q }]); return op === 'create' ? { name: q.bot, id: sent.length, provider: q.model.split('/')[0], model: q.model.split('/')[1], reasoning: q.reasoning ?? null, workspace: q.workspace ?? '/synthetic' } : { nodes: [], workspaces:[],next_from: null }; },
+    request: async (op, q) => { sent.push([op, { ...q }]); return op === 'create' ? { name: q.bot, id: sent.length, provider: q.model.split('/')[0], model: q.model.split('/')[1], effort: q.effort ?? null, workspace: q.workspace ?? '/synthetic' } : { nodes: [], workspaces:[],next_from: null }; },
   }, storage);
   await p.createProject('/synthetic/weather', 'anthropic/claude-x', 'max');
   const creates = () => sent.filter(([op]) => op === 'create').map(([, q]) => q);
-  assert.equal(creates()[0].reasoning, 'max');
+  assert.equal(creates()[0].effort, 'max');
   // With no threads' model, tasks are started on the lead's own, named so a role's model cannot replace it.
-  assert.match(creates()[0].instructions, /with --model "\$AGENT_MODEL" \$\{AGENT_REASONING:\+--reasoning "\$AGENT_REASONING"\}\. When this folder is a git repository, a task that changes files works in its own worktree/);
+  assert.match(creates()[0].instructions, /with --model "\$AGENT_MODEL" \$\{AGENT_EFFORT:\+--effort "\$AGENT_EFFORT"\}\. When this folder is a git repository, a task that changes files works in its own worktree/);
   assert.deepEqual(sent.find(([op]) => op === 'write')[1], { dir: '/synthetic/weather', name: 'weather', model: 'anthropic/claude-x', reasoning: 'max', threads: null });
   assert.equal(p.S.bots.get('weather.lead').reasoning, 'max');
   assert.equal(storage.get('agent:effort'), 'max', 'the last pick is offered next time, as the model is');
   // A folder whose file names a model keeps that model's effort, whatever was picked.
   p.S.bots.clear(); file = { model: 'alpha/one', reasoning: 'low', threads_model: 'beta/two', threads_in: 'project' };
   await p.createProject('/synthetic/weather', 'anthropic/claude-x', 'high', { model: 'gamma/three', reasoning: null, inProject: false });
-  assert.deepEqual([creates()[1].model, creates()[1].reasoning], ['alpha/one', 'low']);
+  assert.deepEqual([creates()[1].model, creates()[1].effort], ['alpha/one', 'low']);
   assert.match(creates()[1].instructions, /with --model 'beta\/two'\. Every task works in this folder/, 'and its threads\' picks');
   // /new takes an effort after the model.
   await p.submit('/new Bob anthropic/claude-x max');
   await p.submit('/new Ann openai/gpt-6-luna xhigh');
   await p.submit('/new Cy openai/gpt-6-luna');
-  assert.deepEqual(creates().slice(2).map((q) => [q.bot, q.reasoning]), [['Bob', 'max'], ['Ann', 'xhigh'], ['Cy', undefined]]);
+  assert.deepEqual(creates().slice(2).map((q) => [q.bot, q.effort]), [['Bob', 'max'], ['Ann', 'xhigh'], ['Cy', undefined]]);
   // A creation event from another client carries the level, as the list does.
-  await p.onEvent({ event: 'created', bot: 'Eve', cursor: 900, data: { id: 90, provider: 'openai', model: 'gpt-6-luna', reasoning: 'high', status: 'idle', running_turn: null } });
+  await p.onEvent({ event: 'created', bot: 'Eve', cursor: 900, data: { id: 90, provider: 'openai', model: 'gpt-6-luna', effort: 'high', status: 'idle', running_turn: null } });
   assert.equal(p.S.bots.get('Eve').reasoning, 'high');
   // An event that does not name the level leaves the one known.
   p.upsert({ name: 'Eve', id: 90, provider: 'openai', model: 'gpt-6-luna', status: 'running' });
@@ -2021,7 +2021,7 @@ test('the sheet offers the folder\'s profiles as identities and shows each row\'
     settings: async () => ({ providers: ['alpha', 'beta'] }),
     profiles: async (dir) => { assert.equal(dir, '/synthetic/app'); return [{ name: 'reviewer', summary: 'Reviews', model: 'beta/two' }]; },
   });
-  p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', reasoning: 'high', workspace: '/synthetic/app' });
+  p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', effort: 'high', workspace: '/synthetic/app' });
   const el = (id) => p.context.document.getElementById(id);
   el('sw-n').value = '4'; el('sw-n').id = 'sw-n'; el('sw-budget').value = '3'; el('sw-budget').id = 'sw-budget';
   await p.openSwarmSheet('app');
@@ -2431,19 +2431,15 @@ function settingsShell({ env = {}, lists = {} } = {}) {
   return { p, calls, env };
 }
 
-test('Bedrock is one provider running both its APIs, signed with the AWS login unless an API key is given', () => {
+test('Bedrock is one provider running both its APIs, named alone whether it signs with the AWS login or a key', () => {
   const p = shell();
-  assert.deepEqual([...p.providerSpecs('bedrock', { AWS_REGION: 'us-west-2' })], ['bedrock', 'bedrock-openai']);
-  assert.deepEqual([...p.providerSpecs('bedrock', { AWS_REGION: 'eu-west-1', AWS_BEARER_TOKEN_BEDROCK: 'k' })], [
-    'bedrock=anthropic,https://bedrock-mantle.eu-west-1.api.aws/anthropic/v1,AWS_BEARER_TOKEN_BEDROCK',
-    'bedrock-openai=responses,https://bedrock-mantle.eu-west-1.api.aws/openai/v1,AWS_BEARER_TOKEN_BEDROCK']);
-  assert.deepEqual([...p.providerSpecs('anthropic', { ANTHROPIC_API_KEY: 'k' })], ['anthropic']);
+  assert.deepEqual([...p.providerSpecs('bedrock')], ['bedrock', 'bedrock-openai']);
+  assert.deepEqual([...p.providerSpecs('anthropic')], ['anthropic']);
 });
 
 test('connecting a provider keeps the others, saves only what was typed, restarts the daemon and lists its models', async () => {
   const { p, calls, env } = settingsShell({ env: { AGENT_PROVIDER: 'openai', OPENAI_API_KEY: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] }, bedrock: { models: [{ id: 'claude' }, { id: 'haiku' }] }, 'bedrock-openai': { models: [{ id: 'grok' }] } } });
   await p.openSetup();
-  await assert.rejects(p.connectProvider('bedrock', { AWS_REGION: '', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: '' }), /Region is required/);
   await assert.rejects(p.connectProvider('bedrock', { AWS_REGION: 'us east-1', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: '' }), /Region must look like us-east-1/);
   assert.equal(calls.length, 0);
   await p.connectProvider('bedrock', { AWS_REGION: 'us-east-1', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: '' });
@@ -2461,11 +2457,14 @@ test('connecting a provider keeps the others, saves only what was typed, restart
   assert.match(html, /Amazon Bedrock<\/span><span class="st ok">✓ 3 models/);
   assert.equal(html.match(/<optgroup label="Amazon Bedrock">/g).length, 1);
   assert.match(html, /<option value="bedrock-openai\/grok">grok<\/option>/);
-  // A Bedrock key, once saved, stays in use when the region changes and its field is left empty.
+  // A Bedrock key, once saved, stays in use when the region changes and its field is left empty;
+  // a key works only in its own region, so it needs one named.
   await p.connectProvider('bedrock', { AWS_REGION: 'us-east-1', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: 'k' });
+  await assert.rejects(p.connectProvider('bedrock', { AWS_REGION: '', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: '' }), /Region is required with a Bedrock API key/);
   await p.connectProvider('bedrock', { AWS_REGION: 'us-west-2', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: '' });
-  assert.equal(env.AGENT_PROVIDER, 'openai bedrock=anthropic,https://bedrock-mantle.us-west-2.api.aws/anthropic/v1,AWS_BEARER_TOKEN_BEDROCK bedrock-openai=responses,https://bedrock-mantle.us-west-2.api.aws/openai/v1,AWS_BEARER_TOKEN_BEDROCK');
+  assert.equal(env.AGENT_PROVIDER, 'openai bedrock bedrock-openai');
   assert.equal(env.AWS_BEARER_TOKEN_BEDROCK, 'k');
+  assert.equal(env.AWS_REGION, 'us-west-2');
   // Removing Bedrock removes both of its APIs, its key, and a default model on either.
   calls.length = 0;
   await p.removeProvider('bedrock');
@@ -2591,19 +2590,23 @@ test('a daemon with no provider is not started again until settings change', asy
 });
 
 test('Bedrock with a saved key switches to the AWS login when asked, and keeps the key otherwise', async () => {
-  const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: 'bedrock=anthropic,https://bedrock-mantle.us-east-1.api.aws/anthropic/v1,AWS_BEARER_TOKEN_BEDROCK bedrock-openai=responses,https://bedrock-mantle.us-east-1.api.aws/openai/v1,AWS_BEARER_TOKEN_BEDROCK', AWS_REGION: 'us-east-1', AWS_BEARER_TOKEN_BEDROCK: 'k' }, lists: { bedrock: { models: [{ id: 'claude' }] }, 'bedrock-openai': { models: [{ id: 'grok' }] } } });
+  const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: 'bedrock bedrock-openai', AWS_REGION: 'us-east-1', AWS_BEARER_TOKEN_BEDROCK: 'k' }, lists: { bedrock: { models: [{ id: 'claude' }] }, 'bedrock-openai': { models: [{ id: 'grok' }] } } });
   await p.openSetup();
   p.S.setup.adding = 'bedrock';
   assert.match(p.setupHTML(), /<option value="key" selected>Bedrock API key/);
   await p.connectProvider('bedrock', { AWS_REGION: 'us-east-1', AUTH: 'key', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: '' });
-  assert.match(calls.filter(([c]) => c === 'save')[0][1].AGENT_PROVIDER, /^bedrock=anthropic,/);
+  assert.deepEqual({ ...calls.filter(([c]) => c === 'save')[0][1] }, { AGENT_PROVIDER: 'bedrock bedrock-openai', AWS_REGION: 'us-east-1', AWS_PROFILE: '' });
   await p.connectProvider('bedrock', { AWS_REGION: 'us-east-1', AUTH: 'aws', AWS_PROFILE: 'work', AWS_BEARER_TOKEN_BEDROCK: '' });
   assert.deepEqual({ ...calls.filter(([c]) => c === 'save')[1][1] }, { AGENT_PROVIDER: 'bedrock bedrock-openai', AWS_REGION: 'us-east-1', AWS_PROFILE: 'work', AWS_BEARER_TOKEN_BEDROCK: '' });
 });
 
-test('Bedrock signing in with AWS stays so while the shell exports a Bedrock key', async () => {
-  const { p } = settingsShell({ env: { AGENT_PROVIDER: 'bedrock bedrock-openai', AWS_REGION: 'us-east-1', AWS_BEARER_TOKEN_BEDROCK: 'shell' }, lists: { bedrock: { models: [{ id: 'claude' }] } } });
+test('Bedrock signs in with any key the daemon would be given, the shell\'s too, until the AWS login empties it', async () => {
+  const { p, env } = settingsShell({ env: { AGENT_PROVIDER: 'bedrock bedrock-openai', AWS_BEARER_TOKEN_BEDROCK: 'shell' }, lists: { bedrock: { models: [{ id: 'claude' }] } } });
   await p.openSetup();
+  p.S.setup.adding = 'bedrock';
+  assert.match(p.setupHTML(), /<option value="key" selected>Bedrock API key/);
+  await p.connectProvider('bedrock', { AWS_REGION: '', AUTH: 'aws', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: '' });
+  assert.equal(env.AWS_BEARER_TOKEN_BEDROCK, undefined);
   p.S.setup.adding = 'bedrock';
   assert.match(p.setupHTML(), /<option value="aws" selected>AWS login/);
 });
@@ -2633,7 +2636,7 @@ test('a connected provider can be edited in place', async () => {
 
 test('a gateway set up by hand under a known name is not offered the catalog form, which would overwrite it', async () => {
   const gateway = 'openai=responses,https://proxy.example/v1,PROXY_KEY';
-  const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: `${gateway} bedrock=anthropic,https://bedrock-mantle.us-east-1.api.aws/anthropic/v1,AWS_BEARER_TOKEN_BEDROCK bedrock-openai=responses,https://bedrock-mantle.us-east-1.api.aws/openai/v1,AWS_BEARER_TOKEN_BEDROCK`, AWS_BEARER_TOKEN_BEDROCK: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] } } });
+  const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: `${gateway} bedrock bedrock-openai`, AWS_BEARER_TOKEN_BEDROCK: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] } } });
   await p.openSetup();
   const html = p.setupHTML();
   assert.doesNotMatch(html, /data-act="setup-pick" data-v="openai"/);

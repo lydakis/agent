@@ -723,7 +723,7 @@ def parse_start(args):
             if not parts[0].strip() or not share.isdigit():
                 raise Refused('invalid_mix', '%s is not MODEL,SHARE[,IDENTITY[,EFFORT]]' % value)
             asked['mix'].append({'model': parts[0].strip(), 'share': int(share),
-                                 'identity': parts[2].strip(), 'reasoning': parts[3].strip() or None})
+                                 'identity': parts[2].strip(), 'effort': parts[3].strip() or None})
         elif flag in ('--project', '--folder'):
             asked[flag[2:]] = value
         else:
@@ -751,7 +751,7 @@ def valid_mix(mix):
     for row in mix:
         if not 1 <= row['share'] <= 100:
             raise Refused('invalid_mix', 'a share is 1 to 100 percent, not %d' % row['share'])
-        level, identity = row.get('reasoning'), row['identity']
+        level, identity = row.get('effort'), row['identity']
         if level and not (level.isascii() and level.isalpha() and level.islower()):
             raise Refused('invalid_mix', 'an effort level is a lowercase word')
         if identity.startswith('.') or not all(c.isascii() and (c.isalnum() or c in '-_.') for c in identity):
@@ -889,8 +889,8 @@ def make(swarm, folder, names, rows, each, late=False):
         mix = swarm['mix'][row]
         command = [agent, 'run', '--detach', '--new', '--bot', name, '--workspace', swarm['workspace'],
                    '--model', mix['model'], '--budget-tokens', str(each), '--request-id', 'swarm-' + name]
-        if mix.get('reasoning'):
-            command += ['--reasoning', mix['reasoning']]
+        if mix.get('effort'):
+            command += ['--effort', mix['effort']]
         command += ['--profile', mix['identity']] if mix['identity'] else ['--agents']
         running.append((name, row, subprocess.Popen(command + ['--', brief(swarm, folder, name, late)],
                                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)))
@@ -923,8 +923,8 @@ def start(daemon, args):
         if not asked['mix']:
             # Without rows, every agent runs this turn's model at this turn's effort.
             model = os.environ.get('AGENT_MODEL') or '%s/%s' % (me['provider'], me['model'])
-            effort = os.environ.get('AGENT_REASONING') if os.environ.get('AGENT_MODEL') else me.get('reasoning')
-            asked['mix'] = [{'model': model, 'share': 100, 'identity': '', 'reasoning': effort or None}]
+            effort = os.environ.get('AGENT_EFFORT') if os.environ.get('AGENT_MODEL') else me.get('effort')
+            asked['mix'] = [{'model': model, 'share': 100, 'identity': '', 'effort': effort or None}]
     elif not (asked['project'] and asked['folder']):
         raise Refused('usage', 'without an agent shell, name --project and --folder', True)
     valid_mix(asked['mix'])

@@ -37,7 +37,7 @@ window.Daemon = (() => {
       removeTrigger: (name) => invoke('trigger_remove', { name }),
       hosts: () => invoke('hosts'),
       openHost: (host) => invoke('open_host', { host }),
-      swarmStart: ({ project, folder, goal, shared, mix, agents, budgetTokens }) => invoke('swarm_run', { args: ['start', '--project', project, '--folder', folder, '--agents', String(agents), '--budget', String(budgetTokens / 1e6), ...(shared ? [] : ['--in-project']), ...mix.flatMap((r) => ['--row', [r.model, r.share, r.identity ?? '', r.reasoning ?? ''].join(',')]), '--', goal] }),
+      swarmStart: ({ project, folder, goal, shared, mix, agents, budgetTokens }) => invoke('swarm_run', { args: ['start', '--project', project, '--folder', folder, '--agents', String(agents), '--budget', String(budgetTokens / 1e6), ...(shared ? [] : ['--in-project']), ...mix.flatMap((r) => ['--row', [r.model, r.share, r.identity ?? '', r.effort ?? ''].join(',')]), '--', goal] }),
       swarmAdd: (swarm, row) => invoke('swarm_run', { args: ['add', '--swarm', swarm, '--row', String(row)] }),
       swarmStop: (swarm) => invoke('swarm_run', { args: ['stop', '--swarm', swarm] }),
       swarmBoard: (swarm, offset) => invoke('swarm_board', { swarm, offset: offset ?? null }),
@@ -56,7 +56,7 @@ window.Daemon = (() => {
     openai: [{ id: 'gpt-6-luna' }, { id: 'gpt-6-sol' }],
     anthropic: [{ id: 'claude-sonnet-5', name: 'Claude Sonnet 5' }],
     chatgpt: [{ id: 'gpt-6-luna' }],
-    bedrock: [{ id: 'anthropic.claude-opus-5', name: 'Claude Opus 5' }, { id: 'anthropic.claude-sonnet-5', name: 'Claude Sonnet 5' }, { id: 'anthropic.claude-haiku-5', name: 'Claude Haiku 5' }],
+    bedrock: [{ id: 'global.anthropic.claude-opus-5-5', name: 'Global Claude Opus 5.5' }, { id: 'global.anthropic.claude-sonnet-5', name: 'Global Claude Sonnet 5' }, { id: 'global.anthropic.claude-haiku-4-5', name: 'Global Claude Haiku 4.5' }],
     'bedrock-openai': [{ id: 'openai.gpt-6-luna' }, { id: 'qwen.qwen3-coder-480b' }],
   };
   const specs = () => (ENV.AGENT_PROVIDER ?? '').split(/\s+/).filter(Boolean);
@@ -72,12 +72,12 @@ window.Daemon = (() => {
   const emit = (event) => { if (event.data?.node != null) { if (!S.lineages.has(event.bot)) S.lineages.set(event.bot, []); S.lineages.get(event.bot).push({node:event.data.node,turn:event.turn ?? null,...authorOf(event)}); } if (event.durable !== false) event.cursor = ++S.cursor; S.queue.push(event); if (S.waiter) { const w = S.waiter; S.waiter = null; w(); } };
   const node = (item) => { const id = S.nextNode++; S.nodes.set(id, item); return id; };
   const wait = (ms) => new Promise((r) => { const t = setTimeout(() => { S.timers.delete(t); r(); }, ms); S.timers.add(t); });
-  const record = (name, model, reasoning = null) => ({ name, status: 'idle', running_turn: null, provider: model.split('/')[0], model: model.split('/').slice(1).join('/'), reasoning, workspace: '/workspace', input_tokens: 0, cached_input_tokens: 0, tokens_used: 0 });
+  const record = (name, model, reasoning = null) => ({ name, status: 'idle', running_turn: null, provider: model.split('/')[0], model: model.split('/').slice(1).join('/'), effort: reasoning, workspace: '/workspace', input_tokens: 0, cached_input_tokens: 0, tokens_used: 0 });
 
   async function create(name, model, createdBy = null, source = null, workspace = null, allowed = null, reasoning = null) {
     if (S.bots.has(name)) throw new Error('bot_exists');
     // Lineage is pinned to the creator's identity, and the event carries the record's list fields, as the daemon's does.
-    const b = { ...record(name, model, source ? S.bots.get(source)?.reasoning ?? null : reasoning), ...(workspace ? { workspace } : {}), id: S.nextId++, created_by: createdBy, created_by_id: createdBy ? S.bots.get(createdBy)?.id ?? null : null, turns: 0, interrupted: false, ...(allowed ? { allowed } : {}) };
+    const b = { ...record(name, model, source ? S.bots.get(source)?.effort ?? null : reasoning), ...(workspace ? { workspace } : {}), id: S.nextId++, created_by: createdBy, created_by_id: createdBy ? S.bots.get(createdBy)?.id ?? null : null, turns: 0, interrupted: false, ...(allowed ? { allowed } : {}) };
     S.bots.set(name, b);
     // A fork shares its source's history up to its newest finished round. The demo keeps no call
     // nodes, only their results, so that is its newest node that is not a tool result.
@@ -87,7 +87,7 @@ window.Daemon = (() => {
       S.lineages.set(name, all.slice(0, end));
     }
     const checkpoint = source ? S.lineages.get(source)?.at(-1)?.node ?? null : undefined;
-    emit({ event: source ? 'forked' : 'created', bot: name, turn: null, data: { id: b.id, provider: b.provider, model: b.model, reasoning: b.reasoning, workspace: b.workspace, status: 'idle', running_turn: null, created_by: createdBy, created_by_id: b.created_by_id, ...(allowed ? { allowed } : {}), ...(source ? { source, checkpoint } : {}) } });
+    emit({ event: source ? 'forked' : 'created', bot: name, turn: null, data: { id: b.id, provider: b.provider, model: b.model, effort: b.effort, workspace: b.workspace, status: 'idle', running_turn: null, created_by: createdBy, created_by_id: b.created_by_id, ...(allowed ? { allowed } : {}), ...(source ? { source, checkpoint } : {}) } });
     return b;
   }
   // Scripted work outlives a stop; a bot deleted meanwhile reads as interrupted, so it ends quietly.
@@ -318,7 +318,7 @@ window.Daemon = (() => {
   async function enlist(sw, rows, each, late = false) {
     const bots = [];
     for (const [name, row] of rows) {
-      const b = await api.request('create', { bot: name, model: sw.mix[row].model, reasoning: sw.mix[row].reasoning ?? null, workspace: sw.workspace, budget_tokens: each });
+      const b = await api.request('create', { bot: name, model: sw.mix[row].model, effort: sw.mix[row].effort ?? null, workspace: sw.workspace, budget_tokens: each });
       sw.members.push(name); sw.ids[name] = b.id; sw.rows[name] = row; bots.push(b);
       sw.made = Math.max(sw.made ?? 0, Number(name.split('-').pop()) || 0);
     }
@@ -350,13 +350,23 @@ window.Daemon = (() => {
     deliver(sw, name, text, turn);
     await steerIn(name, turn);
   }
-  // Four scripted roles; `@N` names the swarm's Nth agent.
+  // Four scripted roles; `@N` names the swarm's Nth agent, and `work` is one of the script's work commands.
   const ROLES = [
-    [['post', 'Taking the profile first, so we know where p99 goes.'], ['shell', 'python3 bench/latency.py --runs 200', 'p99 142 ms · p50 61 ms', 1500], ['post', 'Profile: 61% of p99 is the TLS handshake and first byte, 22% store commits. @2 connections are yours.']],
-    [['wait', 2600], ['post', 'Taking provider connection reuse. Editing src/provider/socket.rs.'], ['edit', 'src/provider/socket.rs', '+36 −12', 1700], ['shell', 'python3 bench/latency.py --runs 200', 'p99 71 ms · p50 44 ms', 1500], ['post', 'Pooled connections: p99 142 → 71 ms on bench/latency.py. @4 can you run the full suite?']],
-    [['wait', 1200], ['post', 'Taking one store commit per model round. Editing src/store/db.rs.'], ['edit', 'src/store/db.rs', '+48 −21', 1900], ['shell', 'cargo test -p agent-runtime store', 'test result: ok. 64 passed; 0 failed', 1300], ['post', 'Batched commits are in; the 64 store tests pass.']],
-    [['wait', 1800], ['read', 'board.jsonl'], ['post', 'Keeping cargo test green: I will run the suite as changes land.'], ['shell', 'cargo test', 'test result: ok. 212 passed; 0 failed', 2200], ['post', 'Full suite after both changes: 212 passed.']],
+    [['post', 'Taking the profile first, so we know where p99 goes.'], ['shell', 'python3 bench/latency.py --runs 200', 'p99 142 ms · p50 61 ms', 1500], ['post', 'Profile: 61% of p99 is the TLS handshake and first byte, 22% store commits. @2 connections are yours.'], ['work', 'assign', 'conn-pool', 2, 4, 'Reuse provider connections across turns.'], ['work', 'assign', 'batch-commits', 3, 4, 'One store commit per model round.']],
+    [['wait', 2600], ['work', 'claim', 'conn-pool'], ['post', 'Taking provider connection reuse. Editing src/provider/socket.rs.'], ['edit', 'src/provider/socket.rs', '+36 −12', 1700], ['shell', 'python3 bench/latency.py --runs 200', 'p99 71 ms · p50 44 ms', 1500], ['work', 'submit', 'conn-pool', 'Pooled connections: p99 142 → 71 ms on bench/latency.py.'], ['post', 'Pooled connections: p99 142 → 71 ms on bench/latency.py. @4 can you run the full suite?']],
+    [['wait', 3400], ['work', 'claim', 'batch-commits'], ['post', 'Taking one store commit per model round. Editing src/store/db.rs.'], ['edit', 'src/store/db.rs', '+48 −21', 1900], ['shell', 'cargo test -p agent-runtime store', 'test result: ok. 64 passed; 0 failed', 1300], ['post', 'Batched commits are in; the 64 store tests pass.']],
+    [['wait', 1800], ['read', 'board.jsonl'], ['post', 'Keeping cargo test green: I will run the suite as changes land.'], ['shell', 'cargo test', 'test result: ok. 212 passed; 0 failed', 2200], ['wait', 2800], ['work', 'review', 'conn-pool', 'supported', 'Full suite passes with pooling; p99 reproduced at 72 ms.'], ['post', 'Full suite after both changes: 212 passed.']],
   ];
+  // A work command's board line and what it changes, as the script folds it.
+  function swarmWork(sw, name, turn, [kind, task, ...a]) {
+    const me = short(sw, name), base = me.replace(/-\d+$/, ''), t = sw.state.tasks[task];
+    const line = { at: Date.now(), from: me, bot: name, turn, kind, stream: task };
+    if (kind === 'assign') { const [owner, reviewer] = [`${base}-${a[0]}`, `${base}-${a[1]}`]; sw.state.tasks[task] = { owner, reviewer, brief: a[2], status: 'assigned' }; line.text = `${owner} owns it, ${reviewer} reviews: ${a[2]}`; }
+    else if (kind === 'claim') { t.status = 'working'; sw.state.streams[me] = task; line.text = 'claimed'; }
+    else if (kind === 'submit') { Object.assign(t, { status: 'submitted', result: a[0] }); delete sw.state.streams[me]; line.text = a[0]; }
+    else { Object.assign(t, { status: 'reviewed', verdict: a[0], evidence: a[1] }); line.text = `${a[0]}: ${a[1]}`; }
+    sw.board.push(line);
+  }
   async function member(sw, name, turn) {
     const i = sw.members.indexOf(name), mine = ROLES[i % ROLES.length], b = S.bots.get(name);
     const base = short(sw, sw.members[0]).replace(/-\d+$/, '');
@@ -366,6 +376,7 @@ window.Daemon = (() => {
       if (op === 'wait') await wait(a[0]);
       else if (op === 'post') await agentPost(sw, name, turn, a[0].replace(/@(\d)/g, (_, n) => `@${base}-${n}`));
       else if (op === 'read') await tool(name, turn, 'read', { path: `${sw.dir}/${a[0]}` }, `${sw.board.length} posts`, 400);
+      else if (op === 'work') { if (!sw.stopped) await tool(name, turn, 'shell', { command: `"$SWARM" ${a[0]} ${a[1]}` }, JSON.stringify({ exit_code: 0, stderr: '', stdout: '{"task":"' + a[1] + '"}\n', success: true }), 300).then(() => swarmWork(sw, name, turn, a)); }
       else if (op === 'edit') await tool(name, turn, 'edit', { path: a[0] }, a[1], a[2]);
       else await tool(name, turn, 'shell', { command: a[0] }, JSON.stringify({ exit_code: 0, stderr: '', stdout: a[1] + '\n', success: true }), a[2]);
       b.tokens_used += 20000;
@@ -498,7 +509,7 @@ window.Daemon = (() => {
         // A demo bot's only unfinished turn is the one it runs.
         case 'turns': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); return { turns: b.running_turn != null && params.after < b.running_turn ? [{ turn: b.running_turn, status: b.status }] : [], next_after: null }; }
         case 'resume': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); return { ...b }; }
-        case 'create': { await create(params.bot, params.model, params.created_by ?? null, null, params.workspace, null, params.reasoning ?? null); return { ...S.bots.get(params.bot) }; }
+        case 'create': { await create(params.bot, params.model, params.created_by ?? null, null, params.workspace, null, params.effort ?? null); const b = S.bots.get(params.bot); if (params.budget_tokens) b.budget_tokens = params.budget_tokens; return { ...b }; }
         case 'submit': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); if (b.status !== 'idle' && params.delivery === 'reject') throw new Error('bot_busy');
           if (params.delivery === 'steer' && params.expected_turn != null && params.expected_turn !== b.running_turn) throw new Error('stale_turn');
           const by = params.from ?? (params.origin ? { origin: params.origin } : null);

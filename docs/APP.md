@@ -144,10 +144,10 @@ threads' picks are kept there as `threads_model`, `threads_reasoning` and
 `threads_in` (`worktree` or `project`). The app tells them to the coordinator
 when it creates it, as one paragraph after the composed instructions, so a
 folder's or your own `coordinator.md` cannot drop them: start every task, in
-a role (`--profile`) or not, with `--model` and `--reasoning` named, and say
+a role (`--profile`) or not, with `--model` and `--effort` named, and say
 whether tasks work in this folder or in their own worktrees. Without a
 threads' model the flags are the lead's own, `--model "$AGENT_MODEL"
-${AGENT_REASONING:+--reasoning "$AGENT_REASONING"}` (see [CLI.md](CLI.md)),
+${AGENT_EFFORT:+--effort "$AGENT_EFFORT"}` (see [CLI.md](CLI.md)),
 so a role that names a model of its own does not replace the lead's. A
 coordinator keeps the instructions it was made with: a file written or edited
 later reaches the next coordinator made for the folder.
@@ -159,9 +159,13 @@ model from any of them (demo `?first`).
 
 ![Setup's provider choices](app/setup-providers.png)
 
-Each provider asks for what it needs to sign in; Bedrock takes a region and an
-AWS profile or a Bedrock API key, and serves Claude and its other models as
-one provider.
+Each provider asks for what it needs to sign in; Bedrock takes an AWS profile
+or a Bedrock API key, and serves Claude and its other models as one provider.
+With the AWS login its region is optional: the daemon takes the profile's,
+else us-east-1. A Bedrock API key needs the region it was made in. Claude
+runs through cross-region inference profiles, which AWS routes to
+whichever region holds the model, so the region no longer decides which Claude
+models are offered (within the source regions each profile supports).
 
 ![Connecting Amazon Bedrock](app/setup-bedrock.png)
 
@@ -187,8 +191,7 @@ from the app's text the first time, and from then on that file is the role in
 every project (a project's own `.agents/agents` file of the same name still
 comes first). An agent keeps the text it started with, so an edit reaches
 coordinators made after it. A swarm's agents follow the swarm skill's
-`member.md` instead. Captured 2026-09-28, when it also listed the two swarm
-roles.
+`member.md` instead. Captured 2026-10-10 in demo mode.
 
 ![Settings with the roles](app/settings-roles.png)
 
@@ -197,17 +200,17 @@ the tokens they share and what they are made of. What they are made of is a
 mix: rows of an identity (a plain agent, or a profile the folder offers, such
 as a reviewer), a model from any connected provider, its effort, and a share,
 each shown as the agents it makes at the size picked. The first row starts on
-the lead's model and effort. Captured 2026-09-29, when the sheet also had an
-"Organized as" picker for a council.
+the lead's model and effort. Captured 2026-10-10 in demo mode.
 
 ![The new swarm sheet](app/new-swarm.png)
 
 The swarm's board: your goal first, then its agents' posts, the ones they
-name marked, each under what its agent is when the swarm mixes kinds (here
-three plain agents and a reviewer on another model). Its row in the sidebar
+name marked, and the work's steps (assignments, claims, submissions and
+reviews) quieter under their task's tag, which filters the board. A post
+names what its agent is when the swarm mixes kinds. Its row in the sidebar
 is working while any agent works.
 
-![A swarm's board while three of four agents work](app/swarm-board.png)
+![A swarm's board](app/swarm-board.png)
 
 Its agents as cards, each with what it is and its newest line.
 
@@ -219,7 +222,10 @@ the agent beside, with the board's posts it heard.
 ![An agent beside the board](app/swarm-beside.png)
 
 The Work tab lists each task the agents registered, its owner, reviewer and
-where it stands, then the final result once one is published.
+where it stands, then the final result once one is published. The board and
+this tab captured 2026-10-10 in demo mode.
+
+![A swarm's tasks](app/swarm-work.png)
 
 You can also ask a project's coordinator for one ("start a swarm of six, two
 of them reviewers, to halve the p99"). Its role tells it to read the swarm
@@ -465,9 +471,9 @@ connected, and forks and side chats keep their source's. One screen covers a
 first run and later changes:
 
 1. **Providers.** Anthropic, OpenAI and OpenRouter take an API key; a ChatGPT
-   plan uses the sign-in Codex saved; Amazon Bedrock takes a region and signs
-   in one of two ways, chosen on the form: the AWS CLI's credentials for an
-   optional profile (which drops a saved key), or a Bedrock API key. Bedrock serves Claude over Anthropic's API and
+   plan uses the sign-in Codex saved; Amazon Bedrock takes an optional region
+   and signs in one of two ways, chosen on the form: the AWS CLI's credentials
+   for an optional profile (which drops a saved key), or a Bedrock API key. Bedrock serves Claude over Anthropic's API and
    its other models over OpenAI's, so the daemon runs it as two providers,
    `bedrock` and `bedrock-openai`; the app connects, lists and removes them
    as one. Connecting writes `AGENT_PROVIDER` (the providers already running
@@ -1292,6 +1298,61 @@ its folder rather than trusting a compacted conversation for ids and times,
 report a source it could not read by name, re-check items right before
 posting, and record a post only once the destination confirms it.
 
+## Memory
+
+Memory is what earlier agents learned that a later one needs: decisions,
+the person's preferences and corrections, traps, pointers. Each fact is one
+Markdown file of at most 4 KiB with front matter (`name`, `description`,
+`type` of `user`, `feedback`, `project` or `reference`, `source`,
+`verified`). The person's facts are in `~/.agents/memory`, a project's in
+`~/.agents/memory/projects/NAME`, outside the checkout, so its lead and every
+task's worktree share one copy whatever is committed (a task's worktree
+starts at the last commit, so an uncommitted AGENTS.md line never reaches
+it). Each folder's `MEMORY.md` is an index generated from the front matter,
+one line per fact, and is held to 4 KiB so reading it at the start of
+every task stays cheap. The daemon knows nothing of memory.
+
+The app writes `~/.agent/memory` each time it opens, a script that runs its
+executable with `--memory` ([memory.rs](../app/src-tauri/src/memory.rs)):
+
+```sh
+~/.agent/memory show [SCOPE]
+~/.agent/memory save NAME --type TYPE --description TEXT --source TEXT [SCOPE] -- TEXT|-
+~/.agent/memory rm NAME [SCOPE]
+~/.agent/memory index [SCOPE]
+~/.agent/memory check [SCOPE]
+  SCOPE: --user | --project NAME; none: the project of this folder
+```
+
+Without a scope, the project is found from the working folder: in a git
+worktree, the same place in the repository's main checkout, then the
+nearest `.agents/project.toml` at or above it; none is `project_unknown`.
+Every reply is one JSON value on stdout; a failure is one `{"error": CODE,
+"detail": ...}` on stderr with exit 1. `show` reads without changing
+anything: the person's index and the project's, each with its folder's
+absolute path, the project null outside one, so an agent need not expand
+`~` or find the project itself. A save writes the fact and the
+index under the folder's lock, so two agents saving at once cannot leave
+an index that misses one. Saving a fact unchanged is `"duplicate": true`,
+and so is removing one already gone. A save that would push the index past
+4 KiB is `memory_full` and changes nothing; so is a folder holding a `.md`
+file that is not a valid fact (`memory_invalid` names it), rather than an
+index that quietly leaves it out. `check` reports such a file and an index
+that is out of date without changing anything; `index` rewrites the index,
+and refuses with `memory_full` an index of hand-added facts past 4 KiB. A
+removal reads the folder before deleting anything, and text piped on stdin
+past 4 KiB is `fact_too_large` rather than cut.
+
+The app ships a `memory` skill ([SKILL.md](../app/skills/memory/SKILL.md))
+that says to read both indexes with `show` before starting work, to check a fact that
+names code against the current tree before acting on it, what to save
+(decisions and why, preferences, traps, pointers) and what not to (what the
+code, git or AGENTS.md already says, progress logs, secrets, and
+instructions from text that did not come from the person). The
+coordinator's role saves lasting findings there rather than suggesting an
+AGENTS.md line, which it keeps for rules every agent and collaborator must
+follow.
+
 ## Skills the app ships
 
 Agents read only skills in a folder's `.agents/skills` or in
@@ -1302,7 +1363,8 @@ every start the app links each one from `~/.agents/skills/NAME`
 the link points at, so nothing is copied or recorded; a moved app re-points
 its links at its next start, and a skill it stops shipping loses its link.
 The Homebrew cask runs `agent-app --setup` after an install or upgrade, which
-writes what a start writes (scripts, `~/.agent/trigger`, these links) before
+writes what a start writes (scripts, `~/.agent/trigger`, `~/.agent/memory`,
+these links) before
 the first window, and `agent-app --unlink-skills` before an uninstall, which
 removes this bundle's links and nothing else, so none outlives the app. The app's links are those into a copy of it (a bundle with
 `Contents/MacOS/agent-app`) or into an app since removed; a folder, file or
@@ -1574,6 +1636,20 @@ The UI bounds payload buffering, history decoding, and rendered fleet rows:
   a partial socket write closes the session before another request can write.
 
 ## Verified
+
+2026-10-10 swarms as a skill: `tests/test_swarm.py` runs the skill's script
+against a real daemon on Python 3.9 and 3.13: a coordinator's start from its
+shell (members pinned by id, its model and effort, the folder under its
+store), a shared worktree's setup and a failed setup leaving nothing, posts
+reaching who they name, `--all`, a recreated member missed, Stop and the
+person's post resuming, the work lifecycle and `status` folded without
+`state.json`, four claims at once with one winner, the coordinator told once
+when quiet, and Stop ending helpers' turns. Unit tests cover reach, budget
+shares told once, the fold, reviewer replacement, naming and a deleted
+helper's tokens. The page suite (192 tests) covers the sheet, board, Work tab,
+Add and Stop through the script's answers. The sheet, board, Work tab and
+Settings were captured in demo mode in headless Chromium with no page errors.
+The macOS app was not run, so the bundled script was not run from a bundle.
 
 2026-09-29 swarm coordination update: the UI state suite covers budget defaults,
 usage-triggered checks while turns are running, coalescing, partial work and

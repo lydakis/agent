@@ -263,15 +263,15 @@ mod tests {
         output
             .respond(
                 serde_json::json!(7),
-                Err(crate::Error::with("invalid_reasoning_level", echoed)
-                    .facts(serde_json::json!({"levels":["low","high"]}))),
+                Err(crate::Error::with("invalid_effort", echoed)
+                    .facts(serde_json::json!({"efforts":["low","high"]}))),
             )
             .await
             .unwrap();
         let (bytes, _, _) = receiver.recv().await.unwrap();
         let response = serde_json::from_slice::<Value>(&bytes).unwrap();
-        assert_eq!(response["error"], "invalid_reasoning_level");
-        assert_eq!(response["levels"], serde_json::json!(["low", "high"]));
+        assert_eq!(response["error"], "invalid_effort");
+        assert_eq!(response["efforts"], serde_json::json!(["low", "high"]));
         let detail = response["detail"].as_str().unwrap();
         assert!(detail.len() <= DETAIL_LIMIT + '…'.len_utf8());
         assert!(detail.starts_with("éx") && detail.ends_with("is not one of low, high"));
