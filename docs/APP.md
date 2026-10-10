@@ -1175,7 +1175,7 @@ with.
 
 What a model writes is drawn the way a page would draw it. A message is
 Markdown (GitHub's flavour, with a line break wherever the model wrote one),
-parsed by [marked](https://marked.js.org) once and kept with the item, so a
+parsed by [markdown-it](https://github.com/markdown-it/markdown-it) once and kept with the item, so a
 pane drawn again reuses it; when highlighting loads, only messages whose code
 waited for it are drawn again, and a file beside only when it shows as code
 (a page, diagram or chart there keeps running). A table past 256 columns or 10,000 cells shows
@@ -1183,9 +1183,14 @@ as its source, as a short row is padded to the header's width and a few bytes
 a row could ask for millions of cells. A message past 50,000 lines, or one
 that would draw past 100,000 tags, shows as its text, as a `- x` line makes
 an element from four bytes. One with more than 100,000 marks that open an
-inline element (`*`, `_`, a backtick, `[`, `<`, `~`, `|`, `@`, `www.`,
-`://`) is not parsed either: the parser's tokens for a single line of `*x*`
-cost far more than the HTML they become. A link's target and title are
+inline element (`*`, `_`, a backtick, `[`, `!`, `<`, `~`, `|`, `@`, `\`,
+`&`, `www.`, `://`) is not parsed either: the parser's tokens for a single
+line of `*x*` cost far more than the HTML they become. The parser was chosen
+for how its time grows: marked, used first, took 217 ms on a line of 10,000
+`!` and 3.2 s on one of 40,000, while markdown-it 14.1.0 grows with its
+input on every run of markers tried (`!`, `![`, `[`, `*x`, `_a`, backticks,
+references), its slowest being about 0.6 s for 100,000 marks of `![` in
+Node on this container, and a test holds it to that. A link's target and title are
 copied into the page once per use, and a reference defined once can be used
 thousands of times, so a message's links and images carry at most 1 Mi
 characters of targets and titles in all; past that a link is its text. A
@@ -1241,7 +1246,7 @@ also draw, and an HTML preview can still draw a chart with its own inline
 SVG or canvas.
 
 Highlighting, Mermaid and Vega load the first time something needs them;
-marked loads with the page. Text, lists, tables and code draw as a message
+markdown-it loads with the page. Text, lists, tables and code draw as a message
 arrives; diagrams, charts, previews and images draw only when asked, so
 opening a long chat runs none of them, and a reader below a block that
 draws keeps their place. Mermaid's own limits (50,000 characters, 500 edges) do
@@ -1249,8 +1254,9 @@ not bound its layout work, which is why a diagram waits for a click. Drawn
 diagrams and charts are kept by source (a chart also by its width) and show
 again when their pane is redrawn: at most 64 and 8 MiB. A
 message's drawn HTML counts toward the chat's 8 MiB of decoded bodies, and
-so does what it puts on the page, 40 bytes for each tag it draws: a window
-holds about 200,000 drawn tags however its messages split them, so many
+so does what it puts on the page and what parsing it cost, 40 bytes for each
+tag it draws and 16 for each mark parsed: a window holds about 200,000 drawn
+tags and 500,000 parsed marks however its messages split them, so many
 replies each within their own bounds never add up to more. Drawing past that
 folds the oldest bodies as a load would. All are vendored
 under `app/ui/vendor` (versions
@@ -1298,26 +1304,27 @@ only from the app itself, `data:` and `blob:`, so a library drawing a message
 cannot fetch one either: a Mermaid node's `img:` URL or a `url()` in its theme
 CSS is refused, and the diagram names the failure in its head.
 
-Measured 2026-10-09 at a038530 with `node app/bench/render.cjs`, in headless
-Chromium 141.0.7390.37 on a 4-core cloud container: seven runs, each the
+Measured 2026-10-10 at 023fd3e with `node app/bench/render.cjs`, in headless
+Chromium 141.0.7390.37 on a 4-core cloud container: three runs, each the
 median of nine (synthetic messages: prose, lists, a table, and Rust in every
-third one). Drawing 400 messages (292 KiB) costs 61 to 71 ms of parsing the
-first time, against 5.5 to 6.4 ms for the line renderer this replaced; drawn
-again, a message costs no parsing, as its HTML is kept on its item. Putting
-those 400 into the page and laying them out takes 187 to 472 ms, against 120
-to 337 ms for the old renderer's markup under its own stylesheet (read from
-b7bdfe4). This container's layout times vary widely: within a run the new
-page took 0.55 to 3.6 times the old, 1.3 times at the median, as its HTML is
-larger (654 KiB against 425 KiB) and its code highlighted. Parsing a whole
-9 KiB reply again on each of its 1,121 deltas would cost 1.0 to 1.1 s.
+third one). Drawing 400 messages (292 KiB) costs 50 to 52 ms of parsing the
+first time (14 to 16 ms of it markdown-it's, 22 to 23 ms highlighting),
+against 5.5 to 5.6 ms for the line renderer this replaced; drawn again, a
+message costs no parsing, as its HTML is kept on its item. Putting those 400
+into the page and laying them out takes 261 to 392 ms, against 121 to 164 ms
+for the old renderer's markup under its own stylesheet (read from b7bdfe4),
+2.0 to 2.4 times as long, as its HTML is larger (653 KiB against 425 KiB)
+and its code highlighted. This container's layout times vary widely: at
+a038530, with marked, seven runs had the new page at 0.55 to 3.6 times the
+old, 1.3 times at the median. Parsing a whole 9 KiB reply again on each of
+its 1,121 deltas would cost 0.83 to 0.87 s.
 
-Streaming was measured again 2026-10-10 at e1725d7, three runs, with each
-delta paying what the app's render does around it: reading whether the reader
-is at the bottom, keeping them there (a layout per delta), and for the new
-tail hydrating the blocks that delta finished. That 9 KiB reply in
-8-character deltas (44 finished blocks) costs 58 to 66 ms in all, against
-317 to 364 ms for the old tail, one text node that grows and is laid out
-whole on every delta.
+Streaming is measured with each delta paying what the app's render does
+around it: reading whether the reader is at the bottom, keeping them there
+(a layout per delta), and for the new tail hydrating the blocks that delta
+finished. That 9 KiB reply in 8-character deltas (44 finished blocks) costs
+58 to 61 ms in all, against 318 to 358 ms for the old tail, one text node
+that grows and is laid out whole on every delta.
 
 While a reply streams, each block that has ended (a paragraph after its blank
 line, a fence once it closes) is drawn once and appended; only the block still
