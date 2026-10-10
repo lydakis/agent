@@ -27,7 +27,7 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "fork",
         usage: "fork --source NAME --bot NAME [--checkpoint NODE] [--allow LIST]",
-        flags: "--source --bot --checkpoint --workspace --budget-tokens --approval --approve --allow --pretty",
+        flags: "--source --bot --checkpoint --workspace --budget-tokens --approval --approve --allow --request-id --pretty",
         startup: false,
     },
     Command {
@@ -56,8 +56,8 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "rm",
-        usage: "rm --bot NAME",
-        flags: "--bot --pretty --no-spawn",
+        usage: "rm --bot NAME [--bot-id N]",
+        flags: "--bot --bot-id --pretty --no-spawn",
         startup: true,
     },
     Command {
@@ -195,8 +195,14 @@ fn print_flags(flags: &str) {
                 "LEVEL",
                 "Effort: low, medium, high, or xhigh; Claude also max. A new bot keeps it (default AGENT_REASONING on AGENT_MODEL, else the model's own); on an existing bot, for this turn",
             ),
-            "--request-id" => ("ID", "Idempotency key for this submission"),
-            "--bot-id" => ("N", "Refuse if --bot no longer names this identity"),
+            "--request-id" => (
+                "ID",
+                "Idempotency key: resending the same command gets what it made, duplicate: true",
+            ),
+            "--bot-id" => (
+                "N",
+                "The identity --bot must name; rm then succeeds as a duplicate once it is gone",
+            ),
             "--budget-tokens" => ("N", "New bot's lifetime input + output token cap"),
             "--pretty" => ("", "Render human-readable output"),
             "--no-spawn" => ("", "Require an already running daemon"),

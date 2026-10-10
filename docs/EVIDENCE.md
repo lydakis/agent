@@ -9,7 +9,8 @@ request of its own, at `cd1d45f` for the fix to run 5's lost steers, at
 `7061fab` and `7c1904d` for the sustained task's runs, at `ea82f7a` for
 serving a gate tag to one approver, at `74f726b` and `aed1669` for
 the automatic approver's own cost, at `81458d2` for the judges
-compared, and at `7a66687` for the finish cost of per-bot settings.
+compared, at `7a66687` for the finish cost of per-bot settings, and by
+the change that keyed creation for its cost.
 This is the one place that says what is currently
 known. The documents it links to
 keep the method, the raw tables and superseded runs. When a history document's
@@ -71,6 +72,12 @@ more turns is not here, because its work changes with its speed; it is under
   macOS is not measured: the earlier macOS probe of 32 clients (median
   284.8 ms to all replies, `7120b48`) has not been rerun.
   [Record](DAEMON_MEASUREMENTS.md#admission-window).
+- **Keyed creation.** 64 creations sent at once cost the same with or
+  without a `request_id` (median daemon CPU 12.28 ms on main, 10.64 unkeyed
+  and 10.87 keyed with the key stored and the deleted-key lookup, each inside
+  the others' interquartile range), and resending the 64 took 5.87 ms of CPU.
+  Linux x86_64 container, `e1b631d` against `b7bdfe4`, 2026-10-09; macOS not
+  measured. [Record](DAEMON_MEASUREMENTS.md#keyed-creation-cost).
 - **Savepoint journals in memory.** With the writer's journals in memory
   instead of temporary files, a submission's `begin` job ran in a median
   184 µs instead of 416 µs, ranges not overlapping. Its round trip (1.28
