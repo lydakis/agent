@@ -23,7 +23,7 @@ class AnthropicCompactionTests(ModelFixture):
                         settings={'context_bytes': 8192, 'compact_at': 50})
         self.addCleanup(client.close)
         self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path),
-                                               compaction_instructions='Summarize.', reasoning='low'))
+                                               compaction_instructions='Summarize.', effort='low'))
         for n in range(7):
             prompt = ('tool:' if n == 0 else f'{n}:') + 'x' * 500
             turn = client.request('submit', bot='Bob', request_id=str(n), prompt=prompt)['result']['turn']
@@ -64,7 +64,7 @@ class AnthropicCompactionTests(ModelFixture):
         self.addCleanup(client.close)
         self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path),
                                                tools=['echo', 'shell'], compaction_instructions='Summarize.',
-                                               reasoning='low'))
+                                               effort='low'))
         turn = client.request('submit', bot='Bob', request_id='1', prompt='long:6')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         requests = []
@@ -102,7 +102,7 @@ class AnthropicCompactionTests(ModelFixture):
         client = start()
         self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path),
                                                tools=['echo', 'shell'], compaction_instructions='Summarize.',
-                                               reasoning='low'))
+                                               effort='low'))
         self.model.compaction_refusals = 1
         turn = client.request('submit', bot='Bob', request_id='1', prompt='long:12x40')['result']['turn']
         client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn)
@@ -603,7 +603,7 @@ class AnthropicThinkingBindingTests(ModelFixture):
 
     def test_a_sliding_window_drops_thinking_bound_to_the_turns_it_left(self):
         client = self.anthropic(settings={'context_bytes': 4096})
-        client.request('create', bot='Bob', workspace=str(self.path), reasoning='low')
+        client.request('create', bot='Bob', workspace=str(self.path), effort='low')
         for n in range(12):
             self.turn(client, 'Bob', n, ('tool:' if n % 3 == 0 else f'{n}:') + 'x' * 400)
         requests = self.requests()
@@ -616,7 +616,7 @@ class AnthropicThinkingBindingTests(ModelFixture):
 
     def test_summaries_and_the_compacted_window_replay_only_bound_thinking(self):
         client = self.anthropic(settings={'context_bytes': 8192, 'compact_at': 50})
-        client.request('create', bot='Bob', workspace=str(self.path), reasoning='low',
+        client.request('create', bot='Bob', workspace=str(self.path), effort='low',
                        compaction_instructions='Summarize.')
         for n in range(8):
             self.turn(client, 'Bob', n, ('tool:' if n % 3 == 0 else f'{n}:') + 'x' * 500)
@@ -630,7 +630,7 @@ class AnthropicThinkingBindingTests(ModelFixture):
 
     def test_a_fork_keeps_its_sources_thinking(self):
         client = self.anthropic(settings={'context_bytes': 65536})
-        client.request('create', bot='Bob', workspace=str(self.path), reasoning='low')
+        client.request('create', bot='Bob', workspace=str(self.path), effort='low')
         for n in range(3):
             self.turn(client, 'Bob', n, ('tool:' if n == 0 else f'{n}:') + 'x' * 100)
         self.requests()
@@ -642,7 +642,7 @@ class AnthropicThinkingBindingTests(ModelFixture):
 
     def test_an_answer_of_only_thinking_is_left_out_once_its_context_changes(self):
         client = self.anthropic(settings={'context_bytes': 4096})
-        client.request('create', bot='Bob', workspace=str(self.path), reasoning='low')
+        client.request('create', bot='Bob', workspace=str(self.path), effort='low')
         text = lambda m: m['content'][0].get('text')
         self.turn(client, 'Bob', 0, 'x' * 1500)
         self.turn(client, 'Bob', 1, 'think-only')
@@ -666,7 +666,7 @@ class AnthropicThinkingBindingTests(ModelFixture):
 
     def test_thinking_the_provider_drops_is_reported_live(self):
         client = self.anthropic(None)
-        client.request('create', bot='Bob', workspace=str(self.path), reasoning='low')
+        client.request('create', bot='Bob', workspace=str(self.path), effort='low')
         self.turn(client, 'Bob', 0, 'kept')
         self.model.report_drops = 2
         self.turn(client, 'Bob', 1, 'dropped')

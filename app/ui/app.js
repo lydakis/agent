@@ -24,7 +24,7 @@ const S = {
   // scanning the fleet on every event.
   botsGen: 0, shapeGen: 0, deleted: new Set(),
   // The tabs are the agents opened full screen, in order; Home is always there and is not one of them.
-  config: null, ui: { rail: true, side: null, tabs: [], picker: false, pickerSel: 0, pickerMode: 'agents', found: null, tabFile: null, help: false, steps: false, toast: null, menu: false },
+  config: null, ui: { rail: true, side: null, tabs: [], picker: false, pickerSel: 0, pickerMode: 'agents', found: null, tabFile: null, help: false, steps: false, toast: null, menu: false, planFolded: {} },
   // How Send reaches a working bot, the last pick from its menu (sticky across windows), and the
   // model each bot's next turns run on when it differs from the one it was created with.
   send: loadSend(), override: new Map(), effort: new Map(),
@@ -42,6 +42,9 @@ const S = {
   // Unsent text for each bot not on screen. A composer's text is its bot's own: when a pane shows
   // another bot, the text stays behind with the one it was typed for (see `followDrafts`).
   drafts: new Map(),
+  // Each agent's plan by bot id, as the plan skill keeps it beside the store (see `loadPlans`), and
+  // whether this window can read them at all.
+  plans: new Map(), plansOff: false, plansGen: 0,
 };
 function loadSend() { try { const v = localStorage.getItem('agent:send'); return v === 'steer' || v === 'side' ? v : 'queue'; } catch (_) { return 'queue'; } }
 // What a window remembers belongs to the store it shows and its folder, not to the socket that reached
@@ -233,9 +236,9 @@ function upsert(record) {
   if (!record?.name) return;
   // Same name, different identity: everything known about the old bot belongs to the old bot.
   const known = bot(record.name);
-  if (known && known.id != null && record.id != null && known.id !== record.id) { forgetBot(record.name); }
+  if (known && known.id != null && record.bot_id != null && known.id !== record.bot_id) { forgetBot(record.name); }
   const b = bot(record.name) || { name: record.name, id: null, parent: null, waitingOn: [], turnStarted: 0, elapsed: 0 };
-  if (record.id != null) b.id = record.id;
+  if (record.bot_id != null) b.id = record.bot_id;
   if (!known || known !== b) S.shapeGen += 1;
   S.botsGen += 1;
   b.status = record.status === 'completed' ? 'idle' : (record.status || 'idle');
@@ -249,7 +252,7 @@ function upsert(record) {
   seedHistory(record);
 }
 // A bot's effort level is set when it is made and kept for life; a record that does not name it says nothing.
-function learnEffort(b, record) { if ('reasoning' in record) b.reasoning = record.reasoning ?? null; }
+function learnEffort(b, record) { if ('effort' in record) b.reasoning = record.effort ?? null; }
 // A new folder means its branch is read again, when the bot is next shown.
 function learnWorkspace(b, record) {
   const ws = record.workspace ?? null;
@@ -327,7 +330,7 @@ const leadProject = (name) => name.length > LEAD.length && name.endsWith(LEAD) ?
 // Who sent a prompt that is not yours: another agent's turn, or the app on its own (`origin`), as
 // the daemon keeps them with the prompt.
 function senderOf(p) {
-  if (p.from?.bot) return { bot: p.from.bot, turn: p.from.turn, id: p.from.id };
+  if (p.from?.bot) return { bot: p.from.bot, turn: p.from.turn, id: p.from.bot_id };
   return typeof p.origin === 'string' ? { app: p.origin } : null;
 }
 // The agent that sent it, while its name still holds the identity it had then.
@@ -520,7 +523,7 @@ async function readUsage(sw) {
         for (const r of page.bots ?? []) {
           if (r.name > prefix && !r.name.startsWith(prefix)) { past = true; break; }
           const member = sw.members.includes(r.name);
-          if (member ? sw.ids[r.name] === r.id : makers.has(r.created_by_id)) { if (!member) { makers.add(r.id); seen.add(String(r.id)); } used += r.tokens_used ?? 0; }
+          if (member ? sw.ids[r.name] === r.bot_id : makers.has(r.created_by_id)) { if (!member) { makers.add(r.bot_id); seen.add(String(r.bot_id)); } used += r.tokens_used ?? 0; }
         }
         if (past || !page.next_after) break;
         after = page.next_after;
@@ -681,7 +684,7 @@ async function onEvent(ev) {
       // bot the snapshot already holds keeps its record; the event says the same thing.
       S.deleted.delete(name);
       const known = bot(name);
-      if (!known || known.id == null || known.id !== data.id) upsert({ name, ...data });
+      if (!known || known.id == null || known.id !== data.bot_id) upsert({ name, ...data });
       bot(name).touched = S.session;
       const parent = bot(name) && creatorOf(bot(name));
       if (parent) addItem(transcript(parent.name), { kind: 'peer', who: name, turn: parent.runningTurn ?? null });
@@ -730,7 +733,7 @@ async function onEvent(ev) {
       let parsed = {}; try { parsed = JSON.parse(args) ?? {}; } catch (_) {}
       const tname = data.name ?? 'tool';
       const t = transcript(name);
-      const row = { kind: 'tool', from: t.callNode, callId: data.call_id, name: tname, summary: callSummary(tname, args), path: toolPath(tname, parsed), background: tname === 'shell' && parsed.background === true, done: false, started: S.live ? Date.now() : 0, took: 0, turn };
+      const row = { kind: 'tool', from: t.callNode, callId: data.call_id, name: tname, summary: callSummary(tname, args), path: toolPath(tname, parsed), background: tname === 'shell' && parsed.background === true, plan: tname === 'shell' && (PLAN_CALL.test(parsed.command ?? '') || PLAN_CALL.test(String(data.arguments ?? ''))), done: false, started: S.live ? Date.now() : 0, took: 0, turn };
       let existing = null;
       for (let i = t.items.length - 1; i >= 0; i--) {
         const it = t.items[i]; if (it.turn !== turn) break;
@@ -738,7 +741,7 @@ async function onEvent(ev) {
       }
       if (existing) {
         row.from = existing.from ?? row.from;
-        if (data.arguments_truncated) { row.summary = existing.summary; row.path = existing.path; row.background = existing.background; }
+        if (data.arguments_truncated) { row.summary = existing.summary; row.path = existing.path; row.background = existing.background; row.plan = existing.plan; }
         Object.assign(existing, row); t.gen += 1; } else addItem(t, row);
       break;
     }
@@ -747,6 +750,8 @@ async function onEvent(ev) {
       let call = null;
       for (let i = t.items.length - 1; i >= 0; i--) { const it = t.items[i]; if ((it.kind === 'tool' || it.kind === 'tool_stub') && it.turn === turn && it.callId === data.call_id) { call = it; break; } }
       if (call) { call.done = true; if (call.started) call.took = Date.now() - call.started; call.started = 0; patchRun(name, call); }
+      // The plan skill's script ran: the plan it left is read back.
+      if (call?.plan && S.live && bot(name)?.id != null) loadPlans([bot(name).id]);
       const shown = S.ui.file;
       // Read again as the agent left it; what it wrote is new, so a page, diagram or image in it waits for a click.
       // A write or edit that failed or was refused changed nothing, and what is shown keeps running.
@@ -807,7 +812,10 @@ async function onEvent(ev) {
       // A later bot may take the name as a swarm's agent, so it is looked for again.
       looked.delete(name);
       // Its tab goes up a level, to what made it, rather than closing on the reader.
-      const up = upOf(name);
+      const up = upOf(name), id = bot(name)?.id;
+      // Its plan goes with it.
+      if (id != null && S.plans.delete(id)) S.plansGen += 1;
+      if (id != null && S.live && !S.config?.host && !S.plansOff) Daemon.forgetPlan?.(id).catch((e) => Daemon.log?.(`plan of ${name}: ${e?.message ?? e}`));
       forgetBot(name);
       retab(name, isOpen(up) ? up : ''); save();
       // A deleted agent leaves its swarm, which stops counting it and posting to it.
@@ -1141,10 +1149,10 @@ function lost(reason) {
 function seat(record, session) {
   if (S.deleted.has(record.name)) return;
   const b = bot(record.name);
-  const conflict = b && b.id != null && record.id != null && b.id !== record.id;
+  const conflict = b && b.id != null && record.bot_id != null && b.id !== record.bot_id;
   if (!b || b.touched !== session) { upsert(record); return; }
   if (conflict) return;
-  if (record.id != null) b.id = record.id;
+  if (record.bot_id != null) b.id = record.bot_id;
   b.model = `${record.provider ?? '?'}/${record.model ?? '?'}`;
   learnEffort(b, record);
   learnFamily(b, record);
@@ -1222,6 +1230,7 @@ async function attachOnce() {
       S.ui.tabs = S.ui.tabs.filter(isOpen); if (!isOpen(S.selected)) S.selected = '';
       const shown = swarmOf(S.selected); if (shown) { readBoard(shown); readUsage(shown); }
       S.botsGen += 1; S.shapeGen += 1;
+      await loadPlans();
       await loadVisible();
       if (S.session !== session) return false;
     });
@@ -1241,7 +1250,7 @@ async function attachOnce() {
 // Everything the window learned from one store, dropped before it shows another.
 function forgetStore() {
   S.cursor = 0; S.bots.clear(); S.transcripts.clear(); S.drafts.clear(); S.override.clear(); S.effort.clear(); S.families.clear();
-  S.swarms.clear(); S.memberOf.clear(); S.deleted.clear(); looked.clear();
+  S.swarms.clear(); S.memberOf.clear(); S.deleted.clear(); looked.clear(); S.plans.clear(); S.plansOff = false; S.plansGen += 1;
   for (const w of S.wakes.values()) clearTimeout(w.timer);
   S.wakes.clear(); S.turnFrom.clear(); S.turnOrigin.clear(); S.answerTo.clear(); S.heldNews = []; S.answered.clear();
   for (const timer of S.forwarding.values()) clearTimeout(timer); S.forwarding.clear(); S.unseen.clear(); S.wanted.clear();
@@ -1370,11 +1379,12 @@ function cardHTML(card) {
   return `<div class="peer${card.sel ? ' sel' : ''}" ${card.attr}${card.task ? ' role="button" tabindex="0"' : ''}>${cardInner(card)}${card.task ? `<span class="tacts">${moreButton(card.task)}</span>` : ''}</div>`;
 }
 const cssEsc = (s) => String(s).replace(/[\x00-\x1f\x7f"\\]/g, (c) => c === '\0' ? '\ufffd' : c === '"' || c === '\\' ? '\\' + c : '\\' + c.charCodeAt(0).toString(16) + ' ');
-// A task's card: its status, its elapsed time and its newest line. Click opens it beside.
+// A task's card: its status, its elapsed time and its newest line, or with a plan the steps done and
+// the one it is on. Click opens it beside.
 function taskCard(who) {
   const p = bot(who); if (!p) return null;
-  const el = p.turnStarted ? fmt(Date.now() - p.turnStarted) : p.elapsed ? fmt(p.elapsed) : '';
-  return { attr: `data-task="${esc(p.name)}"`, task: p.name, status: shownStatus(p), name: shortName(p), last: lastLine(transcript(who)), elapsed: el, sel: S.ui.side === who || S.selected === who };
+  const el = p.turnStarted ? fmt(Date.now() - p.turnStarted) : p.elapsed ? fmt(p.elapsed) : '', plan = planOf(p);
+  return { attr: `data-task="${esc(p.name)}"`, task: p.name, status: shownStatus(p), name: shortName(p), last: plan?.at ? `${STEP_GLYPH[plan.at.s]} ${plan.at.t}` : lastLine(transcript(who)), elapsed: plan ? [planCount(plan), el].filter(Boolean).join(' · ') : el, sel: S.ui.side === who || S.selected === who };
 }
 // The two panes that show a transcript: the main thread and the one beside it.
 const PANES = [['log', () => S.selected], ['side', () => S.ui.file ? null : S.ui.side]];
@@ -1420,6 +1430,57 @@ function lastLine(t) {
   if (t.text) return tailOf(t.text); if (t.thinking) return t.thinking.slice(-400).split('. ').pop().slice(0, 200);
   for (let i = t.items.length - 1; i >= 0; i--) { const it = t.items[i]; if (it.kind === 'text') return tailOf(it.text); if (it.kind === 'tool') return `▸ ${it.name} ${it.summary}`; }
   return '';
+}
+
+// ---------- plans ----------
+// An agent's plan, which the plan skill's script keeps beside the store under the agent's bot id: the
+// steps done, the one it is on, and the rest. Every plan is read when the window attaches, and an
+// agent's again when a shell call of its that ran the script ends, so a quiet fleet costs nothing.
+const PLAN_CALL = /skills\/plan\/plan\b/;
+const PLAN_MARK = { '[x] ': 'done', '[>] ': 'now', '[ ] ': 'todo' };
+const STEP_GLYPH = { done: '✓', now: '✱', todo: '○' };
+function parsePlan(text) {
+  const steps = [];
+  for (const line of String(text ?? '').split('\n').slice(0, 30)) { const s = PLAN_MARK[line.slice(0, 4)], t = line.slice(4).trim(); if (s && t) steps.push({ s, t: t.slice(0, 200) }); }
+  if (!steps.length) return null;
+  return { steps, done: steps.filter((x) => x.s === 'done').length, at: steps.find((x) => x.s === 'now') ?? steps.find((x) => x.s === 'todo') ?? null };
+}
+const planOf = (b) => (b?.id != null ? S.plans.get(b.id) ?? null : null);
+const planCount = (plan) => `${plan.done}/${plan.steps.length}`;
+// Every plan, or `ids`' (an agent with none loses the one shown). Reads go one at a time, so an older
+// read never lands after a newer one. A window on a host, or one opened on a socket alone, cannot read
+// them; it logs why once and stops asking.
+let planReads = Promise.resolve();
+// No ids reads every seated agent's, and those replace what was shown. A plan named for no agent
+// here, such as one deleted from another window, is never read; the app's side lists the plans
+// folder for a long list, so the cost follows the plans that exist.
+function loadPlans(ids = null) { return (planReads = planReads.then(() => readPlans(ids))); }
+async function readPlans(ids) {
+  if (S.config?.host || S.plansOff || !Daemon.plans) return;
+  const session = S.session;
+  const all = !ids;
+  if (all) ids = [...S.bots.values()].map((b) => b.id).filter((id) => id != null);
+  let got; try { got = ids.length ? await Daemon.plans(ids) : {}; } catch (e) {
+    const why = String(e?.message ?? e); if (/^(plans|remote)_unsupported/.test(why)) S.plansOff = true;
+    Daemon.log?.(`plans: ${why}`); return;
+  }
+  if (S.session !== session) return;
+  // An agent asked about and left out has no plan.
+  if (all) S.plans.clear();
+  for (const id of ids) { const plan = parsePlan(got?.[id] ?? ''); if (plan) S.plans.set(id, plan); else S.plans.delete(id); }
+  S.plansGen += 1;
+  // What shows a plan: the list's rows, task cards, and the plan above a chat.
+  if (S.attached) { rail.key = ''; render(); refreshLive($('log')); if (S.ui.side && !S.ui.file) refreshLive($('side')); }
+}
+// The plan above a chat: every step, the one it is on marked; its count folds it to that step.
+function renderPlan(el, b) {
+  // Each pane folds its own plan.
+  const plan = planOf(b), folded = !!S.ui.planFolded[el.id], key = plan ? `${b.id}|${S.plansGen}|${folded}` : '';
+  if (el.dataset.k === key) return; el.dataset.k = key;
+  el.hidden = !plan; if (!plan) { el.innerHTML = ''; return; }
+  const step = (x) => `<div class="pstep ${x.s}"><span class="pm">${STEP_GLYPH[x.s]}</span>${esc(x.t)}</div>`;
+  const shown = folded ? (plan.at ? [plan.at] : []) : plan.steps;
+  el.innerHTML = `<button type="button" class="pcount" data-act="plan-fold" data-v="${el.id}" title="${folded ? 'Show the whole plan' : 'Fold the plan to its current step'}">${planCount(plan)}</button>${shown.map(step).join('')}`;
 }
 
 // ---------- runs ----------
@@ -2136,7 +2197,9 @@ function botRowHTML(n) {
     return `<div class="botrow" data-bot="${esc(n.key)}" role="button" tabindex="0"><span class="glyph ${st}">${glyphOf(st)}</span><span class="n">⁂ ${esc(memberShort(sw, sw.name))}</span><span class="meta">${sw.members.length}</span><span class="acts">${moreButton(n.key)}</span></div>`;
   }
   const b = n.b, st = shownStatus(b), beside = S.ui.side === b.name ? ' beside' : '';
-  return `<div class="botrow${n.head != null ? ' proj' : ''}${beside}" data-bot="${esc(b.name)}" role="button" tabindex="0"><span class="glyph ${st}">${glyphOf(st)}</span><span class="n">${esc(n.head ?? shortName(b))}</span>${kids}<span class="acts">${moreButton(b.name)}</span></div>`;
+  // An agent with a plan shows the step it is on and how many are done.
+  const plan = planOf(b), step = plan?.at ? `<span class="step"> · ${esc(plan.at.t)}</span>` : '', done = plan ? `<span class="meta" title="steps done">${planCount(plan)}</span>` : '';
+  return `<div class="botrow${n.head != null ? ' proj' : ''}${beside}" data-bot="${esc(b.name)}" role="button" tabindex="0"><span class="glyph ${st}">${glyphOf(st)}</span><span class="n">${esc(n.head ?? shortName(b))}${step}</span>${done}${kids}<span class="acts">${moreButton(b.name)}</span></div>`;
 }
 // ---------- tabs ----------
 // Home, then a tab for each agent opened full screen. They are redrawn only when one opens, closes,
@@ -2188,6 +2251,8 @@ function render() {
   renderTabs();
   const tab = fileOf(S.selected);
   if (tab == null) dropTabFile(); else if (S.ui.tabFile?.full !== tab) readTabFile(tab);
+  // Each plan before its chat, so a chat that follows its end measures what is left once the plan is drawn.
+  renderPlan($('plan'), sw ? null : b); renderPlan($('sideplan'), side);
   if (sw) { renderSwarmHead($('title'), sw); renderSwarm($('log'), sw); }
   else if (tab != null) renderFile(S.ui.tabFile, $('log'), $('title'), 'main');
   else { renderHead($('title'), b, 'main'); if (b) renderTranscript($('log'), b.name); else renderHome($('log')); }
@@ -2461,7 +2526,7 @@ async function submit(text, pane = 'main', to = PANE[pane].bot()) {
     // cannot be composed rejects here and nothing is created, as with the CLI's --agents.
     const policy = await Daemon.policy();
     const session = S.session;
-    const record = await Daemon.request('create', { bot: name, workspace: S.config.workspace, model: m, ...(effort ? { reasoning: effort } : {}), instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: S.config.tools });
+    const record = await Daemon.request('create', { bot: name, workspace: S.config.workspace, model: m, ...(effort ? { effort } : {}), instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: S.config.tools });
     await enqueue(() => { if (S.session === session) seat(record, session); });
     await go(name); toast(`created ${name} · ${policy.note}`); return;
   }
@@ -2477,7 +2542,7 @@ async function submit(text, pane = 'main', to = PANE[pane].bot()) {
   // It also names the turn on screen, so a turn that ended meanwhile refuses it as stale_turn
   // rather than the message landing in whatever turn runs next. A bot keeps its folder, so a
   // message names one only for a bot that has none.
-  const where = delivery === 'steer' ? (b.runningTurn != null ? { expected_turn: b.runningTurn } : {}) : { ...home(b), ...(model && model !== b.model ? { model } : {}), ...(effort && effort !== b.reasoning ? { reasoning: effort } : {}) };
+  const where = delivery === 'steer' ? (b.runningTurn != null ? { expected_turn: b.runningTurn } : {}) : { ...home(b), ...(model && model !== b.model ? { model } : {}), ...(effort && effort !== b.reasoning ? { effort } : {}) };
   // The identity on screen, so a name that changed hands in between is refused rather than handed the prompt.
   try { await Daemon.request('submit', { bot: b.name, bot_id: b.id, request_id: `app-${crypto.randomUUID()}`, prompt: text, delivery, ...where }); }
   catch (e) { if (delivery === 'steer' && /stale_turn/.test(String(e?.message ?? e))) throw new Error('that turn ended; not steered'); throw e; }
@@ -2525,7 +2590,7 @@ async function sideChat(name, text = '') {
   // The first message goes before the pane loads any history, so the turn starts at once.
   let failed = null;
   if (text) {
-    try { await Daemon.request('submit', { bot: copy, bot_id: record.id, request_id: `app-${crypto.randomUUID()}`, prompt: text, delivery: 'reject', ...home(record) }); }
+    try { await Daemon.request('submit', { bot: copy, bot_id: record.bot_id, request_id: `app-${crypto.randomUUID()}`, prompt: text, delivery: 'reject', ...home(record) }); }
     catch (err) { failed = err instanceof Error ? err : new Error(String(err)); }
   }
   if (S.ui.side !== copy) await go(copy, 'beside');
@@ -2570,18 +2635,18 @@ async function createProject(dir, picked = null, effort = null, threads = null) 
   if (effort !== null) try { localStorage.setItem('agent:effort', effort); } catch (_) {}
   const tasks = info.file ? { model: info.threads_model ?? null, reasoning: info.threads_reasoning ?? null, inProject: info.threads_in === 'project' } : threads;
   const session = S.session;
-  const record = await Daemon.request('create', { bot: info.coordinator, workspace: info.dir, model, ...(reasoning ? { reasoning } : {}), instructions: `${policy.instructions}\n\n${tasksRule(tasks)}`, compaction_instructions: policy.compaction_instructions, tools: policy.tools ?? S.config.tools });
+  const record = await Daemon.request('create', { bot: info.coordinator, workspace: info.dir, model, ...(reasoning ? { effort: reasoning } : {}), instructions: `${policy.instructions}\n\n${tasksRule(tasks)}`, compaction_instructions: policy.compaction_instructions, tools: policy.tools ?? S.config.tools });
   await enqueue(() => { if (S.session === session) seat(record, session); });
   if (!info.file) await Daemon.writeProject({ dir: info.dir, name: info.name, model, reasoning, threads });
   await go(info.coordinator); toast(`project ${info.name} · ${policy.note}${info.file && asked ? ' · set up from its project file, not these picks' : ''}`);
 }
 // A project's task settings, said to its coordinator as the flags its starts take. The model is always
 // named, so a role a task starts in (--profile) cannot swap it: the one picked, else the lead's own,
-// which its shell holds as AGENT_MODEL (and its effort as AGENT_REASONING).
+// which its shell holds as AGENT_MODEL (and its effort as AGENT_EFFORT).
 // A picked model goes in quoted, since a model id may hold characters a shell would act on.
 const shq = (v) => `'${String(v).replaceAll("'", `'\\''`)}'`;
 function tasksRule(t) {
-  const flags = t?.model ? `--model ${shq(t.model)}${t.reasoning ? ` --reasoning ${shq(t.reasoning)}` : ''}` : '--model "$AGENT_MODEL" ${AGENT_REASONING:+--reasoning "$AGENT_REASONING"}';
+  const flags = t?.model ? `--model ${shq(t.model)}${t.reasoning ? ` --effort ${shq(t.reasoning)}` : ''}` : '--model "$AGENT_MODEL" ${AGENT_EFFORT:+--effort "$AGENT_EFFORT"}';
   const where = t?.inProject ? 'Every task works in this folder, with no worktree of its own.' : 'When this folder is a git repository, a task that changes files works in its own worktree, so tasks do not collide.';
   return `This project's tasks, as the person set them up: start every new task, in a role (--profile) or not, with ${flags}. ${where}`;
 }
@@ -2596,7 +2661,7 @@ function detach() { save(); Daemon.close(); }
 const AWS = 'Signs in with your AWS CLI (version 2) login for the profile (aws configure, or aws sso login), or with a Bedrock API key.';
 // A field that is `local` is the form's own choice, never saved.
 const BEDROCK = [
-  { key: 'AWS_REGION', label: 'Region', hint: 'us-east-1', required: true },
+  { key: 'AWS_REGION', label: 'Region', hint: "the key's; with AWS login, optional" },
   { key: 'AUTH', label: 'Sign in with', local: true, choices: [['aws', 'AWS login'], ['key', 'Bedrock API key']] },
   { key: 'AWS_PROFILE', label: 'AWS profile', hint: 'default' },
   { key: 'AWS_BEARER_TOKEN_BEDROCK', label: 'Bedrock API key', hint: 'optional', secret: true },
@@ -2624,8 +2689,7 @@ const keysOf = (spec) => [
 const providerLabel = (name) => catalogOf(name)?.label ?? name;
 // A spec the catalog writes, which its form can edit; any other (a gateway under a known name) it
 // would overwrite with the provider's defaults.
-const editable = (spec) => spec === specName(spec) ? !!catalogOf(spec) : !!catalogOf(specName(spec))?.parts
-  && providerSpecs(catalogOf(specName(spec)).id, { AWS_REGION: spec.split('.')[1], AWS_BEARER_TOKEN_BEDROCK: 'x' }).includes(spec);
+const editable = (spec) => spec === specName(spec) && !!catalogOf(spec);
 // Effort: how hard a model thinks, picked beside its model when an agent is made; the model chip
 // changes it for the agent's next turns. Both families take low to xhigh and Anthropic's also max;
 // which of those a model accepts is its provider's to say. No level sends none, and the model uses
@@ -2662,13 +2726,9 @@ function modelSelectHTML(id, list, prefer = null, none = null) {
   const first = none !== null ? `<option value=""${pick ? '' : ' selected'}>${esc(none)}</option>` : pick ? '' : '<option value="" selected disabled>Choose a model</option>';
   return `<select id="${id}" aria-label="Model">${first}${options}</select>`;
 }
-// An entry's `--provider` specs. Bedrock with an API key names each endpoint so the key can be named
-// after it; without one it signs with the AWS CLI's credentials in the region.
-function providerSpecs(id, values) {
-  const c = catalogOf(id);
-  if (!c?.parts) return [id];
-  return c.parts.map(([name, family, path]) => values.AWS_BEARER_TOKEN_BEDROCK ? `${name}=${family},https://bedrock-mantle.${values.AWS_REGION}.api.aws/${path}/v1,AWS_BEARER_TOKEN_BEDROCK` : name);
-}
+// An entry's `--provider` specs: its daemon providers by name. Bedrock's sign with a Bedrock API key
+// when one is set, else with the AWS CLI's credentials, in the region the AWS tools would use.
+const providerSpecs = (id) => partsOf(catalogOf(id) ?? { id });
 // One screen, one state: `settings` as the app would start a daemon with, each provider's answer
 // (`checking`, a model count, or an error), and the list models are picked from.
 function setupState() { return S.setup ??= { open: false, settings: null, status: {}, list: [], adding: null, busy: null, error: null, listError: null }; }
@@ -2765,11 +2825,12 @@ async function connectProvider(id, values) {
   // Bedrock signs in one way: with the AWS login, which drops a saved key, or with a key, typed or saved.
   const saved = st.settings?.keys?.includes('AWS_BEARER_TOKEN_BEDROCK');
   const aws = values.AUTH ? values.AUTH === 'aws' : !values.AWS_BEARER_TOKEN_BEDROCK && !saved;
-  // The region names the endpoint and sits inside a space-separated provider list.
-  if (c.parts && !/^[a-z]{2}(-[a-z]+)+-\d+$/.test(values.AWS_REGION ?? '')) throw new Error(`Region must look like us-east-1, not "${values.AWS_REGION}"`);
+  // The region names the endpoint; left empty, the daemon takes the profile's, else us-east-1.
+  if (c.parts && values.AWS_REGION && !/^[a-z]{2}(-[a-z]+)+-\d+$/.test(values.AWS_REGION)) throw new Error(`Region must look like us-east-1, not "${values.AWS_REGION}"`);
   if (c.parts && !aws && !values.AWS_BEARER_TOKEN_BEDROCK && !saved) throw new Error('Bedrock API key is required');
-  const keyed = c.parts ? { ...values, AWS_BEARER_TOKEN_BEDROCK: aws ? '' : values.AWS_BEARER_TOKEN_BEDROCK || 'saved' } : values;
-  const changes = { AGENT_PROVIDER: [...specs, ...providerSpecs(c.id, keyed)].join(' ') };
+  // A short-term key works only in the region that made it, so signing in with a key names one.
+  if (c.parts && !aws && !values.AWS_REGION) throw new Error('Region is required with a Bedrock API key');
+  const changes = { AGENT_PROVIDER: [...specs, ...providerSpecs(c.id)].join(' ') };
   // A key left empty keeps the one saved; another field left empty is cleared, the shell's value too.
   for (const f of c.fields) if (!f.local && (!f.secret || values[f.key])) changes[f.key] = values[f.key] || '';
   // Emptied rather than removed, so a key the shell exports stays out of it too.
@@ -2829,8 +2890,8 @@ function setupHTML(kept = new Map()) {
   else {
     const c = catalogOf(st.adding);
     const value = (f) => f.key === 'AWS_REGION' ? set?.region ?? '' : f.key === 'AWS_PROFILE' ? set?.profile ?? '' : '';
-    // How Bedrock signs in now, from its specs: a key only the shell exports does not change it.
-    const choice = (f) => { const on = (set?.providers ?? []).some((s) => catalogOf(specName(s))?.parts && s.endsWith(',AWS_BEARER_TOKEN_BEDROCK')) ? 'key' : 'aws'; return `<label><span>${esc(f.label)}</span><select name="${f.key}">${f.choices.map(([v, l]) => `<option value="${v}"${v === on ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select></label>`; };
+    // How Bedrock signs in now: with its key whenever one is set.
+    const choice = (f) => { const on = set?.keys?.includes('AWS_BEARER_TOKEN_BEDROCK') ? 'key' : 'aws'; return `<label><span>${esc(f.label)}</span><select name="${f.key}">${f.choices.map(([v, l]) => `<option value="${v}"${v === on ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select></label>`; };
     const fields = c.fields.map((f) => f.choices ? choice(f) : `<label><span>${esc(f.label)}</span><input name="${f.key}" type="${f.secret ? 'password' : 'text'}" autocomplete="off" spellcheck="false" value="${esc(value(f))}" placeholder="${esc(f.secret && set?.keys?.includes(f.key) ? 'saved; type to replace' : f.hint ?? '')}"></label>`).join('');
     const working = anyActive() ? `<p class="warn">Agents are working. Connecting restarts the daemon, which stops them.</p>` : '';
     add = `<form class="pform" id="setupform"><b>${esc(c.label)}</b>${c.about ? `<p>${esc(c.about)}</p>` : ''}${fields}${working}<div class="row"><button type="submit" class="sbtn primary"${busy}>Connect</button><button type="button" class="sbtn" data-act="setup-cancel"${busy}>Cancel</button></div></form>`;
@@ -3090,6 +3151,7 @@ async function act(el) {
     // What is beside goes full screen, with its draft; ← closes it.
     case 'full': if (S.ui.side) await go(S.ui.side); return;
     case 'close-side': if (S.ui.side) await go(S.ui.side, 'beside'); return;
+    case 'plan-fold': S.ui.planFolded[v] = !S.ui.planFolded[v]; render(); return;
     case 'close-file': closeFile(); return;
     // The file beside becomes a tab, and the pane beside closes.
     case 'file-tab': { const f = S.ui.file; if (!f) return; dropFile(); await go(FILE + f.full, 'tab'); return; }

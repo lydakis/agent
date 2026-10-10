@@ -16,6 +16,8 @@
 
 mod daemon;
 mod files;
+mod memory;
+mod plan;
 mod project;
 mod remote;
 mod session;
@@ -1313,6 +1315,43 @@ fn trigger_fire(
     trigger::fire_now(&triggers_of(&*windows.of(&window)?)?, &name)
 }
 
+/// The folder of plans beside the store this window's daemon runs, where
+/// its agents' `plan` script writes (see `plan`).
+fn plans_of(state: &Shared) -> Result<PathBuf, String> {
+    match &state.config.target {
+        Target::Host(host) => Err(format!(
+            "remote_unsupported: plans are read from this machine's files, and this window's agents run on {}",
+            host.alias
+        )),
+        Target::Local { store: Some(store), .. } => plan::dir(store),
+        Target::Local { store: None, .. } => Err(
+            "plans_unsupported: this window was opened on a socket, so the store its agents' plans sit beside is unknown; open it with --store".into(),
+        ),
+    }
+}
+
+/// The plans of the agents `ids` names, by bot id (one with none is left out).
+#[tauri::command]
+async fn plans(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    ids: Vec<i64>,
+) -> Result<Value, String> {
+    let dir = plans_of(&*windows.of(&window)?)?;
+    blocking(move || plan::read(&dir, &ids)).await
+}
+
+/// Remove a deleted agent's plan.
+#[tauri::command]
+async fn plan_forget(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    id: i64,
+) -> Result<(), String> {
+    let dir = plans_of(&*windows.of(&window)?)?;
+    blocking(move || plan::forget(&dir, id)).await
+}
+
 /// Page diagnostics land on stderr, where a terminal can see them.
 #[tauri::command]
 fn log(message: String) {
@@ -1338,9 +1377,9 @@ async fn request(
 const SETUP_FLAG: &str = "--setup";
 
 /// What the app puts on this machine, written at every start so it all leads
-/// to this copy: swarm scripts, the coordinator's `start`, `~/.agent/trigger`,
-/// triggers reloaded after a move, and the skills it ships linked from
-/// `~/.agents/skills`. False when any of it failed; each failure is printed
+/// to this copy: swarm scripts, the coordinator's `start`, `~/.agent/trigger`
+/// and `~/.agent/memory`, triggers reloaded after a move, and the skills it
+/// ships linked from `~/.agents/skills`. False when any of it failed; each failure is printed
 /// and does not stop the rest. A start reloads triggers off the window's way.
 fn machine_setup(background: bool) -> bool {
     let mut ok = true;
@@ -1353,10 +1392,15 @@ fn machine_setup(background: bool) -> bool {
         if let Err(error) = swarm::write_start_script(&home, &app) {
             report(&error);
         }
-        if let Some(state) = home.parent()
-            && let Err(error) = trigger::write_script(state, &app)
-        {
-            report(&error);
+        if let Some(state) = home.parent() {
+            for written in [
+                trigger::write_script(state, &app),
+                memory::write_script(state, &app),
+            ] {
+                if let Err(error) = written {
+                    report(&error);
+                }
+            }
         }
         // Ends a fire cut short are finished, and a moved app reloads every
         // trigger, each a launchctl run.
@@ -1389,7 +1433,7 @@ fn machine_setup(background: bool) -> bool {
 
 fn main() {
     // A swarm's `post` script, a coordinator's `start`, `~/.agent/trigger`,
-    // launchd's fires and the Homebrew cask's install and uninstall run this
+    // `~/.agent/memory`, launchd's fires and the Homebrew cask's install and uninstall run this
     // executable; each acts and exits without a window.
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
@@ -1398,6 +1442,7 @@ fn main() {
         Some(trigger::FLAG) => std::process::exit(trigger::cli(&args[2..])),
         Some(trigger::FIRE_FLAG) => std::process::exit(trigger::fire_cli(&args[2..])),
         Some(trigger::WATCH_FLAG) => std::process::exit(trigger::watch_cli()),
+        Some(memory::FLAG) => std::process::exit(memory::cli(&args[2..])),
         Some(SETUP_FLAG) => std::process::exit(i32::from(!machine_setup(false))),
         Some(skills::UNLINK_FLAG) => std::process::exit(skills::unlink_cli()),
         _ => {}
@@ -1460,6 +1505,8 @@ fn main() {
             swarm_decide,
             triggers,
             trigger_fire,
+            plans,
+            plan_forget,
             trigger_remove
         ])
         .setup(move |app| {

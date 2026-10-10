@@ -33,7 +33,7 @@ def run(agent, out, bots, model, max_connecting, reasoning):
     provider = model.split('/', 1)[0]
     env = os.environ.copy()
     tools = 'shell,read,write,edit,wait'
-    common = ['--store', str(store), '--provider', provider, '--model', model, '--reasoning', reasoning,
+    common = ['--store', str(store), '--provider', provider, '--model', model, '--effort', reasoning,
               '--tools', tools, '--workspace', str(workspace),
               *(['--max-connecting', str(max_connecting)] if max_connecting is not None else [])]
     # One detached turn starts the daemon so every fleet submission races a live one.
@@ -74,7 +74,7 @@ def run(agent, out, bots, model, max_connecting, reasoning):
     results = {}
 
     def waiter(chunk):  # wait accepts at most 64 handles per request
-        r = subprocess.run([str(agent), 'wait', '--store', str(store), '--timeout-ms', '600000', *chunk],
+        r = subprocess.run([str(agent), 'wait', '--store', str(store), '--timeout', '10m', *chunk],
                            capture_output=True, text=True, env=env)
         got = json.loads(r.stdout)['results'] if r.stdout.strip() else {
             h: {'error': 'wait_failed', 'detail': r.stderr.strip()[:120]} for h in chunk}

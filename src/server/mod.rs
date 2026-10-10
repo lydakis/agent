@@ -97,7 +97,7 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
             workspace,
             model,
             instructions,
-            reasoning,
+            effort,
             tools,
             created_by,
             compaction_instructions,
@@ -109,7 +109,7 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
                 bot,
                 model,
                 instructions,
-                reasoning,
+                effort,
                 tools,
                 created_by,
                 compaction_instructions,
@@ -126,11 +126,11 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
             bot,
             request_id,
             model,
-            reasoning,
+            effort,
             delivery,
             ..
         } => (
-            output::encoded_len(&(id, bot, bot, request_id, model, reasoning, delivery)),
+            output::encoded_len(&(id, bot, bot, request_id, model, effort, delivery)),
             output::encoded_len(&(bot, request_id)),
             0,
             Ok(0),
@@ -173,7 +173,7 @@ enum Command {
         workspace: Option<String>,
         model: Option<String>,
         instructions: Option<String>,
-        reasoning: Option<String>,
+        effort: Option<String>,
         budget_tokens: Option<u64>,
         /// The tools this bot may call, from the daemon's registered set.
         tools: Option<Vec<String>>,
@@ -254,7 +254,7 @@ enum Command {
         workspace: Option<String>,
         model: Option<String>,
         /// This turn's effort level; absent is the bot's own.
-        reasoning: Option<String>,
+        effort: Option<String>,
         /// `reject` (default), `queue`, or `steer`.
         delivery: Option<String>,
         /// With `steer`: the running turn this message is for, or `stale_turn`.
@@ -372,6 +372,8 @@ enum Command {
         grace_ms: u64,
     },
 }
+/// The variable a Bedrock API key is read from, as the AWS tools name it.
+const BEDROCK_KEY: &str = "AWS_BEARER_TOKEN_BEDROCK";
 pub struct ProviderSpec {
     pub name: String,
     pub family: Family,
@@ -394,14 +396,23 @@ impl ProviderSpec {
     /// variable is read only when named here or implied by a default endpoint.
     /// `chatgpt` at its default endpoint without a key variable uses Codex's
     /// saved ChatGPT login; the login never goes to a caller-chosen URL.
-    /// `bedrock` (Claude) and `bedrock-openai` default to Bedrock Mantle in
-    /// `AWS_REGION`, or `AWS_DEFAULT_REGION`; any Bedrock URL without a key
-    /// variable signs with SigV4, and one with a key variable sends it as a
-    /// Bedrock API key.
+    /// `bedrock` (Claude) defaults to Bedrock runtime, where cross-region
+    /// inference profiles (`global.anthropic.…`) route to whichever region
+    /// holds the model, from any source region the profile supports, and `bedrock-openai` to Bedrock Mantle, as Claude
+    /// Code and Codex default. Both are in the region the AWS SDKs would
+    /// use (`aws::region`). Any Bedrock URL without a key variable signs
+    /// with SigV4, and one with a key variable sends it as a Bedrock API
+    /// key; the defaults take `AWS_BEARER_TOKEN_BEDROCK` when it is set.
     pub fn parse(spec: &str) -> Result<Self> {
-        Self::parse_with(spec, &|name| std::env::var(name).ok())
+        Self::parse_with(spec, &|name| std::env::var(name).ok(), &|path| {
+            std::fs::read_to_string(path).ok()
+        })
     }
-    fn parse_with(spec: &str, env: &dyn Fn(&str) -> Option<String>) -> Result<Self> {
+    fn parse_with(
+        spec: &str,
+        env: &dyn Fn(&str) -> Option<String>,
+        read: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Self> {
         let (name, rest) = spec.split_once('=').unwrap_or((spec, ""));
         let mut fields = rest.split(',').filter(|s| !s.is_empty());
         let (family, url, key) = fields.next().map(|f| f.to_owned()).map_or_else(
@@ -433,26 +444,38 @@ impl ProviderSpec {
             "chatgpt" => ("responses", "https://chatgpt.com/backend-api/codex", None),
             "bedrock" => (
                 "anthropic",
-                "https://bedrock-mantle.{region}.api.aws/anthropic/v1",
-                None,
+                "https://bedrock-runtime.{region}.amazonaws.com/anthropic/v1",
+                Some(BEDROCK_KEY),
             ),
             "bedrock-openai" => (
                 "responses",
                 "https://bedrock-mantle.{region}.api.aws/openai/v1",
-                None,
+                Some(BEDROCK_KEY),
             ),
             _ => ("", "", None),
         };
+        // A Bedrock API key is used when it is set, as Claude Code and
+        // Codex use it; otherwise the default endpoints sign with SigV4.
+        let default_key = default_key
+            .filter(|&key| key != BEDROCK_KEY || env(key).is_some_and(|v| !v.is_empty()));
         let default_url = if default_url.contains("{region}") && url.is_none() {
-            let region = env("AWS_REGION")
-                .or_else(|| env("AWS_DEFAULT_REGION"))
-                .filter(|region| !region.is_empty())
-                .ok_or_else(|| {
-                    Error::with(
+            use agent_runtime::provider::aws;
+            let region = aws::region(env, read).map_err(|reason| {
+                Error::with("invalid_provider_spec", format!("{spec}: {reason}"))
+            })?;
+            let region = match (region, default_key) {
+                (Some(region), _) => region,
+                // Short-term Bedrock API keys work only in the region that
+                // made them (AWS documents), so a key needs its region named,
+                // as Codex requires; SigV4 falls back as Claude Code does.
+                (None, Some(key)) => {
+                    return Err(Error::with(
                         "invalid_provider_spec",
-                        format!("{spec}: set AWS_REGION or give the endpoint URL"),
-                    )
-                })?;
+                        format!("{spec}: {key} needs AWS_REGION, the region the key works in"),
+                    ));
+                }
+                (None, None) => aws::DEFAULT_REGION.to_owned(),
+            };
             default_url.replace("{region}", &region)
         } else {
             default_url.to_owned()
@@ -1833,7 +1856,7 @@ impl Service {
                 workspace: path,
                 model,
                 instructions,
-                reasoning,
+                effort,
                 budget_tokens,
                 tools,
                 created_by,
@@ -1877,8 +1900,8 @@ impl Service {
                 // with no room for thinking, is refused before the bot exists.
                 settings.validate()?;
                 turn::shaped(served, &settings)?;
-                if let Some(level) = &reasoning {
-                    family.check_reasoning(level)?;
+                if let Some(level) = &effort {
+                    family.check_effort(level)?;
                 }
                 let instructions = instructions.ok_or(Error::new("instructions_required"))?;
                 if instructions.len() > 64 * 1024 {
@@ -1922,7 +1945,7 @@ impl Service {
                                 family,
                                 model: &model,
                                 instructions: &instructions,
-                                reasoning: reasoning.as_deref(),
+                                effort: effort.as_deref(),
                                 budget_tokens,
                                 tools: &tools,
                                 created_by: created_by.as_deref(),
@@ -1988,7 +2011,7 @@ impl Service {
                     Some(id) => id,
                     None => {
                         store
-                            .op("inspect", move |db| Ok(db.inspect(&name)?.id))
+                            .op("inspect", move |db| Ok(db.inspect(&name)?.bot_id))
                             .await?
                     }
                 };
@@ -2496,7 +2519,7 @@ impl Service {
                 prompt,
                 workspace: path,
                 model,
-                reasoning,
+                effort,
                 delivery,
                 expected_turn,
                 from,
@@ -2527,7 +2550,7 @@ impl Service {
                 let options = TurnOptions {
                     workspace: path.as_deref().map(workspace).transpose()?,
                     model,
-                    reasoning,
+                    effort,
                     delivery,
                     expected_turn,
                     from: from.map(|author| (author.bot, author.turn)),
@@ -2957,14 +2980,15 @@ mod tests {
     }
 
     #[test]
-    fn bedrock_specs_default_to_mantle_in_the_aws_region_and_sign() {
+    fn bedrock_specs_default_to_runtime_and_mantle_in_the_aws_region_and_sign() {
+        let none = |_: &str| None;
         let region = |name: &str| (name == "AWS_REGION").then(|| "us-east-1".to_owned());
-        let parse = |spec: &str| ProviderSpec::parse_with(spec, &region).unwrap();
+        let parse = |spec: &str| ProviderSpec::parse_with(spec, &region, &none).unwrap();
         let claude = parse("bedrock");
         assert_eq!(claude.family, Family::Anthropic);
         assert_eq!(
             claude.url,
-            "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1"
+            "https://bedrock-runtime.us-east-1.amazonaws.com/anthropic/v1"
         );
         assert!(claude.sigv4 && claude.key_env.is_none());
         let openai = parse("bedrock-openai");
@@ -2977,13 +3001,50 @@ mod tests {
         // AWS_DEFAULT_REGION is the fallback name the AWS CLI also reads.
         let fallback = |name: &str| (name == "AWS_DEFAULT_REGION").then(|| "eu-west-1".to_owned());
         assert_eq!(
-            ProviderSpec::parse_with("bedrock", &fallback).unwrap().url,
-            "https://bedrock-mantle.eu-west-1.api.aws/anthropic/v1"
+            ProviderSpec::parse_with("bedrock", &fallback, &none)
+                .unwrap()
+                .url,
+            "https://bedrock-runtime.eu-west-1.amazonaws.com/anthropic/v1"
         );
-        let error = ProviderSpec::parse_with("bedrock", &|_| None)
+        // With no region named anywhere, us-east-1, as Claude Code does.
+        assert_eq!(
+            ProviderSpec::parse_with("bedrock-openai", &none, &none)
+                .unwrap()
+                .url,
+            "https://bedrock-mantle.us-east-1.api.aws/openai/v1"
+        );
+        // A Bedrock API key in the environment is used, as the AWS tools use it.
+        let keyed_env = |name: &str| match name {
+            "AWS_BEARER_TOKEN_BEDROCK" => Some("key".to_owned()),
+            "AWS_REGION" => Some("us-west-2".to_owned()),
+            _ => None,
+        };
+        for name in ["bedrock", "bedrock-openai"] {
+            let keyed = ProviderSpec::parse_with(name, &keyed_env, &none).unwrap();
+            assert_eq!(keyed.key_env.as_deref(), Some("AWS_BEARER_TOKEN_BEDROCK"));
+            assert!(!keyed.sigv4 && keyed.url.contains(".us-west-2."));
+        }
+        // A region set but malformed refuses the spec rather than calling elsewhere.
+        let typo = |name: &str| (name == "AWS_REGION").then(|| "US-EAST-1".to_owned());
+        let error = ProviderSpec::parse_with("bedrock", &typo, &none)
             .err()
             .unwrap();
         assert_eq!(error.code, "invalid_provider_spec");
+        assert!(error.detail.unwrap().starts_with("bedrock: AWS_REGION is"));
+        // A key with no region named is refused: short-term keys work only in
+        // their own region.
+        let unplaced = |name: &str| (name == "AWS_BEARER_TOKEN_BEDROCK").then(|| "key".to_owned());
+        let error = ProviderSpec::parse_with("bedrock", &unplaced, &none)
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "invalid_provider_spec");
+        assert!(error.detail.unwrap().contains("needs AWS_REGION"));
+        let empty = |name: &str| (name == "AWS_BEARER_TOKEN_BEDROCK").then(String::new);
+        assert!(
+            ProviderSpec::parse_with("bedrock", &empty, &none)
+                .unwrap()
+                .sigv4
+        );
         // Any Bedrock URL signs, runtime included; a key variable is sent as
         // a Bedrock API key instead.
         let runtime =
@@ -2999,7 +3060,8 @@ mod tests {
         assert!(
             ProviderSpec::parse_with(
                 "b=responses-ws,https://bedrock-mantle.us-east-1.api.aws/openai/v1",
-                &region
+                &region,
+                &none
             )
             .is_err()
         );
@@ -3008,7 +3070,9 @@ mod tests {
             "b=anthropic,http://bedrock-runtime.us-west-2.amazonaws.com/anthropic/v1",
             "b=responses,http://bedrock-mantle.us-east-1.api.aws/openai/v1,AWS_BEARER_TOKEN_BEDROCK",
         ] {
-            let error = ProviderSpec::parse_with(spec, &region).err().unwrap();
+            let error = ProviderSpec::parse_with(spec, &region, &none)
+                .err()
+                .unwrap();
             assert_eq!(error.code, "invalid_provider_spec");
         }
     }
@@ -3096,7 +3160,7 @@ mod tests {
                         family: Family::Responses,
                         model: "synthetic-model",
                         instructions: "test",
-                        reasoning: None,
+                        effort: None,
                         budget_tokens: None,
                         tools: &[],
                         created_by: None,
@@ -3306,7 +3370,7 @@ mod tests {
             family: Family::Responses,
             model: "synthetic-model",
             instructions: "test",
-            reasoning: None,
+            effort: None,
             budget_tokens: None,
             tools: &[],
             created_by: None,
@@ -3466,7 +3530,7 @@ mod tests {
             prompt: "work".into(),
             workspace: None,
             model: None,
-            reasoning: None,
+            effort: None,
             delivery: None,
             expected_turn: None,
             from: None,
@@ -3538,7 +3602,7 @@ mod tests {
                                 family: Family::Responses,
                                 model: "synthetic",
                                 instructions: "",
-                                reasoning: None,
+                                effort: None,
                                 budget_tokens: None,
                                 tools: &[],
                                 created_by: None,
@@ -3735,7 +3799,7 @@ mod tests {
         rusqlite::Connection::open(&path)
             .unwrap()
             .execute(
-                "UPDATE bots SET settings='{\"retain_turns\":1}' WHERE name='Bob'",
+                "UPDATE bots SET settings='{\"keep_turns\":1}' WHERE name='Bob'",
                 [],
             )
             .unwrap();
@@ -3831,7 +3895,7 @@ mod tests {
                         family: Family::Responses,
                         model: "synthetic",
                         instructions: "",
-                        reasoning: None,
+                        effort: None,
                         budget_tokens: None,
                         tools: &[],
                         created_by: None,
@@ -3917,7 +3981,7 @@ mod tests {
                         family: Family::Responses,
                         model: "synthetic",
                         instructions: "",
-                        reasoning: None,
+                        effort: None,
                         budget_tokens: None,
                         tools: &[],
                         created_by: None,
@@ -4158,7 +4222,7 @@ mod tests {
             workspace: Some(workspace.to_str().unwrap().into()),
             model: Some("openai/synthetic".into()),
             instructions: Some(String::new()),
-            reasoning: None,
+            effort: None,
             budget_tokens: None,
             tools: Some(Vec::new()),
             created_by: None,
@@ -4297,7 +4361,7 @@ mod tests {
             (&first["duplicate"], &again["duplicate"]),
             (&json!(false), &json!(true))
         );
-        assert_eq!(first["id"], again["id"]);
+        assert_eq!((&first["bot_id"], &again["bot_id"]), (&json!(1), &json!(1)));
         let events = store.call(|db| db.events("A", 0, 10)).await.unwrap();
         assert_eq!(
             events["events"].as_array().unwrap().len(),
@@ -4700,7 +4764,7 @@ mod tests {
         if let Command::Create {
             model,
             instructions,
-            reasoning,
+            effort,
             compaction_instructions,
             compaction_model,
             ..
@@ -4708,7 +4772,7 @@ mod tests {
         {
             *model = Some(format!("openai/{}", "\u{1}".repeat(256)));
             *instructions = Some(awkward.clone());
-            *reasoning = Some("high".into());
+            *effort = Some("high".into());
             *compaction_instructions = Some(awkward);
             *compaction_model = Some("openai/synthetic".into());
         }
@@ -4732,11 +4796,11 @@ mod tests {
                             family: Family::Responses,
                             model: "synthetic",
                             instructions: "",
-                            reasoning: None,
+                            effort: None,
                             budget_tokens: None,
                             tools: &tools,
                             created_by: creator.as_ref().map(|c| c.name.as_str()),
-                            created_by_id: creator.as_ref().map(|c| c.id),
+                            created_by_id: creator.as_ref().map(|c| c.bot_id),
                             compaction_instructions: None,
                             compaction_model: None,
                             fallbacks: false,
@@ -4763,7 +4827,7 @@ mod tests {
             *workspace = None;
             *tools = Some(vec!["echo".into()]);
             *created_by = Some(parent.name);
-            *created_by_id = Some(parent.id);
+            *created_by_id = Some(parent.bot_id);
         }
         for command in [create, submit("Bot", "r1"), child] {
             let bound = admission_bound(&command, &id, 1);
@@ -5011,7 +5075,7 @@ mod tests {
                         family: Family::Responses,
                         model: "synthetic",
                         instructions: "",
-                        reasoning: None,
+                        effort: None,
                         budget_tokens: None,
                         tools: &tools,
                         created_by: None,

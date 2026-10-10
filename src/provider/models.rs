@@ -117,10 +117,18 @@ impl Provider {
     fn models_url(&self) -> reqwest::Url {
         // The listing sits beside the completion route: `.../v1/models`,
         // except on Bedrock Mantle, which lists every family at the host's
-        // `/v1/models` (docs/BEDROCK.md).
+        // `/v1/models`, and Bedrock runtime, whose models are the inference
+        // profiles the control plane in its region lists, signed under the
+        // same name (docs/BEDROCK.md).
         let mut url = self.url.clone();
         let base = match aws::endpoint(&url) {
             Some((_, "bedrock-mantle")) => "/v1".to_owned(),
+            Some((region, "bedrock")) => {
+                let _ = url.set_host(Some(&format!("bedrock.{region}.amazonaws.com")));
+                url.set_path("/inference-profiles");
+                url.set_query(Some("maxResults=1000&typeEquals=SYSTEM_DEFINED"));
+                return url;
+            }
             _ => url
                 .path()
                 .rsplit_once('/')
@@ -146,42 +154,53 @@ impl Provider {
         let mut room = LIMIT;
         let mut entries = Vec::new();
         let mut after: Option<String> = None;
+        let runtime = matches!(aws::endpoint(&self.url), Some((_, "bedrock")));
         for _ in 0..PAGES {
             let mut url = self.models_url();
             if let Some(after) = &after {
-                url.query_pairs_mut().append_pair("after_id", after);
+                let name = if runtime { "nextToken" } else { "after_id" };
+                url.query_pairs_mut().append_pair(name, after);
             }
             let mut page = self.fetch_page(session, url, &mut room).await?;
             let listed = match (page["data"].is_array(), page["models"].is_array()) {
                 (true, _) => page["data"].take(),
                 (false, true) => page["models"].take(),
+                _ if runtime && page["inferenceProfileSummaries"].is_array() => {
+                    profiles(page["inferenceProfileSummaries"].take())
+                }
                 _ => return Err(Error::with("invalid_provider_response", "model listing")),
             };
             if let Value::Array(listed) = listed {
                 entries.extend(listed);
             }
-            if page["has_more"] != true {
+            // Anthropic pages with `has_more` and `last_id`, AWS with
+            // `nextToken`.
+            let next = match page["has_more"] == true {
+                true => Some(page["last_id"].as_str()),
+                false => page["nextToken"].as_str().map(Some),
+            };
+            if next.is_none() {
                 let mut models = parse(&json!({"data": entries}))?;
                 // Mantle lists every family at one address; offer only those
                 // this binding's wire format runs.
                 if self.url.host_str() == Some("api.openai.com") {
                     models.retain(|model| model["id"].as_str().is_some_and(openai_text));
                 }
-                if matches!(aws::endpoint(&self.url), Some((_, "bedrock-mantle"))) {
+                if let Some((_, service)) = aws::endpoint(&self.url) {
                     models.retain(|model| {
                         model["id"]
                             .as_str()
-                            .is_some_and(|id| mantle_runs(self.family, id))
+                            .is_some_and(|id| bedrock_runs(service, self.family, id))
                     });
                 }
                 return Ok(models);
             }
-            match page["last_id"].as_str() {
+            match next.flatten() {
                 Some(last) if after.as_deref() != Some(last) => after = Some(last.to_owned()),
                 _ => {
                     return Err(Error::with(
                         "invalid_provider_response",
-                        "model listing has more pages but no new last_id",
+                        "model listing has more pages but no new page token",
                     ));
                 }
             }
@@ -201,7 +220,11 @@ impl Provider {
         let (client, _lease) = self.transport.lease();
         let key = session.map(|s| &s.token).or(self.key.as_ref());
         let mut http = client.get(url.clone()).header("accept", "application/json");
+        // The Bedrock control plane takes a Bedrock API key as a bearer
+        // token, whichever family the runtime binding speaks.
+        let control = matches!(aws::endpoint(&self.url), Some((_, "bedrock")));
         http = match (self.family, key) {
+            (_, Some(key)) if control => http.bearer_auth(key),
             (Family::Responses, Some(key)) => http.bearer_auth(key),
             (Family::Anthropic, key) => {
                 let http = http.header("anthropic-version", "2023-06-01");
@@ -283,22 +306,47 @@ fn openai_text(id: &str) -> bool {
     !NOT_TEXT.iter().any(|family| base.contains(family))
 }
 
-/// Whether a Mantle model id is one of the family its binding speaks:
+/// Whether a Bedrock model id is one of the family its binding speaks:
 /// Anthropic's models (`anthropic.`, perhaps under a routing prefix such as
-/// `global.`) on the Messages route, everything else on Responses.
+/// `global.`) on the Messages route; on Responses, every other Mantle model
+/// and runtime's OpenAI ones, the only family its Responses route serves.
 ///
 /// gpt-oss is listed but refused on the Responses route ("does not support
 /// the '/openai/v1/responses' API", docs/BEDROCK.md), so it is offered on
 /// neither.
-fn mantle_runs(family: Family, id: &str) -> bool {
+fn bedrock_runs(service: &str, family: Family, id: &str) -> bool {
+    let vendor = |name: &str| id.split('.').any(|part| part == name);
     !id.contains("gpt-oss")
-        && id.split('.').any(|part| part == "anthropic") == (family == Family::Anthropic)
+        && match family {
+            Family::Anthropic => vendor("anthropic"),
+            Family::Responses => !vendor("anthropic") && (service != "bedrock" || vendor("openai")),
+        }
+}
+
+/// The active system-defined inference profiles of a control-plane page,
+/// as listing entries: the id is what a runtime call names as its model.
+fn profiles(summaries: Value) -> Value {
+    let Value::Array(summaries) = summaries else {
+        return Value::Array(Vec::new());
+    };
+    summaries
+        .into_iter()
+        .filter(|profile| profile["status"].as_str().is_none_or(|s| s == "ACTIVE"))
+        .filter_map(|profile| {
+            Some(json!({
+                "id": profile["inferenceProfileId"].as_str()?,
+                "name": profile["inferenceProfileName"],
+                "created": profile["createdAt"],
+            }))
+        })
+        .collect()
 }
 
 /// The shapes providers answer with: `data` (OpenAI, Anthropic, OpenRouter,
 /// Bedrock Mantle) or `models` (the ChatGPT Codex backend, whose `hide` and
-/// `none` entries its own picker leaves out too). Newest first where the
-/// provider dates them, since OpenAI's order is arbitrary.
+/// `none` entries its own picker leaves out too), with Bedrock runtime's
+/// inference profiles read into the same entries by [`profiles`]. Newest
+/// first where the provider dates them, since OpenAI's order is arbitrary.
 fn parse(listed: &Value) -> Result<Vec<Value>> {
     let number = |entry: &Value, keys: &[&str]| {
         keys.iter()
@@ -310,7 +358,11 @@ fn parse(listed: &Value) -> Result<Vec<Value>> {
         _ => return Err(Error::with("invalid_provider_response", "model listing")),
     };
     let mut entries: Vec<&Value> = entries.iter().collect();
-    entries.sort_by_key(|entry| std::cmp::Reverse(entry["created"].as_i64().unwrap_or(i64::MIN)));
+    // Seconds from OpenAI and Anthropic, RFC 3339 text from AWS.
+    entries.sort_by_key(|entry| {
+        let created = &entry["created"];
+        std::cmp::Reverse((created.as_i64().unwrap_or(i64::MIN), created.as_str()))
+    });
     Ok(entries
         .into_iter()
         .filter(|entry| entry["visibility"].as_str().is_none_or(|v| v == "list"))
@@ -472,18 +524,51 @@ mod tests {
     }
 
     #[test]
-    fn mantle_offers_each_binding_only_its_own_family() {
-        use super::mantle_runs;
-        assert!(mantle_runs(Family::Anthropic, "anthropic.claude-sonnet-5"));
-        assert!(mantle_runs(
+    fn bedrock_offers_each_binding_only_its_own_family() {
+        use super::bedrock_runs;
+        let mantle = |family, id| bedrock_runs("bedrock-mantle", family, id);
+        assert!(mantle(Family::Anthropic, "anthropic.claude-sonnet-5"));
+        assert!(mantle(
             Family::Anthropic,
             "global.anthropic.claude-sonnet-5"
         ));
-        assert!(!mantle_runs(Family::Anthropic, "openai.gpt-6-luna"));
-        assert!(mantle_runs(Family::Responses, "openai.gpt-6-luna"));
-        assert!(!mantle_runs(Family::Responses, "anthropic.claude-sonnet-5"));
-        assert!(!mantle_runs(Family::Responses, "openai.gpt-oss-20b"));
-        assert!(!mantle_runs(Family::Anthropic, "openai.gpt-oss-120b"));
+        assert!(!mantle(Family::Anthropic, "openai.gpt-6-luna"));
+        assert!(mantle(Family::Responses, "openai.gpt-6-luna"));
+        assert!(mantle(Family::Responses, "qwen.qwen3-coder-480b"));
+        assert!(!mantle(Family::Responses, "anthropic.claude-sonnet-5"));
+        assert!(!mantle(Family::Responses, "openai.gpt-oss-20b"));
+        assert!(!mantle(Family::Anthropic, "openai.gpt-oss-120b"));
+        // Runtime's Responses route serves OpenAI's models only.
+        let runtime = |family, id| bedrock_runs("bedrock", family, id);
+        assert!(runtime(
+            Family::Anthropic,
+            "global.anthropic.claude-opus-5-5"
+        ));
+        assert!(runtime(Family::Responses, "us.openai.gpt-6-luna"));
+        assert!(!runtime(
+            Family::Responses,
+            "us.meta.llama4-maverick-17b-instruct-v1:0"
+        ));
+        assert!(!runtime(Family::Anthropic, "global.openai.gpt-6-luna"));
+    }
+
+    #[test]
+    fn runtime_lists_its_active_inference_profiles_newest_first() {
+        use super::profiles;
+        let page = json!([
+            {"inferenceProfileId": "global.anthropic.claude-sonnet-5", "inferenceProfileName": "Global Claude Sonnet 5", "status": "ACTIVE", "createdAt": "2026-06-01T00:00:00Z"},
+            {"inferenceProfileId": "global.anthropic.claude-opus-5-5", "inferenceProfileName": "Global Claude Opus 5.5", "status": "ACTIVE", "createdAt": "2026-09-01T00:00:00Z"},
+            {"inferenceProfileId": "us.anthropic.claude-old", "status": "INACTIVE"},
+            {"inferenceProfileName": "no id"}
+        ]);
+        let models = parse(&json!({"data": profiles(page)})).unwrap();
+        assert_eq!(
+            models,
+            [
+                json!({"id": "global.anthropic.claude-opus-5-5", "name": "Global Claude Opus 5.5"}),
+                json!({"id": "global.anthropic.claude-sonnet-5", "name": "Global Claude Sonnet 5"}),
+            ]
+        );
     }
 
     #[test]
@@ -535,6 +620,11 @@ mod tests {
             assert_eq!(
                 url(family, &mantle).split('?').next().unwrap(),
                 "https://bedrock-mantle.us-east-1.api.aws/v1/models"
+            );
+            let runtime = format!("https://bedrock-runtime.us-west-2.amazonaws.com/{route}/v1");
+            assert_eq!(
+                url(family, &runtime),
+                "https://bedrock.us-west-2.amazonaws.com/inference-profiles?maxResults=1000&typeEquals=SYSTEM_DEFINED"
             );
         }
     }

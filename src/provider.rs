@@ -897,6 +897,11 @@ impl Provider {
             },
         );
         match key {
+            // Runtime takes a Bedrock API key as a bearer token, as AWS
+            // documents for its calls; Mantle takes Anthropic's header.
+            Some(key) if matches!(aws::endpoint(&self.url), Some((_, "bedrock"))) => {
+                http.bearer_auth(key)
+            }
             Some(key) => http.header("x-api-key", key),
             None => http,
         }
@@ -2341,6 +2346,40 @@ mod tests {
                 route(Family::Responses, format!("{host}/openai/v1")),
                 format!("{host}/openai/v1/responses")
             );
+        }
+    }
+
+    /// A Bedrock API key goes as a bearer token to runtime and in
+    /// Anthropic's own header everywhere else.
+    #[test]
+    fn bedrock_api_keys_go_the_way_each_endpoint_takes_them() {
+        let transport = Transport::new(64, 1).unwrap();
+        let key = "k".to_owned();
+        for (base, header, value) in [
+            (
+                "https://bedrock-runtime.us-east-1.amazonaws.com/anthropic/v1",
+                "authorization",
+                "Bearer k",
+            ),
+            (
+                "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1",
+                "x-api-key",
+                "k",
+            ),
+            ("https://api.anthropic.com/v1", "x-api-key", "k"),
+        ] {
+            let provider = Provider::new(
+                transport.clone(),
+                Family::Anthropic,
+                base,
+                Some(key.clone()),
+            )
+            .unwrap();
+            let request = provider
+                .anthropic_headers(reqwest::Client::new().post(base), Some(&key), false)
+                .build()
+                .unwrap();
+            assert_eq!(request.headers()[header], value, "{base}");
         }
     }
 

@@ -19,7 +19,7 @@ class CaskTest(unittest.TestCase):
         self.assertIn('  binary "#{appdir}/Agent.app/Contents/MacOS/agent"\n', cask)
         # The bundled daemon is stopped before its binary goes.
         self.assertIn('Agent.app/Contents/MacOS/agent",', cask)
-        self.assertIn('args:         ["shutdown", "--store", "#{Dir.home}/.agent/state.sqlite", "--grace", "30"]', cask)
+        self.assertIn('args:         ["shutdown", "--store", "#{Dir.home}/.agent/state.sqlite", "--grace", "30s"]', cask)
         # What a start writes is there at install; skill links go with the app.
         self.assertIn('Agent.app/Contents/MacOS/agent-app",\n                   args:         ["--setup"]', cask)
         self.assertIn('args:         ["--unlink-skills"]', cask)

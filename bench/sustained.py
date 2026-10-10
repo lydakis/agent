@@ -37,7 +37,7 @@ def percentile(values, p):
     return ordered[min(len(ordered) - 1, max(0, int(len(ordered) * p) - 1))]
 
 
-def run(agent, out, bots, minutes, model, context_items, window_seconds, retain_turns=None):
+def run(agent, out, bots, minutes, model, context_items, window_seconds, keep_turns=None):
     store = out / 'state.sqlite'
     workspace = out / 'workspace'
     workspace.mkdir(parents=True)
@@ -49,10 +49,10 @@ def run(agent, out, bots, minutes, model, context_items, window_seconds, retain_
     client = Client(agent, store, url, 'shell,read,write,edit,wait', model=name, key_env=key_env,
                     env=os.environ.copy(), provider=provider, family=family,
                     settings={'context_items': context_items,
-                              **({'retain_turns': retain_turns} if retain_turns else {})})
+                              **({'keep_turns': keep_turns} if keep_turns else {})})
     daemon = psutil.Process(client.process.pid)
     for index in range(bots):
-        client.request('create', bot=f'b{index}', workspace=str(workspace), reasoning='low')
+        client.request('create', bot=f'b{index}', workspace=str(workspace), effort='low')
     started = time.monotonic()
     deadline = started + minutes * 60
     submitted_at, sequence = {}, {}
@@ -143,7 +143,7 @@ def run(agent, out, bots, minutes, model, context_items, window_seconds, retain_
         for code, count in window['failed'].items():
             failed_by_code[code] = failed_by_code.get(code, 0) + count
     return dict(schema='sustained_v1', created_at=datetime.now(timezone.utc).isoformat(), model=model, bots=bots,
-                minutes=minutes, context_items=context_items, retain_turns=retain_turns, prompt=PROMPT,
+                minutes=minutes, context_items=context_items, keep_turns=keep_turns, prompt=PROMPT,
                 binary_sha256=file_hash(agent),
                 elapsed_seconds=round(elapsed, 1), window_seconds=window_seconds, windows=windows,
                 failed_by_code=failed_by_code, totals=totals, samples=samples,
@@ -159,7 +159,7 @@ def main():
     parser.add_argument('--model', required=True)
     parser.add_argument('--context-items', type=int, default=8)
     parser.add_argument('--window-seconds', type=int, default=30)
-    parser.add_argument('--retain-turns', type=int, default=None, help="each bot's retention; none by default")
+    parser.add_argument('--keep-turns', type=int, default=None, help="each bot's retention; none by default")
     args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
     out = args.out.resolve()
@@ -168,7 +168,7 @@ def main():
     if not (1 <= args.bots <= 1024) or not (0.1 <= args.minutes <= 60):
         parser.error('--bots must be 1 to 1024 and --minutes 0.1 to 60')
     result = run(args.binary.resolve(), out, args.bots, args.minutes, args.model, args.context_items,
-                 args.window_seconds, args.retain_turns)
+                 args.window_seconds, args.keep_turns)
     (out / 'result.json').write_text(json.dumps(result, indent=2))
     print(json.dumps({k: v for k, v in result.items() if k not in ('windows', 'samples')}))
     return 0 if not result['failed_by_code'] else 1

@@ -26,7 +26,7 @@ class DeliveryTests(ModelFixture):
         self.model.all_streaming = threading.Event()
         self.model.all_streaming.set()
         self.addCleanup(self.model.release_headers.set)
-        client = self.client(extra=('--max-active', '1'), settings={'retain_turns': 1})
+        client = self.client(extra=('--max-active', '1'), settings={'keep_turns': 1})
         for bot in ('Alice', 'Bob'):
             client.request('create', bot=bot, workspace=str(self.path))
         first = client.request('submit', bot='Alice', request_id='a', prompt='gate')['result']['turn']
@@ -203,7 +203,7 @@ class DeliveryTests(ModelFixture):
         self.assertEqual(poll(client, 'Bob', successor)['result']['text'], 'reply:successor')
 
     def test_retention_preserves_completion_with_queued_and_steered_work(self):
-        client = self.client(settings={'retain_turns': 1})
+        client = self.client(settings={'keep_turns': 1})
         client.request('create', bot='Bob', workspace=str(self.path))
         first = client.request('submit', bot='Bob', request_id='a', prompt='slow')['result']['turn']
         successor = client.request('submit', bot='Bob', request_id='b', prompt='next',
