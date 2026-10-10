@@ -493,7 +493,7 @@ pub struct Local {
     pub minute: u8,
 }
 
-fn local(epoch: i64) -> Local {
+pub(crate) fn local(epoch: i64) -> Local {
     // SAFETY: localtime_r fills the zeroed struct it is given and nothing else.
     let tm = unsafe {
         let mut tm: libc::tm = std::mem::zeroed();
@@ -1183,7 +1183,7 @@ fn replace(path: &Path, text: &str) -> Result<(), String> {
 
 /// `replace` with the file's mode set from creation, so the new name never
 /// has any other.
-fn replace_mode(path: &Path, text: &[u8], mode: u32) -> Result<(), String> {
+pub(crate) fn replace_mode(path: &Path, text: &[u8], mode: u32) -> Result<(), String> {
     use std::os::unix::fs::OpenOptionsExt;
     let dir = path.parent().ok_or("no folder")?;
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;

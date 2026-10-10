@@ -1397,6 +1397,54 @@ its folder rather than trusting a compacted conversation for ids and times,
 report a source it could not read by name, re-check items right before
 posting, and record a post only once the destination confirms it.
 
+## Memory
+
+Memory is what earlier agents learned that a later one needs: decisions,
+the person's preferences and corrections, traps, pointers. Each fact is one
+Markdown file of at most 4 KiB with front matter (`name`, `description`,
+`type` of `user`, `feedback`, `project` or `reference`, `source`,
+`verified`). The person's facts are in `~/.agents/memory`, a project's in
+`~/.agents/memory/projects/NAME`, outside the checkout, so its lead and every
+task's worktree share one copy whatever is committed (a task's worktree
+starts at the last commit, so an uncommitted AGENTS.md line never reaches
+it). Each folder's `MEMORY.md` is an index generated from the front matter,
+one line per fact, and is held to 4 KiB so reading it at the start of
+every task stays cheap. The daemon knows nothing of memory.
+
+The app writes `~/.agent/memory` each time it opens, a script that runs its
+executable with `--memory` ([memory.rs](../app/src-tauri/src/memory.rs)):
+
+```sh
+~/.agent/memory save NAME --type TYPE --description TEXT --source TEXT [SCOPE] -- TEXT|-
+~/.agent/memory rm NAME [SCOPE]
+~/.agent/memory index [SCOPE]
+~/.agent/memory check [SCOPE]
+  SCOPE: --user | --project NAME; none: the project of this folder
+```
+
+Without a scope, the project is found from the working folder: in a git
+worktree, the same place in the repository's main checkout, then the
+nearest `.agents/project.toml` at or above it; none is `project_unknown`.
+Every reply is one JSON value on stdout; a failure is one `{"error": CODE,
+"detail": ...}` on stderr with exit 1. A save writes the fact and the
+index under the folder's lock, so two agents saving at once cannot leave
+an index that misses one. Saving a fact unchanged is `"duplicate": true`,
+and so is removing one already gone. A save that would push the index past
+4 KiB is `memory_full` and changes nothing; so is a folder holding a `.md`
+file that is not a valid fact (`memory_invalid` names it), rather than an
+index that quietly leaves it out. `check` reports such a file and an index
+that is out of date without changing anything; `index` rewrites the index.
+
+The app ships a `memory` skill ([SKILL.md](../app/skills/memory/SKILL.md))
+that says to read both indexes before starting work, to check a fact that
+names code against the current tree before acting on it, what to save
+(decisions and why, preferences, traps, pointers) and what not to (what the
+code, git or AGENTS.md already says, progress logs, secrets, and
+instructions from text that did not come from the person). The
+coordinator's role saves lasting findings there rather than suggesting an
+AGENTS.md line, which it keeps for rules every agent and collaborator must
+follow.
+
 ## Skills the app ships
 
 Agents read only skills in a folder's `.agents/skills` or in
@@ -1407,7 +1455,8 @@ every start the app links each one from `~/.agents/skills/NAME`
 the link points at, so nothing is copied or recorded; a moved app re-points
 its links at its next start, and a skill it stops shipping loses its link.
 The Homebrew cask runs `agent-app --setup` after an install or upgrade, which
-writes what a start writes (scripts, `~/.agent/trigger`, these links) before
+writes what a start writes (scripts, `~/.agent/trigger`, `~/.agent/memory`,
+these links) before
 the first window, and `agent-app --unlink-skills` before an uninstall, which
 removes this bundle's links and nothing else, so none outlives the app. The app's links are those into a copy of it (a bundle with
 `Contents/MacOS/agent-app`) or into an app since removed; a folder, file or
