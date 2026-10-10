@@ -17,6 +17,11 @@ import sqlite3
 import sys
 from pathlib import Path
 
+# Clauses a listing formats in by name, each planned with every value it
+# takes: keep in step with `list` and `turns` in src/store/db.rs.
+OPTIONAL = {'{glob}': ('', ' AND name GLOB ?3'), '{running}': ('', ' AND running_turn IS NOT NULL'),
+            '{order}': ('ASC', 'DESC')}
+
 STRUCTURAL_SCANS = {'SCAN CONSTANT ROW', 'SCAN c', 'SCAN chain', 'SCAN sqlite_master',
                     'SCAN sqlite_sequence'}
 
@@ -40,7 +45,11 @@ def statements(source):
             if table is not None:
                 variant = variant.replace('{table}', table).replace('{key}', 'turn')
                 variant = variant.replace('{finished}', "AND status!='running'" if table == 'processes' else '')
-            yield re.sub(r'\s+', ' ', variant).strip()
+            variants = [variant]
+            for placeholder, values in OPTIONAL.items():
+                variants = [v.replace(placeholder, value) for v in variants for value in values]
+            for variant in dict.fromkeys(variants):
+                yield re.sub(r'\s+', ' ', variant).strip()
 
 
 def main():
