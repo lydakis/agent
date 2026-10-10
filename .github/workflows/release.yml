@@ -225,6 +225,8 @@ jobs:
           done
           test "$("$app/Contents/MacOS/agent" --version)" = "agent-runtime ${version}"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")" = "$version"
+          # The app links these from ~/.agents/skills.
+          test -f "$app/Contents/Resources/skills/automation/SKILL.md"
           mkdir dist
           archive="dist/Agent_${version}_universal.zip"
           ditto -c -k --sequesterRsrc --keepParent "$app" "$archive"

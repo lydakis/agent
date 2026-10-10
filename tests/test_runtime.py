@@ -1815,14 +1815,23 @@ class RuntimeTests(ModelFixture):
 
     def test_large_deletions_run_in_pieces_and_refuse_work_meanwhile(self):
         client = self.client('echo,shell')
-        for bot in ('Big', 'Other'):
-            client.request('create', bot=bot, workspace=str(self.path))
+        big = [client.request('create', bot=bot, workspace=str(self.path))['result'] for bot in ('Big', 'Other')][0]
         for n in range(40):
             turn = client.request('submit', bot='Big', request_id=str(n), prompt='shell:printf big')['result']['turn']
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         before = client.request('stats')['result']['store']['operations'].get('delete_bot', {}).get('count', 0)
-        freed = client.request('delete', bot='Big')['result']
-        self.assertEqual(freed['turns'], 40)
+        # A delete resent while the first still runs succeeds beside it; the
+        # pieces each one took add up to the bot.
+        sent = []
+        for _ in range(2):
+            client.next_id += 1
+            sent.append(client.next_id)
+            client.process.stdin.write(json.dumps({'id': client.next_id, 'op': 'delete', 'bot': 'Big',
+                                                   'bot_id': big['id']}) + '\n')
+        client.process.stdin.flush()
+        freed = [client.receive(lambda m, i=i: m.get('id') == i)['result'] for i in sent]
+        self.assertEqual(sorted(f['duplicate'] for f in freed), [False, True])
+        self.assertEqual(sum(f['turns'] for f in freed), 40)
         after = client.request('stats')['result']['store']['operations']['delete_bot']['count']
         # 40 turns of records in pieces of 16, then the turn rows, then nodes, then the bot.
         self.assertGreaterEqual(after - before, 5)
