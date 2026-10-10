@@ -1276,10 +1276,13 @@ executable with `--trigger`:
 `changed --except BOT` is a check for `--if`: it pages the daemon's
 `bots` (256 a page), hashes each agent's name, id, newest message and
 status other than BOT's, and compares the digest with the one it kept in
-`~/.agent/triggers/.changed.BOT`. It prints `{"changed": true}` and exits
-0 when they differ, or `{"changed": false}` and exits 1; the first check,
-and one with no daemon running, only take note. BOT's own turns are not
-news to it, so a heartbeat into BOT does not wake itself.
+`~/.agent/triggers/.changed.BOT.STORE` (one per store). It prints
+`{"changed": true}` and exits 0 when they differ, or `{"changed": false}`
+and exits 1; the first check only takes note, and one with no daemon
+running says nothing changed. BOT's own turns are not news to it, so a
+heartbeat into BOT does not wake itself. While BOT is busy the check says
+nothing changed and keeps the old digest, so news that BOT could not take
+then waits for the next tick instead of being skipped.
 
 Every reply is one JSON value on stdout; a failure is one
 `{"error": CODE, "detail": ...}` on stderr with exit 1.

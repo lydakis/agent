@@ -2558,7 +2558,10 @@ function triggerArgs(f) {
 // Run from the agent's folder: a relative path, a commit's repository and a check are its.
 async function addTrigger(f) {
   const b = bot(f.bot); if (!b) throw new Error(`bot_not_found: ${f.bot}`);
-  const row = await Daemon.addTrigger(b.workspace, triggerArgs(f));
+  // An agent with no folder of its own works in the window's.
+  const dir = b.workspace ?? S.config?.workspace;
+  if (!dir) throw new Error(`no_folder: ${f.bot} has no folder to run the trigger in`);
+  const row = await Daemon.addTrigger(dir, triggerArgs(f));
   readTriggers();
   return row;
 }

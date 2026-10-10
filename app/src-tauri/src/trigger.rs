@@ -2207,7 +2207,9 @@ fn changed_at(places: &Places, except: &str, socket: &Path) -> Result<bool, Stri
         let Ok((client, _events)) = Client::connect(socket).await else {
             return Ok(None);
         };
-        let mut hash = Fnv::new(client.store().unwrap_or_default());
+        let store = client.store().unwrap_or_default().to_owned();
+        let mut hash = Fnv::new(&store);
+        let mut busy = false;
         let mut after = Value::Null;
         let read = loop {
             let page = match client
@@ -2218,7 +2220,9 @@ fn changed_at(places: &Places, except: &str, socket: &Path) -> Result<bool, Stri
                 Err(e) => break Err(coded(e)),
             };
             for bot in page["bots"].as_array().into_iter().flatten() {
-                if bot["name"] != except {
+                if bot["name"] == except {
+                    busy = bot["status"] != "idle";
+                } else {
                     hash.add(&format!(
                         "{}|{}|{}|{}",
                         bot["name"], bot["bot_id"], bot["head"], bot["status"]
@@ -2227,16 +2231,23 @@ fn changed_at(places: &Places, except: &str, socket: &Path) -> Result<bool, Stri
             }
             after = page["next_after"].clone();
             if after.is_null() {
-                break Ok(Some(format!("{:016x}", hash.0)));
+                break Ok(Some((format!("{:016x}", hash.0), busy, store)));
             }
         };
         client.close().await;
         read
     })?;
-    let Some(now) = now else { return Ok(false) };
-    let seen = places.state.join(format!(".changed.{except}"));
+    let Some((now, busy, store)) = now else {
+        return Ok(false);
+    };
+    // One note per store: two daemons' fleets never read as each other's.
+    let seen = places
+        .state
+        .join(format!(".changed.{except}.{:016x}", Fnv::new(&store).0));
     let before = std::fs::read_to_string(&seen).ok();
-    if before.as_deref() == Some(now.as_str()) {
+    // A busy agent would skip this wake, so the change stays unseen until
+    // a tick can deliver it.
+    if busy || before.as_deref() == Some(now.as_str()) {
         return Ok(false);
     }
     std::fs::create_dir_all(&places.state).map_err(|e| e.to_string())?;
@@ -3767,7 +3778,7 @@ mod tests {
         let socket = w.root.join("f.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         // The fleet each connection sees: home, and one task on two pages.
-        let fleet = std::sync::Arc::new(std::sync::Mutex::new((1, 1, "idle")));
+        let fleet = std::sync::Arc::new(std::sync::Mutex::new((1, 1, "idle", "idle")));
         let kept = fleet.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
@@ -3778,9 +3789,9 @@ mod tests {
                 for line in reader.lines() {
                     let Ok(line) = line else { break };
                     let request: Value = serde_json::from_str(&line).unwrap();
-                    let (home, task, status) = *kept.lock().unwrap();
+                    let (home, task, status, at_home) = *kept.lock().unwrap();
                     let result = if request["after"].is_null() {
-                        json!({"bots": [{"name": "home", "bot_id": 1, "head": home, "status": "idle"}], "next_after": "home"})
+                        json!({"bots": [{"name": "home", "bot_id": 1, "head": home, "status": at_home}], "next_after": "home"})
                     } else {
                         json!({"bots": [{"name": "p.task", "bot_id": 2, "head": task, "status": status}], "next_after": null})
                     };
@@ -3803,6 +3814,12 @@ mod tests {
         assert!(!changed(), "once");
         fleet.lock().unwrap().2 = "waiting";
         assert!(changed(), "so is another status");
+        // Home busy at a tick would skip the wake: the news waits for it.
+        fleet.lock().unwrap().1 = 3;
+        fleet.lock().unwrap().3 = "running";
+        assert!(!changed());
+        fleet.lock().unwrap().3 = "idle";
+        assert!(changed(), "once Home can take it");
         // No daemon: nothing to tell, and the last digest stays.
         assert!(!changed_at(&w.places, "home", &w.root.join("none.sock")).unwrap());
         assert!(!changed());
