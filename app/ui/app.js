@@ -2312,7 +2312,7 @@ async function pick(r) {
 }
 // A pick opens its bot in a tab, so focus goes to the main composer; Escape goes back where it was.
 // A closed finder lets its listing go.
-function closePicker(pane = pickerPane) { S.ui.picker = false; S.ui.found = null; $('pickerwrap').classList.remove('on'); render(); $(PANE[S.ui.side ? pane : 'main'].input).focus(); }
+function closePicker(pane = pickerPane) { S.ui.picker = false; S.ui.found = null; $('pickerwrap').classList.remove('on'); render(); focusInput(S.ui.side ? pane : 'main'); }
 let helpPane = 'main';
 async function showHelp(pane = 'main') {
   helpPane = pane;
@@ -2975,7 +2975,11 @@ async function nextBeside() {
   const next = ps[(ps.indexOf(S.ui.side) + 1) % ps.length]; if (next !== S.ui.side) await go(next, 'beside');
 }
 // Late, after a load: by then the finder or a sheet may have opened, and it keeps the keyboard.
-function focusInput(pane) { const el = $(PANE[pane].input); if (el) setTimeout(() => { if (!covered()) el.focus({ preventScroll: true }); }, 0); }
+// A file tab has no composer, so the keyboard goes to its tab.
+function focusInput(pane) {
+  const el = pane === 'main' && fileOf(S.selected) != null ? $('tabs').querySelector('.wtab.on') : $(PANE[pane].input);
+  if (el) setTimeout(() => { if (!covered()) el.focus({ preventScroll: true }); }, 0);
+}
 
 // ---------- input ----------
 function grow(el) { if (!el.style) return; el.style.height = 'auto'; el.style.height = `${Math.min(160, el.scrollHeight)}px`; }
@@ -3184,15 +3188,9 @@ function waitsForHighlight(el) {
 }
 Rich.onReady = () => { for (const [id] of PANES) if (!(id === 'side' && S.ui.file) && waitsForHighlight($(id))) $(id).dataset.key = ''; render(); };
 Rich.onFile = openFileFrom;
-// Escape in a preview: a file's beside closes it, as Escape does there; a file tab's, which has no
-// composer, gives the keyboard to its tab; a message's returns the keyboard to its pane, where the
-// next Escape does what it does.
-Rich.onEscape = (frame) => {
-  const side = frame.closest('.pane.side');
-  if (side && frame.closest('.pane.side .fview') && S.ui.file) closeFile();
-  else if (!side && fileOf(S.selected) != null) $('tabs').querySelector('.wtab.on')?.focus();
-  else focusInput(side && !S.ui.file ? 'side' : 'main');
-};
+// Escape in a preview: a file's beside closes it, as Escape does there; any other returns the
+// keyboard to its pane (a file tab's to the tab), where the next Escape does what it does.
+Rich.onEscape = (frame) => { if (frame.closest('.pane.side .fview') && S.ui.file) closeFile(); else focusInput(frame.closest('.pane.side') && !S.ui.file ? 'side' : 'main'); };
 Rich.onError = (text) => toast(text, 4000);
 
 // ---------- boot ----------

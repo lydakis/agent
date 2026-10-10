@@ -1567,9 +1567,10 @@ the pane ⌘P was pressed in: a file's folder, else the agent's or the swarm's. 
 ignore, and only what opens as a file: an index entry whose mode is a file or a
 symlink (not a submodule), a new file (not `nested/`, another repository
 inside), and not a tracked file deleted from the folder (`--deleted`). The top
-is named from the agent's folder (`--show-cdup`), so a file found through a
-symlinked folder has the path the agent's steps write, and a write refreshes its
-tab. At most 100,000 paths from 16 MiB of git's answer are read, name by name so git stops at
+is named from the agent's folder (`--show-cdup`) where that reaches git's own
+top, so a file found through a symlinked folder has the path the agent's steps
+write, and a write refreshes its tab; a link into a folder inside the repository
+uses git's top. At most 100,000 paths from 16 MiB of git's answer are read, name by name so git stops at
 either bound (a cut listing says so under every search, as typing cannot reach
 past it); a folder outside a repository says so, and a window on a host
 refuses, as for reading a file. It is listed once each time the finder opens

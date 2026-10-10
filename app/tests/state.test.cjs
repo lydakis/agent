@@ -517,8 +517,12 @@ test('⌘P pressed beside searches the side agent\'s repository, and Escape in a
   let focused = 0; const tabs = doc.getElementById('tabs'); tabs.querySelector = (s) => s === '.wtab.on' ? { focus() { focused++; } } : null;
   const win = {}, frame = { contentWindow: win, closest: () => null };
   doc.querySelectorAll = (s) => s === '.rc iframe' ? [frame] : []; doc.activeElement = frame;
-  p.context.window.listeners.message({ source: win, data: { rich: 'escape' } });
+  p.context.window.listeners.message({ source: win, data: { rich: 'escape' } }); await p.tick();
   assert.equal(focused, 1);
+  // So does closing the finder opened there.
+  p.openPicker('files'); await settle(); doc.activeElement = { closest: () => null };
+  await doc.getElementById('pickerq').listeners.keydown({ key: 'Escape', preventDefault() {} }); await p.tick();
+  assert.equal(focused, 2);
   assert.equal(doc.getElementById('newproj').hidden, false);
 });
 
@@ -531,7 +535,7 @@ test('⌘P from Home with no folder says what it searches', async () => {
 test('Escape in a preview the reader is in closes the file it shows', async () => {
   const p = page({ readFile: async () => new TextEncoder().encode('<button>x</button>') }), c = p.context, win = {};
   p.setRender(() => {}); await p.openFile('Bob', '/w/p.html');
-  const frame = { contentWindow: win, closest: (s) => s === '.pane.side .fview' || s === '.pane.side' ? {} : null };
+  const frame = { contentWindow: win, closest: (s) => s === '.pane.side .fview' ? {} : null };
   c.document.querySelectorAll = (s) => s === '.rc iframe' ? [frame] : [];
   // A page the reader is not in cannot close it.
   c.window.listeners.message({ source: win, data: { rich: 'escape' } });

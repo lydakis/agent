@@ -21,11 +21,11 @@ pub struct Listing {
 }
 
 pub fn list(dir: &Path) -> Result<Listing, String> {
-    // The top named from `dir` (`--show-cdup`, not `--show-toplevel`), so
-    // a path found is spelled as the agent's folder is, through any
-    // symlink, and matches the paths its steps write.
+    // The top named from `dir` where that reaches it (`--show-cdup`), so a
+    // path found is spelled as the agent's folder is, through a symlinked
+    // folder, and matches the paths its steps write; else git's own top.
     let up = git(dir)
-        .args(["rev-parse", "--show-cdup"])
+        .args(["rev-parse", "--show-toplevel", "--show-cdup"])
         .stderr(Stdio::null())
         .output()
         .map_err(|e| format!("git: {e}"))?;
@@ -35,11 +35,19 @@ pub fn list(dir: &Path) -> Result<Listing, String> {
             dir.display()
         ));
     }
+    let up = String::from_utf8_lossy(&up.stdout);
+    let mut lines = up.lines();
+    let real = lines.next().unwrap_or_default().to_owned();
     let mut top = dir.to_path_buf();
-    for _ in String::from_utf8_lossy(&up.stdout).matches("../") {
+    for _ in lines.next().unwrap_or_default().matches("../") {
         top.pop();
     }
-    let root = top.to_string_lossy().into_owned();
+    let same = std::fs::canonicalize(&top).ok() == std::fs::canonicalize(&real).ok();
+    let root = if same {
+        top.to_string_lossy().into_owned()
+    } else {
+        real
+    };
     // A tracked file deleted from the folder but not yet from the index
     // would open as "no such file", so it is left out.
     let deleted = answer(&root, &["ls-files", "-z", "--deleted"])?;
@@ -186,6 +194,18 @@ mod tests {
         std::os::unix::fs::symlink(&tmp, &link).unwrap();
         let listing = list(&link.join("src/deep")).unwrap();
         assert_eq!(listing.root, link.to_string_lossy());
+        // A link to a folder inside the repository cannot name its top, so
+        // git's own is used.
+        let deep = std::env::temp_dir().join(format!("agent-files-deep-{}", std::process::id()));
+        let _ = std::fs::remove_file(&deep);
+        std::os::unix::fs::symlink(tmp.join("src"), &deep).unwrap();
+        let inner = list(&deep.join("deep")).unwrap();
+        assert_eq!(
+            inner.root,
+            std::fs::canonicalize(&tmp).unwrap().to_string_lossy()
+        );
+        assert_eq!(inner.files.len(), 3);
+        let _ = std::fs::remove_file(&deep);
         let mut files = listing.files;
         files.sort();
         // Tracked, new and not ignored; the ignored build output, a
