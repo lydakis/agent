@@ -3202,53 +3202,26 @@ async function sideChat(name, text = '') {
 }
 async function remove(name) { await Daemon.request('delete', { bot: name }); }
 // A project in a folder: the folder's `.agents/project.toml` names it, or the folder's own name does,
-// and its coordinator is `<name>.lead` working there. An existing coordinator is opened, not made
-// twice, unless it works in another folder, and keeps the settings it was made with: they were told
-// it then and cannot be read back, so no file is written for it. The file is written only once the
-// daemon has accepted a coordinator the app makes, so a model it refuses is never saved, and it
-// records what that coordinator was told. A folder that is already a project keeps its settings, and
-// the window says the sheet's picks were not applied.
-// The app's own opinion of how a coordinator works is its `coordinator` profile: the folder's
-// `.agents/agents/coordinator.md`, the user's, or the one the app ships (app/agents/coordinator.md).
-// `threads` is what its threads run on and where they work: their model and effort, when not the lead's,
-// and whether all work in the project folder rather than their own worktrees. A folder's file keeps
-// its own. The coordinator is told them by `tasksRule`, after its role, so a role of one's own keeps them.
+// and its coordinator is `<name>.lead` working there. The app's core makes it (`project::create`), as
+// `~/.agent/project add` does for an agent: the coordinator in its `coordinator` role, told its tasks'
+// settings, then the folder's file once the daemon took the coordinator. An existing coordinator in
+// this folder is opened, not made twice, and keeps the settings it was made with; one in another
+// folder refuses the name. A folder that is already a project keeps its settings, and the window
+// says the sheet's picks were not applied. `threads` is what its threads run on and where they work.
 async function createProject(dir, picked = null, effort = null, threads = null) {
-  const info = await Daemon.project(dir);
-  const existing = bot(info.coordinator);
   // The sheet's thread settings are picks even at their defaults: "Own worktree" is shown as chosen.
   const asked = !!(picked || effort || threads);
-  if (existing) {
-    if (existing.workspace !== info.dir) throw new Error(`${info.coordinator} already belongs to ${existing.workspace ?? 'another folder'}`);
-    await go(info.coordinator);
-    if (asked) toast(`${info.coordinator} already exists and keeps the settings it was made with`, 5000);
-    return;
-  }
-  const policy = await Daemon.policy(info.dir, 'coordinator');
-  // A folder that already has a project file keeps its model and effort; a new one takes the model
-  // picked for it, else its coordinator profile's, and the effort picked beside it.
-  const kept = !!(info.file && info.model);
-  const model = kept ? info.model : picked || policy.model;
-  if (!model) throw new Error('model_required: choose a model');
-  const reasoning = (kept ? info.reasoning : effort) || null;
+  const made = await Daemon.createProject({ dir, model: picked, effort, threads });
   if (picked) try { localStorage.setItem('agent:model', picked); } catch (_) {}
   if (effort !== null) try { localStorage.setItem('agent:effort', effort); } catch (_) {}
-  const tasks = info.file ? { model: info.threads_model ?? null, reasoning: info.threads_reasoning ?? null, inProject: info.threads_in === 'project' } : threads;
+  if (!made.created) {
+    await go(made.coordinator);
+    if (asked) toast(`${made.coordinator} already exists and keeps the settings it was made with`, 5000);
+    return;
+  }
   const session = S.session;
-  const record = await Daemon.request('create', { bot: info.coordinator, workspace: info.dir, model, ...(reasoning ? { effort: reasoning } : {}), instructions: `${policy.instructions}\n\n${tasksRule(tasks)}`, compaction_instructions: policy.compaction_instructions, tools: policy.tools ?? S.config.tools });
-  await enqueue(() => { if (S.session === session) seat(record, session); });
-  if (!info.file) await Daemon.writeProject({ dir: info.dir, name: info.name, model, reasoning, threads });
-  await go(info.coordinator); toast(`project ${info.name} · ${policy.note}${info.file && asked ? ' · set up from its project file, not these picks' : ''}`);
-}
-// A project's task settings, said to its coordinator as the flags its starts take. The model is always
-// named, so a role a task starts in (--profile) cannot swap it: the one picked, else the lead's own,
-// which its shell holds as AGENT_MODEL (and its effort as AGENT_EFFORT).
-// A picked model goes in quoted, since a model id may hold characters a shell would act on.
-const shq = (v) => `'${String(v).replaceAll("'", `'\\''`)}'`;
-function tasksRule(t) {
-  const flags = t?.model ? `--model ${shq(t.model)}${t.reasoning ? ` --effort ${shq(t.reasoning)}` : ''}` : '--model "$AGENT_MODEL" ${AGENT_EFFORT:+--effort "$AGENT_EFFORT"}';
-  const where = t?.inProject ? 'Every task works in this folder, with no worktree of its own.' : 'When this folder is a git repository, a task that changes files works in its own worktree, so tasks do not collide.';
-  return `This project's tasks, as the person set them up: start every new task, in a role (--profile) or not, with ${flags}. ${where}`;
+  await enqueue(() => { if (S.session === session) seat(made.record, session); });
+  await go(made.coordinator); toast(`project ${made.project} · ${made.note}${made.from_file && asked ? ' · set up from its project file, not these picks' : ''}`);
 }
 function detach() { save(); Daemon.close(); }
 

@@ -856,16 +856,7 @@ pub fn view(root: &Path, project: Option<&str>) -> Value {
 /// `~/.agent/memory`, written again whenever the app starts from
 /// somewhere else.
 pub fn write_script(state: &Path, app: &Path) -> Result<(), String> {
-    let quote = |p: &Path| format!("'{}'", p.to_string_lossy().replace('\'', r"'\''"));
-    let usage = USAGE.replace('\n', "\n# ");
-    let text = format!("#!/bin/sh\n# {usage}\nexec {} {FLAG} \"$@\"\n", quote(app));
-    let path = state.join("memory");
-    use std::os::unix::fs::PermissionsExt;
-    let runnable = std::fs::metadata(&path).is_ok_and(|m| m.permissions().mode() & 0o777 == 0o755);
-    if runnable && std::fs::read_to_string(&path).is_ok_and(|have| have == text) {
-        return Ok(());
-    }
-    crate::trigger::replace_mode(&path, text.as_bytes(), 0o755)
+    crate::trigger::write_runner(&state.join("memory"), USAGE, app, FLAG)
 }
 
 #[cfg(test)]

@@ -643,50 +643,39 @@ fn roles(windows: State<'_, Windows>, window: tauri::WebviewWindow) -> Result<Va
     ))
 }
 
-/// The project in a folder: its `.agents/project.toml`, or the defaults a
-/// new project there would take.
-#[tauri::command]
-fn project(
-    windows: State<'_, Windows>,
-    window: tauri::WebviewWindow,
-    dir: String,
-) -> Result<Value, String> {
-    windows
-        .of(&window)?
-        .here("A project's .agents/project.toml")?;
-    project::read(std::path::Path::new(&workspace_path(
-        std::path::Path::new(&dir),
-    )?))
-}
-
-/// Write a new project's `.agents/project.toml`; an existing one is kept.
+/// Make the project in `dir` as `project add` does (see `project::create`):
+/// its coordinator in its role, told its tasks' settings, and the folder's
+/// file once it was taken. `threads_in_project` comes with the threads'
+/// picks; without it the coordinator picks their model.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
-fn write_project(
+async fn create_project(
     windows: State<'_, Windows>,
     window: tauri::WebviewWindow,
     dir: String,
-    name: String,
-    model: String,
-    reasoning: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
     threads_model: Option<String>,
-    threads_reasoning: Option<String>,
-    threads_in_project: bool,
-) -> Result<(), String> {
-    windows
-        .of(&window)?
-        .here("A project's .agents/project.toml")?;
-    project::write(
-        std::path::Path::new(&workspace_path(std::path::Path::new(&dir))?),
-        &name,
-        &model,
-        reasoning.as_deref(),
-        &project::Threads {
-            model: threads_model.as_deref(),
-            reasoning: threads_reasoning.as_deref(),
-            in_project: threads_in_project,
-        },
-    )
+    threads_effort: Option<String>,
+    threads_in_project: Option<bool>,
+) -> Result<Value, String> {
+    let state = windows.of(&window)?;
+    state.here("Making a project (its coordinator and .agents/project.toml)")?;
+    let client = state.client.lock().await.clone().ok_or("detached")?;
+    let dir = PathBuf::from(workspace_path(std::path::Path::new(&dir))?);
+    let policy = compose(&dir, Some("coordinator"))?;
+    let picks = project::Picks {
+        model,
+        effort,
+        threads: threads_in_project.map(|in_project| project::ThreadPicks {
+            model: threads_model,
+            effort: threads_effort,
+            in_project,
+        }),
+    };
+    let mut made = project::create(&*client, &dir, &policy, &json!(TOOLS), &picks).await?;
+    made["note"] = policy["note"].clone();
+    Ok(made)
 }
 
 /// The system's folder picker, which can also make a new folder, over the
@@ -1354,7 +1343,7 @@ async fn request(
 const SETUP_FLAG: &str = "--setup";
 
 /// What the app puts on this machine, written at every start so it all leads
-/// to this copy: `~/.agent/trigger` and `~/.agent/memory`, triggers
+/// to this copy: `~/.agent/trigger`, `~/.agent/memory` and `~/.agent/project`, triggers
 /// reloaded after a move, and the skills it ships linked from
 /// `~/.agents/skills`. False when any of it failed; each failure is printed
 /// and does not stop the rest. A start reloads triggers off the window's way.
@@ -1369,6 +1358,7 @@ fn machine_setup(background: bool) -> bool {
         for written in [
             trigger::write_script(&state, &app),
             memory::write_script(&state, &app),
+            project::write_script(&state, &app),
         ] {
             if let Err(error) = written {
                 report(&error);
@@ -1404,7 +1394,7 @@ fn machine_setup(background: bool) -> bool {
 }
 
 fn main() {
-    // `~/.agent/trigger`, `~/.agent/memory`, launchd's fires and the Homebrew
+    // `~/.agent/trigger`, `~/.agent/memory`, `~/.agent/project`, launchd's fires and the Homebrew
     // cask's install and uninstall run this executable; each acts and exits
     // without a window.
     let args: Vec<String> = std::env::args().collect();
@@ -1413,6 +1403,11 @@ fn main() {
         Some(trigger::FIRE_FLAG) => std::process::exit(trigger::fire_cli(&args[2..])),
         Some(trigger::WATCH_FLAG) => std::process::exit(trigger::watch_cli()),
         Some(memory::FLAG) => std::process::exit(memory::cli(&args[2..])),
+        Some(project::FLAG) => std::process::exit(project::cli(
+            &args[2..],
+            &|dir| compose(dir, Some("coordinator")),
+            &json!(TOOLS),
+        )),
         Some(SETUP_FLAG) => std::process::exit(i32::from(!machine_setup(false))),
         Some(skills::UNLINK_FLAG) => std::process::exit(skills::unlink_cli()),
         _ => {}
@@ -1456,8 +1451,7 @@ fn main() {
             memory_view,
             branch,
             models,
-            project,
-            write_project,
+            create_project,
             choose_folder,
             settings,
             save_settings,
