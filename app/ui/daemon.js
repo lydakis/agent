@@ -530,7 +530,12 @@ window.Daemon = (() => {
           const page = params.oldest_first ? all.slice(0,limit) : all.slice(-limit);
           const next_from = all.findLast(n=>n.node < (page[0]?.node ?? 0))?.node ?? null;
           const next_newer = all.find(n=>n.node > (page.at(-1)?.node ?? Infinity))?.node ?? null;
-          const workspaces = Object.fromEntries(page.filter(n=>S.folders.has(n.turn)).map(n=>[n.turn,S.folders.get(n.turn)]));
+          const workspaces = [];
+          for (const turn of [...new Set(page.map(n=>n.turn))].sort((a,b)=>a-b)) {
+            const folder = S.folders.get(turn); if (folder == null) continue;
+            const group = workspaces.find(w=>w.folder===folder);
+            if (group) group.turns.push(turn); else workspaces.push({folder, turns:[turn]});
+          }
           return {nodes:page.slice().reverse(),next_from,next_newer,workspaces};
         }
         case 'history_items': {

@@ -1270,7 +1270,8 @@ read, wrote or edited (the path in its line) or a message's link to a path
 line or section is dropped). A path is relative to the folder the turn that
 named it ran in (`history_nodes` names each turn's, and `accepted` the
 running one's), so a link an agent wrote before it moved still opens what it
-meant; a turn the store no longer holds, as after its fork source was
+meant. The app keeps a turn's folder only while the turn is in the window; a
+folded turn's folder returns with the page that reloads it. A turn the store no longer holds, as after its fork source was
 deleted, uses the agent's folder now. A link inside an open file is relative
 to that file. The core reads the first 4 MiB of a regular file (`read_file`; a
 FIFO or device is refused, as reading one need not end, and a window on a

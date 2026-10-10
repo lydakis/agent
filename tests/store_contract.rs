@@ -1545,10 +1545,25 @@ fn history_pages_name_the_folder_each_turn_ran_in() {
     db.append(second, vec![assistant("wrote b.md")], &[], None)
         .unwrap();
     db.finish(second, None).unwrap();
+    let back = TurnOptions {
+        workspace: Some("/synthetic/first".into()),
+        ..TurnOptions::default()
+    };
+    let third = db
+        .begin("Bob", "r3", "back", true, &back, allow_provider)
+        .unwrap()
+        .turn;
+    db.append(third, vec![assistant("wrote c.md")], &[], None)
+        .unwrap();
+    db.finish(third, None).unwrap();
+    // Each folder is named once, with the turns that ran in it.
     let page = db.history_nodes("Bob", None, 400, None, false).unwrap();
     assert_eq!(
         page["workspaces"],
-        json!({first.to_string(): "/synthetic/first", second.to_string(): "/synthetic/second"})
+        json!([
+            {"folder": "/synthetic/first", "turns": [first, third]},
+            {"folder": "/synthetic/second", "turns": [second]},
+        ])
     );
     // A page holds only the folders of the turns it lists.
     let newest = page["nodes"][0]["node"].as_i64().unwrap();
@@ -1557,7 +1572,7 @@ fn history_pages_name_the_folder_each_turn_ran_in() {
         .unwrap();
     assert_eq!(
         one["workspaces"],
-        json!({second.to_string(): "/synthetic/second"})
+        json!([{"folder": "/synthetic/first", "turns": [third]}])
     );
 }
 

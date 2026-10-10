@@ -135,6 +135,9 @@ function evict(t) {
   if (earlierNotes) result.unshift({kind:'note_gap',total:earlierNotes});
   if (laterNotes) result.push({kind:'note_gap',total:laterNotes,later:true});
   t.items = result; normalizeRanges(t); t.gen += 1;
+  // A folded turn's folder comes back with the page that reloads it.
+  const kept = new Set(t.items.map(it => it.turn)); kept.add(t.streamingTurn);
+  for (const turn of t.folders.keys()) if (!kept.has(turn)) t.folders.delete(turn);
 }
 // Ranges may straddle peer cards when one provider node holds several calls.
 // Union overlapping intervals globally, retaining only the first placeholder.
@@ -877,7 +880,7 @@ async function loadInherited(name, older) {
   const present = new Set(t.items.map(it => it.kind === 'node' ? it.node : it.from).filter(id => id != null));
   const nodes = page.nodes.slice().reverse().filter(n => !(marker.exclusive && n.node === marker.next) && !present.has(n.node)).map((n) => ({ kind: 'node', node: n.node, turn: n.turn ?? null }));
   for (const it of nodes) count(t, it, 1);
-  for (const [turn, folder] of Object.entries(page.workspaces)) t.folders.set(Number(turn), folder);
+  for (const { folder, turns } of page.workspaces) for (const turn of turns) t.folders.set(turn, folder);
   let replacement;
   if (marker.forward) replacement = [...nodes, ...(page.next_newer == null ? [] : [{...marker, min: page.next_newer, loaded: true}])];
   else replacement = [...(page.next_from == null ? [] : [{...marker, next: page.next_from, exclusive:false, loaded: true}]), ...nodes];
