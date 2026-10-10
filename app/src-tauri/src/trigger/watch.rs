@@ -133,14 +133,18 @@ fn step(watched: &mut [Watched], sent: &mut Sent, event: &Value) -> Vec<Step> {
                 return steps;
             };
             let by = sent.remove(&(bot.to_owned(), turn)).map(|(id, _)| id);
+            let status = event["data"]["status"].as_str().unwrap_or("ended");
             for (i, w) in watched.iter_mut().enumerate() {
                 if w.done || w.source() != bot || w.cursor.is_some_and(|c| cursor <= c) {
                     continue;
                 }
                 w.cursor = Some(cursor);
-                if by
-                    .as_deref()
-                    .is_some_and(|id| id.starts_with(&sent_by(&w.trigger)))
+                // A message taken into a running turn as a steer ends its own
+                // queued turn (`steered`); the running turn's end is the one.
+                if status == "steered"
+                    || by
+                        .as_deref()
+                        .is_some_and(|id| id.starts_with(&sent_by(&w.trigger)))
                 {
                     steps.push(Step::Save(i));
                     continue;
@@ -151,7 +155,6 @@ fn step(watched: &mut [Watched], sent: &mut Sent, event: &Value) -> Vec<Step> {
                     continue;
                 }
                 w.count = 0;
-                let status = event["data"]["status"].as_str().unwrap_or("ended");
                 steps.push(Step::Fire(
                     i,
                     format!("{}: turn:{bot}/{turn} {status}", w.trigger.when),
@@ -703,6 +706,12 @@ mod tests {
             vec![]
         );
         assert_eq!(w[1].cursor, Some(0));
+        // A message taken in as a steer ends its own queued turn: not a turn
+        // end of the agent, which goes on with the running turn.
+        let steered = json!({"bot": "p.task", "event": "turn_finished", "turn": 6,
+            "cursor": 16, "data": {"status": "steered", "into": 5}});
+        assert_eq!(step(&mut w, &mut sent, &steered), vec![Step::Save(0)]);
+        assert_eq!(w[0].cursor, Some(16));
     }
 
     #[test]

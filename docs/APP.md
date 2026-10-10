@@ -1087,7 +1087,7 @@ refused, and adding the same trigger again watches the git folder the
 repository has now, recording where its HEAD is in place of the old one's.
 git is the one on the `PATH` `add` ran with, which the plist keeps. `--turn-end BOT` fires each time BOT,
 pinned by its id, ends a turn that ends after `add` (completed, failed or
-interrupted); `--count N` only every Nth, a count of the messages BOT
+interrupted; a message taken into a running turn as a steer is not one); `--count N` only every Nth, a count of the messages BOT
 answered. A turn the trigger itself sent BOT, its message or an answer
 `--reply-to` passed on, is not counted, so `--turn-end lead --reply-to lead`
 does not wake itself (two triggers that wake each other are bounded only by
