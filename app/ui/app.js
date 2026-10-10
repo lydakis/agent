@@ -1213,6 +1213,9 @@ async function attachOnce() {
       // What waited while detached goes out now, each window permitting.
       for (const lead of S.wakes.keys()) wakeSoon(lead);
       try { await loadSwarms(); } catch (e) { toast(`swarms: ${e?.message ?? e}`, 5000); }
+      // Turns that ended and agents deleted while detached left no event to check on: each swarm is
+      // checked once now, as the page learns its agents again.
+      for (const sw of S.swarms.values()) checkSoon(sw);
       restore();
       // Tabs deleted while detached had no `deleted` event to replay; they close.
       S.ui.tabs = S.ui.tabs.filter(isOpen); if (!isOpen(S.selected)) S.selected = '';

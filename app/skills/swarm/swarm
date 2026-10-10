@@ -615,6 +615,13 @@ def spent(bot):
     return bool(bot.get('budget_tokens')) and (bot.get('tokens_used') or 0) >= bot['budget_tokens']
 
 
+def able(swarm, members):
+    """The live members that can still take a turn, in the swarm's order: an
+    added agent's brief names them, so one at its cap is never told to wait
+    on a plan from a member that cannot write one."""
+    return [m for m in swarm['members'] if m in members and not spent(members[m])]
+
+
 def status(folder, members, helpers):
     swarm, state = folder.swarm, folder.state
     used, total = usage(state, members, helpers)
@@ -1011,7 +1018,8 @@ def brief(swarm, folder, member, each, late=False, roster=None):
              'leave, status' % quote(SCRIPT),
              'Board: ' + quote(os.path.join(folder, 'board.jsonl')),
              'The others: ' + (', '.join(others) or 'none yet'),
-             'First member: %s; if it is deleted, the lowest-numbered member status lists takes its place' % short(roster[0], swarm),
+             'First member: %s; if it is deleted or has used its tokens, the lowest-numbered member status lists '
+             'outside exhausted_members takes its place' % short(roster[0], swarm),
              'Your lifetime allowance: %d tokens, including cached input on every call.' % each]
     if late:
         lines.append('You joined after the others started, so read the board first.')
@@ -1183,7 +1191,7 @@ def add(daemon, folder, args):
     # Saved only once made (by pin), so an add cut short names no member.
     swarm['members'].append(name)
     swarm['rows'][name] = row
-    roster = [m for m in swarm['members'] if m in members] + [name]
+    roster = able(swarm, members) + [name]
     made, failed = make(swarm, folder.dir, [name], [row], each, True, roster)
     if failed:
         swarm['budget_tokens'] -= each

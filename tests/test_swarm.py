@@ -474,6 +474,8 @@ class SwarmRuleTests(unittest.TestCase):
         _, act = self.act('p.w-3', state, live)
         self.s.review(act, 't', 'supported', 'checked')
         self.assertEqual([m for m, *_ in act.sends], ['p.w-2'])
+        # An added agent's brief leaves a member at its cap out of who plans first.
+        self.assertEqual(self.s.able(self.swarm, live), ['p.w-2', 'p.w-3'])
         # Nothing is sent to a member at its cap, so a post naming it wakes nobody.
         _, act = self.act(None, state, live)
         self.s.post(act, '@w-1 carry on', False)

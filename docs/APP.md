@@ -959,8 +959,10 @@ daemon learns nothing about projects; everything here is client work.
   its token cap (the answer lists it in `missed`), so a post to one wakes
   nobody and is not news. Only the page's checks can find a swarm quiet (an
   agent acting is running): the page checks a swarm when its turns end, when
-  it learns a swarm's agents or a change in them, and when one is deleted,
-  so a quiet swarm is reported only while the app is attached. A swarm you start from the sheet has no
+  it learns a swarm's agents or a change in them, when one is deleted, and
+  once at every attach, so a quiet swarm is reported only while the app is
+  attached. An added agent's brief names as first member the lowest-numbered
+  one with tokens left, itself when none has any. A swarm you start from the sheet has no
   coordinator and tells nobody.
 - **The role as a file.** Settings lists the app's `coordinator` role and
   whether you have your own file for it. Edit writes

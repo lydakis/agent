@@ -3462,3 +3462,19 @@ test('a swarm row shows done while one of its agents has an unseen result, until
   p.S.selected = '⁂app.latency'; p.markSeen();
   assert.equal(row(), 'idle');
 });
+
+test('each swarm is checked once at every attach, since what ran while detached left no event', async () => {
+  const checks = [];
+  const p = page({
+    setup: async () => ({}), attach: async () => ({ session: 1, store: 'store-1' }), pull: () => new Promise(() => {}),
+    request: async (op) => (op === 'bots' ? { bots: [{ name: 'app.latency-1', id: 3, provider: 'alpha', model: 'one', status: 'idle' }] } : {}),
+    swarms: async () => ({ swarms: [swarmRecord(['app.latency-1'], { ids: { 'app.latency-1': 3 } })], broken: [] }),
+    swarmCheck: async (name) => { checks.push(name); return {}; },
+  });
+  p.setRender(() => {});
+  await p.attach(); await settle(); await p.tick();
+  assert.deepEqual(checks, ['app.latency']);
+  // Reattached with the same agents and pins, it is checked again.
+  p.S.attached = false; await p.attach(); await settle(); await p.tick();
+  assert.deepEqual(checks, ['app.latency', 'app.latency']);
+});
