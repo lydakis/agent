@@ -47,7 +47,7 @@ pub struct Bot {
     pub family: String,
     pub model: String,
     pub instructions: String,
-    pub reasoning: Option<String>,
+    pub effort: Option<String>,
     /// The tools this bot is shown, chosen at creation and kept with it.
     pub tools: Vec<String>,
     /// The subset of `tools` it may call, when narrower; `None` is all of
@@ -305,7 +305,7 @@ pub struct Binding<'a> {
     pub family: Family,
     pub model: &'a str,
     pub instructions: &'a str,
-    pub reasoning: Option<&'a str>,
+    pub effort: Option<&'a str>,
     pub budget_tokens: Option<u64>,
     pub tools: &'a [String],
     pub created_by: Option<&'a str>,
@@ -338,7 +338,7 @@ pub struct TurnOptions {
     pub workspace: Option<String>,
     pub model: Option<String>,
     /// The effort level this turn runs at; none is the bot's own.
-    pub reasoning: Option<String>,
+    pub effort: Option<String>,
     pub delivery: Delivery,
     /// A strict steer: for this running turn or nobody. Never absorbed by
     /// another turn, never started as new work; `stale_turn` instead.
@@ -932,7 +932,7 @@ pub struct TurnContext {
     pub workspace: String,
     pub model: String,
     /// The effort level this turn runs at: its own, else the bot's.
-    pub reasoning: Option<String>,
+    pub effort: Option<String>,
     /// The model and effort of the bot's latest earlier turn that started,
     /// when its calls sent the history this turn starts from: a call sent
     /// its view last, and something follows its prompt. `None` otherwise,
@@ -1575,7 +1575,7 @@ impl Database {
             family: r.get(6)?,
             model: r.get(7)?,
             instructions: r.get(8)?,
-            reasoning: r.get(9)?,
+            effort: r.get(9)?,
             tools: split_tools(&r.get::<_, String>(12)?),
             allowed: r
                 .get::<_, Option<String>>(32)?
@@ -1707,7 +1707,7 @@ impl Database {
                 "workspace":r.get::<_, Option<String>>(2)?,"status":r.get::<_, String>(3)?,
                 "running_turn":r.get::<_, Option<i64>>(4)?,"provider":r.get::<_, String>(5)?,
                 "family":r.get::<_, String>(6)?,"model":r.get::<_, String>(7)?,
-                "reasoning":r.get::<_, Option<String>>(8)?,
+                "effort":r.get::<_, Option<String>>(8)?,
                 "budget_tokens":r.get::<_, Option<i64>>(9)?,"tokens_used":r.get::<_, i64>(10)?,
                 "tools":split_tools(&r.get::<_, String>(11)?),
                 "input_tokens":r.get::<_, i64>(12)?,"cached_input_tokens":r.get::<_, i64>(13)?,
@@ -1813,7 +1813,7 @@ impl Database {
         // As sent, so a resend compares equal whatever has happened since;
         // the instructions are compared with the bot's own, never copied.
         let request = binding.request_id.map(|_| json!({"op":"create","workspace":workspace,
-            "provider":binding.provider,"model":binding.model,"reasoning":binding.reasoning,
+            "provider":binding.provider,"model":binding.model,"effort":binding.effort,
             "budget_tokens":binding.budget_tokens,"tools":binding.tools,"created_by":binding.created_by,
             "created_by_id":binding.created_by_id,"compaction_model":binding.compaction_model,
             "fallbacks":binding.fallbacks,"gate":binding.gate,"settings":binding.settings}));
@@ -1848,7 +1848,7 @@ impl Database {
                 binding.family.name(),
                 binding.model,
                 binding.instructions,
-                binding.reasoning,
+                binding.effort,
                 binding.budget_tokens.map(|b| b as i64),
                 binding.tools.join(","),
                 binding.created_by,
@@ -1864,7 +1864,7 @@ impl Database {
         // The event carries the list record's fields, so a follower can
         // seat a new bot without a request per creation.
         let mut data = json!({"id":id,"provider":binding.provider,"model":binding.model,
-            "reasoning":binding.reasoning,"workspace":workspace,"status":"idle","running_turn":null,
+            "effort":binding.effort,"workspace":workspace,"status":"idle","running_turn":null,
             "created_by":binding.created_by,"created_by_id":created_by_id});
         if let Some(gates) = &gates {
             data["gates"] = serde_json::from_str(gates)?;
@@ -3655,7 +3655,7 @@ impl Database {
                         TurnOptions {
                             workspace: r.get(3)?,
                             model: r.get(4)?,
-                            reasoning: r.get(11)?,
+                            effort: r.get(11)?,
                             delivery: Delivery::parse(&r.get::<_, String>(5)?).unwrap_or_default(),
                             expected_turn: r.get(6)?,
                             from: match (r.get::<_, Option<String>>(8)?, r.get(9)?) {
@@ -3688,7 +3688,7 @@ impl Database {
             let TurnOptions {
                 workspace,
                 model,
-                reasoning,
+                effort,
                 delivery,
                 expected_turn,
                 from,
@@ -3698,7 +3698,7 @@ impl Database {
                 ("prompt", saved != prompt),
                 ("workspace", *workspace != same.workspace),
                 ("model", *model != same.model),
-                ("reasoning", *reasoning != same.reasoning),
+                ("effort", *effort != same.effort),
                 ("delivery", *delivery != same.delivery),
                 ("expected_turn", *expected_turn != same.expected_turn),
                 ("from", *from != same.from),
@@ -3754,8 +3754,8 @@ impl Database {
                 return fail_with("invalid_from", format!("{from} has no turn {turn}"));
             }
         }
-        if let Some(level) = &options.reasoning {
-            bot.family()?.check_reasoning(level)?;
+        if let Some(level) = &options.effort {
+            bot.family()?.check_effort(level)?;
         }
         if let Err(error) = validate(&bot, options.model.as_deref()) {
             // An omitted steer model inherits the active turn for absorption.
@@ -3863,7 +3863,7 @@ impl Database {
                 if options.delivery == Delivery::Steer { options.workspace.as_deref() } else { Some(workspace.as_str()) },
                 options.model, options.delivery.name(), options.expected_turn,
                 options.from.as_ref().map(|f| &f.0), options.from.as_ref().map(|f| f.1), from_id, options.origin,
-                options.reasoning],
+                options.effort],
         )?;
         if moved {
             tx.prepare_cached("UPDATE bots SET workspace=? WHERE name=?")?
@@ -3875,16 +3875,16 @@ impl Database {
             .model
             .clone()
             .unwrap_or_else(|| format!("{}/{}", bot.provider, bot.model));
-        let reasoning = options.reasoning.as_ref().or(bot.reasoning.as_ref());
+        let effort = options.effort.as_ref().or(bot.effort.as_ref());
         let (kind, data) = if status == "running" {
             let mut data = json!({"request_id":request_id,"workspace":workspace,"model":model,
-                "reasoning":reasoning});
+                "effort":effort});
             start_locked(&tx, &bot, turn, prompt, &mut data)?;
             ("accepted", data)
         } else {
             let mut data = json!({"request_id":request_id,"status":status,
                 "delivery":options.delivery.name(),"workspace":workspace,"model":model,
-                "reasoning":reasoning});
+                "effort":effort});
             sender_fields(
                 &mut data,
                 options
@@ -3971,10 +3971,10 @@ impl Database {
             .or(bot.workspace.clone())
             .ok_or(Error::new("workspace_required"))?;
         let model = model.unwrap_or_else(|| format!("{}/{}", bot.provider, bot.model));
-        let reasoning = reasoning.or(bot.reasoning.clone());
+        let effort = reasoning.or(bot.effort.clone());
         let tx = self.conn.savepoint()?;
         let mut data = json!({"request_id":request_id,"workspace":workspace,"model":model,
-            "reasoning":reasoning});
+            "effort":effort});
         start_locked(&tx, &bot, turn, &prompt, &mut data)?;
         let cursor = event(&tx, &name, Some(turn), "accepted", data.clone())?;
         tx.commit()?;
@@ -5242,7 +5242,7 @@ impl Database {
                   WHERE t.bot=?1 AND t.id<?2 AND t.started_ms IS NOT NULL AND s.turn=?2
                   ORDER BY t.id DESC LIMIT 1",
             )?
-            .query_row(params![bot.name, turn, default, bot.reasoning], |r| {
+            .query_row(params![bot.name, turn, default, bot.effort], |r| {
                 r.get::<_, bool>(1)?
                     .then(|| Ok((r.get(0)?, r.get(2)?)))
                     .transpose()
@@ -5256,7 +5256,7 @@ impl Database {
                 .or(bot.workspace)
                 .ok_or(Error::new("workspace_required"))?,
             model: model.unwrap_or(default),
-            reasoning: reasoning.or(bot.reasoning),
+            effort: reasoning.or(bot.effort),
             previous_call,
             created_by: bot.created_by,
             created_by_id: bot.created_by_id,
@@ -6000,7 +6000,7 @@ impl Database {
                 parent.family,
                 parent.model,
                 parent.instructions,
-                parent.reasoning,
+                parent.effort,
                 budget_tokens.map(|b| b as i64),
                 parent.tools.join(","),
                 created_by,
@@ -6067,7 +6067,7 @@ impl Database {
             )?;
         }
         let mut data = json!({"id":id,"source":source,"checkpoint":checkpoint,"node":checkpoint,
-            "provider":parent.provider,"model":parent.model,"reasoning":parent.reasoning,
+            "provider":parent.provider,"model":parent.model,"effort":parent.effort,
             "workspace":workspace,"status":"idle","running_turn":null,
             "created_by":created_by,"created_by_id":created_by_id});
         if let Some(gates) = &gates {
@@ -6714,7 +6714,7 @@ impl Database {
             turn["prompt_preview"] = json!(r.get::<_, String>(at + 2)?);
             turn["prompt_bytes"] = json!(r.get::<_, i64>(at + 3)?);
             turn["delivery"] = json!(r.get::<_, String>(at + 4)?);
-            turn["reasoning"] = json!(r.get::<_, Option<String>>(at + 5)?);
+            turn["effort"] = json!(r.get::<_, Option<String>>(at + 5)?);
             turn["summary_ms"] = json!(r.get::<_, i64>(at + 6)?);
             turn["cache_hit"] = json!(cache_hit(
                 turn["cached_input_tokens"].as_i64().unwrap_or(0),

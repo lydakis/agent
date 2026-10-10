@@ -305,7 +305,7 @@ outcome once finished; an `interrupt` reply is the view plus
 `submit` answers with the view's identity and status, without a second read.
 
 `turns` (protocol) and `agent turns --bot NAME` list a bot's turns as views
-with effective workspace, model and reasoning, delivery, cache hit, and a
+with effective workspace, model and effort, delivery, cache hit, and a
 prompt preview, paged by `after`. A finished turn's outcome comes from `wait` on
 its handle; `timeout_ms: 0` answers at once, pending while the turn runs. `agent turns`
 restarts an idle daemon using the supplied provider/tool configuration (or
@@ -502,13 +502,13 @@ to recognize arbitrary encodings of secrets or unknown credentials.
 History items are stored in the family's native encoding and streamed into
 requests by reference, without translation. A bot is therefore bound to its
 provider family at creation; `create` accepts `model`, `instructions`, and
-`reasoning` (`low`, `medium`, `high`, `xhigh`, and on Anthropic `max`), and a
+`effort` (`low`, `medium`, `high`, `xhigh`, and on Anthropic `max`), and a
 fork inherits its source's binding.
 A turn may override the model within the same family (`submit` with `model`, or
 `run --model` on an existing bot); a different family is rejected with
 `provider_family_mismatch`. A turn may likewise run at another effort level
-(`submit` with `reasoning`, or `run --reasoning` on an existing bot); a level
-the family does not take is `invalid_reasoning_level`. Each override is recorded
+(`submit` with `effort`, or `run --effort` on an existing bot); a level
+the family does not take is `invalid_effort`. Each override is recorded
 on the turn and in its `accepted` event, and the bot's default is unchanged. A
 steer that names a level joins only a running turn at that level. Cross-family handoff of a
 conversation is not implemented; it would be an explicit lossy fork that
@@ -668,7 +668,7 @@ and `claude-opus-5-5`, `claude-opus-5` and `claude-fable-5-1` answer normally
 with it set; a live refusal was not reproduced, so the fallback path is covered
 by parser and synthetic-endpoint tests.
 
-`reasoning` (`low`, `medium`, `high`, `xhigh`, `max`) maps to Responses
+`effort` (`low`, `medium`, `high`, `xhigh`, `max`) maps to Responses
 `reasoning.effort` with summaries requested, and to Anthropic adaptive thinking
 (`thinking.type: adaptive` with summarized display) plus `output_config.effort`.
 Every Anthropic call sets `max_tokens` to the model's full output limit:
@@ -863,7 +863,7 @@ Requests include a string or nonnegative integer `id`. Responses carry the same
 `id` and either `result` or an explicit `error` code with optional `detail`.
 A refusal a program acts on also carries its facts as fields beside them:
 `bot_busy` from `submit` reports `running_turn` and `fork_point`, and
-`invalid_reasoning_level` lists the model's `levels`. A line that is not JSON
+`invalid_effort` lists the model's `efforts`. A line that is not JSON
 is `invalid_json` with a null `id`; JSON of the wrong shape is
 `invalid_request`, answered with its `id` when that parses, and its detail
 names the unknown or ill-typed field.
@@ -879,7 +879,7 @@ they report. Live `text_delta` and `thinking_delta` notifications keep their
 own path from the turn. Example requests:
 
 ```json
-{"id":1,"op":"create","bot":"Bob","workspace":"/workspaces/project","model":"anthropic/claude-sonnet-5","reasoning":"low","instructions":"...","tools":["shell","read","write","edit","wait","history"],"compaction_instructions":"...","created_by":"Alice","created_by_id":42}
+{"id":1,"op":"create","bot":"Bob","workspace":"/workspaces/project","model":"anthropic/claude-sonnet-5","effort":"low","instructions":"...","tools":["shell","read","write","edit","wait","history"],"compaction_instructions":"...","created_by":"Alice","created_by_id":42}
 {"id":2,"op":"submit","bot":"Bob","request_id":"work-1","prompt":"Hello","workspace":"/workspaces/project-copy","model":"anthropic/claude-opus-5-5"}
 {"id":19,"op":"submit","bot":"Bob","request_id":"work-2","prompt":"Also check the docs","delivery":"steer"}
 {"id":3,"op":"follow","bot":"Bob","after":0}
@@ -2011,7 +2011,7 @@ starts `agent approver` detached if no session serves `auto`, logging to
 `TYPESAFE_API_KEY` is set, else the bot's own model, and a judge that
 cannot start fails the command before any bot is made
 (`approver_start_failed`). `agent approver [--tag TAG] [--judge
-PROVIDER/MODEL] [--reasoning LEVEL] [--note FILE] [--judge-url URL]` serves
+PROVIDER/MODEL] [--effort LEVEL] [--note FILE] [--judge-url URL]` serves
 a tag and has a judge decide every call waiting on it, printing one JSON
 line per round ([APPROVALS.md](APPROVALS.md#automatic-mode)). `agent approvals [--bot NAME] [--tag TAG]` lists pending
 calls, `agent answer --bot NAME --turn N --call ID --request R allow|deny

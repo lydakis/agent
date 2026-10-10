@@ -138,7 +138,7 @@ so the model uses its own default. It is picked with the model, the model chip
 changes it later, and it is kept in `.agents/project.toml` as `reasoning`
 beside `model`; `/new NAME PROVIDER/MODEL [EFFORT]` takes one too. A task the
 coordinator starts on its own model takes its effort as well
-(`AGENT_REASONING`, see [CLI.md](CLI.md)).
+(`AGENT_EFFORT`, see [CLI.md](CLI.md)).
 
 ![New project](app/new-project.png)
 

@@ -242,7 +242,7 @@ function upsert(record) {
   seedHistory(record);
 }
 // A bot's effort level is set when it is made and kept for life; a record that does not name it says nothing.
-function learnEffort(b, record) { if ('reasoning' in record) b.reasoning = record.reasoning ?? null; }
+function learnEffort(b, record) { if ('effort' in record) b.reasoning = record.effort ?? null; }
 // A new folder means its branch is read again, when the bot is next shown.
 function learnWorkspace(b, record) {
   const ws = record.workspace ?? null;
@@ -2256,7 +2256,7 @@ async function submit(text, pane = 'main', to = PANE[pane].bot()) {
     // cannot be composed rejects here and nothing is created, as with the CLI's --agents.
     const policy = await Daemon.policy();
     const session = S.session;
-    const record = await Daemon.request('create', { bot: name, workspace: S.config.workspace, model: m, ...(effort ? { reasoning: effort } : {}), instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: S.config.tools });
+    const record = await Daemon.request('create', { bot: name, workspace: S.config.workspace, model: m, ...(effort ? { effort } : {}), instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: S.config.tools });
     await enqueue(() => { if (S.session === session) seat(record, session); });
     await go(name); toast(`created ${name} · ${policy.note}`); return;
   }
@@ -2272,7 +2272,7 @@ async function submit(text, pane = 'main', to = PANE[pane].bot()) {
   // It also names the turn on screen, so a turn that ended meanwhile refuses it as stale_turn
   // rather than the message landing in whatever turn runs next. A bot keeps its folder, so a
   // message names one only for a bot that has none.
-  const where = delivery === 'steer' ? (b.runningTurn != null ? { expected_turn: b.runningTurn } : {}) : { ...home(b), ...(model && model !== b.model ? { model } : {}), ...(effort && effort !== b.reasoning ? { reasoning: effort } : {}) };
+  const where = delivery === 'steer' ? (b.runningTurn != null ? { expected_turn: b.runningTurn } : {}) : { ...home(b), ...(model && model !== b.model ? { model } : {}), ...(effort && effort !== b.reasoning ? { effort } : {}) };
   // The identity on screen, so a name that changed hands in between is refused rather than handed the prompt.
   try { await Daemon.request('submit', { bot: b.name, bot_id: b.id, request_id: `app-${crypto.randomUUID()}`, prompt: text, delivery, ...where }); }
   catch (e) { if (delivery === 'steer' && /stale_turn/.test(String(e?.message ?? e))) throw new Error('that turn ended; not steered'); throw e; }
@@ -2356,7 +2356,7 @@ async function createProject(dir, picked = null, effort = null) {
   if (picked) try { localStorage.setItem('agent:model', picked); } catch (_) {}
   if (effort !== null) try { localStorage.setItem('agent:effort', effort); } catch (_) {}
   const session = S.session;
-  const record = await Daemon.request('create', { bot: info.coordinator, workspace: info.dir, model, ...(reasoning ? { reasoning } : {}), instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: policy.tools ?? S.config.tools });
+  const record = await Daemon.request('create', { bot: info.coordinator, workspace: info.dir, model, ...(reasoning ? { effort: reasoning } : {}), instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: policy.tools ?? S.config.tools });
   await enqueue(() => { if (S.session === session) seat(record, session); });
   if (!info.file) await Daemon.writeProject({ dir: info.dir, name: info.name, model, reasoning });
   await go(info.coordinator); toast(`project ${info.name} · ${policy.note}`);

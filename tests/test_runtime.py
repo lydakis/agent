@@ -692,7 +692,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
 
     def test_a_long_tool_call_keeps_the_prompt_cache_warm(self):
         client, model, path = self.start(settings={'keep_warm': 1})
-        client.request('create', bot='Bob', workspace=str(path), reasoning='low')
+        client.request('create', bot='Bob', workspace=str(path), effort='low')
         turn = client.request('submit', bot='Bob', request_id='w1', prompt='shell:sleep 2.5')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         requests = []
@@ -719,7 +719,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
     def test_a_long_reply_keeps_its_own_prompt_cache_warm(self):
         client, model, path = self.start(settings={'keep_warm': 1})
         model.generate_delay = 2.5
-        client.request('create', bot='Bob', workspace=str(path), reasoning='low')
+        client.request('create', bot='Bob', workspace=str(path), effort='low')
         turn = client.request('submit', bot='Bob', request_id='g1', prompt='long')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         requests = []
@@ -738,7 +738,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
         client, model, path = self.start(settings={'keep_warm': 1})
         model.generate_delay = 1.5
         model.warm_delay = 1
-        client.request('create', bot='Bob', workspace=str(path), reasoning='low')
+        client.request('create', bot='Bob', workspace=str(path), effort='low')
         turn = client.request('submit', bot='Bob', request_id='g2', prompt='shell:true')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         requests = []
@@ -756,7 +756,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
         model.generate_delay = 1.5
         model.warm_delay = 1
         # The call bills 14 tokens (5 + 2 cached in, 7 out) and its refresh 9.
-        client.request('create', bot='Bob', workspace=str(path), reasoning='low', budget_tokens=20)
+        client.request('create', bot='Bob', workspace=str(path), effort='low', budget_tokens=20)
         turn = client.request('submit', bot='Bob', request_id='s1', prompt='long')['result']['turn']
         model.requests.get(timeout=5)
         steer = client.request('submit', bot='Bob', request_id='s2', prompt='more', delivery='steer')
@@ -778,7 +778,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
         model.generate_delay = 1.5
         model.arrivals = []
         for bot in ('Ann', 'Bob'):
-            client.request('create', bot=bot, workspace=str(path), reasoning='low')
+            client.request('create', bot=bot, workspace=str(path), effort='low')
         held = client.request('submit', bot='Ann', request_id='h1', prompt='hold')['result']['turn']
         model.requests.get(timeout=5)
         turn = client.request('submit', bot='Bob', request_id='h2', prompt='long')['result']['turn']
@@ -794,7 +794,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
     def test_a_refused_refresh_ends_the_refreshes_but_not_the_turn(self):
         client, model, path = self.start(settings={'keep_warm': 1})
         model.refuse_warm = True
-        client.request('create', bot='Bob', workspace=str(path), reasoning='low')
+        client.request('create', bot='Bob', workspace=str(path), effort='low')
         turn = client.request('submit', bot='Bob', request_id='w1', prompt='shell:sleep 2.5')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         failed = [m for m in client.saved if m.get('event') == 'keep_warm_failed']
@@ -807,7 +807,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
     def test_a_refresh_sent_before_the_tool_ends_is_still_recorded(self):
         client, model, path = self.start(settings={'keep_warm': 1})
         model.warm_delay = 1
-        client.request('create', bot='Bob', workspace=str(path), reasoning='low')
+        client.request('create', bot='Bob', workspace=str(path), effort='low')
         turn = client.request('submit', bot='Bob', request_id='w1', prompt='shell:sleep 1.5')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         usage = [m['data'] for m in client.saved if m.get('event') == 'usage']
@@ -816,7 +816,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
     def test_an_interrupt_still_records_a_refresh_already_sent(self):
         client, model, path = self.start(settings={'keep_warm': 1})
         model.warm_delay = 1.5
-        client.request('create', bot='Bob', workspace=str(path), reasoning='low')
+        client.request('create', bot='Bob', workspace=str(path), effort='low')
         turn = client.request('submit', bot='Bob', request_id='i1', prompt='shell:sleep 10')['result']['turn']
         call = model.requests.get(timeout=5)
         self.assertEqual(model.requests.get(timeout=5)['max_tokens'], 0)  # the refresh is in flight
@@ -831,7 +831,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
         model.cache_control = {'type': 'ephemeral', 'ttl': '1h'}
         # A report without the per-lifetime split: every write is an hour's.
         model.start_usage = {'cache_creation_input_tokens': 3}
-        client.request('create', bot='Bob', workspace=str(path), reasoning='low')
+        client.request('create', bot='Bob', workspace=str(path), effort='low')
         turn = client.request('submit', bot='Bob', request_id='h1', prompt='shell:sleep 1.5')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertEqual([r['max_tokens'] > 0 for r in (model.requests.get(timeout=1),
@@ -842,7 +842,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
 
     def test_a_short_tool_call_sends_no_refresh(self):
         client, model, path = self.start()
-        client.request('create', bot='Bob', workspace=str(path), reasoning='low')
+        client.request('create', bot='Bob', workspace=str(path), effort='low')
         turn = client.request('submit', bot='Bob', request_id='w1', prompt='shell:true')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertEqual([r['max_tokens'] > 0 for r in (model.requests.get(timeout=1),
@@ -851,7 +851,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
 
     def test_a_fallback_answer_replays_without_the_declined_attempt(self):
         client, model, path = self.start()
-        client.request('create', bot='Bob', workspace=str(path), reasoning='low', fallbacks=True)
+        client.request('create', bot='Bob', workspace=str(path), effort='low', fallbacks=True)
         turn = client.request('submit', bot='Bob', request_id='f1', prompt='fallback:kept')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         fallback = [m for m in client.saved if m.get('event') == 'model_fallback']
@@ -881,7 +881,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
 
     def test_messages_family_round_trips_thinking_tools_and_usage(self):
         client, model, path = self.start()
-        client.request('create', bot='Bob', workspace=str(path), reasoning='low', fallbacks=True)
+        client.request('create', bot='Bob', workspace=str(path), effort='low', fallbacks=True)
         before = time.time() * 1000
         turn = client.request('submit', bot='Bob', request_id='r1', prompt='tool:shared')['result']['turn']
         finished = client.finished(turn)
@@ -912,10 +912,10 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertEqual(len(second['messages']), 3)
         # The store is bound to the provider family; resume and replay are exact.
         state = client.request('resume', bot='Bob')['result']
-        self.assertEqual((state['provider'], state['family'], state['model'], state['reasoning']),
+        self.assertEqual((state['provider'], state['family'], state['model'], state['effort']),
                          ('anthropic', 'anthropic', 'synthetic-claude', 'low'))
-        self.assertEqual(client.request('create', bot='Bad', workspace=str(path), reasoning='extreme')['error'],
-                         'invalid_reasoning_level')
+        self.assertEqual(client.request('create', bot='Bad', workspace=str(path), effort='extreme')['error'],
+                         'invalid_effort')
         self.assertEqual(client.request('create', bot='Bad', workspace=str(path), model='openai/x')['error'],
                          'provider_unavailable')
         client.request('create', bot='Capped', workspace=str(path), budget_tokens=10)

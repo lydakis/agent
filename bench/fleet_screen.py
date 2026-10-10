@@ -114,7 +114,7 @@ class Screen:
     def create_all(self):
         started = time.monotonic()
         for index in range(self.bots):
-            response = self.client.request('create', bot=f'b{index}', workspace=str(self.workspace), reasoning='low')
+            response = self.client.request('create', bot=f'b{index}', workspace=str(self.workspace), effort='low')
             if 'error' in response:
                 raise RuntimeError(f"create failed: {response['error']}")
         seconds = time.monotonic() - started

@@ -590,7 +590,7 @@ approver the CLI starts.
   with one outside 0 to 1, is a failed check. The forks keep rounds apart,
   run them at once, and share the base's prompt cache. Forks left by an
   approver that stopped are deleted when the next one starts.
-  `--reasoning` sets the judge bot's effort; the model's default is used
+  `--effort` sets the judge bot's effort; the model's default is used
   otherwise.
 
 A general model is slower than Jev, so its round gets 30 s, and the CLI

@@ -66,7 +66,7 @@ class Agent(BaseInstalledAgent):
                    release build under .local/target, or AGENT_HARBOR_BINARY)
       provider     extra `--provider` spec, or a list of them, for gateways
                    such as Bedrock; the spec's KEY_ENV is forwarded
-      reasoning    `--reasoning` level
+      reasoning    `--effort` level
       codex_auth   for chatgpt/MODEL: Codex's ChatGPT login to copy into the
                    container (default: $CODEX_HOME/auth.json, else ~/.codex/auth.json)
       max_output_tokens, context_bytes, compact_at: the new bot's settings
@@ -191,7 +191,7 @@ class Agent(BaseInstalledAgent):
         for spec in self._providers:
             flags += ['--provider', spec]
         if self._reasoning:
-            flags += ['--reasoning', self._reasoning]
+            flags += ['--effort', self._reasoning]
         for key, value in self._limits.items():
             flags += [self._LIMITS[key], str(value)]
         logs = EnvironmentPaths.agent_dir.as_posix()

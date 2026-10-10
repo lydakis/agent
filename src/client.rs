@@ -48,7 +48,7 @@ struct Options {
     allow: Option<String>,
     model: Option<String>,
     instructions: Option<String>,
-    reasoning: Option<String>,
+    effort: Option<String>,
     workspace: Option<PathBuf>,
     bot: Option<String>,
     source: Option<String>,
@@ -116,7 +116,7 @@ fn parse(args: &[String]) -> Result<Options> {
         allow: None,
         model: None,
         instructions: None,
-        reasoning: None,
+        effort: None,
         workspace: None,
         bot: None,
         source: None,
@@ -229,7 +229,7 @@ fn parse(args: &[String]) -> Result<Options> {
                             })?)
                     }
                     "--compaction-model" => options.compaction_model = Some(value),
-                    "--reasoning" => options.reasoning = Some(value),
+                    "--effort" => options.effort = Some(value),
                     "--workspace" => options.workspace = Some(value.into()),
                     "--bot" => options.bot = Some(value),
                     "--source" => options.source = Some(value),
@@ -1268,11 +1268,11 @@ fn run(options: &Options) -> Result<i32> {
             .clone()
             .or_else(|| role.as_ref().and_then(|r| r.model.clone()));
         // A peer on its creator's model takes its creator's effort level too;
-        // a model chosen for it takes its own --reasoning or none.
-        let reasoning = options.reasoning.clone().or_else(|| {
+        // a model chosen for it takes its own --effort or none.
+        let effort = options.effort.clone().or_else(|| {
             chosen
                 .is_none()
-                .then(|| std::env::var("AGENT_REASONING").ok())
+                .then(|| std::env::var("AGENT_EFFORT").ok())
                 .flatten()
                 .filter(|level| !level.is_empty())
         });
@@ -1295,7 +1295,7 @@ fn run(options: &Options) -> Result<i32> {
                 .collect(),
         };
         let mut create = json!({"bot":bot,"workspace":workspace,"model":model,
-            "instructions":instructions,"reasoning":reasoning,
+            "instructions":instructions,"effort":effort,
             "budget_tokens":options.budget_tokens,"tools":tools,
             "created_by":created_by,"created_by_id":created_by_id,
             "compaction_instructions":options.compaction_instructions,
@@ -1318,15 +1318,15 @@ fn run(options: &Options) -> Result<i32> {
         }
     }
     // Existing bots keep their model and effort unless --model or
-    // --reasoning overrides them for this turn. AGENT_MODEL and
-    // AGENT_REASONING are only creation defaults, including in a peer's shell.
+    // --effort overrides them for this turn. AGENT_MODEL and
+    // AGENT_EFFORT are only creation defaults, including in a peer's shell.
     let submitted = connection
         .request(
             "submit",
             json!({"bot":bot,"bot_id":options.bot_id,"request_id":request_id,"prompt":prompt,
                 "workspace":options.workspace.as_ref().and(workspace.as_ref()),
                 "model":if created { Value::Null } else { json!(options.model) },
-                "reasoning":if created { Value::Null } else { json!(options.reasoning) },
+                "effort":if created { Value::Null } else { json!(options.effort) },
                 "delivery":options.delivery,"expected_turn":options.turn,"from":from}),
         )
         .map_err(|error| ways_past_busy(&bot, error))?;
@@ -1676,7 +1676,7 @@ fn approver(options: &Options) -> Result<i32> {
         },
         None => crate::approver::JudgeSpec::Model {
             model: judge,
-            reasoning: options.reasoning.clone(),
+            effort: options.effort.clone(),
         },
     };
     crate::approver::main(crate::approver::Settings {

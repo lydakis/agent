@@ -39,7 +39,7 @@ fn binding() -> Binding<'static> {
         family: Family::Responses,
         model: "synthetic-model",
         instructions: "test",
-        reasoning: None,
+        effort: None,
         budget_tokens: None,
         tools: &READ,
         created_by: None,
@@ -153,7 +153,7 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
     let branch = TurnOptions {
         workspace: Some("/synthetic/alternative".into()),
         model: None,
-        reasoning: None,
+        effort: None,
         delivery: Delivery::Reject,
         expected_turn: None,
         from: None,
@@ -2208,7 +2208,7 @@ fn schema_41_turns_ran_at_their_bots_effort() {
             "Bob",
             Some("/synthetic"),
             Binding {
-                reasoning: Some("medium"),
+                effort: Some("medium"),
                 ..binding()
             },
         )
@@ -2246,11 +2246,11 @@ fn schema_41_turns_ran_at_their_bots_effort() {
         .unwrap();
     let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     assert_eq!(
-        db.turns("Bob", 0, 10).unwrap()["turns"][0]["reasoning"],
+        db.turns("Bob", 0, 10).unwrap()["turns"][0]["effort"],
         "medium"
     );
     assert_eq!(
-        db.turns("Bob", 0, 10).unwrap()["turns"][1]["reasoning"],
+        db.turns("Bob", 0, 10).unwrap()["turns"][1]["effort"],
         "medium"
     );
     drop(db);
@@ -2317,7 +2317,7 @@ fn schema_42_backfills_absorbed_effort_or_rolls_back_when_history_is_missing() {
                 "Bob",
                 Some("/synthetic"),
                 Binding {
-                    reasoning: Some("high"),
+                    effort: Some("high"),
                     ..binding()
                 },
             )
@@ -2329,7 +2329,7 @@ fn schema_42_backfills_absorbed_effort_or_rolls_back_when_history_is_missing() {
                     "work",
                     true,
                     &TurnOptions {
-                        reasoning: Some("low".into()),
+                        effort: Some("low".into()),
                         ..TurnOptions::default()
                     },
                     allow_provider,
@@ -2361,7 +2361,7 @@ fn schema_42_backfills_absorbed_effort_or_rolls_back_when_history_is_missing() {
                 "join",
                 true,
                 &TurnOptions {
-                    reasoning: Some("low".into()),
+                    effort: Some("low".into()),
                     ..steer.clone()
                 },
                 allow_provider,
@@ -2436,7 +2436,7 @@ fn schema_42_backfills_absorbed_effort_or_rolls_back_when_history_is_missing() {
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|t| t["reasoning"].as_str().unwrap())
+                .map(|t| t["effort"].as_str().unwrap())
                 .collect();
             assert_eq!(levels, ["low", "low", "low", "low", "high", "high"]);
             drop(db);
@@ -2824,32 +2824,29 @@ fn a_turn_runs_at_its_own_effort_or_its_bots() {
         "Bob",
         Some("/synthetic"),
         Binding {
-            reasoning: Some("high"),
+            effort: Some("high"),
             ..binding()
         },
     )
     .unwrap();
     let at = |level: &str| TurnOptions {
-        reasoning: Some(level.into()),
+        effort: Some(level.into()),
         ..TurnOptions::default()
     };
     // Only the levels the bot's family takes, named as at creation.
     let refused = db
         .begin("Bob", "r0", "work", true, &at("max"), allow_provider)
         .unwrap_err();
-    assert_eq!(refused.code, "invalid_reasoning_level");
+    assert_eq!(refused.code, "invalid_effort");
     assert_eq!(
-        refused.facts.unwrap()["levels"],
+        refused.facts.unwrap()["efforts"],
         json!(["low", "medium", "high", "xhigh"])
     );
     let low = db
         .begin("Bob", "r1", "work", true, &at("low"), allow_provider)
         .unwrap();
-    assert_eq!(low.entry.unwrap()["data"]["reasoning"], "low");
-    assert_eq!(
-        db.context(low.turn).unwrap().reasoning.as_deref(),
-        Some("low")
-    );
+    assert_eq!(low.entry.unwrap()["data"]["effort"], "low");
+    assert_eq!(db.context(low.turn).unwrap().effort.as_deref(), Some("low"));
     // The level is part of the request: a retry must name the same one.
     assert!(
         !db.begin("Bob", "r1", "work", true, &at("low"), allow_provider)
@@ -2863,7 +2860,7 @@ fn a_turn_runs_at_its_own_effort_or_its_bots() {
         "idempotency_conflict"
     );
     let steer = |level: Option<&str>| TurnOptions {
-        reasoning: level.map(Into::into),
+        effort: level.map(Into::into),
         delivery: Delivery::Steer,
         ..TurnOptions::default()
     };
@@ -2922,13 +2919,13 @@ fn a_turn_runs_at_its_own_effort_or_its_bots() {
             allow_provider,
         )
         .unwrap();
-    assert_eq!(plain.entry.unwrap()["data"]["reasoning"], "high");
+    assert_eq!(plain.entry.unwrap()["data"]["effort"], "high");
     let listed = db.turns("Bob", 0, 10).unwrap();
     let levels: Vec<&Value> = listed["turns"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|t| &t["reasoning"])
+        .map(|t| &t["effort"])
         .collect();
     assert_eq!(levels, ["low", "low", "low", "xhigh", "high", "high"]);
 }
@@ -2942,7 +2939,7 @@ fn absorbed_effort_does_not_change_the_submitted_request() {
                 "Bob",
                 Some("/synthetic"),
                 Binding {
-                    reasoning: Some("high"),
+                    effort: Some("high"),
                     ..binding()
                 },
             )
@@ -2954,7 +2951,7 @@ fn absorbed_effort_does_not_change_the_submitted_request() {
                     "work",
                     true,
                     &TurnOptions {
-                        reasoning: Some("low".into()),
+                        effort: Some("low".into()),
                         ..TurnOptions::default()
                     },
                     allow_provider,
@@ -2963,7 +2960,7 @@ fn absorbed_effort_does_not_change_the_submitted_request() {
                 .turn;
             let prompt = "x".repeat(size);
             let options = TurnOptions {
-                reasoning: level.map(Into::into),
+                effort: level.map(Into::into),
                 delivery: Delivery::Steer,
                 expected_turn: Some(running),
                 ..TurnOptions::default()
@@ -2984,10 +2981,7 @@ fn absorbed_effort_does_not_change_the_submitted_request() {
             db.finish(running, None).unwrap();
             // Both the inline and shared-prompt paths report the effective effort,
             // but retries still compare the original omission or explicit level.
-            assert_eq!(
-                db.turns("Bob", 0, 10).unwrap()["turns"][1]["reasoning"],
-                "low"
-            );
+            assert_eq!(db.turns("Bob", 0, 10).unwrap()["turns"][1]["effort"], "low");
             let retry = db
                 .begin("Bob", "steer", &prompt, true, &options, allow_provider)
                 .unwrap();
@@ -2998,7 +2992,7 @@ fn absorbed_effort_does_not_change_the_submitted_request() {
                 .filter(|v| *v != level)
             {
                 let other = TurnOptions {
-                    reasoning: changed.map(Into::into),
+                    effort: changed.map(Into::into),
                     ..options.clone()
                 };
                 assert_eq!(
@@ -3019,7 +3013,7 @@ fn the_next_turn_knows_the_effort_its_history_was_sent_at() {
         "Bob",
         Some("/synthetic"),
         Binding {
-            reasoning: Some("high"),
+            effort: Some("high"),
             ..binding()
         },
     )
@@ -3027,7 +3021,7 @@ fn the_next_turn_knows_the_effort_its_history_was_sent_at() {
     let mut previous = Vec::new();
     for (n, level) in [(1, Some("low")), (2, None), (3, None)] {
         let options = TurnOptions {
-            reasoning: level.map(Into::into),
+            effort: level.map(Into::into),
             ..TurnOptions::default()
         };
         let turn = db
@@ -3062,7 +3056,7 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
     let options = TurnOptions {
         workspace: Some("/synthetic/elsewhere".into()),
         model: Some("openai/other-model".into()),
-        reasoning: None,
+        effort: None,
         delivery: Delivery::Reject,
         expected_turn: None,
         from: None,
@@ -3190,7 +3184,7 @@ fn a_bot_without_a_default_workspace_needs_one_per_submission() {
     let options = TurnOptions {
         workspace: Some("/synthetic/today".into()),
         model: None,
-        reasoning: None,
+        effort: None,
         delivery: Delivery::Reject,
         expected_turn: None,
         from: None,
@@ -3836,7 +3830,7 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
             &TurnOptions {
                 workspace: Some("/synthetic/b".into()),
                 model: None,
-                reasoning: None,
+                effort: None,
                 delivery: Delivery::Reject,
                 expected_turn: None,
                 from: None,
