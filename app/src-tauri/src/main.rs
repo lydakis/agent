@@ -14,7 +14,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod daemon;
+mod files;
+mod git;
 mod memory;
+mod plan;
 mod project;
 mod remote;
 mod session;
@@ -310,8 +313,9 @@ fn setup(windows: State<'_, Windows>, window: tauri::WebviewWindow) -> Result<Va
 }
 
 /// The shared client policy for a workspace (the app's own by default),
-/// composed now so an edited AGENTS.md reaches the next bot: preamble,
-/// AGENTS.md files, skills and profiles, and the role `profile` names.
+/// composed now so an edited AGENTS.md or saved memory reaches the next
+/// bot: preamble, AGENTS.md files, skills and profiles, the person's and
+/// the project's memory indexes, and the role `profile` names.
 #[tauri::command]
 fn policy(
     windows: State<'_, Windows>,
@@ -320,12 +324,20 @@ fn policy(
     profile: Option<String>,
 ) -> Result<Value, String> {
     let state = windows.of(&window)?;
-    state.here("Composing an agent's instructions (AGENTS.md, skills, profiles)")?;
+    state.here("Composing an agent's instructions (AGENTS.md, skills, profiles, memory)")?;
     let dir = match workspace.or_else(|| state.config.workspace.clone()) {
         Some(dir) => workspace_path(std::path::Path::new(&dir))?,
         None => return Err("no workspace".into()),
     };
     compose(std::path::Path::new(&dir), profile.as_deref())
+}
+
+/// The folder Home works in: yours. Home reads every project's agents
+/// through `agent`, so it needs no folder of its own.
+#[tauri::command]
+fn home_dir(windows: State<'_, Windows>, window: tauri::WebviewWindow) -> Result<String, String> {
+    windows.of(&window)?.here("Starting Home")?;
+    std::env::var("HOME").map_err(|_| "no HOME for Home to work in".into())
 }
 
 /// The profiles a folder offers as identities for a swarm's agents, with
@@ -341,7 +353,7 @@ fn profiles(
     let dir = workspace_path(std::path::Path::new(&dir))?;
     let failed = |error: agent_client::policy::Failure| format!("{}: {error}", error.code());
     let workspace = std::path::Path::new(&dir);
-    let listed = agent_client::policy::instructions(workspace, None).map_err(failed)?;
+    let listed = agent_client::policy::instructions(workspace, None, &[]).map_err(failed)?;
     let mut out = Vec::new();
     // The app's own roles are client roles, which the index leaves out.
     for entry in listed.profiles {
@@ -356,7 +368,10 @@ fn profiles(
 /// The roles the app ships, used where neither the folder nor the user has
 /// a file of that name. They are `policy::CLIENT_ROLES`, so no agent is
 /// offered one as a role to start a peer in.
-const BUILT_IN: [(&str, &str); 1] = [("coordinator", include_str!("../../agents/coordinator.md"))];
+const BUILT_IN: [(&str, &str); 2] = [
+    ("coordinator", include_str!("../../agents/coordinator.md")),
+    ("home", include_str!("../../agents/home.md")),
+];
 
 /// The file a role of the app's is read from in every project: yours,
 /// `~/.agents/agents/NAME.md`, which a project's own file of that name
@@ -464,6 +479,106 @@ async fn read_file(
 }
 
 const FILE_CAP: u64 = 4 * 1024 * 1024;
+
+/// The files of the repository `dir` is in, for ⌘P: paths under `root`,
+/// listed by git. Only this machine's: a window on a host is refused.
+#[tauri::command]
+async fn list_files(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    dir: String,
+) -> Result<Value, String> {
+    windows.of(&window)?.here("Finding a file")?;
+    let dir = file_path(&dir, std::env::var_os("HOME"))?;
+    let listing = tauri::async_runtime::spawn_blocking(move || files::list(&dir))
+        .await
+        .map_err(|e| e.to_string())??;
+    Ok(json!({"root": listing.root, "files": listing.files, "more": listing.more}))
+}
+
+/// What the Git tab shows of the repository `dir` is in: its changes, its
+/// last commits and its worktrees. Only this machine's: a window on a host
+/// is refused.
+#[tauri::command]
+async fn git_view(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    dir: String,
+) -> Result<Value, String> {
+    windows.of(&window)?.here("The Git tab")?;
+    let dir = file_path(&dir, std::env::var_os("HOME"))?;
+    let view = blocking(move || git::view(&dir)).await?;
+    let changes: Vec<Value> = view
+        .changes
+        .iter()
+        .map(|c| json!({"code": c.code, "path": c.path, "from": c.from}))
+        .collect();
+    let commits: Vec<Value> = view
+        .commits
+        .iter()
+        .map(|c| json!({"sha": c.sha, "subject": c.subject, "author": c.author, "when": c.when}))
+        .collect();
+    let worktrees: Vec<Value> = view
+        .worktrees
+        .iter()
+        .map(|w| json!({"path": w.path, "branch": w.branch}))
+        .collect();
+    Ok(json!({
+        "root": view.root,
+        "branch": view.branch,
+        "changes": changes,
+        "more": view.more,
+        "commits": commits,
+        "worktrees": worktrees,
+    }))
+}
+
+/// Memory as the Memory sheet and a coordinator's wake show it: the
+/// person's facts, and the project's of the folder `dir` is in, or every
+/// project's with no folder. Only this machine's: a window on a host is
+/// refused.
+#[tauri::command]
+async fn memory_view(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    project: Option<String>,
+) -> Result<Value, String> {
+    windows.of(&window)?.here("Memory")?;
+    if let Some(name) = &project
+        && !project::valid_name(name)
+    {
+        return Err(format!("project_invalid: {name}"));
+    }
+    let home = std::env::var_os("HOME").ok_or("no HOME for ~/.agents/memory")?;
+    let root = std::path::Path::new(&home).join(".agents/memory");
+    blocking(move || Ok(memory::view(&root, project.as_deref()))).await
+}
+
+/// The diff of one change under `root`, or of one commit (`commit`).
+#[tauri::command]
+async fn git_diff(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    root: String,
+    path: Option<String>,
+    from: Option<String>,
+    untracked: Option<bool>,
+    commit: Option<String>,
+) -> Result<Value, String> {
+    windows.of(&window)?.here("The Git tab")?;
+    let root = file_path(&root, std::env::var_os("HOME"))?;
+    let target = match (commit, path) {
+        (Some(sha), _) => git::Target::Commit(sha),
+        (None, Some(path)) => git::Target::Change {
+            path,
+            from,
+            untracked: untracked.unwrap_or(false),
+        },
+        (None, None) => return Err("a path or a commit".to_owned()),
+    };
+    let diff = blocking(move || git::diff(&root, &target)).await?;
+    Ok(json!({"text": diff.text, "cut": diff.cut}))
+}
 
 fn file_path(path: &str, home: Option<std::ffi::OsString>) -> Result<std::path::PathBuf, String> {
     let path = match (path.strip_prefix("~/"), home) {
@@ -776,12 +891,15 @@ fn compose(workspace: &std::path::Path, profile: Option<&str>) -> Result<Value, 
         }
     };
     let role = profile.map(find).transpose()?;
-    let composed = agent_client::policy::instructions(workspace, role.as_ref()).map_err(failed)?;
+    let memory = agent_client::policy::memory_indexes(workspace).map_err(failed)?;
+    let composed =
+        agent_client::policy::instructions(workspace, role.as_ref(), &memory).map_err(failed)?;
     let mut note = format!(
-        "preamble + {} AGENTS.md + {} skills + {} profiles",
+        "preamble + {} AGENTS.md + {} skills + {} profiles + {} memory indexes",
         composed.sources.len(),
         composed.skills.len(),
-        composed.profiles.len()
+        composed.profiles.len(),
+        composed.memory.len()
     );
     if let Some(role) = &role {
         let from = role.path.as_ref().map_or_else(
@@ -1058,6 +1176,16 @@ fn swarms_of(state: &Shared) -> Result<PathBuf, String> {
     swarm::root(&store.ok_or("detached: swarms are read once the window is attached")?)
 }
 
+/// File work a command does off the window's thread and the async workers:
+/// it waits on the blocking pool.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// The swarm skill's script, run for you with `args` (see `swarm::run`).
 #[tauri::command]
 async fn swarm_run(
@@ -1133,6 +1261,43 @@ fn trigger_fire(
     name: String,
 ) -> Result<Value, String> {
     trigger::fire_now(&triggers_of(&*windows.of(&window)?)?, &name)
+}
+
+/// The folder of plans beside the store this window's daemon runs, where
+/// its agents' `plan` script writes (see `plan`).
+fn plans_of(state: &Shared) -> Result<PathBuf, String> {
+    match &state.config.target {
+        Target::Host(host) => Err(format!(
+            "remote_unsupported: plans are read from this machine's files, and this window's agents run on {}",
+            host.alias
+        )),
+        Target::Local { store: Some(store), .. } => plan::dir(store),
+        Target::Local { store: None, .. } => Err(
+            "plans_unsupported: this window was opened on a socket, so the store its agents' plans sit beside is unknown; open it with --store".into(),
+        ),
+    }
+}
+
+/// The plans of the agents `ids` names, by bot id (one with none is left out).
+#[tauri::command]
+async fn plans(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    ids: Vec<i64>,
+) -> Result<Value, String> {
+    let dir = plans_of(&*windows.of(&window)?)?;
+    blocking(move || plan::read(&dir, &ids)).await
+}
+
+/// Remove a deleted agent's plan.
+#[tauri::command]
+async fn plan_forget(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    id: i64,
+) -> Result<(), String> {
+    let dir = plans_of(&*windows.of(&window)?)?;
+    blocking(move || plan::forget(&dir, id)).await
 }
 
 /// Page diagnostics land on stderr, where a terminal can see them.
@@ -1256,6 +1421,10 @@ fn main() {
             edit_role,
             open_link,
             read_file,
+            list_files,
+            git_view,
+            git_diff,
+            memory_view,
             branch,
             models,
             project,
@@ -1273,6 +1442,9 @@ fn main() {
             swarm_board,
             triggers,
             trigger_fire,
+            plans,
+            home_dir,
+            plan_forget,
             trigger_remove
         ])
         .setup(move |app| {

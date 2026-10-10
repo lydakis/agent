@@ -46,7 +46,7 @@ class TriggerFireTests(ModelFixture):
         return json.loads(self.agent('turns', '--store', str(self.store), '--bot', bot).stdout)
 
     def bot_id(self, bot):
-        return next(b['id'] for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout) if b['name'] == bot)
+        return next(b['bot_id'] for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout) if b['name'] == bot)
 
     def store_identity(self):
         # What the daemon announces in `ready`, and `add` keeps.
@@ -291,7 +291,7 @@ class TriggerFireTests(ModelFixture):
         try:
             events = connection.request('events', bot='p.lead', after=0, limit=256)['result']['events']
             accepted = next(e['data'] for e in events if e['event'] == 'accepted' and e['turn'] == answer['turn'])
-            self.assertEqual(accepted['from'], {'bot': 'p.task', 'turn': task_turn, 'id': self.bot_id('p.task')})
+            self.assertEqual(accepted['from'], {'bot': 'p.task', 'turn': task_turn, 'bot_id': self.bot_id('p.task')})
             self.assertNotIn('origin', accepted)
             # The task's own turn names where its answer goes.
             self.assertEqual(self.turns('p.task')[-1]['request_id'].rsplit('.to.', 1)[1], str(lead))
@@ -312,6 +312,12 @@ class TriggerFireTests(ModelFixture):
             self.assertEqual(first['last']['outcome'], 'sent', first)
             self.fire('p.task', 'once', extra=['--runs', '1'], generation='g1')
             self.assertEqual(len(self.turns('p.task')), 2)
+
+    def test_a_fire_caps_the_turn_it_starts(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        self.fire('p.task', 'check', extra=['--turn-budget-tokens', '500'])
+        self.settle('p.task')
+        self.assertEqual([t['budget_tokens'] for t in self.turns('p.task')], [None, 500])
 
     def test_a_one_off_whose_gate_says_no_ends_saying_so(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')

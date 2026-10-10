@@ -155,22 +155,10 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
                     _ => max_connecting = Some(parsed),
                 }
             }
-            "--stall-timeout" => {
-                stall_timeout = Some(
-                    value
-                        .parse::<u64>()
-                        .ok()
-                        .filter(|n| (1..=86_400).contains(n))
-                        .ok_or(Error::with(
-                            "usage",
-                            "--stall-timeout needs seconds from 1 to 86400",
-                        ))?,
-                )
-            }
+            // `prepare` has checked each range.
+            "--stall-timeout" => stall_timeout = Some(cli::duration_secs(flag, value)?),
             "--idle-exit" => {
-                let seconds: u64 = value
-                    .parse()
-                    .map_err(|_| Error::with("usage", "--idle-exit needs seconds (0 disables)"))?;
+                let seconds = cli::duration_secs(flag, value)?;
                 idle_exit = (seconds > 0).then_some(seconds);
             }
             _ => return fail_with("usage", format!("unknown option {flag}")),

@@ -133,8 +133,9 @@ A bot is an identity with a retained conversation: every turn appends to it.
 exist; `--new --bot NAME` creates it and fails with `bot_exists` if the name is
 taken; no `--bot` creates a fresh generated identity. A typo can therefore never
 silently start an empty conversation under a familiar name. Names are the
-address; the identity is a store-wide integer `id` that `create`, `fork`,
-`resume`, `bots`, and every `submit` answer report, and that is never reused
+address; the identity is a store-wide integer `bot_id` that `create`, `fork`,
+`resume`, `bots`, every `submit` answer, and the `created` and `forked` events
+report, and that is never reused
 after a delete. A fork is a new identity with an empty request namespace.
 
 A bot keeps its folder but is not bound to it. A new bot starts in the
@@ -292,6 +293,16 @@ Cancellation and failures before a usage report is returned can leave usage
 unaccounted for; these totals are not a reconciliation of provider billing.
 Successful calls retain their single atomic transcript/usage commit; budget
 checks use the turn's running total without an extra database read per round.
+`submit` also accepts `budget_tokens`, a cap on the input plus output tokens
+of the turn it starts, checked where the bot's cap is. A turn past it ends as
+`failed` with `turn_budget_exhausted` and the facts `turn_budget_tokens` and
+`turn_tokens_used`; when both caps are reached the bot's `budget_exhausted`
+is named, since it outlasts the turn. The cap is stored on the turn (`turns`
+lists it as `budget_tokens`), so a resumed turn counts what it spent before
+parking, and a resend naming another cap is an `idempotency_conflict`. A
+steer joins a turn that already has its cap: `budget_tokens` with
+`delivery: "steer"` is `invalid_delivery`. A summary held beside a call
+counts toward both caps.
 
 A turn reads the same wherever a client meets it. Its view is `bot`,
 `bot_id`, `turn`, `handle`, `request_id`, `status`, `waiting_on`,
@@ -306,7 +317,11 @@ outcome once finished; an `interrupt` reply is the view plus
 
 `turns` (protocol) and `agent turns --bot NAME` list a bot's turns as views
 with effective workspace, model and effort, delivery, cache hit, and a
-prompt preview, paged by `after`. A finished turn's outcome comes from `wait` on
+prompt preview, oldest first and paged by `after` (`next_after`). With
+`newest: true` a page runs newest first from the end of the bot's turn index
+and is paged by `before` (`next_before`), so a bot's last few turns cost one
+indexed read however many it has; `after` and `before` bound either direction
+(`agent turns --newest --limit N`). A finished turn's outcome comes from `wait` on
 its handle; `timeout_ms: 0` answers at once, pending while the turn runs. `agent turns`
 restarts an idle daemon using the supplied provider/tool configuration (or
 provider environment defaults), honors `--no-spawn`, and refuses missing stores.
@@ -337,8 +352,8 @@ bound; the operating system is then the only limit.
 | `--max-pending` | Submissions waiting to start: queued behind a bot's own work or ready for a slot, daemon-wide. A submission that would wait past the bound answers `pending_limit` and writes nothing; one that starts at once is never refused by it. | none |
 | `--max-pending-bytes` | UTF-8 prompt bytes of those waiting submissions. | none |
 | `--max-connecting` | Provider requests awaiting response headers, a Bedrock Runtime call's body digest included. Established streams are not capped. Both providers hold headers until the first token, so a permit is held for the whole time to first token; a bound of N caps throughput at N calls per first-token latency. | none |
-| `--stall-timeout` | Seconds an established provider stream may go without a content frame before the attempt fails as `provider_stream_stalled` and is retried. Keepalives do not count. 1 to 86,400. | 120 |
-| `--idle-exit` | Seconds after which a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
+| `--stall-timeout` | How long an established provider stream may go without a content frame before the attempt fails as `provider_stream_stalled` and is retried. Keepalives do not count. Whole seconds, `1s` to `24h`. | `2m` |
+| `--idle-exit` | How long, in whole seconds, before a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
 | (derived) `connections` | HTTP/2 connections per provider: `max-active` divided by 64 streams per connection (both providers allow 100; fewer bounds how many turns one reset connection takes with it), 1 to 256; 64 when active is unbounded. Reported in `ready`, not a flag. | 64 |
 
 ### Bot settings
@@ -365,8 +380,8 @@ keep-warm when it sets any of them.
 | `note_turns` (`--note-turns`) | Omitted turns the context note lists, newest first, with the first line of each prompt. 0 lists none. | 48 |
 | `compact_at` (`--compact-at`) | Percent of either context envelope that triggers compaction, and of the byte envelope that triggers tool-result elision first. Estimated completion headroom can advance the byte trigger without reducing the input allowance. | 75 |
 | `compact_keep` (`--compact-keep`) | Target percent of either context envelope kept verbatim: as newest whole turns by compaction, as newest items by elision. Reduced when pinned context leaves less room. Must be below `compact_at`. | 25 |
-| `retain_turns` (`--retain-turns`) | After each of its turns finishes, prune the bot to this many turns' records (see [Retention](#retention)). | none |
-| `approval_hold_ms` (`--approval-hold-ms`) | Milliseconds a gated call waits live for its verdict before its turn parks (see [tool approval](#tool-approval)). 0 parks at once; at most 3,600,000. | 2,000 |
+| `keep_turns` (`--keep-turns`) | After each of its turns finishes, prune the bot to this many turns' records (see [Retention](#retention)). | none |
+| `approval_hold_ms` (`--approval-hold`) | Milliseconds a gated call waits live for its verdict before its turn parks (see [tool approval](#tool-approval)). 0 parks at once; at most 3,600,000. | 2,000 |
 | `max_output_tokens` (`--max-output-tokens`) | Generated tokens per model call, including reasoning, summaries included. Anthropic calls use the model's full output limit (read inside Bedrock ids) unless this is set; set, it is sent as `max_tokens`, at least 2,048 so a legacy thinking budget of 1,024 or more fits beside the answer. Bedrock deducts input plus this bound from quota when a call starts, so a bound near real output buys throughput there. | none |
 | `keep_warm` (`--keep-warm`) | Seconds an Anthropic prompt cache may sit unread while a turn runs a tool before it is refreshed (see [keeping the cache warm](#keeping-the-anthropic-cache-warm)). Below 300; 0 never refreshes. | 240 |
 | `cache_ttl` (`--cache-ttl`) | Anthropic prompt-cache lifetime, `5m` or `1h`, on both cache markers. `1h` bills each write at twice the input rate instead of 1.25 times and sends no refreshes. Responses providers are unaffected; Bedrock's acceptance of `1h` is unverified. | `5m` |
@@ -857,7 +872,7 @@ start. Parked and paced turns stay parked, as on any shutdown. `stats` reports
 `draining: true`. The daemon exits when no turn is running or the deadline
 passes, whichever comes first. A later `shutdown` can only bring the deadline
 closer; SIGTERM and SIGINT still exit at once. Turns still running at exit are
-cancelled like any others at shutdown. `agent shutdown --grace SECONDS` sends
+cancelled like any others at shutdown. `agent shutdown --grace DURATION` sends
 it and waits that much longer than 30 seconds.
 
 On shutdown, committed turn events get up to five seconds to drain through
@@ -905,13 +920,15 @@ own path from the turn. Example requests:
 {"id":8,"op":"fork","source":"Bob","checkpoint":2,"bot":"Alternative","request_id":"alt-1"}
 {"id":9,"op":"interrupt","bot":"Bob","turn":1}
 {"id":11,"op":"bots","after":null,"limit":64}
+{"id":22,"op":"bots","after":null,"limit":64,"name":"project.*","active":true}
+{"id":23,"op":"turns","bot":"Bob","newest":true,"limit":3}
 {"id":14,"op":"prune","bot":"Bob","keep_turns":8}
 {"id":15,"op":"delete","bot":"Bob","bot_id":1}
 {"id":16,"op":"follow","bot":"*","after":0}
 {"id":17,"op":"wait","handles":["turn:Bob/1","turn:Alice/3"],"any":true,"timeout_ms":60000}
 {"id":18,"op":"stats"}
 {"id":19,"op":"provider_models"}
-{"id":21,"op":"create","bot":"Carol","workspace":"/workspaces/project","model":"openai/gpt-6-luna","instructions":"...","tools":["shell","read","write","edit","wait","history"],"approve":["shell","write","edit","read"],"approver":"manual","settings":{"context_bytes":1048576,"retain_turns":16}}
+{"id":21,"op":"create","bot":"Carol","workspace":"/workspaces/project","model":"openai/gpt-6-luna","instructions":"...","tools":["shell","read","write","edit","wait","history"],"approve":["shell","write","edit","read"],"approver":"manual","settings":{"context_bytes":1048576,"keep_turns":16}}
 {"id":22,"op":"approvals","bot":"Carol","limit":64}
 {"id":23,"op":"answer","bot":"Carol","turn":7,"call_id":"call_1","request":1,"decision":"deny","reason":"not on main","by":"cli"}
 {"id":24,"op":"serve_approvals","tag":"auto","lease_ms":5000,"limit":64}
@@ -944,7 +961,7 @@ The fork can read its shared prefix after its source is deleted.
 `history_items` accepts `bot` and 1–400 distinct `nodes`. It validates all IDs
 against that bot's lineage with one ancestry walk and returns a prefix as
 `items: [{node: ID, item: VALUE}, ...]` in request order. A prompt a bot's turn
-wrote also carries `from: {bot, turn, id}`, with `id` the identity the bot's name
+wrote also carries `from: {bot, turn, bot_id}`, with `bot_id` the identity the bot's name
 held when it wrote it, and one a client sent with an `origin` carries that, so a
 client can say who each message came from without reading every turn. The store
 keeps both with the prompt's node (`senders`), so they last as long as the item:
@@ -1059,6 +1076,13 @@ budget. Pass `next_after` as the next request's `after` until it is null. Pages
 omit instructions; `resume` returns the full individual bot record. Concurrent
 creations before an already-consumed cursor require restarting the listing.
 `agent ls` reads pages incrementally while preserving its JSON-array output.
+Protocol version 12 lets `bots` filter on the daemon side: `name` keeps the
+bots whose name matches a SQLite GLOB pattern (1 to 256 bytes; case-sensitive
+like names), read from the name index's range for the pattern's literal
+prefix, and `active: true` keeps those with a turn running, read from a partial
+index of only them (`bots_running`). Filtered pages page and bound like any
+other. `bots` and `turns` run on the store's reader connection, so a listing
+never waits behind, or holds up, the writer.
 
 Replay tasks are owned by their subscriptions and tracked by the service.
 Replacing a follow on the same bot/session and session closure
@@ -1121,7 +1145,7 @@ that turn; a prompt without it is a person's. The CLI sends it from
 without the other (`author_turn_required`). The store checks that the turn
 is the bot's (`invalid_from`), keeps it on the new turn's row, a steer's
 included, counts it in the request's idempotency, and reports it on
-`accepted`, `queued` and `steered`, with the sender's identity as `from.id`. Like the
+`accepted`, `queued` and `steered`, with the sender's identity as `from.bot_id`. Like the
 creator, it is declared, not verified. A client that sends a prompt on its own,
 not from a bot's turn, may name itself with `origin` (a name's characters,
 else `invalid_origin`), mutually exclusive with `from`, stored and reported the same way; the daemon gives it
@@ -1752,7 +1776,7 @@ needs, and one optional policy composes them:
   cursor: an `events` page starting before it carries `pruned_before`, and a
   `follow` from before it is preceded by a `pruned` notification, so no
   consumer replays a silent gap. `agent prune --bot --keep-turns N`.
-- A bot's `retain_turns` setting applies `prune` to it after each of
+- A bot's `keep_turns` setting applies `prune` to it after each of
   its turns finishes, inside the same commit, including cancelled or failed queued work and interruption
   while parked, before the terminal
   event is delivered. Whoever sees `turn_finished` sees the store as retention

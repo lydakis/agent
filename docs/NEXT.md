@@ -140,7 +140,7 @@ bytes per parked turn versus per live process, on the lifecycle screen.
    memory, threads, or open files and no provider rate limit; the store grew
    2.8 KB per turn. Retention is now explicit: `delete` frees a bot and its
    exclusive history, `prune` keeps the newest N turns' records, and
-   a bot's `retain_turns` setting applies prune after every turn; see
+   a bot's `keep_turns` setting applies prune after every turn; see
    [RUST_PROTOTYPE.md](RUST_PROTOTYPE.md#retention) and the measured growth in
    [LIVE_FLEET.md](LIVE_FLEET.md#retention-under-sustained-load). What still
    grows per turn is the original transcript. Context compaction does not
@@ -445,7 +445,7 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     histograms come from one consistent snapshot, formatted outside the lock. The
     store-scale screen (item 3) reads them. (From the second Astra Pro
     review.)
-28. Done: bot identities. A bot has a store-wide integer `id`, allocated
+28. Done: bot identities. A bot has a store-wide integer `bot_id`, allocated
     from a sequence and never reused after delete; `create`, `fork`,
     `resume`, `bots`, and `submit` report it and the `created` and `forked`
     events carry it. `submit` accepts `bot_id`, and `run --bot-id N`: a retry

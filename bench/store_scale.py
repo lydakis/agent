@@ -321,7 +321,7 @@ class Screen:
             db.executescript("DROP INDEX bots_id; ALTER TABLE bots DROP COLUMN id; DROP TABLE bot_sequence;"
                              " PRAGMA user_version=20;")
         out['migration_restart_ready_ms'] = self.connect()
-        assert self.client.request('resume', bot=self.heavy(0))['result']['id'] > 0
+        assert self.client.request('resume', bot=self.heavy(0))['result']['bot_id'] > 0
         # Copy values so later phases cannot rewrite an earlier checkpoint.
         out['peaks'] = {k: dict(v) for k, v in list(self.sampler.peaks.items())}
         self.sampler.phase = 'idle'

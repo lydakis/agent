@@ -76,11 +76,11 @@ class SwarmTests(ModelFixture):
         self.assertEqual(started['failed'], [])
         # Every agent runs the coordinator's model, in its folder, with half the budget.
         listed = self.listed()
-        self.assertEqual(started['swarm']['ids'], {m: listed[m]['id'] for m in started['bots']})
+        self.assertEqual(started['swarm']['ids'], {m: listed[m]['bot_id'] for m in started['bots']})
         self.assertEqual(started['swarm']['mix'], [{'model': 'openai/synthetic-model', 'share': 100,
                                                     'identity': '', 'effort': None}])
         self.assertEqual(started['swarm']['workspace'], str(self.path))
-        self.assertEqual(started['swarm']['coordinator'], {'bot': 'p.lead', 'id': listed['p.lead']['id']})
+        self.assertEqual(started['swarm']['coordinator'], {'bot': 'p.lead', 'id': listed['p.lead']['bot_id']})
         self.assertEqual(listed['p.widget-1']['budget_tokens'], 250000)
         self.assertEqual(listed['p.widget-1']['created_by'], 'p.lead')
         # Its folder is the one a window on this store reads, and the goal opens the board.
@@ -332,19 +332,19 @@ class SwarmRuleTests(unittest.TestCase):
         return folder, self.s.Act(folder, author, 1, live)
 
     def bot(self, n, used, cap=1000, turn=None):
-        return {'name': f'p.w-{n}', 'id': n, 'tokens_used': used, 'budget_tokens': cap, 'running_turn': turn}
+        return {'name': f'p.w-{n}', 'bot_id': n, 'tokens_used': used, 'budget_tokens': cap, 'running_turn': turn}
 
     def test_a_deleted_helper_still_counts_and_a_deleted_member_takes_its_share(self):
         state = self.s.empty_state()
         members = {'p.w-1': self.bot(1, 100), 'p.w-2': self.bot(2, 50)}
-        helper = {'name': 'p.w-1.fix', 'id': 7, 'tokens_used': 30, 'root': 1}
+        helper = {'name': 'p.w-1.fix', 'bot_id': 7, 'tokens_used': 30, 'root': 1}
         self.assertEqual(self.s.usage(state, members, [helper]), (180, 2000))
         self.assertTrue(state.pop('dirty'))
         self.assertEqual(self.s.usage(state, members, [helper]), (180, 2000))
         self.assertNotIn('dirty', state)
         # Once gone, a helper is its member's sum, not an id kept forever,
         # unless a helper it made is still listed.
-        deeper = {'name': 'p.w-1.fix.more', 'id': 8, 'tokens_used': 5, 'root': 1, 'created_by_id': 7}
+        deeper = {'name': 'p.w-1.fix.more', 'bot_id': 8, 'tokens_used': 5, 'root': 1, 'created_by_id': 7}
         self.assertEqual(self.s.usage(state, members, [deeper]), (185, 2000))
         self.assertEqual((state['helpers'], state['gone']), ({'7': [0, 1], '8': [5, 1]}, {'1': 30}))
         state.pop('dirty')

@@ -43,6 +43,81 @@ made.
 ![The finder](app/nav-find.png)
 ![A third tab from the finder](app/nav-tabs.png)
 
+### Files
+
+Captured 2026-10-10. A file a reply links opens beside it; ⤢ Open as tab
+makes it a tab of its own.
+
+![PLAN.md open beside the reply that links it](app/file-beside.png)
+![PLAN.md in a tab](app/file-tab.png)
+
+⌘P searches the files of the repository in view (Tab inside the finder
+trades it for the agents), and Enter opens the pick in a tab.
+
+![The finder's files](app/file-find.png)
+![session.rs in a tab, highlighted](app/file-code-tab.png)
+
+### Git
+
+Captured 2026-10-10. An agent's ⎇ branch, or Git in its ⋯ menu, opens its
+folder's Git tab: changes, commits and worktrees on the left, the chosen diff
+on the right.
+
+![build's worktree: three changes, session.rs's diff](app/git-changes.png)
+
+A click on a diff line writes a note; Enter sends it to the agent working
+there, which reads the file, line and quoted text first.
+
+![A note on an added line of mod.rs, going to build](app/git-note.png)
+![The note in build's chat, and its answer](app/git-agent.png)
+
+2 shows a commit's diff, file by file.
+
+![The worktree's newest commit](app/git-commit.png)
+
+### Memory
+
+Captured 2026-10-10. Memory, at the foot of the list at Home and in a
+project, shows what agents saved: yours and every project's at Home, newest
+first.
+
+![Memory at Home: yours, demo's and notes'](app/memory-home.png)
+
+In a project, its own facts come first. A fact opens in a tab, its front
+matter as a table.
+
+![demo's memory](app/memory-project.png)
+![A fact in a tab](app/memory-fact.png)
+
+A task update tells the lead what a task saved since it last heard.
+
+![demo's lead told that plan saved session-cookie](app/memory-wake.png)
+
+### Home
+
+Captured 2026-10-10. The first message sent at Home asks for the model and
+effort Home's agent runs on, then starts it and sends the message.
+
+![Start Home: a model and an effort, and Start and send](app/home-start.png)
+
+Home's chat: a status question answered from `agent ls`, and work for the
+demo project handed to its lead. Home's agent is not a row in the list.
+
+![Home's chat with two answers](app/home-chat.png)
+
+### Plans
+
+Captured 2026-10-10. A task that keeps a plan shows its count and current
+step on its card in the lead's chat and on its row in the list.
+
+![The demo project: build's card and row show 2 of 4 steps and the step it is on](app/plan-project.png)
+
+Beside, and full screen, the whole plan sits above its chat; the count folds
+it to the current step.
+
+![build beside the project, its plan above its chat](app/plan-beside.png)
+![build full screen, three of four steps done](app/plan-thread.png)
+
 ### Earlier
 
 Captured 2026-09-28, before the navigation above: the list was on the left
@@ -92,7 +167,7 @@ read back after a restart keeps the names. Messages the app sends on its own
 name their `origin` and are tagged with it: `tasks` for a coordinator's task
 updates and `trigger` for a triggered message. The daemon keeps the sender
 with the message, so a fork keeps it after its source is deleted; the name
-links to the agent only while that name still holds the identity (`from.id`)
+links to the agent only while that name still holds the identity (`from.bot_id`)
 that sent it.
 
 ![A task's chat: the coordinator's messages tagged](app/agent-message.png)
@@ -125,11 +200,9 @@ with a click.
 
 ![A Vega-Lite chart and an HTML preview](app/rich-preview.png)
 
-A file the reply links, open beside it: `PLAN.md` drawn as Markdown with its
-diagram. Its own link to `report/latency.vl.json` opens that chart file in its
-place.
-
-![PLAN.md open beside the reply that links it](app/file-beside.png)
+A file the reply links opens beside it (see Files above): `PLAN.md` drawn as
+Markdown with its diagram. Its own link to `report/latency.vl.json` opens that
+chart file in its place.
 
 New project is a sheet with the fundamentals only: a folder, typed or
 chosen with the system's picker (which can make a new one), the lead's model
@@ -185,13 +258,13 @@ says why beside those that answered.
 
 ![Settings with one provider failing](app/settings.png)
 
-Once a project exists, Settings also lists the app's coordinator role.
-**Edit** opens your own copy in `~/.agents/agents/` in your text editor, made
-from the app's text the first time, and from then on that file is the role in
-every project (a project's own `.agents/agents` file of the same name still
-comes first). An agent keeps the text it started with, so an edit reaches
-coordinators made after it. A swarm's agents follow the swarm skill's
-`member.md` instead. Captured 2026-10-10 in demo mode.
+Once Home or a project exists, Settings also lists the app's roles: the
+coordinator's and Home's. **Edit** opens your own copy in `~/.agents/agents/`
+in your text editor, made from the app's text the first time, and from then
+on that file is the role in every project (a project's own `.agents/agents`
+file of the same name still comes first). An agent keeps the text it started
+with, so an edit reaches the agents made after it. A swarm's agents follow
+the swarm skill's `member.md` instead. Captured 2026-10-10.
 
 ![Settings with the roles](app/settings-roles.png)
 
@@ -353,7 +426,7 @@ environment. A failed start shows the CLI's
 reason on the page and is not retried for 30 seconds. An explicit `--socket`
 or `AGENT_SOCKET` never starts anything. Uninstalling or upgrading the cask
 quits the app and runs the bundled `agent shutdown --store
-~/.agent/state.sqlite --grace 30`, so the default store's daemon, whoever
+~/.agent/state.sqlite --grace 30s`, so the default store's daemon, whoever
 started it, lets running turns finish and exits before its binary is replaced.
 The store is named so the uninstalling shell's `AGENT_STORE` or `AGENT_SOCKET`
 cannot point the shutdown elsewhere.
@@ -664,6 +737,27 @@ parent-death signal for the master to follow).
 The shell follows the "Agent App Concepts" prototype (NEXT item 47). The
 daemon learns nothing about projects; everything here is client work.
 
+- **Home.** Home is a chat with the person's own agent, the bot `home`,
+  which works in their home folder in the `home` role: the folder's (their
+  own `~/.agents/agents/home.md`) or the one the app ships
+  ([home.md](../app/agents/home.md)). The shipped text has it answer what is
+  running, what finished and what waits on the person from `agent ls`,
+  `approvals`, `turns` and `wait --timeout 0`, with the daemon reading only
+  what the question needs (`ls --active`, `approvals --limit 20`,
+  `ls --name 'PROJECT.*'`, `ls --name '*.lead'`,
+  `turns --newest --limit 3`) so a large fleet costs neither the daemon
+  a full listing nor the shell its output limit, hand a project's work to its lead with
+  `run --detach --delivery queue`, change no files and start no agents of
+  its own. Until it exists, Home says what it is for, and the first message
+  sent there opens **Start Home**, a model and an effort as every agent
+  takes, then creates it and sends that message; Cancel puts the message
+  back in the composer. At Home the main pane is its chat, its head
+  "Home" with its state, and away from Home the Home button shows that
+  state (working, waiting, done, failed); it is never a row in the list or a tab, and
+  opening it by name, from the finder or a crumb, opens Home. What it made
+  sits a level below it, reached from the finder. Home's agent is local
+  only, as projects are. It has no heartbeat or stand-up yet: those come
+  with triggers on Home (T2).
 - **Projects.** A project is a folder, its coordinator bot `<project>.lead`,
   and `.agents/project.toml` (name, coordinator, model and effort, the
   threads' model and effort and where they work; mechanics only). The
@@ -735,6 +829,26 @@ daemon learns nothing about projects; everything here is client work.
 - **Runs.** Thinking, tool calls and their output between two messages fold
   to one line: the call in progress with its clock, or the tools used, and
   any failure. A click opens a run or unfolds one long output.
+- **Plans.** An agent keeps its plan with the `plan` skill the app ships
+  ([SKILL.md](../app/skills/plan/SKILL.md)): its script replaces the whole
+  plan on each call, one step an argument marked `[x] ` done, `[>] ` doing
+  now or `[ ] ` to do (at most 30 steps of 200 bytes), and writes it whole
+  through a temporary and a rename to `STORE-plans/BOT_ID`, beside the
+  store the agent's shell names as `AGENT_STORE`, so a bot id never names
+  another store's agent. It answers a write with one line, not the plan
+  back, and `--clear` removes the plan once the work it describes is done.
+  The app reads the plans of the agents it seats when a window attaches,
+  and an agent's again when a shell call of its that ran the script ends:
+  nothing is watched or polled, and a plan left by an agent deleted from
+  another window is never read. For more than a few agents the app lists
+  the plans folder rather than looking each one up, so attaching costs the
+  plans that exist, not the agents in the store. An agent with a plan shows the step it is
+  on and how many are done on its row and its task card, and the whole
+  plan above its chat, whose count folds it to the current step. A
+  deleted agent's plan is removed. The coordinator's profile has a task of
+  several steps keep one. Plans are this machine's files: a window on a
+  host reads none, and one opened on a socket alone, whose store's path it
+  does not know, reads none and logs why.
 - **Side chats.** A side chat forks a bot, running or not, with no
   checkpoint, so the daemon copies it at its newest finished round; the
   source is untouched. The copy is named `NAME-side`, nests under its
@@ -1051,7 +1165,7 @@ The app writes `~/.agent/trigger` each time it opens, a script that runs its
 executable with `--trigger`:
 
 ```sh
-~/.agent/trigger add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] -- MESSAGE
+~/.agent/trigger add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--turn-budget-tokens N] -- MESSAGE
   WHEN: --every 30m | --in 45m | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO | --turn-end BOT [--count N]
 ~/.agent/trigger ls [--after NAME]
 ~/.agent/trigger fire NAME
@@ -1137,7 +1251,10 @@ was seen, so a heartbeat whose check finds
 nothing to do costs one process and no model call. A one-off whose check
 says no ends, listed as not sent.
 `--runs N` ends the trigger once N messages went out; a fire after that
-(its end could not unload it) only tries to end it again. Each message the
+(its end could not unload it) only tries to end it again.
+`--turn-budget-tokens N` submits each message with that turn cap, so one
+runaway fire fails with `turn_budget_exhausted` instead of spending the
+agent's whole lifetime budget. Each message the
 agent gets starts with one line, `[trigger NAME · YYYY-MM-DD HH:MM · why]`,
 the local fire time and what fired it (its time, `file PATH`, `commit REPO
 at SHA`, `turn end of BOT: turn:BOT/N completed`, or `fired`), so a
@@ -1370,9 +1487,36 @@ and refuses with `memory_full` an index of hand-added facts past 4 KiB. A
 removal reads the folder before deleting anything, and text piped on stdin
 past 4 KiB is `fact_too_large` rather than cut.
 
+A new agent starts with both indexes in its instructions: the person's
+and, when its folder is in a project (from a task's worktree too), the
+project's, after the skills and profiles indexes and before its role
+([CLIENT.md](CLIENT.md#layers)). That holds for agents the app creates and
+for those an agent creates with `agent run --new --agents`, such as a
+coordinator's tasks. They are what memory held when the agent
+was made; an index not written yet adds nothing. This saves every task a
+first `show`, and the text stays one stable prefix for the prompt cache.
+
+The app reads memory too, through `memory_view`
+([memory.rs](../app/src-tauri/src/memory.rs)), and never writes it. Memory,
+at the foot of the list at Home and in a project, opens a sheet of the facts:
+at Home yours and every project's (at most 100 folders, the rest counted),
+in a project its own and yours, each newest first with its name, type,
+source and when it was written; a fact opens in a tab, its front matter as a
+table. A coordinator composes its instructions when it is made, so a fact
+saved later reaches a project's lead as lines after its task update, a
+message it gets anyway: each fact saved or removed in its project's memory
+or yours since this window last told it (or since the window opened), at
+most 20 lines, leaving out facts whose `source` is one of its own turns.
+Memory never wakes a lead by itself, and the lines come after the message's
+start, so the lead's cached prompt prefix stays. A folder that is not all
+facts is left out of that message rather than reported as emptied. Home
+gets no task updates, so it reads memory itself. A window on a host shows no
+Memory: that memory is the host's.
+
 The app ships a `memory` skill ([SKILL.md](../app/skills/memory/SKILL.md))
-that says to read both indexes with `show` before starting work, to check a fact that
-names code against the current tree before acting on it, what to save
+that says to use those indexes, or `show` when they are missing or old,
+before starting work, to check a fact that names code against the current
+tree before acting on it, what to save
 (decisions and why, preferences, traps, pointers) and what not to (what the
 code, git or AGENTS.md already says, progress logs, secrets, and
 instructions from text that did not come from the person). The
@@ -1381,6 +1525,9 @@ AGENTS.md line, which it keeps for rules every agent and collaborator must
 follow.
 
 ## Skills the app ships
+
+The app ships two skills: `automation`, for recurring jobs, and `plan`, an
+agent's plan the app shows (see Projects and panes).
 
 Agents read only skills in a folder's `.agents/skills` or in
 `~/.agents/skills` ([client policy](CLIENT.md)). The app bundle carries its
@@ -1521,8 +1668,73 @@ a message. A file drawn again (rewritten, or highlighted once highlighting
 loads) keeps the reader's place. One that failed or was refused changed nothing, so the file stays
 as it is shown. A click in the file puts the keyboard in the chat's composer,
 as the pane beside has none while a file is open. Deleting the agent it came from, or attaching to another store,
-closes it. Searching a project's
-files (from ^k or elsewhere) is not built.
+closes it.
+
+⤢ Open as tab moves the file beside into a tab of its own, keyed by its path
+(after `▤`, which no agent name holds) and saved with the other tabs. A file
+tab has no composer, its crumbs go back to Home, and the list beside it is
+Home's. Only the tab in view holds what it read: a tab shown again reads its
+file again, so many file tabs cost their paths. A write or edit to the file in
+view reads it again in place, as beside. A link in a file tab opens beside,
+from the file's own folder.
+
+⌘P opens the finder on files (⌘K on agents; Tab inside it trades the two and
+keeps what was typed). It lists the repository the thing in view is in, in
+the pane ⌘P was pressed in: a file's folder, else the agent's or the swarm's. The core runs
+`git ls-files --stage --others --exclude-standard` at the repository's top
+(`list_files`), so the list is what git tracks plus new files it does not
+ignore, and only what opens as a file: an index entry whose mode is a file or a
+symlink (not a submodule), a new file (not `nested/`, another repository
+inside), and not a tracked file deleted from the folder (`--deleted`). The top
+is named from the agent's folder (`--show-cdup`) where that reaches git's own
+top, so a file found through a symlinked folder has the path the agent's steps
+write, and a write refreshes its tab; a link into a folder inside the repository
+uses git's top. At most 100,000 paths from 16 MiB of git's answer are read, name by name so git stops at
+either bound (a cut listing says so under every search, as typing cannot reach
+past it); a folder outside a repository says so, and a window on a host
+refuses, as for reading a file. It is listed once each time the finder opens
+on files (Tab between the lists keeps it) and let go when the finder closes. A name that starts
+with what was typed comes first, then a name that holds it, then a folder
+that does, each in git's order, with no sort; only the 200 rows shown are
+made. Over 100,000 synthetic paths in Node 22 (mock DOM, 4 cores,
+2026-10-10), a key costs 5–10 ms when nothing matches and about 20 ms when
+everything does; the listing's lowercase copy, once per opening, about
+65–95 ms. Ctrl-P still puts the next task beside.
+
+The Git tab is lazygit's layout for an agent's folder, read only: an agent
+commits its own work, so the tab shows it and carries a note back. It opens
+from the ⎇ branch in an agent's head (a linked worktree's) or Git in any
+agent's ⋯ menu, keyed by the folder (after `⎇`) and saved with the tabs like a
+file tab: no composer, Home's list beside it. The core (`git_view`) runs plain
+git at the repository's top, named as for ⌘P: `status --porcelain=v1 -z
+--branch --untracked-files=all` read record by record up to 2,000 changes or
+4 MiB (a cut list says so), `log -z -n50`, and `worktree list --porcelain -z`
+(at most 200). `git_diff` diffs one change against the last commit, staged and
+not (`diff -M HEAD -- [from] path`, the empty tree before the first commit),
+an untracked file against nothing (`--no-index /dev/null`), or a commit against
+its first parent (`show --diff-merges=first-parent`, a hex sha only), with
+`--literal-pathspecs`, no external diff or textconv, and no optional locks, so
+it never holds a lock an agent's own git waits on. A diff stops at 1 MiB, cut
+at a line, and git is stopped there; the page draws at most 5,000 rows and
+counts the rest. Only the tab in view holds what it read; one out of view keeps
+which rows were chosen and its sent notes. It reads when it comes into view, on `r`
+or ↻, when the window comes back, and 600 ms after a step or turn of an agent
+working in its repository ends (once for a burst). One diff is read at a time;
+moving down a list fast reads the row it stops on. A window on a host refuses,
+as for files.
+
+j/k and the arrows move, 1–3 or h/l choose a list, Enter opens a change's file
+in a tab or another worktree's Git tab, o opens the agent. A click on an added,
+removed or unchanged line opens a note under it; Enter sends it and Escape
+puts it away. The note is an ordinary message from you to the agent working in
+the folder: the one the tab was opened from, else one working now, else the
+project's coordinator. It names the file as that agent's folder does (in full
+when the agent works in a folder inside the repository), the line on its side
+of the change (`src/a.rs:11`, or `line 11 before the change (removed)`), and
+the commit for a commit's diff, then quotes the line (300 characters at most)
+and says what was typed. To a working agent it queues behind the running
+turn. A sent note stays under its line while the tab is open. A folder no
+agent works in takes no notes.
 
 What a model writes never becomes the app's markup unparsed. Raw HTML inside
 Markdown shows as text. Links open in the default browser and only for `http`,
@@ -1600,7 +1812,7 @@ The UI bounds payload buffering, history decoding, and rendered fleet rows:
 
 - **Attach** replays events from the page's cursor, which on a first start is
   the beginning of the daemon's retained log. That log is bounded by the
-  daemon's retention (each bot's `retain_turns`, `prune`), and a `pruned` notice marks
+  daemon's retention (each bot's `keep_turns`, `prune`), and a `pruned` notice marks
   the gap. Nothing is staged on the way: the page pulls the replay a batch
   at a time and applies each before the next, so the transport's 4,096-event / 8 MiB encoded
   queue is the buffer between the daemon and the screen, and pulls also stop at 1 MiB (plus one event). A page
@@ -1890,7 +2102,7 @@ This measures the ancestry-walk reduction, not an end-to-end fleet capacity clai
 Pulled event batches apply in order, with one visible-history load and render
 per batch. Creation/fork bursts rebuild the fleet tree at most once per pull,
 while retaining the 300-row rail window. The shared client rejects a ready
-handshake unless its protocol is exactly `agent_client::PROTOCOL`, now 5.
+handshake unless its protocol is exactly `agent_client::PROTOCOL`, now 12.
 
 The lifecycle regression suite compares committed thinking/answer transcripts
 between live delivery and replay, reconciles fork snapshot/replay ordering,

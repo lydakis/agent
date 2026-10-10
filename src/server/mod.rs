@@ -237,12 +237,16 @@ enum Command {
         bot: String,
         keep_turns: usize,
     },
-    /// A bot's turns with status, workspace, model, tokens, and timing.
+    /// A bot's turns with status, workspace, model, tokens, and timing,
+    /// oldest first; with `newest`, newest first.
     Turns {
         bot: String,
         #[serde(default)]
         after: i64,
+        before: Option<i64>,
         limit: Option<usize>,
+        #[serde(default)]
+        newest: bool,
     },
     Submit {
         bot: String,
@@ -264,6 +268,9 @@ enum Command {
         /// What sent it when no bot's turn did, as the client names itself
         /// (a name's characters); absent for a person.
         origin: Option<String>,
+        /// The most input plus output tokens this turn may spend, beside
+        /// the bot's own budget; absent leaves only that.
+        budget_tokens: Option<u64>,
     },
     Interrupt {
         bot: String,
@@ -360,9 +367,14 @@ enum Command {
     /// Each provider's own model listing, for a client writing its model
     /// list. Asked when requested and kept five minutes; nothing runs on it.
     ProviderModels,
+    /// A page of bots in name order: with `name`, those matching a GLOB
+    /// pattern; with `active`, those with a turn running.
     Bots {
         after: Option<String>,
         limit: Option<usize>,
+        name: Option<String>,
+        #[serde(default)]
+        active: bool,
     },
     /// Stop the daemon. With `grace_ms`, running turns first get up to that
     /// long to finish while nothing new starts; whatever still runs is then
@@ -922,20 +934,29 @@ pub async fn run(config: Configuration) -> Result<()> {
             }
             (key, None)
         };
-        let mut provider = Provider::new(transport.clone(), spec.family, &spec.url, key)?;
+        // Which provider's URL it is: the URL itself may carry a secret.
+        let named = |error: Error| match (error.code.as_str(), &error.detail) {
+            ("invalid_provider_url", Some(why)) => {
+                Error::with("invalid_provider_url", format!("{}: {why}", spec.name))
+            }
+            _ => error,
+        };
+        let mut provider =
+            Provider::new(transport.clone(), spec.family, &spec.url, key).map_err(named)?;
         if let Some(login) = login {
             provider = provider.with_login(login)?;
         }
         let mut auth = None;
         if spec.sigv4 {
-            let url =
-                reqwest::Url::parse(&spec.url).map_err(|_| Error::new("invalid_provider_url"))?;
+            let url = reqwest::Url::parse(&spec.url)
+                .map_err(|_| Error::with("invalid_provider_url", "the base URL does not parse"))?;
             let (aws, unresolved) = agent_runtime::provider::aws::Aws::open(
                 &url,
                 Some(credentials.clone()),
                 &aws_start,
             )
-            .await?;
+            .await
+            .map_err(named)?;
             let mut signed = json!({"auth":"sigv4","region":aws.region(),
                 "credentials":aws.source()});
             // Keys the CLI cannot resolve yet leave this binding waiting on a
@@ -1977,10 +1998,16 @@ impl Service {
                 });
                 Err(Error::new("deferred"))
             }
-            Command::Turns { bot, after, limit } => {
+            Command::Turns {
+                bot,
+                after,
+                before,
+                limit,
+                newest,
+            } => {
                 store
-                    .op("turns", move |db| {
-                        db.turns(&bot, after, limit.unwrap_or(64))
+                    .read("turns", move |db| {
+                        db.turns(&bot, after, before, limit.unwrap_or(64), newest)
                     })
                     .await
             }
@@ -2011,7 +2038,7 @@ impl Service {
                     Some(id) => id,
                     None => {
                         store
-                            .op("inspect", move |db| Ok(db.inspect(&name)?.id))
+                            .op("inspect", move |db| Ok(db.inspect(&name)?.bot_id))
                             .await?
                     }
                 };
@@ -2355,10 +2382,20 @@ impl Service {
                 // The response is sent by the completion, not by this dispatch.
                 Err(Error::new("deferred"))
             }
-            Command::Bots { after, limit } => {
+            Command::Bots {
+                after,
+                limit,
+                name,
+                active,
+            } => {
                 store
-                    .op("list", move |db| {
-                        db.list(after.as_deref(), limit.unwrap_or(64))
+                    .read("list", move |db| {
+                        db.list(
+                            after.as_deref(),
+                            limit.unwrap_or(64),
+                            name.as_deref(),
+                            active,
+                        )
                     })
                     .await
             }
@@ -2524,6 +2561,7 @@ impl Service {
                 expected_turn,
                 from,
                 origin,
+                budget_tokens,
             } => {
                 name("request_id", &request_id)?;
                 if origin.is_some() && from.is_some() {
@@ -2545,6 +2583,19 @@ impl Service {
                 if expected_turn.is_some() && delivery != Delivery::Steer {
                     return fail_with("invalid_delivery", "expected_turn needs delivery steer");
                 }
+                // A steer joins a turn that already has its cap.
+                if budget_tokens.is_some() && delivery == Delivery::Steer {
+                    return fail_with(
+                        "invalid_delivery",
+                        "budget_tokens starts a turn; a steer joins one, so send it with reject or queue",
+                    );
+                }
+                if budget_tokens.is_some_and(|n| n == 0 || n > i64::MAX as u64) {
+                    return fail_with(
+                        "invalid_budget",
+                        format!("budget_tokens must be from 1 to {}", i64::MAX),
+                    );
+                }
                 // A turn may run in another checkout or on another model of
                 // the same family; the conversation encoding never changes.
                 let options = TurnOptions {
@@ -2555,6 +2606,7 @@ impl Service {
                     expected_turn,
                     from: from.map(|author| (author.bot, author.turn)),
                     origin,
+                    budget_tokens,
                 };
                 // A slot is promised before the commit that may take it, so
                 // admissions queued together cannot start more turns than
@@ -3535,6 +3587,7 @@ mod tests {
             expected_turn: None,
             from: None,
             origin: None,
+            budget_tokens: None,
         }
     }
     /// Take requests the way the run loop does: an admission with room joins
@@ -3799,7 +3852,7 @@ mod tests {
         rusqlite::Connection::open(&path)
             .unwrap()
             .execute(
-                "UPDATE bots SET settings='{\"retain_turns\":1}' WHERE name='Bob'",
+                "UPDATE bots SET settings='{\"keep_turns\":1}' WHERE name='Bob'",
                 [],
             )
             .unwrap();
@@ -4361,7 +4414,7 @@ mod tests {
             (&first["duplicate"], &again["duplicate"]),
             (&json!(false), &json!(true))
         );
-        assert_eq!(first["id"], again["id"]);
+        assert_eq!((&first["bot_id"], &again["bot_id"]), (&json!(1), &json!(1)));
         let events = store.call(|db| db.events("A", 0, 10)).await.unwrap();
         assert_eq!(
             events["events"].as_array().unwrap().len(),
@@ -4800,7 +4853,7 @@ mod tests {
                             budget_tokens: None,
                             tools: &tools,
                             created_by: creator.as_ref().map(|c| c.name.as_str()),
-                            created_by_id: creator.as_ref().map(|c| c.id),
+                            created_by_id: creator.as_ref().map(|c| c.bot_id),
                             compaction_instructions: None,
                             compaction_model: None,
                             fallbacks: false,
@@ -4827,7 +4880,7 @@ mod tests {
             *workspace = None;
             *tools = Some(vec!["echo".into()]);
             *created_by = Some(parent.name);
-            *created_by_id = Some(parent.id);
+            *created_by_id = Some(parent.bot_id);
         }
         for command in [create, submit("Bot", "r1"), child] {
             let bound = admission_bound(&command, &id, 1);

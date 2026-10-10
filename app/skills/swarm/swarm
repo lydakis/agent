@@ -64,7 +64,7 @@ ACTIVE = ('running', 'waiting', 'paced', 'queued', 'ready')
 PLAIN = {'the', 'and', 'for', 'with', 'that', 'this', 'from', 'into', 'make', 'keep', 'cut', 'all',
          'our', 'its', 'half', 'every', 'each', 'add', 'fix', 'get', 'lock'}
 # Profiles a client gives its own agents, as `agent` lists them (policy::CLIENT_ROLES).
-CLIENT_ROLES = ('coordinator',)
+CLIENT_ROLES = ('coordinator', 'home')
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.abspath(__file__)
 
@@ -170,16 +170,16 @@ def scan(daemon, folder):
             if name > prefix and not name.startswith(prefix):
                 break
             if name in ids:
-                if ids[name] == bot['id']:
+                if ids[name] == bot['bot_id']:
                     members[name] = bot
             elif bot.get('created_by_id') in roots:
-                roots[bot['id']] = bot['root'] = roots[bot['created_by_id']]
+                roots[bot['bot_id']] = bot['root'] = roots[bot['created_by_id']]
                 helpers.append(bot)
         else:
             if page.get('next_after'):
                 after = page['next_after']
                 continue
-        live = {b['id'] for b in members.values()}
+        live = {b['bot_id'] for b in members.values()}
         return members, [h for h in helpers if h['root'] in live]
 
 
@@ -190,8 +190,8 @@ def usage(state, members, helpers):
     works for, so deleting it keeps its tokens counted: once gone, they join
     that member's sum, and its id is kept only while a helper it made is."""
     seen, gone = state['helpers'], state['gone']
-    live = {b['id'] for b in members.values()}
-    listed = {str(h['id']): [h.get('tokens_used') or 0, h['root']] for h in helpers}
+    live = {b['bot_id'] for b in members.values()}
+    listed = {str(h['bot_id']): [h.get('tokens_used') or 0, h['root']] for h in helpers}
     anchors = {str(h.get('created_by_id')) for h in helpers}
     for key, (tokens, root) in list(seen.items()):
         if key in listed or (not tokens and key in anchors and root in live):
@@ -218,7 +218,7 @@ def usage(state, members, helpers):
 
 def member_view(bot, helper=False):
     used, cap = bot.get('tokens_used') or 0, bot.get('budget_tokens')
-    view = {'name': bot['name'], 'id': bot['id'], 'status': bot.get('status'),
+    view = {'name': bot['name'], 'bot_id': bot['bot_id'], 'status': bot.get('status'),
             'running_turn': bot.get('running_turn'), 'used': used, 'limit': cap,
             'remaining': None if cap is None else max(0, cap - used)}
     if helper:
@@ -579,10 +579,10 @@ def budget(act, folder, members, helpers):
         if not cap or name not in running:
             continue
         passed = [p for p in SPENT if mine * 100 >= p * cap]
-        if passed and passed[-1] > state['warned'].get(str(bot['id']), 0):
+        if passed and passed[-1] > state['warned'].get(str(bot['bot_id']), 0):
             text = '%s: %d of %d lifetime tokens used; %d remain. Cached input is counted on every call.' % (
                 short(name, swarm), mine, cap, max(0, cap - mine))
-            act.lines.append({'at': act.at, 'from': 'budget', 'member': short(name, swarm), 'id': bot['id'],
+            act.lines.append({'at': act.at, 'from': 'budget', 'member': short(name, swarm), 'id': bot['bot_id'],
                               'spent': passed[-1], 'text': text})
             act.tell([name], '[board] budget: ' + text, 'steer', False)
             act.answer['budget'] = text
@@ -1066,7 +1066,7 @@ def start(daemon, args):
         if not author.endswith('.lead'):
             raise Refused('coordinators_only', "a project's coordinator (PROJECT.lead) starts a swarm; ask it")
         me = daemon.call('resume', bot=author)
-        lead = {'bot': author, 'id': me['id']}
+        lead = {'bot': author, 'id': me['bot_id']}
         asked['project'], asked['folder'] = author[:-len('.lead')], me['workspace']
         if not asked['mix']:
             # Without rows, every agent runs this turn's model at this turn's effort.

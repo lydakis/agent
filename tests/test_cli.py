@@ -50,6 +50,37 @@ class SocketAndCliTests(ModelFixture):
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         return result
 
+    def test_listings_filter_and_stop_at_their_limit(self):
+        for bot in ('p.lead', 'p.worker', 'q.lead'):
+            self.agent('run', *self.common, '--new', '--bot', bot, 'hello')
+        for n in range(3):
+            self.agent('run', *self.again, '--bot', 'p.lead', f'again {n}')
+        store = ['--store', str(self.store)]
+        names = lambda *flags: [b['name'] for b in json.loads(self.agent('ls', *store, *flags).stdout)]
+        self.assertEqual(names('--name', 'p.*'), ['p.lead', 'p.worker'])
+        self.assertEqual(names('--name', '*.lead'), ['p.lead', 'q.lead'])
+        self.assertEqual(names('--limit', '2'), ['p.lead', 'p.worker'])
+        self.assertEqual(names('--active'), [])
+        self.model.release_headers = threading.Event()
+        self.model.all_streaming = self.model.release_headers
+        self.addCleanup(self.model.release_headers.set)
+        held = json.loads(self.agent('run', *self.again, '--bot', 'p.worker', '--detach', 'gate').stdout)
+        self.assertEqual(names('--active'), ['p.worker'])
+        self.assertEqual(self.agent('ls', *store, '--active', '--pretty').stdout.split()[0], 'p.worker')
+        self.model.release_headers.set()
+        self.agent('wait', *store, held['handle'])
+        turns = lambda *flags: [t['turn'] for t in json.loads(self.agent('turns', *store, '--bot', 'p.lead', *flags).stdout)]
+        # Turn ids count across bots.
+        self.assertEqual(turns(), [1, 4, 5, 6])
+        self.assertEqual(turns('--newest', '--limit', '2'), [6, 5])
+        self.assertEqual(turns('--newest'), [6, 5, 4, 1])
+        self.assertEqual(turns('--limit', '2', '--after', '1'), [4, 5])
+        for flags in (('--limit', '0'), ('--limit', 'x')):
+            refused = self.agent('ls', *store, *flags, check=False)
+            self.assertEqual((refused.returncode, json.loads(refused.stderr)['error']), (2, 'usage'))
+        bad = self.agent('ls', *store, '--name', '', check=False)
+        self.assertEqual(json.loads(bad.stderr)['error'], 'invalid_bot_filter')
+
     def test_run_starts_a_daemon_streams_the_turn_and_resumes_the_bot(self):
         missing = self.agent('run', *self.again, '--bot', 'Bob', 'hello', check=False)
         self.assertEqual(missing.returncode, 1)
@@ -116,7 +147,9 @@ class SocketAndCliTests(ModelFixture):
     def test_shutdown_returns_once_the_daemon_has_exited(self):
         handle = json.loads(self.agent('run', *self.common, '--new', '--bot', 'Bob', '--detach', 'wait').stdout)
         self.model.requests.get(timeout=3)
-        self.agent('shutdown', '--store', str(self.store))
+        pid = json.loads(self.agent('start', '--store', str(self.store)).stdout)['pid']
+        stopped = self.agent('shutdown', '--store', str(self.store))
+        self.assertEqual(json.loads(stopped.stdout), {'stopped': True, 'pid': pid})
         # The active turn's record is committed and the store is released:
         # a caller may copy or reopen it now.
         self.assertFalse(self.socket.exists())
@@ -131,7 +164,7 @@ class SocketAndCliTests(ModelFixture):
         self.model.all_streaming = self.model.release_headers
         handle = json.loads(self.agent('run', *self.common, '--new', '--bot', 'Bob', '--detach', 'gate').stdout)
         self.model.requests.get(timeout=3)
-        for bad in ('-1', '86401', 'soon'):
+        for bad in ('-1s', '25h', 'soon', '5'):
             usage = self.agent('shutdown', '--store', str(self.store), '--grace', bad, check=False)
             self.assertEqual(usage.returncode, 2, usage.stderr)
             self.assertEqual(json.loads(usage.stderr)['error'], 'usage')
@@ -150,7 +183,7 @@ class SocketAndCliTests(ModelFixture):
         pretty = self.agent('run', '--store', str(self.store), '--pretty', '--bot', check=False)
         self.assertEqual((pretty.returncode, pretty.stderr), (2, 'agent: usage: --bot needs a value\n'))
         threading.Timer(.3, self.model.release_headers.set).start()
-        self.agent('shutdown', '--store', str(self.store), '--grace', '5')
+        self.agent('shutdown', '--store', str(self.store), '--grace', '5s')
         self.assertFalse(self.socket.exists())
         with sqlite3.connect(self.store) as db:
             status, = db.execute('SELECT status FROM turns WHERE id=?', (handle['turn'],)).fetchone()
@@ -194,18 +227,18 @@ class SocketAndCliTests(ModelFixture):
                                      '--new', '--bot', 'Slow', '--detach', 'wait').stdout)['handle']
         quick = json.loads(self.agent('run', '--store', str(self.store), '--model', 'openai/synthetic-model',
                                       '--new', '--bot', 'Quick', '--detach', 'hi').stdout)['handle']
-        first = json.loads(self.agent('wait', '--store', str(self.store), '--any', '--timeout-ms', '5000', slow, quick).stdout)
+        first = json.loads(self.agent('wait', '--store', str(self.store), '--any', '--timeout', '5s', slow, quick).stdout)
         self.assertEqual(first['pending'], [slow])
         self.assertEqual(first['results'][quick]['text'], 'reply:hi')
-        timed = self.agent('wait', '--store', str(self.store), '--any', '--timeout-ms', '0', slow, check=False)
+        timed = self.agent('wait', '--store', str(self.store), '--any', '--timeout', '0', slow, check=False)
         self.assertEqual((timed.returncode, timed.stderr), (1, ''))
         timed = json.loads(timed.stdout)
         self.assertEqual(timed['pending'], [slow])
         self.assertEqual((timed['results'][slow]['pending'], timed['results'][slow]['status'],
                           timed['results'][slow]['handle']), (True, 'running', slow))
-        done = self.agent('wait', '--store', str(self.store), '--timeout-ms=0', quick)
+        done = self.agent('wait', '--store', str(self.store), '--timeout=0', quick)
         self.assertEqual(json.loads(done.stdout)['results'][quick]['text'], 'reply:hi')
-        mixed = self.agent('wait', '--store', str(self.store), '--any', '--timeout-ms=0', slow, quick)
+        mixed = self.agent('wait', '--store', str(self.store), '--any', '--timeout=0', slow, quick)
         self.assertEqual(json.loads(mixed.stdout)['pending'], [slow])
         # interrupt prints the turn view, as it stood when asked.
         printed = self.agent('interrupt', '--store', str(self.store), '--bot', 'Slow', '--pretty').stdout
@@ -427,16 +460,17 @@ class SocketAndCliTests(ModelFixture):
             self.assertIn('daemon_configuration_mismatch', refused.stderr)
             self.assertIn(named, refused.stderr)
         # A bot's settings are its own, chosen when it is made.
-        kept = attempt('--note-turns', '5', '--retain-turns', '2')
+        kept = attempt('--note-turns', '5', '--keep-turns', '2')
         self.assertEqual(kept.returncode, 2, kept.stdout + kept.stderr)
-        self.assertIn("--note-turns, --retain-turns set a new bot's settings; an existing bot keeps its own",
+        self.assertIn("--note-turns, --keep-turns set a new bot's settings; an existing bot keeps its own",
                       kept.stderr)
         # The daemon has no model of its own: --model belongs to run alone.
         stats = self.agent('stats', '--store', str(self.store), '--model', 'openai/other', check=False)
         self.assertEqual(stats.returncode, 2)
         self.assertIn('does not accept --model', stats.stderr)
-        # A fork is an exact copy of its source, so it takes no instructions.
-        for flag in ('--instructions', '--instructions-file', '--agents', '--profile'):
+        # A fork is an exact copy of its source, so it takes no instructions,
+        # and keeps its source's gates, so it takes no approval of its own.
+        for flag in ('--instructions', '--instructions-file', '--agents', '--profile', '--approval', '--approve'):
             args = (flag,) if flag == '--agents' else (flag, 'x')
             fork = self.agent('fork', '--store', str(self.store), '--source', 'Bob', '--bot', 'Copy', *args,
                               check=False)
@@ -447,7 +481,7 @@ class SocketAndCliTests(ModelFixture):
                          'completed')
 
     def test_daemon_limits_match_on_startup_and_attach_and_bots_keep_their_settings(self):
-        flags = ['--idle-exit', '0', '--stall-timeout', '30']
+        flags = ['--idle-exit', '0', '--stall-timeout', '30s']
         self.agent('run', *self.common, *flags, '--context-bytes', '1024', '--context-items', '2',
                    '--keep-warm', '0', '--cache-ttl', '1h', '--new', '--bot', 'Bob', 'hi')
         self.agent('run', *self.again, *flags, '--bot', 'Bob', 'again')
@@ -463,12 +497,12 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual(json.loads(small.stderr), {'error': 'invalid_setting',
                                                     'detail': 'context_bytes is at least 1024'})
         self.assertEqual(control.request('resume', bot='Small')['error'], 'bot_not_found')
-        refused = self.agent('stats', '--store', str(self.store), '--idle-exit', '1', check=False)
+        refused = self.agent('stats', '--store', str(self.store), '--idle-exit', '1s', check=False)
         self.assertIn('daemon_configuration_mismatch', refused.stderr)
-        refused = self.agent('stats', '--store', str(self.store), '--stall-timeout', '120', check=False)
-        self.assertIn('--stall-timeout: requested 120 but daemon has 30', refused.stderr)
+        refused = self.agent('stats', '--store', str(self.store), '--stall-timeout', '2m', check=False)
+        self.assertIn('--stall-timeout: requested 2m but daemon has 30s', refused.stderr)
         # How a bot calls its model is chosen when it is made, not by the daemon.
-        for flag, value in (('--keep-warm', '240'), ('--cache-ttl', '5m'), ('--max-output-tokens', '4096')):
+        for flag, value in (('--keep-warm', '4m'), ('--cache-ttl', '5m'), ('--max-output-tokens', '4096')):
             refused = self.agent('stats', '--store', str(self.store), flag, value, check=False)
             self.assertEqual(refused.returncode, 2)
             self.assertIn(f'does not accept {flag}', refused.stderr)
@@ -480,6 +514,14 @@ class SocketAndCliTests(ModelFixture):
                 result = self.agent(*args)
                 self.assertIn('Usage:', result.stdout)
                 self.assertEqual(result.stderr, '')
+        # One line per command, and a new bot's settings apart from run's everyday flags.
+        top = self.agent('--help').stdout
+        self.assertRegex(top, r'\n  wait {7}A turn.s or command.s result: status, text, usage; --timeout 0 polls\n')
+        run = self.agent('run', '--help').stdout
+        everyday, settings = run.split('New bot settings (the defaults are right; rarely needed):')
+        self.assertIn('--bot NAME', everyday)
+        self.assertNotIn('--approval MODE', everyday)
+        self.assertIn('--approval MODE', settings.split('Daemon options')[0])
         invalid = [
             ('follow', '--all', '--bot', 'Bob'),
             ('stats', '--any'), ('ls', 'ignored'), ('ls', '-x'),
@@ -490,8 +532,12 @@ class SocketAndCliTests(ModelFixture):
             ('run', '--bot', 'Bob', '--bot', 'Alice', 'hi'),
             ('run', '--max-output-tokens', '0', 'hi'),
             ('run', '--stall-timeout', '0', 'hi'),
-            ('run', '--stall-timeout', '86401', 'hi'),
-            ('run', '--keep-warm', '300', 'hi'),
+            ('run', '--stall-timeout', '25h', 'hi'),
+            ('run', '--stall-timeout', '30', 'hi'),
+            ('run', '--keep-warm', '5m', 'hi'),
+            ('run', '--keep-warm', '1500ms', 'hi'),
+            ('wait', '--timeout-ms', '5', 'proc:1'),
+            ('run', '--retain-turns', '2', 'hi'),
             ('run', '--cache-ttl', '2h', 'hi'),
             ('run', '--new', '--context-items', '0', 'hi'),
             ('follow', '--after=-1', '--all'),
@@ -603,10 +649,10 @@ class SocketAndCliTests(ModelFixture):
         self.agent('wait', '--store', str(self.store), first['handle'])
         fork = ['fork', '--store', str(self.store), '--source', 'Once', '--bot', 'Side', '--request-id', 'side']
         forked, refork = (json.loads(self.agent(*fork).stdout) for _ in range(2))
-        self.assertEqual((refork['id'], refork['duplicate']), (forked['id'], True))
+        self.assertEqual((refork['bot_id'], refork['duplicate']), (forked['bot_id'], True))
         # A delete resent once its bot is gone succeeds, and never reaches a
         # later bot of the same name.
-        rm = ['rm', '--store', str(self.store), '--bot', 'Side', '--bot-id', str(forked['id'])]
+        rm = ['rm', '--store', str(self.store), '--bot', 'Side', '--bot-id', str(forked['bot_id'])]
         self.assertFalse(json.loads(self.agent(*rm).stdout)['duplicate'])
         self.agent('fork', '--store', str(self.store), '--source', 'Once', '--bot', 'Side')
         self.assertTrue(json.loads(self.agent(*rm).stdout)['duplicate'])
@@ -615,9 +661,8 @@ class SocketAndCliTests(ModelFixture):
         kept = fork[:-4] + ['--bot', 'Kept', '--request-id', 'kept']
         made = json.loads(self.agent(*kept).stdout)
         self.agent('rm', '--store', str(self.store), '--bot', 'Once')
-        for flags in ([], ['--approval', 'full']):
-            resent = json.loads(self.agent(*kept, *flags).stdout)
-            self.assertEqual((resent['id'], resent['duplicate']), (made['id'], True))
+        resent = json.loads(self.agent(*kept).stdout)
+        self.assertEqual((resent['bot_id'], resent['duplicate']), (made['bot_id'], True))
 
     def test_retry_of_pruned_turn_exits_and_retained_retry_still_replays(self):
         self.agent('run', *self.common, '--new', '--bot', 'Bob', '--request-id', 'old', 'first')
@@ -675,7 +720,7 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual(result['results'][handle]['text'], 'reply:slow')
         pending = self.agent('run', '--store', str(self.store), '--detach', '--bot', 'Alice', 'wait')
         again = json.loads(pending.stdout)['handle']
-        timed = self.agent('wait', '--store', str(self.store), '--timeout-ms', '200', again, check=False)
+        timed = self.agent('wait', '--store', str(self.store), '--timeout', '200ms', again, check=False)
         self.assertEqual(timed.returncode, 1)
         self.assertEqual(json.loads(timed.stdout)['pending'], [again])
         inside = subprocess.run([*self.base, 'wait', '--store', str(self.store), again],
@@ -782,15 +827,15 @@ class SocketAndCliTests(ModelFixture):
         self.assertTrue(all(b['status'] == 'completed' for b in listing))
         self.assertEqual({b['name']: b['created_by'] for b in listing}, {'Alice': 'Bob', 'Bob': None})
         by_name = {b['name']: b for b in listing}
-        self.assertEqual(by_name['Alice']['created_by_id'], by_name['Bob']['id'])
+        self.assertEqual(by_name['Alice']['created_by_id'], by_name['Bob']['bot_id'])
         replay = self.agent('follow', '--store', str(self.store), '--bot', 'Alice')
         events = [json.loads(line) for line in replay.stdout.splitlines()]
         self.assertEqual([e['event'] for e in events][:2], ['created', 'accepted'])
         self.assertEqual((self.path / 'lineage').read_text(),
-                         f"Bob/{by_name['Bob']['id']}/Alice/{events[1]['turn']}")
+                         f"Bob/{by_name['Bob']['bot_id']}/Alice/{events[1]['turn']}")
         bob_turn = json.loads(self.agent('turns', '--store', str(self.store), '--bot', 'Bob').stdout)
         self.assertEqual(events[1]['data']['from'], {'bot': 'Bob', 'turn': bob_turn[0]['turn'],
-                                                     'id': by_name['Bob']['id']})
+                                                     'bot_id': by_name['Bob']['bot_id']})
         self.assertEqual(events[-1]['event'], 'follow_live')
         self.assertTrue(all(e['cursor'] < f['cursor'] for e, f in zip(events[:-2], events[1:-1])))
         # A follower attached while a turn runs replays, then sees live deltas and the end.
@@ -821,7 +866,7 @@ class SocketAndCliTests(ModelFixture):
         self.assertIn('result', control.request('delete', bot='Bob'))
         self.agent('run', *self.common, '--new', '--bot', 'Bob', 'replacement')
         replacement = control.request('resume', bot='Bob')['result']
-        self.assertNotEqual(replacement['id'], by_name['Bob']['id'])
+        self.assertNotEqual(replacement['bot_id'], by_name['Bob']['bot_id'])
         route = ('"$AGENT_BIN" run --detach --bot "$AGENT_PARENT" '
                  '--bot-id "$AGENT_PARENT_ID" -- should-not-deliver > route.out 2> route.err; '
                  'printf "%s" "$?" > route.status')
@@ -834,9 +879,9 @@ class SocketAndCliTests(ModelFixture):
         self.agent('run', *self.common, '--new', '--bot', 'Creator',
                    'shell:printf "%s" "$AGENT_BOT_ID" > own-id')
         creator = json.loads(self.agent('ls', '--store', str(self.store)).stdout)[0]
-        self.assertEqual((self.path / 'own-id').read_text(), str(creator['id']))
+        self.assertEqual((self.path / 'own-id').read_text(), str(creator['bot_id']))
         # A surviving shell retains this environment even across daemon replacement.
-        shell_env = dict(clean_env(), AGENT_BOT='Creator', AGENT_BOT_ID=str(creator['id']))
+        shell_env = dict(clean_env(), AGENT_BOT='Creator', AGENT_BOT_ID=str(creator['bot_id']))
         self.shutdown()
         self.agent('run', *self.again, '--bot', 'Creator', 'after restart')
         control = Connection(self.socket)
@@ -850,7 +895,7 @@ class SocketAndCliTests(ModelFixture):
             args = (['run', *self.common, '--new', '--bot', 'Child', 'hello']
                     if operation == 'create' else
                     ['fork', '--store', str(self.store), '--source', 'Creator', '--bot', 'Child'])
-            for identity in (str(creator['id']), None, str(replacement['id'])):
+            for identity in (str(creator['bot_id']), None, str(replacement['bot_id'])):
                 env = dict(shell_env)
                 if identity is None:
                     env.pop('AGENT_BOT_ID')
@@ -858,10 +903,10 @@ class SocketAndCliTests(ModelFixture):
                     env['AGENT_BOT_ID'] = identity
                 result = subprocess.run([*self.base, *args], env=env, cwd=self.path,
                                         capture_output=True, text=True, timeout=15)
-                if identity == str(replacement['id']):
+                if identity == str(replacement['bot_id']):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     child = control.request('resume', bot='Child')['result']
-                    self.assertEqual(child['created_by_id'], replacement['id'])
+                    self.assertEqual(child['created_by_id'], replacement['bot_id'])
                     self.assertIn('result', control.request('delete', bot='Child'))
                 else:
                     self.assertNotEqual(result.returncode, 0)
@@ -999,8 +1044,10 @@ class CliTests(ModelFixture):
                                  '--model', 'fixture/model', 'hello'], env=clean_env(),
                                 capture_output=True, text=True, timeout=3)
         self.assertNotEqual(result.returncode, 0)
-        # The daemon's own refusal, not a wrapper around its text.
-        self.assertEqual(json.loads(result.stderr)['error'], 'invalid_provider_url')
+        # The daemon's own refusal, not a wrapper around its text; it names
+        # the provider and what is wrong, never the URL, which may hold a secret.
+        self.assertEqual(json.loads(result.stderr), {'error': 'invalid_provider_url',
+                                                     'detail': 'fixture: the base URL does not parse'})
         self.assertLess(time.monotonic()-start, 2)
 
     def test_concurrent_failed_starts_each_report_their_own_error(self):
@@ -1134,12 +1181,13 @@ class CliTests(ModelFixture):
                     try:
                         with listener.accept()[0] as peer:
                             peer.sendall((json.dumps(dict(event='ready', protocol=protocol, pid=daemon.pid))+'\n').encode())
-                            _, stderr = process.communicate(timeout=10)
+                            stdout, stderr = process.communicate(timeout=10)
                     finally:
                         self.stop_process(process)
                 if stopped:
                     self.assertEqual(process.returncode, 0, stderr)
                     self.assertEqual(daemon.wait(timeout=3), 0 if gone else -15)
+                    self.assertEqual(json.loads(stdout), {'stopped': True, 'pid': daemon.pid})
                 else:
                     self.assertEqual(process.returncode, 1)
                     self.assertIn(b'daemon_protocol_mismatch', stderr)

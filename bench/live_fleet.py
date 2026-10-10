@@ -74,7 +74,7 @@ def run(agent, out, bots, model, max_connecting, reasoning):
     results = {}
 
     def waiter(chunk):  # wait accepts at most 64 handles per request
-        r = subprocess.run([str(agent), 'wait', '--store', str(store), '--timeout-ms', '600000', *chunk],
+        r = subprocess.run([str(agent), 'wait', '--store', str(store), '--timeout', '10m', *chunk],
                            capture_output=True, text=True, env=env)
         got = json.loads(r.stdout)['results'] if r.stdout.strip() else {
             h: {'error': 'wait_failed', 'detail': r.stderr.strip()[:120]} for h in chunk}

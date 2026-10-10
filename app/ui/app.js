@@ -24,7 +24,7 @@ const S = {
   // scanning the fleet on every event.
   botsGen: 0, shapeGen: 0, deleted: new Set(),
   // The tabs are the agents opened full screen, in order; Home is always there and is not one of them.
-  config: null, ui: { rail: true, side: null, tabs: [], picker: false, pickerSel: 0, help: false, steps: false, toast: null, menu: false },
+  config: null, ui: { rail: true, side: null, tabs: [], picker: false, pickerSel: 0, pickerMode: 'agents', found: null, tabFile: null, git: new Map(), gitFrom: new Map(), help: false, steps: false, toast: null, menu: false, planFolded: {} },
   // How Send reaches a working bot, the last pick from its menu (sticky across windows), and the
   // model each bot's next turns run on when it differs from the one it was created with.
   send: loadSend(), override: new Map(), effort: new Map(),
@@ -42,6 +42,9 @@ const S = {
   // Unsent text for each bot not on screen. A composer's text is its bot's own: when a pane shows
   // another bot, the text stays behind with the one it was typed for (see `followDrafts`).
   drafts: new Map(),
+  // Each agent's plan by bot id, as the plan skill keeps it beside the store (see `loadPlans`), and
+  // whether this window can read them at all.
+  plans: new Map(), plansOff: false, plansGen: 0,
 };
 function loadSend() { try { const v = localStorage.getItem('agent:send'); return v === 'steer' || v === 'side' ? v : 'queue'; } catch (_) { return 'queue'; } }
 // What a window remembers belongs to the store it shows and its folder, not to the socket that reached
@@ -203,7 +206,7 @@ const onScreen = (name) => {
   if (!looking()) return false;
   const sw = swarmOfBot(name);
   // A file open beside covers the chat that was there.
-  return S.selected === name || (S.ui.side === name && !S.ui.file) || (!!sw && S.selected === swarmKey(sw.name));
+  return mainBot() === name || (S.ui.side === name && !S.ui.file) || (!!sw && S.selected === swarmKey(sw.name));
 };
 // Each row a change touches is drawn once, however many of a swarm's agents it covers.
 function patchUnseen(names) {
@@ -217,7 +220,7 @@ function patchUnseen(names) {
 function markSeen() {
   if (!S.unseen.size || !looking()) return;
   const sw = swarmOf(S.selected);
-  const seen = [...new Set([S.selected, S.ui.file ? null : S.ui.side, ...(sw ? sw.members : [])])].filter((name) => name && S.unseen.has(name));
+  const seen = [...new Set([mainBot(), S.ui.file ? null : S.ui.side, ...(sw ? sw.members : [])])].filter((name) => name && S.unseen.has(name));
   if (!seen.length) return;
   for (const name of seen) S.unseen.delete(name);
   patchUnseen(seen);
@@ -233,9 +236,9 @@ function upsert(record) {
   if (!record?.name) return;
   // Same name, different identity: everything known about the old bot belongs to the old bot.
   const known = bot(record.name);
-  if (known && known.id != null && record.id != null && known.id !== record.id) { forgetBot(record.name); }
+  if (known && known.id != null && record.bot_id != null && known.id !== record.bot_id) { forgetBot(record.name); }
   const b = bot(record.name) || { name: record.name, id: null, parent: null, waitingOn: [], turnStarted: 0, elapsed: 0 };
-  if (record.id != null) b.id = record.id;
+  if (record.bot_id != null) b.id = record.bot_id;
   if (!known || known !== b) S.shapeGen += 1;
   S.botsGen += 1;
   b.status = record.status === 'completed' ? 'idle' : (record.status || 'idle');
@@ -253,7 +256,7 @@ function learnEffort(b, record) { if ('effort' in record) b.reasoning = record.e
 // A new folder means its branch is read again, when the bot is next shown.
 function learnWorkspace(b, record) {
   const ws = record.workspace ?? null;
-  if (b.workspace !== ws) { b.workspace = ws; b.branch = undefined; }
+  if (b.workspace !== ws) { b.workspace = ws; b.branch = undefined; S.botsGen += 1; }
 }
 // A bot keeps its folder, so the app names one only for a bot that has none.
 const home = (b) => (b.workspace ? {} : { workspace: S.config.workspace });
@@ -323,11 +326,17 @@ const isActive = (status) => ACTIVE.has(status);
 // the coordinator bots in the store, so nothing else can drift from it. A project's tasks are its
 // coordinator's lineage, and any root bot named `<project>.<task>`.
 const LEAD = '.lead';
+// Home's agent: the person's own, across every project, and the chat Home shows. It is never a tab
+// or a row of its own; opening it opens Home.
+const HOME = 'home';
+// The agent the main pane shows: the one open, or at Home Home's agent once it exists.
+// A file or Git tab shows no agent.
+const mainBot = () => pageOf(S.selected) ? '' : S.selected || (S.bots.has(HOME) ? HOME : '');
 const leadProject = (name) => name.length > LEAD.length && name.endsWith(LEAD) ? name.slice(0, -LEAD.length) : null;
 // Who sent a prompt that is not yours: another agent's turn, or the app on its own (`origin`), as
 // the daemon keeps them with the prompt.
 function senderOf(p) {
-  if (p.from?.bot) return { bot: p.from.bot, turn: p.from.turn, id: p.from.id };
+  if (p.from?.bot) return { bot: p.from.bot, turn: p.from.turn, id: p.from.bot_id };
   return typeof p.origin === 'string' ? { app: p.origin } : null;
 }
 // The agent that sent it, while its name still holds the identity it had then.
@@ -401,7 +410,8 @@ function tree() {
   pushSwarms(swarmsOf.get(null), 0);
   // Anything the roots do not reach is rooted where it stands: one pass, nothing hidden.
   for (const b of S.bots.values()) if (!seen.has(b.name)) { stack.push([b, 0, true, '', null]); walk(); }
-  if (projects.size && out.length > loose) out.splice(loose, 0, { label: 'bots' });
+  // Home's agent is Home itself, so it alone heads no list of bots.
+  if (projects.size && out.slice(loose).some((n) => n.depth === 0 && n.b?.name !== HOME)) out.splice(loose, 0, { label: 'bots' });
   return out;
 }
 // The path a read, write or edit names, whole (the summary is cut for display); none when it cannot be one.
@@ -421,7 +431,17 @@ function callSummary(name, args) {
 const SWARM = '⁂';
 const swarmKey = (name) => SWARM + name;
 const swarmOf = (key) => (typeof key === 'string' && key.startsWith(SWARM) ? S.swarms.get(key.slice(SWARM.length)) ?? null : null);
-const isOpen = (key) => S.bots.has(key) || !!swarmOf(key);
+// A file in a tab is keyed by its path after a mark no bot name can hold, and is open while its tab is.
+const FILE = '▤';
+const fileOf = (key) => (typeof key === 'string' && key.startsWith(FILE) ? key.slice(FILE.length) : null);
+// A Git tab is keyed the same way by the folder it shows.
+const GIT = '⎇';
+const gitOf = (key) => (typeof key === 'string' && key.startsWith(GIT) ? key.slice(GIT.length) : null);
+// A page tab: a file or a Git tab, which show no agent and have no composer.
+const pageOf = (key) => fileOf(key) != null || gitOf(key) != null;
+const isOpen = (key) => S.bots.has(key) || !!swarmOf(key) || pageOf(key);
+// What the sidebar and the list below it follow: a page tab has nothing below it, so Home's.
+const opened = () => (pageOf(S.selected) ? '' : S.selected);
 // A member is the bot the swarm pinned: another bot later given its name is not the swarm's.
 const memberBot = (sw, m) => { const b = bot(m); return b && b.id != null && b.id === sw.ids[m] ? b : null; };
 // A member whose bot was deleted is out of the swarm, though the swarm's record still names it.
@@ -525,8 +545,8 @@ async function readUsage(sw) {
         const page = await Daemon.request('bots', { after, limit: 256 }); let past = false;
         for (const r of page.bots ?? []) {
           if (r.name > prefix && !r.name.startsWith(prefix)) { past = true; break; }
-          if (r.name in sw.ids) { if (sw.ids[r.name] === r.id) { live.add(r.id); budget += r.budget_tokens ?? 0; used += r.tokens_used ?? 0; } }
-          else if (roots.has(r.created_by_id)) { roots.set(r.id, roots.get(r.created_by_id)); helpers[r.id] = [r.tokens_used ?? 0, roots.get(r.id)]; }
+          if (r.name in sw.ids) { if (sw.ids[r.name] === r.bot_id) { live.add(r.bot_id); budget += r.budget_tokens ?? 0; used += r.tokens_used ?? 0; } }
+          else if (roots.has(r.created_by_id)) { roots.set(r.bot_id, roots.get(r.created_by_id)); helpers[r.bot_id] = [r.tokens_used ?? 0, roots.get(r.bot_id)]; }
         }
         if (past || !page.next_after) break;
         after = page.next_after;
@@ -681,7 +701,7 @@ async function onEvent(ev) {
       // bot the snapshot already holds keeps its record; the event says the same thing.
       S.deleted.delete(name);
       const known = bot(name);
-      if (!known || known.id == null || known.id !== data.id) upsert({ name, ...data });
+      if (!known || known.id == null || known.id !== data.bot_id) upsert({ name, ...data });
       bot(name).touched = S.session;
       const parent = bot(name) && creatorOf(bot(name));
       if (parent) addItem(transcript(parent.name), { kind: 'peer', who: name, turn: parent.runningTurn ?? null });
@@ -730,7 +750,7 @@ async function onEvent(ev) {
       let parsed = {}; try { parsed = JSON.parse(args) ?? {}; } catch (_) {}
       const tname = data.name ?? 'tool';
       const t = transcript(name);
-      const row = { kind: 'tool', from: t.callNode, callId: data.call_id, name: tname, summary: callSummary(tname, args), path: toolPath(tname, parsed), background: tname === 'shell' && parsed.background === true, done: false, started: S.live ? Date.now() : 0, took: 0, turn };
+      const row = { kind: 'tool', from: t.callNode, callId: data.call_id, name: tname, summary: callSummary(tname, args), path: toolPath(tname, parsed), background: tname === 'shell' && parsed.background === true, plan: tname === 'shell' && (PLAN_CALL.test(parsed.command ?? '') || PLAN_CALL.test(String(data.arguments ?? ''))), done: false, started: S.live ? Date.now() : 0, took: 0, turn };
       let existing = null;
       for (let i = t.items.length - 1; i >= 0; i--) {
         const it = t.items[i]; if (it.turn !== turn) break;
@@ -738,7 +758,7 @@ async function onEvent(ev) {
       }
       if (existing) {
         row.from = existing.from ?? row.from;
-        if (data.arguments_truncated) { row.summary = existing.summary; row.path = existing.path; row.background = existing.background; }
+        if (data.arguments_truncated) { row.summary = existing.summary; row.path = existing.path; row.background = existing.background; row.plan = existing.plan; }
         Object.assign(existing, row); t.gen += 1; } else addItem(t, row);
       break;
     }
@@ -747,10 +767,16 @@ async function onEvent(ev) {
       let call = null;
       for (let i = t.items.length - 1; i >= 0; i--) { const it = t.items[i]; if ((it.kind === 'tool' || it.kind === 'tool_stub') && it.turn === turn && it.callId === data.call_id) { call = it; break; } }
       if (call) { call.done = true; if (call.started) call.took = Date.now() - call.started; call.started = 0; patchRun(name, call); }
+      // The plan skill's script ran: the plan it left is read back.
+      if (call?.plan && S.live && bot(name)?.id != null) loadPlans([bot(name).id]);
       const shown = S.ui.file;
       // Read again as the agent left it; what it wrote is new, so a page, diagram or image in it waits for a click.
       // A write or edit that failed or was refused changed nothing, and what is shown keeps running.
-      if (shown && !data.failed && !data.denied && call?.path && (call.name === 'write' || call.name === 'edit') && joinPath(folderOf(name, turn), call.path) === shown.full) openFile(shown.bot, shown.full, false);
+      const wrote = !data.failed && !data.denied && call?.path && (call.name === 'write' || call.name === 'edit') ? joinPath(folderOf(name, turn), call.path) : null;
+      if (shown && wrote === shown.full) openFile(shown.bot, shown.full, false);
+      if (wrote != null && S.ui.tabFile?.full === wrote) { readTabFile(wrote, false); render(); }
+      // A step may have changed the repository a Git tab shows.
+      if (S.live) gitChanged(name);
       if (typeof data.node === 'number') {
         pushNode(t, { kind: 'node', node: data.node, callId: data.call_id, turn });
         if (call && (call.background || call.name === 'wait') && await loadWaitOrProc(name, data.node, call)) {
@@ -797,6 +823,7 @@ async function onEvent(ev) {
       if (S.live && status !== 'steered') { if (S.snapshot) S.heldNews.push([name, turn, status, from, undefined, origin, answered]); else turnNews(name, turn, status, from, undefined, origin, answered); }
       // A coordinator coming to rest hears what waited for it.
       if (S.wakes.has(name)) wakeSoon(name);
+      if (S.live) gitChanged(name);
       // A background command may outlive its turn; only a wait result says how it ended.
       break;
     }
@@ -805,7 +832,10 @@ async function onEvent(ev) {
       // A later bot may take the name as a swarm's agent, so it is looked for again.
       looked.delete(name);
       // Its tab goes up a level, to what made it, rather than closing on the reader.
-      const up = upOf(name);
+      const up = upOf(name), id = bot(name)?.id;
+      // Its plan goes with it.
+      if (id != null && S.plans.delete(id)) S.plansGen += 1;
+      if (id != null && S.live && !S.config?.host && !S.plansOff) Daemon.forgetPlan?.(id).catch((e) => Daemon.log?.(`plan of ${name}: ${e?.message ?? e}`));
       forgetBot(name);
       retab(name, isOpen(up) ? up : ''); save();
       // A deleted agent is no longer its swarm's: the swarm stops counting it and posting to it.
@@ -1000,10 +1030,10 @@ async function loadVisible() {
   // A swarm's agents show their last lines on its Agents tab, so the first dozen load.
   const sw = swarmOf(S.selected);
   if (sw) { if (sw.tab === 'agents') for (const m of sw.members.slice(0, 12)) if (memberBot(sw, m) && m !== S.ui.side) await load(m); }
-  else await load(S.selected);
-  if (S.ui.side && S.ui.side !== S.selected) await load(S.ui.side);
+  else await load(mainBot());
+  if (S.ui.side && S.ui.side !== mainBot()) await load(S.ui.side);
   // Cards on screen show their peer's last line, so those peers load too.
-  for (const who of peers().slice(-12)) if (who !== S.selected && who !== S.ui.side) await load(who);
+  for (const who of peers().slice(-12)) if (who !== mainBot() && who !== S.ui.side) await load(who);
 }
 
 // All transcript mutations, including snapshot pages and creation replies,
@@ -1048,12 +1078,17 @@ function merge(tasks, name, news) {
 // A working coordinator waits for its turn to end, which calls this again.
 function wakeSoon(lead) {
   const w = S.wakes.get(lead), l = bot(lead);
-  if (!w || w.timer || !w.tasks.size || !l || isActive(l.status)) return;
+  if (!w || w.timer || w.busy || !w.tasks.size || !l || isActive(l.status)) return;
   w.timer = setTimeout(() => { w.timer = null; wake(lead); }, Math.max(0, w.last + WAKE_MS - Date.now()));
 }
 async function wake(lead) {
   const w = S.wakes.get(lead), l = bot(lead);
-  if (!w || !w.tasks.size || !S.attached || !l || l.id == null || isActive(l.status)) return;
+  if (!w || w.busy || !w.tasks.size || !S.attached || !l || l.id == null || isActive(l.status)) return;
+  // What changed in memory rides along; it never wakes a coordinator by itself.
+  w.busy = true;
+  const mem = await memoryNews(l, w).catch((e) => { Daemon.log?.(`memory for ${lead}: ${e?.message ?? e}`); return null; });
+  w.busy = false;
+  if (S.wakes.get(lead) !== w || bot(lead) !== l || !w.tasks.size || !S.attached || isActive(l.status)) return;
   const sent = [...w.tasks].sort(([, a], [, b]) => (b.act ? 1 : 0) - (a.act ? 1 : 0)).slice(0, WAKE_TASKS);
   const items = sent.flatMap(([name, n]) => KINDS.filter((k) => n[k]).map((k) => [name, k, n[k]]));
   for (const [name] of sent) w.tasks.delete(name);
@@ -1062,13 +1097,13 @@ async function wake(lead) {
   // approval call: one turn can need several approvals before its completion.
   // Windows with the same news still deduplicate, regardless of earlier turn
   // counts; a window that saw news of another kind sends its own message.
-  const prompt = wakeText(items, w.tasks.size);
+  const prompt = wakeText(items, w.tasks.size) + (mem ? `\n\n${mem.text}` : '');
   const key = ([name, k]) => `${name}\u0000${k}`;
   const id = `app-wake-${l.id}-${digest(JSON.stringify(items.map(([name, k, t]) => [name, k, t.turn, t.status, t.approval ?? null]).sort((a, b) => key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0)))}`;
-  try { await Daemon.request('submit', { bot: lead, bot_id: l.id, request_id: id, prompt, delivery: 'queue', origin: 'tasks' }); }
+  try { await Daemon.request('submit', { bot: lead, bot_id: l.id, request_id: id, prompt, delivery: 'queue', origin: 'tasks' }); mem?.told(); }
   catch (e) {
     if (/^bot_not_found/.test(e?.message ?? '')) { S.wakes.delete(lead); return; }
-    // Another window told it first.
+    // Another window told it first, perhaps without this window's memory lines, which wait for the next.
     if (/^idempotency_conflict/.test(e?.message ?? '')) return;
     const later = w.tasks;
     w.tasks = new Map(sent);
@@ -1077,6 +1112,30 @@ async function wake(lead) {
     wakeSoon(lead);
   }
 }
+// ---------- memory news ----------
+// A coordinator composed its instructions when it was made, so a fact a task saved since reaches it
+// as lines added to a message it gets anyway, a task update: what was saved or removed in its own and
+// its project's memory since this window last told it, or since the window opened. A fact it saved
+// itself is not news. The lines come after the prompt's start, so its cached prefix stays.
+const OPENED_AT = Date.now(), MEMORY_LINES = 20;
+async function memoryNews(l, w) {
+  const project = leadProject(l.name);
+  if (S.config?.host || !project || !Daemon.memoryView) return null;
+  const v = await Daemon.memoryView(project);
+  const read = [v.user, ...(v.projects ?? [])].filter((sc) => sc?.facts), now = new Map();
+  for (const sc of read) for (const f of sc.facts) now.set(f.path, f);
+  // Each fact as last told, by its file and when it was written; a folder that could not be read keeps its own.
+  const seen = w.memSeen, own = `turn:${l.name}/`, inRead = (p) => read.some((sc) => trimDir(sc.dir) === p.slice(0, p.lastIndexOf('/')));
+  const saved = [...now.values()].filter((f) => (seen ? seen.get(f.path) !== f.modified : f.modified > OPENED_AT) && !f.source.startsWith(own)).sort((a, b) => b.modified - a.modified);
+  const gone = seen ? [...seen.keys()].filter((p) => !now.has(p) && inRead(p)) : [];
+  const told = () => { w.memSeen = new Map([...[...(seen ?? [])].filter(([p]) => !inRead(p)), ...[...now].map(([p, f]) => [p, f.modified])]); };
+  // Removals first: past the cap, saved facts are still listed by memory show, removed ones are not.
+  const lines = [...gone.map((p) => `- removed: ${p}`), ...saved.map((f) => `- saved: ${f.path}: ${f.description}`)];
+  if (!lines.length) { told(); return null; }
+  const more = lines.length - MEMORY_LINES;
+  return { told, text: `Memory changed since you last heard; each fact is a file, read before relying on it:\n${lines.slice(0, MEMORY_LINES).join('\n')}${more > 0 ? `\n- ${more} more: ~/.agent/memory show lists every fact` : ''}` };
+}
+
 // FNV-1a over the text's UTF-16 units, 64 bits as hex.
 function digest(text) {
   let h = 0xcbf29ce484222325n;
@@ -1140,10 +1199,10 @@ function lost(reason) {
 function seat(record, session) {
   if (S.deleted.has(record.name)) return;
   const b = bot(record.name);
-  const conflict = b && b.id != null && record.id != null && b.id !== record.id;
+  const conflict = b && b.id != null && record.bot_id != null && b.id !== record.bot_id;
   if (!b || b.touched !== session) { upsert(record); return; }
   if (conflict) return;
-  if (record.id != null) b.id = record.id;
+  if (record.bot_id != null) b.id = record.bot_id;
   b.model = `${record.provider ?? '?'}/${record.model ?? '?'}`;
   learnEffort(b, record);
   learnFamily(b, record);
@@ -1224,6 +1283,7 @@ async function attachOnce() {
       S.ui.tabs = S.ui.tabs.filter(isOpen); if (!isOpen(S.selected)) S.selected = '';
       const shown = swarmOf(S.selected); if (shown) { readBoard(shown); readUsage(shown); }
       S.botsGen += 1; S.shapeGen += 1;
+      await loadPlans();
       await loadVisible();
       if (S.session !== session) return false;
     });
@@ -1243,11 +1303,12 @@ async function attachOnce() {
 // Everything the window learned from one store, dropped before it shows another.
 function forgetStore() {
   S.cursor = 0; S.bots.clear(); S.transcripts.clear(); S.drafts.clear(); S.override.clear(); S.effort.clear(); S.families.clear();
-  S.swarms.clear(); S.memberOf.clear(); S.deleted.clear(); looked.clear();
+  S.swarms.clear(); S.memberOf.clear(); S.deleted.clear(); looked.clear(); S.plans.clear(); S.plansOff = false; S.plansGen += 1;
   for (const w of S.wakes.values()) clearTimeout(w.timer);
   S.wakes.clear(); S.turnFrom.clear(); S.turnOrigin.clear(); S.answerTo.clear(); S.heldNews = []; S.answered.clear();
   for (const timer of S.forwarding.values()) clearTimeout(timer); S.forwarding.clear(); S.unseen.clear(); S.wanted.clear();
-  S.selected = ''; S.ui.tabs = []; S.ui.side = null; dropFile();
+  for (const g of S.ui.git.values()) clearTimeout(g.timer);
+  S.selected = ''; S.ui.tabs = []; S.ui.side = null; S.ui.git.clear(); S.ui.gitFrom.clear(); dropFile(); dropTabFile();
   S.botsGen += 1; S.shapeGen += 1;
   // A home the last host named is not this one's.
   if (S.homeWorkspace) { S.config.workspace = null; S.homeWorkspace = false; }
@@ -1310,13 +1371,15 @@ function restore() {
 const keyIdentity = (k) => { const up = upOf(k); return [k, bot(k)?.id ?? null, up || null, up ? bot(up)?.id ?? null : null]; };
 const savedKey = (k, id) => {
   if (typeof k !== 'string') return null;
-  if (swarmOf(k)) return k;
+  if (swarmOf(k) || pageOf(k)) return k;
   const b = bot(k); return b && b.id != null && b.id === id ? k : null;
 };
 const sameKey = (entry) => { const [k, id, up, upId] = Array.isArray(entry) ? entry : []; return savedKey(k, id) ?? savedKey(up, upId); };
 function save() { const key = sessionKey(); if (!key) return; try { localStorage.setItem(key, JSON.stringify({ selected: S.selected, tabs: S.ui.tabs.map(keyIdentity), side: S.ui.side ? keyIdentity(S.ui.side) : null, rail: S.ui.rail, steps: S.ui.steps, override: [...S.override].map(([name, model]) => [name, bot(name)?.id ?? null, model]), effort: [...S.effort].map(([name, level]) => [name, bot(name)?.id ?? null, level]) })); } catch (_) {} }
 window.addEventListener('beforeunload', save);
 window.addEventListener('focus', markSeen);
+// Back in the window, a Git tab in view reads what changed meanwhile.
+window.addEventListener('focus', () => { const dir = gitOf(S.selected), g = dir != null ? S.ui.git.get(dir) : null; if (g?.state === 'ok') readGit(g); });
 
 // ---------- render ----------
 function inline(text) {
@@ -1372,14 +1435,15 @@ function cardHTML(card) {
   return `<div class="peer${card.sel ? ' sel' : ''}" ${card.attr}${card.task ? ' role="button" tabindex="0"' : ''}>${cardInner(card)}${card.task ? `<span class="tacts">${moreButton(card.task)}</span>` : ''}</div>`;
 }
 const cssEsc = (s) => String(s).replace(/[\x00-\x1f\x7f"\\]/g, (c) => c === '\0' ? '\ufffd' : c === '"' || c === '\\' ? '\\' + c : '\\' + c.charCodeAt(0).toString(16) + ' ');
-// A task's card: its status, its elapsed time and its newest line. Click opens it beside.
+// A task's card: its status, its elapsed time and its newest line, or with a plan the steps done and
+// the one it is on. Click opens it beside.
 function taskCard(who) {
   const p = bot(who); if (!p) return null;
-  const el = p.turnStarted ? fmt(Date.now() - p.turnStarted) : p.elapsed ? fmt(p.elapsed) : '';
-  return { attr: `data-task="${esc(p.name)}"`, task: p.name, status: shownStatus(p), name: shortName(p), last: lastLine(transcript(who)), elapsed: el, sel: S.ui.side === who || S.selected === who };
+  const el = p.turnStarted ? fmt(Date.now() - p.turnStarted) : p.elapsed ? fmt(p.elapsed) : '', plan = planOf(p);
+  return { attr: `data-task="${esc(p.name)}"`, task: p.name, status: shownStatus(p), name: shortName(p), last: plan?.at ? `${STEP_GLYPH[plan.at.s]} ${plan.at.t}` : lastLine(transcript(who)), elapsed: plan ? [planCount(plan), el].filter(Boolean).join(' · ') : el, sel: S.ui.side === who || S.selected === who };
 }
 // The two panes that show a transcript: the main thread and the one beside it.
-const PANES = [['log', () => S.selected], ['side', () => S.ui.file ? null : S.ui.side]];
+const PANES = [['log', mainBot], ['side', () => S.ui.file ? null : S.ui.side]];
 const paneKey = (name, t) => `${name}|${t.gen}|${S.ui.steps}`;
 // Replace one rendered card in place, in whichever pane shows that bot, so a process ending costs the
 // size of its own card, not a rebuild of the window.
@@ -1422,6 +1486,57 @@ function lastLine(t) {
   if (t.text) return tailOf(t.text); if (t.thinking) return t.thinking.slice(-400).split('. ').pop().slice(0, 200);
   for (let i = t.items.length - 1; i >= 0; i--) { const it = t.items[i]; if (it.kind === 'text') return tailOf(it.text); if (it.kind === 'tool') return `▸ ${it.name} ${it.summary}`; }
   return '';
+}
+
+// ---------- plans ----------
+// An agent's plan, which the plan skill's script keeps beside the store under the agent's bot id: the
+// steps done, the one it is on, and the rest. Every plan is read when the window attaches, and an
+// agent's again when a shell call of its that ran the script ends, so a quiet fleet costs nothing.
+const PLAN_CALL = /skills\/plan\/plan\b/;
+const PLAN_MARK = { '[x] ': 'done', '[>] ': 'now', '[ ] ': 'todo' };
+const STEP_GLYPH = { done: '✓', now: '✱', todo: '○' };
+function parsePlan(text) {
+  const steps = [];
+  for (const line of String(text ?? '').split('\n').slice(0, 30)) { const s = PLAN_MARK[line.slice(0, 4)], t = line.slice(4).trim(); if (s && t) steps.push({ s, t: t.slice(0, 200) }); }
+  if (!steps.length) return null;
+  return { steps, done: steps.filter((x) => x.s === 'done').length, at: steps.find((x) => x.s === 'now') ?? steps.find((x) => x.s === 'todo') ?? null };
+}
+const planOf = (b) => (b?.id != null ? S.plans.get(b.id) ?? null : null);
+const planCount = (plan) => `${plan.done}/${plan.steps.length}`;
+// Every plan, or `ids`' (an agent with none loses the one shown). Reads go one at a time, so an older
+// read never lands after a newer one. A window on a host, or one opened on a socket alone, cannot read
+// them; it logs why once and stops asking.
+let planReads = Promise.resolve();
+// No ids reads every seated agent's, and those replace what was shown. A plan named for no agent
+// here, such as one deleted from another window, is never read; the app's side lists the plans
+// folder for a long list, so the cost follows the plans that exist.
+function loadPlans(ids = null) { return (planReads = planReads.then(() => readPlans(ids))); }
+async function readPlans(ids) {
+  if (S.config?.host || S.plansOff || !Daemon.plans) return;
+  const session = S.session;
+  const all = !ids;
+  if (all) ids = [...S.bots.values()].map((b) => b.id).filter((id) => id != null);
+  let got; try { got = ids.length ? await Daemon.plans(ids) : {}; } catch (e) {
+    const why = String(e?.message ?? e); if (/^(plans|remote)_unsupported/.test(why)) S.plansOff = true;
+    Daemon.log?.(`plans: ${why}`); return;
+  }
+  if (S.session !== session) return;
+  // An agent asked about and left out has no plan.
+  if (all) S.plans.clear();
+  for (const id of ids) { const plan = parsePlan(got?.[id] ?? ''); if (plan) S.plans.set(id, plan); else S.plans.delete(id); }
+  S.plansGen += 1;
+  // What shows a plan: the list's rows, task cards, and the plan above a chat.
+  if (S.attached) { rail.key = ''; render(); refreshLive($('log')); if (S.ui.side && !S.ui.file) refreshLive($('side')); }
+}
+// The plan above a chat: every step, the one it is on marked; its count folds it to that step.
+function renderPlan(el, b) {
+  // Each pane folds its own plan.
+  const plan = planOf(b), folded = !!S.ui.planFolded[el.id], key = plan ? `${b.id}|${S.plansGen}|${folded}` : '';
+  if (el.dataset.k === key) return; el.dataset.k = key;
+  el.hidden = !plan; if (!plan) { el.innerHTML = ''; return; }
+  const step = (x) => `<div class="pstep ${x.s}"><span class="pm">${STEP_GLYPH[x.s]}</span>${esc(x.t)}</div>`;
+  const shown = folded ? (plan.at ? [plan.at] : []) : plan.steps;
+  el.innerHTML = `<button type="button" class="pcount" data-act="plan-fold" data-v="${el.id}" title="${folded ? 'Show the whole plan' : 'Fold the plan to its current step'}">${planCount(plan)}</button>${shown.map(step).join('')}`;
 }
 
 // ---------- runs ----------
@@ -1475,7 +1590,7 @@ function stepHTML(it, i) {
 // Open or close a run, or unfold one output, and redraw just that run.
 function toggleStep(target) {
   const pane = target.closest('.scroll'); if (!pane) return;
-  const name = pane.id === 'side' ? S.ui.side : S.selected, t = name && S.transcripts.get(name);
+  const name = pane.id === 'side' ? S.ui.side : mainBot(), t = name && S.transcripts.get(name);
   if (!t || pane.dataset.key !== paneKey(name, t)) return;
   const len = Number(pane.dataset.len);
   const i = Number(target.dataset.out ?? target.dataset.run); if (!(i >= 0 && i < len)) return;
@@ -1612,7 +1727,9 @@ for (const [id, who] of PANES) {
 // ---------- files ----------
 // A file a message links or a step read, wrote or edited, opened beside: read from the agent's
 // folder by the core, drawn by its kind (see `Rich.file`). It takes the place of the pane beside
-// until closed, and is read again when a step of the agent it came from writes or edits it.
+// until closed. A file can also be a tab (from beside, or found with ⌘P); only the tab in view holds
+// what it read, and a tab shown again reads its file again. Either is read again when a step writes
+// or edits it.
 const FILE_CAP = 4 * 1024 * 1024;
 // `~/` is the home folder, as the core reads it; any other name, `~notes.md` too, is the folder's.
 function joinPath(dir, path) {
@@ -1629,12 +1746,13 @@ function folderOf(who, turn) {
   return (turn != null && S.transcripts.get(who)?.folders.get(Number(turn))) || (bot(who)?.workspace ?? S.config?.workspace ?? '');
 }
 const turnAttr = (turn) => turn != null ? ` data-turn="${esc(turn)}"` : '';
-// Which folder a click names a path in: the file beside's own folder, or the folder of the turn that
+// Which folder a click names a path in: the shown file's own folder, or the folder of the turn that
 // wrote the message or step, in the agent in that pane.
 function openFileFrom(path, el) {
-  const beside = el?.closest?.('.pane.side');
+  const beside = el?.closest?.('.pane.side'), tab = fileOf(S.selected);
   if (beside && S.ui.file) return openFile(S.ui.file.bot, joinPath(dirOf(S.ui.file.full), path));
-  const who = beside ? S.ui.side : S.selected;
+  if (!beside && tab != null) return openFile(null, joinPath(dirOf(tab), path));
+  const who = beside ? S.ui.side : mainBot();
   return openFile(who, joinPath(folderOf(who, el?.closest?.('[data-turn]')?.dataset.turn), path));
 }
 // `asked`: someone opened it, so what it holds draws at once. `gen` counts every opening and load
@@ -1645,12 +1763,28 @@ async function openFile(who, full, asked = true) {
   if (old?.url) URL.revokeObjectURL(old.url);
   const f = S.ui.file = { bot: who, full, asked, gen: ++fileGen, state: 'loading', view: null, url: null };
   render();
+  await readInto(f, () => S.ui.file === f);
+}
+// `still`: the view is still the one shown, so what was read is kept.
+async function readInto(f, still) {
   try {
-    const bytes = new Uint8Array(await Daemon.readFile(full));
-    if (S.ui.file !== f) return;
+    const bytes = new Uint8Array(await Daemon.readFile(f.full));
+    if (!still()) return;
     Object.assign(f, { state: 'ok', bytes: bytes.subarray(0, FILE_CAP), more: bytes.length > FILE_CAP, gen: ++fileGen });
-  } catch (e) { if (S.ui.file !== f) return; Object.assign(f, { state: 'error', error: String(e?.message ?? e), gen: ++fileGen }); }
+  } catch (e) { if (!still()) return; Object.assign(f, { state: 'error', error: String(e?.message ?? e), gen: ++fileGen }); }
   render();
+}
+// The file tab in view, read when it comes into view; `asked` as for a file beside.
+function readTabFile(full, asked = true) {
+  dropTabFile(!asked);
+  const f = S.ui.tabFile = { bot: null, full, asked, gen: ++fileGen, state: 'loading', view: null, url: null };
+  readInto(f, () => S.ui.tabFile === f);
+}
+// A file read again because a step changed it keeps the reader's place.
+function dropTabFile(keepPlace = false) {
+  const f = S.ui.tabFile; if (!f) return;
+  if (f.url) URL.revokeObjectURL(f.url);
+  S.ui.tabFile = null; if (!keepPlace) $('log').dataset.shows = '';
 }
 // A file opened from an agent goes with that agent, and with the store it came from.
 function dropFile() {
@@ -1661,8 +1795,8 @@ function dropFile() {
 }
 // The chat it covered is on screen again, and what it finished meanwhile is seen.
 function closeFile() { if (dropFile()) { render(); markSeen(); focusInput(S.ui.side ? 'side' : 'main'); } }
-function renderFile() {
-  const f = S.ui.file, el = $('side');
+// Beside, the head closes it or opens it as a tab; in a tab, the crumbs say where it is.
+function renderFile(f = S.ui.file, el = $('side'), head = $('sidetitle'), pane = 'side') {
   // Drawn when read, and again when highlighting arrives for code that waited for it; a page,
   // diagram or chart beside keeps running as it is.
   if (f.state === 'ok' && (f.at !== f.gen || (f.waited && f.ver !== Rich.version))) {
@@ -1672,9 +1806,11 @@ function renderFile() {
   }
   const key = `file|${f.full}|${f.gen}|${f.ver}`;
   if (el.dataset.key === key) return;
-  const name = f.full.split('/').pop(), where = dirOf(f.full).replace(/^\/(Users|home)\/[^/]+/, '~');
-  $('sidetitle').dataset.k = key;
-  $('sidetitle').innerHTML = `<div class="crumbs"><b>${esc(name)}</b><span class="branch" title="${esc(f.full)}">${esc(where)}</span></div><div class="tools"><button type="button" class="ibtn" data-act="close-file" title="Close (Esc)" aria-label="Close">✕</button></div>`;
+  const name = f.full.split('/').pop(), where = `<span class="branch" title="${esc(f.full)}">${esc(dirOf(f.full).replace(/^\/(Users|home)\/[^/]+/, '~'))}</span>`;
+  head.dataset.k = key;
+  head.innerHTML = pane === 'side'
+    ? `<div class="crumbs"><b>${esc(name)}</b>${where}</div><div class="tools"><button type="button" class="ibtn" data-act="file-tab" title="Open as tab">⤢ Open as tab</button><button type="button" class="ibtn" data-act="close-file" title="Close (Esc)" aria-label="Close">✕</button></div>`
+    : `<div class="crumbs">${crumbsHTML(S.selected)}${where}</div><div class="tools"></div>`;
   el.innerHTML = `<div class="fview">${f.state === 'loading' ? '<div class="line pending">reading…</div>' : f.state === 'error' ? `<div class="line out bad">${esc(f.error)}</div>` : f.view}</div>`;
   // A file drawn again (highlighting arrived, an agent rewrote it) keeps the reader's place.
   if (el.dataset.shows !== f.full) el.scrollTop = 0;
@@ -1685,6 +1821,271 @@ function renderFile() {
   else Promise.all(opening.map((a) => a.finished.catch(() => {}))).then(() => { if (el.dataset.key === key) Rich.hydrate(el); });
 }
 
+// ---------- the Git tab ----------
+// A folder's repository the way lazygit lays it out: its changes, its last commits and its
+// worktrees on the left, the diff of the one chosen on the right. The app runs plain git there and
+// only reads; an agent commits its own work. A click on a diff line writes a note that goes to the
+// agent working in that folder as an ordinary message, naming the file and line.
+// Each open Git tab keeps its view while it is open; only the one in view is read again, when it
+// comes into view, on `r`, when the window comes back, and soon after an agent working in its
+// repository finishes a step.
+const GIT_PANELS = ['changes', 'commits', 'worktrees'];
+function gitTab(dir) {
+  let g = S.ui.git.get(dir);
+  if (!g) S.ui.git.set(dir, g = { dir, state: 'idle', error: '', view: null, panel: 'changes', sel: { changes: 0, commits: 0, worktrees: 0 }, diff: null, notes: new Map(), note: null, gen: 0, reading: false, again: false, timer: null, diffBusy: false, diffWant: false });
+  return g;
+}
+// What a row is, across reads: a change by its path, a commit by its sha, a worktree by its folder.
+// A path both deleted from the index and new in the folder is two changes.
+const gitKeyOf = (panel, it) => (panel === 'changes' ? `c:${it.code === '??' ? '?' : ''}${it.path}` : panel === 'commits' ? `s:${it.sha}` : `w:${it.path}`);
+const gitList = (g, panel = g.panel) => (g.view ? panel === 'changes' ? g.view.changes : panel === 'commits' ? g.view.commits : g.view.worktrees : []);
+const gitItem = (g) => gitList(g)[g.sel[g.panel]] ?? null;
+// The rows chosen, by what they are; a Git tab out of view keeps only these.
+const chosen = (g) => (g.view ? Object.fromEntries(GIT_PANELS.map((p) => { const it = gitList(g, p)[g.sel[p]]; return [p, it ? gitKeyOf(p, it) : null]; })) : g.chosen ?? {});
+async function readGit(g) {
+  if (g.reading) { g.again = true; return; }
+  g.reading = true; clearTimeout(g.timer); g.timer = null;
+  if (g.state === 'idle') g.state = 'loading';
+  try {
+    const view = await Daemon.gitView(g.dir);
+    // The rows chosen stay chosen when they are still there, as chosen when the read comes back:
+    // the lists stay live while git runs.
+    const was = chosen(g);
+    Object.assign(g, { state: 'ok', view, error: '' });
+    for (const p of GIT_PANELS) {
+      const list = gitList(g, p), at = was[p] == null ? -1 : list.findIndex((it) => gitKeyOf(p, it) === was[p]);
+      g.sel[p] = at >= 0 ? at : Math.max(0, Math.min(g.sel[p], list.length - 1));
+    }
+    // At first the worktree shown is the one chosen.
+    if (was.worktrees == null) g.sel.worktrees = Math.max(0, view.worktrees.findIndex((w) => trimDir(w.path) === trimDir(view.root)));
+  } catch (e) { Object.assign(g, { state: 'error', error: String(e?.message ?? e) }); }
+  g.reading = false; g.gen += 1;
+  if (S.ui.git.get(g.dir) !== g) return;
+  if (g.again) { g.again = false; readGit(g); }
+  if (g.state === 'ok') readDiff(g, true);
+  render();
+}
+// Soon after an agent working in the repository in view finishes a step or a turn, once for a burst.
+function gitChanged(name) {
+  const dir = gitOf(S.selected), g = dir != null ? S.ui.git.get(dir) : null, ws = bot(name)?.workspace;
+  if (!g || !ws) return;
+  const root = trimDir(g.view?.root ?? dir);
+  if (trimDir(ws) !== trimDir(dir) && trimDir(ws) !== root && !ws.startsWith(`${root}/`)) return;
+  if (!g.timer) g.timer = setTimeout(() => { g.timer = null; readGit(g); }, 600);
+}
+// One diff read at a time: moving down a list fast reads the row it stops on, not every row passed.
+async function readDiff(g, fresh = false) {
+  const it = gitItem(g), of = it && g.panel !== 'worktrees' ? gitKeyOf(g.panel, it) : null;
+  if (of == null) { g.diff = null; return; }
+  if (!fresh && g.diff?.of === of) return;
+  // A diff read again keeps what it showed until the new one arrives.
+  const d = g.diff = { of, state: 'loading', rows: g.diff?.of === of ? g.diff.rows : [], more: 0, cut: false, error: '' };
+  if (it.path?.endsWith('/')) { Object.assign(d, { state: 'ok', rows: [{ k: 'meta', t: 'A folder holding another repository; its own Git tab shows it.' }] }); return; }
+  if (g.diffBusy) { g.diffWant = true; return; }
+  g.diffBusy = true;
+  try {
+    const got = await Daemon.gitDiff(g.panel === 'commits' ? { root: g.view.root, commit: it.sha } : { root: g.view.root, path: it.path, from: it.from ?? null, untracked: it.code === '??' });
+    if (g.diff === d) { const { rows, more } = diffRows(got.text, it.path ?? null); Object.assign(d, { state: 'ok', rows, more, cut: !!got.cut }); }
+  } catch (e) { if (g.diff === d) Object.assign(d, { state: 'error', error: String(e?.message ?? e) }); }
+  g.diffBusy = false;
+  if (g.diffWant) { g.diffWant = false; readDiff(g, true); }
+  if (S.ui.git.get(g.dir) === g) render();
+}
+// A diff as rows, each line numbered on its side: `o` before the change, `n` after. A commit's
+// diff holds several files, each row knowing its own (`p`): a removed line the file it was removed
+// from, which a rename names apart from where the file is now. Past `DIFF_ROWS` rows only a count is kept.
+const DIFF_ROWS = 5000;
+function diffRows(text, path) {
+  const rows = []; let o = 0, n = 0, p = path, was = path, hunk = false, more = 0, from = null;
+  const lines = text.split('\n'); if (lines.at(-1) === '') lines.pop();
+  for (const l of lines) {
+    if (rows.length >= DIFF_ROWS) { more += 1; continue; }
+    if (l.startsWith('diff ')) { hunk = false; from = null; continue; }
+    if (!hunk) {
+      if (l.startsWith('--- ')) { from = l.slice(4); continue; }
+      if (l.startsWith('+++ ')) {
+        const to = l.slice(4), named = to === '/dev/null' ? from : to, strip = (x) => x.replace(/^[ab]\//, '');
+        p = named && named !== '/dev/null' ? strip(named) : p;
+        was = from && from !== '/dev/null' ? strip(from) : p;
+        rows.push({ k: 'file', t: p ?? '' }); continue;
+      }
+      if (l.startsWith('index ')) continue;
+    }
+    if (l.startsWith('@@')) {
+      const m = /^@@+ -(\d+)(?:,\d+)? \+(\d+)/.exec(l); if (m) { o = Number(m[1]); n = Number(m[2]); }
+      hunk = true; rows.push({ k: 'hunk', t: l }); continue;
+    }
+    if (!hunk) { rows.push({ k: 'meta', t: l }); continue; }
+    const c = l[0];
+    if (c === '+') rows.push({ k: 'add', t: l, n: n++, p });
+    else if (c === '-') rows.push({ k: 'del', t: l, o: o++, p: was });
+    else if (c === ' ') rows.push({ k: 'ctx', t: l, o: o++, n: n++, p });
+    else rows.push({ k: 'meta', t: l });
+  }
+  return { rows, more };
+}
+// Who a note goes to: an agent working in the folder (or, if none, inside it), the one its tab was opened from first, then
+// one working now, then the project's coordinator. A folder no agent works in takes no notes.
+// The agents by folder are gathered once per change to the fleet, not once per row.
+const workers = { gen: -1, by: new Map() };
+const trimDir = (dir) => (dir ? dir.replace(/\/+$/, '') || '/' : '');
+function gitOwner(dir) {
+  if (workers.gen !== S.botsGen) {
+    workers.gen = S.botsGen; workers.by = new Map();
+    for (const b of S.bots.values()) if (b.name !== HOME && b.workspace) { const d = trimDir(b.workspace); if (!workers.by.has(d)) workers.by.set(d, []); workers.by.get(d).push(b); }
+    for (const list of workers.by.values()) list.sort((a, b) => a.name.localeCompare(b.name));
+  }
+  // A task started in a project below the repository's top works in the same folder of its worktree,
+  // so a worktree no agent works at the top of takes the agents working inside it.
+  const at = trimDir(dir), inside = (d) => at === '/' || d.startsWith(`${at}/`);
+  const here = (workers.by.get(at) ?? [...workers.by].filter(([d]) => inside(d)).flatMap(([, list]) => list)).filter((b) => bot(b.name) === b), [name, id] = S.ui.gitFrom.get(dir) ?? [], from = bot(name)?.id === id ? bot(name) : null;
+  if (from && here.includes(from)) return from;
+  return here.find((b) => isActive(b.status)) ?? here.find((b) => leadProject(b.name)) ?? here[0] ?? null;
+}
+async function openGit(who) {
+  const b = bot(who), dir = b?.workspace; if (!dir) return;
+  if (S.config?.host) throw new Error(`git_local_only: the Git tab reads this machine's folders, and this window's agents run on ${S.config.host}`);
+  // The agent it was opened from, by identity: another bot later given its name is not it.
+  S.ui.gitFrom.set(dir, [who, b.id]);
+  await go(GIT + dir, 'tab');
+}
+// A sent note stays under the line it is about, by what the line holds and which of the lines
+// holding the same it is, as other lines come and go.
+const noteKey = (of, r) => `${of}\u0000${r.p ?? ''}\u0000${r.k}\u0000${r.t}`;
+function nthSame(rows, at) { const r = rows[at]; let n = 0; for (let i = 0; i < at; i += 1) { const x = rows[i]; if (x.k === r.k && x.p === r.p && x.t === r.t) n += 1; } return n; }
+const NOTE_QUOTE = 300;
+// The note names the file and line as the agent's folder names them, quotes the line, then says
+// what was typed; a commit's names the commit too.
+function noteText(g, r, text) {
+  const root = trimDir(g.view.root), owner = gitOwner(g.dir);
+  const path = trimDir(owner?.workspace) === root ? r.p : `${root}/${r.p}`;
+  const it = gitItem(g), where = r.k === 'del' ? `${path}, line ${r.o} before the change (removed)` : `${path}:${r.n}`;
+  const line = r.t.slice(1), quote = line.length > NOTE_QUOTE ? `${line.slice(0, NOTE_QUOTE)}…` : line;
+  return `${g.panel === 'commits' ? `In commit ${it.sha.slice(0, 12)}, ` : ''}${where}\n> ${quote}\n${text}`;
+}
+// The row a note is on, in the diff as read now: a read again while it is typed (an agent finished a
+// step) can move the line, so it is found again by what it holds, the nearest such row; -1 when it
+// is gone, and the note then names the line as it was clicked.
+function noteRow(g) {
+  const note = g.note, d = g.diff; if (!note || d?.of !== note.of) return -1;
+  const same = (r) => r && r.k === note.r.k && r.p === note.r.p && r.t === note.r.t;
+  if (same(d.rows[note.row])) return note.row;
+  let best = -1; d.rows.forEach((r, i) => { if (same(r) && (best < 0 || Math.abs(i - note.row) < Math.abs(best - note.row))) best = i; });
+  return best;
+}
+async function sendNote(g, text) {
+  const note = g.note, d = g.diff, at = noteRow(g), r = at >= 0 ? d.rows[at] : note?.r, owner = gitOwner(g.dir);
+  g.note = null;
+  if (!text || !r || !owner || d?.of !== note.of) { render(); return; }
+  try {
+    // A note waits for a working agent's turn to end, as a queued message does.
+    await submit(noteText(g, r, text), 'main', owner.name, isActive(owner.status) ? 'queue' : 'send');
+    const key = `${noteKey(d.of, r)}\u0000${at >= 0 ? nthSame(d.rows, at) : 0}`; g.notes.set(key, [...(g.notes.get(key) ?? []), text]);
+    toast(`sent to ${shortName(owner)}`);
+  } catch (e) { g.note = note; g.draft = text; toast(String(e?.message ?? e), 4000); }
+  g.gen += 1; render(); focusInput('main');
+}
+function openNote(g, row) {
+  const d = g.diff, r = d?.rows[row]; if (!r || !['add', 'del', 'ctx'].includes(r.k)) return;
+  const owner = gitOwner(g.dir);
+  if (!owner) { toast('No agent works in this folder, so a note has no one to go to'); return; }
+  g.note = { row, of: d.of, r }; g.draft = ''; g.gen += 1; render();
+  setTimeout(() => $('gnote')?.focus(), 0);
+}
+// j/k and the arrows move, 1-3 or h/l choose a list, Enter opens what is chosen, o its agent, r reads again.
+async function gitKey(g, k) {
+  const list = gitList(g), i = g.sel[g.panel], it = list[i];
+  const move = (to) => { g.sel[g.panel] = Math.max(0, Math.min(list.length - 1, to)); g.note = null; g.gen += 1; readDiff(g); render(); scrollGitRow(); };
+  if (k === 'j' || k === 'ArrowDown') move(i + 1);
+  else if (k === 'k' || k === 'ArrowUp') move(i - 1);
+  else if (k === 'g' || k === 'Home') move(0);
+  else if (k === 'G' || k === 'End') move(list.length - 1);
+  else if (k === '1' || k === '2' || k === '3') gitPanel(g, GIT_PANELS[Number(k) - 1]);
+  else if (k === 'l' || k === 'ArrowRight') gitPanel(g, GIT_PANELS[(GIT_PANELS.indexOf(g.panel) + 1) % 3]);
+  else if (k === 'h' || k === 'ArrowLeft') gitPanel(g, GIT_PANELS[(GIT_PANELS.indexOf(g.panel) + 2) % 3]);
+  else if (k === 'r') readGit(g);
+  else if (k === 'o') { const owner = g.panel === 'worktrees' && it ? gitOwner(it.path) : gitOwner(g.dir); if (owner) await go(owner.name, 'tab'); }
+  else if (k === 'Enter' || k === 'e') await gitOpen(g, it);
+  else if (k === '?') showHelp();
+  else return false;
+  return true;
+}
+function gitPanel(g, panel) { if (g.panel === panel) return; g.panel = panel; g.note = null; g.gen += 1; readDiff(g); render(); scrollGitRow(); }
+// A change opens its file in a tab; a worktree opens its own Git tab.
+async function gitOpen(g, it) {
+  if (!it || !g.view) return;
+  if (g.panel === 'changes' && !it.path.endsWith('/') && !fileGone(it.code)) await go(`${FILE}${trimDir(g.view.root)}/${it.path}`, 'tab');
+  else if (g.panel === 'worktrees' && trimDir(it.path) !== trimDir(g.dir)) await go(GIT + it.path, 'tab');
+}
+function scrollGitRow() { $('log').querySelector('.gbox.on .gi.sel')?.scrollIntoView?.({ block: 'nearest' }); }
+// A change whose file is not in the folder: deleted there, or by both sides of a merge. One side's
+// deletion in a conflict (UD, DU) leaves the other side's file to open.
+const fileGone = (code) => code === 'DD' || (!code.includes('U') && code.includes('D'));
+const CHANGE_WORD = { M: 'modified', A: 'added', D: 'deleted', R: 'renamed', C: 'copied', U: 'in conflict', T: 'type changed', '?': 'new, not tracked' };
+const changeWord = (code) => [...new Set([...code.trim()].map((c) => CHANGE_WORD[c]).filter(Boolean))].join(', ');
+function gitRowsHTML(g, panel) {
+  const list = gitList(g, panel), sel = g.sel[panel];
+  const row = (i, inner, title = '') => `<button type="button" class="gi${i === sel ? ' sel' : ''}" data-gpanel="${panel}" data-gi="${i}"${title ? ` title="${esc(title)}"` : ''}>${inner}</button>`;
+  if (panel === 'changes') return list.map((c, i) => row(i, `<span class="m c${esc(c.code.trim()[0] ?? '')}">${esc(c.code.replace(/ /g, '·'))}</span><span class="p">${c.from ? `${esc(c.from)} → ` : ''}${esc(c.path)}</span>`, changeWord(c.code))).join('') + (g.view.more ? `<div class="gnote">the first ${list.length} changes; there are more</div>` : '') || '<div class="gnote">No changes.</div>';
+  if (panel === 'commits') return list.map((c, i) => row(i, `<span class="sha">${esc(c.sha.slice(0, 7))}</span><span class="p">${esc(c.subject)}</span><span class="who">${esc(c.when)}</span>`, `${c.author} · ${c.when}`)).join('') || '<div class="gnote">No commits yet.</div>';
+  const here = trimDir(g.view.root);
+  return list.map((w, i) => { const owner = gitOwner(w.path), cur = trimDir(w.path) === here; return row(i, `<span class="m">${cur ? '*' : ' '}</span><span class="p">${esc(w.branch ?? 'detached')}</span>${owner ? `<span class="who">${esc(shortName(owner))}</span>` : ''}`, w.path); }).join('');
+}
+function gitDiffHTML(g) {
+  const d = g.diff, it = gitItem(g);
+  if (g.panel === 'worktrees') {
+    if (!it) return '';
+    const owner = gitOwner(it.path), cur = trimDir(it.path) === trimDir(g.view.root);
+    return `<div class="ghead"><b>⎇ ${esc(it.branch ?? 'detached')}</b><br><span class="d">${esc(it.path)}</span></div><div class="gnote">${owner ? `${esc(shortName(owner))} works here. ` : ''}${cur ? 'This tab shows it.' : 'Enter opens its Git tab.'}${owner ? ' o opens the agent.' : ''}</div>`;
+  }
+  if (!it) return '';
+  const head = g.panel === 'commits'
+    ? `<div class="ghead"><span class="sha">${esc(it.sha.slice(0, 12))}</span> <b>${esc(it.subject)}</b><br><span class="d">${esc(it.author)} · ${esc(it.when)}</span></div>`
+    : `<div class="ghead"><b>${esc(it.path)}</b> <span class="d">· ${esc(changeWord(it.code))}${fileGone(it.code) || it.path.endsWith('/') ? '' : ' · Enter opens it'}</span></div>`;
+  if (!d || (d.state === 'loading' && !d.rows.length)) return `${head}<div class="gnote">reading…</div>`;
+  if (d.state === 'error') return `${head}<div class="line out bad">${esc(d.error)}</div>`;
+  const owner = gitOwner(g.dir), seen = new Map();
+  const sent = (r) => { const key = noteKey(d.of, r), n = seen.get(key) ?? 0; seen.set(key, n + 1); return (g.notes.get(`${key}\u0000${n}`) ?? []).map((t) => `<div class="dsent">› ${esc(t)}</div>`).join(''); };
+  const at = owner ? noteRow(g) : -1;
+  const input = (what) => `<div class="dcm"><input id="gnote" placeholder="Tell ${esc(shortName(owner))} about ${what}…" autocomplete="off" spellcheck="false" aria-label="Note on this line"><span class="to">↵ to ${esc(shortName(owner))} · Esc</span></div>`;
+  // A note whose line is gone from the diff stays open above it, on the line as it was clicked.
+  const lost = owner && g.note?.of === d.of && at < 0 ? input(`the line it was: ${g.note.r.t.slice(0, 60)}`) : '';
+  const rows = lost + d.rows.map((r, i) => {
+    // A change's one file is named above it already.
+    if (r.k === 'file' && g.panel === 'changes') return '';
+    const line = r.k === 'add' || r.k === 'del' || r.k === 'ctx';
+    let h = `<div class="dl ${r.k}"${line && owner ? ` data-dl="${i}"` : ''}><span class="no">${r.o ?? ''}</span><span class="no">${r.n ?? ''}</span><span class="tx">${esc(r.t)}</span></div>`;
+    if (line) h += sent(r);
+    if (i === at) h += input('this line');
+    return h;
+  }).join('');
+  const tail = (d.more ? `<div class="gnote">${d.more} more lines</div>` : '') + (d.cut ? '<div class="gnote">The diff goes on; the rest is not shown.</div>' : '');
+  return `${head}<div class="diff">${rows || '<div class="gnote">No difference to show.</div>'}${tail}</div>`;
+}
+function renderGit(g, el = $('log'), head = $('title')) {
+  if (g.state === 'idle') readGit(g);
+  const v = g.view, branch = v?.branch ? `<span class="branch" title="${esc(v.root)}">⎇ ${esc(v.branch)}</span>` : '';
+  const owner = gitOwner(g.dir);
+  const hk = `git|${g.dir}|${v?.branch ?? ''}|${owner?.name ?? ''}|${S.shapeGen}`;
+  if (head.dataset.k !== hk) {
+    head.dataset.k = hk;
+    head.innerHTML = `<div class="crumbs">${crumbsHTML(S.selected)}${branch}${owner ? `<span class="state">notes go to <button type="button" class="back" data-act="open" data-who="${esc(owner.name)}">${esc(shortName(owner))}</button></span>` : ''}</div><div class="tools"><button type="button" class="ibtn" data-act="git-read" title="Read again (r)">↻</button></div>`;
+  }
+  const key = `git|${g.dir}|${g.gen}|${g.diff?.state ?? ''}|${g.diff?.rows.length ?? 0}|${owner?.name ?? ''}`;
+  if (el.dataset.key === key) return;
+  // A note being typed survives the view being drawn again.
+  const typed = $('gnote')?.value ?? g.draft ?? '';
+  const scroll = el.querySelector('.gmain .glist')?.scrollTop ?? 0, same = el.dataset.shows === `git|${g.dir}`;
+  el.dataset.key = key; el.dataset.who = ''; el.dataset.shows = `git|${g.dir}`;
+  if (g.state !== 'ok') { el.innerHTML = `<div class="gitview"><div class="gnote${g.state === 'error' ? ' bad' : ''}">${g.state === 'error' ? esc(g.error) : 'reading…'}</div></div>`; return; }
+  const box = (panel, n, title) => `<div class="gbox${g.panel === panel ? ' on' : ''}" data-gpanel="${panel}"><div class="gt"><span class="k">[${n}]</span> ${title} <span class="d">${gitList(g, panel).length}</span></div><div class="glist">${gitRowsHTML(g, panel)}</div></div>`;
+  const title = g.panel === 'commits' ? 'Commit' : g.panel === 'worktrees' ? 'Worktree' : 'Diff';
+  el.innerHTML = `<div class="gitview"><div class="gcol">${box('changes', 1, 'Changes')}${box('commits', 2, 'Commits')}${box('worktrees', 3, 'Worktrees')}</div><div class="gbox gmain"><div class="gt">${title}${owner ? '<span class="d"> · click a line to tell its agent</span>' : ''}</div><div class="glist">${gitDiffHTML(g)}</div></div></div>`;
+  if (same) { const m = el.querySelector('.gmain .glist'); if (m) m.scrollTop = scroll; }
+  const input = $('gnote'); if (input) { input.value = typed; if (document.activeElement === document.body || !document.activeElement) input.focus(); }
+  scrollGitRow();
+}
+
 // ---------- heads and composers ----------
 // One level up from an agent or a swarm: what made it, a swarm's agent its swarm, a task its project's
 // coordinator, and a coordinator or a bot in no project Home ('').
@@ -1692,10 +2093,10 @@ function upOf(key) {
   const sw = swarmOf(key); if (sw) return bot(sw.project + LEAD) ? sw.project + LEAD : '';
   const b = bot(key); if (!b || leadProject(key)) return '';
   const mine = swarmOfBot(key); if (mine) return swarmKey(mine.name);
-  const c = creatorOf(b); if (c) return c.name;
+  const c = creatorOf(b); if (c) return c.name === HOME ? '' : c.name;
   return b.project && bot(b.project + LEAD) ? b.project + LEAD : '';
 }
-const keyLabel = (key) => { const sw = swarmOf(key); if (sw) return `⁂ ${memberShort(sw, sw.name)}`; const b = bot(key); return b ? shortName(b) : key; };
+const keyLabel = (key) => { const sw = swarmOf(key); if (sw) return `⁂ ${memberShort(sw, sw.name)}`; const full = fileOf(key); if (full != null) return full.split('/').pop() || full; const dir = gitOf(key); if (dir != null) return dir.replace(/\/+$/, '').split('/').pop() || dir; const b = bot(key); return b ? shortName(b) : key; };
 // The way down from Home to an agent, each step up a button. A long chain shows its two ends; the walk
 // up stops at a bound, so a chain of thousands costs that bound.
 const CRUMBS = 64;
@@ -1711,10 +2112,12 @@ function headHTML(b, pane) {
   const waiting = b.waitingOn.length ? ` on ${esc(waitSummary(b))}` : '';
   const state = `<span class="glyph ${b.status}">${glyphOf(b.status)}</span><span class="state">${labelOf(b.status)}${waiting}</span>`;
   // Beside, a look into an agent from the list: back to the list, or full screen.
+  if (pane === 'main' && b.name === HOME) { document.title = 'Agent'; return `<div class="crumbs"><b>Home</b>${state}</div><div class="tools">${moreButton(b.name)}</div>`; }
   if (pane === 'side') return `<div class="crumbs"><button type="button" class="back" data-act="close-side" title="Back to the list (Esc)" aria-label="Back to the list">←</button><b>${esc(shortName(b))}</b>${branchHTML(b)}${state}</div><div class="tools">${moreButton(b.name)}<button type="button" class="ibtn" data-act="full" title="Full screen (or double-click its row)">⤢ Full screen</button></div>`;
   return `<div class="crumbs">${crumbsHTML(b.name)}${branchHTML(b)}${state}</div><div class="tools">${moreButton(b.name)}</div>`;
 }
-const branchHTML = (b) => (b.branch ? `<span class="branch" title="${esc(b.workspace)}">⎇ ${esc(b.branch)}</span>` : '');
+// The branch opens the folder's Git tab.
+const branchHTML = (b) => (b.branch ? `<button type="button" class="branch" data-act="git" data-who="${esc(b.name)}" title="Git: ${esc(b.workspace)}">⎇ ${esc(b.branch)}</button>` : '');
 // A head names a few of the handles a bot waits on and counts the rest, so its cost stays bounded.
 const WAIT_SHOWN = 3;
 function waitSummary(b) {
@@ -1732,7 +2135,7 @@ function renderHead(el, b, pane) {
   el.innerHTML = b ? headHTML(b, pane) : pane === 'main' ? '<div class="crumbs"><b>Home</b></div>' : '';
 }
 const PANE = {
-  main: { form: 'form', input: 'input', model: 'model', send: 'send', stop: 'stop', bot: () => S.selected },
+  main: { form: 'form', input: 'input', model: 'model', send: 'send', stop: 'stop', bot: mainBot },
   side: { form: 'sideform', input: 'sideinput', model: 'sidemodel', send: 'sidesend', stop: 'sidestop', bot: () => S.ui.side },
 };
 const ACTION = { send: 'Send', queue: 'Queue', steer: 'Steer', side: 'Side chat' };
@@ -1753,7 +2156,7 @@ const modelOf = (b) => S.override.get(b.name) ?? b.model;
 const effortOf = (b) => S.effort.get(b.name) ?? b.reasoning ?? null;
 function renderComposer(pane, b, sw = null) {
   const ids = PANE[pane], mode = sendMode(b), model = b ? modelOf(b) : '', effort = b ? effortOf(b) : null;
-  const key = sw ? `${SWARM}${sw.name}` : b ? `${b.name}|${mode}|${model}|${effort}|${b.runningTurn !== null}` : '-';
+  const key = sw ? `${SWARM}${sw.name}` : b ? `${b.name}|${mode}|${model}|${effort}|${b.runningTurn !== null}` : `-${!S.selected}`;
   const send = $(ids.send); if (send.dataset.k === key) return; send.dataset.k = key;
   const caret = $(ids.form).querySelector?.('.caret'); if (caret) caret.hidden = !!sw;
   // On a swarm the composer posts to its board: no model, no stop, one way to send.
@@ -1761,7 +2164,7 @@ function renderComposer(pane, b, sw = null) {
   send.textContent = ACTION[mode];
   $(ids.model).textContent = b ? `${model.split('/').slice(1).join('/') || model}${effort ? ` · ${effort}` : ''} ▾` : '';
   $(ids.model).hidden = !b; $(ids.stop).hidden = !b || b.runningTurn === null;
-  $(ids.input).placeholder = !b ? (pane === 'main' ? '/new NAME PROVIDER/MODEL [EFFORT]' : '') : mode === 'queue' ? 'queues after this turn' : mode === 'steer' ? 'steers into this turn' : mode === 'side' ? 'asks a side chat' : '';
+  $(ids.input).placeholder = !b ? (pane !== 'main' ? '' : S.selected ? '/new NAME PROVIDER/MODEL [EFFORT]' : 'Ask Home about any project, or hand it work') : mode === 'queue' ? 'queues after this turn' : mode === 'steer' ? 'steers into this turn' : mode === 'side' ? 'asks a side chat' : '';
 }
 
 // ---------- swarm view ----------
@@ -1878,6 +2281,84 @@ async function submitProject() {
   } catch (err) { toast(String(err?.message ?? err), 6000); go.disabled = false; go.textContent = 'Create'; }
 }
 
+// ---------- the Memory sheet ----------
+// What agents saved for later agents, as files: at Home yours and every project's, in a project its
+// own and yours, newest first. A fact opens in a tab. Agents write memory; the sheet only reads it.
+let memoryAsk = 0;
+async function openMemorySheet(lead) {
+  closeMenu();
+  const ask = ++memoryAsk;
+  const project = lead ? leadProject(lead) : null;
+  sheetFor = null; sheetKind = 'memory';
+  $('sheet').innerHTML = `<h4>${project ? `${esc(project)} memory` : 'Memory'}</h4><p class="hint">reading…</p>`;
+  $('sheetwrap').classList.add('on'); S.ui.sheet = true;
+  let v = null, error = '';
+  try { v = await Daemon.memoryView(project); } catch (e) { error = String(e?.message ?? e); }
+  // A sheet closed, or opened again since, while memory was read shows only its own answer.
+  if (!S.ui.sheet || sheetKind !== 'memory' || ask !== memoryAsk) return;
+  $('sheet').innerHTML = memoryHTML(v, project, error);
+  setTimeout(() => $('sheet').querySelector('.mrow,.sbtn.primary')?.focus?.(), 0);
+}
+function memoryHTML(v, project, error) {
+  const now = Date.now(), you = v ? { ...v.user, label: 'You' } : null;
+  const projects = (v?.projects ?? []).map((sc) => ({ ...sc, label: sc.name }));
+  const scopes = v ? (project ? [...projects, you] : [you, ...projects]) : [];
+  const fact = (f) => `<button type="button" class="mrow" data-act="open-fact" data-v="${esc(f.path)}" title="${esc(f.path)}"><span class="md">${esc(f.description)}</span><span class="mm">${esc(f.name)} · ${esc(f.type)} · ${esc(f.source)} · ${esc(agoText(now - f.modified))}</span></button>`;
+  const scope = (sc) => `<div class="mscope"><div class="mh">${esc(sc.label)} <span class="d">${esc(sc.dir)}</span></div>${sc.error ? `<p class="hint warn">${esc(sc.error)}</p>` : sc.facts.length ? [...sc.facts].sort((a, b) => b.modified - a.modified).map(fact).join('') : '<p class="hint">Nothing saved yet.</p>'}</div>`;
+  const lede = project ? `Facts the project's lead and every thread share, and yours, which hold across projects. Agents save them with the memory skill.` : `Yours hold across projects; a project's are shared by its lead and every thread. Agents save them with the memory skill.`;
+  const more = v?.more ? `<p class="hint">${v.more} more projects not shown.</p>` : '';
+  return `<h4>${project ? `${esc(project)} memory` : 'Memory'}</h4><p class="hint">${lede}</p>${error ? `<p class="hint warn">${esc(error)}</p>` : ''}<div class="mlist">${scopes.map(scope).join('')}${more}</div>
+    <div class="foot"><button type="button" class="sbtn primary" data-act="close-sheet">Done</button></div>`;
+}
+function agoText(ms) {
+  const m = Math.max(0, Math.round(ms / 60000));
+  return m < 1 ? 'just now' : m < 60 ? `${m}m ago` : m < 1440 ? `${Math.round(m / 60)}h ago` : `${Math.round(m / 1440)}d ago`;
+}
+
+// ---------- the Start Home sheet ----------
+// Home's agent is made on the first message sent at Home: a model and an effort, as every agent
+// takes, and nothing else. It works in your home folder, in the home role, and the message goes to it
+// once it exists.
+const homeSheet = { text: '', open: false };
+async function openHomeSheet(text) {
+  // One first message starts Home; another sent before it is picked comes back as a draft.
+  if (homeSheet.open) throw new Error('home_starting: choose a model for Home first');
+  homeSheet.open = true;
+  closeMenu();
+  let models = []; try { const [all, set] = await Promise.all([Daemon.models(), S.setup?.settings ?? Daemon.settings?.().catch(() => null)]); if (set) S.seenSettings = set; models = connected(all, set?.restartable === false && !S.setup?.settings ? null : set); } catch (e) { toast(`models: ${e?.message ?? e}`, 5000); }
+  homeSheet.text = text; sheetFor = null; sheetKind = 'home';
+  const none = !models.length ? '<p class="hint warn">No models listed: connect a provider in Settings.</p>' : '';
+  $('sheet').innerHTML = `<h4>Start Home</h4>
+    <p class="hint">Home answers what is running and what waits on you across every project, and hands work to a project's lead. It changes no files itself.</p>
+    <label for="hm-model">Model</label><div class="pair">${modelSelectHTML('hm-model', models)}${effortSelectHTML('hm-effort', pickedModel(models))}</div>${none}
+    <div class="foot"><button type="button" class="sbtn" data-act="close-sheet">Cancel</button><button type="submit" class="sbtn primary" id="hm-start"${models.length ? '' : ' disabled'}>Start and send</button></div>`;
+  $('sheetwrap').classList.add('on'); S.ui.sheet = true;
+  setTimeout(() => $('hm-model').focus?.(), 0);
+}
+async function submitHome() {
+  const go = $('hm-start'), model = $('hm-model').value, effort = $('hm-effort').value, text = homeSheet.text;
+  if (go.disabled) return;
+  if (!model) { toast('model_required: choose a model', 5000); return; }
+  go.disabled = true; go.textContent = 'Starting…';
+  try { if (!bot(HOME)) await createHome(model, effort || null); }
+  catch (err) { toast(String(err?.message ?? err), 6000); go.disabled = false; go.textContent = 'Start and send'; return; }
+  // Cancelled while Home was being made: Home exists, and the message is back in the composer, unsent.
+  if (sheetKind !== 'home' || homeSheet.text !== text) return;
+  homeSheet.text = '';
+  closeSheet();
+  try { await submit(text, 'main', HOME); }
+  catch (err) { toast(String(err?.message ?? err), 6000); const input = $('input'); if (!input.value) { input.value = text; grow(input); } }
+}
+async function createHome(model, effort) {
+  const dir = await Daemon.homeDir();
+  const policy = await Daemon.policy(dir, 'home');
+  try { localStorage.setItem('agent:model', model); if (effort !== null) localStorage.setItem('agent:effort', effort); } catch (_) {}
+  const session = S.session;
+  const record = await Daemon.request('create', { bot: HOME, workspace: dir, model, ...(effort ? { effort } : {}), instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: policy.tools ?? S.config.tools });
+  await enqueue(() => { if (S.session === session) seat(record, session); });
+  render();
+}
+
 // ---------- the new swarm sheet ----------
 // A goal, how many agents, what they are, where they work, and a budget they share. What they are is
 // a mix: rows of an identity (a profile the folder offers, or a plain agent), a model and its effort, and a share,
@@ -1964,13 +2445,19 @@ function mixChange(el) {
   if (r.reasoning && !effortsFor(r.model).includes(r.reasoning)) r.reasoning = '';
   if (el.dataset.f !== 'share' || el.type !== 'number') renderMix();
 }
-function closeSheet() { if (!S.ui.sheet) return; S.ui.sheet = false; sheetFor = null; sheetKind = null; $('sheetwrap').classList.remove('on'); markSeen(); focusInput('main'); }
-$('sheet').addEventListener('change', (e) => { if (sheetKind === 'project') { projectChange(e.target); return; } if (e.target.dataset?.mix != null) mixChange(e.target); else if (e.target.id === 'sw-n' || e.target.id === 'sw-budget') { updateSwarmBudget(e.target.id); renderMix(); } });
+function closeSheet() {
+  if (!S.ui.sheet) return;
+  // A message that would have started Home goes back to the composer, unsent.
+  if (sheetKind === 'home' && homeSheet.text && !S.selected && !$('input').value) { $('input').value = homeSheet.text; grow($('input')); }
+  homeSheet.text = ''; homeSheet.open = false; S.ui.sheet = false; sheetFor = null; sheetKind = null; $('sheetwrap').classList.remove('on'); markSeen(); focusInput('main'); }
+$('sheet').addEventListener('change', (e) => { if (sheetKind === 'memory') return; if (sheetKind === 'project') { projectChange(e.target); return; } if (sheetKind === 'home') { if (e.target.id === 'hm-model') followModel(e.target.value, 'hm-effort'); return; } if (e.target.dataset?.mix != null) mixChange(e.target); else if (e.target.id === 'sw-n' || e.target.id === 'sw-budget') { updateSwarmBudget(e.target.id); renderMix(); } });
 // A share typed updates the counts once it is a number, without redrawing the field being typed in.
-$('sheet').addEventListener('input', (e) => { if (sheetKind === 'project') { projectReady(); return; } if (e.target.id === 'sw-n' || e.target.id === 'sw-budget') { updateSwarmBudget(e.target.id); renderMix(); return; } if (e.target.dataset?.f !== 'share') return; mixChange(e.target); const n = agentCount(), problem = sheetProblem(n), counts = problem ? null : mixCounts(sheet.mix, mixRows(sheet.mix, n)); $('sw-mix').querySelectorAll('.count').forEach((c, i) => { c.textContent = counts ? `${counts[i]} agent${counts[i] === 1 ? '' : 's'}` : ''; c.classList.toggle('none', !!counts && !counts[i]); }); const w = $('sw-mix').querySelector('.mixfoot span'); if (w) { w.textContent = problem ?? (counts.some((c) => !c) ? `A row makes no agent at ${n} agents` : ''); w.className = w.textContent ? 'warn' : ''; } });
+$('sheet').addEventListener('input', (e) => { if (sheetKind === 'memory') return; if (sheetKind === 'project') { projectReady(); return; } if (sheetKind === 'home') return; if (e.target.id === 'sw-n' || e.target.id === 'sw-budget') { updateSwarmBudget(e.target.id); renderMix(); return; } if (e.target.dataset?.f !== 'share') return; mixChange(e.target); const n = agentCount(), problem = sheetProblem(n), counts = problem ? null : mixCounts(sheet.mix, mixRows(sheet.mix, n)); $('sw-mix').querySelectorAll('.count').forEach((c, i) => { c.textContent = counts ? `${counts[i]} agent${counts[i] === 1 ? '' : 's'}` : ''; c.classList.toggle('none', !!counts && !counts[i]); }); const w = $('sw-mix').querySelector('.mixfoot span'); if (w) { w.textContent = problem ?? (counts.some((c) => !c) ? `A row makes no agent at ${n} agents` : ''); w.className = w.textContent ? 'warn' : ''; } });
 $('sheet').addEventListener('submit', async (e) => {
   e.preventDefault();
+  if (sheetKind === 'memory') return;
   if (sheetKind === 'project') { await submitProject(); return; }
+  if (sheetKind === 'home') { await submitHome(); return; }
   const project = sheetFor, start = $('sw-start'); if (!project || start.disabled) return;
   start.disabled = true; start.textContent = 'Starting…';
   try {
@@ -2003,9 +2490,9 @@ function fleetIndex() {
 const rail = { open: null, rows: [], index: new Map(), drawn: '', start: 0, end: 0, key: '' };
 function railRows() {
   fleetIndex();
-  if (rail.open !== S.selected) {
-    rail.rows = levelOf(S.selected); rail.index = new Map(); rail.rows.forEach((n, i) => { const k = n.key ?? n.b?.name; if (k) rail.index.set(k, i); });
-    rail.open = S.selected; rail.key = '';
+  if (rail.open !== opened()) {
+    rail.rows = levelOf(opened()); rail.index = new Map(); rail.rows.forEach((n, i) => { const k = n.key ?? n.b?.name; if (k) rail.index.set(k, i); });
+    rail.open = opened(); rail.key = '';
   }
   return rail.rows;
 }
@@ -2015,18 +2502,22 @@ function levelOf(open) {
   const { rows: all } = fleet, at = open ? fleet.at.get(open) : -1;
   if (at === undefined) return [];
   const depth = open ? all[at].depth : -1, out = [];
+  let home = false;
   for (let i = at + 1; i < all.length; i++) {
     const n = all[i];
     if (n.label) { if (open) break; out.push(n); continue; }
     if (n.depth <= depth) break;
+    // Home shows its agent's chat, not its row; what that agent made is a level below it.
+    if (n.depth === depth + 1) home = !open && n.b?.name === HOME;
+    if (home) continue;
     if (n.depth === depth + 1) out.push({ ...n, kids: 0 }); else if (n.depth === depth + 2) out.at(-1).kids += 1;
   }
   return out;
 }
-const levelName = () => !S.selected ? (rail.rows.some((n) => n.head != null) ? 'projects' : 'agents') : swarmOf(S.selected) ? 'agents' : leadProject(S.selected) ? 'threads' : 'helpers';
+const levelName = () => !opened() ? (rail.rows.some((n) => n.head != null) ? 'projects' : 'agents') : swarmOf(S.selected) ? 'agents' : leadProject(S.selected) ? 'threads' : 'helpers';
 function renderRail() {
   const rows = railRows(), el = $('bots');
-  const level = `${S.shapeGen}|${S.selected}`;
+  const level = `${S.shapeGen}|${opened()}`;
   const key = () => `${level}|${S.ui.side}|${rail.start}|${rail.end}`;
   if (rail.key === key()) return;
   // A new level starts at its top, or around the row beside.
@@ -2038,7 +2529,7 @@ function renderRail() {
   rail.drawn = level; rail.key = key();
   const above = rail.start ? `<div class="botrow more">… ${rail.start} above</div>` : '';
   const below = rail.end < rows.length ? `<div class="botrow more">… ${rows.length - rail.end} below</div>` : '';
-  const none = rows.length ? '' : `<div class="pnote">${!S.selected ? 'No projects yet.' : leadProject(S.selected) ? 'No threads yet.' : 'No helpers.'}</div>`;
+  const none = rows.length ? '' : `<div class="pnote">${!opened() ? 'No projects yet.' : leadProject(S.selected) ? 'No threads yet.' : 'No helpers.'}</div>`;
   el.innerHTML = none + above + rows.slice(rail.start, rail.end).map(botRowHTML).join('') + below;
   el.dataset.key = rail.key;
 }
@@ -2073,30 +2564,35 @@ function botRowHTML(n) {
     return `<div class="botrow" data-bot="${esc(n.key)}" role="button" tabindex="0"><span class="glyph ${st}">${glyphOf(st)}</span><span class="n">⁂ ${esc(memberShort(sw, sw.name))}</span><span class="meta">${liveMembers(sw).length}</span><span class="acts">${moreButton(n.key)}</span></div>`;
   }
   const b = n.b, st = shownStatus(b), beside = S.ui.side === b.name ? ' beside' : '';
-  return `<div class="botrow${n.head != null ? ' proj' : ''}${beside}" data-bot="${esc(b.name)}" role="button" tabindex="0"><span class="glyph ${st}">${glyphOf(st)}</span><span class="n">${esc(n.head ?? shortName(b))}</span>${kids}<span class="acts">${moreButton(b.name)}</span></div>`;
+  // An agent with a plan shows the step it is on and how many are done.
+  const plan = planOf(b), step = plan?.at ? `<span class="step"> · ${esc(plan.at.t)}</span>` : '', done = plan ? `<span class="meta" title="steps done">${planCount(plan)}</span>` : '';
+  return `<div class="botrow${n.head != null ? ' proj' : ''}${beside}" data-bot="${esc(b.name)}" role="button" tabindex="0"><span class="glyph ${st}">${glyphOf(st)}</span><span class="n">${esc(n.head ?? shortName(b))}${step}</span>${done}${kids}<span class="acts">${moreButton(b.name)}</span></div>`;
 }
 // ---------- tabs ----------
 // Home, then a tab for each agent opened full screen. They are redrawn only when one opens, closes,
 // is chosen, or changes state or name (a task whose coordinator is gone is named in full).
-const tabState = (k) => { const sw = swarmOf(k); return sw ? swarmStatus(sw) : shownStatus(bot(k)); };
+const tabState = (k) => { if (fileOf(k) != null) return 'file'; if (gitOf(k) != null) return 'git'; const sw = swarmOf(k); return sw ? swarmStatus(sw) : shownStatus(bot(k)); };
 function renderTabs() {
   const tabs = S.ui.tabs.filter(isOpen), states = tabs.map(tabState), labels = tabs.map(keyLabel);
-  const key = `${S.selected}|${tabs.map((k, i) => `${k}\u0000${states[i]}\u0000${labels[i]}`).join('\u0000')}`;
+  // Away from Home, its button carries Home's agent's state, as a tab would: running, waiting, done or failed.
+  const hb = S.selected && bot(HOME), hs = hb ? shownStatus(hb) : 'idle';
+  const key = `${S.selected}|${hs}|${tabs.map((k, i) => `${k}\u0000${states[i]}\u0000${labels[i]}`).join('\u0000')}`;
   const el = $('tabs'); if (el.dataset.k === key) return; el.dataset.k = key;
-  const home = `<button type="button" class="homebtn${S.selected ? '' : ' on'}" data-act="home" title="Home">⌂ Home</button>`;
+  const home = `<button type="button" class="homebtn${S.selected ? '' : ' on'}" data-act="home" title="Home${hs === 'idle' ? '' : ` · ${labelOf(hs)}`}">${hs === 'idle' ? '⌂' : `<span class="glyph ${hs}">${glyphOf(hs)}</span>`} Home</button>`;
   el.innerHTML = home + (tabs.length ? '<span class="tabsep"></span>' : '') + tabs.map((k, i) => {
     const on = k === S.selected, label = esc(labels[i]);
-    return `<div class="wtab${on ? ' on' : ''}" role="tab" aria-selected="${on}" tabindex="0" data-tab="${esc(k)}" title="${esc(k)}"><span class="glyph ${states[i]}">${glyphOf(states[i])}</span><span class="tl">${label}</span><button type="button" class="x" data-act="close-tab" data-who="${esc(k)}" aria-label="Close ${label}">×</button></div>`;
+    return `<div class="wtab${on ? ' on' : ''}" role="tab" aria-selected="${on}" tabindex="0" data-tab="${esc(k)}" title="${esc(fileOf(k) ?? gitOf(k) ?? k)}"><span class="glyph ${states[i]}">${states[i] === 'file' ? FILE : states[i] === 'git' ? GIT : glyphOf(states[i])}</span><span class="tl">${label}</span><button type="button" class="x" data-act="close-tab" data-who="${esc(k)}" aria-label="Close ${label}">×</button></div>`;
   }).join('');  // Past the bar's width the tabs scroll, and the one on screen stays in view.
   el.querySelector('.wtab.on')?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
 }
-function peers() { return (S.transcripts.get(S.selected)?.peers ?? []).filter((who) => S.bots.has(who)); }
+function peers() { return (S.transcripts.get(mainBot())?.peers ?? []).filter((who) => S.bots.has(who)); }
 function keybarHTML(b) {
   const busy = b && isActive(b.status);
   const dot = `<span><span class="dot${!S.attached ? ' off' : busy ? ' busy' : ''}"></span>${!S.attached ? 'detached' : 'live'}</span>`;
   const keys = [];
   if (S.ui.picker) keys.push('<kbd>↑↓</kbd> choose', '<kbd>Enter</kbd> open', '<kbd>Esc</kbd> cancel');
-  else { keys.push('<kbd>^k</kbd> find'); if (S.ui.side) keys.push('<kbd>Esc</kbd> close'); else if (busy) keys.push('<kbd>Esc</kbd> stop'); }
+  else if (gitOf(S.selected) != null) keys.push('<kbd>j k</kbd> move', '<kbd>1–3</kbd> lists', '<kbd>Enter</kbd> open', '<kbd>click a line</kbd> note', '<kbd>r</kbd> read again');
+  else { keys.push('<kbd>^k</kbd> find', '<kbd>⌘P</kbd> files'); if (S.ui.side) keys.push('<kbd>Esc</kbd> close'); else if (busy) keys.push('<kbd>Esc</kbd> stop'); }
   return `${dot}${S.ui.toast ? `<span class="toast">${esc(S.ui.toast)}</span>` : ''}<span class="spacer"></span>${keys.join('<span> </span>')}<span><kbd>?</kbd> keys</span>`;
 }
 // Each composer holds the text of the bot its pane shows. When a pane shows another bot, its text is
@@ -2108,25 +2604,42 @@ function followDrafts() {
     const input = $(ids.input), who = ids.bot() ?? '';
     if ((input.dataset.for ?? '') === who) continue;
     if (input.dataset.for) { if (input.value) S.drafts.set(input.dataset.for, input.value); else S.drafts.delete(input.dataset.for); }
-    moved.push([input, who]);
+    // What was typed at Home before its agent existed is that agent's once it does.
+    moved.push([input, who, !input.dataset.for && who === HOME ? input.value : '']);
   }
-  for (const [input, who] of moved) { input.value = S.drafts.get(who) ?? ''; S.drafts.delete(who); input.dataset.for = who; grow(input); }
+  for (const [input, who, kept] of moved) { input.value = S.drafts.get(who) ?? kept; S.drafts.delete(who); input.dataset.for = who; grow(input); }
 }
 function render() {
   const app = $('app');
   // The sidebar's rows also stamp each bot's project, which names and crumbs use.
   railRows();
-  const b = bot(S.selected), sw = swarmOf(S.selected);
-  if (S.ui.side && (!S.bots.has(S.ui.side) || S.ui.side === S.selected)) S.ui.side = null;
+  const b = bot(mainBot()), sw = swarmOf(S.selected);
+  if (S.ui.side && (!S.bots.has(S.ui.side) || S.ui.side === mainBot())) S.ui.side = null;
   const side = S.ui.side && !S.ui.file ? bot(S.ui.side) : null;
   app.classList.toggle('rail', S.ui.rail); app.classList.toggle('side', !!side || !!S.ui.file);
   followDrafts();
   markSeen();
   renderTabs();
+  const tab = fileOf(S.selected), gtab = gitOf(S.selected);
+  if (tab == null) dropTabFile(); else if (S.ui.tabFile?.full !== tab) readTabFile(tab);
+  // A closed Git tab lets its view go.
+  // A Git tab out of view keeps only which rows were chosen and its notes, and reads again when shown.
+  for (const [dir, g] of S.ui.git) {
+    if (!S.ui.tabs.includes(GIT + dir)) { clearTimeout(g.timer); S.ui.git.delete(dir); }
+    else if (dir !== gtab && g.view) { g.chosen = chosen(g); clearTimeout(g.timer); Object.assign(g, { view: null, diff: null, note: null, state: 'idle', timer: null }); g.gen += 1; }
+  }
+  $('log').classList.toggle('gitpane', gtab != null); $('title').classList.toggle('wide', gtab != null);
+  // Each plan before its chat, so a chat that follows its end measures what is left once the plan is drawn.
+  renderPlan($('plan'), sw ? null : b); renderPlan($('sideplan'), side);
   if (sw) { renderSwarmHead($('title'), sw); renderSwarm($('log'), sw); }
+  else if (tab != null) renderFile(S.ui.tabFile, $('log'), $('title'), 'main');
+  else if (gtab != null) renderGit(gitTab(gtab));
   else { renderHead($('title'), b, 'main'); if (b) renderTranscript($('log'), b.name); else renderHome($('log')); }
-  // New project belongs to Home's list.
-  $('newproj').hidden = !!S.selected;
+  $('form').hidden = pageOf(S.selected);
+  // New project belongs to Home's list, which a file tab shows too.
+  $('newproj').hidden = !!opened();
+  // Memory is a project's and yours: at Home and in a project, on this machine.
+  const memOf = opened(), mem = $('memory'); mem.hidden = !!S.config?.host || (!!memOf && !leadProject(memOf)); mem.dataset.who = memOf;
   if (S.ui.rail) renderRail();
   if (S.ui.file) renderFile();
   else if (side) { renderHead($('sidetitle'), side, 'side'); renderTranscript($('side'), side.name); }
@@ -2137,10 +2650,10 @@ function render() {
   if (S.ui.picker) renderPicker();
   refreshMenu();
 }
-// Home has no chat of its own yet: it says where things are.
+// Home before its agent exists: what that agent is for, and where things are.
 function renderHome(el) {
-  const key = `home|${S.bots.size > 0}`; if (el.dataset.key === key) return; el.dataset.key = key; el.dataset.who = '';
-  el.innerHTML = `<div class="home">${S.bots.size ? 'Projects and agents are in the list. Click one to look in, double-click to open it as a tab. ⌘K finds any agent.' : 'No agents yet. ＋ New project starts one, or /new NAME PROVIDER/MODEL here.'}</div>`;
+  const host = S.config?.host ?? '', key = `home|${S.bots.size > 0}|${host}`; if (el.dataset.key === key) return; el.dataset.key = key; el.dataset.who = '';
+  el.innerHTML = `<div class="home">Home is your own agent across every project: ask it what is running, what finished and what waits on you, or hand it work and it goes to that project's lead. ${host ? `It runs on this machine, so a window on ${esc(host)} has none; open Home in a window here.` : 'Your first message starts it.'}<br><br>${S.bots.size ? 'Projects and agents are in the list. Click one to look in, double-click to open it as a tab. ⌘K finds any agent.' : 'No projects yet. ＋ New project starts one.'}</div>`;
 }
 // Once a second, while anything runs: the clocks on cards and run lines, in place. The activity
 // check is cached per fleet change, so a quiet fleet of any size costs nothing here.
@@ -2149,15 +2662,78 @@ function anyActive() { if (activeAt !== S.botsGen) { activeAt = S.botsGen; activ
 setInterval(() => { if (S.attached && anyActive()) { refreshLive($('log')); if (S.ui.side && !S.ui.file) refreshLive($('side')); } }, 1000);
 
 // ---------- picker ----------
+// One finder, two lists: agents (⌘K) and the files of the repository in view (⌘P); Tab trades them.
 function pickerRows() {
   const q = $('pickerq').value.trim().toLowerCase();
+  if (S.ui.pickerMode === 'files') return fileRows(q);
   return fleetIndex().rows.filter((n) => n.b).map((n) => ({ ...n, i: q ? n.b.name.toLowerCase().indexOf(q) : -1 })).filter((r) => !q || r.i >= 0);
 }
+// The folder ⌘P searches the repository of: that of the pane it was pressed in, which is the file in
+// view's, else the agent's or the swarm's.
+function searchFolder() {
+  if (pickerPane === 'side' && S.ui.file) return dirOf(S.ui.file.full);
+  const beside = pickerPane === 'side' && S.ui.side;
+  const tab = beside ? null : fileOf(S.selected); if (tab != null) return dirOf(tab);
+  const gtab = beside ? null : gitOf(S.selected); if (gtab != null) return gtab;
+  const key = beside ? S.ui.side : mainBot();
+  const sw = swarmOf(key); if (sw) return sw.workspace ?? null;
+  return bot(key)?.workspace ?? S.config?.workspace ?? null;
+}
+// Listed once each time the finder opens on files, so it is what git sees now; trading lists with
+// Tab keeps the listing, so key repeat starts no more git. The lowercase copy is made once per
+// listing, not per key.
+async function listFiles() {
+  const dir = searchFolder();
+  const found = S.ui.found = { dir, state: dir ? 'loading' : 'none', files: [], lower: [], root: '', more: false, error: '' };
+  if (!dir) return;
+  try {
+    const got = await Daemon.listFiles(dir);
+    if (S.ui.found !== found) return;
+    Object.assign(found, { state: 'ok', root: got.root, files: got.files, lower: got.files.map((f) => f.toLowerCase()), more: !!got.more });
+  } catch (e) { if (S.ui.found !== found) return; Object.assign(found, { state: 'error', error: String(e?.message ?? e) }); }
+  if (S.ui.picker && S.ui.pickerMode === 'files') renderPicker();
+}
+// A name that starts with what was typed comes first, then a name holding it, then a folder; within
+// each, git's order. One pass over the listing, no sort; only the rows shown are made, and `total`
+// counts the rest.
+function fileRows(q) {
+  const found = S.ui.found; if (!found || found.state !== 'ok') return [];
+  const row = (n) => { const lower = found.lower[n], base = lower.lastIndexOf('/') + 1, name = lower.indexOf(q, base); return { path: found.files[n], i: !q ? -1 : name >= base ? name : lower.indexOf(q) }; };
+  if (!q) return Object.assign(found.files.slice(0, PICKER_ROWS).map((_, n) => row(n)), { total: found.files.length });
+  const named = [], within = [], under = [];
+  for (let n = 0; n < found.lower.length; n++) {
+    const lower = found.lower[n], i = lower.indexOf(q); if (i < 0) continue;
+    const base = lower.lastIndexOf('/') + 1, name = i >= base ? i : lower.indexOf(q, base);
+    (name === base ? named : name > base ? within : under).push(n);
+  }
+  const total = named.length + within.length + under.length;
+  const shown = [];
+  for (const list of [named, within, under]) for (let k = 0; k < list.length && shown.length < PICKER_ROWS; k++) shown.push(row(list[k]));
+  return Object.assign(shown, { total });
+}
 const PICKER_ROWS = 200;
+const hitHTML = (text, i, len) => (i >= 0 ? `${esc(text.slice(0, i))}<span class="hit">${esc(text.slice(i, i + len))}</span>${esc(text.slice(i + len))}` : esc(text));
+function fileRowHTML(r, idx, len) {
+  const base = r.path.lastIndexOf('/') + 1, name = r.path.slice(base), dir = r.path.slice(0, Math.max(0, base - 1));
+  const hit = r.i >= base ? hitHTML(name, r.i - base, len) : esc(name), where = r.i >= 0 && r.i < base ? hitHTML(dir, r.i, Math.min(len, dir.length - r.i)) : esc(dir);
+  return `<div class="row${idx === S.ui.pickerSel ? ' sel' : ''}" data-found="${esc(r.path)}"><span class="glyph file">${FILE}</span><span class="n">${hit}</span><span class="h">${where}</span></div>`;
+}
 function renderPicker() {
+  const files = S.ui.pickerMode === 'files', found = S.ui.found;
+  $('pmodes').innerHTML = `<button type="button" data-pmode="agents" class="${files ? '' : 'on'}">Agents <span class="kbd">⌘K</span></button><button type="button" data-pmode="files" class="${files ? 'on' : ''}">Files <span class="kbd">⌘P</span></button><span class="ph">Tab switches</span>`;
+  $('pickerq').placeholder = files ? 'find a file…' : 'find an agent…';
+  $('pickerq').setAttribute?.('aria-label', files ? 'Find a file' : 'Find an agent');
   const q = $('pickerq').value.trim(); const all = pickerRows(); const rows = all.slice(0, PICKER_ROWS);
-  S.ui.pickerSel = Math.min(S.ui.pickerSel, Math.max(0, rows.length - 1));
-  const more = all.length > rows.length ? `<div class="empty">${all.length - rows.length} more; type to narrow</div>` : '';
+  S.ui.pickerSel = Math.max(0, Math.min(S.ui.pickerSel, rows.length - 1));
+  const total = all.total ?? all.length;
+  // A listing cut at its bound says so whatever is typed: narrowing cannot find a file past it.
+  const cut = files && found?.more ? `<div class="empty">searched the first ${found.files.length} files; the repository has more</div>` : '';
+  const more = (total > rows.length ? `<div class="empty">${total - rows.length} more; type to narrow</div>` : '') + cut;
+  if (files) {
+    const none = !found || found.state === 'loading' ? 'listing files…' : found.state === 'none' ? 'Open an agent first: ⌘P searches the repository its folder is in.' : found.state === 'error' ? found.error : 'no file matches';
+    $('pickerlist').innerHTML = (rows.length ? rows.map((r, idx) => fileRowHTML(r, idx, q.length)).join('') : `<div class="empty">${esc(none)}</div>`) + more;
+    return;
+  }
   $('pickerlist').innerHTML = (rows.length ? rows.map((r, idx) => {
     const n = r.b.name; const hit = r.i >= 0 ? `${esc(n.slice(0, r.i))}<span class="hit">${esc(n.slice(r.i, r.i + q.length))}</span>${esc(n.slice(r.i + q.length))}` : esc(n);
     const st = shownStatus(r.b), state = st === 'idle' ? '' : labelOf(st);
@@ -2166,14 +2742,31 @@ function renderPicker() {
   }).join('') : '<div class="empty">no bot matches</div>') + more;
 }
 let pickerPane = 'main';
-function openPicker() { pickerPane = paneOf(document.activeElement, menuPane); closeMenu(); S.ui.picker = true; S.ui.pickerSel = 0; $('pickerq').value = ''; $('pickerwrap').classList.add('on'); render(); $('pickerq').focus(); }
+function openPicker(mode = 'agents') {
+  if (!S.ui.picker) pickerPane = paneOf(document.activeElement, menuPane);
+  closeMenu(); S.ui.picker = true; S.ui.pickerSel = 0; $('pickerq').value = ''; $('pickerwrap').classList.add('on');
+  S.ui.found = null; pickerMode(mode); render(); $('pickerq').focus();
+}
+// What was typed stays when the list changes, so Tab looks for the same text in the other list.
+function pickerMode(mode) {
+  S.ui.pickerMode = mode; S.ui.pickerSel = 0;
+  if (mode === 'files' && !S.ui.found) listFiles();
+}
+// A file found opens in a tab, from the repository's top folder; git's path is always under it, so
+// it is appended as is (a folder named `~` in the repository is not the home folder).
+async function pick(r) {
+  const root = S.ui.found?.root; closePicker('main');
+  if (r?.path != null) await go(`${FILE}${root.replace(/\/+$/, '')}/${r.path}`, 'tab');
+  else if (r) await go(r.b.name, 'tab');
+}
 // A pick opens its bot in a tab, so focus goes to the main composer; Escape goes back where it was.
-function closePicker(pane = pickerPane) { S.ui.picker = false; $('pickerwrap').classList.remove('on'); render(); $(PANE[S.ui.side ? pane : 'main'].input).focus(); }
+// A closed finder lets its listing go.
+function closePicker(pane = pickerPane) { S.ui.picker = false; S.ui.found = null; $('pickerwrap').classList.remove('on'); render(); focusInput(S.ui.side ? pane : 'main'); }
 let helpPane = 'main';
 async function showHelp(pane = 'main') {
   helpPane = pane;
   // Open at once so Esc closes it; the list is read now, so an edited ~/.agent/models shows without a restart.
-  const shown = S.ui.help = {}; const text = (models) => { $('helptext').innerHTML = `<b>keys</b>\n ^k   find an agent     ^b   sidebar\n ^p   next task beside  Esc  close beside · stop\n ^o   all steps         ^d   detach (close)\n ↑ ↓  previous / next bot   ^,   settings\n Enter sends · Shift-Enter a new line\n A row: click to look in, double-click for a tab\n\n /new NAME PROVIDER/MODEL [EFFORT]  create a bot\n${models}\n<i>any key closes this</i>`; };
+  const shown = S.ui.help = {}; const text = (models) => { $('helptext').innerHTML = `<b>keys</b>\n ^k   find an agent     ^b   sidebar\n ⌘P   find a file in the repository in view\n ^p   next task beside  Esc  close beside · stop\n ^o   all steps         ^d   detach (close)\n ↑ ↓  previous / next bot   ^,   settings\n Enter sends · Shift-Enter a new line\n A row: click to look in, double-click for a tab\n\n<b>a Git tab</b> (an agent's ⋯ › Git, or its ⎇ branch)\n j k  move    1 2 3  changes, commits, worktrees\n Enter opens the file or worktree · o its agent\n r    read again · click a diff line to tell its agent\n\n /new NAME PROVIDER/MODEL [EFFORT]  create a bot\n${models}\n<i>any key closes this</i>`; };
   text('   reading ~/.agent/models'); $('helpwrap').classList.add('on');
   let models; try { const list = await Daemon.models(); models = list.length ? list.map((m) => `   ${esc(m.id)}`).join('\n') : '   none listed: Settings lists your providers\' models'; } catch (e) { models = `   ${esc(String(e?.message ?? e))}`; }
   if (S.ui.help === shown) text(models);
@@ -2220,7 +2813,7 @@ function refreshMenu() {
 // Keep, which turns a side chat into a task, is not built yet.
 function botMenuItems(name) {
   const sw = swarmOf(name);
-  const tab = { act: 'open-tab', who: name, label: 'Open as tab', hint: 'double-click', disabled: S.ui.tabs.includes(name) };
+  const tab = { act: 'open-tab', who: name, label: 'Open as tab', hint: 'double-click', disabled: S.ui.tabs.includes(name) || name === HOME };
   if (sw) return [
     tab, { sep: true },
     { act: 'swarm-stop', who: name, label: 'Stop every agent', disabled: sw.stopped && !sw.members.some((m) => memberBot(sw, m)?.runningTurn != null) },
@@ -2234,6 +2827,8 @@ function botMenuItems(name) {
     // A swarm runs on this machine: its board is the app's files and its agents run the app's scripts.
     ...(leadProject(name) ? [{ act: 'new-swarm', who: name, label: 'New swarm', hint: S.config?.host ? 'local only' : '⁂', disabled: !!S.config?.host }, { sep: true }] : []),
     { act: 'side-chat', who: name, label: 'Side chat', hint: '⑂', disabled: b.id == null },
+    // Its folder's repository: what changed, as diffs a note on a line comes back from.
+    { act: 'git', who: name, label: 'Git', hint: S.config?.host ? 'local only' : GIT, disabled: !b.workspace || !!S.config?.host },
     { act: 'stop', who: name, label: 'Stop', disabled: b.runningTurn === null },
     { act: 'fork', who: name, label: 'Fork', hint: busy ? 'when idle' : '', disabled: busy },
     { act: 'delete', who: name, label: 'Delete', hint: busy ? 'when idle' : '', disabled: busy },
@@ -2306,7 +2901,7 @@ async function modelMenu(pane, anchor) {
 // ---------- actions ----------
 // `to` is the bot the text was typed for, which is the one it goes to even if the pane has since
 // been pointed at another.
-async function submit(text, pane = 'main', to = PANE[pane].bot()) {
+async function submit(text, pane = 'main', to = PANE[pane].bot(), how = null) {
   if (pane === 'main' && text.startsWith('/new ')) {
     const [name, model, effort] = text.slice(5).trim().split(/\s+/);
     if (!name) throw new Error('name_required');
@@ -2323,10 +2918,15 @@ async function submit(text, pane = 'main', to = PANE[pane].bot()) {
   if (text === '/help' || text === '?') { showHelp(pane); return; }
   const sw = pane === 'main' && swarmOf(to);
   if (sw) { await postToSwarm(sw, text); return; }
+  // At Home before its agent exists, the first message starts it.
+  if (pane === 'main' && !to && !S.selected) {
+    if (S.config?.host) throw new Error(`home_local_only: Home runs on this machine, and this window's agents run on ${S.config.host}`);
+    await openHomeSheet(text); return;
+  }
   const b = bot(to); if (!b) throw new Error('no bot selected; /new NAME PROVIDER/MODEL [EFFORT] creates one');
   // An event can seat a bot before its snapshot identity arrives. Never send an unpinned name.
   if (b.id == null) throw new Error('bot_identity_pending: wait for attachment to finish');
-  const mode = sendMode(b), model = S.override.get(b.name), effort = S.effort.get(b.name), delivery = mode === 'send' ? 'reject' : mode;
+  const mode = how ?? sendMode(b), model = S.override.get(b.name), effort = S.effort.get(b.name), delivery = mode === 'send' ? 'reject' : mode;
   if (mode === 'side') { await sideChat(b.name, text); return; }
   // A steer joins the running turn only on that turn's model, effort and folder, so it names none.
   // It also names the turn on screen, so a turn that ended meanwhile refuses it as stale_turn
@@ -2337,7 +2937,7 @@ async function submit(text, pane = 'main', to = PANE[pane].bot()) {
   try { await Daemon.request('submit', { bot: b.name, bot_id: b.id, request_id: `app-${crypto.randomUUID()}`, prompt: text, delivery, ...where }); }
   catch (e) { if (delivery === 'steer' && /stale_turn/.test(String(e?.message ?? e))) throw new Error('that turn ended; not steered'); throw e; }
 }
-async function interrupt(name = S.selected) { const b = bot(name); if (!b || b.runningTurn === null) return; try { await Daemon.request('interrupt', { bot: b.name, turn: b.runningTurn }); } catch (e) { toast(`interrupt: ${e?.message ?? e}`); } }
+async function interrupt(name = mainBot()) { const b = bot(name); if (!b || b.runningTurn === null) return; try { await Daemon.request('interrupt', { bot: b.name, turn: b.runningTurn }); } catch (e) { toast(`interrupt: ${e?.message ?? e}`); } }
 // `NAME-fork`, then `NAME-fork-2` on (or `-side`), with NAME cut whole characters short so the
 // daemon's 128-byte name limit holds.
 const NAME_BYTES = 128;
@@ -2380,7 +2980,7 @@ async function sideChat(name, text = '') {
   // The first message goes before the pane loads any history, so the turn starts at once.
   let failed = null;
   if (text) {
-    try { await Daemon.request('submit', { bot: copy, bot_id: record.id, request_id: `app-${crypto.randomUUID()}`, prompt: text, delivery: 'reject', ...home(record) }); }
+    try { await Daemon.request('submit', { bot: copy, bot_id: record.bot_id, request_id: `app-${crypto.randomUUID()}`, prompt: text, delivery: 'reject', ...home(record) }); }
     catch (err) { failed = err instanceof Error ? err : new Error(String(err)); }
   }
   if (S.ui.side !== copy) await go(copy, 'beside');
@@ -2702,7 +3302,8 @@ function setupHTML(kept = new Map()) {
   return `<div class="shead"><b>${ready && projects ? 'Settings' : 'Set up Agent'}</b><button type="button" class="ibtn" data-act="setup-close" title="Close" aria-label="Close"${busy}>✕</button></div>`
     + step(1, 'Providers', ready, `${rows}<div class="row">${set?.host ? `<p class="dim">This window's daemon runs on ${esc(set.host)}, with the providers its login shell there exports; change them there.</p>` : set?.restartable === false ? '<p class="dim">This window uses a daemon it did not start, so it cannot apply provider changes.</p>' : add}${st.adding === null && !set?.host ? refresh : ''}</div>${listed}`)
     + step(2, 'First project', projects, project)
-    + (projects && !S.config?.host ? rolesHTML(st, busy) : '')
+    // Onboarding is the fundamentals; the roles show once a project or Home exists.
+    + ((projects || S.bots.has(HOME)) && !S.config?.host ? rolesHTML(st, busy) : '')
     + hostsHTML(st, busy)
     + (!S.config?.host && (projects || st.triggers?.length || st.triggersAfter || st.triggersError) ? triggersHTML(st, busy) : '')
     + (st.busy ? `<p class="busy">${esc(st.busy)}</p>` : '') + (st.error ? `<p class="bad">${esc(st.error)}</p>` : '');
@@ -2718,11 +3319,11 @@ function hostsHTML(st, busy) {
 }
 // The app's roles, each read from your own file in every project once you have one. Edit makes that
 // file from the app's text the first time and opens it in your editor.
-const ROLES = [['coordinator', 'Coordinator']];
+const ROLES = [['coordinator', 'Coordinator'], ['home', 'Home']];
 function rolesHTML(st, busy) {
   const own = new Map((st.roles ?? []).map((r) => [r.name, r.file]));
   const rows = ROLES.map(([name, label]) => `<div class="prow"><span class="pn">${label}</span><span class="st${own.get(name) ? '' : ' dim'}">${own.get(name) ? `~/.agents/agents/${name}.md` : 'the app\'s own'}</span><span class="acts"><button type="button" class="sbtn" data-act="edit-role" data-v="${name}"${busy}>Edit</button></span></div>`).join('');
-  return `<section><h3>Roles</h3>${rows}<p class="dim">A project's coordinator follows this in every project; a project's own .agents/agents file of that name comes first. An agent keeps the text it started with, so an edit reaches new projects. A swarm's agents follow the swarm skill's member.md.</p></section>`;
+  return `<section><h3>Roles</h3>${rows}<p class="dim">A project's coordinator follows its own in every project; a project's own .agents/agents file of that name comes first. Home follows its own. An agent keeps the text it started with, so an edit reaches the projects and Home made after it. A swarm's agents follow the swarm skill's member.md.</p></section>`;
 }
 // Agents wake from triggers they or their coordinator made: a time, a file written, a commit, or a fire by name.
 // launchd keeps watch. Each shows who it wakes, on what, what its last fire did, and the message it sends.
@@ -2795,6 +3396,7 @@ function renderSetup() {
 // - 'close': its tab closes, and an open one hands the window to the tab before it, or Home.
 async function go(name, how = 'here') {
   clearTimeout(rowLook.timer); rowLook.who = rowLook.before = null;
+  if (name === HOME && how !== 'close') { name = ''; how = 'here'; }
   const tabs = S.ui.tabs;
   if (how === 'close') {
     const i = tabs.indexOf(name); if (i < 0) return;
@@ -2827,7 +3429,11 @@ async function nextBeside() {
   const next = ps[(ps.indexOf(S.ui.side) + 1) % ps.length]; if (next !== S.ui.side) await go(next, 'beside');
 }
 // Late, after a load: by then the finder or a sheet may have opened, and it keeps the keyboard.
-function focusInput(pane) { const el = $(PANE[pane].input); if (el) setTimeout(() => { if (!covered()) el.focus({ preventScroll: true }); }, 0); }
+// A page tab has no composer, so the keyboard goes to its tab.
+function focusInput(pane) {
+  const el = pane === 'main' && pageOf(S.selected) ? $('tabs').querySelector('.wtab.on') : $(PANE[pane].input);
+  if (el) setTimeout(() => { if (!covered()) el.focus({ preventScroll: true }); }, 0);
+}
 
 // ---------- input ----------
 function grow(el) { if (!el.style) return; el.style.height = 'auto'; el.style.height = `${Math.min(160, el.scrollHeight)}px`; }
@@ -2849,13 +3455,21 @@ for (const [pane, ids] of Object.entries(PANE)) {
 }
 $('pickerq').addEventListener('input', renderPicker);
 $('pickerq').addEventListener('keydown', async (e) => {
+  if (e.key === 'Tab' || (e.metaKey && (e.key === 'k' || e.key === 'p'))) {
+    pickerMode(e.key === 'Tab' ? (S.ui.pickerMode === 'files' ? 'agents' : 'files') : e.key === 'p' ? 'files' : 'agents'); renderPicker(); e.preventDefault(); return;
+  }
   const rows = pickerRows();
   if (e.key === 'Escape') { closePicker(); e.preventDefault(); }
-  else if (e.key === 'ArrowDown' || (e.ctrlKey && e.key === 'n')) { S.ui.pickerSel = Math.min(rows.length - 1, S.ui.pickerSel + 1); renderPicker(); e.preventDefault(); }
+  else if (e.key === 'ArrowDown' || (e.ctrlKey && e.key === 'n')) { S.ui.pickerSel = Math.max(0, Math.min(rows.length - 1, S.ui.pickerSel + 1)); renderPicker(); e.preventDefault(); }
   else if (e.key === 'ArrowUp' || (e.ctrlKey && e.key === 'p')) { S.ui.pickerSel = Math.max(0, S.ui.pickerSel - 1); renderPicker(); e.preventDefault(); }
-  else if (e.key === 'Enter') { const r = rows[S.ui.pickerSel]; closePicker('main'); if (r) await go(r.b.name, 'tab'); e.preventDefault(); }
+  else if (e.key === 'Enter') { e.preventDefault(); await pick(rows[S.ui.pickerSel]); }
 });
-$('pickerlist').addEventListener('click', async (e) => { const r = e.target.closest('[data-pick]'); if (r) { closePicker('main'); await go(r.dataset.pick, 'tab'); } });
+$('pickerlist').addEventListener('click', async (e) => {
+  // A found file is `data-found`, not `data-file`, which a message link uses and opens beside.
+  const f = e.target.closest('[data-found]'), r = f ?? e.target.closest('[data-pick]'); if (!r) return;
+  await pick(f ? { path: f.dataset.found } : { b: { name: r.dataset.pick } });
+});
+$('pmodes').addEventListener('click', (e) => { const b = e.target.closest('[data-pmode]'); if (b) { pickerMode(b.dataset.pmode); renderPicker(); $('pickerq').focus(); } });
 const inputIds = new Set(['input', 'sideinput', 'pickerq']);
 document.addEventListener('keydown', async (e) => {
   if (S.ui.help) { hideHelp(); e.preventDefault(); return; }
@@ -2866,26 +3480,42 @@ document.addEventListener('keydown', async (e) => {
   if (S.ui.picker || e.target.id === 'pickerq') return;
   const k = e.key, ctrl = e.ctrlKey || e.metaKey;
   if (S.ui.menu) { if (k === 'Escape') { closeMenu(); e.preventDefault(); } return; }
+  // A note on a diff line: Enter sends it, Escape puts it away.
+  const gdir = gitOf(S.selected), g = gdir != null ? S.ui.git.get(gdir) : null;
+  if (e.target.id === 'gnote') {
+    if (!g) return;
+    if (k === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); await sendNote(g, e.target.value.trim()); }
+    else if (k === 'Escape') { e.preventDefault(); g.note = null; g.draft = ''; g.gen += 1; render(); focusInput('main'); }
+    return;
+  }
+  // In a Git tab its keys act wherever the keyboard is, but in a field, on a button, or on another tab.
+  const ontab = e.target.closest?.('[data-tab]');
+  if (g && !ctrl && !e.altKey && !e.target.closest?.('input, textarea, select, [data-act]') && (!ontab || ontab.dataset.tab === S.selected) && await gitKey(g, k)) { e.preventDefault(); return; }
   // A tab is chosen with Enter or Space, as a button is; its close button keeps its own keys.
   const tab = e.target.closest?.('[data-tab]');
   if (tab && (k === 'Enter' || k === ' ') && !e.target.closest('[data-act]')) { await go(tab.dataset.tab); e.preventDefault(); return; }
   if (ctrl && k === 'k') { openPicker(); e.preventDefault(); return; }
+  if (e.metaKey && k === 'p') { openPicker('files'); e.preventDefault(); return; }
   // A hidden sidebar patches no rows, so it draws them all again when it opens.
   if (ctrl && k === 'b') { S.ui.rail = !S.ui.rail; if (S.ui.rail) rail.key = ''; render(); save(); e.preventDefault(); return; }
   if (ctrl && k === 'd') { detach(); e.preventDefault(); return; }
   if (ctrl && k === 'o') { S.ui.steps = !S.ui.steps; render(); save(); e.preventDefault(); return; }
-  if (ctrl && k === 'p') { await nextBeside(); e.preventDefault(); return; }
+  if (e.ctrlKey && k === 'p') { await nextBeside(); e.preventDefault(); return; }
   if (k === 'Escape') { if (S.ui.file) closeFile(); else if (S.ui.side) await go(S.ui.side, 'beside'); else await interrupt(); e.preventDefault(); return; }
   const empty = e.target.id === 'input' && $('input').value === '';
   // Up and down step through every agent in order; from Home, down is the first and up the last.
   if (empty && (k === 'ArrowUp' || k === 'ArrowDown')) {
-    const names = fleetIndex().rows.filter((n) => n.b).map((n) => n.b.name), down = k === 'ArrowDown';
+    const names = fleetIndex().rows.filter((n) => n.b && n.b.name !== HOME).map((n) => n.b.name), down = k === 'ArrowDown';
     let i = names.indexOf(S.selected);
     i = i >= 0 ? (i + (down ? 1 : names.length - 1)) % names.length : S.selected ? -1 : down ? 0 : names.length - 1;
     if (i >= 0) await go(names[i]);
     e.preventDefault(); return;
   }
-  if (!inputIds.has(e.target.id) && k.length === 1 && !ctrl && !e.altKey) $('input').focus();
+  // A key typed outside a field goes to the composer; a page tab has none, so there only ? (keys) acts.
+  if (!inputIds.has(e.target.id) && k.length === 1 && !ctrl && !e.altKey) {
+    if (!pageOf(S.selected)) $('input').focus();
+    else if (k === '?') { showHelp(); e.preventDefault(); }
+  }
 });
 function failed(err) {
   const text = String(err?.message ?? err);
@@ -2924,8 +3554,15 @@ async function act(el) {
     // What is beside goes full screen, with its draft; ← closes it.
     case 'full': if (S.ui.side) await go(S.ui.side); return;
     case 'close-side': if (S.ui.side) await go(S.ui.side, 'beside'); return;
+    case 'plan-fold': S.ui.planFolded[v] = !S.ui.planFolded[v]; render(); return;
     case 'close-file': closeFile(); return;
+    case 'git': await openGit(who); return;
+    case 'git-read': { const dir = gitOf(S.selected); if (dir != null) readGit(gitTab(dir)); return; }
+    // The file beside becomes a tab, and the pane beside closes.
+    case 'file-tab': { const f = S.ui.file; if (!f) return; dropFile(); await go(FILE + f.full, 'tab'); return; }
     case 'new-project': await openProjectSheet(); return;
+    case 'memory': await openMemorySheet(who || null); return;
+    case 'open-fact': closeSheet(); await go(FILE + v, 'tab'); return;
     case 'np-choose': await chooseProjectFolder(); return;
     case 'np-in': np.in = v; renderProjectSheet(); return;
     case 'new-swarm': await openSwarmSheet(leadProject(who)); return;
@@ -2983,6 +3620,20 @@ document.addEventListener('click', async (e) => {
   if (button) { if (!button.disabled) { try { await act(button); } catch (err) { failed(err); } } return; }
   if (e.target.closest('#setupwrap')) return;
   if (e.target.closest('#menu')) return;
+  // In a Git tab a row is chosen, a double-click opens it, and a diff line takes a note.
+  const gdir = gitOf(S.selected), g = gdir != null ? S.ui.git.get(gdir) : null;
+  if (g && e.target.closest('#log')) {
+    const gi = e.target.closest('[data-gi]'), dl = e.target.closest('[data-dl]'), box = e.target.closest('.gbox[data-gpanel]');
+    if (gi) {
+      const panel = gi.dataset.gpanel, i = Number(gi.dataset.gi), again = g.panel === panel && g.sel[panel] === i;
+      if (!again) { g.panel = panel; g.sel[panel] = i; g.note = null; g.gen += 1; readDiff(g); render(); }
+      if (again && e.detail === 2) await gitOpen(g, gitItem(g));
+      return;
+    }
+    if (dl) { if (window.getSelection?.()?.isCollapsed !== false) openNote(g, Number(dl.dataset.dl)); return; }
+    if (e.target.closest('.dcm')) return;
+    if (box) gitPanel(g, box.dataset.gpanel);
+  }
   const step = e.target.closest('[data-out], [data-run]'), task = e.target.closest('[data-task]'), row = e.target.closest('[data-bot]'), tab = e.target.closest('[data-tab]');
   if (step) toggleStep(step);
   else if (task) { await go(task.dataset.task, 'beside'); return; }
@@ -3011,7 +3662,8 @@ document.addEventListener('contextmenu', (e) => {
   if (e.target.closest('a')) { e.preventDefault(); return; }
   const t = e.target.closest('[data-bot], [data-task], [data-tab]'); if (!t) return;
   const who = t.dataset.bot ?? t.dataset.task ?? t.dataset.tab;
-  e.preventDefault(); closeMenu(); showMenu(botMenuItems(who), { x: e.clientX, y: e.clientY }, who);
+  // A file tab has no actions, so it opens no menu.
+  const items = botMenuItems(who); e.preventDefault(); closeMenu(); if (items.length) showMenu(items, { x: e.clientX, y: e.clientY }, who);
 });
 
 // Highlighting arrived: a pane whose messages were drawn without it is drawn again; one with no
@@ -3024,9 +3676,9 @@ function waitsForHighlight(el) {
 }
 Rich.onReady = () => { for (const [id] of PANES) if (!(id === 'side' && S.ui.file) && waitsForHighlight($(id))) $(id).dataset.key = ''; render(); };
 Rich.onFile = openFileFrom;
-// Escape in a preview: a file's closes it, as Escape does there; a message's returns the keyboard to
-// its pane, where the next Escape does what it does.
-Rich.onEscape = (frame) => { if (frame.closest('.fview') && S.ui.file) closeFile(); else focusInput(frame.closest('.pane.side') && !S.ui.file ? 'side' : 'main'); };
+// Escape in a preview: a file's beside closes it, as Escape does there; any other returns the
+// keyboard to its pane (a file tab's to the tab), where the next Escape does what it does.
+Rich.onEscape = (frame) => { if (frame.closest('.pane.side .fview') && S.ui.file) closeFile(); else focusInput(frame.closest('.pane.side') && !S.ui.file ? 'side' : 'main'); };
 Rich.onError = (text) => toast(text, 4000);
 
 // ---------- boot ----------

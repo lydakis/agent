@@ -186,45 +186,18 @@ fn run(
     }
 }
 
-/// The project a folder belongs to: the nearest `.agents/project.toml` at or
-/// above it. A task's worktree is another checkout of its project's
-/// repository, so a folder in one is first moved to the same place in the
-/// repository's main checkout, where the project's file is.
+/// The project a folder belongs to, as the client composing a new agent
+/// finds it: the nearest `.agents/project.toml`, looked up from a task's
+/// worktree at the same place in the repository's main checkout.
 fn project_of(cwd: &Path) -> Result<String, String> {
-    let mut at = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-    let git = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&at)
-        .args([
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-common-dir",
-            "--show-prefix",
-        ])
-        .stderr(std::process::Stdio::null())
-        .output();
-    if let Ok(out) = git
-        && out.status.success()
-    {
-        let out = String::from_utf8_lossy(&out.stdout);
-        let mut lines = out.lines();
-        if let (Some(common), Some(prefix)) = (lines.next(), lines.next())
-            && Path::new(common).file_name().is_some_and(|f| f == ".git")
-            && let Some(main) = Path::new(common).parent()
-        {
-            at = main.join(prefix);
-        }
+    match agent_client::policy::project(cwd) {
+        Ok(Some(name)) => Ok(name),
+        Ok(None) => Err(format!(
+            "project_unknown: {}: no .agents/project.toml at or above this folder; pass --project NAME or --user",
+            cwd.display()
+        )),
+        Err(error) => Err(format!("project_invalid: {error}")),
     }
-    for dir in at.ancestors() {
-        if dir.join(crate::project::FILE).is_file() {
-            let project = crate::project::read(dir)?;
-            return Ok(project["name"].as_str().unwrap_or_default().to_owned());
-        }
-    }
-    Err(format!(
-        "project_unknown: {}: no .agents/project.toml at or above this folder; pass --project NAME or --user",
-        at.display()
-    ))
 }
 
 /// The local date, for a fact's `verified`.
@@ -490,6 +463,63 @@ fn check(dir: &Path) -> Value {
     json!({"dir": dir, "facts": count, "index_bytes": bytes, "limit": LIMIT, "problems": problems})
 }
 
+/// Project folders the Memory sheet at Home lists at most; the rest are
+/// counted.
+const MAX_PROJECTS: usize = 100;
+
+/// What the app shows of memory, and what it tells a coordinator changed:
+/// the person's facts, and `project`'s, or with no project every project's,
+/// each fact with its file and when it was last written. A folder that is not
+/// all facts says so in place of its facts.
+pub fn view(root: &Path, project: Option<&str>) -> Value {
+    let scope = |dir: PathBuf, name: Option<&str>| {
+        let listed = facts(&dir).map(|all| {
+            all.iter()
+                .map(|fact| {
+                    let path = dir.join(format!("{}.md", fact.name));
+                    let modified = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map_or(0, |d| d.as_millis() as u64);
+                    json!({"name": fact.name, "type": fact.kind, "description": fact.description,
+                        "source": fact.source, "verified": fact.verified, "path": path, "modified": modified})
+                })
+                .collect::<Vec<_>>()
+        });
+        let mut out = json!({"name": name, "dir": dir});
+        match listed {
+            Ok(facts) => out["facts"] = json!(facts),
+            Err(error) => out["error"] = json!(error),
+        }
+        out
+    };
+    let projects = root.join("projects");
+    let (names, more) = match project {
+        Some(name) => (vec![name.to_owned()], 0),
+        None => {
+            let mut names: Vec<String> = std::fs::read_dir(&projects)
+                .into_iter()
+                .flatten()
+                .take(MAX_ENTRIES)
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|name| crate::project::valid_name(name))
+                .collect();
+            names.sort();
+            let more = names.len().saturating_sub(MAX_PROJECTS);
+            names.truncate(MAX_PROJECTS);
+            (names, more)
+        }
+    };
+    let listed: Vec<Value> = names
+        .iter()
+        .map(|name| scope(projects.join(name), Some(name)))
+        .collect();
+    json!({"user": scope(root.to_path_buf(), None), "projects": listed, "more": more})
+}
+
 /// `~/.agent/memory`, written again whenever the app starts from
 /// somewhere else.
 pub fn write_script(state: &Path, app: &Path) -> Result<(), String> {
@@ -514,6 +544,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn view_lists_the_persons_facts_and_a_projects() {
+        let root = temp("view");
+        save_user(&root, "short-replies", "keep replies short", "Short.").unwrap();
+        let shown = view(&root, None);
+        let fact = &shown["user"]["facts"][0];
+        assert_eq!(fact["name"], "short-replies");
+        assert_eq!(fact["description"], "keep replies short");
+        assert_eq!(fact["path"], json!(root.join("short-replies.md")));
+        assert!(fact["modified"].as_u64().unwrap() > 0);
+        assert_eq!(shown["projects"], json!([]));
+        // Every project's at Home; one project's in it.
+        let project = root.join("projects/demo");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("bad.md"), "not a fact").unwrap();
+        let shown = view(&root, None);
+        assert_eq!(shown["projects"][0]["name"], "demo");
+        assert!(
+            shown["projects"][0]["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("memory_invalid: ")
+        );
+        assert_eq!(view(&root, Some("demo"))["projects"][0]["name"], "demo");
+        assert_eq!(view(&root, Some("new"))["projects"][0]["facts"], json!([]));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn args(line: &[&str]) -> Vec<String> {

@@ -60,7 +60,7 @@ def render_cask(version: str, archive: Path) -> str:
   uninstall quit:   "me.lydakis.agent",
             script: {{
               executable:   "#{{appdir}}/Agent.app/Contents/MacOS/agent",
-              args:         ["shutdown", "--store", "#{{Dir.home}}/.agent/state.sqlite", "--grace", "30"],
+              args:         ["shutdown", "--store", "#{{Dir.home}}/.agent/state.sqlite", "--grace", "30s"],
               must_succeed: false,
             }}
 

@@ -7,7 +7,8 @@
 //! results through this runtime), every AGENTS.md and `.agents/AGENTS.md`
 //! from the workspace up to the filesystem root plus the user's global one,
 //! an index of skills the bot can open with its `read` tool and of profiles
-//! it can start peers in, and the bot's own role when it is started in one.
+//! it can start peers in, the memory indexes the client names, and the
+//! bot's own role when it is started in one.
 //! The text is a stable prefix on purpose: it rides the provider's prompt
 //! cache after the first turn, so it changes only when a file changes.
 use std::path::{Path, PathBuf};
@@ -50,6 +51,9 @@ pub struct Source {
 pub struct Instructions {
     pub text: String,
     pub sources: Vec<Source>,
+    /// The memory indexes that went into the text; one that does not
+    /// exist is not listed.
+    pub memory: Vec<Source>,
     pub skills: Vec<Skill>,
     pub profiles: Vec<Entry>,
 }
@@ -309,11 +313,11 @@ pub struct Entry {
 }
 pub type Skill = Entry;
 
-/// Roles a client starts its own bots in: the app's coordinator. A
-/// `.agents/agents` file of one of these names replaces
+/// Roles a client starts its own bots in: the app's coordinator and its
+/// Home. A `.agents/agents` file of one of these names replaces
 /// the client's text for that role, so it is not a role to start a peer in,
 /// and the Profiles index leaves it out.
-pub const CLIENT_ROLES: [&str; 1] = ["coordinator"];
+pub const CLIENT_ROLES: [&str; 2] = ["coordinator", "home"];
 
 /// Whether a profile file's stem is a client role. Case is ignored: on a
 /// case-insensitive filesystem (macOS's default) `Coordinator.md` is the
@@ -415,6 +419,94 @@ fn not_dangling(path: &Path) -> Result<(), Failure> {
         return Ok(());
     }
     Ok(())
+}
+
+/// The memory indexes a new bot in `workspace` starts with: the person's
+/// `~/.agents/memory/MEMORY.md`, then, when the workspace is in a project,
+/// `~/.agents/memory/projects/NAME/MEMORY.md`. The app's memory script
+/// keeps both.
+pub fn memory_indexes(workspace: &Path) -> Result<Vec<PathBuf>, Failure> {
+    memory_indexes_from(workspace, home().as_deref())
+}
+
+fn memory_indexes_from(workspace: &Path, home: Option<&Path>) -> Result<Vec<PathBuf>, Failure> {
+    let Some(home) = home else {
+        return Ok(Vec::new());
+    };
+    let root = home.join(".agents/memory");
+    let mut found = vec![root.join("MEMORY.md")];
+    if let Some(name) = project(workspace)? {
+        found.push(root.join("projects").join(name).join("MEMORY.md"));
+    }
+    Ok(found)
+}
+
+/// The project `dir` belongs to: the name in the nearest
+/// `.agents/project.toml` at or above it. A task's worktree is another
+/// checkout of its project's repository, where that file may not be
+/// committed or may differ, so a folder in one is looked up at the same
+/// place in the repository's main checkout first.
+pub fn project(dir: &Path) -> Result<Option<String>, Failure> {
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let main = main_checkout(&dir);
+    for start in main.iter().chain(std::iter::once(&dir)) {
+        for at in start.ancestors() {
+            let path = at.join(".agents/project.toml");
+            if !is_file(&path)? {
+                continue;
+            }
+            let unreadable = |reason: String| Failure::Unreadable {
+                path: path.clone(),
+                reason,
+            };
+            let text = read_bounded(&path, 64 * 1024)?
+                .ok_or_else(|| unreadable("larger than 64 KiB".into()))?;
+            let table: toml::Table = text
+                .parse()
+                .map_err(|e: toml::de::Error| unreadable(e.message().to_owned()))?;
+            return match table.get("name") {
+                Some(toml::Value::String(name)) if project_name(name) => Ok(Some(name.clone())),
+                _ => Err(unreadable(
+                    "name must be 1-64 of A-Z a-z 0-9 - _ ., not starting or ending with .".into(),
+                )),
+            };
+        }
+    }
+    Ok(None)
+}
+
+fn project_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        && !name.starts_with('.')
+        && !name.ends_with('.')
+}
+
+/// The same place as `dir` in its repository's main checkout, when `dir` is
+/// in a linked worktree: its `.git` is a file naming the worktree's git
+/// folder, whose `commondir` names the main checkout's `.git`. Read from
+/// the files rather than by running git, so composing spawns nothing.
+fn main_checkout(dir: &Path) -> Option<PathBuf> {
+    for top in dir.ancestors() {
+        let dot = top.join(".git");
+        let Ok(meta) = std::fs::symlink_metadata(&dot) else {
+            continue;
+        };
+        if !meta.is_file() {
+            return None;
+        }
+        let text = std::fs::read_to_string(&dot).ok()?;
+        let gitdir = top.join(text.strip_prefix("gitdir: ")?.trim());
+        let common = std::fs::read_to_string(gitdir.join("commondir")).ok()?;
+        let common = gitdir.join(common.trim()).canonicalize().ok()?;
+        if common.file_name()? != ".git" {
+            return None;
+        }
+        return Some(common.parent()?.join(dir.strip_prefix(top).ok()?));
+    }
+    None
 }
 
 fn entry_row(entry: &Entry) -> String {
@@ -601,40 +693,49 @@ pub fn profile(workspace: &Path, name: &str) -> Result<Option<Profile>, Failure>
     Ok(None)
 }
 
-/// The full text for a new bot in `workspace`, in `role` when given. Fails
-/// rather than truncates when the files do not fit: a silently shortened
-/// AGENTS.md is worse than none.
-pub fn instructions(workspace: &Path, role: Option<&Profile>) -> Result<Instructions, Failure> {
+/// Append `path` to `text` under `header`, unless it is empty. Reads no
+/// more than what could still fit, so a file past the budget fails on its
+/// size, not after being copied into memory.
+fn append(text: &mut String, path: PathBuf, header: &str) -> Result<Option<Source>, Failure> {
+    let room = MAX_INSTRUCTIONS.saturating_sub(text.len() + header.len());
+    let Some(body) = read_bounded(&path, room)? else {
+        let size = std::fs::metadata(&path).map_or(room + 1, |m| m.len() as usize);
+        return Err(Failure::TooLong {
+            path,
+            total: text.len() + header.len() + size,
+        });
+    };
+    let body = body.trim();
+    if body.is_empty() {
+        return Ok(None);
+    }
+    let block = format!("{header}{body}");
+    if text.len() + block.len() > MAX_INSTRUCTIONS {
+        return Err(Failure::TooLong {
+            path,
+            total: text.len() + block.len(),
+        });
+    }
+    text.push_str(&block);
+    Ok(Some(Source {
+        path,
+        bytes: body.len(),
+    }))
+}
+
+/// The full text for a new bot in `workspace`, in `role` when given, with
+/// the `memory` indexes the client keeps. Fails rather than truncates when
+/// the files do not fit: a silently shortened AGENTS.md is worse than none.
+pub fn instructions(
+    workspace: &Path,
+    role: Option<&Profile>,
+    memory: &[PathBuf],
+) -> Result<Instructions, Failure> {
     let mut text = String::from(PREAMBLE);
     let mut sources = Vec::new();
     for path in agents_files(workspace)? {
-        // Read no more than what could still fit; a file past the budget
-        // fails on its size, not after being copied into memory.
         let header = format!("\n\n# Instructions from {}\n\n", path.display());
-        let room = MAX_INSTRUCTIONS.saturating_sub(text.len() + header.len());
-        let Some(body) = read_bounded(&path, room)? else {
-            let size = std::fs::metadata(&path).map_or(room + 1, |m| m.len() as usize);
-            return Err(Failure::TooLong {
-                path,
-                total: text.len() + header.len() + size,
-            });
-        };
-        let body = body.trim();
-        if body.is_empty() {
-            continue;
-        }
-        let block = format!("{header}{body}");
-        if text.len() + block.len() > MAX_INSTRUCTIONS {
-            return Err(Failure::TooLong {
-                path,
-                total: text.len() + block.len(),
-            });
-        }
-        text.push_str(&block);
-        sources.push(Source {
-            path,
-            bytes: body.len(),
-        });
+        sources.extend(append(&mut text, path, &header)?);
     }
     let mut lists = Vec::new();
     for kind in [Kind::Skills, Kind::Profiles] {
@@ -658,6 +759,16 @@ pub fn instructions(workspace: &Path, role: Option<&Profile>) -> Result<Instruct
         }
         lists.push(entries);
     }
+    // Memory follows: what earlier agents saved, as it stands when the bot
+    // is made. An index carries its own heading, so it goes in as it is;
+    // one not written yet is none.
+    let mut indexes = Vec::new();
+    for path in memory {
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => not_dangling(path)?,
+            _ => indexes.extend(append(&mut text, path.clone(), "\n\n")?),
+        }
+    }
     // The role comes last: the most specific text a bot is given.
     if let Some(role) = role.filter(|r| !r.body.is_empty()) {
         let block = format!("\n\n# Role: {}\n\n{}", role.name, role.body);
@@ -677,6 +788,7 @@ pub fn instructions(workspace: &Path, role: Option<&Profile>) -> Result<Instruct
     Ok(Instructions {
         text,
         sources,
+        memory: indexes,
         skills,
         profiles,
     })
@@ -713,7 +825,7 @@ mod tests {
             files.iter().rev().take(2).collect::<Vec<_>>(),
             vec![&deep.join("AGENTS.md"), &root.join("AGENTS.md")]
         );
-        let composed = instructions(&deep, None).unwrap();
+        let composed = instructions(&deep, None, &[]).unwrap();
         assert!(composed.text.starts_with(PREAMBLE));
         let outer = composed.text.find("outer rule").unwrap();
         let inner = composed.text.find("inner rule").unwrap();
@@ -763,7 +875,7 @@ mod tests {
             1
         );
         assert_eq!(files.last(), Some(&deep.join(".agents/AGENTS.md")));
-        let composed = instructions(&deep, None).unwrap();
+        let composed = instructions(&deep, None, &[]).unwrap();
         let order = [
             "outer rule",
             "outer agents rule",
@@ -790,7 +902,7 @@ mod tests {
     fn oversized_files_fail_instead_of_being_cut() {
         let root = temp("big");
         std::fs::write(root.join("AGENTS.md"), "x".repeat(MAX_INSTRUCTIONS)).unwrap();
-        let error = instructions(&root, None).unwrap_err();
+        let error = instructions(&root, None, &[]).unwrap_err();
         assert_eq!(error.code(), "instructions_limit");
         assert!(
             matches!(&error, Failure::TooLong { path, total } if *path == root.join("AGENTS.md") && *total > MAX_INSTRUCTIONS)
@@ -806,7 +918,7 @@ mod tests {
         let file = std::fs::File::create(root.join("AGENTS.md")).unwrap();
         file.set_len(512 * 1024 * 1024).unwrap();
         drop(file);
-        let error = instructions(&root, None).unwrap_err();
+        let error = instructions(&root, None, &[]).unwrap_err();
         assert!(
             matches!(&error, Failure::TooLong { path, total } if *path == root.join("AGENTS.md") && *total > 512 * 1024 * 1024)
         );
@@ -815,7 +927,7 @@ mod tests {
         let mut long = String::from("# Big skill\n\n");
         long.push_str(&"x".repeat(SKILL_HEAD * 4));
         std::fs::write(root.join(".agents/skills/big/SKILL.md"), long).unwrap();
-        let composed = instructions(&root, None).unwrap();
+        let composed = instructions(&root, None, &[]).unwrap();
         assert_eq!(composed.skills[0].summary, "Big skill");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -824,7 +936,7 @@ mod tests {
     fn an_unreadable_file_is_an_error_not_a_silent_omission() {
         let root = temp("unreadable");
         std::fs::write(root.join("AGENTS.md"), [0xff, 0xfe, b'x']).unwrap();
-        let error = instructions(&root, None).unwrap_err();
+        let error = instructions(&root, None, &[]).unwrap_err();
         assert_eq!(error.code(), "instructions_unreadable");
         assert!(
             matches!(&error, Failure::Unreadable { path, .. } if *path == root.join("AGENTS.md"))
@@ -834,7 +946,7 @@ mod tests {
         std::fs::remove_file(root.join("AGENTS.md")).unwrap();
         std::os::unix::fs::symlink("AGENTS.md", root.join("AGENTS.md")).unwrap();
         assert_eq!(
-            instructions(&root, None).unwrap_err().code(),
+            instructions(&root, None, &[]).unwrap_err().code(),
             "instructions_unreadable"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -886,11 +998,109 @@ mod tests {
     #[test]
     fn a_workspace_without_files_gets_the_preamble_only() {
         let root = temp("bare");
-        let composed = instructions(&root, None).unwrap();
+        let composed = instructions(&root, None, &[]).unwrap();
         assert_eq!(composed.sources, Vec::new());
         assert!(composed.skills.is_empty() || composed.text.contains("# Skills"));
         assert!(composed.text.starts_with(PREAMBLE));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn memory_indexes_go_in_as_they_are_after_the_indexes_and_before_the_role() {
+        let root = temp("memory");
+        std::fs::write(root.join("AGENTS.md"), "rule").unwrap();
+        let user = root.join("user.md");
+        let index = "# Memory in /u\n\n- short-replies (feedback, verified 2026-10-10): one line";
+        std::fs::write(&user, format!("{index}\n")).unwrap();
+        let empty = root.join("empty.md");
+        std::fs::write(&empty, "\n").unwrap();
+        let missing = root.join("missing.md");
+        let role = Profile::parse("lead", None, "Lead.");
+        let memory = [user.clone(), empty, missing];
+        let composed = instructions(&root, Some(&role), &memory).unwrap();
+        assert_eq!(
+            composed.memory,
+            [Source {
+                path: user.clone(),
+                bytes: index.len()
+            }]
+        );
+        assert!(
+            composed
+                .text
+                .ends_with(&format!("\n\n{index}\n\n# Role: lead\n\nLead.")),
+            "{}",
+            composed.text
+        );
+        // An index that cannot be read fails the bot, as an AGENTS.md does.
+        std::fs::write(&user, [0xff, 0xfe]).unwrap();
+        let error = instructions(&root, None, &memory).unwrap_err();
+        assert_eq!(error.code(), "instructions_unreadable");
+        // So does one behind a link to a folder that is gone.
+        std::os::unix::fs::symlink(root.join("gone"), root.join("link")).unwrap();
+        let behind = [root.join("link/MEMORY.md")];
+        let error = instructions(&root, None, &behind).unwrap_err();
+        assert_eq!(error.code(), "instructions_unreadable");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_worktree_finds_its_project_and_memory_through_the_main_checkout() {
+        let home = temp("memory-home");
+        let repo = temp("memory-repo");
+        let git = |dir: &Path, line: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(line)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{line:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&repo, &["init", "-q"]);
+        std::fs::create_dir_all(repo.join("web/.agents")).unwrap();
+        std::fs::write(repo.join("web/.agents/project.toml"), "name = \"old\"\n").unwrap();
+        git(&repo, &["add", "web"]);
+        git(&repo, &["commit", "-qm", "x"]);
+        // The main checkout's file is what counts, committed or not.
+        std::fs::write(repo.join("web/.agents/project.toml"), "name = \"demo\"\n").unwrap();
+        let worktree = repo.with_extension("worktree");
+        let _ = std::fs::remove_dir_all(&worktree);
+        let at = worktree.to_str().unwrap();
+        git(&repo, &["worktree", "add", "-q", "-b", "task", at, "HEAD"]);
+        assert_eq!(
+            project(&worktree.join("web")).unwrap().as_deref(),
+            Some("demo")
+        );
+        assert_eq!(project(&repo.join("web")).unwrap().as_deref(), Some("demo"));
+        assert_eq!(project(&repo).unwrap(), None);
+        let memory = home.join(".agents/memory");
+        assert_eq!(
+            memory_indexes_from(&worktree.join("web"), Some(&home)).unwrap(),
+            [
+                memory.join("MEMORY.md"),
+                memory.join("projects/demo/MEMORY.md")
+            ]
+        );
+        assert_eq!(
+            memory_indexes_from(&repo, Some(&home)).unwrap(),
+            [memory.join("MEMORY.md")]
+        );
+        assert_eq!(
+            memory_indexes_from(&repo, None).unwrap(),
+            Vec::<PathBuf>::new()
+        );
+        std::fs::write(repo.join("web/.agents/project.toml"), "name = \"../up\"\n").unwrap();
+        let error = project(&repo.join("web")).unwrap_err();
+        assert_eq!(error.code(), "instructions_unreadable");
+        git(&repo, &["worktree", "remove", "--force", at]);
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]
@@ -904,7 +1114,7 @@ mod tests {
             )
             .unwrap();
         }
-        let composed = instructions(&root, None).unwrap();
+        let composed = instructions(&root, None, &[]).unwrap();
         let listed: Vec<&str> = composed.profiles.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(listed, ["reviewer"]);
         assert!(!composed.text.contains("- coordinator:"));
@@ -912,7 +1122,7 @@ mod tests {
         // The file still replaces the client's text when it starts a bot in that role.
         let role = profile(&root, "coordinator").unwrap().unwrap();
         assert_eq!(role.body, "Be the coordinator.");
-        let composed = instructions(&root, Some(&role)).unwrap();
+        let composed = instructions(&root, Some(&role), &[]).unwrap();
         assert!(
             composed
                 .text
@@ -941,7 +1151,7 @@ mod tests {
         for unusable in ["my role.md", ".draft.md", "rôle.md"] {
             std::fs::write(root.join(".agents/agents").join(unusable), "x").unwrap();
         }
-        let composed = instructions(&root, None).unwrap();
+        let composed = instructions(&root, None, &[]).unwrap();
         assert_eq!(composed.profiles.len(), 1);
         assert_eq!(composed.skills[0].name, "release");
         assert_eq!(
@@ -963,7 +1173,7 @@ mod tests {
             Some(vec!["read".to_owned(), "shell".to_owned()])
         );
         assert_eq!(role.body, "You review changes. Report bugs only.");
-        let composed = instructions(&root, Some(&role)).unwrap();
+        let composed = instructions(&root, Some(&role), &[]).unwrap();
         assert!(
             composed
                 .text
@@ -1005,7 +1215,7 @@ mod tests {
             "instructions_unreadable"
         );
         assert_eq!(
-            instructions(&root, None).unwrap_err().code(),
+            instructions(&root, None, &[]).unwrap_err().code(),
             "instructions_unreadable"
         );
         std::fs::remove_file(root.join(".agents/agents/reviewer.md")).unwrap();
@@ -1013,7 +1223,7 @@ mod tests {
         std::os::unix::fs::symlink("SKILL.md", root.join(".agents/skills/review/SKILL.md"))
             .unwrap();
         assert_eq!(
-            instructions(&root, None).unwrap_err().code(),
+            instructions(&root, None, &[]).unwrap_err().code(),
             "instructions_unreadable"
         );
         std::fs::remove_file(root.join(".agents/skills/review/SKILL.md")).unwrap();
@@ -1038,7 +1248,7 @@ mod tests {
         let big = std::fs::File::create(root.join(".agents/agents/huge.md")).unwrap();
         big.set_len(MAX_INSTRUCTIONS as u64 + 1).unwrap();
         assert!(
-            instructions(&root, None)
+            instructions(&root, None, &[])
                 .unwrap()
                 .profiles
                 .iter()
@@ -1073,13 +1283,13 @@ mod tests {
         std::fs::remove_dir_all(root.join(".agents/skills/review")).unwrap();
         std::os::unix::fs::symlink("gone", root.join(".agents/skills/review")).unwrap();
         assert_eq!(
-            instructions(&root, None).unwrap_err().code(),
+            instructions(&root, None, &[]).unwrap_err().code(),
             "instructions_unreadable"
         );
         std::fs::remove_file(root.join(".agents/skills/review")).unwrap();
         std::os::unix::fs::symlink("gone.md", root.join("AGENTS.md")).unwrap();
         assert_eq!(
-            instructions(&root, None).unwrap_err().code(),
+            instructions(&root, None, &[]).unwrap_err().code(),
             "instructions_unreadable"
         );
         std::fs::remove_file(root.join("AGENTS.md")).unwrap();
@@ -1096,7 +1306,7 @@ mod tests {
         std::fs::remove_dir_all(root.join(".agents/skills")).unwrap();
         std::os::unix::fs::symlink("gone", root.join(".agents/skills")).unwrap();
         assert_eq!(
-            instructions(&root, None).unwrap_err().code(),
+            instructions(&root, None, &[]).unwrap_err().code(),
             "instructions_unreadable"
         );
         std::fs::remove_file(root.join(".agents/skills")).unwrap();
@@ -1105,7 +1315,7 @@ mod tests {
         std::fs::remove_dir_all(root.join(".agents/skills")).unwrap();
         std::fs::create_dir_all(root.join(".agents/skills")).unwrap();
         std::fs::write(root.join(".agents/skills/README.md"), "notes").unwrap();
-        assert!(instructions(&root, None).unwrap().skills.is_empty());
+        assert!(instructions(&root, None, &[]).unwrap().skills.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 

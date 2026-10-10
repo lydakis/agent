@@ -307,7 +307,7 @@ impl Model {
             .await
             .map_err(Error::from)?;
         Ok(Model {
-            base_id: created["id"]
+            base_id: created["bot_id"]
                 .as_i64()
                 .ok_or(Error::new("daemon_protocol_mismatch"))?,
             base,

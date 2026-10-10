@@ -43,7 +43,17 @@ Implemented 2026-09-19.
    index: a file of that name replaces the app's text for that role, not a
    role to start a peer in, so no agent is offered a nested coordinator. A
    swarm member's rules are the swarm skill's `member.md`, not a profile.
-5. **Role.** A bot started in a profile (`--profile ROLE`, or the app's
+5. **Memory.** The person's `~/.agents/memory/MEMORY.md` and, when the
+   workspace is in a project, `~/.agents/memory/projects/NAME/MEMORY.md`,
+   each as it is (an index carries its own `# Memory in DIR` heading); one
+   not written yet adds nothing. The project is the `name` in the nearest
+   `.agents/project.toml`; from a git worktree it is looked up first at the
+   same place in the main checkout, read from the worktree's `.git` and
+   `commondir` files rather than by running git. The app's memory script
+   keeps the indexes ([APP.md](APP.md#memory)). They come after the indexes
+   because they change more often than the files above, and they are a
+   snapshot: a bot's instructions are fixed when it is made.
+6. **Role.** A bot started in a profile (`--profile ROLE`, or the app's
    coordinator) gets that body last, under `# Role: ROLE`. The app ships a
    `coordinator` profile ([app/agents/coordinator.md](../app/agents/coordinator.md));
    a folder's or the user's `coordinator.md` replaces it.

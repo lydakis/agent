@@ -6,8 +6,10 @@ Agent uses flat verbs: `run`, `follow`, `fork`, `interrupt`, `wait`, `ls`,
 bots use the same commands. There is no parent/child command hierarchy.
 
 Use `agent --help`, `agent COMMAND --help`, or `agent help COMMAND` for help;
-`-h` also works. Help writes to stdout and exits successfully without opening
-a store or connecting to a daemon.
+`-h` also works. `agent --help` gives each command in one line; a command's own
+help lists its flags, and `run --help` lists a new bot's settings apart, after
+the everyday flags. Help writes to stdout and exits successfully without
+opening a store or connecting to a daemon.
 
 Inside a bot's shell tool, `AGENT_BOT` and `AGENT_BOT_ID` identify that bot.
 The client sends both as `created_by` and `created_by_id` when creating or
@@ -57,6 +59,11 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   joined) or when the turn it started completes.
   A steer with an explicit workspace or model that differs from the running
   turn stays queued and runs separately with those choices.
+- `run --turn-budget-tokens N` caps this turn's input plus output tokens,
+  beside the bot's lifetime `--budget-tokens`. The turn fails with
+  `turn_budget_exhausted` before a call once it has spent N; the cap is
+  the turn's own, so the next turn starts from zero. A steer joins a turn
+  that already has its cap, so `steer` with the flag is `invalid_delivery`.
 - `run --workspace DIR` chooses the folder. A new bot starts in it, or in
   the directory `run` was invoked from. A bot keeps its folder: a later
   `run` without the flag runs there wherever it is invoked, and one with it
@@ -68,8 +75,8 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   `--agents` composes the shared client policy instead: the harness preamble,
   every AGENTS.md and `.agents/AGENTS.md` from the workspace up to the root
   plus `~/.agents/AGENTS.md`, and indexes of the skills in
-  `.agents/skills/NAME/SKILL.md` and the profiles in `.agents/agents/ROLE.md`
-  ([CLIENT.md](CLIENT.md)). It is
+  `.agents/skills/NAME/SKILL.md` and the profiles in `.agents/agents/ROLE.md`,
+  and the memory indexes in `~/.agents/memory` ([CLIENT.md](CLIENT.md)). It is
   opt-in on the CLI, the default in the app, and exclusive with
   `--instructions`. `--profile ROLE` composes the same text with that role
   last, and takes the role's `model` and `tools` unless `--model` or
@@ -78,7 +85,7 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   included.
   With `run`, instructions and token budget apply to new identities;
   passing them while continuing an existing named bot is an error.
-- `run --new --approval MODE` and `fork --approval MODE` choose whether a
+- `run --new --approval MODE` chooses whether a
   new bot's tool calls wait for a verdict: `full` runs every allowed call (no
   gate), `manual` waits for an answer from any client, and `auto` has a
   judge model decide each call. For `auto`, and whenever `run` continues or
@@ -88,7 +95,8 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   Without the flag, `AGENT_APPROVAL` applies, then `full`. `--approve LIST`
   picks the gated tools and must name at least one; the default is every
   tool but `history`, `wait`, `note`, and `echo`. A fork keeps its source's gates and a created bot its
-  creator's ([APPROVALS.md](APPROVALS.md)).
+  creator's ([APPROVALS.md](APPROVALS.md)); `fork` takes no approval flags, and a
+  program that wants a fork gated further passes `approve` on the protocol's `fork`.
 - `approver [--tag TAG] [--judge PROVIDER/MODEL] [--effort LEVEL]
   [--note FILE] [--judge-url URL]` serves a gate tag (default `auto`) and
   has a judge decide every call waiting on it, one request per round,
@@ -99,7 +107,9 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   a tag of at most 87 bytes, and `--effort` sets its effort. `--note` (default `AGENT_APPROVER_NOTE`)
   is a regular file of at most 96,000 bytes the judge always sees, such as
   trusted remotes and hosts ([APPROVALS.md](APPROVALS.md#automatic-mode)).
-- `approvals [--bot NAME] [--tag TAG]` lists the calls waiting on a gate.
+- `approvals [--bot NAME] [--tag TAG] [--full]` lists the calls waiting on a gate.
+  Each previews its arguments; `--full` reads the whole arguments of a
+  call whose preview was cut from the node that planned it.
   With `--pretty`, each call shows what it would do (every line of its
   command, or of what a `write` or `edit` puts in its file, terminal
   controls escaped) and, for each gate still
@@ -113,14 +123,27 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   same commands when a call waits. A printed command carries `--store` or
   `--socket`, as absolute paths, whenever the daemon it came from is not
   the default one, so it answers that daemon from any shell.
-- Time units are explicit: `--timeout-ms` is milliseconds; `--idle-exit`,
-  `--stall-timeout`, and `--keep-warm` are seconds. `--after` is an exclusive event cursor for `follow` and an exclusive
+- Every time flag takes a duration with its unit: `500ms`, `30s`, `5m`,
+  `1h`, or a bare `0`. A bare number is refused, so no flag guesses a unit:
+  `--timeout`, `--approval-hold`, `--grace`, `--stall-timeout`,
+  `--idle-exit` and `--keep-warm`. The last three count whole seconds. The
+  protocol keeps its own units (`timeout_ms`, `grace_ms`, `approval_hold_ms`,
+  `keep_warm` seconds). `--approval-hold` is how long a new bot's gated calls
+  wait live for a verdict before the turn parks (default `2s`; `0` parks at
+  once). `--after` is an exclusive event cursor for `follow` and an exclusive
   turn ID for `turns`. `--checkpoint` is a history node ID.
-  `--approval-hold-ms` is milliseconds: how long a new bot's gated calls
-  wait live for a verdict before the turn parks (default 2,000; 0 parks at once).
+- Listings read only what they print. `--limit N` stops `ls`, `turns` and
+  `approvals` after N entries. `ls --name GLOB` keeps the bots whose name
+  matches (`'project.*'`, `'*.lead'`; SQLite GLOB, case-sensitive) and
+  `ls --active` those with a turn running; the daemon filters, so neither
+  pages through every bot. `turns --newest` lists newest first, read from the
+  end, so `turns --bot NAME --newest --limit 3` is a bot's last three turns.
+- `--keep-turns N` means the same on `prune` and `run`: keep the newest N
+  turns' records. `prune` applies it once; on `run --new` it is the bot's
+  setting, applied after each of its turns.
 - `run` sets a new bot's own settings with `--context-bytes`, `--context-items`,
-  `--note-turns`, `--compact-at`, `--compact-keep`, `--retain-turns`,
-  `--approval-hold-ms`, `--max-output-tokens`, `--keep-warm`, and
+  `--note-turns`, `--compact-at`, `--compact-keep`, `--keep-turns`,
+  `--approval-hold`, `--max-output-tokens`, `--keep-warm`, and
   `--cache-ttl`; they are not daemon options, and an existing bot
   keeps its own (see [bot settings](RUST_PROTOTYPE.md#bot-settings)).
 
@@ -133,10 +156,12 @@ dependency is required.
 
 Default output is machine-readable JSON. `run` and `follow` stream one JSON
 object per line. Snapshot commands return compact JSON objects; `ls` and `turns`
-return arrays. `interrupt` prints the turn view, and `shutdown` prints nothing
-on success.
+return arrays. Every command prints its reply: `interrupt` the turn view,
+`answer` what it answered, and `shutdown` `{"stopped":true,"pid":N}` once the
+daemon is gone. Every client command takes `--pretty`; `approver` and `serve`
+run until stopped and print no reply to render.
 `shutdown` returns once the daemon process has exited and its store is closed.
-`shutdown --grace SECONDS` first lets running turns finish for up to that long
+`shutdown --grace DURATION` first lets running turns finish for up to that long
 while starting none; turns still running then end `interrupted` with
 `daemon_shutdown`. A daemon whose ready line announces an older protocol than
 this `agent`'s cannot be asked in this protocol, so `shutdown` sends SIGTERM to
@@ -200,7 +225,7 @@ a daemon that exits without one is `daemon_start_failed`, naming the log.
 `wait` normally requires all handles to resolve without errors. With `--any`,
 one resolved successful handle suffices and the remaining handles stay valid.
 An errored first result or a timeout with no resolved result exits 1.
-`--timeout-ms 0` polls once and prints the same JSON result with unresolved
+`--timeout 0` polls once and prints the same JSON result with unresolved
 handles marked pending. Completed successful handles can still return exit 0.
 
 ## Connection and startup

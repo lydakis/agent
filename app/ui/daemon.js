@@ -21,8 +21,13 @@ window.Daemon = (() => {
       project: (dir) => invoke('project', { dir }),
       writeProject: ({ dir, name, model, reasoning = null, threads = null }) => invoke('write_project', { dir, name, model, reasoning, threadsModel: threads?.model ?? null, threadsReasoning: threads?.reasoning ?? null, threadsInProject: !!threads?.inProject }),
       chooseFolder: (start = null) => invoke('choose_folder', { start }),
+      homeDir: () => invoke('home_dir'),
       branch: (dir) => invoke('branch', { dir }),
       readFile: (path) => invoke('read_file', { path }),
+      listFiles: (dir) => invoke('list_files', { dir }),
+      gitView: (dir) => invoke('git_view', { dir }),
+      memoryView: (project) => invoke('memory_view', { project: project ?? null }),
+      gitDiff: ({ root, path = null, from = null, untracked = false, commit = null }) => invoke('git_diff', { root, path, from, untracked, commit }),
       attach: (after) => invoke('attach', { after }),
       replaceDaemon: () => invoke('replace_daemon'),
       pull: (session) => invoke('pull', { session }),
@@ -35,6 +40,8 @@ window.Daemon = (() => {
       triggers: (after = null) => invoke('triggers', { after }),
       fireTrigger: (name) => invoke('trigger_fire', { name }),
       removeTrigger: (name) => invoke('trigger_remove', { name }),
+      plans: (ids) => invoke('plans', { ids }),
+      forgetPlan: (id) => invoke('plan_forget', { id }),
       hosts: () => invoke('hosts'),
       openHost: (host) => invoke('open_host', { host }),
       swarmStart: ({ project, folder, goal, shared, mix, agents, budgetTokens }) => invoke('swarm_run', { args: ['start', '--project', project, '--folder', folder, '--agents', String(agents), '--budget', String(budgetTokens / 1e6), ...(shared ? [] : ['--in-project']), ...mix.flatMap((r) => ['--row', [r.model, r.share, r.identity ?? '', r.effort ?? ''].join(',')]), '--', goal] }),
@@ -67,7 +74,7 @@ window.Daemon = (() => {
   // A prompt another bot wrote names it with its item, as the daemon's `history_items` does.
   // Who sent a prompt, as the daemon keeps it with the node: another bot's turn, with the identity
   // its name held then, or what the client named as its origin.
-  const senderOf = (by) => by?.origin ? { origin: by.origin } : by ? { from: { bot: by.bot, turn: by.turn, id: S.bots.get(by.bot)?.id ?? null } } : {};
+  const senderOf = (by) => by?.origin ? { origin: by.origin } : by ? { from: { bot: by.bot, turn: by.turn, bot_id: S.bots.get(by.bot)?.bot_id ?? null } } : {};
   const authorOf = (event) => ({ ...(event.data.from ? { from: event.data.from } : {}), ...(event.data.origin ? { origin: event.data.origin } : {}) });
   const emit = (event) => { if (event.data?.node != null) { if (!S.lineages.has(event.bot)) S.lineages.set(event.bot, []); S.lineages.get(event.bot).push({node:event.data.node,turn:event.turn ?? null,...authorOf(event)}); } if (event.durable !== false) event.cursor = ++S.cursor; S.queue.push(event); if (S.waiter) { const w = S.waiter; S.waiter = null; w(); } };
   const node = (item) => { const id = S.nextNode++; S.nodes.set(id, item); return id; };
@@ -77,7 +84,7 @@ window.Daemon = (() => {
   async function create(name, model, createdBy = null, source = null, workspace = null, allowed = null, reasoning = null) {
     if (S.bots.has(name)) throw new Error('bot_exists');
     // Lineage is pinned to the creator's identity, and the event carries the record's list fields, as the daemon's does.
-    const b = { ...record(name, model, source ? S.bots.get(source)?.effort ?? null : reasoning), ...(workspace ? { workspace } : {}), id: S.nextId++, created_by: createdBy, created_by_id: createdBy ? S.bots.get(createdBy)?.id ?? null : null, turns: 0, interrupted: false, ...(allowed ? { allowed } : {}) };
+    const b = { ...record(name, model, source ? S.bots.get(source)?.effort ?? null : reasoning), ...(workspace ? { workspace } : {}), bot_id: S.nextId++, created_by: createdBy, created_by_id: createdBy ? S.bots.get(createdBy)?.bot_id ?? null : null, turns: 0, interrupted: false, ...(allowed ? { allowed } : {}) };
     S.bots.set(name, b);
     // A fork shares its source's history up to its newest finished round. The demo keeps no call
     // nodes, only their results, so that is its newest node that is not a tool result.
@@ -87,7 +94,7 @@ window.Daemon = (() => {
       S.lineages.set(name, all.slice(0, end));
     }
     const checkpoint = source ? S.lineages.get(source)?.at(-1)?.node ?? null : undefined;
-    emit({ event: source ? 'forked' : 'created', bot: name, turn: null, data: { id: b.id, provider: b.provider, model: b.model, effort: b.effort, workspace: b.workspace, status: 'idle', running_turn: null, created_by: createdBy, created_by_id: b.created_by_id, ...(allowed ? { allowed } : {}), ...(source ? { source, checkpoint } : {}) } });
+    emit({ event: source ? 'forked' : 'created', bot: name, turn: null, data: { bot_id: b.bot_id, provider: b.provider, model: b.model, effort: b.effort, workspace: b.workspace, status: 'idle', running_turn: null, created_by: createdBy, created_by_id: b.created_by_id, ...(allowed ? { allowed } : {}), ...(source ? { source, checkpoint } : {}) } });
     return b;
   }
   // Scripted work outlives a stop; a bot deleted meanwhile reads as interrupted, so it ends quietly.
@@ -165,6 +172,7 @@ window.Daemon = (() => {
     const turn = start(name, prompt, from);
     if (turn === null) return;
     await wait(250);
+    if (name === 'home') { await home(name, turn, prompt); return; }
     if (/scenario|ship|split/i.test(prompt)) { await scenario(name, turn); return; }
     // The app telling a coordinator its tasks moved: it reads one, and passes on what another needs.
     if (prompt.startsWith('Task updates: ')) {
@@ -214,6 +222,27 @@ window.Daemon = (() => {
     'src/auth/session.rs': ['use crate::store::{Store, SessionId};', '', '/// Rotates the token and writes the cookie once, after the store commits.', 'pub fn refresh_session(store: &Store, id: SessionId) -> Result<Cookie> {', '    let token = rotate(store, id)?; // pure: no cookie here', '    store.commit()?;', '    Ok(Cookie::new("session", token).http_only(true).secure(true))', '}', '', 'fn rotate(store: &Store, id: SessionId) -> Result<Token> {', '    let token = Token::random();', '    store.put_session(id, &token)?;', '    Ok(token)', '}', ''].join('\n'),
     'src/server/mod.rs': ['//! Dispatch: each op to its store call.', '', 'pub async fn dispatch(op: Op, store: &Store) -> Reply {', '    match op {', '        Op::Wait(handles) => registry().defer(handles).await,', '        op => store.call(op).await,', '    }', '}', ''].join('\n'),
     'report/latency.vl.json': JSON.stringify({ title: 'Refresh latency, p50 and p99 (ms)', data: { values: [['before', 'p50', 41], ['before', 'p99', 188], ['after', 'p50', 23], ['after', 'p99', 61]].map(([build, q, ms]) => ({ build, q, ms })) }, mark: 'bar', encoding: { x: { field: 'q', type: 'nominal', title: null, axis: { labelAngle: 0 } }, xOffset: { field: 'build', sort: ['before', 'after'] }, y: { field: 'ms', type: 'quantitative', title: 'ms' }, color: { field: 'build', type: 'nominal', sort: ['before', 'after'], title: null } } }, null, 2),
+  };
+  // Memory, as the memory skill keeps it: one fact a file, newest first in the sheet.
+  const MEMORY_ROOT = '/Users/you/.agents/memory', DAY = 86400000;
+  const MEMORY = {
+    '': [
+      { name: 'short-replies', type: 'feedback', description: 'Lead with the answer; one line when one line will do', source: 'the person, 2026-09-28', verified: '2026-10-08', modified: Date.now() - 2 * DAY },
+      { name: 'paid-runs', type: 'feedback', description: 'Ask before any run that spends money on a provider', source: 'the person, 2026-09-26', verified: '2026-10-01', modified: Date.now() - 9 * DAY },
+    ],
+    demo: [
+      { name: 'worktrees', type: 'project', description: 'Tasks that edit work in ~/.agent/worktrees, one per task', source: 'app/agents/coordinator.md', verified: '2026-10-09', modified: Date.now() - DAY },
+    ],
+    notes: [
+      { name: 'theme', type: 'feedback', description: 'Follow the system theme; no toggle', source: 'the person, 2026-10-02', verified: '2026-10-02', modified: Date.now() - 6 * DAY },
+    ],
+  };
+  const memoryFact = (path) => {
+    for (const [scope, facts] of Object.entries(MEMORY)) for (const f of facts) {
+      if (path !== `${MEMORY_ROOT}${scope ? `/projects/${scope}` : ''}/${f.name}.md`) continue;
+      return { text: `---\nname: ${f.name}\ndescription: ${f.description}\ntype: ${f.type}\nsource: ${f.source}\nverified: ${f.verified}\n---\n\n${f.body ?? f.description + '.'}\n` };
+    }
+    return null;
   };
   // A reply that uses everything the page draws: Markdown, code, a diagram and a page preview.
   const RICH = [
@@ -275,12 +304,46 @@ window.Daemon = (() => {
     await stream(name, turn, 'All of it landed. Plan matches the diff, tests are green with one harmless warning, release build finished. Ready for review: two files, 41 lines.');
     finish(name, turn);
   }
+  // Home reads the fleet with `agent ls`, answers what it can, and hands a project's work to its lead.
+  async function home(name, turn, prompt) {
+    const others = [...S.bots.values()].filter((b) => b.name !== name);
+    const ls = others.map((b) => JSON.stringify({ bot: b.name, status: b.status, workspace: b.workspace })).join('\n') + '\n';
+    await tool(name, turn, 'shell', { command: '"$AGENT_BIN" ls' }, JSON.stringify({ exit_code: 0, stderr: '', stdout: ls, success: true }), 400);
+    if ((S.bots.get(name) ?? GONE).interrupted) return;
+    const lead = others.find((b) => b.name.endsWith('.lead') && prompt.toLowerCase().includes(b.name.slice(0, -5)));
+    if (lead) {
+      const brief = prompt.replace(/'/g, '');
+      await tool(name, turn, 'shell', { command: `"$AGENT_BIN" run --detach --delivery queue --bot ${lead.name} -- '${brief}'` }, JSON.stringify({ exit_code: 0, stderr: '', stdout: JSON.stringify({ bot: lead.name, status: 'queued' }) + '\n', success: true }), 400);
+      setTimeout(() => reply(lead.name, brief, { bot: name, turn }), 300);
+      await stream(name, turn, `Sent to ${lead.name.slice(0, -5)}'s lead; it reports back in its own chat.`);
+    } else {
+      const working = others.filter((b) => b.status !== 'idle').map((b) => b.name);
+      await stream(name, turn, `Needs you: nothing right now.\n\n${working.length ? `Working: ${working.join(', ')}.` : 'Nothing is running.'} notes answered its open questions: where worktrees live, and who runs the setup command.`);
+    }
+    if (!(S.bots.get(name) ?? GONE).interrupted) finish(name, turn);
+  }
+  // A task keeps its plan with the plan skill's script; the page reads it back by bot id.
+  async function plan(name, turn, ...steps) {
+    const b = S.bots.get(name); if (!b || b.interrupted) return;
+    const text = steps.join('\n') + '\n';
+    (S.plans ??= new Map()).set(b.bot_id, text);
+    await tool(name, turn, 'shell', { command: `sh "$HOME/.agents/skills/plan/plan" ${steps.map((x) => `'${x}'`).join(' ')}` }, JSON.stringify({ exit_code: 0, stderr: "", stdout: `plan saved: ${steps.length} steps\n`, success: true }), 200);
+  }
   async function work(n, turn, text) {
     await wait(300);
-    if (n === 'demo.plan') { await tool(n, turn, 'read', { path: 'src/auth/' }, 'session.rs refresh.rs cookie.rs · 612 lines', 500); await tool(n, turn, 'write', { path: 'PLAN.md' }, '1.2 KiB', 600); }
+    if (n === 'demo.plan') {
+      await tool(n, turn, 'read', { path: 'src/auth/' }, 'session.rs refresh.rs cookie.rs · 612 lines', 500); await tool(n, turn, 'write', { path: 'PLAN.md' }, '1.2 KiB', 600);
+      // A finding the next task would otherwise rediscover goes to the project's memory.
+      const fact = { name: 'session-cookie', type: 'project', description: 'The session cookie is written in refresh_session only, after the store commits', source: `turn:${n}/${turn}`, verified: '2026-10-10', modified: Date.now(), body: 'The session cookie is written in one place, refresh_session in src/auth/session.rs, after store.commit().\n\n**Why:** writing it before the commit left a cookie for a session the store never kept.' };
+      MEMORY.demo = [...MEMORY.demo.filter((f) => f.name !== fact.name), fact];
+      await tool(n, turn, 'shell', { command: `"$HOME/.agent/memory" save session-cookie --type project --description '${fact.description}' --source ${fact.source} -- -` }, JSON.stringify({ exit_code: 0, stderr: '', stdout: JSON.stringify({ saved: 'session-cookie', replaced: false, duplicate: false, facts: MEMORY.demo.length }) + '\n', success: true }), 400);
+    }
     if (n === 'demo.build') {
+      await plan(n, turn, '[>] Make rotate() pure', '[ ] Write the cookie once, after the commit', '[ ] Check that it builds', '[ ] Get a review');
       await tool(n, turn, 'edit', { path: 'src/auth/session.rs' }, '+23 −8', 900);
+      await plan(n, turn, '[x] Make rotate() pure', '[x] Write the cookie once, after the commit', '[>] Check that it builds', '[ ] Get a review');
       await tool(n, turn, 'shell', { command: 'cargo check -p auth' }, JSON.stringify({ exit_code: 0, stderr: '', stdout: 'Finished dev profile in 2.1s\n', success: true }), 1100);
+      await plan(n, turn, '[x] Make rotate() pure', '[x] Write the cookie once, after the commit', '[x] Check that it builds', '[>] Get a review');
       // build asks a peer of its own to review, and waits on it: depth two.
       if ((S.bots.get(n) ?? GONE).interrupted) return;
       const cmd = `"$AGENT_BIN" run --new --bot demo.review --model "$AGENT_MODEL" --detach 'Review the auth diff for regressions.'`;
@@ -303,6 +366,7 @@ window.Daemon = (() => {
       emit({ event: 'turn_resumed', bot: n, turn, data: { call_id: wid } });
       emit({ event: 'tool_completed', bot: n, turn, data: { call_id: wid, node: node({ type: 'function_call_output', call_id: wid, output: JSON.stringify({ pending: [], results: { [`turn:demo.review/${rt}`]: { status: 'completed', text: 'Diff is sound.' } } }) }), artifacts: [] } });
       await steerIn(n, turn);
+      await plan(n, turn, '[x] Make rotate() pure', '[x] Write the cookie once, after the commit', '[x] Check that it builds', '[x] Get a review');
     }
     if (n === 'demo.test') { await tool(n, turn, 'shell', { command: 'cargo test -p auth' }, JSON.stringify({ exit_code: 0, stderr: '', stdout: 'test result: ok. 34 passed; 0 failed\n', success: true }), 1600); }
     await stream(n, turn, text, 50);
@@ -319,7 +383,7 @@ window.Daemon = (() => {
     const bots = [];
     for (const [name, row] of rows) {
       const b = await api.request('create', { bot: name, model: sw.mix[row].model, effort: sw.mix[row].effort ?? null, workspace: sw.workspace, budget_tokens: each });
-      sw.members.push(name); sw.ids[name] = b.id; sw.rows[name] = row; bots.push(b);
+      sw.members.push(name); sw.ids[name] = b.bot_id; sw.rows[name] = row; bots.push(b);
       sw.made = Math.max(sw.made ?? 0, Number(name.split('-').pop()) || 0);
     }
     for (const [name] of rows) reply(name, `You are ${short(sw, name)}, one of ${sw.members.length} agents in the swarm ${short(sw, sw.name)}.${late ? ' You joined after the others started, so read the board first.' : ''}`);
@@ -403,17 +467,53 @@ window.Daemon = (() => {
     project: async (dir) => { const name = String(dir).split('/').filter(Boolean).pop()?.replace(/[^A-Za-z0-9_-]+/g, '-') || 'project'; return { dir, name, coordinator: `${name}.lead`, model: null, file: false }; },
     writeProject: async () => {},
     chooseFolder: async () => '/Users/you/Developer/weather',
+    homeDir: async () => '/Users/you',
     // A coordinator puts a task that edits in `~/.agent/worktrees/NAME` on branch agent/NAME.
     // The demo's files, by their path under any agent's folder.
     readFile: async (path) => {
+      const fact = memoryFact(path); if (fact) return new TextEncoder().encode(fact.text).buffer;
       const hit = Object.keys(FILES).find((k) => path === k || path.endsWith(`/${k}`));
       if (hit == null) throw new Error(path.endsWith('/') ? `${path}: is a folder` : `${path}: no such file`);
       return new TextEncoder().encode(FILES[hit]).buffer;
     },
+    // The demo's repository is its files, under whichever folder asks.
+    listFiles: async (dir) => ({ root: dir, files: Object.keys(FILES).sort(), more: false }),
     branch: async (dir) => { const m = /\/worktrees\/([^/]+)$/.exec(dir ?? ''); return m ? `agent/${m[1]}` : null; },
+    // The demo's memory: yours, and the demo project's, which a task adds to as it works.
+    memoryView: async (project) => {
+      const scope = (name) => { const d = name ? `${MEMORY_ROOT}/projects/${name}` : MEMORY_ROOT; return { name, dir: d, facts: (MEMORY[name ?? ''] ?? []).map((f) => ({ ...f, path: `${d}/${f.name}.md` })) }; };
+      return { user: scope(null), projects: project == null ? ['demo', 'notes'].map(scope) : [scope(project)], more: 0 };
+    },
+    // The demo's repository: the project folder on main and each task's worktree on its branch, with
+    // the changes a task that edits leaves before it commits.
+    gitView: async (dir) => {
+      const m = /\/worktrees\/([^/]+)$/.exec(dir ?? ''), trees = [...S.bots.values()].map((b) => b.workspace).filter((w) => /\/worktrees\//.test(w ?? ''));
+      return {
+        root: dir, branch: m ? `agent/${m[1]}` : 'main...origin/main',
+        changes: m ? [{ code: ' M', path: 'src/auth/session.rs', from: null }, { code: 'M ', path: 'src/server/mod.rs', from: null }, { code: '??', path: 'report/latency.vl.json', from: null }] : [],
+        more: false,
+        commits: [
+          ...(m ? [{ sha: 'c41d9e2f7a0b3c5d6e7f8091a2b3c4d5e6f70812', subject: 'Write the session cookie once, after the store commits', author: m[1], when: '4 minutes ago' }] : []),
+          { sha: '8a1f03b6c2d4e5f60718293a4b5c6d7e8f901234', subject: 'Plan the login fix', author: 'you', when: '2 hours ago' },
+          { sha: '3e9b77d0a1b2c3d4e5f60718293a4b5c6d7e8f90', subject: 'Add the session store', author: 'you', when: '3 days ago' },
+        ],
+        worktrees: [{ path: '/workspace', branch: 'main' }, ...[...new Set(trees)].map((w) => ({ path: w, branch: `agent/${w.split('/').pop()}` }))],
+      };
+    },
+    gitDiff: async ({ path, commit }) => {
+      await wait(60);
+      const session = ['@@ -1,8 +1,9 @@', ' use crate::store::{Store, SessionId};', ' ', '-/// Rotates the token and reissues the cookie.', '+/// Rotates the token and writes the cookie once, after the store commits.', ' pub fn refresh_session(store: &Store, id: SessionId) -> Result<Cookie> {', '-    let token = rotate_and_set_cookie(store, id)?;', '+    let token = rotate(store, id)?; // pure: no cookie here', '+    store.commit()?;', '     Ok(Cookie::new("session", token).http_only(true).secure(true))', ' }', ' '];
+      const server = ['@@ -3,6 +3,7 @@', ' pub async fn dispatch(op: Op, store: &Store) -> Reply {', '     match op {', '         Op::Wait(handles) => registry().defer(handles).await,', '+        Op::Refresh(id) => refresh_session(store, id).into(),', '         op => store.call(op).await,', '     }', ' }'];
+      const file = (p, hunk, mode = '') => [`diff --git a/${p} b/${p}`, ...(mode ? [mode] : []), 'index 1111111..2222222 100644', mode ? '--- /dev/null' : `--- a/${p}`, `+++ b/${p}`, ...hunk];
+      if (commit) return { text: [...file('src/auth/session.rs', session), ...file('src/server/mod.rs', server)].join('\n') + '\n', cut: false };
+      if (path === 'src/server/mod.rs') return { text: file(path, server).join('\n') + '\n', cut: false };
+      if (path === 'src/auth/session.rs') return { text: file(path, session).join('\n') + '\n', cut: false };
+      const lines = (FILES[path] ?? '').replace(/\n$/, '').split('\n');
+      return { text: file(path, [`@@ -0,0 +1,${lines.length} @@`, ...lines.map((l) => `+${l}`)], 'new file mode 100644').join('\n') + '\n', cut: false };
+    },
     swarms: async () => ({ swarms: [...S.swarms.values()].map(swarmRecord), broken: [] }),
     // The demo has no editor to open: Edit only says your copy is now the one read.
-    roles: async () => ['coordinator'].map(name => ({ name, file: S.ownRoles?.has(name) ? `/home/you/.agents/agents/${name}.md` : null })),
+    roles: async () => ['coordinator', 'home'].map(name => ({ name, file: S.ownRoles?.has(name) ? `/home/you/.agents/agents/${name}.md` : null })),
     editRole: async (name) => { (S.ownRoles ??= new Set()).add(name); return `/home/you/.agents/agents/${name}.md`; },
     // Triggers a coordinator made: a task that checks its PR, a reviewer started at the next commit
     // whose answer goes to the lead, a one-off for itself, and one whose agent was deleted before its time came.
@@ -425,6 +525,8 @@ window.Daemon = (() => {
     ]).map((x) => ({ ...x })), next_after: null }),
     fireTrigger: async (name) => { const x = (S.triggers ?? []).find((t) => t.name === name); if (x) { x.last = { outcome: 'sent', turn: 1, fired_ms: Date.now() }; x.sent = (x.sent ?? 0) + 1; } return { name, fired: true }; },
     removeTrigger: async (name) => { S.triggers = (S.triggers ?? []).filter((x) => x.name !== name); },
+    plans: async (ids) => Object.fromEntries(ids.filter((id) => S.plans?.has(id)).map((id) => [id, S.plans.get(id)])),
+    forgetPlan: async (id) => { S.plans?.delete(id); },
     profiles: async () => [{ name: 'reviewer', summary: 'Reviews changes and reports bugs only', model: 'anthropic/claude-sonnet-5' }, { name: 'tester', summary: 'Keeps the test suite green', model: null }],
     // Named from the goal's longest word and dealt as the swarm's script does it.
     swarmStart: async ({ project, folder, goal, shared, mix, agents, budgetTokens }) => {
