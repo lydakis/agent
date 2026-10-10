@@ -1445,7 +1445,8 @@ const planCount = (plan) => `${plan.done}/${plan.steps.length}`;
 // them; it logs why once and stops asking.
 let planReads = Promise.resolve();
 // No ids reads every seated agent's, and those replace what was shown. A plan named for no agent
-// here, such as one deleted from another window, is never read.
+// here, such as one deleted from another window, is never read; the app's side lists the plans
+// folder for a long list, so the cost follows the plans that exist.
 function loadPlans(ids = null) { return (planReads = planReads.then(() => readPlans(ids))); }
 async function readPlans(ids) {
   if (S.config?.host || S.plansOff || !Daemon.plans) return;
@@ -1457,8 +1458,9 @@ async function readPlans(ids) {
     Daemon.log?.(`plans: ${why}`); return;
   }
   if (S.session !== session) return;
+  // An agent asked about and left out has no plan.
   if (all) S.plans.clear();
-  for (const [id, text] of Object.entries(got ?? {})) { const plan = parsePlan(text); if (plan) S.plans.set(Number(id), plan); else S.plans.delete(Number(id)); }
+  for (const id of ids) { const plan = parsePlan(got?.[id] ?? ''); if (plan) S.plans.set(id, plan); else S.plans.delete(id); }
   S.plansGen += 1;
   // What shows a plan: the list's rows, task cards, and the plan above a chat.
   if (S.attached) { rail.key = ''; render(); refreshLive($('log')); if (S.ui.side && !S.ui.file) refreshLive($('side')); }

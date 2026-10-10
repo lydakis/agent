@@ -472,7 +472,7 @@ window.Daemon = (() => {
     ]).map((x) => ({ ...x })), next_after: null }),
     fireTrigger: async (name) => { const x = (S.triggers ?? []).find((t) => t.name === name); if (x) { x.last = { outcome: 'sent', turn: 1, fired_ms: Date.now() }; x.sent = (x.sent ?? 0) + 1; } return { name, fired: true }; },
     removeTrigger: async (name) => { S.triggers = (S.triggers ?? []).filter((x) => x.name !== name); },
-    plans: async (ids) => Object.fromEntries(ids.map((id) => [id, S.plans?.get(id) ?? null])),
+    plans: async (ids) => Object.fromEntries(ids.filter((id) => S.plans?.has(id)).map((id) => [id, S.plans.get(id)])),
     forgetPlan: async (id) => { S.plans?.delete(id); },
     profiles: async () => [{ name: 'reviewer', summary: 'Reviews changes and reports bugs only', model: 'anthropic/claude-sonnet-5' }, { name: 'tester', summary: 'Keeps the test suite green', model: null }],
     // Named from the goal's longest word and dealt as the app's side does it.
