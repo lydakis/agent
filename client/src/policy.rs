@@ -4,12 +4,12 @@
 //! reads the same way.
 //!
 //! Layers, in this order: the harness preamble (how to delegate and collect
-//! results through this runtime), every AGENTS.md from the workspace up to
-//! the filesystem root plus the user's global one, an index of skills the bot
-//! can open with its `read` tool and of profiles it can start peers in, and
-//! the bot's own role when it is started in one. The text is
-//! a stable prefix on purpose: it rides the provider's prompt cache after
-//! the first turn, so it changes only when a file changes.
+//! results through this runtime), every AGENTS.md and `.agents/AGENTS.md`
+//! from the workspace up to the filesystem root plus the user's global one,
+//! an index of skills the bot can open with its `read` tool and of profiles
+//! it can start peers in, and the bot's own role when it is started in one.
+//! The text is a stable prefix on purpose: it rides the provider's prompt
+//! cache after the first turn, so it changes only when a file changes.
 use std::path::{Path, PathBuf};
 
 /// The daemon refuses instructions above 64 KiB; stay under it with room
@@ -145,24 +145,35 @@ const MAX_ENTRIES: usize = 4096;
 
 /// AGENTS.md files that apply to `workspace`: the global one first, then
 /// from the filesystem root down to the workspace, so the nearest file is
-/// read last and wins where they disagree.
+/// read last and wins where they disagree. Each folder contributes its
+/// `AGENTS.md` and then its `.agents/AGENTS.md`. A file reached twice, such
+/// as the home folder's `.agents/AGENTS.md` (the global one) or a link to
+/// its folder's `AGENTS.md`, is read once, at its first place.
 pub fn agents_files(workspace: &Path) -> Result<Vec<PathBuf>, Failure> {
-    let mut files = Vec::new();
-    if let Some(global) = home().map(|h| h.join(".agents").join("AGENTS.md"))
-        && is_file(&global)?
-    {
-        files.push(global);
-    }
-    let start = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    agents_files_from(workspace, home().as_deref())
+}
+
+fn agents_files_from(workspace: &Path, home: Option<&Path>) -> Result<Vec<PathBuf>, Failure> {
     let mut chain = Vec::new();
-    for file in start.ancestors().map(|dir| dir.join("AGENTS.md")) {
-        if is_file(&file)? {
-            chain.push(file);
-        }
+    let start = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    for dir in start.ancestors() {
+        // Read in reverse: the global file, then from the root down, each
+        // folder's `AGENTS.md` before its `.agents/AGENTS.md`.
+        chain.push(dir.join(".agents").join("AGENTS.md"));
+        chain.push(dir.join("AGENTS.md"));
     }
-    chain.reverse();
-    for file in chain {
-        if !files.contains(&file) {
+    if let Some(home) = home {
+        chain.push(home.join(".agents").join("AGENTS.md"));
+    }
+    let mut files = Vec::new();
+    let mut seen = Vec::new();
+    for file in chain.into_iter().rev() {
+        if !is_file(&file)? {
+            continue;
+        }
+        let real = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
+        if !seen.contains(&real) {
+            seen.push(real);
             files.push(file);
         }
     }
@@ -298,6 +309,21 @@ pub struct Entry {
 }
 pub type Skill = Entry;
 
+/// Roles a client starts its own bots in: the app's coordinator and its
+/// swarms' members. A `.agents/agents` file of one of these names replaces
+/// the client's text for that role, so it is not a role to start a peer in,
+/// and the Profiles index leaves it out.
+pub const CLIENT_ROLES: [&str; 3] = ["coordinator", "swarm-flat", "swarm-council"];
+
+/// Whether a profile file's stem is a client role. Case is ignored: on a
+/// case-insensitive filesystem (macOS's default) `Coordinator.md` is the
+/// file `profile(_, "coordinator")` reads.
+fn client_role(stem: &str) -> bool {
+    CLIENT_ROLES
+        .iter()
+        .any(|role| role.eq_ignore_ascii_case(stem))
+}
+
 /// Skills are folders `<name>/SKILL.md` in `<workspace>/.agents/skills`, then
 /// `~/.agents/skills`, the layout agentskills.io describes. Profiles are
 /// `<name>.md` files in `.agents/agents` in the same two places. The
@@ -325,14 +351,14 @@ impl Kind {
         }
     }
     /// The name an entry of this directory would index under. Only a name
-    /// --profile accepts is offered as a role.
+    /// --profile accepts is offered as a role, and never a client's own.
     fn name(self, path: &Path) -> Option<String> {
         let name = path.file_name()?.to_str()?;
         match self {
             Kind::Skills => Some(name.to_owned()),
             Kind::Profiles => name
                 .strip_suffix(".md")
-                .filter(|stem| profile_name(stem))
+                .filter(|stem| profile_name(stem) && !client_role(stem))
                 .map(str::to_owned),
         }
     }
@@ -704,6 +730,63 @@ mod tests {
     }
 
     #[test]
+    fn each_folder_adds_its_agents_folder_file_after_its_own() {
+        let root = temp("dot-agents");
+        let deep = root.join("repo").join("crate");
+        std::fs::create_dir_all(deep.join(".agents")).unwrap();
+        std::fs::create_dir_all(root.join(".agents")).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "outer rule").unwrap();
+        std::fs::write(root.join(".agents/AGENTS.md"), "outer agents rule").unwrap();
+        std::fs::write(deep.join("AGENTS.md"), "inner rule").unwrap();
+        std::fs::write(deep.join(".agents/AGENTS.md"), "inner agents rule").unwrap();
+        // A `.agents` that is a file holds no AGENTS.md.
+        std::fs::write(root.join("repo/.agents"), "not a folder").unwrap();
+        let files = agents_files_from(&deep, None).unwrap();
+        assert_eq!(
+            files.iter().rev().take(4).rev().collect::<Vec<_>>(),
+            vec![
+                &root.join("AGENTS.md"),
+                &root.join(".agents/AGENTS.md"),
+                &deep.join("AGENTS.md"),
+                &deep.join(".agents/AGENTS.md"),
+            ]
+        );
+        // The home folder's `.agents/AGENTS.md` is the global file: read
+        // first, and not again as an ancestor's.
+        let files = agents_files_from(&deep, Some(&root)).unwrap();
+        assert_eq!(files[0], root.join(".agents/AGENTS.md"));
+        assert_eq!(
+            files
+                .iter()
+                .filter(|f| **f == root.join(".agents/AGENTS.md"))
+                .count(),
+            1
+        );
+        assert_eq!(files.last(), Some(&deep.join(".agents/AGENTS.md")));
+        let composed = instructions(&deep, None).unwrap();
+        let order = [
+            "outer rule",
+            "outer agents rule",
+            "inner rule",
+            "inner agents rule",
+        ]
+        .map(|rule| composed.text.find(&format!("\n\n{rule}")).unwrap());
+        assert!(order.is_sorted(), "{order:?}");
+        // A `.agents/AGENTS.md` that links to its folder's file is read once.
+        let linked = root.join("linked");
+        std::fs::create_dir_all(linked.join(".agents")).unwrap();
+        std::fs::write(linked.join("AGENTS.md"), "linked rule").unwrap();
+        std::os::unix::fs::symlink("../AGENTS.md", linked.join(".agents/AGENTS.md")).unwrap();
+        let files = agents_files_from(&linked, None).unwrap();
+        assert_eq!(files.last(), Some(&linked.join("AGENTS.md")));
+        assert!(
+            !files.contains(&linked.join(".agents/AGENTS.md")),
+            "{files:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn oversized_files_fail_instead_of_being_cut() {
         let root = temp("big");
         std::fs::write(root.join("AGENTS.md"), "x".repeat(MAX_INSTRUCTIONS)).unwrap();
@@ -807,6 +890,33 @@ mod tests {
         assert_eq!(composed.sources, Vec::new());
         assert!(composed.skills.is_empty() || composed.text.contains("# Skills"));
         assert!(composed.text.starts_with(PREAMBLE));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_clients_own_roles_are_read_but_not_offered_as_peer_roles() {
+        let root = temp("client-roles");
+        std::fs::create_dir_all(root.join(".agents/agents")).unwrap();
+        for name in ["coordinator", "swarm-flat", "Swarm-Council", "reviewer"] {
+            std::fs::write(
+                root.join(".agents/agents").join(format!("{name}.md")),
+                format!("---\ndescription: the {name}\n---\nBe the {name}.\n"),
+            )
+            .unwrap();
+        }
+        let composed = instructions(&root, None).unwrap();
+        let listed: Vec<&str> = composed.profiles.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(listed, ["reviewer"]);
+        assert!(!composed.text.contains("- coordinator:"));
+        // The file still replaces the client's text when it starts a bot in that role.
+        let role = profile(&root, "coordinator").unwrap().unwrap();
+        assert_eq!(role.body, "Be the coordinator.");
+        let composed = instructions(&root, Some(&role)).unwrap();
+        assert!(
+            composed
+                .text
+                .ends_with("# Role: coordinator\n\nBe the coordinator.")
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
