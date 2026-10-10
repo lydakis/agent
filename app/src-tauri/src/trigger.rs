@@ -1812,7 +1812,9 @@ fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
         return Err(bad("one of --bot or --start".into()));
     }
     let runs = take("--runs")
-        .map(|n| n.parse::<u64>().ok().filter(|n| *n > 0))
+        // A count the fire's own arguments read back: past i64 every fire
+        // would fail to start.
+        .map(|n| n.parse::<i64>().ok().filter(|n| *n > 0).map(|n| n as u64))
         .map(|n| n.ok_or_else(|| bad("--runs takes a count of at least 1".into())))
         .transpose()?;
     if message.trim().is_empty() {
@@ -2224,9 +2226,10 @@ fn stamp(epoch: i64) -> String {
     )
 }
 
-/// `sh -c CMD` in the trigger's folder, given `GATE_TIMEOUT`; why not,
-/// when it says no.
-fn gate(command: &str, dir: Option<&Path>) -> Result<(), String> {
+/// `sh -c CMD` in the trigger's folder, given `GATE_TIMEOUT`: whether it
+/// said go, and why not when it said no; why it said nothing when it could
+/// not run or ran past its time, which is the fire failing, not a no.
+fn gate(command: &str, dir: Option<&Path>) -> Result<Result<(), String>, String> {
     let mut sh = std::process::Command::new("/bin/sh");
     sh.args(["-c", command])
         .stdin(std::process::Stdio::null())
@@ -2249,8 +2252,8 @@ fn gate(command: &str, dir: Option<&Path>) -> Result<(), String> {
     let said = loop {
         match child.try_wait() {
             Err(e) => break Err(format!("--if: {e}")),
-            Ok(Some(status)) if status.success() => break Ok(()),
-            Ok(Some(status)) => break Err(format!("--if: {status}")),
+            Ok(Some(status)) if status.success() => break Ok(Ok(())),
+            Ok(Some(status)) => break Ok(Err(format!("--if: {status}"))),
             Ok(None) if std::time::Instant::now() > until => {
                 end_group();
                 let _ = child.wait();
@@ -2299,9 +2302,37 @@ async fn start(client: &Client, trigger: &Trigger, adopt: bool) -> Result<i64, S
             .ok_or_else(|| "create: no bot id".into()),
         // A fire cut short after the daemon made it, before it heard so:
         // the name was free at `add`, and this trigger began to take it.
-        Err(error) if error.code == "bot_exists" && adopt => bot_id(client, name).await,
+        // Only an agent made as this one is, that has run nothing, is it;
+        // anyone else's under the name is refused.
+        Err(error) if error.code == "bot_exists" && adopt => {
+            let there = client
+                .request("resume", json!({"bot": name}))
+                .await
+                .map_err(coded)?;
+            match made_here(
+                &there,
+                &policy["instructions"],
+                by.as_ref().map(|(_, id)| *id),
+            ) {
+                true => there["id"]
+                    .as_i64()
+                    .ok_or_else(|| "resume: no bot id".into()),
+                false => Err(coded(error)),
+            }
+        }
         Err(error) => Err(coded(error)),
     }
+}
+
+/// Whether an agent is the one a `--start` fire made before it was cut
+/// short: its instructions and maker are the trigger's, and it has run no
+/// turn.
+fn made_here(there: &Value, instructions: &Value, by: Option<i64>) -> bool {
+    // The daemon keeps none as "".
+    there["instructions"].as_str() == Some(instructions.as_str().unwrap_or(""))
+        && there["created_by_id"].as_i64() == by
+        && there["tokens_used"] == 0
+        && there["running_turn"].is_null()
 }
 
 /// Send the fire's message: a new turn when the agent is resting; a working
@@ -2565,15 +2596,25 @@ fn fire(places: &Places, trigger: &Trigger, asked: bool) {
         }
     }
     // A gate that says no costs this process and nothing else; a one-off
-    // had its one time, and ends saying so.
-    if let Some(command) = &trigger.gate
-        && let Err(no) = gate(command, trigger.dir.as_deref())
+    // had its one time, and ends saying so. One that could not say is a
+    // failed fire, shown as one.
+    match trigger
+        .gate
+        .as_deref()
+        .map(|c| gate(c, trigger.dir.as_deref()))
     {
-        if trigger.at.is_some() {
-            let declined = json!({"outcome": "declined", "detail": no});
-            settle(places, trigger, &declined, &kept, &launchctl);
+        None | Some(Ok(Ok(()))) => {}
+        Some(Ok(Err(no))) => {
+            if trigger.at.is_some() {
+                let declined = json!({"outcome": "declined", "detail": no});
+                settle(places, trigger, &declined, &kept, &launchctl);
+            }
+            return;
         }
-        return;
+        Some(Err(broken)) => {
+            let failed = json!({"outcome": "failed", "detail": broken});
+            return settle(places, trigger, &failed, &kept, &launchctl);
+        }
     }
     let outcome = with_daemon(trigger, async |client| {
         deliver(client, places, trigger, &mut kept, &why, asked).await
@@ -3507,13 +3548,35 @@ mod tests {
     }
 
     #[test]
+    fn a_cut_short_start_takes_back_only_the_agent_it_made() {
+        let made = json!({"id": 7, "instructions": "be brief", "created_by_id": 3,
+            "tokens_used": 0, "running_turn": null});
+        assert!(made_here(&made, &json!("be brief"), Some(3)));
+        let none = json!({"instructions": "", "tokens_used": 0, "running_turn": null});
+        assert!(made_here(&none, &Value::Null, None));
+        for (key, other) in [
+            ("instructions", json!("someone else's")),
+            ("created_by_id", json!(4)),
+            ("tokens_used", json!(12)),
+            ("running_turn", json!(1)),
+        ] {
+            let mut there = made.clone();
+            there[key] = other;
+            assert!(!made_here(&there, &json!("be brief"), Some(3)), "{key}");
+        }
+        assert!(!made_here(&made, &json!("be brief"), None));
+    }
+
+    #[test]
     fn a_gate_says_no_with_any_exit_but_zero() {
-        assert!(gate("true", None).is_ok());
-        assert!(gate("exit 3", None).unwrap_err().contains('3'));
+        assert_eq!(gate("true", None), Ok(Ok(())));
+        assert!(gate("exit 3", None).unwrap().unwrap_err().contains('3'));
+        // One that cannot run says nothing: that is no answer, not a no.
+        assert!(gate("true", Some(Path::new("/nonexistent/agent-gate"))).is_err());
         // What it started in the background ends with it.
         let pid = std::env::temp_dir().join(format!("agent-app-gate-{}", std::process::id()));
         let command = format!("sleep 30 & echo $! > {}", pid.display());
-        assert!(gate(&command, None).is_ok());
+        assert_eq!(gate(&command, None), Ok(Ok(())));
         let pid: libc::pid_t = std::fs::read_to_string(&pid)
             .unwrap()
             .trim()
@@ -3531,6 +3594,7 @@ mod tests {
                 "test \"$(pwd -P)\" = \"$(cd \"$0\" && pwd -P)\"",
                 Some(&dir)
             )
+            .unwrap()
             .is_err()
         );
         assert!(
@@ -3541,8 +3605,7 @@ mod tests {
                     dir.display()
                 ),
                 Some(&dir)
-            )
-            .is_ok()
+            ) == Ok(Ok(()))
         );
     }
 
@@ -4060,6 +4123,7 @@ mod tests {
             "--model a/m -- x",
             "--bot p.x --start p.r --model a/m -- x",
             "--runs 0 -- x",
+            "--runs 9223372036854775808 -- x",
             "--bot a --bot b -- x",
             "--wat x -- x",
         ] {
