@@ -36,7 +36,7 @@ function page(daemon = {}, storage = null) {
   context.Rich = context.window.Rich;
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, openFileFrom, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, save, restore, showMenu, refreshMenu, entries, pickerRows, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readTriggers, tellLead, markSeen, renderFile, go, upOf, crumbsHTML, railRows, renderTabs };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, openFileFrom, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, save, restore, showMenu, refreshMenu, entries, pickerRows, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readTriggers, tellLead, markSeen, renderFile, go, upOf, crumbsHTML, railRows, renderTabs, triggerAct };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -3077,12 +3077,34 @@ test('Settings lists triggers with no project, and only then when there are some
   assert.doesNotMatch(p.setupHTML(), /Triggers/);
   st.triggers = [{ name: 'loose', bot: 'loose', bot_id: 3, when: 'in 2h', once: true, ended: true, message: 'x', last: { outcome: 'failed', fired_ms: 0, detail: 'daemon_unavailable' } }];
   assert.match(p.setupHTML(), /<h3>Triggers<\/h3>.*not delivered/s);
+  assert.doesNotMatch(p.setupHTML(), /trigger-fire/, 'an ended trigger has nothing to run');
   // A one-off past its time and a plist that cannot be read are listed too, each removable.
   st.triggers.push({ name: 'late', bot: 'late', bot_id: 4, when: 'at 2026-09-01 09:00', once: true, ended: false, missed: true, message: 'y', last: null },
-    { name: 'odd', ended: false, problem: 'unreadable: not a trigger\'s plist' });
+    { name: 'odd', ended: false, problem: 'unreadable: not a trigger\'s plist' },
+    { name: 'review', bot: 'demo.test', bot_id: 5, when: 'commit /r', once: false, ended: false, message: 'z', last: null });
   const html = p.setupHTML();
   assert.match(html, /missed its time/);
   assert.match(html, /unreadable<\/span>.*data-v="odd"/s);
+  assert.match(html, /commit \/r<\/span>.*data-act="trigger-fire" data-v="review".*not run yet · review/s);
+});
+
+test('Run now looks again until the fire it started has written its result', async () => {
+  let fired = null, reads = 0;
+  const p = page({ fireTrigger: async () => ({ fired: true }), triggers: async () => { reads++;
+    return { triggers: [{ name: 'r', bot: 'r', bot_id: 1, when: 'every 30m', message: 'x', last: fired && { outcome: 'sent', fired_ms: fired } }] }; } });
+  p.setupState().open = true;
+  await p.readTriggers();
+  const run = p.triggerAct('fire', 'r');
+  await settle();
+  assert.equal(reads, 2, 'read once as launchd starts it');
+  await p.tick();
+  assert.equal(reads, 3, 'and again while it has not written');
+  fired = 5;
+  await p.tick();
+  assert.equal(reads, 4);
+  await p.tick();
+  await run;
+  assert.equal(reads, 4, 'its result ends the looking');
 });
 
 test('a coordinator\'s backlog stays small however much its tasks do, and what one message leaves out comes next', async () => {

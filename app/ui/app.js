@@ -2663,8 +2663,8 @@ function rolesHTML(st, busy) {
   const rows = ROLES.map(([name, label]) => `<div class="prow"><span class="pn">${label}</span><span class="st${own.get(name) ? '' : ' dim'}">${own.get(name) ? `~/.agents/agents/${name}.md` : 'the app\'s own'}</span><span class="acts"><button type="button" class="sbtn" data-act="edit-role" data-v="${name}"${busy}>Edit</button></span></div>`).join('');
   return `<section><h3>Roles</h3>${rows}<p class="dim">A project's coordinator and a swarm's agents follow these in every project; a project's own .agents/agents file of that name comes first. An agent keeps the text it started with, so an edit reaches new projects and swarms.</p></section>`;
 }
-// Agents wake at set times from triggers they or their coordinator made; the Mac keeps the time.
-// Each shows who it wakes, when, what its last time did, and the message it sends.
+// Agents wake from triggers they or their coordinator made: a time, a file written, a commit, or a fire by name.
+// launchd keeps watch. Each shows who it wakes, on what, what its last fire did, and the message it sends.
 // A trigger that ended on its own without delivering stays listed, saying why, until it is removed; so do a
 // one-off still there after its time and a plist that cannot be read.
 async function readTriggers(after = null) {
@@ -2679,18 +2679,32 @@ const LAST = { sent: 'sent', skipped: 'skipped, it was working', gone: 'its agen
 function triggersHTML(st, busy) {
   const at = (ms) => new Date(ms).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
   const last = (l, ended) => l ? `${ended ? 'ended' : 'last'} ${at(l.fired_ms)}: ${LAST[l.outcome] ?? l.outcome}${l.outcome === 'failed' && l.detail ? ` (${String(l.detail).slice(0, 120)})` : ''}` : 'not run yet';
-  const remove = (x) => `<span class="acts"><button type="button" class="sbtn" data-act="trigger-remove" data-v="${esc(x.name)}"${busy}>Remove</button></span>`;
+  const acts = (x) => `<span class="acts">${x.problem || x.ended ? '' : `<button type="button" class="sbtn" data-act="trigger-fire" data-v="${esc(x.name)}"${busy}>Run now</button>`}<button type="button" class="sbtn" data-act="trigger-remove" data-v="${esc(x.name)}"${busy}>Remove</button></span>`;
   const rows = (st.triggers ?? []).map((x) => x.problem
-    ? `<div class="prow"><span class="pn">${esc(x.name)}</span><span class="st bad">unreadable</span>${remove(x)}<div class="sub dim">${esc(x.problem)}</div></div>`
-    : `<div class="prow"><span class="pn">${esc(x.bot)}</span><span class="st${x.ended || x.missed ? ' bad' : ''}">${x.ended ? 'not delivered' : x.missed ? 'missed its time' : esc(x.when)}</span>${remove(x)}<div class="sub dim">${esc(last(x.last, x.ended))}${x.name !== x.bot ? ` · ${esc(x.name)}` : ''}</div><div class="sub dim">${esc(x.message.length > 240 ? `${x.message.slice(0, 240)}…` : x.message)}</div></div>`).join('');
+    ? `<div class="prow"><span class="pn">${esc(x.name)}</span><span class="st bad">unreadable</span>${acts(x)}<div class="sub dim">${esc(x.problem)}</div></div>`
+    : `<div class="prow"><span class="pn">${esc(x.bot)}</span><span class="st${x.ended || x.missed ? ' bad' : ''}">${x.ended ? 'not delivered' : x.missed ? 'missed its time' : esc(x.when === 'fire' ? 'when run' : x.when)}</span>${acts(x)}<div class="sub dim">${esc(last(x.last, x.ended))}${x.name !== x.bot ? ` · ${esc(x.name)}` : ''}</div><div class="sub dim">${esc(x.message.length > 240 ? `${x.message.slice(0, 240)}…` : x.message)}</div></div>`).join('');
   const none = st.triggersError ? `<p class="bad">${esc(st.triggersError)}</p>` : rows ? '' : '<p class="dim">None yet. Ask a coordinator, for example "have build check its PR every 30 minutes".</p>';
-  return `<section><h3>Triggers</h3>${rows}${none}${st.triggersAfter ? '<button class="sbtn" data-act="triggers-first">First page</button>' : ''}${st.triggersNext ? '<button class="sbtn" data-act="triggers-next">Next page</button>' : ''}<p class="dim">Each time, the agent gets its message in its own chat. A repeating one skips a time its agent is working; a one-off waits for it. They run with the app closed; a time the Mac slept through runs once when it wakes.</p></section>`;
+  return `<section><h3>Triggers</h3>${rows}${none}${st.triggersAfter ? '<button class="sbtn" data-act="triggers-first">First page</button>' : ''}${st.triggersNext ? '<button class="sbtn" data-act="triggers-next">Next page</button>' : ''}<p class="dim">Each fire, the agent gets its message in its own chat. A repeating one skips a fire while its agent is working; a one-off, or Run now, waits for it. They run with the app closed; a time the Mac slept through runs once when it wakes.</p></section>`;
 }
-async function removeTrigger(name) {
+// Run now returns once launchd starts the fire, before it has sent anything: the row is read again, a little
+// later each time, until its last fire changes or it ends, while Settings stays open.
+// Waits between reads after Run now: it looks at 0.5, 1, 2, 4, 8, 12 and 16 s. launchd starts a job at most
+// once every 10 s, so a Run now soon after the last fire can start that late.
+const RUN_NOW_LOOKS = [500, 500, 1000, 2000, 4000, 4000, 4000];
+async function triggerAct(act, name) {
   const st = setupState();
-  try { await Daemon.removeTrigger(name); } catch (e) { toast(`remove ${name}: ${e?.message ?? e}`, 5000); }
+  const lastOf = () => st.triggers?.find((x) => x.name === name)?.last?.fired_ms ?? null;
+  const before = lastOf();
+  let fired = act === 'fire';
+  try { await (act === 'fire' ? Daemon.fireTrigger(name) : Daemon.removeTrigger(name)); } catch (e) { fired = false; toast(`${act === 'fire' ? 'run' : 'remove'} ${name}: ${e?.message ?? e}`, 5000); }
   await readTriggers(st.triggersAfter);
   renderSetup();
+  for (const ms of fired ? RUN_NOW_LOOKS : []) {
+    if (!st.open || !st.triggers?.some((x) => x.name === name) || lastOf() !== before) return;
+    await new Promise((done) => setTimeout(done, ms));
+    await readTriggers(st.triggersAfter);
+    renderSetup();
+  }
 }
 async function editRole(name) {
   const st = setupState();
@@ -2891,7 +2905,8 @@ async function act(el) {
     case 'edit-role': await editRole(v); return;
     case 'triggers-first': await readTriggers(); renderSetup(); return;
     case 'triggers-next': await readTriggers(setupState().triggersNext); renderSetup(); return;
-    case 'trigger-remove': await removeTrigger(v); return;
+    case 'trigger-fire': await triggerAct('fire', v); return;
+    case 'trigger-remove': await triggerAct('remove', v); return;
     case 'open-host': await Daemon.openHost(v); return;
     default: return;
   }

@@ -5,7 +5,7 @@
 //! (projects, profiles, swarms, triggers) and makes a swarm's shared
 //! worktree; run with `--swarm-post` it is a swarm's post tool (see
 //! `swarm`), and with `--trigger` or `--trigger-fire` it adds, lists,
-//! removes or fires triggers (see `trigger`). `--setup` writes what a start
+//! fires or removes triggers (see `trigger`). `--setup` writes what a start
 //! writes (see `machine_setup`), and `--unlink-skills` removes the links to the
 //! skills it ships (see `skills`); the Homebrew cask runs both.
 //!
@@ -1255,6 +1255,16 @@ fn trigger_remove(
     )
 }
 
+/// Run a trigger now, as `trigger fire NAME` does.
+#[tauri::command]
+fn trigger_fire(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    name: String,
+) -> Result<Value, String> {
+    trigger::fire_now(&triggers_of(&*windows.of(&window)?)?, &name)
+}
+
 /// Page diagnostics land on stderr, where a terminal can see them.
 #[tauri::command]
 fn log(message: String) {
@@ -1398,6 +1408,7 @@ fn main() {
             swarm_check,
             swarm_decide,
             triggers,
+            trigger_fire,
             trigger_remove
         ])
         .setup(move |app| {

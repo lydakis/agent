@@ -1,6 +1,8 @@
 """A trigger's fire against a real daemon: what launchd runs, sent to the bot it was made for."""
+import html
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -17,6 +19,8 @@ from tests.test_runtime import ModelFixture
 
 ROOT = Path(__file__).resolve().parent.parent
 APP = next((p for p in (ROOT / '.local/target/debug/agent-app', ROOT / '.local/target/release/agent-app') if p.exists()), None)
+# What a fire puts before the message: `[trigger NAME · YYYY-MM-DD HH:MM · why]`.
+LINE = r'\[trigger {} · \d{{4}}-\d\d-\d\d \d\d:\d\d · {}\]\n'
 
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
@@ -50,13 +54,27 @@ class TriggerFireTests(ModelFixture):
             self._store_id = json.loads(self.agent('start', '--store', str(self.store)).stdout)['store']['identity']
         return self._store_id
 
-    def fire(self, name, bot, bot_id, message, at=None, app=APP, socket=None, env=None, store_id=None, not_before=None):
+    def bundle(self):
+        # The app starts a daemon, and a `--start` agent, with the `agent` it ships beside it.
+        bundle = self.path / 'bundle'
+        if not bundle.exists():
+            bundle.mkdir()
+            try:
+                os.link(APP, bundle / 'agent-app')
+            except OSError:
+                shutil.copy2(APP, bundle / 'agent-app')
+            (bundle / 'agent').symlink_to(self.binary)
+        return bundle / 'agent-app'
+
+    def fire(self, name, message, target=None, when='every 30m', extra=(), at=None, app=APP, socket=None,
+             env=None, store_id=None, not_before=None, generation=None):
         # What a trigger's plist has launchd run.
-        store_id = store_id or self.store_identity()
-        args = [str(app), '--trigger-fire', '--name', name, '--bot', bot, '--bot-id', str(bot_id),
-                '--generation', str(time.time_ns()), '--when', 'every 30m', *(['--at', str(at)] if at else []), '--store', str(self.store),
-                *(['--socket', str(socket)] if socket else []),
-                '--store-id', store_id, *(['--not-before', str(not_before)] if not_before else []), '--', message]
+        target = target or ['--bot', name, '--bot-id', str(self.bot_id(name))]
+        args = [str(app), '--trigger-fire', '--name', name, *target,
+                '--generation', generation or str(time.time_ns()), '--when', when, *(['--at', str(at)] if at else []),
+                *extra, '--store', str(self.store), *(['--socket', str(socket)] if socket else []),
+                '--store-id', store_id or self.store_identity(),
+                *(['--not-before', str(not_before)] if not_before else []), '--', message]
         env = {**clean_env(), 'HOME': str(self.home), **(env or {})}
         # A fire records and ends only the trigger its plist still holds.
         plist = self.home / 'Library/LaunchAgents' / f'me.lydakis.agent.trigger.{name}.plist'
@@ -73,13 +91,14 @@ class TriggerFireTests(ModelFixture):
 
     def test_a_fire_wakes_its_resting_bot_and_skips_a_working_one(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
-        bot_id = self.bot_id('p.task')
-        sent = self.fire('p.task', 'p.task', bot_id, 'Check the PR again.')
+        sent = self.fire('p.task', 'Check the PR again.')
         self.assertEqual(sent['last']['outcome'], 'sent', sent)
         self.settle('p.task')
-        self.assertEqual(self.turns('p.task')[-1]['prompt_preview'], 'Check the PR again.')
-        # The actual trigger submit preserves its automated origin in the
-        # approver's input, the durable event, and the displayed history.
+        # The message, after one line with the local fire time and what fired it.
+        self.assertRegex(self.turns('p.task')[-1]['prompt_preview'],
+                         '^' + LINE.format('p.task', 'every 30m') + 'Check the PR again.$')
+        # The submit keeps its automated origin in the approver's input, the
+        # durable event, and the displayed history.
         connection = Connection(str(self.store) + '.sock')
         try:
             turn = sent['last']['turn']
@@ -98,7 +117,7 @@ class TriggerFireTests(ModelFixture):
         self.addCleanup(self.model.release_headers.set)
         self.agent('run', '--store', str(self.store), '--bot', 'p.task', '--detach', 'gate')
         time.sleep(0.5)
-        skipped = self.fire('p.task', 'p.task', bot_id, 'Check the PR again.')
+        skipped = self.fire('p.task', 'Check the PR again.')
         self.assertEqual(skipped['last']['outcome'], 'skipped', skipped)
         self.model.release_headers.set()
         self.settle('p.task')
@@ -106,8 +125,7 @@ class TriggerFireTests(ModelFixture):
 
     def test_a_recurring_fire_waits_for_its_first_interval(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
-        self.assertIsNone(self.fire('p.task', 'p.task', self.bot_id('p.task'), 'x',
-                                    not_before=int(time.time()) + 1800))
+        self.assertIsNone(self.fire('p.task', 'x', not_before=int(time.time()) + 1800))
         self.assertEqual(len(self.turns('p.task')), 1)
 
     def test_a_stale_shell_cannot_add_a_trigger_for_a_replacement_bot(self):
@@ -120,18 +138,17 @@ class TriggerFireTests(ModelFixture):
                  'AGENT_BOT': 'p.task', 'AGENT_BOT_ID': str(old)},
             capture_output=True, text=True, timeout=30)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('bot_not_found', result.stderr)
+        self.assertEqual(json.loads(result.stderr)['error'], 'bot_not_found')
         self.assertEqual(list((self.home / 'Library/LaunchAgents').glob('*.plist')), [])
 
     def test_a_one_off_waits_for_a_working_bot_instead_of_skipping(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
-        bot_id = self.bot_id('p.task')
         self.model.release_headers = threading.Event()
         self.model.all_streaming = self.model.release_headers
         self.addCleanup(self.model.release_headers.set)
         self.agent('run', '--store', str(self.store), '--bot', 'p.task', '--detach', 'gate')
         time.sleep(0.5)
-        fired = self.fire('p.task', 'p.task', bot_id, 'Look again.', at=int(time.time()))
+        fired = self.fire('p.task', 'Look again.', at=int(time.time()))
         if sys.platform == 'darwin':
             # Delivered, it leaves no row behind.
             self.assertIsNone(fired)
@@ -140,38 +157,31 @@ class TriggerFireTests(ModelFixture):
             self.assertEqual(fired['last']['outcome'], 'sent', fired)
         self.model.release_headers.set()
         self.settle('p.task')
-        self.assertEqual([t['prompt_preview'] for t in self.turns('p.task')][1:], ['gate', 'Look again.'])
+        previews = [t['prompt_preview'] for t in self.turns('p.task')][1:]
+        self.assertEqual(previews[0], 'gate')
+        self.assertTrue(previews[1].endswith(']\nLook again.'), previews)
 
     def test_a_fire_starts_its_stopped_daemon_on_the_socket_it_was_made_with(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
-        bot_id = self.bot_id('p.task')
+        target = ['--bot', 'p.task', '--bot-id', str(self.bot_id('p.task'))]
         self.store_identity()
         self.agent('shutdown', '--store', str(self.store))
-        # The app starts a daemon with the `agent` it ships beside it.
-        bundle = self.path / 'bundle'
-        bundle.mkdir()
-        app = bundle / 'agent-app'
-        try:
-            os.link(APP, app)
-        except OSError:
-            shutil.copy2(APP, app)
-        (bundle / 'agent').symlink_to(self.binary)
         # A deep checkout's path would pass macOS's 104-byte limit for a socket's.
         short = Path(tempfile.mkdtemp(prefix='ag', dir='/tmp'))
         self.addCleanup(shutil.rmtree, short, True)
         socket = short / 'own.sock'
         self.addCleanup(lambda: subprocess.run([str(self.binary), 'shutdown', '--store', str(self.store),
                                                 '--socket', str(socket)], env=clean_env(), capture_output=True, timeout=35))
-        sent = self.fire('p.task', 'p.task', bot_id, 'Morning check.', app=app, socket=socket,
+        sent = self.fire('p.task', 'Morning check.', target=target, app=self.bundle(), socket=socket,
                          env={'AGENT_PROVIDER': f'openai=responses,{self.url}', 'SHELL': '/bin/sh'})
         self.assertEqual(sent['last']['outcome'], 'sent', sent)
         self.assertTrue(socket.exists())
         turns = json.loads(self.agent('turns', '--store', str(self.store), '--socket', str(socket), '--bot', 'p.task').stdout)
-        self.assertEqual(turns[-1]['prompt_preview'], 'Morning check.')
+        self.assertTrue(turns[-1]['prompt_preview'].endswith(']\nMorning check.'))
 
     def test_a_fire_never_reaches_another_stores_daemon(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
-        other = self.fire('p.task', 'p.task', self.bot_id('p.task'), 'x', store_id='0' * 32)
+        other = self.fire('p.task', 'x', store_id='0' * 32)
         self.assertEqual(other['last']['outcome'], 'failed', other)
         self.assertIn('store_mismatch', other['last']['detail'])
         self.assertEqual(len(self.turns('p.task')), 1)
@@ -181,7 +191,7 @@ class TriggerFireTests(ModelFixture):
         old = self.bot_id('p.task')
         self.agent('rm', '--store', str(self.store), '--bot', 'p.task')
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello again')
-        gone = self.fire('p.task', 'p.task', old, 'Check the PR again.')
+        gone = self.fire('p.task', 'Check the PR again.', target=['--bot', 'p.task', '--bot-id', str(old)])
         self.assertEqual(gone['last']['outcome'], 'gone', gone)
         # The trigger ended on its own, and says why until it is removed.
         self.assertEqual(gone['message'], 'Check the PR again.')
@@ -189,31 +199,92 @@ class TriggerFireTests(ModelFixture):
 
     def test_a_one_off_ignores_its_date_a_year_early(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
-        early = self.fire('p.task', 'p.task', self.bot_id('p.task'), 'x', at=int(time.time()) + 10 * 86400)
+        early = self.fire('p.task', 'x', at=int(time.time()) + 10 * 86400)
         self.assertIsNone(early)
         self.assertEqual(len(self.turns('p.task')), 1)
 
     def test_a_one_off_months_late_is_its_next_year_and_not_sent(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
-        late = self.fire('p.task', 'p.task', self.bot_id('p.task'), 'x', at=int(time.time()) - 200 * 86400)
+        late = self.fire('p.task', 'x', at=int(time.time()) - 200 * 86400)
         self.assertEqual(late['last']['outcome'], 'missed', late)
         self.assertEqual(len(self.turns('p.task')), 1)
 
     def test_a_fire_records_nothing_for_a_trigger_replaced_or_removed_meanwhile(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
-        bot_id = self.bot_id('p.task')
-        first = self.fire('p.task', 'p.task', bot_id, 'first')
+        first = self.fire('p.task', 'first', generation='g1')
         # The plist now holds another generation of the same message: the old job's fire leaves its result alone.
         plist = self.home / 'Library/LaunchAgents/me.lydakis.agent.trigger.p.task.plist'
-        plist.write_text(plist.read_text().replace(first['generation'], first['generation'] + '-replacement'))
+        program = re.search(r'<key>ProgramArguments</key>\s*<array>(.*?)</array>', plist.read_text(), re.S).group(1)
+        args = [html.unescape(a) for a in re.findall(r'<string>(.*?)</string>', program)]
+        plist.write_text(plist.read_text().replace('<string>g1</string>', '<string>g2</string>'))
         last = self.home / '.agent/triggers/p.task.json'
         last.unlink()
-        args = [str(APP), '--trigger-fire', '--name', 'p.task', '--bot', 'p.task', '--bot-id', str(bot_id),
-                '--generation', first['generation'], '--when', 'every 30m', '--store', str(self.store), '--store-id', self.store_identity(), '--', 'first']
         result = subprocess.run(args, env={**clean_env(), 'HOME': str(self.home)}, capture_output=True, text=True,
                                 timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(first['generation'], 'g1')
         self.assertFalse(last.exists())
+
+    def test_a_commit_trigger_sends_only_for_a_new_commit(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        repo = self.path / 'repo'
+        repo.mkdir()
+        git = ['git', '-C', str(repo), '-c', 'user.name=t', '-c', 'user.email=t@example.com']
+        subprocess.run([*git, 'init', '-q'], check=True)
+        subprocess.run([*git, 'commit', '-q', '--allow-empty', '-m', 'one'], check=True)
+        extra = ['--commit', str(repo)]
+        when = f'commit {repo}'
+        first = self.fire('p.task', 'Look at it.', when=when, extra=extra, generation='g')
+        self.assertEqual(first['last']['outcome'], 'sent', first)
+        self.settle('p.task')
+        sha = subprocess.run([*git, 'rev-parse', 'HEAD'], check=True, capture_output=True, text=True).stdout.strip()
+        self.assertRegex(self.turns('p.task')[-1]['prompt_preview'], '^' + LINE.format('p.task', re.escape(f'{when} at {sha[:12]}')))
+        # The same HEAD again (a checkout, a reflog write) is not news.
+        again = self.fire('p.task', 'Look at it.', when=when, extra=extra, generation='g')
+        self.assertEqual(again['last'], first['last'])
+        self.assertEqual(len(self.turns('p.task')), 2)
+        subprocess.run([*git, 'commit', '-q', '--allow-empty', '-m', 'two'], check=True)
+        news = self.fire('p.task', 'Look at it.', when=when, extra=extra, generation='g')
+        self.assertNotEqual(news['last']['turn'], first['last']['turn'])
+        self.settle('p.task')
+        # A move between commits sends nothing, and the next look starts past it.
+        # git's dates are whole seconds; a commit the second before a look is older than it.
+        time.sleep(1.1)
+        subprocess.run([*git, 'checkout', '-q', 'HEAD~1'], check=True)
+        back = self.fire('p.task', 'Look at it.', when=when, extra=extra, generation='g')
+        self.assertEqual(back['last'], news['last'])
+        self.assertEqual(back['head'], sha)
+        self.assertIsNotNone(back['seen_at'])
+        time.sleep(1.1)
+        subprocess.run([*git, 'checkout', '-q', '-'], check=True)
+        news = self.fire('p.task', 'Look at it.', when=when, extra=extra, generation='g')
+        self.assertEqual(news['last'], back['last'])
+        self.assertEqual(len(self.turns('p.task')), 3)
+        # Run now while the repository is away sends, and keeps the commit last seen.
+        moved = self.path / 'away'
+        repo.rename(moved)
+        (self.home / '.agent/triggers/p.task.asks').mkdir(parents=True, exist_ok=True)
+        (self.home / '.agent/triggers/p.task.asks/1').write_text('')
+        asked = self.fire('p.task', 'Look at it.', when=when, extra=extra, generation='g')
+        self.assertEqual(asked['last']['outcome'], 'sent', asked)
+        self.assertEqual(asked['head'], news['head'])
+        self.settle('p.task')
+        moved.rename(repo)
+        count = len(self.turns('p.task'))
+        self.fire('p.task', 'Look at it.', when=when, extra=extra, generation='g')
+        self.assertEqual(len(self.turns('p.task')), count, 'its return is no new commit')
+
+    def test_a_file_trigger_whose_path_became_its_own_state_ends_saying_why(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        state = self.home / '.agent/triggers'
+        state.mkdir(parents=True)
+        # Made for a folder a link pointed elsewhere; the link now points at the triggers' own.
+        link = self.path / 'watched'
+        link.symlink_to(state)
+        ended = self.fire('p.task', 'x', when=f'file {link}', extra=['--file', str(link / 'p.task.json')])
+        self.assertEqual(ended['last']['outcome'], 'failed', ended)
+        self.assertTrue(ended['last']['detail'].startswith('invalid_file:'), ended)
+        self.assertEqual(len(self.turns('p.task')), 1)
 
     def test_add_from_an_agents_shell_needs_launchd(self):
         # Here there is no launchd: the trigger is refused and nothing is left behind.
@@ -223,13 +294,12 @@ class TriggerFireTests(ModelFixture):
         out = self.path / 'added.json'
         self.agent('run', '--store', str(self.store), '--bot', 'p.task',
                    f"shell:HOME='{self.home}' '{APP}' --trigger add --every 30m -- check > '{out}' 2>&1")
-        text = out.read_text()
-        self.assertIn('triggers_unsupported', text)
+        self.assertEqual(json.loads(out.read_text())['error'], 'triggers_unsupported')
         self.assertEqual(list((self.home / 'Library/LaunchAgents').glob('*.plist')), [])
 
     @unittest.skipUnless(sys.platform == 'darwin' and os.environ.get('AGENT_TEST_LAUNCHD') == '1',
                          'real launchd: macOS with AGENT_TEST_LAUNCHD=1')
-    def test_real_launchd_fires_replaces_and_removes(self):
+    def test_real_launchd_fires_watches_and_removes(self):
         # The plists live under this test's HOME, so nothing loads at the next login.
         name = f'ztest-{os.getpid()}'
         label = f'me.lydakis.agent.trigger.{name}'
@@ -241,7 +311,7 @@ class TriggerFireTests(ModelFixture):
 
         def trigger(*args, ok=True):
             result = subprocess.run([str(APP), '--trigger', *args], env=env, capture_output=True, text=True,
-                                    timeout=60)
+                                    timeout=60, cwd=self.path)
             if ok:
                 self.assertEqual(result.returncode, 0, result.stderr)
             return result
@@ -261,12 +331,20 @@ class TriggerFireTests(ModelFixture):
         self.assertTrue(until(lambda: len(self.turns('p.task')) == 2, 150), 'launchd did not fire it')
         self.assertTrue(until(lambda: not loaded() and not plist.exists(), 30), 'it did not end itself')
         self.assertEqual(json.loads(trigger('ls').stdout)['triggers'], [])
-        # A repeating one, replaced: one job, the new one.
-        trigger('add', '--bot', 'p.task', '--name', name, '--every', '30m', '--', 'a')
-        trigger('add', '--bot', 'p.task', '--name', name, '--every', '1h', '--', 'b')
-        self.assertTrue(loaded())
-        rows = json.loads(trigger('ls').stdout)['triggers']
-        self.assertEqual([(r['name'], r['when'], r['message']) for r in rows], [(name, 'every 1h', 'b')])
+        # A file trigger: a write to the file fires it; the same add again is that trigger.
+        watched = self.path / 'notes.md'
+        trigger('add', '--bot', 'p.task', '--name', name, '--file', str(watched), '--', 'notes changed')
+        self.assertTrue(json.loads(trigger('add', '--bot', 'p.task', '--name', name, '--file', str(watched),
+                                           '--', 'notes changed').stdout)['duplicate'])
+        other = trigger('add', '--bot', 'p.task', '--name', name, '--every', '1h', '--', 'b', ok=False)
+        self.assertEqual(json.loads(other.stderr)['field'], 'when')
+        watched.write_text('synthetic\n')
+        self.assertTrue(until(lambda: len(self.turns('p.task')) == 3, 60), 'launchd did not fire on the write')
+        self.settle('p.task')
+        # Fire by name: launchd runs it now.
+        self.assertEqual(json.loads(trigger('fire', name).stdout), {'name': name, 'fired': True})
+        self.assertTrue(until(lambda: len(self.turns('p.task')) == 4, 60), 'fire did not run it')
+        self.assertTrue(self.turns('p.task')[-1]['prompt_preview'].startswith(f'[trigger {name} · '))
         # A plist launchd no longer has, as after a failed reload: rm still removes it.
         subprocess.run(['/bin/launchctl', 'bootout', target], check=True, capture_output=True)
         trigger('rm', name)
@@ -277,7 +355,7 @@ class TriggerFireTests(ModelFixture):
         trigger('rm', name)
         self.assertFalse(loaded())
         # Nothing left: bootout's not-loaded answer reads as that.
-        self.assertIn('trigger_not_found', trigger('rm', name, ok=False).stderr)
+        self.assertEqual(json.loads(trigger('rm', name, ok=False).stderr)['error'], 'trigger_not_found')
 
 
 if __name__ == '__main__':
