@@ -35,7 +35,7 @@ const S = {
   swarms: new Map(), memberOf: new Map(),
   // Who asked for each turn another bot asked for, until it ends, and what each coordinator has yet to
   // hear about its tasks (see `wake`), and turns that ended live before the snapshot said who made their bot.
-  turnFrom: new Map(), turnOrigin: new Map(), wakes: new Map(), heldNews: [],
+  turnFrom: new Map(), turnOrigin: new Map(), answerTo: new Map(), forwarding: new Map(), answered: new Set(), wakes: new Map(), heldNews: [],
   // Bots whose finished turn the person has not looked at yet (see `shownStatus`), and turns another
   // bot asked for that the person steered into, whose end is theirs to see too.
   unseen: new Set(), wanted: new Set(),
@@ -273,6 +273,28 @@ function learnFamily(b, record) {
 }
 // The creator, when the bot holding that name now is the identity that did the creating. A later
 // bot reusing the name is a stranger, and a creator the store could not resolve links to nothing.
+// A trigger's fire with --reply-to ends its request id `-to-ID`: the agent the turn's answer goes to.
+function answerTo(name, turn, data) {
+  const to = /^trigger-.*-to-(\d+)$/.exec(typeof data.request_id === 'string' ? data.request_id : '');
+  if (to) S.answerTo.set(`${name}\u0000${turn}`, Number(to[1]));
+}
+// A task turn whose answer a trigger passes to the task's coordinator is that answer's news, not
+// news again; only an answer that does not arrive (the fire failed to pass it on) leaves it news.
+const FORWARD_MS = 15000;
+function turnNews(name, turn, status, from, callId, origin, answered) {
+  const b = bot(name);
+  if (answered == null || !b || answered !== creatorOf(b)?.id) return tellLead(name, turn, status, from, callId, origin);
+  const key = `${name}\u0000${turn}`;
+  if (S.answered.delete(key)) return;
+  clearTimeout(S.forwarding.get(key));
+  S.forwarding.set(key, setTimeout(() => { S.forwarding.delete(key); tellLead(name, turn, status, from, undefined, origin); }, FORWARD_MS));
+}
+// An answer replayed while the snapshot holds its turn's news: that news, once let go, is no news.
+function forwarded(from) {
+  const key = `${from.bot}\u0000${from.turn}`;
+  if (S.forwarding.has(key)) { clearTimeout(S.forwarding.get(key)); S.forwarding.delete(key); }
+  else if (S.snapshot) S.answered.add(key);
+}
 function creatorOf(b) { const p = b.parent && b.parentId != null ? S.bots.get(b.parent) : null; return p && p.id === b.parentId ? p : null; }
 function forgetBot(name) {
   const parent = bot(name) && creatorOf(bot(name));
@@ -282,7 +304,8 @@ function forgetBot(name) {
   // A coordinator gone hears nothing more, and its queued turns never end; a task gone is no news.
   if (S.wakes.has(name)) { clearTimeout(S.wakes.get(name).timer); S.wakes.delete(name); }
   for (const w of S.wakes.values()) if (w.tasks.delete(name) && !w.tasks.size) { clearTimeout(w.timer); w.timer = null; }
-  for (const map of [S.turnFrom, S.turnOrigin]) for (const key of map.keys()) if (key.startsWith(`${name}\u0000`)) map.delete(key);
+  for (const map of [S.turnFrom, S.turnOrigin, S.answerTo]) for (const key of map.keys()) if (key.startsWith(`${name}\u0000`)) map.delete(key);
+  for (const [key, timer] of S.forwarding) if (key.startsWith(`${name}\u0000`)) { clearTimeout(timer); S.forwarding.delete(key); }
   for (const key of S.wanted) if (key.startsWith(`${name}\u0000`)) S.wanted.delete(key);
   // Held news is this bot's; a later bot of the same name is another.
   S.heldNews = S.heldNews.filter(([held]) => held !== name);
@@ -665,8 +688,9 @@ async function onEvent(ev) {
       break;
     }
     case 'accepted': {
-      if (data.from?.bot) S.turnFrom.set(`${name}\u0000${turn}`, data.from.bot);
+      if (data.from?.bot) { S.turnFrom.set(`${name}\u0000${turn}`, data.from.bot); forwarded(data.from); }
       else if (typeof data.origin === 'string') S.turnOrigin.set(`${name}\u0000${turn}`, data.origin);
+      answerTo(name, turn, data);
       const b = bot(name); if (b) { b.status = 'running'; b.runningTurn = turn; b.waitingOn = []; b.turnStarted = S.live ? Date.now() : 0; b.elapsed = 0; }
       // The event that puts a prompt on the lineage names who sent it, here and on `steered`.
       const t = transcript(name), by = senderOf(data);
@@ -675,8 +699,9 @@ async function onEvent(ev) {
       break;
     }
     case 'queued': {
-      if (data.from?.bot) S.turnFrom.set(`${name}\u0000${turn}`, data.from.bot);
+      if (data.from?.bot) { S.turnFrom.set(`${name}\u0000${turn}`, data.from.bot); forwarded(data.from); }
       else if (typeof data.origin === 'string') S.turnOrigin.set(`${name}\u0000${turn}`, data.origin);
+      answerTo(name, turn, data);
       // `ready` waits for a daemon-wide slot with nothing else running on the bot; `queued` sits behind its own turn.
       const b = bot(name); const behindOwn = !!b && (b.runningTurn !== null || isActive(b.status));
       if (b && !behindOwn) { b.status = data.status ?? 'queued'; b.runningTurn = turn; }
@@ -751,7 +776,8 @@ async function onEvent(ev) {
     case 'turn_finished': {
       const status = data.status ?? '?';
       const b = bot(name);
-      const key = `${name}\u0000${turn}`, from = S.turnFrom.get(key), origin = S.turnOrigin.get(key); S.turnFrom.delete(key); S.turnOrigin.delete(key);
+      const key = `${name}\u0000${turn}`, from = S.turnFrom.get(key), origin = S.turnOrigin.get(key), answered = S.answerTo.get(key);
+      S.turnFrom.delete(key); S.turnOrigin.delete(key); S.answerTo.delete(key);
       // A steer absorbed into a running turn finishes as its own turn while that turn goes on.
       if (b && (b.runningTurn === null || b.runningTurn === turn)) { b.runningTurn = null; b.waitingOn = []; if (b.turnStarted) b.elapsed = Date.now() - b.turnStarted; b.turnStarted = 0; b.status = status === 'completed' || status === 'steered' ? 'idle' : status; }
       const t = transcript(name);
@@ -762,7 +788,8 @@ async function onEvent(ev) {
       if (b && S.live && status === 'completed' && (!from || wanted) && !onScreen(name) && !S.unseen.has(name)) { S.unseen.add(name); patchUnseen([name]); }
       // A steer's turn is part of the turn it joined, whose end is the news.
       // A task's creator may still be on a snapshot page to come; its news waits for the whole snapshot.
-      if (S.live && status !== 'steered') { if (S.snapshot) S.heldNews.push([name, turn, status, from, undefined, origin]); else tellLead(name, turn, status, from, undefined, origin); }
+      // Whether a trigger passes its answer to the coordinator is known once the creator is.
+      if (S.live && status !== 'steered') { if (S.snapshot) S.heldNews.push([name, turn, status, from, undefined, origin, answered]); else turnNews(name, turn, status, from, undefined, origin, answered); }
       // A coordinator coming to rest hears what waited for it.
       if (S.wakes.has(name)) wakeSoon(name);
       // A background command may outlive its turn; only a wait result says how it ended.
@@ -1177,7 +1204,8 @@ async function attachOnce() {
         if (parent) addItem(transcript(parent.name), {kind:'peer',who:b.name,turn:null});
       }
       S.snapshot = false; S.deleted.clear();
-      for (const news of S.heldNews.splice(0)) tellLead(...news);
+      for (const news of S.heldNews.splice(0)) turnNews(...news);
+      S.answered.clear();
       S.attached = true;
       // What waited while detached goes out now, each window permitting.
       for (const lead of S.wakes.keys()) wakeSoon(lead);
@@ -1208,7 +1236,8 @@ function forgetStore() {
   S.cursor = 0; S.bots.clear(); S.transcripts.clear(); S.drafts.clear(); S.override.clear(); S.effort.clear(); S.families.clear();
   S.swarms.clear(); S.memberOf.clear(); S.deleted.clear(); looked.clear();
   for (const w of S.wakes.values()) clearTimeout(w.timer);
-  S.wakes.clear(); S.turnFrom.clear(); S.turnOrigin.clear(); S.heldNews = []; S.unseen.clear(); S.wanted.clear();
+  S.wakes.clear(); S.turnFrom.clear(); S.turnOrigin.clear(); S.answerTo.clear(); S.heldNews = []; S.answered.clear();
+  for (const timer of S.forwarding.values()) clearTimeout(timer); S.forwarding.clear(); S.unseen.clear(); S.wanted.clear();
   S.selected = ''; S.ui.tabs = []; S.ui.side = null; dropFile();
   S.botsGen += 1; S.shapeGen += 1;
   // A home the last host named is not this one's.
@@ -2675,14 +2704,16 @@ async function readTriggers(after = null) {
     st.triggers = page?.triggers ?? null; st.triggersNext = page?.next_after ?? null; st.triggersError = null;
   } catch (e) { st.triggers = null; st.triggersNext = null; st.triggersError = String(e?.message ?? e); }
 }
-const LAST = { sent: 'sent', skipped: 'skipped, it was working', gone: 'its agent is gone', failed: 'failed', missed: 'missed, its time passed long ago' };
+const LAST = { sent: 'sent', skipped: 'skipped, it was working', gone: 'its agent is gone', failed: 'failed', missed: 'missed, its time passed long ago', declined: 'not sent, its check said no' };
 function triggersHTML(st, busy) {
   const at = (ms) => new Date(ms).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-  const last = (l, ended) => l ? `${ended ? 'ended' : 'last'} ${at(l.fired_ms)}: ${LAST[l.outcome] ?? l.outcome}${l.outcome === 'failed' && l.detail ? ` (${String(l.detail).slice(0, 120)})` : ''}` : 'not run yet';
+  const why = (o) => o.detail ? ` (${String(o.detail).slice(0, 120)})` : '';
+  const last = (l, ended) => l ? `${ended ? 'ended' : 'last'} ${at(l.fired_ms)}: ${LAST[l.outcome] ?? l.outcome}${l.outcome === 'failed' || l.outcome === 'declined' ? why(l) : ''}${l.reply?.outcome === 'failed' ? `, its answer did not get through${why(l.reply)}` : ''}` : 'not run yet';
   const acts = (x) => `<span class="acts">${x.problem || x.ended ? '' : `<button type="button" class="sbtn" data-act="trigger-fire" data-v="${esc(x.name)}"${busy}>Run now</button>`}<button type="button" class="sbtn" data-act="trigger-remove" data-v="${esc(x.name)}"${busy}>Remove</button></span>`;
+  const more = (x) => [x.name !== x.bot ? x.name : '', x.start && x.bot_id == null ? `starts it on ${x.start.model}` : '', x.reply_to ? `answer to ${x.reply_to}` : '', x.if ? `if ${x.if}` : '', x.runs ? `${x.sent ?? 0} of ${x.runs} runs` : ''].filter(Boolean).join(' · ');
   const rows = (st.triggers ?? []).map((x) => x.problem
     ? `<div class="prow"><span class="pn">${esc(x.name)}</span><span class="st bad">unreadable</span>${acts(x)}<div class="sub dim">${esc(x.problem)}</div></div>`
-    : `<div class="prow"><span class="pn">${esc(x.bot)}</span><span class="st${x.ended || x.missed ? ' bad' : ''}">${x.ended ? 'not delivered' : x.missed ? 'missed its time' : esc(x.when === 'fire' ? 'when run' : x.when)}</span>${acts(x)}<div class="sub dim">${esc(last(x.last, x.ended))}${x.name !== x.bot ? ` · ${esc(x.name)}` : ''}</div><div class="sub dim">${esc(x.message.length > 240 ? `${x.message.slice(0, 240)}…` : x.message)}</div></div>`).join('');
+    : `<div class="prow"><span class="pn">${esc(x.bot)}</span><span class="st${x.ended || x.missed ? ' bad' : ''}">${x.ended ? (x.last?.outcome === 'sent' ? 'answer not passed on' : 'not delivered') : x.missed ? 'missed its time' : esc(x.when === 'fire' ? 'when run' : x.when)}</span>${acts(x)}<div class="sub dim">${esc([last(x.last, x.ended), more(x)].filter(Boolean).join(' · '))}</div><div class="sub dim">${esc(x.message.length > 240 ? `${x.message.slice(0, 240)}…` : x.message)}</div></div>`).join('');
   const none = st.triggersError ? `<p class="bad">${esc(st.triggersError)}</p>` : rows ? '' : '<p class="dim">None yet. Ask a coordinator, for example "have build check its PR every 30 minutes".</p>';
   return `<section><h3>Triggers</h3>${rows}${none}${st.triggersAfter ? '<button class="sbtn" data-act="triggers-first">First page</button>' : ''}${st.triggersNext ? '<button class="sbtn" data-act="triggers-next">Next page</button>' : ''}<p class="dim">Each fire, the agent gets its message in its own chat. A repeating one skips a fire while its agent is working; a one-off, or Run now, waits for it. They run with the app closed; a time the Mac slept through runs once when it wakes.</p></section>`;
 }

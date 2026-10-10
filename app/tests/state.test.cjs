@@ -36,7 +36,7 @@ function page(daemon = {}, storage = null) {
   context.Rich = context.window.Rich;
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, openFileFrom, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, save, restore, showMenu, refreshMenu, entries, pickerRows, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readTriggers, tellLead, markSeen, renderFile, go, upOf, crumbsHTML, railRows, renderTabs, triggerAct };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, openFileFrom, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, save, restore, showMenu, refreshMenu, entries, pickerRows, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readTriggers, tellLead, markSeen, renderFile, go, upOf, crumbsHTML, railRows, renderTabs, triggerAct, turnNews };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -3081,11 +3081,55 @@ test('Settings lists triggers with no project, and only then when there are some
   // A one-off past its time and a plist that cannot be read are listed too, each removable.
   st.triggers.push({ name: 'late', bot: 'late', bot_id: 4, when: 'at 2026-09-01 09:00', once: true, ended: false, missed: true, message: 'y', last: null },
     { name: 'odd', ended: false, problem: 'unreadable: not a trigger\'s plist' },
-    { name: 'review', bot: 'demo.test', bot_id: 5, when: 'commit /r', once: false, ended: false, message: 'z', last: null });
+    { name: 'review', bot: 'demo.review', bot_id: null, start: { model: 'a/m', effort: null }, reply_to: 'demo.lead', if: 'git diff --quiet', runs: 3, sent: 1, when: 'commit /r', once: false, ended: false, message: 'z', last: null });
   const html = p.setupHTML();
   assert.match(html, /missed its time/);
   assert.match(html, /unreadable<\/span>.*data-v="odd"/s);
-  assert.match(html, /commit \/r<\/span>.*data-act="trigger-fire" data-v="review".*not run yet · review/s);
+  assert.match(html, /commit \/r<\/span>.*data-act="trigger-fire" data-v="review".*review · starts it on a\/m · answer to demo.lead · if git diff --quiet · 1 of 3 runs/s);
+});
+
+test('a task turn whose answer a trigger passes to its coordinator is not news for it again', async () => {
+  const p = page({ request: async () => ({}), log() {} });
+  p.S.live = true; p.S.attached = true;
+  p.upsert({ name: 'demo.lead', id: 1, status: 'idle' });
+  p.upsert({ name: 'demo.review', id: 2, status: 'idle', created_by: 'demo.lead', created_by_id: 1 });
+  await p.onEvent({ event: 'accepted', bot: 'demo.review', turn: 7, data: { request_id: 'trigger-2-1790000000-41-to-1', origin: 'trigger' } });
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.review', turn: 7, data: { status: 'completed' } });
+  await p.onEvent({ event: 'accepted', bot: 'demo.lead', turn: 3, data: { from: { bot: 'demo.review', turn: 7, id: 2 } } });
+  await p.tick();
+  assert.equal(p.S.wakes.get('demo.lead')?.tasks.size ?? 0, 0, 'its answer reaches the coordinator already');
+  // An answer the trigger failed to pass on leaves the turn news after all.
+  await p.onEvent({ event: 'accepted', bot: 'demo.review', turn: 9, data: { request_id: 'trigger-2-1790000000-43-to-1', origin: 'trigger' } });
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.review', turn: 9, data: { status: 'completed' } });
+  assert.equal(p.S.wakes.get('demo.lead')?.tasks.size ?? 0, 0, 'not before the answer had its time');
+  await p.tick();
+  assert.deepEqual({ ...p.S.wakes.get('demo.lead').tasks.get('demo.review').act }, { first: 9, turn: 9, status: 'completed', by: 'trigger', count: 1 });
+  p.S.wakes.get('demo.lead').tasks.clear();
+  // Held while a snapshot loads, the turn keeps where its answer goes.
+  p.S.snapshot = true;
+  await p.onEvent({ event: 'accepted', bot: 'demo.review', turn: 10, data: { request_id: 'trigger-2-1790000000-44-to-1', origin: 'trigger' } });
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.review', turn: 10, data: { status: 'completed' } });
+  assert.equal(p.S.heldNews.at(-1)[6], 1);
+  // Its answer, replayed before the held news goes out, keeps it from being news.
+  await p.onEvent({ event: 'accepted', bot: 'demo.lead', turn: 4, data: { from: { bot: 'demo.review', turn: 10, id: 2 } } });
+  p.S.snapshot = false;
+  for (const news of p.S.heldNews.splice(0)) p.turnNews(...news);
+  await p.tick();
+  assert.equal(p.S.wakes.get('demo.lead')?.tasks.size ?? 0, 0, 'the answer it was held with reached the coordinator');
+  // One whose answer goes elsewhere, or a plain trigger's, still is.
+  await p.onEvent({ event: 'accepted', bot: 'demo.review', turn: 8, data: { request_id: 'trigger-2-1790000000-42-to-9', origin: 'trigger' } });
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.review', turn: 8, data: { status: 'completed' } });
+  assert.equal(p.S.wakes.get('demo.lead').tasks.get('demo.review').act.turn, 8);
+});
+
+test('Settings says when a trigger\'s check said no, or its answer did not get through', () => {
+  const p = page({});
+  const st = p.setupState();
+  st.triggers = [{ name: 'a', bot: 'a', bot_id: 1, when: 'in 2h', once: true, ended: true, message: 'x', last: { outcome: 'declined', fired_ms: 0, detail: '--if: exit status: 1' } },
+    { name: 'b', bot: 'b', bot_id: 2, when: 'in 2h', once: true, ended: true, message: 'y', reply_to: 'p.lead', last: { outcome: 'sent', fired_ms: 0, reply: { outcome: 'failed', detail: 'bot_not_found' } } }];
+  const html = p.setupHTML();
+  assert.match(html, /not delivered.*not sent, its check said no \(--if: exit status: 1\)/s);
+  assert.match(html, /answer not passed on.*ended .*: sent, its answer did not get through \(bot_not_found\)/s);
 });
 
 test('Run now looks again until the fire it started has written its result', async () => {
