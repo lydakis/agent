@@ -720,6 +720,7 @@ async function onEvent(ev) {
     case 'queued': {
       if (data.from?.bot) { S.turnFrom.set(`${name}\u0000${turn}`, data.from.bot); forwarded(data.from); }
       else if (typeof data.origin === 'string') S.turnOrigin.set(`${name}\u0000${turn}`, data.origin);
+      if (data.origin === 'trigger' && S.live) soonTriggers(1500);
       answerTo(name, turn, data);
       // `ready` waits for a daemon-wide slot with nothing else running on the bot; `queued` sits behind its own turn.
       const b = bot(name); const behindOwn = !!b && (b.runningTurn !== null || isActive(b.status));
@@ -803,6 +804,8 @@ async function onEvent(ev) {
       const b = bot(name);
       const key = `${name}\u0000${turn}`, from = S.turnFrom.get(key), origin = S.turnOrigin.get(key), answered = S.answerTo.get(key);
       S.turnFrom.delete(key); S.turnOrigin.delete(key); S.answerTo.delete(key);
+      // A trigger that passes the answer on writes its fire's result once it has.
+      if (origin === 'trigger' && S.live) soonTriggers(1500);
       // A steer absorbed into a running turn finishes as its own turn while that turn goes on.
       if (b && (b.runningTurn === null || b.runningTurn === turn)) { b.runningTurn = null; b.waitingOn = []; if (b.turnStarted) b.elapsed = Date.now() - b.turnStarted; b.turnStarted = 0; b.status = status === 'completed' || status === 'steered' ? 'idle' : status; }
       const t = transcript(name);
@@ -2069,8 +2072,9 @@ async function createHome(model, effort) {
 // time, and a row opens the trigger's sheet. One that ended without delivering stays listed, saying why,
 // until it is removed; so do a one-off still there after its time and a plist that cannot be read.
 // The page is read when the window attaches, when an agent's shell call of the trigger script ends, a
-// little after a trigger's message arrives (its fire writes what it did once the message is in), and
-// when a sheet opens, so a quiet fleet costs nothing. A window on a host has none: they run on this machine.
+// little after a trigger's message is taken or queued and after its turn ends (its fire writes what it
+// did once the message is in, or once it passed the answer on), and when a sheet opens, so a quiet
+// fleet costs nothing. A window on a host has none: they run on this machine.
 const TRIGGER_CALL = /\.agent\/trigger\b/;
 // The line a fire puts before its message: the trigger, the time, and why it fired.
 const TRIGGER_LINE = /^\[trigger ([\w.-]+) · ([^·\]\n]+) · ([^\]\n]*)\]\n?/;
@@ -2147,7 +2151,7 @@ function renderTriggerSheet() {
   const b = triggerBot(x), quoted = /^[\w.-]+$/.test(name) ? name : `'${name}'`;
   $('sheet').innerHTML = `<h4><span class="tk">${triggerKind(x.when ?? '')}</span> ${esc(name)}</h4>
     <div class="pipe"><div class="st"><span class="lab">When</span>${esc(whenOf(x, false))}</div><span class="ar">→</span><div class="st"><span class="lab">Do</span>${does}</div><span class="ar">→</span><div class="st"><span class="lab">Reply to</span>${x.reply_to ? `<b>${esc(x.reply_to)}</b>` : 'Stays in its chat'}</div></div>
-    <dl>${x.if ? `<dt>checks first</dt><dd>${esc(x.if)}<br><span class="hint">It fires only when this exits 0, so a check that finds nothing calls no model.</span></dd>` : ''}<dt>last fire</dt><dd>${esc(last)}</dd><dt>sent</dt><dd>${x.sent ?? 0}${x.runs ? ` of ${x.runs}, then it ends` : ''}</dd><dt>message</dt><dd class="msg">${esc(x.message ?? '')}</dd></dl>
+    <dl>${x.if ? `<dt>checks first</dt><dd><div class="check">${esc(x.if)}</div><span class="hint">It fires only when this exits 0, so a check that finds nothing calls no model.</span></dd>` : ''}<dt>last fire</dt><dd>${esc(last)}</dd><dt>sent</dt><dd>${x.sent ?? 0}${x.runs ? ` of ${x.runs}, then it ends` : ''}</dd><dt>message</dt><dd class="msg">${esc(x.message ?? '')}</dd></dl>
     <div class="wire"><span class="c">$</span> ~/.agent/trigger fire ${esc(quoted)}</div>
     <div class="foot"><button type="button" class="sbtn" data-act="trigger-open"${b ? '' : ' disabled'} title="${b ? 'Open its chat' : x.bot_id == null && x.start ? 'Its first fire starts it' : 'Its agent is gone'}">Open ${esc(b ? shortName(b) : x.bot)}</button><button type="button" class="sbtn" data-act="trigger-remove"${busy}>Remove</button><button type="button" class="sbtn primary" data-act="trigger-fire"${x.ended ? ' disabled' : busy}>Run now</button></div>`;
 }

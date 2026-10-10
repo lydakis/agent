@@ -3392,7 +3392,7 @@ test('a trigger\'s sheet shows when, what and where its answer goes, and Run now
   await p.openTriggerSheet('r');
   let html = p.elements.get('sheet').innerHTML;
   assert.match(html, /<span class="lab">When<\/span>Every 30m<\/div>.*<span class="lab">Do<\/span>Message <b>demo\.build<\/b>.*<span class="lab">Reply to<\/span><b>demo\.lead<\/b>/s);
-  assert.match(html, /checks first<\/dt><dd>test -s queue/);
+  assert.match(html, /checks first<\/dt><dd><div class="check">test -s queue<\/div>/);
   assert.match(html, /not sent, its check said no \(--if: exit status: 1\)/);
   assert.match(html, /<dt>sent<\/dt><dd>1 of 5, then it ends/);
   assert.match(html, /~\/\.agent\/trigger fire r</);
@@ -3460,15 +3460,26 @@ test('reads asked for while one runs come to one more read, and a trigger\'s mes
   await p.onEvent({ event: 'accepted', bot: 'b', turn: 1, data: { node: 2, origin: 'trigger' } });
   await p.tick();
   assert.equal(reads, 3);
+  // One queued behind a running turn, and the end of a triggered turn, whose answer a reply-to passes on.
+  await p.onEvent({ event: 'queued', bot: 'c', turn: 2, data: { origin: 'trigger' } });
+  await p.tick();
+  assert.equal(reads, 4);
+  await p.onEvent({ event: 'turn_finished', bot: 'a', turn: 1, data: { status: 'completed' } });
+  await p.tick();
+  assert.equal(reads, 5);
+  await p.onEvent({ event: 'accepted', bot: 'd', turn: 1, data: { node: 3 } });
+  await p.onEvent({ event: 'turn_finished', bot: 'd', turn: 1, data: { status: 'completed' } });
+  await p.tick();
+  assert.equal(reads, 5, 'a turn no trigger sent reads nothing');
   // An agent's shell call of the trigger script.
   await p.onEvent({ event: 'tool_started', bot: 'a', turn: 1, data: { call_id: 'c', name: 'shell', arguments: JSON.stringify({ command: '"$HOME/.agent/trigger" add --every 30m -- check' }) } });
   await p.onEvent({ event: 'tool_completed', bot: 'a', turn: 1, data: { call_id: 'c' } });
   await p.tick();
-  assert.equal(reads, 4);
+  assert.equal(reads, 6);
   await p.onEvent({ event: 'tool_started', bot: 'a', turn: 1, data: { call_id: 'd', name: 'shell', arguments: JSON.stringify({ command: 'ls ~/.agent/triggers' }) } });
   await p.onEvent({ event: 'tool_completed', bot: 'a', turn: 1, data: { call_id: 'd' } });
   await p.tick();
-  assert.equal(reads, 4, 'its folder is not the script');
+  assert.equal(reads, 6, 'its folder is not the script');
 });
 
 test('a triggered message names its trigger and why it fired, and the name opens it', () => {
