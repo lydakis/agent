@@ -3,8 +3,11 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "libfx": "0.0.8",
+    "@earendil-works/chord": "1.0.0",
     "@earendil-works/pi-agent-core": "0.85.1",
-    "@earendil-works/pi-ai": "0.85.1"
+    "@earendil-works/pi-ai": "0.85.1",
+    "@earendil-works/pi-durable": "1.0.0",
+    "libfx": "0.0.8",
+    "pi-ai-durable": "npm:@earendil-works/pi-ai@1.0.0"
   }
 }

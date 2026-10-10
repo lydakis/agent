@@ -3498,6 +3498,49 @@ strict Clippy. The statement-cache experiment was separately checked with all
 55 store tests and ten compaction/evaluator tests before measurement. The earlier
 paid evaluation's totals remain incomplete until rerun with corrected accounting.
 
+### Summaries beside the turn
+
+2026-10-09. A summary due inside a turn, behind a call the turn made, now
+runs beside that boundary's call and is installed once the call is
+recorded, before its tools run
+([design](RUST_PROTOTYPE.md#summaries-beside-the-turn)). Measured with
+`bench/summary_beside.py` on a shared 4-vCPU Linux 6.18 cloud container:
+the runtime tests' synthetic Responses fixture, every work call delayed by
+a fixed time and every summary by a longer one, one bot with `shell` and
+`read`, one turn. Before is main at `b026767` (summaries before the call;
+release binary sha256 `8c0114d640d46601…`); after is `3ad9e2f` (sha256
+`6a50ffab902c9147…`), rustc 1.98.0. Synthetic delays, no model calls.
+
+| Turn | Delays (work / summary) | Summaries | Wall time before | Wall time after | Turn's `summary_ms` after | Work input bytes before → after | Largest request before → after |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `long:150x40`, 64 KiB budget, 1 run | 1.0 s / 4.0 s | 4 | 168.18 s | 164.19 s | 12.0 s | 4.46 M → 4.59 M | 49.3 K → 50.4 K |
+| `long:40`, 24 KiB budget, 3 runs | 0.15 s / 0.6 s | 5 | 9.69 s (9.67–9.70) | 8.91 s (8.90–8.92) | 2.25 s | 620 K → 655 K | 18.4 K → 19.3 K |
+
+```sh
+.local/venv/bin/python -m bench.summary_beside BEFORE_BINARY AFTER_BINARY \
+  --work 1.0 --summary 4.0 --prompt long:150x40 --context-bytes 65536
+.local/venv/bin/python -m bench.summary_beside BEFORE_BINARY AFTER_BINARY \
+  --work 0.15 --summary 0.6 --prompt long:40 --context-bytes 24576 --runs 3
+```
+
+Each summary hides the call it runs beside, so a turn should save the
+shorter of the two per summary: predicted 4.0 s for four 1 s calls at
+64 KiB and 0.75 s for five 0.15 s calls at 24 KiB. The observed wall
+deltas are 3.99 s and 0.78 s; the 0.03 s left over at 24 KiB is noise or
+other overhead, not overlap. The turn's own count of the time it held
+for summaries, `summary_ms`, agrees: the rest of each summary, 12.0 of
+16 s and 2.25 of 3.0 s. The cost is input: the call beside each summary sends the longer
+view, 3% more work-call input bytes at 64 KiB and 6% at 24 KiB. On a
+provider cache most of that call is a cached prefix; this screen has no
+cache, and no paid run measured the price. Request sizes stay within the
+budget in both.
+
+The design measured on 2026-10-02 (`f05caa3`) let a summary run on across
+later rounds and tools and saved the whole 16 s at 64 KiB (152.54 s), but
+its summary outlived its round across parks, approvals, interrupts and
+resumes, and each review found another state it mishandled. That result is
+superseded: the code it measured is gone.
+
 ## Compaction retry resumption
 
 Local synthetic screen, 2026-09-19: the park record now identifies which

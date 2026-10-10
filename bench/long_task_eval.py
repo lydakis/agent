@@ -798,10 +798,11 @@ def reported_closes(answer, numbers):
     return reported
 
 
-def score(root, facts, events, answer, corrected_at=None):
+def score(root, facts, events, answer, corrected_at=None, summary_ms=0):
     """Outcomes from the workspace and the bot's events. For the sustained
     task, `corrected_at` is how many steps the record held when the turn
-    took in the correction."""
+    took in the correction. `summary_ms` is how long summaries held the
+    bot's turns, as the daemon counted it."""
     passed, cases, failure = hidden_tests(root)
     vendor_intact = vendor_manifest(root) == facts['vendor']
     compactions = [e for e in events if e['event'] == 'compacted']
@@ -878,24 +879,12 @@ def score(root, facts, events, answer, corrected_at=None):
                               'view_bytes': (data.get('context_before') or {}).get('bytes'),
                               'limit_bytes': (data.get('input_limit') or {}).get('bytes'),
                               'form': request.get('form'), 'copied_items': request.get('items'),
+                              'beside': request.get('beside'),
                               'estimate': request.get('estimate'),
                               'calls': len(spent), 'input_tokens': total(spent, 'input_tokens'),
                               'cached_input_tokens': total(spent, 'cached_input_tokens'),
                               'output_tokens': total(spent, 'output_tokens')})
             spent = []
-
-    # A summary's latency: from its send to the send of the model call it
-    # held back, which also counts recording the compaction. Attempts in a
-    # row, such as a retry after one that failed, are one interval.
-    held, start = 0, None
-    for row in usage:
-        if not row.get('sent_ms'):
-            continue
-        if row.get('purpose') == 'compaction':
-            start = row['sent_ms'] if start is None else start
-        elif start is not None:
-            held += row['sent_ms'] - start
-            start = None
 
     return {
         'hidden_tests': f'{passed}/{cases}', 'hidden_failure': failure,
@@ -947,7 +936,7 @@ def score(root, facts, events, answer, corrected_at=None):
         'summarizer_input_tokens': total(summarizer, 'input_tokens'),
         'summarizer_cached_input_tokens': total(summarizer, 'cached_input_tokens'),
         'summarizer_output_tokens': total(summarizer, 'output_tokens'),
-        'summarizer_ms': held,
+        'summarizer_ms': summary_ms,
         'summaries': summaries,
         # The whole task's input, model and summarizer, with cached tokens
         # at a tenth of the price.
@@ -1025,6 +1014,7 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
                 marks[name] = steps_before(root / name, steered['finished_ms'])
         for name in names:
             events = list(page_rows(client, 'events', name))
+            summary_ms = sum(t['summary_ms'] for t in page_rows(client, 'turns', name))
             checkpoint = done[name]['data'].get('checkpoint')
             answer = ''
             if checkpoint:
@@ -1034,7 +1024,7 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
                              'wall_s': finished[name],
                              'steer': steer_outcome(steers.get(name), ends.get(name)),
                              'answer': answer[:2000], 'compaction_failures': failures[name],
-                             **score(root / name, facts[name], events, answer, marks.get(name))}
+                             **score(root / name, facts[name], events, answer, marks.get(name), summary_ms)}
         client.request('shutdown')
     finally:
         client.close(kill=True)

@@ -454,6 +454,10 @@ pub struct Waiting {
     /// sends the same request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copied: Option<CopiedCall>,
+    /// Until when a summary beside the turn that parked on its pool is not
+    /// tried again, so the turn resumed before then does not wait on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_retry_ms: Option<u64>,
 }
 /// The call a summary copies: the elision floor its window was read under,
 /// the node that window starts at, the node it ends at when the copy had
@@ -711,7 +715,7 @@ fn planned_calls(item: &[u8]) -> Vec<Cow<'_, str>> {
         .collect()
 }
 /// The bounded request context: ordered node ids and exact item bytes.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Window {
     pub family: Family,
     pub ids: Vec<i64>,
@@ -1061,7 +1065,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 44;
+    pub const SCHEMA: i32 = 45;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1218,6 +1222,7 @@ impl Database {
                 input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
                 started_ms INTEGER, finished_ms INTEGER,
                 retries INTEGER NOT NULL DEFAULT 0, paced_ms INTEGER NOT NULL DEFAULT 0,
+                summary_ms INTEGER NOT NULL DEFAULT 0,
                 delivery TEXT NOT NULL DEFAULT 'reject', expected_turn INTEGER,
                 cached_input_tokens INTEGER NOT NULL DEFAULT 0,
                 from_bot TEXT, from_turn INTEGER, from_id INTEGER, origin TEXT, reasoning TEXT, inherited_reasoning TEXT,
@@ -4644,6 +4649,7 @@ impl Database {
         pending: &[ToolCall],
         now_ms: u64,
         route: Option<&str>,
+        summary_retry_ms: Option<u64>,
     ) -> Result<Option<Option<u64>>> {
         let bot = self.active(turn)?;
         let call = pending.first().ok_or(Error::new("invalid_tool_state"))?;
@@ -4676,6 +4682,7 @@ impl Database {
             route: route.map(str::to_owned),
             approval: true,
             copied: None,
+            summary_retry_ms,
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
@@ -5327,6 +5334,7 @@ impl Database {
         any: bool,
         pending: &[ToolCall],
         route: Option<&str>,
+        summary_retry_ms: Option<u64>,
     ) -> Result<Value> {
         let bot = self.active(turn)?;
         let executing: bool = self.conn.query_row(
@@ -5352,6 +5360,7 @@ impl Database {
             route: route.map(str::to_owned),
             approval: false,
             copied: None,
+            summary_retry_ms,
         };
         let tx = self.conn.savepoint()?;
         // A verdict for a later call of the round waits in the store.
@@ -5379,9 +5388,11 @@ impl Database {
         call_spent_ms: u64,
         retries: u64,
         paced_ms: u64,
+        summary_ms: u64,
         compaction: bool,
         copied: Option<CopiedCall>,
         route: Option<&str>,
+        summary_retry_ms: Option<u64>,
     ) -> Result<Value> {
         let bot = self.active(turn)?;
         if bot.status != "running" {
@@ -5402,12 +5413,20 @@ impl Database {
             route: route.map(str::to_owned),
             approval: false,
             copied,
+            summary_retry_ms,
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
         tx.execute(
-            "UPDATE turns SET status='paced',waiting=?,retries=retries+?,paced_ms=paced_ms+? WHERE id=?",
-            params![serde_json::to_string(&waiting)?, retries as i64, paced_ms as i64, turn],
+            "UPDATE turns SET status='paced',waiting=?,retries=retries+?,paced_ms=paced_ms+?,
+                summary_ms=summary_ms+? WHERE id=?",
+            params![
+                serde_json::to_string(&waiting)?,
+                retries as i64,
+                paced_ms as i64,
+                summary_ms as i64,
+                turn
+            ],
         )?;
         tx.execute("UPDATE bots SET status='paced' WHERE name=?", [&bot.name])?;
         let data = json!({"resume_at_ms":resume_at_ms});
@@ -6568,10 +6587,16 @@ impl Database {
         let (queued, _) = self.pending()?;
         Ok((waiting, self.running_processes()?, queued, paced))
     }
-    pub fn note_pacing(&mut self, turn: i64, retries: u64, paced_ms: u64) -> Result<()> {
+    pub fn note_pacing(
+        &mut self,
+        turn: i64,
+        retries: u64,
+        paced_ms: u64,
+        summary_ms: u64,
+    ) -> Result<()> {
         self.conn.execute(
-            "UPDATE turns SET retries=retries+?,paced_ms=paced_ms+? WHERE id=?",
-            params![retries as i64, paced_ms as i64, turn],
+            "UPDATE turns SET retries=retries+?,paced_ms=paced_ms+?,summary_ms=summary_ms+? WHERE id=?",
+            params![retries as i64, paced_ms as i64, summary_ms as i64, turn],
         )?;
         Ok(())
     }
@@ -6589,7 +6614,8 @@ impl Database {
                     t.model_rounds,t.started_ms,t.finished_ms,
                     substr(CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END,1,200),
                     length(CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END),
-                    t.retries,t.paced_ms,t.delivery,t.cached_input_tokens,COALESCE(t.reasoning,t.inherited_reasoning,b.reasoning)
+                    t.retries,t.paced_ms,t.delivery,t.cached_input_tokens,COALESCE(t.reasoning,t.inherited_reasoning,b.reasoning),
+                    t.summary_ms
              FROM turns t JOIN bots b ON b.name=t.bot LEFT JOIN nodes n ON n.id=t.prompt_node
              WHERE t.bot=? AND t.id>? ORDER BY t.id LIMIT ?",
         )?;
@@ -6611,6 +6637,7 @@ impl Database {
                 "started_ms":r.get::<_, Option<i64>>(8)?,"finished_ms":r.get::<_, Option<i64>>(9)?,
                 "prompt_preview":preview,"prompt_bytes":r.get::<_, i64>(11)?,
                 "retries":r.get::<_, i64>(12)?,"paced_ms":r.get::<_, i64>(13)?,
+                "summary_ms":r.get::<_, i64>(17)?,
                 "delivery":r.get::<_, String>(14)?,
                 "cached_input_tokens":r.get::<_, i64>(15)?,
                 "cache_hit":cache_hit(r.get::<_, i64>(15)?, r.get::<_, i64>(5)?)}),
@@ -7904,6 +7931,15 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         // 43 -> 44: a keyed creation's request, to recognize its resend.
         // Earlier bots were made without a key, so none is recorded.
         conn.execute_batch("ALTER TABLE bots ADD COLUMN creation TEXT;")?;
+    }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='summary_ms')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 44 -> 45: how long summaries held each turn. None was counted
+        // before, so stored turns report zero.
+        conn.execute_batch("ALTER TABLE turns ADD COLUMN summary_ms INTEGER NOT NULL DEFAULT 0;")?;
     }
     Ok(())
 }
