@@ -978,6 +978,24 @@ const TURN_VIEW: &str = "t.id,t.bot,b.id,t.request_id,t.status,t.input_tokens,
 /// Columns `TURN_VIEW` takes, for queries that select more after it.
 const TURN_VIEW_COLUMNS: usize = 18;
 
+/// The turn view's own fields beside a turn's identity and status: who asked,
+/// what it waits on, its usage and timing. A model's `wait` leaves them out.
+pub const TURN_VIEW_ACCOUNTING: [&str; 13] = [
+    "bot",
+    "bot_id",
+    "handle",
+    "request_id",
+    "waiting_on",
+    "input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+    "model_rounds",
+    "retries",
+    "paced_ms",
+    "started_ms",
+    "finished_ms",
+];
+
 /// One turn as it stands. `waiting_on` is what a parked turn waits for, as
 /// its `turn_waiting` or `turn_paced` event said, and null otherwise.
 fn turn_view(r: &rusqlite::Row) -> rusqlite::Result<Value> {
