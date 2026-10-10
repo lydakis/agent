@@ -8,7 +8,8 @@ function page(daemon = {}, storage = null) {
   const elements = new Map(), timers = new Map();
   let timer = 0;
   const element = () => ({
-    children: [], replaceChildren(...nodes) { this.children = nodes; }, dataset: {}, style: {}, innerHTML: '', value: '', scrollHeight: 0, scrollTop: 0, clientHeight: 0,
+    children: [], replaceChildren(...nodes) { this.children = nodes; }, append(...nodes) { this.children.push(...nodes); }, get childNodes() { return this.innerHTML ? [{ html: this.innerHTML }] : []; },
+    dataset: {}, style: {}, innerHTML: '', value: '', scrollHeight: 0, scrollTop: 0, clientHeight: 0,
     classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
     listeners: {}, addEventListener(type,fn) { this.listeners[type]=fn; }, querySelector() { return null; }, querySelectorAll() { return []; }, focus() {},
   });
@@ -25,15 +26,17 @@ function page(daemon = {}, storage = null) {
     return {items};
   }};
   const context = vm.createContext({
-    Daemon: transport, console, queueMicrotask, crypto: require('node:crypto').webcrypto,
+    Daemon: transport, console, queueMicrotask, crypto: require('node:crypto').webcrypto, TextDecoder,
     document: { getElementById(id) { if (!elements.has(id)) elements.set(id, element()); return elements.get(id); }, listeners: {}, addEventListener(type, fn) { this.listeners[type] = fn; },
       createElement: element, createTextNode: () => ({ data: '', appended: 0, appendData(s) { this.data += s; this.appended += s.length; } }) },
-    window: { addEventListener() {} }, localStorage: storage ? { getItem: k => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, String(v)) } : { getItem() { return null; } },
+    window: { listeners: {}, addEventListener(type, fn) { this.listeners[type] = fn; } }, localStorage: storage ? { getItem: k => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, String(v)) } : { getItem() { return null; } },
     setTimeout(fn) { const id = ++timer; timers.set(id, fn); return id; }, clearTimeout(id) { timers.delete(id); }, setInterval() {},
   });
+  for (const file of ['../ui/vendor/markdown-it.js', '../ui/rich.js']) vm.runInContext(fs.readFileSync(require.resolve(file), 'utf8'), context);
+  context.Rich = context.window.Rich;
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readTriggers, triggerAct, tellLead, markSeen };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readTriggers, triggerAct, tellLead, markSeen, renderFile };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -120,15 +123,529 @@ test('stream rendering appends only new characters and resets between messages',
   for (const field of ['text', 'thinking']) {
     t.text = ''; t.thinking = ''; t.streamGen = (t.streamGen || 0) + 1;
     for (let i = 0; i < 1000; i++) { t[field] += '<& chunk >'; p.renderTail(el, 'Bob', t); }
-    const line = el.children[0], text = line.children[0];
+    const line = el.children.at(-1), text = line.children[0];
     assert.equal(text.data, t[field]);
     assert.equal(text.appended, t[field].length);
     t[field] = 'new'; t.streamGen += 1;
     p.renderTail(el, 'Bob', t);
-    assert.equal(el.children[0].children[0].data, 'new');
+    assert.equal(el.children.at(-1).children[0].data, 'new');
   }
 });
 
+
+test('messages draw as Markdown with raw HTML, scripts and remote fetches kept out', () => {
+  const p = page(), Rich = p.context.Rich;
+  const html = Rich.html('# Title\n\n**bold** <img src=x onerror=alert(1)> [ok](https://example.com) [bad](javascript:alert(1)) ![pic](https://example.com/p.png)\n\n<script>alert(1)</script>\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n- [x] done');
+  assert.match(html, /<h1>Title<\/h1>/);
+  assert.match(html, /<strong>bold<\/strong>/);
+  assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;/);
+  assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+  assert.match(html, /<a href="#" data-href="https:\/\/example.com">ok<\/a>/);
+  assert.doesNotMatch(html, /javascript:/);
+  assert.doesNotMatch(html, /<img/);
+  assert.match(html, /<a href="#" data-href="https:\/\/example.com\/p.png">pic<\/a>/);
+  assert.match(html, /<table>/);
+  assert.match(html, /type="checkbox"/);
+});
+
+test('fenced blocks become code, previews, diagrams and images by their language', () => {
+  const p = page(), Rich = p.context.Rich;
+  assert.match(Rich.html('```rust\nfn main() {}\n```'), /data-kind="code".*<span class="lang">rust<\/span>.*fn main\(\) \{\}/s);
+  // A page in a message runs only when asked: its scripts would share the window's thread.
+  assert.match(Rich.html('```html\n<!doctype html><body><b>hi</b></body>\n```'), /data-kind="html" data-view="code".*&lt;b&gt;hi&lt;\/b&gt;/s);
+  assert.match(Rich.html('```html\n<b>hi</b>\n```'), /data-kind="html" data-view="code"/);
+  assert.match(Rich.html('```mermaid\ngraph TD\nA-->B\n```'), /data-kind="mermaid".*A--&gt;B/s);
+  // A diagram in a message draws when asked; one in a file someone opened draws at once.
+  assert.match(Rich.html('```mermaid\ngraph TD\n```'), /data-kind="mermaid" data-lazy data-view="code"/);
+  assert.match(Rich.file('/w/flow.mmd', new TextEncoder().encode('graph TD')).html, /data-kind="mermaid" data-lazy data-page/);
+  const svg = Rich.html('```svg\n<svg xmlns="http://www.w3.org/2000/svg"><circle r="4"/></svg>\n```');
+  // An SVG draws as an image, and in a message only when asked: its filters and animations take CPU.
+  assert.match(svg, /data-kind="svg" data-view="code"/);
+  assert.doesNotMatch(svg, /<img/);
+  assert.doesNotMatch(svg.split('<pre')[0], /<svg/);
+  assert.match(Rich.file('/w/a.svg', new TextEncoder().encode('<svg/>')).html, /data-kind="svg" data-view="view"/);
+  assert.doesNotMatch(Rich.html('![x](data:image/svg+xml,%3Csvg%2F%3E)'), /<img/);
+  // A raster image the message carries draws on a click; a local one opens beside; a remote one is a link.
+  const png = Rich.html('![dot](data:image/png;base64,iVBORw0KGgo=)');
+  assert.doesNotMatch(png, /<img/);
+  assert.match(png, /<button type="button" class="img" data-img="data:image\/png;base64,iVBORw0KGgo=" title="dot">image: dot<\/button>/);
+  assert.match(Rich.html('![flow](docs/flow.png)'), /<a class="file" href="#" data-file="docs\/flow.png">flow<\/a>/);
+  assert.match(Rich.html('![r](https://example.com/r.png)'), /<a href="#" data-href="https:\/\/example.com\/r.png">r<\/a>/);
+});
+
+test('a table too wide or too large shows as its source; a modest one draws', () => {
+  const Rich = page().context.Rich;
+  assert.match(Rich.html('| a | b |\n|---|---|\n| 1 | 2 |'), /<table>/);
+  const wide = '|' + 'a|'.repeat(300) + '\n|' + '-|'.repeat(300) + '\n|1|';
+  assert.doesNotMatch(Rich.html(wide), /<table>|<th>/);
+  assert.match(Rich.html(wide), /data-kind="code"/);
+  const tall = '| a | b | c | d |\n|---|---|---|---|\n' + 'x\n'.repeat(3000);
+  assert.doesNotMatch(Rich.html(tall), /<td>/);
+});
+
+test('a message highlights at most 256 KiB of code in all', () => {
+  const p = page(), Rich = p.context.Rich; let calls = 0, bytes = 0;
+  p.context.hljs = { getLanguage: () => true, highlight: (text) => { calls++; bytes += text.length; return { value: text }; } };
+  const fence = '```rust\n' + 'x'.repeat(60 * 1024) + '\n```\n\n';
+  Rich.html(fence.repeat(10));
+  assert.equal(calls, 4); assert.ok(bytes <= 256 * 1024);
+  Rich.html(fence); assert.equal(calls, 5);
+  // A streamed reply's blocks share one budget.
+  calls = 0; const used = { lines: 0, tags: 0 };
+  Rich.html(fence.repeat(3), used); Rich.html(fence.repeat(3), used);
+  assert.equal(calls, 4);
+});
+
+test('a message past 100,000 tags shows as its text', () => {
+  const Rich = page().context.Rich;
+  const list = '- *x*\n'.repeat(30000);
+  assert.doesNotMatch(Rich.html(list), /<li>/);
+  assert.match(Rich.html(list), /data-kind="code"/);
+  assert.match(Rich.html('- x\n'.repeat(100)), /<li>/);
+  assert.doesNotMatch(Rich.html('x\n'.repeat(60000)), /<br>/);
+  // One long line of inline marks is not parsed: emphasis, links written bare.
+  for (const line of ['*x* '.repeat(60000), 'www.a.io '.repeat(120000)]) {
+    const out = Rich.html(line);
+    assert.doesNotMatch(out, /<em>|<a /); assert.match(out, /data-kind="code"/);
+  }
+  assert.match(Rich.html('*x* '.repeat(100)), /<em>/);
+  // A streamed reply's blocks share the bounds: each piece alone would draw, together they are text.
+  const used = { lines: 0, tags: 0 }, piece = '- x\n'.repeat(30000);
+  assert.match(Rich.html(piece, used), /<li>/);
+  assert.doesNotMatch(Rich.html(piece, used), /<li>/);
+  assert.equal(used.over, true);
+});
+
+test('the text blocks of one stored message share its bounds', () => {
+  const p = page(), list = '- x\n'.repeat(30000);
+  const es = p.entries({ role: 'assistant', content: [{ type: 'text', text: list }, { type: 'tool_use', id: 'c1', name: 'read', input: {} }, { type: 'text', text: list }] });
+  const texts = es.filter((e) => e.kind === 'text');
+  assert.equal(texts.length, 2);
+  assert.match(p.textHTML(texts[0]), /<li>/);
+  assert.doesNotMatch(p.textHTML(texts[1]), /<li>/);
+  // Drawn again, the first block's share is counted once.
+  texts[0].htmlOf = null; assert.match(p.textHTML(texts[0]), /<li>/);
+});
+
+test('highlighting arriving redraws only messages whose code waited for it', () => {
+  const p = page(), R = p.context.Rich; let v = 0, calls = 0;
+  p.context.Rich = { html: (x) => { calls++; return R.html(x); }, get version() { return v; }, get waited() { return R.waited; } };
+  const prose = { text: 'just words' }, code = { text: '```rust\nfn a() {}\n```' };
+  p.textHTML(prose); p.textHTML(code); assert.equal(calls, 2);
+  v = 1; p.textHTML(prose); p.textHTML(code);
+  assert.equal(calls, 3);
+});
+
+test('a diagram draws when clicked, and a pane drawn anew asks again, drawing from the cache', async () => {
+  const p = page(), c = p.context, Rich = c.Rich; let renders = 0;
+  c.document.head = { append(s) { s.onload(); } };
+  c.getComputedStyle = () => ({ getPropertyValue: () => '' });
+  c.mermaid = { initialize() {}, render: async (id, src) => { renders++; return { svg: `<svg>${src}</svg>` }; } };
+  const box = (src = 'graph TD') => { const view = { innerHTML: '' }, pre = { textContent: src };
+    return { dataset: { kind: 'mermaid', lazy: '', view: 'code' }, clientWidth: 0, view, closest: () => null, querySelector: (s) => s === 'pre' ? pre : s === '.view' ? view : null }; };
+  const click = (b) => { const btn = { dataset: { rich: 'view' }, closest: () => b }; Rich.click({ target: { closest: (s) => s === '[data-rich]' ? btn : null }, preventDefault() {} }); };
+  const asked = box(); click(asked);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(asked.view.innerHTML, '<svg>graph TD</svg>'); assert.equal(renders, 1);
+  // The pane drawn anew: nothing remembers the click, so the block is code until clicked again,
+  // which draws it from the cache at once.
+  const again = box(); Rich.hydrate({ querySelectorAll: () => [again] });
+  assert.equal(again.view.innerHTML, '');
+  click(again); assert.equal(again.view.innerHTML, '<svg>graph TD</svg>'); assert.equal(renders, 1);
+  // A file someone opened draws at once.
+  const page_ = box('graph LR'); page_.dataset.page = ''; Rich.hydrate({ querySelectorAll: () => [page_] });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(page_.view.innerHTML, '<svg>graph LR</svg>'); assert.equal(renders, 2);
+  // A reader below a block that draws keeps their place.
+  let h = 1000; const pane = { scrollTop: 500, clientHeight: 100, get scrollHeight() { return h; }, getBoundingClientRect: () => ({ top: 0 }) };
+  const b = box(); b.closest = (s) => s === '.scroll' ? pane : null; b.getBoundingClientRect = () => ({ bottom: -10 });
+  let html = ''; Object.defineProperty(b.view, 'innerHTML', { get: () => html, set: (v) => { html = v; h += 300; } });
+  click(b); assert.equal(html, '<svg>graph TD</svg>'); assert.equal(pane.scrollTop, 800);
+});
+
+test('a reply\'s diagram is code while it streams, and can be drawn once it is in', async () => {
+  const reply = 'First:\n\n```mermaid\ngraph TD\n```\n\nand on.';
+  const p = page({ request: async () => ({ type: 'message', role: 'assistant', content: [{ type: 'text', text: reply }] }) }), t = p.transcript('Bob');
+  t.streamingTurn = 7; t.streamGen = 1; t.text = '';
+  const el = { dataset: {}, children: [], replaceChildren(...nodes) { this.children = nodes; } };
+  for (const ch of reply) { t.text += ch; p.renderTail(el, 'Bob', t); }
+  const streamed = el.children[0].children.map((c) => c.html).join('');
+  assert.match(streamed, /data-kind="code"><div class="rh"><span class="lang">mermaid/); assert.doesNotMatch(streamed, /data-lazy|data-rich="view"/);
+  await p.onEvent({ event: 'message', bot: 'Bob', turn: 7, data: { node: 3 } }); await p.loadBatch('Bob');
+  const text = t.items.find((it) => it.kind === 'text');
+  assert.match(p.textHTML(text), /data-kind="mermaid" data-lazy data-view="code">.*data-rich="view"/);
+});
+
+test('a message\'s later blocks are drawn anew when an earlier one\'s share of its bounds changes', () => {
+  const p = page(), list = '- x\n'.repeat(20000);
+  const es = p.entries({ role: 'assistant', content: [{ type: 'text', text: 'short' }, { type: 'tool_use', id: 'c1', name: 'read', input: {} }, { type: 'text', text: list }] });
+  const [first, later] = es.filter((e) => e.kind === 'text');
+  p.textHTML(first); assert.match(p.textHTML(later), /<li>/);
+  // The first block draws again with far more tags (as highlighting arriving can make it): the later one is past the bound.
+  first.text = '- y\n'.repeat(40000); p.textHTML(first);
+  assert.doesNotMatch(p.textHTML(later), /<li>/);
+});
+
+test('Markdown parses in time that grows with its length, for runs of markers too', () => {
+  const p = page(), Rich = p.context.Rich;
+  const took = (s) => { const t0 = process.hrtime.bigint(); Rich.html(s); return Number(process.hrtime.bigint() - t0) / 1e6; };
+  for (const unit of ['!', '![', '[', '*x', '_a', '`a``']) {
+    took(unit.repeat(2000));
+    const small = took(unit.repeat(10000)), large = took(unit.repeat(40000));
+    assert.ok(large < 12 * Math.max(small, 2), `${unit}: ${small.toFixed(1)} ms at 10k, ${large.toFixed(1)} ms at 40k`);
+  }
+  // A line of them past the bound is not parsed at all.
+  assert.match(Rich.html('!'.repeat(200000)), /<span class="lang">text<\/span>/);
+});
+
+test('a message\'s parsing counts toward the window\'s bound', () => {
+  const p = page(), it = { kind: 'text', text: '*x* '.repeat(1000) };
+  p.textHTML(it);
+  assert.ok(it.bytes >= 16 * 2000, `${it.bytes} bytes for 2,000 marks`);
+});
+
+test('a reference used many times copies at most 1 Mi characters of targets into the page', () => {
+  const p = page(), Rich = p.context.Rich, target = 'https://example.com/' + 'a'.repeat(100000);
+  const out = Rich.html(`[x][a] `.repeat(5000) + `\n\n[a]: ${target}`);
+  assert.ok(out.length < 2 * 1024 * 1024, `${out.length} characters`);
+  assert.equal((out.match(/data-href=/g) ?? []).length, 10);
+  // The budget is shared by the pieces of one message, as a streamed reply's are.
+  const used = { lines: 0, tags: 0, code: 0 }, piece = `[x][a]\n\n[a]: ${target}\n\n`;
+  let links = 0; for (let i = 0; i < 20; i++) links += (Rich.html(piece, used).match(/data-href=/g) ?? []).length;
+  assert.equal(links, 10);
+  // Targets are charged as written into the page, escaped.
+  const quoted = Rich.html(`[x][q] `.repeat(10) + `\n\n[q]: https://example.com/${"'".repeat(100000)}`);
+  assert.ok(quoted.length < 2 * 1024 * 1024, `${quoted.length} characters`);
+  assert.equal((quoted.match(/data-href=/g) ?? []).length, 2);
+});
+
+test('the text blocks of one message share the bound on marks parsed', () => {
+  const p = page(), bang = '!'.repeat(99000), content = [];
+  for (let i = 0; i < 7; i++) content.push({ type: 'text', text: bang }, { type: 'tool_use', id: `c${i}`, name: 'read', input: {} });
+  const texts = p.entries({ role: 'assistant', content }).filter((e) => e.kind === 'text');
+  assert.equal(texts.length, 7);
+  assert.doesNotMatch(p.textHTML(texts[0]), /<span class="lang">text<\/span>/);
+  for (const t of texts.slice(1)) assert.match(p.textHTML(t), /<span class="lang">text<\/span>/);
+});
+
+test('a diagram that failed to draw asks again before it is tried again', async () => {
+  const p = page(), c = p.context, Rich = c.Rich; let renders = 0;
+  c.document.head = { append(s) { s.onload(); } };
+  c.getComputedStyle = () => ({ getPropertyValue: () => '' });
+  c.mermaid = { initialize() {}, render: async () => { renders++; throw new Error('too big'); } };
+  const box = () => { const view = { innerHTML: '' }, pre = { textContent: 'graph TD' }, lang = { textContent: 'mermaid' };
+    return { dataset: { kind: 'mermaid', lazy: '', view: 'code', id: 'Bob|1|mermaid|x' }, clientWidth: 0, view, lang, closest: () => null, querySelector: (s) => s === 'pre' ? pre : s === '.view' ? view : s === '.rh .lang' ? lang : null }; };
+  const asked = box(), button = { dataset: { rich: 'view' }, closest: () => asked };
+  Rich.click({ target: { closest: (s) => s === '[data-rich]' ? button : null }, preventDefault() {} });
+  await new Promise((r) => setImmediate(r)); await new Promise((r) => setImmediate(r));
+  assert.equal(renders, 1); assert.match(asked.lang.textContent, /too big/);
+  Rich.hydrate({ querySelectorAll: () => [box()] }); await new Promise((r) => setImmediate(r));
+  assert.equal(renders, 1);
+});
+
+test('a file opened while the side pane opens is drawn once the pane has its width', async () => {
+  const p = page(), c = p.context, R = c.Rich, opening = deferred(); let hydrated = 0;
+  c.Rich = { file: R.file, get version() { return R.version; }, hydrate: () => { hydrated++; } };
+  p.elements.set('app', { getAnimations: () => [{ finished: opening.promise }] });
+  p.S.ui.file = { bot: 'Bob', full: '/w/c.vl.json', gen: 1, state: 'ok', bytes: new TextEncoder().encode('{}'), more: false, url: null };
+  p.renderFile(); await settle();
+  assert.equal(hydrated, 0);
+  opening.resolve(); await settle();
+  assert.equal(hydrated, 1);
+});
+
+test('drawn HTML is kept for the transcripts on screen and the most recent others up to 16 MiB', () => {
+  const p = page(), MiB = 1024 * 1024;
+  const fill = (name) => { const t = p.transcript(name), it = { kind: 'text', text: 'x', html: '<p>x</p>', htmlOf: 'x', drawnBytes: 9 * MiB, bytes: 9 * MiB + 1 }; t.items.push(it); t.bytes = it.bytes; return it; };
+  const a = fill('A'), b = fill('B'), c = fill('C');
+  p.releaseDrawn(['A']); p.releaseDrawn(['B']); p.releaseDrawn(['C', 'A']);
+  // A is on screen again, B the most recent other: all kept.
+  assert.ok(a.html && b.html && c.html);
+  p.releaseDrawn(['C']);
+  // Off screen now: A (shown last, kept) and B (past 16 MiB, let go, its bytes returned).
+  assert.ok(a.html && c.html); assert.equal(b.html, undefined);
+  assert.equal(b.bytes, 1); assert.equal(p.transcript('B').bytes, 1);
+  // Shown again, it is drawn anew.
+  assert.match(p.textHTML(b, p.transcript('B')), /<p>x<\/p>/);
+});
+
+test('highlighting arriving redraws only a pane with code waiting for it', () => {
+  const p = page(), t = p.transcript('Bob'), el = { dataset: { who: 'Bob' }, lastElementChild: null };
+  t.items.push({ kind: 'text', text: 'just words' }); p.textHTML(t.items[0]);
+  assert.equal(p.waitsForHighlight(el), false);
+  t.items.push({ kind: 'text', text: '```rust\nfn a() {}\n```' }); p.textHTML(t.items[1]);
+  assert.equal(p.waitsForHighlight(el), true);
+  // A streamed reply's code waits too.
+  const u = p.transcript('Ann'), tail = { dataset: {}, replaceChildren() {} }, side = { dataset: { who: 'Ann' }, lastElementChild: tail };
+  u.streamingTurn = 1; u.streamGen = 1; u.text = 'words\n\n'; p.renderTail(tail, 'Ann', u);
+  assert.equal(p.waitsForHighlight(side), false);
+  u.text += '```rust\nfn a() {}\n```\n\n'; p.renderTail(tail, 'Ann', u);
+  assert.equal(p.waitsForHighlight(side), true);
+});
+
+test('a link\'s own menu is not offered, as it would follow the link in the window', () => {
+  const p = page(); let prevented = 0;
+  const target = { closest: (s) => s === 'a' ? {} : null };
+  p.context.document.listeners.contextmenu({ target, preventDefault() { prevented++; } });
+  assert.equal(prevented, 1);
+});
+
+test('highlighting arriving redraws a file beside only when its code waited for it', () => {
+  const p = page(), c = p.context, R = c.Rich, enc = (s) => new TextEncoder().encode(s); let v = 0, files = 0;
+  c.Rich = { file: (...a) => { files++; return R.file(...a); }, get version() { return v; }, hydrate() {} };
+  const show = (full, text) => { p.S.ui.file = { bot: 'Bob', full, gen: 2, state: 'ok', bytes: enc(text), more: false, url: null }; p.renderFile(); };
+  show('/w/page.html', '<p>hi</p>'); assert.equal(files, 1);
+  v = 1; p.renderFile(); assert.equal(files, 1);
+  show('/w/a.rs', 'fn a() {}'); assert.equal(files, 2);
+  v = 2; p.renderFile(); assert.equal(files, 3);
+});
+
+test('a file drawn again keeps the reader\'s place; another file starts at its top', () => {
+  const p = page(), enc = (s) => new TextEncoder().encode(s), el = p.elements.get('side') ?? p.context.document.getElementById('side');
+  p.S.ui.file = { bot: 'Bob', full: '/w/a.rs', gen: 2, state: 'ok', bytes: enc('fn a() {}'), more: false, url: null }; p.renderFile();
+  el.scrollTop = 300; p.S.ui.file.gen = 3; p.renderFile();
+  assert.equal(el.scrollTop, 300);
+  p.S.ui.file = { bot: 'Bob', full: '/w/b.rs', gen: 4, state: 'ok', bytes: enc('fn b() {}'), more: false, url: null }; p.renderFile();
+  assert.equal(el.scrollTop, 0);
+});
+
+test('Escape in a preview the reader is in closes the file it shows', async () => {
+  const p = page({ readFile: async () => new TextEncoder().encode('<button>x</button>') }), c = p.context, win = {};
+  p.setRender(() => {}); await p.openFile('Bob', '/w/p.html');
+  const frame = { contentWindow: win, closest: (s) => s === '.fview' ? {} : null };
+  c.document.querySelectorAll = (s) => s === '.rc iframe' ? [frame] : [];
+  // A page the reader is not in cannot close it.
+  c.window.listeners.message({ source: win, data: { rich: 'escape' } });
+  assert.ok(p.S.ui.file);
+  c.document.activeElement = frame;
+  c.window.listeners.message({ source: win, data: { rich: 'escape' } });
+  assert.equal(p.S.ui.file, null);
+});
+
+test('a file closed and opened again never shares a view key with the one before', async () => {
+  const p = page({ readFile: async () => new TextEncoder().encode('{}') });
+  p.setRender(() => {});
+  await p.openFile('Bob', '/w/c.vl.json'); const first = p.S.ui.file.gen;
+  p.dropFile(); const again = p.openFile('Bob', '/w/c.vl.json');
+  assert.ok(p.S.ui.file.gen > first, `${p.S.ui.file.gen} after ${first}`);
+  await again; assert.ok(p.S.ui.file.gen > first + 1);
+});
+
+test('a file an agent rewrote while open waits for a click to run', async () => {
+  const enc = (s) => new TextEncoder().encode(s), opened = [];
+  const p = page({ readFile: async (full) => { opened.push(full); return enc('<p>hi</p>'); } }), Rich = p.context.Rich;
+  assert.match(Rich.file('/w/p.html', enc('<p>hi</p>')).html, /data-kind="html" data-view="view"/);
+  assert.match(Rich.file('/w/p.html', enc('<p>hi</p>'), false, false).html, /data-kind="html" data-view="code"/);
+  assert.match(Rich.file('/w/d.mmd', enc('graph TD'), false, false).html, /data-lazy data-view="code"/);
+  p.S.config = { workspace: '/w' };
+  p.S.ui.file = { bot: 'Bob', full: '/w/p.html', asked: true, gen: 2, state: 'ok', bytes: enc('<p>hi</p>'), more: false, url: null };
+  await p.onEvent({ event: 'tool_started', bot: 'Bob', turn: 1, data: { call_id: 'w1', name: 'write', arguments: JSON.stringify({ path: 'p.html', content: 'x' }) } });
+  await p.onEvent({ event: 'tool_completed', bot: 'Bob', turn: 1, data: { call_id: 'w1' } });
+  await settle();
+  assert.deepEqual(opened, ['/w/p.html']); assert.equal(p.S.ui.file.asked, false);
+  // A write that failed or was refused changed nothing: what is shown stays as it is.
+  for (const [id, extra] of [['w2', { failed: true }], ['w3', { denied: true }]]) {
+    await p.onEvent({ event: 'tool_started', bot: 'Bob', turn: 1, data: { call_id: id, name: 'edit', arguments: JSON.stringify({ path: 'p.html' }) } });
+    await p.onEvent({ event: 'tool_completed', bot: 'Bob', turn: 1, data: { call_id: id, ...extra } });
+  }
+  await settle();
+  assert.deepEqual(opened, ['/w/p.html']);
+});
+
+test('an SVG file is drawn after a declaration, comments and a doctype', () => {
+  const p = page(), Rich = p.context.Rich, enc = (s) => new TextEncoder().encode(s);
+  const svg = '<?xml version="1.0"?>\n<!-- Generator: tool -->\n<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "x.dtd" [ <!ENTITY a "b"> ]>\n<svg xmlns="http://www.w3.org/2000/svg"/>';
+  assert.match(Rich.file('/w/a.svg', enc(svg)).html, /data-kind="svg"/);
+  assert.doesNotMatch(Rich.file('/w/b.svg', enc('<!-- open <svg/>')).html, /data-kind="svg"/);
+  assert.doesNotMatch(Rich.file('/w/c.svg', enc('<svgx/>')).html, /data-kind="svg"/);
+  // Many comments are read in one pass.
+  const t0 = Date.now(); Rich.file('/w/d.svg', enc('<!--a-->'.repeat(100000) + '<p/>')); assert.ok(Date.now() - t0 < 1000);
+});
+
+test('a name starting with a tilde is the folder\'s; only ~/ is home', () => {
+  const p = page();
+  assert.equal(p.joinPath('/w', '~notes.md'), '/w/~notes.md');
+  assert.equal(p.joinPath('/w', '~/notes.md'), '~/notes.md');
+});
+
+test('a link in a drawn diagram opens through the guarded opener', () => {
+  const p = page(), Rich = p.context.Rich, opened = [];
+  p.context.__TAURI__ = { core: { invoke: (cmd, args) => { opened.push([cmd, args.url]); return Promise.resolve(); } } };
+  const click = (attrs, dataset) => { let prevented = false; const a = { dataset, getAttribute: (k) => attrs[k] ?? null };
+    const handled = Rich.click({ target: { closest: (sel) => sel.includes('.rc a') ? a : null }, preventDefault: () => { prevented = true; } });
+    return handled && prevented; };
+  assert.equal(click({ 'xlink:href': 'https://example.com/m' }), true);
+  assert.equal(click({ href: 'javascript:alert(1)' }), true);
+  // A Markdown link is inert, its target data the opener reads.
+  assert.equal(click({ href: '#' }, { href: 'https://example.com/d' }), true);
+  assert.deepEqual(opened, [['open_link', 'https://example.com/m'], ['open_link', 'https://example.com/d']]);
+});
+
+test('charts, file links and opened files draw by kind', () => {
+  const p = page(), Rich = p.context.Rich;
+  // A chart in a message draws when asked; one in a file someone opened draws at once.
+  assert.match(Rich.html('```vega-lite\n{"mark":"bar"}\n```'), /data-kind="chart" data-lang="vega-lite" data-lazy data-view="code"/);
+  assert.match(Rich.file('/w/c.vl.json', new TextEncoder().encode('{}')).html, /data-kind="chart" data-lang="vega-lite" data-lazy data-page/);
+  assert.match(Rich.html('```vega\n{}\n```'), /data-lang="vega"/);
+  const links = Rich.html('[plan](PLAN.md) [code](src/a.rs:12) [line](src/b.rs#L4-L9) [web](https://example.com) [here](#top)');
+  assert.match(links, /<a class="file" href="#" data-file="PLAN.md">plan<\/a>/);
+  assert.match(links, /data-file="src\/a.rs">code/);
+  // A file with no folder takes its line too; a scheme with a number names no file.
+  assert.match(Rich.html('[code](a.rs:12) [doc](README.md:20:4)'), /data-file="a.rs">code.*data-file="README.md">doc/);
+  assert.doesNotMatch(Rich.html('[call](tel:12345)'), /data-file/);
+  assert.match(links, /data-file="src\/b.rs">line/);
+  // A section of another file opens that file; a `#` in a name is written `%23`.
+  assert.match(Rich.html('[install](README.md#install)'), /data-file="README.md">install/);
+  assert.match(Rich.html('[odd](notes/a%23b.md)'), /data-file="notes\/a#b.md">odd/);
+  // The line suffix is read before decoding, so `%3A` is a colon in the name.
+  assert.match(Rich.html('[log](logs/build%3A2026)'), /data-file="logs\/build:2026">log/);
+  assert.match(Rich.html('[log](a%3A2026)'), /data-file="a:2026">log/);
+  assert.match(links, /<a href="#" data-href="https:\/\/example.com">web<\/a>/);
+  assert.doesNotMatch(links, /data-file="#top"/);
+  const enc = (text) => new TextEncoder().encode(text);
+  assert.match(Rich.file('/w/PLAN.md', enc('# Plan')).html, /<div class="md"><h1>Plan<\/h1>/);
+  assert.match(Rich.file('/w/x.rs', enc('fn a() {}')).html, /data-kind="code".*<span class="lang">rs<\/span>/s);
+  assert.match(Rich.file('/w/r/latency.vl.json', enc('{}')).html, /data-kind="chart"/);
+  assert.match(Rich.file('/w/flow.mmd', enc('graph TD')).html, /data-kind="mermaid"/);
+  assert.match(Rich.file('/w/frag.html', enc('<b>x</b>')).html, /data-kind="html" data-view="view"/);
+  assert.match(Rich.file('/w/t.csv', enc('a,b\n1,"2"')).html, /<th>a<\/th><th>b<\/th>.*<td>1<\/td><td>2<\/td>/s);
+  // A quoted field keeps its separators, line breaks and doubled quotes.
+  assert.match(Rich.file('/w/q.csv', enc('name,note\r\nAlice,"a,b"\nBob,"say ""hi""\nthen go"\n')).html,
+    /<td>Alice<\/td><td>a,b<\/td><\/tr><tr><td>Bob<\/td><td>say &quot;hi&quot;\nthen go<\/td><\/tr><\/tbody>/);
+  assert.match(Rich.file('/w/t.tsv', enc('a\tb\n1\t2')).html, /<td>1<\/td><td>2<\/td>/);
+  // Columns are capped as well as rows, so a line of separators costs no more than a wide table.
+  assert.equal(Rich.file('/w/wide.csv', enc(','.repeat(100000))).html.match(/<th>/g).length, 256);
+  // Rows stop at the one reaching 10,000 cells, and the view says rows were left out.
+  const many = Rich.file('/w/many.csv', enc((','.repeat(255) + '\n').repeat(1001))).html;
+  assert.ok(many.match(/<t[hd]>/g).length <= 10000 + 256);
+  assert.match(many, /showing the first 39 rows/);
+  assert.doesNotMatch(Rich.file('/w/t.csv', enc('a,b\n1,2\n')).html, /showing/);
+  assert.match(Rich.file('/w/blob.bin', new Uint8Array([1, 0, 2])).html, /binary file · 3 bytes/);
+  assert.match(Rich.file('/w/big.log', enc('x'), true).html, /showing the first/);
+  assert.match(Rich.file('/w/<i>.md', enc('<script>alert(1)</script>')).html, /&lt;script&gt;/);
+});
+
+test('a message is parsed once and drawn again from what it kept', () => {
+  const p = page(), t = p.transcript('Bob'); let parsed = 0;
+  const real = p.context.Rich.html; p.context.Rich.html = (text) => { parsed++; return real(text); };
+  t.items = Array.from({ length: 50 }, (_, i) => ({ kind: 'text', turn: i, text: `reply **${i}**` }));
+  const first = p.itemsHTML(t), again = p.itemsHTML(t);
+  assert.equal(parsed, 50); assert.equal(first, again);
+  assert.ok(t.bytes > 0);
+  t.items[3].text = 'changed'; p.itemsHTML(t); assert.equal(parsed, 51);
+});
+
+test('drawing messages past the byte bound folds the oldest instead of keeping them', () => {
+  const p = page(), t = p.transcript('Bob'), el = p.context.document.getElementById('log');
+  const DECODE_BYTES = 8 * 1024 * 1024, text = 'word '.repeat(40000);
+  t.items = Array.from({ length: 20 }, (_, i) => ({ kind: 'text', turn: i, from: i, text, bytes: text.length * 2 }));
+  t.bytes = t.items.reduce((n, it) => n + it.bytes, 0);
+  assert.ok(t.bytes < DECODE_BYTES);
+  el.lastElementChild = p.context.document.createElement('div');
+  p.renderTranscript(el, 'Bob');
+  assert.ok(t.bytes <= DECODE_BYTES, `${t.bytes} bytes kept`);
+  assert.equal(t.items[0].kind, 'history');
+  assert.ok(t.items.some((it) => it.kind === 'text' && it.html));
+  assert.match(el.innerHTML, /earlier history/);
+});
+
+test('what drawn messages put on the page counts toward the window\'s bound across messages', () => {
+  const p = page(), t = p.transcript('Bob'), el = p.context.document.getElementById('log');
+  const DECODE_BYTES = 8 * 1024 * 1024, list = '- x\n'.repeat(49999);
+  // Five replies, each within its own bounds, with a tool call between them.
+  t.items = Array.from({ length: 5 }, (_, i) => p.entries({ role: 'assistant', content: [{ type: 'text', text: list }, { type: 'tool_use', id: `c${i}`, name: 'read', input: {} }] })
+    .map((e) => ({ ...e, turn: i, from: i, bytes: (e.text ?? '').length * 2 }))).flat();
+  t.bytes = t.items.reduce((n, it) => n + it.bytes, 0);
+  assert.ok(t.bytes < DECODE_BYTES);
+  el.lastElementChild = p.context.document.createElement('div');
+  p.renderTranscript(el, 'Bob');
+  const items = (el.innerHTML.match(/<li>/g) ?? []).length;
+  assert.ok(items > 0 && items <= 100000, `${items} list items drawn`);
+  assert.ok(t.bytes <= DECODE_BYTES, `${t.bytes} bytes kept`);
+  assert.match(el.innerHTML, /earlier history/);
+});
+
+test('an item added to a drawn pane hydrates only what was added', () => {
+  const p = page(), c = p.context, t = p.transcript('Bob'), el = c.document.getElementById('log'), R = c.Rich, seen = [];
+  c.Rich = { html: R.html, get version() { return R.version; }, get waited() { return R.waited; }, hydrate: (n) => { seen.push(n); } };
+  t.items = [{ kind: 'text', turn: 1, text: 'first' }];
+  const shown = { name: 'shown' };
+  const tail = Object.assign(c.document.createElement('div'), { classList: { contains: (c) => c === 'tail' }, previousElementSibling: shown,
+    insertAdjacentHTML(_, html) { const n = { name: 'added', html, nextElementSibling: tail }; shown.nextElementSibling = n; } });
+  el.lastElementChild = tail; p.renderTranscript(el, 'Bob');
+  seen.length = 0; el.lastElementChild = tail;
+  t.items.push({ kind: 'text', turn: 2, text: 'second' });
+  p.renderTranscript(el, 'Bob');
+  assert.deepEqual(seen.map((n) => n.name), ['added']);
+});
+
+test('a step links the whole path it named, not its shortened summary', async () => {
+  const p = page(), long = `/w/${'d/'.repeat(200)}a.md`;
+  await p.onEvent({ event: 'tool_started', bot: 'Bob', turn: 1, data: { call_id: 'c1', name: 'read', arguments: JSON.stringify({ path: long }) } });
+  await p.onEvent({ event: 'tool_started', bot: 'Bob', turn: 1, data: { call_id: 'c2', name: 'shell', arguments: JSON.stringify({ command: 'ls', path: '/w/x' }) } });
+  const [read, shell] = p.transcript('Bob').items.filter((it) => it.kind === 'tool');
+  assert.equal(read.path, long); assert.ok(read.summary.length < long.length);
+  assert.equal(shell.path, undefined);
+  p.S.ui.steps = true;
+  assert.match(p.runHTML(p.transcript('Bob'), 0).html, new RegExp(`<a class="fpath" href="#" data-file="${long}"`));
+});
+
+test('a chat covered by a file beside is not seen until the file closes', () => {
+  const p = page();
+  p.S.ui.side = 'Bob'; p.S.ui.file = { bot: 'Ann', full: '/w/a.md', url: null }; p.S.unseen.add('Bob');
+  p.markSeen(); assert.ok(p.S.unseen.has('Bob'));
+  p.S.ui.file = null; p.markSeen(); assert.ok(!p.S.unseen.has('Bob'));
+});
+
+test('a file opened from an agent closes when that agent is forgotten', () => {
+  const p = page();
+  p.S.ui.file = { bot: 'Bob', full: '/w/a.md', url: null };
+  p.forgetBot('Carol'); assert.ok(p.S.ui.file);
+  p.forgetBot('Bob'); assert.equal(p.S.ui.file, null);
+});
+
+test('a long streamed line is searched for its end once, not on every delta', () => {
+  const p = page(), Rich = p.context.Rich, st = {};
+  const line = 'x'.repeat(200000); let searched = 0;
+  for (let i = 1000; i <= line.length; i += 1000) {
+    const text = 'para\n\n' + line.slice(0, i);
+    const from = Math.max(st.scan ?? 0, st.seen ?? 0); searched += text.length - from;
+    assert.equal(Rich.cut(st, text), 6);
+  }
+  assert.ok(searched < 210000, `searched ${searched} characters`);
+  assert.equal(Rich.cut(st, 'para\n\n' + line + '\n\nnext'), 6 + line.length + 2);
+});
+
+test('streamed Markdown draws each finished block once and keeps fences whole', () => {
+  const p = page(), Rich = p.context.Rich;
+  const st = {};
+  const text = 'para one\n\n```js\nconst a = 1;\n\nconst b = 2;\n```\nafter\n\n- item';
+  const cuts = []; for (let i = 1; i <= text.length; i++) cuts.push(Rich.cut(st, text.slice(0, i)));
+  const fence = text.indexOf('```\nafter') + 4, para = text.indexOf('- item');
+  assert.deepEqual([...new Set(cuts)], [0, 10, fence, para]);
+  assert.equal(text.slice(10, fence), '```js\nconst a = 1;\n\nconst b = 2;\n```\n');
+
+  const t = p.transcript('Bob'); t.streamingTurn = 1; t.streamGen = 1; t.text = '';
+  const el = { dataset: {}, children: [], replaceChildren(...nodes) { this.children = nodes; } };
+  let parsed = 0; const real = Rich.html; Rich.html = (s) => { parsed++; return real(s); };
+  for (const ch of text) { t.text += ch; p.renderTail(el, 'Bob', t); }
+  const [done, line] = el.children;
+  assert.equal(parsed, 3);
+  assert.deepEqual(done.children.map((c) => c.html), [real(text.slice(0, 10)), real(text.slice(10, fence)), real(text.slice(fence, para))]);
+  assert.match(done.children[1].html, /data-kind="code"/);
+  assert.equal(line.children[0].data, '- item');
+});
+
+test('a streamed reply\'s blocks share one message\'s bounds, then stream as text', () => {
+  const p = page(), t = p.transcript('Bob'); t.streamingTurn = 1; t.streamGen = 1; t.text = '';
+  const el = { dataset: {}, children: [], replaceChildren(...nodes) { this.children = nodes; } };
+  const list = '- x\n'.repeat(30000) + '\n';
+  for (const piece of [list, list, 'more\n\n', 'tail']) { t.text += piece; p.renderTail(el, 'Bob', t); }
+  const [done, line] = el.children, html = done.children.map((c) => c.html);
+  assert.equal(html.length, 2);
+  assert.match(html[0], /<li>/); assert.doesNotMatch(html[1], /<li>/);
+  assert.equal(line.children[0].data, 'more\n\ntail');
+});
 
 test('tool-heavy history folds rows and restores their summaries on scroll', async () => {
   const p = page();
@@ -228,6 +745,11 @@ test('truncated tool previews preserve decoded flags and tool failures stay visi
   await p.onEvent({event:'message',bot:'Bob',turn:1,data:{node:1}}); await p.loadBatch('Bob');
   await p.onEvent({event:'tool_started',bot:'Bob',turn:1,data:{call_id:'call',name:'shell',arguments:JSON.stringify(input).slice(0,2048),arguments_truncated:true}});
   assert.equal(t.items.find(it=>it.kind==='tool').background,true);
+  // A path longer than the preview keeps the one decoded from the committed call.
+  const path='/w/'+'d/'.repeat(1100)+'f.md'; output={type:'function_call',call_id:'read',name:'read',arguments:JSON.stringify({path})};
+  await p.onEvent({event:'message',bot:'Bob',turn:1,data:{node:4}}); await p.loadBatch('Bob');
+  await p.onEvent({event:'tool_started',bot:'Bob',turn:1,data:{call_id:'read',name:'read',arguments:JSON.stringify({path}).slice(0,2048),arguments_truncated:true}});
+  assert.equal(t.items.find(it=>it.callId==='read').path,path);
   output={type:'function_call_output',output:'{"error":"spawn_failed"}'};
   await p.onEvent({event:'tool_completed',bot:'Bob',turn:1,data:{call_id:'call',node:2}});
   await p.loadBatch('Bob'); assert.match(p.itemsHTML(t),/spawn_failed/);
@@ -350,7 +872,7 @@ test('answer deltas follow thinking immediately and failed partial text stays ep
   await p.onEvent({event:'thinking_delta',bot:'Bob',turn:1,text:'thinking'});
   p.renderTail(el,'Bob',t);
   await p.onEvent({event:'text_delta',bot:'Bob',turn:1,text:'answer'});
-  p.renderTail(el,'Bob',t);assert.equal(el.children[0].children[0].data,'answer');
+  p.renderTail(el,'Bob',t);assert.equal(el.children.at(-1).children[0].data,'answer');
   await p.onEvent({event:'turn_finished',bot:'Bob',turn:1,data:{status:'interrupted'}});
   assert.equal(t.text,'');assert.equal(t.items.some(it=>it.kind==='text'&&it.text==='answer'),false);
 });
@@ -1161,6 +1683,17 @@ test('a task card leaves the keyboard beside; swapping a folded task in unfolds 
   p.S.ui.folded.add('app'); p.swap();
   assert.equal(p.S.selected, 'app.build'); assert.equal(p.S.ui.folded.has('app'), false);
   assert.ok(p.tree().some((n) => n.b?.name === 'app.build'), 'the selected task has a sidebar row');
+});
+
+test('a click in a file beside keeps the keyboard in the visible composer', async () => {
+  const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
+  p.upsert({ name: 'Bob', id: 1, provider: 'alpha', model: 'one' }); p.tree(); p.S.selected = 'Bob';
+  const doc = p.context.document, focused = [];
+  for (const id of ['input', 'sideinput']) doc.getElementById(id).focus = () => focused.push(id);
+  p.S.ui.file = { bot: 'Bob', full: '/w/a.md', gen: 0, state: 'loading' };
+  await doc.listeners.click({ target: { closest: (sel) => (sel === '.pane.side' ? {} : null) } });
+  await p.tick();
+  assert.equal(focused.at(-1), 'input');
 });
 
 test('a failed first message waits in the side chat\'s composer', async () => {
@@ -2247,7 +2780,7 @@ test('a window that saw news to act on never defers to one that saw only yours',
   assert.ok([...told.values()].some((prompt) => /\n- demo\.build: turn:demo\.build\/2 completed, asked by you\n/.test(prompt)));
 });
 
-test('an approval answered before the coordinator hears of it is not raised, and a schedule\'s turn is the coordinator\'s', async () => {
+test('an approval answered before the coordinator hears of it is not raised, and a trigger\'s turn is the coordinator\'s', async () => {
   const sent = [];
   const p = page({ request: async (op, params) => { if (op === 'submit') sent.push(params); return {}; }, log() {} });
   p.S.live = true; p.S.attached = true;
@@ -2257,15 +2790,15 @@ test('an approval answered before the coordinator hears of it is not raised, and
   await p.onEvent({ event: 'accepted', bot: 'demo.build', turn: 1, data: { node: 1 } });
   await p.onEvent({ event: 'turn_waiting', bot: 'demo.build', turn: 1, data: { call_id: 'c1', approval: true } });
   await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 1, data: { status: 'completed' } });
-  // A schedule asks a task for a check.
-  await p.onEvent({ event: 'accepted', bot: 'demo.nightly', turn: 4, data: { node: 2, origin: 'schedule' } });
+  // A trigger asks a task for a check.
+  await p.onEvent({ event: 'accepted', bot: 'demo.nightly', turn: 4, data: { node: 2, origin: 'trigger' } });
   await p.onEvent({ event: 'turn_finished', bot: 'demo.nightly', turn: 4, data: { status: 'completed' } });
   await p.onEvent({ event: 'turn_finished', bot: 'demo.lead', turn: 2, data: { status: 'completed' } });
   await p.tick();
   assert.equal(sent.length, 1);
   assert.doesNotMatch(sent[0].prompt, /waiting for approval/);
   assert.doesNotMatch(sent[0].prompt, /theirs/);
-  assert.match(sent[0].prompt, /\n- demo\.build: turn:demo\.build\/1 completed, asked by the person, and 1 earlier since turn:demo\.build\/1\n- demo\.nightly: turn:demo\.nightly\/4 completed, asked by schedule$/);
+  assert.match(sent[0].prompt, /\n- demo\.build: turn:demo\.build\/1 completed, asked by the person, and 1 earlier since turn:demo\.build\/1\n- demo\.nightly: turn:demo\.nightly\/4 completed, asked by trigger$/);
   assert.equal(p.S.turnOrigin.size, 0, 'origins are forgotten as turns end');
 });
 

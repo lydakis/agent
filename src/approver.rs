@@ -70,13 +70,6 @@ const RETRY_MAX_SECS: f64 = 60.0;
 /// A judge fork is `approver.TAG.PID.N`, and every bot name fits 128 bytes.
 const JUDGE_NAME_ROOM: usize = 128 - "approver.".len() - ".4294967295.18446744073709551615".len();
 
-fn daemon(error: agent_client::Error) -> Error {
-    match error.detail {
-        Some(detail) => Error::with(&error.code, detail),
-        None => Error::new(&error.code),
-    }
-}
-
 fn epoch_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -268,7 +261,7 @@ impl Model {
                     format!("{base} is a bot that is not a judge; rename it to serve this tag"),
                 ));
             }
-            Err(error) if error.code != "bot_not_found" => return Err(daemon(error)),
+            Err(error) if error.code != "bot_not_found" => return Err(error.into()),
             _ => {}
         }
         // Bots are listed in name order, so the judge's forks are the run
@@ -279,7 +272,7 @@ impl Model {
             let page = client
                 .request("bots", json!({"after":after,"limit":64}))
                 .await
-                .map_err(daemon)?;
+                .map_err(Error::from)?;
             for bot in page["bots"].as_array().into_iter().flatten() {
                 let Some(name) = bot["name"]
                     .as_str()
@@ -302,7 +295,7 @@ impl Model {
             }
         }
         match client.request("delete", json!({"bot":base})).await {
-            Err(error) if error.code != "bot_not_found" => return Err(daemon(error)),
+            Err(error) if error.code != "bot_not_found" => return Err(error.into()),
             _ => {}
         }
         let created = client
@@ -312,7 +305,7 @@ impl Model {
                     "instructions":policy::JUDGE_INSTRUCTIONS,"tools":[]}),
             )
             .await
-            .map_err(daemon)?;
+            .map_err(Error::from)?;
         Ok(Model {
             base_id: created["id"]
                 .as_i64()
@@ -497,14 +490,16 @@ async fn serve(settings: Settings) -> Result<i32> {
             format!("a model judge's tag is at most {JUDGE_NAME_ROOM} bytes, to name its forks"),
         ));
     }
-    let (client, mut events) = Client::connect(&settings.socket).await.map_err(daemon)?;
+    let (client, mut events) = Client::connect(&settings.socket)
+        .await
+        .map_err(Error::from)?;
     let served = client
         .request(
             "serve_approvals",
             json!({"tag":tag,"lease_ms":LEASE_MS,"limit":256}),
         )
         .await
-        .map_err(daemon)?;
+        .map_err(Error::from)?;
     let (Some(lease), Some(through)) = (served["lease"].as_u64(), served["through"].as_i64())
     else {
         return Err(Error::new("daemon_protocol_mismatch"));
@@ -570,7 +565,7 @@ async fn serve(settings: Settings) -> Result<i32> {
                 json!({"tag":tag,"after":after,"through":through,"limit":256}),
             )
             .await
-            .map_err(daemon)?;
+            .map_err(Error::from)?;
     }
     for (bot, turn, calls) in group(waiting) {
         rounds.spawn(round(shared.clone(), bot, turn, calls));

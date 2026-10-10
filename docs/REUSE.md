@@ -14,9 +14,24 @@ own only the agent lifecycle and execution behavior being investigated.
 | Prime Agent / nano-rlm | [Source assessment](PRIME_INTELLECT.md): programmatic RLM context, headless operation, and explicit persistence differences. | Full process-tree costs and long-history behavior under matched contracts. Reuse design ideas; retain the selected Rust core. |
 | Codex app-server | Shared services and threads in source; 0.153.1 completed the synthetic matrix through 32 simultaneous streams. Lower one-agent CPU than Pi in this setup. | History-fork granularity, unload/recovery, model coverage, and resource cost under equivalent durable/tool workloads. |
 | Pi core and model packages | Published 0.85.1 completed the same matrix; lower sampled RSS and CPU at 8 and 32 streams. | Copying/allocation hotspots, backpressure, durable historical forks, and provider fidelity. |
+| Pi Durable | [Lifecycle screen](LIFECYCLE_MEASUREMENTS.md#pi-durable-baseline), 2026-10-02: 1.0.0 completed Agent's durable workload (32 named conversations, tools, kill/reopen, duplicate submit, historical fork) at `synchronous=FULL`, set by the adapter. | Event-log replay (absent), per-commit event batching, the serial commit line under more conversations, crash during a turn, cancellation, long histories with compaction, and memory beyond 32 conversations, each under a matched contract. |
 | Claude Code CLI | [Pinned adapter](BENCHMARKS.md#claude-code-adapter): 2.1.267 native CLI, one process per agent over stream-json, Anthropic Messages SSE; completed smoke and 32-agent 64 KiB screens on 2026-09-23 (sanity runs, not matrix results). | Per-process cost is the deployment unit; establish durable resume/fork, tools, and long-history costs, and whether any shared-process arrangement exists, before treating it as more than a measured baseline. |
 | OpenCode server | Documented session and event APIs. | Ownership/isolation and resource costs for the required workload; investigate if the first two candidates leave a relevant gap. |
 | New Rust core | Shared streaming core and durable Bob lifecycle implemented; see [prototype](RUST_PROTOTYPE.md) and [measurements](RUST_MEASUREMENTS.md). | Durable performance, coding tools, real providers, long-lived memory, and broader platform validation. |
+
+Pi Durable equivalent-workload evidence, 2026-10-02: on Agent's durable
+lifecycle workload at 32 conversations, both at `synchronous=FULL`, one Node
+process with Pi Durable sampled 138–149 MiB RSS and 2.4–3.5 CPU seconds
+without tool processes, against Agent's 21 MiB and 0.8–1.0 s, on one shared
+Linux host ([results](LIFECYCLE_MEASUREMENTS.md#pi-durable-baseline)). This is
+an exploratory observation: Pi Durable commits partial answers, serializes all
+commits on one line, delivers events per commit, and has no event log to
+replay, so the work differs. Remaining gaps before a matched comparison:
+event-log replay or a stated equivalent, crash during a turn (Pi resends the
+cut-off request; Agent marks the turn interrupted), cancellation, slow
+consumers, long histories with compaction, and scaling past 32 conversations.
+Reuse decision unchanged: Pi Durable is a measured baseline and a design
+reference for checkpointed tasks and prefix-sharing forks, not a dependency.
 
 See [runtime evidence and pinned revisions](RUNTIMES.md). Pi's human-facing
 application does not disqualify its reusable core. No engine has been rejected

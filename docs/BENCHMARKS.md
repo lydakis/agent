@@ -671,8 +671,13 @@ database replay, before and after restart. The controller and follower readers
 run in the Python observer; these measurements do not include Rust CLI processes.
 For all built-in tool schemas, use `--tools echo,shell,read,write,edit`. Shell mode
 executes shell tools; read/write/edit are registered but are not exercised here.
-Results use `rust_lifecycle_v2` and record transport, follower count, peak sampled
-daemon RSS separately from its descendant tree, and tree thread counts.
+Results use `lifecycle_v3` and record the engine, durability, transport, follower
+count, peak sampled daemon RSS separately from its descendant tree, and tree
+thread counts. From v3 the provider streams each tool call as a Responses
+function-call item (`output_item.added`, argument delta and done,
+`output_item.done`, `response.completed`) for every engine; earlier
+`rust_lifecycle_v2` echo and shell captures sent the call only in the terminal
+payload and are not the same workload.
 
 ```sh
 .local/venv/bin/python -m bench.lifecycle --transport socket --agents 32 \
@@ -705,6 +710,72 @@ Lifecycle results have a separate schema and cannot be passed to streaming
 speedups. Compare lifecycle revisions only with the same mode, toolset, complete
 workload, transport/follower count, host/power, observer fingerprint, bounds, successful runs, and achieved
 concurrency. See [the recorded measurements](LIFECYCLE_MEASUREMENTS.md).
+
+### Pi Durable adapter
+
+Added 2026-10-02. `--engine pi-durable` runs the same lifecycle workload,
+provider, observer, sampling, and guards against npm
+`@earendil-works/pi-durable` **1.0.0** (source commit and source facts in
+[RUNTIMES.md](RUNTIMES.md#pi-durable-durable-harness-over-one-commit-line)).
+It is pinned with `@earendil-works/chord` 1.0.0 and its pi-ai 1.0.0
+dependency (installed under the alias `pi-ai-durable`, next to the 0.85.1
+packages of the ephemeral Pi adapter) in `bench/adapters/package.json` and the
+pnpm lockfile.
+
+```sh
+pnpm --dir bench/adapters install --frozen-lockfile --ignore-scripts
+AGENT_BENCH_TEST_PI_DURABLE=1 .local/venv/bin/python -m unittest tests.test_pi_durable -v
+.local/venv/bin/python -m bench.lifecycle --engine pi-durable --agents 32 --mode echo --tools echo --out .local/bench/pi-durable-echo
+.local/venv/bin/python -m bench.lifecycle --engine pi-durable --synchronous normal --agents 32 --mode echo --tools echo --out .local/bench/pi-durable-normal-echo
+```
+
+**Arrangement.** `bench/adapters/pi-durable.mjs` is one Node process holding
+one `Harness` over one SQLite file, with one ownerless conversation per bot.
+The Python observer drives it over stdin/stdout JSON lines, as it drives
+Agent's stdio daemon: `create`, `submit` (with a request ID), `resume`,
+`transcript`, `entry`, and `fork`. A submitted turn ends with a
+`turn_finished` event carrying the answer entry, which is the fork checkpoint.
+Every bot's `watchEvents()` stream is written to stdout as it arrives, as
+Agent writes its events; a run fails unless that stream delivers each bot's
+final submission as done. **Node, the harness, and its tool processes are the
+charged target.** The model is pi-ai 1.0.0's own `openai-responses` API with a
+custom provider pointed at the fixture: SSE, no SDK retries, durable retries
+off, compaction off, no prompt-cache retention. Echo is a defined tool; shell
+mode uses Pi's own `bash` tool in a `NodeExecutionEnv` rooted at the bot's
+workspace (Pi's read, write, and edit tools stand in for Agent's when
+registered). Names map to conversations through a session-scoped document
+written in the commit that creates the conversation; an unknown name answers
+`bot_not_found` and is never created.
+
+**Durability.** Pi Durable's Node opener sets WAL and `synchronous=NORMAL`.
+The adapter calls the exported `openNodeSqliteDatabase()`, sets
+`synchronous=FULL` on that connection, reads both pragmas back, and fails
+unless they hold, then passes the database to `SqliteStorage.open()`. The
+`ready` event and the result record (`durability`) state the setting. With
+`--synchronous normal` the package default is kept and the run is recorded as
+`sqlite_wal_synchronous_normal`; Agent has only FULL. Under strace, one bot
+and ten text turns of this workload's 20 × 25 ms streaming made 3.1
+`fsync`/`fdatasync` calls per turn in Agent, 9.0 in Pi Durable at FULL (one per
+commit, including partial-answer commits), and none in Pi Durable at NORMAL
+(syncs only at checkpoints). These are single-bot counts, not the 32-agent
+screen.
+
+**Validation.** The provider's per-agent ledger is unchanged, but Pi resends
+the conversation in its own serialization: a leading system message with the
+instructions and assistant items without logprobs. For
+this engine the provider compares role and text, call ID, name, parsed
+arguments, and output text, and requires the instruction message; Agent's
+requests are still compared item for item. Pi's `bash` result is its combined
+output (`tool-ok`); Agent's shell result is its JSON record.
+
+**Not the same as Agent's lifecycle steps.** Pi Durable keeps no durable
+event log, so "replay" is a re-read of the committed transcript, compared
+before and after the kill; Agent's step is a replay of its event log from
+cursor zero. "Item retrieval" reads each transcript entry by ID. Event
+delivery is per commit, so text deltas arrive in batches of up to 100 ms of
+streaming rather than per provider delta. The socket transport and followers
+exist only for Agent. See [the results](LIFECYCLE_MEASUREMENTS.md#pi-durable-baseline)
+for the full list of matched and unmatched capabilities.
 
 Benchmark failures from Rust can now include a strictly whitelisted stage/code
 and numeric OS error. URLs, error messages, stderr, prompts, and credentials are

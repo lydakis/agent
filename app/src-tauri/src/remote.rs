@@ -563,15 +563,6 @@ fn ssh_reason(alias: &str, stderr: &str) -> String {
     }
 }
 
-/// The CLI's error line, `agent: CODE: DETAIL`.
-fn cli_reason(stderr: &[u8]) -> Option<String> {
-    String::from_utf8_lossy(stderr)
-        .lines()
-        .rev()
-        .find_map(|line| line.trim().strip_prefix("agent: "))
-        .map(str::to_owned)
-}
-
 /// Read `agent start`'s answer from the host. Its ready line says which
 /// daemon holds the store there, even when the host's agent refused it for
 /// another protocol, so an older daemon can be told from an older agent.
@@ -593,7 +584,7 @@ pub fn started(alias: &str, output: &Output) -> Result<Remote, String> {
             .ok()
             .filter(|value| value["event"] == "ready")
     });
-    let reason = cli_reason(&output.stderr);
+    let reason = crate::daemon::cli_reason(&output.stderr);
     let Some(ready) = ready else {
         return Err(match reason {
             Some(reason) if reason.starts_with("usage: no provider") => format!(
@@ -958,7 +949,7 @@ impl Host {
                 &String::from_utf8_lossy(&output.stderr),
             )),
             Some(127) => Err(missing(&self.alias)),
-            _ => Err(match cli_reason(&output.stderr) {
+            _ => Err(match crate::daemon::cli_reason(&output.stderr) {
                 Some(reason) if reason.starts_with("daemon_unavailable") => return Ok(()),
                 Some(reason) => format!("{reason} (on {})", self.alias),
                 None => format!(
@@ -1601,7 +1592,7 @@ cd "$root/remote" && HOME="$root/remote" SHELL=/bin/sh PATH="$root/remote/bin:/u
             script(
                 &self.remote.join("bin/agent"),
                 &format!(
-                    "#!/bin/sh\necho \"agent $*\" >> '{r}/log'\n[ \"$1\" = start ] || exit 0\ncat '{r}/ready'\n[ {status} = 0 ] || echo 'agent: daemon_protocol_mismatch: the daemon speaks protocol 1' >&2\nexit {status}\n"
+                    "#!/bin/sh\necho \"agent $*\" >> '{r}/log'\n[ \"$1\" = start ] || exit 0\ncat '{r}/ready'\n[ {status} = 0 ] || echo '{{\"error\":\"daemon_protocol_mismatch\",\"detail\":\"the daemon speaks protocol 1\"}}' >&2\nexit {status}\n"
                 ),
             );
         }
@@ -1933,7 +1924,7 @@ mod tests {
         assert_eq!(
             code(started(
                 "box",
-                &output(2, "", "agent: usage: no provider: pass")
+                &output(2, "", r#"{"error":"usage","detail":"no provider: pass"}"#)
             )),
             "host_no_provider"
         );
@@ -1943,7 +1934,8 @@ mod tests {
             "host_agent_older"
         );
         // It refused one: an upgrade there left the old daemon, which it can replace.
-        let refused = "agent: daemon_protocol_mismatch: the daemon speaks protocol 3";
+        let refused =
+            r#"{"error":"daemon_protocol_mismatch","detail":"the daemon speaks protocol 3"}"#;
         assert_eq!(
             code(started("box", &output(1, &line(now - 1), refused))),
             "daemon_older"
@@ -1962,7 +1954,11 @@ mod tests {
         assert_eq!(
             started(
                 "box",
-                &output(1, "", "agent: daemon_start_failed: disk full")
+                &output(
+                    1,
+                    "",
+                    r#"{"error":"daemon_start_failed","detail":"disk full"}"#
+                )
             )
             .unwrap_err(),
             "daemon_start_failed: disk full (on box)"

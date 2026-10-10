@@ -21,7 +21,7 @@ html,body{height:100%;margin:0;background:var(--t-bg);color:var(--t-ink);font-fa
 .main{grid-row:1;grid-column:2}
 .pane.side{grid-row:1;grid-column:3;overflow:hidden;border-left:1px solid var(--t-line);background:var(--t-panel)}
 .pane-title{display:flex;align-items:center;justify-content:space-between;padding:6px 6px 0 12px;color:var(--t-faint);font-size:12px;white-space:nowrap}
-.scroll{flex:1;overflow-y:auto;overflow-x:hidden;padding:10px 12px;scrollbar-width:thin;scrollbar-color:var(--t-line) transparent}
+.scroll{flex:1;overflow-y:auto;overflow-x:hidden;overflow-anchor:none;padding:10px 12px;scrollbar-width:thin;scrollbar-color:var(--t-line) transparent}
 .sidebar .scroll{padding:2px 0 8px}
 .main .scroll,.main .composer{padding-inline:max(16px,calc(50% - 42ch))}
 button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:pointer}
@@ -72,8 +72,73 @@ button:focus-visible,[tabindex]:focus-visible{outline:1px solid var(--amber);out
 .line.pending{color:var(--t-faint)}
 .line h{font-weight:600}
 .line code{background:var(--t-raised);border-radius:3px;padding:0 4px}
-pre.code{margin:6px 0;padding:6px 10px;background:var(--t-panel);border:1px solid var(--t-line);border-radius:6px;white-space:pre-wrap;word-break:break-word;position:relative;font:inherit}
-pre.code .lang{position:absolute;right:10px;top:4px;color:var(--t-faint);font-size:12px}
+/* A message's Markdown, kept to the terminal's one face and size: headings keep their #s. */
+.md{margin-top:4px;word-break:break-word}
+.md>:first-child{margin-top:0}.md>:last-child{margin-bottom:0}
+.md p{margin:0 0 8px}
+.md h1,.md h2,.md h3,.md h4,.md h5,.md h6{font-size:inherit;font-weight:600;margin:14px 0 4px;color:#eef0f6}
+.md h1::before{content:'# '}.md h2::before{content:'## '}.md h3::before{content:'### '}.md h4::before,.md h5::before,.md h6::before{content:'#### '}
+.md h1::before,.md h2::before,.md h3::before,.md h4::before,.md h5::before,.md h6::before{color:var(--t-faint);font-weight:400}
+.md strong{font-weight:600;color:#eef0f6}
+.md ul,.md ol{margin:0 0 8px;padding-left:3ch}
+.md li{margin:1px 0}.md li>p{margin:0 0 4px}.md li::marker{color:var(--t-faint)}
+.md li>input[type=checkbox]{margin:0 1ch 0 0;vertical-align:-2px;accent-color:var(--amber)}
+.md blockquote{margin:0 0 8px;padding-left:1.5ch;border-left:2px solid var(--t-line);color:var(--t-dim)}
+.md a{color:var(--user);text-decoration:underline;text-decoration-color:var(--t-faint);text-underline-offset:3px}
+.md a:hover{color:var(--amber);text-decoration-color:var(--amber)}
+/* A path that opens its file beside: in a message's links and a step's line. */
+.md a.file,.fpath{cursor:pointer;color:var(--user);text-decoration:underline dotted var(--t-faint);text-underline-offset:3px}
+.md a.file:hover,.fpath:hover{color:var(--amber);text-decoration-color:var(--amber)}
+.steps .sum .fpath{color:inherit}
+/* A file opened beside. */
+.fview{padding-top:2px}
+.fview>.md>.rc:first-child{margin-top:0}
+.fview .rc pre.code{max-height:none}
+.fimg{text-align:center;padding:8px;background:repeating-conic-gradient(var(--t-raised) 0 25%,var(--t-panel) 0 50%) 0 0/16px 16px;border:1px solid var(--t-line);border-radius:6px}
+.fimg img{max-width:100%;vertical-align:top}
+.md code{background:var(--t-raised);border-radius:3px;padding:0 4px;font:inherit}
+.md pre code{background:none;border-radius:0;padding:0}
+.md hr{border:0;border-top:1px solid var(--t-line);margin:12px 0}
+.md table{display:block;max-width:100%;overflow-x:auto;border-collapse:collapse;margin:0 0 8px;scrollbar-width:thin;scrollbar-color:var(--t-line) transparent}
+.md th,.md td{border:1px solid var(--t-line);padding:2px 1ch;text-align:left;vertical-align:top}
+.md th{background:var(--t-panel);font-weight:600}
+.md img{max-width:100%}
+.md button.img{font:inherit;color:var(--user);background:none;border:1px dashed var(--t-faint);border-radius:3px;padding:0 6px;cursor:pointer}
+.md button.img:hover{color:var(--amber);border-color:var(--amber)}
+/* A fenced block: its language and actions above, then the code, or what the code draws. */
+.rc{margin:6px 0 10px;border:1px solid var(--t-line);border-radius:6px;background:var(--t-panel);overflow:hidden}
+.pane.side .rc{background:var(--t-bg)}
+.rh{display:flex;align-items:center;gap:1ch;height:24px;padding:0 4px 0 10px;border-bottom:1px solid var(--t-line);color:var(--t-faint);font-size:12px}
+.rh .lang{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rh .ra{display:flex;gap:2px}
+.rh button{padding:0 6px;border-radius:4px;line-height:18px;color:var(--t-faint)}
+.rh button:hover{background:var(--t-raised);color:var(--t-ink)}
+.rc[data-view=view] [data-rich=view]::after{content:'code'}
+.rc:not([data-view=view]) [data-rich=view]::after{content:'preview'}
+.rc[data-kind=mermaid]:not([data-view=view]) [data-rich=view]::after{content:'diagram'}
+.rc[data-kind=chart]:not([data-view=view]) [data-rich=view]::after{content:'chart'}
+.rc[data-asked]:not([data-drawn]) [data-rich=view]::after{content:'drawing…'}
+.rc pre.code{margin:0;padding:6px 10px;white-space:pre;overflow-x:auto;font:inherit;scrollbar-width:thin;scrollbar-color:var(--t-line) transparent}
+.rc[data-view=view]>pre,.rc:not([data-view=view])>.view{display:none}
+.rc .view{padding:12px;overflow:auto;text-align:center}
+.rc .view svg{max-width:100%;height:auto}
+.rc[data-kind=svg] .view{background:#fff}
+.rc[data-kind=svg] .view img{max-width:100%;vertical-align:top}
+.rc .view.frame{padding:0;background:#fff}
+.rc .view.frame:empty{height:160px}
+.rc .frame iframe{display:block;width:100%;height:160px;border:0;background:#fff}
+/* Highlighting in the ground's own colors. */
+.hljs-keyword,.hljs-selector-tag,.hljs-doctag{color:#c78ad6}
+.hljs-string,.hljs-regexp,.hljs-addition,.hljs-template-tag,.hljs-selector-attr{color:#7fc47a}
+.hljs-number,.hljs-literal,.hljs-symbol,.hljs-bullet,.hljs-link{color:var(--amber)}
+.hljs-comment,.hljs-quote{color:var(--t-faint);font-style:italic}
+.hljs-title,.hljs-section,.hljs-name,.hljs-selector-id,.hljs-selector-class{color:var(--user)}
+.hljs-type,.hljs-built_in,.hljs-title.class_,.hljs-class .hljs-title{color:#6cc4c0}
+.hljs-attr,.hljs-attribute,.hljs-variable,.hljs-template-variable,.hljs-property,.hljs-params{color:#e0a87b}
+.hljs-meta,.hljs-tag,.hljs-punctuation,.hljs-operator{color:var(--t-dim)}
+.hljs-tag .hljs-name{color:var(--user)}.hljs-tag .hljs-attr{color:#e0a87b}.hljs-tag .hljs-string{color:#7fc47a}
+.hljs-deletion{color:var(--fail)}
+.hljs-emphasis{font-style:italic}.hljs-strong{font-weight:600}
 .cursor{display:inline-block;width:.6ch;height:1.1em;vertical-align:-.15em;background:var(--amber);animation:blink 1s steps(1) infinite;margin-left:1px}
 @keyframes blink{50%{opacity:0}}
 .glyph{display:inline-block;width:1ch;text-align:center}

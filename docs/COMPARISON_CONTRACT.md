@@ -49,13 +49,34 @@ concurrency, or incompatible measurement conditions. `bench.matrix` is explicitl
 exploratory and uses this unranked output. A matching declaration is still a
 reviewed assertion, not proof of every internal behavior or product feature.
 
-The new durable lifecycle screen is **Rust-only** and has its own result schema.
-Do not compare it to the ephemeral tables. Before comparing another engine,
-implement the same retained history, tools/results, fork boundary, durable
-acknowledgment, restart, replay, cancellation, output bounds, retry policy,
-consumer pace, and process accounting. Mark unsupported semantics explicitly.
-Different durability guarantees must not be relabeled equivalent simply because
-both implementations write files.
+The durable lifecycle screen has its own result schema. Do not compare it to
+the ephemeral tables. Before comparing another engine, implement the same
+retained history, tools/results, fork boundary, durable acknowledgment,
+restart, replay, cancellation, output bounds, retry policy, consumer pace, and
+process accounting. Mark unsupported semantics explicitly. Different durability
+guarantees must not be relabeled equivalent simply because both implementations
+write files.
+
+## Pi Durable lifecycle comparison
+
+Added 2026-10-02. Pi Durable 1.0.0 is the first engine run on the lifecycle
+screen besides Agent ([adapter](BENCHMARKS.md#pi-durable-adapter),
+[results](LIFECYCLE_MEASUREMENTS.md#pi-durable-baseline)). Matched in the
+exercised workload: 32 named conversations in one process, SQLite WAL with a
+sync on every commit (`synchronous=FULL`, set by the adapter; Pi's default is
+NORMAL), full history validated on every request, echo and shell tool round
+trips, kill and reopen of the same store, resume by name with no implicit
+creation, duplicate submission by request ID, a fork at the first completed
+answer whose workspace stays untouched, and an event stream to one stdio
+controller. Not matched: Pi has no event log, so replay is a transcript
+re-read; its events are batched per commit; its commits are serialized on one
+line per harness and include partial answers every 100 ms; its shell tool and
+result format differ; names are an adapter document, not a native identity;
+request serialization and tool schemas differ; Agent's socket transport has no
+counterpart. Cancellation, crash during a turn, slow consumers, retention,
+long histories, and compaction were not exercised for either engine. The
+cross-engine lifecycle results are therefore exploratory observations without
+a ranking. A NORMAL run of Pi Durable is a separate, labeled durability class.
 
 ## FX embedded comparison
 

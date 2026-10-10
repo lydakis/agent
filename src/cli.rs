@@ -328,6 +328,11 @@ fn print_flags(flags: &str) {
 
 /// Normalize value flags once for both parsers; reject unused flags instead of
 /// silently accepting them. None means help was printed successfully.
+/// Whether `prepare` accepted `--pretty` as a flag, so a failure, even one
+/// later in the same command line, is reported the way output was asked
+/// for; a `--pretty` taken as another flag's missing value is not a request.
+pub static PRETTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
     let c = command(&args[0])?;
     let mut out = Vec::with_capacity(args.len());
@@ -386,6 +391,9 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
         ) {
             if inline.is_some() {
                 return fail_with("usage", format!("{flag} takes no value"));
+            }
+            if flag == "--pretty" {
+                PRETTY.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         } else {
             let value = match inline {
