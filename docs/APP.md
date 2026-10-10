@@ -1211,9 +1211,13 @@ text. Fenced blocks are drawn by their language:
   click on **chart**: Vega draws on the window's thread, and a few characters
   of spec (a `sequence` transform to a billion, a billion ticks) can ask it
   for more than it can draw. A diagram or chart drawn shows again when its
-  pane is redrawn, and only that block: an identical one elsewhere still
-  asks, so one click never fills a chat of copies. One in a file opened
-  beside is measured once the pane has finished opening.
+  pane is redrawn, when the reply it streamed in is committed, and when its
+  message is drawn anew for highlighting: its id is its turn (or file) and
+  its source. An identical one in another turn or file still asks, so one
+  click never fills a chat of copies; one whose source changed, as in a file
+  an agent rewrote, asks too. One that fails to draw shows its error and
+  asks again before it is tried again. One in a file opened beside is
+  measured once the pane has finished opening.
 - **`html`** opens as code, and runs as a preview in a sandboxed frame only
   when asked: a click on **preview** runs it, a click on **code** stops it.
   A preview's scripts share the window's thread (a frame is not a process),
@@ -1295,10 +1299,16 @@ those 400 into the page and laying them out takes 187 to 472 ms, against 120
 to 337 ms for the old renderer's markup under its own stylesheet (read from
 b7bdfe4). This container's layout times vary widely: within a run the new
 page took 0.55 to 3.6 times the old, 1.3 times at the median, as its HTML is
-larger (654 KiB against 425 KiB) and its code highlighted. A 9 KiB reply
-streamed in 8-character deltas (1,121 of them, 44 finished blocks) costs 9.6
-to 18 ms in all, against 1.4 to 1.7 ms for plain text; parsing the whole
-reply again on each delta would cost 1.0 to 1.1 s.
+larger (654 KiB against 425 KiB) and its code highlighted. Parsing a whole
+9 KiB reply again on each of its 1,121 deltas would cost 1.0 to 1.1 s.
+
+Streaming was measured again 2026-10-10 at e1725d7, three runs, with each
+delta paying what the app's render does around it: reading whether the reader
+is at the bottom, keeping them there (a layout per delta), and for the new
+tail hydrating the blocks that delta finished. That 9 KiB reply in
+8-character deltas (44 finished blocks) costs 58 to 66 ms in all, against
+317 to 364 ms for the old tail, one text node that grows and is laid out
+whole on every delta.
 
 While a reply streams, each block that has ended (a paragraph after its blank
 line, a fence once it closes) is drawn once and appended; only the block still
