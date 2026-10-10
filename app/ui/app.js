@@ -2366,7 +2366,7 @@ async function remove(name) { await Daemon.request('delete', { bot: name }); }
 async function createProject(dir, picked = null, effort = null, threads = null) {
   const info = await Daemon.project(dir);
   const existing = bot(info.coordinator);
-  const asked = !!(picked || threads?.model || threads?.inProject);
+  const asked = !!(picked || effort || threads?.model || threads?.inProject);
   if (existing) {
     if (existing.workspace !== info.dir) throw new Error(`${info.coordinator} already belongs to ${existing.workspace ?? 'another folder'}`);
     await go(info.coordinator);

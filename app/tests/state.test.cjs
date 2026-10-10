@@ -1504,6 +1504,10 @@ test('a project name taken by another folder\'s coordinator is refused, and a re
   assert.equal(calls.length, n, 'no create and no write'); assert.equal(threads, 'unwritten');
   assert.match(p.S.ui.toast ?? '', /weather\.lead already exists and keeps the settings it was made with/);
   assert.equal(p.S.selected, 'weather.lead');
+  // An effort picked on its own is a pick too.
+  p.S.ui.toast = null;
+  await p.createProject('/synthetic/weather', null, 'high');
+  assert.match(p.S.ui.toast ?? '', /keeps the settings it was made with/);
 });
 
 test('runs fold thinking and tool calls to one line each, keep failures visible, and expand on demand', () => {
