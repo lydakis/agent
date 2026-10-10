@@ -229,7 +229,10 @@ impl Aws {
         redaction: Option<Credentials>,
         start: &Start,
     ) -> Result<(Self, Option<Error>)> {
-        let (region, service) = endpoint(url).ok_or(Error::new("invalid_provider_url"))?;
+        let (region, service) = endpoint(url).ok_or(Error::with(
+            "invalid_provider_url",
+            "a signed provider's host is bedrock-runtime.REGION.amazonaws.com or bedrock-mantle.REGION.api.aws",
+        ))?;
         let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
         if let Some(redaction) = &redaction {
             withhold(redaction, var);

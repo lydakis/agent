@@ -6,8 +6,10 @@ Agent uses flat verbs: `run`, `follow`, `fork`, `interrupt`, `wait`, `ls`,
 bots use the same commands. There is no parent/child command hierarchy.
 
 Use `agent --help`, `agent COMMAND --help`, or `agent help COMMAND` for help;
-`-h` also works. Help writes to stdout and exits successfully without opening
-a store or connecting to a daemon.
+`-h` also works. `agent --help` gives each command in one line; a command's own
+help lists its flags, and `run --help` lists a new bot's settings apart, after
+the everyday flags. Help writes to stdout and exits successfully without
+opening a store or connecting to a daemon.
 
 Inside a bot's shell tool, `AGENT_BOT` and `AGENT_BOT_ID` identify that bot.
 The client sends both as `created_by` and `created_by_id` when creating or
@@ -140,8 +142,9 @@ dependency is required.
 
 Default output is machine-readable JSON. `run` and `follow` stream one JSON
 object per line. Snapshot commands return compact JSON objects; `ls` and `turns`
-return arrays. `interrupt` prints the turn view, and `shutdown` prints nothing
-on success.
+return arrays. Every command prints its reply: `interrupt` the turn view,
+`answer` what it answered, and `shutdown` `{"stopped":true,"pid":N}` once the
+daemon is gone. Every command but `approver` takes `--pretty`.
 `shutdown` returns once the daemon process has exited and its store is closed.
 `shutdown --grace DURATION` first lets running turns finish for up to that long
 while starting none; turns still running then end `interrupted` with

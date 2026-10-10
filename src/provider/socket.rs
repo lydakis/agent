@@ -193,18 +193,18 @@ impl Sockets {
         headers: &[(&'static str, &str)],
     ) -> std::result::Result<(Session, HeaderMap), Opening> {
         let secure = url.scheme() == "https";
-        let host = url.host_str().ok_or(Error::new("invalid_provider_url"))?;
-        let port = url
-            .port_or_known_default()
-            .ok_or(Error::new("invalid_provider_url"))?;
+        let host = (url.host_str()).ok_or(Error::with("invalid_provider_url", "no host"))?;
+        let port =
+            (url.port_or_known_default()).ok_or(Error::with("invalid_provider_url", "no port"))?;
         let tcp = tokio::time::timeout(CONNECT, tokio::net::TcpStream::connect((host, port)))
             .await
             .map_err(|_| Error::new("provider_connection_timeout"))?
             .map_err(|error| Error::with("provider_connection_failed", error.kind().to_string()))?;
         let _ = tcp.set_nodelay(true);
         let io: Pin<Box<dyn Io>> = if secure {
-            let name = rustls::pki_types::ServerName::try_from(host.to_owned())
-                .map_err(|_| Error::new("invalid_provider_url"))?;
+            let name = rustls::pki_types::ServerName::try_from(host.to_owned()).map_err(|_| {
+                Error::with("invalid_provider_url", "the host is no TLS server name")
+            })?;
             let tls = tokio::time::timeout(
                 CONNECT,
                 tokio_rustls::TlsConnector::from(self.tls.clone()).connect(name, tcp),
@@ -221,7 +221,7 @@ impl Sockets {
         let mut request = target
             .as_str()
             .into_client_request()
-            .map_err(|_| Error::new("invalid_provider_url"))?;
+            .map_err(|_| Error::with("invalid_provider_url", "no WebSocket request can name it"))?;
         for (name, value) in headers.iter().copied().chain([("openai-beta", BETA)]) {
             request.headers_mut().insert(
                 HeaderName::from_static(name),
