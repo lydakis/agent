@@ -1617,6 +1617,8 @@ test("Home's first message starts its agent in your home folder in the home role
   assert.equal(calls.length, 0, 'nothing is made before a model is picked');
   assert.match(el('sheet').innerHTML, /<h4>Start Home<\/h4>/);
   assert.match(el('sheet').innerHTML, /id="hm-model"/);
+  // A second message before Home is picked does not replace the first.
+  await assert.rejects(p.submit('and another'), /home_starting/);
   el('hm-model').value = 'alpha/one'; el('hm-effort').value = 'high';
   await el('sheet').listeners.submit({ preventDefault() {} }); await settle();
   assert.deepEqual(calls.find(([op]) => op === 'policy').slice(1), ['/synthetic/you', 'home']);
@@ -1650,6 +1652,17 @@ test("Home's agent is Home: no row, no tab, no crumb, and a closed Start Home gi
   assert.match(q.elements.get('sheet').innerHTML, /No models listed/);
   q.closeSheet();
   assert.equal(q.context.document.getElementById('input').value, 'hello');
+  // Cancelled while Home is being made: Home exists, and nothing is sent.
+  const made = deferred(), sent = [];
+  const r = shell({ models: async () => [{ id: 'alpha/one' }], settings: async () => ({ providers: ['alpha'], keys: [] }), homeDir: async () => '/synthetic/you', policy: async () => ({ instructions: 'home rules', compaction_instructions: 'summary', note: 'test' }),
+    request: async (op, x) => { sent.push(op); if (op === 'create') { await made.promise; return { name: x.bot, id: 9, provider: 'alpha', model: 'one', workspace: x.workspace }; } return { nodes: [], workspaces: [], next_from: null }; } });
+  await r.submit('status?');
+  r.context.document.getElementById('hm-model').value = 'alpha/one';
+  const starting = r.context.document.getElementById('sheet').listeners.submit({ preventDefault() {} });
+  await settle(); r.closeSheet(); made.resolve(); await starting; await settle();
+  assert.equal(r.S.bots.has('home'), true);
+  assert.deepEqual(sent, ['create']);
+  assert.equal(r.context.document.getElementById('input').value, 'status?');
 });
 
 test('a new project creates its coordinator in the folder, in its role, writes its file once, and is not made twice', async () => {
@@ -2588,9 +2601,11 @@ test('Settings edits flat and council profiles independently', async () => {
     roles: async () => ['coordinator', 'swarm-flat', 'swarm-council'].map((name) => ({ name, file: own.has(name) ? `/home/u/.agents/agents/${name}.md` : null })),
     editRole: async (name) => { edited.push(name); own.add(name); return `/home/u/.agents/agents/${name}.md`; },
   });
-  // Onboarding has no roles to show; Settings, once a project exists, does.
+  // Onboarding has no roles to show; Settings, once Home or a project exists, does.
   await p.openSetup();
   assert.doesNotMatch(p.setupHTML(), /Roles/);
+  p.upsert({ name: 'home', id: 2, provider: 'openai', model: 'gpt' });
+  assert.match(p.setupHTML(), /<h3>Roles<\/h3>/);
   p.upsert({ name: 'app.lead', id: 1, provider: 'openai', model: 'gpt' });
   let html = p.setupHTML();
   assert.match(html, /<h3>Roles<\/h3>/);

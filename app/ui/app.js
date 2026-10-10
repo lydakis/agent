@@ -1982,8 +1982,11 @@ async function submitProject() {
 // Home's agent is made on the first message sent at Home: a model and an effort, as every agent
 // takes, and nothing else. It works in your home folder, in the home role, and the message goes to it
 // once it exists.
-const homeSheet = { text: '' };
+const homeSheet = { text: '', open: false };
 async function openHomeSheet(text) {
+  // One first message starts Home; another sent before it is picked comes back as a draft.
+  if (homeSheet.open) throw new Error('home_starting: choose a model for Home first');
+  homeSheet.open = true;
   closeMenu();
   let models = []; try { const [all, set] = await Promise.all([Daemon.models(), S.setup?.settings ?? Daemon.settings?.().catch(() => null)]); if (set) S.seenSettings = set; models = connected(all, set?.restartable === false && !S.setup?.settings ? null : set); } catch (e) { toast(`models: ${e?.message ?? e}`, 5000); }
   homeSheet.text = text; sheetFor = null; sheetKind = 'home';
@@ -1996,13 +1999,15 @@ async function openHomeSheet(text) {
   setTimeout(() => $('hm-model').focus?.(), 0);
 }
 async function submitHome() {
-  const go = $('hm-start'), model = $('hm-model').value, effort = $('hm-effort').value;
+  const go = $('hm-start'), model = $('hm-model').value, effort = $('hm-effort').value, text = homeSheet.text;
   if (go.disabled) return;
   if (!model) { toast('model_required: choose a model', 5000); return; }
   go.disabled = true; go.textContent = 'Starting…';
   try { if (!bot(HOME)) await createHome(model, effort || null); }
   catch (err) { toast(String(err?.message ?? err), 6000); go.disabled = false; go.textContent = 'Start and send'; return; }
-  const text = homeSheet.text; homeSheet.text = '';
+  // Cancelled while Home was being made: Home exists, and the message is back in the composer, unsent.
+  if (sheetKind !== 'home' || homeSheet.text !== text) return;
+  homeSheet.text = '';
   closeSheet();
   try { await submit(text, 'main', HOME); }
   catch (err) { toast(String(err?.message ?? err), 6000); const input = $('input'); if (!input.value) { input.value = text; grow(input); } }
@@ -2108,7 +2113,7 @@ function closeSheet() {
   if (!S.ui.sheet) return;
   // A message that would have started Home goes back to the composer, unsent.
   if (sheetKind === 'home' && homeSheet.text && !S.selected && !$('input').value) { $('input').value = homeSheet.text; grow($('input')); }
-  homeSheet.text = ''; S.ui.sheet = false; sheetFor = null; sheetKind = null; $('sheetwrap').classList.remove('on'); markSeen(); focusInput('main'); }
+  homeSheet.text = ''; homeSheet.open = false; S.ui.sheet = false; sheetFor = null; sheetKind = null; $('sheetwrap').classList.remove('on'); markSeen(); focusInput('main'); }
 $('sheet').addEventListener('change', (e) => { if (sheetKind === 'project') { projectChange(e.target); return; } if (sheetKind === 'home') { if (e.target.id === 'hm-model') followModel(e.target.value, 'hm-effort'); return; } if (e.target.dataset?.mix != null) mixChange(e.target); else if (e.target.id === 'sw-n' || e.target.id === 'sw-budget' || e.target.id === 'sw-org') { updateSwarmBudget(e.target.id); renderMix(); } });
 // A share typed updates the counts once it is a number, without redrawing the field being typed in.
 $('sheet').addEventListener('input', (e) => { if (sheetKind === 'project') { projectReady(); return; } if (sheetKind === 'home') return; if (e.target.id === 'sw-n' || e.target.id === 'sw-budget') { updateSwarmBudget(e.target.id); renderMix(); return; } if (e.target.dataset?.f !== 'share') return; mixChange(e.target); const n = agentCount(), problem = sheetProblem(n), counts = problem ? null : mixCounts(sheet.mix, mixRows(sheet.mix, n)); $('sw-mix').querySelectorAll('.count').forEach((c, i) => { c.textContent = counts ? `${counts[i]} agent${counts[i] === 1 ? '' : 's'}` : ''; c.classList.toggle('none', !!counts && !counts[i]); }); const w = $('sw-mix').querySelector('.mixfoot span'); if (w) { w.textContent = problem ?? (counts.some((c) => !c) ? `A row makes no agent at ${n} agents` : ''); w.className = w.textContent ? 'warn' : ''; } });
@@ -2861,7 +2866,8 @@ function setupHTML(kept = new Map()) {
   return `<div class="shead"><b>${ready && projects ? 'Settings' : 'Set up Agent'}</b><button type="button" class="ibtn" data-act="setup-close" title="Close" aria-label="Close"${busy}>✕</button></div>`
     + step(1, 'Providers', ready, `${rows}<div class="row">${set?.host ? `<p class="dim">This window's daemon runs on ${esc(set.host)}, with the providers its login shell there exports; change them there.</p>` : set?.restartable === false ? '<p class="dim">This window uses a daemon it did not start, so it cannot apply provider changes.</p>' : add}${st.adding === null && !set?.host ? refresh : ''}</div>${listed}`)
     + step(2, 'First project', projects, project)
-    + (projects && !S.config?.host ? rolesHTML(st, busy) : '')
+    // Onboarding is the fundamentals; the roles show once a project or Home exists.
+    + ((projects || S.bots.has(HOME)) && !S.config?.host ? rolesHTML(st, busy) : '')
     + hostsHTML(st, busy)
     + (!S.config?.host && (projects || st.triggers?.length || st.triggersAfter || st.triggersError) ? triggersHTML(st, busy) : '')
     + (st.busy ? `<p class="busy">${esc(st.busy)}</p>` : '') + (st.error ? `<p class="bad">${esc(st.error)}</p>` : '');

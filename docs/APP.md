@@ -206,7 +206,8 @@ says why beside those that answered.
 
 ![Settings with one provider failing](app/settings.png)
 
-Settings also lists the app's roles: the coordinator's, a flat and a council
+Once Home or a project exists, Settings also lists the app's roles: the
+coordinator's, a flat and a council
 swarm's, and Home's. **Edit** opens your own copy in
 `~/.agents/agents/` in your text editor, made from the app's text the first
 time, and from then on that file is the role in every project (a project's
