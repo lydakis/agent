@@ -362,6 +362,7 @@ pub enum Delivery {
     Steer,
 }
 impl Delivery {
+    pub const NAMES: [&str; 3] = ["reject", "queue", "steer"];
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "reject" => Some(Self::Reject),
@@ -369,6 +370,16 @@ impl Delivery {
             "steer" => Some(Self::Steer),
             _ => None,
         }
+    }
+    /// `parse`, refusing a name it does not know with the ones it does.
+    pub fn requested(name: &str) -> Result<Self> {
+        Self::parse(name).ok_or_else(|| {
+            Error::with(
+                "invalid_delivery",
+                format!("{name} is not one of {}", Self::NAMES.join(", ")),
+            )
+            .facts(serde_json::json!({"deliveries":Self::NAMES}))
+        })
     }
     pub fn name(self) -> &'static str {
         match self {

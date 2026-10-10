@@ -2511,8 +2511,7 @@ impl Service {
                 }
                 let delivery = match delivery.as_deref() {
                     None => Delivery::Reject,
-                    Some(mode) => Delivery::parse(mode)
-                        .ok_or_else(|| Error::with("invalid_delivery", mode))?,
+                    Some(mode) => Delivery::requested(mode)?,
                 };
                 if expected_turn.is_some() && delivery != Delivery::Steer {
                     return fail_with("invalid_delivery", "expected_turn needs delivery steer");

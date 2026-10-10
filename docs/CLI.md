@@ -173,10 +173,13 @@ xterm.js with a small OSC 7501 handler that draws the tab's mark.
 A failure prints one JSON object on stderr, the shape the daemon answers with:
 `error` is the code, `detail` states the rule that was broken, and any other
 field is a fact about the current state, named as a request field (such as
-`running_turn`, `bot_id`, `levels` or `field`). When the CLI can say how to get
+`running_turn`, `bot_id`, `levels`, `deliveries` or `field`). When the CLI can say how to get
 past the refusal in its own flags, it adds `hint`. With `--pretty` the failure
 is one line instead: `agent: CODE: DETAIL`, followed by `; HINT` when there is
-one. Usage errors use the same object with `error` set to `usage`.
+one. Usage errors use the same object with `error` set to `usage`. A detail
+that echoes what was sent is cut in its middle to about 4 KiB, so a refusal
+always fits in one response. When `run` or `start` starts a daemon that fails,
+the command fails with the daemon's own error, such as `invalid_provider_url`.
 
 ```json
 {"error":"bot_busy","detail":"turn 4 is running","running_turn":4,"fork_point":9,

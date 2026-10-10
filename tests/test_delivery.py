@@ -266,8 +266,10 @@ class DeliveryTests(ModelFixture):
         # The same facts for programs, as of the refusal.
         self.assertEqual(refused['running_turn'], first['turn'])
         self.assertIsInstance(refused['fork_point'], int)
-        self.assertEqual(client.request('submit', bot='Bob', request_id='x', prompt='never', delivery='later')['error'],
-                         'invalid_delivery')
+        unknown = client.request('submit', bot='Bob', request_id='x', prompt='never', delivery='later')
+        self.assertEqual((unknown['error'], unknown['detail'], unknown['deliveries']),
+                         ('invalid_delivery', 'later is not one of reject, queue, steer',
+                          ['reject', 'queue', 'steer']))
         second = client.request('submit', bot='Bob', request_id='2', prompt='second', delivery='queue')['result']
         third = client.request('submit', bot='Bob', request_id='3', prompt='third', delivery='queue')['result']
         self.assertEqual((second['status'], third['status']), ('queued', 'queued'))

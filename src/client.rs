@@ -668,10 +668,19 @@ fn ensure_daemon(options: &Options) -> Result<Connection> {
             startup_remaining(deadline)?;
             let mut log = options.store.clone().into_os_string();
             log.push(".log");
-            let detail = std::fs::read_to_string(log)
+            // The child reports its failure as the CLI does, one JSON
+            // object as its last log line; that error is this command's.
+            let last = std::fs::read_to_string(log)
                 .ok()
-                .and_then(|text| text.lines().last().map(str::to_owned))
-                .unwrap_or_else(|| format!("daemon exited with {status}"));
+                .and_then(|text| text.lines().last().map(str::to_owned));
+            if let Some(error) = last
+                .as_deref()
+                .and_then(|line| serde_json::from_str(line).ok())
+                .and_then(|value| Error::reported(&value))
+            {
+                return Err(error);
+            }
+            let detail = last.unwrap_or_else(|| format!("daemon exited with {status}"));
             return fail_with("daemon_start_failed", detail);
         }
         // An ownership-conflict exit only says our child lost. The winner

@@ -985,8 +985,8 @@ class CliTests(ModelFixture):
                                  '--model', 'fixture/model', 'hello'], env=clean_env(),
                                 capture_output=True, text=True, timeout=3)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('daemon_start_failed', result.stderr)
-        self.assertIn('invalid_provider_url', result.stderr)
+        # The daemon's own refusal, not a wrapper around its text.
+        self.assertEqual(json.loads(result.stderr)['error'], 'invalid_provider_url')
         self.assertLess(time.monotonic()-start, 2)
 
     def test_startup_ownership_conflict_has_a_bounded_wait(self):
