@@ -421,6 +421,94 @@ fn not_dangling(path: &Path) -> Result<(), Failure> {
     Ok(())
 }
 
+/// The memory indexes a new bot in `workspace` starts with: the person's
+/// `~/.agents/memory/MEMORY.md`, then, when the workspace is in a project,
+/// `~/.agents/memory/projects/NAME/MEMORY.md`. The app's memory script
+/// keeps both.
+pub fn memory_indexes(workspace: &Path) -> Result<Vec<PathBuf>, Failure> {
+    memory_indexes_from(workspace, home().as_deref())
+}
+
+fn memory_indexes_from(workspace: &Path, home: Option<&Path>) -> Result<Vec<PathBuf>, Failure> {
+    let Some(home) = home else {
+        return Ok(Vec::new());
+    };
+    let root = home.join(".agents/memory");
+    let mut found = vec![root.join("MEMORY.md")];
+    if let Some(name) = project(workspace)? {
+        found.push(root.join("projects").join(name).join("MEMORY.md"));
+    }
+    Ok(found)
+}
+
+/// The project `dir` belongs to: the name in the nearest
+/// `.agents/project.toml` at or above it. A task's worktree is another
+/// checkout of its project's repository, where that file may not be
+/// committed or may differ, so a folder in one is looked up at the same
+/// place in the repository's main checkout first.
+pub fn project(dir: &Path) -> Result<Option<String>, Failure> {
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let main = main_checkout(&dir);
+    for start in main.iter().chain(std::iter::once(&dir)) {
+        for at in start.ancestors() {
+            let path = at.join(".agents/project.toml");
+            if !is_file(&path)? {
+                continue;
+            }
+            let unreadable = |reason: String| Failure::Unreadable {
+                path: path.clone(),
+                reason,
+            };
+            let text = read_bounded(&path, 64 * 1024)?
+                .ok_or_else(|| unreadable("larger than 64 KiB".into()))?;
+            let table: toml::Table = text
+                .parse()
+                .map_err(|e: toml::de::Error| unreadable(e.message().to_owned()))?;
+            return match table.get("name") {
+                Some(toml::Value::String(name)) if project_name(name) => Ok(Some(name.clone())),
+                _ => Err(unreadable(
+                    "name must be 1-64 of A-Z a-z 0-9 - _ ., not starting or ending with .".into(),
+                )),
+            };
+        }
+    }
+    Ok(None)
+}
+
+fn project_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        && !name.starts_with('.')
+        && !name.ends_with('.')
+}
+
+/// The same place as `dir` in its repository's main checkout, when `dir` is
+/// in a linked worktree: its `.git` is a file naming the worktree's git
+/// folder, whose `commondir` names the main checkout's `.git`. Read from
+/// the files rather than by running git, so composing spawns nothing.
+fn main_checkout(dir: &Path) -> Option<PathBuf> {
+    for top in dir.ancestors() {
+        let dot = top.join(".git");
+        let Ok(meta) = std::fs::symlink_metadata(&dot) else {
+            continue;
+        };
+        if !meta.is_file() {
+            return None;
+        }
+        let text = std::fs::read_to_string(&dot).ok()?;
+        let gitdir = top.join(text.strip_prefix("gitdir: ")?.trim());
+        let common = std::fs::read_to_string(gitdir.join("commondir")).ok()?;
+        let common = gitdir.join(common.trim()).canonicalize().ok()?;
+        if common.file_name()? != ".git" {
+            return None;
+        }
+        return Some(common.parent()?.join(dir.strip_prefix(top).ok()?));
+    }
+    None
+}
+
 fn entry_row(entry: &Entry) -> String {
     format!(
         "\n- {}: {} ({})",
@@ -677,7 +765,7 @@ pub fn instructions(
     let mut indexes = Vec::new();
     for path in memory {
         match std::fs::symlink_metadata(path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => not_dangling(path)?,
             _ => indexes.extend(append(&mut text, path.clone(), "\n\n")?),
         }
     }
@@ -948,7 +1036,71 @@ mod tests {
         std::fs::write(&user, [0xff, 0xfe]).unwrap();
         let error = instructions(&root, None, &memory).unwrap_err();
         assert_eq!(error.code(), "instructions_unreadable");
+        // So does one behind a link to a folder that is gone.
+        std::os::unix::fs::symlink(root.join("gone"), root.join("link")).unwrap();
+        let behind = [root.join("link/MEMORY.md")];
+        let error = instructions(&root, None, &behind).unwrap_err();
+        assert_eq!(error.code(), "instructions_unreadable");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_worktree_finds_its_project_and_memory_through_the_main_checkout() {
+        let home = temp("memory-home");
+        let repo = temp("memory-repo");
+        let git = |dir: &Path, line: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(line)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{line:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&repo, &["init", "-q"]);
+        std::fs::create_dir_all(repo.join("web/.agents")).unwrap();
+        std::fs::write(repo.join("web/.agents/project.toml"), "name = \"old\"\n").unwrap();
+        git(&repo, &["add", "web"]);
+        git(&repo, &["commit", "-qm", "x"]);
+        // The main checkout's file is what counts, committed or not.
+        std::fs::write(repo.join("web/.agents/project.toml"), "name = \"demo\"\n").unwrap();
+        let worktree = repo.with_extension("worktree");
+        let _ = std::fs::remove_dir_all(&worktree);
+        let at = worktree.to_str().unwrap();
+        git(&repo, &["worktree", "add", "-q", "-b", "task", at, "HEAD"]);
+        assert_eq!(
+            project(&worktree.join("web")).unwrap().as_deref(),
+            Some("demo")
+        );
+        assert_eq!(project(&repo.join("web")).unwrap().as_deref(), Some("demo"));
+        assert_eq!(project(&repo).unwrap(), None);
+        let memory = home.join(".agents/memory");
+        assert_eq!(
+            memory_indexes_from(&worktree.join("web"), Some(&home)).unwrap(),
+            [
+                memory.join("MEMORY.md"),
+                memory.join("projects/demo/MEMORY.md")
+            ]
+        );
+        assert_eq!(
+            memory_indexes_from(&repo, Some(&home)).unwrap(),
+            [memory.join("MEMORY.md")]
+        );
+        assert_eq!(
+            memory_indexes_from(&repo, None).unwrap(),
+            Vec::<PathBuf>::new()
+        );
+        std::fs::write(repo.join("web/.agents/project.toml"), "name = \"../up\"\n").unwrap();
+        let error = project(&repo.join("web")).unwrap_err();
+        assert_eq!(error.code(), "instructions_unreadable");
+        git(&repo, &["worktree", "remove", "--force", at]);
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]

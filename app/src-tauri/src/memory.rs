@@ -186,76 +186,18 @@ fn run(
     }
 }
 
-/// The project a folder belongs to: the nearest `.agents/project.toml` at or
-/// above it. A task's worktree is another checkout of its project's
-/// repository, without the project's file when it is not committed, so a
-/// folder where none is found is moved to the same place in the
-/// repository's main checkout and looked up again.
+/// The project a folder belongs to, as the client composing a new agent
+/// finds it: the nearest `.agents/project.toml`, looked up from a task's
+/// worktree at the same place in the repository's main checkout.
 fn project_of(cwd: &Path) -> Result<String, String> {
-    let at = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-    if let Some(name) = nearest_project(&at)? {
-        return Ok(name);
+    match agent_client::policy::project(cwd) {
+        Ok(Some(name)) => Ok(name),
+        Ok(None) => Err(format!(
+            "project_unknown: {}: no .agents/project.toml at or above this folder; pass --project NAME or --user",
+            cwd.display()
+        )),
+        Err(error) => Err(format!("project_invalid: {error}")),
     }
-    let git = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&at)
-        .args([
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-common-dir",
-            "--show-prefix",
-        ])
-        .stderr(std::process::Stdio::null())
-        .output();
-    if let Ok(out) = git
-        && out.status.success()
-    {
-        let out = String::from_utf8_lossy(&out.stdout);
-        let mut lines = out.lines();
-        if let (Some(common), Some(prefix)) = (lines.next(), lines.next())
-            && Path::new(common).file_name().is_some_and(|f| f == ".git")
-            && let Some(main) = Path::new(common).parent()
-            && let Some(name) = nearest_project(&main.join(prefix))?
-        {
-            return Ok(name);
-        }
-    }
-    Err(format!(
-        "project_unknown: {}: no .agents/project.toml at or above this folder; pass --project NAME or --user",
-        at.display()
-    ))
-}
-
-fn nearest_project(at: &Path) -> Result<Option<String>, String> {
-    for dir in at.ancestors() {
-        if dir.join(crate::project::FILE).is_file() {
-            let project = crate::project::read(dir)?;
-            return Ok(Some(
-                project["name"].as_str().unwrap_or_default().to_owned(),
-            ));
-        }
-    }
-    Ok(None)
-}
-
-/// The memory indexes a new agent in `workspace` starts with: the
-/// person's, then its project's when it is in one. An index not written
-/// yet is left out when the instructions are composed.
-pub fn indexes(workspace: &Path) -> Result<Vec<PathBuf>, String> {
-    let root = std::env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join(".agents/memory"))
-        .ok_or("memory_failed: no HOME")?;
-    indexes_in(&root, workspace)
-}
-
-fn indexes_in(root: &Path, workspace: &Path) -> Result<Vec<PathBuf>, String> {
-    let mut found = vec![root.join(INDEX)];
-    match project_of(workspace) {
-        Ok(name) => found.push(root.join("projects").join(name).join(INDEX)),
-        Err(error) if error.starts_with("project_unknown: ") => {}
-        Err(error) => return Err(error),
-    }
-    Ok(found)
 }
 
 /// The local date, for a fact's `verified`.
@@ -840,12 +782,6 @@ mod tests {
         assert_eq!(project_of(&repo.join("web")).unwrap(), "demo");
         let unknown = project_of(&repo).unwrap_err();
         assert!(unknown.starts_with("project_unknown: "), "{unknown}");
-        // A new agent starts with the person's index and its project's.
-        assert_eq!(
-            indexes_in(&root, &worktree.join("web")).unwrap(),
-            [root.join(INDEX), root.join("projects/demo").join(INDEX)]
-        );
-        assert_eq!(indexes_in(&root, &repo).unwrap(), [root.join(INDEX)]);
         let save = |cwd: &Path, scope: &[&str]| {
             let mut line = vec![
                 "save",

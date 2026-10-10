@@ -1548,7 +1548,9 @@ past 4 KiB is `fact_too_large` rather than cut.
 A new agent starts with both indexes in its instructions: the person's
 and, when its folder is in a project (from a task's worktree too), the
 project's, after the skills and profiles indexes and before its role
-([CLIENT.md](CLIENT.md#layers)). They are what memory held when the agent
+([CLIENT.md](CLIENT.md#layers)). That holds for agents the app creates and
+for those an agent creates with `agent run --new --agents`, such as a
+coordinator's tasks. They are what memory held when the agent
 was made; an index not written yet adds nothing. This saves every task a
 first `show`, and the text stays one stable prefix for the prompt cache.
 

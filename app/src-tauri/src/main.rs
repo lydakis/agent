@@ -890,7 +890,7 @@ fn compose(
             .collect::<Vec<_>>()
             .join("\n\n");
     }
-    let memory = memory::indexes(workspace)?;
+    let memory = agent_client::policy::memory_indexes(workspace).map_err(failed)?;
     let composed =
         agent_client::policy::instructions(workspace, role.as_ref(), &memory).map_err(failed)?;
     let mut note = format!(
