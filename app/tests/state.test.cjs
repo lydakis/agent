@@ -33,7 +33,7 @@ function page(daemon = {}, storage = null) {
   });
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readTriggers, triggerAct, tellLead, markSeen };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readTriggers, triggerAct, tellLead, turnNews, markSeen };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -2341,7 +2341,12 @@ test('a task turn whose answer a trigger passes to its coordinator is not news f
   await p.onEvent({ event: 'accepted', bot: 'demo.review', turn: 10, data: { request_id: 'trigger_9-1_2.1790000000.44.to.1', origin: 'trigger' } });
   await p.onEvent({ event: 'turn_finished', bot: 'demo.review', turn: 10, data: { status: 'completed' } });
   assert.equal(p.S.heldNews.at(-1)[6], 1);
-  p.S.snapshot = false; p.S.heldNews = [];
+  // Its answer, replayed before the held news goes out, keeps it from being news.
+  await p.onEvent({ event: 'accepted', bot: 'demo.lead', turn: 4, data: { from: { bot: 'demo.review', turn: 10, id: 2 } } });
+  p.S.snapshot = false;
+  for (const news of p.S.heldNews.splice(0)) p.turnNews(...news);
+  await p.tick();
+  assert.equal(p.S.wakes.get('demo.lead')?.tasks.size ?? 0, 0, 'the answer it was held with reached the coordinator');
   // One whose answer goes elsewhere, or a plain trigger's, still is.
   await p.onEvent({ event: 'accepted', bot: 'demo.review', turn: 8, data: { request_id: 'trigger_9-1_2.1790000000.42.to.9', origin: 'trigger' } });
   await p.onEvent({ event: 'turn_finished', bot: 'demo.review', turn: 8, data: { status: 'completed' } });

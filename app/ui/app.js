@@ -33,7 +33,7 @@ const S = {
   swarms: new Map(), memberOf: new Map(),
   // Who asked for each turn another bot asked for, until it ends, and what each coordinator has yet to
   // hear about its tasks (see `wake`), and turns that ended live before the snapshot said who made their bot.
-  turnFrom: new Map(), turnOrigin: new Map(), answerTo: new Map(), forwarding: new Map(), wakes: new Map(), heldNews: [],
+  turnFrom: new Map(), turnOrigin: new Map(), answerTo: new Map(), forwarding: new Map(), answered: new Set(), wakes: new Map(), heldNews: [],
   // Bots whose finished turn the person has not looked at yet (see `shownStatus`), and turns another
   // bot asked for that the person steered into, whose end is theirs to see too.
   unseen: new Set(), wanted: new Set(),
@@ -273,12 +273,15 @@ function turnNews(name, turn, status, from, callId, origin, answered) {
   const b = bot(name);
   if (answered == null || !b || answered !== creatorOf(b)?.id) return tellLead(name, turn, status, from, callId, origin);
   const key = `${name}\u0000${turn}`;
+  if (S.answered.delete(key)) return;
   clearTimeout(S.forwarding.get(key));
   S.forwarding.set(key, setTimeout(() => { S.forwarding.delete(key); tellLead(name, turn, status, from, undefined, origin); }, FORWARD_MS));
 }
+// An answer replayed while the snapshot holds its turn's news: that news, once let go, is no news.
 function forwarded(from) {
   const key = `${from.bot}\u0000${from.turn}`;
   if (S.forwarding.has(key)) { clearTimeout(S.forwarding.get(key)); S.forwarding.delete(key); }
+  else if (S.snapshot) S.answered.add(key);
 }
 function creatorOf(b) { const p = b.parent && b.parentId != null ? S.bots.get(b.parent) : null; return p && p.id === b.parentId ? p : null; }
 function forgetBot(name) {
@@ -1172,6 +1175,7 @@ async function attachOnce() {
       }
       S.snapshot = false; S.deleted.clear();
       for (const news of S.heldNews.splice(0)) turnNews(...news);
+      S.answered.clear();
       S.attached = true;
       // What waited while detached goes out now, each window permitting.
       for (const lead of S.wakes.keys()) wakeSoon(lead);
@@ -1202,7 +1206,7 @@ function forgetStore() {
   S.cursor = 0; S.bots.clear(); S.transcripts.clear(); S.drafts.clear(); S.override.clear(); S.effort.clear(); S.families.clear();
   S.swarms.clear(); S.memberOf.clear(); S.deleted.clear(); looked.clear();
   for (const w of S.wakes.values()) clearTimeout(w.timer);
-  S.wakes.clear(); S.turnFrom.clear(); S.turnOrigin.clear(); S.answerTo.clear(); S.heldNews = [];
+  S.wakes.clear(); S.turnFrom.clear(); S.turnOrigin.clear(); S.answerTo.clear(); S.heldNews = []; S.answered.clear();
   for (const timer of S.forwarding.values()) clearTimeout(timer); S.forwarding.clear(); S.unseen.clear(); S.wanted.clear();
   S.selected = ''; S.autoSelect = true; S.ui.side = null; S.ui.folded = new Set();
   S.botsGen += 1; S.shapeGen += 1;

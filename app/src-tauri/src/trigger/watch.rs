@@ -734,11 +734,15 @@ mod tests {
         let why = "turn end of p.task: turn:p.task/3 completed";
         assert!(act(&places, &mut w, Step::Fire(0, why.into())));
         assert_eq!(read_watched(&places, &w[0].trigger), Some((7, 0)));
-        let asked = take_ask(&places, &w[0].trigger).unwrap();
-        assert_eq!((asked.why.as_str(), asked.turn), (why, Some(7)));
-        // A watcher stopped before it saved asks again: the same ask.
+        let asked = take_ask(&places, &w[0].trigger).unwrap().unwrap();
+        assert_eq!((asked.why.as_str(), asked.kind), (why, Ask::Turn(7)));
+        // A watcher stopped before it saved asks again: the same ask, which
+        // the fire holding it takes with it.
         assert!(act(&places, &mut w, Step::Fire(0, why.into())));
         assert_eq!(std::fs::read_dir(places.asks("t")).unwrap().count(), 1);
+        let again = take_ask(&places, &w[0].trigger).unwrap().unwrap();
+        assert_eq!(again.path, asked.path);
+        assert_eq!(std::fs::read_dir(places.asks("t")).unwrap().count(), 0);
         std::fs::remove_file(&asked.path).unwrap();
         // An ask it cannot make leaves its place unsaved, to read that turn
         // end again.
@@ -752,7 +756,7 @@ mod tests {
         std::fs::remove_file(places.plist("t")).unwrap();
         assert!(act(&places, &mut w, Step::Fire(0, why.into())));
         assert!(w[0].done);
-        assert!(take_ask(&places, &w[0].trigger).is_none());
+        assert!(take_ask(&places, &w[0].trigger).unwrap().is_none());
         std::fs::remove_dir_all(&root).unwrap();
     }
 
