@@ -36,7 +36,7 @@ function page(daemon = {}, storage = null) {
   context.Rich = context.window.Rich;
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules, tellLead, markSeen, renderFile };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, dropFile, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules, tellLead, markSeen, renderFile };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -408,6 +408,15 @@ test('highlighting arriving redraws a file beside only when its code waited for 
   v = 2; p.renderFile(); assert.equal(files, 3);
 });
 
+test('a file closed and opened again never shares a view key with the one before', async () => {
+  const p = page({ readFile: async () => new TextEncoder().encode('{}') });
+  p.setRender(() => {});
+  await p.openFile('Bob', '/w/c.vl.json'); const first = p.S.ui.file.gen;
+  p.dropFile(); const again = p.openFile('Bob', '/w/c.vl.json');
+  assert.ok(p.S.ui.file.gen > first, `${p.S.ui.file.gen} after ${first}`);
+  await again; assert.ok(p.S.ui.file.gen > first + 1);
+});
+
 test('a file an agent rewrote while open waits for a click to run', async () => {
   const enc = (s) => new TextEncoder().encode(s), opened = [];
   const p = page({ readFile: async (full) => { opened.push(full); return enc('<p>hi</p>'); } }), Rich = p.context.Rich;
@@ -465,6 +474,9 @@ test('charts, file links and opened files draw by kind', () => {
   const links = Rich.html('[plan](PLAN.md) [code](src/a.rs:12) [line](src/b.rs#L4-L9) [web](https://example.com) [here](#top)');
   assert.match(links, /<a class="file" href="#" data-file="PLAN.md">plan<\/a>/);
   assert.match(links, /data-file="src\/a.rs">code/);
+  // A file with no folder takes its line too; a scheme with a number names no file.
+  assert.match(Rich.html('[code](a.rs:12) [doc](README.md:20:4)'), /data-file="a.rs">code.*data-file="README.md">doc/);
+  assert.doesNotMatch(Rich.html('[call](tel:12345)'), /data-file/);
   assert.match(links, /data-file="src\/b.rs">line/);
   // A section of another file opens that file; a `#` in a name is written `%23`.
   assert.match(Rich.html('[install](README.md#install)'), /data-file="README.md">install/);

@@ -1539,17 +1539,19 @@ function openFileFrom(path, el) {
   const who = beside ? S.ui.side : S.selected, b = bot(who);
   return openFile(who, joinPath(b?.workspace ?? S.config?.workspace ?? '', path));
 }
-// `asked`: someone opened it, so what it holds draws at once.
+// `asked`: someone opened it, so what it holds draws at once. `gen` counts every opening and load
+// across closes, so a view never shares a key with one before it.
+let fileGen = 0;
 async function openFile(who, full, asked = true) {
   const old = S.ui.file;
   if (old?.url) URL.revokeObjectURL(old.url);
-  const f = S.ui.file = { bot: who, full, asked, gen: (old?.gen ?? 0) + 1, state: 'loading', view: null, url: null };
+  const f = S.ui.file = { bot: who, full, asked, gen: ++fileGen, state: 'loading', view: null, url: null };
   render();
   try {
     const bytes = new Uint8Array(await Daemon.readFile(full));
     if (S.ui.file !== f) return;
-    Object.assign(f, { state: 'ok', bytes: bytes.subarray(0, FILE_CAP), more: bytes.length > FILE_CAP, gen: f.gen + 1 });
-  } catch (e) { if (S.ui.file !== f) return; Object.assign(f, { state: 'error', error: String(e?.message ?? e), gen: f.gen + 1 }); }
+    Object.assign(f, { state: 'ok', bytes: bytes.subarray(0, FILE_CAP), more: bytes.length > FILE_CAP, gen: ++fileGen });
+  } catch (e) { if (S.ui.file !== f) return; Object.assign(f, { state: 'error', error: String(e?.message ?? e), gen: ++fileGen }); }
   render();
 }
 // A file opened from an agent goes with that agent, and with the store it came from.

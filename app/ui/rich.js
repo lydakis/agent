@@ -162,9 +162,13 @@ window.Rich = (() => {
   // A link's target as a path, without its fragment (`a.md#install`, `a.rs#L12`) or a line suffix
   // (`a.rs:12`); null for a URL or anchor. A `#` or `:` in a file's name is written `%23` or `%3A`.
   function filePath(href) {
+    const scheme = /^[a-z][a-z0-9+.-]*:/i;
     let p = (href ?? '').replace(/#.*$/s, '').replace(/^file:\/\//i, '');
-    if (!p || /^[a-z][a-z0-9+.-]*:/i.test(p)) return null;
-    p = p.replace(/:\d+(:\d+)?$/, ''); try { p = decodeURIComponent(p); } catch (_) {}
+    const bare = p.replace(/:\d+(:\d+)?$/, '');
+    // `a.rs:12` is a file and its line; `tel:12345` keeps its scheme, as what precedes the number
+    // names no file.
+    if (!bare || scheme.test(bare) || (bare !== p && !/[./]/.test(bare))) return null;
+    p = bare; try { p = decodeURIComponent(p); } catch (_) {}
     return p || null;
   }
   // A message's HTML, inside the caller's `.md` box. One that would draw past 100,000 tags (about

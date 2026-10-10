@@ -1267,7 +1267,7 @@ and licenses in `LICENSES.txt`), so drawing a message fetches nothing.
 
 A file opens beside the chat, in the pane a task opens in, from a path a step
 read, wrote or edited (the path in its line) or a message's link to a path
-(`[plan](PLAN.md)`, `src/a.rs:12`, `src/a.rs#L4`, `README.md#install`; the
+(`[plan](PLAN.md)`, `src/a.rs:12` or `a.rs:12`, `src/a.rs#L4`, `README.md#install`; the
 line or section is dropped). A path is the agent's folder's, and a link
 inside an open file is relative to that file. The core reads the first 4 MiB of a regular file (`read_file`; a
 FIFO or device is refused, as reading one need not end, and a window on a
