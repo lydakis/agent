@@ -1489,7 +1489,8 @@ fn interrupt(options: &Options) -> Result<i32> {
     let Some(turn) = state["running_turn"].as_i64() else {
         return fail_with("no_active_turn", format!("{bot} has no running turn"));
     };
-    connection.request("interrupt", json!({"bot":bot,"turn":turn}))?;
+    let view = connection.request("interrupt", json!({"bot":bot,"turn":turn}))?;
+    print_json(&view, options.pretty)?;
     Ok(0)
 }
 
