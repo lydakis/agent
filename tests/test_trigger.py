@@ -365,10 +365,15 @@ class TriggerFireTests(ModelFixture):
     def test_a_trigger_at_its_run_limit_sends_nothing_more(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
         first = self.fire('p.task', 'once', extra=['--runs', '1'], generation='g1')
-        self.assertEqual(first['last']['outcome'], 'sent', first)
         self.settle('p.task')
-        # Its end could not unload it (no launchd here): a later fire only ends it again.
-        if sys.platform != 'darwin':
+        self.assertEqual(len(self.turns('p.task')), 2)
+        if sys.platform == 'darwin':
+            # Delivered to its limit, it ends leaving nothing.
+            self.assertIsNone(first)
+            self.assertFalse((self.home / 'Library/LaunchAgents/me.lydakis.agent.trigger.p.task.plist').exists())
+        else:
+            # Its end could not unload it (no launchd here): a later fire only ends it again.
+            self.assertEqual(first['last']['outcome'], 'sent', first)
             self.fire('p.task', 'once', extra=['--runs', '1'], generation='g1')
             self.assertEqual(len(self.turns('p.task')), 2)
 
