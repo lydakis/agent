@@ -70,6 +70,10 @@ impl Places {
     fn asks(&self, name: &str) -> PathBuf {
         self.state.join(format!("{name}.asks"))
     }
+    /// The ask a fire took out of the queue, until it is done with it.
+    fn taking(&self, name: &str) -> PathBuf {
+        self.state.join(format!("{name}.taking"))
+    }
 }
 
 /// What launchd is asked to do. Tests stand in for it.
@@ -700,44 +704,82 @@ fn head_log(repo: &Path) -> Option<PathBuf> {
 /// start and end). HEAD back where it was is not news; a log rewritten
 /// since (expired, or made again) is news when HEAD is elsewhere.
 fn moved(repo: &Path, since: &Seen) -> (bool, Seen) {
-    let now = Seen {
-        head: head(repo),
-        log: head_log(repo).and_then(|log| std::fs::metadata(log).ok().map(|m| m.len())),
-    };
+    let now = seen(repo);
     let news = match (&since.head, since.log) {
         _ if now.head.is_none() => false,
         (None, _) => true,
         (head, _) if *head == now.head => false,
-        (_, Some(at)) if now.log.is_some_and(|len| at <= len) => {
-            entries_since(repo, at).iter().any(|what| makes(what))
-        }
+        (_, Some(at)) if now.log.is_some_and(|len| at <= len) => made_since(repo, at),
         _ => true,
     };
     (news, now)
 }
 
-/// The actions of the HEAD log's entries past `at`, each the text after
-/// its tab. Titles in a legacy encoding are not UTF-8; actions are ASCII.
-fn entries_since(repo: &Path, at: u64) -> Vec<String> {
-    use std::io::{Read, Seek};
-    let mut text = Vec::new();
-    let read = head_log(repo)
-        .and_then(|log| std::fs::File::open(log).ok())
-        .map(|mut file| {
-            file.seek(std::io::SeekFrom::Start(at))
-                .and_then(|_| file.read_to_end(&mut text))
-        });
-    if !matches!(read, Some(Ok(_))) {
-        return vec![String::new()];
+/// Where HEAD and its log are, taken together: a commit between reading
+/// one and the other would pair a HEAD with a log that has passed it, so
+/// both are read again until the log stands still around HEAD.
+fn seen(repo: &Path) -> Seen {
+    let log_len = || head_log(repo).and_then(|log| std::fs::metadata(log).ok().map(|m| m.len()));
+    let mut log = log_len();
+    for _ in 0..8 {
+        let head = head(repo);
+        let after = log_len();
+        if after == log {
+            return Seen { head, log };
+        }
+        log = after;
     }
-    String::from_utf8_lossy(&text)
-        .lines()
-        .map(|line| {
-            line.split_once('\t')
-                .map_or("", |(_, what)| what)
-                .to_owned()
-        })
-        .collect()
+    // A log that never stands still: no place in it is kept, so the next
+    // look takes any other HEAD for news.
+    Seen {
+        head: head(repo),
+        log: None,
+    }
+}
+
+/// How much of an entry's action is read: enough for its verb, whatever
+/// the commit title after it.
+const ACTION: usize = 64;
+
+/// Whether any entry of the HEAD log past `at` made a commit, read as a
+/// stream with each action cut to `ACTION` bytes, so a long title costs
+/// nothing. One that cannot be read is news. Titles in a legacy encoding
+/// are not UTF-8; actions are ASCII.
+fn made_since(repo: &Path, at: u64) -> bool {
+    use std::io::{BufRead, Seek};
+    let Some(mut file) = head_log(repo).and_then(|log| std::fs::File::open(log).ok()) else {
+        return true;
+    };
+    if file.seek(std::io::SeekFrom::Start(at)).is_err() {
+        return true;
+    }
+    let mut reader = std::io::BufReader::new(file);
+    let (mut action, mut in_action) = (Vec::with_capacity(ACTION), false);
+    loop {
+        let buf = match reader.fill_buf() {
+            Ok([]) => break,
+            Ok(buf) => buf,
+            Err(_) => return true,
+        };
+        for &byte in buf {
+            match byte {
+                b'\n' => {
+                    if makes(&String::from_utf8_lossy(&action)) {
+                        return true;
+                    }
+                    action.clear();
+                    in_action = false;
+                }
+                b'\t' if !in_action => in_action = true,
+                _ if in_action && action.len() < ACTION => action.push(byte),
+                _ => {}
+            }
+        }
+        let read = buf.len();
+        reader.consume(read);
+    }
+    // A last entry still being written counts as one.
+    !action.is_empty() && makes(&String::from_utf8_lossy(&action))
 }
 
 /// Whether a HEAD log entry made a commit, or brought one: anything but a
@@ -1241,19 +1283,46 @@ pub fn fire_now(places: &Places, name: &str) -> Result<Value, String> {
     if !places.plist(name).exists() {
         return Err(format!("trigger_not_found: {name}"));
     }
-    ask(places, name)?;
+    ask(places, name, Ask::Fire)?;
     Ok(json!({"name": name, "fired": true}))
+}
+
+/// What an ask asks of the fire launchd runs for it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Ask {
+    /// Send, whatever the time or path says (`fire NAME`).
+    Fire,
+    /// Look as launchd would, and send only what is news: `add` asks so for
+    /// a commit made while launchd began to watch, which woke nothing.
+    Wake,
+}
+
+impl Ask {
+    /// How its file's name starts.
+    fn prefix(self) -> &'static str {
+        match self {
+            Ask::Fire => "",
+            Ask::Wake => "wake.",
+        }
+    }
+    fn of(file: &str) -> Self {
+        match file {
+            _ if file.starts_with(Ask::Wake.prefix()) => Ask::Wake,
+            _ => Ask::Fire,
+        }
+    }
 }
 
 /// Ask for a fire: a file in the trigger's queue, written whole beside it
 /// first, so launchd never starts the job for half of one. Called under the
 /// lock, with the plist there.
-fn ask(places: &Places, name: &str) -> Result<(), String> {
+fn ask(places: &Places, name: &str, kind: Ask) -> Result<(), String> {
     let asks = places.asks(name);
     std::fs::create_dir_all(&asks).map_err(|e| format!("{}: {e}", asks.display()))?;
     static ASKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let file = format!(
-        "{}.{}.{}",
+        "{}{}.{}.{}",
+        kind.prefix(),
         now(),
         std::process::id(),
         ASKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -1268,15 +1337,60 @@ fn ask(places: &Places, name: &str) -> Result<(), String> {
         })
 }
 
-/// Whether this fire was asked for. The asks it read go, so launchd does
-/// not run it again for them; one made while it runs is the next fire's.
-fn take_asks(places: &Places, name: &str) -> bool {
-    let asks = places.asks(name);
-    let mut asked = false;
-    for e in std::fs::read_dir(&asks).into_iter().flatten().flatten() {
-        asked |= forget(&e.path()).is_ok();
+/// An ask a fire took: out of the queue launchd watches, in the trigger's
+/// `NAME.taking` folder until the fire is done with it.
+#[derive(Debug)]
+struct Asked {
+    kind: Ask,
+    path: PathBuf,
+}
+
+/// The ask this fire is for: one a fire took and was cut short before it
+/// was done with, else the oldest in the queue, moved out of it. Each ask is
+/// one fire, and launchd runs the job again while any is left. One that
+/// cannot be moved out would have launchd run the job for ever: an error,
+/// which stops the trigger.
+fn take_ask(places: &Places, name: &str) -> Result<Option<Asked>, String> {
+    let oldest = |dir: &Path| {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
+            .min()
+    };
+    let taking = places.taking(name);
+    if let Some((file, path)) = oldest(&taking) {
+        return Ok(Some(Asked {
+            kind: Ask::of(&file),
+            path,
+        }));
     }
-    asked
+    let asks = places.asks(name);
+    let Some((file, path)) = oldest(&asks) else {
+        return Ok(None);
+    };
+    let to = taking.join(&file);
+    std::fs::create_dir_all(&taking)
+        .and_then(|()| std::fs::rename(&path, &to))
+        .and_then(|()| std::fs::File::open(&asks)?.sync_all())
+        .and_then(|()| std::fs::File::open(&taking)?.sync_all())
+        .map_err(|e| format!("asks_stuck: {}: {e}", path.display()))?;
+    Ok(Some(Asked {
+        kind: Ask::of(&file),
+        path: to,
+    }))
+}
+
+/// The fire is done with its ask.
+fn done_with(asked: &Asked) {
+    let gone = match std::fs::symlink_metadata(&asked.path) {
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&asked.path),
+        _ => std::fs::remove_file(&asked.path),
+    };
+    if let Err(e) = gone {
+        eprintln!("{}", error_json(&format!("{}: {e}", asked.path.display())));
+    }
 }
 
 /// What a fire leaves for the next: the commit it saw.
@@ -1387,16 +1501,36 @@ fn retire(places: &Places, name: &str, keep: bool, launchd: Loader) -> Result<bo
         }
     }
     let here = gone.iter().any(|(_, text)| text.is_some());
-    // Asks for a trigger that goes are for nothing.
-    let _ = std::fs::remove_dir_all(places.asks(name));
-    match launchd(Launchd::Unload(&format!("{LABEL}{name}"))) {
+    // Its asks wait aside until launchd lets the job go: they come back with
+    // the rest when it does not, and are for nothing once it does.
+    let aside = places.state.join(format!(".{name}.gone"));
+    let _ = std::fs::remove_dir_all(&aside);
+    let _ = std::fs::create_dir_all(&aside);
+    let mut set_aside = Vec::new();
+    for queue in [places.asks(name), places.taking(name)] {
+        let Some(to) = queue.file_name().map(|file| aside.join(file)) else {
+            continue;
+        };
+        match std::fs::rename(&queue, &to) {
+            Ok(()) => set_aside.push((queue, to)),
+            Err(_) => {
+                let _ = std::fs::remove_dir_all(&queue);
+            }
+        }
+    }
+    let unloaded = match launchd(Launchd::Unload(&format!("{LABEL}{name}"))) {
         Ok(()) => Ok(true),
         Err(error) if error.starts_with(NOT_LOADED) => Ok(here),
         Err(error) => {
             restore(&gone);
-            Err(error)
+            for (queue, to) in &set_aside {
+                let _ = std::fs::rename(to, queue);
+            }
+            return Err(error);
         }
-    }
+    };
+    let _ = std::fs::remove_dir_all(&aside);
+    unloaded
 }
 
 /// The app moves when it is updated, so it writes its path into every
@@ -1841,6 +1975,14 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
     };
     let daemon = Daemon::current()?;
     if let Some(watch) = &asked.when.watch {
+        // A watched file could be the store, which every send writes: one
+        // whose store is not known cannot be told apart from it.
+        if asked.commit.is_none() && daemon.store.is_none() {
+            return Err(
+                "invalid_file: the daemon's store is not known (AGENT_SOCKET without AGENT_STORE), so --file cannot be checked against it"
+                    .into(),
+            );
+        }
         watches_itself(places, daemon.store.as_deref(), watch)?;
     }
     let socket = daemon.socket()?;
@@ -1942,8 +2084,9 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
                     let kept = Kept { seen: seen.clone() };
                     record_last(places, &trigger, &Value::Null, &kept)?;
                     // A commit made while launchd began to watch woke nothing.
+                    // A fire launchd ran for it already finds no news.
                     match moved(repo, &seen).0 {
-                        true => ask(places, &trigger.name),
+                        true => ask(places, &trigger.name, Ask::Wake),
                         false => Ok(()),
                     }
                 });
@@ -2029,9 +2172,44 @@ pub fn fire_cli(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let asked = take_asks(&places, &trigger.name);
-    fire(&places, &trigger, asked);
+    let asked = match take_ask(&places, &trigger.name) {
+        Ok(asked) => asked,
+        Err(error) => {
+            stops(&places, &trigger, error, &launchctl);
+            return 1;
+        }
+    };
+    fire(
+        &places,
+        &trigger,
+        asked.as_ref().is_some_and(|a| a.kind == Ask::Fire),
+    );
+    if let Some(asked) = &asked {
+        done_with(asked);
+    }
     0
+}
+
+/// A trigger that cannot go on ends, saying why: its row stays.
+fn stops(places: &Places, trigger: &Trigger, detail: String, launchd: Loader) {
+    let log = |error: String| eprintln!("{}", error_json(&error));
+    log(detail.clone());
+    let _lock = match Lock::take(places) {
+        Ok(lock) => lock,
+        Err(error) => return log(error),
+    };
+    let ours = std::fs::read_to_string(places.plist(&trigger.name))
+        .is_ok_and(|text| read_plist(&text).is_some_and(|(now, _)| now == *trigger));
+    if !ours {
+        return;
+    }
+    let failed = json!({"outcome": "failed", "detail": detail});
+    let kept = Kept::of(&state(places, trigger));
+    if let Err(error) = record_last(places, trigger, &failed, &kept)
+        .and_then(|()| retire(places, &trigger.name, true, launchd).map(drop))
+    {
+        log(error);
+    }
 }
 
 /// This process's sends so far: each send is its own request.
@@ -2873,19 +3051,39 @@ mod tests {
             "<key>QueueDirectories</key>\n  <array>\n    <string>{}</string>",
             asks.display()
         )));
-        assert!(!take_asks(&w.places, &s.name), "launchd's own fire");
-        // Asks made before a fire starts are all that fire's, and go with it:
-        // launchd has nothing to run it again for.
+        let take = |places: &Places| {
+            let asked = take_ask(places, &s.name).unwrap()?;
+            done_with(&asked);
+            Some(asked.kind)
+        };
+        assert_eq!(take(&w.places), None, "launchd's own fire");
+        // Each ask is one fire, oldest first; launchd runs the job again
+        // while any is left.
         for _ in 0..2 {
             assert_eq!(
                 fire_now(&w.places, &s.name).unwrap(),
                 json!({"name": s.name, "fired": true})
             );
         }
-        assert_eq!(std::fs::read_dir(&asks).unwrap().count(), 2);
-        assert!(take_asks(&w.places, &s.name));
+        ask(&w.places, &s.name, Ask::Wake).unwrap();
+        assert_eq!(std::fs::read_dir(&asks).unwrap().count(), 3);
+        assert_eq!(take(&w.places), Some(Ask::Fire));
+        assert_eq!(take(&w.places), Some(Ask::Fire));
+        assert_eq!(take(&w.places), Some(Ask::Wake));
+        assert_eq!(take(&w.places), None);
+        // One a fire took and did not finish with is the next fire's.
+        fire_now(&w.places, &s.name).unwrap();
+        let cut = take_ask(&w.places, &s.name).unwrap().unwrap();
         assert_eq!(std::fs::read_dir(&asks).unwrap().count(), 0);
-        assert!(!take_asks(&w.places, &s.name));
+        assert_eq!(
+            take_ask(&w.places, &s.name).unwrap().unwrap().path,
+            cut.path
+        );
+        done_with(&cut);
+        // Whatever is in the queue goes out of it, a folder too.
+        std::fs::create_dir_all(asks.join("x/y")).unwrap();
+        assert_eq!(take(&w.places), Some(Ask::Fire));
+        assert_eq!(std::fs::read_dir(&asks).unwrap().count(), 0);
         // Nothing half written is ever in the queue.
         let beside = std::fs::read_dir(&w.places.state)
             .unwrap()
@@ -2894,10 +3092,43 @@ mod tests {
             .filter(|e| e.file_name() != ".lock")
             .count();
         assert_eq!(beside, 0);
-        // A trigger that goes takes its asks with it.
+        // A trigger that goes takes its asks with it, once launchd lets it
+        // go: until then they stay.
         fire_now(&w.places, &s.name).unwrap();
+        w.fake.refuse_unload.set(true);
+        assert!(w.remove(&s.name).is_err());
+        assert_eq!(std::fs::read_dir(&asks).unwrap().count(), 1);
+        w.fake.refuse_unload.set(false);
         w.remove(&s.name).unwrap();
         assert!(!asks.exists());
+        assert!(
+            std::fs::read_dir(&w.places.state)
+                .unwrap()
+                .flatten()
+                .all(|e| !e.file_name().to_string_lossy().ends_with(".gone"))
+        );
+    }
+
+    #[test]
+    fn a_queue_a_fire_cannot_take_from_stops_its_trigger() {
+        let w = World::new("stuck-asks");
+        let s = trigger();
+        w.install(&s).unwrap();
+        // A taking folder that is a file: nothing can be moved into it.
+        std::fs::write(w.places.taking(&s.name), "").unwrap();
+        fire_now(&w.places, &s.name).unwrap();
+        let stuck = take_ask(&w.places, &s.name).unwrap_err();
+        assert!(stuck.starts_with("asks_stuck:"), "{stuck}");
+        stops(&w.places, &s, stuck, &|x| w.fake.call(x));
+        assert_eq!(w.state(&s.name), (false, false, true));
+        let row = &w.rows()[0];
+        assert_eq!(row["last"]["outcome"], "failed");
+        assert!(
+            row["last"]["detail"]
+                .as_str()
+                .unwrap()
+                .starts_with("asks_stuck:")
+        );
     }
 
     #[test]
@@ -2997,7 +3228,16 @@ mod tests {
         let at_first = moved(&root, &at_two).1;
         // A commit, then back, then to it again: the commit is in the log
         // past where it was, though HEAD came back to that commit between.
-        git(&["commit", "-q", "--allow-empty", "-m", "three"]);
+        // Its title is long however git cuts it to columns: the log is read
+        // as a stream, keeping only the start of each action.
+        std::fs::write(&message, format!("three {}", "\u{301}".repeat(200_000))).unwrap();
+        git(&[
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-F",
+            message.to_str().unwrap(),
+        ]);
         let three = head(&root).unwrap();
         git(&["reset", "-q", "--hard", &first]);
         assert!(!moved(&root, &at_first).0, "back where it was");

@@ -1046,7 +1046,9 @@ or a file is added to or removed from it when it is a folder (launchd's
 `WatchPaths`); it need not exist yet, and it may not be in
 `~/.agent/triggers` or be its daemon's store (or its `-wal` and `-shm`, by
 any name, a hard link included), which every fire writes: `add` refuses one, and a fire that finds its path
-became one (a link moved) ends the trigger and sends nothing. `--commit REPO` watches the
+became one (a link moved) ends the trigger and sends nothing. A shell that
+names its daemon's socket and not its store cannot add one, since its store
+is not known to check. `--commit REPO` watches the
 repository's own HEAD log, which git writes on every move of HEAD, and sends
 only when HEAD names a commit other than the one the trigger last saw and
 the HEAD log's entries past where it was then (git only appends to it; the
@@ -1054,8 +1056,13 @@ trigger keeps that place in bytes) include more than moves between commits
 already there (`checkout:`, `reset:`, a rebase's start, finish and abort).
 So a checkout back and forth, or a write that moved nothing, sends nothing;
 a commit, even one HEAD left and came back to, sends; a log made again since
-counts as news when HEAD is elsewhere. `add` records where HEAD is before
-launchd watches, and asks for a fire when a commit came in between. A repository where git keeps no HEAD log
+counts as news when HEAD is elsewhere. HEAD and the log's length are read
+together, again until the log stands still around HEAD, and the log is read
+as a stream keeping only the first 64 bytes of each entry's action, so a
+long commit title costs nothing. `add` records where HEAD is before
+launchd watches, and when a commit came in between asks for a fire that
+looks as launchd would (a `wake.` ask), so a fire launchd already ran for
+it finds no news and the commit is sent once. A repository where git keeps no HEAD log
 (`core.logAllRefUpdates` false, or a bare one by default) is refused, and
 adding the same trigger again watches the git folder the repository has
 now. With no WHEN, only `fire` runs it; `fire` while a fire still runs is
@@ -1088,10 +1095,14 @@ messages are retained. `fire NAME` asks for a fire and returns
 in the trigger's queue folder, `~/.agent/triggers/NAME.asks`, which its plist
 names as launchd's `QueueDirectories`: launchd runs the job while an ask is
 there, one run at a time, and runs it again when a run ends with one still
-there. A fire takes the asks it finds as it starts, so it sends whatever its
-time or watched path, and queues behind work rather than skipping it; one
-made while it runs is the next run's. Nothing else starts a fire: launchd
-is the only thing that runs one.
+there. Each ask is one fire: the fire moves the oldest out of the queue into
+`NAME.taking`, sends whatever its time or watched path, queues behind work
+rather than skipping it, and removes the ask once done; one a fire was cut
+short on is the next fire's. An entry that cannot be moved out of the queue
+would have launchd run the job for ever, so the trigger ends, saying why
+(`asks_stuck`). `rm` sets a trigger's asks aside until launchd unloads its
+job, and puts them back when it will not. Nothing else starts a fire:
+launchd is the only thing that runs one.
 
 Each is one LaunchAgent, `~/Library/LaunchAgents/me.lydakis.agent.trigger.NAME.plist`,
 and that file is its definition: its program arguments carry the agent and
