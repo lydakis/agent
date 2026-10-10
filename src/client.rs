@@ -1048,7 +1048,7 @@ pub fn main(args: Vec<String>) -> Result<i32> {
         "shutdown" => {
             let mut connection = match Connection::connect(&options.socket) {
                 Ok(connection) => connection,
-                Err(error) => return stop_older(error),
+                Err(error) => return stop_older(error, options.pretty),
             };
             let pid = connection.ready["pid"]
                 .as_u64()
@@ -1059,7 +1059,7 @@ pub fn main(args: Vec<String>) -> Result<i32> {
                 pid,
                 SHUTDOWN_TIMEOUT + Duration::from_millis(options.grace_ms),
             )?;
-            Ok(0)
+            stopped(pid, options.pretty)
         }
         _ => fail("usage"),
     }
@@ -1070,7 +1070,7 @@ pub fn main(args: Vec<String>) -> Result<i32> {
 /// interrupted and the store keeps every chat. This is how an upgrade on a
 /// host replaces its daemon. A newer daemon, or a listener that did not greet
 /// as a daemon, is left alone and the error stands.
-fn stop_older(error: Error) -> Result<i32> {
+fn stop_older(error: Error, pretty: bool) -> Result<i32> {
     let ready = (error.facts.as_ref()).and_then(|facts| facts.get("ready"));
     let older = ready
         .and_then(|ready| ready["protocol"].as_u64())
@@ -1086,11 +1086,17 @@ fn stop_older(error: Error) -> Result<i32> {
         let error = std::io::Error::last_os_error();
         // It exited after it greeted: it is stopped.
         if error.raw_os_error() == Some(libc::ESRCH) {
-            return Ok(0);
+            return stopped(pid, pretty);
         }
         return fail_with("daemon_stop_failed", error.to_string());
     }
     await_exit(pid, SHUTDOWN_TIMEOUT)?;
+    stopped(pid, pretty)
+}
+
+/// What `shutdown` prints once the daemon is gone: which process stopped.
+fn stopped(pid: i32, pretty: bool) -> Result<i32> {
+    print_json(&json!({"stopped":true,"pid":pid}), pretty)?;
     Ok(0)
 }
 
@@ -1735,7 +1741,7 @@ fn answer(options: &Options) -> Result<i32> {
         json!({"bot":bot,"turn":turn,"call_id":call,"request":request,"tag":options.tag,
             "decision":decision,"reason":options.reason,"by":"cli"}),
     )?;
-    print_json(&answered, false)?;
+    print_json(&answered, options.pretty)?;
     Ok(0)
 }
 

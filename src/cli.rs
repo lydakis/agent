@@ -6,112 +6,150 @@ const STARTUP: &str = "--provider --max-processes --max-detached --max-active --
 
 struct Command {
     name: &'static str,
+    /// One line for `agent --help`.
+    about: &'static str,
     usage: &'static str,
     flags: &'static str,
+    /// A new bot's settings, listed apart: the defaults are right.
+    settings: &'static str,
     startup: bool,
 }
 
 const COMMANDS: &[Command] = &[
     Command {
         name: "run",
+        about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
-        flags: "--bot --new --detach --delivery --turn --model --tools --workspace --instructions --instructions-file --effort --request-id --bot-id --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallbacks --agents --profile --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --pretty --no-spawn",
+        flags: "--bot --new --detach --delivery --turn --model --workspace --effort --agents --profile --request-id --bot-id --pretty --no-spawn",
+        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallbacks --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl",
         startup: true,
     },
     Command {
         name: "follow",
+        about: "Stream a bot's events, or every bot's with --all",
         usage: "follow (--bot NAME | --all) [--after CURSOR]",
         flags: "--bot --all --after --pretty",
+        settings: "",
         startup: false,
     },
     Command {
         name: "fork",
+        about: "Copy a bot's conversation up to a message into a new bot",
         usage: "fork --source NAME --bot NAME [--checkpoint NODE] [--allow LIST]",
         flags: "--source --bot --checkpoint --workspace --budget-tokens --approval --approve --allow --request-id --pretty",
+        settings: "",
         startup: false,
     },
     Command {
         name: "interrupt",
+        about: "Stop a bot's running turn; prints its turn view",
         usage: "interrupt --bot NAME",
         flags: "--bot --pretty",
+        settings: "",
         startup: false,
     },
     Command {
         name: "ls",
+        about: "List the bots",
         usage: "ls [OPTIONS]",
         flags: "--pretty",
+        settings: "",
         startup: false,
     },
     Command {
         name: "turns",
+        about: "A bot's turns and how each ended",
         usage: "turns --bot NAME [--after TURN]",
         flags: "--bot --after --pretty --no-spawn",
+        settings: "",
         startup: true,
     },
     Command {
         name: "wait",
+        about: "A turn's or command's result: status, text, usage; --timeout 0 polls",
         usage: "wait [--any] [--timeout DURATION] HANDLE...",
         flags: "--any --timeout --pretty",
+        settings: "",
         startup: false,
     },
     Command {
         name: "rm",
+        about: "Delete an idle bot; prints what was freed",
         usage: "rm --bot NAME [--bot-id N]",
         flags: "--bot --bot-id --pretty --no-spawn",
+        settings: "",
         startup: true,
     },
     Command {
         name: "prune",
+        about: "Drop a bot's older turns' operational records, keeping the newest N",
         usage: "prune --bot NAME --keep-turns N",
         flags: "--bot --keep-turns --pretty --no-spawn",
+        settings: "",
         startup: true,
     },
     Command {
         name: "approvals",
+        about: "Tool calls waiting for a verdict",
         usage: "approvals [--bot NAME] [--tag TAG]",
         flags: "--bot --tag --pretty --no-spawn",
+        settings: "",
         startup: true,
     },
     Command {
         name: "answer",
+        about: "Allow or deny a waiting tool call",
         usage: "answer --bot NAME --turn TURN --call ID --request N [--tag TAG] [--reason TEXT] allow|deny",
-        flags: "--bot --turn --call --request --tag --reason --no-spawn",
+        flags: "--bot --turn --call --request --tag --reason --pretty --no-spawn",
+        settings: "",
         startup: true,
     },
     Command {
         name: "approver",
+        about: "Judge a gate's calls with a model, until stopped",
         usage: "approver [--tag TAG] [--judge PROVIDER/MODEL] [--effort LEVEL] [--note FILE] [--judge-url URL]",
         flags: "--tag --judge --effort --note --judge-url",
+        settings: "",
         startup: false,
     },
     Command {
         name: "models",
+        about: "The models the providers serve",
         usage: "models [--discover]",
         flags: "--discover --pretty --no-spawn",
+        settings: "",
         startup: true,
     },
     Command {
         name: "start",
+        about: "Start the store's daemon if none runs; prints its ready line",
         usage: "start [OPTIONS]",
         flags: "--pretty",
+        settings: "",
         startup: true,
     },
     Command {
         name: "stats",
+        about: "The daemon's limits and load",
         usage: "stats [OPTIONS]",
         flags: "--pretty --no-spawn",
+        settings: "",
         startup: true,
     },
     Command {
         name: "shutdown",
+        about: "Stop the daemon once running turns end or the grace passes",
         usage: "shutdown [--grace DURATION]",
-        flags: "--grace",
+        flags: "--grace --pretty",
+        settings: "",
         startup: false,
     },
     Command {
         name: "serve",
+        about: "Run the daemon in the foreground; other commands start it for you",
         usage: "serve --store PATH --provider SPEC... [OPTIONS]",
         flags: "",
+        settings: "",
         startup: true,
     },
 ];
@@ -130,21 +168,25 @@ pub fn help(name: Option<&str>) -> Result<()> {
         print_flags(CONNECTION);
         print_flags(c.flags);
         println!("  -h, --help                   Show help");
+        if !c.settings.is_empty() {
+            println!("\nNew bot settings (the defaults are right; rarely needed):");
+            print_flags(c.settings);
+        }
         if c.startup {
             println!("\nDaemon options (client commands apply these on startup):");
             print_flags(STARTUP);
         }
     } else {
-        println!("Usage: agent COMMAND [OPTIONS]\n");
+        println!("Usage: agent COMMAND [OPTIONS]\n\nCommands:");
         for c in COMMANDS {
-            println!("  {}", c.usage);
+            println!("  {:<11}{}", c.name, c.about);
         }
         println!(
-            "\nUse agent COMMAND --help for its flags.\n  -h, --help     Show help\n  --version      Show version"
+            "\nUse agent COMMAND --help for its usage and flags.\n  -h, --help     Show help\n  --version      Show version"
         );
     }
     println!(
-        "\nValue flags accept --flag VALUE or --flag=VALUE; -- ends option parsing.\nJSON is the default; --pretty selects human output where supported.\nExit status: 0 success, 1 failed/incomplete operation, 2 invalid usage.\nProvider: NAME[=FAMILY[,BASE_URL[,KEY_ENV]]]; families: responses, responses-ws (Responses over WebSocket), anthropic."
+        "\nValue flags accept --flag VALUE or --flag=VALUE; -- ends option parsing.\nJSON is the default; --pretty selects human output.\nExit status: 0 success, 1 failed/incomplete operation, 2 invalid usage.\nProvider: NAME[=FAMILY[,BASE_URL[,KEY_ENV]]]; families: responses, responses-ws (Responses over WebSocket), anthropic."
     );
     Ok(())
 }
@@ -428,6 +470,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
         let allowed = CONNECTION
             .split_whitespace()
             .chain(c.flags.split_whitespace())
+            .chain(c.settings.split_whitespace())
             .chain(if c.startup { STARTUP } else { "" }.split_whitespace())
             .any(|f| f == flag);
         if !allowed {
