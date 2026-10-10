@@ -1,4 +1,5 @@
 """A trigger's fire against a real daemon: what launchd runs, sent to the bot it was made for."""
+import html
 import json
 import os
 import re
@@ -222,7 +223,8 @@ class TriggerFireTests(ModelFixture):
         first = self.fire('p.task', 'first', generation='g1')
         # The plist now holds another generation of the same message: the old job's fire leaves its result alone.
         plist = self.home / 'Library/LaunchAgents/me.lydakis.agent.trigger.p.task.plist'
-        args = re.findall(r'<string>(.*?)</string>', plist.read_text())
+        program = re.search(r'<key>ProgramArguments</key>\s*<array>(.*?)</array>', plist.read_text(), re.S).group(1)
+        args = [html.unescape(a) for a in re.findall(r'<string>(.*?)</string>', program)]
         plist.write_text(plist.read_text().replace('<string>g1</string>', '<string>g2</string>'))
         last = self.home / '.agent/triggers/p.task.json'
         last.unlink()
@@ -273,105 +275,6 @@ class TriggerFireTests(ModelFixture):
         self.assertEqual(taken['last']['outcome'], 'failed', taken)
         self.assertIn('bot_exists', taken['last']['detail'])
         self.assertEqual(len(self.turns('p.review')), 3)
-
-    def test_a_start_trigger_cut_short_while_it_waits_passes_its_answer_on_next_time(self):
-        self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
-        lead = self.bot_id('p.lead')
-        target = ['--start', 'p.review', '--model', 'openai/synthetic-model', '--by', 'p.lead', '--by-id', str(lead)]
-        extra = ['--dir', str(self.path), '--reply-to', 'p.lead', '--reply-to-id', str(lead)]
-        env = {'AGENT_PROVIDER': f'openai=responses,{self.url}'}
-        # Its turn holds, so the fire waits to pass its answer on, and is stopped there.
-        self.model.release_headers = threading.Event()
-        self.model.all_streaming = self.model.release_headers
-        self.addCleanup(self.model.release_headers.set)
-        running = self.fire('p.review', 'gate', target=target, extra=extra, app=self.bundle(), env=env,
-                            generation='g1', wait=False)
-        last = self.home / '.agent/triggers/p.review.json'
-        deadline = time.time() + 20
-        def waiting():
-            return (last.exists() and json.loads(last.read_text()).get('sending')
-                    and any(b['name'] == 'p.review' for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout))
-                    and self.turns('p.review'))
-        while time.time() < deadline and not waiting():
-            time.sleep(0.1)
-        running.kill()
-        running.wait()
-        made = self.bot_id('p.review')
-        kept = json.loads(last.read_text())
-        self.assertEqual(kept['started_id'], made)
-        self.assertEqual(kept['sending']['bot'], 'p.review')
-        turn = self.turns('p.review')[-1]['turn']
-        self.model.release_headers.set()
-        self.settle('p.review')
-        # The next fire passes that answer on in its place, and sends nothing new.
-        again = self.fire('p.review', 'gate', target=target, extra=extra, app=self.bundle(), env=env,
-                          generation='g1')
-        self.assertEqual(again['bot_id'], made)
-        self.assertEqual((again['last']['turn'], again['last']['reply']['outcome']), (turn, 'sent'), again)
-        self.assertNotIn('sending', json.loads(last.read_text()))
-        self.assertEqual(len(self.turns('p.review')), 1)
-        self.settle('p.lead')
-        self.assertRegex(self.turns('p.lead')[-1]['prompt_preview'],
-                         '^' + LINE.format('p.review', f'p.review turn {turn} completed'))
-
-    def test_a_message_a_fire_began_goes_once_whether_or_not_it_got_there(self):
-        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
-        task = self.bot_id('p.task')
-        first = self.fire('p.task', 'first', generation='g1')
-        self.assertEqual(first['sent'], 1, first)
-        self.settle('p.task')
-        last = self.home / '.agent/triggers/p.task.json'
-        for landed in (False, True):
-            # A fire cut short after it wrote down the message, before or after the daemon took it.
-            sending = {'bot': 'p.task', 'bot_id': task, 'request_id': f'trigger-{task}-cut-{landed}',
-                       'prompt': f'[trigger p.task · 2026-10-10 00:00 · fired]\nlanded {landed}',
-                       'delivery': 'queue', 'started': False}
-            if landed:
-                connection = Connection(str(self.store) + '.sock')
-                try:
-                    connection.request('submit', bot='p.task', bot_id=task, request_id=sending['request_id'],
-                                       prompt=sending['prompt'], delivery='queue', origin='trigger')
-                finally:
-                    connection.close()
-                self.settle('p.task')
-            before = len(self.turns('p.task'))
-            kept = json.loads(last.read_text())
-            last.write_text(json.dumps({**kept, 'sending': sending}))
-            # The next fire, launchd's own, finishes it as the same request and sends nothing new.
-            again = self.fire('p.task', 'first', generation='g1')
-            self.assertEqual(again['last']['outcome'], 'sent', again)
-            self.assertNotIn('sending', again)
-            self.assertEqual(again['sent'], kept['sent'] + 1)
-            self.assertEqual(len(self.turns('p.task')), before + (0 if landed else 1))
-            self.assertEqual(self.turns('p.task')[-1]['request_id'], sending['request_id'])
-            self.settle('p.task')
-
-    def test_a_turn_end_asked_while_a_message_is_begun_is_sent_after_it(self):
-        self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
-        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
-        task, lead = self.bot_id('p.task'), self.bot_id('p.lead')
-        target = ['--bot', 'p.lead', '--bot-id', str(lead)]
-        extra = ['--turn-end', 'p.task', '--turn-end-id', str(task)]
-        # A fire cut short with its message for one turn end begun, and the
-        # watcher's ask for the next turn end in the queue.
-        triggers = self.home / '.agent/triggers'
-        (triggers / 'ends.asks').mkdir(parents=True)
-        sending = {'bot': 'p.lead', 'bot_id': lead, 'request_id': 'trigger_g_cut',
-                   'prompt': '[trigger ends · 2026-10-10 00:00 · first]\nReview.', 'delivery': 'queue',
-                   'started': False}
-        (triggers / 'ends.json').write_text(json.dumps(
-            {'generation': 'g', 'sent': 0, 'sending': sending, 'turn': 3, 'ask': f'turn.{3:020}'}))
-        why = 'turn end of p.task: turn:p.task/2 completed'
-        (triggers / f'ends.asks/turn.{5:020}').write_text(why)
-        kept = self.fire('ends', 'Review.', target=target, when='turn end of p.task', extra=extra, generation='g')
-        # It finishes that message, then sends the one asked for.
-        self.assertEqual((kept['sent'], kept['turn']), (2, 5), kept)
-        self.assertNotIn('sending', kept)
-        self.assertEqual(list((triggers / 'ends.asks').iterdir()), [])
-        self.settle('p.lead')
-        turns = self.turns('p.lead')
-        self.assertEqual(turns[1]['request_id'], 'trigger_g_cut')
-        self.assertRegex(turns[2]['prompt_preview'], '^' + LINE.format('ends', re.escape(why)) + 'Review.$')
 
     def test_an_answer_goes_to_the_reply_agent(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
@@ -529,6 +432,19 @@ class TriggerFireTests(ModelFixture):
         news = self.fire('p.task', 'Look at it.', when=when, extra=extra, generation='g')
         self.assertEqual(news['sent'], 2)
         self.settle('p.task')
+        # A move between commits sends nothing, and the next look starts past it.
+        # git's dates are whole seconds; a commit the second before a look is older than it.
+        time.sleep(1.1)
+        subprocess.run([*git, 'checkout', '-q', 'HEAD~1'], check=True)
+        back = self.fire('p.task', 'Look at it.', when=when, extra=extra, generation='g')
+        self.assertEqual(back['last'], news['last'])
+        self.assertEqual(back['head'], sha)
+        self.assertIsNotNone(back['seen_at'])
+        time.sleep(1.1)
+        subprocess.run([*git, 'checkout', '-q', '-'], check=True)
+        news = self.fire('p.task', 'Look at it.', when=when, extra=extra, generation='g')
+        self.assertEqual(news['last'], back['last'])
+        self.assertEqual(len(self.turns('p.task')), 3)
         # Run now while the repository is away sends, and keeps the commit last seen.
         moved = self.path / 'away'
         repo.rename(moved)
@@ -560,18 +476,21 @@ class TriggerFireTests(ModelFixture):
         self.assertEqual(declined['head'], sha)
         # A checkout later wakes it with the gate open: the declined commit is not news.
         go.write_text('')
+        time.sleep(1.1)
         subprocess.run([*git, 'checkout', '-q', 'HEAD~1'], check=True)
         self.fire('p.task', 'x', when=when, extra=extra, generation='g')
         self.assertEqual(len(self.turns('p.task')), 1)
 
-    def test_a_file_trigger_whose_path_became_its_own_state_ends_without_sending(self):
+    def test_a_file_trigger_whose_path_became_its_own_state_ends_saying_why(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
         state = self.home / '.agent/triggers'
         state.mkdir(parents=True)
         # Made for a folder a link pointed elsewhere; the link now points at the triggers' own.
         link = self.path / 'watched'
         link.symlink_to(state)
-        self.assertIsNone(self.fire('p.task', 'x', when=f'file {link}', extra=['--file', str(link / 'p.task.json')]))
+        ended = self.fire('p.task', 'x', when=f'file {link}', extra=['--file', str(link / 'p.task.json')])
+        self.assertEqual(ended['last']['outcome'], 'failed', ended)
+        self.assertTrue(ended['last']['detail'].startswith('invalid_file:'), ended)
         self.assertEqual(len(self.turns('p.task')), 1)
 
     def test_add_from_an_agents_shell_needs_launchd(self):

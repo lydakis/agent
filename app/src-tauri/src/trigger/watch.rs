@@ -430,8 +430,8 @@ fn ask_fire(places: &Places, w: &mut Watched, why: &str) -> Result<(), String> {
 }
 
 /// Say in the trigger's last result that events it would read are gone,
-/// keeping the rest of what its fires left (a message one began), under the
-/// lock and only while its plist is still this trigger's.
+/// keeping the rest of what its fires left, under the lock and only while
+/// its plist is still this trigger's.
 fn gap(places: &Places, w: &mut Watched, detail: &str) -> Result<(), String> {
     let _lock = Lock::take(places)?;
     if !ours(places, &w.trigger) {
@@ -841,9 +841,12 @@ mod tests {
             &[],
         );
         std::fs::write(places.plist("t"), text).unwrap();
-        // A fire cut short with its message begun.
-        let sending = json!({"bot": "p.lead", "request_id": "trigger_g_1"});
-        keep(&places, &w[0].trigger, |k| k.sending = sending.clone()).unwrap();
+        // What its fires left.
+        let fired = Kept {
+            sent: 3,
+            ..Kept::default()
+        };
+        record_last(&places, &w[0].trigger, &Value::Null, &fired).unwrap();
         let mut sent = Sent::new();
         let pruned = |before: i64| json!({"bot": "p.task", "event": "pruned", "before": before});
         let steps = step(&mut w, &mut sent, &pruned(30));
@@ -854,14 +857,14 @@ mod tests {
             panic!("{gap:?}")
         };
         assert!(act(&places, &mut w, &sent, Step::Gap(0, why.clone())));
-        // It says so and goes on, from past what is gone, the message
-        // begun still there to finish.
+        // It says so and goes on, from past what is gone, keeping what its
+        // fires left.
         let kept = state(&places, &w[0].trigger);
         assert_eq!(
             (&kept["last"]["outcome"], &kept["last"]["detail"]),
             (&json!("failed"), &json!(why))
         );
-        assert_eq!(kept["sending"], sending);
+        assert_eq!(kept["sent"], 3);
         assert!(!w[0].done);
         assert_eq!(
             read_watched(&places, &w[0].trigger),
