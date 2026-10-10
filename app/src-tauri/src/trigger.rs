@@ -49,8 +49,6 @@ const GATE_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a fire waits for the turn whose answer goes to `--reply-to`:
 /// the longest wait the daemon takes.
 const REPLY_WAIT_MS: u64 = 86_400_000;
-/// How old a `fire NAME` may be when launchd starts the fire it asked for.
-const ASKED_WITHIN: i64 = 120;
 const USAGE: &str = "usage: trigger add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] -- MESSAGE\n         WHEN: --every N{m,h,d} | --in N{m,h} | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO; none: only fire runs it\n       trigger ls [--after NAME]\n       trigger fire NAME\n       trigger rm NAME";
 
 /// Where triggers live: the LaunchAgents folder holds their plists, and
@@ -74,9 +72,10 @@ impl Places {
     fn last(&self, name: &str) -> PathBuf {
         self.state.join(format!("{name}.json"))
     }
-    /// Left by `fire NAME` for the fire launchd starts.
-    fn asked(&self, name: &str) -> PathBuf {
-        self.state.join(format!("{name}.fire"))
+    /// The trigger's asks: launchd runs its job while any is there, one run
+    /// at a time, and again after one that ends with an ask still there.
+    fn asks(&self, name: &str) -> PathBuf {
+        self.state.join(format!("{name}.asks"))
     }
 }
 
@@ -84,8 +83,6 @@ impl Places {
 pub enum Launchd<'a> {
     Load(&'a Path),
     Unload(&'a str),
-    /// Run a loaded job now.
-    Start(&'a str),
 }
 
 pub type Loader<'a> = &'a dyn Fn(Launchd) -> Result<(), String>;
@@ -105,7 +102,6 @@ pub fn launchctl(what: Launchd) -> Result<(), String> {
             path.to_string_lossy().into_owned(),
         ],
         Launchd::Unload(label) => vec!["bootout".into(), format!("{domain}/{label}")],
-        Launchd::Start(label) => vec!["kickstart".into(), format!("{domain}/{label}")],
     };
     let out = std::process::Command::new("/bin/launchctl")
         .args(&args)
@@ -873,8 +869,15 @@ pub fn commit(value: &str) -> Result<(When, PathBuf), String> {
 /// The LaunchAgent for a trigger. `environment` is what the fire starts
 /// with besides launchd's own: the shell whose login environment starts a
 /// daemon with your keys, as the app starts one. Without calendar entries
-/// or a watched path, launchd runs it only when asked (`fire`).
-pub fn plist(app: &Path, trigger: &Trigger, when: &When, environment: &[(&str, String)]) -> String {
+/// or a watched path, launchd runs it only when asked (`fire`): an ask is a
+/// file in `asks`, which launchd watches as a queue.
+pub fn plist(
+    app: &Path,
+    trigger: &Trigger,
+    when: &When,
+    asks: &Path,
+    environment: &[(&str, String)],
+) -> String {
     let mut out = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n",
     );
@@ -921,7 +924,22 @@ pub fn plist(app: &Path, trigger: &Trigger, when: &When, environment: &[(&str, S
         out += "  </dict>\n";
     }
     out += "  <key>ProcessType</key>\n  <string>Background</string>\n</dict>\n</plist>\n";
-    out
+    queued(&out, asks)
+}
+
+/// A plist with `asks` as its queue: launchd runs the job while a file is
+/// there, and runs it again when it ends with one still there.
+fn queued(text: &str, asks: &Path) -> String {
+    let key = format!(
+        "  <key>QueueDirectories</key>\n  <array>\n    <string>{}</string>\n  </array>\n",
+        escape(&asks.to_string_lossy())
+    );
+    match text.rfind("</dict>") {
+        Some(at) if !text.contains("<key>QueueDirectories</key>") => {
+            format!("{}{key}{}", &text[..at], &text[at..])
+        }
+        _ => text.to_owned(),
+    }
 }
 
 /// A plist's program arguments, as the app writes them.
@@ -1171,7 +1189,8 @@ pub fn install(
                     // repository made again at its path has another git
                     // folder. launchd is made to watch the one it is now.
                     if watched(&text) != when.watch {
-                        let want = plist(&there_app, &there, when, environment);
+                        let asks = places.asks(&there.name);
+                        let want = plist(&there_app, &there, when, &asks, environment);
                         swap(&path, &there.name, Some(&text), &want, launchd)?;
                     }
                     Ok(Some(there))
@@ -1185,11 +1204,13 @@ pub fn install(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("{}: {e}", path.display())),
     }
+    let asks = places.asks(&trigger.name);
+    std::fs::create_dir_all(&asks).map_err(|e| format!("{}: {e}", asks.display()))?;
     swap(
         &path,
         &trigger.name,
         None,
-        &plist(app, trigger, when, environment),
+        &plist(app, trigger, when, &asks, environment),
         launchd,
     )?;
     Ok(None)
@@ -1274,94 +1295,85 @@ fn forget(path: &Path) -> Result<(), String> {
     .map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Remove a trigger: launchd's copy, then its plist and last result. An
-/// unload launchd refuses keeps the plist, so the removal can be retried.
-/// Whatever is left of it goes, a job loaded without its plist included.
+/// Remove a trigger, whatever is left of it: its plist, its last result,
+/// and launchd's job, also one loaded without its plist.
 pub fn remove(places: &Places, name: &str, launchd: Loader) -> Result<(), String> {
     valid_name(name)?;
     let _lock = Lock::take(places)?;
-    let path = places.plist(name);
-    let last = places.last(name);
-    // A folder that ignores case finds `build`'s files for `Build`, whose
-    // label launchd does not have: only the name as stored is that trigger.
-    let stored = |dir: &Path, file: &Path| {
-        let want = file.file_name();
-        std::fs::read_dir(dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .any(|e| Some(e.file_name().as_os_str()) == want)
-    };
-    let (path_here, last_here) = (stored(&places.agents, &path), stored(&places.state, &last));
-    // launchd's labels keep their case, so this reaches only this name's job.
-    let loaded = match launchd(Launchd::Unload(&format!("{LABEL}{name}"))) {
-        Ok(()) => true,
-        Err(error) if error.starts_with(NOT_LOADED) => false,
-        Err(error) => return Err(error),
-    };
-    if !path_here && !last_here && !loaded {
-        return Err(format!("trigger_not_found: {name}"));
+    match retire(places, name, false, launchd)? {
+        true => Ok(()),
+        false => Err(format!("trigger_not_found: {name}")),
     }
-    if path_here {
-        forget(&path)?;
-    }
-    if last_here {
-        forget(&last)?;
-    }
-    let _ = forget(&places.asked(name));
-    Ok(())
 }
 
-/// `fire NAME`: launchd runs the trigger's job now. The note it leaves tells
-/// that fire it was asked for, so it sends whatever the time or its watched
-/// path. While one of its fires still runs launchd starts no other: that
-/// fire finds the note when it is done and sends once more.
-pub fn fire_now(places: &Places, name: &str, launchd: Loader) -> Result<Value, String> {
+/// `fire NAME`: an ask, which launchd runs the trigger's job for. While a
+/// fire of it runs launchd starts no other; it runs the job again once that
+/// one is done, for the ask it left.
+pub fn fire_now(places: &Places, name: &str) -> Result<Value, String> {
     valid_name(name)?;
     let _lock = Lock::take(places)?;
     if !places.plist(name).exists() {
         return Err(format!("trigger_not_found: {name}"));
     }
-    let asked = places.asked(name);
-    replace(&asked, &now().to_string())?;
-    if let Err(error) = launchd(Launchd::Start(&format!("{LABEL}{name}"))) {
-        let _ = forget(&asked);
-        return Err(error);
-    }
+    ask(places, name, false)?;
     Ok(json!({"name": name, "fired": true}))
 }
 
-/// Whether this fire is one `fire NAME` asked for; the note goes either way.
-fn take_asked(places: &Places, name: &str) -> bool {
-    take_note(places, name, |at| (now() - at).abs() <= ASKED_WITHIN)
+/// Ask for a fire: a file in the trigger's queue, written whole beside it
+/// first, so launchd never starts the job for half of one. Called under the
+/// lock, with the plist there. A `finish` ask only has a fire finish what a
+/// cut-short one began (`resume`), sending nothing new.
+fn ask(places: &Places, name: &str, finish: bool) -> Result<(), String> {
+    let asks = places.asks(name);
+    std::fs::create_dir_all(&asks).map_err(|e| format!("{}: {e}", asks.display()))?;
+    static ASKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let file = format!(
+        "{}{}.{}.{}",
+        if finish { FINISH } else { "" },
+        now(),
+        std::process::id(),
+        ASKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let beside = places.state.join(format!(".ask.{name}.{file}"));
+    replace(&beside, "")?;
+    std::fs::rename(&beside, asks.join(&file))
+        .and_then(|()| std::fs::File::open(&asks)?.sync_all())
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&beside);
+            format!("{}: {e}", asks.display())
+        })
 }
 
-/// The `fire NAME` note, gone once read, when `fresh` takes its time.
-fn take_note(places: &Places, name: &str, fresh: impl Fn(i64) -> bool) -> bool {
-    // Moved aside first: a note written while this one is read is the
-    // next one, not lost with it.
-    let path = places.asked(name);
-    let taken = path.with_extension("fire.taken");
-    if std::fs::rename(&path, &taken).is_err() {
-        return false;
+/// How a `finish` ask's file starts.
+const FINISH: &str = "finish.";
+
+/// Whether this fire was asked for; a `finish` ask is not that. The asks it
+/// read go, so launchd does not run it again for them; one made while it
+/// runs is the next fire's.
+fn take_asks(places: &Places, name: &str) -> bool {
+    let asks = places.asks(name);
+    let mut asked = false;
+    for e in std::fs::read_dir(&asks).into_iter().flatten().flatten() {
+        let finish = e.file_name().to_string_lossy().starts_with(FINISH);
+        asked |= forget(&e.path()).is_ok() && !finish;
     }
-    let at = std::fs::read_to_string(&taken)
-        .ok()
-        .and_then(|t| t.trim().parse::<i64>().ok());
-    let _ = forget(&taken);
-    at.is_some_and(fresh)
+    asked
 }
 
-/// What a fire leaves for the next: messages sent, the agent it started
-/// (or began to), the commit it saw, and the turn whose answer it was
-/// waiting to pass on when it was cut short.
+/// What a fire leaves for the next, all in one record, each part on disk
+/// before the step it is for: messages sent, the agent it started (or began
+/// to), the commit it saw, and the message it began to send, until it
+/// settles. A fire cut short anywhere leaves the next one what it needs to
+/// finish, and nothing it could do twice.
 #[derive(Debug, Default, Clone, PartialEq)]
 struct Kept {
     sent: u64,
     started_id: Option<i64>,
     starting: bool,
     head: Option<String>,
-    pending: Value,
+    /// `{bot, bot_id, request_id, prompt, delivery, started}`: the submit,
+    /// whole, so sending it again is the same request.
+    sending: Value,
 }
 
 impl Kept {
@@ -1371,7 +1383,7 @@ impl Kept {
             started_id: state["started_id"].as_i64(),
             starting: state["starting"] == true,
             head: state["head"].as_str().map(str::to_owned),
-            pending: state["pending"].clone(),
+            sending: state["sending"].clone(),
         }
     }
 }
@@ -1391,7 +1403,7 @@ fn settle(places: &Places, trigger: &Trigger, outcome: &Value, kept: &Kept, laun
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Under the lock no `add` is between writing and loading one.
-            if let Err(error) = unload(&format!("{LABEL}{}", trigger.name), launchd) {
+            if let Err(error) = retire(places, &trigger.name, true, launchd) {
                 log(error);
             }
             return;
@@ -1404,7 +1416,7 @@ fn settle(places: &Places, trigger: &Trigger, outcome: &Value, kept: &Kept, laun
     let sent = outcome["outcome"] == "sent";
     let kept = Kept {
         sent: kept.sent + u64::from(sent),
-        pending: Value::Null,
+        sending: Value::Null,
         ..kept.clone()
     };
     let recorded = record_last(places, trigger, outcome, &kept);
@@ -1418,41 +1430,65 @@ fn settle(places: &Places, trigger: &Trigger, outcome: &Value, kept: &Kept, laun
     // stays, listed.
     // An answer that did not get through keeps its row, saying so.
     let kept_row = !sent || outcome["reply"]["outcome"] == "failed";
-    if over && (sent || recorded.is_ok()) {
-        end(places, &trigger.name, &path, &text, kept_row, launchd);
+    if over
+        && (sent || recorded.is_ok())
+        && let Err(error) = retire(places, &trigger.name, kept_row, launchd)
+    {
+        log(error);
     }
 }
 
-/// A trigger ends itself: its plist first, then launchd's copy, whose
-/// unload ends this process. `keep` leaves its last result, so an end nobody
-/// asked for still shows, and why. A plist that will not go stays loaded,
-/// listed, for `rm`: unloaded, it would load again at the next login. An
-/// unload launchd refuses writes the plist back, so the job still loaded
-/// stays listed for `rm`. Called under the lock.
-fn end(places: &Places, name: &str, path: &Path, text: &str, keep: bool, launchd: Loader) {
-    let log = |error: String| eprintln!("{}", error_json(&error));
-    if let Err(error) = forget(path) {
-        return log(error);
-    }
-    let last = places.last(name);
-    let result = if keep {
-        None
-    } else {
-        let result = std::fs::read_to_string(&last).ok();
-        if let Err(error) = forget(&last) {
-            log(error);
-        }
-        result
+/// The one way a trigger goes, by `rm` or by its own end, under the lock:
+/// its files first, then launchd's job, whose unload ends a fire that ends
+/// its own trigger, so nothing can be left to do after it. `keep` leaves its
+/// last result, so an end nobody asked for still shows, and why. A job
+/// launchd will not unload gets its files back, so it stays listed for `rm`:
+/// with its plist gone it would load again at the next login. Whether any of
+/// it was there. A folder that ignores case finds `build`'s files for
+/// `Build`, whose label launchd does not have: only the name as stored is
+/// that trigger, and launchd's labels keep their case.
+fn retire(places: &Places, name: &str, keep: bool, launchd: Loader) -> Result<bool, String> {
+    let stored = |dir: &Path, file: &Path| {
+        let want = file.file_name();
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|e| Some(e.file_name().as_os_str()) == want)
+            .then(|| std::fs::read_to_string(file).ok())
     };
-    if let Err(error) = unload(&format!("{LABEL}{name}"), launchd) {
-        log(error);
-        // Still loaded, it is still this trigger, with what its fire did.
-        for (path, text) in [(path, Some(text)), (&last, result.as_deref())] {
-            if let Some(text) = text
+    let plist = places.plist(name);
+    let last = places.last(name);
+    let mut gone = vec![(plist.clone(), stored(&places.agents, &plist))];
+    if !keep {
+        gone.push((last.clone(), stored(&places.state, &last)));
+    }
+    let restore = |gone: &[(PathBuf, Option<Option<String>>)]| {
+        for (path, text) in gone {
+            if let Some(Some(text)) = text
                 && let Err(error) = replace(path, text)
             {
-                log(error);
+                eprintln!("{}", error_json(&error));
             }
+        }
+    };
+    for (i, (path, text)) in gone.iter().enumerate() {
+        if text.is_some()
+            && let Err(error) = forget(path)
+        {
+            restore(&gone[..i]);
+            return Err(error);
+        }
+    }
+    let here = gone.iter().any(|(_, text)| text.is_some());
+    // Asks for a trigger that goes are for nothing.
+    let _ = std::fs::remove_dir_all(places.asks(name));
+    match launchd(Launchd::Unload(&format!("{LABEL}{name}"))) {
+        Ok(()) => Ok(true),
+        Err(error) if error.starts_with(NOT_LOADED) => Ok(here),
+        Err(error) => {
+            restore(&gone);
+            Err(error)
         }
     }
 }
@@ -1540,6 +1576,8 @@ pub fn migrate(places: &Places, running: Option<&str>, launchd: Loader) -> bool 
         // A plist renamed by hand names another trigger, or another job.
         let names_it = read_plist(&converted).is_some_and(|(t, _)| t.name == name)
             && converted.contains(&format!("<string>{LABEL}{name}</string>"));
+        let asks = places.asks(&name);
+        let converted = queued(&converted, &asks);
         if !names_it {
             log(format!(
                 "unconvertible: schedule {name} is left at {}",
@@ -1559,7 +1597,9 @@ pub fn migrate(places: &Places, running: Option<&str>, launchd: Loader) -> bool 
                 ));
                 continue;
             }
-            if let Err(error) = swap(&path, &name, None, &converted, launchd) {
+            let made =
+                std::fs::create_dir_all(&asks).map_err(|e| format!("{}: {e}", asks.display()));
+            if let Err(error) = made.and_then(|()| swap(&path, &name, None, &converted, launchd)) {
                 log(error);
                 continue;
             }
@@ -1798,7 +1838,7 @@ pub fn cli(args: &[String]) -> i32 {
         Some((verb, [name])) if verb == "rm" => {
             remove(&places, name, &launchctl).map(|()| json!({"removed": name}))
         }
-        Some((verb, [name])) if verb == "fire" => fire_now(&places, name, &launchctl),
+        Some((verb, [name])) if verb == "fire" => fire_now(&places, name),
         Some((verb, rest)) if verb == "add" => add(&places, rest),
         _ => Err(format!("usage: {USAGE}")),
     }) {
@@ -2063,24 +2103,22 @@ fn write_row(places: &Places, trigger: &Trigger, last: &Value, kept: &Kept) -> R
     if kept.starting {
         row["starting"] = json!(true);
     }
-    if !kept.pending.is_null() {
-        row["pending"] = kept.pending.clone();
+    if !kept.sending.is_null() {
+        row["sending"] = kept.sending.clone();
     }
     replace(&places.last(&trigger.name), &row.to_string())
 }
 
-/// What a fire must not lose if it is cut short before it settles (its
-/// answer can take a day) goes on disk at once: the agent it is making or
-/// made, the turn whose answer it waits on. Only that changes; the rest is
-/// as the last fire left it, its commit included, which this fire has not
-/// sent yet. Only while the plist is still this trigger's, as `settle`
-/// writes.
+/// A step of a fire goes on disk before the fire takes it (`Kept`). Only
+/// that changes; the rest is as the last fire left it. Only while the plist
+/// is still this trigger's: one removed or replaced takes no more steps.
 fn keep(places: &Places, trigger: &Trigger, change: impl FnOnce(&mut Kept)) -> Result<(), String> {
     let _lock = Lock::take(places)?;
-    let path = places.plist(&trigger.name);
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if read_plist(&text).is_none_or(|(now, _)| now != *trigger) {
-        return Ok(());
+    if !ours(places, trigger) {
+        return Err(format!(
+            "trigger_not_found: {} was removed or replaced",
+            trigger.name
+        ));
     }
     let durable = state(places, trigger);
     let mut kept = Kept::of(&durable);
@@ -2225,16 +2263,36 @@ async fn deliver(
     } else {
         "reject"
     };
+    let sending = json!({"bot": bot, "bot_id": id, "request_id": request_id(trigger, id),
+        "prompt": prompt, "delivery": delivery, "started": started});
+    let head = kept.head.clone();
+    if let Err(error) = keep(places, trigger, |k| {
+        k.sending = sending.clone();
+        k.head = head;
+    }) {
+        return json!({"outcome": "failed", "detail": error});
+    }
+    kept.sending = sending.clone();
+    submit(client, trigger, &sending).await
+}
+
+/// Send the message a fire began and pass its answer on. Sent again, after
+/// a fire was cut short, it is the same request: the daemon answers with
+/// the turn it made the first time, or makes it now.
+async fn submit(client: &Client, trigger: &Trigger, sending: &Value) -> Value {
+    let bot = sending["bot"].as_str().unwrap_or_default();
     let submitted = client
         .request(
             "submit",
-            json!({"bot": bot, "bot_id": id,
-                "request_id": request_id(trigger, id),
-                "prompt": prompt, "delivery": delivery, "origin": "trigger"}),
+            json!({"bot": bot, "bot_id": sending["bot_id"],
+                "request_id": sending["request_id"], "prompt": sending["prompt"],
+                "delivery": sending["delivery"], "origin": "trigger"}),
         )
         .await;
     let outcome = match submitted {
-        Ok(turn) if started => json!({"outcome": "sent", "turn": turn["turn"], "started": true}),
+        Ok(turn) if sending["started"] == true => {
+            json!({"outcome": "sent", "turn": turn["turn"], "started": true})
+        }
         Ok(turn) => json!({"outcome": "sent", "turn": turn["turn"]}),
         Err(error) if error.code == "bot_busy" || error.code == "active_agent_limit" => {
             json!({"outcome": "skipped", "detail": error.to_string()})
@@ -2244,7 +2302,7 @@ async fn deliver(
         }
         Err(error) => json!({"outcome": "failed", "detail": error.to_string()}),
     };
-    reply(client, places, trigger, bot, outcome).await
+    reply(client, trigger, bot, outcome).await
 }
 
 /// A fire's request id. With `--reply-to` it ends `-to-ID`, the agent its
@@ -2260,22 +2318,10 @@ fn request_id(trigger: &Trigger, id: i64) -> String {
 
 /// With `--reply-to`, wait for the turn a fire sent and queue its answer
 /// to that agent; what came of it is the outcome's `reply`.
-async fn reply(
-    client: &Client,
-    places: &Places,
-    trigger: &Trigger,
-    bot: &str,
-    mut outcome: Value,
-) -> Value {
+async fn reply(client: &Client, trigger: &Trigger, bot: &str, mut outcome: Value) -> Value {
     let (Some((to, to_id)), Some(turn)) = (&trigger.reply_to, outcome["turn"].as_i64()) else {
         return outcome;
     };
-    // A fire cut short while it waits leaves the turn for the next fire,
-    // or the app's next start, to pass on.
-    let pending = json!({"bot": bot, "turn": turn, "pid": std::process::id()});
-    if let Err(error) = keep(places, trigger, |k| k.pending = pending) {
-        eprintln!("{}", error_json(&error));
-    }
     let handle = format!("turn:{bot}/{turn}");
     let waited = client
         .request(
@@ -2321,6 +2367,11 @@ async fn reply(
         .await;
     outcome["reply"] = match sent {
         Ok(sent) => json!({"outcome": "sent", "bot": to, "turn": sent["turn"]}),
+        // Its request id is the turn's own: another prompt under it is this
+        // answer, passed on by a fire cut short before it settled.
+        Err(error) if error.code == "idempotency_conflict" => {
+            json!({"outcome": "sent", "bot": to})
+        }
         Err(error) => json!({"outcome": "failed", "bot": to, "detail": error.to_string()}),
     };
     outcome
@@ -2335,29 +2386,12 @@ pub fn fire_cli(args: &[String]) -> i32 {
             return 1;
         }
     };
-    fires(&places, &trigger.name, |asked| {
-        fire(&places, &trigger, asked)
-    });
+    let asked = take_asks(&places, &trigger.name);
+    fire(&places, &trigger, asked);
     0
 }
 
-/// Fire, and again for each `fire NAME` asked while it ran.
-/// One asked while it ran is this fire's however long it ran (a fire can
-/// wait a day); one asked before it started was read at its start.
-fn fires(places: &Places, name: &str, mut fire: impl FnMut(bool)) {
-    let mut asked = take_asked(places, name);
-    loop {
-        let started = now();
-        fire(asked);
-        if !take_note(places, name, |at| at >= started) {
-            return;
-        }
-        asked = true;
-    }
-}
-
-/// This process's sends so far: one fire can send twice within a second
-/// (`fires`), and each send is its own request.
+/// This process's sends so far: each send is its own request.
 fn sends() -> u64 {
     static SENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     SENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -2374,21 +2408,25 @@ fn fire(places: &Places, trigger: &Trigger, asked: bool) {
         return ends(places, trigger, true);
     }
     let now = now();
-    let durable = state(places, trigger);
+    let mut durable = state(places, trigger);
     let mut kept = Kept::of(&durable);
-    // A fire cut short while it waited for its answer: this one passes that
-    // answer on in its place, counts its message, and sends nothing new.
-    if let (Some(bot), Some(turn)) = (kept.pending["bot"].as_str(), kept.pending["turn"].as_i64()) {
-        let sent = json!({"outcome": "sent", "turn": turn});
-        let bot = bot.to_owned();
-        // A daemon it cannot reach now keeps the turn for the next fire.
+    // A message a fire began and did not settle (the Mac restarted while it
+    // waited for the answer): this one finishes it first, as the same
+    // request, and sends anything new only when asked to.
+    if !kept.sending.is_null() {
+        let sending = kept.sending.clone();
         match with_daemon(trigger, async |client| {
-            reply(client, places, trigger, &bot, sent).await
+            submit(client, trigger, &sending).await
         }) {
             Ok(outcome) => settle(places, trigger, &outcome, &kept, &launchctl),
-            Err(failed) => eprintln!("{failed}"),
+            // A daemon it cannot reach now keeps it for the next fire.
+            Err(failed) => return eprintln!("{failed}"),
         }
-        return;
+        if !asked || !Lock::take(places).is_ok_and(|_lock| ours(places, trigger)) {
+            return;
+        }
+        durable = state(places, trigger);
+        kept = Kept::of(&durable);
     }
     // Its last run went out but its end did not (launchd would not unload
     // it): it ends now, sending nothing more.
@@ -2477,31 +2515,42 @@ fn with_daemon(trigger: &Trigger, f: impl AsyncFnOnce(&Client) -> Value) -> Resu
     })
 }
 
+/// Whether the plist is still this trigger's. Read under the lock.
+fn ours(places: &Places, trigger: &Trigger) -> bool {
+    std::fs::read_to_string(places.plist(&trigger.name))
+        .is_ok_and(|text| read_plist(&text).is_some_and(|(now, _)| now == *trigger))
+}
+
 /// The trigger ends, under the lock, while the plist is still its own.
 fn ends(places: &Places, trigger: &Trigger, keep: bool) {
-    if let Ok(_lock) = Lock::take(places) {
-        let path = places.plist(&trigger.name);
-        if let Ok(text) = std::fs::read_to_string(&path)
-            && read_plist(&text).is_some_and(|(now, _)| now == *trigger)
-        {
-            end(places, &trigger.name, &path, &text, keep, &launchctl);
-        }
+    let log = |error: String| eprintln!("{}", error_json(&error));
+    let _lock = match Lock::take(places) {
+        Ok(lock) => lock,
+        Err(error) => return log(error),
+    };
+    if ours(places, trigger)
+        && let Err(error) = retire(places, &trigger.name, keep, &launchctl)
+    {
+        log(error);
     }
 }
 
-/// At the app's start: a trigger whose fire was cut short while it waited
-/// for an answer (the Mac restarted) fires again to pass it on, when no
-/// fire of it still runs. A one-off has no next time to do it at.
-pub fn resume(places: &Places, launchd: Loader) {
+/// At the app's start: a trigger whose fire was cut short with a message
+/// begun (the Mac restarted) is asked to finish it, so a one-off, which has
+/// no next time, or a trigger whose next time is far off passes it on now.
+/// A fire of it still running settles it first; the one launchd runs after
+/// that finds nothing to finish.
+pub fn resume(places: &Places) {
     for (name, read) in read_all(places) {
         let Ok((trigger, _)) = read else { continue };
-        let pending = &state(places, &trigger)["pending"];
-        let Some(pid) = pending["pid"].as_i64() else {
+        if state(places, &trigger)["sending"].is_null() {
             continue;
-        };
-        // SAFETY: signal 0 only asks whether the process exists.
-        let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
-        if !alive && let Err(error) = fire_now(places, &name, launchd) {
+        }
+        let asked = Lock::take(places).and_then(|_lock| match ours(places, &trigger) {
+            true => ask(places, &name, true),
+            false => Ok(()),
+        });
+        if let Err(error) = asked {
             eprintln!("{}", error_json(&error));
         }
     }
@@ -2723,8 +2772,13 @@ mod tests {
             Path::new("/Applications/Agent.app/Contents/MacOS/agent-app"),
             &s,
             &when,
+            Path::new("/H/.agent/triggers/p.fix-login.asks"),
             &[("SHELL", "/bin/zsh".into())],
         );
+        assert!(text.contains(
+            "<key>QueueDirectories</key>\n  <array>\n    <string>/H/.agent/triggers/p.fix-login.asks</string>"
+        ));
+        assert_eq!(queued(&text, Path::new("/other")), text);
         assert!(
             text.contains(
                 "<key>Label</key>\n  <string>me.lydakis.agent.trigger.p.fix-login</string>"
@@ -2766,7 +2820,7 @@ mod tests {
             watch: Some("/r/.git/logs/HEAD".into()),
             ..fired()
         };
-        let text = plist(Path::new("/A/app"), &full, &watched, &[]);
+        let text = plist(Path::new("/A/app"), &full, &watched, Path::new("/q"), &[]);
         assert!(
             text.contains(
                 "<key>WatchPaths</key>\n  <array>\n    <string>/r/.git/logs/HEAD</string>"
@@ -2775,7 +2829,7 @@ mod tests {
         assert!(!text.contains("StartCalendarInterval"));
         assert_eq!(read_plist(&text).unwrap().0, full);
         // Only `fire` runs one with neither.
-        let text = plist(Path::new("/A/app"), &s, &fired(), &[]);
+        let text = plist(Path::new("/A/app"), &s, &fired(), Path::new("/q"), &[]);
         assert!(!text.contains("StartCalendarInterval") && !text.contains("WatchPaths"));
         for bad in [
             vec!["--bot", "x"],
@@ -2797,7 +2851,6 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         loaded: RefCell<std::collections::BTreeSet<String>>,
-        started: RefCell<Vec<String>>,
         refuse_load: std::cell::Cell<bool>,
         refuse_unload: std::cell::Cell<bool>,
         unloads: std::cell::Cell<usize>,
@@ -2827,13 +2880,6 @@ mod tests {
                         .remove(label)
                         .then_some(())
                         .ok_or_else(|| format!("{NOT_LOADED}launchctl bootout: no such process"))
-                }
-                Launchd::Start(label) => {
-                    if !self.loaded.borrow().contains(label) {
-                        return Err("launchctl kickstart: no such service".into());
-                    }
-                    self.started.borrow_mut().push(label.to_owned());
-                    Ok(())
                 }
             }
         }
@@ -2967,6 +3013,7 @@ mod tests {
                 Path::new("/A/agent-app"),
                 &s,
                 &every("1d", clock(2026, 9, 28, 9, 7)).unwrap(),
+                &w.places.asks(&s.name),
                 &[]
             )
         );
@@ -3043,7 +3090,7 @@ mod tests {
             ..trigger()
         };
         let app = Path::new("/A/agent-app");
-        assert!(plist(app, &s, &broad, &[]).len() as u64 > MAX_RECORD);
+        assert!(plist(app, &s, &broad, Path::new("/q"), &[]).len() as u64 > MAX_RECORD);
         let refused = install(&w.places, app, &s, &broad, &[], &|what| w.fake.call(what));
         assert!(refused.unwrap_err().starts_with("invalid_trigger:"));
         assert_eq!(w.state(&s.name), (false, false, false));
@@ -3092,14 +3139,20 @@ mod tests {
         };
         std::fs::write(
             w.places.plist(&s.name),
-            plist(Path::new("/A/app"), &changed, &fired(), &[]),
+            plist(
+                Path::new("/A/app"),
+                &changed,
+                &fired(),
+                Path::new("/q"),
+                &[],
+            ),
         )
         .unwrap();
         assert!(w.rows()[0]["last"].is_null());
         assert_eq!(w.rows()[0]["sent"], 0);
         std::fs::write(
             w.places.plist(&s.name),
-            plist(Path::new("/A/app"), &s, &fired(), &[]),
+            plist(Path::new("/A/app"), &s, &fired(), Path::new("/q"), &[]),
         )
         .unwrap();
         assert_eq!(w.rows()[0]["last"]["turn"], 7);
@@ -3111,7 +3164,7 @@ mod tests {
             };
             std::fs::write(
                 w.places.plist(&item.name),
-                plist(Path::new("/A/app"), &item, &fired(), &[]),
+                plist(Path::new("/A/app"), &item, &fired(), Path::new("/q"), &[]),
             )
             .unwrap();
         }
@@ -3253,7 +3306,7 @@ mod tests {
         let stuck = w.places.plist("p.stuck");
         std::fs::create_dir_all(stuck.join("x")).unwrap();
         w.fake.loaded.borrow_mut().insert(format!("{LABEL}p.stuck"));
-        end(&w.places, "p.stuck", &stuck, "", false, &|x| w.fake.call(x));
+        assert!(retire(&w.places, "p.stuck", false, &|x| w.fake.call(x)).is_err());
         assert!(w.fake.loaded.borrow().contains(&format!("{LABEL}p.stuck")));
         std::fs::remove_dir_all(&stuck).unwrap();
         // A repeating one ends only when its agent is gone, keeping why.
@@ -3311,50 +3364,57 @@ mod tests {
     }
 
     #[test]
-    fn fire_asks_launchd_to_run_the_job_now_and_its_fire_knows() {
+    fn fire_asks_launchd_to_run_the_job_and_its_fire_knows() {
         let w = World::new("fire-now");
         let s = trigger();
         assert!(
-            fire_now(&w.places, &s.name, &|x| w.fake.call(x))
+            fire_now(&w.places, &s.name)
                 .unwrap_err()
                 .starts_with("trigger_not_found")
         );
         w.install(&s).unwrap();
-        assert_eq!(
-            fire_now(&w.places, &s.name, &|x| w.fake.call(x)).unwrap(),
-            json!({"name": s.name, "fired": true})
+        let asks = w.places.asks(&s.name);
+        assert!(w.plist(&s.name).contains(&format!(
+            "<key>QueueDirectories</key>\n  <array>\n    <string>{}</string>",
+            asks.display()
+        )));
+        assert!(!take_asks(&w.places, &s.name), "launchd's own fire");
+        // Asks made before a fire starts are all that fire's, and go with it:
+        // launchd has nothing to run it again for.
+        for _ in 0..2 {
+            assert_eq!(
+                fire_now(&w.places, &s.name).unwrap(),
+                json!({"name": s.name, "fired": true})
+            );
+        }
+        assert_eq!(std::fs::read_dir(&asks).unwrap().count(), 2);
+        assert!(take_asks(&w.places, &s.name));
+        assert_eq!(std::fs::read_dir(&asks).unwrap().count(), 0);
+        assert!(!take_asks(&w.places, &s.name));
+        // Nothing half written is ever in the queue.
+        let beside = std::fs::read_dir(&w.places.state)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
+            .filter(|e| e.file_name() != ".lock")
+            .count();
+        assert_eq!(beside, 0);
+        // The app's start asks one with a message begun only to finish it.
+        resume(&w.places);
+        assert_eq!(std::fs::read_dir(&asks).unwrap().count(), 0);
+        keep(&w.places, &s, |k| k.sending = json!({"bot": "p.x"})).unwrap();
+        resume(&w.places);
+        let finish: Vec<_> = std::fs::read_dir(&asks).unwrap().flatten().collect();
+        assert!(finish[0].file_name().to_string_lossy().starts_with(FINISH));
+        assert!(
+            !take_asks(&w.places, &s.name),
+            "a finish ask asks for nothing new"
         );
-        assert_eq!(*w.fake.started.borrow(), [format!("{LABEL}{}", s.name)]);
-        assert!(take_asked(&w.places, &s.name));
-        // Read once: the next fire is launchd's own.
-        assert!(!take_asked(&w.places, &s.name));
-        // One asked for long ago is not this fire's.
-        replace(&w.places.asked(&s.name), &(now() - 3600).to_string()).unwrap();
-        assert!(!take_asked(&w.places, &s.name));
-        // One asked while a fire runs is sent once that fire is done.
-        let mut seen = Vec::new();
-        fires(&w.places, &s.name, |asked| {
-            if seen.is_empty() {
-                fire_now(&w.places, &s.name, &|x| w.fake.call(x)).unwrap();
-            }
-            seen.push(asked);
-        });
-        assert_eq!(seen, [false, true]);
-        // However long that fire ran; but not one older than its start.
-        let mut seen = Vec::new();
-        fires(&w.places, &s.name, |asked| {
-            if seen.is_empty() {
-                replace(&w.places.asked(&s.name), &(now() + 3600).to_string()).unwrap();
-            } else if seen.len() == 1 {
-                replace(&w.places.asked(&s.name), &(now() - 3600).to_string()).unwrap();
-            }
-            seen.push(asked);
-        });
-        assert_eq!(seen, [false, true]);
-        // One launchd will not run leaves no note behind.
-        w.fake.loaded.borrow_mut().clear();
-        assert!(fire_now(&w.places, &s.name, &|x| w.fake.call(x)).is_err());
-        assert!(!w.places.asked(&s.name).exists());
+        assert_eq!(std::fs::read_dir(&asks).unwrap().count(), 0);
+        // A trigger that goes takes its asks with it.
+        fire_now(&w.places, &s.name).unwrap();
+        w.remove(&s.name).unwrap();
+        assert!(!asks.exists());
     }
 
     #[test]
@@ -3584,7 +3644,7 @@ mod tests {
         // and one that is not a schedule's plist.
         let entries = every("1d", clock(2026, 9, 28, 9, 7)).unwrap();
         let old = |s: &Trigger| {
-            plist(Path::new("/A/agent-app"), s, &entries, &[])
+            plist(Path::new("/A/agent-app"), s, &entries, Path::new("/q"), &[])
                 .replace(LABEL, SCHEDULE_LABEL)
                 .replace(FIRE_FLAG, SCHEDULE_FIRE_FLAG)
         };
@@ -3672,7 +3732,7 @@ mod tests {
             },
         );
         for s in [&cut, &ended] {
-            let new = plist(Path::new("/A/agent-app"), s, &entries, &[]);
+            let new = plist(Path::new("/A/agent-app"), s, &entries, Path::new("/q"), &[]);
             let old = new
                 .replace(LABEL, SCHEDULE_LABEL)
                 .replace(FIRE_FLAG, SCHEDULE_FIRE_FLAG);
@@ -3738,7 +3798,7 @@ mod tests {
         std::fs::create_dir_all(&places.agents).unwrap();
         let entries = every("1d", clock(2026, 9, 28, 9, 7)).unwrap();
         let old_plist = |s: &Trigger| {
-            plist(Path::new("/A/agent-app"), s, &entries, &[])
+            plist(Path::new("/A/agent-app"), s, &entries, Path::new("/q"), &[])
                 .replace(LABEL, SCHEDULE_LABEL)
                 .replace(FIRE_FLAG, SCHEDULE_FIRE_FLAG)
         };

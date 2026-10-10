@@ -270,15 +270,19 @@ class TriggerFireTests(ModelFixture):
                             generation='g1', wait=False)
         last = self.home / '.agent/triggers/p.review.json'
         deadline = time.time() + 20
-        while time.time() < deadline and not (last.exists() and json.loads(last.read_text()).get('pending')):
-            time.sleep(0.05)
+        def waiting():
+            return (last.exists() and json.loads(last.read_text()).get('sending')
+                    and any(b['name'] == 'p.review' for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout))
+                    and self.turns('p.review'))
+        while time.time() < deadline and not waiting():
+            time.sleep(0.1)
         running.kill()
         running.wait()
         made = self.bot_id('p.review')
         kept = json.loads(last.read_text())
         self.assertEqual(kept['started_id'], made)
-        self.assertEqual(kept['pending']['bot'], 'p.review')
-        turn = kept['pending']['turn']
+        self.assertEqual(kept['sending']['bot'], 'p.review')
+        turn = self.turns('p.review')[-1]['turn']
         self.model.release_headers.set()
         self.settle('p.review')
         # The next fire passes that answer on in its place, and sends nothing new.
@@ -286,11 +290,43 @@ class TriggerFireTests(ModelFixture):
                           generation='g1')
         self.assertEqual(again['bot_id'], made)
         self.assertEqual((again['last']['turn'], again['last']['reply']['outcome']), (turn, 'sent'), again)
-        self.assertNotIn('pending', json.loads(last.read_text()))
+        self.assertNotIn('sending', json.loads(last.read_text()))
         self.assertEqual(len(self.turns('p.review')), 1)
         self.settle('p.lead')
         self.assertRegex(self.turns('p.lead')[-1]['prompt_preview'],
                          '^' + LINE.format('p.review', f'p.review turn {turn} completed'))
+
+    def test_a_message_a_fire_began_goes_once_whether_or_not_it_got_there(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        task = self.bot_id('p.task')
+        first = self.fire('p.task', 'first', generation='g1')
+        self.assertEqual(first['sent'], 1, first)
+        self.settle('p.task')
+        last = self.home / '.agent/triggers/p.task.json'
+        for landed in (False, True):
+            # A fire cut short after it wrote down the message, before or after the daemon took it.
+            sending = {'bot': 'p.task', 'bot_id': task, 'request_id': f'trigger-{task}-cut-{landed}',
+                       'prompt': f'[trigger p.task · 2026-10-10 00:00 · fired]\nlanded {landed}',
+                       'delivery': 'queue', 'started': False}
+            if landed:
+                connection = Connection(str(self.store) + '.sock')
+                try:
+                    connection.request('submit', bot='p.task', bot_id=task, request_id=sending['request_id'],
+                                       prompt=sending['prompt'], delivery='queue', origin='trigger')
+                finally:
+                    connection.close()
+                self.settle('p.task')
+            before = len(self.turns('p.task'))
+            kept = json.loads(last.read_text())
+            last.write_text(json.dumps({**kept, 'sending': sending}))
+            # The next fire, launchd's own, finishes it as the same request and sends nothing new.
+            again = self.fire('p.task', 'first', generation='g1')
+            self.assertEqual(again['last']['outcome'], 'sent', again)
+            self.assertNotIn('sending', again)
+            self.assertEqual(again['sent'], kept['sent'] + 1)
+            self.assertEqual(len(self.turns('p.task')), before + (0 if landed else 1))
+            self.assertEqual(self.turns('p.task')[-1]['request_id'], sending['request_id'])
+            self.settle('p.task')
 
     def test_an_answer_goes_to_the_reply_agent(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
@@ -366,7 +402,8 @@ class TriggerFireTests(ModelFixture):
         # Run now while the repository is away sends, and keeps the commit last seen.
         moved = self.path / 'away'
         repo.rename(moved)
-        (self.home / '.agent/triggers/p.task.fire').write_text(str(int(time.time())))
+        (self.home / '.agent/triggers/p.task.asks').mkdir(parents=True, exist_ok=True)
+        (self.home / '.agent/triggers/p.task.asks/1').write_text('')
         asked = self.fire('p.task', 'Look at it.', when=when, extra=extra, generation='g')
         self.assertEqual(asked['last']['outcome'], 'sent', asked)
         self.assertEqual(asked['head'], news['head'])

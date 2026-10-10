@@ -1065,10 +1065,18 @@ answer to BOT, pinned by id; launchd starts no second fire of the trigger
 meanwhile, so a repeating one skips the times that turn spans. The fire's
 request id then ends `-to-ID`, BOT's id, so the app does not also tell
 that agent of the turn as a task update, unless that answer has not
-reached it 15 s after the turn ended. The turn waited on is kept with the
-trigger's state before the wait: a fire cut short there (a restart) leaves
-it to the next fire, or to the app's next start when no fire runs, which
-passes that answer on in its place and sends nothing new. An answer the daemon cut short is
+reached it 15 s after the turn ended. A fire keeps one record with the
+trigger's state, each part on disk before the step it is for: the agent it
+is making, then the message it is about to send, whole (`sending`: agent,
+request id, prompt, delivery), until it settles. A fire cut short anywhere
+(a restart, while it waits a day for an answer) leaves the next fire to send
+that message again first, as the same request: the daemon answers with the
+turn it made, or makes it now, so it goes once, is counted once, and its
+answer is passed on. The app's start asks a trigger with a message begun
+for a fire that only finishes it (a `finish.` ask), so a one-off or a
+trigger whose next time is far off does not wait; a fire of it still
+running settles it first. Only an ask sends anything new after finishing
+one. An answer the daemon cut short is
 marked so in its first line, and one that does not get through keeps an
 ended trigger listed, saying so. `--if CMD` runs `sh -c CMD` in the folder
 `add` ran in, with the `PATH` `add` ran with, before anything else, for up
@@ -1097,11 +1105,15 @@ first. A name differing from another only in case is refused
 a trigger only by the name as stored; `rm` of a name not there is
 `trigger_not_found`. `ls` returns 64 triggers per page, with `next_after`
 for `--after NAME` or the next page in Settings; only the current page's
-messages are retained. `fire NAME` has launchd run the trigger's job now
-(`launchctl kickstart`) and returns `{"name", "fired": true}`; what the fire
-did shows in `ls`. It leaves a note the fire reads, so that fire sends
-whatever its time or watched path, and queues behind work rather than
-skipping it. launchd runs no second copy of a job still running.
+messages are retained. `fire NAME` asks for a fire and returns
+`{"name", "fired": true}`; what the fire did shows in `ls`. An ask is a file
+in the trigger's queue folder, `~/.agent/triggers/NAME.asks`, which its plist
+names as launchd's `QueueDirectories`: launchd runs the job while an ask is
+there, one run at a time, and runs it again when a run ends with one still
+there. A fire takes the asks it finds as it starts, so it sends whatever its
+time or watched path, and queues behind work rather than skipping it; one
+made while it runs is the next run's. Nothing else starts a fire: launchd
+is the only thing that runs one.
 
 Each is one LaunchAgent, `~/Library/LaunchAgents/me.lydakis.agent.trigger.NAME.plist`,
 and that file is its definition: its program arguments carry the agent and
@@ -1354,9 +1366,9 @@ its result and an ended one's moved, an unreadable plist left in place.
 The same day, file, commit and fire-by-name triggers were added and passed
 the real-daemon tests too: a message starts with its fire line, a commit
 trigger fired again on the same HEAD sends nothing and on a new commit sends
-again, and `add`'s idempotence, `fire`'s note and the `WatchPaths` plist are
+again, and `add`'s idempotence, `fire`'s ask and the `WatchPaths` plist are
 covered against the stand-in launchd. A file trigger firing on a write and
-`fire` through `launchctl kickstart` need a Mac (`AGENT_TEST_LAUNCHD=1`).
+`fire` through the `QueueDirectories` queue need a Mac (`AGENT_TEST_LAUNCHD=1`).
 Then `--start`, `--reply-to`, `--if` and `--runs` passed against a real
 daemon: a started agent made once in the trigger's folder under the agent
 that added it, then messaged; a second trigger for that name refused at its
