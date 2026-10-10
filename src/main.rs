@@ -65,8 +65,19 @@ fn report(error: &Error) {
     if let Some(facts) = &error.facts {
         report.extend(facts.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
-    eprintln!("{}", serde_json::Value::Object(report));
+    // A daemon names itself, so the launcher that started it can pick its
+    // own line out of the log other starts append to; one write keeps the
+    // line whole among theirs.
+    if SERVING.load(std::sync::atomic::Ordering::Relaxed) {
+        report.insert("pid".into(), std::process::id().into());
+    }
+    let mut line = serde_json::Value::Object(report).to_string();
+    line.push('\n');
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
 }
+
+/// Set once this process is `agent serve`.
+static SERVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn run() -> Result<i32> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -90,6 +101,7 @@ fn run() -> Result<i32> {
         return Ok(0);
     };
     if args[0] == "serve" {
+        SERVING.store(true, std::sync::atomic::Ordering::Relaxed);
         let config = configuration(&args[1..])?;
         runtime()?.block_on(server::run(config))?;
         Ok(0)
