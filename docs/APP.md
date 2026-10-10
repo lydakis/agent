@@ -1102,9 +1102,10 @@ anything else a failure can leave is listed and removable:
   whatever their size or contents, and deleted once launchd lets the job
   go; a file that cannot be set aside keeps its job loaded, and an unload
   launchd refuses renames them back, so either stays listed with what its
-  fire did. A
-  job left loaded after its plist went (an end cut short) is unloaded by
-  its next fire.
+  fire did. A fire whose unload ends it before it deletes them leaves them
+  aside; the app's next start, or the next `add` or `rm` of that name,
+  finishes that end. A job left loaded after its plist went (an end cut
+  short) is unloaded by its next fire.
 - **Removing** unloads the job by its label whether or not its plist is
   there, then deletes the plist and the last result, so it reaches an
   ended row, a plist launchd no longer has, and a job loaded without its

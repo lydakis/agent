@@ -847,6 +847,7 @@ pub fn install(
             trigger.name
         ));
     }
+    unfinished(places, &trigger.name, launchd)?;
     let path = places.plist(&trigger.name);
     // One that cannot be read cannot be put back, so it is not replaced.
     let old = match std::fs::read_to_string(&path) {
@@ -995,50 +996,55 @@ fn settle(places: &Places, trigger: &Trigger, outcome: &Value, launchd: Loader) 
 
 /// The one way a trigger goes, by `rm` or by its own end, under the lock:
 /// its files first, then launchd's job, whose unload ends a fire that ends
-/// its own trigger, so nothing can be left to do after it. `keep` leaves its
-/// last result, so an end nobody asked for still shows, and why. Its files
-/// are set aside by rename, whatever their size or contents, and deleted
-/// once launchd has let the job go; a job launchd will not unload gets them
-/// back, so it stays listed for `rm`: with its plist gone it would load
-/// again at the next login. Whether any of it was there. A folder that
-/// ignores case finds `build`'s files for `Build`, whose label launchd does
-/// not have: only the name as stored is that trigger, and launchd's labels
-/// keep their case.
+/// its own trigger. `keep` leaves its last result, so an end nobody asked
+/// for still shows, and why. Its files are set aside by rename, whatever
+/// their size or contents, and deleted once launchd has let the job go; a
+/// job launchd will not unload gets them back, so it stays listed for `rm`:
+/// with its plist gone it would load again at the next login. What an
+/// earlier retire of the name set aside is finished with the rest: a fire's
+/// own unload ends it before it deletes them. Whether any of it was there.
+/// A folder that ignores case finds `build`'s files for `Build`, whose
+/// label launchd does not have: only the name as stored is that trigger,
+/// and launchd's labels keep their case.
 fn retire(places: &Places, name: &str, keep: bool, launchd: Loader) -> Result<bool, String> {
-    let stored = |dir: &Path, file: &Path| {
+    let stored = |file: &Path| {
         let want = file.file_name();
-        std::fs::read_dir(dir)
+        file.parent()
+            .and_then(|dir| std::fs::read_dir(dir).ok())
             .into_iter()
             .flatten()
             .flatten()
             .any(|e| Some(e.file_name().as_os_str()) == want)
     };
-    let mut files = vec![places.plist(name)];
-    if !keep {
-        files.push(places.last(name));
-    }
     let mut aside: Vec<(PathBuf, PathBuf)> = Vec::new();
+    // A file comes back only to a place nothing has taken since.
     let back = |aside: &[(PathBuf, PathBuf)]| {
         for (path, by) in aside {
-            if let Err(error) = renamed(by, path) {
+            if !stored(path)
+                && let Err(error) = renamed(by, path)
+            {
                 eprintln!("{}", error_json(&error));
             }
         }
     };
-    for path in files {
-        let dir = path.parent().ok_or("no folder")?;
-        if !stored(dir, &path) {
+    let (plist, last) = (places.plist(name), places.last(name));
+    for (path, go) in [(&plist, true), (&last, !keep)] {
+        let by = tomb(path);
+        if !(go && stored(path)) {
+            if stored(&by) {
+                aside.push((path.clone(), by));
+            }
             continue;
         }
-        let by = dir.join(format!(
-            ".{}.retiring",
-            path.file_name().unwrap_or_default().to_string_lossy()
-        ));
-        if let Err(error) = renamed(&path, &by) {
+        if let Err(e) = std::fs::rename(path, &by) {
+            back(&aside);
+            return Err(format!("{}: {e}", path.display()));
+        }
+        aside.push((path.clone(), by));
+        if let Err(error) = synced(path) {
             back(&aside);
             return Err(error);
         }
-        aside.push((path, by));
     }
     let here = !aside.is_empty();
     let unloaded = match launchd(Launchd::Unload(&format!("{LABEL}{name}"))) {
@@ -1057,14 +1063,63 @@ fn retire(places: &Places, name: &str, keep: bool, launchd: Loader) -> Result<bo
     unloaded
 }
 
+/// Where a retiring file waits for launchd to let its job go.
+fn tomb(path: &Path) -> PathBuf {
+    let file = path.file_name().unwrap_or_default().to_string_lossy();
+    path.with_file_name(format!(".{file}.retiring"))
+}
+
+/// Finish the retires a fire's own unload cut short, at the app's start.
+/// A name whose plist is back is a trigger added since, and keeps what it
+/// has.
+pub fn finish(places: &Places, launchd: Loader) {
+    let names = |dir: &Path, prefix: &str, suffix: &str| {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter_map(|f| Some(f.strip_prefix(prefix)?.strip_suffix(suffix)?.to_owned()))
+            .collect::<Vec<_>>()
+    };
+    let mut cut = names(&places.agents, &format!(".{LABEL}"), ".plist.retiring");
+    cut.extend(names(&places.state, ".", ".json.retiring"));
+    cut.sort();
+    cut.dedup();
+    for name in cut.iter().filter(|name| valid_name(name).is_ok()) {
+        let Ok(_lock) = Lock::take(places) else {
+            return;
+        };
+        if let Err(error) = unfinished(places, name, launchd) {
+            eprintln!("{}", error_json(&error));
+        }
+    }
+}
+
+/// Under the lock, finish a retire of `name` that was cut short, before
+/// anything else is done with the name.
+fn unfinished(places: &Places, name: &str, launchd: Loader) -> Result<(), String> {
+    let (plist, last) = (places.plist(name), places.last(name));
+    if plist.exists() || !(tomb(&plist).exists() || tomb(&last).exists()) {
+        return Ok(());
+    }
+    retire(places, name, true, launchd).map(|_| ())
+}
+
 /// Rename a file, durably: its folder is synced after.
 fn renamed(from: &Path, to: &Path) -> Result<(), String> {
     std::fs::rename(from, to)
-        .and_then(|()| match to.parent() {
-            Some(dir) => std::fs::File::open(dir).and_then(|d| d.sync_all()),
-            None => Ok(()),
-        })
         .map_err(|e| format!("{}: {e}", from.display()))
+        .and_then(|()| synced(to))
+}
+
+/// Sync the folder a file was renamed in.
+fn synced(path: &Path) -> Result<(), String> {
+    match path.parent() {
+        Some(dir) => std::fs::File::open(dir).and_then(|d| d.sync_all()),
+        None => Ok(()),
+    }
+    .map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// The app moves when it is updated, so it writes its path into every
@@ -2639,6 +2694,48 @@ mod tests {
                 .any(|e| e.file_name().to_string_lossy().ends_with(".retiring"))
         };
         assert!(!left(&w.places.agents) && !left(&w.places.state));
+    }
+
+    #[test]
+    fn an_end_its_own_unload_cut_short_is_finished_later() {
+        let w = World::new("cut-short");
+        let s = trigger();
+        let left = |dir: &Path| {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().ends_with(".retiring"))
+        };
+        // What a fire leaves when its unload ends it: its files set aside,
+        // its job unloaded, or not yet when it died before.
+        let cut = |loaded: bool| {
+            w.install(&s).unwrap();
+            std::fs::write(w.places.last(&s.name), "{}").unwrap();
+            for path in [w.places.plist(&s.name), w.places.last(&s.name)] {
+                std::fs::rename(&path, tomb(&path)).unwrap();
+            }
+            if !loaded {
+                w.fake
+                    .loaded
+                    .borrow_mut()
+                    .remove(&format!("{LABEL}{}", s.name));
+            }
+        };
+        for loaded in [false, true] {
+            cut(loaded);
+            finish(&w.places, &|x| w.fake.call(x));
+            assert_eq!(w.state(&s.name), (false, false, false));
+            assert!(!left(&w.places.agents) && !left(&w.places.state));
+        }
+        // Adding the name again finishes it first; the new one keeps its own.
+        cut(true);
+        w.install(&s).unwrap();
+        assert_eq!(w.state(&s.name), (true, true, false));
+        assert!(!left(&w.places.agents) && !left(&w.places.state));
+        // The app's start leaves a trigger added since alone.
+        std::fs::write(tomb(&w.places.last(&s.name)), "{}").unwrap();
+        finish(&w.places, &|x| w.fake.call(x));
+        assert_eq!(w.state(&s.name), (true, true, false));
     }
 
     #[test]
