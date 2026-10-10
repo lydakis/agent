@@ -85,7 +85,7 @@ class Soak:
         self.control.tools = ['shell', 'read', 'write', 'edit', 'wait', 'history']
         # Every bot's context, compaction and retention.
         self.control.settings = {'context_bytes': 512 * 1024, 'compact_at': 50, 'compact_keep': 25,
-                                 'retain_turns': 12}
+                                 'keep_turns': 12}
         self.events = Connection(self.socket, retain_durable=False)
         self.connections.append(self.events)
         return self.control

@@ -3799,7 +3799,7 @@ mod tests {
         rusqlite::Connection::open(&path)
             .unwrap()
             .execute(
-                "UPDATE bots SET settings='{\"retain_turns\":1}' WHERE name='Bob'",
+                "UPDATE bots SET settings='{\"keep_turns\":1}' WHERE name='Bob'",
                 [],
             )
             .unwrap();

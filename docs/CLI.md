@@ -113,14 +113,21 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   same commands when a call waits. A printed command carries `--store` or
   `--socket`, as absolute paths, whenever the daemon it came from is not
   the default one, so it answers that daemon from any shell.
-- Time units are explicit: `--timeout-ms` is milliseconds; `--idle-exit`,
-  `--stall-timeout`, and `--keep-warm` are seconds. `--after` is an exclusive event cursor for `follow` and an exclusive
+- Every time flag takes a duration with its unit: `500ms`, `30s`, `5m`,
+  `1h`, or a bare `0`. A bare number is refused, so no flag guesses a unit:
+  `--timeout`, `--approval-hold`, `--grace`, `--stall-timeout`,
+  `--idle-exit` and `--keep-warm`. The last three count whole seconds. The
+  protocol keeps its own units (`timeout_ms`, `grace_ms`, `approval_hold_ms`,
+  `keep_warm` seconds). `--approval-hold` is how long a new bot's gated calls
+  wait live for a verdict before the turn parks (default `2s`; `0` parks at
+  once). `--after` is an exclusive event cursor for `follow` and an exclusive
   turn ID for `turns`. `--checkpoint` is a history node ID.
-  `--approval-hold-ms` is milliseconds: how long a new bot's gated calls
-  wait live for a verdict before the turn parks (default 2,000; 0 parks at once).
+- `--keep-turns N` means the same on `prune` and `run`: keep the newest N
+  turns' records. `prune` applies it once; on `run --new` it is the bot's
+  setting, applied after each of its turns.
 - `run` sets a new bot's own settings with `--context-bytes`, `--context-items`,
-  `--note-turns`, `--compact-at`, `--compact-keep`, `--retain-turns`,
-  `--approval-hold-ms`, `--max-output-tokens`, `--keep-warm`, and
+  `--note-turns`, `--compact-at`, `--compact-keep`, `--keep-turns`,
+  `--approval-hold`, `--max-output-tokens`, `--keep-warm`, and
   `--cache-ttl`; they are not daemon options, and an existing bot
   keeps its own (see [bot settings](RUST_PROTOTYPE.md#bot-settings)).
 
@@ -136,7 +143,7 @@ object per line. Snapshot commands return compact JSON objects; `ls` and `turns`
 return arrays. `interrupt` prints the turn view, and `shutdown` prints nothing
 on success.
 `shutdown` returns once the daemon process has exited and its store is closed.
-`shutdown --grace SECONDS` first lets running turns finish for up to that long
+`shutdown --grace DURATION` first lets running turns finish for up to that long
 while starting none; turns still running then end `interrupted` with
 `daemon_shutdown`. A daemon whose ready line announces an older protocol than
 this `agent`'s cannot be asked in this protocol, so `shutdown` sends SIGTERM to
@@ -200,7 +207,7 @@ a daemon that exits without one is `daemon_start_failed`, naming the log.
 `wait` normally requires all handles to resolve without errors. With `--any`,
 one resolved successful handle suffices and the remaining handles stay valid.
 An errored first result or a timeout with no resolved result exits 1.
-`--timeout-ms 0` polls once and prints the same JSON result with unresolved
+`--timeout 0` polls once and prints the same JSON result with unresolved
 handles marked pending. Completed successful handles can still return exit 0.
 
 ## Connection and startup

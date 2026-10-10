@@ -149,7 +149,7 @@ pub struct Settings {
     /// After each of its turns finishes, prune the bot to this many turns'
     /// records; none keeps them until an explicit `prune`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub retain_turns: Option<usize>,
+    pub keep_turns: Option<usize>,
     /// Milliseconds a gated call waits live for its verdict before its turn
     /// parks; zero parks at once.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -224,8 +224,8 @@ impl Settings {
         if self.compact_keep() >= self.compact_at() {
             return refuse("compact_keep is below compact_at");
         }
-        if self.retain_turns == Some(0) {
-            return refuse("retain_turns is at least 1");
+        if self.keep_turns == Some(0) {
+            return refuse("keep_turns is at least 1");
         }
         if self.approval_hold_ms.is_some_and(|n| n > 3_600_000) {
             return refuse("approval_hold_ms is at most 3600000; 0 parks at once");
@@ -245,7 +245,7 @@ impl Settings {
     pub fn resolved(&self) -> Value {
         json!({"context_bytes":self.context_bytes(),"context_items":self.context_items(),
             "note_turns":self.note_turns(),"compact_at":self.compact_at(),
-            "compact_keep":self.compact_keep(),"retain_turns":self.retain_turns,
+            "compact_keep":self.compact_keep(),"keep_turns":self.keep_turns,
             "approval_hold_ms":self.approval_hold_ms(),"max_output_tokens":self.max_output_tokens,
             "keep_warm":self.keep_warm().map_or(0, |after| after.as_secs()),
             "cache_ttl":self.cache_ttl.unwrap_or(CacheTtl::Minutes)})
@@ -1125,7 +1125,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 46;
+    pub const SCHEMA: i32 = 47;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -6360,7 +6360,7 @@ impl Database {
         self.prune_records(name, keep_turns, protect, 0, Some(Self::RETENTION_PIECE))
     }
     /// The bot's own retention, as it chose at creation: after one of its
-    /// turns ends, prune it to its `retain_turns`, if it set one.
+    /// turns ends, prune it to its `keep_turns`, if it set one.
     pub fn retain(&mut self, name: &str, protect: Option<i64>) -> Result<()> {
         let stored: Option<String> = self
             .conn
@@ -6369,7 +6369,7 @@ impl Database {
             .optional()?
             .ok_or(Error::new("bot_not_found"))?;
         let keep = match stored {
-            Some(text) => serde_json::from_str::<Settings>(&text)?.retain_turns,
+            Some(text) => serde_json::from_str::<Settings>(&text)?.keep_turns,
             None => None,
         };
         if let Some(keep) = keep {
@@ -8052,6 +8052,16 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
              WHERE kind IN ('created','forked') AND json_type(data,'$.id') IS NOT NULL;
              UPDATE events SET data=json_set(json_remove(data,'$.from.id'),'$.from.bot_id',json_extract(data,'$.from.id'))
              WHERE kind IN ('accepted','queued','steered') AND json_type(data,'$.from.id') IS NOT NULL;",
+        )?;
+    }
+    if from < 47 {
+        // 46 -> 47: the retention setting is `keep_turns`, as `prune` names
+        // it, in a bot's settings and in the creation a resend compares.
+        conn.execute_batch(
+            "UPDATE bots SET settings=json_set(json_remove(settings,'$.retain_turns'),'$.keep_turns',json_extract(settings,'$.retain_turns'))
+             WHERE json_type(settings,'$.retain_turns') IS NOT NULL;
+             UPDATE bots SET creation=json_set(json_remove(creation,'$.request.settings.retain_turns'),'$.request.settings.keep_turns',json_extract(creation,'$.request.settings.retain_turns'))
+             WHERE json_type(creation,'$.request.settings.retain_turns') IS NOT NULL;",
         )?;
     }
     Ok(())

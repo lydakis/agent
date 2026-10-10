@@ -246,7 +246,7 @@ class IdleExitTests(ModelFixture):
         store = self.path / 'state.sqlite'
         socket = self.path / 'state.sqlite.sock'
         common = ['--store', str(store), '--provider', f'openai=responses,{self.url}',
-                  '--model', 'openai/synthetic-model', '--tools', 'echo,shell,wait', '--idle-exit', '1']
+                  '--model', 'openai/synthetic-model', '--tools', 'echo,shell,wait', '--idle-exit', '1s']
         run = subprocess.run([str(self.binary), 'run', *common, '--new', '--bot', 'Bob', 'hello'],
                              env=clean_env(), capture_output=True, text=True, timeout=30, cwd=self.path)
         self.assertEqual(run.returncode, 0, run.stderr)

@@ -2527,7 +2527,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
     let mut db = db();
     let settings = Settings {
         context_bytes: Some(4096),
-        retain_turns: Some(1),
+        keep_turns: Some(1),
         keep_warm: Some(0),
         cache_ttl: Some(CacheTtl::Hour),
         ..Settings::default()
@@ -2547,7 +2547,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
     assert_eq!(
         serde_json::to_value(&bob).unwrap()["settings"],
         json!({"context_bytes":4096,"context_items":4096,"note_turns":48,"compact_at":75,
-            "compact_keep":25,"retain_turns":1,"approval_hold_ms":2000,"max_output_tokens":null,
+            "compact_keep":25,"keep_turns":1,"approval_hold_ms":2000,"max_output_tokens":null,
             "keep_warm":0,"cache_ttl":"1h"})
     );
     // Retention follows the bot's own setting.
@@ -2597,7 +2597,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
             ..Settings::default()
         },
         Settings {
-            retain_turns: Some(0),
+            keep_turns: Some(0),
             ..Settings::default()
         },
         Settings {
@@ -6316,6 +6316,51 @@ fn schema_45_events_name_identities_bot_id() {
         .unwrap();
     assert_eq!(version, Database::SCHEMA);
     drop(conn);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn schema_46_settings_keep_turns_as_prune_names_it() {
+    let path = std::env::temp_dir().join(format!("agent-schema46-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let settings = Settings {
+        keep_turns: Some(1),
+        ..Settings::default()
+    };
+    let made = || Binding {
+        settings,
+        request_id: Some("once"),
+        ..binding()
+    };
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), made()).unwrap();
+    }
+    // Before 47 a bot's settings and its creation named retention `retain_turns`.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "UPDATE bots SET settings='{\"retain_turns\":1}',
+             creation=json_set(json_remove(creation,'$.request.settings.keep_turns'),'$.request.settings.retain_turns',1);
+             PRAGMA user_version=46;",
+        )
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    // The bot reads its setting, and a resend of its creation is still the same request.
+    let (again, event) = db.create("Bob", Some("/synthetic"), made()).unwrap();
+    assert_eq!((again.settings, event), (settings, None));
+    for n in 1..=3 {
+        converse(&mut db, "Bob", n);
+    }
+    db.retain("Bob", None).unwrap();
+    let finished = db.events("Bob", 0, 256).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["event"] == "turn_finished")
+        .count();
+    assert_eq!(finished, 1);
+    drop(db);
     std::fs::remove_file(path).unwrap();
 }
 

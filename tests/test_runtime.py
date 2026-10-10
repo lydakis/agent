@@ -1791,7 +1791,7 @@ class RuntimeTests(ModelFixture):
         self.assertTrue(requests[-2]['input'][0]['content'][0]['text'].startswith('[context note]'))
 
     def test_retention_prunes_records_and_deletes_idle_bots(self):
-        client = self.client(settings={'retain_turns': 2})
+        client = self.client(settings={'keep_turns': 2})
         client.request('create', bot='Bob', workspace=str(self.path))
         for n in range(4):
             turn = client.request('submit', bot='Bob', request_id=str(n), prompt=f'p{n}')['result']['turn']
@@ -1825,7 +1825,7 @@ class RuntimeTests(ModelFixture):
         self.assertEqual(client.request('bots')['result']['bots'], [])
 
     def test_retention_preserves_background_completion_and_stale_turn_identity(self):
-        client = self.client(tools='shell,wait', settings={'retain_turns': 1})
+        client = self.client(tools='shell,wait', settings={'keep_turns': 1})
         client.request('create', bot='Bob', workspace=str(self.path))
         old = client.request('submit', bot='Bob', request_id='bg',
                              prompt='bg:while [ ! -f release ]; do sleep .01; done; printf done')['result']['turn']
@@ -1846,7 +1846,7 @@ class RuntimeTests(ModelFixture):
         self.assertIn('result', client.request('delete', bot='Bob'))
         client.request('shutdown')
         client.close()
-        client = self.client(tools='shell,wait', settings={'retain_turns': 1})
+        client = self.client(tools='shell,wait', settings={'keep_turns': 1})
         for index in range(10):
             client.request('create', bot='Bob', workspace=str(self.path))
             new = client.request('submit', bot='Bob', request_id='r', prompt='replacement')['result']['turn']
