@@ -1362,6 +1362,34 @@ test('the sidebar lists one level below what is open, and the crumbs go back up'
   assert.equal(p.context.document.title, 'Agent › app › build › review');
 });
 
+test('Home lists the threads its agent started beside the projects, and hears of their turns', async () => {
+  const sent = [];
+  const p = page({ request: async (op, params) => { if (op === 'submit') sent.push(params); return { turn: 9 }; }, log() {} });
+  p.S.live = true; p.S.attached = true;
+  p.upsert({ name: 'app.lead', bot_id: 1, status: 'idle' });
+  p.upsert({ name: 'home', bot_id: 2, status: 'idle' });
+  p.upsert({ name: 'home.notes', bot_id: 3, status: 'idle', created_by: 'home', created_by_id: 2 });
+  p.upsert({ name: 'home.notes.probe', bot_id: 4, status: 'idle', created_by: 'home.notes', created_by_id: 3 });
+  // A project Home made heads its own list, not Home's.
+  p.upsert({ name: 'web.lead', bot_id: 5, status: 'idle', created_by: 'home', created_by_id: 2 });
+  p.tree();
+  const level = (open) => { p.S.selected = open; return Array.from(p.railRows(), (r) => [r.label ?? r.b.name, r.kids ?? 0]); };
+  assert.deepEqual(level(''), [['app.lead', 0], ['web.lead', 0], ['bots', 0], ['home.notes', 1]]);
+  assert.deepEqual(level('home.notes'), [['home.notes.probe', 0]]);
+  assert.equal(p.upOf('home.notes'), '', 'a thread of Home\'s goes back up to Home');
+  p.S.selected = '';
+  const turn = async (bot, n) => {
+    await p.onEvent({ event: 'accepted', bot, turn: n, data: { node: 1, from: { bot: 'home', turn: 1 } } });
+    await p.onEvent({ event: 'turn_finished', bot, turn: n, data: { status: 'completed' } });
+  };
+  await turn('home.notes', 1);
+  await turn('home.notes.probe', 1); // not Home's thread
+  await p.tick();
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].bot, 'home'); assert.equal(sent[0].origin, 'tasks');
+  assert.match(sent[0].prompt, /^Task updates: [^]*\n- home\.notes: turn:home\.notes\/1 completed, asked by you$/);
+});
+
 test('a card looks in beside, full screen takes the tab, and Home and the finder open tabs', async () => {
   const p = shell({ request: async () => ({ nodes: [], workspaces:[],next_from: null }) });
   for (const [name, id] of [['app.lead', 1], ['app.build', 2], ['app.test', 3]]) p.upsert({ name, bot_id: id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
@@ -1793,7 +1821,7 @@ test("Home's agent is Home: no row, no tab, no crumb, and a closed Start Home gi
   p.upsert({ name: 'app.lead', bot_id: 2, provider: 'alpha', model: 'one' });
   p.upsert({ name: 'home-side', bot_id: 3, provider: 'alpha', model: 'one', created_by: 'home', created_by_id: 1 });
   p.S.shapeGen += 1;
-  assert.deepEqual(names(p.railRows()), ['app.lead']);
+  assert.deepEqual(names(p.railRows()), ['app.lead', 'bots', 'home-side'], 'what Home made is listed in its place');
   await p.go('home');
   assert.equal(p.S.selected, ''); assert.deepEqual(Array.from(p.S.ui.tabs), []);
   assert.equal(p.upOf('home-side'), '');
