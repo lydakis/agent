@@ -1380,6 +1380,7 @@ fn main() {
         Some(swarm::START_FLAG) => std::process::exit(swarm::start_cli(&args[2..])),
         Some(trigger::FLAG) => std::process::exit(trigger::cli(&args[2..])),
         Some(trigger::FIRE_FLAG) => std::process::exit(trigger::fire_cli(&args[2..])),
+        Some(trigger::WATCH_FLAG) => std::process::exit(trigger::watch_cli()),
         Some(SETUP_FLAG) => std::process::exit(i32::from(!machine_setup(false))),
         Some(skills::UNLINK_FLAG) => std::process::exit(skills::unlink_cli()),
         _ => {}

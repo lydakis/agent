@@ -1109,21 +1109,22 @@ its news goes out is dropped from it.
 ## Triggers
 
 A trigger wakes an agent with a message when something happens: a time
-comes, a file is written, a repository's HEAD moves, or someone fires it by
-name. The message is a new turn in the agent's own conversation; a trigger
+comes, a file is written, a repository's HEAD moves, an agent ends a turn,
+or someone fires it by name. The message is a new turn in the agent's own conversation; a trigger
 may also start the agent it names on its first fire. launchd watches, so a
 trigger fires with the app closed, and a time the Mac slept through fires
 once when it wakes (`StartCalendarInterval` coalesces missed times;
 `StartInterval` and cron skip them). The daemon has no clock or watcher of
-its own, and no process of a trigger runs between its fires: while nothing
-happens a trigger costs its plist and launchd's watch, and no model call.
+its own, and no process of a trigger runs between its fires but one
+watcher, while any trigger waits on turn ends: while nothing happens a
+trigger costs its plist and launchd's watch, and no model call.
 
 The app writes `~/.agent/trigger` each time it opens, a script that runs its
 executable with `--trigger`:
 
 ```sh
 ~/.agent/trigger add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] -- MESSAGE
-  WHEN: --every 30m | --in 45m | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO
+  WHEN: --every 30m | --in 45m | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO | --turn-end BOT [--count N]
 ~/.agent/trigger ls [--after NAME]
 ~/.agent/trigger fire NAME
 ~/.agent/trigger rm NAME
@@ -1162,8 +1163,14 @@ when a commit came in between asks for a fire that looks as launchd would
 no HEAD log (`core.logAllRefUpdates` false, or a bare one by default) is
 refused, and adding the same trigger again watches the git folder the
 repository has now, recording where its HEAD is in place of the old one's.
-git is the one on the `PATH` `add` ran with, which the plist keeps. With no WHEN, only `fire` runs it; `fire` while a fire still runs is
-sent by that fire once it is done.
+git is the one on the `PATH` `add` ran with, which the plist keeps. `--turn-end BOT` fires each time BOT,
+pinned by its id, ends a turn that ends after `add` (completed, failed or
+interrupted; a message taken into a running turn as a steer is not one); `--count N` only every Nth, a count of the messages BOT
+answered. A turn the trigger itself sent BOT, its message or an answer
+`--reply-to` passed on, is not counted, so `--turn-end lead --reply-to lead`
+does not wake itself (two triggers that wake each other are bounded only by
+`--runs`). With no WHEN, only `fire` runs it; `fire`, or a turn end, while
+a fire still runs is sent by that fire once it is done.
 
 **Whom.** `add` defaults to the agent whose shell runs it (`AGENT_BOT`,
 which must still match `AGENT_BOT_ID`); `--bot` names another. Either is
@@ -1186,7 +1193,7 @@ and gets that same agent, and no other.
 sent ends (the daemon's `wait`, up to a day), then queues that turn's
 answer to BOT, pinned by id; launchd starts no second fire of the trigger
 meanwhile, so a repeating one skips the times that turn spans. The fire's
-request id then ends `-to-ID`, BOT's id, so the app does not also tell
+request id then ends `.to.ID`, BOT's id, so the app does not also tell
 that agent of the turn as a task update, unless that answer has not
 reached it 15 s after the turn ended. A fire cut short while it waits
 (the Mac restarted) passes no answer on: nothing resumes that wait. An
@@ -1205,7 +1212,8 @@ says no ends, listed as not sent.
 (its end could not unload it) only tries to end it again. Each message the
 agent gets starts with one line, `[trigger NAME · YYYY-MM-DD HH:MM · why]`,
 the local fire time and what fired it (its time, `file PATH`, `commit REPO
-at SHA`, or `fired`), so a catch-up fire after sleep reads as late; an
+at SHA`, `turn end of BOT: turn:BOT/N completed`, or `fired`), so a
+catch-up fire after sleep reads as late; an
 answer passed on by `--reply-to` starts with the agent and turn it is from.
 Submissions carry `origin: "trigger"`, and a passed-on answer carries
 `from: {bot, turn}`, the turn it is; coordinator updates carry `origin:
@@ -1216,7 +1224,8 @@ otherwise. `add` with a name in use and the same definition changes nothing
 and returns that trigger with `"duplicate": true`, so a retried `add` is
 safe; with another definition it is refused as `trigger_exists`, whose
 `field` names the first that differs (`when`, `bot`, `start`, `message`,
-`reply_to`, `if`, `runs`, `commit`, `dir`, `daemon`, `store_id`): `rm` it
+`reply_to`, `if`, `runs`, `turn_end`, `count`, `commit`, `dir`, `daemon`,
+`store_id`): `rm` it
 first. A name differing from another only in case is refused
 (`name_taken`), since macOS folders would give both one file, and `rm` finds
 a trigger only by the name as stored; `rm` of a name not there is
@@ -1262,7 +1271,69 @@ What the fire did (`sent` with the turn and any `reply`, `skipped`, `gone`,
 started and the commit it saw, is kept in `~/.agent/triggers/NAME.json`,
 which Settings shows beside each trigger with its message, a Run now button
 and a Remove button. Triggers are local to this machine. Remote windows
-neither list, run nor remove local triggers.
+neither list, run nor remove local triggers. Only launchd runs a fire, so
+no two of one trigger ever run at once.
+
+**The turn-end watcher.** One process, `APP --trigger-watch`, watches for
+every turn-end trigger: launchd's `me.lydakis.agent.trigger-watch`
+(`RunAtLoad`, `KeepAlive` unless it exits 0), written and restarted by each
+`add` and `rm` of a turn-end trigger and removed with the last. It reads
+their plists, connects once per daemon, and follows each watched agent's
+own events (`follow {bot, after}`, whose replay is bounded to that agent's
+events); between turn ends it waits on the socket, and with no daemon there
+it tries again, backing off to once a minute. `add` finds the agent's
+newest event cursor without a daemon change by bisecting `events {bot,
+after, limit: 1}` (an indexed lookup each, about 2·log2 of the cursor), and
+the watcher keeps where it is per trigger in `~/.agent/triggers/NAME.watch`,
+written only when that agent ends a turn, and for one that fires only once
+its ask is on disk: a restart replays from there, so no turn end is missed.
+Like every trigger write it is under the lock, and only while the plist is
+still that trigger's, so none is left behind by a trigger that went.
+A place it cannot read whole (not readable, not JSON, its `generation`,
+`cursor`, `count` or `from` missing or of another kind, or `from` past
+`cursor`) is
+not a fresh start, which would skip every turn end since: the trigger ends,
+saying so (`watch_unreadable`). A place it has never had, or an earlier trigger's of
+the same name, starts at the agent's newest event.
+A turn end that counts is an ask in the trigger's queue saying why (`turn
+end of BOT: turn:BOT/N completed`), under the lock `rm` takes and only
+while the plist is still that trigger's; launchd runs the fire for it, as
+for `fire NAME`. The ask is named by the turn end's event cursor
+(`turn.CURSOR`), and the fire keeps that cursor with the message it begins:
+a watcher stopped after an ask and before it saved its place asks again,
+which is the same file, or one the fire already took and passes over, so
+no turn end is sent twice. A place it cannot save, or an ask it cannot
+make, sends it back to what is on disk to read those turn ends again. The
+watcher runs nothing itself, so restarting it never ends a fire still
+waiting on `--reply-to`; turn ends during a long fire are each sent after
+it, in order. The `request_id` of a turn is read from its `accepted` or
+`queued` event, since a queued turn can end without starting; while such a
+turn has not ended, the place kept says to read again from before that
+event, and only turn ends past the last one counted count, so a restart
+still knows whose that turn is. On each
+connection the watcher looks each agent up once however many triggers
+follow it, and reads events while its follows go out, so a long replay
+never fills what the client holds unread. A trigger whose agent is gone
+is done only once that end is on disk and the trigger gone; else it is
+looked at again on the next connection. A trigger that goes, by `rm` or
+its own end (its runs, its agent gone), unloads its own job first and
+then restarts the watcher, which reads the ones left, or unloads it with
+the last; one whose plist cannot be read but whose place is kept does the
+same. A new watcher plist (the app moved) that will not load gives way to
+the old one, loaded again. Events retention removed that a trigger would
+read again (any after its `from`, where it replays from, not only after its
+`cursor`) are turn ends not counted, or the start of a turn it sent, whose
+end may then count; the
+trigger's last result says so (`events_pruned`), under the lock and keeping
+what its fires left, and its place moves past them, so it is said once.
+A gap ends nothing: the trigger goes on watching. A turn a trigger sent says so in its `request_id`
+(`trigger_GENERATION_...`, a name's characters, so the generation and not
+the trigger's name), which is how the watcher tells its own turns apart.
+An agent deleted (the `deleted` event, or found gone on connecting), or its
+name now another agent's (a `created` event with another id), ends its
+turn-end triggers as `gone`. Once none is left the
+watcher exits 0 and launchd leaves it stopped. A turn-end trigger's own
+plist has no calendar or watched path, so launchd runs it only for `fire`.
 
 A trigger's state is three things: its plist, launchd's loaded copy, and
 that state file. Every change keeps them either whole or as they were, and
@@ -1773,14 +1844,21 @@ folded with failures on their line. Also covers coordinator task updates: batche
 `cargo test -p agent-app` includes a failed project-file write leaving
 neither a partial file nor a temporary, and triggers' calendars, plists,
 watched paths, idempotent `add`, `fire`, `--runs`, `--if`, the commit check,
-move, and each lifecycle step with launchd refusing. With `AGENT_TEST_RUNTIME=1` after a release build
+the watcher's counting (a count, a turn its own trigger sent, an agent
+replaced under its name) and its job's lifecycle, move, and each lifecycle step with launchd refusing. With `AGENT_TEST_RUNTIME=1` after a release build
 and `cargo build -p agent-app`, `python3 -m unittest tests.test_trigger`
-fires triggers against a real daemon; on a Mac, `AGENT_TEST_LAUNCHD=1`
+fires triggers against a real daemon, and runs the watcher against one: a
+turn end fires (the test running the trigger's job while its queue holds
+an ask, as launchd does), the answer `--reply-to` passes back wakes
+nothing, and a turn that ends while no watcher runs fires when one starts
+again; on a Mac, `AGENT_TEST_LAUNCHD=1`
 adds its one launchd test, which loads real jobs (under a scratch `HOME`, so
 nothing loads at the next login) and checks that launchd fires a one-off,
 which ends itself, fires a file trigger on a write (the same `add` again
 being that trigger, a different one refused naming `when`), runs `fire`
-by name, and that `rm` removes a job whose plist or load is already gone.
+by name, that `rm` removes a job whose plist or load is already gone, and
+that a turn-end trigger loads the watcher, which fires it, and its `rm`
+unloads it (skipped while a real watcher is loaded).
 App tests also cover hosts over SSH against a stand-in
 `ssh` that runs the remote command here and forwards by linking: `~/.ssh/config`
 aliases, includes and quoting, `ssh -G` read to its bound, the ssh arguments, `agent start`'s answers, attaching

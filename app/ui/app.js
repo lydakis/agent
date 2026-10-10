@@ -273,9 +273,9 @@ function learnFamily(b, record) {
 }
 // The creator, when the bot holding that name now is the identity that did the creating. A later
 // bot reusing the name is a stranger, and a creator the store could not resolve links to nothing.
-// A trigger's fire with --reply-to ends its request id `-to-ID`: the agent the turn's answer goes to.
+// A trigger's fire with --reply-to ends its request id `.to.ID`: the agent the turn's answer goes to.
 function answerTo(name, turn, data) {
-  const to = /^trigger-.*-to-(\d+)$/.exec(typeof data.request_id === 'string' ? data.request_id : '');
+  const to = /^trigger_.*\.to\.(\d+)$/.exec(typeof data.request_id === 'string' ? data.request_id : '');
   if (to) S.answerTo.set(`${name}\u0000${turn}`, Number(to[1]));
 }
 // A task turn whose answer a trigger passes to the task's coordinator is that answer's news, not
