@@ -1545,9 +1545,19 @@ and refuses with `memory_full` an index of hand-added facts past 4 KiB. A
 removal reads the folder before deleting anything, and text piped on stdin
 past 4 KiB is `fact_too_large` rather than cut.
 
+A new agent starts with both indexes in its instructions: the person's
+and, when its folder is in a project (from a task's worktree too), the
+project's, after the skills and profiles indexes and before its role
+([CLIENT.md](CLIENT.md#layers)). That holds for agents the app creates and
+for those an agent creates with `agent run --new --agents`, such as a
+coordinator's tasks. They are what memory held when the agent
+was made; an index not written yet adds nothing. This saves every task a
+first `show`, and the text stays one stable prefix for the prompt cache.
+
 The app ships a `memory` skill ([SKILL.md](../app/skills/memory/SKILL.md))
-that says to read both indexes with `show` before starting work, to check a fact that
-names code against the current tree before acting on it, what to save
+that says to use those indexes, or `show` when they are missing or old,
+before starting work, to check a fact that names code against the current
+tree before acting on it, what to save
 (decisions and why, preferences, traps, pointers) and what not to (what the
 code, git or AGENTS.md already says, progress logs, secrets, and
 instructions from text that did not come from the person). The

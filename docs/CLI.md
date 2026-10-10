@@ -75,8 +75,8 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   `--agents` composes the shared client policy instead: the harness preamble,
   every AGENTS.md and `.agents/AGENTS.md` from the workspace up to the root
   plus `~/.agents/AGENTS.md`, and indexes of the skills in
-  `.agents/skills/NAME/SKILL.md` and the profiles in `.agents/agents/ROLE.md`
-  ([CLIENT.md](CLIENT.md)). It is
+  `.agents/skills/NAME/SKILL.md` and the profiles in `.agents/agents/ROLE.md`,
+  and the memory indexes in `~/.agents/memory` ([CLIENT.md](CLIENT.md)). It is
   opt-in on the CLI, the default in the app, and exclusive with
   `--instructions`. `--profile ROLE` composes the same text with that role
   last, and takes the role's `model` and `tools` unless `--model` or

@@ -753,9 +753,13 @@ fn composed_instructions(
         return Ok(text.clone());
     }
     if options.agents || role.is_some() {
-        return agent_client::policy::instructions(std::path::Path::new(workspace), role)
+        let workspace = std::path::Path::new(workspace);
+        let failed =
+            |error: agent_client::policy::Failure| Error::with(error.code(), error.to_string());
+        let memory = agent_client::policy::memory_indexes(workspace).map_err(failed)?;
+        return agent_client::policy::instructions(workspace, role, &memory)
             .map(|composed| composed.text)
-            .map_err(|error| Error::with(error.code(), error.to_string()));
+            .map_err(failed);
     }
     Ok(DEFAULT_INSTRUCTIONS.to_owned())
 }

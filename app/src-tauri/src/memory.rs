@@ -186,45 +186,18 @@ fn run(
     }
 }
 
-/// The project a folder belongs to: the nearest `.agents/project.toml` at or
-/// above it. A task's worktree is another checkout of its project's
-/// repository, so a folder in one is first moved to the same place in the
-/// repository's main checkout, where the project's file is.
+/// The project a folder belongs to, as the client composing a new agent
+/// finds it: the nearest `.agents/project.toml`, looked up from a task's
+/// worktree at the same place in the repository's main checkout.
 fn project_of(cwd: &Path) -> Result<String, String> {
-    let mut at = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-    let git = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&at)
-        .args([
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-common-dir",
-            "--show-prefix",
-        ])
-        .stderr(std::process::Stdio::null())
-        .output();
-    if let Ok(out) = git
-        && out.status.success()
-    {
-        let out = String::from_utf8_lossy(&out.stdout);
-        let mut lines = out.lines();
-        if let (Some(common), Some(prefix)) = (lines.next(), lines.next())
-            && Path::new(common).file_name().is_some_and(|f| f == ".git")
-            && let Some(main) = Path::new(common).parent()
-        {
-            at = main.join(prefix);
-        }
+    match agent_client::policy::project(cwd) {
+        Ok(Some(name)) => Ok(name),
+        Ok(None) => Err(format!(
+            "project_unknown: {}: no .agents/project.toml at or above this folder; pass --project NAME or --user",
+            cwd.display()
+        )),
+        Err(error) => Err(format!("project_invalid: {error}")),
     }
-    for dir in at.ancestors() {
-        if dir.join(crate::project::FILE).is_file() {
-            let project = crate::project::read(dir)?;
-            return Ok(project["name"].as_str().unwrap_or_default().to_owned());
-        }
-    }
-    Err(format!(
-        "project_unknown: {}: no .agents/project.toml at or above this folder; pass --project NAME or --user",
-        at.display()
-    ))
 }
 
 /// The local date, for a fact's `verified`.
