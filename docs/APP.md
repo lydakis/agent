@@ -1562,11 +1562,14 @@ from the file's own folder.
 ⌘P opens the finder on files (⌘K on agents; Tab inside it trades the two and
 keeps what was typed). It lists the repository the thing in view is in, in
 the pane ⌘P was pressed in: a file's folder, else the agent's or the swarm's. The core runs
-`git ls-files --cached --others --exclude-standard` at the repository's top
+`git ls-files --stage --others --exclude-standard` at the repository's top
 (`list_files`), so the list is what git tracks plus new files it does not
-ignore, less a tracked file deleted from the folder (`--deleted`) and a submodule
-(`.gitmodules`), which git lists as one entry but is a folder, at most
-100,000 paths from 16 MiB of git's answer, read name by name so git stops at
+ignore, and only what opens as a file: an index entry whose mode is a file or a
+symlink (not a submodule), a new file (not `nested/`, another repository
+inside), and not a tracked file deleted from the folder (`--deleted`). The top
+is named from the agent's folder (`--show-cdup`), so a file found through a
+symlinked folder has the path the agent's steps write, and a write refreshes its
+tab. At most 100,000 paths from 16 MiB of git's answer are read, name by name so git stops at
 either bound (a cut listing says so under every search, as typing cannot reach
 past it); a folder outside a repository says so, and a window on a host
 refuses, as for reading a file. It is listed once each time the finder opens
