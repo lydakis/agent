@@ -1663,7 +1663,7 @@ async fn end_turns(client: &Client, member: &str, id: Option<i64>) -> Result<boo
             .await
         {
             Ok(_) => {}
-            Err(error) if error.code == "stale_turn" || error.code == "no_active_turn" => {}
+            Err(error) if error.code == "stale_turn" => {}
             Err(error) => return Err(error.to_string()),
         }
     }
