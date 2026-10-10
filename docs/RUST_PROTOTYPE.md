@@ -133,8 +133,9 @@ A bot is an identity with a retained conversation: every turn appends to it.
 exist; `--new --bot NAME` creates it and fails with `bot_exists` if the name is
 taken; no `--bot` creates a fresh generated identity. A typo can therefore never
 silently start an empty conversation under a familiar name. Names are the
-address; the identity is a store-wide integer `id` that `create`, `fork`,
-`resume`, `bots`, and every `submit` answer report, and that is never reused
+address; the identity is a store-wide integer `bot_id` that `create`, `fork`,
+`resume`, `bots`, every `submit` answer, and the `created` and `forked` events
+report, and that is never reused
 after a delete. A fork is a new identity with an empty request namespace.
 
 A bot keeps its folder but is not bound to it. A new bot starts in the
@@ -944,7 +945,7 @@ The fork can read its shared prefix after its source is deleted.
 `history_items` accepts `bot` and 1–400 distinct `nodes`. It validates all IDs
 against that bot's lineage with one ancestry walk and returns a prefix as
 `items: [{node: ID, item: VALUE}, ...]` in request order. A prompt a bot's turn
-wrote also carries `from: {bot, turn, id}`, with `id` the identity the bot's name
+wrote also carries `from: {bot, turn, bot_id}`, with `bot_id` the identity the bot's name
 held when it wrote it, and one a client sent with an `origin` carries that, so a
 client can say who each message came from without reading every turn. The store
 keeps both with the prompt's node (`senders`), so they last as long as the item:
@@ -1121,7 +1122,7 @@ that turn; a prompt without it is a person's. The CLI sends it from
 without the other (`author_turn_required`). The store checks that the turn
 is the bot's (`invalid_from`), keeps it on the new turn's row, a steer's
 included, counts it in the request's idempotency, and reports it on
-`accepted`, `queued` and `steered`, with the sender's identity as `from.id`. Like the
+`accepted`, `queued` and `steered`, with the sender's identity as `from.bot_id`. Like the
 creator, it is declared, not verified. A client that sends a prompt on its own,
 not from a bot's turn, may name itself with `origin` (a name's characters,
 else `invalid_origin`), mutually exclusive with `from`, stored and reported the same way; the daemon gives it

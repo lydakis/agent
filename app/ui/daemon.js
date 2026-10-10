@@ -68,7 +68,7 @@ window.Daemon = (() => {
   // A prompt another bot wrote names it with its item, as the daemon's `history_items` does.
   // Who sent a prompt, as the daemon keeps it with the node: another bot's turn, with the identity
   // its name held then, or what the client named as its origin.
-  const senderOf = (by) => by?.origin ? { origin: by.origin } : by ? { from: { bot: by.bot, turn: by.turn, id: S.bots.get(by.bot)?.id ?? null } } : {};
+  const senderOf = (by) => by?.origin ? { origin: by.origin } : by ? { from: { bot: by.bot, turn: by.turn, bot_id: S.bots.get(by.bot)?.bot_id ?? null } } : {};
   const authorOf = (event) => ({ ...(event.data.from ? { from: event.data.from } : {}), ...(event.data.origin ? { origin: event.data.origin } : {}) });
   const emit = (event) => { if (event.data?.node != null) { if (!S.lineages.has(event.bot)) S.lineages.set(event.bot, []); S.lineages.get(event.bot).push({node:event.data.node,turn:event.turn ?? null,...authorOf(event)}); } if (event.durable !== false) event.cursor = ++S.cursor; S.queue.push(event); if (S.waiter) { const w = S.waiter; S.waiter = null; w(); } };
   const node = (item) => { const id = S.nextNode++; S.nodes.set(id, item); return id; };
@@ -78,7 +78,7 @@ window.Daemon = (() => {
   async function create(name, model, createdBy = null, source = null, workspace = null, allowed = null, reasoning = null) {
     if (S.bots.has(name)) throw new Error('bot_exists');
     // Lineage is pinned to the creator's identity, and the event carries the record's list fields, as the daemon's does.
-    const b = { ...record(name, model, source ? S.bots.get(source)?.effort ?? null : reasoning), ...(workspace ? { workspace } : {}), id: S.nextId++, created_by: createdBy, created_by_id: createdBy ? S.bots.get(createdBy)?.id ?? null : null, turns: 0, interrupted: false, ...(allowed ? { allowed } : {}) };
+    const b = { ...record(name, model, source ? S.bots.get(source)?.effort ?? null : reasoning), ...(workspace ? { workspace } : {}), bot_id: S.nextId++, created_by: createdBy, created_by_id: createdBy ? S.bots.get(createdBy)?.bot_id ?? null : null, turns: 0, interrupted: false, ...(allowed ? { allowed } : {}) };
     S.bots.set(name, b);
     // A fork shares its source's history up to its newest finished round. The demo keeps no call
     // nodes, only their results, so that is its newest node that is not a tool result.
@@ -88,7 +88,7 @@ window.Daemon = (() => {
       S.lineages.set(name, all.slice(0, end));
     }
     const checkpoint = source ? S.lineages.get(source)?.at(-1)?.node ?? null : undefined;
-    emit({ event: source ? 'forked' : 'created', bot: name, turn: null, data: { id: b.id, provider: b.provider, model: b.model, effort: b.effort, workspace: b.workspace, status: 'idle', running_turn: null, created_by: createdBy, created_by_id: b.created_by_id, ...(allowed ? { allowed } : {}), ...(source ? { source, checkpoint } : {}) } });
+    emit({ event: source ? 'forked' : 'created', bot: name, turn: null, data: { bot_id: b.bot_id, provider: b.provider, model: b.model, effort: b.effort, workspace: b.workspace, status: 'idle', running_turn: null, created_by: createdBy, created_by_id: b.created_by_id, ...(allowed ? { allowed } : {}), ...(source ? { source, checkpoint } : {}) } });
     return b;
   }
   // Scripted work outlives a stop; a bot deleted meanwhile reads as interrupted, so it ends quietly.
@@ -321,7 +321,7 @@ window.Daemon = (() => {
     const bots = [];
     for (const [name, row] of rows) {
       const b = await api.request('create', { bot: name, model: sw.mix[row].model, effort: sw.mix[row].reasoning ?? null, workspace: sw.workspace, budget_tokens: each });
-      sw.members.push(name); sw.ids[name] = b.id; sw.rows[name] = row; bots.push(b);
+      sw.members.push(name); sw.ids[name] = b.bot_id; sw.rows[name] = row; bots.push(b);
       sw.made = Math.max(sw.made ?? 0, Number(name.split('-').pop()) || 0);
     }
     for (const [name] of rows) reply(name, `You are ${short(sw, name)}, one of ${sw.members.length} agents in the swarm ${short(sw, sw.name)}.${late ? ' You joined after the others started, so read the board first.' : ''}`);

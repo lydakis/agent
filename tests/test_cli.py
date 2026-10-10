@@ -603,10 +603,10 @@ class SocketAndCliTests(ModelFixture):
         self.agent('wait', '--store', str(self.store), first['handle'])
         fork = ['fork', '--store', str(self.store), '--source', 'Once', '--bot', 'Side', '--request-id', 'side']
         forked, refork = (json.loads(self.agent(*fork).stdout) for _ in range(2))
-        self.assertEqual((refork['id'], refork['duplicate']), (forked['id'], True))
+        self.assertEqual((refork['bot_id'], refork['duplicate']), (forked['bot_id'], True))
         # A delete resent once its bot is gone succeeds, and never reaches a
         # later bot of the same name.
-        rm = ['rm', '--store', str(self.store), '--bot', 'Side', '--bot-id', str(forked['id'])]
+        rm = ['rm', '--store', str(self.store), '--bot', 'Side', '--bot-id', str(forked['bot_id'])]
         self.assertFalse(json.loads(self.agent(*rm).stdout)['duplicate'])
         self.agent('fork', '--store', str(self.store), '--source', 'Once', '--bot', 'Side')
         self.assertTrue(json.loads(self.agent(*rm).stdout)['duplicate'])
@@ -617,7 +617,7 @@ class SocketAndCliTests(ModelFixture):
         self.agent('rm', '--store', str(self.store), '--bot', 'Once')
         for flags in ([], ['--approval', 'full']):
             resent = json.loads(self.agent(*kept, *flags).stdout)
-            self.assertEqual((resent['id'], resent['duplicate']), (made['id'], True))
+            self.assertEqual((resent['bot_id'], resent['duplicate']), (made['bot_id'], True))
 
     def test_retry_of_pruned_turn_exits_and_retained_retry_still_replays(self):
         self.agent('run', *self.common, '--new', '--bot', 'Bob', '--request-id', 'old', 'first')
@@ -782,15 +782,15 @@ class SocketAndCliTests(ModelFixture):
         self.assertTrue(all(b['status'] == 'completed' for b in listing))
         self.assertEqual({b['name']: b['created_by'] for b in listing}, {'Alice': 'Bob', 'Bob': None})
         by_name = {b['name']: b for b in listing}
-        self.assertEqual(by_name['Alice']['created_by_id'], by_name['Bob']['id'])
+        self.assertEqual(by_name['Alice']['created_by_id'], by_name['Bob']['bot_id'])
         replay = self.agent('follow', '--store', str(self.store), '--bot', 'Alice')
         events = [json.loads(line) for line in replay.stdout.splitlines()]
         self.assertEqual([e['event'] for e in events][:2], ['created', 'accepted'])
         self.assertEqual((self.path / 'lineage').read_text(),
-                         f"Bob/{by_name['Bob']['id']}/Alice/{events[1]['turn']}")
+                         f"Bob/{by_name['Bob']['bot_id']}/Alice/{events[1]['turn']}")
         bob_turn = json.loads(self.agent('turns', '--store', str(self.store), '--bot', 'Bob').stdout)
         self.assertEqual(events[1]['data']['from'], {'bot': 'Bob', 'turn': bob_turn[0]['turn'],
-                                                     'id': by_name['Bob']['id']})
+                                                     'bot_id': by_name['Bob']['bot_id']})
         self.assertEqual(events[-1]['event'], 'follow_live')
         self.assertTrue(all(e['cursor'] < f['cursor'] for e, f in zip(events[:-2], events[1:-1])))
         # A follower attached while a turn runs replays, then sees live deltas and the end.
@@ -821,7 +821,7 @@ class SocketAndCliTests(ModelFixture):
         self.assertIn('result', control.request('delete', bot='Bob'))
         self.agent('run', *self.common, '--new', '--bot', 'Bob', 'replacement')
         replacement = control.request('resume', bot='Bob')['result']
-        self.assertNotEqual(replacement['id'], by_name['Bob']['id'])
+        self.assertNotEqual(replacement['bot_id'], by_name['Bob']['bot_id'])
         route = ('"$AGENT_BIN" run --detach --bot "$AGENT_PARENT" '
                  '--bot-id "$AGENT_PARENT_ID" -- should-not-deliver > route.out 2> route.err; '
                  'printf "%s" "$?" > route.status')
@@ -834,9 +834,9 @@ class SocketAndCliTests(ModelFixture):
         self.agent('run', *self.common, '--new', '--bot', 'Creator',
                    'shell:printf "%s" "$AGENT_BOT_ID" > own-id')
         creator = json.loads(self.agent('ls', '--store', str(self.store)).stdout)[0]
-        self.assertEqual((self.path / 'own-id').read_text(), str(creator['id']))
+        self.assertEqual((self.path / 'own-id').read_text(), str(creator['bot_id']))
         # A surviving shell retains this environment even across daemon replacement.
-        shell_env = dict(clean_env(), AGENT_BOT='Creator', AGENT_BOT_ID=str(creator['id']))
+        shell_env = dict(clean_env(), AGENT_BOT='Creator', AGENT_BOT_ID=str(creator['bot_id']))
         self.shutdown()
         self.agent('run', *self.again, '--bot', 'Creator', 'after restart')
         control = Connection(self.socket)
@@ -850,7 +850,7 @@ class SocketAndCliTests(ModelFixture):
             args = (['run', *self.common, '--new', '--bot', 'Child', 'hello']
                     if operation == 'create' else
                     ['fork', '--store', str(self.store), '--source', 'Creator', '--bot', 'Child'])
-            for identity in (str(creator['id']), None, str(replacement['id'])):
+            for identity in (str(creator['bot_id']), None, str(replacement['bot_id'])):
                 env = dict(shell_env)
                 if identity is None:
                     env.pop('AGENT_BOT_ID')
@@ -858,10 +858,10 @@ class SocketAndCliTests(ModelFixture):
                     env['AGENT_BOT_ID'] = identity
                 result = subprocess.run([*self.base, *args], env=env, cwd=self.path,
                                         capture_output=True, text=True, timeout=15)
-                if identity == str(replacement['id']):
+                if identity == str(replacement['bot_id']):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     child = control.request('resume', bot='Child')['result']
-                    self.assertEqual(child['created_by_id'], replacement['id'])
+                    self.assertEqual(child['created_by_id'], replacement['bot_id'])
                     self.assertIn('result', control.request('delete', bot='Child'))
                 else:
                     self.assertNotEqual(result.returncode, 0)

@@ -2194,7 +2194,7 @@ async fn bot_id(client: &Client, name: &str) -> Result<i64, String> {
         .request("resume", json!({"bot": name}))
         .await
         .map_err(coded)?;
-    record["id"]
+    record["bot_id"]
         .as_i64()
         .ok_or_else(|| "the daemon named no bot id".into())
 }
@@ -2557,7 +2557,7 @@ async fn start(client: &Client, trigger: &Trigger) -> Result<i64, String> {
         )
         .await
         .map_err(coded)?;
-    made["id"]
+    made["bot_id"]
         .as_i64()
         .ok_or_else(|| "create: no bot id".into())
 }

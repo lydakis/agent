@@ -1872,7 +1872,7 @@ class RuntimeTests(ModelFixture):
             client.next_id += 1
             sent.append(client.next_id)
             client.process.stdin.write(json.dumps({'id': client.next_id, 'op': 'delete', 'bot': 'Big',
-                                                   'bot_id': big['id']}) + '\n')
+                                                   'bot_id': big['bot_id']}) + '\n')
         client.process.stdin.flush()
         freed = [client.receive(lambda m, i=i: m.get('id') == i)['result'] for i in sent]
         self.assertEqual(sorted(f['duplicate'] for f in freed), [False, True])
@@ -1887,37 +1887,37 @@ class RuntimeTests(ModelFixture):
     def test_bot_identities_outlive_names_and_refuse_stale_retries(self):
         client = self.client()
         bob = client.request('create', bot='Bob', workspace=str(self.path))['result']
-        first = client.request('submit', bot='Bob', request_id='r7', bot_id=bob['id'], prompt='hello')['result']
-        self.assertEqual((first['bot_id'], first['duplicate']), (bob['id'], False))
+        first = client.request('submit', bot='Bob', request_id='r7', bot_id=bob['bot_id'], prompt='hello')['result']
+        self.assertEqual((first['bot_id'], first['duplicate']), (bob['bot_id'], False))
         checkpoint = client.finished(first['turn'])['data']['checkpoint']
         fork = client.request('fork', source='Bob', checkpoint=checkpoint, bot='Fork', workspace=str(self.path))['result']
-        self.assertNotEqual(fork['id'], bob['id'])
+        self.assertNotEqual(fork['bot_id'], bob['bot_id'])
         # The request namespace is per identity: the fork never ran r7.
-        forked = client.request('submit', bot='Fork', request_id='r7', bot_id=fork['id'], prompt='hello')['result']
-        self.assertEqual((forked['duplicate'], forked['bot_id']), (False, fork['id']))
+        forked = client.request('submit', bot='Fork', request_id='r7', bot_id=fork['bot_id'], prompt='hello')['result']
+        self.assertEqual((forked['duplicate'], forked['bot_id']), (False, fork['bot_id']))
         client.finished(forked['turn'])
-        self.assertEqual(client.request('submit', bot='Fork', request_id='r7', bot_id=bob['id'], prompt='hello')['error'],
+        self.assertEqual(client.request('submit', bot='Fork', request_id='r7', bot_id=bob['bot_id'], prompt='hello')['error'],
                          'bot_not_found')
         # Identities survive restart and never move to another name.
         client.close(kill=True)
         client = self.client()
-        listed = {b['name']: b['id'] for b in client.request('bots')['result']['bots']}
-        self.assertEqual(listed, {'Bob': bob['id'], 'Fork': fork['id']})
-        self.assertEqual(client.request('resume', bot='Bob')['result']['id'], bob['id'])
-        again = client.request('submit', bot='Bob', request_id='r7', bot_id=bob['id'], prompt='hello')['result']
+        listed = {b['name']: b['bot_id'] for b in client.request('bots')['result']['bots']}
+        self.assertEqual(listed, {'Bob': bob['bot_id'], 'Fork': fork['bot_id']})
+        self.assertEqual(client.request('resume', bot='Bob')['result']['bot_id'], bob['bot_id'])
+        again = client.request('submit', bot='Bob', request_id='r7', bot_id=bob['bot_id'], prompt='hello')['result']
         self.assertEqual((again['duplicate'], again['turn']), (True, first['turn']))
         # A recycled name is a new identity: a stale retry is refused, a plain one is fresh work.
         client.request('delete', bot='Bob')
         reborn = client.request('create', bot='Bob', workspace=str(self.path))['result']
-        self.assertGreater(reborn['id'], fork['id'])
-        stale = client.request('submit', bot='Bob', request_id='r7', bot_id=bob['id'], prompt='hello')
+        self.assertGreater(reborn['bot_id'], fork['bot_id'])
+        stale = client.request('submit', bot='Bob', request_id='r7', bot_id=bob['bot_id'], prompt='hello')
         self.assertEqual(stale['error'], 'bot_not_found')
-        self.assertIn(str(reborn['id']), stale['detail'])
+        self.assertIn(str(reborn['bot_id']), stale['detail'])
         fresh = client.request('submit', bot='Bob', request_id='r7', prompt='hello')['result']
-        self.assertEqual((fresh['duplicate'], fresh['bot_id']), (False, reborn['id']))
+        self.assertEqual((fresh['duplicate'], fresh['bot_id']), (False, reborn['bot_id']))
         self.assertNotEqual(fresh['turn'], first['turn'])
         client.finished(fresh['turn'])
-        self.assertEqual(client.request('submit', bot='Gone', request_id='r7', bot_id=bob['id'], prompt='hello')['error'],
+        self.assertEqual(client.request('submit', bot='Gone', request_id='r7', bot_id=bob['bot_id'], prompt='hello')['error'],
                          'bot_not_found')
 
     def test_transient_failures_are_retried_and_rate_limits_pace_the_pool(self):

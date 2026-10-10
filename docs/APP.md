@@ -92,7 +92,7 @@ read back after a restart keeps the names. Messages the app sends on its own
 name their `origin` and are tagged with it: `tasks` for a coordinator's task
 updates and `trigger` for a triggered message. The daemon keeps the sender
 with the message, so a fork keeps it after its source is deleted; the name
-links to the agent only while that name still holds the identity (`from.id`)
+links to the agent only while that name still holds the identity (`from.bot_id`)
 that sent it.
 
 ![A task's chat: the coordinator's messages tagged](app/agent-message.png)

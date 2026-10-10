@@ -233,9 +233,9 @@ function upsert(record) {
   if (!record?.name) return;
   // Same name, different identity: everything known about the old bot belongs to the old bot.
   const known = bot(record.name);
-  if (known && known.id != null && record.id != null && known.id !== record.id) { forgetBot(record.name); }
+  if (known && known.id != null && record.bot_id != null && known.id !== record.bot_id) { forgetBot(record.name); }
   const b = bot(record.name) || { name: record.name, id: null, parent: null, waitingOn: [], turnStarted: 0, elapsed: 0 };
-  if (record.id != null) b.id = record.id;
+  if (record.bot_id != null) b.id = record.bot_id;
   if (!known || known !== b) S.shapeGen += 1;
   S.botsGen += 1;
   b.status = record.status === 'completed' ? 'idle' : (record.status || 'idle');
@@ -327,7 +327,7 @@ const leadProject = (name) => name.length > LEAD.length && name.endsWith(LEAD) ?
 // Who sent a prompt that is not yours: another agent's turn, or the app on its own (`origin`), as
 // the daemon keeps them with the prompt.
 function senderOf(p) {
-  if (p.from?.bot) return { bot: p.from.bot, turn: p.from.turn, id: p.from.id };
+  if (p.from?.bot) return { bot: p.from.bot, turn: p.from.turn, id: p.from.bot_id };
   return typeof p.origin === 'string' ? { app: p.origin } : null;
 }
 // The agent that sent it, while its name still holds the identity it had then.
@@ -515,7 +515,7 @@ async function readUsage(sw) {
         for (const r of page.bots ?? []) {
           if (r.name > prefix && !r.name.startsWith(prefix)) { past = true; break; }
           const member = sw.members.includes(r.name);
-          if (member ? sw.ids[r.name] === r.id : makers.has(r.created_by_id)) { if (!member) { makers.add(r.id); seen.add(String(r.id)); } used += r.tokens_used ?? 0; }
+          if (member ? sw.ids[r.name] === r.bot_id : makers.has(r.created_by_id)) { if (!member) { makers.add(r.bot_id); seen.add(String(r.bot_id)); } used += r.tokens_used ?? 0; }
         }
         if (past || !page.next_after) break;
         after = page.next_after;
@@ -676,7 +676,7 @@ async function onEvent(ev) {
       // bot the snapshot already holds keeps its record; the event says the same thing.
       S.deleted.delete(name);
       const known = bot(name);
-      if (!known || known.id == null || known.id !== data.id) upsert({ name, ...data });
+      if (!known || known.id == null || known.id !== data.bot_id) upsert({ name, ...data });
       bot(name).touched = S.session;
       const parent = bot(name) && creatorOf(bot(name));
       if (parent) addItem(transcript(parent.name), { kind: 'peer', who: name, turn: parent.runningTurn ?? null });
@@ -1134,10 +1134,10 @@ function lost(reason) {
 function seat(record, session) {
   if (S.deleted.has(record.name)) return;
   const b = bot(record.name);
-  const conflict = b && b.id != null && record.id != null && b.id !== record.id;
+  const conflict = b && b.id != null && record.bot_id != null && b.id !== record.bot_id;
   if (!b || b.touched !== session) { upsert(record); return; }
   if (conflict) return;
-  if (record.id != null) b.id = record.id;
+  if (record.bot_id != null) b.id = record.bot_id;
   b.model = `${record.provider ?? '?'}/${record.model ?? '?'}`;
   learnEffort(b, record);
   learnFamily(b, record);
@@ -2415,7 +2415,7 @@ async function sideChat(name, text = '') {
   // The first message goes before the pane loads any history, so the turn starts at once.
   let failed = null;
   if (text) {
-    try { await Daemon.request('submit', { bot: copy, bot_id: record.id, request_id: `app-${crypto.randomUUID()}`, prompt: text, delivery: 'reject', ...home(record) }); }
+    try { await Daemon.request('submit', { bot: copy, bot_id: record.bot_id, request_id: `app-${crypto.randomUUID()}`, prompt: text, delivery: 'reject', ...home(record) }); }
     catch (err) { failed = err instanceof Error ? err : new Error(String(err)); }
   }
   if (S.ui.side !== copy) await go(copy, 'beside');

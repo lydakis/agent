@@ -445,7 +445,7 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     histograms come from one consistent snapshot, formatted outside the lock. The
     store-scale screen (item 3) reads them. (From the second Astra Pro
     review.)
-28. Done: bot identities. A bot has a store-wide integer `id`, allocated
+28. Done: bot identities. A bot has a store-wide integer `bot_id`, allocated
     from a sequence and never reused after delete; `create`, `fork`,
     `resume`, `bots`, and `submit` report it and the `created` and `forked`
     events carry it. `submit` accepts `bot_id`, and `run --bot-id N`: a retry

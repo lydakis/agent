@@ -118,7 +118,8 @@ fn step(watched: &mut [Watched], sent: &mut Sent, event: &Value) -> Vec<Step> {
         // The name is another agent's now: the one it was made for is gone.
         "created" => {
             for (i, w) in watched.iter_mut().enumerate() {
-                if !w.done && w.source() == bot && event["data"]["id"].as_i64() != w.source_id() {
+                if !w.done && w.source() == bot && event["data"]["bot_id"].as_i64() != w.source_id()
+                {
                     w.done = true;
                     steps.push(Step::Gone(
                         i,
@@ -793,7 +794,7 @@ mod tests {
     fn its_agent_replaced_under_its_name_ends_it() {
         let mut w = vec![watched("t", "p.task", None, 0)];
         let mut sent = Sent::new();
-        let created = |id: i64| json!({"bot": "p.task", "event": "created", "cursor": 30, "data": {"id": id}});
+        let created = |id: i64| json!({"bot": "p.task", "event": "created", "cursor": 30, "data": {"bot_id": id}});
         assert_eq!(step(&mut w, &mut sent, &created(5)), vec![]);
         assert_eq!(
             step(&mut w, &mut sent, &created(6)),

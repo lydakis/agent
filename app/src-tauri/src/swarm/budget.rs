@@ -5,7 +5,7 @@ use super::*;
 pub fn member(bot: &Value) -> Value {
     let used = bot["tokens_used"].as_u64().unwrap_or(0);
     let cap = bot["budget_tokens"].as_u64();
-    json!({"name": bot["name"], "id": bot["id"], "status": bot["status"],
+    json!({"name": bot["name"], "bot_id": bot["bot_id"], "status": bot["status"],
         "running_turn": bot["running_turn"], "used": used, "limit": cap,
         "remaining": cap.map(|cap| cap.saturating_sub(used))})
 }
@@ -15,7 +15,7 @@ pub fn warnings(state: &mut State, members: &[Value], at: u64) -> Vec<(Value, No
     for member in members {
         let (Some(cap), Some(id), Some(name)) = (
             member["limit"].as_u64().filter(|n| *n > 0),
-            member["id"].as_i64(),
+            member["bot_id"].as_i64(),
             member["name"].as_str(),
         ) else {
             continue;
@@ -152,7 +152,7 @@ mod tests {
     #[test]
     fn warns_an_individual_early_once_without_waking_idle_members() {
         let mut state = State::default();
-        let mut m = json!({"name":"agent.x-1", "id": 10, "limit": 1_000_000, "used": 510_000, "running_turn": 1});
+        let mut m = json!({"name":"agent.x-1", "bot_id": 10, "limit": 1_000_000, "used": 510_000, "running_turn": 1});
         let warnings = warnings(&mut state, &[m.clone()], 1);
         assert_eq!(warnings.len(), 1);
         assert!(
