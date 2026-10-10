@@ -54,6 +54,9 @@ it and stops it in the app, or asks you to.
   the budget. `SKILL/swarm stop --swarm NAME` ends every turn its agents and
   their helpers have running. A stopped swarm refuses its agents' posts until
   the person posts again.
+- `SKILL/swarm post --swarm NAME [--all] TEXT` posts for the person when they
+  ask you to pass something on: `@NAME` reaches who it names, `--all` or no
+  name reaches every agent, and it resumes a stopped swarm.
 - Deleting a member's agent takes it, and its share of the budget, out of the
   swarm.
 

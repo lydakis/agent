@@ -36,7 +36,7 @@ function page(daemon = {}, storage = null) {
   context.Rich = context.window.Rich;
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, openFileFrom, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, fork, remove, createProject, save, restore, showMenu, refreshMenu, entries, pickerRows, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, forgetBot, setupState, readTriggers, tellLead, markSeen, renderFile, go, upOf, crumbsHTML, railRows, renderTabs, triggerAct, turnNews, openProjectSheet };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, openFileFrom, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, fork, remove, createProject, save, restore, showMenu, refreshMenu, entries, pickerRows, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, checkSoon, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, forgetBot, setupState, readTriggers, tellLead, markSeen, renderFile, go, upOf, crumbsHTML, railRows, renderTabs, triggerAct, turnNews, openProjectSheet };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -3469,12 +3469,19 @@ test('each swarm is checked once at every attach, since what ran while detached 
     setup: async () => ({}), attach: async () => ({ session: 1, store: 'store-1' }), pull: () => new Promise(() => {}),
     request: async (op) => (op === 'bots' ? { bots: [{ name: 'app.latency-1', id: 3, provider: 'alpha', model: 'one', status: 'idle' }] } : {}),
     swarms: async () => ({ swarms: [swarmRecord(['app.latency-1'], { ids: { 'app.latency-1': 3 } })], broken: [] }),
-    swarmCheck: async (name) => { checks.push(name); return {}; },
+    swarmCheck: async (name) => { checks.push(name); return hang ? new Promise(() => {}) : {}; },
   });
+  let hang = false;
   p.setRender(() => {});
   await p.attach(); await settle(); await p.tick();
   assert.deepEqual(checks, ['app.latency']);
   // Reattached with the same agents and pins, it is checked again.
   p.S.attached = false; await p.attach(); await settle(); await p.tick();
   assert.deepEqual(checks, ['app.latency', 'app.latency']);
+  // A check the lost session left running or scheduled does not stand in for the new one.
+  hang = true; p.checkSoon(p.S.swarms.get('app.latency')); await p.tick();
+  assert.equal(checks.length, 3);
+  p.checkSoon(p.S.swarms.get('app.latency'));
+  p.lost('offline'); hang = false; await p.attach(); await settle(); await p.tick();
+  assert.equal(checks.length, 4);
 });

@@ -563,7 +563,7 @@ function checkSoon(sw) {
     const check = { again: false }; checkingBudgets.set(sw.name, check); sw.unchecked = 0;
     try { const r = await Daemon.swarmCheck(sw.name); if (S.session === session && r?.board_changed) boardSoon(sw); }
     catch (e) { Daemon.log?.(`budget check ${sw.name}: ${e?.message ?? e}`); }
-    finally { checkingBudgets.delete(sw.name); if (check.again && S.session === session && !sw.stopped) checkSoon(sw); }
+    finally { if (checkingBudgets.get(sw.name) === check) checkingBudgets.delete(sw.name); if (check.again && S.session === session && !sw.stopped) checkSoon(sw); }
   }, 250));
 }
 // A helper's tokens count in its swarm's, so its finished turn is accounted as a member's is: its maker,
@@ -1128,6 +1128,9 @@ async function handle(ev, session, paint = true) {
 function lost(reason) {
   S.lastReason = reason;
   S.session = null; S.attached = false; S.live = false;
+  // A check scheduled or running for the lost session answers to nobody: the next attach checks afresh.
+  for (const t of checkTimers.values()) clearTimeout(t);
+  checkTimers.clear(); checkingBudgets.clear();
   // Live deltas have no replay cursor. Reconnect rebuilds from durable nodes.
   for (const t of S.transcripts.values()) { t.text = ''; t.thinking = ''; t.thinkingSince = 0; t.thinkingMs = 0; t.streamingTurn = null; t.streamGen += 1; }
   showDetached(reason);

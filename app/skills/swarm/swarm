@@ -1279,14 +1279,15 @@ def which(args, root):
     """The swarm a command names with --swarm, else the one this shell's
     agent is a member of, or helps: SWARM-N, or SWARM-N.WHAT. A project's
     name may hold dots too, so each place that could end a member's number
-    is tried, shortest first: the swarm that names SWARM-N as a member, else
-    the first that is there, since one being started or added to names its
-    new member only once made, and the board's lock waits for that."""
+    is tried, longest first, so a swarm named like another's deleted member
+    keeps its own: the swarm that names SWARM-N as a member, else the first
+    that is there, since one being started or added to names its new member
+    only once made, and the board's lock waits for that."""
     if args[:1] == ['--swarm'] and len(args) > 1:
         return args[1], args[2:]
     bot = os.environ.get('AGENT_BOT') or ''
     there = []
-    for m in re.finditer(r'-\d+(?=\.|$)', bot):
+    for m in reversed(list(re.finditer(r'-\d+(?=\.|$)', bot))):
         name, member = bot[:m.start()], bot[:m.end()]
         if '.' not in name:
             continue
@@ -1324,6 +1325,11 @@ def main(argv):
         if verb in ('stop', 'status', 'check'):
             need(args, 0, '%s [--swarm NAME]' % verb, True)
         folder = Folder(root, name)
+        lead = folder.swarm.get('coordinator') or {}
+        coordinating = author and (author, int(os.environ.get('AGENT_BOT_ID') or -1)) == (lead.get('bot'), lead.get('id'))
+        if verb == 'post' and coordinating:
+            # The coordinator that started the swarm posts for the person.
+            author = None
         if verb in ACTS:
             if author and author not in folder.swarm['ids']:
                 raise Refused('not_a_member', '%s is not in %s' % (author, name))
@@ -1342,8 +1348,7 @@ def main(argv):
             folder.append(act.lines)
             deliver(daemon, act, folder, members)
             out = act.answer
-        elif author and (author, int(os.environ.get('AGENT_BOT_ID') or -1)) != tuple(
-                (folder.swarm.get('coordinator') or {}).get(k) for k in ('bot', 'id')):
+        elif author and not coordinating:
             raise Refused('coordinator_only', 'the person or the coordinator that started it does this')
         elif verb == 'add':
             out = add(daemon, folder, args)

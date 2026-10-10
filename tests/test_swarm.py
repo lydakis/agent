@@ -90,6 +90,11 @@ class SwarmTests(ModelFixture):
         # Each agent got its rules and its brief as its first message.
         first = self.turns('p.widget-1')[0]['prompt_preview']
         self.assertTrue(first.startswith('You are one of several agents in a flat swarm'), first)
+        # Its coordinator posts for the person, as the person would.
+        posted = self.swarm('p.lead', 'post', '--swarm', 'p.widget', '@widget-1 use the small fixture')
+        self.assertEqual(posted['woke'], ['widget-1'])
+        self.assertEqual(self.board(started)[-1]['from'], 'user')
+        self.settle('p.widget-1')
         # A turn run at another effort starts its swarm at that effort.
         self.agent('run', '--store', str(self.store), '--bot', 'p.lead', '--effort', 'xhigh',
                    f"shell:HOME='{self.home}' '{SCRIPT}' start --agents 1 --budget 0.5 --in-project -- Ship the gadget"
@@ -511,14 +516,16 @@ class SwarmRuleTests(unittest.TestCase):
     def test_a_member_finds_its_swarm_even_in_a_dotted_project(self):
         made = tempfile.TemporaryDirectory()
         self.addCleanup(made.cleanup)
-        for name, members in [('p.widget', ['p.widget-1']), ('p.widget-2', ['p.widget-2-1']),
+        # p.widget-2 was a member of p.widget, deleted, and its name became a swarm's.
+        for name, members in [('p.widget', ['p.widget-1', 'p.widget-2']), ('p.widget-2', ['p.widget-2-1']),
                               ('foo.bar.widget', ['foo.bar.widget-1'])]:
             (Path(made.name) / name).mkdir()
             (Path(made.name) / name / 'swarm.json').write_text(json.dumps({'members': members}))
         self.addCleanup(os.environ.pop, 'AGENT_BOT', None)
         # The one that names it, else the first there: an added agent is named once made.
         for bot, name in [('p.widget-1', 'p.widget'), ('p.widget-2-1', 'p.widget-2'), ('p.widget-1.fix-2', 'p.widget'),
-                          ('foo.bar.widget-1.fix.deep', 'foo.bar.widget'), ('p.widget-3', 'p.widget')]:
+                          ('foo.bar.widget-1.fix.deep', 'foo.bar.widget'), ('p.widget-3', 'p.widget'),
+                          ('p.widget-2-2', 'p.widget-2')]:
             os.environ['AGENT_BOT'] = bot
             self.assertEqual(self.s.which(['status'], made.name), (name, ['status']), bot)
 
