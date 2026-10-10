@@ -31,8 +31,9 @@ window.Daemon = (() => {
       profiles: (dir) => invoke('profiles', { dir }),
       roles: () => invoke('roles'),
       editRole: (name) => invoke('edit_role', { name }),
-      schedules: (after = null) => invoke('schedules', { after }),
-      removeSchedule: (name) => invoke('schedule_remove', { name }),
+      triggers: (after = null) => invoke('triggers', { after }),
+      fireTrigger: (name) => invoke('trigger_fire', { name }),
+      removeTrigger: (name) => invoke('trigger_remove', { name }),
       hosts: () => invoke('hosts'),
       openHost: (host) => invoke('open_host', { host }),
       swarmStart: ({ project, folder, goal, shared, mix, agents, budgetTokens, council }) => invoke('swarm_start', { project, folder, goal, shared, mix, agents, budgetTokens, council: council ?? 0 }),
@@ -448,14 +449,16 @@ window.Daemon = (() => {
     // The demo has no editor to open: Edit only says your copy is now the one read.
     roles: async () => ['coordinator', 'swarm-flat', 'swarm-council'].map(name => ({ name, file: S.ownRoles?.has(name) ? `/home/you/.agents/agents/${name}.md` : null })),
     editRole: async (name) => { (S.ownRoles ??= new Set()).add(name); return `/home/you/.agents/agents/${name}.md`; },
-    // Schedules a coordinator made: a task that checks its PR, a one-off for itself, and one whose
-    // agent was deleted before its time came.
-    schedules: async () => ({ schedules: (S.schedules ??= [
-      { name: 'demo.build', bot: 'demo.build', bot_id: 3, when: 'every 30m', once: false, message: "Check the login PR: fix a red CI run and answer new review comments. When it is merged, remove this schedule.", last: { outcome: 'sent', turn: 4, fired_ms: Date.now() - 12 * 60000 } },
+    // Triggers a coordinator made: a task that checks its PR, a reviewer started at the next commit
+    // whose answer goes to the lead, a one-off for itself, and one whose agent was deleted before its time came.
+    triggers: async () => ({ triggers: (S.triggers ??= [
+      { name: 'demo.build', bot: 'demo.build', bot_id: 3, when: 'every 30m', once: false, sent: 4, message: "Check the login PR: fix a red CI run and answer new review comments. When it is merged, remove this trigger.", last: { outcome: 'sent', turn: 4, fired_ms: Date.now() - 12 * 60000 } },
+      { name: 'demo.review', bot: 'demo.review', bot_id: null, start: { model: 'anthropic/claude-sonnet-5', effort: null }, reply_to: 'demo.lead', when: 'commit /Users/you/demo', once: false, runs: 3, sent: 0, message: 'Review the newest commit for regressions; say what you found.', last: null },
       { name: 'demo.lead', bot: 'demo.lead', bot_id: 1, when: 'at 2026-09-30 09:07', once: true, message: 'Summarize what the tasks finished overnight.', last: null },
       { name: 'demo.docs', bot: 'demo.docs', bot_id: 6, when: 'in 2h', once: true, ended: true, message: 'Check whether the docs preview deployed.', last: { outcome: 'gone', fired_ms: Date.now() - 95 * 60000 } },
     ]).map((x) => ({ ...x })), next_after: null }),
-    removeSchedule: async (name) => { S.schedules = (S.schedules ?? []).filter((x) => x.name !== name); },
+    fireTrigger: async (name) => { const x = (S.triggers ?? []).find((t) => t.name === name); if (x) { x.last = { outcome: 'sent', turn: 1, fired_ms: Date.now() }; x.sent = (x.sent ?? 0) + 1; } return { name, fired: true }; },
+    removeTrigger: async (name) => { S.triggers = (S.triggers ?? []).filter((x) => x.name !== name); },
     profiles: async () => [{ name: 'reviewer', summary: 'Reviews changes and reports bugs only', model: 'anthropic/claude-sonnet-5' }, { name: 'tester', summary: 'Keeps the test suite green', model: null }],
     // Named from the goal's longest word and dealt as the app's side does it.
     swarmStart: async ({ project, folder, goal, shared, mix, agents, budgetTokens, council = 0 }) => {

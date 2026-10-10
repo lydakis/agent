@@ -38,7 +38,7 @@ def render_cask(version: str, archive: Path) -> str:
   app "Agent.app"
   binary "#{{appdir}}/Agent.app/Contents/MacOS/agent"
 
-  # What the app writes at every start (its scripts, schedules and the skill
+  # What the app writes at every start (its scripts, triggers and the skill
   # links in your .agents/skills) is there before its first window. Before it
   # goes, only its skill links are removed, so none is left leading nowhere.
   postflight do
