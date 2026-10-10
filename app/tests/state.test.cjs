@@ -3980,6 +3980,9 @@ test('a note keeps the line it was opened on when the diff is read again under i
   // y deleted and its name given to another bot: the note goes by the folder's rule instead.
   p.forgetBot('y'); p.upsert({ name: 'y', bot_id: 9, provider: 'alpha', model: 'one', workspace: '/w' });
   assert.equal(p.gitOwner('/w').name, 'x');
+  // A worktree whose agent works in a project below its top is that agent's.
+  p.upsert({ name: 'sub', bot_id: 10, provider: 'alpha', model: 'one', workspace: '/t/app' });
+  assert.equal(p.gitOwner('/t').name, 'sub'); assert.equal(p.gitOwner('/t/app').name, 'sub'); assert.equal(p.gitOwner('/tx'), null);
 });
 
 test('a Git tab out of view lets its lists and diff go and reads them again, on the same rows, when shown', async () => {

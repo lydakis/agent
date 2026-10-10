@@ -1885,7 +1885,7 @@ function diffRows(text, path) {
   }
   return { rows, more };
 }
-// Who a note goes to: an agent working in the folder, the one its tab was opened from first, then
+// Who a note goes to: an agent working in the folder (or, if none, inside it), the one its tab was opened from first, then
 // one working now, then the project's coordinator. A folder no agent works in takes no notes.
 // The agents by folder are gathered once per change to the fleet, not once per row.
 const workers = { gen: -1, by: new Map() };
@@ -1896,7 +1896,10 @@ function gitOwner(dir) {
     for (const b of S.bots.values()) if (b.name !== HOME && b.workspace) { const d = trimDir(b.workspace); if (!workers.by.has(d)) workers.by.set(d, []); workers.by.get(d).push(b); }
     for (const list of workers.by.values()) list.sort((a, b) => a.name.localeCompare(b.name));
   }
-  const here = (workers.by.get(trimDir(dir)) ?? []).filter((b) => bot(b.name) === b), [name, id] = S.ui.gitFrom.get(dir) ?? [], from = bot(name)?.id === id ? bot(name) : null;
+  // A task started in a project below the repository's top works in the same folder of its worktree,
+  // so a worktree no agent works at the top of takes the agents working inside it.
+  const at = trimDir(dir), inside = (d) => at === '/' || d.startsWith(`${at}/`);
+  const here = (workers.by.get(at) ?? [...workers.by].filter(([d]) => inside(d)).flatMap(([, list]) => list)).filter((b) => bot(b.name) === b), [name, id] = S.ui.gitFrom.get(dir) ?? [], from = bot(name)?.id === id ? bot(name) : null;
   if (from && here.includes(from)) return from;
   return here.find((b) => isActive(b.status)) ?? here.find((b) => leadProject(b.name)) ?? here[0] ?? null;
 }
