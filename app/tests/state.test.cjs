@@ -32,7 +32,7 @@ function page(daemon = {}, storage = null) {
     window: { addEventListener() {} }, localStorage: storage ? { getItem: k => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, String(v)) } : { getItem() { return null; } },
     setTimeout(fn) { const id = ++timer; timers.set(id, fn); return id; }, clearTimeout(id) { timers.delete(id); }, setInterval() {},
   });
-  for (const file of ['../ui/vendor/marked.js', '../ui/rich.js']) vm.runInContext(fs.readFileSync(require.resolve(file), 'utf8'), context);
+  for (const file of ['../ui/vendor/markdown-it.js', '../ui/rich.js']) vm.runInContext(fs.readFileSync(require.resolve(file), 'utf8'), context);
   context.Rich = context.window.Rich;
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
@@ -294,6 +294,24 @@ test('a message\'s later blocks are drawn anew when an earlier one\'s share of i
   // The first block draws again with far more tags (as highlighting arriving can make it): the later one is past the bound.
   first.text = '- y\n'.repeat(40000); p.textHTML(first);
   assert.doesNotMatch(p.textHTML(later), /<li>/);
+});
+
+test('Markdown parses in time that grows with its length, for runs of markers too', () => {
+  const p = page(), Rich = p.context.Rich;
+  const took = (s) => { const t0 = process.hrtime.bigint(); Rich.html(s); return Number(process.hrtime.bigint() - t0) / 1e6; };
+  for (const unit of ['!', '![', '[', '*x', '_a', '`a``']) {
+    took(unit.repeat(2000));
+    const small = took(unit.repeat(10000)), large = took(unit.repeat(40000));
+    assert.ok(large < 12 * Math.max(small, 2), `${unit}: ${small.toFixed(1)} ms at 10k, ${large.toFixed(1)} ms at 40k`);
+  }
+  // A line of them past the bound is not parsed at all.
+  assert.match(Rich.html('!'.repeat(200000)), /<span class="lang">text<\/span>/);
+});
+
+test('a message\'s parsing counts toward the window\'s bound', () => {
+  const p = page(), it = { kind: 'text', text: '*x* '.repeat(1000) };
+  p.textHTML(it);
+  assert.ok(it.bytes >= 16 * 2000, `${it.bytes} bytes for 2,000 marks`);
 });
 
 test('a reference used many times copies at most 1 Mi characters of targets into the page', () => {

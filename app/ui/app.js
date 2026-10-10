@@ -1252,18 +1252,19 @@ function inline(text) {
 // A message's Markdown, drawn once and kept with the item: a pane drawn again reuses it, and it is
 // drawn anew only when its text changes or, for one whose code waited, highlighting arrives (see
 // `Rich.onReady`). What it keeps counts toward the transcript's decoded bytes, so the window's bound
-// holds, and so does what it puts on the page: each tag it draws counts `TAG_BYTES`, so the window
-// holds about 200,000 drawn tags however the messages split them.
-const TAG_BYTES = 40;
+// holds, and so does what it puts on the page and what parsing it cost: each tag it draws counts
+// `TAG_BYTES` and each mark parsed `MARK_BYTES`, so a window holds about 200,000 drawn tags and
+// 500,000 parsed marks however the messages split them, and opening a chat parses a bounded amount.
+const TAG_BYTES = 40, MARK_BYTES = 16;
 function textHTML(it, t) {
   // A block after the first of its message starts from what the blocks before it drew, and is drawn
   // anew when that changes (an earlier block highlighted once highlighting arrived).
-  const used = { lines: 0, tags: 0, code: 0, blocks: 0, links: 0, over: false, scope: it.scope };
+  const used = { lines: 0, tags: 0, code: 0, blocks: 0, links: 0, marks: 0, over: false, scope: it.scope };
   for (const s of it.budget?.spent.slice(0, it.sib) ?? []) if (s) { used.lines += s.lines; used.tags += s.tags; used.code += s.code; used.blocks += s.blocks; used.links += s.links; used.over ||= s.over; }
   const from = `${used.lines} ${used.tags} ${used.code} ${used.blocks} ${used.links} ${used.over}`;
   if (it.htmlOf !== it.text || it.htmlFrom !== from || (it.htmlWaited && it.htmlAt !== Rich.version)) {
     const start = { ...used }, html = `<div class="md">${Rich.html(it.text, used)}</div>`;
-    const tags = used.tags - start.tags, cost = 2 * html.length + TAG_BYTES * tags;
+    const tags = used.tags - start.tags, cost = 2 * html.length + TAG_BYTES * tags + MARK_BYTES * (used.marks - start.marks);
     if (it.budget) it.budget.spent[it.sib] = { lines: used.lines - start.lines, tags, code: used.code - start.code, blocks: used.blocks - start.blocks, links: used.links - start.links, over: !!used.over };
     const d = cost - (it.drawnBytes ?? 0); it.drawnBytes = cost; it.bytes = (it.bytes || 0) + d; if (t) t.bytes = Math.max(0, (t.bytes || 0) + d);
     it.html = html; it.htmlOf = it.text; it.htmlFrom = from; it.htmlAt = Rich.version; it.htmlWaited = Rich.waited;

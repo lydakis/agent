@@ -1,6 +1,6 @@
 // What a model writes, drawn as a page draws it: Markdown, highlighted code, Mermaid diagrams,
 // Vega-Lite charts and HTML previews, in a message or a file opened beside. Markdown is parsed once
-// per message (marked, loaded with the page); highlighting, Mermaid and Vega load the first time
+// per message (markdown-it, loaded with the page); highlighting, Mermaid and Vega load the first time
 // something needs them. Raw HTML in Markdown stays text; an ```html block runs only when asked, in a
 // sandboxed frame with no network and no way into the app; a chart loads no data from anywhere.
 window.Rich = (() => {
@@ -75,26 +75,65 @@ window.Rich = (() => {
   const LINK_CHARS = 1 << 20;
   let linkLeft = LINK_CHARS;
   const linkCost = (href, title) => { const n = (href?.length ?? 0) + (title?.length ?? 0); if (n > linkLeft) return false; linkLeft -= n; return true; };
-  let md = null;
+  // Markdown is parsed by markdown-it, whose work grows with its input: a hostile reply can make
+  // a parser's time grow faster than its length, and this one runs on the window's thread.
+  let md = null; const closes = [];
   function parser() {
-    if (md || !globalThis.marked) return md;
-    md = new globalThis.marked.Marked({
-      gfm: true, breaks: true,
-      renderer: {
-        html: ({ text }) => esc(text),
-        code: ({ text, lang }) => block(text, lang),
-        // A table past 256 columns or 10,000 cells shows as its source: a short row is padded to
-        // the header's width, so a few bytes a row can ask for millions of cells.
-        table(token) { return token.header.length > COLUMNS || token.header.length * (token.rows.length + 1) > CELLS ? block(token.raw.replace(/\n+$/, ''), '') : false; },
-        // A link to a path opens that file beside, from the agent's folder; its `#` href lets Tab and
-        // Enter reach it, and the click handler keeps it from navigating.
-        link({ href, title, tokens }) { const inner = this.parser.parseInline(tokens); if (!linkCost(href, title)) return inner; const t = title ? ` title="${esc(title)}"` : ''; return linkable(href) ? `<a href="${esc(href)}"${t}>${inner}</a>` : filePath(href) ? `<a class="file" href="#" data-file="${esc(filePath(href))}"${t}>${inner}</a>` : inner; },
-        // An image draws only from data the message carries, and only on a click: a small PNG can
-        // decode to hundreds of megabytes and an animated one takes CPU for as long as it shows.
-        // A remote image is a link and a local one opens beside, so drawing a message fetches
-        // nothing a model chose.
-        image: ({ href, text }) => !linkCost(href, text) ? esc(text) : /^data:image\/(png|gif|jpe?g|webp)[;,]/i.test(href ?? '') ? `<button type="button" class="img" data-img="${esc(href)}" title="${esc(text)}">image${text ? `: ${esc(text)}` : ''}</button>` : linkable(href) ? `<a href="${esc(href)}">${esc(text || href)}</a>` : filePath(href) ? `<a class="file" href="#" data-file="${esc(filePath(href))}">${esc(text || href)}</a>` : esc(text),
-      },
+    if (md || !globalThis.markdownit) return md;
+    md = globalThis.markdownit({ html: false, linkify: true, breaks: true });
+    // Which links open, and how, is decided below; a link the window would not open is its text.
+    md.validateLink = () => true;
+    const r = md.renderer.rules;
+    r.fence = (tokens, i) => block(tokens[i].content.replace(/\n$/, ''), tokens[i].info);
+    r.code_block = (tokens, i) => block(tokens[i].content.replace(/\n$/, ''), '');
+    r.rich_source = (tokens, i) => block(tokens[i].content, '');
+    // A link to a path opens that file beside, from the agent's folder; its `#` href lets Tab and
+    // Enter reach it, and the click handler keeps it from navigating.
+    r.link_open = (tokens, i) => {
+      const href = tokens[i].attrGet('href') ?? '', title = tokens[i].attrGet('title'), t = title ? ` title="${esc(title)}"` : '';
+      const open = !linkCost(href, title) ? '' : linkable(href) ? `<a href="${esc(href)}"${t}>` : filePath(href) ? `<a class="file" href="#" data-file="${esc(filePath(href))}"${t}>` : '';
+      closes.push(open ? '</a>' : ''); return open;
+    };
+    r.link_close = () => closes.pop() ?? '';
+    // An image draws only from data the message carries, and only on a click: a small PNG can
+    // decode to hundreds of megabytes and an animated one takes CPU for as long as it shows.
+    // A remote image is a link and a local one opens beside, so drawing a message fetches
+    // nothing a model chose.
+    r.image = (tokens, i, options, env, self) => {
+      const href = tokens[i].attrGet('src') ?? '', text = self.renderInlineAsText(tokens[i].children ?? [], options, env);
+      return !linkCost(href, text) ? esc(text) : /^data:image\/(png|gif|jpe?g|webp)[;,]/i.test(href) ? `<button type="button" class="img" data-img="${esc(href)}" title="${esc(text)}">image${text ? `: ${esc(text)}` : ''}</button>` : linkable(href) ? `<a href="${esc(href)}">${esc(text || href)}</a>` : filePath(href) ? `<a class="file" href="#" data-file="${esc(filePath(href))}">${esc(text || href)}</a>` : esc(text);
+    };
+    // A table past 256 columns or 10,000 cells shows as its source, before its cells are parsed: a
+    // short row is padded to the header's width, so a few bytes a row can ask for millions of cells.
+    md.core.ruler.after('block', 'rich_table', (state) => {
+      const out = []; let starts = null;
+      for (let i = 0; i < state.tokens.length; i++) {
+        const t = state.tokens[i];
+        if (t.type !== 'table_open') { out.push(t); continue; }
+        let end = i, cols = 0, rows = 0, head = true;
+        for (; state.tokens[end].type !== 'table_close'; end++) {
+          const k = state.tokens[end].type;
+          if (k === 'th_open' && head) cols++; else if (k === 'tr_open') rows++; else if (k === 'thead_close') head = false;
+        }
+        if (cols <= COLUMNS && cols * rows <= CELLS) { out.push(...state.tokens.slice(i, end + 1)); i = end; continue; }
+        if (!starts) { starts = [0]; for (let j = state.src.indexOf('\n'); j !== -1; j = state.src.indexOf('\n', j + 1)) starts.push(j + 1); }
+        const src = new state.Token('rich_source', '', 0);
+        src.content = state.src.slice(starts[t.map[0]], t.map[1] < starts.length ? starts[t.map[1]] : state.src.length).replace(/\n+$/, '');
+        out.push(src); i = end;
+      }
+      state.tokens = out;
+    });
+    // `- [ ] item` and `- [x] item` are task boxes, which the window shows but nobody ticks.
+    md.core.ruler.after('inline', 'rich_tasks', (state) => {
+      const ts = state.tokens;
+      for (let i = 2; i < ts.length; i++) {
+        const first = ts[i].type === 'inline' && ts[i - 1].type === 'paragraph_open' && ts[i - 2].type === 'list_item_open' ? ts[i].children?.[0] : null;
+        const m = first?.type === 'text' && /^\[([ xX])\] /.exec(first.content);
+        if (!m) continue;
+        first.content = first.content.slice(4);
+        const box = new state.Token('html_inline', '', 0); box.content = `<input type="checkbox" disabled${m[1] === ' ' ? '' : ' checked'}> `;
+        ts[i].children.unshift(box);
+      }
     });
     return md;
   }
@@ -109,16 +148,17 @@ window.Rich = (() => {
   // A message's HTML, inside the caller's `.md` box. One that would draw past 100,000 tags (about
   // 50,000 elements) shows as its text: a line of `- x` or a `*x*` makes an element from a few
   // bytes, and the window pays for every element it holds. It is not parsed past 50,000 lines or
-  // 100,000 marks that open an inline element (`*`, `_`, a backtick, `[`, `<`, `~`, `|`, `@`,
+  // 100,000 marks that open an inline element (`*`, `_`, a backtick, `[`, `!`, `<`, `~`, `|`, `@`, `\`, `&`,
   // `www.`, `://`), since the parser's tokens cost more than the HTML they become.
   const TAGS = 100000, LINES = 50000;
   const count = (s, c, max) => { let n = 0, i = -1; while (n <= max && (i = s.indexOf(c, i + 1)) !== -1) n++; return n; };
-  const MARK = /[*_`[<~|@]|www\.|:\/\//g;
+  const MARK = /[*_`[<~|@!\\&]|www\.|:\/\//g;
   const marks = (s, max) => { let n = 0; MARK.lastIndex = 0; while (n <= max && MARK.exec(s)) n++; return n; };
   const asText = (text) => `<div class="rc" data-kind="code">${head('text', '')}<pre class="code"><code>${esc(text)}</code></pre></div>`;
   // `used` carries the bounds across the pieces of one message drawn apart, as a streamed reply's
   // blocks are; once over, `used.over` is set and that piece is text. `used.scope` names where its
   // diagrams and charts were drawn and `used.blocks` counts those drawn before it (see `lazy`);
+  // `used.marks` counts the marks parsed, which is what the parsing cost;
   // `used.draft` marks a reply still streaming.
   function html(text, used = { lines: 0, tags: 0, code: 0 }) {
     waited = false; spent = used.code ?? 0; scope = used.scope ?? null; nth = used.blocks ?? 0; draft = !!used.draft; linkLeft = LINK_CHARS - (used.links ?? 0);
@@ -126,12 +166,14 @@ window.Rich = (() => {
     if (!p) return `<p>${esc(text)}</p>`;
     if (used.over) return asText(text);
     const lines = count(text, '\n', LINES - used.lines);
-    if (used.lines + lines > LINES || used.tags + marks(text, TAGS - used.tags) > TAGS) { used.over = true; return asText(text); }
-    let out; try { out = p.parse(text); } catch (_) { return `<p>${esc(text)}</p>`; }
+    const mk = marks(text, TAGS - used.tags);
+    if (used.lines + lines > LINES || used.tags + mk > TAGS) { used.over = true; return asText(text); }
+    closes.length = 0;
+    let out; try { out = p.render(text); } catch (_) { return `<p>${esc(text)}</p>`; }
     used.code = spent;
     const tags = count(out, '<', TAGS - used.tags);
     if (used.tags + tags > TAGS) { waited = false; used.over = true; return asText(text); }
-    used.lines += lines; used.tags += tags; used.blocks = nth; used.links = LINK_CHARS - linkLeft;
+    used.lines += lines; used.tags += tags; used.marks = (used.marks ?? 0) + mk; used.blocks = nth; used.links = LINK_CHARS - linkLeft;
     return out;
   }
 
