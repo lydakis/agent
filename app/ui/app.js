@@ -846,12 +846,14 @@ function entries(item) {
     if (Array.isArray(item.content)) { let t = ''; for (const p of item.content) { if (p.type === 'tool_result') out.push(out_(p.tool_use_id, text(p.content, ['text']), p.is_error === true)); else if (p.type === 'text' || p.type === 'input_text') t += p.text ?? ''; } if (t) out.unshift({ kind: 'user', text: t }); }
     else out.push({ kind: 'user', text: text(item.content, ['text']) });
   } else if (item.role === 'assistant' && Array.isArray(item.content)) {
+    // Its text blocks, split by tool calls, are one message: they share its bounds (`budget`).
+    let budget = null, sib = 0;
     for (const p of item.content) {
       if (p.type === 'tool_use') out.push(storedTool(p.name, p.id, JSON.stringify(p.input)));
       else if (p.type === 'thinking' && p.thinking) out.push({ kind: 'thought', text: p.thinking, secs: null });
       else if ((p.type === 'text' || p.type === 'output_text') && p.text) {
         const previous = out.at(-1);
-        if (previous?.kind === 'text') previous.text += p.text; else out.push({kind:'text',text:p.text});
+        if (previous?.kind === 'text') previous.text += p.text; else { budget ??= { spent: [] }; out.push({ kind: 'text', text: p.text, budget, sib: sib++ }); }
       }
     }
   }
@@ -1250,7 +1252,11 @@ function inline(text) {
 // holds.
 function textHTML(it, t) {
   if (it.htmlOf !== it.text || (it.htmlWaited && it.htmlAt !== Rich.version)) {
-    const html = `<div class="md">${Rich.html(it.text)}</div>`;
+    // A block after the first of its message starts from what the blocks before it drew.
+    const used = { lines: 0, tags: 0, code: 0 };
+    for (const s of it.budget?.spent.slice(0, it.sib) ?? []) if (s) { used.lines += s.lines; used.tags += s.tags; used.code += s.code; used.over ||= s.over; }
+    const start = { ...used }, html = `<div class="md">${Rich.html(it.text, used)}</div>`;
+    if (it.budget) it.budget.spent[it.sib] = { lines: used.lines - start.lines, tags: used.tags - start.tags, code: used.code - start.code, over: !!used.over };
     const d = 2 * (html.length - (it.html?.length ?? 0)); it.bytes = (it.bytes || 0) + d; if (t) t.bytes = Math.max(0, (t.bytes || 0) + d);
     it.html = html; it.htmlOf = it.text; it.htmlAt = Rich.version; it.htmlWaited = Rich.waited;
   }

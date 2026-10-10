@@ -110,6 +110,7 @@ window.Rich = (() => {
     waited = false; spent = used.code ?? 0;
     const p = parser();
     if (!p) return `<p>${esc(text)}</p>`;
+    if (used.over) return asText(text);
     const lines = count(text, '\n', LINES - used.lines);
     if (used.lines + lines > LINES || used.tags + marks(text, TAGS - used.tags) > TAGS) { used.over = true; return asText(text); }
     let out; try { out = p.parse(text); } catch (_) { return `<p>${esc(text)}</p>`; }

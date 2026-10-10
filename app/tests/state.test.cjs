@@ -216,6 +216,17 @@ test('a message past 100,000 tags shows as its text', () => {
   assert.equal(used.over, true);
 });
 
+test('the text blocks of one stored message share its bounds', () => {
+  const p = page(), list = '- x\n'.repeat(30000);
+  const es = p.entries({ role: 'assistant', content: [{ type: 'text', text: list }, { type: 'tool_use', id: 'c1', name: 'read', input: {} }, { type: 'text', text: list }] });
+  const texts = es.filter((e) => e.kind === 'text');
+  assert.equal(texts.length, 2);
+  assert.match(p.textHTML(texts[0]), /<li>/);
+  assert.doesNotMatch(p.textHTML(texts[1]), /<li>/);
+  // Drawn again, the first block's share is counted once.
+  texts[0].htmlOf = null; assert.match(p.textHTML(texts[0]), /<li>/);
+});
+
 test('highlighting arriving redraws only messages whose code waited for it', () => {
   const p = page(), R = p.context.Rich; let v = 0, calls = 0;
   p.context.Rich = { html: (x) => { calls++; return R.html(x); }, get version() { return v; }, get waited() { return R.waited; } };

@@ -1154,8 +1154,9 @@ an element from four bytes. One with more than 100,000 marks that open an
 inline element (`*`, `_`, a backtick, `[`, `<`, `~`, `|`, `@`, `www.`,
 `://`) is not parsed either: the parser's tokens for a single line of `*x*`
 cost far more than the HTML they become. A streamed reply's blocks share
-those bounds and the highlighting budget below, and past them the rest
-streams as text. Fenced blocks are drawn by their language:
+those bounds and the highlighting budget below, as do the text blocks of one
+stored message on either side of its tool calls; past them the rest shows as
+text. Fenced blocks are drawn by their language:
 
 - **Code** is highlighted with [highlight.js](https://highlightjs.org) (its
   common languages) in the window's own colors, with a copy button. A block
