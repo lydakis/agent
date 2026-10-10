@@ -524,6 +524,9 @@ test('⌘P pressed beside searches the side agent\'s repository, and Escape in a
   await doc.getElementById('pickerq').listeners.keydown({ key: 'Escape', preventDefault() {} }); await p.tick();
   assert.equal(focused, 2);
   assert.equal(doc.getElementById('newproj').hidden, false);
+  // ? still shows the keys there.
+  await doc.listeners.keydown({ key: '?', target: { id: '', closest: () => null }, preventDefault() {} });
+  assert.ok(p.S.ui.help);
 });
 
 test('⌘P from Home with no folder says what it searches', async () => {

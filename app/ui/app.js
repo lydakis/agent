@@ -3045,7 +3045,11 @@ document.addEventListener('keydown', async (e) => {
     if (i >= 0) await go(names[i]);
     e.preventDefault(); return;
   }
-  if (!inputIds.has(e.target.id) && k.length === 1 && !ctrl && !e.altKey) $('input').focus();
+  // A key typed outside a field goes to the composer; a file tab has none, so there only ? (keys) acts.
+  if (!inputIds.has(e.target.id) && k.length === 1 && !ctrl && !e.altKey) {
+    if (fileOf(S.selected) == null) $('input').focus();
+    else if (k === '?') { showHelp(); e.preventDefault(); }
+  }
 });
 function failed(err) {
   const text = String(err?.message ?? err);
