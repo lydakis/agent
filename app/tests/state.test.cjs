@@ -1656,6 +1656,7 @@ test("Home's agent is Home: no row, no tab, no crumb, and a closed Start Home gi
   const made = deferred(), sent = [];
   const r = shell({ models: async () => [{ id: 'alpha/one' }], settings: async () => ({ providers: ['alpha'], keys: [] }), homeDir: async () => '/synthetic/you', policy: async () => ({ instructions: 'home rules', compaction_instructions: 'summary', note: 'test' }),
     request: async (op, x) => { sent.push(op); if (op === 'create') { await made.promise; return { name: x.bot, id: 9, provider: 'alpha', model: 'one', workspace: x.workspace }; } return { nodes: [], workspaces: [], next_from: null }; } });
+  r.setRender(() => r.followDrafts());
   await r.submit('status?');
   r.context.document.getElementById('hm-model').value = 'alpha/one';
   const starting = r.context.document.getElementById('sheet').listeners.submit({ preventDefault() {} });

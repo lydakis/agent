@@ -2266,9 +2266,10 @@ function followDrafts() {
     const input = $(ids.input), who = ids.bot() ?? '';
     if ((input.dataset.for ?? '') === who) continue;
     if (input.dataset.for) { if (input.value) S.drafts.set(input.dataset.for, input.value); else S.drafts.delete(input.dataset.for); }
-    moved.push([input, who]);
+    // What was typed at Home before its agent existed is that agent's once it does.
+    moved.push([input, who, !input.dataset.for && who === HOME ? input.value : '']);
   }
-  for (const [input, who] of moved) { input.value = S.drafts.get(who) ?? ''; S.drafts.delete(who); input.dataset.for = who; grow(input); }
+  for (const [input, who, kept] of moved) { input.value = S.drafts.get(who) ?? kept; S.drafts.delete(who); input.dataset.for = who; grow(input); }
 }
 function render() {
   const app = $('app');
