@@ -675,6 +675,7 @@ impl Reader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
     use std::sync::{Arc, Barrier};
 
     fn scratch_path(name: &str) -> std::path::PathBuf {
@@ -894,6 +895,46 @@ mod tests {
                 .code,
             "turn_result_pruned"
         );
+        // A client's wait meets the pruned turn as its view, and a kept
+        // finished turn as its outcome, neither pending.
+        let (pruned, kept) = store
+            .read("turn_answers", move |db| {
+                Ok((
+                    db.turn_answer("Bob", first)?,
+                    db.turn_answer("Alice", other)?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                &pruned["turn"],
+                &pruned["status"],
+                &pruned["error"],
+                &pruned["pending"]
+            ),
+            (
+                &json!(first),
+                &json!("completed"),
+                &json!("turn_result_pruned"),
+                &Value::Null
+            )
+        );
+        assert_eq!(
+            (
+                &kept["turn"],
+                &kept["status"],
+                &kept["error"],
+                &kept["pending"]
+            ),
+            (
+                &json!(other),
+                &json!("completed"),
+                &Value::Null,
+                &Value::Null
+            )
+        );
+        assert!(kept["text"].is_string());
         let mut terminal = Vec::new();
         while let Ok(publication) = publications.try_recv() {
             if let Publication::Event(event) = publication

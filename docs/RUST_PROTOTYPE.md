@@ -200,7 +200,8 @@ a client's `wait` gets the whole turn view (below) with them, and a model's
 and exit code a foreground `shell` would. Unresolved handles at the deadline
 are returned as pending and remain valid for a later wait: a process as
 `{"pending": true}`, a turn, for a client, as its view with `pending: true`,
-read in one job for all of them. A turn cannot wait on itself; unknown handles
+read in one job for all of them. A turn that finished between the deadline
+and that read answers with its outcome instead. A turn cannot wait on itself; unknown handles
 resolve to errors rather than blocking.
 Malformed handles return `invalid_handle`; numeric IDs use the exact decimal
 form printed by the runtime, without leading zeros or a plus sign. A rejected
@@ -1720,7 +1721,8 @@ needs, and one optional policy composes them:
   transcript and the turn rows themselves stay, so the context window, the
   `history` tool, `history_items`, forks, and accounting are unaffected; what shrinks
   is replay and artifact retrieval. New `wait` calls for an expired
-  turn outcome return `turn_result_pruned`; they never report an empty success.
+  turn outcome return the turn's view with `error: turn_result_pruned`; they
+  never report an empty success.
   On a pruning notice, `agent run` and `agent follow` reconcile their selected
   turn through a zero-timeout `wait`, so retries of expired turns exit with that error
   instead of waiting for a terminal event that no longer exists.

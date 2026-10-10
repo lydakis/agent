@@ -251,23 +251,24 @@ impl Handles {
                     return;
                 }
                 // Pending turns are read in one job on the reader, off the
-                // registry lock; one that vanished meanwhile stays pending.
+                // registry lock, as `wait` reports a turn: one that finished
+                // meanwhile answers with its outcome, and one that vanished
+                // stays pending.
                 tokio::spawn(async move {
                     let mut results = results;
-                    let views = reader
-                        .read("turn_views", move |db| {
+                    let answers = reader
+                        .read("turn_answers", move |db| {
                             Ok(pending
                                 .into_iter()
                                 .filter_map(|(text, bot, turn)| {
-                                    Some((text, db.turn_view(&bot, turn).ok()?))
+                                    Some((text, db.turn_answer(&bot, turn).ok()?))
                                 })
                                 .collect::<Vec<_>>())
                         })
                         .await
                         .unwrap_or_default();
-                    for (text, mut view) in views {
-                        view["pending"] = json!(true);
-                        results.insert(text, Arc::new(view));
+                    for (text, answer) in answers {
+                        results.insert(text, Arc::new(answer));
                     }
                     respond(&output, request, results);
                 });
@@ -386,11 +387,14 @@ impl Handles {
             Err(error) => Some((json!({"error":error.code,"detail":error.detail}), false)),
             Ok(Handle::Turn { bot, turn }) => {
                 match store
-                    .op("turn_outcome", move |db| db.turn_outcome(&bot, turn))
+                    .op("turn_answer", move |db| db.turn_answer(&bot, turn))
                     .await
                 {
-                    Ok(Some(outcome)) => Some((outcome, true)),
-                    Ok(None) => None,
+                    Ok(answer) if answer["pending"] == true => None,
+                    Ok(answer) => {
+                        let durable = answer["error"] != "turn_result_pruned";
+                        Some((answer, durable))
+                    }
                     Err(error) => Some((json!({"error":error.code,"detail":error.detail}), false)),
                 }
             }

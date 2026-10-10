@@ -32,7 +32,7 @@ def poll(client, bot, turn):
     found = response['result']['results'][handle]
     if found.get('pending'):
         return {'result': {'turn': turn, 'finished': False}}
-    if 'error' in found and 'status' not in found:
+    if 'error' in found and ('status' not in found or found['error'] == 'turn_result_pruned'):
         return {'error': found['error']}
     return {'result': found}
 

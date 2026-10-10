@@ -1806,7 +1806,9 @@ class RuntimeTests(ModelFixture):
         client.finished(later)
         self.assertEqual(poll(client, 'Bob', old)['error'], 'turn_result_pruned')
         waited = client.request('wait', handles=[f'turn:Bob/{old}'], timeout_ms=100)['result']['results']
-        self.assertEqual(waited[f'turn:Bob/{old}']['error'], 'turn_result_pruned')
+        # The turn's view stays; only how it ended is gone.
+        pruned = waited[f'turn:Bob/{old}']
+        self.assertEqual((pruned['error'], pruned['status'], pruned['bot']), ('turn_result_pruned', 'completed', 'Bob'))
         (self.path / 'release').touch()
         waited = client.request('wait', handles=[handle], timeout_ms=3000)['result']['results']
         self.assertEqual(waited[handle]['stdout'], 'done')

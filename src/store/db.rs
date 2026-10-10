@@ -5605,7 +5605,28 @@ impl Database {
     /// A finished turn's outcome for a waiter: terminal status, error, and the
     /// final assistant text, bounded. `None` while the turn is still going.
     pub fn turn_outcome(&self, name: &str, turn: i64) -> Result<Option<Value>> {
-        let mut outcome = self.turn_view(name, turn)?;
+        self.outcome_of(self.turn_view(name, turn)?, turn)
+    }
+    /// A turn as a client's `wait` reports it: its outcome once finished,
+    /// its view marked `pending` while it runs, or its view with
+    /// `turn_result_pruned` once retention removed how it ended.
+    pub fn turn_answer(&self, name: &str, turn: i64) -> Result<Value> {
+        let mut view = self.turn_view(name, turn)?;
+        match self.outcome_of(view.clone(), turn) {
+            Ok(Some(outcome)) => Ok(outcome),
+            Ok(None) => {
+                view["pending"] = json!(true);
+                Ok(view)
+            }
+            Err(error) if error.code == "turn_result_pruned" => {
+                view["error"] = json!(error.code);
+                view["detail"] = json!("its outcome was pruned");
+                Ok(view)
+            }
+            Err(error) => Err(error),
+        }
+    }
+    fn outcome_of(&self, mut outcome: Value, turn: i64) -> Result<Option<Value>> {
         if matches!(
             outcome["status"].as_str(),
             Some("running" | "waiting" | "paced" | "queued" | "ready")
