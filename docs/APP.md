@@ -739,10 +739,11 @@ daemon learns nothing about projects; everything here is client work.
   own `~/.agents/agents/home.md`) or the one the app ships
   ([home.md](../app/agents/home.md)). The shipped text has it answer what is
   running, what finished and what waits on the person from `agent ls`,
-  `approvals`, `turns` and `wait --timeout-ms 0`, filtered to what the
-  question needs (the agents not at rest, the calls waiting on an approval,
-  one project's agents, the leads, an agent's last turns) so a large
-  fleet stays under the shell's output limit, hand a project's work to its lead with
+  `approvals`, `turns` and `wait --timeout 0`, with the daemon reading only
+  what the question needs (`ls --active`, `approvals --limit 20`,
+  `ls --name 'PROJECT.*'`, `ls --name '*.lead'`,
+  `turns --newest --limit 3`) so a large fleet costs neither the daemon
+  a full listing nor the shell its output limit, hand a project's work to its lead with
   `run --detach --delivery queue`, change no files and start no agents of
   its own. Until it exists, Home says what it is for, and the first message
   sent there opens **Start Home**, a model and an effort as every agent
@@ -2129,7 +2130,7 @@ This measures the ancestry-walk reduction, not an end-to-end fleet capacity clai
 Pulled event batches apply in order, with one visible-history load and render
 per batch. Creation/fork bursts rebuild the fleet tree at most once per pull,
 while retaining the 300-row rail window. The shared client rejects a ready
-handshake unless its protocol is exactly `agent_client::PROTOCOL`, now 11.
+handshake unless its protocol is exactly `agent_client::PROTOCOL`, now 12.
 
 The lifecycle regression suite compares committed thinking/answer transcripts
 between live delivery and replay, reconciles fork snapshot/replay ordering,

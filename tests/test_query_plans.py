@@ -18,6 +18,12 @@ class QueryPlanTests(unittest.TestCase):
             with self.subTest(table=table):
                 self.assertIn(f'DELETE FROM {table} WHERE turn=?', queries)
         self.assertIn("DELETE FROM processes WHERE turn=? AND status!='running'", queries)
+        # Every filter and direction of a listing is planned.
+        bots = [q for q in queries if q.startswith('SELECT name,head,') and 'FROM bots WHERE name > ?1' in q]
+        self.assertEqual(len(bots), 4)
+        self.assertTrue(any('name GLOB ?3 AND running_turn IS NOT NULL ORDER BY name' in q for q in bots))
+        self.assertTrue(any('ORDER BY t.id DESC LIMIT ?4' in q for q in queries))
+        self.assertTrue(any('ORDER BY t.id ASC LIMIT ?4' in q for q in queries))
         # A prune never drops a running process; a deletion refuses a bot
         # that still has one instead of filtering.
         prune = source.split('fn prune_records(', 1)[1].split('\n    pub fn ', 1)[0]
