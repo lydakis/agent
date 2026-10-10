@@ -34,14 +34,27 @@ pub fn list(dir: &Path) -> Result<Listing, String> {
     }
     let root = String::from_utf8_lossy(&top.stdout);
     let root = root.strip_suffix('\n').unwrap_or(&root).to_owned();
-    // A tracked file deleted from the folder but not yet from the index
-    // would open as "no such file", so it is left out.
-    let deleted = git(Path::new(&root))
-        .args(["ls-files", "-z", "--deleted"])
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|e| format!("git: {e}"))?;
-    let deleted: HashSet<&[u8]> = deleted.stdout.split(|b| *b == 0).collect();
+    // Left out, as each would open as "no such file": a tracked file
+    // deleted from the folder but not yet from the index, and a submodule,
+    // which git lists as one entry but is a folder.
+    let deleted = answer(&root, &["ls-files", "-z", "--deleted"])?;
+    let modules = answer(
+        &root,
+        &[
+            "config",
+            "-z",
+            "--file",
+            ".gitmodules",
+            "--get-regexp",
+            r"^submodule\..*\.path$",
+        ],
+    )?;
+    let mut skip: HashSet<&[u8]> = deleted.split(|b| *b == 0).collect();
+    // Each entry is its key, a newline, then the path.
+    skip.extend(modules.split(|b| *b == 0).filter_map(|entry| {
+        let at = entry.iter().position(|b| *b == b'\n')?;
+        Some(&entry[at + 1..])
+    }));
     let mut child = git(Path::new(&root))
         .args([
             "ls-files",
@@ -73,7 +86,7 @@ pub fn list(dir: &Path) -> Result<Listing, String> {
         }
         // A name that is not UTF-8 cannot be opened by its path from the
         // page, so it is left out too.
-        if !deleted.contains(&name[..])
+        if !skip.contains(&name[..])
             && let Ok(text) = std::str::from_utf8(&name)
         {
             files.push(text.to_owned());
@@ -90,6 +103,17 @@ pub fn list(dir: &Path) -> Result<Listing, String> {
         return Err(format!("{root}: git ls-files failed ({status})"));
     }
     Ok(Listing { root, files, more })
+}
+
+/// What git prints, whether or not it succeeds: no `.gitmodules` is no
+/// submodules.
+fn answer(root: &str, args: &[&str]) -> Result<Vec<u8>, String> {
+    let out = git(Path::new(root))
+        .args(args)
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|e| format!("git: {e}"))?;
+    Ok(out.stdout)
 }
 
 /// git about `dir` alone: a `GIT_DIR` and the like from the app's own
@@ -140,16 +164,26 @@ mod tests {
         std::fs::create_dir_all(tmp.join("target")).unwrap();
         std::fs::write(tmp.join("target/out.bin"), "").unwrap();
         std::fs::write(tmp.join("gone.md"), "").unwrap();
+        std::fs::write(
+            tmp.join(".gitmodules"),
+            "[submodule \"sub\"]\n\tpath = lib/sub\n\turl = ./sub\n",
+        )
+        .unwrap();
         run(&tmp, &["add", "README.md", "gone.md"]);
+        let gitlink = "160000,1111111111111111111111111111111111111111,lib/sub";
+        run(&tmp, &["update-index", "--add", "--cacheinfo", gitlink]);
         std::fs::remove_file(tmp.join("gone.md")).unwrap();
         let root = std::fs::canonicalize(&tmp).unwrap();
         let listing = list(&tmp.join("src/deep")).unwrap();
         assert_eq!(listing.root, root.to_string_lossy());
         let mut files = listing.files;
         files.sort();
-        // Tracked, new and not ignored; the ignored build output and a
-        // tracked file deleted from the folder are left out.
-        assert_eq!(files, [".gitignore", "README.md", "src/deep/a.rs"]);
+        // Tracked, new and not ignored; the ignored build output, a
+        // tracked file deleted from the folder and a submodule are left out.
+        assert_eq!(
+            files,
+            [".gitignore", ".gitmodules", "README.md", "src/deep/a.rs"]
+        );
         assert!(!listing.more);
         let outside = std::env::temp_dir().join(format!("agent-nogit-{}", std::process::id()));
         std::fs::create_dir_all(&outside).unwrap();

@@ -486,6 +486,30 @@ test('a cut listing says so whatever is typed, and a file tab opens no menu', as
   assert.equal(prevented, 1); assert.equal(p.S.ui.menu, false);
 });
 
+test('⌘P pressed beside searches the side agent\'s repository, and Escape in a file tab\'s page focuses its tab', async () => {
+  const listed = [];
+  const p = page({ request: async () => ({ nodes: [], workspaces: [], next_from: null }), listFiles: async (dir) => { listed.push(dir); return { root: dir, files: [], more: false }; }, readFile: async () => new TextEncoder().encode('<p>x</p>') });
+  p.S.session = 1; p.S.config = { workspace: '/synthetic' };
+  p.upsert({ name: 'Bob', id: 1, provider: 'alpha', model: 'one', workspace: '/w/main' });
+  p.upsert({ name: 'Ann', id: 2, provider: 'alpha', model: 'one', workspace: '/w/side' });
+  await p.go('Bob'); p.S.ui.side = 'Ann';
+  const doc = p.context.document;
+  doc.activeElement = { closest: (s) => s === '.pane.side' ? {} : null };
+  p.openPicker('files'); await settle();
+  assert.deepEqual(listed, ['/w/side']);
+  p.S.ui.picker = false;
+  doc.activeElement = { closest: () => null };
+  p.openPicker('files'); await settle();
+  assert.deepEqual(listed, ['/w/side', '/w/main']);
+  // A page in a file tab: Escape leaves it for the tab, as the tab has no composer.
+  await p.go('▤/w/main/p.html', 'tab'); await settle();
+  let focused = 0; const tabs = doc.getElementById('tabs'); tabs.querySelector = (s) => s === '.wtab.on' ? { focus() { focused++; } } : null;
+  const win = {}, frame = { contentWindow: win, closest: () => null };
+  doc.querySelectorAll = (s) => s === '.rc iframe' ? [frame] : []; doc.activeElement = frame;
+  p.context.window.listeners.message({ source: win, data: { rich: 'escape' } });
+  assert.equal(focused, 1);
+});
+
 test('⌘P from Home with no folder says what it searches', async () => {
   const p = page({ request: async () => ({ nodes: [], workspaces: [], next_from: null }), listFiles: async () => { throw new Error('unexpected'); } });
   p.openPicker('files'); await settle();
@@ -495,7 +519,7 @@ test('⌘P from Home with no folder says what it searches', async () => {
 test('Escape in a preview the reader is in closes the file it shows', async () => {
   const p = page({ readFile: async () => new TextEncoder().encode('<button>x</button>') }), c = p.context, win = {};
   p.setRender(() => {}); await p.openFile('Bob', '/w/p.html');
-  const frame = { contentWindow: win, closest: (s) => s === '.pane.side .fview' ? {} : null };
+  const frame = { contentWindow: win, closest: (s) => s === '.pane.side .fview' || s === '.pane.side' ? {} : null };
   c.document.querySelectorAll = (s) => s === '.rc iframe' ? [frame] : [];
   // A page the reader is not in cannot close it.
   c.window.listeners.message({ source: win, data: { rich: 'escape' } });

@@ -2222,11 +2222,15 @@ function pickerRows() {
   if (S.ui.pickerMode === 'files') return fileRows(q);
   return fleetIndex().rows.filter((n) => n.b).map((n) => ({ ...n, i: q ? n.b.name.toLowerCase().indexOf(q) : -1 })).filter((r) => !q || r.i >= 0);
 }
-// The folder ⌘P searches the repository of: the file in view's, else the agent's or the swarm's.
+// The folder ⌘P searches the repository of: that of the pane it was pressed in, which is the file in
+// view's, else the agent's or the swarm's.
 function searchFolder() {
-  const tab = fileOf(S.selected); if (tab != null) return dirOf(tab);
-  const sw = swarmOf(S.selected); if (sw) return sw.workspace ?? null;
-  return bot(S.selected)?.workspace ?? S.config?.workspace ?? null;
+  const beside = pickerPane === 'side' && S.ui.side;
+  if (beside && S.ui.file) return dirOf(S.ui.file.full);
+  const key = beside ? S.ui.side : S.selected;
+  const tab = fileOf(key); if (tab != null) return dirOf(tab);
+  const sw = swarmOf(key); if (sw) return sw.workspace ?? null;
+  return bot(key)?.workspace ?? S.config?.workspace ?? null;
 }
 // Listed once each time the finder opens on files, so it is what git sees now; trading lists with
 // Tab keeps the listing, so key repeat starts no more git. The lowercase copy is made once per
@@ -3181,9 +3185,15 @@ function waitsForHighlight(el) {
 }
 Rich.onReady = () => { for (const [id] of PANES) if (!(id === 'side' && S.ui.file) && waitsForHighlight($(id))) $(id).dataset.key = ''; render(); };
 Rich.onFile = openFileFrom;
-// Escape in a preview: a file's closes it, as Escape does there; a message's returns the keyboard to
-// its pane, where the next Escape does what it does.
-Rich.onEscape = (frame) => { if (frame.closest('.pane.side .fview') && S.ui.file) closeFile(); else focusInput(frame.closest('.pane.side') && !S.ui.file ? 'side' : 'main'); };
+// Escape in a preview: a file's beside closes it, as Escape does there; a file tab's, which has no
+// composer, gives the keyboard to its tab; a message's returns the keyboard to its pane, where the
+// next Escape does what it does.
+Rich.onEscape = (frame) => {
+  const side = frame.closest('.pane.side');
+  if (side && frame.closest('.pane.side .fview') && S.ui.file) closeFile();
+  else if (!side && fileOf(S.selected) != null) $('tabs').querySelector('.wtab.on')?.focus();
+  else focusInput(side && !S.ui.file ? 'side' : 'main');
+};
 Rich.onError = (text) => toast(text, 4000);
 
 // ---------- boot ----------
