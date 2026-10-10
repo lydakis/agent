@@ -20,6 +20,10 @@ class CaskTest(unittest.TestCase):
         # The bundled daemon is stopped before its binary goes.
         self.assertIn('Agent.app/Contents/MacOS/agent",', cask)
         self.assertIn('args:         ["shutdown", "--store", "#{Dir.home}/.agent/state.sqlite", "--grace", "30"]', cask)
+        # What a start writes is there at install; skill links go with the app.
+        self.assertIn('Agent.app/Contents/MacOS/agent-app",\n                   args:         ["--setup"]', cask)
+        self.assertIn('args:         ["--unlink-skills"]', cask)
+        self.assertLess(cask.index("postflight do"), cask.index("uninstall_preflight do"))
         # brew style (Homebrew/OSDependsOn) requires it of a macOS-only cask.
         self.assertIn("  depends_on :macos\n", cask)
         # The store is shared with the CLI and is the user's data, not the app's.
