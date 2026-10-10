@@ -798,7 +798,9 @@ daemon learns nothing about projects; everything here is client work.
   The app reads the plans of the agents it seats when a window attaches,
   and an agent's again when a shell call of its that ran the script ends:
   nothing is watched or polled, and a plan left by an agent deleted from
-  another window is never read. An agent with a plan shows the step it is
+  another window is never read. For more than a few agents the app lists
+  the plans folder rather than looking each one up, so attaching costs the
+  plans that exist, not the agents in the store. An agent with a plan shows the step it is
   on and how many are done on its row and its task card, and the whole
   plan above its chat, whose count folds it to the current step. A
   deleted agent's plan is removed. The coordinator's profile has a task of

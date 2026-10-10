@@ -20,13 +20,43 @@ pub fn dir(store: &Path) -> Result<PathBuf, String> {
     Ok(PathBuf::from(name))
 }
 
-/// The plans in `dir` of the agents `ids` names, by bot id, with null for one
-/// that has none. A file that is not a plan's size or not text is not a plan.
+/// Up to this many agents are looked up one by one; more are found by
+/// listing the folder, which holds only the agents that wrote a plan.
+const FEW: usize = 8;
+
+/// The plans in `dir` of the agents `ids` names, by bot id; one with none is
+/// left out. A file that is not a plan's size or not text is not a plan. The
+/// cost follows the plans that exist, not the agents asked about, and a file
+/// of an agent not asked about is never read.
 pub fn read(dir: &Path, ids: &[i64]) -> Result<Value, String> {
     let mut out = Map::new();
-    for &id in ids {
-        let text = plain(&dir.join(id.to_string()))?;
-        out.insert(id.to_string(), text.map_or(Value::Null, Value::String));
+    let mut take = |id: i64| -> Result<(), String> {
+        if let Some(text) = plain(&dir.join(id.to_string()))? {
+            out.insert(id.to_string(), Value::String(text));
+        }
+        Ok(())
+    };
+    if ids.len() <= FEW {
+        for &id in ids {
+            take(id)?;
+        }
+        return Ok(Value::Object(out));
+    }
+    let wanted: std::collections::HashSet<i64> = ids.iter().copied().collect();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Value::Object(out)),
+        Err(e) => return Err(format!("{}: {e}", dir.display())),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
+        let id = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<i64>().ok());
+        if let Some(id) = id.filter(|id| wanted.contains(id)) {
+            take(id)?;
+        }
     }
     Ok(Value::Object(out))
 }
@@ -83,28 +113,28 @@ mod tests {
     }
 
     #[test]
-    fn plans_are_read_by_bot_id_and_what_is_not_one_is_none() {
+    fn plans_are_read_by_bot_id_and_what_is_not_one_is_left_out() {
         let root = scratch("read");
         let plans = root.join("state.sqlite-plans");
-        assert_eq!(read(&plans, &[7]).unwrap(), serde_json::json!({"7": null}));
+        let many: Vec<i64> = (1..=40).collect();
+        assert_eq!(read(&plans, &[7]).unwrap(), serde_json::json!({}));
+        assert_eq!(read(&plans, &many).unwrap(), serde_json::json!({}));
         std::fs::create_dir_all(&plans).unwrap();
         std::fs::write(plans.join("7"), "[x] Read it\n[>] Write it\n").unwrap();
         std::fs::write(plans.join("12"), "[ ] Ship it\n").unwrap();
-        // One too big, one not text, and a folder.
+        // One too big, one not text, a folder, the script's temporary, and an agent not asked about.
         std::fs::write(plans.join("13"), vec![b'x'; CAP as usize + 1]).unwrap();
         std::fs::write(plans.join("14"), [0xff, 0xfe]).unwrap();
         std::fs::create_dir_all(plans.join("15")).unwrap();
-        assert_eq!(
-            read(&plans, &[7, 12, 13, 14, 15, 99]).unwrap(),
-            serde_json::json!({"7": "[x] Read it\n[>] Write it\n", "12": "[ ] Ship it\n",
-                "13": null, "14": null, "15": null, "99": null})
-        );
+        std::fs::write(plans.join(".plan.ab12cd"), "[ ] half").unwrap();
+        std::fs::write(plans.join("99"), "[ ] Not asked\n").unwrap();
+        let both = serde_json::json!({"7": "[x] Read it\n[>] Write it\n", "12": "[ ] Ship it\n"});
+        // A few ids are looked up one by one, many by listing the folder; both give the same.
+        assert_eq!(read(&plans, &[7, 12, 13, 14, 15]).unwrap(), both);
+        assert_eq!(read(&plans, &many).unwrap(), both);
         forget(&plans, 12).unwrap();
         forget(&plans, 12).unwrap();
-        assert_eq!(
-            read(&plans, &[12]).unwrap(),
-            serde_json::json!({"12": null})
-        );
+        assert_eq!(read(&plans, &[12]).unwrap(), serde_json::json!({}));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -181,7 +211,7 @@ mod tests {
         }
         assert_eq!(
             read(&dir(&store).unwrap(), &[7]).unwrap(),
-            serde_json::json!({"7": null})
+            serde_json::json!({})
         );
         // Outside an agent's shell it says so.
         let outside = std::process::Command::new("sh")

@@ -1321,7 +1321,7 @@ fn plans_of(state: &Shared) -> Result<PathBuf, String> {
     }
 }
 
-/// The plans of the agents `ids` names, by bot id (null for one with none).
+/// The plans of the agents `ids` names, by bot id (one with none is left out).
 #[tauri::command]
 async fn plans(
     windows: State<'_, Windows>,

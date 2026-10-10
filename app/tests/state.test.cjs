@@ -3573,7 +3573,7 @@ test('a plan is its marked lines: what it has done, the step it is on, and the r
 
 test("plans are read at once, then an agent's again when it runs the plan script, and shown on its row, card and chat", async () => {
   const files = new Map([[2, '[x] Read it\n[>] Write <b>it</b>\n[ ] Ship it\n']]), asked = [];
-  const p = page({ plans: async (ids) => { asked.push(ids); return Object.fromEntries(ids.map((id) => [id, files.get(id) ?? null])); } });
+  const p = page({ plans: async (ids) => { asked.push(ids); return Object.fromEntries(ids.filter((id) => files.has(id)).map((id) => [id, files.get(id)])); } });
   p.S.config = { workspace: '/synthetic' }; p.S.session = 1;
   p.upsert({ name: 'app.lead', id: 1 });
   p.upsert({ name: 'app.build', id: 2, created_by: 'app.lead', created_by_id: 1 });
