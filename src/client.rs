@@ -81,6 +81,8 @@ struct Options {
     all: bool,
     /// `wait --any`: return on the first resolved handle.
     any: bool,
+    /// `approvals --full`: whole arguments for calls whose preview was cut.
+    full: bool,
     /// `run --delivery`: what to do when the bot is busy.
     delivery: Option<String>,
     /// A new bot's approval mode and gated tools.
@@ -144,6 +146,7 @@ fn parse(args: &[String]) -> Result<Options> {
         keep_turns: None,
         all: false,
         any: false,
+        full: false,
         delivery: std::env::var("AGENT_DELIVERY").ok(),
         approval: std::env::var("AGENT_APPROVAL")
             .ok()
@@ -179,6 +182,7 @@ fn parse(args: &[String]) -> Result<Options> {
             "--detach" => options.detach = true,
             "--all" => options.all = true,
             "--any" => options.any = true,
+            "--full" => options.full = true,
             "--" => options.positional.extend(iter.by_ref().cloned()),
             flag if flag.starts_with("--") => {
                 let value = iter
@@ -1499,31 +1503,19 @@ fn fork(options: &Options) -> Result<i32> {
         let allow: Vec<&str> = allow.split(',').filter(|t| !t.is_empty()).collect();
         request["allow"] = json!(allow);
     }
-    // A fork keeps its source's tools and gates; its own gate adds to them.
-    // Its approver starts first, so a missing judge leaves no fork behind.
-    // Only a gate of the fork's own is built from the source's tools.
-    let gated =
-        options.approval.as_deref().unwrap_or("full") != "full" || options.approve.is_some();
+    // A fork keeps its source's tools and gates. An approver its inherited
+    // `auto` gate needs starts first, so a missing judge leaves no fork behind.
     let state = match connection.request("resume", json!({"bot":source})) {
         // A keyed fork outlives its source: its resend is answered from the
         // fork, so it needs nothing from the source.
-        Err(error) if error.code == "bot_not_found" && options.request_id.is_some() && !gated => {
+        Err(error) if error.code == "bot_not_found" && options.request_id.is_some() => {
             let result = connection.request("fork", request)?;
             print_json(&result, options.pretty)?;
             return Ok(0);
         }
         state => state?,
     };
-    let mut auto = answered_by_auto(&state);
-    if gated {
-        let tools: Vec<String> = serde_json::from_value(state["tools"].clone())
-            .map_err(|_| Error::new("daemon_protocol_mismatch"))?;
-        if let Value::Object(gate) = requested_gate(options, &tools)? {
-            auto |= gate.get("approver").is_some_and(|tag| tag == "auto");
-            request.as_object_mut().expect("object").extend(gate);
-        }
-    }
-    if auto {
+    if answered_by_auto(&state) {
         ensure_approver(options, &mut connection, bot_model(&state))?;
     }
     let result = connection.request("fork", request)?;
@@ -1616,10 +1608,16 @@ fn approvals(options: &Options) -> Result<i32> {
             "approvals",
             json!({"bot":options.bot,"tag":options.tag,"after":after,"limit":256}),
         )?;
-        let calls = page["approvals"]
+        let mut calls = page["approvals"]
             .as_array()
-            .ok_or(Error::new("daemon_protocol_mismatch"))?;
-        for call in calls {
+            .ok_or(Error::new("daemon_protocol_mismatch"))?
+            .clone();
+        if options.full {
+            for call in &mut calls {
+                whole_arguments(&mut connection, call)?;
+            }
+        }
+        for call in &calls {
             if options.pretty {
                 println!(
                     "{} turn {} {}",
@@ -1647,6 +1645,31 @@ fn approvals(options: &Options) -> Result<i32> {
         println!("]");
     }
     Ok(0)
+}
+
+/// Replace a call's preview with its whole arguments, read from the node
+/// that planned it, when the preview left any out. One too large to read
+/// keeps its preview, still marked cut.
+fn whole_arguments(connection: &mut Connection, call: &mut Value) -> Result<()> {
+    let whole = call["arguments"].is_object()
+        && call["arguments_cut"].as_array().is_none_or(Vec::is_empty)
+        && call["arguments_omitted"].as_u64().unwrap_or(0) == 0;
+    if whole {
+        return Ok(());
+    }
+    let read = connection.request(
+        "history_items",
+        json!({"bot":call["bot"],"nodes":[call["node"]]}),
+    )?;
+    let call_id = call["call_id"].as_str().unwrap_or_default();
+    if let Some(arguments) =
+        agent_client::approver::call_arguments(&read["items"][0]["item"], call_id)
+    {
+        call["arguments"] = arguments;
+        call["arguments_cut"] = json!([]);
+        call["arguments_omitted"] = json!(0);
+    }
+    Ok(())
 }
 
 /// Allow or deny one gated call. The request number is required, so a

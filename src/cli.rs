@@ -36,7 +36,7 @@ const COMMANDS: &[Command] = &[
         name: "fork",
         about: "Copy a bot's conversation up to a message into a new bot",
         usage: "fork --source NAME --bot NAME [--checkpoint NODE] [--allow LIST]",
-        flags: "--source --bot --checkpoint --workspace --budget-tokens --approval --approve --allow --request-id --pretty",
+        flags: "--source --bot --checkpoint --workspace --budget-tokens --allow --request-id --pretty",
         settings: "",
         startup: false,
     },
@@ -91,8 +91,8 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "approvals",
         about: "Tool calls waiting for a verdict",
-        usage: "approvals [--bot NAME] [--tag TAG]",
-        flags: "--bot --tag --pretty --no-spawn",
+        usage: "approvals [--bot NAME] [--tag TAG] [--full]",
+        flags: "--bot --tag --full --pretty --no-spawn",
         settings: "",
         startup: true,
     },
@@ -340,6 +340,7 @@ fn print_flags(flags: &str) {
                 "Tools whose calls need a verdict; default every tool but history, wait, note, echo",
             ),
             "--call" => ("ID", "The tool call to answer"),
+            "--full" => ("", "Every call's whole arguments, not their preview"),
             "--request" => ("N", "The request number the call was announced with"),
             "--tag" => (
                 "TAG",
@@ -493,6 +494,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                 | "--detach"
                 | "--all"
                 | "--any"
+                | "--full"
                 | "--no-compaction"
                 | "--agents"
                 | "--fallbacks"

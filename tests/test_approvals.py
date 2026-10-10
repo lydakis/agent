@@ -653,6 +653,24 @@ class ApprovalCliTests(ModelFixture):
         result = self.agent('wait', '--store', str(self.store), submitted['handle'])
         self.assertEqual(json.loads(result.stdout)['results'][submitted['handle']]['status'], 'completed')
 
+    def test_approvals_full_reads_what_the_preview_cut(self):
+        command = 'printf ' + 'a' * 3000
+        submitted = json.loads(self.agent('run', *self.common, '--new', '--bot', 'Bob', '--detach',
+                                          f'shell:{command}', env={'AGENT_APPROVAL': 'manual'}).stdout)
+        deadline = time.monotonic() + 10
+        while not (pending := json.loads(self.agent('approvals', '--store', str(self.store)).stdout)):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.05)
+        [call] = pending
+        self.assertEqual(call['arguments_cut'], ['command'])
+        self.assertEqual(len(call['arguments']['command']), 2048)
+        [call] = json.loads(self.agent('approvals', '--store', str(self.store), '--full').stdout)
+        self.assertEqual((call['arguments']['command'], call['arguments_cut']), (command, []))
+        self.assertIn('a' * 3000, self.agent('approvals', '--store', str(self.store), '--full', '--pretty').stdout)
+        self.agent('answer', '--store', str(self.store), '--bot', 'Bob', '--turn', str(call['turn']),
+                   '--call', 'shell-1', '--request', '1', 'deny')
+        self.agent('wait', '--store', str(self.store), submitted['handle'])
+
     def test_a_printed_answer_keeps_any_call_id_one_word(self):
         submitted = json.loads(self.agent('run', *self.common, '--new', '--bot', 'Bob', '--detach',
                                           'oddshell:printf ok', env={'AGENT_APPROVAL': 'manual'}).stdout)
