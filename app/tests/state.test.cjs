@@ -1623,7 +1623,7 @@ test("Home's first message starts its agent in your home folder in the home role
   await el('sheet').listeners.submit({ preventDefault() {} }); await settle();
   assert.deepEqual(calls.find(([op]) => op === 'policy').slice(1), ['/synthetic/you', 'home']);
   const create = calls.find(([op]) => op === 'create')[1];
-  assert.deepEqual([create.bot, create.workspace, create.model, create.reasoning, create.instructions], ['home', '/synthetic/you', 'alpha/one', 'high', 'home rules']);
+  assert.deepEqual([create.bot, create.workspace, create.model, create.effort, create.instructions], ['home', '/synthetic/you', 'alpha/one', 'high', 'home rules']);
   const sent = () => calls.filter(([op]) => op === 'submit').map(([, q]) => [q.bot, q.bot_id, q.prompt]);
   assert.deepEqual(sent(), [['home', 9, 'what is running?']]);
   // At Home its chat is the main pane, so the next message goes straight to it.
@@ -1631,6 +1631,12 @@ test("Home's first message starts its agent in your home folder in the home role
   await p.submit('and what waits on me?');
   assert.deepEqual(sent().at(-1), ['home', 9, 'and what waits on me?']);
   assert.equal(calls.filter(([op]) => op === 'create').length, 1);
+  // A window on another host has no Home to start: it says so and asks for nothing.
+  const far = shell({ models: async () => { calls.push(['models']); return []; } });
+  far.S.config.host = 'box'; calls.length = 0;
+  await assert.rejects(far.submit('what is running?'), /home_local_only: .*box/);
+  assert.deepEqual(calls, []);
+  assert.doesNotMatch(far.context.document.getElementById('sheet').innerHTML, /Start Home/);
 });
 
 test("Home's agent is Home: no row, no tab, no crumb, and a closed Start Home gives the message back", async () => {

@@ -2014,12 +2014,12 @@ async function submitHome() {
   try { await submit(text, 'main', HOME); }
   catch (err) { toast(String(err?.message ?? err), 6000); const input = $('input'); if (!input.value) { input.value = text; grow(input); } }
 }
-async function createHome(model, reasoning) {
+async function createHome(model, effort) {
   const dir = await Daemon.homeDir();
   const policy = await Daemon.policy(dir, 'home');
-  try { localStorage.setItem('agent:model', model); if (reasoning !== null) localStorage.setItem('agent:effort', reasoning); } catch (_) {}
+  try { localStorage.setItem('agent:model', model); if (effort !== null) localStorage.setItem('agent:effort', effort); } catch (_) {}
   const session = S.session;
-  const record = await Daemon.request('create', { bot: HOME, workspace: dir, model, ...(reasoning ? { reasoning } : {}), instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: policy.tools ?? S.config.tools });
+  const record = await Daemon.request('create', { bot: HOME, workspace: dir, model, ...(effort ? { effort } : {}), instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: policy.tools ?? S.config.tools });
   await enqueue(() => { if (S.session === session) seat(record, session); });
   render();
 }
@@ -2300,8 +2300,8 @@ function render() {
 }
 // Home before its agent exists: what that agent is for, and where things are.
 function renderHome(el) {
-  const key = `home|${S.bots.size > 0}`; if (el.dataset.key === key) return; el.dataset.key = key; el.dataset.who = '';
-  el.innerHTML = `<div class="home">Home is your own agent across every project: ask it what is running, what finished and what waits on you, or hand it work and it goes to that project's lead. Your first message starts it.<br><br>${S.bots.size ? 'Projects and agents are in the list. Click one to look in, double-click to open it as a tab. ⌘K finds any agent.' : 'No projects yet. ＋ New project starts one.'}</div>`;
+  const host = S.config?.host ?? '', key = `home|${S.bots.size > 0}|${host}`; if (el.dataset.key === key) return; el.dataset.key = key; el.dataset.who = '';
+  el.innerHTML = `<div class="home">Home is your own agent across every project: ask it what is running, what finished and what waits on you, or hand it work and it goes to that project's lead. ${host ? `It runs on this machine, so a window on ${esc(host)} has none; open Home in a window here.` : 'Your first message starts it.'}<br><br>${S.bots.size ? 'Projects and agents are in the list. Click one to look in, double-click to open it as a tab. ⌘K finds any agent.' : 'No projects yet. ＋ New project starts one.'}</div>`;
 }
 // Once a second, while anything runs: the clocks on cards and run lines, in place. The activity
 // check is cached per fleet change, so a quiet fleet of any size costs nothing here.
@@ -2485,7 +2485,10 @@ async function submit(text, pane = 'main', to = PANE[pane].bot()) {
   const sw = pane === 'main' && swarmOf(to);
   if (sw) { await postToSwarm(sw, text); return; }
   // At Home before its agent exists, the first message starts it.
-  if (pane === 'main' && !to && !S.selected) { await openHomeSheet(text); return; }
+  if (pane === 'main' && !to && !S.selected) {
+    if (S.config?.host) throw new Error(`home_local_only: Home runs on this machine, and this window's agents run on ${S.config.host}`);
+    await openHomeSheet(text); return;
+  }
   const b = bot(to); if (!b) throw new Error('no bot selected; /new NAME PROVIDER/MODEL [EFFORT] creates one');
   // An event can seat a bot before its snapshot identity arrives. Never send an unpinned name.
   if (b.id == null) throw new Error('bot_identity_pending: wait for attachment to finish');
