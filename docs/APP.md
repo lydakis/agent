@@ -1566,7 +1566,8 @@ file tab's folder, else the agent's or the swarm's. The core runs
 (`list_files`), so the list is what git tracks plus new files it does not
 ignore, less a tracked file deleted from the folder (`--deleted`), at most
 100,000 paths from 16 MiB of git's answer, read name by name so git stops at
-either bound; a folder outside a repository says so, and a window on a host
+either bound (a cut listing says so under every search, as typing cannot reach
+past it); a folder outside a repository says so, and a window on a host
 refuses, as for reading a file. It is listed once each time the finder opens
 on files (Tab between the lists keeps it) and let go when the finder closes. A name that starts
 with what was typed comes first, then a name that holds it, then a folder

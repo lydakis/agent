@@ -79,6 +79,9 @@ pub fn list(dir: &Path) -> Result<Listing, String> {
             files.push(text.to_owned());
         }
     };
+    // A cut that fell just after a name's end reads as the end; the
+    // spent byte bound still says git had more to give.
+    let more = more || out.get_ref().limit() == 0;
     if more {
         let _ = child.kill();
     }

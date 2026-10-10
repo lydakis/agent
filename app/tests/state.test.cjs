@@ -470,6 +470,22 @@ test('file tabs come back after a restart', () => {
   assert.deepEqual([...b.S.ui.tabs], ['Bob', '▤/w/a.md']); assert.equal(b.S.selected, '▤/w/a.md');
 });
 
+test('a cut listing says so whatever is typed, and a file tab opens no menu', async () => {
+  const p = page({ request: async () => ({ nodes: [], workspaces: [], next_from: null }), listFiles: async () => ({ root: '/w', files: ['a.md', 'b.md'], more: true }) });
+  p.S.session = 1; p.S.config = { workspace: '/synthetic' };
+  p.upsert({ name: 'Bob', id: 1, provider: 'alpha', model: 'one', workspace: '/w' });
+  await p.go('Bob');
+  const doc = p.context.document, q = doc.getElementById('pickerq');
+  p.openPicker('files'); await settle();
+  assert.match(doc.getElementById('pickerlist').innerHTML, /searched the first 2 files; the repository has more/);
+  q.value = 'zzz'; p.renderPicker();
+  assert.match(doc.getElementById('pickerlist').innerHTML, /no file matches.*searched the first 2 files/);
+  let prevented = 0;
+  const target = { closest: (s) => s === 'a' ? null : { dataset: { tab: '▤/w/a.md' } } };
+  doc.listeners.contextmenu({ target, preventDefault() { prevented++; }, clientX: 1, clientY: 1 });
+  assert.equal(prevented, 1); assert.equal(p.S.ui.menu, false);
+});
+
 test('⌘P from Home with no folder says what it searches', async () => {
   const p = page({ request: async () => ({ nodes: [], workspaces: [], next_from: null }), listFiles: async () => { throw new Error('unexpected'); } });
   p.openPicker('files'); await settle();

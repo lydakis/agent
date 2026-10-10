@@ -2275,7 +2275,9 @@ function renderPicker() {
   const q = $('pickerq').value.trim(); const all = pickerRows(); const rows = all.slice(0, PICKER_ROWS);
   S.ui.pickerSel = Math.min(S.ui.pickerSel, Math.max(0, rows.length - 1));
   const total = all.total ?? all.length;
-  const more = total > rows.length ? `<div class="empty">${total - rows.length} more; type to narrow</div>` : files && found?.more && !q ? '<div class="empty">the repository has more files than listed; type to narrow</div>' : '';
+  // A listing cut at its bound says so whatever is typed: narrowing cannot find a file past it.
+  const cut = files && found?.more ? `<div class="empty">searched the first ${found.files.length} files; the repository has more</div>` : '';
+  const more = (total > rows.length ? `<div class="empty">${total - rows.length} more; type to narrow</div>` : '') + cut;
   if (files) {
     const none = !found || found.state === 'loading' ? 'listing files…' : found.state === 'none' ? 'Open an agent first: ⌘P searches the repository its folder is in.' : found.state === 'error' ? found.error : 'no file matches';
     $('pickerlist').innerHTML = (rows.length ? rows.map((r, idx) => fileRowHTML(r, idx, q.length)).join('') : `<div class="empty">${esc(none)}</div>`) + more;
@@ -3165,7 +3167,8 @@ document.addEventListener('contextmenu', (e) => {
   if (e.target.closest('a')) { e.preventDefault(); return; }
   const t = e.target.closest('[data-bot], [data-task], [data-tab]'); if (!t) return;
   const who = t.dataset.bot ?? t.dataset.task ?? t.dataset.tab;
-  e.preventDefault(); closeMenu(); showMenu(botMenuItems(who), { x: e.clientX, y: e.clientY }, who);
+  // A file tab has no actions, so it opens no menu.
+  const items = botMenuItems(who); e.preventDefault(); closeMenu(); if (items.length) showMenu(items, { x: e.clientX, y: e.clientY }, who);
 });
 
 // Highlighting arrived: a pane whose messages were drawn without it is drawn again; one with no
