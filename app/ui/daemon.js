@@ -38,7 +38,7 @@ window.Daemon = (() => {
       hosts: () => invoke('hosts'),
       openHost: (host) => invoke('open_host', { host }),
       swarmStart: ({ project, folder, goal, shared, mix, agents, budgetTokens }) => invoke('swarm_run', { args: ['start', '--project', project, '--folder', folder, '--agents', String(agents), '--budget', String(budgetTokens / 1e6), ...(shared ? [] : ['--in-project']), ...mix.flatMap((r) => ['--row', [r.model, r.share, r.identity ?? '', r.effort ?? ''].join(',')]), '--', goal] }),
-      swarmAdd: (swarm, row) => invoke('swarm_run', { args: ['add', '--swarm', swarm, '--row', String(row)] }),
+      swarmAdd: (swarm) => invoke('swarm_run', { args: ['add', '--swarm', swarm] }),
       swarmStop: (swarm) => invoke('swarm_run', { args: ['stop', '--swarm', swarm] }),
       swarmBoard: (swarm, offset) => invoke('swarm_board', { swarm, offset: offset ?? null }),
       swarmPost: (swarm, text) => invoke('swarm_run', { args: ['post', '--swarm', swarm, text] }),
@@ -437,8 +437,12 @@ window.Daemon = (() => {
       const bots = await enlist(sw, rows.map((row, i) => [`${full}-${i + 1}`, row]), Math.max(1, Math.floor(budgetTokens / rows.length)));
       return { swarm: swarmRecord(sw), bots, failed: [] };
     },
-    swarmAdd: async (swarm, row) => {
+    swarmAdd: async (swarm) => {
       const sw = S.swarms.get(swarm), each = Math.max(1, Math.floor(sw.budget / Math.max(1, sw.members.length)));
+      // The row furthest below its share among the members still there, as the script picks it.
+      const live = sw.members.filter((m) => S.bots.get(m)?.id === sw.ids[m]), t = live.length + 1;
+      const counts = sw.mix.map((_, r) => live.filter((m) => sw.rows[m] === r).length);
+      const row = counts.reduce((best, c, r) => (sw.mix[r].share * t - 100 * c > sw.mix[best].share * t - 100 * counts[best] ? r : best), 0);
       // A number no agent of the swarm ever had, as the swarm's script does.
       let i = (sw.made ?? 0) + 1; while (S.bots.has(`${swarm}-${i}`)) i++;
       const bots = await enlist(sw, [[`${swarm}-${i}`, row]], each, true); sw.budget += each;

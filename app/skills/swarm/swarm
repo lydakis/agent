@@ -36,6 +36,7 @@ stderr, exit 1 (2 for usage).
 import fcntl
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -230,21 +231,34 @@ class Folder:
                 raise ValueError
         except (OSError, ValueError, KeyError, TypeError):
             state = empty_state()
+        # Line by line, so a long board is never held whole.
         with open(os.path.join(self.dir, 'board.jsonl'), 'rb') as board:
             board.seek(state['offset'])
-            for line in board.read(size - state['offset']).splitlines():
+            while board.tell() < size:
+                line = board.readline(size - board.tell())
                 try:
                     apply(state, json.loads(line))
                 except (ValueError, KeyError, TypeError, AttributeError):
                     pass
+            self.torn = self.torn_end(board, size)
         state['offset'] = size
         self.cached = state['offset']
         return state
 
+    @staticmethod
+    def torn_end(board, size):
+        if not size:
+            return False
+        board.seek(size - 1)
+        return board.read(1) != b'\n'
+
     def append(self, lines):
-        """Lines go on the board in one write, durable before anyone is told."""
+        """Lines go on the board in one write, durable before anyone is told.
+        A board cut off mid-line (a write that died) gets its line ended
+        first, so the fragment stays a line of its own."""
         if lines:
-            self.board.write(b''.join((json.dumps(line) + '\n').encode() for line in lines))
+            self.board.write((b'\n' if self.torn else b'') + b''.join((json.dumps(line) + '\n').encode() for line in lines))
+            self.torn = False
             self.board.flush()
             os.fsync(self.board.fileno())
             for line in lines:
@@ -766,7 +780,8 @@ def profile_tools(folder, identity):
             continue
     else:
         return ('shell',)
-    lines = text.splitlines()
+    # Comments go first, as YAML drops them; a quoted '#' is not one a tool name has.
+    lines = [line.split(' #', 1)[0].rstrip() if not line.lstrip().startswith('#') else '' for line in text.splitlines()]
     if not lines or lines[0].strip() != '---':
         return ('shell',)
     tools = None
@@ -919,7 +934,7 @@ def brief(swarm, folder, member, each, late=False, roster=None):
              'leave, status' % quote(SCRIPT),
              'Board: ' + quote(os.path.join(folder, 'board.jsonl')),
              'The others: ' + (', '.join(others) or 'none yet'),
-             'First member: ' + short(roster[0]),
+             'First member: %s; if it is deleted, the lowest-numbered member status lists takes its place' % short(roster[0]),
              'Your lifetime allowance: %d tokens, including cached input on every call.' % each]
     if late:
         lines.append('You joined after the others started, so read the board first.')
@@ -1159,13 +1174,13 @@ def which(args):
     agent is a member of, or helps: SWARM-N, or SWARM-N.WHAT."""
     if args[:1] == ['--swarm'] and len(args) > 1:
         return args[1], args[2:]
+    # SWARM-N then .WHAT or nothing, where a project's name may hold dots too:
+    # each place that could end the member's number, shortest swarm name first.
     bot = os.environ.get('AGENT_BOT') or ''
-    base = bot.split('.', 2)
-    member = '.'.join(base[:2])
-    name, _, number = member.rpartition('-')
-    if not (name and number.isdigit()):
+    names = [bot[:m.start()] for m in re.finditer(r'-\d+(?=\.|$)', bot) if '.' in bot[:m.start()]]
+    if not names:
         raise Refused('usage', 'name the swarm with --swarm NAME; list shows them', True)
-    return name, args
+    return names, args
 
 
 def main(argv):
@@ -1184,9 +1199,12 @@ def main(argv):
     elif verb == 'list':
         out = listing(daemon)
     elif verb in ACTS + ('add', 'stop', 'status', 'check'):
-        name, args = which(args)
+        names, args = which(args)
         author = os.environ.get('AGENT_BOT') or None
-        folder = Folder(daemon.root(), name)
+        root = daemon.root()
+        name = names if isinstance(names, str) else next(
+            (n for n in names if os.path.isdir(os.path.join(root, n))), names[0])
+        folder = Folder(root, name)
         if verb in ACTS:
             if author and author not in folder.swarm['ids']:
                 raise Refused('not_a_member', '%s is not in %s' % (author, name))

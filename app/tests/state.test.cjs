@@ -2213,14 +2213,14 @@ test('a member\'s durable event reads the board only while the swarm is on scree
   await p.tick(); assert.equal(reads, 1, 'a burst reads once');
 });
 
-test('Stop and Add are one call each; an added agent comes from the row furthest below its share', async () => {
+test('Stop and Add are one call each, and the script picks an added agent\'s row', async () => {
   const calls = [];
   const mix = [{ identity: '', model: 'alpha/one', share: 50 }, { identity: 'reviewer', model: 'beta/two', share: 50 }];
   const ids = { 'app.latency-1': 3, 'app.latency-2': 4, 'app.latency-3': 5, 'app.latency-4': 9 };
   const members = ['app.latency-1', 'app.latency-2', 'app.latency-3'], rows = { 'app.latency-1': 0, 'app.latency-2': 1, 'app.latency-3': 0 };
   const p = shell({
     swarmStop: async (swarm) => { calls.push(['stop', swarm]); return { swarm: swarmRecord(members.slice(0, 2), { stopped: true, mix, rows, ids }), failed: [] }; },
-    swarmAdd: async (swarm, row) => { calls.push(['add', swarm, row]); return { swarm: swarmRecord([...members.slice(0, 2), 'app.latency-4'], { mix, rows: { ...rows, 'app.latency-4': row }, ids }), bots: ['app.latency-4'], failed: [] }; },
+    swarmAdd: async (swarm) => { calls.push(['add', swarm]); return { swarm: swarmRecord([...members.slice(0, 2), 'app.latency-4'], { mix, rows: { ...rows, 'app.latency-4': 0 }, ids }), bots: ['app.latency-4'], failed: [] }; },
     request: async () => ({ bots: [], next_after: null }),
   });
   const sw = p.learnSwarm(swarmRecord(members, { mix, rows, ids }));
@@ -2228,7 +2228,7 @@ test('Stop and Add are one call each; an added agent comes from the row furthest
   assert.equal(sw.stopped, true);
   assert.deepEqual(sw.members, ['app.latency-1', 'app.latency-2']);
   await p.addAgent(sw);
-  assert.deepEqual(calls, [['stop', 'app.latency'], ['add', 'app.latency', 0]]);
+  assert.deepEqual(calls, [['stop', 'app.latency'], ['add', 'app.latency']]);
   assert.equal(p.S.memberOf.get('app.latency-4'), 'app.latency');
   // Cards and posts say what an agent is, where the swarm has more than one kind.
   p.upsert({ name: 'app.latency-2', id: 4, provider: 'beta', model: 'two' });

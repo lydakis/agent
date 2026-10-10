@@ -614,10 +614,9 @@ async function createSwarm(project, { goal, n, mix, shared, budget }) {
   const sw = await learnStarted(r, n);
   await go(swarmKey(sw.name));
 }
-// An added agent comes from the row furthest below its share.
+// The script picks an added agent's row: the one furthest below its share among the live members.
 async function addAgent(sw) {
-  const row = nextRow(sw.mix, mixCounts(sw.mix, sw.members.map((m) => sw.rows[m])));
-  await learnStarted(await Daemon.swarmAdd(sw.name, row), 1);
+  await learnStarted(await Daemon.swarmAdd(sw.name), 1);
 }
 // Stopped, the swarm refuses its agents' posts, so nothing wakes them; your next post resumes it.
 async function stopSwarm(sw) {

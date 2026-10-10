@@ -390,10 +390,38 @@ class SwarmRuleTests(unittest.TestCase):
         (agents / 'inline.md').write_text('---\ntools: [read, "edit"]\n---\nReviews.\n')
         (agents / 'block.md').write_text('---\ndescription: x\ntools:\n  - read\n  - shell\nmodel: m\n---\n')
         (agents / 'open.md').write_text('---\ndescription: x\n---\nAnything.\n')
+        (agents / 'noted.md').write_text('---\ntools: [read, shell] # the defaults\n---\n')
+        (agents / 'listed.md').write_text('---\ntools:\n  # needed\n  - shell # for the board\n---\n')
+        self.assertEqual(self.s.profile_tools(str(folder), 'noted'), ['read', 'shell'])
+        self.assertEqual(self.s.profile_tools(str(folder), 'listed'), ['shell'])
         self.assertEqual(self.s.profile_tools(str(folder), 'inline'), ['read', 'edit'])
         self.assertEqual(self.s.profile_tools(str(folder), 'block'), ['read', 'shell'])
         self.assertIn('shell', self.s.profile_tools(str(folder), 'open'))
         self.assertIn('shell', self.s.profile_tools(str(folder), 'missing'))
+
+    def test_a_member_finds_its_swarm_even_in_a_dotted_project(self):
+        for bot, names in [('p.widget-2', ['p.widget']), ('p.widget-2-1.fix', ['p.widget-2']),
+                           ('foo.bar.widget-1', ['foo.bar.widget']), ('foo.bar.widget-1.fix.deep', ['foo.bar.widget'])]:
+            os.environ['AGENT_BOT'] = bot
+            self.addCleanup(os.environ.pop, 'AGENT_BOT', None)
+            self.assertEqual(self.s.which(['status'])[0][:1], names, bot)
+
+    def test_a_board_cut_mid_line_keeps_its_next_line_whole(self):
+        made = tempfile.TemporaryDirectory()
+        self.addCleanup(made.cleanup)
+        folder = Path(made.name) / 'p.w'
+        folder.mkdir()
+        (folder / 'swarm.json').write_text(json.dumps(self.swarm))
+        (folder / 'board.jsonl').write_bytes(b'{"from":"user","text":"goal"}\n{"from":"w-1","kind":"ro')
+        board = self.s.Folder(made.name, 'p.w')
+        board.append([{'from': 'w-1', 'kind': 'role', 'role': 'profiler'}])
+        board.board.close()
+        lines = (folder / 'board.jsonl').read_bytes().split(b'\n')
+        self.assertEqual(json.loads(lines[2])['role'], 'profiler')
+        (folder / 'state.json').unlink()
+        again = self.s.Folder(made.name, 'p.w')
+        self.assertEqual(again.state['roles'], {'w-1': 'profiler'})
+        again.board.close()
 
     def test_the_mix_is_dealt_to_the_row_furthest_below_its_share(self):
         mix = [{'share': 50}, {'share': 25}, {'share': 25}]
