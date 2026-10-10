@@ -43,6 +43,19 @@ made.
 ![The finder](app/nav-find.png)
 ![A third tab from the finder](app/nav-tabs.png)
 
+### Plans
+
+Captured 2026-10-10. A task that keeps a plan shows its count and current
+step on its card in the lead's chat and on its row in the list.
+
+![The demo project: build's card and row show 2 of 4 steps and the step it is on](app/plan-project.png)
+
+Beside, and full screen, the whole plan sits above its chat; the count folds
+it to the current step.
+
+![build beside the project, its plan above its chat](app/plan-beside.png)
+![build full screen, three of four steps done](app/plan-thread.png)
+
 ### Earlier
 
 Captured 2026-09-28, before the navigation above: the list was on the left
@@ -749,6 +762,26 @@ daemon learns nothing about projects; everything here is client work.
 - **Runs.** Thinking, tool calls and their output between two messages fold
   to one line: the call in progress with its clock, or the tools used, and
   any failure. A click opens a run or unfolds one long output.
+- **Plans.** An agent keeps its plan with the `plan` skill the app ships
+  ([SKILL.md](../app/skills/plan/SKILL.md)): its script replaces the whole
+  plan on each call, one step an argument marked `[x] ` done, `[>] ` doing
+  now or `[ ] ` to do (at most 30 steps of 200 bytes), and writes it whole
+  through a temporary and a rename to `STORE-plans/BOT_ID`, beside the
+  store the agent's shell names as `AGENT_STORE`, so a bot id never names
+  another store's agent. It answers a write with one line, not the plan
+  back, and `--clear` removes the plan once the work it describes is done.
+  The app reads the plans of the agents it seats when a window attaches,
+  and an agent's again when a shell call of its that ran the script ends:
+  nothing is watched or polled, and a plan left by an agent deleted from
+  another window is never read. For more than a few agents the app lists
+  the plans folder rather than looking each one up, so attaching costs the
+  plans that exist, not the agents in the store. An agent with a plan shows the step it is
+  on and how many are done on its row and its task card, and the whole
+  plan above its chat, whose count folds it to the current step. A
+  deleted agent's plan is removed. The coordinator's profile has a task of
+  several steps keep one. Plans are this machine's files: a window on a
+  host reads none, and one opened on a socket alone, whose store's path it
+  does not know, reads none and logs why.
 - **Side chats.** A side chat forks a bot, running or not, with no
   checkpoint, so the daemon copies it at its newest finished round; the
   source is untouched. The copy is named `NAME-side`, nests under its
@@ -1457,6 +1490,9 @@ AGENTS.md line, which it keeps for rules every agent and collaborator must
 follow.
 
 ## Skills the app ships
+
+The app ships two skills: `automation`, for recurring jobs, and `plan`, an
+agent's plan the app shows (see Projects and panes).
 
 Agents read only skills in a folder's `.agents/skills` or in
 `~/.agents/skills` ([client policy](CLIENT.md)). The app bundle carries its
