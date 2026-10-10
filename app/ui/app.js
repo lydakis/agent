@@ -24,7 +24,7 @@ const S = {
   // scanning the fleet on every event.
   botsGen: 0, shapeGen: 0, deleted: new Set(),
   // The tabs are the agents opened full screen, in order; Home is always there and is not one of them.
-  config: null, ui: { rail: true, side: null, tabs: [], picker: false, pickerSel: 0, pickerMode: 'agents', found: null, tabFile: null, help: false, steps: false, toast: null, menu: false, planFolded: {} },
+  config: null, ui: { rail: true, side: null, tabs: [], picker: false, pickerSel: 0, pickerMode: 'agents', found: null, tabFile: null, git: new Map(), gitFrom: new Map(), help: false, steps: false, toast: null, menu: false, planFolded: {} },
   // How Send reaches a working bot, the last pick from its menu (sticky across windows), and the
   // model each bot's next turns run on when it differs from the one it was created with.
   send: loadSend(), override: new Map(), effort: new Map(),
@@ -256,7 +256,7 @@ function learnEffort(b, record) { if ('effort' in record) b.reasoning = record.e
 // A new folder means its branch is read again, when the bot is next shown.
 function learnWorkspace(b, record) {
   const ws = record.workspace ?? null;
-  if (b.workspace !== ws) { b.workspace = ws; b.branch = undefined; }
+  if (b.workspace !== ws) { b.workspace = ws; b.branch = undefined; S.botsGen += 1; }
 }
 // A bot keeps its folder, so the app names one only for a bot that has none.
 const home = (b) => (b.workspace ? {} : { workspace: S.config.workspace });
@@ -330,8 +330,8 @@ const LEAD = '.lead';
 // or a row of its own; opening it opens Home.
 const HOME = 'home';
 // The agent the main pane shows: the one open, or at Home Home's agent once it exists.
-// A file tab shows no agent.
-const mainBot = () => fileOf(S.selected) != null ? '' : S.selected || (S.bots.has(HOME) ? HOME : '');
+// A file or Git tab shows no agent.
+const mainBot = () => pageOf(S.selected) ? '' : S.selected || (S.bots.has(HOME) ? HOME : '');
 const leadProject = (name) => name.length > LEAD.length && name.endsWith(LEAD) ? name.slice(0, -LEAD.length) : null;
 // Who sent a prompt that is not yours: another agent's turn, or the app on its own (`origin`), as
 // the daemon keeps them with the prompt.
@@ -434,9 +434,14 @@ const swarmOf = (key) => (typeof key === 'string' && key.startsWith(SWARM) ? S.s
 // A file in a tab is keyed by its path after a mark no bot name can hold, and is open while its tab is.
 const FILE = '▤';
 const fileOf = (key) => (typeof key === 'string' && key.startsWith(FILE) ? key.slice(FILE.length) : null);
-const isOpen = (key) => S.bots.has(key) || !!swarmOf(key) || fileOf(key) != null;
-// What the sidebar and the list below it follow: a file tab has nothing below it, so Home's.
-const opened = () => (fileOf(S.selected) != null ? '' : S.selected);
+// A Git tab is keyed the same way by the folder it shows.
+const GIT = '⎇';
+const gitOf = (key) => (typeof key === 'string' && key.startsWith(GIT) ? key.slice(GIT.length) : null);
+// A page tab: a file or a Git tab, which show no agent and have no composer.
+const pageOf = (key) => fileOf(key) != null || gitOf(key) != null;
+const isOpen = (key) => S.bots.has(key) || !!swarmOf(key) || pageOf(key);
+// What the sidebar and the list below it follow: a page tab has nothing below it, so Home's.
+const opened = () => (pageOf(S.selected) ? '' : S.selected);
 // A member is the bot the swarm pinned: another bot later given its name is not the swarm's.
 const memberBot = (sw, m) => { const b = bot(m); return b && b.id != null && b.id === sw.ids[m] ? b : null; };
 const swarmOfBot = (name) => { const sw = S.swarms.get(S.memberOf.get(name)); return sw && memberBot(sw, name) ? sw : null; };
@@ -765,6 +770,8 @@ async function onEvent(ev) {
       const wrote = !data.failed && !data.denied && call?.path && (call.name === 'write' || call.name === 'edit') ? joinPath(folderOf(name, turn), call.path) : null;
       if (shown && wrote === shown.full) openFile(shown.bot, shown.full, false);
       if (wrote != null && S.ui.tabFile?.full === wrote) { readTabFile(wrote, false); render(); }
+      // A step may have changed the repository a Git tab shows.
+      if (S.live) gitChanged(name);
       if (typeof data.node === 'number') {
         pushNode(t, { kind: 'node', node: data.node, callId: data.call_id, turn });
         if (call && (call.background || call.name === 'wait') && await loadWaitOrProc(name, data.node, call)) {
@@ -811,6 +818,7 @@ async function onEvent(ev) {
       if (S.live && status !== 'steered') { if (S.snapshot) S.heldNews.push([name, turn, status, from, undefined, origin, answered]); else turnNews(name, turn, status, from, undefined, origin, answered); }
       // A coordinator coming to rest hears what waited for it.
       if (S.wakes.has(name)) wakeSoon(name);
+      if (S.live) gitChanged(name);
       // A background command may outlive its turn; only a wait result says how it ended.
       break;
     }
@@ -1324,13 +1332,15 @@ function restore() {
 const keyIdentity = (k) => { const up = upOf(k); return [k, bot(k)?.id ?? null, up || null, up ? bot(up)?.id ?? null : null]; };
 const savedKey = (k, id) => {
   if (typeof k !== 'string') return null;
-  if (swarmOf(k) || fileOf(k) != null) return k;
+  if (swarmOf(k) || pageOf(k)) return k;
   const b = bot(k); return b && b.id != null && b.id === id ? k : null;
 };
 const sameKey = (entry) => { const [k, id, up, upId] = Array.isArray(entry) ? entry : []; return savedKey(k, id) ?? savedKey(up, upId); };
 function save() { const key = sessionKey(); if (!key) return; try { localStorage.setItem(key, JSON.stringify({ selected: S.selected, tabs: S.ui.tabs.map(keyIdentity), side: S.ui.side ? keyIdentity(S.ui.side) : null, rail: S.ui.rail, steps: S.ui.steps, override: [...S.override].map(([name, model]) => [name, bot(name)?.id ?? null, model]), effort: [...S.effort].map(([name, level]) => [name, bot(name)?.id ?? null, level]) })); } catch (_) {} }
 window.addEventListener('beforeunload', save);
 window.addEventListener('focus', markSeen);
+// Back in the window, a Git tab in view reads what changed meanwhile.
+window.addEventListener('focus', () => { const dir = gitOf(S.selected), g = dir != null ? S.ui.git.get(dir) : null; if (g?.state === 'ok') readGit(g); });
 
 // ---------- render ----------
 function inline(text) {
@@ -1772,6 +1782,240 @@ function renderFile(f = S.ui.file, el = $('side'), head = $('sidetitle'), pane =
   else Promise.all(opening.map((a) => a.finished.catch(() => {}))).then(() => { if (el.dataset.key === key) Rich.hydrate(el); });
 }
 
+// ---------- the Git tab ----------
+// A folder's repository the way lazygit lays it out: its changes, its last commits and its
+// worktrees on the left, the diff of the one chosen on the right. The app runs plain git there and
+// only reads; an agent commits its own work. A click on a diff line writes a note that goes to the
+// agent working in that folder as an ordinary message, naming the file and line.
+// Each open Git tab keeps its view while it is open; only the one in view is read again, when it
+// comes into view, on `r`, when the window comes back, and soon after an agent working in its
+// repository finishes a step.
+const GIT_PANELS = ['changes', 'commits', 'worktrees'];
+function gitTab(dir) {
+  let g = S.ui.git.get(dir);
+  if (!g) S.ui.git.set(dir, g = { dir, state: 'idle', error: '', view: null, panel: 'changes', sel: { changes: 0, commits: 0, worktrees: 0 }, diff: null, notes: new Map(), note: null, gen: 0, reading: false, again: false, timer: null, diffBusy: false, diffWant: false });
+  return g;
+}
+// What a row is, across reads: a change by its path, a commit by its sha, a worktree by its folder.
+const gitKeyOf = (panel, it) => (panel === 'changes' ? `c:${it.path}` : panel === 'commits' ? `s:${it.sha}` : `w:${it.path}`);
+const gitList = (g, panel = g.panel) => (g.view ? panel === 'changes' ? g.view.changes : panel === 'commits' ? g.view.commits : g.view.worktrees : []);
+const gitItem = (g) => gitList(g)[g.sel[g.panel]] ?? null;
+async function readGit(g) {
+  if (g.reading) { g.again = true; return; }
+  g.reading = true; clearTimeout(g.timer); g.timer = null;
+  if (g.state === 'idle') g.state = 'loading';
+  // The rows chosen stay chosen when they are still there.
+  const was = Object.fromEntries(GIT_PANELS.map((p) => { const it = gitList(g, p)[g.sel[p]]; return [p, it ? gitKeyOf(p, it) : null]; }));
+  try {
+    const view = await Daemon.gitView(g.dir);
+    Object.assign(g, { state: 'ok', view, error: '' });
+    for (const p of GIT_PANELS) {
+      const list = gitList(g, p), at = was[p] == null ? -1 : list.findIndex((it) => gitKeyOf(p, it) === was[p]);
+      g.sel[p] = at >= 0 ? at : Math.max(0, Math.min(g.sel[p], list.length - 1));
+    }
+    // At first the worktree shown is the one chosen.
+    if (was.worktrees == null) g.sel.worktrees = Math.max(0, view.worktrees.findIndex((w) => trimDir(w.path) === trimDir(view.root)));
+  } catch (e) { Object.assign(g, { state: 'error', error: String(e?.message ?? e) }); }
+  g.reading = false; g.gen += 1;
+  if (S.ui.git.get(g.dir) !== g) return;
+  if (g.again) { g.again = false; readGit(g); }
+  if (g.state === 'ok') readDiff(g, true);
+  render();
+}
+// Soon after an agent working in the repository in view finishes a step or a turn, once for a burst.
+function gitChanged(name) {
+  const dir = gitOf(S.selected), g = dir != null ? S.ui.git.get(dir) : null, ws = bot(name)?.workspace;
+  if (!g || !ws) return;
+  const root = trimDir(g.view?.root ?? dir);
+  if (trimDir(ws) !== trimDir(dir) && trimDir(ws) !== root && !ws.startsWith(`${root}/`)) return;
+  if (!g.timer) g.timer = setTimeout(() => { g.timer = null; readGit(g); }, 600);
+}
+// One diff read at a time: moving down a list fast reads the row it stops on, not every row passed.
+async function readDiff(g, fresh = false) {
+  const it = gitItem(g), of = it && g.panel !== 'worktrees' ? gitKeyOf(g.panel, it) : null;
+  if (of == null) { g.diff = null; return; }
+  if (!fresh && g.diff?.of === of) return;
+  // A diff read again keeps what it showed until the new one arrives.
+  const d = g.diff = { of, state: 'loading', rows: g.diff?.of === of ? g.diff.rows : [], more: 0, cut: false, error: '' };
+  if (it.path?.endsWith('/')) { Object.assign(d, { state: 'ok', rows: [{ k: 'meta', t: 'A folder holding another repository; its own Git tab shows it.' }] }); return; }
+  if (g.diffBusy) { g.diffWant = true; return; }
+  g.diffBusy = true;
+  try {
+    const got = await Daemon.gitDiff(g.panel === 'commits' ? { root: g.view.root, commit: it.sha } : { root: g.view.root, path: it.path, from: it.from ?? null, untracked: it.code === '??' });
+    if (g.diff === d) { const { rows, more } = diffRows(got.text, it.path ?? null); Object.assign(d, { state: 'ok', rows, more, cut: !!got.cut }); }
+  } catch (e) { if (g.diff === d) Object.assign(d, { state: 'error', error: String(e?.message ?? e) }); }
+  g.diffBusy = false;
+  if (g.diffWant) { g.diffWant = false; readDiff(g, true); }
+  if (S.ui.git.get(g.dir) === g) render();
+}
+// A diff as rows, each line numbered on its side: `o` before the change, `n` after. A commit's
+// diff holds several files, each row knowing its own (`p`). Past `DIFF_ROWS` rows only a count is kept.
+const DIFF_ROWS = 5000;
+function diffRows(text, path) {
+  const rows = []; let o = 0, n = 0, p = path, hunk = false, more = 0, from = null;
+  const lines = text.split('\n'); if (lines.at(-1) === '') lines.pop();
+  for (const l of lines) {
+    if (rows.length >= DIFF_ROWS) { more += 1; continue; }
+    if (l.startsWith('diff ')) { hunk = false; from = null; continue; }
+    if (!hunk) {
+      if (l.startsWith('--- ')) { from = l.slice(4); continue; }
+      if (l.startsWith('+++ ')) {
+        const to = l.slice(4), named = to === '/dev/null' ? from : to;
+        p = named && named !== '/dev/null' ? named.replace(/^[ab]\//, '') : p;
+        rows.push({ k: 'file', t: p ?? '' }); continue;
+      }
+      if (l.startsWith('index ')) continue;
+    }
+    if (l.startsWith('@@')) {
+      const m = /^@@+ -(\d+)(?:,\d+)? \+(\d+)/.exec(l); if (m) { o = Number(m[1]); n = Number(m[2]); }
+      hunk = true; rows.push({ k: 'hunk', t: l }); continue;
+    }
+    if (!hunk) { rows.push({ k: 'meta', t: l }); continue; }
+    const c = l[0];
+    if (c === '+') rows.push({ k: 'add', t: l, n: n++, p });
+    else if (c === '-') rows.push({ k: 'del', t: l, o: o++, p });
+    else if (c === ' ') rows.push({ k: 'ctx', t: l, o: o++, n: n++, p });
+    else rows.push({ k: 'meta', t: l });
+  }
+  return { rows, more };
+}
+// Who a note goes to: an agent working in the folder, the one its tab was opened from first, then
+// one working now, then the project's coordinator. A folder no agent works in takes no notes.
+// The agents by folder are gathered once per change to the fleet, not once per row.
+const workers = { gen: -1, by: new Map() };
+const trimDir = (dir) => (dir ? dir.replace(/\/+$/, '') || '/' : '');
+function gitOwner(dir) {
+  if (workers.gen !== S.botsGen) {
+    workers.gen = S.botsGen; workers.by = new Map();
+    for (const b of S.bots.values()) if (b.name !== HOME && b.workspace) { const d = trimDir(b.workspace); if (!workers.by.has(d)) workers.by.set(d, []); workers.by.get(d).push(b); }
+    for (const list of workers.by.values()) list.sort((a, b) => a.name.localeCompare(b.name));
+  }
+  const here = (workers.by.get(trimDir(dir)) ?? []).filter((b) => bot(b.name) === b), from = bot(S.ui.gitFrom.get(dir));
+  if (from && here.includes(from)) return from;
+  return here.find((b) => isActive(b.status)) ?? here.find((b) => leadProject(b.name)) ?? here[0] ?? null;
+}
+async function openGit(who) {
+  const b = bot(who), dir = b?.workspace; if (!dir) return;
+  if (S.config?.host) throw new Error(`git_local_only: the Git tab reads this machine's folders, and this window's agents run on ${S.config.host}`);
+  S.ui.gitFrom.set(dir, who);
+  await go(GIT + dir, 'tab');
+}
+const noteKey = (of, r) => `${of}\u0000${r.p ?? ''}\u0000${r.k === 'del' ? `o${r.o}` : `n${r.n}`}`;
+const NOTE_QUOTE = 300;
+// The note names the file and line as the agent's folder names them, quotes the line, then says
+// what was typed; a commit's names the commit too.
+function noteText(g, r, text) {
+  const root = trimDir(g.view.root), owner = gitOwner(g.dir);
+  const path = trimDir(owner?.workspace) === root ? r.p : `${root}/${r.p}`;
+  const it = gitItem(g), where = r.k === 'del' ? `${path}, line ${r.o} before the change (removed)` : `${path}:${r.n}`;
+  const line = r.t.slice(1), quote = line.length > NOTE_QUOTE ? `${line.slice(0, NOTE_QUOTE)}…` : line;
+  return `${g.panel === 'commits' ? `In commit ${it.sha.slice(0, 12)}, ` : ''}${where}\n> ${quote}\n${text}`;
+}
+async function sendNote(g, text) {
+  const note = g.note, d = g.diff, r = d?.rows[note?.row], owner = gitOwner(g.dir);
+  g.note = null;
+  if (!text || !r || !owner || d.of !== note.of) { render(); return; }
+  try {
+    // A note waits for a working agent's turn to end, as a queued message does.
+    await submit(noteText(g, r, text), 'main', owner.name, isActive(owner.status) ? 'queue' : 'send');
+    const key = noteKey(d.of, r); g.notes.set(key, [...(g.notes.get(key) ?? []), text]);
+    toast(`sent to ${shortName(owner)}`);
+  } catch (e) { g.note = note; g.draft = text; toast(String(e?.message ?? e), 4000); }
+  g.gen += 1; render(); focusInput('main');
+}
+function openNote(g, row) {
+  const d = g.diff, r = d?.rows[row]; if (!r || !['add', 'del', 'ctx'].includes(r.k)) return;
+  const owner = gitOwner(g.dir);
+  if (!owner) { toast('No agent works in this folder, so a note has no one to go to'); return; }
+  g.note = { row, of: d.of }; g.draft = ''; g.gen += 1; render();
+  setTimeout(() => $('gnote')?.focus(), 0);
+}
+// j/k and the arrows move, 1-3 or h/l choose a list, Enter opens what is chosen, o its agent, r reads again.
+async function gitKey(g, k) {
+  const list = gitList(g), i = g.sel[g.panel], it = list[i];
+  const move = (to) => { g.sel[g.panel] = Math.max(0, Math.min(list.length - 1, to)); g.note = null; g.gen += 1; readDiff(g); render(); scrollGitRow(); };
+  if (k === 'j' || k === 'ArrowDown') move(i + 1);
+  else if (k === 'k' || k === 'ArrowUp') move(i - 1);
+  else if (k === 'g' || k === 'Home') move(0);
+  else if (k === 'G' || k === 'End') move(list.length - 1);
+  else if (k === '1' || k === '2' || k === '3') gitPanel(g, GIT_PANELS[Number(k) - 1]);
+  else if (k === 'l' || k === 'ArrowRight') gitPanel(g, GIT_PANELS[(GIT_PANELS.indexOf(g.panel) + 1) % 3]);
+  else if (k === 'h' || k === 'ArrowLeft') gitPanel(g, GIT_PANELS[(GIT_PANELS.indexOf(g.panel) + 2) % 3]);
+  else if (k === 'r') readGit(g);
+  else if (k === 'o') { const owner = g.panel === 'worktrees' && it ? gitOwner(it.path) : gitOwner(g.dir); if (owner) await go(owner.name, 'tab'); }
+  else if (k === 'Enter' || k === 'e') await gitOpen(g, it);
+  else if (k === '?') showHelp();
+  else return false;
+  return true;
+}
+function gitPanel(g, panel) { if (g.panel === panel) return; g.panel = panel; g.note = null; g.gen += 1; readDiff(g); render(); scrollGitRow(); }
+// A change opens its file in a tab; a worktree opens its own Git tab.
+async function gitOpen(g, it) {
+  if (!it || !g.view) return;
+  if (g.panel === 'changes' && !it.path.endsWith('/') && !it.code.includes('D')) await go(`${FILE}${trimDir(g.view.root)}/${it.path}`, 'tab');
+  else if (g.panel === 'worktrees' && trimDir(it.path) !== trimDir(g.dir)) await go(GIT + it.path, 'tab');
+}
+function scrollGitRow() { $('log').querySelector('.gbox.on .gi.sel')?.scrollIntoView?.({ block: 'nearest' }); }
+const CHANGE_WORD = { M: 'modified', A: 'added', D: 'deleted', R: 'renamed', C: 'copied', U: 'in conflict', T: 'type changed', '?': 'new, not tracked' };
+const changeWord = (code) => [...new Set([...code.trim()].map((c) => CHANGE_WORD[c]).filter(Boolean))].join(', ');
+function gitRowsHTML(g, panel) {
+  const list = gitList(g, panel), sel = g.sel[panel];
+  const row = (i, inner, title = '') => `<button type="button" class="gi${i === sel ? ' sel' : ''}" data-gpanel="${panel}" data-gi="${i}"${title ? ` title="${esc(title)}"` : ''}>${inner}</button>`;
+  if (panel === 'changes') return list.map((c, i) => row(i, `<span class="m c${esc(c.code.trim()[0] ?? '')}">${esc(c.code.replace(/ /g, '·'))}</span><span class="p">${c.from ? `${esc(c.from)} → ` : ''}${esc(c.path)}</span>`, changeWord(c.code))).join('') + (g.view.more ? `<div class="gnote">the first ${list.length} changes; there are more</div>` : '') || '<div class="gnote">No changes.</div>';
+  if (panel === 'commits') return list.map((c, i) => row(i, `<span class="sha">${esc(c.sha.slice(0, 7))}</span><span class="p">${esc(c.subject)}</span><span class="who">${esc(c.when)}</span>`, `${c.author} · ${c.when}`)).join('') || '<div class="gnote">No commits yet.</div>';
+  const here = trimDir(g.view.root);
+  return list.map((w, i) => { const owner = gitOwner(w.path), cur = trimDir(w.path) === here; return row(i, `<span class="m">${cur ? '*' : ' '}</span><span class="p">${esc(w.branch ?? 'detached')}</span>${owner ? `<span class="who">${esc(shortName(owner))}</span>` : ''}`, w.path); }).join('');
+}
+function gitDiffHTML(g) {
+  const d = g.diff, it = gitItem(g);
+  if (g.panel === 'worktrees') {
+    if (!it) return '';
+    const owner = gitOwner(it.path), cur = trimDir(it.path) === trimDir(g.view.root);
+    return `<div class="ghead"><b>⎇ ${esc(it.branch ?? 'detached')}</b><br><span class="d">${esc(it.path)}</span></div><div class="gnote">${owner ? `${esc(shortName(owner))} works here. ` : ''}${cur ? 'This tab shows it.' : 'Enter opens its Git tab.'}${owner ? ' o opens the agent.' : ''}</div>`;
+  }
+  if (!it) return '';
+  const head = g.panel === 'commits'
+    ? `<div class="ghead"><span class="sha">${esc(it.sha.slice(0, 12))}</span> <b>${esc(it.subject)}</b><br><span class="d">${esc(it.author)} · ${esc(it.when)}</span></div>`
+    : `<div class="ghead"><b>${esc(it.path)}</b> <span class="d">· ${esc(changeWord(it.code))}${it.code.includes('D') || it.path.endsWith('/') ? '' : ' · Enter opens it'}</span></div>`;
+  if (!d || (d.state === 'loading' && !d.rows.length)) return `${head}<div class="gnote">reading…</div>`;
+  if (d.state === 'error') return `${head}<div class="line out bad">${esc(d.error)}</div>`;
+  const owner = gitOwner(g.dir), sent = (r) => (g.notes.get(noteKey(d.of, r)) ?? []).map((t) => `<div class="dsent">› ${esc(t)}</div>`).join('');
+  const rows = d.rows.map((r, i) => {
+    // A change's one file is named above it already.
+    if (r.k === 'file' && g.panel === 'changes') return '';
+    const line = r.k === 'add' || r.k === 'del' || r.k === 'ctx';
+    let h = `<div class="dl ${r.k}"${line && owner ? ` data-dl="${i}"` : ''}><span class="no">${r.o ?? ''}</span><span class="no">${r.n ?? ''}</span><span class="tx">${esc(r.t)}</span></div>`;
+    if (line) h += sent(r);
+    if (g.note?.row === i && g.note.of === d.of) h += `<div class="dcm"><input id="gnote" placeholder="Tell ${esc(shortName(owner))} about this line…" autocomplete="off" spellcheck="false" aria-label="Note on this line"><span class="to">↵ to ${esc(shortName(owner))} · Esc</span></div>`;
+    return h;
+  }).join('');
+  const tail = (d.more ? `<div class="gnote">${d.more} more lines</div>` : '') + (d.cut ? '<div class="gnote">The diff goes on; the rest is not shown.</div>' : '');
+  return `${head}<div class="diff">${rows || '<div class="gnote">No difference to show.</div>'}${tail}</div>`;
+}
+function renderGit(g, el = $('log'), head = $('title')) {
+  if (g.state === 'idle') readGit(g);
+  const v = g.view, branch = v?.branch ? `<span class="branch" title="${esc(v.root)}">⎇ ${esc(v.branch)}</span>` : '';
+  const owner = gitOwner(g.dir);
+  const hk = `git|${g.dir}|${v?.branch ?? ''}|${owner?.name ?? ''}|${S.shapeGen}`;
+  if (head.dataset.k !== hk) {
+    head.dataset.k = hk;
+    head.innerHTML = `<div class="crumbs">${crumbsHTML(S.selected)}${branch}${owner ? `<span class="state">notes go to <button type="button" class="back" data-act="open" data-who="${esc(owner.name)}">${esc(shortName(owner))}</button></span>` : ''}</div><div class="tools"><button type="button" class="ibtn" data-act="git-read" title="Read again (r)">↻</button></div>`;
+  }
+  const key = `git|${g.dir}|${g.gen}|${g.diff?.state ?? ''}|${g.diff?.rows.length ?? 0}|${owner?.name ?? ''}`;
+  if (el.dataset.key === key) return;
+  // A note being typed survives the view being drawn again.
+  const typed = $('gnote')?.value ?? g.draft ?? '';
+  const scroll = el.querySelector('.gmain .glist')?.scrollTop ?? 0, same = el.dataset.shows === `git|${g.dir}`;
+  el.dataset.key = key; el.dataset.who = ''; el.dataset.shows = `git|${g.dir}`;
+  if (g.state !== 'ok') { el.innerHTML = `<div class="gitview"><div class="gnote${g.state === 'error' ? ' bad' : ''}">${g.state === 'error' ? esc(g.error) : 'reading…'}</div></div>`; return; }
+  const box = (panel, n, title) => `<div class="gbox${g.panel === panel ? ' on' : ''}" data-gpanel="${panel}"><div class="gt"><span class="k">[${n}]</span> ${title} <span class="d">${gitList(g, panel).length}</span></div><div class="glist">${gitRowsHTML(g, panel)}</div></div>`;
+  const title = g.panel === 'commits' ? 'Commit' : g.panel === 'worktrees' ? 'Worktree' : 'Diff';
+  el.innerHTML = `<div class="gitview"><div class="gcol">${box('changes', 1, 'Changes')}${box('commits', 2, 'Commits')}${box('worktrees', 3, 'Worktrees')}</div><div class="gbox gmain"><div class="gt">${title}${owner ? '<span class="d"> · click a line to tell its agent</span>' : ''}</div><div class="glist">${gitDiffHTML(g)}</div></div></div>`;
+  if (same) { const m = el.querySelector('.gmain .glist'); if (m) m.scrollTop = scroll; }
+  const input = $('gnote'); if (input) { input.value = typed; if (document.activeElement === document.body || !document.activeElement) input.focus(); }
+  scrollGitRow();
+}
+
 // ---------- heads and composers ----------
 // One level up from an agent or a swarm: what made it, a swarm's agent its swarm, a task its project's
 // coordinator, and a coordinator or a bot in no project Home ('').
@@ -1782,7 +2026,7 @@ function upOf(key) {
   const c = creatorOf(b); if (c) return c.name === HOME ? '' : c.name;
   return b.project && bot(b.project + LEAD) ? b.project + LEAD : '';
 }
-const keyLabel = (key) => { const sw = swarmOf(key); if (sw) return `⁂ ${memberShort(sw, sw.name)}`; const full = fileOf(key); if (full != null) return full.split('/').pop() || full; const b = bot(key); return b ? shortName(b) : key; };
+const keyLabel = (key) => { const sw = swarmOf(key); if (sw) return `⁂ ${memberShort(sw, sw.name)}`; const full = fileOf(key); if (full != null) return full.split('/').pop() || full; const dir = gitOf(key); if (dir != null) return dir.replace(/\/+$/, '').split('/').pop() || dir; const b = bot(key); return b ? shortName(b) : key; };
 // The way down from Home to an agent, each step up a button. A long chain shows its two ends; the walk
 // up stops at a bound, so a chain of thousands costs that bound.
 const CRUMBS = 64;
@@ -1802,7 +2046,8 @@ function headHTML(b, pane) {
   if (pane === 'side') return `<div class="crumbs"><button type="button" class="back" data-act="close-side" title="Back to the list (Esc)" aria-label="Back to the list">←</button><b>${esc(shortName(b))}</b>${branchHTML(b)}${state}</div><div class="tools">${moreButton(b.name)}<button type="button" class="ibtn" data-act="full" title="Full screen (or double-click its row)">⤢ Full screen</button></div>`;
   return `<div class="crumbs">${crumbsHTML(b.name)}${branchHTML(b)}${state}</div><div class="tools">${moreButton(b.name)}</div>`;
 }
-const branchHTML = (b) => (b.branch ? `<span class="branch" title="${esc(b.workspace)}">⎇ ${esc(b.branch)}</span>` : '');
+// The branch opens the folder's Git tab.
+const branchHTML = (b) => (b.branch ? `<button type="button" class="branch" data-act="git" data-who="${esc(b.name)}" title="Git: ${esc(b.workspace)}">⎇ ${esc(b.branch)}</button>` : '');
 // A head names a few of the handles a bot waits on and counts the rest, so its cost stays bounded.
 const WAIT_SHOWN = 3;
 function waitSummary(b) {
@@ -2265,7 +2510,7 @@ function botRowHTML(n) {
 // ---------- tabs ----------
 // Home, then a tab for each agent opened full screen. They are redrawn only when one opens, closes,
 // is chosen, or changes state or name (a task whose coordinator is gone is named in full).
-const tabState = (k) => { if (fileOf(k) != null) return 'file'; const sw = swarmOf(k); return sw ? swarmStatus(sw) : shownStatus(bot(k)); };
+const tabState = (k) => { if (fileOf(k) != null) return 'file'; if (gitOf(k) != null) return 'git'; const sw = swarmOf(k); return sw ? swarmStatus(sw) : shownStatus(bot(k)); };
 function renderTabs() {
   const tabs = S.ui.tabs.filter(isOpen), states = tabs.map(tabState), labels = tabs.map(keyLabel);
   // Away from Home, its button carries Home's agent's state, as a tab would: running, waiting, done or failed.
@@ -2275,7 +2520,7 @@ function renderTabs() {
   const home = `<button type="button" class="homebtn${S.selected ? '' : ' on'}" data-act="home" title="Home${hs === 'idle' ? '' : ` · ${labelOf(hs)}`}">${hs === 'idle' ? '⌂' : `<span class="glyph ${hs}">${glyphOf(hs)}</span>`} Home</button>`;
   el.innerHTML = home + (tabs.length ? '<span class="tabsep"></span>' : '') + tabs.map((k, i) => {
     const on = k === S.selected, label = esc(labels[i]);
-    return `<div class="wtab${on ? ' on' : ''}" role="tab" aria-selected="${on}" tabindex="0" data-tab="${esc(k)}" title="${esc(fileOf(k) ?? k)}"><span class="glyph ${states[i]}">${states[i] === 'file' ? FILE : glyphOf(states[i])}</span><span class="tl">${label}</span><button type="button" class="x" data-act="close-tab" data-who="${esc(k)}" aria-label="Close ${label}">×</button></div>`;
+    return `<div class="wtab${on ? ' on' : ''}" role="tab" aria-selected="${on}" tabindex="0" data-tab="${esc(k)}" title="${esc(fileOf(k) ?? gitOf(k) ?? k)}"><span class="glyph ${states[i]}">${states[i] === 'file' ? FILE : states[i] === 'git' ? GIT : glyphOf(states[i])}</span><span class="tl">${label}</span><button type="button" class="x" data-act="close-tab" data-who="${esc(k)}" aria-label="Close ${label}">×</button></div>`;
   }).join('');  // Past the bar's width the tabs scroll, and the one on screen stays in view.
   el.querySelector('.wtab.on')?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
 }
@@ -2285,6 +2530,7 @@ function keybarHTML(b) {
   const dot = `<span><span class="dot${!S.attached ? ' off' : busy ? ' busy' : ''}"></span>${!S.attached ? 'detached' : 'live'}</span>`;
   const keys = [];
   if (S.ui.picker) keys.push('<kbd>↑↓</kbd> choose', '<kbd>Enter</kbd> open', '<kbd>Esc</kbd> cancel');
+  else if (gitOf(S.selected) != null) keys.push('<kbd>j k</kbd> move', '<kbd>1–3</kbd> lists', '<kbd>Enter</kbd> open', '<kbd>click a line</kbd> note', '<kbd>r</kbd> read again');
   else { keys.push('<kbd>^k</kbd> find', '<kbd>⌘P</kbd> files'); if (S.ui.side) keys.push('<kbd>Esc</kbd> close'); else if (busy) keys.push('<kbd>Esc</kbd> stop'); }
   return `${dot}${S.ui.toast ? `<span class="toast">${esc(S.ui.toast)}</span>` : ''}<span class="spacer"></span>${keys.join('<span> </span>')}<span><kbd>?</kbd> keys</span>`;
 }
@@ -2313,14 +2559,18 @@ function render() {
   followDrafts();
   markSeen();
   renderTabs();
-  const tab = fileOf(S.selected);
+  const tab = fileOf(S.selected), gtab = gitOf(S.selected);
   if (tab == null) dropTabFile(); else if (S.ui.tabFile?.full !== tab) readTabFile(tab);
+  // A closed Git tab lets its view go.
+  for (const dir of S.ui.git.keys()) if (!S.ui.tabs.includes(GIT + dir)) { clearTimeout(S.ui.git.get(dir).timer); S.ui.git.delete(dir); }
+  $('log').classList.toggle('gitpane', gtab != null); $('title').classList.toggle('wide', gtab != null);
   // Each plan before its chat, so a chat that follows its end measures what is left once the plan is drawn.
   renderPlan($('plan'), sw ? null : b); renderPlan($('sideplan'), side);
   if (sw) { renderSwarmHead($('title'), sw); renderSwarm($('log'), sw); }
   else if (tab != null) renderFile(S.ui.tabFile, $('log'), $('title'), 'main');
+  else if (gtab != null) renderGit(gitTab(gtab));
   else { renderHead($('title'), b, 'main'); if (b) renderTranscript($('log'), b.name); else renderHome($('log')); }
-  $('form').hidden = tab != null;
+  $('form').hidden = pageOf(S.selected);
   // New project belongs to Home's list, which a file tab shows too.
   $('newproj').hidden = !!opened();
   if (S.ui.rail) renderRail();
@@ -2357,6 +2607,7 @@ function searchFolder() {
   if (pickerPane === 'side' && S.ui.file) return dirOf(S.ui.file.full);
   const beside = pickerPane === 'side' && S.ui.side;
   const tab = beside ? null : fileOf(S.selected); if (tab != null) return dirOf(tab);
+  const gtab = beside ? null : gitOf(S.selected); if (gtab != null) return gtab;
   const key = beside ? S.ui.side : mainBot();
   const sw = swarmOf(key); if (sw) return sw.workspace ?? null;
   return bot(key)?.workspace ?? S.config?.workspace ?? null;
@@ -2448,7 +2699,7 @@ let helpPane = 'main';
 async function showHelp(pane = 'main') {
   helpPane = pane;
   // Open at once so Esc closes it; the list is read now, so an edited ~/.agent/models shows without a restart.
-  const shown = S.ui.help = {}; const text = (models) => { $('helptext').innerHTML = `<b>keys</b>\n ^k   find an agent     ^b   sidebar\n ⌘P   find a file in the repository in view\n ^p   next task beside  Esc  close beside · stop\n ^o   all steps         ^d   detach (close)\n ↑ ↓  previous / next bot   ^,   settings\n Enter sends · Shift-Enter a new line\n A row: click to look in, double-click for a tab\n\n /new NAME PROVIDER/MODEL [EFFORT]  create a bot\n${models}\n<i>any key closes this</i>`; };
+  const shown = S.ui.help = {}; const text = (models) => { $('helptext').innerHTML = `<b>keys</b>\n ^k   find an agent     ^b   sidebar\n ⌘P   find a file in the repository in view\n ^p   next task beside  Esc  close beside · stop\n ^o   all steps         ^d   detach (close)\n ↑ ↓  previous / next bot   ^,   settings\n Enter sends · Shift-Enter a new line\n A row: click to look in, double-click for a tab\n\n<b>a Git tab</b> (an agent's ⋯ › Git, or its ⎇ branch)\n j k  move    1 2 3  changes, commits, worktrees\n Enter opens the file or worktree · o its agent\n r    read again · click a diff line to tell its agent\n\n /new NAME PROVIDER/MODEL [EFFORT]  create a bot\n${models}\n<i>any key closes this</i>`; };
   text('   reading ~/.agent/models'); $('helpwrap').classList.add('on');
   let models; try { const list = await Daemon.models(); models = list.length ? list.map((m) => `   ${esc(m.id)}`).join('\n') : '   none listed: Settings lists your providers\' models'; } catch (e) { models = `   ${esc(String(e?.message ?? e))}`; }
   if (S.ui.help === shown) text(models);
@@ -2509,6 +2760,8 @@ function botMenuItems(name) {
     // A swarm runs on this machine: its board is the app's files and its agents run the app's scripts.
     ...(leadProject(name) ? [{ act: 'new-swarm', who: name, label: 'New swarm', hint: S.config?.host ? 'local only' : '⁂', disabled: !!S.config?.host }, { sep: true }] : []),
     { act: 'side-chat', who: name, label: 'Side chat', hint: '⑂', disabled: b.id == null },
+    // Its folder's repository: what changed, as diffs a note on a line comes back from.
+    { act: 'git', who: name, label: 'Git', hint: S.config?.host ? 'local only' : GIT, disabled: !b.workspace || !!S.config?.host },
     { act: 'stop', who: name, label: 'Stop', disabled: b.runningTurn === null },
     { act: 'fork', who: name, label: 'Fork', hint: busy ? 'when idle' : '', disabled: busy },
     { act: 'delete', who: name, label: 'Delete', hint: busy ? 'when idle' : '', disabled: busy },
@@ -2581,7 +2834,7 @@ async function modelMenu(pane, anchor) {
 // ---------- actions ----------
 // `to` is the bot the text was typed for, which is the one it goes to even if the pane has since
 // been pointed at another.
-async function submit(text, pane = 'main', to = PANE[pane].bot()) {
+async function submit(text, pane = 'main', to = PANE[pane].bot(), how = null) {
   if (pane === 'main' && text.startsWith('/new ')) {
     const [name, model, effort] = text.slice(5).trim().split(/\s+/);
     if (!name) throw new Error('name_required');
@@ -2606,7 +2859,7 @@ async function submit(text, pane = 'main', to = PANE[pane].bot()) {
   const b = bot(to); if (!b) throw new Error('no bot selected; /new NAME PROVIDER/MODEL [EFFORT] creates one');
   // An event can seat a bot before its snapshot identity arrives. Never send an unpinned name.
   if (b.id == null) throw new Error('bot_identity_pending: wait for attachment to finish');
-  const mode = sendMode(b), model = S.override.get(b.name), effort = S.effort.get(b.name), delivery = mode === 'send' ? 'reject' : mode;
+  const mode = how ?? sendMode(b), model = S.override.get(b.name), effort = S.effort.get(b.name), delivery = mode === 'send' ? 'reject' : mode;
   if (mode === 'side') { await sideChat(b.name, text); return; }
   // A steer joins the running turn only on that turn's model, effort and folder, so it names none.
   // It also names the turn on screen, so a turn that ended meanwhile refuses it as stale_turn
@@ -3093,6 +3346,7 @@ async function go(name, how = 'here') {
     if (name && !tabs.includes(name)) { if (how === 'tab' || at < 0) tabs.push(name); else tabs[at] = name; }
     S.selected = name; S.ui.side = null;
     const sw = swarmOf(name); if (sw) { readBoard(sw); readUsage(sw); }
+    const dir = gitOf(name); if (dir != null && S.ui.git.get(dir)?.state === 'ok') readGit(S.ui.git.get(dir));
   }
   await enqueue(loadVisible); render(); save();
   focusInput(S.ui.side && how === 'beside' ? 'side' : 'main');
@@ -3109,9 +3363,9 @@ async function nextBeside() {
   const next = ps[(ps.indexOf(S.ui.side) + 1) % ps.length]; if (next !== S.ui.side) await go(next, 'beside');
 }
 // Late, after a load: by then the finder or a sheet may have opened, and it keeps the keyboard.
-// A file tab has no composer, so the keyboard goes to its tab.
+// A page tab has no composer, so the keyboard goes to its tab.
 function focusInput(pane) {
-  const el = pane === 'main' && fileOf(S.selected) != null ? $('tabs').querySelector('.wtab.on') : $(PANE[pane].input);
+  const el = pane === 'main' && pageOf(S.selected) ? $('tabs').querySelector('.wtab.on') : $(PANE[pane].input);
   if (el) setTimeout(() => { if (!covered()) el.focus({ preventScroll: true }); }, 0);
 }
 
@@ -3160,6 +3414,17 @@ document.addEventListener('keydown', async (e) => {
   if (S.ui.picker || e.target.id === 'pickerq') return;
   const k = e.key, ctrl = e.ctrlKey || e.metaKey;
   if (S.ui.menu) { if (k === 'Escape') { closeMenu(); e.preventDefault(); } return; }
+  // A note on a diff line: Enter sends it, Escape puts it away.
+  const gdir = gitOf(S.selected), g = gdir != null ? S.ui.git.get(gdir) : null;
+  if (e.target.id === 'gnote') {
+    if (!g) return;
+    if (k === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); await sendNote(g, e.target.value.trim()); }
+    else if (k === 'Escape') { e.preventDefault(); g.note = null; g.draft = ''; g.gen += 1; render(); focusInput('main'); }
+    return;
+  }
+  // In a Git tab its keys act wherever the keyboard is, but in a field, on a button, or on another tab.
+  const ontab = e.target.closest?.('[data-tab]');
+  if (g && !ctrl && !e.altKey && !e.target.closest?.('input, textarea, select, [data-act]') && (!ontab || ontab.dataset.tab === S.selected) && await gitKey(g, k)) { e.preventDefault(); return; }
   // A tab is chosen with Enter or Space, as a button is; its close button keeps its own keys.
   const tab = e.target.closest?.('[data-tab]');
   if (tab && (k === 'Enter' || k === ' ') && !e.target.closest('[data-act]')) { await go(tab.dataset.tab); e.preventDefault(); return; }
@@ -3180,9 +3445,9 @@ document.addEventListener('keydown', async (e) => {
     if (i >= 0) await go(names[i]);
     e.preventDefault(); return;
   }
-  // A key typed outside a field goes to the composer; a file tab has none, so there only ? (keys) acts.
+  // A key typed outside a field goes to the composer; a page tab has none, so there only ? (keys) acts.
   if (!inputIds.has(e.target.id) && k.length === 1 && !ctrl && !e.altKey) {
-    if (fileOf(S.selected) == null) $('input').focus();
+    if (!pageOf(S.selected)) $('input').focus();
     else if (k === '?') { showHelp(); e.preventDefault(); }
   }
 });
@@ -3225,6 +3490,8 @@ async function act(el) {
     case 'close-side': if (S.ui.side) await go(S.ui.side, 'beside'); return;
     case 'plan-fold': S.ui.planFolded[v] = !S.ui.planFolded[v]; render(); return;
     case 'close-file': closeFile(); return;
+    case 'git': await openGit(who); return;
+    case 'git-read': { const dir = gitOf(S.selected); if (dir != null) readGit(gitTab(dir)); return; }
     // The file beside becomes a tab, and the pane beside closes.
     case 'file-tab': { const f = S.ui.file; if (!f) return; dropFile(); await go(FILE + f.full, 'tab'); return; }
     case 'new-project': await openProjectSheet(); return;
@@ -3286,6 +3553,20 @@ document.addEventListener('click', async (e) => {
   if (button) { if (!button.disabled) { try { await act(button); } catch (err) { failed(err); } } return; }
   if (e.target.closest('#setupwrap')) return;
   if (e.target.closest('#menu')) return;
+  // In a Git tab a row is chosen, a double-click opens it, and a diff line takes a note.
+  const gdir = gitOf(S.selected), g = gdir != null ? S.ui.git.get(gdir) : null;
+  if (g && e.target.closest('#log')) {
+    const gi = e.target.closest('[data-gi]'), dl = e.target.closest('[data-dl]'), box = e.target.closest('.gbox[data-gpanel]');
+    if (gi) {
+      const panel = gi.dataset.gpanel, i = Number(gi.dataset.gi), again = g.panel === panel && g.sel[panel] === i;
+      if (!again) { g.panel = panel; g.sel[panel] = i; g.note = null; g.gen += 1; readDiff(g); render(); }
+      if (again && e.detail === 2) await gitOpen(g, gitItem(g));
+      return;
+    }
+    if (dl) { if (window.getSelection?.()?.isCollapsed !== false) openNote(g, Number(dl.dataset.dl)); return; }
+    if (e.target.closest('.dcm')) return;
+    if (box) gitPanel(g, box.dataset.gpanel);
+  }
   const step = e.target.closest('[data-out], [data-run]'), task = e.target.closest('[data-task]'), row = e.target.closest('[data-bot]'), tab = e.target.closest('[data-tab]');
   if (step) toggleStep(step);
   else if (task) { await go(task.dataset.task, 'beside'); return; }

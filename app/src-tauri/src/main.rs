@@ -16,6 +16,7 @@
 
 mod daemon;
 mod files;
+mod git;
 mod memory;
 mod plan;
 mod project;
@@ -498,6 +499,69 @@ async fn list_files(
         .await
         .map_err(|e| e.to_string())??;
     Ok(json!({"root": listing.root, "files": listing.files, "more": listing.more}))
+}
+
+/// What the Git tab shows of the repository `dir` is in: its changes, its
+/// last commits and its worktrees. Only this machine's: a window on a host
+/// is refused.
+#[tauri::command]
+async fn git_view(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    dir: String,
+) -> Result<Value, String> {
+    windows.of(&window)?.here("The Git tab")?;
+    let dir = file_path(&dir, std::env::var_os("HOME"))?;
+    let view = blocking(move || git::view(&dir)).await?;
+    let changes: Vec<Value> = view
+        .changes
+        .iter()
+        .map(|c| json!({"code": c.code, "path": c.path, "from": c.from}))
+        .collect();
+    let commits: Vec<Value> = view
+        .commits
+        .iter()
+        .map(|c| json!({"sha": c.sha, "subject": c.subject, "author": c.author, "when": c.when}))
+        .collect();
+    let worktrees: Vec<Value> = view
+        .worktrees
+        .iter()
+        .map(|w| json!({"path": w.path, "branch": w.branch}))
+        .collect();
+    Ok(json!({
+        "root": view.root,
+        "branch": view.branch,
+        "changes": changes,
+        "more": view.more,
+        "commits": commits,
+        "worktrees": worktrees,
+    }))
+}
+
+/// The diff of one change under `root`, or of one commit (`commit`).
+#[tauri::command]
+async fn git_diff(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    root: String,
+    path: Option<String>,
+    from: Option<String>,
+    untracked: Option<bool>,
+    commit: Option<String>,
+) -> Result<Value, String> {
+    windows.of(&window)?.here("The Git tab")?;
+    let root = file_path(&root, std::env::var_os("HOME"))?;
+    let target = match (commit, path) {
+        (Some(sha), _) => git::Target::Commit(sha),
+        (None, Some(path)) => git::Target::Change {
+            path,
+            from,
+            untracked: untracked.unwrap_or(false),
+        },
+        (None, None) => return Err("a path or a commit".to_owned()),
+    };
+    let diff = blocking(move || git::diff(&root, &target)).await?;
+    Ok(json!({"text": diff.text, "cut": diff.cut}))
 }
 
 fn file_path(path: &str, home: Option<std::ffi::OsString>) -> Result<std::path::PathBuf, String> {
@@ -1490,6 +1554,8 @@ fn main() {
             open_link,
             read_file,
             list_files,
+            git_view,
+            git_diff,
             branch,
             models,
             project,
