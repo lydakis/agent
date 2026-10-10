@@ -709,16 +709,17 @@ daemon learns nothing about projects; everything here is client work.
   own `~/.agents/agents/home.md`) or the one the app ships
   ([home.md](../app/agents/home.md)). The shipped text has it answer what is
   running, what finished and what waits on the person from `agent ls`,
-  `turns` and `wait --timeout-ms 0`, filtered to what the question needs
-  (the agents not at rest, one project's, the leads whose chats hold what
-  their tasks finished, an agent's last turns) so a large
+  `approvals`, `turns` and `wait --timeout-ms 0`, filtered to what the
+  question needs (the agents not at rest, the calls waiting on an approval,
+  one project's agents, the leads, an agent's last turns) so a large
   fleet stays under the shell's output limit, hand a project's work to its lead with
   `run --detach --delivery queue`, change no files and start no agents of
   its own. Until it exists, Home says what it is for, and the first message
   sent there opens **Start Home**, a model and an effort as every agent
   takes, then creates it and sends that message; Cancel puts the message
   back in the composer. At Home the main pane is its chat, its head
-  "Home" with its state; it is never a row in the list or a tab, and
+  "Home" with its state, and away from Home the Home button shows that
+  state (working, waiting, done, failed); it is never a row in the list or a tab, and
   opening it by name, from the finder or a crumb, opens Home. What it made
   sits a level below it, reached from the finder. Home's agent is local
   only, as projects are. It has no heartbeat or stand-up yet: those come

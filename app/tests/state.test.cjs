@@ -1652,6 +1652,17 @@ test("Home's agent is Home: no row, no tab, no crumb, and a closed Start Home gi
   const head = p.context.document.getElementById('title');
   p.renderHead(head, p.S.bots.get('home'), 'main');
   assert.match(head.innerHTML, /^<div class="crumbs"><b>Home<\/b><span class="glyph/);
+  // Away from Home, its button says what Home's agent is doing, and that it finished.
+  const homebtn = () => p.context.document.getElementById('tabs').innerHTML.match(/<button[^>]*class="homebtn[^"]*"[^>]*>.*?<\/button>/)[0];
+  p.S.bots.get('home').status = 'running'; p.renderTabs();
+  assert.doesNotMatch(homebtn(), /glyph/, 'at Home its chat is on screen');
+  p.S.selected = 'app.lead'; p.renderTabs();
+  assert.match(homebtn(), /<span class="glyph running">/);
+  p.S.bots.get('home').status = 'idle'; p.S.unseen.add('home'); p.renderTabs();
+  assert.match(homebtn(), /<span class="glyph done">✔<\/span> Home/);
+  p.S.unseen.delete('home'); p.renderTabs();
+  assert.match(homebtn(), />⌂ Home</);
+  p.S.selected = '';
   // Before Home's agent exists, Cancel puts the message back in the composer.
   const q = shell({ models: async () => [], settings: async () => ({ providers: [], keys: [] }) });
   await q.submit('hello');

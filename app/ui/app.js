@@ -2239,9 +2239,11 @@ function botRowHTML(n) {
 const tabState = (k) => { const sw = swarmOf(k); return sw ? swarmStatus(sw) : shownStatus(bot(k)); };
 function renderTabs() {
   const tabs = S.ui.tabs.filter(isOpen), states = tabs.map(tabState), labels = tabs.map(keyLabel);
-  const key = `${S.selected}|${tabs.map((k, i) => `${k}\u0000${states[i]}\u0000${labels[i]}`).join('\u0000')}`;
+  // Away from Home, its button carries Home's agent's state, as a tab would: running, waiting, done or failed.
+  const hb = S.selected && bot(HOME), hs = hb ? shownStatus(hb) : 'idle';
+  const key = `${S.selected}|${hs}|${tabs.map((k, i) => `${k}\u0000${states[i]}\u0000${labels[i]}`).join('\u0000')}`;
   const el = $('tabs'); if (el.dataset.k === key) return; el.dataset.k = key;
-  const home = `<button type="button" class="homebtn${S.selected ? '' : ' on'}" data-act="home" title="Home">⌂ Home</button>`;
+  const home = `<button type="button" class="homebtn${S.selected ? '' : ' on'}" data-act="home" title="Home${hs === 'idle' ? '' : ` · ${labelOf(hs)}`}">${hs === 'idle' ? '⌂' : `<span class="glyph ${hs}">${glyphOf(hs)}</span>`} Home</button>`;
   el.innerHTML = home + (tabs.length ? '<span class="tabsep"></span>' : '') + tabs.map((k, i) => {
     const on = k === S.selected, label = esc(labels[i]);
     return `<div class="wtab${on ? ' on' : ''}" role="tab" aria-selected="${on}" tabindex="0" data-tab="${esc(k)}" title="${esc(k)}"><span class="glyph ${states[i]}">${glyphOf(states[i])}</span><span class="tl">${label}</span><button type="button" class="x" data-act="close-tab" data-who="${esc(k)}" aria-label="Close ${label}">×</button></div>`;
