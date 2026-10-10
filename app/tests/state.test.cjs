@@ -1384,6 +1384,7 @@ test('Home lists the threads its agent started beside the projects, and hears of
   };
   await turn('home.notes', 1);
   await turn('home.notes.probe', 1); // not Home's thread
+  await turn('web.lead', 1); // a project Home made: its lead's turns are its own
   await p.tick();
   assert.equal(sent.length, 1);
   assert.equal(sent[0].bot, 'home'); assert.equal(sent[0].origin, 'tasks');

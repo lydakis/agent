@@ -1068,7 +1068,8 @@ function enqueue(job) { chain = chain.then(job, job); return chain; }
 const WAKE_MS = 10 * 60 * 1000, WAKE_TASKS = 32, KINDS = ['act', 'theirs'];
 function tellLead(name, turn, status, from, approval, origin) {
   const b = bot(name), lead = b && creatorOf(b);
-  if (!lead || !coordinates(lead.name) || name.startsWith(`${lead.name}-`)) return;
+  // A coordinator heads its own project, whoever made it: its turns are no one's task updates.
+  if (!lead || !coordinates(lead.name) || leadProject(name) || name.startsWith(`${lead.name}-`)) return;
   if (lead.waitingOn?.includes(`turn:${name}/${turn}`)) return;
   let w = S.wakes.get(lead.name);
   if (!w) { w = { tasks: new Map(), last: 0, timer: null }; S.wakes.set(lead.name, w); }
