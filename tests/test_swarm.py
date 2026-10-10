@@ -134,6 +134,17 @@ class SwarmTests(ModelFixture):
         self.assertEqual(failed['error'], 'setup_failed')
         self.assertIn('could not run', failed['detail'])
         self.assertFalse((self.home / '.agent/worktrees/r.widget-2').exists())
+        # The profile the agents get is the worktree's, not an edit not yet committed.
+        (repo / '.agents/setup').unlink()
+        (repo / '.agents/agents').mkdir()
+        (repo / '.agents/agents/narrow.md').write_text('---\ntools: [read]\n---\n')
+        git('add', '-A')
+        git('commit', '-qm', 'narrow')
+        (repo / '.agents/agents/narrow.md').write_text('---\ntools: [read, shell]\n---\n')
+        failed = self.swarm('r.lead', 'start', '--agents', '1', '--row', 'openai/synthetic-model,100,narrow', '--', 'Ship the widget')
+        self.assertEqual(failed['error'], 'identity_without_shell')
+        self.assertFalse((self.home / '.agent/worktrees/r.widget-2').exists())
+        self.assertNotIn('agent/r.widget-2', git('branch').stdout.decode())
         self.assertEqual([s['swarm'] for s in self.person('list')['swarms']], ['r.widget'])
 
     def test_publication_is_silent_and_mentions_deliver_only_to_named_members(self):
@@ -218,8 +229,11 @@ class SwarmTests(ModelFixture):
         (Path(started['board']).parent / 'state.json').unlink()
         again = self.person('status', '--swarm', 'p.widget')
         self.assertEqual((again['tasks'], again['result']), (done['tasks'], done['result']))
+        # A new assignment reopens the work, and its answer says so.
+        self.assertIs(self.swarm('p.widget-2', 'assign', 'next', 'widget-2', 'widget-1', 'One more check')['completed'], False)
+        self.swarm('p.widget-1', 'finish', 'partial', 'One conditional finding, no measured speedup; next is open')
         kinds = [line.get('kind', 'post') for line in self.board(started)]
-        self.assertEqual(kinds, ['post', 'post', 'assign', 'claim', 'submit', 'review', 'finish'])
+        self.assertEqual(kinds, ['post', 'post', 'assign', 'claim', 'submit', 'review', 'finish', 'assign', 'finish'])
 
     def test_an_added_agent_takes_the_row_a_deleted_one_left(self):
         row = 'openai/synthetic-model,50'
@@ -480,6 +494,14 @@ class SwarmRuleTests(unittest.TestCase):
         again.append([])
         again.board.close()
         self.assertEqual(json.loads((folder / 'state.json').read_text())['roles'], {'w-1': 'profiler'})
+
+    def test_your_post_that_wakes_someone_is_news_after_quiet_even_refolded(self):
+        state = self.s.empty_state()
+        self.s.apply(state, {'from': 'swarm', 'kind': 'quiet'})
+        self.s.apply(state, {'from': 'user', 'text': '@w-9 typo', 'sent': 0})
+        self.assertTrue(state['told'])
+        self.s.apply(state, {'from': 'user', 'text': 'carry on', 'sent': 3})
+        self.assertFalse(state['told'])
 
     def test_the_mix_is_dealt_to_the_row_furthest_below_its_share(self):
         mix = [{'share': 50}, {'share': 25}, {'share': 25}]

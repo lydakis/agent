@@ -307,6 +307,12 @@ def write_json(path, value):
         f.flush()
         os.fsync(f.fileno())
     os.replace(temporary, path)
+    # The rename too, so a pin or a stop outlives a power cut.
+    directory = os.open(os.path.dirname(path), os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def empty_state():
@@ -351,8 +357,9 @@ def apply(state, line):
         state['warned'][str(line['id'])] = line['spent']
     elif me == 'budget':
         state['spent'] = line['spent']
-    if me not in ('user', 'budget', 'swarm'):
-        # A member acted, so something ran since the swarm last went quiet.
+    if me not in ('user', 'budget', 'swarm') or (me == 'user' and line.get('sent')):
+        # A member acted, or your post woke one, so something ran since the
+        # swarm last went quiet.
         state['told'] = False
 
 
@@ -691,7 +698,7 @@ def run_act(daemon, folder, author, verb, args):
         leave(act)
     if act.lines and act.lines[0].get('kind') in ('assign', 'claim', 'submit', 'review', 'leave'):
         task = act.lines[0]['stream']
-        act.answer.update(task=task, completed=act.state['result'] is not None)
+        act.answer['task'] = task
     if author:
         for line in act.lines:
             line.update(bot=author, turn=int(os.environ.get('AGENT_TURN') or 0) or None)
@@ -705,7 +712,9 @@ def run_act(daemon, folder, author, verb, args):
     act.answer['board_changed'] = bool(act.lines)
     folder.append(act.lines)
     if act.answer.get('task'):
-        act.answer['status'] = act.state['tasks'][act.answer['task']]['status']
+        # As the board stands after this act: an assignment clears a result.
+        act.answer.update(status=act.state['tasks'][act.answer['task']]['status'],
+                          completed=act.state['result'] is not None)
     deliver(daemon, act, folder, members)
     return act.answer
 
@@ -1052,6 +1061,15 @@ def start(daemon, args):
                 raise
     else:
         raise Refused('swarm_exists', '%s and the names before it are taken; give the goal other words' % name)
+    if asked['shared']:
+        # The profiles the agents get are the worktree's, after its setup.
+        try:
+            for row in asked['mix']:
+                has_shell(workspace, row)
+        except Refused:
+            os.rmdir(folder)
+            unplace(name, asked['folder'])
+            raise
     n = asked['agents']
     names = ['%s-%d' % (name, i) for i in range(1, n + 1)]
     rows = deal(asked['mix'], n)

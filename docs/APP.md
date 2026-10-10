@@ -861,8 +861,11 @@ daemon learns nothing about projects; everything here is client work.
     `agent-notes/swarm-skills/` in the project's notes, not this repository.
   - **Customizing.** Copy the skill folder into `.agents/skills/` under
     another name and edit the copy; the thresholds sit at the top of
-    `swarm`, the rules in `member.md`. The app runs your
-    `~/.agents/skills/swarm/swarm` when there is one, else its own.
+    `swarm`, the rules in `member.md`. A coordinator using the copy runs
+    its script, but the app's Start, Post, Add, Stop and quiet check run
+    your `~/.agents/skills/swarm/swarm` when there is one, else its own;
+    `swarm.json` does not name a script for the app to run. To change what
+    the app does too, edit that one.
 - **Work and results.** The board is the shared place for deliverable decisions,
   changes of approach, progress and results, all visible in the app. There is
   no separate planning file. The skill's `member.md` defines how agents

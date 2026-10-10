@@ -65,4 +65,6 @@ handoff or budget notice. `state.json` beside it is what the board adds up to,
 and `swarm.json` lists the members, pinned by bot id. The script changes them
 only under an exclusive lock on the board. To change how a swarm works, copy
 this folder into `.agents/skills/` under another name and edit the copy. The
-thresholds sit at the top of `swarm`, and the rules are in `member.md`.
+thresholds sit at the top of `swarm`, and the rules are in `member.md`. The
+app's buttons run `~/.agents/skills/swarm/swarm`, not a copy's script, so a
+change the app should follow belongs in that one.
