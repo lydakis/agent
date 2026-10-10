@@ -736,7 +736,8 @@ Agent's stdio daemon: `create`, `submit` (with a request ID), `resume`,
 `transcript`, `entry`, and `fork`. A submitted turn ends with a
 `turn_finished` event carrying the answer entry, which is the fork checkpoint.
 Every bot's `watchEvents()` stream is written to stdout as it arrives, as
-Agent writes its events. **Node, the harness, and its tool processes are the
+Agent writes its events; a run fails unless that stream delivers each bot's
+final submission as done. **Node, the harness, and its tool processes are the
 charged target.** The model is pi-ai 1.0.0's own `openai-responses` API with a
 custom provider pointed at the fixture: SSE, no SDK retries, durable retries
 off, compaction off, no prompt-cache retention. Echo is a defined tool; shell

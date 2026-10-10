@@ -134,7 +134,7 @@ def run_once(binary, directory, config, mode, toolset, transport='stdio', memory
             assert 'result' in client.request('create', bot=str(agent), workspace=str(workspace))
         create_ms = (time.monotonic()-before)*1000
         phase = 'turns'
-        latencies, checkpoints = [], {}
+        latencies, checkpoints, finals = [], {}, {}
         for turn in range(config['turns']):
             pending = []
             for agent in range(config['concurrency']):
@@ -147,16 +147,19 @@ def run_once(binary, directory, config, mode, toolset, transport='stdio', memory
                 latencies.append((event['_received_at']-before)*1000)
                 if turn == 0:
                     checkpoints[agent] = event['data']['checkpoint']
+                finals[str(agent)] = native
         if mode == 'shell':
             for agent in range(config['concurrency']):
                 assert (directory/f'workspace-{agent}'/'artifact').read_text() == 'tool-ok'
         phase = 'idle'
         time.sleep(.45)
         if engine == 'pi-durable':
-            # Pi Durable's own event stream, a batch per commit, reached
-            # every conversation.
-            streamed = {m['bot'] for m in list(client.saved) if m.get('event') == 'pi' and m.get('events')}
-            assert streamed == {str(agent) for agent in range(config['concurrency'])}, sorted(streamed)
+            # Pi Durable's own event stream, a batch per commit, delivers
+            # every conversation's final turn as done.
+            for bot, native in finals.items():
+                client.receive(lambda m, bot=bot, native=native: m.get('event') == 'pi' and m.get('bot') == bot
+                               and any(e.get('type') == 'submission' and e['record'].get('id') == native
+                                       and e['record'].get('status') == 'done' for e in m['events']))
         pages = {str(agent):replay(client, engine, str(agent)) for agent in range(config['concurrency'])}
         if transport == 'socket':
             client.verify_followers(pages)
