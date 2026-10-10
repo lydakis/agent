@@ -2345,11 +2345,12 @@ async fn start(client: &Client, trigger: &Trigger) -> Result<i64, String> {
 }
 
 /// What came of a fire whose agent could not be made. Pinned by id, an
-/// agent that added the trigger and is gone never comes back: the trigger
-/// ends, as for an answer whose agent is gone.
+/// agent that added the trigger and is gone never comes back, nor does the
+/// agent this trigger made once it is deleted: the trigger ends, as for an
+/// answer whose agent is gone.
 fn unmade(error: String) -> Value {
     let mut failed = json!({"outcome": "failed", "detail": error});
-    if error.starts_with("creator_not_found") {
+    if error.starts_with("creator_not_found") || error.starts_with("bot_deleted") {
         failed["gone"] = json!(true);
     }
     failed
@@ -3512,6 +3513,9 @@ mod tests {
                 .unwrap()
                 .starts_with("creator_not_found")
         );
+        w.install(&s).unwrap();
+        w.settle(&s, unmade("bot_deleted: the p.review this request made".into()));
+        assert_eq!(w.state(&s.name), (false, false, true));
     }
 
     #[test]
