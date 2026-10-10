@@ -92,6 +92,7 @@ class AccountingTests(ModelFixture):
         submit = lambda key, prompt, **more: client.request(
             'submit', bot='Bob', request_id=key, prompt=prompt, **more)
         self.assertEqual(submit('zero', 'hello', budget_tokens=0)['error'], 'invalid_budget')
+        self.assertEqual(submit('huge', 'hello', budget_tokens=2**63)['error'], 'invalid_budget')
         self.assertEqual(submit('steer', 'hello', budget_tokens=10, delivery='steer')['error'],
                          'invalid_delivery')
         # Each synthetic call costs 110 tokens. A turn capped at 110 makes one

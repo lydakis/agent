@@ -2565,8 +2565,11 @@ impl Service {
                         "budget_tokens starts a turn; a steer joins one, so send it with reject or queue",
                     );
                 }
-                if budget_tokens == Some(0) {
-                    return fail_with("invalid_budget", "budget_tokens must be at least 1");
+                if budget_tokens.is_some_and(|n| n == 0 || n > i64::MAX as u64) {
+                    return fail_with(
+                        "invalid_budget",
+                        format!("budget_tokens must be from 1 to {}", i64::MAX),
+                    );
                 }
                 // A turn may run in another checkout or on another model of
                 // the same family; the conversation encoding never changes.

@@ -226,6 +226,9 @@ struct Warm<'a> {
     stopped: bool,
     /// Tokens the refreshes billed, for the bot's budget.
     tokens: u64,
+    /// What the bot's and turn's caps leave the refreshes, when either is
+    /// set: they stop once they have billed it.
+    room: Option<u64>,
     /// The refresh in flight, held by [`Accounting`] so an interrupt that
     /// drops the turn's rounds still settles one already sent.
     pending: &'a mut Option<Pending>,
@@ -2285,8 +2288,11 @@ impl Turn {
                     fallbacks: record.fallbacks,
                     after,
                     read_at,
-                    stopped,
+                    stopped: stopped || record.exhausted().is_some(),
                     tokens: 0,
+                    room: record
+                        .ceiling()
+                        .map(|c| c.saturating_sub(record.tokens_used)),
                     pending,
                 });
             let stop = self
@@ -2511,6 +2517,9 @@ impl Turn {
                         read_at: tokio::time::Instant::now(),
                         stopped: false,
                         tokens: 0,
+                        room: record
+                            .ceiling()
+                            .map(|c| c.saturating_sub(record.tokens_used)),
                         pending: &mut accounting.refresh,
                     };
                     let result = self.stream_warm(call, &sent, &mut warm).await;
@@ -2852,6 +2861,8 @@ impl Turn {
                 // The refresh's own read, from when it was sent. One carried
                 // over from an earlier attempt can be older than this one's.
                 warm.read_at = warm.read_at.max(sent_at);
+                // A cap reached ends them: no call after it would read the cache.
+                warm.stopped |= warm.room.is_some_and(|room| warm.tokens >= room);
             }
             None => warm.stopped = true,
         }
