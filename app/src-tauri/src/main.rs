@@ -15,6 +15,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod daemon;
+mod files;
 mod project;
 mod remote;
 mod session;
@@ -471,6 +472,22 @@ async fn read_file(
 }
 
 const FILE_CAP: u64 = 4 * 1024 * 1024;
+
+/// The files of the repository `dir` is in, for ⌘P: paths under `root`,
+/// listed by git. Only this machine's: a window on a host is refused.
+#[tauri::command]
+async fn list_files(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    dir: String,
+) -> Result<Value, String> {
+    windows.of(&window)?.here("Finding a file")?;
+    let dir = file_path(&dir, std::env::var_os("HOME"))?;
+    let listing = tauri::async_runtime::spawn_blocking(move || files::list(&dir))
+        .await
+        .map_err(|e| e.to_string())??;
+    Ok(json!({"root": listing.root, "files": listing.files, "more": listing.more}))
+}
 
 fn file_path(path: &str, home: Option<std::ffi::OsString>) -> Result<std::path::PathBuf, String> {
     let path = match (path.strip_prefix("~/"), home) {
@@ -1418,6 +1435,7 @@ fn main() {
             edit_role,
             open_link,
             read_file,
+            list_files,
             branch,
             models,
             project,

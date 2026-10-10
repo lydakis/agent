@@ -246,6 +246,12 @@ button.newproj:hover{background:var(--t-raised);color:var(--t-ink)}
 .picker .row .n{flex:1}
 .picker .row .h{color:var(--t-faint);font-size:12px}
 .picker .row .hit{color:var(--amber)}
+.picker .pmodes{display:flex;gap:4px;align-items:center;padding:6px 8px 0}
+.picker .pmodes button{background:transparent;border:1px solid transparent;border-radius:6px;color:var(--t-faint);font:inherit;font-size:12px;padding:2px 8px;cursor:pointer}
+.picker .pmodes button.on{color:var(--t-ink);border-color:var(--t-line);background:var(--t-bg)}
+.picker .pmodes .ph{margin-left:auto;color:var(--t-faint);font-size:11px}
+.picker .row .h{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:50%}
+.glyph.file{color:var(--t-faint)}
 .picker .empty{padding:8px 12px;color:var(--t-faint);font-style:italic}
 .helpbox{max-height:calc(100vh - 120px);overflow:auto;background:var(--t-raised);border:1px solid var(--t-line);border-radius:8px;padding:14px 20px;white-space:pre;color:var(--t-ink);line-height:22px;box-shadow:0 24px 60px -20px rgba(0,0,0,.8)}
 .helpbox b{color:var(--amber);font-weight:500}

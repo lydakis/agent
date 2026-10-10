@@ -23,6 +23,7 @@ window.Daemon = (() => {
       chooseFolder: (start = null) => invoke('choose_folder', { start }),
       branch: (dir) => invoke('branch', { dir }),
       readFile: (path) => invoke('read_file', { path }),
+      listFiles: (dir) => invoke('list_files', { dir }),
       attach: (after) => invoke('attach', { after }),
       replaceDaemon: () => invoke('replace_daemon'),
       pull: (session) => invoke('pull', { session }),
@@ -444,6 +445,8 @@ window.Daemon = (() => {
       if (hit == null) throw new Error(path.endsWith('/') ? `${path}: is a folder` : `${path}: no such file`);
       return new TextEncoder().encode(FILES[hit]).buffer;
     },
+    // The demo's repository is its files, under whichever folder asks.
+    listFiles: async (dir) => ({ root: dir, files: Object.keys(FILES).sort(), more: false }),
     branch: async (dir) => { const m = /\/worktrees\/([^/]+)$/.exec(dir ?? ''); return m ? `agent/${m[1]}` : null; },
     swarms: async () => ({ swarms: [...S.swarms.values()].map(swarmRecord), broken: [] }),
     // The demo has no editor to open: Edit only says your copy is now the one read.

@@ -36,7 +36,7 @@ function page(daemon = {}, storage = null) {
   context.Rich = context.window.Rich;
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, openFileFrom, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, fork, remove, createProject, save, restore, showMenu, refreshMenu, entries, pickerRows, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readTriggers, tellLead, markSeen, renderFile, go, upOf, crumbsHTML, railRows, renderTabs, triggerAct, turnNews, openProjectSheet };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, openFileFrom, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, fork, remove, createProject, save, restore, showMenu, refreshMenu, entries, pickerRows, openPicker, pickerMode, renderPicker, keyLabel, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readTriggers, tellLead, markSeen, renderFile, go, upOf, crumbsHTML, railRows, renderTabs, triggerAct, turnNews, openProjectSheet };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -409,10 +409,76 @@ test('a file drawn again keeps the reader\'s place; another file starts at its t
   assert.equal(el.scrollTop, 0);
 });
 
+test('⌘P lists the repository in view, names first, and opens the pick in a file tab', async () => {
+  const listed = [];
+  const p = page({ request: async () => ({ nodes: [], workspaces: [], next_from: null }), listFiles: async (dir) => { listed.push(dir); return { root: '/w', files: ['docs/session.md', 'src/auth/session.rs', 'src/sessions/mod.rs', 'README.md'], more: false }; }, readFile: async (path) => new TextEncoder().encode(`# ${path}`) });
+  p.S.session = 1; p.S.config = { workspace: '/synthetic' };
+  p.upsert({ name: 'Bob', id: 1, provider: 'alpha', model: 'one', workspace: '/w/src' });
+  await p.go('Bob');
+  const doc = p.context.document, q = doc.getElementById('pickerq');
+  p.openPicker('files'); await settle();
+  assert.deepEqual(listed, ['/w/src'], "the agent's folder names the repository");
+  q.value = 'sess';
+  // A name that starts with it, then a name holding it, then a folder that does.
+  assert.deepEqual(Array.from(p.pickerRows(), (r) => r.path), ['docs/session.md', 'src/auth/session.rs', 'src/sessions/mod.rs']);
+  p.renderPicker();
+  assert.match(doc.getElementById('pickerlist').innerHTML, /<span class="n"><span class="hit">sess<\/span>ion\.md<\/span><span class="h">docs<\/span>/);
+  // Tab trades lists and keeps what was typed.
+  await q.listeners.keydown({ key: 'Tab', preventDefault() {} });
+  assert.equal(p.S.ui.pickerMode, 'agents'); assert.equal(q.value, 'sess');
+  await q.listeners.keydown({ key: 'Tab', preventDefault() {} }); await settle();
+  p.S.ui.pickerSel = 1;
+  await q.listeners.keydown({ key: 'Enter', preventDefault() {} }); await settle();
+  assert.equal(p.S.selected, '▤/w/src/auth/session.rs'); assert.deepEqual([...p.S.ui.tabs], ['Bob', '▤/w/src/auth/session.rs']);
+  assert.equal(p.keyLabel(p.S.selected), 'session.rs');
+  // The file is drawn in the main pane, which has no composer for it, and the sidebar shows Home's list.
+  assert.match(doc.getElementById('log').innerHTML, /class="fview"/); assert.match(doc.getElementById('log').innerHTML, /\/w\/src\/auth\/session\.rs/);
+  assert.equal(doc.getElementById('form').hidden, true);
+  assert.equal(p.rail.open, '');
+  // Back on the agent, the tab keeps only its path; shown again, it is read again.
+  await p.go('Bob');
+  assert.equal(p.S.ui.tabFile, null); assert.equal(doc.getElementById('form').hidden, false);
+  await p.go('▤/w/src/auth/session.rs'); await settle();
+  assert.equal(p.S.ui.tabFile.state, 'ok');
+  // A link in it names a path from the file's own folder, and opens beside.
+  await p.openFileFrom('../README.md', { closest: () => null });
+  assert.equal(p.S.ui.file.full, '/w/src/README.md');
+});
+
+test('a file beside opens as a tab, and a step that writes it reads the tab again in place', async () => {
+  let text = 'one';
+  const p = page({ request: async () => ({ nodes: [], workspaces: [], next_from: null }), readFile: async () => new TextEncoder().encode(text) });
+  p.S.session = 1; p.S.config = { workspace: '/synthetic' };
+  p.upsert({ name: 'Bob', id: 1, provider: 'alpha', model: 'one', workspace: '/w' });
+  await p.go('Bob'); await p.openFile('Bob', '/w/notes.txt');
+  await p.act({ dataset: { act: 'file-tab' } }); await settle();
+  assert.equal(p.S.ui.file, null); assert.equal(p.S.selected, '▤/w/notes.txt');
+  const log = p.context.document.getElementById('log');
+  assert.match(log.innerHTML, /one/);
+  log.scrollTop = 120; text = 'two';
+  const t = p.transcript('Bob'); t.items.push({ kind: 'tool', callId: 'c1', turn: 3, name: 'write', path: 'notes.txt', done: false });
+  await p.onEvent({ event: 'tool_completed', bot: 'Bob', turn: 3, data: { call_id: 'c1' } }); await settle();
+  assert.match(log.innerHTML, /two/); assert.equal(log.scrollTop, 120, 'the reader keeps their place');
+});
+
+test('file tabs come back after a restart', () => {
+  const storage = new Map(), a = shell({}, storage);
+  a.upsert({ name: 'Bob', id: 1, provider: 'alpha', model: 'one' });
+  a.S.ui.tabs.push('Bob', '▤/w/a.md'); a.S.selected = '▤/w/a.md'; a.save();
+  const b = shell({}, storage); b.upsert({ name: 'Bob', id: 1, provider: 'alpha', model: 'one' }); b.restore();
+  assert.deepEqual([...b.S.ui.tabs], ['Bob', '▤/w/a.md']); assert.equal(b.S.selected, '▤/w/a.md');
+});
+
+test('⌘P from Home with no folder says what it searches', async () => {
+  const p = page({ request: async () => ({ nodes: [], workspaces: [], next_from: null }), listFiles: async () => { throw new Error('unexpected'); } });
+  p.openPicker('files'); await settle();
+  assert.match(p.context.document.getElementById('pickerlist').innerHTML, /Open an agent first/);
+});
+
 test('Escape in a preview the reader is in closes the file it shows', async () => {
   const p = page({ readFile: async () => new TextEncoder().encode('<button>x</button>') }), c = p.context, win = {};
   p.setRender(() => {}); await p.openFile('Bob', '/w/p.html');
-  const frame = { contentWindow: win, closest: (s) => s === '.fview' ? {} : null };
+  const frame = { contentWindow: win, closest: (s) => s === '.pane.side .fview' ? {} : null };
   c.document.querySelectorAll = (s) => s === '.rc iframe' ? [frame] : [];
   // A page the reader is not in cannot close it.
   c.window.listeners.message({ source: win, data: { rich: 'escape' } });

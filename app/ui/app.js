@@ -24,7 +24,7 @@ const S = {
   // scanning the fleet on every event.
   botsGen: 0, shapeGen: 0, deleted: new Set(),
   // The tabs are the agents opened full screen, in order; Home is always there and is not one of them.
-  config: null, ui: { rail: true, side: null, tabs: [], picker: false, pickerSel: 0, help: false, steps: false, toast: null, menu: false },
+  config: null, ui: { rail: true, side: null, tabs: [], picker: false, pickerSel: 0, pickerMode: 'agents', found: null, tabFile: null, help: false, steps: false, toast: null, menu: false },
   // How Send reaches a working bot, the last pick from its menu (sticky across windows), and the
   // model each bot's next turns run on when it differs from the one it was created with.
   send: loadSend(), override: new Map(), effort: new Map(),
@@ -421,7 +421,12 @@ function callSummary(name, args) {
 const SWARM = '⁂';
 const swarmKey = (name) => SWARM + name;
 const swarmOf = (key) => (typeof key === 'string' && key.startsWith(SWARM) ? S.swarms.get(key.slice(SWARM.length)) ?? null : null);
-const isOpen = (key) => S.bots.has(key) || !!swarmOf(key);
+// A file in a tab is keyed by its path after a mark no bot name can hold, and is open while its tab is.
+const FILE = '▤';
+const fileOf = (key) => (typeof key === 'string' && key.startsWith(FILE) ? key.slice(FILE.length) : null);
+const isOpen = (key) => S.bots.has(key) || !!swarmOf(key) || fileOf(key) != null;
+// What the sidebar and the list below it follow: a file tab has nothing below it, so Home's.
+const opened = () => (fileOf(S.selected) != null ? '' : S.selected);
 // A member is the bot the swarm pinned: another bot later given its name is not the swarm's.
 const memberBot = (sw, m) => { const b = bot(m); return b && b.id != null && b.id === sw.ids[m] ? b : null; };
 const swarmOfBot = (name) => { const sw = S.swarms.get(S.memberOf.get(name)); return sw && memberBot(sw, name) ? sw : null; };
@@ -745,7 +750,9 @@ async function onEvent(ev) {
       const shown = S.ui.file;
       // Read again as the agent left it; what it wrote is new, so a page, diagram or image in it waits for a click.
       // A write or edit that failed or was refused changed nothing, and what is shown keeps running.
-      if (shown && !data.failed && !data.denied && call?.path && (call.name === 'write' || call.name === 'edit') && joinPath(folderOf(name, turn), call.path) === shown.full) openFile(shown.bot, shown.full, false);
+      const wrote = !data.failed && !data.denied && call?.path && (call.name === 'write' || call.name === 'edit') ? joinPath(folderOf(name, turn), call.path) : null;
+      if (shown && wrote === shown.full) openFile(shown.bot, shown.full, false);
+      if (wrote != null && S.ui.tabFile?.full === wrote) { readTabFile(wrote, false); render(); }
       if (typeof data.node === 'number') {
         pushNode(t, { kind: 'node', node: data.node, callId: data.call_id, turn });
         if (call && (call.background || call.name === 'wait') && await loadWaitOrProc(name, data.node, call)) {
@@ -997,7 +1004,7 @@ async function loadVisible() {
   // A swarm's agents show their last lines on its Agents tab, so the first dozen load.
   const sw = swarmOf(S.selected);
   if (sw) { if (sw.tab === 'agents') for (const m of sw.members.slice(0, 12)) if (memberBot(sw, m) && m !== S.ui.side) await load(m); }
-  else await load(S.selected);
+  else if (fileOf(S.selected) == null) await load(S.selected);
   if (S.ui.side && S.ui.side !== S.selected) await load(S.ui.side);
   // Cards on screen show their peer's last line, so those peers load too.
   for (const who of peers().slice(-12)) if (who !== S.selected && who !== S.ui.side) await load(who);
@@ -1238,7 +1245,7 @@ function forgetStore() {
   for (const w of S.wakes.values()) clearTimeout(w.timer);
   S.wakes.clear(); S.turnFrom.clear(); S.turnOrigin.clear(); S.answerTo.clear(); S.heldNews = []; S.answered.clear();
   for (const timer of S.forwarding.values()) clearTimeout(timer); S.forwarding.clear(); S.unseen.clear(); S.wanted.clear();
-  S.selected = ''; S.ui.tabs = []; S.ui.side = null; dropFile();
+  S.selected = ''; S.ui.tabs = []; S.ui.side = null; dropFile(); dropTabFile();
   S.botsGen += 1; S.shapeGen += 1;
   // A home the last host named is not this one's.
   if (S.homeWorkspace) { S.config.workspace = null; S.homeWorkspace = false; }
@@ -1301,7 +1308,7 @@ function restore() {
 const keyIdentity = (k) => { const up = upOf(k); return [k, bot(k)?.id ?? null, up || null, up ? bot(up)?.id ?? null : null]; };
 const savedKey = (k, id) => {
   if (typeof k !== 'string') return null;
-  if (swarmOf(k)) return k;
+  if (swarmOf(k) || fileOf(k) != null) return k;
   const b = bot(k); return b && b.id != null && b.id === id ? k : null;
 };
 const sameKey = (entry) => { const [k, id, up, upId] = Array.isArray(entry) ? entry : []; return savedKey(k, id) ?? savedKey(up, upId); };
@@ -1603,7 +1610,9 @@ for (const [id, who] of PANES) {
 // ---------- files ----------
 // A file a message links or a step read, wrote or edited, opened beside: read from the agent's
 // folder by the core, drawn by its kind (see `Rich.file`). It takes the place of the pane beside
-// until closed, and is read again when a step of the agent it came from writes or edits it.
+// until closed. A file can also be a tab (from beside, or found with ⌘P); only the tab in view holds
+// what it read, and a tab shown again reads its file again. Either is read again when a step writes
+// or edits it.
 const FILE_CAP = 4 * 1024 * 1024;
 // `~/` is the home folder, as the core reads it; any other name, `~notes.md` too, is the folder's.
 function joinPath(dir, path) {
@@ -1620,11 +1629,12 @@ function folderOf(who, turn) {
   return (turn != null && S.transcripts.get(who)?.folders.get(Number(turn))) || (bot(who)?.workspace ?? S.config?.workspace ?? '');
 }
 const turnAttr = (turn) => turn != null ? ` data-turn="${esc(turn)}"` : '';
-// Which folder a click names a path in: the file beside's own folder, or the folder of the turn that
+// Which folder a click names a path in: the shown file's own folder, or the folder of the turn that
 // wrote the message or step, in the agent in that pane.
 function openFileFrom(path, el) {
-  const beside = el?.closest?.('.pane.side');
+  const beside = el?.closest?.('.pane.side'), tab = fileOf(S.selected);
   if (beside && S.ui.file) return openFile(S.ui.file.bot, joinPath(dirOf(S.ui.file.full), path));
+  if (!beside && tab != null) return openFile(null, joinPath(dirOf(tab), path));
   const who = beside ? S.ui.side : S.selected;
   return openFile(who, joinPath(folderOf(who, el?.closest?.('[data-turn]')?.dataset.turn), path));
 }
@@ -1636,12 +1646,28 @@ async function openFile(who, full, asked = true) {
   if (old?.url) URL.revokeObjectURL(old.url);
   const f = S.ui.file = { bot: who, full, asked, gen: ++fileGen, state: 'loading', view: null, url: null };
   render();
+  await readInto(f, () => S.ui.file === f);
+}
+// `still`: the view is still the one shown, so what was read is kept.
+async function readInto(f, still) {
   try {
-    const bytes = new Uint8Array(await Daemon.readFile(full));
-    if (S.ui.file !== f) return;
+    const bytes = new Uint8Array(await Daemon.readFile(f.full));
+    if (!still()) return;
     Object.assign(f, { state: 'ok', bytes: bytes.subarray(0, FILE_CAP), more: bytes.length > FILE_CAP, gen: ++fileGen });
-  } catch (e) { if (S.ui.file !== f) return; Object.assign(f, { state: 'error', error: String(e?.message ?? e), gen: ++fileGen }); }
+  } catch (e) { if (!still()) return; Object.assign(f, { state: 'error', error: String(e?.message ?? e), gen: ++fileGen }); }
   render();
+}
+// The file tab in view, read when it comes into view; `asked` as for a file beside.
+function readTabFile(full, asked = true) {
+  dropTabFile(!asked);
+  const f = S.ui.tabFile = { bot: null, full, asked, gen: ++fileGen, state: 'loading', view: null, url: null };
+  readInto(f, () => S.ui.tabFile === f);
+}
+// A file read again because a step changed it keeps the reader's place.
+function dropTabFile(keepPlace = false) {
+  const f = S.ui.tabFile; if (!f) return;
+  if (f.url) URL.revokeObjectURL(f.url);
+  S.ui.tabFile = null; if (!keepPlace) $('log').dataset.shows = '';
 }
 // A file opened from an agent goes with that agent, and with the store it came from.
 function dropFile() {
@@ -1652,8 +1678,8 @@ function dropFile() {
 }
 // The chat it covered is on screen again, and what it finished meanwhile is seen.
 function closeFile() { if (dropFile()) { render(); markSeen(); focusInput(S.ui.side ? 'side' : 'main'); } }
-function renderFile() {
-  const f = S.ui.file, el = $('side');
+// Beside, the head closes it or opens it as a tab; in a tab, the crumbs say where it is.
+function renderFile(f = S.ui.file, el = $('side'), head = $('sidetitle'), pane = 'side') {
   // Drawn when read, and again when highlighting arrives for code that waited for it; a page,
   // diagram or chart beside keeps running as it is.
   if (f.state === 'ok' && (f.at !== f.gen || (f.waited && f.ver !== Rich.version))) {
@@ -1663,9 +1689,11 @@ function renderFile() {
   }
   const key = `file|${f.full}|${f.gen}|${f.ver}`;
   if (el.dataset.key === key) return;
-  const name = f.full.split('/').pop(), where = dirOf(f.full).replace(/^\/(Users|home)\/[^/]+/, '~');
-  $('sidetitle').dataset.k = key;
-  $('sidetitle').innerHTML = `<div class="crumbs"><b>${esc(name)}</b><span class="branch" title="${esc(f.full)}">${esc(where)}</span></div><div class="tools"><button type="button" class="ibtn" data-act="close-file" title="Close (Esc)" aria-label="Close">✕</button></div>`;
+  const name = f.full.split('/').pop(), where = `<span class="branch" title="${esc(f.full)}">${esc(dirOf(f.full).replace(/^\/(Users|home)\/[^/]+/, '~'))}</span>`;
+  head.dataset.k = key;
+  head.innerHTML = pane === 'side'
+    ? `<div class="crumbs"><b>${esc(name)}</b>${where}</div><div class="tools"><button type="button" class="ibtn" data-act="file-tab" title="Open as tab">⤢ Open as tab</button><button type="button" class="ibtn" data-act="close-file" title="Close (Esc)" aria-label="Close">✕</button></div>`
+    : `<div class="crumbs">${crumbsHTML(S.selected)}${where}</div><div class="tools"></div>`;
   el.innerHTML = `<div class="fview">${f.state === 'loading' ? '<div class="line pending">reading…</div>' : f.state === 'error' ? `<div class="line out bad">${esc(f.error)}</div>` : f.view}</div>`;
   // A file drawn again (highlighting arrived, an agent rewrote it) keeps the reader's place.
   if (el.dataset.shows !== f.full) el.scrollTop = 0;
@@ -1686,7 +1714,7 @@ function upOf(key) {
   const c = creatorOf(b); if (c) return c.name;
   return b.project && bot(b.project + LEAD) ? b.project + LEAD : '';
 }
-const keyLabel = (key) => { const sw = swarmOf(key); if (sw) return `⁂ ${memberShort(sw, sw.name)}`; const b = bot(key); return b ? shortName(b) : key; };
+const keyLabel = (key) => { const sw = swarmOf(key); if (sw) return `⁂ ${memberShort(sw, sw.name)}`; const full = fileOf(key); if (full != null) return full.split('/').pop() || full; const b = bot(key); return b ? shortName(b) : key; };
 // The way down from Home to an agent, each step up a button. A long chain shows its two ends; the walk
 // up stops at a bound, so a chain of thousands costs that bound.
 const CRUMBS = 64;
@@ -2038,9 +2066,9 @@ function fleetIndex() {
 const rail = { open: null, rows: [], index: new Map(), drawn: '', start: 0, end: 0, key: '' };
 function railRows() {
   fleetIndex();
-  if (rail.open !== S.selected) {
-    rail.rows = levelOf(S.selected); rail.index = new Map(); rail.rows.forEach((n, i) => { const k = n.key ?? n.b?.name; if (k) rail.index.set(k, i); });
-    rail.open = S.selected; rail.key = '';
+  if (rail.open !== opened()) {
+    rail.rows = levelOf(opened()); rail.index = new Map(); rail.rows.forEach((n, i) => { const k = n.key ?? n.b?.name; if (k) rail.index.set(k, i); });
+    rail.open = opened(); rail.key = '';
   }
   return rail.rows;
 }
@@ -2058,10 +2086,10 @@ function levelOf(open) {
   }
   return out;
 }
-const levelName = () => !S.selected ? (rail.rows.some((n) => n.head != null) ? 'projects' : 'agents') : swarmOf(S.selected) ? 'agents' : leadProject(S.selected) ? 'threads' : 'helpers';
+const levelName = () => !opened() ? (rail.rows.some((n) => n.head != null) ? 'projects' : 'agents') : swarmOf(S.selected) ? 'agents' : leadProject(S.selected) ? 'threads' : 'helpers';
 function renderRail() {
   const rows = railRows(), el = $('bots');
-  const level = `${S.shapeGen}|${S.selected}`;
+  const level = `${S.shapeGen}|${opened()}`;
   const key = () => `${level}|${S.ui.side}|${rail.start}|${rail.end}`;
   if (rail.key === key()) return;
   // A new level starts at its top, or around the row beside.
@@ -2073,7 +2101,7 @@ function renderRail() {
   rail.drawn = level; rail.key = key();
   const above = rail.start ? `<div class="botrow more">… ${rail.start} above</div>` : '';
   const below = rail.end < rows.length ? `<div class="botrow more">… ${rows.length - rail.end} below</div>` : '';
-  const none = rows.length ? '' : `<div class="pnote">${!S.selected ? 'No projects yet.' : leadProject(S.selected) ? 'No threads yet.' : 'No helpers.'}</div>`;
+  const none = rows.length ? '' : `<div class="pnote">${!opened() ? 'No projects yet.' : leadProject(S.selected) ? 'No threads yet.' : 'No helpers.'}</div>`;
   el.innerHTML = none + above + rows.slice(rail.start, rail.end).map(botRowHTML).join('') + below;
   el.dataset.key = rail.key;
 }
@@ -2113,7 +2141,7 @@ function botRowHTML(n) {
 // ---------- tabs ----------
 // Home, then a tab for each agent opened full screen. They are redrawn only when one opens, closes,
 // is chosen, or changes state or name (a task whose coordinator is gone is named in full).
-const tabState = (k) => { const sw = swarmOf(k); return sw ? swarmStatus(sw) : shownStatus(bot(k)); };
+const tabState = (k) => { if (fileOf(k) != null) return 'file'; const sw = swarmOf(k); return sw ? swarmStatus(sw) : shownStatus(bot(k)); };
 function renderTabs() {
   const tabs = S.ui.tabs.filter(isOpen), states = tabs.map(tabState), labels = tabs.map(keyLabel);
   const key = `${S.selected}|${tabs.map((k, i) => `${k}\u0000${states[i]}\u0000${labels[i]}`).join('\u0000')}`;
@@ -2121,7 +2149,7 @@ function renderTabs() {
   const home = `<button type="button" class="homebtn${S.selected ? '' : ' on'}" data-act="home" title="Home">⌂ Home</button>`;
   el.innerHTML = home + (tabs.length ? '<span class="tabsep"></span>' : '') + tabs.map((k, i) => {
     const on = k === S.selected, label = esc(labels[i]);
-    return `<div class="wtab${on ? ' on' : ''}" role="tab" aria-selected="${on}" tabindex="0" data-tab="${esc(k)}" title="${esc(k)}"><span class="glyph ${states[i]}">${glyphOf(states[i])}</span><span class="tl">${label}</span><button type="button" class="x" data-act="close-tab" data-who="${esc(k)}" aria-label="Close ${label}">×</button></div>`;
+    return `<div class="wtab${on ? ' on' : ''}" role="tab" aria-selected="${on}" tabindex="0" data-tab="${esc(k)}" title="${esc(fileOf(k) ?? k)}"><span class="glyph ${states[i]}">${states[i] === 'file' ? FILE : glyphOf(states[i])}</span><span class="tl">${label}</span><button type="button" class="x" data-act="close-tab" data-who="${esc(k)}" aria-label="Close ${label}">×</button></div>`;
   }).join('');  // Past the bar's width the tabs scroll, and the one on screen stays in view.
   el.querySelector('.wtab.on')?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
 }
@@ -2131,7 +2159,7 @@ function keybarHTML(b) {
   const dot = `<span><span class="dot${!S.attached ? ' off' : busy ? ' busy' : ''}"></span>${!S.attached ? 'detached' : 'live'}</span>`;
   const keys = [];
   if (S.ui.picker) keys.push('<kbd>↑↓</kbd> choose', '<kbd>Enter</kbd> open', '<kbd>Esc</kbd> cancel');
-  else { keys.push('<kbd>^k</kbd> find'); if (S.ui.side) keys.push('<kbd>Esc</kbd> close'); else if (busy) keys.push('<kbd>Esc</kbd> stop'); }
+  else { keys.push('<kbd>^k</kbd> find', '<kbd>⌘P</kbd> files'); if (S.ui.side) keys.push('<kbd>Esc</kbd> close'); else if (busy) keys.push('<kbd>Esc</kbd> stop'); }
   return `${dot}${S.ui.toast ? `<span class="toast">${esc(S.ui.toast)}</span>` : ''}<span class="spacer"></span>${keys.join('<span> </span>')}<span><kbd>?</kbd> keys</span>`;
 }
 // Each composer holds the text of the bot its pane shows. When a pane shows another bot, its text is
@@ -2158,8 +2186,12 @@ function render() {
   followDrafts();
   markSeen();
   renderTabs();
+  const tab = fileOf(S.selected);
+  if (tab == null) dropTabFile(); else if (S.ui.tabFile?.full !== tab) readTabFile(tab);
   if (sw) { renderSwarmHead($('title'), sw); renderSwarm($('log'), sw); }
+  else if (tab != null) renderFile(S.ui.tabFile, $('log'), $('title'), 'main');
   else { renderHead($('title'), b, 'main'); if (b) renderTranscript($('log'), b.name); else renderHome($('log')); }
+  $('form').hidden = tab != null;
   // New project belongs to Home's list.
   $('newproj').hidden = !!S.selected;
   if (S.ui.rail) renderRail();
@@ -2184,15 +2216,69 @@ function anyActive() { if (activeAt !== S.botsGen) { activeAt = S.botsGen; activ
 setInterval(() => { if (S.attached && anyActive()) { refreshLive($('log')); if (S.ui.side && !S.ui.file) refreshLive($('side')); } }, 1000);
 
 // ---------- picker ----------
+// One finder, two lists: agents (⌘K) and the files of the repository in view (⌘P); Tab trades them.
 function pickerRows() {
   const q = $('pickerq').value.trim().toLowerCase();
+  if (S.ui.pickerMode === 'files') return fileRows(q);
   return fleetIndex().rows.filter((n) => n.b).map((n) => ({ ...n, i: q ? n.b.name.toLowerCase().indexOf(q) : -1 })).filter((r) => !q || r.i >= 0);
 }
+// The folder ⌘P searches the repository of: the file in view's, else the agent's or the swarm's.
+function searchFolder() {
+  const tab = fileOf(S.selected); if (tab != null) return dirOf(tab);
+  const sw = swarmOf(S.selected); if (sw) return sw.workspace ?? null;
+  return bot(S.selected)?.workspace ?? S.config?.workspace ?? null;
+}
+// Listed again each time the files list opens, so it is what git sees now; the lowercase copy is
+// made once per listing, not per key.
+async function listFiles() {
+  const dir = searchFolder();
+  const found = S.ui.found = { dir, state: dir ? 'loading' : 'none', files: [], lower: [], root: '', more: false, error: '' };
+  if (!dir) return;
+  try {
+    const got = await Daemon.listFiles(dir);
+    if (S.ui.found !== found) return;
+    Object.assign(found, { state: 'ok', root: got.root, files: got.files, lower: got.files.map((f) => f.toLowerCase()), more: !!got.more });
+  } catch (e) { if (S.ui.found !== found) return; Object.assign(found, { state: 'error', error: String(e?.message ?? e) }); }
+  if (S.ui.picker && S.ui.pickerMode === 'files') renderPicker();
+}
+// A name that starts with what was typed comes first, then a name holding it, then a folder; within
+// each, git's order. One pass over the listing, no sort; only the rows shown are made, and `total`
+// counts the rest.
+function fileRows(q) {
+  const found = S.ui.found; if (!found || found.state !== 'ok') return [];
+  const row = (n) => { const lower = found.lower[n], base = lower.lastIndexOf('/') + 1, name = lower.indexOf(q, base); return { path: found.files[n], i: !q ? -1 : name >= base ? name : lower.indexOf(q) }; };
+  if (!q) return Object.assign(found.files.slice(0, PICKER_ROWS).map((_, n) => row(n)), { total: found.files.length });
+  const named = [], within = [], under = [];
+  for (let n = 0; n < found.lower.length; n++) {
+    const lower = found.lower[n], i = lower.indexOf(q); if (i < 0) continue;
+    const base = lower.lastIndexOf('/') + 1, name = i >= base ? i : lower.indexOf(q, base);
+    (name === base ? named : name > base ? within : under).push(n);
+  }
+  const total = named.length + within.length + under.length;
+  const shown = [];
+  for (const list of [named, within, under]) for (let k = 0; k < list.length && shown.length < PICKER_ROWS; k++) shown.push(row(list[k]));
+  return Object.assign(shown, { total });
+}
 const PICKER_ROWS = 200;
+const hitHTML = (text, i, len) => (i >= 0 ? `${esc(text.slice(0, i))}<span class="hit">${esc(text.slice(i, i + len))}</span>${esc(text.slice(i + len))}` : esc(text));
+function fileRowHTML(r, idx, len) {
+  const base = r.path.lastIndexOf('/') + 1, name = r.path.slice(base), dir = r.path.slice(0, Math.max(0, base - 1));
+  const hit = r.i >= base ? hitHTML(name, r.i - base, len) : esc(name), where = r.i >= 0 && r.i < base ? hitHTML(dir, r.i, Math.min(len, dir.length - r.i)) : esc(dir);
+  return `<div class="row${idx === S.ui.pickerSel ? ' sel' : ''}" data-file="${esc(r.path)}"><span class="glyph file">${FILE}</span><span class="n">${hit}</span><span class="h">${where}</span></div>`;
+}
 function renderPicker() {
+  const files = S.ui.pickerMode === 'files', found = S.ui.found;
+  $('pmodes').innerHTML = `<button type="button" data-pmode="agents" class="${files ? '' : 'on'}">Agents <span class="kbd">⌘K</span></button><button type="button" data-pmode="files" class="${files ? 'on' : ''}">Files <span class="kbd">⌘P</span></button><span class="ph">Tab switches</span>`;
+  $('pickerq').placeholder = files ? 'find a file…' : 'find an agent…';
   const q = $('pickerq').value.trim(); const all = pickerRows(); const rows = all.slice(0, PICKER_ROWS);
   S.ui.pickerSel = Math.min(S.ui.pickerSel, Math.max(0, rows.length - 1));
-  const more = all.length > rows.length ? `<div class="empty">${all.length - rows.length} more; type to narrow</div>` : '';
+  const total = all.total ?? all.length;
+  const more = total > rows.length ? `<div class="empty">${total - rows.length} more; type to narrow</div>` : files && found?.more && !q ? '<div class="empty">the repository has more files than listed; type to narrow</div>' : '';
+  if (files) {
+    const none = !found || found.state === 'loading' ? 'listing files…' : found.state === 'none' ? 'Open an agent first: ⌘P searches the repository its folder is in.' : found.state === 'error' ? found.error : 'no file matches';
+    $('pickerlist').innerHTML = (rows.length ? rows.map((r, idx) => fileRowHTML(r, idx, q.length)).join('') : `<div class="empty">${esc(none)}</div>`) + more;
+    return;
+  }
   $('pickerlist').innerHTML = (rows.length ? rows.map((r, idx) => {
     const n = r.b.name; const hit = r.i >= 0 ? `${esc(n.slice(0, r.i))}<span class="hit">${esc(n.slice(r.i, r.i + q.length))}</span>${esc(n.slice(r.i + q.length))}` : esc(n);
     const st = shownStatus(r.b), state = st === 'idle' ? '' : labelOf(st);
@@ -2201,14 +2287,29 @@ function renderPicker() {
   }).join('') : '<div class="empty">no bot matches</div>') + more;
 }
 let pickerPane = 'main';
-function openPicker() { pickerPane = paneOf(document.activeElement, menuPane); closeMenu(); S.ui.picker = true; S.ui.pickerSel = 0; $('pickerq').value = ''; $('pickerwrap').classList.add('on'); render(); $('pickerq').focus(); }
+function openPicker(mode = 'agents') {
+  if (!S.ui.picker) pickerPane = paneOf(document.activeElement, menuPane);
+  closeMenu(); S.ui.picker = true; S.ui.pickerSel = 0; $('pickerq').value = ''; $('pickerwrap').classList.add('on');
+  pickerMode(mode); render(); $('pickerq').focus();
+}
+// What was typed stays when the list changes, so Tab looks for the same text in the other list.
+function pickerMode(mode) {
+  S.ui.pickerMode = mode; S.ui.pickerSel = 0;
+  if (mode === 'files') listFiles(); else S.ui.found = null;
+}
+// A file found opens in a tab, from the repository's top folder.
+async function pick(r) {
+  closePicker('main');
+  if (r?.path != null) await go(FILE + joinPath(S.ui.found.root, r.path), 'tab');
+  else if (r) await go(r.b.name, 'tab');
+}
 // A pick opens its bot in a tab, so focus goes to the main composer; Escape goes back where it was.
 function closePicker(pane = pickerPane) { S.ui.picker = false; $('pickerwrap').classList.remove('on'); render(); $(PANE[S.ui.side ? pane : 'main'].input).focus(); }
 let helpPane = 'main';
 async function showHelp(pane = 'main') {
   helpPane = pane;
   // Open at once so Esc closes it; the list is read now, so an edited ~/.agent/models shows without a restart.
-  const shown = S.ui.help = {}; const text = (models) => { $('helptext').innerHTML = `<b>keys</b>\n ^k   find an agent     ^b   sidebar\n ^p   next task beside  Esc  close beside · stop\n ^o   all steps         ^d   detach (close)\n ↑ ↓  previous / next bot   ^,   settings\n Enter sends · Shift-Enter a new line\n A row: click to look in, double-click for a tab\n\n /new NAME PROVIDER/MODEL [EFFORT]  create a bot\n${models}\n<i>any key closes this</i>`; };
+  const shown = S.ui.help = {}; const text = (models) => { $('helptext').innerHTML = `<b>keys</b>\n ^k   find an agent     ^b   sidebar\n ⌘P   find a file in the repository in view\n ^p   next task beside  Esc  close beside · stop\n ^o   all steps         ^d   detach (close)\n ↑ ↓  previous / next bot   ^,   settings\n Enter sends · Shift-Enter a new line\n A row: click to look in, double-click for a tab\n\n /new NAME PROVIDER/MODEL [EFFORT]  create a bot\n${models}\n<i>any key closes this</i>`; };
   text('   reading ~/.agent/models'); $('helpwrap').classList.add('on');
   let models; try { const list = await Daemon.models(); models = list.length ? list.map((m) => `   ${esc(m.id)}`).join('\n') : '   none listed: Settings lists your providers\' models'; } catch (e) { models = `   ${esc(String(e?.message ?? e))}`; }
   if (S.ui.help === shown) text(models);
@@ -2888,13 +2989,20 @@ for (const [pane, ids] of Object.entries(PANE)) {
 }
 $('pickerq').addEventListener('input', renderPicker);
 $('pickerq').addEventListener('keydown', async (e) => {
+  if (e.key === 'Tab' || (e.metaKey && (e.key === 'k' || e.key === 'p'))) {
+    pickerMode(e.key === 'Tab' ? (S.ui.pickerMode === 'files' ? 'agents' : 'files') : e.key === 'p' ? 'files' : 'agents'); renderPicker(); e.preventDefault(); return;
+  }
   const rows = pickerRows();
   if (e.key === 'Escape') { closePicker(); e.preventDefault(); }
   else if (e.key === 'ArrowDown' || (e.ctrlKey && e.key === 'n')) { S.ui.pickerSel = Math.min(rows.length - 1, S.ui.pickerSel + 1); renderPicker(); e.preventDefault(); }
   else if (e.key === 'ArrowUp' || (e.ctrlKey && e.key === 'p')) { S.ui.pickerSel = Math.max(0, S.ui.pickerSel - 1); renderPicker(); e.preventDefault(); }
-  else if (e.key === 'Enter') { const r = rows[S.ui.pickerSel]; closePicker('main'); if (r) await go(r.b.name, 'tab'); e.preventDefault(); }
+  else if (e.key === 'Enter') { e.preventDefault(); await pick(rows[S.ui.pickerSel]); }
 });
-$('pickerlist').addEventListener('click', async (e) => { const r = e.target.closest('[data-pick]'); if (r) { closePicker('main'); await go(r.dataset.pick, 'tab'); } });
+$('pickerlist').addEventListener('click', async (e) => {
+  const f = e.target.closest('[data-file]'), r = f ?? e.target.closest('[data-pick]'); if (!r) return;
+  await pick(f ? { path: f.dataset.file } : { b: { name: r.dataset.pick } });
+});
+$('pmodes').addEventListener('click', (e) => { const b = e.target.closest('[data-pmode]'); if (b) { pickerMode(b.dataset.pmode); renderPicker(); $('pickerq').focus(); } });
 const inputIds = new Set(['input', 'sideinput', 'pickerq']);
 document.addEventListener('keydown', async (e) => {
   if (S.ui.help) { hideHelp(); e.preventDefault(); return; }
@@ -2909,11 +3017,12 @@ document.addEventListener('keydown', async (e) => {
   const tab = e.target.closest?.('[data-tab]');
   if (tab && (k === 'Enter' || k === ' ') && !e.target.closest('[data-act]')) { await go(tab.dataset.tab); e.preventDefault(); return; }
   if (ctrl && k === 'k') { openPicker(); e.preventDefault(); return; }
+  if (e.metaKey && k === 'p') { openPicker('files'); e.preventDefault(); return; }
   // A hidden sidebar patches no rows, so it draws them all again when it opens.
   if (ctrl && k === 'b') { S.ui.rail = !S.ui.rail; if (S.ui.rail) rail.key = ''; render(); save(); e.preventDefault(); return; }
   if (ctrl && k === 'd') { detach(); e.preventDefault(); return; }
   if (ctrl && k === 'o') { S.ui.steps = !S.ui.steps; render(); save(); e.preventDefault(); return; }
-  if (ctrl && k === 'p') { await nextBeside(); e.preventDefault(); return; }
+  if (e.ctrlKey && k === 'p') { await nextBeside(); e.preventDefault(); return; }
   if (k === 'Escape') { if (S.ui.file) closeFile(); else if (S.ui.side) await go(S.ui.side, 'beside'); else await interrupt(); e.preventDefault(); return; }
   const empty = e.target.id === 'input' && $('input').value === '';
   // Up and down step through every agent in order; from Home, down is the first and up the last.
@@ -2964,6 +3073,8 @@ async function act(el) {
     case 'full': if (S.ui.side) await go(S.ui.side); return;
     case 'close-side': if (S.ui.side) await go(S.ui.side, 'beside'); return;
     case 'close-file': closeFile(); return;
+    // The file beside becomes a tab, and the pane beside closes.
+    case 'file-tab': { const f = S.ui.file; if (!f) return; dropFile(); await go(FILE + f.full, 'tab'); return; }
     case 'new-project': await openProjectSheet(); return;
     case 'np-choose': await chooseProjectFolder(); return;
     case 'np-in': np.in = v; renderProjectSheet(); return;
@@ -3066,7 +3177,7 @@ Rich.onReady = () => { for (const [id] of PANES) if (!(id === 'side' && S.ui.fil
 Rich.onFile = openFileFrom;
 // Escape in a preview: a file's closes it, as Escape does there; a message's returns the keyboard to
 // its pane, where the next Escape does what it does.
-Rich.onEscape = (frame) => { if (frame.closest('.fview') && S.ui.file) closeFile(); else focusInput(frame.closest('.pane.side') && !S.ui.file ? 'side' : 'main'); };
+Rich.onEscape = (frame) => { if (frame.closest('.pane.side .fview') && S.ui.file) closeFile(); else focusInput(frame.closest('.pane.side') && !S.ui.file ? 'side' : 'main'); };
 Rich.onError = (text) => toast(text, 4000);
 
 // ---------- boot ----------
