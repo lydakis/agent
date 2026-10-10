@@ -493,7 +493,7 @@ pub struct Local {
     pub minute: u8,
 }
 
-fn local(epoch: i64) -> Local {
+pub(crate) fn local(epoch: i64) -> Local {
     // SAFETY: localtime_r fills the zeroed struct it is given and nothing else.
     let tm = unsafe {
         let mut tm: libc::tm = std::mem::zeroed();
@@ -1183,7 +1183,7 @@ fn replace(path: &Path, text: &str) -> Result<(), String> {
 
 /// `replace` with the file's mode set from creation, so the new name never
 /// has any other.
-fn replace_mode(path: &Path, text: &[u8], mode: u32) -> Result<(), String> {
+pub(crate) fn replace_mode(path: &Path, text: &[u8], mode: u32) -> Result<(), String> {
     use std::os::unix::fs::OpenOptionsExt;
     let dir = path.parent().ok_or("no folder")?;
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -2194,7 +2194,7 @@ async fn bot_id(client: &Client, name: &str) -> Result<i64, String> {
         .request("resume", json!({"bot": name}))
         .await
         .map_err(coded)?;
-    record["id"]
+    record["bot_id"]
         .as_i64()
         .ok_or_else(|| "the daemon named no bot id".into())
 }
@@ -2547,7 +2547,7 @@ async fn start(client: &Client, trigger: &Trigger) -> Result<i64, String> {
     let made = client
         .request(
             "create",
-            json!({"bot": name, "workspace": dir, "model": model, "reasoning": effort,
+            json!({"bot": name, "workspace": dir, "model": model, "effort": effort,
                 "instructions": policy["instructions"],
                 "compaction_instructions": policy["compaction_instructions"],
                 "tools": crate::TOOLS,
@@ -2557,7 +2557,7 @@ async fn start(client: &Client, trigger: &Trigger) -> Result<i64, String> {
         )
         .await
         .map_err(coded)?;
-    made["id"]
+    made["bot_id"]
         .as_i64()
         .ok_or_else(|| "create: no bot id".into())
 }
@@ -4126,12 +4126,18 @@ mod tests {
         };
         git(&["merge", "-q", "--ff-only", &three]);
         assert!(!moved(&root, &looked).0);
-        // A HEAD the repository no longer has (made again) is not known.
+        // A HEAD the repository no longer has (made again) excludes nothing:
+        // what HEAD reaches is news when it was committed since the last look.
         let gone = Seen {
             head: Some("0".repeat(40)),
-            ..at_main
+            ..at_first.clone()
         };
         assert!(moved(&root, &gone).0);
+        let gone_after = Seen {
+            at: looked.at,
+            ..gone
+        };
+        assert!(!moved(&root, &gone_after).0);
         assert!(
             commit(root.join("nope").to_str().unwrap())
                 .unwrap_err()

@@ -107,7 +107,7 @@ def run(binary, rounds, judge, *, providers, reasoning, note, parallel, out):
             control = Connection(sock, retain_durable=False)
             args = [str(binary), 'approver', '--store', str(store), '--socket', str(sock), '--judge', judge]
             if reasoning:
-                args += ['--reasoning', reasoning]
+                args += ['--effort', reasoning]
             if note:
                 args += ['--note', str(note)]
             approver = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,

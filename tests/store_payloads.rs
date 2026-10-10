@@ -29,7 +29,7 @@ fn binding(family: Family) -> Binding<'static> {
         family,
         model: "test",
         instructions: "test",
-        reasoning: None,
+        effort: None,
         budget_tokens: None,
         tools: &[],
         created_by: None,

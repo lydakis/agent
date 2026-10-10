@@ -133,8 +133,9 @@ A bot is an identity with a retained conversation: every turn appends to it.
 exist; `--new --bot NAME` creates it and fails with `bot_exists` if the name is
 taken; no `--bot` creates a fresh generated identity. A typo can therefore never
 silently start an empty conversation under a familiar name. Names are the
-address; the identity is a store-wide integer `id` that `create`, `fork`,
-`resume`, `bots`, and every `submit` answer report, and that is never reused
+address; the identity is a store-wide integer `bot_id` that `create`, `fork`,
+`resume`, `bots`, every `submit` answer, and the `created` and `forked` events
+report, and that is never reused
 after a delete. A fork is a new identity with an empty request namespace.
 
 A bot keeps its folder but is not bound to it. A new bot starts in the
@@ -305,7 +306,7 @@ outcome once finished; an `interrupt` reply is the view plus
 `submit` answers with the view's identity and status, without a second read.
 
 `turns` (protocol) and `agent turns --bot NAME` list a bot's turns as views
-with effective workspace, model and reasoning, delivery, cache hit, and a
+with effective workspace, model and effort, delivery, cache hit, and a
 prompt preview, paged by `after`. A finished turn's outcome comes from `wait` on
 its handle; `timeout_ms: 0` answers at once, pending while the turn runs. `agent turns`
 restarts an idle daemon using the supplied provider/tool configuration (or
@@ -393,8 +394,8 @@ A model reference is `PROVIDER/MODEL`. A provider spec is
 
 | Family | Protocol | Defaults |
 | --- | --- | --- |
-| `responses` | OpenAI Responses API, streaming SSE | `openai` → `https://api.openai.com/v1`, `OPENAI_API_KEY`; `openrouter` → `https://openrouter.ai/api/v1`, `OPENROUTER_API_KEY`; `chatgpt` → `https://chatgpt.com/backend-api/codex`, Codex's ChatGPT login; `bedrock-openai` → `https://bedrock-mantle.$AWS_REGION.api.aws/openai/v1`, SigV4 |
-| `anthropic` | Anthropic Messages API, streaming SSE | `anthropic` → `https://api.anthropic.com/v1`, `ANTHROPIC_API_KEY`; `bedrock` → `https://bedrock-mantle.$AWS_REGION.api.aws/anthropic/v1`, SigV4 |
+| `responses` | OpenAI Responses API, streaming SSE | `openai` → `https://api.openai.com/v1`, `OPENAI_API_KEY`; `openrouter` → `https://openrouter.ai/api/v1`, `OPENROUTER_API_KEY`; `chatgpt` → `https://chatgpt.com/backend-api/codex`, Codex's ChatGPT login; `bedrock-openai` → `https://bedrock-mantle.{region}.api.aws/openai/v1`, SigV4 or `AWS_BEARER_TOKEN_BEDROCK` |
+| `anthropic` | Anthropic Messages API, streaming SSE | `anthropic` → `https://api.anthropic.com/v1`, `ANTHROPIC_API_KEY`; `bedrock` → `https://bedrock-runtime.{region}.amazonaws.com/anthropic/v1`, SigV4 or `AWS_BEARER_TOKEN_BEDROCK` |
 
 The family `responses-ws` is the Responses API over a WebSocket per bot,
 continuing from the bot's previous response where it can; for example
@@ -411,12 +412,26 @@ the family label alone does not establish support for an arbitrary gateway.
 
 Amazon Bedrock serves both families, so a Bedrock binding is a base URL and
 a way to authenticate; [BEDROCK.md](BEDROCK.md) records the survey and the
-choices. `bedrock` and `bedrock-openai` take the region from `AWS_REGION`, or
-`AWS_DEFAULT_REGION`, and fail at startup naming the spec when neither is set.
+choices. `bedrock` binds Claude on Bedrock runtime, whose cross-region
+inference profiles (`global.anthropic.claude-opus-5-5`, or `us.`, `eu.`,
+`apac.` and the other geographies) route each call to whichever region
+holds the model, from any source region the profile supports (AWS lists them
+per profile, and `ListInferenceProfiles` names only the profiles callable from
+the region asked), and `bedrock-openai` binds OpenAI and other models on Bedrock Mantle, as
+Claude Code and Codex do by default. Both take the region in Claude Code's
+order: `AWS_REGION`, `AWS_DEFAULT_REGION`, the `region` of the active profile
+(`AWS_PROFILE`, else `default`) in the AWS shared credentials file and then
+the config file, else us-east-1; the first value set must be shaped like a region,
+or the spec is refused naming where it came from. Both use a Bedrock API key when `AWS_BEARER_TOKEN_BEDROCK` is set, and
+SigV4 otherwise; a key takes no us-east-1 fallback, since a short-term key works
+only in the region that made it, so with nothing naming a region the spec is
+refused (Codex requires a region for keys too). `provider_models` lists runtime's models as the active
+system-defined inference profiles the Bedrock control plane in its region
+names (`ListInferenceProfiles`), and Mantle's as its host's `/v1/models`.
 Any `bedrock-mantle.{region}.api.aws` or `bedrock-runtime.{region}.amazonaws.com`
 URL without a key field signs every request with SigV4, for example
-`--provider br=anthropic,https://bedrock-runtime.us-west-2.amazonaws.com/anthropic/v1`
-with `global.anthropic.claude-opus-5` model ids. Keys come from the AWS chain in
+`--provider mantle=anthropic,https://bedrock-mantle.us-east-1.api.aws/anthropic/v1`
+for Claude on Mantle with in-region `anthropic.claude-opus-5-5` ids. Keys come from the AWS chain in
 its own order: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (with
 `AWS_SESSION_TOKEN`) when set, otherwise whatever the AWS CLI resolves for
 `AWS_PROFILE` or the default profile, SSO and assumed roles included, through
@@ -502,13 +517,13 @@ to recognize arbitrary encodings of secrets or unknown credentials.
 History items are stored in the family's native encoding and streamed into
 requests by reference, without translation. A bot is therefore bound to its
 provider family at creation; `create` accepts `model`, `instructions`, and
-`reasoning` (`low`, `medium`, `high`, `xhigh`, and on Anthropic `max`), and a
+`effort` (`low`, `medium`, `high`, `xhigh`, and on Anthropic `max`), and a
 fork inherits its source's binding.
 A turn may override the model within the same family (`submit` with `model`, or
 `run --model` on an existing bot); a different family is rejected with
 `provider_family_mismatch`. A turn may likewise run at another effort level
-(`submit` with `reasoning`, or `run --reasoning` on an existing bot); a level
-the family does not take is `invalid_reasoning_level`. Each override is recorded
+(`submit` with `effort`, or `run --effort` on an existing bot); a level
+the family does not take is `invalid_effort`. Each override is recorded
 on the turn and in its `accepted` event, and the bot's default is unchanged. A
 steer that names a level joins only a running turn at that level. Cross-family handoff of a
 conversation is not implemented; it would be an explicit lossy fork that
@@ -668,7 +683,7 @@ and `claude-opus-5-5`, `claude-opus-5` and `claude-fable-5-1` answer normally
 with it set; a live refusal was not reproduced, so the fallback path is covered
 by parser and synthetic-endpoint tests.
 
-`reasoning` (`low`, `medium`, `high`, `xhigh`, `max`) maps to Responses
+`effort` (`low`, `medium`, `high`, `xhigh`, `max`) maps to Responses
 `reasoning.effort` with summaries requested, and to Anthropic adaptive thinking
 (`thinking.type: adaptive` with summarized display) plus `output_config.effort`.
 Every Anthropic call sets `max_tokens` to the model's full output limit:
@@ -863,7 +878,7 @@ Requests include a string or nonnegative integer `id`. Responses carry the same
 `id` and either `result` or an explicit `error` code with optional `detail`.
 A refusal a program acts on also carries its facts as fields beside them:
 `bot_busy` from `submit` reports `running_turn` and `fork_point`, and
-`invalid_reasoning_level` lists the model's `levels`. A line that is not JSON
+`invalid_effort` lists the model's `efforts`. A line that is not JSON
 is `invalid_json` with a null `id`; JSON of the wrong shape is
 `invalid_request`, answered with its `id` when that parses, and its detail
 names the unknown or ill-typed field.
@@ -879,7 +894,7 @@ they report. Live `text_delta` and `thinking_delta` notifications keep their
 own path from the turn. Example requests:
 
 ```json
-{"id":1,"op":"create","bot":"Bob","workspace":"/workspaces/project","model":"anthropic/claude-sonnet-5","reasoning":"low","instructions":"...","tools":["shell","read","write","edit","wait","history"],"compaction_instructions":"...","created_by":"Alice","created_by_id":42}
+{"id":1,"op":"create","bot":"Bob","workspace":"/workspaces/project","model":"anthropic/claude-sonnet-5","effort":"low","instructions":"...","tools":["shell","read","write","edit","wait","history"],"compaction_instructions":"...","created_by":"Alice","created_by_id":42}
 {"id":2,"op":"submit","bot":"Bob","request_id":"work-1","prompt":"Hello","workspace":"/workspaces/project-copy","model":"anthropic/claude-opus-5-5"}
 {"id":19,"op":"submit","bot":"Bob","request_id":"work-2","prompt":"Also check the docs","delivery":"steer"}
 {"id":3,"op":"follow","bot":"Bob","after":0}
@@ -930,7 +945,7 @@ The fork can read its shared prefix after its source is deleted.
 `history_items` accepts `bot` and 1–400 distinct `nodes`. It validates all IDs
 against that bot's lineage with one ancestry walk and returns a prefix as
 `items: [{node: ID, item: VALUE}, ...]` in request order. A prompt a bot's turn
-wrote also carries `from: {bot, turn, id}`, with `id` the identity the bot's name
+wrote also carries `from: {bot, turn, bot_id}`, with `bot_id` the identity the bot's name
 held when it wrote it, and one a client sent with an `origin` carries that, so a
 client can say who each message came from without reading every turn. The store
 keeps both with the prompt's node (`senders`), so they last as long as the item:
@@ -1107,7 +1122,7 @@ that turn; a prompt without it is a person's. The CLI sends it from
 without the other (`author_turn_required`). The store checks that the turn
 is the bot's (`invalid_from`), keeps it on the new turn's row, a steer's
 included, counts it in the request's idempotency, and reports it on
-`accepted`, `queued` and `steered`, with the sender's identity as `from.id`. Like the
+`accepted`, `queued` and `steered`, with the sender's identity as `from.bot_id`. Like the
 creator, it is declared, not verified. A client that sends a prompt on its own,
 not from a bot's turn, may name itself with `origin` (a name's characters,
 else `invalid_origin`), mutually exclusive with `from`, stored and reported the same way; the daemon gives it
@@ -2015,7 +2030,7 @@ starts `agent approver` detached if no session serves `auto`, logging to
 `TYPESAFE_API_KEY` is set, else the bot's own model, and a judge that
 cannot start fails the command before any bot is made
 (`approver_start_failed`). `agent approver [--tag TAG] [--judge
-PROVIDER/MODEL] [--reasoning LEVEL] [--note FILE] [--judge-url URL]` serves
+PROVIDER/MODEL] [--effort LEVEL] [--note FILE] [--judge-url URL]` serves
 a tag and has a judge decide every call waiting on it, printing one JSON
 line per round ([APPROVALS.md](APPROVALS.md#automatic-mode)). `agent approvals [--bot NAME] [--tag TAG]` lists pending
 calls, `agent answer --bot NAME --turn N --call ID --request R allow|deny

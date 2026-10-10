@@ -49,12 +49,14 @@ export OPENROUTER_API_KEY=...   # openrouter/VENDOR/MODEL
 export AGENT_MODEL=anthropic/claude-opus-5-5
 ```
 
-For Amazon Bedrock, set `AWS_REGION` and use your usual AWS credentials
-(`AWS_PROFILE`, SSO, or keys in the environment); start the daemon with
-`--provider bedrock` and name models like `bedrock/anthropic.claude-opus-5-5`,
-or `--provider bedrock-openai` for `bedrock-openai/openai.gpt-6-sol`.
+For Amazon Bedrock, use your usual AWS credentials (`AWS_PROFILE`, SSO, or keys
+in the environment); no region is needed. A Bedrock API key in
+`AWS_BEARER_TOKEN_BEDROCK` works too, with `AWS_REGION` set to the key's region. Start the daemon with `--provider bedrock` and name Claude
+models by their cross-region inference profile, like
+`bedrock/global.anthropic.claude-opus-5-5`, which AWS routes to whichever
+region holds the model (from any source region the profile supports), or `--provider bedrock-openai` for `bedrock-openai/openai.gpt-6-sol`.
 `AGENT_PROVIDER` takes the place of `--provider` for any provider, so
-`export AGENT_PROVIDER=bedrock AGENT_MODEL=bedrock/anthropic.claude-sonnet-5`
+`export AGENT_PROVIDER=bedrock AGENT_MODEL=bedrock/global.anthropic.claude-sonnet-5`
 needs no flags.
 `agent models --discover` writes `~/.agent/models` from what your providers
 list; edit it down to the models the app and your agents should offer.

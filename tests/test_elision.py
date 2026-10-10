@@ -416,7 +416,7 @@ class AnthropicElisionTests(ModelFixture):
                         env={**clean_env(), 'ANTHROPIC_TEST_KEY': 'synthetic-anthropic-key'},
                         settings={'context_bytes': 65536})
         self.addCleanup(client.close)
-        self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path), reasoning='low'))
+        self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path), effort='low'))
         turn = client.request('submit', bot='Bob', request_id='1', prompt='long:16')['result']['turn']
         ended = client.finished(turn)
         self.assertEqual(ended['data']['status'], 'completed', ended)
