@@ -38,6 +38,18 @@ impl Family {
             Family::Anthropic => &["low", "medium", "high", "xhigh", "max"],
         }
     }
+    /// Refuse a level this family does not take, naming the ones it does.
+    pub fn check_reasoning(self, level: &str) -> Result<()> {
+        let levels = self.reasoning_levels();
+        if levels.contains(&level) {
+            return Ok(());
+        }
+        Err(crate::Error::with(
+            "invalid_reasoning_level",
+            format!("{level} is not one of {}", levels.join(", ")),
+        )
+        .facts(json!({"levels":levels})))
+    }
     /// The quota a model draws on. Dated snapshots and their alias share one
     /// allowance at both providers, so they share one pool: `gpt-5.6-luna`
     /// and `gpt-5.6-luna-2026-05-01`, `claude-sonnet-5` and

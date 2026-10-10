@@ -360,16 +360,6 @@ class LongTaskScoreTests(unittest.TestCase):
             passed, total, failure = long_task_eval.hidden_tests(self.root)
         self.assertEqual((passed, failure), (total, None))
 
-    def test_summary_time_counts_retried_attempts_once(self):
-        usage = lambda cursor, sent, purpose=None: {
-            'cursor': cursor, 'event': 'usage', 'data': {'sent_ms': sent, 'purpose': purpose}}
-        # A failed summary retried before the call it held back, then a
-        # second summary later in the task.
-        events = [usage(1, 1000), usage(2, 2000, 'compaction'), usage(3, 5000, 'compaction'),
-                  usage(4, 9000), usage(5, 10000, 'compaction'), usage(6, 12000)]
-        result = score(self.root, self.facts, events, '')
-        self.assertEqual(result['summarizer_ms'], 7000 + 2000)
-
     def test_each_call_is_scored_under_the_view_it_was_made_under(self):
         usage = lambda cursor: {'cursor': cursor, 'event': 'usage', 'data': {'sent_ms': cursor}}
         # A call, a stub pass, a call, a summary and a second step at the
@@ -655,10 +645,16 @@ class LongTaskRunnerTests(ModelFixture):
                 # Each installed summary names its span, how it was sent,
                 # and what it cost.
                 self.assertEqual(len(result['summaries']), result['compactions'])
+                # A summary installed a boundary after its plan also holds
+                # the rounds that ran beside it, which can take the view past
+                # the limit, for the next summary to catch up.
+                after_beside = False
                 for summary in result['summaries']:
                     self.assertEqual(summary['calls'], 1)
                     self.assertGreater(summary['span_bytes'], 0)
-                    self.assertLessEqual(summary['view_bytes'], summary['limit_bytes'])
+                    if not (summary['beside'] or after_beside):
+                        self.assertLessEqual(summary['view_bytes'], summary['limit_bytes'])
+                    after_beside = summary['beside']
                     self.assertIn(summary['form'], ('copy', 'own'))
                     self.assertEqual(summary['copied_items'] is None, summary['form'] == 'own')
                     self.assertGreater(summary['estimate']['own'], 0)

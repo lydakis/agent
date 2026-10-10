@@ -13,6 +13,11 @@ use tokio::{
 
 const QUEUE_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_EVENT: usize = 1024 * 1024;
+/// A refusal's detail is at most about this long in a response. A detail
+/// can echo what the client sent, up to a whole request line; its middle is
+/// elided so the refusal always fits, and its start and end, where the
+/// value and the rule are named, survive.
+pub const DETAIL_LIMIT: usize = 4096;
 type Packet = (Vec<u8>, OwnedSemaphorePermit, Option<oneshot::Sender<()>>);
 
 #[derive(Clone)]
@@ -20,6 +25,22 @@ pub struct Output {
     sender: mpsc::Sender<Packet>,
     budget: Arc<Semaphore>,
     closed: watch::Sender<bool>,
+}
+
+/// `detail` cut to `DETAIL_LIMIT`, keeping its start and end.
+pub fn bounded(detail: String) -> String {
+    if detail.len() <= DETAIL_LIMIT {
+        return detail;
+    }
+    let mut head = DETAIL_LIMIT / 2;
+    while !detail.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = detail.len() - DETAIL_LIMIT / 2;
+    while !detail.is_char_boundary(tail) {
+        tail += 1;
+    }
+    format!("{}…{}", &detail[..head], &detail[tail..])
 }
 
 impl Output {
@@ -127,7 +148,7 @@ impl Output {
                 let mut response = error.facts.map(|facts| *facts).unwrap_or_default();
                 response.insert("id".into(), id);
                 response.insert("error".into(), error.code.into());
-                response.insert("detail".into(), error.detail.into());
+                response.insert("detail".into(), error.detail.map(bounded).into());
                 Value::Object(response)
             }
         }
@@ -234,6 +255,26 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(output.send(serde_json::json!({})).await.is_err());
+    }
+    #[tokio::test]
+    async fn a_refusal_echoing_a_whole_request_still_fits() {
+        let (output, mut receiver) = Output::channel();
+        let echoed = format!("é{}is not one of low, high", "x".repeat(MAX_EVENT));
+        output
+            .respond(
+                serde_json::json!(7),
+                Err(crate::Error::with("invalid_reasoning_level", echoed)
+                    .facts(serde_json::json!({"levels":["low","high"]}))),
+            )
+            .await
+            .unwrap();
+        let (bytes, _, _) = receiver.recv().await.unwrap();
+        let response = serde_json::from_slice::<Value>(&bytes).unwrap();
+        assert_eq!(response["error"], "invalid_reasoning_level");
+        assert_eq!(response["levels"], serde_json::json!(["low", "high"]));
+        let detail = response["detail"].as_str().unwrap();
+        assert!(detail.len() <= DETAIL_LIMIT + '…'.len_utf8());
+        assert!(detail.starts_with("éx") && detail.ends_with("is not one of low, high"));
     }
     #[tokio::test]
     async fn oversized_response_is_correlated_and_does_not_close_output() {
