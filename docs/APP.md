@@ -1046,26 +1046,32 @@ or a file is added to or removed from it when it is a folder (launchd's
 `WatchPaths`); it need not exist yet, and it may not be in
 `~/.agent/triggers` or be its daemon's store (or its `-wal` and `-shm`, by
 any name, a hard link included), which every fire writes: `add` refuses one, and a fire that finds its path
-became one (a link moved) ends the trigger and sends nothing. A shell that
+became one (a link moved) ends the trigger, sending nothing and keeping a
+`failed` row that says why. A shell that
 names its daemon's socket and not its store cannot add one, since its store
 is not known to check. `--commit REPO` watches the
 repository's own HEAD log, which git writes on every move of HEAD, and sends
 only when HEAD names a commit other than the one the trigger last saw and
 the HEAD log's entries past where it was then (git only appends to it; the
 trigger keeps that place in bytes) include more than moves between commits
-already there (`checkout:`, `reset:`, a rebase's start, finish and abort).
+already there (`checkout:`, `reset:`, a rebase's start, finish and abort,
+a `merge` that only fast-forwards; a `pull` that fast-forwards brought
+commits, and sends). A fire for moves alone keeps where they took HEAD and
+its log, so the next fire reads only what came after.
 So a checkout back and forth, or a write that moved nothing, sends nothing;
 a commit, even one HEAD left and came back to, sends; a log made again since
 counts as news when HEAD is elsewhere. HEAD and the log's length are read
 together, again until the log stands still around HEAD, and the log is read
-as a stream keeping only the first 64 bytes of each entry's action, so a
-long commit title costs nothing. `add` records where HEAD is before
+as a stream keeping only the first 320 bytes of each entry's action, so a
+long commit title costs nothing; a fire finds the log once. `add` records
+where HEAD is, a repository with no commit yet included, before
 launchd watches, and when a commit came in between asks for a fire that
 looks as launchd would (a `wake.` ask), so a fire launchd already ran for
 it finds no news and the commit is sent once. A repository where git keeps no HEAD log
 (`core.logAllRefUpdates` false, or a bare one by default) is refused, and
 adding the same trigger again watches the git folder the repository has
-now. With no WHEN, only `fire` runs it; `fire` while a fire still runs is
+now, recording where its HEAD is in place of the old one's. git is the one
+on the `PATH` `add` ran with, which the plist keeps. With no WHEN, only `fire` runs it; `fire` while a fire still runs is
 sent by that fire once it is done.
 
 **Whom.** `add` defaults to the agent whose shell runs it (`AGENT_BOT`,
@@ -1096,11 +1102,13 @@ in the trigger's queue folder, `~/.agent/triggers/NAME.asks`, which its plist
 names as launchd's `QueueDirectories`: launchd runs the job while an ask is
 there, one run at a time, and runs it again when a run ends with one still
 there. Each ask is one fire: the fire moves the oldest out of the queue into
-`NAME.taking`, sends whatever its time or watched path, queues behind work
-rather than skipping it, and removes the ask once done; one a fire was cut
-short on is the next fire's. An entry that cannot be moved out of the queue
-would have launchd run the job for ever, so the trigger ends, saying why
-(`asks_stuck`). A trigger that goes sets its asks aside with its files until launchd unloads its
+`NAME.taking`, which launchd also watches, sends whatever its time or
+watched path, queues behind work rather than skipping it, and removes the
+ask once done; one a fire was cut short on is the next fire's, and its
+message has the same `request_id`, named by the ask, so the daemon takes it
+once. A queue that cannot be read, or an ask that cannot be moved out of it
+or removed once done, would have launchd run the job for ever, so the
+trigger ends, saying why (`asks_stuck`). A trigger that goes sets its asks aside with its files until launchd unloads its
 job, and puts them back when it will not. Nothing else starts a fire:
 launchd is the only thing that runs one.
 

@@ -245,6 +245,16 @@ class TriggerFireTests(ModelFixture):
         news = self.fire('p.task', 'Look at it.', when=when, extra=extra, generation='g')
         self.assertNotEqual(news['last']['turn'], first['last']['turn'])
         self.settle('p.task')
+        # A move between commits sends nothing, and the next look starts past it.
+        subprocess.run([*git, 'checkout', '-q', 'HEAD~1'], check=True)
+        back = self.fire('p.task', 'Look at it.', when=when, extra=extra, generation='g')
+        self.assertEqual(back['last'], news['last'])
+        self.assertEqual(back['head'], sha)
+        self.assertGreater(back['log'], news['log'])
+        subprocess.run([*git, 'checkout', '-q', '-'], check=True)
+        news = self.fire('p.task', 'Look at it.', when=when, extra=extra, generation='g')
+        self.assertEqual(news['last'], back['last'])
+        self.assertEqual(len(self.turns('p.task')), 3)
         # Run now while the repository is away sends, and keeps the commit last seen.
         moved = self.path / 'away'
         repo.rename(moved)
@@ -259,14 +269,16 @@ class TriggerFireTests(ModelFixture):
         self.fire('p.task', 'Look at it.', when=when, extra=extra, generation='g')
         self.assertEqual(len(self.turns('p.task')), count, 'its return is no new commit')
 
-    def test_a_file_trigger_whose_path_became_its_own_state_ends_without_sending(self):
+    def test_a_file_trigger_whose_path_became_its_own_state_ends_saying_why(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
         state = self.home / '.agent/triggers'
         state.mkdir(parents=True)
         # Made for a folder a link pointed elsewhere; the link now points at the triggers' own.
         link = self.path / 'watched'
         link.symlink_to(state)
-        self.assertIsNone(self.fire('p.task', 'x', when=f'file {link}', extra=['--file', str(link / 'p.task.json')]))
+        ended = self.fire('p.task', 'x', when=f'file {link}', extra=['--file', str(link / 'p.task.json')])
+        self.assertEqual(ended['last']['outcome'], 'failed', ended)
+        self.assertTrue(ended['last']['detail'].startswith('invalid_file:'), ended)
         self.assertEqual(len(self.turns('p.task')), 1)
 
     def test_add_from_an_agents_shell_needs_launchd(self):
