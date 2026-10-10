@@ -36,7 +36,7 @@ function page(daemon = {}, storage = null) {
   context.Rich = context.window.Rich;
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, openFileFrom, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, save, restore, showMenu, refreshMenu, entries, pickerRows, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules, tellLead, markSeen, renderFile, go, upOf, crumbsHTML, railRows, renderTabs };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, openFileFrom, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, save, restore, showMenu, refreshMenu, entries, pickerRows, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readTriggers, tellLead, markSeen, renderFile, go, upOf, crumbsHTML, railRows, renderTabs };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -2847,10 +2847,10 @@ test('a message another agent sent names its sender, live, steered in, and read 
   assert.equal((reused.match(/<span class="by" title="Sent by demo.lead, turn \d, since deleted">coordinator<\/span>/g) || []).length, 3, reused);
 });
 
-test('the app\'s own task updates and scheduled messages are tagged by the origin it sent them with', async () => {
+test('the app\'s own task updates and triggered messages are tagged by the origin it sent them with', async () => {
   const items = { 1: { role: 'user', content: [{ type: 'input_text', text: 'Task updates: build ended' }] }, 2: { role: 'user', content: [{ type: 'input_text', text: 'check the nightly run' }] },
     3: { role: 'user', content: [{ type: 'input_text', text: 'thanks' }] } };
-  const origins = { 1: { origin: 'tasks' }, 2: { origin: 'schedule' } };
+  const origins = { 1: { origin: 'tasks' }, 2: { origin: 'trigger' } };
   const p = page({ request: async (op) => {
     if (op === 'history_nodes') return { nodes: [{ node: 3, turn: 3 }, { node: 2, turn: 2 }, { node: 1, turn: 1 }], workspaces:[],next_from: null, next_newer: null };
     throw new Error(op);
@@ -2859,13 +2859,13 @@ test('the app\'s own task updates and scheduled messages are tagged by the origi
   await p.load('demo.lead');
   let html = p.itemsHTML(t);
   assert.match(html, /<span class="by">tasks<\/span> Task updates: build ended/);
-  assert.match(html, /<span class="by">schedule<\/span> check the nightly run/);
+  assert.match(html, /<span class="by">trigger<\/span> check the nightly run/);
   assert.match(html, /<div class="line user">› thanks<\/div>/);
   // Live, the origin comes with the turn's start.
   const q = page({ request: async (op, r) => items[r.node] });
-  await q.onEvent({ event: 'accepted', bot: 'demo.lead', turn: 2, data: { node: 2, origin: 'schedule' } });
+  await q.onEvent({ event: 'accepted', bot: 'demo.lead', turn: 2, data: { node: 2, origin: 'trigger' } });
   await q.loadBatch('demo.lead');
-  assert.match(q.itemsHTML(q.transcript('demo.lead')), /<span class="by">schedule<\/span> check the nightly run/);
+  assert.match(q.itemsHTML(q.transcript('demo.lead')), /<span class="by">trigger<\/span> check the nightly run/);
 });
 
 test('a coordinator hears once, when it rests, of turns its tasks ended that it did not ask for', async () => {
@@ -3016,7 +3016,7 @@ test('a window that saw news to act on never defers to one that saw only yours',
   assert.ok([...told.values()].some((prompt) => /\n- demo\.build: turn:demo\.build\/2 completed, asked by you\n/.test(prompt)));
 });
 
-test('an approval answered before the coordinator hears of it is not raised, and a schedule\'s turn is the coordinator\'s', async () => {
+test('an approval answered before the coordinator hears of it is not raised, and a trigger\'s turn is the coordinator\'s', async () => {
   const sent = [];
   const p = page({ request: async (op, params) => { if (op === 'submit') sent.push(params); return {}; }, log() {} });
   p.S.live = true; p.S.attached = true;
@@ -3026,15 +3026,15 @@ test('an approval answered before the coordinator hears of it is not raised, and
   await p.onEvent({ event: 'accepted', bot: 'demo.build', turn: 1, data: { node: 1 } });
   await p.onEvent({ event: 'turn_waiting', bot: 'demo.build', turn: 1, data: { call_id: 'c1', approval: true } });
   await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 1, data: { status: 'completed' } });
-  // A schedule asks a task for a check.
-  await p.onEvent({ event: 'accepted', bot: 'demo.nightly', turn: 4, data: { node: 2, origin: 'schedule' } });
+  // A trigger asks a task for a check.
+  await p.onEvent({ event: 'accepted', bot: 'demo.nightly', turn: 4, data: { node: 2, origin: 'trigger' } });
   await p.onEvent({ event: 'turn_finished', bot: 'demo.nightly', turn: 4, data: { status: 'completed' } });
   await p.onEvent({ event: 'turn_finished', bot: 'demo.lead', turn: 2, data: { status: 'completed' } });
   await p.tick();
   assert.equal(sent.length, 1);
   assert.doesNotMatch(sent[0].prompt, /waiting for approval/);
   assert.doesNotMatch(sent[0].prompt, /theirs/);
-  assert.match(sent[0].prompt, /\n- demo\.build: turn:demo\.build\/1 completed, asked by the person, and 1 earlier since turn:demo\.build\/1\n- demo\.nightly: turn:demo\.nightly\/4 completed, asked by schedule$/);
+  assert.match(sent[0].prompt, /\n- demo\.build: turn:demo\.build\/1 completed, asked by the person, and 1 earlier since turn:demo\.build\/1\n- demo\.nightly: turn:demo\.nightly\/4 completed, asked by trigger$/);
   assert.equal(p.S.turnOrigin.size, 0, 'origins are forgotten as turns end');
 });
 
@@ -3070,16 +3070,16 @@ test('approval calls and completion in one turn each reach the coordinator once 
   assert.match([...delivered.values()].at(-1), /completed, asked by the person$/);
 });
 
-test('Settings lists schedules with no project, and only then when there are some', async () => {
+test('Settings lists triggers with no project, and only then when there are some', async () => {
   const p = page({});
   const st = p.setupState();
   p.S.bots.clear();
-  assert.doesNotMatch(p.setupHTML(), /Schedules/);
-  st.schedules = [{ name: 'loose', bot: 'loose', bot_id: 3, when: 'in 2h', once: true, ended: true, message: 'x', last: { outcome: 'failed', fired_ms: 0, detail: 'daemon_unavailable' } }];
-  assert.match(p.setupHTML(), /<h3>Schedules<\/h3>.*not delivered/s);
+  assert.doesNotMatch(p.setupHTML(), /Triggers/);
+  st.triggers = [{ name: 'loose', bot: 'loose', bot_id: 3, when: 'in 2h', once: true, ended: true, message: 'x', last: { outcome: 'failed', fired_ms: 0, detail: 'daemon_unavailable' } }];
+  assert.match(p.setupHTML(), /<h3>Triggers<\/h3>.*not delivered/s);
   // A one-off past its time and a plist that cannot be read are listed too, each removable.
-  st.schedules.push({ name: 'late', bot: 'late', bot_id: 4, when: 'at 2026-09-01 09:00', once: true, ended: false, missed: true, message: 'y', last: null },
-    { name: 'odd', ended: false, problem: 'unreadable: not a schedule\'s plist' });
+  st.triggers.push({ name: 'late', bot: 'late', bot_id: 4, when: 'at 2026-09-01 09:00', once: true, ended: false, missed: true, message: 'y', last: null },
+    { name: 'odd', ended: false, problem: 'unreadable: not a trigger\'s plist' });
   const html = p.setupHTML();
   assert.match(html, /missed its time/);
   assert.match(html, /unreadable<\/span>.*data-v="odd"/s);
@@ -3158,7 +3158,7 @@ test('a window on a host takes the home the host names and leaves out what reads
     attach: async () => ({ session: 1, store: 'store-box', workspace: '/home/someone' }),
     pull: () => new Promise(() => {}),
     request: async (op) => (op === 'bots' ? { bots: [{ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', workspace: '/home/someone/app', status: 'idle' }] } : {}),
-    schedules: async () => { calls.push('schedules'); return []; },
+    triggers: async () => { calls.push('triggers'); return []; },
     swarms: async () => { calls.push('swarms'); return { swarms: [], broken: [] }; },
     branch: async () => { calls.push('branch'); return null; },
     settings: async () => ({ providers: [], keys: [], restartable: false, host: 'box' }),
@@ -3178,8 +3178,8 @@ test('a window on a host takes the home the host names and leaves out what reads
   assert.match(html, /runs on box, with the providers its login shell there exports/);
   assert.match(html, /remote_unsupported: The model list/);
   assert.doesNotMatch(html, /Roles/);
-  assert.doesNotMatch(html, /<h3>Schedules<\/h3>/);
-  assert.ok(!calls.includes('schedules'), 'remote Settings never reads local schedules');
+  assert.doesNotMatch(html, /<h3>Triggers<\/h3>/);
+  assert.ok(!calls.includes('triggers'), 'remote Settings never reads local triggers');
   assert.doesNotMatch(html, /Add a provider/);
   p.lost('agent_missing: box has no agent on its login shell\'s PATH');
   assert.match(p.elements.get('detached').innerHTML, /daemon on <span class="k">box<\/span>/);
@@ -3245,22 +3245,22 @@ test('a home the last host named is replaced by the one the new store names', as
   assert.equal(p.S.config.workspace, '/home/b');
 });
 
-test('schedule pages replace the previous messages and remote windows do not fetch them', async () => {
+test('trigger pages replace the previous messages and remote windows do not fetch them', async () => {
   const calls = [];
-  const p = page({ schedules: async (after) => {
+  const p = page({ triggers: async (after) => {
     calls.push(after);
-    return { schedules: [{ name: after ? 'second' : 'first' }], next_after: after ? null : 'first' };
+    return { triggers: [{ name: after ? 'second' : 'first' }], next_after: after ? null : 'first' };
   } });
-  await p.readSchedules();
-  assert.equal(p.setupState().schedules[0].name, 'first');
-  await p.readSchedules(p.setupState().schedulesNext);
-  assert.equal(p.setupState().schedules.length, 1);
-  assert.equal(p.setupState().schedules[0].name, 'second');
-  assert.equal(p.setupState().schedulesNext, null);
+  await p.readTriggers();
+  assert.equal(p.setupState().triggers[0].name, 'first');
+  await p.readTriggers(p.setupState().triggersNext);
+  assert.equal(p.setupState().triggers.length, 1);
+  assert.equal(p.setupState().triggers[0].name, 'second');
+  assert.equal(p.setupState().triggersNext, null);
   p.S.config = { host: 'remote' };
-  await p.readSchedules();
+  await p.readTriggers();
   assert.deepEqual(calls, [null, 'first']);
-  assert.equal(p.setupState().schedules, null);
+  assert.equal(p.setupState().triggers, null);
 });
 
 test('usage checks member and descendant budgets before any turn ends, once enough tokens could move a share', async () => {

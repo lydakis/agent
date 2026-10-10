@@ -1,4 +1,4 @@
-"""A schedule's fire against a real daemon: what launchd runs, sent to the bot it was made for."""
+"""A trigger's fire against a real daemon: what launchd runs, sent to the bot it was made for."""
 import json
 import os
 import shutil
@@ -21,7 +21,7 @@ APP = next((p for p in (ROOT / '.local/target/debug/agent-app', ROOT / '.local/t
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 @unittest.skipUnless(APP, 'build the app first: cargo build -p agent-app')
-class ScheduleFireTests(ModelFixture):
+class TriggerFireTests(ModelFixture):
     def setUp(self):
         super().setUp()
         self.store = self.path / 'state.sqlite'
@@ -51,21 +51,21 @@ class ScheduleFireTests(ModelFixture):
         return self._store_id
 
     def fire(self, name, bot, bot_id, message, at=None, app=APP, socket=None, env=None, store_id=None, not_before=None):
-        # What a schedule's plist has launchd run.
+        # What a trigger's plist has launchd run.
         store_id = store_id or self.store_identity()
-        args = [str(app), '--schedule-fire', '--name', name, '--bot', bot, '--bot-id', str(bot_id),
+        args = [str(app), '--trigger-fire', '--name', name, '--bot', bot, '--bot-id', str(bot_id),
                 '--generation', str(time.time_ns()), '--when', 'every 30m', *(['--at', str(at)] if at else []), '--store', str(self.store),
                 *(['--socket', str(socket)] if socket else []),
                 '--store-id', store_id, *(['--not-before', str(not_before)] if not_before else []), '--', message]
         env = {**clean_env(), 'HOME': str(self.home), **(env or {})}
-        # A fire records and ends only the schedule its plist still holds.
-        plist = self.home / 'Library/LaunchAgents' / f'me.lydakis.agent.schedule.{name}.plist'
+        # A fire records and ends only the trigger its plist still holds.
+        plist = self.home / 'Library/LaunchAgents' / f'me.lydakis.agent.trigger.{name}.plist'
         plist.parent.mkdir(parents=True, exist_ok=True)
         strings = ''.join(f'<string>{xml_escape(a)}</string>' for a in args)
         plist.write_text(f'<plist><dict><key>ProgramArguments</key><array>{strings}</array></dict></plist>')
         result = subprocess.run(args, env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
-        last = self.home / '.agent/schedules' / f'{name}.json'
+        last = self.home / '.agent/triggers' / f'{name}.json'
         return json.loads(last.read_text()) if last.exists() else None
 
     def settle(self, bot):
@@ -78,18 +78,18 @@ class ScheduleFireTests(ModelFixture):
         self.assertEqual(sent['last']['outcome'], 'sent', sent)
         self.settle('p.task')
         self.assertEqual(self.turns('p.task')[-1]['prompt_preview'], 'Check the PR again.')
-        # The actual schedule submit preserves its automated origin in the
+        # The actual trigger submit preserves its automated origin in the
         # approver's input, the durable event, and the displayed history.
         connection = Connection(str(self.store) + '.sock')
         try:
             turn = sent['last']['turn']
             prompts = connection.request('prompts', bot='p.task', turn=turn)['result']['prompts']
-            self.assertEqual(prompts[0]['origin'], 'schedule')
+            self.assertEqual(prompts[0]['origin'], 'trigger')
             events = connection.request('events', bot='p.task', after=0, limit=256)['result']['events']
             accepted = next(e['data'] for e in events if e['event'] == 'accepted' and e['turn'] == turn)
-            self.assertEqual(accepted['origin'], 'schedule')
+            self.assertEqual(accepted['origin'], 'trigger')
             item = connection.request('history_items', bot='p.task', nodes=[accepted['node']])['result']['items'][0]
-            self.assertEqual(item['origin'], 'schedule')
+            self.assertEqual(item['origin'], 'trigger')
         finally:
             connection.close()
         # A working bot is not interrupted or queued behind: that time is skipped.
@@ -110,12 +110,12 @@ class ScheduleFireTests(ModelFixture):
                                     not_before=int(time.time()) + 1800))
         self.assertEqual(len(self.turns('p.task')), 1)
 
-    def test_a_stale_shell_cannot_schedule_a_replacement_bot(self):
+    def test_a_stale_shell_cannot_add_a_trigger_for_a_replacement_bot(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
         old = self.bot_id('p.task')
         self.agent('rm', '--store', str(self.store), '--bot', 'p.task')
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'again')
-        result = subprocess.run([str(APP), '--schedule', 'add', '--every', '30m', '--', 'x'],
+        result = subprocess.run([str(APP), '--trigger', 'add', '--every', '30m', '--', 'x'],
             env={**clean_env(), 'HOME': str(self.home), 'AGENT_STORE': str(self.store),
                  'AGENT_BOT': 'p.task', 'AGENT_BOT_ID': str(old)},
             capture_output=True, text=True, timeout=30)
@@ -183,7 +183,7 @@ class ScheduleFireTests(ModelFixture):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello again')
         gone = self.fire('p.task', 'p.task', old, 'Check the PR again.')
         self.assertEqual(gone['last']['outcome'], 'gone', gone)
-        # The schedule ended on its own, and says why until it is removed.
+        # The trigger ended on its own, and says why until it is removed.
         self.assertEqual(gone['message'], 'Check the PR again.')
         self.assertEqual(len(self.turns('p.task')), 1)
 
@@ -199,16 +199,16 @@ class ScheduleFireTests(ModelFixture):
         self.assertEqual(late['last']['outcome'], 'missed', late)
         self.assertEqual(len(self.turns('p.task')), 1)
 
-    def test_a_fire_records_nothing_for_a_schedule_replaced_or_removed_meanwhile(self):
+    def test_a_fire_records_nothing_for_a_trigger_replaced_or_removed_meanwhile(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
         bot_id = self.bot_id('p.task')
         first = self.fire('p.task', 'p.task', bot_id, 'first')
         # The plist now holds another generation of the same message: the old job's fire leaves its result alone.
-        plist = self.home / 'Library/LaunchAgents/me.lydakis.agent.schedule.p.task.plist'
+        plist = self.home / 'Library/LaunchAgents/me.lydakis.agent.trigger.p.task.plist'
         plist.write_text(plist.read_text().replace(first['generation'], first['generation'] + '-replacement'))
-        last = self.home / '.agent/schedules/p.task.json'
+        last = self.home / '.agent/triggers/p.task.json'
         last.unlink()
-        args = [str(APP), '--schedule-fire', '--name', 'p.task', '--bot', 'p.task', '--bot-id', str(bot_id),
+        args = [str(APP), '--trigger-fire', '--name', 'p.task', '--bot', 'p.task', '--bot-id', str(bot_id),
                 '--generation', first['generation'], '--when', 'every 30m', '--store', str(self.store), '--store-id', self.store_identity(), '--', 'first']
         result = subprocess.run(args, env={**clean_env(), 'HOME': str(self.home)}, capture_output=True, text=True,
                                 timeout=60)
@@ -216,15 +216,15 @@ class ScheduleFireTests(ModelFixture):
         self.assertFalse(last.exists())
 
     def test_add_from_an_agents_shell_needs_launchd(self):
-        # Here there is no launchd: the schedule is refused and nothing is left behind.
+        # Here there is no launchd: the trigger is refused and nothing is left behind.
         if os.uname().sysname == 'Darwin':
             self.skipTest('would add a real LaunchAgent on macOS')
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
         out = self.path / 'added.json'
         self.agent('run', '--store', str(self.store), '--bot', 'p.task',
-                   f"shell:HOME='{self.home}' '{APP}' --schedule add --every 30m -- check > '{out}' 2>&1")
+                   f"shell:HOME='{self.home}' '{APP}' --trigger add --every 30m -- check > '{out}' 2>&1")
         text = out.read_text()
-        self.assertIn('schedules_unsupported', text)
+        self.assertIn('triggers_unsupported', text)
         self.assertEqual(list((self.home / 'Library/LaunchAgents').glob('*.plist')), [])
 
     @unittest.skipUnless(sys.platform == 'darwin' and os.environ.get('AGENT_TEST_LAUNCHD') == '1',
@@ -232,15 +232,15 @@ class ScheduleFireTests(ModelFixture):
     def test_real_launchd_fires_replaces_and_removes(self):
         # The plists live under this test's HOME, so nothing loads at the next login.
         name = f'ztest-{os.getpid()}'
-        label = f'me.lydakis.agent.schedule.{name}'
+        label = f'me.lydakis.agent.trigger.{name}'
         target = f'gui/{os.getuid()}/{label}'
         plist = self.home / f'Library/LaunchAgents/{label}.plist'
         self.addCleanup(lambda: subprocess.run(['/bin/launchctl', 'bootout', target], capture_output=True))
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
         env = {**clean_env(), 'HOME': str(self.home), 'AGENT_STORE': str(self.store)}
 
-        def schedule(*args, ok=True):
-            result = subprocess.run([str(APP), '--schedule', *args], env=env, capture_output=True, text=True,
+        def trigger(*args, ok=True):
+            result = subprocess.run([str(APP), '--trigger', *args], env=env, capture_output=True, text=True,
                                     timeout=60)
             if ok:
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -256,28 +256,28 @@ class ScheduleFireTests(ModelFixture):
             return check()
 
         # A one-off: launchd runs it at its minute, the bot gets the message, and it ends itself.
-        schedule('add', '--bot', 'p.task', '--name', name, '--in', '1m', '--', 'launchd says hi')
+        trigger('add', '--bot', 'p.task', '--name', name, '--in', '1m', '--', 'launchd says hi')
         self.assertTrue(loaded())
         self.assertTrue(until(lambda: len(self.turns('p.task')) == 2, 150), 'launchd did not fire it')
         self.assertTrue(until(lambda: not loaded() and not plist.exists(), 30), 'it did not end itself')
-        self.assertEqual(json.loads(schedule('ls').stdout)['schedules'], [])
+        self.assertEqual(json.loads(trigger('ls').stdout)['triggers'], [])
         # A repeating one, replaced: one job, the new one.
-        schedule('add', '--bot', 'p.task', '--name', name, '--every', '30m', '--', 'a')
-        schedule('add', '--bot', 'p.task', '--name', name, '--every', '1h', '--', 'b')
+        trigger('add', '--bot', 'p.task', '--name', name, '--every', '30m', '--', 'a')
+        trigger('add', '--bot', 'p.task', '--name', name, '--every', '1h', '--', 'b')
         self.assertTrue(loaded())
-        rows = json.loads(schedule('ls').stdout)['schedules']
+        rows = json.loads(trigger('ls').stdout)['triggers']
         self.assertEqual([(r['name'], r['when'], r['message']) for r in rows], [(name, 'every 1h', 'b')])
         # A plist launchd no longer has, as after a failed reload: rm still removes it.
         subprocess.run(['/bin/launchctl', 'bootout', target], check=True, capture_output=True)
-        schedule('rm', name)
+        trigger('rm', name)
         self.assertFalse(plist.exists())
         # A job loaded without its plist, as after an end cut short: rm reaches it by name.
-        schedule('add', '--bot', 'p.task', '--name', name, '--every', '30m', '--', 'c')
+        trigger('add', '--bot', 'p.task', '--name', name, '--every', '30m', '--', 'c')
         plist.unlink()
-        schedule('rm', name)
+        trigger('rm', name)
         self.assertFalse(loaded())
         # Nothing left: bootout's not-loaded answer reads as that.
-        self.assertIn('schedule_not_found', schedule('rm', name, ok=False).stderr)
+        self.assertIn('trigger_not_found', trigger('rm', name, ok=False).stderr)
 
 
 if __name__ == '__main__':

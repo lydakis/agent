@@ -989,7 +989,7 @@ function enqueue(job) { chain = chain.then(job, job); return chain; }
 // them with, and its role says what to do with that. A turn it is waiting on is not news, since its wait
 // reads it; nor is its own fork or side chat. Only live turns count, while this window is attached.
 // Turns you asked for in a task yourself are its `theirs` news, listed apart: the coordinator hears of
-// them but is not asked to act on them. Turns another agent or the app (a schedule, by its `origin`)
+// them but is not asked to act on them. Turns another agent or the app (a trigger, by its `origin`)
 // asked for, and approvals, are its `act` news; a turn's end goes where its pending approval is.
 // Each kind keeps its own first and latest turn and a count, whatever the backlog, so a task can be in
 // both lists with the handles each one needs; one message names at most WAKE_TASKS tasks, those with
@@ -2478,7 +2478,7 @@ async function openSetup() {
   try { await loadSettings(); } catch (e) { st.error = String(e?.message ?? e); }
   try { st.roles = await Daemon.roles?.(); } catch (_) {}
   if (!st.settings?.providers?.length) st.adding = st.adding ?? '';
-  await readSchedules();
+  await readTriggers();
   renderSetup();
   await Promise.all([checkProviders(st.settings?.listing), readList()]);
 }
@@ -2643,7 +2643,7 @@ function setupHTML(kept = new Map()) {
     + step(2, 'First project', projects, project)
     + (projects && !S.config?.host ? rolesHTML(st, busy) : '')
     + hostsHTML(st, busy)
-    + (!S.config?.host && (projects || st.schedules?.length || st.schedulesAfter || st.schedulesError) ? schedulesHTML(st, busy) : '')
+    + (!S.config?.host && (projects || st.triggers?.length || st.triggersAfter || st.triggersError) ? triggersHTML(st, busy) : '')
     + (st.busy ? `<p class="busy">${esc(st.busy)}</p>` : '') + (st.error ? `<p class="bad">${esc(st.error)}</p>` : '');
 }
 // The hosts in ~/.ssh/config, each of which a window can be opened on. That window's agents run on
@@ -2663,33 +2663,33 @@ function rolesHTML(st, busy) {
   const rows = ROLES.map(([name, label]) => `<div class="prow"><span class="pn">${label}</span><span class="st${own.get(name) ? '' : ' dim'}">${own.get(name) ? `~/.agents/agents/${name}.md` : 'the app\'s own'}</span><span class="acts"><button type="button" class="sbtn" data-act="edit-role" data-v="${name}"${busy}>Edit</button></span></div>`).join('');
   return `<section><h3>Roles</h3>${rows}<p class="dim">A project's coordinator and a swarm's agents follow these in every project; a project's own .agents/agents file of that name comes first. An agent keeps the text it started with, so an edit reaches new projects and swarms.</p></section>`;
 }
-// Agents wake at set times from schedules they or their coordinator made; the Mac keeps the time.
+// Agents wake at set times from triggers they or their coordinator made; the Mac keeps the time.
 // Each shows who it wakes, when, what its last time did, and the message it sends.
-// A schedule that ended on its own without delivering stays listed, saying why, until it is removed; so do a
+// A trigger that ended on its own without delivering stays listed, saying why, until it is removed; so do a
 // one-off still there after its time and a plist that cannot be read.
-async function readSchedules(after = null) {
+async function readTriggers(after = null) {
   const st = setupState();
-  st.schedulesAfter = after;
+  st.triggersAfter = after;
   try {
-    const page = S.config?.host ? null : await Daemon.schedules?.(after);
-    st.schedules = page?.schedules ?? null; st.schedulesNext = page?.next_after ?? null; st.schedulesError = null;
-  } catch (e) { st.schedules = null; st.schedulesNext = null; st.schedulesError = String(e?.message ?? e); }
+    const page = S.config?.host ? null : await Daemon.triggers?.(after);
+    st.triggers = page?.triggers ?? null; st.triggersNext = page?.next_after ?? null; st.triggersError = null;
+  } catch (e) { st.triggers = null; st.triggersNext = null; st.triggersError = String(e?.message ?? e); }
 }
 const LAST = { sent: 'sent', skipped: 'skipped, it was working', gone: 'its agent is gone', failed: 'failed', missed: 'missed, its time passed long ago' };
-function schedulesHTML(st, busy) {
+function triggersHTML(st, busy) {
   const at = (ms) => new Date(ms).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
   const last = (l, ended) => l ? `${ended ? 'ended' : 'last'} ${at(l.fired_ms)}: ${LAST[l.outcome] ?? l.outcome}${l.outcome === 'failed' && l.detail ? ` (${String(l.detail).slice(0, 120)})` : ''}` : 'not run yet';
-  const remove = (x) => `<span class="acts"><button type="button" class="sbtn" data-act="schedule-remove" data-v="${esc(x.name)}"${busy}>Remove</button></span>`;
-  const rows = (st.schedules ?? []).map((x) => x.problem
+  const remove = (x) => `<span class="acts"><button type="button" class="sbtn" data-act="trigger-remove" data-v="${esc(x.name)}"${busy}>Remove</button></span>`;
+  const rows = (st.triggers ?? []).map((x) => x.problem
     ? `<div class="prow"><span class="pn">${esc(x.name)}</span><span class="st bad">unreadable</span>${remove(x)}<div class="sub dim">${esc(x.problem)}</div></div>`
     : `<div class="prow"><span class="pn">${esc(x.bot)}</span><span class="st${x.ended || x.missed ? ' bad' : ''}">${x.ended ? 'not delivered' : x.missed ? 'missed its time' : esc(x.when)}</span>${remove(x)}<div class="sub dim">${esc(last(x.last, x.ended))}${x.name !== x.bot ? ` · ${esc(x.name)}` : ''}</div><div class="sub dim">${esc(x.message.length > 240 ? `${x.message.slice(0, 240)}…` : x.message)}</div></div>`).join('');
-  const none = st.schedulesError ? `<p class="bad">${esc(st.schedulesError)}</p>` : rows ? '' : '<p class="dim">None yet. Ask a coordinator, for example "have build check its PR every 30 minutes".</p>';
-  return `<section><h3>Schedules</h3>${rows}${none}${st.schedulesAfter ? '<button class="sbtn" data-act="schedules-first">First page</button>' : ''}${st.schedulesNext ? '<button class="sbtn" data-act="schedules-next">Next page</button>' : ''}<p class="dim">Each time, the agent gets its message in its own chat. A repeating one skips a time its agent is working; a one-off waits for it. They run with the app closed; a time the Mac slept through runs once when it wakes.</p></section>`;
+  const none = st.triggersError ? `<p class="bad">${esc(st.triggersError)}</p>` : rows ? '' : '<p class="dim">None yet. Ask a coordinator, for example "have build check its PR every 30 minutes".</p>';
+  return `<section><h3>Triggers</h3>${rows}${none}${st.triggersAfter ? '<button class="sbtn" data-act="triggers-first">First page</button>' : ''}${st.triggersNext ? '<button class="sbtn" data-act="triggers-next">Next page</button>' : ''}<p class="dim">Each time, the agent gets its message in its own chat. A repeating one skips a time its agent is working; a one-off waits for it. They run with the app closed; a time the Mac slept through runs once when it wakes.</p></section>`;
 }
-async function removeSchedule(name) {
+async function removeTrigger(name) {
   const st = setupState();
-  try { await Daemon.removeSchedule(name); } catch (e) { toast(`remove ${name}: ${e?.message ?? e}`, 5000); }
-  await readSchedules(st.schedulesAfter);
+  try { await Daemon.removeTrigger(name); } catch (e) { toast(`remove ${name}: ${e?.message ?? e}`, 5000); }
+  await readTriggers(st.triggersAfter);
   renderSetup();
 }
 async function editRole(name) {
@@ -2889,9 +2889,9 @@ async function act(el) {
     case 'setup-remove': { const st = setupState(); if (anyActive() && st.confirm !== v) { st.confirm = v; renderSetup(); return; } st.confirm = null; await removeProvider(v); return; }
     case 'setup-retry': case 'setup-refresh': await refreshModels(); return;
     case 'edit-role': await editRole(v); return;
-    case 'schedules-first': await readSchedules(); renderSetup(); return;
-    case 'schedules-next': await readSchedules(setupState().schedulesNext); renderSetup(); return;
-    case 'schedule-remove': await removeSchedule(v); return;
+    case 'triggers-first': await readTriggers(); renderSetup(); return;
+    case 'triggers-next': await readTriggers(setupState().triggersNext); renderSetup(); return;
+    case 'trigger-remove': await removeTrigger(v); return;
     case 'open-host': await Daemon.openHost(v); return;
     default: return;
   }
