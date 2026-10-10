@@ -28,7 +28,7 @@ pub struct Output {
 }
 
 /// `detail` cut to `DETAIL_LIMIT`, keeping its start and end.
-fn bounded(detail: String) -> String {
+pub fn bounded(detail: String) -> String {
     if detail.len() <= DETAIL_LIMIT {
         return detail;
     }

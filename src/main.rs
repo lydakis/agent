@@ -41,8 +41,13 @@ fn main() {
 
 /// A failure on stderr: one JSON object, `{"error", "detail", ...facts}`,
 /// the daemon's own fields plus the CLI's `hint` in flags; `--pretty`
-/// asks for a line a person reads instead.
+/// asks for a line a person reads instead. The detail is bounded as in a
+/// daemon response, since it can echo an argument.
 fn report(error: &Error) {
+    let error = &Error {
+        detail: error.detail.clone().map(agent_runtime::output::bounded),
+        ..error.clone()
+    };
     if cli::PRETTY.load(std::sync::atomic::Ordering::Relaxed) {
         match error
             .facts
