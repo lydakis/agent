@@ -676,7 +676,10 @@ daemon learns nothing about projects; everything here is client work.
   place of the list, with its own composer (a beat later, so a double-click
   can claim it); a double-click, or "Open as tab" in its ⋯, opens a tab. The
   double-click is the click the system counts as second, so it holds when the
-  look has already redrawn the row. A
+  look has already replaced the row, and it opens the tab from where the
+  window was before the first click. Every move (rows, Home, tabs, crumbs,
+  the finder, keys) goes through one function that first cancels a row's
+  pending look, so any later click or key wins over it. A
   task card in a chat opens beside the same way. ⤢ Full screen takes the tab
   on screen a level down; from Home it opens a tab. The crumbs in the head
   (Home › project › thread) go back up, and the window's title says the same.
@@ -684,9 +687,11 @@ daemon learns nothing about projects; everything here is client work.
   one before it, and the first to Home; a deleted agent's tab goes up to what made it. Tabs, and the
   agent beside, are saved with the bot's id and come back only for that
   identity, never for a new bot under the old name. ← or `Esc`
-  closes what is beside. The list draws a window of rows cut from the fleet's
-  tree in one pass over the open agent's subtree, so a large level costs a
-  screenful of rows.
+  closes what is beside. One index of the fleet, every bot in tree order with
+  a swarm's agents and what they made under its row, is rebuilt when the
+  fleet's shape changes; the list's levels, the finder (⌘K) and the arrow
+  keys read it. The list draws a window of rows cut from it in one pass over
+  the open agent's subtree, so a large level costs a screenful of rows.
 - **Composer.** The model chip lists `~/.agent/models`, read on each open,
   each provider under its own heading.
   Models of any provider in the bot's family (known from the fleet's bot

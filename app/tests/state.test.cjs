@@ -36,7 +36,7 @@ function page(daemon = {}, storage = null) {
   context.Rich = context.window.Rich;
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, openOnly, openBeside, openTab, closeTab, full, upOf, crumbsHTML, railRows, renderTabs, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules, tellLead, markSeen };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, go, upOf, crumbsHTML, railRows, renderTabs, save, restore, showMenu, refreshMenu, entries, pickerRows, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules, tellLead, markSeen };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -862,24 +862,24 @@ test('the sidebar lists one level below what is open, and the crumbs go back up'
 test('a card looks in beside, full screen takes the tab, and Home and the finder open tabs', async () => {
   const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
   for (const [name, id] of [['app.lead', 1], ['app.build', 2], ['app.test', 3]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
-  p.tree(); await p.openOnly('app.lead');
+  p.tree(); await p.go('app.lead');
   assert.deepEqual([...p.S.ui.tabs], ['app.lead'], 'from Home it opens a tab');
-  await p.openBeside('app.build'); assert.equal(p.S.ui.side, 'app.build');
-  await p.openBeside('app.build'); assert.equal(p.S.ui.side, null, 'the same card closes it again');
-  await p.openBeside('app.build', false); await p.openBeside('app.build', false); assert.equal(p.S.ui.side, 'app.build', 'a row looks in; a second click keeps it');
-  await p.openBeside('app.lead'); assert.equal(p.S.ui.side, 'app.build', 'the thread in view never opens beside itself');
-  await p.full();
+  await p.go('app.build', 'beside'); assert.equal(p.S.ui.side, 'app.build');
+  await p.go('app.build', 'beside'); assert.equal(p.S.ui.side, null, 'the same card closes it again');
+  await p.go('app.build', 'beside');
+  await p.go('app.lead', 'beside'); assert.equal(p.S.ui.side, 'app.build', 'the thread in view never opens beside itself');
+  await p.go(p.S.ui.side);
   assert.equal(p.S.selected, 'app.build'); assert.equal(p.S.ui.side, null);
   assert.deepEqual([...p.S.ui.tabs], ['app.build'], 'inside a tab it goes down a level in that tab');
-  await p.openOnly(''); assert.equal(p.S.selected, ''); assert.deepEqual([...p.S.ui.tabs], ['app.build'], 'Home keeps the tabs');
-  await p.openOnly('app.test'); assert.deepEqual([...p.S.ui.tabs], ['app.build', 'app.test']);
-  await p.openOnly('app.build'); assert.deepEqual([...p.S.ui.tabs], ['app.build', 'app.test'], 'an agent already in a tab is that tab');
-  await p.openTab('app.lead'); assert.deepEqual([...p.S.ui.tabs], ['app.build', 'app.test', 'app.lead']); assert.equal(p.S.selected, 'app.lead');
-  await p.closeTab('app.lead'); assert.equal(p.S.selected, 'app.test', 'a closed tab hands over to the one before');
-  await p.closeTab('app.build'); assert.equal(p.S.selected, 'app.test'); assert.deepEqual([...p.S.ui.tabs], ['app.test']);
-  await p.openTab('app.build'); await p.openOnly('app.test');
-  await p.closeTab('app.test'); assert.equal(p.S.selected, '', 'before the first tab is Home'); assert.deepEqual([...p.S.ui.tabs], ['app.build']);
-  await p.openOnly('app.test'); await p.closeTab('app.build'); assert.deepEqual([...p.S.ui.tabs], ['app.test']); assert.equal(p.S.selected, 'app.test');
+  await p.go(''); assert.equal(p.S.selected, ''); assert.deepEqual([...p.S.ui.tabs], ['app.build'], 'Home keeps the tabs');
+  await p.go('app.test'); assert.deepEqual([...p.S.ui.tabs], ['app.build', 'app.test']);
+  await p.go('app.build'); assert.deepEqual([...p.S.ui.tabs], ['app.build', 'app.test'], 'an agent already in a tab is that tab');
+  await p.go('app.lead', 'tab'); assert.deepEqual([...p.S.ui.tabs], ['app.build', 'app.test', 'app.lead']); assert.equal(p.S.selected, 'app.lead');
+  await p.go('app.lead', 'close'); assert.equal(p.S.selected, 'app.test', 'a closed tab hands over to the one before');
+  await p.go('app.build', 'close'); assert.equal(p.S.selected, 'app.test'); assert.deepEqual([...p.S.ui.tabs], ['app.test']);
+  await p.go('app.build', 'tab'); await p.go('app.test');
+  await p.go('app.test', 'close'); assert.equal(p.S.selected, '', 'before the first tab is Home'); assert.deepEqual([...p.S.ui.tabs], ['app.build']);
+  await p.go('app.test'); await p.go('app.build', 'close'); assert.deepEqual([...p.S.ui.tabs], ['app.test']); assert.equal(p.S.selected, 'app.test');
   // A deleted agent's tab goes up a level; one whose way up is Home closes.
   await p.onEvent({ event: 'deleted', bot: 'app.test' });
   assert.deepEqual([...p.S.ui.tabs], ['app.lead']); assert.equal(p.S.selected, 'app.lead');
@@ -893,7 +893,7 @@ test('from Home the arrows open the first or last agent; Enter or Space on a tab
   const doc = p.context.document, key = (k, target = { id: 'input' }) => doc.listeners.keydown({ key: k, target, preventDefault() {} });
   await key('ArrowDown'); assert.equal(p.S.selected, 'app.lead', 'down from Home is the first row');
   await key('ArrowDown'); assert.equal(p.S.selected, 'app.build');
-  await p.openOnly(''); await key('ArrowUp'); assert.equal(p.S.selected, 'loose', 'up from Home is the last row');
+  await p.go(''); await key('ArrowUp'); assert.equal(p.S.selected, 'loose', 'up from Home is the last row');
   await key('ArrowUp'); assert.equal(p.S.selected, 'app.build');
   // A focused tab is a button: Enter or Space opens it, and its close button keeps its own keys.
   p.S.ui.tabs = ['app.lead', 'app.build']; p.S.selected = 'app.build';
@@ -1159,11 +1159,11 @@ test('a failed send comes back only to the bot it was for', async () => {
   for (const [name, id] of [['app.lead', 1], ['app.build', 2], ['app.test', 3]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
   p.tree(); p.S.selected = 'app.lead';
   const doc = p.context.document, side = doc.getElementById('sideinput');
-  await p.openBeside('app.build');
+  await p.go('app.build', 'beside');
   side.value = 'for build';
   const sending = doc.getElementById('sideform').listeners.submit({ preventDefault() {} });
   await new Promise((r) => setImmediate(r));
-  await p.openBeside('app.test');
+  await p.go('app.test', 'beside');
   fail(); await sending;
   assert.equal(p.S.ui.side, 'app.test'); assert.equal(side.value, '', 'not restored under another bot');
 });
@@ -1334,7 +1334,7 @@ test('Escape in the finder never stops a turn, and a deleted bot takes its draft
   await doc.listeners.keydown({ key: 'Escape', target: { id: 'pickerq' }, preventDefault() {} });
   assert.deepEqual(sent.filter((op) => op === 'interrupt'), []);
   doc.getElementById('input').value = 'for lead';
-  await p.openOnly('app.task'); doc.getElementById('input').value = 'for task';
+  await p.go('app.task'); doc.getElementById('input').value = 'for task';
   await p.onEvent({ event: 'deleted', bot: 'app.task' }); p.followDrafts();
   assert.equal(p.S.selected, 'app.lead'); assert.equal(doc.getElementById('input').value, 'for lead');
   assert.equal(p.S.drafts.has('app.task'), false, 'a deleted bot takes its draft with it');
@@ -1366,11 +1366,11 @@ test('a folded run names a timeout or a failed call; the finder reaches any task
   assert.deepEqual(Array.from(p.pickerRows(), (r) => r.b.name), ['app.build'], 'a task outside the open level is still found');
   p.S.selected = 'app.lead';
   const draft = p.context.document.getElementById('sideinput');
-  await p.openBeside('app.build'); draft.value = 'for build only';
-  await p.openBeside('app.test'); assert.equal(draft.value, '', 'another bot beside has its own draft');
-  draft.value = 'for test only'; p.closeSide(); assert.equal(draft.value, '');
-  await p.openBeside('app.build'); assert.equal(draft.value, 'for build only', 'a closed pane keeps its bot\'s draft');
-  await p.openBeside('app.test'); assert.equal(draft.value, 'for test only');
+  await p.go('app.build', 'beside'); draft.value = 'for build only';
+  await p.go('app.test', 'beside'); assert.equal(draft.value, '', 'another bot beside has its own draft');
+  draft.value = 'for test only'; await p.go(p.S.ui.side, 'beside'); assert.equal(draft.value, '');
+  await p.go('app.build', 'beside'); assert.equal(draft.value, 'for build only', 'a closed pane keeps its bot\'s draft');
+  await p.go('app.test', 'beside'); assert.equal(draft.value, 'for test only');
 });
 
 test('full screen carries each draft with its bot; a long wait list stays short in the head', async () => {
@@ -1378,10 +1378,10 @@ test('full screen carries each draft with its bot; a long wait list stays short 
   for (const [name, id] of [['app.lead', 1], ['app.build', 2]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
   p.tree(); p.S.selected = 'app.lead'; p.followDrafts();
   const main = p.context.document.getElementById('input'), side = p.context.document.getElementById('sideinput');
-  await p.openBeside('app.build'); main.value = 'to lead'; side.value = 'to build';
-  await p.full();
+  await p.go('app.build', 'beside'); main.value = 'to lead'; side.value = 'to build';
+  await p.go(p.S.ui.side);
   assert.equal(p.S.selected, 'app.build'); assert.equal(main.value, 'to build');
-  await p.openBeside('app.lead'); assert.equal(side.value, 'to lead', 'the draft left behind waits with its bot');
+  await p.go('app.lead', 'beside'); assert.equal(side.value, 'to lead', 'the draft left behind waits with its bot');
   p.upsert({ name: 'app.test', id: 3, provider: 'alpha', model: 'one', created_by: 'app.lead', created_by_id: 1 });
   p.transcript('app.build').peers = ['app.lead', 'app.test'];
   p.transcript('app.build').peers = ['app.lead'];
@@ -1451,7 +1451,7 @@ test('a failed first message waits in the side chat\'s composer', async () => {
   } });
   p.upsert({ name: 'lead', id: 1, provider: 'alpha', model: 'one', status: 'running', running_turn: 3 });
   p.upsert({ name: 'task', id: 2, provider: 'alpha', model: 'one', status: 'running', running_turn: 4, created_by: 'lead', created_by_id: 1 });
-  p.S.selected = 'lead'; await p.openBeside('task');
+  p.S.selected = 'lead'; await p.go('task', 'beside');
   // Asked from the side pane: the copy replaces its source there, and keeps the unsent message.
   const side = p.context.document.getElementById('sideinput'), main = p.context.document.getElementById('input');
   p.setSend('side');
@@ -1483,7 +1483,7 @@ const rowsOf = (rows) => Array.from(rows, (r) => r.label ?? r.key ?? r.b.name);
 const PLAIN = [{ identity: '', model: 'alpha/one', share: 100 }];
 const swarmRecord = (members = [], extra = {}) => ({ swarm: 'app.latency', dir: "/home/u/.agent/swarms/app.latency", project: 'app', goal: 'Halve p99.', workspace: '/w/app.latency', budget_tokens: 3000000, mix: PLAIN, members, rows: Object.fromEntries(members.map((m) => [m, 0])), stopped: false, ...extra });
 
-test('a swarm is one row under its project; its agents and what they made stay in its view', () => {
+test('a swarm is one row in its project\'s list; its agents and what they made sit under it in the fleet', () => {
   const p = shell();
   p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one' });
   p.upsert({ name: 'app.build', id: 2, provider: 'alpha', model: 'one', created_by: 'app.lead', created_by_id: 1 });
@@ -1496,7 +1496,9 @@ test('a swarm is one row under its project; its agents and what they made stay i
   // A swarm whose project is gone still has a row, among the bots in no project.
   p.learnSwarm({ ...swarmRecord([]), swarm: 'gone.x', project: 'gone' });
   const rows = p.tree();
-  assert.deepEqual(rowsOf(rows), ['app.lead', '⁂app.latency', 'app.build', 'app.latency-3', 'bots', '⁂gone.x']);
+  assert.deepEqual(rowsOf(rows), ['app.lead', '⁂app.latency', 'app.latency-1', 'app.latency-1-side', 'app.latency-1-deep', 'app.latency-2', 'app.build', 'app.latency-3', 'bots', '⁂gone.x']);
+  p.S.selected = 'app.lead';
+  assert.deepEqual(Array.from(p.railRows(), (r) => r.key ?? r.b.name), ['⁂app.latency', 'app.build', 'app.latency-3'], 'the project\'s list holds the swarm as one row');
   assert.equal(rows[1].prefix, '├ ');
   p.S.bots.get('app.latency-3').status = 'running';
   assert.match(p.botRowHTML(rows[1]), /glyph idle/, 'the stranger does not count as working');
@@ -1653,18 +1655,18 @@ test('a swarm row opens a beat later, so a double-click opens it as a new tab', 
   p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one' });
   p.upsert({ name: 'app.latency-1', id: 3, provider: 'alpha', model: 'one' });
   p.learnSwarm(swarmRecord(['app.latency-1'], { ids: { 'app.latency-1': 3 } }));
-  await p.openOnly('app.lead');
+  await p.go('app.lead');
   const doc = p.context.document, row = { dataset: { bot: '⁂app.latency' } }, at = (sel) => (sel === '[data-bot]' ? row : null);
   await doc.listeners.click({ detail: 1, target: { closest: at } });
   assert.equal(p.S.selected, 'app.lead', 'the first click waits');
   await doc.listeners.click({ detail: 2, target: { closest: at } }); await p.tick();
   assert.deepEqual([...p.S.ui.tabs], ['app.lead', '⁂app.latency'], 'a double-click opens a new tab'); assert.equal(p.S.selected, '⁂app.latency');
-  await p.openOnly('app.lead');
+  await p.go('app.lead');
   await doc.listeners.click({ detail: 1, target: { closest: at } }); await p.tick();
   assert.equal(p.S.selected, '⁂app.latency'); assert.deepEqual([...p.S.ui.tabs], ['app.lead', '⁂app.latency'], 'a click goes to its tab');
   // A slow double-click: the swarm already took the tab in view, and the second click, landing on what
   // replaced the row, gives that tab back and opens the swarm beside it.
-  p.S.ui.tabs = ['app.lead']; await p.openOnly('app.lead');
+  p.S.ui.tabs = ['app.lead']; await p.go('app.lead');
   await doc.listeners.click({ detail: 1, target: { closest: at } }); await p.tick();
   assert.deepEqual([...p.S.ui.tabs], ['⁂app.latency']);
   await doc.listeners.click({ detail: 2, target: { closest: () => null } }); await p.tick();
@@ -1681,6 +1683,42 @@ test('a tab is renamed when what it belongs to changes, with no change of state'
   await p.handle({ event: 'deleted', bot: 'app.lead' }, p.S.session);
   p.railRows(); p.renderTabs();
   assert.match(tabs.innerHTML, /<span class="tl">app\.build<\/span>/, 'a task whose coordinator is gone is named in full');
+});
+
+test('every control is one move: a pending look yields to Home or a tab, a double-click opens a tab, the finder reaches a swarm helper', async () => {
+  const p = shell({ swarmBoard: async () => ({ lines: [], offset: 0, more: false }), request: async () => ({ bots: [], next_after: null, nodes: [], next_from: null }) });
+  p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one' });
+  p.upsert({ name: 'app.build', id: 2, provider: 'alpha', model: 'one', created_by: 'app.lead', created_by_id: 1 });
+  p.upsert({ name: 'app.latency-1', id: 3, provider: 'alpha', model: 'one' });
+  p.upsert({ name: 'app.latency-1-probe', id: 4, provider: 'alpha', model: 'one', created_by: 'app.latency-1', created_by_id: 3 });
+  p.learnSwarm(swarmRecord(['app.latency-1'], { ids: { 'app.latency-1': 3 } }));
+  const doc = p.context.document, on = (sel, el) => ({ closest: (q) => (q === sel ? el : null) });
+  const row = (who) => on('[data-bot]', { dataset: { bot: who } }), click = (target, detail = 1) => doc.listeners.click({ detail, target });
+  await p.go('app.lead');
+  // A click, then Home within the beat: Home wins, and nothing opens beside after it.
+  await click(row('app.build')); await click(on('[data-act]', { dataset: { act: 'home' } })); await p.tick();
+  assert.equal(p.S.selected, ''); assert.equal(p.S.ui.side, null);
+  // A click, then a tab: the tab wins.
+  await click(row('app.build')); await click(on('[data-tab]', { dataset: { tab: 'app.lead' } })); await p.tick();
+  assert.equal(p.S.selected, 'app.lead'); assert.equal(p.S.ui.side, null);
+  // A fast double-click opens a tab and no look.
+  await click(row('app.build')); await click(row('app.build'), 2); await p.tick();
+  assert.deepEqual([...p.S.ui.tabs], ['app.lead', 'app.build']); assert.equal(p.S.selected, 'app.build'); assert.equal(p.S.ui.side, null);
+  // A slow one, on a swarm: the first click already opened it in the tab in view, and the second,
+  // landing on what replaced the row, puts that tab back and opens the swarm in a new one.
+  await p.go('app.lead');
+  await click(row('⁂app.latency')); await p.tick();
+  assert.deepEqual([...p.S.ui.tabs], ['⁂app.latency', 'app.build']);
+  await click(on('.pane.main', {}), 2); await p.tick();
+  assert.deepEqual([...p.S.ui.tabs], ['app.lead', 'app.build', '⁂app.latency']); assert.equal(p.S.selected, '⁂app.latency');
+  // The finder reads the whole fleet, swarm agents and what they made included.
+  doc.getElementById('pickerq').value = 'probe';
+  assert.deepEqual(Array.from(p.pickerRows(), (r) => r.b.name), ['app.latency-1-probe']);
+  await doc.getElementById('pickerlist').listeners.click({ target: on('[data-pick]', { dataset: { pick: 'app.latency-1-probe' } }) }); await p.tick();
+  assert.equal(p.S.selected, 'app.latency-1-probe'); assert.equal(p.S.ui.tabs.at(-1), 'app.latency-1-probe');
+  assert.equal(p.upOf('app.latency-1-probe'), 'app.latency-1');
+  await p.go('app.latency-1');
+  assert.deepEqual(Array.from(p.railRows(), (r) => r.b.name), ['app.latency-1-probe'], 'the helper is the level below its agent');
 });
 
 test('looking at an agent clears the done glyph on its tab', async () => {
@@ -1939,17 +1977,17 @@ test('a draft stays with the bot it was typed for, and Enter sends it there even
   const p = drafting({ request: async (op, q) => { if (op === 'history_nodes') await slow; if (op === 'submit') sent.push([q.bot, q.bot_id, q.prompt]); return { nodes: [], next_from: null }; } });
   for (const [name, id] of [['app.lead', 1], ['app.lead-side', 2]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
   p.S.transcripts.get('app.lead-side') ?? p.transcript('app.lead-side').nodes;
-  p.tree(); await p.openOnly('app.lead');
+  p.tree(); await p.go('app.lead');
   const doc = p.context.document, main = doc.getElementById('input');
   main.value = 'Ship it.';
   // Sol's audit, step 7: the coordinator's text followed the selection to its side chat.
-  release(); await p.openOnly('app.lead-side');
+  release(); await p.go('app.lead-side');
   assert.equal(main.value, '', 'the side chat has its own, empty composer');
   main.value = 'Only for the side chat.';
-  await p.openOnly('app.lead');
+  await p.go('app.lead');
   assert.equal(main.value, 'Ship it.');
   // Enter while another bot is being opened: the text goes to the bot it was typed for.
-  const opening = p.openOnly('app.lead-side');
+  const opening = p.go('app.lead-side');
   await doc.getElementById('form').listeners.submit({ preventDefault() {} });
   await opening;
   assert.deepEqual(sent, [['app.lead', 1, 'Ship it.']]);
