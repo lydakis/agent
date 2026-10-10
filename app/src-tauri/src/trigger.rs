@@ -672,39 +672,84 @@ fn git(repo: &Path, args: &[&str]) -> Option<String> {
         .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
-    // Commit titles in a legacy encoding are not UTF-8; the hashes and
-    // actions read here are ASCII either way.
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    // Only the newline git ends its answer with goes: a path may end in
+    // spaces.
+    out.status.success().then(|| {
+        let text = String::from_utf8_lossy(&out.stdout);
+        text.strip_suffix('\n').unwrap_or(&text).to_owned()
+    })
 }
 
-/// Whether HEAD moved by more than checkouts and resets since it named
-/// `since`: its log's entries newer than that one, newest first. A move
-/// back and forth between commits there already is not news; one the log
-/// no longer reaches is.
-fn committed(repo: &Path, since: &Option<String>) -> bool {
-    let Some(since) = since else {
-        return true;
+/// Where a repository's HEAD is: its commit, and how far its HEAD log
+/// went then, in bytes. git only appends to that log, so what moved HEAD
+/// since is the entries past that point, whatever commits they name.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct Seen {
+    head: Option<String>,
+    log: Option<u64>,
+}
+
+/// The repository's HEAD log, in its own git folder (a worktree has its own).
+fn head_log(repo: &Path) -> Option<PathBuf> {
+    git(repo, &["rev-parse", "--absolute-git-dir"]).map(|dir| PathBuf::from(dir).join("logs/HEAD"))
+}
+
+/// Where HEAD is now, and whether getting there made a commit since
+/// `since`: some entry past its place in the log is one that is not only a
+/// move between commits already there (a checkout, a reset, a rebase's
+/// start and end). HEAD back where it was is not news; a log rewritten
+/// since (expired, or made again) is news when HEAD is elsewhere.
+fn moved(repo: &Path, since: &Seen) -> (bool, Seen) {
+    let now = Seen {
+        head: head(repo),
+        log: head_log(repo).and_then(|log| std::fs::metadata(log).ok().map(|m| m.len())),
     };
-    // Only each entry's action is read: subjects are cut to 32 columns, so
-    // the log is at most about 20 KB however long its commit titles.
-    let Some(log) = git(
-        repo,
-        &["reflog", "-n", "256", "--format=%H %<(32,trunc)%gs", "HEAD"],
-    ) else {
-        return true;
+    let news = match (&since.head, since.log) {
+        _ if now.head.is_none() => false,
+        (None, _) => true,
+        (head, _) if *head == now.head => false,
+        (_, Some(at)) if now.log.is_some_and(|len| at <= len) => {
+            entries_since(repo, at).iter().any(|what| makes(what))
+        }
+        _ => true,
     };
-    for line in log.lines() {
-        let (sha, what) = line.split_once(' ').unwrap_or((line, ""));
-        if sha == since {
-            return false;
-        }
-        if !what.starts_with("checkout:") && !what.starts_with("reset:") {
-            return true;
-        }
+    (news, now)
+}
+
+/// The actions of the HEAD log's entries past `at`, each the text after
+/// its tab. Titles in a legacy encoding are not UTF-8; actions are ASCII.
+fn entries_since(repo: &Path, at: u64) -> Vec<String> {
+    use std::io::{Read, Seek};
+    let mut text = Vec::new();
+    let read = head_log(repo)
+        .and_then(|log| std::fs::File::open(log).ok())
+        .map(|mut file| {
+            file.seek(std::io::SeekFrom::Start(at))
+                .and_then(|_| file.read_to_end(&mut text))
+        });
+    if !matches!(read, Some(Ok(_))) {
+        return vec![String::new()];
     }
-    true
+    String::from_utf8_lossy(&text)
+        .lines()
+        .map(|line| {
+            line.split_once('\t')
+                .map_or("", |(_, what)| what)
+                .to_owned()
+        })
+        .collect()
+}
+
+/// Whether a HEAD log entry made a commit, or brought one: anything but a
+/// move between commits there already.
+fn makes(what: &str) -> bool {
+    let rebase_edge = what.starts_with("rebase")
+        && ["(start)", "(finish)", "(abort)"].iter().any(|edge| {
+            what.split(':')
+                .next()
+                .is_some_and(|verb| verb.contains(edge))
+        });
+    !(what.starts_with("checkout:") || what.starts_with("reset:") || rebase_edge)
 }
 
 /// The commit a repository's HEAD names, when it names one.
@@ -1237,13 +1282,16 @@ fn take_asks(places: &Places, name: &str) -> bool {
 /// What a fire leaves for the next: the commit it saw.
 #[derive(Debug, Default, Clone, PartialEq)]
 struct Kept {
-    head: Option<String>,
+    seen: Seen,
 }
 
 impl Kept {
     fn of(state: &Value) -> Self {
         Self {
-            head: state["head"].as_str().map(str::to_owned),
+            seen: Seen {
+                head: state["head"].as_str().map(str::to_owned),
+                log: state["log"].as_u64(),
+            },
         }
     }
 }
@@ -1713,6 +1761,29 @@ fn watches_itself(places: &Places, store: Option<&Path>, watch: &Path) -> Result
             watch.display()
         ));
     }
+    // A hard link is the store's file by another name: the same file.
+    use std::os::unix::fs::MetadataExt;
+    let same = |other: &Path| match (std::fs::metadata(watch), std::fs::metadata(other)) {
+        (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
+        _ => false,
+    };
+    if let Some(store) = store {
+        let name = store.as_os_str().to_owned();
+        let with = |suffix: &str| {
+            let mut name = name.clone();
+            name.push(suffix);
+            PathBuf::from(name)
+        };
+        if [with(""), with("-wal"), with("-shm")]
+            .iter()
+            .any(|f| same(f))
+        {
+            return Err(format!(
+                "invalid_file: {}: it is its daemon's store by another name, which changes with every message; watch another path",
+                watch.display()
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1805,9 +1876,12 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
         store_id,
         message: asked.message,
     };
-    // The commit there now is seen: only the next one fires. It is read
-    // before launchd watches, so a commit after it is news.
-    let seen = trigger.commit.as_deref().and_then(head);
+    // Where HEAD is now is seen: only a commit after it fires. It is read
+    // before launchd watches; one made before launchd did is asked for.
+    let seen = trigger
+        .commit
+        .as_deref()
+        .map(|repo| moved(repo, &Seen::default()).1);
     let app = std::env::current_exe().map_err(|e| e.to_string())?;
     let environment: Vec<(&str, String)> = ["HOME", "SHELL"]
         .into_iter()
@@ -1830,13 +1904,18 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
             // Under the lock, and only while no fire has written its own: a
             // fire's head is newer. A trigger without either would take the
             // commit there for news, so it goes.
-            if let Some(head) = seen {
-                let kept = Kept { head: Some(head) };
+            if let Some(seen) = seen.filter(|seen| seen.head.is_some()) {
+                let repo = trigger.commit.as_deref().unwrap_or(Path::new(""));
                 let recorded = Lock::take(places).and_then(|_lock| {
-                    if state(places, &trigger).is_null() {
-                        record_last(places, &trigger, &Value::Null, &kept)
-                    } else {
-                        Ok(())
+                    if !state(places, &trigger).is_null() {
+                        return Ok(());
+                    }
+                    let kept = Kept { seen: seen.clone() };
+                    record_last(places, &trigger, &Value::Null, &kept)?;
+                    // A commit made while launchd began to watch woke nothing.
+                    match moved(repo, &seen).0 {
+                        true => ask(places, &trigger.name),
+                        false => Ok(()),
                     }
                 });
                 if let Err(error) = recorded {
@@ -1863,7 +1942,8 @@ fn record_last(
         outcome["fired_ms"] = json!(now() * 1000);
     }
     let mut row = trigger.json(&json!({"last": outcome}));
-    row["head"] = json!(kept.head);
+    row["head"] = json!(kept.seen.head);
+    row["log"] = json!(kept.seen.log);
     replace(&places.last(&trigger.name), &row.to_string())
 }
 
@@ -1970,14 +2050,14 @@ fn fire(places: &Places, trigger: &Trigger, asked: bool) {
     };
     // Any write to the HEAD log wakes it; only another commit is news.
     if let Some(repo) = &trigger.commit {
-        let seen = head(repo);
-        if !asked && (seen.is_none() || seen == kept.head || !committed(repo, &kept.head)) {
+        let (news, now) = moved(repo, &kept.seen);
+        if !asked && !news {
             return;
         }
         // A HEAD that cannot be read now keeps the last one seen.
-        if let Some(sha) = seen {
+        if let Some(sha) = &now.head {
             why = format!("{why} at {}", &sha[..sha.len().min(12)]);
-            kept.head = Some(sha);
+            kept.seen = now;
         }
     }
     let outcome = match runtime() {
@@ -2823,6 +2903,15 @@ mod tests {
             ),
             Ok(())
         );
+        // Nor the store's file by another name.
+        std::fs::write(store.with_extension("sqlite-wal"), "").unwrap();
+        let alias = w.root.join("elsewhere");
+        std::fs::hard_link(store.with_extension("sqlite-wal"), &alias).unwrap();
+        assert!(
+            watches_itself(&w.places, Some(&store), &alias)
+                .unwrap_err()
+                .contains("store")
+        );
     }
 
     #[test]
@@ -2870,13 +2959,47 @@ mod tests {
         ]);
         let two = head(&root);
         assert_ne!(two.as_deref().unwrap(), first);
+        let (news, at_two) = moved(&root, &Seen::default());
+        assert!(news && at_two.head == two && at_two.log.is_some());
+        assert!(!moved(&root, &at_two).0);
         // Checking out a commit that was there is a move, not a commit.
-        assert!(!committed(&root, &two));
         git(&["checkout", "-q", &first]);
-        assert!(!committed(&root, &two));
+        assert!(!moved(&root, &at_two).0);
+        let at_first = moved(&root, &at_two).1;
+        // A commit, then back, then to it again: the commit is in the log
+        // past where it was, though HEAD came back to that commit between.
         git(&["commit", "-q", "--allow-empty", "-m", "three"]);
-        assert!(committed(&root, &two));
-        assert!(committed(&root, &None));
+        let three = head(&root).unwrap();
+        git(&["reset", "-q", "--hard", &first]);
+        assert!(!moved(&root, &at_first).0, "back where it was");
+        git(&["checkout", "-q", &three]);
+        assert!(moved(&root, &at_first).0);
+        // A log made again since is news when HEAD is elsewhere.
+        let rewritten = Seen {
+            log: Some(u64::MAX),
+            ..at_first.clone()
+        };
+        assert!(moved(&root, &rewritten).0);
+        // What only moves HEAD between commits there already.
+        for what in [
+            "checkout: moving from main to x",
+            "reset: moving to HEAD~1",
+            "rebase (start): checkout main",
+            "rebase -i (finish): returning to refs/heads/x",
+            "rebase (abort): returning to refs/heads/x",
+        ] {
+            assert!(!makes(what), "{what}");
+        }
+        for what in [
+            "commit: x",
+            "commit (amend): x",
+            "rebase (pick): checkout: x",
+            "merge x: Fast-forward",
+            "pull: Fast-forward",
+            "cherry-pick: x",
+        ] {
+            assert!(makes(what), "{what}");
+        }
         assert!(
             commit(root.join("nope").to_str().unwrap())
                 .unwrap_err()

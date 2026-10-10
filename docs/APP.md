@@ -1031,14 +1031,18 @@ launchd keeps minutes; `--at` refuses a part out of range or extra parts);
 up to 1,024 calendar entries. `--file PATH` fires when the file is written,
 or a file is added to or removed from it when it is a folder (launchd's
 `WatchPaths`); it need not exist yet, and it may not be in
-`~/.agent/triggers` or be its daemon's store (or its `-wal` and `-shm`),
-which every fire writes: `add` refuses one, and a fire that finds its path
+`~/.agent/triggers` or be its daemon's store (or its `-wal` and `-shm`, by
+any name, a hard link included), which every fire writes: `add` refuses one, and a fire that finds its path
 became one (a link moved) ends the trigger and sends nothing. `--commit REPO` watches the
 repository's own HEAD log, which git writes on every move of HEAD, and sends
-only when HEAD names a commit other than the one the trigger last saw
-(`add` records the one there now) and the HEAD log shows more than
-`checkout:` and `reset:` moves since that one, so a checkout of a commit
-already there, back and forth, or a write that moved nothing sends nothing. A repository where git keeps no HEAD log
+only when HEAD names a commit other than the one the trigger last saw and
+the HEAD log's entries past where it was then (git only appends to it; the
+trigger keeps that place in bytes) include more than moves between commits
+already there (`checkout:`, `reset:`, a rebase's start, finish and abort).
+So a checkout back and forth, or a write that moved nothing, sends nothing;
+a commit, even one HEAD left and came back to, sends; a log made again since
+counts as news when HEAD is elsewhere. `add` records where HEAD is before
+launchd watches, and asks for a fire when a commit came in between. A repository where git keeps no HEAD log
 (`core.logAllRefUpdates` false, or a bare one by default) is refused, and
 adding the same trigger again watches the git folder the repository has
 now. With no WHEN, only `fire` runs it; `fire` while a fire still runs is
