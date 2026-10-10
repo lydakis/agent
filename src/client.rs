@@ -479,18 +479,10 @@ impl Connection {
         loop {
             let message = self.read_line()?;
             if message.get("id").is_some_and(|id| *id == json!(self.next)) {
-                let Some(code) = message.get("error").and_then(Value::as_str) else {
-                    return Ok(message["result"].clone());
+                return match Error::reported(&message) {
+                    Some(error) => Err(error),
+                    None => Ok(message["result"].clone()),
                 };
-                let mut error = Error::new(code);
-                error.detail = message["detail"].as_str().map(str::to_owned);
-                if let Value::Object(mut facts) = message {
-                    for key in ["id", "error", "detail"] {
-                        facts.remove(key);
-                    }
-                    error.facts = (!facts.is_empty()).then(|| Box::new(facts));
-                }
-                return Err(error);
             }
             if message.get("id").is_none() {
                 self.pending.push_back(message);
@@ -1108,11 +1100,6 @@ fn await_exit(pid: i32, timeout: Duration) -> Result<()> {
 /// the daemon runs, and never replaces a list that exists.
 fn models(options: &Options) -> Result<i32> {
     let path = agent_client::models::path().ok_or(Error::with("usage", "set HOME"))?;
-    let client_error = |e: agent_client::Error| Error {
-        code: e.code,
-        detail: e.detail,
-        facts: e.facts,
-    };
     if options.discover {
         if path.exists() {
             return fail_with(
@@ -1125,7 +1112,7 @@ fn models(options: &Options) -> Result<i32> {
         }
         let mut connection = ensure_daemon(options)?;
         let listing = connection.request("provider_models", json!({}))?;
-        let text = agent_client::models::render(&listing, &[]).map_err(client_error)?;
+        let text = agent_client::models::render(&listing, &[]).map_err(Error::from)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -1155,7 +1142,7 @@ fn models(options: &Options) -> Result<i32> {
         }
         eprintln!("wrote {}", path.display());
     }
-    let models = agent_client::models::read(&path).map_err(client_error)?;
+    let models = agent_client::models::read(&path).map_err(Error::from)?;
     if options.pretty {
         for model in &models {
             match &model.note {
@@ -1877,12 +1864,8 @@ impl Renderer {
             // Retained and running turns still finish through normal events.
             let handle = format!("turn:{}/{turn}", event["bot"].as_str().unwrap_or(""));
             let found = connection.request("wait", json!({"handles":[&handle],"timeout_ms":0}))?;
-            let result = &found["results"][&handle];
-            if let Some(code) = result["error"].as_str() {
-                return Err(Error {
-                    detail: result["detail"].as_str().map(Into::into),
-                    ..Error::new(code)
-                });
+            if let Some(error) = Error::reported(&found["results"][&handle]) {
+                return Err(error);
             }
         }
         let finished =
@@ -2585,6 +2568,30 @@ fn preview(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reported_error_keeps_every_fact() {
+        let ended = json!({"status":"failed","turn":3,"error":"budget_exhausted",
+            "detail":"220 of 200 tokens used","budget_tokens":200,"tokens_used":220});
+        let error = Error::reported(&ended).unwrap();
+        assert_eq!(error.detail.as_deref(), Some("220 of 200 tokens used"));
+        let facts = error.facts.unwrap();
+        assert_eq!(
+            (&facts["budget_tokens"], &facts["turn"]),
+            (&json!(200), &json!(3))
+        );
+        assert!(!facts.contains_key("error") && !facts.contains_key("detail"));
+        let served = agent_client::Error {
+            code: "approvals_served".into(),
+            detail: None,
+            facts: json!({"tag":"auto","lease_left_ms":900})
+                .as_object()
+                .cloned()
+                .map(Box::new),
+        };
+        assert_eq!(Error::from(served).facts.unwrap()["lease_left_ms"], 900);
+        assert!(Error::reported(&json!({"result":{}})).is_none());
+    }
 
     #[test]
     fn refusals_past_capacity_give_the_flags_that_get_past_them() {

@@ -4568,6 +4568,15 @@ fn history_preserves_content_beyond_the_preview() {
         db.history_read("Bob", 1, offset + 1, 97).unwrap_err().code,
         "invalid_history_page"
     );
+    // An offset past any history names that bound, not the page size.
+    let far = db.history_read("Bob", 1, u64::MAX, 97).unwrap_err();
+    assert_eq!(
+        (far.code.as_str(), far.detail.as_deref()),
+        (
+            "invalid_history_page",
+            Some(format!("offset may be up to {}", i64::MAX).as_str())
+        )
+    );
     let unicode_offset = full.find('é').unwrap() as u64 + 1;
     assert_eq!(
         db.history_read("Bob", 1, unicode_offset, 97)

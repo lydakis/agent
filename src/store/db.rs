@@ -3373,8 +3373,14 @@ impl Database {
         offset: u64,
         limit: usize,
     ) -> Result<Value> {
-        if !(4..=64 * 1024).contains(&limit) || offset > i64::MAX as u64 {
+        if !(4..=64 * 1024).contains(&limit) {
             return fail_with("invalid_history_page", "limit must be 4 to 65536 bytes");
+        }
+        if offset > i64::MAX as u64 {
+            return fail_with(
+                "invalid_history_page",
+                format!("offset may be up to {}", i64::MAX),
+            );
         }
         let head: Option<i64> = self
             .conn
@@ -6760,8 +6766,14 @@ impl Database {
         offset: u64,
         limit: usize,
     ) -> Result<Value> {
-        if !(4..=64 * 1024).contains(&limit) || offset > i64::MAX as u64 - 1 {
+        if !(4..=64 * 1024).contains(&limit) {
             return fail_with("invalid_artifact_page", "limit must be 4 to 65536 bytes");
+        }
+        if offset > i64::MAX as u64 - 1 {
+            return fail_with(
+                "invalid_artifact_page",
+                format!("offset may be up to {}", i64::MAX - 1),
+            );
         }
         self.authorize_artifact(name, turn, call_id)?;
         let Some((total, bytes)) =
