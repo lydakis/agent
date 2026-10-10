@@ -43,6 +43,20 @@ made.
 ![The finder](app/nav-find.png)
 ![A third tab from the finder](app/nav-tabs.png)
 
+### Files
+
+Captured 2026-10-10. A file a reply links opens beside it; ⤢ Open as tab
+makes it a tab of its own.
+
+![PLAN.md open beside the reply that links it](app/file-beside.png)
+![PLAN.md in a tab](app/file-tab.png)
+
+⌘P searches the files of the repository in view (Tab inside the finder
+trades it for the agents), and Enter opens the pick in a tab.
+
+![The finder's files](app/file-find.png)
+![session.rs in a tab, highlighted](app/file-code-tab.png)
+
 ### Home
 
 Captured 2026-10-10. The first message sent at Home asks for the model and
@@ -150,11 +164,9 @@ with a click.
 
 ![A Vega-Lite chart and an HTML preview](app/rich-preview.png)
 
-A file the reply links, open beside it: `PLAN.md` drawn as Markdown with its
-diagram. Its own link to `report/latency.vl.json` opens that chart file in its
-place.
-
-![PLAN.md open beside the reply that links it](app/file-beside.png)
+A file the reply links opens beside it (see Files above): `PLAN.md` drawn as
+Markdown with its diagram. Its own link to `report/latency.vl.json` opens that
+chart file in its place.
 
 New project is a sheet with the fundamentals only: a folder, typed or
 chosen with the system's picker (which can make a new one), the lead's model
@@ -1666,8 +1678,38 @@ a message. A file drawn again (rewritten, or highlighted once highlighting
 loads) keeps the reader's place. One that failed or was refused changed nothing, so the file stays
 as it is shown. A click in the file puts the keyboard in the chat's composer,
 as the pane beside has none while a file is open. Deleting the agent it came from, or attaching to another store,
-closes it. Searching a project's
-files (from ^k or elsewhere) is not built.
+closes it.
+
+⤢ Open as tab moves the file beside into a tab of its own, keyed by its path
+(after `▤`, which no agent name holds) and saved with the other tabs. A file
+tab has no composer, its crumbs go back to Home, and the list beside it is
+Home's. Only the tab in view holds what it read: a tab shown again reads its
+file again, so many file tabs cost their paths. A write or edit to the file in
+view reads it again in place, as beside. A link in a file tab opens beside,
+from the file's own folder.
+
+⌘P opens the finder on files (⌘K on agents; Tab inside it trades the two and
+keeps what was typed). It lists the repository the thing in view is in, in
+the pane ⌘P was pressed in: a file's folder, else the agent's or the swarm's. The core runs
+`git ls-files --stage --others --exclude-standard` at the repository's top
+(`list_files`), so the list is what git tracks plus new files it does not
+ignore, and only what opens as a file: an index entry whose mode is a file or a
+symlink (not a submodule), a new file (not `nested/`, another repository
+inside), and not a tracked file deleted from the folder (`--deleted`). The top
+is named from the agent's folder (`--show-cdup`) where that reaches git's own
+top, so a file found through a symlinked folder has the path the agent's steps
+write, and a write refreshes its tab; a link into a folder inside the repository
+uses git's top. At most 100,000 paths from 16 MiB of git's answer are read, name by name so git stops at
+either bound (a cut listing says so under every search, as typing cannot reach
+past it); a folder outside a repository says so, and a window on a host
+refuses, as for reading a file. It is listed once each time the finder opens
+on files (Tab between the lists keeps it) and let go when the finder closes. A name that starts
+with what was typed comes first, then a name that holds it, then a folder
+that does, each in git's order, with no sort; only the 200 rows shown are
+made. Over 100,000 synthetic paths in Node 22 (mock DOM, 4 cores,
+2026-10-10), a key costs 5–10 ms when nothing matches and about 20 ms when
+everything does; the listing's lowercase copy, once per opening, about
+65–95 ms. Ctrl-P still puts the next task beside.
 
 What a model writes never becomes the app's markup unparsed. Raw HTML inside
 Markdown shows as text. Links open in the default browser and only for `http`,
