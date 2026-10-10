@@ -790,7 +790,8 @@ daemon learns nothing about projects; everything here is client work.
   unchecked: a trigger (`home.heartbeat`) every 30 minutes whose check,
   `~/.agent/trigger changed --except home`, lets it fire only when an agent
   other than Home has a new message or another status since the last tick,
-  so a quiet half hour costs one process and no model call. Its stand-up
+  so a quiet half hour costs a few short processes (the fire, its shell and
+  the `changed` check, which pages the daemon's `bots`) and no model call. Its stand-up
   (`home.standup`, weekdays at 9:00) is off unless checked. Both land in
   Home's chat, and `home.md` says how Home answers each; the New trigger
   sheet fills in either for a Home made without them.
