@@ -135,6 +135,38 @@ def engine_target(engine, root, binary=None):
     return command, metadata, str(executable) if executable else None
 
 
+# npm @earendil-works/pi-durable 1.0.0: its SLSA provenance names tag v1.0.0 of
+# github.com/earendil-works/pi at this commit (packages/durable).
+PI_DURABLE_PACKAGES = {"@earendil-works/pi-durable": "1.0.0", "@earendil-works/chord": "1.0.0",
+                       "pi-ai-durable": "1.0.0"}
+PI_DURABLE_SOURCE_REVISION = "a13d35a742c6ef8462812a28fbe1d8c8b7431c32"
+
+
+def pi_durable_metadata(root):
+    """Pinned Pi Durable lifecycle adapter: versions, lock, Node, adapter hash."""
+    modules = root / "bench/adapters/node_modules"
+    metadata = {}
+    for package, version in PI_DURABLE_PACKAGES.items():
+        path = modules / package / "package.json"
+        if not path.exists():
+            raise ValueError("install the pinned benchmark adapter dependencies first")
+        if json.loads(path.read_text())["version"] != version:
+            raise ValueError("Pi Durable installed version differs from benchmark pin")
+        metadata[package.rsplit("/", 1)[-1]] = version
+    node = shutil.which("node")
+    if not node:
+        raise ValueError("Node.js is required for the Pi Durable adapter")
+    metadata.update(
+        pi_durable_source_revision=PI_DURABLE_SOURCE_REVISION,
+        dependency_lock_sha256=file_hash(root / "bench/adapters/pnpm-lock.yaml"),
+        adapter_sha256=file_hash(root / "bench/adapters/pi-durable.mjs"),
+        node_sha256=file_hash(Path(node).resolve()),
+        node_version=subprocess.check_output([node, "--version"], env=clean_env(), text=True, timeout=5).strip(),
+        node_sqlite_version=subprocess.check_output([node, "-p", "process.versions.sqlite"],
+                                                    env=clean_env(), text=True, timeout=5).strip())
+    return metadata
+
+
 # Tag v1.18.32 at github.com/anomalyco/opencode (formerly sst/opencode).
 OPENCODE_VERSION = "1.18.32"
 OPENCODE_SOURCE_REVISION = "545f51d26cc39a907d2867492d498d9607ea5fa4"

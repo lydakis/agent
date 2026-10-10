@@ -284,20 +284,20 @@ fn admission_reconciles_retries_without_accepting_fresh_work_at_capacity() {
         .unwrap();
     assert!(!retry.fresh);
     assert_eq!(retry.turn, turn);
-    assert_eq!(
-        db.begin(
+    // The refusal names the field that differs from the first request.
+    let changed = db
+        .begin(
             "Bob",
             "same",
             "changed",
             false,
             &TurnOptions::default(),
-            allow_provider
+            allow_provider,
         )
         .err()
-        .unwrap()
-        .code,
-        "idempotency_conflict"
-    );
+        .unwrap();
+    assert_eq!(changed.code, "idempotency_conflict");
+    assert_eq!(changed.facts.unwrap()["field"], "prompt");
     assert_eq!(
         db.begin(
             "Other",
@@ -811,10 +811,9 @@ fn a_deny_decides_the_call_and_later_answers_are_refused() {
     // Neither verdict nor reason is kept once the call is denied.
     for (allow, reason) in [(true, None), (false, Some(long.as_str()))] {
         let late = answer(&mut db, "second", allow, reason);
-        assert_eq!(
-            late.err().map(|e| e.to_string()).as_deref(),
-            Some("approval_already_answered")
-        );
+        let late = late.err().unwrap();
+        assert_eq!(late.code, "approval_already_answered");
+        assert_eq!(late.facts.unwrap()["decision"], "deny");
     }
     assert!(matches!(
         db.approval_start(turn, &call, 0).unwrap(),
@@ -904,7 +903,7 @@ fn a_turn_parked_on_one_verdict_ends_when_a_later_call_lapses_first() {
     };
     // Parked on the first call, the turn wakes when the second one lapses.
     assert_eq!(
-        db.suspend_approval(turn, &round, epoch_now(), None)
+        db.suspend_approval(turn, &round, epoch_now(), None, None)
             .unwrap(),
         Some(Some(lapse))
     );
@@ -951,7 +950,7 @@ fn every_parked_turns_lapse_is_read_at_once() {
     let next = db.next_lapse(turn).unwrap().expect("w1 lapses");
     // A running turn's lapse is its task's to watch.
     assert!(db.lapses().unwrap().is_empty());
-    db.suspend_approval(turn, &round, epoch_now(), None)
+    db.suspend_approval(turn, &round, epoch_now(), None, None)
         .unwrap();
     assert_eq!(db.lapses().unwrap(), [(turn, next)].into());
     // An allow decides the only call that can lapse.
@@ -1115,7 +1114,7 @@ fn a_tag_listing_reads_no_call_that_tag_answered() {
     assert_eq!(rest["next_after"], Value::Null);
     // They leave the index when the turn parks.
     assert_eq!(
-        db.suspend_approval(turn, &round, epoch_now(), None)
+        db.suspend_approval(turn, &round, epoch_now(), None, None)
             .unwrap(),
         Some(None)
     );
@@ -1348,7 +1347,7 @@ fn the_announced_call_count_follows_the_rows() {
     ));
     assert_eq!((db.approval_requests(), rows()), (1, 1));
     // A parked turn's call is counted again when the store opens.
-    db.suspend_approval(turn, &round[2..], epoch_now(), None)
+    db.suspend_approval(turn, &round[2..], epoch_now(), None, None)
         .unwrap();
     drop(db);
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
@@ -2152,8 +2151,17 @@ fn schema_40_gives_every_existing_bot_the_defaults_and_completes_parked_turns() 
         db.append(turn, vec![item], std::slice::from_ref(&w), None)
             .unwrap();
         db.tool_start(turn, &w).unwrap();
-        db.suspend(turn, "w", &["turn:Nobody/1".into()], None, false, &[], None)
-            .unwrap();
+        db.suspend(
+            turn,
+            "w",
+            &["turn:Nobody/1".into()],
+            None,
+            false,
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
         turn
     };
     // An earlier daemon parked it before these fields were recorded.
@@ -2244,6 +2252,45 @@ fn schema_41_turns_ran_at_their_bots_effort() {
     assert_eq!(
         db.turns("Bob", 0, 10).unwrap()["turns"][1]["reasoning"],
         "medium"
+    );
+    drop(db);
+    let version: i32 = Connection::open(&path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, Database::SCHEMA);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn schema_44_turns_report_no_summary_time_and_count_it_after() {
+    let path = std::env::temp_dir().join(format!("agent-summary-ms-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let turn = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        db.begin(
+            "Bob",
+            "r1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn
+    };
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE turns DROP COLUMN summary_ms; PRAGMA user_version=44;")
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert_eq!(db.turns("Bob", 0, 10).unwrap()["turns"][0]["summary_ms"], 0);
+    db.note_pacing(turn, 0, 0, 1200).unwrap();
+    db.note_pacing(turn, 0, 0, 300).unwrap();
+    assert_eq!(
+        db.turns("Bob", 0, 10).unwrap()["turns"][0]["summary_ms"],
+        1500
     );
     drop(db);
     let version: i32 = Connection::open(&path)
@@ -2786,12 +2833,14 @@ fn a_turn_runs_at_its_own_effort_or_its_bots() {
         reasoning: Some(level.into()),
         ..TurnOptions::default()
     };
-    // Only the levels the bot's family takes.
+    // Only the levels the bot's family takes, named as at creation.
+    let refused = db
+        .begin("Bob", "r0", "work", true, &at("max"), allow_provider)
+        .unwrap_err();
+    assert_eq!(refused.code, "invalid_reasoning_level");
     assert_eq!(
-        db.begin("Bob", "r0", "work", true, &at("max"), allow_provider)
-            .unwrap_err()
-            .code,
-        "invalid_reasoning_level"
+        refused.facts.unwrap()["levels"],
+        json!(["low", "medium", "high", "xhigh"])
     );
     let low = db
         .begin("Bob", "r1", "work", true, &at("low"), allow_provider)
@@ -3930,8 +3979,17 @@ fn a_running_turn_forks_at_its_newest_finished_round() {
     db.append(turn, vec![w_item], std::slice::from_ref(&w), None)
         .unwrap();
     db.tool_start(turn, &w).unwrap();
-    db.suspend(turn, "w", &["turn:Nobody/1".into()], None, false, &[], None)
-        .unwrap();
+    db.suspend(
+        turn,
+        "w",
+        &["turn:Nobody/1".into()],
+        None,
+        false,
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
     assert_eq!(fork_point(&mut db, "Bob", "f5").unwrap(), answered);
 
     // A forking bot's own fork: the round before the running one.
@@ -4130,8 +4188,17 @@ fn schema_36_ends_a_turn_in_flight_and_keeps_its_history() {
         db.append(turn, vec![item], std::slice::from_ref(&w), None)
             .unwrap();
         db.tool_start(turn, &w).unwrap();
-        db.suspend(turn, "w", &["turn:Nobody/1".into()], None, false, &[], None)
-            .unwrap();
+        db.suspend(
+            turn,
+            "w",
+            &["turn:Nobody/1".into()],
+            None,
+            false,
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
         (turn, stored(&mut db, "Bob"))
     };
     Connection::open(&path)
@@ -4566,6 +4633,15 @@ fn history_preserves_content_beyond_the_preview() {
     assert_eq!(
         db.history_read("Bob", 1, offset + 1, 97).unwrap_err().code,
         "invalid_history_page"
+    );
+    // An offset past any history names that bound, not the page size.
+    let far = db.history_read("Bob", 1, u64::MAX, 97).unwrap_err();
+    assert_eq!(
+        (far.code.as_str(), far.detail.as_deref()),
+        (
+            "invalid_history_page",
+            Some(format!("offset may be up to {}", i64::MAX).as_str())
+        )
     );
     let unicode_offset = full.find('é').unwrap() as u64 + 1;
     assert_eq!(
@@ -6339,9 +6415,11 @@ fn deletion_runs_in_pieces_refuses_work_and_resumes_after_interruption() {
                 .code,
             "bot_not_found"
         );
+        // The name is held, by the identity being deleted, until it is gone.
+        let taken = db.create("Bob", None, binding()).unwrap_err();
         assert_eq!(
-            db.create("Bob", None, binding()).unwrap_err().code,
-            "bot_exists"
+            (taken.code.as_str(), taken.facts.unwrap()["bot_id"].as_i64()),
+            ("bot_exists", Some(id))
         );
         assert_eq!(db.delete_bot_piece("Bob", id, 16).unwrap()["done"], false);
     }

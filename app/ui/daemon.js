@@ -21,6 +21,7 @@ window.Daemon = (() => {
       project: (dir) => invoke('project', { dir }),
       writeProject: ({ dir, name, model, reasoning = null }) => invoke('write_project', { dir, name, model, reasoning }),
       branch: (dir) => invoke('branch', { dir }),
+      readFile: (path) => invoke('read_file', { path }),
       attach: (after) => invoke('attach', { after }),
       replaceDaemon: () => invoke('replace_daemon'),
       pull: (session) => invoke('pull', { session }),
@@ -193,7 +194,10 @@ window.Daemon = (() => {
       if (!(S.bots.get(name) ?? GONE).interrupted) finish(name, turn);
       return;
     }
-    if (/test|check|run/i.test(prompt)) {
+    if (/render|rich|diagram|markdown/i.test(prompt)) {
+      await tool(name, turn, 'read', { path: 'src/auth/session.rs' }, '212 lines · refresh_session at line 88', 400);
+      await stream(name, turn, RICH, 12);
+    } else if (/test|check|run/i.test(prompt)) {
       await tool(name, turn, 'shell', { command: 'cargo test -p agent-runtime' }, JSON.stringify({ exit_code: 0, stderr: '', stdout: 'running 80 tests\ntest result: ok. 80 passed; 0 failed\n', success: true }), 900);
       await stream(name, turn, 'All green. Eighty tests pass, nothing flaky in the store or delivery suites.');
     } else if (/read|look|what|how/i.test(prompt)) {
@@ -204,6 +208,26 @@ window.Daemon = (() => {
     }
     if (!(S.bots.get(name) ?? GONE).interrupted) finish(name, turn);
   }
+  const FILES = {
+    'PLAN.md': ['# Login fix', '', 'The session cookie is written in three places. After this change it is written once, in [refresh_session](src/auth/session.rs).', '', '## Steps', '', '- [x] make `rotate()` pure', '- [x] write the cookie after the store commits', '- [ ] drop the reissue in `middleware.rs`', '', '## Risk', '', '> The refresh path has no regression test today. Add one before merging.', '', '```mermaid', 'flowchart LR', '    login --> rotate --> commit --> cookie', '    refresh --> rotate', '```', '', 'Latency before and after: [report/latency.vl.json](report/latency.vl.json).'].join('\n'),
+    'src/auth/session.rs': ['use crate::store::{Store, SessionId};', '', '/// Rotates the token and writes the cookie once, after the store commits.', 'pub fn refresh_session(store: &Store, id: SessionId) -> Result<Cookie> {', '    let token = rotate(store, id)?; // pure: no cookie here', '    store.commit()?;', '    Ok(Cookie::new("session", token).http_only(true).secure(true))', '}', '', 'fn rotate(store: &Store, id: SessionId) -> Result<Token> {', '    let token = Token::random();', '    store.put_session(id, &token)?;', '    Ok(token)', '}', ''].join('\n'),
+    'src/server/mod.rs': ['//! Dispatch: each op to its store call.', '', 'pub async fn dispatch(op: Op, store: &Store) -> Reply {', '    match op {', '        Op::Wait(handles) => registry().defer(handles).await,', '        op => store.call(op).await,', '    }', '}', ''].join('\n'),
+    'report/latency.vl.json': JSON.stringify({ title: 'Refresh latency, p50 and p99 (ms)', data: { values: [['before', 'p50', 41], ['before', 'p99', 188], ['after', 'p50', 23], ['after', 'p99', 61]].map(([build, q, ms]) => ({ build, q, ms })) }, mark: 'bar', encoding: { x: { field: 'q', type: 'nominal', title: null, axis: { labelAngle: 0 } }, xOffset: { field: 'build', sort: ['before', 'after'] }, y: { field: 'ms', type: 'quantitative', title: 'ms' }, color: { field: 'build', type: 'nominal', sort: ['before', 'after'], title: null } } }, null, 2),
+  };
+  // A reply that uses everything the page draws: Markdown, code, a diagram and a page preview.
+  const RICH = [
+    '## Session refresh', '',
+    'The cookie is reissued in **one place** now, `refresh_session`, so `rotate()` stays pure. Three things changed:', '',
+    '1. `rotate()` returns the new token instead of writing it', '2. `refresh_session` writes the cookie once, after the store commits', '3. the old reissue in `middleware.rs` is gone', '',
+    '| path | before | after |', '|---|---|---|', '| login | 2 writes | 1 write |', '| refresh | 3 writes | 1 write |', '',
+    '```rust', 'pub fn refresh_session(store: &Store, id: SessionId) -> Result<Cookie> {', '    let token = rotate(store, id)?; // pure: no cookie here', '    store.commit()?;', '    Ok(Cookie::new("session", token).http_only(true))', '}', '```', '',
+    '```mermaid', 'sequenceDiagram', '    participant C as Client', '    participant S as Server', '    participant DB as Store', '    C->>S: POST /refresh', '    S->>DB: rotate(id)', '    DB-->>S: new token', '    S->>DB: commit', '    S-->>C: Set-Cookie: session', '```', '',
+    'Refresh latency on the bench, before and after:', '',
+    '```vega-lite', JSON.stringify({ data: { values: [['before', 'p50', 41], ['before', 'p99', 188], ['after', 'p50', 23], ['after', 'p99', 61]].map(([build, q, ms]) => ({ build, q, ms })) }, mark: 'bar', encoding: { x: { field: 'q', type: 'nominal', title: null, axis: { labelAngle: 0 } }, xOffset: { field: 'build', sort: ['before', 'after'] }, y: { field: 'ms', type: 'quantitative', title: 'ms' }, color: { field: 'build', type: 'nominal', sort: ['before', 'after'], title: null } } }), '```', '',
+    'A sketch of the login card with the new copy:', '',
+    '```html', '<!doctype html>', '<html><body style="margin:0;font:15px system-ui;background:#f4f1ea;display:grid;place-items:center;height:180px">', '<div style="background:#fff;padding:20px 28px;border-radius:12px;box-shadow:0 6px 24px #0002">', '<b>Signed in</b><p style="margin:6px 0 0;color:#555">Your session renews itself while you work.</p>', '</div></body></html>', '```', '',
+    '> Tests that call `rotate()` directly need a session first; see [the auth notes](https://example.com/auth). The plan is in [PLAN.md](PLAN.md).',
+  ].join('\n');
   async function scenario(name, turn) {
     const m = S.bots.get(name);
     await think(name, turn, 'Three independent pieces here: plan, build, test. Peers are cheap, so spawn all three. The release build is slow and nobody depends on it until the end, so start it in the background now and collect it with the rest.');
@@ -411,6 +435,12 @@ window.Daemon = (() => {
     project: async (dir) => { const name = String(dir).split('/').filter(Boolean).pop()?.replace(/[^A-Za-z0-9_-]+/g, '-') || 'project'; return { dir, name, coordinator: `${name}.lead`, model: null, file: false }; },
     writeProject: async () => {},
     // A coordinator puts a task that edits in `~/.agent/worktrees/NAME` on branch agent/NAME.
+    // The demo's files, by their path under any agent's folder.
+    readFile: async (path) => {
+      const hit = Object.keys(FILES).find((k) => path === k || path.endsWith(`/${k}`));
+      if (hit == null) throw new Error(path.endsWith('/') ? `${path}: is a folder` : `${path}: no such file`);
+      return new TextEncoder().encode(FILES[hit]).buffer;
+    },
     branch: async (dir) => { const m = /\/worktrees\/([^/]+)$/.exec(dir ?? ''); return m ? `agent/${m[1]}` : null; },
     swarms: async () => ({ swarms: [...S.swarms.values()].map(swarmRecord), broken: [] }),
     // The demo has no editor to open: Edit only says your copy is now the one read.

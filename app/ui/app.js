@@ -193,7 +193,8 @@ const looking = () => !covered() && document.visibilityState !== 'hidden' && doc
 const onScreen = (name) => {
   if (!looking()) return false;
   const sw = swarmOfBot(name);
-  return S.selected === name || S.ui.side === name || (!!sw && S.selected === swarmKey(sw.name));
+  // A file open beside covers the chat that was there.
+  return S.selected === name || (S.ui.side === name && !S.ui.file) || (!!sw && S.selected === swarmKey(sw.name));
 };
 // Each row a change touches is drawn once, however many of a swarm's agents it covers.
 function patchUnseen(names) {
@@ -205,11 +206,11 @@ function patchUnseen(names) {
 function markSeen() {
   if (!S.unseen.size || !looking()) return;
   const sw = swarmOf(S.selected);
-  const seen = [...new Set([S.selected, S.ui.side, ...(sw ? sw.members : [])])].filter((name) => name && S.unseen.has(name));
+  const seen = [...new Set([S.selected, S.ui.file ? null : S.ui.side, ...(sw ? sw.members : [])])].filter((name) => name && S.unseen.has(name));
   if (!seen.length) return;
   for (const name of seen) S.unseen.delete(name);
   patchUnseen(seen);
-  refreshLive($('log')); if (S.ui.side) refreshLive($('side'));
+  refreshLive($('log')); if (S.ui.side && !S.ui.file) refreshLive($('side'));
 }
 const fmt = (ms) => { const s = Math.max(0, Math.round(ms / 1000)); return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`; };
 // Safe in text and inside a quoted attribute alike: names and call ids come from providers and land in both.
@@ -276,6 +277,7 @@ function forgetBot(name) {
   S.heldNews = S.heldNews.filter(([held]) => held !== name);
   // A draft belongs to its bot, so it goes with it.
   if (S.ui.side === name) S.ui.side = null;
+  if (S.ui.file?.bot === name) dropFile();
   S.drafts.delete(name);
   for (const ids of Object.values(PANE)) { const input = $(ids.input); if (input.dataset.for === name) { input.value = ''; input.dataset.for = ''; } }
 }
@@ -365,6 +367,9 @@ function tree(all = false) {
   if (projects.size && out.length > loose) out.splice(loose, 0, { label: 'bots' });
   return out;
 }
+// The path a read, write or edit names, whole (the summary is cut for display); none when it cannot be one.
+const FILE_TOOLS = new Set(['read', 'write', 'edit']);
+const toolPath = (name, parsed) => FILE_TOOLS.has(name) && typeof parsed?.path === 'string' && parsed.path && parsed.path.length <= 4096 ? parsed.path : undefined;
 function callSummary(name, args) {
   let a = {}; try { a = JSON.parse(args) ?? {}; } catch (_) {}
   let s = name === 'shell' ? a.command ?? '' : ['read', 'write', 'edit'].includes(name) ? a.path ?? '' : name === 'wait' ? (Array.isArray(a.handles) ? a.handles : []).filter((h) => typeof h === 'string').map((h) => h.replace(/^turn:/, '')).join(', ') : args;
@@ -685,7 +690,7 @@ async function onEvent(ev) {
       let parsed = {}; try { parsed = JSON.parse(args) ?? {}; } catch (_) {}
       const tname = data.name ?? 'tool';
       const t = transcript(name);
-      const row = { kind: 'tool', from: t.callNode, callId: data.call_id, name: tname, summary: callSummary(tname, args), background: tname === 'shell' && parsed.background === true, done: false, started: S.live ? Date.now() : 0, took: 0, turn };
+      const row = { kind: 'tool', from: t.callNode, callId: data.call_id, name: tname, summary: callSummary(tname, args), path: toolPath(tname, parsed), background: tname === 'shell' && parsed.background === true, done: false, started: S.live ? Date.now() : 0, took: 0, turn };
       let existing = null;
       for (let i = t.items.length - 1; i >= 0; i--) {
         const it = t.items[i]; if (it.turn !== turn) break;
@@ -693,7 +698,7 @@ async function onEvent(ev) {
       }
       if (existing) {
         row.from = existing.from ?? row.from;
-        if (data.arguments_truncated) { row.summary = existing.summary; row.background = existing.background; }
+        if (data.arguments_truncated) { row.summary = existing.summary; row.path = existing.path; row.background = existing.background; }
         Object.assign(existing, row); t.gen += 1; } else addItem(t, row);
       break;
     }
@@ -702,6 +707,10 @@ async function onEvent(ev) {
       let call = null;
       for (let i = t.items.length - 1; i >= 0; i--) { const it = t.items[i]; if ((it.kind === 'tool' || it.kind === 'tool_stub') && it.turn === turn && it.callId === data.call_id) { call = it; break; } }
       if (call) { call.done = true; if (call.started) call.took = Date.now() - call.started; call.started = 0; patchRun(name, call); }
+      const shown = S.ui.file;
+      // Read again as the agent left it; what it wrote is new, so a page, diagram or image in it waits for a click.
+      // A write or edit that failed or was refused changed nothing, and what is shown keeps running.
+      if (shown && !data.failed && !data.denied && call?.path && (call.name === 'write' || call.name === 'edit') && joinPath(bot(name)?.workspace ?? S.config?.workspace ?? '', call.path) === shown.full) openFile(shown.bot, shown.full, false);
       if (typeof data.node === 'number') {
         pushNode(t, { kind: 'node', node: data.node, callId: data.call_id, turn });
         if (call && (call.background || call.name === 'wait') && await loadWaitOrProc(name, data.node, call)) {
@@ -823,7 +832,7 @@ function applyWaitOrProc(name, item, call, node) {
 }
 function storedTool(name, callId, args) {
   let parsed = {}; try { parsed = JSON.parse(args) ?? {}; } catch (_) {}
-  return { kind: 'tool', name, callId, summary: callSummary(name, args), background: name === 'shell' && parsed.background === true, done: true, started: 0, took: 0 };
+  return { kind: 'tool', name, callId, summary: callSummary(name, args), path: toolPath(name, parsed), background: name === 'shell' && parsed.background === true, done: true, started: 0, took: 0 };
 }
 function entries(item) {
   const out = [];
@@ -839,12 +848,14 @@ function entries(item) {
     if (Array.isArray(item.content)) { let t = ''; for (const p of item.content) { if (p.type === 'tool_result') out.push(out_(p.tool_use_id, text(p.content, ['text']), p.is_error === true)); else if (p.type === 'text' || p.type === 'input_text') t += p.text ?? ''; } if (t) out.unshift({ kind: 'user', text: t }); }
     else out.push({ kind: 'user', text: text(item.content, ['text']) });
   } else if (item.role === 'assistant' && Array.isArray(item.content)) {
+    // Its text blocks, split by tool calls, are one message: they share its bounds (`budget`).
+    let budget = null, sib = 0;
     for (const p of item.content) {
       if (p.type === 'tool_use') out.push(storedTool(p.name, p.id, JSON.stringify(p.input)));
       else if (p.type === 'thinking' && p.thinking) out.push({ kind: 'thought', text: p.thinking, secs: null });
       else if ((p.type === 'text' || p.type === 'output_text') && p.text) {
         const previous = out.at(-1);
-        if (previous?.kind === 'text') previous.text += p.text; else out.push({kind:'text',text:p.text});
+        if (previous?.kind === 'text') previous.text += p.text; else { budget ??= { spent: [] }; out.push({ kind: 'text', text: p.text, budget, sib: sib++ }); }
       }
     }
   }
@@ -966,7 +977,7 @@ function enqueue(job) { chain = chain.then(job, job); return chain; }
 // them with, and its role says what to do with that. A turn it is waiting on is not news, since its wait
 // reads it; nor is its own fork or side chat. Only live turns count, while this window is attached.
 // Turns you asked for in a task yourself are its `theirs` news, listed apart: the coordinator hears of
-// them but is not asked to act on them. Turns another agent or the app (a schedule, by its `origin`)
+// them but is not asked to act on them. Turns another agent or the app (a trigger, by its `origin`)
 // asked for, and approvals, are its `act` news; a turn's end goes where its pending approval is.
 // Each kind keeps its own first and latest turn and a count, whatever the backlog, so a task can be in
 // both lists with the handles each one needs; one message names at most WAKE_TASKS tasks, those with
@@ -1179,7 +1190,7 @@ function forgetStore() {
   S.swarms.clear(); S.memberOf.clear(); S.deleted.clear(); looked.clear();
   for (const w of S.wakes.values()) clearTimeout(w.timer);
   S.wakes.clear(); S.turnFrom.clear(); S.turnOrigin.clear(); S.heldNews = []; S.unseen.clear(); S.wanted.clear();
-  S.selected = ''; S.autoSelect = true; S.ui.side = null; S.ui.folded = new Set();
+  S.selected = ''; S.autoSelect = true; S.ui.side = null; S.ui.folded = new Set(); dropFile();
   S.botsGen += 1; S.shapeGen += 1;
   // A home the last host named is not this one's.
   if (S.homeWorkspace) { S.config.workspace = null; S.homeWorkspace = false; }
@@ -1237,17 +1248,47 @@ window.addEventListener('focus', markSeen);
 function inline(text) {
   return esc(text).replace(/\*\*(.+?)\*\*/g, '<h>$1</h>').replace(/`([^`]+)`/g, '<code>$1</code>');
 }
-function markdown(text) {
-  const out = []; let fence = null;
-  for (const raw of text.split('\n')) {
-    const m = raw.trimStart().match(/^```(.*)$/);
-    if (m) { if (fence) { out.push(`<pre class="code">${fence.lang ? `<span class="lang">${esc(fence.lang)}</span>` : ''}${esc(fence.body.join('\n'))}</pre>`); fence = null; } else fence = { lang: m[1].trim(), body: [] }; continue; }
-    if (fence) { fence.body.push(raw); continue; }
-    const h = raw.trimStart().match(/^#+\s*(.*)$/);
-    out.push(h ? `<div class="line text"><h>${inline(h[1])}</h></div>` : `<div class="line text">${inline(raw)}</div>`);
+// A message's Markdown, drawn once and kept with the item: a pane drawn again reuses it, and it is
+// drawn anew only when its text changes or, for one whose code waited, highlighting arrives (see
+// `Rich.onReady`). What it keeps counts toward the transcript's decoded bytes, so the window's bound
+// holds, and so does what it puts on the page and what parsing it cost: each tag it draws counts
+// `TAG_BYTES` and each mark parsed `MARK_BYTES`, so a window holds about 200,000 drawn tags and
+// 500,000 parsed marks however the messages split them, and opening a chat parses a bounded amount.
+const TAG_BYTES = 40, MARK_BYTES = 16;
+function textHTML(it, t) {
+  // A block after the first of its message starts from what the blocks before it drew, and is drawn
+  // anew when that changes (an earlier block highlighted once highlighting arrived).
+  const used = { lines: 0, tags: 0, code: 0, links: 0, marks: 0, over: false };
+  for (const s of it.budget?.spent.slice(0, it.sib) ?? []) if (s) { used.lines += s.lines; used.tags += s.tags; used.code += s.code; used.links += s.links; used.marks += s.marks; used.over ||= s.over; }
+  const from = `${used.lines} ${used.tags} ${used.code} ${used.links} ${used.marks} ${used.over}`;
+  if (it.htmlOf !== it.text || it.htmlFrom !== from || (it.htmlWaited && it.htmlAt !== Rich.version)) {
+    const start = { ...used }, html = `<div class="md">${Rich.html(it.text, used)}</div>`;
+    const tags = used.tags - start.tags, mk = used.marks - start.marks, cost = 2 * html.length + TAG_BYTES * tags + MARK_BYTES * mk;
+    if (it.budget) it.budget.spent[it.sib] = { lines: used.lines - start.lines, tags, code: used.code - start.code, links: used.links - start.links, marks: mk, over: !!used.over };
+    const d = cost - (it.drawnBytes ?? 0); it.drawnBytes = cost; it.bytes = (it.bytes || 0) + d; if (t) t.bytes = Math.max(0, (t.bytes || 0) + d);
+    it.html = html; it.htmlOf = it.text; it.htmlFrom = from; it.htmlAt = Rich.version; it.htmlWaited = Rich.waited;
   }
-  if (fence) out.push(`<pre class="code">${fence.lang ? `<span class="lang">${esc(fence.lang)}</span>` : ''}${esc(fence.body.join('\n'))}</pre>`);
-  return out.join('');
+  return it.html;
+}
+// A transcript's drawn HTML is kept while it is on screen, and for the most recently shown others up
+// to 16 MiB in all, so going back to one is quick; past that the oldest let theirs go and are parsed
+// again when shown. The 8 MiB bound is each transcript's, so this one is the window's.
+const OFF_SCREEN_BYTES = 16 * 1024 * 1024, drawnBy = new Map(); let drawnOn = '';
+function releaseDrawn(shown) {
+  const on = shown.join('\n'); if (on === drawnOn) return; drawnOn = on;
+  for (const name of shown) { const t = S.transcripts.get(name); drawnBy.delete(name); if (t) drawnBy.set(name, t); }
+  let kept = 0;
+  for (const [name, t] of [...drawnBy].reverse()) {
+    if (S.transcripts.get(name) !== t) { drawnBy.delete(name); continue; }
+    if (shown.includes(name)) continue;
+    let bytes = 0; for (const it of t.items) bytes += it.drawnBytes ?? 0;
+    if (kept + bytes <= OFF_SCREEN_BYTES) { kept += bytes; continue; }
+    for (const it of t.items) if (it.drawnBytes) {
+      it.bytes = Math.max(0, (it.bytes || 0) - it.drawnBytes); t.bytes = Math.max(0, (t.bytes || 0) - it.drawnBytes);
+      it.html = it.htmlOf = it.htmlFrom = undefined; it.drawnBytes = 0;
+    }
+    drawnBy.delete(name);
+  }
 }
 const moreButton = (name) => `<button type="button" class="ibtn" data-act="more" data-who="${esc(name)}" title="More" aria-label="More">⋯</button>`;
 function cardInner({ status, name, last, elapsed, body }) {
@@ -1264,7 +1305,7 @@ function taskCard(who) {
   return { attr: `data-task="${esc(p.name)}"`, task: p.name, status: shownStatus(p), name: shortName(p), last: lastLine(transcript(who)), elapsed: el, sel: S.ui.side === who || S.selected === who };
 }
 // The two panes that show a transcript: the main thread and the one beside it.
-const PANES = [['log', () => S.selected], ['side', () => S.ui.side]];
+const PANES = [['log', () => S.selected], ['side', () => S.ui.file ? null : S.ui.side]];
 const paneKey = (name, t) => `${name}|${t.gen}|${S.ui.steps}`;
 // Replace one rendered card in place, in whichever pane shows that bot, so a process ending costs the
 // size of its own card, not a rebuild of the window.
@@ -1335,7 +1376,7 @@ function runHTML(t, s, limit = t.items.length) {
   } else {
     const last = tools[tools.length - 1];
     const el = last.started ? ` <span class="el" data-started="${last.started}">${fmt(Date.now() - last.started)}</span>` : last.took >= 1500 ? ` <span class="el">${fmt(last.took)}</span>` : '';
-    const now = n === 1 || last.started ? `<b>${esc(last.name)}</b> ${esc(last.summary)}${el}` : esc([...new Set(tools.map((it) => it.name))].join(' · '));
+    const now = n === 1 || last.started ? `<b>${esc(last.name)}</b> ${summaryHTML(last)}${el}` : esc([...new Set(tools.map((it) => it.name))].join(' · '));
     head = n === 1 ? `<span class="now">${now}</span>` : `${n} steps <span class="now">${now}</span>`;
   }
   let err = null; for (const it of items) if (it.kind === 'out' && it.err) err = it.err;
@@ -1343,10 +1384,12 @@ function runHTML(t, s, limit = t.items.length) {
   const body = open ? `<div class="body">${items.map((it, k) => stepHTML(it, s + k)).join('')}</div>` : '';
   return { html: `<div class="steps" data-i="${s}"><div class="sum" data-run="${s}" role="button" tabindex="0">${open ? '▾' : '▸'} ${head}</div>${body}</div>`, end };
 }
+// A read, write or edit names its path; it opens that file beside.
+const summaryHTML = (it) => it.path ? `<a class="fpath" href="#" data-file="${esc(it.path)}">${esc(it.summary)}</a>` : esc(it.summary);
 function stepHTML(it, i) {
   switch (it.kind) {
     case 'thought': return `<div class="line think">${esc(it.text)}</div>`;
-    case 'tool': { const el = it.started ? `<span class="el" data-started="${it.started}">${fmt(Date.now() - it.started)}</span>` : it.took >= 1500 ? `<span class="el">${fmt(it.took)}</span>` : ''; return `<div class="line tool" data-call="${esc(it.callId)}">▸ <b>${esc(it.name)}</b> ${esc(it.summary)}${el}</div>`; }
+    case 'tool': { const el = it.started ? `<span class="el" data-started="${it.started}">${fmt(Date.now() - it.started)}</span>` : it.took >= 1500 ? `<span class="el">${fmt(it.took)}</span>` : ''; return `<div class="line tool" data-call="${esc(it.callId)}">▸ <b>${esc(it.name)}</b> ${summaryHTML(it)}${el}</div>`; }
     case 'out': {
       const rows = it.text.split('\n').filter((l) => l.trim()); const long = rows.length > 2;
       const shown = long && !S.ui.steps && !it.open ? rows.slice(0, 2) : rows;
@@ -1368,7 +1411,7 @@ function toggleStep(target) {
   const old = pane.querySelector(`.steps[data-i="${s}"]`); if (old) old.outerHTML = runHTML(t, s, len).html;
 }
 
-function itemHTML(it) {
+function itemHTML(it, t = null) {
   switch (it.kind) {
     case 'user': {
       if (!it.by) return `<div class="line user">› ${esc(it.text)}</div>`;
@@ -1377,7 +1420,7 @@ function itemHTML(it) {
         : `<span class="by"${it.by.bot ? ` title="Sent by ${esc(it.by.bot)}, turn ${esc(it.by.turn)}, since deleted"` : ''}>${esc(it.by.bot ? agentName(it.by.bot, null) : it.by.app)}</span>`;
       return `<div class="line user agent">${tag} ${esc(it.text)}</div>`;
     }
-    case 'text': return markdown(it.text);
+    case 'text': return textHTML(it, t);
     case 'note': return `<div class="line note">${esc(it.text)}</div>`;
     case 'note_gap': return `<div class="line note">${it.total} ${it.later ? 'later' : 'earlier'} activity notes summarized · durable messages remain available</div>`;
     case 'peer_gap': return `<div class="line note">${it.total} earlier tasks · ^k finds a bot</div>`;
@@ -1400,7 +1443,7 @@ function itemsHTML(t, from = 0) {
     flush();
     if (it.turn != null && it.turn !== lastTurn) { if (h || from > 0) h += `<div class="line sep" data-sep="${i}"></div>`; lastTurn = it.turn; }
     if (STEP.has(it.kind)) { const run = runHTML(t, i); h += run.html; i = run.end; continue; }
-    h += itemHTML(it); i++;
+    h += itemHTML(it, t); i++;
   }
   flush();
   return h;
@@ -1416,13 +1459,24 @@ function renderTail(el, name, t) {
     const text = document.createTextNode('');
     const cursor = document.createElement('span'); cursor.className = 'cursor';
     line.replaceChildren(text, cursor);
-    el.replaceChildren(...(kind || running ? [line] : []));
-    state = { transcript: t, kind, turn: t.streamingTurn, gen: t.streamGen, offset: 0, text, running };
+    const done = kind === 'text' ? document.createElement('div') : null; if (done) done.className = 'md';
+    el.replaceChildren(...(kind || running ? [done, line].filter(Boolean) : []));
+    state = { transcript: t, kind, turn: t.streamingTurn, gen: t.streamGen, offset: 0, text, running, done, cut: {}, drawn: 0, used: { lines: 0, tags: 0, code: 0, draft: true } };
     tails.set(el, state);
   }
-  // Plain text while streaming; the durable message gets Markdown once. No full-prefix parsing
-  // or HTML replacement on each delta, and provider text never becomes markup.
-  if (value.length > state.offset) { state.text.appendData(value.slice(state.offset)); state.offset = value.length; }
+  if (value.length <= state.offset) return;
+  // Streamed text is drawn block by block: what has ended (a paragraph, a closed fence) is drawn
+  // once and appended, and only the block still being written is plain text. Each delta reads its
+  // own characters, never the whole reply, and provider text never becomes markup unparsed. The
+  // blocks share one message's bounds (`used`); past them the rest streams as plain text.
+  const at = state.done && !state.used.over ? Rich.cut(state.cut, value) : 0;
+  if (at > state.drawn) {
+    const box = document.createElement('div'); box.innerHTML = Rich.html(value.slice(state.drawn, at), state.used); state.waited ||= Rich.waited;
+    const added = [...box.childNodes]; state.done.append(...added);
+    for (const n of added) if (n.nodeType === 1) Rich.hydrate(n);
+    state.text.data = value.slice(at); state.drawn = at;
+  } else state.text.appendData(value.slice(state.offset));
+  state.offset = value.length;
 }
 // A streamed delta touches only the tail. The items rebuild when a load replaced nodes (gen) or the
 // steps fold changes; items appended since the last render are added on their own, and a step that
@@ -1437,21 +1491,34 @@ function renderTranscript(el, name) {
   const key = paneKey(name, t);
   const rendered = el.dataset.key === key ? Number(el.dataset.len) : -1;
   let tail = el.lastElementChild;
-  if (rendered < 0 || rendered > t.items.length || !tail || !tail.classList.contains('tail')) {
-    el.innerHTML = itemsHTML(t) + '<div class="tail"></div>';
-    el.dataset.key = key;
-    tail = el.lastElementChild;
-    // History loaded above the reader keeps their place instead of shoving it down.
-    if (!atBottom) el.scrollTop += el.scrollHeight - before;
-  } else if (rendered < t.items.length) {
-    let from = rendered;
+  const rebuild = rendered < 0 || rendered > t.items.length || !tail || !tail.classList.contains('tail');
+  let added = '', from = rendered, old = null; const was = t.bytes || 0;
+  if (!rebuild && rendered < t.items.length) {
     const next = t.items[rendered], prev = t.items[rendered - 1];
     if (prev && inRun(prev, next.turn) && inRun(next, next.turn)) {
       const s = runStart(t, rendered - 1);
-      const old = STEP.has(t.items[s].kind) ? el.querySelector(`.steps[data-i="${s}"]`) : null;
-      if (old) { const sep = old.previousElementSibling; if (sep?.dataset?.sep === String(s)) sep.remove(); old.remove(); from = s; }
+      old = STEP.has(t.items[s].kind) ? el.querySelector(`.steps[data-i="${s}"]`) : null;
+      if (old) from = s;
     }
-    tail.insertAdjacentHTML('beforebegin', itemsHTML(t, from));
+    added = itemsHTML(t, from);
+  }
+  // Drawn messages count toward the transcript's bytes, so drawing can pass the bound: the window then
+  // folds what it lets go, and the pane is drawn from what is left (kept messages reuse their HTML).
+  const over = () => t.bytes > DECODE_BYTES && t.bytes > was;
+  if (rebuild || over()) {
+    let html = itemsHTML(t);
+    if (over()) { evict(t); html = itemsHTML(t); }
+    el.innerHTML = html + '<div class="tail"></div>';
+    el.dataset.key = paneKey(name, t);
+    Rich.hydrate(el);
+    tail = el.lastElementChild;
+    // History loaded above the reader keeps their place instead of shoving it down.
+    if (!atBottom) el.scrollTop += el.scrollHeight - before;
+  } else if (added) {
+    if (old) { const sep = old.previousElementSibling; if (sep?.dataset?.sep === String(from)) sep.remove(); old.remove(); }
+    // Only what was just added is looked through for blocks to draw.
+    const prev = tail.previousElementSibling; tail.insertAdjacentHTML('beforebegin', added);
+    for (let n = prev ? prev.nextElementSibling : el.firstElementChild; n && n !== tail; n = n.nextElementSibling) Rich.hydrate(n);
   }
   el.dataset.len = String(t.items.length);
   refreshLive(el);
@@ -1466,6 +1533,75 @@ for (const [id, who] of PANES) {
     if (nearTop && !nearEnd) t.anchor = 'top'; else if (nearEnd) t.anchor = 'end';
     if ((nearTop || nearEnd) && (t.nodes > 0 || t.history != null)) enqueue(async () => { await load(name, nearTop); render(); });
   });
+}
+
+// ---------- files ----------
+// A file a message links or a step read, wrote or edited, opened beside: read from the agent's
+// folder by the core, drawn by its kind (see `Rich.file`). It takes the place of the pane beside
+// until closed, and is read again when a step of the agent it came from writes or edits it.
+const FILE_CAP = 4 * 1024 * 1024;
+// `~/` is the home folder, as the core reads it; any other name, `~notes.md` too, is the folder's.
+function joinPath(dir, path) {
+  const parts = [];
+  for (const seg of (path.startsWith('/') || path.startsWith('~/') || !dir ? path : `${dir.replace(/\/+$/, '')}/${path}`).split('/')) {
+    if (seg === '..' && parts.length && parts.at(-1) !== '..' && parts.at(-1) !== '') parts.pop(); else if (seg !== '.' && (seg || !parts.length)) parts.push(seg);
+  }
+  return parts.join('/') || '/';
+}
+const dirOf = (path) => path.replace(/\/[^/]*$/, '') || '/';
+// Which agent's folder a click names a path in: the file beside's own folder, or the agent in that pane.
+function openFileFrom(path, el) {
+  const beside = el?.closest?.('.pane.side');
+  if (beside && S.ui.file) return openFile(S.ui.file.bot, joinPath(dirOf(S.ui.file.full), path));
+  const who = beside ? S.ui.side : S.selected, b = bot(who);
+  return openFile(who, joinPath(b?.workspace ?? S.config?.workspace ?? '', path));
+}
+// `asked`: someone opened it, so what it holds draws at once. `gen` counts every opening and load
+// across closes, so a view never shares a key with one before it.
+let fileGen = 0;
+async function openFile(who, full, asked = true) {
+  const old = S.ui.file;
+  if (old?.url) URL.revokeObjectURL(old.url);
+  const f = S.ui.file = { bot: who, full, asked, gen: ++fileGen, state: 'loading', view: null, url: null };
+  render();
+  try {
+    const bytes = new Uint8Array(await Daemon.readFile(full));
+    if (S.ui.file !== f) return;
+    Object.assign(f, { state: 'ok', bytes: bytes.subarray(0, FILE_CAP), more: bytes.length > FILE_CAP, gen: ++fileGen });
+  } catch (e) { if (S.ui.file !== f) return; Object.assign(f, { state: 'error', error: String(e?.message ?? e), gen: ++fileGen }); }
+  render();
+}
+// A file opened from an agent goes with that agent, and with the store it came from.
+function dropFile() {
+  const f = S.ui.file; if (!f) return false;
+  if (f.url) URL.revokeObjectURL(f.url);
+  S.ui.file = null; $('side').dataset.key = ''; $('side').dataset.who = ''; $('side').dataset.shows = ''; $('sidetitle').dataset.k = '';
+  return true;
+}
+// The chat it covered is on screen again, and what it finished meanwhile is seen.
+function closeFile() { if (dropFile()) { render(); markSeen(); focusInput(S.ui.side ? 'side' : 'main'); } }
+function renderFile() {
+  const f = S.ui.file, el = $('side');
+  // Drawn when read, and again when highlighting arrives for code that waited for it; a page,
+  // diagram or chart beside keeps running as it is.
+  if (f.state === 'ok' && (f.at !== f.gen || (f.waited && f.ver !== Rich.version))) {
+    if (f.url) URL.revokeObjectURL(f.url);
+    const shown = Rich.file(f.full, f.bytes, f.more, f.asked !== false);
+    Object.assign(f, { view: shown.html, url: shown.url ?? null, waited: shown.waited, at: f.gen, ver: Rich.version });
+  }
+  const key = `file|${f.full}|${f.gen}|${f.ver}`;
+  if (el.dataset.key === key) return;
+  const name = f.full.split('/').pop(), where = dirOf(f.full).replace(/^\/(Users|home)\/[^/]+/, '~');
+  $('sidetitle').dataset.k = key;
+  $('sidetitle').innerHTML = `<div class="crumbs"><b>${esc(name)}</b><span class="branch" title="${esc(f.full)}">${esc(where)}</span></div><div class="tools"><button type="button" class="ibtn" data-act="close-file" title="Close (Esc)" aria-label="Close">✕</button></div>`;
+  el.innerHTML = `<div class="fview">${f.state === 'loading' ? '<div class="line pending">reading…</div>' : f.state === 'error' ? `<div class="line out bad">${esc(f.error)}</div>` : f.view}</div>`;
+  // A file drawn again (highlighting arrived, an agent rewrote it) keeps the reader's place.
+  if (el.dataset.shows !== f.full) el.scrollTop = 0;
+  el.dataset.key = key; el.dataset.who = ''; el.dataset.shows = f.full;
+  // A chart fills the pane's width, so it is measured once the pane has finished opening.
+  const opening = $('app')?.getAnimations?.() ?? [];
+  if (!opening.length) Rich.hydrate(el);
+  else Promise.all(opening.map((a) => a.finished.catch(() => {}))).then(() => { if (el.dataset.key === key) Rich.hydrate(el); });
 }
 
 // ---------- heads and composers ----------
@@ -1835,14 +1971,17 @@ function render() {
   railRows();
   const b = bot(S.selected), sw = swarmOf(S.selected);
   if (S.ui.side && (!S.bots.has(S.ui.side) || S.ui.side === S.selected)) S.ui.side = null;
-  const side = S.ui.side ? bot(S.ui.side) : null;
-  app.classList.toggle('rail', S.ui.rail); app.classList.toggle('side', !!side);
+  const side = S.ui.side && !S.ui.file ? bot(S.ui.side) : null;
+  app.classList.toggle('rail', S.ui.rail); app.classList.toggle('side', !!side || !!S.ui.file);
   followDrafts();
   markSeen();
   if (sw) { renderSwarmHead($('title'), sw); renderSwarm($('log'), sw); }
   else { renderHead($('title'), b, 'main'); if (b) renderTranscript($('log'), b.name); else { $('log').innerHTML = ''; $('log').dataset.key = ''; } }
   if (S.ui.rail) renderRail();
-  if (side) { renderHead($('sidetitle'), side, 'side'); renderTranscript($('side'), side.name); }
+  if (S.ui.file) renderFile();
+  else if (side) { renderHead($('sidetitle'), side, 'side'); renderTranscript($('side'), side.name); }
+  $('sideform').hidden = !!S.ui.file;
+  releaseDrawn([!sw && b ? b.name : '', side ? side.name : ''].filter(Boolean));
   renderComposer('main', b, sw); renderComposer('side', side);
   $('keybar').innerHTML = keybarHTML(b);
   if (S.ui.picker) renderPicker();
@@ -1852,7 +1991,7 @@ function render() {
 // check is cached per fleet change, so a quiet fleet of any size costs nothing here.
 let activeAt = -1, active = false;
 function anyActive() { if (activeAt !== S.botsGen) { activeAt = S.botsGen; active = [...S.bots.values()].some((b) => isActive(b.status)); } return active; }
-setInterval(() => { if (S.attached && anyActive()) { refreshLive($('log')); if (S.ui.side) refreshLive($('side')); } }, 1000);
+setInterval(() => { if (S.attached && anyActive()) { refreshLive($('log')); if (S.ui.side && !S.ui.file) refreshLive($('side')); } }, 1000);
 
 // ---------- picker ----------
 function pickerRows() {
@@ -2548,7 +2687,7 @@ document.addEventListener('keydown', async (e) => {
   if (ctrl && k === 'd') { detach(); e.preventDefault(); return; }
   if (ctrl && k === 'o') { S.ui.steps = !S.ui.steps; render(); save(); e.preventDefault(); return; }
   if (ctrl && k === 'p') { await nextBeside(); e.preventDefault(); return; }
-  if (k === 'Escape') { if (S.ui.side) closeSide(); else await interrupt(); e.preventDefault(); return; }
+  if (k === 'Escape') { if (S.ui.file) closeFile(); else if (S.ui.side) closeSide(); else await interrupt(); e.preventDefault(); return; }
   const empty = e.target.id === 'input' && $('input').value === '';
   if (empty && (k === 'ArrowUp' || k === 'ArrowDown')) { const names = tree().filter((n) => n.b).map((n) => n.b.name); let i = names.indexOf(S.selected); if (i >= 0) { i = (i + (k === 'ArrowDown' ? 1 : names.length - 1)) % names.length; await openOnly(names[i]); } e.preventDefault(); return; }
   if (!inputIds.has(e.target.id) && k.length === 1 && !ctrl && !e.altKey) $('input').focus();
@@ -2586,6 +2725,7 @@ async function act(el) {
     case 'open': await openOnly(who); return;
     case 'swap': swap(); return;
     case 'close-side': closeSide(); return;
+    case 'close-file': closeFile(); return;
     case 'new-project': showNewProject(true); return;
     case 'new-swarm': await openSwarmSheet(leadProject(who)); return;
     case 'close-sheet': closeSheet(); return;
@@ -2624,6 +2764,7 @@ document.addEventListener('click', async (e) => {
   if (S.ui.help) { hideHelp(); return; }
   if (e.target.closest?.('#sheetwrap') && !e.target.closest('#sheet')) { closeSheet(); return; }
   if (e.target.closest('#pickerwrap') && !e.target.closest('.picker')) { closePicker(); return; }
+  if (Rich.click(e)) { closeMenu(); return; }
   const button = e.target.closest('[data-act]');
   closeMenu();
   if (button) { if (!button.disabled) { try { await act(button); } catch (err) { failed(err); } } return; }
@@ -2635,13 +2776,30 @@ document.addEventListener('click', async (e) => {
   else if (task) { await openBeside(task.dataset.task); return; }
   else if (row) await openOnly(row.dataset.bot);
   // Clicks return the keyboard to the pane's composer, unless they selected text to copy.
-  if (!e.target.closest('input, textarea, form') && window.getSelection?.()?.isCollapsed !== false) focusInput(e.target.closest('.pane.side') ? 'side' : 'main');
+  if (!e.target.closest('input, textarea, form') && window.getSelection?.()?.isCollapsed !== false) focusInput(e.target.closest('.pane.side') && !S.ui.file ? 'side' : 'main');
 });
 document.addEventListener('contextmenu', (e) => {
+  // A link's own menu would follow it in the window, past the opener that sends it to the browser.
+  if (e.target.closest('a')) { e.preventDefault(); return; }
   const t = e.target.closest('[data-bot], [data-task]'); if (!t) return;
   const who = t.dataset.bot ?? t.dataset.task;
   e.preventDefault(); closeMenu(); showMenu(botMenuItems(who), { x: e.clientX, y: e.clientY }, who);
 });
+
+// Highlighting arrived: a pane whose messages were drawn without it is drawn again; one with no
+// code waiting keeps what it drew. A file beside decides for itself (`renderFile`), so a page
+// running there keeps running.
+function waitsForHighlight(el) {
+  if (tails.get(el.lastElementChild)?.waited) return true;
+  const t = S.transcripts.get(el.dataset.who);
+  return !!t?.items.some((it) => it.htmlWaited);
+}
+Rich.onReady = () => { for (const [id] of PANES) if (!(id === 'side' && S.ui.file) && waitsForHighlight($(id))) $(id).dataset.key = ''; render(); };
+Rich.onFile = openFileFrom;
+// Escape in a preview: a file's closes it, as Escape does there; a message's returns the keyboard to
+// its pane, where the next Escape does what it does.
+Rich.onEscape = (frame) => { if (frame.closest('.fview') && S.ui.file) closeFile(); else focusInput(frame.closest('.pane.side') && !S.ui.file ? 'side' : 'main'); };
+Rich.onError = (text) => toast(text, 4000);
 
 // ---------- boot ----------
 render();

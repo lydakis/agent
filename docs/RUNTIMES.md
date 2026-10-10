@@ -20,6 +20,7 @@ preserving every existing coding-harness feature is not a goal.
 | Prime Agent / nano-rlm | [Pinned investigation](PRIME_INTELLECT.md): daemon workers, lazy Python kernels, context compaction, and retained history objects; nano-rlm explicitly omits restart/load. | Direct harness references, especially for long histories. Resource costs unmeasured; no efficiency ranking. |
 | Codex app-server | Shared services and thread/turn protocol; 0.153.1 completed the synthetic concurrency matrix. | Shared native baseline. Durable/tool workload cost and active capacity beyond the screen remain unmeasured. |
 | Pi agent core / model layer | Separate per-agent state; published 0.85.1 completed the same matrix with lower sampled costs at 8/32 streams. | Comparison baseline; earlier reuse recommendation superseded by the custom-core decision. Durable capacity remains unmeasured. |
+| Pi Durable | npm `@earendil-works/pi-durable` 1.0.0 (2026-10-01): one harness, many conversations, SQLite/JSONL/memory storage, task checkpoints, prefix-sharing forks. [Source check below](#pi-durable-durable-harness-over-one-commit-line); [lifecycle screen](LIFECYCLE_MEASUREMENTS.md#pi-durable-baseline). | Closest measured baseline to Agent's contract. No event log to replay from a cursor; one serial commit line per harness. |
 | New minimal core | Rust prototype with shared provider I/O, immutable encoded history, and a durable lifecycle service. [Measurements](RUST_MEASUREMENTS.md). | Selected experiment. Durable performance and full coding-tool/provider coverage remain open. |
 | Codex TypeScript SDK | The inspected execution path spawns the native executable. | Convenient interface; not evidence of lower process overhead. |
 | OpenCode server | Session CRUD/fork/abort, asynchronous prompts, and event endpoints. | Existing programmable server worth examining before building a new one. |
@@ -107,6 +108,61 @@ application. Investigate allocation/copying during streaming, retained history,
 subscriber backpressure, provider-specific context, and lifecycle persistence.
 Measure it as a candidate before deciding to reuse or replace the loop or model
 adapters. Neither TypeScript nor a small public API establishes its runtime cost.
+
+## Pi Durable: durable harness over one commit line
+
+Observed 2026-10-02. npm `@earendil-works/pi-durable` **1.0.0**, published
+2026-10-01T19:11Z, tarball SHA-512 prefix `3ef8c221dcb98d1b`. Its SLSA
+provenance attestation names tag `v1.0.0` of github.com/earendil-works/pi at
+commit `a13d35a742c6ef8462812a28fbe1d8c8b7431c32` (`packages/durable`); the
+attestation payload was decoded and its subject digest matches the tarball,
+but its signature was not independently verified (`npm audit signatures` could
+not download its trust material here), and the GitHub repository was not
+readable from this session. It depends on `@earendil-works/pi-ai` 1.0.0 and
+`@earendil-works/chord` 1.0.0, a different pi-ai major than the 0.85.1
+packages of the ephemeral Pi adapter. The README marks the package
+experimental, with the API changing without notice.
+
+Verified in the installed 1.0.0 distribution (`dist/`, line numbers of the
+published JavaScript):
+
+- `storage/sqlite/node.js` lines 160–161 open WAL with
+  `PRAGMA synchronous = NORMAL`; there is no option for another setting.
+  `openNodeSqliteDatabase()` is exported, so a caller can open the database,
+  change the pragma, and pass it to the exported `SqliteStorage.open()`; the
+  benchmark adapter does that for FULL. Agent opens WAL with
+  `synchronous=FULL` (`src/store/db.rs`, line 1041).
+- Each transaction is `BEGIN IMMEDIATE` … `COMMIT` on one connection
+  (`node.js` line 113), and `SqliteStorage.commit()` runs one transaction per
+  Session commit (`storage/sqlite/storage.js` line 102). The Session has one
+  mutation line that runs every commit callback and storage settlement in
+  turn (`session/session.js` line 59), so commits from all conversations of a
+  harness are serialized, one storage transaction each. A commit that writes
+  nothing touches no storage (line 262).
+- Generation commits partial answers as they stream, at most every 100 ms
+  (`harness/generation.js` line 15, `PARTIAL_THROTTLE_MS`).
+- A conversation record carries its fork parent and the inclusive parent entry
+  (`types.d.ts`, `ConversationRecord.parent`); a fork reads the parent's
+  entries up to that point instead of copying them.
+- A submission's `requestId` deduplicates within its conversation
+  (`Tx.submissionByRequest`). Conversations have generated integer IDs; there
+  is no caller-chosen name. The adapter keeps names in a session-scoped
+  document written in the creating commit.
+- `watchEvents()` derives events from commits, one batch per commit, and
+  replaces more than 100 undelivered batches with a snapshot. The README states
+  that a late or reconnecting watcher starts from the current view and
+  "nothing is replayed".
+
+Claims from the [announcement](https://earendil.com/posts/pi-durable/)
+(Earendil Engineering, 2026-10-01), not verified beyond the points above: one
+harness "runs as many conversations as you need, concurrently"; a fork "sees the
+parent's history up to that point without copying it"; after a crash a new
+process "continues each one from its last checkpoint" and resends a cut-off
+model request; on SQLite only the working set stays in memory. The post gives no
+performance numbers and does not mention fsync or power loss; the README states
+that NORMAL commits "survive process crashes; the newest may be lost on power
+or host failure". The post names the watch API `thread.watch()`; 1.0.0
+exposes it as `Conversation.watch()`.
 
 ## OpenCode: existing server rather than another wrapper
 

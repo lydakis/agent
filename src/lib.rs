@@ -39,6 +39,32 @@ impl Error {
         }
         self
     }
+    /// The error an object reports, as a refusal or an outcome flattens it:
+    /// `error` and `detail`, with every other field but `id` as a fact.
+    pub fn reported(value: &serde_json::Value) -> Option<Self> {
+        let code = value.get("error")?.as_str()?;
+        let mut facts = value.as_object()?.clone();
+        let detail = facts
+            .remove("detail")
+            .and_then(|d| d.as_str().map(str::to_owned));
+        for key in ["id", "error"] {
+            facts.remove(key);
+        }
+        Some(Self {
+            code: code.into(),
+            detail,
+            facts: (!facts.is_empty()).then(|| Box::new(facts)),
+        })
+    }
+}
+impl From<agent_client::Error> for Error {
+    fn from(error: agent_client::Error) -> Self {
+        Self {
+            code: error.code,
+            detail: error.detail,
+            facts: error.facts,
+        }
+    }
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

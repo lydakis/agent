@@ -56,6 +56,14 @@ pub(super) fn put(db: &Connection, turn: i64, call: &str, stream: &str, raw: &[u
     Ok(())
 }
 
+fn past_end(size: u64) -> Error {
+    Error::with(
+        "invalid_artifact_page",
+        format!("offset is past the end, {size} bytes"),
+    )
+    .facts(serde_json::json!({"size":size}))
+}
+
 pub(super) fn read(
     db: &Connection,
     turn: i64,
@@ -91,7 +99,7 @@ pub(super) fn read(
     if raw_size == 0 {
         let total = u64::try_from(stored_size).map_err(|_| Error::new("storage_error"))?;
         if offset > total {
-            return fail("invalid_artifact_page");
+            return Err(past_end(total));
         }
         return Ok(Some((total, bytes)));
     }
@@ -100,7 +108,7 @@ pub(super) fn read(
         return fail("storage_error");
     }
     if offset > total as u64 {
-        return fail("invalid_artifact_page");
+        return Err(past_end(total as u64));
     }
     let count = total.div_ceil(BLOCK);
     let header = (count + 1) * 4;
