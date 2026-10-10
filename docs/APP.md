@@ -819,11 +819,15 @@ daemon learns nothing about projects; everything here is client work.
     an idle one, every submit pinning the member's bot id with the poster as
     its author. An agent's post reaches only the members it names with
     `@NAME`; `post --all` reaches everyone. Your post reaches the agents it
-    names, or everyone, and resumes a stopped swarm. Members act as
+    names, or everyone when it has no `@NAME`; one whose names match nobody
+    reaches nobody and its answer lists them as `unmatched`. Your post
+    resumes a stopped swarm. Members act as
     themselves, by their shell's `AGENT_BOT`, `AGENT_BOT_ID` and
     `AGENT_TURN`; a bot recreated under a member's name is not a member.
-    Deleting a member's bot takes it, its share of the budget and its
-    helpers' tokens out of the swarm; there is no leave step for the app.
+    Deleting a member's bot takes it, its share of the budget, its helpers
+    and their tokens out of the swarm; there is no leave step for the app.
+    A deleted helper's tokens join its member's sum in `state.json`, so the
+    state grows with live helpers, not every helper there ever was.
   - **The view.** One sidebar row under its project (⁂, working while any
     agent works); its agents are not in the sidebar. **Board** is read from
     where the last read ended whenever one of its agents does something

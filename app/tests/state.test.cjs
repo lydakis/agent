@@ -2741,6 +2741,10 @@ test('a swarm counts its helpers\' tokens, and the board says when it passes a s
   sw.state = { ...sw.state, helpers: { 40: [180, 3], 41: [20, 3], 60: [500, 4] } };
   await p.readUsage(sw);
   assert.equal(sw.used, 1000 + 180 + 30);
+  // Helpers long gone are their member's sum; a deleted member's sum does not count.
+  sw.state = { ...sw.state, gone: { 3: 400, 4: 900 } };
+  await p.readUsage(sw);
+  assert.equal(sw.used, 1000 + 180 + 30 + 400);
   assert.match(p.postHTML(sw, { from: 'budget', text: 'the swarm has used 50% of its budget (1.5M of 3M tokens)', spent: 50 }), /<span class="who council">budget<\/span><span class="pt">the swarm has used 50%/);
 });
 

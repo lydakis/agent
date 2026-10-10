@@ -296,7 +296,7 @@ def load():
 class SwarmRuleTests(unittest.TestCase):
     def setUp(self):
         self.s = load()
-        self.swarm = {'name': 'p.w', 'members': ['p.w-1', 'p.w-2', 'p.w-3'], 'ids': {'p.w-1': 1, 'p.w-2': 2, 'p.w-3': 3},
+        self.swarm = {'name': 'p.w', 'project': 'p', 'members': ['p.w-1', 'p.w-2', 'p.w-3'], 'ids': {'p.w-1': 1, 'p.w-2': 2, 'p.w-3': 3},
                       'coordinator': {'bot': 'p.lead', 'id': 9}, 'stopped': False}
 
     def act(self, author=None, state=None, live=None):
@@ -312,10 +312,25 @@ class SwarmRuleTests(unittest.TestCase):
         helper = {'name': 'p.w-1.fix', 'id': 7, 'tokens_used': 30, 'root': 1}
         self.assertEqual(self.s.usage(state, members, [helper]), (180, 2000))
         self.assertTrue(state.pop('dirty'))
-        self.assertEqual(self.s.usage(state, members, []), (180, 2000))
+        self.assertEqual(self.s.usage(state, members, [helper]), (180, 2000))
         self.assertNotIn('dirty', state)
+        # Once gone, a helper is its member's sum, not an id kept forever,
+        # unless a helper it made is still listed.
+        deeper = {'name': 'p.w-1.fix.more', 'id': 8, 'tokens_used': 5, 'root': 1, 'created_by_id': 7}
+        self.assertEqual(self.s.usage(state, members, [deeper]), (185, 2000))
+        self.assertEqual((state['helpers'], state['gone']), ({'7': [0, 1], '8': [5, 1]}, {'1': 30}))
+        state.pop('dirty')
+        self.assertEqual(self.s.usage(state, members, [deeper]), (185, 2000))
+        self.assertNotIn('dirty', state)
+        self.assertEqual(self.s.usage(state, members, []), (185, 2000))
+        self.assertEqual((state['helpers'], state['gone']), ({}, {'1': 35}))
         del members['p.w-1']
         self.assertEqual(self.s.usage(state, members, []), (50, 1000))
+        self.assertEqual(state['gone'], {})
+
+    def test_names_drop_the_whole_project_even_with_dots(self):
+        self.assertEqual(self.s.short('foo.bar.widget-1', {'project': 'foo.bar'}), 'widget-1')
+        self.assertEqual(self.s.short('p.w-1.fix', self.swarm), 'w-1.fix')
 
     def test_posts_reach_who_they_name_and_everyone_only_when_asked(self):
         reach = lambda act: sorted(m for m, how, _, _ in act.sends)
@@ -331,6 +346,10 @@ class SwarmRuleTests(unittest.TestCase):
         _, act = self.act()
         self.s.post(act, 'carry on', False)
         self.assertEqual(reach(act), ['p.w-1', 'p.w-2', 'p.w-3'])
+        # The person's @name that matches nobody reaches nobody, and says so.
+        _, act = self.act()
+        self.s.post(act, '@w-9 look at this', False)
+        self.assertEqual((reach(act), act.answer['unmatched']), ([], ['w-9']))
 
     def test_each_share_of_a_budget_is_told_once_and_only_to_working_agents(self):
         folder, act = self.act('p.w-1')
@@ -344,6 +363,11 @@ class SwarmRuleTests(unittest.TestCase):
         folder, act = self.act('p.w-2', folder.state)
         self.s.budget(act, folder, members, [])
         self.assertEqual(act.lines, [])
+        # A call can overshoot a cap; what remains is never below none.
+        members['p.w-2'] = self.bot(2, 1100, turn=7)
+        folder, act = self.act('p.w-2', folder.state)
+        self.s.budget(act, folder, members, [])
+        self.assertIn('0 remain', act.lines[-1]['text'])
 
     def test_the_state_is_the_board_folded(self):
         state = self.s.empty_state()
@@ -368,6 +392,11 @@ class SwarmRuleTests(unittest.TestCase):
         self.s.apply(state, act.lines[0])
         self.assertEqual((state['tasks']['t']['reviewer'], state['tasks']['t']['result']), ('w-3', 'r'))
         self.assertEqual([m for m, *_ in act.sends], ['p.w-3'])
+        _, act = self.act('p.w-1', state, {'p.w-1', 'p.w-2'})
+        state['tasks']['t']['reviewer'] = 'w-3'
+        with self.assertRaises(self.s.Refused) as refused:
+            self.s.assign(act, 't', 'w-1', 'w-1', 'I will')
+        self.assertEqual(refused.exception.code, 'independent_review_required')
 
     def test_a_deleted_member_takes_no_work_and_its_review_is_handed_on(self):
         state = self.s.empty_state()
@@ -390,7 +419,7 @@ class SwarmRuleTests(unittest.TestCase):
         (agents / 'inline.md').write_text('---\ntools: [read, "edit"]\n---\nReviews.\n')
         (agents / 'block.md').write_text('---\ndescription: x\ntools:\n  - read\n  - shell\nmodel: m\n---\n')
         (agents / 'open.md').write_text('---\ndescription: x\n---\nAnything.\n')
-        (agents / 'noted.md').write_text('---\ntools: [read, shell] # the defaults\n---\n')
+        (agents / 'noted.md').write_text('---\ntools: [read, shell]\t# the defaults\n---\n')
         (agents / 'listed.md').write_text('---\ntools:\n  # needed\n  - shell # for the board\n---\n')
         self.assertEqual(self.s.profile_tools(str(folder), 'noted'), ['read', 'shell'])
         self.assertEqual(self.s.profile_tools(str(folder), 'listed'), ['shell'])
@@ -400,11 +429,18 @@ class SwarmRuleTests(unittest.TestCase):
         self.assertIn('shell', self.s.profile_tools(str(folder), 'missing'))
 
     def test_a_member_finds_its_swarm_even_in_a_dotted_project(self):
-        for bot, names in [('p.widget-2', ['p.widget']), ('p.widget-2-1.fix', ['p.widget-2']),
-                           ('foo.bar.widget-1', ['foo.bar.widget']), ('foo.bar.widget-1.fix.deep', ['foo.bar.widget'])]:
+        made = tempfile.TemporaryDirectory()
+        self.addCleanup(made.cleanup)
+        for name, members in [('p.widget', ['p.widget-1']), ('p.widget-2', ['p.widget-2-1']),
+                              ('foo.bar.widget', ['foo.bar.widget-1'])]:
+            (Path(made.name) / name).mkdir()
+            (Path(made.name) / name / 'swarm.json').write_text(json.dumps({'members': members}))
+        self.addCleanup(os.environ.pop, 'AGENT_BOT', None)
+        # The one that names it, else the first there: an added agent is named once made.
+        for bot, name in [('p.widget-1', 'p.widget'), ('p.widget-2-1', 'p.widget-2'), ('p.widget-1.fix-2', 'p.widget'),
+                          ('foo.bar.widget-1.fix.deep', 'foo.bar.widget'), ('p.widget-3', 'p.widget')]:
             os.environ['AGENT_BOT'] = bot
-            self.addCleanup(os.environ.pop, 'AGENT_BOT', None)
-            self.assertEqual(self.s.which(['status'])[0][:1], names, bot)
+            self.assertEqual(self.s.which(['status'], made.name), (name, ['status']), bot)
 
     def test_a_board_cut_mid_line_keeps_its_next_line_whole(self):
         made = tempfile.TemporaryDirectory()
@@ -421,7 +457,10 @@ class SwarmRuleTests(unittest.TestCase):
         (folder / 'state.json').unlink()
         again = self.s.Folder(made.name, 'p.w')
         self.assertEqual(again.state['roles'], {'w-1': 'profiler'})
+        # A cache folded again is written back, even by an act that adds nothing.
+        again.append([])
         again.board.close()
+        self.assertEqual(json.loads((folder / 'state.json').read_text())['roles'], {'w-1': 'profiler'})
 
     def test_the_mix_is_dealt_to_the_row_furthest_below_its_share(self):
         mix = [{'share': 50}, {'share': 25}, {'share': 25}]

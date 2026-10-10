@@ -493,7 +493,7 @@ async function readUsage(sw) {
   if (sw.usage) return sw.usage;
   sw.usage = (async () => {
     // As the script counts: live members and their caps, and every helper seen working for a live
-    // member, deleted ones by the tokens the board's state last recorded.
+    // member, deleted ones by the tokens the board's state last recorded, or summed per member.
     const helpers = { ...(sw.state.helpers ?? {}) }, live = new Set(), prefix = sw.name + '-';
     const roots = new Map([...Object.entries(helpers).map(([id, [, root]]) => [Number(id), root]), ...Object.values(sw.ids).map((id) => [id, id])]);
     let used = 0, budget = 0, after = sw.name;
@@ -509,6 +509,7 @@ async function readUsage(sw) {
         after = page.next_after;
       }
       for (const [tokens, root] of Object.values(helpers)) if (live.has(root)) used += tokens;
+      for (const [root, tokens] of Object.entries(sw.state.gone ?? {})) if (live.has(Number(root))) used += tokens;
       sw.used = used; sw.budget = budget;
     } catch (_) { sw.used = null; }
     finally { sw.usage = null; }

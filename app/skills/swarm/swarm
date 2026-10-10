@@ -77,9 +77,11 @@ def now_ms():
     return int(time.time() * 1000)
 
 
-def short(name):
-    """A member's name without its project, as the board and @names use it."""
-    return name.split('.', 1)[1] if '.' in name else name
+def short(name, swarm):
+    """A member's name without its project, as the board, @names and the
+    app use it: a project's name may hold dots too."""
+    prefix = swarm['project'] + '.'
+    return name[len(prefix):] if name.startswith(prefix) else name
 
 
 def valid_name(name):
@@ -150,9 +152,10 @@ class Daemon:
 
 def scan(daemon, folder):
     """The swarm's agents as the daemon lists them: members by their pinned
-    ids, then helpers, named after the agent that made them (NAME-N.WHAT),
-    whose maker is a member or a helper, seen now or before. They sit
-    together in name order, and a maker sorts before what it made."""
+    ids, then the helpers working for one of them, named after the agent
+    that made them (NAME-N.WHAT), whose maker is a member or a helper, seen
+    now or before. A deleted member's helpers are out of the swarm with it.
+    They sit together in name order, and a maker sorts before what it made."""
     swarm = folder.swarm
     prefix, after, ids = swarm['name'] + '-', swarm['name'], swarm['ids']
     roots = {int(i): root for i, (_, root) in folder.state['helpers'].items()}
@@ -163,32 +166,50 @@ def scan(daemon, folder):
         for bot in page['bots']:
             name = bot['name']
             if name > prefix and not name.startswith(prefix):
-                return members, helpers
+                break
             if name in ids:
                 if ids[name] == bot['id']:
                     members[name] = bot
             elif bot.get('created_by_id') in roots:
                 roots[bot['id']] = bot['root'] = roots[bot['created_by_id']]
                 helpers.append(bot)
-        if not page.get('next_after'):
-            return members, helpers
-        after = page['next_after']
+        else:
+            if page.get('next_after'):
+                after = page['next_after']
+                continue
+        live = {b['id'] for b in members.values()}
+        return members, [h for h in helpers if h['root'] in live]
 
 
 def usage(state, members, helpers):
     """Tokens used and the budget: the members' own caps, so a member that
     is deleted takes its share, and what it and its helpers used, with it,
-    and an added one brings its own. A helper is remembered once seen, by
-    the member it works for, so deleting it keeps its tokens counted."""
-    seen = state['helpers']
-    for helper in helpers:
-        mark = [helper.get('tokens_used') or 0, helper['root']]
-        if seen.get(str(helper['id'])) != mark:
-            seen[str(helper['id'])] = mark
-            state['dirty'] = True
+    and an added one brings its own. A helper is remembered by the member it
+    works for, so deleting it keeps its tokens counted: once gone, they join
+    that member's sum, and its id is kept only while a helper it made is."""
+    seen, gone = state['helpers'], state['gone']
     live = {b['id'] for b in members.values()}
+    listed = {str(h['id']): [h.get('tokens_used') or 0, h['root']] for h in helpers}
+    anchors = {str(h.get('created_by_id')) for h in helpers}
+    for key, (tokens, root) in list(seen.items()):
+        if key in listed or (not tokens and key in anchors and root in live):
+            continue
+        if tokens and root in live:
+            gone[str(root)] = gone.get(str(root), 0) + tokens
+        if key in anchors and root in live:
+            seen[key] = [0, root]
+        else:
+            del seen[key]
+        state['dirty'] = True
+    for key in [k for k in gone if int(k) not in live]:
+        del gone[key]
+        state['dirty'] = True
+    for key, mark in listed.items():
+        if seen.get(key) != mark:
+            seen[key] = mark
+            state['dirty'] = True
     used = sum(b.get('tokens_used') or 0 for b in members.values())
-    used += sum(tokens for tokens, root in seen.values() if root in live)
+    used += sum(tokens for tokens, root in seen.values() if root in live) + sum(gone.values())
     budget = sum(b.get('budget_tokens') or 0 for b in members.values())
     return used, budget
 
@@ -229,8 +250,10 @@ class Folder:
             state = read_json(path)
             if state['offset'] > size:
                 raise ValueError
+            # What the cache says, so a fold that read past it is written back.
+            self.cached = state['offset']
         except (OSError, ValueError, KeyError, TypeError):
-            state = empty_state()
+            state, self.cached = empty_state(), None
         # Line by line, so a long board is never held whole.
         with open(os.path.join(self.dir, 'board.jsonl'), 'rb') as board:
             board.seek(state['offset'])
@@ -242,7 +265,6 @@ class Folder:
                     pass
             self.torn = self.torn_end(board, size)
         state['offset'] = size
-        self.cached = state['offset']
         return state
 
     @staticmethod
@@ -289,7 +311,7 @@ def write_json(path, value):
 
 def empty_state():
     return {'offset': 0, 'tasks': {}, 'result': None, 'roles': {}, 'streams': {},
-            'warned': {}, 'spent': 0, 'told': False, 'helpers': {}}
+            'warned': {}, 'spent': 0, 'told': False, 'helpers': {}, 'gone': {}}
 
 
 def apply(state, line):
@@ -346,7 +368,7 @@ class Act:
         # The members whose bots still exist, in the swarm's order: a deleted
         # one is out of it, though swarm.json still names it.
         self.live = [m for m in self.swarm['members'] if live is None or m in live]
-        self.me = short(author) if author else 'user'
+        self.me = short(author, self.swarm) if author else 'user'
         self.lines, self.sends, self.answer = [], [], {}
 
     def line(self, **fields):
@@ -362,7 +384,7 @@ class Act:
 
     def member(self, name):
         for m in self.live:
-            if name in (m, short(m)):
+            if name in (m, short(m, self.swarm)):
                 return m
         raise Refused('not_a_member', '%s is not in %s; status lists its members' % (name, self.swarm['name']))
 
@@ -386,10 +408,15 @@ def post(act, text, everyone):
         while end < len(word) and (word[end].isascii() and (word[end].isalnum() or word[end] in '-_.')):
             end += 1
         names.add(word[:end].rstrip('.'))
-    named = [m for m in act.live if m in names or short(m) in names]
+    names.discard('')
+    named = [m for m in act.live if m in names or short(m, act.swarm) in names]
+    unmatched = names - {n for m in named for n in (m, short(m, act.swarm))}
+    if unmatched:
+        act.answer['unmatched'] = sorted(unmatched)
     # A post is stored without interrupting anyone; @NAME wakes that member,
-    # and --all, or the person's post that names nobody, wakes everyone.
-    if everyone or (not act.author and not named):
+    # and --all, or the person's post with no @name at all, wakes everyone.
+    # One whose @names match nobody reaches nobody, and says which.
+    if everyone or (not act.author and not names):
         named = act.live
     act.tell(named, '[board] %s: %s' % (act.me, text))
 
@@ -415,17 +442,19 @@ def assign(act, task, owner, reviewer, brief):
     if not (0 < len(task) <= MAX_TASK and task[0].isascii() and task[0].isalnum()
             and all(c in 'abcdefghijklmnopqrstuvwxyz0123456789-' for c in task)):
         raise Refused('invalid_task', 'name a task like conn-pool: lowercase letters, digits and -, at most %d' % MAX_TASK)
-    reviewer = short(act.member(reviewer))
-    tasks, current = act.state['tasks'], {short(m) for m in act.live}
+    reviewer = short(act.member(reviewer), act.swarm)
+    tasks, current = act.state['tasks'], {short(m, act.swarm) for m in act.live}
     old = tasks.get(task)
     # A submitted result outlives its reviewer: one that left is replaced,
     # and the result keeps its author.
-    if old and old['status'] == 'reviewing' and old['owner'] == short(owner) and old['reviewer'] not in current:
+    if old and old['status'] == 'reviewing' and old['owner'] == short(owner, act.swarm) and old['reviewer'] not in current:
+        if reviewer == old['owner']:
+            raise Refused('independent_review_required', 'choose a reviewer other than the owner')
         act.line(kind='assign', stream=task, owner=old['owner'], reviewer=reviewer, brief=old['brief'],
                  reviewing=True, text='%s now reviews %s. %s' % (reviewer, task, brief))
         act.tell([act.member(reviewer)], '[board] %s submitted for your review: %s' % (task, old['result']))
         return
-    owner = short(act.member(owner))
+    owner = short(act.member(owner), act.swarm)
     if owner == reviewer:
         raise Refused('independent_review_required', 'choose a reviewer other than the owner')
     if old:
@@ -523,8 +552,8 @@ def budget(act, folder, members, helpers):
         passed = [p for p in SPENT if mine * 100 >= p * cap]
         if passed and passed[-1] > state['warned'].get(str(bot['id']), 0):
             text = '%s: %d of %d lifetime tokens used; %d remain. Cached input is counted on every call.' % (
-                short(name), mine, cap, cap - mine)
-            act.lines.append({'at': act.at, 'from': 'budget', 'member': short(name), 'id': bot['id'],
+                short(name, swarm), mine, cap, max(0, cap - mine))
+            act.lines.append({'at': act.at, 'from': 'budget', 'member': short(name, swarm), 'id': bot['id'],
                               'spent': passed[-1], 'text': text})
             act.tell([name], '[board] budget: ' + text, 'steer', False)
             act.answer['budget'] = text
@@ -556,9 +585,9 @@ def quote(text):
 def status(folder, members, helpers):
     swarm, state = folder.swarm, folder.state
     used, total = usage(state, members, helpers)
-    current = {short(m) for m in members}
+    current = {short(m, swarm) for m in members}
     missing_members = [m for m in swarm['members'] if m not in members]
-    spent = [short(m) for m, b in members.items() if b.get('budget_tokens') and (b.get('tokens_used') or 0) >= b['budget_tokens']]
+    spent = [short(m, swarm) for m, b in members.items() if b.get('budget_tokens') and (b.get('tokens_used') or 0) >= b['budget_tokens']]
     needs = {'reviewed': (), 'reviewing': ('reviewer',)}
     blocked = any(t[k] not in current for t in state['tasks'].values() for k in needs.get(t['status'], ('owner', 'reviewer')))
     running = any(b.get('running_turn') for b in list(members.values()) + helpers)
@@ -609,11 +638,11 @@ def deliver(daemon, act, folder, members):
         if 'error' in answer:
             # A turn that ended between the list and the steer reads the board when next woken.
             if answer['error'] != 'stale_turn':
-                missed.append({'agent': short(member), 'error': '%s: %s' % (answer['error'], answer.get('detail') or '')})
+                missed.append({'agent': short(member, swarm), 'error': '%s: %s' % (answer['error'], answer.get('detail') or '')})
         elif how == 'steer' or (members.get(member) or {}).get('running_turn'):
-            steered.add(short(member))
+            steered.add(short(member, swarm))
         else:
-            woke.add(short(member))
+            woke.add(short(member, swarm))
     act.answer.update(posted=True, steered=sorted(steered), woke=sorted(woke), missed=missed)
 
 
@@ -781,7 +810,7 @@ def profile_tools(folder, identity):
     else:
         return ('shell',)
     # Comments go first, as YAML drops them; a quoted '#' is not one a tool name has.
-    lines = [line.split(' #', 1)[0].rstrip() if not line.lstrip().startswith('#') else '' for line in text.splitlines()]
+    lines = [re.split(r'\s#', line, maxsplit=1)[0].rstrip() if not line.lstrip().startswith('#') else '' for line in text.splitlines()]
     if not lines or lines[0].strip() != '---':
         return ('shell',)
     tools = None
@@ -921,12 +950,12 @@ def brief(swarm, folder, member, each, late=False, roster=None):
         rules = f.read().strip()
     def known(m):
         row = swarm['mix'][swarm['rows'][m]] if m in swarm['rows'] else {}
-        return '%s (%s)' % (short(m), row['identity']) if row.get('identity') else short(m)
+        return '%s (%s)' % (short(m, swarm), row['identity']) if row.get('identity') else short(m, swarm)
     roster = roster or swarm['members']
     others = [known(m) for m in roster if m != member]
     lines = [rules, '',
              'You are %s, one of %d agents in the swarm %s, all working in this folder.'
-             % (short(member), len(roster), short(swarm['name'])),
+             % (short(member, swarm), len(roster), short(swarm['name'], swarm)),
              'Goal: ' + swarm['goal'],
              'Script: %s COMMAND ARGS, with these commands: post [--all] TEXT, role ROLE, '
              'assign TASK OWNER REVIEWER BRIEF, claim TASK, submit TASK RESULT, '
@@ -934,7 +963,7 @@ def brief(swarm, folder, member, each, late=False, roster=None):
              'leave, status' % quote(SCRIPT),
              'Board: ' + quote(os.path.join(folder, 'board.jsonl')),
              'The others: ' + (', '.join(others) or 'none yet'),
-             'First member: %s; if it is deleted, the lowest-numbered member status lists takes its place' % short(roster[0]),
+             'First member: %s; if it is deleted, the lowest-numbered member status lists takes its place' % short(roster[0], swarm),
              'Your lifetime allowance: %d tokens, including cached input on every call.' % each]
     if late:
         lines.append('You joined after the others started, so read the board first.')
@@ -968,7 +997,7 @@ def make(swarm, folder, names, rows, each, late=False, roster=None):
                 why = '%s: %s' % (why.get('error'), why.get('detail') or '')
             except ValueError:
                 why = err.strip() or out.strip() or 'agent exited %d' % child.returncode
-            failed.append({'agent': short(name), 'error': why})
+            failed.append({'agent': short(name, swarm), 'error': why})
     return made, failed
 
 
@@ -1035,6 +1064,9 @@ def start(daemon, args):
             if asked['shared']:
                 unplace(name, asked['folder'])
             raise Refused('start_failed', failed[0]['error'] if failed else 'no agent could be made')
+        if failed:
+            # The budget is what the agents made were given.
+            swarm['budget_tokens'] = asked['budget'] // n * len(made)
         pin(swarm, made, folder)
     if failed:
         tell_missing(daemon, swarm, made, failed, names[0])
@@ -1058,9 +1090,9 @@ def tell_missing(daemon, swarm, made, failed, first):
     made, and which is the first member when the one their brief named is
     among them."""
     names = ', '.join(f['agent'] for f in failed)
-    prompt = '[board] %s could not be made; the agents are %s' % (names, ', '.join(short(m) for m in swarm['members']))
-    if short(first) in [f['agent'] for f in failed]:
-        prompt += '. The first member is now %s' % short(swarm['members'][0])
+    prompt = '[board] %s could not be made; the agents are %s' % (names, ', '.join(short(m, swarm) for m in swarm['members']))
+    if short(first, swarm) in [f['agent'] for f in failed]:
+        prompt += '. The first member is now %s' % short(swarm['members'][0], swarm)
     for name, _, bot_id in made:
         try:
             daemon.call('submit', bot=name, bot_id=bot_id, request_id='swarm-missing-' + name, prompt=prompt, delivery='steer')
@@ -1073,6 +1105,8 @@ def add(daemon, folder, args):
     share, under a number no agent of the swarm ever had. It brings its own
     share of the budget."""
     swarm = folder.swarm
+    if args and (len(args) != 2 or args[0] != '--row'):
+        raise Refused('usage', 'usage: add [--swarm NAME] [--row N]', True)
     if swarm['stopped']:
         raise Refused('swarm_stopped', 'post to the board to resume the swarm, then add an agent')
     members, _ = scan(daemon, folder)
@@ -1082,7 +1116,7 @@ def add(daemon, folder, args):
     counts = [0] * len(swarm['mix'])
     for m in members:
         counts[swarm['rows'].get(m, 0)] += 1
-    row = number(args[1], 'invalid_row', '--row is a row number') if args[:1] == ['--row'] and len(args) > 1 else deal(swarm['mix'], 1, counts)[0]
+    row = number(args[1], 'invalid_row', '--row is a row number') if args else deal(swarm['mix'], 1, counts)[0]
     if row >= len(swarm['mix']):
         raise Refused('invalid_row', 'the mix has no row %d' % row)
     each = sum(b.get('budget_tokens') or 0 for b in members.values()) // len(members)
@@ -1121,11 +1155,11 @@ def stop(daemon, folder):
             try:
                 end_turns(daemon, bot)
             except Refused as e:
-                failed.append({'agent': short(bot['name']), 'error': '%s: %s' % (e.code, e.detail)})
+                failed.append({'agent': short(bot['name'], swarm), 'error': '%s: %s' % (e.code, e.detail)})
     else:
         # Still making helpers or turns after every round: say which, not that all stopped.
         members, helpers = scan(daemon, folder)
-        failed += [{'agent': short(b['name']), 'error': 'still_running: turn %d' % b['running_turn']}
+        failed += [{'agent': short(b['name'], swarm), 'error': 'still_running: turn %d' % b['running_turn']}
                    for b in list(members.values()) + helpers if b.get('running_turn')]
     return {'swarm': record(swarm, folder.dir), 'failed': failed}
 
@@ -1169,18 +1203,31 @@ START_USAGE = ('start [--agents N] [--budget MILLIONS] [--in-project] '
 ACTS = ('post', 'role', 'assign', 'claim', 'submit', 'review', 'finish', 'leave')
 
 
-def which(args):
+def which(args, root):
     """The swarm a command names with --swarm, else the one this shell's
-    agent is a member of, or helps: SWARM-N, or SWARM-N.WHAT."""
+    agent is a member of, or helps: SWARM-N, or SWARM-N.WHAT. A project's
+    name may hold dots too, so each place that could end a member's number
+    is tried, shortest first: the swarm that names SWARM-N as a member, else
+    the first that is there, since one being started or added to names its
+    new member only once made, and the board's lock waits for that."""
     if args[:1] == ['--swarm'] and len(args) > 1:
         return args[1], args[2:]
-    # SWARM-N then .WHAT or nothing, where a project's name may hold dots too:
-    # each place that could end the member's number, shortest swarm name first.
     bot = os.environ.get('AGENT_BOT') or ''
-    names = [bot[:m.start()] for m in re.finditer(r'-\d+(?=\.|$)', bot) if '.' in bot[:m.start()]]
-    if not names:
+    there = []
+    for m in re.finditer(r'-\d+(?=\.|$)', bot):
+        name, member = bot[:m.start()], bot[:m.end()]
+        if '.' not in name:
+            continue
+        try:
+            if member in read_json(os.path.join(root, name, 'swarm.json'))['members']:
+                return name, args
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        if os.path.isdir(os.path.join(root, name)):
+            there.append(name)
+    if not there:
         raise Refused('usage', 'name the swarm with --swarm NAME; list shows them', True)
-    return names, args
+    return there[0], args
 
 
 def main(argv):
@@ -1199,11 +1246,9 @@ def main(argv):
     elif verb == 'list':
         out = listing(daemon)
     elif verb in ACTS + ('add', 'stop', 'status', 'check'):
-        names, args = which(args)
-        author = os.environ.get('AGENT_BOT') or None
         root = daemon.root()
-        name = names if isinstance(names, str) else next(
-            (n for n in names if os.path.isdir(os.path.join(root, n))), names[0])
+        name, args = which(args, root)
+        author = os.environ.get('AGENT_BOT') or None
         folder = Folder(root, name)
         if verb in ACTS:
             if author and author not in folder.swarm['ids']:
@@ -1223,7 +1268,8 @@ def main(argv):
             folder.append(act.lines)
             deliver(daemon, act, folder, members)
             out = act.answer
-        elif author and author != (folder.swarm.get('coordinator') or {}).get('bot'):
+        elif author and (author, int(os.environ.get('AGENT_BOT_ID') or -1)) != tuple(
+                (folder.swarm.get('coordinator') or {}).get(k) for k in ('bot', 'id')):
             raise Refused('coordinator_only', 'the person or the coordinator that started it does this')
         elif verb == 'add':
             out = add(daemon, folder, args)
