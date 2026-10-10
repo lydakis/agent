@@ -1201,7 +1201,9 @@ anything else a failure can leave is listed and removable:
   set aside keeps its job loaded, and an unload launchd refuses renames
   them back, so either stays listed with what its fire did. A fire whose
   unload ends it before it deletes them leaves them aside; the app's next
-  start, or the next `add` or `rm` of that name, finishes that end. A job
+  start, or the next `add` or `rm` of that name, finishes that end. The
+  app's start also removes the temporary of a write that died before its
+  rename: every write takes the lock, so none is under way. A job
   left loaded after its plist went (an end cut short) is unloaded by its
   next fire.
 - **Removing** unloads the job by its label whether or not its plist is
