@@ -6509,8 +6509,10 @@ impl Database {
             }
         }
         snapshot.commit()?;
-        Ok(json!({"nodes":nodes,"next_from":next.filter(|id| *id >= floor),
-            "next_newer":next_newer,"workspaces":workspaces}))
+        Ok(
+            json!({"nodes":nodes,"next_from":next.filter(|id| *id >= floor),
+            "next_newer":next_newer,"workspaces":workspaces}),
+        )
     }
     /// Fetch a byte-bounded batch after one ancestry walk for all requested IDs.
     pub fn history_items(&self, name: &str, wanted: &[i64]) -> Result<Value> {
