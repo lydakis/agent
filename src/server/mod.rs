@@ -922,20 +922,29 @@ pub async fn run(config: Configuration) -> Result<()> {
             }
             (key, None)
         };
-        let mut provider = Provider::new(transport.clone(), spec.family, &spec.url, key)?;
+        // Which provider's URL it is: the URL itself may carry a secret.
+        let named = |error: Error| match (error.code.as_str(), &error.detail) {
+            ("invalid_provider_url", Some(why)) => {
+                Error::with("invalid_provider_url", format!("{}: {why}", spec.name))
+            }
+            _ => error,
+        };
+        let mut provider =
+            Provider::new(transport.clone(), spec.family, &spec.url, key).map_err(named)?;
         if let Some(login) = login {
             provider = provider.with_login(login)?;
         }
         let mut auth = None;
         if spec.sigv4 {
-            let url =
-                reqwest::Url::parse(&spec.url).map_err(|_| Error::new("invalid_provider_url"))?;
+            let url = reqwest::Url::parse(&spec.url)
+                .map_err(|_| Error::with("invalid_provider_url", "the base URL does not parse"))?;
             let (aws, unresolved) = agent_runtime::provider::aws::Aws::open(
                 &url,
                 Some(credentials.clone()),
                 &aws_start,
             )
-            .await?;
+            .await
+            .map_err(named)?;
             let mut signed = json!({"auth":"sigv4","region":aws.region(),
                 "credentials":aws.source()});
             // Keys the CLI cannot resolve yet leave this binding waiting on a
