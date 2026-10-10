@@ -1,7 +1,9 @@
 //! A project is a folder, its coordinator bot `NAME.lead`, and
 //! `.agents/project.toml` in that folder. The file holds mechanics only (the
-//! name and the coordinator's model and effort level); how the coordinator behaves stays in
-//! AGENTS.md. The project list itself comes from the coordinator bots in the
+//! name, the coordinator's model and effort level, and its threads': their
+//! model and effort, when the coordinator is not to pick, and whether they
+//! work in their own worktrees or the project folder); how the coordinator
+//! behaves stays in AGENTS.md and its profile, which tells it to read them. The project list itself comes from the coordinator bots in the
 //! store, so this file is read when a project is opened and written once
 //! when the app creates one. The daemon knows nothing of projects.
 use serde_json::{Value, json};
@@ -11,7 +13,26 @@ use std::path::Path;
 pub const FILE: &str = ".agents/project.toml";
 const LIMIT: u64 = 64 * 1024;
 /// Every key the file may hold; anything else is a mistake, not ignored.
-const KEYS: [&str; 4] = ["name", "coordinator", "model", "reasoning"];
+const KEYS: [&str; 7] = [
+    "name",
+    "coordinator",
+    "model",
+    "reasoning",
+    "threads_model",
+    "threads_reasoning",
+    "threads_in",
+];
+/// Where a project's threads work: each in its own worktree, or all in
+/// the project folder.
+const THREADS_IN: [&str; 2] = ["worktree", "project"];
+
+/// What a new project's threads run on and where they work.
+#[derive(Debug, Default)]
+pub struct Threads<'a> {
+    pub model: Option<&'a str>,
+    pub reasoning: Option<&'a str>,
+    pub in_project: bool,
+}
 
 /// A name that is also a bot-name prefix: the daemon's name characters,
 /// short enough that `NAME.lead` and its task names fit.
@@ -76,7 +97,8 @@ pub fn read(dir: &Path) -> Result<Value, String> {
         let name = default_name(dir);
         return Ok(json!({
             "dir": dir, "name": name, "coordinator": format!("{name}.lead"),
-            "model": null, "reasoning": null, "file": false,
+            "model": null, "reasoning": null, "threads_model": null,
+            "threads_reasoning": null, "threads_in": "worktree", "file": false,
         }));
     };
     let table: toml::Table = text
@@ -102,20 +124,42 @@ pub fn read(dir: &Path) -> Result<Value, String> {
     if model.as_deref() == Some("") {
         return Err(invalid("model must not be empty"));
     }
-    // The daemon judges the level when the coordinator is made.
-    let reasoning = field("reasoning")?;
-    if reasoning.as_deref() == Some("") {
-        return Err(invalid("reasoning must not be empty"));
+    // The daemon judges models and levels when the agents are made.
+    let said = |key: &str| {
+        let value = field(key)?;
+        if value.as_deref() == Some("") {
+            return Err(invalid(&format!("{key} must not be empty")));
+        }
+        Ok(value)
+    };
+    let (reasoning, threads_model, threads_reasoning) = (
+        said("reasoning")?,
+        said("threads_model")?,
+        said("threads_reasoning")?,
+    );
+    if threads_reasoning.is_some() && threads_model.is_none() {
+        return Err(invalid("threads_reasoning goes with threads_model"));
+    }
+    let threads_in = field("threads_in")?.unwrap_or_else(|| "worktree".into());
+    if !THREADS_IN.contains(&threads_in.as_str()) {
+        return Err(invalid("threads_in must be \"worktree\" or \"project\""));
     }
     Ok(json!({
         "dir": dir, "name": name, "coordinator": coordinator, "model": model,
-        "reasoning": reasoning, "file": true,
+        "reasoning": reasoning, "threads_model": threads_model,
+        "threads_reasoning": threads_reasoning, "threads_in": threads_in, "file": true,
     }))
 }
 
 /// Write a new project's file. An existing file is the user's and is kept:
 /// one that appeared since the folder was read is refused, to be read again.
-pub fn write(dir: &Path, name: &str, model: &str, reasoning: Option<&str>) -> Result<(), String> {
+pub fn write(
+    dir: &Path,
+    name: &str,
+    model: &str,
+    reasoning: Option<&str>,
+    threads: &Threads,
+) -> Result<(), String> {
     if !valid_name(name) {
         return Err("project_invalid: name must be 1-64 of A-Z a-z 0-9 - _ .".into());
     }
@@ -127,9 +171,22 @@ pub fn write(dir: &Path, name: &str, model: &str, reasoning: Option<&str>) -> Re
         quote(&format!("{name}.lead")),
         quote(model)
     );
-    if let Some(level) = reasoning.filter(|level| !level.is_empty()) {
+    fn some(value: Option<&str>) -> Option<&str> {
+        value.filter(|v| !v.is_empty())
+    }
+    if let Some(level) = some(reasoning) {
         text.push_str(&format!("reasoning = {}\n", quote(level)));
     }
+    if let Some(model) = some(threads.model) {
+        text.push_str(&format!("threads_model = {}\n", quote(model)));
+        if let Some(level) = some(threads.reasoning) {
+            text.push_str(&format!("threads_reasoning = {}\n", quote(level)));
+        }
+    }
+    text.push_str(&format!(
+        "threads_in = {}\n",
+        quote(THREADS_IN[usize::from(threads.in_project)])
+    ));
     let failed = |e: std::io::Error| match e.kind() {
         std::io::ErrorKind::AlreadyExists => {
             format!(
@@ -207,17 +264,30 @@ mod tests {
     #[test]
     fn a_written_file_reads_back_and_is_never_overwritten() {
         let dir = root("write");
-        write(&dir, "demo", "alpha/one", Some("high")).unwrap();
+        let threads = Threads {
+            model: Some("beta/two"),
+            reasoning: Some("low"),
+            in_project: true,
+        };
+        write(&dir, "demo", "alpha/one", Some("high"), &threads).unwrap();
         // One that appeared since the folder was read is kept and reported.
-        let refused = write(&dir, "other", "beta/two", None).unwrap_err();
+        let refused = write(&dir, "other", "beta/two", None, &Threads::default()).unwrap_err();
         assert!(refused.starts_with("project_changed: "), "{refused}");
         let project = read(&dir).unwrap();
         assert_eq!(project["name"], "demo");
         assert_eq!(project["coordinator"], "demo.lead");
         assert_eq!(project["model"], "alpha/one");
         assert_eq!(project["reasoning"], "high");
+        assert_eq!(
+            (
+                &project["threads_model"],
+                &project["threads_reasoning"],
+                &project["threads_in"]
+            ),
+            (&json!("beta/two"), &json!("low"), &json!("project"))
+        );
         assert_eq!(project["file"], true);
-        assert!(write(&dir, "bad name", "alpha/one", None).is_err());
+        assert!(write(&dir, "bad name", "alpha/one", None, &Threads::default()).is_err());
         std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 
@@ -233,11 +303,28 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.to_string(), "synthetic disk full");
         assert!(!path.exists(), "no partial project file");
-        write(&dir, "demo", "alpha/one", None).unwrap();
+        // No threads' model: the coordinator picks, and they get worktrees.
+        let alone = Threads {
+            reasoning: Some("high"),
+            ..Threads::default()
+        };
+        write(&dir, "demo", "alpha/one", None, &alone).unwrap();
         let project = read(&dir).unwrap();
         assert_eq!(
-            (&project["name"], &project["reasoning"]),
-            (&json!("demo"), &Value::Null)
+            (
+                &project["name"],
+                &project["reasoning"],
+                &project["threads_model"],
+                &project["threads_reasoning"],
+                &project["threads_in"]
+            ),
+            (
+                &json!("demo"),
+                &Value::Null,
+                &Value::Null,
+                &Value::Null,
+                &json!("worktree")
+            )
         );
         let left: Vec<_> = std::fs::read_dir(dir.join(".agents"))
             .unwrap()
@@ -256,6 +343,9 @@ mod tests {
             "model = \"alpha/one\"",
             "name = 7",
             "name = \"demo\"\ncoordinator = \"other.lead\"",
+            "name = \"demo\"\nthreads_in = \"elsewhere\"",
+            "name = \"demo\"\nthreads_reasoning = \"low\"",
+            "name = \"demo\"\nthreads_model = \"\"",
         ] {
             std::fs::write(dir.join(FILE), text).unwrap();
             let error = read(&dir).unwrap_err();

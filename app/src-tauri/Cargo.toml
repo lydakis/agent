@@ -16,6 +16,9 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 agent-client = { path = "../../client" }
 libc = "0.2"
+# The system folder picker (NSOpenPanel on macOS); GTK elsewhere, which the
+# webview already links.
+rfd = { version = "0.17", default-features = false, features = ["gtk3"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
 tokio = { version = "1", features = ["rt", "sync", "macros", "process", "time"] }
