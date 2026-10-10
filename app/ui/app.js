@@ -2093,7 +2093,8 @@ async function listTriggers() {
   catch (e) { Object.assign(t, { list: null, next: null, error: String(e?.message ?? e) }); }
   t.gen += 1;
   if (S.attached) renderTriggers();
-  if (sheetKind === 'trigger' && !trigSheet.busy) { const x = t.list?.find((r) => r.name === sheetFor); if (x) { trigSheet.row = x; renderTriggerSheet(); } }
+  // The open trigger's row; one not on this page, or gone since, is read by name.
+  if (sheetKind === 'trigger' && !trigSheet.busy) { const x = t.list?.find((r) => r.name === sheetFor); if (x) { trigSheet.row = x; renderTriggerSheet(); } else if (t.list) readTrigger(sheetFor); }
 }
 function soonTriggers(ms) { if (trigSoon || S.config?.host) return; trigSoon = setTimeout(() => { trigSoon = null; readTriggers(); }, ms); }
 // What it watches, short for its row and whole for its sheet.

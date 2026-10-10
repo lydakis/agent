@@ -3429,6 +3429,17 @@ test('a trigger that starts its agent, one gone, and one past the first page eac
   assert.match(p.elements.get('sheet').innerHTML, /No trigger by this name now/);
 });
 
+test('an open trigger that a refresh no longer lists is read by name, and shows it is gone', async () => {
+  let there = true;
+  const row = { name: 'once', bot: 'x', bot_id: 1, when: 'in 2h', message: 'm', last: null };
+  const p = page({ trigger: async () => (there ? row : null), triggers: async () => ({ triggers: there ? [row] : [] }) });
+  await p.openTriggerSheet('once');
+  assert.match(p.elements.get('sheet').innerHTML, /Run now/);
+  there = false;
+  await p.readTriggers(); await settle();
+  assert.match(p.elements.get('sheet').innerHTML, /No trigger by this name now/);
+});
+
 test('trigger pages replace the previous rows, and a window on a host reads none', async () => {
   const calls = [];
   const p = page({ triggers: async (after) => {
