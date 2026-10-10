@@ -403,8 +403,8 @@ and `bedrock-openai` binds OpenAI and other models on Bedrock Mantle, as
 Claude Code and Codex do by default. Both take the region in Claude Code's
 order: `AWS_REGION`, `AWS_DEFAULT_REGION`, the `region` of the active profile
 (`AWS_PROFILE`, else `default`) in the AWS shared credentials file and then
-the config file, else us-east-1; a value not shaped like a region is passed
-over. Both use a Bedrock API key when `AWS_BEARER_TOKEN_BEDROCK` is set, and
+the config file, else us-east-1; the first value set must be shaped like a region,
+or the spec is refused naming where it came from. Both use a Bedrock API key when `AWS_BEARER_TOKEN_BEDROCK` is set, and
 SigV4 otherwise. `provider_models` lists runtime's models as the active
 system-defined inference profiles the Bedrock control plane in its region
 names (`ListInferenceProfiles`), and Mantle's as its host's `/v1/models`.

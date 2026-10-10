@@ -63,26 +63,14 @@ const DEFAULT_REGION: &str = "us-east-1";
 /// The region Bedrock calls are made in, in Claude Code's order:
 /// `AWS_REGION`, `AWS_DEFAULT_REGION`, the active profile's `region`
 /// (`AWS_PROFILE`, else `default`) in the shared credentials file and then
-/// the config file, else us-east-1. A value not shaped like a region is
-/// passed over. `read` reads a file; tests give it their own.
+/// the config file, else us-east-1. An empty value is unset; the first one
+/// set must be shaped like a region, or the reason names where it came
+/// from, so a typo never sends signed calls to another region. `read`
+/// reads a file; tests give it their own.
 pub fn region(
     env: &dyn Fn(&str) -> Option<String>,
     read: &dyn Fn(&str) -> Option<String>,
-) -> String {
-    let shaped = |region: &str| {
-        !region.is_empty()
-            && region
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-    };
-    let named = ["AWS_REGION", "AWS_DEFAULT_REGION"]
-        .into_iter()
-        .filter_map(env)
-        .map(|value| value.trim().to_owned())
-        .find(|value| shaped(value));
-    if let Some(region) = named {
-        return region;
-    }
+) -> std::result::Result<String, String> {
     let profile = env("AWS_PROFILE")
         .map(|profile| profile.trim().to_owned())
         .filter(|profile| !profile.is_empty())
@@ -99,17 +87,36 @@ pub fn region(
         "default" => "default".to_owned(),
         name => format!("profile {name}"),
     };
-    [
+    let files = [
         (
             path("AWS_SHARED_CREDENTIALS_FILE", "credentials"),
             profile.clone(),
         ),
         (path("AWS_CONFIG_FILE", "config"), config_section),
-    ]
-    .into_iter()
-    .filter_map(|(path, section)| ini_value(&read(&path?)?, &section, "region"))
-    .find(|region| shaped(region))
-    .unwrap_or_else(|| DEFAULT_REGION.to_owned())
+    ];
+    let named = ["AWS_REGION", "AWS_DEFAULT_REGION"]
+        .into_iter()
+        .map(|name| (name.to_owned(), env(name)));
+    let profiles = files.into_iter().map(|(path, section)| {
+        let value = path
+            .as_ref()
+            .and_then(|path| ini_value(&read(path)?, &section, "region"));
+        (format!("the region of [{section}] in the AWS files"), value)
+    });
+    let Some((source, region)) = named
+        .chain(profiles)
+        .filter_map(|(source, value)| Some((source, value?.trim().to_owned())))
+        .find(|(_, value)| !value.is_empty())
+    else {
+        return Ok(DEFAULT_REGION.to_owned());
+    };
+    match region
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        true => Ok(region),
+        false => Err(format!("{source} is {region:?}, which is not a region")),
+    }
 }
 
 /// `key` in `[section]` of an AWS shared config or credentials file.
@@ -793,6 +800,7 @@ mod tests {
             "/h/.aws/config" => Some(config.to_owned()),
             "/h/.aws/credentials" => Some(credentials.to_owned()),
             "/elsewhere" => Some("[profile work]\nregion = sa-east-1\n".to_owned()),
+            "/bad" => Some("[profile work]\nregion = us east\n".to_owned()),
             _ => None,
         };
         let env = |pairs: &'static [(&'static str, &'static str)]| {
@@ -803,7 +811,7 @@ mod tests {
                     .map(|(_, value)| (*value).to_owned())
             }
         };
-        let resolve = |pairs| region(&env(pairs), &read);
+        let resolve = |pairs| region(&env(pairs), &read).unwrap();
         assert_eq!(
             resolve(&[("AWS_REGION", "us-east-2"), ("HOME", "/h")]),
             "us-east-2"
@@ -812,13 +820,23 @@ mod tests {
             resolve(&[("AWS_DEFAULT_REGION", "eu-north-1")]),
             "eu-north-1"
         );
-        // A value not shaped like a region is passed over.
+        // An empty value is unset; one not shaped like a region is refused,
+        // naming where it came from, rather than sending calls elsewhere.
         assert_eq!(
-            resolve(&[
-                ("AWS_REGION", "us east"),
+            resolve(&[("AWS_REGION", " "), ("AWS_DEFAULT_REGION", "eu-north-1")]),
+            "eu-north-1"
+        );
+        let refused = |pairs| region(&env(pairs), &read).unwrap_err();
+        assert_eq!(
+            refused(&[
+                ("AWS_REGION", "US-EAST-1"),
                 ("AWS_DEFAULT_REGION", "eu-north-1")
             ]),
-            "eu-north-1"
+            "AWS_REGION is \"US-EAST-1\", which is not a region"
+        );
+        assert_eq!(
+            refused(&[("AWS_PROFILE", "work"), ("AWS_CONFIG_FILE", "/bad")]),
+            "the region of [profile work] in the AWS files is \"us east\", which is not a region"
         );
         assert_eq!(resolve(&[("HOME", "/h")]), "eu-west-1");
         // The credentials file is read before the config file.

@@ -459,7 +459,10 @@ impl ProviderSpec {
         let default_key = default_key
             .filter(|&key| key != BEDROCK_KEY || env(key).is_some_and(|v| !v.is_empty()));
         let default_url = if default_url.contains("{region}") && url.is_none() {
-            default_url.replace("{region}", &agent_runtime::provider::aws::region(env, read))
+            let region = agent_runtime::provider::aws::region(env, read).map_err(|reason| {
+                Error::with("invalid_provider_spec", format!("{spec}: {reason}"))
+            })?;
+            default_url.replace("{region}", &region)
         } else {
             default_url.to_owned()
         };
@@ -2986,6 +2989,13 @@ mod tests {
             assert_eq!(keyed.key_env.as_deref(), Some("AWS_BEARER_TOKEN_BEDROCK"));
             assert!(!keyed.sigv4 && keyed.url.contains(".us-west-2."));
         }
+        // A region set but malformed refuses the spec rather than calling elsewhere.
+        let typo = |name: &str| (name == "AWS_REGION").then(|| "US-EAST-1".to_owned());
+        let error = ProviderSpec::parse_with("bedrock", &typo, &none)
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "invalid_provider_spec");
+        assert!(error.detail.unwrap().starts_with("bedrock: AWS_REGION is"));
         let empty = |name: &str| (name == "AWS_BEARER_TOKEN_BEDROCK").then(String::new);
         assert!(
             ProviderSpec::parse_with("bedrock", &empty, &none)
