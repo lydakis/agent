@@ -1564,31 +1564,54 @@ fn tomb(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{file}.retiring"))
 }
 
-/// Finish the retires a fire's own unload cut short, at the app's start.
-/// A name whose plist is back is a trigger added since, and keeps what it
+/// At the app's start, under the lock, finish what was cut short: a retire
+/// a fire's own unload ended before it deleted what it set aside, and a
+/// write that died before its rename, whose temporary nothing else would
+/// remove. Every write here is under the lock, so no other is under way. A
+/// name whose plist is back is a trigger added since, and keeps what it
 /// has.
 pub fn finish(places: &Places, launchd: Loader) {
-    let names = |dir: &Path, prefix: &str, suffix: &str| {
+    let Ok(_lock) = Lock::take(places) else {
+        return;
+    };
+    let log = |error: String| eprintln!("{}", error_json(&error));
+    let dots = |dir: &Path| {
         std::fs::read_dir(dir)
             .into_iter()
             .flatten()
             .flatten()
             .filter_map(|e| e.file_name().into_string().ok())
-            .filter_map(|f| Some(f.strip_prefix(prefix)?.strip_suffix(suffix)?.to_owned()))
+            .filter_map(|f| f.strip_prefix('.').map(str::to_owned))
             .collect::<Vec<_>>()
     };
-    let mut cut = names(&places.agents, &format!(".{LABEL}"), ".plist.retiring");
-    for suffix in [".json.retiring", ".asks.retiring", ".taking.retiring"] {
-        cut.extend(names(&places.state, ".", suffix));
+    let mut cut = Vec::new();
+    let ours = dots(&places.agents)
+        .into_iter()
+        .filter(|f| f.starts_with(LABEL))
+        .map(|f| (places.agents.join(format!(".{f}")), f));
+    let state = dots(&places.state)
+        .into_iter()
+        .filter(|f| f != "lock")
+        .map(|f| (places.state.join(format!(".{f}")), f));
+    for (path, file) in ours.chain(state) {
+        // `.NAME.EXT.retiring`, or `.LABELNAME.plist.retiring`.
+        match file
+            .strip_suffix(".retiring")
+            .and_then(|f| f.rsplit_once('.'))
+        {
+            Some((name, _)) => cut.push(name.strip_prefix(LABEL).unwrap_or(name).to_owned()),
+            None => {
+                if let Err(error) = forget(&path) {
+                    log(error);
+                }
+            }
+        }
     }
     cut.sort();
     cut.dedup();
     for name in cut.iter().filter(|name| valid_name(name).is_ok()) {
-        let Ok(_lock) = Lock::take(places) else {
-            return;
-        };
         if let Err(error) = unfinished(places, name, launchd) {
-            eprintln!("{}", error_json(&error));
+            log(error);
         }
     }
 }
@@ -3771,10 +3794,22 @@ mod tests {
         w.install(&s).unwrap();
         assert_eq!(w.state(&s.name), (true, true, false));
         assert!(!left(&w.places.agents) && !left(&w.places.state));
-        // The app's start leaves a trigger added since alone.
+        // The app's start leaves a trigger added since alone, and removes
+        // what writes that died before their rename left.
         std::fs::write(tomb(&w.places.last(&s.name)), "{}").unwrap();
+        let temporaries = [
+            w.places.state.join(format!(".{}.json.4242", s.name)),
+            w.places
+                .agents
+                .join(format!(".{LABEL}{}.plist.4242", s.name)),
+        ];
+        for path in &temporaries {
+            std::fs::write(path, "half").unwrap();
+        }
         finish(&w.places, &|x| w.fake.call(x));
         assert_eq!(w.state(&s.name), (true, true, false));
+        assert!(temporaries.iter().all(|path| !path.exists()));
+        assert!(w.places.state.join(".lock").exists());
     }
 
     #[test]
