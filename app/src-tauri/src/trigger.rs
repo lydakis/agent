@@ -884,15 +884,29 @@ pub fn plist(
             string(&path.to_string_lossy())
         );
     }
-    if !environment.is_empty() {
-        out += "  <key>EnvironmentVariables</key>\n  <dict>\n";
-        for (key, value) in environment {
-            out += &format!("    <key>{key}</key>{}\n", string(value));
-        }
-        out += "  </dict>\n";
-    }
+    out += &environment_section(environment);
     out += "  <key>ProcessType</key>\n  <string>Background</string>\n</dict>\n</plist>\n";
     queued(&out, asks)
+}
+
+/// Whether a plist runs its fires with this environment and no other.
+fn runs_with(text: &str, environment: &[(&str, String)]) -> bool {
+    match environment {
+        [] => !text.contains("<key>EnvironmentVariables</key>"),
+        _ => text.contains(&environment_section(environment)),
+    }
+}
+
+/// The environment a fire runs with, as its plist says it.
+fn environment_section(environment: &[(&str, String)]) -> String {
+    if environment.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("  <key>EnvironmentVariables</key>\n  <dict>\n");
+    for (key, value) in environment {
+        out += &format!("    <key>{key}</key><string>{}</string>\n", escape(value));
+    }
+    out + "  </dict>\n"
 }
 
 /// A plist with `asks` as its queue: launchd runs the job while a file is
@@ -1155,8 +1169,9 @@ pub fn install(
                 None => {
                     // The same definition can watch another path: a
                     // repository made again at its path has another git
-                    // folder. launchd is made to watch the one it is now.
-                    if watched(&text) != when.watch {
+                    // folder. launchd is made to watch the one it is now,
+                    // and to run it with the environment it is added with now.
+                    if watched(&text) != when.watch || !runs_with(&text, environment) {
                         let asks = places.asks(&there.name);
                         let want = plist(&there_app, &there, when, &asks, environment);
                         swap(&path, &there.name, Some(&text), &want, launchd)?;
@@ -2706,6 +2721,30 @@ mod tests {
         };
         assert_eq!(w.install(&again).unwrap(), Some(s.clone()));
         assert_eq!(w.fake.unloads.get(), unloads);
+        assert_eq!(w.rows()[0]["last"]["outcome"], "skipped");
+        // Added again with another environment, its fires run with that one.
+        let when = every("1d", clock(2026, 9, 28, 9, 7)).unwrap();
+        let path = [("PATH", "/opt/new/bin".to_owned())];
+        let add = |environment: &[(&str, String)]| {
+            install(
+                &w.places,
+                Path::new("/A/agent-app"),
+                &again,
+                &when,
+                environment,
+                &|c| w.fake.call(c),
+            )
+        };
+        assert_eq!(add(&path).unwrap(), Some(s.clone()));
+        assert!(
+            w.plist(&s.name)
+                .contains("<key>PATH</key><string>/opt/new/bin</string>")
+        );
+        assert_eq!(w.fake.unloads.get(), unloads + 1);
+        assert_eq!(add(&path).unwrap(), Some(s.clone()));
+        assert_eq!(w.fake.unloads.get(), unloads + 1);
+        assert_eq!(add(&[]).unwrap(), Some(s.clone()));
+        assert!(!w.plist(&s.name).contains("EnvironmentVariables"));
         assert_eq!(w.rows()[0]["last"]["outcome"], "skipped");
         // Another under its name is refused, naming what differs.
         let other = Trigger {
