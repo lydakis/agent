@@ -456,6 +456,24 @@ class SwarmRuleTests(unittest.TestCase):
         _, act = self.act('p.w-3', state, live)
         self.s.assign(act, 't', 'w-3', 'w-2', 'please review')
         self.assertTrue(act.lines[0]['reviewing'])
+        # Naming another owner never drops the submitted result, and a review
+        # that ends wakes the first member that can still take a turn.
+        with self.assertRaises(self.s.Refused) as refused:
+            self.s.assign(act, 't', 'w-2', 'w-3', 'redo it')
+        self.assertEqual(refused.exception.code, 'result_submitted')
+        state['tasks']['t'].update(reviewer='w-2')
+        _, act = self.act('p.w-2', state, live)
+        with self.assertRaises(self.s.Refused) as refused:
+            self.s.assign(act, 't', 'w-3', 'w-1', 'please review')
+        self.assertEqual(refused.exception.code, 'member_exhausted')
+        state['tasks']['t'].update(owner='w-3', reviewer='w-2')
+        _, act = self.act('p.w-2', state, live)
+        self.s.review(act, 't', 'supported', 'checked')
+        self.assertEqual(act.sends, [])
+        state['tasks']['t'].update(owner='w-2', reviewer='w-3', status='reviewing')
+        _, act = self.act('p.w-3', state, live)
+        self.s.review(act, 't', 'supported', 'checked')
+        self.assertEqual([m for m, *_ in act.sends], ['p.w-2'])
 
     def test_the_coordinator_hears_when_every_member_is_deleted(self):
         folder, act = self.act()
@@ -525,10 +543,12 @@ class SwarmRuleTests(unittest.TestCase):
         self.assertTrue(state['told'])
         self.s.apply(state, {'from': 'user', 'text': 'carry on', 'sent': 3})
         self.assertFalse(state['told'])
-        # Joining resets the share of the budget the swarm was told it passed.
+        # Joining resets the share of the budget the swarm was told it passed,
+        # and a new agent is news after quiet.
         state['spent'] = 80
+        self.s.apply(state, {'from': 'swarm', 'kind': 'quiet'})
         self.s.apply(state, {'from': 'swarm', 'kind': 'joined', 'member': 'w-4', 'spent': 50})
-        self.assertEqual(state['spent'], 50)
+        self.assertEqual((state['spent'], state['told']), (50, False))
 
     def test_the_mix_is_dealt_to_the_row_furthest_below_its_share(self):
         mix = [{'share': 50}, {'share': 25}, {'share': 25}]

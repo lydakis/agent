@@ -917,7 +917,10 @@ daemon learns nothing about projects; everything here is client work.
   submitted task whose reviewer departed keeps its result: assigning a new
   reviewer hands it over for review without new work or approval, even if
   its original owner also left. Keep that original owner in the assignment;
-  authorship and the submitted result are preserved. A new
+  authorship and the submitted result are preserved, and naming another
+  owner is refused (`result_submitted`). A finished review wakes the first
+  member that can still take a turn. An added agent's `joined` line is news
+  after quiet, like a member's act. A new
   assignment clears the current final result, retaining its board history.
   A swarm with one member needs another for independent review.
   The Work view shows partial results, verdicts and the final outcome.

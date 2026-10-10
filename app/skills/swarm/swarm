@@ -357,6 +357,7 @@ def apply(state, line):
         state['told'] = True
     elif kind == 'joined':
         state['spent'] = line['spent']
+        state['told'] = False
     elif me == 'budget' and 'member' in line:
         state['warned'][str(line['id'])] = line['spent']
     elif me == 'budget':
@@ -461,9 +462,13 @@ def assign(act, task, owner, reviewer, brief):
     if reviewer not in able:
         raise Refused('member_exhausted', '%s has used its tokens; choose another member or add one' % reviewer)
     old = tasks.get(task)
-    # A submitted result outlives its reviewer: one that left or spent its
-    # tokens is replaced, and the result keeps its author.
-    if old and old['status'] == 'reviewing' and old['owner'] == short(owner, act.swarm) and old['reviewer'] not in able:
+    # A submitted result outlives its owner and its reviewer: only a reviewer
+    # that left or spent its tokens is replaced, and the result keeps its author.
+    if old and old['status'] == 'reviewing':
+        if old['reviewer'] in able:
+            raise Refused('task_exists', '%s is waiting on its review by %s' % (task, old['reviewer']))
+        if short(owner, act.swarm) != old['owner']:
+            raise Refused('result_submitted', '%s submitted %s; assign it to %s with a new reviewer' % (old['owner'], task, old['owner']))
         if reviewer == old['owner']:
             raise Refused('independent_review_required', 'choose a reviewer other than the owner')
         act.line(kind='assign', stream=task, owner=old['owner'], reviewer=reviewer, brief=old['brief'],
@@ -478,7 +483,7 @@ def assign(act, task, owner, reviewer, brief):
     if old:
         # Reassigning is explicit: a task whose owner or reviewer left or spent
         # its tokens, or one released back to assigned and changed.
-        missing = old['status'] != 'reviewed' and (old['owner'] not in able or old['reviewer'] not in able)
+        missing = old['status'] in ('assigned', 'working') and (old['owner'] not in able or old['reviewer'] not in able)
         changed = (old['owner'], old['reviewer'], old['brief']) != (owner, reviewer, brief)
         released = changed and old['status'] == 'assigned' and task not in act.state['streams'].values()
         if not (missing or released):
@@ -520,7 +525,7 @@ def review(act, task, verdict, evidence):
     if t['reviewer'] != act.me or t['owner'] == act.me or t['status'] != 'reviewing':
         raise Refused('reviewer_only', 'only the assigned independent reviewer reviews a submitted result')
     act.line(kind='review', stream=task, verdict=verdict, evidence=evidence, text='%s: %s' % (verdict, evidence))
-    act.tell(act.live[:1], '[board] %s reviewed: %s. %s' % (task, verdict, evidence))
+    act.tell([m for m in act.live if short(m, act.swarm) in act.able][:1], '[board] %s reviewed: %s. %s' % (task, verdict, evidence))
 
 
 def finish(act, outcome, summary):
