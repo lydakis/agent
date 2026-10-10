@@ -272,6 +272,42 @@ impl<T> std::future::Future for Answer<T> {
             .map(|answer| answer.unwrap_or_else(|_| Err(Error::new("storage_worker_failed"))))
     }
 }
+/// Room on the storage worker's queue: a job sent through it is queued at
+/// once, with nothing left to wait for before the worker holds it, and is
+/// timed from when the room was asked for.
+pub struct Slot<'a>(mpsc::Permit<'a, Box<dyn Job>>, std::time::Instant);
+impl Slot<'_> {
+    /// Queue a job, counted under `label` as `Store::op` counts it.
+    pub fn op<T: Send + 'static>(
+        self,
+        label: &'static str,
+        operation: impl FnOnce(&mut Database) -> Result<T> + Send + 'static,
+    ) -> Answer<T> {
+        self.send(label, None, operation)
+    }
+    fn send<T: Send + 'static>(
+        self,
+        label: &'static str,
+        pruning_bot: Option<String>,
+        operation: impl FnOnce(&mut Database) -> Result<T> + Send + 'static,
+    ) -> Answer<T> {
+        let (reply, receiver) = oneshot::channel();
+        self.0.send(Box::new(Queued {
+            operation: Some(operation),
+            pruning_bot,
+            outcome: None,
+            reply,
+            timing: Timing {
+                label,
+                queued: self.1,
+                waited_ns: 0,
+                ran_ns: None,
+                storage_error: false,
+            },
+        }));
+        Answer(receiver)
+    }
+}
 #[derive(Clone)]
 pub struct Store {
     sender: mpsc::Sender<Box<dyn Job>>,
@@ -587,24 +623,18 @@ impl Store {
         pruning_bot: Option<String>,
         operation: impl FnOnce(&mut Database) -> Result<T> + Send + 'static,
     ) -> Result<Answer<T>> {
-        let (reply, receiver) = oneshot::channel();
+        Ok(self.slot().await?.send(label, pruning_bot, operation))
+    }
+    /// Wait for room on the worker's queue without giving it a job yet, so
+    /// a caller can keep what the job will own until it is surely queued.
+    /// Its wait counts as the job's time queued.
+    pub async fn slot(&self) -> Result<Slot<'_>> {
+        let queued = std::time::Instant::now();
         self.sender
-            .send(Box::new(Queued {
-                operation: Some(operation),
-                pruning_bot,
-                outcome: None,
-                reply,
-                timing: Timing {
-                    label,
-                    queued: std::time::Instant::now(),
-                    waited_ns: 0,
-                    ran_ns: None,
-                    storage_error: false,
-                },
-            }))
+            .reserve()
             .await
-            .map_err(|_| Error::new("storage_worker_failed"))?;
-        Ok(Answer(receiver))
+            .map(|permit| Slot(permit, queued))
+            .map_err(|_| Error::new("storage_worker_failed"))
     }
     /// Run a read on the reader connection, counted like any job. Only for
     /// reads whose result is bytes for a caller, never for decisions that
@@ -1215,6 +1245,32 @@ mod tests {
                 .sum::<u64>(),
             groups["count"].as_u64().unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn a_slot_waits_for_room_before_its_job_owns_anything() {
+        let (sender, mut queue) = mpsc::channel(1);
+        let (reader, _reads) = mpsc::channel(1);
+        let store = Store {
+            sender,
+            reader,
+            path: Arc::new(std::path::PathBuf::new()),
+            counters: Arc::default(),
+        };
+        let _first = store.queue("first", |_| Ok(())).await.unwrap();
+        // A full queue: a caller cancelled while waiting still holds what
+        // its job would have owned.
+        let mut kept = Some(String::from("summary"));
+        let waited = tokio::time::timeout(std::time::Duration::from_millis(20), store.slot()).await;
+        assert!(waited.is_err());
+        assert!(kept.is_some());
+        let first = queue.recv().await.unwrap();
+        assert_eq!(first.timing().label, "first");
+        let slot = store.slot().await.unwrap();
+        let owned = kept.take().unwrap();
+        let _answer = slot.op("compact", move |_| Ok(owned));
+        let queued = queue.try_recv().unwrap();
+        assert_eq!(queued.timing().label, "compact");
     }
 
     #[test]

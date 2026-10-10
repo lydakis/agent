@@ -61,6 +61,8 @@ class AccountingTests(ModelFixture):
         end = client.finished(second)
         self.assertEqual((end['data']['status'], end['data']['error']), ('failed', 'budget_exhausted'))
         self.assertIn('220 of 200', end['data']['detail'])
+        # The end carries the refusal's facts, as a reply does.
+        self.assertEqual((end['data']['budget_tokens'], end['data']['tokens_used']), (200, 220))
         self.assertEqual(client.request('submit', bot='Bob', request_id='3', prompt='again')['error'], 'budget_exhausted')
         listing = client.request('turns', bot='Bob')['result']
         self.assertEqual([t['status'] for t in listing['turns']], ['completed', 'failed'])

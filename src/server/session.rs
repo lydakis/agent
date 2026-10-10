@@ -19,6 +19,24 @@ pub enum Inbound {
 
 pub const LINE_LIMIT: usize = 1024 * 1024;
 
+/// A request line. A line that is JSON but not a request is refused with
+/// what is wrong with it, under its `id` when that is one, so the client
+/// knows which request failed and why.
+fn parse(line: &[u8]) -> Result<Request> {
+    serde_json::from_slice(line).map_err(|error| {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
+            return Error::new("invalid_json");
+        };
+        let refused = Error::with("invalid_request", error.to_string());
+        match value.get("id") {
+            Some(id) if id.is_u64() || id.as_str().is_some_and(|id| id.len() <= 128) => {
+                refused.facts(serde_json::json!({"id": id}))
+            }
+            _ => refused,
+        }
+    })
+}
+
 pub fn stdio_reader(sender: mpsc::Sender<Inbound>) {
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
@@ -31,7 +49,7 @@ pub fn stdio_reader(sender: mpsc::Sender<Inbound>) {
             match result {
                 Ok(0) => break,
                 Ok(_) if line.len() <= LINE_LIMIT && line.ends_with(b"\n") => {
-                    let request = serde_json::from_slice(&line).map_err(Error::from);
+                    let request = parse(&line);
                     if sender.blocking_send(Inbound::Request(0, request)).is_err() {
                         break;
                     }
@@ -61,7 +79,7 @@ pub async fn socket_reader(
         match result {
             Ok(0) => break,
             Ok(_) if line.len() <= LINE_LIMIT && line.ends_with(b"\n") => {
-                let request = serde_json::from_slice(&line).map_err(Error::from);
+                let request = parse(&line);
                 if sender.send(Inbound::Request(id, request)).await.is_err() {
                     break;
                 }

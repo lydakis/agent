@@ -96,6 +96,11 @@ and possible upstream benchmark contributions. Gateway/Responses protocol and
 resident feature differences remain explicit; this does not change the selected
 Rust experiment or establish parity for durable/tool-equipped agents.
 
+The [Pi Durable baseline](LIFECYCLE_MEASUREMENTS.md#pi-durable-baseline)
+(2026-10-02) is the first other engine on the durable lifecycle screen, at
+matched `synchronous=FULL`. It is exploratory: event replay, commit
+granularity, and event delivery differ, as listed in the comparison contract.
+
 Implemented: explicit comparison profiles, sanitized benchmark failure codes,
 opt-in bounded shell execution with process-group cancellation, bounded request
 startup, and a Rust-only
