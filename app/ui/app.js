@@ -1192,7 +1192,7 @@ function forgetStore() {
   S.swarms.clear(); S.memberOf.clear(); S.deleted.clear(); looked.clear();
   for (const w of S.wakes.values()) clearTimeout(w.timer);
   S.wakes.clear(); S.turnFrom.clear(); S.turnOrigin.clear(); S.heldNews = []; S.unseen.clear(); S.wanted.clear();
-  S.selected = ''; S.autoSelect = true; S.ui.side = null; S.ui.folded = new Set(); dropFile();
+  S.selected = ''; S.autoSelect = true; S.ui.side = null; S.ui.folded = new Set(); dropFile(); Rich.forget();
   S.botsGen += 1; S.shapeGen += 1;
   // A home the last host named is not this one's.
   if (S.homeWorkspace) { S.config.workspace = null; S.homeWorkspace = false; }
@@ -1261,12 +1261,12 @@ function textHTML(it, t) {
   // A block after the first of its message starts from what the blocks before it drew, and is drawn
   // anew when that changes (an earlier block highlighted once highlighting arrived).
   const used = { lines: 0, tags: 0, code: 0, blocks: 0, links: 0, marks: 0, over: false, scope: it.scope };
-  for (const s of it.budget?.spent.slice(0, it.sib) ?? []) if (s) { used.lines += s.lines; used.tags += s.tags; used.code += s.code; used.blocks += s.blocks; used.links += s.links; used.over ||= s.over; }
-  const from = `${used.lines} ${used.tags} ${used.code} ${used.blocks} ${used.links} ${used.over}`;
+  for (const s of it.budget?.spent.slice(0, it.sib) ?? []) if (s) { used.lines += s.lines; used.tags += s.tags; used.code += s.code; used.blocks += s.blocks; used.links += s.links; used.marks += s.marks; used.over ||= s.over; }
+  const from = `${used.lines} ${used.tags} ${used.code} ${used.blocks} ${used.links} ${used.marks} ${used.over}`;
   if (it.htmlOf !== it.text || it.htmlFrom !== from || (it.htmlWaited && it.htmlAt !== Rich.version)) {
     const start = { ...used }, html = `<div class="md">${Rich.html(it.text, used)}</div>`;
-    const tags = used.tags - start.tags, cost = 2 * html.length + TAG_BYTES * tags + MARK_BYTES * (used.marks - start.marks);
-    if (it.budget) it.budget.spent[it.sib] = { lines: used.lines - start.lines, tags, code: used.code - start.code, blocks: used.blocks - start.blocks, links: used.links - start.links, over: !!used.over };
+    const tags = used.tags - start.tags, mk = used.marks - start.marks, cost = 2 * html.length + TAG_BYTES * tags + MARK_BYTES * mk;
+    if (it.budget) it.budget.spent[it.sib] = { lines: used.lines - start.lines, tags, code: used.code - start.code, blocks: used.blocks - start.blocks, links: used.links - start.links, marks: mk, over: !!used.over };
     const d = cost - (it.drawnBytes ?? 0); it.drawnBytes = cost; it.bytes = (it.bytes || 0) + d; if (t) t.bytes = Math.max(0, (t.bytes || 0) + d);
     it.html = html; it.htmlOf = it.text; it.htmlFrom = from; it.htmlAt = Rich.version; it.htmlWaited = Rich.waited;
   }
@@ -1492,7 +1492,8 @@ function renderTranscript(el, name) {
     if (over()) { evict(t); html = itemsHTML(t); }
     el.innerHTML = html + '<div class="tail"></div>';
     el.dataset.key = paneKey(name, t);
-    Rich.hydrate(el);
+    // Blocks drawn from the cache here change the height once, and the place is kept once, below.
+    Rich.hydrate(el, false);
     tail = el.lastElementChild;
     // History loaded above the reader keeps their place instead of shoving it down.
     if (!atBottom) el.scrollTop += el.scrollHeight - before;
@@ -1968,7 +1969,7 @@ function render() {
 // check is cached per fleet change, so a quiet fleet of any size costs nothing here.
 let activeAt = -1, active = false;
 function anyActive() { if (activeAt !== S.botsGen) { activeAt = S.botsGen; active = [...S.bots.values()].some((b) => isActive(b.status)); } return active; }
-setInterval(() => { if (S.attached && anyActive()) { refreshLive($('log')); if (S.ui.side) refreshLive($('side')); } }, 1000);
+setInterval(() => { if (S.attached && anyActive()) { refreshLive($('log')); if (S.ui.side && !S.ui.file) refreshLive($('side')); } }, 1000);
 
 // ---------- picker ----------
 function pickerRows() {

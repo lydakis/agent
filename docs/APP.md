@@ -1193,8 +1193,9 @@ references), its slowest being about 0.6 s for 100,000 marks of `![` in
 Node on this container, and a test holds it to that. A link's target and title are
 copied into the page once per use, and a reference defined once can be used
 thousands of times, so a message's links and images carry at most 1 Mi
-characters of targets and titles in all; past that a link is its text. A
-streamed reply's blocks share those bounds and the highlighting budget below,
+characters of targets and titles in all, counted as written into the page
+(escaped, and an image's twice); past that a link is its text. A
+streamed reply's blocks share those bounds (marks parsed included) and the highlighting budget below,
 as do the text blocks of one stored message on either side of its tool calls,
 and a later block is drawn anew when an earlier one's share changes (as when
 highlighting arrives); past them the rest shows as text. Fenced blocks are drawn by their language:
@@ -1226,7 +1227,8 @@ highlighting arrives); past them the rest shows as text. Fenced blocks are drawn
   its file), its place among the diagrams and charts there, and its source. Every other
   block still asks, a copy in the same reply included, so one click never
   fills a chat of copies; one whose source changed, as in a file an agent
-  rewrote, asks too. One that fails to draw shows its error and
+  rewrote, asks too. What was asked for is forgotten when the window follows
+  another store, whose messages can have the same ids. One that fails to draw shows its error and
   asks again before it is tried again. One in a file opened beside is
   measured once the pane has finished opening.
 - **`html`** opens as code, and runs as a preview in a sandboxed frame only
@@ -1249,7 +1251,8 @@ Highlighting, Mermaid and Vega load the first time something needs them;
 markdown-it loads with the page. Text, lists, tables and code draw as a message
 arrives; diagrams, charts, previews and images draw only when asked, so
 opening a long chat runs none of them, and a reader below a block that
-draws keeps their place. Mermaid's own limits (50,000 characters, 500 edges) do
+draws keeps their place (once, for a pane drawn whole). A file beside is not
+scanned by the once-a-second clock of running turns. Mermaid's own limits (50,000 characters, 500 edges) do
 not bound its layout work, which is why a diagram waits for a click. Drawn
 diagrams and charts are kept by source (a chart also by its width) and show
 again when their pane is redrawn: at most 64 and 8 MiB. A

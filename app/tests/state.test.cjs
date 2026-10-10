@@ -262,6 +262,19 @@ test('a diagram someone asked for shows again; an identical one elsewhere still 
   for (let i = 3; i <= 1027; i++) { const b = box(String(i)), btn = { dataset: { rich: 'view' }, closest: () => b }; Rich.click({ target: { closest: (s) => s === '[data-rich]' ? btn : null }, preventDefault() {} }); }
   const old = box('1'), recent = box('1027'); Rich.hydrate({ querySelectorAll: () => [old, recent] });
   assert.equal(old.view.innerHTML, ''); assert.equal(recent.view.innerHTML, '<svg>graph TD</svg>');
+  // A reader below a block drawn from the cache keeps their place; while a whole pane is drawn, its
+  // caller keeps it once instead.
+  const placed = (anchor) => {
+    let h = 1000; const pane = { scrollTop: 500, clientHeight: 100, get scrollHeight() { return h; }, getBoundingClientRect: () => ({ top: 0 }) };
+    const b = box('1027'); b.closest = (s) => s === '.scroll' ? pane : null; b.getBoundingClientRect = () => ({ bottom: -10 });
+    let html = ''; Object.defineProperty(b.view, 'innerHTML', { get: () => html, set: (v) => { html = v; h += 300; } });
+    Rich.hydrate({ querySelectorAll: () => [b] }, anchor); assert.equal(html, '<svg>graph TD</svg>');
+    return pane.scrollTop;
+  };
+  assert.equal(placed(true), 800); assert.equal(placed(false), 500);
+  // Another store's blocks were not asked for here.
+  Rich.forget(); const after = box('1027'); Rich.hydrate({ querySelectorAll: () => [after] });
+  assert.equal(after.view.innerHTML, '');
 });
 
 test('a reply\'s diagram is code while it streams, and keeps one id per copy once it is in', async () => {
@@ -323,6 +336,19 @@ test('a reference used many times copies at most 1 Mi characters of targets into
   const used = { lines: 0, tags: 0, code: 0 }, piece = `[x][a]\n\n[a]: ${target}\n\n`;
   let links = 0; for (let i = 0; i < 20; i++) links += (Rich.html(piece, used).match(/<a href=/g) ?? []).length;
   assert.equal(links, 10);
+  // Targets are charged as written into the page, escaped.
+  const quoted = Rich.html(`[x][q] `.repeat(10) + `\n\n[q]: https://example.com/${"'".repeat(100000)}`);
+  assert.ok(quoted.length < 2 * 1024 * 1024, `${quoted.length} characters`);
+  assert.equal((quoted.match(/<a href=/g) ?? []).length, 2);
+});
+
+test('the text blocks of one message share the bound on marks parsed', () => {
+  const p = page(), bang = '!'.repeat(99000), content = [];
+  for (let i = 0; i < 7; i++) content.push({ type: 'text', text: bang }, { type: 'tool_use', id: `c${i}`, name: 'read', input: {} });
+  const texts = p.entries({ role: 'assistant', content }).filter((e) => e.kind === 'text');
+  assert.equal(texts.length, 7);
+  assert.doesNotMatch(p.textHTML(texts[0]), /<span class="lang">text<\/span>/);
+  for (const t of texts.slice(1)) assert.match(p.textHTML(t), /<span class="lang">text<\/span>/);
 });
 
 test('a diagram that failed to draw asks again before it is tried again', async () => {
@@ -2887,6 +2913,7 @@ test('another store answering on reattach is followed from its start, with nothi
   p.S.cursor = 50; p.S.drafts.set('Bob', 'unsent');
   p.S.turnFrom.set(42, 'Bob');
   p.S.wakes.set('Bob', { tasks: new Map([['old-task', { turn: 42 }]]), timer: null, last: 0 });
+  let forgot = 0; const forget = p.context.Rich.forget; p.context.Rich.forget = () => { forgot++; forget(); };
   p.lost('closed'); await p.tick(); await settle();
   assert.deepEqual(afters, [0, 50, 0], 'the new store is followed from cursor zero');
   assert.equal(p.S.store, 'store-2');
@@ -2895,6 +2922,7 @@ test('another store answering on reattach is followed from its start, with nothi
   assert.equal(p.S.drafts.size, 0);
   assert.equal(p.S.wakes.size, 0, 'wake backlogs belong to the old store');
   assert.equal(p.S.turnFrom.size, 0, 'turn authors belong to the old store');
+  assert.equal(forgot, 1, 'previews asked for belong to the old store');
   assert.equal(p.S.config.workspace, '/synthetic', 'a folder the window was given is kept');
 });
 

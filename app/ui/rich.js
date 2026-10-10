@@ -87,10 +87,16 @@ window.Rich = (() => {
   }
   // A reference defined once can be used thousands of times, and each use copies its target into
   // the page: a message's links and images carry at most 1 Mi characters of targets and titles in
-  // all (`linkLeft`, shared like the other bounds); past that a link is its text.
+  // all (`linkLeft`, shared like the other bounds); past that a link is its text. Each is charged
+  // as written into the page, escaped, and an image's target and text as often as it writes them.
   const LINK_CHARS = 1 << 20;
   let linkLeft = LINK_CHARS;
-  const linkCost = (href, title) => { const n = (href?.length ?? 0) + (title?.length ?? 0); if (n > linkLeft) return false; linkLeft -= n; return true; };
+  // Read no further than the budget left, so a target used past it costs its length, not a scan.
+  const linkCost = (href, title, k = 1) => {
+    href ??= ''; title ??= ''; let n = k * (href.length + title.length);
+    for (const s of [href, title]) for (let i = 0; i < s.length && n <= linkLeft; i++) { const c = s.charCodeAt(i); n += k * (c === 34 ? 5 : c === 38 || c === 39 ? 4 : c === 60 || c === 62 ? 3 : 0); }
+    if (n > linkLeft) return false; linkLeft -= n; return true;
+  };
   // Markdown is parsed by markdown-it, whose work grows with its input: a hostile reply can make
   // a parser's time grow faster than its length, and this one runs on the window's thread.
   let md = null; const closes = [];
@@ -117,7 +123,7 @@ window.Rich = (() => {
     // nothing a model chose.
     r.image = (tokens, i, options, env, self) => {
       const href = tokens[i].attrGet('src') ?? '', text = self.renderInlineAsText(tokens[i].children ?? [], options, env);
-      return !linkCost(href, text) ? esc(text) : /^data:image\/(png|gif|jpe?g|webp)[;,]/i.test(href) ? `<button type="button" class="img" data-img="${esc(href)}" title="${esc(text)}">image${text ? `: ${esc(text)}` : ''}</button>` : linkable(href) ? `<a href="${esc(href)}">${esc(text || href)}</a>` : filePath(href) ? `<a class="file" href="#" data-file="${esc(filePath(href))}">${esc(text || href)}</a>` : esc(text);
+      return !linkCost(href, text, 2) ? esc(text) : /^data:image\/(png|gif|jpe?g|webp)[;,]/i.test(href) ? `<button type="button" class="img" data-img="${esc(href)}" title="${esc(text)}">image${text ? `: ${esc(text)}` : ''}</button>` : linkable(href) ? `<a href="${esc(href)}">${esc(text || href)}</a>` : filePath(href) ? `<a class="file" href="#" data-file="${esc(filePath(href))}">${esc(text || href)}</a>` : esc(text);
     };
     // A table past 256 columns or 10,000 cells shows as its source, before its cells are parsed: a
     // short row is padded to the header's width, so a few bytes a row can ask for millions of cells.
@@ -182,8 +188,8 @@ window.Rich = (() => {
     if (!p) return `<p>${esc(text)}</p>`;
     if (used.over) return asText(text);
     const lines = count(text, '\n', LINES - used.lines);
-    const mk = marks(text, TAGS - used.tags);
-    if (used.lines + lines > LINES || used.tags + mk > TAGS) { used.over = true; return asText(text); }
+    const mk = marks(text, TAGS - Math.max(used.tags, used.marks ?? 0));
+    if (used.lines + lines > LINES || used.tags + mk > TAGS || (used.marks ?? 0) + mk > TAGS) { used.over = true; return asText(text); }
     closes.length = 0;
     let out; try { out = p.render(text); } catch (_) { return `<p>${esc(text)}</p>`; }
     used.code = spent;
@@ -217,8 +223,10 @@ window.Rich = (() => {
   // Something drawn later changes a block's height; a reader at the end of the pane stays there, and
   // one reading below the block keeps their place (the panes do no scroll anchoring of their own).
   // `hold` notes the reader's place before a change; each call of what it returns keeps it after.
+  // While a pane is drawn whole its caller keeps the place once, after (`hydrate(root, false)`).
+  let holding = true;
   function hold(box) {
-    const pane = box.closest?.('.scroll'); if (!pane) return () => {};
+    const pane = holding && box.closest?.('.scroll'); if (!pane) return () => {};
     const end = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 40;
     const above = !end && box.getBoundingClientRect().bottom <= pane.getBoundingClientRect().top; let h = pane.scrollHeight;
     return () => { if (end) pane.scrollTop = pane.scrollHeight; else if (above) pane.scrollTop += pane.scrollHeight - h; h = pane.scrollHeight; };
@@ -325,13 +333,18 @@ window.Rich = (() => {
   // and a diagram or chart someone asked for shows again from the cache. A page or SVG someone ran
   // in a message is code again once its pane is drawn anew: running it is asked of one block, once.
   const HYDRATE = '.rc[data-lazy]:not([data-on]), .rc[data-kind="html"]:not([data-on]), .rc[data-kind="svg"]:not([data-on])';
-  function hydrate(root) {
-    for (const box of [...(root.matches?.(HYDRATE) ? [root] : []), ...root.querySelectorAll(HYDRATE)]) {
-      box.dataset.on = '';
-      if ('lazy' in box.dataset) draw(box, !('page' in box.dataset));
-      else if (box.dataset.view === 'view') mount(box);
-    }
+  function hydrate(root, anchor = true) {
+    holding = anchor;
+    try {
+      for (const box of [...(root.matches?.(HYDRATE) ? [root] : []), ...root.querySelectorAll(HYDRATE)]) {
+        box.dataset.on = '';
+        if ('lazy' in box.dataset) draw(box, !('page' in box.dataset));
+        else if (box.dataset.view === 'view') mount(box);
+      }
+    } finally { holding = true; }
   }
+  // Another store's blocks are not the ones asked for here, whatever their ids.
+  const forget = () => shown.clear();
   if (typeof window.addEventListener === 'function') window.addEventListener('message', (e) => {
     if (e.data?.rich !== 'height' || !(e.data.h > 0)) return;
     for (const f of document.querySelectorAll('.rc iframe')) if (f.contentWindow === e.source) { const h = `${Math.min(Math.ceil(e.data.h), Math.round(window.innerHeight * 0.8))}px`; if (f.style.height !== h) settle(f, () => { f.style.height = h; }); break; }
@@ -420,5 +433,5 @@ window.Rich = (() => {
   // A middle click on a link would open it in a new app window.
   document.addEventListener?.('auxclick', (e) => { if (e.target.closest?.('.md a, .rc a, a[data-file]')) e.preventDefault(); });
 
-  return { html, cut, hydrate, click, file, filePath, esc, get version() { return version; }, get waited() { return waited; }, set onReady(fn) { ready = fn; }, set onFile(fn) { openFile = fn; }, set onError(fn) { failed = fn; } };
+  return { html, cut, hydrate, forget, click, file, filePath, esc, get version() { return version; }, get waited() { return waited; }, set onReady(fn) { ready = fn; }, set onFile(fn) { openFile = fn; }, set onError(fn) { failed = fn; } };
 })();
