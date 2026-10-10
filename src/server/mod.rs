@@ -1338,15 +1338,19 @@ pub async fn run(config: Configuration) -> Result<()> {
         let _ = publisher.await;
     }
     drop(firehose_hub);
-    handles.shutdown();
+    let mut reads = handles.shutdown();
     // Socket writers need runtime time to flush terminal events and wait
     // results. Drain concurrently under one deadline, so slow clients cannot
     // multiply shutdown latency. Stdout also drains through its worker below.
-    let _ = tokio::time::timeout(
-        Duration::from_secs(5),
-        futures_util::future::join_all(sessions.values().map(Output::drain)),
-    )
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        while reads.join_next().await.is_some() {}
+        futures_util::future::join_all(sessions.values().map(Output::drain)).await;
+    })
     .await;
+    // A wait answer still reading holds its session's output; end it here,
+    // while the runtime can still drop it, or joining stdout below would wait
+    // on it forever.
+    reads.shutdown().await;
     drop(sessions);
     // The stdio firehose's senders went with the service and the publisher;
     // the output worker can now drain and exit, including shutdown without EOF.
@@ -2321,6 +2325,7 @@ impl Service {
                             session,
                             output: output.clone(),
                             request: id,
+                            reader: store.reader(),
                         },
                     )
                     .await;
@@ -2585,53 +2590,69 @@ impl Service {
                 Err(Error::new("deferred"))
             }
             Command::Interrupt { bot, turn } => {
+                // The reply is the turn view: as it stood when the interrupt
+                // was requested, or its final state when it had already ended.
+                let reader = store.clone();
+                let view = |store: &Store, bot: String, requested: bool| {
+                    let store = store.clone();
+                    async move {
+                        // On the writer, which has seen the end it just recorded.
+                        let mut view = store
+                            .op("turn_view", move |db| db.turn_view(&bot, turn))
+                            .await?;
+                        view["interrupt_requested"] = json!(requested);
+                        Ok(view)
+                    }
+                };
                 if let Some(active) = self.active.get(&bot).filter(|a| a.turn == turn) {
                     if active.cancel(turn::INTERRUPTED) {
-                        return Ok(json!({"interrupt_requested":true,"turn":turn}));
+                        return view(&reader, bot, true).await;
                     }
                     // The task exited but its JoinSet result has not been reaped.
                     // Release its slot; the result still gets checked by the loop.
                     self.active.remove(&bot);
                 }
-                // A queued turn has no task either; end it where it stands.
-                // An unknown id is judged below against the bot's state.
                 let check = bot.clone();
                 let status = store
                     .op("turn_status", move |db| db.turn_status(&check, turn))
-                    .await
-                    .unwrap_or_default();
-                if matches!(status.as_str(), "queued" | "ready") {
-                    self.end_queued(bot, turn, Error::new(turn::INTERRUPTED))
-                        .await?;
-                    return Ok(json!({"interrupt_requested":true,"turn":turn,"queued":true}));
+                    .await?;
+                match status.as_str() {
+                    // A queued turn has no task either; end it where it stands.
+                    "queued" | "ready" => {
+                        self.end_queued(bot.clone(), turn, Error::new(turn::INTERRUPTED))
+                            .await?;
+                        return view(&reader, bot, true).await;
+                    }
+                    // Repeating an interrupt, or one that crossed the turn's
+                    // own end, finds it ended and says how.
+                    "completed" | "failed" | "interrupted" | "steered" => {
+                        return view(&reader, bot, false).await;
+                    }
+                    _ => {}
                 }
                 // Refusals say what the bot is running and where the named
-                // turn stands, so a client can tell an ended turn from one
-                // that never was.
-                let stale = |running: Option<i64>, code: &str| {
+                // turn stands.
+                let stale = |running: Option<i64>| {
                     Error::with(
-                        code,
+                        "stale_turn",
                         match running {
                             Some(running) if running == turn => format!("turn {turn} is starting"),
                             Some(running) => format!("{bot} is running turn {running}, not {turn}"),
                             None => format!("{bot} is running no turn"),
                         },
                     )
-                    .facts(json!({"running_turn":running,"status":(!status.is_empty()).then_some(&status)}))
+                    .facts(json!({"running_turn":running,"status":status}))
                 };
                 if let Some(active) = self.active.get(&bot) {
-                    return Err(stale(Some(active.turn), "stale_turn"));
+                    return Err(stale(Some(active.turn)));
                 }
                 // A parked turn has no task; confirm durable state and end it.
                 let check = bot.clone();
                 let state = store.op("inspect", move |db| db.inspect(&check)).await?;
-                if state.running_turn.is_none() {
-                    return Err(stale(None, "no_active_turn"));
-                }
                 if state.running_turn != Some(turn)
                     || (state.status != "waiting" && state.status != "paced")
                 {
-                    return Err(stale(state.running_turn, "stale_turn"));
+                    return Err(stale(state.running_turn));
                 }
                 let name = bot.clone();
                 store
@@ -2649,7 +2670,7 @@ impl Service {
                 self.handles.forget(Waiter::Turn(turn));
                 self.wakes.cancel(turn);
                 self.ready_hint = true;
-                Ok(json!({"interrupt_requested":true,"turn":turn,"parked":true}))
+                view(&reader, bot, true).await
             }
             Command::Shutdown { grace_ms } => {
                 if grace_ms > 86_400_000 {
@@ -3185,7 +3206,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert_eq!(stale.code, "stale_turn");
+        assert_eq!(stale.code, "turn_not_found");
         let reply = service
             .dispatch(
                 Command::Interrupt {
@@ -3199,7 +3220,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(reply["parked"], true);
+        // The parked turn ended in place; the reply shows it ended.
+        assert_eq!(
+            (&reply["interrupt_requested"], &reply["status"]),
+            (&json!(true), &json!("interrupted"))
+        );
         assert!(service.has_capacity());
         assert_eq!(service.jobs.join_next().await.unwrap().unwrap().1, turn);
         let next = store
@@ -4922,8 +4947,8 @@ mod tests {
         assert_eq!(answers[1].1.as_ref().unwrap()["turn"], 1);
         let interrupted = answers[2].1.as_ref().unwrap();
         assert_eq!(interrupted["interrupt_requested"], true);
-        assert!(
-            interrupted.get("queued").is_none(),
+        assert_eq!(
+            interrupted["status"], "running",
             "it reached the started task, not a durable row behind its back"
         );
         let (bot, turn, task, exit) = service.jobs.join_next().await.unwrap().unwrap();

@@ -13,7 +13,8 @@ const PEER_WINDOW = 300;
 const DECODE_BYTES = 8 * 1024 * 1024;
 
 const S = {
-  bots: new Map(), transcripts: new Map(), selected: '', cursor: 0, live: false, attached: false, autoSelect: true,
+  // `selected` is what the main pane shows: the agent open in the active tab, or '' for Home.
+  bots: new Map(), transcripts: new Map(), selected: '', cursor: 0, live: false, attached: false,
   // Whether the workspace is the home a host named, not a folder the window was given.
   homeWorkspace: false,
   // The store identity the attached daemon announced; what the window remembers is saved under it.
@@ -22,7 +23,8 @@ const S = {
   // removed (shapeGen), so the activity check and the rail's tree rebuild once per change instead of
   // scanning the fleet on every event.
   botsGen: 0, shapeGen: 0, deleted: new Set(),
-  config: null, ui: { rail: true, side: null, picker: false, pickerSel: 0, help: false, steps: false, toast: null, menu: false, folded: new Set() },
+  // The tabs are the agents opened full screen, in order; Home is always there and is not one of them.
+  config: null, ui: { rail: true, side: null, tabs: [], picker: false, pickerSel: 0, help: false, steps: false, toast: null, menu: false },
   // How Send reaches a working bot, the last pick from its menu (sticky across windows), and the
   // model each bot's next turns run on when it differs from the one it was created with.
   send: loadSend(), override: new Map(), effort: new Map(),
@@ -201,6 +203,8 @@ function patchUnseen(names) {
   const rows = new Set();
   for (const name of names) { rows.add(name); const sw = swarmOfBot(name); if (sw) rows.add(swarmKey(sw.name)); }
   for (const row of rows) patchRailRow(row);
+  // A tab's glyph says done too; the bar redraws only when a tab's state changed.
+  renderTabs();
 }
 // Only what the panes show can become seen: the bots in them, or the selected swarm's agents.
 function markSeen() {
@@ -328,10 +332,10 @@ function shortName(b) {
   if (b.name === p + LEAD) return p;
   return b.name.startsWith(p + '.') ? b.name.slice(p.length + 1) : b.name;
 }
-// The sidebar's rows: each project's coordinator, then its tasks by lineage (unless folded), then
-// the bots in no project. Rebuilt once per fleet shape change; it also stamps each bot's project.
-// `all` includes folded projects' tasks, for finding rather than drawing.
-function tree(all = false) {
+// The fleet in order: each project's coordinator, then its swarms with their agents and its tasks by
+// lineage, then the bots in no project, each row with its depth. Every bot is in it once: the list
+// draws one level of it, and the finder and the arrow keys all of it. It also stamps each bot's project.
+function tree() {
   // One pass builds the children index; an explicit stack walks it, so a deep delegation chain
   // costs one prefix string per row and no recursion.
   const children = new Map(), projects = new Map();
@@ -353,40 +357,43 @@ function tree(all = false) {
   const swarmsOf = new Map();
   for (const sw of S.swarms.values()) { const p = projects.has(sw.project) ? sw.project : null; if (!swarmsOf.has(p)) swarmsOf.set(p, []); swarmsOf.get(p).push(sw); }
   // Coordinators head their own projects wherever they were created.
+  // A swarm's agents sit under its row, not under whoever made them.
+  const held = new Set();
+  for (const sw of S.swarms.values()) for (const m of sw.members) if (memberBot(sw, m)) held.add(m);
   const pushKids = (parent, depth, cont, project, extra) => {
-    const kids = [...(children.get(parent) ?? []), ...(extra ?? [])].filter((b) => !seen.has(b.name) && !leadProject(b.name));
+    const kids = [...(children.get(parent) ?? []), ...(extra ?? [])].filter((b) => !seen.has(b.name) && !held.has(b.name) && !leadProject(b.name));
     for (let i = kids.length - 1; i >= 0; i--) stack.push([kids[i], depth, i === kids.length - 1, cont, project]);
   };
-  const walk = (hidden) => {
-    let visited = 0;
+  const walk = () => {
     while (stack.length) {
       const [b, depth, last, cont, project] = stack.pop();
-      if (seen.has(b.name)) continue; seen.add(b.name); b.project = project; visited++;
+      if (seen.has(b.name)) continue; seen.add(b.name); b.project = project;
       const prefix = depth === 0 ? '' : cont + (last ? '└ ' : '├ ');
-      if (!hidden) out.push({ b, depth, prefix });
+      out.push({ b, depth, prefix });
       // The continuation stops growing past a few levels: a chain of thousands must not cost thousands per row.
       pushKids(b.name, depth + 1, depth === 0 ? '' : depth > 6 ? cont : cont + (last ? '  ' : '│ '), project);
     }
-    return visited;
   };
-  // A swarm's agents, and whatever they made, are drawn in the swarm's own view, not here.
-  for (const sw of S.swarms.values()) for (const m of sw.members) { const b = memberBot(sw, m); if (b && !seen.has(m)) { stack.push([b, 1, true, '', sw.project]); walk(true); } }
-  const swarmRows = (list, depth) => [...(list ?? [])].sort((a, c) => a.name.localeCompare(c.name)).map((sw) => ({ swarm: sw, key: swarmKey(sw.name), depth, prefix: depth ? '├ ' : '' }));
+  const pushSwarms = (list, depth) => [...(list ?? [])].sort((a, c) => a.name.localeCompare(c.name)).map((sw) => {
+    const row = { swarm: sw, key: swarmKey(sw.name), depth, prefix: depth ? '├ ' : '' }; out.push(row);
+    const ms = sw.members.map((m) => memberBot(sw, m)).filter(Boolean);
+    for (let i = ms.length - 1; i >= 0; i--) stack.push([ms[i], depth + 1, i === ms.length - 1, depth ? '│ ' : '', sw.project]);
+    walk(); return row;
+  });
   for (const p of [...projects.keys()].sort()) {
     const lead = projects.get(p); seen.add(lead.name); lead.project = p;
-    const head = { b: lead, depth: 0, prefix: '', head: p, tasks: 0 }; out.push(head);
+    out.push({ b: lead, depth: 0, prefix: '', head: p });
     // Its swarms first, one row each, then its tasks.
-    const folded = !all && S.ui.folded.has(p), rows = swarmRows(swarmsOf.get(p), 1);
-    if (!folded) out.push(...rows);
+    const rows = pushSwarms(swarmsOf.get(p), 1);
     const before = out.length;
-    pushKids(lead.name, 1, '', p, prefixed.get(p)); head.tasks = walk(folded) + rows.length;
+    pushKids(lead.name, 1, '', p, prefixed.get(p)); walk();
     if (rows.length && out.length === before) rows.at(-1).prefix = '└ ';
   }
   const loose = out.length;
-  pushKids(null, 0, '', null); walk(false);
-  out.push(...swarmRows(swarmsOf.get(null), 0));
+  pushKids(null, 0, '', null); walk();
+  pushSwarms(swarmsOf.get(null), 0);
   // Anything the roots do not reach is rooted where it stands: one pass, nothing hidden.
-  for (const b of S.bots.values()) if (!seen.has(b.name)) { stack.push([b, 0, true, '', null]); walk(false); }
+  for (const b of S.bots.values()) if (!seen.has(b.name)) { stack.push([b, 0, true, '', null]); walk(); }
   if (projects.size && out.length > loose) out.splice(loose, 0, { label: 'bots' });
   return out;
 }
@@ -402,7 +409,7 @@ function callSummary(name, args) {
 // ---------- swarms ----------
 // A swarm is the app's: its folder in ~/.agent/swarms holds its goal, its members and its board, and its
 // agents are ordinary bots named `<swarm>-N`. It is one row under its project, selected by a key no bot
-// name can be; its agents live in its view. Its board is read only while it is on screen, from where the
+// name can be; its agents sit under it in the fleet and are listed in its view. Its board is read only while it is on screen, from where the
 // last read ended, whenever one of its agents does something durable, so a quiet swarm costs nothing.
 const SWARM = '⁂';
 const swarmKey = (name) => SWARM + name;
@@ -613,7 +620,7 @@ async function createSwarm(project, { goal, n, mix, shared, budget, council = 0 
   goal = goal.trim(); if (!goal) throw new Error('goal_required: a swarm needs a goal');
   const r = await Daemon.swarmStart({ project, folder: lead.workspace, goal, shared, mix, agents: n, budgetTokens: budget, council });
   const sw = await learnStarted(r, n);
-  await openOnly(swarmKey(sw.name));
+  await go(swarmKey(sw.name));
 }
 // An added agent comes from the row furthest below its share.
 async function addAgent(sw) {
@@ -652,12 +659,7 @@ async function onEvent(ev) {
   if (name && name !== '*' && !NAMELESS.has(kind) && !S.bots.has(name)) { S.bots.set(name, { name, id: null, parent: null, parentId: null, waitingOn: [], turnStarted: 0, elapsed: 0, status: 'idle', runningTurn: null, model: '?', workspace: null }); S.shapeGen += 1; }
   if (name && bot(name)) bot(name).touched = S.session;
   switch (kind) {
-    case 'follow_live': {
-      S.live = true;
-      if (S.autoSelect) { const first = tree().find((n) => n.b); if (first) S.selected = first.b.name; }
-      S.autoSelect = false;
-      break;
-    }
+    case 'follow_live': S.live = true; break;
     // Attaching queues its own load on the chain this handler runs in; done here it would wait on itself.
     case 'follow_lagged': lost('event stream lagged; attaching again'); retryAttach(0); return true;
     case 'text_delta': { const t = transcript(name); t.streamingTurn = turn; if (t.thinkingSince) { t.thinkingMs += Date.now() - t.thinkingSince; t.thinkingSince = 0; } t.text += ev.text ?? ''; break; }
@@ -789,9 +791,10 @@ async function onEvent(ev) {
       if (S.snapshot) S.deleted.add(name);
       // A later bot may take the name as a swarm's agent, so it is looked for again.
       looked.delete(name);
-      const p = bot(name)?.project;
+      // Its tab goes up a level, to what made it, rather than closing on the reader.
+      const up = upOf(name);
       forgetBot(name);
-      if (S.selected === name) S.selected = p && S.bots.has(p + LEAD) ? p + LEAD : S.bots.keys().next().value ?? '';
+      retab(name, isOpen(up) ? up : ''); save();
       // A deleted agent leaves its swarm, which stops counting it and posting to it.
       if (S.memberOf.has(name)) {
         const sw = S.memberOf.get(name); patchRailRow(swarmKey(sw));
@@ -1177,7 +1180,14 @@ async function attachOnce() {
       if (S.session !== session) return;
       // Gone from the store while this page had no session: its live-only `deleted` notice cannot be
       // replayed. A bot this session's events mentioned was born after its page was listed, not deleted.
-      for (const [name, b] of [...S.bots]) if (!listed.has(name) && b.touched !== session) { forgetBot(name); }
+      // Its tab goes up a level, as a live `deleted` moves it, and is saved so restore keeps the move.
+      let moved = false;
+      for (const [name, b] of [...S.bots]) if (!listed.has(name) && b.touched !== session) {
+        const up = upOf(name);
+        forgetBot(name);
+        if (S.ui.tabs.includes(name)) { retab(name, isOpen(up) ? up : ''); moved = true; }
+      }
+      if (moved) save();
       // Resolve lineage only after all pages are seated: a child can sort before
       // its parent, and retention may have removed both creation events.
       for (const b of S.bots.values()) {
@@ -1192,8 +1202,8 @@ async function attachOnce() {
       for (const lead of S.wakes.keys()) wakeSoon(lead);
       try { await loadSwarms(); } catch (e) { toast(`swarms: ${e?.message ?? e}`, 5000); }
       restore();
-      // A selection deleted while detached had no `deleted` event to replay; show a surviving bot.
-      if (!isOpen(S.selected)) { const first = tree().find((n) => n.b); S.selected = first ? first.b.name : ''; }
+      // Tabs deleted while detached had no `deleted` event to replay; they close.
+      S.ui.tabs = S.ui.tabs.filter(isOpen); if (!isOpen(S.selected)) S.selected = '';
       const shown = swarmOf(S.selected); if (shown) { readBoard(shown); readUsage(shown); }
       S.botsGen += 1; S.shapeGen += 1;
       await loadVisible();
@@ -1219,7 +1229,7 @@ function forgetStore() {
   for (const w of S.wakes.values()) clearTimeout(w.timer);
   S.wakes.clear(); S.turnFrom.clear(); S.turnOrigin.clear(); S.answerTo.clear(); S.heldNews = []; S.answered.clear();
   for (const timer of S.forwarding.values()) clearTimeout(timer); S.forwarding.clear(); S.unseen.clear(); S.wanted.clear();
-  S.selected = ''; S.autoSelect = true; S.ui.side = null; S.ui.folded = new Set(); dropFile();
+  S.selected = ''; S.ui.tabs = []; S.ui.side = null; dropFile();
   S.botsGen += 1; S.shapeGen += 1;
   // A home the last host named is not this one's.
   if (S.homeWorkspace) { S.config.workspace = null; S.homeWorkspace = false; }
@@ -1253,10 +1263,18 @@ function restore() {
   const key = sessionKey(); if (!key) return;
   let saved = null; try { saved = JSON.parse(localStorage.getItem(key) || 'null'); } catch (_) {}
   if (!saved) return;
-  if (saved.selected && isOpen(saved.selected)) { S.selected = saved.selected; S.autoSelect = false; }
-  if (saved.side && S.bots.has(saved.side) && saved.side !== S.selected) S.ui.side = saved.side;
+  // Tabs come back like a browser's. One whose agent is gone since, or made again under its name, goes
+  // up a level to what made it, as it would have live, or closes when that is gone too.
+  let selected = '';
+  if (Array.isArray(saved.tabs)) {
+    const now = saved.tabs.map((entry) => [Array.isArray(entry) ? entry[0] : null, sameKey(entry)]);
+    S.ui.tabs = [...new Set(now.map(([, k]) => k).filter(Boolean))];
+    selected = now.find(([k]) => k === saved.selected)?.[1] ?? '';
+  }
+  S.selected = S.ui.tabs.includes(selected) ? selected : '';
+  const side = Array.isArray(saved.side) ? savedKey(saved.side[0], saved.side[1]) : null;
+  if (side && S.bots.has(side) && side !== S.selected) S.ui.side = side;
   S.ui.rail = saved.rail !== false; S.ui.steps = !!saved.steps;
-  if (Array.isArray(saved.folded)) { S.ui.folded = new Set(saved.folded.filter((p) => typeof p === 'string')); S.shapeGen += 1; }
   // A model pick belongs to the identity it was made for, not to whichever bot holds the name now.
   if (Array.isArray(saved.override)) for (const entry of saved.override) {
     const [name, id, model] = Array.isArray(entry) ? entry : [];
@@ -1269,7 +1287,16 @@ function restore() {
     if (b && b.id != null && b.id === id && effortsFor(b.model).includes(level) && level !== b.reasoning) S.effort.set(name, level);
   }
 }
-function save() { const key = sessionKey(); if (!key) return; try { localStorage.setItem(key, JSON.stringify({ selected: S.selected, side: S.ui.side, rail: S.ui.rail, steps: S.ui.steps, folded: [...S.ui.folded], override: [...S.override].map(([name, model]) => [name, bot(name)?.id ?? null, model]), effort: [...S.effort].map(([name, level]) => [name, bot(name)?.id ?? null, level]) })); } catch (_) {} }
+// A tab, or the agent beside, is saved with the identity it shows and the one a level up; a swarm is
+// its key.
+const keyIdentity = (k) => { const up = upOf(k); return [k, bot(k)?.id ?? null, up || null, up ? bot(up)?.id ?? null : null]; };
+const savedKey = (k, id) => {
+  if (typeof k !== 'string') return null;
+  if (swarmOf(k)) return k;
+  const b = bot(k); return b && b.id != null && b.id === id ? k : null;
+};
+const sameKey = (entry) => { const [k, id, up, upId] = Array.isArray(entry) ? entry : []; return savedKey(k, id) ?? savedKey(up, upId); };
+function save() { const key = sessionKey(); if (!key) return; try { localStorage.setItem(key, JSON.stringify({ selected: S.selected, tabs: S.ui.tabs.map(keyIdentity), side: S.ui.side ? keyIdentity(S.ui.side) : null, rail: S.ui.rail, steps: S.ui.steps, override: [...S.override].map(([name, model]) => [name, bot(name)?.id ?? null, model]), effort: [...S.effort].map(([name, level]) => [name, bot(name)?.id ?? null, level]) })); } catch (_) {} }
 window.addEventListener('beforeunload', save);
 window.addEventListener('focus', markSeen);
 
@@ -1634,16 +1661,33 @@ function renderFile() {
 }
 
 // ---------- heads and composers ----------
+// One level up from an agent or a swarm: what made it, a swarm's agent its swarm, a task its project's
+// coordinator, and a coordinator or a bot in no project Home ('').
+function upOf(key) {
+  const sw = swarmOf(key); if (sw) return bot(sw.project + LEAD) ? sw.project + LEAD : '';
+  const b = bot(key); if (!b || leadProject(key)) return '';
+  const mine = swarmOfBot(key); if (mine) return swarmKey(mine.name);
+  const c = creatorOf(b); if (c) return c.name;
+  return b.project && bot(b.project + LEAD) ? b.project + LEAD : '';
+}
+const keyLabel = (key) => { const sw = swarmOf(key); if (sw) return `⁂ ${memberShort(sw, sw.name)}`; const b = bot(key); return b ? shortName(b) : key; };
+// The way down from Home to an agent, each step up a button. A long chain shows its two ends; the walk
+// up stops at a bound, so a chain of thousands costs that bound.
+const CRUMBS = 64;
+function crumbsHTML(key) {
+  const up = []; for (let k = upOf(key); k && up.length < CRUMBS; k = upOf(k)) up.unshift(k);
+  const shown = up.length > 3 ? [up[0], null, ...up.slice(-2)] : up, sep = '<span class="sep">›</span>';
+  const step = (k) => k === null ? '<span class="sep">…</span>' : `<button type="button" class="back" data-act="open" data-who="${esc(k)}">${esc(keyLabel(k))}</button>`;
+  // The window's own title says where it is too, so the Dock and the window list do.
+  document.title = ['Agent', ...up.map(keyLabel), keyLabel(key)].join(' › ');
+  return `<button type="button" class="back" data-act="home">Home</button>${shown.map((k) => sep + step(k)).join('')}${sep}<b>${esc(keyLabel(key))}</b>`;
+}
 function headHTML(b, pane) {
   const waiting = b.waitingOn.length ? ` on ${esc(waitSummary(b))}` : '';
   const state = `<span class="glyph ${b.status}">${glyphOf(b.status)}</span><span class="state">${labelOf(b.status)}${waiting}</span>`;
-  if (pane === 'side') return `<div class="crumbs"><b>${esc(shortName(b))}</b>${branchHTML(b)}${state}</div><div class="tools">${moreButton(b.name)}<button type="button" class="ibtn" data-act="swap" title="Full view" aria-label="Full view">⤢</button><button type="button" class="ibtn" data-act="close-side" title="Close (Esc)" aria-label="Close">✕</button></div>`;
-  const lead = b.project ? bot(b.project + LEAD) : null, sw = swarmOfBot(b.name);
-  // A swarm's agent goes back to its swarm.
-  const crumbs = sw ? `<button type="button" class="back" data-act="open" data-who="${esc(swarmKey(sw.name))}" title="Back to the swarm">← ⁂ ${esc(memberShort(sw, sw.name))}</button><span class="sep">/</span><b>${esc(shortName(b))}</b>`
-    : !lead ? `<b>${esc(b.name)}</b>` : lead === b ? `<b>${esc(b.project)}</b>`
-    : `<button type="button" class="back" data-act="open" data-who="${esc(lead.name)}" title="Back to the coordinator">← ${esc(b.project)}</button><span class="sep">/</span><b>${esc(shortName(b))}</b>`;
-  return `<div class="crumbs">${crumbs}${branchHTML(b)}${state}</div><div class="tools">${moreButton(b.name)}</div>`;
+  // Beside, a look into an agent from the list: back to the list, or full screen.
+  if (pane === 'side') return `<div class="crumbs"><button type="button" class="back" data-act="close-side" title="Back to the list (Esc)" aria-label="Back to the list">←</button><b>${esc(shortName(b))}</b>${branchHTML(b)}${state}</div><div class="tools">${moreButton(b.name)}<button type="button" class="ibtn" data-act="full" title="Full screen (or double-click its row)">⤢ Full screen</button></div>`;
+  return `<div class="crumbs">${crumbsHTML(b.name)}${branchHTML(b)}${state}</div><div class="tools">${moreButton(b.name)}</div>`;
 }
 const branchHTML = (b) => (b.branch ? `<span class="branch" title="${esc(b.workspace)}">⎇ ${esc(b.branch)}</span>` : '');
 // A head names a few of the handles a bot waits on and counts the rest, so its cost stays bounded.
@@ -1656,9 +1700,11 @@ function waitSummary(b) {
 // Heads change with their bot's status, not with time, so they are written only when that changes.
 function renderHead(el, b, pane) {
   if (b) readBranch(b);
-  const key = b ? `${b.name}|${b.status}|${waitSummary(b)}|${b.project}|${b.branch ?? ''}` : '-';
+  // A fleet shape change can move an agent's way up, so it redraws the crumbs.
+  const key = b ? `${b.name}|${b.status}|${waitSummary(b)}|${b.project}|${b.branch ?? ''}|${pane === 'main' ? S.shapeGen : ''}` : '-';
   if (el.dataset.k === key) return; el.dataset.k = key;
-  el.innerHTML = b ? headHTML(b, pane) : pane === 'main' ? '<div class="crumbs"><span class="state">no bots · /new NAME PROVIDER/MODEL creates one</span></div>' : '';
+  if (!b && pane === 'main') document.title = 'Agent';
+  el.innerHTML = b ? headHTML(b, pane) : pane === 'main' ? '<div class="crumbs"><b>Home</b></div>' : '';
 }
 const PANE = {
   main: { form: 'form', input: 'input', model: 'model', send: 'send', stop: 'stop', bot: () => S.selected },
@@ -1701,16 +1747,15 @@ const tokens = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(n >= 1e7 ? 0 : 1).replace
 function renderSwarmHead(el, sw) {
   const working = sw.members.filter((m) => RUNNING.has(memberBot(sw, m)?.status)).length;
   const open = sw.state.proposals.filter((p) => p.status === 'open').length, streams = sw.state.proposals.filter((p) => p.status === 'approved').length;
-  const key = `${SWARM}${sw.name}|${working}|${sw.members.length}|${sw.stopped}|${sw.used}|${sw.tab}|${open}|${streams}|${sw.filter}`;
+  const key = `${SWARM}${sw.name}|${working}|${sw.members.length}|${sw.stopped}|${sw.used}|${sw.tab}|${open}|${streams}|${sw.filter}|${S.shapeGen}`;
   if (el.dataset.k === key) return; el.dataset.k = key;
-  const lead = bot(sw.project + LEAD), st = swarmStatus(sw);
-  const back = lead ? `<button type="button" class="back" data-act="open" data-who="${esc(lead.name)}" title="Back to the coordinator">← ${esc(sw.project)}</button><span class="sep">/</span>` : '';
+  const st = swarmStatus(sw);
   const state = sw.stopped ? 'stopped' : working ? `${working} of ${sw.members.length} working` : `${sw.members.length} agents`;
   const budget = `${sw.used == null ? '' : tokens(sw.used) + ' of '}${tokens(sw.budget)} tokens`;
   const tab = (v, label) => `<button type="button" class="tab${sw.tab === v ? ' on' : ''}" data-act="swarm-tab" data-v="${v}">${label}</button>`;
   const filter = sw.filter && sw.tab === 'board' ? `<button type="button" class="tag on" data-act="swarm-filter" data-v="" title="Show every post">#${esc(sw.filter)} ×</button>` : '';
   const council = sw.council ? `${tab('council', `Council${open ? ` <span class="count">${open}</span>` : ''}`)}${tab('streams', `Streams ${streams}`)}` : '';
-  el.innerHTML = `<div class="crumbs">${back}<b>⁂ ${esc(memberShort(sw, sw.name))}</b><span class="glyph ${st}">${glyphOf(st)}</span><span class="state">${esc(state)}</span><span class="branch">${esc(budget)}</span></div><div class="tools">${filter}${tab('board', 'Board')}${council}${!sw.council ? tab('streams', 'Work') : ''}${tab('agents', `Agents ${sw.members.length}`)}${moreButton(swarmKey(sw.name))}</div>`;
+  el.innerHTML = `<div class="crumbs">${crumbsHTML(swarmKey(sw.name))}<span class="glyph ${st}">${glyphOf(st)}</span><span class="state">${esc(state)}</span><span class="branch">${esc(budget)}</span></div><div class="tools">${filter}${tab('board', 'Board')}${council}${!sw.council ? tab('streams', 'Work') : ''}${tab('agents', `Agents ${sw.members.length}`)}${moreButton(swarmKey(sw.name))}</div>`;
 }
 const streamTag = (stream) => `<button type="button" class="tag" data-act="swarm-filter" data-v="${esc(stream)}">#${esc(stream)}</button>`;
 // A proposal's votes so far against the seats' majority.
@@ -1906,40 +1951,71 @@ $('sheet').addEventListener('submit', async (e) => {
 $('sheet').addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); $('sheet').requestSubmit(); } });
 
 // ---------- sidebar ----------
-// The sidebar shows a window of rows around the selection; scrolling to an edge extends it. The rows
-// are rebuilt when the fleet's shape changes (a bot created, forked or deleted, a project folded); a
-// status change patches the bot's own row. A fleet of thousands costs a screenful of rows, not a row
-// each per event.
+// The sidebar lists what sits one level below the open agent: at Home the projects and the bots in
+// none, in a project its tasks and swarms, in a task what it made, in a swarm its agents. The fleet's
+// rows are rebuilt when its shape changes (a bot created, forked or deleted); a level is cut from them
+// when the open agent changes, in one pass over its subtree; a status change patches the bot's own
+// row. It shows a window of rows; scrolling to an edge extends it. A fleet of thousands costs a
+// screenful of rows, not a row each per event.
 const RAIL_ROWS = 300;
-const rail = { shapeGen: -1, drawn: -1, selected: null, rows: [], index: new Map(), start: 0, end: 0, key: '' };
+// One index of the fleet, every bot and swarm in tree order, rebuilt only when its shape changes: the
+// list's levels, the finder and the arrow keys all read it.
+const fleet = { shapeGen: -1, rows: [], at: new Map() };
+function fleetIndex() {
+  if (fleet.shapeGen !== S.shapeGen) {
+    fleet.rows = tree(); fleet.at = new Map(); fleet.rows.forEach((n, i) => { const k = n.key ?? n.b?.name; if (k) fleet.at.set(k, i); });
+    fleet.shapeGen = S.shapeGen; rail.open = null;
+  }
+  return fleet;
+}
+const rail = { open: null, rows: [], index: new Map(), drawn: '', start: 0, end: 0, key: '' };
 function railRows() {
-  if (rail.shapeGen !== S.shapeGen) {
-    rail.rows = tree(); rail.index = new Map(); rail.rows.forEach((n, i) => { const k = n.key ?? n.b?.name; if (k) rail.index.set(k, i); });
-    rail.shapeGen = S.shapeGen; rail.key = '';
+  fleetIndex();
+  if (rail.open !== S.selected) {
+    rail.rows = levelOf(S.selected); rail.index = new Map(); rail.rows.forEach((n, i) => { const k = n.key ?? n.b?.name; if (k) rail.index.set(k, i); });
+    rail.open = S.selected; rail.key = '';
   }
   return rail.rows;
 }
-function renderRail() {
-  const recenter = rail.drawn !== S.shapeGen || rail.selected !== S.selected;
-  const rows = railRows(); const el = $('bots');
-  const sel = rail.index.get(S.selected) ?? 0;
-  const key = () => `${S.shapeGen}|${S.selected}|${S.ui.side}|${rail.start}|${rail.end}`;
-  if (rail.key !== key()) {
-    if (recenter) { rail.start = Math.max(0, sel - RAIL_ROWS / 2); rail.end = Math.min(rows.length, rail.start + RAIL_ROWS); }
-    rail.selected = S.selected; rail.drawn = S.shapeGen;
-    rail.key = key();
-    const above = rail.start ? `<div class="botrow more">… ${rail.start} above</div>` : '';
-    const below = rail.end < rows.length ? `<div class="botrow more">… ${rows.length - rail.end} below</div>` : '';
-    el.innerHTML = above + rows.slice(rail.start, rail.end).map((n) => botRowHTML(n, (n.key ?? n.b?.name) === S.selected)).join('') + below;
-    el.dataset.key = rail.key;
+// The rows one level below `open`: those after it one deeper, until the tree comes back up to its
+// depth. Each counts the rows one further down, so the list says which go deeper.
+function levelOf(open) {
+  const { rows: all } = fleet, at = open ? fleet.at.get(open) : -1;
+  if (at === undefined) return [];
+  const depth = open ? all[at].depth : -1, out = [];
+  for (let i = at + 1; i < all.length; i++) {
+    const n = all[i];
+    if (n.label) { if (open) break; out.push(n); continue; }
+    if (n.depth <= depth) break;
+    if (n.depth === depth + 1) out.push({ ...n, kids: 0 }); else if (n.depth === depth + 2) out.at(-1).kids += 1;
   }
+  return out;
+}
+const levelName = () => !S.selected ? (rail.rows.some((n) => n.head != null) ? 'projects' : 'agents') : swarmOf(S.selected) ? 'agents' : leadProject(S.selected) ? 'threads' : 'helpers';
+function renderRail() {
+  const rows = railRows(), el = $('bots');
+  const level = `${S.shapeGen}|${S.selected}`;
+  const key = () => `${level}|${S.ui.side}|${rail.start}|${rail.end}`;
+  if (rail.key === key()) return;
+  // A new level starts at its top, or around the row beside.
+  if (rail.drawn !== level) {
+    const at = rail.index.get(S.ui.side) ?? 0;
+    rail.start = Math.max(0, at - RAIL_ROWS / 2); rail.end = Math.min(rows.length, rail.start + RAIL_ROWS);
+    $('level').textContent = levelName();
+  }
+  rail.drawn = level; rail.key = key();
+  const above = rail.start ? `<div class="botrow more">… ${rail.start} above</div>` : '';
+  const below = rail.end < rows.length ? `<div class="botrow more">… ${rows.length - rail.end} below</div>` : '';
+  const none = rows.length ? '' : `<div class="pnote">${!S.selected ? 'No projects yet.' : leadProject(S.selected) ? 'No threads yet.' : 'No helpers.'}</div>`;
+  el.innerHTML = none + above + rows.slice(rail.start, rail.end).map(botRowHTML).join('') + below;
+  el.dataset.key = rail.key;
 }
 // A bot's row, replaced in place when its status changes; nothing if it is outside the window.
 function patchRailRow(name) {
   if (!S.ui.rail) return;
   const i = rail.index.get(name); if (i === undefined || i < rail.start || i >= rail.end) return;
   const el = $('bots'); const old = el.querySelector(`.botrow[data-bot="${cssEsc(name)}"]`); if (!old) return;
-  old.outerHTML = botRowHTML(rail.rows[i], name === S.selected);
+  old.outerHTML = botRowHTML(rail.rows[i]);
 }
 $('bots').addEventListener('scroll', () => {
   const el = $('bots'); const rows = rail.rows, previousStart = rail.start; let moved = false;
@@ -1955,22 +2031,32 @@ $('bots').addEventListener('scroll', () => {
     if (before != null && after != null) el.scrollTop = top + after - before;
   }
 });
-// A project's row is its coordinator: click it to talk to the coordinator; the chevron folds its tasks.
-function botRowHTML(n, sel) {
+// A row is one agent: a click looks in beside, a double-click opens it as a tab. A project's row is
+// its coordinator. The count is how many sit one level further down.
+function botRowHTML(n) {
   if (n.label) return `<div class="sblabel">${esc(n.label)}</div>`;
+  const kids = n.kids ? `<span class="meta">${n.kids}</span>` : '';
   if (n.swarm) {
     const sw = n.swarm, st = swarmStatus(sw);
-    return `<div class="botrow${sel ? ' sel' : ''}" data-bot="${esc(n.key)}" role="button" tabindex="0"><span class="tree">${n.prefix}</span><span class="glyph ${st}">${glyphOf(st)}</span><span class="n">⁂ ${esc(memberShort(sw, sw.name))}</span><span class="meta">${sw.members.length}</span><span class="acts">${moreButton(n.key)}</span></div>`;
+    return `<div class="botrow" data-bot="${esc(n.key)}" role="button" tabindex="0"><span class="glyph ${st}">${glyphOf(st)}</span><span class="n">⁂ ${esc(memberShort(sw, sw.name))}</span><span class="meta">${sw.members.length}</span><span class="acts">${moreButton(n.key)}</span></div>`;
   }
-  const b = n.b, acts = `<span class="acts">${moreButton(b.name)}</span>`;
-  const st = shownStatus(b), glyph = `<span class="glyph ${st}">${glyphOf(st)}</span>`;
-  if (n.head != null) {
-    const folded = S.ui.folded.has(n.head);
-    const chev = n.tasks ? `<button type="button" class="chev" data-act="fold" data-v="${esc(n.head)}" aria-label="${folded ? 'Show' : 'Hide'} tasks">${folded ? '▸' : '▾'}</button>` : '<span class="chev"></span>';
-    return `<div class="botrow proj${sel ? ' sel' : ''}" data-bot="${esc(b.name)}" role="button" tabindex="0">${chev}${glyph}<span class="n">${esc(n.head)}</span>${acts}</div>`;
-  }
-  const beside = S.ui.side === b.name ? ' beside' : '';
-  return `<div class="botrow${sel ? ' sel' : ''}${beside}" data-bot="${esc(b.name)}" role="button" tabindex="0"><span class="tree">${n.prefix}</span>${glyph}<span class="n">${esc(shortName(b))}</span>${acts}</div>`;
+  const b = n.b, st = shownStatus(b), beside = S.ui.side === b.name ? ' beside' : '';
+  return `<div class="botrow${n.head != null ? ' proj' : ''}${beside}" data-bot="${esc(b.name)}" role="button" tabindex="0"><span class="glyph ${st}">${glyphOf(st)}</span><span class="n">${esc(n.head ?? shortName(b))}</span>${kids}<span class="acts">${moreButton(b.name)}</span></div>`;
+}
+// ---------- tabs ----------
+// Home, then a tab for each agent opened full screen. They are redrawn only when one opens, closes,
+// is chosen, or changes state or name (a task whose coordinator is gone is named in full).
+const tabState = (k) => { const sw = swarmOf(k); return sw ? swarmStatus(sw) : shownStatus(bot(k)); };
+function renderTabs() {
+  const tabs = S.ui.tabs.filter(isOpen), states = tabs.map(tabState), labels = tabs.map(keyLabel);
+  const key = `${S.selected}|${tabs.map((k, i) => `${k}\u0000${states[i]}\u0000${labels[i]}`).join('\u0000')}`;
+  const el = $('tabs'); if (el.dataset.k === key) return; el.dataset.k = key;
+  const home = `<button type="button" class="homebtn${S.selected ? '' : ' on'}" data-act="home" title="Home">⌂ Home</button>`;
+  el.innerHTML = home + (tabs.length ? '<span class="tabsep"></span>' : '') + tabs.map((k, i) => {
+    const on = k === S.selected, label = esc(labels[i]);
+    return `<div class="wtab${on ? ' on' : ''}" role="tab" aria-selected="${on}" tabindex="0" data-tab="${esc(k)}" title="${esc(k)}"><span class="glyph ${states[i]}">${glyphOf(states[i])}</span><span class="tl">${label}</span><button type="button" class="x" data-act="close-tab" data-who="${esc(k)}" aria-label="Close ${label}">×</button></div>`;
+  }).join('');  // Past the bar's width the tabs scroll, and the one on screen stays in view.
+  el.querySelector('.wtab.on')?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
 }
 function peers() { return (S.transcripts.get(S.selected)?.peers ?? []).filter((who) => S.bots.has(who)); }
 function keybarHTML(b) {
@@ -2004,8 +2090,12 @@ function render() {
   app.classList.toggle('rail', S.ui.rail); app.classList.toggle('side', !!side || !!S.ui.file);
   followDrafts();
   markSeen();
+  renderTabs();
   if (sw) { renderSwarmHead($('title'), sw); renderSwarm($('log'), sw); }
-  else { renderHead($('title'), b, 'main'); if (b) renderTranscript($('log'), b.name); else { $('log').innerHTML = ''; $('log').dataset.key = ''; } }
+  else { renderHead($('title'), b, 'main'); if (b) renderTranscript($('log'), b.name); else renderHome($('log')); }
+  // New project belongs to Home's list.
+  const home = !S.selected; if (!home && !$('projform').hidden) showNewProject(false);
+  $('newproj').hidden = !home || !$('projform').hidden;
   if (S.ui.rail) renderRail();
   if (S.ui.file) renderFile();
   else if (side) { renderHead($('sidetitle'), side, 'side'); renderTranscript($('side'), side.name); }
@@ -2016,6 +2106,11 @@ function render() {
   if (S.ui.picker) renderPicker();
   refreshMenu();
 }
+// Home has no chat of its own yet: it says where things are.
+function renderHome(el) {
+  const key = `home|${S.bots.size > 0}`; if (el.dataset.key === key) return; el.dataset.key = key; el.dataset.who = '';
+  el.innerHTML = `<div class="home">${S.bots.size ? 'Projects and agents are in the list. Click one to look in, double-click to open it as a tab. ⌘K finds any agent.' : 'No agents yet. ＋ New project starts one, or /new NAME PROVIDER/MODEL here.'}</div>`;
+}
 // Once a second, while anything runs: the clocks on cards and run lines, in place. The activity
 // check is cached per fleet change, so a quiet fleet of any size costs nothing here.
 let activeAt = -1, active = false;
@@ -2025,7 +2120,7 @@ setInterval(() => { if (S.attached && anyActive()) { refreshLive($('log')); if (
 // ---------- picker ----------
 function pickerRows() {
   const q = $('pickerq').value.trim().toLowerCase();
-  return tree(true).filter((n) => n.b).map((n) => ({ ...n, i: q ? n.b.name.toLowerCase().indexOf(q) : -1 })).filter((r) => !q || r.i >= 0);
+  return fleetIndex().rows.filter((n) => n.b).map((n) => ({ ...n, i: q ? n.b.name.toLowerCase().indexOf(q) : -1 })).filter((r) => !q || r.i >= 0);
 }
 const PICKER_ROWS = 200;
 function renderPicker() {
@@ -2041,13 +2136,13 @@ function renderPicker() {
 }
 let pickerPane = 'main';
 function openPicker() { pickerPane = paneOf(document.activeElement, menuPane); closeMenu(); S.ui.picker = true; S.ui.pickerSel = 0; $('pickerq').value = ''; $('pickerwrap').classList.add('on'); render(); $('pickerq').focus(); }
-// A pick opens its bot alone, so focus goes to the main composer; Escape goes back where it was.
+// A pick opens its bot in a tab, so focus goes to the main composer; Escape goes back where it was.
 function closePicker(pane = pickerPane) { S.ui.picker = false; $('pickerwrap').classList.remove('on'); render(); $(PANE[S.ui.side ? pane : 'main'].input).focus(); }
 let helpPane = 'main';
 async function showHelp(pane = 'main') {
   helpPane = pane;
   // Open at once so Esc closes it; the list is read now, so an edited ~/.agent/models shows without a restart.
-  const shown = S.ui.help = {}; const text = (models) => { $('helptext').innerHTML = `<b>keys</b>\n ^k   find a bot        ^b   sidebar\n ^p   next task beside  Esc  close beside · stop\n ^o   all steps         ^d   detach (close)\n ↑ ↓  previous / next bot   ^,   settings\n Enter sends · Shift-Enter a new line\n\n /new NAME PROVIDER/MODEL [EFFORT]  create a bot\n${models}\n<i>any key closes this</i>`; };
+  const shown = S.ui.help = {}; const text = (models) => { $('helptext').innerHTML = `<b>keys</b>\n ^k   find an agent     ^b   sidebar\n ^p   next task beside  Esc  close beside · stop\n ^o   all steps         ^d   detach (close)\n ↑ ↓  previous / next bot   ^,   settings\n Enter sends · Shift-Enter a new line\n A row: click to look in, double-click for a tab\n\n /new NAME PROVIDER/MODEL [EFFORT]  create a bot\n${models}\n<i>any key closes this</i>`; };
   text('   reading ~/.agent/models'); $('helpwrap').classList.add('on');
   let models; try { const list = await Daemon.models(); models = list.length ? list.map((m) => `   ${esc(m.id)}`).join('\n') : '   none listed: Settings lists your providers\' models'; } catch (e) { models = `   ${esc(String(e?.message ?? e))}`; }
   if (S.ui.help === shown) text(models);
@@ -2094,7 +2189,9 @@ function refreshMenu() {
 // Keep, which turns a side chat into a task, is not built yet.
 function botMenuItems(name) {
   const sw = swarmOf(name);
+  const tab = { act: 'open-tab', who: name, label: 'Open as tab', hint: 'double-click', disabled: S.ui.tabs.includes(name) };
   if (sw) return [
+    tab, { sep: true },
     { act: 'swarm-stop', who: name, label: 'Stop every agent', disabled: sw.stopped && !sw.members.some((m) => memberBot(sw, m)?.runningTurn != null) },
     // A stopped swarm takes no new agent until your next post resumes it.
     { act: 'swarm-add', who: name, label: 'Add an agent', disabled: sw.stopped, hint: sw.stopped ? 'post to resume' : '' },
@@ -2102,6 +2199,7 @@ function botMenuItems(name) {
   const b = bot(name); if (!b) return [];
   const busy = isActive(b.status);
   return [
+    tab, { sep: true },
     // A swarm runs on this machine: its board is the app's files and its agents run the app's scripts.
     ...(leadProject(name) ? [{ act: 'new-swarm', who: name, label: 'New swarm', hint: S.config?.host ? 'local only' : '⁂', disabled: !!S.config?.host }, { sep: true }] : []),
     { act: 'side-chat', who: name, label: 'Side chat', hint: '⑂', disabled: b.id == null },
@@ -2189,7 +2287,7 @@ async function submit(text, pane = 'main', to = PANE[pane].bot()) {
     const session = S.session;
     const record = await Daemon.request('create', { bot: name, workspace: S.config.workspace, model: m, ...(effort ? { reasoning: effort } : {}), instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: S.config.tools });
     await enqueue(() => { if (S.session === session) seat(record, session); });
-    await openOnly(name); toast(`created ${name} · ${policy.note}`); return;
+    await go(name); toast(`created ${name} · ${policy.note}`); return;
   }
   if (text === '/help' || text === '?') { showHelp(pane); return; }
   const sw = pane === 'main' && swarmOf(to);
@@ -2235,7 +2333,7 @@ async function fork(name) {
   const record = await Daemon.request('fork', { source: name, bot: copy, ...(parent ? { created_by: parent.name, created_by_id: parent.id } : {}) });
   await enqueue(() => { if (S.session === session) seat(record, session); });
   S.shapeGen += 1;
-  await openBeside(copy);
+  await go(copy, 'beside');
 }
 // A side chat is a fork of a bot, running or not, from its newest finished round, nested under it
 // and opened beside; the source is untouched. It has its source's tools and works in its source's
@@ -2254,7 +2352,7 @@ async function sideChat(name, text = '') {
     try { await Daemon.request('submit', { bot: copy, bot_id: record.id, request_id: `app-${crypto.randomUUID()}`, prompt: text, delivery: 'reject', ...home(record) }); }
     catch (err) { failed = err instanceof Error ? err : new Error(String(err)); }
   }
-  if (S.ui.side !== copy) await openBeside(copy);
+  if (S.ui.side !== copy) await go(copy, 'beside');
   if (!failed) return;
   // The side chat exists, so an unsent first message waits in its composer, not its source's.
   const pane = Object.values(PANE).find((p) => p.bot() === copy), input = pane && $(pane.input);
@@ -2275,7 +2373,7 @@ async function createProject(dir, picked = null, effort = null) {
   if (existing) {
     if (existing.workspace !== info.dir) throw new Error(`${info.coordinator} already belongs to ${existing.workspace ?? 'another folder'}`);
     if (!info.file) await Daemon.writeProject({ dir: info.dir, name: info.name, model: existing.model, reasoning: existing.reasoning ?? null });
-    await openOnly(info.coordinator); return;
+    await go(info.coordinator); return;
   }
   const policy = await Daemon.policy(info.dir, 'coordinator');
   // A folder that already has a project file keeps its model and effort; a new one takes the model
@@ -2290,7 +2388,7 @@ async function createProject(dir, picked = null, effort = null) {
   const record = await Daemon.request('create', { bot: info.coordinator, workspace: info.dir, model, ...(reasoning ? { reasoning } : {}), instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: policy.tools ?? S.config.tools });
   await enqueue(() => { if (S.session === session) seat(record, session); });
   if (!info.file) await Daemon.writeProject({ dir: info.dir, name: info.name, model, reasoning });
-  await openOnly(info.coordinator); toast(`project ${info.name} · ${policy.note}`);
+  await go(info.coordinator); toast(`project ${info.name} · ${policy.note}`);
 }
 function detach() { save(); Daemon.close(); }
 
@@ -2638,41 +2736,49 @@ function renderSetup() {
   for (const el of box.querySelectorAll('input, select')) { const v = kept.get(el.name || el.id); if (v !== undefined) el.value = v; if (focused && (el.name || el.id) === focused) el.focus(); }
 }
 
-// ---------- opening threads ----------
-// From the sidebar or the finder a thread takes the whole window, with nothing beside it.
-async function openOnly(name) {
-  if (!isOpen(name)) return;
-  S.selected = name; S.autoSelect = false; S.ui.side = null;
-  const sw = swarmOf(name);
-  const p = (sw ?? bot(name)).project; if (p && S.ui.folded.delete(p)) S.shapeGen += 1;
-  if (sw) { readBoard(sw); readUsage(sw); }
+// ---------- moving around ----------
+// Every move goes through `go`: rows, Home, tabs, crumbs, the finder, keys, and what the app opens on its
+// own. It first drops a row's pending look, so the newest choice wins. `how` says where `name` goes:
+// - 'here': full screen. An agent already in a tab is that tab; from Home it opens a new tab; otherwise
+//   it takes the tab in view, a level up or down. '' is Home.
+// - 'tab': full screen in a new tab.
+// - 'beside': beside what is open, with its own composer; the one already beside closes instead.
+// - 'close': its tab closes, and an open one hands the window to the tab before it, or Home.
+async function go(name, how = 'here') {
+  clearTimeout(rowLook.timer); rowLook.who = rowLook.before = null;
+  const tabs = S.ui.tabs;
+  if (how === 'close') {
+    const i = tabs.indexOf(name); if (i < 0) return;
+    tabs.splice(i, 1);
+    if (S.selected !== name) { render(); save(); return; }
+    name = i > 0 ? tabs[i - 1] : ''; how = 'here';
+  }
+  if (how === 'beside') {
+    if (!S.bots.has(name) || name === S.selected) return;
+    S.ui.side = S.ui.side === name ? null : name;
+  } else {
+    if (name && !isOpen(name)) return;
+    const at = tabs.indexOf(S.selected);
+    if (name && !tabs.includes(name)) { if (how === 'tab' || at < 0) tabs.push(name); else tabs[at] = name; }
+    S.selected = name; S.ui.side = null;
+    const sw = swarmOf(name); if (sw) { readBoard(sw); readUsage(sw); }
+  }
   await enqueue(loadVisible); render(); save();
+  focusInput(S.ui.side && how === 'beside' ? 'side' : 'main');
 }
-// A task card opens its bot beside the thread; clicking it again closes it.
-async function openBeside(name) {
-  if (!S.bots.has(name) || name === S.selected) return;
-  S.ui.side = S.ui.side === name ? null : name;
-  await enqueue(loadVisible); render(); save();
-  focusInput(S.ui.side ? 'side' : 'main');
+// A tab whose agent is gone shows `to` instead, or closes when that is Home or already a tab.
+function retab(name, to) {
+  const tabs = S.ui.tabs, i = tabs.indexOf(name); if (i < 0) return;
+  if (to && !tabs.includes(to)) tabs[i] = to; else tabs.splice(i, 1);
+  if (S.selected === name) S.selected = to && tabs.includes(to) ? to : '';
 }
 // Ctrl-P puts the next peer beside, with its own draft.
 async function nextBeside() {
   const ps = peers().filter((who) => who !== S.selected); if (!ps.length) return;
-  const next = ps[(ps.indexOf(S.ui.side) + 1) % ps.length]; if (next === S.ui.side) return;
-  S.ui.side = next;
-  await enqueue(loadVisible); render(); save(); focusInput('side');
+  const next = ps[(ps.indexOf(S.ui.side) + 1) % ps.length]; if (next !== S.ui.side) await go(next, 'beside');
 }
-// Drafts travel with their bots.
-function swap() {
-  if (!S.ui.side) return;
-  // A swarm has no place beside, so its agent takes the window alone.
-  if (swarmOf(S.selected)) { openOnly(S.ui.side); return; }
-  [S.selected, S.ui.side] = [S.ui.side, S.selected];
-  const p = bot(S.selected).project; if (p && S.ui.folded.delete(p)) S.shapeGen += 1;
-  render(); save(); focusInput('main');
-}
-function closeSide() { if (!S.ui.side) return; S.ui.side = null; render(); save(); focusInput('main'); }
-function focusInput(pane) { const el = $(PANE[pane].input); if (el) setTimeout(() => el.focus({ preventScroll: true }), 0); }
+// Late, after a load: by then the finder or a sheet may have opened, and it keeps the keyboard.
+function focusInput(pane) { const el = $(PANE[pane].input); if (el) setTimeout(() => { if (!covered()) el.focus({ preventScroll: true }); }, 0); }
 function showNewProject(on) {
   $('projform').hidden = !on; $('newproj').hidden = on;
   if (!on) return;
@@ -2712,9 +2818,9 @@ $('pickerq').addEventListener('keydown', async (e) => {
   if (e.key === 'Escape') { closePicker(); e.preventDefault(); }
   else if (e.key === 'ArrowDown' || (e.ctrlKey && e.key === 'n')) { S.ui.pickerSel = Math.min(rows.length - 1, S.ui.pickerSel + 1); renderPicker(); e.preventDefault(); }
   else if (e.key === 'ArrowUp' || (e.ctrlKey && e.key === 'p')) { S.ui.pickerSel = Math.max(0, S.ui.pickerSel - 1); renderPicker(); e.preventDefault(); }
-  else if (e.key === 'Enter') { const r = rows[S.ui.pickerSel]; closePicker('main'); if (r) await openOnly(r.b.name); e.preventDefault(); }
+  else if (e.key === 'Enter') { const r = rows[S.ui.pickerSel]; closePicker('main'); if (r) await go(r.b.name, 'tab'); e.preventDefault(); }
 });
-$('pickerlist').addEventListener('click', async (e) => { const r = e.target.closest('[data-pick]'); if (r) { closePicker('main'); await openOnly(r.dataset.pick); } });
+$('pickerlist').addEventListener('click', async (e) => { const r = e.target.closest('[data-pick]'); if (r) { closePicker('main'); await go(r.dataset.pick, 'tab'); } });
 const inputIds = new Set(['input', 'sideinput', 'projdir', 'pickerq']);
 document.addEventListener('keydown', async (e) => {
   if (S.ui.help) { hideHelp(); e.preventDefault(); return; }
@@ -2725,15 +2831,25 @@ document.addEventListener('keydown', async (e) => {
   if (S.ui.picker || e.target.id === 'projdir' || e.target.id === 'projsel' || e.target.id === 'projeffort' || e.target.id === 'pickerq') return;
   const k = e.key, ctrl = e.ctrlKey || e.metaKey;
   if (S.ui.menu) { if (k === 'Escape') { closeMenu(); e.preventDefault(); } return; }
+  // A tab is chosen with Enter or Space, as a button is; its close button keeps its own keys.
+  const tab = e.target.closest?.('[data-tab]');
+  if (tab && (k === 'Enter' || k === ' ') && !e.target.closest('[data-act]')) { await go(tab.dataset.tab); e.preventDefault(); return; }
   if (ctrl && k === 'k') { openPicker(); e.preventDefault(); return; }
   // A hidden sidebar patches no rows, so it draws them all again when it opens.
   if (ctrl && k === 'b') { S.ui.rail = !S.ui.rail; if (S.ui.rail) rail.key = ''; render(); save(); e.preventDefault(); return; }
   if (ctrl && k === 'd') { detach(); e.preventDefault(); return; }
   if (ctrl && k === 'o') { S.ui.steps = !S.ui.steps; render(); save(); e.preventDefault(); return; }
   if (ctrl && k === 'p') { await nextBeside(); e.preventDefault(); return; }
-  if (k === 'Escape') { if (S.ui.file) closeFile(); else if (S.ui.side) closeSide(); else await interrupt(); e.preventDefault(); return; }
+  if (k === 'Escape') { if (S.ui.file) closeFile(); else if (S.ui.side) await go(S.ui.side, 'beside'); else await interrupt(); e.preventDefault(); return; }
   const empty = e.target.id === 'input' && $('input').value === '';
-  if (empty && (k === 'ArrowUp' || k === 'ArrowDown')) { const names = tree().filter((n) => n.b).map((n) => n.b.name); let i = names.indexOf(S.selected); if (i >= 0) { i = (i + (k === 'ArrowDown' ? 1 : names.length - 1)) % names.length; await openOnly(names[i]); } e.preventDefault(); return; }
+  // Up and down step through every agent in order; from Home, down is the first and up the last.
+  if (empty && (k === 'ArrowUp' || k === 'ArrowDown')) {
+    const names = fleetIndex().rows.filter((n) => n.b).map((n) => n.b.name), down = k === 'ArrowDown';
+    let i = names.indexOf(S.selected);
+    i = i >= 0 ? (i + (down ? 1 : names.length - 1)) % names.length : S.selected ? -1 : down ? 0 : names.length - 1;
+    if (i >= 0) await go(names[i]);
+    e.preventDefault(); return;
+  }
   if (!inputIds.has(e.target.id) && k.length === 1 && !ctrl && !e.altKey) $('input').focus();
 });
 function failed(err) {
@@ -2765,10 +2881,14 @@ async function act(el) {
     case 'delete': showMenu([{ act: 'delete-yes', who, label: `Delete ${shortName(bot(who))}`, danger: true }, { act: 'close-menu', label: 'Cancel' }], menuAnchor ?? { rect }); return;
     case 'delete-yes': await remove(who); return;
     case 'steps': S.ui.steps = !S.ui.steps; render(); save(); return;
-    case 'fold': if (!S.ui.folded.delete(v)) S.ui.folded.add(v); S.shapeGen += 1; render(); save(); return;
-    case 'open': await openOnly(who); return;
-    case 'swap': swap(); return;
-    case 'close-side': closeSide(); return;
+    case 'open': await go(who); return;
+    case 'home': await go(''); return;
+    case 'open-tab': await go(who, 'tab'); return;
+    case 'close-tab': await go(who, 'close'); return;
+    case 'find': openPicker(); return;
+    // What is beside goes full screen, with its draft; ← closes it.
+    case 'full': if (S.ui.side) await go(S.ui.side); return;
+    case 'close-side': if (S.ui.side) await go(S.ui.side, 'beside'); return;
     case 'close-file': closeFile(); return;
     case 'new-project': showNewProject(true); return;
     case 'new-swarm': await openSwarmSheet(leadProject(who)); return;
@@ -2806,28 +2926,55 @@ async function act(el) {
   }
 }
 document.addEventListener('click', async (e) => {
+  // The click right after a row's names that row: the system counts a double-click by place and time,
+  // not by what is under the pointer, so the second can land on the look the first opened. Any click is
+  // a newer choice than a pending look.
+  const first = rowLook.who, before = rowLook.before; rowLook.who = rowLook.before = null;
+  clearTimeout(rowLook.timer);
   if (S.ui.help) { hideHelp(); return; }
   if (e.target.closest?.('#sheetwrap') && !e.target.closest('#sheet')) { closeSheet(); return; }
   if (e.target.closest('#pickerwrap') && !e.target.closest('.picker')) { closePicker(); return; }
+  // A double-click opens the row as a new tab, from where the window was before its first click.
+  if (e.detail === 2 && first) {
+    closeMenu();
+    if (before) { S.ui.tabs = before.tabs.filter(isOpen); S.selected = isOpen(before.selected) ? before.selected : ''; }
+    try { await go(first, 'tab'); } catch (err) { failed(err); }
+    return;
+  }
   if (Rich.click(e)) { closeMenu(); return; }
   const button = e.target.closest('[data-act]');
   closeMenu();
   if (button) { if (!button.disabled) { try { await act(button); } catch (err) { failed(err); } } return; }
   if (e.target.closest('#setupwrap')) return;
   if (e.target.closest('#menu')) return;
-  const step = e.target.closest('[data-out], [data-run]'), task = e.target.closest('[data-task]'), row = e.target.closest('[data-bot]');
+  const step = e.target.closest('[data-out], [data-run]'), task = e.target.closest('[data-task]'), row = e.target.closest('[data-bot]'), tab = e.target.closest('[data-tab]');
   if (step) toggleStep(step);
-  // Opening a task beside puts the keyboard where openBeside chose.
-  else if (task) { await openBeside(task.dataset.task); return; }
-  else if (row) await openOnly(row.dataset.bot);
+  else if (task) { await go(task.dataset.task, 'beside'); return; }
+  // A row waits a beat, so a double-click can claim it, then looks in beside; a swarm has no place
+  // beside, so it opens in the tab in view.
+  else if (row) {
+    if (e.detail > 1) return;
+    const who = rowLook.who = row.dataset.bot;
+    // The look is a move like any other; the row stays named, with where the window was, until the next.
+    rowLook.timer = setTimeout(() => {
+      const before = { tabs: [...S.ui.tabs], selected: S.selected };
+      go(who, swarmOf(who) ? 'here' : 'beside').catch(failed);
+      rowLook.who = who; rowLook.before = before;
+    }, DOUBLE_CLICK_MS);
+    return;
+  }
+  else if (tab) await go(tab.dataset.tab);
   // Clicks return the keyboard to the pane's composer, unless they selected text to copy.
   if (!e.target.closest('input, textarea, form') && window.getSelection?.()?.isCollapsed !== false) focusInput(e.target.closest('.pane.side') && !S.ui.file ? 'side' : 'main');
 });
+// A row's pending look: its timer, its row, and once it ran, where the window was before it.
+const DOUBLE_CLICK_MS = 230;
+const rowLook = { timer: null, who: null, before: null };
 document.addEventListener('contextmenu', (e) => {
   // A link's own menu would follow it in the window, past the opener that sends it to the browser.
   if (e.target.closest('a')) { e.preventDefault(); return; }
-  const t = e.target.closest('[data-bot], [data-task]'); if (!t) return;
-  const who = t.dataset.bot ?? t.dataset.task;
+  const t = e.target.closest('[data-bot], [data-task], [data-tab]'); if (!t) return;
+  const who = t.dataset.bot ?? t.dataset.task ?? t.dataset.tab;
   e.preventDefault(); closeMenu(); showMenu(botMenuItems(who), { x: e.clientX, y: e.clientY }, who);
 });
 

@@ -13,8 +13,40 @@ covered it, so one state model exists, not two.
 
 ## Screenshots
 
-Demo mode in headless Chromium, 1280×780, captured 2026-09-28. The data is
-the synthetic `demo` project.
+Demo mode in headless Chromium, 1280×780. The data is the synthetic `demo`
+project.
+
+### Navigation
+
+Captured 2026-10-09. Home: the list on the right is one level below what is
+open, here the projects.
+
+![Home with its projects listed](app/nav-home.png)
+
+A click on a row looks in beside, with its own composer; ← goes back to the
+list and ⤢ Full screen opens it.
+
+![The demo coordinator open beside Home](app/nav-peek.png)
+
+The project full screen, in a tab of its own: the crumbs go back up and the
+list holds its threads.
+
+![The demo project in a tab, its threads in the list](app/nav-project.png)
+
+A double-click on a thread opens it as another tab; its list holds what it
+made.
+
+![build in a second tab, its reviewer in the list](app/nav-thread.png)
+
+⌘K finds any agent and opens it as a tab.
+
+![The finder](app/nav-find.png)
+![A third tab from the finder](app/nav-tabs.png)
+
+### Earlier
+
+Captured 2026-09-28, before the navigation above: the list was on the left
+and held the whole tree.
 
 The lead splits the work, build opens beside it, then build's ⋯ menu.
 
@@ -402,9 +434,13 @@ socket is resolved the way the CLI and the daemon resolve it (the shared
 client crate's rendezvous), so a deep store path meets the same short socket.
 The page draws with the machine's own monospace face and fetches nothing.
 Closing the window is detaching; the daemon and its bots continue. The page
-remembers the thread on screen, the one beside it, the sidebar, folded
-projects, model picks and the steps fold per store and workspace in the
-webview's local storage, and restores them on the next start. The store is
+remembers the open tabs and the one on screen, the agent beside, the
+sidebar, model picks and the steps fold per store and workspace in the
+webview's local storage, and restores them on the next start. Each is kept
+with its bot's id and the id of what is a level above it, so a tab whose agent
+was deleted while the window was closed comes back as that level above, as it
+would have moved live, and one whose name now holds another bot does not come
+back. The store is
 the identity the daemon announces when the window attaches, so two hosts, or
 a host and this machine, never share what a window remembers, whatever socket
 reaches them. When the socket a window reattaches to answers with another
@@ -415,9 +451,10 @@ steer pick is remembered for every window. If the daemon is unreachable or close
 and retries every two seconds. Only one attachment runs at a time, including
 the snapshot pages. A connected peer must send its ready line within five seconds.
 
-Keys: `^k` find a bot, `^b` sidebar, `^,` settings, `^p` next task beside, `^o` every
+Keys: `^k` find an agent and open it as a tab, `^b` sidebar, `^,` settings, `^p` next task beside, `^o` every
 run's thoughts and output, `Esc` close the side pane then stop, `↑` `↓` on an
-empty message to move between bots, `^d` close the window, Enter to send and
+empty message to move between bots (from Home, `↓` opens the first and `↑` the
+last), Enter or Space on a focused tab to choose it, `^d` close the window, Enter to send and
 Shift-Enter for a new line, `/new NAME PROVIDER/MODEL` to create a bot, `?`
 on an empty message for the list and the models in `~/.agent/models`, read
 each time. `⌘` works where `^` does.
@@ -629,8 +666,8 @@ daemon learns nothing about projects; everything here is client work.
   and `.agents/project.toml` (name, coordinator, model; mechanics only). The
   sidebar lists every coordinator in the store as a project, with its tasks
   under it: the coordinator's `created_by` lineage, plus any root bot named
-  `<project>.<task>`. Bots in no project follow. A project row opens its
-  coordinator; its chevron folds the tasks. **＋ New project** takes a
+  `<project>.<task>`. Bots in no project follow. **＋ New project**, under
+  Home's list, takes a
   folder and a model from `~/.agent/models` under its provider's name (the
   last one picked comes first), reads its `project.toml` (unknown keys are refused) or names the
   project after the folder, creates the coordinator there with the folder's
@@ -640,9 +677,31 @@ daemon learns nothing about projects; everything here is client work.
   coordinator is opened if it works in that folder (and the file it lacks is
   written with its model); one in another folder is a name collision,
   reported and not opened.
-- **Panes.** A sidebar row opens that thread alone. A task card opens its
-  bot in a side pane with its own composer; ⤢ swaps it into full view, ✕ or
-  `Esc` closes it.
+- **Navigation.** Home, then a tab for each agent opened full screen, on a
+  bar of floating tabs. The list on the right holds one level below what is
+  open: at Home the projects and the bots in none, in a project its threads
+  and swarms, in a thread what it made, in a swarm its agents, and in a swarm
+  agent what it made; each row
+  counts the rows one further down. A click on a row looks in beside, in
+  place of the list, with its own composer (a beat later, so a double-click
+  can claim it); a double-click, or "Open as tab" in its ⋯, opens a tab. The
+  double-click is the click the system counts as second, so it holds when the
+  look has already replaced the row, and it opens the tab from where the
+  window was before the first click. Every move (rows, Home, tabs, crumbs,
+  the finder, keys) goes through one function that first cancels a row's
+  pending look, so any later click or key wins over it. A
+  task card in a chat opens beside the same way. ⤢ Full screen takes the tab
+  on screen a level down; from Home it opens a tab. The crumbs in the head
+  (Home › project › thread) go back up, and the window's title says the same.
+  An agent already in a tab is that tab. A closed tab hands the window to the
+  one before it, and the first to Home; a deleted agent's tab goes up to what made it. Tabs, and the
+  agent beside, are saved with the bot's id and come back only for that
+  identity, never for a new bot under the old name. ← or `Esc`
+  closes what is beside. One index of the fleet, every bot in tree order with
+  a swarm's agents and what they made under its row, is rebuilt when the
+  fleet's shape changes; the list's levels, the finder (⌘K) and the arrow
+  keys read it. The list draws a window of rows cut from it in one pass over
+  the open agent's subtree, so a large level costs a screenful of rows.
 - **Composer.** The model chip lists `~/.agent/models`, read on each open,
   each provider under its own heading.
   Models of any provider in the bot's family (known from the fleet's bot
@@ -1603,6 +1662,19 @@ projects and tasks in the sidebar, a card opened beside and swapped, the three
 menus, fork, confirmed delete, folding and a new project, with no page errors.
 A task's runs rendered while it worked matched a full redraw of the same pane.
 
+On 2026-10-09 the navigation shell was driven in demo mode in headless
+Chromium (Home, a look beside, a project and a thread in tabs, the finder,
+crumbs back up) with no page errors, and measured ("here": the tree committed as
+49c1ca6, which records these numbers) against main (169cf40) on one synthetic
+fleet: 40 projects of 25 threads, one thread each with 120
+rounds, five page loads per build, the same machine. Window ready (attached,
+rows drawn): p50 802 ms on main, 198 ms here, since Home draws 40 rows where
+the tree drew a 300-row window; DOM nodes after load 3155 and 572; JS heap
+5.2 and 5.3 MB. ⌘K to a thread's newest message on screen, first visit p50
+26.4 / p95 37.8 ms on main and 23.2 / 32.4 here; between two visited p50
+25.4 / 39.4 and 24.5 / 26.5. A tab click between two visited threads: p50
+31.7 / p95 32.1 ms. The macOS webview was not measured.
+
 On 2026-09-29 (Linux container) a schedule's fire ran against a real daemon
 in `tests/test_schedule.py`: it sent its message to its resting bot as a new
 turn, skipped the bot while a turn held it, gave a one-off to a working bot
@@ -1661,7 +1733,9 @@ submission IDs, fork-history paging, snapshot/history ordering, history paging
 past activity summaries, pinned submission identities, oversized-item isolation,
 compaction policy propagation, creation refusal when the workspace policy
 cannot compose, completed thought timing, and the shell: projects from
-coordinators and lineage, folding, opening alone or beside and swapping,
+coordinators and lineage, the list one level below what is open, crumbs back
+up, rows that look in beside and open tabs on a double-click, tabs opening,
+closing and following a deleted agent up, full screen from beside,
 per-pane sends with the sticky queue or steer pick, model choices within a
 provider, the agent menu's enabled items and its refresh on a status change,
 fork naming and placement, side chats (a running source, the allowed list,

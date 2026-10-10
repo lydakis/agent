@@ -44,7 +44,8 @@ class WaitTests(ModelFixture):
             client.receive(lambda e: e.get('event') == 'turn_waiting' and e.get('turn') == turn)
             time.sleep(.03)  # Let the parked task retire; exercise the direct interrupt path.
             interrupted = client.request('interrupt', bot='Bob', turn=turn)['result']
-            self.assertTrue(interrupted.get('parked'), interrupted)
+            # Ended in place, not by a task: the view already shows the end.
+            self.assertEqual(interrupted['status'], 'interrupted', interrupted)
             self.assertEqual(client.finished(turn)['data']['status'], 'interrupted')
         page = client.request('events', bot='Bob', after=0, limit=256)['result']
         self.assertEqual([e['turn'] for e in page['events'] if e['event'] == 'turn_finished'], [turn])
@@ -120,6 +121,11 @@ class WaitTests(ModelFixture):
                 self.assertFalse(any('SCAN events' in row[3] for row in plan), plan)
         outcome = client.request('wait', handles=[turn['handle']])['result']['results'][turn['handle']]
         self.assertEqual((outcome['status'], outcome['text']), ('completed', 'reply:hello'))
+        # A client's result is the whole turn view: identity, usage and timing.
+        self.assertEqual((outcome['handle'], outcome['request_id'], outcome['waiting_on']),
+                         (turn['handle'], turn['request_id'], None))
+        self.assertGreater(outcome['input_tokens'], 0)
+        self.assertGreaterEqual(outcome['finished_ms'], outcome['started_ms'])
 
     def tool_output(self, client, bot, call_id):
         events = client.request('events', bot=bot, after=0, limit=256)['result']['events']
@@ -214,6 +220,8 @@ class WaitTests(ModelFixture):
         result = self.tool_output(client, 'Bob', 'wait-1')['results'][alice['handle']]
         self.assertEqual((result['status'], result['text'], result['turn']), ('completed', 'reply:slow', alice['turn']))
         self.assertIsNotNone(result['checkpoint'])
+        # The model's copy is the outcome alone; accounting stays out of its context.
+        self.assertFalse({'input_tokens', 'bot_id', 'started_ms', 'waiting_on'} & result.keys(), result)
         # Waiting on an already finished turn resolves without parking.
         done = client.request('submit', bot='Bob', request_id='b2', prompt='wait:' + alice['handle'])['result']['turn']
         self.assertEqual(client.finished(done)['data']['status'], 'completed')
@@ -236,8 +244,14 @@ class WaitTests(ModelFixture):
         carol = client.request('submit', bot='Carol', request_id='c', prompt='wait:' + alice['handle'])['result']['turn']
         client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == carol)
         self.assertEqual(client.request('resume', bot='Carol')['result']['status'], 'waiting')
-        self.assertEqual(client.request('interrupt', bot='Carol', turn=carol + 1)['error'], 'stale_turn')
-        self.assertTrue(client.request('interrupt', bot='Carol', turn=carol)['result']['parked'])
+        # A pending turn is shown as it stands, with what it waits for.
+        handle = f'turn:Carol/{carol}'
+        polled = client.request('wait', handles=[handle, alice['handle']], timeout_ms=0)['result']['results']
+        self.assertEqual((polled[handle]['pending'], polled[handle]['status'], polled[handle]['waiting_on']['handles']),
+                         (True, 'waiting', [alice['handle']]))
+        self.assertEqual((polled[alice['handle']]['status'], polled[alice['handle']]['waiting_on']), ('running', None))
+        self.assertEqual(client.request('interrupt', bot='Carol', turn=carol + 1)['error'], 'turn_not_found')
+        self.assertEqual(client.request('interrupt', bot='Carol', turn=carol)['result']['status'], 'interrupted')
         self.assertEqual(client.finished(carol)['data']['status'], 'interrupted')
         self.assertEqual(client.request('resume', bot='Carol')['result']['status'], 'interrupted')
         # The abandoned wait received a cancellation result, so the history stays valid.

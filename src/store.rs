@@ -17,8 +17,8 @@ pub use context::{ContextPrefix, ContextUsage, pinned_item, thinking_bytes, with
 pub use db::{
     Absorbed, Answered, Binding, Bot, CacheTtl, CatchUp, CompactionPlan, CompactionView,
     CopiedCall, Database, Decision, Delivery, ElisionPlan, Fork, Gate, Gated, MAX_GATES, Planning,
-    Publication, Served, Settings, Started, Strip, TurnContext, TurnOptions, Waiting, Wake, Window,
-    cache_hit, merge_gates,
+    Publication, Served, Settings, Started, Strip, TURN_VIEW_ACCOUNTING, TurnContext, TurnOptions,
+    Waiting, Wake, Window, cache_hit, merge_gates,
 };
 
 type ReadJob = Box<dyn FnOnce(&Database) + Send>;
@@ -644,6 +644,41 @@ impl Store {
         label: &'static str,
         operation: impl FnOnce(&Database) -> Result<T> + Send + 'static,
     ) -> Result<T> {
+        self.reader().read(label, operation).await
+    }
+    /// The reader connection alone, for a holder that must not keep the
+    /// writer, and so the publication stream, open: a waiter in the
+    /// registry outlives the service at shutdown.
+    pub fn reader(&self) -> Reader {
+        Reader {
+            reader: self.reader.clone(),
+            counters: self.counters.clone(),
+        }
+    }
+    /// A job without a named operation, counted as `other`.
+    pub async fn call<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&mut Database) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        self.op("other", operation).await
+    }
+}
+
+/// Reads on the reader connection; see `Store::reader`.
+#[derive(Clone)]
+pub struct Reader {
+    reader: mpsc::Sender<ReadJob>,
+    counters: std::sync::Arc<Counters>,
+}
+impl Reader {
+    /// Run a read on the reader connection, counted like any job. Only for
+    /// reads whose result is bytes for a caller, never for decisions that
+    /// must see the write the caller is about to make.
+    pub async fn read<T: Send + 'static>(
+        &self,
+        label: &'static str,
+        operation: impl FnOnce(&Database) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
         let (sender, receiver) = oneshot::channel();
         let counters = self.counters.clone();
         let queued = std::time::Instant::now();
@@ -665,18 +700,12 @@ impl Store {
             .await
             .map_err(|_| Error::new("storage_worker_failed"))?
     }
-    /// A job without a named operation, counted as `other`.
-    pub async fn call<T: Send + 'static>(
-        &self,
-        operation: impl FnOnce(&mut Database) -> Result<T> + Send + 'static,
-    ) -> Result<T> {
-        self.op("other", operation).await
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
     use std::sync::{Arc, Barrier};
 
     fn scratch_path(name: &str) -> std::path::PathBuf {
@@ -896,6 +925,46 @@ mod tests {
                 .code,
             "turn_result_pruned"
         );
+        // A client's wait meets the pruned turn as its view, and a kept
+        // finished turn as its outcome, neither pending.
+        let (pruned, kept) = store
+            .read("turn_answers", move |db| {
+                Ok((
+                    db.turn_answer("Bob", first)?,
+                    db.turn_answer("Alice", other)?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                &pruned["turn"],
+                &pruned["status"],
+                &pruned["error"],
+                &pruned["pending"]
+            ),
+            (
+                &json!(first),
+                &json!("completed"),
+                &json!("turn_result_pruned"),
+                &Value::Null
+            )
+        );
+        assert_eq!(
+            (
+                &kept["turn"],
+                &kept["status"],
+                &kept["error"],
+                &kept["pending"]
+            ),
+            (
+                &json!(other),
+                &json!("completed"),
+                &Value::Null,
+                &Value::Null
+            )
+        );
+        assert!(kept["text"].is_string());
         let mut terminal = Vec::new();
         while let Ok(publication) = publications.try_recv() {
             if let Publication::Event(event) = publication

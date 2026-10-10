@@ -814,9 +814,11 @@ struct Seen {
 /// merge, a cherry-pick, a rebase that rewrote commits, or a pull of work
 /// committed since do. One git run for HEAD and one for the question.
 fn moved(repo: &Path, since: &Seen) -> (bool, Seen) {
+    // The time first: a commit HEAD does not name yet is made after it.
+    let at = Some(self::now());
     let now = Seen {
         head: head(repo),
-        at: Some(self::now()),
+        at,
     };
     let news = match (&since.head, &now.head) {
         (_, None) => false,
