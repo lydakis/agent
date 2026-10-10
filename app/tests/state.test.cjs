@@ -36,7 +36,7 @@ function page(daemon = {}, storage = null) {
   context.Rich = context.window.Rich;
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules, tellLead, markSeen, renderFile };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules, tellLead, markSeen, renderFile };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -375,6 +375,27 @@ test('a file opened while the side pane opens is drawn once the pane has its wid
   assert.equal(hydrated, 0);
   opening.resolve(); await settle();
   assert.equal(hydrated, 1);
+});
+
+test('highlighting arriving redraws only a pane with code waiting for it', () => {
+  const p = page(), t = p.transcript('Bob'), el = { dataset: { who: 'Bob' }, lastElementChild: null };
+  t.items.push({ kind: 'text', text: 'just words' }); p.textHTML(t.items[0]);
+  assert.equal(p.waitsForHighlight(el), false);
+  t.items.push({ kind: 'text', text: '```rust\nfn a() {}\n```' }); p.textHTML(t.items[1]);
+  assert.equal(p.waitsForHighlight(el), true);
+  // A streamed reply's code waits too.
+  const u = p.transcript('Ann'), tail = { dataset: {}, replaceChildren() {} }, side = { dataset: { who: 'Ann' }, lastElementChild: tail };
+  u.streamingTurn = 1; u.streamGen = 1; u.text = 'words\n\n'; p.renderTail(tail, 'Ann', u);
+  assert.equal(p.waitsForHighlight(side), false);
+  u.text += '```rust\nfn a() {}\n```\n\n'; p.renderTail(tail, 'Ann', u);
+  assert.equal(p.waitsForHighlight(side), true);
+});
+
+test('a link\'s own menu is not offered, as it would follow the link in the window', () => {
+  const p = page(); let prevented = 0;
+  const target = { closest: (s) => s === 'a' ? {} : null };
+  p.context.document.listeners.contextmenu({ target, preventDefault() { prevented++; } });
+  assert.equal(prevented, 1);
 });
 
 test('highlighting arriving redraws a file beside only when its code waited for it', () => {

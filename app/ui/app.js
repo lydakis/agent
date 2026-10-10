@@ -1453,7 +1453,7 @@ function renderTail(el, name, t) {
   // blocks share one message's bounds (`used`); past them the rest streams as plain text.
   const at = state.done && !state.used.over ? Rich.cut(state.cut, value) : 0;
   if (at > state.drawn) {
-    const box = document.createElement('div'); box.innerHTML = Rich.html(value.slice(state.drawn, at), state.used);
+    const box = document.createElement('div'); box.innerHTML = Rich.html(value.slice(state.drawn, at), state.used); state.waited ||= Rich.waited;
     const added = [...box.childNodes]; state.done.append(...added);
     for (const n of added) if (n.nodeType === 1) Rich.hydrate(n);
     state.text.data = value.slice(at); state.drawn = at;
@@ -2757,14 +2757,22 @@ document.addEventListener('click', async (e) => {
   if (!e.target.closest('input, textarea, form') && window.getSelection?.()?.isCollapsed !== false) focusInput(e.target.closest('.pane.side') && !S.ui.file ? 'side' : 'main');
 });
 document.addEventListener('contextmenu', (e) => {
+  // A link's own menu would follow it in the window, past the opener that sends it to the browser.
+  if (e.target.closest('a')) { e.preventDefault(); return; }
   const t = e.target.closest('[data-bot], [data-task]'); if (!t) return;
   const who = t.dataset.bot ?? t.dataset.task;
   e.preventDefault(); closeMenu(); showMenu(botMenuItems(who), { x: e.clientX, y: e.clientY }, who);
 });
 
-// Highlighting arrived: messages drawn without it are drawn again.
-// A file beside decides for itself (`renderFile`), so a page running there keeps running.
-Rich.onReady = () => { for (const [id] of PANES) if (!(id === 'side' && S.ui.file)) $(id).dataset.key = ''; render(); };
+// Highlighting arrived: a pane whose messages were drawn without it is drawn again; one with no
+// code waiting keeps what it drew. A file beside decides for itself (`renderFile`), so a page
+// running there keeps running.
+function waitsForHighlight(el) {
+  if (tails.get(el.lastElementChild)?.waited) return true;
+  const t = S.transcripts.get(el.dataset.who);
+  return !!t?.items.some((it) => it.htmlWaited);
+}
+Rich.onReady = () => { for (const [id] of PANES) if (!(id === 'side' && S.ui.file) && waitsForHighlight($(id))) $(id).dataset.key = ''; render(); };
 Rich.onFile = openFileFrom;
 Rich.onError = (text) => toast(text, 4000);
 
