@@ -2268,7 +2268,7 @@ const hitHTML = (text, i, len) => (i >= 0 ? `${esc(text.slice(0, i))}<span class
 function fileRowHTML(r, idx, len) {
   const base = r.path.lastIndexOf('/') + 1, name = r.path.slice(base), dir = r.path.slice(0, Math.max(0, base - 1));
   const hit = r.i >= base ? hitHTML(name, r.i - base, len) : esc(name), where = r.i >= 0 && r.i < base ? hitHTML(dir, r.i, Math.min(len, dir.length - r.i)) : esc(dir);
-  return `<div class="row${idx === S.ui.pickerSel ? ' sel' : ''}" data-file="${esc(r.path)}"><span class="glyph file">${FILE}</span><span class="n">${hit}</span><span class="h">${where}</span></div>`;
+  return `<div class="row${idx === S.ui.pickerSel ? ' sel' : ''}" data-found="${esc(r.path)}"><span class="glyph file">${FILE}</span><span class="n">${hit}</span><span class="h">${where}</span></div>`;
 }
 function renderPicker() {
   const files = S.ui.pickerMode === 'files', found = S.ui.found;
@@ -2304,10 +2304,11 @@ function pickerMode(mode) {
   S.ui.pickerMode = mode; S.ui.pickerSel = 0;
   if (mode === 'files' && !S.ui.found) listFiles();
 }
-// A file found opens in a tab, from the repository's top folder.
+// A file found opens in a tab, from the repository's top folder; git's path is always under it, so
+// it is appended as is (a folder named `~` in the repository is not the home folder).
 async function pick(r) {
   const root = S.ui.found?.root; closePicker('main');
-  if (r?.path != null) await go(FILE + joinPath(root, r.path), 'tab');
+  if (r?.path != null) await go(`${FILE}${root.replace(/\/+$/, '')}/${r.path}`, 'tab');
   else if (r) await go(r.b.name, 'tab');
 }
 // A pick opens its bot in a tab, so focus goes to the main composer; Escape goes back where it was.
@@ -3011,8 +3012,9 @@ $('pickerq').addEventListener('keydown', async (e) => {
   else if (e.key === 'Enter') { e.preventDefault(); await pick(rows[S.ui.pickerSel]); }
 });
 $('pickerlist').addEventListener('click', async (e) => {
-  const f = e.target.closest('[data-file]'), r = f ?? e.target.closest('[data-pick]'); if (!r) return;
-  await pick(f ? { path: f.dataset.file } : { b: { name: r.dataset.pick } });
+  // A found file is `data-found`, not `data-file`, which a message link uses and opens beside.
+  const f = e.target.closest('[data-found]'), r = f ?? e.target.closest('[data-pick]'); if (!r) return;
+  await pick(f ? { path: f.dataset.found } : { b: { name: r.dataset.pick } });
 });
 $('pmodes').addEventListener('click', (e) => { const b = e.target.closest('[data-pmode]'); if (b) { pickerMode(b.dataset.pmode); renderPicker(); $('pickerq').focus(); } });
 const inputIds = new Set(['input', 'sideinput', 'pickerq']);

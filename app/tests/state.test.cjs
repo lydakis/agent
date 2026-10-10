@@ -529,6 +529,20 @@ test('⌘P pressed beside searches the side agent\'s repository, and Escape in a
   assert.ok(p.S.ui.help);
 });
 
+test('a file found and clicked opens only its tab, from the repository, even under a folder named ~', async () => {
+  const p = page({ request: async () => ({ nodes: [], workspaces: [], next_from: null }), listFiles: async () => ({ root: '/w', files: ['~/notes.md'], more: false }), readFile: async () => new TextEncoder().encode('x') });
+  p.S.session = 1; p.S.config = { workspace: '/synthetic' };
+  p.upsert({ name: 'Bob', id: 1, provider: 'alpha', model: 'one', workspace: '/w' });
+  await p.go('Bob');
+  const doc = p.context.document;
+  p.openPicker('files'); await settle();
+  assert.match(doc.getElementById('pickerlist').innerHTML, /data-found="~\/notes\.md"/);
+  assert.doesNotMatch(doc.getElementById('pickerlist').innerHTML, /data-file=/, 'a message link\'s attribute would open it beside too');
+  const row = { dataset: { found: '~/notes.md' } };
+  await doc.getElementById('pickerlist').listeners.click({ target: { closest: (s) => s === '[data-found]' ? row : null } }); await settle();
+  assert.equal(p.S.selected, '▤/w/~/notes.md'); assert.ok(!p.S.ui.file);
+});
+
 test('⌘P from Home with no folder says what it searches', async () => {
   const p = page({ request: async () => ({ nodes: [], workspaces: [], next_from: null }), listFiles: async () => { throw new Error('unexpected'); } });
   p.openPicker('files'); await settle();
