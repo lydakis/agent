@@ -1055,14 +1055,20 @@ default tools), made by the agent that added the trigger when one did, so
 it shows under that agent, and gives it the fire's message. Its id is kept with the trigger's
 state as soon as it is made, before any wait, and later fires message it. A name an agent already has is refused at
 `add` (`bot_exists`), and an agent of that name made before the first fire
-makes that fire fail, naming it.
+makes that fire fail, naming it, unless that fire's own `create` made it
+and was cut short before it heard so: the trigger marks the name as being
+taken before `create`, and the next fire takes that agent as its own.
 
 **What else.** `--reply-to BOT` keeps the fire's process until the turn it
 sent ends (the daemon's `wait`, up to a day), then queues that turn's
 answer to BOT, pinned by id; launchd starts no second fire of the trigger
 meanwhile, so a repeating one skips the times that turn spans. The fire's
 request id then ends `-to-ID`, BOT's id, so the app does not also tell
-that agent of the turn as a task update; an answer the daemon cut short is
+that agent of the turn as a task update, unless that answer has not
+reached it 15 s after the turn ended. The turn waited on is kept with the
+trigger's state before the wait: a fire cut short there (a restart) leaves
+it to the next fire, or to the app's next start when no fire runs, which
+passes that answer on in its place and sends nothing new. An answer the daemon cut short is
 marked so in its first line, and one that does not get through keeps an
 ended trigger listed, saying so. `--if CMD` runs `sh -c CMD` in the folder
 `add` ran in, with the `PATH` `add` ran with, before anything else, for up
@@ -1070,7 +1076,8 @@ to 60 s, in its own process group, which ends with it; any exit but 0
 skips that fire and records nothing, so a heartbeat whose check finds
 nothing to do costs one process and no model call. A one-off whose check
 says no ends, listed as not sent.
-`--runs N` ends the trigger once N messages went out. Each message the
+`--runs N` ends the trigger once N messages went out; a fire after that
+(its end could not unload it) only tries to end it again. Each message the
 agent gets starts with one line, `[trigger NAME · YYYY-MM-DD HH:MM · why]`,
 the local fire time and what fired it (its time, `file PATH`, `commit REPO
 at SHA`, or `fired`), so a catch-up fire after sleep reads as late; an

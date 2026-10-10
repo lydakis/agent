@@ -256,7 +256,7 @@ class TriggerFireTests(ModelFixture):
         self.assertEqual(taken['last']['outcome'], 'failed', taken)
         self.assertEqual(len(self.turns('p.review')), 2)
 
-    def test_a_start_trigger_cut_short_while_it_waits_messages_the_agent_it_made(self):
+    def test_a_start_trigger_cut_short_while_it_waits_passes_its_answer_on_next_time(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
         lead = self.bot_id('p.lead')
         target = ['--start', 'p.review', '--model', 'openai/synthetic-model', '--by', 'p.lead', '--by-id', str(lead)]
@@ -266,22 +266,31 @@ class TriggerFireTests(ModelFixture):
         self.model.release_headers = threading.Event()
         self.model.all_streaming = self.model.release_headers
         self.addCleanup(self.model.release_headers.set)
-        running = self.fire('p.review', 'Review.', target=target, extra=extra, app=self.bundle(), env=env,
+        running = self.fire('p.review', 'gate', target=target, extra=extra, app=self.bundle(), env=env,
                             generation='g1', wait=False)
         last = self.home / '.agent/triggers/p.review.json'
         deadline = time.time() + 20
-        while time.time() < deadline and not (last.exists() and json.loads(last.read_text()).get('started_id')):
+        while time.time() < deadline and not (last.exists() and json.loads(last.read_text()).get('pending')):
             time.sleep(0.05)
         running.kill()
         running.wait()
         made = self.bot_id('p.review')
-        self.assertEqual(json.loads(last.read_text())['started_id'], made)
+        kept = json.loads(last.read_text())
+        self.assertEqual(kept['started_id'], made)
+        self.assertEqual(kept['pending']['bot'], 'p.review')
+        turn = kept['pending']['turn']
         self.model.release_headers.set()
         self.settle('p.review')
-        again = self.fire('p.review', 'Review.', target=target, extra=extra, app=self.bundle(), env=env,
+        # The next fire passes that answer on in its place, and sends nothing new.
+        again = self.fire('p.review', 'gate', target=target, extra=extra, app=self.bundle(), env=env,
                           generation='g1')
-        self.assertEqual(again['last']['outcome'], 'sent', again)
         self.assertEqual(again['bot_id'], made)
+        self.assertEqual((again['last']['turn'], again['last']['reply']['outcome']), (turn, 'sent'), again)
+        self.assertNotIn('pending', json.loads(last.read_text()))
+        self.assertEqual(len(self.turns('p.review')), 1)
+        self.settle('p.lead')
+        self.assertRegex(self.turns('p.lead')[-1]['prompt_preview'],
+                         '^' + LINE.format('p.review', f'p.review turn {turn} completed'))
 
     def test_an_answer_goes_to_the_reply_agent(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
@@ -304,6 +313,16 @@ class TriggerFireTests(ModelFixture):
             self.assertEqual(self.turns('p.task')[-1]['request_id'].rsplit('-to-', 1)[1], str(lead))
         finally:
             connection.close()
+
+    def test_a_trigger_at_its_run_limit_sends_nothing_more(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        first = self.fire('p.task', 'once', extra=['--runs', '1'], generation='g1')
+        self.assertEqual(first['last']['outcome'], 'sent', first)
+        self.settle('p.task')
+        # Its end could not unload it (no launchd here): a later fire only ends it again.
+        if sys.platform != 'darwin':
+            self.fire('p.task', 'once', extra=['--runs', '1'], generation='g1')
+            self.assertEqual(len(self.turns('p.task')), 2)
 
     def test_a_one_off_whose_gate_says_no_ends_saying_so(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')

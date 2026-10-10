@@ -33,7 +33,7 @@ const S = {
   swarms: new Map(), memberOf: new Map(),
   // Who asked for each turn another bot asked for, until it ends, and what each coordinator has yet to
   // hear about its tasks (see `wake`), and turns that ended live before the snapshot said who made their bot.
-  turnFrom: new Map(), answerTo: new Map(), wakes: new Map(), heldNews: [],
+  turnFrom: new Map(), answerTo: new Map(), forwarding: new Map(), wakes: new Map(), heldNews: [],
   // Bots whose finished turn the person has not looked at yet (see `shownStatus`), and turns another
   // bot asked for that the person steered into, whose end is theirs to see too.
   unseen: new Set(), wanted: new Set(),
@@ -266,6 +266,20 @@ function answerTo(name, turn, data) {
   const to = /^trigger-.*-to-(\d+)$/.exec(typeof data.request_id === 'string' ? data.request_id : '');
   if (to) S.answerTo.set(`${name}\u0000${turn}`, Number(to[1]));
 }
+// A task turn whose answer a trigger passes to the task's coordinator is that answer's news, not
+// news again; only an answer that does not arrive (the fire failed to pass it on) leaves it news.
+const FORWARD_MS = 15000;
+function turnNews(name, turn, status, from, callId, answered) {
+  const b = bot(name);
+  if (answered == null || !b || answered !== creatorOf(b)?.id) return tellLead(name, turn, status, from, callId);
+  const key = `${name}\u0000${turn}`;
+  clearTimeout(S.forwarding.get(key));
+  S.forwarding.set(key, setTimeout(() => { S.forwarding.delete(key); tellLead(name, turn, status, from); }, FORWARD_MS));
+}
+function forwarded(from) {
+  const key = `${from.bot}\u0000${from.turn}`;
+  if (S.forwarding.has(key)) { clearTimeout(S.forwarding.get(key)); S.forwarding.delete(key); }
+}
 function creatorOf(b) { const p = b.parent && b.parentId != null ? S.bots.get(b.parent) : null; return p && p.id === b.parentId ? p : null; }
 function forgetBot(name) {
   const parent = bot(name) && creatorOf(bot(name));
@@ -277,6 +291,7 @@ function forgetBot(name) {
   for (const w of S.wakes.values()) if (w.tasks.delete(name) && !w.tasks.size) { clearTimeout(w.timer); w.timer = null; }
   for (const key of S.turnFrom.keys()) if (key.startsWith(`${name}\u0000`)) S.turnFrom.delete(key);
   for (const key of S.answerTo.keys()) if (key.startsWith(`${name}\u0000`)) S.answerTo.delete(key);
+  for (const [key, timer] of S.forwarding) if (key.startsWith(`${name}\u0000`)) { clearTimeout(timer); S.forwarding.delete(key); }
   for (const key of S.wanted) if (key.startsWith(`${name}\u0000`)) S.wanted.delete(key);
   // Held news is this bot's; a later bot of the same name is another.
   S.heldNews = S.heldNews.filter(([held]) => held !== name);
@@ -657,7 +672,7 @@ async function onEvent(ev) {
       break;
     }
     case 'accepted': {
-      if (data.from?.bot) S.turnFrom.set(`${name}\u0000${turn}`, data.from.bot);
+      if (data.from?.bot) { S.turnFrom.set(`${name}\u0000${turn}`, data.from.bot); forwarded(data.from); }
       answerTo(name, turn, data);
       const b = bot(name); if (b) { b.status = 'running'; b.runningTurn = turn; b.waitingOn = []; b.turnStarted = S.live ? Date.now() : 0; b.elapsed = 0; }
       // The event that puts a prompt on the lineage names who sent it, here and on `steered`.
@@ -666,7 +681,7 @@ async function onEvent(ev) {
       break;
     }
     case 'queued': {
-      if (data.from?.bot) S.turnFrom.set(`${name}\u0000${turn}`, data.from.bot);
+      if (data.from?.bot) { S.turnFrom.set(`${name}\u0000${turn}`, data.from.bot); forwarded(data.from); }
       answerTo(name, turn, data);
       // `ready` waits for a daemon-wide slot with nothing else running on the bot; `queued` sits behind its own turn.
       const b = bot(name); const behindOwn = !!b && (b.runningTurn !== null || isActive(b.status));
@@ -749,9 +764,8 @@ async function onEvent(ev) {
       if (b && S.live && status === 'completed' && (!from || wanted) && !onScreen(name) && !S.unseen.has(name)) { S.unseen.add(name); patchUnseen([name]); }
       // A steer's turn is part of the turn it joined, whose end is the news.
       // A task's creator may still be on a snapshot page to come; its news waits for the whole snapshot.
-      // A trigger that passes the turn's answer to the task's coordinator has told it already.
-      const told = answered != null && b && answered === creatorOf(b)?.id;
-      if (S.live && status !== 'steered' && !told) { if (S.snapshot) S.heldNews.push([name, turn, status, from]); else tellLead(name, turn, status, from); }
+      // Whether a trigger passes its answer to the coordinator is known once the creator is.
+      if (S.live && status !== 'steered') { if (S.snapshot) S.heldNews.push([name, turn, status, from, undefined, answered]); else turnNews(name, turn, status, from, undefined, answered); }
       // A coordinator coming to rest hears what waited for it.
       if (S.wakes.has(name)) wakeSoon(name);
       // A background command may outlive its turn; only a wait result says how it ended.
@@ -1140,7 +1154,7 @@ async function attachOnce() {
         if (parent) addItem(transcript(parent.name), {kind:'peer',who:b.name,turn:null});
       }
       S.snapshot = false; S.deleted.clear();
-      for (const news of S.heldNews.splice(0)) tellLead(...news);
+      for (const news of S.heldNews.splice(0)) turnNews(...news);
       S.attached = true;
       // What waited while detached goes out now, each window permitting.
       for (const lead of S.wakes.keys()) wakeSoon(lead);
@@ -1171,7 +1185,8 @@ function forgetStore() {
   S.cursor = 0; S.bots.clear(); S.transcripts.clear(); S.drafts.clear(); S.override.clear(); S.effort.clear(); S.families.clear();
   S.swarms.clear(); S.memberOf.clear(); S.deleted.clear(); looked.clear();
   for (const w of S.wakes.values()) clearTimeout(w.timer);
-  S.wakes.clear(); S.turnFrom.clear(); S.answerTo.clear(); S.heldNews = []; S.unseen.clear(); S.wanted.clear();
+  S.wakes.clear(); S.turnFrom.clear(); S.answerTo.clear(); S.heldNews = [];
+  for (const timer of S.forwarding.values()) clearTimeout(timer); S.forwarding.clear(); S.unseen.clear(); S.wanted.clear();
   S.selected = ''; S.autoSelect = true; S.ui.side = null; S.ui.folded = new Set();
   S.botsGen += 1; S.shapeGen += 1;
   // A home the last host named is not this one's.
