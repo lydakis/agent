@@ -316,12 +316,18 @@ gets a commit or an agent ends a turn, or by name. Home's list shows the
 triggers under the projects: each one's kind, name, time or what it
 watches, and who it wakes. A row opens its sheet: when it fires, what it
 does, where the answer goes, its check, its last fire and its message, with
-Open, Remove and Run now. A message a trigger sent starts with the
+Open, Remove and Run now. **＋ New trigger** under them adds one: whom it
+wakes, when (every N, weekdays or every day at a time, once at a time,
+cron, a file written, a new commit, or only when run), an optional check
+and agent its answer goes to, the message, and a name; it runs `trigger add`
+from that agent's folder and opens the new trigger's sheet. A message a trigger sent starts with the
 trigger's name and why it fired, and the name opens the trigger.
 
 ![Home's triggers under its projects](app/triggers-home.png)
 
 ![A trigger's sheet: when, do, reply to, its check, and Run now](app/triggers-sheet.png)
+
+![New trigger, with Home's stand-up filled in](app/trigger-new.png)
 
 ![A triggered message says which trigger woke the agent, and why](app/trigger-woke.png)
 
@@ -378,8 +384,9 @@ client/          agent-client: the socket protocol and the client policy
   ([remote.rs](../app/src-tauri/src/remote.rs));
   `policy` composes a folder's client policy, in a profile when named, and
   falls back to the profiles the app ships for `coordinator`;
-  `triggers`, `trigger`, `trigger_fire` and `trigger_remove` list a page,
-  read one by name, run and remove [triggers](#triggers) ([trigger.rs](../app/src-tauri/src/trigger.rs)).
+  `triggers`, `trigger`, `trigger_add`, `trigger_fire` and `trigger_remove`
+  list a page, read one by name, add one (running `APP --trigger add` in a
+  folder on the window's daemon), run and remove [triggers](#triggers) ([trigger.rs](../app/src-tauri/src/trigger.rs)).
   When nothing listens on a store's socket, `attach` starts a daemon first
   ([daemon.rs](../app/src-tauri/src/daemon.rs)); see
   [Installing](#installing).
@@ -764,8 +771,17 @@ daemon learns nothing about projects; everything here is client work.
   state (working, waiting, done, failed); it is never a row in the list or a tab, and
   opening it by name, from the finder or a crumb, opens Home. What it made
   sits a level below it, reached from the finder. Home's agent is local
-  only, as projects are. It has no heartbeat or stand-up yet: those come
-  with triggers on Home (T2).
+  only, as projects are. Start Home also adds its heartbeat, on unless
+  unchecked: a trigger (`home.heartbeat`) every 30 minutes whose check,
+  `~/.agent/trigger changed --except home`, lets it fire only when an agent
+  other than Home has a new message or another status since the last tick,
+  so a quiet half hour costs a few short processes (the fire, its shell and
+  the `changed` check, which pages the daemon's `bots`) and no model call. Its stand-up
+  (`home.standup`, weekdays at 9:00) is off unless checked. Both land in
+  Home's chat, and `home.md` says how Home answers each; the New trigger
+  sheet fills in either for a Home made without them.
+
+![Start Home with its heartbeat checked](app/home-start-triggers.png)
 - **Projects.** A project is a folder, its coordinator bot `<project>.lead`,
   and `.agents/project.toml` (name, coordinator, model and effort, the
   threads' model and effort and where they work; mechanics only). The
@@ -1178,7 +1194,19 @@ executable with `--trigger`:
 ~/.agent/trigger ls [--after NAME]
 ~/.agent/trigger fire NAME
 ~/.agent/trigger rm NAME
+~/.agent/trigger changed --except BOT
 ```
+
+`changed --except BOT` is a check for `--if`: it pages the daemon's
+`bots` (256 a page), hashes each agent's name, id, newest message and
+status other than BOT's, and compares the digest with the one it kept in
+`~/.agent/triggers/.changed.BOT.STORE` (one per store). It prints
+`{"changed": true}` and exits 0 when they differ, or `{"changed": false}`
+and exits 1; the first check only takes note, and one with no daemon
+running says nothing changed. BOT's own turns are not news to it, so a
+heartbeat into BOT does not wake itself. While BOT is busy the check says
+nothing changed and keeps the old digest, so news that BOT could not take
+then waits for the next tick instead of being skipped.
 
 Every reply is one JSON value on stdout; a failure is one
 `{"error": CODE, "detail": ...}` on stderr with exit 1.
@@ -1252,7 +1280,8 @@ marked so in its first line; a turn that ended saying nothing passes on an
 empty answer. One that does not get through keeps an ended trigger listed,
 saying so, and one whose BOT is gone (`bot_not_found`: pinned by id, it
 never comes back) ends the trigger. `--if CMD` runs `sh -c CMD` in the folder
-`add` ran in, with the `PATH` `add` ran with, before anything else, for up
+`add` ran in, with the `PATH` `add` ran with and `AGENT_SOCKET` and
+`AGENT_STORE` naming the trigger's daemon, before anything else, for up
 to 60 s, in its own process group, which ends with it; any exit but 0
 skips that fire and records nothing but, for `--commit`, that its commit
 was seen, so a heartbeat whose check finds

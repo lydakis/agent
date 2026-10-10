@@ -1240,6 +1240,25 @@ fn triggers(
     ))
 }
 
+/// Add a trigger as `trigger add ARGS` does, from `dir` (see
+/// `trigger::add_for`).
+#[tauri::command]
+async fn trigger_add(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    dir: String,
+    args: Vec<String>,
+) -> Result<Value, String> {
+    let state = windows.of(&window)?;
+    triggers_of(&state)?;
+    let Target::Local { socket, store } = &state.config.target else {
+        unreachable!("triggers_of refuses a host");
+    };
+    let (socket, store) = (socket.clone(), store.clone());
+    blocking(move || trigger::add_for(&socket, store.as_deref(), std::path::Path::new(&dir), &args))
+        .await
+}
+
 /// One trigger by name, as `triggers` lists it; null when there is none.
 #[tauri::command]
 fn trigger(
@@ -1452,6 +1471,7 @@ fn main() {
             swarm_board,
             triggers,
             trigger,
+            trigger_add,
             trigger_fire,
             plans,
             home_dir,

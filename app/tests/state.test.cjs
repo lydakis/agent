@@ -36,7 +36,7 @@ function page(daemon = {}, storage = null) {
   context.Rich = context.window.Rich;
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, openFileFrom, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, fork, remove, createProject, save, restore, showMenu, refreshMenu, entries, pickerRows, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, checkSoon, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, forgetBot, setupState, readTriggers, tellLead, markSeen, renderFile, go, upOf, crumbsHTML, railRows, renderTabs, triggerAct, turnNews, openProjectSheet, parsePlan, loadPlans, renderPlan, taskCard, mainBot, closeSheet, openPicker, pickerMode, renderPicker, keyLabel, gitTab, readGit, diffRows, gitOwner, forgetStore, renderTriggers, openTriggerSheet, renderTriggerSheet, trigSheet, soonTriggers };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, openFileFrom, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, fork, remove, createProject, save, restore, showMenu, refreshMenu, entries, pickerRows, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, checkSoon, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, forgetBot, setupState, readTriggers, tellLead, markSeen, renderFile, go, upOf, crumbsHTML, railRows, renderTabs, triggerAct, turnNews, openProjectSheet, parsePlan, loadPlans, renderPlan, taskCard, mainBot, closeSheet, openPicker, pickerMode, renderPicker, keyLabel, gitTab, readGit, diffRows, gitOwner, forgetStore, triggerArgs, openNewTrigger, HOME_TRIGGERS, renderTriggers, openTriggerSheet, renderTriggerSheet, trigSheet, soonTriggers };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -3426,6 +3426,7 @@ test('Home lists the triggers under its projects, each with its kind, its time a
     { name: 'review', bot: 'demo.review', bot_id: null, start: { model: 'a/m', effort: null }, reply_to: 'demo.lead', if: 'git diff --quiet', runs: 3, sent: 1, when: 'commit /Users/you/demo', once: false, ended: false, message: 'z', last: null },
     { name: 'pr', bot: 'demo.build', bot_id: 2, when: 'every 30m', message: 'w', last: null },
     { name: 'after', bot: 'demo.lead', bot_id: 1, when: 'every 3 turns of demo.build', message: 'v', last: null },
+    { name: 'standup', bot: 'home', bot_id: 9, when: 'cron 0 9 * * 1-5', message: 'u', last: null },
   ], next_after: 'review' }) });
   p.S.attached = true;
   await p.readTriggers();
@@ -3436,6 +3437,7 @@ test('Home lists the triggers under its projects, each with its kind, its time a
   assert.match(html, /data-v="odd">.*unreadable/);
   assert.match(html, /<span class="tk">⎇<\/span><span class="n">review<\/span><span class="w">commit demo<\/span><\/span><span class="r2">→ demo\.review · answer to demo\.lead/);
   assert.match(html, /<span class="tk">↻<\/span><span class="n">after<\/span><span class="w">every 3 turns<\/span>/);
+  assert.match(html, /<span class="n">standup<\/span><span class="w">weekdays 9:00<\/span>/);
   assert.match(html, /data-act="triggers-next"/, 'a page with more after it says so');
   // An agent's project opened in the list hides them, and a window on a host has none.
   p.S.selected = 'demo.lead'; p.S.bots.set('demo.lead', { name: 'demo.lead', id: 1 });
@@ -3551,6 +3553,53 @@ test('reads asked for while one runs come to one more read, and a trigger\'s mes
   await p.onEvent({ event: 'tool_completed', bot: 'a', turn: 1, data: { call_id: 'd' } });
   await p.tick();
   assert.equal(reads, 6, 'its folder is not the script');
+});
+
+test('Start Home adds the heartbeat it checks, from Home\'s folder, and the heartbeat asks whether another agent moved', async () => {
+  const added = [];
+  const p = shell({
+    models: async () => [{ id: 'alpha/one' }], settings: async () => ({ providers: ['alpha'], keys: [] }), homeDir: async () => '/synthetic/you',
+    policy: async () => ({ instructions: 'home rules', compaction_instructions: 'summary', note: 'test' }),
+    request: async (op, q) => (op === 'create' ? { name: q.bot, bot_id: 9, provider: 'alpha', model: 'one', workspace: q.workspace } : { nodes: [], workspaces: [], next_from: null }),
+    addTrigger: async (dir, args) => { added.push([dir, [...args]]); return { name: args[1] }; }, triggers: async () => ({ triggers: [] }),
+  });
+  const el = (id) => p.context.document.getElementById(id);
+  await p.submit('what is running?');
+  assert.match(el('sheet').innerHTML, /id="hm-beat" checked>.*id="hm-standup">/s, 'the heartbeat is on and the stand-up off until checked');
+  el('hm-model').value = 'alpha/one'; el('hm-beat').checked = true; el('hm-standup').checked = false;
+  await el('sheet').listeners.submit({ preventDefault() {} }); await settle();
+  assert.deepEqual(added, [['/synthetic/you', ['--name', 'home.heartbeat', '--every', '30m', '--bot', 'home', '--if', '"$HOME/.agent/trigger" changed --except home', '--', 'Heartbeat: agents moved since the last one.']]]);
+});
+
+test('the New trigger sheet makes each kind of when into the script\'s flags, and opens what it added', async () => {
+  const f = (kind, when, more = {}) => ({ bot: 'p.lead', kind, when, if: '', reply: '', message: 'm', name: '', ...more });
+  const p = page({});
+  const args = (x) => [...p.triggerArgs(x)];
+  assert.deepEqual(args(f('every', '2h')), ['--every', '2h', '--bot', 'p.lead', '--', 'm']);
+  assert.deepEqual(args(f('weekdays', '09:05')), ['--cron', '5 9 * * 1-5', '--bot', 'p.lead', '--', 'm']);
+  assert.deepEqual(args(f('daily', '7:30')), ['--cron', '30 7 * * *', '--bot', 'p.lead', '--', 'm']);
+  assert.throws(() => p.triggerArgs(f('daily', '9am')), /invalid_cron/);
+  assert.deepEqual(args(f('commit', '', { name: 'review', if: 'test -s x', reply: 'p.lead' })), ['--name', 'review', '--commit', '.', '--bot', 'p.lead', '--if', 'test -s x', '--reply-to', 'p.lead', '--', 'm']);
+  assert.deepEqual(args(f('fire', 'ignored')), ['--bot', 'p.lead', '--', 'm']);
+  assert.deepEqual(args(f('file', 'out/x.csv')), ['--file', 'out/x.csv', '--bot', 'p.lead', '--', 'm']);
+  const added = [];
+  const q = page({ addTrigger: async (dir, a) => { added.push([dir, [...a]]); return { name: 'review' }; }, trigger: async (name) => ({ name, bot: 'p.lead', bot_id: 1, when: 'fire', message: 'm' }), triggers: async () => ({ triggers: [] }) });
+  q.S.bots.set('p.lead', { name: 'p.lead', id: 1, workspace: '/synthetic/p' });
+  q.openNewTrigger();
+  const el = (id) => q.context.document.getElementById(id);
+  assert.doesNotMatch(el('sheet').innerHTML, /nt-preset/, 'Home\'s own show once Home exists');
+  el('nt-bot').value = 'p.lead'; el('nt-kind').value = 'fire'; el('nt-when').value = ''; el('nt-if').value = ''; el('nt-reply').value = ''; el('nt-message').value = 'look'; el('nt-name').value = 'review';
+  await el('sheet').listeners.submit({ preventDefault() {} }); await settle();
+  assert.deepEqual(added, [['/synthetic/p', ['--name', 'review', '--bot', 'p.lead', '--', 'look']]]);
+  assert.match(el('sheet').innerHTML, /<h4><span class="tk">▶<\/span> review<\/h4>/);
+  // An agent not here is refused before anything runs.
+  q.openNewTrigger(); el('nt-bot').value = 'nobody'; el('nt-message').value = 'x'; el('nt-name').value = '';
+  await el('sheet').listeners.submit({ preventDefault() {} }); await settle();
+  assert.equal(added.length, 1);
+  // Home's list says New trigger even with none yet.
+  q.S.attached = true; await q.readTriggers();
+  assert.match(el('trigs').innerHTML, /data-act="new-trigger"/);
+  assert.equal(el('trigs').hidden, false);
 });
 
 test('a triggered message names its trigger and why it fired, and the name opens it', () => {
