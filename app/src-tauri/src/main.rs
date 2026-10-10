@@ -5,8 +5,9 @@
 //! (projects, profiles, swarms, schedules) and makes a swarm's shared
 //! worktree; run with `--swarm-post` it is a swarm's post tool (see
 //! `swarm`), and with `--schedule` or `--schedule-fire` it adds, lists,
-//! removes or fires schedules (see `schedule`), and with `--link-skills` or
-//! `--unlink-skills` it links or unlinks the skills it ships (see `skills`).
+//! removes or fires schedules (see `schedule`). `--setup` writes what a start
+//! writes (see `machine_setup`), and `--unlink-skills` removes the links to the
+//! skills it ships (see `skills`); the Homebrew cask runs both.
 //!
 //! Each window attaches to one daemon: this machine's, or a host's reached
 //! over SSH (see `remote`). A window on a host never reads or writes this
@@ -1187,36 +1188,42 @@ async fn request(
     client.request(&op, params).await.map_err(|e| e.to_string())
 }
 
-fn main() {
-    // A swarm's `post` script, a coordinator's `start`, `~/.agent/schedule`,
-    // launchd's fires and the Homebrew cask's skill links run this
-    // executable; each acts and exits without a window.
-    let args: Vec<String> = std::env::args().collect();
-    match args.get(1).map(String::as_str) {
-        Some(swarm::POST_FLAG) => std::process::exit(swarm::cli(&args[2..])),
-        Some(swarm::START_FLAG) => std::process::exit(swarm::start_cli(&args[2..])),
-        Some(schedule::FLAG) => std::process::exit(schedule::cli(&args[2..])),
-        Some(schedule::FIRE_FLAG) => std::process::exit(schedule::fire_cli(&args[2..])),
-        Some(skills::LINK_FLAG) => std::process::exit(skills::cli(true)),
-        Some(skills::UNLINK_FLAG) => std::process::exit(skills::cli(false)),
-        _ => {}
-    }
+/// Run by the Homebrew cask after an install or upgrade: what a start does in
+/// `machine_setup`, so the scripts, schedules and skills the app provides are
+/// there before its first window.
+const SETUP_FLAG: &str = "--setup";
+
+/// What the app puts on this machine, written at every start so it all leads
+/// to this copy: swarm scripts, the coordinator's `start`, `~/.agent/schedule`,
+/// schedules reloaded after a move, and the skills it ships linked from
+/// `~/.agents/skills`. False when any of it failed; each failure is printed
+/// and does not stop the rest. A start reloads schedules off the window's way.
+fn machine_setup(background: bool) -> bool {
+    let mut ok = true;
+    let mut report = |error: &dyn std::fmt::Display| {
+        eprintln!("agent-app: {error}");
+        ok = false;
+    };
     if let (Ok(home), Ok(app)) = (swarm::home(), std::env::current_exe()) {
         swarm::refresh_scripts(&home, &app);
         if let Err(error) = swarm::write_start_script(&home, &app) {
-            eprintln!("agent-app: {error}");
+            report(&error);
         }
         if let Some(state) = home.parent()
             && let Err(error) = schedule::write_script(state, &app)
         {
-            eprintln!("agent-app: {error}");
+            report(&error);
         }
-        // Off the window's way: a moved app reloads every schedule, each a launchctl run.
+        // A moved app reloads every schedule, each a launchctl run.
         if cfg!(target_os = "macos")
             && let Ok(places) = schedule::Places::home()
         {
-            let app = app.clone();
-            std::thread::spawn(move || schedule::refresh(&places, &app, &schedule::launchctl));
+            let refresh = move || schedule::refresh(&places, &app, &schedule::launchctl);
+            if background {
+                std::thread::spawn(refresh);
+            } else {
+                refresh();
+            }
         }
     }
     if let (Some(user), Some(shipped)) = (
@@ -1226,9 +1233,27 @@ fn main() {
             .and_then(|exe| skills::bundled(&exe)),
     ) {
         for error in skills::install(std::path::Path::new(&user), &shipped) {
-            eprintln!("agent-app: {error}");
+            report(&error);
         }
     }
+    ok
+}
+
+fn main() {
+    // A swarm's `post` script, a coordinator's `start`, `~/.agent/schedule`,
+    // launchd's fires and the Homebrew cask's install and uninstall run this
+    // executable; each acts and exits without a window.
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
+        Some(swarm::POST_FLAG) => std::process::exit(swarm::cli(&args[2..])),
+        Some(swarm::START_FLAG) => std::process::exit(swarm::start_cli(&args[2..])),
+        Some(schedule::FLAG) => std::process::exit(schedule::cli(&args[2..])),
+        Some(schedule::FIRE_FLAG) => std::process::exit(schedule::fire_cli(&args[2..])),
+        Some(SETUP_FLAG) => std::process::exit(i32::from(!machine_setup(false))),
+        Some(skills::UNLINK_FLAG) => std::process::exit(skills::unlink_cli()),
+        _ => {}
+    }
+    machine_setup(true);
     let links = remote::Hosts::new(
         std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent/hosts")),
         PathBuf::from("ssh"),

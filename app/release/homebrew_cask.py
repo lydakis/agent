@@ -38,12 +38,12 @@ def render_cask(version: str, archive: Path) -> str:
   app "Agent.app"
   binary "#{{appdir}}/Agent.app/Contents/MacOS/agent"
 
-  # The app links the skills it ships from your .agents/skills at every start.
-  # Link them as soon as it is installed or upgraded, and remove only those
-  # links before it goes, so none is left leading nowhere.
+  # What the app writes at every start (its scripts, schedules and the skill
+  # links in your .agents/skills) is there before its first window. Before it
+  # goes, only its skill links are removed, so none is left leading nowhere.
   postflight do
     system_command "#{{appdir}}/Agent.app/Contents/MacOS/agent-app",
-                   args:         ["--link-skills"],
+                   args:         ["--setup"],
                    must_succeed: false
   end
 

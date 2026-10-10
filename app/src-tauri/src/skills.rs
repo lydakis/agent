@@ -4,11 +4,10 @@
 //! A link is never stale: updating the app updates what it points at, with
 //! nothing copied or recorded. A folder, file or link of yours at that name
 //! is left alone, and a folder's own skill of the same name wins over it.
-//! The app links at every start; the Homebrew cask runs `--link-skills`
-//! after an install or upgrade and `--unlink-skills` before an uninstall.
+//! The app links at every start, and the Homebrew cask's `--setup` after an
+//! install or upgrade; the cask runs `--unlink-skills` before an uninstall.
 use std::path::{Path, PathBuf};
 
-pub const LINK_FLAG: &str = "--link-skills";
 pub const UNLINK_FLAG: &str = "--unlink-skills";
 
 /// Where a bundled app keeps its skills, beside `Contents/MacOS/BINARY`.
@@ -17,8 +16,8 @@ pub fn bundled(exe: &Path) -> Option<PathBuf> {
     skills.is_dir().then_some(skills)
 }
 
-/// `--link-skills` or `--unlink-skills`: this bundle's links, then exit.
-pub fn cli(link: bool) -> i32 {
+/// `--unlink-skills`: remove this bundle's links, then exit.
+pub fn unlink_cli() -> i32 {
     let Some(home) = std::env::var_os("HOME") else {
         eprintln!("agent-app: HOME is not set");
         return 1;
@@ -27,12 +26,7 @@ pub fn cli(link: bool) -> i32 {
         eprintln!("agent-app: no skills beside this executable");
         return 1;
     };
-    let home = Path::new(&home);
-    let errors = if link {
-        install(home, &shipped)
-    } else {
-        uninstall(home, &shipped)
-    };
+    let errors = uninstall(Path::new(&home), &shipped);
     for error in &errors {
         eprintln!("agent-app: {error}");
     }
@@ -103,43 +97,39 @@ pub fn install(home: &Path, shipped: &Path) -> Vec<String> {
     // A skill this copy does not ship keeps no link of the app's, whether it
     // leads nowhere or into another copy. The index reads no more of the
     // folder than its own bound, nor does this.
-    remove(
-        &dir,
-        |name, target| !names.iter().any(|shipped| shipped == name) && ours(target),
-        &mut fail,
-    );
-    errors
-}
-
-/// Remove the links into `shipped` that `install` made, and nothing else.
-pub fn uninstall(home: &Path, shipped: &Path) -> Vec<String> {
-    let mut errors = Vec::new();
-    let mut fail = |path: &Path, error: std::io::Error| {
-        errors.push(format!("{}: {error}", path.display()));
-    };
-    let dir = home.join(".agents/skills");
-    remove(&dir, |name, target| target == shipped.join(name), &mut fail);
-    errors
-}
-
-/// Remove each link in `dir` whose name and target `doomed` picks.
-fn remove(
-    dir: &Path,
-    doomed: impl Fn(&std::ffi::OsStr, &Path) -> bool,
-    fail: &mut impl FnMut(&Path, std::io::Error),
-) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return errors;
     };
     for entry in entries.take(4096).flatten() {
         let link = entry.path();
-        if let Ok(target) = std::fs::read_link(&link)
-            && doomed(&entry.file_name(), &dir.join(target))
+        if !names.contains(&entry.file_name())
+            && let Ok(target) = std::fs::read_link(&link)
+            && ours(&dir.join(target))
             && let Err(error) = std::fs::remove_file(&link)
         {
             fail(&link, error);
         }
     }
+    errors
+}
+
+/// Remove the links into `shipped` that `install` made, and nothing else:
+/// only the names this bundle ships are looked at.
+pub fn uninstall(home: &Path, shipped: &Path) -> Vec<String> {
+    let dir = home.join(".agents/skills");
+    let mut errors = Vec::new();
+    let Ok(entries) = std::fs::read_dir(shipped) else {
+        return errors;
+    };
+    for entry in entries.flatten() {
+        let (link, target) = (dir.join(entry.file_name()), entry.path());
+        if std::fs::read_link(&link).is_ok_and(|current| current == target)
+            && let Err(error) = std::fs::remove_file(&link)
+        {
+            errors.push(format!("{}: {error}", link.display()));
+        }
+    }
+    errors
 }
 
 #[cfg(test)]

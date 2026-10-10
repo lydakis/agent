@@ -366,6 +366,11 @@ cargo build --release -p agent-app
   --socket ~/.agent/state.sqlite.sock --workspace "$PWD"
 ```
 
+A source build is not a bundle, so it links no skills: it uses whatever
+`~/.agents/skills` holds. To try the current `app/skills/NAME`, link it there
+yourself (a link of yours stays), or build a bundle as the release does
+([Installing](#installing)).
+
 Without `--workspace` the workspace is the launching directory, or home when
 that is `/`, as for a window opened from the Dock. `--host ALIAS` opens the
 window on that SSH host instead ([Hosts over SSH](#hosts-over-ssh)), with
@@ -1135,9 +1140,10 @@ every start the app links each one from `~/.agents/skills/NAME`
 ([skills.rs](../app/src-tauri/src/skills.rs)). Updating the app updates what
 the link points at, so nothing is copied or recorded; a moved app re-points
 its links at its next start, and a skill it stops shipping loses its link.
-The Homebrew cask runs `agent-app --link-skills` after an install or upgrade
-and `agent-app --unlink-skills` before an uninstall, so no link outlives the
-app. The app's links are those into a copy of it (a bundle with
+The Homebrew cask runs `agent-app --setup` after an install or upgrade, which
+writes what a start writes (scripts, `~/.agent/schedule`, these links) before
+the first window, and `agent-app --unlink-skills` before an uninstall, which
+removes this bundle's links and nothing else, so none outlives the app. The app's links are those into a copy of it (a bundle with
 `Contents/MacOS/agent-app`) or into an app since removed; a folder, file or
 link of yours at that name, another app's skills folder included, is left
 alone, and a folder's own skill of the same name wins over it. To change a shipped skill, replace the
