@@ -616,8 +616,9 @@ async function createSwarm(project, { goal, n, mix, shared, budget }) {
   await go(swarmKey(sw.name));
 }
 // The script picks an added agent's row: the one furthest below its share among the live members.
+// Its budget is its live members' caps, so it is read again with the new one in.
 async function addAgent(sw) {
-  await learnStarted(await Daemon.swarmAdd(sw.name), 1);
+  await readUsage(await learnStarted(await Daemon.swarmAdd(sw.name), 1));
 }
 // Stopped, the swarm refuses its agents' posts, so nothing wakes them; your next post resumes it.
 async function stopSwarm(sw) {

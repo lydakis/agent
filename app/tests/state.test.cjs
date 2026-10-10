@@ -2221,7 +2221,7 @@ test('Stop and Add are one call each, and the script picks an added agent\'s row
   const p = shell({
     swarmStop: async (swarm) => { calls.push(['stop', swarm]); return { swarm: swarmRecord(members.slice(0, 2), { stopped: true, mix, rows, ids }), failed: [] }; },
     swarmAdd: async (swarm) => { calls.push(['add', swarm]); return { swarm: swarmRecord([...members.slice(0, 2), 'app.latency-4'], { mix, rows: { ...rows, 'app.latency-4': 0 }, ids }), bots: ['app.latency-4'], failed: [] }; },
-    request: async () => ({ bots: [], next_after: null }),
+    request: async (op) => ({ bots: op === 'bots' ? [{ name: 'app.latency-1', id: 3, budget_tokens: 100 }, { name: 'app.latency-2', id: 4, budget_tokens: 100 }, { name: 'app.latency-4', id: 9, budget_tokens: 100 }] : [], next_after: null }),
   });
   const sw = p.learnSwarm(swarmRecord(members, { mix, rows, ids }));
   await p.stopSwarm(sw);
@@ -2230,6 +2230,8 @@ test('Stop and Add are one call each, and the script picks an added agent\'s row
   await p.addAgent(sw);
   assert.deepEqual(calls, [['stop', 'app.latency'], ['add', 'app.latency']]);
   assert.equal(p.S.memberOf.get('app.latency-4'), 'app.latency');
+  // The budget is read again with the added agent's cap in.
+  assert.equal(sw.budget, 300);
   // Cards and posts say what an agent is, where the swarm has more than one kind.
   p.upsert({ name: 'app.latency-2', id: 4, provider: 'beta', model: 'two' });
   assert.match(p.postHTML(sw, { from: 'latency-2', bot: 'app.latency-2', text: 'LGTM' }), /class="who wide" data-task="app.latency-2">latency-2 <span class="kind">reviewer · two<\/span><\/button>/);

@@ -460,7 +460,7 @@ def assign(act, task, owner, reviewer, brief):
     if old:
         # Reassigning is explicit: a task whose owner or reviewer left, or one
         # released back to assigned and changed.
-        missing = old['owner'] not in current or old['reviewer'] not in current
+        missing = old['status'] != 'reviewed' and (old['owner'] not in current or old['reviewer'] not in current)
         changed = (old['owner'], old['reviewer'], old['brief']) != (owner, reviewer, brief)
         released = changed and old['status'] == 'assigned' and task not in act.state['streams'].values()
         if not (missing or released):
@@ -561,7 +561,7 @@ def budget(act, folder, members, helpers):
     if running or helpers and any(h.get('running_turn') for h in helpers) or woken:
         if state['told']:
             state.update(told=False, dirty=True)
-    elif members and swarm.get('coordinator') and not state['result'] and not state['told']:
+    elif swarm.get('coordinator') and not state['result'] and not state['told']:
         outcome = status(folder, members, helpers)['outcome']
         text = 'nothing is running and there is no final result (%s)' % outcome
         act.lines.append({'at': act.at, 'from': 'swarm', 'kind': 'quiet', 'outcome': outcome, 'text': text})
@@ -675,7 +675,7 @@ def run_act(daemon, folder, author, verb, args):
         need(args, 4, 'assign TASK OWNER REVIEWER BRIEF')
         assign(act, args[0], args[1], args[2], ' '.join(args[3:]))
     elif verb == 'claim':
-        need(args, 1, 'claim TASK')
+        need(args, 1, 'claim TASK', True)
         claim(act, args[0])
     elif verb == 'submit':
         need(args, 2, 'submit TASK RESULT')
@@ -687,6 +687,7 @@ def run_act(daemon, folder, author, verb, args):
         need(args, 2, 'finish achieved|partial|failed SUMMARY')
         finish(act, args[0], ' '.join(args[1:]))
     elif verb == 'leave':
+        need(args, 0, 'leave', True)
         leave(act)
     if act.lines and act.lines[0].get('kind') in ('assign', 'claim', 'submit', 'review', 'leave'):
         task = act.lines[0]['stream']
@@ -709,8 +710,10 @@ def run_act(daemon, folder, author, verb, args):
     return act.answer
 
 
-def need(args, n, usage):
-    if len(args) < n:
+def need(args, n, usage, exact=False):
+    """A malformed command does nothing: too few words, or more than a
+    command without free text takes."""
+    if len(args) < n or (exact and len(args) > n):
         raise Refused('usage', 'usage: ' + usage, True)
 
 
@@ -825,6 +828,12 @@ def profile_tools(folder, identity):
             value = line[len('tools:'):].strip().strip('[]')
             tools = [t.strip().strip('"\'') for t in value.split(',') if t.strip()]
     return ('shell',) if tools is None else tools
+
+
+def has_shell(folder, row):
+    if row['identity'] and 'shell' not in profile_tools(folder, row['identity']):
+        raise Refused('identity_without_shell', "%s's tools leave out shell, which runs this script; "
+                      'give it shell or pick another identity' % row['identity'])
 
 
 def valid_mix(mix):
@@ -1021,9 +1030,7 @@ def start(daemon, args):
         raise Refused('usage', 'without an agent shell, name --project and --folder', True)
     valid_mix(asked['mix'])
     for row in asked['mix']:
-        if row['identity'] and 'shell' not in profile_tools(asked['folder'], row['identity']):
-            raise Refused('identity_without_shell', "%s's tools leave out shell, which runs this script; "
-                          'give it shell or pick another identity' % row['identity'])
+        has_shell(asked['folder'], row)
     root, base = daemon.root(), goal_name(asked['goal'])
     os.makedirs(root, exist_ok=True)
     for k in range(1, NAME_TRIES + 1):
@@ -1119,6 +1126,8 @@ def add(daemon, folder, args):
     row = number(args[1], 'invalid_row', '--row is a row number') if args else deal(swarm['mix'], 1, counts)[0]
     if row >= len(swarm['mix']):
         raise Refused('invalid_row', 'the mix has no row %d' % row)
+    # Its profile as it is now: it may have changed since the start.
+    has_shell(swarm['workspace'], swarm['mix'][row])
     each = sum(b.get('budget_tokens') or 0 for b in members.values()) // len(members)
     swarm['made'] += 1
     swarm['budget_tokens'] += each
@@ -1126,7 +1135,8 @@ def add(daemon, folder, args):
     # Saved only once made (by pin), so an add cut short names no member.
     swarm['members'].append(name)
     swarm['rows'][name] = row
-    made, failed = make(swarm, folder.dir, [name], [row], each, True, list(members) + [name])
+    roster = [m for m in swarm['members'] if m in members] + [name]
+    made, failed = make(swarm, folder.dir, [name], [row], each, True, roster)
     if failed:
         swarm['budget_tokens'] -= each
     pin(swarm, made, folder.dir)
@@ -1249,6 +1259,8 @@ def main(argv):
         root = daemon.root()
         name, args = which(args, root)
         author = os.environ.get('AGENT_BOT') or None
+        if verb in ('stop', 'status', 'check'):
+            need(args, 0, '%s [--swarm NAME]' % verb, True)
         folder = Folder(root, name)
         if verb in ACTS:
             if author and author not in folder.swarm['ids']:

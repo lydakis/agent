@@ -191,6 +191,9 @@ class SwarmTests(ModelFixture):
         self.assertEqual(self.swarm('p.widget-2', 'assign', 'waits', 'widget-1', 'widget-2', 'Inspect cleanup; report evidence')['error'], 'task_exists')
         self.assertEqual(self.swarm('p.widget-1', 'assign', 'more', 'widget-1', 'widget-2', 'x')['error'], 'owner_busy')
         self.assertEqual(self.swarm('p.widget-2', 'claim', 'waits')['error'], 'task_owner_only')
+        # A malformed command does nothing.
+        self.assertEqual(self.swarm('p.widget-1', 'claim', 'waits', 'typo')['error'], 'usage')
+        self.assertEqual(self.person('stop', '--swarm', 'p.widget', 'typo')['error'], 'usage')
         self.assertEqual(self.swarm('p.widget-1', 'claim', 'waits')['status'], 'working')
         self.assertEqual(self.swarm('p.widget-1', 'review', 'waits', 'supported', 'mine')['error'], 'reviewer_only')
         submitted = self.swarm('p.widget-1', 'submit', 'waits', 'Source inspected; no measured latency')
@@ -227,6 +230,7 @@ class SwarmTests(ModelFixture):
         self.assertEqual(added['bots'], ['p.widget-3'])
         self.assertEqual(added['swarm']['rows']['p.widget-3'], 1)
         self.assertEqual(self.listed()['p.widget-3']['budget_tokens'], self.listed()['p.widget-1']['budget_tokens'])
+        self.assertEqual(self.person('add', '--swarm', 'p.widget', '--row')['error'], 'usage')
 
     def test_two_claims_at_once_have_one_winner(self):
         started = self.start('--agents', '3')
@@ -409,6 +413,21 @@ class SwarmRuleTests(unittest.TestCase):
         self.assertEqual(refused.exception.code, 'not_a_member')
         self.s.assign(act, 't', 'w-1', 'w-3', 'please review')
         self.assertEqual(act.lines[0]['reviewer'], 'w-3')
+        # Finished work stays finished when one who did it is deleted.
+        state['tasks']['t'].update(status='reviewed', reviewer='w-2')
+        _, act = self.act('p.w-1', state, live)
+        with self.assertRaises(self.s.Refused) as refused:
+            self.s.assign(act, 't', 'w-1', 'w-3', 'again')
+        self.assertEqual(refused.exception.code, 'task_exists')
+
+    def test_the_coordinator_hears_when_every_member_is_deleted(self):
+        folder, act = self.act()
+        folder.board = open(os.devnull, 'rb')
+        self.addCleanup(folder.board.close)
+        self.swarm['rows'] = {}
+        self.s.budget(act, folder, {}, [])
+        self.assertEqual([(l['kind'], l['outcome']) for l in act.lines], [('quiet', 'blocked')])
+        self.assertEqual([m for m, *_ in act.sends], ['p.lead'])
 
     def test_an_identity_needs_shell_only_when_its_profile_lists_tools(self):
         made = tempfile.TemporaryDirectory()
