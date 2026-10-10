@@ -931,8 +931,6 @@ async function loadBatch(name) {
           count(t, live, -1); t.items.splice(t.items.indexOf(live), 1);
         }
       }
-      // A message's diagrams and charts are named by its node, which every redraw of it shares.
-      if (e.kind === 'text') e.scope = `${name}|${it.node}`;
       rep.push({ ...e, callId: e.callId ?? it.callId, turn: it.turn });
     }
     const size = r.ok ? JSON.stringify(r.ok).length * 2 : 0;
@@ -1192,7 +1190,7 @@ function forgetStore() {
   S.swarms.clear(); S.memberOf.clear(); S.deleted.clear(); looked.clear();
   for (const w of S.wakes.values()) clearTimeout(w.timer);
   S.wakes.clear(); S.turnFrom.clear(); S.turnOrigin.clear(); S.heldNews = []; S.unseen.clear(); S.wanted.clear();
-  S.selected = ''; S.autoSelect = true; S.ui.side = null; S.ui.folded = new Set(); dropFile(); Rich.forget();
+  S.selected = ''; S.autoSelect = true; S.ui.side = null; S.ui.folded = new Set(); dropFile();
   S.botsGen += 1; S.shapeGen += 1;
   // A home the last host named is not this one's.
   if (S.homeWorkspace) { S.config.workspace = null; S.homeWorkspace = false; }
@@ -1260,13 +1258,13 @@ const TAG_BYTES = 40, MARK_BYTES = 16;
 function textHTML(it, t) {
   // A block after the first of its message starts from what the blocks before it drew, and is drawn
   // anew when that changes (an earlier block highlighted once highlighting arrived).
-  const used = { lines: 0, tags: 0, code: 0, blocks: 0, links: 0, marks: 0, over: false, scope: it.scope };
-  for (const s of it.budget?.spent.slice(0, it.sib) ?? []) if (s) { used.lines += s.lines; used.tags += s.tags; used.code += s.code; used.blocks += s.blocks; used.links += s.links; used.marks += s.marks; used.over ||= s.over; }
-  const from = `${used.lines} ${used.tags} ${used.code} ${used.blocks} ${used.links} ${used.marks} ${used.over}`;
+  const used = { lines: 0, tags: 0, code: 0, links: 0, marks: 0, over: false };
+  for (const s of it.budget?.spent.slice(0, it.sib) ?? []) if (s) { used.lines += s.lines; used.tags += s.tags; used.code += s.code; used.links += s.links; used.marks += s.marks; used.over ||= s.over; }
+  const from = `${used.lines} ${used.tags} ${used.code} ${used.links} ${used.marks} ${used.over}`;
   if (it.htmlOf !== it.text || it.htmlFrom !== from || (it.htmlWaited && it.htmlAt !== Rich.version)) {
     const start = { ...used }, html = `<div class="md">${Rich.html(it.text, used)}</div>`;
     const tags = used.tags - start.tags, mk = used.marks - start.marks, cost = 2 * html.length + TAG_BYTES * tags + MARK_BYTES * mk;
-    if (it.budget) it.budget.spent[it.sib] = { lines: used.lines - start.lines, tags, code: used.code - start.code, blocks: used.blocks - start.blocks, links: used.links - start.links, marks: mk, over: !!used.over };
+    if (it.budget) it.budget.spent[it.sib] = { lines: used.lines - start.lines, tags, code: used.code - start.code, links: used.links - start.links, marks: mk, over: !!used.over };
     const d = cost - (it.drawnBytes ?? 0); it.drawnBytes = cost; it.bytes = (it.bytes || 0) + d; if (t) t.bytes = Math.max(0, (t.bytes || 0) + d);
     it.html = html; it.htmlOf = it.text; it.htmlFrom = from; it.htmlAt = Rich.version; it.htmlWaited = Rich.waited;
   }
@@ -1512,8 +1510,7 @@ function renderTranscript(el, name) {
     if (over()) { evict(t); html = itemsHTML(t); }
     el.innerHTML = html + '<div class="tail"></div>';
     el.dataset.key = paneKey(name, t);
-    // Blocks drawn from the cache here change the height once, and the place is kept once, below.
-    Rich.hydrate(el, false);
+    Rich.hydrate(el);
     tail = el.lastElementChild;
     // History loaded above the reader keeps their place instead of shoving it down.
     if (!atBottom) el.scrollTop += el.scrollHeight - before;

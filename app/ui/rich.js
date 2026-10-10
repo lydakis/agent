@@ -50,15 +50,11 @@ window.Rich = (() => {
   // window's thread, and a few characters can ask for more than it can do (a page's loop, an SVG's
   // filters, a chart's `sequence` to a billion, a Mermaid `space:500000`), so each runs only when
   // asked, block by block. `page` draws it at once, for a file someone opened.
-  // A diagram or chart in a message carries an id: where it was drawn (`scope`, its message or
-  // file), which of the diagrams and charts there it is (`nth`), and what it draws. The message
-  // drawn anew, for highlighting or a pane redrawn, gives it the same id, so the one someone asked
-  // for stays shown; every other block, a copy of it included, still asks. Without a scope each
-  // block is its own. While a reply streams (`draft`), its diagrams, charts and pages are code: one
-  // is drawn once the reply is in and has the id it keeps.
-  let scope = null, nth = 0, blockId = 0, draft = false;
-  const digest = (s) => { let a = 0x811c9dc5, b = 5381; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); a = Math.imul(a ^ c, 0x01000193); b = (Math.imul(b, 33) + c) | 0; } return `${s.length}.${(a >>> 0).toString(36)}.${(b >>> 0).toString(36)}`; };
-  const lazy = (page, kind, text) => page ? ' data-page' : ` data-id="${esc(scope == null ? `#${++blockId}` : `${scope}|${nth++}|${kind}|${digest(text)}`)}"`;
+  // Nothing remembers a click: a block drawn again (its pane redrawn) asks again, and the drawing
+  // cache below makes that click instant. While a reply streams (`draft`), its diagrams, charts and
+  // pages are code; each can be drawn once the reply is in.
+  let draft = false;
+  const lazy = (page) => page ? ' data-page' : '';
   // Whether text is an SVG document: its root is `<svg>`, after an XML declaration, comments and a
   // doctype if it has them. Read in one pass, as a generated file can open with many comments.
   function isSVG(text) {
@@ -78,8 +74,8 @@ window.Rich = (() => {
   function block(text, info, page = false) {
     const lang = (info ?? '').trim().split(/\s+/)[0].toLowerCase();
     if (draft) return `<div class="rc" data-kind="code">${head(lang, '')}${pre(text, lang)}</div>`;
-    if (lang === 'mermaid' || lang === 'mmd') return `<div class="rc" data-kind="mermaid" data-lazy${lazy(page, 'mermaid', text)} data-view="code">${head('mermaid', toggle)}<div class="view"></div>${pre(text, '')}</div>`;
-    if (CHART.has(lang)) return `<div class="rc" data-kind="chart" data-lang="${lang === 'vega' ? 'vega' : 'vega-lite'}" data-lazy${lazy(page, lang, text)} data-view="code">${head(lang, toggle)}<div class="view"></div>${pre(text, 'json')}</div>`;
+    if (lang === 'mermaid' || lang === 'mmd') return `<div class="rc" data-kind="mermaid" data-lazy${lazy(page)} data-view="code">${head('mermaid', toggle)}<div class="view"></div>${pre(text, '')}</div>`;
+    if (CHART.has(lang)) return `<div class="rc" data-kind="chart" data-lang="${lang === 'vega' ? 'vega' : 'vega-lite'}" data-lazy${lazy(page)} data-view="code">${head(lang, toggle)}<div class="view"></div>${pre(text, 'json')}</div>`;
     if (lang === 'html' || lang === 'htm') return `<div class="rc" data-kind="html" data-view="${page ? 'view' : 'code'}">${head(lang, '<button type="button" data-rich="view"></button>')}<div class="view frame"></div>${pre(text, 'xml')}</div>`;
     // An SVG draws as an image, which runs no script and loads nothing.
     if (lang === 'svg' && isSVG(text)) return `<div class="rc" data-kind="svg" data-view="${page ? 'view' : 'code'}">${head(lang, '<button type="button" data-rich="view"></button>')}<div class="view"></div>${pre(text, 'xml')}</div>`;
@@ -184,12 +180,11 @@ window.Rich = (() => {
   const marks = (s, max) => { let n = 0; MARK.lastIndex = 0; while (n <= max && MARK.exec(s)) n++; return n; };
   const asText = (text) => `<div class="rc" data-kind="code">${head('text', '')}<pre class="code"><code>${esc(text)}</code></pre></div>`;
   // `used` carries the bounds across the pieces of one message drawn apart, as a streamed reply's
-  // blocks are; once over, `used.over` is set and that piece is text. `used.scope` names where its
-  // diagrams and charts were drawn and `used.blocks` counts those drawn before it (see `lazy`);
-  // `used.marks` counts the marks parsed, which is what the parsing cost;
+  // blocks are; once over, `used.over` is set and that piece is text. `used.marks` counts the marks
+  // parsed, which is what the parsing cost;
   // `used.draft` marks a reply still streaming.
   function html(text, used = { lines: 0, tags: 0, code: 0 }) {
-    waited = false; spent = used.code ?? 0; scope = used.scope ?? null; nth = used.blocks ?? 0; draft = !!used.draft; linkLeft = LINK_CHARS - (used.links ?? 0);
+    waited = false; spent = used.code ?? 0; draft = !!used.draft; linkLeft = LINK_CHARS - (used.links ?? 0);
     const p = parser();
     if (!p) return `<p>${esc(text)}</p>`;
     if (used.over) return asText(text);
@@ -201,7 +196,7 @@ window.Rich = (() => {
     used.code = spent;
     const tags = count(out, '<', TAGS - used.tags);
     if (used.tags + tags > TAGS) { waited = false; used.over = true; return asText(text); }
-    used.lines += lines; used.tags += tags; used.marks = (used.marks ?? 0) + mk; used.blocks = nth; used.links = LINK_CHARS - linkLeft;
+    used.lines += lines; used.tags += tags; used.marks = (used.marks ?? 0) + mk; used.links = LINK_CHARS - linkLeft;
     return out;
   }
 
@@ -229,10 +224,8 @@ window.Rich = (() => {
   // Something drawn later changes a block's height; a reader at the end of the pane stays there, and
   // one reading below the block keeps their place (the panes do no scroll anchoring of their own).
   // `hold` notes the reader's place before a change; each call of what it returns keeps it after.
-  // While a pane is drawn whole its caller keeps the place once, after (`hydrate(root, false)`).
-  let holding = true;
   function hold(box) {
-    const pane = holding && box.closest?.('.scroll'); if (!pane) return () => {};
+    const pane = box.closest?.('.scroll'); if (!pane) return () => {};
     const end = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 40;
     const above = !end && box.getBoundingClientRect().bottom <= pane.getBoundingClientRect().top; let h = pane.scrollHeight;
     return () => { if (end) pane.scrollTop = pane.scrollHeight; else if (above) pane.scrollTop += pane.scrollHeight - h; h = pane.scrollHeight; };
@@ -258,14 +251,9 @@ window.Rich = (() => {
   // A diagram or chart drawn to SVG once per source; one at a time, as Mermaid measures in a shared
   // scratch element. A source that does not draw keeps showing as code, the error in its head,
   // and draws again only when asked again.
-  // With `cached`, only a block someone asked for (`shown`, the last 1,024 asked) draws again,
-  // from the cache or, when a chart's width changed, anew.
-  const shown = new Set(), SHOWN = 1024;
-  function drawLazy(box, src, make, cached = false) {
+  function drawLazy(box, src, make) {
     const key = `${box.dataset.kind}|${box.dataset.lang ?? ''}|${box.dataset.kind === 'chart' ? box.clientWidth : ''}|${src}`;
     const show = (svg) => settle(box, () => { box.querySelector('.view').innerHTML = svg; box.dataset.view = 'view'; box.dataset.drawn = ''; });
-    if (cached && !shown.has(box.dataset.id)) return;
-    if (!cached && box.dataset.id) { shown.delete(box.dataset.id); shown.add(box.dataset.id); if (shown.size > SHOWN) shown.delete(shown.values().next().value); }
     if (diagrams.has(key)) { show(diagrams.get(key)); return; }
     if ('asked' in box.dataset) return;
     box.dataset.asked = '';
@@ -278,7 +266,7 @@ window.Rich = (() => {
         const [k, v] = diagrams.entries().next().value; diagrams.delete(k); diagramBytes -= 2 * (k.length + v.length);
       }
       show(svg);
-    }, (e) => { delete box.dataset.asked; shown.delete(box.dataset.id); const l = box.querySelector('.rh .lang'); l.textContent = `${l.textContent.split(' · ')[0]} · ${String(e?.message ?? e).split('\n')[0].slice(0, 80)}`; });
+    }, (e) => { delete box.dataset.asked; const l = box.querySelector('.rh .lang'); l.textContent = `${l.textContent.split(' · ')[0]} · ${String(e?.message ?? e).split('\n')[0].slice(0, 80)}`; });
   }
   const mermaidSVG = (src) => mermaidReady().then((m) => m.render(`rich-mmd-${++diagramId}`, src)).then(({ svg }) => svg);
 
@@ -332,26 +320,20 @@ window.Rich = (() => {
     host.append(f);
   }
   function unmount(box) { box.querySelector('.view')?.replaceChildren(); }
-  function draw(box, cached = false) {
+  function draw(box) {
     const src = box.querySelector('pre').textContent;
-    drawLazy(box, src, box.dataset.kind === 'mermaid' ? mermaidSVG : chartSVG, cached);
+    drawLazy(box, src, box.dataset.kind === 'mermaid' ? mermaidSVG : chartSVG);
   }
-  // After HTML from `html` is in the document (`root` and what it holds): a file's drawing starts,
-  // and a diagram or chart someone asked for shows again from the cache. A page or SVG someone ran
-  // in a message is code again once its pane is drawn anew: running it is asked of one block, once.
+  // After HTML from `html` is in the document (`root` and what it holds): a file's drawing starts.
+  // Whatever was drawn in a message is code again once its pane is drawn anew.
   const HYDRATE = '.rc[data-lazy]:not([data-on]), .rc[data-kind="html"]:not([data-on]), .rc[data-kind="svg"]:not([data-on])';
-  function hydrate(root, anchor = true) {
-    holding = anchor;
-    try {
-      for (const box of [...(root.matches?.(HYDRATE) ? [root] : []), ...root.querySelectorAll(HYDRATE)]) {
-        box.dataset.on = '';
-        if ('lazy' in box.dataset) draw(box, !('page' in box.dataset));
-        else if (box.dataset.view === 'view') mount(box);
-      }
-    } finally { holding = true; }
+  function hydrate(root) {
+    for (const box of [...(root.matches?.(HYDRATE) ? [root] : []), ...root.querySelectorAll(HYDRATE)]) {
+      box.dataset.on = '';
+      if ('lazy' in box.dataset) { if ('page' in box.dataset) draw(box); }
+      else if (box.dataset.view === 'view') mount(box);
+    }
   }
-  // Another store's blocks are not the ones asked for here, whatever their ids.
-  const forget = () => shown.clear();
   if (typeof window.addEventListener === 'function') window.addEventListener('message', (e) => {
     // Only a frame the reader is in can hand the window its Escape.
     if (e.data?.rich === 'escape') { for (const f of document.querySelectorAll('.rc iframe')) if (f.contentWindow === e.source && document.activeElement === f) { escaped(f); break; } return; }
@@ -422,7 +404,7 @@ window.Rich = (() => {
   }
   // `waited` says the view is code that highlighting, once loaded, would draw differently.
   function file(path, bytes, more = false, asked = true) {
-    spent = 0; waited = false; scope = `file ${path}`; nth = 0; draft = false;
+    spent = 0; waited = false; draft = false;
     const ext = extOf(path), note = more ? `<div class="line note">showing the first ${Math.round(bytes.length / 1048576)} MiB</div>` : '';
     if (IMAGE[ext]) {
       if (more) return { html: '<div class="line note">image too large to show</div>' };
@@ -431,7 +413,7 @@ window.Rich = (() => {
     }
     if (bytes.subarray(0, 8000).includes(0)) return { html: `<div class="line note">binary file · ${bytes.length}${more ? '+' : ''} bytes</div>` };
     const text = new TextDecoder().decode(bytes);
-    if (ext === 'md' || ext === 'markdown') return { html: `${note}<div class="md">${html(text, { lines: 0, tags: 0, code: 0, scope })}</div>`, waited };
+    if (ext === 'md' || ext === 'markdown') return { html: `${note}<div class="md">${html(text, { lines: 0, tags: 0, code: 0 })}</div>`, waited };
     if (ext === 'csv' || ext === 'tsv') return { html: note + table(text, ext === 'csv' ? ',' : '\t') };
     const lang = { mmd: 'mermaid', mermaid: 'mermaid', vl: 'vega-lite', vg: 'vega', htm: 'html', html: 'html', svg: 'svg' }[ext] ?? ext;
     const out = block(text, lang, asked);
@@ -442,5 +424,5 @@ window.Rich = (() => {
   // A middle click on a link would open it in a new app window.
   document.addEventListener?.('auxclick', (e) => { if (e.target.closest?.('.md a, .rc a, a[data-file]')) e.preventDefault(); });
 
-  return { html, cut, hydrate, forget, click, file, filePath, esc, get version() { return version; }, get waited() { return waited; }, set onReady(fn) { ready = fn; }, set onEscape(fn) { escaped = fn; }, set onFile(fn) { openFile = fn; }, set onError(fn) { failed = fn; } };
+  return { html, cut, hydrate, click, file, filePath, esc, get version() { return version; }, get waited() { return waited; }, set onReady(fn) { ready = fn; }, set onEscape(fn) { escaped = fn; }, set onFile(fn) { openFile = fn; }, set onError(fn) { failed = fn; } };
 })();
