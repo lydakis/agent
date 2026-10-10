@@ -30,7 +30,13 @@ pub fn install(home: &Path) -> Vec<String> {
         Ok(names) => skills.extend(
             names
                 .into_iter()
-                .filter(|name| BUILT_IN.iter().all(|(shipped, _)| shipped != name))
+                // A folder that ignores case finds `automation`'s record
+                // under `Automation` too.
+                .filter(|name| {
+                    BUILT_IN
+                        .iter()
+                        .all(|(shipped, _)| !shipped.eq_ignore_ascii_case(name))
+                })
                 .filter(|name| records.join(name).is_dir())
                 .map(|name| (name, &[][..])),
         ),
@@ -500,6 +506,22 @@ mod tests {
         std::fs::write(&path, "mine").unwrap();
         one(&home, "x", &[("SKILL.md", "new")]).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine");
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_record_named_like_a_shipped_skill_in_other_case_is_left_alone() {
+        let home = home("case");
+        let (name, files) = BUILT_IN[0];
+        let other = name.to_ascii_uppercase();
+        one(&home, &other, files).unwrap();
+        install(&home);
+        assert!(
+            home.join(".agents/skills")
+                .join(&other)
+                .join("SKILL.md")
+                .exists()
+        );
         std::fs::remove_dir_all(home).unwrap();
     }
 
