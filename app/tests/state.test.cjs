@@ -1860,7 +1860,7 @@ test('a new project is made by the app\'s core, seated and opened, and one alrea
   const p = shell({
     createProject: async (q) => {
       calls.push(['make', { ...q }]);
-      if (made) return { project: 'weather', coordinator: 'weather.lead', dir: q.dir, created: false, from_file: true, record: null };
+      if (made) return { project: 'weather', coordinator: 'weather.lead', dir: q.dir, created: false, from_file: true, record: { name: 'weather.lead', bot_id: 7, provider: 'alpha', model: 'role', workspace: q.dir } };
       made = true;
       return { project: 'weather', coordinator: 'weather.lead', dir: q.dir, created: true, from_file: false, note: 'test', record: { name: 'weather.lead', bot_id: 7, provider: 'alpha', model: 'role', workspace: q.dir } };
     },
@@ -1874,6 +1874,11 @@ test('a new project is made by the app\'s core, seated and opened, and one alrea
   p.S.selected = '';
   await p.createProject('/synthetic/weather');
   assert.equal(p.S.selected, 'weather.lead', 'opened, not made twice');
+  // One an agent made with ~/.agent/project that has not reached this window yet is seated from the reply.
+  p.S.bots.delete('weather.lead'); p.S.selected = '';
+  await p.createProject('/synthetic/weather');
+  assert.equal(p.S.bots.get('weather.lead').id, 7);
+  assert.equal(p.S.selected, 'weather.lead');
 });
 
 test('an agent\'s effort is picked beside its model, kept in the project file, and shown with its model', async () => {
@@ -1920,7 +1925,7 @@ test('the coordinator the app ships gives editing tasks worktrees and cleans up 
 test('a project the core refuses opens nothing, and one already there says when the picks were not applied', async () => {
   let refuse = 'project_exists: demo.lead already belongs to /synthetic/first';
   const p = shell({
-    createProject: async (q) => { if (refuse) throw new Error(refuse); return { project: 'weather', coordinator: 'weather.lead', dir: q.dir, created: false, from_file: false, record: null }; },
+    createProject: async (q) => { if (refuse) throw new Error(refuse); return { project: 'weather', coordinator: 'weather.lead', dir: q.dir, created: false, from_file: false, record: { name: 'weather.lead', bot_id: 7, provider: 'alpha', model: 'one', workspace: q.dir } }; },
     request: async () => ({ nodes: [], workspaces: [], next_from: null }),
   });
   p.upsert({ name: 'weather.lead', bot_id: 7, provider: 'alpha', model: 'one', workspace: '/synthetic/weather' });

@@ -664,12 +664,14 @@ async fn create_project(
     let client = state.client.lock().await.clone().ok_or("detached")?;
     let dir = PathBuf::from(workspace_path(std::path::Path::new(&dir))?);
     let policy = compose(&dir, Some("coordinator"))?;
+    // The sheet's selects send "" for their defaults.
+    let picked = |v: Option<String>| v.filter(|v| !v.is_empty());
     let picks = project::Picks {
-        model,
-        effort,
+        model: picked(model),
+        effort: picked(effort),
         threads: threads_in_project.map(|in_project| project::ThreadPicks {
-            model: threads_model,
-            effort: threads_effort,
+            model: picked(threads_model),
+            effort: picked(threads_effort),
             in_project,
         }),
     };

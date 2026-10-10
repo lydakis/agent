@@ -301,7 +301,8 @@ pub fn tasks_rule(model: Option<&str>, effort: Option<&str>, in_project: bool) -
 /// its role (`policy`, as composed for the folder), told its tasks'
 /// settings, then the folder's file when it had none, once the daemon took
 /// the coordinator. A project that already exists in this folder is
-/// returned with `created: false` and nothing changed; a name another
+/// returned with `created: false`, its coordinator's row as the record, and
+/// nothing changed; a name another
 /// folder's coordinator holds is refused.
 pub async fn create(
     daemon: &impl Requests,
@@ -331,7 +332,7 @@ pub async fn create(
             return Ok(None);
         };
         match bot["workspace"].as_str() {
-            Some(have) if have == at => Ok(Some(made(false, Value::Null))),
+            Some(have) if have == at => Ok(Some(made(false, bot.clone()))),
             have => Err(format!(
                 "project_exists: {coordinator} already belongs to {}",
                 have.unwrap_or("another folder")
@@ -641,6 +642,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(again["created"], false);
+        assert_eq!(again["record"]["name"], again["coordinator"]);
         assert_eq!(
             daemon
                 .calls

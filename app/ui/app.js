@@ -3215,13 +3215,14 @@ async function createProject(dir, picked = null, effort = null, threads = null) 
   const made = await Daemon.createProject({ dir, model: picked, effort, threads });
   if (picked) try { localStorage.setItem('agent:model', picked); } catch (_) {}
   if (effort !== null) try { localStorage.setItem('agent:effort', effort); } catch (_) {}
+  // Seated either way: one an agent just made may not have reached this window yet.
+  const session = S.session;
+  await enqueue(() => { if (S.session === session) seat(made.record, session); });
   if (!made.created) {
     await go(made.coordinator);
     if (asked) toast(`${made.coordinator} already exists and keeps the settings it was made with`, 5000);
     return;
   }
-  const session = S.session;
-  await enqueue(() => { if (S.session === session) seat(made.record, session); });
   await go(made.coordinator); toast(`project ${made.project} · ${made.note}${made.from_file && asked ? ' · set up from its project file, not these picks' : ''}`);
 }
 function detach() { save(); Daemon.close(); }

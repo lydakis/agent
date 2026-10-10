@@ -483,7 +483,7 @@ window.Daemon = (() => {
     // As the app's core makes a project: its coordinator, unless one is there already.
     createProject: async ({ dir, model = null, effort = null }) => {
       const name = String(dir).split('/').filter(Boolean).pop()?.replace(/[^A-Za-z0-9_-]+/g, '-') || 'project', coordinator = `${name}.lead`, had = S.bots.get(coordinator);
-      if (had) { if (had.workspace !== dir) throw new Error(`project_exists: ${coordinator} already belongs to ${had.workspace}`); return { project: name, coordinator, dir, created: false, from_file: false, record: null }; }
+      if (had) { if (had.workspace !== dir) throw new Error(`project_exists: ${coordinator} already belongs to ${had.workspace}`); return { project: name, coordinator, dir, created: false, from_file: false, record: { ...had } }; }
       if (!model) throw new Error('model_required: choose a model');
       return { project: name, coordinator, dir, created: true, from_file: false, record: { ...await create(coordinator, model, null, null, dir, null, effort) }, note: 'demo policy' };
     },
