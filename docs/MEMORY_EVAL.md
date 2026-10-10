@@ -179,8 +179,9 @@ What it shows, as observations from three trials per cell:
   alone, this scenario can show harm from a wrong fact but not a benefit
   from memory. A wrong fact that is more tempting would test more.
 - **Cost.** Memory took about 2.5 times the input tokens and zero to two
-  more rounds per task, 1.3 on average. That is more than its roughly 800 extra characters
-  of instructions explain: the extra rounds read memory and save facts.
+  more rounds per task, 1.3 on average. Its roughly 800 extra characters
+  of instructions don't account for that. A likely cause, which this run
+  doesn't establish, is the rounds spent reading memory and saving facts.
   Three `memory` bots re-saved a fact they had been given, with the same
   text, which left the file unchanged and spent a call.
 
