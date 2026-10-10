@@ -49,9 +49,9 @@ export OPENROUTER_API_KEY=...   # openrouter/VENDOR/MODEL
 export AGENT_MODEL=anthropic/claude-opus-5-5
 ```
 
-For Amazon Bedrock, use your usual AWS credentials (`AWS_PROFILE`, SSO, keys
-in the environment, or a Bedrock API key in `AWS_BEARER_TOKEN_BEDROCK`); no
-region is needed. Start the daemon with `--provider bedrock` and name Claude
+For Amazon Bedrock, use your usual AWS credentials (`AWS_PROFILE`, SSO, or keys
+in the environment); no region is needed. A Bedrock API key in
+`AWS_BEARER_TOKEN_BEDROCK` works too, with `AWS_REGION` set to the key's region. Start the daemon with `--provider bedrock` and name Claude
 models by their cross-region inference profile, like
 `bedrock/global.anthropic.claude-opus-5-5`, which AWS routes to whichever
 region holds the model (from any source region the profile supports), or `--provider bedrock-openai` for `bedrock-openai/openai.gpt-6-sol`.

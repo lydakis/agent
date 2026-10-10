@@ -38,7 +38,7 @@ features that depend on the first-party APIs.
 
 `--provider bedrock` binds Claude on runtime and `--provider bedrock-openai`
 binds OpenAI and other models on Mantle, in the region the AWS tools would
-use, else us-east-1 ([regions and model access](#regions-and-model-access)).
+use, else us-east-1 for SigV4 ([regions and model access](#regions-and-model-access)).
 Claude was first bound on Mantle too, because both model vendors document it
 and because its quota shape suits a fleet: separate input and output
 allowances with no output burndown and no request cap, and a body taken
@@ -76,6 +76,8 @@ account reached every model without a region being picked.
 So `bedrock` now defaults to runtime with cross-region profile ids, and
 `bedrock-openai` stays on Mantle; both resolve the region in Claude Code's
 order and use `AWS_BEARER_TOKEN_BEDROCK` when it is set, as both tools do.
+A key gets no us-east-1 fallback: AWS documents that a short-term key works
+only in the region that made it, and Codex refuses a key with no region.
 Discovery lists runtime's models as the active system-defined inference
 profiles of the control plane (`bedrock.{region}.amazonaws.com`, which signs
 under runtime's name, `bedrock`), so the list shows `global.` and the

@@ -2204,12 +2204,13 @@ test('connecting a provider keeps the others, saves only what was typed, restart
   assert.equal(html.match(/<optgroup label="Amazon Bedrock">/g).length, 1);
   assert.match(html, /<option value="bedrock-openai\/grok">grok<\/option>/);
   // A Bedrock key, once saved, stays in use when the region changes and its field is left empty;
-  // a region left empty is the profile's to name.
+  // a key works only in its own region, so it needs one named.
   await p.connectProvider('bedrock', { AWS_REGION: 'us-east-1', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: 'k' });
-  await p.connectProvider('bedrock', { AWS_REGION: '', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: '' });
+  await assert.rejects(p.connectProvider('bedrock', { AWS_REGION: '', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: '' }), /Region is required with a Bedrock API key/);
+  await p.connectProvider('bedrock', { AWS_REGION: 'us-west-2', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: '' });
   assert.equal(env.AGENT_PROVIDER, 'openai bedrock bedrock-openai');
   assert.equal(env.AWS_BEARER_TOKEN_BEDROCK, 'k');
-  assert.equal(env.AWS_REGION, undefined);
+  assert.equal(env.AWS_REGION, 'us-west-2');
   // Removing Bedrock removes both of its APIs, its key, and a default model on either.
   calls.length = 0;
   await p.removeProvider('bedrock');

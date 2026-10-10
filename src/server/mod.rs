@@ -459,9 +459,23 @@ impl ProviderSpec {
         let default_key = default_key
             .filter(|&key| key != BEDROCK_KEY || env(key).is_some_and(|v| !v.is_empty()));
         let default_url = if default_url.contains("{region}") && url.is_none() {
-            let region = agent_runtime::provider::aws::region(env, read).map_err(|reason| {
+            use agent_runtime::provider::aws;
+            let region = aws::region(env, read).map_err(|reason| {
                 Error::with("invalid_provider_spec", format!("{spec}: {reason}"))
             })?;
+            let region = match (region, default_key) {
+                (Some(region), _) => region,
+                // Short-term Bedrock API keys work only in the region that
+                // made them (AWS documents), so a key needs its region named,
+                // as Codex requires; SigV4 falls back as Claude Code does.
+                (None, Some(key)) => {
+                    return Err(Error::with(
+                        "invalid_provider_spec",
+                        format!("{spec}: {key} needs AWS_REGION, the region the key works in"),
+                    ));
+                }
+                (None, None) => aws::DEFAULT_REGION.to_owned(),
+            };
             default_url.replace("{region}", &region)
         } else {
             default_url.to_owned()
@@ -2996,6 +3010,14 @@ mod tests {
             .unwrap();
         assert_eq!(error.code, "invalid_provider_spec");
         assert!(error.detail.unwrap().starts_with("bedrock: AWS_REGION is"));
+        // A key with no region named is refused: short-term keys work only in
+        // their own region.
+        let unplaced = |name: &str| (name == "AWS_BEARER_TOKEN_BEDROCK").then(|| "key".to_owned());
+        let error = ProviderSpec::parse_with("bedrock", &unplaced, &none)
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "invalid_provider_spec");
+        assert!(error.detail.unwrap().contains("needs AWS_REGION"));
         let empty = |name: &str| (name == "AWS_BEARER_TOKEN_BEDROCK").then(String::new);
         assert!(
             ProviderSpec::parse_with("bedrock", &empty, &none)

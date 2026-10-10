@@ -2274,7 +2274,7 @@ function detach() { save(); Daemon.close(); }
 const AWS = 'Signs in with your AWS CLI (version 2) login for the profile (aws configure, or aws sso login), or with a Bedrock API key.';
 // A field that is `local` is the form's own choice, never saved.
 const BEDROCK = [
-  { key: 'AWS_REGION', label: 'Region', hint: "optional: the profile's, else us-east-1" },
+  { key: 'AWS_REGION', label: 'Region', hint: "the key's; with AWS login, optional" },
   { key: 'AUTH', label: 'Sign in with', local: true, choices: [['aws', 'AWS login'], ['key', 'Bedrock API key']] },
   { key: 'AWS_PROFILE', label: 'AWS profile', hint: 'default' },
   { key: 'AWS_BEARER_TOKEN_BEDROCK', label: 'Bedrock API key', hint: 'optional', secret: true },
@@ -2439,6 +2439,8 @@ async function connectProvider(id, values) {
   // The region names the endpoint; left empty, the daemon takes the profile's, else us-east-1.
   if (c.parts && values.AWS_REGION && !/^[a-z]{2}(-[a-z]+)+-\d+$/.test(values.AWS_REGION)) throw new Error(`Region must look like us-east-1, not "${values.AWS_REGION}"`);
   if (c.parts && !aws && !values.AWS_BEARER_TOKEN_BEDROCK && !saved) throw new Error('Bedrock API key is required');
+  // A short-term key works only in the region that made it, so signing in with a key names one.
+  if (c.parts && !aws && !values.AWS_REGION) throw new Error('Region is required with a Bedrock API key');
   const changes = { AGENT_PROVIDER: [...specs, ...providerSpecs(c.id)].join(' ') };
   // A key left empty keeps the one saved; another field left empty is cleared, the shell's value too.
   for (const f of c.fields) if (!f.local && (!f.secret || values[f.key])) changes[f.key] = values[f.key] || '';

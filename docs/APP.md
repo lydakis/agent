@@ -117,8 +117,9 @@ model from any of them (demo `?first`).
 
 Each provider asks for what it needs to sign in; Bedrock takes an AWS profile
 or a Bedrock API key, and serves Claude and its other models as one provider.
-Its region is optional: the daemon takes the profile's, else us-east-1, and
-Claude runs through cross-region inference profiles, which AWS routes to
+With the AWS login its region is optional: the daemon takes the profile's,
+else us-east-1. A Bedrock API key needs the region it was made in. Claude
+runs through cross-region inference profiles, which AWS routes to
 whichever region holds the model, so the region no longer decides which Claude
 models are offered (within the source regions each profile supports).
 

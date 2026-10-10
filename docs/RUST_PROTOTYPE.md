@@ -407,7 +407,9 @@ order: `AWS_REGION`, `AWS_DEFAULT_REGION`, the `region` of the active profile
 (`AWS_PROFILE`, else `default`) in the AWS shared credentials file and then
 the config file, else us-east-1; the first value set must be shaped like a region,
 or the spec is refused naming where it came from. Both use a Bedrock API key when `AWS_BEARER_TOKEN_BEDROCK` is set, and
-SigV4 otherwise. `provider_models` lists runtime's models as the active
+SigV4 otherwise; a key takes no us-east-1 fallback, since a short-term key works
+only in the region that made it, so with nothing naming a region the spec is
+refused (Codex requires a region for keys too). `provider_models` lists runtime's models as the active
 system-defined inference profiles the Bedrock control plane in its region
 names (`ListInferenceProfiles`), and Mantle's as its host's `/v1/models`.
 Any `bedrock-mantle.{region}.api.aws` or `bedrock-runtime.{region}.amazonaws.com`

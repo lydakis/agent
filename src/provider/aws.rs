@@ -56,22 +56,22 @@ const ENVIRONMENT: [&str; 3] = [
     "AWS_SESSION_TOKEN",
 ];
 pub const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
-/// Where calls go when nothing names a region, as Claude Code does:
+/// Where SigV4 calls go when nothing names a region, as Claude Code does:
 /// a source region for the US and global inference profiles in AWS's
 /// support matrix.
-const DEFAULT_REGION: &str = "us-east-1";
+pub const DEFAULT_REGION: &str = "us-east-1";
 
 /// The region Bedrock calls are made in, in Claude Code's order:
 /// `AWS_REGION`, `AWS_DEFAULT_REGION`, the active profile's `region`
 /// (`AWS_PROFILE`, else `default`) in the shared credentials file and then
-/// the config file, else us-east-1. An empty value is unset; the first one
+/// the config file; `None` when none names one. An empty value is unset; the first one
 /// set must be shaped like a region, or the reason names where it came
 /// from, so a typo never sends signed calls to another region. `read`
 /// reads a file; tests give it their own.
 pub fn region(
     env: &dyn Fn(&str) -> Option<String>,
     read: &dyn Fn(&str) -> Option<String>,
-) -> std::result::Result<String, String> {
+) -> std::result::Result<Option<String>, String> {
     let profile = env("AWS_PROFILE")
         .map(|profile| profile.trim().to_owned())
         .filter(|profile| !profile.is_empty())
@@ -109,13 +109,13 @@ pub fn region(
         .filter_map(|(source, value)| Some((source, value?.trim().to_owned())))
         .find(|(_, value)| !value.is_empty())
     else {
-        return Ok(DEFAULT_REGION.to_owned());
+        return Ok(None);
     };
     match region
         .bytes()
         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
     {
-        true => Ok(region),
+        true => Ok(Some(region)),
         false => Err(format!("{source} is {region:?}, which is not a region")),
     }
 }
@@ -794,7 +794,7 @@ mod tests {
     }
 
     #[test]
-    fn the_region_comes_from_the_environment_then_the_profile_then_us_east_1() {
+    fn the_region_comes_from_the_environment_then_the_profile() {
         let config = "[default]\nregion = eu-west-1\n\n[profile work]\noutput = json\nregion=us-west-2\n[sso-session work]\nregion = ap-south-1\n";
         let credentials = "[work]\naws_access_key_id = x\nregion = ca-central-1\n";
         let read = |path: &str| match path {
@@ -812,7 +812,7 @@ mod tests {
                     .map(|(_, value)| (*value).to_owned())
             }
         };
-        let resolve = |pairs| region(&env(pairs), &read).unwrap();
+        let resolve = |pairs| region(&env(pairs), &read).unwrap().unwrap_or_default();
         assert_eq!(
             resolve(&[("AWS_REGION", "us-east-2"), ("HOME", "/h")]),
             "us-east-2"
@@ -857,11 +857,9 @@ mod tests {
             resolve(&[("AWS_PROFILE", "work"), ("AWS_CONFIG_FILE", "/elsewhere")]),
             "sa-east-1"
         );
-        assert_eq!(
-            resolve(&[("HOME", "/h"), ("AWS_PROFILE", "other")]),
-            "us-east-1"
-        );
-        assert_eq!(resolve(&[]), "us-east-1");
+        // Nothing names one: the caller picks the fallback.
+        assert_eq!(resolve(&[("HOME", "/h"), ("AWS_PROFILE", "other")]), "");
+        assert_eq!(resolve(&[]), "");
     }
 
     #[test]
