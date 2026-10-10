@@ -26,7 +26,7 @@ window.Daemon = (() => {
       readFile: (path) => invoke('read_file', { path }),
       listFiles: (dir) => invoke('list_files', { dir }),
       gitView: (dir) => invoke('git_view', { dir }),
-      memoryView: (dir) => invoke('memory_view', { dir: dir ?? null }),
+      memoryView: (project) => invoke('memory_view', { project: project ?? null }),
       gitDiff: ({ root, path = null, from = null, untracked = false, commit = null }) => invoke('git_diff', { root, path, from, untracked, commit }),
       attach: (after) => invoke('attach', { after }),
       replaceDaemon: () => invoke('replace_daemon'),
@@ -514,9 +514,9 @@ window.Daemon = (() => {
     listFiles: async (dir) => ({ root: dir, files: Object.keys(FILES).sort(), more: false }),
     branch: async (dir) => { const m = /\/worktrees\/([^/]+)$/.exec(dir ?? ''); return m ? `agent/${m[1]}` : null; },
     // The demo's memory: yours, and the demo project's, which a task adds to as it works.
-    memoryView: async (dir) => {
+    memoryView: async (project) => {
       const scope = (name) => { const d = name ? `${MEMORY_ROOT}/projects/${name}` : MEMORY_ROOT; return { name, dir: d, facts: (MEMORY[name ?? ''] ?? []).map((f) => ({ ...f, path: `${d}/${f.name}.md` })) }; };
-      return { user: scope(null), projects: dir == null ? ['demo', 'notes'].map(scope) : [scope('demo')], more: 0 };
+      return { user: scope(null), projects: project == null ? ['demo', 'notes'].map(scope) : [scope(project)], more: 0 };
     },
     // The demo's repository: the project folder on main and each task's worktree on its branch, with
     // the changes a task that edits leaves before it commits.

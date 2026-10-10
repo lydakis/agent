@@ -546,13 +546,17 @@ async fn git_view(
 async fn memory_view(
     windows: State<'_, Windows>,
     window: tauri::WebviewWindow,
-    dir: Option<String>,
+    project: Option<String>,
 ) -> Result<Value, String> {
     windows.of(&window)?.here("Memory")?;
+    if let Some(name) = &project
+        && !project::valid_name(name)
+    {
+        return Err(format!("project_invalid: {name}"));
+    }
     let home = std::env::var_os("HOME").ok_or("no HOME for ~/.agents/memory")?;
-    let dir = dir.map(|d| file_path(&d, Some(home.clone()))).transpose()?;
     let root = std::path::Path::new(&home).join(".agents/memory");
-    blocking(move || Ok(memory::view(&root, dir.as_deref()))).await
+    blocking(move || Ok(memory::view(&root, project.as_deref()))).await
 }
 
 /// The diff of one change under `root`, or of one commit (`commit`).

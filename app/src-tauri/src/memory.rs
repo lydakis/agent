@@ -495,10 +495,10 @@ fn check(dir: &Path) -> Value {
 const MAX_PROJECTS: usize = 100;
 
 /// What the app shows of memory, and what it tells a coordinator changed:
-/// the person's facts, and the project's of the folder `dir` is in, or with
-/// no folder every project's, each fact with its file and when it was last
-/// written. A folder that is not all facts says so in place of its facts.
-pub fn view(root: &Path, dir: Option<&Path>) -> Value {
+/// the person's facts, and `project`'s, or with no project every project's,
+/// each fact with its file and when it was last written. A folder that is not
+/// all facts says so in place of its facts.
+pub fn view(root: &Path, project: Option<&str>) -> Value {
     let scope = |dir: PathBuf, name: Option<&str>| {
         let listed = facts(&dir).map(|all| {
             all.iter()
@@ -522,16 +522,8 @@ pub fn view(root: &Path, dir: Option<&Path>) -> Value {
         out
     };
     let projects = root.join("projects");
-    let (names, more) = match dir {
-        // A folder in no project has none; one whose project file is broken says so.
-        Some(dir) => match project_of(dir) {
-            Ok(name) => (vec![name], 0),
-            Err(error) if error.starts_with("project_unknown: ") => (Vec::new(), 0),
-            Err(error) => {
-                let user = scope(root.to_path_buf(), None);
-                return json!({"user": user, "projects": [{"name": null, "dir": dir, "error": error}], "more": 0});
-            }
-        },
+    let (names, more) = match project {
+        Some(name) => (vec![name.to_owned()], 0),
         None => {
             let mut names: Vec<String> = std::fs::read_dir(&projects)
                 .into_iter()
@@ -592,7 +584,7 @@ mod tests {
         assert_eq!(fact["path"], json!(root.join("short-replies.md")));
         assert!(fact["modified"].as_u64().unwrap() > 0);
         assert_eq!(shown["projects"], json!([]));
-        // Every project's at Home; the folder's own project elsewhere.
+        // Every project's at Home; one project's in it.
         let project = root.join("projects/demo");
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(project.join("bad.md"), "not a fact").unwrap();
@@ -604,13 +596,8 @@ mod tests {
                 .unwrap()
                 .starts_with("memory_invalid: ")
         );
-        let work = root.join("work");
-        std::fs::create_dir_all(work.join(".agents")).unwrap();
-        std::fs::write(work.join(".agents/project.toml"), "name = \"demo\"\n").unwrap();
-        assert_eq!(view(&root, Some(&work))["projects"][0]["name"], "demo");
-        assert_eq!(view(&root, Some(&root))["projects"], json!([]));
-        std::fs::write(work.join(".agents/project.toml"), "name = [\n").unwrap();
-        assert!(view(&root, Some(&work))["projects"][0]["error"].is_string());
+        assert_eq!(view(&root, Some("demo"))["projects"][0]["name"], "demo");
+        assert_eq!(view(&root, Some("new"))["projects"][0]["facts"], json!([]));
         let _ = std::fs::remove_dir_all(&root);
     }
 

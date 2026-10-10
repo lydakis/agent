@@ -3177,7 +3177,7 @@ test("a coordinator's task update says what changed in memory since it last hear
   p.upsert({ name: 'demo.build', bot_id: 2, status: 'idle', created_by: 'demo.lead', created_by_id: 1 });
   const turn = async (n) => { await p.onEvent({ event: 'accepted', bot: 'demo.build', turn: n, data: { node: 1 } }); await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: n, data: { status: 'completed' } }); await p.tick(); await settle(); };
   await turn(2);
-  assert.equal(sent.length, 1); assert.deepEqual(dirs, ['/w']);
+  assert.equal(sent.length, 1); assert.deepEqual(dirs, ['demo']);
   assert.match(sent[0].prompt, /^Task updates: [^]*\n\nMemory changed since you last heard; each fact is a file, read before relying on it:\n- saved: \/m\/projects\/demo\/cookie\.md: the cookie is written once$/);
   // Told once: the next update has no memory lines, and a fact removed since is named.
   p.S.wakes.get('demo.lead').last = 0;
@@ -3209,21 +3209,21 @@ test("the Memory sheet lists a project's facts and yours, newest first, and open
   const doc = p.context.document;
   await p.act({ dataset: { act: 'memory', who: 'demo.lead' } }); await settle();
   const html = doc.getElementById('sheet').innerHTML;
-  assert.deepEqual(asked, ['/w']);
+  assert.deepEqual(asked, ['demo']);
   assert.match(html, /<h4>demo memory<\/h4>/);
   assert.ok(html.indexOf('about newer') < html.indexOf('about older') && html.indexOf('about older') < html.indexOf('about you-old'));
   await p.act({ dataset: { act: 'open-fact', v: '/m/projects/demo/newer.md' } }); await settle();
   assert.equal(p.S.selected, '▤/m/projects/demo/newer.md'); assert.equal(p.S.ui.sheet, false);
   // At Home: every project's, yours first.
   await p.act({ dataset: { act: 'memory', who: '' } }); await settle();
-  assert.deepEqual(asked, ['/w', null]);
+  assert.deepEqual(asked, ['demo', null]);
   assert.match(doc.getElementById('sheet').innerHTML, /<h4>Memory<\/h4>/);
 });
 
-test('a Memory sheet opened again shows only the newest answer, and a broken project file says so', async () => {
+test('a Memory sheet opened again shows only the newest answer', async () => {
   let release;
   const slow = new Promise((r) => { release = r; });
-  const answers = [() => slow, async () => ({ user: { name: null, dir: '/m', facts: [] }, projects: [{ name: null, dir: '/w', error: 'invalid project file' }], more: 0 })];
+  const answers = [() => slow, async () => ({ user: { name: null, dir: '/m', facts: [] }, projects: [{ name: 'demo', dir: '/m/projects/demo', error: 'memory_invalid: bad.md' }], more: 0 })];
   const p = page({ memoryView: () => answers.shift()() });
   p.upsert({ name: 'demo.lead', bot_id: 1, workspace: '/w' });
   const doc = p.context.document;
@@ -3232,8 +3232,7 @@ test('a Memory sheet opened again shows only the newest answer, and a broken pro
   release({ user: { name: null, dir: '/m', facts: [] }, projects: [], more: 0 }); await first; await settle();
   const html = doc.getElementById('sheet').innerHTML;
   assert.match(html, /<h4>demo memory<\/h4>/);
-  assert.match(html, /This project[^]*invalid project file/);
-  assert.doesNotMatch(html, /No \.agents\/project\.toml/);
+  assert.match(html, /demo[^]*memory_invalid: bad\.md/);
 });
 
 test('a coordinator hears once, when it rests, of turns its tasks ended that it did not ask for', async () => {

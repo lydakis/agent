@@ -1116,8 +1116,9 @@ async function wake(lead) {
 // itself is not news. The lines come after the prompt's start, so its cached prefix stays.
 const OPENED_AT = Date.now(), MEMORY_LINES = 20;
 async function memoryNews(l, w) {
-  if (S.config?.host || !l.workspace || !Daemon.memoryView) return null;
-  const v = await Daemon.memoryView(l.workspace);
+  const project = leadProject(l.name);
+  if (S.config?.host || !project || !Daemon.memoryView) return null;
+  const v = await Daemon.memoryView(project);
   const read = [v.user, ...(v.projects ?? [])].filter((sc) => sc?.facts), now = new Map();
   for (const sc of read) for (const f of sc.facts) now.set(f.path, f);
   // Each fact as last told, by its file and when it was written; a folder that could not be read keeps its own.
@@ -2320,12 +2321,12 @@ let memoryAsk = 0;
 async function openMemorySheet(lead) {
   closeMenu();
   const ask = ++memoryAsk;
-  const b = lead ? bot(lead) : null, project = lead ? leadProject(lead) : null;
+  const project = lead ? leadProject(lead) : null;
   sheetFor = null; sheetKind = 'memory';
   $('sheet').innerHTML = `<h4>${project ? `${esc(project)} memory` : 'Memory'}</h4><p class="hint">reading…</p>`;
   $('sheetwrap').classList.add('on'); S.ui.sheet = true;
   let v = null, error = '';
-  try { v = await Daemon.memoryView(b?.workspace ?? null); } catch (e) { error = String(e?.message ?? e); }
+  try { v = await Daemon.memoryView(project); } catch (e) { error = String(e?.message ?? e); }
   // A sheet closed, or opened again since, while memory was read shows only its own answer.
   if (!S.ui.sheet || sheetKind !== 'memory' || ask !== memoryAsk) return;
   $('sheet').innerHTML = memoryHTML(v, project, error);
@@ -2333,14 +2334,13 @@ async function openMemorySheet(lead) {
 }
 function memoryHTML(v, project, error) {
   const now = Date.now(), you = v ? { ...v.user, label: 'You' } : null;
-  const projects = (v?.projects ?? []).map((sc) => ({ ...sc, label: sc.name ?? 'This project' }));
+  const projects = (v?.projects ?? []).map((sc) => ({ ...sc, label: sc.name }));
   const scopes = v ? (project ? [...projects, you] : [you, ...projects]) : [];
   const fact = (f) => `<button type="button" class="mrow" data-act="open-fact" data-v="${esc(f.path)}" title="${esc(f.path)}"><span class="md">${esc(f.description)}</span><span class="mm">${esc(f.name)} · ${esc(f.type)} · ${esc(f.source)} · ${esc(agoText(now - f.modified))}</span></button>`;
   const scope = (sc) => `<div class="mscope"><div class="mh">${esc(sc.label)} <span class="d">${esc(sc.dir)}</span></div>${sc.error ? `<p class="hint warn">${esc(sc.error)}</p>` : sc.facts.length ? [...sc.facts].sort((a, b) => b.modified - a.modified).map(fact).join('') : '<p class="hint">Nothing saved yet.</p>'}</div>`;
   const lede = project ? `Facts the project's lead and every thread share, and yours, which hold across projects. Agents save them with the memory skill.` : `Yours hold across projects; a project's are shared by its lead and every thread. Agents save them with the memory skill.`;
-  const none = project && v && !projects.length ? `<p class="hint">No .agents/project.toml names this folder's project, so it has no memory of its own.</p>` : '';
   const more = v?.more ? `<p class="hint">${v.more} more projects not shown.</p>` : '';
-  return `<h4>${project ? `${esc(project)} memory` : 'Memory'}</h4><p class="hint">${lede}</p>${error ? `<p class="hint warn">${esc(error)}</p>` : ''}${none}<div class="mlist">${scopes.map(scope).join('')}${more}</div>
+  return `<h4>${project ? `${esc(project)} memory` : 'Memory'}</h4><p class="hint">${lede}</p>${error ? `<p class="hint warn">${esc(error)}</p>` : ''}<div class="mlist">${scopes.map(scope).join('')}${more}</div>
     <div class="foot"><button type="button" class="sbtn primary" data-act="close-sheet">Done</button></div>`;
 }
 function agoText(ms) {
