@@ -2,10 +2,9 @@
 //! daemon. The page owns the state model and the protocol logic, exactly as
 //! the prototype did; this side connects, forwards notifications as window
 //! events, and relays requests. Beside that it reads the files the app owns
-//! (projects, profiles, swarms, triggers) and makes a swarm's shared
-//! worktree; run with `--swarm-post` it is a swarm's post tool (see
-//! `swarm`), and with `--trigger` or `--trigger-fire` it adds, lists,
-//! fires or removes triggers (see `trigger`). `--setup` writes what a start
+//! (projects, profiles, triggers) and a swarm's board, and runs the swarm
+//! skill's script for you (see `swarm`); run with `--trigger` or
+//! `--trigger-fire` it adds, lists, fires or removes triggers (see `trigger`). `--setup` writes what a start
 //! writes (see `machine_setup`), and `--unlink-skills` removes the links to the
 //! skills it ships (see `skills`); the Homebrew cask runs both.
 //!
@@ -330,7 +329,7 @@ fn policy(
         Some(dir) => workspace_path(std::path::Path::new(&dir))?,
         None => return Err("no workspace".into()),
     };
-    compose(std::path::Path::new(&dir), profile.as_deref(), None)
+    compose(std::path::Path::new(&dir), profile.as_deref())
 }
 
 /// The folder Home works in: yours. Home reads every project's agents
@@ -343,7 +342,7 @@ fn home_dir(windows: State<'_, Windows>, window: tauri::WebviewWindow) -> Result
 
 /// The profiles a folder offers as identities for a swarm's agents, with
 /// what each says it is and the model it names: the folder's and the
-/// user's, not the roles the app gives a coordinator and a swarm's agents.
+/// user's, not the role the app gives a coordinator.
 #[tauri::command]
 fn profiles(
     windows: State<'_, Windows>,
@@ -369,13 +368,8 @@ fn profiles(
 /// The roles the app ships, used where neither the folder nor the user has
 /// a file of that name. They are `policy::CLIENT_ROLES`, so no agent is
 /// offered one as a role to start a peer in.
-const BUILT_IN: [(&str, &str); 4] = [
+const BUILT_IN: [(&str, &str); 2] = [
     ("coordinator", include_str!("../../agents/coordinator.md")),
-    ("swarm-flat", include_str!("../../agents/swarm-flat.md")),
-    (
-        "swarm-council",
-        include_str!("../../agents/swarm-council.md"),
-    ),
     ("home", include_str!("../../agents/home.md")),
 ];
 
@@ -882,13 +876,8 @@ async fn discover_models(
 
 /// Too much or unreadable text fails with the CLI's `--agents` code, and
 /// `/new` creates nothing: a bot without its workspace's rules is worse
-/// than no bot. `also` names a role whose text follows the profile's, as a
-/// swarm's rules follow an identity's; the profile's model and tools stand.
-fn compose(
-    workspace: &std::path::Path,
-    profile: Option<&str>,
-    also: Option<&str>,
-) -> Result<Value, String> {
+/// than no bot.
+fn compose(workspace: &std::path::Path, profile: Option<&str>) -> Result<Value, String> {
     use agent_client::policy::Profile;
     let failed = |error: agent_client::policy::Failure| format!("{}: {error}", error.code());
     let find = |name: &str| -> Result<Profile, String> {
@@ -901,16 +890,7 @@ fn compose(
                 .ok_or_else(|| format!("profile_not_found: no .agents/agents/{name}.md")),
         }
     };
-    let mut role = profile.map(find).transpose()?;
-    if let (Some(role), Some(also)) = (role.as_mut(), also) {
-        let also = find(also)?;
-        role.body = [role.body.as_str(), also.body.as_str()]
-            .iter()
-            .filter(|body| !body.is_empty())
-            .copied()
-            .collect::<Vec<_>>()
-            .join("\n\n");
-    }
+    let role = profile.map(find).transpose()?;
     let memory = agent_client::policy::memory_indexes(workspace).map_err(failed)?;
     let composed =
         agent_client::policy::instructions(workspace, role.as_ref(), &memory).map_err(failed)?;
@@ -949,15 +929,15 @@ mod policy_tests {
         let root = root.canonicalize().unwrap();
         let file = root.join("AGENTS.md");
         std::fs::write(&file, "rule").unwrap();
-        let composed = compose(&root, None, None).unwrap();
+        let composed = compose(&root, None).unwrap();
         let rule = format!("{}\n\nrule", file.display());
         assert!(composed["instructions"].as_str().unwrap().contains(&rule));
         std::fs::write(&file, "x".repeat(agent_client::policy::MAX_INSTRUCTIONS)).unwrap();
-        let error = compose(&root, None, None).unwrap_err();
+        let error = compose(&root, None).unwrap_err();
         assert!(error.starts_with("instructions_limit: "), "{error}");
         assert!(error.contains(file.to_str().unwrap()), "{error}");
         std::fs::write(&file, [0xff, 0xfe]).unwrap();
-        let error = compose(&root, None, None).unwrap_err();
+        let error = compose(&root, None).unwrap_err();
         assert!(error.starts_with("instructions_unreadable: "), "{error}");
         assert!(error.contains(file.to_str().unwrap()), "{error}");
         std::fs::remove_dir_all(root).unwrap();
@@ -989,36 +969,23 @@ mod policy_tests {
                 .starts_with("profile_not_found")
         );
         // Many made at once each write their own file, and the role is whole.
+        std::fs::remove_file(&path).unwrap();
         let calls: Vec<_> = (0..8)
             .map(|_| {
                 let home = home.clone();
-                std::thread::spawn(move || own_role(&home, "swarm-flat"))
+                std::thread::spawn(move || own_role(&home, "coordinator"))
             })
             .collect();
         for call in calls {
             call.join().unwrap().unwrap();
         }
-        let swarm = home.join(".agents/agents/swarm-flat.md");
-        assert_eq!(std::fs::read_to_string(&swarm).unwrap(), BUILT_IN[1].1);
-        let council = own_role(&home, "swarm-council").unwrap();
-        assert_eq!(std::fs::read_to_string(&council).unwrap(), BUILT_IN[2].1);
-        std::fs::write(&council, "Custom council rules.").unwrap();
-        own_role(&home, "swarm-council").unwrap();
-        assert_eq!(
-            std::fs::read_to_string(council).unwrap(),
-            "Custom council rules."
-        );
-        assert_eq!(std::fs::read_to_string(&swarm).unwrap(), BUILT_IN[1].1);
-        // Nothing but the roles is left beside them.
-        let mut names: Vec<_> = std::fs::read_dir(home.join(".agents/agents"))
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), BUILT_IN[0].1);
+        // Nothing but the role is left beside it.
+        let names: Vec<_> = std::fs::read_dir(home.join(".agents/agents"))
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
-        names.sort();
-        assert_eq!(
-            names,
-            ["coordinator.md", "swarm-council.md", "swarm-flat.md"]
-        );
+        assert_eq!(names, ["coordinator.md"]);
         std::fs::remove_dir_all(home).unwrap();
     }
 
@@ -1028,7 +995,7 @@ mod policy_tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let root = root.canonicalize().unwrap();
-        let built = compose(&root, Some("coordinator"), None).unwrap();
+        let built = compose(&root, Some("coordinator")).unwrap();
         let text = built["instructions"].as_str().unwrap();
         assert!(text.contains("# Role: coordinator\n\nYou coordinate the work in this folder."));
         assert!(text.contains("git worktree add -b agent/NAME"));
@@ -1048,7 +1015,7 @@ mod policy_tests {
             "---\nmodel: openai/gpt-6-luna\ntools: shell, wait\n---\nOur own way.",
         )
         .unwrap();
-        let own = compose(&root, Some("coordinator"), None).unwrap();
+        let own = compose(&root, Some("coordinator")).unwrap();
         assert!(
             own["instructions"]
                 .as_str()
@@ -1058,7 +1025,7 @@ mod policy_tests {
         assert_eq!(own["model"], "openai/gpt-6-luna");
         assert_eq!(own["tools"], serde_json::json!(["shell", "wait"]));
         assert!(
-            compose(&root, Some("nobody"), None)
+            compose(&root, Some("nobody"))
                 .unwrap_err()
                 .starts_with("profile_not_found: ")
         );
@@ -1195,16 +1162,9 @@ async fn pull(
     Ok(json!({"events": batch, "closed": false}))
 }
 
-/// Every swarm in `~/.agent/swarms`, and the folders there that are not
-/// readable swarms.
-#[tauri::command]
-fn swarms(windows: State<'_, Windows>, window: tauri::WebviewWindow) -> Result<Value, String> {
-    swarm::list(&swarms_of(&*windows.of(&window)?)?)
-}
-
 /// The swarms of the store this window's daemon runs. A swarm lives on one
 /// machine, this one: its board is in this machine's files and its agents'
-/// scripts run this app.
+/// script runs here.
 fn swarms_of(state: &Shared) -> Result<PathBuf, String> {
     if let Some(host) = state.host() {
         return Err(format!(
@@ -1216,9 +1176,8 @@ fn swarms_of(state: &Shared) -> Result<PathBuf, String> {
     swarm::root(&store.ok_or("detached: swarms are read once the window is attached")?)
 }
 
-/// A change to a swarm's files waits for its board's lock, which an agent's
-/// post holds while it sends; it waits on the blocking pool, never on the
-/// window's thread or the async workers.
+/// File work a command does off the window's thread and the async workers:
+/// it waits on the blocking pool.
 async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
@@ -1227,81 +1186,26 @@ async fn blocking<T: Send + 'static>(
         .map_err(|e| e.to_string())?
 }
 
-/// Start a swarm in a project folder, agents and all (see `swarm::start`).
-/// `mix` is its rows of identity, model and share.
+/// The swarm skill's script, run for you with `args` (see `swarm::run`).
 #[tauri::command]
-#[allow(clippy::too_many_arguments)]
-async fn swarm_start(
+async fn swarm_run(
     windows: State<'_, Windows>,
     window: tauri::WebviewWindow,
-    project: String,
-    folder: String,
-    goal: String,
-    shared: bool,
-    mix: Vec<Value>,
-    agents: usize,
-    budget_tokens: u64,
-    council: usize,
+    args: Vec<String>,
 ) -> Result<Value, String> {
     let state = windows.of(&window)?;
-    let root = swarms_of(&state)?;
-    let client = state.client.lock().await.clone().ok_or("detached")?;
-    let mix = (mix.iter())
-        .map(swarm::Mix::from_json)
-        .collect::<Option<Vec<_>>>()
-        .ok_or("invalid_mix: each row is an identity, a model and a share")?;
-    let start = swarm::Start {
-        project,
-        folder: workspace_path(std::path::Path::new(&folder))?.into(),
-        goal,
-        shared,
-        mix,
-        agents,
-        budget_tokens,
-        council,
-        coordinator: None,
+    swarms_of(&state)?;
+    let Target::Local { socket, .. } = &state.config.target else {
+        return Err("remote_unsupported: swarms run on this machine only".into());
     };
-    let app = std::env::current_exe().map_err(|e| e.to_string())?;
-    swarm::start(&client, &root, &app, start).await
+    let agent = state
+        .agent
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("agent"));
+    swarm::run(socket, &agent, &args).await
 }
 
-/// One more agent, from `row` of the swarm's mix.
-#[tauri::command]
-async fn swarm_add(
-    windows: State<'_, Windows>,
-    window: tauri::WebviewWindow,
-    swarm: String,
-    row: usize,
-) -> Result<Value, String> {
-    let state = windows.of(&window)?;
-    let client = state.client.lock().await.clone().ok_or("detached")?;
-    swarm::add(&client, &swarms_of(&state)?, &swarm, row).await
-}
-
-#[tauri::command]
-async fn swarm_leave(
-    windows: State<'_, Windows>,
-    window: tauri::WebviewWindow,
-    swarm: String,
-    member: String,
-) -> Result<Value, String> {
-    let state = windows.of(&window)?;
-    let root = swarms_of(&state)?;
-    let client = state.client.lock().await.clone().ok_or("detached")?;
-    swarm::leave(&client, &root, &swarm, &member).await
-}
-
-#[tauri::command]
-async fn swarm_stop(
-    windows: State<'_, Windows>,
-    window: tauri::WebviewWindow,
-    swarm: String,
-) -> Result<Value, String> {
-    let state = windows.of(&window)?;
-    let client = state.client.lock().await.clone().ok_or("detached")?;
-    swarm::stop(&client, &swarms_of(&state)?, &swarm).await
-}
-
+/// A swarm's board from `offset`, and what it adds up to (see `swarm::board`).
 #[tauri::command]
 async fn swarm_board(
     windows: State<'_, Windows>,
@@ -1309,64 +1213,10 @@ async fn swarm_board(
     swarm: String,
     offset: Option<u64>,
 ) -> Result<Value, String> {
-    let state = windows.of(&window)?;
-    let root = swarms_of(&state)?;
-    // It may wait on the board's lock to settle a change a crash cut short.
-    blocking(move || swarm::board(&root, &swarm, offset)).await
-}
-
-/// Your post, over the window's own connection.
-#[tauri::command]
-async fn swarm_post(
-    windows: State<'_, Windows>,
-    window: tauri::WebviewWindow,
-    swarm: String,
-    text: String,
-) -> Result<Value, String> {
-    let state = windows.of(&window)?;
-    let client = state.client.lock().await.clone().ok_or("detached")?;
-    let act = swarm::Act::Post { text, all: true };
-    swarm::act(&client, &swarms_of(&state)?, &swarm, None, act).await
-}
-
-/// Tell the swarm's working agents when it has passed a share of its
-/// budget, once each; the page asks as its agents finish turns.
-#[tauri::command]
-async fn swarm_check(
-    windows: State<'_, Windows>,
-    window: tauri::WebviewWindow,
-    swarm: String,
-) -> Result<Value, String> {
-    let state = windows.of(&window)?;
-    let client = state.client.lock().await.clone().ok_or("detached")?;
-    swarm::act(
-        &client,
-        &swarms_of(&state)?,
-        &swarm,
-        None,
-        swarm::Act::Check,
-    )
-    .await
-}
-
-/// You approve or deny an open proposal, which decides it.
-#[tauri::command]
-async fn swarm_decide(
-    windows: State<'_, Windows>,
-    window: tauri::WebviewWindow,
-    swarm: String,
-    id: String,
-    approve: bool,
-    reason: String,
-) -> Result<Value, String> {
-    let state = windows.of(&window)?;
-    let client = state.client.lock().await.clone().ok_or("detached")?;
-    let act = swarm::Act::Vote {
-        id,
-        yes: approve,
-        reason,
-    };
-    swarm::act(&client, &swarms_of(&state)?, &swarm, None, act).await
+    let root = swarms_of(&*windows.of(&window)?)?;
+    tokio::task::spawn_blocking(move || swarm::board(&root, &swarm, offset))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Triggers use this machine's launchd, never a remote window's agents.
@@ -1485,9 +1335,9 @@ async fn request(
 const SETUP_FLAG: &str = "--setup";
 
 /// What the app puts on this machine, written at every start so it all leads
-/// to this copy: swarm scripts, the coordinator's `start`, `~/.agent/trigger`
-/// and `~/.agent/memory`, triggers reloaded after a move, and the skills it
-/// ships linked from `~/.agents/skills`. False when any of it failed; each failure is printed
+/// to this copy: `~/.agent/trigger` and `~/.agent/memory`, triggers
+/// reloaded after a move, and the skills it ships linked from
+/// `~/.agents/skills`. False when any of it failed; each failure is printed
 /// and does not stop the rest. A start reloads triggers off the window's way.
 fn machine_setup(background: bool) -> bool {
     let mut ok = true;
@@ -1495,19 +1345,14 @@ fn machine_setup(background: bool) -> bool {
         eprintln!("agent-app: {error}");
         ok = false;
     };
-    if let (Ok(home), Ok(app)) = (swarm::home(), std::env::current_exe()) {
-        swarm::refresh_scripts(&home, &app);
-        if let Err(error) = swarm::write_start_script(&home, &app) {
-            report(&error);
-        }
-        if let Some(state) = home.parent() {
-            for written in [
-                trigger::write_script(state, &app),
-                memory::write_script(state, &app),
-            ] {
-                if let Err(error) = written {
-                    report(&error);
-                }
+    if let (Some(home), Ok(app)) = (std::env::var_os("HOME"), std::env::current_exe()) {
+        let state = PathBuf::from(home).join(".agent");
+        for written in [
+            trigger::write_script(&state, &app),
+            memory::write_script(&state, &app),
+        ] {
+            if let Err(error) = written {
+                report(&error);
             }
         }
         // Ends a fire cut short are finished, and a moved app reloads every
@@ -1540,13 +1385,11 @@ fn machine_setup(background: bool) -> bool {
 }
 
 fn main() {
-    // A swarm's `post` script, a coordinator's `start`, `~/.agent/trigger`,
-    // `~/.agent/memory`, launchd's fires and the Homebrew cask's install and uninstall run this
-    // executable; each acts and exits without a window.
+    // `~/.agent/trigger`, `~/.agent/memory`, launchd's fires and the Homebrew
+    // cask's install and uninstall run this executable; each acts and exits
+    // without a window.
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
-        Some(swarm::POST_FLAG) => std::process::exit(swarm::cli(&args[2..])),
-        Some(swarm::START_FLAG) => std::process::exit(swarm::start_cli(&args[2..])),
         Some(trigger::FLAG) => std::process::exit(trigger::cli(&args[2..])),
         Some(trigger::FIRE_FLAG) => std::process::exit(trigger::fire_cli(&args[2..])),
         Some(trigger::WATCH_FLAG) => std::process::exit(trigger::watch_cli()),
@@ -1605,15 +1448,8 @@ fn main() {
             pull,
             request,
             log,
-            swarms,
-            swarm_start,
-            swarm_add,
-            swarm_leave,
-            swarm_stop,
+            swarm_run,
             swarm_board,
-            swarm_post,
-            swarm_check,
-            swarm_decide,
             triggers,
             trigger,
             trigger_fire,

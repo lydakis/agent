@@ -2573,7 +2573,7 @@ async fn start(client: &Client, trigger: &Trigger) -> Result<i64, String> {
         .dir
         .as_ref()
         .ok_or("invalid_trigger: --start has no folder")?;
-    let policy = crate::compose(dir, None, None)?;
+    let policy = crate::compose(dir, None)?;
     let made = client
         .request(
             "create",

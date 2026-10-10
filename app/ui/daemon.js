@@ -32,7 +32,8 @@ window.Daemon = (() => {
       replaceDaemon: () => invoke('replace_daemon'),
       pull: (session) => invoke('pull', { session }),
       request: (op, params = {}) => invoke('request', { op, params }),
-      swarms: () => invoke('swarms'),
+      // Swarms are the swarm skill's: its script, run for you, starts, adds to, stops and posts to them.
+      swarms: () => invoke('swarm_run', { args: ['list'] }),
       profiles: (dir) => invoke('profiles', { dir }),
       roles: () => invoke('roles'),
       editRole: (name) => invoke('edit_role', { name }),
@@ -44,14 +45,12 @@ window.Daemon = (() => {
       forgetPlan: (id) => invoke('plan_forget', { id }),
       hosts: () => invoke('hosts'),
       openHost: (host) => invoke('open_host', { host }),
-      swarmStart: ({ project, folder, goal, shared, mix, agents, budgetTokens, council }) => invoke('swarm_start', { project, folder, goal, shared, mix, agents, budgetTokens, council: council ?? 0 }),
-      swarmAdd: (swarm, row) => invoke('swarm_add', { swarm, row }),
-      swarmLeave: (swarm, member) => invoke('swarm_leave', { swarm, member }),
-      swarmStop: (swarm) => invoke('swarm_stop', { swarm }),
+      swarmStart: ({ project, folder, goal, shared, mix, agents, budgetTokens }) => invoke('swarm_run', { args: ['start', '--project', project, '--folder', folder, '--agents', String(agents), '--budget', String(budgetTokens / 1e6), ...(shared ? [] : ['--in-project']), ...mix.flatMap((r) => ['--row', [r.model, r.share, r.identity ?? '', r.effort ?? ''].join(',')]), '--', goal] }),
+      swarmAdd: (swarm) => invoke('swarm_run', { args: ['add', '--swarm', swarm] }),
+      swarmStop: (swarm) => invoke('swarm_run', { args: ['stop', '--swarm', swarm] }),
       swarmBoard: (swarm, offset) => invoke('swarm_board', { swarm, offset: offset ?? null }),
-      swarmPost: (swarm, text) => invoke('swarm_post', { swarm, text }),
-      swarmCheck: (swarm) => invoke('swarm_check', { swarm }),
-      swarmDecide: (swarm, id, approve, reason) => invoke('swarm_decide', { swarm, id, approve, reason: reason ?? '' }),
+      swarmPost: (swarm, text) => invoke('swarm_run', { args: ['post', '--swarm', swarm, text] }),
+      swarmCheck: (swarm) => invoke('swarm_run', { args: ['check', '--swarm', swarm] }),
       close: () => tauri.window.getCurrentWindow().close(),
     };
   }
@@ -376,45 +375,24 @@ window.Daemon = (() => {
   }
 
   // ---------- demo swarms ----------
-  // The app's swarm folder, kept in memory: its record and its board. The offset is a line count.
+  // A swarm's folder, kept in memory: its record and its board. The offset is a line count.
   const memberOf = (name) => [...S.swarms.values()].find((sw) => sw.members.includes(name)) ?? null;
   const short = (sw, name) => (name.startsWith(sw.project + '.') ? name.slice(sw.project.length + 1) : name);
-  const seats = (sw) => sw.members.slice(0, sw.council);
-  const swarmRecord = (sw) => ({ swarm: sw.name, dir: sw.dir, project: sw.project, goal: sw.goal, workspace: sw.workspace, budget_tokens: sw.budget, mix: sw.mix.map((r) => ({ ...r })), members: [...sw.members], ids: { ...sw.ids }, rows: { ...sw.rows }, stopped: sw.stopped, council: sw.council, seats: seats(sw) });
-  // Agents made from rows of the mix, each joined and then briefed, as the app's side does.
+  const swarmRecord = (sw) => ({ swarm: sw.name, dir: sw.dir, project: sw.project, goal: sw.goal, workspace: sw.workspace, budget_tokens: sw.budget, mix: sw.mix.map((r) => ({ ...r })), members: [...sw.members], ids: { ...sw.ids }, rows: { ...sw.rows }, stopped: sw.stopped });
+  // Agents made from rows of the mix, each joined and then briefed, as the swarm's script does.
   async function enlist(sw, rows, each, late = false) {
     const bots = [];
     for (const [name, row] of rows) {
-      const b = await api.request('create', { bot: name, model: sw.mix[row].model, effort: sw.mix[row].reasoning ?? null, workspace: sw.workspace, budget_tokens: each });
+      const b = await api.request('create', { bot: name, model: sw.mix[row].model, effort: sw.mix[row].effort ?? null, workspace: sw.workspace, budget_tokens: each });
       sw.members.push(name); sw.ids[name] = b.bot_id; sw.rows[name] = row; bots.push(b);
       sw.made = Math.max(sw.made ?? 0, Number(name.split('-').pop()) || 0);
     }
     for (const [name] of rows) reply(name, `You are ${short(sw, name)}, one of ${sw.members.length} agents in the swarm ${short(sw, sw.name)}.${late ? ' You joined after the others started, so read the board first.' : ''}`);
     return bots;
   }
-  // The board's roles, proposals and streams, by the app's rules: a majority of the seats decides, you
-  // decide alone, and an approved proposal opens its stream with its proposer in it.
-  function councilAct(sw, from, act) {
-    const st = sw.state, line = { at: Date.now(), from };
-    if (act.role) { st.roles[from] = act.role; return [{ ...line, kind: 'role', role: act.role }]; }
-    if (act.join) { st.streams[from] = act.join; return [{ ...line, kind: 'join', stream: act.join }]; }
-    if (act.propose) { const id = `P${st.proposals.length + 1}`; st.proposals.push({ id, stream: act.propose, why: act.why, by: from, at: line.at, votes: {}, status: 'open', decided_by: null }); return [{ ...line, kind: 'propose', id, stream: act.propose, text: act.why }]; }
-    const p = st.proposals.find((x) => x.id === act.vote); if (!p || p.status !== 'open') throw new Error(`decided: ${act.vote}`);
-    p.votes[from] = { yes: act.yes, reason: act.reason ?? '' };
-    const n = sw.council, need = Math.floor(n / 2) + 1, ayes = Object.values(p.votes).filter((v) => v.yes).length, noes = Object.keys(p.votes).length - ayes;
-    const decided = from === 'user' ? act.yes : ayes >= need ? true : n - noes < need ? false : null;
-    const out = [{ ...line, kind: 'vote', id: p.id, yes: act.yes, text: act.reason ?? '' }];
-    if (decided !== null) {
-      p.status = decided ? 'approved' : 'denied'; p.decided_by = from === 'user' ? 'user' : 'council';
-      if (decided) st.streams[p.by] = p.stream;
-      out.push({ at: line.at, from: p.decided_by, kind: 'decision', id: p.id, stream: p.stream, approved: decided, lead: p.by });
-    }
-    return out;
-  }
-  // Who hears a post, as the app's post tool decides: working agents, and idle ones only when named
-  // (or, for your post, when it names nobody).
-  // A stream's post reaches the working agents in its stream and whoever it names, as the app's does.
-  function deliver(sw, from, text, stream, turn = null) {
+  // Who hears a post, as the swarm's script decides: whoever it names, and for your post when it
+  // names nobody, everyone.
+  function deliver(sw, from, text, turn = null) {
     const by = from && turn != null ? { bot: from, turn } : null;
     const named = [...text.matchAll(/@([\w.-]*\w)/g)].map((m) => m[1]);
     for (const m of sw.members) {
@@ -426,56 +404,44 @@ window.Daemon = (() => {
       else if (isNamed || (!from && !named.length)) reply(m, prompt, by);
     }
   }
-  async function agentPost(sw, name, turn, text, stream) {
+  async function agentPost(sw, name, turn, text) {
     const b = S.bots.get(name) ?? GONE; if (b.interrupted || sw.stopped) return;
     const call_id = `call_${++calls}`;
-    emit({ event: 'tool_started', bot: name, turn, data: { call_id, name: 'shell', arguments: JSON.stringify({ command: `"$SWARM/post" ${JSON.stringify(text.length > 40 ? text.slice(0, 39) + '…' : text)}` }), arguments_truncated: false } });
+    emit({ event: 'tool_started', bot: name, turn, data: { call_id, name: 'shell', arguments: JSON.stringify({ command: `"$SWARM" post ${JSON.stringify(text.length > 40 ? text.slice(0, 39) + '…' : text)}` }), arguments_truncated: false } });
     await wait(200);
-    sw.board.push({ at: Date.now(), from: short(sw, name), bot: name, turn, text, ...(stream ? { stream } : {}) });
+    sw.board.push({ at: Date.now(), from: short(sw, name), bot: name, turn, text });
     b.tokens_used += 4000;
     emit({ event: 'tool_completed', bot: name, turn, data: { call_id, node: node({ type: 'function_call_output', call_id, output: JSON.stringify({ exit_code: 0, stdout: '{"posted":true}\n', stderr: '', success: true }) }), artifacts: [] } });
-    deliver(sw, name, text, stream, turn);
+    deliver(sw, name, text, turn);
     await steerIn(name, turn);
   }
-  // An agent's role, proposal, vote or join, run as its script.
-  async function agentAct(sw, name, turn, script, args, act) {
-    const b = S.bots.get(name) ?? GONE; if (b.interrupted || sw.stopped) return;
-    const call_id = `call_${++calls}`;
-    emit({ event: 'tool_started', bot: name, turn, data: { call_id, name: 'shell', arguments: JSON.stringify({ command: `"$SWARM/${script}" ${args}` }), arguments_truncated: false } });
-    await wait(200);
-    sw.board.push(...councilAct(sw, short(sw, name), act).map((l) => (l.from === 'council' ? l : { ...l, bot: name, turn })));
-    b.tokens_used += 3000;
-    emit({ event: 'tool_completed', bot: name, turn, data: { call_id, node: node({ type: 'function_call_output', call_id, output: JSON.stringify({ exit_code: 0, stdout: '{"posted":true}\n', stderr: '', success: true }) }), artifacts: [] } });
-    await steerIn(name, turn);
-  }
-  // Four scripted roles; `@N` names the swarm's Nth agent.
+  // Four scripted roles; `@N` names the swarm's Nth agent, and `work` is one of the script's work commands.
   const ROLES = [
-    [['post', 'Taking the profile first, so we know where p99 goes.'], ['shell', 'python3 bench/latency.py --runs 200', 'p99 142 ms · p50 61 ms', 1500], ['post', 'Profile: 61% of p99 is the TLS handshake and first byte, 22% store commits. @2 connections are yours.']],
-    [['wait', 2600], ['post', 'Taking provider connection reuse. Editing src/provider/socket.rs.'], ['edit', 'src/provider/socket.rs', '+36 −12', 1700], ['shell', 'python3 bench/latency.py --runs 200', 'p99 71 ms · p50 44 ms', 1500], ['post', 'Pooled connections: p99 142 → 71 ms on bench/latency.py. @4 can you run the full suite?']],
-    [['wait', 1200], ['post', 'Taking one store commit per model round. Editing src/store/db.rs.'], ['edit', 'src/store/db.rs', '+48 −21', 1900], ['shell', 'cargo test -p agent-runtime store', 'test result: ok. 64 passed; 0 failed', 1300], ['post', 'Batched commits are in; the 64 store tests pass.']],
-    [['wait', 1800], ['read', 'board.jsonl'], ['post', 'Keeping cargo test green: I will run the suite as changes land.'], ['shell', 'cargo test', 'test result: ok. 212 passed; 0 failed', 2200], ['post', 'Full suite after both changes: 212 passed.']],
+    [['post', 'Taking the profile first, so we know where p99 goes.'], ['shell', 'python3 bench/latency.py --runs 200', 'p99 142 ms · p50 61 ms', 1500], ['post', 'Profile: 61% of p99 is the TLS handshake and first byte, 22% store commits. @2 connections are yours.'], ['work', 'assign', 'conn-pool', 2, 4, 'Reuse provider connections across turns.'], ['work', 'assign', 'batch-commits', 3, 4, 'One store commit per model round.']],
+    [['wait', 2600], ['work', 'claim', 'conn-pool'], ['post', 'Taking provider connection reuse. Editing src/provider/socket.rs.'], ['edit', 'src/provider/socket.rs', '+36 −12', 1700], ['shell', 'python3 bench/latency.py --runs 200', 'p99 71 ms · p50 44 ms', 1500], ['work', 'submit', 'conn-pool', 'Pooled connections: p99 142 → 71 ms on bench/latency.py.'], ['post', 'Pooled connections: p99 142 → 71 ms on bench/latency.py. @4 can you run the full suite?']],
+    [['wait', 3400], ['work', 'claim', 'batch-commits'], ['post', 'Taking one store commit per model round. Editing src/store/db.rs.'], ['edit', 'src/store/db.rs', '+48 −21', 1900], ['shell', 'cargo test -p agent-runtime store', 'test result: ok. 64 passed; 0 failed', 1300], ['post', 'Batched commits are in; the 64 store tests pass.']],
+    [['wait', 1800], ['read', 'board.jsonl'], ['post', 'Keeping cargo test green: I will run the suite as changes land.'], ['shell', 'cargo test', 'test result: ok. 212 passed; 0 failed', 2200], ['wait', 2800], ['work', 'review', 'conn-pool', 'supported', 'Full suite passes with pooling; p99 reproduced at 72 ms.'], ['post', 'Full suite after both changes: 212 passed.']],
   ];
-  // With a council: roles, two proposals, the seats' votes, and a stream the first one opens. The
-  // second waits on its last seat, so you can approve or deny it.
-  const COUNCIL = [
-    [['role', 'profiler'], ['shell', 'python3 bench/latency.py --runs 200', 'p99 142 ms · p50 61 ms', 1300], ['post', 'Profile: 61% of p99 is the TLS handshake and first byte, 22% store commits.'], ['propose', 'conn-pool', 'Pool provider connections: the handshake is 61% of p99.'], ['wait', 2600], ['vote', 'batch-commits', false, 'Commits are 22%; take the pool first and measure again.']],
-    [['wait', 900], ['role', 'provider sockets'], ['wait', 2400], ['vote', 'conn-pool', true, 'The profile shows it, and the change is local to socket.rs.'], ['wait', 900], ['join', 'conn-pool'], ['edit', 'src/provider/socket.rs', '+36 −12', 1500], ['post', 'Pooled connections: p99 142 → 71 ms on bench/latency.py.']],
-    [['wait', 1400], ['role', 'store'], ['wait', 900], ['propose', 'batch-commits', 'One store commit per model round: commits are 22% of p99.'], ['wait', 700], ['vote', 'conn-pool', true, 'Measured and small.']],
-    [['wait', 1900], ['role', 'keeps cargo test green'], ['read', 'board.jsonl'], ['wait', 2600], ['join', 'conn-pool'], ['shell', 'cargo test', 'test result: ok. 212 passed; 0 failed', 1800], ['post', 'Full suite with the pool: 212 passed.']],
-  ];
+  // A work command's board line and what it changes, as the script folds it.
+  function swarmWork(sw, name, turn, [kind, task, ...a]) {
+    const me = short(sw, name), base = me.replace(/-\d+$/, ''), t = sw.state.tasks[task];
+    const line = { at: Date.now(), from: me, bot: name, turn, kind, stream: task };
+    if (kind === 'assign') { const [owner, reviewer] = [`${base}-${a[0]}`, `${base}-${a[1]}`]; sw.state.tasks[task] = { owner, reviewer, brief: a[2], status: 'assigned' }; line.text = `${owner} owns it, ${reviewer} reviews: ${a[2]}`; }
+    else if (kind === 'claim') { t.status = 'working'; sw.state.streams[me] = task; line.text = 'claimed'; }
+    else if (kind === 'submit') { Object.assign(t, { status: 'submitted', result: a[0] }); delete sw.state.streams[me]; line.text = a[0]; }
+    else { Object.assign(t, { status: 'reviewed', verdict: a[0], evidence: a[1] }); line.text = `${a[0]}: ${a[1]}`; }
+    sw.board.push(line);
+  }
   async function member(sw, name, turn) {
-    const i = sw.members.indexOf(name), mine = (sw.council ? COUNCIL : ROLES)[i % ROLES.length], b = S.bots.get(name);
+    const i = sw.members.indexOf(name), mine = ROLES[i % ROLES.length], b = S.bots.get(name);
     const base = short(sw, sw.members[0]).replace(/-\d+$/, '');
     await think(name, turn, 'Read the goal and the board first, then take a piece nobody holds.');
     for (const [op, ...a] of mine) {
       if (b.interrupted) return;
       if (op === 'wait') await wait(a[0]);
-      else if (op === 'post') await agentPost(sw, name, turn, a[0].replace(/@(\d)/g, (_, n) => `@${base}-${n}`), sw.state.streams[short(sw, name)]);
-      else if (op === 'role') await agentAct(sw, name, turn, 'role', JSON.stringify(a[0]), { role: a[0] });
-      else if (op === 'propose') await agentAct(sw, name, turn, 'propose', `${a[0]} ${JSON.stringify(a[1].slice(0, 30) + '…')}`, { propose: a[0], why: a[1] });
-      else if (op === 'vote') { const id = sw.state.proposals.find((x) => x.stream === a[0])?.id ?? '?'; await agentAct(sw, name, turn, 'vote', `${id} ${a[1] ? 'yes' : 'no'} …`, { vote: id, yes: a[1], reason: a[2] }).catch(() => {}); }
-      else if (op === 'join') await agentAct(sw, name, turn, 'join', a[0], { join: a[0] });
+      else if (op === 'post') await agentPost(sw, name, turn, a[0].replace(/@(\d)/g, (_, n) => `@${base}-${n}`));
       else if (op === 'read') await tool(name, turn, 'read', { path: `${sw.dir}/${a[0]}` }, `${sw.board.length} posts`, 400);
+      else if (op === 'work') { if (!sw.stopped) await tool(name, turn, 'shell', { command: `"$SWARM" ${a[0]} ${a[1]}` }, JSON.stringify({ exit_code: 0, stderr: '', stdout: '{"task":"' + a[1] + '"}\n', success: true }), 300).then(() => swarmWork(sw, name, turn, a)); }
       else if (op === 'edit') await tool(name, turn, 'edit', { path: a[0] }, a[1], a[2]);
       else await tool(name, turn, 'shell', { command: a[0] }, JSON.stringify({ exit_code: 0, stderr: '', stdout: a[1] + '\n', success: true }), a[2]);
       b.tokens_used += 20000;
@@ -548,7 +514,7 @@ window.Daemon = (() => {
     },
     swarms: async () => ({ swarms: [...S.swarms.values()].map(swarmRecord), broken: [] }),
     // The demo has no editor to open: Edit only says your copy is now the one read.
-    roles: async () => ['coordinator', 'swarm-flat', 'swarm-council', 'home'].map(name => ({ name, file: S.ownRoles?.has(name) ? `/home/you/.agents/agents/${name}.md` : null })),
+    roles: async () => ['coordinator', 'home'].map(name => ({ name, file: S.ownRoles?.has(name) ? `/home/you/.agents/agents/${name}.md` : null })),
     editRole: async (name) => { (S.ownRoles ??= new Set()).add(name); return `/home/you/.agents/agents/${name}.md`; },
     // Triggers a coordinator made: a task that checks its PR, a reviewer started at a commit that changes src
     // whose answer goes to the lead, a weekday digest, and one whose agent was deleted before its time came.
@@ -571,33 +537,27 @@ window.Daemon = (() => {
     plans: async (ids) => Object.fromEntries(ids.filter((id) => S.plans?.has(id)).map((id) => [id, S.plans.get(id)])),
     forgetPlan: async (id) => { S.plans?.delete(id); },
     profiles: async () => [{ name: 'reviewer', summary: 'Reviews changes and reports bugs only', model: 'anthropic/claude-sonnet-5' }, { name: 'tester', summary: 'Keeps the test suite green', model: null }],
-    // Named from the goal's longest word and dealt as the app's side does it.
-    swarmStart: async ({ project, folder, goal, shared, mix, agents, budgetTokens, council = 0 }) => {
+    // Named from the goal's longest word and dealt as the swarm's script does it.
+    swarmStart: async ({ project, folder, goal, shared, mix, agents, budgetTokens }) => {
       const word = (goal.toLowerCase().match(/[a-z0-9]{3,}/g) ?? []).slice(0, 6).reduce((a, w) => (w.length > a.length ? w : a), '') || 'swarm';
       let full = `${project}.${word}`; for (let k = 2; S.swarms.has(full); k++) full = `${project}.${word}-${k}`;
       const counts = mix.map(() => 0), rows = [];
       for (let t = 1; t <= agents; t++) { let best = 0; mix.forEach((m, i) => { if (m.share * t - 100 * counts[i] > mix[best].share * t - 100 * counts[best]) best = i; }); counts[best] += 1; rows.push(best); }
-      const sw = { name: full, project, goal, mix, budget: budgetTokens, council, state: { roles: {}, streams: {}, proposals: [] }, dir: `~/.agent/swarms/${full}`, workspace: shared ? `~/.agent/worktrees/${full}` : folder, members: [], ids: {}, rows: {}, stopped: false, board: [{ at: Date.now(), from: 'user', text: goal }] };
+      const sw = { name: full, project, goal, mix, budget: budgetTokens, state: { roles: {}, streams: {}, tasks: {} }, dir: `~/.agent/swarms/${full}`, workspace: shared ? `~/.agent/worktrees/${full}` : folder, members: [], ids: {}, rows: {}, stopped: false, board: [{ at: Date.now(), from: 'user', text: goal }] };
       S.swarms.set(full, sw); await wait(300);
       const bots = await enlist(sw, rows.map((row, i) => [`${full}-${i + 1}`, row]), Math.max(1, Math.floor(budgetTokens / rows.length)));
       return { swarm: swarmRecord(sw), bots, failed: [] };
     },
-    swarmAdd: async (swarm, row) => {
+    swarmAdd: async (swarm) => {
       const sw = S.swarms.get(swarm), each = Math.max(1, Math.floor(sw.budget / Math.max(1, sw.members.length)));
-      // A number no agent of the swarm ever had, as the app's own swarms do.
+      // The row furthest below its share among the members still there, as the script picks it.
+      const live = sw.members.filter((m) => S.bots.get(m)?.id === sw.ids[m]), t = live.length + 1;
+      const counts = sw.mix.map((_, r) => live.filter((m) => sw.rows[m] === r).length);
+      const row = counts.reduce((best, c, r) => (sw.mix[r].share * t - 100 * c > sw.mix[best].share * t - 100 * counts[best] ? r : best), 0);
+      // A number no agent of the swarm ever had, as the swarm's script does.
       let i = (sw.made ?? 0) + 1; while (S.bots.has(`${swarm}-${i}`)) i++;
       const bots = await enlist(sw, [[`${swarm}-${i}`, row]], each, true); sw.budget += each;
       return { swarm: swarmRecord(sw), bots, failed: [] };
-    },
-    // A stream the leaver led goes to the first agent left in it, as the app's does.
-    swarmLeave: async (swarm, member) => {
-      const sw = S.swarms.get(swarm); if (sw.members.includes(member)) sw.budget -= Math.floor(sw.budget / sw.members.length); sw.members = sw.members.filter((m) => m !== member); delete sw.ids[member]; delete sw.rows[member];
-      const st = sw.state, was = short(sw, member); delete st.roles[was]; delete st.streams[was];
-      for (const p of st.proposals.filter((x) => x.status === 'approved' && (x.lead ?? x.by) === was)) {
-        const next = Object.keys(st.streams).sort().find((m) => st.streams[m] === p.stream);
-        if (next) { p.lead = next; sw.board.push({ at: Date.now(), from: 'council', kind: 'lead', stream: p.stream, lead: next, was }); }
-      }
-      return swarmRecord(sw);
     },
     swarmStop: async (swarm) => {
       const sw = S.swarms.get(swarm); sw.stopped = true;
@@ -605,7 +565,6 @@ window.Daemon = (() => {
       return { swarm: swarmRecord(sw), failed: [] };
     },
     swarmBoard: async (swarm, offset) => { const sw = S.swarms.get(swarm); const from = offset ?? Math.max(0, sw.board.length - 500); return { lines: sw.board.slice(from), offset: sw.board.length, more: false, reset: offset == null, state: JSON.parse(JSON.stringify(sw.state)) }; },
-    swarmDecide: async (swarm, id, approve) => { const sw = S.swarms.get(swarm); const lines = councilAct(sw, 'user', { vote: id, yes: approve }); sw.board.push(...lines); return { posted: true, id, decided: approve ? 'approved' : 'denied', steered: [], woke: [], missed: [] }; },
     swarmPost: async (swarm, text) => {
       const sw = S.swarms.get(swarm); sw.stopped = false; sw.board.push({ at: Date.now(), from: 'user', text });
       const busy = sw.members.filter((m) => S.bots.get(m)?.status !== 'idle');
@@ -665,7 +624,7 @@ window.Daemon = (() => {
         // A demo bot's only unfinished turn is the one it runs.
         case 'turns': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); return { turns: b.running_turn != null && params.after < b.running_turn ? [{ turn: b.running_turn, status: b.status }] : [], next_after: null }; }
         case 'resume': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); return { ...b }; }
-        case 'create': { await create(params.bot, params.model, params.created_by ?? null, null, params.workspace, null, params.effort ?? null); return { ...S.bots.get(params.bot) }; }
+        case 'create': { await create(params.bot, params.model, params.created_by ?? null, null, params.workspace, null, params.effort ?? null); const b = S.bots.get(params.bot); if (params.budget_tokens) b.budget_tokens = params.budget_tokens; return { ...b }; }
         case 'submit': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); if (b.status !== 'idle' && params.delivery === 'reject') throw new Error('bot_busy');
           if (params.delivery === 'steer' && params.expected_turn != null && params.expected_turn !== b.running_turn) throw new Error('stale_turn');
           const by = params.from ?? (params.origin ? { origin: params.origin } : null);
