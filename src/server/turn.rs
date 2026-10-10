@@ -1436,25 +1436,30 @@ impl Turn {
         if let Some(running) = running {
             *landed = Some(running.await);
         }
-        if landed.is_none() {
-            return Ok(false);
-        }
-        // The summary leaves the slot only once its install has room on
-        // the store's queue: a cancellation before then leaves it to
+        // A written summary leaves the slot only once its install has room
+        // on the store's queue: a cancellation before then leaves it to
         // `execute`, which installs and bills it.
-        let slot = self.store.slot().await?;
+        let slot = match landed {
+            Some(Landed {
+                result: Ok(Summary::Written(_)),
+                ..
+            }) => Some(self.store.slot().await?),
+            Some(_) => None,
+            None => return Ok(false),
+        };
         let Some(Landed { result, spent }) = landed.take() else {
             return Ok(false);
         };
         spent.count(tokens_used, model_rounds);
-        let installed = match result {
-            Ok(Summary::Written(written)) => self.install(slot, *written).await,
-            Ok(Summary::Parked(until)) => {
+        let installed = match (result, slot) {
+            (Ok(Summary::Written(written)), Some(slot)) => self.install(slot, *written).await,
+            (Ok(Summary::Written(_)), None) => unreachable!("a written summary reserves a slot"),
+            (Ok(Summary::Parked(until)), _) => {
                 accounting.summary_retry_at = until;
                 Ok(Compaction::Skipped)
             }
-            Ok(Summary::Skipped) => Ok(Compaction::Skipped),
-            Err(error) => Err(error),
+            (Ok(Summary::Skipped), _) => Ok(Compaction::Skipped),
+            (Err(error), _) => Err(error),
         };
         Ok(matches!(installed?, Compaction::Done))
     }
