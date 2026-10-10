@@ -144,7 +144,8 @@ Default output is machine-readable JSON. `run` and `follow` stream one JSON
 object per line. Snapshot commands return compact JSON objects; `ls` and `turns`
 return arrays. Every command prints its reply: `interrupt` the turn view,
 `answer` what it answered, and `shutdown` `{"stopped":true,"pid":N}` once the
-daemon is gone. Every command but `approver` takes `--pretty`.
+daemon is gone. Every client command takes `--pretty`; `approver` and `serve`
+run until stopped and print no reply to render.
 `shutdown` returns once the daemon process has exited and its store is closed.
 `shutdown --grace DURATION` first lets running turns finish for up to that long
 while starting none; turns still running then end `interrupted` with
