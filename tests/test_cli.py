@@ -1003,6 +1003,22 @@ class CliTests(ModelFixture):
         self.assertEqual(json.loads(result.stderr)['error'], 'invalid_provider_url')
         self.assertLess(time.monotonic()-start, 2)
 
+    def test_concurrent_failed_starts_each_report_their_own_error(self):
+        # Every start appends to the store's one log; each launcher reports
+        # its own child's failure, never another's.
+        store = str(self.path/'shared.db')
+        specs = {'invalid_provider_url': 'fixture=responses,not-a-url',
+                 'invalid_provider_spec': 'fixture=nonsense,http://127.0.0.1:9/v1'}
+
+        def start(expected):
+            result = subprocess.run([str(self.binary), 'run', '--detach', '--new', '--bot', 'bad', '--store', store,
+                                     '--provider', specs[expected], '--model', 'fixture/model', 'hello'],
+                                    env=clean_env(), capture_output=True, text=True, timeout=5)
+            return expected, json.loads(result.stderr)['error']
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            outcomes = list(pool.map(start, list(specs) * 8))
+        self.assertEqual([got for want, got in outcomes if got != want], [])
+
     def test_startup_ownership_conflict_has_a_bounded_wait(self):
         # A stdio owner never publishes the socket the CLI is waiting for.
         with tempfile.TemporaryDirectory(dir='/tmp') as directory:

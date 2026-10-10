@@ -181,6 +181,9 @@ one. Usage errors use the same object with `error` set to `usage`. A detail
 that echoes what was sent is cut in its middle to about 4 KiB, so a refusal
 always fits in one response. When `run` or `start` starts a daemon that fails,
 the command fails with the daemon's own error, such as `invalid_provider_url`.
+`serve` adds its `pid` to its error line, so a launcher reports its own
+daemon's failure from the store's shared log even when several start at once;
+a daemon that exits without one is `daemon_start_failed`, naming the log.
 
 ```json
 {"error":"bot_busy","detail":"turn 4 is running","running_turn":4,"fork_point":9,
