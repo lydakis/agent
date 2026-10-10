@@ -942,41 +942,15 @@ fn forget(path: &Path) -> Result<(), String> {
     .map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Remove a trigger: launchd's copy, then its plist and last result. An
-/// unload launchd refuses keeps the plist, so the removal can be retried.
-/// Whatever is left of it goes, a job loaded without its plist included.
+/// Remove a trigger, whatever is left of it: its plist, its last result,
+/// and launchd's job, also one loaded without its plist.
 pub fn remove(places: &Places, name: &str, launchd: Loader) -> Result<(), String> {
     valid_name(name)?;
     let _lock = Lock::take(places)?;
-    let path = places.plist(name);
-    let last = places.last(name);
-    // A folder that ignores case finds `build`'s files for `Build`, whose
-    // label launchd does not have: only the name as stored is that trigger.
-    let stored = |dir: &Path, file: &Path| {
-        let want = file.file_name();
-        std::fs::read_dir(dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .any(|e| Some(e.file_name().as_os_str()) == want)
-    };
-    let (path_here, last_here) = (stored(&places.agents, &path), stored(&places.state, &last));
-    // launchd's labels keep their case, so this reaches only this name's job.
-    let loaded = match launchd(Launchd::Unload(&format!("{LABEL}{name}"))) {
-        Ok(()) => true,
-        Err(error) if error.starts_with(NOT_LOADED) => false,
-        Err(error) => return Err(error),
-    };
-    if !path_here && !last_here && !loaded {
-        return Err(format!("trigger_not_found: {name}"));
+    match retire(places, name, false, launchd)? {
+        true => Ok(()),
+        false => Err(format!("trigger_not_found: {name}")),
     }
-    if path_here {
-        forget(&path)?;
-    }
-    if last_here {
-        forget(&last)?;
-    }
-    Ok(())
 }
 
 /// What a fire did goes on disk, and a trigger that is over ends: both
@@ -994,7 +968,7 @@ fn settle(places: &Places, trigger: &Trigger, outcome: &Value, launchd: Loader) 
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Under the lock no `add` is between writing and loading one.
-            if let Err(error) = unload(&format!("{LABEL}{}", trigger.name), launchd) {
+            if let Err(error) = retire(places, &trigger.name, true, launchd) {
                 log(error);
             }
             return;
@@ -1011,41 +985,63 @@ fn settle(places: &Places, trigger: &Trigger, outcome: &Value, launchd: Loader) 
     let sent = outcome["outcome"] == "sent";
     // One that did not deliver ends only once why is on disk; else its plist
     // stays, listed.
-    if (trigger.at.is_some() || outcome["outcome"] == "gone") && (sent || recorded.is_ok()) {
-        end(places, &trigger.name, &path, &text, !sent, launchd);
+    if (trigger.at.is_some() || outcome["outcome"] == "gone")
+        && (sent || recorded.is_ok())
+        && let Err(error) = retire(places, &trigger.name, !sent, launchd)
+    {
+        log(error);
     }
 }
 
-/// A trigger ends itself: its plist first, then launchd's copy, whose
-/// unload ends this process. `keep` leaves its last result, so an end nobody
-/// asked for still shows, and why. A plist that will not go stays loaded,
-/// listed, for `rm`: unloaded, it would load again at the next login. An
-/// unload launchd refuses writes the plist back, so the job still loaded
-/// stays listed for `rm`. Called under the lock.
-fn end(places: &Places, name: &str, path: &Path, text: &str, keep: bool, launchd: Loader) {
-    let log = |error: String| eprintln!("{}", error_json(&error));
-    if let Err(error) = forget(path) {
-        return log(error);
-    }
-    let last = places.last(name);
-    let result = if keep {
-        None
-    } else {
-        let result = std::fs::read_to_string(&last).ok();
-        if let Err(error) = forget(&last) {
-            log(error);
-        }
-        result
+/// The one way a trigger goes, by `rm` or by its own end, under the lock:
+/// its files first, then launchd's job, whose unload ends a fire that ends
+/// its own trigger, so nothing can be left to do after it. `keep` leaves its
+/// last result, so an end nobody asked for still shows, and why. A job
+/// launchd will not unload gets its files back, so it stays listed for `rm`:
+/// with its plist gone it would load again at the next login. Whether any of
+/// it was there. A folder that ignores case finds `build`'s files for
+/// `Build`, whose label launchd does not have: only the name as stored is
+/// that trigger, and launchd's labels keep their case.
+fn retire(places: &Places, name: &str, keep: bool, launchd: Loader) -> Result<bool, String> {
+    let stored = |dir: &Path, file: &Path| {
+        let want = file.file_name();
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|e| Some(e.file_name().as_os_str()) == want)
+            .then(|| std::fs::read_to_string(file).ok())
     };
-    if let Err(error) = unload(&format!("{LABEL}{name}"), launchd) {
-        log(error);
-        // Still loaded, it is still this trigger, with what its fire did.
-        for (path, text) in [(path, Some(text)), (&last, result.as_deref())] {
-            if let Some(text) = text
+    let plist = places.plist(name);
+    let last = places.last(name);
+    let mut gone = vec![(plist.clone(), stored(&places.agents, &plist))];
+    if !keep {
+        gone.push((last.clone(), stored(&places.state, &last)));
+    }
+    let restore = |gone: &[(PathBuf, Option<Option<String>>)]| {
+        for (path, text) in gone {
+            if let Some(Some(text)) = text
                 && let Err(error) = replace(path, text)
             {
-                log(error);
+                eprintln!("{}", error_json(&error));
             }
+        }
+    };
+    for (i, (path, text)) in gone.iter().enumerate() {
+        if text.is_some()
+            && let Err(error) = forget(path)
+        {
+            restore(&gone[..i]);
+            return Err(error);
+        }
+    }
+    let here = gone.iter().any(|(_, text)| text.is_some());
+    match launchd(Launchd::Unload(&format!("{LABEL}{name}"))) {
+        Ok(()) => Ok(true),
+        Err(error) if error.starts_with(NOT_LOADED) => Ok(here),
+        Err(error) => {
+            restore(&gone);
+            Err(error)
         }
     }
 }
@@ -2276,7 +2272,7 @@ mod tests {
         std::fs::create_dir_all(stuck.join("x")).unwrap();
         record_last(&w.places, &once(), &json!({"outcome": "sent"})).unwrap();
         w.fake.loaded.borrow_mut().insert(format!("{LABEL}p.stuck"));
-        end(&w.places, "p.stuck", &stuck, "", false, &|x| w.fake.call(x));
+        assert!(retire(&w.places, "p.stuck", false, &|x| w.fake.call(x)).is_err());
         assert!(w.fake.loaded.borrow().contains(&format!("{LABEL}p.stuck")));
         std::fs::remove_dir_all(&stuck).unwrap();
         // A repeating one ends only when its agent is gone, keeping why.
