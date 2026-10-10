@@ -853,14 +853,21 @@ daemon learns nothing about projects; everything here is client work.
     the last reach a twentieth of a member's allowance, or a turn finishes,
     coalesced over 250 ms with one in flight per swarm; a check that appends
     a line says `board_changed`, so the open board reads it.
-  - **Cost.** Measured 2026-10-10 on Linux, N=40, against today's app
-    binary on the same daemon and board: a post reaching nobody took
-    46.8 ms p50 through the app binary and 45.1 ms through the script; a
-    post waking four took 54.5 ms and 47.7 ms. The binary's own floor is
-    its load (42.9 ms); Python 3.9's is 17 ms. The same script calling the
-    CLI once per recipient took 65.4 ms for four, which is why it talks to
-    the socket. Memory was not measured reliably. Method and code:
-    `agent-notes/swarm-skills/` in the project's notes, not this repository.
+  - **Cost.** Measured 2026-10-10 on Linux x86_64, before this skill, at
+    main `ec9aeb1`: release builds of `agent` and `agent-app` at that
+    revision, the test suite's synthetic model, five members, and N=40
+    posts per row, each post a fresh process as an agent's shell runs it.
+    The app side is that revision's `agent-app --swarm-post`; the script
+    side is a prototype of this script's post path (lock the board, read
+    the swarm, list bots, append and fsync, send on one socket connection),
+    not the script at this revision. A post reaching nobody took 46.8 ms
+    p50 through the app binary and 45.1 ms through the prototype; a post
+    waking four took 54.5 ms and 47.7 ms. The binary's own floor is its
+    load (42.9 ms); Python 3.9's is 17 ms. The prototype calling the CLI
+    once per recipient took 65.4 ms for four, which is why the script talks
+    to the socket. Memory and macOS were not measured. The harness drives
+    `--swarm-post`, which this skill removed, so it cannot rerun on later
+    revisions; it is kept with the project's notes rather than here.
   - **Customizing.** Copy the skill folder into `.agents/skills/` under
     another name and edit the copy; the thresholds sit at the top of
     `swarm`, the rules in `member.md`. A coordinator using the copy runs
@@ -905,7 +912,8 @@ daemon learns nothing about projects; everything here is client work.
   These checks establish authorship and lifecycle, not truth or sufficiency
   of evidence. `leave` releases actual membership; a working task becomes
   assigned again. Members can revise released assignments or recover a
-  departed member's task. A
+  departed member's task; a member at its own token cap counts as departed
+  here, and nobody can assign work to it (`member_exhausted`). A
   submitted task whose reviewer departed keeps its result: assigning a new
   reviewer hands it over for review without new work or approval, even if
   its original owner also left. Keep that original owner in the assignment;

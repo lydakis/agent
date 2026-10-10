@@ -379,6 +379,9 @@ class Act:
         # The members whose bots still exist, in the swarm's order: a deleted
         # one is out of it, though swarm.json still names it.
         self.live = [m for m in self.swarm['members'] if live is None or m in live]
+        # Who can still take a turn: a member at its own token cap is refused
+        # every turn, so it can no more do or review work than one that left.
+        self.able = {short(m, self.swarm) for m in self.live if not live or not spent(live[m])}
         self.me = short(author, self.swarm) if author else 'user'
         self.lines, self.sends, self.answer = [], [], {}
 
@@ -454,11 +457,13 @@ def assign(act, task, owner, reviewer, brief):
             and all(c in 'abcdefghijklmnopqrstuvwxyz0123456789-' for c in task)):
         raise Refused('invalid_task', 'name a task like conn-pool: lowercase letters, digits and -, at most %d' % MAX_TASK)
     reviewer = short(act.member(reviewer), act.swarm)
-    tasks, current = act.state['tasks'], {short(m, act.swarm) for m in act.live}
+    tasks, able = act.state['tasks'], act.able
+    if reviewer not in able:
+        raise Refused('member_exhausted', '%s has used its tokens; choose another member or add one' % reviewer)
     old = tasks.get(task)
-    # A submitted result outlives its reviewer: one that left is replaced,
-    # and the result keeps its author.
-    if old and old['status'] == 'reviewing' and old['owner'] == short(owner, act.swarm) and old['reviewer'] not in current:
+    # A submitted result outlives its reviewer: one that left or spent its
+    # tokens is replaced, and the result keeps its author.
+    if old and old['status'] == 'reviewing' and old['owner'] == short(owner, act.swarm) and old['reviewer'] not in able:
         if reviewer == old['owner']:
             raise Refused('independent_review_required', 'choose a reviewer other than the owner')
         act.line(kind='assign', stream=task, owner=old['owner'], reviewer=reviewer, brief=old['brief'],
@@ -466,12 +471,14 @@ def assign(act, task, owner, reviewer, brief):
         act.tell([act.member(reviewer)], '[board] %s submitted for your review: %s' % (task, old['result']))
         return
     owner = short(act.member(owner), act.swarm)
+    if owner not in able:
+        raise Refused('member_exhausted', '%s has used its tokens; choose another member or add one' % owner)
     if owner == reviewer:
         raise Refused('independent_review_required', 'choose a reviewer other than the owner')
     if old:
-        # Reassigning is explicit: a task whose owner or reviewer left, or one
-        # released back to assigned and changed.
-        missing = old['status'] != 'reviewed' and (old['owner'] not in current or old['reviewer'] not in current)
+        # Reassigning is explicit: a task whose owner or reviewer left or spent
+        # its tokens, or one released back to assigned and changed.
+        missing = old['status'] != 'reviewed' and (old['owner'] not in able or old['reviewer'] not in able)
         changed = (old['owner'], old['reviewer'], old['brief']) != (owner, reviewer, brief)
         released = changed and old['status'] == 'assigned' and task not in act.state['streams'].values()
         if not (missing or released):
@@ -593,12 +600,16 @@ def quote(text):
     return "'%s'" % text.replace("'", "'\\''")
 
 
+def spent(bot):
+    return bool(bot.get('budget_tokens')) and (bot.get('tokens_used') or 0) >= bot['budget_tokens']
+
+
 def status(folder, members, helpers):
     swarm, state = folder.swarm, folder.state
     used, total = usage(state, members, helpers)
-    current = {short(m, swarm) for m in members}
+    current = {short(m, swarm) for m, b in members.items() if not spent(b)}
     missing_members = [m for m in swarm['members'] if m not in members]
-    spent = [short(m, swarm) for m, b in members.items() if b.get('budget_tokens') and (b.get('tokens_used') or 0) >= b['budget_tokens']]
+    exhausted = [short(m, swarm) for m, b in members.items() if spent(b)]
     needs = {'reviewed': (), 'reviewing': ('reviewer',)}
     blocked = any(t[k] not in current for t in state['tasks'].values() for k in needs.get(t['status'], ('owner', 'reviewer')))
     running = any(b.get('running_turn') for b in list(members.values()) + helpers)
@@ -606,7 +617,7 @@ def status(folder, members, helpers):
         outcome = 'completed'
     elif swarm['stopped']:
         outcome = 'stopped'
-    elif (members and len(spent) == len(members)) or used >= total > 0:
+    elif (members and len(exhausted) == len(members)) or used >= total > 0:
         outcome = 'budget_exhausted'
     elif blocked or not members:
         outcome = 'blocked'
@@ -618,7 +629,7 @@ def status(folder, members, helpers):
             'members': [member_view(b) for b in members.values()] + [member_view(h, True) for h in helpers],
             'tokens_used': used, 'budget_tokens': total, 'remaining_tokens': max(0, total - used),
             'tasks': state['tasks'], 'result': state['result'], 'missing_members': missing_members,
-            'exhausted_members': spent,
+            'exhausted_members': exhausted,
             'last_board_activity_ms': int(os.fstat(folder.board.fileno()).st_mtime * 1000)}
 
 

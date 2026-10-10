@@ -322,6 +322,8 @@ class SwarmRuleTests(unittest.TestCase):
 
     def act(self, author=None, state=None, live=None):
         folder = type('Folder', (), {'swarm': self.swarm, 'state': state or self.s.empty_state()})()
+        # The daemon's member rows by name; a set names members with no usage.
+        live = {m: {} for m in live} if isinstance(live, set) else live
         return folder, self.s.Act(folder, author, 1, live)
 
     def bot(self, n, used, cap=1000, turn=None):
@@ -436,6 +438,24 @@ class SwarmRuleTests(unittest.TestCase):
         with self.assertRaises(self.s.Refused) as refused:
             self.s.assign(act, 't', 'w-1', 'w-3', 'again')
         self.assertEqual(refused.exception.code, 'task_exists')
+
+    def test_a_member_out_of_tokens_hands_its_work_on_and_takes_none(self):
+        state = self.s.empty_state()
+        state['tasks']['t'] = {'owner': 'w-1', 'reviewer': 'w-2', 'brief': 'b', 'status': 'working', 'result': None,
+                               'verdict': None, 'evidence': None}
+        live = {'p.w-1': self.bot(1, 1000), 'p.w-2': self.bot(2, 10), 'p.w-3': self.bot(3, 10)}
+        _, act = self.act('p.w-2', state, live)
+        for owner, reviewer in (('w-3', 'w-1'), ('w-1', 'w-3')):
+            with self.assertRaises(self.s.Refused) as refused:
+                self.s.assign(act, 'u', owner, reviewer, 'new work')
+            self.assertEqual(refused.exception.code, 'member_exhausted')
+        self.s.assign(act, 't', 'w-3', 'w-2', 'take this over')
+        self.assertEqual((act.lines[0]['owner'], act.lines[0]['reviewer']), ('w-3', 'w-2'))
+        # A submitted result whose reviewer ran out goes to another reviewer.
+        state['tasks']['t'].update(owner='w-3', reviewer='w-1', status='reviewing', result='r')
+        _, act = self.act('p.w-3', state, live)
+        self.s.assign(act, 't', 'w-3', 'w-2', 'please review')
+        self.assertTrue(act.lines[0]['reviewing'])
 
     def test_the_coordinator_hears_when_every_member_is_deleted(self):
         folder, act = self.act()
