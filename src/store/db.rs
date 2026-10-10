@@ -28,7 +28,7 @@ pub struct Bot {
     pub name: String,
     /// Store-wide identity, never reused after deletion. A name can be
     /// recycled; a retry that carries the id cannot land on the new holder.
-    pub id: i64,
+    pub bot_id: i64,
     pub head: Option<i64>,
     /// Lifetime cap on input plus output tokens; checked before each model call.
     pub budget_tokens: Option<u64>,
@@ -274,7 +274,7 @@ impl Bot {
     }
     /// The bot id that keys this bot's provider prompt cache.
     pub fn cache_bot(&self) -> i64 {
-        self.cache_bot.unwrap_or(self.id)
+        self.cache_bot.unwrap_or(self.bot_id)
     }
     pub fn family(&self) -> Result<Family> {
         Family::parse(&self.family).ok_or(Error::new("store_family_unsupported"))
@@ -1125,7 +1125,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 45;
+    pub const SCHEMA: i32 = 46;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1583,7 +1583,7 @@ impl Database {
             input_tokens: r.get::<_, i64>(13)?.max(0) as u64,
             cached_input_tokens: r.get::<_, i64>(14)?.max(0) as u64,
             cache_hit: cache_hit(r.get::<_, i64>(14)?, r.get::<_, i64>(13)?),
-            id: r.get(15)?,
+            bot_id: r.get(15)?,
             created_by: r.get(16)?,
             created_by_id: r.get(17)?,
             note: r.get(18)?,
@@ -1702,7 +1702,7 @@ impl Database {
         let mut bytes = 0;
         let mut more = false;
         while let Some(r) = rows.next()? {
-            let bot = json!({"name":r.get::<_, String>(0)?,"id":r.get::<_, i64>(14)?,
+            let bot = json!({"name":r.get::<_, String>(0)?,"bot_id":r.get::<_, i64>(14)?,
                 "head":r.get::<_, Option<i64>>(1)?,
                 "workspace":r.get::<_, Option<String>>(2)?,"status":r.get::<_, String>(3)?,
                 "running_turn":r.get::<_, Option<i64>>(4)?,"provider":r.get::<_, String>(5)?,
@@ -1863,7 +1863,7 @@ impl Database {
         )?;
         // The event carries the list record's fields, so a follower can
         // seat a new bot without a request per creation.
-        let mut data = json!({"id":id,"provider":binding.provider,"model":binding.model,
+        let mut data = json!({"bot_id":id,"provider":binding.provider,"model":binding.model,
             "effort":binding.effort,"workspace":workspace,"status":"idle","running_turn":null,
             "created_by":binding.created_by,"created_by_id":created_by_id});
         if let Some(gates) = &gates {
@@ -5261,7 +5261,7 @@ impl Database {
             created_by: bot.created_by,
             created_by_id: bot.created_by_id,
             bot: bot.name,
-            bot_id: bot.id,
+            bot_id: bot.bot_id,
         })
     }
     fn active(&self, turn: i64) -> Result<Bot> {
@@ -6066,7 +6066,7 @@ impl Database {
                 params![version, name],
             )?;
         }
-        let mut data = json!({"id":id,"source":source,"checkpoint":checkpoint,"node":checkpoint,
+        let mut data = json!({"bot_id":id,"source":source,"checkpoint":checkpoint,"node":checkpoint,
             "provider":parent.provider,"model":parent.model,"effort":parent.effort,
             "workspace":workspace,"status":"idle","running_turn":null,
             "created_by":created_by,"created_by_id":created_by_id});
@@ -6176,7 +6176,7 @@ impl Database {
     /// first piece using the same loaded record.
     pub fn start_delete_bot(&mut self, name: &str, piece: usize) -> Result<(i64, Value)> {
         let bot = self.inspect(name)?;
-        let id = bot.id;
+        let id = bot.bot_id;
         Ok((id, self.delete_bot_piece_for(name, bot, piece)?))
     }
     /// One bounded piece of a deletion. The first piece checks the bot is
@@ -6192,7 +6192,7 @@ impl Database {
         piece: usize,
     ) -> Result<Value> {
         let bot = self.inspect(name)?;
-        if bot.id != expected_id {
+        if bot.bot_id != expected_id {
             return fail("bot_not_found");
         }
         self.delete_bot_piece_for(name, bot, piece)
@@ -7377,7 +7377,7 @@ fn sender_fields(
     origin: Option<&str>,
 ) {
     if let Some((bot, turn)) = from {
-        data["from"] = json!({"bot":bot,"turn":turn,"id":bot_id});
+        data["from"] = json!({"bot":bot,"turn":turn,"bot_id":bot_id});
     }
     if let Some(origin) = origin {
         data["origin"] = json!(origin);
@@ -8043,6 +8043,16 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         // 44 -> 45: how long summaries held each turn. None was counted
         // before, so stored turns report zero.
         conn.execute_batch("ALTER TABLE turns ADD COLUMN summary_ms INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    if from < 46 {
+        // 45 -> 46: events name a bot's identity `bot_id`, as replies do:
+        // a made bot's own, and a sender's beside its name.
+        conn.execute_batch(
+            "UPDATE events SET data=json_set(json_remove(data,'$.id'),'$.bot_id',json_extract(data,'$.id'))
+             WHERE kind IN ('created','forked') AND json_type(data,'$.id') IS NOT NULL;
+             UPDATE events SET data=json_set(json_remove(data,'$.from.id'),'$.from.bot_id',json_extract(data,'$.from.id'))
+             WHERE kind IN ('accepted','queued','steered') AND json_type(data,'$.from.id') IS NOT NULL;",
+        )?;
     }
     Ok(())
 }

@@ -1988,7 +1988,7 @@ impl Service {
                     Some(id) => id,
                     None => {
                         store
-                            .op("inspect", move |db| Ok(db.inspect(&name)?.id))
+                            .op("inspect", move |db| Ok(db.inspect(&name)?.bot_id))
                             .await?
                     }
                 };
@@ -4297,7 +4297,7 @@ mod tests {
             (&first["duplicate"], &again["duplicate"]),
             (&json!(false), &json!(true))
         );
-        assert_eq!(first["id"], again["id"]);
+        assert_eq!((&first["bot_id"], &again["bot_id"]), (&json!(1), &json!(1)));
         let events = store.call(|db| db.events("A", 0, 10)).await.unwrap();
         assert_eq!(
             events["events"].as_array().unwrap().len(),
@@ -4736,7 +4736,7 @@ mod tests {
                             budget_tokens: None,
                             tools: &tools,
                             created_by: creator.as_ref().map(|c| c.name.as_str()),
-                            created_by_id: creator.as_ref().map(|c| c.id),
+                            created_by_id: creator.as_ref().map(|c| c.bot_id),
                             compaction_instructions: None,
                             compaction_model: None,
                             fallbacks: false,
@@ -4763,7 +4763,7 @@ mod tests {
             *workspace = None;
             *tools = Some(vec!["echo".into()]);
             *created_by = Some(parent.name);
-            *created_by_id = Some(parent.id);
+            *created_by_id = Some(parent.bot_id);
         }
         for command in [create, submit("Bot", "r1"), child] {
             let bound = admission_bound(&command, &id, 1);

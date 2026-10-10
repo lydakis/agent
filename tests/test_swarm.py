@@ -33,7 +33,7 @@ class SwarmPostTests(ModelFixture):
         return result
 
     def ids(self):
-        return {b['name']: b['id'] for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout)}
+        return {b['name']: b['bot_id'] for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout)}
 
     def swarm(self, members, council=0):
         # The folder the app writes for a swarm, by hand: each member pinned to its bot's id.

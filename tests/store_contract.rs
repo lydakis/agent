@@ -706,7 +706,7 @@ fn gated_bot(
         tools: &tools,
         gate: Some(&gate),
         created_by: creator.map(|c| c.name.as_str()),
-        created_by_id: creator.map(|c| c.id),
+        created_by_id: creator.map(|c| c.bot_id),
         ..binding()
     };
     Ok(db.create(name, Some("/synthetic"), binding)?.0)
@@ -840,7 +840,7 @@ fn lapsing_round(db: &mut Database, calls: &[(&str, &str)]) -> (i64, Vec<ToolCal
             tools: &tools,
             gate: Some(gate),
             created_by: creator.map(|c| c.name.as_str()),
-            created_by_id: creator.map(|c| c.id),
+            created_by_id: creator.map(|c| c.bot_id),
             ..binding()
         };
         db.create(name, Some("/synthetic"), binding).unwrap().0
@@ -1065,7 +1065,7 @@ fn a_tag_listing_reads_no_call_that_tag_answered() {
             tools: &tools,
             gate: Some(&b),
             created_by: Some(&ann.name),
-            created_by_id: Some(ann.id),
+            created_by_id: Some(ann.bot_id),
             ..binding()
         },
     )
@@ -1593,7 +1593,7 @@ fn history_items_name_who_sent_each_prompt_after_its_turns_are_gone() {
         )
         .unwrap()
         .turn;
-    let bob = json!({"bot":"Bob","turn":person,"id":1});
+    let bob = json!({"bot":"Bob","turn":person,"bot_id":1});
     let by_bob = |delivery| TurnOptions {
         delivery,
         from: Some(("Bob".into(), person)),
@@ -1774,7 +1774,7 @@ fn a_turn_started_from_the_line_names_its_author_again() {
     assert_eq!(accepted["event"], "accepted");
     assert_eq!(
         accepted["data"]["from"],
-        json!({"bot":"Bob","turn":person,"id":1})
+        json!({"bot":"Bob","turn":person,"bot_id":1})
     );
 }
 
@@ -1807,7 +1807,7 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
     let turn = started.turn;
     assert_eq!(
         started.entry.unwrap()["data"]["from"],
-        json!({"bot":"Bob","turn":person,"id":1})
+        json!({"bot":"Bob","turn":person,"bot_id":1})
     );
     // The same request from someone else is not a retry of it.
     let conflict = db.begin(
@@ -2051,7 +2051,7 @@ fn schema_40_keeps_each_bot_written_prompts_sender_with_its_node() {
              ALTER TABLE turns DROP COLUMN from_id;
              UPDATE events SET data=json_object('from',json_extract(data,'$.steer'),
                 'node',json_extract(data,'$.node')) WHERE kind='steered';
-             UPDATE events SET data=json_remove(data,'$.from.id') WHERE kind IN ('accepted','queued');
+             UPDATE events SET data=json_remove(data,'$.from.bot_id') WHERE kind IN ('accepted','queued');
              PRAGMA user_version=40;",
         )
         .unwrap();
@@ -2070,7 +2070,7 @@ fn schema_40_keeps_each_bot_written_prompts_sender_with_its_node() {
         .iter()
         .map(|n| json!([n["item"]["content"][0]["text"], n["from"]]))
         .collect();
-    let bob = json!({"bot":"Bob","turn":person,"id":1});
+    let bob = json!({"bot":"Bob","turn":person,"bot_id":1});
     assert_eq!(
         sent,
         [
@@ -3578,9 +3578,9 @@ fn creation_and_fork_reject_incomplete_deleted_and_reused_creator_identities() {
             db.create("Creator", Some("/synthetic"), binding()).unwrap();
         }
         for (name, id, code) in [
-            (Some("Creator"), Some(creator.id), "creator_not_found"),
+            (Some("Creator"), Some(creator.bot_id), "creator_not_found"),
             (Some("Creator"), None, "creator_identity_required"),
-            (None, Some(creator.id), "creator_identity_required"),
+            (None, Some(creator.bot_id), "creator_identity_required"),
         ] {
             let before = db.list(None, 64).unwrap();
             let mut b = binding();
@@ -3618,24 +3618,24 @@ fn lineage_pins_the_creator_identity_so_a_reused_name_is_a_stranger() {
     let (first_a, _) = db.create("A", Some("/synthetic"), binding()).unwrap();
     let mut by_a = binding();
     by_a.created_by = Some("A");
-    by_a.created_by_id = Some(first_a.id);
+    by_a.created_by_id = Some(first_a.bot_id);
     let (b, _) = db.create("B", Some("/synthetic"), by_a).unwrap();
-    assert_eq!(b.created_by_id, Some(first_a.id));
+    assert_eq!(b.created_by_id, Some(first_a.bot_id));
     db.delete_bot("A").unwrap();
     let (second_a, _) = db.create("A", Some("/synthetic"), binding()).unwrap();
-    assert_ne!(second_a.id, first_a.id);
+    assert_ne!(second_a.bot_id, first_a.bot_id);
     let b = db.inspect("B").unwrap();
     assert_eq!(b.created_by.as_deref(), Some("A"));
     assert_eq!(
         b.created_by_id,
-        Some(first_a.id),
+        Some(first_a.bot_id),
         "B still names the A that made it"
     );
     let page = db.list(None, 64).unwrap();
     let listed = page["bots"].as_array().unwrap();
     let b_row = listed.iter().find(|r| r["name"] == "B").unwrap();
-    assert_eq!(b_row["created_by_id"], first_a.id);
-    assert_ne!(b_row["created_by_id"], second_a.id);
+    assert_eq!(b_row["created_by_id"], first_a.bot_id);
+    assert_ne!(b_row["created_by_id"], second_a.bot_id);
 }
 
 #[test]
@@ -3751,13 +3751,13 @@ fn forks_keep_the_binding_and_instructions_and_record_a_creator() {
     created.instructions = "first text";
     let (parent, _) = db.create("Parent", Some("/synthetic"), binding()).unwrap();
     created.created_by = Some("Parent");
-    created.created_by_id = Some(parent.id);
+    created.created_by_id = Some(parent.bot_id);
     let (bot, event) = db.create("Bob", Some("/synthetic"), created).unwrap();
     let event = event.unwrap();
     assert_eq!(bot.created_by.as_deref(), Some("Parent"));
     assert_eq!(event["data"]["created_by"], "Parent");
     // The event carries the validated creator identity.
-    assert_eq!(bot.created_by_id, Some(parent.id));
+    assert_eq!(bot.created_by_id, Some(parent.bot_id));
     assert_eq!(event["data"]["status"], "idle");
     assert_eq!(event["data"]["provider"], "openai");
     assert_eq!(event["data"]["workspace"], "/synthetic");
@@ -3768,7 +3768,7 @@ fn forks_keep_the_binding_and_instructions_and_record_a_creator() {
             "same",
             Fork {
                 created_by: Some("Bob"),
-                created_by_id: Some(bot.id),
+                created_by_id: Some(bot.bot_id),
                 ..Fork::default()
             },
         )
@@ -3777,7 +3777,7 @@ fn forks_keep_the_binding_and_instructions_and_record_a_creator() {
     assert_eq!(same.created_by.as_deref(), Some("Bob"));
     assert_eq!(
         same.created_by_id,
-        Some(bot.id),
+        Some(bot.bot_id),
         "the creator's identity, not its name"
     );
     // Without a creator the fork records none; the source is untouched.
@@ -6274,6 +6274,52 @@ fn cache_migration_rebuilds_retained_usage_or_rolls_back_when_pruned() {
 }
 
 #[test]
+fn schema_45_events_name_identities_bot_id() {
+    let path = std::env::temp_dir().join(format!("agent-schema45-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        converse(&mut db, "Bob", 1);
+    }
+    // Before 46 a made bot's event named its identity `id`, and a sender's too.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "UPDATE events SET data=json_set(json_remove(data,'$.bot_id'),'$.id',json_extract(data,'$.bot_id'))
+             WHERE kind='created';
+             UPDATE events SET data=json_set(data,'$.from',json_object('bot','Ann','turn',3,'id',7))
+             WHERE kind='accepted';
+             PRAGMA user_version=45;",
+        )
+        .unwrap();
+    drop(Database::initialize(Connection::open(&path).unwrap()).unwrap());
+    let conn = Connection::open(&path).unwrap();
+    let data = |kind: &str| -> Value {
+        let text: String = conn
+            .query_row(
+                "SELECT data FROM events WHERE kind=? ORDER BY id LIMIT 1",
+                [kind],
+                |r| r.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&text).unwrap()
+    };
+    let created = data("created");
+    assert_eq!((&created["bot_id"], created.get("id")), (&json!(1), None));
+    assert_eq!(
+        data("accepted")["from"],
+        json!({"bot":"Ann","turn":3,"bot_id":7})
+    );
+    let version: i32 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, Database::SCHEMA);
+    drop(conn);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn bot_identities_are_assigned_in_creation_order_and_never_reused() {
     let path = std::env::temp_dir().join(format!("agent-identity-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
@@ -6281,7 +6327,7 @@ fn bot_identities_are_assigned_in_creation_order_and_never_reused() {
         let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
         let (bob, event) = db.create("Bob", Some("/synthetic"), binding()).unwrap();
         assert_eq!(
-            (bob.id, event.unwrap()["data"]["id"].as_i64()),
+            (bob.bot_id, event.unwrap()["data"]["bot_id"].as_i64()),
             (1, Some(1))
         );
         converse(&mut db, "Bob", 1);
@@ -6296,7 +6342,7 @@ fn bot_identities_are_assigned_in_creation_order_and_never_reused() {
             )
             .unwrap();
         assert_eq!(
-            (fork.id, event.unwrap()["data"]["id"].as_i64()),
+            (fork.bot_id, event.unwrap()["data"]["bot_id"].as_i64()),
             (2, Some(2))
         );
         assert_eq!(db.identity("Bob", Some(1)).unwrap(), 1);
@@ -6312,7 +6358,7 @@ fn bot_identities_are_assigned_in_creation_order_and_never_reused() {
             db.create("Fork", Some("/synthetic"), binding())
                 .unwrap()
                 .0
-                .id,
+                .bot_id,
             3
         );
     }
@@ -6328,13 +6374,13 @@ fn bot_identities_are_assigned_in_creation_order_and_never_reused() {
     }
     {
         let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
-        assert_eq!(db.inspect("Bob").unwrap().id, 1);
-        assert_eq!(db.inspect("Fork").unwrap().id, 2);
+        assert_eq!(db.inspect("Bob").unwrap().bot_id, 1);
+        assert_eq!(db.inspect("Fork").unwrap().bot_id, 2);
         assert_eq!(
             db.create("New", Some("/synthetic"), binding())
                 .unwrap()
                 .0
-                .id,
+                .bot_id,
             3
         );
     }
@@ -6344,8 +6390,8 @@ fn bot_identities_are_assigned_in_creation_order_and_never_reused() {
     }
     {
         let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
-        assert_eq!(db.inspect("New").unwrap().id, 3);
-        assert_eq!(db.list(None, 8).unwrap()["bots"][0]["id"], 1);
+        assert_eq!(db.inspect("New").unwrap().bot_id, 3);
+        assert_eq!(db.list(None, 8).unwrap()["bots"][0]["bot_id"], 1);
     }
     std::fs::remove_file(path).unwrap();
 }
@@ -6381,24 +6427,24 @@ fn identity_migration_seeds_allocation_after_sparse_and_empty_stores() {
             let maximum = if empty {
                 0
             } else {
-                let first = db.inspect("First").unwrap().id;
-                let last = db.inspect("Last").unwrap().id;
+                let first = db.inspect("First").unwrap().bot_id;
+                let last = db.inspect("Last").unwrap().bot_id;
                 assert!(first > 0 && last > first);
                 last
             };
             let created = db.create("New", Some("/synthetic"), binding()).unwrap().0;
-            assert!(created.id > maximum);
+            assert!(created.bot_id > maximum);
             last = db
                 .fork("New", "Fork", Fork { ..Fork::default() })
                 .unwrap()
                 .0
-                .id;
-            assert!(last > created.id);
+                .bot_id;
+            assert!(last > created.bot_id);
             db.delete_bot("Fork").unwrap();
         }
         {
             let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
-            assert!(db.create("AfterRestart", None, binding()).unwrap().0.id > last);
+            assert!(db.create("AfterRestart", None, binding()).unwrap().0.bot_id > last);
         }
         std::fs::remove_file(path).unwrap();
     }
@@ -6522,7 +6568,7 @@ fn explicit_prune_pieces_cover_the_same_records_as_one_pass() {
     for n in 1..=40 {
         converse(&mut db, "Bob", n);
     }
-    let id = db.inspect("Bob").unwrap().id;
+    let id = db.inspect("Bob").unwrap().bot_id;
     let mut after = 0;
     let mut events = 0;
     let mut pieces = 0;
@@ -6550,7 +6596,7 @@ fn stale_deletion_piece_cannot_remove_a_replacement_bot() {
         .create("Bob", Some("/synthetic"), binding())
         .unwrap()
         .0
-        .id;
+        .bot_id;
     converse(&mut db, "Bob", 1);
     converse(&mut db, "Bob", 2);
     let (id, first) = db.start_delete_bot("Bob", 1).unwrap();
@@ -6562,7 +6608,7 @@ fn stale_deletion_piece_cannot_remove_a_replacement_bot() {
         .create("Bob", Some("/synthetic"), binding())
         .unwrap()
         .0
-        .id;
+        .bot_id;
     assert_ne!(original, replacement);
     converse(&mut db, "Bob", 3);
     let history = stored(&mut db, "Bob");
@@ -6570,7 +6616,7 @@ fn stale_deletion_piece_cannot_remove_a_replacement_bot() {
         db.delete_bot_piece("Bob", original, 1).unwrap_err().code,
         "bot_not_found"
     );
-    assert_eq!(db.inspect("Bob").unwrap().id, replacement);
+    assert_eq!(db.inspect("Bob").unwrap().bot_id, replacement);
     assert_eq!(db.inspect("Bob").unwrap().status, "completed");
     assert_eq!(stored(&mut db, "Bob"), history);
     assert!(db.delete_bot("Bob").is_ok());
@@ -6617,7 +6663,7 @@ fn stale_prune_piece_preserves_replacement_records() {
         .create("Bob", Some("/synthetic"), binding())
         .unwrap()
         .0
-        .id;
+        .bot_id;
     for n in 1..=10 {
         converse(&mut db, "Bob", n);
     }
@@ -6628,7 +6674,7 @@ fn stale_prune_piece_preserves_replacement_records() {
         .create("Bob", Some("/synthetic"), binding())
         .unwrap()
         .0
-        .id;
+        .bot_id;
     assert_ne!(original, replacement);
     for n in 11..=12 {
         converse(&mut db, "Bob", n);
@@ -8020,15 +8066,15 @@ fn merged_schema_preserves_stores_from_both_published_branches() {
                 .create("Parent", Some("/synthetic"), binding())
                 .unwrap()
                 .0;
-            parent_id = parent.id;
+            parent_id = parent.bot_id;
             let mut b = binding();
             b.created_by = Some("Parent");
-            b.created_by_id = Some(parent.id);
+            b.created_by_id = Some(parent.bot_id);
             b.compaction_instructions = Some("preserve decisions");
             db.create("Bob", Some("/synthetic"), b).unwrap();
             converse(&mut db, "Bob", 1);
             let bot = db.inspect("Bob").unwrap();
-            id = bot.id;
+            id = bot.bot_id;
             head = bot.head.unwrap();
             item = read_item(&db, "Bob", head).unwrap();
         }
@@ -8064,7 +8110,7 @@ fn merged_schema_preserves_stores_from_both_published_branches() {
         for _ in 0..2 {
             let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
             let bot = db.inspect("Bob").unwrap();
-            assert_eq!((bot.id, bot.head), (id, Some(head)));
+            assert_eq!((bot.bot_id, bot.head), (id, Some(head)));
             assert_eq!(read_item(&db, "Bob", head).unwrap(), item);
             if lineage {
                 assert_eq!(bot.created_by.as_deref(), Some("Parent"));
@@ -8199,13 +8245,13 @@ fn schema_27_migrates_cache_lineage_and_thinking_sizes() {
     assert_eq!(full.len() - sent.len(), stripped);
     assert!(!String::from_utf8(sent).unwrap().contains("\"thinking\""));
     let bob = db.inspect("Bob").unwrap();
-    assert_eq!((bob.cache_bot, bob.cache_bot()), (None, bob.id));
+    assert_eq!((bob.cache_bot, bob.cache_bot()), (None, bob.bot_id));
     // A fork repeats its source's prefix, so it shares the source's cache,
     // and so does a fork of that fork.
     db.fork("Bob", "Alice", Fork::default()).unwrap();
     db.fork("Alice", "Ann", Fork::default()).unwrap();
     for name in ["Alice", "Ann"] {
-        assert_eq!(db.inspect(name).unwrap().cache_bot(), bob.id, "{name}");
+        assert_eq!(db.inspect(name).unwrap().cache_bot(), bob.bot_id, "{name}");
     }
     drop(db);
     std::fs::remove_file(path).unwrap();
@@ -10108,7 +10154,7 @@ fn a_resent_keyed_creation_gets_its_bot_and_a_changed_one_names_the_field() {
     // The bot has worked since; a resend still gets it, with no new event.
     converse(&mut db, "Bob", 1);
     let (again, event) = db.create("Bob", Some("/synthetic"), keyed()).unwrap();
-    assert_eq!((again.id, event), (bob.id, None));
+    assert_eq!((again.bot_id, event), (bob.bot_id, None));
     assert_eq!(again.head, db.inspect("Bob").unwrap().head);
     let conflict = |db: &mut Database, binding: Binding<'_>, workspace: &str| {
         let error = db.create("Bob", Some(workspace), binding).unwrap_err();
@@ -10166,7 +10212,10 @@ fn a_resent_keyed_fork_gets_its_fork_wherever_the_source_moved() {
     assert!(event.is_some());
     converse(&mut db, "Bob", 2);
     let (again, event) = db.fork("Bob", "Side", keyed).unwrap();
-    assert_eq!((again.id, again.head, event), (fork.id, fork.head, None));
+    assert_eq!(
+        (again.bot_id, again.head, event),
+        (fork.bot_id, fork.head, None)
+    );
     let error = db
         .fork(
             "Bob",
@@ -10197,20 +10246,20 @@ fn a_resent_keyed_fork_gets_its_fork_wherever_the_source_moved() {
 fn a_deleted_identity_is_gone_and_a_later_namesake_is_not() {
     let mut db = db();
     let (first, _) = db.create("Bob", Some("/synthetic"), binding()).unwrap();
-    assert!(!db.gone("Bob", first.id).unwrap());
-    while db.delete_bot_piece("Bob", first.id, 4).unwrap()["done"] != true {}
+    assert!(!db.gone("Bob", first.bot_id).unwrap());
+    while db.delete_bot_piece("Bob", first.bot_id, 4).unwrap()["done"] != true {}
     let (second, _) = db.create("Bob", Some("/synthetic"), binding()).unwrap();
     let (alice, _) = db.create("Alice", Some("/synthetic"), binding()).unwrap();
-    assert!(db.gone("Bob", first.id).unwrap());
-    assert!(!db.gone("Bob", second.id).unwrap());
+    assert!(db.gone("Bob", first.bot_id).unwrap());
+    assert!(!db.gone("Bob", second.bot_id).unwrap());
     // An identity never issued, another bot's, or one deleted under another
     // name is not this name's.
     for (name, id) in [
-        ("Bob", alice.id + 1),
-        ("Other", second.id),
+        ("Bob", alice.bot_id + 1),
+        ("Other", second.bot_id),
         ("Bob", 0),
-        ("Alice", first.id),
-        ("Other", first.id),
+        ("Alice", first.bot_id),
+        ("Other", first.bot_id),
     ] {
         assert_eq!(db.gone(name, id).unwrap_err().code, "bot_not_found");
     }
@@ -10220,10 +10269,10 @@ fn a_deleted_identity_is_gone_and_a_later_namesake_is_not() {
         ..binding()
     };
     let (kay, _) = db.create("Kay", Some("/synthetic"), keyed()).unwrap();
-    while db.delete_bot_piece("Kay", kay.id, 4).unwrap()["done"] != true {}
+    while db.delete_bot_piece("Kay", kay.bot_id, 4).unwrap()["done"] != true {}
     let error = db.create("Kay", Some("/synthetic"), keyed()).unwrap_err();
     assert_eq!(error.code, "bot_deleted");
-    assert_eq!(error.facts.unwrap()["bot_id"], kay.id);
+    assert_eq!(error.facts.unwrap()["bot_id"], kay.bot_id);
     db.create("Kay", Some("/synthetic"), binding()).unwrap();
 }
 

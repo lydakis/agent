@@ -1632,7 +1632,7 @@ const HELPER_ROUNDS: usize = 8;
 /// bot any more: deleted while no window watched, or made again.
 async fn end_turns(client: &Client, member: &str, id: Option<i64>) -> Result<bool, String> {
     match client.request("resume", json!({"bot": member})).await {
-        Ok(bot) if bot["id"].as_i64() == id => {}
+        Ok(bot) if bot["bot_id"].as_i64() == id => {}
         Ok(_) => return Ok(false),
         Err(error) if error.code == "bot_not_found" => return Ok(false),
         Err(error) => return Err(error.to_string()),
@@ -1761,7 +1761,7 @@ async fn create(
 
 fn pins(made: &[Made]) -> Vec<(String, i64, usize)> {
     made.iter()
-        .map(|(name, row, record)| (name.clone(), record["id"].as_i64().unwrap_or(-1), *row))
+        .map(|(name, row, record)| (name.clone(), record["bot_id"].as_i64().unwrap_or(-1), *row))
         .collect()
 }
 
@@ -1784,7 +1784,7 @@ async fn brief_all(
     let mut sends = tokio::task::JoinSet::new();
     for (i, (name, _, record)) in made.iter().enumerate() {
         let params = json!({
-            "bot": name, "bot_id": record["id"], "request_id": format!("{stamp}-{i}"),
+            "bot": name, "bot_id": record["bot_id"], "request_id": format!("{stamp}-{i}"),
             "prompt": brief(swarm, dir, name, late), "delivery": "reject",
         });
         let (client, name) = (client.clone(), name.clone());
@@ -2862,7 +2862,7 @@ async fn scan(client: &Client, swarm: &Swarm, roots: &BTreeMap<i64, i64>) -> Res
             if name > prefix.as_str() && !name.starts_with(&prefix) {
                 return Ok(out);
             }
-            let (Some(id), used) = (bot["id"].as_i64(), bot["tokens_used"].as_u64()) else {
+            let (Some(id), used) = (bot["bot_id"].as_i64(), bot["tokens_used"].as_u64()) else {
                 continue;
             };
             if swarm.members.iter().any(|m| m == name) {
@@ -3397,7 +3397,7 @@ pub fn start_cli(args: &[String]) -> i32 {
             ) else {
                 return Err(format!("{lead} has no folder or model"));
             };
-            if me["id"].as_i64() != Some(id) {
+            if me["bot_id"].as_i64() != Some(id) {
                 return Err(format!("{lead} is not this shell's bot any more"));
             }
             // This turn's model and effort, which the shell names, else the
@@ -4488,8 +4488,8 @@ mod tests {
                 "bots" => {
                     let turn = on.load(std::sync::atomic::Ordering::Relaxed).then_some(7);
                     Ok(json!({"bots": [
-                        {"name": agent(1), "id": 1, "tokens_used": 10, "budget_tokens": 1000},
-                        {"name": agent(2), "id": 2, "tokens_used": 10, "budget_tokens": 1000, "running_turn": turn},
+                        {"name": agent(1), "bot_id": 1, "tokens_used": 10, "budget_tokens": 1000},
+                        {"name": agent(2), "bot_id": 2, "tokens_used": 10, "budget_tokens": 1000, "running_turn": turn},
                     ], "next_after": null}))
                 }
                 "submit" => Ok(json!({"status": "queued"})),
@@ -4564,8 +4564,8 @@ mod tests {
                     &tag,
                     Box::new(move |op, request| match op {
                         "bots" => Ok(json!({"bots": [
-                        {"name": agent(1), "id": 1, "tokens_used": 10, "budget_tokens": 1000},
-                        {"name": agent(2), "id": 2, "tokens_used": 10, "budget_tokens": 1000},
+                        {"name": agent(1), "bot_id": 1, "tokens_used": 10, "budget_tokens": 1000},
+                        {"name": agent(2), "bot_id": 2, "tokens_used": 10, "budget_tokens": 1000},
                     ], "next_after": null})),
                         "submit" if failed && request["bot"] != "agent.lead" => {
                             Err("cannot_start".into())
@@ -4705,7 +4705,7 @@ mod tests {
     fn made(request: &Value) -> Value {
         let name = request["bot"].as_str().unwrap();
         let n: i64 = name.rsplit('-').next().unwrap().parse().unwrap();
-        json!({"name": name, "id": 100 + n, "model": request["model"]})
+        json!({"name": name, "bot_id": 100 + n, "model": request["model"]})
     }
 
     #[test]
@@ -5029,7 +5029,7 @@ mod tests {
         let fake = Fake::start(
             "names-held",
             Box::new(|op, _| match op {
-                "resume" => Ok(json!({"id": 7})),
+                "resume" => Ok(json!({"bot_id": 7})),
                 _ => Err("unexpected".into()),
             }),
         );
@@ -5069,7 +5069,7 @@ mod tests {
             "names",
             Box::new(|op, request| match op {
                 // A task is named p.ship; strays of an old p.ship-2 are left.
-                "resume" if request["bot"] == "p.ship" => Ok(json!({"id": 7})),
+                "resume" if request["bot"] == "p.ship" => Ok(json!({"bot_id": 7})),
                 "resume" => Err("bot_not_found".into()),
                 "bots" if request["after"] == "p.ship-2" => {
                     Ok(json!({"bots": [{"name": "p.ship-2-1"}]}))
@@ -5222,27 +5222,27 @@ mod tests {
                     // not a helper.
                     ("bots", _) => {
                         let first = looked.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0;
-                        let deep = json!({"name": "agent.latency-1.fix.deep", "id": 41, "created_by_id": 40});
+                        let deep = json!({"name": "agent.latency-1.fix.deep", "bot_id": 41, "created_by_id": 40});
                         // Another window gave latency-1 a turn after its first end.
                         let running = if first { json!(9) } else { Value::Null };
                         let mut bots = vec![
-                            json!({"name": agent(1), "id": 1, "tokens_used": 10, "running_turn": running}),
-                            json!({"name": "agent.latency-1.fix", "id": 40, "created_by_id": 1}),
+                            json!({"name": agent(1), "bot_id": 1, "tokens_used": 10, "running_turn": running}),
+                            json!({"name": "agent.latency-1.fix", "bot_id": 40, "created_by_id": 1}),
                         ];
                         bots.extend((!first).then_some(deep));
                         bots.extend([
-                            json!({"name": "agent.latency-1.stray", "id": 42, "created_by_id": 77}),
-                            json!({"name": agent(2), "id": 99}),
-                            json!({"name": "agent.other", "id": 50}),
+                            json!({"name": "agent.latency-1.stray", "bot_id": 42, "created_by_id": 77}),
+                            json!({"name": agent(2), "bot_id": 99}),
+                            json!({"name": "agent.other", "bot_id": 50}),
                         ]);
                         Ok(json!({"bots": bots, "next_after": null}))
                     }
-                    ("resume", "agent.latency-1.fix") => Ok(json!({"id": 40})),
-                    ("resume", "agent.latency-1.fix.deep") => Ok(json!({"id": 41})),
+                    ("resume", "agent.latency-1.fix") => Ok(json!({"bot_id": 40})),
+                    ("resume", "agent.latency-1.fix.deep") => Ok(json!({"bot_id": 41})),
                     // latency-2 was deleted and made again: another bot now.
-                    ("resume", "agent.latency-2") => Ok(json!({"id": 99})),
+                    ("resume", "agent.latency-2") => Ok(json!({"bot_id": 99})),
                     ("resume", "agent.latency-3") => Err("bot_not_found".into()),
-                    ("resume", _) => Ok(json!({"id": 1})),
+                    ("resume", _) => Ok(json!({"bot_id": 1})),
                     ("turns", _) if request["after"] == 0 => Ok(json!({
                         "turns": [{"turn": 5, "status": "completed"}, {"turn": 6, "status": "running"}],
                         "next_after": 6,
@@ -5304,16 +5304,16 @@ mod tests {
             Box::new(move |op, request| match op {
                 "bots" => {
                     let round = now.load(std::sync::atomic::Ordering::Relaxed);
-                    let mut bots = vec![json!({"name": agent(1), "id": 1, "tokens_used": 100})];
+                    let mut bots = vec![json!({"name": agent(1), "bot_id": 1, "tokens_used": 100})];
                     if round == 0 {
-                        bots.push(json!({"name": "agent.latency-1.fix", "id": 40, "created_by_id": 1, "tokens_used": 20}));
+                        bots.push(json!({"name": "agent.latency-1.fix", "bot_id": 40, "created_by_id": 1, "tokens_used": 20}));
                     }
                     if round < 2 {
-                        bots.push(json!({"name": "agent.latency-1.fix.deep", "id": 41, "created_by_id": 40, "tokens_used": 3 + 2 * round}));
+                        bots.push(json!({"name": "agent.latency-1.fix.deep", "bot_id": 41, "created_by_id": 40, "tokens_used": 3 + 2 * round}));
                     }
                     Ok(json!({"bots": bots, "next_after": null}))
                 }
-                "resume" => Ok(json!({"id": if request["bot"] == agent(1) { 1 } else { 41 }})),
+                "resume" => Ok(json!({"bot_id": if request["bot"] == agent(1) { 1 } else { 41 }})),
                 "turns" => {
                     Ok(json!({"turns": [{"turn": 2, "status": "running"}], "next_after": null}))
                 }
@@ -5533,15 +5533,15 @@ mod tests {
                 // fix shows only at Stop's first look, and deep, which fix made, only after.
                 "bots" => {
                     let first = looked.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0;
-                    let mut bots = vec![json!({"name": agent(1), "id": 1})];
+                    let mut bots = vec![json!({"name": agent(1), "bot_id": 1})];
                     bots.push(if first {
-                        json!({"name": "agent.latency-1.fix", "id": 40, "created_by_id": 1})
+                        json!({"name": "agent.latency-1.fix", "bot_id": 40, "created_by_id": 1})
                     } else {
-                        json!({"name": "agent.latency-1.fix.deep", "id": 41, "created_by_id": 40})
+                        json!({"name": "agent.latency-1.fix.deep", "bot_id": 41, "created_by_id": 40})
                     });
                     Ok(json!({"bots": bots, "next_after": null}))
                 }
-                "resume" => Ok(json!({"id": match request["bot"].as_str().unwrap() {
+                "resume" => Ok(json!({"bot_id": match request["bot"].as_str().unwrap() {
                     "agent.latency-1.fix" => 40,
                     "agent.latency-1.fix.deep" => 41,
                     _ => 1,
@@ -5584,15 +5584,15 @@ mod tests {
                 // fix made, only after.
                 "bots" => {
                     let first = looked.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0;
-                    let mut bots = vec![json!({"name": agent(1), "id": 1})];
+                    let mut bots = vec![json!({"name": agent(1), "bot_id": 1})];
                     bots.push(if first {
-                        json!({"name": "agent.latency-1.fix", "id": 40, "created_by_id": 1})
+                        json!({"name": "agent.latency-1.fix", "bot_id": 40, "created_by_id": 1})
                     } else {
-                        json!({"name": "agent.latency-1.fix.deep", "id": 41, "created_by_id": 40})
+                        json!({"name": "agent.latency-1.fix.deep", "bot_id": 41, "created_by_id": 40})
                     });
                     Ok(json!({"bots": bots, "next_after": null}))
                 }
-                "resume" => Ok(json!({"id": match request["bot"].as_str().unwrap() {
+                "resume" => Ok(json!({"bot_id": match request["bot"].as_str().unwrap() {
                     "agent.latency-1.fix" => 40,
                     "agent.latency-1.fix.deep" => 41,
                     _ => 1,
@@ -5650,10 +5650,10 @@ mod tests {
                 // latency-1 works; its helper's tokens count too.
                 "bots" => {
                     let mut bots = vec![
-                        json!({"name": agent(1), "id": 1, "running_turn": 4, "tokens_used": now.load(std::sync::atomic::Ordering::Relaxed)}),
-                        json!({"name": "agent.latency-1.fix", "id": 40, "created_by_id": 1, "tokens_used": 600_000}),
-                        json!({"name": agent(2), "id": 2}),
-                        json!({"name": "agent.latency-3.fix", "id": 43, "created_by_id": 3}),
+                        json!({"name": agent(1), "bot_id": 1, "running_turn": 4, "tokens_used": now.load(std::sync::atomic::Ordering::Relaxed)}),
+                        json!({"name": "agent.latency-1.fix", "bot_id": 40, "created_by_id": 1, "tokens_used": 600_000}),
+                        json!({"name": agent(2), "bot_id": 2}),
+                        json!({"name": "agent.latency-3.fix", "bot_id": 43, "created_by_id": 3}),
                     ];
                     if !alive.load(std::sync::atomic::Ordering::Relaxed) {
                         bots.retain(|b| b["created_by_id"].is_null());
@@ -5915,7 +5915,7 @@ mod tests {
             "resume",
             Box::new(move |op, _| match op {
                 "bots" if up.load(std::sync::atomic::Ordering::Relaxed) => Ok(json!({
-                    "bots": [{"name": agent(1), "id": 1}], "next_after": null,
+                    "bots": [{"name": agent(1), "bot_id": 1}], "next_after": null,
                 })),
                 "bots" => Err("unavailable".into()),
                 "submit" => Ok(json!({"status": "started"})),
