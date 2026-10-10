@@ -3514,7 +3514,10 @@ mod tests {
                 .starts_with("creator_not_found")
         );
         w.install(&s).unwrap();
-        w.settle(&s, unmade("bot_deleted: the p.review this request made".into()));
+        w.settle(
+            &s,
+            unmade("bot_deleted: the p.review this request made".into()),
+        );
         assert_eq!(w.state(&s.name), (false, false, true));
     }
 
