@@ -1516,6 +1516,37 @@ fn served_announcements_carry_each_call_and_the_denials_so_far() {
 }
 
 #[test]
+fn history_pages_name_the_folder_each_turn_ran_in() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic/first"), binding()).unwrap();
+    let first = db
+        .begin("Bob", "r1", "here", true, &TurnOptions::default(), allow_provider)
+        .unwrap()
+        .turn;
+    db.append(first, vec![assistant("wrote a.md")], &[], None).unwrap();
+    db.finish(first, None).unwrap();
+    let moved = TurnOptions {
+        workspace: Some("/synthetic/second".into()),
+        ..TurnOptions::default()
+    };
+    let second = db
+        .begin("Bob", "r2", "there", true, &moved, allow_provider)
+        .unwrap()
+        .turn;
+    db.append(second, vec![assistant("wrote b.md")], &[], None).unwrap();
+    db.finish(second, None).unwrap();
+    let page = db.history_nodes("Bob", None, 400, None, false).unwrap();
+    assert_eq!(
+        page["workspaces"],
+        json!({first.to_string(): "/synthetic/first", second.to_string(): "/synthetic/second"})
+    );
+    // A page holds only the folders of the turns it lists.
+    let newest = page["nodes"][0]["node"].as_i64().unwrap();
+    let one = db.history_nodes("Bob", Some(newest), 1, None, false).unwrap();
+    assert_eq!(one["workspaces"], json!({second.to_string(): "/synthetic/second"}));
+}
+
+#[test]
 fn history_items_name_who_sent_each_prompt_after_its_turns_are_gone() {
     let mut db = db();
     for bot in ["Bob", "Carol"] {

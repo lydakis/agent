@@ -904,6 +904,9 @@ not copy bodies. `min_node` optionally bounds the oldest included ID.
 returning its nodes newest first; `next_newer` is the inclusive minimum ID for
 the next forward page, or null. This lets clients retain only range endpoints.
 Turn IDs are inherited from each node's nearest turn-start ancestor.
+`workspaces` maps each listed turn's ID to the folder it ran in, so a client
+resolves a path a message names where it was written even after the bot moved;
+a turn whose rows went with a deleted fork source is absent.
 Membership validation walks the lineage, as `history_items` does. Both operations run
 on the read worker in a consistent snapshot, avoiding the serialized writer.
 The fork can read its shared prefix after its source is deleted.

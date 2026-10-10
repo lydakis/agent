@@ -46,7 +46,7 @@ function loadSend() { try { const v = localStorage.getItem('agent:send'); return
 // it: two hosts, or a host and this machine, never share it. Nothing is saved before the store is known.
 const sessionKey = () => (S.store ? `agent:${S.store}|${S.config?.workspace}` : null);
 const bot = (name) => S.bots.get(name);
-const transcript = (name) => { if (!S.transcripts.has(name)) S.transcripts.set(name, { items: [], nodes: 0, thoughts: 0, longOut: 0, peers: [], anchor: 'end', gen: 0, text: '', thinking: '', thinkingSince: 0, thinkingMs: 0, streamingTurn: null, streamGen: 0 }); return S.transcripts.get(name); };
+const transcript = (name) => { if (!S.transcripts.has(name)) S.transcripts.set(name, { items: [], nodes: 0, thoughts: 0, longOut: 0, peers: [], anchor: 'end', gen: 0, text: '', thinking: '', thinkingSince: 0, thinkingMs: 0, streamingTurn: null, streamGen: 0, folders: new Map() }); return S.transcripts.get(name); };
 // Counters kept in step with the items, so the key bar never scans the history.
 function count(t, it, d) {
   t.bytes = Math.max(0, (t.bytes || 0) + d * (it.bytes || 0));
@@ -661,6 +661,7 @@ async function onEvent(ev) {
       const b = bot(name); if (b) { b.status = 'running'; b.runningTurn = turn; b.waitingOn = []; b.turnStarted = S.live ? Date.now() : 0; b.elapsed = 0; }
       // The event that puts a prompt on the lineage names who sent it, here and on `steered`.
       const t = transcript(name), by = senderOf(data);
+      if (typeof data.workspace === 'string') t.folders.set(turn, data.workspace);
       if (typeof data.node === 'number') pushNode(t, { kind: 'node', node: data.node, turn, ...(by ? { by } : {}) });
       break;
     }
@@ -710,7 +711,7 @@ async function onEvent(ev) {
       const shown = S.ui.file;
       // Read again as the agent left it; what it wrote is new, so a page, diagram or image in it waits for a click.
       // A write or edit that failed or was refused changed nothing, and what is shown keeps running.
-      if (shown && !data.failed && !data.denied && call?.path && (call.name === 'write' || call.name === 'edit') && joinPath(bot(name)?.workspace ?? S.config?.workspace ?? '', call.path) === shown.full) openFile(shown.bot, shown.full, false);
+      if (shown && !data.failed && !data.denied && call?.path && (call.name === 'write' || call.name === 'edit') && joinPath(folderOf(name, turn), call.path) === shown.full) openFile(shown.bot, shown.full, false);
       if (typeof data.node === 'number') {
         pushNode(t, { kind: 'node', node: data.node, callId: data.call_id, turn });
         if (call && (call.background || call.name === 'wait') && await loadWaitOrProc(name, data.node, call)) {
@@ -876,6 +877,7 @@ async function loadInherited(name, older) {
   const present = new Set(t.items.map(it => it.kind === 'node' ? it.node : it.from).filter(id => id != null));
   const nodes = page.nodes.slice().reverse().filter(n => !(marker.exclusive && n.node === marker.next) && !present.has(n.node)).map((n) => ({ kind: 'node', node: n.node, turn: n.turn ?? null }));
   for (const it of nodes) count(t, it, 1);
+  for (const [turn, folder] of Object.entries(page.workspaces)) t.folders.set(Number(turn), folder);
   let replacement;
   if (marker.forward) replacement = [...nodes, ...(page.next_newer == null ? [] : [{...marker, min: page.next_newer, loaded: true}])];
   else replacement = [...(page.next_from == null ? [] : [{...marker, next: page.next_from, exclusive:false, loaded: true}]), ...nodes];
@@ -1262,7 +1264,7 @@ function textHTML(it, t) {
   for (const s of it.budget?.spent.slice(0, it.sib) ?? []) if (s) { used.lines += s.lines; used.tags += s.tags; used.code += s.code; used.links += s.links; used.marks += s.marks; used.over ||= s.over; }
   const from = `${used.lines} ${used.tags} ${used.code} ${used.links} ${used.marks} ${used.over}`;
   if (it.htmlOf !== it.text || it.htmlFrom !== from || (it.htmlWaited && it.htmlAt !== Rich.version)) {
-    const start = { ...used }, html = `<div class="md">${Rich.html(it.text, used)}</div>`;
+    const start = { ...used }, html = `<div class="md"${turnAttr(it.turn)}>${Rich.html(it.text, used)}</div>`;
     const tags = used.tags - start.tags, mk = used.marks - start.marks, cost = 2 * html.length + TAG_BYTES * tags + MARK_BYTES * mk;
     if (it.budget) it.budget.spent[it.sib] = { lines: used.lines - start.lines, tags, code: used.code - start.code, links: used.links - start.links, marks: mk, over: !!used.over };
     const d = cost - (it.drawnBytes ?? 0); it.drawnBytes = cost; it.bytes = (it.bytes || 0) + d; if (t) t.bytes = Math.max(0, (t.bytes || 0) + d);
@@ -1385,7 +1387,7 @@ function runHTML(t, s, limit = t.items.length) {
   return { html: `<div class="steps" data-i="${s}"><div class="sum" data-run="${s}" role="button" tabindex="0">${open ? '▾' : '▸'} ${head}</div>${body}</div>`, end };
 }
 // A read, write or edit names its path; it opens that file beside.
-const summaryHTML = (it) => it.path ? `<a class="fpath" href="#" data-file="${esc(it.path)}">${esc(it.summary)}</a>` : esc(it.summary);
+const summaryHTML = (it) => it.path ? `<a class="fpath" href="#" data-file="${esc(it.path)}"${turnAttr(it.turn)}>${esc(it.summary)}</a>` : esc(it.summary);
 function stepHTML(it, i) {
   switch (it.kind) {
     case 'thought': return `<div class="line think">${esc(it.text)}</div>`;
@@ -1459,7 +1461,7 @@ function renderTail(el, name, t) {
     const text = document.createTextNode('');
     const cursor = document.createElement('span'); cursor.className = 'cursor';
     line.replaceChildren(text, cursor);
-    const done = kind === 'text' ? document.createElement('div') : null; if (done) done.className = 'md';
+    const done = kind === 'text' ? document.createElement('div') : null; if (done) { done.className = 'md'; if (t.streamingTurn != null) done.dataset.turn = String(t.streamingTurn); }
     el.replaceChildren(...(kind || running ? [done, line].filter(Boolean) : []));
     state = { transcript: t, kind, turn: t.streamingTurn, gen: t.streamGen, offset: 0, text, running, done, cut: {}, drawn: 0, used: { lines: 0, tags: 0, code: 0, draft: true } };
     tails.set(el, state);
@@ -1549,12 +1551,19 @@ function joinPath(dir, path) {
   return parts.join('/') || '/';
 }
 const dirOf = (path) => path.replace(/\/[^/]*$/, '') || '/';
-// Which agent's folder a click names a path in: the file beside's own folder, or the agent in that pane.
+// The folder a turn ran in, as the daemon reported it; a turn it no longer knows (its rows went with
+// a deleted fork source) or no turn at all is the agent's folder now.
+function folderOf(who, turn) {
+  return (turn != null && S.transcripts.get(who)?.folders.get(Number(turn))) || (bot(who)?.workspace ?? S.config?.workspace ?? '');
+}
+const turnAttr = (turn) => turn != null ? ` data-turn="${esc(turn)}"` : '';
+// Which folder a click names a path in: the file beside's own folder, or the folder of the turn that
+// wrote the message or step, in the agent in that pane.
 function openFileFrom(path, el) {
   const beside = el?.closest?.('.pane.side');
   if (beside && S.ui.file) return openFile(S.ui.file.bot, joinPath(dirOf(S.ui.file.full), path));
-  const who = beside ? S.ui.side : S.selected, b = bot(who);
-  return openFile(who, joinPath(b?.workspace ?? S.config?.workspace ?? '', path));
+  const who = beside ? S.ui.side : S.selected;
+  return openFile(who, joinPath(folderOf(who, el?.closest?.('[data-turn]')?.dataset.turn), path));
 }
 // `asked`: someone opened it, so what it holds draws at once. `gen` counts every opening and load
 // across closes, so a view never shares a key with one before it.

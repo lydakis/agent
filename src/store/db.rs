@@ -6489,10 +6489,28 @@ impl Database {
             .and_then(|n| n["node"].as_i64())
             .filter(|id| Some(*id) != range_head)
             .map(|id| id + 1);
+        // The folder each turn on the page ran in, so a path its messages name
+        // resolves where it was written. A turn whose rows went with a deleted
+        // fork source is left out.
+        let mut workspaces = serde_json::Map::new();
+        let mut folder = self
+            .conn
+            .prepare_cached("SELECT workspace FROM turns WHERE id=?")?;
+        for turn in nodes.iter().filter_map(|n| n["turn"].as_i64()) {
+            let key = turn.to_string();
+            if workspaces.contains_key(&key) {
+                continue;
+            }
+            if let Some(Some(path)) = folder
+                .query_row([turn], |r| r.get::<_, Option<String>>(0))
+                .optional()?
+            {
+                workspaces.insert(key, json!(path));
+            }
+        }
         snapshot.commit()?;
-        Ok(
-            json!({"nodes":nodes,"next_from":next.filter(|id| *id >= floor),"next_newer":next_newer}),
-        )
+        Ok(json!({"nodes":nodes,"next_from":next.filter(|id| *id >= floor),
+            "next_newer":next_newer,"workspaces":workspaces}))
     }
     /// Fetch a byte-bounded batch after one ancestry walk for all requested IDs.
     pub fn history_items(&self, name: &str, wanted: &[i64]) -> Result<Value> {
