@@ -290,11 +290,19 @@ needs.
 
 ![A coordinator reads a task update and passes build's change on to test](app/coordinator-wake.png)
 
-Agents can be woken at set times, when a file is written or a repository
-gets a commit, or by name. Settings lists the triggers, what each one last
-did, and the message it sends, with Run now and Remove.
+Agents can be woken at set times, when a file is written, a repository
+gets a commit or an agent ends a turn, or by name. Home's list shows the
+triggers under the projects: each one's kind, name, time or what it
+watches, and who it wakes. A row opens its sheet: when it fires, what it
+does, where the answer goes, its check, its last fire and its message, with
+Open, Remove and Run now. A message a trigger sent starts with the
+trigger's name and why it fired, and the name opens the trigger.
 
-![Triggers in Settings](app/settings-triggers.png)
+![Home's triggers under its projects](app/triggers-home.png)
+
+![A trigger's sheet: when, do, reply to, its check, and Run now](app/triggers-sheet.png)
+
+![A triggered message says which trigger woke the agent, and why](app/trigger-woke.png)
 
 ## What the daemon speaks, and why the client speaks it directly
 
@@ -349,8 +357,8 @@ client/          agent-client: the socket protocol and the client policy
   ([remote.rs](../app/src-tauri/src/remote.rs));
   `policy` composes a folder's client policy, in a profile when named, and
   falls back to the profiles the app ships for `coordinator`;
-  `triggers`, `trigger_fire` and `trigger_remove` list, run and remove
-  [triggers](#triggers) ([trigger.rs](../app/src-tauri/src/trigger.rs)).
+  `triggers`, `trigger`, `trigger_fire` and `trigger_remove` list a page,
+  read one by name, run and remove [triggers](#triggers) ([trigger.rs](../app/src-tauri/src/trigger.rs)).
   When nothing listens on a store's socket, `attach` starts a daemon first
   ([daemon.rs](../app/src-tauri/src/daemon.rs)); see
   [Installing](#installing).
@@ -1312,7 +1320,7 @@ first. A name differing from another only in case is refused
 (`name_taken`), since macOS folders would give both one file, and `rm` finds
 a trigger only by the name as stored; `rm` of a name not there is
 `trigger_not_found`. `ls` returns 64 triggers per page, with `next_after`
-for `--after NAME` or the next page in Settings; only the current page's
+for `--after NAME` or the next page in Home's list; only the current page's
 messages are retained. `fire NAME` asks for a fire and returns
 `{"name", "fired": true}`; what the fire did shows in `ls`. An ask is a file
 in the trigger's queue folder, `~/.agent/triggers/NAME.asks`, which its plist
@@ -1351,8 +1359,13 @@ after it is that entry's next year: it sends nothing and ends as `missed`.
 What the fire did (`sent` with the turn and any `reply`, `skipped`, `gone`,
 `missed` or `failed` with why), with the messages sent so far, the agent it
 started and the commit it saw, is kept in `~/.agent/triggers/NAME.json`,
-which Settings shows beside each trigger with its message, a Run now button
-and a Remove button. Triggers are local to this machine. Remote windows
+which a trigger's sheet shows with its message, a Run now button and a
+Remove button. The app reads a page of triggers when the window attaches,
+when an agent's shell call of the trigger script ends, 1.5 s after a
+trigger's message arrives (once however many arrive; the fire writes its
+result after the message is in), and when a sheet opens, which reads that
+trigger by name; after Run now it reads it again until its last fire
+changes. A quiet fleet costs the app no reads. Triggers are local to this machine. Remote windows
 neither list, run nor remove local triggers. Only launchd runs a fire, so
 no two of one trigger ever run at once.
 
@@ -1464,7 +1477,7 @@ changes, and the refresh reads each plist again under it.
 the app starts from a new place, as after an update, it writes its path into
 every trigger and loads it again, on a thread of its own so the window does
 not wait; one launchd refuses keeps its old path and is tried again at the
-next start. Settings lists triggers also when no project exists. Only macOS
+next start. Home lists triggers also when no project exists. Only macOS
 has launchd; elsewhere `add` refuses with `triggers_unsupported`.
 
 Earlier apps called these schedules (`me.lydakis.agent.schedule.NAME`).

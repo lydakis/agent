@@ -36,7 +36,7 @@ function page(daemon = {}, storage = null) {
   context.Rich = context.window.Rich;
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, openFileFrom, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, fork, remove, createProject, save, restore, showMenu, refreshMenu, entries, pickerRows, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readTriggers, tellLead, markSeen, renderFile, go, upOf, crumbsHTML, railRows, renderTabs, triggerAct, turnNews, openProjectSheet, parsePlan, loadPlans, renderPlan, taskCard, mainBot, closeSheet, openPicker, pickerMode, renderPicker, keyLabel };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, openFileFrom, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, fork, remove, createProject, save, restore, showMenu, refreshMenu, entries, pickerRows, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readTriggers, renderTriggers, openTriggerSheet, renderTriggerSheet, trigSheet, soonTriggers, tellLead, markSeen, renderFile, go, upOf, crumbsHTML, railRows, renderTabs, triggerAct, turnNews, openProjectSheet, parsePlan, loadPlans, renderPlan, taskCard, mainBot, closeSheet, openPicker, pickerMode, renderPicker, keyLabel };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -3358,22 +3358,125 @@ test('approval calls and completion in one turn each reach the coordinator once 
   assert.match([...delivered.values()].at(-1), /completed, asked by the person$/);
 });
 
-test('Settings lists triggers with no project, and only then when there are some', async () => {
-  const p = page({});
-  const st = p.setupState();
-  p.S.bots.clear();
-  assert.doesNotMatch(p.setupHTML(), /Triggers/);
-  st.triggers = [{ name: 'loose', bot: 'loose', bot_id: 3, when: 'in 2h', once: true, ended: true, message: 'x', last: { outcome: 'failed', fired_ms: 0, detail: 'daemon_unavailable' } }];
-  assert.match(p.setupHTML(), /<h3>Triggers<\/h3>.*not delivered/s);
-  assert.doesNotMatch(p.setupHTML(), /trigger-fire/, 'an ended trigger has nothing to run');
-  // A one-off past its time and a plist that cannot be read are listed too, each removable.
-  st.triggers.push({ name: 'late', bot: 'late', bot_id: 4, when: 'at 2026-09-01 09:00', once: true, ended: false, missed: true, message: 'y', last: null },
+test('Home lists the triggers under its projects, each with its kind, its time and who it wakes', async () => {
+  const p = page({ triggers: async () => ({ triggers: [
+    { name: 'loose', bot: 'loose', bot_id: 3, when: 'in 2h', once: true, ended: true, message: 'x', last: { outcome: 'failed', fired_ms: 0, detail: 'daemon_unavailable' } },
+    { name: 'late', bot: 'late', bot_id: 4, when: 'at 2026-09-01 09:00', once: true, ended: false, missed: true, message: 'y', last: null },
     { name: 'odd', ended: false, problem: 'unreadable: not a trigger\'s plist' },
-    { name: 'review', bot: 'demo.review', bot_id: null, start: { model: 'a/m', effort: null }, reply_to: 'demo.lead', if: 'git diff --quiet', runs: 3, sent: 1, when: 'commit /r', once: false, ended: false, message: 'z', last: null });
-  const html = p.setupHTML();
-  assert.match(html, /missed its time/);
-  assert.match(html, /unreadable<\/span>.*data-v="odd"/s);
-  assert.match(html, /commit \/r<\/span>.*data-act="trigger-fire" data-v="review".*review · starts it on a\/m · answer to demo.lead · if git diff --quiet · 1 of 3 runs/s);
+    { name: 'review', bot: 'demo.review', bot_id: null, start: { model: 'a/m', effort: null }, reply_to: 'demo.lead', if: 'git diff --quiet', runs: 3, sent: 1, when: 'commit /Users/you/demo', once: false, ended: false, message: 'z', last: null },
+    { name: 'pr', bot: 'demo.build', bot_id: 2, when: 'every 30m', message: 'w', last: null },
+    { name: 'after', bot: 'demo.lead', bot_id: 1, when: 'every 3 turns of demo.build', message: 'v', last: null },
+  ], next_after: 'review' }) });
+  p.S.attached = true;
+  await p.readTriggers();
+  const html = p.elements.get('trigs').innerHTML;
+  assert.equal(p.elements.get('trigs').hidden, false);
+  assert.match(html, /<span class="tk">⏱<\/span><span class="n">loose<\/span><span class="w">ended<\/span>/);
+  assert.match(html, /trow bad" data-act="trigger" data-v="late">.*missed/);
+  assert.match(html, /data-v="odd">.*unreadable/);
+  assert.match(html, /<span class="tk">⎇<\/span><span class="n">review<\/span><span class="w">commit demo<\/span><\/span><span class="r2">→ demo\.review · answer to demo\.lead/);
+  assert.match(html, /<span class="tk">↻<\/span><span class="n">after<\/span><span class="w">every 3 turns<\/span>/);
+  assert.match(html, /data-act="triggers-next"/, 'a page with more after it says so');
+  // An agent's project opened in the list hides them, and a window on a host has none.
+  p.S.selected = 'demo.lead'; p.S.bots.set('demo.lead', { name: 'demo.lead', id: 1 });
+  p.renderTriggers();
+  assert.equal(p.elements.get('trigs').hidden, true);
+});
+
+test('a trigger\'s sheet shows when, what and where its answer goes, and Run now looks again until the fire has written', async () => {
+  let fired = null, reads = 0, fires = 0;
+  const row = () => ({ name: 'r', bot: 'demo.build', bot_id: 2, when: 'every 30m', if: 'test -s queue', reply_to: 'demo.lead', runs: 5, sent: fired ? 2 : 1, message: 'check the queue', last: fired ? { outcome: 'sent', fired_ms: fired, turn: 7 } : { outcome: 'declined', fired_ms: 0, detail: '--if: exit status: 1', reply: null } });
+  const p = page({ fireTrigger: async () => { fires++; return { fired: true }; }, trigger: async () => { reads++; return row(); }, triggers: async () => ({ triggers: [row()] }) });
+  p.S.attached = true;
+  p.S.bots.set('demo.build', { name: 'demo.build', id: 2 });
+  await p.openTriggerSheet('r');
+  let html = p.elements.get('sheet').innerHTML;
+  assert.match(html, /<span class="lab">When<\/span>Every 30m<\/div>.*<span class="lab">Do<\/span>Message <b>demo\.build<\/b>.*<span class="lab">Reply to<\/span><b>demo\.lead<\/b>/s);
+  assert.match(html, /checks first<\/dt><dd>test -s queue/);
+  assert.match(html, /not sent, its check said no \(--if: exit status: 1\)/);
+  assert.match(html, /<dt>sent<\/dt><dd>1 of 5, then it ends/);
+  assert.match(html, /~\/\.agent\/trigger fire r</);
+  assert.match(html, /data-act="trigger-open" title="Open its chat">Open demo\.build/);
+  const run = p.act({ dataset: { act: 'trigger-fire' } });
+  await settle();
+  assert.equal(fires, 1);
+  assert.equal(reads, 1, 'read once as the sheet opened');
+  await p.tick();
+  assert.equal(reads, 2, 'and again while the fire has not written');
+  fired = 5;
+  await p.tick();
+  assert.equal(reads, 3);
+  await p.tick();
+  await run;
+  assert.equal(reads, 3, 'its result ends the looking');
+  html = p.elements.get('sheet').innerHTML;
+  assert.match(html, /: sent, turn 7/);
+});
+
+test('a trigger that starts its agent, one gone, and one past the first page each show in a sheet', async () => {
+  const rows = { s: { name: 's', bot: 'p.review', bot_id: null, start: { model: 'a/m', effort: 'high' }, when: 'fire', message: 'm', last: null },
+    gone: { name: 'gone', bot: 'p.old', bot_id: 9, when: 'file /tmp/x.csv', message: 'm', last: null } };
+  const p = page({ trigger: async (name) => rows[name] ?? null });
+  await p.openTriggerSheet('s');
+  let html = p.elements.get('sheet').innerHTML;
+  assert.match(html, /Only when run.*Start <b>p\.review<\/b> on a\/m at high.*Stays in its chat/s);
+  assert.match(html, /data-act="trigger-open" disabled title="Its first fire starts it"/);
+  await p.openTriggerSheet('gone');
+  html = p.elements.get('sheet').innerHTML;
+  assert.match(html, /When \/tmp\/x\.csv is written/);
+  assert.match(html, /disabled title="Its agent is gone"/);
+  await p.openTriggerSheet('nope');
+  assert.match(p.elements.get('sheet').innerHTML, /No trigger by this name now/);
+});
+
+test('trigger pages replace the previous rows, and a window on a host reads none', async () => {
+  const calls = [];
+  const p = page({ triggers: async (after) => {
+    calls.push(after);
+    return { triggers: [{ name: after ? 'second' : 'first', bot: 'x', when: 'fire', message: '' }], next_after: after ? null : 'first' };
+  } });
+  await p.readTriggers();
+  assert.equal(p.S.trig.list[0].name, 'first');
+  await p.act({ dataset: { act: 'triggers-next' } });
+  assert.deepEqual(p.S.trig.list.map((x) => x.name), ['second']);
+  assert.equal(p.S.trig.next, null);
+  assert.equal(p.S.trig.after, 'first');
+  p.S.config = { host: 'remote' };
+  await p.readTriggers();
+  assert.deepEqual(calls, [null, 'first']);
+  assert.equal(p.S.trig.list, null);
+});
+
+test('reads asked for while one runs come to one more read, and a trigger\'s message or script call asks for one', async () => {
+  let reads = 0; const gate = deferred();
+  const p = page({ triggers: async () => { reads++; await gate.promise; return { triggers: [] }; }, request: async () => ({}) });
+  p.S.live = true;
+  const first = p.readTriggers();
+  p.readTriggers(); p.readTriggers(); p.readTriggers();
+  gate.resolve(); await first; await settle();
+  assert.equal(reads, 2);
+  // A fire's message: read a little later, once, however many arrive.
+  await p.onEvent({ event: 'accepted', bot: 'a', turn: 1, data: { node: 1, origin: 'trigger' } });
+  await p.onEvent({ event: 'accepted', bot: 'b', turn: 1, data: { node: 2, origin: 'trigger' } });
+  await p.tick();
+  assert.equal(reads, 3);
+  // An agent's shell call of the trigger script.
+  await p.onEvent({ event: 'tool_started', bot: 'a', turn: 1, data: { call_id: 'c', name: 'shell', arguments: JSON.stringify({ command: '"$HOME/.agent/trigger" add --every 30m -- check' }) } });
+  await p.onEvent({ event: 'tool_completed', bot: 'a', turn: 1, data: { call_id: 'c' } });
+  await p.tick();
+  assert.equal(reads, 4);
+  await p.onEvent({ event: 'tool_started', bot: 'a', turn: 1, data: { call_id: 'd', name: 'shell', arguments: JSON.stringify({ command: 'ls ~/.agent/triggers' }) } });
+  await p.onEvent({ event: 'tool_completed', bot: 'a', turn: 1, data: { call_id: 'd' } });
+  await p.tick();
+  assert.equal(reads, 4, 'its folder is not the script');
+});
+
+test('a triggered message names its trigger and why it fired, and the name opens it', () => {
+  const p = page({});
+  const html = p.itemsHTML(Object.assign(p.transcript('x'), { items: [{ kind: 'user', by: { app: 'trigger' }, text: '[trigger pr-check · 2026-10-10 09:30 · commit /r at 1a2b3c]\nCheck the PR.' }] }));
+  assert.match(html, /<button type="button" class="by" data-act="trigger" data-v="pr-check" title="Open this trigger">⎇ pr-check<\/button> <span class="why">commit \/r at 1a2b3c · 2026-10-10 09:30<\/span>\nCheck the PR\./);
+  p.S.config = { host: 'box' };
+  assert.match(p.itemsHTML(p.transcript('x')), /<span class="by">⎇ pr-check<\/span>/, 'a window on a host cannot open it');
 });
 
 test('a task turn whose answer a trigger passes to its coordinator is not news for it again', async () => {
@@ -3408,35 +3511,6 @@ test('a task turn whose answer a trigger passes to its coordinator is not news f
   await p.onEvent({ event: 'accepted', bot: 'demo.review', turn: 8, data: { request_id: 'trigger_9-1_2.1790000000.42.to.9', origin: 'trigger' } });
   await p.onEvent({ event: 'turn_finished', bot: 'demo.review', turn: 8, data: { status: 'completed' } });
   assert.equal(p.S.wakes.get('demo.lead').tasks.get('demo.review').act.turn, 8);
-});
-
-test('Settings says when a trigger\'s check said no, or its answer did not get through', () => {
-  const p = page({});
-  const st = p.setupState();
-  st.triggers = [{ name: 'a', bot: 'a', bot_id: 1, when: 'in 2h', once: true, ended: true, message: 'x', last: { outcome: 'declined', fired_ms: 0, detail: '--if: exit status: 1' } },
-    { name: 'b', bot: 'b', bot_id: 2, when: 'in 2h', once: true, ended: true, message: 'y', reply_to: 'p.lead', last: { outcome: 'sent', fired_ms: 0, reply: { outcome: 'failed', detail: 'bot_not_found' } } }];
-  const html = p.setupHTML();
-  assert.match(html, /not delivered.*not sent, its check said no \(--if: exit status: 1\)/s);
-  assert.match(html, /answer not passed on.*ended .*: sent, its answer did not get through \(bot_not_found\)/s);
-});
-
-test('Run now looks again until the fire it started has written its result', async () => {
-  let fired = null, reads = 0;
-  const p = page({ fireTrigger: async () => ({ fired: true }), triggers: async () => { reads++;
-    return { triggers: [{ name: 'r', bot: 'r', bot_id: 1, when: 'every 30m', message: 'x', last: fired && { outcome: 'sent', fired_ms: fired } }] }; } });
-  p.setupState().open = true;
-  await p.readTriggers();
-  const run = p.triggerAct('fire', 'r');
-  await settle();
-  assert.equal(reads, 2, 'read once as launchd starts it');
-  await p.tick();
-  assert.equal(reads, 3, 'and again while it has not written');
-  fired = 5;
-  await p.tick();
-  assert.equal(reads, 4);
-  await p.tick();
-  await run;
-  assert.equal(reads, 4, 'its result ends the looking');
 });
 
 test('a coordinator\'s backlog stays small however much its tasks do, and what one message leaves out comes next', async () => {
@@ -3597,24 +3671,6 @@ test('a home the last host named is replaced by the one the new store names', as
   p.lost('closed'); await p.tick(); await settle();
   assert.equal(p.S.store, 'store-2');
   assert.equal(p.S.config.workspace, '/home/b');
-});
-
-test('trigger pages replace the previous messages and remote windows do not fetch them', async () => {
-  const calls = [];
-  const p = page({ triggers: async (after) => {
-    calls.push(after);
-    return { triggers: [{ name: after ? 'second' : 'first' }], next_after: after ? null : 'first' };
-  } });
-  await p.readTriggers();
-  assert.equal(p.setupState().triggers[0].name, 'first');
-  await p.readTriggers(p.setupState().triggersNext);
-  assert.equal(p.setupState().triggers.length, 1);
-  assert.equal(p.setupState().triggers[0].name, 'second');
-  assert.equal(p.setupState().triggersNext, null);
-  p.S.config = { host: 'remote' };
-  await p.readTriggers();
-  assert.deepEqual(calls, [null, 'first']);
-  assert.equal(p.setupState().triggers, null);
 });
 
 test('usage checks member and descendant budgets before any turn ends, once enough tokens could move a share', async () => {
