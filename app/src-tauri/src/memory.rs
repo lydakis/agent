@@ -490,6 +490,63 @@ fn check(dir: &Path) -> Value {
     json!({"dir": dir, "facts": count, "index_bytes": bytes, "limit": LIMIT, "problems": problems})
 }
 
+/// Project folders the Memory sheet at Home lists at most; the rest are
+/// counted.
+const MAX_PROJECTS: usize = 100;
+
+/// What the app shows of memory, and what it tells a coordinator changed:
+/// the person's facts, and the project's of the folder `dir` is in, or with
+/// no folder every project's, each fact with its file and when it was last
+/// written. A folder that is not all facts says so in place of its facts.
+pub fn view(root: &Path, dir: Option<&Path>) -> Value {
+    let scope = |dir: PathBuf, name: Option<&str>| {
+        let listed = facts(&dir).map(|all| {
+            all.iter()
+                .map(|fact| {
+                    let path = dir.join(format!("{}.md", fact.name));
+                    let modified = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map_or(0, |d| d.as_millis() as u64);
+                    json!({"name": fact.name, "type": fact.kind, "description": fact.description,
+                        "source": fact.source, "verified": fact.verified, "path": path, "modified": modified})
+                })
+                .collect::<Vec<_>>()
+        });
+        let mut out = json!({"name": name, "dir": dir});
+        match listed {
+            Ok(facts) => out["facts"] = json!(facts),
+            Err(error) => out["error"] = json!(error),
+        }
+        out
+    };
+    let projects = root.join("projects");
+    let (names, more) = match dir {
+        Some(dir) => (project_of(dir).ok().into_iter().collect(), 0),
+        None => {
+            let mut names: Vec<String> = std::fs::read_dir(&projects)
+                .into_iter()
+                .flatten()
+                .take(MAX_ENTRIES)
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|name| crate::project::valid_name(name))
+                .collect();
+            names.sort();
+            let more = names.len().saturating_sub(MAX_PROJECTS);
+            names.truncate(MAX_PROJECTS);
+            (names, more)
+        }
+    };
+    let listed: Vec<Value> = names
+        .iter()
+        .map(|name| scope(projects.join(name), Some(name)))
+        .collect();
+    json!({"user": scope(root.to_path_buf(), None), "projects": listed, "more": more})
+}
+
 /// `~/.agent/memory`, written again whenever the app starts from
 /// somewhere else.
 pub fn write_script(state: &Path, app: &Path) -> Result<(), String> {
@@ -514,6 +571,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn view_lists_the_persons_facts_and_a_projects() {
+        let root = temp("view");
+        save_user(&root, "short-replies", "keep replies short", "Short.").unwrap();
+        let shown = view(&root, None);
+        let fact = &shown["user"]["facts"][0];
+        assert_eq!(fact["name"], "short-replies");
+        assert_eq!(fact["description"], "keep replies short");
+        assert_eq!(fact["path"], json!(root.join("short-replies.md")));
+        assert!(fact["modified"].as_u64().unwrap() > 0);
+        assert_eq!(shown["projects"], json!([]));
+        // Every project's at Home; the folder's own project elsewhere.
+        let project = root.join("projects/demo");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("bad.md"), "not a fact").unwrap();
+        let shown = view(&root, None);
+        assert_eq!(shown["projects"][0]["name"], "demo");
+        assert!(
+            shown["projects"][0]["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("memory_invalid: ")
+        );
+        let work = root.join("work");
+        std::fs::create_dir_all(work.join(".agents")).unwrap();
+        std::fs::write(work.join(".agents/project.toml"), "name = \"demo\"\n").unwrap();
+        assert_eq!(view(&root, Some(&work))["projects"][0]["name"], "demo");
+        assert_eq!(view(&root, Some(&root))["projects"], json!([]));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn args(line: &[&str]) -> Vec<String> {

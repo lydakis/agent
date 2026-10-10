@@ -1075,12 +1075,17 @@ function merge(tasks, name, news) {
 // A working coordinator waits for its turn to end, which calls this again.
 function wakeSoon(lead) {
   const w = S.wakes.get(lead), l = bot(lead);
-  if (!w || w.timer || !w.tasks.size || !l || isActive(l.status)) return;
+  if (!w || w.timer || w.busy || !w.tasks.size || !l || isActive(l.status)) return;
   w.timer = setTimeout(() => { w.timer = null; wake(lead); }, Math.max(0, w.last + WAKE_MS - Date.now()));
 }
 async function wake(lead) {
   const w = S.wakes.get(lead), l = bot(lead);
-  if (!w || !w.tasks.size || !S.attached || !l || l.id == null || isActive(l.status)) return;
+  if (!w || w.busy || !w.tasks.size || !S.attached || !l || l.id == null || isActive(l.status)) return;
+  // What changed in memory rides along; it never wakes a coordinator by itself.
+  w.busy = true;
+  const mem = await memoryNews(l, w).catch((e) => { Daemon.log?.(`memory for ${lead}: ${e?.message ?? e}`); return null; });
+  w.busy = false;
+  if (S.wakes.get(lead) !== w || bot(lead) !== l || !w.tasks.size || !S.attached || isActive(l.status)) return;
   const sent = [...w.tasks].sort(([, a], [, b]) => (b.act ? 1 : 0) - (a.act ? 1 : 0)).slice(0, WAKE_TASKS);
   const items = sent.flatMap(([name, n]) => KINDS.filter((k) => n[k]).map((k) => [name, k, n[k]]));
   for (const [name] of sent) w.tasks.delete(name);
@@ -1089,14 +1094,14 @@ async function wake(lead) {
   // approval call: one turn can need several approvals before its completion.
   // Windows with the same news still deduplicate, regardless of earlier turn
   // counts; a window that saw news of another kind sends its own message.
-  const prompt = wakeText(items, w.tasks.size);
+  const prompt = wakeText(items, w.tasks.size) + (mem ? `\n\n${mem.text}` : '');
   const key = ([name, k]) => `${name}\u0000${k}`;
   const id = `app-wake-${l.id}-${digest(JSON.stringify(items.map(([name, k, t]) => [name, k, t.turn, t.status, t.approval ?? null]).sort((a, b) => key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0)))}`;
-  try { await Daemon.request('submit', { bot: lead, bot_id: l.id, request_id: id, prompt, delivery: 'queue', origin: 'tasks' }); }
+  try { await Daemon.request('submit', { bot: lead, bot_id: l.id, request_id: id, prompt, delivery: 'queue', origin: 'tasks' }); mem?.told(); }
   catch (e) {
     if (/^bot_not_found/.test(e?.message ?? '')) { S.wakes.delete(lead); return; }
     // Another window told it first.
-    if (/^idempotency_conflict/.test(e?.message ?? '')) return;
+    if (/^idempotency_conflict/.test(e?.message ?? '')) { mem?.told(); return; }
     const later = w.tasks;
     w.tasks = new Map(sent);
     for (const [name, t] of later) merge(w.tasks, name, t);
@@ -1104,6 +1109,28 @@ async function wake(lead) {
     wakeSoon(lead);
   }
 }
+// ---------- memory news ----------
+// A coordinator composed its instructions when it was made, so a fact a task saved since reaches it
+// as lines added to a message it gets anyway, a task update: what was saved or removed in its own and
+// its project's memory since this window last told it, or since the window opened. A fact it saved
+// itself is not news. The lines come after the prompt's start, so its cached prefix stays.
+const OPENED_AT = Date.now(), MEMORY_LINES = 20;
+async function memoryNews(l, w) {
+  if (S.config?.host || !l.workspace || !Daemon.memoryView) return null;
+  const v = await Daemon.memoryView(l.workspace);
+  const read = [v.user, ...(v.projects ?? [])].filter((sc) => sc?.facts), now = new Map();
+  for (const sc of read) for (const f of sc.facts) now.set(f.path, f);
+  // Each fact as last told, by its file and when it was written; a folder that could not be read keeps its own.
+  const seen = w.memSeen, own = `turn:${l.name}/`, inRead = (p) => read.some((sc) => trimDir(sc.dir) === p.slice(0, p.lastIndexOf('/')));
+  const saved = [...now.values()].filter((f) => (seen ? seen.get(f.path) !== f.modified : f.modified > OPENED_AT) && !f.source.startsWith(own)).sort((a, b) => b.modified - a.modified);
+  const gone = seen ? [...seen.keys()].filter((p) => !now.has(p) && inRead(p)) : [];
+  const told = () => { w.memSeen = new Map([...[...(seen ?? [])].filter(([p]) => !inRead(p)), ...[...now].map(([p, f]) => [p, f.modified])]); };
+  const lines = [...saved.map((f) => `- saved: ${f.path}: ${f.description}`), ...gone.map((p) => `- removed: ${p}`)];
+  if (!lines.length) { told(); return null; }
+  const more = lines.length - MEMORY_LINES;
+  return { told, text: `Memory changed since you last heard; each fact is a file, read before relying on it:\n${lines.slice(0, MEMORY_LINES).join('\n')}${more > 0 ? `\n- ${more} more: ~/.agent/memory show lists every fact` : ''}` };
+}
+
 // FNV-1a over the text's UTF-16 units, 64 bits as hex.
 function digest(text) {
   let h = 0xcbf29ce484222325n;
@@ -2286,6 +2313,38 @@ async function submitProject() {
   } catch (err) { toast(String(err?.message ?? err), 6000); go.disabled = false; go.textContent = 'Create'; }
 }
 
+// ---------- the Memory sheet ----------
+// What agents saved for later agents, as files: at Home yours and every project's, in a project its
+// own and yours, newest first. A fact opens in a tab. Agents write memory; the sheet only reads it.
+async function openMemorySheet(lead) {
+  closeMenu();
+  const b = lead ? bot(lead) : null, project = lead ? leadProject(lead) : null;
+  sheetFor = null; sheetKind = 'memory';
+  $('sheet').innerHTML = `<h4>${project ? `${esc(project)} memory` : 'Memory'}</h4><p class="hint">reading…</p>`;
+  $('sheetwrap').classList.add('on'); S.ui.sheet = true;
+  let v = null, error = '';
+  try { v = await Daemon.memoryView(b?.workspace ?? null); } catch (e) { error = String(e?.message ?? e); }
+  if (!S.ui.sheet || sheetKind !== 'memory') return;
+  $('sheet').innerHTML = memoryHTML(v, project, error);
+  setTimeout(() => $('sheet').querySelector('.mrow,.sbtn.primary')?.focus?.(), 0);
+}
+function memoryHTML(v, project, error) {
+  const now = Date.now(), you = v ? { ...v.user, label: 'You' } : null;
+  const projects = (v?.projects ?? []).map((sc) => ({ ...sc, label: sc.name }));
+  const scopes = v ? (project ? [...projects, you] : [you, ...projects]) : [];
+  const fact = (f) => `<button type="button" class="mrow" data-act="open-fact" data-v="${esc(f.path)}" title="${esc(f.path)}"><span class="md">${esc(f.description)}</span><span class="mm">${esc(f.name)} · ${esc(f.type)} · ${esc(f.source)} · ${esc(agoText(now - f.modified))}</span></button>`;
+  const scope = (sc) => `<div class="mscope"><div class="mh">${esc(sc.label)} <span class="d">${esc(sc.dir)}</span></div>${sc.error ? `<p class="hint warn">${esc(sc.error)}</p>` : sc.facts.length ? [...sc.facts].sort((a, b) => b.modified - a.modified).map(fact).join('') : '<p class="hint">Nothing saved yet.</p>'}</div>`;
+  const lede = project ? `Facts the project's lead and every thread share, and yours, which hold across projects. Agents save them with the memory skill.` : `Yours hold across projects; a project's are shared by its lead and every thread. Agents save them with the memory skill.`;
+  const none = project && v && !projects.length ? `<p class="hint">No .agents/project.toml names this folder's project, so it has no memory of its own.</p>` : '';
+  const more = v?.more ? `<p class="hint">${v.more} more projects not shown.</p>` : '';
+  return `<h4>${project ? `${esc(project)} memory` : 'Memory'}</h4><p class="hint">${lede}</p>${error ? `<p class="hint warn">${esc(error)}</p>` : ''}${none}<div class="mlist">${scopes.map(scope).join('')}${more}</div>
+    <div class="foot"><button type="button" class="sbtn primary" data-act="close-sheet">Done</button></div>`;
+}
+function agoText(ms) {
+  const m = Math.max(0, Math.round(ms / 60000));
+  return m < 1 ? 'just now' : m < 60 ? `${m}m ago` : m < 1440 ? `${Math.round(m / 60)}h ago` : `${Math.round(m / 1440)}d ago`;
+}
+
 // ---------- the Start Home sheet ----------
 // Home's agent is made on the first message sent at Home: a model and an effort, as every agent
 // takes, and nothing else. It works in your home folder, in the home role, and the message goes to it
@@ -2422,11 +2481,12 @@ function closeSheet() {
   // A message that would have started Home goes back to the composer, unsent.
   if (sheetKind === 'home' && homeSheet.text && !S.selected && !$('input').value) { $('input').value = homeSheet.text; grow($('input')); }
   homeSheet.text = ''; homeSheet.open = false; S.ui.sheet = false; sheetFor = null; sheetKind = null; $('sheetwrap').classList.remove('on'); markSeen(); focusInput('main'); }
-$('sheet').addEventListener('change', (e) => { if (sheetKind === 'project') { projectChange(e.target); return; } if (sheetKind === 'home') { if (e.target.id === 'hm-model') followModel(e.target.value, 'hm-effort'); return; } if (e.target.dataset?.mix != null) mixChange(e.target); else if (e.target.id === 'sw-n' || e.target.id === 'sw-budget' || e.target.id === 'sw-org') { updateSwarmBudget(e.target.id); renderMix(); } });
+$('sheet').addEventListener('change', (e) => { if (sheetKind === 'memory') return; if (sheetKind === 'project') { projectChange(e.target); return; } if (sheetKind === 'home') { if (e.target.id === 'hm-model') followModel(e.target.value, 'hm-effort'); return; } if (e.target.dataset?.mix != null) mixChange(e.target); else if (e.target.id === 'sw-n' || e.target.id === 'sw-budget' || e.target.id === 'sw-org') { updateSwarmBudget(e.target.id); renderMix(); } });
 // A share typed updates the counts once it is a number, without redrawing the field being typed in.
-$('sheet').addEventListener('input', (e) => { if (sheetKind === 'project') { projectReady(); return; } if (sheetKind === 'home') return; if (e.target.id === 'sw-n' || e.target.id === 'sw-budget') { updateSwarmBudget(e.target.id); renderMix(); return; } if (e.target.dataset?.f !== 'share') return; mixChange(e.target); const n = agentCount(), problem = sheetProblem(n), counts = problem ? null : mixCounts(sheet.mix, mixRows(sheet.mix, n)); $('sw-mix').querySelectorAll('.count').forEach((c, i) => { c.textContent = counts ? `${counts[i]} agent${counts[i] === 1 ? '' : 's'}` : ''; c.classList.toggle('none', !!counts && !counts[i]); }); const w = $('sw-mix').querySelector('.mixfoot span'); if (w) { w.textContent = problem ?? (counts.some((c) => !c) ? `A row makes no agent at ${n} agents` : ''); w.className = w.textContent ? 'warn' : ''; } });
+$('sheet').addEventListener('input', (e) => { if (sheetKind === 'memory') return; if (sheetKind === 'project') { projectReady(); return; } if (sheetKind === 'home') return; if (e.target.id === 'sw-n' || e.target.id === 'sw-budget') { updateSwarmBudget(e.target.id); renderMix(); return; } if (e.target.dataset?.f !== 'share') return; mixChange(e.target); const n = agentCount(), problem = sheetProblem(n), counts = problem ? null : mixCounts(sheet.mix, mixRows(sheet.mix, n)); $('sw-mix').querySelectorAll('.count').forEach((c, i) => { c.textContent = counts ? `${counts[i]} agent${counts[i] === 1 ? '' : 's'}` : ''; c.classList.toggle('none', !!counts && !counts[i]); }); const w = $('sw-mix').querySelector('.mixfoot span'); if (w) { w.textContent = problem ?? (counts.some((c) => !c) ? `A row makes no agent at ${n} agents` : ''); w.className = w.textContent ? 'warn' : ''; } });
 $('sheet').addEventListener('submit', async (e) => {
   e.preventDefault();
+  if (sheetKind === 'memory') return;
   if (sheetKind === 'project') { await submitProject(); return; }
   if (sheetKind === 'home') { await submitHome(); return; }
   const project = sheetFor, start = $('sw-start'); if (!project || start.disabled) return;
@@ -2609,6 +2669,8 @@ function render() {
   $('form').hidden = pageOf(S.selected);
   // New project belongs to Home's list, which a file tab shows too.
   $('newproj').hidden = !!opened();
+  // Memory is a project's and yours: at Home and in a project, on this machine.
+  const memOf = opened(), mem = $('memory'); mem.hidden = !!S.config?.host || (!!memOf && !leadProject(memOf)); mem.dataset.who = memOf;
   if (S.ui.rail) renderRail();
   if (S.ui.file) renderFile();
   else if (side) { renderHead($('sidetitle'), side, 'side'); renderTranscript($('side'), side.name); }
@@ -3530,6 +3592,8 @@ async function act(el) {
     // The file beside becomes a tab, and the pane beside closes.
     case 'file-tab': { const f = S.ui.file; if (!f) return; dropFile(); await go(FILE + f.full, 'tab'); return; }
     case 'new-project': await openProjectSheet(); return;
+    case 'memory': await openMemorySheet(who || null); return;
+    case 'open-fact': closeSheet(); await go(FILE + v, 'tab'); return;
     case 'np-choose': await chooseProjectFolder(); return;
     case 'np-in': np.in = v; renderProjectSheet(); return;
     case 'new-swarm': await openSwarmSheet(leadProject(who)); return;
