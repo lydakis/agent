@@ -87,7 +87,7 @@ fn step(watched: &mut [Watched], sent: &mut Sent, event: &Value) -> Vec<Step> {
         "pruned" => {
             let before = event["before"].as_i64().unwrap_or(0);
             for (i, w) in watched.iter().enumerate() {
-                if !w.done && w.source() == bot && w.cursor.is_none_or(|c| c + 1 < before) {
+                if !w.done && w.source() == bot && w.cursor.is_none_or(|c| c < before) {
                     steps.push(Step::Gap(i, format!(
                         "events_pruned: turn ends of {bot} before event {before} were removed before they were read, and not counted"
                     )));
@@ -231,26 +231,47 @@ async fn follow(places: Places, socket: PathBuf, store: String, mut watched: Vec
             tokio::time::sleep(MAX_WAIT).await;
             continue;
         }
+        let mut handed = true;
         loop {
             tokio::select! {
                 event = events.recv() => {
                     let Some(event) = event else { break };
                     for step in step(&mut watched, &mut sent, &event) {
-                        act(&places, &mut watched, &mut fires, &exited, step);
+                        handed &= act(&places, &mut watched, &mut fires, &exited, step);
                     }
                 }
                 Some(name) = exits.recv() => {
                     for w in watched.iter_mut().filter(|w| !w.done && w.trigger.name == name) {
-                        let there = read_trigger(&places.plist(&name)).ok().map(|(t, _)| t);
-                        w.done = there.as_ref() != Some(&w.trigger);
+                        // A note it did not take before it exited starts the
+                        // next; with none, it may have ended its trigger.
+                        let next = if places.asked(&name).exists() {
+                            hand_off(&places, w, &mut fires, &exited, None)
+                        } else {
+                            let there = read_trigger(&places.plist(&name)).ok().map(|(t, _)| t);
+                            w.done = there.as_ref() != Some(&w.trigger);
+                            Ok(())
+                        };
+                        if let Err(error) = next {
+                            log(error);
+                        }
                     }
                 }
             }
-            if watched.iter().all(|w| w.done) {
+            if !handed || watched.iter().all(|w| w.done) {
                 break;
             }
         }
         client.close().await;
+        // A fire not handed over: its count and place go back to what is on
+        // disk, and following again from there reads that turn end again.
+        if !handed {
+            for w in watched.iter_mut().filter(|w| !w.done) {
+                if let Some((cursor, count)) = read_watched(&places, &w.trigger) {
+                    (w.cursor, w.count) = (Some(cursor), count);
+                }
+            }
+            tokio::time::sleep(wait).await;
+        }
     }
 }
 
@@ -300,14 +321,15 @@ async fn begin(places: &Places, client: &Client, watched: &mut [Watched]) -> Res
 /// The fire each trigger last started, until it exits.
 type Fires = HashMap<String, tokio::task::JoinHandle<()>>;
 
+/// Do one step; false when a fire could not be handed over, so the watcher
+/// reads that turn end again from where it last saved.
 fn act(
     places: &Places,
     watched: &mut [Watched],
     fires: &mut Fires,
     exited: &tokio::sync::mpsc::UnboundedSender<String>,
     step: Step,
-) {
-    let log = |error: String| eprintln!("{}", error_json(&error));
+) -> bool {
     match step {
         Step::Save(i) => save(places, &watched[i]),
         Step::Gone(i, detail) => {
@@ -334,46 +356,95 @@ fn act(
         }
         Step::Fire(i, why) => {
             let w = &mut watched[i];
-            let name = w.trigger.name.clone();
-            // Ended, by its runs or `rm`, or replaced: no longer this trigger.
-            let there = read_trigger(&places.plist(&name)).ok().map(|(t, _)| t);
-            if there.as_ref() != Some(&w.trigger) {
-                w.done = true;
-                return;
-            }
             // Where it is goes on disk only once the fire is handed over: a
             // watcher stopped before then reads this turn end again.
-            if let Err(error) = replace(&places.asked(&name), &format!("{}\n{why}", now())) {
-                return log(error);
-            }
-            // Its last fire still runs, as on a long `--reply-to` wait: it
-            // finds the note when it is done, or the fire waiting on it does.
-            if fires.get(&name).is_some_and(|fire| !fire.is_finished()) {
-                return save(places, w);
-            }
-            // Its own process group: restarting the watcher leaves it running.
-            let spawned = tokio::process::Command::new(&w.app)
-                .args(w.trigger.args())
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .process_group(0)
-                .spawn();
-            match spawned {
-                Ok(mut child) => {
-                    save(places, w);
-                    let exited = exited.clone();
-                    fires.insert(
-                        name.clone(),
-                        tokio::spawn(async move {
-                            let _ = child.wait().await;
-                            let _ = exited.send(name);
-                        }),
-                    );
+            match hand_off(places, w, fires, exited, Some(&why)) {
+                Ok(()) if !w.done => save(places, w),
+                Ok(()) => {}
+                Err(error) => {
+                    eprintln!("{}", error_json(&error));
+                    return false;
                 }
-                Err(error) => log(format!("{}: {error}", w.app.display())),
             }
         }
     }
+    true
+}
+
+/// A fire for the trigger, told why by its note: under the lock `rm` takes,
+/// so a trigger removed is not fired after, and only while its plist is
+/// still this trigger (ended by its runs or `rm`, or replaced, it is done).
+/// Its last fire still running, as on a long `--reply-to` wait, finds the
+/// note when it is done; else one starts as launchd would start it, with
+/// its plist's environment, in its own process group, which a restart of
+/// the watcher leaves running.
+fn hand_off(
+    places: &Places,
+    w: &mut Watched,
+    fires: &mut Fires,
+    exited: &tokio::sync::mpsc::UnboundedSender<String>,
+    why: Option<&str>,
+) -> Result<(), String> {
+    let name = w.trigger.name.clone();
+    let _lock = Lock::take(places)?;
+    let text = read_record(&places.plist(&name)).ok();
+    let Some(text) = text.filter(|t| read_plist(t).is_some_and(|(t, _)| t == w.trigger)) else {
+        w.done = true;
+        return Ok(());
+    };
+    if let Some(why) = why {
+        replace(&places.asked(&name), &format!("{}\n{why}", now()))?;
+    }
+    if fires.get(&name).is_some_and(|fire| !fire.is_finished()) {
+        return Ok(());
+    }
+    let mut child = tokio::process::Command::new(&w.app)
+        .args(w.trigger.args())
+        .envs(environment_of(&text))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .map_err(|error| format!("{}: {error}", w.app.display()))?;
+    let exited = exited.clone();
+    fires.insert(
+        name.clone(),
+        tokio::spawn(async move {
+            let _ = child.wait().await;
+            let _ = exited.send(name);
+        }),
+    );
+    Ok(())
+}
+
+/// A plist's `EnvironmentVariables`, as the app writes them.
+fn environment_of(text: &str) -> Vec<(String, String)> {
+    let Some(at) = text.find("<key>EnvironmentVariables</key>") else {
+        return Vec::new();
+    };
+    let rest = &text[at..];
+    let (Some(open), Some(close)) = (rest.find("<dict>"), rest.find("</dict>")) else {
+        return Vec::new();
+    };
+    let mut pairs = Vec::new();
+    let mut dict = &rest[open + "<dict>".len()..close];
+    while let Some(key) = dict.find("<key>") {
+        let body = &dict[key + "<key>".len()..];
+        let Some(key_end) = body.find("</key>") else {
+            break;
+        };
+        let after = &body[key_end + "</key>".len()..];
+        let (Some(value), Some(value_end)) = (after.find("<string>"), after.find("</string>"))
+        else {
+            break;
+        };
+        pairs.push((
+            unescape(&body[..key_end]),
+            unescape(&after[value + "<string>".len()..value_end]),
+        ));
+        dict = &after[value_end + "</string>".len()..];
+    }
+    pairs
 }
 
 fn save(places: &Places, w: &Watched) {
@@ -668,11 +739,39 @@ mod tests {
         let mut w = vec![
             watched("t", "p.task", None, 10),
             watched("u", "p.task", None, 40),
+            // `before` is the last event removed: one short of it missed it.
+            watched("v", "p.task", None, 29),
+            watched("x", "p.task", None, 30),
         ];
         let mut sent = Sent::new();
         let pruned = json!({"bot": "p.task", "event": "pruned", "before": 30, "durable": false});
         let steps = step(&mut w, &mut sent, &pruned);
-        assert!(matches!(&steps[..], [Step::Gap(0, why)] if why.starts_with("events_pruned:")));
+        assert!(
+            matches!(&steps[..], [Step::Gap(0, why), Step::Gap(2, _)] if why.starts_with("events_pruned:"))
+        );
+    }
+
+    #[test]
+    fn a_fire_gets_its_own_plists_environment() {
+        let when = every("30m", 0).unwrap();
+        let env = [
+            ("PATH", "/a/bin:/b".to_owned()),
+            ("SHELL", "/bin/<z>".to_owned()),
+        ];
+        let text = super::super::plist(
+            Path::new("/A/agent-app"),
+            &watched("t", "p.task", None, 0).trigger,
+            &when,
+            &env,
+        );
+        assert_eq!(
+            environment_of(&text),
+            [
+                ("PATH".to_owned(), "/a/bin:/b".to_owned()),
+                ("SHELL".to_owned(), "/bin/<z>".to_owned())
+            ]
+        );
+        assert!(environment_of("<plist/>").is_empty());
     }
 
     #[test]

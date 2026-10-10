@@ -1793,8 +1793,9 @@ fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
     }
     let mut counted = |flag: &str| {
         take(flag)
-            .map(|n| n.parse::<u64>().ok().filter(|n| *n > 0))
-            .map(|n| n.ok_or_else(|| bad(format!("{flag} takes a count of at least 1"))))
+            // As high as its plist reads back.
+            .map(|n| n.parse::<i64>().ok().filter(|n| *n > 0).map(|n| n as u64))
+            .map(|n| n.ok_or_else(|| bad(format!("{flag} takes a count from 1 to {}", i64::MAX))))
             .transpose()
     };
     let runs = counted("--runs")?;
