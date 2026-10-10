@@ -356,6 +356,20 @@ test('drawing messages past the byte bound folds the oldest instead of keeping t
   assert.match(el.innerHTML, /earlier history/);
 });
 
+test('an item added to a drawn pane hydrates only what was added', () => {
+  const p = page(), c = p.context, t = p.transcript('Bob'), el = c.document.getElementById('log'), R = c.Rich, seen = [];
+  c.Rich = { html: R.html, get version() { return R.version; }, get waited() { return R.waited; }, hydrate: (n) => { seen.push(n); } };
+  t.items = [{ kind: 'text', turn: 1, text: 'first' }];
+  const shown = { name: 'shown' };
+  const tail = Object.assign(c.document.createElement('div'), { classList: { contains: (c) => c === 'tail' }, previousElementSibling: shown,
+    insertAdjacentHTML(_, html) { const n = { name: 'added', html, nextElementSibling: tail }; shown.nextElementSibling = n; } });
+  el.lastElementChild = tail; p.renderTranscript(el, 'Bob');
+  seen.length = 0; el.lastElementChild = tail;
+  t.items.push({ kind: 'text', turn: 2, text: 'second' });
+  p.renderTranscript(el, 'Bob');
+  assert.deepEqual(seen.map((n) => n.name), ['added']);
+});
+
 test('a step links the whole path it named, not its shortened summary', async () => {
   const p = page(), long = `/w/${'d/'.repeat(200)}a.md`;
   await p.onEvent({ event: 'tool_started', bot: 'Bob', turn: 1, data: { call_id: 'c1', name: 'read', arguments: JSON.stringify({ path: long }) } });

@@ -1482,8 +1482,9 @@ function renderTranscript(el, name) {
     if (!atBottom) el.scrollTop += el.scrollHeight - before;
   } else if (added) {
     if (old) { const sep = old.previousElementSibling; if (sep?.dataset?.sep === String(from)) sep.remove(); old.remove(); }
-    tail.insertAdjacentHTML('beforebegin', added);
-    Rich.hydrate(el);
+    // Only what was just added is looked through for blocks to draw.
+    const prev = tail.previousElementSibling; tail.insertAdjacentHTML('beforebegin', added);
+    for (let n = prev ? prev.nextElementSibling : el.firstElementChild; n && n !== tail; n = n.nextElementSibling) Rich.hydrate(n);
   }
   el.dataset.len = String(t.items.length);
   refreshLive(el);
