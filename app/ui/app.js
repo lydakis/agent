@@ -709,7 +709,8 @@ async function onEvent(ev) {
       if (call) { call.done = true; if (call.started) call.took = Date.now() - call.started; call.started = 0; patchRun(name, call); }
       const shown = S.ui.file;
       // Read again as the agent left it; what it wrote is new, so a page, diagram or image in it waits for a click.
-      if (shown && call?.path && (call.name === 'write' || call.name === 'edit') && joinPath(bot(name)?.workspace ?? S.config?.workspace ?? '', call.path) === shown.full) openFile(shown.bot, shown.full, false);
+      // A write or edit that failed or was refused changed nothing, and what is shown keeps running.
+      if (shown && !data.failed && !data.denied && call?.path && (call.name === 'write' || call.name === 'edit') && joinPath(bot(name)?.workspace ?? S.config?.workspace ?? '', call.path) === shown.full) openFile(shown.bot, shown.full, false);
       if (typeof data.node === 'number') {
         pushNode(t, { kind: 'node', node: data.node, callId: data.call_id, turn });
         if (call && (call.background || call.name === 'wait') && await loadWaitOrProc(name, data.node, call)) {
@@ -2752,7 +2753,7 @@ document.addEventListener('click', async (e) => {
   else if (task) { await openBeside(task.dataset.task); return; }
   else if (row) await openOnly(row.dataset.bot);
   // Clicks return the keyboard to the pane's composer, unless they selected text to copy.
-  if (!e.target.closest('input, textarea, form') && window.getSelection?.()?.isCollapsed !== false) focusInput(e.target.closest('.pane.side') ? 'side' : 'main');
+  if (!e.target.closest('input, textarea, form') && window.getSelection?.()?.isCollapsed !== false) focusInput(e.target.closest('.pane.side') && !S.ui.file ? 'side' : 'main');
 });
 document.addEventListener('contextmenu', (e) => {
   const t = e.target.closest('[data-bot], [data-task]'); if (!t) return;

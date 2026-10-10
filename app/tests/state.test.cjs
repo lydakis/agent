@@ -157,7 +157,7 @@ test('fenced blocks become code, previews, diagrams and images by their language
   assert.match(Rich.html('```mermaid\ngraph TD\nA-->B\n```'), /data-kind="mermaid".*A--&gt;B/s);
   // A diagram in a message draws when asked; one in a file someone opened draws at once.
   assert.match(Rich.html('```mermaid\ngraph TD\n```'), /data-kind="mermaid" data-lazy data-id="#\d+" data-view="code"/);
-  assert.match(Rich.file('/w/flow.mmd', new TextEncoder().encode('graph TD')).html, /data-kind="mermaid" data-lazy data-run/);
+  assert.match(Rich.file('/w/flow.mmd', new TextEncoder().encode('graph TD')).html, /data-kind="mermaid" data-lazy data-page/);
   const svg = Rich.html('```svg\n<svg xmlns="http://www.w3.org/2000/svg"><circle r="4"/></svg>\n```');
   // An SVG draws as an image, and in a message only when asked: its filters and animations take CPU.
   assert.match(svg, /data-kind="svg" data-view="code"/);
@@ -373,6 +373,23 @@ test('a file an agent rewrote while open waits for a click to run', async () => 
   await p.onEvent({ event: 'tool_completed', bot: 'Bob', turn: 1, data: { call_id: 'w1' } });
   await settle();
   assert.deepEqual(opened, ['/w/p.html']); assert.equal(p.S.ui.file.asked, false);
+  // A write that failed or was refused changed nothing: what is shown stays as it is.
+  for (const [id, extra] of [['w2', { failed: true }], ['w3', { denied: true }]]) {
+    await p.onEvent({ event: 'tool_started', bot: 'Bob', turn: 1, data: { call_id: id, name: 'edit', arguments: JSON.stringify({ path: 'p.html' }) } });
+    await p.onEvent({ event: 'tool_completed', bot: 'Bob', turn: 1, data: { call_id: id, ...extra } });
+  }
+  await settle();
+  assert.deepEqual(opened, ['/w/p.html']);
+});
+
+test('an SVG file is drawn after a declaration, comments and a doctype', () => {
+  const p = page(), Rich = p.context.Rich, enc = (s) => new TextEncoder().encode(s);
+  const svg = '<?xml version="1.0"?>\n<!-- Generator: tool -->\n<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "x.dtd" [ <!ENTITY a "b"> ]>\n<svg xmlns="http://www.w3.org/2000/svg"/>';
+  assert.match(Rich.file('/w/a.svg', enc(svg)).html, /data-kind="svg"/);
+  assert.doesNotMatch(Rich.file('/w/b.svg', enc('<!-- open <svg/>')).html, /data-kind="svg"/);
+  assert.doesNotMatch(Rich.file('/w/c.svg', enc('<svgx/>')).html, /data-kind="svg"/);
+  // Many comments are read in one pass.
+  const t0 = Date.now(); Rich.file('/w/d.svg', enc('<!--a-->'.repeat(100000) + '<p/>')); assert.ok(Date.now() - t0 < 1000);
 });
 
 test('a name starting with a tilde is the folder\'s; only ~/ is home', () => {
@@ -396,7 +413,7 @@ test('charts, file links and opened files draw by kind', () => {
   const p = page(), Rich = p.context.Rich;
   // A chart in a message draws when asked; one in a file someone opened draws at once.
   assert.match(Rich.html('```vega-lite\n{"mark":"bar"}\n```'), /data-kind="chart" data-lang="vega-lite" data-lazy data-id="#\d+" data-view="code"/);
-  assert.match(Rich.file('/w/c.vl.json', new TextEncoder().encode('{}')).html, /data-kind="chart" data-lang="vega-lite" data-lazy data-run/);
+  assert.match(Rich.file('/w/c.vl.json', new TextEncoder().encode('{}')).html, /data-kind="chart" data-lang="vega-lite" data-lazy data-page/);
   assert.match(Rich.html('```vega\n{}\n```'), /data-lang="vega"/);
   const links = Rich.html('[plan](PLAN.md) [code](src/a.rs:12) [line](src/b.rs#L4-L9) [web](https://example.com) [here](#top)');
   assert.match(links, /<a class="file" href="#" data-file="PLAN.md">plan<\/a>/);
@@ -1591,6 +1608,17 @@ test('a task card leaves the keyboard beside; swapping a folded task in unfolds 
   p.S.ui.folded.add('app'); p.swap();
   assert.equal(p.S.selected, 'app.build'); assert.equal(p.S.ui.folded.has('app'), false);
   assert.ok(p.tree().some((n) => n.b?.name === 'app.build'), 'the selected task has a sidebar row');
+});
+
+test('a click in a file beside keeps the keyboard in the visible composer', async () => {
+  const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
+  p.upsert({ name: 'Bob', id: 1, provider: 'alpha', model: 'one' }); p.tree(); p.S.selected = 'Bob';
+  const doc = p.context.document, focused = [];
+  for (const id of ['input', 'sideinput']) doc.getElementById(id).focus = () => focused.push(id);
+  p.S.ui.file = { bot: 'Bob', full: '/w/a.md', gen: 0, state: 'loading' };
+  await doc.listeners.click({ target: { closest: (sel) => (sel === '.pane.side' ? {} : null) } });
+  await p.tick();
+  assert.equal(focused.at(-1), 'input');
 });
 
 test('a failed first message waits in the side chat\'s composer', async () => {

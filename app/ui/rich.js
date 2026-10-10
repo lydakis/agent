@@ -58,7 +58,23 @@ window.Rich = (() => {
   // is drawn once the reply is in and has the id it keeps.
   let scope = null, nth = 0, blockId = 0, draft = false;
   const digest = (s) => { let a = 0x811c9dc5, b = 5381; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); a = Math.imul(a ^ c, 0x01000193); b = (Math.imul(b, 33) + c) | 0; } return `${s.length}.${(a >>> 0).toString(36)}.${(b >>> 0).toString(36)}`; };
-  const lazy = (page, kind, text) => page ? ' data-run' : ` data-id="${esc(scope == null ? `#${++blockId}` : `${scope}|${nth++}|${kind}|${digest(text)}`)}"`;
+  const lazy = (page, kind, text) => page ? ' data-page' : ` data-id="${esc(scope == null ? `#${++blockId}` : `${scope}|${nth++}|${kind}|${digest(text)}`)}"`;
+  // Whether text is an SVG document: its root is `<svg>`, after an XML declaration, comments and a
+  // doctype if it has them. Read in one pass, as a generated file can open with many comments.
+  function isSVG(text) {
+    let i = 0;
+    const skip = () => { while (i < text.length && /\s/.test(text[i])) i++; };
+    skip();
+    if (text.startsWith('<?xml', i)) { const j = text.indexOf('?>', i); if (j < 0) return false; i = j + 2; }
+    for (;;) {
+      skip();
+      if (text.startsWith('<!--', i)) { const j = text.indexOf('-->', i + 4); if (j < 0) return false; i = j + 3; }
+      else if (text.slice(i, i + 9).toLowerCase() === '<!doctype') {
+        const b = text.indexOf('[', i), g = text.indexOf('>', i); if (g < 0) return false;
+        if (b >= 0 && b < g) { const e = text.indexOf(']', b); if (e < 0) return false; const k = text.indexOf('>', e); if (k < 0) return false; i = k + 1; } else i = g + 1;
+      } else return /^<svg[\s>/]/i.test(text.slice(i, i + 5));
+    }
+  }
   function block(text, info, page = false) {
     const lang = (info ?? '').trim().split(/\s+/)[0].toLowerCase();
     if (draft) return `<div class="rc" data-kind="code">${head(lang, '')}${pre(text, lang)}</div>`;
@@ -66,7 +82,7 @@ window.Rich = (() => {
     if (CHART.has(lang)) return `<div class="rc" data-kind="chart" data-lang="${lang === 'vega' ? 'vega' : 'vega-lite'}" data-lazy${lazy(page, lang, text)} data-view="code">${head(lang, toggle)}<div class="view"></div>${pre(text, 'json')}</div>`;
     if (lang === 'html' || lang === 'htm') return `<div class="rc" data-kind="html" data-view="${page ? 'view' : 'code'}">${head(lang, '<button type="button" data-rich="view"></button>')}<div class="view frame"></div>${pre(text, 'xml')}</div>`;
     // An SVG draws as an image, which runs no script and loads nothing.
-    if (lang === 'svg' && /^\s*(<\?xml[^>]*>\s*)?<svg\b/i.test(text)) return `<div class="rc" data-kind="svg" data-view="${page ? 'view' : 'code'}">${head(lang, '<button type="button" data-rich="view"></button>')}<div class="view"></div>${pre(text, 'xml')}</div>`;
+    if (lang === 'svg' && isSVG(text)) return `<div class="rc" data-kind="svg" data-view="${page ? 'view' : 'code'}">${head(lang, '<button type="button" data-rich="view"></button>')}<div class="view"></div>${pre(text, 'xml')}</div>`;
     return `<div class="rc" data-kind="code">${head(lang, '')}${pre(text, lang)}</div>`;
   }
   // A reference defined once can be used thousands of times, and each use copies its target into
@@ -312,7 +328,7 @@ window.Rich = (() => {
   function hydrate(root) {
     for (const box of [...(root.matches?.(HYDRATE) ? [root] : []), ...root.querySelectorAll(HYDRATE)]) {
       box.dataset.on = '';
-      if ('lazy' in box.dataset) draw(box, !('run' in box.dataset));
+      if ('lazy' in box.dataset) draw(box, !('page' in box.dataset));
       else if (box.dataset.view === 'view') mount(box);
     }
   }

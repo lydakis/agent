@@ -1271,14 +1271,17 @@ FIFO or device is refused, as reading one need not end, and a window on a
 host is refused by name, as its files are the host's). The file draws by its
 kind: Markdown, a diagram (`.mmd`, `.mermaid`) or a chart (`.vl.json`,
 `.vg.json`), drawn at once, a page (`.html`, opened as its preview), an SVG
-or image (opening the file is the asking), a CSV or TSV as a table of its
+(its root after any declaration, comments and doctype) or image (opening the
+file is the asking), a CSV or TSV as a table of its
 first 1,000 rows and 256 columns, ending with the row that reaches 10,000
 cells (quoted fields kept whole, and the view says when rows were left out),
 a binary file as its size, anything else as code highlighted by its
 extension. Esc or ✕ closes it and brings back the task that was beside, if
 any. A write or edit to the open file reads it again, and what the agent
 wrote is new: a page, diagram, chart or image in it waits for a click, as in
-a message. Deleting the agent it came from, or attaching to another store,
+a message. One that failed or was refused changed nothing, so the file stays
+as it is shown. A click in the file puts the keyboard in the chat's composer,
+as the pane beside has none while a file is open. Deleting the agent it came from, or attaching to another store,
 closes it. Searching a project's
 files (from ^k or elsewhere) is not built.
 
