@@ -424,7 +424,13 @@ class TriggerFireTests(ModelFixture):
         def watcher():
             process = subprocess.Popen([str(APP), '--trigger-watch'], env=env, stdout=subprocess.DEVNULL,
                                        stderr=subprocess.PIPE, text=True)
-            self.addCleanup(lambda: process.poll() is None and process.kill())
+
+            def end():
+                if process.poll() is None:
+                    process.kill()
+                process.wait()
+                process.stderr.close()
+            self.addCleanup(end)
             return process
 
         def until(check, seconds=30):

@@ -1136,10 +1136,10 @@ messages are retained. `fire NAME` asks for a fire and returns
 in the trigger's queue folder, `~/.agent/triggers/NAME.asks`, which its plist
 names as launchd's `QueueDirectories`: launchd runs the job while an ask is
 there, one run at a time, and runs it again when a run ends with one still
-there. A fire takes the asks it finds as it starts, so it sends whatever its
-time or watched path, and queues behind work rather than skipping it; one
-made while it runs is the next run's. Nothing else starts a fire: launchd
-is the only thing that runs one.
+there. Each ask is one fire: a fire takes the oldest, sends whatever its
+time or watched path, queues behind work rather than skipping it, and
+removes that ask when it is done, so launchd runs the job again for any
+left. Nothing else starts a fire: launchd is the only thing that runs one.
 
 Each is one LaunchAgent, `~/Library/LaunchAgents/me.lydakis.agent.trigger.NAME.plist`,
 and that file is its definition: its program arguments carry the agent and
@@ -1184,12 +1184,24 @@ its ask is on disk: a restart replays from there, so no turn end is missed.
 A turn end that counts is an ask in the trigger's queue saying why (`turn
 end of BOT: turn:BOT/N completed`), under the lock `rm` takes and only
 while the plist is still that trigger's; launchd runs the fire for it, as
-for `fire NAME`. The watcher runs nothing itself, so restarting it never
-ends a fire still waiting on `--reply-to`; a turn end during a long fire
-is sent after it, and several are sent once, with the newest why. A
-trigger that goes, by `rm` or its own end (its runs, its agent gone),
-restarts the watcher, which reads the ones left, or unloads it with the
-last. Events retention removed before the watcher read them are
+for `fire NAME`. The ask is named by the turn end's event cursor
+(`turn.CURSOR`), and the fire keeps that cursor with the message it begins:
+a watcher stopped after an ask and before it saved its place asks again,
+which is the same file, or one the fire already took and passes over, so
+no turn end is sent twice. A place it cannot save, or an ask it cannot
+make, sends it back to what is on disk to read those turn ends again. The
+watcher runs nothing itself, so restarting it never ends a fire still
+waiting on `--reply-to`; turn ends during a long fire are each sent after
+it, in order. The `request_id` of a turn is read from its `accepted` or
+`queued` event, since a queued turn can end without starting. On each
+connection the watcher looks each agent up once however many triggers
+follow it, and reads events while its follows go out, so a long replay
+never fills what the client holds unread. A trigger that goes, by `rm` or
+its own end (its runs, its agent gone), unloads its own job first and
+then restarts the watcher, which reads the ones left, or unloads it with
+the last; one whose plist cannot be read but whose place is kept does the
+same. A new watcher plist (the app moved) that will not load gives way to
+the old one, loaded again. Events retention removed before the watcher read them are
 turn ends not counted; the trigger's last result says so
 (`events_pruned`). A turn a trigger sent says so in its `request_id`
 (`trigger_GENERATION_...`, a name's characters, so the generation and not

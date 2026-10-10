@@ -5,8 +5,10 @@
 //! that counts is an ask in the trigger's queue, saying why, for which
 //! launchd runs its fire, as for `fire NAME`; the watcher runs nothing
 //! itself. Where it is in each agent's events is kept per trigger
-//! (`NAME.watch`), once the ask is on disk, so a restart neither misses one
-//! nor asks twice but for one ask made just before it.
+//! (`NAME.watch`), once the ask is on disk, so a restart misses no turn end.
+//! An ask is named by its turn end's place in those events, so one asked
+//! again by a watcher stopped before it saved is the same ask, or one its
+//! fire already took (`take_ask`): none is sent twice.
 use super::*;
 use std::collections::HashMap;
 
@@ -48,7 +50,7 @@ enum Step {
 }
 
 /// The `request_id`s of turns triggers sent, by agent and turn, from their
-/// `accepted` events, until those turns end.
+/// `accepted` or `queued` events, until those turns end.
 type Sent = HashMap<(String, i64), String>;
 
 /// What one event means for the triggers following its agent. Only a turn
@@ -59,7 +61,9 @@ fn step(watched: &mut [Watched], sent: &mut Sent, event: &Value) -> Vec<Step> {
     };
     let mut steps = Vec::new();
     match kind {
-        "accepted" => {
+        // A queued turn can end without starting (stopped, or taken in as
+        // a steer), so it is known from either.
+        "accepted" | "queued" => {
             if let (Some(turn), Some(id)) =
                 (event["turn"].as_i64(), event["data"]["request_id"].as_str())
                 && id.starts_with("trigger_")
@@ -221,25 +225,57 @@ async fn follow(places: Places, socket: PathBuf, store: String, mut watched: Vec
             continue;
         };
         wait = Duration::from_secs(1);
-        if let Err(error) = begin(&places, &client, &mut watched).await {
-            log(error);
-            client.close().await;
-            tokio::time::sleep(MAX_WAIT).await;
-            continue;
-        }
-        let mut asked = true;
-        while let Some(event) = events.recv().await {
-            for step in step(&mut watched, &mut sent, &event) {
-                asked &= act(&places, &mut watched, step);
+        let from = match begin(&places, &client, &mut watched).await {
+            Ok(from) => from,
+            Err(error) => {
+                log(error);
+                client.close().await;
+                tokio::time::sleep(MAX_WAIT).await;
+                continue;
             }
-            if !asked || watched.iter().all(|w| w.done) {
-                break;
+        };
+        // Its events are read while the follows go out: what they replay
+        // can be more than the client holds unread.
+        let mut following = tokio::spawn({
+            let client = client.clone();
+            async move {
+                for (bot, after) in from {
+                    client
+                        .request("follow", json!({"bot": bot, "after": after}))
+                        .await
+                        .map_err(super::coded)?;
+                }
+                Ok::<(), String>(())
+            }
+        });
+        let (mut kept, mut followed) = (true, false);
+        loop {
+            tokio::select! {
+                done = &mut following, if !followed => {
+                    followed = true;
+                    if let Err(error) = done.map_err(|e| e.to_string()).and_then(|r| r) {
+                        log(error);
+                        kept = false;
+                        break;
+                    }
+                }
+                event = events.recv() => {
+                    let Some(event) = event else { break };
+                    for step in step(&mut watched, &mut sent, &event) {
+                        kept &= act(&places, &mut watched, step);
+                    }
+                    if !kept || watched.iter().all(|w| w.done) {
+                        break;
+                    }
+                }
             }
         }
+        following.abort();
         client.close().await;
-        // An ask not made: its count and place go back to what is on disk,
-        // and following again from there reads that turn end again.
-        if !asked {
+        // An ask not made, or a place not saved: counts and places go back
+        // to what is on disk, and following again from there reads those
+        // turn ends again.
+        if !kept {
             for w in watched.iter_mut().filter(|w| !w.done) {
                 if let Some((cursor, count)) = read_watched(&places, &w.trigger) {
                     (w.cursor, w.count) = (Some(cursor), count);
@@ -251,14 +287,28 @@ async fn follow(places: Places, socket: PathBuf, store: String, mut watched: Vec
 }
 
 /// On each connection: end the triggers whose agent is gone, find where
-/// a new one starts, and follow each agent from the earliest place any of
-/// its triggers is at.
-async fn begin(places: &Places, client: &Client, watched: &mut [Watched]) -> Result<(), String> {
+/// a new one starts, and say where to follow each agent from: the earliest
+/// place any of its triggers is at. Each agent is looked up once, however
+/// many triggers follow it.
+async fn begin(
+    places: &Places,
+    client: &Client,
+    watched: &mut [Watched],
+) -> Result<Vec<(String, i64)>, String> {
+    let mut ids = HashMap::<String, Option<i64>>::new();
+    let mut newest = HashMap::<String, i64>::new();
     for w in watched.iter_mut().filter(|w| !w.done) {
-        let now = match bot_id(client, w.source()).await {
-            Ok(id) => Some(id),
-            Err(error) if error.starts_with("bot_not_found") => None,
-            Err(error) => return Err(error),
+        let source = w.source().to_owned();
+        let now = match ids.get(&source) {
+            Some(id) => *id,
+            None => {
+                let id = match bot_id(client, &source).await {
+                    Ok(id) => Some(id),
+                    Err(error) if error.starts_with("bot_not_found") => None,
+                    Err(error) => return Err(error),
+                };
+                *ids.entry(source.clone()).or_insert(id)
+            }
         };
         if now != w.source_id() {
             w.done = true;
@@ -273,31 +323,35 @@ async fn begin(places: &Places, client: &Client, watched: &mut [Watched]) -> Res
             continue;
         }
         if w.cursor.is_none() {
-            w.cursor = Some(newest_cursor(client, w.source()).await?);
-            save(places, w);
+            let at = match newest.get(&source) {
+                Some(at) => *at,
+                None => *newest
+                    .entry(source.clone())
+                    .or_insert(newest_cursor(client, &source).await?),
+            };
+            w.cursor = Some(at);
+            save(places, w)?;
         }
     }
-    let mut from = HashMap::<&str, i64>::new();
+    let mut from = HashMap::<String, i64>::new();
     for w in watched.iter().filter(|w| !w.done) {
         let at = w.cursor.unwrap_or(0);
-        from.entry(w.source())
+        from.entry(w.source().to_owned())
             .and_modify(|c| *c = (*c).min(at))
             .or_insert(at);
     }
-    for (bot, after) in from {
-        client
-            .request("follow", json!({"bot": bot, "after": after}))
-            .await
-            .map_err(super::coded)?;
-    }
-    Ok(())
+    Ok(from.into_iter().collect())
 }
 
-/// Do one step; false when an ask could not be made, so the watcher reads
-/// that turn end again from where it last saved.
+/// Do one step; false when an ask could not be made or a place saved, so
+/// the watcher reads those turn ends again from where it last saved.
 fn act(places: &Places, watched: &mut [Watched], step: Step) -> bool {
+    let log = |error: String| {
+        eprintln!("{}", error_json(&error));
+        false
+    };
     match step {
-        Step::Save(i) => save(places, &watched[i]),
+        Step::Save(i) => return save(places, &watched[i]).map_or_else(log, |()| true),
         Step::Gone(i, detail) => {
             let trigger = &watched[i].trigger;
             let gone = json!({"outcome": "gone", "detail": detail});
@@ -323,15 +377,12 @@ fn act(places: &Places, watched: &mut [Watched], step: Step) -> bool {
         Step::Fire(i, why) => {
             let w = &mut watched[i];
             // Where it is goes on disk only once the ask is: a watcher
-            // stopped before then reads this turn end again.
-            match ask_fire(places, w, &why) {
-                Ok(()) if !w.done => save(places, w),
-                Ok(()) => {}
-                Err(error) => {
-                    eprintln!("{}", error_json(&error));
-                    return false;
-                }
-            }
+            // stopped before then asks again, which is the same ask.
+            let asked = ask_fire(places, w, &why).and_then(|()| match w.done {
+                false => save(places, w),
+                true => Ok(()),
+            });
+            return asked.map_or_else(log, |()| true);
         }
     }
     true
@@ -347,13 +398,11 @@ fn ask_fire(places: &Places, w: &mut Watched, why: &str) -> Result<(), String> {
         w.done = true;
         return Ok(());
     }
-    ask(places, &w.trigger.name, Some(why))
+    ask_turn(places, &w.trigger.name, w.cursor.unwrap_or(0), why)
 }
 
-fn save(places: &Places, w: &Watched) {
-    if let Err(error) = save_watched(places, &w.trigger, w.cursor.unwrap_or(0), w.count) {
-        eprintln!("{}", error_json(&error));
-    }
+fn save(places: &Places, w: &Watched) -> Result<(), String> {
+    save_watched(places, &w.trigger, w.cursor.unwrap_or(0), w.count)
 }
 
 pub(super) fn save_watched(
@@ -447,10 +496,10 @@ pub(super) fn rewatch(
 ) -> Result<(), String> {
     let path = places.watcher();
     let text = plist(app, environment);
-    if any_watched(places) && std::fs::read_to_string(&path).ok().as_deref() != Some(&text) {
-        unload(WATCH_LABEL, launchd)?;
-        replace(&path, &text)?;
-        return launchd(Launchd::Load(&path));
+    let old = std::fs::read_to_string(&path).ok();
+    if any_watched(places) && old.as_deref() != Some(&text) {
+        // One that will not load gives way to the one that ran.
+        return swap(&path, WATCH_LABEL, old.as_deref(), &text, launchd);
     }
     match restart || !any_watched(places) {
         true => unwatch(places, launchd),
@@ -685,7 +734,12 @@ mod tests {
         let why = "turn end of p.task: turn:p.task/3 completed";
         assert!(act(&places, &mut w, Step::Fire(0, why.into())));
         assert_eq!(read_watched(&places, &w[0].trigger), Some((7, 0)));
-        assert_eq!(take_asks(&places, "t").as_deref(), Some(why));
+        let asked = take_ask(&places, &w[0].trigger).unwrap();
+        assert_eq!((asked.why.as_str(), asked.turn), (why, Some(7)));
+        // A watcher stopped before it saved asks again: the same ask.
+        assert!(act(&places, &mut w, Step::Fire(0, why.into())));
+        assert_eq!(std::fs::read_dir(places.asks("t")).unwrap().count(), 1);
+        std::fs::remove_file(&asked.path).unwrap();
         // An ask it cannot make leaves its place unsaved, to read that turn
         // end again.
         std::fs::remove_file(places.watched("t")).unwrap();
@@ -698,7 +752,7 @@ mod tests {
         std::fs::remove_file(places.plist("t")).unwrap();
         assert!(act(&places, &mut w, Step::Fire(0, why.into())));
         assert!(w[0].done);
-        assert_eq!(take_asks(&places, "t"), None);
+        assert!(take_ask(&places, &w[0].trigger).is_none());
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -728,6 +782,14 @@ mod tests {
         );
         assert_eq!(
             step(&mut w, &mut sent, &ended("p.task", 5000, 5001)),
+            vec![Step::Save(0)]
+        );
+        // One that only queued, then ended without starting, is its own too.
+        let mut queued = accepted("p.task", 6000, 6000, &format!("{own}z"));
+        queued["event"] = json!("queued");
+        step(&mut w, &mut sent, &queued);
+        assert_eq!(
+            step(&mut w, &mut sent, &ended("p.task", 6000, 6001)),
             vec![Step::Save(0)]
         );
     }
@@ -802,11 +864,36 @@ mod tests {
                 .contains("/B/app")
         );
         calls.take();
-        // The last gone: so is the watcher.
-        std::fs::remove_file(places.plist("t")).unwrap();
-        rewatch(&places, app, &env, true, &launchd).unwrap();
-        assert_eq!(calls.take(), vec![format!("unload {WATCH_LABEL}")]);
-        assert!(!places.watcher().exists());
+        // A replacement that will not load gives way to the one that ran.
+        let refusing = |what: Launchd| match what {
+            Launchd::Load(path) if std::fs::read_to_string(path).unwrap().contains("/C/app") => {
+                Err("launchctl bootstrap: refused".to_owned())
+            }
+            other => launchd(other),
+        };
+        assert!(rewatch(&places, Path::new("/C/app"), &env, false, &refusing).is_err());
+        assert!(
+            std::fs::read_to_string(places.watcher())
+                .unwrap()
+                .contains("/B/app")
+        );
+        assert_eq!(
+            calls.take(),
+            vec![
+                format!("unload {WATCH_LABEL}"),
+                format!("load {WATCH_LABEL}.plist")
+            ]
+        );
+        // The last going, its plist unreadable but its place kept: its own
+        // job goes first, then the watcher, which may be what retires it.
+        save_watched(&places, &w.trigger, 3, 0).unwrap();
+        std::fs::write(places.plist("t"), "not a plist").unwrap();
+        retire(&places, "t", false, &launchd).unwrap();
+        assert_eq!(
+            calls.take(),
+            vec![format!("unload {LABEL}t"), format!("unload {WATCH_LABEL}")]
+        );
+        assert!(!places.watcher().exists() && !places.watched("t").exists());
         // A kept place is this generation's only.
         save_watched(&places, &w.trigger, 41, 2).unwrap();
         assert_eq!(read_watched(&places, &w.trigger), Some((41, 2)));

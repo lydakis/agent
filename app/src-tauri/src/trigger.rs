@@ -1277,7 +1277,13 @@ pub fn install(
                     if watched(&text) != when.watch {
                         let asks = places.asks(&there.name);
                         let want = plist(&there_app, &there, when, &asks, environment);
-                        swap(&path, &there.name, Some(&text), &want, launchd)?;
+                        swap(
+                            &path,
+                            &format!("{LABEL}{}", there.name),
+                            Some(&text),
+                            &want,
+                            launchd,
+                        )?;
                     }
                     Ok(Some(there))
                 }
@@ -1294,7 +1300,7 @@ pub fn install(
     std::fs::create_dir_all(&asks).map_err(|e| format!("{}: {e}", asks.display()))?;
     swap(
         &path,
-        &trigger.name,
+        &format!("{LABEL}{}", trigger.name),
         None,
         &plist(app, trigger, when, &asks, environment),
         launchd,
@@ -1307,7 +1313,7 @@ pub fn install(
 /// one cannot be written or loaded the old one is written back and loaded.
 fn swap(
     path: &Path,
-    name: &str,
+    label: &str,
     old: Option<&str>,
     text: &str,
     launchd: Loader,
@@ -1318,7 +1324,7 @@ fn swap(
             "invalid_trigger: serialized plist exceeds {MAX_RECORD} bytes; narrow --cron or shorten the message"
         ));
     }
-    unload(&format!("{LABEL}{name}"), launchd)?;
+    unload(label, launchd)?;
     let loaded = replace(path, text).and_then(|()| launchd(Launchd::Load(path)));
     if let Err(error) = loaded {
         match old {
@@ -1411,8 +1417,6 @@ pub fn fire_now(places: &Places, name: &str) -> Result<Value, String> {
 /// watcher which turn ended); `None` is a `finish` ask, which only has a
 /// fire finish what a cut-short one began (`resume`), sending nothing new.
 fn ask(places: &Places, name: &str, why: Option<&str>) -> Result<(), String> {
-    let asks = places.asks(name);
-    std::fs::create_dir_all(&asks).map_err(|e| format!("{}: {e}", asks.display()))?;
     static ASKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let file = format!(
         "{}{}.{}.{}",
@@ -1421,9 +1425,22 @@ fn ask(places: &Places, name: &str, why: Option<&str>) -> Result<(), String> {
         std::process::id(),
         ASKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
+    ask_as(places, name, &file, why)
+}
+
+/// The watcher's ask for a turn end, named by where the turn end is in its
+/// agent's events: made again, it is the same ask, and one a fire already
+/// took for its message is passed over (`take_ask`).
+fn ask_turn(places: &Places, name: &str, cursor: i64, why: &str) -> Result<(), String> {
+    ask_as(places, name, &format!("{TURN}{cursor:020}"), Some(why))
+}
+
+fn ask_as(places: &Places, name: &str, file: &str, why: Option<&str>) -> Result<(), String> {
+    let asks = places.asks(name);
+    std::fs::create_dir_all(&asks).map_err(|e| format!("{}: {e}", asks.display()))?;
     let beside = places.state.join(format!(".ask.{name}.{file}"));
     replace(&beside, why.unwrap_or_default())?;
-    std::fs::rename(&beside, asks.join(&file))
+    std::fs::rename(&beside, asks.join(file))
         .and_then(|()| std::fs::File::open(&asks)?.sync_all())
         .map_err(|e| {
             let _ = std::fs::remove_file(&beside);
@@ -1433,31 +1450,46 @@ fn ask(places: &Places, name: &str, why: Option<&str>) -> Result<(), String> {
 
 /// How a `finish` ask's file starts.
 const FINISH: &str = "finish.";
+/// How a turn end's ask starts, before its place in the agent's events.
+const TURN: &str = "turn.";
 
-/// Whether this fire was asked for, and why, the newest ask's that says
-/// (empty when none does); a `finish` ask is not asking. The asks it read
-/// go, so launchd does not run it again for them; one made while it runs is
-/// the next fire's.
-fn take_asks(places: &Places, name: &str) -> Option<String> {
-    let mut asks: Vec<_> = std::fs::read_dir(places.asks(name))
+/// The ask a fire is for: why, and for a turn end where it is in its
+/// agent's events.
+struct Asked {
+    why: String,
+    turn: Option<i64>,
+    path: PathBuf,
+}
+
+/// The oldest ask, which this fire is for: each is one fire, and launchd
+/// runs the job again while any is left. A `finish` ask asks for nothing
+/// new, and a turn end whose message a fire already began was asked again
+/// by a watcher that stopped before it saved its place: both go here. The
+/// fire takes the one it is for away once it is done (`fire_cli`).
+fn take_ask(places: &Places, trigger: &Trigger) -> Option<Asked> {
+    let fired = Kept::of(&state(places, trigger)).turn;
+    let mut asks: Vec<_> = std::fs::read_dir(places.asks(&trigger.name))
         .into_iter()
         .flatten()
         .flatten()
         .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
         .collect();
-    // By when each was made: its name starts with the time.
+    // By when each was made, or where its turn end is.
     asks.sort();
-    let mut asked: Option<String> = None;
     for (file, path) in asks {
-        let why = std::fs::read_to_string(&path).unwrap_or_default();
-        if forget(&path).is_ok() && !file.starts_with(FINISH) {
-            let why = why.trim();
-            if asked.is_none() || !why.is_empty() {
-                asked = Some(why.to_owned());
-            }
+        let turn = file.strip_prefix(TURN).and_then(|n| n.parse::<i64>().ok());
+        if file.starts_with(FINISH) || turn.is_some_and(|t| fired.is_some_and(|f| t <= f)) {
+            let _ = forget(&path);
+            continue;
         }
+        let why = std::fs::read_to_string(&path).unwrap_or_default();
+        return Some(Asked {
+            why: why.trim().to_owned(),
+            turn,
+            path,
+        });
     }
-    asked
+    None
 }
 
 /// What a fire leaves for the next, all in one record, each part on disk
@@ -1474,6 +1506,9 @@ struct Kept {
     /// `{bot, bot_id, request_id, prompt, delivery, started}`: the submit,
     /// whole, so sending it again is the same request.
     sending: Value,
+    /// The newest turn end a message was begun for, by its place in its
+    /// agent's events.
+    turn: Option<i64>,
 }
 
 impl Kept {
@@ -1487,6 +1522,7 @@ impl Kept {
                 log: state["log"].as_u64(),
             },
             sending: state["sending"].clone(),
+            turn: state["turn"].as_i64(),
         }
     }
 }
@@ -1562,14 +1598,17 @@ fn retire(places: &Places, name: &str, keep: bool, launchd: Loader) -> Result<bo
     };
     let plist = places.plist(name);
     let last = places.last(name);
-    let watched = read_trigger(&plist).is_ok_and(|(t, _)| t.turn_end.is_some());
+    // Where the watcher was in its agent's events: a turn-end trigger's,
+    // also when its plist cannot be read.
+    let cursor = places.watched(name);
+    let followed = stored(&places.state, &cursor);
+    let watched =
+        followed.is_some() || read_trigger(&plist).is_ok_and(|(t, _)| t.turn_end.is_some());
     let mut gone = vec![(plist.clone(), stored(&places.agents, &plist))];
     if !keep {
         gone.push((last.clone(), stored(&places.state, &last)));
     }
-    // Where the watcher was in its agent's events.
-    let cursor = places.watched(name);
-    gone.push((cursor.clone(), stored(&places.state, &cursor)));
+    gone.push((cursor.clone(), followed));
     let restore = |gone: &[(PathBuf, Option<Option<String>>)]| {
         for (path, text) in gone {
             if let Some(Some(text)) = text
@@ -1588,24 +1627,23 @@ fn retire(places: &Places, name: &str, keep: bool, launchd: Loader) -> Result<bo
         }
     }
     let here = gone.iter().any(|(_, text)| text.is_some());
-    // Asks for a trigger that goes are for nothing. The watcher reads the
-    // turn-end triggers left, or goes with the last.
+    // Asks for a trigger that goes are for nothing.
     let _ = std::fs::remove_dir_all(places.asks(name));
-    let unwatch = || {
-        if watched && let Err(error) = unwatch(places, launchd) {
-            eprintln!("{}", error_json(&error));
-        }
-    };
-    unwatch();
-    match launchd(Launchd::Unload(&format!("{LABEL}{name}"))) {
+    let unloaded = match launchd(Launchd::Unload(&format!("{LABEL}{name}"))) {
         Ok(()) => Ok(true),
         Err(error) if error.starts_with(NOT_LOADED) => Ok(here),
         Err(error) => {
             restore(&gone);
-            unwatch();
             Err(error)
         }
+    };
+    // Then the watcher reads the turn-end triggers left, or goes with the
+    // last: last, since the watcher may be what is retiring this one, and
+    // its restart ends it.
+    if watched && let Err(error) = unwatch(places, launchd) {
+        eprintln!("{}", error_json(&error));
     }
+    unloaded
 }
 
 /// The app moves when it is updated, so it writes its path into every
@@ -1633,7 +1671,13 @@ pub fn refresh(places: &Places, app: &Path, launchd: Loader) {
             &format!("<string>{}</string>", escape(&app.to_string_lossy())),
             1,
         );
-        let _ = swap(&path, &trigger.name, Some(&text), &moved, launchd);
+        let _ = swap(
+            &path,
+            &format!("{LABEL}{}", trigger.name),
+            Some(&text),
+            &moved,
+            launchd,
+        );
     }
     // The watcher's job runs the app too.
     if let Err(error) = rewatch(places, app, &environment(), false, launchd) {
@@ -1725,9 +1769,15 @@ pub fn migrate(places: &Places, running: Option<&str>, launchd: Loader) -> bool 
             continue;
         }
         let made = std::fs::create_dir_all(&asks).map_err(|e| format!("{}: {e}", asks.display()));
-        if let Err(error) =
-            made.and_then(|()| swap(&path, &name, there.as_deref(), &converted, launchd))
-        {
+        if let Err(error) = made.and_then(|()| {
+            swap(
+                &path,
+                &format!("{LABEL}{name}"),
+                there.as_deref(),
+                &converted,
+                launchd,
+            )
+        }) {
             log(error);
             continue;
         }
@@ -2250,9 +2300,7 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
             // An add that failed after its plist went in left the watcher
             // without it: the same add again makes it whole.
             if let (Some(_), Some((_, _, cursor))) = (&there.turn_end, turn_end) {
-                if read_watched(places, &there).is_none() {
-                    save_watched(places, &there, cursor, 0)?;
-                }
+                start_watch(places, &there, cursor)?;
                 rewatch(places, &app, &environment, true, &launchctl)?;
             }
             let mut row = there.json(&state(places, &there));
@@ -2286,11 +2334,29 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
                 }
             }
             if let Some((_, _, cursor)) = turn_end {
-                save_watched(places, &trigger, cursor, 0)?;
+                start_watch(places, &trigger, cursor)?;
                 rewatch(places, &app, &environment, true, &launchctl)?;
             }
             Ok(trigger.json(&state(places, &trigger)))
         }
+    }
+}
+
+/// Where the watcher starts on a turn-end trigger `add` installed, under
+/// the lock `rm` takes, and only while it is still that trigger: an `rm`
+/// that came between leaves nothing to watch, and the add says so. One it
+/// has a place for keeps it.
+fn start_watch(places: &Places, trigger: &Trigger, cursor: i64) -> Result<(), String> {
+    let _lock = Lock::take(places)?;
+    if !ours(places, trigger) {
+        return Err(format!(
+            "trigger_not_found: {} was removed while it was added",
+            trigger.name
+        ));
+    }
+    match read_watched(places, trigger) {
+        Some(_) => Ok(()),
+        None => save_watched(places, trigger, cursor, 0),
     }
 }
 
@@ -2322,6 +2388,9 @@ fn write_row(places: &Places, trigger: &Trigger, last: &Value, kept: &Kept) -> R
     }
     if !kept.sending.is_null() {
         row["sending"] = kept.sending.clone();
+    }
+    if let Some(turn) = kept.turn {
+        row["turn"] = json!(turn);
     }
     replace(&places.last(&trigger.name), &row.to_string())
 }
@@ -2519,10 +2588,11 @@ async fn deliver(
     };
     let sending = json!({"bot": bot, "bot_id": id, "request_id": request_id(trigger, id),
         "prompt": prompt, "delivery": delivery, "started": started});
-    let seen = kept.seen.clone();
+    let (seen, turn) = (kept.seen.clone(), kept.turn);
     if let Err(error) = keep(places, trigger, |k| {
         k.sending = sending.clone();
         k.seen = seen;
+        k.turn = turn;
     }) {
         return json!({"outcome": "failed", "detail": error});
     }
@@ -2646,8 +2716,19 @@ pub fn fire_cli(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let asked = take_asks(&places, &trigger.name);
-    fire(&places, &trigger, asked);
+    let asked = take_ask(&places, &trigger);
+    fire(
+        &places,
+        &trigger,
+        asked.as_ref().map(|a| a.why.clone()),
+        asked.as_ref().and_then(|a| a.turn),
+    );
+    // Done with: launchd runs the job again for any ask left.
+    if let Some(asked) = asked
+        && let Err(error) = forget(&asked.path)
+    {
+        eprintln!("{}", error_json(&error));
+    }
     0
 }
 
@@ -2659,7 +2740,7 @@ fn sends() -> u64 {
 
 /// One fire: send the message when it is time, or when it was asked for,
 /// saying why when the note does.
-fn fire(places: &Places, trigger: &Trigger, asked_why: Option<String>) {
+fn fire(places: &Places, trigger: &Trigger, asked_why: Option<String>, turn: Option<i64>) {
     // A link moved since `add` can make its path one every fire writes: it
     // would fire itself for ever. It ends, writing nothing more there.
     if let Some(file) = &trigger.file
@@ -2689,6 +2770,11 @@ fn fire(places: &Places, trigger: &Trigger, asked_why: Option<String>) {
         }
         durable = state(places, trigger);
         kept = Kept::of(&durable);
+    }
+    // The turn end this fire is for goes on disk with its message, so the
+    // same ask made again is passed over.
+    if turn.is_some() {
+        kept.turn = turn;
     }
     // Only the watcher, or `fire`, has news of a turn end.
     if trigger.turn_end.is_some() && !asked {
@@ -3666,31 +3752,36 @@ mod tests {
             "<key>QueueDirectories</key>\n  <array>\n    <string>{}</string>",
             asks.display()
         )));
-        assert_eq!(take_asks(&w.places, &s.name), None, "launchd's own fire");
-        // Asks made before a fire starts are all that fire's, and go with it:
-        // launchd has nothing to run it again for.
+        let taken = |places: &Places| {
+            let asked = take_ask(places, &s)?;
+            forget(&asked.path).unwrap();
+            Some((asked.why, asked.turn))
+        };
+        assert_eq!(taken(&w.places), None, "launchd's own fire");
+        // Each ask is one fire, oldest first; launchd runs the job again for
+        // the rest.
         for _ in 0..2 {
             assert_eq!(
                 fire_now(&w.places, &s.name).unwrap(),
                 json!({"name": s.name, "fired": true})
             );
         }
-        assert_eq!(std::fs::read_dir(&asks).unwrap().count(), 2);
-        assert_eq!(take_asks(&w.places, &s.name).as_deref(), Some(""));
-        assert_eq!(std::fs::read_dir(&asks).unwrap().count(), 0);
-        assert_eq!(take_asks(&w.places, &s.name), None);
-        // The newest that says why is why: the watcher's, which names the turn.
-        ask(
-            &w.places,
-            &s.name,
-            Some("turn end of p: turn:p/3 completed"),
-        )
-        .unwrap();
-        ask(&w.places, &s.name, Some("")).unwrap();
+        ask_turn(&w.places, &s.name, 7, "turn end of p: turn:p/3 completed").unwrap();
+        ask_turn(&w.places, &s.name, 9, "turn end of p: turn:p/4 completed").unwrap();
+        // The same turn end asked again is the same ask.
+        ask_turn(&w.places, &s.name, 9, "turn end of p: turn:p/4 completed").unwrap();
+        assert_eq!(std::fs::read_dir(&asks).unwrap().count(), 4);
+        assert_eq!(taken(&w.places), Some((String::new(), None)));
+        assert_eq!(taken(&w.places), Some((String::new(), None)));
         assert_eq!(
-            take_asks(&w.places, &s.name).as_deref(),
-            Some("turn end of p: turn:p/3 completed")
+            taken(&w.places),
+            Some(("turn end of p: turn:p/3 completed".into(), Some(7)))
         );
+        // One a fire already began a message for is passed over.
+        keep(&w.places, &s, |k| k.turn = Some(9)).unwrap();
+        ask_turn(&w.places, &s.name, 8, "late").unwrap();
+        assert_eq!(taken(&w.places), None);
+        assert_eq!(std::fs::read_dir(&asks).unwrap().count(), 0);
         // Nothing half written is ever in the queue.
         let beside = std::fs::read_dir(&w.places.state)
             .unwrap()
@@ -3706,9 +3797,8 @@ mod tests {
         resume(&w.places);
         let finish: Vec<_> = std::fs::read_dir(&asks).unwrap().flatten().collect();
         assert!(finish[0].file_name().to_string_lossy().starts_with(FINISH));
-        assert_eq!(
-            take_asks(&w.places, &s.name),
-            None,
+        assert!(
+            take_ask(&w.places, &s).is_none(),
             "a finish ask asks for nothing new"
         );
         assert_eq!(std::fs::read_dir(&asks).unwrap().count(), 0);
@@ -3736,6 +3826,25 @@ mod tests {
             assert!(!made_here(&there, &json!("be brief"), Some(3)), "{key}");
         }
         assert!(!made_here(&made, &json!("be brief"), None));
+    }
+
+    #[test]
+    fn an_add_an_rm_came_between_starts_no_watch() {
+        let w = World::new("start-watch");
+        let mut s = trigger();
+        s.turn_end = Some(("p.task".into(), 5));
+        assert!(
+            start_watch(&w.places, &s, 9)
+                .unwrap_err()
+                .starts_with("trigger_not_found")
+        );
+        assert!(!w.places.watched(&s.name).exists());
+        w.install(&s).unwrap();
+        start_watch(&w.places, &s, 9).unwrap();
+        // The same add again keeps the place the watcher reached.
+        watch::save_watched(&w.places, &s, 12, 1).unwrap();
+        start_watch(&w.places, &s, 9).unwrap();
+        assert_eq!(watch::read_watched(&w.places, &s), Some((12, 1)));
     }
 
     #[test]
