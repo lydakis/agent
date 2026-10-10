@@ -156,7 +156,7 @@ test('fenced blocks become code, previews, diagrams and images by their language
   assert.match(Rich.html('```html\n<b>hi</b>\n```'), /data-kind="html" data-view="code"/);
   assert.match(Rich.html('```mermaid\ngraph TD\nA-->B\n```'), /data-kind="mermaid".*A--&gt;B/s);
   // A diagram in a message draws when asked; one in a file someone opened draws at once.
-  assert.match(Rich.html('```mermaid\ngraph TD\n```'), /data-kind="mermaid" data-lazy data-id="\d+" data-view="code"/);
+  assert.match(Rich.html('```mermaid\ngraph TD\n```'), /data-kind="mermaid" data-lazy data-id="#\d+" data-view="code"/);
   assert.match(Rich.file('/w/flow.mmd', new TextEncoder().encode('graph TD')).html, /data-kind="mermaid" data-lazy data-run/);
   const svg = Rich.html('```svg\n<svg xmlns="http://www.w3.org/2000/svg"><circle r="4"/></svg>\n```');
   // An SVG draws as an image, and in a message only when asked: its filters and animations take CPU.
@@ -264,6 +264,39 @@ test('a diagram someone asked for shows again; an identical one elsewhere still 
   assert.equal(old.view.innerHTML, ''); assert.equal(recent.view.innerHTML, '<svg>graph TD</svg>');
 });
 
+test('a diagram asked for while its reply streamed stays shown once the reply is committed', async () => {
+  const reply = 'First:\n\n```mermaid\ngraph TD\n```\n\nand on.';
+  const p = page({ request: async () => ({ type: 'message', role: 'assistant', content: [{ type: 'text', text: reply }] }) }), Rich = p.context.Rich, t = p.transcript('Bob');
+  const idOf = (html) => html.match(/data-id="([^"]*)"/)[1];
+  t.streamingTurn = 7; t.streamGen = 1; t.text = '';
+  const el = { dataset: {}, children: [], replaceChildren(...nodes) { this.children = nodes; } };
+  for (const ch of reply) { t.text += ch; p.renderTail(el, 'Bob', t); }
+  const streamed = idOf(el.children[0].children.map((c) => c.html).join(''));
+  await p.onEvent({ event: 'message', bot: 'Bob', turn: 7, data: { node: 3 } }); await p.loadBatch('Bob');
+  const text = t.items.find((it) => it.kind === 'text');
+  assert.equal(idOf(p.textHTML(text)), streamed);
+  // Drawn anew when highlighting arrives, it keeps the id; in another turn or file, or changed, it asks.
+  text.htmlOf = null; assert.equal(idOf(p.textHTML(text)), streamed);
+  assert.notEqual(idOf(Rich.html(reply, { lines: 0, tags: 0, code: 0, scope: 'Bob|8' })), streamed);
+  assert.notEqual(idOf(Rich.html(reply.replace('TD', 'LR'), { lines: 0, tags: 0, code: 0, scope: 'Bob|7' })), streamed);
+  assert.notEqual(idOf(Rich.file('/w/d.md', new TextEncoder().encode(reply), false, false).html), streamed);
+});
+
+test('a diagram that failed to draw asks again before it is tried again', async () => {
+  const p = page(), c = p.context, Rich = c.Rich; let renders = 0;
+  c.document.head = { append(s) { s.onload(); } };
+  c.getComputedStyle = () => ({ getPropertyValue: () => '' });
+  c.mermaid = { initialize() {}, render: async () => { renders++; throw new Error('too big'); } };
+  const box = () => { const view = { innerHTML: '' }, pre = { textContent: 'graph TD' }, lang = { textContent: 'mermaid' };
+    return { dataset: { kind: 'mermaid', lazy: '', view: 'code', id: 'Bob|1|mermaid|x' }, clientWidth: 0, view, lang, closest: () => null, querySelector: (s) => s === 'pre' ? pre : s === '.view' ? view : s === '.rh .lang' ? lang : null }; };
+  const asked = box(), button = { dataset: { rich: 'view' }, closest: () => asked };
+  Rich.click({ target: { closest: (s) => s === '[data-rich]' ? button : null }, preventDefault() {} });
+  await new Promise((r) => setImmediate(r)); await new Promise((r) => setImmediate(r));
+  assert.equal(renders, 1); assert.match(asked.lang.textContent, /too big/);
+  Rich.hydrate({ querySelectorAll: () => [box()] }); await new Promise((r) => setImmediate(r));
+  assert.equal(renders, 1);
+});
+
 test('a file opened while the side pane opens is drawn once the pane has its width', async () => {
   const p = page(), c = p.context, R = c.Rich, opening = deferred(); let hydrated = 0;
   c.Rich = { file: R.file, get version() { return R.version; }, hydrate: () => { hydrated++; } };
@@ -290,7 +323,7 @@ test('a file an agent rewrote while open waits for a click to run', async () => 
   const p = page({ readFile: async (full) => { opened.push(full); return enc('<p>hi</p>'); } }), Rich = p.context.Rich;
   assert.match(Rich.file('/w/p.html', enc('<p>hi</p>')).html, /data-kind="html" data-view="view"/);
   assert.match(Rich.file('/w/p.html', enc('<p>hi</p>'), false, false).html, /data-kind="html" data-view="code"/);
-  assert.match(Rich.file('/w/d.mmd', enc('graph TD'), false, false).html, /data-lazy data-id="\d+"/);
+  assert.match(Rich.file('/w/d.mmd', enc('graph TD'), false, false).html, /data-lazy data-id="file \/w\/d\.mmd\|mermaid\|[^"]+"/);
   p.S.config = { workspace: '/w' };
   p.S.ui.file = { bot: 'Bob', full: '/w/p.html', asked: true, gen: 2, state: 'ok', bytes: enc('<p>hi</p>'), more: false, url: null };
   await p.onEvent({ event: 'tool_started', bot: 'Bob', turn: 1, data: { call_id: 'w1', name: 'write', arguments: JSON.stringify({ path: 'p.html', content: 'x' }) } });
@@ -319,7 +352,7 @@ test('a link in a drawn diagram opens through the guarded opener', () => {
 test('charts, file links and opened files draw by kind', () => {
   const p = page(), Rich = p.context.Rich;
   // A chart in a message draws when asked; one in a file someone opened draws at once.
-  assert.match(Rich.html('```vega-lite\n{"mark":"bar"}\n```'), /data-kind="chart" data-lang="vega-lite" data-lazy data-id="\d+" data-view="code"/);
+  assert.match(Rich.html('```vega-lite\n{"mark":"bar"}\n```'), /data-kind="chart" data-lang="vega-lite" data-lazy data-id="#\d+" data-view="code"/);
   assert.match(Rich.file('/w/c.vl.json', new TextEncoder().encode('{}')).html, /data-kind="chart" data-lang="vega-lite" data-lazy data-run/);
   assert.match(Rich.html('```vega\n{}\n```'), /data-lang="vega"/);
   const links = Rich.html('[plan](PLAN.md) [code](src/a.rs:12) [line](src/b.rs#L4-L9) [web](https://example.com) [here](#top)');

@@ -55,14 +55,19 @@ const BASE = 'b7bdfe4';
     out.new_dom_notable_ms = time(() => draw(newHTML.replace(/<table>[\s\S]*?<\/table>/g, '')));
     out.new_dom_noblock_ms = time(() => draw(newHTML.replace(/<div class="rc"[\s\S]*?<\/pre><\/div>/g, '')));
     out.old_html_kib = Math.round(oldHTML.length / 1024); out.new_html_kib = Math.round(newHTML.length / 1024);
-    // Streaming: a 20 KiB reply in 8-character deltas, the old tail (append) against the new one (cut + draw finished blocks).
+    // Streaming: a 9 KiB reply in 8-character deltas, the old tail (append) against the new one (cut + draw
+    // finished blocks into one message's bounds, hydrating what was added). Each delta does what the app's
+    // render does around it: read whether the reader is at the bottom, then keep them there, so every delta
+    // pays its own layout.
     const reply = msgs.slice(0, 12).join('\n\n'); const deltas = []; for (let i = 0; i < reply.length; i += 8) deltas.push(reply.slice(0, i + 8));
     out.stream_kib = Math.round(reply.length / 1024); out.stream_deltas = deltas.length;
+    const follow = (fn) => { const atBottom = host.scrollHeight - host.scrollTop - host.clientHeight < 40; fn(); if (atBottom) host.scrollTop = host.scrollHeight; };
     sheet(true);
-    out.stream_old_ms = time(() => { const tn = document.createTextNode(''); host.replaceChildren(tn); let off = 0; for (const v of deltas) { tn.appendData(v.slice(off)); off = v.length; } void host.scrollHeight; });
+    out.stream_old_ms = time(() => { const tn = document.createTextNode(''); host.replaceChildren(tn); let off = 0; for (const v of deltas) follow(() => { tn.appendData(v.slice(off)); off = v.length; }); });
     sheet(false);
-    out.stream_new_ms = time(() => { const done = document.createElement('div'), tn = document.createTextNode(''); host.replaceChildren(done, tn); const st = {}; let drawn = 0, off = 0, blocks = 0;
-      for (const v of deltas) { const at = Rich.cut(st, v); if (at > drawn) { const box = document.createElement('div'); box.innerHTML = Rich.html(v.slice(drawn, at)); done.append(...box.childNodes); tn.data = v.slice(at); drawn = at; blocks++; } else tn.appendData(v.slice(off)); off = v.length; } void host.scrollHeight; out.stream_blocks = blocks; });
+    out.stream_new_ms = time(() => { const done = document.createElement('div'), tn = document.createTextNode(''); done.className = 'md'; host.replaceChildren(done, tn); const st = {}, used = { lines: 0, tags: 0, code: 0, scope: 'bench|1' }; let drawn = 0, off = 0, blocks = 0;
+      for (const v of deltas) follow(() => { const at = used.over ? 0 : Rich.cut(st, v); if (at > drawn) { const box = document.createElement('div'); box.innerHTML = Rich.html(v.slice(drawn, at), used); const added = [...box.childNodes]; done.append(...added); for (const n of added) if (n.nodeType === 1) Rich.hydrate(n); tn.data = v.slice(at); drawn = at; blocks++; } else tn.appendData(v.slice(off)); off = v.length; });
+      out.stream_blocks = blocks; });
     out.stream_full_reparse_ms = time(() => { for (const v of deltas) Rich.html(v); }, 1);
     host.remove();
     return out;

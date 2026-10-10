@@ -50,14 +50,17 @@ window.Rich = (() => {
   // window's thread, and a few characters can ask for more than it can do (a page's loop, an SVG's
   // filters, a chart's `sequence` to a billion, a Mermaid `space:500000`), so each runs only when
   // asked, block by block. `page` draws it at once, for a file someone opened.
-  // A diagram or chart in a message carries an id, kept with the message's HTML, so the one someone
-  // asked for shows again when its pane is drawn anew and an identical one elsewhere still asks.
-  let blockId = 0;
-  const lazy = (page) => page ? ' data-run' : ` data-id="${++blockId}"`;
+  // A diagram or chart in a message carries an id: where it was drawn (`scope`, its turn or file)
+  // and what it draws. Its streamed draft, the message committed, and the message drawn anew for
+  // highlighting all give it the same id, so the one someone asked for stays shown; an identical one
+  // in another turn or file still asks. Without a scope each block is its own.
+  let scope = null, blockId = 0;
+  const digest = (s) => { let a = 0x811c9dc5, b = 5381; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); a = Math.imul(a ^ c, 0x01000193); b = (Math.imul(b, 33) + c) | 0; } return `${s.length}.${(a >>> 0).toString(36)}.${(b >>> 0).toString(36)}`; };
+  const lazy = (page, kind, text) => page ? ' data-run' : ` data-id="${esc(scope == null ? `#${++blockId}` : `${scope}|${kind}|${digest(text)}`)}"`;
   function block(text, info, page = false) {
     const lang = (info ?? '').trim().split(/\s+/)[0].toLowerCase();
-    if (lang === 'mermaid' || lang === 'mmd') return `<div class="rc" data-kind="mermaid" data-lazy${lazy(page)} data-view="code">${head('mermaid', toggle)}<div class="view"></div>${pre(text, '')}</div>`;
-    if (CHART.has(lang)) return `<div class="rc" data-kind="chart" data-lang="${lang === 'vega' ? 'vega' : 'vega-lite'}" data-lazy${lazy(page)} data-view="code">${head(lang, toggle)}<div class="view"></div>${pre(text, 'json')}</div>`;
+    if (lang === 'mermaid' || lang === 'mmd') return `<div class="rc" data-kind="mermaid" data-lazy${lazy(page, 'mermaid', text)} data-view="code">${head('mermaid', toggle)}<div class="view"></div>${pre(text, '')}</div>`;
+    if (CHART.has(lang)) return `<div class="rc" data-kind="chart" data-lang="${lang === 'vega' ? 'vega' : 'vega-lite'}" data-lazy${lazy(page, lang, text)} data-view="code">${head(lang, toggle)}<div class="view"></div>${pre(text, 'json')}</div>`;
     if (lang === 'html' || lang === 'htm') return `<div class="rc" data-kind="html" data-view="${page ? 'view' : 'code'}">${head(lang, '<button type="button" data-rich="view"></button>')}<div class="view frame"></div>${pre(text, 'xml')}</div>`;
     // An SVG draws as an image, which runs no script and loads nothing.
     if (lang === 'svg' && /^\s*(<\?xml[^>]*>\s*)?<svg\b/i.test(text)) return `<div class="rc" data-kind="svg" data-view="${page ? 'view' : 'code'}">${head(lang, '<button type="button" data-rich="view"></button>')}<div class="view"></div>${pre(text, 'xml')}</div>`;
@@ -105,9 +108,10 @@ window.Rich = (() => {
   const marks = (s, max) => { let n = 0; MARK.lastIndex = 0; while (n <= max && MARK.exec(s)) n++; return n; };
   const asText = (text) => `<div class="rc" data-kind="code">${head('text', '')}<pre class="code"><code>${esc(text)}</code></pre></div>`;
   // `used` carries the bounds across the pieces of one message drawn apart, as a streamed reply's
-  // blocks are; once over, `used.over` is set and that piece is text.
+  // blocks are; once over, `used.over` is set and that piece is text. `used.scope` names where its
+  // diagrams and charts were drawn (see `lazy`).
   function html(text, used = { lines: 0, tags: 0, code: 0 }) {
-    waited = false; spent = used.code ?? 0;
+    waited = false; spent = used.code ?? 0; scope = used.scope ?? null;
     const p = parser();
     if (!p) return `<p>${esc(text)}</p>`;
     if (used.over) return asText(text);
@@ -170,7 +174,8 @@ window.Rich = (() => {
     });
   }
   // A diagram or chart drawn to SVG once per source; one at a time, as Mermaid measures in a shared
-  // scratch element. A source that does not draw keeps showing as code, the error in its head.
+  // scratch element. A source that does not draw keeps showing as code, the error in its head,
+  // and draws again only when asked again.
   // With `cached`, only a block someone asked for (`shown`, the last 1,024 asked) draws again,
   // from the cache or, when a chart's width changed, anew.
   const shown = new Set(), SHOWN = 1024;
@@ -191,7 +196,7 @@ window.Rich = (() => {
         const [k, v] = diagrams.entries().next().value; diagrams.delete(k); diagramBytes -= 2 * (k.length + v.length);
       }
       show(svg);
-    }, (e) => { delete box.dataset.asked; const l = box.querySelector('.rh .lang'); l.textContent = `${l.textContent.split(' · ')[0]} · ${String(e?.message ?? e).split('\n')[0].slice(0, 80)}`; });
+    }, (e) => { delete box.dataset.asked; shown.delete(box.dataset.id); const l = box.querySelector('.rh .lang'); l.textContent = `${l.textContent.split(' · ')[0]} · ${String(e?.message ?? e).split('\n')[0].slice(0, 80)}`; });
   }
   const mermaidSVG = (src) => mermaidReady().then((m) => m.render(`rich-mmd-${++diagramId}`, src)).then(({ svg }) => svg);
 
@@ -327,7 +332,7 @@ window.Rich = (() => {
   }
   // `waited` says the view is code that highlighting, once loaded, would draw differently.
   function file(path, bytes, more = false, asked = true) {
-    spent = 0; waited = false;
+    spent = 0; waited = false; scope = `file ${path}`;
     const ext = extOf(path), note = more ? `<div class="line note">showing the first ${Math.round(bytes.length / 1048576)} MiB</div>` : '';
     if (IMAGE[ext]) {
       if (more) return { html: '<div class="line note">image too large to show</div>' };
@@ -336,7 +341,7 @@ window.Rich = (() => {
     }
     if (bytes.subarray(0, 8000).includes(0)) return { html: `<div class="line note">binary file · ${bytes.length}${more ? '+' : ''} bytes</div>` };
     const text = new TextDecoder().decode(bytes);
-    if (ext === 'md' || ext === 'markdown') return { html: `${note}<div class="md">${html(text)}</div>`, waited };
+    if (ext === 'md' || ext === 'markdown') return { html: `${note}<div class="md">${html(text, { lines: 0, tags: 0, code: 0, scope })}</div>`, waited };
     if (ext === 'csv' || ext === 'tsv') return { html: note + table(text, ext === 'csv' ? ',' : '\t') };
     const lang = { mmd: 'mermaid', mermaid: 'mermaid', vl: 'vega-lite', vg: 'vega', htm: 'html', html: 'html', svg: 'svg' }[ext] ?? ext;
     const out = block(text, lang, asked);

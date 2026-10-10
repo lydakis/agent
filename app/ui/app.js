@@ -930,6 +930,8 @@ async function loadBatch(name) {
           count(t, live, -1); t.items.splice(t.items.indexOf(live), 1);
         }
       }
+      // A message's diagrams keep the consent given while it streamed: both are scoped to its turn.
+      if (e.kind === 'text') e.scope = `${name}|${it.turn ?? `node ${it.node}`}`;
       rep.push({ ...e, callId: e.callId ?? it.callId, turn: it.turn });
     }
     const size = r.ok ? JSON.stringify(r.ok).length * 2 : 0;
@@ -1254,7 +1256,7 @@ function inline(text) {
 function textHTML(it, t) {
   if (it.htmlOf !== it.text || (it.htmlWaited && it.htmlAt !== Rich.version)) {
     // A block after the first of its message starts from what the blocks before it drew.
-    const used = { lines: 0, tags: 0, code: 0 };
+    const used = { lines: 0, tags: 0, code: 0, scope: it.scope };
     for (const s of it.budget?.spent.slice(0, it.sib) ?? []) if (s) { used.lines += s.lines; used.tags += s.tags; used.code += s.code; used.over ||= s.over; }
     const start = { ...used }, html = `<div class="md">${Rich.html(it.text, used)}</div>`;
     if (it.budget) it.budget.spent[it.sib] = { lines: used.lines - start.lines, tags: used.tags - start.tags, code: used.code - start.code, over: !!used.over };
@@ -1434,7 +1436,7 @@ function renderTail(el, name, t) {
     line.replaceChildren(text, cursor);
     const done = kind === 'text' ? document.createElement('div') : null; if (done) done.className = 'md';
     el.replaceChildren(...(kind || running ? [done, line].filter(Boolean) : []));
-    state = { transcript: t, kind, turn: t.streamingTurn, gen: t.streamGen, offset: 0, text, running, done, cut: {}, drawn: 0, used: { lines: 0, tags: 0, code: 0 } };
+    state = { transcript: t, kind, turn: t.streamingTurn, gen: t.streamGen, offset: 0, text, running, done, cut: {}, drawn: 0, used: { lines: 0, tags: 0, code: 0, scope: `${name}|${t.streamingTurn}` } };
     tails.set(el, state);
   }
   if (value.length <= state.offset) return;
