@@ -16,6 +16,19 @@ class ReferenceTests(unittest.TestCase):
     def test_hidden_checks_pass_the_right_answer_and_fail_the_wrong_one(self):
         memory_eval.self_check()
 
+    def test_only_the_selected_providers_key_is_passed_on(self):
+        self.assertEqual(memory_eval.provider_keys('openai'), ['OPENAI_API_KEY'])
+        self.assertEqual(memory_eval.provider_keys('openai=responses-ws'), ['OPENAI_API_KEY'])
+        self.assertEqual(memory_eval.provider_keys('gw=responses,https://gw.example.test/v1,GW_KEY'), ['GW_KEY'])
+        self.assertEqual(memory_eval.provider_keys('chatgpt'), [])
+
+    def test_the_stale_fact_counts_as_corrected_only_when_it_says_half_up(self):
+        self.assertTrue(memory_eval.fact_corrected(None))
+        self.assertTrue(memory_eval.fact_corrected('Prices round half up with quantize_price in shop/pricing.py; '
+                                                   'shop/money.py and half to even are gone.'))
+        self.assertFalse(memory_eval.fact_corrected(memory_eval.FACTS['price-rounding'][4]))
+        self.assertFalse(memory_eval.fact_corrected('Prices round half to even.'))
+
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class PlumbingTests(unittest.TestCase):

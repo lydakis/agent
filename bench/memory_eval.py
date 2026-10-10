@@ -58,8 +58,8 @@ from bench.targets import clean_env, file_hash  # noqa: E402
 ROOT = Path(__file__).resolve().parents[1]
 PROJECT = 'shop'
 CONDITIONS = ('none', 'memory')
-# Provider keys a run may need, passed through only when set.
-KEYS = ('OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'OPENROUTER_API_KEY')
+# The key variable each built-in provider reads.
+KEYS = {'openai': 'OPENAI_API_KEY', 'anthropic': 'ANTHROPIC_API_KEY', 'openrouter': 'OPENROUTER_API_KEY'}
 
 FILES = {
     '.agents/project.toml': f'name = "{PROJECT}"\n',
@@ -165,7 +165,8 @@ import json
 from datetime import datetime, timezone
 from shop.orders import Order
 try:
-    got = Order(1, datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)).to_json().get('created_at')
+    # Microseconds too, since the decision says whole seconds.
+    got = Order(1, datetime(2026, 1, 2, 3, 4, 5, 678901, tzinfo=timezone.utc)).to_json().get('created_at')
 except Exception as error:
     got = f'raised {error!r}'
 print(json.dumps({'correct': got == '2026-01-02T03:04:05Z', 'got': str(got)}))
@@ -212,7 +213,8 @@ print(json.dumps({'correct': got == Decimal('5.03') and plain == Decimal('10.05'
 # A reference answer per scenario, right and wrong, for --self-check.
 REFERENCE = {
     'decision': (("'items': [", "'created_at': self.created.strftime('%Y-%m-%dT%H:%M:%SZ'),\n                'items': ["),
-                 ("'items': [", "'created_at': self.created.isoformat(),\n                'items': [")),
+                 ("'items': [", "'created_at': self.created.isoformat().replace('+00:00', 'Z'),\n"
+                  "                'items': [")),
     'preference': (("    cart[sku]", "    if quantity < 1:\n        raise ValueError(f'[E_QUANTITY] quantity must be at "
                     "least 1, got {quantity}')\n    cart[sku]"),
                    ("    cart[sku]", "    if quantity < 1:\n        raise ValueError('quantity must be at least 1')\n"
@@ -264,6 +266,24 @@ def visible_tests(worktree):
     out = subprocess.run([sys.executable, '-m', 'unittest', '-q'], cwd=worktree, env=clean_env(),
                          capture_output=True, text=True, timeout=120)
     return out.returncode == 0
+
+
+def provider_keys(specs):
+    """The key variables the daemon's providers read, which it registers as
+    credentials and so keeps out of the bot's shell: a spec's KEY_ENV, else
+    its built-in provider's own. No other key is passed on."""
+    keys = []
+    for spec in specs.split():
+        name, _, rest = spec.partition('=')
+        fields = rest.split(',') if rest else []
+        keys.append(fields[2] if len(fields) > 2 and fields[2] else KEYS.get(name))
+    return [key for key in keys if key]
+
+
+def fact_corrected(text):
+    """Whether the stale fact now says what the code does: removed, or
+    saying prices round half up."""
+    return text is None or bool(re.search(r'half[ _-]up', text, re.I))
 
 
 def memory_app(given):
@@ -361,8 +381,9 @@ def run_bot(binary, app, model, env, out_dir, condition, scenario, trial, budget
         stream, error = out.decode() if isinstance(out, bytes) else out, 'timeout'
         subprocess.run([*agent, 'interrupt', '--bot', name], env=bot_env, capture_output=True, timeout=30)
     wall = round(time.monotonic() - started, 1)
-    view = subprocess.run([*agent, 'wait', '--timeout', '0', f'turn:{name}/1'], env=bot_env,
-                          capture_output=True, text=True, timeout=60)
+    # A finished turn returns at once; an interrupted one once it settles.
+    view = subprocess.run([*agent, 'wait', '--timeout', '60s', f'turn:{name}/1'], env=bot_env,
+                          capture_output=True, text=True, timeout=90)
     try:
         turn = json.loads(view.stdout)['results'][f'turn:{name}/1']
     except (ValueError, KeyError, TypeError):
@@ -382,7 +403,7 @@ def run_bot(binary, app, model, env, out_dir, condition, scenario, trial, budget
         'shell_calls': len(commands),
         'memory_saved': sorted(k for k in after if before.get(k) != after[k]),
         'memory_removed': sorted(k for k in before if k not in after),
-        **({'fact_corrected': stale not in after or 'money.py' not in after[stale]}
+        **({'fact_corrected': fact_corrected(after.get(stale)), 'fact_after': after.get(stale)}
            if condition == 'memory' and scenario == 'stale' else {}),
         'answer': answer(found),
         'dir': str(root),
@@ -448,22 +469,27 @@ def main():
     if not args.binary.exists():
         parser.error(f'{args.binary} is missing: cargo build --release --locked')
     app = memory_app(args.memory_app)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
     env = clean_env()
     env['AGENT_PROVIDER'] = args.provider or args.model.split('/', 1)[0]
-    env.update({k: os.environ[k] for k in KEYS if k in os.environ})
+    env.update({k: os.environ[k] for k in provider_keys(env['AGENT_PROVIDER']) if k in os.environ})
     # The daemon reads Codex's ChatGPT login from CODEX_HOME, which must
     # outlive the bot's own HOME.
     env['CODEX_HOME'] = os.environ.get('CODEX_HOME') or str(Path.home() / '.codex')
-    out_dir = args.out.resolve().parent / 'run'
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # Bots work outside this checkout, so composing their instructions
+    # finds the shop's AGENTS.md and not this repository's.
+    out_dir = Path(tempfile.mkdtemp(prefix='agent-memory-eval-'))
+    if ROOT in out_dir.resolve().parents:
+        parser.error(f'{out_dir} is inside {ROOT}: set TMPDIR elsewhere')
     jobs = [(c, s, t) for c in args.conditions for s in args.scenarios for t in range(args.trials)]
     with concurrent.futures.ThreadPoolExecutor(len(jobs)) as pool:
         rows = list(pool.map(lambda job: run_bot(args.binary.resolve(), app, args.model, env, out_dir, *job,
                                                  args.turn_budget_tokens, args.timeout), jobs))
-    result = {'binary_sha256': file_hash(args.binary), 'model': args.model,
+    result = {'binary_sha256': file_hash(args.binary), 'model': args.model, 'bots_dir': str(out_dir),
               'summary': summarize(rows), 'bots': rows}
     args.out.write_text(json.dumps(result, indent=1))
     print(json.dumps(result['summary'], indent=1))
+    print(f'bots kept in {out_dir}', file=sys.stderr)
 
 
 if __name__ == '__main__':

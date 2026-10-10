@@ -28,7 +28,7 @@ task that needs it:
 
 | Scenario | Fact in memory | Task | Correct means |
 | --- | --- | --- | --- |
-| `decision` | project: API timestamps end in `Z`, never `+00:00` | add `created_at` to `Order.to_json()` | `2026-01-02T03:04:05Z`, where `isoformat()` gives `+00:00` |
+| `decision` | project: API timestamps end in `Z`, never `+00:00` | add `created_at` to `Order.to_json()` | `2026-01-02T03:04:05Z` for a time with microseconds, where `isoformat()` gives `.678901+00:00` |
 | `preference` | person: error messages start with a bracketed code | make `add_item` reject a quantity below 1 | `ValueError("[E_...] ...")` for 0 and -1, while 1 still works |
 | `stale` | project: prices round half to even with `round_price` in `shop/money.py` (wrong: the file is gone, and `shop/pricing.py` rounds half up) | add a `discount` to `Order.total()`, rounded as the project rounds | 10.05 at 50% off is 5.03 (half up, not 5.02), and no `shop/money.py` |
 
@@ -42,8 +42,9 @@ its work isn't used. For each bot, the script also records:
 - whether the visible tests pass;
 - the final reply and the time taken.
 
-In `stale`, `fact_corrected` records whether the agent fixed or removed the
-wrong fact, which the `memory` skill asks it to do.
+In `stale`, `fact_corrected` records whether the agent removed the wrong
+fact or rewrote it to say prices round half up, which the `memory` skill
+asks it to do; `fact_after` keeps the fact's text for reading.
 
 The research's third condition, the skill with no index composed, is left
 out. M2 already composes the indexes, and the runtime has one behavior, so
@@ -68,12 +69,16 @@ cargo build --release --locked
   trials (`--trials`). Each bot's turn is capped at 400,000 tokens
   (`--turn-budget-tokens`) and 20 minutes (`--timeout`).
 - **Output.** The summary prints per condition and scenario. Every bot's
-  record goes to `--out`, and its folder, worktree and memory stay under
-  `.local/memory-eval/run/` for reading afterwards.
+  record goes to `--out`. Its folder, worktree and memory stay in a new
+  `agent-memory-eval-*` folder under the system's temporary directory,
+  named in the output as `bots_dir`. That is outside this checkout so a
+  bot's instructions don't pick up this repository's `AGENTS.md`.
 - **App path.** When the app isn't where `~/.agent/memory` points, pass
   `--memory-app /path/to/agent-app`.
 - **API key instead.** An API key works as well: `--model openai/MODEL`
   with `OPENAI_API_KEY` set, or `anthropic/MODEL` with `ANTHROPIC_API_KEY`.
+  Only the selected provider's key reaches the daemons, which keep it out
+  of the bots' shells.
 
 Checks with no model call, which ran in this PR:
 
