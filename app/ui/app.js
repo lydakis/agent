@@ -2412,7 +2412,8 @@ async function remove(name) { await Daemon.request('delete', { bot: name }); }
 async function createProject(dir, picked = null, effort = null, threads = null) {
   const info = await Daemon.project(dir);
   const existing = bot(info.coordinator);
-  const asked = !!(picked || effort || threads?.model || threads?.inProject);
+  // The sheet's thread settings are picks even at their defaults: "Own worktree" is shown as chosen.
+  const asked = !!(picked || effort || threads);
   if (existing) {
     if (existing.workspace !== info.dir) throw new Error(`${info.coordinator} already belongs to ${existing.workspace ?? 'another folder'}`);
     await go(info.coordinator);

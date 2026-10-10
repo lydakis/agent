@@ -1703,6 +1703,10 @@ test('a project name taken by another folder\'s coordinator is refused, and a re
   p.S.ui.toast = null;
   await p.createProject('/synthetic/weather', null, 'high');
   assert.match(p.S.ui.toast ?? '', /keeps the settings it was made with/);
+  // So is the sheet's worktree choice left at its default.
+  p.S.ui.toast = null;
+  await p.createProject('/synthetic/weather', null, null, { model: null, reasoning: null, inProject: false });
+  assert.match(p.S.ui.toast ?? '', /keeps the settings it was made with/);
 });
 
 test('runs fold thinking and tool calls to one line each, keep failures visible, and expand on demand', () => {
