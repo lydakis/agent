@@ -530,14 +530,23 @@ pub(super) fn read_watched(places: &Places, trigger: &Trigger) -> Result<Option<
 
 /// An agent's newest event cursor. Its events after a cursor are none from
 /// that cursor on, so bisecting finds it in about 2·log2(cursor) indexed
-/// lookups, with no daemon change.
+/// lookups, with no daemon change. Retention may have removed every event
+/// it had: then the newest is where retention stopped, not 0.
 pub(super) async fn newest_cursor(client: &Client, bot: &str) -> Result<i64, String> {
-    let none_after = |after: i64| async move {
-        client
-            .request("events", json!({"bot": bot, "after": after, "limit": 1}))
-            .await
-            .map(|page| page["events"].as_array().is_none_or(Vec::is_empty))
-            .map_err(super::coded)
+    let pruned = std::sync::atomic::AtomicI64::new(0);
+    let none_after = |after: i64| {
+        let pruned = &pruned;
+        async move {
+            let page = client
+                .request("events", json!({"bot": bot, "after": after, "limit": 1}))
+                .await
+                .map_err(super::coded)?;
+            pruned.fetch_max(
+                page["pruned_before"].as_i64().unwrap_or(0),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            Ok::<_, String>(page["events"].as_array().is_none_or(Vec::is_empty))
+        }
     };
     let mut high = 1i64;
     while !none_after(high).await? {
@@ -552,7 +561,7 @@ pub(super) async fn newest_cursor(client: &Client, bot: &str) -> Result<i64, Str
             low = mid + 1;
         }
     }
-    Ok(high)
+    Ok(high.max(pruned.into_inner()))
 }
 
 /// The watcher's LaunchAgent: started at login and whenever it stops
