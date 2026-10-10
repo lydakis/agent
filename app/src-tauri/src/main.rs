@@ -1240,6 +1240,16 @@ fn triggers(
     ))
 }
 
+/// One trigger by name, as `triggers` lists it; null when there is none.
+#[tauri::command]
+fn trigger(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    name: String,
+) -> Result<Option<Value>, String> {
+    Ok(trigger::one(&triggers_of(&*windows.of(&window)?)?, &name))
+}
+
 #[tauri::command]
 fn trigger_remove(
     windows: State<'_, Windows>,
@@ -1441,6 +1451,7 @@ fn main() {
             swarm_run,
             swarm_board,
             triggers,
+            trigger,
             trigger_fire,
             plans,
             home_dir,
