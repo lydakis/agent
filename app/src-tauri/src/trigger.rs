@@ -1112,8 +1112,15 @@ pub fn migrate(places: &Places, running: Option<&str>, launchd: Loader) -> bool 
     let mut converted_running = false;
     for name in names {
         let old = places.agents.join(format!("{SCHEDULE_LABEL}{name}.plist"));
-        let Ok(text) = read_record(&old) else {
-            continue;
+        let text = match read_record(&old) {
+            Ok(text) => text,
+            Err(error) => {
+                log(format!(
+                    "unconvertible: schedule {name} is left at {}: {error}",
+                    old.display()
+                ));
+                continue;
+            }
         };
         let converted = text
             .replacen(
@@ -1137,23 +1144,23 @@ pub fn migrate(places: &Places, running: Option<&str>, launchd: Loader) -> bool 
             continue;
         }
         let path = places.plist(&name);
-        // A conversion cut short left its trigger in: it is finished.
-        let resumed = std::fs::read_to_string(&path).is_ok_and(|t| t == converted);
-        if !resumed {
-            // A trigger of that name, or one that ended and is still listed.
-            if path.exists() || places.last(&name).exists() {
-                log(format!(
-                    "name_taken: schedule {name} is left at {}: a trigger has its name",
-                    old.display()
-                ));
-                continue;
-            }
-            if let Err(error) = swap(&path, &name, None, &converted, launchd) {
-                log(error);
-                continue;
-            }
-            converted_running |= Some(name.as_str()) == running;
+        let there = std::fs::read_to_string(&path).ok();
+        // A conversion cut short left its trigger in, maybe before launchd
+        // loaded it: it is loaded again, and finished.
+        let resumed = there.as_deref() == Some(converted.as_str());
+        // A trigger of that name, or one that ended and is still listed.
+        if !resumed && (path.exists() || places.last(&name).exists()) {
+            log(format!(
+                "name_taken: schedule {name} is left at {}: a trigger has its name",
+                old.display()
+            ));
+            continue;
         }
+        if let Err(error) = swap(&path, &name, there.as_deref(), &converted, launchd) {
+            log(error);
+            continue;
+        }
+        converted_running |= !resumed && Some(name.as_str()) == running;
         let result = old_state.join(format!("{name}.json"));
         if result.exists()
             && !places.last(&name).exists()
@@ -1176,7 +1183,8 @@ pub fn migrate(places: &Places, running: Option<&str>, launchd: Loader) -> bool 
         };
         let to = places.state.join(&file);
         let kept = places.agents.join(format!("{SCHEDULE_LABEL}{name}.plist"));
-        if !to.exists() && !kept.exists() {
+        // A trigger of that name, even one with no result yet, keeps its own.
+        if !to.exists() && !kept.exists() && !places.plist(name).exists() {
             let _ = std::fs::rename(e.path(), to);
         }
     }
@@ -2455,19 +2463,35 @@ mod tests {
                 .loaded
                 .borrow_mut()
                 .insert(format!("{SCHEDULE_LABEL}{}", s.name));
-            // The first was converted, and the app stopped before the old went.
+            // The first was converted, and the app stopped before launchd
+            // loaded it, or before the old went.
             if s.name == cut.name {
                 std::fs::write(places.plist(&s.name), new).unwrap();
-                w.fake
-                    .loaded
-                    .borrow_mut()
-                    .insert(format!("{LABEL}{}", s.name));
             }
         }
         // A trigger that ended has the second's name.
         let kept = json!({"name": "p.ended", "message": "an ended trigger's"}).to_string();
         std::fs::write(places.last("p.ended"), &kept).unwrap();
+        // A live trigger with no result yet has an ended schedule's name.
+        let live = Trigger {
+            name: "p.live".into(),
+            ..trigger()
+        };
+        std::fs::write(
+            places.plist("p.live"),
+            plist(Path::new("/A/agent-app"), &live, &entries, &[]),
+        )
+        .unwrap();
+        let ended_schedule = home.join("schedules/p.live.json");
+        std::fs::write(&ended_schedule, "{}").unwrap();
         migrate(&places, None, &|x| w.fake.call(x));
+        assert!(
+            w.fake
+                .loaded
+                .borrow()
+                .contains(&format!("{LABEL}{}", cut.name))
+        );
+        assert!(ended_schedule.exists() && !places.last("p.live").exists());
         assert!(
             !places
                 .agents
@@ -2480,7 +2504,7 @@ mod tests {
                 .borrow()
                 .contains(&format!("{SCHEDULE_LABEL}{}", cut.name))
         );
-        assert_eq!(triggers(&places)[0].0, cut);
+        assert!(triggers(&places).iter().any(|t| t.0 == cut));
         assert_eq!(
             std::fs::read_to_string(places.last("p.ended")).unwrap(),
             kept
