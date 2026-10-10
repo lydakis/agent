@@ -16,6 +16,8 @@ const MAX_WORKTREES: usize = 200;
 const MAX_STATUS_BYTES: u64 = 4 * 1024 * 1024;
 /// What a diff may print before it is cut.
 pub const MAX_DIFF: u64 = 1024 * 1024;
+/// What the log and the worktree list may print.
+const MAX_LISTED: u64 = 1024 * 1024;
 
 #[derive(Debug, PartialEq)]
 pub struct View {
@@ -65,25 +67,31 @@ pub fn view(dir: &Path) -> Result<View, String> {
     })?;
     let at = Path::new(&root);
     let (branch, changes, more) = status(at)?;
-    // A repository with no commit yet has no log.
-    let log = run(at)
-        .args(["log", "-z", "--no-color"])
+    // A repository with no commit yet has no log. A record cut at the
+    // bound is left out.
+    let mut log = run(at);
+    log.args(["log", "-z", "--no-color"])
         .arg(format!("-n{MAX_COMMITS}"))
-        .arg("--format=%H%x1f%an%x1f%ar%x1f%s")
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|e| format!("git log: {e}"))?;
-    let commits = if log.status.success() {
-        log.stdout.split(|b| *b == 0).filter_map(commit).collect()
+        .arg("--format=%H%x1f%an%x1f%ar%x1f%s");
+    let log = capture(log, MAX_LISTED)?;
+    let commits = if log.ok || log.cut {
+        let whole = log
+            .bytes
+            .iter()
+            .rposition(|b| *b == 0)
+            .map_or(0, |at| at + 1);
+        log.bytes[..if log.cut { whole } else { log.bytes.len() }]
+            .split(|b| *b == 0)
+            .filter_map(commit)
+            .collect()
     } else {
         Vec::new()
     };
-    let list = run(at)
-        .args(["worktree", "list", "--porcelain", "-z"])
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|e| format!("git worktree: {e}"))?;
-    let worktrees = worktrees(&list.stdout);
+    // Read up to the bound, so a repository with very many worktrees
+    // costs no more than one with a few hundred.
+    let mut list = run(at);
+    list.args(["worktree", "list", "--porcelain", "-z"]);
+    let worktrees = worktrees(&capture(list, MAX_LISTED)?.bytes);
     Ok(View {
         root,
         branch,
@@ -224,6 +232,15 @@ pub struct Diff {
 pub fn diff(root: &Path, target: &Target) -> Result<Diff, String> {
     let mut command = run(root);
     command.args(["--literal-pathspecs", "-c", "diff.noprefix=false"]);
+    // `diff --no-index` exits 1 when the files differ; anything else that
+    // is not success is a failure, whatever it printed first.
+    let differs = matches!(
+        target,
+        Target::Change {
+            untracked: true,
+            ..
+        }
+    );
     match target {
         Target::Change {
             path,
@@ -258,7 +275,27 @@ pub fn diff(root: &Path, target: &Target) -> Result<Diff, String> {
             ]);
         }
     }
-    read(command, MAX_DIFF)
+    let mut out = capture(command, MAX_DIFF)?;
+    if !out.cut && !out.ok && !(differs && out.code == Some(1)) {
+        let error = out.error.trim();
+        return Err(if error.is_empty() {
+            format!("git failed ({:?})", out.code)
+        } else {
+            error.to_owned()
+        });
+    }
+    if out.cut {
+        let end = out
+            .bytes
+            .iter()
+            .rposition(|b| *b == b'\n')
+            .map_or(0, |at| at + 1);
+        out.bytes.truncate(end);
+    }
+    Ok(Diff {
+        text: String::from_utf8_lossy(&out.bytes).into_owned(),
+        cut: out.cut,
+    })
 }
 
 /// The last commit, or for a repository with none yet the empty tree, so a
@@ -280,11 +317,17 @@ fn base(root: &Path) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&empty.stdout).trim().to_owned())
 }
 
-/// What git prints, up to `limit` bytes, cut at a line's end; git is
-/// stopped there rather than left to print the rest. `diff --no-index`
-/// exits 1 when the files differ, so only a failure with nothing printed
-/// is one.
-fn read(mut command: Command, limit: u64) -> Result<Diff, String> {
+/// What git printed, up to `limit` bytes; past that git is stopped rather
+/// than left to print the rest, and `cut` says so.
+struct Output {
+    bytes: Vec<u8>,
+    cut: bool,
+    ok: bool,
+    code: Option<i32>,
+    error: String,
+}
+
+fn capture(mut command: Command, limit: u64) -> Result<Output, String> {
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -302,28 +345,18 @@ fn read(mut command: Command, limit: u64) -> Result<Diff, String> {
     if cut {
         let _ = child.kill();
         bytes.truncate(limit as usize);
-        let end = bytes
-            .iter()
-            .rposition(|b| *b == b'\n')
-            .map_or(0, |at| at + 1);
-        bytes.truncate(end);
     }
     let mut error = String::new();
     if let Some(mut err) = child.stderr.take() {
         let _ = err.by_ref().take(4096).read_to_string(&mut error);
     }
     let status = child.wait().map_err(|e| format!("git: {e}"))?;
-    if !cut && !status.success() && bytes.is_empty() {
-        let error = error.trim();
-        return Err(if error.is_empty() {
-            format!("git failed ({status})")
-        } else {
-            error.to_owned()
-        });
-    }
-    Ok(Diff {
-        text: String::from_utf8_lossy(&bytes).into_owned(),
+    Ok(Output {
+        bytes,
         cut,
+        ok: status.success(),
+        code: status.code(),
+        error,
     })
 }
 
@@ -465,6 +498,8 @@ mod tests {
         let shown = diff(root, &Target::Commit(v.commits[0].sha.clone())).unwrap();
         assert!(shown.text.contains("+b\n") && !shown.text.contains("TWO"));
         assert!(diff(root, &Target::Commit("HEAD~1".into())).is_err());
+        // A commit git does not have fails, rather than showing nothing.
+        assert!(diff(root, &Target::Commit("0000000".into())).is_err());
         // A path is a path, not a pattern.
         let star = diff(
             root,

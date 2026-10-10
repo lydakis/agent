@@ -3876,7 +3876,7 @@ test('a note on a diff line goes to the agent in that folder, naming the file an
   const g = p.S.ui.git.get('/w'), rows = g.diff.rows, at = rows.findIndex((r) => r.k === 'add');
   const click = (sel, el) => doc.listeners.click({ detail: 1, target: { closest: (s) => (s === sel ? el : s === '#log' ? {} : null) } });
   await click('[data-dl]', { dataset: { dl: String(at) } }); await settle();
-  assert.deepEqual({ ...g.note }, { row: at, of: 'c:src/a.rs' });
+  assert.deepEqual([g.note.row, g.note.of], [at, 'c:src/a.rs']);
   assert.match(doc.getElementById('log').innerHTML, /id="gnote" placeholder="Tell x about this line…"/);
   await doc.listeners.keydown({ key: 'Enter', target: { id: 'gnote', value: ' make it const ', closest: () => null }, preventDefault() {} }); await settle();
   assert.equal(sent.length, 1);
@@ -3948,4 +3948,22 @@ test('a diff is read into numbered rows, each knowing its file, up to a bound', 
   assert.equal(rows[0].t, 'x'); assert.equal(rows[7].t, 'y');
   const long = p.diffRows(`@@ -1,0 +1,6000 @@\n${'+l\n'.repeat(6000)}`, 'z');
   assert.equal(long.rows.length, 5000); assert.equal(long.more, 1001);
+});
+
+test('a note keeps the line it was opened on when the diff is read again under it, and goes to the agent that opened the tab only while it is that agent', async () => {
+  let text = A_DIFF;
+  const { p, sent, doc } = gitPage({ gitDiff: async () => ({ text, cut: false }) });
+  p.upsert({ name: 'y', bot_id: 3, provider: 'alpha', model: 'one', workspace: '/w' });
+  await p.act({ dataset: { act: 'git', who: 'y' } }); await settle();
+  const g = p.S.ui.git.get('/w'), at = g.diff.rows.findIndex((r) => r.k === 'add');
+  doc.listeners.click({ detail: 1, target: { closest: (s) => (s === '[data-dl]' ? { dataset: { dl: String(at) } } : s === '#log' ? {} : null) } });
+  // An agent's step adds two lines above it while the note is typed.
+  text = A_DIFF.replace(' keep\n', ' keep\n+first\n+second\n');
+  await p.readGit(g); await settle();
+  assert.match(doc.getElementById('log').innerHTML, /new line<\/span><\/div><div class="dcm">/);
+  await doc.listeners.keydown({ key: 'Enter', target: { id: 'gnote', value: 'n', closest: () => null }, preventDefault() {} }); await settle();
+  assert.equal(sent[0].bot, 'y'); assert.equal(sent[0].prompt, 'src/a.rs:13\n> new line\nn');
+  // y deleted and its name given to another bot: the note goes by the folder's rule instead.
+  p.forgetBot('y'); p.upsert({ name: 'y', bot_id: 9, provider: 'alpha', model: 'one', workspace: '/w' });
+  assert.equal(p.gitOwner('/w').name, 'x');
 });

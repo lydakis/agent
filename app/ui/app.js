@@ -1890,14 +1890,15 @@ function gitOwner(dir) {
     for (const b of S.bots.values()) if (b.name !== HOME && b.workspace) { const d = trimDir(b.workspace); if (!workers.by.has(d)) workers.by.set(d, []); workers.by.get(d).push(b); }
     for (const list of workers.by.values()) list.sort((a, b) => a.name.localeCompare(b.name));
   }
-  const here = (workers.by.get(trimDir(dir)) ?? []).filter((b) => bot(b.name) === b), from = bot(S.ui.gitFrom.get(dir));
+  const here = (workers.by.get(trimDir(dir)) ?? []).filter((b) => bot(b.name) === b), [name, id] = S.ui.gitFrom.get(dir) ?? [], from = bot(name)?.id === id ? bot(name) : null;
   if (from && here.includes(from)) return from;
   return here.find((b) => isActive(b.status)) ?? here.find((b) => leadProject(b.name)) ?? here[0] ?? null;
 }
 async function openGit(who) {
   const b = bot(who), dir = b?.workspace; if (!dir) return;
   if (S.config?.host) throw new Error(`git_local_only: the Git tab reads this machine's folders, and this window's agents run on ${S.config.host}`);
-  S.ui.gitFrom.set(dir, who);
+  // The agent it was opened from, by identity: another bot later given its name is not it.
+  S.ui.gitFrom.set(dir, [who, b.id]);
   await go(GIT + dir, 'tab');
 }
 const noteKey = (of, r) => `${of}\u0000${r.p ?? ''}\u0000${r.k === 'del' ? `o${r.o}` : `n${r.n}`}`;
@@ -1911,10 +1912,20 @@ function noteText(g, r, text) {
   const line = r.t.slice(1), quote = line.length > NOTE_QUOTE ? `${line.slice(0, NOTE_QUOTE)}…` : line;
   return `${g.panel === 'commits' ? `In commit ${it.sha.slice(0, 12)}, ` : ''}${where}\n> ${quote}\n${text}`;
 }
+// The row a note is on, in the diff as read now: a read again while it is typed (an agent finished a
+// step) can move the line, so it is found again by what it holds, the nearest such row; -1 when it
+// is gone, and the note then names the line as it was clicked.
+function noteRow(g) {
+  const note = g.note, d = g.diff; if (!note || d?.of !== note.of) return -1;
+  const same = (r) => r && r.k === note.r.k && r.p === note.r.p && r.t === note.r.t;
+  if (same(d.rows[note.row])) return note.row;
+  let best = -1; d.rows.forEach((r, i) => { if (same(r) && (best < 0 || Math.abs(i - note.row) < Math.abs(best - note.row))) best = i; });
+  return best;
+}
 async function sendNote(g, text) {
-  const note = g.note, d = g.diff, r = d?.rows[note?.row], owner = gitOwner(g.dir);
+  const note = g.note, d = g.diff, at = noteRow(g), r = at >= 0 ? d.rows[at] : note?.r, owner = gitOwner(g.dir);
   g.note = null;
-  if (!text || !r || !owner || d.of !== note.of) { render(); return; }
+  if (!text || !r || !owner || d?.of !== note.of) { render(); return; }
   try {
     // A note waits for a working agent's turn to end, as a queued message does.
     await submit(noteText(g, r, text), 'main', owner.name, isActive(owner.status) ? 'queue' : 'send');
@@ -1927,7 +1938,7 @@ function openNote(g, row) {
   const d = g.diff, r = d?.rows[row]; if (!r || !['add', 'del', 'ctx'].includes(r.k)) return;
   const owner = gitOwner(g.dir);
   if (!owner) { toast('No agent works in this folder, so a note has no one to go to'); return; }
-  g.note = { row, of: d.of }; g.draft = ''; g.gen += 1; render();
+  g.note = { row, of: d.of, r }; g.draft = ''; g.gen += 1; render();
   setTimeout(() => $('gnote')?.focus(), 0);
 }
 // j/k and the arrows move, 1-3 or h/l choose a list, Enter opens what is chosen, o its agent, r reads again.
@@ -1980,13 +1991,17 @@ function gitDiffHTML(g) {
   if (!d || (d.state === 'loading' && !d.rows.length)) return `${head}<div class="gnote">reading…</div>`;
   if (d.state === 'error') return `${head}<div class="line out bad">${esc(d.error)}</div>`;
   const owner = gitOwner(g.dir), sent = (r) => (g.notes.get(noteKey(d.of, r)) ?? []).map((t) => `<div class="dsent">› ${esc(t)}</div>`).join('');
-  const rows = d.rows.map((r, i) => {
+  const at = owner ? noteRow(g) : -1;
+  const input = (what) => `<div class="dcm"><input id="gnote" placeholder="Tell ${esc(shortName(owner))} about ${what}…" autocomplete="off" spellcheck="false" aria-label="Note on this line"><span class="to">↵ to ${esc(shortName(owner))} · Esc</span></div>`;
+  // A note whose line is gone from the diff stays open above it, on the line as it was clicked.
+  const lost = owner && g.note?.of === d.of && at < 0 ? input(`the line it was: ${g.note.r.t.slice(0, 60)}`) : '';
+  const rows = lost + d.rows.map((r, i) => {
     // A change's one file is named above it already.
     if (r.k === 'file' && g.panel === 'changes') return '';
     const line = r.k === 'add' || r.k === 'del' || r.k === 'ctx';
     let h = `<div class="dl ${r.k}"${line && owner ? ` data-dl="${i}"` : ''}><span class="no">${r.o ?? ''}</span><span class="no">${r.n ?? ''}</span><span class="tx">${esc(r.t)}</span></div>`;
     if (line) h += sent(r);
-    if (g.note?.row === i && g.note.of === d.of) h += `<div class="dcm"><input id="gnote" placeholder="Tell ${esc(shortName(owner))} about this line…" autocomplete="off" spellcheck="false" aria-label="Note on this line"><span class="to">↵ to ${esc(shortName(owner))} · Esc</span></div>`;
+    if (i === at) h += input('this line');
     return h;
   }).join('');
   const tail = (d.more ? `<div class="gnote">${d.more} more lines</div>` : '') + (d.cut ? '<div class="gnote">The diff goes on; the rest is not shown.</div>' : '');
