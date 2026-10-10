@@ -314,8 +314,9 @@ fn setup(windows: State<'_, Windows>, window: tauri::WebviewWindow) -> Result<Va
 }
 
 /// The shared client policy for a workspace (the app's own by default),
-/// composed now so an edited AGENTS.md reaches the next bot: preamble,
-/// AGENTS.md files, skills and profiles, and the role `profile` names.
+/// composed now so an edited AGENTS.md or saved memory reaches the next
+/// bot: preamble, AGENTS.md files, skills and profiles, the person's and
+/// the project's memory indexes, and the role `profile` names.
 #[tauri::command]
 fn policy(
     windows: State<'_, Windows>,
@@ -324,7 +325,7 @@ fn policy(
     profile: Option<String>,
 ) -> Result<Value, String> {
     let state = windows.of(&window)?;
-    state.here("Composing an agent's instructions (AGENTS.md, skills, profiles)")?;
+    state.here("Composing an agent's instructions (AGENTS.md, skills, profiles, memory)")?;
     let dir = match workspace.or_else(|| state.config.workspace.clone()) {
         Some(dir) => workspace_path(std::path::Path::new(&dir))?,
         None => return Err("no workspace".into()),
@@ -353,7 +354,7 @@ fn profiles(
     let dir = workspace_path(std::path::Path::new(&dir))?;
     let failed = |error: agent_client::policy::Failure| format!("{}: {error}", error.code());
     let workspace = std::path::Path::new(&dir);
-    let listed = agent_client::policy::instructions(workspace, None).map_err(failed)?;
+    let listed = agent_client::policy::instructions(workspace, None, &[]).map_err(failed)?;
     let mut out = Vec::new();
     // The app's own roles are client roles, which the index leaves out.
     for entry in listed.profiles {
@@ -889,12 +890,15 @@ fn compose(
             .collect::<Vec<_>>()
             .join("\n\n");
     }
-    let composed = agent_client::policy::instructions(workspace, role.as_ref()).map_err(failed)?;
+    let memory = memory::indexes(workspace)?;
+    let composed =
+        agent_client::policy::instructions(workspace, role.as_ref(), &memory).map_err(failed)?;
     let mut note = format!(
-        "preamble + {} AGENTS.md + {} skills + {} profiles",
+        "preamble + {} AGENTS.md + {} skills + {} profiles + {} memory indexes",
         composed.sources.len(),
         composed.skills.len(),
-        composed.profiles.len()
+        composed.profiles.len(),
+        composed.memory.len()
     );
     if let Some(role) = &role {
         let from = role.path.as_ref().map_or_else(

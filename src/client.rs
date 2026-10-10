@@ -753,7 +753,7 @@ fn composed_instructions(
         return Ok(text.clone());
     }
     if options.agents || role.is_some() {
-        return agent_client::policy::instructions(std::path::Path::new(workspace), role)
+        return agent_client::policy::instructions(std::path::Path::new(workspace), role, &[])
             .map(|composed| composed.text)
             .map_err(|error| Error::with(error.code(), error.to_string()));
     }

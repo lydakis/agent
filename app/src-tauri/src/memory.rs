@@ -188,10 +188,14 @@ fn run(
 
 /// The project a folder belongs to: the nearest `.agents/project.toml` at or
 /// above it. A task's worktree is another checkout of its project's
-/// repository, so a folder in one is first moved to the same place in the
-/// repository's main checkout, where the project's file is.
+/// repository, without the project's file when it is not committed, so a
+/// folder where none is found is moved to the same place in the
+/// repository's main checkout and looked up again.
 fn project_of(cwd: &Path) -> Result<String, String> {
-    let mut at = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let at = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    if let Some(name) = nearest_project(&at)? {
+        return Ok(name);
+    }
     let git = std::process::Command::new("git")
         .arg("-C")
         .arg(&at)
@@ -211,20 +215,47 @@ fn project_of(cwd: &Path) -> Result<String, String> {
         if let (Some(common), Some(prefix)) = (lines.next(), lines.next())
             && Path::new(common).file_name().is_some_and(|f| f == ".git")
             && let Some(main) = Path::new(common).parent()
+            && let Some(name) = nearest_project(&main.join(prefix))?
         {
-            at = main.join(prefix);
-        }
-    }
-    for dir in at.ancestors() {
-        if dir.join(crate::project::FILE).is_file() {
-            let project = crate::project::read(dir)?;
-            return Ok(project["name"].as_str().unwrap_or_default().to_owned());
+            return Ok(name);
         }
     }
     Err(format!(
         "project_unknown: {}: no .agents/project.toml at or above this folder; pass --project NAME or --user",
         at.display()
     ))
+}
+
+fn nearest_project(at: &Path) -> Result<Option<String>, String> {
+    for dir in at.ancestors() {
+        if dir.join(crate::project::FILE).is_file() {
+            let project = crate::project::read(dir)?;
+            return Ok(Some(
+                project["name"].as_str().unwrap_or_default().to_owned(),
+            ));
+        }
+    }
+    Ok(None)
+}
+
+/// The memory indexes a new agent in `workspace` starts with: the
+/// person's, then its project's when it is in one. An index not written
+/// yet is left out when the instructions are composed.
+pub fn indexes(workspace: &Path) -> Result<Vec<PathBuf>, String> {
+    let root = std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".agents/memory"))
+        .ok_or("memory_failed: no HOME")?;
+    indexes_in(&root, workspace)
+}
+
+fn indexes_in(root: &Path, workspace: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut found = vec![root.join(INDEX)];
+    match project_of(workspace) {
+        Ok(name) => found.push(root.join("projects").join(name).join(INDEX)),
+        Err(error) if error.starts_with("project_unknown: ") => {}
+        Err(error) => return Err(error),
+    }
+    Ok(found)
 }
 
 /// The local date, for a fact's `verified`.
@@ -809,6 +840,12 @@ mod tests {
         assert_eq!(project_of(&repo.join("web")).unwrap(), "demo");
         let unknown = project_of(&repo).unwrap_err();
         assert!(unknown.starts_with("project_unknown: "), "{unknown}");
+        // A new agent starts with the person's index and its project's.
+        assert_eq!(
+            indexes_in(&root, &worktree.join("web")).unwrap(),
+            [root.join(INDEX), root.join("projects/demo").join(INDEX)]
+        );
+        assert_eq!(indexes_in(&root, &repo).unwrap(), [root.join(INDEX)]);
         let save = |cwd: &Path, scope: &[&str]| {
             let mut line = vec![
                 "save",

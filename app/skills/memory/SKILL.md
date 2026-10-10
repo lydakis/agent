@@ -24,8 +24,11 @@ itself is `NAME.md` in the same folder.
 
 ## Reading
 
-Before starting work, run `"$HOME/.agent/memory" show`. It prints both
-indexes as JSON: `user` and `project`, each with its folder's absolute
+An agent the app creates starts with both indexes in its instructions,
+each under `# Memory in DIR`, as they were when it was made. When there is
+no such section, or yours may be out of date because the agent has been
+running a while, run `"$HOME/.agent/memory" show`. It prints both indexes
+as JSON: `user` and `project`, each with its folder's absolute
 `dir` and its `index` text, and the project's `name`. `project` is null
 outside a project. Open a fact's file, `DIR/NAME.md`, with the `read` tool
 when its description bears on the task. An empty index means nothing is

@@ -668,6 +668,7 @@ mod tests {
             reply_to: None,
             gate: None,
             runs: None,
+            turn_budget_tokens: None,
             turn_end: Some((source.into(), 5)),
             count,
             file: None,
