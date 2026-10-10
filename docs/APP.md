@@ -57,6 +57,24 @@ trades it for the agents), and Enter opens the pick in a tab.
 ![The finder's files](app/file-find.png)
 ![session.rs in a tab, highlighted](app/file-code-tab.png)
 
+### Git
+
+Captured 2026-10-10. An agent's ⎇ branch, or Git in its ⋯ menu, opens its
+folder's Git tab: changes, commits and worktrees on the left, the chosen diff
+on the right.
+
+![build's worktree: three changes, session.rs's diff](app/git-changes.png)
+
+A click on a diff line writes a note; Enter sends it to the agent working
+there, which reads the file, line and quoted text first.
+
+![A note on an added line of mod.rs, going to build](app/git-note.png)
+![The note in build's chat, and its answer](app/git-agent.png)
+
+2 shows a commit's diff, file by file.
+
+![The worktree's newest commit](app/git-commit.png)
+
 ### Home
 
 Captured 2026-10-10. The first message sent at Home asks for the model and
@@ -1713,6 +1731,41 @@ made. Over 100,000 synthetic paths in Node 22 (mock DOM, 4 cores,
 2026-10-10), a key costs 5–10 ms when nothing matches and about 20 ms when
 everything does; the listing's lowercase copy, once per opening, about
 65–95 ms. Ctrl-P still puts the next task beside.
+
+The Git tab is lazygit's layout for an agent's folder, read only: an agent
+commits its own work, so the tab shows it and carries a note back. It opens
+from the ⎇ branch in an agent's head (a linked worktree's) or Git in any
+agent's ⋯ menu, keyed by the folder (after `⎇`) and saved with the tabs like a
+file tab: no composer, Home's list beside it. The core (`git_view`) runs plain
+git at the repository's top, named as for ⌘P: `status --porcelain=v1 -z
+--branch --untracked-files=all` read record by record up to 2,000 changes or
+4 MiB (a cut list says so), `log -z -n50`, and `worktree list --porcelain -z`
+(at most 200). `git_diff` diffs one change against the last commit, staged and
+not (`diff -M HEAD -- [from] path`, the empty tree before the first commit),
+an untracked file against nothing (`--no-index /dev/null`), or a commit against
+its first parent (`show --diff-merges=first-parent`, a hex sha only), with
+`--literal-pathspecs`, no external diff or textconv, and no optional locks, so
+it never holds a lock an agent's own git waits on. A diff stops at 1 MiB, cut
+at a line, and git is stopped there; the page draws at most 5,000 rows and
+counts the rest. Only the tab in view holds what it read; one out of view keeps
+which rows were chosen and its sent notes. It reads when it comes into view, on `r`
+or ↻, when the window comes back, and 600 ms after a step or turn of an agent
+working in its repository ends (once for a burst). One diff is read at a time;
+moving down a list fast reads the row it stops on. A window on a host refuses,
+as for files.
+
+j/k and the arrows move, 1–3 or h/l choose a list, Enter opens a change's file
+in a tab or another worktree's Git tab, o opens the agent. A click on an added,
+removed or unchanged line opens a note under it; Enter sends it and Escape
+puts it away. The note is an ordinary message from you to the agent working in
+the folder: the one the tab was opened from, else one working now, else the
+project's coordinator. It names the file as that agent's folder does (in full
+when the agent works in a folder inside the repository), the line on its side
+of the change (`src/a.rs:11`, or `line 11 before the change (removed)`), and
+the commit for a commit's diff, then quotes the line (300 characters at most)
+and says what was typed. To a working agent it queues behind the running
+turn. A sent note stays under its line while the tab is open. A folder no
+agent works in takes no notes.
 
 What a model writes never becomes the app's markup unparsed. Raw HTML inside
 Markdown shows as text. Links open in the default browser and only for `http`,

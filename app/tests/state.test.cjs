@@ -36,7 +36,7 @@ function page(daemon = {}, storage = null) {
   context.Rich = context.window.Rich;
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, openFileFrom, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, fork, remove, createProject, save, restore, showMenu, refreshMenu, entries, pickerRows, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readTriggers, tellLead, markSeen, renderFile, go, upOf, crumbsHTML, railRows, renderTabs, triggerAct, turnNews, openProjectSheet, parsePlan, loadPlans, renderPlan, taskCard, mainBot, closeSheet, openPicker, pickerMode, renderPicker, keyLabel };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, openFileFrom, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, fork, remove, createProject, save, restore, showMenu, refreshMenu, entries, pickerRows, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readTriggers, tellLead, markSeen, renderFile, go, upOf, crumbsHTML, railRows, renderTabs, triggerAct, turnNews, openProjectSheet, parsePlan, loadPlans, renderPlan, taskCard, mainBot, closeSheet, openPicker, pickerMode, renderPicker, keyLabel, gitTab, readGit, diffRows, gitOwner, forgetStore };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -1644,8 +1644,12 @@ test('one menu per agent: side chat any time, stop while running, fork and delet
   p.upsert({ name: 'busy', bot_id: 1, provider: 'alpha', model: 'one', status: 'running', running_turn: 4 });
   p.upsert({ name: 'rest', bot_id: 2, provider: 'alpha', model: 'one' });
   const state = (name) => Object.fromEntries(p.botMenuItems(name).filter((i) => i.act).map((i) => [i.act, !i.disabled]));
-  assert.deepEqual(state('busy'), { 'open-tab': true, 'side-chat': true, stop: true, fork: false, delete: false, steps: true });
-  assert.deepEqual(state('rest'), { 'open-tab': true, 'side-chat': true, stop: false, fork: true, delete: true, steps: true });
+  assert.deepEqual(state('busy'), { 'open-tab': true, 'side-chat': true, git: false, stop: true, fork: false, delete: false, steps: true });
+  assert.deepEqual(state('rest'), { 'open-tab': true, 'side-chat': true, git: false, stop: false, fork: true, delete: true, steps: true });
+  // Git opens an agent's folder, on this machine.
+  p.upsert({ name: 'here', bot_id: 3, provider: 'alpha', model: 'one', workspace: '/w' });
+  assert.equal(state('here').git, true);
+  p.S.config.host = 'box'; assert.equal(state('here').git, false);
   p.S.ui.tabs.push('rest'); assert.equal(state('rest')['open-tab'], false, 'an agent in a tab already has one');
 });
 
@@ -3812,4 +3816,205 @@ test("a deleted agent's plan goes with it, and a window that cannot read plans s
   const remote = page({ plans: async () => { calls += 1; return {}; } });
   remote.S.config = { host: 'box' }; await remote.loadPlans();
   assert.equal(calls, 2);
+});
+
+// ---------- the Git tab ----------
+const GIT_VIEW = {
+  root: '/w', branch: 'agent/x...origin/agent/x [ahead 1]',
+  changes: [{ code: ' M', path: 'src/a.rs', from: null }, { code: 'R ', path: 'src/c.rs', from: 'src/b.rs' }, { code: '??', path: 'notes.md', from: null }],
+  more: false,
+  commits: [{ sha: 'abcdef0123456789abcdef0123456789abcdef01', subject: 'Make a pure', author: 'x', when: '2 minutes ago' }],
+  worktrees: [{ path: '/repo', branch: 'main' }, { path: '/w', branch: 'agent/x' }],
+};
+const A_DIFF = 'diff --git a/src/a.rs b/src/a.rs\nindex 1..2 100644\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -10,3 +10,3 @@ fn a()\n keep\n-old line\n+new line\n';
+function gitPage(extra = {}) {
+  const sent = [], diffs = [];
+  const p = page({ request: async (op, params) => { if (op === 'submit') sent.push(params); return { nodes: [], workspaces: [], next_from: null }; }, gitView: async () => structuredClone(GIT_VIEW), gitDiff: async (args) => { diffs.push(args); return { text: args.commit ? `diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-x\n+y\ndiff --git a/src/z.rs b/src/z.rs\nnew file mode 100644\n--- /dev/null\n+++ b/src/z.rs\n@@ -0,0 +1,2 @@\n+one\n+two\n` : A_DIFF, cut: false }; }, ...extra });
+  p.S.session = 1; p.S.config = { workspace: '/synthetic' };
+  p.upsert({ name: 'x', bot_id: 1, provider: 'alpha', model: 'one', workspace: '/w' });
+  p.upsert({ name: 'lead', bot_id: 2, provider: 'alpha', model: 'one', workspace: '/repo' });
+  return { p, sent, diffs, doc: p.context.document };
+}
+const key = (doc, k) => doc.listeners.keydown({ key: k, target: { id: '', closest: () => null }, preventDefault() {} });
+
+test("an agent's Git tab lists its folder's changes, commits and worktrees, and shows the chosen diff", async () => {
+  const { p, diffs, doc } = gitPage();
+  await p.go('x');
+  await p.act({ dataset: { act: 'git', who: 'x' } }); await settle();
+  assert.equal(p.S.selected, '⎇/w'); assert.deepEqual([...p.S.ui.tabs], ['x', '⎇/w']);
+  assert.equal(p.keyLabel('⎇/w'), 'w'); assert.equal(p.mainBot(), '');
+  assert.equal(doc.getElementById('form').hidden, true, 'a Git tab has no composer');
+  const log = doc.getElementById('log').innerHTML;
+  assert.match(log, /\[1\]<\/span> Changes/); assert.match(log, /src\/b\.rs → src\/c\.rs/); assert.match(log, /Make a pure/);
+  assert.match(log, /class="dl del"[^>]*><span class="no">11<\/span><span class="no"><\/span><span class="tx">-old line/);
+  assert.match(log, /class="dl add"[^>]*><span class="no"><\/span><span class="no">11<\/span>/);
+  assert.match(doc.getElementById('title').innerHTML, /agent\/x\.\.\.origin\/agent\/x \[ahead 1\]/);
+  assert.match(doc.getElementById('title').innerHTML, /notes go to <button[^>]*data-who="x"/);
+  // The worktree it shows is the one chosen there.
+  assert.equal(p.S.ui.git.get('/w').sel.worktrees, 1);
+  // j moves down; a rename is diffed with its old path, a new file as untracked.
+  await key(doc, 'j'); await settle();
+  assert.deepEqual({ ...diffs.at(-1) }, { root: '/w', path: 'src/c.rs', from: 'src/b.rs', untracked: false });
+  await key(doc, 'j'); await settle();
+  assert.deepEqual({ ...diffs.at(-1) }, { root: '/w', path: 'notes.md', from: null, untracked: true });
+  // 2 shows the commit's diff; 3 the worktrees, where Enter opens another's Git tab.
+  await key(doc, '2'); await settle();
+  assert.deepEqual({ ...diffs.at(-1) }, { root: '/w', commit: GIT_VIEW.commits[0].sha });
+  assert.match(doc.getElementById('log').innerHTML, /src\/z\.rs/);
+  await key(doc, '3'); await key(doc, 'k'); await key(doc, 'Enter'); await settle();
+  assert.equal(p.S.selected, '⎇/repo');
+  // Enter on a change opens its file in a tab, from the repository's top.
+  await p.go('⎇/w'); await key(doc, '1'); await key(doc, 'g'); await key(doc, 'Enter'); await settle();
+  assert.equal(p.S.selected, '▤/w/src/a.rs');
+  // A closed Git tab lets its view go.
+  await p.go('⎇/w', 'close'); assert.equal(p.S.ui.git.has('/w'), false);
+});
+
+test("a conflict's surviving file opens, a deleted one does not, and a new store forgets its Git tabs", async () => {
+  const view = { ...structuredClone(GIT_VIEW), changes: [{ code: 'UD', path: 'kept.rs', from: null }, { code: ' D', path: 'gone.rs', from: null }] };
+  const { p, doc } = gitPage({ gitView: async () => structuredClone(view) });
+  await p.go('⎇/w', 'tab'); await settle();
+  await key(doc, 'j'); await key(doc, 'Enter'); await settle();
+  assert.equal(p.S.selected, '⎇/w');
+  await p.go('⎇/w'); await key(doc, 'g'); await key(doc, 'Enter'); await settle();
+  assert.equal(p.S.selected, '▤/w/kept.rs');
+  p.forgetStore(); assert.equal(p.S.ui.git.size, 0);
+});
+
+test('a note on a diff line goes to the agent in that folder, naming the file and line', async () => {
+  const { p, sent, doc } = gitPage();
+  await p.go('⎇/w', 'tab'); await settle();
+  const g = p.S.ui.git.get('/w'), rows = g.diff.rows, at = rows.findIndex((r) => r.k === 'add');
+  const click = (sel, el) => doc.listeners.click({ detail: 1, target: { closest: (s) => (s === sel ? el : s === '#log' ? {} : null) } });
+  await click('[data-dl]', { dataset: { dl: String(at) } }); await settle();
+  assert.deepEqual([g.note.row, g.note.of], [at, 'c:src/a.rs']);
+  assert.match(doc.getElementById('log').innerHTML, /id="gnote" placeholder="Tell x about this line…"/);
+  await doc.listeners.keydown({ key: 'Enter', target: { id: 'gnote', value: ' make it const ', closest: () => null }, preventDefault() {} }); await settle();
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].bot, 'x'); assert.equal(sent[0].delivery, 'reject');
+  assert.equal(sent[0].prompt, 'src/a.rs:11\n> new line\nmake it const');
+  assert.match(doc.getElementById('log').innerHTML, /<div class="dsent">› make it const<\/div>/);
+  // A removed line is named as it was; to a working agent the note waits for its turn to end.
+  p.S.bots.get('x').status = 'running';
+  const del = rows.findIndex((r) => r.k === 'del');
+  await click('[data-dl]', { dataset: { dl: String(del) } });
+  await doc.listeners.keydown({ key: 'Enter', target: { id: 'gnote', value: 'why?', closest: () => null }, preventDefault() {} }); await settle();
+  assert.equal(sent[1].delivery, 'queue');
+  assert.equal(sent[1].prompt, 'src/a.rs, line 11 before the change (removed)\n> old line\nwhy?');
+  // A commit's note names the commit, and Escape puts a note away unsent.
+  await key(doc, '2'); await settle();
+  const crow = g.diff.rows.findIndex((r) => r.k === 'add' && r.p === 'src/z.rs');
+  p.S.bots.get('x').status = 'idle';
+  await click('[data-dl]', { dataset: { dl: String(crow) } });
+  await doc.listeners.keydown({ key: 'Enter', target: { id: 'gnote', value: 'test this', closest: () => null }, preventDefault() {} }); await settle();
+  assert.equal(sent[2].prompt, 'In commit abcdef012345, src/z.rs:1\n> one\ntest this');
+  await click('[data-dl]', { dataset: { dl: String(crow) } });
+  await doc.listeners.keydown({ key: 'Escape', target: { id: 'gnote', value: 'never mind', closest: () => null }, preventDefault() {} });
+  assert.equal(g.note, null); assert.equal(sent.length, 3);
+});
+
+test("a note from a Git tab of a repository's subfolder agent names the file in full, and a folder no agent works in takes none", async () => {
+  const { p, sent, doc } = gitPage();
+  p.upsert({ name: 'sub', bot_id: 3, provider: 'alpha', model: 'one', workspace: '/w/src' });
+  await p.act({ dataset: { act: 'git', who: 'sub' } }); await settle();
+  const g = p.S.ui.git.get('/w/src'), at = g.diff.rows.findIndex((r) => r.k === 'add');
+  assert.equal(p.gitOwner('/w/src').name, 'sub');
+  doc.listeners.click({ detail: 1, target: { closest: (s) => (s === '[data-dl]' ? { dataset: { dl: String(at) } } : s === '#log' ? {} : null) } });
+  await doc.listeners.keydown({ key: 'Enter', target: { id: 'gnote', value: 'n', closest: () => null }, preventDefault() {} }); await settle();
+  assert.equal(sent[0].bot, 'sub'); assert.match(sent[0].prompt, /^\/w\/src\/a\.rs:11\n/);
+  await p.go('⎇/nobody', 'tab'); await settle();
+  assert.doesNotMatch(doc.getElementById('log').innerHTML, /data-dl=/);
+  assert.doesNotMatch(doc.getElementById('title').innerHTML, /notes go to/);
+});
+
+test("the Git tab in view is read again soon after an agent in its repository finishes a step, once for a burst", async () => {
+  let reads = 0;
+  const { p } = gitPage({ gitView: async () => { reads++; return structuredClone(GIT_VIEW); } });
+  p.upsert({ name: 'far', bot_id: 3, provider: 'alpha', model: 'one', workspace: '/elsewhere' });
+  await p.go('⎇/w', 'tab'); await settle();
+  assert.equal(reads, 1);
+  p.S.live = true;
+  for (const call of ['c1', 'c2']) await p.onEvent({ event: 'tool_completed', bot: 'x', turn: 1, data: { call_id: call } });
+  await p.onEvent({ event: 'tool_completed', bot: 'far', turn: 1, data: { call_id: 'c3' } });
+  await p.tick();
+  assert.equal(reads, 2);
+  await p.onEvent({ event: 'tool_completed', bot: 'far', turn: 1, data: { call_id: 'c4' } }); await p.tick();
+  assert.equal(reads, 2, 'an agent working elsewhere changes nothing here');
+});
+
+test('Git tabs come back after a restart', () => {
+  const storage = new Map(), a = shell({}, storage);
+  a.S.ui.tabs.push('⎇/w'); a.S.selected = '⎇/w'; a.save();
+  const b = shell({}, storage); b.restore();
+  assert.deepEqual([...b.S.ui.tabs], ['⎇/w']); assert.equal(b.S.selected, '⎇/w');
+});
+
+test('a diff is read into numbered rows, each knowing its file, up to a bound', () => {
+  const p = shell();
+  const { rows } = p.diffRows('diff --git a/x b/x\nindex 1..2\n--- a/x\n+++ b/x\n@@ -3,2 +3,2 @@\n a\n-b\n+c\n\\ No newline at end of file\ndiff --git a/y b/y\ndeleted file mode 100644\n--- a/y\n+++ /dev/null\n@@ -1 +0,0 @@\n-gone\n', null);
+  assert.deepEqual(Array.from(rows, (r) => [r.k, r.o ?? null, r.n ?? null, r.p ?? null]), [
+    ['file', null, null, null], ['hunk', null, null, null], ['ctx', 3, 3, 'x'], ['del', 4, null, 'x'], ['add', null, 4, 'x'], ['meta', null, null, null],
+    ['meta', null, null, null], ['file', null, null, null], ['hunk', null, null, null], ['del', 1, null, 'y'],
+  ]);
+  assert.equal(rows[0].t, 'x'); assert.equal(rows[7].t, 'y');
+  // A renamed file's removed lines were in the file it was renamed from.
+  const moved = p.diffRows('diff --git a/old.rs b/new.rs\nsimilarity index 90%\nrename from old.rs\nrename to new.rs\n--- a/old.rs\n+++ b/new.rs\n@@ -1,2 +1,2 @@\n a\n-b\n+c\n', 'new.rs').rows;
+  assert.deepEqual(Array.from(moved.filter((r) => r.p), (r) => [r.k, r.p]), [['ctx', 'new.rs'], ['del', 'old.rs'], ['add', 'new.rs']]);
+  const long = p.diffRows(`@@ -1,0 +1,6000 @@\n${'+l\n'.repeat(6000)}`, 'z');
+  assert.equal(long.rows.length, 5000); assert.equal(long.more, 1001);
+});
+
+test('a sent note shows under the one line it is about when the diff holds the same line twice', async () => {
+  const { p, doc } = gitPage({ gitDiff: async () => ({ text: 'diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,0 +1,4 @@\n+}\n+x\n+}\n+y\n', cut: false }) });
+  await p.go('⎇/w', 'tab'); await settle();
+  const g = p.S.ui.git.get('/w'), second = g.diff.rows.findLastIndex((r) => r.t === '+}');
+  doc.listeners.click({ detail: 1, target: { closest: (s) => (s === '[data-dl]' ? { dataset: { dl: String(second) } } : s === '#log' ? {} : null) } });
+  await doc.listeners.keydown({ key: 'Enter', target: { id: 'gnote', value: 'this one', closest: () => null }, preventDefault() {} }); await settle();
+  const html = doc.getElementById('log').innerHTML;
+  assert.equal(html.match(/class="dsent"/g).length, 1);
+  assert.match(html, /<span class="no">3<\/span><span class="tx">\+\}<\/span><\/div><div class="dsent">› this one<\/div>/);
+});
+
+test('a note keeps the line it was opened on when the diff is read again under it, and goes to the agent that opened the tab only while it is that agent', async () => {
+  let text = A_DIFF;
+  const { p, sent, doc } = gitPage({ gitDiff: async () => ({ text, cut: false }) });
+  p.upsert({ name: 'y', bot_id: 3, provider: 'alpha', model: 'one', workspace: '/w' });
+  await p.act({ dataset: { act: 'git', who: 'y' } }); await settle();
+  const g = p.S.ui.git.get('/w'), at = g.diff.rows.findIndex((r) => r.k === 'add');
+  doc.listeners.click({ detail: 1, target: { closest: (s) => (s === '[data-dl]' ? { dataset: { dl: String(at) } } : s === '#log' ? {} : null) } });
+  // An agent's step adds two lines above it while the note is typed.
+  text = A_DIFF.replace(' keep\n', ' keep\n+first\n+second\n');
+  await p.readGit(g); await settle();
+  assert.match(doc.getElementById('log').innerHTML, /new line<\/span><\/div><div class="dcm">/);
+  await doc.listeners.keydown({ key: 'Enter', target: { id: 'gnote', value: 'n', closest: () => null }, preventDefault() {} }); await settle();
+  assert.equal(sent[0].bot, 'y'); assert.equal(sent[0].prompt, 'src/a.rs:13\n> new line\nn');
+  // y deleted and its name given to another bot: the note goes by the folder's rule instead.
+  p.forgetBot('y'); p.upsert({ name: 'y', bot_id: 9, provider: 'alpha', model: 'one', workspace: '/w' });
+  assert.equal(p.gitOwner('/w').name, 'x');
+  // A worktree whose agent works in a project below its top is that agent's.
+  p.upsert({ name: 'sub', bot_id: 10, provider: 'alpha', model: 'one', workspace: '/t/app' });
+  assert.equal(p.gitOwner('/t').name, 'sub'); assert.equal(p.gitOwner('/t/app').name, 'sub'); assert.equal(p.gitOwner('/tx'), null);
+});
+
+test('a Git tab out of view lets its lists and diff go and reads them again, on the same rows, when shown', async () => {
+  let reads = 0;
+  const { p, doc } = gitPage({ gitView: async () => { reads++; return structuredClone(GIT_VIEW); } });
+  await p.go('x'); await p.act({ dataset: { act: 'git', who: 'x' } }); await settle();
+  await key(doc, 'j'); await settle();
+  const g = p.S.ui.git.get('/w');
+  await p.go('x'); await settle();
+  assert.equal(g.view, null); assert.equal(g.diff, null);
+  await p.go('⎇/w'); await settle();
+  assert.equal(reads, 2); assert.equal(g.sel.changes, 1); assert.equal(g.diff.of, 'c:src/c.rs');
+});
+
+test('a row chosen while the Git tab is being read again stays chosen', async () => {
+  let gate = null;
+  const { p, doc } = gitPage({ gitView: async () => { if (gate) await gate.promise; return structuredClone(GIT_VIEW); } });
+  await p.go('⎇/w', 'tab'); await settle();
+  const g = p.S.ui.git.get('/w');
+  gate = deferred(); const reading = p.readGit(g);
+  await key(doc, 'j'); await key(doc, 'j');
+  gate.resolve(); await reading; await settle();
+  assert.equal(g.sel.changes, 2); assert.equal(g.diff.of, 'c:?notes.md');
 });

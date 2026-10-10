@@ -25,6 +25,8 @@ window.Daemon = (() => {
       branch: (dir) => invoke('branch', { dir }),
       readFile: (path) => invoke('read_file', { path }),
       listFiles: (dir) => invoke('list_files', { dir }),
+      gitView: (dir) => invoke('git_view', { dir }),
+      gitDiff: ({ root, path = null, from = null, untracked = false, commit = null }) => invoke('git_diff', { root, path, from, untracked, commit }),
       attach: (after) => invoke('attach', { after }),
       replaceDaemon: () => invoke('replace_daemon'),
       pull: (session) => invoke('pull', { session }),
@@ -482,6 +484,33 @@ window.Daemon = (() => {
     // The demo's repository is its files, under whichever folder asks.
     listFiles: async (dir) => ({ root: dir, files: Object.keys(FILES).sort(), more: false }),
     branch: async (dir) => { const m = /\/worktrees\/([^/]+)$/.exec(dir ?? ''); return m ? `agent/${m[1]}` : null; },
+    // The demo's repository: the project folder on main and each task's worktree on its branch, with
+    // the changes a task that edits leaves before it commits.
+    gitView: async (dir) => {
+      const m = /\/worktrees\/([^/]+)$/.exec(dir ?? ''), trees = [...S.bots.values()].map((b) => b.workspace).filter((w) => /\/worktrees\//.test(w ?? ''));
+      return {
+        root: dir, branch: m ? `agent/${m[1]}` : 'main...origin/main',
+        changes: m ? [{ code: ' M', path: 'src/auth/session.rs', from: null }, { code: 'M ', path: 'src/server/mod.rs', from: null }, { code: '??', path: 'report/latency.vl.json', from: null }] : [],
+        more: false,
+        commits: [
+          ...(m ? [{ sha: 'c41d9e2f7a0b3c5d6e7f8091a2b3c4d5e6f70812', subject: 'Write the session cookie once, after the store commits', author: m[1], when: '4 minutes ago' }] : []),
+          { sha: '8a1f03b6c2d4e5f60718293a4b5c6d7e8f901234', subject: 'Plan the login fix', author: 'you', when: '2 hours ago' },
+          { sha: '3e9b77d0a1b2c3d4e5f60718293a4b5c6d7e8f90', subject: 'Add the session store', author: 'you', when: '3 days ago' },
+        ],
+        worktrees: [{ path: '/workspace', branch: 'main' }, ...[...new Set(trees)].map((w) => ({ path: w, branch: `agent/${w.split('/').pop()}` }))],
+      };
+    },
+    gitDiff: async ({ path, commit }) => {
+      await wait(60);
+      const session = ['@@ -1,8 +1,9 @@', ' use crate::store::{Store, SessionId};', ' ', '-/// Rotates the token and reissues the cookie.', '+/// Rotates the token and writes the cookie once, after the store commits.', ' pub fn refresh_session(store: &Store, id: SessionId) -> Result<Cookie> {', '-    let token = rotate_and_set_cookie(store, id)?;', '+    let token = rotate(store, id)?; // pure: no cookie here', '+    store.commit()?;', '     Ok(Cookie::new("session", token).http_only(true).secure(true))', ' }', ' '];
+      const server = ['@@ -3,6 +3,7 @@', ' pub async fn dispatch(op: Op, store: &Store) -> Reply {', '     match op {', '         Op::Wait(handles) => registry().defer(handles).await,', '+        Op::Refresh(id) => refresh_session(store, id).into(),', '         op => store.call(op).await,', '     }', ' }'];
+      const file = (p, hunk, mode = '') => [`diff --git a/${p} b/${p}`, ...(mode ? [mode] : []), 'index 1111111..2222222 100644', mode ? '--- /dev/null' : `--- a/${p}`, `+++ b/${p}`, ...hunk];
+      if (commit) return { text: [...file('src/auth/session.rs', session), ...file('src/server/mod.rs', server)].join('\n') + '\n', cut: false };
+      if (path === 'src/server/mod.rs') return { text: file(path, server).join('\n') + '\n', cut: false };
+      if (path === 'src/auth/session.rs') return { text: file(path, session).join('\n') + '\n', cut: false };
+      const lines = (FILES[path] ?? '').replace(/\n$/, '').split('\n');
+      return { text: file(path, [`@@ -0,0 +1,${lines.length} @@`, ...lines.map((l) => `+${l}`)], 'new file mode 100644').join('\n') + '\n', cut: false };
+    },
     swarms: async () => ({ swarms: [...S.swarms.values()].map(swarmRecord), broken: [] }),
     // The demo has no editor to open: Edit only says your copy is now the one read.
     roles: async () => ['coordinator', 'swarm-flat', 'swarm-council', 'home'].map(name => ({ name, file: S.ownRoles?.has(name) ? `/home/you/.agents/agents/${name}.md` : null })),
