@@ -2,9 +2,11 @@
 //! turn ends, for all of them. It connects once per daemon and follows each
 //! of those agents' events; between turn ends it waits on the socket, and
 //! with no daemon there it tries again, at most once a minute. A turn end
-//! that counts starts the trigger's own fire, the one launchd would run,
-//! told why by the `fire` note. Where it is in each agent's events is kept
-//! per trigger (`NAME.watch`), so a restart neither misses nor repeats one.
+//! that counts is an ask in the trigger's queue, saying why, for which
+//! launchd runs its fire, as for `fire NAME`; the watcher runs nothing
+//! itself. Where it is in each agent's events is kept per trigger
+//! (`NAME.watch`), once the ask is on disk, so a restart neither misses one
+//! nor asks twice but for one ask made just before it.
 use super::*;
 use std::collections::HashMap;
 
@@ -15,7 +17,6 @@ const MAX_SENT: usize = 1024;
 /// One turn-end trigger, as the watcher holds it.
 struct Watched {
     trigger: Trigger,
-    app: PathBuf,
     /// The last event of its agent it has counted, or passed over.
     cursor: Option<i64>,
     /// Turn ends counted since it last fired.
@@ -153,7 +154,7 @@ pub fn watch_cli() -> i32 {
         }
     };
     let mut daemons: HashMap<(PathBuf, String), Vec<Watched>> = HashMap::new();
-    for (trigger, app) in read_all(&places).filter_map(|(_, read)| read.ok()) {
+    for (trigger, _) in read_all(&places).filter_map(|(_, read)| read.ok()) {
         if trigger.turn_end.is_none() {
             continue;
         }
@@ -169,7 +170,6 @@ pub fn watch_cli() -> i32 {
             .or_default()
             .push(Watched {
                 trigger,
-                app,
                 cursor,
                 count,
                 done: false,
@@ -199,10 +199,6 @@ pub fn watch_cli() -> i32 {
 async fn follow(places: Places, socket: PathBuf, store: String, mut watched: Vec<Watched>) {
     let log = |error: String| eprintln!("{}", error_json(&error));
     let mut sent = Sent::new();
-    let mut fires = Fires::new();
-    // A fire that ended its own trigger (its runs, its agent gone) says so
-    // here when it exits, so nothing is followed for it after.
-    let (exited, mut exits) = tokio::sync::mpsc::unbounded_channel::<String>();
     let mut wait = Duration::from_secs(1);
     loop {
         if watched.iter().all(|w| w.done) {
@@ -231,40 +227,19 @@ async fn follow(places: Places, socket: PathBuf, store: String, mut watched: Vec
             tokio::time::sleep(MAX_WAIT).await;
             continue;
         }
-        let mut handed = true;
-        loop {
-            tokio::select! {
-                event = events.recv() => {
-                    let Some(event) = event else { break };
-                    for step in step(&mut watched, &mut sent, &event) {
-                        handed &= act(&places, &mut watched, &mut fires, &exited, step);
-                    }
-                }
-                Some(name) = exits.recv() => {
-                    for w in watched.iter_mut().filter(|w| !w.done && w.trigger.name == name) {
-                        // A note it did not take before it exited starts the
-                        // next; with none, it may have ended its trigger.
-                        let next = if places.asked(&name).exists() {
-                            hand_off(&places, w, &mut fires, &exited, None)
-                        } else {
-                            let there = read_trigger(&places.plist(&name)).ok().map(|(t, _)| t);
-                            w.done = there.as_ref() != Some(&w.trigger);
-                            Ok(())
-                        };
-                        if let Err(error) = next {
-                            log(error);
-                        }
-                    }
-                }
+        let mut asked = true;
+        while let Some(event) = events.recv().await {
+            for step in step(&mut watched, &mut sent, &event) {
+                asked &= act(&places, &mut watched, step);
             }
-            if !handed || watched.iter().all(|w| w.done) {
+            if !asked || watched.iter().all(|w| w.done) {
                 break;
             }
         }
         client.close().await;
-        // A fire not handed over: its count and place go back to what is on
-        // disk, and following again from there reads that turn end again.
-        if !handed {
+        // An ask not made: its count and place go back to what is on disk,
+        // and following again from there reads that turn end again.
+        if !asked {
             for w in watched.iter_mut().filter(|w| !w.done) {
                 if let Some((cursor, count)) = read_watched(&places, &w.trigger) {
                     (w.cursor, w.count) = (Some(cursor), count);
@@ -318,18 +293,9 @@ async fn begin(places: &Places, client: &Client, watched: &mut [Watched]) -> Res
     Ok(())
 }
 
-/// The fire each trigger last started, until it exits.
-type Fires = HashMap<String, tokio::task::JoinHandle<()>>;
-
-/// Do one step; false when a fire could not be handed over, so the watcher
-/// reads that turn end again from where it last saved.
-fn act(
-    places: &Places,
-    watched: &mut [Watched],
-    fires: &mut Fires,
-    exited: &tokio::sync::mpsc::UnboundedSender<String>,
-    step: Step,
-) -> bool {
+/// Do one step; false when an ask could not be made, so the watcher reads
+/// that turn end again from where it last saved.
+fn act(places: &Places, watched: &mut [Watched], step: Step) -> bool {
     match step {
         Step::Save(i) => save(places, &watched[i]),
         Step::Gone(i, detail) => {
@@ -356,9 +322,9 @@ fn act(
         }
         Step::Fire(i, why) => {
             let w = &mut watched[i];
-            // Where it is goes on disk only once the fire is handed over: a
-            // watcher stopped before then reads this turn end again.
-            match hand_off(places, w, fires, exited, Some(&why)) {
+            // Where it is goes on disk only once the ask is: a watcher
+            // stopped before then reads this turn end again.
+            match ask_fire(places, w, &why) {
                 Ok(()) if !w.done => save(places, w),
                 Ok(()) => {}
                 Err(error) => {
@@ -371,80 +337,17 @@ fn act(
     true
 }
 
-/// A fire for the trigger, told why by its note: under the lock `rm` takes,
-/// so a trigger removed is not fired after, and only while its plist is
-/// still this trigger (ended by its runs or `rm`, or replaced, it is done).
-/// Its last fire still running, as on a long `--reply-to` wait, finds the
-/// note when it is done; else one starts as launchd would start it, with
-/// its plist's environment, in its own process group, which a restart of
-/// the watcher leaves running.
-fn hand_off(
-    places: &Places,
-    w: &mut Watched,
-    fires: &mut Fires,
-    exited: &tokio::sync::mpsc::UnboundedSender<String>,
-    why: Option<&str>,
-) -> Result<(), String> {
-    let name = w.trigger.name.clone();
+/// Ask for the trigger's fire, saying why, under the lock `rm` takes, and
+/// only while its plist is still this trigger's: one ended (its runs, `rm`)
+/// or replaced is done. launchd runs the fire; one still running, as on a
+/// long `--reply-to` wait, finishes first, and launchd runs it again.
+fn ask_fire(places: &Places, w: &mut Watched, why: &str) -> Result<(), String> {
     let _lock = Lock::take(places)?;
-    let text = read_record(&places.plist(&name)).ok();
-    let Some(text) = text.filter(|t| read_plist(t).is_some_and(|(t, _)| t == w.trigger)) else {
+    if !ours(places, &w.trigger) {
         w.done = true;
         return Ok(());
-    };
-    if let Some(why) = why {
-        replace(&places.asked(&name), &format!("{}\n{why}", now()))?;
     }
-    if fires.get(&name).is_some_and(|fire| !fire.is_finished()) {
-        return Ok(());
-    }
-    let mut child = tokio::process::Command::new(&w.app)
-        .args(w.trigger.args())
-        .envs(environment_of(&text))
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .process_group(0)
-        .spawn()
-        .map_err(|error| format!("{}: {error}", w.app.display()))?;
-    let exited = exited.clone();
-    fires.insert(
-        name.clone(),
-        tokio::spawn(async move {
-            let _ = child.wait().await;
-            let _ = exited.send(name);
-        }),
-    );
-    Ok(())
-}
-
-/// A plist's `EnvironmentVariables`, as the app writes them.
-fn environment_of(text: &str) -> Vec<(String, String)> {
-    let Some(at) = text.find("<key>EnvironmentVariables</key>") else {
-        return Vec::new();
-    };
-    let rest = &text[at..];
-    let (Some(open), Some(close)) = (rest.find("<dict>"), rest.find("</dict>")) else {
-        return Vec::new();
-    };
-    let mut pairs = Vec::new();
-    let mut dict = &rest[open + "<dict>".len()..close];
-    while let Some(key) = dict.find("<key>") {
-        let body = &dict[key + "<key>".len()..];
-        let Some(key_end) = body.find("</key>") else {
-            break;
-        };
-        let after = &body[key_end + "</key>".len()..];
-        let (Some(value), Some(value_end)) = (after.find("<string>"), after.find("</string>"))
-        else {
-            break;
-        };
-        pairs.push((
-            unescape(&body[..key_end]),
-            unescape(&after[value + "<string>".len()..value_end]),
-        ));
-        dict = &after[value_end + "</string>".len()..];
-    }
-    pairs
+    ask(places, &w.trigger.name, Some(why))
 }
 
 fn save(places: &Places, w: &Watched) {
@@ -543,24 +446,34 @@ pub(super) fn rewatch(
     launchd: Loader,
 ) -> Result<(), String> {
     let path = places.watcher();
-    let any = read_all(places).any(|(_, read)| read.is_ok_and(|(t, _)| t.turn_end.is_some()));
-    if !any {
-        if !path.exists() {
-            return Ok(());
-        }
-        unload(WATCH_LABEL, launchd)?;
-        return forget(&path);
-    }
     let text = plist(app, environment);
-    if std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
+    if any_watched(places) && std::fs::read_to_string(&path).ok().as_deref() != Some(&text) {
         unload(WATCH_LABEL, launchd)?;
         replace(&path, &text)?;
         return launchd(Launchd::Load(&path));
     }
-    if !restart {
+    match restart || !any_watched(places) {
+        true => unwatch(places, launchd),
+        false => Ok(()),
+    }
+}
+
+/// The watcher reads the turn-end triggers there are again, or goes with
+/// the last. Its plist stays as the app wrote it.
+pub(super) fn unwatch(places: &Places, launchd: Loader) -> Result<(), String> {
+    let path = places.watcher();
+    if !path.exists() {
         return Ok(());
     }
+    if !any_watched(places) {
+        unload(WATCH_LABEL, launchd)?;
+        return forget(&path);
+    }
     launchd(Launchd::Restart(WATCH_LABEL)).or_else(|_| launchd(Launchd::Load(&path)))
+}
+
+fn any_watched(places: &Places) -> bool {
+    read_all(places).any(|(_, read)| read.is_ok_and(|(t, _)| t.turn_end.is_some()))
 }
 
 #[cfg(test)]
@@ -598,7 +511,6 @@ mod tests {
         };
         Watched {
             trigger,
-            app: "/A/app".into(),
             cursor: Some(cursor),
             count: 0,
             done: false,
@@ -752,26 +664,42 @@ mod tests {
     }
 
     #[test]
-    fn a_fire_gets_its_own_plists_environment() {
+    fn a_counted_turn_end_is_an_ask_saying_why_and_only_then_saved() {
+        let root = std::env::temp_dir().join(format!("agent-watch-ask-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let places = Places {
+            agents: root.join("LaunchAgents"),
+            state: root.join("triggers"),
+        };
+        std::fs::create_dir_all(&places.agents).unwrap();
+        let mut w = vec![watched("t", "p.task", None, 7)];
         let when = every("30m", 0).unwrap();
-        let env = [
-            ("PATH", "/a/bin:/b".to_owned()),
-            ("SHELL", "/bin/<z>".to_owned()),
-        ];
         let text = super::super::plist(
             Path::new("/A/agent-app"),
-            &watched("t", "p.task", None, 0).trigger,
+            &w[0].trigger,
             &when,
-            &env,
+            &places.asks("t"),
+            &[],
         );
-        assert_eq!(
-            environment_of(&text),
-            [
-                ("PATH".to_owned(), "/a/bin:/b".to_owned()),
-                ("SHELL".to_owned(), "/bin/<z>".to_owned())
-            ]
-        );
-        assert!(environment_of("<plist/>").is_empty());
+        std::fs::write(places.plist("t"), text).unwrap();
+        let why = "turn end of p.task: turn:p.task/3 completed";
+        assert!(act(&places, &mut w, Step::Fire(0, why.into())));
+        assert_eq!(read_watched(&places, &w[0].trigger), Some((7, 0)));
+        assert_eq!(take_asks(&places, "t").as_deref(), Some(why));
+        // An ask it cannot make leaves its place unsaved, to read that turn
+        // end again.
+        std::fs::remove_file(places.watched("t")).unwrap();
+        std::fs::remove_dir_all(places.asks("t")).unwrap();
+        std::fs::write(places.asks("t"), "").unwrap();
+        assert!(!act(&places, &mut w, Step::Fire(0, why.into())));
+        assert_eq!(read_watched(&places, &w[0].trigger), None);
+        std::fs::remove_file(places.asks("t")).unwrap();
+        // Its trigger gone: done, with nothing asked.
+        std::fs::remove_file(places.plist("t")).unwrap();
+        assert!(act(&places, &mut w, Step::Fire(0, why.into())));
+        assert!(w[0].done);
+        assert_eq!(take_asks(&places, "t"), None);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -820,7 +748,6 @@ mod tests {
                     format!("load {}", path.file_name().unwrap().to_string_lossy())
                 }
                 Launchd::Unload(label) => format!("unload {label}"),
-                Launchd::Start(label) => format!("start {label}"),
                 Launchd::Restart(label) => format!("restart {label}"),
             });
             Ok(())
@@ -843,6 +770,7 @@ mod tests {
                     at: None,
                     watch: None,
                 },
+                &places.asks("t"),
                 &[],
             ),
         )

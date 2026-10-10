@@ -1072,10 +1072,18 @@ answer to BOT, pinned by id; launchd starts no second fire of the trigger
 meanwhile, so a repeating one skips the times that turn spans. The fire's
 request id then ends `.to.ID`, BOT's id, so the app does not also tell
 that agent of the turn as a task update, unless that answer has not
-reached it 15 s after the turn ended. The turn waited on is kept with the
-trigger's state before the wait: a fire cut short there (a restart) leaves
-it to the next fire, or to the app's next start when no fire runs, which
-passes that answer on in its place and sends nothing new. An answer the daemon cut short is
+reached it 15 s after the turn ended. A fire keeps one record with the
+trigger's state, each part on disk before the step it is for: the agent it
+is making, then the message it is about to send, whole (`sending`: agent,
+request id, prompt, delivery), until it settles. A fire cut short anywhere
+(a restart, while it waits a day for an answer) leaves the next fire to send
+that message again first, as the same request: the daemon answers with the
+turn it made, or makes it now, so it goes once, is counted once, and its
+answer is passed on. The app's start asks a trigger with a message begun
+for a fire that only finishes it (a `finish.` ask), so a one-off or a
+trigger whose next time is far off does not wait; a fire of it still
+running settles it first. Only an ask sends anything new after finishing
+one. An answer the daemon cut short is
 marked so in its first line, and one that does not get through keeps an
 ended trigger listed, saying so. `--if CMD` runs `sh -c CMD` in the folder
 `add` ran in, with the `PATH` `add` ran with, before anything else, for up
@@ -1106,11 +1114,15 @@ first. A name differing from another only in case is refused
 a trigger only by the name as stored; `rm` of a name not there is
 `trigger_not_found`. `ls` returns 64 triggers per page, with `next_after`
 for `--after NAME` or the next page in Settings; only the current page's
-messages are retained. `fire NAME` has launchd run the trigger's job now
-(`launchctl kickstart`) and returns `{"name", "fired": true}`; what the fire
-did shows in `ls`. It leaves a note the fire reads, so that fire sends
-whatever its time or watched path, and queues behind work rather than
-skipping it. launchd runs no second copy of a job still running.
+messages are retained. `fire NAME` asks for a fire and returns
+`{"name", "fired": true}`; what the fire did shows in `ls`. An ask is a file
+in the trigger's queue folder, `~/.agent/triggers/NAME.asks`, which its plist
+names as launchd's `QueueDirectories`: launchd runs the job while an ask is
+there, one run at a time, and runs it again when a run ends with one still
+there. A fire takes the asks it finds as it starts, so it sends whatever its
+time or watched path, and queues behind work rather than skipping it; one
+made while it runs is the next run's. Nothing else starts a fire: launchd
+is the only thing that runs one.
 
 Each is one LaunchAgent, `~/Library/LaunchAgents/me.lydakis.agent.trigger.NAME.plist`,
 and that file is its definition: its program arguments carry the agent and
@@ -1136,9 +1148,8 @@ What the fire did (`sent` with the turn and any `reply`, `skipped`, `gone`,
 started and the commit it saw, is kept in `~/.agent/triggers/NAME.json`,
 which Settings shows beside each trigger with its message, a Run now button
 and a Remove button. Triggers are local to this machine. Remote windows
-neither list, run nor remove local triggers. A fire holds a lock on its own
-plist while it runs, so a second fire of the same trigger, from launchd,
-`fire` or the watcher, does nothing.
+neither list, run nor remove local triggers. Only launchd runs a fire, so
+no two of one trigger ever run at once.
 
 **The turn-end watcher.** One process, `APP --trigger-watch`, watches for
 every turn-end trigger: launchd's `me.lydakis.agent.trigger-watch`
@@ -1152,16 +1163,16 @@ newest event cursor without a daemon change by bisecting `events {bot,
 after, limit: 1}` (an indexed lookup each, about 2·log2 of the cursor), and
 the watcher keeps where it is per trigger in `~/.agent/triggers/NAME.watch`,
 written only when that agent ends a turn, and for one that fires only once
-the fire is handed over: a restart replays from there, so no turn end is
-missed. A turn end that counts writes the `fire` note with why and starts
-the trigger's own fire, the arguments its plist holds, in its own process
-group (and the job abandons its group), so restarting the watcher never
-ends a fire still waiting on `--reply-to`. A fire holds a lock on its own
-plist while it runs; another fire of it waits for that one, and the one
-running sends once more for a note left while it ran, so a turn end during
-a long fire is sent after it, and several are sent once. A trigger a fire
-ended itself (its runs, its agent gone) is no longer followed once that
-fire exits. Events retention removed before the watcher read them are
+its ask is on disk: a restart replays from there, so no turn end is missed.
+A turn end that counts is an ask in the trigger's queue saying why (`turn
+end of BOT: turn:BOT/N completed`), under the lock `rm` takes and only
+while the plist is still that trigger's; launchd runs the fire for it, as
+for `fire NAME`. The watcher runs nothing itself, so restarting it never
+ends a fire still waiting on `--reply-to`; a turn end during a long fire
+is sent after it, and several are sent once, with the newest why. A
+trigger that goes, by `rm` or its own end (its runs, its agent gone),
+restarts the watcher, which reads the ones left, or unloads it with the
+last. Events retention removed before the watcher read them are
 turn ends not counted; the trigger's last result says so
 (`events_pruned`). A turn a trigger sent says so in its `request_id`
 (`trigger_GENERATION_...`, a name's characters, so the generation and not
@@ -1397,9 +1408,9 @@ its result and an ended one's moved, an unreadable plist left in place.
 The same day, file, commit and fire-by-name triggers were added and passed
 the real-daemon tests too: a message starts with its fire line, a commit
 trigger fired again on the same HEAD sends nothing and on a new commit sends
-again, and `add`'s idempotence, `fire`'s note and the `WatchPaths` plist are
+again, and `add`'s idempotence, `fire`'s ask and the `WatchPaths` plist are
 covered against the stand-in launchd. A file trigger firing on a write and
-`fire` through `launchctl kickstart` need a Mac (`AGENT_TEST_LAUNCHD=1`).
+`fire` through the `QueueDirectories` queue need a Mac (`AGENT_TEST_LAUNCHD=1`).
 Then `--start`, `--reply-to`, `--if` and `--runs` passed against a real
 daemon: a started agent made once in the trigger's folder under the agent
 that added it, then messaged; a second trigger for that name refused at its
@@ -1449,8 +1460,11 @@ the watcher's counting (a count, a turn its own trigger sent, an agent
 replaced under its name) and its job's lifecycle, move, the conversion of earlier schedules, and each lifecycle step with launchd refusing. With `AGENT_TEST_RUNTIME=1` after a release build
 and `cargo build -p agent-app`, `python3 -m unittest tests.test_trigger`
 fires triggers against a real daemon, and runs the watcher against one: a
-turn end fires, the answer `--reply-to` passes back wakes nothing, and a
-turn that ends while no watcher runs fires when one starts again; on a Mac, `AGENT_TEST_LAUNCHD=1`
+turn end fires (the test running the trigger's job while its queue holds
+an ask, as launchd does), the answer `--reply-to` passes back wakes
+nothing, and a turn that ends while no watcher runs fires when one starts
+again; a message a fire began goes once whether or not the daemon took it
+before the fire was cut short; on a Mac, `AGENT_TEST_LAUNCHD=1`
 adds its one launchd test, which loads real jobs (under a scratch `HOME`, so
 nothing loads at the next login) and checks that launchd fires a one-off,
 which ends itself, fires a file trigger on a write (the same `add` again
