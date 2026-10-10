@@ -584,14 +584,20 @@ impl Limits {
     }
 }
 
-fn name(value: &str) -> Result<()> {
+/// Names, tags and keys: 1 to 128 of `A-Z a-z 0-9 . _ -`. A refusal names
+/// the request field it was in.
+fn name(field: &str, value: &str) -> Result<()> {
     if value.is_empty()
         || value.len() > 128
         || !value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
     {
-        return fail("invalid_name");
+        return Err(Error::with(
+            "invalid_name",
+            format!("{field} must be 1 to 128 of A-Z a-z 0-9 . _ -"),
+        )
+        .facts(json!({"field":field})));
     }
     Ok(())
 }
@@ -633,9 +639,15 @@ fn gate(
             ),
         ),
         (Some(mut tools), Some(tag)) if !tools.is_empty() => {
-            name(&tag).map_err(|_| Error::new("invalid_approver"))?;
+            name("approver", &tag).map_err(|e| Error {
+                code: "invalid_approver".into(),
+                ..e
+            })?;
             if expire_ms.is_some_and(|ms| ms == 0 || ms > 86_400_000) {
-                return fail("invalid_approve_expiry");
+                return fail_with(
+                    "invalid_approve_expiry",
+                    "approve_expire_ms must be 1 to 86400000",
+                );
             }
             tools.sort();
             tools.dedup();
@@ -1197,7 +1209,10 @@ pub async fn run(config: Configuration) -> Result<()> {
                             let request = request.and_then(|request| match &request.id {
                                 Value::Number(number) if number.is_u64() => Ok(request),
                                 Value::String(text) if text.len() <= 128 => Ok(request),
-                                _ => fail("invalid_request_id"),
+                                _ => fail_with(
+                                    "invalid_request_id",
+                                    "id is a u64 or a string of at most 128 bytes",
+                                ),
                             });
                             let bound = request.as_ref().map_or(Bound::default(), |r| service.admission_sends(&r.command, &r.id, id));
                             // Everything but an admission with room waits for the
@@ -1241,7 +1256,11 @@ pub async fn run(config: Configuration) -> Result<()> {
                                     }).or(answered);
                                     (request.id, result, shutdown, serving)
                                 }
-                                Err(error) => (Value::Null, Err(error), None, None),
+                                // A request that did not parse is answered under its id when it had one.
+                                Err(mut error) => {
+                                    let id = error.facts.as_mut().and_then(|facts| facts.remove("id"));
+                                    (id.unwrap_or(Value::Null), Err(error), None, None)
+                                }
                             };
                             let shutdown = shutdown.filter(|_| result.is_ok());
                             reply(&mut service, &mut sessions, stdio_owner, id, &output, request_id, result).await?;
@@ -1824,10 +1843,10 @@ impl Service {
                 request_id,
             } => {
                 if budget_tokens == Some(0) {
-                    return fail("invalid_budget");
+                    return fail_with("invalid_budget", "budget_tokens must be at least 1");
                 }
                 if let Some(key) = &request_id {
-                    name(key)?;
+                    name("request_id", key)?;
                 }
                 let gate = gate(
                     approve,
@@ -1835,9 +1854,9 @@ impl Service {
                     approve_expire_ms,
                     self.registry.tool_count(),
                 )?;
-                name(&bot)?;
+                name("bot", &bot)?;
                 if let Some(creator) = &created_by {
-                    name(creator)?;
+                    name("created_by", creator)?;
                 }
                 let path = path.as_deref().map(workspace).transpose()?;
                 // The daemon supplies no agent behavior: who creates a bot
@@ -1853,14 +1872,15 @@ impl Service {
                 // with no room for thinking, is refused before the bot exists.
                 settings.validate()?;
                 turn::shaped(served, &settings)?;
-                if let Some(level) = &reasoning
-                    && !family.reasoning_levels().contains(&level.as_str())
-                {
-                    return fail("invalid_reasoning_level");
+                if let Some(level) = &reasoning {
+                    family.check_reasoning(level)?;
                 }
                 let instructions = instructions.ok_or(Error::new("instructions_required"))?;
                 if instructions.len() > 64 * 1024 {
-                    return fail("instructions_limit");
+                    return fail_with(
+                        "instructions_limit",
+                        "instructions may be up to 65536 bytes",
+                    );
                 }
                 let tools = tools.ok_or(Error::new("tools_required"))?;
                 self.registry.validate(&tools)?;
@@ -1868,7 +1888,10 @@ impl Service {
                     .as_ref()
                     .is_some_and(|text| text.len() > 64 * 1024)
                 {
-                    return fail("instructions_limit");
+                    return fail_with(
+                        "instructions_limit",
+                        "compaction_instructions may be up to 65536 bytes",
+                    );
                 }
                 // The summarizer must speak the bot's family: its items are
                 // stored in that encoding and go to the summarizer as they are.
@@ -1941,8 +1964,12 @@ impl Service {
                             "turns":0,"events":0,"nodes":0}));
                     }
                 }
-                if self.active.contains_key(&bot) {
-                    return fail("bot_busy");
+                if let Some(active) = self.active.get(&bot) {
+                    return Err(Error::with(
+                        "bot_busy",
+                        format!("turn {} of {bot} is running", active.turn),
+                    )
+                    .facts(json!({"running_turn":active.turn})));
                 }
                 // One bounded piece per job, on a task of its own, so other
                 // bots' requests and commits interleave with a large deletion
@@ -2151,20 +2178,23 @@ impl Service {
                     _ => return fail_with("invalid_decision", "allow or deny"),
                 };
                 if call_id.is_empty() {
-                    return fail("invalid_call_id");
+                    return fail_with("invalid_call_id", "call_id may not be empty");
                 }
                 if let Some(tag) = &tag {
-                    name(tag).map_err(|_| Error::new("invalid_approver"))?;
+                    name("tag", tag).map_err(|e| Error {
+                        code: "invalid_approver".into(),
+                        ..e
+                    })?;
                 }
                 // The model sees a denial's reason; an allow has no use for one.
                 if allow && reason.is_some() {
                     return fail_with("invalid_reason", "only a deny carries a reason");
                 }
                 if reason.as_ref().is_some_and(|r| r.len() > 16 * 1024) {
-                    return fail("reason_limit");
+                    return fail_with("reason_limit", "reason may be up to 16384 bytes");
                 }
                 if by.as_ref().is_some_and(|b| b.is_empty() || b.len() > 128) {
-                    return fail("invalid_by");
+                    return fail_with("invalid_by", "by must be 1 to 128 bytes");
                 }
                 // Hold through storage and reply backpressure. An expired
                 // lease changes nothing: the new holder decides.
@@ -2223,14 +2253,17 @@ impl Service {
                 lease_ms,
                 limit,
             } => {
-                name(&tag).map_err(|_| Error::new("invalid_approver"))?;
+                name("tag", &tag).map_err(|e| Error {
+                    code: "invalid_approver".into(),
+                    ..e
+                })?;
                 if !(100..=600_000).contains(&lease_ms) {
                     return fail_with("invalid_lease", "lease_ms from 100 to 600000");
                 }
                 // Checked before a lease is made.
                 let limit = limit.unwrap_or(64);
                 if !(1..=256).contains(&limit) {
-                    return fail("invalid_approval_page");
+                    return fail_with("invalid_approval_page", "limit must be 1 to 256");
                 }
                 let (lease, serving) = self.hub.serve(&tag, session, output.clone(), lease_ms)?;
                 // The listing and the start of delivery share one job, so
@@ -2266,10 +2299,10 @@ impl Service {
                 any,
             } => {
                 if handles.is_empty() || handles.len() > 64 {
-                    return fail("invalid_handles");
+                    return fail_with("invalid_handles", "handles must name 1 to 64 handles");
                 }
                 if timeout_ms.is_some_and(|t| t > 86_400_000) {
-                    return fail("invalid_timeout");
+                    return fail_with("invalid_timeout", "timeout_ms may be up to 86400000");
                 }
                 for handle in &handles {
                     handles::Handle::parse(handle)?;
@@ -2315,10 +2348,10 @@ impl Service {
                 request_id,
             } => {
                 if budget_tokens == Some(0) {
-                    return fail("invalid_budget");
+                    return fail_with("invalid_budget", "budget_tokens must be at least 1");
                 }
                 if let Some(key) = &request_id {
-                    name(key)?;
+                    name("request_id", key)?;
                 }
                 let allow = match allow {
                     None => None,
@@ -2351,9 +2384,9 @@ impl Service {
                     approve_expire_ms,
                     self.registry.tool_count(),
                 )?;
-                name(&bot)?;
+                name("bot", &bot)?;
                 if let Some(creator) = &created_by {
-                    name(creator)?;
+                    name("created_by", creator)?;
                 }
                 let path = path.as_deref().map(workspace).transpose()?;
                 let (created, event) = store
@@ -2431,7 +2464,7 @@ impl Service {
             }
             Command::Follow { bot, after } => {
                 if after < 0 {
-                    return fail("invalid_event_page");
+                    return fail_with("invalid_event_page", "after must be 0 or more");
                 }
                 // `*` follows every bot from a store-wide cursor.
                 if bot != hub::ALL {
@@ -2463,20 +2496,22 @@ impl Service {
                 from,
                 origin,
             } => {
-                name(&request_id)?;
+                name("request_id", &request_id)?;
                 if origin.is_some() && from.is_some() {
                     return fail_with("invalid_origin", "from and origin are mutually exclusive");
                 }
                 if let Some(origin) = &origin {
-                    name(origin).map_err(|_| Error::with("invalid_origin", origin.as_str()))?;
+                    name("origin", origin).map_err(|e| Error {
+                        code: "invalid_origin".into(),
+                        ..e
+                    })?;
                 }
                 if prompt.len() > 256 * 1024 {
-                    return fail("prompt_limit");
+                    return fail_with("prompt_limit", "prompt may be up to 262144 bytes");
                 }
                 let delivery = match delivery.as_deref() {
                     None => Delivery::Reject,
-                    Some(mode) => Delivery::parse(mode)
-                        .ok_or_else(|| Error::with("invalid_delivery", mode))?,
+                    Some(mode) => Delivery::requested(mode)?,
                 };
                 if expected_turn.is_some() && delivery != Delivery::Steer {
                     return fail_with("invalid_delivery", "expected_turn needs delivery steer");
@@ -2569,19 +2604,33 @@ impl Service {
                         .await?;
                     return Ok(json!({"interrupt_requested":true,"turn":turn,"queued":true}));
                 }
-                if self.active.contains_key(&bot) {
-                    return fail("stale_turn");
+                // Refusals say what the bot is running and where the named
+                // turn stands, so a client can tell an ended turn from one
+                // that never was.
+                let stale = |running: Option<i64>, code: &str| {
+                    Error::with(
+                        code,
+                        match running {
+                            Some(running) if running == turn => format!("turn {turn} is starting"),
+                            Some(running) => format!("{bot} is running turn {running}, not {turn}"),
+                            None => format!("{bot} is running no turn"),
+                        },
+                    )
+                    .facts(json!({"running_turn":running,"status":(!status.is_empty()).then_some(&status)}))
+                };
+                if let Some(active) = self.active.get(&bot) {
+                    return Err(stale(Some(active.turn), "stale_turn"));
                 }
                 // A parked turn has no task; confirm durable state and end it.
                 let check = bot.clone();
                 let state = store.op("inspect", move |db| db.inspect(&check)).await?;
                 if state.running_turn.is_none() {
-                    return fail("no_active_turn");
+                    return Err(stale(None, "no_active_turn"));
                 }
                 if state.running_turn != Some(turn)
                     || (state.status != "waiting" && state.status != "paced")
                 {
-                    return fail("stale_turn");
+                    return Err(stale(state.running_turn, "stale_turn"));
                 }
                 let name = bot.clone();
                 store
@@ -2603,7 +2652,7 @@ impl Service {
             }
             Command::Shutdown { grace_ms } => {
                 if grace_ms > 86_400_000 {
-                    return fail("invalid_timeout");
+                    return fail_with("invalid_timeout", "grace_ms may be up to 86400000");
                 }
                 Ok(json!({"shutting_down":true}))
             }

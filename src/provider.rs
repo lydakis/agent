@@ -512,8 +512,17 @@ impl Provider {
     /// input plus this bound from quota when a call starts, so a bound near
     /// real output is throughput there.
     pub fn with_max_output_tokens(mut self, limit: u32) -> Result<Self> {
-        if limit == 0 || (self.family == Family::Anthropic && limit < 2048) {
-            return fail("invalid_output_token_limit");
+        let least = if self.family == Family::Anthropic {
+            2048
+        } else {
+            1
+        };
+        if limit < least {
+            return Err(Error::with(
+                "invalid_output_token_limit",
+                format!("the output token limit is at least {least} on this provider"),
+            )
+            .facts(json!({"least":least})));
         }
         self.max_output_tokens = Some(limit);
         Ok(self)
@@ -548,7 +557,10 @@ impl Provider {
     /// more than zero, at most a day.
     pub fn with_stall_timeout(mut self, bound: Duration) -> Result<Self> {
         if bound.is_zero() || bound > Duration::from_secs(86_400) {
-            return fail("invalid_stall_timeout");
+            return Err(Error::with(
+                "invalid_stall_timeout",
+                "stall_timeout is more than 0 and at most a day",
+            ));
         }
         self.stall_timeout = bound;
         Ok(self)
@@ -558,7 +570,13 @@ impl Provider {
     /// lifetime; `None` disables it.
     pub fn with_keep_warm(mut self, after: Option<Duration>) -> Result<Self> {
         if after.is_some_and(|after| after.is_zero() || after >= CACHE_LIFETIME) {
-            return fail("invalid_keep_warm");
+            return Err(Error::with(
+                "invalid_keep_warm",
+                format!(
+                    "keep_warm is more than 0 and under the {}s cache lifetime",
+                    CACHE_LIFETIME.as_secs()
+                ),
+            ));
         }
         self.keep_warm = after;
         Ok(self)

@@ -362,6 +362,7 @@ pub enum Delivery {
     Steer,
 }
 impl Delivery {
+    pub const NAMES: [&str; 3] = ["reject", "queue", "steer"];
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "reject" => Some(Self::Reject),
@@ -369,6 +370,16 @@ impl Delivery {
             "steer" => Some(Self::Steer),
             _ => None,
         }
+    }
+    /// `parse`, refusing a name it does not know with the ones it does.
+    pub fn requested(name: &str) -> Result<Self> {
+        Self::parse(name).ok_or_else(|| {
+            Error::with(
+                "invalid_delivery",
+                format!("{name} is not one of {}", Self::NAMES.join(", ")),
+            )
+            .facts(serde_json::json!({"deliveries":Self::NAMES}))
+        })
     }
     pub fn name(self) -> &'static str {
         match self {
@@ -991,6 +1002,49 @@ fn creation(request_id: Option<&str>, request: Option<Value>) -> Option<String> 
         .zip(request)
         .map(|(key, request)| json!({"request_id":key,"request":request}).to_string())
 }
+/// An offset must start a character: page from a returned `next_offset`.
+fn inside_character(code: &str) -> Error {
+    Error::with(
+        code,
+        "offset falls inside a character; page from a returned next_offset",
+    )
+}
+
+/// A turn's end carries its error's facts, as a refusal's reply does, so a
+/// client reads them from `turn_finished` or a wait instead of the detail.
+fn with_facts(data: &mut Value, error: Option<&Error>) {
+    let (Some(data), Some(facts)) = (data.as_object_mut(), error.and_then(|e| e.facts.as_deref()))
+    else {
+        return;
+    };
+    for (key, value) in facts {
+        data.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+}
+
+/// A gate can hold back only tools the bot may call.
+fn not_in_tools(gated: &[String], tools: &[String]) -> Result<()> {
+    let missing: Vec<&String> = gated.iter().filter(|t| !tools.contains(t)).collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(Error::with(
+        "approve_not_in_tools",
+        "a gate can hold back only tools the bot may call",
+    )
+    .facts(json!({"approve":missing})))
+}
+
+fn budget_exhausted(bot: &Bot, budget: u64) -> Error {
+    Error::with(
+        "budget_exhausted",
+        format!(
+            "{} has used {} of its {budget} tokens",
+            bot.name, bot.tokens_used
+        ),
+    )
+    .facts(json!({"budget_tokens":budget,"tokens_used":bot.tokens_used}))
+}
 fn conflict(name: &str, field: &str) -> Error {
     Error::with(
         "idempotency_conflict",
@@ -1568,7 +1622,10 @@ impl Database {
     /// Bounded keyset pages. Full instructions remain available through inspect.
     pub fn list(&self, after: Option<&str>, limit: usize) -> Result<Value> {
         if !(1..=256).contains(&limit) || after.is_some_and(|s| s.len() > 128) {
-            return fail("invalid_bot_page");
+            return fail_with(
+                "invalid_bot_page",
+                "limit must be 1 to 256 and after a name of up to 128 bytes",
+            );
         }
         let mut statement = self.conn.prepare(
             "SELECT name,head,workspace,status,running_turn,provider,family,model,reasoning,budget_tokens,tokens_used,tools,
@@ -1632,12 +1689,12 @@ impl Database {
         request_id: Option<&str>,
         request: Option<&Value>,
     ) -> Result<Option<Bot>> {
-        let creation: Option<Option<String>> = self
+        let holder: Option<(Option<String>, i64, String)> = self
             .conn
-            .prepare_cached("SELECT creation FROM bots WHERE name=?")?
-            .query_row([name], |r| r.get(0))
+            .prepare_cached("SELECT creation,id,status FROM bots WHERE name=?")?
+            .query_row([name], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .optional()?;
-        let Some(creation) = creation else {
+        let Some((creation, id, status)) = holder else {
             let Some(key) = request_id else {
                 return Ok(None);
             };
@@ -1659,7 +1716,12 @@ impl Database {
         let Some(creation) =
             creation.filter(|c| request_id.is_some_and(|key| c["request_id"] == key))
         else {
-            return fail("bot_exists");
+            // A name still held by a deletion is taken until it finishes.
+            let detail = match status.as_str() {
+                "deleting" => format!("{name} is taken until its deletion finishes"),
+                _ => format!("{name} is taken"),
+            };
+            return Err(Error::with("bot_exists", detail).facts(json!({"bot_id":id})));
         };
         let fields = request
             .and_then(Value::as_object)
@@ -1670,11 +1732,10 @@ impl Database {
         {
             return Err(conflict(name, field));
         }
-        let bot = self.inspect(name)?;
-        if bot.status == "deleting" {
+        if status == "deleting" {
             return fail_with("bot_not_found", format!("{name} is being deleted"));
         }
-        Ok(Some(bot))
+        Ok(Some(self.inspect(name)?))
     }
     /// A new bot, and its `created` event; a resend of the request that made
     /// it gets the bot and no event.
@@ -1700,10 +1761,8 @@ impl Database {
             }
             return Ok((bot, None));
         }
-        if let Some(gate) = binding.gate
-            && gate.tools.iter().any(|t| !binding.tools.contains(t))
-        {
-            return fail("approve_not_in_tools");
+        if let Some(gate) = binding.gate {
+            not_in_tools(&gate.tools, binding.tools)?;
         }
         binding.settings.validate()?;
         let tx = self.conn.savepoint()?;
@@ -3325,8 +3384,14 @@ impl Database {
         offset: u64,
         limit: usize,
     ) -> Result<Value> {
-        if !(4..=64 * 1024).contains(&limit) || offset > i64::MAX as u64 {
-            return fail("invalid_history_page");
+        if !(4..=64 * 1024).contains(&limit) {
+            return fail_with("invalid_history_page", "limit must be 4 to 65536 bytes");
+        }
+        if offset > i64::MAX as u64 {
+            return fail_with(
+                "invalid_history_page",
+                format!("offset may be up to {}", i64::MAX),
+            );
         }
         let head: Option<i64> = self
             .conn
@@ -3404,7 +3469,7 @@ impl Database {
                     Err(error) if error.error_len().is_none() => {
                         std::str::from_utf8(&chunk[..error.valid_up_to()]).unwrap()
                     }
-                    Err(_) => return fail("invalid_history_page"),
+                    Err(_) => return Err(inside_character("invalid_history_page")),
                 };
                 text.push_str(piece);
                 if within + (piece.len() as u64) < bytes {
@@ -3421,7 +3486,11 @@ impl Database {
             position = end;
         }
         if done && offset > position {
-            return fail("invalid_history_page");
+            return Err(Error::with(
+                "invalid_history_page",
+                format!("offset is past the end, {position} bytes"),
+            )
+            .facts(json!({"size":position})));
         }
         let next = offset + text.len() as u64;
         Ok(
@@ -3550,8 +3619,34 @@ impl Database {
                     .or(saved_options.workspace.clone()),
                 ..options.clone()
             };
-            if saved != prompt || saved_options != same {
-                return fail("idempotency_conflict");
+            // Destructured so a new option can't be left out of the check.
+            let TurnOptions {
+                workspace,
+                model,
+                reasoning,
+                delivery,
+                expected_turn,
+                from,
+                origin,
+            } = &saved_options;
+            let differs = [
+                ("prompt", saved != prompt),
+                ("workspace", *workspace != same.workspace),
+                ("model", *model != same.model),
+                ("reasoning", *reasoning != same.reasoning),
+                ("delivery", *delivery != same.delivery),
+                ("expected_turn", *expected_turn != same.expected_turn),
+                ("from", *from != same.from),
+                ("origin", *origin != same.origin),
+            ]
+            .into_iter()
+            .find_map(|(field, differs)| differs.then_some(field));
+            if let Some(field) = differs {
+                return Err(Error::with(
+                    "idempotency_conflict",
+                    format!("{field} differs from the request that started turn {turn}"),
+                )
+                .facts(json!({"field":field,"turn":turn})));
             }
             return Ok(Started {
                 turn,
@@ -3563,7 +3658,10 @@ impl Database {
         let reject = options.delivery == Delivery::Reject;
         // Admission applies only to new work, before any durable mutation.
         if !capacity && reject {
-            return fail("active_agent_limit");
+            return fail_with(
+                "active_agent_limit",
+                "the daemon runs as many turns as it may; delivery queue waits for room",
+            );
         }
         let bot = self.inspect(name)?;
         // A strict steer is for one running turn; anything else is stale
@@ -3571,7 +3669,11 @@ impl Database {
         if let Some(expected) = options.expected_turn
             && (options.delivery != Delivery::Steer || bot.running_turn != Some(expected))
         {
-            return fail("stale_turn");
+            return Err(Error::with(
+                "stale_turn",
+                format!("expected_turn {expected} is not {name}'s running turn"),
+            )
+            .facts(json!({"running_turn":bot.running_turn})));
         }
         // Declared, not verified: the named turn exists and is that bot's.
         let mut from_id = None;
@@ -3587,10 +3689,8 @@ impl Database {
                 return fail_with("invalid_from", format!("{from} has no turn {turn}"));
             }
         }
-        if let Some(level) = &options.reasoning
-            && !bot.family()?.reasoning_levels().contains(&level.as_str())
-        {
-            return fail_with("invalid_reasoning_level", level.as_str());
+        if let Some(level) = &options.reasoning {
+            bot.family()?.check_reasoning(level)?;
         }
         if let Err(error) = validate(&bot, options.model.as_deref()) {
             // An omitted steer model inherits the active turn for absorption.
@@ -3637,8 +3737,8 @@ impl Database {
             return Err(Error::with("bot_busy", detail)
                 .facts(json!({"running_turn":bot.running_turn,"fork_point":bot.fork_point})));
         }
-        if bot.budget_tokens.is_some_and(|b| bot.tokens_used >= b) {
-            return fail("budget_exhausted");
+        if let Some(budget) = bot.budget_tokens.filter(|b| bot.tokens_used >= *b) {
+            return Err(budget_exhausted(&bot, budget));
         }
         // A bot keeps its folder; a turn that names one moves it there.
         let workspace = options
@@ -3798,8 +3898,8 @@ impl Database {
                 .execute("UPDATE turns SET status='queued' WHERE id=?", [turn])?;
             return fail("bot_busy");
         }
-        if bot.budget_tokens.is_some_and(|b| bot.tokens_used >= b) {
-            return fail("budget_exhausted");
+        if let Some(budget) = bot.budget_tokens.filter(|b| bot.tokens_used >= *b) {
+            return Err(budget_exhausted(&bot, budget));
         }
         validate(&bot, model.as_deref())?;
         let workspace = workspace
@@ -3869,7 +3969,8 @@ impl Database {
         if status == "ready" {
             promote(&tx, &name)?;
         }
-        let data = json!({"status":ended,"checkpoint":Value::Null,"error":error.code,"detail":error.detail});
+        let mut data = json!({"status":ended,"checkpoint":Value::Null,"error":error.code,"detail":error.detail});
+        with_facts(&mut data, Some(error));
         let cursor = event(&tx, &name, Some(turn), "turn_finished", data.clone())?;
         tx.commit()?;
         self.pending_left(prompt_bytes as usize);
@@ -4606,13 +4707,23 @@ impl Database {
             return fail("turn_not_found");
         };
         if !matches!(status.as_str(), "running" | "waiting" | "paced") {
-            return fail("stale_turn");
+            return Err(
+                Error::with("stale_turn", format!("turn {} is {status}", answer.turn))
+                    .facts(json!({"status":status})),
+            );
         }
         let Some(mut request) = self.request(answer.turn, answer.call_id)? else {
             return fail("no_pending_approval");
         };
         if answer.request < request.request {
-            return fail("approval_superseded");
+            return Err(Error::with(
+                "approval_superseded",
+                format!(
+                    "the call was announced again as request {}",
+                    request.request
+                ),
+            )
+            .facts(json!({"request":request.request})));
         }
         if answer.request > request.request {
             return fail("no_pending_approval");
@@ -4632,8 +4743,18 @@ impl Database {
         let tag = gate.tag.clone();
         // The first deny decides the call, and only its reason is used, so
         // an answer after it is refused rather than held.
-        if request.verdicts.iter().any(|v| v.tag == tag || !v.allow) {
-            return fail("approval_already_answered");
+        if let Some(verdict) = request.verdicts.iter().find(|v| v.tag == tag || !v.allow) {
+            return Err(Error::with(
+                "approval_already_answered",
+                format!(
+                    "{} already answered {}",
+                    verdict.tag,
+                    if verdict.allow { "allow" } else { "deny" }
+                ),
+            )
+            .facts(
+                json!({"tag":verdict.tag,"decision":if verdict.allow { "allow" } else { "deny" }}),
+            ));
         }
         // A gate's expiry is a deadline for its verdict, even before the
         // turn gets to deny the call for it.
@@ -4714,7 +4835,10 @@ impl Database {
     ) -> Result<Value> {
         const READ: usize = 1024;
         if !(1..=256).contains(&limit) || after < 0 {
-            return fail("invalid_approval_page");
+            return fail_with(
+                "invalid_approval_page",
+                "limit must be 1 to 256 and after 0 or more",
+            );
         }
         let through = through.unwrap_or(i64::MAX);
         let mut page = ApprovalPage {
@@ -5167,8 +5291,9 @@ impl Database {
                 params![bot.name, head],
             )?;
         }
-        let data = json!({"status":status,"checkpoint":if status == "completed" { head } else { None },
+        let mut data = json!({"status":status,"checkpoint":if status == "completed" { head } else { None },
             "error":code,"detail":error.and_then(|e| e.detail.clone())});
+        with_facts(&mut data, error);
         let cursor = event(&tx, &bot.name, Some(turn), "turn_finished", data.clone())?;
         tx.commit()?;
         self.approvals -= unstarted;
@@ -5687,10 +5812,8 @@ impl Database {
         let parent = self.inspect(source)?;
         // A fork starts where its source is unless told otherwise.
         let workspace = workspace.or(parent.workspace.as_deref());
-        if let Some(gate) = gate
-            && gate.tools.iter().any(|t| !parent.tools.contains(t))
-        {
-            return fail("approve_not_in_tools");
+        if let Some(gate) = gate {
+            not_in_tools(&gate.tools, &parent.tools)?;
         }
         // A fork never widens what its source may call.
         let allowed = match allow {
@@ -5870,7 +5993,10 @@ impl Database {
     }
     fn event_page(&self, name: Option<&str>, after: i64, limit: usize) -> Result<Value> {
         if after < 0 || !(1..=256).contains(&limit) {
-            return fail("invalid_event_page");
+            return fail_with(
+                "invalid_event_page",
+                "limit must be 1 to 256 and after 0 or more",
+            );
         }
         let mut stmt = self.conn.prepare_cached(match name {
             Some(_) => "SELECT id,turn,kind,data,bot FROM events WHERE bot=?1 AND id>?2 ORDER BY id LIMIT ?3",
@@ -5975,8 +6101,9 @@ impl Database {
         let tx = self.conn.savepoint()?;
         let mut out = json!({"turns":0,"events":0,"nodes":0,"done":false});
         if bot.status != "deleting" {
-            if bot.running_turn.is_some() {
-                return fail("bot_busy");
+            if let Some(turn) = bot.running_turn {
+                return Err(Error::with("bot_busy", format!("turn {turn} is running"))
+                    .facts(json!({"running_turn":turn})));
             }
             let running: bool = tx
                 .prepare_cached(
@@ -5986,7 +6113,10 @@ impl Database {
                 )?
                 .query_row([name, name], |r| r.get(0))?;
             if running {
-                return fail("bot_busy");
+                return fail_with(
+                    "bot_busy",
+                    "a command it started is running or turns are queued",
+                );
             }
             // Preserve identity before freeing the suffix, in the same transaction.
             // The head is the largest ID on this append-only lineage. Together
@@ -6178,7 +6308,7 @@ impl Database {
         limit: Option<usize>,
     ) -> Result<Value> {
         if keep_turns == 0 {
-            return fail("invalid_retention");
+            return fail_with("invalid_retention", "keep_turns must be at least 1");
         }
         let floor: Option<i64> = self
             .conn
@@ -6275,7 +6405,7 @@ impl Database {
         oldest_first: bool,
     ) -> Result<Value> {
         if !(1..=400).contains(&limit) {
-            return fail("invalid_history_limit");
+            return fail_with("invalid_history_limit", "limit must be 1 to 400");
         }
         let snapshot = self.conn.unchecked_transaction()?;
         let head = self.inspect(name)?.head;
@@ -6349,7 +6479,7 @@ impl Database {
     pub fn history_items(&self, name: &str, wanted: &[i64]) -> Result<Value> {
         use std::collections::HashSet;
         if wanted.is_empty() || wanted.len() > 400 {
-            return fail("invalid_history_limit");
+            return fail_with("invalid_history_limit", "nodes must name 1 to 400 nodes");
         }
         let unique: HashSet<i64> = wanted.iter().copied().collect();
         if unique.len() != wanted.len() {
@@ -6448,7 +6578,10 @@ impl Database {
     pub fn turns(&self, name: &str, after: i64, limit: usize) -> Result<Value> {
         self.inspect(name)?;
         if after < 0 || !(1..=256).contains(&limit) {
-            return fail("invalid_turn_page");
+            return fail_with(
+                "invalid_turn_page",
+                "limit must be 1 to 256 and after 0 or more",
+            );
         }
         let mut statement = self.conn.prepare(
             "SELECT t.id,t.request_id,t.status,COALESCE(t.workspace,b.workspace),
@@ -6644,8 +6777,14 @@ impl Database {
         offset: u64,
         limit: usize,
     ) -> Result<Value> {
-        if !(4..=64 * 1024).contains(&limit) || offset > i64::MAX as u64 - 1 {
-            return fail("invalid_artifact_page");
+        if !(4..=64 * 1024).contains(&limit) {
+            return fail_with("invalid_artifact_page", "limit must be 4 to 65536 bytes");
+        }
+        if offset > i64::MAX as u64 - 1 {
+            return fail_with(
+                "invalid_artifact_page",
+                format!("offset may be up to {}", i64::MAX - 1),
+            );
         }
         self.authorize_artifact(name, turn, call_id)?;
         let Some((total, bytes)) =
@@ -6659,7 +6798,7 @@ impl Database {
                 std::str::from_utf8(&bytes[..error.valid_up_to()])
                     .map_err(|_| Error::new("invalid_artifact_page"))?
             }
-            Err(_) => return fail("invalid_artifact_page"),
+            Err(_) => return Err(inside_character("invalid_artifact_page")),
         };
         let next = offset + text.len() as u64;
         Ok(json!({"stream":stream,"offset":offset,"text":text,

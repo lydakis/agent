@@ -284,20 +284,20 @@ fn admission_reconciles_retries_without_accepting_fresh_work_at_capacity() {
         .unwrap();
     assert!(!retry.fresh);
     assert_eq!(retry.turn, turn);
-    assert_eq!(
-        db.begin(
+    // The refusal names the field that differs from the first request.
+    let changed = db
+        .begin(
             "Bob",
             "same",
             "changed",
             false,
             &TurnOptions::default(),
-            allow_provider
+            allow_provider,
         )
         .err()
-        .unwrap()
-        .code,
-        "idempotency_conflict"
-    );
+        .unwrap();
+    assert_eq!(changed.code, "idempotency_conflict");
+    assert_eq!(changed.facts.unwrap()["field"], "prompt");
     assert_eq!(
         db.begin(
             "Other",
@@ -811,10 +811,9 @@ fn a_deny_decides_the_call_and_later_answers_are_refused() {
     // Neither verdict nor reason is kept once the call is denied.
     for (allow, reason) in [(true, None), (false, Some(long.as_str()))] {
         let late = answer(&mut db, "second", allow, reason);
-        assert_eq!(
-            late.err().map(|e| e.to_string()).as_deref(),
-            Some("approval_already_answered")
-        );
+        let late = late.err().unwrap();
+        assert_eq!(late.code, "approval_already_answered");
+        assert_eq!(late.facts.unwrap()["decision"], "deny");
     }
     assert!(matches!(
         db.approval_start(turn, &call, 0).unwrap(),
@@ -2786,12 +2785,14 @@ fn a_turn_runs_at_its_own_effort_or_its_bots() {
         reasoning: Some(level.into()),
         ..TurnOptions::default()
     };
-    // Only the levels the bot's family takes.
+    // Only the levels the bot's family takes, named as at creation.
+    let refused = db
+        .begin("Bob", "r0", "work", true, &at("max"), allow_provider)
+        .unwrap_err();
+    assert_eq!(refused.code, "invalid_reasoning_level");
     assert_eq!(
-        db.begin("Bob", "r0", "work", true, &at("max"), allow_provider)
-            .unwrap_err()
-            .code,
-        "invalid_reasoning_level"
+        refused.facts.unwrap()["levels"],
+        json!(["low", "medium", "high", "xhigh"])
     );
     let low = db
         .begin("Bob", "r1", "work", true, &at("low"), allow_provider)
@@ -4567,6 +4568,15 @@ fn history_preserves_content_beyond_the_preview() {
         db.history_read("Bob", 1, offset + 1, 97).unwrap_err().code,
         "invalid_history_page"
     );
+    // An offset past any history names that bound, not the page size.
+    let far = db.history_read("Bob", 1, u64::MAX, 97).unwrap_err();
+    assert_eq!(
+        (far.code.as_str(), far.detail.as_deref()),
+        (
+            "invalid_history_page",
+            Some(format!("offset may be up to {}", i64::MAX).as_str())
+        )
+    );
     let unicode_offset = full.find('é').unwrap() as u64 + 1;
     assert_eq!(
         db.history_read("Bob", 1, unicode_offset, 97)
@@ -6339,9 +6349,11 @@ fn deletion_runs_in_pieces_refuses_work_and_resumes_after_interruption() {
                 .code,
             "bot_not_found"
         );
+        // The name is held, by the identity being deleted, until it is gone.
+        let taken = db.create("Bob", None, binding()).unwrap_err();
         assert_eq!(
-            db.create("Bob", None, binding()).unwrap_err().code,
-            "bot_exists"
+            (taken.code.as_str(), taken.facts.unwrap()["bot_id"].as_i64()),
+            ("bot_exists", Some(id))
         );
         assert_eq!(db.delete_bot_piece("Bob", id, 16).unwrap()["done"], false);
     }
