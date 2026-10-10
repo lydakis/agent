@@ -23,7 +23,7 @@ use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     ops::ControlFlow,
     path::PathBuf,
     sync::{
@@ -1537,7 +1537,7 @@ impl Turn {
                             _ => None,
                         })
                         .collect();
-                    let outcome = Outcome::text(wait_result(results).to_string());
+                    let outcome = Outcome::text(wait_result(for_model(results)).to_string());
                     let id = waiting.call_id.clone();
                     self.store
                         .op("tool_finish", move |db| {
@@ -3061,6 +3061,34 @@ fn annotate(mut outcome: Outcome, turn: i64, call_id: &str) -> Outcome {
     outcome
 }
 
+/// A model reads a peer turn's outcome, not its accounting: the turn view's
+/// usage, timing and identity stay with clients and out of the context.
+fn for_model(results: BTreeMap<String, Arc<Value>>) -> BTreeMap<String, Arc<Value>> {
+    const KEPT: [&str; 8] = [
+        "turn",
+        "status",
+        "into",
+        "checkpoint",
+        "error",
+        "detail",
+        "text",
+        "text_truncated",
+    ];
+    results
+        .into_iter()
+        .map(|(handle, result)| match Handle::parse(&handle) {
+            Ok(Handle::Turn { .. }) if result["pending"] != true => {
+                let kept: serde_json::Map<String, Value> = KEPT
+                    .iter()
+                    .filter_map(|key| Some((key.to_string(), result.get(*key)?.clone())))
+                    .collect();
+                (handle, Arc::new(Value::Object(kept)))
+            }
+            _ => (handle, result),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 use agent_runtime::store::pinned_item;
 
@@ -3523,6 +3551,7 @@ mod tests {
                     session: 1,
                     output: Output::writer(reply_writer),
                     request: json!(1),
+                    reader: store.reader(),
                 },
             )
             .await;

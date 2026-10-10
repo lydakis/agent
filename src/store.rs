@@ -614,6 +614,41 @@ impl Store {
         label: &'static str,
         operation: impl FnOnce(&Database) -> Result<T> + Send + 'static,
     ) -> Result<T> {
+        self.reader().read(label, operation).await
+    }
+    /// The reader connection alone, for a holder that must not keep the
+    /// writer, and so the publication stream, open: a waiter in the
+    /// registry outlives the service at shutdown.
+    pub fn reader(&self) -> Reader {
+        Reader {
+            reader: self.reader.clone(),
+            counters: self.counters.clone(),
+        }
+    }
+    /// A job without a named operation, counted as `other`.
+    pub async fn call<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&mut Database) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        self.op("other", operation).await
+    }
+}
+
+/// Reads on the reader connection; see `Store::reader`.
+#[derive(Clone)]
+pub struct Reader {
+    reader: mpsc::Sender<ReadJob>,
+    counters: std::sync::Arc<Counters>,
+}
+impl Reader {
+    /// Run a read on the reader connection, counted like any job. Only for
+    /// reads whose result is bytes for a caller, never for decisions that
+    /// must see the write the caller is about to make.
+    pub async fn read<T: Send + 'static>(
+        &self,
+        label: &'static str,
+        operation: impl FnOnce(&Database) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
         let (sender, receiver) = oneshot::channel();
         let counters = self.counters.clone();
         let queued = std::time::Instant::now();
@@ -634,13 +669,6 @@ impl Store {
         receiver
             .await
             .map_err(|_| Error::new("storage_worker_failed"))?
-    }
-    /// A job without a named operation, counted as `other`.
-    pub async fn call<T: Send + 'static>(
-        &self,
-        operation: impl FnOnce(&mut Database) -> Result<T> + Send + 'static,
-    ) -> Result<T> {
-        self.op("other", operation).await
     }
 }
 

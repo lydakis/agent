@@ -967,6 +967,48 @@ pub struct Database {
     served: Vec<Served>,
 }
 
+/// The columns of the turn view, from `turns t JOIN bots b ON b.name=t.bot`.
+/// A wait result, a `turns` item and an `interrupt` reply all start from it,
+/// so a client reads one shape wherever it meets a turn.
+const TURN_VIEW: &str = "t.id,t.bot,b.id,t.request_id,t.status,t.input_tokens,
+    t.cached_input_tokens,t.output_tokens,t.model_rounds,t.retries,t.paced_ms,t.started_ms,
+    t.finished_ms,json_extract(t.waiting,'$.call_id'),json_extract(t.waiting,'$.approval'),
+    json_extract(t.waiting,'$.handles'),json_extract(t.waiting,'$.any'),
+    json_extract(t.waiting,'$.deadline_ms')";
+/// Columns `TURN_VIEW` takes, for queries that select more after it.
+const TURN_VIEW_COLUMNS: usize = 18;
+
+/// One turn as it stands. `waiting_on` is what a parked turn waits for, as
+/// its `turn_waiting` or `turn_paced` event said, and null otherwise.
+fn turn_view(r: &rusqlite::Row) -> rusqlite::Result<Value> {
+    let turn: i64 = r.get(0)?;
+    let bot: String = r.get(1)?;
+    let status: String = r.get(4)?;
+    let call_id: Option<String> = r.get(13)?;
+    let deadline_ms: Option<i64> = r.get(17)?;
+    let waiting_on = match status.as_str() {
+        "waiting" if r.get::<_, Option<i64>>(14)? == Some(1) => {
+            json!({"call_id":call_id,"approval":true,"deadline_ms":deadline_ms})
+        }
+        "waiting" => {
+            let handles = r
+                .get::<_, Option<String>>(15)?
+                .and_then(|h| serde_json::from_str::<Value>(&h).ok());
+            json!({"call_id":call_id,"handles":handles,"deadline_ms":deadline_ms,
+                "any":r.get::<_, Option<i64>>(16)? == Some(1)})
+        }
+        "paced" => json!({"resume_at_ms":deadline_ms}),
+        _ => Value::Null,
+    };
+    Ok(json!({"bot":bot,"bot_id":r.get::<_, i64>(2)?,"turn":turn,
+        "handle":format!("turn:{bot}/{turn}"),"request_id":r.get::<_, String>(3)?,
+        "status":status,"waiting_on":waiting_on,
+        "input_tokens":r.get::<_, i64>(5)?,"cached_input_tokens":r.get::<_, i64>(6)?,
+        "output_tokens":r.get::<_, i64>(7)?,"model_rounds":r.get::<_, i64>(8)?,
+        "retries":r.get::<_, i64>(9)?,"paced_ms":r.get::<_, i64>(10)?,
+        "started_ms":r.get::<_, Option<i64>>(11)?,"finished_ms":r.get::<_, Option<i64>>(12)?}))
+}
+
 /// The share of input tokens the provider served from its prompt cache,
 /// to three places; zero when nothing was sent.
 pub fn cache_hit(cached: i64, input: i64) -> f64 {
@@ -5563,21 +5605,10 @@ impl Database {
     /// A finished turn's outcome for a waiter: terminal status, error, and the
     /// final assistant text, bounded. `None` while the turn is still going.
     pub fn turn_outcome(&self, name: &str, turn: i64) -> Result<Option<Value>> {
-        let owner: Option<(String, String)> = self
-            .conn
-            .query_row("SELECT bot,status FROM turns WHERE id=?", [turn], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
-            .optional()?;
-        let Some((owner, status)) = owner else {
-            return fail("turn_not_found");
-        };
-        if owner != name {
-            return fail("turn_not_found");
-        }
+        let mut outcome = self.turn_view(name, turn)?;
         if matches!(
-            status.as_str(),
-            "running" | "waiting" | "paced" | "queued" | "ready"
+            outcome["status"].as_str(),
+            Some("running" | "waiting" | "paced" | "queued" | "ready")
         ) {
             return Ok(None);
         }
@@ -5589,10 +5620,12 @@ impl Database {
                 |r| r.get(0),
             )
             .optional()?;
-        let mut outcome: Value = match finished {
+        let finished: serde_json::Map<String, Value> = match finished {
             Some(data) => serde_json::from_str(&data)?,
             None => return fail("turn_result_pruned"),
         };
+        // How it ended: checkpoint, error and detail, or the turn a steer joined.
+        outcome.as_object_mut().unwrap().extend(finished);
         let last: Option<i64> = self
             .conn
             .query_row(
@@ -5616,8 +5649,18 @@ impl Database {
         let bounded: String = text.chars().take(16 * 1024).collect();
         outcome["text_truncated"] = json!(bounded.len() < text.len());
         outcome["text"] = json!(bounded);
-        outcome["turn"] = json!(turn);
         Ok(Some(outcome))
+    }
+    /// The turn view of `name`'s turn, finished or not; `turn_not_found`
+    /// when the bot has no such turn.
+    pub fn turn_view(&self, name: &str, turn: i64) -> Result<Value> {
+        self.conn
+            .prepare_cached(&format!(
+                "SELECT {TURN_VIEW} FROM turns t JOIN bots b ON b.name=t.bot WHERE t.id=? AND t.bot=?"
+            ))?
+            .query_row(params![turn, name], turn_view)
+            .optional()?
+            .ok_or(Error::new("turn_not_found"))
     }
     /// Register a background command. Ids are unique for the store's lifetime,
     /// so a handle never resolves to a later command after a restart.
@@ -6583,16 +6626,15 @@ impl Database {
                 "limit must be 1 to 256 and after 0 or more",
             );
         }
-        let mut statement = self.conn.prepare(
-            "SELECT t.id,t.request_id,t.status,COALESCE(t.workspace,b.workspace),
-                    COALESCE(t.model,b.provider||'/'||b.model),t.input_tokens,t.output_tokens,
-                    t.model_rounds,t.started_ms,t.finished_ms,
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT {TURN_VIEW},COALESCE(t.workspace,b.workspace),
+                    COALESCE(t.model,b.provider||'/'||b.model),
                     substr(CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END,1,200),
                     length(CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END),
-                    t.retries,t.paced_ms,t.delivery,t.cached_input_tokens,COALESCE(t.reasoning,t.inherited_reasoning,b.reasoning)
+                    t.delivery,COALESCE(t.reasoning,t.inherited_reasoning,b.reasoning)
              FROM turns t JOIN bots b ON b.name=t.bot LEFT JOIN nodes n ON n.id=t.prompt_node
-             WHERE t.bot=? AND t.id>? ORDER BY t.id LIMIT ?",
-        )?;
+             WHERE t.bot=? AND t.id>? ORDER BY t.id LIMIT ?"
+        ))?;
         let mut rows = statement.query(params![name, after, (limit + 1) as i64])?;
         let mut turns = Vec::new();
         let mut more = false;
@@ -6601,20 +6643,19 @@ impl Database {
                 more = true;
                 break;
             }
-            let preview: String = r.get(10)?;
-            turns.push(
-                json!({"turn":r.get::<_, i64>(0)?,"request_id":r.get::<_, String>(1)?,
-                "status":r.get::<_, String>(2)?,"workspace":r.get::<_, Option<String>>(3)?,
-                "model":r.get::<_, String>(4)?,"reasoning":r.get::<_, Option<String>>(16)?,
-                "input_tokens":r.get::<_, i64>(5)?,
-                "output_tokens":r.get::<_, i64>(6)?,"model_rounds":r.get::<_, i64>(7)?,
-                "started_ms":r.get::<_, Option<i64>>(8)?,"finished_ms":r.get::<_, Option<i64>>(9)?,
-                "prompt_preview":preview,"prompt_bytes":r.get::<_, i64>(11)?,
-                "retries":r.get::<_, i64>(12)?,"paced_ms":r.get::<_, i64>(13)?,
-                "delivery":r.get::<_, String>(14)?,
-                "cached_input_tokens":r.get::<_, i64>(15)?,
-                "cache_hit":cache_hit(r.get::<_, i64>(15)?, r.get::<_, i64>(5)?)}),
-            );
+            let mut turn = turn_view(r)?;
+            let at = TURN_VIEW_COLUMNS;
+            turn["workspace"] = json!(r.get::<_, Option<String>>(at)?);
+            turn["model"] = json!(r.get::<_, String>(at + 1)?);
+            turn["prompt_preview"] = json!(r.get::<_, String>(at + 2)?);
+            turn["prompt_bytes"] = json!(r.get::<_, i64>(at + 3)?);
+            turn["delivery"] = json!(r.get::<_, String>(at + 4)?);
+            turn["reasoning"] = json!(r.get::<_, Option<String>>(at + 5)?);
+            turn["cache_hit"] = json!(cache_hit(
+                turn["cached_input_tokens"].as_i64().unwrap_or(0),
+                turn["input_tokens"].as_i64().unwrap_or(0)
+            ));
+            turns.push(turn);
         }
         let next = more.then(|| {
             turns

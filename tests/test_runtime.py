@@ -1469,7 +1469,7 @@ class RuntimeTests(ModelFixture):
         client.request('create', bot='Bob', workspace=str(self.path))
         turn = client.request('submit', bot='Bob', request_id='wait-1', prompt='wait')['result']['turn']
         self.model.requests.get(timeout=3)
-        self.assertEqual(client.request('interrupt', bot='Bob', turn=turn+1)['error'], 'stale_turn')
+        self.assertEqual(client.request('interrupt', bot='Bob', turn=turn+1)['error'], 'turn_not_found')
         client.request('interrupt', bot='Bob', turn=turn)
         self.assertEqual(client.finished(turn)['data']['status'], 'interrupted')
         pending = client.request('submit', bot='Bob', request_id='wait-2', prompt='wait')['result']['turn']

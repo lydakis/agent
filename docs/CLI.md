@@ -133,7 +133,8 @@ dependency is required.
 
 Default output is machine-readable JSON. `run` and `follow` stream one JSON
 object per line. Snapshot commands return compact JSON objects; `ls` and `turns`
-return arrays. `interrupt` and `shutdown` return no stdout on success.
+return arrays. `interrupt` prints the turn view, and `shutdown` prints nothing
+on success.
 `shutdown` returns once the daemon process has exited and its store is closed.
 `shutdown --grace SECONDS` first lets running turns finish for up to that long
 while starting none; turns still running then end `interrupted` with

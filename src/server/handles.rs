@@ -2,7 +2,11 @@
 //! turns, resolved from the daemon's own completions, and background commands
 //! recorded in the store. A waiter is either a parked turn (a store row plus a
 //! registry entry, no task) or a client request awaiting its response.
-use agent_runtime::{Result, fail_with, output::Output, store::Store};
+use agent_runtime::{
+    Result, fail_with,
+    output::Output,
+    store::{Reader, Store},
+};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -62,11 +66,14 @@ pub fn now_ms() -> u64 {
 pub enum Completion {
     /// Spawn a task that continues the parked turn.
     Resume { bot: String, turn: i64 },
-    /// Answer a client's `wait` request on its session.
+    /// Answer a client's `wait` request on its session. A turn still
+    /// pending is shown as it stands, read through `reader`, which keeps
+    /// no writer open past shutdown.
     Respond {
         session: u64,
         output: Output,
         request: Value,
+        reader: Reader,
     },
 }
 
@@ -219,20 +226,51 @@ impl Handles {
                 let _ = resume.send((bot, turn));
             }
             Completion::Respond {
-                output, request, ..
+                output,
+                request,
+                reader,
+                ..
             } => {
                 // A request waiter is consumed by its response.
                 Self::detach_locked(inner, waiter);
                 let results = inner
                     .waiters
                     .remove(&waiter)
-                    .map(|mut w| std::mem::take(&mut w.results));
-                if output
-                    .try_respond(request, Ok(wait_result(results.unwrap_or_default())))
-                    .is_err()
-                {
-                    output.close();
+                    .map(|mut w| std::mem::take(&mut w.results))
+                    .unwrap_or_default();
+                let pending: Vec<(String, String, i64)> = results
+                    .iter()
+                    .filter(|(_, result)| result["pending"] == true)
+                    .filter_map(|(text, _)| match Handle::parse(text) {
+                        Ok(Handle::Turn { bot, turn }) => Some((text.clone(), bot, turn)),
+                        _ => None,
+                    })
+                    .collect();
+                if pending.is_empty() {
+                    respond(&output, request, results);
+                    return;
                 }
+                // Pending turns are read in one job on the reader, off the
+                // registry lock; one that vanished meanwhile stays pending.
+                tokio::spawn(async move {
+                    let mut results = results;
+                    let views = reader
+                        .read("turn_views", move |db| {
+                            Ok(pending
+                                .into_iter()
+                                .filter_map(|(text, bot, turn)| {
+                                    Some((text, db.turn_view(&bot, turn).ok()?))
+                                })
+                                .collect::<Vec<_>>())
+                        })
+                        .await
+                        .unwrap_or_default();
+                    for (text, mut view) in views {
+                        view["pending"] = json!(true);
+                        results.insert(text, Arc::new(view));
+                    }
+                    respond(&output, request, results);
+                });
             }
         }
     }
@@ -492,6 +530,15 @@ impl Handles {
     }
 }
 
+fn respond(output: &Output, request: Value, results: BTreeMap<String, Arc<Value>>) {
+    if output
+        .try_respond(request, Ok(wait_result(results)))
+        .is_err()
+    {
+        output.close();
+    }
+}
+
 /// The shape a wait produces, for tool results and `wait` responses alike.
 pub fn wait_result(results: BTreeMap<String, Arc<Value>>) -> Value {
     let results: BTreeMap<String, Value> = results
@@ -515,8 +562,10 @@ pub fn wait_result(results: BTreeMap<String, Arc<Value>>) -> Value {
 mod tests {
     use super::*;
 
-    #[test]
-    fn any_mode_completes_on_the_first_result_and_pends_the_rest() {
+    #[tokio::test]
+    async fn any_mode_completes_on_the_first_result_and_pends_the_rest() {
+        let dir = std::env::temp_dir().join(format!("agent-any-wait-test-{}", std::process::id()));
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
         let handles = Handles::new(mpsc::unbounded_channel().0);
         let (output, _worker) = Output::stdout();
         {
@@ -532,6 +581,7 @@ mod tests {
                         session: 7,
                         output,
                         request: json!(1),
+                        reader: store.reader(),
                     },
                     timer: None,
                 },
@@ -540,10 +590,14 @@ mod tests {
             inner.by_process.insert(1, vec![Waiter::Request(1)]);
         }
         handles.process_finished(2, json!({"exit_code":0}));
-        let inner = handles.inner.lock().unwrap();
-        // Consumed by its response, with nothing left registered.
-        assert!(inner.waiters.is_empty());
-        assert!(inner.by_process.is_empty());
+        {
+            let inner = handles.inner.lock().unwrap();
+            // Consumed by its response, with nothing left registered.
+            assert!(inner.waiters.is_empty());
+            assert!(inner.by_process.is_empty());
+        }
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
