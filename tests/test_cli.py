@@ -314,32 +314,32 @@ class SocketAndCliTests(ModelFixture):
         # given a model, and Dan, given his own level, do not.
         spawn = ' && '.join(f'"$AGENT_BIN" run --detach --no-spawn --new --bot {name} {flags} -- shell:true'
                             for name, flags in (('Alice', ''), ('Carol', '--model openai/synthetic-model'),
-                                                ('Dan', '--reasoning low')))
-        bob = self.agent('run', *self.common, '--reasoning', 'xhigh', '--new', '--bot', 'Bob',
-                         f'shell:printf "$AGENT_REASONING" > effort && {spawn}')
+                                                ('Dan', '--effort low')))
+        bob = self.agent('run', *self.common, '--effort', 'xhigh', '--new', '--bot', 'Bob',
+                         f'shell:printf "$AGENT_EFFORT" > effort && {spawn}')
         self.assertEqual(bob.returncode, 0, bob.stderr)
         self.assertEqual((self.path / 'effort').read_text(), 'xhigh')
         self.assertEqual(self.model.requests.get(timeout=5)['reasoning'], {'effort': 'xhigh', 'summary': 'auto'})
-        listed = {b['name']: b['reasoning'] for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout)}
+        listed = {b['name']: b['effort'] for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout)}
         self.assertEqual(listed, {'Bob': 'xhigh', 'Alice': 'xhigh', 'Carol': None, 'Dan': 'low'})
         # Followers learn the level from the creation event, as the list shows it.
         replay = self.agent('follow', '--store', str(self.store), '--bot', 'Alice')
         created = json.loads(replay.stdout.splitlines()[0])
-        self.assertEqual((created['event'], created['data']['reasoning']), ('created', 'xhigh'))
+        self.assertEqual((created['event'], created['data']['effort']), ('created', 'xhigh'))
         # A level the model's family does not take is refused before the bot exists.
-        refused = self.agent('run', *self.common, '--reasoning', 'max', '--new', '--bot', 'Max', 'hi', check=False)
+        refused = self.agent('run', *self.common, '--effort', 'max', '--new', '--bot', 'Max', 'hi', check=False)
         self.assertEqual(refused.returncode, 1)
         level = json.loads(refused.stderr)
-        self.assertEqual(level['error'], 'invalid_reasoning_level')
-        self.assertIn('xhigh', level['levels'])
+        self.assertEqual(level['error'], 'invalid_effort')
+        self.assertIn('xhigh', level['efforts'])
         # On an existing bot a level is that turn's alone, as --model is.
         for name in ('Alice', 'Carol', 'Dan'):
             turn = json.loads(self.agent('turns', '--store', str(self.store), '--bot', name).stdout)[-1]['turn']
             self.agent('wait', '--store', str(self.store), f'turn:{name}/{turn}')
         while not self.model.requests.empty():
             self.model.requests.get_nowait()
-        again = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--reasoning', 'low',
-                           'shell:printf "$AGENT_REASONING" > effort')
+        again = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--effort', 'low',
+                           'shell:printf "$AGENT_EFFORT" > effort')
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertEqual((self.path / 'effort').read_text(), 'low')
         sent = []
@@ -348,8 +348,8 @@ class SocketAndCliTests(ModelFixture):
         self.assertTrue(sent)
         self.assertEqual(sent, [{'effort': 'low', 'summary': 'auto'}] * len(sent))
         turns = json.loads(self.agent('turns', '--store', str(self.store), '--bot', 'Bob').stdout)
-        self.assertEqual([t['reasoning'] for t in turns], ['xhigh', 'low'])
-        listed = {b['name']: b['reasoning'] for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout)}
+        self.assertEqual([t['effort'] for t in turns], ['xhigh', 'low'])
+        listed = {b['name']: b['effort'] for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout)}
         self.assertEqual(listed['Bob'], 'xhigh')
 
     def test_new_bots_get_the_cli_compaction_text_unless_declined(self):
@@ -484,7 +484,7 @@ class SocketAndCliTests(ModelFixture):
             ('follow', '--all', '--bot', 'Bob'),
             ('stats', '--any'), ('ls', 'ignored'), ('ls', '-x'),
             ('wait', '--all', 'proc:1'),
-            ('run', '--bot', 'Bob', '--reasoning', 'low', 'hi'),
+            ('run', '--bot', 'Bob', '--effort', 'low', 'hi'),
             ('run', '--new', '--instructions', 'one', '--instructions-file', 'missing', 'hi'),
             ('wait', '--any=true', 'proc:1'),
             ('run', '--bot', 'Bob', '--bot', 'Alice', 'hi'),

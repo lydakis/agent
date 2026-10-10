@@ -97,7 +97,7 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
             workspace,
             model,
             instructions,
-            reasoning,
+            effort,
             tools,
             created_by,
             compaction_instructions,
@@ -109,7 +109,7 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
                 bot,
                 model,
                 instructions,
-                reasoning,
+                effort,
                 tools,
                 created_by,
                 compaction_instructions,
@@ -126,11 +126,11 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
             bot,
             request_id,
             model,
-            reasoning,
+            effort,
             delivery,
             ..
         } => (
-            output::encoded_len(&(id, bot, bot, request_id, model, reasoning, delivery)),
+            output::encoded_len(&(id, bot, bot, request_id, model, effort, delivery)),
             output::encoded_len(&(bot, request_id)),
             0,
             Ok(0),
@@ -173,7 +173,7 @@ enum Command {
         workspace: Option<String>,
         model: Option<String>,
         instructions: Option<String>,
-        reasoning: Option<String>,
+        effort: Option<String>,
         budget_tokens: Option<u64>,
         /// The tools this bot may call, from the daemon's registered set.
         tools: Option<Vec<String>>,
@@ -254,7 +254,7 @@ enum Command {
         workspace: Option<String>,
         model: Option<String>,
         /// This turn's effort level; absent is the bot's own.
-        reasoning: Option<String>,
+        effort: Option<String>,
         /// `reject` (default), `queue`, or `steer`.
         delivery: Option<String>,
         /// With `steer`: the running turn this message is for, or `stale_turn`.
@@ -1833,7 +1833,7 @@ impl Service {
                 workspace: path,
                 model,
                 instructions,
-                reasoning,
+                effort,
                 budget_tokens,
                 tools,
                 created_by,
@@ -1877,8 +1877,8 @@ impl Service {
                 // with no room for thinking, is refused before the bot exists.
                 settings.validate()?;
                 turn::shaped(served, &settings)?;
-                if let Some(level) = &reasoning {
-                    family.check_reasoning(level)?;
+                if let Some(level) = &effort {
+                    family.check_effort(level)?;
                 }
                 let instructions = instructions.ok_or(Error::new("instructions_required"))?;
                 if instructions.len() > 64 * 1024 {
@@ -1922,7 +1922,7 @@ impl Service {
                                 family,
                                 model: &model,
                                 instructions: &instructions,
-                                reasoning: reasoning.as_deref(),
+                                effort: effort.as_deref(),
                                 budget_tokens,
                                 tools: &tools,
                                 created_by: created_by.as_deref(),
@@ -2496,7 +2496,7 @@ impl Service {
                 prompt,
                 workspace: path,
                 model,
-                reasoning,
+                effort,
                 delivery,
                 expected_turn,
                 from,
@@ -2527,7 +2527,7 @@ impl Service {
                 let options = TurnOptions {
                     workspace: path.as_deref().map(workspace).transpose()?,
                     model,
-                    reasoning,
+                    effort,
                     delivery,
                     expected_turn,
                     from: from.map(|author| (author.bot, author.turn)),
@@ -3096,7 +3096,7 @@ mod tests {
                         family: Family::Responses,
                         model: "synthetic-model",
                         instructions: "test",
-                        reasoning: None,
+                        effort: None,
                         budget_tokens: None,
                         tools: &[],
                         created_by: None,
@@ -3306,7 +3306,7 @@ mod tests {
             family: Family::Responses,
             model: "synthetic-model",
             instructions: "test",
-            reasoning: None,
+            effort: None,
             budget_tokens: None,
             tools: &[],
             created_by: None,
@@ -3466,7 +3466,7 @@ mod tests {
             prompt: "work".into(),
             workspace: None,
             model: None,
-            reasoning: None,
+            effort: None,
             delivery: None,
             expected_turn: None,
             from: None,
@@ -3538,7 +3538,7 @@ mod tests {
                                 family: Family::Responses,
                                 model: "synthetic",
                                 instructions: "",
-                                reasoning: None,
+                                effort: None,
                                 budget_tokens: None,
                                 tools: &[],
                                 created_by: None,
@@ -3831,7 +3831,7 @@ mod tests {
                         family: Family::Responses,
                         model: "synthetic",
                         instructions: "",
-                        reasoning: None,
+                        effort: None,
                         budget_tokens: None,
                         tools: &[],
                         created_by: None,
@@ -3917,7 +3917,7 @@ mod tests {
                         family: Family::Responses,
                         model: "synthetic",
                         instructions: "",
-                        reasoning: None,
+                        effort: None,
                         budget_tokens: None,
                         tools: &[],
                         created_by: None,
@@ -4158,7 +4158,7 @@ mod tests {
             workspace: Some(workspace.to_str().unwrap().into()),
             model: Some("openai/synthetic".into()),
             instructions: Some(String::new()),
-            reasoning: None,
+            effort: None,
             budget_tokens: None,
             tools: Some(Vec::new()),
             created_by: None,
@@ -4700,7 +4700,7 @@ mod tests {
         if let Command::Create {
             model,
             instructions,
-            reasoning,
+            effort,
             compaction_instructions,
             compaction_model,
             ..
@@ -4708,7 +4708,7 @@ mod tests {
         {
             *model = Some(format!("openai/{}", "\u{1}".repeat(256)));
             *instructions = Some(awkward.clone());
-            *reasoning = Some("high".into());
+            *effort = Some("high".into());
             *compaction_instructions = Some(awkward);
             *compaction_model = Some("openai/synthetic".into());
         }
@@ -4732,7 +4732,7 @@ mod tests {
                             family: Family::Responses,
                             model: "synthetic",
                             instructions: "",
-                            reasoning: None,
+                            effort: None,
                             budget_tokens: None,
                             tools: &tools,
                             created_by: creator.as_ref().map(|c| c.name.as_str()),
@@ -5011,7 +5011,7 @@ mod tests {
                         family: Family::Responses,
                         model: "synthetic",
                         instructions: "",
-                        reasoning: None,
+                        effort: None,
                         budget_tokens: None,
                         tools: &tools,
                         created_by: None,

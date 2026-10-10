@@ -52,7 +52,7 @@ def run(agent, out, bots, minutes, model, context_items, window_seconds, retain_
                               **({'retain_turns': retain_turns} if retain_turns else {})})
     daemon = psutil.Process(client.process.pid)
     for index in range(bots):
-        client.request('create', bot=f'b{index}', workspace=str(workspace), reasoning='low')
+        client.request('create', bot=f'b{index}', workspace=str(workspace), effort='low')
     started = time.monotonic()
     deadline = started + minutes * 60
     submitted_at, sequence = {}, {}
