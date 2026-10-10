@@ -1744,7 +1744,8 @@ its first parent (`show --diff-merges=first-parent`, a hex sha only), with
 `--literal-pathspecs`, no external diff or textconv, and no optional locks, so
 it never holds a lock an agent's own git waits on. A diff stops at 1 MiB, cut
 at a line, and git is stopped there; the page draws at most 5,000 rows and
-counts the rest. Only the tab in view reads: when it comes into view, on `r`
+counts the rest. Only the tab in view holds what it read; one out of view keeps
+which rows were chosen and its sent notes. It reads when it comes into view, on `r`
 or ↻, when the window comes back, and 600 ms after a step or turn of an agent
 working in its repository ends (once for a burst). One diff is read at a time;
 moving down a list fast reads the row it stops on. A window on a host refuses,

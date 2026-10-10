@@ -1797,17 +1797,21 @@ function gitTab(dir) {
   return g;
 }
 // What a row is, across reads: a change by its path, a commit by its sha, a worktree by its folder.
-const gitKeyOf = (panel, it) => (panel === 'changes' ? `c:${it.path}` : panel === 'commits' ? `s:${it.sha}` : `w:${it.path}`);
+// A path both deleted from the index and new in the folder is two changes.
+const gitKeyOf = (panel, it) => (panel === 'changes' ? `c:${it.code === '??' ? '?' : ''}${it.path}` : panel === 'commits' ? `s:${it.sha}` : `w:${it.path}`);
 const gitList = (g, panel = g.panel) => (g.view ? panel === 'changes' ? g.view.changes : panel === 'commits' ? g.view.commits : g.view.worktrees : []);
 const gitItem = (g) => gitList(g)[g.sel[g.panel]] ?? null;
+// The rows chosen, by what they are; a Git tab out of view keeps only these.
+const chosen = (g) => (g.view ? Object.fromEntries(GIT_PANELS.map((p) => { const it = gitList(g, p)[g.sel[p]]; return [p, it ? gitKeyOf(p, it) : null]; })) : g.chosen ?? {});
 async function readGit(g) {
   if (g.reading) { g.again = true; return; }
   g.reading = true; clearTimeout(g.timer); g.timer = null;
   if (g.state === 'idle') g.state = 'loading';
-  // The rows chosen stay chosen when they are still there.
-  const was = Object.fromEntries(GIT_PANELS.map((p) => { const it = gitList(g, p)[g.sel[p]]; return [p, it ? gitKeyOf(p, it) : null]; }));
   try {
     const view = await Daemon.gitView(g.dir);
+    // The rows chosen stay chosen when they are still there, as chosen when the read comes back:
+    // the lists stay live while git runs.
+    const was = chosen(g);
     Object.assign(g, { state: 'ok', view, error: '' });
     for (const p of GIT_PANELS) {
       const list = gitList(g, p), at = was[p] == null ? -1 : list.findIndex((it) => gitKeyOf(p, it) === was[p]);
@@ -1901,7 +1905,8 @@ async function openGit(who) {
   S.ui.gitFrom.set(dir, [who, b.id]);
   await go(GIT + dir, 'tab');
 }
-const noteKey = (of, r) => `${of}\u0000${r.p ?? ''}\u0000${r.k === 'del' ? `o${r.o}` : `n${r.n}`}`;
+// A sent note stays under the line it is about, by what the line holds, as lines above it come and go.
+const noteKey = (of, r) => `${of}\u0000${r.p ?? ''}\u0000${r.k}\u0000${r.t}`;
 const NOTE_QUOTE = 300;
 // The note names the file and line as the agent's folder names them, quotes the line, then says
 // what was typed; a commit's names the commit too.
@@ -2577,7 +2582,11 @@ function render() {
   const tab = fileOf(S.selected), gtab = gitOf(S.selected);
   if (tab == null) dropTabFile(); else if (S.ui.tabFile?.full !== tab) readTabFile(tab);
   // A closed Git tab lets its view go.
-  for (const dir of S.ui.git.keys()) if (!S.ui.tabs.includes(GIT + dir)) { clearTimeout(S.ui.git.get(dir).timer); S.ui.git.delete(dir); }
+  // A Git tab out of view keeps only which rows were chosen and its notes, and reads again when shown.
+  for (const [dir, g] of S.ui.git) {
+    if (!S.ui.tabs.includes(GIT + dir)) { clearTimeout(g.timer); S.ui.git.delete(dir); }
+    else if (dir !== gtab && g.view) { g.chosen = chosen(g); clearTimeout(g.timer); Object.assign(g, { view: null, diff: null, note: null, state: 'idle', timer: null }); g.gen += 1; }
+  }
   $('log').classList.toggle('gitpane', gtab != null); $('title').classList.toggle('wide', gtab != null);
   // Each plan before its chat, so a chat that follows its end measures what is left once the plan is drawn.
   renderPlan($('plan'), sw ? null : b); renderPlan($('sideplan'), side);
@@ -3361,7 +3370,6 @@ async function go(name, how = 'here') {
     if (name && !tabs.includes(name)) { if (how === 'tab' || at < 0) tabs.push(name); else tabs[at] = name; }
     S.selected = name; S.ui.side = null;
     const sw = swarmOf(name); if (sw) { readBoard(sw); readUsage(sw); }
-    const dir = gitOf(name); if (dir != null && S.ui.git.get(dir)?.state === 'ok') readGit(S.ui.git.get(dir));
   }
   await enqueue(loadVisible); render(); save();
   focusInput(S.ui.side && how === 'beside' ? 'side' : 'main');

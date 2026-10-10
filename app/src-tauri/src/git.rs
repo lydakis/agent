@@ -231,9 +231,12 @@ pub struct Diff {
 
 pub fn diff(root: &Path, target: &Target) -> Result<Diff, String> {
     let mut command = run(root);
-    command.args(["--literal-pathspecs", "-c", "diff.noprefix=false"]);
+    command.args(["--literal-pathspecs"]);
     // `diff --no-index` exits 1 when the files differ; anything else that
     // is not success is a failure, whatever it printed first.
+    // The page reads paths from `a/` and `b/` headers, whatever prefixes
+    // the person's own git config asks for.
+    const PREFIXES: [&str; 2] = ["--src-prefix=a/", "--dst-prefix=b/"];
     let differs = matches!(
         target,
         Target::Change {
@@ -247,11 +250,13 @@ pub fn diff(root: &Path, target: &Target) -> Result<Diff, String> {
             untracked: true,
             ..
         } => {
-            command.args(["diff", "--no-index", "--no-color", "--no-ext-diff", "--"]);
+            command.args(["diff", "--no-index", "--no-color", "--no-ext-diff"]);
+            command.args(PREFIXES).arg("--");
             command.arg("/dev/null").arg(path);
         }
         Target::Change { path, from, .. } => {
             command.args(["diff", "--no-color", "--no-ext-diff", "--no-textconv", "-M"]);
+            command.args(PREFIXES);
             command.arg(base(root)?).arg("--");
             if let Some(from) = from {
                 command.arg(from);
@@ -270,13 +275,17 @@ pub fn diff(root: &Path, target: &Target) -> Result<Diff, String> {
                 "--format=",
                 "-M",
                 "--diff-merges=first-parent",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
                 sha,
                 "--",
             ]);
         }
     }
     let mut out = capture(command, MAX_DIFF)?;
-    if !out.cut && !out.ok && !(differs && out.code == Some(1)) {
+    // A file it cannot read also exits 1, with nothing printed but an error.
+    let differed = differs && out.code == Some(1) && !out.bytes.is_empty();
+    if !out.cut && !out.ok && !differed {
         let error = out.error.trim();
         return Err(if error.is_empty() {
             format!("git failed ({:?})", out.code)
@@ -495,6 +504,26 @@ mod tests {
         )
         .unwrap();
         assert!(new.text.contains("+fn main() {}"), "{}", new.text);
+        // A file gone before its diff is read fails rather than showing nothing.
+        let gone = Target::Change {
+            path: "gone.rs".into(),
+            from: None,
+            untracked: true,
+        };
+        assert!(diff(root, &gone).is_err());
+        // Headers keep `a/` and `b/` whatever the config asks for.
+        run(&tmp, &["config", "diff.mnemonicPrefix", "true"]);
+        run(&tmp, &["config", "diff.noprefix", "true"]);
+        let prefixed = diff(
+            root,
+            &Target::Change {
+                path: "a.txt".into(),
+                from: None,
+                untracked: false,
+            },
+        )
+        .unwrap();
+        assert!(prefixed.text.contains("+++ b/a.txt"), "{}", prefixed.text);
         let shown = diff(root, &Target::Commit(v.commits[0].sha.clone())).unwrap();
         assert!(shown.text.contains("+b\n") && !shown.text.contains("TWO"));
         assert!(diff(root, &Target::Commit("HEAD~1".into())).is_err());

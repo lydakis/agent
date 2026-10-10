@@ -3967,3 +3967,26 @@ test('a note keeps the line it was opened on when the diff is read again under i
   p.forgetBot('y'); p.upsert({ name: 'y', bot_id: 9, provider: 'alpha', model: 'one', workspace: '/w' });
   assert.equal(p.gitOwner('/w').name, 'x');
 });
+
+test('a Git tab out of view lets its lists and diff go and reads them again, on the same rows, when shown', async () => {
+  let reads = 0;
+  const { p, doc } = gitPage({ gitView: async () => { reads++; return structuredClone(GIT_VIEW); } });
+  await p.go('x'); await p.act({ dataset: { act: 'git', who: 'x' } }); await settle();
+  await key(doc, 'j'); await settle();
+  const g = p.S.ui.git.get('/w');
+  await p.go('x'); await settle();
+  assert.equal(g.view, null); assert.equal(g.diff, null);
+  await p.go('⎇/w'); await settle();
+  assert.equal(reads, 2); assert.equal(g.sel.changes, 1); assert.equal(g.diff.of, 'c:src/c.rs');
+});
+
+test('a row chosen while the Git tab is being read again stays chosen', async () => {
+  let gate = null;
+  const { p, doc } = gitPage({ gitView: async () => { if (gate) await gate.promise; return structuredClone(GIT_VIEW); } });
+  await p.go('⎇/w', 'tab'); await settle();
+  const g = p.S.ui.git.get('/w');
+  gate = deferred(); const reading = p.readGit(g);
+  await key(doc, 'j'); await key(doc, 'j');
+  gate.resolve(); await reading; await settle();
+  assert.equal(g.sel.changes, 2); assert.equal(g.diff.of, 'c:?notes.md');
+});
