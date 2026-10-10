@@ -766,7 +766,7 @@ async function onEvent(ev) {
       // Its tab goes up a level, to what made it, rather than closing on the reader.
       const up = upOf(name);
       forgetBot(name);
-      retab(name, isOpen(up) ? up : '');
+      retab(name, isOpen(up) ? up : ''); save();
       // A deleted agent leaves its swarm, which stops counting it and posting to it.
       if (S.memberOf.has(name)) {
         const sw = S.memberOf.get(name); patchRailRow(swarmKey(sw));
@@ -1235,10 +1235,16 @@ function restore() {
   const key = sessionKey(); if (!key) return;
   let saved = null; try { saved = JSON.parse(localStorage.getItem(key) || 'null'); } catch (_) {}
   if (!saved) return;
-  // Tabs come back like a browser's, less any agent gone since or made again under its name.
-  if (Array.isArray(saved.tabs)) S.ui.tabs = [...new Set(saved.tabs.map(sameKey).filter(Boolean))];
-  S.selected = S.ui.tabs.includes(saved.selected) ? saved.selected : '';
-  const side = sameKey(saved.side);
+  // Tabs come back like a browser's. One whose agent is gone since, or made again under its name, goes
+  // up a level to what made it, as it would have live, or closes when that is gone too.
+  let selected = '';
+  if (Array.isArray(saved.tabs)) {
+    const now = saved.tabs.map((entry) => [Array.isArray(entry) ? entry[0] : null, sameKey(entry)]);
+    S.ui.tabs = [...new Set(now.map(([, k]) => k).filter(Boolean))];
+    selected = now.find(([k]) => k === saved.selected)?.[1] ?? '';
+  }
+  S.selected = S.ui.tabs.includes(selected) ? selected : '';
+  const side = Array.isArray(saved.side) ? savedKey(saved.side[0], saved.side[1]) : null;
   if (side && S.bots.has(side) && side !== S.selected) S.ui.side = side;
   S.ui.rail = saved.rail !== false; S.ui.steps = !!saved.steps;
   // A model pick belongs to the identity it was made for, not to whichever bot holds the name now.
@@ -1253,14 +1259,15 @@ function restore() {
     if (b && b.id != null && b.id === id && effortsFor(b.model).includes(level) && level !== b.reasoning) S.effort.set(name, level);
   }
 }
-// A tab, or the agent beside, is saved with the identity it shows; a swarm is its key.
-const keyIdentity = (k) => [k, bot(k)?.id ?? null];
-const sameKey = (entry) => {
-  const [k, id] = Array.isArray(entry) ? entry : [];
+// A tab, or the agent beside, is saved with the identity it shows and the one a level up; a swarm is
+// its key.
+const keyIdentity = (k) => { const up = upOf(k); return [k, bot(k)?.id ?? null, up || null, up ? bot(up)?.id ?? null : null]; };
+const savedKey = (k, id) => {
   if (typeof k !== 'string') return null;
   if (swarmOf(k)) return k;
   const b = bot(k); return b && b.id != null && b.id === id ? k : null;
 };
+const sameKey = (entry) => { const [k, id, up, upId] = Array.isArray(entry) ? entry : []; return savedKey(k, id) ?? savedKey(up, upId); };
 function save() { const key = sessionKey(); if (!key) return; try { localStorage.setItem(key, JSON.stringify({ selected: S.selected, tabs: S.ui.tabs.map(keyIdentity), side: S.ui.side ? keyIdentity(S.ui.side) : null, rail: S.ui.rail, steps: S.ui.steps, override: [...S.override].map(([name, model]) => [name, bot(name)?.id ?? null, model]), effort: [...S.effort].map(([name, level]) => [name, bot(name)?.id ?? null, level]) })); } catch (_) {} }
 window.addEventListener('beforeunload', save);
 window.addEventListener('focus', markSeen);
@@ -2734,7 +2741,7 @@ function renderSetup() {
 // - 'beside': beside what is open, with its own composer; the one already beside closes instead.
 // - 'close': its tab closes, and an open one hands the window to the tab before it, or Home.
 async function go(name, how = 'here') {
-  clearTimeout(rowLook.timer);
+  clearTimeout(rowLook.timer); rowLook.who = rowLook.before = null;
   const tabs = S.ui.tabs;
   if (how === 'close') {
     const i = tabs.indexOf(name); if (i < 0) return;
@@ -2931,7 +2938,12 @@ document.addEventListener('click', async (e) => {
   else if (row) {
     if (e.detail > 1) return;
     const who = rowLook.who = row.dataset.bot;
-    rowLook.timer = setTimeout(() => { rowLook.before = { tabs: [...S.ui.tabs], selected: S.selected }; go(who, swarmOf(who) ? 'here' : 'beside').catch(failed); }, DOUBLE_CLICK_MS);
+    // The look is a move like any other; the row stays named, with where the window was, until the next.
+    rowLook.timer = setTimeout(() => {
+      const before = { tabs: [...S.ui.tabs], selected: S.selected };
+      go(who, swarmOf(who) ? 'here' : 'beside').catch(failed);
+      rowLook.who = who; rowLook.before = before;
+    }, DOUBLE_CLICK_MS);
     return;
   }
   else if (tab) await go(tab.dataset.tab);

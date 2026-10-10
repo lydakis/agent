@@ -447,7 +447,11 @@ The page draws with the machine's own monospace face and fetches nothing.
 Closing the window is detaching; the daemon and its bots continue. The page
 remembers the open tabs and the one on screen, the agent beside, the
 sidebar, model picks and the steps fold per store and workspace in the
-webview's local storage, and restores them on the next start. The store is
+webview's local storage, and restores them on the next start. Each is kept
+with its bot's id and the id of what is a level above it, so a tab whose agent
+was deleted while the window was closed comes back as that level above, as it
+would have moved live, and one whose name now holds another bot does not come
+back. The store is
 the identity the daemon announces when the window attaches, so two hosts, or
 a host and this machine, never share what a window remembers, whatever socket
 reaches them. When the socket a window reattaches to answers with another
