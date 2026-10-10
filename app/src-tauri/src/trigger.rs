@@ -1020,7 +1020,7 @@ fn retire(places: &Places, name: &str, keep: bool, launchd: Loader) -> Result<bo
     let mut aside: Vec<(PathBuf, PathBuf)> = Vec::new();
     let back = |aside: &[(PathBuf, PathBuf)]| {
         for (path, by) in aside {
-            if let Err(error) = moved(by, path) {
+            if let Err(error) = renamed(by, path) {
                 eprintln!("{}", error_json(&error));
             }
         }
@@ -1034,7 +1034,7 @@ fn retire(places: &Places, name: &str, keep: bool, launchd: Loader) -> Result<bo
             ".{}.retiring",
             path.file_name().unwrap_or_default().to_string_lossy()
         ));
-        if let Err(error) = moved(&path, &by) {
+        if let Err(error) = renamed(&path, &by) {
             back(&aside);
             return Err(error);
         }
@@ -1058,7 +1058,7 @@ fn retire(places: &Places, name: &str, keep: bool, launchd: Loader) -> Result<bo
 }
 
 /// Rename a file, durably: its folder is synced after.
-fn moved(from: &Path, to: &Path) -> Result<(), String> {
+fn renamed(from: &Path, to: &Path) -> Result<(), String> {
     std::fs::rename(from, to)
         .and_then(|()| match to.parent() {
             Some(dir) => std::fs::File::open(dir).and_then(|d| d.sync_all()),
