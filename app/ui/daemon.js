@@ -60,7 +60,7 @@ window.Daemon = (() => {
     openai: [{ id: 'gpt-6-luna' }, { id: 'gpt-6-sol' }],
     anthropic: [{ id: 'claude-sonnet-5', name: 'Claude Sonnet 5' }],
     chatgpt: [{ id: 'gpt-6-luna' }],
-    bedrock: [{ id: 'anthropic.claude-opus-5', name: 'Claude Opus 5' }, { id: 'anthropic.claude-sonnet-5', name: 'Claude Sonnet 5' }, { id: 'anthropic.claude-haiku-5', name: 'Claude Haiku 5' }],
+    bedrock: [{ id: 'global.anthropic.claude-opus-5-5', name: 'Global Claude Opus 5.5' }, { id: 'global.anthropic.claude-sonnet-5', name: 'Global Claude Sonnet 5' }, { id: 'global.anthropic.claude-haiku-4-5', name: 'Global Claude Haiku 4.5' }],
     'bedrock-openai': [{ id: 'openai.gpt-6-luna' }, { id: 'qwen.qwen3-coder-480b' }],
   };
   const specs = () => (ENV.AGENT_PROVIDER ?? '').split(/\s+/).filter(Boolean);
@@ -71,17 +71,17 @@ window.Daemon = (() => {
   // A prompt another bot wrote names it with its item, as the daemon's `history_items` does.
   // Who sent a prompt, as the daemon keeps it with the node: another bot's turn, with the identity
   // its name held then, or what the client named as its origin.
-  const senderOf = (by) => by?.origin ? { origin: by.origin } : by ? { from: { bot: by.bot, turn: by.turn, id: S.bots.get(by.bot)?.id ?? null } } : {};
+  const senderOf = (by) => by?.origin ? { origin: by.origin } : by ? { from: { bot: by.bot, turn: by.turn, bot_id: S.bots.get(by.bot)?.bot_id ?? null } } : {};
   const authorOf = (event) => ({ ...(event.data.from ? { from: event.data.from } : {}), ...(event.data.origin ? { origin: event.data.origin } : {}) });
   const emit = (event) => { if (event.data?.node != null) { if (!S.lineages.has(event.bot)) S.lineages.set(event.bot, []); S.lineages.get(event.bot).push({node:event.data.node,turn:event.turn ?? null,...authorOf(event)}); } if (event.durable !== false) event.cursor = ++S.cursor; S.queue.push(event); if (S.waiter) { const w = S.waiter; S.waiter = null; w(); } };
   const node = (item) => { const id = S.nextNode++; S.nodes.set(id, item); return id; };
   const wait = (ms) => new Promise((r) => { const t = setTimeout(() => { S.timers.delete(t); r(); }, ms); S.timers.add(t); });
-  const record = (name, model, reasoning = null) => ({ name, status: 'idle', running_turn: null, provider: model.split('/')[0], model: model.split('/').slice(1).join('/'), reasoning, workspace: '/workspace', input_tokens: 0, cached_input_tokens: 0, tokens_used: 0 });
+  const record = (name, model, reasoning = null) => ({ name, status: 'idle', running_turn: null, provider: model.split('/')[0], model: model.split('/').slice(1).join('/'), effort: reasoning, workspace: '/workspace', input_tokens: 0, cached_input_tokens: 0, tokens_used: 0 });
 
   async function create(name, model, createdBy = null, source = null, workspace = null, allowed = null, reasoning = null) {
     if (S.bots.has(name)) throw new Error('bot_exists');
     // Lineage is pinned to the creator's identity, and the event carries the record's list fields, as the daemon's does.
-    const b = { ...record(name, model, source ? S.bots.get(source)?.reasoning ?? null : reasoning), ...(workspace ? { workspace } : {}), id: S.nextId++, created_by: createdBy, created_by_id: createdBy ? S.bots.get(createdBy)?.id ?? null : null, turns: 0, interrupted: false, ...(allowed ? { allowed } : {}) };
+    const b = { ...record(name, model, source ? S.bots.get(source)?.effort ?? null : reasoning), ...(workspace ? { workspace } : {}), bot_id: S.nextId++, created_by: createdBy, created_by_id: createdBy ? S.bots.get(createdBy)?.bot_id ?? null : null, turns: 0, interrupted: false, ...(allowed ? { allowed } : {}) };
     S.bots.set(name, b);
     // A fork shares its source's history up to its newest finished round. The demo keeps no call
     // nodes, only their results, so that is its newest node that is not a tool result.
@@ -91,7 +91,7 @@ window.Daemon = (() => {
       S.lineages.set(name, all.slice(0, end));
     }
     const checkpoint = source ? S.lineages.get(source)?.at(-1)?.node ?? null : undefined;
-    emit({ event: source ? 'forked' : 'created', bot: name, turn: null, data: { id: b.id, provider: b.provider, model: b.model, reasoning: b.reasoning, workspace: b.workspace, status: 'idle', running_turn: null, created_by: createdBy, created_by_id: b.created_by_id, ...(allowed ? { allowed } : {}), ...(source ? { source, checkpoint } : {}) } });
+    emit({ event: source ? 'forked' : 'created', bot: name, turn: null, data: { bot_id: b.bot_id, provider: b.provider, model: b.model, effort: b.effort, workspace: b.workspace, status: 'idle', running_turn: null, created_by: createdBy, created_by_id: b.created_by_id, ...(allowed ? { allowed } : {}), ...(source ? { source, checkpoint } : {}) } });
     return b;
   }
   // Scripted work outlives a stop; a bot deleted meanwhile reads as interrupted, so it ends quietly.
@@ -302,7 +302,7 @@ window.Daemon = (() => {
   async function plan(name, turn, ...steps) {
     const b = S.bots.get(name); if (!b || b.interrupted) return;
     const text = steps.join('\n') + '\n';
-    (S.plans ??= new Map()).set(b.id, text);
+    (S.plans ??= new Map()).set(b.bot_id, text);
     await tool(name, turn, 'shell', { command: `sh "$HOME/.agents/skills/plan/plan" ${steps.map((x) => `'${x}'`).join(' ')}` }, JSON.stringify({ exit_code: 0, stderr: "", stdout: `plan saved: ${steps.length} steps\n`, success: true }), 200);
   }
   async function work(n, turn, text) {
@@ -353,8 +353,8 @@ window.Daemon = (() => {
   async function enlist(sw, rows, each, late = false) {
     const bots = [];
     for (const [name, row] of rows) {
-      const b = await api.request('create', { bot: name, model: sw.mix[row].model, reasoning: sw.mix[row].reasoning ?? null, workspace: sw.workspace, budget_tokens: each });
-      sw.members.push(name); sw.ids[name] = b.id; sw.rows[name] = row; bots.push(b);
+      const b = await api.request('create', { bot: name, model: sw.mix[row].model, effort: sw.mix[row].reasoning ?? null, workspace: sw.workspace, budget_tokens: each });
+      sw.members.push(name); sw.ids[name] = b.bot_id; sw.rows[name] = row; bots.push(b);
       sw.made = Math.max(sw.made ?? 0, Number(name.split('-').pop()) || 0);
     }
     for (const [name] of rows) reply(name, `You are ${short(sw, name)}, one of ${sw.members.length} agents in the swarm ${short(sw, sw.name)}.${late ? ' You joined after the others started, so read the board first.' : ''}`);
@@ -590,7 +590,7 @@ window.Daemon = (() => {
         // A demo bot's only unfinished turn is the one it runs.
         case 'turns': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); return { turns: b.running_turn != null && params.after < b.running_turn ? [{ turn: b.running_turn, status: b.status }] : [], next_after: null }; }
         case 'resume': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); return { ...b }; }
-        case 'create': { await create(params.bot, params.model, params.created_by ?? null, null, params.workspace, null, params.reasoning ?? null); return { ...S.bots.get(params.bot) }; }
+        case 'create': { await create(params.bot, params.model, params.created_by ?? null, null, params.workspace, null, params.effort ?? null); return { ...S.bots.get(params.bot) }; }
         case 'submit': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); if (b.status !== 'idle' && params.delivery === 'reject') throw new Error('bot_busy');
           if (params.delivery === 'steer' && params.expected_turn != null && params.expected_turn !== b.running_turn) throw new Error('stale_turn');
           const by = params.from ?? (params.origin ? { origin: params.origin } : null);

@@ -33,7 +33,7 @@ def run(agent, out, bots, model, max_connecting, reasoning):
     provider = model.split('/', 1)[0]
     env = os.environ.copy()
     tools = 'shell,read,write,edit,wait'
-    common = ['--store', str(store), '--provider', provider, '--model', model, '--reasoning', reasoning,
+    common = ['--store', str(store), '--provider', provider, '--model', model, '--effort', reasoning,
               '--tools', tools, '--workspace', str(workspace),
               *(['--max-connecting', str(max_connecting)] if max_connecting is not None else [])]
     # One detached turn starts the daemon so every fleet submission races a live one.

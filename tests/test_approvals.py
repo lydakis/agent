@@ -205,10 +205,10 @@ class ApprovalTests(ModelFixture):
         # A bot created from a gated bot's shell keeps the gates its tools meet.
         bob = client.request('resume', bot='Bob')['result']
         child = client.request('create', bot='Dan', workspace=str(self.path), tools=['echo', 'shell'],
-                               created_by='Bob', created_by_id=bob['id'])['result']
+                               created_by='Bob', created_by_id=bob['bot_id'])['result']
         self.assertEqual(child['gates'], [{'tag': 'manual', 'tools': ['shell']}])
         reader = client.request('create', bot='Eve', workspace=str(self.path), tools=['echo'],
-                                created_by='Bob', created_by_id=bob['id'])['result']
+                                created_by='Bob', created_by_id=bob['bot_id'])['result']
         self.assertEqual(reader['gates'], [])
         refused = client.request('create', bot='Fay', approve=['read'], approver='manual')
         self.assertEqual((refused['error'], refused['approve']), ('approve_not_in_tools', ['read']))
