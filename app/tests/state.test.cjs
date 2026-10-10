@@ -501,13 +501,25 @@ test('⌘P pressed beside searches the side agent\'s repository, and Escape in a
   doc.activeElement = { closest: () => null };
   p.openPicker('files'); await settle();
   assert.deepEqual(listed, ['/w/side', '/w/main']);
-  // A page in a file tab: Escape leaves it for the tab, as the tab has no composer.
+  // A file beside, with no agent beside, is searched from the side pane too.
+  await p.openFile('Bob', '/w/other/notes.md'); p.S.ui.side = null; p.S.ui.picker = false;
+  doc.activeElement = { closest: (s) => s === '.pane.side' ? {} : null };
+  p.openPicker('files');
+  // Down while the list is loading keeps a row to pick once it comes.
+  await doc.getElementById('pickerq').listeners.keydown({ key: 'ArrowDown', preventDefault() {} });
+  assert.equal(p.S.ui.pickerSel, 0);
+  await settle();
+  assert.deepEqual(listed, ['/w/side', '/w/main', '/w/other']);
+  p.S.ui.picker = false; p.dropFile();
+  // A page in a file tab: Escape leaves it for the tab, as the tab has no composer; the sidebar
+  // shows Home's list, with New project.
   await p.go('▤/w/main/p.html', 'tab'); await settle();
   let focused = 0; const tabs = doc.getElementById('tabs'); tabs.querySelector = (s) => s === '.wtab.on' ? { focus() { focused++; } } : null;
   const win = {}, frame = { contentWindow: win, closest: () => null };
   doc.querySelectorAll = (s) => s === '.rc iframe' ? [frame] : []; doc.activeElement = frame;
   p.context.window.listeners.message({ source: win, data: { rich: 'escape' } });
   assert.equal(focused, 1);
+  assert.equal(doc.getElementById('newproj').hidden, false);
 });
 
 test('⌘P from Home with no folder says what it searches', async () => {

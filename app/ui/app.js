@@ -2192,8 +2192,8 @@ function render() {
   else if (tab != null) renderFile(S.ui.tabFile, $('log'), $('title'), 'main');
   else { renderHead($('title'), b, 'main'); if (b) renderTranscript($('log'), b.name); else renderHome($('log')); }
   $('form').hidden = tab != null;
-  // New project belongs to Home's list.
-  $('newproj').hidden = !!S.selected;
+  // New project belongs to Home's list, which a file tab shows too.
+  $('newproj').hidden = !!opened();
   if (S.ui.rail) renderRail();
   if (S.ui.file) renderFile();
   else if (side) { renderHead($('sidetitle'), side, 'side'); renderTranscript($('side'), side.name); }
@@ -2225,9 +2225,8 @@ function pickerRows() {
 // The folder ⌘P searches the repository of: that of the pane it was pressed in, which is the file in
 // view's, else the agent's or the swarm's.
 function searchFolder() {
-  const beside = pickerPane === 'side' && S.ui.side;
-  if (beside && S.ui.file) return dirOf(S.ui.file.full);
-  const key = beside ? S.ui.side : S.selected;
+  if (pickerPane === 'side' && S.ui.file) return dirOf(S.ui.file.full);
+  const key = pickerPane === 'side' && S.ui.side ? S.ui.side : S.selected;
   const tab = fileOf(key); if (tab != null) return dirOf(tab);
   const sw = swarmOf(key); if (sw) return sw.workspace ?? null;
   return bot(key)?.workspace ?? S.config?.workspace ?? null;
@@ -2277,7 +2276,7 @@ function renderPicker() {
   $('pickerq').placeholder = files ? 'find a file…' : 'find an agent…';
   $('pickerq').setAttribute?.('aria-label', files ? 'Find a file' : 'Find an agent');
   const q = $('pickerq').value.trim(); const all = pickerRows(); const rows = all.slice(0, PICKER_ROWS);
-  S.ui.pickerSel = Math.min(S.ui.pickerSel, Math.max(0, rows.length - 1));
+  S.ui.pickerSel = Math.max(0, Math.min(S.ui.pickerSel, rows.length - 1));
   const total = all.total ?? all.length;
   // A listing cut at its bound says so whatever is typed: narrowing cannot find a file past it.
   const cut = files && found?.more ? `<div class="empty">searched the first ${found.files.length} files; the repository has more</div>` : '';
@@ -3003,7 +3002,7 @@ $('pickerq').addEventListener('keydown', async (e) => {
   }
   const rows = pickerRows();
   if (e.key === 'Escape') { closePicker(); e.preventDefault(); }
-  else if (e.key === 'ArrowDown' || (e.ctrlKey && e.key === 'n')) { S.ui.pickerSel = Math.min(rows.length - 1, S.ui.pickerSel + 1); renderPicker(); e.preventDefault(); }
+  else if (e.key === 'ArrowDown' || (e.ctrlKey && e.key === 'n')) { S.ui.pickerSel = Math.max(0, Math.min(rows.length - 1, S.ui.pickerSel + 1)); renderPicker(); e.preventDefault(); }
   else if (e.key === 'ArrowUp' || (e.ctrlKey && e.key === 'p')) { S.ui.pickerSel = Math.max(0, S.ui.pickerSel - 1); renderPicker(); e.preventDefault(); }
   else if (e.key === 'Enter') { e.preventDefault(); await pick(rows[S.ui.pickerSel]); }
 });
