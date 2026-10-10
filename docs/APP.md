@@ -1142,7 +1142,10 @@ there, one run at a time, and runs it again when a run ends with one still
 there. Each ask is one fire: the fire moves the oldest out of the queue into
 `NAME.taking`, sends whatever its time or watched path, queues behind work
 rather than skipping it, and removes the ask once done; one a fire was cut
-short on is the next fire's. An entry that cannot be moved out of the queue
+short on is the next fire's. The message a fire begins keeps the name of
+the ask it is for, so one cut short after its message went is not sent
+again, and one cut short while it was going is finished, as the same
+request, and nothing more. An entry that cannot be moved out of the queue
 would have launchd run the job for ever, so the trigger ends, saying why
 (`asks_stuck`). `rm` sets a trigger's asks aside until launchd unloads its
 job, and puts them back when it will not. Nothing else starts a fire:

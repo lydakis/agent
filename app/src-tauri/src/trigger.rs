@@ -1484,12 +1484,24 @@ struct Asked {
     path: PathBuf,
 }
 
+impl Asked {
+    /// Its file's name, which no other ask has.
+    fn name(&self) -> String {
+        self.path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+}
+
 /// The ask this fire is for: one a fire took and was cut short before it
 /// was done with, else the oldest in the queue, moved out of it. Each ask is
 /// one fire, and launchd runs the job again while any is left. One that
 /// cannot be moved out would have launchd run the job for ever: an error,
-/// which stops the trigger.
-fn take_ask(places: &Places, name: &str) -> Result<Option<Asked>, String> {
+/// which stops the trigger. One whose message went, by a fire cut short
+/// before it was done with it, is done with here.
+fn take_ask(places: &Places, trigger: &Trigger) -> Result<Option<Asked>, String> {
+    let name = &trigger.name;
     let oldest = |dir: &Path| {
         std::fs::read_dir(dir)
             .into_iter()
@@ -1498,12 +1510,19 @@ fn take_ask(places: &Places, name: &str) -> Result<Option<Asked>, String> {
             .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
             .min()
     };
+    let kept = Kept::of(&state(places, trigger));
     let taking = places.taking(name);
-    if let Some((file, path)) = oldest(&taking) {
-        return Ok(Some(Asked {
+    while let Some((file, path)) = oldest(&taking) {
+        let asked = Asked {
             kind: Ask::of(&file),
             path,
-        }));
+        };
+        if !(kept.sending.is_null() && kept.ask.as_deref() == Some(file.as_str())) {
+            return Ok(Some(asked));
+        }
+        if !done_with(&asked) {
+            return Err(format!("asks_stuck: {}", asked.path.display()));
+        }
     }
     let asks = places.asks(name);
     let Some((file, path)) = oldest(&asks) else {
@@ -1521,15 +1540,14 @@ fn take_ask(places: &Places, name: &str) -> Result<Option<Asked>, String> {
     }))
 }
 
-/// The fire is done with its ask.
-fn done_with(asked: &Asked) {
+/// The fire is done with its ask. Whether it is gone.
+fn done_with(asked: &Asked) -> bool {
     let gone = match std::fs::symlink_metadata(&asked.path) {
         Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&asked.path),
         _ => std::fs::remove_file(&asked.path),
     };
-    if let Err(e) = gone {
-        eprintln!("{}", error_json(&format!("{}: {e}", asked.path.display())));
-    }
+    gone.map_err(|e| eprintln!("{}", error_json(&format!("{}: {e}", asked.path.display()))))
+        .is_ok()
 }
 
 /// What a fire leaves for the next, all in one record, each part on disk
@@ -1545,6 +1563,9 @@ struct Kept {
     /// `{bot, bot_id, request_id, prompt, delivery, started}`: the submit,
     /// whole, so sending it again is the same request.
     sending: Value,
+    /// The ask the last message begun was for, by its file's name: one a
+    /// fire cut short took, whose message went, is not sent again.
+    ask: Option<String>,
 }
 
 impl Kept {
@@ -1557,6 +1578,7 @@ impl Kept {
                 log: state["log"].as_u64(),
             },
             sending: state["sending"].clone(),
+            ask: state["ask"].as_str().map(str::to_owned),
         }
     }
 }
@@ -2366,6 +2388,9 @@ fn write_row(places: &Places, trigger: &Trigger, last: &Value, kept: &Kept) -> R
     row["started_id"] = json!(kept.started_id);
     row["head"] = json!(kept.seen.head);
     row["log"] = json!(kept.seen.log);
+    if let Some(ask) = &kept.ask {
+        row["ask"] = json!(ask);
+    }
     if !kept.sending.is_null() {
         row["sending"] = kept.sending.clone();
     }
@@ -2516,10 +2541,11 @@ async fn deliver(
     };
     let sending = json!({"bot": bot, "bot_id": id, "request_id": request_id(trigger, id),
         "prompt": prompt, "delivery": delivery, "started": started});
-    let seen = kept.seen.clone();
+    let (seen, ask) = (kept.seen.clone(), kept.ask.clone());
     if let Err(error) = keep(places, trigger, |k| {
         k.sending = sending.clone();
         k.seen = seen;
+        k.ask = ask;
         if started {
             k.started_id = Some(id);
         }
@@ -2660,15 +2686,16 @@ pub fn fire_cli(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let asked = match take_ask(&places, &trigger.name) {
+    let asked = match take_ask(&places, &trigger) {
         Ok(asked) => asked,
         Err(error) => {
             stops(&places, &trigger, error, &launchctl);
             return 1;
         }
     };
-    let done = fire(&places, &trigger, asked.as_ref().map(|a| a.kind));
-    if let Some(asked) = asked.as_ref().filter(|_| done) {
+    if fire(&places, &trigger, asked.as_ref())
+        && let Some(asked) = &asked
+    {
         done_with(asked);
     }
     0
@@ -2706,7 +2733,8 @@ fn sends() -> u64 {
 /// none of launchd's own runs is asked for. Whether it got to its ask: a
 /// message a cut-short fire began, which it could not finish, keeps the ask
 /// for the next fire.
-fn fire(places: &Places, trigger: &Trigger, ask: Option<Ask>) -> bool {
+fn fire(places: &Places, trigger: &Trigger, asked: Option<&Asked>) -> bool {
+    let ask = asked.map(|a| a.kind);
     // A link moved since `add` can make its path one every fire writes: it
     // would fire itself for ever. It ends, writing nothing more there.
     if let Some(file) = &trigger.file
@@ -2732,22 +2760,29 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<Ask>) -> bool {
                 return false;
             }
         }
-        if ask != Some(Ask::Fire) || !Lock::take(places).is_ok_and(|_lock| ours(places, trigger)) {
+        // The message it finished was this ask's own.
+        let its_own = asked.is_some_and(|a| kept.ask == Some(a.name()));
+        if ask != Some(Ask::Fire)
+            || its_own
+            || !Lock::take(places).is_ok_and(|_lock| ours(places, trigger))
+        {
             return true;
         }
     }
     // Asked only to finish one, it sends nothing new, whenever it runs.
     if ask != Some(Ask::Finish) {
-        send(places, trigger, ask == Some(Ask::Fire));
+        send(places, trigger, asked);
     }
     true
 }
 
 /// A fire's own message, when it is time or was asked for.
-fn send(places: &Places, trigger: &Trigger, asked: bool) {
+fn send(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
+    let asked = ask.is_some_and(|a| a.kind == Ask::Fire);
     let now = now();
     let durable = state(places, trigger);
     let mut kept = Kept::of(&durable);
+    kept.ask = ask.map(Asked::name);
     // Its last run went out but its end did not (launchd would not unload
     // it): it ends now, sending nothing more.
     if trigger.runs.is_some_and(|runs| kept.sent >= runs) {
@@ -3762,7 +3797,7 @@ mod tests {
             asks.display()
         )));
         let take = |places: &Places| {
-            let asked = take_ask(places, &s.name).unwrap()?;
+            let asked = take_ask(places, &s).unwrap()?;
             done_with(&asked);
             Some(asked.kind)
         };
@@ -3783,13 +3818,20 @@ mod tests {
         assert_eq!(take(&w.places), None);
         // One a fire took and did not finish with is the next fire's.
         fire_now(&w.places, &s.name).unwrap();
-        let cut = take_ask(&w.places, &s.name).unwrap().unwrap();
+        let cut = take_ask(&w.places, &s).unwrap().unwrap();
         assert_eq!(std::fs::read_dir(&asks).unwrap().count(), 0);
-        assert_eq!(
-            take_ask(&w.places, &s.name).unwrap().unwrap().path,
-            cut.path
-        );
-        done_with(&cut);
+        assert_eq!(take_ask(&w.places, &s).unwrap().unwrap().path, cut.path);
+        // While the message begun for it is not settled it is still the
+        // next fire's, to finish; once that message went it is done with.
+        keep(&w.places, &s, |k| {
+            k.sending = json!({"bot": "p.x"});
+            k.ask = Some(cut.name());
+        })
+        .unwrap();
+        assert_eq!(take_ask(&w.places, &s).unwrap().unwrap().path, cut.path);
+        keep(&w.places, &s, |k| k.sending = Value::Null).unwrap();
+        assert!(take_ask(&w.places, &s).unwrap().is_none());
+        assert!(!cut.path.exists());
         // Whatever is in the queue goes out of it, a folder too.
         std::fs::create_dir_all(asks.join("x/y")).unwrap();
         assert_eq!(take(&w.places), Some(Ask::Fire));
@@ -3834,7 +3876,7 @@ mod tests {
         // A taking folder that is a file: nothing can be moved into it.
         std::fs::write(w.places.taking(&s.name), "").unwrap();
         fire_now(&w.places, &s.name).unwrap();
-        let stuck = take_ask(&w.places, &s.name).unwrap_err();
+        let stuck = take_ask(&w.places, &s).unwrap_err();
         assert!(stuck.starts_with("asks_stuck:"), "{stuck}");
         stops(&w.places, &s, stuck, &|x| w.fake.call(x));
         assert_eq!(w.state(&s.name), (false, false, true));
