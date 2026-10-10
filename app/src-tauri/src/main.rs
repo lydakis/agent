@@ -1205,8 +1205,8 @@ const SETUP_FLAG: &str = "--setup";
 
 /// What the app puts on this machine, written at every start so it all leads
 /// to this copy: swarm scripts, the coordinator's `start`, `~/.agent/trigger`,
-/// earlier schedules made triggers, triggers reloaded after a move, and the
-/// skills it ships linked from `~/.agents/skills`. False when any of it failed; each failure is printed
+/// triggers reloaded after a move, and the skills it ships linked from
+/// `~/.agents/skills`. False when any of it failed; each failure is printed
 /// and does not stop the rest. A start reloads triggers off the window's way.
 fn machine_setup(background: bool) -> bool {
     let mut ok = true;
@@ -1224,18 +1224,14 @@ fn machine_setup(background: bool) -> bool {
         {
             report(&error);
         }
-        // Ends a fire cut short are finished, earlier schedules become
-        // triggers, a moved app reloads every trigger, each a launchctl run,
-        // and a message a fire began before the Mac stopped is asked to
-        // finish.
+        // Ends a fire cut short are finished, and a moved app reloads every
+        // trigger, each a launchctl run.
         if cfg!(target_os = "macos")
             && let Ok(places) = trigger::Places::home()
         {
             let refresh = move || {
                 trigger::finish(&places, &trigger::launchctl);
-                trigger::migrate(&places, None, &trigger::launchctl);
                 trigger::refresh(&places, &app, &trigger::launchctl);
-                trigger::resume(&places);
             };
             if background {
                 std::thread::spawn(refresh);
@@ -1267,7 +1263,6 @@ fn main() {
         Some(swarm::START_FLAG) => std::process::exit(swarm::start_cli(&args[2..])),
         Some(trigger::FLAG) => std::process::exit(trigger::cli(&args[2..])),
         Some(trigger::FIRE_FLAG) => std::process::exit(trigger::fire_cli(&args[2..])),
-        Some(trigger::SCHEDULE_FIRE_FLAG) => std::process::exit(trigger::migrate_cli(&args[2..])),
         Some(SETUP_FLAG) => std::process::exit(i32::from(!machine_setup(false))),
         Some(skills::UNLINK_FLAG) => std::process::exit(skills::unlink_cli()),
         _ => {}
