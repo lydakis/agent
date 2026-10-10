@@ -1224,12 +1224,13 @@ fn machine_setup(background: bool) -> bool {
         {
             report(&error);
         }
-        // Earlier schedules become triggers, and a moved app reloads every
-        // trigger, each a launchctl run.
+        // Ends a fire cut short are finished, earlier schedules become
+        // triggers, and a moved app reloads every trigger, each a launchctl run.
         if cfg!(target_os = "macos")
             && let Ok(places) = trigger::Places::home()
         {
             let refresh = move || {
+                trigger::finish(&places, &trigger::launchctl);
                 trigger::migrate(&places, None, &trigger::launchctl);
                 trigger::refresh(&places, &app, &trigger::launchctl);
             };
