@@ -164,6 +164,10 @@ test('fenced blocks become code, previews, diagrams and images by their language
   assert.doesNotMatch(svg, /<img/);
   assert.doesNotMatch(svg.split('<pre')[0], /<svg/);
   assert.match(Rich.file('/w/a.svg', new TextEncoder().encode('<svg/>')).html, /data-kind="svg" data-view="view"/);
+  // A Markdown file's front matter is a table above its text; anything else between rules stays Markdown.
+  const fact = Rich.file('/m/x.md', new TextEncoder().encode('---\nname: x\ntype: project\n---\n\nThe **fact**.\n')).html;
+  assert.match(fact, /^<div class="md"><table class="fm"><tbody><tr><th>name<\/th><td>x<\/td><\/tr><tr><th>type<\/th><td>project<\/td><\/tr><\/tbody><\/table><p>The <strong>fact<\/strong>\.<\/p>/);
+  assert.doesNotMatch(Rich.file('/m/y.md', new TextEncoder().encode('---\nnot front matter\n---\n')).html, /class="fm"/);
   assert.doesNotMatch(Rich.html('![x](data:image/svg+xml,%3Csvg%2F%3E)'), /<img/);
   // A raster image the message carries draws on a click; a local one opens beside; a remote one is a link.
   const png = Rich.html('![dot](data:image/png;base64,iVBORw0KGgo=)');
@@ -3158,6 +3162,93 @@ test('the app\'s own task updates and triggered messages are tagged by the origi
   await q.onEvent({ event: 'accepted', bot: 'demo.lead', turn: 2, data: { node: 2, origin: 'trigger' } });
   await q.loadBatch('demo.lead');
   assert.match(q.itemsHTML(q.transcript('demo.lead')), /<span class="by">trigger<\/span> check the nightly run/);
+});
+
+test("a coordinator's task update says what changed in memory since it last heard, never what it saved itself", async () => {
+  const sent = [], later = Date.now() + 60000, user = { name: null, dir: '/m', facts: [{ name: 'short', type: 'feedback', description: 'keep it short', source: 'the person, 2026-10-01', verified: '2026-10-01', path: '/m/short.md', modified: 1 }] };
+  let project = { name: 'demo', dir: '/m/projects/demo', facts: [
+    { name: 'cookie', type: 'project', description: 'the cookie is written once', source: 'turn:demo.build/1', verified: '2026-10-10', path: '/m/projects/demo/cookie.md', modified: later },
+    { name: 'mine', type: 'project', description: 'the lead saved this', source: 'turn:demo.lead/3', verified: '2026-10-10', path: '/m/projects/demo/mine.md', modified: later },
+  ] };
+  const dirs = [];
+  const p = page({ request: async (op, params) => { if (op === 'submit') sent.push(params); return { turn: 9 }; }, memoryView: async (dir) => { dirs.push(dir); return { user, projects: [structuredClone(project)], more: 0 }; }, log() {} });
+  p.S.live = true; p.S.attached = true;
+  p.upsert({ name: 'demo.lead', bot_id: 1, status: 'idle', workspace: '/w' });
+  p.upsert({ name: 'demo.build', bot_id: 2, status: 'idle', created_by: 'demo.lead', created_by_id: 1 });
+  const turn = async (n) => { await p.onEvent({ event: 'accepted', bot: 'demo.build', turn: n, data: { node: 1 } }); await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: n, data: { status: 'completed' } }); await p.tick(); await settle(); };
+  await turn(2);
+  assert.equal(sent.length, 1); assert.deepEqual(dirs, ['demo']);
+  assert.match(sent[0].prompt, /^Task updates: [^]*\n\nMemory changed since you last heard; each fact is a file, read before relying on it:\n- saved: \/m\/projects\/demo\/cookie\.md: the cookie is written once$/);
+  // Told once: the next update has no memory lines, and a fact removed since is named.
+  p.S.wakes.get('demo.lead').last = 0;
+  await turn(3);
+  assert.equal(sent.length, 2); assert.doesNotMatch(sent[1].prompt, /Memory changed/);
+  project = { ...project, facts: project.facts.filter((f) => f.name !== 'cookie') };
+  p.S.wakes.get('demo.lead').last = 0;
+  await turn(4);
+  assert.match(sent[2].prompt, /\n\nMemory changed since you last heard; [^\n]*\n- removed: \/m\/projects\/demo\/cookie\.md$/);
+  // A folder that is not all facts is skipped, not reported as every fact removed.
+  project = { name: 'demo', dir: '/m/projects/demo', error: 'memory_invalid: bad.md' };
+  p.S.wakes.get('demo.lead').last = 0;
+  await turn(5);
+  assert.doesNotMatch(sent[3].prompt, /Memory changed/);
+  // Memory that cannot be read leaves the update as it was.
+  const q = page({ request: async (op, params) => { if (op === 'submit') sent.push(params); return { turn: 9 }; }, memoryView: async () => { throw new Error('memory_failed: x'); }, log() {} });
+  q.S.live = true; q.S.attached = true;
+  q.upsert({ name: 'demo.lead', bot_id: 1, status: 'idle', workspace: '/w' });
+  q.upsert({ name: 'demo.build', bot_id: 2, status: 'idle', created_by: 'demo.lead', created_by_id: 1 });
+  await q.onEvent({ event: 'accepted', bot: 'demo.build', turn: 1, data: { node: 1 } }); await q.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: 1, data: { status: 'completed' } }); await q.tick(); await settle();
+  assert.equal(sent.length, 5); assert.doesNotMatch(sent[4].prompt, /Memory/);
+});
+
+test('a removal is named in a task update even past the line cap', async () => {
+  const sent = [], fact = (name, modified) => ({ name, type: 'project', description: name, source: 'turn:demo.build/1', verified: '2026-10-10', path: `/m/projects/demo/${name}.md`, modified });
+  let facts = [fact('old', Date.now() + 60000)];
+  const p = page({ request: async (op, params) => { if (op === 'submit') sent.push(params); return { turn: 9 }; }, memoryView: async () => ({ user: { name: null, dir: '/m', facts: [] }, projects: [{ name: 'demo', dir: '/m/projects/demo', facts }], more: 0 }), log() {} });
+  p.S.live = true; p.S.attached = true;
+  p.upsert({ name: 'demo.lead', bot_id: 1, status: 'idle', workspace: '/w' });
+  p.upsert({ name: 'demo.build', bot_id: 2, status: 'idle', created_by: 'demo.lead', created_by_id: 1 });
+  const turn = async (n) => { await p.onEvent({ event: 'accepted', bot: 'demo.build', turn: n, data: { node: 1 } }); await p.onEvent({ event: 'turn_finished', bot: 'demo.build', turn: n, data: { status: 'completed' } }); await p.tick(); await settle(); };
+  await turn(1);
+  facts = Array.from({ length: 25 }, (_, i) => fact(`new-${i}`, Date.now() + 60000));
+  p.S.wakes.get('demo.lead').last = 0;
+  await turn(2);
+  assert.match(sent[1].prompt, /\n- removed: \/m\/projects\/demo\/old\.md\n/);
+  assert.match(sent[1].prompt, /\n- 6 more: ~\/\.agent\/memory show lists every fact$/);
+});
+
+test("the Memory sheet lists a project's facts and yours, newest first, and opens one in a tab", async () => {
+  const facts = (dir, list) => list.map(([name, modified]) => ({ name, type: 'project', description: `about ${name}`, source: 'the person, 2026-10-01', verified: '2026-10-01', path: `${dir}/${name}.md`, modified }));
+  const asked = [];
+  const p = page({ memoryView: async (dir) => { asked.push(dir); return { user: { name: null, dir: '/m', facts: facts('/m', [['you-old', 1]]) }, projects: [{ name: 'demo', dir: '/m/projects/demo', facts: facts('/m/projects/demo', [['older', 10], ['newer', 20]]) }], more: 0 }; } });
+  p.upsert({ name: 'demo.lead', bot_id: 1, workspace: '/w' });
+  const doc = p.context.document;
+  await p.act({ dataset: { act: 'memory', who: 'demo.lead' } }); await settle();
+  const html = doc.getElementById('sheet').innerHTML;
+  assert.deepEqual(asked, ['demo']);
+  assert.match(html, /<h4>demo memory<\/h4>/);
+  assert.ok(html.indexOf('about newer') < html.indexOf('about older') && html.indexOf('about older') < html.indexOf('about you-old'));
+  await p.act({ dataset: { act: 'open-fact', v: '/m/projects/demo/newer.md' } }); await settle();
+  assert.equal(p.S.selected, '▤/m/projects/demo/newer.md'); assert.equal(p.S.ui.sheet, false);
+  // At Home: every project's, yours first.
+  await p.act({ dataset: { act: 'memory', who: '' } }); await settle();
+  assert.deepEqual(asked, ['demo', null]);
+  assert.match(doc.getElementById('sheet').innerHTML, /<h4>Memory<\/h4>/);
+});
+
+test('a Memory sheet opened again shows only the newest answer', async () => {
+  let release;
+  const slow = new Promise((r) => { release = r; });
+  const answers = [() => slow, async () => ({ user: { name: null, dir: '/m', facts: [] }, projects: [{ name: 'demo', dir: '/m/projects/demo', error: 'memory_invalid: bad.md' }], more: 0 })];
+  const p = page({ memoryView: () => answers.shift()() });
+  p.upsert({ name: 'demo.lead', bot_id: 1, workspace: '/w' });
+  const doc = p.context.document;
+  const first = p.act({ dataset: { act: 'memory', who: '' } });
+  await p.act({ dataset: { act: 'memory', who: 'demo.lead' } }); await settle();
+  release({ user: { name: null, dir: '/m', facts: [] }, projects: [], more: 0 }); await first; await settle();
+  const html = doc.getElementById('sheet').innerHTML;
+  assert.match(html, /<h4>demo memory<\/h4>/);
+  assert.match(html, /demo[^]*memory_invalid: bad\.md/);
 });
 
 test('a coordinator hears once, when it rests, of turns its tasks ended that it did not ask for', async () => {

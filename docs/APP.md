@@ -75,6 +75,24 @@ there, which reads the file, line and quoted text first.
 
 ![The worktree's newest commit](app/git-commit.png)
 
+### Memory
+
+Captured 2026-10-10. Memory, at the foot of the list at Home and in a
+project, shows what agents saved: yours and every project's at Home, newest
+first.
+
+![Memory at Home: yours, demo's and notes'](app/memory-home.png)
+
+In a project, its own facts come first. A fact opens in a tab, its front
+matter as a table.
+
+![demo's memory](app/memory-project.png)
+![A fact in a tab](app/memory-fact.png)
+
+A task update tells the lead what a task saved since it last heard.
+
+![demo's lead told that plan saved session-cookie](app/memory-wake.png)
+
 ### Home
 
 Captured 2026-10-10. The first message sent at Home asks for the model and
@@ -1554,6 +1572,23 @@ for those an agent creates with `agent run --new --agents`, such as a
 coordinator's tasks. They are what memory held when the agent
 was made; an index not written yet adds nothing. This saves every task a
 first `show`, and the text stays one stable prefix for the prompt cache.
+
+The app reads memory too, through `memory_view`
+([memory.rs](../app/src-tauri/src/memory.rs)), and never writes it. Memory,
+at the foot of the list at Home and in a project, opens a sheet of the facts:
+at Home yours and every project's (at most 100 folders, the rest counted),
+in a project its own and yours, each newest first with its name, type,
+source and when it was written; a fact opens in a tab, its front matter as a
+table. A coordinator composes its instructions when it is made, so a fact
+saved later reaches a project's lead as lines after its task update, a
+message it gets anyway: each fact saved or removed in its project's memory
+or yours since this window last told it (or since the window opened), at
+most 20 lines, leaving out facts whose `source` is one of its own turns.
+Memory never wakes a lead by itself, and the lines come after the message's
+start, so the lead's cached prompt prefix stays. A folder that is not all
+facts is left out of that message rather than reported as emptied. Home
+gets no task updates, so it reads memory itself. A window on a host shows no
+Memory: that memory is the host's.
 
 The app ships a `memory` skill ([SKILL.md](../app/skills/memory/SKILL.md))
 that says to use those indexes, or `show` when they are missing or old,

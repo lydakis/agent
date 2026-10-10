@@ -26,6 +26,7 @@ window.Daemon = (() => {
       readFile: (path) => invoke('read_file', { path }),
       listFiles: (dir) => invoke('list_files', { dir }),
       gitView: (dir) => invoke('git_view', { dir }),
+      memoryView: (project) => invoke('memory_view', { project: project ?? null }),
       gitDiff: ({ root, path = null, from = null, untracked = false, commit = null }) => invoke('git_diff', { root, path, from, untracked, commit }),
       attach: (after) => invoke('attach', { after }),
       replaceDaemon: () => invoke('replace_daemon'),
@@ -223,6 +224,27 @@ window.Daemon = (() => {
     'src/server/mod.rs': ['//! Dispatch: each op to its store call.', '', 'pub async fn dispatch(op: Op, store: &Store) -> Reply {', '    match op {', '        Op::Wait(handles) => registry().defer(handles).await,', '        op => store.call(op).await,', '    }', '}', ''].join('\n'),
     'report/latency.vl.json': JSON.stringify({ title: 'Refresh latency, p50 and p99 (ms)', data: { values: [['before', 'p50', 41], ['before', 'p99', 188], ['after', 'p50', 23], ['after', 'p99', 61]].map(([build, q, ms]) => ({ build, q, ms })) }, mark: 'bar', encoding: { x: { field: 'q', type: 'nominal', title: null, axis: { labelAngle: 0 } }, xOffset: { field: 'build', sort: ['before', 'after'] }, y: { field: 'ms', type: 'quantitative', title: 'ms' }, color: { field: 'build', type: 'nominal', sort: ['before', 'after'], title: null } } }, null, 2),
   };
+  // Memory, as the memory skill keeps it: one fact a file, newest first in the sheet.
+  const MEMORY_ROOT = '/Users/you/.agents/memory', DAY = 86400000;
+  const MEMORY = {
+    '': [
+      { name: 'short-replies', type: 'feedback', description: 'Lead with the answer; one line when one line will do', source: 'the person, 2026-09-28', verified: '2026-10-08', modified: Date.now() - 2 * DAY },
+      { name: 'paid-runs', type: 'feedback', description: 'Ask before any run that spends money on a provider', source: 'the person, 2026-09-26', verified: '2026-10-01', modified: Date.now() - 9 * DAY },
+    ],
+    demo: [
+      { name: 'worktrees', type: 'project', description: 'Tasks that edit work in ~/.agent/worktrees, one per task', source: 'app/agents/coordinator.md', verified: '2026-10-09', modified: Date.now() - DAY },
+    ],
+    notes: [
+      { name: 'theme', type: 'feedback', description: 'Follow the system theme; no toggle', source: 'the person, 2026-10-02', verified: '2026-10-02', modified: Date.now() - 6 * DAY },
+    ],
+  };
+  const memoryFact = (path) => {
+    for (const [scope, facts] of Object.entries(MEMORY)) for (const f of facts) {
+      if (path !== `${MEMORY_ROOT}${scope ? `/projects/${scope}` : ''}/${f.name}.md`) continue;
+      return { text: `---\nname: ${f.name}\ndescription: ${f.description}\ntype: ${f.type}\nsource: ${f.source}\nverified: ${f.verified}\n---\n\n${f.body ?? f.description + '.'}\n` };
+    }
+    return null;
+  };
   // A reply that uses everything the page draws: Markdown, code, a diagram and a page preview.
   const RICH = [
     '## Session refresh', '',
@@ -310,7 +332,13 @@ window.Daemon = (() => {
   }
   async function work(n, turn, text) {
     await wait(300);
-    if (n === 'demo.plan') { await tool(n, turn, 'read', { path: 'src/auth/' }, 'session.rs refresh.rs cookie.rs · 612 lines', 500); await tool(n, turn, 'write', { path: 'PLAN.md' }, '1.2 KiB', 600); }
+    if (n === 'demo.plan') {
+      await tool(n, turn, 'read', { path: 'src/auth/' }, 'session.rs refresh.rs cookie.rs · 612 lines', 500); await tool(n, turn, 'write', { path: 'PLAN.md' }, '1.2 KiB', 600);
+      // A finding the next task would otherwise rediscover goes to the project's memory.
+      const fact = { name: 'session-cookie', type: 'project', description: 'The session cookie is written in refresh_session only, after the store commits', source: `turn:${n}/${turn}`, verified: '2026-10-10', modified: Date.now(), body: 'The session cookie is written in one place, refresh_session in src/auth/session.rs, after store.commit().\n\n**Why:** writing it before the commit left a cookie for a session the store never kept.' };
+      MEMORY.demo = [...MEMORY.demo.filter((f) => f.name !== fact.name), fact];
+      await tool(n, turn, 'shell', { command: `"$HOME/.agent/memory" save session-cookie --type project --description '${fact.description}' --source ${fact.source} -- -` }, JSON.stringify({ exit_code: 0, stderr: '', stdout: JSON.stringify({ saved: 'session-cookie', replaced: false, duplicate: false, facts: MEMORY.demo.length }) + '\n', success: true }), 400);
+    }
     if (n === 'demo.build') {
       await plan(n, turn, '[>] Make rotate() pure', '[ ] Write the cookie once, after the commit', '[ ] Check that it builds', '[ ] Get a review');
       await tool(n, turn, 'edit', { path: 'src/auth/session.rs' }, '+23 −8', 900);
@@ -477,6 +505,7 @@ window.Daemon = (() => {
     // A coordinator puts a task that edits in `~/.agent/worktrees/NAME` on branch agent/NAME.
     // The demo's files, by their path under any agent's folder.
     readFile: async (path) => {
+      const fact = memoryFact(path); if (fact) return new TextEncoder().encode(fact.text).buffer;
       const hit = Object.keys(FILES).find((k) => path === k || path.endsWith(`/${k}`));
       if (hit == null) throw new Error(path.endsWith('/') ? `${path}: is a folder` : `${path}: no such file`);
       return new TextEncoder().encode(FILES[hit]).buffer;
@@ -484,6 +513,11 @@ window.Daemon = (() => {
     // The demo's repository is its files, under whichever folder asks.
     listFiles: async (dir) => ({ root: dir, files: Object.keys(FILES).sort(), more: false }),
     branch: async (dir) => { const m = /\/worktrees\/([^/]+)$/.exec(dir ?? ''); return m ? `agent/${m[1]}` : null; },
+    // The demo's memory: yours, and the demo project's, which a task adds to as it works.
+    memoryView: async (project) => {
+      const scope = (name) => { const d = name ? `${MEMORY_ROOT}/projects/${name}` : MEMORY_ROOT; return { name, dir: d, facts: (MEMORY[name ?? ''] ?? []).map((f) => ({ ...f, path: `${d}/${f.name}.md` })) }; };
+      return { user: scope(null), projects: project == null ? ['demo', 'notes'].map(scope) : [scope(project)], more: 0 };
+    },
     // The demo's repository: the project folder on main and each task's worktree on its branch, with
     // the changes a task that edits leaves before it commits.
     gitView: async (dir) => {

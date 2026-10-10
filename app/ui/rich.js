@@ -413,7 +413,12 @@ window.Rich = (() => {
     }
     if (bytes.subarray(0, 8000).includes(0)) return { html: `<div class="line note">binary file · ${bytes.length}${more ? '+' : ''} bytes</div>` };
     const text = new TextDecoder().decode(bytes);
-    if (ext === 'md' || ext === 'markdown') return { html: `${note}<div class="md">${html(text, { lines: 0, tags: 0, code: 0 })}</div>`, waited };
+    if (ext === 'md' || ext === 'markdown') {
+      // Front matter (a skill's, a profile's, a memory fact's) is a table above the text, as GitHub shows it.
+      const m = /^---\r?\n([^]*?)\r?\n---\r?\n/.exec(text.slice(0, 16384)), rows = m?.[1].split(/\r?\n/).map((l) => /^([\w.-]+):\s?(.*)$/.exec(l));
+      const head = rows?.every(Boolean) ? `<table class="fm"><tbody>${rows.map(([, k, v]) => `<tr><th>${esc(k)}</th><td>${esc(v)}</td></tr>`).join('')}</tbody></table>` : '';
+      return { html: `${note}<div class="md">${head}${html(head ? text.slice(m[0].length) : text, { lines: 0, tags: 0, code: 0 })}</div>`, waited };
+    }
     if (ext === 'csv' || ext === 'tsv') return { html: note + table(text, ext === 'csv' ? ',' : '\t') };
     const lang = { mmd: 'mermaid', mermaid: 'mermaid', vl: 'vega-lite', vg: 'vega', htm: 'html', html: 'html', svg: 'svg' }[ext] ?? ext;
     const out = block(text, lang, asked);

@@ -539,6 +539,27 @@ async fn git_view(
     }))
 }
 
+/// Memory as the Memory sheet and a coordinator's wake show it: the
+/// person's facts, and the project's of the folder `dir` is in, or every
+/// project's with no folder. Only this machine's: a window on a host is
+/// refused.
+#[tauri::command]
+async fn memory_view(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    project: Option<String>,
+) -> Result<Value, String> {
+    windows.of(&window)?.here("Memory")?;
+    if let Some(name) = &project
+        && !project::valid_name(name)
+    {
+        return Err(format!("project_invalid: {name}"));
+    }
+    let home = std::env::var_os("HOME").ok_or("no HOME for ~/.agents/memory")?;
+    let root = std::path::Path::new(&home).join(".agents/memory");
+    blocking(move || Ok(memory::view(&root, project.as_deref()))).await
+}
+
 /// The diff of one change under `root`, or of one commit (`commit`).
 #[tauri::command]
 async fn git_diff(
@@ -1560,6 +1581,7 @@ fn main() {
             list_files,
             git_view,
             git_diff,
+            memory_view,
             branch,
             models,
             project,
