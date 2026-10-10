@@ -7,8 +7,8 @@
 //! save that would pass that is refused until facts are merged or removed.
 //! The daemon knows nothing of memory.
 //!
-//! `~/.agent/memory`, a script the app writes, saves, removes, indexes and
-//! checks facts; the `memory` skill the app ships says what to save.
+//! `~/.agent/memory`, a script the app writes, shows the indexes and saves,
+//! removes, indexes and checks facts; the `memory` skill the app ships says what to save.
 use serde_json::{Value, json};
 use std::{
     io::Read,
@@ -24,9 +24,9 @@ const LIMIT: usize = 4096;
 const MAX_ENTRIES: usize = 1024;
 const INDEX: &str = "MEMORY.md";
 const TYPES: [&str; 4] = ["user", "feedback", "project", "reference"];
-const USAGE: &str = "usage: memory save NAME --type user|feedback|project|reference --description TEXT --source TEXT [SCOPE] -- TEXT|-\n       memory rm NAME [SCOPE]\n       memory index [SCOPE]\n       memory check [SCOPE]\n         SCOPE: --user | --project NAME; none: the project of this folder";
+const USAGE: &str = "usage: memory show [SCOPE]\n       memory save NAME --type user|feedback|project|reference --description TEXT --source TEXT [SCOPE] -- TEXT|-\n       memory rm NAME [SCOPE]\n       memory index [SCOPE]\n       memory check [SCOPE]\n         SCOPE: --user | --project NAME; none: the project of this folder";
 
-/// `APP --memory save|rm|index|check`, from `~/.agent/memory`.
+/// `APP --memory show|save|rm|index|check`, from `~/.agent/memory`.
 pub fn cli(args: &[String]) -> i32 {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let cwd = std::env::current_dir().ok();
@@ -108,23 +108,53 @@ fn run(
     }
     // The scope is resolved once the command is known to be whole, so a
     // usage error says so even outside a project.
-    let scope = || -> Result<PathBuf, String> {
+    let project = || -> Result<Option<String>, String> {
         Ok(match &scope {
-            Some(user) if user.is_empty() => root.to_path_buf(),
+            Some(user) if user.is_empty() => None,
             Some(project) => {
                 if !crate::project::valid_name(project) {
                     return Err(format!(
                         "invalid_project: {project}: a project name is 1-64 of A-Z a-z 0-9 - _ ."
                     ));
                 }
-                root.join("projects").join(project)
+                Some(project.clone())
             }
-            None => root.join("projects").join(project_of(cwd)?),
+            None => Some(project_of(cwd)?),
+        })
+    };
+    let scope = || -> Result<PathBuf, String> {
+        Ok(match project()? {
+            None => root.to_path_buf(),
+            Some(project) => root.join("projects").join(project),
         })
     };
     match (verb.as_str(), name, fields, text) {
+        ("show", None, [None, None, None], None) => {
+            // Outside a project, the person's index alone.
+            let project = match project() {
+                Err(error) if error.starts_with("project_unknown: ") => None,
+                project => project?,
+            };
+            let index = |dir: PathBuf| {
+                let text = std::fs::read_to_string(dir.join(INDEX)).unwrap_or_default();
+                json!({"dir": dir, "index": text})
+            };
+            let mut shown = json!({"user": index(root.to_path_buf()), "project": null});
+            if let Some(name) = project {
+                shown["project"] = index(root.join("projects").join(&name));
+                shown["project"]["name"] = json!(name);
+            }
+            Ok(shown)
+        }
         ("save", Some(name), [Some(kind), Some(description), Some(source)], Some(text)) => {
             let text = if text == "-" { stdin()? } else { text };
+            // Standard input is read to one byte past the limit, so a fact
+            // whose end went unread is refused rather than cut.
+            if text.len() > LIMIT {
+                return Err(format!(
+                    "fact_too_large: the text is more than {LIMIT} bytes; save one fact per file"
+                ));
+            }
             let fact = Fact {
                 name,
                 kind,
@@ -140,6 +170,12 @@ fn run(
             let _lock = lock(&dir)?;
             let all = facts(&dir)?;
             let text = render_index(&dir, &all);
+            if text.len() > LIMIT {
+                return Err(format!(
+                    "memory_full: the index would be {} bytes, above {LIMIT}; merge facts or remove one with memory rm NAME first",
+                    text.len()
+                ));
+            }
             write(&dir.join(INDEX), &text)?;
             Ok(
                 json!({"index": dir.join(INDEX), "bytes": text.len(), "facts": all.len(), "limit": LIMIT}),
@@ -413,13 +449,15 @@ fn remove(dir: &Path, name: &str) -> Result<Value, String> {
     valid_name(name)?;
     let _lock = lock(dir)?;
     let path = dir.join(format!("{name}.md"));
+    // Read the folder first, so one that is not all facts changes nothing.
+    let mut all = facts(dir)?;
+    all.retain(|fact| fact.name != name);
+    let index = render_index(dir, &all);
     let duplicate = match std::fs::remove_file(&path) {
         Ok(()) => false,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
         Err(e) => return Err(format!("memory_failed: {}: {e}", path.display())),
     };
-    let all = facts(dir)?;
-    let index = render_index(dir, &all);
     write(&dir.join(INDEX), &index)?;
     Ok(
         json!({"removed": name, "duplicate": duplicate, "index_bytes": index.len(), "facts": all.len()}),
@@ -631,6 +669,40 @@ mod tests {
         assert!(!root.join(format!("fact-{n:03}.md")).exists());
         // Replacing a fact with one no longer still fits.
         assert!(save_user(&root, "fact-000", "shorter", "x").is_ok());
+        // A rebuild that would pass the limit is refused too.
+        let fact = std::fs::read_to_string(root.join("fact-001.md")).unwrap();
+        for extra in n..n + 4 {
+            std::fs::write(
+                root.join(format!("fact-{extra:03}.md")),
+                fact.replace("fact-001", &format!("fact-{extra:03}")),
+            )
+            .unwrap();
+        }
+        let before = std::fs::read_to_string(root.join(INDEX)).unwrap();
+        let rebuilt = run(&root, &root, &args(&["index", "--user"]), &no_stdin);
+        assert_eq!(code(rebuilt), "memory_full");
+        assert_eq!(std::fs::read_to_string(root.join(INDEX)).unwrap(), before);
+        // Text read from stdin past the limit is refused, not cut short.
+        let long = format!("x{}y", " ".repeat(LIMIT));
+        let piped = run(
+            &root,
+            &root,
+            &args(&[
+                "save",
+                "piped",
+                "--user",
+                "--type",
+                "user",
+                "--description",
+                "d",
+                "--source",
+                "s",
+                "--",
+                "-",
+            ]),
+            &|| Ok(long[..=LIMIT].to_owned()),
+        );
+        assert_eq!(code(piped), "fact_too_large");
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -648,6 +720,10 @@ mod tests {
             "{error}"
         );
         assert!(!root.join("other.md").exists());
+        // A removal in such a folder changes nothing either.
+        let removed = run(&root, &root, &args(&["rm", "good", "--user"]), &no_stdin);
+        assert!(removed.unwrap_err().starts_with("memory_invalid: "));
+        assert!(root.join("good.md").exists());
         let report = check(&root);
         assert_eq!(report["problems"].as_array().unwrap().len(), 1, "{report}");
         std::fs::write(root.join("notes.md"), "---\nname: elsewhere\ndescription: d\ntype: user\nsource: s\nverified: 2026-10-10\n---\n\nx\n").unwrap();
@@ -765,6 +841,42 @@ mod tests {
                 .unwrap()
                 .ends_with("\n\nfrom stdin\n")
         );
+        // show gives the person's index and this folder's project's.
+        let show = |cwd: &Path, scope: &[&str]| {
+            let mut line = vec!["show"];
+            line.extend(scope);
+            run(&root, cwd, &args(&line), &no_stdin)
+        };
+        let shown = show(&worktree.join("web"), &[]).unwrap();
+        assert_eq!(shown["user"]["dir"], json!(root));
+        assert!(
+            shown["user"]["index"]
+                .as_str()
+                .unwrap()
+                .contains("\n- x (project, verified ")
+        );
+        assert_eq!(shown["project"]["name"], "demo");
+        assert_eq!(shown["project"]["dir"], json!(root.join("projects/demo")));
+        assert!(
+            shown["project"]["index"]
+                .as_str()
+                .unwrap()
+                .starts_with("# Memory in ")
+        );
+        assert_eq!(show(&repo, &[]).unwrap()["project"], json!(null));
+        assert_eq!(
+            show(&worktree, &["--user"]).unwrap()["project"],
+            json!(null)
+        );
+        assert_eq!(
+            show(&repo, &["--project", "none"]).unwrap()["project"]["index"],
+            ""
+        );
+        assert!(
+            show(&repo, &["--project", "../up"])
+                .unwrap_err()
+                .starts_with("invalid_project: ")
+        );
         assert!(
             save(&repo, &["--project", "../up"])
                 .unwrap_err()
@@ -780,6 +892,7 @@ mod tests {
             &["rm"],
             &["index", "x"],
             &["check", "--type", "user"],
+            &["show", "x"],
             &["list"],
             &[],
         ] {
@@ -807,7 +920,9 @@ mod tests {
         )
         .unwrap();
         let text = std::fs::read_to_string(state.join("memory")).unwrap();
-        assert!(text.starts_with("#!/bin/sh\n# usage: memory save NAME"));
+        assert!(
+            text.starts_with("#!/bin/sh\n# usage: memory show [SCOPE]\n#        memory save NAME")
+        );
         assert!(text.ends_with(
             "\nexec '/Apps/Agent'\\''s.app/Contents/MacOS/agent-app' --memory \"$@\"\n"
         ));

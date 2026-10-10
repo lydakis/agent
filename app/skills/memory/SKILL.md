@@ -24,9 +24,12 @@ itself is `NAME.md` in the same folder.
 
 ## Reading
 
-Before starting work, read both indexes with the `read` tool. Open a fact's
-file when its description bears on the task. A missing index means nothing
-is saved yet.
+Before starting work, run `"$HOME/.agent/memory" show`. It prints both
+indexes as JSON: `user` and `project`, each with its folder's absolute
+`dir` and its `index` text, and the project's `name`. `project` is null
+outside a project. Open a fact's file, `DIR/NAME.md`, with the `read` tool
+when its description bears on the task. An empty index means nothing is
+saved yet.
 
 A fact can be out of date. Before acting on one that names code, a file, a
 command or a setting, check that thing in the current tree. If the fact is
@@ -41,6 +44,7 @@ one JSON object on stdout; a failure is one `{"error", "detail"}` object on
 stderr with exit 1.
 
 ```sh
+"$HOME/.agent/memory" show [SCOPE]
 "$HOME/.agent/memory" save NAME --type TYPE --description TEXT --source TEXT [SCOPE] -- TEXT
 "$HOME/.agent/memory" save NAME --type TYPE --description TEXT --source TEXT [SCOPE] -- - <<'EOF'
 longer text

@@ -1415,6 +1415,7 @@ The app writes `~/.agent/memory` each time it opens, a script that runs its
 executable with `--memory` ([memory.rs](../app/src-tauri/src/memory.rs)):
 
 ```sh
+~/.agent/memory show [SCOPE]
 ~/.agent/memory save NAME --type TYPE --description TEXT --source TEXT [SCOPE] -- TEXT|-
 ~/.agent/memory rm NAME [SCOPE]
 ~/.agent/memory index [SCOPE]
@@ -1426,17 +1427,23 @@ Without a scope, the project is found from the working folder: in a git
 worktree, the same place in the repository's main checkout, then the
 nearest `.agents/project.toml` at or above it; none is `project_unknown`.
 Every reply is one JSON value on stdout; a failure is one `{"error": CODE,
-"detail": ...}` on stderr with exit 1. A save writes the fact and the
+"detail": ...}` on stderr with exit 1. `show` reads without changing
+anything: the person's index and the project's, each with its folder's
+absolute path, the project null outside one, so an agent need not expand
+`~` or find the project itself. A save writes the fact and the
 index under the folder's lock, so two agents saving at once cannot leave
 an index that misses one. Saving a fact unchanged is `"duplicate": true`,
 and so is removing one already gone. A save that would push the index past
 4 KiB is `memory_full` and changes nothing; so is a folder holding a `.md`
 file that is not a valid fact (`memory_invalid` names it), rather than an
 index that quietly leaves it out. `check` reports such a file and an index
-that is out of date without changing anything; `index` rewrites the index.
+that is out of date without changing anything; `index` rewrites the index,
+and refuses with `memory_full` an index of hand-added facts past 4 KiB. A
+removal reads the folder before deleting anything, and text piped on stdin
+past 4 KiB is `fact_too_large` rather than cut.
 
 The app ships a `memory` skill ([SKILL.md](../app/skills/memory/SKILL.md))
-that says to read both indexes before starting work, to check a fact that
+that says to read both indexes with `show` before starting work, to check a fact that
 names code against the current tree before acting on it, what to save
 (decisions and why, preferences, traps, pointers) and what not to (what the
 code, git or AGENTS.md already says, progress logs, secrets, and
