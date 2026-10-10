@@ -87,7 +87,7 @@ that is out of date; `index` rewrites the index from the facts.
 When the person has run `"$HOME/.agent/memory" schedule`, a nightly agent
 merges duplicates and drops superseded facts, following the
 `memory-cleanup` skill. `~/.agents/memory` is then a local git repository
-whose history keeps every version. Leave the `cleanup` and `changed`
+whose history keeps memory as it was before and after each cleanup. Leave the `cleanup` and `changed`
 commands to that agent.
 
 ## What to save, and what not to

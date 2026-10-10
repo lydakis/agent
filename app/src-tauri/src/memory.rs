@@ -480,7 +480,7 @@ fn check(dir: &Path) -> Value {
 /// Cleanup: a nightly agent merges duplicate facts and drops superseded
 /// ones, as the `memory-cleanup` skill says, between `cleanup start` and
 /// `cleanup finish`. `~/.agents/memory` is a local git repository, never
-/// pushed, so every earlier version is kept: `start` commits what agents
+/// pushed, holding memory as it was at each cleanup: `start` commits what agents
 /// saved since, and `finish` commits the cleanup, or reverts it when it
 /// removed more facts than the loss guard allows.
 const CLEANUP: &str = ".cleanup";
@@ -519,12 +519,19 @@ fn git(root: &Path, args: &[&str]) -> Result<String, String> {
 /// The memory folder as a git repository, made one if it is not yet.
 fn repo(root: &Path) -> Result<(), String> {
     std::fs::create_dir_all(root).map_err(|e| format!("memory_failed: {}: {e}", root.display()))?;
-    if !root.join(".git").exists() {
+    let new = !root.join(".git").exists();
+    if new {
         git(root, &["init", "-q"])?;
     }
     let ignore = root.join(".gitignore");
     if std::fs::read_to_string(&ignore).ok().as_deref() != Some(IGNORE) {
         write(&ignore, IGNORE)?;
+    }
+    if new {
+        // Only the ignore file, so a new repository is not a change to
+        // clean up, and facts already there still are.
+        git(root, &["add", ".gitignore"])?;
+        git(root, &["commit", "-q", "-m", "Memory repository"])?;
     }
     Ok(())
 }
@@ -546,10 +553,14 @@ fn all_facts(root: &Path) -> Result<usize, String> {
     Ok(count)
 }
 
-/// Whether anything was saved or removed since the last cleanup, for a
-/// trigger's `--if`: exit 0 when so, else `unchanged` and exit 1.
+/// Whether anything was saved or removed since the last cleanup, or a
+/// cleanup is open, for a trigger's `--if`: exit 0 when so, else
+/// `unchanged` and exit 1.
 fn changed(root: &Path) -> Result<Value, String> {
-    let saved = if root.join(".git").exists() {
+    // A cleanup cut short counts too, so the next night finishes it.
+    let saved = if root.join(CLEANUP).exists() {
+        true
+    } else if root.join(".git").exists() {
         !git(root, &["status", "--porcelain", "--untracked-files=all"])?
             .trim()
             .is_empty()
@@ -1156,6 +1167,9 @@ mod tests {
         let code = |r: Result<Value, String>| error_json(&r.unwrap_err())["error"].clone();
         let run_ = |line: &[&str]| run(&root, &root, &args(line), &no_stdin);
         assert_eq!(code(changed(&root)), "unchanged");
+        // A new repository is no change to clean up.
+        repo(&root).unwrap();
+        assert_eq!(code(changed(&root)), "unchanged");
         for name in ["a", "b", "c", "d"] {
             save_user(&root, name, &format!("fact {name}"), "x").unwrap();
         }
@@ -1174,7 +1188,9 @@ mod tests {
             (started["started"].clone(), json!(true))
         );
         assert_eq!(again["saved"], started["saved"]);
-        assert_eq!(code(changed(&root)), "unchanged");
+        // An open cleanup counts as a change, so one cut short is finished
+        // the next night.
+        assert_eq!(changed(&root).unwrap(), json!({"changed": true}));
         // Merge two facts into one.
         run_(&["rm", "b", "--user"]).unwrap();
         save_user(&root, "a", "facts a and b", "x and y").unwrap();
