@@ -710,7 +710,8 @@ async function onEvent(ev) {
       for (let i = t.items.length - 1; i >= 0; i--) { const it = t.items[i]; if ((it.kind === 'tool' || it.kind === 'tool_stub') && it.turn === turn && it.callId === data.call_id) { call = it; break; } }
       if (call) { call.done = true; if (call.started) call.took = Date.now() - call.started; call.started = 0; patchRun(name, call); }
       const shown = S.ui.file;
-      if (shown && call?.path && (call.name === 'write' || call.name === 'edit') && joinPath(bot(name)?.workspace ?? S.config?.workspace ?? '', call.path) === shown.full) openFile(shown.bot, shown.full);
+      // Read again as the agent left it; what it wrote is new, so a page, diagram or image in it waits for a click.
+      if (shown && call?.path && (call.name === 'write' || call.name === 'edit') && joinPath(bot(name)?.workspace ?? S.config?.workspace ?? '', call.path) === shown.full) openFile(shown.bot, shown.full, false);
       if (typeof data.node === 'number') {
         pushNode(t, { kind: 'node', node: data.node, callId: data.call_id, turn });
         if (call && (call.background || call.name === 'wait') && await loadWaitOrProc(name, data.node, call)) {
@@ -849,12 +850,14 @@ function entries(item) {
     if (Array.isArray(item.content)) { let t = ''; for (const p of item.content) { if (p.type === 'tool_result') out.push(out_(p.tool_use_id, text(p.content, ['text']), p.is_error === true)); else if (p.type === 'text' || p.type === 'input_text') t += p.text ?? ''; } if (t) out.unshift({ kind: 'user', text: t }); }
     else out.push({ kind: 'user', text: text(item.content, ['text']) });
   } else if (item.role === 'assistant' && Array.isArray(item.content)) {
+    // Its text blocks, split by tool calls, are one message: they share its bounds (`budget`).
+    let budget = null, sib = 0;
     for (const p of item.content) {
       if (p.type === 'tool_use') out.push(storedTool(p.name, p.id, JSON.stringify(p.input)));
       else if (p.type === 'thinking' && p.thinking) out.push({ kind: 'thought', text: p.thinking, secs: null });
       else if ((p.type === 'text' || p.type === 'output_text') && p.text) {
         const previous = out.at(-1);
-        if (previous?.kind === 'text') previous.text += p.text; else out.push({kind:'text',text:p.text});
+        if (previous?.kind === 'text') previous.text += p.text; else { budget ??= { spent: [] }; out.push({ kind: 'text', text: p.text, budget, sib: sib++ }); }
       }
     }
   }
@@ -930,6 +933,8 @@ async function loadBatch(name) {
           count(t, live, -1); t.items.splice(t.items.indexOf(live), 1);
         }
       }
+      // A message's diagrams keep the consent given while it streamed: both are scoped to its turn.
+      if (e.kind === 'text') e.scope = `${name}|${it.turn ?? `node ${it.node}`}`;
       rep.push({ ...e, callId: e.callId ?? it.callId, turn: it.turn });
     }
     const size = r.ok ? JSON.stringify(r.ok).length * 2 : 0;
@@ -1270,7 +1275,11 @@ function inline(text) {
 // holds.
 function textHTML(it, t) {
   if (it.htmlOf !== it.text || (it.htmlWaited && it.htmlAt !== Rich.version)) {
-    const html = `<div class="md">${Rich.html(it.text)}</div>`;
+    // A block after the first of its message starts from what the blocks before it drew.
+    const used = { lines: 0, tags: 0, code: 0, scope: it.scope };
+    for (const s of it.budget?.spent.slice(0, it.sib) ?? []) if (s) { used.lines += s.lines; used.tags += s.tags; used.code += s.code; used.over ||= s.over; }
+    const start = { ...used }, html = `<div class="md">${Rich.html(it.text, used)}</div>`;
+    if (it.budget) it.budget.spent[it.sib] = { lines: used.lines - start.lines, tags: used.tags - start.tags, code: used.code - start.code, over: !!used.over };
     const d = 2 * (html.length - (it.html?.length ?? 0)); it.bytes = (it.bytes || 0) + d; if (t) t.bytes = Math.max(0, (t.bytes || 0) + d);
     it.html = html; it.htmlOf = it.text; it.htmlAt = Rich.version; it.htmlWaited = Rich.waited;
   }
@@ -1371,7 +1380,7 @@ function runHTML(t, s, limit = t.items.length) {
   return { html: `<div class="steps" data-i="${s}"><div class="sum" data-run="${s}" role="button" tabindex="0">${open ? '▾' : '▸'} ${head}</div>${body}</div>`, end };
 }
 // A read, write or edit names its path; it opens that file beside.
-const summaryHTML = (it) => it.path ? `<span class="fpath" data-file="${esc(it.path)}">${esc(it.summary)}</span>` : esc(it.summary);
+const summaryHTML = (it) => it.path ? `<a class="fpath" href="#" data-file="${esc(it.path)}">${esc(it.summary)}</a>` : esc(it.summary);
 function stepHTML(it, i) {
   switch (it.kind) {
     case 'thought': return `<div class="line think">${esc(it.text)}</div>`;
@@ -1447,17 +1456,19 @@ function renderTail(el, name, t) {
     line.replaceChildren(text, cursor);
     const done = kind === 'text' ? document.createElement('div') : null; if (done) done.className = 'md';
     el.replaceChildren(...(kind || running ? [done, line].filter(Boolean) : []));
-    state = { transcript: t, kind, turn: t.streamingTurn, gen: t.streamGen, offset: 0, text, running, done, cut: {}, drawn: 0 };
+    state = { transcript: t, kind, turn: t.streamingTurn, gen: t.streamGen, offset: 0, text, running, done, cut: {}, drawn: 0, used: { lines: 0, tags: 0, code: 0, scope: `${name}|${t.streamingTurn}` } };
     tails.set(el, state);
   }
   if (value.length <= state.offset) return;
   // Streamed text is drawn block by block: what has ended (a paragraph, a closed fence) is drawn
   // once and appended, and only the block still being written is plain text. Each delta reads its
-  // own characters, never the whole reply, and provider text never becomes markup unparsed.
-  const at = state.done ? Rich.cut(state.cut, value) : 0;
+  // own characters, never the whole reply, and provider text never becomes markup unparsed. The
+  // blocks share one message's bounds (`used`); past them the rest streams as plain text.
+  const at = state.done && !state.used.over ? Rich.cut(state.cut, value) : 0;
   if (at > state.drawn) {
-    const box = document.createElement('div'); box.innerHTML = Rich.html(value.slice(state.drawn, at));
-    state.done.append(...box.childNodes); Rich.hydrate(state.done);
+    const box = document.createElement('div'); box.innerHTML = Rich.html(value.slice(state.drawn, at), state.used);
+    const added = [...box.childNodes]; state.done.append(...added);
+    for (const n of added) if (n.nodeType === 1) Rich.hydrate(n);
     state.text.data = value.slice(at); state.drawn = at;
   } else state.text.appendData(value.slice(state.offset));
   state.offset = value.length;
@@ -1500,8 +1511,9 @@ function renderTranscript(el, name) {
     if (!atBottom) el.scrollTop += el.scrollHeight - before;
   } else if (added) {
     if (old) { const sep = old.previousElementSibling; if (sep?.dataset?.sep === String(from)) sep.remove(); old.remove(); }
-    tail.insertAdjacentHTML('beforebegin', added);
-    Rich.hydrate(el);
+    // Only what was just added is looked through for blocks to draw.
+    const prev = tail.previousElementSibling; tail.insertAdjacentHTML('beforebegin', added);
+    for (let n = prev ? prev.nextElementSibling : el.firstElementChild; n && n !== tail; n = n.nextElementSibling) Rich.hydrate(n);
   }
   el.dataset.len = String(t.items.length);
   refreshLive(el);
@@ -1539,10 +1551,11 @@ function openFileFrom(path, el) {
   const who = beside ? S.ui.side : S.selected, b = bot(who);
   return openFile(who, joinPath(b?.workspace ?? S.config?.workspace ?? '', path));
 }
-async function openFile(who, full) {
+// `asked`: someone opened it, so what it holds draws at once.
+async function openFile(who, full, asked = true) {
   const old = S.ui.file;
   if (old?.url) URL.revokeObjectURL(old.url);
-  const f = S.ui.file = { bot: who, full, gen: (old?.gen ?? 0) + 1, state: 'loading', view: null, url: null };
+  const f = S.ui.file = { bot: who, full, asked, gen: (old?.gen ?? 0) + 1, state: 'loading', view: null, url: null };
   render();
   try {
     const bytes = new Uint8Array(await Daemon.readFile(full));
@@ -1561,19 +1574,25 @@ function dropFile() {
 // The chat it covered is on screen again, and what it finished meanwhile is seen.
 function closeFile() { if (dropFile()) { render(); markSeen(); focusInput(S.ui.side ? 'side' : 'main'); } }
 function renderFile() {
-  const f = S.ui.file, key = `file|${f.full}|${f.gen}|${Rich.version}`, el = $('side');
+  const f = S.ui.file, el = $('side');
+  // Drawn when read, and again when highlighting arrives for code that waited for it; a page,
+  // diagram or chart beside keeps running as it is.
+  if (f.state === 'ok' && (f.at !== f.gen || (f.waited && f.ver !== Rich.version))) {
+    if (f.url) URL.revokeObjectURL(f.url);
+    const shown = Rich.file(f.full, f.bytes, f.more, f.asked !== false);
+    Object.assign(f, { view: shown.html, url: shown.url ?? null, waited: shown.waited, at: f.gen, ver: Rich.version });
+  }
+  const key = `file|${f.full}|${f.gen}|${f.ver}`;
   if (el.dataset.key === key) return;
   const name = f.full.split('/').pop(), where = dirOf(f.full).replace(/^\/(Users|home)\/[^/]+/, '~');
   $('sidetitle').dataset.k = key;
   $('sidetitle').innerHTML = `<div class="crumbs"><b>${esc(name)}</b><span class="branch" title="${esc(f.full)}">${esc(where)}</span></div><div class="tools"><button type="button" class="ibtn" data-act="close-file" title="Close (Esc)" aria-label="Close">✕</button></div>`;
-  // Drawn when read, and again when highlighting arrives.
-  if (f.state === 'ok' && f.at !== `${f.gen}|${Rich.version}`) {
-    if (f.url) URL.revokeObjectURL(f.url);
-    const shown = Rich.file(f.full, f.bytes, f.more); f.view = shown.html; f.url = shown.url ?? null; f.at = `${f.gen}|${Rich.version}`;
-  }
   el.innerHTML = `<div class="fview">${f.state === 'loading' ? '<div class="line pending">reading…</div>' : f.state === 'error' ? `<div class="line out bad">${esc(f.error)}</div>` : f.view}</div>`;
   el.dataset.key = key; el.dataset.who = ''; el.scrollTop = 0;
-  Rich.hydrate(el);
+  // A chart fills the pane's width, so it is measured once the pane has finished opening.
+  const opening = $('app')?.getAnimations?.() ?? [];
+  if (!opening.length) Rich.hydrate(el);
+  else Promise.all(opening.map((a) => a.finished.catch(() => {}))).then(() => { if (el.dataset.key === key) Rich.hydrate(el); });
 }
 
 // ---------- heads and composers ----------
@@ -2871,7 +2890,8 @@ document.addEventListener('contextmenu', (e) => {
 });
 
 // Highlighting arrived: messages drawn without it are drawn again.
-Rich.onReady = () => { for (const [id] of PANES) $(id).dataset.key = ''; render(); };
+// A file beside decides for itself (`renderFile`), so a page running there keeps running.
+Rich.onReady = () => { for (const [id] of PANES) if (!(id === 'side' && S.ui.file)) $(id).dataset.key = ''; render(); };
 Rich.onFile = openFileFrom;
 Rich.onError = (text) => toast(text, 4000);
 

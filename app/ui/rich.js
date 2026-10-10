@@ -30,11 +30,14 @@ window.Rich = (() => {
 
   // ---------- Markdown ----------
   // Past this a block is shown as plain text: highlighting is linear but not free.
-  const HIGHLIGHT_MAX = 64 * 1024;
+  // A message or file highlights at most 256 KiB of code in all (`spent`, set by `html` and
+  // `file`); past that its blocks are plain, so a file of many fences costs no more than one.
+  const HIGHLIGHT_MAX = 64 * 1024, HIGHLIGHT_TOTAL = 256 * 1024;
+  let spent = 0;
   function codeHTML(text, lang) {
     const h = hl();
-    if (lang && text.length <= HIGHLIGHT_MAX) {
-      if (h?.getLanguage(lang)) { try { return h.highlight(text, { language: lang, ignoreIllegals: true }).value; } catch (_) {} }
+    if (lang && text.length <= HIGHLIGHT_MAX && spent + text.length <= HIGHLIGHT_TOTAL) {
+      if (h?.getLanguage(lang)) { spent += text.length; try { return h.highlight(text, { language: lang, ignoreIllegals: true }).value; } catch (_) {} }
       else if (!h) { waited = true; wantHighlight(); }
     }
     return esc(text);
@@ -47,10 +50,17 @@ window.Rich = (() => {
   // window's thread, and a few characters can ask for more than it can do (a page's loop, an SVG's
   // filters, a chart's `sequence` to a billion, a Mermaid `space:500000`), so each runs only when
   // asked, block by block. `page` draws it at once, for a file someone opened.
+  // A diagram or chart in a message carries an id: where it was drawn (`scope`, its turn or file)
+  // and what it draws. Its streamed draft, the message committed, and the message drawn anew for
+  // highlighting all give it the same id, so the one someone asked for stays shown; an identical one
+  // in another turn or file still asks. Without a scope each block is its own.
+  let scope = null, blockId = 0;
+  const digest = (s) => { let a = 0x811c9dc5, b = 5381; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); a = Math.imul(a ^ c, 0x01000193); b = (Math.imul(b, 33) + c) | 0; } return `${s.length}.${(a >>> 0).toString(36)}.${(b >>> 0).toString(36)}`; };
+  const lazy = (page, kind, text) => page ? ' data-run' : ` data-id="${esc(scope == null ? `#${++blockId}` : `${scope}|${kind}|${digest(text)}`)}"`;
   function block(text, info, page = false) {
     const lang = (info ?? '').trim().split(/\s+/)[0].toLowerCase();
-    if (lang === 'mermaid' || lang === 'mmd') return `<div class="rc" data-kind="mermaid" data-lazy${page ? ' data-run' : ''} data-view="code">${head('mermaid', toggle)}<div class="view"></div>${pre(text, '')}</div>`;
-    if (CHART.has(lang)) return `<div class="rc" data-kind="chart" data-lang="${lang === 'vega' ? 'vega' : 'vega-lite'}" data-lazy${page ? ' data-run' : ''} data-view="code">${head(lang, toggle)}<div class="view"></div>${pre(text, 'json')}</div>`;
+    if (lang === 'mermaid' || lang === 'mmd') return `<div class="rc" data-kind="mermaid" data-lazy${lazy(page, 'mermaid', text)} data-view="code">${head('mermaid', toggle)}<div class="view"></div>${pre(text, '')}</div>`;
+    if (CHART.has(lang)) return `<div class="rc" data-kind="chart" data-lang="${lang === 'vega' ? 'vega' : 'vega-lite'}" data-lazy${lazy(page, lang, text)} data-view="code">${head(lang, toggle)}<div class="view"></div>${pre(text, 'json')}</div>`;
     if (lang === 'html' || lang === 'htm') return `<div class="rc" data-kind="html" data-view="${page ? 'view' : 'code'}">${head(lang, '<button type="button" data-rich="view"></button>')}<div class="view frame"></div>${pre(text, 'xml')}</div>`;
     // An SVG draws as an image, which runs no script and loads nothing.
     if (lang === 'svg' && /^\s*(<\?xml[^>]*>\s*)?<svg\b/i.test(text)) return `<div class="rc" data-kind="svg" data-view="${page ? 'view' : 'code'}">${head(lang, '<button type="button" data-rich="view"></button>')}<div class="view"></div>${pre(text, 'xml')}</div>`;
@@ -67,37 +77,51 @@ window.Rich = (() => {
         // A table past 256 columns or 10,000 cells shows as its source: a short row is padded to
         // the header's width, so a few bytes a row can ask for millions of cells.
         table(token) { return token.header.length > COLUMNS || token.header.length * (token.rows.length + 1) > CELLS ? block(token.raw.replace(/\n+$/, ''), '') : false; },
-        // A link to a path opens that file beside, from the agent's folder.
-        link({ href, title, tokens }) { const inner = this.parser.parseInline(tokens), t = title ? ` title="${esc(title)}"` : ''; return linkable(href) ? `<a href="${esc(href)}"${t}>${inner}</a>` : filePath(href) ? `<a class="file" data-file="${esc(filePath(href))}"${t}>${inner}</a>` : inner; },
+        // A link to a path opens that file beside, from the agent's folder; its `#` href lets Tab and
+        // Enter reach it, and the click handler keeps it from navigating.
+        link({ href, title, tokens }) { const inner = this.parser.parseInline(tokens), t = title ? ` title="${esc(title)}"` : ''; return linkable(href) ? `<a href="${esc(href)}"${t}>${inner}</a>` : filePath(href) ? `<a class="file" href="#" data-file="${esc(filePath(href))}"${t}>${inner}</a>` : inner; },
         // An image draws only from data the message carries, and only on a click: a small PNG can
         // decode to hundreds of megabytes and an animated one takes CPU for as long as it shows.
         // A remote image is a link and a local one opens beside, so drawing a message fetches
         // nothing a model chose.
-        image: ({ href, text }) => /^data:image\/(png|gif|jpe?g|webp)[;,]/i.test(href ?? '') ? `<button type="button" class="img" data-img="${esc(href)}" title="${esc(text)}">image${text ? `: ${esc(text)}` : ''}</button>` : linkable(href) ? `<a href="${esc(href)}">${esc(text || href)}</a>` : filePath(href) ? `<a class="file" data-file="${esc(filePath(href))}">${esc(text || href)}</a>` : esc(text),
+        image: ({ href, text }) => /^data:image\/(png|gif|jpe?g|webp)[;,]/i.test(href ?? '') ? `<button type="button" class="img" data-img="${esc(href)}" title="${esc(text)}">image${text ? `: ${esc(text)}` : ''}</button>` : linkable(href) ? `<a href="${esc(href)}">${esc(text || href)}</a>` : filePath(href) ? `<a class="file" href="#" data-file="${esc(filePath(href))}">${esc(text || href)}</a>` : esc(text),
       },
     });
     return md;
   }
   // A link's target as a path, without its fragment (`a.md#install`, `a.rs#L12`) or a line suffix
-  // (`a.rs:12`); null for a URL or anchor. A `#` in a file's name is written `%23`.
+  // (`a.rs:12`); null for a URL or anchor. A `#` or `:` in a file's name is written `%23` or `%3A`.
   function filePath(href) {
-    let p = (href ?? '').replace(/#.*$/s, ''); try { p = decodeURIComponent(p); } catch (_) {}
-    if (!p || /^[a-z][a-z0-9+.-]*:/i.test(p.replace(/^file:\/\//i, ''))) return null;
-    return p.replace(/^file:\/\//i, '').replace(/:\d+(:\d+)?$/, '') || null;
+    let p = (href ?? '').replace(/#.*$/s, '').replace(/^file:\/\//i, '');
+    if (!p || /^[a-z][a-z0-9+.-]*:/i.test(p)) return null;
+    p = p.replace(/:\d+(:\d+)?$/, ''); try { p = decodeURIComponent(p); } catch (_) {}
+    return p || null;
   }
   // A message's HTML, inside the caller's `.md` box. One that would draw past 100,000 tags (about
   // 50,000 elements) shows as its text: a line of `- x` or a `*x*` makes an element from a few
-  // bytes, and the window pays for every element it holds. Past 50,000 lines it is not parsed.
+  // bytes, and the window pays for every element it holds. It is not parsed past 50,000 lines or
+  // 100,000 marks that open an inline element (`*`, `_`, a backtick, `[`, `<`, `~`, `|`, `@`,
+  // `www.`, `://`), since the parser's tokens cost more than the HTML they become.
   const TAGS = 100000, LINES = 50000;
   const count = (s, c, max) => { let n = 0, i = -1; while (n <= max && (i = s.indexOf(c, i + 1)) !== -1) n++; return n; };
+  const MARK = /[*_`[<~|@]|www\.|:\/\//g;
+  const marks = (s, max) => { let n = 0; MARK.lastIndex = 0; while (n <= max && MARK.exec(s)) n++; return n; };
   const asText = (text) => `<div class="rc" data-kind="code">${head('text', '')}<pre class="code"><code>${esc(text)}</code></pre></div>`;
-  function html(text) {
-    waited = false;
+  // `used` carries the bounds across the pieces of one message drawn apart, as a streamed reply's
+  // blocks are; once over, `used.over` is set and that piece is text. `used.scope` names where its
+  // diagrams and charts were drawn (see `lazy`).
+  function html(text, used = { lines: 0, tags: 0, code: 0 }) {
+    waited = false; spent = used.code ?? 0; scope = used.scope ?? null;
     const p = parser();
     if (!p) return `<p>${esc(text)}</p>`;
-    if (count(text, '\n', LINES) > LINES) return asText(text);
+    if (used.over) return asText(text);
+    const lines = count(text, '\n', LINES - used.lines);
+    if (used.lines + lines > LINES || used.tags + marks(text, TAGS - used.tags) > TAGS) { used.over = true; return asText(text); }
     let out; try { out = p.parse(text); } catch (_) { return `<p>${esc(text)}</p>`; }
-    if (count(out, '<', TAGS) > TAGS) { waited = false; return asText(text); }
+    used.code = spent;
+    const tags = count(out, '<', TAGS - used.tags);
+    if (used.tags + tags > TAGS) { waited = false; used.over = true; return asText(text); }
+    used.lines += lines; used.tags += tags;
     return out;
   }
 
@@ -124,13 +148,14 @@ window.Rich = (() => {
   // ---------- drawn in place ----------
   // Something drawn later changes a block's height; a reader at the end of the pane stays there, and
   // one reading below the block keeps their place (the panes do no scroll anchoring of their own).
-  function settle(box, change) {
-    const pane = box.closest('.scroll'); if (!pane) { change(); return; }
+  // `hold` notes the reader's place before a change; each call of what it returns keeps it after.
+  function hold(box) {
+    const pane = box.closest?.('.scroll'); if (!pane) return () => {};
     const end = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 40;
-    const above = !end && box.getBoundingClientRect().bottom <= pane.getBoundingClientRect().top, h = pane.scrollHeight;
-    change();
-    if (end) pane.scrollTop = pane.scrollHeight; else if (above) pane.scrollTop += pane.scrollHeight - h;
+    const above = !end && box.getBoundingClientRect().bottom <= pane.getBoundingClientRect().top; let h = pane.scrollHeight;
+    return () => { if (end) pane.scrollTop = pane.scrollHeight; else if (above) pane.scrollTop += pane.scrollHeight - h; h = pane.scrollHeight; };
   }
+  function settle(box, change) { const keep = hold(box); change(); keep(); }
   // Rendered diagrams by source (and a chart by its width), so a pane drawn again shows them at once;
   // at most 64 of them and 8 MiB of SVG.
   const diagrams = new Map(), DIAGRAMS = 64, DIAGRAM_BYTES = 8 * 1024 * 1024; let diagramBytes = 0;
@@ -149,13 +174,18 @@ window.Rich = (() => {
     });
   }
   // A diagram or chart drawn to SVG once per source; one at a time, as Mermaid measures in a shared
-  // scratch element. A source that does not draw keeps showing as code, the error in its head.
-  // With `cached`, only one already drawn is shown: a chart drawn once, when asked, shows again.
+  // scratch element. A source that does not draw keeps showing as code, the error in its head,
+  // and draws again only when asked again.
+  // With `cached`, only a block someone asked for (`shown`, the last 1,024 asked) draws again,
+  // from the cache or, when a chart's width changed, anew.
+  const shown = new Set(), SHOWN = 1024;
   function drawLazy(box, src, make, cached = false) {
     const key = `${box.dataset.kind}|${box.dataset.lang ?? ''}|${box.dataset.kind === 'chart' ? box.clientWidth : ''}|${src}`;
     const show = (svg) => settle(box, () => { box.querySelector('.view').innerHTML = svg; box.dataset.view = 'view'; box.dataset.drawn = ''; });
+    if (cached && !shown.has(box.dataset.id)) return;
+    if (!cached && box.dataset.id) { shown.delete(box.dataset.id); shown.add(box.dataset.id); if (shown.size > SHOWN) shown.delete(shown.values().next().value); }
     if (diagrams.has(key)) { show(diagrams.get(key)); return; }
-    if (cached || 'asked' in box.dataset) return;
+    if ('asked' in box.dataset) return;
     box.dataset.asked = '';
     // One queued behind the same source takes its result instead of drawing it again; one larger
     // than the whole budget is shown but not kept.
@@ -166,7 +196,7 @@ window.Rich = (() => {
         const [k, v] = diagrams.entries().next().value; diagrams.delete(k); diagramBytes -= 2 * (k.length + v.length);
       }
       show(svg);
-    }, (e) => { delete box.dataset.asked; const l = box.querySelector('.rh .lang'); l.textContent = `${l.textContent.split(' · ')[0]} · ${String(e?.message ?? e).split('\n')[0].slice(0, 80)}`; });
+    }, (e) => { delete box.dataset.asked; shown.delete(box.dataset.id); const l = box.querySelector('.rh .lang'); l.textContent = `${l.textContent.split(' · ')[0]} · ${String(e?.message ?? e).split('\n')[0].slice(0, 80)}`; });
   }
   const mermaidSVG = (src) => mermaidReady().then((m) => m.render(`rich-mmd-${++diagramId}`, src)).then(({ svg }) => svg);
 
@@ -223,11 +253,12 @@ window.Rich = (() => {
     const src = box.querySelector('pre').textContent;
     drawLazy(box, src, box.dataset.kind === 'mermaid' ? mermaidSVG : chartSVG, cached);
   }
-  // After HTML from `html` is in the document: a file's drawing starts, and a diagram or chart already
-  // drawn shows again from the cache. A page or SVG someone ran in a message is code again once its
-  // pane is drawn anew: running it is asked of one block, once.
+  // After HTML from `html` is in the document (`root` and what it holds): a file's drawing starts,
+  // and a diagram or chart someone asked for shows again from the cache. A page or SVG someone ran
+  // in a message is code again once its pane is drawn anew: running it is asked of one block, once.
+  const HYDRATE = '.rc[data-lazy]:not([data-on]), .rc[data-kind="html"]:not([data-on]), .rc[data-kind="svg"]:not([data-on])';
   function hydrate(root) {
-    for (const box of root.querySelectorAll('.rc[data-lazy]:not([data-on]), .rc[data-kind="html"]:not([data-on]), .rc[data-kind="svg"]:not([data-on])')) {
+    for (const box of [...(root.matches?.(HYDRATE) ? [root] : []), ...root.querySelectorAll(HYDRATE)]) {
       box.dataset.on = '';
       if ('lazy' in box.dataset) draw(box, !('run' in box.dataset));
       else if (box.dataset.view === 'view') mount(box);
@@ -248,7 +279,8 @@ window.Rich = (() => {
     const f = e.target.closest?.('[data-file]');
     if (f) { e.preventDefault(); openFile(f.dataset.file, f); return true; }
     const im = e.target.closest?.('button.img[data-img]');
-    if (im) { const img = document.createElement('img'); img.src = im.dataset.img; img.alt = im.title; im.replaceWith(img); return true; }
+    // It has no height until decoded, so the reader's place is kept again once it loads.
+    if (im) { const img = document.createElement('img'), keep = hold(im); img.addEventListener('load', keep); img.src = im.dataset.img; img.alt = im.title; im.replaceWith(img); keep(); return true; }
     // Every link in drawn content goes through the guarded opener, or nowhere: a Mermaid `click`
     // link is an SVG `<a xlink:href>` that would otherwise take over the window.
     const a = e.target.closest?.('.md a, .rc a');
@@ -270,15 +302,18 @@ window.Rich = (() => {
   // ---------- files ----------
   // A file opened beside, drawn by its kind: Markdown, a diagram, a chart, a page, an image, a
   // table, or code. `bytes` is what was read (at most `cap`); `more` says the file goes on.
+  // `asked` draws a page, diagram, chart or image at once; without it (a file an agent rewrote
+  // while open) each waits for a click, as in a message.
   const IMAGE = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', avif: 'image/avif', bmp: 'image/bmp', ico: 'image/x-icon' };
   const extOf = (path) => { const n = path.split('/').pop().toLowerCase(); return /\.(vl|vg)\.json$/.test(n) ? n.slice(-7, -5) : n.includes('.') ? n.split('.').pop() : n; };
-  // The first `max` rows of a CSV or TSV, at most 256 columns each: a quoted field may hold the
-  // separator, a line break or a doubled quote.
+  // The first `max` rows of a CSV or TSV, at most 256 columns each, ending with the row that
+  // reaches 10,000 cells: a quoted field may hold the separator, a line break or a doubled quote.
+  // `more` says rows were left out.
   const COLUMNS = 256, CELLS = 10000;
   function csv(text, sep, max) {
-    const out = []; let row = [], cell = '', quoted = false, i = 0;
-    const end = () => { if (row.length < COLUMNS) row.push(cell); cell = ''; if (row.length > 1 || row[0]) out.push(row); row = []; };
-    for (; i < text.length && out.length < max; i++) {
+    const out = []; let row = [], cell = '', quoted = false, i = 0, cells = 0;
+    const end = () => { if (row.length < COLUMNS) row.push(cell); cell = ''; if (row.length > 1 || row[0]) { out.push(row); cells += row.length; } row = []; };
+    for (; i < text.length && out.length < max && cells < CELLS; i++) {
       const c = text[i];
       if (quoted) { if (c !== '"') cell += c; else if (text[i + 1] === '"') { cell += c; i++; } else quoted = false; }
       else if (c === '"' && !cell) quoted = true;
@@ -286,32 +321,36 @@ window.Rich = (() => {
       else if (c === '\n') end();
       else if (c !== '\r') cell += c;
     }
-    if (out.length < max && (cell || row.length)) end();
+    if (out.length < max && cells < CELLS && (cell || row.length)) end();
+    out.more = /\S/.test(text.slice(i));
     return out;
   }
   function table(text, sep) {
     const rows = csv(text, sep, 1001);
     const cell = (tag) => (c) => `<${tag}>${esc(c)}</${tag}>`;
-    return `<div class="md"><table><thead><tr>${(rows[0] ?? []).map(cell('th')).join('')}</tr></thead><tbody>${rows.slice(1).map((r) => `<tr>${r.map(cell('td')).join('')}</tr>`).join('')}</tbody></table></div>`;
+    return `${rows.more ? `<div class="line note">showing the first ${rows.length - 1} rows</div>` : ''}<div class="md"><table><thead><tr>${(rows[0] ?? []).map(cell('th')).join('')}</tr></thead><tbody>${rows.slice(1).map((r) => `<tr>${r.map(cell('td')).join('')}</tr>`).join('')}</tbody></table></div>`;
   }
-  function file(path, bytes, more = false) {
+  // `waited` says the view is code that highlighting, once loaded, would draw differently.
+  function file(path, bytes, more = false, asked = true) {
+    spent = 0; waited = false; scope = `file ${path}`;
     const ext = extOf(path), note = more ? `<div class="line note">showing the first ${Math.round(bytes.length / 1048576)} MiB</div>` : '';
     if (IMAGE[ext]) {
       if (more) return { html: '<div class="line note">image too large to show</div>' };
-      const url = URL.createObjectURL(new Blob([bytes], { type: IMAGE[ext] }));
-      return { html: `<div class="fimg"><img alt="" src="${esc(url)}"></div>`, url };
+      const url = URL.createObjectURL(new Blob([bytes], { type: IMAGE[ext] })), name = path.split('/').pop();
+      return { html: asked ? `<div class="fimg"><img alt="" src="${esc(url)}"></div>` : `<div class="md fimg"><button type="button" class="img" data-img="${esc(url)}" title="${esc(name)}">image: ${esc(name)}</button></div>`, url };
     }
     if (bytes.subarray(0, 8000).includes(0)) return { html: `<div class="line note">binary file · ${bytes.length}${more ? '+' : ''} bytes</div>` };
     const text = new TextDecoder().decode(bytes);
-    if (ext === 'md' || ext === 'markdown') return { html: `${note}<div class="md">${html(text)}</div>` };
+    if (ext === 'md' || ext === 'markdown') return { html: `${note}<div class="md">${html(text, { lines: 0, tags: 0, code: 0, scope })}</div>`, waited };
     if (ext === 'csv' || ext === 'tsv') return { html: note + table(text, ext === 'csv' ? ',' : '\t') };
     const lang = { mmd: 'mermaid', mermaid: 'mermaid', vl: 'vega-lite', vg: 'vega', htm: 'html', html: 'html', svg: 'svg' }[ext] ?? ext;
-    return { html: note + `<div class="md">${block(text, lang, true)}</div>` };
+    const out = block(text, lang, asked);
+    return { html: note + `<div class="md">${out}</div>`, waited: waited && out.startsWith('<div class="rc" data-kind="code"') };
   }
   let openFile = () => {}, failed = () => {};
 
   // A middle click on a link would open it in a new app window.
-  document.addEventListener?.('auxclick', (e) => { if (e.target.closest?.('.md a, .rc a')) e.preventDefault(); });
+  document.addEventListener?.('auxclick', (e) => { if (e.target.closest?.('.md a, .rc a, a[data-file]')) e.preventDefault(); });
 
   return { html, cut, hydrate, click, file, filePath, esc, get version() { return version; }, get waited() { return waited; }, set onReady(fn) { ready = fn; }, set onFile(fn) { openFile = fn; }, set onError(fn) { failed = fn; } };
 })();

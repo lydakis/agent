@@ -129,7 +129,9 @@ failed, and cancelled turns. A controller reconnect must be able to determine
 which state actually holds. Losing a connection is not evidence that the turn
 stopped. A bot may outlive many terminal turns.
 
-Submission needs an idempotency key or equivalent durable request identity.
+Submission, creation and forking need an idempotency key or equivalent
+durable request identity, and deletion an expected identity, so a client that
+lost a reply resends the same request and gets what the first one did.
 After uncertain dispatch, reconcile against the owning engine's state before retrying.
 Do not promise exactly-once external tool side effects. If recovery cannot
 establish an outcome, report it as unknown rather than replaying work blindly.
