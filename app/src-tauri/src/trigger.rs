@@ -1621,6 +1621,7 @@ fn settle(places: &Places, trigger: &Trigger, outcome: &Value, kept: &Kept, laun
     }
     let over = trigger.at.is_some()
         || outcome["outcome"] == "gone"
+        || outcome["gone"] == true
         || outcome["reply"]["gone"] == true
         || trigger.runs.is_some_and(|runs| kept.sent >= runs);
     // One that did not deliver ends only once why is on disk; else its plist
@@ -2599,6 +2600,17 @@ async fn start(client: &Client, trigger: &Trigger) -> Result<i64, String> {
         .ok_or_else(|| "create: no bot id".into())
 }
 
+/// What came of a fire whose agent could not be made. Pinned by id, an
+/// agent that added the trigger and is gone never comes back: the trigger
+/// ends, as for an answer whose agent is gone.
+fn unmade(error: String) -> Value {
+    let mut failed = json!({"outcome": "failed", "detail": error});
+    if error.starts_with("creator_not_found") {
+        failed["gone"] = json!(true);
+    }
+    failed
+}
+
 /// Send the fire's message: a new turn when the agent is resting; a working
 /// agent, or one with work waiting, skips this time of a repeating trigger
 /// and gets any other's after its work. A deleted agent's trigger goes.
@@ -2626,7 +2638,7 @@ async fn deliver(
                 // Its id goes on disk with the message to it, below; a fire
                 // cut short before then gets the same agent again.
                 Ok(id) => (name, id, true),
-                Err(error) => return Ok(json!({"outcome": "failed", "detail": error})),
+                Err(error) => return Ok(unmade(error)),
             }
         }
     };
@@ -3839,6 +3851,24 @@ mod tests {
         w.settle(&s, json!({"outcome": "sent", "turn": 2, "reply": lost}));
         assert_eq!(w.state(&s.name), (false, false, true));
         assert_eq!(w.rows()[0]["last"]["reply"]["gone"], true);
+        // And one that starts its agent once the agent that added it is gone;
+        // any other agent it could not make is tried again next time.
+        w.install(&s).unwrap();
+        w.settle(&s, unmade("bot_exists: p.review".into()));
+        assert_eq!(w.state(&s.name), (true, true, true));
+        w.settle(&s, unmade("creator_not_found: ".into()));
+        assert_eq!(w.state(&s.name), (false, false, true));
+        let row = &w.rows()[0];
+        assert_eq!(
+            (&row["ended"], &row["last"]["outcome"]),
+            (&json!(true), &json!("failed"))
+        );
+        assert!(
+            row["last"]["detail"]
+                .as_str()
+                .unwrap()
+                .starts_with("creator_not_found")
+        );
     }
 
     #[test]

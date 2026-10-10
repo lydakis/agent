@@ -1079,7 +1079,9 @@ default tools), made by the agent that added the trigger when one did, so
 it shows under that agent, and gives it the fire's message. Its id is kept with the trigger's
 state together with that message, before any wait, and later fires message it. A name an agent already has is refused at
 `add` (`bot_exists`), and an agent of that name made before the first fire
-makes that fire fail, naming it. The `create` carries the trigger's own
+makes that fire fail, naming it. The agent that added it is pinned by its
+id too: once it is deleted, `create` fails with `creator_not_found`, and the
+trigger ends, keeping its row, as when its `--reply-to` agent is gone. The `create` carries the trigger's own
 request id, so a fire cut short after the daemon made the agent asks again
 and gets that same agent, and no other.
 
@@ -1187,7 +1189,8 @@ anything else a failure can leave is listed and removable:
   and fires only use a state file of the current generation, so a trigger
   made again under an ended one's name starts afresh.
 - **Firing** records its result and ends a trigger that is over (a one-off,
-  one whose agent is gone, one that reached `--runs`), both under the lock
+  one whose agent, `--reply-to` agent or, for `--start`, adding agent is
+  gone, one that reached `--runs`), both under the lock
   and only while the plist is still the one it fired for: a trigger
   removed while its message went out is left as it now is. A one-off that
   delivered leaves nothing. One that ends without delivering (its agent
