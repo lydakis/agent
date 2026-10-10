@@ -203,6 +203,11 @@ button.newproj:hover{background:var(--t-raised);color:var(--t-ink)}
 .trow .w,.trow .r2{color:var(--t-faint);font-size:12px}
 .trow .r2{padding-left:2ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:16px}
 .trow.bad .w,.trigs .pnote.bad{color:var(--fail)}
+.trigs .newproj{margin:4px 8px 0}
+.sheet label.check{display:flex;align-items:center;gap:8px;color:var(--t-ink);font-size:13px;margin-top:8px}
+.sheet .tin{width:100%;min-width:0;background:var(--t-bg);border:1px solid var(--t-line);border-radius:6px;color:var(--t-ink);font:inherit;padding:6px 8px;outline:none}
+.sheet .tin:focus{border-color:#6f5a36}
+.sheet .tin[hidden]{display:none}
 .tk{color:var(--amber);width:1.2ch;text-align:center;flex-shrink:0;display:inline-block}
 .line.user .why{color:var(--t-faint);font-size:12px}
 #newproj+#memory{margin-top:-4px}
