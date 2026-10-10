@@ -36,7 +36,7 @@ function page(daemon = {}, storage = null) {
   context.Rich = context.window.Rich;
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules, tellLead, markSeen, renderFile };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, save, restore, showMenu, refreshMenu, entries, pickerRows, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules, tellLead, markSeen, renderFile, go, upOf, crumbsHTML, railRows, renderTabs };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -814,9 +814,9 @@ test('process-heavy history folds cards into recoverable result ranges', async (
 test('a waiting sidebar row is one row: its glyph says waiting, and no handle line follows it', () => {
   const p=page();p.upsert({name:'Bob',id:1});const b=p.S.bots.get('Bob');
   b.status='waiting';b.waitingOn=['turn:<img src=x onerror=alert(1)>/1'];
-  const html=p.botRowHTML({b,depth:1,prefix:'│ └'},false);
+  const html=p.botRowHTML({b,depth:1,kids:0});
   assert.ok(!html.includes('img'));assert.doesNotMatch(html,/class="w"/);
-  assert.match(html,/<span class="tree">│ └<\/span><span class="glyph waiting">/);
+  assert.match(html,/role="button" tabindex="0"><span class="glyph waiting">/);
   assert.ok(html.endsWith('</div>') && html.indexOf('<div class="botrow')===0 && html.lastIndexOf('<div')===0,'exactly one element per row');
 });
 
@@ -971,17 +971,18 @@ test('reconnect after pruning reloads the full lineage in either snapshot/replay
   }
 });
 
-test('rail scrolling moves a bounded window both ways independently of selection', () => {
+test('rail scrolling moves a bounded window both ways independently of what is open', () => {
   const p=page();p.S.ui.rail=true;
   for(let i=0;i<1000;i++)p.upsert({name:`bot${i}`,id:i+1});
-  p.S.selected='bot0';p.renderRail();const el=p.elements.get('bots');
+  p.S.selected='';p.renderRail();const el=p.elements.get('bots');
   el.scrollHeight=1000;el.clientHeight=100;
   for(let i=0;i<6;i++){el.scrollTop=900;el.listeners.scroll();assert.ok((el.innerHTML.match(/data-bot=/g)||[]).length<=300);}
   assert.match(el.innerHTML,/data-bot="bot999"/);
-  assert.equal(p.S.selected,'bot0');
+  assert.equal(p.S.selected,'');
   for(let i=0;i<6;i++){el.scrollTop=0;el.listeners.scroll();}
   assert.match(el.innerHTML,/data-bot="bot0"/);
-  p.S.selected='bot900';p.renderRail();assert.match(el.innerHTML,/data-bot="bot900"/);
+  // A level drawn anew centers on the bot beside.
+  p.S.ui.side='bot900';p.S.shapeGen++;p.renderRail();assert.match(el.innerHTML,/data-bot="bot900"/);
 });
 
 
@@ -1146,7 +1147,7 @@ const shell = (daemon = {}, storage = null) => { const p = page(daemon, storage)
 const drafting = (daemon = {}) => { const p = shell(daemon); p.setRender(() => p.followDrafts()); return p; };
 const names = (rows) => Array.from(rows, (r) => r.label ?? r.b.name);
 
-test('projects list coordinators with their lineage and prefixed tasks, then other bots', () => {
+test('the sidebar lists one level below what is open, and the crumbs go back up', () => {
   const p = shell();
   p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one' });
   p.upsert({ name: 'app.build', id: 2, provider: 'alpha', model: 'one', created_by: 'app.lead', created_by_id: 1 });
@@ -1157,28 +1158,103 @@ test('projects list coordinators with their lineage and prefixed tasks, then oth
   p.upsert({ name: 'zeta.lead', id: 6, provider: 'alpha', model: 'one', created_by: 'app.build', created_by_id: 2 });
   const rows = p.tree();
   assert.deepEqual(names(rows), ['app.lead', 'app.build', 'app.review', 'app.manual', 'zeta.lead', 'bots', 'loose']);
-  assert.equal(rows[0].head, 'app'); assert.equal(rows[0].tasks, 3); assert.equal(rows[4].tasks, 0);
+  assert.equal(rows[0].head, 'app');
   const bot = (n) => p.S.bots.get(n);
   assert.equal(p.shortName(bot('app.lead')), 'app'); assert.equal(p.shortName(bot('app.review')), 'review'); assert.equal(p.shortName(bot('loose')), 'loose');
-  assert.match(p.botRowHTML(rows[0], true), /data-act="fold"/); assert.doesNotMatch(p.botRowHTML(rows[4], false), /data-act="fold"/);
-  assert.match(p.botRowHTML(rows[1], false), /data-act="more" data-who="app.build"/);
-  p.S.ui.folded.add('app');
-  assert.deepEqual(names(p.tree()), ['app.lead', 'zeta.lead', 'bots', 'loose']);
-  assert.equal(bot('app.review').project, 'app', 'a folded project still owns its tasks');
+  const level = (open) => { p.S.selected = open; return Array.from(p.railRows(), (r) => [r.label ?? r.b.name, r.kids ?? 0]); };
+  assert.deepEqual(level(''), [['app.lead', 2], ['zeta.lead', 0], ['bots', 0], ['loose', 0]], 'Home: projects with their thread counts, then the rest');
+  assert.deepEqual(level('app.lead'), [['app.build', 1], ['app.manual', 0]], 'a project: its threads, a prefixed root among them');
+  assert.deepEqual(level('app.build'), [['app.review', 0]]);
+  assert.deepEqual(level('app.review'), []);
+  assert.match(p.botRowHTML(p.railRows()[0] ?? { b: bot('app.build'), kids: 1 }), /data-act="more" data-who="app.build"/);
+  assert.equal(p.upOf('app.review'), 'app.build'); assert.equal(p.upOf('app.manual'), 'app.lead');
+  assert.equal(p.upOf('zeta.lead'), '', 'a coordinator sits under Home, whoever started it');
+  const crumbs = p.crumbsHTML('app.review');
+  assert.match(crumbs, /data-act="home">Home<\/button>.*data-who="app.lead">app<\/button>.*data-who="app.build">build<\/button>.*<b>review<\/b>/);
+  assert.equal(p.context.document.title, 'Agent › app › build › review');
 });
 
-test('a sidebar row opens a thread alone, a card opens it beside, and swap trades them', async () => {
+test('a card looks in beside, full screen takes the tab, and Home and the finder open tabs', async () => {
   const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
   for (const [name, id] of [['app.lead', 1], ['app.build', 2], ['app.test', 3]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
-  p.tree(); p.S.selected = 'app.lead';
-  await p.openBeside('app.build'); assert.equal(p.S.ui.side, 'app.build');
-  await p.openBeside('app.build'); assert.equal(p.S.ui.side, null, 'the same card closes it again');
-  await p.openBeside('app.lead'); assert.equal(p.S.ui.side, null, 'the thread in view never opens beside itself');
-  await p.openBeside('app.build'); p.swap();
-  assert.equal(p.S.selected, 'app.build'); assert.equal(p.S.ui.side, 'app.lead');
-  p.S.ui.folded.add('app');
-  await p.openOnly('app.test');
-  assert.equal(p.S.selected, 'app.test'); assert.equal(p.S.ui.side, null); assert.equal(p.S.ui.folded.has('app'), false);
+  p.tree(); await p.go('app.lead');
+  assert.deepEqual([...p.S.ui.tabs], ['app.lead'], 'from Home it opens a tab');
+  await p.go('app.build', 'beside'); assert.equal(p.S.ui.side, 'app.build');
+  await p.go('app.build', 'beside'); assert.equal(p.S.ui.side, null, 'the same card closes it again');
+  await p.go('app.build', 'beside');
+  await p.go('app.lead', 'beside'); assert.equal(p.S.ui.side, 'app.build', 'the thread in view never opens beside itself');
+  await p.go(p.S.ui.side);
+  assert.equal(p.S.selected, 'app.build'); assert.equal(p.S.ui.side, null);
+  assert.deepEqual([...p.S.ui.tabs], ['app.build'], 'inside a tab it goes down a level in that tab');
+  await p.go(''); assert.equal(p.S.selected, ''); assert.deepEqual([...p.S.ui.tabs], ['app.build'], 'Home keeps the tabs');
+  await p.go('app.test'); assert.deepEqual([...p.S.ui.tabs], ['app.build', 'app.test']);
+  await p.go('app.build'); assert.deepEqual([...p.S.ui.tabs], ['app.build', 'app.test'], 'an agent already in a tab is that tab');
+  await p.go('app.lead', 'tab'); assert.deepEqual([...p.S.ui.tabs], ['app.build', 'app.test', 'app.lead']); assert.equal(p.S.selected, 'app.lead');
+  await p.go('app.lead', 'close'); assert.equal(p.S.selected, 'app.test', 'a closed tab hands over to the one before');
+  await p.go('app.build', 'close'); assert.equal(p.S.selected, 'app.test'); assert.deepEqual([...p.S.ui.tabs], ['app.test']);
+  await p.go('app.build', 'tab'); await p.go('app.test');
+  await p.go('app.test', 'close'); assert.equal(p.S.selected, '', 'before the first tab is Home'); assert.deepEqual([...p.S.ui.tabs], ['app.build']);
+  await p.go('app.test'); await p.go('app.build', 'close'); assert.deepEqual([...p.S.ui.tabs], ['app.test']); assert.equal(p.S.selected, 'app.test');
+  // A deleted agent's tab goes up a level; one whose way up is Home closes.
+  await p.onEvent({ event: 'deleted', bot: 'app.test' });
+  assert.deepEqual([...p.S.ui.tabs], ['app.lead']); assert.equal(p.S.selected, 'app.lead');
+  await p.onEvent({ event: 'deleted', bot: 'app.lead' });
+  assert.deepEqual([...p.S.ui.tabs], []); assert.equal(p.S.selected, '');
+});
+
+test('from Home the arrows open the first or last agent; Enter or Space on a tab chooses it', async () => {
+  const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
+  for (const [name, id] of [['app.lead', 1], ['app.build', 2], ['loose', 3]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id === 2 ? 'app.lead' : null, created_by_id: id === 2 ? 1 : null });
+  const doc = p.context.document, key = (k, target = { id: 'input' }) => doc.listeners.keydown({ key: k, target, preventDefault() {} });
+  await key('ArrowDown'); assert.equal(p.S.selected, 'app.lead', 'down from Home is the first row');
+  await key('ArrowDown'); assert.equal(p.S.selected, 'app.build');
+  await p.go(''); await key('ArrowUp'); assert.equal(p.S.selected, 'loose', 'up from Home is the last row');
+  await key('ArrowUp'); assert.equal(p.S.selected, 'app.build');
+  // A focused tab is a button: Enter or Space opens it, and its close button keeps its own keys.
+  p.S.ui.tabs = ['app.lead', 'app.build']; p.S.selected = 'app.build';
+  const tab = (who, act = false) => ({ id: '', closest: (sel) => (sel === '[data-tab]' ? { dataset: { tab: who } } : sel === '[data-act]' && act ? {} : null) });
+  await key('Enter', tab('app.lead')); assert.equal(p.S.selected, 'app.lead');
+  await key(' ', tab('app.build')); assert.equal(p.S.selected, 'app.build');
+  await key('Enter', tab('app.lead', true)); assert.equal(p.S.selected, 'app.build', 'Enter on × is the close button\'s');
+});
+
+test('a saved tab comes back only for the same bot identity', () => {
+  const storage = new Map();
+  const p = shell({}, storage);
+  for (const [name, id] of [['lead', 1], ['task', 2], ['peek', 3]]) p.upsert({ name, id, provider: 'alpha', model: 'one' });
+  p.S.ui.tabs = ['lead', 'task']; p.S.selected = 'task'; p.S.ui.side = 'peek'; p.save();
+  const q = shell({}, storage);
+  q.upsert({ name: 'lead', id: 1, provider: 'alpha', model: 'one' });
+  q.upsert({ name: 'task', id: 9, provider: 'alpha', model: 'one' }); // deleted and made again
+  q.upsert({ name: 'peek', id: 3, provider: 'alpha', model: 'one' });
+  q.restore();
+  assert.deepEqual([...q.S.ui.tabs], ['lead'], 'a new bot under an old name does not take its tab');
+  assert.equal(q.S.selected, '', 'the dropped tab is not selected');
+  assert.equal(q.S.ui.side, 'peek');
+  const r = shell({}, storage);
+  r.upsert({ name: 'lead', id: 1, provider: 'alpha', model: 'one' }); r.upsert({ name: 'task', id: 2, provider: 'alpha', model: 'one' }); r.upsert({ name: 'peek', id: 8, provider: 'alpha', model: 'one' });
+  r.restore();
+  assert.deepEqual([...r.S.ui.tabs], ['lead', 'task']); assert.equal(r.S.selected, 'task');
+  assert.equal(r.S.ui.side, null, 'nor the agent beside');
+});
+
+test('a saved tab whose agent is gone goes up to what made it', async () => {
+  const storage = new Map();
+  const p = shell({}, storage);
+  await p.onEvent({ event: 'created', bot: 'lead', data: { id: 1, provider: 'alpha', model: 'one' } });
+  await p.onEvent({ event: 'created', bot: 'helper', data: { id: 2, provider: 'alpha', model: 'one', created_by: 'lead', created_by_id: 1 } });
+  p.S.ui.tabs = ['helper']; p.S.selected = 'helper'; p.save();
+  const q = shell({}, storage);
+  q.upsert({ name: 'lead', id: 1, provider: 'alpha', model: 'one' }); // helper was deleted while the app was closed
+  q.restore();
+  assert.deepEqual([...q.S.ui.tabs], ['lead']); assert.equal(q.S.selected, 'lead', 'the tab moved up stays selected');
+  const r = shell({}, storage);
+  r.upsert({ name: 'lead', id: 7, provider: 'alpha', model: 'one' }); r.restore();
+  assert.deepEqual([...r.S.ui.tabs], [], 'nor to a new bot under its maker\'s name'); assert.equal(r.S.selected, '');
+  // A live deletion's move up is saved at once, so a window lost before the next save keeps it.
+  await p.onEvent({ event: 'deleted', bot: 'helper', data: {} });
+  const s = shell({}, storage); s.upsert({ name: 'lead', id: 1, provider: 'alpha', model: 'one' }); s.restore();
+  assert.equal(s.S.selected, 'lead');
 });
 
 test('each composer sends to its own pane, and a working bot gets the sticky queue or steer pick', async () => {
@@ -1340,8 +1416,9 @@ test('one menu per agent: side chat any time, stop while running, fork and delet
   p.upsert({ name: 'busy', id: 1, provider: 'alpha', model: 'one', status: 'running', running_turn: 4 });
   p.upsert({ name: 'rest', id: 2, provider: 'alpha', model: 'one' });
   const state = (name) => Object.fromEntries(p.botMenuItems(name).filter((i) => i.act).map((i) => [i.act, !i.disabled]));
-  assert.deepEqual(state('busy'), { 'side-chat': true, stop: true, fork: false, delete: false, steps: true });
-  assert.deepEqual(state('rest'), { 'side-chat': true, stop: false, fork: true, delete: true, steps: true });
+  assert.deepEqual(state('busy'), { 'open-tab': true, 'side-chat': true, stop: true, fork: false, delete: false, steps: true });
+  assert.deepEqual(state('rest'), { 'open-tab': true, 'side-chat': true, stop: false, fork: true, delete: true, steps: true });
+  p.S.ui.tabs.push('rest'); assert.equal(state('rest')['open-tab'], false, 'an agent in a tab already has one');
 });
 
 test('a side chat forks a running bot under it, beside, with its tools and folder, and takes the first message', async () => {
@@ -1416,11 +1493,11 @@ test('a failed send comes back only to the bot it was for', async () => {
   for (const [name, id] of [['app.lead', 1], ['app.build', 2], ['app.test', 3]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
   p.tree(); p.S.selected = 'app.lead';
   const doc = p.context.document, side = doc.getElementById('sideinput');
-  await p.openBeside('app.build');
+  await p.go('app.build', 'beside');
   side.value = 'for build';
   const sending = doc.getElementById('sideform').listeners.submit({ preventDefault() {} });
   await new Promise((r) => setImmediate(r));
-  await p.openBeside('app.test');
+  await p.go('app.test', 'beside');
   fail(); await sending;
   assert.equal(p.S.ui.side, 'app.test'); assert.equal(side.value, '', 'not restored under another bot');
 });
@@ -1591,7 +1668,7 @@ test('Escape in the finder never stops a turn, and a deleted bot takes its draft
   await doc.listeners.keydown({ key: 'Escape', target: { id: 'pickerq' }, preventDefault() {} });
   assert.deepEqual(sent.filter((op) => op === 'interrupt'), []);
   doc.getElementById('input').value = 'for lead';
-  await p.openOnly('app.task'); doc.getElementById('input').value = 'for task';
+  await p.go('app.task'); doc.getElementById('input').value = 'for task';
   await p.onEvent({ event: 'deleted', bot: 'app.task' }); p.followDrafts();
   assert.equal(p.S.selected, 'app.lead'); assert.equal(doc.getElementById('input').value, 'for lead');
   assert.equal(p.S.drafts.has('app.task'), false, 'a deleted bot takes its draft with it');
@@ -1613,31 +1690,32 @@ test('the demo daemon ends a stopped turn quietly when its bot is deleted before
   } finally { process.off('unhandledRejection', onFail); d.close(); }
 });
 
-test('a folded run names a timeout or a failed call; the finder reaches folded tasks; a side draft stays with its bot', async () => {
+test('a folded run names a timeout or a failed call; the finder reaches any task; a side draft stays with its bot', async () => {
   const p = drafting({ request: async () => ({ nodes: [], next_from: null }) });
   for (const [out, want] of [[{ stdout: '', exit_code: null, success: false, timed_out: true }, 'timed out'], [{ stdout: '', exit_code: null, success: false }, 'failed'], [{ stdout: 'ok', exit_code: 0, success: true }, null]])
     assert.equal(p.entries({ type: 'function_call_output', call_id: 'c', output: JSON.stringify(out) })[0].err, want);
   for (const [name, id] of [['app.lead', 1], ['app.build', 2], ['app.test', 3]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
-  p.tree(); p.S.selected = 'app.lead'; p.S.ui.folded.add('app');
+  p.tree(); p.S.selected = 'app.test';
   p.context.document.getElementById('pickerq').value = 'build';
-  assert.deepEqual(Array.from(p.pickerRows(), (r) => r.b.name), ['app.build'], 'a folded task is still found');
+  assert.deepEqual(Array.from(p.pickerRows(), (r) => r.b.name), ['app.build'], 'a task outside the open level is still found');
+  p.S.selected = 'app.lead';
   const draft = p.context.document.getElementById('sideinput');
-  await p.openBeside('app.build'); draft.value = 'for build only';
-  await p.openBeside('app.test'); assert.equal(draft.value, '', 'another bot beside has its own draft');
-  draft.value = 'for test only'; p.closeSide(); assert.equal(draft.value, '');
-  await p.openBeside('app.build'); assert.equal(draft.value, 'for build only', 'a closed pane keeps its bot\'s draft');
-  await p.openBeside('app.test'); assert.equal(draft.value, 'for test only');
+  await p.go('app.build', 'beside'); draft.value = 'for build only';
+  await p.go('app.test', 'beside'); assert.equal(draft.value, '', 'another bot beside has its own draft');
+  draft.value = 'for test only'; await p.go(p.S.ui.side, 'beside'); assert.equal(draft.value, '');
+  await p.go('app.build', 'beside'); assert.equal(draft.value, 'for build only', 'a closed pane keeps its bot\'s draft');
+  await p.go('app.test', 'beside'); assert.equal(draft.value, 'for test only');
 });
 
-test('swap carries each draft with its bot; a long wait list stays short in the head', async () => {
+test('full screen carries each draft with its bot; a long wait list stays short in the head', async () => {
   const p = drafting({ request: async () => ({ nodes: [], next_from: null }) });
   for (const [name, id] of [['app.lead', 1], ['app.build', 2]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
   p.tree(); p.S.selected = 'app.lead'; p.followDrafts();
   const main = p.context.document.getElementById('input'), side = p.context.document.getElementById('sideinput');
-  await p.openBeside('app.build'); main.value = 'to lead'; side.value = 'to build';
-  p.swap();
+  await p.go('app.build', 'beside'); main.value = 'to lead'; side.value = 'to build';
+  await p.go(p.S.ui.side);
   assert.equal(p.S.selected, 'app.build'); assert.equal(main.value, 'to build');
-  assert.equal(p.S.ui.side, 'app.lead'); assert.equal(side.value, 'to lead');
+  await p.go('app.lead', 'beside'); assert.equal(side.value, 'to lead', 'the draft left behind waits with its bot');
   p.upsert({ name: 'app.test', id: 3, provider: 'alpha', model: 'one', created_by: 'app.lead', created_by_id: 1 });
   p.transcript('app.build').peers = ['app.lead', 'app.test'];
   p.transcript('app.build').peers = ['app.lead'];
@@ -1670,7 +1748,7 @@ test('the demo daemon answers as a side chat only for a fork nested under its so
   } finally { d.close(); }
 });
 
-test('a task card leaves the keyboard beside; swapping a folded task in unfolds its project', async () => {
+test('a task card leaves the keyboard beside; a row looks in, and a double-click opens a tab', async () => {
   const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
   for (const [name, id] of [['app.lead', 1], ['app.build', 2]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
   p.tree(); p.S.selected = 'app.lead';
@@ -1680,9 +1758,28 @@ test('a task card leaves the keyboard beside; swapping a folded task in unfolds 
   await doc.listeners.click({ target: { closest: (sel) => (sel === '[data-task]' ? card : sel === '.pane.main' ? {} : null) } });
   await p.tick();
   assert.equal(p.S.ui.side, 'app.build'); assert.equal(focused.at(-1), 'sideinput');
-  p.S.ui.folded.add('app'); p.swap();
-  assert.equal(p.S.selected, 'app.build'); assert.equal(p.S.ui.folded.has('app'), false);
-  assert.ok(p.tree().some((n) => n.b?.name === 'app.build'), 'the selected task has a sidebar row');
+  p.S.ui.side = null; p.S.selected = ''; p.S.ui.tabs = [];
+  const row = { dataset: { bot: 'app.lead' } }, at = (sel) => (sel === '[data-bot]' ? row : null);
+  await doc.listeners.click({ detail: 1, target: { closest: at } }); await p.tick();
+  assert.equal(p.S.ui.side, 'app.lead'); assert.equal(p.S.selected, '', 'a click on a row looks in beside');
+  // The second click opens the tab by its count, even when the look already covers the list and the
+  // click lands on it.
+  await doc.listeners.click({ detail: 2, target: { closest: (sel) => (sel === '.pane.side' ? {} : null) } }); await p.tick();
+  assert.equal(p.S.selected, 'app.lead'); assert.deepEqual([...p.S.ui.tabs], ['app.lead']); assert.equal(p.S.ui.side, null);
+  assert.equal(doc.listeners.dblclick, undefined, 'no dblclick handler to miss a redrawn row');
+  // A fast double-click takes the tab before the look fires.
+  p.S.selected = ''; p.S.ui.tabs = [];
+  const build = { dataset: { bot: 'app.build' } }, atBuild = (sel) => (sel === '[data-bot]' ? build : null);
+  await doc.listeners.click({ detail: 1, target: { closest: atBuild } });
+  await doc.listeners.click({ detail: 2, target: { closest: atBuild } }); await p.tick();
+  assert.equal(p.S.selected, 'app.build'); assert.equal(p.S.ui.side, null, 'the pending look was cancelled');
+  // A move after the look is newer: a click the system counts as a second no longer opens the old row.
+  p.S.selected = ''; p.S.ui.tabs = [];
+  await doc.listeners.click({ detail: 1, target: { closest: at } }); await p.tick();
+  assert.equal(p.S.ui.side, 'app.lead');
+  await p.go('app.build');
+  await doc.listeners.click({ detail: 2, target: { closest: () => null } }); await p.tick();
+  assert.equal(p.S.selected, 'app.build'); assert.deepEqual([...p.S.ui.tabs], ['app.build'], 'the old row did not open');
 });
 
 test('a click in a file beside keeps the keyboard in the visible composer', async () => {
@@ -1706,7 +1803,7 @@ test('a failed first message waits in the side chat\'s composer', async () => {
   } });
   p.upsert({ name: 'lead', id: 1, provider: 'alpha', model: 'one', status: 'running', running_turn: 3 });
   p.upsert({ name: 'task', id: 2, provider: 'alpha', model: 'one', status: 'running', running_turn: 4, created_by: 'lead', created_by_id: 1 });
-  p.S.selected = 'lead'; await p.openBeside('task');
+  p.S.selected = 'lead'; await p.go('task', 'beside');
   // Asked from the side pane: the copy replaces its source there, and keeps the unsent message.
   const side = p.context.document.getElementById('sideinput'), main = p.context.document.getElementById('input');
   p.setSend('side');
@@ -1738,38 +1835,49 @@ const rowsOf = (rows) => Array.from(rows, (r) => r.label ?? r.key ?? r.b.name);
 const PLAIN = [{ identity: '', model: 'alpha/one', share: 100 }];
 const swarmRecord = (members = [], extra = {}) => ({ swarm: 'app.latency', dir: "/home/u/.agent/swarms/app.latency", project: 'app', goal: 'Halve p99.', workspace: '/w/app.latency', budget_tokens: 3000000, mix: PLAIN, members, rows: Object.fromEntries(members.map((m) => [m, 0])), stopped: false, ...extra });
 
-test('a swarm is one row under its project; its agents and what they made stay in its view', () => {
+test('a swarm is one row in its project\'s list; its agents and what they made sit under it in the fleet', () => {
   const p = shell();
   p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one' });
   p.upsert({ name: 'app.build', id: 2, provider: 'alpha', model: 'one', created_by: 'app.lead', created_by_id: 1 });
   for (const [n, id] of [['app.latency-1', 3], ['app.latency-2', 4]]) p.upsert({ name: n, id, provider: 'alpha', model: 'one' });
   p.upsert({ name: 'app.latency-1-side', id: 5, provider: 'alpha', model: 'one', created_by: 'app.latency-1', created_by_id: 3 });
+  p.upsert({ name: 'app.latency-1-deep', id: 7, provider: 'alpha', model: 'one', created_by: 'app.latency-1-side', created_by_id: 5 });
   // A bot that took a member's name after the member was deleted is not the swarm's: it stays in the tree.
   p.upsert({ name: 'app.latency-3', id: 9, provider: 'alpha', model: 'one' });
   p.learnSwarm(swarmRecord(['app.latency-1', 'app.latency-2', 'app.latency-3'], { ids: { 'app.latency-1': 3, 'app.latency-2': 4, 'app.latency-3': 6 } }));
   // A swarm whose project is gone still has a row, among the bots in no project.
   p.learnSwarm({ ...swarmRecord([]), swarm: 'gone.x', project: 'gone' });
   const rows = p.tree();
-  assert.deepEqual(rowsOf(rows), ['app.lead', '⁂app.latency', 'app.build', 'app.latency-3', 'bots', '⁂gone.x']);
-  assert.equal(rows[1].prefix, '├ '); assert.equal(rows[0].tasks, 3);
+  assert.deepEqual(rowsOf(rows), ['app.lead', '⁂app.latency', 'app.latency-1', 'app.latency-1-side', 'app.latency-1-deep', 'app.latency-2', 'app.build', 'app.latency-3', 'bots', '⁂gone.x']);
+  p.S.selected = 'app.lead';
+  assert.deepEqual(Array.from(p.railRows(), (r) => r.key ?? r.b.name), ['⁂app.latency', 'app.build', 'app.latency-3'], 'the project\'s list holds the swarm as one row');
+  assert.equal(rows[1].prefix, '├ ');
   p.S.bots.get('app.latency-3').status = 'running';
-  assert.match(p.botRowHTML(rows[1], true), /glyph idle/, 'the stranger does not count as working');
+  assert.match(p.botRowHTML(rows[1]), /glyph idle/, 'the stranger does not count as working');
   assert.equal(p.S.bots.get('app.latency-1-side').project, 'app');
   p.S.bots.get('app.latency-2').status = 'running';
-  const html = p.botRowHTML(rows[1], true);
+  const html = p.botRowHTML(rows[1]);
   assert.match(html, /data-bot="⁂app.latency"/); assert.match(html, /glyph running/); assert.match(html, /⁂ latency/);
   assert.match(html, /data-act="more" data-who="⁂app.latency"/);
-  // With no tasks after it, the last swarm closes the branch; folded, the project hides it.
+  // A swarm open in the window lists its agents; its agent's way up is the swarm.
+  p.S.selected = '⁂app.latency';
+  assert.deepEqual(Array.from(p.railRows(), (r) => [r.b.name, r.kids]), [['app.latency-1', 1], ['app.latency-2', 0]], 'each agent counts what it made');
+  assert.equal(p.upOf('app.latency-1'), '⁂app.latency'); assert.equal(p.upOf('⁂app.latency'), 'app.lead');
+  // An agent of the swarm open in a tab lists its helpers, and they theirs.
+  const level = (open) => { p.S.selected = open; return Array.from(p.railRows(), (r) => [r.b.name, r.kids]); };
+  assert.deepEqual(level('app.latency-1'), [['app.latency-1-side', 1]]);
+  assert.deepEqual(level('app.latency-1-side'), [['app.latency-1-deep', 0]]);
+  assert.deepEqual(level('app.latency-2'), []);
+  p.S.selected = '⁂app.latency';
+  // With no tasks after it, the last swarm closes the branch.
   p.S.bots.delete('app.build'); p.S.bots.delete('app.latency-3'); p.S.shapeGen++;
   assert.equal(p.tree()[1].prefix, '└ ');
-  p.S.ui.folded.add('app');
-  assert.deepEqual(rowsOf(p.tree()), ['app.lead', 'bots', '⁂gone.x']);
-  assert.deepEqual(Array.from(p.botMenuItems('⁂app.latency'), (i) => i.act), ['swarm-stop', 'swarm-add']);
+  assert.deepEqual(Array.from(p.botMenuItems('⁂app.latency'), (i) => i.act).filter(Boolean), ['open-tab', 'swarm-stop', 'swarm-add']);
   // A stopped swarm takes no new agent until a post resumes it.
   p.S.swarms.get('app.latency').stopped = true;
-  assert.equal(p.botMenuItems('⁂app.latency')[1].disabled, true);
-  assert.equal(p.botMenuItems('app.lead')[0].act, 'new-swarm');
-  assert.notEqual(p.botMenuItems('app.build-x')?.[0]?.act, 'new-swarm');
+  assert.equal(p.botMenuItems('⁂app.latency').find((i) => i.act === 'swarm-add').disabled, true);
+  assert.equal(p.botMenuItems('app.lead')[2].act, 'new-swarm');
+  assert.ok(!(p.botMenuItems('app.build-x') ?? []).some((i) => i.act === 'new-swarm'));
 });
 
 test('a new swarm is one call: its agents are dealt from the mix, and the page seats them and opens it', async () => {
@@ -1892,6 +2000,90 @@ test('the board shows roles, proposals, votes and decisions, and a stream tag fi
   p.learnSwarm(swarmRecord(['app.latency-2', 'app.latency-3', 'app.latency-4'], { council: 3, seats: ['app.latency-2', 'app.latency-3', 'app.latency-4'] }));
   p.renderSwarm(log, sw);
   assert.match(log.innerHTML, /Seats: latency-2, latency-3, latency-4\./);
+});
+
+test('a swarm row opens a beat later, so a double-click opens it as a new tab', async () => {
+  const p = shell({ swarmBoard: async () => ({ lines: [], offset: 0, more: false }), request: async () => ({ bots: [], next_after: null, nodes: [], next_from: null }) });
+  p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one' });
+  p.upsert({ name: 'app.latency-1', id: 3, provider: 'alpha', model: 'one' });
+  p.learnSwarm(swarmRecord(['app.latency-1'], { ids: { 'app.latency-1': 3 } }));
+  await p.go('app.lead');
+  const doc = p.context.document, row = { dataset: { bot: '⁂app.latency' } }, at = (sel) => (sel === '[data-bot]' ? row : null);
+  await doc.listeners.click({ detail: 1, target: { closest: at } });
+  assert.equal(p.S.selected, 'app.lead', 'the first click waits');
+  await doc.listeners.click({ detail: 2, target: { closest: at } }); await p.tick();
+  assert.deepEqual([...p.S.ui.tabs], ['app.lead', '⁂app.latency'], 'a double-click opens a new tab'); assert.equal(p.S.selected, '⁂app.latency');
+  await p.go('app.lead');
+  await doc.listeners.click({ detail: 1, target: { closest: at } }); await p.tick();
+  assert.equal(p.S.selected, '⁂app.latency'); assert.deepEqual([...p.S.ui.tabs], ['app.lead', '⁂app.latency'], 'a click goes to its tab');
+  // A slow double-click: the swarm already took the tab in view, and the second click, landing on what
+  // replaced the row, gives that tab back and opens the swarm beside it.
+  p.S.ui.tabs = ['app.lead']; await p.go('app.lead');
+  await doc.listeners.click({ detail: 1, target: { closest: at } }); await p.tick();
+  assert.deepEqual([...p.S.ui.tabs], ['⁂app.latency']);
+  await doc.listeners.click({ detail: 2, target: { closest: () => null } }); await p.tick();
+  assert.deepEqual([...p.S.ui.tabs], ['app.lead', '⁂app.latency']); assert.equal(p.S.selected, '⁂app.latency');
+});
+
+test('a tab is renamed when what it belongs to changes, with no change of state', async () => {
+  const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
+  p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one' });
+  p.upsert({ name: 'app.build', id: 2, provider: 'alpha', model: 'one', created_by: 'app.lead', created_by_id: 1 });
+  p.S.ui.tabs = ['app.build']; p.S.selected = 'app.build'; p.railRows(); p.renderTabs();
+  const tabs = p.context.document.getElementById('tabs');
+  assert.match(tabs.innerHTML, /<span class="tl">build<\/span>/);
+  await p.handle({ event: 'deleted', bot: 'app.lead' }, p.S.session);
+  p.railRows(); p.renderTabs();
+  assert.match(tabs.innerHTML, /<span class="tl">app\.build<\/span>/, 'a task whose coordinator is gone is named in full');
+});
+
+test('every control is one move: a pending look yields to Home or a tab, a double-click opens a tab, the finder reaches a swarm helper', async () => {
+  const p = shell({ swarmBoard: async () => ({ lines: [], offset: 0, more: false }), request: async () => ({ bots: [], next_after: null, nodes: [], next_from: null }) });
+  p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one' });
+  p.upsert({ name: 'app.build', id: 2, provider: 'alpha', model: 'one', created_by: 'app.lead', created_by_id: 1 });
+  p.upsert({ name: 'app.latency-1', id: 3, provider: 'alpha', model: 'one' });
+  p.upsert({ name: 'app.latency-1-probe', id: 4, provider: 'alpha', model: 'one', created_by: 'app.latency-1', created_by_id: 3 });
+  p.learnSwarm(swarmRecord(['app.latency-1'], { ids: { 'app.latency-1': 3 } }));
+  const doc = p.context.document, on = (sel, el) => ({ closest: (q) => (q === sel ? el : null) });
+  const row = (who) => on('[data-bot]', { dataset: { bot: who } }), click = (target, detail = 1) => doc.listeners.click({ detail, target });
+  await p.go('app.lead');
+  // A click, then Home within the beat: Home wins, and nothing opens beside after it.
+  await click(row('app.build')); await click(on('[data-act]', { dataset: { act: 'home' } })); await p.tick();
+  assert.equal(p.S.selected, ''); assert.equal(p.S.ui.side, null);
+  // A click, then a tab: the tab wins.
+  await click(row('app.build')); await click(on('[data-tab]', { dataset: { tab: 'app.lead' } })); await p.tick();
+  assert.equal(p.S.selected, 'app.lead'); assert.equal(p.S.ui.side, null);
+  // A fast double-click opens a tab and no look.
+  await click(row('app.build')); await click(row('app.build'), 2); await p.tick();
+  assert.deepEqual([...p.S.ui.tabs], ['app.lead', 'app.build']); assert.equal(p.S.selected, 'app.build'); assert.equal(p.S.ui.side, null);
+  // A slow one, on a swarm: the first click already opened it in the tab in view, and the second,
+  // landing on what replaced the row, puts that tab back and opens the swarm in a new one.
+  await p.go('app.lead');
+  await click(row('⁂app.latency')); await p.tick();
+  assert.deepEqual([...p.S.ui.tabs], ['⁂app.latency', 'app.build']);
+  await click(on('.pane.main', {}), 2); await p.tick();
+  assert.deepEqual([...p.S.ui.tabs], ['app.lead', 'app.build', '⁂app.latency']); assert.equal(p.S.selected, '⁂app.latency');
+  // The finder reads the whole fleet, swarm agents and what they made included.
+  doc.getElementById('pickerq').value = 'probe';
+  assert.deepEqual(Array.from(p.pickerRows(), (r) => r.b.name), ['app.latency-1-probe']);
+  await doc.getElementById('pickerlist').listeners.click({ target: on('[data-pick]', { dataset: { pick: 'app.latency-1-probe' } }) }); await p.tick();
+  assert.equal(p.S.selected, 'app.latency-1-probe'); assert.equal(p.S.ui.tabs.at(-1), 'app.latency-1-probe');
+  assert.equal(p.upOf('app.latency-1-probe'), 'app.latency-1');
+  await p.go('app.latency-1');
+  assert.deepEqual(Array.from(p.railRows(), (r) => r.b.name), ['app.latency-1-probe'], 'the helper is the level below its agent');
+});
+
+test('looking at an agent clears the done glyph on its tab', async () => {
+  const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
+  p.context.document.hasFocus = () => true;
+  for (const [name, id] of [['lead', 1], ['task', 2]]) p.upsert({ name, id, provider: 'alpha', model: 'one' });
+  p.S.ui.tabs = ['lead', 'task']; p.S.selected = 'lead'; p.S.unseen.add('task');
+  p.renderTabs();
+  const tabs = p.elements.get('tabs');
+  assert.match(tabs.innerHTML, /data-tab="task"/); assert.match(tabs.innerHTML, /glyph done/);
+  p.S.selected = 'task'; p.markSeen();
+  assert.equal(p.S.unseen.has('task'), false);
+  assert.doesNotMatch(tabs.innerHTML, /glyph done/, 'the tab redraws with the agent seen');
 });
 
 test('a flat swarm has no Council or Streams tab', async () => {
@@ -2137,17 +2329,17 @@ test('a draft stays with the bot it was typed for, and Enter sends it there even
   const p = drafting({ request: async (op, q) => { if (op === 'history_nodes') await slow; if (op === 'submit') sent.push([q.bot, q.bot_id, q.prompt]); return { nodes: [], next_from: null }; } });
   for (const [name, id] of [['app.lead', 1], ['app.lead-side', 2]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
   p.S.transcripts.get('app.lead-side') ?? p.transcript('app.lead-side').nodes;
-  p.tree(); await p.openOnly('app.lead');
+  p.tree(); await p.go('app.lead');
   const doc = p.context.document, main = doc.getElementById('input');
   main.value = 'Ship it.';
   // Sol's audit, step 7: the coordinator's text followed the selection to its side chat.
-  release(); await p.openOnly('app.lead-side');
+  release(); await p.go('app.lead-side');
   assert.equal(main.value, '', 'the side chat has its own, empty composer');
   main.value = 'Only for the side chat.';
-  await p.openOnly('app.lead');
+  await p.go('app.lead');
   assert.equal(main.value, 'Ship it.');
   // Enter while another bot is being opened: the text goes to the bot it was typed for.
-  const opening = p.openOnly('app.lead-side');
+  const opening = p.go('app.lead-side');
   await doc.getElementById('form').listeners.submit({ preventDefault() {} });
   await opening;
   assert.deepEqual(sent, [['app.lead', 1, 'Ship it.']]);
@@ -2881,19 +3073,38 @@ test('what a window remembers belongs to its store, so two hosts, or a host and 
   const storage = new Map();
   const p = shell({}, storage);
   p.upsert({ name: 'lead', id: 1, provider: 'alpha', model: 'one' });
-  p.S.selected = 'lead'; p.S.ui.rail = false; p.save();
+  p.S.ui.tabs = ['gone', 'lead', 'lead']; p.S.selected = 'lead'; p.S.ui.rail = false; p.save();
   const other = shell({}, storage); other.S.store = 'store-2';
   other.upsert({ name: 'lead', id: 1, provider: 'alpha', model: 'one' });
   other.restore();
   assert.equal(other.S.ui.rail, true, 'another store with the same folder starts fresh');
+  assert.deepEqual([...other.S.ui.tabs], []); assert.equal(other.S.selected, '');
   const same = shell({}, storage);
   same.upsert({ name: 'lead', id: 1, provider: 'alpha', model: 'one' });
   same.restore();
   assert.equal(same.S.ui.rail, false);
+  assert.deepEqual([...same.S.ui.tabs], ['lead'], 'tabs come back once each, less agents gone since'); assert.equal(same.S.selected, 'lead');
   // Before a daemon has said which store it is, nothing is saved.
   const unknown = shell({}, storage); unknown.S.store = null; unknown.S.ui.rail = false;
   const before = storage.size; unknown.save();
   assert.equal(storage.size, before);
+});
+
+test('a tab deleted while detached goes up to what made it on reconnect, as a live delete moves it', async () => {
+  const storage = new Map();
+  const p = page({
+    attach: async () => ({ session: 2, store: 'store-1' }),
+    pull: () => new Promise(() => {}),
+    request: async (op) => (op === 'bots' ? { bots: [{ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', status: 'idle' }] } : { nodes: [], next_from: null }),
+  }, storage);
+  p.setRender(() => {}); p.S.store = 'store-1'; p.S.config = { workspace: '/synthetic', tools: [] };
+  p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one' });
+  p.upsert({ name: 'app.build', id: 2, provider: 'alpha', model: 'one', created_by: 'app.lead', created_by_id: 1 });
+  p.tree(); p.S.ui.tabs = ['app.build']; p.S.selected = 'app.build'; p.save();
+  await p.attach(); await settle();
+  assert.equal(p.S.attached, true);
+  assert.equal(p.S.bots.has('app.build'), false);
+  assert.deepEqual([...p.S.ui.tabs], ['app.lead'], 'the tab shows what made it'); assert.equal(p.S.selected, 'app.lead');
 });
 
 test('a window on a host takes the home the host names and leaves out what reads this machine', async () => {
