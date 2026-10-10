@@ -1135,8 +1135,12 @@ every start the app links each one from `~/.agents/skills/NAME`
 ([skills.rs](../app/src-tauri/src/skills.rs)). Updating the app updates what
 the link points at, so nothing is copied or recorded; a moved app re-points
 its links at its next start, and a skill it stops shipping loses its link.
-A folder or file of yours at that name is left alone, and a folder's own
-skill of the same name wins over it. To change a shipped skill, replace the
+The Homebrew cask runs `agent-app --link-skills` after an install or upgrade
+and `agent-app --unlink-skills` before an uninstall, so no link outlives the
+app. The app's links are those into a copy of it (a bundle with
+`Contents/MacOS/agent-app`) or into an app since removed; a folder, file or
+link of yours at that name, another app's skills folder included, is left
+alone, and a folder's own skill of the same name wins over it. To change a shipped skill, replace the
 link with a folder of your own: the link leads into the signed app, which is
 not yours to edit. Agents already running keep the index they were created
 with.

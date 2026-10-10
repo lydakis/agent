@@ -5,7 +5,8 @@
 //! (projects, profiles, swarms, schedules) and makes a swarm's shared
 //! worktree; run with `--swarm-post` it is a swarm's post tool (see
 //! `swarm`), and with `--schedule` or `--schedule-fire` it adds, lists,
-//! removes or fires schedules (see `schedule`).
+//! removes or fires schedules (see `schedule`), and with `--link-skills` or
+//! `--unlink-skills` it links or unlinks the skills it ships (see `skills`).
 //!
 //! Each window attaches to one daemon: this machine's, or a host's reached
 //! over SSH (see `remote`). A window on a host never reads or writes this
@@ -1187,15 +1188,17 @@ async fn request(
 }
 
 fn main() {
-    // A swarm's `post` script, a coordinator's `start`, `~/.agent/schedule`
-    // and launchd's fires run this executable; each acts and exits without
-    // a window.
+    // A swarm's `post` script, a coordinator's `start`, `~/.agent/schedule`,
+    // launchd's fires and the Homebrew cask's skill links run this
+    // executable; each acts and exits without a window.
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some(swarm::POST_FLAG) => std::process::exit(swarm::cli(&args[2..])),
         Some(swarm::START_FLAG) => std::process::exit(swarm::start_cli(&args[2..])),
         Some(schedule::FLAG) => std::process::exit(schedule::cli(&args[2..])),
         Some(schedule::FIRE_FLAG) => std::process::exit(schedule::fire_cli(&args[2..])),
+        Some(skills::LINK_FLAG) => std::process::exit(skills::cli(true)),
+        Some(skills::UNLINK_FLAG) => std::process::exit(skills::cli(false)),
         _ => {}
     }
     if let (Ok(home), Ok(app)) = (swarm::home(), std::env::current_exe()) {

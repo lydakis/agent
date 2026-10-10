@@ -38,6 +38,21 @@ def render_cask(version: str, archive: Path) -> str:
   app "Agent.app"
   binary "#{{appdir}}/Agent.app/Contents/MacOS/agent"
 
+  # The app links the skills it ships from your .agents/skills at every start.
+  # Link them as soon as it is installed or upgraded, and remove only those
+  # links before it goes, so none is left leading nowhere.
+  postflight do
+    system_command "#{{appdir}}/Agent.app/Contents/MacOS/agent-app",
+                   args:         ["--link-skills"],
+                   must_succeed: false
+  end
+
+  uninstall_preflight do
+    system_command "#{{appdir}}/Agent.app/Contents/MacOS/agent-app",
+                   args:         ["--unlink-skills"],
+                   must_succeed: false
+  end
+
   # The app starts a daemon from its bundle that outlives the window. Stop it
   # (letting running turns finish) before the bundle goes, as on an upgrade.
   # The store is named: the uninstalling shell's AGENT_STORE or AGENT_SOCKET
