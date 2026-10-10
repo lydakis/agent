@@ -1537,9 +1537,7 @@ test('the New project sheet asks only for a folder, the lead\'s and threads\' mo
   const p = shell({
     models: async () => [{ id: 'anthropic/claude-x' }, { id: 'openai/gpt-6-luna' }],
     settings: async () => ({ providers: ['anthropic', 'openai'], keys: [] }),
-    project: async (dir) => ({ dir, name: 'weather', coordinator: 'weather.lead', model: null, file: false }),
-    policy: async () => ({ instructions: 'rules', compaction_instructions: 'summary', note: 'test' }),
-    writeProject: async (q) => { calls.push(['write', { ...q, threads: { ...q.threads } }]); },
+    createProject: async (q) => { calls.push(['make', { ...q, threads: { ...q.threads } }]); return { project: 'weather', coordinator: 'weather.lead', dir: q.dir, created: true, from_file: false, note: 'test', record: { name: 'weather.lead', bot_id: 7, provider: 'anthropic', model: 'claude-x', workspace: q.dir } }; },
     chooseFolder: async (start) => { calls.push(['choose', start]); return '/synthetic/weather'; },
     request: async (op, q) => { calls.push([op, q]); return op === 'create' ? { name: q.bot, bot_id: 7, provider: 'anthropic', model: 'claude-x', workspace: q.workspace } : { nodes: [], next_from: null }; },
   });
@@ -1568,11 +1566,8 @@ test('the New project sheet asks only for a folder, the lead\'s and threads\' mo
   await p.act({ dataset: { act: 'np-in', v: 'project' } });
   assert.match(el('np-in').innerHTML, /class="opt on" data-act="np-in" data-v="project"/);
   await el('sheet').listeners.submit({ preventDefault() {} });
-  const create = calls.find(([op]) => op === 'create')[1];
-  assert.deepEqual([create.bot, create.workspace, create.model, create.effort], ['weather.lead', '/synthetic/weather', 'anthropic/claude-x', 'high']);
-  // The coordinator is told the threads' picks after its role, whichever role that is.
-  assert.equal(create.instructions, 'rules\n\nThis project\'s tasks, as the person set them up: start every new task, in a role (--profile) or not, with --model \'openai/gpt-6-luna\' --effort \'low\'. Every task works in this folder, with no worktree of its own.');
-  assert.deepEqual(calls.find(([op]) => op === 'write')[1], { dir: '/synthetic/weather', name: 'weather', model: 'anthropic/claude-x', reasoning: 'high', threads: { model: 'openai/gpt-6-luna', reasoning: 'low', inProject: true } });
+  // The app's core makes it from the picks (project::create, tested there).
+  assert.deepEqual(calls.find(([op]) => op === 'make')[1], { dir: '/synthetic/weather', model: 'anthropic/claude-x', effort: 'high', threads: { model: 'openai/gpt-6-luna', reasoning: 'low', inProject: true } });
   assert.equal(p.S.ui.sheet, false, 'the sheet closes once the project is made');
   assert.equal(p.S.selected, 'weather.lead');
 });
@@ -1860,54 +1855,50 @@ test("Home's agent is Home: no row, no tab, no crumb, and a closed Start Home gi
   assert.equal(r.context.document.getElementById('input').value, 'status?');
 });
 
-test('a new project creates its coordinator in the folder, in its role, writes its file once, and is not made twice', async () => {
-  const calls = []; let written = false;
+test('a new project is made by the app\'s core, seated and opened, and one already there is opened again', async () => {
+  const calls = []; let made = false;
   const p = shell({
-    project: async (dir) => ({ dir, name: 'weather', coordinator: 'weather.lead', model: null, file: written }),
-    policy: async (dir, profile) => { calls.push(['policy', dir, profile]); return { instructions: 'rules', compaction_instructions: 'summary', model: 'alpha/role', tools: ['shell', 'wait'], note: 'test' }; },
-    writeProject: async (q) => { calls.push(['write', q]); written = true; },
-    request: async (op, q) => { calls.push([op, q]); return op === 'create' ? { name: q.bot, bot_id: 7, provider: 'alpha', model: 'role', workspace: q.workspace } : { nodes: [], workspaces:[],next_from: null }; },
+    createProject: async (q) => {
+      calls.push(['make', { ...q }]);
+      if (made) return { project: 'weather', coordinator: 'weather.lead', dir: q.dir, created: false, from_file: true, record: { name: 'weather.lead', bot_id: 7, provider: 'alpha', model: 'role', workspace: q.dir } };
+      made = true;
+      return { project: 'weather', coordinator: 'weather.lead', dir: q.dir, created: true, from_file: false, note: 'test', record: { name: 'weather.lead', bot_id: 7, provider: 'alpha', model: 'role', workspace: q.dir } };
+    },
+    request: async () => ({ nodes: [], workspaces: [], next_from: null }),
   });
   await p.createProject('/synthetic/weather');
-  const create = calls.find(([op]) => op === 'create')[1];
-  // The coordinator profile composes the text, then the project's task settings follow; its model and
-  // tools apply when the project names none.
-  assert.deepEqual(calls.find(([op]) => op === 'policy').slice(1), ['/synthetic/weather', 'coordinator']);
-  assert.deepEqual([create.bot, create.workspace, create.model, create.instructions.split('\n\n')[0], Array.from(create.tools)], ['weather.lead', '/synthetic/weather', 'alpha/role', 'rules', ['shell', 'wait']]);
-  assert.deepEqual({ ...calls.find(([op]) => op === 'write')[1] }, { dir: '/synthetic/weather', name: 'weather', model: 'alpha/role', reasoning: null, threads: null });
-  assert.equal('effort' in create, false, 'no effort picked sends none: the model uses its own');
+  assert.deepEqual(calls.shift(), ['make', { dir: '/synthetic/weather', model: null, effort: null, threads: null }]);
+  assert.equal(p.S.bots.get('weather.lead').id, 7);
   assert.equal(p.S.selected, 'weather.lead');
-  const before = calls.length;
+  assert.match(p.S.ui.toast ?? '', /^project weather · test$/);
+  p.S.selected = '';
   await p.createProject('/synthetic/weather');
-  assert.equal(calls.filter(([op]) => op === 'create').length, 1); assert.equal(calls.length, before);
+  assert.equal(p.S.selected, 'weather.lead', 'opened, not made twice');
+  // One an agent made with ~/.agent/project that has not reached this window yet is seated from the reply.
+  p.S.bots.delete('weather.lead'); p.S.selected = '';
+  await p.createProject('/synthetic/weather');
+  assert.equal(p.S.bots.get('weather.lead').id, 7);
+  assert.equal(p.S.selected, 'weather.lead');
 });
 
 test('an agent\'s effort is picked beside its model, kept in the project file, and shown with its model', async () => {
-  const sent = []; const storage = new Map(); let file = null;
+  const sent = []; const storage = new Map();
   const p = shell({
-    project: async (dir) => ({ dir, name: 'weather', coordinator: 'weather.lead', model: file?.model ?? null, reasoning: file?.reasoning ?? null, threads_model: file?.threads_model ?? null, threads_reasoning: null, threads_in: file?.threads_in ?? 'worktree', file: !!file }),
+    createProject: async (q) => { sent.push(['make', { ...q }]); return { project: 'weather', coordinator: 'weather.lead', dir: q.dir, created: true, from_file: false, note: 'test', record: { name: 'weather.lead', bot_id: 1, provider: 'anthropic', model: 'claude-x', effort: q.effort, workspace: q.dir } }; },
     policy: async () => ({ instructions: 'rules', compaction_instructions: 'summary', note: 'test' }),
-    writeProject: async (q) => { sent.push(['write', { ...q }]); },
     request: async (op, q) => { sent.push([op, { ...q }]); return op === 'create' ? { name: q.bot, bot_id: sent.length, provider: q.model.split('/')[0], model: q.model.split('/')[1], effort: q.effort ?? null, workspace: q.workspace ?? '/synthetic' } : { nodes: [], workspaces:[],next_from: null }; },
   }, storage);
   await p.createProject('/synthetic/weather', 'anthropic/claude-x', 'max');
   const creates = () => sent.filter(([op]) => op === 'create').map(([, q]) => q);
-  assert.equal(creates()[0].effort, 'max');
-  // With no threads' model, tasks are started on the lead's own, named so a role's model cannot replace it.
-  assert.match(creates()[0].instructions, /with --model "\$AGENT_MODEL" \$\{AGENT_EFFORT:\+--effort "\$AGENT_EFFORT"\}\. When this folder is a git repository, a task that changes files works in its own worktree/);
-  assert.deepEqual(sent.find(([op]) => op === 'write')[1], { dir: '/synthetic/weather', name: 'weather', model: 'anthropic/claude-x', reasoning: 'max', threads: null });
+  // A project's file and what its coordinator is told are the core's (project::create).
+  assert.deepEqual(sent.find(([op]) => op === 'make')[1], { dir: '/synthetic/weather', model: 'anthropic/claude-x', effort: 'max', threads: null });
   assert.equal(p.S.bots.get('weather.lead').reasoning, 'max');
   assert.equal(storage.get('agent:effort'), 'max', 'the last pick is offered next time, as the model is');
-  // A folder whose file names a model keeps that model's effort, whatever was picked.
-  p.S.bots.clear(); file = { model: 'alpha/one', reasoning: 'low', threads_model: 'beta/two', threads_in: 'project' };
-  await p.createProject('/synthetic/weather', 'anthropic/claude-x', 'high', { model: 'gamma/three', reasoning: null, inProject: false });
-  assert.deepEqual([creates()[1].model, creates()[1].effort], ['alpha/one', 'low']);
-  assert.match(creates()[1].instructions, /with --model 'beta\/two'\. Every task works in this folder/, 'and its threads\' picks');
   // /new takes an effort after the model.
   await p.submit('/new Bob anthropic/claude-x max');
   await p.submit('/new Ann openai/gpt-6-luna xhigh');
   await p.submit('/new Cy openai/gpt-6-luna');
-  assert.deepEqual(creates().slice(2).map((q) => [q.bot, q.effort]), [['Bob', 'max'], ['Ann', 'xhigh'], ['Cy', undefined]]);
+  assert.deepEqual(creates().map((q) => [q.bot, q.effort]), [['Bob', 'max'], ['Ann', 'xhigh'], ['Cy', undefined]]);
   // A creation event from another client carries the level, as the list does.
   await p.onEvent({ event: 'created', bot: 'Eve', cursor: 900, data: { bot_id: 90, provider: 'openai', model: 'gpt-6-luna', effort: 'high', status: 'idle', running_turn: null } });
   assert.equal(p.S.bots.get('Eve').reasoning, 'high');
@@ -1931,40 +1922,31 @@ test('the coordinator the app ships gives editing tasks worktrees and cleans up 
   assert.match(text, /Unless this project's tasks all work in this folder/);
 });
 
-test('a project name taken by another folder\'s coordinator is refused, and a refused model is never written', async () => {
-  const calls = []; let fail = true, failWrite = false, threads;
+test('a project the core refuses opens nothing, and one already there says when the picks were not applied', async () => {
+  let refuse = 'project_exists: demo.lead already belongs to /synthetic/first';
   const p = shell({
-    project: async (dir) => ({ dir, name: dir.endsWith('taken') ? 'demo' : 'weather', coordinator: dir.endsWith('taken') ? 'demo.lead' : 'weather.lead', model: null, file: false }),
-    policy: async () => ({ instructions: 'rules', compaction_instructions: 'summary', note: 'test' }),
-    writeProject: async (q) => { calls.push(['write', q.dir, q.model]); threads = q.threads; if (failWrite) throw new Error('project_unwritable'); },
-    request: async (op, q) => { calls.push([op, q.bot]); if (op === 'create' && fail) throw new Error('create_failed'); return op === 'create' ? { name: q.bot, bot_id: 7, provider: 'alpha', model: 'one', workspace: q.workspace } : { nodes: [], workspaces:[],next_from: null }; },
+    createProject: async (q) => { if (refuse) throw new Error(refuse); return { project: 'weather', coordinator: 'weather.lead', dir: q.dir, created: false, from_file: false, record: { name: 'weather.lead', bot_id: 7, provider: 'alpha', model: 'one', workspace: q.dir } }; },
+    request: async () => ({ nodes: [], workspaces: [], next_from: null }),
   });
-  p.upsert({ name: 'demo.lead', bot_id: 1, provider: 'alpha', model: 'one', workspace: '/synthetic/first' });
+  p.upsert({ name: 'weather.lead', bot_id: 7, provider: 'alpha', model: 'one', workspace: '/synthetic/weather' });
   p.S.selected = '';
   await assert.rejects(p.createProject('/synthetic/taken'), /demo\.lead already belongs to \/synthetic\/first/);
-  assert.equal(p.S.selected, ''); assert.equal(calls.length, 0);
-  await assert.rejects(p.createProject('/synthetic/weather'), /model_required/);
-  assert.equal(calls.length, 0, 'there is no default model to fall back on');
-  await assert.rejects(p.createProject('/synthetic/weather', 'alpha/one'), /create_failed/);
-  assert.deepEqual(calls.map(([op]) => op), ['create'], 'a model the daemon refuses is not saved to the folder');
-  fail = false; failWrite = true;
-  await assert.rejects(p.createProject('/synthetic/weather', 'alpha/one'), /project_unwritable/);
-  assert.deepEqual(calls.map(([op]) => op), ['create', 'create', 'write'], 'the file follows an accepted coordinator');
-  // The coordinator made before the failed write keeps what it was told: a retry opens it, writes no
-  // file that would claim other picks, and says the picks were not applied.
-  failWrite = false; const n = calls.length; threads = 'unwritten';
+  assert.equal(p.S.selected, '');
+  refuse = null;
   await p.createProject('/synthetic/weather', 'alpha/one', null, { model: 'beta/two', reasoning: 'low', inProject: true });
-  assert.equal(calls.length, n, 'no create and no write'); assert.equal(threads, 'unwritten');
   assert.match(p.S.ui.toast ?? '', /weather\.lead already exists and keeps the settings it was made with/);
   assert.equal(p.S.selected, 'weather.lead');
   // An effort picked on its own is a pick too.
   p.S.ui.toast = null;
   await p.createProject('/synthetic/weather', null, 'high');
   assert.match(p.S.ui.toast ?? '', /keeps the settings it was made with/);
-  // So is the sheet's worktree choice left at its default.
+  // So is the sheet's worktree choice left at its default; with no pick at all it just opens.
   p.S.ui.toast = null;
   await p.createProject('/synthetic/weather', null, null, { model: null, reasoning: null, inProject: false });
   assert.match(p.S.ui.toast ?? '', /keeps the settings it was made with/);
+  p.S.ui.toast = null;
+  await p.createProject('/synthetic/weather');
+  assert.equal(p.S.ui.toast ?? null, null);
 });
 
 test('runs fold thinking and tool calls to one line each, keep failures visible, and expand on demand', () => {
@@ -2722,9 +2704,7 @@ function settingsShell({ env = {}, lists = {} } = {}) {
     models: async () => Object.entries(answer()).flatMap(([n, l]) => (l.models ?? []).map((m) => ({ id: `${n}/${m.id}` }))),
     attach: async () => { calls.push(['attach']); if (!specs().length) throw new Error('no_provider: connect a provider in Settings'); return { session: 2 }; },
     pull: () => new Promise(() => {}),
-    project: async (dir) => ({ dir, name: 'weather', coordinator: 'weather.lead', model: null, file: false }),
-    policy: async () => ({ instructions: 'rules', compaction_instructions: 'summary', note: 'test' }),
-    writeProject: async (q) => { calls.push(['write', q.model]); },
+    createProject: async (q) => { if (!q.model) throw new Error('model_required: choose a model'); calls.push(['make', q.model]); return { project: 'weather', coordinator: 'weather.lead', dir: q.dir, created: true, from_file: false, note: 'test', record: { name: 'weather.lead', bot_id: 9, provider: q.model.split('/')[0], model: q.model.split('/')[1], workspace: q.dir } }; },
     request: async (op, q) => { if (op === 'provider_models') return { providers: answer() }; if (op === 'bots') return { bots: [], next_after: null }; if (op === 'create') { calls.push(['create', q.bot, q.model]); return { name: q.bot, bot_id: 9, provider: q.model.split('/')[0], model: q.model.split('/')[1], workspace: q.workspace }; } return { nodes: [], workspaces:[],next_from: null }; },
   });
   p.S.config.model = null; p.S.attached = true;
@@ -2921,13 +2901,6 @@ test('a change another window saved is kept when this one connects a provider', 
   assert.equal(calls.find(([c]) => c === 'save')[1].AGENT_PROVIDER, 'openai chatgpt anthropic');
 });
 
-test('a folder with a project file keeps its model when its coordinator is made again', async () => {
-  const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: 'openai', OPENAI_API_KEY: 'k' }, lists: { openai: { models: [{ id: 'gpt' }, { id: 'mini' }] } } });
-  p.context.Daemon.project = async (dir) => ({ dir, name: 'weather', coordinator: 'weather.lead', model: 'openai/gpt', file: true });
-  await p.createProject('/synthetic/weather', 'openai/mini');
-  assert.deepEqual(calls.filter(([c]) => c === 'create' || c === 'write'), [['create', 'weather.lead', 'openai/gpt']]);
-});
-
 test('a connected provider can be edited in place', async () => {
   const { p } = settingsShell({ env: { AGENT_PROVIDER: 'bedrock bedrock-openai', AWS_REGION: 'us-west-2' }, lists: { bedrock: { models: [{ id: 'claude' }] }, 'bedrock-openai': { models: [{ id: 'grok' }] } } });
   await p.openSetup();
@@ -2971,9 +2944,9 @@ test('a project starts on the model picked for it, and the pick is offered first
   const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: 'openai bedrock bedrock-openai', OPENAI_API_KEY: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] }, bedrock: { models: [{ id: 'claude' }] }, 'bedrock-openai': { models: [{ id: 'grok' }] } } });
   p.context.localStorage = { getItem: (k) => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, String(v)) };
   await assert.rejects(p.createProject('/synthetic/weather'), /model_required/);
-  assert.equal(calls.filter(([c]) => c === 'create').length, 0);
+  assert.equal(calls.filter(([c]) => c === 'make').length, 0);
   await p.createProject('/synthetic/weather', 'bedrock-openai/grok');
-  assert.deepEqual(calls.filter(([c]) => c === 'create' || c === 'write'), [['create', 'weather.lead', 'bedrock-openai/grok'], ['write', 'bedrock-openai/grok']]);
+  assert.deepEqual(calls.filter(([c]) => c === 'make'), [['make', 'bedrock-openai/grok']]);
   await p.openSetup();
   p.S.bots.clear();
   const html = p.setupHTML();

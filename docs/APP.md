@@ -385,8 +385,8 @@ client/          agent-client: the socket protocol and the client policy
   `request` relays any protocol op; `models` reads `~/.agent/models`;
   `settings`, `save_settings`, `restart_daemon` and `discover_models` back
   [Setup](#setup-and-settings); and
-  `project` and `write_project` read and write a folder's
-  `.agents/project.toml` ([project.rs](../app/src-tauri/src/project.rs));
+  `create_project` makes a folder's project as `~/.agent/project add`
+  does ([project.rs](../app/src-tauri/src/project.rs));
   `hosts` lists `~/.ssh/config`'s hosts and `open_host` opens a window on one
   ([remote.rs](../app/src-tauri/src/remote.rs));
   `policy` composes a folder's client policy, in a profile when named, and
@@ -805,7 +805,9 @@ daemon learns nothing about projects; everything here is client work.
   Home's list, opens the sheet: a folder, which **Choose…** picks with the
   system's folder panel (`NSOpenPanel` through `rfd`, with New Folder), and
   models from `~/.agent/models` under their providers' names (the last one
-  picked comes first). Creating reads its `project.toml` (unknown keys are refused) or names the
+  picked comes first). Creating is the app's core (`project::create`), the
+  same an agent runs with `~/.agent/project add` (below): it reads the folder's
+  `project.toml` (unknown keys are refused) or names the
   project after the folder, creates the coordinator there with the folder's
   own client policy, and then writes the file if there was none, so a model
   the daemon refuses is never saved. The file goes in through a temporary
@@ -818,6 +820,19 @@ daemon learns nothing about projects; everything here is client work.
   project with no model picked, from the sheet or its coordinator profile,
   is refused with `model_required`. The threads' model and effort reach the
   coordinator shell-quoted.
+- **Projects from an agent.** The app writes `~/.agent/project` each time it
+  opens, a script that runs its executable with `--project`:
+  `~/.agent/project add DIR [--model PROVIDER/MODEL] [--effort LEVEL]
+  [--threads-model PROVIDER/MODEL [--threads-effort LEVEL]] [--threads-in
+  worktree|project]`. It makes the project in an existing folder exactly as
+  New project does, on the daemon of the shell it runs in (`AGENT_SOCKET`,
+  `AGENT_STORE`), and prints `{"project", "coordinator", "dir", "created",
+  "from_file"}`, with `created: false` for one already there; a failure is
+  `{"error": CODE, "detail": ...}` on stderr and exit 1 (`model_required`,
+  `project_exists`, `project_invalid`, or the daemon's refusal). Home makes
+  one when the person asks for a project, and so can a lead; the new lead
+  heads its own project, created by no agent, so its turns are not task
+  updates for whoever asked.
 - **Navigation.** Home, then a tab for each agent opened full screen, on a
   bar of floating tabs. The list on the right holds one level below what is
   open: at Home the projects, then Home's threads and the bots in none, in a project its threads
@@ -1629,7 +1644,7 @@ every start the app links each one from `~/.agents/skills/NAME`
 the link points at, so nothing is copied or recorded; a moved app re-points
 its links at its next start, and a skill it stops shipping loses its link.
 The Homebrew cask runs `agent-app --setup` after an install or upgrade, which
-writes what a start writes (scripts, `~/.agent/trigger`, `~/.agent/memory`,
+writes what a start writes (scripts, `~/.agent/trigger`, `~/.agent/memory`, `~/.agent/project`,
 these links) before
 the first window, and `agent-app --unlink-skills` before an uninstall, which
 removes this bundle's links and nothing else, so none outlives the app. The app's links are those into a copy of it (a bundle with

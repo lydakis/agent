@@ -168,7 +168,7 @@ pub struct Daemon {
 impl Daemon {
     /// The daemon of the shell the trigger is made from, found as the CLI
     /// finds it. An agent's shell has both its daemon's store and socket.
-    fn current() -> Result<Self, String> {
+    pub(crate) fn current() -> Result<Self, String> {
         // A launchd job has no working folder: paths are kept absolute.
         let absolute = |p: PathBuf| std::path::absolute(&p).unwrap_or(p);
         let socket = std::env::var_os("AGENT_SOCKET")
@@ -189,7 +189,7 @@ impl Daemon {
         }
         Ok(Self { store, socket })
     }
-    fn socket(&self) -> Result<PathBuf, String> {
+    pub(crate) fn socket(&self) -> Result<PathBuf, String> {
         match (&self.socket, &self.store) {
             (Some(socket), _) => Ok(socket.clone()),
             (None, Some(store)) => {
@@ -2092,7 +2092,7 @@ fn environment() -> Vec<(&'static str, String)> {
         .collect()
 }
 
-fn runtime() -> Result<tokio::runtime::Runtime, String> {
+pub(crate) fn runtime() -> Result<tokio::runtime::Runtime, String> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -2108,7 +2108,7 @@ fn coded(error: agent_client::Error) -> String {
 /// One error shape, `{"error": CODE, "detail": ...}`, from the
 /// `CODE: detail` this module's errors are; `trigger_exists` also names the
 /// `field` that differs.
-fn error_json(message: &str) -> Value {
+pub(crate) fn error_json(message: &str) -> Value {
     let (code, detail) = match message.split_once(": ") {
         Some((code, detail))
             if !code.is_empty() && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') =>
@@ -3129,16 +3129,21 @@ async fn connect(socket: &Path, daemon: &Daemon) -> Result<std::sync::Arc<Client
 /// `~/.agent/trigger`, written again whenever the app starts from
 /// somewhere else.
 pub fn write_script(home: &Path, app: &Path) -> Result<(), String> {
+    write_runner(&home.join("trigger"), USAGE, app, FLAG)
+}
+
+/// A script at `path` that runs `app` with `flag`, its usage in comments:
+/// written when it differs, so a start that changes nothing writes nothing.
+pub(crate) fn write_runner(path: &Path, usage: &str, app: &Path, flag: &str) -> Result<(), String> {
     let quote = |p: &Path| format!("'{}'", p.to_string_lossy().replace('\'', r"'\''"));
-    let usage = USAGE.replace('\n', "\n# ");
-    let text = format!("#!/bin/sh\n# {usage}\nexec {} {FLAG} \"$@\"\n", quote(app));
-    let path = home.join("trigger");
+    let usage = usage.replace('\n', "\n# ");
+    let text = format!("#!/bin/sh\n# {usage}\nexec {} {flag} \"$@\"\n", quote(app));
     use std::os::unix::fs::PermissionsExt;
-    let runnable = std::fs::metadata(&path).is_ok_and(|m| m.permissions().mode() & 0o777 == 0o755);
-    if runnable && std::fs::read_to_string(&path).is_ok_and(|have| have == text) {
+    let runnable = std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o777 == 0o755);
+    if runnable && std::fs::read_to_string(path).is_ok_and(|have| have == text) {
         return Ok(());
     }
-    replace_mode(&path, text.as_bytes(), 0o755)
+    replace_mode(path, text.as_bytes(), 0o755)
 }
 
 #[cfg(test)]

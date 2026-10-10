@@ -18,8 +18,7 @@ window.Daemon = (() => {
       saveSettings: (changes) => invoke('save_settings', { changes }),
       restartDaemon: () => invoke('restart_daemon'),
       discoverModels: () => invoke('discover_models'),
-      project: (dir) => invoke('project', { dir }),
-      writeProject: ({ dir, name, model, reasoning = null, threads = null }) => invoke('write_project', { dir, name, model, reasoning, threadsModel: threads?.model ?? null, threadsReasoning: threads?.reasoning ?? null, threadsInProject: !!threads?.inProject }),
+      createProject: ({ dir, model = null, effort = null, threads = null }) => invoke('create_project', { dir, model, effort, threadsModel: threads?.model ?? null, threadsEffort: threads?.reasoning ?? null, threadsInProject: threads ? !!threads.inProject : null }),
       chooseFolder: (start = null) => invoke('choose_folder', { start }),
       homeDir: () => invoke('home_dir'),
       branch: (dir) => invoke('branch', { dir }),
@@ -481,8 +480,13 @@ window.Daemon = (() => {
       return { providers: Object.fromEntries(Object.entries(answer).map(([n, l]) => [n, l.models ? { models: l.models.length } : l])), written: !!found.length, error: found.length ? null : 'models_none_listed' };
     },
     policy: async () => ({ instructions: 'demo', compaction_instructions: 'demo summary policy', note: 'demo policy' }),
-    project: async (dir) => { const name = String(dir).split('/').filter(Boolean).pop()?.replace(/[^A-Za-z0-9_-]+/g, '-') || 'project'; return { dir, name, coordinator: `${name}.lead`, model: null, file: false }; },
-    writeProject: async () => {},
+    // As the app's core makes a project: its coordinator, unless one is there already.
+    createProject: async ({ dir, model = null, effort = null }) => {
+      const name = String(dir).split('/').filter(Boolean).pop()?.replace(/[^A-Za-z0-9_-]+/g, '-') || 'project', coordinator = `${name}.lead`, had = S.bots.get(coordinator);
+      if (had) { if (had.workspace !== dir) throw new Error(`project_exists: ${coordinator} already belongs to ${had.workspace}`); return { project: name, coordinator, dir, created: false, from_file: false, record: { ...had } }; }
+      if (!model) throw new Error('model_required: choose a model');
+      return { project: name, coordinator, dir, created: true, from_file: false, record: { ...await create(coordinator, model, null, null, dir, null, effort) }, note: 'demo policy' };
+    },
     chooseFolder: async () => '/Users/you/Developer/weather',
     homeDir: async () => '/Users/you',
     // A coordinator puts a task that edits in `~/.agent/worktrees/NAME` on branch agent/NAME.
