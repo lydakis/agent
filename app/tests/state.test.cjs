@@ -1021,6 +1021,14 @@ test('rail scrolling moves a bounded window both ways independently of selection
 });
 
 
+test('a reconnect snapshot drops the folders of the nodes it rebuilds', async () => {
+  const p=page({request:async()=>({nodes:[{node:2,turn:1},{node:1,turn:1}],workspaces:[{folder:'/a',turns:[1]}],next_from:null,next_newer:null})});
+  p.S.session=1;p.upsert({name:'Bob',id:1,head:2});await p.load('Bob');
+  const t=p.transcript('Bob');assert.equal(t.folders.get(1),'/a');
+  p.lost('offline');p.S.session=2;p.seat({name:'Bob',id:1,head:10},2);
+  assert.equal(t.folders.has(1),false);
+});
+
 test('a delayed reconnect snapshot preserves newer folded replay ranges', async () => {
   const p=page(historyDaemon());p.S.session=1;p.upsert({name:'Bob',id:1,head:2});await p.load('Bob');
   p.lost('offline');p.S.session=2;

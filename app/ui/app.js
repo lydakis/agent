@@ -134,8 +134,11 @@ function evict(t) {
   }
   if (earlierNotes) result.unshift({kind:'note_gap',total:earlierNotes});
   if (laterNotes) result.push({kind:'note_gap',total:laterNotes,later:true});
-  t.items = result; normalizeRanges(t); t.gen += 1;
-  // A folded turn's folder comes back with the page that reloads it.
+  t.items = result; normalizeRanges(t); t.gen += 1; dropFolders(t);
+}
+// Keep only the folders of turns still in the window. A dropped turn's folder
+// comes back with the page that reloads it.
+function dropFolders(t) {
   const kept = new Set(t.items.map(it => it.turn)); kept.add(t.streamingTurn);
   for (const turn of t.folders.keys()) if (!kept.has(turn)) t.folders.delete(turn);
 }
@@ -178,6 +181,7 @@ function seedHistory(record) {
     });
     t.nodes = t.thoughts = t.longOut = t.bytes = 0;
     for (const it of t.items) count(t, it, 1);
+    dropFolders(t);
   }
   t.seeded = true; t.seedSession = S.session; t.seedHead = record.head;
   const ids = t.items.map(it => it.kind === 'node' ? it.node : it.from).filter(id => id != null);
