@@ -708,7 +708,8 @@ async function onEvent(ev) {
       for (let i = t.items.length - 1; i >= 0; i--) { const it = t.items[i]; if ((it.kind === 'tool' || it.kind === 'tool_stub') && it.turn === turn && it.callId === data.call_id) { call = it; break; } }
       if (call) { call.done = true; if (call.started) call.took = Date.now() - call.started; call.started = 0; patchRun(name, call); }
       const shown = S.ui.file;
-      if (shown && call?.path && (call.name === 'write' || call.name === 'edit') && joinPath(bot(name)?.workspace ?? S.config?.workspace ?? '', call.path) === shown.full) openFile(shown.bot, shown.full);
+      // Read again as the agent left it; what it wrote is new, so a page, diagram or image in it waits for a click.
+      if (shown && call?.path && (call.name === 'write' || call.name === 'edit') && joinPath(bot(name)?.workspace ?? S.config?.workspace ?? '', call.path) === shown.full) openFile(shown.bot, shown.full, false);
       if (typeof data.node === 'number') {
         pushNode(t, { kind: 'node', node: data.node, callId: data.call_id, turn });
         if (call && (call.background || call.name === 'wait') && await loadWaitOrProc(name, data.node, call)) {
@@ -1528,10 +1529,11 @@ function openFileFrom(path, el) {
   const who = beside ? S.ui.side : S.selected, b = bot(who);
   return openFile(who, joinPath(b?.workspace ?? S.config?.workspace ?? '', path));
 }
-async function openFile(who, full) {
+// `asked`: someone opened it, so what it holds draws at once.
+async function openFile(who, full, asked = true) {
   const old = S.ui.file;
   if (old?.url) URL.revokeObjectURL(old.url);
-  const f = S.ui.file = { bot: who, full, gen: (old?.gen ?? 0) + 1, state: 'loading', view: null, url: null };
+  const f = S.ui.file = { bot: who, full, asked, gen: (old?.gen ?? 0) + 1, state: 'loading', view: null, url: null };
   render();
   try {
     const bytes = new Uint8Array(await Daemon.readFile(full));
@@ -1555,7 +1557,7 @@ function renderFile() {
   // diagram or chart beside keeps running as it is.
   if (f.state === 'ok' && (f.at !== f.gen || (f.waited && f.ver !== Rich.version))) {
     if (f.url) URL.revokeObjectURL(f.url);
-    const shown = Rich.file(f.full, f.bytes, f.more);
+    const shown = Rich.file(f.full, f.bytes, f.more, f.asked !== false);
     Object.assign(f, { view: shown.html, url: shown.url ?? null, waited: shown.waited, at: f.gen, ver: Rich.version });
   }
   const key = `file|${f.full}|${f.gen}|${f.ver}`;
@@ -2751,7 +2753,8 @@ document.addEventListener('contextmenu', (e) => {
 });
 
 // Highlighting arrived: messages drawn without it are drawn again.
-Rich.onReady = () => { for (const [id] of PANES) $(id).dataset.key = ''; render(); };
+// A file beside decides for itself (`renderFile`), so a page running there keeps running.
+Rich.onReady = () => { for (const [id] of PANES) if (!(id === 'side' && S.ui.file)) $(id).dataset.key = ''; render(); };
 Rich.onFile = openFileFrom;
 Rich.onError = (text) => toast(text, 4000);
 

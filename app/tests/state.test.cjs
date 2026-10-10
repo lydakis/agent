@@ -285,6 +285,20 @@ test('highlighting arriving redraws a file beside only when its code waited for 
   v = 2; p.renderFile(); assert.equal(files, 3);
 });
 
+test('a file an agent rewrote while open waits for a click to run', async () => {
+  const enc = (s) => new TextEncoder().encode(s), opened = [];
+  const p = page({ readFile: async (full) => { opened.push(full); return enc('<p>hi</p>'); } }), Rich = p.context.Rich;
+  assert.match(Rich.file('/w/p.html', enc('<p>hi</p>')).html, /data-kind="html" data-view="view"/);
+  assert.match(Rich.file('/w/p.html', enc('<p>hi</p>'), false, false).html, /data-kind="html" data-view="code"/);
+  assert.match(Rich.file('/w/d.mmd', enc('graph TD'), false, false).html, /data-lazy data-id="\d+"/);
+  p.S.config = { workspace: '/w' };
+  p.S.ui.file = { bot: 'Bob', full: '/w/p.html', asked: true, gen: 2, state: 'ok', bytes: enc('<p>hi</p>'), more: false, url: null };
+  await p.onEvent({ event: 'tool_started', bot: 'Bob', turn: 1, data: { call_id: 'w1', name: 'write', arguments: JSON.stringify({ path: 'p.html', content: 'x' }) } });
+  await p.onEvent({ event: 'tool_completed', bot: 'Bob', turn: 1, data: { call_id: 'w1' } });
+  await settle();
+  assert.deepEqual(opened, ['/w/p.html']); assert.equal(p.S.ui.file.asked, false);
+});
+
 test('a name starting with a tilde is the folder\'s; only ~/ is home', () => {
   const p = page();
   assert.equal(p.joinPath('/w', '~notes.md'), '/w/~notes.md');

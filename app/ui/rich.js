@@ -297,6 +297,8 @@ window.Rich = (() => {
   // ---------- files ----------
   // A file opened beside, drawn by its kind: Markdown, a diagram, a chart, a page, an image, a
   // table, or code. `bytes` is what was read (at most `cap`); `more` says the file goes on.
+  // `asked` draws a page, diagram, chart or image at once; without it (a file an agent rewrote
+  // while open) each waits for a click, as in a message.
   const IMAGE = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', avif: 'image/avif', bmp: 'image/bmp', ico: 'image/x-icon' };
   const extOf = (path) => { const n = path.split('/').pop().toLowerCase(); return /\.(vl|vg)\.json$/.test(n) ? n.slice(-7, -5) : n.includes('.') ? n.split('.').pop() : n; };
   // The first `max` rows of a CSV or TSV, at most 256 columns each, ending with the row that
@@ -324,20 +326,20 @@ window.Rich = (() => {
     return `${rows.more ? `<div class="line note">showing the first ${rows.length - 1} rows</div>` : ''}<div class="md"><table><thead><tr>${(rows[0] ?? []).map(cell('th')).join('')}</tr></thead><tbody>${rows.slice(1).map((r) => `<tr>${r.map(cell('td')).join('')}</tr>`).join('')}</tbody></table></div>`;
   }
   // `waited` says the view is code that highlighting, once loaded, would draw differently.
-  function file(path, bytes, more = false) {
+  function file(path, bytes, more = false, asked = true) {
     spent = 0; waited = false;
     const ext = extOf(path), note = more ? `<div class="line note">showing the first ${Math.round(bytes.length / 1048576)} MiB</div>` : '';
     if (IMAGE[ext]) {
       if (more) return { html: '<div class="line note">image too large to show</div>' };
-      const url = URL.createObjectURL(new Blob([bytes], { type: IMAGE[ext] }));
-      return { html: `<div class="fimg"><img alt="" src="${esc(url)}"></div>`, url };
+      const url = URL.createObjectURL(new Blob([bytes], { type: IMAGE[ext] })), name = path.split('/').pop();
+      return { html: asked ? `<div class="fimg"><img alt="" src="${esc(url)}"></div>` : `<div class="md fimg"><button type="button" class="img" data-img="${esc(url)}" title="${esc(name)}">image: ${esc(name)}</button></div>`, url };
     }
     if (bytes.subarray(0, 8000).includes(0)) return { html: `<div class="line note">binary file · ${bytes.length}${more ? '+' : ''} bytes</div>` };
     const text = new TextDecoder().decode(bytes);
     if (ext === 'md' || ext === 'markdown') return { html: `${note}<div class="md">${html(text)}</div>`, waited };
     if (ext === 'csv' || ext === 'tsv') return { html: note + table(text, ext === 'csv' ? ',' : '\t') };
     const lang = { mmd: 'mermaid', mermaid: 'mermaid', vl: 'vega-lite', vg: 'vega', htm: 'html', html: 'html', svg: 'svg' }[ext] ?? ext;
-    const out = block(text, lang, true);
+    const out = block(text, lang, asked);
     return { html: note + `<div class="md">${out}</div>`, waited: waited && out.startsWith('<div class="rc" data-kind="code"') };
   }
   let openFile = () => {}, failed = () => {};

@@ -1225,8 +1225,10 @@ first 1,000 rows and 256 columns, ending with the row that reaches 10,000
 cells (quoted fields kept whole, and the view says when rows were left out),
 a binary file as its size, anything else as code highlighted by its
 extension. Esc or ✕ closes it and brings back the task that was beside, if
-any. A write or edit to the open file reads it again; deleting the agent it
-came from, or attaching to another store, closes it. Searching a project's
+any. A write or edit to the open file reads it again, and what the agent
+wrote is new: a page, diagram, chart or image in it waits for a click, as in
+a message. Deleting the agent it came from, or attaching to another store,
+closes it. Searching a project's
 files (from ^k or elsewhere) is not built.
 
 What a model writes never becomes the app's markup unparsed. Raw HTML inside
