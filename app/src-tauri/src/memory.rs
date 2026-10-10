@@ -487,11 +487,24 @@ const CLEANUP: &str = ".cleanup";
 const IGNORE: &str = ".lock\n/.cleanup\n.DS_Store\n";
 
 fn git(root: &Path, args: &[&str]) -> Result<String, String> {
-    let out = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    // A hook's `GIT_DIR` and the like would name another repository.
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+    ] {
+        command.env_remove(key);
+    }
+    let out = command
         .arg("-C")
         .arg(root)
-        // The person's own git settings must not sign, run hooks or fail
-        // for want of a name here.
+        // The person's own git settings must not sign, run hooks, change
+        // line endings or fail for want of a name here.
         .args([
             "-c",
             "user.name=Agent memory",
@@ -501,6 +514,10 @@ fn git(root: &Path, args: &[&str]) -> Result<String, String> {
             "commit.gpgsign=false",
             "-c",
             "core.hooksPath=/dev/null",
+            "-c",
+            "core.autocrlf=false",
+            "-c",
+            "core.eol=lf",
         ])
         .args(args)
         .stdin(std::process::Stdio::null())
@@ -521,7 +538,8 @@ fn repo(root: &Path) -> Result<(), String> {
     std::fs::create_dir_all(root).map_err(|e| format!("memory_failed: {}: {e}", root.display()))?;
     let new = !root.join(".git").exists();
     if new {
-        git(root, &["init", "-q"])?;
+        // Objects as private as the facts, which are 0600.
+        git(root, &["init", "-q", "--shared=0600"])?;
     }
     let ignore = root.join(".gitignore");
     if std::fs::read_to_string(&ignore).ok().as_deref() != Some(IGNORE) {
@@ -532,6 +550,23 @@ fn repo(root: &Path) -> Result<(), String> {
         // clean up, and facts already there still are.
         git(root, &["add", ".gitignore"])?;
         git(root, &["commit", "-q", "-m", "Memory repository"])?;
+    }
+    Ok(())
+}
+
+/// Files git wrote back are made 0600 again, as `write` makes them.
+fn private(root: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let listed = git(root, &["ls-files", "-z"])?;
+    for path in listed.split('\0').filter(|p| !p.is_empty()) {
+        let path = root.join(path);
+        match std::fs::symlink_metadata(&path) {
+            Ok(m) if m.is_file() && m.permissions().mode() & 0o777 != 0o600 => {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                    .map_err(|e| format!("memory_failed: {}: {e}", path.display()))?;
+            }
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -673,6 +708,7 @@ fn cleanup_finish(root: &Path) -> Result<Value, String> {
     let limit = (before as usize / 4).max(2);
     if removed.len() > limit {
         git(root, &["revert", "--no-edit", &head])?;
+        private(root)?;
         let _ = std::fs::remove_file(&state);
         return Err(format!(
             "loss_guard: the cleanup removed {} of {before} facts, above {limit}; memory is back as it was at {start}, and the refused cleanup is commit {head}",
@@ -1214,8 +1250,16 @@ mod tests {
             refused.starts_with("loss_guard: the cleanup removed 3 of 4 facts, above 2"),
             "{refused}"
         );
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         for name in ["a", "c", "d", "e"] {
-            assert!(root.join(format!("{name}.md")).exists(), "{name}");
+            // Put back as private as `save` wrote it.
+            assert_eq!(mode(&root.join(format!("{name}.md"))), 0o600, "{name}");
+        }
+        // No object of the repository is readable by anyone else.
+        let objects = root.join(".git/objects");
+        for dir in std::fs::read_dir(&objects).unwrap().flatten() {
+            assert_eq!(mode(&dir.path()) & 0o077, 0, "{}", dir.path().display());
         }
         assert!(
             std::fs::read_to_string(root.join(INDEX))
