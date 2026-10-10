@@ -763,12 +763,12 @@ pub fn list(places: &Places, after: Option<&str>) -> Value {
 
 /// Write a file whole beside its place, then rename it there.
 fn replace(path: &Path, text: &str) -> Result<(), String> {
-    replace_mode(path, text, 0o644)
+    replace_mode(path, text.as_bytes(), 0o644)
 }
 
 /// `replace` with the file's mode set from creation, so the new name never
 /// has any other.
-fn replace_mode(path: &Path, text: &str, mode: u32) -> Result<(), String> {
+fn replace_mode(path: &Path, text: &[u8], mode: u32) -> Result<(), String> {
     use std::os::unix::fs::OpenOptionsExt;
     let dir = path.parent().ok_or("no folder")?;
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -789,7 +789,7 @@ fn replace_mode(path: &Path, text: &str, mode: u32) -> Result<(), String> {
             &temporary,
             std::os::unix::fs::PermissionsExt::from_mode(mode),
         )?;
-        file.write_all(text.as_bytes())?;
+        file.write_all(text)?;
         file.sync_all()?;
         std::fs::rename(&temporary, path)?;
         // The new name is durable only once its folder is.
@@ -1010,7 +1010,7 @@ fn retire(places: &Places, name: &str, keep: bool, launchd: Loader) -> Result<bo
             .flatten()
             .flatten()
             .any(|e| Some(e.file_name().as_os_str()) == want)
-            .then(|| std::fs::read_to_string(file).ok())
+            .then(|| std::fs::read(file).ok())
     };
     let plist = places.plist(name);
     let last = places.last(name);
@@ -1018,20 +1018,28 @@ fn retire(places: &Places, name: &str, keep: bool, launchd: Loader) -> Result<bo
     if !keep {
         gone.push((last.clone(), stored(&places.state, &last)));
     }
-    let restore = |gone: &[(PathBuf, Option<Option<String>>)]| {
+    // As bytes: a file that is not text comes back as it was.
+    let restore = |gone: &[(PathBuf, Option<Option<Vec<u8>>>)]| {
         for (path, text) in gone {
             if let Some(Some(text)) = text
-                && let Err(error) = replace(path, text)
+                && let Err(error) = replace_mode(path, text, 0o644)
             {
                 eprintln!("{}", error_json(&error));
             }
         }
     };
+    // A file there that cannot be read could not come back: it stays, and
+    // so does the trigger.
+    if let Some((path, _)) = gone.iter().find(|(_, text)| matches!(text, Some(None))) {
+        return Err(format!("{}: unreadable, so it is left", path.display()));
+    }
     for (i, (path, text)) in gone.iter().enumerate() {
+        // One whose removal could not be made durable may be gone anyway:
+        // it comes back with the rest.
         if text.is_some()
             && let Err(error) = forget(path)
         {
-            restore(&gone[..i]);
+            restore(&gone[..=i]);
             return Err(error);
         }
     }
@@ -1102,7 +1110,19 @@ pub fn migrate(places: &Places, running: Option<&str>, launchd: Loader) -> bool 
                     .to_owned(),
             )
         })
-        .filter(|name| valid_name(name).is_ok())
+        .filter(|name| match valid_name(name) {
+            Ok(()) => true,
+            Err(error) => {
+                log(format!(
+                    "unconvertible: schedule {name} is left at {}: {error}",
+                    places
+                        .agents
+                        .join(format!("{SCHEDULE_LABEL}{name}.plist"))
+                        .display()
+                ));
+                false
+            }
+        })
         .collect();
     let Ok(_lock) = Lock::take(places) else {
         log("migration_failed: no trigger lock".into());
@@ -1575,7 +1595,7 @@ pub fn write_script(home: &Path, app: &Path) -> Result<(), String> {
     if runnable && std::fs::read_to_string(&path).is_ok_and(|have| have == text) {
         return Ok(());
     }
-    replace_mode(&path, &text, 0o755)
+    replace_mode(&path, text.as_bytes(), 0o755)
 }
 
 #[cfg(test)]
@@ -2548,6 +2568,8 @@ mod tests {
         };
         std::fs::write(old("p.renamed"), old_plist(&other)).unwrap();
         std::fs::write(old_state.join("p.renamed.json"), "{}").unwrap();
+        // A name no trigger may have is left where it is, and said.
+        std::fs::write(old("p bad"), old_plist(&other)).unwrap();
         // The old job's unload fails: its plist stays for the next run.
         migrate(&places, None, &|x| match x {
             Launchd::Unload(label) if label.starts_with(SCHEDULE_LABEL) => {
@@ -2570,6 +2592,20 @@ mod tests {
         assert!(!places.plist("p.renamed").exists() && !places.plist("p.other").exists());
         assert!(old_state.join("p.renamed.json").exists());
         assert!(!places.last("p.renamed").exists());
+        assert!(old("p bad").exists());
+    }
+
+    #[test]
+    fn a_failed_rm_puts_back_files_that_are_not_text() {
+        let w = World::new("rm-bytes");
+        let s = trigger();
+        w.install(&s).unwrap();
+        let odd = b"\xff\xfe not text";
+        std::fs::write(w.places.last(&s.name), odd).unwrap();
+        w.fake.refuse_unload.set(true);
+        assert!(w.remove(&s.name).is_err());
+        assert_eq!(std::fs::read(w.places.last(&s.name)).unwrap(), odd);
+        assert_eq!(w.state(&s.name), (true, true, true));
     }
 
     #[test]
