@@ -143,13 +143,14 @@ window.Rich = (() => {
   // ---------- drawn in place ----------
   // Something drawn later changes a block's height; a reader at the end of the pane stays there, and
   // one reading below the block keeps their place (the panes do no scroll anchoring of their own).
-  function settle(box, change) {
-    const pane = box.closest('.scroll'); if (!pane) { change(); return; }
+  // `hold` notes the reader's place before a change; each call of what it returns keeps it after.
+  function hold(box) {
+    const pane = box.closest?.('.scroll'); if (!pane) return () => {};
     const end = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 40;
-    const above = !end && box.getBoundingClientRect().bottom <= pane.getBoundingClientRect().top, h = pane.scrollHeight;
-    change();
-    if (end) pane.scrollTop = pane.scrollHeight; else if (above) pane.scrollTop += pane.scrollHeight - h;
+    const above = !end && box.getBoundingClientRect().bottom <= pane.getBoundingClientRect().top; let h = pane.scrollHeight;
+    return () => { if (end) pane.scrollTop = pane.scrollHeight; else if (above) pane.scrollTop += pane.scrollHeight - h; h = pane.scrollHeight; };
   }
+  function settle(box, change) { const keep = hold(box); change(); keep(); }
   // Rendered diagrams by source (and a chart by its width), so a pane drawn again shows them at once;
   // at most 64 of them and 8 MiB of SVG.
   const diagrams = new Map(), DIAGRAMS = 64, DIAGRAM_BYTES = 8 * 1024 * 1024; let diagramBytes = 0;
@@ -169,15 +170,16 @@ window.Rich = (() => {
   }
   // A diagram or chart drawn to SVG once per source; one at a time, as Mermaid measures in a shared
   // scratch element. A source that does not draw keeps showing as code, the error in its head.
-  // With `cached`, only a block someone asked for (`shown`) that is already drawn is shown again.
-  const shown = new Set();
+  // With `cached`, only a block someone asked for (`shown`, the last 1,024 asked) draws again,
+  // from the cache or, when a chart's width changed, anew.
+  const shown = new Set(), SHOWN = 1024;
   function drawLazy(box, src, make, cached = false) {
     const key = `${box.dataset.kind}|${box.dataset.lang ?? ''}|${box.dataset.kind === 'chart' ? box.clientWidth : ''}|${src}`;
     const show = (svg) => settle(box, () => { box.querySelector('.view').innerHTML = svg; box.dataset.view = 'view'; box.dataset.drawn = ''; });
     if (cached && !shown.has(box.dataset.id)) return;
-    if (!cached && box.dataset.id) shown.add(box.dataset.id);
+    if (!cached && box.dataset.id) { shown.delete(box.dataset.id); shown.add(box.dataset.id); if (shown.size > SHOWN) shown.delete(shown.values().next().value); }
     if (diagrams.has(key)) { show(diagrams.get(key)); return; }
-    if (cached || 'asked' in box.dataset) return;
+    if ('asked' in box.dataset) return;
     box.dataset.asked = '';
     // One queued behind the same source takes its result instead of drawing it again; one larger
     // than the whole budget is shown but not kept.
@@ -271,7 +273,8 @@ window.Rich = (() => {
     const f = e.target.closest?.('[data-file]');
     if (f) { e.preventDefault(); openFile(f.dataset.file, f); return true; }
     const im = e.target.closest?.('button.img[data-img]');
-    if (im) { const img = document.createElement('img'); img.src = im.dataset.img; img.alt = im.title; im.replaceWith(img); return true; }
+    // It has no height until decoded, so the reader's place is kept again once it loads.
+    if (im) { const img = document.createElement('img'), keep = hold(im); img.addEventListener('load', keep); img.src = im.dataset.img; img.alt = im.title; im.replaceWith(img); keep(); return true; }
     // Every link in drawn content goes through the guarded opener, or nowhere: a Mermaid `click`
     // link is an SVG `<a xlink:href>` that would otherwise take over the window.
     const a = e.target.closest?.('.md a, .rc a');
@@ -339,7 +342,7 @@ window.Rich = (() => {
   let openFile = () => {}, failed = () => {};
 
   // A middle click on a link would open it in a new app window.
-  document.addEventListener?.('auxclick', (e) => { if (e.target.closest?.('.md a, .rc a')) e.preventDefault(); });
+  document.addEventListener?.('auxclick', (e) => { if (e.target.closest?.('.md a, .rc a, a[data-file]')) e.preventDefault(); });
 
   return { html, cut, hydrate, click, file, filePath, esc, get version() { return version; }, get waited() { return waited; }, set onReady(fn) { ready = fn; }, set onFile(fn) { openFile = fn; }, set onError(fn) { failed = fn; } };
 })();

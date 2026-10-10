@@ -1351,7 +1351,7 @@ function runHTML(t, s, limit = t.items.length) {
   return { html: `<div class="steps" data-i="${s}"><div class="sum" data-run="${s}" role="button" tabindex="0">${open ? '▾' : '▸'} ${head}</div>${body}</div>`, end };
 }
 // A read, write or edit names its path; it opens that file beside.
-const summaryHTML = (it) => it.path ? `<span class="fpath" data-file="${esc(it.path)}">${esc(it.summary)}</span>` : esc(it.summary);
+const summaryHTML = (it) => it.path ? `<a class="fpath" href="#" data-file="${esc(it.path)}">${esc(it.summary)}</a>` : esc(it.summary);
 function stepHTML(it, i) {
   switch (it.kind) {
     case 'thought': return `<div class="line think">${esc(it.text)}</div>`;

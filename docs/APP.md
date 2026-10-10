@@ -1198,9 +1198,10 @@ also draw, and an HTML preview can still draw a chart with its own inline
 SVG or canvas.
 
 Highlighting, Mermaid and Vega load the first time something needs them;
-marked loads with the page. Nothing in a message draws until asked, so
-opening a long chat draws nothing, and a reader below a block that draws
-keeps their place. Mermaid's own limits (50,000 characters, 500 edges) do
+marked loads with the page. Text, lists, tables and code draw as a message
+arrives; diagrams, charts, previews and images draw only when asked, so
+opening a long chat runs none of them, and a reader below a block that
+draws keeps their place. Mermaid's own limits (50,000 characters, 500 edges) do
 not bound its layout work, which is why a diagram waits for a click. Drawn
 diagrams and charts are kept by source (a chart also by its width) and show
 again when their pane is redrawn: at most 64 and 8 MiB. A

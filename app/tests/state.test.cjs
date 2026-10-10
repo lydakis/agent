@@ -230,7 +230,7 @@ test('a diagram someone asked for shows again; an identical one elsewhere still 
   c.document.head = { append(s) { s.onload(); } };
   c.getComputedStyle = () => ({ getPropertyValue: () => '' });
   c.mermaid = { initialize() {}, render: async (id, src) => { renders++; return { svg: `<svg>${src}</svg>` }; } };
-  const box = (id) => { const view = { innerHTML: '' }, pre = { textContent: 'graph TD' };
+  const box = (id, src = 'graph TD') => { const view = { innerHTML: '' }, pre = { textContent: src };
     return { dataset: { kind: 'mermaid', lazy: '', view: 'code', id }, clientWidth: 0, view, closest: () => null, querySelector: (s) => s === 'pre' ? pre : s === '.view' ? view : null }; };
   const asked = box('1'), button = { dataset: { rich: 'view' }, closest: () => asked };
   Rich.click({ target: { closest: (s) => s === '[data-rich]' ? button : null }, preventDefault() {} });
@@ -243,6 +243,14 @@ test('a diagram someone asked for shows again; an identical one elsewhere still 
   // A block handed in on its own is hydrated too, as a streamed reply's new blocks are.
   const alone = box('1'); alone.matches = () => true; alone.querySelectorAll = () => [];
   Rich.hydrate(alone); assert.equal(alone.view.innerHTML, '<svg>graph TD</svg>');
+  // One asked for whose drawing is no longer kept (a chart at a new width) draws anew.
+  const moved = box('1', 'graph LR'); Rich.hydrate({ querySelectorAll: () => [moved] });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(moved.view.innerHTML, '<svg>graph LR</svg>'); assert.equal(renders, 2);
+  // Only the last 1,024 asked for are remembered.
+  for (let i = 3; i <= 1027; i++) { const b = box(String(i)), btn = { dataset: { rich: 'view' }, closest: () => b }; Rich.click({ target: { closest: (s) => s === '[data-rich]' ? btn : null }, preventDefault() {} }); }
+  const old = box('1'), recent = box('1027'); Rich.hydrate({ querySelectorAll: () => [old, recent] });
+  assert.equal(old.view.innerHTML, ''); assert.equal(recent.view.innerHTML, '<svg>graph TD</svg>');
 });
 
 test('a file opened while the side pane opens is drawn once the pane has its width', async () => {
@@ -356,7 +364,7 @@ test('a step links the whole path it named, not its shortened summary', async ()
   assert.equal(read.path, long); assert.ok(read.summary.length < long.length);
   assert.equal(shell.path, undefined);
   p.S.ui.steps = true;
-  assert.match(p.runHTML(p.transcript('Bob'), 0).html, new RegExp(`data-file="${long}"`));
+  assert.match(p.runHTML(p.transcript('Bob'), 0).html, new RegExp(`<a class="fpath" href="#" data-file="${long}"`));
 });
 
 test('a chat covered by a file beside is not seen until the file closes', () => {
