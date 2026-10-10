@@ -338,8 +338,8 @@ bound; the operating system is then the only limit.
 | `--max-pending` | Submissions waiting to start: queued behind a bot's own work or ready for a slot, daemon-wide. A submission that would wait past the bound answers `pending_limit` and writes nothing; one that starts at once is never refused by it. | none |
 | `--max-pending-bytes` | UTF-8 prompt bytes of those waiting submissions. | none |
 | `--max-connecting` | Provider requests awaiting response headers, a Bedrock Runtime call's body digest included. Established streams are not capped. Both providers hold headers until the first token, so a permit is held for the whole time to first token; a bound of N caps throughput at N calls per first-token latency. | none |
-| `--stall-timeout` | Seconds an established provider stream may go without a content frame before the attempt fails as `provider_stream_stalled` and is retried. Keepalives do not count. 1 to 86,400. | 120 |
-| `--idle-exit` | Seconds after which a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
+| `--stall-timeout` | How long an established provider stream may go without a content frame before the attempt fails as `provider_stream_stalled` and is retried. Keepalives do not count. Whole seconds, `1s` to `24h`. | `2m` |
+| `--idle-exit` | How long, in whole seconds, before a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
 | (derived) `connections` | HTTP/2 connections per provider: `max-active` divided by 64 streams per connection (both providers allow 100; fewer bounds how many turns one reset connection takes with it), 1 to 256; 64 when active is unbounded. Reported in `ready`, not a flag. | 64 |
 
 ### Bot settings
@@ -366,8 +366,8 @@ keep-warm when it sets any of them.
 | `note_turns` (`--note-turns`) | Omitted turns the context note lists, newest first, with the first line of each prompt. 0 lists none. | 48 |
 | `compact_at` (`--compact-at`) | Percent of either context envelope that triggers compaction, and of the byte envelope that triggers tool-result elision first. Estimated completion headroom can advance the byte trigger without reducing the input allowance. | 75 |
 | `compact_keep` (`--compact-keep`) | Target percent of either context envelope kept verbatim: as newest whole turns by compaction, as newest items by elision. Reduced when pinned context leaves less room. Must be below `compact_at`. | 25 |
-| `retain_turns` (`--retain-turns`) | After each of its turns finishes, prune the bot to this many turns' records (see [Retention](#retention)). | none |
-| `approval_hold_ms` (`--approval-hold-ms`) | Milliseconds a gated call waits live for its verdict before its turn parks (see [tool approval](#tool-approval)). 0 parks at once; at most 3,600,000. | 2,000 |
+| `keep_turns` (`--keep-turns`) | After each of its turns finishes, prune the bot to this many turns' records (see [Retention](#retention)). | none |
+| `approval_hold_ms` (`--approval-hold`) | Milliseconds a gated call waits live for its verdict before its turn parks (see [tool approval](#tool-approval)). 0 parks at once; at most 3,600,000. | 2,000 |
 | `max_output_tokens` (`--max-output-tokens`) | Generated tokens per model call, including reasoning, summaries included. Anthropic calls use the model's full output limit (read inside Bedrock ids) unless this is set; set, it is sent as `max_tokens`, at least 2,048 so a legacy thinking budget of 1,024 or more fits beside the answer. Bedrock deducts input plus this bound from quota when a call starts, so a bound near real output buys throughput there. | none |
 | `keep_warm` (`--keep-warm`) | Seconds an Anthropic prompt cache may sit unread while a turn runs a tool before it is refreshed (see [keeping the cache warm](#keeping-the-anthropic-cache-warm)). Below 300; 0 never refreshes. | 240 |
 | `cache_ttl` (`--cache-ttl`) | Anthropic prompt-cache lifetime, `5m` or `1h`, on both cache markers. `1h` bills each write at twice the input rate instead of 1.25 times and sends no refreshes. Responses providers are unaffected; Bedrock's acceptance of `1h` is unverified. | `5m` |
@@ -858,7 +858,7 @@ start. Parked and paced turns stay parked, as on any shutdown. `stats` reports
 `draining: true`. The daemon exits when no turn is running or the deadline
 passes, whichever comes first. A later `shutdown` can only bring the deadline
 closer; SIGTERM and SIGINT still exit at once. Turns still running at exit are
-cancelled like any others at shutdown. `agent shutdown --grace SECONDS` sends
+cancelled like any others at shutdown. `agent shutdown --grace DURATION` sends
 it and waits that much longer than 30 seconds.
 
 On shutdown, committed turn events get up to five seconds to drain through
@@ -912,7 +912,7 @@ own path from the turn. Example requests:
 {"id":17,"op":"wait","handles":["turn:Bob/1","turn:Alice/3"],"any":true,"timeout_ms":60000}
 {"id":18,"op":"stats"}
 {"id":19,"op":"provider_models"}
-{"id":21,"op":"create","bot":"Carol","workspace":"/workspaces/project","model":"openai/gpt-6-luna","instructions":"...","tools":["shell","read","write","edit","wait","history"],"approve":["shell","write","edit","read"],"approver":"manual","settings":{"context_bytes":1048576,"retain_turns":16}}
+{"id":21,"op":"create","bot":"Carol","workspace":"/workspaces/project","model":"openai/gpt-6-luna","instructions":"...","tools":["shell","read","write","edit","wait","history"],"approve":["shell","write","edit","read"],"approver":"manual","settings":{"context_bytes":1048576,"keep_turns":16}}
 {"id":22,"op":"approvals","bot":"Carol","limit":64}
 {"id":23,"op":"answer","bot":"Carol","turn":7,"call_id":"call_1","request":1,"decision":"deny","reason":"not on main","by":"cli"}
 {"id":24,"op":"serve_approvals","tag":"auto","lease_ms":5000,"limit":64}
@@ -1753,7 +1753,7 @@ needs, and one optional policy composes them:
   cursor: an `events` page starting before it carries `pruned_before`, and a
   `follow` from before it is preceded by a `pruned` notification, so no
   consumer replays a silent gap. `agent prune --bot --keep-turns N`.
-- A bot's `retain_turns` setting applies `prune` to it after each of
+- A bot's `keep_turns` setting applies `prune` to it after each of
   its turns finishes, inside the same commit, including cancelled or failed queued work and interruption
   while parked, before the terminal
   event is delivered. Whoever sees `turn_finished` sees the store as retention

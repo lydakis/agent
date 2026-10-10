@@ -26,7 +26,7 @@ def run(binary, out, boundaries):
     completed, samples = 0, []
     try:
         for boundary in boundaries:
-            client = Client(binary, store, url, 'shell', settings={'retain_turns': 4, 'context_bytes': 524288})
+            client = Client(binary, store, url, 'shell', settings={'keep_turns': 4, 'context_bytes': 524288})
             if completed == 0:
                 for n in range(16):
                     response = client.request('create', bot=f'b{n}', workspace=str(out))
@@ -54,7 +54,7 @@ def run(binary, out, boundaries):
             print(json.dumps({key: sample[key] for key in ('completed_turns', 'database_bytes',
                                                          'payload_bytes', 'duplicate_prompt_bytes')}), flush=True)
         result = {'schema': 'storage_growth_v1', 'binary_sha256': file_hash(binary),
-                  'bots': 16, 'retain_turns': 4, 'samples': samples}
+                  'bots': 16, 'keep_turns': 4, 'samples': samples}
         (out / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
         return result
     finally:

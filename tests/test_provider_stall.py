@@ -66,7 +66,7 @@ class ProviderStallTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=root/'.local') as directory:
             client = Client(root/'.local/target/release/agent', Path(directory)/'agent.db',
                             f'http://127.0.0.1:{server.server_port}/v1', family='anthropic',
-                            provider='fixture', extra=['--stall-timeout', '1'])
+                            provider='fixture', extra=['--stall-timeout', '1s'])
             self.addCleanup(client.close)
             client.request('create', bot='Bob', workspace=directory)
             started = time.monotonic()

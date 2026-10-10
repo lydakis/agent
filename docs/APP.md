@@ -367,7 +367,7 @@ environment. A failed start shows the CLI's
 reason on the page and is not retried for 30 seconds. An explicit `--socket`
 or `AGENT_SOCKET` never starts anything. Uninstalling or upgrading the cask
 quits the app and runs the bundled `agent shutdown --store
-~/.agent/state.sqlite --grace 30`, so the default store's daemon, whoever
+~/.agent/state.sqlite --grace 30s`, so the default store's daemon, whoever
 started it, lets running turns finish and exits before its binary is replaced.
 The store is named so the uninstalling shell's `AGENT_STORE` or `AGENT_SOCKET`
 cannot point the shutdown elsewhere.
@@ -1676,7 +1676,7 @@ The UI bounds payload buffering, history decoding, and rendered fleet rows:
 
 - **Attach** replays events from the page's cursor, which on a first start is
   the beginning of the daemon's retained log. That log is bounded by the
-  daemon's retention (each bot's `retain_turns`, `prune`), and a `pruned` notice marks
+  daemon's retention (each bot's `keep_turns`, `prune`), and a `pruned` notice marks
   the gap. Nothing is staged on the way: the page pulls the replay a batch
   at a time and applies each before the next, so the transport's 4,096-event / 8 MiB encoded
   queue is the buffer between the daemon and the screen, and pulls also stop at 1 MiB (plus one event). A page

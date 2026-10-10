@@ -70,8 +70,8 @@ struct Options {
     detach: bool,
     no_spawn: bool,
     timeout_ms: Option<u64>,
-    /// `shutdown --grace`: seconds running turns may take to finish.
-    grace: u64,
+    /// `shutdown --grace`: milliseconds running turns may take to finish.
+    grace_ms: u64,
     budget_tokens: Option<u64>,
     turn: Option<i64>,
     keep_turns: Option<usize>,
@@ -135,7 +135,7 @@ fn parse(args: &[String]) -> Result<Options> {
         detach: false,
         no_spawn: false,
         timeout_ms: None,
-        grace: 0,
+        grace_ms: 0,
         budget_tokens: None,
         turn: None,
         keep_turns: None,
@@ -248,32 +248,34 @@ fn parse(args: &[String]) -> Result<Options> {
                         )
                     }
                     "--keep-turns" => {
-                        options.keep_turns = Some(value.parse().ok().filter(|n| *n > 0).ok_or(
-                            Error::with("usage", "--keep-turns needs a positive integer"),
-                        )?)
+                        let keep = value.parse().ok().filter(|n| *n > 0).ok_or(Error::with(
+                            "usage",
+                            "--keep-turns needs a positive integer",
+                        ))?;
+                        // prune takes it as is; a new bot keeps it as its setting.
+                        options.keep_turns = Some(keep);
+                        options
+                            .settings
+                            .insert("keep_turns".to_owned(), json!(keep));
+                        options.settings_flags.push(flag.to_owned());
                     }
-                    "--grace" => {
-                        options.grace = value
-                            .parse()
-                            .map_err(|_| Error::with("usage", "--grace needs seconds"))?
-                    }
-                    "--timeout-ms" => {
-                        options.timeout_ms =
-                            Some(value.parse().map_err(|_| {
-                                Error::with("usage", "--timeout-ms needs an integer")
-                            })?)
+                    "--grace" => options.grace_ms = crate::cli::duration_ms(flag, &value)?,
+                    "--timeout" => {
+                        options.timeout_ms = Some(crate::cli::duration_ms(flag, &value)?)
                     }
                     "--max-processes"
                     | "--max-detached"
                     | "--max-active"
                     | "--max-connecting"
                     | "--max-pending"
-                    | "--max-pending-bytes"
-                    | "--stall-timeout"
-                    | "--idle-exit" => {
+                    | "--max-pending-bytes" => {
                         value.parse::<usize>().map_err(|_| {
                             Error::with("usage", format!("{flag} needs an integer"))
                         })?;
+                        options.daemon_flags.push((flag.to_owned(), value));
+                    }
+                    "--stall-timeout" | "--idle-exit" => {
+                        crate::cli::duration_secs(flag, &value)?;
                         options.daemon_flags.push((flag.to_owned(), value));
                     }
                     "--context-bytes"
@@ -281,16 +283,27 @@ fn parse(args: &[String]) -> Result<Options> {
                     | "--note-turns"
                     | "--compact-at"
                     | "--compact-keep"
-                    | "--retain-turns"
-                    | "--approval-hold-ms"
-                    | "--max-output-tokens"
-                    | "--keep-warm" => {
+                    | "--max-output-tokens" => {
                         let number = value.parse::<u64>().map_err(|_| {
                             Error::with("usage", format!("{flag} needs an integer"))
                         })?;
                         // The daemon checks each setting's range.
                         let key = flag.trim_start_matches("--").replace('-', "_");
                         options.settings.insert(key, json!(number));
+                        options.settings_flags.push(flag.to_owned());
+                    }
+                    "--approval-hold" => {
+                        let ms = crate::cli::duration_ms(flag, &value)?;
+                        options
+                            .settings
+                            .insert("approval_hold_ms".to_owned(), json!(ms));
+                        options.settings_flags.push(flag.to_owned());
+                    }
+                    "--keep-warm" => {
+                        let seconds = crate::cli::duration_secs(flag, &value)?;
+                        options
+                            .settings
+                            .insert("keep_warm".to_owned(), json!(seconds));
                         options.settings_flags.push(flag.to_owned());
                     }
                     "--cache-ttl" => {
@@ -562,15 +575,18 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
             _ => continue,
         };
         let running = &ready["limits"][key];
-        let requested = value
-            .parse::<u64>()
-            .ok()
-            .filter(|value| flag != "--idle-exit" || *value != 0);
+        let requested = match flag.as_str() {
+            "--stall-timeout" | "--idle-exit" => crate::cli::duration_secs(flag, value).ok(),
+            _ => value.parse::<u64>().ok(),
+        }
+        .filter(|value| flag != "--idle-exit" || *value != 0);
         if running.as_u64() != requested {
             differences.push(format!(
                 "{flag}: requested {value} but daemon has {}",
                 if running.is_null() {
                     "no value".to_owned()
+                } else if key.ends_with("_seconds") {
+                    format!("{running}s")
                 } else {
                     running.to_string()
                 }
@@ -1038,8 +1054,11 @@ pub fn main(args: Vec<String>) -> Result<i32> {
                 .as_u64()
                 .and_then(|pid| i32::try_from(pid).ok())
                 .ok_or(Error::new("daemon_protocol_mismatch"))?;
-            connection.request("shutdown", json!({"grace_ms": options.grace * 1000}))?;
-            await_exit(pid, SHUTDOWN_TIMEOUT + Duration::from_secs(options.grace))?;
+            connection.request("shutdown", json!({"grace_ms": options.grace_ms}))?;
+            await_exit(
+                pid,
+                SHUTDOWN_TIMEOUT + Duration::from_millis(options.grace_ms),
+            )?;
             Ok(0)
         }
         _ => fail("usage"),

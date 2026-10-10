@@ -131,7 +131,7 @@ class SocketAndCliTests(ModelFixture):
         self.model.all_streaming = self.model.release_headers
         handle = json.loads(self.agent('run', *self.common, '--new', '--bot', 'Bob', '--detach', 'gate').stdout)
         self.model.requests.get(timeout=3)
-        for bad in ('-1', '86401', 'soon'):
+        for bad in ('-1s', '25h', 'soon', '5'):
             usage = self.agent('shutdown', '--store', str(self.store), '--grace', bad, check=False)
             self.assertEqual(usage.returncode, 2, usage.stderr)
             self.assertEqual(json.loads(usage.stderr)['error'], 'usage')
@@ -150,7 +150,7 @@ class SocketAndCliTests(ModelFixture):
         pretty = self.agent('run', '--store', str(self.store), '--pretty', '--bot', check=False)
         self.assertEqual((pretty.returncode, pretty.stderr), (2, 'agent: usage: --bot needs a value\n'))
         threading.Timer(.3, self.model.release_headers.set).start()
-        self.agent('shutdown', '--store', str(self.store), '--grace', '5')
+        self.agent('shutdown', '--store', str(self.store), '--grace', '5s')
         self.assertFalse(self.socket.exists())
         with sqlite3.connect(self.store) as db:
             status, = db.execute('SELECT status FROM turns WHERE id=?', (handle['turn'],)).fetchone()
@@ -194,18 +194,18 @@ class SocketAndCliTests(ModelFixture):
                                      '--new', '--bot', 'Slow', '--detach', 'wait').stdout)['handle']
         quick = json.loads(self.agent('run', '--store', str(self.store), '--model', 'openai/synthetic-model',
                                       '--new', '--bot', 'Quick', '--detach', 'hi').stdout)['handle']
-        first = json.loads(self.agent('wait', '--store', str(self.store), '--any', '--timeout-ms', '5000', slow, quick).stdout)
+        first = json.loads(self.agent('wait', '--store', str(self.store), '--any', '--timeout', '5s', slow, quick).stdout)
         self.assertEqual(first['pending'], [slow])
         self.assertEqual(first['results'][quick]['text'], 'reply:hi')
-        timed = self.agent('wait', '--store', str(self.store), '--any', '--timeout-ms', '0', slow, check=False)
+        timed = self.agent('wait', '--store', str(self.store), '--any', '--timeout', '0', slow, check=False)
         self.assertEqual((timed.returncode, timed.stderr), (1, ''))
         timed = json.loads(timed.stdout)
         self.assertEqual(timed['pending'], [slow])
         self.assertEqual((timed['results'][slow]['pending'], timed['results'][slow]['status'],
                           timed['results'][slow]['handle']), (True, 'running', slow))
-        done = self.agent('wait', '--store', str(self.store), '--timeout-ms=0', quick)
+        done = self.agent('wait', '--store', str(self.store), '--timeout=0', quick)
         self.assertEqual(json.loads(done.stdout)['results'][quick]['text'], 'reply:hi')
-        mixed = self.agent('wait', '--store', str(self.store), '--any', '--timeout-ms=0', slow, quick)
+        mixed = self.agent('wait', '--store', str(self.store), '--any', '--timeout=0', slow, quick)
         self.assertEqual(json.loads(mixed.stdout)['pending'], [slow])
         # interrupt prints the turn view, as it stood when asked.
         printed = self.agent('interrupt', '--store', str(self.store), '--bot', 'Slow', '--pretty').stdout
@@ -427,9 +427,9 @@ class SocketAndCliTests(ModelFixture):
             self.assertIn('daemon_configuration_mismatch', refused.stderr)
             self.assertIn(named, refused.stderr)
         # A bot's settings are its own, chosen when it is made.
-        kept = attempt('--note-turns', '5', '--retain-turns', '2')
+        kept = attempt('--note-turns', '5', '--keep-turns', '2')
         self.assertEqual(kept.returncode, 2, kept.stdout + kept.stderr)
-        self.assertIn("--note-turns, --retain-turns set a new bot's settings; an existing bot keeps its own",
+        self.assertIn("--note-turns, --keep-turns set a new bot's settings; an existing bot keeps its own",
                       kept.stderr)
         # The daemon has no model of its own: --model belongs to run alone.
         stats = self.agent('stats', '--store', str(self.store), '--model', 'openai/other', check=False)
@@ -447,7 +447,7 @@ class SocketAndCliTests(ModelFixture):
                          'completed')
 
     def test_daemon_limits_match_on_startup_and_attach_and_bots_keep_their_settings(self):
-        flags = ['--idle-exit', '0', '--stall-timeout', '30']
+        flags = ['--idle-exit', '0', '--stall-timeout', '30s']
         self.agent('run', *self.common, *flags, '--context-bytes', '1024', '--context-items', '2',
                    '--keep-warm', '0', '--cache-ttl', '1h', '--new', '--bot', 'Bob', 'hi')
         self.agent('run', *self.again, *flags, '--bot', 'Bob', 'again')
@@ -463,12 +463,12 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual(json.loads(small.stderr), {'error': 'invalid_setting',
                                                     'detail': 'context_bytes is at least 1024'})
         self.assertEqual(control.request('resume', bot='Small')['error'], 'bot_not_found')
-        refused = self.agent('stats', '--store', str(self.store), '--idle-exit', '1', check=False)
+        refused = self.agent('stats', '--store', str(self.store), '--idle-exit', '1s', check=False)
         self.assertIn('daemon_configuration_mismatch', refused.stderr)
-        refused = self.agent('stats', '--store', str(self.store), '--stall-timeout', '120', check=False)
-        self.assertIn('--stall-timeout: requested 120 but daemon has 30', refused.stderr)
+        refused = self.agent('stats', '--store', str(self.store), '--stall-timeout', '2m', check=False)
+        self.assertIn('--stall-timeout: requested 2m but daemon has 30s', refused.stderr)
         # How a bot calls its model is chosen when it is made, not by the daemon.
-        for flag, value in (('--keep-warm', '240'), ('--cache-ttl', '5m'), ('--max-output-tokens', '4096')):
+        for flag, value in (('--keep-warm', '4m'), ('--cache-ttl', '5m'), ('--max-output-tokens', '4096')):
             refused = self.agent('stats', '--store', str(self.store), flag, value, check=False)
             self.assertEqual(refused.returncode, 2)
             self.assertIn(f'does not accept {flag}', refused.stderr)
@@ -490,8 +490,12 @@ class SocketAndCliTests(ModelFixture):
             ('run', '--bot', 'Bob', '--bot', 'Alice', 'hi'),
             ('run', '--max-output-tokens', '0', 'hi'),
             ('run', '--stall-timeout', '0', 'hi'),
-            ('run', '--stall-timeout', '86401', 'hi'),
-            ('run', '--keep-warm', '300', 'hi'),
+            ('run', '--stall-timeout', '25h', 'hi'),
+            ('run', '--stall-timeout', '30', 'hi'),
+            ('run', '--keep-warm', '5m', 'hi'),
+            ('run', '--keep-warm', '1500ms', 'hi'),
+            ('wait', '--timeout-ms', '5', 'proc:1'),
+            ('run', '--retain-turns', '2', 'hi'),
             ('run', '--cache-ttl', '2h', 'hi'),
             ('run', '--new', '--context-items', '0', 'hi'),
             ('follow', '--after=-1', '--all'),
@@ -675,7 +679,7 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual(result['results'][handle]['text'], 'reply:slow')
         pending = self.agent('run', '--store', str(self.store), '--detach', '--bot', 'Alice', 'wait')
         again = json.loads(pending.stdout)['handle']
-        timed = self.agent('wait', '--store', str(self.store), '--timeout-ms', '200', again, check=False)
+        timed = self.agent('wait', '--store', str(self.store), '--timeout', '200ms', again, check=False)
         self.assertEqual(timed.returncode, 1)
         self.assertEqual(json.loads(timed.stdout)['pending'], [again])
         inside = subprocess.run([*self.base, 'wait', '--store', str(self.store), again],

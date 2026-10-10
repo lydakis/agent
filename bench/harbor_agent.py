@@ -70,7 +70,7 @@ class Agent(BaseInstalledAgent):
       codex_auth   for chatgpt/MODEL: Codex's ChatGPT login to copy into the
                    container (default: $CODEX_HOME/auth.json, else ~/.codex/auth.json)
       max_output_tokens, context_bytes, compact_at: the new bot's settings
-      stall_timeout: the daemon's stall limit
+      stall_timeout: the daemon's stall limit, a duration such as 5m
     """
 
     # Resolve the provider from the model prefix and forward its key env
