@@ -1,7 +1,8 @@
 //! The files ⌘P searches: those git tracks in the repository a folder is
 //! in, and those it would track (new, not ignored), as an editor lists
 //! them. git reads the index and `.gitignore`, so the app walks no folder.
-use std::io::Read;
+use std::collections::HashSet;
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -33,6 +34,14 @@ pub fn list(dir: &Path) -> Result<Listing, String> {
     }
     let root = String::from_utf8_lossy(&top.stdout);
     let root = root.strip_suffix('\n').unwrap_or(&root).to_owned();
+    // A tracked file deleted from the folder but not yet from the index
+    // would open as "no such file", so it is left out.
+    let deleted = git(Path::new(&root))
+        .args(["ls-files", "-z", "--deleted"])
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|e| format!("git: {e}"))?;
+    let deleted: HashSet<&[u8]> = deleted.stdout.split(|b| *b == 0).collect();
     let mut child = git(Path::new(&root))
         .args([
             "ls-files",
@@ -46,33 +55,36 @@ pub fn list(dir: &Path) -> Result<Listing, String> {
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("git: {e}"))?;
-    let mut out = Vec::new();
+    // Read name by name, so git stops at either bound rather than listing
+    // the whole repository first.
     let stdout = child.stdout.take().expect("piped");
-    stdout
-        .take(MAX_BYTES + 1)
-        .read_to_end(&mut out)
-        .map_err(|e| format!("git ls-files: {e}"))?;
-    let mut more = out.len() as u64 > MAX_BYTES;
+    let mut out = BufReader::new(stdout.take(MAX_BYTES + 1));
+    let (mut files, mut name) = (Vec::new(), Vec::new());
+    let more = loop {
+        name.clear();
+        out.read_until(0, &mut name)
+            .map_err(|e| format!("git ls-files: {e}"))?;
+        // The end, or a name cut at the byte bound.
+        if name.pop() != Some(0) {
+            break !name.is_empty();
+        }
+        if files.len() == MAX_FILES {
+            break true;
+        }
+        // A name that is not UTF-8 cannot be opened by its path from the
+        // page, so it is left out too.
+        if !deleted.contains(&name[..])
+            && let Ok(text) = std::str::from_utf8(&name)
+        {
+            files.push(text.to_owned());
+        }
+    };
     if more {
-        // A path cut at the limit is not listed.
         let _ = child.kill();
-        out.truncate(out.iter().rposition(|b| *b == 0).map_or(0, |i| i + 1));
     }
     let status = child.wait().map_err(|e| format!("git ls-files: {e}"))?;
     if !more && !status.success() {
         return Err(format!("{root}: git ls-files failed ({status})"));
-    }
-    let mut files = Vec::new();
-    // A name that is not UTF-8 cannot be opened by its path from the page,
-    // so it is left out.
-    for name in out.split(|b| *b == 0).filter(|n| !n.is_empty()) {
-        if files.len() == MAX_FILES {
-            more = true;
-            break;
-        }
-        if let Ok(name) = std::str::from_utf8(name) {
-            files.push(name.to_owned());
-        }
     }
     Ok(Listing { root, files, more })
 }
@@ -124,13 +136,16 @@ mod tests {
         std::fs::write(tmp.join("src/deep/a.rs"), "").unwrap();
         std::fs::create_dir_all(tmp.join("target")).unwrap();
         std::fs::write(tmp.join("target/out.bin"), "").unwrap();
-        run(&tmp, &["add", "README.md"]);
+        std::fs::write(tmp.join("gone.md"), "").unwrap();
+        run(&tmp, &["add", "README.md", "gone.md"]);
+        std::fs::remove_file(tmp.join("gone.md")).unwrap();
         let root = std::fs::canonicalize(&tmp).unwrap();
         let listing = list(&tmp.join("src/deep")).unwrap();
         assert_eq!(listing.root, root.to_string_lossy());
         let mut files = listing.files;
         files.sort();
-        // Tracked, new and not ignored; the ignored build output is left out.
+        // Tracked, new and not ignored; the ignored build output and a
+        // tracked file deleted from the folder are left out.
         assert_eq!(files, [".gitignore", "README.md", "src/deep/a.rs"]);
         assert!(!listing.more);
         let outside = std::env::temp_dir().join(format!("agent-nogit-{}", std::process::id()));

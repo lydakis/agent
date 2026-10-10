@@ -2228,8 +2228,9 @@ function searchFolder() {
   const sw = swarmOf(S.selected); if (sw) return sw.workspace ?? null;
   return bot(S.selected)?.workspace ?? S.config?.workspace ?? null;
 }
-// Listed again each time the files list opens, so it is what git sees now; the lowercase copy is
-// made once per listing, not per key.
+// Listed once each time the finder opens on files, so it is what git sees now; trading lists with
+// Tab keeps the listing, so key repeat starts no more git. The lowercase copy is made once per
+// listing, not per key.
 async function listFiles() {
   const dir = searchFolder();
   const found = S.ui.found = { dir, state: dir ? 'loading' : 'none', files: [], lower: [], root: '', more: false, error: '' };
@@ -2270,6 +2271,7 @@ function renderPicker() {
   const files = S.ui.pickerMode === 'files', found = S.ui.found;
   $('pmodes').innerHTML = `<button type="button" data-pmode="agents" class="${files ? '' : 'on'}">Agents <span class="kbd">⌘K</span></button><button type="button" data-pmode="files" class="${files ? 'on' : ''}">Files <span class="kbd">⌘P</span></button><span class="ph">Tab switches</span>`;
   $('pickerq').placeholder = files ? 'find a file…' : 'find an agent…';
+  $('pickerq').setAttribute?.('aria-label', files ? 'Find a file' : 'Find an agent');
   const q = $('pickerq').value.trim(); const all = pickerRows(); const rows = all.slice(0, PICKER_ROWS);
   S.ui.pickerSel = Math.min(S.ui.pickerSel, Math.max(0, rows.length - 1));
   const total = all.total ?? all.length;
@@ -2290,21 +2292,22 @@ let pickerPane = 'main';
 function openPicker(mode = 'agents') {
   if (!S.ui.picker) pickerPane = paneOf(document.activeElement, menuPane);
   closeMenu(); S.ui.picker = true; S.ui.pickerSel = 0; $('pickerq').value = ''; $('pickerwrap').classList.add('on');
-  pickerMode(mode); render(); $('pickerq').focus();
+  S.ui.found = null; pickerMode(mode); render(); $('pickerq').focus();
 }
 // What was typed stays when the list changes, so Tab looks for the same text in the other list.
 function pickerMode(mode) {
   S.ui.pickerMode = mode; S.ui.pickerSel = 0;
-  if (mode === 'files') listFiles(); else S.ui.found = null;
+  if (mode === 'files' && !S.ui.found) listFiles();
 }
 // A file found opens in a tab, from the repository's top folder.
 async function pick(r) {
-  closePicker('main');
-  if (r?.path != null) await go(FILE + joinPath(S.ui.found.root, r.path), 'tab');
+  const root = S.ui.found?.root; closePicker('main');
+  if (r?.path != null) await go(FILE + joinPath(root, r.path), 'tab');
   else if (r) await go(r.b.name, 'tab');
 }
 // A pick opens its bot in a tab, so focus goes to the main composer; Escape goes back where it was.
-function closePicker(pane = pickerPane) { S.ui.picker = false; $('pickerwrap').classList.remove('on'); render(); $(PANE[S.ui.side ? pane : 'main'].input).focus(); }
+// A closed finder lets its listing go.
+function closePicker(pane = pickerPane) { S.ui.picker = false; S.ui.found = null; $('pickerwrap').classList.remove('on'); render(); $(PANE[S.ui.side ? pane : 'main'].input).focus(); }
 let helpPane = 'main';
 async function showHelp(pane = 'main') {
   helpPane = pane;

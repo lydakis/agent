@@ -427,6 +427,7 @@ test('⌘P lists the repository in view, names first, and opens the pick in a fi
   await q.listeners.keydown({ key: 'Tab', preventDefault() {} });
   assert.equal(p.S.ui.pickerMode, 'agents'); assert.equal(q.value, 'sess');
   await q.listeners.keydown({ key: 'Tab', preventDefault() {} }); await settle();
+  assert.deepEqual(listed, ['/w/src'], 'trading lists keeps the listing: no second git');
   p.S.ui.pickerSel = 1;
   await q.listeners.keydown({ key: 'Enter', preventDefault() {} }); await settle();
   assert.equal(p.S.selected, '▤/w/src/auth/session.rs'); assert.deepEqual([...p.S.ui.tabs], ['Bob', '▤/w/src/auth/session.rs']);
