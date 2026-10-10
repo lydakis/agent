@@ -1161,31 +1161,37 @@ pub fn list(places: &Places, after: Option<&str>) -> Value {
         names.pop_last();
     }
     let next = more.then(|| names.last().cloned()).flatten();
-    let rows: Vec<_> = names
-        .into_iter()
-        .map(|name| {
-            let path = places.plist(&name);
-            if !path.exists() {
-                let mut row = read_json(&places.last(&name))
-                    .filter(|r| r["name"] == name)
-                    .unwrap_or_else(|| json!({"name": name, "problem": "unreadable: result"}));
-                row["ended"] = json!(true);
-                return row;
-            }
-            match read_trigger(&path) {
-                Ok((t, _)) => {
-                    let mut row = t.json(&state(places, &t));
-                    row["ended"] = json!(false);
-                    if t.at.is_some_and(|at| now() > at + SLACK) {
-                        row["missed"] = json!(true);
-                    }
-                    row
-                }
-                Err(problem) => json!({"name": name, "ended": false, "problem": problem}),
-            }
-        })
-        .collect();
+    let rows: Vec<_> = names.into_iter().map(|name| row(places, &name)).collect();
     json!({"triggers": rows, "next_after": next})
+}
+
+/// One trigger's row, as `list` shows it; none when no trigger of that
+/// name is there, or one that ended has been removed.
+pub fn one(places: &Places, name: &str) -> Option<Value> {
+    (valid_name(name).is_ok() && (places.plist(name).exists() || places.last(name).exists()))
+        .then(|| row(places, name))
+}
+
+fn row(places: &Places, name: &str) -> Value {
+    let path = places.plist(name);
+    if !path.exists() {
+        let mut row = read_json(&places.last(name))
+            .filter(|r| r["name"] == name)
+            .unwrap_or_else(|| json!({"name": name, "problem": "unreadable: result"}));
+        row["ended"] = json!(true);
+        return row;
+    }
+    match read_trigger(&path) {
+        Ok((t, _)) => {
+            let mut row = t.json(&state(places, &t));
+            row["ended"] = json!(false);
+            if t.at.is_some_and(|at| now() > at + SLACK) {
+                row["missed"] = json!(true);
+            }
+            row
+        }
+        Err(problem) => json!({"name": name, "ended": false, "problem": problem}),
+    }
 }
 
 /// Write a file whole beside its place, then rename it there.
@@ -2573,7 +2579,7 @@ async fn start(client: &Client, trigger: &Trigger) -> Result<i64, String> {
         .dir
         .as_ref()
         .ok_or("invalid_trigger: --start has no folder")?;
-    let policy = crate::compose(dir, None, None)?;
+    let policy = crate::compose(dir, None)?;
     let made = client
         .request(
             "create",
@@ -3634,6 +3640,10 @@ mod tests {
                 .iter()
                 .all(|r| r["name"].as_str().unwrap() > before)
         );
+        // One row by name, past the first page too; none for a name not there.
+        assert_eq!(one(&w.places, "task-065").unwrap(), second["triggers"][2]);
+        assert!(one(&w.places, "task-999").is_none());
+        assert!(one(&w.places, "../x").is_none());
     }
 
     #[test]

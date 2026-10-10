@@ -75,6 +75,24 @@ there, which reads the file, line and quoted text first.
 
 ![The worktree's newest commit](app/git-commit.png)
 
+### Memory
+
+Captured 2026-10-10. Memory, at the foot of the list at Home and in a
+project, shows what agents saved: yours and every project's at Home, newest
+first.
+
+![Memory at Home: yours, demo's and notes'](app/memory-home.png)
+
+In a project, its own facts come first. A fact opens in a tab, its front
+matter as a table.
+
+![demo's memory](app/memory-project.png)
+![A fact in a tab](app/memory-fact.png)
+
+A task update tells the lead what a task saved since it last heard.
+
+![demo's lead told that plan saved session-cookie](app/memory-wake.png)
+
 ### Home
 
 Captured 2026-10-10. The first message sent at Home asks for the model and
@@ -241,32 +259,31 @@ says why beside those that answered.
 ![Settings with one provider failing](app/settings.png)
 
 Once Home or a project exists, Settings also lists the app's roles: the
-coordinator's, a flat and a council
-swarm's, and Home's. **Edit** opens your own copy in
-`~/.agents/agents/` in your text editor, made from the app's text the first
-time, and from then on that file is the role in every project (a project's
-own `.agents/agents` file of the same name still comes first). An agent keeps
-the text it started with, so an edit reaches the agents made after it.
-Captured 2026-10-10.
+coordinator's and Home's. **Edit** opens your own copy in `~/.agents/agents/`
+in your text editor, made from the app's text the first time, and from then
+on that file is the role in every project (a project's own `.agents/agents`
+file of the same name still comes first). An agent keeps the text it started
+with, so an edit reaches the agents made after it. A swarm's agents follow
+the swarm skill's `member.md` instead. Captured 2026-10-10.
 
 ![Settings with the roles](app/settings-roles.png)
 
 A project's ⋯ menu starts a swarm: a goal, how many agents, where they work,
-the tokens they share, what they are made of, and how they organize: one
-board, or a council of three that approves streams of work. What they are
-made of is a mix: rows of an identity (a plain agent, or a profile the
-folder offers, such as a reviewer), a model from any connected provider, its
-effort, and a share, each shown as the agents it makes at the size picked. The
-first row starts on the lead's model and effort. Captured 2026-09-29.
+the tokens they share and what they are made of. What they are made of is a
+mix: rows of an identity (a plain agent, or a profile the folder offers, such
+as a reviewer), a model from any connected provider, its effort, and a share,
+each shown as the agents it makes at the size picked. The first row starts on
+the lead's model and effort. Captured 2026-10-10 in demo mode.
 
 ![The new swarm sheet](app/new-swarm.png)
 
 The swarm's board: your goal first, then its agents' posts, the ones they
-name marked, each under what its agent is when the swarm mixes kinds (here
-three plain agents and a reviewer on another model). Its row in the sidebar
+name marked, and the work's steps (assignments, claims, submissions and
+reviews) quieter under their task's tag, which filters the board. A post
+names what its agent is when the swarm mixes kinds. Its row in the sidebar
 is working while any agent works.
 
-![A swarm's board while three of four agents work](app/swarm-board.png)
+![A swarm's board](app/swarm-board.png)
 
 Its agents as cards, each with what it is and its newest line.
 
@@ -277,30 +294,16 @@ the agent beside, with the board's posts it heard.
 
 ![An agent beside the board](app/swarm-beside.png)
 
-With a council, the board also carries roles, proposals, the seats' votes and
-their decisions; a post in a stream wears its tag, which filters the board.
+The Work tab lists each task the agents registered, its owner, reviewer and
+where it stands, then the final result once one is published. The board and
+this tab captured 2026-10-10 in demo mode.
 
-![A council swarm's board](app/swarm-council-board.png)
-
-The Council tab: each open proposal with its votes so far, which you can
-approve or deny yourself, then the ones decided.
-
-![The council](app/swarm-council.png)
-
-Streams: the approved proposals, each with its lead and the agents in it.
-
-![Streams](app/swarm-streams.png)
-
-When a stream's lead leaves, the first agent left in it leads it, and the
-board says so.
-
-![A stream handed on when its lead left](app/swarm-lead.png)
+![A swarm's tasks](app/swarm-work.png)
 
 You can also ask a project's coordinator for one ("start a swarm of six, two
-of them reviewers, to halve the p99"). Its role tells it to run
-`~/.agent/swarms/start`, a script the app writes, which starts the swarm the
-way the sheet does; the swarm shows under the project once its agents take
-their briefs.
+of them reviewers, to halve the p99"). Its role tells it to read the swarm
+skill and run the skill's script, which starts the swarm the way the sheet
+does; the swarm shows under the project once its agents take their briefs.
 
 A coordinator hears when you work in a task it started: once it rests, one
 message lists the turns its tasks ended, and it passes on what another task
@@ -308,11 +311,19 @@ needs.
 
 ![A coordinator reads a task update and passes build's change on to test](app/coordinator-wake.png)
 
-Agents can be woken at set times, when a file is written or a repository
-gets a commit, or by name. Settings lists the triggers, what each one last
-did, and the message it sends, with Run now and Remove.
+Agents can be woken at set times, when a file is written, a repository
+gets a commit or an agent ends a turn, or by name. Home's list shows the
+triggers under the projects: each one's kind, name, time or what it
+watches, and who it wakes. A row opens its sheet: when it fires, what it
+does, where the answer goes, its check, its last fire and its message, with
+Open, Remove and Run now. A message a trigger sent starts with the
+trigger's name and why it fired, and the name opens the trigger.
 
-![Triggers in Settings](app/settings-triggers.png)
+![Home's triggers under its projects](app/triggers-home.png)
+
+![A trigger's sheet: when, do, reply to, its check, and Run now](app/triggers-sheet.png)
+
+![A triggered message says which trigger woke the agent, and why](app/trigger-woke.png)
 
 ## What the daemon speaks, and why the client speaks it directly
 
@@ -367,8 +378,8 @@ client/          agent-client: the socket protocol and the client policy
   ([remote.rs](../app/src-tauri/src/remote.rs));
   `policy` composes a folder's client policy, in a profile when named, and
   falls back to the profiles the app ships for `coordinator`;
-  `triggers`, `trigger_fire` and `trigger_remove` list, run and remove
-  [triggers](#triggers) ([trigger.rs](../app/src-tauri/src/trigger.rs)).
+  `triggers`, `trigger`, `trigger_fire` and `trigger_remove` list a page,
+  read one by name, run and remove [triggers](#triggers) ([trigger.rs](../app/src-tauri/src/trigger.rs)).
   When nothing listens on a store's socket, `attach` starts a daemon first
   ([daemon.rs](../app/src-tauri/src/daemon.rs)); see
   [Installing](#installing).
@@ -717,8 +728,8 @@ instructions from AGENTS.md, skills and profiles (so `/new` and New project),
 a project's `.agents/project.toml`, the model list in `~/.agent/models`, the
 roles in `~/.agents/agents`, provider settings in `~/.agent/env`, and a
 folder's branch, which is not shown. Swarms stay on this machine: their board
-is the app's files and their agents run the app's scripts, so New swarm is
-disabled on a host. Chat, follow, steer, stop, fork, side chats and delete
+is a folder here and the app runs the swarm skill's script here, so New swarm
+is disabled on a host. Chat, follow, steer, stop, fork, side chats and delete
 work on the host's bots, and a bot made there (`agent run --new --agents` in
 a shell on the host) shows in the window.
 
@@ -739,10 +750,11 @@ daemon learns nothing about projects; everything here is client work.
   own `~/.agents/agents/home.md`) or the one the app ships
   ([home.md](../app/agents/home.md)). The shipped text has it answer what is
   running, what finished and what waits on the person from `agent ls`,
-  `approvals`, `turns` and `wait --timeout-ms 0`, filtered to what the
-  question needs (the agents not at rest, the calls waiting on an approval,
-  one project's agents, the leads, an agent's last turns) so a large
-  fleet stays under the shell's output limit, hand a project's work to its lead with
+  `approvals`, `turns` and `wait --timeout 0`, with the daemon reading only
+  what the question needs (`ls --active`, `approvals --limit 20`,
+  `ls --name 'PROJECT.*'`, `ls --name '*.lead'`,
+  `turns --newest --limit 3`) so a large fleet costs neither the daemon
+  a full listing nor the shell its output limit, hand a project's work to its lead with
   `run --detach --delivery queue`, change no files and start no agents of
   its own. Until it exists, Home says what it is for, and the first message
   sent there opens **Start Home**, a model and an effort as every agent
@@ -873,177 +885,133 @@ daemon learns nothing about projects; everything here is client work.
   turn where the bot is, or where a message moves it. A bot in a
   linked worktree shows its branch after its name in the head, read once
   from the worktree's files when the head is first drawn.
-- **Swarms.** Also the app's opinion; the daemon learns nothing new. A
-  project's ⋯ menu has **New swarm**: a goal, any number of agents up to 64 (typed), a mix, where
-  they work (one worktree they share, `~/.agent/worktrees/PROJECT.NAME` on
-  `agent/PROJECT.NAME` with the folder's `.agents/setup` run in it, or the
-  project folder), and a token budget typed in millions (0.1 to 1,000),
-  split evenly among them, each agent's share shown beside it. The default is
-  **10 million per agent** (40 million for four), scaling with the agent count
-  until the user edits the total. Input is counted again on every call,
-  including cached input. Smaller explicit totals remain allowed. A goal is
-  at most 16 KiB. The swarm is named after the goal's longest telling word
-  among its first six; a name a bot holds (or its agents' names), or whose
-  folder, worktree or branch another swarm or store holds, is skipped for
-  the next, `-2`, `-3` and so on. Setup gets ten minutes and the login
-  shell's ordinary variables (PATH, HOME, USER, LOGNAME, SHELL, LANG, LC_*,
-  TMPDIR, TERM) and no others, so no provider or cloud keys (as do the
-  swarm's git commands, whose hooks run too; this process's own variables
-  stand in only when there is no login shell); past its time
-  its whole process group is killed, and its output is kept only to its
-  last 64 KiB. A failed start removes a worktree and branch only when it
-  made them, never the project folder. The mix is up to eight rows of an identity, a model and a
-  share, the shares adding up to 100%. An identity is a profile in the
-  folder's or the user's `.agents/agents` other than the app's own
-  `coordinator` and `swarm`; picking one picks the model its profile names,
-  when that model is connected. The agents are dealt one at a time, each
-  to the row furthest below its share of the agents so far, so any prefix
-  of them keeps the shares as well as whole agents can (the council's seats
-  mix too), and the sheet shows each row's count, or that a row makes none
-  at that size. Start, Add and Stop are one call each to the app's Rust
-  side, which names the swarm, deals its agents, makes or stops everything
-  and undoes a failed start, so the
-  page only shows the outcome: a swarm whose files or instructions cannot
-  be made, or none of whose agents can be created, is removed with its
-  worktree and branch; an agent that could not be made or briefed beside
-  others that were is reported by name.
-  The swarm is a folder, `~/.agent/swarms/STORE/PROJECT.NAME/`, where
-  STORE is the store identity the daemon announces when a window attaches,
-  so a window sees only its store's swarms, whatever socket reaches it:
-  `swarm.toml` (its project, goal, folder, budget, mix, members with each
-  one's bot id and row of the mix, whether you stopped it, the highest
-  number an agent of it was made under, and the bot ids of members that
-  left; at most
-  1 MiB, never written past it (an Add that would is refused and its agent
-  deleted), read only when every member has an id and a row, changed only
-  under the board's lock, synced, and replaced whole; written last when
-  a swarm is made, so a folder without it is not listed), `board.jsonl` (one
-  line a post or act, appended under a lock and synced, your goal first;
-  each line says how many agents it was `sent` to, so what a
-  swarm's posts cost in deliveries can be read off its board; the line is
-  written before the sends, and a send that failed is in the poster's answer), `state.json` (what the board adds up to: roles, open and approved
-  proposals with their votes (at most 16 open at once, and an approved
-  stream closes when nobody is in it any more), the last 16 denied ones, a
-  count that numbers the next, who is in which stream; a decided proposal's
-  vote reasons stay on the board only). A change to it commits with its lines: the new state
-  is written beside it as `state.pending.json` with the board's length
-  before and after the lines, the lines are appended and synced, and the
-  file then replaces `state.json`; the next act under the lock, or the
-  next read of the board, finishes a change whose lines are all on the board and otherwise cuts the board back
-  to where it was and drops the change. Then scripts that run the app's own
-  executable with `--swarm-post`: `post`, `role`, `assign`, `claim`,
-  `submit`, `review`, `finish`, `leave`, `status`, and with a council
-  `propose`, `vote` and `join` (replaced whole when the app moves). Its agents
-  are ordinary bots named `PROJECT.NAME-N`, each created with its row's
-  model and its share of the budget, and started in the mode's profile:
-  [swarm-flat.md](../app/agents/swarm-flat.md) or
-  [swarm-council.md](../app/agents/swarm-council.md). Each uses the folder's
-  override, then the user's, then the shipped file. An agent with an identity
-  starts in that profile, with the selected mode's text after its own and the
-  identity's tools, which must include `shell` since the board's scripts
-  run in it. Each joins the swarm once created, and then gets a first
-  message naming it, the goal, the others with their identities, the board
-  and its scripts (and, with a council, the seats). A card and a post show
-  an agent's identity, and its model when the swarm has more than one. A post is written to the board, then
-  steered into the agents it reaches over one daemon connection: an
-  ordinary publication does not interrupt anyone. `@NAME` delivers only to
-  named members, waking them if idle. `post --all` explicitly wakes all other
-  members. Your post wakes everyone, or only the agents it names. A post holds
-  the board lock until delivery completes, and Stop holds the same lock, so a
-  post either precedes Stop or is refused afterwards; your post resumes a
-  stopped swarm. A post is at most 16 KiB and comes only from a member, named
-  by its shell's `AGENT_BOT`, `AGENT_BOT_ID` and `AGENT_TURN`; the daemon records
-  it as each steer's author. Every steer pins the member's bot id, so a bot
-  deleted and recreated under a
-  member's name is not a member: a post misses it, and the app keeps it in
-  the sidebar and out of the swarm's cards and counts; a deleted agent
-  leaves its swarm when the app sees it go, taking its share of the budget,
-  its role, its stream, its votes on open proposals and the open proposals
-  it made (the board keeps them all); its helpers still count in the
-  swarm's tokens and Stop still ends them (`swarm.toml` keeps its bot id
-  in `left` until a look at the daemon's list finds nothing it made). A
-  stream it led goes to the first agent left in it (a `lead` line on the
-  board, and that agent is told, never one leaving with it); an agent that
-  moves up into its council seat is named on the board (a `seat` line) and,
-  when proposals are open, told it holds one, with them. A stopped swarm
-  tells neither, and a send that fails is shown. A new agent always takes a
-  number no agent of the swarm had, so a name on the board is only ever
-  one agent's. A swarm is one sidebar row
-  under its project (⁂, working while any agent works); its agents are not
-  in the sidebar. Its view has two tabs: **Board**, read from where the
-  last read ended whenever one of its agents does something durable, and
-  only while it is on screen (more than 256 KiB behind, it reads the
-  board's last 256 KiB instead; lines and state are read together under a
-  shared lock, so they always agree, and a budget check that adds a line
-  reads it too); and **Agents**, their cards, which open
-  beside. The head counts working agents and tokens used against the
-  budget, its helpers' tokens included. Its composer posts to the board.
-  Its ⋯ menu stops every agent and helper
-  (agents first, then the helpers they made, looked for again until a look
-  finds none it has not stopped and no agent given a turn meanwhile; every unfinished turn, queued ones first, of each member that is still
-  the bot that joined; a name now held by another bot leaves instead; and
-  the swarm refuses its agents' posts until your next one the board takes; that post
-  resumes the swarm before it goes on the board, so a failure between leaves it
-  running with nothing new rather than your post on a stopped board)
-  or, unless it is stopped, adds one from the row furthest below its share, told to read the board first,
-  whose share of tokens the swarm's budget grows by. New agents join and
-  get their briefs under the board's lock, so a Stop from another window
-  comes first and they are refused (and deleted), or waits and ends the
-  turns their briefs started. An agent whose brief did not arrive is
-  deleted with its share, the agents briefed with it hear that it left,
-  and a start none of whose briefs arrived starts nothing. A swarm every
-  agent left takes no new one (`swarm_empty`); start another. A swarm's budget is what the agents it made
-  were given: a start where some could not be made has the budget of those
-  that were. Any agent says what it is doing with
-  `role ROLE`, shown on the board and on its card. A helper is a bot an
-  agent made with the CLI (a fork of a peer to ask it something, or of
-  itself for a subtask), named after its maker (`PROJECT.NAME-N.WHAT`) so
-  it sorts in the swarm's range of the daemon's list; one made by a member
-  or by another helper counts in the swarm's tokens and stops with it, and
-  cannot post. The daemon forgets a deleted bot's tokens, so each act that
-  reads its list keeps each helper's tokens in `state.json` (`helpers`), and
-  a helper deleted since counts on (`gone`) with what that look saw it use;
-  what it used after that look is not counted. It keeps where each helper
-  comes from too (`roots`), so a helper whose maker was deleted still
-  counts and still stops, as long as a look saw its maker first; Stop keeps
-  what each of its looks saw, so a Stop tried again after one that failed
-  still finds such a helper. Each act that reads the daemon's list, and a check the page
-  asks for on **usage events during model/tool work**, tell the working agents
-  at 50%, 65% and 80% of their allowances. A check lists the swarm's bots and
-  takes its board lock, so the page asks for one only once the tokens its
-  usage events report (input, cached included, plus output) since the last
-  check reach a twentieth of a member's allowance, or when a turn finishes;
-  each warning lands within five points of its mark. Checks are coalesced
-  over 250 ms with one in flight per swarm, including offscreen swarms and
-  descendants, and a check with nothing to say writes nothing.
-  Both total and individual allowances are checked: idle peers cannot hide
-  a worker running out. Individual notices name exact used/remaining tokens
-  and target the observed running turn; a stale notice cannot wake a finished
-  agent. The role starts reporting at 65% and keeps the final 20% for review
-  and synthesis. This reserve is a work instruction, not a second allowance
-  or a relaxation of the runtime cap. Checks require an attached app or a
-  board operation; `status` also exposes remaining allowances. Checks return
-  `board_changed` when they append an entry, so the open board refreshes for
-  budget and stall notices without extra reads after unchanged checks. A call can
-  cross a threshold before delivery, and the runtime's existing admission
-  check can allow one call to overshoot its token limit.
+- **Swarms.** A skill, not the app's code: [app/skills/swarm](../app/skills/swarm)
+  holds `SKILL.md` (how a coordinator starts, watches and stops one),
+  `member.md` (a member's rules) and `swarm`, a Python 3 script with only the
+  standard library that does everything on a board over the daemon's socket.
+  The daemon learns nothing new, and the app only runs the script and reads
+  a board as a file ([swarm.rs](../app/src-tauri/src/swarm.rs)). A project's
+  ⋯ menu has **New swarm**: a goal, any number of agents up to 64 (typed), a
+  mix, where they work (one worktree they share,
+  `~/.agent/worktrees/PROJECT.NAME` on `agent/PROJECT.NAME` with the folder's
+  `.agents/setup` run in it, or the project folder), and a token budget typed
+  in millions (0.1 to 1,000), split evenly among them, each agent's share
+  shown beside it. The default is **10 million per agent** (40 million for
+  four), scaling with the agent count until the user edits the total. Input
+  is counted again on every call, including cached input. A goal is at most
+  16 KiB. Start, Add, Stop and Post are one run of the script each, with the
+  login shell's ordinary variables (PATH, HOME, USER, LOGNAME, SHELL, LANG,
+  LC_*, TMPDIR, TERM) and no provider or cloud keys; its JSON answer or its
+  `{"error","detail"}` refusal is all the page sees.
+  - **Starting.** The swarm is named after the goal's longest telling word
+    among its first six; a name a bot holds (or its agents' names), or whose
+    folder another swarm holds, is skipped for the next, `-2`, `-3` and so
+    on, nine tries in all. Setup gets ten minutes; past it its whole process
+    group is killed. A failed start removes a worktree and branch only when
+    it made them, never the project folder. The mix is up to eight rows of an
+    identity, a model, an effort and a share, the shares adding up to 100%.
+    An identity is a profile in the folder's or the user's `.agents/agents`
+    other than `coordinator`; picking one picks the model its profile names.
+    The agents are dealt one at a time, each to the row furthest below its
+    share so far, so any prefix of them keeps the shares as well as whole
+    agents can. Its agents are ordinary bots named `PROJECT.NAME-N`, made
+    with `agent run --detach --new` with their row's model, effort and share
+    of the budget, under the board's lock, so no act can reach the swarm
+    before its members are pinned. Each first message is `member.md`, then
+    who it is, the goal, the script's path and commands, the board, and the
+    others with their identities. An agent that could not be made is
+    reported by name and the others hear it is missing; a start none of
+    whose agents could be made leaves nothing.
+  - **The folder.** `~/.agent/swarms/STORE/PROJECT.NAME/`, where STORE is
+    the store identity the daemon announces, so a window sees only its
+    store's swarms: `swarm.json` (project, goal, folder, mix, members pinned
+    by bot id with each one's row, whether it is stopped, the starting
+    coordinator), `board.jsonl` (one line a post or act, your goal first,
+    each saying how many agents it was `sent` to) and `state.json`. The
+    state is a fold of the board (roles, tasks, the result, who works on
+    what, which budget shares were told) kept with the board length it was
+    folded to, so an act folds only what was appended since, and a lost
+    cache is folded again from the start. Every change holds an exclusive
+    `flock` on the board from its first read to its last send: two claims
+    of one task have one winner, and a post either precedes a Stop or is
+    refused after it. Readers take no lock; the script writes whole synced
+    lines and replaces `state.json` whole.
+  - **Posting.** A post is written to the board, then delivered over one
+    daemon connection: `steer` into a running member's turn, a new turn for
+    an idle one, every submit pinning the member's bot id with the poster as
+    its author. An agent's post reaches only the members it names with
+    `@NAME`; `post --all` reaches everyone. Your post reaches the agents it
+    names, or everyone when it has no `@NAME`; one whose names match nobody
+    reaches nobody and its answer lists them as `unmatched`. Your post
+    resumes a stopped swarm. Members act as
+    themselves, by their shell's `AGENT_BOT`, `AGENT_BOT_ID` and
+    `AGENT_TURN`; a bot recreated under a member's name is not a member.
+    Deleting a member's bot takes it, its share of the budget, its helpers
+    and their tokens out of the swarm; there is no leave step for the app.
+    A deleted helper's tokens join its member's sum in `state.json`, so the
+    state grows with live helpers, not every helper there ever was.
+  - **The view.** One sidebar row under its project (⁂, working while any
+    agent works); its agents are not in the sidebar. **Board** is read from
+    where the last read ended whenever one of its agents does something
+    durable, only while it is on screen (more than 256 KiB behind, it reads
+    the last 256 KiB instead); **Work** lists the tasks and the final
+    result; **Agents** shows their cards, which open beside. The head counts
+    working agents and tokens used against the budget, helpers included.
+    Its ⋯ menu stops it (every member's and helper's unfinished turns,
+    newest first, looked for again until none are left) or adds an agent
+    from the row furthest below its share, with its own share of tokens.
+  - **Budget.** The budget is the sum of the live members' caps. A helper
+    is a bot an agent made (`PROJECT.NAME-N.WHAT`), sorting in the swarm's
+    range of the daemon's list; it counts in the swarm's tokens and stops
+    with it. The daemon forgets a deleted bot's tokens, so each look keeps
+    each helper's tokens and the member it works for in `state.json`
+    (`helpers`); a helper deleted since counts on with what that look saw.
+    Each act, and a `check` the page runs on usage events and finished
+    turns, tells working agents when the swarm passes 50%, 65% and 80% of
+    its budget, and each member when it passes those shares of its own.
+    An added agent's `joined` line on the board sets the share passed
+    against the larger budget, so the shares after it are news again.
+    The page asks for a check once the tokens its usage events report since
+    the last reach a twentieth of a member's allowance, or a turn finishes,
+    coalesced over 250 ms with one in flight per swarm; a check that appends
+    a line says `board_changed`, so the open board reads it.
+  - **Cost.** Measured 2026-10-10 on Linux x86_64, before this skill, at
+    main `ec9aeb1`: release builds of `agent` and `agent-app` at that
+    revision, the test suite's synthetic model, five members, and N=40
+    posts per row, each post a fresh process as an agent's shell runs it.
+    The app side is that revision's `agent-app --swarm-post`; the script
+    side is a prototype of this script's post path (lock the board, read
+    the swarm, list bots, append and fsync, send on one socket connection),
+    not the script at this revision. A post reaching nobody took 46.8 ms
+    p50 through the app binary and 45.1 ms through the prototype; a post
+    waking four took 54.5 ms and 47.7 ms. The binary's own floor is its
+    load (42.9 ms); Python 3.9's is 17 ms. The prototype calling the CLI
+    once per recipient took 65.4 ms for four, which is why the script talks
+    to the socket. Memory and macOS were not measured. The harness drives
+    `--swarm-post`, which this skill removed, so it cannot rerun on later
+    revisions; it is kept with the project's notes rather than here.
+  - **Customizing.** Copy the skill folder into `.agents/skills/` under
+    another name and edit the copy; the thresholds sit at the top of
+    `swarm`, the rules in `member.md`. A coordinator using the copy runs
+    its script, but the app's Start, Post, Add, Stop and quiet check run
+    your `~/.agents/skills/swarm/swarm` when there is one, else its own;
+    `swarm.json` does not name a script for the app to run. To change what
+    the app does too, edit that one.
 - **Work and results.** The board is the shared place for deliverable decisions,
   changes of approach, progress and results, all visible in the app. There is
-  no separate planning file. The separately editable `swarm-flat` and
-  `swarm-council` Markdown profiles define how agents derive the deliverable, completion evidence, work split and handoff
+  no separate planning file. The skill's `member.md` defines how agents
+  derive the deliverable, completion evidence, work split and handoff
   owner from the request. It asks for a concise board agreement before work,
   revised through board posts as agents learn. No task-type enum or output
-  template is prescribed. Under the default profiles, the first member posts
+  template is prescribed. Under the shipped rules, the first member posts
   the agreement with every piece's owner and reviewer and registers those
   assignments itself, so peers wake to work already theirs; other members
-  explore briefly and wait for it. Council votes on those assignments assess
-  the agreement with its pieces. These work
-  habits live in the profile, not in generated launch or budget messages.
+  explore briefly and wait for it. These work habits live in `member.md`,
+  not in generated launch or budget messages.
   `assign TASK OWNER REVIEWER BRIEF` is available to every member and records
   distinct work with an independent reviewer. Each owner has at most one
   unfinished task. `claim TASK` checks ownership atomically under the board
-  lock. In council mode each assignment becomes a proposal and the owner
-  cannot claim it until approved. `submit TASK RESULT` preserves evidence,
+  lock. `submit TASK RESULT` preserves evidence,
   leaves the owner's stream and wakes its reviewer. `review TASK
   supported|conditional|rejected EVIDENCE` is accepted only from that reviewer
   and closes the stream. The profile requires checking the actual output
@@ -1066,15 +1034,19 @@ daemon learns nothing about projects; everything here is client work.
   These checks establish authorship and lifecycle, not truth or sufficiency
   of evidence. `leave` releases actual membership; a working task becomes
   assigned again. Members can revise released assignments or recover a
-  departed member's task; council revisions require fresh approval. A
+  departed member's task; a member at its own token cap counts as departed
+  here, and nobody can assign work to it (`member_exhausted`). A
   submitted task whose reviewer departed keeps its result: assigning a new
   reviewer hands it over for review without new work or approval, even if
   its original owner also left. Keep that original owner in the assignment;
-  authorship and the submitted result are preserved. A new
+  authorship and the submitted result are preserved, and naming another
+  owner is refused (`result_submitted`). A finished review wakes the first
+  member that can still take a turn. An added agent's `joined` line is news
+  after quiet, like a member's act. A new
   assignment clears the current final result, retaining its board history.
   A swarm with one member needs another for independent review.
-  The Work/Streams view shows partial results, verdicts and the final outcome.
-  The `status` script is callable by the coordinator or a terminal without
+  The Work view shows partial results, verdicts and the final outcome.
+  `swarm status` is callable by the coordinator or a terminal without
   impersonating a member. Its JSON includes member states,
   remaining budgets, tasks, partial results, `result`, last board activity and
   the top-level `outcome`: `running`, `partial`, `blocked`, `failed`, `stopped`,
@@ -1087,65 +1059,43 @@ daemon learns nothing about projects; everything here is client work.
   is null and task outputs remain available. Finished bot turns alone never
   establish task success. Task constraints remain instructions; no
   write-prevention policy is introduced.
-- **Swarms a coordinator starts.** The app writes `~/.agent/swarms/start`
-  each time it opens, a script that runs the app's executable with
-  `--swarm-start` and no window, as the board's scripts do. It takes
-  `--agents N` (4), `--budget MILLIONS` (an explicit total; otherwise 10 per agent), `--council 3`, `--in-project`
-  (else one shared worktree) and any number of `--row MODEL,SHARE[,IDENTITY]`,
-  then `-- GOAL`; without rows every agent is a plain agent on the
-  coordinator's own model. It runs only in a coordinator's shell (its bot is
-  `PROJECT.lead`, the id its shell names still that bot's), reaches the
-  daemon that shell belongs to, starts the swarm in the coordinator's
-  project and folder through the same Rust start as the sheet, and prints
-  the swarm, its agents' names and its board's path. Without rows its
-  agents get the model of the coordinator's current turn (`AGENT_MODEL`).
-  The start runs in a process group of its own, so a shell that gives up
-  on it (its timeout, or its turn ending) cannot cut it off between making
-  a worktree and undoing it; the role asks for a ten-minute shell timeout.
-  When the goal's name and eight more are all taken it makes nothing. The app's
-  [coordinator.md](../app/agents/coordinator.md) says when and how to run
-  it. A window learns of a swarm it did not start when an agent it does
-  not know, named like an agent (`-N`), takes a turn: it reads the swarms
-  again once for a burst of those, and at most once for each such name.
-  `swarm.toml` keeps the starting coordinator's name and bot id, and the
-  coordinator hears from its swarm by a queued message starting
+- **Swarms a coordinator starts.** The app's
+  [coordinator.md](../app/agents/coordinator.md) says to read the swarm skill
+  listed under Skills and start one the way it says: `swarm start` runs only
+  in a coordinator's shell (its bot is `PROJECT.lead`), reaches the daemon
+  that shell belongs to, starts the swarm in the coordinator's project and
+  folder, and prints the swarm, its agents' names and its board. Without
+  rows its agents get the coordinator's model and effort. The start runs in
+  a session of its own, so a shell that gives up on it cannot cut it off
+  between making a worktree and undoing it; the skill asks for a ten-minute
+  shell timeout. A window learns of a swarm it did not start when an agent
+  it does not know, named like an agent (`-N`), takes a turn: it reads the
+  swarms again once for a burst of those, and at most once for each such
+  name; one named like a known swarm's agent but not yet in it (a
+  coordinator's Add names it after its first turn starts) is read for as a
+  start's unpinned agents are. The coordinator hears from its swarm by a queued message starting
   `[swarm NAME]`, which never interrupts its running turn and names the
-  status script: `finish` sends the final result, and a check that finds
+  status command: `finish` sends the final result, and a check that finds
   nothing running (helpers included) and no final result says so once,
-  again only after something has run since. Only the page's budget checks
-  can find a swarm quiet (an agent acting is running), so a quiet swarm is
-  reported only while the app is attached. A swarm you start from
-  the sheet has no coordinator and tells nobody.
-- **The roles as files.** Settings lists the app's `coordinator`, `swarm-flat` and
-  `swarm-council` roles and whether you have your own file for each. Edit writes
-  `~/.agents/agents/NAME.md` from the app's text only when it is missing
-  (whole beside it, then linked into place),
-  then opens it with `open -t` (`xdg-open` elsewhere). The file is the
-  user's profile of that name, read in every folder that has none of its
-  own. A bot's instructions are fixed when it is made, so an edit applies
-  to coordinators and swarm agents made afterwards, including members added
-  to an existing swarm. Flat and council roles are independent files; neither
-  appends the other mode's instructions.
-- **Swarm councils.** The sheet's "Organized as" picks one board (peer-owned
-  pieces with independent review) or a council of 3, which needs at least three
-  agents; a start that made fewer than three deletes them (naming any it
-  could not) and starts nothing. With a council, the seats are the swarm's
-  first three agents; when a seat is deleted the next agent takes it, and
-  only the votes of the seats as they are now count, still 2 of the
-  council's 3 however many seats are filled. An agent proposes a stream of work with
-  `propose STREAM WHY`, which wakes the other seats; a seat votes with
-  `vote ID yes|no REASON`, once. A majority of the seats (2 of 3) approves or
-  denies; an approved assignment puts its owner in the stream and wakes that
-  owner. A standalone proposal uses its proposer as lead. A denied proposal
-  wakes only the proposer; a denied assignment is withdrawn, freeing its
-  owner for other work, and wakes both its owner and its proposer. You decide any open proposal alone
-  from the **Council** tab. `join STREAM` puts an agent in an approved
-  stream (one at a time). An agent in a stream posts to that stream: the
-  post carries its tag but is silent unless it names a recipient;
-  `post --all` explicitly notifies all peers. Reviewers do not join the task
-  they review. Your untargeted posts reach everyone. The
-  head gains **Council**, with the open count, and **Streams**, the approved
-  ones with their lead and agents and their roles; a tag filters the board.
+  again only after something has run since. Nothing is sent to a member at
+  its token cap (the answer lists it in `missed`), so a post to one wakes
+  nobody and is not news. Only the page's checks can find a swarm quiet (an
+  agent acting is running): the page checks a swarm when its turns end, when
+  it learns a swarm's agents or a change in them, when one is deleted, and
+  once at every attach, so a quiet swarm is reported only while the app is
+  attached. An added agent's brief names as first member the lowest-numbered
+  one with tokens left, itself when none has any. A swarm you start from the sheet has no
+  coordinator and tells nobody.
+- **The role as a file.** Settings lists the app's `coordinator` role and
+  whether you have your own file for it. Edit writes
+  `~/.agents/agents/coordinator.md` from the app's text only when it is
+  missing (whole beside it, then linked into place), then opens it with
+  `open -t` (`xdg-open` elsewhere). The file is the user's profile of that
+  name, read in every folder that has none of its own. A bot's instructions
+  are fixed when it is made, so an edit applies to coordinators made
+  afterwards.
+- **Councils.** Not in the skill yet; a council swarm comes back as a second
+  skill.
 - **Not built yet.** Keep, which turns a side chat into a task, removing a
   deleted task's worktree, deleting a swarm, and approvals are later steps
   of item 47.
@@ -1333,7 +1283,7 @@ first. A name differing from another only in case is refused
 (`name_taken`), since macOS folders would give both one file, and `rm` finds
 a trigger only by the name as stored; `rm` of a name not there is
 `trigger_not_found`. `ls` returns 64 triggers per page, with `next_after`
-for `--after NAME` or the next page in Settings; only the current page's
+for `--after NAME` or the next page in Home's list; only the current page's
 messages are retained. `fire NAME` asks for a fire and returns
 `{"name", "fired": true}`; what the fire did shows in `ls`. An ask is a file
 in the trigger's queue folder, `~/.agent/triggers/NAME.asks`, which its plist
@@ -1372,8 +1322,13 @@ after it is that entry's next year: it sends nothing and ends as `missed`.
 What the fire did (`sent` with the turn and any `reply`, `skipped`, `gone`,
 `missed` or `failed` with why), with the messages sent so far, the agent it
 started and the commit it saw, is kept in `~/.agent/triggers/NAME.json`,
-which Settings shows beside each trigger with its message, a Run now button
-and a Remove button. Triggers are local to this machine. Remote windows
+which a trigger's sheet shows with its message, a Run now button and a
+Remove button. The app reads a page of triggers when the window attaches,
+when an agent's shell call of the trigger script ends, 1.5 s after a
+trigger's message arrives (once however many arrive; the fire writes its
+result after the message is in), and when a sheet opens, which reads that
+trigger by name; after Run now it reads it again until its last fire
+changes. A quiet fleet costs the app no reads. Triggers are local to this machine. Remote windows
 neither list, run nor remove local triggers. Only launchd runs a fire, so
 no two of one trigger ever run at once.
 
@@ -1485,7 +1440,7 @@ changes, and the refresh reads each plist again under it.
 the app starts from a new place, as after an update, it writes its path into
 every trigger and loads it again, on a thread of its own so the window does
 not wait; one launchd refuses keeps its old path and is tried again at the
-next start. Settings lists triggers also when no project exists. Only macOS
+next start. Home lists triggers also when no project exists. Only macOS
 has launchd; elsewhere `add` refuses with `triggers_unsupported`.
 
 Earlier apps called these schedules (`me.lydakis.agent.schedule.NAME`).
@@ -1555,6 +1510,23 @@ for those an agent creates with `agent run --new --agents`, such as a
 coordinator's tasks. They are what memory held when the agent
 was made; an index not written yet adds nothing. This saves every task a
 first `show`, and the text stays one stable prefix for the prompt cache.
+
+The app reads memory too, through `memory_view`
+([memory.rs](../app/src-tauri/src/memory.rs)), and never writes it. Memory,
+at the foot of the list at Home and in a project, opens a sheet of the facts:
+at Home yours and every project's (at most 100 folders, the rest counted),
+in a project its own and yours, each newest first with its name, type,
+source and when it was written; a fact opens in a tab, its front matter as a
+table. A coordinator composes its instructions when it is made, so a fact
+saved later reaches a project's lead as lines after its task update, a
+message it gets anyway: each fact saved or removed in its project's memory
+or yours since this window last told it (or since the window opened), at
+most 20 lines, leaving out facts whose `source` is one of its own turns.
+Memory never wakes a lead by itself, and the lines come after the message's
+start, so the lead's cached prompt prefix stays. A folder that is not all
+facts is left out of that message rather than reported as emptied. Home
+gets no task updates, so it reads memory itself. A window on a host shows no
+Memory: that memory is the host's.
 
 The app ships a `memory` skill ([SKILL.md](../app/skills/memory/SKILL.md))
 that says to use those indexes, or `show` when they are missing or old,
@@ -1953,6 +1925,20 @@ The UI bounds payload buffering, history decoding, and rendered fleet rows:
 
 ## Verified
 
+2026-10-10 swarms as a skill: `tests/test_swarm.py` runs the skill's script
+against a real daemon on Python 3.9 and 3.13: a coordinator's start from its
+shell (members pinned by id, its model and effort, the folder under its
+store), a shared worktree's setup and a failed setup leaving nothing, posts
+reaching who they name, `--all`, a recreated member missed, Stop and the
+person's post resuming, the work lifecycle and `status` folded without
+`state.json`, four claims at once with one winner, the coordinator told once
+when quiet, and Stop ending helpers' turns. Unit tests cover reach, budget
+shares told once, the fold, reviewer replacement, naming and a deleted
+helper's tokens. The page suite (192 tests) covers the sheet, board, Work tab,
+Add and Stop through the script's answers. The sheet, board, Work tab and
+Settings were captured in demo mode in headless Chromium with no page errors.
+The macOS app was not run, so the bundled script was not run from a bundle.
+
 2026-09-29 swarm coordination update: the UI state suite covers budget defaults,
 usage-triggered checks while turns are running, coalescing, partial work and
 review rendering. Rust tests cover exclusive claims, durable partial results,
@@ -2165,7 +2151,7 @@ This measures the ancestry-walk reduction, not an end-to-end fleet capacity clai
 Pulled event batches apply in order, with one visible-history load and render
 per batch. Creation/fork bursts rebuild the fleet tree at most once per pull,
 while retaining the 300-row rail window. The shared client rejects a ready
-handshake unless its protocol is exactly `agent_client::PROTOCOL`, now 11.
+handshake unless its protocol is exactly `agent_client::PROTOCOL`, now 12.
 
 The lifecycle regression suite compares committed thinking/answer transcripts
 between live delivery and replay, reconciles fork snapshot/replay ordering,

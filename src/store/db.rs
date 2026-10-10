@@ -1373,7 +1373,8 @@ impl Database {
             CREATE INDEX IF NOT EXISTS turns_ready ON turns(id) WHERE status='ready';
             CREATE INDEX IF NOT EXISTS turns_ready_bot ON turns(bot) WHERE status='ready';
             CREATE INDEX IF NOT EXISTS processes_running ON processes(turn) WHERE status='running';
-            CREATE INDEX IF NOT EXISTS bots_deleting ON bots(name) WHERE status='deleting';")?;
+            CREATE INDEX IF NOT EXISTS bots_deleting ON bots(name) WHERE status='deleting';
+            CREATE INDEX IF NOT EXISTS bots_running ON bots(name) WHERE running_turn IS NOT NULL;")?;
         if version != Self::SCHEMA {
             tx.pragma_update(None, "user_version", Self::SCHEMA)?;
         }
@@ -1730,19 +1731,50 @@ impl Database {
             .ok_or(Error::new("bot_not_found"))
     }
     /// Bounded keyset pages. Full instructions remain available through inspect.
-    pub fn list(&self, after: Option<&str>, limit: usize) -> Result<Value> {
+    /// A page of bots in name order after `after`. `name` keeps those whose
+    /// name matches a GLOB pattern, which reads only its literal prefix's
+    /// range of the name index; `active` keeps those with a turn running,
+    /// read from an index of only them.
+    pub fn list(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+        name: Option<&str>,
+        active: bool,
+    ) -> Result<Value> {
         if !(1..=256).contains(&limit) || after.is_some_and(|s| s.len() > 128) {
             return fail_with(
                 "invalid_bot_page",
                 "limit must be 1 to 256 and after a name of up to 128 bytes",
             );
         }
-        let mut statement = self.conn.prepare(
+        if name.is_some_and(|pattern| pattern.is_empty() || pattern.len() > 256) {
+            return fail_with(
+                "invalid_bot_filter",
+                "name is a GLOB pattern of 1 to 256 bytes",
+            );
+        }
+        let glob = if name.is_some() {
+            " AND name GLOB ?3"
+        } else {
+            ""
+        };
+        let running = if active {
+            " AND running_turn IS NOT NULL"
+        } else {
+            ""
+        };
+        let mut statement = self.conn.prepare_cached(&format!(
             "SELECT name,head,workspace,status,running_turn,provider,family,model,reasoning,budget_tokens,tokens_used,tools,
                     input_tokens,cached_input_tokens,id,created_by,created_by_id,gates,allowed
-             FROM bots WHERE name > ? ORDER BY name LIMIT ?",
-        )?;
-        let mut rows = statement.query(params![after.unwrap_or(""), (limit + 1) as i64])?;
+             FROM bots WHERE name > ?1{glob}{running} ORDER BY name LIMIT ?2"
+        ))?;
+        let after = after.unwrap_or("");
+        let limit_rows = (limit + 1) as i64;
+        let mut rows = match name {
+            Some(pattern) => statement.query(params![after, limit_rows, pattern])?,
+            None => statement.query(params![after, limit_rows])?,
+        };
         let mut bots = Vec::new();
         let mut bytes = 0;
         let mut more = false;
@@ -6770,15 +6802,26 @@ impl Database {
         )?;
         Ok(())
     }
-    pub fn turns(&self, name: &str, after: i64, limit: usize) -> Result<Value> {
+    /// A page of a bot's turns between `after` and `before`, oldest first
+    /// with `next_after` to continue; with `newest`, newest first from the
+    /// end of the bot's index, with `next_before` to continue.
+    pub fn turns(
+        &self,
+        name: &str,
+        after: i64,
+        before: Option<i64>,
+        limit: usize,
+        newest: bool,
+    ) -> Result<Value> {
         self.inspect(name)?;
-        if after < 0 || !(1..=256).contains(&limit) {
+        if after < 0 || before.is_some_and(|b| b < 1) || !(1..=256).contains(&limit) {
             return fail_with(
                 "invalid_turn_page",
-                "limit must be 1 to 256 and after 0 or more",
+                "limit must be 1 to 256, after 0 or more and before 1 or more",
             );
         }
-        let mut statement = self.conn.prepare(&format!(
+        let order = if newest { "DESC" } else { "ASC" };
+        let mut statement = self.conn.prepare_cached(&format!(
             "SELECT {TURN_VIEW},COALESCE(t.workspace,b.workspace),
                     COALESCE(t.model,b.provider||'/'||b.model),
                     substr(CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END,1,200),
@@ -6786,9 +6829,10 @@ impl Database {
                     t.delivery,COALESCE(t.reasoning,t.inherited_reasoning,b.reasoning),t.summary_ms,
                     t.budget_tokens
              FROM turns t JOIN bots b ON b.name=t.bot LEFT JOIN nodes n ON n.id=t.prompt_node
-             WHERE t.bot=? AND t.id>? ORDER BY t.id LIMIT ?"
+             WHERE t.bot=?1 AND t.id>?2 AND t.id<?3 ORDER BY t.id {order} LIMIT ?4"
         ))?;
-        let mut rows = statement.query(params![name, after, (limit + 1) as i64])?;
+        let before = before.unwrap_or(i64::MAX);
+        let mut rows = statement.query(params![name, after, before, (limit + 1) as i64])?;
         let mut turns = Vec::new();
         let mut more = false;
         while let Some(r) = rows.next()? {
@@ -6818,7 +6862,10 @@ impl Database {
                 .map(|t| t["turn"].clone())
                 .unwrap_or(Value::Null)
         });
-        Ok(json!({"turns":turns,"next_after":next}))
+        Ok(match newest {
+            true => json!({"turns":turns,"next_before":next}),
+            false => json!({"turns":turns,"next_after":next}),
+        })
     }
     /// Own outputs stay a direct indexed lookup. Inherited outputs must have
     /// their tool-result node in the selected branch, never a later source turn.

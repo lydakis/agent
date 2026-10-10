@@ -62,6 +62,13 @@ struct Options {
     fallbacks: bool,
     discover: bool,
     after: i64,
+    /// Listing filters: a GLOB on bot names, bots with a turn running,
+    /// newest first.
+    name: Option<String>,
+    active: bool,
+    newest: bool,
+    /// The most a listing prints.
+    limit: Option<usize>,
     pretty: bool,
     new: bool,
     agents: bool,
@@ -132,6 +139,10 @@ fn parse(args: &[String]) -> Result<Options> {
         fallbacks: false,
         discover: false,
         after: 0,
+        name: None,
+        active: false,
+        newest: false,
+        limit: None,
         pretty: false,
         new: false,
         agents: false,
@@ -183,6 +194,8 @@ fn parse(args: &[String]) -> Result<Options> {
             "--all" => options.all = true,
             "--any" => options.any = true,
             "--full" => options.full = true,
+            "--active" => options.active = true,
+            "--newest" => options.newest = true,
             "--" => options.positional.extend(iter.by_ref().cloned()),
             flag if flag.starts_with("--") => {
                 let value = iter
@@ -215,6 +228,16 @@ fn parse(args: &[String]) -> Result<Options> {
                         )
                     }
                     "--tag" => options.tag = Some(value),
+                    "--name" => options.name = Some(value),
+                    "--limit" => {
+                        options.limit = Some(
+                            value
+                                .parse()
+                                .ok()
+                                .filter(|n| *n > 0)
+                                .ok_or(Error::with("usage", "--limit needs a positive integer"))?,
+                        )
+                    }
                     "--reason" => options.reason = Some(value),
                     "--note" => options.note = Some(PathBuf::from(value)),
                     "--judge-url" => options.judge_url = Some(value),
@@ -1598,11 +1621,13 @@ fn wait(options: &Options) -> Result<i32> {
     Ok(if clean { 0 } else { 1 })
 }
 
-/// Calls waiting for a verdict, paged through completely; JSON array or
-/// one line per call with the command that answers it.
+/// Calls waiting for a verdict, paged through completely or up to
+/// `--limit`; JSON array or one line per call with the command that
+/// answers it.
 fn approvals(options: &Options) -> Result<i32> {
     let mut connection = ensure_existing_daemon(options)?;
     let mut after = json!(0);
+    let mut left = options.limit.unwrap_or(usize::MAX);
     let mut first = true;
     if !options.pretty {
         print!("[");
@@ -1610,12 +1635,13 @@ fn approvals(options: &Options) -> Result<i32> {
     loop {
         let page = connection.request(
             "approvals",
-            json!({"bot":options.bot,"tag":options.tag,"after":after,"limit":256}),
+            json!({"bot":options.bot,"tag":options.tag,"after":after,"limit":left.min(256)}),
         )?;
         let mut calls = page["approvals"]
             .as_array()
             .ok_or(Error::new("daemon_protocol_mismatch"))?
             .clone();
+        left -= calls.len();
         if options.full {
             whole_arguments(&mut connection, &mut calls)?;
         }
@@ -1639,7 +1665,7 @@ fn approvals(options: &Options) -> Result<i32> {
             }
         }
         after = page["next_after"].clone();
-        if after.is_null() {
+        if after.is_null() || left == 0 {
             break;
         }
     }
@@ -1810,7 +1836,8 @@ fn answer(options: &Options) -> Result<i32> {
     Ok(0)
 }
 
-/// A bot's turns, paged through completely; JSON array or a table.
+/// A bot's turns, paged through completely or up to `--limit`, oldest
+/// first or with `--newest` newest first; JSON array or a table.
 fn turns(options: &Options) -> Result<i32> {
     let bot = options
         .bot
@@ -1818,15 +1845,21 @@ fn turns(options: &Options) -> Result<i32> {
         .ok_or(Error::with("usage", "turns needs --bot"))?;
     let mut connection = ensure_existing_daemon(options)?;
     let mut after = json!(options.after);
+    let mut before = Value::Null;
+    let mut left = options.limit.unwrap_or(usize::MAX);
     let mut first = true;
     if !options.pretty {
         print!("[");
     }
     loop {
-        let page = connection.request("turns", json!({"bot":bot,"after":after,"limit":64}))?;
+        let page = connection.request(
+            "turns",
+            json!({"bot":bot,"after":after,"before":before,"limit":left.min(256),"newest":options.newest}),
+        )?;
         let turns = page["turns"]
             .as_array()
             .ok_or(Error::new("daemon_protocol_mismatch"))?;
+        left -= turns.len();
         for turn in turns {
             if options.pretty {
                 println!(
@@ -1855,8 +1888,18 @@ fn turns(options: &Options) -> Result<i32> {
                 first = false;
             }
         }
-        after = page["next_after"].clone();
-        if after.is_null() {
+        let next = if options.newest {
+            &mut before
+        } else {
+            &mut after
+        };
+        *next = page[if options.newest {
+            "next_before"
+        } else {
+            "next_after"
+        }]
+        .clone();
+        if next.is_null() || left == 0 {
             break;
         }
     }
@@ -1866,18 +1909,25 @@ fn turns(options: &Options) -> Result<i32> {
     Ok(0)
 }
 
+/// The bots in name order, filtered by the daemon, paged through
+/// completely or up to `--limit`; JSON array or a table.
 fn list(options: &Options) -> Result<i32> {
     let mut connection = Connection::connect(&options.socket)?;
     let mut after = Value::Null;
+    let mut left = options.limit.unwrap_or(usize::MAX);
     let mut first = true;
     if !options.pretty {
         print!("[");
     }
     loop {
-        let page = connection.request("bots", json!({"after":after,"limit":64}))?;
+        let page = connection.request(
+            "bots",
+            json!({"after":after,"limit":left.min(256),"name":options.name,"active":options.active}),
+        )?;
         let bots = page["bots"]
             .as_array()
             .ok_or(Error::new("daemon_protocol_mismatch"))?;
+        left -= bots.len();
         for bot in bots {
             if options.pretty {
                 println!(
@@ -1897,7 +1947,7 @@ fn list(options: &Options) -> Result<i32> {
             }
         }
         after = page["next_after"].clone();
-        if after.is_null() {
+        if after.is_null() || left == 0 {
             break;
         }
     }
