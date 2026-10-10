@@ -1227,6 +1227,7 @@ fn main() {
             std::thread::spawn(move || {
                 trigger::migrate(&places, None, &trigger::launchctl);
                 trigger::refresh(&places, &app, &trigger::launchctl);
+                trigger::resume(&places, &trigger::launchctl);
             });
         }
     }

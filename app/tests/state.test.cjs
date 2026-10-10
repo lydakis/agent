@@ -2268,7 +2268,22 @@ test('a task turn whose answer a trigger passes to its coordinator is not news f
   p.upsert({ name: 'demo.review', id: 2, status: 'idle', created_by: 'demo.lead', created_by_id: 1 });
   await p.onEvent({ event: 'accepted', bot: 'demo.review', turn: 7, data: { request_id: 'trigger_9-1_2.1790000000.41.to.1', origin: 'trigger' } });
   await p.onEvent({ event: 'turn_finished', bot: 'demo.review', turn: 7, data: { status: 'completed' } });
+  await p.onEvent({ event: 'accepted', bot: 'demo.lead', turn: 3, data: { from: { bot: 'demo.review', turn: 7, id: 2 } } });
+  await p.tick();
   assert.equal(p.S.wakes.get('demo.lead')?.tasks.size ?? 0, 0, 'its answer reaches the coordinator already');
+  // An answer the trigger failed to pass on leaves the turn news after all.
+  await p.onEvent({ event: 'accepted', bot: 'demo.review', turn: 9, data: { request_id: 'trigger_9-1_2.1790000000.43.to.1', origin: 'trigger' } });
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.review', turn: 9, data: { status: 'completed' } });
+  assert.equal(p.S.wakes.get('demo.lead')?.tasks.size ?? 0, 0, 'not before the answer had its time');
+  await p.tick();
+  assert.equal(p.S.wakes.get('demo.lead').tasks.get('demo.review').turn, 9);
+  p.S.wakes.get('demo.lead').tasks.clear();
+  // Held while a snapshot loads, the turn keeps where its answer goes.
+  p.S.snapshot = true;
+  await p.onEvent({ event: 'accepted', bot: 'demo.review', turn: 10, data: { request_id: 'trigger_9-1_2.1790000000.44.to.1', origin: 'trigger' } });
+  await p.onEvent({ event: 'turn_finished', bot: 'demo.review', turn: 10, data: { status: 'completed' } });
+  assert.equal(p.S.heldNews.at(-1)[5], 1);
+  p.S.snapshot = false; p.S.heldNews = [];
   // One whose answer goes elsewhere, or a plain trigger's, still is.
   await p.onEvent({ event: 'accepted', bot: 'demo.review', turn: 8, data: { request_id: 'trigger_9-1_2.1790000000.42.to.9', origin: 'trigger' } });
   await p.onEvent({ event: 'turn_finished', bot: 'demo.review', turn: 8, data: { status: 'completed' } });
