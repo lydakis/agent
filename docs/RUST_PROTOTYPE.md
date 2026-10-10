@@ -293,6 +293,16 @@ Cancellation and failures before a usage report is returned can leave usage
 unaccounted for; these totals are not a reconciliation of provider billing.
 Successful calls retain their single atomic transcript/usage commit; budget
 checks use the turn's running total without an extra database read per round.
+`submit` also accepts `budget_tokens`, a cap on the input plus output tokens
+of the turn it starts, checked where the bot's cap is. A turn past it ends as
+`failed` with `turn_budget_exhausted` and the facts `turn_budget_tokens` and
+`turn_tokens_used`; when both caps are reached the bot's `budget_exhausted`
+is named, since it outlasts the turn. The cap is stored on the turn (`turns`
+lists it as `budget_tokens`), so a resumed turn counts what it spent before
+parking, and a resend naming another cap is an `idempotency_conflict`. A
+steer joins a turn that already has its cap: `budget_tokens` with
+`delivery: "steer"` is `invalid_delivery`. A summary held beside a call
+counts toward both caps.
 
 A turn reads the same wherever a client meets it. Its view is `bot`,
 `bot_id`, `turn`, `handle`, `request_id`, `status`, `waiting_on`,
@@ -307,7 +317,11 @@ outcome once finished; an `interrupt` reply is the view plus
 
 `turns` (protocol) and `agent turns --bot NAME` list a bot's turns as views
 with effective workspace, model and effort, delivery, cache hit, and a
-prompt preview, paged by `after`. A finished turn's outcome comes from `wait` on
+prompt preview, oldest first and paged by `after` (`next_after`). With
+`newest: true` a page runs newest first from the end of the bot's turn index
+and is paged by `before` (`next_before`), so a bot's last few turns cost one
+indexed read however many it has; `after` and `before` bound either direction
+(`agent turns --newest --limit N`). A finished turn's outcome comes from `wait` on
 its handle; `timeout_ms: 0` answers at once, pending while the turn runs. `agent turns`
 restarts an idle daemon using the supplied provider/tool configuration (or
 provider environment defaults), honors `--no-spawn`, and refuses missing stores.
@@ -906,6 +920,8 @@ own path from the turn. Example requests:
 {"id":8,"op":"fork","source":"Bob","checkpoint":2,"bot":"Alternative","request_id":"alt-1"}
 {"id":9,"op":"interrupt","bot":"Bob","turn":1}
 {"id":11,"op":"bots","after":null,"limit":64}
+{"id":22,"op":"bots","after":null,"limit":64,"name":"project.*","active":true}
+{"id":23,"op":"turns","bot":"Bob","newest":true,"limit":3}
 {"id":14,"op":"prune","bot":"Bob","keep_turns":8}
 {"id":15,"op":"delete","bot":"Bob","bot_id":1}
 {"id":16,"op":"follow","bot":"*","after":0}
@@ -1060,6 +1076,13 @@ budget. Pass `next_after` as the next request's `after` until it is null. Pages
 omit instructions; `resume` returns the full individual bot record. Concurrent
 creations before an already-consumed cursor require restarting the listing.
 `agent ls` reads pages incrementally while preserving its JSON-array output.
+Protocol version 12 lets `bots` filter on the daemon side: `name` keeps the
+bots whose name matches a SQLite GLOB pattern (1 to 256 bytes; case-sensitive
+like names), read from the name index's range for the pattern's literal
+prefix, and `active: true` keeps those with a turn running, read from a partial
+index of only them (`bots_running`). Filtered pages page and bound like any
+other. `bots` and `turns` run on the store's reader connection, so a listing
+never waits behind, or holds up, the writer.
 
 Replay tasks are owned by their subscriptions and tracked by the service.
 Replacing a follow on the same bot/session and session closure

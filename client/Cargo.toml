@@ -11,6 +11,8 @@ publish = false
 [dependencies]
 libc = "0.2"
 serde_json = "1"
+# Reads a project's name from `.agents/project.toml`.
+toml = "0.9"
 tokio = { version = "1", features = ["rt", "net", "sync", "io-util", "time"] }
 
 [dev-dependencies]

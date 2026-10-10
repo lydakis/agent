@@ -86,6 +86,40 @@ class AccountingTests(ModelFixture):
         row = client.request('turns', bot='Parked')['result']['turns'][0]
         self.assertEqual((row['input_tokens'], row['output_tokens'], row['model_rounds']), (100, 10, 1))
 
+    def test_a_turns_own_cap_stops_it_before_the_next_call(self):
+        client = self.client('echo,shell,wait')
+        client.request('create', bot='Bob', workspace=str(self.path))
+        submit = lambda key, prompt, **more: client.request(
+            'submit', bot='Bob', request_id=key, prompt=prompt, **more)
+        self.assertEqual(submit('zero', 'hello', budget_tokens=0)['error'], 'invalid_budget')
+        self.assertEqual(submit('huge', 'hello', budget_tokens=2**63)['error'], 'invalid_budget')
+        self.assertEqual(submit('steer', 'hello', budget_tokens=10, delivery='steer')['error'],
+                         'invalid_delivery')
+        # Each synthetic call costs 110 tokens. A turn capped at 110 makes one
+        # call; its tool still runs, and the turn fails before the second.
+        capped = submit('capped', 'tool:x', budget_tokens=110)['result']['turn']
+        end = client.finished(capped)['data']
+        self.assertEqual((end['status'], end['error']), ('failed', 'turn_budget_exhausted'))
+        self.assertEqual((end['turn_budget_tokens'], end['turn_tokens_used']), (110, 110))
+        self.assertEqual(submit('capped', 'tool:x', budget_tokens=220)['error'], 'idempotency_conflict')
+        # The cap is the turn's: the bot's own count is past it, and the next
+        # turn, capped or not, starts from its own zero.
+        self.assertEqual(client.request('resume', bot='Bob')['result']['tokens_used'], 110)
+        for key, more in (('free', {}), ('roomy', {'budget_tokens': 220})):
+            turn = submit(key, 'tool:x', **more)['result']['turn']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        listing = client.request('turns', bot='Bob')['result']['turns']
+        self.assertEqual([t['budget_tokens'] for t in listing], [110, None, 220])
+        self.assertEqual([t['model_rounds'] for t in listing], [1, 2, 2])
+        # A turn that resumes after parking counts what it spent before.
+        parked = submit('park', 'wait:proc:999999', budget_tokens=110)['result']['turn']
+        end = client.finished(parked)['data']
+        self.assertEqual((end['error'], end['turn_tokens_used']), ('turn_budget_exhausted', 110))
+        # Under both caps the bot's own is named: it outlasts the turn.
+        client.request('create', bot='Both', workspace=str(self.path), budget_tokens=110)
+        both = client.request('submit', bot='Both', request_id='1', prompt='tool:x',
+                              budget_tokens=110)['result']['turn']
+        self.assertEqual(client.finished(both)['data']['error'], 'budget_exhausted')
 
     def test_cache_hits_are_recorded_per_turn_per_bot_and_per_daemon(self):
         client = self.client()

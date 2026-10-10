@@ -16,6 +16,7 @@
 
 mod daemon;
 mod files;
+mod git;
 mod memory;
 mod plan;
 mod project;
@@ -313,8 +314,9 @@ fn setup(windows: State<'_, Windows>, window: tauri::WebviewWindow) -> Result<Va
 }
 
 /// The shared client policy for a workspace (the app's own by default),
-/// composed now so an edited AGENTS.md reaches the next bot: preamble,
-/// AGENTS.md files, skills and profiles, and the role `profile` names.
+/// composed now so an edited AGENTS.md or saved memory reaches the next
+/// bot: preamble, AGENTS.md files, skills and profiles, the person's and
+/// the project's memory indexes, and the role `profile` names.
 #[tauri::command]
 fn policy(
     windows: State<'_, Windows>,
@@ -323,7 +325,7 @@ fn policy(
     profile: Option<String>,
 ) -> Result<Value, String> {
     let state = windows.of(&window)?;
-    state.here("Composing an agent's instructions (AGENTS.md, skills, profiles)")?;
+    state.here("Composing an agent's instructions (AGENTS.md, skills, profiles, memory)")?;
     let dir = match workspace.or_else(|| state.config.workspace.clone()) {
         Some(dir) => workspace_path(std::path::Path::new(&dir))?,
         None => return Err("no workspace".into()),
@@ -352,7 +354,7 @@ fn profiles(
     let dir = workspace_path(std::path::Path::new(&dir))?;
     let failed = |error: agent_client::policy::Failure| format!("{}: {error}", error.code());
     let workspace = std::path::Path::new(&dir);
-    let listed = agent_client::policy::instructions(workspace, None).map_err(failed)?;
+    let listed = agent_client::policy::instructions(workspace, None, &[]).map_err(failed)?;
     let mut out = Vec::new();
     // The app's own roles are client roles, which the index leaves out.
     for entry in listed.profiles {
@@ -498,6 +500,90 @@ async fn list_files(
         .await
         .map_err(|e| e.to_string())??;
     Ok(json!({"root": listing.root, "files": listing.files, "more": listing.more}))
+}
+
+/// What the Git tab shows of the repository `dir` is in: its changes, its
+/// last commits and its worktrees. Only this machine's: a window on a host
+/// is refused.
+#[tauri::command]
+async fn git_view(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    dir: String,
+) -> Result<Value, String> {
+    windows.of(&window)?.here("The Git tab")?;
+    let dir = file_path(&dir, std::env::var_os("HOME"))?;
+    let view = blocking(move || git::view(&dir)).await?;
+    let changes: Vec<Value> = view
+        .changes
+        .iter()
+        .map(|c| json!({"code": c.code, "path": c.path, "from": c.from}))
+        .collect();
+    let commits: Vec<Value> = view
+        .commits
+        .iter()
+        .map(|c| json!({"sha": c.sha, "subject": c.subject, "author": c.author, "when": c.when}))
+        .collect();
+    let worktrees: Vec<Value> = view
+        .worktrees
+        .iter()
+        .map(|w| json!({"path": w.path, "branch": w.branch}))
+        .collect();
+    Ok(json!({
+        "root": view.root,
+        "branch": view.branch,
+        "changes": changes,
+        "more": view.more,
+        "commits": commits,
+        "worktrees": worktrees,
+    }))
+}
+
+/// Memory as the Memory sheet and a coordinator's wake show it: the
+/// person's facts, and the project's of the folder `dir` is in, or every
+/// project's with no folder. Only this machine's: a window on a host is
+/// refused.
+#[tauri::command]
+async fn memory_view(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    project: Option<String>,
+) -> Result<Value, String> {
+    windows.of(&window)?.here("Memory")?;
+    if let Some(name) = &project
+        && !project::valid_name(name)
+    {
+        return Err(format!("project_invalid: {name}"));
+    }
+    let home = std::env::var_os("HOME").ok_or("no HOME for ~/.agents/memory")?;
+    let root = std::path::Path::new(&home).join(".agents/memory");
+    blocking(move || Ok(memory::view(&root, project.as_deref()))).await
+}
+
+/// The diff of one change under `root`, or of one commit (`commit`).
+#[tauri::command]
+async fn git_diff(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    root: String,
+    path: Option<String>,
+    from: Option<String>,
+    untracked: Option<bool>,
+    commit: Option<String>,
+) -> Result<Value, String> {
+    windows.of(&window)?.here("The Git tab")?;
+    let root = file_path(&root, std::env::var_os("HOME"))?;
+    let target = match (commit, path) {
+        (Some(sha), _) => git::Target::Commit(sha),
+        (None, Some(path)) => git::Target::Change {
+            path,
+            from,
+            untracked: untracked.unwrap_or(false),
+        },
+        (None, None) => return Err("a path or a commit".to_owned()),
+    };
+    let diff = blocking(move || git::diff(&root, &target)).await?;
+    Ok(json!({"text": diff.text, "cut": diff.cut}))
 }
 
 fn file_path(path: &str, home: Option<std::ffi::OsString>) -> Result<std::path::PathBuf, String> {
@@ -825,12 +911,15 @@ fn compose(
             .collect::<Vec<_>>()
             .join("\n\n");
     }
-    let composed = agent_client::policy::instructions(workspace, role.as_ref()).map_err(failed)?;
+    let memory = agent_client::policy::memory_indexes(workspace).map_err(failed)?;
+    let composed =
+        agent_client::policy::instructions(workspace, role.as_ref(), &memory).map_err(failed)?;
     let mut note = format!(
-        "preamble + {} AGENTS.md + {} skills + {} profiles",
+        "preamble + {} AGENTS.md + {} skills + {} profiles + {} memory indexes",
         composed.sources.len(),
         composed.skills.len(),
-        composed.profiles.len()
+        composed.profiles.len(),
+        composed.memory.len()
     );
     if let Some(role) = &role {
         let from = role.path.as_ref().map_or_else(
@@ -1500,6 +1589,9 @@ fn main() {
             open_link,
             read_file,
             list_files,
+            git_view,
+            git_diff,
+            memory_view,
             branch,
             models,
             project,

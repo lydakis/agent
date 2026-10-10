@@ -4,7 +4,7 @@ use agent_runtime::{
     provider::{ToolCall, Usage},
     store::{
         Answered, Binding, Bot, CacheTtl, CompactionPlan, ContextUsage, Database, Decision,
-        Delivery, Fork, Gate, Gated, Planning, Settings, Strip, TurnOptions, Wake,
+        Delivery, Fork, Gate, Gated, Planning, Settings, Strip, TurnBudget, TurnOptions, Wake,
     },
     tools::Outcome,
 };
@@ -158,6 +158,7 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
         expected_turn: None,
         from: None,
         origin: None,
+        budget_tokens: None,
     };
     let alt = db
         .begin("Alternative", "r1", "different", true, &branch, |_, _| {
@@ -1840,7 +1841,7 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
     // The steer named no folder, so it records the one its turn ran in,
     // which a later move does not rewrite.
     let row = |db: &Database, id: i64| {
-        db.turns("Carol", 0, 10).unwrap()["turns"]
+        db.turns("Carol", 0, None, 10, false).unwrap()["turns"]
             .as_array()
             .unwrap()
             .iter()
@@ -2154,7 +2155,7 @@ fn schema_39_records_the_folder_each_earlier_turn_ran_in() {
         .unwrap();
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     // The steer ran with the folder and model of the turn it joined.
-    let listed = db.turns("Dan", 0, 10).unwrap();
+    let listed = db.turns("Dan", 0, None, 10, false).unwrap();
     let row = listed["turns"]
         .as_array()
         .unwrap()
@@ -2172,7 +2173,7 @@ fn schema_39_records_the_folder_each_earlier_turn_ran_in() {
     };
     db.begin("Bob", "r-move", "later", true, &moving, allow_provider)
         .unwrap();
-    let listed = db.turns("Bob", 0, 10).unwrap();
+    let listed = db.turns("Bob", 0, None, 10, false).unwrap();
     let row = listed["turns"]
         .as_array()
         .unwrap()
@@ -2307,11 +2308,11 @@ fn schema_41_turns_ran_at_their_bots_effort() {
         .unwrap();
     let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     assert_eq!(
-        db.turns("Bob", 0, 10).unwrap()["turns"][0]["effort"],
+        db.turns("Bob", 0, None, 10, false).unwrap()["turns"][0]["effort"],
         "medium"
     );
     assert_eq!(
-        db.turns("Bob", 0, 10).unwrap()["turns"][1]["effort"],
+        db.turns("Bob", 0, None, 10, false).unwrap()["turns"][1]["effort"],
         "medium"
     );
     drop(db);
@@ -2346,11 +2347,14 @@ fn schema_44_turns_report_no_summary_time_and_count_it_after() {
         .execute_batch("ALTER TABLE turns DROP COLUMN summary_ms; PRAGMA user_version=44;")
         .unwrap();
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
-    assert_eq!(db.turns("Bob", 0, 10).unwrap()["turns"][0]["summary_ms"], 0);
+    assert_eq!(
+        db.turns("Bob", 0, None, 10, false).unwrap()["turns"][0]["summary_ms"],
+        0
+    );
     db.note_pacing(turn, 0, 0, 1200).unwrap();
     db.note_pacing(turn, 0, 0, 300).unwrap();
     assert_eq!(
-        db.turns("Bob", 0, 10).unwrap()["turns"][0]["summary_ms"],
+        db.turns("Bob", 0, None, 10, false).unwrap()["turns"][0]["summary_ms"],
         1500
     );
     drop(db);
@@ -2492,7 +2496,7 @@ fn schema_42_backfills_absorbed_effort_or_rolls_back_when_history_is_missing() {
             assert!(!conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='inherited_reasoning')", [], |r| r.get::<_, bool>(0)).unwrap());
         } else {
             let db = opened.unwrap();
-            let listed = db.turns("Bob", 0, 10).unwrap();
+            let listed = db.turns("Bob", 0, None, 10, false).unwrap();
             let levels: Vec<_> = listed["turns"]
                 .as_array()
                 .unwrap()
@@ -2981,7 +2985,7 @@ fn a_turn_runs_at_its_own_effort_or_its_bots() {
         )
         .unwrap();
     assert_eq!(plain.entry.unwrap()["data"]["effort"], "high");
-    let listed = db.turns("Bob", 0, 10).unwrap();
+    let listed = db.turns("Bob", 0, None, 10, false).unwrap();
     let levels: Vec<&Value> = listed["turns"]
         .as_array()
         .unwrap()
@@ -3042,7 +3046,10 @@ fn absorbed_effort_does_not_change_the_submitted_request() {
             db.finish(running, None).unwrap();
             // Both the inline and shared-prompt paths report the effective effort,
             // but retries still compare the original omission or explicit level.
-            assert_eq!(db.turns("Bob", 0, 10).unwrap()["turns"][1]["effort"], "low");
+            assert_eq!(
+                db.turns("Bob", 0, None, 10, false).unwrap()["turns"][1]["effort"],
+                "low"
+            );
             let retry = db
                 .begin("Bob", "steer", &prompt, true, &options, allow_provider)
                 .unwrap();
@@ -3122,6 +3129,7 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
         expected_turn: None,
         from: None,
         origin: None,
+        budget_tokens: None,
     };
     let started = db
         .begin("Bob", "r1", "work", true, &options, allow_provider)
@@ -3250,6 +3258,7 @@ fn a_bot_without_a_default_workspace_needs_one_per_submission() {
         expected_turn: None,
         from: None,
         origin: None,
+        budget_tokens: None,
     };
     let turn = db
         .begin("Nomad", "r1", "work", true, &options, allow_provider)
@@ -3269,15 +3278,136 @@ fn bot_pages_obey_byte_budget_without_loading_instructions() {
         db.create(&format!("bot-{n:03}"), Some(&workspace), config)
             .unwrap();
     }
-    let page = db.list(None, 256).unwrap();
+    let page = db.list(None, 256, None, false).unwrap();
     let bots = page["bots"].as_array().unwrap();
     assert!(!bots.is_empty() && bots.len() < 140);
     assert!(serde_json::to_vec(&page).unwrap().len() < 524288);
     assert!(bots.iter().all(|b| b.get("instructions").is_none()));
-    let rest = db.list(page["next_after"].as_str(), 256).unwrap();
+    let rest = db
+        .list(page["next_after"].as_str(), 256, None, false)
+        .unwrap();
     assert_eq!(bots.len() + rest["bots"].as_array().unwrap().len(), 140);
     assert!(rest["next_after"].is_null());
     assert_eq!(db.inspect("bot-000").unwrap().instructions, instructions);
+}
+
+#[test]
+fn bot_pages_filter_by_name_pattern_and_activity() {
+    let mut db = db();
+    for name in [
+        "alpha.lead",
+        "alpha.worker",
+        "beta.lead",
+        "beta.worker",
+        "home",
+    ] {
+        db.create(name, Some("/synthetic"), binding()).unwrap();
+    }
+    for name in ["alpha.worker", "beta.lead"] {
+        db.begin(
+            name,
+            "r1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap();
+    }
+    let names = |page: Value| -> Vec<String> {
+        page["bots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(
+        names(db.list(None, 64, Some("alpha.*"), false).unwrap()),
+        ["alpha.lead", "alpha.worker"]
+    );
+    assert_eq!(
+        names(db.list(None, 64, Some("*.lead"), false).unwrap()),
+        ["alpha.lead", "beta.lead"]
+    );
+    assert_eq!(
+        names(db.list(None, 64, None, true).unwrap()),
+        ["alpha.worker", "beta.lead"]
+    );
+    assert_eq!(
+        names(db.list(None, 64, Some("beta.*"), true).unwrap()),
+        ["beta.lead"]
+    );
+    // Filtered pages continue from their cursor like any other.
+    let page = db.list(None, 1, Some("*.lead"), false).unwrap();
+    assert_eq!(page["next_after"], "alpha.lead");
+    let rest = db
+        .list(page["next_after"].as_str(), 1, Some("*.lead"), false)
+        .unwrap();
+    assert_eq!(names(rest.clone()), ["beta.lead"]);
+    assert!(rest["next_after"].is_null());
+    // GLOB is case-sensitive, like names.
+    assert!(names(db.list(None, 64, Some("ALPHA.*"), false).unwrap()).is_empty());
+    for bad in ["", &"*".repeat(257)] {
+        assert_eq!(
+            db.list(None, 64, Some(bad), false).unwrap_err().code,
+            "invalid_bot_filter"
+        );
+    }
+    // The active filter reads its own index, not every bot.
+    let path = std::env::temp_dir().join(format!("agent-active-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    drop(Database::initialize(Connection::open(&path).unwrap()).unwrap());
+    let plan: String = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "EXPLAIN QUERY PLAN SELECT name FROM bots WHERE name > ?1 AND running_turn IS NOT NULL ORDER BY name LIMIT 2",
+            [""],
+            |r| r.get(3),
+        )
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(plan.contains("bots_running"), "{plan}");
+}
+
+#[test]
+fn turn_pages_read_newest_first_from_the_end() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    for n in 1..=5 {
+        converse(&mut db, "Bob", n);
+    }
+    let ids = |page: &Value| -> Vec<i64> {
+        page["turns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["turn"].as_i64().unwrap())
+            .collect()
+    };
+    let all = ids(&db.turns("Bob", 0, None, 64, false).unwrap());
+    let newest = db.turns("Bob", 0, None, 2, true).unwrap();
+    assert_eq!(ids(&newest), [all[4], all[3]]);
+    assert_eq!(newest["next_before"], all[3]);
+    assert!(newest.get("next_after").is_none());
+    let older = db
+        .turns("Bob", 0, newest["next_before"].as_i64(), 2, true)
+        .unwrap();
+    assert_eq!(ids(&older), [all[2], all[1]]);
+    let last = db
+        .turns("Bob", 0, older["next_before"].as_i64(), 2, true)
+        .unwrap();
+    assert_eq!(ids(&last), [all[0]]);
+    assert!(last["next_before"].is_null());
+    // `after` and `before` bound either direction.
+    assert_eq!(
+        ids(&db.turns("Bob", all[0], Some(all[4]), 64, false).unwrap()),
+        &all[1..4]
+    );
+    assert_eq!(
+        db.turns("Bob", 0, Some(0), 2, true).unwrap_err().code,
+        "invalid_turn_page"
+    );
 }
 
 #[test]
@@ -3340,7 +3470,7 @@ fn budgets_count_tokens_and_turn_listings_carry_accounting() {
         .code,
         "budget_exhausted"
     );
-    let page = db.turns("Bob", 0, 1).unwrap();
+    let page = db.turns("Bob", 0, None, 1, false).unwrap();
     let first = &page["turns"][0];
     assert_eq!(
         (
@@ -3353,7 +3483,7 @@ fn budgets_count_tokens_and_turn_listings_carry_accounting() {
     assert_eq!(first["status"], "completed");
     assert!(first["started_ms"].as_i64().unwrap() <= first["finished_ms"].as_i64().unwrap());
     assert_eq!(page["next_after"], turn);
-    let rest = db.turns("Bob", turn, 64).unwrap();
+    let rest = db.turns("Bob", turn, None, 64, false).unwrap();
     assert_eq!(rest["turns"].as_array().unwrap().len(), 1);
     assert!(rest["next_after"].is_null());
 }
@@ -3582,7 +3712,7 @@ fn creation_and_fork_reject_incomplete_deleted_and_reused_creator_identities() {
             (Some("Creator"), None, "creator_identity_required"),
             (None, Some(creator.bot_id), "creator_identity_required"),
         ] {
-            let before = db.list(None, 64).unwrap();
+            let before = db.list(None, 64, None, false).unwrap();
             let mut b = binding();
             b.created_by = name;
             b.created_by_id = id;
@@ -3604,7 +3734,7 @@ fn creation_and_fork_reject_incomplete_deleted_and_reused_creator_identities() {
                 .code,
                 code
             );
-            assert_eq!(db.list(None, 64).unwrap(), before);
+            assert_eq!(db.list(None, 64, None, false).unwrap(), before);
         }
         if !reused {
             db.create("Creator", Some("/synthetic"), binding()).unwrap();
@@ -3631,7 +3761,7 @@ fn lineage_pins_the_creator_identity_so_a_reused_name_is_a_stranger() {
         Some(first_a.bot_id),
         "B still names the A that made it"
     );
-    let page = db.list(None, 64).unwrap();
+    let page = db.list(None, 64, None, false).unwrap();
     let listed = page["bots"].as_array().unwrap();
     let b_row = listed.iter().find(|r| r["name"] == "B").unwrap();
     assert_eq!(b_row["created_by_id"], first_a.bot_id);
@@ -3790,7 +3920,7 @@ fn forks_keep_the_binding_and_instructions_and_record_a_creator() {
     );
     assert_eq!(db.inspect("Bob").unwrap().instructions, "first text");
     // Listing carries the creator; a fork keeps the model and tools.
-    let page = db.list(None, 64).unwrap();
+    let page = db.list(None, 64, None, false).unwrap();
     let listed: Vec<(&str, Option<&str>)> = page["bots"]
         .as_array()
         .unwrap()
@@ -3896,6 +4026,7 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
                 expected_turn: None,
                 from: None,
                 origin: None,
+                budget_tokens: None,
             },
             allow_provider,
         )
@@ -4972,7 +5103,7 @@ fn pruning_keeps_the_transcript_and_marks_the_replay_gap() {
             .contains("p1")
     );
     assert_eq!(
-        db.turns("Bob", 0, 64).unwrap()["turns"]
+        db.turns("Bob", 0, None, 64, false).unwrap()["turns"]
             .as_array()
             .unwrap()
             .len(),
@@ -4994,7 +5125,7 @@ fn turn_identity_migrates_above_fork_retained_history() {
         db.create("Bob", Some("/synthetic"), binding()).unwrap();
         converse(&mut db, "Bob", 1);
         converse(&mut db, "Bob", 2);
-        last = db.turns("Bob", 0, 64).unwrap()["turns"][1]["turn"]
+        last = db.turns("Bob", 0, None, 64, false).unwrap()["turns"][1]["turn"]
             .as_i64()
             .unwrap();
         db.fork(
@@ -5735,7 +5866,7 @@ fn steers_preserve_explicit_overrides_and_do_not_overtake_a_deferred_steer() {
         inherited
     );
     // The steer named neither, so it records the model and folder it ran with.
-    let listed = db.turns("Bob", 0, 10).unwrap();
+    let listed = db.turns("Bob", 0, None, 10, false).unwrap();
     let row = listed["turns"]
         .as_array()
         .unwrap()
@@ -5966,7 +6097,7 @@ fn strict_steers_are_for_one_running_turn_or_nobody() {
         "stale_turn"
     );
     assert_eq!(
-        db.turns("Bob", 0, 10).unwrap()["turns"]
+        db.turns("Bob", 0, None, 10, false).unwrap()["turns"]
             .as_array()
             .unwrap()
             .len(),
@@ -6099,7 +6230,7 @@ fn cached_input_tokens_are_kept_per_turn_and_per_bot_with_their_ratio() {
     db.append(turn, vec![assistant("two")], &[], Some(&warm))
         .unwrap();
     db.finish(turn, None).unwrap();
-    let listed = db.turns("Bob", 0, 10).unwrap();
+    let listed = db.turns("Bob", 0, None, 10, false).unwrap();
     let row = &listed["turns"][0];
     assert_eq!(
         (
@@ -6115,7 +6246,7 @@ fn cached_input_tokens_are_kept_per_turn_and_per_bot_with_their_ratio() {
         (400, 240, 0.6)
     );
     assert_eq!(bot.tokens_used, 420);
-    let page = db.list(None, 10).unwrap();
+    let page = db.list(None, 10, None, false).unwrap();
     assert_eq!(page["bots"][0]["cache_hit"], 0.6);
     assert_eq!(agent_runtime::store::cache_hit(0, 0), 0.0);
     assert_eq!(agent_runtime::store::cache_hit(1, 3), 0.333);
@@ -6253,7 +6384,7 @@ fn cache_migration_rebuilds_retained_usage_or_rolls_back_when_pruned() {
                 (500, 280, 530)
             );
             assert_eq!(bot.cache_hit, 0.56);
-            let turns = db.turns("Bob", 0, 10).unwrap();
+            let turns = db.turns("Bob", 0, None, 10, false).unwrap();
             assert_eq!(turns["turns"][0]["cached_input_tokens"], 240);
             assert_eq!(turns["turns"][1]["cached_input_tokens"], 40);
             let fork = db.inspect("Fork").unwrap();
@@ -6365,6 +6496,100 @@ fn schema_46_settings_keep_turns_as_prune_names_it() {
 }
 
 #[test]
+fn schema_47_turns_take_their_own_token_cap() {
+    let path = std::env::temp_dir().join(format!("agent-schema47-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let usage = |input_tokens, output_tokens| Usage {
+        input_tokens,
+        output_tokens,
+        cached_input_tokens: 0,
+        cache_write_tokens: 0,
+        cache_write_1h_tokens: 0,
+        sent_ms: 0,
+        models: Vec::new(),
+        served_model: String::new(),
+    };
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        let turn = db
+            .begin(
+                "Bob",
+                "r1",
+                "p1",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        db.append(turn, vec![assistant("one")], &[], Some(&usage(100, 20)))
+            .unwrap();
+        db.finish(turn, None).unwrap();
+    }
+    // Before 48 no turn had a cap of its own.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE turns DROP COLUMN budget_tokens; PRAGMA user_version=47;")
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let capped = TurnOptions {
+        budget_tokens: Some(300),
+        ..TurnOptions::default()
+    };
+    let turn = db
+        .begin("Bob", "r2", "p2", true, &capped, allow_provider)
+        .unwrap()
+        .turn;
+    // The cap counts from the bot's total when the turn began, however much
+    // of it the turn has already spent when its engine reloads it.
+    let check = |db: &Database| {
+        let mut bot = db.inspect("Bob").unwrap();
+        bot.turn_budget = db.context(turn).unwrap().budget;
+        bot
+    };
+    db.append(turn, vec![assistant("two")], &[], Some(&usage(100, 20)))
+        .unwrap();
+    let bot = check(&db);
+    let cap = TurnBudget {
+        tokens: 300,
+        until: 420,
+    };
+    assert_eq!((bot.turn_budget, bot.ceiling()), (Some(cap), Some(420)));
+    assert!(bot.exhausted().is_none());
+    db.append(turn, vec![assistant("three")], &[], Some(&usage(180, 20)))
+        .unwrap();
+    let error = check(&db).exhausted().unwrap();
+    assert_eq!(error.code, "turn_budget_exhausted");
+    assert_eq!(
+        error.facts.map(|facts| Value::Object(*facts)),
+        Some(json!({"turn_budget_tokens":300,"turn_tokens_used":320}))
+    );
+    db.finish(turn, None).unwrap();
+    // A resend names the same cap; the earlier turn reports none.
+    let other = TurnOptions {
+        budget_tokens: Some(200),
+        ..TurnOptions::default()
+    };
+    assert_eq!(
+        db.begin("Bob", "r2", "p2", true, &other, allow_provider)
+            .unwrap_err()
+            .code,
+        "idempotency_conflict"
+    );
+    let page = db.turns("Bob", 0, None, 256, false).unwrap();
+    let caps: Vec<_> = page["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["budget_tokens"].clone())
+        .collect();
+    assert_eq!(caps, [Value::Null, json!(300)]);
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn bot_identities_are_assigned_in_creation_order_and_never_reused() {
     let path = std::env::temp_dir().join(format!("agent-identity-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
@@ -6436,7 +6661,10 @@ fn bot_identities_are_assigned_in_creation_order_and_never_reused() {
     {
         let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
         assert_eq!(db.inspect("New").unwrap().bot_id, 3);
-        assert_eq!(db.list(None, 8).unwrap()["bots"][0]["bot_id"], 1);
+        assert_eq!(
+            db.list(None, 8, None, false).unwrap()["bots"][0]["bot_id"],
+            1
+        );
     }
     std::fs::remove_file(path).unwrap();
 }
@@ -10132,7 +10360,7 @@ fn a_fork_narrows_what_it_may_call_and_never_widens() {
         .collect();
     assert_eq!(announced.len(), 1);
     assert_eq!(announced[0]["name"], "read");
-    let listed = db.list(None, 16).unwrap();
+    let listed = db.list(None, 16, None, false).unwrap();
     let reader = listed["bots"]
         .as_array()
         .unwrap()

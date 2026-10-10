@@ -83,7 +83,9 @@ watching such a source, tell the person, and say that isolation, such as a
 separate macOS user or a virtual machine, has to come from outside Agent.
 
 Its `--budget-tokens` is a lifetime cap, so size it for many runs. When the
-cap is reached its turns fail with `budget_exhausted`.
+cap is reached its turns fail with `budget_exhausted`. A trigger's
+`--turn-budget-tokens N` caps each run on its own, and a run past it fails
+with `turn_budget_exhausted`.
 
 ## Each run
 

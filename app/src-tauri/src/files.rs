@@ -21,33 +21,12 @@ pub struct Listing {
 }
 
 pub fn list(dir: &Path) -> Result<Listing, String> {
-    // The top named from `dir` where that reaches it (`--show-cdup`), so a
-    // path found is spelled as the agent's folder is, through a symlinked
-    // folder, and matches the paths its steps write; else git's own top.
-    let up = git(dir)
-        .args(["rev-parse", "--show-toplevel", "--show-cdup"])
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|e| format!("git: {e}"))?;
-    if !up.status.success() {
-        return Err(format!(
+    let root = top(dir).map_err(|_| {
+        format!(
             "{}: not in a git repository; ⌘P lists a repository's files",
             dir.display()
-        ));
-    }
-    let up = String::from_utf8_lossy(&up.stdout);
-    let mut lines = up.lines();
-    let real = lines.next().unwrap_or_default().to_owned();
-    let mut top = dir.to_path_buf();
-    for _ in lines.next().unwrap_or_default().matches("../") {
-        top.pop();
-    }
-    let same = std::fs::canonicalize(&top).ok() == std::fs::canonicalize(&real).ok();
-    let root = if same {
-        top.to_string_lossy().into_owned()
-    } else {
-        real
-    };
+        )
+    })?;
     // A tracked file deleted from the folder but not yet from the index
     // would open as "no such file", so it is left out.
     let deleted = answer(&root, &["ls-files", "-z", "--deleted"])?;
@@ -122,6 +101,34 @@ fn openable(record: &[u8]) -> Option<&[u8]> {
     (record.starts_with(b"100") || record.starts_with(b"120")).then(|| &record[tab + 1..])
 }
 
+/// The top folder of the repository `dir` is in. It is named from `dir`
+/// where that reaches it (`--show-cdup`), so a path under it is spelled as
+/// the agent's folder is, through a symlinked folder, and matches the paths
+/// its steps write; else it is git's own top.
+pub fn top(dir: &Path) -> Result<String, String> {
+    let up = git(dir)
+        .args(["rev-parse", "--show-toplevel", "--show-cdup"])
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|e| format!("git: {e}"))?;
+    if !up.status.success() {
+        return Err(format!("{}: not in a git repository", dir.display()));
+    }
+    let up = String::from_utf8_lossy(&up.stdout);
+    let mut lines = up.lines();
+    let real = lines.next().unwrap_or_default().to_owned();
+    let mut top = dir.to_path_buf();
+    for _ in lines.next().unwrap_or_default().matches("../") {
+        top.pop();
+    }
+    let same = std::fs::canonicalize(&top).ok() == std::fs::canonicalize(&real).ok();
+    Ok(if same {
+        top.to_string_lossy().into_owned()
+    } else {
+        real
+    })
+}
+
 /// What git prints.
 fn answer(root: &str, args: &[&str]) -> Result<Vec<u8>, String> {
     let out = git(Path::new(root))
@@ -134,7 +141,7 @@ fn answer(root: &str, args: &[&str]) -> Result<Vec<u8>, String> {
 
 /// git about `dir` alone: a `GIT_DIR` and the like from the app's own
 /// environment would name another repository.
-fn git(dir: &Path) -> Command {
+pub fn git(dir: &Path) -> Command {
     let mut command = Command::new("git");
     for key in [
         "GIT_DIR",

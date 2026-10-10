@@ -57,6 +57,42 @@ trades it for the agents), and Enter opens the pick in a tab.
 ![The finder's files](app/file-find.png)
 ![session.rs in a tab, highlighted](app/file-code-tab.png)
 
+### Git
+
+Captured 2026-10-10. An agent's ⎇ branch, or Git in its ⋯ menu, opens its
+folder's Git tab: changes, commits and worktrees on the left, the chosen diff
+on the right.
+
+![build's worktree: three changes, session.rs's diff](app/git-changes.png)
+
+A click on a diff line writes a note; Enter sends it to the agent working
+there, which reads the file, line and quoted text first.
+
+![A note on an added line of mod.rs, going to build](app/git-note.png)
+![The note in build's chat, and its answer](app/git-agent.png)
+
+2 shows a commit's diff, file by file.
+
+![The worktree's newest commit](app/git-commit.png)
+
+### Memory
+
+Captured 2026-10-10. Memory, at the foot of the list at Home and in a
+project, shows what agents saved: yours and every project's at Home, newest
+first.
+
+![Memory at Home: yours, demo's and notes'](app/memory-home.png)
+
+In a project, its own facts come first. A fact opens in a tab, its front
+matter as a table.
+
+![demo's memory](app/memory-project.png)
+![A fact in a tab](app/memory-fact.png)
+
+A task update tells the lead what a task saved since it last heard.
+
+![demo's lead told that plan saved session-cookie](app/memory-wake.png)
+
 ### Home
 
 Captured 2026-10-10. The first message sent at Home asks for the model and
@@ -729,10 +765,11 @@ daemon learns nothing about projects; everything here is client work.
   own `~/.agents/agents/home.md`) or the one the app ships
   ([home.md](../app/agents/home.md)). The shipped text has it answer what is
   running, what finished and what waits on the person from `agent ls`,
-  `approvals`, `turns` and `wait --timeout-ms 0`, filtered to what the
-  question needs (the agents not at rest, the calls waiting on an approval,
-  one project's agents, the leads, an agent's last turns) so a large
-  fleet stays under the shell's output limit, hand a project's work to its lead with
+  `approvals`, `turns` and `wait --timeout 0`, with the daemon reading only
+  what the question needs (`ls --active`, `approvals --limit 20`,
+  `ls --name 'PROJECT.*'`, `ls --name '*.lead'`,
+  `turns --newest --limit 3`) so a large fleet costs neither the daemon
+  a full listing nor the shell its output limit, hand a project's work to its lead with
   `run --detach --delivery queue`, change no files and start no agents of
   its own. Until it exists, Home says what it is for, and the first message
   sent there opens **Start Home**, a model and an effort as every agent
@@ -1213,7 +1250,7 @@ The app writes `~/.agent/trigger` each time it opens, a script that runs its
 executable with `--trigger`:
 
 ```sh
-~/.agent/trigger add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] -- MESSAGE
+~/.agent/trigger add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--turn-budget-tokens N] -- MESSAGE
   WHEN: --every 30m | --in 45m | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO | --turn-end BOT [--count N]
 ~/.agent/trigger ls [--after NAME]
 ~/.agent/trigger fire NAME
@@ -1299,7 +1336,10 @@ was seen, so a heartbeat whose check finds
 nothing to do costs one process and no model call. A one-off whose check
 says no ends, listed as not sent.
 `--runs N` ends the trigger once N messages went out; a fire after that
-(its end could not unload it) only tries to end it again. Each message the
+(its end could not unload it) only tries to end it again.
+`--turn-budget-tokens N` submits each message with that turn cap, so one
+runaway fire fails with `turn_budget_exhausted` instead of spending the
+agent's whole lifetime budget. Each message the
 agent gets starts with one line, `[trigger NAME · YYYY-MM-DD HH:MM · why]`,
 the local fire time and what fired it (its time, `file PATH`, `commit REPO
 at SHA`, `turn end of BOT: turn:BOT/N completed`, or `fired`), so a
@@ -1537,9 +1577,36 @@ and refuses with `memory_full` an index of hand-added facts past 4 KiB. A
 removal reads the folder before deleting anything, and text piped on stdin
 past 4 KiB is `fact_too_large` rather than cut.
 
+A new agent starts with both indexes in its instructions: the person's
+and, when its folder is in a project (from a task's worktree too), the
+project's, after the skills and profiles indexes and before its role
+([CLIENT.md](CLIENT.md#layers)). That holds for agents the app creates and
+for those an agent creates with `agent run --new --agents`, such as a
+coordinator's tasks. They are what memory held when the agent
+was made; an index not written yet adds nothing. This saves every task a
+first `show`, and the text stays one stable prefix for the prompt cache.
+
+The app reads memory too, through `memory_view`
+([memory.rs](../app/src-tauri/src/memory.rs)), and never writes it. Memory,
+at the foot of the list at Home and in a project, opens a sheet of the facts:
+at Home yours and every project's (at most 100 folders, the rest counted),
+in a project its own and yours, each newest first with its name, type,
+source and when it was written; a fact opens in a tab, its front matter as a
+table. A coordinator composes its instructions when it is made, so a fact
+saved later reaches a project's lead as lines after its task update, a
+message it gets anyway: each fact saved or removed in its project's memory
+or yours since this window last told it (or since the window opened), at
+most 20 lines, leaving out facts whose `source` is one of its own turns.
+Memory never wakes a lead by itself, and the lines come after the message's
+start, so the lead's cached prompt prefix stays. A folder that is not all
+facts is left out of that message rather than reported as emptied. Home
+gets no task updates, so it reads memory itself. A window on a host shows no
+Memory: that memory is the host's.
+
 The app ships a `memory` skill ([SKILL.md](../app/skills/memory/SKILL.md))
-that says to read both indexes with `show` before starting work, to check a fact that
-names code against the current tree before acting on it, what to save
+that says to use those indexes, or `show` when they are missing or old,
+before starting work, to check a fact that names code against the current
+tree before acting on it, what to save
 (decisions and why, preferences, traps, pointers) and what not to (what the
 code, git or AGENTS.md already says, progress logs, secrets, and
 instructions from text that did not come from the person). The
@@ -1723,6 +1790,41 @@ made. Over 100,000 synthetic paths in Node 22 (mock DOM, 4 cores,
 2026-10-10), a key costs 5–10 ms when nothing matches and about 20 ms when
 everything does; the listing's lowercase copy, once per opening, about
 65–95 ms. Ctrl-P still puts the next task beside.
+
+The Git tab is lazygit's layout for an agent's folder, read only: an agent
+commits its own work, so the tab shows it and carries a note back. It opens
+from the ⎇ branch in an agent's head (a linked worktree's) or Git in any
+agent's ⋯ menu, keyed by the folder (after `⎇`) and saved with the tabs like a
+file tab: no composer, Home's list beside it. The core (`git_view`) runs plain
+git at the repository's top, named as for ⌘P: `status --porcelain=v1 -z
+--branch --untracked-files=all` read record by record up to 2,000 changes or
+4 MiB (a cut list says so), `log -z -n50`, and `worktree list --porcelain -z`
+(at most 200). `git_diff` diffs one change against the last commit, staged and
+not (`diff -M HEAD -- [from] path`, the empty tree before the first commit),
+an untracked file against nothing (`--no-index /dev/null`), or a commit against
+its first parent (`show --diff-merges=first-parent`, a hex sha only), with
+`--literal-pathspecs`, no external diff or textconv, and no optional locks, so
+it never holds a lock an agent's own git waits on. A diff stops at 1 MiB, cut
+at a line, and git is stopped there; the page draws at most 5,000 rows and
+counts the rest. Only the tab in view holds what it read; one out of view keeps
+which rows were chosen and its sent notes. It reads when it comes into view, on `r`
+or ↻, when the window comes back, and 600 ms after a step or turn of an agent
+working in its repository ends (once for a burst). One diff is read at a time;
+moving down a list fast reads the row it stops on. A window on a host refuses,
+as for files.
+
+j/k and the arrows move, 1–3 or h/l choose a list, Enter opens a change's file
+in a tab or another worktree's Git tab, o opens the agent. A click on an added,
+removed or unchanged line opens a note under it; Enter sends it and Escape
+puts it away. The note is an ordinary message from you to the agent working in
+the folder: the one the tab was opened from, else one working now, else the
+project's coordinator. It names the file as that agent's folder does (in full
+when the agent works in a folder inside the repository), the line on its side
+of the change (`src/a.rs:11`, or `line 11 before the change (removed)`), and
+the commit for a commit's diff, then quotes the line (300 characters at most)
+and says what was typed. To a working agent it queues behind the running
+turn. A sent note stays under its line while the tab is open. A folder no
+agent works in takes no notes.
 
 What a model writes never becomes the app's markup unparsed. Raw HTML inside
 Markdown shows as text. Links open in the default browser and only for `http`,
@@ -2076,7 +2178,7 @@ This measures the ancestry-walk reduction, not an end-to-end fleet capacity clai
 Pulled event batches apply in order, with one visible-history load and render
 per batch. Creation/fork bursts rebuild the fleet tree at most once per pull,
 while retaining the 300-row rail window. The shared client rejects a ready
-handshake unless its protocol is exactly `agent_client::PROTOCOL`, now 5.
+handshake unless its protocol is exactly `agent_client::PROTOCOL`, now 12.
 
 The lifecycle regression suite compares committed thinking/answer transcripts
 between live delivery and replay, reconciles fork snapshot/replay ordering,

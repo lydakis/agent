@@ -50,6 +50,37 @@ class SocketAndCliTests(ModelFixture):
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         return result
 
+    def test_listings_filter_and_stop_at_their_limit(self):
+        for bot in ('p.lead', 'p.worker', 'q.lead'):
+            self.agent('run', *self.common, '--new', '--bot', bot, 'hello')
+        for n in range(3):
+            self.agent('run', *self.again, '--bot', 'p.lead', f'again {n}')
+        store = ['--store', str(self.store)]
+        names = lambda *flags: [b['name'] for b in json.loads(self.agent('ls', *store, *flags).stdout)]
+        self.assertEqual(names('--name', 'p.*'), ['p.lead', 'p.worker'])
+        self.assertEqual(names('--name', '*.lead'), ['p.lead', 'q.lead'])
+        self.assertEqual(names('--limit', '2'), ['p.lead', 'p.worker'])
+        self.assertEqual(names('--active'), [])
+        self.model.release_headers = threading.Event()
+        self.model.all_streaming = self.model.release_headers
+        self.addCleanup(self.model.release_headers.set)
+        held = json.loads(self.agent('run', *self.again, '--bot', 'p.worker', '--detach', 'gate').stdout)
+        self.assertEqual(names('--active'), ['p.worker'])
+        self.assertEqual(self.agent('ls', *store, '--active', '--pretty').stdout.split()[0], 'p.worker')
+        self.model.release_headers.set()
+        self.agent('wait', *store, held['handle'])
+        turns = lambda *flags: [t['turn'] for t in json.loads(self.agent('turns', *store, '--bot', 'p.lead', *flags).stdout)]
+        # Turn ids count across bots.
+        self.assertEqual(turns(), [1, 4, 5, 6])
+        self.assertEqual(turns('--newest', '--limit', '2'), [6, 5])
+        self.assertEqual(turns('--newest'), [6, 5, 4, 1])
+        self.assertEqual(turns('--limit', '2', '--after', '1'), [4, 5])
+        for flags in (('--limit', '0'), ('--limit', 'x')):
+            refused = self.agent('ls', *store, *flags, check=False)
+            self.assertEqual((refused.returncode, json.loads(refused.stderr)['error']), (2, 'usage'))
+        bad = self.agent('ls', *store, '--name', '', check=False)
+        self.assertEqual(json.loads(bad.stderr)['error'], 'invalid_bot_filter')
+
     def test_run_starts_a_daemon_streams_the_turn_and_resumes_the_bot(self):
         missing = self.agent('run', *self.again, '--bot', 'Bob', 'hello', check=False)
         self.assertEqual(missing.returncode, 1)
@@ -437,8 +468,9 @@ class SocketAndCliTests(ModelFixture):
         stats = self.agent('stats', '--store', str(self.store), '--model', 'openai/other', check=False)
         self.assertEqual(stats.returncode, 2)
         self.assertIn('does not accept --model', stats.stderr)
-        # A fork is an exact copy of its source, so it takes no instructions.
-        for flag in ('--instructions', '--instructions-file', '--agents', '--profile'):
+        # A fork is an exact copy of its source, so it takes no instructions,
+        # and keeps its source's gates, so it takes no approval of its own.
+        for flag in ('--instructions', '--instructions-file', '--agents', '--profile', '--approval', '--approve'):
             args = (flag,) if flag == '--agents' else (flag, 'x')
             fork = self.agent('fork', '--store', str(self.store), '--source', 'Bob', '--bot', 'Copy', *args,
                               check=False)
@@ -629,9 +661,8 @@ class SocketAndCliTests(ModelFixture):
         kept = fork[:-4] + ['--bot', 'Kept', '--request-id', 'kept']
         made = json.loads(self.agent(*kept).stdout)
         self.agent('rm', '--store', str(self.store), '--bot', 'Once')
-        for flags in ([], ['--approval', 'full']):
-            resent = json.loads(self.agent(*kept, *flags).stdout)
-            self.assertEqual((resent['bot_id'], resent['duplicate']), (made['bot_id'], True))
+        resent = json.loads(self.agent(*kept).stdout)
+        self.assertEqual((resent['bot_id'], resent['duplicate']), (made['bot_id'], True))
 
     def test_retry_of_pruned_turn_exits_and_retained_retry_still_replays(self):
         self.agent('run', *self.common, '--new', '--bot', 'Bob', '--request-id', 'old', 'first')

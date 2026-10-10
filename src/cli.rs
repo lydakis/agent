@@ -20,7 +20,7 @@ const COMMANDS: &[Command] = &[
         name: "run",
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
-        flags: "--bot --new --detach --delivery --turn --model --workspace --effort --agents --profile --request-id --bot-id --pretty --no-spawn",
+        flags: "--bot --new --detach --delivery --turn --model --workspace --effort --turn-budget-tokens --agents --profile --request-id --bot-id --pretty --no-spawn",
         settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallbacks --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl",
         startup: true,
     },
@@ -36,7 +36,7 @@ const COMMANDS: &[Command] = &[
         name: "fork",
         about: "Copy a bot's conversation up to a message into a new bot",
         usage: "fork --source NAME --bot NAME [--checkpoint NODE] [--allow LIST]",
-        flags: "--source --bot --checkpoint --workspace --budget-tokens --approval --approve --allow --request-id --pretty",
+        flags: "--source --bot --checkpoint --workspace --budget-tokens --allow --request-id --pretty",
         settings: "",
         startup: false,
     },
@@ -51,16 +51,16 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "ls",
         about: "List the bots",
-        usage: "ls [OPTIONS]",
-        flags: "--pretty",
+        usage: "ls [--name GLOB] [--active] [--limit N]",
+        flags: "--name --active --limit --pretty",
         settings: "",
         startup: false,
     },
     Command {
         name: "turns",
         about: "A bot's turns and how each ended",
-        usage: "turns --bot NAME [--after TURN]",
-        flags: "--bot --after --pretty --no-spawn",
+        usage: "turns --bot NAME [--after TURN] [--newest] [--limit N]",
+        flags: "--bot --after --newest --limit --pretty --no-spawn",
         settings: "",
         startup: true,
     },
@@ -91,8 +91,8 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "approvals",
         about: "Tool calls waiting for a verdict",
-        usage: "approvals [--bot NAME] [--tag TAG]",
-        flags: "--bot --tag --pretty --no-spawn",
+        usage: "approvals [--bot NAME] [--tag TAG] [--full] [--limit N]",
+        flags: "--bot --tag --full --limit --pretty --no-spawn",
         settings: "",
         startup: true,
     },
@@ -246,6 +246,10 @@ fn print_flags(flags: &str) {
                 "The identity --bot must name; rm then succeeds as a duplicate once it is gone",
             ),
             "--budget-tokens" => ("N", "New bot's lifetime input + output token cap"),
+            "--turn-budget-tokens" => (
+                "N",
+                "This turn's input + output token cap, beside the bot's own budget",
+            ),
             "--pretty" => ("", "Render human-readable output"),
             "--no-spawn" => ("", "Require an already running daemon"),
             "--keep-turns" => (
@@ -336,6 +340,14 @@ fn print_flags(flags: &str) {
                 "Tools whose calls need a verdict; default every tool but history, wait, note, echo",
             ),
             "--call" => ("ID", "The tool call to answer"),
+            "--full" => ("", "Every call's whole arguments, not their preview"),
+            "--name" => (
+                "GLOB",
+                "Only bots whose name matches, as SQLite GLOB: * any run, ? one byte, [..] a set",
+            ),
+            "--active" => ("", "Only bots with a turn running"),
+            "--newest" => ("", "Newest first, read from the end"),
+            "--limit" => ("N", "List at most N"),
             "--request" => ("N", "The request number the call was announced with"),
             "--tag" => (
                 "TAG",
@@ -489,6 +501,9 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                 | "--detach"
                 | "--all"
                 | "--any"
+                | "--full"
+                | "--active"
+                | "--newest"
                 | "--no-compaction"
                 | "--agents"
                 | "--fallbacks"
@@ -519,15 +534,21 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                 "--context-bytes"
                     | "--context-items"
                     | "--keep-turns"
+                    | "--limit"
                     | "--max-output-tokens"
                     | "--budget-tokens"
+                    | "--turn-budget-tokens"
                     | "--turn"
                     | "--checkpoint"
                     | "--request"
             ) {
                 let max = match flag {
                     "--max-output-tokens" => u32::MAX as u64,
-                    "--turn" | "--checkpoint" | "--budget-tokens" | "--request" => i64::MAX as u64,
+                    "--turn"
+                    | "--checkpoint"
+                    | "--budget-tokens"
+                    | "--turn-budget-tokens"
+                    | "--request" => i64::MAX as u64,
                     _ => usize::MAX as u64,
                 };
                 if !value.parse::<u64>().is_ok_and(|n| n > 0 && n <= max) {

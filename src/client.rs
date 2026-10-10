@@ -62,6 +62,13 @@ struct Options {
     fallbacks: bool,
     discover: bool,
     after: i64,
+    /// Listing filters: a GLOB on bot names, bots with a turn running,
+    /// newest first.
+    name: Option<String>,
+    active: bool,
+    newest: bool,
+    /// The most a listing prints.
+    limit: Option<usize>,
     pretty: bool,
     new: bool,
     agents: bool,
@@ -73,12 +80,16 @@ struct Options {
     /// `shutdown --grace`: milliseconds running turns may take to finish.
     grace_ms: u64,
     budget_tokens: Option<u64>,
+    /// `run --turn-budget-tokens`: the submitted turn's own cap.
+    turn_budget_tokens: Option<u64>,
     turn: Option<i64>,
     keep_turns: Option<usize>,
     /// `follow --all`: every bot on one connection.
     all: bool,
     /// `wait --any`: return on the first resolved handle.
     any: bool,
+    /// `approvals --full`: whole arguments for calls whose preview was cut.
+    full: bool,
     /// `run --delivery`: what to do when the bot is busy.
     delivery: Option<String>,
     /// A new bot's approval mode and gated tools.
@@ -128,6 +139,10 @@ fn parse(args: &[String]) -> Result<Options> {
         fallbacks: false,
         discover: false,
         after: 0,
+        name: None,
+        active: false,
+        newest: false,
+        limit: None,
         pretty: false,
         new: false,
         agents: false,
@@ -137,10 +152,12 @@ fn parse(args: &[String]) -> Result<Options> {
         timeout_ms: None,
         grace_ms: 0,
         budget_tokens: None,
+        turn_budget_tokens: None,
         turn: None,
         keep_turns: None,
         all: false,
         any: false,
+        full: false,
         delivery: std::env::var("AGENT_DELIVERY").ok(),
         approval: std::env::var("AGENT_APPROVAL")
             .ok()
@@ -176,6 +193,9 @@ fn parse(args: &[String]) -> Result<Options> {
             "--detach" => options.detach = true,
             "--all" => options.all = true,
             "--any" => options.any = true,
+            "--full" => options.full = true,
+            "--active" => options.active = true,
+            "--newest" => options.newest = true,
             "--" => options.positional.extend(iter.by_ref().cloned()),
             flag if flag.starts_with("--") => {
                 let value = iter
@@ -208,6 +228,16 @@ fn parse(args: &[String]) -> Result<Options> {
                         )
                     }
                     "--tag" => options.tag = Some(value),
+                    "--name" => options.name = Some(value),
+                    "--limit" => {
+                        options.limit = Some(
+                            value
+                                .parse()
+                                .ok()
+                                .filter(|n| *n > 0)
+                                .ok_or(Error::with("usage", "--limit needs a positive integer"))?,
+                        )
+                    }
                     "--reason" => options.reason = Some(value),
                     "--note" => options.note = Some(PathBuf::from(value)),
                     "--judge-url" => options.judge_url = Some(value),
@@ -318,6 +348,11 @@ fn parse(args: &[String]) -> Result<Options> {
                     "--budget-tokens" => {
                         options.budget_tokens = Some(value.parse().map_err(|_| {
                             Error::with("usage", "--budget-tokens needs an integer")
+                        })?)
+                    }
+                    "--turn-budget-tokens" => {
+                        options.turn_budget_tokens = Some(value.parse().map_err(|_| {
+                            Error::with("usage", "--turn-budget-tokens needs an integer")
                         })?)
                     }
                     "--turn" => {
@@ -741,9 +776,13 @@ fn composed_instructions(
         return Ok(text.clone());
     }
     if options.agents || role.is_some() {
-        return agent_client::policy::instructions(std::path::Path::new(workspace), role)
+        let workspace = std::path::Path::new(workspace);
+        let failed =
+            |error: agent_client::policy::Failure| Error::with(error.code(), error.to_string());
+        let memory = agent_client::policy::memory_indexes(workspace).map_err(failed)?;
+        return agent_client::policy::instructions(workspace, role, &memory)
             .map(|composed| composed.text)
-            .map_err(|error| Error::with(error.code(), error.to_string()));
+            .map_err(failed);
     }
     Ok(DEFAULT_INSTRUCTIONS.to_owned())
 }
@@ -1352,7 +1391,8 @@ fn run(options: &Options) -> Result<i32> {
                 "workspace":options.workspace.as_ref().and(workspace.as_ref()),
                 "model":if created { Value::Null } else { json!(options.model) },
                 "effort":if created { Value::Null } else { json!(options.effort) },
-                "delivery":options.delivery,"expected_turn":options.turn,"from":from}),
+                "delivery":options.delivery,"expected_turn":options.turn,"from":from,
+                "budget_tokens":options.turn_budget_tokens}),
         )
         .map_err(|error| ways_past_busy(&bot, error))?;
     if options.detach {
@@ -1490,31 +1530,19 @@ fn fork(options: &Options) -> Result<i32> {
         let allow: Vec<&str> = allow.split(',').filter(|t| !t.is_empty()).collect();
         request["allow"] = json!(allow);
     }
-    // A fork keeps its source's tools and gates; its own gate adds to them.
-    // Its approver starts first, so a missing judge leaves no fork behind.
-    // Only a gate of the fork's own is built from the source's tools.
-    let gated =
-        options.approval.as_deref().unwrap_or("full") != "full" || options.approve.is_some();
+    // A fork keeps its source's tools and gates. An approver its inherited
+    // `auto` gate needs starts first, so a missing judge leaves no fork behind.
     let state = match connection.request("resume", json!({"bot":source})) {
         // A keyed fork outlives its source: its resend is answered from the
         // fork, so it needs nothing from the source.
-        Err(error) if error.code == "bot_not_found" && options.request_id.is_some() && !gated => {
+        Err(error) if error.code == "bot_not_found" && options.request_id.is_some() => {
             let result = connection.request("fork", request)?;
             print_json(&result, options.pretty)?;
             return Ok(0);
         }
         state => state?,
     };
-    let mut auto = answered_by_auto(&state);
-    if gated {
-        let tools: Vec<String> = serde_json::from_value(state["tools"].clone())
-            .map_err(|_| Error::new("daemon_protocol_mismatch"))?;
-        if let Value::Object(gate) = requested_gate(options, &tools)? {
-            auto |= gate.get("approver").is_some_and(|tag| tag == "auto");
-            request.as_object_mut().expect("object").extend(gate);
-        }
-    }
-    if auto {
+    if answered_by_auto(&state) {
         ensure_approver(options, &mut connection, bot_model(&state))?;
     }
     let result = connection.request("fork", request)?;
@@ -1593,11 +1621,13 @@ fn wait(options: &Options) -> Result<i32> {
     Ok(if clean { 0 } else { 1 })
 }
 
-/// Calls waiting for a verdict, paged through completely; JSON array or
-/// one line per call with the command that answers it.
+/// Calls waiting for a verdict, paged through completely or up to
+/// `--limit`; JSON array or one line per call with the command that
+/// answers it.
 fn approvals(options: &Options) -> Result<i32> {
     let mut connection = ensure_existing_daemon(options)?;
     let mut after = json!(0);
+    let mut left = options.limit.unwrap_or(usize::MAX);
     let mut first = true;
     if !options.pretty {
         print!("[");
@@ -1605,12 +1635,17 @@ fn approvals(options: &Options) -> Result<i32> {
     loop {
         let page = connection.request(
             "approvals",
-            json!({"bot":options.bot,"tag":options.tag,"after":after,"limit":256}),
+            json!({"bot":options.bot,"tag":options.tag,"after":after,"limit":left.min(256)}),
         )?;
-        let calls = page["approvals"]
+        let mut calls = page["approvals"]
             .as_array()
-            .ok_or(Error::new("daemon_protocol_mismatch"))?;
-        for call in calls {
+            .ok_or(Error::new("daemon_protocol_mismatch"))?
+            .clone();
+        left -= calls.len();
+        if options.full {
+            whole_arguments(&mut connection, &mut calls)?;
+        }
+        for call in &calls {
             if options.pretty {
                 println!(
                     "{} turn {} {}",
@@ -1630,7 +1665,7 @@ fn approvals(options: &Options) -> Result<i32> {
             }
         }
         after = page["next_after"].clone();
-        if after.is_null() {
+        if after.is_null() || left == 0 {
             break;
         }
     }
@@ -1638,6 +1673,62 @@ fn approvals(options: &Options) -> Result<i32> {
         println!("]");
     }
     Ok(0)
+}
+
+/// Replace each cut preview with the call's whole arguments, read from
+/// the node that planned it: one `history_items` read per bot for the
+/// page's nodes, each read once though a round's calls share it, and again
+/// for what a reply's size bound left out. One too large to read keeps its
+/// preview, still marked cut.
+fn whole_arguments(connection: &mut Connection, calls: &mut [Value]) -> Result<()> {
+    let cut = |call: &Value| {
+        !(call["arguments"].is_object()
+            && call["arguments_cut"].as_array().is_none_or(Vec::is_empty)
+            && call["arguments_omitted"].as_u64().unwrap_or(0) == 0)
+    };
+    let mut wanted: std::collections::BTreeMap<&str, Vec<i64>> = Default::default();
+    for call in calls.iter().filter(|call| cut(call)) {
+        if let (Some(bot), Some(node)) = (call["bot"].as_str(), call["node"].as_i64()) {
+            let nodes = wanted.entry(bot).or_default();
+            if !nodes.contains(&node) {
+                nodes.push(node);
+            }
+        }
+    }
+    let mut items = std::collections::HashMap::new();
+    for (bot, nodes) in wanted {
+        let mut rest = nodes.as_slice();
+        while !rest.is_empty() {
+            let read = connection.request("history_items", json!({"bot":bot,"nodes":rest}))?;
+            let got = read["items"].as_array().map_or(&[][..], Vec::as_slice);
+            if got.is_empty() {
+                break;
+            }
+            for entry in got {
+                items.insert(
+                    (bot.to_owned(), entry["node"].as_i64()),
+                    entry["item"].clone(),
+                );
+            }
+            rest = &rest[got.len().min(rest.len())..];
+        }
+    }
+    for call in calls.iter_mut().filter(|call| cut(call)) {
+        let key = (
+            call["bot"].as_str().unwrap_or_default().to_owned(),
+            call["node"].as_i64(),
+        );
+        let call_id = call["call_id"].as_str().unwrap_or_default();
+        if let Some(arguments) = items
+            .get(&key)
+            .and_then(|item| agent_client::approver::call_arguments(item, call_id))
+        {
+            call["arguments"] = arguments;
+            call["arguments_cut"] = json!([]);
+            call["arguments_omitted"] = json!(0);
+        }
+    }
+    Ok(())
 }
 
 /// Allow or deny one gated call. The request number is required, so a
@@ -1745,7 +1836,8 @@ fn answer(options: &Options) -> Result<i32> {
     Ok(0)
 }
 
-/// A bot's turns, paged through completely; JSON array or a table.
+/// A bot's turns, paged through completely or up to `--limit`, oldest
+/// first or with `--newest` newest first; JSON array or a table.
 fn turns(options: &Options) -> Result<i32> {
     let bot = options
         .bot
@@ -1753,15 +1845,21 @@ fn turns(options: &Options) -> Result<i32> {
         .ok_or(Error::with("usage", "turns needs --bot"))?;
     let mut connection = ensure_existing_daemon(options)?;
     let mut after = json!(options.after);
+    let mut before = Value::Null;
+    let mut left = options.limit.unwrap_or(usize::MAX);
     let mut first = true;
     if !options.pretty {
         print!("[");
     }
     loop {
-        let page = connection.request("turns", json!({"bot":bot,"after":after,"limit":64}))?;
+        let page = connection.request(
+            "turns",
+            json!({"bot":bot,"after":after,"before":before,"limit":left.min(256),"newest":options.newest}),
+        )?;
         let turns = page["turns"]
             .as_array()
             .ok_or(Error::new("daemon_protocol_mismatch"))?;
+        left -= turns.len();
         for turn in turns {
             if options.pretty {
                 println!(
@@ -1790,8 +1888,18 @@ fn turns(options: &Options) -> Result<i32> {
                 first = false;
             }
         }
-        after = page["next_after"].clone();
-        if after.is_null() {
+        let next = if options.newest {
+            &mut before
+        } else {
+            &mut after
+        };
+        *next = page[if options.newest {
+            "next_before"
+        } else {
+            "next_after"
+        }]
+        .clone();
+        if next.is_null() || left == 0 {
             break;
         }
     }
@@ -1801,18 +1909,25 @@ fn turns(options: &Options) -> Result<i32> {
     Ok(0)
 }
 
+/// The bots in name order, filtered by the daemon, paged through
+/// completely or up to `--limit`; JSON array or a table.
 fn list(options: &Options) -> Result<i32> {
     let mut connection = Connection::connect(&options.socket)?;
     let mut after = Value::Null;
+    let mut left = options.limit.unwrap_or(usize::MAX);
     let mut first = true;
     if !options.pretty {
         print!("[");
     }
     loop {
-        let page = connection.request("bots", json!({"after":after,"limit":64}))?;
+        let page = connection.request(
+            "bots",
+            json!({"after":after,"limit":left.min(256),"name":options.name,"active":options.active}),
+        )?;
         let bots = page["bots"]
             .as_array()
             .ok_or(Error::new("daemon_protocol_mismatch"))?;
+        left -= bots.len();
         for bot in bots {
             if options.pretty {
                 println!(
@@ -1832,7 +1947,7 @@ fn list(options: &Options) -> Result<i32> {
             }
         }
         after = page["next_after"].clone();
-        if after.is_null() {
+        if after.is_null() || left == 0 {
             break;
         }
     }

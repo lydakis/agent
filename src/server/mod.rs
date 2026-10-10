@@ -237,12 +237,16 @@ enum Command {
         bot: String,
         keep_turns: usize,
     },
-    /// A bot's turns with status, workspace, model, tokens, and timing.
+    /// A bot's turns with status, workspace, model, tokens, and timing,
+    /// oldest first; with `newest`, newest first.
     Turns {
         bot: String,
         #[serde(default)]
         after: i64,
+        before: Option<i64>,
         limit: Option<usize>,
+        #[serde(default)]
+        newest: bool,
     },
     Submit {
         bot: String,
@@ -264,6 +268,9 @@ enum Command {
         /// What sent it when no bot's turn did, as the client names itself
         /// (a name's characters); absent for a person.
         origin: Option<String>,
+        /// The most input plus output tokens this turn may spend, beside
+        /// the bot's own budget; absent leaves only that.
+        budget_tokens: Option<u64>,
     },
     Interrupt {
         bot: String,
@@ -360,9 +367,14 @@ enum Command {
     /// Each provider's own model listing, for a client writing its model
     /// list. Asked when requested and kept five minutes; nothing runs on it.
     ProviderModels,
+    /// A page of bots in name order: with `name`, those matching a GLOB
+    /// pattern; with `active`, those with a turn running.
     Bots {
         after: Option<String>,
         limit: Option<usize>,
+        name: Option<String>,
+        #[serde(default)]
+        active: bool,
     },
     /// Stop the daemon. With `grace_ms`, running turns first get up to that
     /// long to finish while nothing new starts; whatever still runs is then
@@ -1986,10 +1998,16 @@ impl Service {
                 });
                 Err(Error::new("deferred"))
             }
-            Command::Turns { bot, after, limit } => {
+            Command::Turns {
+                bot,
+                after,
+                before,
+                limit,
+                newest,
+            } => {
                 store
-                    .op("turns", move |db| {
-                        db.turns(&bot, after, limit.unwrap_or(64))
+                    .read("turns", move |db| {
+                        db.turns(&bot, after, before, limit.unwrap_or(64), newest)
                     })
                     .await
             }
@@ -2364,10 +2382,20 @@ impl Service {
                 // The response is sent by the completion, not by this dispatch.
                 Err(Error::new("deferred"))
             }
-            Command::Bots { after, limit } => {
+            Command::Bots {
+                after,
+                limit,
+                name,
+                active,
+            } => {
                 store
-                    .op("list", move |db| {
-                        db.list(after.as_deref(), limit.unwrap_or(64))
+                    .read("list", move |db| {
+                        db.list(
+                            after.as_deref(),
+                            limit.unwrap_or(64),
+                            name.as_deref(),
+                            active,
+                        )
                     })
                     .await
             }
@@ -2533,6 +2561,7 @@ impl Service {
                 expected_turn,
                 from,
                 origin,
+                budget_tokens,
             } => {
                 name("request_id", &request_id)?;
                 if origin.is_some() && from.is_some() {
@@ -2554,6 +2583,19 @@ impl Service {
                 if expected_turn.is_some() && delivery != Delivery::Steer {
                     return fail_with("invalid_delivery", "expected_turn needs delivery steer");
                 }
+                // A steer joins a turn that already has its cap.
+                if budget_tokens.is_some() && delivery == Delivery::Steer {
+                    return fail_with(
+                        "invalid_delivery",
+                        "budget_tokens starts a turn; a steer joins one, so send it with reject or queue",
+                    );
+                }
+                if budget_tokens.is_some_and(|n| n == 0 || n > i64::MAX as u64) {
+                    return fail_with(
+                        "invalid_budget",
+                        format!("budget_tokens must be from 1 to {}", i64::MAX),
+                    );
+                }
                 // A turn may run in another checkout or on another model of
                 // the same family; the conversation encoding never changes.
                 let options = TurnOptions {
@@ -2564,6 +2606,7 @@ impl Service {
                     expected_turn,
                     from: from.map(|author| (author.bot, author.turn)),
                     origin,
+                    budget_tokens,
                 };
                 // A slot is promised before the commit that may take it, so
                 // admissions queued together cannot start more turns than
@@ -3544,6 +3587,7 @@ mod tests {
             expected_turn: None,
             from: None,
             origin: None,
+            budget_tokens: None,
         }
     }
     /// Take requests the way the run loop does: an admission with room joins
