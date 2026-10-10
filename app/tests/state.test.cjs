@@ -1087,6 +1087,25 @@ test('a saved tab comes back only for the same bot identity', () => {
   assert.equal(r.S.ui.side, null, 'nor the agent beside');
 });
 
+test('a saved tab whose agent is gone goes up to what made it', async () => {
+  const storage = new Map();
+  const p = shell({}, storage);
+  await p.onEvent({ event: 'created', bot: 'lead', data: { id: 1, provider: 'alpha', model: 'one' } });
+  await p.onEvent({ event: 'created', bot: 'helper', data: { id: 2, provider: 'alpha', model: 'one', created_by: 'lead', created_by_id: 1 } });
+  p.S.ui.tabs = ['helper']; p.S.selected = 'helper'; p.save();
+  const q = shell({}, storage);
+  q.upsert({ name: 'lead', id: 1, provider: 'alpha', model: 'one' }); // helper was deleted while the app was closed
+  q.restore();
+  assert.deepEqual([...q.S.ui.tabs], ['lead']); assert.equal(q.S.selected, 'lead', 'the tab moved up stays selected');
+  const r = shell({}, storage);
+  r.upsert({ name: 'lead', id: 7, provider: 'alpha', model: 'one' }); r.restore();
+  assert.deepEqual([...r.S.ui.tabs], [], 'nor to a new bot under its maker\'s name'); assert.equal(r.S.selected, '');
+  // A live deletion's move up is saved at once, so a window lost before the next save keeps it.
+  await p.onEvent({ event: 'deleted', bot: 'helper', data: {} });
+  const s = shell({}, storage); s.upsert({ name: 'lead', id: 1, provider: 'alpha', model: 'one' }); s.restore();
+  assert.equal(s.S.selected, 'lead');
+});
+
 test('each composer sends to its own pane, and a working bot gets the sticky queue or steer pick', async () => {
   const sent = [], storage = new Map();
   const p = shell({ request: async (op, q) => { sent.push([op, q]); } }, storage);
@@ -1603,6 +1622,13 @@ test('a task card leaves the keyboard beside; a row looks in, and a double-click
   await doc.listeners.click({ detail: 1, target: { closest: atBuild } });
   await doc.listeners.click({ detail: 2, target: { closest: atBuild } }); await p.tick();
   assert.equal(p.S.selected, 'app.build'); assert.equal(p.S.ui.side, null, 'the pending look was cancelled');
+  // A move after the look is newer: a click the system counts as a second no longer opens the old row.
+  p.S.selected = ''; p.S.ui.tabs = [];
+  await doc.listeners.click({ detail: 1, target: { closest: at } }); await p.tick();
+  assert.equal(p.S.ui.side, 'app.lead');
+  await p.go('app.build');
+  await doc.listeners.click({ detail: 2, target: { closest: () => null } }); await p.tick();
+  assert.equal(p.S.selected, 'app.build'); assert.deepEqual([...p.S.ui.tabs], ['app.build'], 'the old row did not open');
 });
 
 test('a failed first message waits in the side chat\'s composer', async () => {
