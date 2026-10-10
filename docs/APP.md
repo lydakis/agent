@@ -1261,7 +1261,10 @@ so does what it puts on the page and what parsing it cost, 40 bytes for each
 tag it draws and 16 for each mark parsed: a window holds about 200,000 drawn
 tags and 500,000 parsed marks however its messages split them, so many
 replies each within their own bounds never add up to more. Drawing past that
-folds the oldest bodies as a load would. All are vendored
+folds the oldest bodies as a load would. A chat off screen keeps its drawn
+HTML only while the most recently shown ones hold 16 MiB of it in all; past
+that the oldest let theirs go and parse again when shown, so visiting many
+agents never adds up. All are vendored
 under `app/ui/vendor` (versions
 and licenses in `LICENSES.txt`), so drawing a message fetches nothing.
 
@@ -1279,7 +1282,8 @@ file is the asking), a CSV or TSV as a table of its
 first 1,000 rows and 256 columns, ending with the row that reaches 10,000
 cells (quoted fields kept whole, and the view says when rows were left out),
 a binary file as its size, anything else as code highlighted by its
-extension. Esc or ✕ closes it and brings back the task that was beside, if
+extension. Esc or ✕ closes it (Esc too from inside a page it shows, which
+hands the key to the window) and brings back the task that was beside, if
 any. A write or edit to the open file reads it again, and what the agent
 wrote is new: a page, diagram, chart or image in it waits for a click, as in
 a message. A file drawn again (rewritten, or highlighted once highlighting

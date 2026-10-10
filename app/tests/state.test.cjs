@@ -29,14 +29,14 @@ function page(daemon = {}, storage = null) {
     Daemon: transport, console, queueMicrotask, crypto: require('node:crypto').webcrypto, TextDecoder,
     document: { getElementById(id) { if (!elements.has(id)) elements.set(id, element()); return elements.get(id); }, listeners: {}, addEventListener(type, fn) { this.listeners[type] = fn; },
       createElement: element, createTextNode: () => ({ data: '', appended: 0, appendData(s) { this.data += s; this.appended += s.length; } }) },
-    window: { addEventListener() {} }, localStorage: storage ? { getItem: k => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, String(v)) } : { getItem() { return null; } },
+    window: { listeners: {}, addEventListener(type, fn) { this.listeners[type] = fn; } }, localStorage: storage ? { getItem: k => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, String(v)) } : { getItem() { return null; } },
     setTimeout(fn) { const id = ++timer; timers.set(id, fn); return id; }, clearTimeout(id) { timers.delete(id); }, setInterval() {},
   });
   for (const file of ['../ui/vendor/markdown-it.js', '../ui/rich.js']) vm.runInContext(fs.readFileSync(require.resolve(file), 'utf8'), context);
   context.Rich = context.window.Rich;
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, dropFile, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules, tellLead, markSeen, renderFile };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readSchedules, tellLead, markSeen, renderFile };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -377,6 +377,21 @@ test('a file opened while the side pane opens is drawn once the pane has its wid
   assert.equal(hydrated, 1);
 });
 
+test('drawn HTML is kept for the transcripts on screen and the most recent others up to 16 MiB', () => {
+  const p = page(), MiB = 1024 * 1024;
+  const fill = (name) => { const t = p.transcript(name), it = { kind: 'text', text: 'x', html: '<p>x</p>', htmlOf: 'x', drawnBytes: 9 * MiB, bytes: 9 * MiB + 1 }; t.items.push(it); t.bytes = it.bytes; return it; };
+  const a = fill('A'), b = fill('B'), c = fill('C');
+  p.releaseDrawn(['A']); p.releaseDrawn(['B']); p.releaseDrawn(['C', 'A']);
+  // A is on screen again, B the most recent other: all kept.
+  assert.ok(a.html && b.html && c.html);
+  p.releaseDrawn(['C']);
+  // Off screen now: A (shown last, kept) and B (past 16 MiB, let go, its bytes returned).
+  assert.ok(a.html && c.html); assert.equal(b.html, undefined);
+  assert.equal(b.bytes, 1); assert.equal(p.transcript('B').bytes, 1);
+  // Shown again, it is drawn anew.
+  assert.match(p.textHTML(b, p.transcript('B')), /<p>x<\/p>/);
+});
+
 test('highlighting arriving redraws only a pane with code waiting for it', () => {
   const p = page(), t = p.transcript('Bob'), el = { dataset: { who: 'Bob' }, lastElementChild: null };
   t.items.push({ kind: 'text', text: 'just words' }); p.textHTML(t.items[0]);
@@ -415,6 +430,19 @@ test('a file drawn again keeps the reader\'s place; another file starts at its t
   assert.equal(el.scrollTop, 300);
   p.S.ui.file = { bot: 'Bob', full: '/w/b.rs', gen: 4, state: 'ok', bytes: enc('fn b() {}'), more: false, url: null }; p.renderFile();
   assert.equal(el.scrollTop, 0);
+});
+
+test('Escape in a preview the reader is in closes the file it shows', async () => {
+  const p = page({ readFile: async () => new TextEncoder().encode('<button>x</button>') }), c = p.context, win = {};
+  p.setRender(() => {}); await p.openFile('Bob', '/w/p.html');
+  const frame = { contentWindow: win, closest: (s) => s === '.fview' ? {} : null };
+  c.document.querySelectorAll = (s) => s === '.rc iframe' ? [frame] : [];
+  // A page the reader is not in cannot close it.
+  c.window.listeners.message({ source: win, data: { rich: 'escape' } });
+  assert.ok(p.S.ui.file);
+  c.document.activeElement = frame;
+  c.window.listeners.message({ source: win, data: { rich: 'escape' } });
+  assert.equal(p.S.ui.file, null);
 });
 
 test('a file closed and opened again never shares a view key with the one before', async () => {

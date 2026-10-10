@@ -1272,6 +1272,26 @@ function textHTML(it, t) {
   }
   return it.html;
 }
+// A transcript's drawn HTML is kept while it is on screen, and for the most recently shown others up
+// to 16 MiB in all, so going back to one is quick; past that the oldest let theirs go and are parsed
+// again when shown. The 8 MiB bound is each transcript's, so this one is the window's.
+const OFF_SCREEN_BYTES = 16 * 1024 * 1024, drawnBy = new Map(); let drawnOn = '';
+function releaseDrawn(shown) {
+  const on = shown.join('\n'); if (on === drawnOn) return; drawnOn = on;
+  for (const name of shown) { const t = S.transcripts.get(name); drawnBy.delete(name); if (t) drawnBy.set(name, t); }
+  let kept = 0;
+  for (const [name, t] of [...drawnBy].reverse()) {
+    if (S.transcripts.get(name) !== t) { drawnBy.delete(name); continue; }
+    if (shown.includes(name)) continue;
+    let bytes = 0; for (const it of t.items) bytes += it.drawnBytes ?? 0;
+    if (kept + bytes <= OFF_SCREEN_BYTES) { kept += bytes; continue; }
+    for (const it of t.items) if (it.drawnBytes) {
+      it.bytes = Math.max(0, (it.bytes || 0) - it.drawnBytes); t.bytes = Math.max(0, (t.bytes || 0) - it.drawnBytes);
+      it.html = it.htmlOf = it.htmlFrom = undefined; it.drawnBytes = 0;
+    }
+    drawnBy.delete(name);
+  }
+}
 const moreButton = (name) => `<button type="button" class="ibtn" data-act="more" data-who="${esc(name)}" title="More" aria-label="More">⋯</button>`;
 function cardInner({ status, name, last, elapsed, body }) {
   return `<span class="glyph ${status}" data-f="g">${glyphOf(status)}</span><span class="pn">${esc(name)}</span><span class="el" data-f="el">${elapsed ?? ''}</span><span class="pl" data-f="pl">${esc(last)}</span>${body ?? ''}`;
@@ -1964,6 +1984,7 @@ function render() {
   if (S.ui.file) renderFile();
   else if (side) { renderHead($('sidetitle'), side, 'side'); renderTranscript($('side'), side.name); }
   $('sideform').hidden = !!S.ui.file;
+  releaseDrawn([!sw && b ? b.name : '', side ? side.name : ''].filter(Boolean));
   renderComposer('main', b, sw); renderComposer('side', side);
   $('keybar').innerHTML = keybarHTML(b);
   if (S.ui.picker) renderPicker();
@@ -2778,6 +2799,9 @@ function waitsForHighlight(el) {
 }
 Rich.onReady = () => { for (const [id] of PANES) if (!(id === 'side' && S.ui.file) && waitsForHighlight($(id))) $(id).dataset.key = ''; render(); };
 Rich.onFile = openFileFrom;
+// Escape in a preview: a file's closes it, as Escape does there; a message's returns the keyboard to
+// its pane, where the next Escape does what it does.
+Rich.onEscape = (frame) => { if (frame.closest('.fview') && S.ui.file) closeFile(); else focusInput(frame.closest('.pane.side') && !S.ui.file ? 'side' : 'main'); };
 Rich.onError = (text) => toast(text, 4000);
 
 // ---------- boot ----------

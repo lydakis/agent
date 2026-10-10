@@ -10,7 +10,7 @@ window.Rich = (() => {
   // Bumped when highlighting arrives, so HTML drawn without it is drawn again (see `ready`).
   // `waited` says the last `html` drew code plain while highlighting loads, so only such a
   // message needs drawing again once it arrives.
-  let version = 0, ready = () => {}, waited = false;
+  let version = 0, ready = () => {}, escaped = () => {}, waited = false;
 
   // ---------- lazy scripts ----------
   const loading = new Map();
@@ -316,10 +316,11 @@ window.Rich = (() => {
     try { return await view.toSVG(); } finally { view.finalize(); }
   }
   // The page a preview runs: nothing fetched, no frames, no forms; it reports its height so the
-  // frame fits it, and its links go nowhere.
+  // frame fits it, its links go nowhere, and Escape pressed in it is the window's (a frame's keys
+  // do not reach its parent).
   const FRAME_HEAD = '<!doctype html><meta charset="utf-8">'
     + `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; media-src data: blob:; base-uri 'none'; form-action 'none'">`
-    + '<script>(()=>{const post=()=>parent.postMessage({rich:"height",h:document.documentElement.scrollHeight},"*");addEventListener("load",post);new ResizeObserver(post).observe(document.documentElement);addEventListener("click",e=>{if(e.target.closest&&e.target.closest("a[href]"))e.preventDefault()},true)})()</script>';
+    + '<script>(()=>{const post=()=>parent.postMessage({rich:"height",h:document.documentElement.scrollHeight},"*");addEventListener("load",post);new ResizeObserver(post).observe(document.documentElement);addEventListener("click",e=>{if(e.target.closest&&e.target.closest("a[href]"))e.preventDefault()},true);addEventListener("keydown",e=>{if(e.key==="Escape")parent.postMessage({rich:"escape"},"*")})})()</script>';
   // A preview shown: a page in its frame, an SVG as an image (which runs no script and loads nothing).
   function mount(box) {
     const host = box.querySelector('.view'); if (!host || host.firstChild) return;
@@ -352,6 +353,8 @@ window.Rich = (() => {
   // Another store's blocks are not the ones asked for here, whatever their ids.
   const forget = () => shown.clear();
   if (typeof window.addEventListener === 'function') window.addEventListener('message', (e) => {
+    // Only a frame the reader is in can hand the window its Escape.
+    if (e.data?.rich === 'escape') { for (const f of document.querySelectorAll('.rc iframe')) if (f.contentWindow === e.source && document.activeElement === f) { escaped(f); break; } return; }
     if (e.data?.rich !== 'height' || !(e.data.h > 0)) return;
     for (const f of document.querySelectorAll('.rc iframe')) if (f.contentWindow === e.source) { const h = `${Math.min(Math.ceil(e.data.h), Math.round(window.innerHeight * 0.8))}px`; if (f.style.height !== h) settle(f, () => { f.style.height = h; }); break; }
   });
@@ -439,5 +442,5 @@ window.Rich = (() => {
   // A middle click on a link would open it in a new app window.
   document.addEventListener?.('auxclick', (e) => { if (e.target.closest?.('.md a, .rc a, a[data-file]')) e.preventDefault(); });
 
-  return { html, cut, hydrate, forget, click, file, filePath, esc, get version() { return version; }, get waited() { return waited; }, set onReady(fn) { ready = fn; }, set onFile(fn) { openFile = fn; }, set onError(fn) { failed = fn; } };
+  return { html, cut, hydrate, forget, click, file, filePath, esc, get version() { return version; }, get waited() { return waited; }, set onReady(fn) { ready = fn; }, set onEscape(fn) { escaped = fn; }, set onFile(fn) { openFile = fn; }, set onError(fn) { failed = fn; } };
 })();
