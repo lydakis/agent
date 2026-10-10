@@ -1,6 +1,6 @@
 //! Streaming model calls. One shared HTTP transport; per-family request
 //! encoding and SSE parsing. History items are streamed by reference.
-use crate::{Error, Result, codec::Family, fail, sse::Decoder};
+use crate::{Error, Result, codec::Family, fail, fail_with, sse::Decoder};
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt, stream};
 use serde::Serialize;
@@ -413,15 +413,18 @@ impl Provider {
         base_url: &str,
         key: Option<String>,
     ) -> Result<Self> {
-        let mut url =
-            reqwest::Url::parse(base_url).map_err(|_| Error::new("invalid_provider_url"))?;
+        let mut url = reqwest::Url::parse(base_url)
+            .map_err(|_| Error::with("invalid_provider_url", "the base URL does not parse"))?;
         if !matches!(url.scheme(), "http" | "https")
             || !url.username().is_empty()
             || url.password().is_some()
             || url.query().is_some()
             || url.fragment().is_some()
         {
-            return fail("invalid_provider_url");
+            return fail_with(
+                "invalid_provider_url",
+                "the base URL is http or https, with no credentials, query or fragment",
+            );
         }
         let route = match family {
             Family::Responses => "responses",

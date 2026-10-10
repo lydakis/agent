@@ -116,7 +116,9 @@ class SocketAndCliTests(ModelFixture):
     def test_shutdown_returns_once_the_daemon_has_exited(self):
         handle = json.loads(self.agent('run', *self.common, '--new', '--bot', 'Bob', '--detach', 'wait').stdout)
         self.model.requests.get(timeout=3)
-        self.agent('shutdown', '--store', str(self.store))
+        pid = json.loads(self.agent('start', '--store', str(self.store)).stdout)['pid']
+        stopped = self.agent('shutdown', '--store', str(self.store))
+        self.assertEqual(json.loads(stopped.stdout), {'stopped': True, 'pid': pid})
         # The active turn's record is committed and the store is released:
         # a caller may copy or reopen it now.
         self.assertFalse(self.socket.exists())
@@ -480,6 +482,14 @@ class SocketAndCliTests(ModelFixture):
                 result = self.agent(*args)
                 self.assertIn('Usage:', result.stdout)
                 self.assertEqual(result.stderr, '')
+        # One line per command, and a new bot's settings apart from run's everyday flags.
+        top = self.agent('--help').stdout
+        self.assertRegex(top, r'\n  wait {7}A turn.s or command.s result: status, text, usage; --timeout 0 polls\n')
+        run = self.agent('run', '--help').stdout
+        everyday, settings = run.split('New bot settings (the defaults are right; rarely needed):')
+        self.assertIn('--bot NAME', everyday)
+        self.assertNotIn('--approval MODE', everyday)
+        self.assertIn('--approval MODE', settings.split('Daemon options')[0])
         invalid = [
             ('follow', '--all', '--bot', 'Bob'),
             ('stats', '--any'), ('ls', 'ignored'), ('ls', '-x'),
@@ -1003,8 +1013,10 @@ class CliTests(ModelFixture):
                                  '--model', 'fixture/model', 'hello'], env=clean_env(),
                                 capture_output=True, text=True, timeout=3)
         self.assertNotEqual(result.returncode, 0)
-        # The daemon's own refusal, not a wrapper around its text.
-        self.assertEqual(json.loads(result.stderr)['error'], 'invalid_provider_url')
+        # The daemon's own refusal, not a wrapper around its text; it names
+        # the provider and what is wrong, never the URL, which may hold a secret.
+        self.assertEqual(json.loads(result.stderr), {'error': 'invalid_provider_url',
+                                                     'detail': 'fixture: the base URL does not parse'})
         self.assertLess(time.monotonic()-start, 2)
 
     def test_concurrent_failed_starts_each_report_their_own_error(self):
@@ -1138,12 +1150,13 @@ class CliTests(ModelFixture):
                     try:
                         with listener.accept()[0] as peer:
                             peer.sendall((json.dumps(dict(event='ready', protocol=protocol, pid=daemon.pid))+'\n').encode())
-                            _, stderr = process.communicate(timeout=10)
+                            stdout, stderr = process.communicate(timeout=10)
                     finally:
                         self.stop_process(process)
                 if stopped:
                     self.assertEqual(process.returncode, 0, stderr)
                     self.assertEqual(daemon.wait(timeout=3), 0 if gone else -15)
+                    self.assertEqual(json.loads(stdout), {'stopped': True, 'pid': daemon.pid})
                 else:
                     self.assertEqual(process.returncode, 1)
                     self.assertIn(b'daemon_protocol_mismatch', stderr)
