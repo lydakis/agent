@@ -55,7 +55,7 @@ window.Daemon = (() => {
     openai: [{ id: 'gpt-6-luna' }, { id: 'gpt-6-sol' }],
     anthropic: [{ id: 'claude-sonnet-5', name: 'Claude Sonnet 5' }],
     chatgpt: [{ id: 'gpt-6-luna' }],
-    bedrock: [{ id: 'anthropic.claude-opus-5', name: 'Claude Opus 5' }, { id: 'anthropic.claude-sonnet-5', name: 'Claude Sonnet 5' }, { id: 'anthropic.claude-haiku-5', name: 'Claude Haiku 5' }],
+    bedrock: [{ id: 'global.anthropic.claude-opus-5-5', name: 'Global Claude Opus 5.5' }, { id: 'global.anthropic.claude-sonnet-5', name: 'Global Claude Sonnet 5' }, { id: 'global.anthropic.claude-haiku-4-5', name: 'Global Claude Haiku 4.5' }],
     'bedrock-openai': [{ id: 'openai.gpt-6-luna' }, { id: 'qwen.qwen3-coder-480b' }],
   };
   const specs = () => (ENV.AGENT_PROVIDER ?? '').split(/\s+/).filter(Boolean);

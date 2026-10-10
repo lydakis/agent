@@ -378,8 +378,8 @@ A model reference is `PROVIDER/MODEL`. A provider spec is
 
 | Family | Protocol | Defaults |
 | --- | --- | --- |
-| `responses` | OpenAI Responses API, streaming SSE | `openai` → `https://api.openai.com/v1`, `OPENAI_API_KEY`; `openrouter` → `https://openrouter.ai/api/v1`, `OPENROUTER_API_KEY`; `chatgpt` → `https://chatgpt.com/backend-api/codex`, Codex's ChatGPT login; `bedrock-openai` → `https://bedrock-mantle.$AWS_REGION.api.aws/openai/v1`, SigV4 |
-| `anthropic` | Anthropic Messages API, streaming SSE | `anthropic` → `https://api.anthropic.com/v1`, `ANTHROPIC_API_KEY`; `bedrock` → `https://bedrock-mantle.$AWS_REGION.api.aws/anthropic/v1`, SigV4 |
+| `responses` | OpenAI Responses API, streaming SSE | `openai` → `https://api.openai.com/v1`, `OPENAI_API_KEY`; `openrouter` → `https://openrouter.ai/api/v1`, `OPENROUTER_API_KEY`; `chatgpt` → `https://chatgpt.com/backend-api/codex`, Codex's ChatGPT login; `bedrock-openai` → `https://bedrock-mantle.{region}.api.aws/openai/v1`, SigV4 or `AWS_BEARER_TOKEN_BEDROCK` |
+| `anthropic` | Anthropic Messages API, streaming SSE | `anthropic` → `https://api.anthropic.com/v1`, `ANTHROPIC_API_KEY`; `bedrock` → `https://bedrock-runtime.{region}.amazonaws.com/anthropic/v1`, SigV4 or `AWS_BEARER_TOKEN_BEDROCK` |
 
 The family `responses-ws` is the Responses API over a WebSocket per bot,
 continuing from the bot's previous response where it can; for example
@@ -396,12 +396,22 @@ the family label alone does not establish support for an arbitrary gateway.
 
 Amazon Bedrock serves both families, so a Bedrock binding is a base URL and
 a way to authenticate; [BEDROCK.md](BEDROCK.md) records the survey and the
-choices. `bedrock` and `bedrock-openai` take the region from `AWS_REGION`, or
-`AWS_DEFAULT_REGION`, and fail at startup naming the spec when neither is set.
+choices. `bedrock` binds Claude on Bedrock runtime, whose cross-region
+inference profiles (`global.anthropic.claude-opus-5-5`, or `us.`, `eu.`,
+`apac.` and the other geographies) reach every Claude model from any region,
+and `bedrock-openai` binds OpenAI and other models on Bedrock Mantle, as
+Claude Code and Codex do by default. Both take the region in Claude Code's
+order: `AWS_REGION`, `AWS_DEFAULT_REGION`, the `region` of the active profile
+(`AWS_PROFILE`, else `default`) in the AWS shared credentials file and then
+the config file, else us-east-1; a value not shaped like a region is passed
+over. Both use a Bedrock API key when `AWS_BEARER_TOKEN_BEDROCK` is set, and
+SigV4 otherwise. `provider_models` lists runtime's models as the active
+system-defined inference profiles the Bedrock control plane in its region
+names (`ListInferenceProfiles`), and Mantle's as its host's `/v1/models`.
 Any `bedrock-mantle.{region}.api.aws` or `bedrock-runtime.{region}.amazonaws.com`
 URL without a key field signs every request with SigV4, for example
-`--provider br=anthropic,https://bedrock-runtime.us-west-2.amazonaws.com/anthropic/v1`
-with `global.anthropic.claude-opus-5` model ids. Keys come from the AWS chain in
+`--provider mantle=anthropic,https://bedrock-mantle.us-east-1.api.aws/anthropic/v1`
+for Claude on Mantle with in-region `anthropic.claude-opus-5-5` ids. Keys come from the AWS chain in
 its own order: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (with
 `AWS_SESSION_TOKEN`) when set, otherwise whatever the AWS CLI resolves for
 `AWS_PROFILE` or the default profile, SSO and assumed roles included, through

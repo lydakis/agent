@@ -2,7 +2,9 @@
 
 Surveyed 2026-09-22 and revised 2026-09-25 against AWS, Anthropic and OpenAI
 documentation, then run live on 2026-09-25; the AWS CLI version the
-credential export needs was checked 2026-09-28. Facts are labelled: **documented**
+credential export needs was checked 2026-09-28, and the default endpoints and
+region were revised on 2026-10-10 to match Claude Code and Codex
+([below](#regions-and-model-access)). Facts are labelled: **documented**
 cites a page, **source** cites this repository, **observed** comes from the
 [live run](#the-live-run), **unverified** is a hypothesis still open.
 
@@ -34,14 +36,60 @@ features that depend on the first-party APIs.
 
 ## What was chosen
 
-`--provider bedrock` binds Claude on Mantle and `--provider bedrock-openai`
-binds OpenAI models on Mantle, in `AWS_REGION` (or `AWS_DEFAULT_REGION`). Mantle
-because both model vendors document it and because its quota shape suits a
-fleet: separate input and output allowances with no output burndown and no
-request cap. It also takes the body unsigned, so a call reads its history
-once. Runtime is one explicit URL away, for its global routing and no
-regional premium, at the cost of a second store read per call to sign the
-body; see [providers and models](RUST_PROTOTYPE.md#providers-and-models).
+`--provider bedrock` binds Claude on runtime and `--provider bedrock-openai`
+binds OpenAI and other models on Mantle, in the region the AWS tools would
+use, else us-east-1 ([regions and model access](#regions-and-model-access)).
+Claude was first bound on Mantle too, because both model vendors document it
+and because its quota shape suits a fleet: separate input and output
+allowances with no output burndown and no request cap, and a body taken
+unsigned, so a call reads its history once. But Mantle serves only the Claude
+models hosted in its own region, so which models a binding reached depended
+on the region. Claude on Mantle is one explicit URL away; see
+[providers and models](RUST_PROTOTYPE.md#providers-and-models).
+
+## Regions and model access
+
+**Observed** 2026-09-28 on the owner's account: Mantle in us-west-2 listed one
+Claude model (Haiku 4.5), and Mantle in us-east-1 listed seven (Opus 5.5,
+Fable 5, Sonnet 5 and older). The owner's AWS profile is in us-west-2, so
+`bedrock` there reached Haiku alone, while Claude Code and Codex on the same
+account reached every model without a region being picked.
+
+**Source and documented**, read 2026-10-10:
+
+- Claude Code calls runtime's Invoke API by default, with cross-region
+  inference profile ids (`us.`, `eu.`, `apac.`, `global.`) that route to any
+  region holding the model; it finds them with `ListInferenceProfiles`. It
+  takes the region from `AWS_REGION`, `AWS_DEFAULT_REGION`, the active
+  profile's `region` in the shared credentials file and then the config file,
+  else us-east-1. Mantle is opt-in (`CLAUDE_CODE_USE_MANTLE`), and with both
+  on, Mantle-format ids go to Mantle and the rest to runtime
+  ([Claude Code on Amazon Bedrock](https://code.claude.com/docs/en/amazon-bedrock)).
+- Codex (openai/codex at 322bbf4) serves OpenAI models on Mantle by default
+  (`amazon-bedrock`), in the region its AWS profile or `AWS_REGION` names,
+  refusing regions without Mantle; `amazon-bedrock-runtime` is the opt-in
+  runtime binding, with `global.` and `us.` GPT ids. OpenAI's models are on
+  Mantle in every region it serves, which is why Codex never asks for one.
+
+So `bedrock` now defaults to runtime with cross-region profile ids, and
+`bedrock-openai` stays on Mantle; both resolve the region in Claude Code's
+order and use `AWS_BEARER_TOKEN_BEDROCK` when it is set, as both tools do.
+Discovery lists runtime's models as the active system-defined inference
+profiles of the control plane (`bedrock.{region}.amazonaws.com`, which signs
+under runtime's name, `bedrock`), so the list shows `global.` and the
+region's geography ids. What the move costs, against Claude on Mantle:
+
+- Each call reads its history from the store twice, to digest the body
+  for the signature and again to send it, plus a SHA-256 pass; no more
+  memory, and under the same admission bound.
+- Runtime's quota deducts `input + max_tokens` at the start of a call and
+  burns output down at 10x, so a fleet with a tight quota sets
+  `--max-output-tokens` near real output.
+- In exchange, `global.` routing carries no regional premium.
+
+**Unverified**: a Bedrock API key reaches runtime's Anthropic route as a
+bearer token, as AWS documents for runtime calls, and Mantle's as
+`x-api-key`; neither keyed route has been run live.
 
 Any Bedrock URL without a key field signs with SigV4 (**source**:
 `src/provider/aws.rs`). The signer is in-tree on `aws-lc-rs`, which rustls
