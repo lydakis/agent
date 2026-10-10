@@ -3611,6 +3611,12 @@ test("plans are read at once, then an agent's again when it runs the plan script
   assert.deepEqual(JSON.parse(JSON.stringify(asked.at(-1))), [2]);
   assert.equal(p.taskCard('app.build').last, '✱ Ship it');
   assert.equal(p.taskCard('app.build').elapsed, '2/3');
+  // A provider may escape the slashes in its JSON; the decoded command still names the script.
+  files.set(2, '[x] Read it\n[x] Write it\n[>] Ship it\n[ ] Tell them\n');
+  await p.onEvent({ event: 'tool_started', bot: 'app.build', turn: 1, data: { call_id: 'c5', name: 'shell', arguments: JSON.stringify({ command: `sh "$HOME/.agents/skills/plan/plan" '[ ] Tell them'` }).replaceAll('/', '\\/') } });
+  await p.onEvent({ event: 'tool_completed', bot: 'app.build', turn: 1, data: { call_id: 'c5' } });
+  await settle();
+  assert.equal(p.taskCard('app.build').elapsed, '2/4');
   // A long plan's call arrives cut short, as the daemon previews it, and still reads the plan.
   files.set(2, '[x] Read it\n[x] Write it\n[x] Ship it\n');
   const cut = JSON.stringify({ command: `sh "$HOME/.agents/skills/plan/plan" '[x] Read it' '[x] ${'Write it '.repeat(300)}` }).slice(0, 2048);
