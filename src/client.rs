@@ -166,10 +166,7 @@ fn parse(args: &[String]) -> Result<Options> {
     let mut store = None;
     while let Some(arg) = iter.next() {
         match arg.as_str() {
-            "--pretty" => {
-                options.pretty = true;
-                PRETTY.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
+            "--pretty" => options.pretty = true,
             "--no-spawn" => options.no_spawn = true,
             "--new" => options.new = true,
             "--agents" => options.agents = true,
@@ -1181,10 +1178,6 @@ fn models(options: &Options) -> Result<i32> {
     Ok(0)
 }
 
-/// Whether the parser accepted `--pretty`, so a failure is reported the way
-/// output was asked for; a `--pretty` it rejected is not a request.
-pub static PRETTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 fn print_json(value: &Value, pretty: bool) -> Result<()> {
     if pretty {
         println!("{}", serde_json::to_string_pretty(value)?);
@@ -1355,6 +1348,17 @@ fn run(options: &Options) -> Result<i32> {
 /// models included, do not act on a description of them. The daemon names
 /// the same ways as request fields.
 fn ways_past_busy(bot: &str, error: Error) -> Error {
+    if error.code == "active_agent_limit" {
+        let mut error = Error {
+            detail: Some("the daemon runs as many turns as it may".into()),
+            ..error
+        };
+        error.facts.get_or_insert_default().insert(
+            "hint".into(),
+            json!("resend with --delivery queue to run it when there is room"),
+        );
+        return error;
+    }
     if error.code != "bot_busy" {
         return error;
     }
@@ -2581,6 +2585,29 @@ fn preview(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refusals_past_capacity_give_the_flags_that_get_past_them() {
+        let full = ways_past_busy(
+            "Bob",
+            Error::with("active_agent_limit", "delivery queue waits for room"),
+        );
+        assert_eq!(
+            full.facts.unwrap()["hint"],
+            "resend with --delivery queue to run it when there is room"
+        );
+        let busy = ways_past_busy(
+            "Bob",
+            Error::new("bot_busy").facts(json!({"running_turn":4})),
+        );
+        assert_eq!(busy.detail.as_deref(), Some("turn 4 is running"));
+        assert!(
+            busy.facts.unwrap()["hint"]
+                .as_str()
+                .unwrap()
+                .starts_with("resend with --delivery steer --turn 4")
+        );
+    }
 
     #[test]
     fn summaries_read_the_field_from_a_cut_preview_and_mark_what_is_hidden() {

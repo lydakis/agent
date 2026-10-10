@@ -210,8 +210,8 @@ class ApprovalTests(ModelFixture):
         reader = client.request('create', bot='Eve', workspace=str(self.path), tools=['echo'],
                                 created_by='Bob', created_by_id=bob['id'])['result']
         self.assertEqual(reader['gates'], [])
-        self.assertEqual(client.request('create', bot='Fay', approve=['read'], approver='manual')['error'],
-                         'approve_not_in_tools')
+        refused = client.request('create', bot='Fay', approve=['read'], approver='manual')
+        self.assertEqual((refused['error'], refused['approve']), ('approve_not_in_tools', ['read']))
         self.assertEqual(client.request('create', bot='Fay', approve=['shell'])['error'], 'invalid_gate')
         # A list longer than the daemon's tools is refused before any work on it.
         self.assertEqual(client.request('create', bot='Fay', approve=['shell'] * 20000,
@@ -528,8 +528,10 @@ class ServedApprovalTests(ModelFixture):
         self.assertEqual(daemon.request('stats')['result']['approvers'], [])
         # Duplicate registration and a bad page both preserve the lease.
         lease = session.request('serve_approvals', tag='auto', lease_ms=5000)['result']['lease']
-        self.assertEqual(session.request('serve_approvals', tag='auto', lease_ms=5000)['error'],
-                         'approvals_served')
+        again = session.request('serve_approvals', tag='auto', lease_ms=5000)
+        # It is told to renew the lease it holds, not that another session has it.
+        self.assertEqual((again['error'], again['lease']), ('approvals_served', lease))
+        self.assertIn('this session', again['detail'])
         for limit in (0, 257):
             self.assertEqual(session.request('serve_approvals', tag='auto', lease_ms=5000, limit=limit)['error'],
                              'invalid_approval_page')

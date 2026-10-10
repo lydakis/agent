@@ -138,6 +138,9 @@ class SocketAndCliTests(ModelFixture):
         # A --pretty the parser took as a missing value is not a request for it.
         missing = self.agent('run', '--store', str(self.store), '--bot', '--pretty', check=False)
         self.assertEqual((missing.returncode, json.loads(missing.stderr)['error']), (2, 'usage'))
+        # One accepted before the failing flag is.
+        pretty = self.agent('run', '--store', str(self.store), '--pretty', '--bot', check=False)
+        self.assertEqual((pretty.returncode, pretty.stderr), (2, 'agent: usage: --bot needs a value\n'))
         threading.Timer(.3, self.model.release_headers.set).start()
         self.agent('shutdown', '--store', str(self.store), '--grace', '5')
         self.assertFalse(self.socket.exists())

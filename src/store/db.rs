@@ -999,6 +999,18 @@ fn inside_character(code: &str) -> Error {
     )
 }
 
+/// A turn's end carries its error's facts, as a refusal's reply does, so a
+/// client reads them from `turn_finished` or a wait instead of the detail.
+fn with_facts(data: &mut Value, error: Option<&Error>) {
+    let (Some(data), Some(facts)) = (data.as_object_mut(), error.and_then(|e| e.facts.as_deref()))
+    else {
+        return;
+    };
+    for (key, value) in facts {
+        data.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+}
+
 /// A gate can hold back only tools the bot may call.
 fn not_in_tools(gated: &[String], tools: &[String]) -> Result<()> {
     let missing: Vec<&String> = gated.iter().filter(|t| !tools.contains(t)).collect();
@@ -1009,7 +1021,7 @@ fn not_in_tools(gated: &[String], tools: &[String]) -> Result<()> {
         "approve_not_in_tools",
         "a gate can hold back only tools the bot may call",
     )
-    .facts(json!({"tools":missing})))
+    .facts(json!({"approve":missing})))
 }
 
 fn budget_exhausted(bot: &Bot, budget: u64) -> Error {
@@ -3940,7 +3952,8 @@ impl Database {
         if status == "ready" {
             promote(&tx, &name)?;
         }
-        let data = json!({"status":ended,"checkpoint":Value::Null,"error":error.code,"detail":error.detail});
+        let mut data = json!({"status":ended,"checkpoint":Value::Null,"error":error.code,"detail":error.detail});
+        with_facts(&mut data, Some(error));
         let cursor = event(&tx, &name, Some(turn), "turn_finished", data.clone())?;
         tx.commit()?;
         self.pending_left(prompt_bytes as usize);
@@ -5261,8 +5274,9 @@ impl Database {
                 params![bot.name, head],
             )?;
         }
-        let data = json!({"status":status,"checkpoint":if status == "completed" { head } else { None },
+        let mut data = json!({"status":status,"checkpoint":if status == "completed" { head } else { None },
             "error":code,"detail":error.and_then(|e| e.detail.clone())});
+        with_facts(&mut data, error);
         let cursor = event(&tx, &bot.name, Some(turn), "turn_finished", data.clone())?;
         tx.commit()?;
         self.approvals -= unstarted;

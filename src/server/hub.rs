@@ -306,6 +306,14 @@ impl Hub {
                 // Only a started lease that is not mid-answer runs out.
                 let left = (held.started && !held.answering)
                     .then(|| held.deadline.saturating_duration_since(now).as_millis() as u64);
+                // A session serving the tag already keeps it by renewing.
+                if held.session == session {
+                    return Err(Error::with(
+                        "approvals_served",
+                        format!("this session serves {tag} already; renew its lease"),
+                    )
+                    .facts(json!({"tag":tag,"lease":held.lease,"lease_left_ms":left})));
+                }
                 return Err(Error::with(
                     "approvals_served",
                     format!("another session serves {tag} until it lets go or its lease runs out"),
