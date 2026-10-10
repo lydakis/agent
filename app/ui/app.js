@@ -309,9 +309,9 @@ function shortName(b) {
   if (b.name === p + LEAD) return p;
   return b.name.startsWith(p + '.') ? b.name.slice(p.length + 1) : b.name;
 }
-// The fleet in order: each project's coordinator, then its tasks by lineage, then the bots in no
-// project, each row with its depth. The sidebar draws one level of it and the finder all of it.
-// Rebuilt once per fleet shape change; it also stamps each bot's project.
+// The fleet in order: each project's coordinator, then its swarms with their agents and its tasks by
+// lineage, then the bots in no project, each row with its depth. Every bot is in it once: the list
+// draws one level of it, and the finder and the arrow keys all of it. It also stamps each bot's project.
 function tree() {
   // One pass builds the children index; an explicit stack walks it, so a deep delegation chain
   // costs one prefix string per row and no recursion.
@@ -334,38 +334,43 @@ function tree() {
   const swarmsOf = new Map();
   for (const sw of S.swarms.values()) { const p = projects.has(sw.project) ? sw.project : null; if (!swarmsOf.has(p)) swarmsOf.set(p, []); swarmsOf.get(p).push(sw); }
   // Coordinators head their own projects wherever they were created.
+  // A swarm's agents sit under its row, not under whoever made them.
+  const held = new Set();
+  for (const sw of S.swarms.values()) for (const m of sw.members) if (memberBot(sw, m)) held.add(m);
   const pushKids = (parent, depth, cont, project, extra) => {
-    const kids = [...(children.get(parent) ?? []), ...(extra ?? [])].filter((b) => !seen.has(b.name) && !leadProject(b.name));
+    const kids = [...(children.get(parent) ?? []), ...(extra ?? [])].filter((b) => !seen.has(b.name) && !held.has(b.name) && !leadProject(b.name));
     for (let i = kids.length - 1; i >= 0; i--) stack.push([kids[i], depth, i === kids.length - 1, cont, project]);
   };
-  const walk = (hidden) => {
+  const walk = () => {
     while (stack.length) {
       const [b, depth, last, cont, project] = stack.pop();
       if (seen.has(b.name)) continue; seen.add(b.name); b.project = project;
       const prefix = depth === 0 ? '' : cont + (last ? '└ ' : '├ ');
-      if (!hidden) out.push({ b, depth, prefix });
+      out.push({ b, depth, prefix });
       // The continuation stops growing past a few levels: a chain of thousands must not cost thousands per row.
       pushKids(b.name, depth + 1, depth === 0 ? '' : depth > 6 ? cont : cont + (last ? '  ' : '│ '), project);
     }
   };
-  // A swarm's agents, and whatever they made, are drawn in the swarm's own view, not here.
-  for (const sw of S.swarms.values()) for (const m of sw.members) { const b = memberBot(sw, m); if (b && !seen.has(m)) { stack.push([b, 1, true, '', sw.project]); walk(true); } }
-  const swarmRows = (list, depth) => [...(list ?? [])].sort((a, c) => a.name.localeCompare(c.name)).map((sw) => ({ swarm: sw, key: swarmKey(sw.name), depth, prefix: depth ? '├ ' : '' }));
+  const pushSwarms = (list, depth) => [...(list ?? [])].sort((a, c) => a.name.localeCompare(c.name)).map((sw) => {
+    const row = { swarm: sw, key: swarmKey(sw.name), depth, prefix: depth ? '├ ' : '' }; out.push(row);
+    const ms = sw.members.map((m) => memberBot(sw, m)).filter(Boolean);
+    for (let i = ms.length - 1; i >= 0; i--) stack.push([ms[i], depth + 1, i === ms.length - 1, depth ? '│ ' : '', sw.project]);
+    walk(); return row;
+  });
   for (const p of [...projects.keys()].sort()) {
     const lead = projects.get(p); seen.add(lead.name); lead.project = p;
     out.push({ b: lead, depth: 0, prefix: '', head: p });
     // Its swarms first, one row each, then its tasks.
-    const rows = swarmRows(swarmsOf.get(p), 1);
-    out.push(...rows);
+    const rows = pushSwarms(swarmsOf.get(p), 1);
     const before = out.length;
-    pushKids(lead.name, 1, '', p, prefixed.get(p)); walk(false);
+    pushKids(lead.name, 1, '', p, prefixed.get(p)); walk();
     if (rows.length && out.length === before) rows.at(-1).prefix = '└ ';
   }
   const loose = out.length;
-  pushKids(null, 0, '', null); walk(false);
-  out.push(...swarmRows(swarmsOf.get(null), 0));
+  pushKids(null, 0, '', null); walk();
+  pushSwarms(swarmsOf.get(null), 0);
   // Anything the roots do not reach is rooted where it stands: one pass, nothing hidden.
-  for (const b of S.bots.values()) if (!seen.has(b.name)) { stack.push([b, 0, true, '', null]); walk(false); }
+  for (const b of S.bots.values()) if (!seen.has(b.name)) { stack.push([b, 0, true, '', null]); walk(); }
   if (projects.size && out.length > loose) out.splice(loose, 0, { label: 'bots' });
   return out;
 }
@@ -381,7 +386,7 @@ function callSummary(name, args) {
 // ---------- swarms ----------
 // A swarm is the app's: its folder in ~/.agent/swarms holds its goal, its members and its board, and its
 // agents are ordinary bots named `<swarm>-N`. It is one row under its project, selected by a key no bot
-// name can be; its agents live in its view. Its board is read only while it is on screen, from where the
+// name can be; its agents sit under it in the fleet and are listed in its view. Its board is read only while it is on screen, from where the
 // last read ended, whenever one of its agents does something durable, so a quiet swarm costs nothing.
 const SWARM = '⁂';
 const swarmKey = (name) => SWARM + name;
@@ -592,7 +597,7 @@ async function createSwarm(project, { goal, n, mix, shared, budget, council = 0 
   goal = goal.trim(); if (!goal) throw new Error('goal_required: a swarm needs a goal');
   const r = await Daemon.swarmStart({ project, folder: lead.workspace, goal, shared, mix, agents: n, budgetTokens: budget, council });
   const sw = await learnStarted(r, n);
-  await openOnly(swarmKey(sw.name));
+  await go(swarmKey(sw.name));
 }
 // An added agent comes from the row furthest below its share.
 async function addAgent(sw) {
@@ -1918,12 +1923,19 @@ $('sheet').addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.meta
 // row. It shows a window of rows; scrolling to an edge extends it. A fleet of thousands costs a
 // screenful of rows, not a row each per event.
 const RAIL_ROWS = 300;
-const rail = { shapeGen: -1, all: [], at: new Map(), open: null, rows: [], index: new Map(), drawn: '', start: 0, end: 0, key: '' };
-function railRows() {
-  if (rail.shapeGen !== S.shapeGen) {
-    rail.all = tree(); rail.at = new Map(); rail.all.forEach((n, i) => { const k = n.key ?? n.b?.name; if (k) rail.at.set(k, i); });
-    rail.shapeGen = S.shapeGen; rail.open = null;
+// One index of the fleet, every bot and swarm in tree order, rebuilt only when its shape changes: the
+// list's levels, the finder and the arrow keys all read it.
+const fleet = { shapeGen: -1, rows: [], at: new Map() };
+function fleetIndex() {
+  if (fleet.shapeGen !== S.shapeGen) {
+    fleet.rows = tree(); fleet.at = new Map(); fleet.rows.forEach((n, i) => { const k = n.key ?? n.b?.name; if (k) fleet.at.set(k, i); });
+    fleet.shapeGen = S.shapeGen; rail.open = null;
   }
+  return fleet;
+}
+const rail = { open: null, rows: [], index: new Map(), drawn: '', start: 0, end: 0, key: '' };
+function railRows() {
+  fleetIndex();
   if (rail.open !== S.selected) {
     rail.rows = levelOf(S.selected); rail.index = new Map(); rail.rows.forEach((n, i) => { const k = n.key ?? n.b?.name; if (k) rail.index.set(k, i); });
     rail.open = S.selected; rail.key = '';
@@ -1933,10 +1945,8 @@ function railRows() {
 // The rows one level below `open`: those after it one deeper, until the tree comes back up to its
 // depth. Each counts the rows one further down, so the list says which go deeper.
 function levelOf(open) {
-  const sw = swarmOf(open);
-  if (sw) return countMade(sw.members.map((m) => memberBot(sw, m)).filter(Boolean).map((b) => ({ b, depth: 0, kids: 0 })));
-  const all = rail.all, at = open ? rail.at.get(open) : -1;
-  if (at === undefined) return S.bots.has(open) ? madeBy(open) : [];
+  const { rows: all } = fleet, at = open ? fleet.at.get(open) : -1;
+  if (at === undefined) return [];
   const depth = open ? all[at].depth : -1, out = [];
   for (let i = at + 1; i < all.length; i++) {
     const n = all[i];
@@ -1944,20 +1954,6 @@ function levelOf(open) {
     if (n.depth <= depth) break;
     if (n.depth === depth + 1) out.push({ ...n, kids: 0 }); else if (n.depth === depth + 2) out.at(-1).kids += 1;
   }
-  return out;
-}
-// A swarm's agents, and what they made, are left out of the tree: their level is read from who made
-// whom, in one pass over the fleet when one of them is opened.
-function madeBy(open) {
-  const out = [];
-  for (const b of S.bots.values()) if (!leadProject(b.name) && creatorOf(b)?.name === open) out.push({ b, depth: 0, kids: 0 });
-  return countMade(out);
-}
-// Each row counts the agents its bot made, in one pass over the fleet.
-function countMade(out) {
-  if (!out.length) return out;
-  const at = new Map(out.map((n, i) => [n.b.name, i]));
-  for (const b of S.bots.values()) { const i = leadProject(b.name) ? undefined : at.get(creatorOf(b)?.name); if (i !== undefined) out[i].kids += 1; }
   return out;
 }
 const levelName = () => !S.selected ? (rail.rows.some((n) => n.head != null) ? 'projects' : 'agents') : swarmOf(S.selected) ? 'agents' : leadProject(S.selected) ? 'threads' : 'helpers';
@@ -2087,7 +2083,7 @@ setInterval(() => { if (S.attached && anyActive()) { refreshLive($('log')); if (
 // ---------- picker ----------
 function pickerRows() {
   const q = $('pickerq').value.trim().toLowerCase();
-  return tree().filter((n) => n.b).map((n) => ({ ...n, i: q ? n.b.name.toLowerCase().indexOf(q) : -1 })).filter((r) => !q || r.i >= 0);
+  return fleetIndex().rows.filter((n) => n.b).map((n) => ({ ...n, i: q ? n.b.name.toLowerCase().indexOf(q) : -1 })).filter((r) => !q || r.i >= 0);
 }
 const PICKER_ROWS = 200;
 function renderPicker() {
@@ -2254,7 +2250,7 @@ async function submit(text, pane = 'main', to = PANE[pane].bot()) {
     const session = S.session;
     const record = await Daemon.request('create', { bot: name, workspace: S.config.workspace, model: m, ...(effort ? { reasoning: effort } : {}), instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: S.config.tools });
     await enqueue(() => { if (S.session === session) seat(record, session); });
-    await openOnly(name); toast(`created ${name} · ${policy.note}`); return;
+    await go(name); toast(`created ${name} · ${policy.note}`); return;
   }
   if (text === '/help' || text === '?') { showHelp(pane); return; }
   const sw = pane === 'main' && swarmOf(to);
@@ -2300,7 +2296,7 @@ async function fork(name) {
   const record = await Daemon.request('fork', { source: name, bot: copy, ...(parent ? { created_by: parent.name, created_by_id: parent.id } : {}) });
   await enqueue(() => { if (S.session === session) seat(record, session); });
   S.shapeGen += 1;
-  await openBeside(copy);
+  await go(copy, 'beside');
 }
 // A side chat is a fork of a bot, running or not, from its newest finished round, nested under it
 // and opened beside; the source is untouched. It has its source's tools and works in its source's
@@ -2319,7 +2315,7 @@ async function sideChat(name, text = '') {
     try { await Daemon.request('submit', { bot: copy, bot_id: record.id, request_id: `app-${crypto.randomUUID()}`, prompt: text, delivery: 'reject', ...home(record) }); }
     catch (err) { failed = err instanceof Error ? err : new Error(String(err)); }
   }
-  if (S.ui.side !== copy) await openBeside(copy);
+  if (S.ui.side !== copy) await go(copy, 'beside');
   if (!failed) return;
   // The side chat exists, so an unsent first message waits in its composer, not its source's.
   const pane = Object.values(PANE).find((p) => p.bot() === copy), input = pane && $(pane.input);
@@ -2342,7 +2338,7 @@ async function createProject(dir, picked = null, effort = null, threads = null) 
   if (existing) {
     if (existing.workspace !== info.dir) throw new Error(`${info.coordinator} already belongs to ${existing.workspace ?? 'another folder'}`);
     if (!info.file) await Daemon.writeProject({ dir: info.dir, name: info.name, model: existing.model, reasoning: existing.reasoning ?? null, threads });
-    await openOnly(info.coordinator); return;
+    await go(info.coordinator); return;
   }
   const policy = await Daemon.policy(info.dir, 'coordinator');
   // A folder that already has a project file keeps its model and effort; a new one takes the model
@@ -2357,7 +2353,7 @@ async function createProject(dir, picked = null, effort = null, threads = null) 
   const record = await Daemon.request('create', { bot: info.coordinator, workspace: info.dir, model, ...(reasoning ? { reasoning } : {}), instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: policy.tools ?? S.config.tools });
   await enqueue(() => { if (S.session === session) seat(record, session); });
   if (!info.file) await Daemon.writeProject({ dir: info.dir, name: info.name, model, reasoning, threads });
-  await openOnly(info.coordinator); toast(`project ${info.name} · ${policy.note}`);
+  await go(info.coordinator); toast(`project ${info.name} · ${policy.note}`);
 }
 function detach() { save(); Daemon.close(); }
 
@@ -2692,25 +2688,35 @@ function renderSetup() {
   for (const el of box.querySelectorAll('input, select')) { const v = kept.get(el.name || el.id); if (v !== undefined) el.value = v; if (focused && (el.name || el.id) === focused) el.focus(); }
 }
 
-// ---------- opening threads ----------
-// Full screen, with nothing beside it: an agent already in a tab is that tab; from Home, or as asked,
-// it opens a new tab; otherwise it takes the tab in view, a level up or down. '' is Home.
-async function openOnly(name, tab = false) {
-  if (name && !isOpen(name)) return;
-  const tabs = S.ui.tabs, at = tabs.indexOf(S.selected);
-  if (name && !tabs.includes(name)) { if (tab || at < 0) tabs.push(name); else tabs[at] = name; }
-  S.selected = name; S.ui.side = null;
-  const sw = swarmOf(name);
-  if (sw) { readBoard(sw); readUsage(sw); }
+// ---------- moving around ----------
+// Every move goes through `go`: rows, Home, tabs, crumbs, the finder, keys, and what the app opens on its
+// own. It first drops a row's pending look, so the newest choice wins. `how` says where `name` goes:
+// - 'here': full screen. An agent already in a tab is that tab; from Home it opens a new tab; otherwise
+//   it takes the tab in view, a level up or down. '' is Home.
+// - 'tab': full screen in a new tab.
+// - 'beside': beside what is open, with its own composer; the one already beside closes instead.
+// - 'close': its tab closes, and an open one hands the window to the tab before it, or Home.
+async function go(name, how = 'here') {
+  clearTimeout(rowLook.timer);
+  const tabs = S.ui.tabs;
+  if (how === 'close') {
+    const i = tabs.indexOf(name); if (i < 0) return;
+    tabs.splice(i, 1);
+    if (S.selected !== name) { render(); save(); return; }
+    name = i > 0 ? tabs[i - 1] : ''; how = 'here';
+  }
+  if (how === 'beside') {
+    if (!S.bots.has(name) || name === S.selected) return;
+    S.ui.side = S.ui.side === name ? null : name;
+  } else {
+    if (name && !isOpen(name)) return;
+    const at = tabs.indexOf(S.selected);
+    if (name && !tabs.includes(name)) { if (how === 'tab' || at < 0) tabs.push(name); else tabs[at] = name; }
+    S.selected = name; S.ui.side = null;
+    const sw = swarmOf(name); if (sw) { readBoard(sw); readUsage(sw); }
+  }
   await enqueue(loadVisible); render(); save();
-}
-const openTab = (name) => openOnly(name, true);
-// A closed tab hands the window to the one before it; before the first is Home.
-async function closeTab(name) {
-  const tabs = S.ui.tabs, i = tabs.indexOf(name); if (i < 0) return;
-  tabs.splice(i, 1);
-  if (S.selected === name) { await openOnly(i > 0 ? tabs[i - 1] : ''); return; }
-  render(); save();
+  focusInput(S.ui.side && how === 'beside' ? 'side' : 'main');
 }
 // A tab whose agent is gone shows `to` instead, or closes when that is Home or already a tab.
 function retab(name, to) {
@@ -2718,23 +2724,11 @@ function retab(name, to) {
   if (to && !tabs.includes(to)) tabs[i] = to; else tabs.splice(i, 1);
   if (S.selected === name) S.selected = to && tabs.includes(to) ? to : '';
 }
-// A task card, or a row in the list, opens its bot beside; clicking the card again closes it.
-async function openBeside(name, toggle = true) {
-  if (!S.bots.has(name) || name === S.selected) return;
-  S.ui.side = toggle && S.ui.side === name ? null : name;
-  await enqueue(loadVisible); render(); save();
-  focusInput(S.ui.side ? 'side' : 'main');
-}
 // Ctrl-P puts the next peer beside, with its own draft.
 async function nextBeside() {
   const ps = peers().filter((who) => who !== S.selected); if (!ps.length) return;
-  const next = ps[(ps.indexOf(S.ui.side) + 1) % ps.length]; if (next === S.ui.side) return;
-  S.ui.side = next;
-  await enqueue(loadVisible); render(); save(); focusInput('side');
+  const next = ps[(ps.indexOf(S.ui.side) + 1) % ps.length]; if (next !== S.ui.side) await go(next, 'beside');
 }
-// What is beside goes full screen, in this tab, or a new one from Home. Its draft goes with it.
-async function full() { if (S.ui.side) { await openOnly(S.ui.side); focusInput('main'); } }
-function closeSide() { if (!S.ui.side) return; S.ui.side = null; render(); save(); focusInput('main'); }
 // Late, after a load: by then the finder or a sheet may have opened, and it keeps the keyboard.
 function focusInput(pane) { const el = $(PANE[pane].input); if (el) setTimeout(() => { if (!covered()) el.focus({ preventScroll: true }); }, 0); }
 
@@ -2762,9 +2756,9 @@ $('pickerq').addEventListener('keydown', async (e) => {
   if (e.key === 'Escape') { closePicker(); e.preventDefault(); }
   else if (e.key === 'ArrowDown' || (e.ctrlKey && e.key === 'n')) { S.ui.pickerSel = Math.min(rows.length - 1, S.ui.pickerSel + 1); renderPicker(); e.preventDefault(); }
   else if (e.key === 'ArrowUp' || (e.ctrlKey && e.key === 'p')) { S.ui.pickerSel = Math.max(0, S.ui.pickerSel - 1); renderPicker(); e.preventDefault(); }
-  else if (e.key === 'Enter') { const r = rows[S.ui.pickerSel]; closePicker('main'); if (r) await openTab(r.b.name); e.preventDefault(); }
+  else if (e.key === 'Enter') { const r = rows[S.ui.pickerSel]; closePicker('main'); if (r) await go(r.b.name, 'tab'); e.preventDefault(); }
 });
-$('pickerlist').addEventListener('click', async (e) => { const r = e.target.closest('[data-pick]'); if (r) { closePicker('main'); await openTab(r.dataset.pick); } });
+$('pickerlist').addEventListener('click', async (e) => { const r = e.target.closest('[data-pick]'); if (r) { closePicker('main'); await go(r.dataset.pick, 'tab'); } });
 const inputIds = new Set(['input', 'sideinput', 'pickerq']);
 document.addEventListener('keydown', async (e) => {
   if (S.ui.help) { hideHelp(); e.preventDefault(); return; }
@@ -2777,21 +2771,21 @@ document.addEventListener('keydown', async (e) => {
   if (S.ui.menu) { if (k === 'Escape') { closeMenu(); e.preventDefault(); } return; }
   // A tab is chosen with Enter or Space, as a button is; its close button keeps its own keys.
   const tab = e.target.closest?.('[data-tab]');
-  if (tab && (k === 'Enter' || k === ' ') && !e.target.closest('[data-act]')) { await openOnly(tab.dataset.tab); e.preventDefault(); return; }
+  if (tab && (k === 'Enter' || k === ' ') && !e.target.closest('[data-act]')) { await go(tab.dataset.tab); e.preventDefault(); return; }
   if (ctrl && k === 'k') { openPicker(); e.preventDefault(); return; }
   // A hidden sidebar patches no rows, so it draws them all again when it opens.
   if (ctrl && k === 'b') { S.ui.rail = !S.ui.rail; if (S.ui.rail) rail.key = ''; render(); save(); e.preventDefault(); return; }
   if (ctrl && k === 'd') { detach(); e.preventDefault(); return; }
   if (ctrl && k === 'o') { S.ui.steps = !S.ui.steps; render(); save(); e.preventDefault(); return; }
   if (ctrl && k === 'p') { await nextBeside(); e.preventDefault(); return; }
-  if (k === 'Escape') { if (S.ui.file) closeFile(); else if (S.ui.side) closeSide(); else await interrupt(); e.preventDefault(); return; }
+  if (k === 'Escape') { if (S.ui.file) closeFile(); else if (S.ui.side) await go(S.ui.side, 'beside'); else await interrupt(); e.preventDefault(); return; }
   const empty = e.target.id === 'input' && $('input').value === '';
   // Up and down step through every agent in order; from Home, down is the first and up the last.
   if (empty && (k === 'ArrowUp' || k === 'ArrowDown')) {
-    railRows(); const names = rail.all.filter((n) => n.b).map((n) => n.b.name), down = k === 'ArrowDown';
+    const names = fleetIndex().rows.filter((n) => n.b).map((n) => n.b.name), down = k === 'ArrowDown';
     let i = names.indexOf(S.selected);
     i = i >= 0 ? (i + (down ? 1 : names.length - 1)) % names.length : S.selected ? -1 : down ? 0 : names.length - 1;
-    if (i >= 0) await openOnly(names[i]);
+    if (i >= 0) await go(names[i]);
     e.preventDefault(); return;
   }
   if (!inputIds.has(e.target.id) && k.length === 1 && !ctrl && !e.altKey) $('input').focus();
@@ -2825,13 +2819,14 @@ async function act(el) {
     case 'delete': showMenu([{ act: 'delete-yes', who, label: `Delete ${shortName(bot(who))}`, danger: true }, { act: 'close-menu', label: 'Cancel' }], menuAnchor ?? { rect }); return;
     case 'delete-yes': await remove(who); return;
     case 'steps': S.ui.steps = !S.ui.steps; render(); save(); return;
-    case 'open': await openOnly(who); return;
-    case 'home': await openOnly(''); return;
-    case 'open-tab': await openTab(who); return;
-    case 'close-tab': await closeTab(who); return;
+    case 'open': await go(who); return;
+    case 'home': await go(''); return;
+    case 'open-tab': await go(who, 'tab'); return;
+    case 'close-tab': await go(who, 'close'); return;
     case 'find': openPicker(); return;
-    case 'full': await full(); return;
-    case 'close-side': closeSide(); return;
+    // What is beside goes full screen, with its draft; ← closes it.
+    case 'full': if (S.ui.side) await go(S.ui.side); return;
+    case 'close-side': if (S.ui.side) await go(S.ui.side, 'beside'); return;
     case 'close-file': closeFile(); return;
     case 'new-project': await openProjectSheet(); return;
     case 'np-choose': await chooseProjectFolder(); return;
@@ -2870,13 +2865,21 @@ async function act(el) {
   }
 }
 document.addEventListener('click', async (e) => {
-  // The system counts a double-click by place and time, not by what is under the pointer: when the
-  // first click's look already covers the list, the second lands on the look and still opens the row.
-  const first = lastRow; lastRow = null;
+  // The click right after a row's names that row: the system counts a double-click by place and time,
+  // not by what is under the pointer, so the second can land on the look the first opened. Any click is
+  // a newer choice than a pending look.
+  const first = rowLook.who, before = rowLook.before; rowLook.who = rowLook.before = null;
+  clearTimeout(rowLook.timer);
   if (S.ui.help) { hideHelp(); return; }
   if (e.target.closest?.('#sheetwrap') && !e.target.closest('#sheet')) { closeSheet(); return; }
   if (e.target.closest('#pickerwrap') && !e.target.closest('.picker')) { closePicker(); return; }
-  if (e.detail === 2 && first) { closeMenu(); try { await rowTwice(first); } catch (err) { failed(err); } focusInput('main'); return; }
+  // A double-click opens the row as a new tab, from where the window was before its first click.
+  if (e.detail === 2 && first) {
+    closeMenu();
+    if (before) { S.ui.tabs = before.tabs.filter(isOpen); S.selected = isOpen(before.selected) ? before.selected : ''; }
+    try { await go(first, 'tab'); } catch (err) { failed(err); }
+    return;
+  }
   if (Rich.click(e)) { closeMenu(); return; }
   const button = e.target.closest('[data-act]');
   closeMenu();
@@ -2885,39 +2888,22 @@ document.addEventListener('click', async (e) => {
   if (e.target.closest('#menu')) return;
   const step = e.target.closest('[data-out], [data-run]'), task = e.target.closest('[data-task]'), row = e.target.closest('[data-bot]'), tab = e.target.closest('[data-tab]');
   if (step) toggleStep(step);
-  // Opening a task beside puts the keyboard where openBeside chose.
-  else if (task) { await openBeside(task.dataset.task); return; }
-  // A row looks in beside, a beat later, so a double-click can claim it before the list turns into
-  // the look; a swarm has no place beside, so it opens, as late. The second click opens a tab: the system
-  // counts it, so it holds even when a slower double-click lands on a row the look redrew.
+  else if (task) { await go(task.dataset.task, 'beside'); return; }
+  // A row waits a beat, so a double-click can claim it, then looks in beside; a swarm has no place
+  // beside, so it opens in the tab in view.
   else if (row) {
-    clearTimeout(rowClick);
-    const who = row.dataset.bot;
-    if (e.detail === 2) { try { await openTab(who); } catch (err) { failed(err); } }
-    else if (e.detail > 2) return;
-    else {
-      const look = lastRow = { who, was: null };
-      rowClick = setTimeout(() => {
-        // A swarm opens in place; a double-click finishing late gives back the tab it took.
-        if (swarmOf(who)) { if (!S.ui.tabs.includes(who)) look.was = S.selected; openOnly(who).then(() => focusInput('main')).catch(failed); }
-        else openBeside(who, false).catch(failed);
-      }, DOUBLE_CLICK_MS);
-      return;
-    }
+    if (e.detail > 1) return;
+    const who = rowLook.who = row.dataset.bot;
+    rowLook.timer = setTimeout(() => { rowLook.before = { tabs: [...S.ui.tabs], selected: S.selected }; go(who, swarmOf(who) ? 'here' : 'beside').catch(failed); }, DOUBLE_CLICK_MS);
+    return;
   }
-  else if (tab) await openOnly(tab.dataset.tab);
+  else if (tab) await go(tab.dataset.tab);
   // Clicks return the keyboard to the pane's composer, unless they selected text to copy.
   if (!e.target.closest('input, textarea, form') && window.getSelection?.()?.isCollapsed !== false) focusInput(e.target.closest('.pane.side') ? 'side' : 'main');
 });
+// A row's pending look: its timer, its row, and once it ran, where the window was before it.
 const DOUBLE_CLICK_MS = 230;
-let rowClick = null, lastRow = null;
-// The second click of a row's double-click: its tab, beside the one in view.
-async function rowTwice({ who, was }) {
-  clearTimeout(rowClick);
-  const i = S.ui.tabs.indexOf(who);
-  if (was && i >= 0 && S.selected === who && !S.ui.tabs.includes(was)) S.ui.tabs[i] = was;
-  await openTab(who);
-}
+const rowLook = { timer: null, who: null, before: null };
 document.addEventListener('contextmenu', (e) => {
   const t = e.target.closest('[data-bot], [data-task], [data-tab]'); if (!t) return;
   const who = t.dataset.bot ?? t.dataset.task ?? t.dataset.tab;
