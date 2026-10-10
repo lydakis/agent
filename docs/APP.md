@@ -1384,8 +1384,13 @@ and licenses in `LICENSES.txt`), so drawing a message fetches nothing.
 A file opens beside the chat, in the pane a task opens in, from a path a step
 read, wrote or edited (the path in its line) or a message's link to a path
 (`[plan](PLAN.md)`, `src/a.rs:12` or `a.rs:12`, `src/a.rs#L4`, `README.md#install`; the
-line or section is dropped). A path is the agent's folder's, and a link
-inside an open file is relative to that file. The core reads the first 4 MiB of a regular file (`read_file`; a
+line or section is dropped). A path is relative to the folder the turn that
+named it ran in (`history_nodes` names each turn's, and `accepted` the
+running one's), so a link an agent wrote before it moved still opens what it
+meant. The app keeps a turn's folder only while the turn is in the window; a
+folded turn's folder returns with the page that reloads it. A turn the store no longer holds, as after its fork source was
+deleted, uses the agent's folder now. A link inside an open file is relative
+to that file. The core reads the first 4 MiB of a regular file (`read_file`; a
 FIFO or device is refused, as reading one need not end, and a window on a
 host is refused by name, as its files are the host's). The file draws by its
 kind: Markdown, a diagram (`.mmd`, `.mermaid`) or a chart (`.vl.json`,

@@ -36,7 +36,7 @@ function page(daemon = {}, storage = null) {
   context.Rich = context.window.Rich;
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, save, restore, showMenu, refreshMenu, entries, pickerRows, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readTriggers, tellLead, markSeen, renderFile, go, upOf, crumbsHTML, railRows, renderTabs, triggerAct };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, openFileFrom, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, showNewProject, fork, remove, createProject, save, restore, showMenu, refreshMenu, entries, pickerRows, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readTriggers, tellLead, markSeen, renderFile, go, upOf, crumbsHTML, railRows, renderTabs, triggerAct };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -590,6 +590,42 @@ test('a step links the whole path it named, not its shortened summary', async ()
   assert.match(p.runHTML(p.transcript('Bob'), 0).html, new RegExp(`<a class="fpath" href="#" data-file="${long}"`));
 });
 
+test('a path a message or step names opens from the folder its turn ran in', async () => {
+  const opened = [];
+  const p = page({ readFile: async (full) => { opened.push(full); return new TextEncoder().encode('x'); } });
+  p.setRender(() => {});
+  p.upsert({ name: 'Bob', id: 7, provider: 'alpha', model: 'one', workspace: '/now' });
+  p.S.selected = 'Bob';
+  await p.onEvent({ event: 'accepted', bot: 'Bob', turn: 1, data: { workspace: '/then' } });
+  const t = p.transcript('Bob');
+  // A message and a step carry their turn; a click inside one opens from that turn's folder.
+  assert.match(p.textHTML({ kind: 'text', text: '[a](a.md)', turn: 1 }, t), /^<div class="md" data-turn="1">/);
+  await p.onEvent({ event: 'tool_started', bot: 'Bob', turn: 1, data: { call_id: 'c1', name: 'read', arguments: JSON.stringify({ path: 'b.md' }) } });
+  p.S.ui.steps = true; assert.match(p.runHTML(t, t.items.findIndex((it) => it.kind === 'tool')).html, /data-file="b.md" data-turn="1"/);
+  const inTurn = (turn) => ({ closest: (s) => s === '[data-turn]' && turn != null ? { dataset: { turn: String(turn) } } : null });
+  await p.openFileFrom('a.md', inTurn(1));
+  // A turn the daemon no longer names, or none, opens from the agent's folder now.
+  await p.openFileFrom('a.md', inTurn(9)); await p.openFileFrom('a.md', inTurn(null));
+  assert.deepEqual(opened, ['/then/a.md', '/now/a.md', '/now/a.md']);
+});
+
+test('a history page records the folder of each turn it lists', async () => {
+  const p = page({ request: async (op) => op === 'history_nodes' ? { nodes: [{ node: 2, turn: 4 }, { node: 1, turn: 3 }], workspaces: [{ folder: '/a', turns: [3] }, { folder: '/b', turns: [4] }], next_from: null, next_newer: null } : { items: [] } });
+  const t = p.transcript('Bob'); t.items.push({ kind: 'history', next: null, min: null, loaded: false });
+  await p.load('Bob', true);
+  assert.deepEqual(new Map(t.folders), new Map([[3, '/a'], [4, '/b']]));
+});
+
+test('folding turns out of the window drops their folders', () => {
+  const p = page(); const t = p.transcript('Bob');
+  t.items = Array.from({ length: 1700 }, (_, i) => ({ kind: 'node', node: i + 1, turn: i + 1 }));
+  for (let turn = 1; turn <= 1700; turn++) t.folders.set(turn, '/w');
+  p.evict(t);
+  assert.equal(t.folders.has(1), false);
+  assert.equal(t.folders.get(1700), '/w');
+  assert.ok(t.folders.size <= 1200);
+});
+
 test('a chat covered by a file beside is not seen until the file closes', () => {
   const p = page();
   p.S.ui.side = 'Bob'; p.S.ui.file = { bot: 'Ann', full: '/w/a.md', url: null }; p.S.unseen.add('Bob');
@@ -686,7 +722,7 @@ test('same-millisecond submissions use distinct idempotency keys across clients'
 test('fork history loads by checkpoint in pages even without its source bot', async () => {
   const pages = [];
   const p = page({request:async (op,params) => {
-    if (op === 'history_nodes') { pages.push(params.from); return params.from === 4 ? {nodes:[{node:4,turn:2},{node:3,turn:2}],next_from:2} : {nodes:[{node:2,turn:1},{node:1,turn:1}],next_from:null}; }
+    if (op === 'history_nodes') { pages.push(params.from); return params.from === 4 ? {nodes:[{node:4,turn:2},{node:3,turn:2}],workspaces:[],next_from:2} : {nodes:[{node:2,turn:1},{node:1,turn:1}],workspaces:[],next_from:null}; }
     assert.equal(op,'item'); return {role:params.node % 2 ? 'user':'assistant',content:[{type:'text',text:`inherited ${params.node}`}]};
   }});
   await p.onEvent({event:'forked',bot:'branch',data:{provider:'test',id:2,source:'deleted-source',checkpoint:4}});
@@ -766,7 +802,7 @@ function historyDaemon(requests = []) {
     const min=q.min_node ?? 1, max=q.from;
     const first=q.oldest_first ? min : Math.max(min,max-q.limit+1);
     const last=q.oldest_first ? Math.min(max,min+q.limit-1) : max;
-    return {nodes:Array.from({length:Math.max(0,last-first+1)},(_,i)=>({node:last-i,turn:Math.ceil((last-i)/2)})),next_from:first>min?first-1:null,next_newer:last<max?last+1:null};
+    return {nodes:Array.from({length:Math.max(0,last-first+1)},(_,i)=>({node:last-i,turn:Math.ceil((last-i)/2)})),workspaces:[],next_from:first>min?first-1:null,next_newer:last<max?last+1:null};
   }};
 }
 
@@ -986,6 +1022,14 @@ test('rail scrolling moves a bounded window both ways independently of what is o
 });
 
 
+test('a reconnect snapshot drops the folders of the nodes it rebuilds', async () => {
+  const p=page({request:async()=>({nodes:[{node:2,turn:1},{node:1,turn:1}],workspaces:[{folder:'/a',turns:[1]}],next_from:null,next_newer:null})});
+  p.S.session=1;p.upsert({name:'Bob',id:1,head:2});await p.load('Bob');
+  const t=p.transcript('Bob');assert.equal(t.folders.get(1),'/a');
+  p.lost('offline');p.S.session=2;p.seat({name:'Bob',id:1,head:10},2);
+  assert.equal(t.folders.has(1),false);
+});
+
 test('a delayed reconnect snapshot preserves newer folded replay ranges', async () => {
   const p=page(historyDaemon());p.S.session=1;p.upsert({name:'Bob',id:1,head:2});await p.load('Bob');
   p.lost('offline');p.S.session=2;
@@ -1061,7 +1105,7 @@ test('snapshot reconciliation cannot splice over an in-flight history page', asy
   p.S.session=1;p.upsert({name:'Bob',id:1,head:2});p.S.selected='Bob';p.lost('offline');
   const attaching=p.attach();await settle();assert.equal(firstHistory,false);
   snapshot.resolve({bots:[{name:'Bob',id:1,head:10}],next_after:null});await settle();
-  history.resolve({nodes:[{node:2,turn:1},{node:1,turn:1}],next_from:null});await attaching;
+  history.resolve({nodes:[{node:2,turn:1},{node:1,turn:1}],workspaces:[],next_from:null});await attaching;
   const ids=p.transcript('Bob').items.filter(it=>it.from!=null).map(it=>it.from);
   assert.deepEqual(Array.from(ids).sort((a,b)=>a-b),Array.from({length:10},(_,i)=>i+1));
 });
@@ -1175,7 +1219,7 @@ test('the sidebar lists one level below what is open, and the crumbs go back up'
 });
 
 test('a card looks in beside, full screen takes the tab, and Home and the finder open tabs', async () => {
-  const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
+  const p = shell({ request: async () => ({ nodes: [], workspaces:[],next_from: null }) });
   for (const [name, id] of [['app.lead', 1], ['app.build', 2], ['app.test', 3]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
   p.tree(); await p.go('app.lead');
   assert.deepEqual([...p.S.ui.tabs], ['app.lead'], 'from Home it opens a tab');
@@ -1203,7 +1247,7 @@ test('a card looks in beside, full screen takes the tab, and Home and the finder
 });
 
 test('from Home the arrows open the first or last agent; Enter or Space on a tab chooses it', async () => {
-  const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
+  const p = shell({ request: async () => ({ nodes: [], workspaces:[],next_from: null }) });
   for (const [name, id] of [['app.lead', 1], ['app.build', 2], ['loose', 3]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id === 2 ? 'app.lead' : null, created_by_id: id === 2 ? 1 : null });
   const doc = p.context.document, key = (k, target = { id: 'input' }) => doc.listeners.keydown({ key: k, target, preventDefault() {} });
   await key('ArrowDown'); assert.equal(p.S.selected, 'app.lead', 'down from Home is the first row');
@@ -1423,7 +1467,7 @@ test('one menu per agent: side chat any time, stop while running, fork and delet
 
 test('a side chat forks a running bot under it, beside, with its tools and folder, and takes the first message', async () => {
   const sent = [], storage = new Map(); let sideAtSubmit;
-  const p = shell({ request: async (op, q) => { sent.push([op, q]); if (op === 'submit') sideAtSubmit = p.S.ui.side; return op === 'fork' ? { name: q.bot, id: 10 + sent.length, provider: 'alpha', model: 'one', workspace: q.workspace, created_by: q.created_by, created_by_id: q.created_by_id, allowed: q.allow } : { nodes: [], next_from: null }; } }, storage);
+  const p = shell({ request: async (op, q) => { sent.push([op, q]); if (op === 'submit') sideAtSubmit = p.S.ui.side; return op === 'fork' ? { name: q.bot, id: 10 + sent.length, provider: 'alpha', model: 'one', workspace: q.workspace, created_by: q.created_by, created_by_id: q.created_by_id, allowed: q.allow } : { nodes: [], workspaces:[],next_from: null }; } }, storage);
   p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', workspace: '/synthetic', status: 'running', running_turn: 3, tools: ['shell', 'read', 'write', 'history'] });
   p.S.selected = 'app.lead';
   await p.sideChat('app.lead');
@@ -1463,7 +1507,7 @@ test('an open agent menu is rebuilt when its bot changes status and closed when 
 
 test('fork copies a bot at rest next to it and opens the copy beside', async () => {
   const sent = [];
-  const p = shell({ request: async (op, q) => { sent.push([op, q]); return op === 'fork' ? { name: q.bot, id: 10 + sent.length, provider: 'alpha', model: 'one', created_by: q.created_by, created_by_id: q.created_by_id } : { nodes: [], next_from: null }; } });
+  const p = shell({ request: async (op, q) => { sent.push([op, q]); return op === 'fork' ? { name: q.bot, id: 10 + sent.length, provider: 'alpha', model: 'one', created_by: q.created_by, created_by_id: q.created_by_id } : { nodes: [], workspaces:[],next_from: null }; } });
   p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one' });
   p.upsert({ name: 'app.task', id: 2, provider: 'alpha', model: 'one', created_by: 'app.lead', created_by_id: 1 });
   p.upsert({ name: 'app.busy', id: 3, provider: 'alpha', model: 'one', status: 'running', running_turn: 1 });
@@ -1489,7 +1533,7 @@ test('fork copies a bot at rest next to it and opens the copy beside', async () 
 
 test('a failed send comes back only to the bot it was for', async () => {
   let fail = null;
-  const p = shell({ request: async (op) => { if (op === 'submit') { await new Promise((r) => { fail = r; }); throw new Error('daemon_unavailable'); } return { nodes: [], next_from: null }; } });
+  const p = shell({ request: async (op) => { if (op === 'submit') { await new Promise((r) => { fail = r; }); throw new Error('daemon_unavailable'); } return { nodes: [], workspaces:[],next_from: null }; } });
   for (const [name, id] of [['app.lead', 1], ['app.build', 2], ['app.test', 3]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
   p.tree(); p.S.selected = 'app.lead';
   const doc = p.context.document, side = doc.getElementById('sideinput');
@@ -1504,7 +1548,7 @@ test('a failed send comes back only to the bot it was for', async () => {
 
 test('fork names fit the daemon\'s 128-byte limit and forks work in the source\'s folder', async () => {
   const sent = [];
-  const p = shell({ request: async (op, q) => { sent.push([op, q]); return op === 'fork' ? { name: q.bot, id: 10 + sent.length, provider: 'alpha', model: 'one' } : { nodes: [], next_from: null }; } });
+  const p = shell({ request: async (op, q) => { sent.push([op, q]); return op === 'fork' ? { name: q.bot, id: 10 + sent.length, provider: 'alpha', model: 'one' } : { nodes: [], workspaces:[],next_from: null }; } });
   const long = 'a'.repeat(128);
   p.upsert({ name: long, id: 1, provider: 'alpha', model: 'one', workspace: '/synthetic/elsewhere' });
   p.S.selected = long;
@@ -1520,7 +1564,7 @@ test('a new project creates its coordinator in the folder, in its role, writes i
     project: async (dir) => ({ dir, name: 'weather', coordinator: 'weather.lead', model: null, file: written }),
     policy: async (dir, profile) => { calls.push(['policy', dir, profile]); return { instructions: 'rules', compaction_instructions: 'summary', model: 'alpha/role', tools: ['shell', 'wait'], note: 'test' }; },
     writeProject: async (q) => { calls.push(['write', q]); written = true; },
-    request: async (op, q) => { calls.push([op, q]); return op === 'create' ? { name: q.bot, id: 7, provider: 'alpha', model: 'role', workspace: q.workspace } : { nodes: [], next_from: null }; },
+    request: async (op, q) => { calls.push([op, q]); return op === 'create' ? { name: q.bot, id: 7, provider: 'alpha', model: 'role', workspace: q.workspace } : { nodes: [], workspaces:[],next_from: null }; },
   });
   await p.createProject('/synthetic/weather');
   const create = calls.find(([op]) => op === 'create')[1];
@@ -1541,7 +1585,7 @@ test('an agent\'s effort is picked beside its model, kept in the project file, a
     project: async (dir) => ({ dir, name: 'weather', coordinator: 'weather.lead', model: file?.model ?? null, reasoning: file?.reasoning ?? null, file: !!file }),
     policy: async () => ({ instructions: 'rules', compaction_instructions: 'summary', note: 'test' }),
     writeProject: async (q) => { sent.push(['write', { ...q }]); },
-    request: async (op, q) => { sent.push([op, { ...q }]); return op === 'create' ? { name: q.bot, id: sent.length, provider: q.model.split('/')[0], model: q.model.split('/')[1], reasoning: q.reasoning ?? null, workspace: q.workspace ?? '/synthetic' } : { nodes: [], next_from: null }; },
+    request: async (op, q) => { sent.push([op, { ...q }]); return op === 'create' ? { name: q.bot, id: sent.length, provider: q.model.split('/')[0], model: q.model.split('/')[1], reasoning: q.reasoning ?? null, workspace: q.workspace ?? '/synthetic' } : { nodes: [], workspaces:[],next_from: null }; },
   }, storage);
   await p.createProject('/synthetic/weather', 'anthropic/claude-x', 'max');
   const creates = () => sent.filter(([op]) => op === 'create').map(([, q]) => q);
@@ -1584,7 +1628,7 @@ test('a project name taken by another folder\'s coordinator is refused, and a re
     project: async (dir) => ({ dir, name: dir.endsWith('taken') ? 'demo' : 'weather', coordinator: dir.endsWith('taken') ? 'demo.lead' : 'weather.lead', model: null, file: false }),
     policy: async () => ({ instructions: 'rules', compaction_instructions: 'summary', note: 'test' }),
     writeProject: async (q) => { calls.push(['write', q.dir, q.model]); if (failWrite) throw new Error('project_unwritable'); },
-    request: async (op, q) => { calls.push([op, q.bot]); if (op === 'create' && fail) throw new Error('create_failed'); return op === 'create' ? { name: q.bot, id: 7, provider: 'alpha', model: 'one', workspace: q.workspace } : { nodes: [], next_from: null }; },
+    request: async (op, q) => { calls.push([op, q.bot]); if (op === 'create' && fail) throw new Error('create_failed'); return op === 'create' ? { name: q.bot, id: 7, provider: 'alpha', model: 'one', workspace: q.workspace } : { nodes: [], workspaces:[],next_from: null }; },
   });
   p.upsert({ name: 'demo.lead', id: 1, provider: 'alpha', model: 'one', workspace: '/synthetic/first' });
   p.S.selected = '';
@@ -1659,7 +1703,7 @@ test('the demo daemon delivers a steer at the next round boundary and refuses a 
 
 test('Escape in the finder never stops a turn, and a deleted bot takes its draft with it', async () => {
   const sent = [];
-  const p = drafting({ request: async (op, q) => { sent.push(op); return { nodes: [], next_from: null }; } });
+  const p = drafting({ request: async (op, q) => { sent.push(op); return { nodes: [], workspaces:[],next_from: null }; } });
   p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', status: 'running', running_turn: 1 });
   p.upsert({ name: 'app.task', id: 2, provider: 'alpha', model: 'one', created_by: 'app.lead', created_by_id: 1 });
   p.tree(); p.S.selected = 'app.lead'; p.followDrafts();
@@ -1691,7 +1735,7 @@ test('the demo daemon ends a stopped turn quietly when its bot is deleted before
 });
 
 test('a folded run names a timeout or a failed call; the finder reaches any task; a side draft stays with its bot', async () => {
-  const p = drafting({ request: async () => ({ nodes: [], next_from: null }) });
+  const p = drafting({ request: async () => ({ nodes: [], workspaces:[],next_from: null }) });
   for (const [out, want] of [[{ stdout: '', exit_code: null, success: false, timed_out: true }, 'timed out'], [{ stdout: '', exit_code: null, success: false }, 'failed'], [{ stdout: 'ok', exit_code: 0, success: true }, null]])
     assert.equal(p.entries({ type: 'function_call_output', call_id: 'c', output: JSON.stringify(out) })[0].err, want);
   for (const [name, id] of [['app.lead', 1], ['app.build', 2], ['app.test', 3]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
@@ -1708,7 +1752,7 @@ test('a folded run names a timeout or a failed call; the finder reaches any task
 });
 
 test('full screen carries each draft with its bot; a long wait list stays short in the head', async () => {
-  const p = drafting({ request: async () => ({ nodes: [], next_from: null }) });
+  const p = drafting({ request: async () => ({ nodes: [], workspaces:[],next_from: null }) });
   for (const [name, id] of [['app.lead', 1], ['app.build', 2]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
   p.tree(); p.S.selected = 'app.lead'; p.followDrafts();
   const main = p.context.document.getElementById('input'), side = p.context.document.getElementById('sideinput');
@@ -1749,7 +1793,7 @@ test('the demo daemon answers as a side chat only for a fork nested under its so
 });
 
 test('a task card leaves the keyboard beside; a row looks in, and a double-click opens a tab', async () => {
-  const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
+  const p = shell({ request: async () => ({ nodes: [], workspaces:[],next_from: null }) });
   for (const [name, id] of [['app.lead', 1], ['app.build', 2]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
   p.tree(); p.S.selected = 'app.lead';
   const doc = p.context.document, focused = [];
@@ -1783,7 +1827,7 @@ test('a task card leaves the keyboard beside; a row looks in, and a double-click
 });
 
 test('a click in a file beside keeps the keyboard in the visible composer', async () => {
-  const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
+  const p = shell({ request: async () => ({ nodes: [], workspaces:[],next_from: null }) });
   p.upsert({ name: 'Bob', id: 1, provider: 'alpha', model: 'one' }); p.tree(); p.S.selected = 'Bob';
   const doc = p.context.document, focused = [];
   for (const id of ['input', 'sideinput']) doc.getElementById(id).focus = () => focused.push(id);
@@ -1799,7 +1843,7 @@ test('a failed first message waits in the side chat\'s composer', async () => {
     sent.push([op, q]);
     if (op === 'fork') return { name: q.bot, id: 20, provider: 'alpha', model: 'one', created_by: q.created_by, created_by_id: q.created_by_id, allowed: q.allow };
     if (op === 'submit') throw new Error('daemon_gone');
-    return { nodes: [], next_from: null };
+    return { nodes: [], workspaces:[],next_from: null };
   } });
   p.upsert({ name: 'lead', id: 1, provider: 'alpha', model: 'one', status: 'running', running_turn: 3 });
   p.upsert({ name: 'task', id: 2, provider: 'alpha', model: 'one', status: 'running', running_turn: 4, created_by: 'lead', created_by_id: 1 });
@@ -1814,7 +1858,7 @@ test('a failed first message waits in the side chat\'s composer', async () => {
 
 test('a bot in a linked worktree shows its branch in its head, read once per folder', async () => {
   const asked = [];
-  const p = shell({ request: async () => ({ nodes: [], next_from: null }), branch: async (dir) => { asked.push(dir); return dir.endsWith('/worktrees/app.build') ? 'agent/app.build' : null; } });
+  const p = shell({ request: async () => ({ nodes: [], workspaces:[],next_from: null }), branch: async (dir) => { asked.push(dir); return dir.endsWith('/worktrees/app.build') ? 'agent/app.build' : null; } });
   p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', workspace: '/synthetic' });
   p.upsert({ name: 'app.build', id: 2, provider: 'alpha', model: 'one', workspace: '/home/u/.agent/worktrees/app.build', created_by: 'app.lead', created_by_id: 1 });
   p.tree();
@@ -1885,7 +1929,7 @@ test('a new swarm is one call: its agents are dealt from the mix, and the page s
   const p = shell({
     swarmStart: async (q) => { calls.push(q); const members = Array.from({ length: q.agents }, (_, i) => `${q.project}.latency-2-${i + 1}`); return { swarm: swarmRecord(members, { swarm: `${q.project}.latency-2`, mix: q.mix }), bots: members.map((m, i) => ({ name: m, id: 10 + i, provider: 'alpha', model: 'one' })), failed: [{ agent: members[2], error: 'provider_unknown' }] }; },
     swarmBoard: async () => ({ lines: [], offset: 0, more: false }),
-    request: async () => ({ bots: [], next_after: null, nodes: [], next_from: null }),
+    request: async () => ({ bots: [], next_after: null, nodes: [], workspaces:[],next_from: null }),
   });
   p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', workspace: '/synthetic/app' });
   p.upsert({ name: 'app.latency-9', id: 2, provider: 'alpha', model: 'one' });
@@ -2003,7 +2047,7 @@ test('the board shows roles, proposals, votes and decisions, and a stream tag fi
 });
 
 test('a swarm row opens a beat later, so a double-click opens it as a new tab', async () => {
-  const p = shell({ swarmBoard: async () => ({ lines: [], offset: 0, more: false }), request: async () => ({ bots: [], next_after: null, nodes: [], next_from: null }) });
+  const p = shell({ swarmBoard: async () => ({ lines: [], offset: 0, more: false }), request: async () => ({ bots: [], next_after: null, nodes: [], workspaces:[],next_from: null }) });
   p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one' });
   p.upsert({ name: 'app.latency-1', id: 3, provider: 'alpha', model: 'one' });
   p.learnSwarm(swarmRecord(['app.latency-1'], { ids: { 'app.latency-1': 3 } }));
@@ -2026,7 +2070,7 @@ test('a swarm row opens a beat later, so a double-click opens it as a new tab', 
 });
 
 test('a tab is renamed when what it belongs to changes, with no change of state', async () => {
-  const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
+  const p = shell({ request: async () => ({ nodes: [], workspaces:[],next_from: null }) });
   p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one' });
   p.upsert({ name: 'app.build', id: 2, provider: 'alpha', model: 'one', created_by: 'app.lead', created_by_id: 1 });
   p.S.ui.tabs = ['app.build']; p.S.selected = 'app.build'; p.railRows(); p.renderTabs();
@@ -2038,7 +2082,7 @@ test('a tab is renamed when what it belongs to changes, with no change of state'
 });
 
 test('every control is one move: a pending look yields to Home or a tab, a double-click opens a tab, the finder reaches a swarm helper', async () => {
-  const p = shell({ swarmBoard: async () => ({ lines: [], offset: 0, more: false }), request: async () => ({ bots: [], next_after: null, nodes: [], next_from: null }) });
+  const p = shell({ swarmBoard: async () => ({ lines: [], offset: 0, more: false }), request: async () => ({ bots: [], next_after: null, nodes: [], workspaces:[],next_from: null }) });
   p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one' });
   p.upsert({ name: 'app.build', id: 2, provider: 'alpha', model: 'one', created_by: 'app.lead', created_by_id: 1 });
   p.upsert({ name: 'app.latency-1', id: 3, provider: 'alpha', model: 'one' });
@@ -2074,7 +2118,7 @@ test('every control is one move: a pending look yields to Home or a tab, a doubl
 });
 
 test('looking at an agent clears the done glyph on its tab', async () => {
-  const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
+  const p = shell({ request: async () => ({ nodes: [], workspaces:[],next_from: null }) });
   p.context.document.hasFocus = () => true;
   for (const [name, id] of [['lead', 1], ['task', 2]]) p.upsert({ name, id, provider: 'alpha', model: 'one' });
   p.S.ui.tabs = ['lead', 'task']; p.S.selected = 'lead'; p.S.unseen.add('task');
@@ -2161,7 +2205,7 @@ test('Stop and Add are one call each; an added agent comes from the row furthest
 
 test('a swarm a coordinator started from its shell shows once its first agent takes its brief', async () => {
   let reads = 0, listed = [];
-  const p = shell({ swarms: async () => { reads += 1; return { swarms: listed, broken: [] }; }, request: async () => ({ bots: [], next_after: null, nodes: [], next_from: null }) });
+  const p = shell({ swarms: async () => { reads += 1; return { swarms: listed, broken: [] }; }, request: async () => ({ bots: [], next_after: null, nodes: [], workspaces:[],next_from: null }) });
   p.S.live = true;
   p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one' });
   // A task named like an agent is looked for once, however many turns it takes.
@@ -2185,7 +2229,7 @@ test('a swarm a coordinator started from its shell shows once its first agent ta
   assert.deepEqual([...p.S.swarms.keys()], ['app.latency']);
   // A read that failed is tried again at the agent's next turn.
   let failing = true;
-  const q = shell({ swarms: async () => { reads += 1; if (failing) throw new Error('unavailable'); return { swarms: listed, broken: [] }; }, request: async () => ({ bots: [], next_after: null, nodes: [], next_from: null }) });
+  const q = shell({ swarms: async () => { reads += 1; if (failing) throw new Error('unavailable'); return { swarms: listed, broken: [] }; }, request: async () => ({ bots: [], next_after: null, nodes: [], workspaces:[],next_from: null }) });
   q.S.live = true;
   q.upsert({ name: 'app.latency-1', id: 3, provider: 'alpha', model: 'one' });
   await q.handle({ event: 'accepted', bot: 'app.latency-1', turn: 1, durable: true }, 1);
@@ -2198,7 +2242,7 @@ test('a swarm a coordinator started from its shell shows once its first agent ta
   assert.equal(p.S.memberOf.get('app.latency-2'), 'app.latency');
   // Two reads at once: an older answer arriving last never removes a swarm the newer one found.
   const answers = [];
-  const r = shell({ swarms: () => new Promise((resolve) => answers.push(resolve)), request: async () => ({ bots: [], next_after: null, nodes: [], next_from: null }) });
+  const r = shell({ swarms: () => new Promise((resolve) => answers.push(resolve)), request: async () => ({ bots: [], next_after: null, nodes: [], workspaces:[],next_from: null }) });
   r.S.live = true;
   for (const [name, id] of [['app.fix-1', 2], ['app.latency-1', 3]]) r.upsert({ name, id, provider: 'alpha', model: 'one' });
   await r.handle({ event: 'accepted', bot: 'app.fix-1', turn: 1, durable: true }, 1);
@@ -2213,7 +2257,7 @@ test('a swarm a coordinator started from its shell shows once its first agent ta
 
 test('a helper finishing a turn has its swarm check its budget, and only current seats are tallied', async () => {
   const checks = [];
-  const p = shell({ swarmCheck: async (swarm) => { checks.push(swarm); return {}; }, request: async () => ({ bots: [], next_after: null, nodes: [], next_from: null }) });
+  const p = shell({ swarmCheck: async (swarm) => { checks.push(swarm); return {}; }, request: async () => ({ bots: [], next_after: null, nodes: [], workspaces:[],next_from: null }) });
   for (const [name, id] of [['app.latency-1', 3], ['app.latency-2', 4]]) p.upsert({ name, id, provider: 'alpha', model: 'one' });
   // A helper of latency-1, and a helper of that helper.
   p.upsert({ name: 'app.latency-1.fix', id: 7, provider: 'alpha', model: 'one', created_by: 'app.latency-1', created_by_id: 3 });
@@ -2326,7 +2370,7 @@ test('the demo daemon\'s council opens a stream by the seats\' majority and leav
 test('a draft stays with the bot it was typed for, and Enter sends it there even mid-switch', async () => {
   const sent = [];
   let release; const slow = new Promise((r) => { release = r; });
-  const p = drafting({ request: async (op, q) => { if (op === 'history_nodes') await slow; if (op === 'submit') sent.push([q.bot, q.bot_id, q.prompt]); return { nodes: [], next_from: null }; } });
+  const p = drafting({ request: async (op, q) => { if (op === 'history_nodes') await slow; if (op === 'submit') sent.push([q.bot, q.bot_id, q.prompt]); return { nodes: [], workspaces:[],next_from: null }; } });
   for (const [name, id] of [['app.lead', 1], ['app.lead-side', 2]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
   p.S.transcripts.get('app.lead-side') ?? p.transcript('app.lead-side').nodes;
   p.tree(); await p.go('app.lead');
@@ -2363,7 +2407,7 @@ function settingsShell({ env = {}, lists = {} } = {}) {
     project: async (dir) => ({ dir, name: 'weather', coordinator: 'weather.lead', model: null, file: false }),
     policy: async () => ({ instructions: 'rules', compaction_instructions: 'summary', note: 'test' }),
     writeProject: async (q) => { calls.push(['write', q.model]); },
-    request: async (op, q) => { if (op === 'provider_models') return { providers: answer() }; if (op === 'bots') return { bots: [], next_after: null }; if (op === 'create') { calls.push(['create', q.bot, q.model]); return { name: q.bot, id: 9, provider: q.model.split('/')[0], model: q.model.split('/')[1], workspace: q.workspace }; } return { nodes: [], next_from: null }; },
+    request: async (op, q) => { if (op === 'provider_models') return { providers: answer() }; if (op === 'bots') return { bots: [], next_after: null }; if (op === 'create') { calls.push(['create', q.bot, q.model]); return { name: q.bot, id: 9, provider: q.model.split('/')[0], model: q.model.split('/')[1], workspace: q.workspace }; } return { nodes: [], workspaces:[],next_from: null }; },
   });
   p.S.config.model = null; p.S.attached = true;
   return { p, calls, env };
@@ -2759,7 +2803,7 @@ test('a message another agent sent names its sender, live, steered in, and read 
   const sent = { 1: lead(4), 2: lead(5), 4: lead(6) };
   const batch = async ({ nodes }) => ({ items: nodes.map((node) => ({ node, item: items[node], ...sent[node] })) });
   const history = async (op) => {
-    if (op === 'history_nodes') return { nodes: [{ node: 4, turn: 10 }, { node: 3, turn: 9 }, { node: 2, turn: 7 }, { node: 1, turn: 7 }], next_from: null, next_newer: null };
+    if (op === 'history_nodes') return { nodes: [{ node: 4, turn: 10 }, { node: 3, turn: 9 }, { node: 2, turn: 7 }, { node: 1, turn: 7 }], workspaces:[],next_from: null, next_newer: null };
     throw new Error(op);
   };
   const p = page({ request: history, batch });
@@ -2808,7 +2852,7 @@ test('the app\'s own task updates and triggered messages are tagged by the origi
     3: { role: 'user', content: [{ type: 'input_text', text: 'thanks' }] } };
   const origins = { 1: { origin: 'tasks' }, 2: { origin: 'trigger' } };
   const p = page({ request: async (op) => {
-    if (op === 'history_nodes') return { nodes: [{ node: 3, turn: 3 }, { node: 2, turn: 2 }, { node: 1, turn: 1 }], next_from: null, next_newer: null };
+    if (op === 'history_nodes') return { nodes: [{ node: 3, turn: 3 }, { node: 2, turn: 2 }, { node: 1, turn: 1 }], workspaces:[],next_from: null, next_newer: null };
     throw new Error(op);
   }, batch: async ({ nodes }) => ({ items: nodes.map((node) => ({ node, item: items[node], ...origins[node] })) }) });
   const t = p.transcript('demo.lead'); t.items = [{ kind: 'history', next: 3, seed: true }]; t.history = t.items[0]; t.seed = t.items[0];
@@ -3117,7 +3161,7 @@ test('a tab deleted while detached goes up to what made it on reconnect, as a li
   const p = page({
     attach: async () => ({ session: 2, store: 'store-1' }),
     pull: () => new Promise(() => {}),
-    request: async (op) => (op === 'bots' ? { bots: [{ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', status: 'idle' }] } : { nodes: [], next_from: null }),
+    request: async (op) => (op === 'bots' ? { bots: [{ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', status: 'idle' }] } : { nodes: [], workspaces:[],next_from: null }),
   }, storage);
   p.setRender(() => {}); p.S.store = 'store-1'; p.S.config = { workspace: '/synthetic', tools: [] };
   p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one' });
