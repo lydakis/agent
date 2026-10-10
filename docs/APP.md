@@ -1132,18 +1132,10 @@ refuses with `triggers_unsupported`.
 Every reply of `~/.agent/trigger` is one JSON value on stdout; a failure is
 one `{"error": CODE, "detail": ...}` on stderr with exit 1.
 
-Earlier apps called these schedules (`~/.agent/schedule`, jobs labelled
-`me.lydakis.agent.schedule.NAME` running `--schedule-fire`, results in
-`~/.agent/schedules`). The first start of this app, or the first fire of
-such a job before it, converts each once: the same definition under the
-trigger label, its last result moved, the old job unloaded and its plist,
-folder and script removed. An old plist goes only once its result moved
-and its job unloaded, so a failed move or unload is tried again at the next
-start. A fire that converts
-its own schedule fires the new trigger in its place, then unloads itself.
-A schedule plist that cannot be read, that names another trigger than its
-file does, or whose name a trigger has, is left where it is with its
-result, and logged.
+Earlier apps called these schedules (`me.lydakis.agent.schedule.NAME`).
+They are not converted: remove them by hand (`launchctl bootout
+gui/$UID/me.lydakis.agent.schedule.NAME`, then delete the plist and
+`~/.agent/schedules`) and add them again as triggers.
 
 The app ships an `automation` skill
 ([SKILL.md](../app/skills/automation/SKILL.md)) for an agent setting up or
