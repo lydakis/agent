@@ -6571,9 +6571,33 @@ impl Database {
             .and_then(|n| n["node"].as_i64())
             .filter(|id| Some(*id) != range_head)
             .map(|id| id + 1);
+        // The folder each turn on the page ran in, so a path its messages name
+        // resolves where it was written. Each folder is listed once with its
+        // turns. A turn whose rows went with a deleted fork source is left out.
+        let mut turns: Vec<i64> = nodes.iter().filter_map(|n| n["turn"].as_i64()).collect();
+        turns.sort_unstable();
+        turns.dedup();
+        let workspaces = self
+            .conn
+            .prepare_cached(
+                "SELECT workspace, json_group_array(id) FROM turns
+                 WHERE id IN (SELECT value FROM json_each(?1)) AND workspace IS NOT NULL
+                 GROUP BY workspace ORDER BY min(id)",
+            )?
+            .query_map([json!(turns).to_string()], |r| {
+                let folder: String = r.get(0)?;
+                let turns: String = r.get(1)?;
+                Ok((folder, turns))
+            })?
+            .map(|row| {
+                let (folder, turns) = row?;
+                Ok(json!({"folder": folder, "turns": serde_json::from_str::<Value>(&turns)?}))
+            })
+            .collect::<Result<Vec<Value>>>()?;
         snapshot.commit()?;
         Ok(
-            json!({"nodes":nodes,"next_from":next.filter(|id| *id >= floor),"next_newer":next_newer}),
+            json!({"nodes":nodes,"next_from":next.filter(|id| *id >= floor),
+            "next_newer":next_newer,"workspaces":workspaces}),
         )
     }
     /// Fetch a byte-bounded batch after one ancestry walk for all requested IDs.
