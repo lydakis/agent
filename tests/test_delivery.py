@@ -99,7 +99,7 @@ class DeliveryTests(ModelFixture):
                 # The final response stays held until that blocker is gone.
                 second = self.model.requests.get(timeout=3)
                 self.assertEqual(second['input'][-1]['type'], 'function_call_output')
-                self.assertTrue(client.request('interrupt', bot=bot, turn=blocker)['result']['queued'])
+                self.assertEqual(client.request('interrupt', bot=bot, turn=blocker)['result']['status'], 'interrupted')
                 final_gate.set()
                 outcome = client.finished(correction)['data']
                 self.assertEqual((outcome['status'], outcome.get('into')), ('steered', turn))
@@ -181,10 +181,10 @@ class DeliveryTests(ModelFixture):
             pending = client.request('submit', bot='Bob', request_id=delivery,
                                      prompt='unwanted', delivery=delivery)['result']['turn']
             reply = client.request('interrupt', bot='Bob', turn=pending)
-            self.assertTrue(reply['result']['queued'])
+            self.assertEqual(reply['result']['status'], 'interrupted')
             self.assertEqual(client.finished(pending)['data']['status'], 'interrupted')
         self.assertEqual(client.request('resume', bot='Bob')['result']['running_turn'], first)
-        self.assertEqual(client.request('interrupt', bot='Bob', turn=999)['error'], 'stale_turn')
+        self.assertEqual(client.request('interrupt', bot='Bob', turn=999)['error'], 'turn_not_found')
         client.request('interrupt', bot='Bob', turn=first)
         self.assertEqual(client.finished(first)['data']['status'], 'interrupted')
 
@@ -198,7 +198,7 @@ class DeliveryTests(ModelFixture):
             self.assertLess(time.monotonic(), deadline)
         successor = client.request('submit', bot='Bob', request_id='b', prompt='successor',
                                    delivery='queue')['result']['turn']
-        self.assertTrue(client.request('interrupt', bot='Bob', turn=first)['result']['parked'])
+        self.assertEqual(client.request('interrupt', bot='Bob', turn=first)['result']['status'], 'interrupted')
         self.assertEqual(client.finished(successor)['data']['status'], 'completed')
         self.assertEqual(poll(client, 'Bob', successor)['result']['text'], 'reply:successor')
 
@@ -584,9 +584,13 @@ class DeliveryTests(ModelFixture):
         self.assertEqual((skipped['status'], after['status']), ('queued', 'queued'))
         self.assertEqual(client.request('delete', bot='Bob')['error'], 'bot_busy')
         cancelled = client.request('interrupt', bot='Bob', turn=skipped['turn'])['result']
-        self.assertEqual(cancelled, {'interrupt_requested': True, 'turn': skipped['turn'], 'queued': True})
+        # The reply is the turn view; a repeat finds the turn ended and says how.
+        self.assertEqual((cancelled['interrupt_requested'], cancelled['turn'], cancelled['status'], cancelled['handle']),
+                         (True, skipped['turn'], 'interrupted', f"turn:Bob/{skipped['turn']}"))
         self.assertEqual(client.finished(skipped['turn'])['data']['status'], 'interrupted')
-        self.assertEqual(client.request('interrupt', bot='Bob', turn=skipped['turn'])['error'], 'no_active_turn')
+        again = client.request('interrupt', bot='Bob', turn=skipped['turn'])['result']
+        self.assertEqual((again['interrupt_requested'], again['status']), (False, 'interrupted'))
+        self.assertEqual(client.request('interrupt', bot='Bob', turn=999)['error'], 'turn_not_found')
         self.assertEqual(client.finished(alice)['data']['status'], 'completed')
         self.assertEqual(client.finished(bob['turn'])['data']['status'], 'completed')
         self.assertEqual(client.finished(after['turn'])['data']['status'], 'completed')

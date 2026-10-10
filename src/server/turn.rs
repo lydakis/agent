@@ -17,7 +17,8 @@ use agent_runtime::{
     fail,
     provider::{Chain, Delta, Items, Provider, Report, Request as ModelRequest, ToolCall},
     store::{
-        Bot, ContextPrefix, ContextUsage, Gated, Settings, Slot, Store, Strip, Waiting, Window,
+        Bot, ContextPrefix, ContextUsage, Gated, Settings, Slot, Store, Strip,
+        TURN_VIEW_ACCOUNTING, Waiting, Window,
     },
     tools::{Outcome, Prepared, ReadSource, Registry},
 };
@@ -25,7 +26,7 @@ use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     ops::ControlFlow,
     path::PathBuf,
     sync::{
@@ -1841,7 +1842,7 @@ impl Turn {
                             _ => None,
                         })
                         .collect();
-                    let outcome = Outcome::text(wait_result(results).to_string());
+                    let outcome = Outcome::text(wait_result(for_model(results)).to_string());
                     let id = waiting.call_id.clone();
                     self.store
                         .op("tool_finish", move |db| {
@@ -3522,6 +3523,28 @@ fn annotate(mut outcome: Outcome, turn: i64, call_id: &str) -> Outcome {
     outcome
 }
 
+/// A model reads a peer turn's outcome, not its accounting: the turn view's
+/// usage, timing and identity stay with clients and out of the context. A
+/// pending turn is its status; an ended one is everything its end recorded,
+/// facts included.
+fn for_model(results: BTreeMap<String, Arc<Value>>) -> BTreeMap<String, Arc<Value>> {
+    results
+        .into_iter()
+        .map(|(handle, result)| match Handle::parse(&handle) {
+            Ok(Handle::Turn { .. }) => {
+                let mut outcome = Arc::unwrap_or_clone(result);
+                if let Some(fields) = outcome.as_object_mut() {
+                    for key in TURN_VIEW_ACCOUNTING {
+                        fields.remove(key);
+                    }
+                }
+                (handle, Arc::new(outcome))
+            }
+            _ => (handle, result),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 use agent_runtime::store::pinned_item;
 
@@ -4000,6 +4023,39 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
+    #[test]
+    fn a_models_wait_keeps_a_turns_outcome_and_drops_its_accounting() {
+        let view = json!({"bot":"Bob","bot_id":2,"turn":3,"handle":"turn:Bob/3",
+            "request_id":"r","waiting_on":null,"input_tokens":10,"cached_input_tokens":0,
+            "output_tokens":4,"model_rounds":1,"retries":0,"paced_ms":0,"started_ms":1,
+            "finished_ms":2});
+        let mut failed = view.clone();
+        failed.as_object_mut().unwrap().extend(
+            json!({"status":"failed","error":"turn_budget_exceeded","detail":"over",
+                "budget_tokens":100,"tokens_used":120})
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let mut pending = view.clone();
+        pending["status"] = json!("running");
+        pending["pending"] = json!(true);
+        let results = BTreeMap::from([
+            ("turn:Bob/3".to_string(), Arc::new(failed)),
+            ("turn:Bob/4".to_string(), Arc::new(pending)),
+        ]);
+        let model = for_model(results);
+        assert_eq!(
+            *model["turn:Bob/3"],
+            json!({"turn":3,"status":"failed","error":"turn_budget_exceeded","detail":"over",
+                "budget_tokens":100,"tokens_used":120})
+        );
+        assert_eq!(
+            *model["turn:Bob/4"],
+            json!({"turn":3,"status":"running","pending":true})
+        );
+    }
+
     #[tokio::test]
     async fn interrupt_finishes_a_committed_steer_batch_and_wakes_waiters() {
         use agent_runtime::{
@@ -4090,6 +4146,7 @@ mod tests {
                     session: 1,
                     output: Output::writer(reply_writer),
                     request: json!(1),
+                    reader: store.reader(),
                 },
             )
             .await;
