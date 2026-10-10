@@ -5,7 +5,9 @@
 //! (projects, profiles, swarms, triggers) and makes a swarm's shared
 //! worktree; run with `--swarm-post` it is a swarm's post tool (see
 //! `swarm`), and with `--trigger` or `--trigger-fire` it adds, lists,
-//! removes or fires triggers (see `trigger`).
+//! removes or fires triggers (see `trigger`). `--setup` writes what a start
+//! writes (see `machine_setup`), and `--unlink-skills` removes the links to the
+//! skills it ships (see `skills`); the Homebrew cask runs both.
 //!
 //! Each window attaches to one daemon: this machine's, or a host's reached
 //! over SSH (see `remote`). A window on a host never reads or writes this
@@ -17,6 +19,7 @@ mod project;
 mod remote;
 mod session;
 mod settings;
+mod skills;
 mod swarm;
 mod trigger;
 mod worktree;
@@ -1185,10 +1188,65 @@ async fn request(
     client.request(&op, params).await.map_err(|e| e.to_string())
 }
 
+/// Run by the Homebrew cask after an install or upgrade: what a start does in
+/// `machine_setup`, so the scripts, triggers and skills the app provides are
+/// there before its first window.
+const SETUP_FLAG: &str = "--setup";
+
+/// What the app puts on this machine, written at every start so it all leads
+/// to this copy: swarm scripts, the coordinator's `start`, `~/.agent/trigger`,
+/// earlier schedules made triggers, triggers reloaded after a move, and the skills it ships linked from
+/// `~/.agents/skills`. False when any of it failed; each failure is printed
+/// and does not stop the rest. A start reloads triggers off the window's way.
+fn machine_setup(background: bool) -> bool {
+    let mut ok = true;
+    let mut report = |error: &dyn std::fmt::Display| {
+        eprintln!("agent-app: {error}");
+        ok = false;
+    };
+    if let (Ok(home), Ok(app)) = (swarm::home(), std::env::current_exe()) {
+        swarm::refresh_scripts(&home, &app);
+        if let Err(error) = swarm::write_start_script(&home, &app) {
+            report(&error);
+        }
+        if let Some(state) = home.parent()
+            && let Err(error) = trigger::write_script(state, &app)
+        {
+            report(&error);
+        }
+        // Earlier schedules become triggers, and a moved app reloads every
+        // trigger, each a launchctl run.
+        if cfg!(target_os = "macos")
+            && let Ok(places) = trigger::Places::home()
+        {
+            let refresh = move || {
+                trigger::migrate(&places, None, &trigger::launchctl);
+                trigger::refresh(&places, &app, &trigger::launchctl);
+            };
+            if background {
+                std::thread::spawn(refresh);
+            } else {
+                refresh();
+            }
+        }
+    }
+    if let (Some(user), Some(shipped)) = (
+        std::env::var_os("HOME"),
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| skills::bundled(&exe)),
+    ) {
+        for error in skills::install(std::path::Path::new(&user), &shipped) {
+            report(&error);
+        }
+    }
+    ok
+}
+
 fn main() {
-    // A swarm's `post` script, a coordinator's `start`, `~/.agent/trigger`
-    // and launchd's fires run this executable; each acts and exits without
-    // a window.
+    // A swarm's `post` script, a coordinator's `start`, `~/.agent/trigger`,
+    // launchd's fires and the Homebrew cask's install and uninstall run this
+    // executable; each acts and exits without a window.
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some(swarm::POST_FLAG) => std::process::exit(swarm::cli(&args[2..])),
@@ -1196,30 +1254,11 @@ fn main() {
         Some(trigger::FLAG) => std::process::exit(trigger::cli(&args[2..])),
         Some(trigger::FIRE_FLAG) => std::process::exit(trigger::fire_cli(&args[2..])),
         Some(trigger::SCHEDULE_FIRE_FLAG) => std::process::exit(trigger::migrate_cli(&args[2..])),
+        Some(SETUP_FLAG) => std::process::exit(i32::from(!machine_setup(false))),
+        Some(skills::UNLINK_FLAG) => std::process::exit(skills::unlink_cli()),
         _ => {}
     }
-    if let (Ok(home), Ok(app)) = (swarm::home(), std::env::current_exe()) {
-        swarm::refresh_scripts(&home, &app);
-        if let Err(error) = swarm::write_start_script(&home, &app) {
-            eprintln!("agent-app: {error}");
-        }
-        if let Some(state) = home.parent()
-            && let Err(error) = trigger::write_script(state, &app)
-        {
-            eprintln!("agent-app: {error}");
-        }
-        // Off the window's way: earlier schedules become triggers, and a
-        // moved app reloads every trigger, each a launchctl run.
-        if cfg!(target_os = "macos")
-            && let Ok(places) = trigger::Places::home()
-        {
-            let app = app.clone();
-            std::thread::spawn(move || {
-                trigger::migrate(&places, None, &trigger::launchctl);
-                trigger::refresh(&places, &app, &trigger::launchctl);
-            });
-        }
-    }
+    machine_setup(true);
     let links = remote::Hosts::new(
         std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent/hosts")),
         PathBuf::from("ssh"),
