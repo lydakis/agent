@@ -248,7 +248,7 @@ async fn follow(places: Places, socket: PathBuf, store: String, mut watched: Vec
             wait = (wait * 2).min(MAX_WAIT);
             continue;
         };
-        wait = Duration::from_secs(1);
+        let up = std::time::Instant::now();
         let from = match begin(&places, &client, &mut watched).await {
             Ok(from) => from,
             Err(error) => {
@@ -313,8 +313,18 @@ async fn follow(places: Places, socket: PathBuf, store: String, mut watched: Vec
                     }
                 }
             }
-            tokio::time::sleep(wait).await;
         }
+        // A daemon that closes the connection soon after it opened, as it
+        // does a client that lags behind its events, is waited on longer
+        // each time; one that kept it a while is reconnected to after a second.
+        if watched.iter().all(|w| w.done) {
+            return;
+        }
+        if up.elapsed() >= MAX_WAIT {
+            wait = Duration::from_secs(1);
+        }
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(MAX_WAIT);
     }
 }
 
