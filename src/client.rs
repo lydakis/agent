@@ -1613,9 +1613,7 @@ fn approvals(options: &Options) -> Result<i32> {
             .ok_or(Error::new("daemon_protocol_mismatch"))?
             .clone();
         if options.full {
-            for call in &mut calls {
-                whole_arguments(&mut connection, call)?;
-            }
+            whole_arguments(&mut connection, &mut calls)?;
         }
         for call in &calls {
             if options.pretty {
@@ -1647,27 +1645,58 @@ fn approvals(options: &Options) -> Result<i32> {
     Ok(0)
 }
 
-/// Replace a call's preview with its whole arguments, read from the node
-/// that planned it, when the preview left any out. One too large to read
-/// keeps its preview, still marked cut.
-fn whole_arguments(connection: &mut Connection, call: &mut Value) -> Result<()> {
-    let whole = call["arguments"].is_object()
-        && call["arguments_cut"].as_array().is_none_or(Vec::is_empty)
-        && call["arguments_omitted"].as_u64().unwrap_or(0) == 0;
-    if whole {
-        return Ok(());
+/// Replace each cut preview with the call's whole arguments, read from
+/// the node that planned it: one `history_items` read per bot for the
+/// page's nodes, each read once though a round's calls share it, and again
+/// for what a reply's size bound left out. One too large to read keeps its
+/// preview, still marked cut.
+fn whole_arguments(connection: &mut Connection, calls: &mut [Value]) -> Result<()> {
+    let cut = |call: &Value| {
+        !(call["arguments"].is_object()
+            && call["arguments_cut"].as_array().is_none_or(Vec::is_empty)
+            && call["arguments_omitted"].as_u64().unwrap_or(0) == 0)
+    };
+    let mut wanted: std::collections::BTreeMap<&str, Vec<i64>> = Default::default();
+    for call in calls.iter().filter(|call| cut(call)) {
+        if let (Some(bot), Some(node)) = (call["bot"].as_str(), call["node"].as_i64()) {
+            let nodes = wanted.entry(bot).or_default();
+            if !nodes.contains(&node) {
+                nodes.push(node);
+            }
+        }
     }
-    let read = connection.request(
-        "history_items",
-        json!({"bot":call["bot"],"nodes":[call["node"]]}),
-    )?;
-    let call_id = call["call_id"].as_str().unwrap_or_default();
-    if let Some(arguments) =
-        agent_client::approver::call_arguments(&read["items"][0]["item"], call_id)
-    {
-        call["arguments"] = arguments;
-        call["arguments_cut"] = json!([]);
-        call["arguments_omitted"] = json!(0);
+    let mut items = std::collections::HashMap::new();
+    for (bot, nodes) in wanted {
+        let mut rest = nodes.as_slice();
+        while !rest.is_empty() {
+            let read = connection.request("history_items", json!({"bot":bot,"nodes":rest}))?;
+            let got = read["items"].as_array().map_or(&[][..], Vec::as_slice);
+            if got.is_empty() {
+                break;
+            }
+            for entry in got {
+                items.insert(
+                    (bot.to_owned(), entry["node"].as_i64()),
+                    entry["item"].clone(),
+                );
+            }
+            rest = &rest[got.len().min(rest.len())..];
+        }
+    }
+    for call in calls.iter_mut().filter(|call| cut(call)) {
+        let key = (
+            call["bot"].as_str().unwrap_or_default().to_owned(),
+            call["node"].as_i64(),
+        );
+        let call_id = call["call_id"].as_str().unwrap_or_default();
+        if let Some(arguments) = items
+            .get(&key)
+            .and_then(|item| agent_client::approver::call_arguments(item, call_id))
+        {
+            call["arguments"] = arguments;
+            call["arguments_cut"] = json!([]);
+            call["arguments_omitted"] = json!(0);
+        }
     }
     Ok(())
 }
