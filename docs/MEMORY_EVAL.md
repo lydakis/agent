@@ -178,11 +178,12 @@ What it shows, as observations from three trials per cell:
   verified date. Because the control also gets `stale` right from the code
   alone, this scenario can show harm from a wrong fact but not a benefit
   from memory. A wrong fact that is more tempting would test more.
-- **Cost.** Memory took about 2.5 times the input tokens and one or two
-  more rounds per task. That is more than its roughly 800 extra characters
+- **Cost.** Memory took about 2.5 times the input tokens and zero to two
+  more rounds per task, 1.3 on average. That is more than its roughly 800 extra characters
   of instructions explain: the extra rounds read memory and save facts.
   Three `memory` bots re-saved a fact they had been given, with the same
   text, which left the file unchanged and spent a call.
 
-The raw result and the bots' transcripts stay in George's local
-`.local/memory-eval/`.
+The raw result stays in George's local `.local/memory-eval/`. The bots'
+folders and transcripts stay in the temporary folder it names as
+`bots_dir`.
