@@ -3,8 +3,8 @@
 Does memory carry what one task learned to a later task, and does a later
 task catch a remembered fact that the code now contradicts? This is plan
 decision 7: a run on real models on George's Mac, which happens only with
-his go-ahead. Written 2026-10-10. It has not run on a real model yet. The
-script, its no-model checks and the cost estimate below are ready.
+his go-ahead. Written 2026-10-10. It ran once on 2026-10-10; the
+[first run](#first-run-2026-10-10) has the results.
 
 ## What it runs
 
@@ -140,3 +140,49 @@ What the run can show:
 - **Cost:** what memory adds, in rounds and tokens.
 
 With three trials per cell, these are observations, not rates.
+
+## First run, 2026-10-10
+
+Measured, not estimated. Observed 2026-10-10 from 13:34Z on George's Mac,
+at revision fefef85 with the defaults (3 trials, 400,000-token turn cap,
+20-minute timeout), on `chatgpt/gpt-6.1-sol` through Codex's ChatGPT
+login. All 18 bots completed, with no errors or timeouts, in 21 to 59
+seconds each. Every bot left the visible tests passing, and none created
+`shop/money.py`.
+
+Rounds are per trial. Tokens are the daemon's totals summed over the three
+trials. The last column counts shell commands that touched memory.
+
+| Condition | Scenario | Correct | Rounds | Input | Cached | Output | Memory commands |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `memory` | `decision` | 3/3 | 9, 8, 9 | 104,648 | 81,408 | 2,446 | 1, 0, 1 |
+| `memory` | `preference` | 3/3 | 7, 7, 7 | 77,507 | 47,104 | 1,758 | 1, 0, 0 |
+| `memory` | `stale` | 3/3 | 7, 8, 8 | 90,096 | 63,488 | 3,071 | 1, 1, 1 |
+| `none` | `decision` | 0/3 | 7, 7, 7 | 37,211 | 21,504 | 1,129 | 0, 0, 0 |
+| `none` | `preference` | 0/3 | 6, 7, 6 | 30,825 | 19,584 | 1,110 | 0, 0, 0 |
+| `none` | `stale` | 3/3 | 6, 6, 6 | 39,506 | 22,016 | 2,220 | 0, 0, 0 |
+
+The whole run used 379,793 input tokens (255,104 cached) and 11,734
+output tokens. That is under a quarter of the input estimate above.
+
+What it shows, as observations from three trials per cell:
+
+- **Recall.** Memory carried both facts every time. Without memory, every
+  bot used `isoformat()`, giving `.678901+00:00`, and wrote error messages
+  with no code. With memory, every bot wrote `...05Z` and a bracketed code.
+- **Verification.** The wrong fact misled no bot: `memory` matched `none`
+  on `stale`. All three `memory` bots then rewrote the fact in place. Each
+  now says prices round half up with `quantize_price` in `shop/pricing.py`
+  and that `shop/money.py` is gone, and each cites the source and a
+  verified date. All three also changed the fact's type from `project` to
+  `reference`. Because the control also gets `stale` right from the code
+  alone, this scenario can show harm from a wrong fact but not a benefit
+  from memory. A wrong fact that is more tempting would test more.
+- **Cost.** Memory took about 2.5 times the input tokens and one or two
+  more rounds per task. That is more than its roughly 800 extra characters
+  of instructions explain: the extra rounds read memory and save facts.
+  Three `memory` bots re-saved a fact they had been given, with the same
+  text, which left the file unchanged and spent a call.
+
+The raw result and the bots' transcripts stay in George's local
+`.local/memory-eval/`.

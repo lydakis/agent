@@ -1038,7 +1038,9 @@ This opt-in screen runs on a real model and costs plan quota or API money.
 It checks whether a fact in memory reaches a later task in a fresh worktree,
 and whether a task catches a remembered fact that the code now contradicts.
 Each bot gets its own HOME and daemon. [MEMORY_EVAL.md](MEMORY_EVAL.md) has
-the scenarios, the instructions and a cost estimate.
+the scenarios, the instructions, a cost estimate and the first run
+(2026-10-10, `chatgpt/gpt-6.1-sol`): 9/9 correct with memory and 3/9
+without, at about 2.5 times the input tokens.
 
 ```sh
 .local/venv/bin/python -m bench.memory_eval --model chatgpt/MODEL --out .local/memory-eval/MODEL.json
