@@ -1014,6 +1014,8 @@ test('the New project sheet asks only for a folder, the lead\'s and threads\' mo
   await el('sheet').listeners.submit({ preventDefault() {} });
   const create = calls.find(([op]) => op === 'create')[1];
   assert.deepEqual([create.bot, create.workspace, create.model, create.reasoning], ['weather.lead', '/synthetic/weather', 'anthropic/claude-x', 'high']);
+  // The coordinator is told the threads' picks after its role, whichever role that is.
+  assert.equal(create.instructions, 'rules\n\nThis project\'s tasks, as the person set them up: start every new task, in a role (--profile) or not, with --model openai/gpt-6-luna --reasoning low. Every task works in this folder, with no worktree of its own.');
   assert.deepEqual(calls.find(([op]) => op === 'write')[1], { dir: '/synthetic/weather', name: 'weather', model: 'anthropic/claude-x', reasoning: 'high', threads: { model: 'openai/gpt-6-luna', reasoning: 'low', inProject: true } });
   assert.equal(p.S.ui.sheet, false, 'the sheet closes once the project is made');
   assert.equal(p.S.selected, 'weather.lead');
@@ -1227,9 +1229,10 @@ test('a new project creates its coordinator in the folder, in its role, writes i
   });
   await p.createProject('/synthetic/weather');
   const create = calls.find(([op]) => op === 'create')[1];
-  // The coordinator profile composes the whole text; its model and tools apply when the project names none.
+  // The coordinator profile composes the text, then the project's task settings follow; its model and
+  // tools apply when the project names none.
   assert.deepEqual(calls.find(([op]) => op === 'policy').slice(1), ['/synthetic/weather', 'coordinator']);
-  assert.deepEqual([create.bot, create.workspace, create.model, create.instructions, Array.from(create.tools)], ['weather.lead', '/synthetic/weather', 'alpha/role', 'rules', ['shell', 'wait']]);
+  assert.deepEqual([create.bot, create.workspace, create.model, create.instructions.split('\n\n')[0], Array.from(create.tools)], ['weather.lead', '/synthetic/weather', 'alpha/role', 'rules', ['shell', 'wait']]);
   assert.deepEqual({ ...calls.find(([op]) => op === 'write')[1] }, { dir: '/synthetic/weather', name: 'weather', model: 'alpha/role', reasoning: null, threads: null });
   assert.equal('reasoning' in create, false, 'no effort picked sends none: the model uses its own');
   assert.equal(p.S.selected, 'weather.lead');
@@ -1241,7 +1244,7 @@ test('a new project creates its coordinator in the folder, in its role, writes i
 test('an agent\'s effort is picked beside its model, kept in the project file, and shown with its model', async () => {
   const sent = []; const storage = new Map(); let file = null;
   const p = shell({
-    project: async (dir) => ({ dir, name: 'weather', coordinator: 'weather.lead', model: file?.model ?? null, reasoning: file?.reasoning ?? null, file: !!file }),
+    project: async (dir) => ({ dir, name: 'weather', coordinator: 'weather.lead', model: file?.model ?? null, reasoning: file?.reasoning ?? null, threads_model: file?.threads_model ?? null, threads_reasoning: null, threads_in: file?.threads_in ?? 'worktree', file: !!file }),
     policy: async () => ({ instructions: 'rules', compaction_instructions: 'summary', note: 'test' }),
     writeProject: async (q) => { sent.push(['write', { ...q }]); },
     request: async (op, q) => { sent.push([op, { ...q }]); return op === 'create' ? { name: q.bot, id: sent.length, provider: q.model.split('/')[0], model: q.model.split('/')[1], reasoning: q.reasoning ?? null, workspace: q.workspace ?? '/synthetic' } : { nodes: [], next_from: null }; },
@@ -1249,13 +1252,16 @@ test('an agent\'s effort is picked beside its model, kept in the project file, a
   await p.createProject('/synthetic/weather', 'anthropic/claude-x', 'max');
   const creates = () => sent.filter(([op]) => op === 'create').map(([, q]) => q);
   assert.equal(creates()[0].reasoning, 'max');
+  // With no threads' model, tasks are started on the lead's own, named so a role's model cannot replace it.
+  assert.match(creates()[0].instructions, /with --model "\$AGENT_MODEL" \$\{AGENT_REASONING:\+--reasoning "\$AGENT_REASONING"\}\. When this folder is a git repository, a task that changes files works in its own worktree/);
   assert.deepEqual(sent.find(([op]) => op === 'write')[1], { dir: '/synthetic/weather', name: 'weather', model: 'anthropic/claude-x', reasoning: 'max', threads: null });
   assert.equal(p.S.bots.get('weather.lead').reasoning, 'max');
   assert.equal(storage.get('agent:effort'), 'max', 'the last pick is offered next time, as the model is');
   // A folder whose file names a model keeps that model's effort, whatever was picked.
-  p.S.bots.clear(); file = { model: 'alpha/one', reasoning: 'low' };
-  await p.createProject('/synthetic/weather', 'anthropic/claude-x', 'high');
+  p.S.bots.clear(); file = { model: 'alpha/one', reasoning: 'low', threads_model: 'beta/two', threads_in: 'project' };
+  await p.createProject('/synthetic/weather', 'anthropic/claude-x', 'high', { model: 'gamma/three', reasoning: null, inProject: false });
   assert.deepEqual([creates()[1].model, creates()[1].reasoning], ['alpha/one', 'low']);
+  assert.match(creates()[1].instructions, /with --model beta\/two\. Every task works in this folder/, 'and its threads\' picks');
   // /new takes an effort after the model.
   await p.submit('/new Bob anthropic/claude-x max');
   await p.submit('/new Ann openai/gpt-6-luna xhigh');
@@ -1279,9 +1285,9 @@ test('the coordinator the app ships gives editing tasks worktrees and cleans up 
   assert.match(text, /the start fails and "\$AGENT_BIN" ls does not list NAME, remove the worktree/);
   assert.match(text, /git worktree remove --force, git branch -D/);
   assert.match(text, /when this folder is not a git repository, works in this folder/);
-  // What the New project sheet wrote for threads.
-  assert.match(text, /when it sets threads_model, start every task with --model THAT, and --reasoning with its threads_reasoning/);
-  assert.match(text, /threads_in = "project", every task works in this folder and gets no worktree/);
+  // The threads' picks are told to the coordinator by the app, not by this role, which a folder may replace.
+  assert.doesNotMatch(text, /threads_|project\.toml/);
+  assert.match(text, /Unless this project's tasks all work in this folder/);
 });
 
 test('a project name taken by another folder\'s coordinator is refused, and a refused model is never written', async () => {

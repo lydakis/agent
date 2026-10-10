@@ -2331,7 +2331,8 @@ async function remove(name) { await Daemon.request('delete', { bot: name }); }
 // The app's own opinion of how a coordinator works is its `coordinator` profile: the folder's
 // `.agents/agents/coordinator.md`, the user's, or the one the app ships (app/agents/coordinator.md).
 // `threads` is what its threads run on and where they work: their model and effort, when not the lead's,
-// and whether all work in the project folder rather than their own worktrees.
+// and whether all work in the project folder rather than their own worktrees. A folder's file keeps
+// its own. The coordinator is told them by `tasksRule`, after its role, so a role of one's own keeps them.
 async function createProject(dir, picked = null, effort = null, threads = null) {
   const info = await Daemon.project(dir);
   const existing = bot(info.coordinator);
@@ -2349,11 +2350,20 @@ async function createProject(dir, picked = null, effort = null, threads = null) 
   const reasoning = (kept ? info.reasoning : effort) || null;
   if (picked) try { localStorage.setItem('agent:model', picked); } catch (_) {}
   if (effort !== null) try { localStorage.setItem('agent:effort', effort); } catch (_) {}
+  const tasks = info.file ? { model: info.threads_model ?? null, reasoning: info.threads_reasoning ?? null, inProject: info.threads_in === 'project' } : threads;
   const session = S.session;
-  const record = await Daemon.request('create', { bot: info.coordinator, workspace: info.dir, model, ...(reasoning ? { reasoning } : {}), instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: policy.tools ?? S.config.tools });
+  const record = await Daemon.request('create', { bot: info.coordinator, workspace: info.dir, model, ...(reasoning ? { reasoning } : {}), instructions: `${policy.instructions}\n\n${tasksRule(tasks)}`, compaction_instructions: policy.compaction_instructions, tools: policy.tools ?? S.config.tools });
   await enqueue(() => { if (S.session === session) seat(record, session); });
   if (!info.file) await Daemon.writeProject({ dir: info.dir, name: info.name, model, reasoning, threads });
   await go(info.coordinator); toast(`project ${info.name} · ${policy.note}`);
+}
+// A project's task settings, said to its coordinator as the flags its starts take. The model is always
+// named, so a role a task starts in (--profile) cannot swap it: the one picked, else the lead's own,
+// which its shell holds as AGENT_MODEL (and its effort as AGENT_REASONING).
+function tasksRule(t) {
+  const flags = t?.model ? `--model ${t.model}${t.reasoning ? ` --reasoning ${t.reasoning}` : ''}` : '--model "$AGENT_MODEL" ${AGENT_REASONING:+--reasoning "$AGENT_REASONING"}';
+  const where = t?.inProject ? 'Every task works in this folder, with no worktree of its own.' : 'When this folder is a git repository, a task that changes files works in its own worktree, so tasks do not collide.';
+  return `This project's tasks, as the person set them up: start every new task, in a role (--profile) or not, with ${flags}. ${where}`;
 }
 function detach() { save(); Daemon.close(); }
 
