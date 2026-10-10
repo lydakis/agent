@@ -62,7 +62,7 @@ window.Daemon = (() => {
   const specs = () => (ENV.AGENT_PROVIDER ?? '').split(/\s+/).filter(Boolean);
   const listing = () => Object.fromEntries(specs().map((spec) => { const n = spec.split('=')[0]; return [n, n === 'openrouter' ? { error: 'provider_http_401', detail: 'invalid key' } : { models: LISTS[n] ?? [] }]; }));
   let listed = FIRST ? [] : null;
-  const S = { swarms: new Map(), bots: new Map(), nodes: new Map(), lineages: new Map(), nextNode: 1, nextTurn: 1, nextProc: 1, nextId: 1, cursor: 0, session: 0, queue: [], waiter: null, timers: new Set(), sides: new Set(), authors: new Map() };
+  const S = { swarms: new Map(), bots: new Map(), nodes: new Map(), lineages: new Map(), nextNode: 1, nextTurn: 1, nextProc: 1, nextId: 1, cursor: 0, session: 0, queue: [], waiter: null, timers: new Set(), sides: new Set(), authors: new Map(), folders: new Map() };
   // Notifications wait in a queue for the page's next pull, as the core's transport holds them.
   // A prompt another bot wrote names it with its item, as the daemon's `history_items` does.
   // Who sent a prompt, as the daemon keeps it with the node: another bot's turn, with the identity
@@ -144,7 +144,7 @@ window.Daemon = (() => {
     const b = S.bots.get(name);
     if (b.status !== 'idle') { emit({ event: 'queued', bot: name, turn: S.nextTurn, data: { delivery: 'queue', ...senderOf(from) } }); return null; }
     const turn = S.nextTurn++;
-    b.turns++; b.running_turn = turn; b.status = 'running'; b.interrupted = false; b.steers = [];
+    b.turns++; b.running_turn = turn; b.status = 'running'; b.interrupted = false; b.steers = []; S.folders.set(turn, b.workspace);
     emit({ event: 'accepted', bot: name, turn, data: { request_id: `demo-${turn}`, node: node({ role: 'user', content: [{ type: 'input_text', text: prompt }] }), workspace: b.workspace, model: `${b.provider}/${b.model}`, ...senderOf(from) } });
     return turn;
   }
@@ -533,7 +533,13 @@ window.Daemon = (() => {
           const page = params.oldest_first ? all.slice(0,limit) : all.slice(-limit);
           const next_from = all.findLast(n=>n.node < (page[0]?.node ?? 0))?.node ?? null;
           const next_newer = all.find(n=>n.node > (page.at(-1)?.node ?? Infinity))?.node ?? null;
-          return {nodes:page.slice().reverse(),next_from,next_newer};
+          const workspaces = [];
+          for (const turn of [...new Set(page.map(n=>n.turn))].sort((a,b)=>a-b)) {
+            const folder = S.folders.get(turn); if (folder == null) continue;
+            const group = workspaces.find(w=>w.folder===folder);
+            if (group) group.turns.push(turn); else workspaces.push({folder, turns:[turn]});
+          }
+          return {nodes:page.slice().reverse(),next_from,next_newer,workspaces};
         }
         case 'history_items': {
           const items=[];let bytes=0;
