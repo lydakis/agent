@@ -248,7 +248,8 @@ class TriggerFireTests(ModelFixture):
         # Run now while the repository is away sends, and keeps the commit last seen.
         moved = self.path / 'away'
         repo.rename(moved)
-        (self.home / '.agent/triggers/p.task.fire').write_text(str(int(time.time())))
+        (self.home / '.agent/triggers/p.task.asks').mkdir(parents=True, exist_ok=True)
+        (self.home / '.agent/triggers/p.task.asks/1').write_text('')
         asked = self.fire('p.task', 'Look at it.', when=when, extra=extra, generation='g')
         self.assertEqual(asked['last']['outcome'], 'sent', asked)
         self.assertEqual(asked['head'], news['head'])

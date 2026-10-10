@@ -1168,11 +1168,7 @@ fn trigger_fire(
     window: tauri::WebviewWindow,
     name: String,
 ) -> Result<Value, String> {
-    trigger::fire_now(
-        &triggers_of(&*windows.of(&window)?)?,
-        &name,
-        &trigger::launchctl,
-    )
+    trigger::fire_now(&triggers_of(&*windows.of(&window)?)?, &name)
 }
 
 /// Page diagnostics land on stderr, where a terminal can see them.

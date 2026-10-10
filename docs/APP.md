@@ -1066,11 +1066,15 @@ first. A name differing from another only in case is refused
 a trigger only by the name as stored; `rm` of a name not there is
 `trigger_not_found`. `ls` returns 64 triggers per page, with `next_after`
 for `--after NAME` or the next page in Settings; only the current page's
-messages are retained. `fire NAME` has launchd run the trigger's job now
-(`launchctl kickstart`) and returns `{"name", "fired": true}`; what the fire
-did shows in `ls`. It leaves a note the fire reads, so that fire sends
-whatever its time or watched path, and queues behind work rather than
-skipping it. launchd runs no second copy of a job still running.
+messages are retained. `fire NAME` asks for a fire and returns
+`{"name", "fired": true}`; what the fire did shows in `ls`. An ask is a file
+in the trigger's queue folder, `~/.agent/triggers/NAME.asks`, which its plist
+names as launchd's `QueueDirectories`: launchd runs the job while an ask is
+there, one run at a time, and runs it again when a run ends with one still
+there. A fire takes the asks it finds as it starts, so it sends whatever its
+time or watched path, and queues behind work rather than skipping it; one
+made while it runs is the next run's. Nothing else starts a fire: launchd
+is the only thing that runs one.
 
 Each is one LaunchAgent, `~/Library/LaunchAgents/me.lydakis.agent.trigger.NAME.plist`,
 and that file is its definition: its program arguments carry the agent and
@@ -1320,9 +1324,9 @@ its result and an ended one's moved, an unreadable plist left in place.
 The same day, file, commit and fire-by-name triggers were added and passed
 the real-daemon tests too: a message starts with its fire line, a commit
 trigger fired again on the same HEAD sends nothing and on a new commit sends
-again, and `add`'s idempotence, `fire`'s note and the `WatchPaths` plist are
+again, and `add`'s idempotence, `fire`'s ask and the `WatchPaths` plist are
 covered against the stand-in launchd. A file trigger firing on a write and
-`fire` through `launchctl kickstart` need a Mac (`AGENT_TEST_LAUNCHD=1`).
+`fire` through the `QueueDirectories` queue need a Mac (`AGENT_TEST_LAUNCHD=1`).
 
 ## Next
 
