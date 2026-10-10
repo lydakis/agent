@@ -20,7 +20,8 @@ There are two conditions:
 
 - **`none`**: no facts and no `memory` skill. This is the control.
 - **`memory`**: three facts are saved through the app's own
-  `~/.agent/memory` script, and the app's `memory` skill is installed. A
+  `~/.agent/memory` script, and the app's `memory` skill is installed, both
+  from this checkout so they match. A
   new agent's instructions then carry the person's index and the project's.
 
 There are three scenarios. Each pairs a fact the code does not show with a
@@ -42,9 +43,10 @@ its work isn't used. For each bot, the script also records:
 - whether the visible tests pass;
 - the final reply and the time taken.
 
-In `stale`, `fact_corrected` records whether the agent removed the wrong
-fact or rewrote it to say prices round half up, which the `memory` skill
-asks it to do; `fact_after` keeps the fact's text for reading.
+In `stale`, `fact_changed` records whether the agent touched the wrong
+fact, and `fact_after` keeps its text, or null if removed. Whether the
+change is a correction, as the `memory` skill asks, is read from that
+text: no keyword test tells a fix from a reworded mistake.
 
 The research's third condition, the skill with no index composed, is left
 out. M2 already composes the indexes, and the runtime has one behavior, so
@@ -52,13 +54,14 @@ that path no longer exists to measure.
 
 ## Run it
 
-These steps run on George's Mac. The app must be installed (the script
-uses its `agent-app --memory`), and Codex must be logged in to ChatGPT:
+These steps run on George's Mac, with Codex logged in to ChatGPT. The
+build makes the daemon and the app from the same checkout, since the memory
+script is `agent-app --memory` and the skill comes from the checkout:
 
 ```sh
 cd ~/Developer/agent
 git pull
-cargo build --release --locked
+cargo build --release --locked -p agent-runtime -p agent-app
 .local/venv/bin/python -m bench.memory_eval --model chatgpt/MODEL --out .local/memory-eval/MODEL.json
 ```
 
@@ -73,8 +76,8 @@ cargo build --release --locked
   `agent-memory-eval-*` folder under the system's temporary directory,
   named in the output as `bots_dir`. That is outside this checkout so a
   bot's instructions don't pick up this repository's `AGENTS.md`.
-- **App path.** When the app isn't where `~/.agent/memory` points, pass
-  `--memory-app /path/to/agent-app`.
+- **Provenance.** The result records when it ran, the checkout's
+  revision, and the hashes of the `agent` and `agent-app` it used.
 - **API key instead.** An API key works as well: `--model openai/MODEL`
   with `OPENAI_API_KEY` set, or `anthropic/MODEL` with `ANTHROPIC_API_KEY`.
   Only the selected provider's key reaches the daemons, which keep it out
@@ -96,7 +99,7 @@ covers the worktree, the per-bot HOME, the facts saved through the real
 script, `run --new --agents`, the daemon's totals and the scoring. It
 checks that the memory condition's instructions carry both indexes and the
 control's carry none. It needs the release `agent` and a built `agent-app`
-(`cargo build` in `app/src-tauri`, or `AGENT_TEST_APP`).
+(the build above, or `AGENT_TEST_APP`).
 
 ## Cost estimate
 
@@ -122,8 +125,9 @@ How much quota isn't published, so that part is unknown.
 **On an API key**, the price depends on the model's rates. As an
 illustration only: at $1 to $5 per million uncached input tokens, a tenth
 of that for cached input, and $10 to $25 per million output tokens, the
-expected run costs about $1.50 to $6. The 7.2-million-token ceiling,
-billed at the high rate with no cache, would cost under $40.
+expected run costs about $1.50 to $6. The 7.2-million-token ceiling
+counts input and output together; billed at the output rate with no
+cache, it would cost up to $180.
 
 ## Reading the result
 

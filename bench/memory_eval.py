@@ -11,7 +11,7 @@ Conditions:
 
 - `none`: no facts and no `memory` skill, the control.
 - `memory`: the facts below saved with the app's `~/.agent/memory` script
-  and the app's `memory` skill installed, so a new agent's instructions
+  and the app's `memory` skill installed, both from this checkout, so a new agent's instructions
   carry both memory indexes (the person's and the project's).
 
 Scenarios, each a fact the code does not show and a task that needs it:
@@ -23,8 +23,9 @@ Scenarios, each a fact the code does not show and a task that needs it:
 - `stale`: memory says prices round half to even with `round_price` in
   `shop/money.py`, but that file is gone and `shop/pricing.py` rounds half
   up. The task adds a discount to `Order.total()`, rounded as the project
-  rounds. Correct means the code, not the fact, won; `fact_corrected` says
-  whether the agent then fixed or removed the fact, as the skill asks.
+  rounds. Correct means the code, not the fact, won; `fact_changed` and
+  `fact_after` show whether and how the agent then fixed the fact, as the
+  skill asks.
 
 Scores come from hidden checks run in the worktree after the turn, not from
 the agent's account. Each bot reports its turn's status, model rounds,
@@ -44,7 +45,6 @@ import argparse
 import concurrent.futures
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -56,6 +56,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bench.targets import clean_env, file_hash  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
+BUILD = 'cargo build --release --locked -p agent-runtime -p agent-app'
 PROJECT = 'shop'
 CONDITIONS = ('none', 'memory')
 # The key variable each built-in provider reads.
@@ -254,8 +255,11 @@ def project(root):
 
 
 def check(worktree, scenario):
-    out = subprocess.run([sys.executable, '-I', '-c', f'import sys; sys.path.insert(0, ".")\n{CHECKS[scenario]}'],
-                         cwd=worktree, env=clean_env(), capture_output=True, text=True, timeout=60)
+    try:
+        out = subprocess.run([sys.executable, '-I', '-c', f'import sys; sys.path.insert(0, ".")\n{CHECKS[scenario]}'],
+                             cwd=worktree, env=clean_env(), capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return {'correct': False, 'error': 'timeout'}
     try:
         return json.loads(out.stdout.strip().splitlines()[-1])
     except (ValueError, IndexError):
@@ -263,40 +267,29 @@ def check(worktree, scenario):
 
 
 def visible_tests(worktree):
-    out = subprocess.run([sys.executable, '-m', 'unittest', '-q'], cwd=worktree, env=clean_env(),
-                         capture_output=True, text=True, timeout=120)
+    try:
+        out = subprocess.run([sys.executable, '-m', 'unittest', '-q'], cwd=worktree, env=clean_env(),
+                             capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return False
     return out.returncode == 0
 
 
 def provider_keys(specs):
     """The key variables the daemon's providers read, which it registers as
     credentials and so keeps out of the bot's shell: a spec's KEY_ENV, else
-    its built-in provider's own. No other key is passed on."""
+    its built-in provider's own when it keeps the built-in URL. No other key
+    is passed on."""
     keys = []
     for spec in specs.split():
         name, _, rest = spec.partition('=')
         fields = rest.split(',') if rest else []
-        keys.append(fields[2] if len(fields) > 2 and fields[2] else KEYS.get(name))
+        if len(fields) > 2 and fields[2]:
+            keys.append(fields[2])
+        elif not (len(fields) > 1 and fields[1]):
+            # A custom URL with no key field sends no credential.
+            keys.append(KEYS.get(name))
     return [key for key in keys if key]
-
-
-def fact_corrected(text):
-    """Whether the stale fact now says what the code does: removed, or
-    saying prices round half up."""
-    return text is None or bool(re.search(r'half[ _-]up', text, re.I))
-
-
-def memory_app(given):
-    """The app executable `~/.agent/memory` runs: the one given, else the
-    one the person's own script names."""
-    if given:
-        return Path(given).resolve()
-    script = Path.home() / '.agent/memory'
-    found = re.search(r"^exec '(.+)' --memory", script.read_text(), re.M) if script.exists() else None
-    if not found:
-        raise SystemExit('no --memory-app, and ~/.agent/memory names none: open the app once, or pass the '
-                         'path to agent-app')
-    return Path(found.group(1).replace("'\\''", "'"))
 
 
 def home(root, condition, app):
@@ -403,7 +396,8 @@ def run_bot(binary, app, model, env, out_dir, condition, scenario, trial, budget
         'shell_calls': len(commands),
         'memory_saved': sorted(k for k in after if before.get(k) != after[k]),
         'memory_removed': sorted(k for k in before if k not in after),
-        **({'fact_corrected': fact_corrected(after.get(stale)), 'fact_after': after.get(stale)}
+        # Whether the agent fixed the wrong fact is read from its text.
+        **({'fact_changed': after.get(stale) != before[stale], 'fact_after': after.get(stale)}
            if condition == 'memory' and scenario == 'stale' else {}),
         'answer': answer(found),
         'dir': str(root),
@@ -424,8 +418,8 @@ def summarize(rows):
                         'tokens_in_cached_out': [total('input_tokens'), total('cached_input_tokens'),
                                                  total('output_tokens')],
                         'memory_commands': [len(r['memory_commands']) for r in block],
-                        **({'fact_corrected': sum(r['fact_corrected'] for r in block)}
-                           if 'fact_corrected' in block[0] else {})})
+                        **({'fact_changed': sum(r['fact_changed'] for r in block)}
+                           if 'fact_changed' in block[0] else {})})
     return summary
 
 
@@ -456,7 +450,8 @@ def main():
     parser.add_argument('--conditions', nargs='+', default=list(CONDITIONS), choices=CONDITIONS)
     parser.add_argument('--scenarios', nargs='+', default=list(SCENARIOS), choices=list(SCENARIOS))
     parser.add_argument('--binary', type=Path, default=ROOT / '.local/target/release/agent')
-    parser.add_argument('--memory-app', help="the agent-app executable (default: the one ~/.agent/memory runs)")
+    parser.add_argument('--memory-app', type=Path, default=ROOT / '.local/target/release/agent-app',
+                        help='agent-app built from this checkout, so the memory script matches its skill')
     parser.add_argument('--provider', help='AGENT_PROVIDER for the daemons (default: the model\'s provider)')
     parser.add_argument('--turn-budget-tokens', type=int, default=400_000, help='cap on each task\'s turn')
     parser.add_argument('--timeout', type=float, default=1200, help='seconds each task may take')
@@ -466,9 +461,10 @@ def main():
         return self_check()
     if not (args.model and args.out):
         parser.error('--model and --out are required')
-    if not args.binary.exists():
-        parser.error(f'{args.binary} is missing: cargo build --release --locked')
-    app = memory_app(args.memory_app)
+    for built in (args.binary, args.memory_app):
+        if not built.exists():
+            parser.error(f'{built} is missing: {BUILD}')
+    app = args.memory_app.resolve()
     args.out.parent.mkdir(parents=True, exist_ok=True)
     env = clean_env()
     env['AGENT_PROVIDER'] = args.provider or args.model.split('/', 1)[0]
@@ -481,11 +477,16 @@ def main():
     out_dir = Path(tempfile.mkdtemp(prefix='agent-memory-eval-'))
     if ROOT in out_dir.resolve().parents:
         parser.error(f'{out_dir} is inside {ROOT}: set TMPDIR elsewhere')
+    observed = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
     jobs = [(c, s, t) for c in args.conditions for s in args.scenarios for t in range(args.trials)]
     with concurrent.futures.ThreadPoolExecutor(len(jobs)) as pool:
         rows = list(pool.map(lambda job: run_bot(args.binary.resolve(), app, args.model, env, out_dir, *job,
                                                  args.turn_budget_tokens, args.timeout), jobs))
-    result = {'binary_sha256': file_hash(args.binary), 'model': args.model, 'bots_dir': str(out_dir),
+    revision = subprocess.run(['git', '-C', str(ROOT), 'describe', '--always', '--dirty', '--abbrev=40'],
+                              capture_output=True, text=True).stdout.strip()
+    result = {'observed': observed, 'revision': revision, 'model': args.model,
+              'binary_sha256': file_hash(args.binary), 'memory_app_sha256': file_hash(app),
+              'bots_dir': str(out_dir),
               'summary': summarize(rows), 'bots': rows}
     args.out.write_text(json.dumps(result, indent=1))
     print(json.dumps(result['summary'], indent=1))

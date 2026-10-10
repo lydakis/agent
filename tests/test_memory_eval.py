@@ -20,14 +20,9 @@ class ReferenceTests(unittest.TestCase):
         self.assertEqual(memory_eval.provider_keys('openai'), ['OPENAI_API_KEY'])
         self.assertEqual(memory_eval.provider_keys('openai=responses-ws'), ['OPENAI_API_KEY'])
         self.assertEqual(memory_eval.provider_keys('gw=responses,https://gw.example.test/v1,GW_KEY'), ['GW_KEY'])
+        self.assertEqual(memory_eval.provider_keys('openai=responses,https://gw.example.test/v1'), [])
         self.assertEqual(memory_eval.provider_keys('chatgpt'), [])
 
-    def test_the_stale_fact_counts_as_corrected_only_when_it_says_half_up(self):
-        self.assertTrue(memory_eval.fact_corrected(None))
-        self.assertTrue(memory_eval.fact_corrected('Prices round half up with quantize_price in shop/pricing.py; '
-                                                   'shop/money.py and half to even are gone.'))
-        self.assertFalse(memory_eval.fact_corrected(memory_eval.FACTS['price-rounding'][4]))
-        self.assertFalse(memory_eval.fact_corrected('Prices round half to even.'))
 
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
@@ -38,9 +33,9 @@ class PlumbingTests(unittest.TestCase):
 
     def setUp(self):
         self.binary = ROOT / '.local/target/release/agent'
-        self.app = Path(os.environ.get('AGENT_TEST_APP', ROOT / '.local/target/debug/agent-app'))
+        self.app = Path(os.environ.get('AGENT_TEST_APP', ROOT / '.local/target/release/agent-app'))
         if not self.app.exists():
-            self.skipTest('build the app (cargo build in app/src-tauri) or set AGENT_TEST_APP')
+            self.skipTest(f'{memory_eval.BUILD}, or set AGENT_TEST_APP')
         self.seen = []
         lock = threading.Lock()
         reply = synthetic_model.Model.reply
