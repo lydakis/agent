@@ -430,6 +430,11 @@ cargo build --release -p agent-app
   --socket ~/.agent/state.sqlite.sock --workspace "$PWD"
 ```
 
+A source build is not a bundle, so it links no skills: it uses whatever
+`~/.agents/skills` holds. To try the current `app/skills/NAME`, link it there
+yourself (a link of yours stays), or build a bundle as the release does
+([Installing](#installing)).
+
 Without `--workspace` the workspace is the launching directory, or home when
 that is `/`, as for a window opened from the Dock. `--host ALIAS` opens the
 window on that SSH host instead ([Hosts over SSH](#hosts-over-ssh)), with
@@ -1208,22 +1213,57 @@ not wait; one launchd refuses keeps its old path and is tried again at the
 next start. Settings lists schedules also when no project exists. Only macOS has launchd; elsewhere `add`
 refuses with `schedules_unsupported`.
 
+The app ships an `automation` skill
+([SKILL.md](../app/skills/automation/SKILL.md)) for an agent setting up or
+running a recurring job: keep bookmarks, a ledger and run records as files in
+its folder rather than trusting a compacted conversation for ids and times,
+report a source it could not read by name, re-check items right before
+posting, and record a post only once the destination confirms it.
+
+## Skills the app ships
+
+Agents read only skills in a folder's `.agents/skills` or in
+`~/.agents/skills` ([client policy](CLIENT.md)). The app bundle carries its
+skills, from `app/skills/NAME/`, in `Contents/Resources/skills/NAME`, and on
+every start the app links each one from `~/.agents/skills/NAME`
+([skills.rs](../app/src-tauri/src/skills.rs)). Updating the app updates what
+the link points at, so nothing is copied or recorded; a moved app re-points
+its links at its next start, and a skill it stops shipping loses its link.
+The Homebrew cask runs `agent-app --setup` after an install or upgrade, which
+writes what a start writes (scripts, `~/.agent/schedule`, these links) before
+the first window, and `agent-app --unlink-skills` before an uninstall, which
+removes this bundle's links and nothing else, so none outlives the app. The app's links are those into a copy of it (a bundle with
+`Contents/MacOS/agent-app`) or into an app since removed; a folder, file or
+link of yours at that name, another app's skills folder included, is left
+alone, and a folder's own skill of the same name wins over it. To change a shipped skill, replace the
+link with a folder of your own: the link leads into the signed app, which is
+not yours to edit. Agents already running keep the index they were created
+with.
+
 ## Messages
 
 What a model writes is drawn the way a page would draw it. A message is
 Markdown (GitHub's flavour, with a line break wherever the model wrote one),
 parsed by [marked](https://marked.js.org) once and kept with the item, so a
 pane drawn again reuses it; when highlighting loads, only messages whose code
-waited for it are drawn again. A table past 256 columns or 10,000 cells shows
+waited for it are drawn again, and a file beside only when it shows as code
+(a page, diagram or chart there keeps running). A table past 256 columns or 10,000 cells shows
 as its source, as a short row is padded to the header's width and a few bytes
 a row could ask for millions of cells. A message past 50,000 lines, or one
 that would draw past 100,000 tags, shows as its text, as a `- x` line makes
-an element from four bytes. Fenced blocks are drawn by their language:
+an element from four bytes. One with more than 100,000 marks that open an
+inline element (`*`, `_`, a backtick, `[`, `<`, `~`, `|`, `@`, `www.`,
+`://`) is not parsed either: the parser's tokens for a single line of `*x*`
+cost far more than the HTML they become. A streamed reply's blocks share
+those bounds and the highlighting budget below, as do the text blocks of one
+stored message on either side of its tool calls; past them the rest shows as
+text. Fenced blocks are drawn by their language:
 
 - **Code** is highlighted with [highlight.js](https://highlightjs.org) (its
   common languages) in the window's own colors, with a copy button. A block
   names its language or is left plain; nothing guesses. Blocks over 64 KiB
-  stay plain.
+  stay plain, and a message or file highlights at most 256 KiB of code in
+  all.
 - **`mermaid`** draws as a diagram with [Mermaid](https://mermaid.js.org),
   themed to the window. In a message it opens as its source and draws with a
   click on **diagram**: Mermaid lays out on the window's thread, and a few
@@ -1239,7 +1279,14 @@ an element from four bytes. Fenced blocks are drawn by their language:
   as generated code. A chart in a message opens as its spec and draws with a
   click on **chart**: Vega draws on the window's thread, and a few characters
   of spec (a `sequence` transform to a billion, a billion ticks) can ask it
-  for more than it can draw. One drawn shows again when its pane is redrawn.
+  for more than it can draw. A diagram or chart drawn shows again when its
+  pane is redrawn, when the reply it streamed in is committed, and when its
+  message is drawn anew for highlighting: its id is its turn (or file) and
+  its source. An identical one in another turn or file still asks, so one
+  click never fills a chat of copies; one whose source changed, as in a file
+  an agent rewrote, asks too. One that fails to draw shows its error and
+  asks again before it is tried again. One in a file opened beside is
+  measured once the pane has finished opening.
 - **`html`** opens as code, and runs as a preview in a sandboxed frame only
   when asked: a click on **preview** runs it, a click on **code** stops it.
   A preview's scripts share the window's thread (a frame is not a process),
@@ -1257,9 +1304,10 @@ also draw, and an HTML preview can still draw a chart with its own inline
 SVG or canvas.
 
 Highlighting, Mermaid and Vega load the first time something needs them;
-marked loads with the page. Nothing in a message draws until asked, so
-opening a long chat draws nothing, and a reader below a block that draws
-keeps their place. Mermaid's own limits (50,000 characters, 500 edges) do
+marked loads with the page. Text, lists, tables and code draw as a message
+arrives; diagrams, charts, previews and images draw only when asked, so
+opening a long chat runs none of them, and a reader below a block that
+draws keeps their place. Mermaid's own limits (50,000 characters, 500 edges) do
 not bound its layout work, which is why a diagram waits for a click. Drawn
 diagrams and charts are kept by source (a chart also by its width) and show
 again when their pane is redrawn: at most 64 and 8 MiB. A
@@ -1278,48 +1326,58 @@ host is refused by name, as its files are the host's). The file draws by its
 kind: Markdown, a diagram (`.mmd`, `.mermaid`) or a chart (`.vl.json`,
 `.vg.json`), drawn at once, a page (`.html`, opened as its preview), an SVG
 or image (opening the file is the asking), a CSV or TSV as a table of its
-first 1,000 rows and 256 columns (quoted fields kept whole), a binary file
-as its size,
-anything else as code highlighted by its extension. Esc or ✕ closes it and
-brings back the task that was beside, if any. A write or edit to the open
-file reads it again; deleting the agent it came from, or attaching to another
-store, closes it. Searching a project's files
-(from ^k or elsewhere) is not built.
+first 1,000 rows and 256 columns, ending with the row that reaches 10,000
+cells (quoted fields kept whole, and the view says when rows were left out),
+a binary file as its size, anything else as code highlighted by its
+extension. Esc or ✕ closes it and brings back the task that was beside, if
+any. A write or edit to the open file reads it again, and what the agent
+wrote is new: a page, diagram, chart or image in it waits for a click, as in
+a message. Deleting the agent it came from, or attaching to another store,
+closes it. Searching a project's
+files (from ^k or elsewhere) is not built.
 
 What a model writes never becomes the app's markup unparsed. Raw HTML inside
 Markdown shows as text. Links open in the default browser and only for `http`,
 `https` and `mailto` (the core's `open_link` refuses anything else); other
 links show as their text. A link inside a drawn diagram (a Mermaid `click`
-link) goes the same way and never navigates the window; a chart's `href` is
-dropped, as Vega's loader refuses every URL. Images draw only from raster
-`data:` URLs the message carries, and only on a click, as a small image can
-decode to far more than its bytes; a remote image is a link and a local one
-opens beside, so drawing a message makes no request a model chose. An HTML
-preview runs scripts in a frame sandboxed without same-origin access: it
-cannot read the app or its storage, cannot navigate the window, and the app's
-script globals are injected into the main frame only. Its page carries a
-policy that loads nothing from the network (no fetch, scripts, styles, images
-or fonts but its own inline ones and `data:`), and the window's policy
-(`frame-src about:`) stops a preview from navigating its own frame to a
+link) goes the same way and never navigates the window. A chart's `href` drew
+no link in Chromium, as Vega's string renderer passes it through the loader,
+which refuses every URL; one that did draw would go the same way. Images draw
+only from raster `data:` URLs the message carries, and only on a click, as a
+small image can decode to far more than its bytes; a remote image is a link
+and a local one opens beside, so drawing a message makes no request a model
+chose. An HTML preview runs scripts in a frame sandboxed without same-origin
+access: it cannot read the app or its storage, cannot navigate the window, and
+the app's script globals are injected into the main frame only. Its page
+carries a policy that loads nothing from the network (no fetch, scripts,
+styles, images or fonts but its own inline ones and `data:`), and the window's
+policy (`frame-src about:`) stops a preview from navigating its own frame to a
 website. A preview runs only once asked, so a long transcript holds no idle
 pages. The window's policy also takes images, fonts, media and stylesheets
 only from the app itself, `data:` and `blob:`, so a library drawing a message
 cannot fetch one either: a Mermaid node's `img:` URL or a `url()` in its theme
 CSS is refused, and the diagram names the failure in its head.
 
-Measured 2026-10-09 at 4dc1751 with `node app/bench/render.cjs`, in headless
+Measured 2026-10-09 at a038530 with `node app/bench/render.cjs`, in headless
 Chromium 141.0.7390.37 on a 4-core cloud container: seven runs, each the
 median of nine (synthetic messages: prose, lists, a table, and Rust in every
-third one). Drawing 400 messages (292 KiB) costs 45 to 84 ms of parsing the
-first time, against 4 to 7 ms for the line renderer this replaced; drawn
+third one). Drawing 400 messages (292 KiB) costs 61 to 71 ms of parsing the
+first time, against 5.5 to 6.4 ms for the line renderer this replaced; drawn
 again, a message costs no parsing, as its HTML is kept on its item. Putting
-those 400 into the page and laying them out takes 165 to 422 ms, against 88
-to 235 ms before (this container's layout times vary widely; in each run the
-new page took 1.3 to 3.3 times the old), because the HTML is larger (654 KiB
-against 421 KiB) and code is highlighted. A 9 KiB reply streamed in
-8-character deltas (1,121 of them, 44 finished blocks) costs 7 to 12 ms in
-all, against 1 to 2 ms for plain text; parsing the whole reply again on each
-delta would cost 0.7 to 1.2 s.
+those 400 into the page and laying them out takes 187 to 472 ms, against 120
+to 337 ms for the old renderer's markup under its own stylesheet (read from
+b7bdfe4). This container's layout times vary widely: within a run the new
+page took 0.55 to 3.6 times the old, 1.3 times at the median, as its HTML is
+larger (654 KiB against 425 KiB) and its code highlighted. Parsing a whole
+9 KiB reply again on each of its 1,121 deltas would cost 1.0 to 1.1 s.
+
+Streaming was measured again 2026-10-10 at e1725d7, three runs, with each
+delta paying what the app's render does around it: reading whether the reader
+is at the bottom, keeping them there (a layout per delta), and for the new
+tail hydrating the blocks that delta finished. That 9 KiB reply in
+8-character deltas (44 finished blocks) costs 58 to 66 ms in all, against
+317 to 364 ms for the old tail, one text node that grows and is laid out
+whole on every delta.
 
 While a reply streams, each block that has ended (a paragraph after its blank
 line, a fence once it closes) is drawn once and appended; only the block still
