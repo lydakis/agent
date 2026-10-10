@@ -2126,6 +2126,12 @@ fn error_json(message: &str) -> Value {
 }
 
 /// `APP --trigger add|ls|fire|rm`, from `~/.agent/trigger`.
+/// `add` for another of the app's scripts, as if `~/.agent/trigger add`
+/// ran in this folder.
+pub(crate) fn add_here(args: &[String]) -> Result<Value, String> {
+    add(&Places::home()?, args)
+}
+
 pub fn cli(args: &[String]) -> i32 {
     let done = match Places::home().and_then(|places| match args.split_first() {
         Some((verb, rest)) if verb == "ls" => match rest {
@@ -2703,7 +2709,7 @@ async fn start(client: &Client, trigger: &Trigger) -> Result<i64, String> {
         .dir
         .as_ref()
         .ok_or("invalid_trigger: --start has no folder")?;
-    let policy = crate::compose(dir, None, None)?;
+    let policy = crate::compose(dir, None)?;
     let made = client
         .request(
             "create",

@@ -446,33 +446,25 @@ const isOpen = (key) => S.bots.has(key) || !!swarmOf(key) || pageOf(key);
 const opened = () => (pageOf(S.selected) ? '' : S.selected);
 // A member is the bot the swarm pinned: another bot later given its name is not the swarm's.
 const memberBot = (sw, m) => { const b = bot(m); return b && b.id != null && b.id === sw.ids[m] ? b : null; };
+// A member whose bot was deleted is out of the swarm, though the swarm's record still names it.
+const liveMembers = (sw) => sw.members.filter((m) => memberBot(sw, m));
 const swarmOfBot = (name) => { const sw = S.swarms.get(S.memberOf.get(name)); return sw && memberBot(sw, name) ? sw : null; };
 const memberShort = (sw, name) => (name.startsWith(sw.project + '.') ? name.slice(sw.project.length + 1) : name);
 // `batch` defers the member index to its caller, which builds it once for all the records it learns.
+// Who a swarm's agents are, pinned or not: a change means events of theirs may have come before the
+// page knew them, so the swarm is checked and its board and usage read again.
+const pinsOf = (sw) => sw.members.map((m) => `${m}=${sw.ids[m] ?? ''}`).join(',');
 function learnSwarm(record, batch = false) {
-  const sw = S.swarms.get(record.swarm) ?? { lines: [], offset: null, tab: 'board', used: null, reading: null, again: false, usage: null, state: { roles: {}, streams: {}, proposals: [] }, filter: null };
-  Object.assign(sw, { name: record.swarm, dir: record.dir, project: record.project, goal: record.goal, workspace: record.workspace, budget: record.budget_tokens, mix: record.mix ?? [], members: record.members ?? [], ids: record.ids ?? {}, rows: record.rows ?? {}, stopped: !!record.stopped, council: record.council ?? 0, seats: record.seats ?? [], left: record.left ?? [] });
+  const known = S.swarms.get(record.swarm), was = known && pinsOf(known);
+  const sw = known ?? { lines: [], offset: null, tab: 'board', used: null, reading: null, again: false, usage: null, state: { roles: {}, streams: {}, tasks: {} }, filter: null };
+  Object.assign(sw, { name: record.swarm, dir: record.dir, project: record.project, goal: record.goal, workspace: record.workspace, budget: sw.budget ?? record.budget_tokens, mix: record.mix ?? [], members: record.members ?? [], ids: record.ids ?? {}, rows: record.rows ?? {}, stopped: !!record.stopped });
   S.swarms.set(sw.name, sw); if (!batch) indexMembers();
+  if (pinsOf(sw) !== was) { checkSoon(sw); boardSoon(sw, true); }
   return sw;
 }
 function indexMembers() {
   S.memberOf = new Map(); for (const sw of S.swarms.values()) for (const m of sw.members) S.memberOf.set(m, sw.name);
   S.shapeGen += 1;
-}
-// A swarm's departures go one at a time, so each answer is newer than the one before it and the last
-// one applied has them all. The board is read after each: a stream or a seat may have changed hands.
-const leaving = new Map();
-function leave(swarm, name) {
-  const next = (leaving.get(swarm) ?? Promise.resolve()).then(() => Daemon.swarmLeave(swarm, name)).then(
-    (r) => {
-      const sw = learnSwarm(r); boardSoon(sw); if (S.selected === swarmKey(swarm)) render();
-      // Who was not told it leads or sits now; the board still says it.
-      if (r.missed?.length) toast(`${swarm}: not told: ${r.missed.map((m) => `${m.agent} (${m.error})`).join(', ')}`, 5000);
-    },
-    (e) => toast(`leave ${swarm}: ${e?.message ?? e}`));
-  leaving.set(swarm, next);
-  next.then(() => { if (leaving.get(swarm) === next) leaving.delete(swarm); });
-  return next;
 }
 // Reads can overlap; only the newest one's answer is kept, so an older snapshot never removes a swarm a
 // newer read found.
@@ -488,6 +480,24 @@ async function loadSwarms() {
   for (const r of swarms) learnSwarm(r, true);
   indexMembers();
   if (broken.length) toast(`not a readable swarm: ${broken[0]}`, 5000);
+  pinsSoon();
+}
+// A swarm read while its start is still making its agents names them before it pins their ids, and
+// their first events have come and gone by then: it is read again, a second apart, until every member
+// is pinned, for at most a minute per swarm, so one left unpinned never holds up the next. An agent
+// named like a known swarm's, briefed before Add named it in the swarm, is waited for the same way.
+let pinsTimer = null; const pinTries = new Map(), adding = new Map();
+function pinsSoon() {
+  for (const [name, of] of [...adding]) if (S.memberOf.has(name) || !S.swarms.has(of) || !bot(name)) adding.delete(name);
+  const waiting = [...new Set([...S.swarms.values()].filter((sw) => sw.members.some((m) => sw.ids[m] == null)).map((sw) => sw.name).concat([...adding.values()]))];
+  for (const name of [...pinTries.keys()]) if (!waiting.includes(name)) pinTries.delete(name);
+  const due = waiting.filter((name) => (pinTries.get(name) ?? 0) < 60);
+  if (pinsTimer || !due.length) return;
+  for (const name of due) pinTries.set(name, (pinTries.get(name) ?? 0) + 1);
+  pinsTimer = setTimeout(async () => {
+    pinsTimer = null;
+    try { await loadSwarms(); render(); } catch (e) { Daemon.log?.(`swarms: ${e?.message ?? e}`); }
+  }, 1000);
 }
 // A swarm works while any agent works, waits while any waits, and is otherwise at rest.
 // At rest, it is done while an agent's finished turn is unseen, even if a later turn of it failed.
@@ -507,7 +517,7 @@ function readBoard(sw) {
         // The board's tail, read afresh: it was rewritten, or grew past what is kept since the last read.
         if (r.reset) sw.lines = [];
         sw.lines.push(...(r.lines ?? []));
-        // Roles, proposals and streams: what the whole board adds up to, not only the lines read.
+        // Roles, tasks and the result: what the whole board adds up to, not only the lines read.
         if (r.state) { sw.state = r.state; sw.stateGen = (sw.stateGen ?? 0) + 1; }
         if (sw.lines.length > BOARD_LINES) sw.lines.splice(0, sw.lines.length - BOARD_LINES);
         sw.offset = r.offset;
@@ -521,30 +531,31 @@ function readBoard(sw) {
   })();
   return sw.reading;
 }
-// Tokens its agents and their helpers have used, from the daemon's list: they sit together in its
-// name order, a helper named after the agent that made it, so after its maker. A member that left
-// still makes its helpers count, and a helper deleted since the board last looked counts with what
-// the board saw it use, as the swarm's budget notices count them.
+// Tokens its agents and their helpers have used, and its budget, from the daemon's list, as the swarm's
+// script counts them: they sit together in its name order, a helper named after the agent that made
+// it, so after its maker. The budget is its members' own caps, so a deleted agent takes its share.
 async function readUsage(sw) {
   if (sw.usage) return sw.usage;
   sw.usage = (async () => {
-    // Helpers seen before stand in for their maker once it is deleted.
-    const prefix = sw.name + '-', makers = new Set([...Object.values(sw.ids), ...(sw.left ?? []), ...Object.keys(sw.state?.roots ?? {}).map(Number)]), seen = new Set();
-    let used = 0, after = sw.name;
+    // As the script counts: live members and their caps, and every helper seen working for a live
+    // member, deleted ones by the tokens the board's state last recorded, or summed per member.
+    const helpers = { ...(sw.state.helpers ?? {}) }, live = new Set(), prefix = sw.name + '-';
+    const roots = new Map([...Object.entries(helpers).map(([id, [, root]]) => [Number(id), root]), ...Object.values(sw.ids).map((id) => [id, id])]);
+    let used = 0, budget = 0, after = sw.name;
     try {
       for (;;) {
         const page = await Daemon.request('bots', { after, limit: 256 }); let past = false;
         for (const r of page.bots ?? []) {
           if (r.name > prefix && !r.name.startsWith(prefix)) { past = true; break; }
-          const member = sw.members.includes(r.name);
-          if (member ? sw.ids[r.name] === r.bot_id : makers.has(r.created_by_id)) { if (!member) { makers.add(r.bot_id); seen.add(String(r.bot_id)); } used += r.tokens_used ?? 0; }
+          if (r.name in sw.ids) { if (sw.ids[r.name] === r.bot_id) { live.add(r.bot_id); budget += r.budget_tokens ?? 0; used += r.tokens_used ?? 0; } }
+          else if (roots.has(r.created_by_id)) { roots.set(r.bot_id, roots.get(r.created_by_id)); helpers[r.bot_id] = [r.tokens_used ?? 0, roots.get(r.bot_id)]; }
         }
         if (past || !page.next_after) break;
         after = page.next_after;
       }
-      const kept = sw.state?.helpers ?? {};
-      for (const id in kept) if (!seen.has(id)) used += kept[id];
-      sw.used = used + (sw.state?.gone ?? 0);
+      for (const [tokens, root] of Object.values(helpers)) if (live.has(root)) used += tokens;
+      for (const [root, tokens] of Object.entries(sw.state.gone ?? {})) if (live.has(Number(root))) used += tokens;
+      sw.used = used; sw.budget = budget;
     } catch (_) { sw.used = null; }
     finally { sw.usage = null; }
     if (S.selected === swarmKey(sw.name)) render();
@@ -559,7 +570,7 @@ const checkTimers = new Map(), checkingBudgets = new Map();
 // member's share by a twentieth: each 50, 65 and 80% warning lands within five points of its mark.
 function usageDue(sw, data) {
   sw.unchecked = (sw.unchecked ?? 0) + (data?.input_tokens ?? 0) + (data?.output_tokens ?? 0);
-  return sw.unchecked >= (sw.budget ?? 0) / Math.max(1, sw.members.length) / 20;
+  return sw.unchecked >= (sw.budget ?? 0) / Math.max(1, liveMembers(sw).length) / 20;
 }
 function checkSoon(sw) {
   if (sw.stopped || !Daemon.swarmCheck) return;
@@ -574,15 +585,14 @@ function checkSoon(sw) {
     const check = { again: false }; checkingBudgets.set(sw.name, check); sw.unchecked = 0;
     try { const r = await Daemon.swarmCheck(sw.name); if (S.session === session && r?.board_changed) boardSoon(sw); }
     catch (e) { Daemon.log?.(`budget check ${sw.name}: ${e?.message ?? e}`); }
-    finally { checkingBudgets.delete(sw.name); if (check.again && S.session === session && !sw.stopped) checkSoon(sw); }
+    finally { if (checkingBudgets.get(sw.name) === check) checkingBudgets.delete(sw.name); if (check.again && S.session === session && !sw.stopped) checkSoon(sw); }
   }, 250));
 }
 // A helper's tokens count in its swarm's, so its finished turn is accounted as a member's is: its maker,
-// or its maker's maker, is a member, or a member that left, known by its bot id once it is gone.
+// or its maker's maker, is a member.
 function swarmOfHelper(name) {
   let b = bot(name);
   for (let depth = 0; b && depth < 16; depth++) {
-    for (const sw of S.swarms.values()) if (b.parentId != null && (sw.left?.includes(b.parentId) || sw.state?.roots?.[b.parentId] != null)) return sw;
     const maker = creatorOf(b); if (!maker) return null; const sw = swarmOfBot(maker.name); if (sw) return sw; b = maker;
   }
   return null;
@@ -600,6 +610,8 @@ function swarmsSoon(name) {
     swarmsTimer = null; const before = new Set(S.swarms.keys()), names = lookFor; lookFor = [];
     // A read that failed looks again at these names' next turn.
     try { await loadSwarms(); } catch (e) { for (const n of names) looked.delete(n); Daemon.log?.(`swarms: ${e?.message ?? e}`); return; }
+    for (const n of names) { const of = [...S.swarms.keys()].find((s) => n.startsWith(s + '-')); if (of && !S.memberOf.has(n)) adding.set(n, of); }
+    pinsSoon();
     const added = [...S.swarms.keys()].filter((n) => !before.has(n));
     if (added.length) { toast(`swarm ${added.join(', ')} started`, 4000); render(); }
   }, 200);
@@ -612,8 +624,8 @@ function boardSoon(sw, usage) {
 }
 // A swarm's mix is rows of an identity (a profile, or '' for a plain agent), a model and a share in
 // percent. Its agents are dealt one at a time, each to the row furthest below its share of the agents
-// so far, so any prefix of them is as close to the mix as whole agents allow: the council's seats (its
-// first agents) mix too, and an added agent keeps the swarm on its shares.
+// so far, so any prefix of them is as close to the mix as whole agents allow, and an added agent keeps
+// the swarm on its shares.
 function nextRow(mix, counts) {
   const t = counts.reduce((a, c) => a + c, 0) + 1;
   let best = 0; mix.forEach((row, i) => { if (row.share * t - 100 * counts[i] > mix[best].share * t - 100 * counts[best]) best = i; });
@@ -632,41 +644,34 @@ function kindOf(sw, member) {
   const models = new Set(sw.mix.map((r) => r.model));
   return [row.identity, models.size > 1 && modelShort(row.model)].filter(Boolean).join(' · ');
 }
-// Starting, adding and stopping are one call each: the app's side makes the agents, has them join and
+// Starting, adding and stopping are one run of the swarm skill's script each: it makes the agents and
 // briefs them, or ends their turns, and undoes what a failed start made. The page learns the result.
 async function learnStarted(r, want) {
-  const session = S.session;
-  await enqueue(() => { if (S.session === session) for (const b of r.bots ?? []) seat(b, session); });
-  const sw = learnSwarm(r.swarm);
+  // The script names the agents it made; their records come from the daemon's events.
+  const sw = learnSwarm(r.swarm); indexMembers();
   const failed = r.failed ?? [];
   if (failed.length) toast(`${want - failed.length} of ${want} agents started: ${failed[0].agent}: ${failed[0].error}`, 6000);
   return sw;
 }
-// The app's side names the swarm from its goal and deals its agents to the mix, as for a coordinator's
+// The script names the swarm from its goal and deals its agents to the mix, as for a coordinator's
 // `start`, and the sheet's counts come from the same rule.
-async function createSwarm(project, { goal, n, mix, shared, budget, council = 0 }) {
+async function createSwarm(project, { goal, n, mix, shared, budget }) {
   const lead = bot(project + LEAD); if (!lead?.workspace) throw new Error(`no coordinator for ${project}`);
   goal = goal.trim(); if (!goal) throw new Error('goal_required: a swarm needs a goal');
-  const r = await Daemon.swarmStart({ project, folder: lead.workspace, goal, shared, mix, agents: n, budgetTokens: budget, council });
+  const r = await Daemon.swarmStart({ project, folder: lead.workspace, goal, shared, mix, agents: n, budgetTokens: budget });
   const sw = await learnStarted(r, n);
   await go(swarmKey(sw.name));
 }
-// An added agent comes from the row furthest below its share.
+// The script picks an added agent's row: the one furthest below its share among the live members.
+// Its budget is its live members' caps, so it is read again with the new one in.
 async function addAgent(sw) {
-  const row = nextRow(sw.mix, mixCounts(sw.mix, sw.members.map((m) => sw.rows[m])));
-  await learnStarted(await Daemon.swarmAdd(sw.name, row), 1);
+  await readUsage(await learnStarted(await Daemon.swarmAdd(sw.name), 1));
 }
 // Stopped, the swarm refuses its agents' posts, so nothing wakes them; your next post resumes it.
 async function stopSwarm(sw) {
   const r = await Daemon.swarmStop(sw.name); learnSwarm(r.swarm);
   const failed = r.failed?.[0];
   toast(failed ? `stop: ${failed.agent}: ${failed.error}` : 'stopped every agent; your next post resumes the swarm', failed ? 6000 : 4000);
-}
-// You decide an open proposal: approving opens its stream with its proposer as lead.
-async function decide(sw, id, approve) {
-  const r = await Daemon.swarmDecide(sw.name, id, approve, '');
-  await readBoard(sw);
-  toast(`${id} ${r.decided ?? (approve ? 'approved' : 'denied')}`, 2200);
 }
 async function postToSwarm(sw, text) {
   const r = await Daemon.swarmPost(sw.name, text);
@@ -842,11 +847,9 @@ async function onEvent(ev) {
       if (id != null && S.live && !S.config?.host && !S.plansOff) Daemon.forgetPlan?.(id).catch((e) => Daemon.log?.(`plan of ${name}: ${e?.message ?? e}`));
       forgetBot(name);
       retab(name, isOpen(up) ? up : ''); save();
-      // A deleted agent leaves its swarm, which stops counting it and posting to it.
-      if (S.memberOf.has(name)) {
-        const sw = S.memberOf.get(name); patchRailRow(swarmKey(sw));
-        leave(sw, name);
-      }
+      // A deleted agent is no longer its swarm's: the swarm stops counting it and posting to it.
+      // Its going may leave the swarm quiet with no later event, so the swarm is checked.
+      if (S.memberOf.has(name)) { const sw = S.swarms.get(S.memberOf.get(name)); patchRailRow(swarmKey(sw.name)); readUsage(sw); checkSoon(sw); }
       break;
     }
     case 'pruned': {
@@ -1193,6 +1196,9 @@ async function handle(ev, session, paint = true) {
 function lost(reason) {
   S.lastReason = reason;
   S.session = null; S.attached = false; S.live = false;
+  // A check scheduled or running for the lost session answers to nobody: the next attach checks afresh.
+  for (const t of checkTimers.values()) clearTimeout(t);
+  checkTimers.clear(); checkingBudgets.clear();
   // Live deltas have no replay cursor. Reconnect rebuilds from durable nodes.
   for (const t of S.transcripts.values()) { t.text = ''; t.thinking = ''; t.thinkingSince = 0; t.thinkingMs = 0; t.streamingTurn = null; t.streamGen += 1; }
   showDetached(reason);
@@ -1278,6 +1284,9 @@ async function attachOnce() {
       // What waited while detached goes out now, each window permitting.
       for (const lead of S.wakes.keys()) wakeSoon(lead);
       try { await loadSwarms(); } catch (e) { toast(`swarms: ${e?.message ?? e}`, 5000); }
+      // Turns that ended and agents deleted while detached left no event to check on: each swarm is
+      // checked once now, as the page learns its agents again.
+      for (const sw of S.swarms.values()) checkSoon(sw);
       restore();
       // Tabs deleted while detached had no `deleted` event to replay; they close.
       S.ui.tabs = S.ui.tabs.filter(isOpen); if (!isOpen(S.selected)) S.selected = '';
@@ -2173,92 +2182,50 @@ function renderComposer(pane, b, sw = null) {
 
 // ---------- swarm view ----------
 // A swarm's head: where it sits, how many of its agents work, its tokens against its budget, and its
-// tabs. The Board is its posts; Agents are its agents as cards, which open beside. A swarm with a
-// council also has the Council, its proposals and their votes, and Streams, the approved ones.
+// tabs. The Board is its posts; Work is its tasks and final result; Agents are its agents as cards,
+// which open beside.
 const tokens = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(n >= 1e7 ? 0 : 1).replace(/\.0$/, '')}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n));
 function renderSwarmHead(el, sw) {
-  const working = sw.members.filter((m) => RUNNING.has(memberBot(sw, m)?.status)).length;
-  const open = sw.state.proposals.filter((p) => p.status === 'open').length, streams = sw.state.proposals.filter((p) => p.status === 'approved').length;
-  const key = `${SWARM}${sw.name}|${working}|${sw.members.length}|${sw.stopped}|${sw.used}|${sw.tab}|${open}|${streams}|${sw.filter}|${S.shapeGen}`;
+  const working = sw.members.filter((m) => RUNNING.has(memberBot(sw, m)?.status)).length, count = liveMembers(sw).length;
+  const key = `${SWARM}${sw.name}|${working}|${count}|${sw.stopped}|${sw.used}|${sw.budget}|${sw.tab}|${sw.filter}|${S.shapeGen}`;
   if (el.dataset.k === key) return; el.dataset.k = key;
   const st = swarmStatus(sw);
-  const state = sw.stopped ? 'stopped' : working ? `${working} of ${sw.members.length} working` : `${sw.members.length} agents`;
+  const state = sw.stopped ? 'stopped' : working ? `${working} of ${count} working` : `${count} agents`;
   const budget = `${sw.used == null ? '' : tokens(sw.used) + ' of '}${tokens(sw.budget)} tokens`;
   const tab = (v, label) => `<button type="button" class="tab${sw.tab === v ? ' on' : ''}" data-act="swarm-tab" data-v="${v}">${label}</button>`;
   const filter = sw.filter && sw.tab === 'board' ? `<button type="button" class="tag on" data-act="swarm-filter" data-v="" title="Show every post">#${esc(sw.filter)} ×</button>` : '';
-  const council = sw.council ? `${tab('council', `Council${open ? ` <span class="count">${open}</span>` : ''}`)}${tab('streams', `Streams ${streams}`)}` : '';
-  el.innerHTML = `<div class="crumbs">${crumbsHTML(swarmKey(sw.name))}<span class="glyph ${st}">${glyphOf(st)}</span><span class="state">${esc(state)}</span><span class="branch">${esc(budget)}</span></div><div class="tools">${filter}${tab('board', 'Board')}${council}${!sw.council ? tab('streams', 'Work') : ''}${tab('agents', `Agents ${sw.members.length}`)}${moreButton(swarmKey(sw.name))}</div>`;
+  el.innerHTML = `<div class="crumbs">${crumbsHTML(swarmKey(sw.name))}<span class="glyph ${st}">${glyphOf(st)}</span><span class="state">${esc(state)}</span><span class="branch">${esc(budget)}</span></div><div class="tools">${filter}${tab('board', 'Board')}${tab('streams', 'Work')}${tab('agents', `Agents ${count}`)}${moreButton(swarmKey(sw.name))}</div>`;
 }
 const streamTag = (stream) => `<button type="button" class="tag" data-act="swarm-filter" data-v="${esc(stream)}">#${esc(stream)}</button>`;
-// A proposal's votes so far against the seats' majority.
-// Only the seats as they are now count: a seat that left gives its place, and its vote, to the next agent.
-function tally(sw, p) {
-  const seats = new Set(sw.seats.map((m) => memberShort(sw, m)));
-  const votes = Object.entries(p.votes ?? {}).filter(([seat]) => seats.has(seat)).map(([, v]) => v);
-  const yes = votes.filter((v) => v.yes).length, no = votes.length - yes;
-  return `${yes} yes${no ? ` · ${no} no` : ''} of ${sw.council}`;
-}
 // A board line: who, then the post, with the agents it names marked and its stream as a tag that
-// filters the board; an agent's name opens it beside. Roles, votes, decisions and joins are quieter.
+// filters the board; an agent's name opens it beside. Roles and the work's steps are quieter.
 function postHTML(sw, line) {
   if (line.from == null) return `<div class="line note">${esc(line.text ?? '')}</div>`;
   const you = line.from === 'user', member = line.bot ?? `${sw.project}.${line.from}`;
   // A swarm of more than one kind keeps a wider name column, so its posts still line up.
   const kind = !you && kindOf(sw, member), w = sw.mix.length > 1 ? ' wide' : '';
-  const who = you ? `<span class="who you${w}">you</span>` : ['council', 'budget', 'swarm'].includes(line.from) ? `<span class="who council${w}">${esc(line.from)}</span>` : `<button type="button" class="who${w}" data-task="${esc(member)}">${esc(line.from)}${kind ? ` <span class="kind">${esc(kind)}</span>` : ''}</button>`;
+  const who = you ? `<span class="who you${w}">you</span>` : ['budget', 'swarm'].includes(line.from) ? `<span class="who council${w}">${esc(line.from)}</span>` : `<button type="button" class="who${w}" data-task="${esc(member)}">${esc(line.from)}${kind ? ` <span class="kind">${esc(kind)}</span>` : ''}</button>`;
   const text = inline(String(line.text ?? '')).replace(/(^|[\s(])@([A-Za-z0-9_.-]*[A-Za-z0-9_-])/g, '$1<span class="at">@$2</span>');
   const row = (cls, body) => `<div class="line post ${cls}">${who}<span class="pt">${body}</span></div>`;
   switch (line.kind) {
     case 'role': return row('ev', `is now <i>${esc(line.role ?? '')}</i>`);
     case 'assign': case 'claim': case 'submit': case 'review': case 'finish': case 'leave': return row('ev', `${line.stream ? streamTag(line.stream) + ' ' : ''}${line.outcome ? esc(line.outcome) + ': ' : ''}${text}`);
-    case 'join': return row('ev', `joined ${streamTag(line.stream ?? '')}`);
-    case 'vote': return row('ev', `votes <b>${line.yes ? 'yes' : 'no'}</b> on ${esc(line.id ?? '')}${line.text ? `: ${text}` : ''}`);
-    case 'seat': return row('ev', `${esc(line.was ?? '')} left · ${esc(line.seat ?? '')} holds a council seat`);
-    case 'lead': return row('ev', `${streamTag(line.stream ?? '')} ${esc(line.was ?? '')} left · ${esc(line.lead ?? '')} leads it`);
-    case 'decision': return row(`ev decided ${line.approved ? 'yes' : 'no'}`, `${esc(line.id ?? '')} ${streamTag(line.stream ?? '')} ${line.approved ? `approved · ${esc(line.lead ?? '')} leads it` : 'denied'}`);
-    case 'propose': {
-      const p = sw.state.proposals.find((x) => x.id === line.id);
-      return row('prop', `proposes <b>${esc(line.id ?? '')}</b> ${streamTag(line.stream ?? '')}: ${text}${p ? ` <span class="tally">${p.status === 'open' ? tally(sw, p) : p.status}</span>` : ''}`);
-    }
+    case 'quiet': case 'joined': return row('ev', text);
     default: return row(you ? 'mine' : '', `${line.stream ? `${streamTag(line.stream)} ` : ''}${text}`);
   }
 }
-// The council: its seats, each open proposal with the seats' votes and your Approve and Deny, then
-// the ones decided.
-function councilHTML(sw) {
-  const who = (short) => `<button type="button" class="who" data-task="${esc(`${sw.project}.${short}`)}">${esc(short)}</button>`;
-  const seats = sw.seats.map((m) => memberShort(sw, m));
-  // A majority of the council's size, however many seats are filled now.
-  const need = Math.floor(sw.council / 2) + 1;
-  const card = (p) => {
-    // Once decided, only the votes cast.
-    const votes = seats.filter((seat) => p.status === 'open' || p.votes?.[seat]).map((seat) => { const v = p.votes?.[seat]; return `<div class="vote">${who(seat)} ${v ? `<b class="${v.yes ? 'yes' : 'no'}">${v.yes ? 'yes' : 'no'}</b> ${esc(v.reason)}` : '<span class="dim">not yet</span>'}</div>`; }).join('');
-    const yours = p.votes?.user ? `<div class="vote"><span class="who you">you</span> <b class="${p.votes.user.yes ? 'yes' : 'no'}">${p.votes.user.yes ? 'approved' : 'denied'}</b></div>` : '';
-    const acts = p.status === 'open' ? `<div class="acts"><button type="button" class="sbtn primary" data-act="swarm-decide" data-v="${esc(p.id)}:yes">Approve</button><button type="button" class="sbtn" data-act="swarm-decide" data-v="${esc(p.id)}:no">Deny</button></div>` : '';
-    const state = p.status === 'open' ? tally(sw, p) : `${p.status}${p.decided_by === 'user' ? ' by you' : ''}`;
-    return `<div class="prop ${esc(p.status)}"><div class="ph"><b>${esc(p.id)}</b> ${streamTag(p.stream)} <span class="dim">by</span> ${who(p.by)}<span class="tally">${esc(state)}</span></div><div class="why">${inline(p.why)}</div>${votes}${yours}${acts}</div>`;
-  };
-  const open = sw.state.proposals.filter((p) => p.status === 'open'), done = sw.state.proposals.filter((p) => p.status !== 'open').reverse();
-  return `<div class="line note">Seats: ${seats.map(esc).join(', ') || 'none yet'}. ${need} of ${sw.council} decide; you can decide any proposal yourself.</div>${open.length ? open.map(card).join('') : '<div class="line note">no open proposals</div>'}${done.map(card).join('')}`;
-}
-// Streams: each approved proposal, its lead and the agents in it with their roles.
+// The work: each assigned task, its owner, reviewer and where it stands, then the final result.
 function streamsHTML(sw) {
-  // Assigned tasks, then streams a plain proposal opened, then the final result.
   const tasks = Object.entries(sw.state.tasks ?? {});
   const result = sw.state.result;
   const handoff = result ? `<div class="prop"><b>Final result · ${esc(result.outcome)}</b><div class="why">${inline(result.summary ?? '')}</div></div>` : '';
   const work = tasks.map(([name,t]) => `<div class="prop stream"><div class="ph">${streamTag(name)} <b>${esc(t.status)}</b></div><div class="why">${esc(t.owner)} · reviewer ${esc(t.reviewer)}<br>${inline(t.brief ?? '')}</div>${t.result ? `<div class="why">${inline(t.result)}</div>` : ''}${t.verdict ? `<div class="why"><b>${esc(t.verdict)}</b>: ${inline(t.evidence ?? '')}</div>` : ''}</div>`).join('');
-  const approved = sw.state.proposals.filter((p) => p.status === 'approved' && !sw.state.tasks?.[p.stream]);
-  if (!tasks.length && !approved.length && !result) return sw.council ? '<div class="line note">no streams yet: an approved proposal opens one</div>' : '<div class="line note">no tasks yet: an agent registers one with assign</div>';
-  return work + approved.map((p) => {
-    const members = Object.entries(sw.state.streams ?? {}).filter(([, st]) => st === p.stream).map(([m]) => m);
-    const people = members.map((m) => `<button type="button" class="member" data-task="${esc(`${sw.project}.${m}`)}">${esc(m)}${m === (p.lead ?? p.by) ? ' <span class="dim">lead</span>' : ''}${sw.state.roles?.[m] ? ` <i>${esc(sw.state.roles[m])}</i>` : ''}</button>`).join('');
-    return `<div class="prop stream"><div class="ph">${streamTag(p.stream)} <span class="dim">${members.length} agent${members.length === 1 ? '' : 's'}</span><button type="button" class="sbtn" data-act="swarm-filter" data-v="${esc(p.stream)}">Posts</button></div><div class="why">${inline(p.why)}</div><div class="members">${people}</div></div>`;
-  }).join('') + handoff;
+  if (!tasks.length && !result) return '<div class="line note">no tasks yet: an agent registers one with assign</div>';
+  return work + handoff;
 }
 function renderSwarm(el, sw) {
-  // Members and seats are in the key: one leaving changes the council and agents views, not the board.
-  const key = `${SWARM}${sw.name}|${sw.tab}|${sw.offset}|${sw.lines.length}|${sw.filter}|${sw.stateGen}|${sw.members.join(',')}|${sw.seats.join(',')}`;
+  // Live members are in the key: one deleted changes the agents view, not the board.
+  const key = `${SWARM}${sw.name}|${sw.tab}|${sw.offset}|${sw.lines.length}|${sw.filter}|${sw.stateGen}|${liveMembers(sw).join(',')}`;
   const fresh = el.dataset.who !== swarmKey(sw.name); el.dataset.who = swarmKey(sw.name);
   const atBottom = fresh || el.scrollHeight - el.scrollTop - el.clientHeight < 40;
   if (el.dataset.key !== key) {
@@ -2267,8 +2234,7 @@ function renderSwarm(el, sw) {
       // Each card says what its agent is, what it took on, and the stream it works in.
       const cards = sw.members.filter((m) => memberBot(sw, m)).map((m) => { const c = taskCard(m), short = memberShort(sw, m); if (c) c.name = [c.name, kindOf(sw, m), sw.state.roles?.[short], sw.state.streams?.[short] && `#${sw.state.streams[short]}`].filter(Boolean).join(' · '); return c; }).filter(Boolean);
       el.innerHTML = cards.length ? cards.map(cardHTML).join('') : '<div class="line note">no agents yet</div>';
-    } else if (sw.tab === 'council') el.innerHTML = councilHTML(sw);
-    else if (sw.tab === 'streams') el.innerHTML = streamsHTML(sw);
+    } else if (sw.tab === 'streams') el.innerHTML = streamsHTML(sw);
     else {
       const lines = sw.filter ? sw.lines.filter((l) => l.stream === sw.filter) : sw.lines;
       el.innerHTML = lines.length ? lines.map((l) => postHTML(sw, l)).join('') : `<div class="line note">${sw.offset === null ? 'reading the board' : sw.filter ? `nothing on #${esc(sw.filter)} yet` : 'nothing posted yet'}</div>`;
@@ -2623,7 +2589,6 @@ async function openSwarmSheet(project) {
     <div class="row"><div><label for="sw-n">Agents</label><input id="sw-n" type="number" min="1" max="${MAX_AGENTS}" step="1" value="4"></div><div class="wide"><label for="sw-where">They work in</label>${sel('sw-where', [['shared', 'One shared worktree'], ['project', 'The project folder']], 'shared')}</div><div><label for="sw-budget">Budget (M)</label><input id="sw-budget" type="number" min="0.1" max="${MAX_BUDGET_M}" step="any" value="${4 * BUDGET_PER_AGENT_M}" aria-label="Total budget in millions of tokens"></div></div>
     <div id="sw-each" class="hint"></div>
     <label>Made of <span class="dim">identity, model, effort and share</span></label><div id="sw-mix" class="mix"></div>
-    <label for="sw-org">Organized as</label>${sel('sw-org', [[0, 'One board: assigned tasks and independent review'], [3, 'A council of 3 approves streams of work']], 0)}
     <div class="foot"><button type="button" class="sbtn" data-act="close-sheet">Cancel</button><button type="submit" class="sbtn primary" id="sw-start">Start swarm</button></div>`;
   $('sw-budget').value = String(4 * BUDGET_PER_AGENT_M);
   renderMix();
@@ -2634,7 +2599,7 @@ async function openSwarmSheet(project) {
 function agentCount() { const n = Number($('sw-n')?.value); return Number.isInteger(n) && n >= 1 && n <= MAX_AGENTS ? n : 0; }
 // The budget, typed in millions of tokens; 0 until it is a number in range.
 function budgetTokens() { const m = Number($('sw-budget')?.value); return m >= 0.1 && m <= MAX_BUDGET_M ? Math.round(m * 1e6) : 0; }
-const sheetProblem = (n) => (!n ? `Agents is a whole number from 1 to ${MAX_AGENTS}` : !budgetTokens() ? `Budget is 0.1 to ${MAX_BUDGET_M} million tokens` : Number($('sw-org')?.value) > n ? 'A council of 3 needs at least 3 agents' : mixProblem(sheet.mix));
+const sheetProblem = (n) => (!n ? `Agents is a whole number from 1 to ${MAX_AGENTS}` : !budgetTokens() ? `Budget is 0.1 to ${MAX_BUDGET_M} million tokens` : mixProblem(sheet.mix));
 // The mix's rows, each with how many agents it makes, and what is wrong with it if anything.
 function mixProblem(mix) {
   const total = mix.reduce((a, r) => a + (Number(r.share) || 0), 0);
@@ -2690,7 +2655,7 @@ function closeSheet() {
   // A message that would have started Home goes back to the composer, unsent.
   if (sheetKind === 'home' && homeSheet.text && !S.selected && !$('input').value) { $('input').value = homeSheet.text; grow($('input')); }
   homeSheet.text = ''; homeSheet.open = false; S.ui.sheet = false; sheetFor = null; sheetKind = null; $('sheetwrap').classList.remove('on'); markSeen(); focusInput('main'); }
-$('sheet').addEventListener('change', (e) => { if (sheetKind === 'memory') return; if (sheetKind === 'newtrig') { if (e.target.id === 'nt-kind') newTriggerWhen(); return; } if (sheetKind === 'project') { projectChange(e.target); return; } if (sheetKind === 'home') { if (e.target.id === 'hm-model') followModel(e.target.value, 'hm-effort'); return; } if (e.target.dataset?.mix != null) mixChange(e.target); else if (e.target.id === 'sw-n' || e.target.id === 'sw-budget' || e.target.id === 'sw-org') { updateSwarmBudget(e.target.id); renderMix(); } });
+$('sheet').addEventListener('change', (e) => { if (sheetKind === 'memory') return; if (sheetKind === 'newtrig') { if (e.target.id === 'nt-kind') newTriggerWhen(); return; } if (sheetKind === 'project') { projectChange(e.target); return; } if (sheetKind === 'home') { if (e.target.id === 'hm-model') followModel(e.target.value, 'hm-effort'); return; } if (e.target.dataset?.mix != null) mixChange(e.target); else if (e.target.id === 'sw-n' || e.target.id === 'sw-budget') { updateSwarmBudget(e.target.id); renderMix(); } });
 // A share typed updates the counts once it is a number, without redrawing the field being typed in.
 $('sheet').addEventListener('input', (e) => { if (sheetKind === 'memory') return; if (sheetKind === 'project') { projectReady(); return; } if (sheetKind === 'home' || sheetKind === 'newtrig') return; if (e.target.id === 'sw-n' || e.target.id === 'sw-budget') { updateSwarmBudget(e.target.id); renderMix(); return; } if (e.target.dataset?.f !== 'share') return; mixChange(e.target); const n = agentCount(), problem = sheetProblem(n), counts = problem ? null : mixCounts(sheet.mix, mixRows(sheet.mix, n)); $('sw-mix').querySelectorAll('.count').forEach((c, i) => { c.textContent = counts ? `${counts[i]} agent${counts[i] === 1 ? '' : 's'}` : ''; c.classList.toggle('none', !!counts && !counts[i]); }); const w = $('sw-mix').querySelector('.mixfoot span'); if (w) { w.textContent = problem ?? (counts.some((c) => !c) ? `A row makes no agent at ${n} agents` : ''); w.className = w.textContent ? 'warn' : ''; } });
 $('sheet').addEventListener('submit', async (e) => {
@@ -2704,8 +2669,8 @@ $('sheet').addEventListener('submit', async (e) => {
   start.disabled = true; start.textContent = 'Starting…';
   try {
     const n = agentCount(), problem = sheetProblem(n); if (problem) throw new Error(problem);
-    const mix = sheet.mix.map((r) => ({ identity: r.identity, model: r.model, reasoning: r.reasoning || null, share: r.share }));
-    await createSwarm(project, { goal: $('sw-goal').value, n, mix, shared: $('sw-where').value === 'shared', budget: budgetTokens(), council: Number($('sw-org').value) });
+    const mix = sheet.mix.map((r) => ({ identity: r.identity, model: r.model, effort: r.reasoning || null, share: r.share }));
+    await createSwarm(project, { goal: $('sw-goal').value, n, mix, shared: $('sw-where').value === 'shared', budget: budgetTokens() });
     closeSheet();
   } catch (err) { toast(String(err?.message ?? err), 6000); start.disabled = false; start.textContent = 'Start swarm'; }
 });
@@ -2803,7 +2768,7 @@ function botRowHTML(n) {
   const kids = n.kids ? `<span class="meta">${n.kids}</span>` : '';
   if (n.swarm) {
     const sw = n.swarm, st = swarmStatus(sw);
-    return `<div class="botrow" data-bot="${esc(n.key)}" role="button" tabindex="0"><span class="glyph ${st}">${glyphOf(st)}</span><span class="n">⁂ ${esc(memberShort(sw, sw.name))}</span><span class="meta">${sw.members.length}</span><span class="acts">${moreButton(n.key)}</span></div>`;
+    return `<div class="botrow" data-bot="${esc(n.key)}" role="button" tabindex="0"><span class="glyph ${st}">${glyphOf(st)}</span><span class="n">⁂ ${esc(memberShort(sw, sw.name))}</span><span class="meta">${liveMembers(sw).length}</span><span class="acts">${moreButton(n.key)}</span></div>`;
   }
   const b = n.b, st = shownStatus(b), beside = S.ui.side === b.name ? ' beside' : '';
   // An agent with a plan shows the step it is on and how many are done.
@@ -3560,11 +3525,11 @@ function hostsHTML(st, busy) {
 }
 // The app's roles, each read from your own file in every project once you have one. Edit makes that
 // file from the app's text the first time and opens it in your editor.
-const ROLES = [['coordinator', 'Coordinator'], ['swarm-flat', 'Flat swarm'], ['swarm-council', 'Council swarm'], ['home', 'Home']];
+const ROLES = [['coordinator', 'Coordinator'], ['home', 'Home']];
 function rolesHTML(st, busy) {
   const own = new Map((st.roles ?? []).map((r) => [r.name, r.file]));
   const rows = ROLES.map(([name, label]) => `<div class="prow"><span class="pn">${label}</span><span class="st${own.get(name) ? '' : ' dim'}">${own.get(name) ? `~/.agents/agents/${name}.md` : 'the app\'s own'}</span><span class="acts"><button type="button" class="sbtn" data-act="edit-role" data-v="${name}"${busy}>Edit</button></span></div>`).join('');
-  return `<section><h3>Roles</h3>${rows}<p class="dim">A project's coordinator and a swarm's agents follow these in every project; a project's own .agents/agents file of that name comes first. Home follows its own. An agent keeps the text it started with, so an edit reaches the projects, swarms and Home made after it.</p></section>`;
+  return `<section><h3>Roles</h3>${rows}<p class="dim">A project's coordinator follows its own in every project; a project's own .agents/agents file of that name comes first. Home follows its own. An agent keeps the text it started with, so an edit reaches the projects and Home made after it. A swarm's agents follow the swarm skill's member.md.</p></section>`;
 }
 async function editRole(name) {
   const st = setupState();
@@ -3769,7 +3734,6 @@ async function act(el) {
     case 'swarm-add': await addAgent(swarmOf(who)); return;
     case 'swarm-tab': { const sw = swarmOf(S.selected); if (sw) { sw.tab = v; await enqueue(loadVisible); render(); } return; }
     case 'swarm-filter': { const sw = swarmOf(S.selected); if (sw) { sw.filter = v || null; sw.tab = 'board'; render(); } return; }
-    case 'swarm-decide': { const sw = swarmOf(S.selected), [id, yes] = v.split(':'); if (sw) await decide(sw, id, yes === 'yes'); return; }
     case 'settings': await openSetup(); return;
     case 'replace-daemon': {
       if (el.disabled) return;

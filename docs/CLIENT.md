@@ -39,10 +39,10 @@ Implemented 2026-09-19.
    `description`, `model`, and `tools` (a list of this runtime's tool
    names) are read, any other key is ignored, so an agent file written for
    another harness loads as it is. The body is the role. The app's own
-   roles (`coordinator`, `swarm-flat`, `swarm-council`, the client roles in
-   `policy.rs`) are left out of the index: a file of that name replaces the
-   app's text for that role, not a role to start a peer in, so no agent is
-   offered a nested coordinator or a swarm member outside a swarm.
+   role (`coordinator`, the client role in `policy.rs`) is left out of the
+   index: a file of that name replaces the app's text for that role, not a
+   role to start a peer in, so no agent is offered a nested coordinator. A
+   swarm member's rules are the swarm skill's `member.md`, not a profile.
 5. **Memory.** The person's `~/.agents/memory/MEMORY.md` and, when the
    workspace is in a project, `~/.agents/memory/projects/NAME/MEMORY.md`,
    each as it is (an index carries its own `# Memory in DIR` heading); one

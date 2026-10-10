@@ -1057,7 +1057,17 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     wall time, result, and deliveries from the board (Astra: in a flat
     swarm every post reaches every working agent, so 16 posting once each
     is 240 deliveries, each re-read as context); Keep. Approvals in the app wait: George runs
-    with full access.
+    with full access. Done (2026-10-10, S1 of the shipping plan, first
+    part): swarms are a skill ([APP.md](APP.md#projects-and-panes)):
+    `app/skills/swarm` holds the rules (`member.md`) and a Python 3 script
+    that starts, posts, stops and folds the board over the daemon's socket
+    under a `flock` on the board; the app's Rust engine, its
+    `--swarm-post`/`--swarm-start` modes and `~/.agent/swarms/start` are
+    gone, and the app runs the script. Measured first: a post through the
+    script costs no more than one through the app binary (APP.md). Flat
+    only for now: the council, its streams and its Settings role come back
+    as a second skill. A swarm started before this has a `swarm.toml` the
+    script does not read, so it is not listed.
     A fork into another provider stays out: history is provider-native.
     Done (2026-09-28): setup and settings, the first items of an app audit
     (Sol, 2026-09-28) George put before swarms. A draft stays with the bot
