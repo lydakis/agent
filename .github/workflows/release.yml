@@ -228,6 +228,7 @@ jobs:
           # The app links these from ~/.agents/skills.
           test -f "$app/Contents/Resources/skills/automation/SKILL.md"
           test -f "$app/Contents/Resources/skills/memory/SKILL.md"
+          test -f "$app/Contents/Resources/skills/memory-cleanup/SKILL.md"
           mkdir dist
           archive="dist/Agent_${version}_universal.zip"
           ditto -c -k --sequesterRsrc --keepParent "$app" "$archive"

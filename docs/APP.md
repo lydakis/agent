@@ -1523,6 +1523,8 @@ executable with `--memory` ([memory.rs](../app/src-tauri/src/memory.rs)):
 ~/.agent/memory rm NAME [SCOPE]
 ~/.agent/memory index [SCOPE]
 ~/.agent/memory check [SCOPE]
+~/.agent/memory changed | cleanup start | cleanup finish
+~/.agent/memory schedule --model PROVIDER/MODEL [--effort LEVEL] [--cron 'MIN HOUR DAY MONTH WEEKDAY']
   SCOPE: --user | --project NAME; none: the project of this folder
 ```
 
@@ -1565,10 +1567,40 @@ coordinator's role saves lasting findings there rather than suggesting an
 AGENTS.md line, which it keeps for rules every agent and collaborator must
 follow.
 
+Memory grows by saves, so a nightly cleanup keeps it small and true. It is
+a skill and a trigger, not part of the app or the daemon. `schedule` adds
+the trigger `memory-cleanup`: at 03:30 by default (`--cron` moves it) it
+starts, on its first fire, an agent of that name in `~/.agents/memory` on
+the model given, and sends it "Clean up memory as the memory-cleanup skill
+says." The trigger's `--if` runs `changed`, so a night after nothing was
+saved or removed costs no turn. Each turn is capped at 1,000,000 tokens:
+the agent keeps one conversation, as every `--start` agent does, so each
+call carries earlier nights up to where compaction summarizes them.
+Nothing is scheduled until the person runs `schedule`, since the app has no
+default model to run it on. The `memory-cleanup` skill
+([SKILL.md](../app/skills/memory-cleanup/SKILL.md)) merges duplicates,
+drops superseded facts and dates relative ones, with `save` and `rm` only,
+and never removes a fact for its age alone.
+
+`~/.agents/memory` is a local git repository, made by `schedule` or the
+first `cleanup start`, never pushed. `cleanup start` commits what agents
+saved since the last cleanup, records that commit and the fact count in
+`.cleanup`, and lists the facts saved and removed since then, which the
+agent reads first rather than every fact; a second `start` before `finish` says `"duplicate": true` and
+keeps the first. `cleanup finish` commits the cleanup and returns what it
+removed, added and changed. A cleanup that removed more than a quarter of
+the facts, and more than two, is `loss_guard`: `finish` reverts it with a
+new commit, so memory is as it was at the start and the refused cleanup
+stays in history for the person to read. `changed` fails with `unchanged`
+when the folder matches the last commit, which is what keeps the trigger
+quiet.
+
 ## Skills the app ships
 
-The app ships two skills: `automation`, for recurring jobs, and `plan`, an
-agent's plan the app shows (see Projects and panes).
+The app ships four skills: `automation`, for recurring jobs; `plan`, an
+agent's plan the app shows (see Projects and panes); `memory`, what to
+save for later agents; and `memory-cleanup`, the nightly cleanup (see
+Memory).
 
 Agents read only skills in a folder's `.agents/skills` or in
 `~/.agents/skills` ([client policy](CLIENT.md)). The app bundle carries its

@@ -84,6 +84,12 @@ Merge related facts into one, or remove one that no longer holds, then
 save again. `check` reports any file that is not a valid fact and an index
 that is out of date; `index` rewrites the index from the facts.
 
+When the person has run `"$HOME/.agent/memory" schedule`, a nightly agent
+merges duplicates and drops superseded facts, following the
+`memory-cleanup` skill. `~/.agents/memory` is then a local git repository
+whose history keeps every version. Leave the `cleanup` and `changed`
+commands to that agent.
+
 ## What to save, and what not to
 
 Save what a later agent would otherwise have to ask the person again or
