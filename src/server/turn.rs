@@ -2168,14 +2168,27 @@ impl Turn {
             // Taken before the commit that stamps the gates' announcement,
             // so a gate's first lapse is never counted late.
             let planned = tokio::time::Instant::now();
-            let announced = match self
-                .store
-                .op("append", move |db| {
-                    let entries = db.append(turn, items, &calls, usage.as_ref())?;
-                    Ok((entries, gated.then(|| (db.verdicts_for(turn), planned))))
-                })
-                .await
-            {
+            let append = self.store.op("append", move |db| {
+                let entries = db.append(turn, items, &calls, usage.as_ref())?;
+                Ok((entries, gated.then(|| (db.verdicts_for(turn), planned))))
+            });
+            // A summary still running keeps streaming while the call's
+            // items commit; one that lands waits outside the rounds.
+            let (appended, running) = match running {
+                None => (append.await, None),
+                Some(mut summary) => {
+                    tokio::pin!(append);
+                    tokio::select! {
+                        biased;
+                        appended = &mut append => (appended, Some(summary)),
+                        done = summary.as_mut() => {
+                            *landed = Some(done);
+                            (append.await, None)
+                        }
+                    }
+                }
+            };
+            let announced = match appended {
                 Ok((entries, verdicts)) => {
                     let nodes: Vec<i64> = entries
                         .iter()
