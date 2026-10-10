@@ -227,6 +227,7 @@ jobs:
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")" = "$version"
           # The app links these from ~/.agents/skills.
           test -f "$app/Contents/Resources/skills/automation/SKILL.md"
+          test -f "$app/Contents/Resources/skills/memory/SKILL.md"
           mkdir dist
           archive="dist/Agent_${version}_universal.zip"
           ditto -c -k --sequesterRsrc --keepParent "$app" "$archive"
