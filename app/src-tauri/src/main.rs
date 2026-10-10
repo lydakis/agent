@@ -340,10 +340,8 @@ fn profiles(
     let workspace = std::path::Path::new(&dir);
     let listed = agent_client::policy::instructions(workspace, None).map_err(failed)?;
     let mut out = Vec::new();
+    // The app's own roles are client roles, which the index leaves out.
     for entry in listed.profiles {
-        if BUILT_IN.iter().any(|(name, _)| *name == entry.name) {
-            continue;
-        }
         let model = agent_client::policy::profile(workspace, &entry.name)
             .map_err(failed)?
             .and_then(|p| p.model);
@@ -353,7 +351,8 @@ fn profiles(
 }
 
 /// The roles the app ships, used where neither the folder nor the user has
-/// a file of that name.
+/// a file of that name. They are `policy::CLIENT_ROLES`, so no agent is
+/// offered one as a role to start a peer in.
 const BUILT_IN: [(&str, &str); 3] = [
     ("coordinator", include_str!("../../agents/coordinator.md")),
     ("swarm-flat", include_str!("../../agents/swarm-flat.md")),
@@ -725,6 +724,12 @@ mod policy_tests {
         assert!(error.starts_with("instructions_unreadable: "), "{error}");
         assert!(error.contains(file.to_str().unwrap()), "{error}");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_apps_roles_are_the_client_roles_the_index_leaves_out() {
+        let names: Vec<&str> = BUILT_IN.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, agent_client::policy::CLIENT_ROLES);
     }
 
     #[test]

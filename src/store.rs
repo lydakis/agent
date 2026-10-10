@@ -796,6 +796,7 @@ mod tests {
                             fallbacks: false,
                             gate: None,
                             settings: Default::default(),
+                            request_id: None,
                         },
                     )?;
                 }
@@ -911,10 +912,11 @@ mod tests {
                         fallbacks: false,
                         gate: None,
                         settings: Default::default(),
+                        request_id: None,
                     },
                 )?;
                 db.connection().execute("DELETE FROM events", [])?;
-                Ok(event["cursor"].as_i64().unwrap())
+                Ok(event.unwrap()["cursor"].as_i64().unwrap())
             })
             .await
             .unwrap();
@@ -1066,6 +1068,7 @@ mod tests {
                         fallbacks: false,
                         gate: None,
                         settings: Default::default(),
+                        request_id: None,
                     },
                 )?;
                 let options = TurnOptions {
