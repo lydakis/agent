@@ -194,11 +194,15 @@ produce handles, and one consumes them:
   because a blocked client would hold a process-budget unit.
 
 A peer handle resolves from the daemon's own `turn_finished` for that turn and
-reports its status, checkpoint, error, and final assistant text (up to 16 KiB).
-A process handle reports the same stdout, stderr, and exit code a foreground
-`shell` would. Unresolved handles at the deadline are returned as
-`{"pending": true}` and remain valid for a later wait. A turn cannot wait on
-itself; unknown handles resolve to errors rather than blocking.
+reports its status, checkpoint, error, and final assistant text (up to 16 KiB);
+a client's `wait` gets the whole turn view (below) with them, and a model's
+`wait` tool gets only those. A process handle reports the same stdout, stderr,
+and exit code a foreground `shell` would. Unresolved handles at the deadline
+are returned as pending and remain valid for a later wait: a process as
+`{"pending": true}`, a turn, for a client, as its view with `pending: true`,
+read in one job for all of them. A turn that finished between the deadline
+and that read answers with its outcome instead. A turn cannot wait on itself; unknown handles
+resolve to errors rather than blocking.
 Malformed handles return `invalid_handle`; numeric IDs use the exact decimal
 form printed by the runtime, without leading zeros or a plus sign. A rejected
 wait tool call does not skip the other calls in its model response. Protocol
@@ -289,10 +293,21 @@ unaccounted for; these totals are not a reconciliation of provider billing.
 Successful calls retain their single atomic transcript/usage commit; budget
 checks use the turn's running total without an extra database read per round.
 
-`turns` (protocol) and `agent turns --bot NAME` list a bot's turns with status,
-effective workspace and model, tokens, rounds, timing, and a prompt preview,
-paged by `after`. A finished turn's outcome comes from `wait` on its handle;
-`timeout_ms: 0` answers at once, pending while the turn runs. `agent turns`
+A turn reads the same wherever a client meets it. Its view is `bot`,
+`bot_id`, `turn`, `handle`, `request_id`, `status`, `waiting_on`,
+`input_tokens`, `cached_input_tokens`, `output_tokens`, `model_rounds`,
+`retries`, `paced_ms`, `started_ms` and `finished_ms`, all from the turn's row.
+`waiting_on` is what a parked turn waits for, as its `turn_waiting` or
+`turn_paced` event said (`call_id` and `approval` or `handles`, or
+`resume_at_ms`), and null otherwise. A `wait` result is the view, plus the
+outcome once finished; an `interrupt` reply is the view plus
+`interrupt_requested`; a `turns` item is the view plus the fields below.
+`submit` answers with the view's identity and status, without a second read.
+
+`turns` (protocol) and `agent turns --bot NAME` list a bot's turns as views
+with effective workspace, model and reasoning, delivery, cache hit, and a
+prompt preview, paged by `after`. A finished turn's outcome comes from `wait` on
+its handle; `timeout_ms: 0` answers at once, pending while the turn runs. `agent turns`
 restarts an idle daemon using the supplied provider/tool configuration (or
 provider environment defaults), honors `--no-spawn`, and refuses missing stores.
 It does not submit new model work; existing parked work may resume on startup.
@@ -1171,6 +1186,15 @@ succeeds with `duplicate: true`, and an identity that name never held is
 `bot_not_found`. Its reply carries `bot`, `bot_id`, `duplicate` and the counts
 it freed. Protocol 7 adds these fields.
 
+`interrupt` answers with the turn view and `interrupt_requested`. A running
+turn's view shows it still running; its `turn_finished` follows. A queued,
+ready or parked turn ends in place, so its view already shows `interrupted`.
+A turn that had already ended answers with how it ended and
+`interrupt_requested: false`, so a repeated interrupt, or one that crossed the
+turn's own end, succeeds. A turn the bot never had is `turn_not_found`; a
+turn that is starting, or that is not the one running, is `stale_turn`.
+Protocol 8 adds the turn view.
+
 ### Delivery modes
 
 `delivery` on `submit` says what happens when the bot is busy or the daemon
@@ -1286,7 +1310,7 @@ the turn's id and handle at once, and `wait`, `turns`, and
 A queued or ready turn that cannot start when its place comes (for example,
 the bot's budget is spent) finishes as `failed` with that
 error, and the next in line takes its place. `interrupt` on a queued or ready
-turn ends it as `interrupted` and answers `queued: true`; interrupting the
+turn ends it as `interrupted` and answers with it ended; interrupting the
 running turn does not touch the line behind it. `delete` refuses a bot with
 queued work as `bot_busy`. `stats` reports queued and ready turns together
 as `queued_turns`, a count the storage worker keeps at each transition
@@ -1704,7 +1728,8 @@ needs, and one optional policy composes them:
   transcript and the turn rows themselves stay, so the context window, the
   `history` tool, `history_items`, forks, and accounting are unaffected; what shrinks
   is replay and artifact retrieval. New `wait` calls for an expired
-  turn outcome return `turn_result_pruned`; they never report an empty success.
+  turn outcome return the turn's view with `error: turn_result_pruned`; they
+  never report an empty success.
   On a pruning notice, `agent run` and `agent follow` reconcile their selected
   turn through a zero-timeout `wait`, so retries of expired turns exit with that error
   instead of waiting for a terminal event that no longer exists.

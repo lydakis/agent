@@ -62,7 +62,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// The socket protocol's version in `ready`. The daemon and its clients ship
 /// together, so a client refuses a daemon of any other version.
-pub const PROTOCOL: u64 = 8;
+pub const PROTOCOL: u64 = 9;
 
 // No await occurs while this lock is held. Synchronous removal makes dropping
 // a request release its registration immediately, without a cleanup task.
