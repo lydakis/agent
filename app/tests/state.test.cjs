@@ -3522,12 +3522,16 @@ test("plans are read at once, then an agent's again when it runs the plan script
   assert.equal(p.taskCard('app.build').last, '✱ Write <b>it</b>');
   assert.equal(p.taskCard('app.build').elapsed, '1/3');
   assert.doesNotMatch(p.botRowHTML({ b: p.S.bots.get('app.lead'), depth: 0, kids: 1 }), /steps done/);
-  const el = p.context.document.getElementById('plan');
+  const el = p.context.document.getElementById('plan'), beside = p.context.document.getElementById('sideplan');
+  el.id = 'plan'; beside.id = 'sideplan';
   p.renderPlan(el, p.S.bots.get('app.build'));
   assert.equal(el.hidden, false);
   assert.match(el.innerHTML, /data-act="plan-fold"[^>]*>1\/3<\/button><div class="pstep done"><span class="pm">✓<\/span>Read it<\/div><div class="pstep now"><span class="pm">✱<\/span>Write &lt;b&gt;it&lt;\/b&gt;<\/div><div class="pstep todo"><span class="pm">○<\/span>Ship it<\/div>$/);
-  p.S.ui.planFolded = true; p.renderPlan(el, p.S.bots.get('app.build'));
+  // Its count folds that pane's plan alone.
+  await p.act({ dataset: { act: 'plan-fold', v: 'plan' } });
+  p.renderPlan(el, p.S.bots.get('app.build')); p.renderPlan(beside, p.S.bots.get('app.build'));
   assert.equal((el.innerHTML.match(/pstep/g) ?? []).length, 1);
+  assert.equal((beside.innerHTML.match(/pstep/g) ?? []).length, 3);
   // Another shell call reads nothing; the script's call reads that agent's plan alone, once it ends.
   p.S.live = true;
   const shell = async (id, command) => {
@@ -3542,6 +3546,13 @@ test("plans are read at once, then an agent's again when it runs the plan script
   assert.deepEqual(JSON.parse(JSON.stringify(asked.at(-1))), [2]);
   assert.equal(p.taskCard('app.build').last, '✱ Ship it');
   assert.equal(p.taskCard('app.build').elapsed, '2/3');
+  // A long plan's call arrives cut short, as the daemon previews it, and still reads the plan.
+  files.set(2, '[x] Read it\n[x] Write it\n[x] Ship it\n');
+  const cut = JSON.stringify({ command: `sh "$HOME/.agents/skills/plan/plan" '[x] Read it' '[x] ${'Write it '.repeat(300)}` }).slice(0, 2048);
+  await p.onEvent({ event: 'tool_started', bot: 'app.build', turn: 1, data: { call_id: 'c4', name: 'shell', arguments: cut, arguments_truncated: true } });
+  await p.onEvent({ event: 'tool_completed', bot: 'app.build', turn: 1, data: { call_id: 'c4' } });
+  await settle();
+  assert.equal(p.taskCard('app.build').elapsed, '3/3');
   // A plan the agent no longer has is no longer shown.
   files.delete(2);
   await shell('c3', `sh "$HOME/.agents/skills/plan/plan" --clear`);

@@ -24,7 +24,7 @@ const S = {
   // scanning the fleet on every event.
   botsGen: 0, shapeGen: 0, deleted: new Set(),
   // The tabs are the agents opened full screen, in order; Home is always there and is not one of them.
-  config: null, ui: { rail: true, side: null, tabs: [], picker: false, pickerSel: 0, help: false, steps: false, toast: null, menu: false, planFolded: false },
+  config: null, ui: { rail: true, side: null, tabs: [], picker: false, pickerSel: 0, help: false, steps: false, toast: null, menu: false, planFolded: {} },
   // How Send reaches a working bot, the last pick from its menu (sticky across windows), and the
   // model each bot's next turns run on when it differs from the one it was created with.
   send: loadSend(), override: new Map(), effort: new Map(),
@@ -728,7 +728,7 @@ async function onEvent(ev) {
       let parsed = {}; try { parsed = JSON.parse(args) ?? {}; } catch (_) {}
       const tname = data.name ?? 'tool';
       const t = transcript(name);
-      const row = { kind: 'tool', from: t.callNode, callId: data.call_id, name: tname, summary: callSummary(tname, args), path: toolPath(tname, parsed), background: tname === 'shell' && parsed.background === true, plan: tname === 'shell' && PLAN_CALL.test(parsed.command ?? ''), done: false, started: S.live ? Date.now() : 0, took: 0, turn };
+      const row = { kind: 'tool', from: t.callNode, callId: data.call_id, name: tname, summary: callSummary(tname, args), path: toolPath(tname, parsed), background: tname === 'shell' && parsed.background === true, plan: tname === 'shell' && PLAN_CALL.test(String(data.arguments ?? '')), done: false, started: S.live ? Date.now() : 0, took: 0, turn };
       let existing = null;
       for (let i = t.items.length - 1; i >= 0; i--) {
         const it = t.items[i]; if (it.turn !== turn) break;
@@ -1465,12 +1465,13 @@ async function readPlans(ids) {
 }
 // The plan above a chat: every step, the one it is on marked; its count folds it to that step.
 function renderPlan(el, b) {
-  const plan = planOf(b), key = plan ? `${b.id}|${S.plansGen}|${!!S.ui.planFolded}` : '';
+  // Each pane folds its own plan.
+  const plan = planOf(b), folded = !!S.ui.planFolded[el.id], key = plan ? `${b.id}|${S.plansGen}|${folded}` : '';
   if (el.dataset.k === key) return; el.dataset.k = key;
   el.hidden = !plan; if (!plan) { el.innerHTML = ''; return; }
   const step = (x) => `<div class="pstep ${x.s}"><span class="pm">${STEP_GLYPH[x.s]}</span>${esc(x.t)}</div>`;
-  const shown = S.ui.planFolded ? (plan.at ? [plan.at] : []) : plan.steps;
-  el.innerHTML = `<button type="button" class="pcount" data-act="plan-fold" title="${S.ui.planFolded ? 'Show the whole plan' : 'Fold the plan to its current step'}">${planCount(plan)}</button>${shown.map(step).join('')}`;
+  const shown = folded ? (plan.at ? [plan.at] : []) : plan.steps;
+  el.innerHTML = `<button type="button" class="pcount" data-act="plan-fold" data-v="${el.id}" title="${folded ? 'Show the whole plan' : 'Fold the plan to its current step'}">${planCount(plan)}</button>${shown.map(step).join('')}`;
 }
 
 // ---------- runs ----------
@@ -3025,7 +3026,7 @@ async function act(el) {
     // What is beside goes full screen, with its draft; ← closes it.
     case 'full': if (S.ui.side) await go(S.ui.side); return;
     case 'close-side': if (S.ui.side) await go(S.ui.side, 'beside'); return;
-    case 'plan-fold': S.ui.planFolded = !S.ui.planFolded; render(); return;
+    case 'plan-fold': S.ui.planFolded[v] = !S.ui.planFolded[v]; render(); return;
     case 'close-file': closeFile(); return;
     case 'new-project': await openProjectSheet(); return;
     case 'np-choose': await chooseProjectFolder(); return;
