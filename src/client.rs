@@ -1363,7 +1363,7 @@ fn ways_past_busy(bot: &str, error: Error) -> Error {
         None => "resend with --delivery queue to run this after it".to_owned(),
     };
     let fork =
-        format!("; to ask without interrupting, fork --source {bot} --bot NEW and send it to NEW");
+        format!("; to ask without interrupting, fork --source={bot} --bot NEW and send it to NEW");
     // The daemon's own detail names request fields; at the CLI the detail
     // states the refusal and the hint gives the ways past it in flags.
     let stated = match running {
@@ -2608,11 +2608,15 @@ mod tests {
             Error::new("bot_busy").facts(json!({"running_turn":4})),
         );
         assert_eq!(busy.detail.as_deref(), Some("turn 4 is running"));
+        let hint = busy.facts.unwrap()["hint"].as_str().unwrap().to_owned();
+        assert!(hint.starts_with("resend with --delivery steer --turn 4"));
+        // A name that looks like a flag still parses as the source.
+        let flagged = ways_past_busy("--worker", Error::new("bot_busy"));
         assert!(
-            busy.facts.unwrap()["hint"]
+            flagged.facts.unwrap()["hint"]
                 .as_str()
                 .unwrap()
-                .starts_with("resend with --delivery steer --turn 4")
+                .contains("fork --source=--worker --bot NEW")
         );
     }
 
