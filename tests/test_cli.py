@@ -198,14 +198,20 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual(first['pending'], [slow])
         self.assertEqual(first['results'][quick]['text'], 'reply:hi')
         timed = self.agent('wait', '--store', str(self.store), '--any', '--timeout-ms', '0', slow, check=False)
-        self.assertEqual(timed.returncode, 1)
-        self.assertEqual(json.loads(timed.stdout), {'pending': [slow], 'results': {slow: {'pending': True}}})
-        self.assertEqual(timed.stderr, '')
+        self.assertEqual((timed.returncode, timed.stderr), (1, ''))
+        timed = json.loads(timed.stdout)
+        self.assertEqual(timed['pending'], [slow])
+        self.assertEqual((timed['results'][slow]['pending'], timed['results'][slow]['status'],
+                          timed['results'][slow]['handle']), (True, 'running', slow))
         done = self.agent('wait', '--store', str(self.store), '--timeout-ms=0', quick)
         self.assertEqual(json.loads(done.stdout)['results'][quick]['text'], 'reply:hi')
         mixed = self.agent('wait', '--store', str(self.store), '--any', '--timeout-ms=0', slow, quick)
         self.assertEqual(json.loads(mixed.stdout)['pending'], [slow])
-        self.agent('interrupt', '--store', str(self.store), '--bot', 'Slow')
+        # interrupt prints the turn view, as it stood when asked.
+        printed = self.agent('interrupt', '--store', str(self.store), '--bot', 'Slow', '--pretty').stdout
+        self.assertIn('\n  "handle"', printed)
+        view = json.loads(printed)
+        self.assertEqual((view['handle'], view['interrupt_requested']), (slow, True))
         failed = self.agent('wait', '--store', str(self.store), '--any', slow, check=False)
         self.assertEqual(failed.returncode, 1)
 

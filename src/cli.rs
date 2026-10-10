@@ -33,7 +33,7 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "interrupt",
         usage: "interrupt --bot NAME",
-        flags: "--bot",
+        flags: "--bot --pretty",
         startup: false,
     },
     Command {
