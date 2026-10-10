@@ -109,11 +109,13 @@ window.Rich = (() => {
     r.fence = (tokens, i) => block(tokens[i].content.replace(/\n$/, ''), tokens[i].info);
     r.code_block = (tokens, i) => block(tokens[i].content.replace(/\n$/, ''), '');
     r.rich_source = (tokens, i) => block(tokens[i].content, '');
-    // A link to a path opens that file beside, from the agent's folder; its `#` href lets Tab and
-    // Enter reach it, and the click handler keeps it from navigating.
+    // Every link drawn is inert: its target is data (`data-href` for a URL, `data-file` for a path,
+    // which opens beside from the agent's folder) and only the click handler acts on it, so no
+    // native path (a context menu, a middle click, a drag) can follow it in the window. The `#`
+    // href lets Tab and Enter reach it.
     r.link_open = (tokens, i) => {
       const href = tokens[i].attrGet('href') ?? '', title = tokens[i].attrGet('title'), t = title ? ` title="${esc(title)}"` : '';
-      const open = !linkCost(href, title) ? '' : linkable(href) ? `<a href="${esc(href)}"${t}>` : filePath(href) ? `<a class="file" href="#" data-file="${esc(filePath(href))}"${t}>` : '';
+      const open = !linkCost(href, title) ? '' : linkable(href) ? `<a href="#" data-href="${esc(href)}"${t}>` : filePath(href) ? `<a class="file" href="#" data-file="${esc(filePath(href))}"${t}>` : '';
       closes.push(open ? '</a>' : ''); return open;
     };
     r.link_close = () => closes.pop() ?? '';
@@ -123,7 +125,7 @@ window.Rich = (() => {
     // nothing a model chose.
     r.image = (tokens, i, options, env, self) => {
       const href = tokens[i].attrGet('src') ?? '', text = self.renderInlineAsText(tokens[i].children ?? [], options, env);
-      return !linkCost(href, text, 2) ? esc(text) : /^data:image\/(png|gif|jpe?g|webp)[;,]/i.test(href) ? `<button type="button" class="img" data-img="${esc(href)}" title="${esc(text)}">image${text ? `: ${esc(text)}` : ''}</button>` : linkable(href) ? `<a href="${esc(href)}">${esc(text || href)}</a>` : filePath(href) ? `<a class="file" href="#" data-file="${esc(filePath(href))}">${esc(text || href)}</a>` : esc(text);
+      return !linkCost(href, text, 2) ? esc(text) : /^data:image\/(png|gif|jpe?g|webp)[;,]/i.test(href) ? `<button type="button" class="img" data-img="${esc(href)}" title="${esc(text)}">image${text ? `: ${esc(text)}` : ''}</button>` : linkable(href) ? `<a href="#" data-href="${esc(href)}">${esc(text || href)}</a>` : filePath(href) ? `<a class="file" href="#" data-file="${esc(filePath(href))}">${esc(text || href)}</a>` : esc(text);
     };
     // A table past 256 columns or 10,000 cells shows as its source, before its cells are parsed: a
     // short row is padded to the header's width, so a few bytes a row can ask for millions of cells.
@@ -369,7 +371,7 @@ window.Rich = (() => {
     // Every link in drawn content goes through the guarded opener, or nowhere: a Mermaid `click`
     // link is an SVG `<a xlink:href>` that would otherwise take over the window.
     const a = e.target.closest?.('.md a, .rc a');
-    if (a) { e.preventDefault(); const href = a.getAttribute('href') ?? a.getAttribute('xlink:href'); if (linkable(href)) open(href); return true; }
+    if (a) { e.preventDefault(); const href = a.dataset?.href ?? a.getAttribute('href') ?? a.getAttribute('xlink:href'); if (linkable(href)) open(href); return true; }
     const b = e.target.closest?.('[data-rich]'); if (!b) return false;
     const box = b.closest('.rc');
     if (b.dataset.rich === 'copy') {

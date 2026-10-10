@@ -1282,7 +1282,8 @@ a binary file as its size, anything else as code highlighted by its
 extension. Esc or ✕ closes it and brings back the task that was beside, if
 any. A write or edit to the open file reads it again, and what the agent
 wrote is new: a page, diagram, chart or image in it waits for a click, as in
-a message. One that failed or was refused changed nothing, so the file stays
+a message. A file drawn again (rewritten, or highlighted once highlighting
+loads) keeps the reader's place. One that failed or was refused changed nothing, so the file stays
 as it is shown. A click in the file puts the keyboard in the chat's composer,
 as the pane beside has none while a file is open. Deleting the agent it came from, or attaching to another store,
 closes it. Searching a project's
@@ -1291,8 +1292,9 @@ files (from ^k or elsewhere) is not built.
 What a model writes never becomes the app's markup unparsed. Raw HTML inside
 Markdown shows as text. Links open in the default browser and only for `http`,
 `https` and `mailto` (the core's `open_link` refuses anything else); other
-links show as their text. A link has no context menu of its own, as the
-web view's Open Link would follow it in the window. A link inside a drawn diagram (a Mermaid `click`
+links show as their text. A link is drawn inert, its target data that
+only a click reads, and offers no context menu, so nothing the web view does
+natively (Open Link, a middle click, a drag) follows it in the window. A link inside a drawn diagram (a Mermaid `click`
 link) goes the same way and never navigates the window. A chart's `href` drew
 no link in Chromium, as Vega's string renderer passes it through the loader,
 which refuses every URL; one that did draw would go the same way. Images draw

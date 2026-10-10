@@ -140,10 +140,10 @@ test('messages draw as Markdown with raw HTML, scripts and remote fetches kept o
   assert.match(html, /<strong>bold<\/strong>/);
   assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;/);
   assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
-  assert.match(html, /<a href="https:\/\/example.com">ok<\/a>/);
+  assert.match(html, /<a href="#" data-href="https:\/\/example.com">ok<\/a>/);
   assert.doesNotMatch(html, /javascript:/);
   assert.doesNotMatch(html, /<img/);
-  assert.match(html, /<a href="https:\/\/example.com\/p.png">pic<\/a>/);
+  assert.match(html, /<a href="#" data-href="https:\/\/example.com\/p.png">pic<\/a>/);
   assert.match(html, /<table>/);
   assert.match(html, /type="checkbox"/);
 });
@@ -170,7 +170,7 @@ test('fenced blocks become code, previews, diagrams and images by their language
   assert.doesNotMatch(png, /<img/);
   assert.match(png, /<button type="button" class="img" data-img="data:image\/png;base64,iVBORw0KGgo=" title="dot">image: dot<\/button>/);
   assert.match(Rich.html('![flow](docs/flow.png)'), /<a class="file" href="#" data-file="docs\/flow.png">flow<\/a>/);
-  assert.match(Rich.html('![r](https://example.com/r.png)'), /<a href="https:\/\/example.com\/r.png">r<\/a>/);
+  assert.match(Rich.html('![r](https://example.com/r.png)'), /<a href="#" data-href="https:\/\/example.com\/r.png">r<\/a>/);
 });
 
 test('a table too wide or too large shows as its source; a modest one draws', () => {
@@ -331,15 +331,15 @@ test('a reference used many times copies at most 1 Mi characters of targets into
   const p = page(), Rich = p.context.Rich, target = 'https://example.com/' + 'a'.repeat(100000);
   const out = Rich.html(`[x][a] `.repeat(5000) + `\n\n[a]: ${target}`);
   assert.ok(out.length < 2 * 1024 * 1024, `${out.length} characters`);
-  assert.equal((out.match(/<a href=/g) ?? []).length, 10);
+  assert.equal((out.match(/data-href=/g) ?? []).length, 10);
   // The budget is shared by the pieces of one message, as a streamed reply's are.
   const used = { lines: 0, tags: 0, code: 0 }, piece = `[x][a]\n\n[a]: ${target}\n\n`;
-  let links = 0; for (let i = 0; i < 20; i++) links += (Rich.html(piece, used).match(/<a href=/g) ?? []).length;
+  let links = 0; for (let i = 0; i < 20; i++) links += (Rich.html(piece, used).match(/data-href=/g) ?? []).length;
   assert.equal(links, 10);
   // Targets are charged as written into the page, escaped.
   const quoted = Rich.html(`[x][q] `.repeat(10) + `\n\n[q]: https://example.com/${"'".repeat(100000)}`);
   assert.ok(quoted.length < 2 * 1024 * 1024, `${quoted.length} characters`);
-  assert.equal((quoted.match(/<a href=/g) ?? []).length, 2);
+  assert.equal((quoted.match(/data-href=/g) ?? []).length, 2);
 });
 
 test('the text blocks of one message share the bound on marks parsed', () => {
@@ -408,6 +408,15 @@ test('highlighting arriving redraws a file beside only when its code waited for 
   v = 2; p.renderFile(); assert.equal(files, 3);
 });
 
+test('a file drawn again keeps the reader\'s place; another file starts at its top', () => {
+  const p = page(), enc = (s) => new TextEncoder().encode(s), el = p.elements.get('side') ?? p.context.document.getElementById('side');
+  p.S.ui.file = { bot: 'Bob', full: '/w/a.rs', gen: 2, state: 'ok', bytes: enc('fn a() {}'), more: false, url: null }; p.renderFile();
+  el.scrollTop = 300; p.S.ui.file.gen = 3; p.renderFile();
+  assert.equal(el.scrollTop, 300);
+  p.S.ui.file = { bot: 'Bob', full: '/w/b.rs', gen: 4, state: 'ok', bytes: enc('fn b() {}'), more: false, url: null }; p.renderFile();
+  assert.equal(el.scrollTop, 0);
+});
+
 test('a file closed and opened again never shares a view key with the one before', async () => {
   const p = page({ readFile: async () => new TextEncoder().encode('{}') });
   p.setRender(() => {});
@@ -457,12 +466,14 @@ test('a name starting with a tilde is the folder\'s; only ~/ is home', () => {
 test('a link in a drawn diagram opens through the guarded opener', () => {
   const p = page(), Rich = p.context.Rich, opened = [];
   p.context.__TAURI__ = { core: { invoke: (cmd, args) => { opened.push([cmd, args.url]); return Promise.resolve(); } } };
-  const click = (attrs) => { let prevented = false; const a = { getAttribute: (k) => attrs[k] ?? null };
+  const click = (attrs, dataset) => { let prevented = false; const a = { dataset, getAttribute: (k) => attrs[k] ?? null };
     const handled = Rich.click({ target: { closest: (sel) => sel.includes('.rc a') ? a : null }, preventDefault: () => { prevented = true; } });
     return handled && prevented; };
   assert.equal(click({ 'xlink:href': 'https://example.com/m' }), true);
   assert.equal(click({ href: 'javascript:alert(1)' }), true);
-  assert.deepEqual(opened, [['open_link', 'https://example.com/m']]);
+  // A Markdown link is inert, its target data the opener reads.
+  assert.equal(click({ href: '#' }, { href: 'https://example.com/d' }), true);
+  assert.deepEqual(opened, [['open_link', 'https://example.com/m'], ['open_link', 'https://example.com/d']]);
 });
 
 test('charts, file links and opened files draw by kind', () => {
@@ -484,7 +495,7 @@ test('charts, file links and opened files draw by kind', () => {
   // The line suffix is read before decoding, so `%3A` is a colon in the name.
   assert.match(Rich.html('[log](logs/build%3A2026)'), /data-file="logs\/build:2026">log/);
   assert.match(Rich.html('[log](a%3A2026)'), /data-file="a:2026">log/);
-  assert.match(links, /<a href="https:\/\/example.com">web<\/a>/);
+  assert.match(links, /<a href="#" data-href="https:\/\/example.com">web<\/a>/);
   assert.doesNotMatch(links, /data-file="#top"/);
   const enc = (text) => new TextEncoder().encode(text);
   assert.match(Rich.file('/w/PLAN.md', enc('# Plan')).html, /<div class="md"><h1>Plan<\/h1>/);

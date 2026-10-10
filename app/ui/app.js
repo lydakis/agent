@@ -1558,7 +1558,7 @@ async function openFile(who, full, asked = true) {
 function dropFile() {
   const f = S.ui.file; if (!f) return false;
   if (f.url) URL.revokeObjectURL(f.url);
-  S.ui.file = null; $('side').dataset.key = ''; $('side').dataset.who = ''; $('sidetitle').dataset.k = '';
+  S.ui.file = null; $('side').dataset.key = ''; $('side').dataset.who = ''; $('side').dataset.shows = ''; $('sidetitle').dataset.k = '';
   return true;
 }
 // The chat it covered is on screen again, and what it finished meanwhile is seen.
@@ -1578,7 +1578,9 @@ function renderFile() {
   $('sidetitle').dataset.k = key;
   $('sidetitle').innerHTML = `<div class="crumbs"><b>${esc(name)}</b><span class="branch" title="${esc(f.full)}">${esc(where)}</span></div><div class="tools"><button type="button" class="ibtn" data-act="close-file" title="Close (Esc)" aria-label="Close">✕</button></div>`;
   el.innerHTML = `<div class="fview">${f.state === 'loading' ? '<div class="line pending">reading…</div>' : f.state === 'error' ? `<div class="line out bad">${esc(f.error)}</div>` : f.view}</div>`;
-  el.dataset.key = key; el.dataset.who = ''; el.scrollTop = 0;
+  // A file drawn again (highlighting arrived, an agent rewrote it) keeps the reader's place.
+  if (el.dataset.shows !== f.full) el.scrollTop = 0;
+  el.dataset.key = key; el.dataset.who = ''; el.dataset.shows = f.full;
   // A chart fills the pane's width, so it is measured once the pane has finished opening.
   const opening = $('app')?.getAnimations?.() ?? [];
   if (!opening.length) Rich.hydrate(el);
