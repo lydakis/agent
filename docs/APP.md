@@ -1156,7 +1156,7 @@ the ask it is for, so one cut short after its message went is not sent
 again, and one cut short while it was going is finished, as the same
 request, and nothing more. An entry that cannot be moved out of the queue
 would have launchd run the job for ever, so the trigger ends, saying why
-(`asks_stuck`). `rm` sets a trigger's asks aside until launchd unloads its
+(`asks_stuck`). A trigger that goes sets its asks aside with its files until launchd unloads its
 job, and puts them back when it will not. Nothing else starts a fire:
 launchd is the only thing that runs one.
 
@@ -1262,9 +1262,11 @@ anything else a failure can leave is listed and removable:
   are set aside by rename (`.NAME.retiring`), whatever their size or
   contents, and deleted once launchd lets the job go; a file that cannot be
   set aside keeps its job loaded, and an unload launchd refuses renames
-  them back, so either stays listed with what its fire did. A job left
-  loaded after its plist went (an end cut short) is unloaded by
-  its next fire.
+  them back, so either stays listed with what its fire did. A fire whose
+  unload ends it before it deletes them leaves them aside; the app's next
+  start, or the next `add` or `rm` of that name, finishes that end. A job
+  left loaded after its plist went (an end cut short) is unloaded by its
+  next fire.
 - **Removing** unloads the job by its label whether or not its plist is
   there, then deletes the plist and the state file, so it reaches an ended
   row, a plist launchd no longer has, and a job loaded without its plist
