@@ -163,7 +163,8 @@ trials. The last column counts shell commands that touched memory.
 | `none` | `stale` | 3/3 | 6, 6, 6 | 39,506 | 22,016 | 2,220 | 0, 0, 0 |
 
 The whole run used 379,793 input tokens (255,104 cached) and 11,734
-output tokens. That is under a quarter of the input estimate above.
+output tokens. The input is below the estimate above, at about 38% of
+its low end.
 
 What it shows, as observations from three trials per cell:
 
@@ -174,8 +175,7 @@ What it shows, as observations from three trials per cell:
   on `stale`. All three `memory` bots then rewrote the fact in place. Each
   now says prices round half up with `quantize_price` in `shop/pricing.py`
   and that `shop/money.py` is gone, and each cites the source and a
-  verified date. All three also changed the fact's type from `project` to
-  `reference`. Because the control also gets `stale` right from the code
+  verified date. Because the control also gets `stale` right from the code
   alone, this scenario can show harm from a wrong fact but not a benefit
   from memory. A wrong fact that is more tempting would test more.
 - **Cost.** Memory took about 2.5 times the input tokens and one or two
