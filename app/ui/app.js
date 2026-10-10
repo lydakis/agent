@@ -457,12 +457,14 @@ async function loadSwarms() {
 }
 // A swarm read while its start is still making its agents names them before it pins their ids, and
 // their first events have come and gone by then: it is read again, a second apart, until every member
-// is pinned, for at most a minute.
-let pinsTimer = null, pinsTries = 0;
+// is pinned, for at most a minute per swarm, so one left unpinned never holds up the next.
+let pinsTimer = null; const pinTries = new Map();
 function pinsSoon() {
-  if (![...S.swarms.values()].some((sw) => sw.members.some((m) => sw.ids[m] == null))) { pinsTries = 0; return; }
-  if (pinsTimer || pinsTries >= 60) return;
-  pinsTries += 1;
+  const waiting = [...S.swarms.values()].filter((sw) => sw.members.some((m) => sw.ids[m] == null)).map((sw) => sw.name);
+  for (const name of [...pinTries.keys()]) if (!waiting.includes(name)) pinTries.delete(name);
+  const due = waiting.filter((name) => (pinTries.get(name) ?? 0) < 60);
+  if (pinsTimer || !due.length) return;
+  for (const name of due) pinTries.set(name, (pinTries.get(name) ?? 0) + 1);
   pinsTimer = setTimeout(async () => {
     pinsTimer = null;
     try { await loadSwarms(); render(); } catch (e) { Daemon.log?.(`swarms: ${e?.message ?? e}`); }

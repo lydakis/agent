@@ -515,6 +515,10 @@ class SwarmRuleTests(unittest.TestCase):
         self.assertEqual(self.s.deal(mix, 4), [0, 1, 2, 0])
         self.assertEqual(self.s.deal(mix, 1, [2, 1, 0]), [2])
         self.assertEqual(self.s.goal_name('Make the provider pool faster'), 'provider')
+        # A client's own role is not a swarm identity.
+        with self.assertRaises(self.s.Refused) as refused:
+            self.s.valid_mix([{'model': 'm', 'share': 100, 'identity': 'Coordinator', 'effort': None}])
+        self.assertIn('client', refused.exception.detail)
 
 
 if __name__ == '__main__':

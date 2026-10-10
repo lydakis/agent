@@ -2292,19 +2292,26 @@ test('a swarm a coordinator started from its shell shows once its first agent ta
   answers[1]({ swarms: listed, broken: [] }); await r.tick();
   answers[0]({ swarms: [], broken: [] }); await r.tick();
   assert.deepEqual([...r.S.swarms.keys()], ['app.latency']);
-  // Read while its start is still making agents, it is read again until they are pinned.
+  // Read while its start is still making agents, it is read again until they are pinned; one left
+  // unpinned by a start that died has used up its own tries, not the next swarm's.
   let pinned = false; reads = 0;
   const unpinned = swarmRecord(['app.latency-1', 'app.latency-2'], { ids: {} });
-  const u = shell({ swarms: async () => { reads += 1; return { swarms: [pinned ? listed[0] : unpinned], broken: [] }; }, request: async () => ({ bots: [], next_after: null, nodes: [], workspaces:[],next_from: null }) });
+  const dead = swarmRecord(['app.dead-1'], { swarm: 'app.dead', ids: {} });
+  const u = shell({ swarms: async () => { reads += 1; return { swarms: reads <= 61 ? [dead] : [dead, pinned ? listed[0] : unpinned], broken: [] }; }, request: async () => ({ bots: [], next_after: null, nodes: [], workspaces:[],next_from: null }) });
   u.S.live = true;
+  u.upsert({ name: 'app.dead-1', id: 8, provider: 'alpha', model: 'one' });
+  await u.handle({ event: 'accepted', bot: 'app.dead-1', turn: 1, durable: true }, 1);
+  for (let i = 0; i < 70; i++) await u.tick();
+  assert.equal(reads, 61, 'a minute of tries, then no more');
+  reads = 61;
   u.upsert({ name: 'app.latency-1', id: 3, provider: 'alpha', model: 'one' });
   await u.handle({ event: 'accepted', bot: 'app.latency-1', turn: 1, durable: true }, 1);
   await u.tick(); await u.tick();
-  assert.equal(reads, 2);
+  assert.equal(reads, 63);
   pinned = true; await u.tick();
   assert.deepEqual(u.S.swarms.get('app.latency').ids, { 'app.latency-1': 3, 'app.latency-2': 4 });
   await u.tick();
-  assert.equal(reads, 3, 'pinned, it is not read again');
+  assert.equal(reads, 64, 'pinned, it is not read again');
 });
 
 test('a helper finishing a turn has its swarm check its budget', async () => {

@@ -63,6 +63,8 @@ ACTIVE = ('running', 'waiting', 'paced', 'queued', 'ready')
 # Words that say little about a goal; `lock` too: git refuses a branch named `agent/X.lock`.
 PLAIN = {'the', 'and', 'for', 'with', 'that', 'this', 'from', 'into', 'make', 'keep', 'cut', 'all',
          'our', 'its', 'half', 'every', 'each', 'add', 'fix', 'get', 'lock'}
+# Profiles a client gives its own agents, as `agent` lists them (policy::CLIENT_ROLES).
+CLIENT_ROLES = ('coordinator',)
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.abspath(__file__)
 
@@ -674,10 +676,6 @@ def run_act(daemon, folder, author, verb, args):
     if verb == 'post':
         everyone = bool(args) and args[0] == '--all'
         post(act, ' '.join(args[1:] if everyone else args), everyone)
-        if not author and swarm['stopped']:
-            # Your post resumes a stopped swarm, once it is on the board.
-            swarm['stopped'] = False
-            folder.save()
     elif verb == 'role':
         role(act, ' '.join(args))
     elif verb == 'assign':
@@ -715,6 +713,10 @@ def run_act(daemon, folder, author, verb, args):
         act.lines[0]['sent'] = sent
     act.answer['board_changed'] = bool(act.lines)
     folder.append(act.lines)
+    if verb == 'post' and not author and swarm['stopped']:
+        # Your post resumes a stopped swarm, once it is on the board.
+        swarm['stopped'] = False
+        folder.save()
     if act.answer.get('task'):
         # As the board stands after this act: an assignment clears a result.
         act.answer.update(status=act.state['tasks'][act.answer['task']]['status'],
@@ -860,6 +862,8 @@ def valid_mix(mix):
             raise Refused('invalid_mix', 'an effort level is a lowercase word')
         if identity.startswith('.') or not all(c.isascii() and (c.isalnum() or c in '-_.') for c in identity):
             raise Refused('invalid_mix', '%s is not an identity' % identity)
+        if identity.lower() in CLIENT_ROLES:
+            raise Refused('invalid_mix', "%s is a client's role, not a swarm identity" % identity)
     total = sum(row['share'] for row in mix)
     if total != 100:
         raise Refused('invalid_mix', 'the shares add up to %d%%, not 100%%' % total)
