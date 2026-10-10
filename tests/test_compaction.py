@@ -73,7 +73,11 @@ class AnthropicCompactionTests(ModelFixture):
         indices = [n for n, r in enumerate(requests) if is_summary(r)]
         self.assertEqual(len(indices), 2)
         for index in indices:
-            summary, call = requests[index], requests[index - 1]
+            # The call before it, or the one before that when a summary
+            # beside the boundary's own call reached the model second.
+            summary = requests[index]
+            calls = [r for r in requests[max(0, index - 2):index] if not is_summary(r)]
+            call = next((c for c in reversed(calls) if c['messages'] == summary['messages'][:-1]), calls[-1])
             self.assertEqual((summary['system'], summary['tools']), (call['system'], call['tools']))
             self.assertEqual(summary['messages'][:-1], call['messages'])
             self.assertTrue(summary['messages'][-1]['content'][-1]['text'].endswith('Summarize.'))
@@ -702,6 +706,15 @@ class SummaryCopyTests(ModelFixture):
             after = page[-1]['cursor']
         return events
 
+    def copied_call(self, requests, index):
+        """The call a summary copies: the one before it, or, for a summary
+        beside a turn's call, the one before that when the boundary's own
+        call reached the model first."""
+        copied = requests[index]['input'][:-1]
+        calls = [r for r in requests[max(0, index - 2):index] if not is_summary(r)]
+        call = next((c for c in reversed(calls) if c['input'][:len(copied)] == copied), calls[-1])
+        return call
+
     def copies(self, requests):
         """Each summary copies the call before it through its span: the same
         instructions, tools, tool choice, cache key, and the start of its
@@ -709,7 +722,7 @@ class SummaryCopyTests(ModelFixture):
         indices = [n for n, r in enumerate(requests) if is_summary(r)]
         self.assertTrue(indices)
         for index in indices:
-            summary, call = requests[index], requests[index - 1]
+            summary, call = requests[index], self.copied_call(requests, index)
             self.assertFalse(is_summary(call))
             self.assertEqual(summary['instructions'], call['instructions'])
             self.assertEqual(summary['tools'], call['tools'])
@@ -726,13 +739,20 @@ class SummaryCopyTests(ModelFixture):
         self.turn(client, 'a', 'first: ' + 'x' * 300)
         self.model.call_script = [('shell', {'command': 'seq 1 300'})] * 3
         self.turn(client, 'b', 'script')
-        indices = self.copies(self.requests())
-        # One at the turn's prompt, one inside the turn, each on the turn's
-        # first routing token, to the server that holds the call's cache.
+        requests = self.requests()
+        first, second = [n for n, r in enumerate(requests) if is_summary(r)]
+        self.copies(requests[:second])
+        # One at the turn's prompt, one inside the turn, each beside a call.
+        # The first copies the call before it, on the turn's first routing
+        # token, to the server that holds the call's cache. The second is
+        # due a boundary after the first was installed: the call between
+        # sent the view from before it, so no call sent the view it would
+        # copy, and it is a request of its own.
         compacted = [e['data'] for e in self.events(client, 'compacted')]
-        self.assertEqual([c['pinned'] is not None for c in compacted], [False, True])
+        self.assertEqual([(c['pinned'] is not None, c['request']['form'], c['request']['beside'])
+                          for c in compacted], [(False, 'copy', True), (True, 'own', True)])
         self.assertIsNone(self.model.routes[1])
-        self.assertEqual([self.model.routes[n] for n in indices], ['route-2', 'route-2'])
+        self.assertEqual(self.model.routes[first], 'route-2')
 
     def test_a_summary_copies_what_the_call_sent_ahead_of_a_note_written_since(self):
         client = self.start(tools='shell,note', budget=8192)
@@ -748,27 +768,34 @@ class SummaryCopyTests(ModelFixture):
         # the note.
         pinned = lambda r: [i['content'][0]['text'] for i in r['input']
                             if i.get('role') == 'user' and i['content'][0]['text'].startswith('[carry-forward note')]
-        self.assertEqual(requests[index - 1]['input'][-1]['call_id'], 'script-0')
+        call = self.copied_call(requests, index)
+        own = next(r for r in requests[requests.index(call) + 1:] if not is_summary(r))
+        self.assertEqual(call['input'][-1]['call_id'], 'script-0')
         self.assertEqual(pinned(requests[index]), [])
-        self.assertIn(note, pinned(requests[index + 1])[0])
+        self.assertIn(note, pinned(own)[0])
 
     def test_a_summary_copies_the_view_from_before_the_stubs_of_its_boundary(self):
-        client = self.start(tools='shell,read', budget=16384)
+        client = self.client(tools='shell,read',
+                             settings={'context_bytes': 16384, 'compact_at': 50, 'compact_keep': 10})
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read'],
+                       compaction_instructions='Summarize.')
         self.turn(client, 'a', 'first: ' + 'x' * 1500)
-        self.model.call_script = [('shell', {'command': 'seq 1 300'}), ('shell', {'command': 'seq 10001 10400'}),
-                                  ('shell', {'command': 'seq 20001 20400'})]
+        self.model.call_script = [('shell', {'command': f'seq {n}0001 {n}0400'}) for n in range(1, 6)]
         self.turn(client, 'b', 'script')
         requests = self.requests()
-        indices = self.copies(requests)
+        index, = self.copies(requests)
         self.assertEqual([e['event'] for e in self.events(client, 'elided', 'compacted')],
-                         ['compacted', 'elided', 'compacted'])
-        # The boundary stubbed results the call before it saw whole, then
-        # summarized: the copy shows the one in its span as the call did.
+                         ['elided', 'elided', 'compacted', 'elided', 'elided'])
+        # The boundary stubbed a result the call before it saw whole, then
+        # summarized beside its own call: the copy shows that result as the
+        # call before did, and the boundary's call sends its stub.
         outputs = lambda r: [i['output'] for i in r['input'] if i.get('type') == 'function_call_output']
-        copied = outputs(requests[indices[-1]])
-        self.assertEqual(len(copied), 1)
-        self.assertFalse(copied[0].startswith('[tool result elided'))
-        self.assertTrue(outputs(requests[indices[-1] + 1])[0].startswith('[tool result elided'))
+        call = self.copied_call(requests, index)
+        own = next(r for r in requests[requests.index(call) + 1:] if not is_summary(r))
+        copied = outputs(requests[index])
+        self.assertEqual(copied, outputs(call)[:len(copied)])
+        self.assertFalse(copied[-1].startswith('[tool result elided'))
+        self.assertTrue(outputs(own)[len(copied) - 1].startswith('[tool result elided'))
 
     def test_a_summary_the_budget_forces_copies_the_call_before_it(self):
         # The third result cannot fit beside the first two, so the view is

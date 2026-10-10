@@ -373,6 +373,31 @@ class ApprovalTests(ModelFixture):
         self.assertEqual(sum(is_summary(r) for r in requests), len(cursors))
         self.assertEqual(client.request('approvals')['result']['approvals'], [])
 
+    def test_a_verdict_given_beside_a_summary_runs_its_call_once_it_is_installed(self):
+        # Each summary takes a second beside the turn's call, and is
+        # installed before that call's tools run: a verdict that comes
+        # meanwhile runs the call once it is, and no call runs beside one.
+        self.model.timeline, self.model.summary_delay = [], 1.0
+        client = self.client('shell,read', settings={'approval_hold_ms': 5000, 'context_bytes': 24576})
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read'],
+                       approve=['shell'], approver='manual', compaction_instructions='Summarize.')
+        rounds = 24
+        turn = client.request('submit', bot='Bob', request_id='1', prompt=f'long:{rounds}')['result']['turn']
+        beside = 0
+        for n in range(rounds):
+            call_id = f'long-{n}'
+            self.announced(client, turn)
+            beside += getattr(self.model, 'summarizing', False)
+            self.assertEqual(self.answer(client, turn, call_id)['result']['pending'], [])
+            client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn
+                           and m['data']['call_id'] == call_id, timeout=30)
+            self.assertFalse(getattr(self.model, 'summarizing', False), call_id)
+        ended = client.finished(turn, timeout=30)
+        self.assertEqual(ended['data']['status'], 'completed', ended)
+        self.assertTrue(beside)
+        kinds = [e['event'] for e in client.request('events', bot='Bob', after=0, limit=256)['result']['events']]
+        self.assertNotIn('turn_waiting', kinds)
+
     def test_a_parked_calls_result_that_overflows_forces_a_summary_after_restart(self):
         # Four small rounds, then a call whose result takes the turn past its
         # budget. That call parks, the daemon restarts, and once allowed its
