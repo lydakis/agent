@@ -397,8 +397,8 @@ impl ProviderSpec {
     /// `chatgpt` at its default endpoint without a key variable uses Codex's
     /// saved ChatGPT login; the login never goes to a caller-chosen URL.
     /// `bedrock` (Claude) defaults to Bedrock runtime, where cross-region
-    /// inference profiles (`global.anthropic.…`) reach every Claude model
-    /// from any region, and `bedrock-openai` to Bedrock Mantle, as Claude
+    /// inference profiles (`global.anthropic.…`) route to whichever region
+    /// holds the model, from any source region the profile supports, and `bedrock-openai` to Bedrock Mantle, as Claude
     /// Code and Codex default. Both are in the region the AWS SDKs would
     /// use (`aws::region`). Any Bedrock URL without a key variable signs
     /// with SigV4, and one with a key variable sends it as a Bedrock API

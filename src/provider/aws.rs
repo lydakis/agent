@@ -56,8 +56,9 @@ const ENVIRONMENT: [&str; 3] = [
     "AWS_SESSION_TOKEN",
 ];
 pub const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
-/// Where calls go when nothing names a region, as Claude Code does. A
-/// cross-region inference profile reaches its models from any region.
+/// Where calls go when nothing names a region, as Claude Code does: a
+/// a source region for the US and global inference profiles in AWS's
+/// support matrix.
 const DEFAULT_REGION: &str = "us-east-1";
 
 /// The region Bedrock calls are made in, in Claude Code's order:

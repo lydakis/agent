@@ -398,8 +398,10 @@ Amazon Bedrock serves both families, so a Bedrock binding is a base URL and
 a way to authenticate; [BEDROCK.md](BEDROCK.md) records the survey and the
 choices. `bedrock` binds Claude on Bedrock runtime, whose cross-region
 inference profiles (`global.anthropic.claude-opus-5-5`, or `us.`, `eu.`,
-`apac.` and the other geographies) reach every Claude model from any region,
-and `bedrock-openai` binds OpenAI and other models on Bedrock Mantle, as
+`apac.` and the other geographies) route each call to whichever region
+holds the model, from any source region the profile supports (AWS lists them
+per profile, and `ListInferenceProfiles` names only the profiles callable from
+the region asked), and `bedrock-openai` binds OpenAI and other models on Bedrock Mantle, as
 Claude Code and Codex do by default. Both take the region in Claude Code's
 order: `AWS_REGION`, `AWS_DEFAULT_REGION`, the `region` of the active profile
 (`AWS_PROFILE`, else `default`) in the AWS shared credentials file and then

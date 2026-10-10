@@ -59,7 +59,9 @@ account reached every model without a region being picked.
 
 - Claude Code calls runtime's Invoke API by default, with cross-region
   inference profile ids (`us.`, `eu.`, `apac.`, `global.`) that route to any
-  region holding the model; it finds them with `ListInferenceProfiles`. It
+  region holding the model; it finds them with `ListInferenceProfiles`, which
+  names only the profiles callable from the region asked (each profile lists
+  its source regions in AWS's support matrix). It
   takes the region from `AWS_REGION`, `AWS_DEFAULT_REGION`, the active
   profile's `region` in the shared credentials file and then the config file,
   else us-east-1. Mantle is opt-in (`CLAUDE_CODE_USE_MANTLE`), and with both

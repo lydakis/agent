@@ -53,8 +53,8 @@ For Amazon Bedrock, use your usual AWS credentials (`AWS_PROFILE`, SSO, keys
 in the environment, or a Bedrock API key in `AWS_BEARER_TOKEN_BEDROCK`); no
 region is needed. Start the daemon with `--provider bedrock` and name Claude
 models by their cross-region inference profile, like
-`bedrock/global.anthropic.claude-opus-5-5`, which reaches the model from any
-region, or `--provider bedrock-openai` for `bedrock-openai/openai.gpt-6-sol`.
+`bedrock/global.anthropic.claude-opus-5-5`, which AWS routes to whichever
+region holds the model (from any source region the profile supports), or `--provider bedrock-openai` for `bedrock-openai/openai.gpt-6-sol`.
 `AGENT_PROVIDER` takes the place of `--provider` for any provider, so
 `export AGENT_PROVIDER=bedrock AGENT_MODEL=bedrock/global.anthropic.claude-sonnet-5`
 needs no flags.
