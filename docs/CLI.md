@@ -85,7 +85,7 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   included.
   With `run`, instructions and token budget apply to new identities;
   passing them while continuing an existing named bot is an error.
-- `run --new --approval MODE` and `fork --approval MODE` choose whether a
+- `run --new --approval MODE` chooses whether a
   new bot's tool calls wait for a verdict: `full` runs every allowed call (no
   gate), `manual` waits for an answer from any client, and `auto` has a
   judge model decide each call. For `auto`, and whenever `run` continues or
@@ -95,7 +95,8 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   Without the flag, `AGENT_APPROVAL` applies, then `full`. `--approve LIST`
   picks the gated tools and must name at least one; the default is every
   tool but `history`, `wait`, `note`, and `echo`. A fork keeps its source's gates and a created bot its
-  creator's ([APPROVALS.md](APPROVALS.md)).
+  creator's ([APPROVALS.md](APPROVALS.md)); `fork` takes no approval flags, and a
+  program that wants a fork gated further passes `approve` on the protocol's `fork`.
 - `approver [--tag TAG] [--judge PROVIDER/MODEL] [--effort LEVEL]
   [--note FILE] [--judge-url URL]` serves a gate tag (default `auto`) and
   has a judge decide every call waiting on it, one request per round,
@@ -106,7 +107,9 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   a tag of at most 87 bytes, and `--effort` sets its effort. `--note` (default `AGENT_APPROVER_NOTE`)
   is a regular file of at most 96,000 bytes the judge always sees, such as
   trusted remotes and hosts ([APPROVALS.md](APPROVALS.md#automatic-mode)).
-- `approvals [--bot NAME] [--tag TAG]` lists the calls waiting on a gate.
+- `approvals [--bot NAME] [--tag TAG] [--full]` lists the calls waiting on a gate.
+  Each previews its arguments; `--full` reads the whole arguments of a
+  call whose preview was cut from the node that planned it.
   With `--pretty`, each call shows what it would do (every line of its
   command, or of what a `write` or `edit` puts in its file, terminal
   controls escaped) and, for each gate still

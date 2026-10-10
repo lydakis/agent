@@ -437,8 +437,9 @@ class SocketAndCliTests(ModelFixture):
         stats = self.agent('stats', '--store', str(self.store), '--model', 'openai/other', check=False)
         self.assertEqual(stats.returncode, 2)
         self.assertIn('does not accept --model', stats.stderr)
-        # A fork is an exact copy of its source, so it takes no instructions.
-        for flag in ('--instructions', '--instructions-file', '--agents', '--profile'):
+        # A fork is an exact copy of its source, so it takes no instructions,
+        # and keeps its source's gates, so it takes no approval of its own.
+        for flag in ('--instructions', '--instructions-file', '--agents', '--profile', '--approval', '--approve'):
             args = (flag,) if flag == '--agents' else (flag, 'x')
             fork = self.agent('fork', '--store', str(self.store), '--source', 'Bob', '--bot', 'Copy', *args,
                               check=False)
@@ -629,9 +630,8 @@ class SocketAndCliTests(ModelFixture):
         kept = fork[:-4] + ['--bot', 'Kept', '--request-id', 'kept']
         made = json.loads(self.agent(*kept).stdout)
         self.agent('rm', '--store', str(self.store), '--bot', 'Once')
-        for flags in ([], ['--approval', 'full']):
-            resent = json.loads(self.agent(*kept, *flags).stdout)
-            self.assertEqual((resent['bot_id'], resent['duplicate']), (made['bot_id'], True))
+        resent = json.loads(self.agent(*kept).stdout)
+        self.assertEqual((resent['bot_id'], resent['duplicate']), (made['bot_id'], True))
 
     def test_retry_of_pruned_turn_exits_and_retained_retry_still_replays(self):
         self.agent('run', *self.common, '--new', '--bot', 'Bob', '--request-id', 'old', 'first')
