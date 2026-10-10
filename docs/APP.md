@@ -1243,7 +1243,10 @@ not bound its layout work, which is why a diagram waits for a click. Drawn
 diagrams and charts are kept by source (a chart also by its width) and show
 again when their pane is redrawn: at most 64 and 8 MiB. A
 message's drawn HTML counts toward the chat's 8 MiB of decoded bodies, and
-drawing past that folds the oldest bodies as a load would. All are vendored
+so does what it puts on the page, 40 bytes for each tag it draws: a window
+holds about 200,000 drawn tags however its messages split them, so many
+replies each within their own bounds never add up to more. Drawing past that
+folds the oldest bodies as a load would. All are vendored
 under `app/ui/vendor` (versions
 and licenses in `LICENSES.txt`), so drawing a message fetches nothing.
 

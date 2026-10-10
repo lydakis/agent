@@ -414,6 +414,22 @@ test('drawing messages past the byte bound folds the oldest instead of keeping t
   assert.match(el.innerHTML, /earlier history/);
 });
 
+test('what drawn messages put on the page counts toward the window\'s bound across messages', () => {
+  const p = page(), t = p.transcript('Bob'), el = p.context.document.getElementById('log');
+  const DECODE_BYTES = 8 * 1024 * 1024, list = '- x\n'.repeat(49999);
+  // Five replies, each within its own bounds, with a tool call between them.
+  t.items = Array.from({ length: 5 }, (_, i) => p.entries({ role: 'assistant', content: [{ type: 'text', text: list }, { type: 'tool_use', id: `c${i}`, name: 'read', input: {} }] })
+    .map((e) => ({ ...e, turn: i, from: i, bytes: (e.text ?? '').length * 2 }))).flat();
+  t.bytes = t.items.reduce((n, it) => n + it.bytes, 0);
+  assert.ok(t.bytes < DECODE_BYTES);
+  el.lastElementChild = p.context.document.createElement('div');
+  p.renderTranscript(el, 'Bob');
+  const items = (el.innerHTML.match(/<li>/g) ?? []).length;
+  assert.ok(items > 0 && items <= 100000, `${items} list items drawn`);
+  assert.ok(t.bytes <= DECODE_BYTES, `${t.bytes} bytes kept`);
+  assert.match(el.innerHTML, /earlier history/);
+});
+
 test('an item added to a drawn pane hydrates only what was added', () => {
   const p = page(), c = p.context, t = p.transcript('Bob'), el = c.document.getElementById('log'), R = c.Rich, seen = [];
   c.Rich = { html: R.html, get version() { return R.version; }, get waited() { return R.waited; }, hydrate: (n) => { seen.push(n); } };
