@@ -1740,12 +1740,14 @@ fn settle(
 /// The one way a trigger goes, by `rm` or by its own end, under the lock:
 /// its files first, then launchd's job, whose unload ends a fire that ends
 /// its own trigger, so nothing can be left to do after it. `keep` leaves its
-/// last result, so an end nobody asked for still shows, and why. A job
-/// launchd will not unload gets its files back, so it stays listed for `rm`:
-/// with its plist gone it would load again at the next login. Whether any of
-/// it was there. A folder that ignores case finds `build`'s files for
-/// `Build`, whose label launchd does not have: only the name as stored is
-/// that trigger, and launchd's labels keep their case.
+/// last result, so an end nobody asked for still shows, and why. Its files
+/// are set aside by rename, whatever their size or contents, and deleted
+/// once launchd has let the job go; a job launchd will not unload gets them
+/// back, so it stays listed for `rm`: with its plist gone it would load
+/// again at the next login. Whether any of it was there. A folder that
+/// ignores case finds `build`'s files for `Build`, whose label launchd does
+/// not have: only the name as stored is that trigger, and launchd's labels
+/// keep their case.
 fn retire(places: &Places, name: &str, keep: bool, launchd: Loader) -> Result<bool, String> {
     let stored = |dir: &Path, file: &Path| {
         let want = file.file_name();
@@ -1754,59 +1756,53 @@ fn retire(places: &Places, name: &str, keep: bool, launchd: Loader) -> Result<bo
             .flatten()
             .flatten()
             .any(|e| Some(e.file_name().as_os_str()) == want)
-            .then(|| std::fs::read(file).ok())
     };
     let plist = places.plist(name);
-    let last = places.last(name);
     // Where the watcher was in its agent's events: a turn-end trigger's,
     // also when its plist cannot be read.
     let cursor = places.watched(name);
-    let followed = stored(&places.state, &cursor);
-    let watched =
-        followed.is_some() || read_trigger(&plist).is_ok_and(|(t, _)| t.turn_end.is_some());
-    let mut gone = vec![(plist.clone(), stored(&places.agents, &plist))];
+    let watched = stored(&places.state, &cursor)
+        || read_trigger(&plist).is_ok_and(|(t, _)| t.turn_end.is_some());
+    let mut files = vec![plist, cursor];
     if !keep {
-        gone.push((last.clone(), stored(&places.state, &last)));
+        files.push(places.last(name));
     }
-    gone.push((cursor.clone(), followed));
-    // As bytes: a file that is not text comes back as it was.
-    let restore = |gone: &[(PathBuf, Option<Option<Vec<u8>>>)]| {
-        for (path, text) in gone {
-            if let Some(Some(text)) = text
-                && let Err(error) = replace_mode(path, text, 0o644)
-            {
+    let mut aside: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let back = |aside: &[(PathBuf, PathBuf)]| {
+        for (path, by) in aside {
+            if let Err(error) = renamed(by, path) {
                 eprintln!("{}", error_json(&error));
             }
         }
     };
-    // A file there that cannot be read could not come back: it stays, and
-    // so does the trigger.
-    if let Some((path, _)) = gone.iter().find(|(_, text)| matches!(text, Some(None))) {
-        return Err(format!("{}: unreadable, so it is left", path.display()));
-    }
-    for (i, (path, text)) in gone.iter().enumerate() {
-        // One whose removal could not be made durable may be gone anyway:
-        // it comes back with the rest.
-        if text.is_some()
-            && let Err(error) = forget(path)
-        {
-            restore(&gone[..=i]);
+    for path in files {
+        let dir = path.parent().ok_or("no folder")?;
+        if !stored(dir, &path) {
+            continue;
+        }
+        let by = dir.join(format!(
+            ".{}.retiring",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        if let Err(error) = renamed(&path, &by) {
+            back(&aside);
             return Err(error);
         }
+        aside.push((path, by));
     }
-    let here = gone.iter().any(|(_, text)| text.is_some());
+    let here = !aside.is_empty();
     // Its asks wait aside until launchd lets the job go: they come back with
     // the rest when it does not, and are for nothing once it does.
-    let aside = places.state.join(format!(".{name}.gone"));
-    let _ = std::fs::remove_dir_all(&aside);
-    let _ = std::fs::create_dir_all(&aside);
-    let mut set_aside = Vec::new();
+    let held = places.state.join(format!(".{name}.gone"));
+    let _ = std::fs::remove_dir_all(&held);
+    let _ = std::fs::create_dir_all(&held);
+    let mut queues = Vec::new();
     for queue in [places.asks(name), places.taking(name)] {
-        let Some(to) = queue.file_name().map(|file| aside.join(file)) else {
+        let Some(to) = queue.file_name().map(|file| held.join(file)) else {
             continue;
         };
         match std::fs::rename(&queue, &to) {
-            Ok(()) => set_aside.push((queue, to)),
+            Ok(()) => queues.push((queue, to)),
             Err(_) => {
                 let _ = std::fs::remove_dir_all(&queue);
             }
@@ -1816,14 +1812,19 @@ fn retire(places: &Places, name: &str, keep: bool, launchd: Loader) -> Result<bo
         Ok(()) => Ok(true),
         Err(error) if error.starts_with(NOT_LOADED) => Ok(here),
         Err(error) => {
-            restore(&gone);
-            for (queue, to) in &set_aside {
+            back(&aside);
+            for (queue, to) in &queues {
                 let _ = std::fs::rename(to, queue);
             }
             return Err(error);
         }
     };
-    let _ = std::fs::remove_dir_all(&aside);
+    for (_, by) in &aside {
+        if let Err(error) = forget(by) {
+            eprintln!("{}", error_json(&error));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&held);
     // Then the watcher reads the turn-end triggers left, or goes with the
     // last: last, since the watcher may be what is retiring this one, and
     // its restart ends it.
@@ -1831,6 +1832,16 @@ fn retire(places: &Places, name: &str, keep: bool, launchd: Loader) -> Result<bo
         eprintln!("{}", error_json(&error));
     }
     unloaded
+}
+
+/// Rename a file, durably: its folder is synced after.
+fn renamed(from: &Path, to: &Path) -> Result<(), String> {
+    std::fs::rename(from, to)
+        .and_then(|()| match to.parent() {
+            Some(dir) => std::fs::File::open(dir).and_then(|d| d.sync_all()),
+            None => Ok(()),
+        })
+        .map_err(|e| format!("{}: {e}", from.display()))
 }
 
 /// The app moves when it is updated, so it writes its path into every
@@ -1981,12 +1992,15 @@ pub fn migrate(places: &Places, running: Option<&str>, launchd: Loader) -> bool 
             continue;
         }
         converted_running |= !resumed && Some(name.as_str()) == running;
+        // The old schedule goes only with its result moved, so a move that
+        // fails is tried again by the next migration, which resumes here.
         let result = old_state.join(format!("{name}.json"));
         if result.exists()
             && !places.last(&name).exists()
             && let Err(e) = std::fs::rename(&result, places.last(&name))
         {
             log(format!("{}: {e}", result.display()));
+            continue;
         }
         done.push((name, old));
     }
@@ -3969,13 +3983,21 @@ mod tests {
         assert_eq!(w.state(&one.name), (false, false, true));
         assert_eq!(w.rows()[0]["last"]["turn"], 4);
         w.remove(&one.name).unwrap();
-        // A plist that will not go keeps its job loaded and its result.
+        // A result that cannot be set aside keeps its job loaded, its plist
+        // and itself.
         let stuck = w.places.plist("p.stuck");
-        std::fs::create_dir_all(stuck.join("x")).unwrap();
+        std::fs::write(&stuck, "plist").unwrap();
+        std::fs::write(w.places.last("p.stuck"), "{}").unwrap();
+        let blocked = w.places.state.join(".p.stuck.json.retiring");
+        std::fs::create_dir_all(blocked.join("x")).unwrap();
         w.fake.loaded.borrow_mut().insert(format!("{LABEL}p.stuck"));
         assert!(retire(&w.places, "p.stuck", false, &|x| w.fake.call(x)).is_err());
         assert!(w.fake.loaded.borrow().contains(&format!("{LABEL}p.stuck")));
-        std::fs::remove_dir_all(&stuck).unwrap();
+        assert_eq!(std::fs::read_to_string(&stuck).unwrap(), "plist");
+        assert!(w.places.last("p.stuck").exists());
+        std::fs::remove_dir_all(&blocked).unwrap();
+        std::fs::remove_file(&stuck).unwrap();
+        std::fs::remove_file(w.places.last("p.stuck")).unwrap();
         // A repeating one ends only when its agent is gone, keeping why.
         let s = trigger();
         w.install(&s).unwrap();
@@ -4733,6 +4755,16 @@ mod tests {
         assert!(w.remove(&s.name).is_err());
         assert_eq!(std::fs::read(w.places.last(&s.name)).unwrap(), odd);
         assert_eq!(w.state(&s.name), (true, true, true));
+        // Once launchd lets it go, nothing is left aside.
+        w.fake.refuse_unload.set(false);
+        w.remove(&s.name).unwrap();
+        let left = |dir: &Path| {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().ends_with(".retiring"))
+        };
+        assert!(!left(&w.places.agents) && !left(&w.places.state));
     }
 
     #[test]
