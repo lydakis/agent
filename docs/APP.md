@@ -1421,8 +1421,8 @@ app's own task updates and triggers by origin), and runs
 folded with failures on their line. Also covers coordinator task updates: batched at rest, excluding requested and replayed turns, retained after send failures.
 `cargo test -p agent-app` includes a failed project-file write leaving
 neither a partial file nor a temporary, and triggers' calendars, plists,
-watched paths, idempotent `add`, `fire`, the commit check, move, the
-conversion of earlier schedules, and each lifecycle step with launchd refusing. With `AGENT_TEST_RUNTIME=1` after a release build
+watched paths, idempotent `add`, `fire`, the commit check, move, and each
+lifecycle step with launchd refusing. With `AGENT_TEST_RUNTIME=1` after a release build
 and `cargo build -p agent-app`, `python3 -m unittest tests.test_trigger`
 fires triggers against a real daemon; on a Mac, `AGENT_TEST_LAUNCHD=1`
 adds its one launchd test, which loads real jobs (under a scratch `HOME`, so
