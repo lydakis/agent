@@ -49,8 +49,8 @@ enum Step {
     Fire(usize, String),
     /// Its agent is gone: it ends.
     Gone(usize, String),
-    /// Retention removed events it had not read: turn ends went uncounted,
-    /// which its last result says.
+    /// Retention removed events it would read: its last result says so,
+    /// and it goes on past them.
     Gap(usize, String),
 }
 
@@ -97,13 +97,21 @@ fn step(watched: &mut [Watched], sent: &mut Sent, event: &Value) -> Vec<Step> {
                 }
             }
         }
+        // Gone from where it reads again from: turn ends it had not
+        // counted, or the start of a turn a trigger sent that has not ended.
+        // What is gone is passed over, so it is said once.
         "pruned" => {
             let before = event["before"].as_i64().unwrap_or(0);
-            for (i, w) in watched.iter().enumerate() {
-                if !w.done && w.source() == bot && w.cursor.is_none_or(|c| c < before) {
-                    steps.push(Step::Gap(i, format!(
-                        "events_pruned: turn ends of {bot} before event {before} were removed before they were read, and not counted"
-                    )));
+            let why = format!(
+                "events_pruned: events of {bot} through {before} were removed before they were \
+                 read: turn ends among them went uncounted, and one of a turn this trigger sent \
+                 there may count"
+            );
+            for (i, w) in watched.iter_mut().enumerate() {
+                let from = w.from.or(w.cursor);
+                if !w.done && w.source() == bot && from.is_none_or(|c| c < before) {
+                    w.cursor = w.cursor.max(Some(before));
+                    steps.push(Step::Gap(i, why.clone()));
                 }
             }
         }
@@ -369,26 +377,32 @@ async fn begin(
 }
 
 /// Do one step; false when an ask could not be made, a place saved, or an
-/// end recorded, so the watcher reads those events again from where it last
-/// saved.
+/// end or gap recorded, so the watcher reads those events again from where
+/// it last saved.
 fn act(places: &Places, watched: &mut [Watched], sent: &Sent, step: Step) -> bool {
     let log = |error: String| {
         eprintln!("{}", error_json(&error));
         false
-    };
-    let record = |w: &Watched, outcome: Value| {
-        let kept = Kept::of(&state(places, &w.trigger));
-        settle(places, &w.trigger, &outcome, &kept, &launchctl)
     };
     match step {
         Step::Save(i) => save(places, &mut watched[i], sent).map_or_else(log, |()| true),
         // Done once its end is on disk and the trigger gone.
         Step::Gone(i, detail) => {
             let w = &mut watched[i];
-            w.done = record(w, json!({"outcome": "gone", "detail": detail}));
+            let gone = json!({"outcome": "gone", "detail": detail});
+            let kept = Kept::of(&state(places, &w.trigger));
+            w.done = settle(places, &w.trigger, &gone, &kept, &launchctl);
             w.done
         }
-        Step::Gap(i, detail) => record(&watched[i], json!({"outcome": "failed", "detail": detail})),
+        // A gap ends nothing: the trigger goes on from past it.
+        Step::Gap(i, detail) => {
+            let w = &mut watched[i];
+            let said = gap(places, w, &detail).and_then(|()| match w.done {
+                false => save(places, w, sent),
+                true => Ok(()),
+            });
+            said.map_or_else(log, |()| true)
+        }
         Step::Fire(i, why) => {
             let w = &mut watched[i];
             // Where it is goes on disk only once the ask is: a watcher
@@ -413,6 +427,24 @@ fn ask_fire(places: &Places, w: &mut Watched, why: &str) -> Result<(), String> {
         return Ok(());
     }
     ask_turn(places, &w.trigger.name, w.cursor.unwrap_or(0), why)
+}
+
+/// Say in the trigger's last result that events it would read are gone,
+/// keeping the rest of what its fires left (a message one began), under the
+/// lock and only while its plist is still this trigger's.
+fn gap(places: &Places, w: &mut Watched, detail: &str) -> Result<(), String> {
+    let _lock = Lock::take(places)?;
+    if !ours(places, &w.trigger) {
+        w.done = true;
+        return Ok(());
+    }
+    let failed = json!({"outcome": "failed", "detail": detail});
+    record_last(
+        places,
+        &w.trigger,
+        &failed,
+        &Kept::of(&state(places, &w.trigger)),
+    )
 }
 
 /// Keep where it is, and where to read again from: before the first event
@@ -462,8 +494,9 @@ pub(super) fn save_watched(places: &Places, trigger: &Trigger, place: Place) -> 
 }
 
 /// Where the watcher is for this trigger; none for a trigger it has not
-/// started on, or an earlier one's of the same name. One it cannot read is
-/// an error: starting over would skip every turn end since.
+/// started on, or an earlier one's of the same name. One it cannot read,
+/// whole and as `save` writes it, is an error: starting over would skip
+/// every turn end since.
 pub(super) fn read_watched(places: &Places, trigger: &Trigger) -> Result<Option<Place>, String> {
     let path = places.watched(&trigger.name);
     if let Err(e) = std::fs::symlink_metadata(&path)
@@ -475,15 +508,21 @@ pub(super) fn read_watched(places: &Places, trigger: &Trigger) -> Result<Option<
         read_record(&path).map_err(|e| format!("watch_unreadable: {}: {e}", path.display()))?;
     let unreadable = || format!("watch_unreadable: {}: not a watcher place", path.display());
     let kept: Value = serde_json::from_str(&text).map_err(|_| unreadable())?;
-    if kept["generation"] != trigger.generation {
+    if kept["generation"].as_str().ok_or_else(unreadable)? != trigger.generation {
         return Ok(None);
     }
-    let cursor = kept["cursor"].as_i64().ok_or_else(unreadable)?;
-    Ok(Some(Place {
-        cursor,
-        count: kept["count"].as_u64().unwrap_or(0),
-        from: kept["from"].as_i64().unwrap_or(cursor).min(cursor),
-    }))
+    match (
+        kept["cursor"].as_i64(),
+        kept["count"].as_u64(),
+        kept["from"].as_i64(),
+    ) {
+        (Some(cursor), Some(count), Some(from)) if from <= cursor => Ok(Some(Place {
+            cursor,
+            count,
+            from,
+        })),
+        _ => Err(unreadable()),
+    }
 }
 
 /// An agent's newest event cursor. Its events after a cursor are none from
@@ -762,13 +801,136 @@ mod tests {
             // `before` is the last event removed: one short of it missed it.
             watched("v", "p.task", None, 29),
             watched("x", "p.task", None, 30),
+            // Read again from before a turn it sent: that turn's start is gone.
+            watched("y", "p.task", None, 40),
+            watched("z", "p.task", None, 40),
         ];
+        (w[4].from, w[5].from) = (Some(20), Some(30));
         let mut sent = Sent::new();
         let pruned = json!({"bot": "p.task", "event": "pruned", "before": 30, "durable": false});
         let steps = step(&mut w, &mut sent, &pruned);
-        assert!(
-            matches!(&steps[..], [Step::Gap(0, why), Step::Gap(2, _)] if why.starts_with("events_pruned:"))
+        assert!(matches!(
+            &steps[..],
+            [Step::Gap(0, why), Step::Gap(2, _), Step::Gap(4, _)] if why.starts_with("events_pruned:")
+        ));
+        // What is gone is passed over, never counted after.
+        let cursors: Vec<_> = w.iter().map(|w| w.cursor).collect();
+        assert_eq!(
+            cursors,
+            [30, 40, 30, 30, 40, 40].map(Some),
+            "cursors past what is gone"
         );
+    }
+
+    #[test]
+    fn a_gap_is_said_once_keeping_a_message_begun_and_its_trigger_goes_on() {
+        let root = std::env::temp_dir().join(format!("agent-watch-gap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let places = Places {
+            agents: root.join("LaunchAgents"),
+            state: root.join("triggers"),
+        };
+        std::fs::create_dir_all(&places.agents).unwrap();
+        let mut w = vec![watched("t", "p.task", None, 10)];
+        let when = every("30m", 0).unwrap();
+        let text = super::super::plist(
+            Path::new("/A/agent-app"),
+            &w[0].trigger,
+            &when,
+            &places.asks("t"),
+            &[],
+        );
+        std::fs::write(places.plist("t"), text).unwrap();
+        // A fire cut short with its message begun.
+        let sending = json!({"bot": "p.lead", "request_id": "trigger_g_1"});
+        keep(&places, &w[0].trigger, |k| k.sending = sending.clone()).unwrap();
+        let mut sent = Sent::new();
+        let pruned = |before: i64| json!({"bot": "p.task", "event": "pruned", "before": before});
+        let steps = step(&mut w, &mut sent, &pruned(30));
+        let [gap] = &steps[..] else {
+            panic!("{steps:?}")
+        };
+        let Step::Gap(0, why) = gap else {
+            panic!("{gap:?}")
+        };
+        assert!(act(&places, &mut w, &sent, Step::Gap(0, why.clone())));
+        // It says so and goes on, from past what is gone, the message
+        // begun still there to finish.
+        let kept = state(&places, &w[0].trigger);
+        assert_eq!(
+            (&kept["last"]["outcome"], &kept["last"]["detail"]),
+            (&json!("failed"), &json!(why))
+        );
+        assert_eq!(kept["sending"], sending);
+        assert!(!w[0].done);
+        assert_eq!(
+            read_watched(&places, &w[0].trigger),
+            Ok(Some(Place {
+                cursor: 30,
+                count: 0,
+                from: 30
+            }))
+        );
+        // Read again from there, the same gap is not said again; turn ends
+        // after it count.
+        assert_eq!(step(&mut w, &mut sent, &pruned(30)), vec![]);
+        assert!(matches!(
+            step(&mut w, &mut sent, &ended("p.task", 9, 31))[..],
+            [Step::Fire(0, _)]
+        ));
+        // Its trigger gone: done, with nothing said.
+        std::fs::remove_file(places.plist("t")).unwrap();
+        assert!(act(&places, &mut w, &sent, Step::Gap(0, "x".into())));
+        assert!(w[0].done);
+        assert_eq!(state(&places, &w[0].trigger)["last"]["detail"], json!(why));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_place_is_read_whole_or_not_at_all() {
+        let root = std::env::temp_dir().join(format!("agent-watch-place-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let places = Places {
+            agents: root.join("LaunchAgents"),
+            state: root.join("triggers"),
+        };
+        std::fs::create_dir_all(&places.state).unwrap();
+        let w = watched("t", "p.task", None, 0);
+        let read = |text: &str| {
+            std::fs::write(places.watched("t"), text).unwrap();
+            read_watched(&places, &w.trigger)
+        };
+        assert_eq!(
+            read(r#"{"generation": "g", "cursor": 9, "count": 1, "from": 4}"#),
+            Ok(Some(Place {
+                cursor: 9,
+                count: 1,
+                from: 4
+            }))
+        );
+        // An earlier trigger's of the same name is none.
+        assert_eq!(
+            read(r#"{"generation": "f", "cursor": 9, "count": 1, "from": 4}"#),
+            Ok(None)
+        );
+        // Any part missing, of another kind, or a place it never writes.
+        for text in [
+            r#"{"cursor": 9, "count": 1, "from": 4}"#,
+            r#"{"generation": 1, "cursor": 9, "count": 1, "from": 4}"#,
+            r#"{"generation": "g", "count": 1, "from": 4}"#,
+            r#"{"generation": "g", "cursor": 9, "from": 4}"#,
+            r#"{"generation": "g", "cursor": 9, "count": -1, "from": 4}"#,
+            r#"{"generation": "g", "cursor": 9, "count": 1}"#,
+            r#"{"generation": "g", "cursor": 9, "count": 1, "from": "4"}"#,
+            r#"{"generation": "g", "cursor": 9, "count": 1, "from": 10}"#,
+            "[]",
+        ] {
+            assert!(
+                read(text).is_err_and(|e| e.starts_with("watch_unreadable")),
+                "{text}"
+            );
+        }
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

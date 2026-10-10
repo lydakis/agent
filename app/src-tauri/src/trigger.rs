@@ -1498,6 +1498,10 @@ impl Ask {
             Ask::Turn(_) => TURN,
         }
     }
+    /// Whether it asks for a message whatever the time or path says.
+    fn sends(self) -> bool {
+        matches!(self, Ask::Fire | Ask::Turn(_))
+    }
     fn of(file: &str) -> Self {
         match file.strip_prefix(TURN).map(str::parse) {
             Some(Ok(cursor)) => Ask::Turn(cursor),
@@ -3076,7 +3080,8 @@ fn fire(places: &Places, trigger: &Trigger, asked: Option<&Asked>) -> bool {
     }
     // A message a fire began and did not settle (the Mac restarted while it
     // waited for the answer): this one finishes it first, as the same
-    // request, and sends anything new only when asked to.
+    // request, and sends anything new only for an ask that sends (`fire
+    // NAME`, a turn end).
     let kept = Kept::of(&state(places, trigger));
     if !kept.sending.is_null() {
         let sending = kept.sending.clone();
@@ -3094,7 +3099,7 @@ fn fire(places: &Places, trigger: &Trigger, asked: Option<&Asked>) -> bool {
         }
         // The message it finished was this ask's own.
         let its_own = asked.is_some_and(|a| kept.ask == Some(a.name()));
-        if ask != Some(Ask::Fire)
+        if !ask.is_some_and(Ask::sends)
             || its_own
             || !Lock::take(places).is_ok_and(|_lock| ours(places, trigger))
         {
@@ -3110,7 +3115,7 @@ fn fire(places: &Places, trigger: &Trigger, asked: Option<&Asked>) -> bool {
 
 /// A fire's own message, when it is time or was asked for.
 fn send(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
-    let asked = ask.is_some_and(|a| matches!(a.kind, Ask::Fire | Ask::Turn(_)));
+    let asked = ask.is_some_and(|a| a.kind.sends());
     let now = now();
     let durable = state(places, trigger);
     let mut kept = Kept::of(&durable);

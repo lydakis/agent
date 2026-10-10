@@ -1108,8 +1108,8 @@ it unknown whether the message went: the fire is shown failed and the
 message stays begun, for the next fire to send as the same request. The app's start asks a trigger with a message begun
 for a fire that only finishes it (a `finish.` ask), so a one-off or a
 trigger whose next time is far off does not wait; a fire of it still
-running settles it first. Only an ask sends anything new after finishing
-one. An answer the daemon cut short is
+running settles it first. Only a `fire NAME` or turn-end ask sends
+anything new after finishing one. An answer the daemon cut short is
 marked so in its first line; a turn that ended saying nothing passes on an
 empty answer. One that does not get through keeps an ended trigger listed,
 saying so, and one whose BOT is gone (`bot_not_found`: pinned by id, it
@@ -1202,9 +1202,11 @@ written only when that agent ends a turn, and for one that fires only once
 its ask is on disk: a restart replays from there, so no turn end is missed.
 Like every trigger write it is under the lock, and only while the plist is
 still that trigger's, so none is left behind by a trigger that went.
-A place it cannot read (malformed, or not readable) is not a fresh start,
-which would skip every turn end since: the trigger ends, saying so
-(`watch_unreadable`). A place it has never had, or an earlier trigger's of
+A place it cannot read whole (not readable, not JSON, its `generation`,
+`cursor`, `count` or `from` missing or of another kind, or `from` past
+`cursor`) is
+not a fresh start, which would skip every turn end since: the trigger ends,
+saying so (`watch_unreadable`). A place it has never had, or an earlier trigger's of
 the same name, starts at the agent's newest event.
 A turn end that counts is an ask in the trigger's queue saying why (`turn
 end of BOT: turn:BOT/N completed`), under the lock `rm` takes and only
@@ -1231,9 +1233,13 @@ its own end (its runs, its agent gone), unloads its own job first and
 then restarts the watcher, which reads the ones left, or unloads it with
 the last; one whose plist cannot be read but whose place is kept does the
 same. A new watcher plist (the app moved) that will not load gives way to
-the old one, loaded again. Events retention removed before the watcher read them are
-turn ends not counted; the trigger's last result says so
-(`events_pruned`). A turn a trigger sent says so in its `request_id`
+the old one, loaded again. Events retention removed that a trigger would
+read again (any after its `from`, where it replays from, not only after its
+`cursor`) are turn ends not counted, or the start of a turn it sent, whose
+end may then count; the
+trigger's last result says so (`events_pruned`), under the lock and keeping
+a message a fire began, and its place moves past them, so it is said once.
+A gap ends nothing: the trigger goes on watching. A turn a trigger sent says so in its `request_id`
 (`trigger_GENERATION_...`, a name's characters, so the generation and not
 the trigger's name), which is how the watcher tells its own turns apart.
 An agent deleted (the `deleted` event, or found gone on connecting), or its

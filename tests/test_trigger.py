@@ -346,6 +346,33 @@ class TriggerFireTests(ModelFixture):
             self.assertEqual(self.turns('p.task')[-1]['request_id'], sending['request_id'])
             self.settle('p.task')
 
+    def test_a_turn_end_asked_while_a_message_is_begun_is_sent_after_it(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        task, lead = self.bot_id('p.task'), self.bot_id('p.lead')
+        target = ['--bot', 'p.lead', '--bot-id', str(lead)]
+        extra = ['--turn-end', 'p.task', '--turn-end-id', str(task)]
+        # A fire cut short with its message for one turn end begun, and the
+        # watcher's ask for the next turn end in the queue.
+        triggers = self.home / '.agent/triggers'
+        (triggers / 'ends.asks').mkdir(parents=True)
+        sending = {'bot': 'p.lead', 'bot_id': lead, 'request_id': 'trigger_g_cut',
+                   'prompt': '[trigger ends · 2026-10-10 00:00 · first]\nReview.', 'delivery': 'queue',
+                   'started': False}
+        (triggers / 'ends.json').write_text(json.dumps(
+            {'generation': 'g', 'sent': 0, 'sending': sending, 'turn': 3, 'ask': f'turn.{3:020}'}))
+        why = 'turn end of p.task: turn:p.task/2 completed'
+        (triggers / f'ends.asks/turn.{5:020}').write_text(why)
+        kept = self.fire('ends', 'Review.', target=target, when='turn end of p.task', extra=extra, generation='g')
+        # It finishes that message, then sends the one asked for.
+        self.assertEqual((kept['sent'], kept['turn']), (2, 5), kept)
+        self.assertNotIn('sending', kept)
+        self.assertEqual(list((triggers / 'ends.asks').iterdir()), [])
+        self.settle('p.lead')
+        turns = self.turns('p.lead')
+        self.assertEqual(turns[1]['request_id'], 'trigger_g_cut')
+        self.assertRegex(turns[2]['prompt_preview'], '^' + LINE.format('ends', re.escape(why)) + 'Review.$')
+
     def test_an_answer_goes_to_the_reply_agent(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
