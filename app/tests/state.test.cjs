@@ -36,7 +36,7 @@ function page(daemon = {}, storage = null) {
   context.Rich = context.window.Rich;
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, openFileFrom, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, fork, remove, createProject, save, restore, showMenu, refreshMenu, entries, pickerRows, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally, forgetBot, setupState, readTriggers, tellLead, markSeen, renderFile, go, upOf, crumbsHTML, railRows, renderTabs, triggerAct, turnNews, openProjectSheet };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, joinPath, textHTML, waitsForHighlight, openFile, openFileFrom, dropFile, releaseDrawn, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, renderTranscript, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, setEffort, fork, remove, createProject, save, restore, showMenu, refreshMenu, entries, pickerRows, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, renderSetup, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, forgetBot, setupState, readTriggers, tellLead, markSeen, renderFile, go, upOf, crumbsHTML, railRows, renderTabs, triggerAct, turnNews, openProjectSheet };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -1986,20 +1986,18 @@ test('a swarm is one row in its project\'s list; its agents and what they made s
   assert.ok(!(p.botMenuItems('app.build-x') ?? []).some((i) => i.act === 'new-swarm'));
 });
 
-test('a new swarm is one call: its agents are dealt from the mix, and the page seats them and opens it', async () => {
+test('a new swarm is one call: the script deals its agents from the mix, and the page opens it', async () => {
   const calls = [];
   const p = shell({
-    swarmStart: async (q) => { calls.push(q); const members = Array.from({ length: q.agents }, (_, i) => `${q.project}.latency-2-${i + 1}`); return { swarm: swarmRecord(members, { swarm: `${q.project}.latency-2`, mix: q.mix }), bots: members.map((m, i) => ({ name: m, id: 10 + i, provider: 'alpha', model: 'one' })), failed: [{ agent: members[2], error: 'provider_unknown' }] }; },
+    swarmStart: async (q) => { calls.push(q); const members = Array.from({ length: q.agents }, (_, i) => `${q.project}.latency-2-${i + 1}`); return { swarm: swarmRecord(members, { swarm: `${q.project}.latency-2`, mix: q.mix }), bots: members, failed: [{ agent: members[2], error: 'provider_unknown' }] }; },
     swarmBoard: async () => ({ lines: [], offset: 0, more: false }),
     request: async () => ({ bots: [], next_after: null, nodes: [], workspaces:[],next_from: null }),
   });
   p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', workspace: '/synthetic/app' });
-  p.upsert({ name: 'app.latency-9', id: 2, provider: 'alpha', model: 'one' });
   const mix = [{ identity: '', model: 'alpha/one', share: 75 }, { identity: 'reviewer', model: 'beta/two', share: 25 }];
-  await p.createSwarm('app', { goal: '  Cut the p99 latency of agent run in half.  ', n: 4, mix, shared: true, budget: 3000000, council: 3 });
-  // The app's side names it and deals the agents; the page seats what it made.
-  assert.deepEqual(JSON.parse(JSON.stringify(calls)), [{ project: 'app', folder: '/synthetic/app', goal: 'Cut the p99 latency of agent run in half.', shared: true, mix, agents: 4, budgetTokens: 3000000, council: 3 }]);
-  assert.equal(p.S.bots.get('app.latency-2-2').id, 11);
+  await p.createSwarm('app', { goal: '  Cut the p99 latency of agent run in half.  ', n: 4, mix, shared: true, budget: 3000000 });
+  assert.deepEqual(JSON.parse(JSON.stringify(calls)), [{ project: 'app', folder: '/synthetic/app', goal: 'Cut the p99 latency of agent run in half.', shared: true, mix, agents: 4, budgetTokens: 3000000 }]);
+  assert.equal(p.S.memberOf.get('app.latency-2-2'), 'app.latency-2');
   assert.equal(p.S.selected, '⁂app.latency-2');
 });
 
@@ -2061,51 +2059,35 @@ test('the sheet offers the folder\'s profiles as identities and shows each row\'
   assert.match(el('sw-mix').innerHTML, /value="90"[\s\S]*The shares add up to 90%, not 100%/);
 });
 
-test('the board shows roles, proposals, votes and decisions, and a stream tag filters it', async () => {
-  const decided = [];
-  const state = { roles: { 'latency-1': 'profiler' }, streams: { 'latency-4': 'conn-pool', 'latency-2': 'conn-pool' }, proposals: [
-    { id: 'P1', stream: 'conn-pool', why: 'Handshake is 61%.', by: 'latency-4', at: 1, votes: { 'latency-1': { yes: true, reason: 'measured' }, 'latency-2': { yes: true, reason: 'small' } }, status: 'approved', decided_by: 'council' },
-    { id: 'P2', stream: 'batch-commits', why: 'Commits are 22%.', by: 'latency-3', at: 2, votes: { 'latency-1': { yes: false, reason: 'pool first' } }, status: 'open', decided_by: null }] };
+test('the board shows roles and the work\'s steps, a task tag filters it, and Work shows each task and the result', async () => {
+  const state = { roles: { 'latency-1': 'profiler' }, streams: { 'latency-2': 'conn-pool' }, tasks: {
+    'conn-pool': { owner: 'latency-2', reviewer: 'latency-3', brief: 'Pool connections.', status: 'submitted', result: 'p99 142 → 71 ms.' } },
+    result: { outcome: 'partial', summary: 'Pooled; commits not batched.' } };
   const lines = [
     { from: 'latency-1', bot: 'app.latency-1', kind: 'role', role: 'profiler' },
-    { from: 'latency-4', bot: 'app.latency-4', kind: 'propose', id: 'P1', stream: 'conn-pool', text: 'Handshake is 61%.' },
-    { from: 'latency-1', bot: 'app.latency-1', kind: 'vote', id: 'P1', yes: true, text: 'measured' },
-    { from: 'council', kind: 'decision', id: 'P1', stream: 'conn-pool', approved: true, lead: 'latency-4' },
-    { from: 'latency-2', bot: 'app.latency-2', kind: 'join', stream: 'conn-pool' },
+    { from: 'latency-1', bot: 'app.latency-1', kind: 'assign', stream: 'conn-pool', text: 'latency-2 owns it, latency-3 reviews: Pool connections.' },
+    { from: 'latency-2', bot: 'app.latency-2', kind: 'claim', stream: 'conn-pool', text: 'claimed' },
     { from: 'latency-2', bot: 'app.latency-2', text: 'Pooled: p99 142 → 71 ms.', stream: 'conn-pool' },
-    { from: 'latency-3', bot: 'app.latency-3', text: 'Store tests pass.' }];
-  const p = shell({ swarmBoard: async () => ({ lines, offset: 99, more: false, state }), swarmDecide: async (swarm, id, approve) => { decided.push([swarm, id, approve]); return { decided: approve ? 'approved' : 'denied' }; }, request: async () => ({ bots: [], next_after: null }) });
-  const sw = p.learnSwarm(swarmRecord(['app.latency-1', 'app.latency-2', 'app.latency-3', 'app.latency-4'], { council: 3, seats: ['app.latency-1', 'app.latency-2', 'app.latency-3'] }));
+    { from: 'latency-3', bot: 'app.latency-3', text: 'Store tests pass.' },
+    { from: 'swarm', kind: 'quiet', outcome: 'partial', text: 'nothing is running and there is no final result (partial)' }];
+  const p = shell({ swarmBoard: async () => ({ lines, offset: 99, more: false, state }), request: async () => ({ bots: [], next_after: null }) });
+  const sw = p.learnSwarm(swarmRecord(['app.latency-1', 'app.latency-2', 'app.latency-3']));
   await p.readBoard(sw);
-  assert.equal(sw.state.proposals.length, 2);
   const html = sw.lines.map((l) => p.postHTML(sw, l)).join('\n');
   assert.match(html, /latency-1<\/button><span class="pt">is now <i>profiler<\/i>/);
-  assert.match(html, /proposes <b>P1<\/b> <button type="button" class="tag" data-act="swarm-filter" data-v="conn-pool">#conn-pool<\/button>: Handshake is 61%\. <span class="tally">approved<\/span>/);
-  assert.match(html, /votes <b>yes<\/b> on P1: measured/);
-  assert.match(html, /<span class="who council">council<\/span><span class="pt">P1 <button[^>]*>#conn-pool<\/button> approved · latency-4 leads it/);
-  assert.match(html, /joined <button[^>]*>#conn-pool/);
+  assert.match(html, /<span class="pt"><button type="button" class="tag" data-act="swarm-filter" data-v="conn-pool">#conn-pool<\/button> latency-2 owns it/);
+  assert.match(html, /<span class="who council">swarm<\/span><span class="pt">nothing is running/);
   p.S.selected = '⁂app.latency';
   const log = { dataset: {}, innerHTML: '', scrollHeight: 0, scrollTop: 0, clientHeight: 0, querySelectorAll: () => [] }, title = { dataset: {}, innerHTML: '' };
   const act = async (v) => { await p.act({ dataset: v }); p.renderSwarmHead(title, sw); p.renderSwarm(log, sw); };
   await act({ act: 'swarm-filter', v: 'conn-pool' });
   assert.match(log.innerHTML, /Pooled: p99/); assert.doesNotMatch(log.innerHTML, /Store tests pass/);
-  assert.match(title.innerHTML, /#conn-pool ×/); assert.match(title.innerHTML, /Council <span class="count">1<\/span>/); assert.match(title.innerHTML, /Streams 1/);
+  assert.match(title.innerHTML, /#conn-pool ×/); assert.doesNotMatch(title.innerHTML, /Council|Streams/);
   await act({ act: 'swarm-filter', v: '' });
   assert.match(log.innerHTML, /Store tests pass/);
-  await act({ act: 'swarm-tab', v: 'council' });
-  assert.match(log.innerHTML, /Seats: latency-1, latency-2, latency-3\. 2 of 3 decide/);
-  assert.match(log.innerHTML, /<b>P2<\/b>[\s\S]*0 yes · 1 no of 3[\s\S]*pool first[\s\S]*not yet[\s\S]*data-v="P2:yes">Approve/);
-  assert.doesNotMatch(log.innerHTML, /data-v="P1:yes"/, 'a decided proposal takes no decision');
-  await act({ act: 'swarm-decide', v: 'P2:no' });
-  assert.deepEqual(decided, [['app.latency', 'P2', false]]);
   await act({ act: 'swarm-tab', v: 'streams' });
-  assert.match(log.innerHTML, /#conn-pool<\/button> <span class="dim">2 agents<\/span>/);
-  assert.match(log.innerHTML, /data-task="app.latency-4">latency-4 <span class="dim">lead<\/span>/);
-  // A seat that leaves while the Council tab is open shows gone at once, with no board change.
-  await act({ act: 'swarm-tab', v: 'council' });
-  p.learnSwarm(swarmRecord(['app.latency-2', 'app.latency-3', 'app.latency-4'], { council: 3, seats: ['app.latency-2', 'app.latency-3', 'app.latency-4'] }));
-  p.renderSwarm(log, sw);
-  assert.match(log.innerHTML, /Seats: latency-2, latency-3, latency-4\./);
+  assert.match(log.innerHTML, /#conn-pool<\/button> <b>submitted<\/b>[\s\S]*latency-2 · reviewer latency-3[\s\S]*Pool connections\./);
+  assert.match(log.innerHTML, /Final result · partial<\/b><div class="why">Pooled; commits not batched\./);
 });
 
 test('a swarm row opens a beat later, so a double-click opens it as a new tab', async () => {
@@ -2192,13 +2174,6 @@ test('looking at an agent clears the done glyph on its tab', async () => {
   assert.doesNotMatch(tabs.innerHTML, /glyph done/, 'the tab redraws with the agent seen');
 });
 
-test('a flat swarm has no Council or Streams tab', async () => {
-  const p = shell({ swarmBoard: async () => ({ lines: [], offset: 0, more: false }), request: async () => ({ bots: [], next_after: null }) });
-  const sw = p.learnSwarm(swarmRecord(['app.latency-1']));
-  const title = { dataset: {}, innerHTML: '' }; p.renderSwarmHead(title, sw);
-  assert.doesNotMatch(title.innerHTML, /Council|Streams/);
-});
-
 test('the board is read on, a tail read afresh replaces what was read, and the composer posts to it', async () => {
   const reads = [], posts = [];
   let board = { lines: [{ from: 'user', text: 'Halve p99.' }], offset: 20, more: false, reset: true };
@@ -2245,7 +2220,7 @@ test('Stop and Add are one call each; an added agent comes from the row furthest
   const members = ['app.latency-1', 'app.latency-2', 'app.latency-3'], rows = { 'app.latency-1': 0, 'app.latency-2': 1, 'app.latency-3': 0 };
   const p = shell({
     swarmStop: async (swarm) => { calls.push(['stop', swarm]); return { swarm: swarmRecord(members.slice(0, 2), { stopped: true, mix, rows, ids }), failed: [] }; },
-    swarmAdd: async (swarm, row) => { calls.push(['add', swarm, row]); return { swarm: swarmRecord([...members.slice(0, 2), 'app.latency-4'], { mix, rows: { ...rows, 'app.latency-4': row }, ids }), bots: [{ name: 'app.latency-4', id: 9, provider: 'beta', model: 'two' }], failed: [] }; },
+    swarmAdd: async (swarm, row) => { calls.push(['add', swarm, row]); return { swarm: swarmRecord([...members.slice(0, 2), 'app.latency-4'], { mix, rows: { ...rows, 'app.latency-4': row }, ids }), bots: ['app.latency-4'], failed: [] }; },
     request: async () => ({ bots: [], next_after: null }),
   });
   const sw = p.learnSwarm(swarmRecord(members, { mix, rows, ids }));
@@ -2254,7 +2229,7 @@ test('Stop and Add are one call each; an added agent comes from the row furthest
   assert.deepEqual(sw.members, ['app.latency-1', 'app.latency-2']);
   await p.addAgent(sw);
   assert.deepEqual(calls, [['stop', 'app.latency'], ['add', 'app.latency', 0]]);
-  assert.equal(p.S.bots.get('app.latency-4').id, 9);
+  assert.equal(p.S.memberOf.get('app.latency-4'), 'app.latency');
   // Cards and posts say what an agent is, where the swarm has more than one kind.
   p.upsert({ name: 'app.latency-2', id: 4, provider: 'beta', model: 'two' });
   assert.match(p.postHTML(sw, { from: 'latency-2', bot: 'app.latency-2', text: 'LGTM' }), /class="who wide" data-task="app.latency-2">latency-2 <span class="kind">reviewer · two<\/span><\/button>/);
@@ -2317,7 +2292,7 @@ test('a swarm a coordinator started from its shell shows once its first agent ta
   assert.deepEqual([...r.S.swarms.keys()], ['app.latency']);
 });
 
-test('a helper finishing a turn has its swarm check its budget, and only current seats are tallied', async () => {
+test('a helper finishing a turn has its swarm check its budget', async () => {
   const checks = [];
   const p = shell({ swarmCheck: async (swarm) => { checks.push(swarm); return {}; }, request: async () => ({ bots: [], next_after: null, nodes: [], workspaces:[],next_from: null }) });
   for (const [name, id] of [['app.latency-1', 3], ['app.latency-2', 4]]) p.upsert({ name, id, provider: 'alpha', model: 'one' });
@@ -2325,28 +2300,24 @@ test('a helper finishing a turn has its swarm check its budget, and only current
   p.upsert({ name: 'app.latency-1.fix', id: 7, provider: 'alpha', model: 'one', created_by: 'app.latency-1', created_by_id: 3 });
   p.upsert({ name: 'app.latency-1.fix.deep', id: 8, provider: 'alpha', model: 'one', created_by: 'app.latency-1.fix', created_by_id: 7 });
   p.upsert({ name: 'app.other', id: 9, provider: 'alpha', model: 'one' });
-  const sw = p.learnSwarm(swarmRecord(['app.latency-1', 'app.latency-2'], { ids: { 'app.latency-1': 3, 'app.latency-2': 4 }, council: 3, seats: ['app.latency-1', 'app.latency-2'] }));
+  const sw = p.learnSwarm(swarmRecord(['app.latency-1', 'app.latency-2'], { ids: { 'app.latency-1': 3, 'app.latency-2': 4 } }));
   await p.handle({ event: 'turn_finished', bot: 'app.latency-1.fix.deep', turn: 1, durable: true }, 1);
   await p.handle({ event: 'turn_finished', bot: 'app.other', turn: 1, durable: true }, 1);
   await p.tick();
   assert.deepEqual(checks, ['app.latency']);
-  // A helper whose maker left and is gone still has its swarm check, by the maker's id; a check that
-  // passed a share reads the board, which no agent's event may do.
+  // A check that passed a share reads the board, which no helper's event may do on its own.
   let reads = 0; p.context.Daemon.swarmBoard = async () => { reads += 1; return { lines: [], offset: 0, more: false, reset: true, state: sw.state }; };
   let passed = null;
   p.context.Daemon.swarmCheck = async (swarm) => { checks.push(swarm); return { budget: passed, board_changed: !!passed }; };
-  sw.left = [11]; p.S.selected = '⁂app.latency';
-  p.upsert({ name: 'app.latency-5.fix', id: 12, provider: 'alpha', model: 'one', created_by: 'app.latency-5', created_by_id: 11 });
-  await p.handle({ event: 'turn_finished', bot: 'app.latency-5.fix', turn: 1, durable: true }, 1);
+  p.S.selected = '⁂app.latency';
+  await p.handle({ event: 'turn_finished', bot: 'app.latency-1.fix', turn: 1, durable: true }, 1);
   await p.tick(); await p.tick();
   assert.deepEqual(checks, ['app.latency', 'app.latency']);
   const quiet = reads;
   passed = 'the swarm has used 50% of its budget';
-  await p.handle({ event: 'turn_finished', bot: 'app.latency-5.fix', turn: 2, durable: true }, 1);
+  await p.handle({ event: 'turn_finished', bot: 'app.latency-1.fix', turn: 2, durable: true }, 1);
   await p.tick(); await p.tick();
   assert.equal(reads, 2 * quiet + 1, 'the same reads again, and one more for the budget line');
-  // A seat that left keeps no say: latency-9's yes is not counted, and the majority is still of the council's three.
-  assert.equal(p.tally(sw, { votes: { 'latency-1': { yes: true }, 'latency-9': { yes: true } } }), '1 yes of 3');
 });
 
 test('a stall notice refreshes the open board, while an unchanged check adds no read', async () => {
@@ -2374,19 +2345,23 @@ test('a stall notice refreshes the open board, while an unchanged check adds no 
   }
 });
 
-test('a deleted agent leaves its swarm', async () => {
-  const calls = [];
-  const p = shell({
-    swarmLeave: async (swarm, member) => { calls.push(['leave', swarm, member]); return swarmRecord(['app.latency-2']); },
-    request: async () => ({ bots: [], next_after: null }),
-  });
+test('a deleted agent is out of its swarm, which counts it no more', async () => {
+  const p = shell({ request: async () => ({ bots: [], next_after: null }) });
   for (const [n, id] of [['app.latency-1', 3], ['app.latency-2', 4]]) p.upsert({ name: n, id, provider: 'alpha', model: 'one' });
-  const sw = p.learnSwarm(swarmRecord(['app.latency-1', 'app.latency-2']));
+  const sw = p.learnSwarm(swarmRecord(['app.latency-1', 'app.latency-2'], { ids: { 'app.latency-1': 3, 'app.latency-2': 4 } }));
+  sw.tab = 'agents';
+  const log = { dataset: {}, innerHTML: '', scrollHeight: 0, scrollTop: 0, clientHeight: 0, querySelectorAll: () => [] };
+  p.renderSwarm(log, sw); assert.match(log.innerHTML, /latency-1/);
   await p.onEvent({ event: 'deleted', bot: 'app.latency-1', durable: true });
   await p.tick();
-  assert.deepEqual(calls.at(-1), ['leave', 'app.latency', 'app.latency-1']);
-  assert.deepEqual(sw.members, ['app.latency-2']);
-  assert.equal(p.S.memberOf.has('app.latency-1'), false);
+  const title = { dataset: {}, innerHTML: '' }; p.renderSwarmHead(title, sw);
+  assert.match(title.innerHTML, />1 agents<[\s\S]*Agents 1</);
+  p.renderSwarm(log, sw);
+  assert.doesNotMatch(log.innerHTML, /latency-1/); assert.match(log.innerHTML, /latency-2/);
+  // A bot that takes the name later is not the member.
+  p.upsert({ name: 'app.latency-1', id: 9, provider: 'alpha', model: 'one' });
+  p.renderSwarm(log, sw);
+  assert.doesNotMatch(log.innerHTML, /latency-1/);
 });
 
 test('the demo daemon\'s swarm: agents post, working ones hear it, and an idle one wakes only when named', async () => {
@@ -2407,25 +2382,6 @@ test('the demo daemon\'s swarm: agents post, working ones hear it, and an idle o
   const board = (await d.swarmBoard('demo.latency', null)).lines.slice(before);
   assert.deepEqual(Array.from(board, (l) => l.from), ['user', 'latency-2']);
   assert.equal(board[1].text, 'On it: look at fsync.');
-  d.close();
-});
-
-test('the demo daemon\'s council opens a stream by the seats\' majority and leaves a proposal for you', async () => {
-  const context = vm.createContext({ window: {}, setTimeout, clearTimeout, Math, JSON, Promise, Error, String, Set, Map, Infinity, Date, structuredClone });
-  vm.runInContext(fs.readFileSync(require.resolve('../ui/daemon.js'), 'utf8'), context);
-  const d = context.window.Daemon;
-  const names = [1, 2, 3, 4].map((i) => `demo.latency-${i}`);
-  const { swarm: sw } = await d.swarmStart({ project: 'demo', folder: '/workspace', goal: 'Halve p99 latency.', shared: true, mix: [{ identity: '', model: 'alpha/one', share: 100 }], agents: 4, budgetTokens: 1000, council: 3 });
-  assert.deepEqual([sw.council, Array.from(sw.seats)], [3, names.slice(0, 3)]);
-  const done = new Set();
-  while (done.size < 4) for (const e of (await d.pull()).events) if (ended(e)) done.add(e.bot);
-  const { state, lines } = await d.swarmBoard('demo.latency', null);
-  assert.deepEqual(state.proposals.map((p) => [p.id, p.stream, p.status]), [['P1', 'conn-pool', 'approved'], ['P2', 'batch-commits', 'open']]);
-  assert.deepEqual({ ...state.streams }, { 'latency-1': 'conn-pool', 'latency-2': 'conn-pool', 'latency-4': 'conn-pool' });
-  assert.ok(lines.some((l) => l.kind === 'decision' && l.from === 'council'));
-  assert.ok(lines.some((l) => l.stream === 'conn-pool' && !l.kind), 'a stream member posts to its stream');
-  await d.swarmDecide('demo.latency', 'P2', true);
-  assert.equal((await d.swarmBoard('demo.latency', null)).state.proposals[1].status, 'approved');
   d.close();
 });
 
@@ -2529,13 +2485,13 @@ test('a provider that fails says why beside the ones that answered', async () =>
   assert.match(row, /✓ 1 model</); assert.match(row, /bedrock-openai: provider_http_401: no</); assert.match(row, /data-act="setup-retry"/);
 });
 
-test('Settings edits flat and council profiles independently', async () => {
+test('Settings edits the coordinator role, and names where a swarm\'s agents get theirs', async () => {
   const edited = [], own = new Set();
   const p = shell({
     settings: async () => ({ providers: ['openai'], region: null, profile: null, keys: [] }),
     request: async () => ({ providers: { openai: { models: [{ id: 'gpt' }] } } }),
     models: async () => [{ id: 'openai/gpt' }],
-    roles: async () => ['coordinator', 'swarm-flat', 'swarm-council'].map((name) => ({ name, file: own.has(name) ? `/home/u/.agents/agents/${name}.md` : null })),
+    roles: async () => ['coordinator'].map((name) => ({ name, file: own.has(name) ? `/home/u/.agents/agents/${name}.md` : null })),
     editRole: async (name) => { edited.push(name); own.add(name); return `/home/u/.agents/agents/${name}.md`; },
   });
   // Onboarding has no roles to show; Settings, once a project exists, does.
@@ -2545,19 +2501,12 @@ test('Settings edits flat and council profiles independently', async () => {
   let html = p.setupHTML();
   assert.match(html, /<h3>Roles<\/h3>/);
   assert.match(html, /Coordinator<\/span><span class="st dim">the app's own/);
+  assert.doesNotMatch(html, /swarm<\/span>/i);
+  assert.match(html, /the swarm skill's member\.md/);
   await p.act({ dataset: { act: 'edit-role', v: 'coordinator' } });
   assert.deepEqual(edited, ['coordinator']);
   html = p.setupHTML();
   assert.match(html, /Coordinator<\/span><span class="st">~\/.agents\/agents\/coordinator.md/);
-  assert.match(html, /Flat swarm<\/span><span class="st dim">the app's own/);
-  assert.match(html, /Council swarm<\/span><span class="st dim">the app's own/);
-  await p.act({ dataset: { act: 'edit-role', v: 'swarm-flat' } });
-  html = p.setupHTML();
-  assert.match(html, /Flat swarm<\/span><span class="st">~\/.agents\/agents\/swarm-flat.md/);
-  assert.match(html, /Council swarm<\/span><span class="st dim">the app's own/);
-  await p.act({ dataset: { act: 'edit-role', v: 'swarm-council' } });
-  assert.deepEqual(edited, ['coordinator', 'swarm-flat', 'swarm-council']);
-  assert.match(p.setupHTML(), /Council swarm<\/span><span class="st">~\/.agents\/agents\/swarm-council.md/);
 });
 
 test('removing a provider drops its key unless another provider uses it', async () => {
@@ -2771,56 +2720,25 @@ test('removing a provider while agents work asks once more before the restart st
 
 test('a swarm counts its helpers\' tokens, and the board says when it passes a share of its budget', async () => {
   const bots = [
-    { name: 'app.latency-1', id: 3, tokens_used: 1000 },
+    { name: 'app.latency-1', id: 3, tokens_used: 1000, budget_tokens: 1500000 },
     { name: 'app.latency-1.fix', id: 40, created_by_id: 3, tokens_used: 200 },
     { name: 'app.latency-1.fix.deep', id: 41, created_by_id: 40, tokens_used: 30 },
     { name: 'app.latency-1.stray', id: 42, created_by_id: 77, tokens_used: 5000 },
-    { name: 'app.latency-2', id: 99, tokens_used: 7000 },
+    { name: 'app.latency-2', id: 99, tokens_used: 7000, budget_tokens: 1500000 },
     { name: 'app.other', id: 50, tokens_used: 9000 },
   ];
   const p = shell({ request: async (op) => (op === 'bots' ? { bots, next_after: null } : { bots: [], next_after: null }) });
   const sw = p.learnSwarm(swarmRecord(['app.latency-1', 'app.latency-2'], { ids: { 'app.latency-1': 3, 'app.latency-2': 4 } }));
   await p.readUsage(sw);
-  assert.equal(sw.used, 1230);
-  // A member that left still makes its helpers count; a helper deleted since the board saw it
-  // counts with what the board recorded, and helpers gone before that with the board's total.
-  bots.push({ name: 'app.latency-3.fix', id: 43, created_by_id: 8, tokens_used: 400 });
-  bots.sort((a, b) => (a.name < b.name ? -1 : 1));
-  sw.left = [8];
-  sw.state = { ...sw.state, helpers: { 40: 150, 44: 60 }, gone: 500 };
-  await p.readUsage(sw);
-  assert.equal(sw.used, 1230 + 400 + 60 + 500);
-  assert.match(p.postHTML(sw, { from: 'budget', text: 'the swarm has used 50% of its budget (1.5M of 3M tokens)', spent: 50 }), /<span class="who council">budget<\/span><span class="pt">the swarm has used 50%/);
-  // fix is deleted: deep, made by it, still counts through what the board knows of fix.
+  // latency-2 was deleted and the name taken: neither its tokens nor its cap count.
+  assert.deepEqual([sw.used, sw.budget], [1230, 1500000]);
+  // A helper deleted since the script saw it counts with what the state recorded, and what it made
+  // still counts as working for its member; a helper working for a deleted member does not.
   bots.splice(bots.findIndex((b) => b.id === 40), 1);
-  sw.state = { ...sw.state, helpers: { 41: 30 }, gone: 0, roots: { 40: 3, 41: 3 } };
+  sw.state = { ...sw.state, helpers: { 40: [180, 3], 41: [20, 3], 60: [500, 4] } };
   await p.readUsage(sw);
-  assert.equal(sw.used, 1000 + 30 + 400);
-});
-
-test('a swarm\'s departures apply in order, and a stream that changed hands shows its new lead', async () => {
-  const answers = [deferred(), deferred()], calls = [];
-  const p = shell({
-    swarmLeave: (swarm, member) => { calls.push(member); return answers[calls.length - 1].promise; },
-    swarmBoard: async () => ({ lines: [], offset: 0, more: false, reset: true }),
-    request: async () => ({ bots: [], next_after: null }),
-  });
-  for (const [n, id] of [['app.latency-1', 3], ['app.latency-2', 4], ['app.latency-3', 5]]) p.upsert({ name: n, id, provider: 'alpha', model: 'one' });
-  const sw = p.learnSwarm(swarmRecord(['app.latency-1', 'app.latency-2', 'app.latency-3']));
-  await p.onEvent({ event: 'deleted', bot: 'app.latency-1', durable: true });
-  await p.onEvent({ event: 'deleted', bot: 'app.latency-2', durable: true });
-  await p.tick();
-  // The second waits for the first's answer, so the first's never lands after it.
-  assert.deepEqual(calls, ['app.latency-1']);
-  answers[0].resolve(swarmRecord(['app.latency-2', 'app.latency-3']));
-  await p.tick();
-  assert.deepEqual(calls, ['app.latency-1', 'app.latency-2']);
-  answers[1].resolve(swarmRecord(['app.latency-3']));
-  await p.tick();
-  assert.deepEqual(sw.members, ['app.latency-3']);
-  const lead = p.postHTML(sw, { from: 'council', kind: 'lead', stream: 'cache', lead: 'latency-3', was: 'latency-1' });
-  assert.match(lead, /latency-1 left · latency-3 leads it/);
-  assert.match(p.postHTML(sw, { from: 'council', kind: 'seat', seat: 'latency-3', was: 'latency-1' }), /latency-1 left · latency-3 holds a council seat/);
+  assert.equal(sw.used, 1000 + 180 + 30);
+  assert.match(p.postHTML(sw, { from: 'budget', text: 'the swarm has used 50% of its budget (1.5M of 3M tokens)', spent: 50 }), /<span class="who council">budget<\/span><span class="pt">the swarm has used 50%/);
 });
 
 test('an older daemon on the socket is replaced from the detached screen; a newer one is left to an app update', async () => {
@@ -3419,11 +3337,8 @@ test('work view retains partial findings and independent verdicts without callin
   sw.state.tasks = {}; sw.state.result = {outcome:'failed',summary:'Could not access the inputs'}; sw.stateGen++;
   p.renderSwarm(el,sw); assert.match(el.innerHTML,/Final result · failed/); assert.match(el.innerHTML,/Could not access the inputs/);
 
-  // A council's plain streams stay beside its assigned tasks; an empty flat view names its own tool.
-  sw.council = 3; sw.state.tasks = { waits: {owner:'latency-1',reviewer:'latency-2',brief:'Check wait cleanup',status:'working'} };
-  sw.state.proposals = [{id:'P1',stream:'waits',why:'w',by:'latency-1',status:'approved',votes:{}},{id:'P2',stream:'profile',why:'Profile the store',by:'latency-2',status:'approved',votes:{}}]; sw.stateGen++;
-  p.renderSwarm(el,sw); assert.match(el.innerHTML,/#waits/); assert.match(el.innerHTML,/Profile the store/);
-  sw.council = 0; sw.state.tasks = {}; sw.state.proposals = []; sw.state.result = null; sw.stateGen++;
+  // An empty view names the command that registers a task.
+  sw.state.tasks = {}; sw.state.result = null; sw.stateGen++;
   p.renderSwarm(el,sw); assert.match(el.innerHTML,/no tasks yet: an agent registers one with assign/);
   // The swarm's own notices are system lines, not a member to open.
   sw.tab = 'board'; sw.lines = [{at:1,from:'swarm',kind:'quiet',text:'nothing is running and there is no final result (partial)'}];

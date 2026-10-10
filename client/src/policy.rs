@@ -309,11 +309,11 @@ pub struct Entry {
 }
 pub type Skill = Entry;
 
-/// Roles a client starts its own bots in: the app's coordinator and its
-/// swarms' members. A `.agents/agents` file of one of these names replaces
+/// Roles a client starts its own bots in: the app's coordinator. A
+/// `.agents/agents` file of one of these names replaces
 /// the client's text for that role, so it is not a role to start a peer in,
 /// and the Profiles index leaves it out.
-pub const CLIENT_ROLES: [&str; 3] = ["coordinator", "swarm-flat", "swarm-council"];
+pub const CLIENT_ROLES: [&str; 1] = ["coordinator"];
 
 /// Whether a profile file's stem is a client role. Case is ignored: on a
 /// case-insensitive filesystem (macOS's default) `Coordinator.md` is the
@@ -897,7 +897,7 @@ mod tests {
     fn a_clients_own_roles_are_read_but_not_offered_as_peer_roles() {
         let root = temp("client-roles");
         std::fs::create_dir_all(root.join(".agents/agents")).unwrap();
-        for name in ["coordinator", "swarm-flat", "Swarm-Council", "reviewer"] {
+        for name in ["coordinator", "reviewer"] {
             std::fs::write(
                 root.join(".agents/agents").join(format!("{name}.md")),
                 format!("---\ndescription: the {name}\n---\nBe the {name}.\n"),
@@ -908,6 +908,7 @@ mod tests {
         let listed: Vec<&str> = composed.profiles.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(listed, ["reviewer"]);
         assert!(!composed.text.contains("- coordinator:"));
+        assert!(client_role("Coordinator"));
         // The file still replaces the client's text when it starts a bot in that role.
         let role = profile(&root, "coordinator").unwrap().unwrap();
         assert_eq!(role.body, "Be the coordinator.");

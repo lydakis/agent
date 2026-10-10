@@ -1,26 +1,28 @@
-"""A swarm's post tool against a real daemon: the board, and who hears a post."""
+"""The swarm skill's script against a real daemon: start, the board, who hears a post, the work
+contract, the budget notices and stop."""
 import json
 import os
+import subprocess
+import sys
 import threading
 import time
 import unittest
 from pathlib import Path
 
-import subprocess
-
 from bench.targets import clean_env
 from tests.test_runtime import ModelFixture
 
 ROOT = Path(__file__).resolve().parent.parent
-APP = next((p for p in (ROOT / '.local/target/debug/agent-app', ROOT / '.local/target/release/agent-app') if p.exists()), None)
+SCRIPT = ROOT / 'app/skills/swarm/swarm'
 
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
-@unittest.skipUnless(APP, 'build the app first: cargo build -p agent-app')
-class SwarmPostTests(ModelFixture):
+class SwarmTests(ModelFixture):
     def setUp(self):
         super().setUp()
         self.store = self.path / 'state.sqlite'
+        self.home = self.path / 'home'
+        self.home.mkdir()
         self.common = ['--store', str(self.store), '--provider', f'openai=responses,{self.url}',
                        '--model', 'openai/synthetic-model', '--tools', 'echo,shell']
         self.addCleanup(lambda: subprocess.run([str(self.binary), 'shutdown', '--store', str(self.store)],
@@ -32,196 +34,328 @@ class SwarmPostTests(ModelFixture):
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         return result
 
-    def ids(self):
-        return {b['name']: b['id'] for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout)}
-
-    def swarm(self, members, council=0):
-        # The folder the app writes for a swarm, by hand: each member pinned to its bot's id.
-        folder = self.path / 'swarms' / 'p.s'
-        folder.mkdir(parents=True)
-        listed = ', '.join(json.dumps(m) for m in members)
-        ids = self.ids()
-        pinned = ''.join(f'{json.dumps(m)} = {ids[m]}\n' for m in members)
-        rows = ''.join(f'{json.dumps(m)} = 0\n' for m in members)
-        (folder / 'swarm.toml').write_text(
-            f'project = "p"\ngoal = "g"\nworkspace = "{self.path}"\n'
-            f'budget_tokens = 1000000\nmembers = [{listed}]\nstopped = false\ncouncil = {council}\n'
-            f'made = {len(members)}\nleft = []\n'
-            f'[[mix]]\nidentity = ""\nmodel = "openai/synthetic-model"\nshare = 100\n'
-            f'[ids]\n{pinned}[rows]\n{rows}')
-        (folder / 'board.jsonl').write_text('')
-        for tool, flag in [('post', ''), ('propose', ' --propose'), ('vote', ' --vote'), ('join', ' --join'), ('status', ' --status'), ('assign', ' --assign'), ('claim', ' --claim'), ('submit', ' --submit'), ('review', ' --review'), ('finish', ' --finish')]:
-            script = folder / tool
-            script.write_text(f'#!/bin/sh\nexec \'{APP}\' --swarm-post \'{folder}\'{flag} "$@"\n')
-            script.chmod(0o755)
-        return folder
+    def listed(self):
+        return {b['name']: b for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout)}
 
     def turns(self, bot):
         return json.loads(self.agent('turns', '--store', str(self.store), '--bot', bot).stdout)
 
-    def post_from(self, bot, folder, text, tool='post'):
-        # The agent runs the script from its shell tool; its output is kept for the test.
-        out = self.path / f'posted-{bot}.json'
-        ran = self.agent('run', '--store', str(self.store), '--bot', bot,
-                         f'shell:"{folder}/{tool}" {text} > "{out}" 2>&1')
-        self.assertTrue(out.exists(), ran.stdout)
+    def settle(self, *bots):
+        for bot in bots:
+            self.agent('wait', '--store', str(self.store), f"turn:{bot}/{self.turns(bot)[-1]['turn']}")
+
+    def swarm(self, bot, *args):
+        """The script run from an agent's shell, as its tool call would; what it printed, parsed."""
+        out = self.path / f'out-{bot}.json'
+        words = ' '.join("'" + a.replace("'", "'\\''") + "'" for a in args)
+        self.agent('run', '--store', str(self.store), '--bot', bot,
+                   f"shell:HOME='{self.home}' '{SCRIPT}' {words} > '{out}' 2>&1")
         return json.loads(out.read_text() or '{}')
 
-    def settle(self, bot):
-        self.agent('wait', '--store', str(self.store), f"turn:{bot}/{self.turns(bot)[-1]['turn']}")
+    def person(self, *args):
+        """The script as the app runs it for the person: no agent in its environment."""
+        env = clean_env() | {'HOME': str(self.home), 'AGENT_SOCKET': str(self.store) + '.sock',
+                             'AGENT_BIN': str(self.binary)}
+        ran = subprocess.run([str(SCRIPT), *args], env=env, capture_output=True, text=True, timeout=30)
+        return json.loads(ran.stdout if ran.returncode == 0 else ran.stderr)
 
-    def test_publication_is_silent_and_mentions_deliver_only_to_named_members(self):
-        self.model.release_headers = threading.Event()
-        self.model.all_streaming = self.model.release_headers
-        self.addCleanup(self.model.release_headers.set)
-        members = ['p.s-1', 'p.s-2', 'p.s-3', 'p.s-4']
-        for bot in members:
-            self.agent('run', *self.common, '--new', '--bot', bot, 'hello')
-        folder = self.swarm(members)
-        # s-2 works on a turn that waits on the model; s-3 and s-4 are idle.
-        self.agent('run', '--store', str(self.store), '--bot', 'p.s-2', '--detach', 'gate')
-        for _ in range(200):
-            if self.turns('p.s-2')[-1]['status'] == 'running':
-                break
-            time.sleep(.02)
-        posted = self.post_from('p.s-1', folder, '"@s-3 take the tests"')
-        self.assertEqual((posted['steered'], posted['woke'], posted['missed']), ([], ['s-3'], []))
-        board = [json.loads(line) for line in (folder / 'board.jsonl').read_text().splitlines()]
-        self.assertEqual(len(board), 1)
-        self.assertEqual((board[0]['from'], board[0]['bot'], board[0]['text']), ('s-1', 'p.s-1', '@s-3 take the tests'))
-        self.assertEqual(board[0]['turn'], self.turns('p.s-1')[-1]['turn'])
-        # The line says how many agents it was sent to: what a swarm's posts cost is on its board.
-        self.assertEqual(board[0]['sent'], 1)
-        # The named idle agent got a turn of its own; the other idle one heard nothing.
-        woken = self.turns('p.s-3')[-1]
-        self.assertEqual((woken['prompt_preview'], woken['delivery']), ('[board] s-1: @s-3 take the tests', 'steer'))
-        self.assertEqual(len(self.turns('p.s-4')), 1)
-        # A routine publication does not interrupt even a working peer.
-        quiet = self.post_from('p.s-4', folder, 'profile is up')
-        self.assertEqual(quiet['steered'], [])
-        self.assertEqual((quiet['woke'], quiet['missed']), ([], []))
-        self.model.release_headers.set()
-        self.agent('wait', '--store', str(self.store), f"turn:p.s-2/{self.turns('p.s-2')[-1]['turn']}")
-        # Posting is for members, and a stopped swarm takes no posts from its agents.
-        outsider = self.path / 'outsider.json'
-        self.agent('run', *self.common, '--new', '--bot', 'q', f'shell:"{folder}/post" hi > "{outsider}" 2>&1')
-        self.assertIn('not_a_member', outsider.read_text())
-        # A member deleted and made again under its name is another bot: it cannot post, and a
-        # post naming it misses it rather than waking the new bot.
-        self.agent('rm', '--store', str(self.store), '--bot', 'p.s-4')
-        self.agent('run', *self.common, '--new', '--bot', 'p.s-4', 'hello')
-        again = self.path / 'again.json'
-        self.agent('run', '--store', str(self.store), '--bot', 'p.s-4', f'shell:"{folder}/post" hi > "{again}" 2>&1')
-        self.assertIn('not_a_member', again.read_text())
-        named = self.post_from('p.s-1', folder, '"@s-4 you there?"')
-        self.assertEqual(([m['agent'] for m in named['missed']], named['woke']), (['s-4'], []))
-        self.assertEqual(len(self.turns('p.s-4')), 2)
-        toml = folder / 'swarm.toml'
-        toml.write_text(toml.read_text().replace('stopped = false', 'stopped = true'))
-        stopped = self.path / 'stopped.json'
-        self.agent('run', '--store', str(self.store), '--bot', 'p.s-1', f'shell:"{folder}/post" hi > "{stopped}" 2>&1')
-        self.assertIn('swarm_stopped', stopped.read_text())
-        self.assertEqual(len((folder / 'board.jsonl').read_text().splitlines()), 3)
+    def start(self, *args, goal='Ship the widget'):
+        self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
+        started = self.swarm('p.lead', 'start', '--in-project', *args, '--', goal)
+        self.assertIn('swarm', started, started)
+        self.settle(*started['bots'])
+        return started
 
-    def test_board_decisions_and_reviewed_results_are_readable_outside_a_member(self):
-        members = ['p.s-1', 'p.s-2']
-        for bot in members:
-            self.agent('run', *self.common, '--new', '--bot', bot, 'hello')
-        folder = self.swarm(members)
-        self.post_from('p.s-1', folder, '"Deliverable: source evidence. Completion: independently checked findings."')
-        self.assertIn('Deliverable: source evidence', (folder / 'board.jsonl').read_text())
-        self.post_from('p.s-1', folder, 'waits s-1 s-2 "Inspect cleanup; report evidence"', 'assign')
-        self.post_from('p.s-1', folder, 'waits', 'claim')
-        self.post_from('p.s-1', folder, 'waits "Source inspected; no measured latency"', 'submit')
-        def status():
-            env = clean_env()
-            env['AGENT_SOCKET'] = str(self.store) + '.sock'
-            result = subprocess.run([str(folder / 'status')], env=env, capture_output=True, text=True, timeout=30)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            return json.loads(result.stdout)
-        partial = status()
-        self.assertIsNone(partial['result'])
-        self.assertEqual(partial['tasks']['waits']['status'], 'reviewing')
-        self.assertIn('no measured latency', partial['tasks']['waits']['result'])
-        self.post_from('p.s-2', folder, 'waits conditional "Verified source; only helper-heavy workloads exercise it"', 'review')
-        self.post_from('p.s-1', folder, 'partial "One conditional finding, no measured speedup"', 'finish')
-        done = status()
-        self.assertEqual(done['outcome'], 'completed')
-        self.assertEqual(done['result']['outcome'], 'partial')
-        self.assertNotIn('plan_path', done)
-        self.assertEqual(done['tasks']['waits']['verdict'], 'conditional')
-        self.assertEqual(len(done['members']), 2)
-
-    def test_a_proposal_wakes_the_seats_and_their_majority_opens_a_stream(self):
-        members = ['p.s-1', 'p.s-2', 'p.s-3', 'p.s-4']
-        for bot in members:
-            self.agent('run', *self.common, '--new', '--bot', bot, 'hello')
-        folder = self.swarm(members, council=3)
-        proposed = self.post_from('p.s-4', folder, 'conn-pool "reuse provider connections"', 'propose')
-        self.assertEqual((proposed['id'], proposed['woke']), ('P1', ['s-1', 's-2', 's-3']))
-        for seat in members[:3]:
-            self.settle(seat)
-            self.assertTrue(self.turns(seat)[-1]['prompt_preview'].startswith('[board] s-4 proposes P1 #conn-pool'))
-        self.assertIsNone(self.post_from('p.s-1', folder, 'P1 yes "measured first"', 'vote')['decided'])
-        refused = self.post_from('p.s-4', folder, 'P1 yes "mine"', 'vote')
-        self.assertTrue(refused['error'].startswith('not_a_seat'))
-        decided = self.post_from('p.s-2', folder, 'P1 yes "worth it"', 'vote')
-        self.assertEqual((decided['decided'], decided['woke']), ('approved', ['s-4']))
-        self.settle('p.s-4')
-        self.assertTrue(self.turns('p.s-4')[-1]['prompt_preview'].startswith('[board] P1 #conn-pool approved'))
-        state = json.loads((folder / 'state.json').read_text())
-        self.assertEqual(state['streams'], {'s-4': 'conn-pool'})
-        self.assertEqual(state['proposals'][0]['status'], 'approved')
-        # A stream's post names its stream; nobody else is in it, so it reaches nobody.
-        self.post_from('p.s-1', folder, 'conn-pool', 'join')
-        streamed = self.post_from('p.s-4', folder, '"pool is in"')
-        self.assertEqual((streamed['stream'], streamed['steered'], streamed['woke']), ('conn-pool', [], []))
-        kinds = [json.loads(line).get('kind', 'post') for line in (folder / 'board.jsonl').read_text().splitlines()]
-        self.assertEqual(kinds, ['propose', 'vote', 'vote', 'decision', 'join', 'post'])
-
+    def board(self, started):
+        return [json.loads(line) for line in Path(started['board']).read_text().splitlines()]
 
     def test_a_coordinator_starts_a_swarm_from_its_shell(self):
-        # What the coordinator's role tells it to run: the app, without a window, from its shell.
-        self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
-        home = self.path / 'home'
-        out = self.path / 'started.json'
-        self.agent('run', '--store', str(self.store), '--bot', 'p.lead',
-                   f"shell:HOME='{home}' '{APP}' --swarm-start --agents 2 --budget 0.5 --in-project"
-                   f" -- Ship the widget > '{out}' 2>&1")
-        started = json.loads(out.read_text())
-        self.assertIn('swarm', started, started)
+        started = self.start('--agents', '2', '--budget', '0.5')
         self.assertEqual((started['swarm']['swarm'], started['bots']), ('p.widget', ['p.widget-1', 'p.widget-2']))
         self.assertEqual(started['failed'], [])
         # Every agent runs the coordinator's model, in its folder, with half the budget.
-        ids = self.ids()
-        self.assertEqual(started['swarm']['ids'], {'p.widget-1': ids['p.widget-1'], 'p.widget-2': ids['p.widget-2']})
-        self.assertEqual(started['swarm']['mix'], [{'identity': '', 'model': 'openai/synthetic-model', 'reasoning': None, 'share': 100}])
+        listed = self.listed()
+        self.assertEqual(started['swarm']['ids'], {m: listed[m]['id'] for m in started['bots']})
+        self.assertEqual(started['swarm']['mix'], [{'model': 'openai/synthetic-model', 'share': 100,
+                                                    'identity': '', 'reasoning': None}])
         self.assertEqual(started['swarm']['workspace'], str(self.path))
-        listed = {b['name']: b for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout)}
+        self.assertEqual(started['swarm']['coordinator'], {'bot': 'p.lead', 'id': listed['p.lead']['id']})
         self.assertEqual(listed['p.widget-1']['budget_tokens'], 250000)
+        self.assertEqual(listed['p.widget-1']['created_by'], 'p.lead')
         # Its folder is the one a window on this store reads, and the goal opens the board.
         board = Path(started['board'])
-        self.assertEqual(board.parent.parent.parent, home / '.agent/swarms')
-        self.assertEqual(json.loads(board.read_text().splitlines()[0])['text'], 'Ship the widget')
-        # Each agent got its brief.
-        for bot in started['bots']:
-            self.assertIn('Ship the widget', self.turns(bot)[0]['prompt_preview'])
+        self.assertEqual(board.parent.parent.parent, self.home / '.agent/swarms')
+        self.assertEqual(self.board(started)[0]['text'], 'Ship the widget')
+        # Each agent got its rules and its brief as its first message.
+        first = self.turns('p.widget-1')[0]['prompt_preview']
+        self.assertTrue(first.startswith('You are one of several agents in a flat swarm'), first)
         # A turn run at another effort starts its swarm at that effort.
-        again = self.path / 'again.json'
         self.agent('run', '--store', str(self.store), '--bot', 'p.lead', '--reasoning', 'xhigh',
-                   f"shell:HOME='{home}' '{APP}' --swarm-start --agents 1 --budget 0.5 --in-project"
-                   f" -- Ship the gadget > '{again}' 2>&1")
-        gadget = json.loads(again.read_text())
-        self.assertIn('swarm', gadget, gadget)
+                   f"shell:HOME='{self.home}' '{SCRIPT}' start --agents 1 --budget 0.5 --in-project -- Ship the gadget"
+                   f" > '{self.path}/again.json' 2>&1")
+        gadget = json.loads((self.path / 'again.json').read_text())
         self.assertEqual(gadget['swarm']['mix'][0]['reasoning'], 'xhigh')
-        listed = {b['name']: b for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout)}
-        self.assertEqual([listed[b]['reasoning'] for b in gadget['bots']], ['xhigh'])
-        self.assertIsNone(listed['p.lead']['reasoning'])
-        # Only a coordinator starts one.
-        refused = self.path / 'refused.json'
-        self.agent('run', *self.common, '--new', '--bot', 'q',
-                   f"shell:HOME='{home}' '{APP}' --swarm-start -- x > '{refused}' 2>&1")
-        self.assertIn("coordinator's shell", refused.read_text())
+        self.assertEqual(self.listed()['p.gadget-1']['reasoning'], 'xhigh')
+        # Only a coordinator starts one, and the app lists both.
+        self.agent('run', *self.common, '--new', '--bot', 'q', 'hello')
+        self.assertEqual(self.swarm('q', 'start', '--', 'x')['error'], 'coordinators_only')
+        self.assertEqual([s['swarm'] for s in self.person('list')['swarms']], ['p.gadget', 'p.widget'])
+
+    def test_a_shared_worktree_runs_setup_and_a_failed_setup_leaves_nothing(self):
+        repo = self.path / 'repo'
+        repo.mkdir()
+        git = lambda *a: subprocess.run(['git', '-C', str(repo), *a], check=True, capture_output=True,
+                                        env=clean_env() | {'HOME': str(self.home), 'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t',
+                                                           'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t'})
+        (repo / '.agents').mkdir()
+        (repo / '.agents/setup').write_text('#!/bin/sh\n[ -f fail ] && exit 3\necho "$AGENT_SOURCE" > set-up\n')
+        (repo / '.agents/setup').chmod(0o755)
+        git('init', '-q')
+        git('add', '.')
+        git('commit', '-qm', 'init')
+        self.agent('run', *self.common, '--new', '--bot', 'r.lead', '--workspace', str(repo), 'hello')
+        started = self.swarm('r.lead', 'start', '--agents', '1', '--', 'Ship the widget')
+        tree = self.home / '.agent/worktrees/r.widget'
+        self.assertEqual(started['swarm']['workspace'], str(tree))
+        self.assertEqual((tree / 'set-up').read_text().strip(), str(repo))
+        self.assertEqual(self.listed()['r.widget-1']['workspace'], str(tree))
+        (repo / 'fail').write_text('')
+        git('add', 'fail')
+        git('commit', '-qm', 'fail')
+        failed = self.swarm('r.lead', 'start', '--agents', '1', '--', 'Ship the widget')
+        self.assertEqual(failed['error'], 'setup_failed')
+        self.assertFalse((self.home / '.agent/worktrees/r.widget-2').exists())
+        self.assertNotIn('agent/r.widget-2', git('branch').stdout.decode())
+        self.assertEqual([s['swarm'] for s in self.person('list')['swarms']], ['r.widget'])
+
+    def test_publication_is_silent_and_mentions_deliver_only_to_named_members(self):
+        started = self.start('--agents', '4')
+        self.model.release_headers = threading.Event()
+        self.model.all_streaming = self.model.release_headers
+        self.addCleanup(self.model.release_headers.set)
+        # widget-2 works on a turn that waits on the model; widget-3 and widget-4 are idle.
+        self.agent('run', '--store', str(self.store), '--bot', 'p.widget-2', '--detach', 'gate')
+        for _ in range(200):
+            if self.turns('p.widget-2')[-1]['status'] == 'running':
+                break
+            time.sleep(.02)
+        posted = self.swarm('p.widget-1', 'post', '@widget-3 take the tests')
+        self.assertEqual((posted['steered'], posted['woke'], posted['missed']), ([], ['widget-3'], []))
+        line = self.board(started)[-1]
+        self.assertEqual((line['from'], line['bot'], line['text'], line['sent']),
+                         ('widget-1', 'p.widget-1', '@widget-3 take the tests', 1))
+        self.assertEqual(line['turn'], self.turns('p.widget-1')[-1]['turn'])
+        woken = self.turns('p.widget-3')[-1]
+        self.assertEqual((woken['prompt_preview'], woken['delivery']), ('[board] widget-1: @widget-3 take the tests', 'steer'))
+        self.assertEqual(len(self.turns('p.widget-4')), 1)
+        # A routine post interrupts nobody, not even a working peer.
+        quiet = self.swarm('p.widget-4', 'post', 'profile is up')
+        self.assertEqual((quiet['steered'], quiet['woke'], quiet['missed']), ([], [], []))
+        # --all reaches everyone: the working one in its turn, the idle ones with a turn.
+        everyone = self.swarm('p.widget-4', 'post', '--all', 'plan is up')
+        self.assertEqual((everyone['steered'], everyone['woke']), (['widget-2'], ['widget-1', 'widget-3']))
+        self.model.release_headers.set()
+        self.settle('p.widget-1', 'p.widget-2', 'p.widget-3')
+        # Posting is for members.
+        self.agent('run', *self.common, '--new', '--bot', 'q', 'hello')
+        self.assertEqual(self.swarm('q', 'post', '--swarm', 'p.widget', 'hi')['error'], 'not_a_member')
+        # A member deleted and made again under its name is another bot: it cannot post, and a
+        # post naming it misses it rather than waking the new bot.
+        self.agent('rm', '--store', str(self.store), '--bot', 'p.widget-4')
+        self.agent('run', *self.common, '--new', '--bot', 'p.widget-4', 'hello')
+        self.assertEqual(self.swarm('p.widget-4', 'post', 'hi')['error'], 'not_a_member')
+        named = self.swarm('p.widget-1', 'post', '@widget-4 you there?')
+        self.assertEqual(([m['agent'] for m in named['missed']], named['woke']), (['widget-4'], []))
+        self.assertEqual(len(self.turns('p.widget-4')), 2)
+        # Stopped, it refuses its agents' posts; the person's post resumes it and wakes everyone.
+        stopped = self.person('stop', '--swarm', 'p.widget')
+        self.assertEqual((stopped['swarm']['stopped'], stopped['failed']), (True, []))
+        self.assertEqual(self.swarm('p.widget-1', 'post', 'hi')['error'], 'swarm_stopped')
+        resumed = self.person('post', '--swarm', 'p.widget', 'carry on')
+        self.assertEqual(resumed['woke'], ['widget-1', 'widget-2', 'widget-3'])
+        self.assertFalse(self.person('list')['swarms'][0]['stopped'])
+
+    def test_the_work_contract_and_its_status(self):
+        started = self.start('--agents', '2')
+        self.swarm('p.widget-1', 'post', '--all', 'Deliverable: source evidence.')
+        assigned = self.swarm('p.widget-1', 'assign', 'waits', 'widget-1', 'widget-2', 'Inspect cleanup; report evidence')
+        self.assertEqual((assigned['task'], assigned['status']), ('waits', 'assigned'))
+        self.assertEqual(self.swarm('p.widget-2', 'assign', 'waits', 'widget-1', 'widget-2', 'Inspect cleanup; report evidence')['error'], 'task_exists')
+        self.assertEqual(self.swarm('p.widget-1', 'assign', 'more', 'widget-1', 'widget-2', 'x')['error'], 'owner_busy')
+        self.assertEqual(self.swarm('p.widget-2', 'claim', 'waits')['error'], 'task_owner_only')
+        self.assertEqual(self.swarm('p.widget-1', 'claim', 'waits')['status'], 'working')
+        self.assertEqual(self.swarm('p.widget-1', 'review', 'waits', 'supported', 'mine')['error'], 'reviewer_only')
+        submitted = self.swarm('p.widget-1', 'submit', 'waits', 'Source inspected; no measured latency')
+        # The reviewer is told; it was idle, so it got a turn of its own.
+        self.assertEqual((submitted['status'], submitted['woke']), ('reviewing', ['widget-2']))
+        self.settle('p.widget-2')
+        self.assertTrue(self.turns('p.widget-2')[-1]['prompt_preview'].startswith('[board] waits submitted for your review'))
+        partial = self.person('status', '--swarm', 'p.widget')
+        self.assertIsNone(partial['result'])
+        self.assertEqual(partial['tasks']['waits']['status'], 'reviewing')
+        self.swarm('p.widget-2', 'review', 'waits', 'conditional', 'Verified source; only helper-heavy workloads exercise it')
+        finished = self.swarm('p.widget-1', 'finish', 'partial', 'One conditional finding, no measured speedup')
+        # The coordinator hears the result after what it is doing.
+        self.assertEqual(finished['woke'], ['lead'])
+        self.settle('p.lead')
+        self.assertTrue(self.turns('p.lead')[-1]['prompt_preview'].startswith('[swarm p.widget] final result from widget-1: partial'))
+        done = self.person('status', '--swarm', 'p.widget')
+        self.assertEqual((done['outcome'], done['result']['outcome']), ('completed', 'partial'))
+        self.assertEqual(done['tasks']['waits']['verdict'], 'conditional')
+        self.assertEqual([m['name'] for m in done['members']], ['p.widget-1', 'p.widget-2'])
+        # The state is the board folded: without its cache, the same.
+        (Path(started['board']).parent / 'state.json').unlink()
+        again = self.person('status', '--swarm', 'p.widget')
+        self.assertEqual((again['tasks'], again['result']), (done['tasks'], done['result']))
+        kinds = [line.get('kind', 'post') for line in self.board(started)]
+        self.assertEqual(kinds, ['post', 'post', 'assign', 'claim', 'submit', 'review', 'finish'])
+
+    def test_two_claims_at_once_have_one_winner(self):
+        started = self.start('--agents', '3')
+        self.swarm('p.widget-1', 'assign', 'waits', 'widget-2', 'widget-3', 'Inspect cleanup')
+        # Two scripts claim the same task at once, as one agent's two shells could.
+        env = clean_env() | {'HOME': str(self.home), 'AGENT_SOCKET': str(self.store) + '.sock',
+                             'AGENT_BOT': 'p.widget-2', 'AGENT_TURN': '1',
+                             'AGENT_BOT_ID': str(started['swarm']['ids']['p.widget-2'])}
+        claims = [subprocess.Popen([str(SCRIPT), 'claim', 'waits'], env=env, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True) for _ in range(4)]
+        codes = sorted(c.wait(timeout=30) for c in claims)
+        self.assertEqual(codes, [0, 1, 1, 1])
+        self.assertEqual([line.get('kind') for line in self.board(started)].count('claim'), 1)
+
+    def test_the_coordinator_hears_once_when_nothing_runs_and_there_is_no_result(self):
+        started = self.start('--agents', '2')
+        quiet = self.person('check', '--swarm', 'p.widget')
+        self.assertEqual((quiet['woke'], quiet['board_changed']), (['lead'], True))
+        self.settle('p.lead')
+        prompt = self.turns('p.lead')[-1]['prompt_preview']
+        self.assertTrue(prompt.startswith('[swarm p.widget] nothing is running and there is no final result (partial)'), prompt)
+        self.assertEqual(self.person('check', '--swarm', 'p.widget')['board_changed'], False)
+        # Once a member has acted, quiet again is news again.
+        self.swarm('p.widget-1', 'role', 'tester')
+        self.assertEqual(self.person('check', '--swarm', 'p.widget')['woke'], ['lead'])
+        self.assertEqual([line.get('kind') for line in self.board(started)].count('quiet'), 2)
+
+    def test_stop_ends_members_and_helpers_turns(self):
+        started = self.start('--agents', '2')
+        self.model.release_headers = threading.Event()
+        self.model.all_streaming = self.model.release_headers
+        self.addCleanup(self.model.release_headers.set)
+        # A helper a member made, named after it, works too.
+        self.agent('run', '--store', str(self.store), '--bot', 'p.widget-1',
+                   f"shell:AGENT_STORE='{self.store}' '{self.binary}' fork --source p.widget-1 --bot p.widget-1.tests")
+        for bot in ('p.widget-1', 'p.widget-1.tests'):
+            self.agent('run', '--store', str(self.store), '--bot', bot, '--detach', 'gate')
+        for _ in range(200):
+            if all(self.turns(b)[-1]['status'] == 'running' for b in ('p.widget-1', 'p.widget-1.tests')):
+                break
+            time.sleep(.02)
+        self.assertEqual([m['name'] for m in self.person('status', '--swarm', 'p.widget')['members'] if m.get('helper')],
+                         ['p.widget-1.tests'])
+        stopped = self.person('stop', '--swarm', 'p.widget')
+        self.assertEqual(stopped['failed'], [])
+        for bot in ('p.widget-1', 'p.widget-1.tests'):
+            self.assertEqual(self.turns(bot)[-1]['status'], 'interrupted')
+        self.assertEqual(self.person('status', '--swarm', 'p.widget')['outcome'], 'stopped')
+        self.assertEqual(len(self.board(started)), 1)
+
+
+def load():
+    """The script as a module, for its rules without a daemon."""
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader('swarm_skill', str(SCRIPT))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader('swarm_skill', loader))
+    # No __pycache__ beside the script: the app bundles that folder as it is.
+    written, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+    try:
+        loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = written
+    return module
+
+
+class SwarmRuleTests(unittest.TestCase):
+    def setUp(self):
+        self.s = load()
+        self.swarm = {'name': 'p.w', 'members': ['p.w-1', 'p.w-2', 'p.w-3'], 'ids': {'p.w-1': 1, 'p.w-2': 2, 'p.w-3': 3},
+                      'coordinator': {'bot': 'p.lead', 'id': 9}, 'stopped': False}
+
+    def act(self, author=None, state=None):
+        folder = type('Folder', (), {'swarm': self.swarm, 'state': state or self.s.empty_state()})()
+        return folder, self.s.Act(folder, author, 1)
+
+    def bot(self, n, used, cap=1000, turn=None):
+        return {'name': f'p.w-{n}', 'id': n, 'tokens_used': used, 'budget_tokens': cap, 'running_turn': turn}
+
+    def test_a_deleted_helper_still_counts_and_a_deleted_member_takes_its_share(self):
+        state = self.s.empty_state()
+        members = {'p.w-1': self.bot(1, 100), 'p.w-2': self.bot(2, 50)}
+        helper = {'name': 'p.w-1.fix', 'id': 7, 'tokens_used': 30, 'root': 1}
+        self.assertEqual(self.s.usage(state, members, [helper]), (180, 2000))
+        self.assertTrue(state.pop('dirty'))
+        self.assertEqual(self.s.usage(state, members, []), (180, 2000))
+        self.assertNotIn('dirty', state)
+        del members['p.w-1']
+        self.assertEqual(self.s.usage(state, members, []), (50, 1000))
+
+    def test_posts_reach_who_they_name_and_everyone_only_when_asked(self):
+        reach = lambda act: sorted(m for m, how, _, _ in act.sends)
+        _, act = self.act('p.w-1')
+        self.s.post(act, 'profile is up, see notes.md', False)
+        self.assertEqual(reach(act), [])
+        _, act = self.act('p.w-1')
+        self.s.post(act, 'over to @w-3. And @p.w-2.', False)
+        self.assertEqual(reach(act), ['p.w-2', 'p.w-3'])
+        _, act = self.act('p.w-1')
+        self.s.post(act, 'plan', True)
+        self.assertEqual(reach(act), ['p.w-2', 'p.w-3'])
+        _, act = self.act()
+        self.s.post(act, 'carry on', False)
+        self.assertEqual(reach(act), ['p.w-1', 'p.w-2', 'p.w-3'])
+
+    def test_each_share_of_a_budget_is_told_once_and_only_to_working_agents(self):
+        folder, act = self.act('p.w-1')
+        members = {'p.w-1': self.bot(1, 700, turn=4), 'p.w-2': self.bot(2, 100, turn=7), 'p.w-3': self.bot(3, 900)}
+        self.s.budget(act, folder, members, [])
+        # 1700 of 3000 passes 50% of the swarm's; w-1 is past 65% of its own, w-3 is idle.
+        self.assertEqual([(l['from'], l.get('member'), l['spent']) for l in act.lines], [('budget', None, 50), ('budget', 'w-1', 65)])
+        self.assertEqual(sorted((m, how) for m, how, _, _ in act.sends), [('p.w-2', 'steer')])
+        for line in act.lines:
+            self.s.apply(folder.state, line)
+        folder, act = self.act('p.w-2', folder.state)
+        self.s.budget(act, folder, members, [])
+        self.assertEqual(act.lines, [])
+
+    def test_the_state_is_the_board_folded(self):
+        state = self.s.empty_state()
+        for line in [{'from': 'w-1', 'kind': 'assign', 'stream': 't', 'owner': 'w-1', 'reviewer': 'w-2', 'brief': 'b', 'at': 1},
+                     {'from': 'w-1', 'kind': 'claim', 'stream': 't', 'at': 2},
+                     {'from': 'w-1', 'kind': 'leave', 'stream': 't', 'at': 3},
+                     {'from': 'w-1', 'kind': 'claim', 'stream': 't', 'at': 4},
+                     {'from': 'w-1', 'kind': 'submit', 'stream': 't', 'text': 'done', 'at': 5},
+                     {'from': 'w-2', 'kind': 'review', 'stream': 't', 'verdict': 'supported', 'evidence': 'ran it', 'at': 6},
+                     {'from': 'w-1', 'kind': 'finish', 'outcome': 'achieved', 'text': 'shipped', 'at': 7}]:
+            self.s.apply(state, line)
+        self.assertEqual(state['tasks']['t'], {'owner': 'w-1', 'reviewer': 'w-2', 'brief': 'b', 'status': 'reviewed',
+                                               'result': 'done', 'verdict': 'supported', 'evidence': 'ran it'})
+        self.assertEqual((state['streams'], state['result']['outcome']), ({}, 'achieved'))
+
+    def test_a_reviewer_that_left_is_replaced_and_the_result_keeps_its_author(self):
+        state = self.s.empty_state()
+        state['tasks']['t'] = {'owner': 'w-1', 'reviewer': 'w-9', 'brief': 'b', 'status': 'reviewing', 'result': 'r',
+                               'verdict': None, 'evidence': None}
+        _, act = self.act('p.w-1', state)
+        self.s.assign(act, 't', 'w-1', 'w-3', 'please review')
+        self.s.apply(state, act.lines[0])
+        self.assertEqual((state['tasks']['t']['reviewer'], state['tasks']['t']['result']), ('w-3', 'r'))
+        self.assertEqual([m for m, *_ in act.sends], ['p.w-3'])
+
+    def test_the_mix_is_dealt_to_the_row_furthest_below_its_share(self):
+        mix = [{'share': 50}, {'share': 25}, {'share': 25}]
+        self.assertEqual(self.s.deal(mix, 4), [0, 1, 2, 0])
+        self.assertEqual(self.s.deal(mix, 1, [2, 1, 0]), [2])
+        self.assertEqual(self.s.goal_name('Make the provider pool faster'), 'provider')
 
 
 if __name__ == '__main__':
