@@ -3220,6 +3220,22 @@ test("the Memory sheet lists a project's facts and yours, newest first, and open
   assert.match(doc.getElementById('sheet').innerHTML, /<h4>Memory<\/h4>/);
 });
 
+test('a Memory sheet opened again shows only the newest answer, and a broken project file says so', async () => {
+  let release;
+  const slow = new Promise((r) => { release = r; });
+  const answers = [() => slow, async () => ({ user: { name: null, dir: '/m', facts: [] }, projects: [{ name: null, dir: '/w', error: 'invalid project file' }], more: 0 })];
+  const p = page({ memoryView: () => answers.shift()() });
+  p.upsert({ name: 'demo.lead', bot_id: 1, workspace: '/w' });
+  const doc = p.context.document;
+  const first = p.act({ dataset: { act: 'memory', who: '' } });
+  await p.act({ dataset: { act: 'memory', who: 'demo.lead' } }); await settle();
+  release({ user: { name: null, dir: '/m', facts: [] }, projects: [], more: 0 }); await first; await settle();
+  const html = doc.getElementById('sheet').innerHTML;
+  assert.match(html, /<h4>demo memory<\/h4>/);
+  assert.match(html, /This project[^]*invalid project file/);
+  assert.doesNotMatch(html, /No \.agents\/project\.toml/);
+});
+
 test('a coordinator hears once, when it rests, of turns its tasks ended that it did not ask for', async () => {
   const sent = [];
   const p = page({ request: async (op, params) => { if (op === 'submit') sent.push(params); return { turn: 9 }; }, log() {} });

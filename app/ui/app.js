@@ -1100,8 +1100,8 @@ async function wake(lead) {
   try { await Daemon.request('submit', { bot: lead, bot_id: l.id, request_id: id, prompt, delivery: 'queue', origin: 'tasks' }); mem?.told(); }
   catch (e) {
     if (/^bot_not_found/.test(e?.message ?? '')) { S.wakes.delete(lead); return; }
-    // Another window told it first.
-    if (/^idempotency_conflict/.test(e?.message ?? '')) { mem?.told(); return; }
+    // Another window told it first, perhaps without this window's memory lines, which wait for the next.
+    if (/^idempotency_conflict/.test(e?.message ?? '')) return;
     const later = w.tasks;
     w.tasks = new Map(sent);
     for (const [name, t] of later) merge(w.tasks, name, t);
@@ -2316,21 +2316,24 @@ async function submitProject() {
 // ---------- the Memory sheet ----------
 // What agents saved for later agents, as files: at Home yours and every project's, in a project its
 // own and yours, newest first. A fact opens in a tab. Agents write memory; the sheet only reads it.
+let memoryAsk = 0;
 async function openMemorySheet(lead) {
   closeMenu();
+  const ask = ++memoryAsk;
   const b = lead ? bot(lead) : null, project = lead ? leadProject(lead) : null;
   sheetFor = null; sheetKind = 'memory';
   $('sheet').innerHTML = `<h4>${project ? `${esc(project)} memory` : 'Memory'}</h4><p class="hint">reading…</p>`;
   $('sheetwrap').classList.add('on'); S.ui.sheet = true;
   let v = null, error = '';
   try { v = await Daemon.memoryView(b?.workspace ?? null); } catch (e) { error = String(e?.message ?? e); }
-  if (!S.ui.sheet || sheetKind !== 'memory') return;
+  // A sheet closed, or opened again since, while memory was read shows only its own answer.
+  if (!S.ui.sheet || sheetKind !== 'memory' || ask !== memoryAsk) return;
   $('sheet').innerHTML = memoryHTML(v, project, error);
   setTimeout(() => $('sheet').querySelector('.mrow,.sbtn.primary')?.focus?.(), 0);
 }
 function memoryHTML(v, project, error) {
   const now = Date.now(), you = v ? { ...v.user, label: 'You' } : null;
-  const projects = (v?.projects ?? []).map((sc) => ({ ...sc, label: sc.name }));
+  const projects = (v?.projects ?? []).map((sc) => ({ ...sc, label: sc.name ?? 'This project' }));
   const scopes = v ? (project ? [...projects, you] : [you, ...projects]) : [];
   const fact = (f) => `<button type="button" class="mrow" data-act="open-fact" data-v="${esc(f.path)}" title="${esc(f.path)}"><span class="md">${esc(f.description)}</span><span class="mm">${esc(f.name)} · ${esc(f.type)} · ${esc(f.source)} · ${esc(agoText(now - f.modified))}</span></button>`;
   const scope = (sc) => `<div class="mscope"><div class="mh">${esc(sc.label)} <span class="d">${esc(sc.dir)}</span></div>${sc.error ? `<p class="hint warn">${esc(sc.error)}</p>` : sc.facts.length ? [...sc.facts].sort((a, b) => b.modified - a.modified).map(fact).join('') : '<p class="hint">Nothing saved yet.</p>'}</div>`;

@@ -523,7 +523,15 @@ pub fn view(root: &Path, dir: Option<&Path>) -> Value {
     };
     let projects = root.join("projects");
     let (names, more) = match dir {
-        Some(dir) => (project_of(dir).ok().into_iter().collect(), 0),
+        // A folder in no project has none; one whose project file is broken says so.
+        Some(dir) => match project_of(dir) {
+            Ok(name) => (vec![name], 0),
+            Err(error) if error.starts_with("project_unknown: ") => (Vec::new(), 0),
+            Err(error) => {
+                let user = scope(root.to_path_buf(), None);
+                return json!({"user": user, "projects": [{"name": null, "dir": dir, "error": error}], "more": 0});
+            }
+        },
         None => {
             let mut names: Vec<String> = std::fs::read_dir(&projects)
                 .into_iter()
@@ -601,6 +609,8 @@ mod tests {
         std::fs::write(work.join(".agents/project.toml"), "name = \"demo\"\n").unwrap();
         assert_eq!(view(&root, Some(&work))["projects"][0]["name"], "demo");
         assert_eq!(view(&root, Some(&root))["projects"], json!([]));
+        std::fs::write(work.join(".agents/project.toml"), "name = [\n").unwrap();
+        assert!(view(&root, Some(&work))["projects"][0]["error"].is_string());
         let _ = std::fs::remove_dir_all(&root);
     }
 
