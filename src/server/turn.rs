@@ -218,6 +218,8 @@ struct Warm<'a> {
     reasoning: Option<&'a str>,
     tools: &'a serde_json::value::RawValue,
     context: &'a Context,
+    /// The items the call sent without thinking: a refresh sends the same.
+    thinking: Strip,
     /// The call's fallback choice: a refresh renders the same request.
     fallbacks: bool,
     after: std::time::Duration,
@@ -607,7 +609,8 @@ impl Turn {
         Ok(context)
     }
 
-    fn items(&self, context: &Context) -> Items {
+    /// The window's items, those `strip` names without thinking.
+    fn items(&self, context: &Context, strip: Strip) -> Items {
         match &context.window {
             Some(w) => self.window_items(
                 context.prefix.bytes.clone(),
@@ -617,7 +620,7 @@ impl Turn {
                     thinking: &w.thinking,
                     elided: w.elided,
                 },
-                context.thinking,
+                strip,
             ),
             None => self.window_items(context.prefix.bytes.clone(), Span::EMPTY, Strip::default()),
         }
@@ -2144,6 +2147,13 @@ impl Turn {
                 model_rounds -= rounds;
                 record.tokens_used = record.tokens_used.saturating_sub(tokens);
             }
+            // A call that withheld its replayed thinking recorded that on
+            // the bot; refreshes send what it sent.
+            if context.window.as_ref().is_some_and(|w| {
+                w.family == agent_runtime::codec::Family::Anthropic && !w.ids.is_empty()
+            }) {
+                context.thinking = record.thinking;
+            }
             let response = match called {
                 Ok(Some(response)) => response,
                 // It lands before the turn parks or fails.
@@ -2285,6 +2295,7 @@ impl Turn {
                     reasoning: record.effort.as_deref(),
                     tools: &tools,
                     context: &context,
+                    thinking: context.thinking,
                     fallbacks: record.fallbacks,
                     after,
                     read_at,
@@ -2464,9 +2475,13 @@ impl Turn {
             Body::Window(_) => provider.keep_warm_after(model, record.effort.as_deref()),
             Body::Copied(_) | Body::Span(..) => None,
         };
+        // Replayed thinking a failure may have come from, once withheld.
+        let mut withheld = None;
+        // Server errors this call met, which alone may come from its body.
+        let mut server_failures = 0;
         loop {
             let items = match body {
-                Body::Window(context) => self.items(context),
+                Body::Window(context) => self.items(context, withheld.unwrap_or(context.thinking)),
                 Body::Copied(copy) => self.copied_items(copy),
                 Body::Span(plan, stripped) => self.span_items(plan, stripped).await?,
             };
@@ -2512,6 +2527,7 @@ impl Turn {
                         reasoning: record.effort.as_deref(),
                         tools,
                         context,
+                        thinking: withheld.unwrap_or(context.thinking),
                         fallbacks: record.fallbacks,
                         after,
                         read_at: tokio::time::Instant::now(),
@@ -2603,24 +2619,57 @@ impl Turn {
             } else {
                 self.failed_usage(usage).await?;
             }
-            // A retry is another billable call. Preserve final provider errors,
-            // but stop retrying once failed usage has spent the bot's budget.
-            let error = if retryable(&error.code) {
-                record
-                    .exhausted()
-                    .or_else(|| {
-                        (*model_rounds >= MAX_ROUNDS).then(|| Error::new("tool_round_limit"))
+            if error.code.starts_with("provider_http_5") {
+                server_failures += 1;
+            }
+            // Thinking this failure may have come from is withheld from the
+            // bot's later requests whether or not this call can resend.
+            let mut resend = false;
+            if let Body::Window(context) = body
+                && withheld.is_none()
+                && let Some(prefix) = record.thinking_prefix
+                && let Some(strip) = withhold_thinking(context, &error, server_failures)
+            {
+                let bot = self.bot.clone();
+                let elided = record.thinking_elided;
+                self.store
+                    .op("set_thinking", move |db| {
+                        db.set_thinking(&bot, prefix, strip, elided)
                     })
-                    .unwrap_or(error)
-            } else {
-                error
-            };
+                    .await?;
+                record.thinking = strip;
+                withheld = Some(strip);
+                resend = true;
+            }
+            // A retry is another billable call: none once failed usage has
+            // spent the bot's or turn's budget, or the rounds are used up.
+            let capped = record
+                .exhausted()
+                .or_else(|| (*model_rounds >= MAX_ROUNDS).then(|| Error::new("tool_round_limit")));
             attempt += 1;
             let paced = error.code == "provider_rate_limited" || error.code == "provider_http_429";
             let cap = if paced {
                 MAX_PACED_ATTEMPTS
             } else {
                 MAX_ATTEMPTS
+            };
+            // Sent again at once without the thinking, within the same
+            // attempt and time limits as any retry.
+            if resend && capped.is_none() && attempt < cap && spent < RETRY_BUDGET {
+                self.hub
+                    .live(
+                        &self.bot,
+                        json!({"event":"retry","bot":self.bot,"turn":turn,"durable":false,
+                            "attempt":attempt,"error":error.code,"detail":error.detail,
+                            "delay_ms":0,"parked":false,"thinking_withheld":true}),
+                    )
+                    .await?;
+                continue;
+            }
+            // Final provider errors are kept.
+            let error = match capped {
+                Some(capped) if retryable(&error.code) || resend => capped,
+                _ => error,
             };
             // Time spent waiting fairly in the pool is the fleet's, not this
             // call's; the budget counts only the attempts and their backoff.
@@ -2825,7 +2874,7 @@ impl Turn {
         let reasoning = warm.reasoning.map(str::to_owned);
         let tools = warm.tools.to_owned();
         let fallbacks = warm.fallbacks;
-        let items = self.items(warm.context);
+        let items = self.items(warm.context, warm.thinking);
         let sent = refresh.clone();
         let expires = warm.read_at + agent_runtime::provider::CACHE_LIFETIME;
         let task = tokio::spawn(async move {
@@ -3472,6 +3521,42 @@ async fn settle(
 /// When `at` was, in milliseconds since the Unix epoch.
 fn epoch_ms(at: tokio::time::Instant) -> u64 {
     now_ms().saturating_sub(at.elapsed().as_millis() as u64)
+}
+
+/// The strip that withholds every thinking block a failed request replayed,
+/// when the failure may have come from one. A provider that cannot read a
+/// replayed block back fails that body every time, so no retry clears it
+/// and every later turn repeats it: Bedrock answers some with a server
+/// error about the reasoning. A server error or a 400 that names the
+/// thinking or reasoning withholds it at once; a server error that does
+/// not, once the call met its second (`server_failures` counts them, this
+/// one included); an internal error in the stream, which is otherwise
+/// final, at once. Every other failure keeps it.
+fn withhold_thinking(context: &Context, error: &Error, server_failures: u32) -> Option<Strip> {
+    let window = context.window.as_ref()?;
+    let replayed = window.family == agent_runtime::codec::Family::Anthropic
+        && window
+            .ids
+            .iter()
+            .zip(&window.thinking)
+            .any(|(id, bytes)| *bytes > 0 && !context.thinking.strips(*id));
+    if !replayed {
+        return None;
+    }
+    let detail = error
+        .detail
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let named = detail.contains("thinking") || detail.contains("reasoning");
+    let withhold = if error.code.starts_with("provider_http_5") {
+        named || server_failures >= 2
+    } else {
+        // A 400 naming a block it cannot verify, which the binding check
+        // that drops blocks does not cover; not a request signature's 403.
+        error.code == "provider_server_error" || (error.code == "provider_http_400" && named)
+    };
+    withhold.then(|| Strip::from(window.ids[window.ids.len() - 1] + 1))
 }
 
 /// Whether the turn may make another model call.

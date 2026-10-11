@@ -256,10 +256,18 @@ impl State {
                 self.done = true;
                 Ok(Frame::Quiet)
             }
-            Some("error") => match detail_of(&event) {
-                Some(detail) => fail_with("provider_error", detail),
-                None => fail("provider_error"),
-            },
+            // An internal error after the stream began is told apart: the
+            // runtime may resend without what the request replayed.
+            Some("error") => {
+                let code = match event["error"]["type"].as_str() {
+                    Some("api_error") => "provider_server_error",
+                    _ => "provider_error",
+                };
+                match detail_of(&event) {
+                    Some(detail) => fail_with(code, detail),
+                    None => fail(code),
+                }
+            }
             // Sent to hold an idle stream open; it is not progress.
             Some("ping") => Ok(Frame::Keepalive),
             _ => Ok(Frame::Quiet), // content_block_stop, unknown metadata
