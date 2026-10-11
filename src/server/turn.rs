@@ -2619,32 +2619,17 @@ impl Turn {
             } else {
                 self.failed_usage(usage).await?;
             }
-            // A retry is another billable call. Preserve final provider errors,
-            // but stop retrying once failed usage has spent the bot's budget.
-            let error = if retryable(&error.code) {
-                record
-                    .exhausted()
-                    .or_else(|| {
-                        (*model_rounds >= MAX_ROUNDS).then(|| Error::new("tool_round_limit"))
-                    })
-                    .unwrap_or(error)
-            } else {
-                error
-            };
-            attempt += 1;
             if error.code.starts_with("provider_http_5") {
                 server_failures += 1;
             }
-            // The resend is billed like any retry: never past the caps.
+            // Thinking this failure may have come from is withheld from the
+            // bot's later requests whether or not this call can resend.
+            let mut resend = false;
             if let Body::Window(context) = body
                 && withheld.is_none()
-                && record.exhausted().is_none()
-                && *model_rounds < MAX_ROUNDS
                 && let Some(prefix) = record.thinking_prefix
                 && let Some(strip) = withhold_thinking(context, &error, server_failures)
             {
-                // Sent again at once without the thinking, which stays
-                // withheld from this bot's later requests too.
                 let bot = self.bot.clone();
                 let elided = record.thinking_elided;
                 self.store
@@ -2654,6 +2639,16 @@ impl Turn {
                     .await?;
                 record.thinking = strip;
                 withheld = Some(strip);
+                resend = true;
+            }
+            // A retry is another billable call: none once failed usage has
+            // spent the bot's or turn's budget, or the rounds are used up.
+            let capped = record
+                .exhausted()
+                .or_else(|| (*model_rounds >= MAX_ROUNDS).then(|| Error::new("tool_round_limit")));
+            attempt += 1;
+            // Sent again at once without the thinking.
+            if resend && capped.is_none() {
                 self.hub
                     .live(
                         &self.bot,
@@ -2664,6 +2659,11 @@ impl Turn {
                     .await?;
                 continue;
             }
+            // Final provider errors are kept.
+            let error = match capped {
+                Some(capped) if retryable(&error.code) || resend => capped,
+                _ => error,
+            };
             let paced = error.code == "provider_rate_limited" || error.code == "provider_http_429";
             let cap = if paced {
                 MAX_PACED_ATTEMPTS

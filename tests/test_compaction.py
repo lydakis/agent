@@ -750,6 +750,20 @@ class AnthropicUnreadableThinkingTests(ModelFixture):
         self.turn(client, 2, 'third')
         self.assertEqual([self.signatures(r) for r in self.requests()], [['sig-1'], ['sig-1']])
 
+    def test_a_turn_out_of_budget_still_withholds_it_from_the_next(self):
+        client = self.anthropic()
+        client.request('create', bot='Bob', workspace=str(self.path), effort='low')
+        self.turn(client, 0, 'first')
+        self.requests()
+        self.model.unreadable, self.model.unreadable_error = {'sig-1'}, ('stream', 'Internal server error')
+        # The failed stream bills its input, which spends the turn's cap.
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='second',
+                              budget_tokens=1)['result']['turn']
+        finished = client.finished(turn)['data']
+        self.assertEqual((finished['status'], finished['error']), ('failed', 'turn_budget_exhausted'))
+        self.turn(client, 2, 'third')
+        self.assertEqual([self.signatures(r) for r in self.requests()], [['sig-1'], []])
+
     def test_an_internal_error_in_the_stream_withholds_it_at_once(self):
         _, sent = self.unreadable(('stream', 'Internal server error'))
         self.assertEqual([self.signatures(r) for r in sent], [['sig-1'], []])
