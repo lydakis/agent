@@ -553,6 +553,16 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
             # request replaying one, as Bedrock has: `unreadable` names their
             # signatures and `unreadable_error` the failure, an HTTP status
             # and message, or 'stream' for an api_error after the stream began.
+            if getattr(self.server, 'rate_limits', 0):
+                self.server.rate_limits -= 1
+                body = b'{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}'
+                self.send_response(429)
+                self.send_header('Retry-After', '0.001')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+                return
             failure = getattr(self.server, 'unreadable_error', None)
             if failure and any(b['type'] == 'thinking' and b['signature'] in self.server.unreadable
                                for m in request['messages'] for b in m['content']):

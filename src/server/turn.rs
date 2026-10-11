@@ -2477,6 +2477,8 @@ impl Turn {
         };
         // Replayed thinking a failure may have come from, once withheld.
         let mut withheld = None;
+        // Server errors this call met, which alone may come from its body.
+        let mut server_failures = 0;
         loop {
             let items = match body {
                 Body::Window(context) => self.items(context, withheld.unwrap_or(context.thinking)),
@@ -2630,10 +2632,16 @@ impl Turn {
                 error
             };
             attempt += 1;
+            if error.code.starts_with("provider_http_5") {
+                server_failures += 1;
+            }
+            // The resend is billed like any retry: never past the caps.
             if let Body::Window(context) = body
                 && withheld.is_none()
+                && record.exhausted().is_none()
+                && *model_rounds < MAX_ROUNDS
                 && let Some(prefix) = record.thinking_prefix
-                && let Some(strip) = withhold_thinking(context, &error, attempt)
+                && let Some(strip) = withhold_thinking(context, &error, server_failures)
             {
                 // Sent again at once without the thinking, which stays
                 // withheld from this bot's later requests too.
@@ -3519,10 +3527,11 @@ fn epoch_ms(at: tokio::time::Instant) -> u64 {
 /// replayed block back fails that body every time, so no retry clears it
 /// and every later turn repeats it: Bedrock answers some with a server
 /// error about the reasoning. A failure that names the thinking withholds
-/// it at once; a server error that does not, once the same body failed
-/// twice; an internal error in the stream, which is otherwise final, at
-/// once. Every other failure keeps it.
-fn withhold_thinking(context: &Context, error: &Error, attempt: u32) -> Option<Strip> {
+/// it at once; a server error that does not, once the call met its second
+/// (`server_failures` counts them, this one included); an internal error
+/// in the stream, which is otherwise final, at once. Every other failure
+/// keeps it.
+fn withhold_thinking(context: &Context, error: &Error, server_failures: u32) -> Option<Strip> {
     let window = context.window.as_ref()?;
     let replayed = window.family == agent_runtime::codec::Family::Anthropic
         && window
@@ -3543,7 +3552,7 @@ fn withhold_thinking(context: &Context, error: &Error, attempt: u32) -> Option<S
         detail.contains("thinking")
             || detail.contains("reasoning")
             || error.code == "provider_server_error"
-            || attempt >= 2
+            || server_failures >= 2
     } else {
         // A client error names a signature it cannot verify; the binding
         // check that drops blocks does not cover that one.

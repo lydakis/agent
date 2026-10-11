@@ -703,7 +703,7 @@ class AnthropicUnreadableThinkingTests(ModelFixture):
     def signatures(request):
         return [b['signature'] for m in request['messages'] for b in m['content'] if b['type'] == 'thinking']
 
-    def unreadable(self, failure):
+    def unreadable(self, failure, rate_limits=0):
         """Bob answers a turn; then the provider cannot read that answer's
         thinking back. Returns the client and the second turn's requests."""
         client = self.anthropic()
@@ -711,7 +711,7 @@ class AnthropicUnreadableThinkingTests(ModelFixture):
         self.turn(client, 0, 'first')
         self.requests()
         self.model.signature, self.model.unreadable = 'sig-2', {'sig-1'}
-        self.model.unreadable_error = failure
+        self.model.unreadable_error, self.model.rate_limits = failure, rate_limits
         self.turn(client, 1, 'second')
         return client, self.requests()
 
@@ -728,6 +728,10 @@ class AnthropicUnreadableThinkingTests(ModelFixture):
     def test_a_server_error_that_names_nothing_withholds_it_on_the_second_failure(self):
         _, sent = self.unreadable((500, 'Internal server error'))
         self.assertEqual([self.signatures(r) for r in sent], [['sig-1'], ['sig-1'], []])
+
+    def test_a_rate_limit_before_does_not_count_as_a_server_error(self):
+        _, sent = self.unreadable((500, 'Internal server error'), rate_limits=1)
+        self.assertEqual([self.signatures(r) for r in sent], [['sig-1'], ['sig-1'], ['sig-1'], []])
 
     def test_an_internal_error_in_the_stream_withholds_it_at_once(self):
         _, sent = self.unreadable(('stream', 'Internal server error'))
