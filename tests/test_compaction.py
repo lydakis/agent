@@ -675,6 +675,66 @@ class AnthropicThinkingBindingTests(ModelFixture):
 
 
 @skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'requires release binary')
+class AnthropicUnreadableThinkingTests(ModelFixture):
+    """The provider can no longer read a replayed thinking block back and
+    fails every request that replays it, as Bedrock has."""
+    handler = AnthropicModel
+
+    def anthropic(self):
+        client = Client(self.binary, self.path / 'state.sqlite', self.url,
+                        tools='echo,shell', provider='anthropic', family='anthropic',
+                        model='synthetic-claude', key_env='ANTHROPIC_TEST_KEY',
+                        env={**clean_env(), 'ANTHROPIC_TEST_KEY': 'synthetic-anthropic-key'},
+                        settings={'context_bytes': 65536})
+        self.addCleanup(client.close)
+        return client
+
+    def requests(self):
+        out = []
+        while not self.model.requests.empty():
+            out.append(self.model.requests.get())
+        return out
+
+    def turn(self, client, request, prompt):
+        turn = client.request('submit', bot='Bob', request_id=str(request), prompt=prompt)['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+
+    @staticmethod
+    def signatures(request):
+        return [b['signature'] for m in request['messages'] for b in m['content'] if b['type'] == 'thinking']
+
+    def unreadable(self, failure):
+        """Bob answers a turn; then the provider cannot read that answer's
+        thinking back. Returns the client and the second turn's requests."""
+        client = self.anthropic()
+        client.request('create', bot='Bob', workspace=str(self.path), effort='low')
+        self.turn(client, 0, 'first')
+        self.requests()
+        self.model.signature, self.model.unreadable = 'sig-2', {'sig-1'}
+        self.model.unreadable_error = failure
+        self.turn(client, 1, 'second')
+        return client, self.requests()
+
+    def test_thinking_the_error_names_is_withheld_at_once_and_from_later_turns(self):
+        client, sent = self.unreadable((500, 'Internal error while restoring the reasoning'))
+        self.assertEqual([self.signatures(r) for r in sent], [['sig-1'], []])
+        # Later turns no longer replay it, and keep the thinking written since.
+        self.turn(client, 2, 'third')
+        self.turn(client, 3, 'tool:x')
+        later = self.requests()
+        self.assertTrue(later and all('sig-1' not in self.signatures(r) for r in later))
+        self.assertIn('sig-2', self.signatures(later[-1]))
+
+    def test_a_server_error_that_names_nothing_withholds_it_on_the_second_failure(self):
+        _, sent = self.unreadable((500, 'Internal server error'))
+        self.assertEqual([self.signatures(r) for r in sent], [['sig-1'], ['sig-1'], []])
+
+    def test_an_internal_error_in_the_stream_withholds_it_at_once(self):
+        _, sent = self.unreadable(('stream', 'Internal server error'))
+        self.assertEqual([self.signatures(r) for r in sent], [['sig-1'], []])
+
+
+@skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'requires release binary')
 class SummaryCopyTests(ModelFixture):
     """A summary request copies the bot's last call through the span it
     summarizes, with the request to write after it, so the provider reads

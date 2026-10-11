@@ -595,7 +595,24 @@ accounts get the same check and a mismatch the runtime missed costs the
 dropped blocks rather than the turn. The response reports each drop in
 `input_transformations`; the runtime publishes the count as a non-durable
 `thinking_dropped` event, which should never appear. The synthetic endpoint
-in the tests refuses mismatches outright, as `error` would. Empty instructions omit the system block, since empty text
+in the tests refuses mismatches outright, as `error` would.
+
+A provider can also fail to read a replayed block back with nothing in front
+of it changed. On 2026-10-11, Opus 5.5 and Fable 5.1 on Bedrock
+answered such requests with server errors about restoring the reasoning (the
+exact text was not kept), often in a sub-agent's long tool-using turn. The
+same body fails every time, so retries never cleared it and every later turn
+of that bot repeated it; switching models only helped because a block from
+another model is dropped unread. The runtime now sends the request once
+more without any thinking it replays, and records that on the bot as a
+binding change, so later requests leave those blocks out too and keep the
+thinking written after. It does that at once when the error names thinking
+or reasoning, when the stream ends in an `api_error` event (otherwise
+final), or for a 4xx naming a signature; for a server error that names
+neither, on its second failure. That `retry` event carries
+`thinking_withheld: true`. The cost is the withheld reasoning and a cache miss
+from the first stripped node, once. Why Bedrock could not read the blocks is
+not known; global cross-Region profiles (#99) are an unverified suspect. Empty instructions omit the system block, since empty text
 cannot carry an Anthropic cache breakpoint; automatic caching remains enabled.
 
 ### Keeping the Anthropic cache warm
