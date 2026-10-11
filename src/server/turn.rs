@@ -3526,11 +3526,11 @@ fn epoch_ms(at: tokio::time::Instant) -> u64 {
 /// when the failure may have come from one. A provider that cannot read a
 /// replayed block back fails that body every time, so no retry clears it
 /// and every later turn repeats it: Bedrock answers some with a server
-/// error about the reasoning. A failure that names the thinking withholds
-/// it at once; a server error that does not, once the call met its second
-/// (`server_failures` counts them, this one included); an internal error
-/// in the stream, which is otherwise final, at once. Every other failure
-/// keeps it.
+/// error about the reasoning. A server error or a 400 that names the
+/// thinking or reasoning withholds it at once; a server error that does
+/// not, once the call met its second (`server_failures` counts them, this
+/// one included); an internal error in the stream, which is otherwise
+/// final, at once. Every other failure keeps it.
 fn withhold_thinking(context: &Context, error: &Error, server_failures: u32) -> Option<Strip> {
     let window = context.window.as_ref()?;
     let replayed = window.family == agent_runtime::codec::Family::Anthropic
@@ -3547,16 +3547,13 @@ fn withhold_thinking(context: &Context, error: &Error, server_failures: u32) -> 
         .as_deref()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let server = error.code.starts_with("provider_http_5") || error.code == "provider_server_error";
-    let withhold = if server {
-        detail.contains("thinking")
-            || detail.contains("reasoning")
-            || error.code == "provider_server_error"
-            || server_failures >= 2
+    let named = detail.contains("thinking") || detail.contains("reasoning");
+    let withhold = if error.code.starts_with("provider_http_5") {
+        named || server_failures >= 2
     } else {
-        // A client error names a signature it cannot verify; the binding
-        // check that drops blocks does not cover that one.
-        error.code.starts_with("provider_http_4") && detail.contains("signature")
+        // A 400 naming a block it cannot verify, which the binding check
+        // that drops blocks does not cover; not a request signature's 403.
+        error.code == "provider_server_error" || (error.code == "provider_http_400" && named)
     };
     withhold.then(|| Strip::from(window.ids[window.ids.len() - 1] + 1))
 }

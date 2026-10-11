@@ -733,6 +733,23 @@ class AnthropicUnreadableThinkingTests(ModelFixture):
         _, sent = self.unreadable((500, 'Internal server error'), rate_limits=1)
         self.assertEqual([self.signatures(r) for r in sent], [['sig-1'], ['sig-1'], ['sig-1'], []])
 
+    def test_a_400_naming_the_thinking_withholds_it_at_once(self):
+        _, sent = self.unreadable((400, 'messages.1.content.0: thinking block could not be verified'))
+        self.assertEqual([self.signatures(r) for r in sent], [['sig-1'], []])
+
+    def test_a_request_signature_refusal_keeps_the_thinking(self):
+        client = self.anthropic()
+        client.request('create', bot='Bob', workspace=str(self.path), effort='low')
+        self.turn(client, 0, 'first')
+        self.requests()
+        self.model.unreadable, self.model.unreadable_error = {'sig-1'}, (
+            403, 'The request signature we calculated does not match the signature you provided.')
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='second')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'failed')
+        self.model.unreadable_error = None
+        self.turn(client, 2, 'third')
+        self.assertEqual([self.signatures(r) for r in self.requests()], [['sig-1'], ['sig-1']])
+
     def test_an_internal_error_in_the_stream_withholds_it_at_once(self):
         _, sent = self.unreadable(('stream', 'Internal server error'))
         self.assertEqual([self.signatures(r) for r in sent], [['sig-1'], []])
