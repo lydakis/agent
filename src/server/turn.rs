@@ -2647,8 +2647,15 @@ impl Turn {
                 .exhausted()
                 .or_else(|| (*model_rounds >= MAX_ROUNDS).then(|| Error::new("tool_round_limit")));
             attempt += 1;
-            // Sent again at once without the thinking.
-            if resend && capped.is_none() {
+            let paced = error.code == "provider_rate_limited" || error.code == "provider_http_429";
+            let cap = if paced {
+                MAX_PACED_ATTEMPTS
+            } else {
+                MAX_ATTEMPTS
+            };
+            // Sent again at once without the thinking, within the same
+            // attempt and time limits as any retry.
+            if resend && capped.is_none() && attempt < cap && spent < RETRY_BUDGET {
                 self.hub
                     .live(
                         &self.bot,
@@ -2663,12 +2670,6 @@ impl Turn {
             let error = match capped {
                 Some(capped) if retryable(&error.code) || resend => capped,
                 _ => error,
-            };
-            let paced = error.code == "provider_rate_limited" || error.code == "provider_http_429";
-            let cap = if paced {
-                MAX_PACED_ATTEMPTS
-            } else {
-                MAX_ATTEMPTS
             };
             // Time spent waiting fairly in the pool is the fleet's, not this
             // call's; the budget counts only the attempts and their backoff.

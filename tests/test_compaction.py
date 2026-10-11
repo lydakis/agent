@@ -768,6 +768,21 @@ class AnthropicUnreadableThinkingTests(ModelFixture):
         _, sent = self.unreadable(('stream', 'Internal server error'))
         self.assertEqual([self.signatures(r) for r in sent], [['sig-1'], []])
 
+    def test_a_failure_on_the_last_attempt_withholds_it_without_another_call(self):
+        client = self.anthropic()
+        client.request('create', bot='Bob', workspace=str(self.path), effort='low')
+        self.turn(client, 0, 'first')
+        self.requests()
+        self.model.unreadable, self.model.unreadable_error = {'sig-1'}, ('stream', 'Internal server error')
+        # Seven rate limits leave the internal error the call's eighth and last attempt.
+        self.model.rate_limits = 7
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='second')['result']['turn']
+        finished = client.finished(turn)['data']
+        self.assertEqual((finished['status'], finished['error']), ('failed', 'provider_server_error'))
+        self.assertEqual([self.signatures(r) for r in self.requests()], [['sig-1']] * 8)
+        self.turn(client, 2, 'third')
+        self.assertEqual([self.signatures(r) for r in self.requests()], [[]])
+
 
 @skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'requires release binary')
 class SummaryCopyTests(ModelFixture):
