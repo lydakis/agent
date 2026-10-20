@@ -65,7 +65,7 @@ cargo build --release --locked -p agent-runtime -p agent-app
 .local/venv/bin/python -m bench.memory_eval --model chatgpt/MODEL --out .local/memory-eval/MODEL.json
 ```
 
-- **Model.** Name it as Codex's `/model` picker shows it.
+- **Model.** Name one `agent models` lists for the `chatgpt` provider.
 - **Login.** The daemons read the plan login `agent login chatgpt` saved,
   from `AGENT_CHATGPT_LOGIN` or `~/.agent/chatgpt.json`. The 2026-10-10 run
   below predates it and used Codex's login.

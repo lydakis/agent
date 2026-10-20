@@ -115,7 +115,8 @@ impl State {
                         .as_deref()
                         .is_some_and(|d| d.starts_with("Rate limit reached"));
                 // A ChatGPT plan's usage limit can also end a started stream.
-                let errors = [&value["error"], &value["response"]["error"]];
+                // A code at the top level of an `error` event, as above.
+                let errors = [&value, &value["error"], &value["response"]["error"]];
                 let named = |test: fn(&str) -> bool| {
                     errors
                         .iter()
@@ -337,6 +338,10 @@ mod tests {
         assert_eq!(spent.code, "provider_quota_exhausted");
         let unavailable = State::default()
             .frame(br#"{"type":"response.failed","response":{"error":{"code":"subscription_sharing_usage_unavailable","message":"Try again later."}}}"#)
+            .unwrap_err();
+        assert_eq!(unavailable.code, "provider_plan_unavailable");
+        let unavailable = State::default()
+            .frame(br#"{"type":"error","code":"subscription_sharing_user_unavailable","message":"Try again later."}"#)
             .unwrap_err();
         assert_eq!(unavailable.code, "provider_plan_unavailable");
         let limited = State::default()

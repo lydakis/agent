@@ -28,8 +28,8 @@ whether the correction reached the task, whether the final answer carries
 the measured numbers, plus every model and summarizer token, compactions,
 retrieval calls, and each bot's time to finish.
 
-Real model, real spend. Run it on the ChatGPT plan with Codex's login,
-naming the model as Codex's /model picker shows it:
+Real model, real spend. Run it on the ChatGPT plan after `agent login
+chatgpt`, naming a model `agent models` lists:
 
     .local/venv/bin/python -m bench.long_task_eval --model chatgpt/MODEL \\
         --trials 3 --out .local/long-task-eval/MODEL.json

@@ -23,7 +23,6 @@ const SCOPE: &str = "openid profile email offline_access resource.invoke chatgpt
 const PORT: u16 = 1455;
 const WAIT: Duration = Duration::from_secs(600);
 const DEADLINE: Duration = Duration::from_secs(30);
-const LIMIT: usize = 256 * 1024;
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 /// `login chatgpt [--port N] [--pretty]`, as `cli::prepare` checked it.
@@ -78,9 +77,21 @@ async fn sign_in(path: &Path, port: u16) -> Result<Saved> {
     let host = host_id(&path.with_file_name("host-id"))?;
     // Signed in before: sign in again as that client, which keeps its
     // workspace; with no file, register a new one.
-    let previous: Option<Saved> = std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    // A file that cannot be read as a login is not taken for none: that
+    // would register anew over its client and account.
+    let previous: Option<Saved> = match std::fs::read(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return fail_with("login_unreadable", format!("{}: {error}", path.display())),
+        Ok(bytes) => Some(serde_json::from_slice(&bytes).map_err(|_| {
+            Error::with(
+                "login_unreadable",
+                format!(
+                    "{} is not a login; delete it to sign in anew",
+                    path.display()
+                ),
+            )
+        })?),
+    };
     let verifier = random(32)?;
     let challenge = B64.encode(digest::digest(&digest::SHA256, verifier.as_bytes()));
     let (state, nonce) = (random(16)?, random(16)?);
@@ -511,13 +522,10 @@ async fn get_json(client: &reqwest::Client, url: &str) -> Result<Value> {
 
 async fn answer(url: &str, response: reqwest::Response) -> Result<Value> {
     let status = response.status();
-    let body = response
-        .bytes()
+    // Stops reading past the limit rather than holding a whole answer.
+    let body = login::bounded(response)
         .await
-        .map_err(|error| Error::with("login_failed", format!("{url}: {error}")))?;
-    if body.len() > LIMIT {
-        return fail_with("login_failed", format!("{url}: the answer is too large"));
-    }
+        .map_err(|error| Error::with("login_failed", format!("{url}: {}", error.code)))?;
     let value: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     if !status.is_success() {
         let code = value["error"].as_str().unwrap_or("refused");
@@ -535,6 +543,18 @@ mod tests {
     use super::*;
     use aws_lc_rs::rsa::{KeyPair, KeySize};
     use aws_lc_rs::signature::KeyPair as _;
+
+    #[tokio::test]
+    async fn a_file_that_is_not_a_login_is_not_signed_in_over() {
+        let dir = std::env::temp_dir().join(format!("agent-sign-in-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chatgpt.json");
+        std::fs::write(&path, "{\"client_id\":").unwrap();
+        let error = sign_in(&path, 1).await.unwrap_err();
+        assert_eq!(error.code, "login_unreadable");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"client_id\":");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// `n` and `e` from a DER `RSAPublicKey` (RFC 8017), as a JWKS lists them.
     fn components(der: &[u8]) -> (Vec<u8>, Vec<u8>) {

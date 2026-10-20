@@ -175,15 +175,14 @@ a client attaching to a daemon compares it like the family and URL, and
   pool. A refusal with no usage settles at zero, since no inference ran, and
   so does a request that could not be written to a connection the provider
   had closed.
-- A ChatGPT login is read as each call starts, and a new connection
-  sends its token and account on the upgrade. A 401 upgrade re-reads the
-  login as a 401 does on HTTP. From the login re-read (NEXT.md item 40) to
-  2026-09-25 the upgrade sent neither token nor account, so
-  `chatgpt=responses-ws` could not authenticate. The
-  socket does not yet carry the ChatGPT sticky-routing token that HTTP calls
-  send back within a turn ([RUST_PROTOTYPE.md](RUST_PROTOTYPE.md)). Codex
-  sends that token in each create event's `client_metadata` and reads it
-  from `response.metadata` events.
+- A ChatGPT plan login's access token is read (and refreshed near expiry)
+  as each call starts, and a new connection sends it as the upgrade's
+  bearer; connections are keyed by that token, so one opened under an older
+  token is not reused. A 401 upgrade refreshes the login once, as a 401 does
+  on HTTP ([RUST_PROTOTYPE.md](RUST_PROTOTYPE.md)). Whether
+  `api.openai.com` accepts `responses-ws` with a plan token has not been
+  observed. The socket does not carry the sticky-routing token that HTTP
+  calls send back within a turn.
 - Accounting follows the HTTP path's boundaries: the reservation is
   dispatched only when the create event is about to be sent, so a connection
   that never opened is refunded, and the startup permit bounded by

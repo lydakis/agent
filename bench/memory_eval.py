@@ -32,8 +32,8 @@ the agent's account. Each bot reports its turn's status, model rounds,
 input, cached input and output tokens (the daemon's totals), shell commands
 that touched memory, the facts it saved or removed, and its time.
 
-Real model, real spend or plan quota. Run it on the ChatGPT plan with
-Codex's login, naming the model as Codex's /model picker shows it:
+Real model, real spend or plan quota. Run it on the ChatGPT plan after
+`agent login chatgpt`, naming a model `agent models` lists:
 
     .local/venv/bin/python -m bench.memory_eval --model chatgpt/MODEL \\
         --out .local/memory-eval/MODEL.json

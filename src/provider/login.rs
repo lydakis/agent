@@ -28,7 +28,8 @@ pub const PLAN_SCOPE: &str = "chatgpt.tokens.use.direct";
 /// starts just before expiry does not carry a token that dies in flight.
 const MARGIN: Duration = Duration::from_secs(120);
 /// A token refreshed this recently and still refused is not refreshed
-/// again: the refusal is about the grant, not the token's age.
+/// again: the refusal is about the grant, not the token's age. A new
+/// sign-in in the file is still taken.
 const FRESH: Duration = Duration::from_secs(60);
 const DEADLINE: Duration = Duration::from_secs(30);
 const LIMIT: usize = 64 * 1024;
@@ -251,7 +252,15 @@ impl Login {
                 return Ok(true);
             }
             if state.refreshed.is_some_and(|at| at.elapsed() < FRESH) {
-                return Ok(false);
+                drop(state);
+                // Not refreshed again, but a sign-in since is taken.
+                return Ok(match read(&self.path) {
+                    Ok(on_disk) if on_disk.access_token != refused.token && !on_disk.due() => {
+                        self.install(on_disk, false);
+                        true
+                    }
+                    _ => false,
+                });
             }
         }
         let session = self.refresh(client, &refused.token).await?;
@@ -382,7 +391,7 @@ pub fn form(pairs: &[(&str, &str)]) -> String {
     url.query().unwrap_or_default().to_owned()
 }
 
-async fn bounded(response: reqwest::Response) -> Result<Vec<u8>> {
+pub async fn bounded(response: reqwest::Response) -> Result<Vec<u8>> {
     use futures_util::StreamExt;
     let mut stream = response.bytes_stream();
     let mut body = Vec::new();
@@ -608,6 +617,10 @@ pub(crate) mod tests {
         assert!(login.reload(&client, &first).await.unwrap());
         // Refused moments after a refresh: not refreshed again.
         assert!(!login.reload(&client, &second).await.unwrap());
+        // Unless a sign-in replaced it meanwhile.
+        save(&path, "signed");
+        assert!(login.reload(&client, &second).await.unwrap());
+        assert_eq!(login.current(&client).await.unwrap().token, "signed");
         // Signed in again meanwhile: the file's token set is taken.
         save(&path, "third");
         login.expire_now();
