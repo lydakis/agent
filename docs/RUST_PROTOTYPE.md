@@ -1061,9 +1061,9 @@ does not, and each is one op:
   moderation and search models by base model name (a fine-tune by the model
   it was tuned from). Explicit output modalities must include text when
   the provider supplies them; unknown custom model names are kept. A
-  ChatGPT login asks the Codex
-  backend with `client_version` (the Codex release this repository measures
-  against). Nothing else reads it: a turn runs whatever model it names.
+  ChatGPT plan login asks `https://api.openai.com/v1/models` with its
+  bearer and keeps `models[]` entries listed as `visibility: "list"`, by
+  `slug`. Nothing else reads it: a turn runs whatever model it names.
   `agent models --discover` uses it once to write `~/.agent/models`.
 - `stats` returns the daemon's live state without sampling its process from
   outside: open sessions, active turns against the bound, parked turns,

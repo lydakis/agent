@@ -15,6 +15,7 @@ import asyncio
 import contextlib
 import json
 import os
+import secrets
 import shlex
 import sqlite3
 import time
@@ -90,7 +91,8 @@ class Agent(BaseInstalledAgent):
         ErrorPattern(r'"error":"provider_stream_stalled"', ApiResponseStalledError),
         ErrorPattern(r'"error":"(?:provider_connection_[a-z0-9_]+|provider_stream_failed'
                      r'|truncated_sse_frame|provider_admission_timeout)"', NetworkConnectionError),
-        ErrorPattern(r'"error":"provider_(?:http_401|http_403|key_unavailable)"', AgentAuthenticationError),
+        ErrorPattern(r'"error":"provider_(?:http_401|http_403|key_unavailable'
+                     r'|login_expired|login_unavailable|login_rejected)"', AgentAuthenticationError),
     ]
     # The HTTP client reads the platform's root certificates at daemon start,
     # even for plain-HTTP endpoints, and minimal images ship none.
@@ -193,8 +195,9 @@ class Agent(BaseInstalledAgent):
             raise ValueError(f'{self._login} expires before a trial could finish; sign in '
                              'again with `agent login chatgpt` just before the run')
         # The daemon needs a refresh token to read the file; this one is
-        # refused if it is ever tried.
-        return {**login, 'refresh_token': 'withheld', 'id_token': ''}
+        # refused if it is ever tried. The daemon redacts it like any token,
+        # so it is random: a common word would be redacted from tool output.
+        return {**login, 'refresh_token': f'withheld-{secrets.token_urlsafe(24)}', 'id_token': ''}
 
     def _command(self, instruction: str) -> str:
         if not self.model_name:

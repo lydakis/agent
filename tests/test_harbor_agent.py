@@ -101,7 +101,10 @@ class HarborAgentTest(unittest.TestCase):
             # The container gets what a request carries, never the refresh or ID token.
             copied = agent._chatgpt_login(now=1_000)
             self.assertEqual(copied['access_token'], 'a')
-            self.assertEqual((copied['refresh_token'], copied['id_token']), ('withheld', ''))
+            self.assertTrue(copied['refresh_token'].startswith('withheld-'))
+            self.assertGreater(len(copied['refresh_token']), 30)
+            self.assertNotEqual(copied['refresh_token'], agent._chatgpt_login(now=1_000)['refresh_token'])
+            self.assertEqual(copied['id_token'], '')
             with self.assertRaisesRegex(ValueError, 'expires before a trial'):
                 agent._chatgpt_login(now=9_000)
             login.write_text(json.dumps({'access_token': 'a'}))
