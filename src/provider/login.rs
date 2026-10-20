@@ -112,22 +112,33 @@ pub fn has_scope(granted: &str, scope: &str) -> bool {
 }
 
 /// Replace the file whole, readable by its owner only: a reader sees the
-/// old token set or the new one, never part of either.
+/// old token set or the new one, never part of either. The staging file is
+/// always new (`O_EXCL`), so one another user placed there, or a symlink,
+/// never receives the tokens.
 pub fn write(path: &Path, saved: &Saved) -> Result<()> {
     use std::io::Write;
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir)?;
-    let temporary = dir.join(format!(
-        ".{}.{}",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("login"),
-        std::process::id()
-    ));
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("login");
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut attempt = 0u32;
+    let (temporary, mut file) = loop {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let temporary = dir.join(format!(".{name}.{}.{nanos}", std::process::id()));
+        match options.open(&temporary) {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempt < 8 => {
+                attempt += 1;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
     let result = (|| {
-        let mut file = options.open(&temporary)?;
         file.write_all(&serde_json::to_vec_pretty(saved)?)?;
         file.sync_all()?;
         std::fs::rename(&temporary, path)
