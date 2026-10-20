@@ -93,7 +93,7 @@ class HarborAgentTest(unittest.TestCase):
     def test_a_chatgpt_model_spends_the_plan_with_only_its_access_token(self):
         with tempfile.TemporaryDirectory() as logs:
             login = Path(logs, 'chatgpt.json')
-            saved = {'client_id': 'oaiapp_x', 'access_token': 'a', 'refresh_token': 'r',
+            saved = {'client_id': 'oaiapp_x', 'subject': 's', 'access_token': 'a', 'refresh_token': 'r',
                      'id_token': 'i', 'expires_at': 10_000, 'scope': 'chatgpt.tokens.use.direct'}
             login.write_text(json.dumps(saved))
             agent = Agent(logs_dir=Path(logs), model_name='chatgpt/m', chatgpt_login=str(login))
@@ -102,7 +102,7 @@ class HarborAgentTest(unittest.TestCase):
             copied = agent._chatgpt_login(now=1_000)
             self.assertEqual(copied['access_token'], 'a')
             self.assertEqual((copied['refresh_token'], copied['id_token']), ('withheld', ''))
-            with self.assertRaisesRegex(ValueError, 'expires within'):
+            with self.assertRaisesRegex(ValueError, 'expires before a trial'):
                 agent._chatgpt_login(now=9_000)
             login.write_text(json.dumps({'access_token': 'a'}))
             with self.assertRaisesRegex(ValueError, 'no ChatGPT login'):

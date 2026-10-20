@@ -35,7 +35,7 @@ class ChatgptLoginTests(unittest.TestCase):
     def test_a_login_that_may_not_spend_the_plan_stops_startup(self):
         with tempfile.TemporaryDirectory(dir=self.root / '.local') as directory:
             (Path(directory) / 'chatgpt.json').write_text(json.dumps({
-                'client_id': 'oaiapp_x', 'access_token': 'a', 'refresh_token': 'r',
+                'client_id': 'oaiapp_x', 'subject': 's', 'access_token': 'a', 'refresh_token': 'r',
                 'id_token': '', 'expires_at': 1, 'scope': 'openid profile email'}))
             process = self.serve(directory, 'chatgpt')
         self.assertNotEqual(process.returncode, 0)

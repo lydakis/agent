@@ -1671,6 +1671,15 @@ pub(crate) fn quota(code: &str) -> bool {
     )
 }
 
+/// A ChatGPT plan's usage service briefly unable to serve, which OpenAI says
+/// to retry with a bounded backoff, also after a stream has started.
+pub(crate) fn plan_unavailable(code: &str) -> bool {
+    matches!(
+        code,
+        "subscription_sharing_usage_unavailable" | "subscription_sharing_user_unavailable"
+    )
+}
+
 /// A short provider message from a bounded body, or nothing safe to show.
 fn parse_error_body(body: &[u8], expects_json: bool) -> Option<ErrorBody> {
     let text = std::str::from_utf8(body).ok()?.trim();

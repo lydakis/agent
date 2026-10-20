@@ -288,7 +288,9 @@ login. The model's tools can still read the access token file; the daemon
 redacts the token from tool output, but a task that reads the file holds a
 login to the plan, so run only tasks you trust on your own account. The token
 is not refreshed during a run, so the adapter refuses one that expires within
-30 minutes; a host daemon's next chatgpt call refreshes it, or sign in again.
+45 minutes, enough for the 2,400-second agent timeout above. An access token
+lasts an hour, so sign in with `agent login chatgpt` just before a run; a
+host daemon refreshes only two minutes before expiry.
 Plan usage windows and any per-app weekly cap set in ChatGPT's settings cap how
 many tasks one run can finish. Harbor's own Codex adapter takes Codex's login
 with `CODEX_FORCE_AUTH_JSON=1`, so the Codex baseline can run on the plan too.

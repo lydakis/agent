@@ -3577,6 +3577,8 @@ fn retryable(code: &str) -> bool {
             | "provider_stream_failed"
             | "provider_stream_stalled"
             | "provider_login_refreshed"
+            | "provider_login_throttled"
+            | "provider_plan_unavailable"
             | "truncated_sse_frame"
             | "provider_admission_timeout"
             | "provider_socket_expired"

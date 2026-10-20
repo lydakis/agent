@@ -115,11 +115,16 @@ impl State {
                         .as_deref()
                         .is_some_and(|d| d.starts_with("Rate limit reached"));
                 // A ChatGPT plan's usage limit can also end a started stream.
-                let quota = [&value["error"], &value["response"]["error"]]
-                    .iter()
-                    .any(|error| error["code"].as_str().is_some_and(super::quota));
-                let code = if quota {
+                let errors = [&value["error"], &value["response"]["error"]];
+                let named = |test: fn(&str) -> bool| {
+                    errors
+                        .iter()
+                        .any(|error| error["code"].as_str().is_some_and(test))
+                };
+                let code = if named(super::quota) {
                     "provider_quota_exhausted"
+                } else if named(super::plan_unavailable) {
+                    "provider_plan_unavailable"
                 } else if rate_limited {
                     "provider_rate_limited"
                 } else {
@@ -330,6 +335,10 @@ mod tests {
             .frame(br#"{"type":"response.failed","response":{"error":{"code":"subscription_sharing_usage_limit_exceeded","message":"Usage limit reached."}}}"#)
             .unwrap_err();
         assert_eq!(spent.code, "provider_quota_exhausted");
+        let unavailable = State::default()
+            .frame(br#"{"type":"response.failed","response":{"error":{"code":"subscription_sharing_usage_unavailable","message":"Try again later."}}}"#)
+            .unwrap_err();
+        assert_eq!(unavailable.code, "provider_plan_unavailable");
         let limited = State::default()
             .frame(br#"{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"Rate limit reached for m on tokens per min (TPM): Limit 4000000"}}}"#)
             .unwrap_err();

@@ -481,7 +481,11 @@ sign-in (`client_id=dynamic_agent_client`, PKCE, a `127.0.0.1` callback,
 default port 1455), checks the ID token against OpenAI's keys and the plan
 scope `chatgpt.tokens.use.direct`, and writes `~/.agent/chatgpt.json`
 (`AGENT_CHATGPT_LOGIN` names another file) with mode 0600. Later sign-ins
-reuse the issued client. A per-machine host id is kept beside it in
+reuse the issued client and must return the same account (`sub`), else
+`login_account_changed`; a first sign-in without the plan scope is still
+saved, so the next one reuses its client. The printed address leaves out
+the `id_token_hint` the browser is given. Over SSH the browser is not opened
+and the callback port has to be forwarded. A per-machine host id is kept beside it in
 `host-id`, so a login copied to another machine (OpenAI's documented way to
 use a VM) does not carry this machine's id. Delete the login file to
 register anew.
@@ -499,23 +503,22 @@ retries without backoff (`provider_login_refreshed`); a 401 moments after a
 refresh ends the turn with `provider_login_rejected`, naming the file. A
 refused refresh answers `provider_login_expired`, naming the file and
 `agent login chatgpt`; a 5xx or 429 from the token endpoint keeps the token
-set and is retried like any provider 5xx. Every token is redacted from tool
-output. Requests on the plan carry no `max_output_tokens`, which it refuses,
+set and is retried with backoff (a 429 as `provider_login_throttled`). A
+sign-in takes the same lock before writing. Every token in the file is
+redacted from tool output. Requests on the plan carry no `max_output_tokens`, which it refuses,
 and its usage limit (`subscription_sharing_usage_limit_exceeded`, a 429 or a
 failed stream) ends the turn as `provider_quota_exhausted` rather than being
-paced and retried. Not yet measured on a real plan: prompt-cache hit rates
+paced and retried; a stream that fails with
+`subscription_sharing_usage_unavailable` or `_user_unavailable` is retried
+with backoff as `provider_plan_unavailable`. Not yet measured on a real plan: prompt-cache hit rates
 at this endpoint, `responses-ws`, and which request fields it accepts beyond
 those OpenAI lists.
-Either way the remedy is any `codex` command, which signs in again, and
-nothing has to restart. The token observed on 2026-09-23 was valid for ten
-days from issue. A missing or unreadable file fails startup with
-`provider_login_unavailable`. The login goes only to that
+A new sign-in needs no restart: the daemon takes the file's token set at its
+next refresh or 401. A missing, unreadable or plan-less file fails startup
+with `provider_login_unavailable`. The login goes only to that
 endpoint: a `chatgpt` spec naming another URL authenticates with the key
 variable it names, or with nothing, so a local or synthetic endpoint never
-receives the real token. The daemon redacts the access token from tool output
-like a key. Only a synthetic
-endpoint has exercised the headers; whether the ChatGPT backend accepts every
-field this adapter sends has not been observed.
+receives the real token.
 
 Responses requests explicitly include `reasoning.encrypted_content` even when
 no reasoning effort is configured, because a model can reason by default.

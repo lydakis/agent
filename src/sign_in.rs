@@ -93,7 +93,7 @@ async fn sign_in(path: &Path, port: u16) -> Result<Saved> {
             )
         })?;
     let redirect = format!("http://127.0.0.1:{port}/auth/callback");
-    let url = authorize_url(&Authorize {
+    let authorize = Authorize {
         client_id: previous.as_ref().map(|p| p.client_id.as_str()),
         id_token_hint: previous.as_ref().map(|p| p.id_token.as_str()),
         host: &host,
@@ -101,8 +101,23 @@ async fn sign_in(path: &Path, port: u16) -> Result<Saved> {
         state: &state,
         nonce: &nonce,
         challenge: &challenge,
+    };
+    let url = authorize_url(&authorize);
+    // The printed address leaves out the ID token hint: terminals and their
+    // logs keep what is printed, and the hint is optional.
+    let shown = authorize_url(&Authorize {
+        id_token_hint: None,
+        ..authorize
     });
-    eprintln!("Open this address to sign in with ChatGPT:\n{url}");
+    eprintln!("Open this address to sign in with ChatGPT:\n{shown}");
+    if std::env::var_os("SSH_CONNECTION").is_some() {
+        eprintln!(
+            "Over SSH the browser's callback needs this port forwarded \
+             (ssh -L {port}:127.0.0.1:{port} HOST), or sign in on your own \
+             machine and copy {} here.",
+            path.display()
+        );
+    }
     open_browser(url.as_str());
     let callback = tokio::time::timeout(WAIT, receive(&listener, &state))
         .await
@@ -162,21 +177,29 @@ async fn sign_in(path: &Path, port: u16) -> Result<Saved> {
     let keys = get_json(&client, jwks_uri).await?;
     let now = now();
     let claims = validate_id_token(id_token, &keys, issuer, &client_id, &nonce, now)?;
-    // A valid ID token alone does not let the token spend the plan.
+    let subject = claims["sub"]
+        .as_str()
+        .filter(|sub| !sub.is_empty())
+        .ok_or(Error::with("login_id_token_invalid", "no subject"))?;
+    // A sign-in as the saved client replaces only that account's login.
+    if let Some(previous) = &previous
+        && previous.subject != subject
+    {
+        return fail_with(
+            "login_account_changed",
+            format!(
+                "the sign-in chose another account than {} holds; delete it to sign in as another",
+                path.display()
+            ),
+        );
+    }
     let scope = text("scope")
         .map(str::to_owned)
         .or(callback.scope)
         .unwrap_or_default();
-    if !login::has_scope(&scope, PLAN_SCOPE) {
-        return fail_with(
-            "login_plan_not_granted",
-            format!(
-                "the sign-in did not grant {PLAN_SCOPE}; plan use needs ChatGPT Go, Plus or Pro"
-            ),
-        );
-    }
     let saved = Saved {
         client_id,
+        subject: subject.to_owned(),
         access_token: access.to_owned(),
         refresh_token: refresh.to_owned(),
         id_token: id_token.to_owned(),
@@ -184,7 +207,23 @@ async fn sign_in(path: &Path, port: u16) -> Result<Saved> {
         scope,
         email: claims["email"].as_str().map(str::to_owned),
     };
-    login::write(path, &saved)?;
+    // A valid ID token alone does not let the token spend the plan. A first
+    // sign-in is kept anyway, so the next one reuses the client it registered;
+    // the daemon refuses a login without the scope.
+    let granted = login::has_scope(&saved.scope, PLAN_SCOPE);
+    if granted || previous.is_none() {
+        // Not while a daemon is refreshing, which would write over this.
+        let _lock = login::lock(path).await?;
+        login::write(path, &saved)?;
+    }
+    if !granted {
+        return fail_with(
+            "login_plan_not_granted",
+            format!(
+                "the sign-in did not grant {PLAN_SCOPE}; plan use needs ChatGPT Go, Plus or Pro"
+            ),
+        );
+    }
     Ok(saved)
 }
 

@@ -45,7 +45,10 @@ REMOTE_BINARY = '/installed-agent/agent'
 REMOTE_LOGIN_DIR = '/installed-agent/chatgpt'
 CHATGPT_URL = 'https://api.openai.com/v1'
 # A trial's token must outlast the trial: nothing in the container can refresh it.
-LOGIN_MARGIN = 30 * 60
+# A copied access token is never refreshed: it must outlast the documented
+# 2,400-second agent timeout, the daemon's two-minute refresh margin and the
+# finishing command.
+LOGIN_MARGIN = 45 * 60
 # SQLite stays on the container's own disk: the log directory is a host mount.
 REMOTE_STORE = '/tmp/agent-harbor'
 BOT = 'task'
@@ -80,10 +83,10 @@ class Agent(BaseInstalledAgent):
     # (ANTHROPIC_API_KEY for anthropic/..., OPENAI_API_KEY for openai/...).
     MODEL_CONNECTION = ModelConnectionSpec(passthrough=True)
     ERROR_PATTERNS: ClassVar[list[ErrorPattern]] = [
-        ErrorPattern(r'"error":"provider_(?:rate_limited|http_429|paced)"', ApiRateLimitError),
+        ErrorPattern(r'"error":"provider_(?:rate_limited|http_429|paced|login_throttled)"', ApiRateLimitError),
         ErrorPattern(r'"error":"provider_quota_exhausted"', ApiUsageLimitError),
         ErrorPattern(r'"error":"provider_http_5(?!03"|29")\d\d"', ApiInternalServerError),
-        ErrorPattern(r'"error":"provider_(?:http_503|http_529|unavailable)"', ApiOverloadedError),
+        ErrorPattern(r'"error":"provider_(?:http_503|http_529|unavailable|plan_unavailable)"', ApiOverloadedError),
         ErrorPattern(r'"error":"provider_stream_stalled"', ApiResponseStalledError),
         ErrorPattern(r'"error":"(?:provider_connection_[a-z0-9_]+|provider_stream_failed'
                      r'|truncated_sse_frame|provider_admission_timeout)"', NetworkConnectionError),
@@ -182,12 +185,13 @@ class Agent(BaseInstalledAgent):
 
     def _chatgpt_login(self, now: float | None = None) -> dict[str, Any]:
         saved = json.loads(self._login.read_text())
-        login = {key: saved.get(key) for key in ('client_id', 'access_token', 'expires_at', 'scope')}
+        login = {key: saved.get(key)
+                 for key in ('client_id', 'subject', 'access_token', 'expires_at', 'scope')}
         if not all(login.values()):
             raise ValueError(f'{self._login} has no ChatGPT login; run `agent login chatgpt`')
         if login['expires_at'] < (now if now is not None else time.time()) + LOGIN_MARGIN:
-            raise ValueError(f'{self._login} expires within 30 minutes; run any chatgpt '
-                             'call or `agent login chatgpt` for a fresh token first')
+            raise ValueError(f'{self._login} expires before a trial could finish; sign in '
+                             'again with `agent login chatgpt` just before the run')
         # The daemon needs a refresh token to read the file; this one is
         # refused if it is ever tried.
         return {**login, 'refresh_token': 'withheld', 'id_token': ''}

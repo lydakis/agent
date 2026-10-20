@@ -17,6 +17,7 @@ use std::{
 /// The environment names the tokens are redacted under; no variable carries them.
 pub const TOKEN_NAME: &str = "AGENT_CHATGPT_TOKEN";
 const REFRESH_NAME: &str = "AGENT_CHATGPT_REFRESH";
+const ID_NAME: &str = "AGENT_CHATGPT_ID_TOKEN";
 pub const ISSUER: &str = "https://auth.openai.com";
 pub const TOKEN_URL: &str = "https://auth.openai.com/api/accounts/oauth/token";
 /// The audience every grant and refresh names, and the inference endpoint.
@@ -39,6 +40,8 @@ pub struct Saved {
     /// The client OpenAI issued at registration (`oaiapp_…`), reused for
     /// every refresh and later sign-in.
     pub client_id: String,
+    /// The account's verified `sub`; a later sign-in must return the same.
+    pub subject: String,
     pub access_token: String,
     pub refresh_token: String,
     /// Kept for `id_token_hint` on the next sign-in.
@@ -283,11 +286,16 @@ impl Login {
         let value: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
         if !(200..300).contains(&status) {
             let code = value["error"].as_str().unwrap_or("refused");
-            // A server's trouble keeps the token set for another try; a
-            // refusal of the grant itself needs a new sign-in.
+            // A server's trouble keeps the token set for another try, after
+            // a backoff: a throttled refresh is not the model's pace, so it
+            // is not a 429 the model's pool would retry at once. A refusal
+            // of the grant itself needs a new sign-in.
             if status >= 500 || status == 429 {
                 return Err(Error {
-                    code: format!("provider_http_{status}"),
+                    code: match status {
+                        429 => "provider_login_throttled".to_owned(),
+                        _ => format!("provider_http_{status}"),
+                    },
                     detail: Some(format!("refreshing {}: {code}", self.path.display())),
                     facts: None,
                 });
@@ -334,6 +342,7 @@ impl Login {
         if let Some(redaction) = &self.redaction {
             redaction.set(TOKEN_NAME, &saved.access_token);
             redaction.set(REFRESH_NAME, &saved.refresh_token);
+            redaction.set(ID_NAME, &saved.id_token);
         }
     }
 
@@ -366,8 +375,8 @@ async fn bounded(response: reqwest::Response) -> Result<Vec<u8>> {
 
 /// An exclusive lock on `PATH.lock`, held while a refresh reads, exchanges
 /// and rewrites the file, so two daemons sharing one login never spend the
-/// same refresh token.
-async fn lock(path: &Path) -> Result<std::fs::File> {
+/// same refresh token, and while a sign-in replaces it.
+pub async fn lock(path: &Path) -> Result<std::fs::File> {
     let path = path.with_extension("json.lock");
     let file = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
         let file = std::fs::OpenOptions::new()
@@ -405,9 +414,10 @@ pub(crate) mod tests {
             path,
             &Saved {
                 client_id: "oaiapp_synthetic".into(),
+                subject: "user-synthetic".into(),
                 access_token: token.into(),
                 refresh_token: format!("refresh-{token}"),
-                id_token: "id".into(),
+                id_token: "id-synthetic".into(),
                 expires_at: at,
                 scope: format!("openid offline_access {PLAN_SCOPE}"),
                 email: None,
@@ -594,12 +604,35 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn every_token_in_the_file_is_redacted() {
+        let dir = temp("login-redact");
+        let path = dir.join("chatgpt.json");
+        save(&path, "access-synthetic");
+        let redaction = Credentials::default();
+        Login::open(&path, Some(redaction.clone())).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let shown = redaction.redact(text);
+        for token in [
+            "access-synthetic",
+            "refresh-access-synthetic",
+            "id-synthetic",
+        ] {
+            assert!(!shown.contains(token), "{shown}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn a_server_error_keeps_the_token_set_for_another_try() {
         let dir = temp("login-5xx");
         let path = dir.join("chatgpt.json");
         save(&path, "first");
-        let (url, _bodies) = token_server(vec![(503, "{}".into())]).await;
+        let (url, _bodies) = token_server(vec![
+            (503, "{}".into()),
+            (429, r#"{"error":"slow_down"}"#.into()),
+        ])
+        .await;
         let login = Login::open(&path, None)
             .unwrap()
             .with_token_url(&url)
@@ -610,6 +643,9 @@ pub(crate) mod tests {
         write(&path, &saved).unwrap();
         let error = login.current(&reqwest::Client::new()).await.unwrap_err();
         assert_eq!(error.code, "provider_http_503");
+        // A throttled refresh backs off rather than retrying at the model's pace.
+        let error = login.current(&reqwest::Client::new()).await.unwrap_err();
+        assert_eq!(error.code, "provider_login_throttled");
         assert_eq!(read(&path).unwrap().refresh_token, "refresh-first");
         std::fs::remove_dir_all(dir).unwrap();
     }
