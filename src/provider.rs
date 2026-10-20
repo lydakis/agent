@@ -697,6 +697,20 @@ impl Provider {
             true => json!({"type":"ephemeral","ttl":"1h"}),
             false => json!({"type":"ephemeral"}),
         };
+        // The ChatGPT plan takes function tools only grouped in a namespace
+        // (OpenAI's preview limitations, read 2026-10-20); a call comes back
+        // naming it, and its item is replayed as it came.
+        let grouped;
+        let tools = match self.login {
+            Some(_) if request.tools.get() != "[]" => {
+                grouped = RawValue::from_string(format!(
+                    r#"[{{"type":"namespace","name":"{PLAN_NAMESPACE}","description":"Tools","tools":{}}}]"#,
+                    request.tools.get()
+                ))?;
+                &*grouped
+            }
+            _ => request.tools,
+        };
         let (mut bytes, field) = match self.family {
             Family::Responses if warm => return fail("keep_warm_unsupported"),
             Family::Responses => (
@@ -710,7 +724,7 @@ impl Provider {
                     // The ChatGPT plan refuses an output cap (OpenAI's
                     // preview limitations, read 2026-10-20).
                     max_output_tokens: self.max_output_tokens.filter(|_| self.login.is_none()),
-                    tools: request.tools,
+                    tools,
                     tool_choice: disable_tools.then_some("none"),
                     reasoning: request
                         .reasoning
@@ -1671,6 +1685,9 @@ pub(crate) fn quota(code: &str) -> bool {
     )
 }
 
+/// The namespace a ChatGPT plan request groups the bot's tools under.
+const PLAN_NAMESPACE: &str = "agent";
+
 /// A ChatGPT plan's usage service briefly unable to serve, which OpenAI says
 /// to retry with a bounded backoff, also after a stream has started.
 pub(crate) fn plan_unavailable(code: &str) -> bool {
@@ -1696,6 +1713,8 @@ fn parse_error_body(body: &[u8], expects_json: bool) -> Option<ErrorBody> {
                 .or_else(|| value["error"]["message"].as_str())
                 .or_else(|| value["error"].as_str())
                 .or_else(|| value["message"].as_str())
+                // The ChatGPT plan route's admission refusals.
+                .or_else(|| value["detail"].as_str())
                 .map(str::to_owned),
         }),
         // Never fall back to a serialized JSON representation: alternate
@@ -2622,6 +2641,12 @@ mod tests {
         }
     }
 
+    #[test]
+    fn an_error_body_keeps_a_top_level_detail() {
+        let body = parse_error_body(br#"{"detail":"Unsupported region."}"#, true).unwrap();
+        assert_eq!(body.detail.as_deref(), Some("Unsupported region."));
+    }
+
     #[tokio::test]
     async fn a_login_sends_its_token_on_every_request_and_no_output_cap() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2668,6 +2693,23 @@ mod tests {
         // The plan refuses an output cap; the bot's own still paces the call.
         let prefix = String::from_utf8(provider.prefix(&request).unwrap()).unwrap();
         assert!(!prefix.contains("max_output_tokens"), "{prefix}");
+        // Its tools go in a namespace; none means no namespace.
+        assert!(prefix.contains(r#""tools":[]"#), "{prefix}");
+        let echo = RawValue::from_string(r#"[{"type":"function","name":"echo"}]"#.into()).unwrap();
+        let prefix = provider
+            .prefix(&Request {
+                tools: &echo,
+                items: Items::empty(),
+                chain: None,
+                ..request
+            })
+            .unwrap();
+        let body: Value = serde_json::from_slice(&[&prefix[..], b"]}"].concat()).unwrap();
+        assert_eq!(
+            body["tools"],
+            json!([{"type":"namespace","name":"agent","description":"Tools",
+                "tools":[{"type":"function","name":"echo"}]}])
+        );
         let _ = provider
             .complete(
                 Request {

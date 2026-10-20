@@ -117,7 +117,10 @@ pub fn has_scope(granted: &str, scope: &str) -> bool {
 /// never receives the tokens.
 pub fn write(path: &Path, saved: &Saved) -> Result<()> {
     use std::io::Write;
-    let dir = path.parent().unwrap_or(Path::new("."));
+    let dir = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir)?;
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("login");
     let mut options = std::fs::OpenOptions::new();
@@ -141,7 +144,10 @@ pub fn write(path: &Path, saved: &Saved) -> Result<()> {
     let result = (|| {
         file.write_all(&serde_json::to_vec_pretty(saved)?)?;
         file.sync_all()?;
-        std::fs::rename(&temporary, path)
+        std::fs::rename(&temporary, path)?;
+        // The rename is durable only once the directory is: a crash must
+        // not bring back a refresh token the issuer has already rotated.
+        std::fs::File::open(dir)?.sync_all()
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
@@ -311,10 +317,16 @@ impl Login {
                     facts: None,
                 });
             }
+            // A client OpenAI no longer knows cannot sign in again either:
+            // only a new registration recovers.
+            let remedy = match code {
+                "invalid_client" => "delete it and run agent login chatgpt to register again",
+                _ => HINT,
+            };
             return Err(Error::with(
                 "provider_login_expired",
                 format!(
-                    "{} refused its refresh ({code}); {HINT}",
+                    "{} refused its refresh ({code}); {remedy}",
                     self.path.display()
                 ),
             ));
@@ -642,6 +654,7 @@ pub(crate) mod tests {
         let (url, _bodies) = token_server(vec![
             (503, "{}".into()),
             (429, r#"{"error":"slow_down"}"#.into()),
+            (401, r#"{"error":"invalid_client"}"#.into()),
         ])
         .await;
         let login = Login::open(&path, None)
@@ -657,6 +670,10 @@ pub(crate) mod tests {
         // A throttled refresh backs off rather than retrying at the model's pace.
         let error = login.current(&reqwest::Client::new()).await.unwrap_err();
         assert_eq!(error.code, "provider_login_throttled");
+        // A client OpenAI no longer knows needs a new registration.
+        let error = login.current(&reqwest::Client::new()).await.unwrap_err();
+        assert_eq!(error.code, "provider_login_expired");
+        assert!(error.detail.unwrap().contains("register again"));
         assert_eq!(read(&path).unwrap().refresh_token, "refresh-first");
         std::fs::remove_dir_all(dir).unwrap();
     }

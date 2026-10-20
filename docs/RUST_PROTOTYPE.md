@@ -502,10 +502,14 @@ refresh) is taken as it is. A 401 for the held token refreshes it once and
 retries without backoff (`provider_login_refreshed`); a 401 moments after a
 refresh ends the turn with `provider_login_rejected`, naming the file. A
 refused refresh answers `provider_login_expired`, naming the file and
-`agent login chatgpt`; a 5xx or 429 from the token endpoint keeps the token
+`agent login chatgpt` (for `invalid_client`, to delete the file and register
+again); a 5xx or 429 from the token endpoint keeps the token
 set and is retried with backoff (a 429 as `provider_login_throttled`). A
 sign-in takes the same lock before writing. Every token in the file is
-redacted from tool output. Requests on the plan carry no `max_output_tokens`, which it refuses,
+redacted from tool output. Requests on the plan group the bot's tools in one namespace, `agent`, since
+the route takes function tools only grouped or as `additional_tools`; a call
+comes back naming it and is replayed as it came. They carry no
+`max_output_tokens`, which it refuses,
 and its usage limit (`subscription_sharing_usage_limit_exceeded`, a 429 or a
 failed stream) ends the turn as `provider_quota_exhausted` rather than being
 paced and retried; a stream that fails with
