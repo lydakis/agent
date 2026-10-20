@@ -28,8 +28,8 @@ whether the correction reached the task, whether the final answer carries
 the measured numbers, plus every model and summarizer token, compactions,
 retrieval calls, and each bot's time to finish.
 
-Real model, real spend. Run it on the ChatGPT plan with Codex's login,
-naming the model as Codex's /model picker shows it:
+Real model, real spend. Run it on the ChatGPT plan after `agent login
+chatgpt`, naming a model `agent models` lists:
 
     .local/venv/bin/python -m bench.long_task_eval --model chatgpt/MODEL \\
         --trials 3 --out .local/long-task-eval/MODEL.json
@@ -54,7 +54,7 @@ from bench.context_eval import COMPACTION, INSTRUCTIONS, page_rows  # noqa: E402
 from bench.runtime_client import Client, node_item  # noqa: E402
 from bench.targets import clean_env, file_hash  # noqa: E402
 
-ENDPOINTS = {'chatgpt': ('responses', 'https://chatgpt.com/backend-api/codex', None),
+ENDPOINTS = {'chatgpt': ('responses', 'https://api.openai.com/v1', None),
              'openai': ('responses', 'https://api.openai.com/v1', 'OPENAI_API_KEY')}
 TOOLS = 'shell,read,write,edit,history'
 # A bot without `read` gets no stubs for its old results, so only summaries
@@ -1098,8 +1098,8 @@ def main():
     if key_env:
         env[key_env] = os.environ[key_env]
     else:
-        # The daemon reads Codex's ChatGPT login from CODEX_HOME or ~/.codex.
-        env.update({k: os.environ[k] for k in ('HOME', 'CODEX_HOME') if k in os.environ})
+        # The daemon reads the plan login `agent login chatgpt` saved.
+        env.update({k: os.environ[k] for k in ('HOME', 'AGENT_CHATGPT_LOGIN') if k in os.environ})
     out_dir = args.out.resolve().parent / 'run'
     out_dir.mkdir(parents=True, exist_ok=True)
     blocks = []

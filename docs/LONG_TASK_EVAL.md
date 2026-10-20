@@ -298,14 +298,14 @@ correct task.
 ## Running it
 
 Real model, real spend. Per the project's rule, run it on the ChatGPT plan
-with Codex's login, never on a paid Anthropic key without asking first:
+after `agent login chatgpt`, never on a paid Anthropic key without asking first:
 
 ```sh
 .local/venv/bin/python -m bench.long_task_eval --model chatgpt/MODEL \
     --trials 3 --out .local/long-task-eval/MODEL.json
 ```
 
-`MODEL` is the id Codex's `/model` picker shows. Workspaces and the store go
+`MODEL` is an id `agent models` lists for the `chatgpt` provider. Workspaces and the store go
 under `.local/long-task-eval/run/`, which git ignores. Each condition
 prints a one-line summary; the JSON file keeps every bot's scores and
 answer.

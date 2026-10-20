@@ -58,6 +58,10 @@ region holds the model (from any source region the profile supports), or `--prov
 `AGENT_PROVIDER` takes the place of `--provider` for any provider, so
 `export AGENT_PROVIDER=bedrock AGENT_MODEL=bedrock/global.anthropic.claude-sonnet-5`
 needs no flags.
+For a ChatGPT Go, Plus or Pro plan, run `agent login chatgpt` once and start
+the daemon with `--provider chatgpt`; it signs in through OpenAI's
+[Sign in with ChatGPT](https://developers.openai.com/siwc/token-sharing-open-source)
+and keeps the token fresh itself.
 `agent models --discover` writes `~/.agent/models` from what your providers
 list; edit it down to the models the app and your agents should offer.
 

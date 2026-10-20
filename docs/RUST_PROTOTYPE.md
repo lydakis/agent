@@ -408,7 +408,7 @@ A model reference is `PROVIDER/MODEL`. A provider spec is
 
 | Family | Protocol | Defaults |
 | --- | --- | --- |
-| `responses` | OpenAI Responses API, streaming SSE | `openai` → `https://api.openai.com/v1`, `OPENAI_API_KEY`; `openrouter` → `https://openrouter.ai/api/v1`, `OPENROUTER_API_KEY`; `chatgpt` → `https://chatgpt.com/backend-api/codex`, Codex's ChatGPT login; `bedrock-openai` → `https://bedrock-mantle.{region}.api.aws/openai/v1`, SigV4 or `AWS_BEARER_TOKEN_BEDROCK` |
+| `responses` | OpenAI Responses API, streaming SSE | `openai` → `https://api.openai.com/v1`, `OPENAI_API_KEY`; `openrouter` → `https://openrouter.ai/api/v1`, `OPENROUTER_API_KEY`; `chatgpt` → `https://api.openai.com/v1`, the ChatGPT plan login `agent login chatgpt` saved; `bedrock-openai` → `https://bedrock-mantle.{region}.api.aws/openai/v1`, SigV4 or `AWS_BEARER_TOKEN_BEDROCK` |
 | `anthropic` | Anthropic Messages API, streaming SSE | `anthropic` → `https://api.anthropic.com/v1`, `ANTHROPIC_API_KEY`; `bedrock` → `https://bedrock-runtime.{region}.amazonaws.com/anthropic/v1`, SigV4 or `AWS_BEARER_TOKEN_BEDROCK` |
 
 The family `responses-ws` is the Responses API over a WebSocket per bot,
@@ -472,32 +472,57 @@ rate-limit headers, so its pools learn no allowance and are paced by refusals
 alone: a 429 naming no delay closes the pool for a second, doubling to 32 while
 refusals continue, until a call's stream completes.
 
-`--provider chatgpt` uses a ChatGPT plan instead of an API key. Codex's own
-source (openai/codex `15922a5`, read 2026-09-23) shows that, when signed in with
-ChatGPT, Codex sends Responses requests to `https://chatgpt.com/backend-api/codex`
-with the saved access token as the bearer and a `ChatGPT-Account-ID` header. The
-daemon reads `tokens.access_token` and `tokens.account_id` from
-`$CODEX_HOME/auth.json` (default `~/.codex/auth.json`) at startup and sends
-the same two headers. It never refreshes the token itself; Codex does that
-when it runs. The daemon re-reads the file in two cases: when the token's own
-`exp` claim has passed, after pacing and admission but before sending, and
-on a 401 for the currently held token. A concurrent 401 for an older token
-reuses the login already installed. A re-read that finds a different token or
-account retries the call without backoff (`provider_login_refreshed`), and
-every token read this way is redacted from tool output. An unchanged login
-ends the turn with `provider_login_rejected`, naming the file; an expired one
-on disk answers `provider_login_expired` with the expiry time, at startup or
-before a call.
-Either way the remedy is any `codex` command, which signs in again, and
-nothing has to restart. The token observed on 2026-09-23 was valid for ten
-days from issue. A missing or unreadable file fails startup with
-`provider_login_unavailable`. The login goes only to that
+`--provider chatgpt` spends a ChatGPT plan instead of an API key, through
+OpenAI's Sign in with ChatGPT for open-source tools
+([developers.openai.com/siwc](https://developers.openai.com/siwc/token-sharing-open-source),
+read 2026-10-20; a preview). `agent login chatgpt` signs in, in the CLI's
+own process: it registers a client for the user and workspace on the first
+sign-in (`client_id=dynamic_agent_client`, PKCE, a `127.0.0.1` callback,
+default port 1455), checks the ID token against OpenAI's keys and the plan
+scope `chatgpt.tokens.use.direct`, and writes `~/.agent/chatgpt.json`
+(`AGENT_CHATGPT_LOGIN` names another file) with mode 0600. Later sign-ins
+reuse the issued client and must return the same account (`sub`), else
+`login_account_changed`; a first sign-in without the plan scope is still
+saved, so the next one reuses its client. The printed address leaves out
+the `id_token_hint` the browser is given. Over SSH the browser is not opened
+and the callback port has to be forwarded. A per-machine host id is kept beside it in
+`host-id`, so a login copied to another machine (OpenAI's documented way to
+use a VM) does not carry this machine's id. Delete the login file to
+register anew.
+
+The daemon reads that file at startup and sends the access token as the
+bearer to `https://api.openai.com/v1/responses`; OpenAI says to use this
+endpoint, not ChatGPT's `backend-api`. Access tokens last an hour and refresh
+tokens are single-use, so the daemon is the one refresher: two minutes before
+expiry, after pacing and admission but before sending, it refreshes under a
+lock (in-process, and `flock` on `chatgpt.json.lock` across daemons sharing
+the file) and writes the rotated pair back before using it. A file holding
+another token than the one in memory (a new sign-in, another daemon's
+refresh) is taken as it is. A 401 for the held token refreshes it once and
+retries without backoff (`provider_login_refreshed`); a 401 moments after a
+refresh ends the turn with `provider_login_rejected`, naming the file. A
+refused refresh answers `provider_login_expired`, naming the file and
+`agent login chatgpt` (for `invalid_client`, to delete the file and register
+again); a 5xx or 429 from the token endpoint keeps the token
+set and is retried with backoff (a 429 as `provider_login_throttled`). A
+sign-in takes the same lock before writing. Every token in the file is
+redacted from tool output. Requests on the plan group the bot's tools in one namespace, `agent`, since
+the route takes function tools only grouped or as `additional_tools`; a call
+comes back naming it and is replayed as it came. They carry no
+`max_output_tokens`, which it refuses,
+and its usage limit (`subscription_sharing_usage_limit_exceeded`, a 429 or a
+failed stream) ends the turn as `provider_quota_exhausted` rather than being
+paced and retried; a stream that fails with
+`subscription_sharing_usage_unavailable` or `_user_unavailable` is retried
+with backoff as `provider_plan_unavailable`. Not yet measured on a real plan: prompt-cache hit rates
+at this endpoint, `responses-ws`, and which request fields it accepts beyond
+those OpenAI lists.
+A new sign-in needs no restart: the daemon takes the file's token set at its
+next refresh or 401. A missing, unreadable or plan-less file fails startup
+with `provider_login_unavailable`. The login goes only to that
 endpoint: a `chatgpt` spec naming another URL authenticates with the key
 variable it names, or with nothing, so a local or synthetic endpoint never
-receives the real token. The daemon redacts the access token from tool output
-like a key. Only a synthetic
-endpoint has exercised the headers; whether the ChatGPT backend accepts every
-field this adapter sends has not been observed.
+receives the real token.
 
 Responses requests explicitly include `reasoning.encrypted_content` even when
 no reasoning effort is configured, because a model can reason by default.
@@ -1036,9 +1061,9 @@ does not, and each is one op:
   moderation and search models by base model name (a fine-tune by the model
   it was tuned from). Explicit output modalities must include text when
   the provider supplies them; unknown custom model names are kept. A
-  ChatGPT login asks the Codex
-  backend with `client_version` (the Codex release this repository measures
-  against). Nothing else reads it: a turn runs whatever model it names.
+  ChatGPT plan login asks `https://api.openai.com/v1/models` with its
+  bearer and keeps `models[]` entries listed as `visibility: "list"`, by
+  `slug`. Nothing else reads it: a turn runs whatever model it names.
   `agent models --discover` uses it once to write `~/.agent/models`.
 - `stats` returns the daemon's live state without sampling its process from
   outside: open sessions, active turns against the bound, parked turns,

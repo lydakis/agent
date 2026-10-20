@@ -744,21 +744,23 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     results, filesystem effects, and final answer as the current loop;
     anything else fails the comparison rather than ranking as cheaper.
     Then a small real-provider check under a stated spend cap.
-40. Done: a ChatGPT login that outlives one token. `--provider chatgpt`
-    used to read Codex's `auth.json` once and never again, so a daemon that
-    outlived the token failed every call until restarted. The login is now
-    re-read when its token's `exp` claim passes, after pacing and admission,
-    and on a 401 for its current token. A concurrent 401 for an older token
-    reuses the login already installed. A changed token or account is retried
-    without backoff, and every token is redacted from then on. An
-    unchanged login is reported as `provider_login_rejected` naming the file,
-    and an expired file as `provider_login_expired` naming the time.
-    Codex still does the signing in. A success that names no content type
-    and finishes without an SSE frame is reported as `provider_expected_sse`
-    with the message it held. Transport failures and partial SSE frames remain
-    retryable. Anthropic subscription use is deliberately not attempted: the
-    terms are a gray area and the account is George's. Performance evidence in
-    [the login screen](DAEMON_MEASUREMENTS.md#login-re-read-and-unnamed-bodies).
+40. Done: the ChatGPT plan through Sign in with ChatGPT (2026-10-20). The
+    `chatgpt` provider used to borrow Codex's `auth.json` and call
+    `chatgpt.com/backend-api/codex`, which OpenAI's Sign in with ChatGPT docs
+    (read 2026-10-20) now say not to use. `agent login chatgpt` signs in
+    from the CLI's own process, never the daemon's, and writes
+    `~/.agent/chatgpt.json`; the daemon calls `api.openai.com/v1/responses`
+    with its token and is the one process that refreshes it, since refresh
+    tokens are single-use. The daemon and CLI need no app and no Codex. The
+    plan's usage limit ends a turn as `provider_quota_exhausted`, and the plan
+    refuses `max_output_tokens`, so it is not sent. Design and sources:
+    [RUST_PROTOTYPE.md](RUST_PROTOTYPE.md). Open, on a real plan: prompt-cache
+    hit rates at this endpoint without the backend's `session-id` and
+    `x-codex-turn-state` affinity (both still sent; the turn-state token and
+    its stored column go once a live run shows the endpoint never returns
+    it), `responses-ws`, and the model ids `/v1/models` lists. Anthropic
+    subscription use is deliberately not attempted: the account is George's
+    and the terms do not allow it.
 
 40. Responses over WebSocket, measured before kept. OpenAI's WebSocket mode
     keeps the latest response per lane in a connection-local cache, so a

@@ -32,8 +32,8 @@ the agent's account. Each bot reports its turn's status, model rounds,
 input, cached input and output tokens (the daemon's totals), shell commands
 that touched memory, the facts it saved or removed, and its time.
 
-Real model, real spend or plan quota. Run it on the ChatGPT plan with
-Codex's login, naming the model as Codex's /model picker shows it:
+Real model, real spend or plan quota. Run it on the ChatGPT plan after
+`agent login chatgpt`, naming a model `agent models` lists:
 
     .local/venv/bin/python -m bench.memory_eval --model chatgpt/MODEL \\
         --out .local/memory-eval/MODEL.json
@@ -469,10 +469,11 @@ def main():
     env = clean_env()
     env['AGENT_PROVIDER'] = args.provider or args.model.split('/', 1)[0]
     env.update({k: os.environ[k] for k in provider_keys(env['AGENT_PROVIDER']) if k in os.environ})
-    # A chatgpt daemon reads Codex's login from CODEX_HOME, which must
-    # outlive the bot's own HOME. No other run is told where it is.
+    # A chatgpt daemon reads the plan login `agent login chatgpt` saved,
+    # which must outlive the bot's own HOME. No other run is told where it is.
     if any(spec.partition('=')[0] == 'chatgpt' for spec in env['AGENT_PROVIDER'].split()):
-        env['CODEX_HOME'] = os.environ.get('CODEX_HOME') or str(Path.home() / '.codex')
+        env['AGENT_CHATGPT_LOGIN'] = (os.environ.get('AGENT_CHATGPT_LOGIN')
+                                      or str(Path.home() / '.agent' / 'chatgpt.json'))
     # Bots work outside this checkout, so composing their instructions
     # finds the shop's AGENTS.md and not this repository's.
     out_dir = Path(tempfile.mkdtemp(prefix='agent-memory-eval-'))

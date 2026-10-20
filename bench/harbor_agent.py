@@ -15,8 +15,10 @@ import asyncio
 import contextlib
 import json
 import os
+import secrets
 import shlex
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any, ClassVar, override
 
@@ -41,8 +43,13 @@ from harbor.models.trial.paths import EnvironmentPaths
 REPOSITORY = Path(__file__).resolve().parents[1]
 DEFAULT_BINARY = REPOSITORY / '.local/target/x86_64-unknown-linux-musl/release/agent'
 REMOTE_BINARY = '/installed-agent/agent'
-REMOTE_CODEX_HOME = '/installed-agent/codex'
-CHATGPT_URL = 'https://chatgpt.com/backend-api/codex'
+REMOTE_LOGIN_DIR = '/installed-agent/chatgpt'
+CHATGPT_URL = 'https://api.openai.com/v1'
+# A trial's token must outlast the trial: nothing in the container can refresh it.
+# A copied access token is never refreshed: it must outlast the documented
+# 2,400-second agent timeout, the daemon's two-minute refresh margin and the
+# finishing command.
+LOGIN_MARGIN = 45 * 60
 # SQLite stays on the container's own disk: the log directory is a host mount.
 REMOTE_STORE = '/tmp/agent-harbor'
 BOT = 'task'
@@ -67,8 +74,8 @@ class Agent(BaseInstalledAgent):
       provider     extra `--provider` spec, or a list of them, for gateways
                    such as Bedrock; the spec's KEY_ENV is forwarded
       reasoning    `--effort` level
-      codex_auth   for chatgpt/MODEL: Codex's ChatGPT login to copy into the
-                   container (default: $CODEX_HOME/auth.json, else ~/.codex/auth.json)
+      chatgpt_login  for chatgpt/MODEL: the plan login to copy into the container
+                   (default: $AGENT_CHATGPT_LOGIN, else ~/.agent/chatgpt.json)
       max_output_tokens, context_bytes, compact_at: the new bot's settings
       stall_timeout: the daemon's stall limit, a duration such as 5m
     """
@@ -77,14 +84,15 @@ class Agent(BaseInstalledAgent):
     # (ANTHROPIC_API_KEY for anthropic/..., OPENAI_API_KEY for openai/...).
     MODEL_CONNECTION = ModelConnectionSpec(passthrough=True)
     ERROR_PATTERNS: ClassVar[list[ErrorPattern]] = [
-        ErrorPattern(r'"error":"provider_(?:rate_limited|http_429|paced)"', ApiRateLimitError),
+        ErrorPattern(r'"error":"provider_(?:rate_limited|http_429|paced|login_throttled)"', ApiRateLimitError),
         ErrorPattern(r'"error":"provider_quota_exhausted"', ApiUsageLimitError),
         ErrorPattern(r'"error":"provider_http_5(?!03"|29")\d\d"', ApiInternalServerError),
-        ErrorPattern(r'"error":"provider_(?:http_503|http_529|unavailable)"', ApiOverloadedError),
+        ErrorPattern(r'"error":"provider_(?:http_503|http_529|unavailable|plan_unavailable)"', ApiOverloadedError),
         ErrorPattern(r'"error":"provider_stream_stalled"', ApiResponseStalledError),
         ErrorPattern(r'"error":"(?:provider_connection_[a-z0-9_]+|provider_stream_failed'
                      r'|truncated_sse_frame|provider_admission_timeout)"', NetworkConnectionError),
-        ErrorPattern(r'"error":"provider_(?:http_401|http_403|key_unavailable)"', AgentAuthenticationError),
+        ErrorPattern(r'"error":"provider_(?:http_401|http_403|key_unavailable'
+                     r'|login_expired|login_unavailable|login_rejected)"', AgentAuthenticationError),
     ]
     # The HTTP client reads the platform's root certificates at daemon start,
     # even for plain-HTTP endpoints, and minimal images ship none.
@@ -107,25 +115,26 @@ class Agent(BaseInstalledAgent):
 
     def __init__(self, *args: Any, binary: str | None = None,
                  provider: str | list[str] | None = None, reasoning: str | None = None,
-                 codex_auth: str | None = None, **kwargs: Any) -> None:
+                 chatgpt_login: str | None = None, **kwargs: Any) -> None:
         limits = {key: kwargs.pop(key) for key in list(kwargs) if key in self._LIMITS}
         super().__init__(*args, **kwargs)
         self._binary = Path(binary or os.environ.get('AGENT_HARBOR_BINARY') or DEFAULT_BINARY)
         self._providers = [provider] if isinstance(provider, str) else list(provider or [])
         self._reasoning = reasoning
         self._limits = limits
-        # A chatgpt/ model signs in with the ChatGPT login Codex saved, unless
-        # a chatgpt spec names another endpoint, which never gets the login.
+        # A chatgpt/ model spends the plan through `agent login chatgpt`'s
+        # login, unless a chatgpt spec names another endpoint, which never
+        # gets the login.
         if ((self.model_name or '').startswith('chatgpt/')
                 and not any(p.partition('=')[0] == 'chatgpt' for p in self._providers)):
             self._providers.append('chatgpt')
         self._chatgpt = any(self._signs_in(spec) for spec in self._providers)
-        codex_home = os.environ.get('CODEX_HOME') or Path.home() / '.codex'
-        self._codex_auth = Path(codex_auth or Path(codex_home) / 'auth.json')
+        self._login = Path(chatgpt_login or os.environ.get('AGENT_CHATGPT_LOGIN')
+                           or Path.home() / '.agent' / 'chatgpt.json')
 
     @staticmethod
     def _signs_in(spec: str) -> bool:
-        """Whether the daemon reads Codex's login for this spec: the chatgpt
+        """Whether the daemon reads the plan login for this spec: the chatgpt
         name at its own endpoint with no key variable, as ProviderSpec::parse."""
         name, _, rest = spec.partition('=')
         fields = [field for field in rest.split(',') if field]
@@ -151,9 +160,9 @@ class Agent(BaseInstalledAgent):
             raise FileNotFoundError(
                 f'{self._binary} is missing; build it with '
                 'cargo build --release --locked --target x86_64-unknown-linux-musl')
-        if self._chatgpt and not self._codex_auth.is_file():
+        if self._chatgpt and not self._login.is_file():
             raise FileNotFoundError(
-                f'{self._codex_auth} is missing; sign in with `codex login` first')
+                f'{self._login} is missing; sign in with `agent login chatgpt` first')
         # Harbor's exec and the run command below need bash; minimal images (Alpine) lack it.
         needed = ('bash',)
         has_roots = ' || '.join(f'[ -s {path} ]' for path in self.CA_BUNDLES)
@@ -168,19 +177,27 @@ class Agent(BaseInstalledAgent):
         )
         if self._chatgpt:
             # Only what a request carries: the refresh and ID tokens stay on
-            # the host, where the model's tools cannot read them. The daemon
-            # redacts the access token from tool output.
-            await self.exec_as_root(environment, command=f'mkdir -p -m 755 {REMOTE_CODEX_HOME}')
+            # the host, where the model's tools cannot read them, and a
+            # container's refresh could not spend the host's single-use
+            # refresh token. The daemon redacts the access token from tool output.
+            await self.exec_as_root(environment, command=f'mkdir -p -m 755 {REMOTE_LOGIN_DIR}')
             await self._upload_config_text(
-                environment, content=json.dumps({'tokens': self._chatgpt_login()}),
-                remote_path=f'{REMOTE_CODEX_HOME}/auth.json', filename='auth.json')
+                environment, content=json.dumps(self._chatgpt_login()),
+                remote_path=f'{REMOTE_LOGIN_DIR}/chatgpt.json', filename='chatgpt.json')
 
-    def _chatgpt_login(self) -> dict[str, str]:
-        tokens = json.loads(self._codex_auth.read_text()).get('tokens') or {}
-        login = {key: tokens.get(key) for key in ('access_token', 'account_id')}
-        if not all(isinstance(value, str) and value for value in login.values()):
-            raise ValueError(f'{self._codex_auth} has no ChatGPT login; run `codex login`')
-        return login
+    def _chatgpt_login(self, now: float | None = None) -> dict[str, Any]:
+        saved = json.loads(self._login.read_text())
+        login = {key: saved.get(key)
+                 for key in ('client_id', 'subject', 'access_token', 'expires_at', 'scope')}
+        if not all(login.values()):
+            raise ValueError(f'{self._login} has no ChatGPT login; run `agent login chatgpt`')
+        if login['expires_at'] < (now if now is not None else time.time()) + LOGIN_MARGIN:
+            raise ValueError(f'{self._login} expires before a trial could finish; sign in '
+                             'again with `agent login chatgpt` just before the run')
+        # The daemon needs a refresh token to read the file; this one is
+        # refused if it is ever tried. The daemon redacts it like any token,
+        # so it is random: a common word would be redacted from tool output.
+        return {**login, 'refresh_token': f'withheld-{secrets.token_urlsafe(24)}', 'id_token': ''}
 
     def _command(self, instruction: str) -> str:
         if not self.model_name:
@@ -223,7 +240,7 @@ class Agent(BaseInstalledAgent):
         env = {**self.resolve_env_vars(), **self.model_connection.env,
                'AGENT_STORE': f'{REMOTE_STORE}/state.sqlite'}
         if self._chatgpt:
-            env['CODEX_HOME'] = REMOTE_CODEX_HOME
+            env['AGENT_CHATGPT_LOGIN'] = f'{REMOTE_LOGIN_DIR}/chatgpt.json'
         for spec in self._providers:
             fields = spec.partition('=')[2].split(',')
             if len(fields) >= 3 and (value := self._get_env(fields[2])):

@@ -391,7 +391,8 @@ pub struct ProviderSpec {
     pub family: Family,
     pub url: String,
     pub key_env: Option<String>,
-    /// Authenticate with the ChatGPT login Codex saved, not a key variable.
+    /// Authenticate with the ChatGPT plan login `agent login chatgpt` saved,
+    /// not a key variable.
     pub chatgpt_login: bool,
     /// Carry Responses calls over WebSocket (family `responses-ws`).
     pub socket: bool,
@@ -406,8 +407,9 @@ impl ProviderSpec {
     }
     /// `NAME[=FAMILY[,URL[,KEY_ENV]]]`. Known names have defaults; the key
     /// variable is read only when named here or implied by a default endpoint.
-    /// `chatgpt` at its default endpoint without a key variable uses Codex's
-    /// saved ChatGPT login; the login never goes to a caller-chosen URL.
+    /// `chatgpt` at its default endpoint without a key variable spends the
+    /// ChatGPT plan through `~/.agent/chatgpt.json`, as `agent login chatgpt`
+    /// saved it; the login never goes to a caller-chosen URL.
     /// `bedrock` (Claude) defaults to Bedrock runtime, where cross-region
     /// inference profiles (`global.anthropic.…`) route to whichever region
     /// holds the model, from any source region the profile supports, and `bedrock-openai` to Bedrock Mantle, as Claude
@@ -453,7 +455,10 @@ impl ProviderSpec {
                 "https://openrouter.ai/api/v1",
                 Some("OPENROUTER_API_KEY"),
             ),
-            "chatgpt" => ("responses", "https://chatgpt.com/backend-api/codex", None),
+            // Sign in with ChatGPT spends the plan at the public endpoint,
+            // never ChatGPT's backend-api (developers.openai.com/siwc, read
+            // 2026-10-20).
+            "chatgpt" => ("responses", "https://api.openai.com/v1", None),
             "bedrock" => (
                 "anthropic",
                 "https://bedrock-runtime.{region}.amazonaws.com/anthropic/v1",
@@ -539,23 +544,6 @@ impl ProviderSpec {
             socket,
         })
     }
-}
-
-/// Codex's `auth.json`: `$CODEX_HOME`, else `~/.codex`.
-fn codex_auth() -> Result<PathBuf> {
-    std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
-        .map(|home| home.join("auth.json"))
-        .ok_or(Error::new("provider_login_unavailable"))
-}
-
-/// The access token and workspace from Codex's `auth.json`. Codex refreshes
-/// the token when it runs; the daemon re-reads the file when the token
-/// expires or is refused, and never refreshes it itself.
-#[cfg(test)]
-fn chatgpt_login(path: &Path) -> Result<(String, String)> {
-    agent_runtime::provider::login::read(path).map(|s| (s.token, s.account))
 }
 
 pub struct Configuration {
@@ -913,10 +901,10 @@ pub async fn run(config: Configuration) -> Result<()> {
     let mut bindings = serde_json::Map::new();
     for spec in &config.providers {
         let (key, login) = if spec.chatgpt_login {
-            // No variable carries the token; the shared set redacts it, and
-            // every token the login re-reads later.
+            // No variable carries the tokens; the shared set redacts them,
+            // and every pair a refresh brings later.
             let login = agent_runtime::provider::login::Login::open(
-                &codex_auth()?,
+                &agent_runtime::provider::login::default_path()?,
                 Some(credentials.clone()),
             )?;
             (None, Some(Arc::new(login)))
@@ -3163,36 +3151,17 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_uses_the_codex_login_unless_given_a_key() {
+    fn chatgpt_uses_the_plan_login_unless_given_a_key() {
         let login = ProviderSpec::parse("chatgpt").unwrap();
-        assert_eq!(login.url, "https://chatgpt.com/backend-api/codex");
+        assert_eq!(login.url, "https://api.openai.com/v1");
         assert!(login.chatgpt_login && login.key_env.is_none());
         // Another endpoint never receives the login, even a local one.
-        let local = ProviderSpec::parse("chatgpt=responses,http://127.0.0.1:9/backend-api/codex");
+        let local = ProviderSpec::parse("chatgpt=responses,http://127.0.0.1:9/v1");
         let local = local.unwrap();
         assert!(!local.chatgpt_login && local.key_env.is_none());
         let keyed = ProviderSpec::parse("chatgpt=responses,https://gw.example.test/v1,GW_KEY");
         assert!(!keyed.unwrap().chatgpt_login);
         assert!(!ProviderSpec::parse("openai").unwrap().chatgpt_login);
-    }
-
-    #[test]
-    fn the_login_is_the_access_token_and_workspace_only() {
-        let dir = std::env::temp_dir().join(format!("agent-codex-login-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("auth.json");
-        std::fs::write(
-            &path,
-            r#"{"OPENAI_API_KEY":null,"tokens":{"id_token":"i","access_token":"a","refresh_token":"r","account_id":"w"}}"#,
-        )
-        .unwrap();
-        assert_eq!(chatgpt_login(&path).unwrap(), ("a".into(), "w".into()));
-        std::fs::write(&path, r#"{"tokens":{"access_token":"a"}}"#).unwrap();
-        let missing = chatgpt_login(&path).unwrap_err();
-        assert_eq!(missing.code, "provider_login_unavailable");
-        std::fs::remove_dir_all(dir).unwrap();
-        let absent = chatgpt_login(&path).unwrap_err();
-        assert_eq!(absent.detail, Some(path.display().to_string()));
     }
 
     #[tokio::test]

@@ -65,9 +65,10 @@ cargo build --release --locked -p agent-runtime -p agent-app
 .local/venv/bin/python -m bench.memory_eval --model chatgpt/MODEL --out .local/memory-eval/MODEL.json
 ```
 
-- **Model.** Name it as Codex's `/model` picker shows it.
-- **Login.** The daemons read Codex's login from `CODEX_HOME`, or from
-  `~/.codex` when that is unset.
+- **Model.** Name one `agent models` lists for the `chatgpt` provider.
+- **Login.** The daemons read the plan login `agent login chatgpt` saved,
+  from `AGENT_CHATGPT_LOGIN` or `~/.agent/chatgpt.json`. The 2026-10-10 run
+  below predates it and used Codex's login.
 - **Run size.** 18 bots start at once: 2 conditions × 3 scenarios × 3
   trials (`--trials`). Each bot's turn is capped at 400,000 tokens
   (`--turn-budget-tokens`) and 20 minutes (`--timeout`).

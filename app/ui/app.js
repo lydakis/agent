@@ -3247,7 +3247,7 @@ const CATALOG = [
   { id: 'anthropic', label: 'Anthropic', fields: [{ key: 'ANTHROPIC_API_KEY', label: 'API key', secret: true, required: true }] },
   { id: 'openai', label: 'OpenAI', fields: [{ key: 'OPENAI_API_KEY', label: 'API key', secret: true, required: true }] },
   { id: 'openrouter', label: 'OpenRouter', fields: [{ key: 'OPENROUTER_API_KEY', label: 'API key', secret: true, required: true }] },
-  { id: 'chatgpt', label: 'ChatGPT plan', about: 'Uses the ChatGPT sign-in Codex saved on this computer (codex login).', fields: [] },
+  { id: 'chatgpt', label: 'ChatGPT plan', about: 'Spends your ChatGPT plan with the sign-in saved on this computer (agent login chatgpt).', fields: [] },
   // Bedrock serves Claude over Anthropic's API and every other model over OpenAI's, each a provider of
   // its own to the daemon; to the user it is one provider, connected and removed as one.
   { id: 'bedrock', label: 'Amazon Bedrock', about: AWS, fields: BEDROCK, parts: [['bedrock', 'anthropic', 'anthropic'], ['bedrock-openai', 'responses', 'openai']] },

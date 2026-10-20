@@ -114,7 +114,19 @@ impl State {
                     || detail
                         .as_deref()
                         .is_some_and(|d| d.starts_with("Rate limit reached"));
-                let code = if rate_limited {
+                // A ChatGPT plan's usage limit can also end a started stream.
+                // A code at the top level of an `error` event, as above.
+                let errors = [&value, &value["error"], &value["response"]["error"]];
+                let named = |test: fn(&str) -> bool| {
+                    errors
+                        .iter()
+                        .any(|error| error["code"].as_str().is_some_and(test))
+                };
+                let code = if named(super::quota) {
+                    "provider_quota_exhausted"
+                } else if named(super::plan_unavailable) {
+                    "provider_plan_unavailable"
+                } else if rate_limited {
                     "provider_rate_limited"
                 } else {
                     "provider_incomplete"
@@ -320,6 +332,18 @@ mod tests {
             (failed.code.as_str(), failed.detail.as_deref()),
             ("provider_incomplete", Some("quota"))
         );
+        let spent = State::default()
+            .frame(br#"{"type":"response.failed","response":{"error":{"code":"subscription_sharing_usage_limit_exceeded","message":"Usage limit reached."}}}"#)
+            .unwrap_err();
+        assert_eq!(spent.code, "provider_quota_exhausted");
+        let unavailable = State::default()
+            .frame(br#"{"type":"response.failed","response":{"error":{"code":"subscription_sharing_usage_unavailable","message":"Try again later."}}}"#)
+            .unwrap_err();
+        assert_eq!(unavailable.code, "provider_plan_unavailable");
+        let unavailable = State::default()
+            .frame(br#"{"type":"error","code":"subscription_sharing_user_unavailable","message":"Try again later."}"#)
+            .unwrap_err();
+        assert_eq!(unavailable.code, "provider_plan_unavailable");
         let limited = State::default()
             .frame(br#"{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"Rate limit reached for m on tokens per min (TPM): Limit 4000000"}}}"#)
             .unwrap_err();

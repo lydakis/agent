@@ -531,8 +531,8 @@ impl Provider {
         Ok(self)
     }
 
-    /// Send a ChatGPT login's current token and workspace on every request,
-    /// re-read from its file when it expires or the endpoint refuses it.
+    /// Send a ChatGPT plan login's current token on every request,
+    /// refreshed when it nears expiry or the endpoint refuses it.
     pub fn with_login(mut self, login: Arc<login::Login>) -> Result<Self> {
         if self.family != Family::Responses {
             return fail("invalid_provider_account");
@@ -697,6 +697,20 @@ impl Provider {
             true => json!({"type":"ephemeral","ttl":"1h"}),
             false => json!({"type":"ephemeral"}),
         };
+        // The ChatGPT plan takes function tools only grouped in a namespace
+        // (OpenAI's preview limitations, read 2026-10-20); a call comes back
+        // naming it, and its item is replayed as it came.
+        let grouped;
+        let tools = match self.login {
+            Some(_) if request.tools.get() != "[]" => {
+                grouped = RawValue::from_string(format!(
+                    r#"[{{"type":"namespace","name":"{PLAN_NAMESPACE}","description":"Tools","tools":{}}}]"#,
+                    request.tools.get()
+                ))?;
+                &*grouped
+            }
+            _ => request.tools,
+        };
         let (mut bytes, field) = match self.family {
             Family::Responses if warm => return fail("keep_warm_unsupported"),
             Family::Responses => (
@@ -707,8 +721,10 @@ impl Provider {
                     store: false,
                     // Request opaque reasoning for stateless continuation across endpoints.
                     include: ["reasoning.encrypted_content"],
-                    max_output_tokens: self.max_output_tokens,
-                    tools: request.tools,
+                    // The ChatGPT plan refuses an output cap (OpenAI's
+                    // preview limitations, read 2026-10-20).
+                    max_output_tokens: self.max_output_tokens.filter(|_| self.login.is_none()),
+                    tools,
                     tool_choice: disable_tools.then_some("none"),
                     reasoning: request
                         .reasoning
@@ -994,7 +1010,7 @@ impl Provider {
             // Read after pacing and admission, as on HTTP; only a new
             // connection sends it.
             if let Some(login) = &self.login {
-                *session = Some(login.current()?);
+                *session = Some(login.current(self.transport.lease().0).await?);
             }
             return self
                 .complete_socket(
@@ -1015,10 +1031,9 @@ impl Provider {
         // A token can expire while pacing or waiting for admission. Read it
         // only now, before building the headers that will carry it.
         if let Some(login) = &self.login {
-            *session = Some(login.current()?);
+            *session = Some(login.current(client).await?);
         }
         let key = session.as_ref().map(|s| &s.token).or(self.key.as_ref());
-        let account = session.as_ref().map(|s| &s.account);
         let mut http = client
             .post(self.url.clone())
             .header("content-type", "application/json")
@@ -1030,9 +1045,6 @@ impl Provider {
             (Family::Anthropic, key) => self.anthropic_headers(http, key, request.fallbacks),
             (Family::Responses, None) => http,
         };
-        if let Some(account) = account {
-            http = http.header("chatgpt-account-id", account);
-        }
         // The ChatGPT Codex endpoint takes cache affinity from this header, not
         // from prompt_cache_key (openai/codex 53446f9, core/src/client.rs).
         if let (Family::Responses, Some(key)) = (self.family, cache_key) {
@@ -1075,7 +1087,7 @@ impl Provider {
                 && let (Some(login), Some(session)) = (&self.login, session.as_ref())
             {
                 reservation.settle(0);
-                return Err(login_refused(login, session, body.detail)?);
+                return Err(login_refused(client, login, session, body.detail).await?);
             }
             // Expired or replaced AWS keys are re-resolved once, as a login is.
             if matches!(status, 401 | 403)
@@ -1302,7 +1314,7 @@ impl Provider {
         // until it closes; open a new one instead, as Codex does.
         let auth = login.map_or(0, |s| {
             use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
-            BuildHasherDefault::<DefaultHasher>::default().hash_one((&s.token, &s.account))
+            BuildHasherDefault::<DefaultHasher>::default().hash_one(&s.token)
         });
         let reused = bot
             .and_then(|bot| sockets.take(bot))
@@ -1315,9 +1327,6 @@ impl Provider {
                 let bearer = key.map(|key| format!("Bearer {key}"));
                 if let Some(bearer) = &bearer {
                     headers.push(("authorization", bearer.as_str()));
-                }
-                if let Some(account) = login.map(|s| &s.account) {
-                    headers.push(("chatgpt-account-id", account.as_str()));
                 }
                 // Cache affinity, as on HTTP; the connection is the bot's own.
                 if let Some(key) = cache_key {
@@ -1351,7 +1360,14 @@ impl Provider {
                         if failure.status == Some(401)
                             && let (Some(login), Some(session)) = (&self.login, login)
                         {
-                            return Err(login_refused(login, session, failure.error.detail)?);
+                            let client = self.transport.lease().0;
+                            return Err(login_refused(
+                                client,
+                                login,
+                                session,
+                                failure.error.detail,
+                            )
+                            .await?);
                         }
                         return Err(failure.error);
                     }
@@ -1434,7 +1450,8 @@ impl Provider {
                     // opens another with the login as re-read.
                     (Some(401), Some(refused), Some(login)) => {
                         keep = false;
-                        Err(login_refused(refused, login, failure.error.detail)?)
+                        let client = self.transport.lease().0;
+                        Err(login_refused(client, refused, login, failure.error.detail).await?)
                     }
                     _ => Err(failure.error),
                 }
@@ -1447,21 +1464,21 @@ impl Provider {
     }
 }
 
-/// A login the endpoint refused with a 401. Codex may have signed in or
-/// selected another account since, so the refusal is retryable when either
-/// auth field changed; otherwise it is final and names the file.
-fn login_refused(
+/// A login the endpoint refused with a 401: retryable once another token
+/// is held (refreshed, or signed in again), else final and names the file.
+async fn login_refused(
+    client: &reqwest::Client,
     login: &login::Login,
     session: &login::Session,
     detail: Option<String>,
 ) -> Result<Error> {
     let refused = detail.unwrap_or_else(|| "HTTP 401".to_owned());
-    Ok(match login.reload(session)? {
+    Ok(match login.reload(client, session).await? {
         true => Error::with("provider_login_refreshed", refused),
         false => Error::with(
             "provider_login_rejected",
             format!(
-                "{refused}; {} holds the refused token, run any codex command to sign in again",
+                "{refused}; {} holds the refused token, run agent login chatgpt to sign in again",
                 login.path().display()
             ),
         ),
@@ -1658,6 +1675,28 @@ fn looks_like_sse_prefix(body: &[u8]) -> bool {
         })
 }
 
+/// An error code that means the account's allowance is spent, not that the
+/// pace is too fast: an API key's quota, or a ChatGPT plan's usage limit,
+/// which OpenAI says not to retry or guess a reset for.
+pub(crate) fn quota(code: &str) -> bool {
+    matches!(
+        code,
+        "insufficient_quota" | "subscription_sharing_usage_limit_exceeded"
+    )
+}
+
+/// The namespace a ChatGPT plan request groups the bot's tools under.
+const PLAN_NAMESPACE: &str = "agent";
+
+/// A ChatGPT plan's usage service briefly unable to serve, which OpenAI says
+/// to retry with a bounded backoff, also after a stream has started.
+pub(crate) fn plan_unavailable(code: &str) -> bool {
+    matches!(
+        code,
+        "subscription_sharing_usage_unavailable" | "subscription_sharing_user_unavailable"
+    )
+}
+
 /// A short provider message from a bounded body, or nothing safe to show.
 fn parse_error_body(body: &[u8], expects_json: bool) -> Option<ErrorBody> {
     let text = std::str::from_utf8(body).ok()?.trim();
@@ -1668,12 +1707,14 @@ fn parse_error_body(body: &[u8], expects_json: bool) -> Option<ErrorBody> {
         Ok(value) => Some(ErrorBody {
             quota: ["code", "type"]
                 .iter()
-                .any(|field| value["error"][field].as_str() == Some("insufficient_quota")),
+                .any(|field| value["error"][field].as_str().is_some_and(quota)),
             detail: value
                 .as_str()
                 .or_else(|| value["error"]["message"].as_str())
                 .or_else(|| value["error"].as_str())
                 .or_else(|| value["message"].as_str())
+                // The ChatGPT plan route's admission refusals.
+                .or_else(|| value["detail"].as_str())
                 .map(str::to_owned),
         }),
         // Never fall back to a serialized JSON representation: alternate
@@ -2600,17 +2641,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn an_error_body_keeps_a_top_level_detail() {
+        let body = parse_error_body(br#"{"detail":"Unsupported region."}"#, true).unwrap();
+        assert_eq!(body.detail.as_deref(), Some("Unsupported region."));
+    }
+
     #[tokio::test]
-    async fn a_login_sends_its_token_and_account_on_every_request() {
+    async fn a_login_sends_its_token_on_every_request_and_no_output_cap() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let dir = std::env::temp_dir().join(format!("agent-login-headers-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("auth.json");
-        std::fs::write(
-            &path,
-            r#"{"tokens":{"access_token":"synthetic-token","account_id":"synthetic-account"}}"#,
-        )
-        .unwrap();
+        let dir = login::tests::temp("login-headers");
+        let path = dir.join("chatgpt.json");
+        login::tests::save(&path, "synthetic-token");
         let login = Arc::new(login::Login::open(&path, None).unwrap());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -2631,6 +2673,8 @@ mod tests {
         let provider = Provider::new(Transport::new(0, 1).unwrap(), Family::Responses, &url, None)
             .unwrap()
             .with_login(login.clone())
+            .unwrap()
+            .with_max_output_tokens(4096)
             .unwrap();
         let tools = none();
         let request = Request {
@@ -2646,6 +2690,26 @@ mod tests {
             route: None,
             sent: None,
         };
+        // The plan refuses an output cap; the bot's own still paces the call.
+        let prefix = String::from_utf8(provider.prefix(&request).unwrap()).unwrap();
+        assert!(!prefix.contains("max_output_tokens"), "{prefix}");
+        // Its tools go in a namespace; none means no namespace.
+        assert!(prefix.contains(r#""tools":[]"#), "{prefix}");
+        let echo = RawValue::from_string(r#"[{"type":"function","name":"echo"}]"#.into()).unwrap();
+        let prefix = provider
+            .prefix(&Request {
+                tools: &echo,
+                items: Items::empty(),
+                chain: None,
+                ..request
+            })
+            .unwrap();
+        let body: Value = serde_json::from_slice(&[&prefix[..], b"]}"].concat()).unwrap();
+        assert_eq!(
+            body["tools"],
+            json!([{"type":"namespace","name":"agent","description":"Tools",
+                "tools":[{"type":"function","name":"echo"}]}])
+        );
         let _ = provider
             .complete(
                 Request {
@@ -2662,10 +2726,7 @@ mod tests {
             head.contains("\r\nauthorization: bearer synthetic-token\r\n"),
             "{head}"
         );
-        assert!(
-            head.contains("\r\nchatgpt-account-id: synthetic-account\r\n"),
-            "{head}"
-        );
+        assert!(!head.contains("chatgpt-account-id"), "{head}");
         assert!(head.contains("\r\naccept: text/event-stream\r\n"), "{head}");
         assert!(head.contains("\r\nuser-agent: agent-runtime/"), "{head}");
         let anthropic = Provider::new(Transport::new(0, 1).unwrap(), Family::Anthropic, &url, None);
@@ -2755,20 +2816,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_socket_opens_with_the_login_and_rereads_it_when_refused() {
+    async fn a_socket_opens_with_the_login_and_refreshes_it_when_refused() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let dir = std::env::temp_dir().join(format!("agent-socket-login-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("auth.json");
-        let write = |token: &str| {
-            std::fs::write(
-                &path,
-                format!(r#"{{"tokens":{{"access_token":"{token}","account_id":"w"}}}}"#),
-            )
-            .unwrap();
-        };
-        write("stale");
-        let login = Arc::new(login::Login::open(&path, None).unwrap());
+        let dir = login::tests::temp("socket-login");
+        let path = dir.join("chatgpt.json");
+        login::tests::save(&path, "stale");
+        let (token_url, _bodies) = login::tests::token_server(vec![(
+            200,
+            r#"{"access_token":"fresh","refresh_token":"r2","expires_in":3600}"#.into(),
+        )])
+        .await;
+        let login = Arc::new(
+            login::Login::open(&path, None)
+                .unwrap()
+                .with_token_url(&token_url)
+                .unwrap(),
+        );
         // Refuse every upgrade, as the endpoint does an expired token.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -2812,26 +2875,25 @@ mod tests {
             route: None,
             sent: None,
         };
-        let error = provider
-            .complete(request(), |_| async { Ok(()) })
-            .await
-            .unwrap_err();
-        assert_eq!(error.code, "provider_login_rejected");
-        let head = heads.recv().await.unwrap();
-        assert!(
-            head.contains("\r\nauthorization: bearer stale\r\n"),
-            "{head}"
-        );
-        assert!(head.contains("\r\nchatgpt-account-id: w\r\n"), "{head}");
-        // Signed in again: retryable, and the next upgrade carries it.
-        write("fresh");
+        // Refused: refreshed, retryable, and the next upgrade carries it.
         let error = provider
             .complete(request(), |_| async { Ok(()) })
             .await
             .unwrap_err();
         assert_eq!(error.code, "provider_login_refreshed");
-        heads.recv().await.unwrap();
-        let _ = provider.complete(request(), |_| async { Ok(()) }).await;
+        let head = heads.recv().await.unwrap();
+        assert!(
+            head.contains("\r\nauthorization: bearer stale\r\n"),
+            "{head}"
+        );
+        assert!(!head.contains("chatgpt-account-id"), "{head}");
+        // The refreshed token refused too: final, and names the file.
+        let error = provider
+            .complete(request(), |_| async { Ok(()) })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "provider_login_rejected");
+        assert!(error.detail.unwrap().contains("chatgpt.json"));
         let head = heads.recv().await.unwrap();
         assert!(
             head.contains("\r\nauthorization: bearer fresh\r\n"),
@@ -2844,17 +2906,9 @@ mod tests {
     async fn a_socket_opened_under_an_older_login_is_not_reused() {
         use futures_util::SinkExt;
         use tokio_tungstenite::tungstenite::{Message, handshake::server};
-        let dir = std::env::temp_dir().join(format!("agent-socket-relogin-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("auth.json");
-        let write = |token: &str| {
-            std::fs::write(
-                &path,
-                format!(r#"{{"tokens":{{"access_token":"{token}","account_id":"w"}}}}"#),
-            )
-            .unwrap();
-        };
-        write("first");
+        let dir = login::tests::temp("socket-relogin");
+        let path = dir.join("chatgpt.json");
+        login::tests::save(&path, "first");
         let login = Arc::new(login::Login::open(&path, None).unwrap());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -2917,10 +2971,9 @@ mod tests {
         // The upgrade precedes each call's response, so it is already queued.
         assert_eq!(upgrades.try_recv().unwrap(), "Bearer first");
         assert!(upgrades.try_recv().is_err());
-        // Codex signed in again; the next call opens a new connection.
-        let refused = login.current().unwrap();
-        write("second");
-        assert!(login.reload(&refused).unwrap());
+        // Signed in again; the next call takes it and opens a new connection.
+        login::tests::save(&path, "second");
+        login.expire_now();
         provider
             .complete(request(), |_| async { Ok(()) })
             .await
@@ -3080,20 +3133,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_refused_login_is_reread_and_retried_only_when_the_file_changed() {
-        let dir = std::env::temp_dir().join(format!("agent-relogin-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("auth.json");
-        let write = |token: &str| {
-            std::fs::write(
-                &path,
-                format!(r#"{{"tokens":{{"access_token":"{token}","account_id":"w"}}}}"#),
-            )
-            .unwrap();
-        };
-        write("stale");
+    async fn a_refused_login_that_cannot_refresh_waits_for_a_new_sign_in() {
+        let dir = login::tests::temp("relogin");
+        let path = dir.join("chatgpt.json");
+        login::tests::save(&path, "stale");
+        let (token_url, _bodies) =
+            login::tests::token_server(vec![(400, r#"{"error":"invalid_grant"}"#.into())]).await;
         let credentials = crate::tools::Credentials::default();
-        let login = Arc::new(login::Login::open(&path, Some(credentials.clone())).unwrap());
+        let login = Arc::new(
+            login::Login::open(&path, Some(credentials.clone()))
+                .unwrap()
+                .with_token_url(&token_url)
+                .unwrap(),
+        );
         let url = gated("fresh").await;
         let provider = Provider::new(Transport::new(0, 1).unwrap(), Family::Responses, &url, None)
             .unwrap()
@@ -3113,22 +3165,22 @@ mod tests {
             sent: None,
             cache_key: None,
         };
-        // Refused, and the file still holds the refused token: final, and
-        // the detail names the file, never the token.
+        // Refused, and the refresh refused too: final, and the detail names
+        // the file and what to run, never the token.
         let error = provider
             .complete(request(), |_| async { Ok(()) })
             .await
             .unwrap_err();
-        assert_eq!(error.code, "provider_login_rejected");
+        assert_eq!(error.code, "provider_login_expired");
         let detail = error.detail.unwrap();
         assert!(
-            detail.starts_with("token expired; ") && detail.contains("auth.json"),
+            detail.contains("chatgpt.json") && detail.contains("agent login chatgpt"),
             "{detail}"
         );
         assert!(!detail.contains("stale"));
-        // Codex signed in again: the refusal becomes a retryable error, and
-        // the retry carries the new token, which is redacted from then on.
-        write("fresh");
+        // Signed in again: the refusal becomes a retryable error, and the
+        // retry carries the new token, which is redacted from then on.
+        login::tests::save(&path, "fresh");
         let error = provider
             .complete(request(), |_| async { Ok(()) })
             .await
@@ -3155,18 +3207,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_login_is_checked_after_startup_admission() {
-        let dir =
-            std::env::temp_dir().join(format!("agent-admission-login-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("auth.json");
-        let write = |token: &str| {
-            std::fs::write(
-                &path,
-                format!(r#"{{"tokens":{{"access_token":"{token}","account_id":"w"}}}}"#),
-            )
-            .unwrap();
-        };
-        write("stale");
+        let dir = login::tests::temp("admission-login");
+        let path = dir.join("chatgpt.json");
+        login::tests::save(&path, "stale");
         let login = Arc::new(login::Login::open(&path, None).unwrap());
         let transport = Transport::new(1, 1).unwrap();
         let admission = transport.starting.acquire().await.unwrap();
@@ -3196,7 +3239,7 @@ mod tests {
             std::task::Poll::Ready(())
         })
         .await;
-        write("fresh");
+        login::tests::save(&path, "fresh");
         login.expire_now();
         drop(admission);
         assert_eq!(call.await.unwrap().items.len(), 1);
