@@ -114,7 +114,13 @@ impl State {
                     || detail
                         .as_deref()
                         .is_some_and(|d| d.starts_with("Rate limit reached"));
-                let code = if rate_limited {
+                // A ChatGPT plan's usage limit can also end a started stream.
+                let quota = [&value["error"], &value["response"]["error"]]
+                    .iter()
+                    .any(|error| error["code"].as_str().is_some_and(super::quota));
+                let code = if quota {
+                    "provider_quota_exhausted"
+                } else if rate_limited {
                     "provider_rate_limited"
                 } else {
                     "provider_incomplete"
@@ -320,6 +326,10 @@ mod tests {
             (failed.code.as_str(), failed.detail.as_deref()),
             ("provider_incomplete", Some("quota"))
         );
+        let spent = State::default()
+            .frame(br#"{"type":"response.failed","response":{"error":{"code":"subscription_sharing_usage_limit_exceeded","message":"Usage limit reached."}}}"#)
+            .unwrap_err();
+        assert_eq!(spent.code, "provider_quota_exhausted");
         let limited = State::default()
             .frame(br#"{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"Rate limit reached for m on tokens per min (TPM): Limit 4000000"}}}"#)
             .unwrap_err();

@@ -90,22 +90,27 @@ class HarborAgentTest(unittest.TestCase):
             self.assertFalse(signs_in(provider=f'chatgpt=responses,{harbor_agent.CHATGPT_URL},K'))
             self.assertFalse(self.agent(logs)._chatgpt)
 
-    def test_a_chatgpt_model_signs_in_with_the_codex_login(self):
+    def test_a_chatgpt_model_spends_the_plan_with_only_its_access_token(self):
         with tempfile.TemporaryDirectory() as logs:
-            auth = Path(logs, 'auth.json')
-            auth.write_text(json.dumps({'OPENAI_API_KEY': None, 'tokens': {
-                'id_token': 'i', 'access_token': 'a', 'refresh_token': 'r', 'account_id': 'w'}}))
-            agent = Agent(logs_dir=Path(logs), model_name='chatgpt/m', codex_auth=str(auth))
+            login = Path(logs, 'chatgpt.json')
+            saved = {'client_id': 'oaiapp_x', 'access_token': 'a', 'refresh_token': 'r',
+                     'id_token': 'i', 'expires_at': 10_000, 'scope': 'chatgpt.tokens.use.direct'}
+            login.write_text(json.dumps(saved))
+            agent = Agent(logs_dir=Path(logs), model_name='chatgpt/m', chatgpt_login=str(login))
             command, env = agent._command('task'), agent._env()
-            # The container gets what a request carries, never the refresh token.
-            self.assertEqual(agent._chatgpt_login(), {'access_token': 'a', 'account_id': 'w'})
-            auth.write_text(json.dumps({'tokens': {'access_token': 'a'}}))
+            # The container gets what a request carries, never the refresh or ID token.
+            copied = agent._chatgpt_login(now=1_000)
+            self.assertEqual(copied['access_token'], 'a')
+            self.assertEqual((copied['refresh_token'], copied['id_token']), ('withheld', ''))
+            with self.assertRaisesRegex(ValueError, 'expires within'):
+                agent._chatgpt_login(now=9_000)
+            login.write_text(json.dumps({'access_token': 'a'}))
             with self.assertRaisesRegex(ValueError, 'no ChatGPT login'):
-                agent._chatgpt_login()
+                agent._chatgpt_login(now=1_000)
         self.assertIn('--model chatgpt/m --provider chatgpt --', command)
-        self.assertEqual(env['CODEX_HOME'], '/installed-agent/codex')
+        self.assertEqual(env['AGENT_CHATGPT_LOGIN'], '/installed-agent/chatgpt/chatgpt.json')
         with tempfile.TemporaryDirectory() as logs:
-            self.assertNotIn('CODEX_HOME', self.agent(logs)._env())
+            self.assertNotIn('AGENT_CHATGPT_LOGIN', self.agent(logs)._env())
 
     def test_each_model_is_priced_at_its_own_rates(self):
         rates = {'gw/m': {'input_cost_per_token': 1e-6, 'output_cost_per_token': 1e-5,

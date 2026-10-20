@@ -1,5 +1,4 @@
-"""The chatgpt provider reads Codex's saved ChatGPT login only for its own endpoint."""
-import base64
+"""The chatgpt provider reads the plan login `agent login chatgpt` saved, only for its own endpoint."""
 import json
 import os
 from pathlib import Path
@@ -15,38 +14,47 @@ class ChatgptLoginTests(unittest.TestCase):
     root = Path(__file__).resolve().parent.parent
     binary = root / '.local/target/release/agent'
 
-    def serve(self, directory, spec):
+    def run_agent(self, directory, *args):
         return subprocess.run(
-            [str(self.binary), 'serve', '--store', str(Path(directory) / 'state.db'), '--provider', spec],
-            env={**clean_env(), 'CODEX_HOME': str(Path(directory) / 'codex')},
+            [str(self.binary), *args],
+            env={**clean_env(), 'AGENT_CHATGPT_LOGIN': str(Path(directory) / 'chatgpt.json')},
             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
 
-    def test_a_missing_login_stops_startup(self):
+    def serve(self, directory, spec):
+        return self.run_agent(directory, 'serve', '--store', str(Path(directory) / 'state.db'),
+                              '--provider', spec)
+
+    def test_a_missing_login_stops_startup_and_says_how_to_sign_in(self):
         with tempfile.TemporaryDirectory(dir=self.root / '.local') as directory:
             process = self.serve(directory, 'chatgpt')
         self.assertNotEqual(process.returncode, 0)
         self.assertIn('provider_login_unavailable', process.stderr)
-        self.assertIn(str(Path(directory) / 'codex' / 'auth.json'), process.stderr)
+        self.assertIn(str(Path(directory) / 'chatgpt.json'), process.stderr)
+        self.assertIn('agent login chatgpt', process.stderr)
 
-    def test_an_expired_login_stops_startup_and_names_the_time(self):
-        # A JWT whose exp claim is one second after the epoch; never verified.
-        payload = base64.urlsafe_b64encode(b'{"exp":1}').rstrip(b'=').decode()
+    def test_a_login_that_may_not_spend_the_plan_stops_startup(self):
         with tempfile.TemporaryDirectory(dir=self.root / '.local') as directory:
-            codex = Path(directory) / 'codex'
-            codex.mkdir()
-            (codex / 'auth.json').write_text(json.dumps(
-                {'tokens': {'access_token': f'eyJhbGciOiJSUzI1NiJ9.{payload}.sig', 'account_id': 'w'}}))
+            (Path(directory) / 'chatgpt.json').write_text(json.dumps({
+                'client_id': 'oaiapp_x', 'access_token': 'a', 'refresh_token': 'r',
+                'id_token': '', 'expires_at': 1, 'scope': 'openid profile email'}))
             process = self.serve(directory, 'chatgpt')
         self.assertNotEqual(process.returncode, 0)
-        self.assertIn('provider_login_expired', process.stderr)
-        self.assertIn('1970-01-01T00:00:01Z', process.stderr)
-        self.assertIn('codex', process.stderr)
+        self.assertIn('provider_login_unavailable', process.stderr)
+        self.assertIn('chatgpt.tokens.use.direct', process.stderr)
 
     def test_another_endpoint_never_reads_the_login(self):
         with tempfile.TemporaryDirectory(dir=self.root / '.local') as directory:
-            process = self.serve(directory, 'chatgpt=responses,http://127.0.0.1:9/backend-api/codex')
+            process = self.serve(directory, 'chatgpt=responses,http://127.0.0.1:9/v1')
         self.assertEqual(process.returncode, 0, process.stderr)
         self.assertNotIn('provider_login_unavailable', process.stderr)
+
+    def test_login_names_its_provider(self):
+        with tempfile.TemporaryDirectory(dir=self.root / '.local') as directory:
+            for args in (['login'], ['login', 'openai'], ['login', 'chatgpt', '--port', '0']):
+                process = self.run_agent(directory, *args)
+                self.assertEqual(process.returncode, 2, (args, process.stderr))
+                self.assertIn('"usage"', process.stderr)
+            self.assertFalse((Path(directory) / 'chatgpt.json').exists())
 
 
 if __name__ == '__main__':

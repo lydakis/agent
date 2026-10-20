@@ -3,6 +3,7 @@ mod cli;
 mod client;
 mod client_path;
 mod server;
+mod sign_in;
 use agent_runtime::{Error, Result, fail_with};
 
 // Machine-readable temporary startup conflict. The CLI waits for the owner
@@ -100,6 +101,9 @@ fn run() -> Result<i32> {
     let Some(args) = cli::prepare(args)? else {
         return Ok(0);
     };
+    if args[0] == "login" {
+        return sign_in::main(&args[1..]);
+    }
     if args[0] == "serve" {
         SERVING.store(true, std::sync::atomic::Ordering::Relaxed);
         let config = configuration(&args[1..])?;

@@ -273,26 +273,25 @@ PYTHONPATH=. harbor run -d terminal-bench/terminal-bench-2-1 -a bench.harbor_age
 harbor run -d terminal-bench/terminal-bench-2-1 -a strands -m anthropic/claude-fable-5 -n 8
 ```
 
-To run on a ChatGPT plan instead of an API key, sign in with `codex login` and
-name the model `chatgpt/MODEL`, using the id Codex's `/model` picker shows. Every
+To run on a ChatGPT plan instead of an API key, sign in with `agent login
+chatgpt` and name the model `chatgpt/MODEL`, using an id `agent models` lists. Every
 task bot is created with `--fallbacks`, so a declined Anthropic request finishes
 on the model Anthropic recommends instead of failing the task; a fleet opts in
 per bot, and so does a bot the task delegates to. The
-adapter copies the access token and account id from Codex's `auth.json` into each
-task container, readable only by the agent user, and adds `--provider chatgpt`.
-The refresh and ID tokens stay on the host, and nothing is uploaded when a
-`provider` spec points `chatgpt` at another endpoint, since the daemon then never
-reads the login. The model's tools can still read the
-access token file; the daemon redacts the token from tool output, but a task
-that reads the file holds a login to the plan, so run only tasks you trust on
-your own account. The token is not refreshed during a run: the daemon re-reads
-the copied file when the token expires or is refused, and nothing in the
-container writes a new one, so run any `codex` command just before starting.
-Plan usage windows cap how
-many tasks one run can finish, and whether a ChatGPT plan may drive a harness
-other than Codex is a question for OpenAI's terms. Harbor's own Codex adapter
-takes the same login with `CODEX_FORCE_AUTH_JSON=1`, so the Codex baseline can
-run on the plan too.
+adapter copies the access token, client and expiry from `~/.agent/chatgpt.json`
+(or `AGENT_CHATGPT_LOGIN`) into each task container, readable only by the agent
+user, points `AGENT_CHATGPT_LOGIN` at it, and adds `--provider chatgpt`. The
+refresh and ID tokens stay on the host: a container's refresh would spend the
+host's single-use refresh token. Nothing is uploaded when a `provider` spec
+points `chatgpt` at another endpoint, since the daemon then never reads the
+login. The model's tools can still read the access token file; the daemon
+redacts the token from tool output, but a task that reads the file holds a
+login to the plan, so run only tasks you trust on your own account. The token
+is not refreshed during a run, so the adapter refuses one that expires within
+30 minutes; a host daemon's next chatgpt call refreshes it, or sign in again.
+Plan usage windows and any per-app weekly cap set in ChatGPT's settings cap how
+many tasks one run can finish. Harbor's own Codex adapter takes Codex's login
+with `CODEX_FORCE_AUTH_JSON=1`, so the Codex baseline can run on the plan too.
 
 ```sh
 PYTHONPATH=. harbor run -d terminal-bench/terminal-bench-2-1 -a bench.harbor_agent:Agent \
@@ -302,7 +301,7 @@ CODEX_FORCE_AUTH_JSON=1 harbor run -d terminal-bench/terminal-bench-2-1 -a codex
 
 Pass `--ak KEY=VALUE` for adapter options: `reasoning`, `max_output_tokens`,
 `stall_timeout`, `context_bytes`, `compact_at`, `binary` (another build),
-`codex_auth` (another `auth.json` for `chatgpt/` models), and
+`chatgpt_login` (another login file for `chatgpt/` models), and
 `provider` (a `--provider` spec for a gateway such as Bedrock, whose named key
 variable is forwarded from the host). Keep job outputs under the ignored
 `.local/` directory, because trial logs contain full transcripts.

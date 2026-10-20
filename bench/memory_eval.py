@@ -469,10 +469,11 @@ def main():
     env = clean_env()
     env['AGENT_PROVIDER'] = args.provider or args.model.split('/', 1)[0]
     env.update({k: os.environ[k] for k in provider_keys(env['AGENT_PROVIDER']) if k in os.environ})
-    # A chatgpt daemon reads Codex's login from CODEX_HOME, which must
-    # outlive the bot's own HOME. No other run is told where it is.
+    # A chatgpt daemon reads the plan login `agent login chatgpt` saved,
+    # which must outlive the bot's own HOME. No other run is told where it is.
     if any(spec.partition('=')[0] == 'chatgpt' for spec in env['AGENT_PROVIDER'].split()):
-        env['CODEX_HOME'] = os.environ.get('CODEX_HOME') or str(Path.home() / '.codex')
+        env['AGENT_CHATGPT_LOGIN'] = (os.environ.get('AGENT_CHATGPT_LOGIN')
+                                      or str(Path.home() / '.agent' / 'chatgpt.json'))
     # Bots work outside this checkout, so composing their instructions
     # finds the shop's AGENTS.md and not this repository's.
     out_dir = Path(tempfile.mkdtemp(prefix='agent-memory-eval-'))

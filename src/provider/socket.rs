@@ -247,7 +247,9 @@ impl Sockets {
                 let status = response.status().as_u16();
                 let quota = status == 429
                     && response.body().as_deref().is_some_and(|body| {
-                        String::from_utf8_lossy(body).contains("insufficient_quota")
+                        let body = String::from_utf8_lossy(body);
+                        body.contains("insufficient_quota")
+                            || body.contains("subscription_sharing_usage_limit_exceeded")
                     });
                 Opening::Refused(Failure {
                     error: Error {
@@ -446,8 +448,8 @@ impl Failure {
         let code = value["error"]["code"]
             .as_str()
             .or_else(|| value["code"].as_str());
-        let quota = code == Some("insufficient_quota")
-            || value["error"]["type"].as_str() == Some("insufficient_quota");
+        let quota = code.is_some_and(super::quota)
+            || value["error"]["type"].as_str().is_some_and(super::quota);
         if quota {
             failure.error.code = "provider_quota_exhausted".into();
             return failure;

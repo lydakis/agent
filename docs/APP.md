@@ -566,7 +566,7 @@ connected, and forks and side chats keep their source's. One screen covers a
 first run and later changes:
 
 1. **Providers.** Anthropic, OpenAI and OpenRouter take an API key; a ChatGPT
-   plan uses the sign-in Codex saved; Amazon Bedrock takes an optional region
+   plan uses the sign-in `agent login chatgpt` saved; Amazon Bedrock takes an optional region
    and signs in one of two ways, chosen on the form: the AWS CLI's credentials
    for an optional profile (which drops a saved key), or a Bedrock API key. Bedrock serves Claude over Anthropic's API and
    its other models over OpenAI's, so the daemon runs it as two providers,

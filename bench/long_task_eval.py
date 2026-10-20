@@ -54,7 +54,7 @@ from bench.context_eval import COMPACTION, INSTRUCTIONS, page_rows  # noqa: E402
 from bench.runtime_client import Client, node_item  # noqa: E402
 from bench.targets import clean_env, file_hash  # noqa: E402
 
-ENDPOINTS = {'chatgpt': ('responses', 'https://chatgpt.com/backend-api/codex', None),
+ENDPOINTS = {'chatgpt': ('responses', 'https://api.openai.com/v1', None),
              'openai': ('responses', 'https://api.openai.com/v1', 'OPENAI_API_KEY')}
 TOOLS = 'shell,read,write,edit,history'
 # A bot without `read` gets no stubs for its old results, so only summaries
@@ -1098,8 +1098,8 @@ def main():
     if key_env:
         env[key_env] = os.environ[key_env]
     else:
-        # The daemon reads Codex's ChatGPT login from CODEX_HOME or ~/.codex.
-        env.update({k: os.environ[k] for k in ('HOME', 'CODEX_HOME') if k in os.environ})
+        # The daemon reads the plan login `agent login chatgpt` saved.
+        env.update({k: os.environ[k] for k in ('HOME', 'AGENT_CHATGPT_LOGIN') if k in os.environ})
     out_dir = args.out.resolve().parent / 'run'
     out_dir.mkdir(parents=True, exist_ok=True)
     blocks = []

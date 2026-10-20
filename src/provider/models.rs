@@ -10,11 +10,6 @@ use std::sync::{Arc, atomic::Ordering};
 use std::time::{Duration, Instant};
 
 const KEEP: Duration = Duration::from_secs(300);
-/// The Codex release whose model list a ChatGPT login is offered: Codex
-/// sends its own version as `client_version` (openai/codex 9db8162, read
-/// 2026-09-27), and the backend answers 400 without it. 0.157.1 is the
-/// release the rest of this repository measures against.
-const CODEX_CLIENT_VERSION: &str = "0.157.1";
 const DEADLINE: Duration = Duration::from_secs(10);
 /// Anthropic's pages hold 1,000 models; nobody lists fifty thousand.
 const PAGES: usize = 50;
@@ -42,7 +37,7 @@ impl Provider {
     /// the provider prefix. Cacheable answers within the shared budget
     /// let concurrent callers share one request.
     /// Refused credentials are not kept, the provider's own 401 or 403
-    /// included: a login made meanwhile (`aws sso login`, Codex signing in)
+    /// included: a login made meanwhile (`aws sso login`, `agent login chatgpt`)
     /// is used on the next ask.
     pub async fn models(&self) -> Listed {
         let mut kept = self.listing.0.lock().await;
@@ -93,8 +88,8 @@ impl Provider {
         listed
     }
 
-    /// A ChatGPT login refused with 401 is read again from disk and tried
-    /// once more, as a completion is, since Codex may have rotated it.
+    /// A ChatGPT login refused with 401 is refreshed and tried once more,
+    /// as a completion is.
     async fn list_models(&self) -> Result<Vec<Value>> {
         let Some(login) = &self.login else {
             return self
@@ -102,10 +97,13 @@ impl Provider {
                 .await
                 .map_err(|error| sanitize_error(error, self.key.as_deref()));
         };
-        let session = login.current()?;
+        let client = self.transport.lease().0;
+        let session = login.current(client).await?;
         match self.fetch_models(Some(&session)).await {
-            Err(error) if error.code == "provider_http_401" && login.reload(&session)? => {
-                let session = login.current()?;
+            Err(error)
+                if error.code == "provider_http_401" && login.reload(client, &session).await? =>
+            {
+                let session = login.current(client).await?;
                 self.fetch_models(Some(&session))
                     .await
                     .map_err(|error| sanitize_error(error, Some(&session.token)))
@@ -138,12 +136,6 @@ impl Provider {
         url.set_path(&format!("{base}/models"));
         if self.family == Family::Anthropic && self.aws.is_none() {
             url.set_query(Some("limit=1000"));
-        }
-        if self.login.is_some() {
-            // The Codex backend lists models for a Codex version and refuses
-            // a request without one.
-            url.query_pairs_mut()
-                .append_pair("client_version", CODEX_CLIENT_VERSION);
         }
         url
     }
@@ -235,9 +227,6 @@ impl Provider {
             }
             (Family::Responses, None) => http,
         };
-        if let Some(session) = session {
-            http = http.header("chatgpt-account-id", &session.account);
-        }
         if let Some(aws) = &self.aws {
             let keys = aws.current().await?;
             let payload = if aws.signs_payload() {
@@ -574,27 +563,23 @@ mod tests {
     #[test]
     fn each_listing_sits_where_its_provider_serves_it() {
         let transport = Transport::new(64, 1).unwrap();
-        let dir = std::env::temp_dir().join(format!("agent-models-login-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let auth = dir.join("auth.json");
-        std::fs::write(
-            &auth,
-            r#"{"tokens":{"access_token":"synthetic-token","account_id":"synthetic-account"}}"#,
-        )
-        .unwrap();
-        let login = std::sync::Arc::new(crate::provider::login::Login::open(&auth, None).unwrap());
+        let dir = crate::provider::login::tests::temp("models-login");
+        let path = dir.join("chatgpt.json");
+        crate::provider::login::tests::save(&path, "synthetic-token");
+        let login = std::sync::Arc::new(crate::provider::login::Login::open(&path, None).unwrap());
         let chatgpt = Provider::new(
             transport.clone(),
             Family::Responses,
-            "https://chatgpt.com/backend-api/codex",
+            "https://api.openai.com/v1",
             None,
         )
         .unwrap()
         .with_login(login)
         .unwrap();
+        // The plan lists what the signed-in account may run, at the API's own listing.
         assert_eq!(
             chatgpt.models_url().as_str(),
-            "https://chatgpt.com/backend-api/codex/models?client_version=0.157.1"
+            "https://api.openai.com/v1/models"
         );
         std::fs::remove_dir_all(&dir).unwrap();
         let url = |family, base: &str| {

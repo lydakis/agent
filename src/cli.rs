@@ -121,6 +121,14 @@ const COMMANDS: &[Command] = &[
         startup: true,
     },
     Command {
+        name: "login",
+        about: "Sign in with ChatGPT so the chatgpt provider spends your plan",
+        usage: "login chatgpt [--port N]",
+        flags: "--port --pretty",
+        settings: "",
+        startup: false,
+    },
+    Command {
         name: "start",
         about: "Start the store's daemon if none runs; prints its ready line",
         usage: "start [OPTIONS]",
@@ -296,6 +304,10 @@ fn print_flags(flags: &str) {
                 "A new bot's Anthropic prompt-cache lifetime; 1h bills writes at 2x input and sends no refresh; default 5m",
             ),
             "--idle-exit" => ("DURATION", "Exit after this long idle; 0 disables"),
+            "--port" => (
+                "N",
+                "Wait for the browser's sign-in on 127.0.0.1:N; default 1455",
+            ),
             "--context-bytes" => ("N", "A new bot's model context bytes; default 8 MiB"),
             "--context-items" => ("N", "A new bot's model context items; default 4096"),
             "--note-turns" => (
@@ -590,6 +602,10 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
     if c.name == "answer" {
         if positional != 1 {
             return fail_with("usage", "answer needs one decision: allow or deny");
+        }
+    } else if c.name == "login" {
+        if positional != 1 {
+            return fail_with("usage", "login needs a provider: chatgpt");
         }
     } else if !matches!(c.name, "run" | "wait") && positional != 0 {
         return fail_with("usage", format!("{} takes no positional arguments", c.name));
