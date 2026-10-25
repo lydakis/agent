@@ -148,7 +148,8 @@ pub fn draw(rows: &[String], width: usize) -> Vec<Line<'static>> {
     out
 }
 
-/// A wrapped row's leading space, left where a word broke, dropped.
+/// A wrapped row's spaces at either end, left where a word broke,
+/// dropped: a trailing one would push the cell past its column.
 fn trim_start(mut spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
     while let Some(first) = spans.first_mut() {
         let trimmed = first.content.trim_start().to_owned();
@@ -156,6 +157,15 @@ fn trim_start(mut spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
             spans.remove(0);
         } else {
             first.content = trimmed.into();
+            break;
+        }
+    }
+    while let Some(last) = spans.last_mut() {
+        let trimmed = last.content.trim_end().to_owned();
+        if trimmed.is_empty() {
+            spans.pop();
+        } else {
+            last.content = trimmed.into();
             break;
         }
     }
@@ -205,6 +215,8 @@ mod tests {
         .map(String::from);
         let lines = draw(&rows, 40);
         assert!(lines.iter().all(|l| l.width() <= 40), "{:?}", text(&lines));
+        let widths: Vec<usize> = lines.iter().map(|l| l.width()).collect();
+        assert!(widths.iter().all(|w| *w == widths[0]), "{:?}", text(&lines));
         assert!(lines.len() > 6, "{:?}", text(&lines));
     }
 }

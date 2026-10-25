@@ -967,11 +967,15 @@ impl App {
         }
     }
 
+    /// The reply's last lines, and a table it ended on, drawn.
     fn end_live(&mut self) {
         if let Some(mut live) = self.live.take() {
             let rest = std::mem::take(&mut live.partial);
+            let rest = rest.strip_suffix('\n').unwrap_or(&rest);
             if !rest.is_empty() {
-                self.live_line(&mut live, &rest);
+                for line in rest.split('\n') {
+                    self.live_line(&mut live, line);
+                }
             }
             let held = live.markdown.finish(self.width);
             self.live_rows(&mut live, held);
@@ -1012,6 +1016,12 @@ impl App {
                 .is_some_and(|node| node <= self.seen_node)
         {
             return;
+        }
+        // Each node is drawn once, should its event come again.
+        if matches!(kind, "accepted" | "steered" | "message" | "tool_completed")
+            && let Some(node) = data["node"].as_i64()
+        {
+            self.seen_node = self.seen_node.max(node);
         }
         match kind {
             "accepted" => {
@@ -1115,15 +1125,7 @@ impl App {
                             live.partial = rest.to_owned();
                         }
                     }
-                    if let Some(mut live) = self.live.take() {
-                        let rest = std::mem::take(&mut live.partial);
-                        let rest = rest.strip_suffix('\n').unwrap_or(&rest);
-                        if !rest.is_empty() {
-                            for line in rest.split('\n') {
-                                self.live_line(&mut live, line);
-                            }
-                        }
-                    }
+                    self.end_live();
                 } else if let Some(item) = &item {
                     let lines = transcript::reply(&text(item), self.width);
                     self.commit(lines);
