@@ -366,6 +366,8 @@ window.Rich = (() => {
   // Whatever was drawn in a message is code again once its pane is drawn anew.
   const HYDRATE = '.rc[data-lazy]:not([data-on]), .rc[data-kind="html"]:not([data-on]), .rc[data-kind="svg"]:not([data-on])';
   function hydrate(root) {
+    // A pane drawn anew replaced the blocks it held: let go of those that were drawn.
+    drawnChars();
     for (const box of [...(root.matches?.(HYDRATE) ? [root] : []), ...root.querySelectorAll(HYDRATE)]) {
       box.dataset.on = '';
       if ('lazy' in box.dataset) { if ('page' in box.dataset) draw(box, true); }
