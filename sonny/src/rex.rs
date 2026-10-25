@@ -319,16 +319,25 @@ fn sides_of(node: &Value, sides: &mut HashMap<String, (&'static str, String)>) {
     sides_of(after, sides);
 }
 
-/// The skill that lets any agent run long work where the person can see it.
+/// The skills that let any agent run long work where the person can see it,
+/// and show the person pictures.
 /// Kept in `~/.agents/skills/rex-windows`, naming this machine's rex and
 /// Sonny; `rex` itself is the name of Rex's own skill.
 pub fn install_skill(bin: &Path) -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var_os("HOME")?).join(".agents/skills/rex-windows");
-    let path = dir.join("SKILL.md");
     let sonny = std::env::current_exe().ok()?;
     let text = include_str!("../skills/rex-windows/SKILL.md")
         .replace("REX_BIN", &format!("\"{}\"", bin.to_string_lossy()))
         .replace("SONNY_BIN", &format!("\"{}\"", sonny.to_string_lossy()));
+    let pictures = install("pictures", include_str!("../skills/pictures/SKILL.md"));
+    install("rex-windows", &text).or(pictures)
+}
+
+/// A skill of Sonny's in the person's skills, rewritten when it changed.
+fn install(name: &str, text: &str) -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var_os("HOME")?)
+        .join(".agents/skills")
+        .join(name);
+    let path = dir.join("SKILL.md");
     if std::fs::read_to_string(&path).is_ok_and(|now| now == text) {
         return None;
     }

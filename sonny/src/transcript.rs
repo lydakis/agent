@@ -14,6 +14,9 @@ use unicode_width::UnicodeWidthStr;
 #[derive(Default, Clone)]
 pub struct Markdown {
     fence: bool,
+    /// An SVG fence's text, gathered to be drawn when it closes.
+    picture: Option<String>,
+    ready: Option<String>,
     /// How far the last line's wrapped rows are indented: under a list
     /// item's text, so a continuation does not read as a new item.
     hang: usize,
@@ -25,12 +28,33 @@ impl Markdown {
         Span::raw(format!("  {}", " ".repeat(self.hang)))
     }
 
+    /// The picture a fence that just closed drew, as rows of the
+    /// terminal's image cells, or why it could not be drawn.
+    pub fn picture(&mut self, width: usize) -> Vec<Line<'static>> {
+        let Some(svg) = self.ready.take() else {
+            return Vec::new();
+        };
+        crate::image::svg(&svg, width).unwrap_or_else(|error| {
+            vec![Line::from(format!("  (could not draw the SVG: {error})")).dim()]
+        })
+    }
+
     /// The styled line, or none for a fence marker, which is not shown.
     pub fn line(&mut self, text: &str) -> Option<Line<'static>> {
         let trimmed = text.trim_start();
         self.hang = 0;
-        if trimmed.starts_with("```") {
+        if let Some(lang) = trimmed.strip_prefix("```") {
             self.fence = !self.fence;
+            if self.fence && lang.trim() == "svg" && crate::term::graphics() {
+                self.picture = Some(String::new());
+            } else if !self.fence {
+                self.ready = self.picture.take();
+            }
+            return None;
+        }
+        if let Some(picture) = &mut self.picture {
+            picture.push_str(text);
+            picture.push('\n');
             return None;
         }
         if self.fence {
@@ -207,6 +231,7 @@ pub fn reply(text: &str, width: usize) -> Vec<Line<'static>> {
             let lead = if out.is_empty() { "• " } else { "  " };
             out.extend(wrap(styled, width, Span::raw(lead), markdown.rest()));
         }
+        out.extend(markdown.picture(width));
     }
     out
 }

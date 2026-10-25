@@ -10,12 +10,13 @@
 //! says how long the turn has run and how to stop it.
 mod calls;
 mod diff;
+mod image;
 mod project;
 mod rex;
 mod shell;
 mod sound;
 mod status;
-mod theme;
+mod term;
 mod transcript;
 
 use agent_client::{Client, Events};
@@ -234,7 +235,7 @@ async fn run() -> Result<(), String> {
     caught_up(&mut events).await;
 
     enable_raw_mode().map_err(|e| e.to_string())?;
-    theme::detect();
+    term::detect();
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
     let mut terminal = Terminal::with_options(
         CrosstermBackend::new(std::io::stdout()),
@@ -885,6 +886,12 @@ impl App {
             let rows = transcript::wrap(styled, self.width, Span::raw(lead), rest);
             live.lines += rows.len();
             self.pending.extend(rows);
+            self.any_history = true;
+        }
+        let picture = live.markdown.picture(self.width);
+        if !picture.is_empty() {
+            live.lines += picture.len();
+            self.pending.extend(picture);
             self.any_history = true;
         }
     }

@@ -39,7 +39,7 @@ const LIGHT: Palette = Palette {
 };
 
 fn palette() -> &'static Palette {
-    if crate::theme::light() { &LIGHT } else { &DARK }
+    if crate::term::light() { &LIGHT } else { &DARK }
 }
 
 #[derive(Clone, Copy, PartialEq)]
