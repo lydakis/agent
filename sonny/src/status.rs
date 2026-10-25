@@ -6,6 +6,7 @@ use ratatui::{
     text::{Line, Span},
 };
 
+#[derive(Clone)]
 pub struct Row {
     /// The agent's name in its project: `lead`, or the task's.
     pub name: String,

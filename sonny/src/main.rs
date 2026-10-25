@@ -30,7 +30,7 @@ use ratatui::{
             KeyModifiers,
         },
         execute,
-        terminal::{disable_raw_mode, enable_raw_mode},
+        terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
     },
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style, Stylize},
@@ -58,6 +58,7 @@ const HISTORY_ITEMS: u64 = 200;
 type Tui = Terminal<CrosstermBackend<std::io::Stdout>>;
 
 struct Options {
+    store: PathBuf,
     socket: PathBuf,
     bot: Option<String>,
     new: bool,
@@ -140,6 +141,47 @@ fn show() -> Result<(), String> {
     Ok(())
 }
 
+/// Agent's own binary: the one the daemon gave this shell, else the
+/// app's. Not `agent` on PATH, which may be another program.
+fn agent_bin() -> Option<PathBuf> {
+    std::env::var_os("AGENT_BIN")
+        .map(PathBuf::from)
+        .or_else(|| {
+            Some(PathBuf::from(
+                "/Applications/Agent.app/Contents/MacOS/agent",
+            ))
+        })
+        .filter(|bin| bin.is_file())
+}
+
+/// The daemon, started the way the CLI starts it when it is not running.
+async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events), String> {
+    if let Ok(connected) = Client::connect(&options.socket).await {
+        return Ok(connected);
+    }
+    let bin = agent_bin().ok_or(
+        "the daemon is not running and Agent's binary was not found; open Agent.app or set AGENT_BIN",
+    )?;
+    let out = std::process::Command::new(&bin)
+        .arg("start")
+        .arg("--store")
+        .arg(&options.store)
+        .arg("--socket")
+        .arg(&options.socket)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("{}: {e}", bin.display()))?;
+    if !out.status.success() {
+        return Err(format!(
+            "could not start the daemon: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Client::connect(&options.socket)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 fn parse() -> Result<Options, String> {
     let mut args = std::env::args().skip(1);
     let (mut store, mut socket, mut bot, mut new, mut model, mut workspace) =
@@ -170,6 +212,7 @@ fn parse() -> Result<Options, String> {
         None => agent_client::socket::default_socket(&store).map_err(|e| e.to_string())?,
     };
     Ok(Options {
+        store,
         socket,
         bot,
         new,
@@ -197,9 +240,7 @@ async fn run() -> Result<(), String> {
         return show();
     }
     let options = parse()?;
-    let (client, mut events) = Client::connect(&options.socket)
-        .await
-        .map_err(|e| format!("{e}; start the daemon with `agent start`"))?;
+    let (client, mut events) = connect(&options).await?;
     let (name, project) = match &options.bot {
         Some(bot) => {
             if options.new {
@@ -372,6 +413,24 @@ struct Running {
     phase: String,
 }
 
+/// The slash commands, as the menu lists them: name and what it does.
+const COMMANDS: [(&str, &str); 4] = [
+    ("/status", "every agent in this project, live"),
+    ("/agents", "the same as /status"),
+    ("/ps", "the same as /status"),
+    ("/quit", "leave Sonny; the agents keep working"),
+];
+
+/// `/status` on its own screen, its timers ticking and its rows read
+/// again every two seconds, until Esc.
+struct Watch {
+    screen: Tui,
+    project: String,
+    rows: Vec<status::Row>,
+    /// When the rows were read: their times count on from here.
+    read: Instant,
+}
+
 struct App {
     client: Arc<Client>,
     bot: String,
@@ -405,6 +464,11 @@ struct App {
     seen_node: i64,
     /// The model this window's turns run on, when not the bot's own.
     turn_model: Option<String>,
+    /// The slash command picked in the menu.
+    pick: usize,
+    watch: Option<Watch>,
+    /// The live area is drawn afresh: the main screen is back from `/status`.
+    redraw: bool,
     sounds: sound::Sounds,
     /// The reply text the current model call has streamed.
     said: String,
@@ -675,6 +739,9 @@ impl App {
             held: Vec::new(),
             seen_node: 0,
             turn_model: None,
+            pick: 0,
+            watch: None,
+            redraw: false,
             sounds: sound::Sounds::new(false),
             said: String::new(),
             replay: None,
@@ -769,6 +836,13 @@ impl App {
                     }
                 }
                 _ = tick.tick() => {}
+            }
+            if self
+                .watch
+                .as_ref()
+                .is_some_and(|w| w.read.elapsed() > Duration::from_secs(2))
+            {
+                self.reread().await;
             }
         }
     }
@@ -1168,7 +1242,43 @@ impl App {
     }
 
     /// The project's agents on one card, from the daemon and Rex alone.
+    /// Open `/status`: its own screen, live until Esc.
     async fn status(&mut self) {
+        let (project, rows) = match self.status_rows().await {
+            Ok(read) => read,
+            Err(error) => {
+                self.notice = Some(error);
+                return;
+            }
+        };
+        let _ = execute!(std::io::stdout(), EnterAlternateScreen);
+        match Terminal::new(CrosstermBackend::new(std::io::stdout())) {
+            Ok(screen) => {
+                self.watch = Some(Watch {
+                    screen,
+                    project,
+                    rows,
+                    read: Instant::now(),
+                })
+            }
+            Err(error) => {
+                let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+                self.notice = Some(error.to_string());
+            }
+        }
+    }
+
+    async fn reread(&mut self) {
+        if let Ok((_, rows)) = self.status_rows().await
+            && let Some(watch) = &mut self.watch
+        {
+            watch.rows = rows;
+            watch.read = Instant::now();
+        }
+    }
+
+    /// The project's agents, as `/status` shows them.
+    async fn status_rows(&self) -> Result<(String, Vec<status::Row>), String> {
         let (project, lead) = match &self.project {
             Some(project) => (project.clone(), format!("{project}.lead")),
             None => (
@@ -1186,8 +1296,7 @@ impl App {
             .request("bots", json!({"name": pattern, "limit": 256}))
             .await
         else {
-            self.notice = Some("could not list the agents".into());
-            return;
+            return Err("could not list the agents".into());
         };
         let places = self
             .fleet
@@ -1273,8 +1382,7 @@ impl App {
             _ => 4,
         };
         rows.sort_by_key(|row| (rank(row), row.seconds.unwrap_or(u64::MAX)));
-        let lines = status::card(&project, &rows, self.width);
-        self.commit(lines);
+        Ok((project, rows))
     }
 
     /// An agent's latest step, as a line.
@@ -1379,7 +1487,66 @@ impl App {
         }
     }
 
+    /// The slash commands the input could be, while it is one word that
+    /// starts with `/`.
+    fn menu(&self) -> Vec<(&'static str, &'static str)> {
+        if !self.input.starts_with('/') || self.input.contains(char::is_whitespace) {
+            return Vec::new();
+        }
+        COMMANDS
+            .into_iter()
+            .filter(|(name, _)| name.starts_with(self.input.as_str()))
+            .collect()
+    }
+
     async fn key(&mut self, event: Event) {
+        if self.watch.is_some() {
+            if let Event::Key(key) = event
+                && key.kind != KeyEventKind::Release
+                && (matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter)
+                    || key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL))
+            {
+                self.watch = None;
+                let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+                self.redraw = true;
+            }
+            return;
+        }
+        let menu = self.menu();
+        if let Event::Key(key) = &event
+            && key.kind != KeyEventKind::Release
+            && !menu.is_empty()
+        {
+            let picked = menu[self.pick.min(menu.len() - 1)].0;
+            match key.code {
+                KeyCode::Up => {
+                    self.pick = (self.pick + menu.len() - 1) % menu.len();
+                    return;
+                }
+                KeyCode::Down => {
+                    self.pick = (self.pick + 1) % menu.len();
+                    return;
+                }
+                KeyCode::Tab => {
+                    self.input = picked.to_owned();
+                    self.pick = 0;
+                    return;
+                }
+                KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    self.input = picked.to_owned();
+                    self.pick = 0;
+                    self.submit().await;
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.input.clear();
+                    self.pick = 0;
+                    return;
+                }
+                _ => self.pick = 0,
+            }
+        }
         match event {
             Event::Paste(text) => self.input.push_str(&text),
             Event::Resize(width, _) => self.width = width as usize,
@@ -1433,6 +1600,11 @@ impl App {
             self.status().await;
             return;
         }
+        if prompt == "/quit" {
+            self.input.clear();
+            self.quit = true;
+            return;
+        }
         // A message to a busy bot joins its running turn, on that turn's model.
         let delivery = self.running.is_some().then_some("steer");
         let model = delivery
@@ -1460,6 +1632,13 @@ impl App {
         // The pane may have changed size since these lines were wrapped:
         // the viewport takes the new size first, and a line still too wide
         // is cut into rows rather than losing its end.
+        if let Some(watch) = &mut self.watch {
+            // History waits for the main screen.
+            return draw_watch(watch);
+        }
+        if std::mem::take(&mut self.redraw) {
+            terminal.clear()?;
+        }
         terminal.autoresize()?;
         let width = terminal.size()?.width as usize;
         self.width = width;
@@ -1497,6 +1676,44 @@ impl App {
                 }
             }
             frame.render_widget(Paragraph::new(self.status_line()), status);
+            let menu = self.menu();
+            if !menu.is_empty() {
+                // Up to three, around the pick, in the rows above the input.
+                let pick = self.pick.min(menu.len() - 1);
+                let first = pick.saturating_sub(2).min(menu.len().saturating_sub(3));
+                let wide = menu.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
+                let rows: Vec<Line> = menu
+                    .iter()
+                    .enumerate()
+                    .skip(first)
+                    .take(3)
+                    .map(|(i, (name, about))| {
+                        let name = format!("{name:<wide$}");
+                        if i == pick {
+                            Line::from(vec![
+                                Span::raw("› ").fg(Color::Cyan),
+                                Span::raw(name).fg(Color::Cyan).bold(),
+                                Span::raw(format!("  {about}")),
+                            ])
+                        } else {
+                            Line::from(vec![
+                                Span::raw("  "),
+                                Span::raw(name),
+                                Span::raw(format!("  {about}")).dim(),
+                            ])
+                        }
+                    })
+                    .collect();
+                let [_, _, _, composer_row, _] =
+                    Layout::vertical([Constraint::Length(1); 5]).areas(frame.area());
+                let area = ratatui::layout::Rect {
+                    y: composer_row.y.saturating_sub(rows.len() as u16),
+                    height: rows.len() as u16,
+                    ..composer_row
+                };
+                frame.render_widget(ratatui::widgets::Clear, area);
+                frame.render_widget(Paragraph::new(rows), area);
+            }
             let (text, cursor) = if self.input.is_empty() {
                 let hint = if self.running.is_some() {
                     "Steer the running turn".to_owned()
@@ -1590,6 +1807,50 @@ impl App {
         let fill = width.saturating_sub(left.width() + right.width());
         Line::from(format!("{left}{}{right}", " ".repeat(fill))).dim()
     }
+}
+
+/// `/status` on its own screen: the card, its times counted on since it was
+/// read, and how to leave.
+fn draw_watch(watch: &mut Watch) -> std::io::Result<()> {
+    let since = watch.read.elapsed().as_secs();
+    let rows: Vec<status::Row> = watch
+        .rows
+        .iter()
+        .cloned()
+        .map(|mut row| {
+            row.seconds = row.seconds.map(|s| s + since);
+            row
+        })
+        .collect();
+    let project = watch.project.clone();
+    watch.screen.autoresize()?;
+    watch.screen.draw(|frame| {
+        let area = frame.area();
+        let width = area.width.saturating_sub(2) as usize;
+        let mut lines = vec![Line::default()];
+        lines.extend(
+            status::card(&project, &rows, width)
+                .into_iter()
+                .map(|line| {
+                    let mut spans = vec![Span::raw(" ")];
+                    spans.extend(line.spans);
+                    Line::from(spans).style(line.style)
+                }),
+        );
+        let footer = Line::from("  esc to close · updates live").dim();
+        let body = ratatui::layout::Rect {
+            height: area.height.saturating_sub(1),
+            ..area
+        };
+        let foot = ratatui::layout::Rect {
+            y: area.y + area.height.saturating_sub(1),
+            height: 1,
+            ..area
+        };
+        frame.render_widget(Paragraph::new(lines), body);
+        frame.render_widget(Paragraph::new(footer), foot);
+    })?;
+    Ok(())
 }
 
 /// Codex's sweep: a brighter band moving across the phase every two seconds.
