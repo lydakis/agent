@@ -274,6 +274,8 @@ struct App {
     fleet: Option<Fleet>,
     /// Layout notes waiting for the lead's running calls to be shown.
     held: Vec<Line<'static>>,
+    /// The newest history item drawn on attach.
+    seen_node: i64,
 }
 
 /// The lead's tasks, laid out in the project's Rex session: a window for
@@ -418,6 +420,7 @@ impl App {
             started: Instant::now(),
             fleet: None,
             held: Vec::new(),
+            seen_node: 0,
         }
     }
 
@@ -551,6 +554,7 @@ impl App {
             .filter_map(|n| n["node"].as_i64())
             .collect();
         nodes.reverse();
+        self.seen_node = nodes.last().copied().unwrap_or(0);
         let mut calls: HashMap<String, (String, Value)> = HashMap::new();
         for chunk in nodes.chunks(100) {
             for item in self.items(chunk).await {
@@ -637,6 +641,15 @@ impl App {
         }
         let data = &event["data"];
         let turn = event["turn"].as_i64();
+        // Followed before history was read, so what history showed can
+        // arrive again here.
+        if matches!(kind, "accepted" | "steered" | "message" | "tool_completed")
+            && data["node"]
+                .as_i64()
+                .is_some_and(|node| node <= self.seen_node)
+        {
+            return;
+        }
         match kind {
             "accepted" => {
                 self.end_live();
@@ -927,8 +940,23 @@ impl App {
     }
 
     fn draw(&mut self, terminal: &mut Tui) -> std::io::Result<()> {
+        // The pane may have changed size since these lines were wrapped:
+        // the viewport takes the new size first, and a line still too wide
+        // is cut into rows rather than losing its end.
+        terminal.autoresize()?;
+        let width = terminal.size()?.width as usize;
+        self.width = width;
         if !self.pending.is_empty() {
-            let lines = std::mem::take(&mut self.pending);
+            let lines: Vec<Line<'static>> = std::mem::take(&mut self.pending)
+                .into_iter()
+                .flat_map(|line| {
+                    if line.width() <= width {
+                        vec![line]
+                    } else {
+                        transcript::wrap(line, width, Span::raw(""), Span::raw("    "))
+                    }
+                })
+                .collect();
             terminal.insert_before(lines.len() as u16, |buf| {
                 Paragraph::new(lines).render(buf.area, buf);
             })?;

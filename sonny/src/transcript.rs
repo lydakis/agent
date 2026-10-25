@@ -220,7 +220,16 @@ pub fn tool(
         "read" => ("Read", field("path")),
         "write" => ("Wrote", field("path")),
         "edit" => ("Edited", field("path")),
-        "wait" => ("Waited for", arguments["handles"].to_string()),
+        "wait" => (
+            "Waited for",
+            arguments["handles"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
         "echo" | "note" => ("Noted", field("text")),
         _ => ("Called", format!("{name} {arguments}")),
     };
@@ -246,6 +255,17 @@ pub fn tool(
         "shell" if started(output).is_some() => {
             let line = started(output).unwrap_or_default();
             out.push(Line::from(vec![elbow(), Span::raw(line).dim()]));
+        }
+        // What a wait resolved: each turn's ending and its reply's first line.
+        "wait" if waited(output).is_some() => {
+            for (i, line) in waited(output).unwrap_or_default().into_iter().enumerate() {
+                let lead = if i == 0 { elbow() } else { gap() };
+                out.extend(
+                    wrap(Line::from(line).dim(), width, lead, gap())
+                        .into_iter()
+                        .take(2),
+                );
+            }
         }
         "shell" | "wait" => {
             let output = output.unwrap_or("");
@@ -292,16 +312,53 @@ fn started(output: Option<&str>) -> Option<String> {
     ))
 }
 
+/// The wait tool's reply as lines: `BOT completed: first line of its reply`.
+fn waited(output: Option<&str>) -> Option<Vec<String>> {
+    let reply: Value = serde_json::from_str(output?.trim()).ok()?;
+    let mut lines = Vec::new();
+    for (handle, result) in reply["results"].as_object()? {
+        let who = result["bot"].as_str().unwrap_or(handle);
+        let line = match (result["status"].as_str(), result["error"].as_str()) {
+            (_, Some(error)) => format!("{who}: {error}"),
+            (Some(status), _) => {
+                let text = result["text"].as_str().unwrap_or("");
+                let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+                format!("{who} {status}: {first}")
+            }
+            _ => continue,
+        };
+        lines.push(line);
+    }
+    let pending = reply["pending"].as_array().map_or(0, Vec::len);
+    if pending > 0 {
+        lines.push(format!("{pending} still running"));
+    }
+    Some(lines)
+}
+
 /// An edit as removed and added lines, numbered where the file now has
 /// them when the new text can be found there.
 fn diff(arguments: &Value, workspace: &str, width: usize) -> Vec<Line<'static>> {
-    let old = arguments["old"].as_str().unwrap_or("");
-    let new = arguments["new"].as_str().unwrap_or("");
+    let (mut old, mut new) = (
+        arguments["old"].as_str().unwrap_or("").to_owned(),
+        arguments["new"].as_str().unwrap_or("").to_owned(),
+    );
     let path = arguments["path"].as_str().unwrap_or("");
     let path = std::path::Path::new(workspace).join(path);
-    let start = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|now| now.find(new).map(|at| now[..at].lines().count() + 1));
+    let mut start = None;
+    // An edit replaces text, not lines: show the whole lines it touched,
+    // read from the file as it is now, so indentation and numbers are right.
+    if !new.is_empty()
+        && let Ok(now) = std::fs::read_to_string(path)
+        && let Some(at) = now.find(&new)
+    {
+        let line_start = now[..at].rfind('\n').map_or(0, |i| i + 1);
+        let before = &now[line_start..at];
+        let after = now[at + new.len()..].split('\n').next().unwrap_or("");
+        old = format!("{before}{old}{after}");
+        new = format!("{before}{new}{after}");
+        start = Some(now[..at].matches('\n').count() + 1);
+    }
     let number = |n: Option<usize>| match n {
         Some(n) => format!("{n:>4} "),
         None => "     ".to_owned(),
@@ -310,12 +367,12 @@ fn diff(arguments: &Value, workspace: &str, width: usize) -> Vec<Line<'static>> 
     for (i, line) in old.lines().enumerate() {
         let text = Line::from(format!("-{line}")).fg(Color::Red);
         let lead = Span::raw(number(start.map(|s| s + i))).dim();
-        out.extend(wrap(text, width, lead, Span::raw("     ")));
+        out.extend(wrap(text, width, lead, Span::raw("      ")));
     }
     for (i, line) in new.lines().enumerate() {
         let text = Line::from(format!("+{line}")).fg(Color::Green);
         let lead = Span::raw(number(start.map(|s| s + i))).dim();
-        out.extend(wrap(text, width, lead, Span::raw("     ")));
+        out.extend(wrap(text, width, lead, Span::raw("      ")));
     }
     out
 }
@@ -455,6 +512,43 @@ mod tests {
             text(&rows),
             ["• Ran agent run --detach", "  └ started calc.fix, turn 2"]
         );
+    }
+
+    #[test]
+    fn an_edit_shows_the_whole_lines_it_touched_at_their_numbers() {
+        let dir = std::env::temp_dir().join(format!("sonny-diff-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("calc.py"),
+            "def average(values):\n    return sum(values) / len(values)\n",
+        )
+        .unwrap();
+        let edit = serde_json::json!({"path": "calc.py", "old": "return sum(values) / (len(values) - 1)",
+            "new": "return sum(values) / len(values)"});
+        let rows = tool("edit", &edit, None, false, dir.to_str().unwrap(), 80);
+        assert_eq!(
+            text(&rows),
+            [
+                "• Edited calc.py",
+                "   2 -    return sum(values) / (len(values) - 1)",
+                "   2 +    return sum(values) / len(values)"
+            ]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_wait_reads_as_each_turns_ending() {
+        let output = r#"{"pending":[],"results":{"turn:c.fix/2":{"bot":"c.fix","status":"completed","text":"\nFixed it.\nMore."}}}"#;
+        let rows = tool(
+            "wait",
+            &serde_json::json!({"handles":["turn:c.fix/2"]}),
+            Some(output),
+            false,
+            "/",
+            60,
+        );
+        assert_eq!(text(&rows)[1], "  └ c.fix completed: Fixed it.");
     }
 
     #[test]
