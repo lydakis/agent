@@ -631,13 +631,17 @@ of that bot repeated it; switching models only helped because a block from
 another model is dropped unread. The runtime now sends the request once
 more without any thinking it replays, and records that on the bot as a
 binding change, so later requests leave those blocks out too and keep the
-thinking written after. It does that at once when the error names thinking
-or reasoning (a server error or a 400), or when the stream ends in an
-`api_error` event (otherwise final); for a server error that names
-neither, on the call's second one. That `retry` event carries
-`thinking_withheld: true`. The cost is the withheld reasoning and a cache miss
-from the first stripped node, once. Why Bedrock could not read the blocks is
-not known; global cross-Region profiles (#99) are an unverified suspect. Empty instructions omit the system block, since empty text
+thinking written after. Recovery requires a 400 or server error (HTTP or
+in-stream `api_error`) identifying a thinking or reasoning signature,
+decryption, restoration, or verification failure. Generic server errors are
+retried without changing the context; an unrelated thinking configuration
+error remains final. That recovery's `retry` event carries
+`thinking_withheld: true`, within the normal retry and token budgets. The
+cost is the withheld reasoning and a cache miss from the first stripped
+node, once. This is recovery from the reported failure, not a confirmed
+diagnosis: the original error and a Bedrock reproduction were not captured.
+Why Bedrock could not read the blocks is not known; global cross-Region
+profiles (#99) are an unverified suspect. Empty instructions omit the system block, since empty text
 cannot carry an Anthropic cache breakpoint; automatic caching remains enabled.
 
 ### Keeping the Anthropic cache warm
