@@ -317,6 +317,16 @@ test('a diagram still laying out is stopped with its worker, and the next starts
   assert.equal(workers.length, 2); assert.equal(next.view.innerHTML, '<svg>graph TD</svg>');
 });
 
+test('a diagram whose block left the document while it waited is not drawn', async () => {
+  const p = page(), Rich = p.context.Rich;
+  const workers = diagramWorkers(p.context, ({ src }) => ({ svg: `<svg>${src}</svg>` }));
+  const gone = diagramBox('graph GONE'), shown = diagramBox('graph TD');
+  Rich.hydrate({ querySelectorAll: () => [gone, shown] }); gone.isConnected = false; await turn();
+  assert.deepEqual(workers[0].sent.map((m) => m.src), ['graph TD']);
+  assert.equal(gone.view.innerHTML, ''); assert.ok(!('asked' in gone.dataset));
+  assert.equal(shown.view.innerHTML, '<svg>graph TD</svg>');
+});
+
 test('a reply\'s diagram is code while it streams, and can be drawn once it is in', async () => {
   const reply = 'First:\n\n```mermaid\ngraph TD\n```\n\nand on.';
   const p = page({ request: async () => ({ type: 'message', role: 'assistant', content: [{ type: 'text', text: reply }] }) }), t = p.transcript('Bob');

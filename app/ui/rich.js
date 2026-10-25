@@ -258,6 +258,7 @@ window.Rich = (() => {
   function drawLazy(box, src, make, auto) {
     const key = `${box.dataset.kind}|${box.dataset.lang ?? ''}|${box.clientWidth}|${src}`;
     const show = (svg) => {
+      if (box.isConnected === false) return;
       if (auto && drawnChars() + svg.length > DRAWN_CHARS) { delete box.dataset.asked; note(box, FULL); return; }
       const id = `d${++ids}`;
       drawn.set(box, svg.length);
@@ -269,8 +270,10 @@ window.Rich = (() => {
     if ('asked' in box.dataset) return;
     box.dataset.asked = '';
     // One queued behind the same source takes its result instead of drawing it again; one larger
-    // than the whole budget is shown but not kept.
-    drawing = drawing.then(() => diagrams.get(key) ?? make(src, box)).then((svg) => {
+    // than the whole budget is shown but not kept. One whose block left the document while it
+    // waited (its pane drawn anew, another agent opened) is not drawn.
+    drawing = drawing.then(() => diagrams.get(key) ?? (box.isConnected === false ? null : make(src, box))).then((svg) => {
+      if (svg == null) { delete box.dataset.asked; return; }
       refused.delete(key);
       const cost = 2 * (key.length + svg.length);
       if (!diagrams.has(key) && cost <= DIAGRAM_BYTES) { diagrams.set(key, svg); diagramBytes += cost; }
