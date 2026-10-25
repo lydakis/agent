@@ -16,6 +16,8 @@ Over a Unix socket instead of stdio, with the approver a process of its own:
   baseline for the two below.
 - `jev`: `agent approver` answers, asking a stand-in for Jev's API that
   judges every call low at once.
+- `decisions`: the same, with `openai-decisions/gpt-6-luna` asking a
+  stand-in for OpenAI's Decisions API.
 - `judge`: `agent approver` answers with the synthetic model as a general
   judge through the daemon (a fork, a turn, and a deletion per round),
   judging every call low at once.
@@ -90,6 +92,23 @@ class Jev(http.server.BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         data = json.dumps({'answers': {id: {'type': 'noul', 'noul': 0.05} for id in body['questions']},
                            'usage': {'input_tokens': 0}}).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+class Decisions(Jev):
+    """A stand-in for OpenAI's Decisions API that judges every predicate low
+    at once."""
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        assert self.path == '/v1/decisions' and all(q['type'] == 'predicate' for q in body['questions'])
+        data = json.dumps({'answers': [{'type': 'predicate', 'name': q['name'], 'probability': 0.05}
+                                       for q in body['questions']],
+                           'usage': {'input_tokens': 0, 'input_tokens_details': {'cached_tokens': 0}}}).encode()
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(data)))
@@ -242,7 +261,7 @@ def run(binary, arm, *, bots, turns, fsync=False):
 
 def run_socket(binary, arm, *, bots, turns):
     """The `held` workload over a Unix socket, answered by this client
-    (`socket`) or by `agent approver` (`jev`, `judge`)."""
+    (`socket`) or by `agent approver` (`jev`, `decisions`, `judge`)."""
     server, url = start()
     jev = None
     with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent.parent / '.local') as temp, \
@@ -270,11 +289,15 @@ def run_socket(binary, arm, *, bots, turns):
             if arm != 'socket':
                 env, args = clean_env(), [str(binary), 'approver', '--store', str(path / 'state.sqlite'),
                                          '--socket', str(sock)]
-                if arm == 'jev':
-                    jev = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Jev)
+                if arm in ('jev', 'decisions'):
+                    jev = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Jev if arm == 'jev' else Decisions)
                     jev.daemon_threads = True
                     threading.Thread(target=jev.serve_forever, daemon=True).start()
-                    env['TYPESAFE_API_KEY'] = 'synthetic-judge-key'
+                    if arm == 'jev':
+                        env['TYPESAFE_API_KEY'] = 'synthetic-judge-key'
+                    else:
+                        env['OPENAI_API_KEY'] = 'synthetic-judge-key'
+                        args += ['--judge', 'openai-decisions/gpt-6-luna']
                     args += ['--judge-url', f'http://127.0.0.1:{jev.server_port}']
                 else:
                     args += ['--judge', 'openai/synthetic-model']
@@ -383,7 +406,8 @@ def main():
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     arms = [('after', arm) for arm in args.arms.split(',')]
-    assert arms and all(arm in ('ungated', 'held', 'parked', 'socket', 'jev', 'judge') for _, arm in arms)
+    assert arms and all(arm in ('ungated', 'held', 'parked', 'socket', 'jev', 'decisions', 'judge')
+                        for _, arm in arms)
     if args.before:
         arms.insert(0, ('before', 'ungated'))
     binaries = {'after': args.after.resolve(), **({'before': args.before.resolve()} if args.before else {})}
@@ -394,7 +418,7 @@ def main():
     for index in range(args.rounds):
         # Rotate the order so no arm always runs first or last.
         for label, arm in arms[index % len(arms):] + arms[:index % len(arms)]:
-            measure = run_socket if arm in ('socket', 'jev', 'judge') else run
+            measure = run_socket if arm in ('socket', 'jev', 'decisions', 'judge') else run
             record = {'binary': label, **measure(binaries[label], arm, bots=args.bots, turns=args.turns)}
             report['runs'].append(record)
             (args.out / 'result.json').write_text(json.dumps(report, indent=2) + '\n')
