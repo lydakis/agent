@@ -344,7 +344,8 @@ pub fn finished(
         label.push_str(&format!(" · {detail}"));
     }
     let text = format!("─ {label} ");
-    let fill = width.saturating_sub(text.width());
+    // No wider than 80 columns, so a pane that narrows later rarely re-wraps it.
+    let fill = width.min(80).saturating_sub(text.width());
     let style = if matches!(status, "completed" | "steered") {
         Style::new().dim()
     } else {
