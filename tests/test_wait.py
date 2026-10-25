@@ -214,7 +214,7 @@ class WaitTests(ModelFixture):
         alice = client.request('submit', bot='Alice', request_id='a', prompt='slow')['result']
         self.assertEqual(alice['handle'], f"turn:Alice/{alice['turn']}")
         bob = client.request('submit', bot='Bob', request_id='b', prompt='wait:' + alice['handle'])['result']['turn']
-        self.assertEqual(client.request('resume', bot='Bob')['result']['status'] in ('running', 'waiting'), True)
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['status'] in ('running', 'waiting'), True)
         self.assertEqual(client.finished(alice['turn'])['data']['status'], 'completed')
         self.assertEqual(client.finished(bob)['data']['status'], 'completed')
         result = self.tool_output(client, 'Bob', 'wait-1')['results'][alice['handle']]
@@ -243,7 +243,7 @@ class WaitTests(ModelFixture):
         self.assertTrue(outcome['results'][alice['handle']]['pending'])
         carol = client.request('submit', bot='Carol', request_id='c', prompt='wait:' + alice['handle'])['result']['turn']
         client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == carol)
-        self.assertEqual(client.request('resume', bot='Carol')['result']['status'], 'waiting')
+        self.assertEqual(client.request('inspect', bot='Carol')['result']['status'], 'waiting')
         # A pending turn is shown as it stands, with what it waits for.
         handle = f'turn:Carol/{carol}'
         polled = client.request('wait', handles=[handle, alice['handle']], timeout_ms=0)['result']['results']
@@ -253,7 +253,7 @@ class WaitTests(ModelFixture):
         self.assertEqual(client.request('interrupt', bot='Carol', turn=carol + 1)['error'], 'turn_not_found')
         self.assertEqual(client.request('interrupt', bot='Carol', turn=carol)['result']['status'], 'interrupted')
         self.assertEqual(client.finished(carol)['data']['status'], 'interrupted')
-        self.assertEqual(client.request('resume', bot='Carol')['result']['status'], 'interrupted')
+        self.assertEqual(client.request('inspect', bot='Carol')['result']['status'], 'interrupted')
         # The abandoned wait received a cancellation result, so the history stays valid.
         cancelled = self.tool_output(client, 'Carol', 'wait-1')
         self.assertEqual(cancelled['error'], 'cancelled')
@@ -278,7 +278,7 @@ class WaitTests(ModelFixture):
         client.close(kill=True)
         self.assertFalse(survivor.exists())
         client = self.client('echo,shell,wait')
-        self.assertEqual(client.request('resume', bot='Alice')['result']['status'], 'interrupted')
+        self.assertEqual(client.request('inspect', bot='Alice')['result']['status'], 'interrupted')
         self.assertEqual(client.finished(bob)['data']['status'], 'completed')
         result = self.tool_output(client, 'Bob', 'wait-1')['results'][alice['handle']]
         self.assertEqual((result['status'], result['error']), ('interrupted', 'process_interrupted'))
@@ -312,7 +312,7 @@ class WaitTests(ModelFixture):
         self.assertEqual(kinds.count('tool_completed'), 2)
         echoed = self.tool_output(client, 'Bob', 'after-1')
         self.assertEqual(echoed, 'after-the-wait')
-        self.assertEqual(client.request('resume', bot='Bob')['result']['status'], 'completed')
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['status'], 'completed')
 
     def test_protocol_wait_answers_clients_without_a_turn(self):
         client = self.client('echo,shell,wait')
@@ -479,7 +479,7 @@ class WaitTests(ModelFixture):
         for bot, turn in turns.items():
             if bot not in (cancelled, deleted):
                 self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-        self.assertEqual(client.request('resume', bot=deleted)['error'], 'bot_not_found')
+        self.assertEqual(client.request('inspect', bot=deleted)['error'], 'bot_not_found')
         fresh = client.request('submit', bot=cancelled, request_id='fresh', prompt='hello')['result']['turn']
         self.assertEqual(client.finished(fresh)['data']['status'], 'completed')
 

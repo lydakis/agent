@@ -216,7 +216,7 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   that removes a tool from it, because the bot's own shell could call that
   operation. The CLI flag is `run --approve shell,write,edit`.
 - **`create` also takes an `approver` tag,** an opaque string the daemon
-  stores, reports in `resume`, `bots`, and `approval_requested`, but never
+  stores, reports in `inspect`, `bots`, and `approval_requested`, but never
   interprets. Clients use it to decide who answers (see the modes above).
   A list and its tag together make a **gate**. A gate may also carry an
   `expire_ms` its creator chooses: a call whose verdict for that gate has

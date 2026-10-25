@@ -1,7 +1,7 @@
 # CLI contract
 
 Agent uses flat verbs: `run`, `follow`, `fork`, `interrupt`, `wait`, `ls`,
-`turns`, `rm`, `prune`, `approvals`, `answer`, `models`, `start`, `stats`,
+`inspect`, `turns`, `rm`, `prune`, `approvals`, `answer`, `models`, `start`, `stats`,
 `shutdown`, and `serve`. All named
 bots use the same commands. There is no parent/child command hierarchy.
 
@@ -37,6 +37,10 @@ succeeds as a duplicate and leaves a later bot of the same name alone. An
 identity that name never held is `bot_not_found`.
 `follow --bot NAME` replays and follows the selected current turn to its end;
 an idle bot returns after replay. `follow --all` stays connected for future work.
+`inspect --bot NAME` prints one bot's whole record: the fields of its `ls`
+row plus its instructions, settings and compaction. It changes nothing, so it
+is safe to repeat; with `--bot-id N`, a bot that no longer holds that
+identity is `bot_not_found`.
 
 ## Arguments and flags
 
@@ -222,6 +226,11 @@ a daemon that exits without one is `daemon_start_failed`, naming the log.
 | 2 | Invalid command-line usage |
 | 75 | `serve` could not acquire store/socket ownership |
 
+`wait --bot NAME` waits on that bot's running turn, else its newest, so a
+caller can wait on work it did not submit; the result is keyed by the handle
+it chose, as if that handle had been given. A turn queued behind the running
+one is not it. A bot with no turns is `no_turn`, and `--bot-id` pins the
+identity as on `inspect`. `--bot` and handles do not mix.
 `wait` normally requires all handles to resolve without errors. With `--any`,
 one resolved successful handle suffices and the remaining handles stay valid.
 An errored first result or a timeout with no resolved result exits 1.

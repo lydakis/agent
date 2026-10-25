@@ -901,7 +901,7 @@ def valid_mix(mix):
 def taken(daemon, name):
     """Whether a bot holds this name, or one of its agents' names."""
     try:
-        daemon.call('resume', bot=name)
+        daemon.call('inspect', bot=name)
         return True
     except Refused as e:
         if e.code != 'bot_not_found':
@@ -1065,7 +1065,7 @@ def start(daemon, args):
         # A project's coordinator starts one from its shell, in its project and folder.
         if not author.endswith('.lead'):
             raise Refused('coordinators_only', "a project's coordinator (PROJECT.lead) starts a swarm; ask it")
-        me = daemon.call('resume', bot=author)
+        me = daemon.call('inspect', bot=author)
         lead = {'bot': author, 'id': me['bot_id']}
         asked['project'], asked['folder'] = author[:-len('.lead')], me['workspace']
         if not asked['mix']:

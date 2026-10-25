@@ -838,7 +838,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertEqual(client.finished(steer['result']['turn'])['data']['error'], 'budget_exhausted')
         self.assertEqual(model.requests.get(timeout=1)['max_tokens'], 0)
         self.assertTrue(model.requests.empty())
-        self.assertEqual(client.request('resume', bot='Bob')['result']['tokens_used'], 23)
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['tokens_used'], 23)
 
     def test_a_call_waiting_to_be_sent_is_refreshed_only_from_its_send(self):
         # One request may start at a time and Ann's waits for its headers,
@@ -981,7 +981,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
                          {'type': 'tool_result', 'tool_use_id': 'toolu_1', 'content': 'shared'})
         self.assertEqual(len(second['messages']), 3)
         # The store is bound to the provider family; resume and replay are exact.
-        state = client.request('resume', bot='Bob')['result']
+        state = client.request('inspect', bot='Bob')['result']
         self.assertEqual((state['provider'], state['family'], state['model'], state['effort']),
                          ('anthropic', 'anthropic', 'synthetic-claude', 'low'))
         self.assertEqual(client.request('create', bot='Bad', workspace=str(path), effort='extreme')['error'],
@@ -991,7 +991,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
         client.request('create', bot='Capped', workspace=str(path), budget_tokens=10)
         capped = client.request('submit', bot='Capped', request_id='cap', prompt='incomplete')['result']['turn']
         self.assertEqual(client.finished(capped)['data']['error'], 'provider_incomplete')
-        self.assertEqual(client.request('resume', bot='Capped')['result']['tokens_used'], 14)  # 5 + 2 cached in, 7 out
+        self.assertEqual(client.request('inspect', bot='Capped')['result']['tokens_used'], 14)  # 5 + 2 cached in, 7 out
         self.assertEqual(client.request('submit', bot='Capped', request_id='retry', prompt='hello')['error'],
                          'budget_exhausted')
         while not model.requests.empty():
@@ -1276,7 +1276,7 @@ class RuntimeTests(ModelFixture):
 
     def test_kill_restart_resume_historical_fork_and_tool_loop(self):
         client = self.client()
-        self.assertEqual(client.request('resume', bot='missing')['error'], 'bot_not_found')
+        self.assertEqual(client.request('inspect', bot='missing')['error'], 'bot_not_found')
         client.request('create', bot='Bob', workspace=str(self.path))
         first = client.request('submit', bot='Bob', request_id='first', prompt='héllo')['result']['turn']
         checkpoint = client.finished(first)['data']['checkpoint']
@@ -1285,7 +1285,7 @@ class RuntimeTests(ModelFixture):
         before = client.request('events', bot='Bob', after=0, limit=256)['result']
         client.close(kill=True)
         client = self.client()
-        self.assertEqual(client.request('resume', bot='Bob')['result']['status'], 'completed')
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['status'], 'completed')
         self.assertEqual(client.request('events', bot='Bob', after=0, limit=256)['result'], before)
         self.assertTrue(client.request('submit', bot='Bob', request_id='first', prompt='héllo')['result']['duplicate'])
         client.request('fork', source='Bob', checkpoint=checkpoint, bot='Alternative', workspace=str(self.path))
@@ -1300,7 +1300,7 @@ class RuntimeTests(ModelFixture):
         self.assertEqual(alt_history[1]['content'][0]['text'], 'reply:héllo')
         self.assertNotIn('second', json.dumps(alt_history))
         self.assertEqual(requests[3]['input'][-1]['output'], 'shared prefix')
-        self.assertEqual(client.request('resume', bot='Bob')['result']['head'], before['events'][-1]['data']['checkpoint'])
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['head'], before['events'][-1]['data']['checkpoint'])
 
     def test_a_turn_keeps_its_first_routing_token_and_the_next_turn_starts_without_one(self):
         self.model.routes = []
@@ -1377,7 +1377,7 @@ class RuntimeTests(ModelFixture):
         self.assertEqual(fork['tools'], ['echo'])
         client.close()
         client = self.client('shell')
-        self.assertEqual(client.request('resume', bot='Both')['result']['tools'], ['shell', 'echo'])
+        self.assertEqual(client.request('inspect', bot='Both')['result']['tools'], ['shell', 'echo'])
         self.assertEqual(client.request('stats')['result']['active_turns'], 0)
 
     def test_a_fork_calls_only_its_allowed_tools_and_keeps_its_sources_request(self):
@@ -1413,7 +1413,7 @@ class RuntimeTests(ModelFixture):
         done = [e for e in events if e['event'] == 'tool_completed'][0]
         output = node_item(client, 'Answer', done['data']['node'])['result']['output']
         self.assertEqual(json.loads(output)['error'], 'tool_not_available')
-        self.assertEqual(client.request('resume', bot='Answer')['result']['allowed'], [])
+        self.assertEqual(client.request('inspect', bot='Answer')['result']['allowed'], [])
 
     def test_a_bot_is_created_with_what_its_client_states_and_keeps_it(self):
         client = self.client()
@@ -1437,14 +1437,14 @@ class RuntimeTests(ModelFixture):
         client.close()
         client = Client(self.binary, self.path / 'state.sqlite', self.url, model='other-model')
         self.addCleanup(client.close)
-        self.assertEqual(client.request('resume', bot='Bob')['result']['instructions'], 'Be brief.')
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['instructions'], 'Be brief.')
 
     def test_stores_open_under_any_provider_set_and_turns_check_the_family(self):
         client = self.client()
         client.request('create', bot='Bob', workspace=str(self.path))
         first = client.request('submit', bot='Bob', request_id='1', prompt='hello')['result']['turn']
         self.assertEqual(client.finished(first)['data']['status'], 'completed')
-        before = client.request('resume', bot='Bob')['result']
+        before = client.request('inspect', bot='Bob')['result']
         client.close()
         # A daemon without Bob's provider opens the store; Bob's turns fail by name.
         client = Client(self.binary, self.path / 'state.sqlite', self.url, provider='other')
@@ -1455,7 +1455,7 @@ class RuntimeTests(ModelFixture):
         for delivery in ('reject', 'queue', 'steer'):
             missing = client.request('submit', bot='Bob', request_id='2', prompt='again', delivery=delivery)
             self.assertEqual(missing['error'], 'provider_unavailable')
-        self.assertEqual(client.request('resume', bot='Bob')['result'], before)
+        self.assertEqual(client.request('inspect', bot='Bob')['result'], before)
         duplicate = client.request('submit', bot='Bob', request_id='1', prompt='hello')['result']
         self.assertTrue(duplicate['duplicate'])
         self.assertEqual(duplicate['turn'], first)
@@ -1466,7 +1466,7 @@ class RuntimeTests(ModelFixture):
         for model in (None, 'openai/synthetic-model'):
             wrong = client.request('submit', bot='Bob', request_id='3', prompt='again', model=model)
             self.assertEqual(wrong['error'], 'provider_family_mismatch')
-        self.assertEqual(client.request('resume', bot='Bob')['result'], before)
+        self.assertEqual(client.request('inspect', bot='Bob')['result'], before)
         client.close()
         # Back with the provider, the conversation continues where it was.
         client = self.client()
@@ -1488,7 +1488,7 @@ class RuntimeTests(ModelFixture):
         branch = client.request('fork', source='Bob', checkpoint=answered, bot='branch', workspace=str(self.path))['result']
         self.assertEqual(branch['head'], answered)
         tip = client.request('fork', source='Bob', bot='tip', workspace=str(self.path))['result']
-        self.assertEqual(tip['head'], client.request('resume', bot='Bob')['result']['head'])
+        self.assertEqual(tip['head'], client.request('inspect', bot='Bob')['result']['head'])
         # The branch continues from the tool result; the provider sees exactly that prefix.
         t2 = client.request('submit', bot='branch', request_id='b', prompt='after the tool')['result']['turn']
         self.assertEqual(client.finished(t2)['data']['status'], 'completed')
@@ -1510,13 +1510,13 @@ class RuntimeTests(ModelFixture):
         # A field name that fills the request line is elided in the
         # refusal, so the refusal still fits in one response.
         huge = 'x' * (1024 * 1024 - 200)
-        client.process.stdin.write(json.dumps({'id': 'huge', 'op': 'resume', 'bot': 'Bob', huge: 1}) + '\n')
+        client.process.stdin.write(json.dumps({'id': 'huge', 'op': 'inspect', 'bot': 'Bob', huge: 1}) + '\n')
         client.process.stdin.flush()
         refused = client.receive(lambda m: 'error' in m and m.get('id') == 'huge')
         self.assertEqual(refused['error'], 'invalid_request')
         self.assertIn('unknown field', refused['detail'])
         self.assertLess(len(refused['detail']), 8192)
-        self.assertEqual(client.request('resume', bot='other')['error'], 'bot_not_found')
+        self.assertEqual(client.request('inspect', bot='other')['error'], 'bot_not_found')
 
     def test_a_running_bot_forks_at_its_newest_finished_round(self):
         client = self.client()
@@ -1554,13 +1554,13 @@ class RuntimeTests(ModelFixture):
         self.assertEqual(client.request('submit', bot='Bob', request_id='m', prompt='hi',
                                         workspace='relative/path')['error'], 'workspace_must_exist_and_be_absolute')
         # The turn that named a folder moved Bob there.
-        self.assertEqual(client.request('resume', bot='Bob')['result']['workspace'], str(other.resolve()))
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['workspace'], str(other.resolve()))
         # A bot created without a workspace needs one named until a turn gives it one.
         self.assertIsNone(client.request('create', bot='Nomad')['result']['workspace'])
         self.assertEqual(client.request('submit', bot='Nomad', request_id='n', prompt='hi')['error'], 'workspace_required')
         turn = client.request('submit', bot='Nomad', request_id='n2', prompt='hi', workspace=str(other))['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-        self.assertEqual(client.request('resume', bot='Nomad')['result']['workspace'], str(other.resolve()))
+        self.assertEqual(client.request('inspect', bot='Nomad')['result']['workspace'], str(other.resolve()))
 
     def test_interrupt_and_crash_recovery_are_explicit(self):
         client = self.client()
@@ -1574,7 +1574,7 @@ class RuntimeTests(ModelFixture):
         self.model.requests.get(timeout=3)
         client.close(kill=True)
         client = self.client()
-        self.assertEqual(client.request('resume', bot='Bob')['result']['status'], 'interrupted')
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['status'], 'interrupted')
         events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
         self.assertTrue(any(e.get('turn') == pending and e['data'].get('error') == 'process_interrupted' for e in events))
         self.assertTrue(self.model.requests.empty())  # Restart did not launch a paid/repeated request.
@@ -1591,7 +1591,7 @@ class RuntimeTests(ModelFixture):
         client.close(kill=True)
         self.model.requests.get(timeout=1)
         client = self.client('echo,shell')
-        self.assertEqual(client.request('resume', bot='Bob')['result']['status'], 'interrupted')
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['status'], 'interrupted')
         events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
         results = [e for e in events if e['event'] == 'tool_completed' and e['turn'] == turn]
         self.assertEqual(len(results), 1)
@@ -1655,7 +1655,7 @@ class RuntimeTests(ModelFixture):
                                 input='', capture_output=True, text=True, timeout=5, env=clean_env())
         self.assertEqual(second.returncode, 75)
         self.assertIn('store_already_owned', second.stderr)
-        self.assertEqual(client.request('resume', bot='Bob')['result']['status'], 'running')
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['status'], 'running')
         client.request('interrupt', bot='Bob', turn=turn)
         client.finished(turn)
 
@@ -1676,7 +1676,7 @@ class RuntimeTests(ModelFixture):
                 self.assertEqual(second.returncode, 75 if kind == 'symlink' else 1, kind)
                 self.assertIn('store_already_owned' if kind == 'symlink'
                               else 'store_hard_links_unsupported', second.stderr)
-                self.assertEqual(client.request('resume', bot='Bob')['result']['status'], 'running')
+                self.assertEqual(client.request('inspect', bot='Bob')['result']['status'], 'running')
             finally:
                 alias.unlink()
         client.request('interrupt', bot='Bob', turn=turn)
@@ -1705,20 +1705,20 @@ class RuntimeTests(ModelFixture):
         self.assertEqual(sum(e['event'] == 'tool_started' for e in events), 12)
         self.assertEqual(sum(e['event'] == 'tool_completed' for e in events), 12)
         self.assertEqual(sum(e['event'] == 'turn_finished' for e in events), 12)
-        self.assertEqual(client.request('resume', bot='Bob')['result']['status'], 'completed')
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['status'], 'completed')
 
     def test_distinct_store_files_do_not_collide_and_symlink_resume_is_exact(self):
         client = self.client()
         client.request('create', bot='Bob', workspace=str(self.path))
         other = Client(self.binary, self.path / 'state.db', self.url)
         self.addCleanup(other.close)
-        self.assertEqual(other.request('resume', bot='Bob')['error'], 'bot_not_found')
+        self.assertEqual(other.request('inspect', bot='Bob')['error'], 'bot_not_found')
         client.close()
         alias = self.path / 'alias.sqlite'
         alias.symlink_to(self.path / 'state.sqlite')
         resumed = Client(self.binary, alias, self.url)
         self.addCleanup(resumed.close)
-        self.assertEqual(resumed.request('resume', bot='Bob')['result']['status'], 'idle')
+        self.assertEqual(resumed.request('inspect', bot='Bob')['result']['status'], 'idle')
         resumed.close()
         link = self.path / 'hardlink.sqlite'
         os.link(self.path / 'state.sqlite', link)
@@ -1887,7 +1887,7 @@ class RuntimeTests(ModelFixture):
         self.assertEqual(freed['turns'], 5)
         self.assertGreater(freed['nodes'], 0)
         self.assertEqual(client.receive(lambda m: m.get('event') == 'deleted')['bot'], 'Bob')
-        self.assertEqual(client.request('resume', bot='Bob')['error'], 'bot_not_found')
+        self.assertEqual(client.request('inspect', bot='Bob')['error'], 'bot_not_found')
         self.assertEqual(client.request('delete', bot='Bob')['error'], 'bot_not_found')
         self.assertEqual(client.request('bots')['result']['bots'], [])
 
@@ -1947,7 +1947,7 @@ class RuntimeTests(ModelFixture):
         after = client.request('stats')['result']['store']['operations']['delete_bot']['count']
         # 40 turns of records in pieces of 16, then the turn rows, then nodes, then the bot.
         self.assertGreaterEqual(after - before, 5)
-        self.assertEqual(client.request('resume', bot='Big')['error'], 'bot_not_found')
+        self.assertEqual(client.request('inspect', bot='Big')['error'], 'bot_not_found')
         turn = client.request('submit', bot='Other', request_id='o', prompt='hi')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
 
@@ -1970,7 +1970,7 @@ class RuntimeTests(ModelFixture):
         client = self.client()
         listed = {b['name']: b['bot_id'] for b in client.request('bots')['result']['bots']}
         self.assertEqual(listed, {'Bob': bob['bot_id'], 'Fork': fork['bot_id']})
-        self.assertEqual(client.request('resume', bot='Bob')['result']['bot_id'], bob['bot_id'])
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['bot_id'], bob['bot_id'])
         again = client.request('submit', bot='Bob', request_id='r7', bot_id=bob['bot_id'], prompt='hello')['result']
         self.assertEqual((again['duplicate'], again['turn']), (True, first['turn']))
         # A recycled name is a new identity: a stale retry is refused, a plain one is fresh work.

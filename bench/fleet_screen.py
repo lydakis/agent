@@ -223,7 +223,7 @@ class Screen:
         ready_seconds = time.monotonic() - started
         statuses = {}
         for index in range(self.bots):
-            state = client.request('resume', bot=f'b{index}')['result']
+            state = client.request('inspect', bot=f'b{index}')['result']
             statuses[state['status']] = statuses.get(state['status'], 0) + 1
         if statuses.get('interrupted', 0) != active:
             raise RuntimeError(f'restart recovered {statuses}, expected {active} interrupted bots')

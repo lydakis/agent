@@ -1964,8 +1964,8 @@ The UI bounds payload buffering, history decoding, and rendered fleet rows:
   rows, and the activity check behind the clock is cached per fleet change.
 - **Creation** costs no request: the `created` and `forked` events carry the
   record's list fields, so a burst of ten thousand bots is ten thousand
-  events, not ten thousand `resume` round trips. An event missing its provider
-  field is a protocol error, with no legacy `resume` fallback. Lineage is the store's
+  events, not ten thousand `inspect` round trips. An event missing its provider
+  field is a protocol error, with no legacy `inspect` fallback. Lineage is the store's
   `created_by_id`: a bot links under its creator only while the bot holding
   that name is the identity that created it.
 - **Sessions** count up; an event from an older session is dropped, a

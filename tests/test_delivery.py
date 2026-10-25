@@ -140,11 +140,11 @@ class DeliveryTests(ModelFixture):
             steers[bot] = client.request('submit', bot=bot, request_id='steer', prompt='continue',
                                          delivery='steer', workspace=str(self.path) if bot == 'Bob' else None)['result']['turn']
         # Cancellation makes this steer start alone, where the default is invalid.
-        head = client.request('resume', bot='Cancelled')['result']['head']
+        head = client.request('inspect', bot='Cancelled')['result']['head']
         client.request('interrupt', bot='Cancelled', turn=active['Cancelled'])
         self.assertEqual(client.finished(active['Cancelled'])['data']['status'], 'interrupted')
         self.assertEqual(client.finished(steers['Cancelled'])['data']['error'], 'provider_unavailable')
-        self.assertEqual(client.request('resume', bot='Cancelled')['result']['head'], head)
+        self.assertEqual(client.request('inspect', bot='Cancelled')['result']['head'], head)
         self.model.release_headers.set()
         for bot in ('Bob', 'Changed'):
             self.assertEqual(client.finished(steers[bot])['data']['status'], 'steered')
@@ -183,7 +183,7 @@ class DeliveryTests(ModelFixture):
             reply = client.request('interrupt', bot='Bob', turn=pending)
             self.assertEqual(reply['result']['status'], 'interrupted')
             self.assertEqual(client.finished(pending)['data']['status'], 'interrupted')
-        self.assertEqual(client.request('resume', bot='Bob')['result']['running_turn'], first)
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['running_turn'], first)
         self.assertEqual(client.request('interrupt', bot='Bob', turn=999)['error'], 'turn_not_found')
         client.request('interrupt', bot='Bob', turn=first)
         self.assertEqual(client.finished(first)['data']['status'], 'interrupted')
@@ -358,7 +358,7 @@ class DeliveryTests(ModelFixture):
         self.assertIn('A short synthetic summary.', text)
         self.assertIn('User messages from those turns, verbatim:', text)
         self.assertIn('\n1: Task 1: 111', text)
-        bob = client.request('resume', bot='Bob')['result']
+        bob = client.request('inspect', bot='Bob')['result']
         # Later compactions stand for everything since the first: the newest
         # version is the bot's, and its coverage still starts at turn 1.
         self.assertEqual(bob['compaction'], compacted[-1]['data']['version'])
@@ -372,10 +372,10 @@ class DeliveryTests(ModelFixture):
         page = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
         early = [e['data']['checkpoint'] for e in page if e['event'] == 'turn_finished' and e['turn'] == turns[('Bob', 0)]][0]
         client.request('fork', source='Bob', checkpoint=early, bot='Early', workspace=str(self.path))
-        self.assertIsNone(client.request('resume', bot='Early')['result']['compaction'])
+        self.assertIsNone(client.request('inspect', bot='Early')['result']['compaction'])
         client.request('fork', source='Bob', bot='Late', workspace=str(self.path))
-        self.assertEqual(client.request('resume', bot='Late')['result']['compaction'],
-                         client.request('resume', bot='Bob')['result']['compaction'])
+        self.assertEqual(client.request('inspect', bot='Late')['result']['compaction'],
+                         client.request('inspect', bot='Bob')['result']['compaction'])
         # A summarizer of another family is refused at creation; an unknown one too.
         self.assertEqual(client.request('create', bot='Bad', workspace=str(self.path),
                                         compaction_instructions='x', compaction_model='nobody/model')['error'],
@@ -389,7 +389,7 @@ class DeliveryTests(ModelFixture):
         completed = [e for e in self.events(client, 'Bob') if e['event'] == 'tool_completed'][-1]
         version = completed['data']['note']
         self.assertEqual(version, completed['data']['node'])
-        self.assertEqual(client.request('resume', bot='Bob')['result']['note'], version)
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['note'], version)
         self.assertEqual(json.loads(node_item(client, 'Bob', version)['result']['output']),
                          {'bytes': 37, 'cleared': False})
         # The next request carries the note ahead of the window, before the prompt.
@@ -400,14 +400,14 @@ class DeliveryTests(ModelFixture):
         texts = [item['content'][0]['text'] for item in request['input'] if item.get('role') == 'user']
         self.assertEqual(texts[0], f'[carry-forward note, version {version}]\nRule: end every file with the marker.')
         self.assertEqual(texts[-1], 'hello')
-        checkpoint = client.request('resume', bot='Bob')['result']['head']
+        checkpoint = client.request('inspect', bot='Bob')['result']['head']
         # A rewrite is a new version; a fork at the earlier checkpoint keeps the old one.
         third = client.request('submit', bot='Bob', request_id='3', prompt='note:Rule v2.')['result']['turn']
         client.finished(third)
-        later = client.request('resume', bot='Bob')['result']['note']
+        later = client.request('inspect', bot='Bob')['result']['note']
         self.assertGreater(later, version)
         client.request('fork', source='Bob', checkpoint=checkpoint, bot='Early', workspace=str(self.path))
-        self.assertEqual(client.request('resume', bot='Early')['result']['note'], version)
+        self.assertEqual(client.request('inspect', bot='Early')['result']['note'], version)
         # Empty text clears it: the next request has no pinned note.
         cleared = client.request('submit', bot='Bob', request_id='4', prompt='note:')['result']['turn']
         client.finished(cleared)
@@ -605,13 +605,13 @@ class DeliveryTests(ModelFixture):
                                  delivery='queue')['result']['turn']
         override = client.request('submit', bot='Bob', request_id='3', prompt='override',
                                   delivery='queue', model='openai/synthetic-model')['result']['turn']
-        head = client.request('resume', bot='Bob')['result']['head']
+        head = client.request('inspect', bot='Bob')['result']['head']
         client.close(kill=True)
         client = Client(self.binary, self.path / 'state.sqlite', self.url, family='anthropic')
         self.addCleanup(client.close)
         for turn in (default, override):
             self.assertEqual(client.finished(turn)['data']['error'], 'provider_family_mismatch')
-        self.assertEqual(client.request('resume', bot='Bob')['result']['head'], head)
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['head'], head)
         events = self.events(client, 'Bob')
         self.assertFalse(any(e['event'] == 'accepted' and e['turn'] in (default, override) for e in events))
         # An accepted request remains reconcilable even if its provider changed.

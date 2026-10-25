@@ -1,7 +1,7 @@
 // Pi Durable lifecycle adapter: one Harness over one SQLite store, one
 // conversation per named bot, driven by the observer over stdio JSON lines.
 // It answers the same lifecycle steps the Rust daemon's stdio protocol does
-// (create, submit, resume, re-read, item read, fork); see BENCHMARKS.md.
+// (create, submit, inspect, re-read, item read, fork); see BENCHMARKS.md.
 import { once } from 'node:events';
 import { createInterface } from 'node:readline';
 import { BACKGROUND_CONTEXT as context } from '@earendil-works/chord/context';
@@ -138,7 +138,7 @@ const operations = {
       submitting.delete(key);
     }
   },
-  async resume({ bot }) {
+  async inspect({ bot }) {
     const handle = await conversation(bot);
     const newest = (await handle.entries({}, 1, undefined, context)).items[0];
     const done = newest?.kind === 'pi.assistant' && newest.model?.[0]?.stopReason === 'stop';

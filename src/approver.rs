@@ -254,7 +254,7 @@ impl Model {
         model: &str,
         effort: Option<&str>,
     ) -> Result<Model> {
-        match client.request("resume", json!({"bot":base})).await {
+        match client.request("inspect", json!({"bot":base})).await {
             Ok(bot) if !judge_bot(&bot) => {
                 return Err(Error::with(
                     "approver_name_taken",
