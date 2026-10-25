@@ -196,6 +196,12 @@ async fn run() -> Result<(), String> {
                 return Err(usage());
             }
             let dir = std::env::current_dir().map_err(|e| e.to_string())?;
+            // Before the lead is made, so its instructions list the skill.
+            if options.rex
+                && let Some(bin) = rex::find()
+            {
+                rex::install_skill(&bin);
+            }
             let lead =
                 project::open(&client, &dir, &options.socket, options.model.as_deref()).await?;
             (lead.bot, Some(lead.project))
@@ -234,6 +240,17 @@ async fn run() -> Result<(), String> {
         app.fleet = Fleet::start(&options, project, &name).await;
         if let Some(fleet) = &app.fleet {
             app.notice = fleet.note.clone();
+        }
+        // Skills are listed in a bot's instructions when it is made.
+        if bot["instructions"]
+            .as_str()
+            .is_some_and(|text| !text.contains("rex-windows"))
+        {
+            app.notice = Some(
+                "this lead was made before the rex-windows skill: ask it to read \
+                 ~/.agents/skills/rex-windows/SKILL.md"
+                    .into(),
+            );
         }
     }
     app.project = project;
@@ -403,7 +420,7 @@ impl Fleet {
         ];
         let mut note = format!("tasks open in Rex session {project}");
         if rex::install_skill(&bin).is_some() {
-            note.push_str(" · rex-windows skill installed");
+            note.push_str(" · rex-windows skill updated");
         }
         let mut fleet = Self {
             rex,

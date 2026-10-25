@@ -237,6 +237,47 @@ pub fn tool(
         }
         return out;
     }
+    // Several commands in one call, some of them known: each on its own
+    // line, said or shown, with what they printed together under the last.
+    let parts = crate::calls::parts(&field("command"));
+    if name == "shell"
+        && parts.len() > 1
+        && parts
+            .iter()
+            .any(|p| crate::calls::said(p, "", false).is_some())
+    {
+        let mut out = Vec::new();
+        for (i, part) in parts.iter().enumerate() {
+            let bullet = if failed && i + 1 == parts.len() {
+                Span::raw("• ").fg(Color::Red)
+            } else {
+                Span::raw("• ").fg(Color::Green)
+            };
+            match crate::calls::said(part, "", false) {
+                Some(said) => {
+                    let mut spans = vec![Span::raw(said.verb).bold()];
+                    if !said.what.is_empty() {
+                        spans.extend([Span::raw(" "), Span::raw(said.what)]);
+                    }
+                    out.extend(wrap(Line::from(spans), width, bullet, gap()));
+                    for (i, line) in said.under.into_iter().enumerate() {
+                        let lead = if i == 0 { elbow() } else { gap() };
+                        out.extend(wrap(line, width, lead, gap()).into_iter().take(2));
+                    }
+                }
+                None => {
+                    let line = Line::from(vec![
+                        Span::raw("Ran").bold(),
+                        Span::raw(" "),
+                        Span::raw(part.lines().next().unwrap_or("").to_owned()),
+                    ]);
+                    out.extend(wrap(line, width, bullet, gap()));
+                }
+            }
+        }
+        out.extend(preview(output.unwrap_or(""), width));
+        return out;
+    }
     // A skill's instructions, read before following them.
     if name == "read"
         && let Some(skill) = field("path")
@@ -302,26 +343,33 @@ pub fn tool(
                 );
             }
         }
-        "shell" | "wait" => {
-            let output = output.unwrap_or("");
-            let lines: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
-            if lines.is_empty() {
-                out.push(Line::from(vec![elbow(), Span::raw("(no output)").dim()]));
-            }
-            let shown = if lines.len() > 5 { 3 } else { lines.len() };
-            for (i, line) in lines.iter().take(shown).enumerate() {
-                let lead = if i == 0 { elbow() } else { gap() };
-                let line = Line::from(line.to_string()).dim();
-                out.extend(wrap(line, width, lead, gap()).into_iter().take(2));
-            }
-            if lines.len() > shown {
-                out.push(Line::from(vec![
-                    gap(),
-                    Span::raw(format!("… +{} lines", lines.len() - shown)).dim(),
-                ]));
-            }
-        }
+        "shell" | "wait" => out.extend(preview(output.unwrap_or(""), width)),
         _ => {}
+    }
+    out
+}
+
+/// A command's output: its first lines, or all of a few, and how many
+/// more there were. An agent's start, printed among them, reads as one.
+fn preview(output: &str, width: usize) -> Vec<Line<'static>> {
+    let elbow = || Span::raw("  └ ").dim();
+    let gap = || Span::raw("    ");
+    let mut out = Vec::new();
+    let lines: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.is_empty() {
+        out.push(Line::from(vec![elbow(), Span::raw("(no output)").dim()]));
+    }
+    let shown = if lines.len() > 5 { 3 } else { lines.len() };
+    for (i, line) in lines.iter().take(shown).enumerate() {
+        let lead = if i == 0 { elbow() } else { gap() };
+        let line = Line::from(started(Some(line)).unwrap_or_else(|| line.to_string())).dim();
+        out.extend(wrap(line, width, lead, gap()).into_iter().take(2));
+    }
+    if lines.len() > shown {
+        out.push(Line::from(vec![
+            gap(),
+            Span::raw(format!("… +{} lines", lines.len() - shown)).dim(),
+        ]));
     }
     out
 }
@@ -516,11 +564,11 @@ mod tests {
     }
 
     #[test]
-    fn starting_an_agent_reads_as_one_line() {
+    fn a_command_line_says_each_known_command() {
         let output = r#"{"bot":"calc.fix","bot_id":2,"handle":"turn:calc.fix/2","status":"running","turn":2}"#;
         let rows = tool(
             "shell",
-            &serde_json::json!({"command":"cd /tmp && agent run --detach"}),
+            &serde_json::json!({"command":"cd /tmp && agent run --detach --bot calc.fix -- 'Go'"}),
             Some(output),
             false,
             "/",
@@ -529,7 +577,9 @@ mod tests {
         assert_eq!(
             text(&rows),
             [
-                "• Ran cd /tmp && agent run --detach",
+                "• Ran cd /tmp",
+                "• Messaged calc.fix",
+                "  └ Go",
                 "  └ started calc.fix, turn 2"
             ]
         );

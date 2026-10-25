@@ -1,8 +1,8 @@
 //! Shell commands Sonny knows the meaning of, said as what they do: an
 //! `agent` call starts, messages, waits on or removes an agent; a `rex` call
-//! opens, reads or types into a window; the plan skill sets the plan. Only a
-//! command that is one such call is read this way; anything else, a pipe or
-//! a `;` included, is shown as the command it is.
+//! opens, reads or types into a window; the plan skill sets the plan. A
+//! command line is read a command at a time; a command with a pipe, a
+//! redirect or a substitution is shown as the command it is.
 use ratatui::{
     style::{Color, Stylize},
     text::{Line, Span},
@@ -45,6 +45,53 @@ pub fn said(command: &str, output: &str, failed: bool) -> Option<Said> {
         }
         _ => None,
     }
+}
+
+/// A command line's commands, split where `;`, `&&`, `||` or a newline
+/// end one outside quotes. Pipes stay inside a command.
+pub fn parts(command: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut part = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some('"'), '\\') => {
+                part.push(c);
+                if let Some(next) = chars.next() {
+                    part.push(next);
+                }
+                continue;
+            }
+            (Some(_), _) => {}
+            (None, '\'' | '"') => quote = Some(c),
+            (None, '\\') => {
+                part.push(c);
+                if let Some(next) = chars.next() {
+                    part.push(next);
+                }
+                continue;
+            }
+            (None, ';' | '\n') => {
+                parts.push(std::mem::take(&mut part));
+                continue;
+            }
+            (None, '&' | '|') if chars.peek() == Some(&c) => {
+                chars.next();
+                parts.push(std::mem::take(&mut part));
+                continue;
+            }
+            _ => {}
+        }
+        part.push(c);
+    }
+    parts.push(part);
+    parts
+        .into_iter()
+        .map(|p| p.trim().to_owned())
+        .filter(|p| !p.is_empty())
+        .collect()
 }
 
 /// A command's words as the shell would split them, without expanding
@@ -540,6 +587,21 @@ Keep the rest.'"#,
 
     fn said_or_none(command: &str, output: &str) -> Said {
         said(command, output, false).unwrap()
+    }
+
+    #[test]
+    fn a_command_line_splits_into_its_commands_outside_quotes() {
+        assert_eq!(
+            parts(
+                "ls \"$HOME/.agent\"; \"$AGENT_BIN\" run --bot x -- 'a; b && c' && env | grep rex\npwd"
+            ),
+            [
+                "ls \"$HOME/.agent\"",
+                "\"$AGENT_BIN\" run --bot x -- 'a; b && c'",
+                "env | grep rex",
+                "pwd"
+            ]
+        );
     }
 
     #[test]
