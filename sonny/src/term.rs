@@ -1,25 +1,35 @@
-//! What the terminal can do, asked once at start: its background (OSC 11),
-//! so tints read on light and dark; whether it draws Kitty graphics; and
-//! its cell size in pixels, so an image fills whole cells.
-//! `SONNY_THEME=light|dark` decides the background instead; Rex, which
-//! does not answer OSC 11, is taken as light, its default.
+//! What the terminal can do, asked at start: its background (OSC 11, or
+//! the colour scheme it reports, mode 2031), so tints read on light and
+//! dark; whether it draws Kitty graphics; and its cell size in pixels, so
+//! an image fills whole cells. A terminal that follows the Mac's light and
+//! dark appearance (Rex does) is followed as it switches.
 use std::{
     io::Write,
-    sync::OnceLock,
+    sync::{
+        OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 struct Probe {
-    light: bool,
     graphics: bool,
-    /// A cell's width and height in pixels.
+    /// A cell's width and height in pixels, as answered at start.
     cell: (u32, u32),
 }
 
 static PROBE: OnceLock<Probe> = OnceLock::new();
+static LIGHT: AtomicBool = AtomicBool::new(true);
+/// The background changed since [`switched`] was last asked.
+static SWITCHED: AtomicBool = AtomicBool::new(false);
 
 pub fn light() -> bool {
-    PROBE.get().is_some_and(|p| p.light)
+    LIGHT.load(Ordering::Relaxed)
+}
+
+/// Whether the background switched between light and dark since asked.
+pub fn switched() -> bool {
+    SWITCHED.swap(false, Ordering::Relaxed)
 }
 
 /// Whether images can be drawn: Kitty graphics answered OK.
@@ -27,7 +37,21 @@ pub fn graphics() -> bool {
     PROBE.get().is_some_and(|p| p.graphics)
 }
 
+/// A cell's size in pixels: as the terminal gives it now with the window
+/// size, else as it answered at start (Rex answers 8×16 for a block it has
+/// not laid out yet, and the real size once it has).
 pub fn cell() -> (u32, u32) {
+    if let Ok(size) = ratatui::crossterm::terminal::window_size()
+        && size.columns > 0
+        && size.rows > 0
+        && size.width >= size.columns
+        && size.height >= size.rows
+    {
+        return (
+            (size.width / size.columns) as u32,
+            (size.height / size.rows) as u32,
+        );
+    }
     PROBE.get().map_or((8, 16), |p| p.cell)
 }
 
@@ -35,31 +59,63 @@ pub fn cell() -> (u32, u32) {
 /// the answers arrive on stdin.
 pub fn detect() {
     let reply = query().unwrap_or_default();
-    let light = match std::env::var("SONNY_THEME").as_deref() {
-        Ok("light") => true,
-        Ok("dark") => false,
-        _ => match parse(&reply) {
-            Some(rgb) => luminance(rgb) > 0.5,
-            None => fallback_light(),
-        },
-    };
+    let mac = appearance();
+    let light = parse(&reply)
+        .map(|rgb| luminance(rgb) > 0.5)
+        .or_else(|| scheme(&reply))
+        .or_else(colorfgbg)
+        .or(mac)
+        .unwrap_or(true);
+    LIGHT.store(light, Ordering::Relaxed);
     let _ = PROBE.set(Probe {
-        light,
         graphics: reply.contains("_Gi=31;OK"),
         cell: cell_size(&reply).unwrap_or((8, 16)),
     });
+    // A terminal on this Mac that matches its appearance now is taken to
+    // follow it, as Rex and Ghostty can.
+    if mac == Some(light) && std::env::var_os("SSH_CONNECTION").is_none() {
+        std::thread::spawn(|| {
+            loop {
+                std::thread::sleep(Duration::from_secs(3));
+                if let Some(now) = appearance()
+                    && LIGHT.swap(now, Ordering::Relaxed) != now
+                {
+                    SWITCHED.store(true, Ordering::Relaxed);
+                }
+            }
+        });
+    }
 }
 
-/// Without an answer to OSC 11: `COLORFGBG` (`15;0` is light on dark)
-/// when set, else Rex's own default, which is light. Rex does not answer
-/// OSC 11 yet.
-fn fallback_light() -> bool {
-    if let Ok(colours) = std::env::var("COLORFGBG")
-        && let Some(Ok(background)) = colours.rsplit(';').next().map(str::parse::<u8>)
-    {
-        return matches!(background, 7 | 15);
+/// The Mac's appearance: light unless `AppleInterfaceStyle` says Dark.
+fn appearance() -> Option<bool> {
+    if !cfg!(target_os = "macos") {
+        return None;
     }
-    std::env::var("TERM_PROGRAM").is_ok_and(|t| t == "rex")
+    let out = std::process::Command::new("defaults")
+        .args(["read", "-g", "AppleInterfaceStyle"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    Some(!String::from_utf8_lossy(&out.stdout).contains("Dark"))
+}
+
+/// The colour scheme a terminal reports (mode 2031): `CSI ? 997 ; 1 n`
+/// is dark, `2` light.
+fn scheme(reply: &str) -> Option<bool> {
+    let at = reply.find("\x1b[?997;")? + "\x1b[?997;".len();
+    match reply.as_bytes().get(at)? {
+        b'1' => Some(false),
+        b'2' => Some(true),
+        _ => None,
+    }
+}
+
+/// `COLORFGBG` (`15;0` is light on dark), when set.
+fn colorfgbg() -> Option<bool> {
+    let colours = std::env::var("COLORFGBG").ok()?;
+    let background = colours.rsplit(';').next()?.parse::<u8>().ok()?;
+    Some(matches!(background, 7 | 15))
 }
 
 /// OSC 11, a Kitty graphics query and the cell size, then DA1, which every
@@ -68,7 +124,7 @@ fn query() -> Option<String> {
     let mut stdout = std::io::stdout();
     write!(
         stdout,
-        "\x1b]11;?\x1b\\\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[16t\x1b[c"
+        "\x1b]11;?\x1b\\\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[16t\x1b[?996n\x1b[c"
     )
     .ok()?;
     stdout.flush().ok()?;

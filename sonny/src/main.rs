@@ -10,6 +10,7 @@
 //! says how long the turn has run and how to stop it.
 mod calls;
 mod diff;
+mod html;
 mod image;
 mod js;
 mod math;
@@ -33,7 +34,10 @@ use ratatui::{
             KeyModifiers,
         },
         execute,
-        terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+        terminal::{
+            Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+            enable_raw_mode,
+        },
     },
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style, Stylize},
@@ -500,6 +504,8 @@ struct App {
     options: Options,
     /// The lead's connection dropped.
     down: bool,
+    /// The background switched: the conversation is drawn again once idle.
+    repaint: bool,
     /// When to connect again, while it or the fleet's is down.
     retry: Option<Instant>,
 }
@@ -546,6 +552,8 @@ impl Fleet {
         // The lead's Sonny rings for the whole project; a task's is quiet.
         let command = vec![
             me.to_string_lossy().into_owned(),
+            "--store".into(),
+            options.store.to_string_lossy().into_owned(),
             "--socket".into(),
             options.socket.to_string_lossy().into_owned(),
             "--no-sound".into(),
@@ -794,6 +802,7 @@ impl App {
             replay: None,
             options,
             down: false,
+            repaint: false,
             retry: None,
         }
     }
@@ -901,7 +910,39 @@ impl App {
             if self.retry.is_some_and(|at| at <= Instant::now()) {
                 self.reattach(events).await;
             }
+            self.repaint |= term::switched();
+            if self.repaint && self.running.is_none() && self.watch.is_none() {
+                self.repaint = false;
+                self.repaint(terminal).await?;
+            }
         }
+    }
+
+    /// The conversation drawn again in the background's new colours, once
+    /// no turn is running: the screen and scrollback cleared, and the
+    /// bot's items read again as on attach.
+    async fn repaint(&mut self, terminal: &mut Tui) -> Result<(), String> {
+        execute!(
+            std::io::stdout(),
+            Clear(ClearType::Purge),
+            Clear(ClearType::All),
+            ratatui::crossterm::cursor::MoveTo(0, 0)
+        )
+        .map_err(|e| e.to_string())?;
+        *terminal = Terminal::with_options(
+            CrosstermBackend::new(std::io::stdout()),
+            TerminalOptions {
+                viewport: Viewport::Inline(VIEWPORT),
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        self.pending.clear();
+        self.held.clear();
+        self.live = None;
+        self.any_history = false;
+        self.seen_node = 0;
+        self.history().await;
+        Ok(())
     }
 
     /// The connection is gone: the daemon drops a reader that falls

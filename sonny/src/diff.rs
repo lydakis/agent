@@ -399,7 +399,7 @@ mod tests {
         let strong: Vec<&str> = lines[1]
             .spans
             .iter()
-            .filter(|s| s.style.bg == Some(DARK.removed_word))
+            .filter(|s| s.style.bg == Some(palette().removed_word))
             .map(|s| s.content.as_ref())
             .collect();
         assert!(strong.concat().contains("(len(values) - 1)"), "{strong:?}");

@@ -69,8 +69,81 @@ pub fn svg(text: &str, width: usize) -> Result<Vec<Line<'static>>, String> {
     Ok(placeholders(id, cols, rows))
 }
 
+/// The pane's width as it is now, should it have narrowed since `width`
+/// was read: a picture wider than its pane wraps into nonsense.
+fn now(width: usize) -> usize {
+    ratatui::crossterm::terminal::size().map_or(width, |(cols, _)| width.min(cols as usize))
+}
+
+/// How many of a picture's pixels a cell is wide, at the scale it is drawn.
+fn up(cell_h: u32) -> u32 {
+    if cell_h >= RETINA_CELL { 1 } else { 2 }
+}
+
+/// The columns a page is laid out across, in CSS pixels at twice that in
+/// the screen's: as wide as the pane, within reason.
+pub fn page_width(width: usize) -> u32 {
+    let (cell_w, cell_h) = crate::term::cell();
+    let cols = (width.saturating_sub(4) as u32).clamp(1, DIACRITICS.len() as u32);
+    (cols * cell_w * up(cell_h) / 2).clamp(320, 960)
+}
+
+/// A page's picture as rows of placeholder cells, its blank end cut off
+/// and drawn at its own size: as wide as it is, and its top [`ROWS`] rows
+/// when it is longer. Says whether it was cut.
+pub fn page(png: &[u8], width: usize) -> Result<(Vec<Line<'static>>, bool), String> {
+    let width = now(width);
+    let shot = tiny_skia::Pixmap::decode_png(png).map_err(|e| e.to_string())?;
+    let (w, h) = trimmed(&shot);
+    let (cell_w, cell_h) = crate::term::cell();
+    let (cw, ch) = (cell_w * up(cell_h), cell_h * up(cell_h));
+    let most_cols = (width.saturating_sub(4) as u32).clamp(1, DIACRITICS.len() as u32);
+    let cols = w.div_ceil(cw).clamp(1, most_cols);
+    let scale = (cols * cw) as f32 / w as f32;
+    let scale = scale.min(1.0);
+    let tall = ((h as f32 * scale) as u32).div_ceil(ch).max(1);
+    let most_rows = ROWS.min(DIACRITICS.len() as u32);
+    let rows = tall.min(most_rows);
+    let mut canvas = tiny_skia::Pixmap::new(cols * cw, rows * ch).ok_or("image too large")?;
+    canvas.draw_pixmap(
+        0,
+        0,
+        shot.as_ref(),
+        &tiny_skia::PixmapPaint {
+            quality: tiny_skia::FilterQuality::Bicubic,
+            ..Default::default()
+        },
+        tiny_skia::Transform::from_scale(scale, scale),
+        None,
+    );
+    let png = canvas.encode_png().map_err(|e| e.to_string())?;
+    let id = next_id();
+    send(id, cols, rows, &png).map_err(|e| e.to_string())?;
+    Ok((placeholders(id, cols, rows), tall > rows))
+}
+
+/// The width and height a screenshot keeps once the rows and columns at
+/// its right and bottom that are all its background are dropped.
+fn trimmed(shot: &tiny_skia::Pixmap) -> (u32, u32) {
+    let (w, h) = (shot.width(), shot.height());
+    let pixels = shot.pixels();
+    let at = |x: u32, y: u32| pixels[(y * w + x) as usize];
+    let background = at(w - 1, h - 1);
+    let last_row = (0..h)
+        .rev()
+        .find(|&y| (0..w).any(|x| at(x, y) != background))
+        .unwrap_or(0);
+    let last_col = (0..w)
+        .rev()
+        .find(|&x| (0..=last_row).any(|y| at(x, y) != background))
+        .unwrap_or(0);
+    // A margin as wide as the page's own, about 16 CSS pixels.
+    ((last_col + 32).min(w), (last_row + 32).min(h))
+}
+
 /// The SVG as a PNG that fills `cols`×`rows` cells.
 pub fn render(text: &str, width: usize) -> Result<(Vec<u8>, u32, u32), String> {
+    let width = now(width);
     let mut options = usvg::Options {
         fontdb: fonts(),
         ..usvg::Options::default()
@@ -80,7 +153,7 @@ pub fn render(text: &str, width: usize) -> Result<(Vec<u8>, u32, u32), String> {
     let size = tree.size();
     let (cell_w, cell_h) = crate::term::cell();
     let (cols, rows) = fit(size.width(), size.height(), (cell_w, cell_h), width);
-    let up = if cell_h >= RETINA_CELL { 1 } else { 2 };
+    let up = up(cell_h);
     let (px_w, px_h) = (cols * cell_w * up, rows * cell_h * up);
     let mut pixmap = tiny_skia::Pixmap::new(px_w, px_h).ok_or("image too large")?;
     let scale = (px_w as f32 / size.width()).min(px_h as f32 / size.height());

@@ -336,21 +336,10 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
 /// The HTML page a reply showed last, for `/open`.
 pub static PAGE: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
 
-/// A ```html fence: its first lines as code, and the page kept in a file
-/// that `/open` shows in the browser. A terminal cannot lay out HTML.
+/// A ```html fence, drawn as the page by a headless browser and kept in
+/// a file `/open` shows in the browser; its first lines as code where it
+/// cannot be drawn.
 fn page(source: &str, width: usize) -> Vec<Line<'static>> {
-    let lines: Vec<&str> = source.lines().collect();
-    let shown = if lines.len() > 8 { 6 } else { lines.len() };
-    let mut out: Vec<Line<'static>> = lines[..shown]
-        .iter()
-        .flat_map(|line| {
-            let code = Line::from(line.to_string()).fg(Color::Cyan);
-            wrap(code, width, Span::raw("    "), Span::raw("    "))
-        })
-        .collect();
-    if lines.len() > shown {
-        out.push(Line::from(format!("    … +{} lines", lines.len() - shown)).dim());
-    }
     let dir = std::env::temp_dir().join("sonny-pages");
     let name = format!(
         "{}-{}.html",
@@ -361,21 +350,43 @@ fn page(source: &str, width: usize) -> Vec<Line<'static>> {
             .as_millis()
     );
     let path = dir.join(name);
-    let saved = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, source));
-    out.push(match saved {
-        Ok(()) => {
-            let note = Line::from(vec![
-                Span::raw("    ↗ ").fg(Color::Cyan),
-                Span::raw("/open").bold(),
-                Span::raw(" shows it in your browser").dim(),
-            ]);
-            if let Ok(mut page) = PAGE.lock() {
-                *page = Some(path);
+    if let Err(error) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, source)) {
+        return vec![Line::from(format!("    could not keep the page: {error}")).dim()];
+    }
+    let drawn = match crate::term::graphics() {
+        true => crate::html::render(&path, crate::image::page_width(width))
+            .and_then(|png| crate::image::page(&png, width)),
+        false => Err(String::new()),
+    };
+    let (mut out, more) = match drawn {
+        Ok((rows, cut)) => (rows, if cut { " for the rest" } else { "" }),
+        Err(error) => {
+            let lines: Vec<&str> = source.lines().collect();
+            let shown = if lines.len() > 8 { 6 } else { lines.len() };
+            let mut out: Vec<Line<'static>> = lines[..shown]
+                .iter()
+                .flat_map(|line| {
+                    let code = Line::from(line.to_string()).fg(Color::Cyan);
+                    wrap(code, width, Span::raw("    "), Span::raw("    "))
+                })
+                .collect();
+            if lines.len() > shown {
+                out.push(Line::from(format!("    … +{} lines", lines.len() - shown)).dim());
             }
-            note
+            if !error.is_empty() {
+                out.push(Line::from(format!("    could not draw it: {error}")).dim());
+            }
+            (out, "")
         }
-        Err(error) => Line::from(format!("    could not keep the page: {error}")).dim(),
-    });
+    };
+    out.push(Line::from(vec![
+        Span::raw("    ↗ ").fg(Color::Cyan),
+        Span::raw("/open").bold(),
+        Span::raw(more).dim(),
+    ]));
+    if let Ok(mut page) = PAGE.lock() {
+        *page = Some(path);
+    }
     out
 }
 
