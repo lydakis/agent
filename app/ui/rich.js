@@ -259,7 +259,8 @@ window.Rich = (() => {
     const key = `${box.dataset.kind}|${box.dataset.lang ?? ''}|${box.clientWidth}|${src}`;
     const show = (svg) => {
       if (box.isConnected === false) return;
-      if (auto && drawnChars() + svg.length > DRAWN_CHARS) { delete box.dataset.asked; note(box, FULL); return; }
+      // Counting also lets go of the blocks gone from the document, so every drawing counts.
+      if (drawnChars() + svg.length > DRAWN_CHARS && auto) { delete box.dataset.asked; note(box, FULL); return; }
       const id = `d${++ids}`;
       drawn.set(box, svg.length);
       settle(box, () => { box.querySelector('.view').innerHTML = svg.replace(ID_USE, `$1${id}`); box.dataset.view = 'view'; box.dataset.drawn = ''; });
