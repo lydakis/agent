@@ -288,26 +288,39 @@ pub fn tool(
                 && !serde_json::from_str::<Value>(line)
                     .is_ok_and(|v| v.get("project").is_some() && v.get("user").is_some())
         });
-        let count = parts.len();
-        // The rest of the output goes under the last command shown as run.
-        let last_ran = said.iter().rposition(Option::is_none);
+        // Commands next to each other that are only run read as one, and
+        // the rest of the output goes under the last of them.
+        let mut groups: Vec<Result<crate::calls::Said, Vec<&str>>> = Vec::new();
+        for (part, said) in parts.iter().zip(said) {
+            match (said, groups.last_mut()) {
+                (Some(said), _) => groups.push(Ok(said)),
+                (None, Some(Err(ran))) => ran.push(part.as_str()),
+                (None, _) => groups.push(Err(vec![part.as_str()])),
+            }
+        }
+        let count = groups.len();
+        let last_ran = groups.iter().rposition(Result::is_err);
         let rest = printed.join("\n");
-        for (i, (part, said)) in parts.iter().zip(said).enumerate() {
-            match said {
-                Some(mut said) => {
+        for (i, group) in groups.into_iter().enumerate() {
+            match group {
+                Ok(mut said) => {
                     said.failed |= failed && i + 1 == count;
                     out.extend(said_lines(said, width));
                 }
-                None => {
+                Err(ran) => {
                     let bullet = if failed && i + 1 == count {
                         Span::raw("• ").fg(Color::Red)
                     } else {
                         Span::raw("• ").fg(Color::Green)
                     };
+                    let commands: Vec<&str> = ran
+                        .iter()
+                        .map(|part| part.lines().next().unwrap_or(""))
+                        .collect();
                     let line = Line::from(vec![
                         Span::raw("Ran").bold(),
                         Span::raw(" "),
-                        Span::raw(part.lines().next().unwrap_or("").to_owned()),
+                        Span::raw(commands.join("; ")),
                     ]);
                     out.extend(wrap(line, width, bullet, gap()));
                     if Some(i) == last_ran && !rest.trim().is_empty() {

@@ -539,7 +539,12 @@ fn sonny_show(words: &[String], failed: bool) -> Option<Said> {
     let (verb, what) = match args.value(&["--split"]) {
         Some(side) => {
             let beside = args.value(&["--beside"]).unwrap_or("you");
-            ("Moved", format!("{bot} to a split {side} of {beside}"))
+            let side = match side {
+                "right" => "right of",
+                "left" => "left of",
+                other => other,
+            };
+            ("Moved", format!("{bot} to a split {side} {beside}"))
         }
         None => ("Moved", format!("{bot} to a tab of its own")),
     };

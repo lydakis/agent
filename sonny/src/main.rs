@@ -399,8 +399,10 @@ struct Fleet {
     command: Vec<String>,
     /// Said once in the status row when Rex is set up.
     note: Option<String>,
-    /// What each bot's window says it is doing.
+    /// What each bot is doing, as its window says.
     doing: HashMap<String, &'static str>,
+    /// The name each window was given.
+    named: HashMap<String, String>,
 }
 
 impl Fleet {
@@ -434,6 +436,7 @@ impl Fleet {
             command,
             note: Some(note),
             doing: HashMap::new(),
+            named: HashMap::new(),
         };
         fleet.rex.adopt_own(lead);
         fleet.doing(lead, "idle");
@@ -450,11 +453,18 @@ impl Fleet {
                     continue;
                 };
                 fleet.lineage.insert(name.to_owned());
-                if name != lead && !bot["running_turn"].is_null() {
+                let running = !bot["running_turn"].is_null();
+                if name != lead {
+                    fleet
+                        .doing
+                        .insert(name.to_owned(), if running { "working" } else { "idle" });
+                }
+                if name != lead && running {
                     let _ = fleet.show(name);
                 }
             }
         }
+        fleet.name_windows();
         Some(fleet)
     }
 
@@ -463,11 +473,7 @@ impl Fleet {
         command.extend(["--bot".into(), bot.into()]);
         let name = format!("{} · working", self.short(bot));
         let opened = self.rex.show(bot, &name, &command)?;
-        if opened {
-            self.doing.insert(bot.to_owned(), "working");
-        } else {
-            self.doing(bot, "working");
-        }
+        self.doing(bot, "working");
         Ok(opened)
     }
 
@@ -480,12 +486,45 @@ impl Fleet {
             .unwrap_or(bot)
     }
 
-    /// Name the bot's window after what it is doing, when that changed.
+    /// Note what the bot is doing, and name the windows after it.
     fn doing(&mut self, bot: &str, doing: &'static str) {
         if self.doing.get(bot) != Some(&doing) {
             self.doing.insert(bot.to_owned(), doing);
-            self.rex
-                .name(bot, &format!("{} · {doing}", self.short(bot)));
+            self.name_windows();
+        }
+    }
+
+    /// Each window holding the project's bots is named after the lead, or
+    /// its first bot, and what that bot is doing, with a count of the others
+    /// that are working or need the person: `lead · done · 2 working`.
+    fn name_windows(&mut self) {
+        for (window, labels) in self.rex.windows() {
+            let bots: Vec<&String> = labels
+                .iter()
+                .filter(|l| self.doing.contains_key(*l))
+                .collect();
+            let Some(first) = bots
+                .iter()
+                .find(|b| **b == &self.lead)
+                .or_else(|| bots.first())
+                .copied()
+            else {
+                continue;
+            };
+            let mut name = format!("{} · {}", self.short(first), self.doing[first]);
+            for state in ["needs you", "working"] {
+                let others = bots
+                    .iter()
+                    .filter(|b| **b != first && self.doing.get(**b) == Some(&state))
+                    .count();
+                if others > 0 {
+                    name.push_str(&format!(" · {others} {state}"));
+                }
+            }
+            if self.named.get(&window) != Some(&name) {
+                self.rex.rename_window(&window, &name);
+                self.named.insert(window, name);
+            }
         }
     }
 
@@ -534,7 +573,7 @@ impl Fleet {
                 None
             }
             "accepted" if bot != self.lead && self.lineage.contains(bot) => match self.show(bot) {
-                Ok(true) => Some(format!("{bot} opened in Rex ({})", self.rex.label)),
+                Ok(true) => Some(format!("{bot} is in Rex ({})", self.rex.label)),
                 Ok(false) => None,
                 Err(error) => Some(error),
             },

@@ -35,13 +35,7 @@ pub struct Rex {
     pub session: String,
     pub label: String,
     /// Each task's block, by bot name.
-    blocks: HashMap<String, Placed>,
-}
-
-struct Placed {
-    block: String,
-    /// The window the block has to itself, named after it.
-    window: Option<String>,
+    blocks: HashMap<String, String>,
 }
 
 /// Where `sonny show` puts a task.
@@ -128,20 +122,12 @@ impl Rex {
             .collect()
     }
 
-    /// A block already labelled with the bot's name, and its window when the
-    /// block is alone in it.
+    /// A block already labelled with the bot's name.
     fn adopt(&mut self, bot: &str, listed: &[Listed]) -> bool {
         let Some(found) = listed.iter().find(|b| b.label == bot) else {
             return false;
         };
-        let alone = listed.iter().filter(|b| b.window == found.window).count() == 1;
-        self.blocks.insert(
-            bot.to_owned(),
-            Placed {
-                block: found.block.clone(),
-                window: alone.then(|| found.window.clone()),
-            },
-        );
+        self.blocks.insert(bot.to_owned(), found.block.clone());
         true
     }
 
@@ -150,8 +136,8 @@ impl Rex {
     /// person's focus stays where it is.
     pub fn show(&mut self, bot: &str, name: &str, command: &[String]) -> Result<bool, String> {
         let listed = self.listed();
-        if let Some(placed) = self.blocks.get(bot)
-            && listed.iter().any(|b| b.block == placed.block)
+        if let Some(block) = self.blocks.get(bot)
+            && listed.iter().any(|b| &b.block == block)
         {
             return Ok(false);
         }
@@ -196,25 +182,36 @@ impl Rex {
             .as_str()
             .ok_or("rex: no block id in the reply")?
             .to_owned();
-        let window = made["window_id"].as_str().map(str::to_owned);
-        if window.is_some() {
+        if made["window_id"].is_string() {
             // `window new` names the window; the block is named after the
             // bot, so it can be found, and anchored on, by that name.
             let _ = self.call(&["block", "rename", &block, bot, "-s", &self.session]);
         }
-        self.blocks.insert(bot.to_owned(), Placed { block, window });
+        self.blocks.insert(bot.to_owned(), block);
         Ok(())
     }
 
-    /// Name the window a bot has to itself.
-    pub fn name(&self, bot: &str, name: &str) {
-        if let Some(window) = self.blocks.get(bot).and_then(|p| p.window.as_deref()) {
-            let _ = self.call(&["window", "rename", window, name, "-s", &self.session]);
+    /// Each window and the labels of its blocks, in Rex's order.
+    pub fn windows(&self) -> Vec<(String, Vec<String>)> {
+        let mut windows: Vec<(String, Vec<String>)> = Vec::new();
+        for block in self.listed() {
+            match windows
+                .iter_mut()
+                .find(|(window, _)| *window == block.window)
+            {
+                Some((_, labels)) => labels.push(block.label),
+                None => windows.push((block.window, vec![block.label])),
+            }
         }
+        windows
     }
 
-    /// Take on the block Sonny itself runs in, when in this session: named
-    /// after the bot, its window after what the bot is doing.
+    pub fn rename_window(&self, window: &str, name: &str) {
+        let _ = self.call(&["window", "rename", window, name, "-s", &self.session]);
+    }
+
+    /// Take on the block Sonny itself runs in, when in this session, named
+    /// after the bot.
     pub fn adopt_own(&mut self, bot: &str) {
         let mine = std::env::var("REX_BLOCK").unwrap_or_default();
         let listed = self.listed();
@@ -228,20 +225,13 @@ impl Rex {
         if own.label != bot {
             let _ = self.call(&["block", "rename", &own.block, bot, "-s", &self.session]);
         }
-        let alone = listed.iter().filter(|b| b.window == own.window).count() == 1;
-        self.blocks.insert(
-            bot.to_owned(),
-            Placed {
-                block: own.block.clone(),
-                window: alone.then(|| own.window.clone()),
-            },
-        );
+        self.blocks.insert(bot.to_owned(), own.block.clone());
     }
 
     /// Close every other block labelled with the bot's name, as one Sonny
     /// opened for the task while this one placed it.
     pub fn close_others(&mut self, bot: &str) {
-        let Some(mine) = self.blocks.get(bot).map(|p| p.block.clone()) else {
+        let Some(mine) = self.blocks.get(bot).cloned() else {
             return;
         };
         for other in self
@@ -255,7 +245,7 @@ impl Rex {
 
     /// Close a task's block, as when its bot is deleted.
     pub fn close(&mut self, bot: &str) {
-        let known = self.blocks.remove(bot).map(|p| p.block);
+        let known = self.blocks.remove(bot);
         for block in self
             .listed()
             .into_iter()
