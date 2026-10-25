@@ -846,7 +846,7 @@ test('CSS string escaping removes literal line controls and preserves escaped qu
   assert.equal(cssEsc('a\n\r\f"\\z'), 'a\\a \\d \\c \\"\\\\z');
 });
 
-test('incomplete creation events fail explicitly without a resume round trip', async () => {
+test('incomplete creation events fail explicitly without an inspect round trip', async () => {
   let requests = 0; const p = page({request:async () => {requests++; return {name:'bad'};}});
   await assert.rejects(p.onEvent({event:'created',bot:'bad',data:{}}), /invalid_created_event/);
   assert.equal(requests,0); assert.equal(p.S.bots.has('bad'),false);
@@ -2155,7 +2155,7 @@ test('a failed first message waits in the side chat\'s composer', async () => {
   p.setSend('side');
   side.value = 'what now?'; await p.context.document.getElementById('sideform').listeners.submit({ preventDefault() {} });
   assert.equal(p.S.ui.side, 'task-side'); assert.equal(side.value, 'what now?'); assert.equal(main.value, '');
-  assert.deepEqual(sent.filter(([op]) => op === 'resume'), [], 'a side chat needs nothing from its source first');
+  assert.deepEqual(sent.filter(([op]) => op === 'inspect'), [], 'a side chat needs nothing from its source first');
 });
 
 test('a bot in a linked worktree shows its branch in its head, read once per folder', async () => {

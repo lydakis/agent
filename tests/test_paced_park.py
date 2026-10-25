@@ -43,7 +43,7 @@ class PacedParkTests(ModelFixture):
         # A paced turn is still the bot's current turn: busy to submit and
         # interruptible, whether caught parked or in a live attempt.
         self.assertEqual(client.request('submit', bot='a0', request_id='again', prompt='x')['error'], 'bot_busy')
-        self.assertIn(client.request('resume', bot='a0')['result']['status'], ('paced', 'running'))
+        self.assertIn(client.request('inspect', bot='a0')['result']['status'], ('paced', 'running'))
         self.assertIn('interrupt_requested', client.request('interrupt', bot='a0', turn=throttled[0]['turn'])['result'])
         self.assertEqual(client.finished(throttled[0]['turn'])['data']['status'], 'interrupted')
         for t in throttled[1:]:
@@ -62,7 +62,7 @@ class PacedParkTests(ModelFixture):
         healthy = client.request('submit', bot='Healthy', request_id='h', prompt='hello', delivery='queue')['result']['turn']
         ended = client.receive(lambda m: m.get('event') == 'turn_finished' and m.get('turn') == healthy, timeout=2)
         self.assertEqual(ended['data']['status'], 'completed')
-        self.assertEqual(client.request('resume', bot='Blocked')['result']['status'], 'paced')
+        self.assertEqual(client.request('inspect', bot='Blocked')['result']['status'], 'paced')
         # Admission waiting did not send a call or spend a retry.
         self.assertEqual(self.model.requests.qsize(), 2)
         row = client.request('turns', bot='Blocked')['result']['turns'][0]

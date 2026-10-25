@@ -107,10 +107,10 @@ class AdapterTests(unittest.TestCase):
             client.close(kill=True)
             client = self.start(store)
             # Bob exists with no answered turn; a name never created stays absent.
-            self.assertEqual(client.request('resume', bot='bob')['result'], {'status': 'not_completed'})
+            self.assertEqual(client.request('inspect', bot='bob')['result'], {'status': 'not_completed'})
             self.assertEqual(client.request('transcript', bot='bob')['result'], {'entries': []})
             for _ in range(2):
-                self.assertEqual(client.request('resume', bot='alice')['error'], {'code': 'bot_not_found'})
+                self.assertEqual(client.request('inspect', bot='alice')['error'], {'code': 'bot_not_found'})
             created_again = client.request('create', bot='alice', workspace=directory)['result']
             self.assertNotEqual(created_again['conversation'], created['conversation'])
             self.assertEqual(client.request('entry', bot='bob', entry=10**9)['error'], {'code': 'entry_not_found'})

@@ -103,7 +103,7 @@ class SocketClient:
         response = self.control.request(op, **params)
         if 'result' not in response:
             return response
-        if op in ('create', 'resume') and params['bot'] not in self.followers:
+        if op in ('create', 'inspect') and params['bot'] not in self.followers:
             bot = params['bot']
             follower = Connection(self.socket_path)
             self.followers[bot] = follower

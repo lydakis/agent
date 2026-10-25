@@ -45,7 +45,7 @@ in [`Service::dispatch`](../src/server/mod.rs); storage execution is in
 
 | Read | Current execution path |
 | --- | --- |
-| `bots`, `turns`, `resume` inspection, `events`, `artifact`, store counts for `stats` | Storage worker shared with writes |
+| `bots`, `turns`, `inspect`, `events`, `artifact`, store counts for `stats` | Storage worker shared with writes |
 | `history_nodes`, `history_items` | Reader shared with model-context construction |
 | `follow` | Bot inspection and replay on the worker; live delivery through the hub |
 | `wait` | Handle registration and settlement against durable outcomes |
@@ -70,7 +70,7 @@ features, not prerequisites for measuring the observation path.
 ### Implementation boundary
 
 Move the observation reads above to a separate read-only connection, leaving
-the context reader for model requests. Route `resume`'s inspection and
+the context reader for model requests. Route `inspect` and
 `follow`'s initial bot lookup through it too. Keep decisions coupled to
 writes, including handle settlement for `wait`, on the worker. This is a
 change to the current protocol path, not an optional alternate mode.
@@ -89,7 +89,7 @@ The implementation must satisfy the whole path from admission to delivery:
    protocol instead of materializing the whole value. Size large blobs
    before loading them; reserve encoding overhead as well as payload
    bytes. Artifact reads require a named stream and a bounded page.
-   `resume` returns a bounded bot view: `instructions` and
+   `inspect` returns a bounded bot view: `instructions` and
    `compaction_instructions` (64 KiB each today) are read through the
    range protocol rather than inlined. Bound the SQLite work behind a
    page, not only its output: oldest-first `history_nodes` orders the
@@ -143,7 +143,7 @@ tests, not claims about tests already written or passed.
 | A stopped reader, cancellation, and disconnect | Byte charges persist through socket delivery, then release; queued work and session/subscription counts return to baseline. |
 | Idle and stopped followers, both one-bot and fleet-wide | Admission and output stay bounded; closure is explicit; reconnect replays the retained interval. |
 | Commits during replay and a burst of tail attachments | Durable stream equals replay without gaps or duplicates, including quiet bots, retention notices, and restart. |
-| Deepest pages of a long history, and `resume` on a bot with maximal instructions | Each chunk's work stays bounded and resumable regardless of history depth; the bot view fits the page ceiling and its long fields reassemble exactly. |
+| Deepest pages of a long history, and `inspect` on a bot with maximal instructions | Each chunk's work stays bounded and resumable regardless of history depth; the bot view fits the page ceiling and its long fields reassemble exactly. |
 | Delete and recreate a followed bot's name during replay | The follow ends with a replacement notice and never delivers the new bot's events. |
 | Existing CLI and app consumers | Their history, artifact, result, and follow flows still work through the bounded protocol. |
 
@@ -408,14 +408,14 @@ The candidate move protocol has these ownership boundaries:
 | Cancel after the cut | Require the destination's durable refusal of that nonce, issued only if it has not imported it. An unreachable destination leaves the source fenced; any operator override must state the duplicate-execution risk. |
 
 Tombstones route supported bot queries and controls with `bot_moved`:
-submissions, `resume`, `follow`, old/new `wait`s, `interrupt`, and
+submissions, `inspect`, `follow`, old/new `wait`s, `interrupt`, and
 fork/history access. The route identifies the destination store and bot;
 operations naming a turn or node use the corresponding target reference
 or the refresh path above. Unsupported operations fail explicitly instead
 of presenting a stale local bot. Resolve already registered waiters too,
 and emit a durable `bot_moved` event for existing followers and reconnects.
-Clients follow that route: `follow` and `interrupt` currently inspect via
-`resume`, so both must handle a moved response there as well as on the
+Clients follow that route: `follow` and `interrupt` currently look the bot up
+through `inspect`, so both must handle a moved response there as well as on the
 later operation. Send cancellation to the remapped target turn. The
 caller resolves the destination instance through its configured endpoints;
 an unknown or unavailable destination produces an explicit error. Endpoint

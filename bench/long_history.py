@@ -97,7 +97,7 @@ def run(binary, out, items, context_bytes, context_items):
     server.seen.clear()
     # Measure readiness and the subsequent resume request separately.
     c, startup_ms = timed(client)
-    head, resume_only_ms = timed(lambda: c.request('resume', bot='long')['result']['head'])
+    head, resume_only_ms = timed(lambda: c.request('inspect', bot='long')['result']['head'])
     daemon = psutil.Process(c.process.pid)
     rss_after_resume = daemon.memory_info().rss
     _, turn_ms = timed(lambda: turn(c, 'long', 'measured', 'measured turn ' + FILLER))

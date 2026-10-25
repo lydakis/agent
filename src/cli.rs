@@ -57,6 +57,14 @@ const COMMANDS: &[Command] = &[
         startup: false,
     },
     Command {
+        name: "inspect",
+        about: "A bot's whole record: model, tools, gates, settings, instructions, tokens",
+        usage: "inspect --bot NAME [--bot-id N]",
+        flags: "--bot --bot-id --pretty --no-spawn",
+        settings: "",
+        startup: true,
+    },
+    Command {
         name: "turns",
         about: "A bot's turns and how each ended",
         usage: "turns --bot NAME [--after TURN] [--newest] [--limit N]",
@@ -67,8 +75,8 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "wait",
         about: "A turn's or command's result: status, text, usage; --timeout 0 polls",
-        usage: "wait [--any] [--timeout DURATION] HANDLE...",
-        flags: "--any --timeout --pretty",
+        usage: "wait [--any] [--timeout DURATION] HANDLE... | wait --bot NAME [--bot-id N] [--timeout DURATION]",
+        flags: "--bot --bot-id --any --timeout --pretty",
         settings: "",
         startup: false,
     },

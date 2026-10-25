@@ -358,7 +358,7 @@ class Soak:
         ready_s = round(time.monotonic() - started, 3)
         statuses = {}
         for _, name in self.bots:
-            state = self.control.request('resume', bot=name)['result']
+            state = self.control.request('inspect', bot=name)['result']
             statuses[state['status']] = statuses.get(state['status'], 0) + 1
         self.control.request('shutdown')
         self.client.close()

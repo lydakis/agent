@@ -184,7 +184,7 @@ def run_condition(binary, provider, family, url, key_env, env, model, condition,
             for turn in page_rows(client, 'turns', name):
                 results[name]['input_tokens'] += turn['input_tokens']
                 results[name]['output_tokens'] += turn['output_tokens']
-            results[name]['cache_hit'] = client.request('resume', bot=name)['result']['cache_hit']
+            results[name]['cache_hit'] = client.request('inspect', bot=name)['result']['cache_hit']
         client.request('shutdown')
         client.close()
     finally:
