@@ -123,6 +123,10 @@ fn show() -> Result<(), String> {
         None => rex::Placement::Window,
     };
     rex.place(&bot, short, &command, &placement)?;
+    // The lead's Sonny opens a window for a task whose turn starts, maybe
+    // while this placed it: what it opened then goes.
+    std::thread::sleep(Duration::from_millis(1500));
+    rex.close_others(&bot);
     println!("{}", json!({"bot": bot, "session": project}));
     Ok(())
 }
@@ -247,11 +251,7 @@ async fn run() -> Result<(), String> {
             .as_str()
             .is_some_and(|text| !text.contains("rex-windows"))
         {
-            app.notice = Some(
-                "this lead was made before the rex-windows skill: ask it to read \
-                 ~/.agents/skills/rex-windows/SKILL.md"
-                    .into(),
-            );
+            app.notice = Some("older lead: ask it to read the rex-windows skill".into());
         }
     }
     app.project = project;
@@ -902,15 +902,35 @@ impl App {
                 }
             }
             "message" => {
-                self.said.clear();
+                let item = match data["node"].as_i64() {
+                    Some(node) => self.items(&[node]).await.into_iter().next(),
+                    None => None,
+                }
+                .filter(|item| item["role"] == "assistant");
+                let said = std::mem::take(&mut self.said);
                 self.replay = None;
                 if self.streamed {
                     self.streamed = false;
-                    self.end_live();
-                } else if let Some(node) = data["node"].as_i64()
-                    && let Some(item) = self.items(&[node]).await.first()
-                    && item["role"] == "assistant"
-                {
+                    // The lines already ended stay; the rest is drawn from
+                    // the message as kept, not as streamed.
+                    if let Some(item) = &item
+                        && let Some(live) = &mut self.live
+                    {
+                        let ended = &said[..said.rfind('\n').map_or(0, |at| at + 1)];
+                        if let Some(rest) = text(item).strip_prefix(ended) {
+                            live.partial = rest.to_owned();
+                        }
+                    }
+                    if let Some(mut live) = self.live.take() {
+                        let rest = std::mem::take(&mut live.partial);
+                        let rest = rest.strip_suffix('\n').unwrap_or(&rest);
+                        if !rest.is_empty() {
+                            for line in rest.split('\n') {
+                                self.live_line(&mut live, line);
+                            }
+                        }
+                    }
+                } else if let Some(item) = &item {
                     let lines = transcript::reply(&text(item), self.width);
                     self.commit(lines);
                 }

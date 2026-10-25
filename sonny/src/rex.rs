@@ -238,6 +238,21 @@ impl Rex {
         );
     }
 
+    /// Close every other block labelled with the bot's name, as one Sonny
+    /// opened for the task while this one placed it.
+    pub fn close_others(&mut self, bot: &str) {
+        let Some(mine) = self.blocks.get(bot).map(|p| p.block.clone()) else {
+            return;
+        };
+        for other in self
+            .listed()
+            .into_iter()
+            .filter(|b| b.label == bot && b.block != mine)
+        {
+            let _ = self.call(&["block", "close", &other.block]);
+        }
+    }
+
     /// Close a task's block, as when its bot is deleted.
     pub fn close(&mut self, bot: &str) {
         let known = self.blocks.remove(bot).map(|p| p.block);

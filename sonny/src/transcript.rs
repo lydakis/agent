@@ -221,21 +221,7 @@ pub fn tool(
     if name == "shell"
         && let Some(said) = crate::calls::said(&field("command"), output.unwrap_or(""), failed)
     {
-        let bullet = if said.failed {
-            Span::raw("• ").fg(Color::Red)
-        } else {
-            Span::raw("• ").fg(Color::Green)
-        };
-        let mut spans = vec![Span::raw(said.verb).bold()];
-        if !said.what.is_empty() {
-            spans.extend([Span::raw(" "), Span::raw(said.what)]);
-        }
-        let mut out = wrap(Line::from(spans), width, bullet, gap());
-        for (i, line) in said.under.into_iter().enumerate() {
-            let lead = if i == 0 { elbow() } else { gap() };
-            out.extend(wrap(line, width, lead, gap()).into_iter().take(2));
-        }
-        return out;
+        return said_lines(said, width);
     }
     // Several commands in one call, some of them known: each on its own
     // line, said or shown, with what they printed together under the last.
@@ -257,25 +243,44 @@ pub fn tool(
                 )
             })
             .collect();
-        for (i, part) in parts.iter().enumerate() {
-            let bullet = if failed && i + 1 == parts.len() {
-                Span::raw("• ").fg(Color::Red)
-            } else {
-                Span::raw("• ").fg(Color::Green)
-            };
-            match crate::calls::said(part, "", false) {
-                Some(said) => {
-                    let mut spans = vec![Span::raw(said.verb).bold()];
-                    if !said.what.is_empty() {
-                        spans.extend([Span::raw(" "), Span::raw(said.what)]);
-                    }
-                    out.extend(wrap(Line::from(spans), width, bullet, gap()));
-                    for (i, line) in said.under.into_iter().enumerate() {
-                        let lead = if i == 0 { elbow() } else { gap() };
-                        out.extend(wrap(line, width, lead, gap()).into_iter().take(2));
-                    }
+        // What the agent calls printed goes back under the call that
+        // printed it; the rest goes under the last command.
+        let mut printed: Vec<&str> = output.unwrap_or("").lines().collect();
+        let mut claim = |is: &dyn Fn(&Value) -> bool| -> Option<String> {
+            let at = printed.iter().position(|line| {
+                serde_json::from_str::<Value>(line.trim()).is_ok_and(|v| is(&v))
+            })?;
+            Some(printed.remove(at).to_owned())
+        };
+        let mut said: Vec<Option<crate::calls::Said>> = Vec::new();
+        for part in &parts {
+            let mut own = String::new();
+            if let Some(first) = crate::calls::said(part, "", false) {
+                if matches!(
+                    first.verb.as_str(),
+                    "Started" | "Messaged" | "Queued for" | "Steered"
+                ) {
+                    own = claim(&|v| v.get("handle").is_some() || v.get("error").is_some())
+                        .unwrap_or_default();
+                } else if first.verb == "Moved" {
+                    claim(&|v| v.get("session").is_some() && v.get("bot").is_some());
+                }
+            }
+            said.push(crate::calls::said(part, &own, false));
+        }
+        let count = parts.len();
+        for (i, (part, said)) in parts.iter().zip(said).enumerate() {
+            match said {
+                Some(mut said) => {
+                    said.failed |= failed && i + 1 == count;
+                    out.extend(said_lines(said, width));
                 }
                 None => {
+                    let bullet = if failed && i + 1 == count {
+                        Span::raw("• ").fg(Color::Red)
+                    } else {
+                        Span::raw("• ").fg(Color::Green)
+                    };
                     let line = Line::from(vec![
                         Span::raw("Ran").bold(),
                         Span::raw(" "),
@@ -285,7 +290,10 @@ pub fn tool(
                 }
             }
         }
-        out.extend(preview(output.unwrap_or(""), width));
+        let rest = printed.join("\n");
+        if !rest.trim().is_empty() || count == 0 {
+            out.extend(preview(&rest, width));
+        }
         return out;
     }
     // A skill's instructions, read before following them.
@@ -357,6 +365,53 @@ pub fn tool(
         _ => {}
     }
     out
+}
+
+/// A call said as an action, with up to two rows of each line under it.
+fn said_lines(said: crate::calls::Said, width: usize) -> Vec<Line<'static>> {
+    let bullet = if said.failed {
+        Span::raw("• ").fg(Color::Red)
+    } else {
+        Span::raw("• ").fg(Color::Green)
+    };
+    let mut spans = vec![Span::raw(said.verb).bold()];
+    if !said.what.is_empty() {
+        spans.extend([Span::raw(" "), Span::raw(said.what)]);
+    }
+    let mut out = wrap(Line::from(spans), width, bullet, Span::raw("    "));
+    for (i, line) in said.under.into_iter().enumerate() {
+        let lead = if i == 0 {
+            Span::raw("  └ ").dim()
+        } else {
+            Span::raw("    ")
+        };
+        out.extend(capped(line, width, lead, 2));
+    }
+    out
+}
+
+/// A line wrapped to at most `rows` rows, the last ending in `…` when
+/// some was left out.
+fn capped(
+    line: Line<'static>,
+    width: usize,
+    lead: Span<'static>,
+    rows: usize,
+) -> Vec<Line<'static>> {
+    let style = line.style;
+    let mut wrapped = wrap(
+        line,
+        width.saturating_sub(1).max(8),
+        lead,
+        Span::raw("    "),
+    );
+    if wrapped.len() > rows {
+        wrapped.truncate(rows);
+        if let Some(last) = wrapped.last_mut() {
+            last.spans.push(Span::styled("…", style));
+        }
+    }
+    wrapped
 }
 
 /// A command's output: its first lines, or all of a few, and how many
@@ -586,12 +641,7 @@ mod tests {
         );
         assert_eq!(
             text(&rows),
-            [
-                "• Ran cd /tmp",
-                "• Messaged calc.fix",
-                "  └ Go",
-                "  └ started calc.fix, turn 2"
-            ]
+            ["• Ran cd /tmp", "• Messaged calc.fix · turn 2", "  └ Go"]
         );
     }
 
