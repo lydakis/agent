@@ -60,18 +60,25 @@ fn next_id() -> u32 {
     base | (NEXT.fetch_add(1, Ordering::Relaxed) % 255 + 1)
 }
 
-/// The SVG as rows of placeholder cells, its image already sent; or why
-/// it could not be drawn.
-pub fn svg(text: &str, width: usize) -> Result<Vec<Line<'static>>, String> {
-    let (png, cols, rows) = render(text, width)?;
+/// A picture ready to show: its PNG, the cells it fills, and whether it
+/// was cut short.
+pub struct Drawn {
+    pub png: Vec<u8>,
+    pub cols: u32,
+    pub rows: u32,
+    pub cut: bool,
+}
+
+/// The picture sent to the terminal, as the rows of cells that show it.
+pub fn show(drawn: &Drawn) -> Result<Vec<Line<'static>>, String> {
     let id = next_id();
-    send(id, cols, rows, &png).map_err(|e| e.to_string())?;
-    Ok(placeholders(id, cols, rows))
+    send(id, drawn.cols, drawn.rows, &drawn.png).map_err(|e| e.to_string())?;
+    Ok(placeholders(id, drawn.cols, drawn.rows))
 }
 
 /// The pane's width as it is now, should it have narrowed since `width`
 /// was read: a picture wider than its pane wraps into nonsense.
-fn now(width: usize) -> usize {
+pub fn now(width: usize) -> usize {
     ratatui::crossterm::terminal::size().map_or(width, |(cols, _)| width.min(cols as usize))
 }
 
@@ -88,10 +95,10 @@ pub fn page_width(width: usize) -> u32 {
     (cols * cell_w * up(cell_h) / 2).clamp(320, 960)
 }
 
-/// A page's picture as rows of placeholder cells, its blank end cut off
+/// A page's picture, its blank end cut off
 /// and drawn at its own size: as wide as it is, and its top [`ROWS`] rows
 /// when it is longer. Says whether it was cut.
-pub fn page(png: &[u8], width: usize) -> Result<(Vec<Line<'static>>, bool), String> {
+pub fn page(png: &[u8], width: usize) -> Result<Drawn, String> {
     let width = now(width);
     let shot = tiny_skia::Pixmap::decode_png(png).map_err(|e| e.to_string())?;
     let (w, h) = trimmed(&shot);
@@ -117,9 +124,12 @@ pub fn page(png: &[u8], width: usize) -> Result<(Vec<Line<'static>>, bool), Stri
         None,
     );
     let png = canvas.encode_png().map_err(|e| e.to_string())?;
-    let id = next_id();
-    send(id, cols, rows, &png).map_err(|e| e.to_string())?;
-    Ok((placeholders(id, cols, rows), tall > rows))
+    Ok(Drawn {
+        png,
+        cols,
+        rows,
+        cut: tall > rows,
+    })
 }
 
 /// The width and height a screenshot keeps once the rows and columns at
@@ -142,7 +152,7 @@ fn trimmed(shot: &tiny_skia::Pixmap) -> (u32, u32) {
 }
 
 /// The SVG as a PNG that fills `cols`×`rows` cells.
-pub fn render(text: &str, width: usize) -> Result<(Vec<u8>, u32, u32), String> {
+pub fn render(text: &str, width: usize) -> Result<Drawn, String> {
     let width = now(width);
     let mut options = usvg::Options {
         fontdb: fonts(),
@@ -164,7 +174,12 @@ pub fn render(text: &str, width: usize) -> Result<(Vec<u8>, u32, u32), String> {
     let transform = tiny_skia::Transform::from_scale(scale, scale).post_translate(dx, dy);
     resvg::render(&tree, transform, &mut pixmap.as_mut());
     let png = pixmap.encode_png().map_err(|e| e.to_string())?;
-    Ok((png, cols, rows))
+    Ok(Drawn {
+        png,
+        cols,
+        rows,
+        cut: false,
+    })
 }
 
 /// Cells for a picture of `w`×`h` pixels: its own size when it fits, else
@@ -242,7 +257,7 @@ mod tests {
     fn an_svg_renders_to_a_png_of_whole_cells() {
         let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="160" height="80">
             <rect width="160" height="80" fill="orange"/></svg>"#;
-        let (png, cols, rows) = render(svg, 80).unwrap();
+        let Drawn { png, cols, rows, .. } = render(svg, 80).unwrap();
         assert_eq!((cols, rows), (20, 5));
         assert!(png.starts_with(b"\x89PNG"));
         assert!(render("<svg", 80).is_err());

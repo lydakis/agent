@@ -8,6 +8,7 @@
 //! alternate screen, replies stream a line at a time, tool calls are one
 //! `• Ran …` line with a short `└` look at the result, and a status row
 //! says how long the turn has run and how to stop it.
+mod cache;
 mod calls;
 mod diff;
 mod html;

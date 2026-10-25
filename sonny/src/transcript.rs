@@ -86,12 +86,15 @@ impl Markdown {
                 })
                 .collect();
         }
-        let svg = match lang.as_str() {
-            "mermaid" => crate::mermaid::svg(&source),
-            "math" => crate::math::svg(&source),
-            _ => Ok(source.clone()),
-        };
-        match svg.and_then(|svg| crate::image::svg(&svg, width)) {
+        let drawn = crate::cache::drawn(&lang, &source, width, || {
+            let svg = match lang.as_str() {
+                "mermaid" => crate::mermaid::svg(&source)?,
+                "math" => crate::math::svg(&source)?,
+                _ => source.clone(),
+            };
+            crate::image::render(&svg, width)
+        });
+        match drawn.and_then(|drawn| crate::image::show(&drawn)) {
             Ok(rows) => rows,
             Err(error) => {
                 let mut out: Vec<Line<'static>> = source
@@ -354,8 +357,11 @@ fn page(source: &str, width: usize) -> Vec<Line<'static>> {
         return vec![Line::from(format!("    could not keep the page: {error}")).dim()];
     }
     let drawn = match crate::term::graphics() {
-        true => crate::html::render(&path, crate::image::page_width(width))
-            .and_then(|png| crate::image::page(&png, width)),
+        true => crate::cache::drawn("html", source, width, || {
+            let png = crate::html::render(&path, crate::image::page_width(width))?;
+            crate::image::page(&png, width)
+        })
+        .and_then(|drawn| Ok((crate::image::show(&drawn)?, drawn.cut))),
         false => Err(String::new()),
     };
     let (mut out, more) = match drawn {

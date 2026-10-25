@@ -127,9 +127,9 @@ mod tests {
         )
         .unwrap();
         let png = super::render(&path, 480).unwrap();
-        let (rows, cut) = crate::image::page(&png, 80).unwrap();
-        assert!(!cut);
+        let drawn = crate::image::page(&png, 80).unwrap();
+        assert!(!drawn.cut);
         // 1600 CSS pixels laid out, a heading and a table kept.
-        assert!((2..12).contains(&rows.len()), "{}", rows.len());
+        assert!((2..12).contains(&drawn.rows), "{}", drawn.rows);
     }
 }
