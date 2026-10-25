@@ -213,6 +213,11 @@ click on **code** away.
 
 ![A Mermaid sequence diagram drawn in a reply](app/rich-diagram.png)
 
+The same in the app itself (the Linux build's WebKitGTK webview, against
+the playground's model): each reply's flowchart drew as the reply came in.
+
+![Two replies' flowcharts drawn in the app's webview](app/rich-diagram-webkit.png)
+
 A file the reply links opens beside it (see Files above): `PLAN.md` drawn as
 Markdown with its diagram. Its own link to `report/latency.vl.json` opens that
 chart file in its place.
@@ -1936,7 +1941,9 @@ while the worker ran was 22 ms. Putting the 866,000-character diagram into
 the page and laying it out took 68 ms; a 1.4-million-character one took
 183 ms, which is the reason for the bound. A flowchart node with an `img:`
 URL and `click` links to `javascript:` and `tel:` drew neither an image nor a
-link. Pele 1.10.0 is 709 KB (264 KB gzipped); the vendored Mermaid was 3.57 MB
+link. In the Linux build's WebKitGTK webview the worker loads from the
+app's own scheme and draws as in Chromium (not yet seen in macOS's WKWebView).
+Pele 1.10.0 is 709 KB (264 KB gzipped); the vendored Mermaid was 3.57 MB
 (980 KB gzipped).
 
 ## What it costs, and where the bounds are
