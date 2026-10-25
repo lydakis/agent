@@ -241,13 +241,31 @@ window.Rich = (() => {
   const refused = new Map();
   let drawing = Promise.resolve();
   const note = (box, msg) => { const l = box.querySelector('.rh .lang'); l.textContent = `${l.textContent.split(' · ')[0]} · ${msg}`; };
+  // What drawn blocks put on the page, by block: a draw nobody asked for stops once the blocks still
+  // in the document hold DRAWN_CHARS of SVG (about 15 large diagrams, or hundreds of ordinary ones),
+  // and its block waits for a click. A block gone from the document counts no more.
+  const DRAWN_CHARS = 2000000, drawn = new Map(), FULL = 'drawn on a click: the window holds enough drawings';
+  function drawnChars() {
+    let n = 0;
+    for (const [b, c] of drawn) if (b.isConnected === false) drawn.delete(b); else n += c;
+    return n;
+  }
+  // Each drawing put on the page gets its own IDs (a diagram's accessible title, a gradient), as
+  // the same SVG can show in two blocks: Pele names them from ID_PREFIX, renamed here.
+  const ID_PREFIX = 'peleid', ID_USE = /(id="|#|by=")peleid/g; let ids = 0;
   // A diagram or chart drawn to SVG once per source and width; one at a time. A source that does not
   // draw keeps showing as code, the error in its head. `auto` is a draw nobody asked for.
   function drawLazy(box, src, make, auto) {
     const key = `${box.dataset.kind}|${box.dataset.lang ?? ''}|${box.clientWidth}|${src}`;
-    const show = (svg) => settle(box, () => { box.querySelector('.view').innerHTML = svg; box.dataset.view = 'view'; box.dataset.drawn = ''; });
+    const show = (svg) => {
+      if (auto && drawnChars() + svg.length > DRAWN_CHARS) { delete box.dataset.asked; note(box, FULL); return; }
+      const id = `d${++ids}`;
+      drawn.set(box, svg.length);
+      settle(box, () => { box.querySelector('.view').innerHTML = svg.replace(ID_USE, `$1${id}`); box.dataset.view = 'view'; box.dataset.drawn = ''; });
+    };
     if (diagrams.has(key)) { show(diagrams.get(key)); return; }
     if (auto && refused.has(key)) { note(box, refused.get(key)); return; }
+    if (auto && drawnChars() >= DRAWN_CHARS) { note(box, FULL); return; }
     if ('asked' in box.dataset) return;
     box.dataset.asked = '';
     // One queued behind the same source takes its result instead of drawing it again; one larger
@@ -282,7 +300,7 @@ window.Rich = (() => {
       w.onmessage = ({ data }) => data.error == null ? end(resolve, data.svg) : end(reject, new Error(data.error));
       w.onerror = (e) => { e.preventDefault?.(); stop(); end(reject, new Error(e.message || 'the diagram worker failed')); };
       const font = getComputedStyle(document.documentElement).getPropertyValue('--mono').trim();
-      w.postMessage({ src, font, width: Math.max(0, box.clientWidth - 24) });
+      w.postMessage({ src, font, width: Math.max(0, box.clientWidth - 24), idPrefix: ID_PREFIX });
     });
   }
 

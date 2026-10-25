@@ -1708,7 +1708,11 @@ highlighting arrives); past them the rest shows as text. Fenced blocks are drawn
   `block-beta` spaces); the app holds its SVG to a million characters, as
   putting one that size into the page takes the window about 150 ms. A
   diagram still laying out after 3 s ends the worker (the next diagram starts
-  another). Its colors are CSS variables set to the window's, the series in
+  another). Diagrams draw on their own only while the blocks on the page hold
+  under 2 million characters of drawn SVG (hundreds of ordinary diagrams);
+  past that one waits for a click, and a block gone from the page counts no
+  more. Each drawing gets its own IDs (its accessible title, a gradient), as
+  the same SVG can show in two blocks. Its colors are CSS variables set to the window's, the series in
   the charts' order, so it follows the theme without drawing again; it lays
   out for its block's width in the window's font. A click on **code** shows
   its source. One that does not draw stays as its source with Pele's message

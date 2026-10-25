@@ -263,7 +263,7 @@ test('a diagram draws at once in a worker, and a pane drawn anew draws it from t
   assert.equal(first.view.innerHTML, '<svg>graph TD</svg>'); assert.equal(first.dataset.view, 'view');
   assert.equal(workers.length, 1); assert.equal(workers[0].url, 'diagram-worker.js');
   // It lays out in the window's font, for the block's width inside its padding.
-  assert.deepEqual({ ...workers[0].sent[0] }, { src: 'graph TD', font: 'Menlo', width: 400 });
+  assert.deepEqual({ ...workers[0].sent[0] }, { src: 'graph TD', font: 'Menlo', width: 400, idPrefix: 'peleid' });
   // The pane drawn anew: the same source at the same width comes from the cache at once.
   const again = diagramBox(); Rich.hydrate({ querySelectorAll: () => [again] });
   assert.equal(again.view.innerHTML, '<svg>graph TD</svg>'); assert.equal(workers[0].sent.length, 1);
@@ -277,6 +277,32 @@ test('a diagram draws at once in a worker, and a pane drawn anew draws it from t
   const btn = { dataset: { rich: 'view' }, closest: () => b };
   Rich.click({ target: { closest: (s) => s === '[data-rich]' ? btn : null }, preventDefault() {} });
   assert.equal(b.dataset.view, 'code'); assert.equal(workers.length, 1);
+});
+
+test('each drawing on the page gets its own IDs, even from the cache', async () => {
+  const p = page(), Rich = p.context.Rich;
+  diagramWorkers(p.context, ({ idPrefix }) => ({ svg: `<svg aria-labelledby="${idPrefix}-title"><title id="${idPrefix}-title">t</title><path fill="url(#${idPrefix}-g)"/></svg>` }));
+  const a = diagramBox(), b = diagramBox(); Rich.hydrate({ querySelectorAll: () => [a] }); await turn(); Rich.hydrate({ querySelectorAll: () => [b] });
+  const ids = (box) => box.view.innerHTML.match(/id="([^"]+)"/)[1];
+  assert.notEqual(ids(a), ids(b));
+  for (const box of [a, b]) { const id = ids(box).replace(/-title$/, ''); assert.equal(box.view.innerHTML, `<svg aria-labelledby="${id}-title"><title id="${id}-title">t</title><path fill="url(#${id}-g)"/></svg>`); }
+});
+
+test('diagrams stop drawing on their own once the page holds 2 million characters of them, and draw on a click', async () => {
+  const p = page(), Rich = p.context.Rich;
+  const workers = diagramWorkers(p.context, ({ src }) => ({ svg: `<svg>${src}${'x'.repeat(900000)}</svg>` }));
+  const [a, b, c] = ['graph A', 'graph B', 'graph C'].map((src) => diagramBox(src));
+  Rich.hydrate({ querySelectorAll: () => [a, b, c] }); await turn(); await turn();
+  assert.equal(a.dataset.view, 'view'); assert.equal(b.dataset.view, 'view');
+  assert.equal(c.dataset.view, 'code'); assert.match(c.lang.textContent, /window holds enough drawings/); assert.ok(!('asked' in c.dataset));
+  // A block gone from the document counts no more.
+  a.isConnected = false;
+  const d = diagramBox('graph D'); Rich.hydrate({ querySelectorAll: () => [d] }); await turn();
+  assert.equal(d.dataset.view, 'view');
+  // A click draws past the bound, from the cache.
+  const button = { dataset: { rich: 'view' }, closest: () => c };
+  Rich.click({ target: { closest: (s) => s === '[data-rich]' ? button : null }, preventDefault() {} });
+  assert.equal(c.dataset.view, 'view'); assert.equal(workers[0].sent.length, 4);
 });
 
 test('a diagram still laying out is stopped with its worker, and the next starts a new one', async () => {
