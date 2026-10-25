@@ -12,6 +12,8 @@ mod calls;
 mod project;
 mod rex;
 mod shell;
+mod sound;
+mod status;
 mod transcript;
 
 use agent_client::{Client, Events};
@@ -61,13 +63,15 @@ struct Options {
     rex: bool,
     /// The Rex server the project's session lives on, when not this one.
     rex_host: Option<String>,
+    /// Ring when work ends or needs the person.
+    sound: bool,
 }
 
 fn usage() -> String {
-    "usage: sonny [--store PATH] [--socket PATH] [--model PROVIDER/MODEL] [--no-rex] [--rex-host HOST]\n\
+    "usage: sonny [--store PATH] [--socket PATH] [--model PROVIDER/MODEL] [--no-rex] [--rex-host HOST] [--no-sound]\n\
      \x20      [--bot NAME [--new [--workspace DIR]]]\n\
      With no --bot, the folder's coordinator, made with --model the first time; its tasks\n\
-     open in the project's Rex session."
+     open in the project's Rex session. Type /status for the project's agents."
         .into()
 }
 
@@ -111,6 +115,7 @@ fn show() -> Result<(), String> {
         me.to_string_lossy().into_owned(),
         "--socket".into(),
         socket.to_string_lossy().into_owned(),
+        "--no-sound".into(),
         "--bot".into(),
         bot.clone(),
     ];
@@ -135,7 +140,7 @@ fn parse() -> Result<Options, String> {
     let mut args = std::env::args().skip(1);
     let (mut store, mut socket, mut bot, mut new, mut model, mut workspace) =
         (None, None, None, false, None, None);
-    let (mut rex, mut rex_host) = (true, None);
+    let (mut rex, mut rex_host, mut sound) = (true, None, true);
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or_else(usage);
         match arg.as_str() {
@@ -147,6 +152,7 @@ fn parse() -> Result<Options, String> {
             "--workspace" => workspace = Some(value()?),
             "--no-rex" => rex = false,
             "--rex-host" => rex_host = Some(value()?),
+            "--no-sound" => sound = false,
             _ => return Err(usage()),
         }
     }
@@ -167,6 +173,7 @@ fn parse() -> Result<Options, String> {
         workspace,
         rex,
         rex_host,
+        sound,
     })
 }
 
@@ -222,6 +229,7 @@ async fn run() -> Result<(), String> {
         .request("follow", json!({"bot": name, "after": 0}))
         .await
         .map_err(|e| e.to_string())?;
+    caught_up(&mut events).await;
 
     enable_raw_mode().map_err(|e| e.to_string())?;
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
@@ -233,6 +241,7 @@ async fn run() -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     let mut app = App::new(client, &name, &bot);
+    app.sounds = sound::Sounds::new(options.sound);
     // A bot keeps the model it was made with; --model runs this window's
     // turns on another.
     if let Some(model) = options.model.as_ref().filter(|m| **m != app.model) {
@@ -329,6 +338,19 @@ fn status_report(state: &str, bot: &str) {
     let _ = stdout.flush();
 }
 
+/// Read past a follow's replay as it arrives, so a long one cannot fill
+/// the client's queue and cut the stream before it goes live.
+async fn caught_up(events: &mut Events) {
+    let replay = async {
+        while let Some(event) = events.recv().await {
+            if event["event"] == "follow_live" {
+                return;
+            }
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(30), replay).await;
+}
+
 /// The reply being written: lines are committed as they end, and the line
 /// still open stays in the viewport.
 struct Live {
@@ -377,6 +399,7 @@ struct App {
     seen_node: i64,
     /// The model this window's turns run on, when not the bot's own.
     turn_model: Option<String>,
+    sounds: sound::Sounds,
     /// The reply text the current model call has streamed.
     said: String,
     /// What a retried call will stream again, not to be shown twice.
@@ -403,23 +426,28 @@ struct Fleet {
     doing: HashMap<String, &'static str>,
     /// The name each window was given.
     named: HashMap<String, String>,
+    /// What to ring for, taken by the app after each event.
+    alerts: Vec<(sound::Alert, String)>,
 }
 
 impl Fleet {
     async fn start(options: &Options, project: &str, lead: &str) -> Option<Self> {
         let bin = rex::find()?;
         let rex = rex::Rex::open(bin.clone(), options.rex_host.as_deref(), project).ok()?;
-        let (client, events) = Client::connect(&options.socket).await.ok()?;
+        let (client, mut events) = Client::connect(&options.socket).await.ok()?;
         client
             .request("follow", json!({"bot": "*", "after": 0}))
             .await
             .ok()?;
+        caught_up(&mut events).await;
         let me = std::env::current_exe().ok()?;
         // Rex starts a block without this process's environment.
+        // The lead's Sonny rings for the whole project; a task's is quiet.
         let command = vec![
             me.to_string_lossy().into_owned(),
             "--socket".into(),
             options.socket.to_string_lossy().into_owned(),
+            "--no-sound".into(),
         ];
         let mut note = format!("tasks open in Rex session {project}");
         if rex::install_skill(&bin).is_some() {
@@ -429,7 +457,7 @@ impl Fleet {
             rex,
             _client: client.clone(),
             events,
-            live: false,
+            live: true,
             project: project.to_owned(),
             lead: lead.to_owned(),
             lineage: [lead.to_owned()].into(),
@@ -437,6 +465,7 @@ impl Fleet {
             note: Some(note),
             doing: HashMap::new(),
             named: HashMap::new(),
+            alerts: Vec::new(),
         };
         fleet.rex.adopt_own(lead);
         fleet.doing(lead, "idle");
@@ -491,6 +520,17 @@ impl Fleet {
         if self.doing.get(bot) != Some(&doing) {
             self.doing.insert(bot.to_owned(), doing);
             self.name_windows();
+            let short = self.short(bot).to_owned();
+            let alert = match doing {
+                "done" if bot == self.lead => {
+                    Some((sound::Alert::LeadDone, format!("{short} is done")))
+                }
+                "done" => Some((sound::Alert::TaskDone, format!("{short} is done"))),
+                "failed" => Some((sound::Alert::Failed, format!("{short} failed"))),
+                "needs you" => Some((sound::Alert::NeedsYou, format!("{short} needs you"))),
+                _ => None,
+            };
+            self.alerts.extend(alert);
         }
     }
 
@@ -617,7 +657,7 @@ impl App {
             usage: (0, 0, 0),
             calls: HashMap::new(),
             approvals: Vec::new(),
-            following: false,
+            following: true,
             notice: None,
             quit: false,
             started: Instant::now(),
@@ -625,6 +665,7 @@ impl App {
             held: Vec::new(),
             seen_node: 0,
             turn_model: None,
+            sounds: sound::Sounds::new(false),
             said: String::new(),
             replay: None,
         }
@@ -700,6 +741,14 @@ impl App {
                     }
                 } => {
                     let said = self.fleet.as_mut().and_then(|fleet| fleet.event(&event));
+                    let alerts = self
+                        .fleet
+                        .as_mut()
+                        .map(|fleet| std::mem::take(&mut fleet.alerts))
+                        .unwrap_or_default();
+                    for (alert, what) in alerts {
+                        self.sounds.alert(alert, &what);
+                    }
                     if let Some(said) = said {
                         // After the call that started the task, not above it.
                         self.held.push(Line::from(format!("  ↳ {said}")).dim());
@@ -1079,6 +1128,19 @@ impl App {
                     },
                     &self.bot,
                 );
+                if self.fleet.is_none() {
+                    match status {
+                        "completed" | "steered" => {
+                            let what = format!("{} is done", self.bot);
+                            self.sounds.alert(sound::Alert::LeadDone, &what)
+                        }
+                        "interrupted" => {}
+                        _ => {
+                            let what = format!("{} failed", self.bot);
+                            self.sounds.alert(sound::Alert::Failed, &what)
+                        }
+                    }
+                }
             }
             "deleted" => {
                 self.notice = Some(format!("{} was deleted", self.bot));
@@ -1087,6 +1149,168 @@ impl App {
             "follow_lagged" => self.notice = Some("fell behind the daemon; reattach".into()),
             _ => {}
         }
+    }
+
+    /// The project's agents on one card, from the daemon and Rex alone.
+    async fn status(&mut self) {
+        let (project, lead) = match &self.project {
+            Some(project) => (project.clone(), format!("{project}.lead")),
+            None => (
+                self.bot.split('.').next().unwrap_or(&self.bot).to_owned(),
+                self.bot.clone(),
+            ),
+        };
+        let pattern = if self.bot.contains('.') || self.project.is_some() {
+            format!("{project}.*")
+        } else {
+            self.bot.clone()
+        };
+        let Ok(page) = self
+            .client
+            .request("bots", json!({"name": pattern, "limit": 256}))
+            .await
+        else {
+            self.notice = Some("could not list the agents".into());
+            return;
+        };
+        let windows = self
+            .fleet
+            .as_ref()
+            .map(|fleet| fleet.rex.windows())
+            .unwrap_or_default();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let mut rows = Vec::new();
+        for bot in page["bots"].as_array().into_iter().flatten() {
+            let Some(name) = bot["name"].as_str() else {
+                continue;
+            };
+            let turn = self
+                .client
+                .request("turns", json!({"bot": name, "newest": true, "limit": 1}))
+                .await
+                .ok()
+                .and_then(|page| page["turns"].get(0).cloned())
+                .unwrap_or(Value::Null);
+            let running = !bot["running_turn"].is_null();
+            let state = match (running, turn["status"].as_str()) {
+                (true, Some("waiting")) if turn["waiting_on"]["approval"] == true => {
+                    "needs you".into()
+                }
+                (true, Some("waiting")) => {
+                    let on: Vec<String> = turn["waiting_on"]["handles"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(calls::handle_bot)
+                        .map(|b| short(&b, &project, &lead))
+                        .collect();
+                    format!("waiting on {}", on.join(", "))
+                }
+                (true, Some("paced")) => "rate limited".into(),
+                (true, Some("queued")) => "queued".into(),
+                (true, _) => "working".into(),
+                (false, Some("completed" | "steered")) => "done".into(),
+                (false, Some("interrupted")) => "stopped".into(),
+                (false, Some(other)) => other.to_owned(),
+                (false, None) => "idle".into(),
+            };
+            let at = if running {
+                turn["started_ms"].as_u64()
+            } else {
+                turn["finished_ms"].as_u64()
+            };
+            let place = windows
+                .iter()
+                .position(|(_, labels)| labels.iter().any(|l| l == name))
+                .map(|i| {
+                    if windows[i].1.len() > 1 {
+                        format!("tab {}, split", i + 1)
+                    } else {
+                        format!("tab {}", i + 1)
+                    }
+                })
+                .unwrap_or_default();
+            rows.push(status::Row {
+                name: short(name, &project, &lead),
+                state,
+                seconds: at.map(|at| now.saturating_sub(at) / 1000),
+                model: format!(
+                    "{}/{}",
+                    bot["provider"].as_str().unwrap_or("?"),
+                    bot["model"].as_str().unwrap_or("?")
+                ),
+                latest: self.latest(name).await,
+                place,
+            });
+        }
+        // The lead first, then what needs the person, what works, the rest.
+        let rank = |row: &status::Row| match row.state.as_str() {
+            _ if row.name == "lead" => 0,
+            "needs you" => 1,
+            "working" => 2,
+            s if s.starts_with("waiting") => 3,
+            _ => 4,
+        };
+        rows.sort_by_key(|row| (rank(row), row.seconds.unwrap_or(u64::MAX)));
+        let lines = status::card(&project, &rows, self.width);
+        self.commit(lines);
+    }
+
+    /// An agent's latest step, as a line.
+    async fn latest(&self, bot: &str) -> String {
+        let Ok(page) = self
+            .client
+            .request("history_nodes", json!({"bot": bot, "limit": 3}))
+            .await
+        else {
+            return String::new();
+        };
+        let nodes: Vec<i64> = page["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|n| n["node"].as_i64())
+            .collect();
+        let Ok(read) = self
+            .client
+            .request("history_items", json!({"bot": bot, "nodes": nodes}))
+            .await
+        else {
+            return String::new();
+        };
+        // Newest first, as the nodes were asked for.
+        let items: Vec<Value> = read["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|entry| entry["item"].clone())
+            .collect();
+        for item in items {
+            match (item["type"].as_str(), item["role"].as_str()) {
+                (_, Some("assistant")) => return first_line(&text(&item)),
+                (Some("function_call"), _) => {
+                    let arguments: Value = item["arguments"]
+                        .as_str()
+                        .and_then(|a| serde_json::from_str(a).ok())
+                        .unwrap_or(Value::Null);
+                    let name = item["name"].as_str().unwrap_or("tool");
+                    return match arguments["command"].as_str() {
+                        Some(command) => match calls::said(command, "", false) {
+                            Some(said) => format!("{} {}", said.verb, said.what).trim().to_owned(),
+                            None => format!("$ {}", first_line(command)),
+                        },
+                        None => format!("{name} {}", arguments["path"].as_str().unwrap_or("")),
+                    };
+                }
+                (_, Some("user")) => return format!("asked: {}", first_line(&text(&item))),
+                _ => {}
+            }
+        }
+        String::new()
     }
 
     /// The turn's calls a person must answer; a program answers the rest.
@@ -1112,6 +1336,11 @@ impl App {
             .collect();
         if !self.approvals.is_empty() {
             status_report("blocked", &self.bot);
+            // With a fleet, the lead's Sonny rings for every agent.
+            if self.fleet.is_none() {
+                let what = format!("{} needs you", self.bot);
+                self.sounds.alert(sound::Alert::NeedsYou, &what);
+            }
         }
     }
 
@@ -1180,6 +1409,11 @@ impl App {
     async fn submit(&mut self) {
         let prompt = self.input.trim().to_owned();
         if prompt.is_empty() {
+            return;
+        }
+        if matches!(prompt.as_str(), "/status" | "/agents" | "/ps") {
+            self.input.clear();
+            self.status().await;
             return;
         }
         // A message to a busy bot joins its running turn, on that turn's model.
@@ -1361,6 +1595,16 @@ fn shimmer(text: &str, since: Duration) -> Vec<Span<'static>> {
             Span::styled(c.to_string(), style)
         })
         .collect()
+}
+
+/// A bot's name in its project: `lead`, or what follows the project's dot.
+fn short(bot: &str, project: &str, lead: &str) -> String {
+    if bot == lead {
+        return "lead".into();
+    }
+    bot.strip_prefix(&format!("{project}."))
+        .unwrap_or(bot)
+        .to_owned()
 }
 
 fn first_line(text: &str) -> String {

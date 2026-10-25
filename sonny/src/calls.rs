@@ -318,29 +318,29 @@ fn agent(words: &[String], stdin: Option<&str>, output: &str, failed: bool) -> O
         }
         "ls" => {
             said.verb = "Listed agents".into();
-            if let Some(rows) = reply
+            // One agent a row, as JSON or as `--pretty` prints it.
+            let rows: Vec<(String, String)> = match reply
                 .as_ref()
                 .and_then(|r| r.as_array().or_else(|| r["bots"].as_array()).cloned())
             {
-                let names: Vec<String> = rows
+                Some(rows) => rows
                     .iter()
                     .filter_map(|row| {
                         let name = row["name"].as_str().or_else(|| row["bot"].as_str())?;
-                        Some(match row["status"].as_str() {
-                            Some(status) => format!("{name} ({status})"),
-                            None => name.to_owned(),
-                        })
+                        Some((
+                            name.to_owned(),
+                            row["status"].as_str().unwrap_or("").to_owned(),
+                        ))
                     })
-                    .collect();
-                if !names.is_empty() {
-                    said.under.push(dim(names.join(", ")));
-                }
-            } else {
-                // `--pretty`: one agent a row, its name and status first.
-                let rows: Vec<String> = output.lines().filter_map(listed_row).collect();
-                if !rows.is_empty() {
-                    said.under.push(dim(rows.join(", ")));
-                }
+                    .collect(),
+                None => output.lines().filter_map(listed_row).collect(),
+            };
+            for (name, status) in rows {
+                said.under.push(Line::from(vec![
+                    crate::status::mark(&status),
+                    Span::raw(name),
+                    Span::raw(format!(" {status}")).dim(),
+                ]));
             }
         }
         "rm" => said.verb = "Removed".into(),
@@ -371,13 +371,13 @@ fn agent(words: &[String], stdin: Option<&str>, output: &str, failed: bool) -> O
     Some(said)
 }
 
-/// A row of `agent ls --pretty`, as `name (status)`.
-pub fn listed_row(line: &str) -> Option<String> {
+/// A row of `agent ls --pretty`: its name and status.
+pub fn listed_row(line: &str) -> Option<(String, String)> {
     let mut fields = line.split_whitespace();
     let (name, status) = (fields.next()?, fields.next()?);
     STATUSES
         .contains(&status)
-        .then(|| format!("{name} ({status})"))
+        .then(|| (name.to_owned(), status.to_owned()))
 }
 
 const STATUSES: &[&str] = &[
