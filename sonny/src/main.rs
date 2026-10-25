@@ -8,6 +8,7 @@
 //! alternate screen, replies stream a line at a time, tool calls are one
 //! `• Ran …` line with a short `└` look at the result, and a status row
 //! says how long the turn has run and how to stop it.
+mod calls;
 mod project;
 mod rex;
 mod transcript;
@@ -69,6 +70,62 @@ fn usage() -> String {
         .into()
 }
 
+/// `sonny show TASK [--split SIDE [--beside BOT]] [--rex-host HOST]`: put a
+/// task's window where the person asked, from the lead's shell. A task gets
+/// a window of its own unless told otherwise; `--split` puts it beside the
+/// lead's block, or `--beside` another bot's.
+fn show() -> Result<(), String> {
+    let usage =
+        "usage: sonny show TASK [--split right|left|above|below [--beside BOT]] [--rex-host HOST]";
+    let mut args = std::env::args().skip(2);
+    let bot = args.next().filter(|b| !b.starts_with('-')).ok_or(usage)?;
+    let caller = std::env::var("AGENT_BOT").ok();
+    let (mut side, mut beside, mut host) = (None, caller.clone(), None);
+    while let Some(arg) = args.next() {
+        let mut value = || args.next().ok_or(usage);
+        match arg.as_str() {
+            "--split" => side = Some(value()?),
+            "--beside" => beside = Some(value()?),
+            "--window" => side = None,
+            "--rex-host" => host = Some(value()?),
+            _ => return Err(usage.into()),
+        }
+    }
+    let socket = std::env::var_os("AGENT_SOCKET")
+        .map(PathBuf::from)
+        .ok_or("run this from an agent's shell (AGENT_SOCKET is not set)")?;
+    let socket = std::path::absolute(socket).map_err(|e| e.to_string())?;
+    // The project is what the names start with: `calc` for `calc.lead`.
+    let project = caller
+        .as_deref()
+        .unwrap_or(&bot)
+        .split('.')
+        .next()
+        .unwrap_or(&bot)
+        .to_owned();
+    let bin = rex::find().ok_or("rex not found")?;
+    let mut rex = rex::Rex::open(bin, host.as_deref(), &project)?;
+    let me = std::env::current_exe().map_err(|e| e.to_string())?;
+    let command = [
+        me.to_string_lossy().into_owned(),
+        "--socket".into(),
+        socket.to_string_lossy().into_owned(),
+        "--bot".into(),
+        bot.clone(),
+    ];
+    let short = bot.strip_prefix(&format!("{project}.")).unwrap_or(&bot);
+    let placement = match side {
+        Some(side) => rex::Placement::Split {
+            side,
+            beside: beside.ok_or("--split needs --beside BOT outside an agent")?,
+        },
+        None => rex::Placement::Window,
+    };
+    rex.place(&bot, short, &command, &placement)?;
+    println!("{}", json!({"bot": bot, "session": project}));
+    Ok(())
+}
+
 fn parse() -> Result<Options, String> {
     let mut args = std::env::args().skip(1);
     let (mut store, mut socket, mut bot, mut new, mut model, mut workspace) =
@@ -120,6 +177,9 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn run() -> Result<(), String> {
+    if std::env::args().nth(1).as_deref() == Some("show") {
+        return show();
+    }
     let options = parse()?;
     let (client, mut events) = Client::connect(&options.socket)
         .await
@@ -233,6 +293,21 @@ fn status_report(state: &str, bot: &str) {
     }
     let mut stdout = std::io::stdout();
     let _ = write!(stdout, "\x1b]7501;{body}\x1b\\");
+    // The terminal title, which Rex shows on the block: the bot's name in
+    // its project, and what it is doing.
+    let name = bot.split_once('.').map_or(bot, |(_, name)| name);
+    let doing = match state {
+        "blocked" => "needs you",
+        "error" => "failed",
+        "clear" => "",
+        other => other,
+    };
+    let title = if doing.is_empty() {
+        String::new()
+    } else {
+        format!("{name} · {doing}")
+    };
+    let _ = write!(stdout, "\x1b]2;{title}\x07");
     let _ = stdout.flush();
 }
 
@@ -284,6 +359,10 @@ struct App {
     seen_node: i64,
     /// The model this window's turns run on, when not the bot's own.
     turn_model: Option<String>,
+    /// The reply text the current model call has streamed.
+    said: String,
+    /// What a retried call will stream again, not to be shown twice.
+    replay: Option<String>,
 }
 
 /// The lead's tasks, laid out in the project's Rex session: a window for
@@ -302,6 +381,8 @@ struct Fleet {
     command: Vec<String>,
     /// Said once in the status row when Rex is set up.
     note: Option<String>,
+    /// What each bot's window says it is doing.
+    doing: HashMap<String, &'static str>,
 }
 
 impl Fleet {
@@ -334,7 +415,10 @@ impl Fleet {
             lineage: [lead.to_owned()].into(),
             command,
             note: Some(note),
+            doing: HashMap::new(),
         };
+        fleet.rex.adopt_own(lead);
+        fleet.doing(lead, "idle");
         // Tasks named in the project's way, and the ones already working.
         if let Ok(page) = client
             .request(
@@ -359,7 +443,32 @@ impl Fleet {
     fn show(&mut self, bot: &str) -> Result<bool, String> {
         let mut command = self.command.clone();
         command.extend(["--bot".into(), bot.into()]);
-        self.rex.show(bot, &command)
+        let name = format!("{} · working", self.short(bot));
+        let opened = self.rex.show(bot, &name, &command)?;
+        if opened {
+            self.doing.insert(bot.to_owned(), "working");
+        } else {
+            self.doing(bot, "working");
+        }
+        Ok(opened)
+    }
+
+    /// A bot's name in its project's session: `lead`, or the task's name.
+    fn short<'a>(&self, bot: &'a str) -> &'a str {
+        if bot == self.lead {
+            return "lead";
+        }
+        bot.strip_prefix(&format!("{}.", self.project))
+            .unwrap_or(bot)
+    }
+
+    /// Name the bot's window after what it is doing, when that changed.
+    fn doing(&mut self, bot: &str, doing: &'static str) {
+        if self.doing.get(bot) != Some(&doing) {
+            self.doing.insert(bot.to_owned(), doing);
+            self.rex
+                .name(bot, &format!("{} · {doing}", self.short(bot)));
+        }
     }
 
     /// What the event did to the layout, as a line for the lead's view.
@@ -370,6 +479,34 @@ impl Fleet {
             return None;
         }
         let bot = event["bot"].as_str()?;
+        let data = &event["data"];
+        if self.lineage.contains(bot) {
+            match kind {
+                "accepted" if bot == self.lead => self.doing(bot, "working"),
+                "approval_requested" => {
+                    let manual = data["calls"].as_array().into_iter().flatten().any(|call| {
+                        call["gates"]
+                            .as_array()
+                            .is_some_and(|gates| gates.iter().any(|g| g == "manual"))
+                    });
+                    if manual {
+                        self.doing(bot, "needs you");
+                    }
+                }
+                "tool_completed" | "turn_resumed" if self.doing.get(bot) == Some(&"needs you") => {
+                    self.doing(bot, "working")
+                }
+                "turn_finished" => self.doing(
+                    bot,
+                    match data["status"].as_str() {
+                        Some("completed" | "steered") => "done",
+                        Some("interrupted") => "stopped",
+                        _ => "failed",
+                    },
+                ),
+                _ => {}
+            }
+        }
         match kind {
             "created" | "forked" => {
                 let by = event["data"]["created_by"].as_str().unwrap_or("");
@@ -386,6 +523,7 @@ impl Fleet {
             "deleted" => {
                 self.rex.close(bot);
                 self.lineage.remove(bot);
+                self.doing.remove(bot);
                 None
             }
             _ => None,
@@ -430,6 +568,8 @@ impl App {
             held: Vec::new(),
             seen_node: 0,
             turn_model: None,
+            said: String::new(),
+            replay: None,
         }
     }
 
@@ -458,6 +598,8 @@ impl App {
                 }
             }
             self.approvals_for(Some(turn)).await;
+        } else {
+            status_report("idle", &self.bot);
         }
         let (keys_tx, mut keys) = tokio::sync::mpsc::unbounded_channel();
         // Poll, not a bare read: a blocked read holds crossterm's reader
@@ -662,6 +804,8 @@ impl App {
         match kind {
             "accepted" => {
                 self.end_live();
+                self.said.clear();
+                self.replay = None;
                 self.usage = (0, 0, 0);
                 self.running = Some(Running {
                     turn: turn.unwrap_or(0),
@@ -687,6 +831,27 @@ impl App {
             }
             "queued" => self.notice = Some(format!("queued behind turn {}", data["behind"])),
             "text_delta" => {
+                let mut delta = event["text"].as_str().unwrap_or("");
+                // A retried call streams its reply again from the start:
+                // what was already shown is not shown twice.
+                if let Some(replay) = &mut self.replay {
+                    if let Some(left) = replay.strip_prefix(delta) {
+                        self.said.push_str(delta);
+                        *replay = left.to_owned();
+                        if replay.is_empty() {
+                            self.replay = None;
+                        }
+                        return;
+                    }
+                    match delta.strip_prefix(replay.as_str()) {
+                        Some(rest) => delta = rest,
+                        None => {
+                            self.notice = Some("the model retried; its reply may repeat".into())
+                        }
+                    }
+                    self.replay = None;
+                }
+                self.said.push_str(delta);
                 self.streamed = true;
                 if let Some(running) = &mut self.running {
                     running.phase = "Working".into();
@@ -706,7 +871,7 @@ impl App {
                         }
                     }
                 };
-                live.partial.push_str(event["text"].as_str().unwrap_or(""));
+                live.partial.push_str(delta);
                 while let Some(at) = live.partial.find('\n') {
                     let line: String = live.partial.drain(..=at).collect();
                     self.live_line(&mut live, line.trim_end_matches('\n'));
@@ -719,6 +884,8 @@ impl App {
                 }
             }
             "message" => {
+                self.said.clear();
+                self.replay = None;
                 if self.streamed {
                     self.streamed = false;
                     self.end_live();
@@ -730,7 +897,16 @@ impl App {
                     self.commit(lines);
                 }
             }
+            "retry" => {
+                if !self.said.is_empty() {
+                    self.replay = Some(std::mem::take(&mut self.said));
+                }
+                if let Some(running) = &mut self.running {
+                    running.phase = "Retrying".into();
+                }
+            }
             "tool_started" => {
+                self.said.clear();
                 self.end_live();
                 let name = data["name"].as_str().unwrap_or("tool").to_owned();
                 let arguments = data["arguments"]

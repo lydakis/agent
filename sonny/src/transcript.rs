@@ -215,6 +215,42 @@ pub fn tool(
         Span::raw("• ").fg(Color::Green)
     };
     let field = |key: &str| arguments[key].as_str().unwrap_or("").to_owned();
+    let elbow = || Span::raw("  └ ").dim();
+    let gap = || Span::raw("    ");
+    // A call Sonny knows the meaning of, said as what it does.
+    if name == "shell"
+        && let Some(said) = crate::calls::said(&field("command"), output.unwrap_or(""), failed)
+    {
+        let bullet = if said.failed {
+            Span::raw("• ").fg(Color::Red)
+        } else {
+            Span::raw("• ").fg(Color::Green)
+        };
+        let mut spans = vec![Span::raw(said.verb).bold()];
+        if !said.what.is_empty() {
+            spans.extend([Span::raw(" "), Span::raw(said.what)]);
+        }
+        let mut out = wrap(Line::from(spans), width, bullet, gap());
+        for (i, line) in said.under.into_iter().enumerate() {
+            let lead = if i == 0 { elbow() } else { gap() };
+            out.extend(wrap(line, width, lead, gap()).into_iter().take(2));
+        }
+        return out;
+    }
+    // A skill's instructions, read before following them.
+    if name == "read"
+        && let Some(skill) = field("path")
+            .strip_suffix("/SKILL.md")
+            .and_then(|dir| dir.rsplit_once("/skills/"))
+            .map(|(_, skill)| skill.to_owned())
+    {
+        let line = Line::from(vec![
+            Span::raw("Loaded the ").dim(),
+            Span::raw(skill).dim().bold(),
+            Span::raw(" skill").dim(),
+        ]);
+        return wrap(line, width, bullet, gap());
+    }
     let (verb, what) = match name {
         "shell" => ("Ran", field("command")),
         "read" => ("Read", field("path")),
@@ -227,6 +263,7 @@ pub fn tool(
                 .into_iter()
                 .flatten()
                 .filter_map(Value::as_str)
+                .map(crate::calls::handle_bot)
                 .collect::<Vec<_>>()
                 .join(", "),
         ),
@@ -239,8 +276,6 @@ pub fn tool(
         Span::raw(what.lines().next().unwrap_or("").to_owned()),
     ]);
     let mut out = wrap(header, width, bullet, Span::raw("    "));
-    let elbow = || Span::raw("  └ ").dim();
-    let gap = || Span::raw("    ");
     match name {
         "edit" => out.extend(diff(arguments, workspace, width)),
         "write" => {
@@ -296,8 +331,10 @@ fn started(output: Option<&str>) -> Option<String> {
     let reply: Value = serde_json::from_str(output?.trim()).ok()?;
     // A refusal, as the CLI writes it: its code and what it says.
     if let Some(error) = reply["error"].as_str() {
-        let detail = reply["detail"].as_str().unwrap_or("");
-        return Some(format!("refused: {detail} ({error})"));
+        return Some(match reply["detail"].as_str().filter(|d| !d.is_empty()) {
+            Some(detail) => format!("refused: {detail} ({error})"),
+            None => format!("refused: {}", error.replace('_', " ")),
+        });
     }
     let bot = reply["bot"].as_str()?;
     let turn = reply["turn"].as_i64()?;
@@ -314,26 +351,7 @@ fn started(output: Option<&str>) -> Option<String> {
 
 /// The wait tool's reply as lines: `BOT completed: first line of its reply`.
 fn waited(output: Option<&str>) -> Option<Vec<String>> {
-    let reply: Value = serde_json::from_str(output?.trim()).ok()?;
-    let mut lines = Vec::new();
-    for (handle, result) in reply["results"].as_object()? {
-        let who = result["bot"].as_str().unwrap_or(handle);
-        let line = match (result["status"].as_str(), result["error"].as_str()) {
-            (_, Some(error)) => format!("{who}: {error}"),
-            (Some(status), _) => {
-                let text = result["text"].as_str().unwrap_or("");
-                let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
-                format!("{who} {status}: {first}")
-            }
-            _ => continue,
-        };
-        lines.push(line);
-    }
-    let pending = reply["pending"].as_array().map_or(0, Vec::len);
-    if pending > 0 {
-        lines.push(format!("{pending} still running"));
-    }
-    Some(lines)
+    crate::calls::waited(&serde_json::from_str(output?.trim()).ok()?)
 }
 
 /// An edit as removed and added lines, numbered where the file now has
@@ -502,7 +520,7 @@ mod tests {
         let output = r#"{"bot":"calc.fix","bot_id":2,"handle":"turn:calc.fix/2","status":"running","turn":2}"#;
         let rows = tool(
             "shell",
-            &serde_json::json!({"command":"agent run --detach"}),
+            &serde_json::json!({"command":"cd /tmp && agent run --detach"}),
             Some(output),
             false,
             "/",
@@ -510,7 +528,10 @@ mod tests {
         );
         assert_eq!(
             text(&rows),
-            ["• Ran agent run --detach", "  └ started calc.fix, turn 2"]
+            [
+                "• Ran cd /tmp && agent run --detach",
+                "  └ started calc.fix, turn 2"
+            ]
         );
     }
 
