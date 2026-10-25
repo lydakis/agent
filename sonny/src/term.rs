@@ -1,7 +1,8 @@
 //! What the terminal can do, asked once at start: its background (OSC 11),
 //! so tints read on light and dark; whether it draws Kitty graphics; and
 //! its cell size in pixels, so an image fills whole cells.
-//! `SONNY_THEME=light|dark` decides the background instead.
+//! `SONNY_THEME=light|dark` decides the background instead; Rex, which
+//! does not answer OSC 11, is taken as light, its default.
 use std::{
     io::Write,
     sync::OnceLock,
@@ -37,13 +38,28 @@ pub fn detect() {
     let light = match std::env::var("SONNY_THEME").as_deref() {
         Ok("light") => true,
         Ok("dark") => false,
-        _ => parse(&reply).is_some_and(|rgb| luminance(rgb) > 0.5),
+        _ => match parse(&reply) {
+            Some(rgb) => luminance(rgb) > 0.5,
+            None => fallback_light(),
+        },
     };
     let _ = PROBE.set(Probe {
         light,
         graphics: reply.contains("_Gi=31;OK"),
         cell: cell_size(&reply).unwrap_or((8, 16)),
     });
+}
+
+/// Without an answer to OSC 11: `COLORFGBG` (`15;0` is light on dark)
+/// when set, else Rex's own default, which is light. Rex does not answer
+/// OSC 11 yet.
+fn fallback_light() -> bool {
+    if let Ok(colours) = std::env::var("COLORFGBG")
+        && let Some(Ok(background)) = colours.rsplit(';').next().map(str::parse::<u8>)
+    {
+        return matches!(background, 7 | 15);
+    }
+    std::env::var("TERM_PROGRAM").is_ok_and(|t| t == "rex")
 }
 
 /// OSC 11, a Kitty graphics query and the cell size, then DA1, which every

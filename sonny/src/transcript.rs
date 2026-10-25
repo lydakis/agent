@@ -616,6 +616,13 @@ fn diff(arguments: &Value, workspace: &str) -> crate::diff::Edit {
             .iter()
             .map(|l| l.to_string())
             .collect();
+        // Blank lines at the edges say nothing and take rows.
+        while after.last().is_some_and(|l: &String| l.trim().is_empty()) {
+            after.pop();
+        }
+        while before.first().is_some_and(|l: &String| l.trim().is_empty()) {
+            before.remove(0);
+        }
         start = Some(first + 1);
     }
     crate::diff::Edit {
