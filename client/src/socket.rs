@@ -55,6 +55,7 @@ pub fn default_socket(store: &Path) -> Result<PathBuf> {
         hash = hash.wrapping_mul(0x0000000001000000000000000000013b);
     }
     // Do not use TMPDIR: snapshot runners may set it to another long path.
+    // SAFETY: geteuid takes no arguments and cannot fail.
     let uid = unsafe { libc::geteuid() };
     let directory = PathBuf::from(format!("/tmp/agent-{uid}"));
     match std::fs::DirBuilder::new().mode(0o700).create(&directory) {

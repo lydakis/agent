@@ -1323,6 +1323,7 @@ mod tests {
         // A FIFO with no writer is skipped, not waited on.
         let fifo = dir.join("fifo");
         let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: path is a NUL-terminated string that outlives the call.
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
         assert!(matches!(written_file(&fifo), Ok(None)));
         assert!(matches!(written_file(&dir.join("gone")), Ok(None)));

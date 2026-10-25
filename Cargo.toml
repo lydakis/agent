@@ -49,3 +49,10 @@ tokio = { version = "1", features = ["test-util", "macros", "rt"] }
 
 [workspace]
 members = ["client", "app/src-tauri"]
+
+[workspace.lints.clippy]
+# Every unsafe block says why it is sound, in a `// SAFETY:` comment.
+undocumented_unsafe_blocks = "warn"
+
+[lints]
+workspace = true
