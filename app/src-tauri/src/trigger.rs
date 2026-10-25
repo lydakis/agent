@@ -2347,7 +2347,7 @@ fn watches_itself(places: &Places, store: Option<&Path>, watch: &Path) -> Result
 /// An agent's id by its name, now.
 async fn bot_id(client: &Client, name: &str) -> Result<i64, String> {
     let record = client
-        .request("resume", json!({"bot": name}))
+        .request("inspect", json!({"bot": name}))
         .await
         .map_err(coded)?;
     record["bot_id"]

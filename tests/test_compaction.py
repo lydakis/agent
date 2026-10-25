@@ -49,7 +49,7 @@ class AnthropicCompactionTests(ModelFixture):
         blocks = [b for m in first['messages'] for b in m['content']]
         self.assertTrue(any(b['type'] == 'tool_use' for b in blocks))
         self.assertTrue(any(b['type'] == 'tool_result' for b in blocks))
-        self.assertIsNotNone(client.request('resume', bot='Bob')['result']['compaction'])
+        self.assertIsNotNone(client.request('inspect', bot='Bob')['result']['compaction'])
         self.assertFalse(any(m.get('event') == 'compaction_failed' for m in client.saved))
 
     def test_a_summary_inside_a_turn_copies_the_call_before_it_whole(self):
@@ -130,13 +130,13 @@ class CompactionTests(ModelFixture):
         for n in range(15):
             self.assertEqual(self.run_turn(client, 'Bob', n, f'{n}: ' + 'x' * 150)['data']['status'],
                              'completed')
-        previous = client.request('resume', bot='Bob')['result']['compaction']
+        previous = client.request('inspect', bot='Bob')['result']['compaction']
         self.assertIsNotNone(previous)
         self.requests()
         for n in range(15, 20):
             self.assertEqual(self.run_turn(client, 'Bob', n, f'{n}: ' + 'x' * 1700)['data']['status'],
                              'completed')
-            current = client.request('resume', bot='Bob')['result']['compaction']
+            current = client.request('inspect', bot='Bob')['result']['compaction']
             self.assertNotEqual(current, previous)
             previous = current
         requests = self.requests()
@@ -168,7 +168,7 @@ class CompactionTests(ModelFixture):
         for n in range(12):
             text = 'x' * 500 if n % 2 == 0 else '\"\\\nλ' * 100
             self.assertEqual(self.run_turn(client, 'Bob', n, f'{n}: ' + text)['data']['status'], 'completed')
-        self.assertIsNotNone(client.request('resume', bot='Bob')['result']['compaction'])
+        self.assertIsNotNone(client.request('inspect', bot='Bob')['result']['compaction'])
         for offset in (0, 97):
             ended = self.run_turn(client, 'Bob', f'h-{offset}', f'history:1,{offset},97')
             self.assertEqual(ended['data']['status'], 'completed')
@@ -188,7 +188,7 @@ class CompactionTests(ModelFixture):
         self.create(client)
         for n in range(3):
             self.assertEqual(self.run_turn(client, 'Bob', n, str(n) * 500)['data']['status'], 'completed')
-        bot = client.request('resume', bot='Bob')['result']
+        bot = client.request('inspect', bot='Bob')['result']
         self.assertIsNone(bot['compaction'])
         self.assertEqual(bot['tokens_used'], 440)  # three answers plus the rejected summary
         self.assertTrue(any(m.get('event') == 'compaction_failed' and m.get('error') == 'compaction_not_smaller'
@@ -200,7 +200,7 @@ class CompactionTests(ModelFixture):
         self.create(client)
         for n in range(3):
             self.assertEqual(self.run_turn(client, 'Bob', n, str(n) * 500)['data']['status'], 'completed')
-        bot = client.request('resume', bot='Bob')['result']
+        bot = client.request('inspect', bot='Bob')['result']
         self.assertIsNone(bot['compaction'])
         self.assertEqual(bot['tokens_used'], 440)
         self.assertTrue(any(m.get('event') == 'compaction_failed' and m.get('error') == 'compaction_context_limit'
@@ -316,7 +316,7 @@ class CompactionTests(ModelFixture):
         requests = self.requests()
         self.assertEqual(sum(is_summary(r) for r in requests), 2)
         self.assertEqual(sum(not is_summary(r) for r in requests), 1)
-        self.assertIsNotNone(client.request('resume', bot='Bob')['result']['compaction'])
+        self.assertIsNotNone(client.request('inspect', bot='Bob')['result']['compaction'])
 
     def test_exhausted_summary_is_skipped_when_the_ordinary_call_resumes(self):
         for restart in (False, True):
@@ -371,7 +371,7 @@ class CompactionTests(ModelFixture):
         requests = self.requests()
         self.assertEqual(len(requests), 3)  # two answers, one summary; no fourth call
         self.assertEqual(sum(is_summary(r) for r in requests), 1)
-        self.assertEqual(client.request('resume', bot='Bob')['result']['tokens_used'], 330)
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['tokens_used'], 330)
         events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
         usage = [e['data'] for e in events if e['event'] == 'usage']
         self.assertEqual(sum(u['input_tokens'] + u['output_tokens'] for u in usage), 330)
@@ -379,7 +379,7 @@ class CompactionTests(ModelFixture):
         # The summary names the model that wrote it, so it is priced at that
         # model's rates even when that is not the turn's model.
         summary = next(u for u in usage if u.get('purpose') == 'compaction')
-        bob = client.request('resume', bot='Bob')['result']
+        bob = client.request('inspect', bot='Bob')['result']
         self.assertEqual([(m['provider'], m['model']) for m in summary['models']],
                          [(bob['provider'], bob['model'])])
         self.assertFalse(any(m.get('event') == 'text_delta' and '[compaction request]' in m.get('text', '')
@@ -399,7 +399,7 @@ class CompactionTests(ModelFixture):
             ended = self.run_turn(client, 'Bob', n, str(n) * 500)
         self.assertEqual(ended['data']['error'], 'budget_exhausted')
         self.assertEqual(len(self.requests()), 3)
-        bot = client.request('resume', bot='Bob')['result']
+        bot = client.request('inspect', bot='Bob')['result']
         self.assertEqual(bot['tokens_used'], 330)
         self.assertIsNone(bot['compaction'])
         self.assertTrue(any(m.get('event') == 'compaction_failed' and m.get('error') == 'empty_summary'
@@ -1034,7 +1034,7 @@ class SummaryCopyTests(ModelFixture):
         self.assertEqual(own, copy + 1)
         self.assertEqual(self.copies(requests[:own]), [copy])
         self.assertEqual((requests[own]['tools'], requests[own]['instructions']), ([], 'Summarize.'))
-        bot = client.request('resume', bot='Bob')['result']
+        bot = client.request('inspect', bot='Bob')['result']
         self.assertIsNotNone(bot['compaction'])
         self.assertEqual(bot['tokens_used'], 550)  # three answers and both summaries
         failed = [m for m in client.saved if m.get('event') == 'compaction_failed']
@@ -1064,7 +1064,7 @@ class SummaryCopyTests(ModelFixture):
                          ('synthetic-model', 'Summarize.', []))
         self.assertTrue(summary['prompt_cache_key'].endswith('-summary'))
         self.assertIsNone(self.model.routes[index])
-        self.assertIsNotNone(client.request('resume', bot='Bob')['result']['compaction'])
+        self.assertIsNotNone(client.request('inspect', bot='Bob')['result']['compaction'])
         self.assertEqual(self.request_of_its_own(client), self.own_bytes(summary))
 
     def test_a_turn_back_on_the_summarizer_does_not_copy_a_call_another_model_sent(self):
@@ -1158,5 +1158,5 @@ class SummaryCopyTests(ModelFixture):
         self.assertEqual((summary['model'], summary['instructions'], summary['tools']),
                          ('synthetic-small', 'Summarize.', []))
         self.assertTrue(summary['prompt_cache_key'].endswith('-summary'))
-        self.assertIsNotNone(client.request('resume', bot='Bob')['result']['compaction'])
+        self.assertIsNotNone(client.request('inspect', bot='Bob')['result']['compaction'])
         self.assertEqual(self.request_of_its_own(client), self.own_bytes(summary))

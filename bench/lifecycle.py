@@ -170,7 +170,7 @@ def run_once(binary, directory, config, mode, toolset, transport='stdio', memory
         restart_ms = (time.monotonic()-before)*1000
         before = time.monotonic()
         for bot, page in pages.items():
-            assert client.request('resume', bot=bot)['result']['status'] == 'completed'
+            assert client.request('inspect', bot=bot)['result']['status'] == 'completed'
             assert replay(client, engine, bot) == page
             read_items(client, engine, bot, page)
             assert client.request('submit', bot=bot, request_id='0', prompt=prompt(config,int(bot),0))['result']['duplicate']

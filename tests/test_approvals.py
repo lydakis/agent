@@ -112,7 +112,7 @@ class ApprovalTests(ModelFixture):
         self.assertEqual(waiting['data'], {'call_id': 'shell-1', 'approval': True, 'deadline_ms': None})
         stats = client.request('stats')['result']
         self.assertEqual((stats['active_turns'], stats['waiting_turns']), (0, 1))
-        self.assertEqual(client.request('resume', bot='Bob')['result']['status'], 'waiting')
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['status'], 'waiting')
         self.assertEqual(len(client.request('approvals')['result']['approvals']), 1)
         self.assertEqual(self.answer(client, turn, 'shell-1', request=0)['error'], 'approval_superseded')
         self.answer(client, turn, 'shell-1')
@@ -203,7 +203,7 @@ class ApprovalTests(ModelFixture):
         self.assertEqual(fork['gates'], [{'tag': 'manual', 'tools': ['shell']},
                                          {'tag': 'second', 'tools': ['echo', 'shell'], 'expire_ms': 60000}])
         # A bot created from a gated bot's shell keeps the gates its tools meet.
-        bob = client.request('resume', bot='Bob')['result']
+        bob = client.request('inspect', bot='Bob')['result']
         child = client.request('create', bot='Dan', workspace=str(self.path), tools=['echo', 'shell'],
                                created_by='Bob', created_by_id=bob['bot_id'])['result']
         self.assertEqual(child['gates'], [{'tag': 'manual', 'tools': ['shell']}])
@@ -301,7 +301,7 @@ class ApprovalTests(ModelFixture):
                          ('interrupted', 'approval_expired'))
         # Ended by the lapse, long before the turn it waited on.
         self.assertLess(time.monotonic() - parked, 2)
-        self.assertEqual(client.request('resume', bot='Alice')['result']['status'], 'running')
+        self.assertEqual(client.request('inspect', bot='Alice')['result']['status'], 'running')
         self.assertTrue(self.tool_output(client, 'shell-1')[0]['expired'])
         # The wait returned with its handle unresolved, not as a success.
         self.assertEqual(self.tool_output(client, 'wait-1')[1],
@@ -490,7 +490,7 @@ class ServedApprovalTests(ModelFixture):
                                      decision='deny', reason='not now')['result']['decision'], 'deny')
         self.assertEqual(daemon.finished(second)['data']['status'], 'completed')
         # The daemon counts the denial on the bot, and the next call carries it.
-        self.assertEqual(daemon.request('resume', bot='Bob')['result']['denials'],
+        self.assertEqual(daemon.request('inspect', bot='Bob')['result']['denials'],
                          {'auto': {'in_row': 1, 'in_turn': 1, 'turn': second}})
         third = daemon.request('submit', bot='Bob', request_id='c', prompt='shell:printf three')['result']['turn']
         [call] = self.pushed(approver, third)['data']['calls']
@@ -507,7 +507,7 @@ class ServedApprovalTests(ModelFixture):
         self.assertEqual([c['turn'] for c in taken['approvals']], [third])
         self.answer(other, third, 'shell-1', tag='auto', lease=taken['lease'])
         self.assertEqual(daemon.finished(third)['data']['status'], 'completed')
-        self.assertEqual(daemon.request('resume', bot='Bob')['result']['denials'],
+        self.assertEqual(daemon.request('inspect', bot='Bob')['result']['denials'],
                          {'auto': {'in_row': 0, 'in_turn': 1, 'turn': second}})
 
     def test_a_quiet_holder_loses_its_tag_to_the_next_server(self):
@@ -899,7 +899,7 @@ class AutoApproverTests(ModelFixture):
             env=clean_env(), capture_output=True, text=True, timeout=30)
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn('approver_name_taken', refused.stderr)
-        self.assertEqual(daemon.request('resume', bot='approver.auto')['result']['instructions'],
+        self.assertEqual(daemon.request('inspect', bot='approver.auto')['result']['instructions'],
                          'Help with the repo.')
         self.assertIn('result', daemon.request('delete', bot='approver.auto'))
         # An approver that stopped leaves its judge and a fork from mid-round:

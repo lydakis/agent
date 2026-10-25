@@ -107,7 +107,7 @@ class TurnCompactionAcceptanceTests(ModelFixture):
         self.assertIn('result', control.request('fork', source='Bob', bot='Branch',
                                                 checkpoint=checkpoint['node'],
                                                 workspace=str(fork_workspace)))
-        self.assertEqual(control.request('resume', bot='Branch')['result']['compaction'],
+        self.assertEqual(control.request('inspect', bot='Branch')['result']['compaction'],
                          second_cut['version'])
         fork_turn = control.request('submit', bot='Branch', request_id='f',
                                     prompt='tool:after the fork')['result']['turn']
@@ -151,7 +151,7 @@ class TurnCompactionAcceptanceTests(ModelFixture):
         client.close(kill=True)
         drain(self.model)
         client = self.client(tools='shell,read,echo', settings={'context_bytes': BUDGET})
-        resumed = client.request('resume', bot='Bob')['result']
+        resumed = client.request('inspect', bot='Bob')['result']
         self.assertEqual(resumed['status'], 'interrupted')
         time.sleep(.2)
         self.assertTrue(self.model.requests.empty())

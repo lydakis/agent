@@ -654,7 +654,7 @@ window.Daemon = (() => {
         }
         // A demo bot's only unfinished turn is the one it runs.
         case 'turns': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); return { turns: b.running_turn != null && params.after < b.running_turn ? [{ turn: b.running_turn, status: b.status }] : [], next_after: null }; }
-        case 'resume': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); return { ...b }; }
+        case 'inspect': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); return { ...b }; }
         case 'create': { await create(params.bot, params.model, params.created_by ?? null, null, params.workspace, null, params.effort ?? null); const b = S.bots.get(params.bot); if (params.budget_tokens) b.budget_tokens = params.budget_tokens; return { ...b }; }
         case 'submit': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); if (b.status !== 'idle' && params.delivery === 'reject') throw new Error('bot_busy');
           if (params.delivery === 'steer' && params.expected_turn != null && params.expected_turn !== b.running_turn) throw new Error('stale_turn');

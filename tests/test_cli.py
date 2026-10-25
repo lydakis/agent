@@ -248,6 +248,39 @@ class SocketAndCliTests(ModelFixture):
         failed = self.agent('wait', '--store', str(self.store), '--any', slow, check=False)
         self.assertEqual(failed.returncode, 1)
 
+    def test_inspect_and_wait_on_a_bot_by_name(self):
+        store = ['--store', str(self.store)]
+        self.agent('run', *self.common, '--new', '--bot', 'Bob', 'p0')
+        bob = json.loads(self.agent('inspect', *store, '--bot', 'Bob').stdout)
+        # The whole record: an ls row's fields, and its instructions and settings.
+        row = json.loads(self.agent('ls', *store, '--name', 'Bob').stdout)[0]
+        self.assertEqual({k: bob[k] for k in row}, row)
+        self.assertIn('settings', bob)
+        self.assertTrue(bob['instructions'])
+        self.assertEqual(json.loads(self.agent('inspect', *store, '--bot', 'Bob', '--bot-id', str(bob['bot_id'])).stdout), bob)
+        for flags in (('--bot', 'Bob', '--bot-id', str(bob['bot_id'] + 1)), ('--bot', 'Nobody')):
+            refused = self.agent('inspect', *store, *flags, check=False)
+            self.assertEqual((refused.returncode, json.loads(refused.stderr)['error']), (1, 'bot_not_found'))
+        self.assertIn('"name": "Bob"', self.agent('inspect', *store, '--bot', 'Bob', '--pretty').stdout)
+        # An idle bot's wait answers with its newest turn.
+        last = json.loads(self.agent('turns', *store, '--bot', 'Bob', '--newest', '--limit', '1').stdout)[0]['handle']
+        done = json.loads(self.agent('wait', *store, '--bot', 'Bob').stdout)
+        self.assertEqual(done['results'][last]['text'], 'reply:p0')
+        # A fork has no turns of its own yet.
+        self.agent('fork', *store, '--source', 'Bob', '--bot', 'Fresh')
+        none = self.agent('wait', *store, '--bot', 'Fresh', check=False)
+        self.assertEqual((none.returncode, json.loads(none.stderr)['error']), (1, 'no_turn'))
+        # A running turn is the one waited on, whoever submitted it.
+        slow = json.loads(self.agent('run', *store, '--bot', 'Bob', '--detach', 'wait').stdout)['handle']
+        polled = self.agent('wait', *store, '--bot', 'Bob', '--timeout', '0', check=False)
+        self.assertEqual((polled.returncode, json.loads(polled.stdout)['pending']), (1, [slow]))
+        self.agent('interrupt', *store, '--bot', 'Bob')
+        ended = self.agent('wait', *store, '--bot', 'Bob', '--bot-id', str(bob['bot_id']), check=False)
+        self.assertEqual((ended.returncode, list(json.loads(ended.stdout)['results'])), (1, [slow]))
+        for args in (('--bot', 'Bob', slow), ()):
+            refused = self.agent('wait', *store, *args, check=False)
+            self.assertEqual((refused.returncode, json.loads(refused.stderr)['error']), (2, 'usage'))
+
     def test_run_delivery_modes_from_the_cli(self):
         self.agent('run', *self.common, '--new', '--bot', 'Bob', 'p0')
         busy = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', 'slow').stdout)
@@ -487,7 +520,7 @@ class SocketAndCliTests(ModelFixture):
         self.agent('run', *self.again, *flags, '--bot', 'Bob', 'again')
         control = Connection(self.socket)
         self.addCleanup(control.close)
-        settings = control.request('resume', bot='Bob')['result']['settings']
+        settings = control.request('inspect', bot='Bob')['result']['settings']
         self.assertEqual((settings['context_bytes'], settings['context_items'], settings['compact_at'],
                           settings['keep_warm'], settings['cache_ttl'], settings['max_output_tokens']),
                          (1024, 2, 75, 0, '1h', None))
@@ -496,7 +529,7 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual(small.returncode, 1)
         self.assertEqual(json.loads(small.stderr), {'error': 'invalid_setting',
                                                     'detail': 'context_bytes is at least 1024'})
-        self.assertEqual(control.request('resume', bot='Small')['error'], 'bot_not_found')
+        self.assertEqual(control.request('inspect', bot='Small')['error'], 'bot_not_found')
         refused = self.agent('stats', '--store', str(self.store), '--idle-exit', '1s', check=False)
         self.assertIn('daemon_configuration_mismatch', refused.stderr)
         refused = self.agent('stats', '--store', str(self.store), '--stall-timeout', '2m', check=False)
@@ -509,7 +542,7 @@ class SocketAndCliTests(ModelFixture):
 
     def test_help_and_invalid_flags_do_not_start_a_daemon(self):
         for args in [('--help',), ('-h',), ('help', 'run')]+[(c, '--help') for c in
-                ('run', 'follow', 'fork', 'interrupt', 'ls', 'turns', 'wait', 'rm', 'prune', 'models', 'stats', 'shutdown', 'serve')]:
+                ('run', 'follow', 'fork', 'interrupt', 'ls', 'inspect', 'turns', 'wait', 'rm', 'prune', 'models', 'stats', 'shutdown', 'serve')]:
             with self.subTest(args=args):
                 result = self.agent(*args)
                 self.assertIn('Usage:', result.stdout)
@@ -626,7 +659,7 @@ class SocketAndCliTests(ModelFixture):
         follower.socket.sendall((json.dumps({'id': 'waiter', 'op': 'wait', 'handles': [handle]}) + '\n').encode())
         # This acknowledgment ensures the wait is registered before shutdown
         # arrives on the independent control connection.
-        follower.request('resume', bot='Bob')
+        follower.request('inspect', bot='Bob')
         client.request('shutdown')
         # Shutdown, not a client, cancelled the turn: the cause is its error.
         self.assertEqual(client.finished(turn)['data']['error'], 'daemon_shutdown')
@@ -865,7 +898,7 @@ class SocketAndCliTests(ModelFixture):
         self.addCleanup(control.close)
         self.assertIn('result', control.request('delete', bot='Bob'))
         self.agent('run', *self.common, '--new', '--bot', 'Bob', 'replacement')
-        replacement = control.request('resume', bot='Bob')['result']
+        replacement = control.request('inspect', bot='Bob')['result']
         self.assertNotEqual(replacement['bot_id'], by_name['Bob']['bot_id'])
         route = ('"$AGENT_BIN" run --detach --bot "$AGENT_PARENT" '
                  '--bot-id "$AGENT_PARENT_ID" -- should-not-deliver > route.out 2> route.err; '
@@ -873,7 +906,7 @@ class SocketAndCliTests(ModelFixture):
         self.agent('run', *self.again, '--bot', 'Alice', f'shell:{route}')
         self.assertEqual((self.path / 'route.status').read_text(), '1')
         self.assertIn('bot_not_found', (self.path / 'route.err').read_text())
-        self.assertEqual(control.request('resume', bot='Bob')['result']['head'], replacement['head'])
+        self.assertEqual(control.request('inspect', bot='Bob')['result']['head'], replacement['head'])
 
     def test_creator_identity_is_required_and_survives_daemon_restart(self):
         self.agent('run', *self.common, '--new', '--bot', 'Creator',
@@ -888,7 +921,7 @@ class SocketAndCliTests(ModelFixture):
         self.addCleanup(control.close)
         self.assertIn('result', control.request('delete', bot='Creator'))
         self.agent('run', *self.common, '--new', '--bot', 'Creator', 'replacement')
-        replacement = control.request('resume', bot='Creator')['result']
+        replacement = control.request('inspect', bot='Creator')['result']
         # A shell also names its turn, which must be the bot's own.
         shell_env['AGENT_TURN'] = str(control.request('turns', bot='Creator')['result']['turns'][-1]['turn'])
         for operation in ('create', 'fork'):
@@ -905,13 +938,13 @@ class SocketAndCliTests(ModelFixture):
                                         capture_output=True, text=True, timeout=15)
                 if identity == str(replacement['bot_id']):
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    child = control.request('resume', bot='Child')['result']
+                    child = control.request('inspect', bot='Child')['result']
                     self.assertEqual(child['created_by_id'], replacement['bot_id'])
                     self.assertIn('result', control.request('delete', bot='Child'))
                 else:
                     self.assertNotEqual(result.returncode, 0)
-                    self.assertNotIn('result', control.request('resume', bot='Child'))
-        self.assertEqual(control.request('resume', bot='Creator')['result']['head'], replacement['head'])
+                    self.assertNotIn('result', control.request('inspect', bot='Child'))
+        self.assertEqual(control.request('inspect', bot='Creator')['result']['head'], replacement['head'])
 
     def test_large_shell_output_is_previewed_and_retained_as_an_artifact(self):
         run = self.agent('run', *self.common, '--new', '--bot', 'Bob',
@@ -973,7 +1006,7 @@ class CliTests(ModelFixture):
                                         peer.sendall(b''.join((json.dumps(event)+'\n').encode() for event in events))
                                     send(dict(event='ready', protocol=PROTOCOL))
                                     request = json.loads(reader.readline())
-                                    if request['op'] == 'resume':
+                                    if request['op'] == 'inspect':
                                         # Snapshot while active, then finish before subscription.
                                         send(dict(id=request['id'], result=dict(name='Bob', running_turn=8, status='running')))
                                         request = json.loads(reader.readline())
@@ -986,7 +1019,7 @@ class CliTests(ModelFixture):
                                         send(dict(id=request['id'], result=dict(following='Bob', after=0)),
                                              *replay, dict(event='follow_live', bot='Bob', cursor=2))
                                         request = json.loads(reader.readline())
-                                        self.assertEqual(request['op'], 'resume')
+                                        self.assertEqual(request['op'], 'inspect')
                                         send(terminal, dict(id=request['id'], result=dict(name='Bob', running_turn=None, status=status)))
                         except Exception as error:
                             errors.append(error)
@@ -1082,7 +1115,7 @@ class CliTests(ModelFixture):
                 self.assertIn('daemon_start_timeout', result.stderr)
                 self.assertGreaterEqual(elapsed, 9)
                 self.assertLess(elapsed, 12)
-                self.assertEqual(owner.request('resume', bot='waiting')['error'], 'bot_not_found')
+                self.assertEqual(owner.request('inspect', bot='waiting')['error'], 'bot_not_found')
             finally:
                 owner.close()
 
@@ -1267,7 +1300,7 @@ class CliTests(ModelFixture):
                                     env=env, capture_output=True, text=True, timeout=2)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('blocking_tool_client', result.stderr)
-        self.assertEqual(client.control.request('resume', bot='blocked')['error'], 'bot_not_found')
+        self.assertEqual(client.control.request('inspect', bot='blocked')['error'], 'bot_not_found')
 
 
 class ListingModel(Model):

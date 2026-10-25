@@ -200,8 +200,12 @@ enum Command {
         /// it made, `duplicate: true`, instead of `bot_exists`.
         request_id: Option<String>,
     },
-    Resume {
+    /// A bot's whole record: what `bots` lists plus its instructions and
+    /// settings. A read; nothing about the bot changes.
+    Inspect {
         bot: String,
+        /// The identity `bot` must hold; another is `bot_not_found`.
+        bot_id: Option<i64>,
     },
     Fork {
         source: String,
@@ -2127,9 +2131,12 @@ impl Service {
                 });
                 Err(Error::new("deferred"))
             }
-            Command::Resume { bot } => {
+            Command::Inspect { bot, bot_id } => {
                 store
                     .op("inspect", move |db| {
+                        if bot_id.is_some() {
+                            db.identity(&bot, bot_id)?;
+                        }
                         Ok(serde_json::to_value(db.inspect(&bot)?)?)
                     })
                     .await

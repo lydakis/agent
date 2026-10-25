@@ -134,7 +134,7 @@ exist; `--new --bot NAME` creates it and fails with `bot_exists` if the name is
 taken; no `--bot` creates a fresh generated identity. A typo can therefore never
 silently start an empty conversation under a familiar name. Names are the
 address; the identity is a store-wide integer `bot_id` that `create`, `fork`,
-`resume`, `bots`, every `submit` answer, and the `created` and `forked` events
+`inspect`, `bots`, every `submit` answer, and the `created` and `forked` events
 report, and that is never reused
 after a delete. A fork is a new identity with an empty request namespace.
 
@@ -361,7 +361,7 @@ bound; the operating system is then the only limit.
 A bot's context, compaction, retention, approval hold and model-call
 settings are its own:
 `create` takes them as a `settings` object, the bot keeps them, a fork
-copies its source's, and `resume` reports every one as it applies, defaults
+copies its source's, and `inspect` reports every one as it applies, defaults
 included. A setting left out takes the default below; a value out of range
 answers `invalid_setting` naming it, and nothing is created. `agent run`
 sets them on a new bot with the flags shown; an existing bot keeps its own.
@@ -972,7 +972,7 @@ own path from the turn. Example requests:
 {"id":2,"op":"submit","bot":"Bob","request_id":"work-1","prompt":"Hello","workspace":"/workspaces/project-copy","model":"anthropic/claude-opus-5-5"}
 {"id":19,"op":"submit","bot":"Bob","request_id":"work-2","prompt":"Also check the docs","delivery":"steer"}
 {"id":3,"op":"follow","bot":"Bob","after":0}
-{"id":4,"op":"resume","bot":"Bob"}
+{"id":4,"op":"inspect","bot":"Bob"}
 {"id":5,"op":"events","bot":"Bob","after":0,"limit":100}
 {"id":20,"op":"history_nodes","bot":"Alternative","from":2,"limit":400}
 {"id":6,"op":"history_items","bot":"Bob","nodes":[2]}
@@ -1133,7 +1133,8 @@ does not, and each is one op:
 Protocol version 3 changes `bots` to return `{bots, next_after}`. It pages by
 name, with a default limit of 64, maximum 256, and a 512 KiB encoded metadata
 budget. Pass `next_after` as the next request's `after` until it is null. Pages
-omit instructions; `resume` returns the full individual bot record. Concurrent
+omit instructions; `inspect` returns the full individual bot record. With `bot_id`,
+a bot that no longer holds that identity is `bot_not_found`, as on `submit`. Concurrent
 creations before an already-consumed cursor require restarting the listing.
 `agent ls` reads pages incrementally while preserving its JSON-array output.
 Protocol version 12 lets `bots` filter on the daemon side: `name` keeps the
@@ -1241,7 +1242,7 @@ none, and `null` fails with `invalid_allow`. A tool outside the source's list
 fails with `allow_not_in_source`, so a fork never widens. The fork is still
 shown every tool, since changing the definitions would rebuild the provider
 cache; a call outside the list is refused at dispatch with
-`tool_not_available` and never waits for an approver. `resume` and `forked`
+`tool_not_available` and never waits for an approver. `inspect` and `forked`
 report `allowed` when a bot has one (schema 37). The point must leave no tool call unanswered, or the fork
 fails with `fork_point_has_open_tool_calls`; a node outside the source's
 lineage fails with `node_not_in_source_history`. A Responses reasoning node
@@ -1535,8 +1536,8 @@ decide whether to resubmit: `cancelled` for a client's `interrupt`,
 signal), and `process_interrupted` when the daemon died with it running and the
 next open ended it. The daemon never continues such a turn on its own.
 
-`resume` restores access to the exact identity and reports its state; it does not
-automatically continue an interrupted network request. A new submission is an
+`inspect` reports the identity's state and changes nothing; no operation
+automatically continues an interrupted network request. A new submission is an
 explicit new turn. Partial streaming text is marked `durable:false` and can be
 lost on crash. Completed messages survive. Paged `events` replay returns durable
 records; message/tool-result records reference stored nodes retrievable through
@@ -1775,7 +1776,7 @@ needs, and one optional policy composes them:
   other bots' work interleaves with a large deletion. The first piece marks
   the bot `deleting`: from then on `submit` and `fork` answer
   `bot_not_found`, `create` under the name still answers `bot_exists`, and
-  `resume` reports the status. Shutdown cancels and awaits pending retention
+  `inspect` reports the status. Shutdown cancels and awaits pending retention
   tasks before closing outputs; committed pieces remain. Whether shutdown
   or a crash interrupts deletion, the next open finishes it before readiness. Live
   followers receive a non-durable `deleted` notification. `agent rm --bot`.

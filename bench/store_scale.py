@@ -285,7 +285,7 @@ class Screen:
         out['events_page'] = self.twice(lambda: {'events': len(
             client.request('events', bot=self.heavy(0), after=0, limit=256)['result']['events'])})
         # Fork, delete the fork, delete one heavy bot with everything it owns.
-        head = client.request('resume', bot=self.heavy(1))['result']['head']
+        head = client.request('inspect', bot=self.heavy(1))['result']['head']
         _, out['fork_ms'] = self.timed('fork', source=self.heavy(1), checkpoint=head, bot=f'fork-{label}',
                                        workspace=str(self.store.parent))
         _, out['delete_fork_ms'] = self.timed('delete', bot=f'fork-{label}')
@@ -321,7 +321,7 @@ class Screen:
             db.executescript("DROP INDEX bots_id; ALTER TABLE bots DROP COLUMN id; DROP TABLE bot_sequence;"
                              " PRAGMA user_version=20;")
         out['migration_restart_ready_ms'] = self.connect()
-        assert self.client.request('resume', bot=self.heavy(0))['result']['bot_id'] > 0
+        assert self.client.request('inspect', bot=self.heavy(0))['result']['bot_id'] > 0
         # Copy values so later phases cannot rewrite an earlier checkpoint.
         out['peaks'] = {k: dict(v) for k, v in list(self.sampler.peaks.items())}
         self.sampler.phase = 'idle'
