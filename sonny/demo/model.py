@@ -1,7 +1,9 @@
-"""A scripted OpenAI Responses endpoint for demoing the TUI without an API key.
+"""A scripted OpenAI Responses endpoint for demoing Sonny without an API key.
 
-Each prompt runs the same small task: run the tests, fix the bug with `edit`,
-run them again, then stream a markdown summary. Usage: python3 model.py PORT
+A coordinator (its instructions carry the coordinator role) hands the work
+to a task; any other bot runs the same small task: run the tests, fix the
+bug with `edit`, run them again, then stream a markdown summary.
+Usage: python3 model.py PORT
 """
 import http.server, json, sys, time
 
@@ -30,7 +32,15 @@ class Model(http.server.BaseHTTPRequestHandler):
         last_user = max(i for i, item in enumerate(items) if item.get('role') == 'user')
         step = sum(item.get('type') == 'function_call_output' for item in items[last_user:])
         text, output = '', []
-        if step == 0:
+        lead = '# Role: coordinator' in request.get('instructions', '')
+        if lead and step == 0:
+            text = "That needs a fix and a test run, so I'll hand it to a task."
+            output = [call('shell', 'l1', command='"$AGENT_BIN" run --detach --new --bot "${AGENT_BOT%.lead}.fix-avg" '
+                           '--model "$AGENT_MODEL" -- "Fix the failing test"')]
+        elif lead:
+            text = ('Started `fix-avg`. It has its own window in Rex, '
+                    'so you can watch it or step in there.')
+        elif step == 0:
             text = "I'll run the tests first to see what fails."
             output = [call('shell', 's1', command='python3 test_calc.py')]
         elif step == 1:

@@ -1,4 +1,4 @@
-//! The folder's coordinator: opened with no `--bot`, agent-tui talks to the
+//! The folder's coordinator: opened with no `--bot`, Sonny talks to the
 //! project's lead, `<project>.lead`, the same bot the app opens for that
 //! folder, so the two clients share one conversation. A folder that is not
 //! a project yet becomes one the way the app makes it, through the app's
@@ -61,7 +61,7 @@ pub async fn open(
             return Ok(Lead { project, bot });
         }
         return Err(format!(
-            "project_exists: {bot} works in {}; open agent-tui there or pass --bot",
+            "project_exists: {bot} works in {}; open sonny there or pass --bot",
             found["workspace"].as_str().unwrap_or("another folder")
         ));
     }

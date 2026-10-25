@@ -14,17 +14,27 @@ use unicode_width::UnicodeWidthStr;
 #[derive(Default, Clone)]
 pub struct Markdown {
     fence: bool,
+    /// How far the last line's wrapped rows are indented: under a list
+    /// item's text, so a continuation does not read as a new item.
+    hang: usize,
 }
 
 impl Markdown {
+    /// What the last line's wrapped rows start with, inside a reply.
+    pub fn rest(&self) -> Span<'static> {
+        Span::raw(format!("  {}", " ".repeat(self.hang)))
+    }
+
     /// The styled line, or none for a fence marker, which is not shown.
     pub fn line(&mut self, text: &str) -> Option<Line<'static>> {
         let trimmed = text.trim_start();
+        self.hang = 0;
         if trimmed.starts_with("```") {
             self.fence = !self.fence;
             return None;
         }
         if self.fence {
+            self.hang = 2;
             return Some(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(text.to_owned(), Style::new().fg(Color::Cyan)),
@@ -38,6 +48,7 @@ impl Markdown {
         let indent = &text[..text.len() - trimmed.len()];
         for marker in ["- ", "* ", "+ "] {
             if let Some(rest) = trimmed.strip_prefix(marker) {
+                self.hang = indent.len() + 2;
                 let mut spans = vec![Span::raw(format!("{indent}- ")).dim()];
                 spans.extend(inline(rest, Style::new()));
                 return Some(Line::from(spans));
@@ -183,7 +194,7 @@ pub fn reply(text: &str, width: usize) -> Vec<Line<'static>> {
     for line in text.lines() {
         if let Some(styled) = markdown.line(line) {
             let lead = if out.is_empty() { "• " } else { "  " };
-            out.extend(wrap(styled, width, Span::raw(lead), Span::raw("  ")));
+            out.extend(wrap(styled, width, Span::raw(lead), markdown.rest()));
         }
     }
     out
@@ -390,6 +401,15 @@ mod tests {
                 "    line 3",
                 "    … +6 lines"
             ]
+        );
+    }
+
+    #[test]
+    fn a_wrapped_list_item_hangs_under_its_text() {
+        let rows = reply("- divide by len(values), not len(values) - 1", 30);
+        assert_eq!(
+            text(&rows),
+            ["• - divide by len(values), not ", "    len(values) - 1"]
         );
     }
 

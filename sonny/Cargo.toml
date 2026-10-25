@@ -1,12 +1,13 @@
 [package]
-name = "agent-tui"
+name = "sonny"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.92"
 license = "MIT OR Apache-2.0"
 publish = false
 
-# A terminal client for the daemon, beside the app. Prototype.
+# Sonny: a terminal client for the daemon, beside the app, that lays its
+# work out in Rex. Prototype.
 
 [dependencies]
 agent-client = { path = "../client" }

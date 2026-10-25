@@ -1,4 +1,4 @@
-//! A terminal client for one bot, beside the app: its conversation goes
+//! Sonny, a terminal client for one bot, beside the app: its conversation goes
 //! into the terminal's own scrollback as it happens, and a few rows at the
 //! bottom hold what is still moving: the reply being written, what the bot
 //! is doing, and the composer. Prototype.
@@ -9,6 +9,7 @@
 //! `• Ran …` line with a short `└` look at the result, and a status row
 //! says how long the turn has run and how to stop it.
 mod project;
+mod rex;
 mod transcript;
 
 use agent_client::{Client, Events};
@@ -54,11 +55,17 @@ struct Options {
     new: bool,
     model: Option<String>,
     workspace: Option<String>,
+    /// Lay the project's tasks out in Rex (on by default when rex is found).
+    rex: bool,
+    /// The Rex server the project's session lives on, when not this one.
+    rex_host: Option<String>,
 }
 
 fn usage() -> String {
-    "usage: agent-tui [--store PATH] [--socket PATH] [--model PROVIDER/MODEL] [--bot NAME [--new [--workspace DIR]]]\n\
-     With no --bot, the folder's coordinator, made with --model the first time."
+    "usage: sonny [--store PATH] [--socket PATH] [--model PROVIDER/MODEL] [--no-rex] [--rex-host HOST]\n\
+     \x20      [--bot NAME [--new [--workspace DIR]]]\n\
+     With no --bot, the folder's coordinator, made with --model the first time; its tasks\n\
+     open in the project's Rex session."
         .into()
 }
 
@@ -66,6 +73,7 @@ fn parse() -> Result<Options, String> {
     let mut args = std::env::args().skip(1);
     let (mut store, mut socket, mut bot, mut new, mut model, mut workspace) =
         (None, None, None, false, None, None);
+    let (mut rex, mut rex_host) = (true, None);
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or_else(usage);
         match arg.as_str() {
@@ -75,6 +83,8 @@ fn parse() -> Result<Options, String> {
             "--new" => new = true,
             "--model" => model = Some(value()?),
             "--workspace" => workspace = Some(value()?),
+            "--no-rex" => rex = false,
+            "--rex-host" => rex_host = Some(value()?),
             _ => return Err(usage()),
         }
     }
@@ -93,6 +103,8 @@ fn parse() -> Result<Options, String> {
         new,
         model,
         workspace,
+        rex,
+        rex_host,
     })
 }
 
@@ -101,7 +113,7 @@ async fn main() -> std::process::ExitCode {
     match run().await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("agent-tui: {error}");
+            eprintln!("sonny: {error}");
             std::process::ExitCode::FAILURE
         }
     }
@@ -150,6 +162,14 @@ async fn run() -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     let mut app = App::new(client, &name, &bot);
+    if let Some(project) = &project
+        && options.rex
+    {
+        app.fleet = Fleet::start(&options, project, &name).await;
+        if let Some(fleet) = &app.fleet {
+            app.notice = fleet.note.clone();
+        }
+    }
     app.project = project;
     let result = app.main(&mut terminal, &mut events).await;
     let _ = terminal.clear();
@@ -251,6 +271,114 @@ struct App {
     notice: Option<String>,
     quit: bool,
     started: Instant,
+    fleet: Option<Fleet>,
+}
+
+/// The lead's tasks, laid out in the project's Rex session: a window for
+/// each task while it works, opened as its turn starts. It follows every
+/// bot on its own connection, so the lead's own view is not disturbed.
+struct Fleet {
+    rex: rex::Rex,
+    _client: Arc<Client>,
+    events: Events,
+    live: bool,
+    project: String,
+    lead: String,
+    /// The lead and every bot it, or one of them, made.
+    lineage: std::collections::HashSet<String>,
+    /// How a task's window runs Sonny on it, without the bot's name.
+    command: Vec<String>,
+    /// Said once in the status row when Rex is set up.
+    note: Option<String>,
+}
+
+impl Fleet {
+    async fn start(options: &Options, project: &str, lead: &str) -> Option<Self> {
+        let bin = rex::find()?;
+        let rex = rex::Rex::open(bin.clone(), options.rex_host.as_deref(), project).ok()?;
+        let (client, events) = Client::connect(&options.socket).await.ok()?;
+        client
+            .request("follow", json!({"bot": "*", "after": 0}))
+            .await
+            .ok()?;
+        let me = std::env::current_exe().ok()?;
+        // Rex starts a block without this process's environment.
+        let command = vec![
+            me.to_string_lossy().into_owned(),
+            "--socket".into(),
+            options.socket.to_string_lossy().into_owned(),
+        ];
+        let mut note = format!("tasks open in Rex session {project}");
+        if let Some(skill) = rex::install_skill(&bin) {
+            note.push_str(&format!("; agents can use Rex through {}", skill.display()));
+        }
+        let mut fleet = Self {
+            rex,
+            _client: client.clone(),
+            events,
+            live: false,
+            project: project.to_owned(),
+            lead: lead.to_owned(),
+            lineage: [lead.to_owned()].into(),
+            command,
+            note: Some(note),
+        };
+        // Tasks named in the project's way, and the ones already working.
+        if let Ok(page) = client
+            .request(
+                "bots",
+                json!({"name": format!("{project}.*"), "limit": 256}),
+            )
+            .await
+        {
+            for bot in page["bots"].as_array().into_iter().flatten() {
+                let Some(name) = bot["name"].as_str() else {
+                    continue;
+                };
+                fleet.lineage.insert(name.to_owned());
+                if name != lead && !bot["running_turn"].is_null() {
+                    let _ = fleet.show(name);
+                }
+            }
+        }
+        Some(fleet)
+    }
+
+    fn show(&mut self, bot: &str) -> Result<bool, String> {
+        let mut command = self.command.clone();
+        command.extend(["--bot".into(), bot.into()]);
+        self.rex.show(bot, &command)
+    }
+
+    /// What the event did to the layout, as a line for the lead's view.
+    fn event(&mut self, event: &Value) -> Option<String> {
+        let kind = event["event"].as_str().unwrap_or("");
+        if !self.live {
+            self.live = kind == "follow_live";
+            return None;
+        }
+        let bot = event["bot"].as_str()?;
+        match kind {
+            "created" | "forked" => {
+                let by = event["data"]["created_by"].as_str().unwrap_or("");
+                if self.lineage.contains(by) || bot.starts_with(&format!("{}.", self.project)) {
+                    self.lineage.insert(bot.to_owned());
+                }
+                None
+            }
+            "accepted" if bot != self.lead && self.lineage.contains(bot) => match self.show(bot) {
+                Ok(true) => Some(format!("{bot} opened in Rex ({})", self.rex.label)),
+                Ok(false) => None,
+                Err(error) => Some(error),
+            },
+            "deleted" => {
+                self.rex.close(bot);
+                self.lineage.remove(bot);
+                None
+            }
+            _ => None,
+        }
+    }
 }
 
 impl App {
@@ -286,6 +414,7 @@ impl App {
             notice: None,
             quit: false,
             started: Instant::now(),
+            fleet: None,
         }
     }
 
@@ -294,6 +423,7 @@ impl App {
         self.history().await;
         // A turn already running: its clock, and any call it waits on.
         if let Some(turn) = self.running.as_ref().map(|r| r.turn) {
+            status_report("working", &self.bot);
             if let Ok(page) = self
                 .client
                 .request(
@@ -315,10 +445,22 @@ impl App {
             self.approvals_for(Some(turn)).await;
         }
         let (keys_tx, mut keys) = tokio::sync::mpsc::unbounded_channel();
+        // Poll, not a bare read: a blocked read holds crossterm's reader
+        // lock, and the cursor query the inline viewport makes on a resize
+        // then times out (Rex resizes a block as it lays it out).
         std::thread::spawn(move || {
-            while let Ok(event) = event::read() {
-                if keys_tx.send(event).is_err() {
-                    break;
+            while !keys_tx.is_closed() {
+                match event::poll(Duration::from_millis(50)) {
+                    Ok(false) => {}
+                    Ok(true) => match event::read() {
+                        Ok(event) => {
+                            if keys_tx.send(event).is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    },
+                    Err(_) => break,
                 }
             }
         });
@@ -337,6 +479,17 @@ impl App {
                     }
                 },
                 Some(key) = keys.recv() => self.key(key).await,
+                Some(event) = async {
+                    match &mut self.fleet {
+                        Some(fleet) => fleet.events.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let said = self.fleet.as_mut().and_then(|fleet| fleet.event(&event));
+                    if let Some(said) = said {
+                        self.commit(vec![Line::from(format!("  ↳ {said}")).dim()]);
+                    }
+                }
                 _ = tick.tick() => {}
             }
         }
@@ -455,7 +608,8 @@ impl App {
     fn live_line(&mut self, live: &mut Live, line: &str) {
         if let Some(styled) = live.markdown.line(line) {
             let lead = if live.lines == 0 { "• " } else { "  " };
-            let rows = transcript::wrap(styled, self.width, Span::raw(lead), Span::raw("  "));
+            let rest = live.markdown.rest();
+            let rows = transcript::wrap(styled, self.width, Span::raw(lead), rest);
             live.lines += rows.len();
             self.pending.extend(rows);
             self.any_history = true;
@@ -778,7 +932,7 @@ impl App {
                 if let Some(line) = markdown.line(&open.partial) {
                     let lead = if open.lines == 0 { "• " } else { "  " };
                     // The open line's end, when it is already wider than a row.
-                    let rows = transcript::wrap(line, width, Span::raw(lead), Span::raw("  "));
+                    let rows = transcript::wrap(line, width, Span::raw(lead), markdown.rest());
                     frame.render_widget(
                         Paragraph::new(rows.last().cloned().unwrap_or_default()),
                         live,
@@ -824,15 +978,15 @@ impl App {
                 .or_else(|| call["arguments"]["path"].as_str())
                 .map(first_line)
                 .unwrap_or_default();
+            // The keys first, so a narrow pane still shows how to answer.
             return Line::from(vec![
                 Span::raw("⏸ ").fg(Color::Yellow),
-                Span::raw(format!("Allow {name} ")).bold(),
-                Span::raw(what),
-                Span::raw("?  ").bold(),
+                Span::raw(format!("Allow {name}? ")).bold(),
                 Span::raw("y").bold(),
                 Span::raw(" allow · ").dim(),
                 Span::raw("n").bold(),
-                Span::raw(" deny").dim(),
+                Span::raw(" deny  ").dim(),
+                Span::raw(what),
             ]);
         }
         if let Some(running) = &self.running {
