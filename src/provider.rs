@@ -488,6 +488,10 @@ impl Provider {
     pub fn family(&self) -> Family {
         self.family
     }
+    /// The endpoint requests go to.
+    pub fn url(&self) -> &reqwest::Url {
+        &self.url
+    }
 
     /// Planning estimate only: tokens do not bound encoded JSON bytes.
     /// An unset Responses cap is unknown, not an invented output limit.

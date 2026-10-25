@@ -81,11 +81,22 @@ impl Span<'_> {
     };
 }
 
-/// A stable fingerprint of the context in front of a window: the encoded
-/// prefix and the first item. FNV-1a, so it survives restarts and upgrades.
-fn fingerprint(prefix: &[u8], first: i64) -> i64 {
+/// A stable fingerprint of what a window's thinking is bound to: the
+/// encoded prefix in front of it, its first item, and the endpoint and model
+/// that read it back. A signature is only valid for the model that wrote it,
+/// on the endpoint that holds its key. FNV-1a, so it survives restarts and
+/// upgrades.
+fn fingerprint(prefix: &[u8], first: i64, url: &str, model: &str) -> i64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in prefix.iter().chain(&first.to_le_bytes()) {
+    let reader = [url, model].map(|part| (part.len() as u64).to_le_bytes());
+    for byte in prefix
+        .iter()
+        .chain(&first.to_le_bytes())
+        .chain(&reader[0])
+        .chain(url.as_bytes())
+        .chain(&reader[1])
+        .chain(model.as_bytes())
+    {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
@@ -627,10 +638,12 @@ impl Turn {
     }
 
     /// Anthropic thinking replay. Each thinking block is bound to the exact
-    /// context before it. Once the context in front of the window changes
-    /// (the window slides, a compaction or note lands, or a fork starts from
-    /// other instructions), every block written under the old one is sent
-    /// without thinking. When the elision floor moves, only the blocks after
+    /// context before it and to the model and endpoint that wrote it. Once
+    /// the context in front of the window changes (the window slides, a
+    /// compaction or note lands, or a fork starts from other instructions),
+    /// or the request goes to another model or endpoint (a turn's own model,
+    /// a fork on another model, a provider name bound elsewhere), every
+    /// block written under the old one is sent without thinking. When the elision floor moves, only the blocks after
     /// the first newly stubbed result are: those before it still follow what
     /// they were written after, and the provider's cache still holds them.
     /// Blocks written after a change keep theirs. Other families send items
@@ -639,25 +652,29 @@ impl Turn {
         &self,
         record: &mut agent_runtime::store::Bot,
         context: &mut Context,
+        (provider, model): (&Provider, &str),
     ) -> Result<()> {
         if let Some(window) = &context.window {
-            context.thinking = self.bound(record, &context.prefix.bytes, window).await?;
+            context.thinking = self
+                .bound(record, &context.prefix.bytes, window, (provider, model))
+                .await?;
         }
         Ok(())
     }
 
-    /// The strip for `window` sent behind `prefix`, recorded on the bot as
-    /// what its next request sends.
+    /// The strip for `window` sent behind `prefix` to `model` on `provider`,
+    /// recorded on the bot as what its next request sends.
     async fn bound(
         &self,
         record: &mut agent_runtime::store::Bot,
         prefix: &[u8],
         window: &Window,
+        (provider, model): (&Provider, &str),
     ) -> Result<Strip> {
         if window.family != agent_runtime::codec::Family::Anthropic || window.ids.is_empty() {
             return Ok(Strip::default());
         }
-        let prefix = fingerprint(prefix, window.ids[0]);
+        let prefix = fingerprint(prefix, window.ids[0], provider.url().as_str(), model);
         let (next, elided) = (window.ids[window.ids.len() - 1] + 1, window.elided);
         let mut strip = record.thinking;
         if record.thinking_prefix != Some(prefix) || elided < record.thinking_elided {
@@ -1248,7 +1265,7 @@ impl Turn {
                     (&view, whole),
                     ahead.as_ref(),
                     &plan,
-                    summarizer.family(),
+                    (&summarizer, split_model(&reference)?.1),
                     &instructions,
                     tools,
                     accounting,
@@ -1534,11 +1551,12 @@ impl Turn {
         (view, whole): (&'a Context, bool),
         ahead: Option<&Bytes>,
         plan: &agent_runtime::store::CompactionPlan,
-        family: agent_runtime::codec::Family,
+        (summarizer, model): (&Provider, &str),
         instructions: &str,
         tools: &serde_json::value::RawValue,
         accounting: &mut Accounting,
     ) -> Result<(Choice, Option<(&'a Window, usize, Strip, Bytes)>)> {
+        let family = summarizer.family();
         let span = view.window.as_ref().and_then(|window| {
             let at = window.ids.binary_search(plan.ids.first()?).ok()?;
             let span = at..at + plan.ids.len();
@@ -1552,7 +1570,9 @@ impl Turn {
             instructions,
             plan.summary_bytes,
         )?);
-        let thinking = self.bound(record, &view.prefix.bytes, window).await?;
+        let thinking = self
+            .bound(record, &view.prefix.bytes, window, (summarizer, model))
+            .await?;
         let sent = if whole { window.ids.len() } else { span.end };
         let choice = choose(&Shape {
             family,
@@ -2094,7 +2114,8 @@ impl Turn {
                 },
                 Err(error) => return Err(error),
             };
-            self.bind_thinking(&mut record, &mut context).await?;
+            self.bind_thinking(&mut record, &mut context, (provider, model))
+                .await?;
             // This call's view replaces the last one's, which goes before
             // the call streams.
             drop(last.take());
