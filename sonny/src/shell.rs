@@ -33,6 +33,12 @@ pub fn parts(command: &str) -> Vec<String> {
                 i = end;
                 continue;
             }
+            '$' if chars.get(i + 1) == Some(&'{') => {
+                let end = braces(&chars, i + 1);
+                part.extend(&chars[i..end]);
+                i = end;
+                continue;
+            }
             '<' if chars.get(i + 1) == Some(&'<') && chars.get(i + 2) != Some(&'<') => {
                 let (delimiter, strip, end) = delimiter(&chars, i + 2);
                 part.extend(&chars[i..end]);
@@ -152,20 +158,34 @@ pub fn simple(command: &str) -> Option<Simple> {
                     .push_str(&substituted(&chars[i..end]));
                 i = end;
             }
+            // `${…}` is one word whatever it holds, as in
+            // `${AGENT_EFFORT:+--effort "$AGENT_EFFORT"}`.
+            '$' if chars.get(i + 1) == Some(&'{') => {
+                let end = braces(&chars, i + 1);
+                word.get_or_insert_with(String::new).extend(&chars[i..end]);
+                i = end;
+            }
             ' ' | '\t' => {
                 words.extend(word.take());
                 i += 1;
             }
             '\n' => {
                 words.extend(word.take());
-                if let Some((delimiter, strip)) = heredoc.take() {
-                    let (text, end) = body(&chars, i + 1, &delimiter, strip);
-                    stdin = Some(text);
-                    i = end;
-                } else {
-                    i += 1;
+                let (delimiter, strip) = heredoc.take()?;
+                let (text, end) = body(&chars, i + 1, &delimiter, strip);
+                stdin = Some(text);
+                i = end;
+                // Anything after the document is another command.
+                if chars[i.min(chars.len())..]
+                    .iter()
+                    .any(|c| !c.is_whitespace())
+                {
+                    return None;
                 }
             }
+            // More than one command.
+            ';' => return None,
+            '&' | '|' if chars.get(i + 1) == Some(&c) => return None,
             '|' => {
                 words.extend(word.take());
                 let rest: String = chars[i + 1..].iter().collect();
@@ -235,6 +255,31 @@ fn quoted(chars: &[char], start: usize) -> usize {
             }
             _ => i += 1,
         }
+    }
+    chars.len()
+}
+
+/// Where a parameter expansion whose `{` is at `open` ends, past its `}`.
+fn braces(chars: &[char], open: usize) -> usize {
+    let mut depth = 0;
+    let mut i = open;
+    while i < chars.len() {
+        match chars[i] {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            '\'' | '"' => {
+                i = quoted(chars, i);
+                continue;
+            }
+            '\\' => i += 1,
+            _ => {}
+        }
+        i += 1;
     }
     chars.len()
 }

@@ -61,6 +61,24 @@ pub fn said(command: &str, output: &str, failed: bool) -> Option<Said> {
     let mut said = match name {
         "$AGENT_BIN" | "${AGENT_BIN}" | "agent" => agent(args, stdin, output, failed),
         "$REX" | "${REX}" | "rex" => rex(args, output, failed),
+        "memory" if program.contains(".agent/memory") => Some(Said {
+            verb: match args.first().map(String::as_str) {
+                Some("show") | None => "Read the memory indexes".into(),
+                Some(other) => format!("Used memory {other}"),
+            },
+            what: String::new(),
+            under: Vec::new(),
+            failed,
+        }),
+        "project" if program.contains(".agent/project") => Some(Said {
+            verb: match args.first().map(String::as_str) {
+                Some("add") => "Added the project".into(),
+                _ => "Read the help for the project script".into(),
+            },
+            what: args.get(1).cloned().unwrap_or_default(),
+            under: Vec::new(),
+            failed,
+        }),
         "plan" if program.contains("skills/plan") => plan(args),
         "sonny" if args.first().is_some_and(|a| a == "show") => sonny_show(&args[1..], failed),
         "sh" | "bash"
@@ -72,7 +90,12 @@ pub fn said(command: &str, output: &str, failed: bool) -> Option<Said> {
         }
         _ => None,
     }?;
-    if let Some(piped) = &simple.piped {
+    // Where its output went, unless only cut short.
+    if let Some(piped) = simple
+        .piped
+        .as_deref()
+        .filter(|p| !matches!(p.split_whitespace().next(), Some("head" | "tail")))
+    {
         said.under.push(dim(format!("| {}", first_line(piped))));
     }
     Some(said)
@@ -121,6 +144,10 @@ impl<'a> Args<'a> {
         let mut plain = Vec::new();
         let mut words = self.words.iter().skip(skip).peekable();
         while let Some(word) = words.next() {
+            // `${VAR:+--flag "$VAR"}` is an option or nothing.
+            if word.starts_with("${") {
+                continue;
+            }
             if word.starts_with("--") {
                 if !word.contains('=') && !SWITCHES.contains(&word.as_str()) {
                     words.next();
@@ -171,6 +198,18 @@ fn dim(text: impl Into<String>) -> Line<'static> {
 }
 
 fn agent(words: &[String], stdin: Option<&str>, output: &str, failed: bool) -> Option<Said> {
+    if words
+        .iter()
+        .take_while(|w| w.starts_with('-'))
+        .any(|w| w == "--help" || w == "-h")
+    {
+        return Some(Said {
+            verb: "Read agent's help".into(),
+            what: String::new(),
+            under: Vec::new(),
+            failed,
+        });
+    }
     // Options may come before the command.
     let mut words = words;
     while let Some(first) = words.first().filter(|w| w.starts_with("--")) {
@@ -181,8 +220,32 @@ fn agent(words: &[String], stdin: Option<&str>, output: &str, failed: bool) -> O
         };
         words = words.get(skip..)?;
     }
-    let (verb, rest) = words.split_first()?;
+    let Some((verb, rest)) = words.split_first() else {
+        // `agent --help`, or options alone.
+        return Some(Said {
+            verb: "Read agent's help".into(),
+            what: String::new(),
+            under: Vec::new(),
+            failed,
+        });
+    };
     let args = Args::new(rest);
+    if verb == "help" || args.has("--help") || args.has("-h") {
+        let topic = if verb == "help" {
+            args.plain(0)
+                .first()
+                .map(|t| t.to_string())
+                .unwrap_or_default()
+        } else {
+            verb.clone()
+        };
+        return Some(Said {
+            verb: "Read the help for".into(),
+            what: format!("agent {topic}").trim().to_owned(),
+            under: Vec::new(),
+            failed,
+        });
+    }
     let bot = args.value(&["--bot"]).map(str::to_owned);
     let reply: Option<Value> = serde_json::from_str(output.trim()).ok();
     let refusal = reply.as_ref().and_then(|r| {
@@ -272,6 +335,12 @@ fn agent(words: &[String], stdin: Option<&str>, output: &str, failed: bool) -> O
                 if !names.is_empty() {
                     said.under.push(dim(names.join(", ")));
                 }
+            } else {
+                // `--pretty`: one agent a row, its name and status first.
+                let rows: Vec<String> = output.lines().filter_map(listed_row).collect();
+                if !rows.is_empty() {
+                    said.under.push(dim(rows.join(", ")));
+                }
             }
         }
         "rm" => said.verb = "Removed".into(),
@@ -301,6 +370,28 @@ fn agent(words: &[String], stdin: Option<&str>, output: &str, failed: bool) -> O
     }
     Some(said)
 }
+
+/// A row of `agent ls --pretty`, as `name (status)`.
+pub fn listed_row(line: &str) -> Option<String> {
+    let mut fields = line.split_whitespace();
+    let (name, status) = (fields.next()?, fields.next()?);
+    STATUSES
+        .contains(&status)
+        .then(|| format!("{name} ({status})"))
+}
+
+const STATUSES: &[&str] = &[
+    "running",
+    "completed",
+    "idle",
+    "queued",
+    "failed",
+    "interrupted",
+    "waiting",
+    "steered",
+    "blocked",
+    "paced",
+];
 
 /// The bot a `turn:BOT/N` handle names.
 pub fn handle_bot(handle: &str) -> String {
@@ -352,7 +443,9 @@ fn rex(words: &[String], output: &str, failed: bool) -> Option<Said> {
     };
     let (verb, rest) = words.split_first()?;
     let (verb, rest) = match (verb.as_str(), rest.split_first()) {
-        ("block" | "window" | "session", Some((sub, rest))) => (format!("{verb} {sub}"), rest),
+        ("block" | "window" | "session" | "__internal" | "skill", Some((sub, rest))) => {
+            (format!("{verb} {sub}"), rest)
+        }
         _ => (verb.clone(), rest),
     };
     let args = Args::new(rest);
@@ -420,6 +513,9 @@ fn rex(words: &[String], output: &str, failed: bool) -> Option<Said> {
         "block close" | "window close" | "close" => {
             said.verb = "Closed Rex".into();
             said.what = args.plain(0).first().map(|t| target(t)).unwrap_or_default();
+        }
+        "__internal skill" | "skill show" | "skill" => {
+            said.verb = "Read Rex's guide for agents".into();
         }
         "ls" | "block ls" | "window ls" | "hosts" => {
             said.verb = match verb.as_str() {

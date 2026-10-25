@@ -240,35 +240,58 @@ pub fn tool(
                 !matches!(
                     p.as_str(),
                     "done" | "fi" | "esac" | "then" | "else" | "do" | "{" | "}"
-                )
+                ) && !assignment(p)
             })
             .collect();
         // What the agent calls printed goes back under the call that
         // printed it; the rest goes under the last command.
         let mut printed: Vec<&str> = output.unwrap_or("").lines().collect();
-        let mut claim = |is: &dyn Fn(&Value) -> bool| -> Option<String> {
+        fn claim(printed: &mut Vec<&str>, is: &dyn Fn(&Value) -> bool) -> Option<String> {
             let at = printed.iter().position(|line| {
                 serde_json::from_str::<Value>(line.trim()).is_ok_and(|v| is(&v))
             })?;
             Some(printed.remove(at).to_owned())
-        };
+        }
         let mut said: Vec<Option<crate::calls::Said>> = Vec::new();
         for part in &parts {
             let mut own = String::new();
             if let Some(first) = crate::calls::said(part, "", false) {
-                if matches!(
+                if first.verb == "Listed agents" {
+                    let mut rows = Vec::new();
+                    while let Some(at) = printed
+                        .iter()
+                        .position(|l| crate::calls::listed_row(l).is_some())
+                    {
+                        rows.push(printed.remove(at));
+                    }
+                    own = rows.join("\n");
+                } else if matches!(
                     first.verb.as_str(),
                     "Started" | "Messaged" | "Queued for" | "Steered"
                 ) {
-                    own = claim(&|v| v.get("handle").is_some() || v.get("error").is_some())
-                        .unwrap_or_default();
+                    own = claim(&mut printed, &|v| {
+                        v.get("handle").is_some() || v.get("error").is_some()
+                    })
+                    .unwrap_or_default();
                 } else if first.verb == "Moved" {
-                    claim(&|v| v.get("session").is_some() && v.get("bot").is_some());
+                    claim(&mut printed, &|v| {
+                        v.get("session").is_some() && v.get("bot").is_some()
+                    });
                 }
             }
             said.push(crate::calls::said(part, &own, false));
         }
+        // What the known calls print says nothing their line does not.
+        printed.retain(|line| {
+            let line = line.trim();
+            !(line.starts_with("plan saved: ") || line == "plan cleared")
+                && !serde_json::from_str::<Value>(line)
+                    .is_ok_and(|v| v.get("project").is_some() && v.get("user").is_some())
+        });
         let count = parts.len();
+        // The rest of the output goes under the last command shown as run.
+        let last_ran = said.iter().rposition(Option::is_none);
+        let rest = printed.join("\n");
         for (i, (part, said)) in parts.iter().zip(said).enumerate() {
             match said {
                 Some(mut said) => {
@@ -287,11 +310,13 @@ pub fn tool(
                         Span::raw(part.lines().next().unwrap_or("").to_owned()),
                     ]);
                     out.extend(wrap(line, width, bullet, gap()));
+                    if Some(i) == last_ran && !rest.trim().is_empty() {
+                        out.extend(preview(&rest, width));
+                    }
                 }
             }
         }
-        let rest = printed.join("\n");
-        if !rest.trim().is_empty() || count == 0 {
+        if last_ran.is_none() && !rest.trim().is_empty() {
             out.extend(preview(&rest, width));
         }
         return out;
@@ -365,6 +390,17 @@ pub fn tool(
         _ => {}
     }
     out
+}
+
+/// A command that only sets a variable, as `result=$?`.
+fn assignment(part: &str) -> bool {
+    crate::shell::simple(part).is_some_and(|simple| {
+        simple.words.iter().all(|word| {
+            word.split_once('=').is_some_and(|(name, _)| {
+                !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            })
+        })
+    })
 }
 
 /// A call said as an action, with up to two rows of each line under it.
@@ -687,5 +723,90 @@ mod tests {
         assert_eq!(elapsed(9), "9s");
         assert_eq!(elapsed(65), "1m 05s");
         assert_eq!(elapsed(3723), "1h 02m 03s");
+    }
+}
+
+#[cfg(test)]
+mod real_calls {
+    use super::*;
+
+    /// No agent call is left showing as the shell command it was.
+    fn show(command: &str, stdout: &str, failed: bool) {
+        let rows = tool(
+            "shell",
+            &serde_json::json!({"command": command}),
+            Some(stdout),
+            failed,
+            "/",
+            72,
+        );
+        for row in rows {
+            let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(
+                !text.contains("AGENT_BIN")
+                    && !text.contains("skills/plan")
+                    && !text.contains("sonny show"),
+                "{command}\n  drew: {text}"
+            );
+        }
+    }
+
+    /// The calls the lead and its tasks made in the first live runs.
+    #[test]
+    fn every_agent_call_from_a_real_run_reads_as_an_action() {
+        let effort = r#"${AGENT_EFFORT:+--effort "$AGENT_EFFORT"}"#;
+        show(
+            &format!(
+                r#""$AGENT_BIN" run --detach --new --agents --model "$AGENT_MODEL" {effort} --bot calc.fix-tests --workspace "$PWD" -- 'The person says tests in this folder fail and asks you to fix them. This folder is not a git repository.'"#
+            ),
+            r#"{"bot":"calc.fix-tests","bot_id":2,"cursor":33,"duplicate":false,"handle":"turn:calc.fix-tests/2","request_id":"r","status":"running","turn":2}"#,
+            false,
+        );
+        show(
+            r#""$AGENT_BIN" ls --pretty | head -100"#,
+            "calc.lead                running     chatgpt/gpt-6-sol  /private/tmp/sonny-live/calc\n",
+            false,
+        );
+        show(
+            &format!(
+                r#""$AGENT_BIN" ls --pretty; cat test_calc.py; "$AGENT_BIN" run --detach --delivery queue --model "$AGENT_MODEL" {effort} --bot calc.fix-tests -- 'Please add an explicit test for average of a single number.'"#
+            ),
+            "calc.fix-tests           completed   chatgpt/gpt-6-sol  /tmp/calc\ncalc.lead                running     chatgpt/gpt-6-sol  /tmp/calc\nfrom calc import average\ncases = []\n{\"bot\":\"calc.fix-tests\",\"handle\":\"turn:calc.fix-tests/4\",\"status\":\"queued\",\"turn\":4}",
+            false,
+        );
+        show(
+            &format!(
+                r#""$AGENT_BIN" run --detach --delivery queue --model "$AGENT_MODEL" {effort} --bot calc.fix-tests -- 'Add a test.'"#
+            ),
+            r#"{"detail":null,"error":"bot_not_found"}"#,
+            true,
+        );
+        show(
+            r#"rex __internal skill; "$AGENT_BIN" ls --pretty; "$AGENT_BIN" run --help"#,
+            "calc.lead                running     chatgpt/gpt-6-sol  /tmp/calc\nUsage: agent run [OPTIONS] [--] PROMPT...\n/bin/sh: rex: command not found",
+            false,
+        );
+        show(
+            r#""$AGENT_BIN" --help; "$HOME/.agent/project" --help; ls /Applications | grep -Ei 'rex|agent|sonny'"#,
+            "Usage: agent COMMAND [OPTIONS]\n",
+            false,
+        );
+        show(
+            &format!(
+                r#""$AGENT_BIN" run --detach --new --agents --model "$AGENT_MODEL" {effort} --bot calc.single-negative --workspace "$PWD" -- 'The person explicitly requests a new task.'; "/Users/x/sonny" show calc.single-negative --split right"#
+            ),
+            "{\"bot\":\"calc.single-negative\",\"handle\":\"turn:calc.single-negative/13\",\"status\":\"running\",\"turn\":13}\n{\"bot\":\"calc.single-negative\",\"session\":\"calc\"}",
+            false,
+        );
+        show(
+            r#"sh "$HOME/.agents/skills/plan/plan" '[x] Read memory and existing tests' '[x] Add single-negative regression case' '[>] Run tests and report exact changes'; python3 test_calc.py; result=$?; printf 'Exit code: %s\n' "$result"; sh "$HOME/.agents/skills/plan/plan" --clear"#,
+            "plan saved: 3 steps\n6 passed, 0 failed\nExit code: 0\nplan cleared",
+            false,
+        );
+        show(
+            r#""$HOME/.agent/memory" show; cat test_calc.py; sh "$HOME/.agents/skills/plan/plan" '[>] Inspect current calculator tests' '[ ] Add negative-number case only'"#,
+            "{}\nfrom calc import average",
+            false,
+        );
     }
 }
