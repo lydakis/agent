@@ -973,7 +973,7 @@ own path from the turn. Example requests:
 {"id":19,"op":"submit","bot":"Bob","request_id":"work-2","prompt":"Also check the docs","delivery":"steer"}
 {"id":3,"op":"follow","bot":"Bob","after":0}
 {"id":4,"op":"inspect","bot":"Bob"}
-{"id":24,"op":"configure","bot":"Bob","bot_id":1,"instructions":"..."}
+{"id":24,"op":"configure","bot":"Bob","bot_id":1,"instructions":"...","model":"anthropic/claude-opus-5-5","effort":"high"}
 {"id":5,"op":"events","bot":"Bob","after":0,"limit":100}
 {"id":20,"op":"history_nodes","bot":"Alternative","from":2,"limit":400}
 {"id":6,"op":"history_items","bot":"Bob","nodes":[2]}
@@ -1139,10 +1139,13 @@ a bot that no longer holds that identity is `bot_not_found`, as on `submit`. Con
 creations before an already-consumed cursor require restarting the listing.
 `agent ls` reads pages incrementally while preserving its JSON-array output.
 Protocol version 14 adds `configure`, which changes what a bot's client
-chose for it when it was made; so far its `instructions` (up to 64 KiB, as on
-`create`). A bot's instructions are otherwise fixed when it is made, so a
+chose for it when it was made: its `instructions` (up to 64 KiB, as on
+`create`), and its `model` with an optional `effort` (absent is the model's
+default). A bot's instructions are otherwise fixed when it is made, so a
 client recomposes them (skills, memory, folder rules added since) and sends
-them here. It answers `{bot, bot_id, changed}`, `changed` naming the fields
+them here. A model must be of the bot's family, as a turn's own model must,
+since its history is kept in that family's encoding
+(`provider_family_mismatch`). It answers `{bot, bot_id, changed}`, `changed` naming the fields
 that differed; the same text again changes nothing, so a resend is harmless.
 It is refused with `bot_busy` while a turn runs, and the next turn sends the
 new instructions: the provider's cache of the old ones is not read again,

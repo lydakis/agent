@@ -1748,6 +1748,24 @@ impl Database {
         )?;
         Ok(changed == 1)
     }
+    /// Point a bot at another model of its family, and its effort level;
+    /// whether either changed. The daemon has checked both.
+    pub fn set_model(
+        &mut self,
+        name: &str,
+        bot_id: Option<i64>,
+        provider: &str,
+        model: &str,
+        effort: Option<&str>,
+    ) -> Result<bool> {
+        let id = self.identity(name, bot_id)?;
+        let changed = self.conn.execute(
+            "UPDATE bots SET provider=?, model=?, reasoning=? WHERE id=?
+             AND (provider<>? OR model<>? OR reasoning IS NOT ?)",
+            params![provider, model, effort, id, provider, model, effort],
+        )?;
+        Ok(changed == 1)
+    }
     /// Bounded keyset pages. Full instructions remain available through inspect.
     /// A page of bots in name order after `after`. `name` keeps those whose
     /// name matches a GLOB pattern, which reads only its literal prefix's

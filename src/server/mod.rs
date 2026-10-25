@@ -207,14 +207,18 @@ enum Command {
         /// The identity `bot` must hold; another is `bot_not_found`.
         bot_id: Option<i64>,
     },
-    /// Change what a bot's client chose for it when it was made: so far its
+    /// Change what a bot's client chose for it when it was made: its
     /// instructions, recomposed with the skills, memory and folder rules
-    /// added since. Refused while a turn runs; the next turn uses them.
+    /// added since, and its model (another of its family) and effort level.
+    /// Refused while a turn runs; the next turn uses them.
     Configure {
         bot: String,
         /// The identity `bot` must hold; another is `bot_not_found`.
         bot_id: Option<i64>,
         instructions: Option<String>,
+        model: Option<String>,
+        /// With `model`: its effort level; absent is the model's default.
+        effort: Option<String>,
     },
     Fork {
         source: String,
@@ -2144,7 +2148,12 @@ impl Service {
                 bot,
                 bot_id,
                 instructions,
+                model,
+                effort,
             } => {
+                if effort.is_some() && model.is_none() {
+                    return fail_with("invalid_effort", "effort goes with model");
+                }
                 if instructions.as_ref().is_some_and(|i| i.len() > 64 * 1024) {
                     return Err(Error::with(
                         "instructions_limit",
@@ -2158,10 +2167,42 @@ impl Service {
                     )
                     .facts(json!({"running_turn":active.turn})));
                 }
+                // Another model of the bot's family: its history is kept in
+                // that family's encoding.
+                let model = match model {
+                    Some(reference) => {
+                        let (provider, name) = split_model(&reference)?;
+                        let served = self
+                            .providers
+                            .get(provider)
+                            .ok_or(Error::with("provider_unavailable", provider))?;
+                        let record = store
+                            .op("inspect", {
+                                let bot = bot.clone();
+                                move |db| db.inspect(&bot)
+                            })
+                            .await?;
+                        let family = record.family()?;
+                        if served.family() != family {
+                            return fail_with("provider_family_mismatch", reference.clone());
+                        }
+                        turn::shaped(served, &record.settings)?;
+                        if let Some(level) = &effort {
+                            family.check_effort(level)?;
+                        }
+                        Some((provider.to_owned(), name.to_owned()))
+                    }
+                    None => None,
+                };
                 store
                     .op("configure", move |db| {
                         let id = db.identity(&bot, bot_id)?;
                         let mut changed = Vec::new();
+                        if let Some((provider, name)) = &model
+                            && db.set_model(&bot, Some(id), provider, name, effort.as_deref())?
+                        {
+                            changed.push("model");
+                        }
                         if let Some(instructions) = instructions
                             && db.set_instructions(&bot, Some(id), &instructions)?
                         {

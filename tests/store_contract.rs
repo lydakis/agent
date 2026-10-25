@@ -10608,3 +10608,16 @@ fn instructions_are_replaced_and_a_fork_keys_its_own_cache_after() {
     let refused = db.set_instructions("Ben", Some(made.bot_id), "x").unwrap_err();
     assert_eq!(refused.code, "bot_not_found");
 }
+
+#[test]
+fn a_bot_is_pointed_at_another_model_and_effort() {
+    let mut db = db();
+    db.create("Ann", None, binding()).unwrap();
+    assert!(!db.set_model("Ann", None, "openai", "synthetic-model", None).unwrap());
+    assert!(db.set_model("Ann", None, "openai", "other", Some("high")).unwrap());
+    let ann = db.inspect("Ann").unwrap();
+    assert_eq!((ann.model.as_str(), ann.effort.as_deref()), ("other", Some("high")));
+    assert!(!db.set_model("Ann", None, "openai", "other", Some("high")).unwrap());
+    assert!(db.set_model("Ann", None, "openai", "other", None).unwrap());
+    assert_eq!(db.inspect("Ann").unwrap().effort, None);
+}
