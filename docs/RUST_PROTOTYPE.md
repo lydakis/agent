@@ -973,6 +973,7 @@ own path from the turn. Example requests:
 {"id":19,"op":"submit","bot":"Bob","request_id":"work-2","prompt":"Also check the docs","delivery":"steer"}
 {"id":3,"op":"follow","bot":"Bob","after":0}
 {"id":4,"op":"inspect","bot":"Bob"}
+{"id":24,"op":"configure","bot":"Bob","bot_id":1,"instructions":"..."}
 {"id":5,"op":"events","bot":"Bob","after":0,"limit":100}
 {"id":20,"op":"history_nodes","bot":"Alternative","from":2,"limit":400}
 {"id":6,"op":"history_items","bot":"Bob","nodes":[2]}
@@ -1137,6 +1138,16 @@ omit instructions; `inspect` returns the full individual bot record. With `bot_i
 a bot that no longer holds that identity is `bot_not_found`, as on `submit`. Concurrent
 creations before an already-consumed cursor require restarting the listing.
 `agent ls` reads pages incrementally while preserving its JSON-array output.
+Protocol version 14 adds `configure`, which changes what a bot's client
+chose for it when it was made; so far its `instructions` (up to 64 KiB, as on
+`create`). A bot's instructions are otherwise fixed when it is made, so a
+client recomposes them (skills, memory, folder rules added since) and sends
+them here. It answers `{bot, bot_id, changed}`, `changed` naming the fields
+that differed; the same text again changes nothing, so a resend is harmless.
+It is refused with `bot_busy` while a turn runs, and the next turn sends the
+new instructions: the provider's cache of the old ones is not read again,
+replayed thinking written after them is withheld as when any context in
+front of it changes, and a fork keys its own prompt cache from then on.
 Protocol version 12 lets `bots` filter on the daemon side: `name` keeps the
 bots whose name matches a SQLite GLOB pattern (1 to 256 bytes; case-sensitive
 like names), read from the name index's range for the pattern's literal

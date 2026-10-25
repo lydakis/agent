@@ -207,6 +207,15 @@ enum Command {
         /// The identity `bot` must hold; another is `bot_not_found`.
         bot_id: Option<i64>,
     },
+    /// Change what a bot's client chose for it when it was made: so far its
+    /// instructions, recomposed with the skills, memory and folder rules
+    /// added since. Refused while a turn runs; the next turn uses them.
+    Configure {
+        bot: String,
+        /// The identity `bot` must hold; another is `bot_not_found`.
+        bot_id: Option<i64>,
+        instructions: Option<String>,
+    },
     Fork {
         source: String,
         /// A node id from the source's history; defaults to its head when it
@@ -2130,6 +2139,37 @@ impl Service {
                     retention_reply(session, &output, id, result).await;
                 });
                 Err(Error::new("deferred"))
+            }
+            Command::Configure {
+                bot,
+                bot_id,
+                instructions,
+            } => {
+                if instructions.as_ref().is_some_and(|i| i.len() > 64 * 1024) {
+                    return Err(Error::with(
+                        "instructions_limit",
+                        "instructions may be up to 65536 bytes",
+                    ));
+                }
+                if let Some(active) = self.active.get(&bot) {
+                    return Err(Error::with(
+                        "bot_busy",
+                        format!("turn {} of {bot} is running", active.turn),
+                    )
+                    .facts(json!({"running_turn":active.turn})));
+                }
+                store
+                    .op("configure", move |db| {
+                        let id = db.identity(&bot, bot_id)?;
+                        let mut changed = Vec::new();
+                        if let Some(instructions) = instructions
+                            && db.set_instructions(&bot, Some(id), &instructions)?
+                        {
+                            changed.push("instructions");
+                        }
+                        Ok(json!({"bot":bot,"bot_id":id,"changed":changed}))
+                    })
+                    .await
             }
             Command::Inspect { bot, bot_id } => {
                 store

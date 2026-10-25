@@ -10590,3 +10590,21 @@ fn schema_43_bots_were_made_without_a_key() {
     assert_eq!(version, Database::SCHEMA);
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn instructions_are_replaced_and_a_fork_keys_its_own_cache_after() {
+    let mut db = db();
+    let (made, _) = db.create("Ann", None, binding()).unwrap();
+    let (fork, _) = db.fork("Ann", "Ben", Fork::default()).unwrap();
+    assert_eq!(fork.cache_bot(), made.bot_id);
+    // The same text again changes nothing.
+    assert!(!db.set_instructions("Ben", None, "test").unwrap());
+    assert!(db.set_instructions("Ben", Some(fork.bot_id), "new rules").unwrap());
+    let after = db.inspect("Ben").unwrap();
+    assert_eq!(after.instructions, "new rules");
+    assert_eq!(after.cache_bot(), fork.bot_id);
+    assert_eq!(db.inspect("Ann").unwrap().instructions, "test");
+    // Another identity under the name is refused.
+    let refused = db.set_instructions("Ben", Some(made.bot_id), "x").unwrap_err();
+    assert_eq!(refused.code, "bot_not_found");
+}

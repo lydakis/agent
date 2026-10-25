@@ -372,7 +372,7 @@ fn agent(words: &[String], stdin: Option<&str>, output: &str, failed: bool) -> O
         "prune" => said.verb = "Pruned finished agents".into(),
         "stats" => said.verb = "Read the daemon's stats".into(),
         "interrupt" => said.verb = "Interrupted".into(),
-        "inspect" | "resume" => said.verb = "Looked up".into(),
+        "inspect" => said.verb = "Looked up".into(),
         "turns" | "history" => said.verb = "Read the turns of".into(),
         "models" => said.verb = "Listed models".into(),
         "approvals" => said.verb = "Checked approvals".into(),

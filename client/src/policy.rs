@@ -435,24 +435,38 @@ fn memory_indexes_from(workspace: &Path, home: Option<&Path>) -> Result<Vec<Path
     };
     let root = home.join(".agents/memory");
     let mut found = vec![root.join("MEMORY.md")];
-    if let Some(name) = project(workspace)? {
+    if let Some(name) = project_from(workspace, Some(home))? {
         found.push(root.join("projects").join(name).join("MEMORY.md"));
     }
     Ok(found)
 }
 
 /// The project `dir` belongs to: the name in the nearest
-/// `.agents/project.toml` at or above it. A task's worktree is another
-/// checkout of its project's repository, where that file may not be
-/// committed or may differ, so a folder in one is looked up at the same
-/// place in the repository's main checkout first.
+/// `.agents/project.toml` at or above it, looking no higher than its
+/// repository's top, and taking the home folder's only for the home folder
+/// itself: a repository, or a folder, under another project's is a project
+/// of its own. A task's worktree is another checkout of its project's
+/// repository, where that file may not be committed or may differ, so a
+/// folder in one is looked up at the same place in the repository's main
+/// checkout first.
 pub fn project(dir: &Path) -> Result<Option<String>, Failure> {
+    project_from(dir, home().as_deref())
+}
+
+fn project_from(dir: &Path, home: Option<&Path>) -> Result<Option<String>, Failure> {
     let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let home = home.map(|h| h.canonicalize().unwrap_or_else(|_| h.to_path_buf()));
     let main = main_checkout(&dir);
     for start in main.iter().chain(std::iter::once(&dir)) {
         for at in start.ancestors() {
+            if home.as_deref() == Some(at) && at != start.as_path() {
+                break;
+            }
             let path = at.join(".agents/project.toml");
             if !is_file(&path)? {
+                if std::fs::symlink_metadata(at.join(".git")).is_ok() {
+                    break;
+                }
                 continue;
             }
             let unreadable = |reason: String| Failure::Unreadable {
@@ -1095,6 +1109,15 @@ mod tests {
             memory_indexes_from(&repo, None).unwrap(),
             Vec::<PathBuf>::new()
         );
+        // A project above a repository, or the home folder's, is not its.
+        let nested = repo.join("web/inner");
+        std::fs::create_dir_all(nested.join(".git")).unwrap();
+        assert_eq!(project(&nested).unwrap(), None);
+        std::fs::create_dir_all(home.join(".agents")).unwrap();
+        std::fs::create_dir_all(home.join("Developer/plain")).unwrap();
+        std::fs::write(home.join(".agents/project.toml"), "name = \"me\"\n").unwrap();
+        assert_eq!(project_from(&home.join("Developer/plain"), Some(&home)).unwrap(), None);
+        assert_eq!(project_from(&home, Some(&home)).unwrap().as_deref(), Some("me"));
         std::fs::write(repo.join("web/.agents/project.toml"), "name = \"../up\"\n").unwrap();
         let error = project(&repo.join("web")).unwrap_err();
         assert_eq!(error.code(), "instructions_unreadable");

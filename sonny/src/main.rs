@@ -293,7 +293,7 @@ async fn run() -> Result<(), String> {
         }
     };
     let bot = client
-        .request("resume", json!({"bot": name}))
+        .request("inspect", json!({"bot": name}))
         .await
         .map_err(|e| e.to_string())?;
     // Everything after now arrives live; history is read from the bot's
@@ -964,7 +964,7 @@ impl App {
         let lead = async {
             let (client, mut fresh) = connect(&self.options).await?;
             let record = client
-                .request("resume", json!({"bot": self.bot}))
+                .request("inspect", json!({"bot": self.bot}))
                 .await
                 .map_err(|e| e.to_string())?;
             client

@@ -1730,6 +1730,24 @@ impl Database {
             .optional()?
             .ok_or(Error::new("bot_not_found"))
     }
+    /// Replace a bot's instructions, as its client composes them now; whether
+    /// they changed. Its next request sends the new ones, so the provider's
+    /// cache of the old is not read again and replayed thinking written
+    /// after them is withheld, as when any context in front of it changes.
+    /// A fork, which read its source's cache, keys its own from then on.
+    pub fn set_instructions(
+        &mut self,
+        name: &str,
+        bot_id: Option<i64>,
+        instructions: &str,
+    ) -> Result<bool> {
+        let id = self.identity(name, bot_id)?;
+        let changed = self.conn.execute(
+            "UPDATE bots SET instructions=?, cache_bot=NULL WHERE id=? AND instructions<>?",
+            params![instructions, id, instructions],
+        )?;
+        Ok(changed == 1)
+    }
     /// Bounded keyset pages. Full instructions remain available through inspect.
     /// A page of bots in name order after `after`. `name` keeps those whose
     /// name matches a GLOB pattern, which reads only its literal prefix's
