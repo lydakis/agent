@@ -628,20 +628,28 @@ answered such requests with server errors about restoring the reasoning (the
 exact text was not kept), often in a sub-agent's long tool-using turn. The
 same body fails every time, so retries never cleared it and every later turn
 of that bot repeated it; switching models only helped because a block from
-another model is dropped unread. The runtime now sends the request once
-more without any thinking it replays, and records that on the bot as a
-binding change, so later requests leave those blocks out too and keep the
-thinking written after. Recovery requires a 400 or server error (HTTP or
-in-stream `api_error`) identifying a thinking or reasoning signature,
-decryption, restoration, recovery, or verification failure. Generic server errors are
-retried without changing the context; an unrelated thinking configuration
-error remains final. That recovery's `retry` event carries
-`thinking_withheld: true`, within the normal retry and token budgets. The
-cost is the withheld reasoning and a cache miss from the first stripped
-node, once. This is recovery from the reported failure, not a confirmed
-diagnosis: the original error and a Bedrock reproduction were not captured.
-Why Bedrock could not read the blocks is not known; global cross-Region
-profiles (#99) are an unverified suspect. Empty instructions omit the system block, since empty text
+another model is dropped unread.
+
+The runtime reacts only to error types the providers publish, never to
+message text. Neither Anthropic nor Bedrock publishes one for unreadable
+thinking: a replayed block whose signature is altered or cannot be decrypted
+is documented to fail with a plain 400 `invalid_request_error`, and a 400 is
+final for its body. So after a 400 on a request that replays thinking, the
+call sends it once more without that thinking (its `retry` event carries
+`thinking_withheld: true`, within the normal retry and token budgets). Only
+if that request is accepted is the strip recorded on the bot as a binding
+change, so later requests leave those blocks out and keep the thinking
+written after; a 400 the thinking did not cause fails the second time too
+and changes nothing. The cost is one extra request on such a 400, and on a
+recovery the withheld reasoning and a cache miss from the first stripped
+node, once. Server errors, including an in-stream `api_error`, are retried
+with the body unchanged, so the 2026-10-11 failures, if they recur in that
+form, are not recovered: a bot switches model to get past them. The error
+text, if it is seen again, is worth keeping. Why Bedrock could not read the
+blocks is not known; global cross-Region profiles (#99) are an unverified
+suspect.
+
+Empty instructions omit the system block, since empty text
 cannot carry an Anthropic cache breakpoint; automatic caching remains enabled.
 
 ### Keeping the Anthropic cache warm
