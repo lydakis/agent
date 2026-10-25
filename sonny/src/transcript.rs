@@ -441,7 +441,7 @@ fn said_lines(said: crate::calls::Said, width: usize) -> Vec<Line<'static>> {
 
 /// A line wrapped to at most `rows` rows, the last ending in `…` when
 /// some was left out.
-fn capped(
+pub fn capped(
     line: Line<'static>,
     width: usize,
     lead: Span<'static>,

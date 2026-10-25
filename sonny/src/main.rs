@@ -1173,10 +1173,10 @@ impl App {
             self.notice = Some("could not list the agents".into());
             return;
         };
-        let windows = self
+        let places = self
             .fleet
             .as_ref()
-            .map(|fleet| fleet.rex.windows())
+            .map(|fleet| fleet.rex.places())
             .unwrap_or_default();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1223,26 +1223,27 @@ impl App {
             } else {
                 turn["finished_ms"].as_u64()
             };
-            let place = windows
-                .iter()
-                .position(|(_, labels)| labels.iter().any(|l| l == name))
-                .map(|i| {
-                    if windows[i].1.len() > 1 {
-                        format!("tab {}, split", i + 1)
-                    } else {
-                        format!("tab {}", i + 1)
-                    }
-                })
-                .unwrap_or_default();
-            rows.push(status::Row {
-                name: short(name, &project, &lead),
-                state,
-                seconds: at.map(|at| now.saturating_sub(at) / 1000),
-                model: format!(
+            let place = match places.get(name) {
+                Some((tab, Some((side, other)))) => {
+                    format!("tab {tab}, {side} {}", short(other, &project, &lead))
+                }
+                Some((tab, None)) => format!("tab {tab}"),
+                None => String::new(),
+            };
+            // This window's turns run on its own model, when it has one.
+            let model = match &self.turn_model {
+                Some(model) if name == self.bot => model.clone(),
+                _ => format!(
                     "{}/{}",
                     bot["provider"].as_str().unwrap_or("?"),
                     bot["model"].as_str().unwrap_or("?")
                 ),
+            };
+            rows.push(status::Row {
+                name: short(name, &project, &lead),
+                state,
+                seconds: at.map(|at| now.saturating_sub(at) / 1000),
+                model,
                 latest: self.latest(name).await,
                 place,
             });

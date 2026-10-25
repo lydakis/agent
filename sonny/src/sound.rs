@@ -4,7 +4,7 @@
 //!
 //! On a Mac the sound is one of the system's (`SONNY_SOUND_DONE=Pop`, a
 //! file's path, or `off` changes one); elsewhere it is the terminal bell.
-//! The notification is OSC 9, which Rex shows as a desktop notification.
+//! The notification is OSC 777, which Rex shows as a desktop notification.
 use std::{
     io::Write,
     path::PathBuf,
@@ -54,9 +54,14 @@ impl Sounds {
             return;
         }
         if matches!(alert, Alert::NeedsYou | Alert::LeadDone | Alert::Failed) {
-            let text: String = what.chars().filter(|c| !c.is_control()).take(200).collect();
+            let text: String = what
+                .chars()
+                .filter(|c| !c.is_control())
+                .map(|c| if c == ';' { ',' } else { c })
+                .take(200)
+                .collect();
             let mut stdout = std::io::stdout();
-            let _ = write!(stdout, "\x1b]9;{text}\x07");
+            let _ = write!(stdout, "\x1b]777;notify;Sonny;{text}\x07");
             let _ = stdout.flush();
         }
         if let Some((at, last)) = self.last

@@ -206,6 +206,35 @@ impl Rex {
         windows
     }
 
+    /// Where each block sits, by label: its tab, counted from 1, and in a
+    /// split, its side of its neighbour (`right of`, `below`, … a label).
+    pub fn places(&self) -> HashMap<String, (usize, Option<(String, String)>)> {
+        let mut places = HashMap::new();
+        let Ok(ls) = self.call(&["window", "ls", "-s", &self.session, "--json"]) else {
+            return places;
+        };
+        for (tab, window) in ls["windows"].as_array().into_iter().flatten().enumerate() {
+            for layer in window["layers"].as_array().into_iter().flatten() {
+                let labels: HashMap<&str, &str> = layer["blocks"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|b| Some((b["block_id"].as_str()?, b["label"].as_str()?)))
+                    .collect();
+                let mut sides = HashMap::new();
+                sides_of(&layer["layout"], &mut sides);
+                for (block, label) in &labels {
+                    let side = sides.get(*block).map(|(side, other): &(&str, String)| {
+                        let other = labels.get(other.as_str()).copied().unwrap_or("");
+                        (side.to_string(), other.to_owned())
+                    });
+                    places.insert(label.to_string(), (tab + 1, side));
+                }
+            }
+        }
+        places
+    }
+
     pub fn rename_window(&self, window: &str, name: &str) {
         let _ = self.call(&["window", "rename", window, name, "-s", &self.session]);
     }
@@ -254,6 +283,40 @@ impl Rex {
             let _ = self.call(&["block", "close", &block.block]);
         }
     }
+}
+
+/// The first block of a layout node, in reading order.
+fn first_block(node: &Value) -> Option<String> {
+    match node["block_id"].as_str() {
+        Some(block) => Some(block.to_owned()),
+        None => first_block(&node["split"]["before"]),
+    }
+}
+
+/// Each block that is one side of a split, and which side of the other side
+/// it is. A vertical split stacks its sides; a horizontal one sets them
+/// side by side.
+fn sides_of(node: &Value, sides: &mut HashMap<String, (&'static str, String)>) {
+    let split = &node["split"];
+    if split.is_null() {
+        return;
+    }
+    let stacked = split["direction"] == "vertical";
+    let (before, after) = (&split["before"], &split["after"]);
+    if let (Some(block), Some(other)) = (before["block_id"].as_str(), first_block(after)) {
+        sides.insert(
+            block.to_owned(),
+            (if stacked { "above" } else { "left of" }, other),
+        );
+    }
+    if let (Some(block), Some(other)) = (after["block_id"].as_str(), first_block(before)) {
+        sides.insert(
+            block.to_owned(),
+            (if stacked { "below" } else { "right of" }, other),
+        );
+    }
+    sides_of(before, sides);
+    sides_of(after, sides);
 }
 
 /// The skill that lets any agent run long work where the person can see it.

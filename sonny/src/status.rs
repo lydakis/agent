@@ -45,11 +45,6 @@ pub fn card(project: &str, rows: &[Row], width: usize) -> Vec<Line<'static>> {
         }
     }
     let mut out = vec![Line::from(head).bold()];
-    let name_width = rows
-        .iter()
-        .map(|r| r.name.chars().count())
-        .max()
-        .unwrap_or(4);
     for row in rows {
         let time = match (row.seconds, row.state.as_str()) {
             (Some(s), "working" | "needs you") => crate::transcript::elapsed(s),
@@ -59,33 +54,39 @@ pub fn card(project: &str, rows: &[Row], width: usize) -> Vec<Line<'static>> {
         let mut spans = vec![
             Span::raw(" "),
             mark(&row.state),
-            Span::raw(format!("{:<name_width$}  ", row.name)).bold(),
-            Span::raw(row.state.clone()),
+            Span::raw(row.name.clone()).bold(),
+            Span::raw(format!(" {}", row.state)),
         ];
-        for part in [&time, &row.model, &row.place] {
-            if !part.is_empty() {
-                spans.push(Span::raw(format!(" · {part}")).dim());
-            }
+        if !time.is_empty() {
+            spans.push(Span::raw(format!(" · {time}")).dim());
         }
         out.extend(crate::transcript::wrap(
             Line::from(spans),
             width,
             Span::raw(""),
-            Span::raw("     "),
+            Span::raw("   "),
         ));
+        let facts: Vec<&str> = [row.model.as_str(), row.place.as_str()]
+            .into_iter()
+            .filter(|f| !f.is_empty())
+            .collect();
+        if !facts.is_empty() {
+            let line = Line::from(facts.join(" · ")).dim();
+            out.extend(crate::transcript::wrap(
+                line,
+                width,
+                Span::raw("   "),
+                Span::raw("   "),
+            ));
+        }
         if !row.latest.is_empty() {
             let line = Line::from(row.latest.clone()).dim();
-            let lead = Span::raw(format!(
-                "   {:width$}  └ ",
-                "",
-                width = name_width.saturating_sub(2)
-            ))
-            .dim();
-            out.extend(
-                crate::transcript::wrap(line, width, lead, Span::raw("     "))
-                    .into_iter()
-                    .take(1),
-            );
+            out.extend(crate::transcript::capped(
+                line,
+                width,
+                Span::raw("   └ ").dim(),
+                1,
+            ));
         }
     }
     out
@@ -119,13 +120,8 @@ mod tests {
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
         assert_eq!(text[0], "calc · 3 agents · 1 working · 1 needs you");
-        assert_eq!(
-            text[1],
-            " ● lead   working · 42s · chatgpt/gpt-6.1-sol · tab 1"
-        );
-        assert_eq!(
-            text[3],
-            " ✓ equal  done · 42s ago · chatgpt/gpt-6.1-sol · tab 1"
-        );
+        assert_eq!(text[1], " ● lead working · 42s");
+        assert_eq!(text[2], "   chatgpt/gpt-6.1-sol · tab 1");
+        assert_eq!(text[5], " ✓ equal done · 42s ago");
     }
 }
