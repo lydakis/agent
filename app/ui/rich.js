@@ -1,8 +1,9 @@
 // What a model writes, drawn as a page draws it: Markdown, highlighted code, Mermaid diagrams,
 // Vega-Lite charts and HTML previews, in a message or a file opened beside. Markdown is parsed once
-// per message (markdown-it, loaded with the page); highlighting, Mermaid and Vega load the first time
-// something needs them. Raw HTML in Markdown stays text; an ```html block runs only when asked, in a
-// sandboxed frame with no network and no way into the app; a chart loads no data from anywhere.
+// per message (markdown-it, loaded with the page); highlighting, Pele (for Mermaid) and Vega load the
+// first time something needs them. Raw HTML in Markdown stays text; an ```html block runs only when
+// asked, in a sandboxed frame with no network and no way into the app; a chart loads no data from
+// anywhere.
 window.Rich = (() => {
   'use strict';
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -46,13 +47,14 @@ window.Rich = (() => {
   const pre = (text, lang) => `<pre class="code"><code>${codeHTML(text, lang)}</code></pre>`;
   const CHART = new Set(['vega-lite', 'vegalite', 'vl', 'vega']);
   const toggle = '<button type="button" data-rich="view"></button>';
-  // A diagram, chart, page or SVG in a message opens as code, drawn a click away. All draw on the
-  // window's thread, and a few characters can ask for more than it can do (a page's loop, an SVG's
-  // filters, a chart's `sequence` to a billion, a Mermaid `space:500000`), so each runs only when
-  // asked, block by block. `page` draws it at once, for a file someone opened.
+  // A chart, page or SVG in a message opens as code, drawn a click away. All draw on the window's
+  // thread, and a few characters can ask for more than it can do (a page's loop, an SVG's filters, a
+  // chart's `sequence` to a billion), so each runs only when asked, block by block. `page` draws it
+  // at once, for a file someone opened. A Mermaid diagram always draws at once: Pele lays it out in
+  // a worker, within bounds, and a worker that runs too long is ended (see `diagramSVG`).
   // Nothing remembers a click: a block drawn again (its pane redrawn) asks again, and the drawing
   // cache below makes that click instant. While a reply streams (`draft`), its diagrams, charts and
-  // pages are code; each can be drawn once the reply is in.
+  // pages are code; each is drawn, or can be, once the reply is in.
   let draft = false;
   const lazy = (page) => page ? ' data-page' : '';
   // Whether text is an SVG document: its root is `<svg>`, after an XML declaration, comments and a
@@ -74,7 +76,7 @@ window.Rich = (() => {
   function block(text, info, page = false) {
     const lang = (info ?? '').trim().split(/\s+/)[0].toLowerCase();
     if (draft) return `<div class="rc" data-kind="code">${head(lang, '')}${pre(text, lang)}</div>`;
-    if (lang === 'mermaid' || lang === 'mmd') return `<div class="rc" data-kind="mermaid" data-lazy${lazy(page)} data-view="code">${head('mermaid', toggle)}<div class="view"></div>${pre(text, '')}</div>`;
+    if (lang === 'mermaid' || lang === 'mmd') return `<div class="rc" data-kind="mermaid" data-lazy data-page data-view="code">${head('mermaid', toggle)}<div class="view"></div>${pre(text, '')}</div>`;
     if (CHART.has(lang)) return `<div class="rc" data-kind="chart" data-lang="${lang === 'vega' ? 'vega' : 'vega-lite'}" data-lazy${lazy(page)} data-view="code">${head(lang, toggle)}<div class="view"></div>${pre(text, 'json')}</div>`;
     if (lang === 'html' || lang === 'htm') return `<div class="rc" data-kind="html" data-view="${page ? 'view' : 'code'}">${head(lang, '<button type="button" data-rich="view"></button>')}<div class="view frame"></div>${pre(text, 'xml')}</div>`;
     // An SVG draws as an image, which runs no script and loads nothing.
@@ -231,44 +233,58 @@ window.Rich = (() => {
     return () => { if (end) pane.scrollTop = pane.scrollHeight; else if (above) pane.scrollTop += pane.scrollHeight - h; h = pane.scrollHeight; };
   }
   function settle(box, change) { const keep = hold(box); change(); keep(); }
-  // Rendered diagrams by source (and a chart by its width), so a pane drawn again shows them at once;
+  // Rendered diagrams and charts by source and width, so a pane drawn again shows them at once;
   // at most 64 of them and 8 MiB of SVG.
   const diagrams = new Map(), DIAGRAMS = 64, DIAGRAM_BYTES = 8 * 1024 * 1024; let diagramBytes = 0;
-  let mermaidChain = Promise.resolve(), diagramId = 0;
-  function mermaidReady() {
-    return script('vendor/mermaid.js').then(() => {
-      if (!mermaidReady.done) {
-        const css = getComputedStyle(document.documentElement), v = (n) => css.getPropertyValue(n).trim();
-        globalThis.mermaid.initialize({
-          startOnLoad: false, securityLevel: 'strict', suppressErrorRendering: true, theme: 'base', fontFamily: v('--mono'),
-          themeVariables: { darkMode: true, fontFamily: v('--mono'), fontSize: '13px', background: v('--t-panel'), primaryColor: v('--t-raised'), primaryTextColor: v('--t-ink'), primaryBorderColor: v('--t-faint'), secondaryColor: v('--t-panel'), tertiaryColor: v('--t-bg'), lineColor: v('--t-dim'), textColor: v('--t-ink'), noteBkgColor: v('--t-raised'), noteTextColor: v('--t-ink'), noteBorderColor: v('--amber'), actorBkg: v('--t-raised'), actorBorder: v('--t-faint'), actorTextColor: v('--t-ink'), signalColor: v('--t-dim'), signalTextColor: v('--t-ink'), labelBoxBkgColor: v('--t-raised'), labelTextColor: v('--t-ink'), edgeLabelBackground: v('--t-panel'), clusterBkg: v('--t-panel'), clusterBorder: v('--t-line') },
-        });
-        mermaidReady.done = true;
-      }
-      return globalThis.mermaid;
-    });
-  }
-  // A diagram or chart drawn to SVG once per source; one at a time, as Mermaid measures in a shared
-  // scratch element. A source that does not draw keeps showing as code, the error in its head,
-  // and draws again only when asked again.
-  function drawLazy(box, src, make) {
-    const key = `${box.dataset.kind}|${box.dataset.lang ?? ''}|${box.dataset.kind === 'chart' ? box.clientWidth : ''}|${src}`;
+  // Sources that failed to draw on their own, with their errors (at most DIAGRAMS): a pane drawn
+  // again shows the error without trying again, and a click tries again.
+  const refused = new Map();
+  let drawing = Promise.resolve();
+  const note = (box, msg) => { const l = box.querySelector('.rh .lang'); l.textContent = `${l.textContent.split(' · ')[0]} · ${msg}`; };
+  // A diagram or chart drawn to SVG once per source and width; one at a time. A source that does not
+  // draw keeps showing as code, the error in its head. `auto` is a draw nobody asked for.
+  function drawLazy(box, src, make, auto) {
+    const key = `${box.dataset.kind}|${box.dataset.lang ?? ''}|${box.clientWidth}|${src}`;
     const show = (svg) => settle(box, () => { box.querySelector('.view').innerHTML = svg; box.dataset.view = 'view'; box.dataset.drawn = ''; });
     if (diagrams.has(key)) { show(diagrams.get(key)); return; }
+    if (auto && refused.has(key)) { note(box, refused.get(key)); return; }
     if ('asked' in box.dataset) return;
     box.dataset.asked = '';
     // One queued behind the same source takes its result instead of drawing it again; one larger
     // than the whole budget is shown but not kept.
-    mermaidChain = mermaidChain.then(() => diagrams.get(key) ?? make(src, box)).then((svg) => {
+    drawing = drawing.then(() => diagrams.get(key) ?? make(src, box)).then((svg) => {
+      refused.delete(key);
       const cost = 2 * (key.length + svg.length);
       if (!diagrams.has(key) && cost <= DIAGRAM_BYTES) { diagrams.set(key, svg); diagramBytes += cost; }
       while (diagrams.size > DIAGRAMS || diagramBytes > DIAGRAM_BYTES) {
         const [k, v] = diagrams.entries().next().value; diagrams.delete(k); diagramBytes -= 2 * (k.length + v.length);
       }
       show(svg);
-    }, (e) => { delete box.dataset.asked; const l = box.querySelector('.rh .lang'); l.textContent = `${l.textContent.split(' · ')[0]} · ${String(e?.message ?? e).split('\n')[0].slice(0, 80)}`; });
+    }, (e) => {
+      const msg = String(e?.message ?? e).split('\n')[0].slice(0, 80);
+      delete box.dataset.asked; refused.delete(key); refused.set(key, msg);
+      if (refused.size > DIAGRAMS) refused.delete(refused.keys().next().value);
+      note(box, msg);
+    });
   }
-  const mermaidSVG = (src) => mermaidReady().then((m) => m.render(`rich-mmd-${++diagramId}`, src)).then(({ svg }) => svg);
+  // Mermaid diagrams: Pele (vendor/pele.js) in a worker, in the window's font, laid out for the
+  // block's width. Pele bounds its input (50,000 characters, 5,000 flowchart edges) and the worker
+  // its output (a million characters), but not its time, so a diagram still laying out after
+  // DIAGRAM_MS ends the worker; the next diagram starts a new one. Its colors are CSS variables (`.pele` in app.css),
+  // so a drawn diagram follows the window's theme.
+  const DIAGRAM_MS = 3000; let worker = null;
+  function diagramSVG(src, box) {
+    return new Promise((resolve, reject) => {
+      const w = worker ??= new Worker('diagram-worker.js');
+      const stop = () => { w.terminate(); if (worker === w) worker = null; };
+      const end = (fn, v) => { clearTimeout(timer); w.onmessage = w.onerror = null; fn(v); };
+      const timer = setTimeout(() => { stop(); end(reject, new Error(`still laying out after ${DIAGRAM_MS / 1000} s`)); }, DIAGRAM_MS);
+      w.onmessage = ({ data }) => data.error == null ? end(resolve, data.svg) : end(reject, new Error(data.error));
+      w.onerror = (e) => { e.preventDefault?.(); stop(); end(reject, new Error(e.message || 'the diagram worker failed')); };
+      const font = getComputedStyle(document.documentElement).getPropertyValue('--mono').trim();
+      w.postMessage({ src, font, width: Math.max(0, box.clientWidth - 24) });
+    });
+  }
 
   // Charts: a Vega-Lite (or Vega) spec, drawn to static SVG in the window's colors. Data comes from
   // the spec alone: the loader refuses every URL, and expressions run in Vega's interpreter, never
@@ -320,9 +336,9 @@ window.Rich = (() => {
     host.append(f);
   }
   function unmount(box) { box.querySelector('.view')?.replaceChildren(); }
-  function draw(box) {
+  function draw(box, auto = false) {
     const src = box.querySelector('pre').textContent;
-    drawLazy(box, src, box.dataset.kind === 'mermaid' ? mermaidSVG : chartSVG);
+    drawLazy(box, src, box.dataset.kind === 'mermaid' ? diagramSVG : chartSVG, auto);
   }
   // After HTML from `html` is in the document (`root` and what it holds): a file's drawing starts.
   // Whatever was drawn in a message is code again once its pane is drawn anew.
@@ -330,7 +346,7 @@ window.Rich = (() => {
   function hydrate(root) {
     for (const box of [...(root.matches?.(HYDRATE) ? [root] : []), ...root.querySelectorAll(HYDRATE)]) {
       box.dataset.on = '';
-      if ('lazy' in box.dataset) { if ('page' in box.dataset) draw(box); }
+      if ('lazy' in box.dataset) { if ('page' in box.dataset) draw(box, true); }
       else if (box.dataset.view === 'view') mount(box);
     }
   }
@@ -354,7 +370,7 @@ window.Rich = (() => {
     // It has no height until decoded, so the reader's place is kept again once it loads.
     if (im) { const img = document.createElement('img'), keep = hold(im); img.addEventListener('load', keep); img.src = im.dataset.img; img.alt = im.title; im.replaceWith(img); keep(); return true; }
     // Every link in drawn content goes through the guarded opener, or nowhere: a Mermaid `click`
-    // link is an SVG `<a xlink:href>` that would otherwise take over the window.
+    // link is an SVG `<a href>` that would otherwise take over the window.
     const a = e.target.closest?.('.md a, .rc a');
     if (a) { e.preventDefault(); const href = a.dataset?.href ?? a.getAttribute('href') ?? a.getAttribute('xlink:href'); if (linkable(href)) open(href); return true; }
     const b = e.target.closest?.('[data-rich]'); if (!b) return false;

@@ -153,6 +153,9 @@ button:focus-visible,[tabindex]:focus-visible{outline:1px solid var(--amber);out
 .rc[data-view=view]>pre,.rc:not([data-view=view])>.view{display:none}
 .rc .view{padding:12px;overflow:auto;text-align:center}
 .rc .view svg{max-width:100%;height:auto}
+/* Drawn diagrams in the window's colors; the series are the charts' categorical order. */
+.rc .pele{--pele-bg:var(--t-panel);--pele-fg:var(--t-ink);--pele-muted:var(--t-dim);--pele-line:var(--t-dim);--pele-surface:var(--t-raised);--pele-surface-alt:var(--t-bg);--pele-border:var(--t-faint);--pele-accent:var(--amber);--pele-critical:#e66767;--pele-font:var(--mono);--pele-font-mono:var(--mono);--pele-series-1:#3987e5;--pele-series-2:#d95926;--pele-series-3:#199e70;--pele-series-4:#c98500;--pele-series-5:#d55181;--pele-series-6:#008300;--pele-series-7:#9085e9;--pele-series-8:#e66767}
+.pane.side .rc .pele{--pele-bg:var(--t-bg);--pele-surface-alt:var(--t-panel)}
 .rc[data-kind=svg] .view{background:#fff}
 .rc[data-kind=svg] .view img{max-width:100%;vertical-align:top}
 .rc .view.frame{padding:0;background:#fff}
