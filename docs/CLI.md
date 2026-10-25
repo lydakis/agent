@@ -106,8 +106,10 @@ identity is `bot_not_found`.
   has a judge decide every call waiting on it, one request per round,
   printing one JSON line per round. The judge is `--judge`, else
   `AGENT_APPROVER_JUDGE`, else `typesafe/jev-latest` when `TYPESAFE_API_KEY`
-  is set, else `AGENT_MODEL`; any model but Jev (`typesafe/jev-*`) runs
-  through the daemon, with
+  is set, else `AGENT_MODEL`. Jev (`typesafe/jev-*`, key `TYPESAFE_API_KEY`)
+  and OpenAI's Decisions API (`openai-decisions/MODEL`, key
+  `OPENAI_API_KEY`) are called on their own APIs, at `--judge-url` when
+  given; any other model runs through the daemon, with
   a tag of at most 87 bytes, and `--effort` sets its effort. `--note` (default `AGENT_APPROVER_NOTE`)
   is a regular file of at most 96,000 bytes the judge always sees, such as
   trusted remotes and hosts ([APPROVALS.md](APPROVALS.md#automatic-mode)).

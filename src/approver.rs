@@ -213,8 +213,11 @@ impl Hosted {
                 // OpenAI's 429 also means the account is out of credit,
                 // which no wait fixes; its body names that by a published code.
                 if matches!(self.api, Api::Decisions) {
-                    let body = response.bytes().await.unwrap_or_default();
-                    let error: Value = serde_json::from_slice(&body).unwrap_or_default();
+                    let error: Value = read_reply(response)
+                        .await
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                        .unwrap_or_default();
                     if error["error"]["code"] == "insufficient_quota" {
                         return Judged::Failed("the judge's account is out of quota".into());
                     }
@@ -237,20 +240,10 @@ impl Hosted {
                     *backoff = (None, BACKOFF);
                 }
             }
-            let mut response = response;
-            let mut bytes = Vec::new();
-            loop {
-                match response.chunk().await {
-                    Ok(Some(chunk)) if bytes.len() + chunk.len() <= REPLY_BYTES => {
-                        bytes.extend_from_slice(&chunk);
-                    }
-                    Ok(Some(_)) => {
-                        return Judged::Failed("the judge's answer was too large".into());
-                    }
-                    Ok(None) => break,
-                    Err(_) => return Judged::Failed("the check failed".into()),
-                }
-            }
+            let bytes = match read_reply(response).await {
+                Ok(bytes) => bytes,
+                Err(why) => return Judged::Failed(why.into()),
+            };
             let Ok(reply) = serde_json::from_slice::<Value>(&bytes) else {
                 return Judged::Failed("the judge's answer was not JSON".into());
             };
@@ -271,6 +264,21 @@ impl Hosted {
                     Err(why) => Judged::Failed(why.into()),
                 },
             };
+        }
+    }
+}
+
+/// A response's body, up to the largest answer a decision API may send.
+async fn read_reply(mut response: reqwest::Response) -> std::result::Result<Vec<u8>, &'static str> {
+    let mut bytes = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) if bytes.len() + chunk.len() <= REPLY_BYTES => {
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(Some(_)) => return Err("the judge's answer was too large"),
+            Ok(None) => return Ok(bytes),
+            Err(_) => return Err("the check failed"),
         }
     }
 }
