@@ -727,6 +727,11 @@ class AnthropicUnreadableThinkingTests(ModelFixture):
         self.assertTrue(later and all('sig-1' not in self.signatures(r) for r in later))
         self.assertIn('sig-2', self.signatures(later[-1]))
 
+    def test_a_server_error_recovering_the_reasoning_withholds_it_at_once(self):
+        # George's report named restoring or recovering; the text was not kept.
+        _, sent = self.unreadable((500, 'Internal error while recovering the reasoning'))
+        self.assertEqual([self.signatures(r) for r in sent], [['sig-1'], []])
+
     def transient(self, failure):
         # Two transient failures must not change the request or the bot's
         # later context, even when an error happens to mention thinking.

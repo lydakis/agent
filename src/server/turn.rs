@@ -3523,8 +3523,8 @@ fn epoch_ms(at: tokio::time::Instant) -> u64 {
 /// replayed block back fails that body every time, so no retry clears it
 /// and every later turn repeats it: Bedrock answers some with a server
 /// error about restoring the reasoning. Only a 400 or server error naming
-/// a thinking signature, decryption, restoration, or verification failure
-/// qualifies. Generic server failures and thinking configuration errors
+/// a thinking signature, decryption, restoration, recovery, or verification
+/// failure qualifies. Generic server failures and thinking configuration errors
 /// must not persistently change the bot's context.
 fn withhold_thinking(context: &Context, error: &Error) -> Option<Strip> {
     let window = context.window.as_ref()?;
@@ -3554,6 +3554,7 @@ fn withhold_thinking(context: &Context, error: &Error) -> Option<Strip> {
             "signature",
             "decrypt",
             "restor",
+            "recover",
             "could not be verified",
             "cannot be verified",
             "failed to verify",

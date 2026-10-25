@@ -633,7 +633,7 @@ more without any thinking it replays, and records that on the bot as a
 binding change, so later requests leave those blocks out too and keep the
 thinking written after. Recovery requires a 400 or server error (HTTP or
 in-stream `api_error`) identifying a thinking or reasoning signature,
-decryption, restoration, or verification failure. Generic server errors are
+decryption, restoration, recovery, or verification failure. Generic server errors are
 retried without changing the context; an unrelated thinking configuration
 error remains final. That recovery's `retry` event carries
 `thinking_withheld: true`, within the normal retry and token budgets. The
