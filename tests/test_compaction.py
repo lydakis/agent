@@ -676,8 +676,8 @@ class AnthropicThinkingBindingTests(ModelFixture):
 
 @skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'requires release binary')
 class AnthropicUnreadableThinkingTests(ModelFixture):
-    """The provider can no longer read a replayed thinking block back and
-    fails every request that replays it, as Bedrock has."""
+    """Recover from identified replay failures without changing thinking
+    for unrelated provider errors."""
     handler = AnthropicModel
 
     def anthropic(self):
@@ -719,22 +719,45 @@ class AnthropicUnreadableThinkingTests(ModelFixture):
         client, sent = self.unreadable((500, 'Internal error while restoring the reasoning'))
         self.assertEqual([self.signatures(r) for r in sent], [['sig-1'], []])
         # Later turns no longer replay it, and keep the thinking written since.
+        client.close()
+        client = self.anthropic()
         self.turn(client, 2, 'third')
         self.turn(client, 3, 'tool:x')
         later = self.requests()
         self.assertTrue(later and all('sig-1' not in self.signatures(r) for r in later))
         self.assertIn('sig-2', self.signatures(later[-1]))
 
-    def test_a_server_error_that_names_nothing_withholds_it_on_the_second_failure(self):
-        _, sent = self.unreadable((500, 'Internal server error'))
-        self.assertEqual([self.signatures(r) for r in sent], [['sig-1'], ['sig-1'], []])
+    def transient(self, failure):
+        # Two transient failures must not change the request or the bot's
+        # later context, even when an error happens to mention thinking.
+        self.model.unreadable_failures = 2
+        client, sent = self.unreadable(failure)
+        self.assertEqual([self.signatures(r) for r in sent], [['sig-1']] * 3)
+        self.assertFalse(any(m.get('thinking_withheld') for m in client.saved))
+        client.close()
+        client = self.anthropic()
+        self.turn(client, 2, 'third')
+        self.assertIn('sig-1', self.signatures(self.requests()[0]))
 
-    def test_a_rate_limit_before_does_not_count_as_a_server_error(self):
-        _, sent = self.unreadable((500, 'Internal server error'), rate_limits=1)
-        self.assertEqual([self.signatures(r) for r in sent], [['sig-1'], ['sig-1'], ['sig-1'], []])
+    def test_transient_http_server_errors_keep_the_thinking(self):
+        self.transient((500, 'Internal server error'))
+
+    def test_transient_stream_errors_keep_the_thinking(self):
+        self.transient(('stream', 'Internal server error'))
+
+    def test_a_server_error_mentioning_thinking_without_a_replay_failure_keeps_it(self):
+        self.transient((500, 'Thinking service temporarily unavailable'))
+
+    def test_a_rate_limit_keeps_thinking_until_a_replay_error(self):
+        _, sent = self.unreadable((500, 'Internal error while restoring the reasoning'), rate_limits=1)
+        self.assertEqual([self.signatures(r) for r in sent], [['sig-1'], ['sig-1'], []])
 
     def test_a_400_naming_the_thinking_withholds_it_at_once(self):
         _, sent = self.unreadable((400, 'messages.1.content.0: thinking block could not be verified'))
+        self.assertEqual([self.signatures(r) for r in sent], [['sig-1'], []])
+
+    def test_an_invalid_thinking_signature_is_withheld_at_once(self):
+        _, sent = self.unreadable((400, 'messages.1.content.0: Invalid `signature` in `thinking` block.'))
         self.assertEqual([self.signatures(r) for r in sent], [['sig-1'], []])
 
     def test_a_request_signature_refusal_keeps_the_thinking(self):
@@ -750,12 +773,26 @@ class AnthropicUnreadableThinkingTests(ModelFixture):
         self.turn(client, 2, 'third')
         self.assertEqual([self.signatures(r) for r in self.requests()], [['sig-1'], ['sig-1']])
 
+    def test_a_thinking_configuration_error_keeps_the_thinking(self):
+        client = self.anthropic()
+        client.request('create', bot='Bob', workspace=str(self.path), effort='low')
+        self.turn(client, 0, 'first')
+        self.requests()
+        self.model.unreadable, self.model.unreadable_error = {'sig-1'}, (
+            400, 'thinking.budget_tokens: must be less than max_tokens')
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='second')['result']['turn']
+        finished = client.finished(turn)['data']
+        self.assertEqual((finished['status'], finished['error']), ('failed', 'provider_http_400'))
+        self.model.unreadable_error = None
+        self.turn(client, 2, 'third')
+        self.assertEqual([self.signatures(r) for r in self.requests()], [['sig-1'], ['sig-1']])
+
     def test_a_turn_out_of_budget_still_withholds_it_from_the_next(self):
         client = self.anthropic()
         client.request('create', bot='Bob', workspace=str(self.path), effort='low')
         self.turn(client, 0, 'first')
         self.requests()
-        self.model.unreadable, self.model.unreadable_error = {'sig-1'}, ('stream', 'Internal server error')
+        self.model.unreadable, self.model.unreadable_error = {'sig-1'}, ('stream', 'Failed to decrypt thinking block')
         # The failed stream bills its input, which spends the turn's cap.
         turn = client.request('submit', bot='Bob', request_id='1', prompt='second',
                               budget_tokens=1)['result']['turn']
@@ -764,16 +801,30 @@ class AnthropicUnreadableThinkingTests(ModelFixture):
         self.turn(client, 2, 'third')
         self.assertEqual([self.signatures(r) for r in self.requests()], [['sig-1'], []])
 
-    def test_an_internal_error_in_the_stream_withholds_it_at_once(self):
-        _, sent = self.unreadable(('stream', 'Internal server error'))
+    def test_a_replay_error_in_the_stream_withholds_it_at_once(self):
+        _, sent = self.unreadable(('stream', 'Failed to decrypt thinking block'))
         self.assertEqual([self.signatures(r) for r in sent], [['sig-1'], []])
+
+    def test_a_generic_stream_error_spends_the_budget_without_withholding_thinking(self):
+        client = self.anthropic()
+        client.request('create', bot='Bob', workspace=str(self.path), effort='low')
+        self.turn(client, 0, 'first')
+        self.requests()
+        self.model.unreadable, self.model.unreadable_error = {'sig-1'}, ('stream', 'Internal server error')
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='second',
+                              budget_tokens=1)['result']['turn']
+        finished = client.finished(turn)['data']
+        self.assertEqual((finished['status'], finished['error']), ('failed', 'turn_budget_exhausted'))
+        self.model.unreadable_error = None
+        self.turn(client, 2, 'third')
+        self.assertEqual([self.signatures(r) for r in self.requests()], [['sig-1'], ['sig-1']])
 
     def test_a_failure_on_the_last_attempt_withholds_it_without_another_call(self):
         client = self.anthropic()
         client.request('create', bot='Bob', workspace=str(self.path), effort='low')
         self.turn(client, 0, 'first')
         self.requests()
-        self.model.unreadable, self.model.unreadable_error = {'sig-1'}, ('stream', 'Internal server error')
+        self.model.unreadable, self.model.unreadable_error = {'sig-1'}, ('stream', 'Failed to decrypt thinking block')
         # Seven rate limits leave the internal error the call's eighth and last attempt.
         self.model.rate_limits = 7
         turn = client.request('submit', bot='Bob', request_id='1', prompt='second')['result']['turn']

@@ -2477,8 +2477,6 @@ impl Turn {
         };
         // Replayed thinking a failure may have come from, once withheld.
         let mut withheld = None;
-        // Server errors this call met, which alone may come from its body.
-        let mut server_failures = 0;
         loop {
             let items = match body {
                 Body::Window(context) => self.items(context, withheld.unwrap_or(context.thinking)),
@@ -2619,16 +2617,13 @@ impl Turn {
             } else {
                 self.failed_usage(usage).await?;
             }
-            if error.code.starts_with("provider_http_5") {
-                server_failures += 1;
-            }
-            // Thinking this failure may have come from is withheld from the
+            // Thinking this failure identifies is withheld from the
             // bot's later requests whether or not this call can resend.
             let mut resend = false;
             if let Body::Window(context) = body
                 && withheld.is_none()
                 && let Some(prefix) = record.thinking_prefix
-                && let Some(strip) = withhold_thinking(context, &error, server_failures)
+                && let Some(strip) = withhold_thinking(context, &error)
             {
                 let bot = self.bot.clone();
                 let elided = record.thinking_elided;
@@ -3524,15 +3519,14 @@ fn epoch_ms(at: tokio::time::Instant) -> u64 {
 }
 
 /// The strip that withholds every thinking block a failed request replayed,
-/// when the failure may have come from one. A provider that cannot read a
+/// when the failure identifies unreadable thinking. A provider that cannot read a
 /// replayed block back fails that body every time, so no retry clears it
 /// and every later turn repeats it: Bedrock answers some with a server
-/// error about the reasoning. A server error or a 400 that names the
-/// thinking or reasoning withholds it at once; a server error that does
-/// not, once the call met its second (`server_failures` counts them, this
-/// one included); an internal error in the stream, which is otherwise
-/// final, at once. Every other failure keeps it.
-fn withhold_thinking(context: &Context, error: &Error, server_failures: u32) -> Option<Strip> {
+/// error about restoring the reasoning. Only a 400 or server error naming
+/// a thinking signature, decryption, restoration, or verification failure
+/// qualifies. Generic server failures and thinking configuration errors
+/// must not persistently change the bot's context.
+fn withhold_thinking(context: &Context, error: &Error) -> Option<Strip> {
     let window = context.window.as_ref()?;
     let replayed = window.family == agent_runtime::codec::Family::Anthropic
         && window
@@ -3543,19 +3537,30 @@ fn withhold_thinking(context: &Context, error: &Error, server_failures: u32) -> 
     if !replayed {
         return None;
     }
+    if !(error.code.starts_with("provider_http_5")
+        || error.code == "provider_server_error"
+        || error.code == "provider_http_400")
+    {
+        return None;
+    }
     let detail = error
         .detail
         .as_deref()
         .unwrap_or_default()
         .to_ascii_lowercase();
     let named = detail.contains("thinking") || detail.contains("reasoning");
-    let withhold = if error.code.starts_with("provider_http_5") {
-        named || server_failures >= 2
-    } else {
-        // A 400 naming a block it cannot verify, which the binding check
-        // that drops blocks does not cover; not a request signature's 403.
-        error.code == "provider_server_error" || (error.code == "provider_http_400" && named)
-    };
+    let withhold = named
+        && [
+            "signature",
+            "decrypt",
+            "restor",
+            "could not be verified",
+            "cannot be verified",
+            "failed to verify",
+            "unable to verify",
+        ]
+        .iter()
+        .any(|cause| detail.contains(cause));
     withhold.then(|| Strip::from(window.ids[window.ids.len() - 1] + 1))
 }
 
@@ -3573,6 +3578,7 @@ fn retryable(code: &str) -> bool {
     matches!(
         code,
         "provider_rate_limited"
+            | "provider_server_error"
             | "provider_http_429"
             | "provider_stream_failed"
             | "provider_stream_stalled"

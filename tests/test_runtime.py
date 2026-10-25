@@ -549,10 +549,10 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                 self.wfile.flush()
                 return
             signature = getattr(self.server, 'signature', 'sig-1')
-            # A provider that cannot read some blocks back fails every
-            # request replaying one, as Bedrock has: `unreadable` names their
-            # signatures and `unreadable_error` the failure, an HTTP status
-            # and message, or 'stream' for an api_error after the stream began.
+            # Simulate replay failures: `unreadable` names the signatures,
+            # `unreadable_error` the HTTP status and message, or 'stream'
+            # for an api_error after the stream began. An optional failure
+            # count also models a transient outage with the same request.
             if getattr(self.server, 'rate_limits', 0):
                 self.server.rate_limits -= 1
                 body = b'{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}'
@@ -564,8 +564,11 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                 self.wfile.flush()
                 return
             failure = getattr(self.server, 'unreadable_error', None)
-            if failure and any(b['type'] == 'thinking' and b['signature'] in self.server.unreadable
+            remaining = getattr(self.server, 'unreadable_failures', None)
+            if failure and remaining != 0 and any(b['type'] == 'thinking' and b['signature'] in self.server.unreadable
                                for m in request['messages'] for b in m['content']):
+                if remaining is not None:
+                    self.server.unreadable_failures -= 1
                 status, message = failure
                 body = json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': message}})
                 if status == 'stream':
