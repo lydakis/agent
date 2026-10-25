@@ -16,8 +16,8 @@ with its name, and each task the lead (or one of its tasks) starts gets a
 window there running Sonny on that task, without taking focus. Each window
 reports OSC 7501 status, so Rex shows which task is working, waiting on an
 approval or done. `--rex-host HOST` puts the session on another Rex server;
-`--no-rex` turns the layout off. On first use Sonny writes the `rex` skill
-(`skills/rex/SKILL.md`) to `~/.agents/skills/rex`, so any agent can run a
+`--no-rex` turns the layout off. On first use Sonny writes the `rex-windows`
+skill (`skills/rex-windows/SKILL.md`) to `~/.agents/skills/rex-windows`, so any agent can run a
 long command in a Rex window the person can watch, and read it back.
 
 Enter sends (and steers a running turn), Esc interrupts, `y`/`n` answer a

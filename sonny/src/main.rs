@@ -272,6 +272,8 @@ struct App {
     quit: bool,
     started: Instant,
     fleet: Option<Fleet>,
+    /// Layout notes waiting for the lead's running calls to be shown.
+    held: Vec<Line<'static>>,
 }
 
 /// The lead's tasks, laid out in the project's Rex session: a window for
@@ -309,8 +311,8 @@ impl Fleet {
             options.socket.to_string_lossy().into_owned(),
         ];
         let mut note = format!("tasks open in Rex session {project}");
-        if let Some(skill) = rex::install_skill(&bin) {
-            note.push_str(&format!("; agents can use Rex through {}", skill.display()));
+        if rex::install_skill(&bin).is_some() {
+            note.push_str(" · rex-windows skill installed");
         }
         let mut fleet = Self {
             rex,
@@ -415,6 +417,7 @@ impl App {
             quit: false,
             started: Instant::now(),
             fleet: None,
+            held: Vec::new(),
         }
     }
 
@@ -487,7 +490,12 @@ impl App {
                 } => {
                     let said = self.fleet.as_mut().and_then(|fleet| fleet.event(&event));
                     if let Some(said) = said {
-                        self.commit(vec![Line::from(format!("  ↳ {said}")).dim()]);
+                        // After the call that started the task, not above it.
+                        self.held.push(Line::from(format!("  ↳ {said}")).dim());
+                        if self.calls.is_empty() {
+                            let held = std::mem::take(&mut self.held);
+                            self.commit(held);
+                        }
                     }
                 }
                 _ = tick.tick() => {}
@@ -742,6 +750,10 @@ impl App {
                     self.width,
                 );
                 self.commit(lines);
+                if self.calls.is_empty() && !self.held.is_empty() {
+                    let held = std::mem::take(&mut self.held);
+                    self.pending.extend(held);
+                }
                 self.approvals.retain(|call| call["call_id"] != id);
                 if let Some(running) = &mut self.running {
                     running.phase = "Working".into();

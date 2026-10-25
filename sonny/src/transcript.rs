@@ -242,6 +242,11 @@ pub fn tool(
             ]));
         }
         "read" => {}
+        // What `agent run --detach` printed: which agent, which turn.
+        "shell" if started(output).is_some() => {
+            let line = started(output).unwrap_or_default();
+            out.push(Line::from(vec![elbow(), Span::raw(line).dim()]));
+        }
         "shell" | "wait" => {
             let output = output.unwrap_or("");
             let lines: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -264,6 +269,22 @@ pub fn tool(
         _ => {}
     }
     out
+}
+
+/// `agent run --detach`'s reply, as a line: the agent and its turn.
+fn started(output: Option<&str>) -> Option<String> {
+    let reply: Value = serde_json::from_str(output?.trim()).ok()?;
+    let bot = reply["bot"].as_str()?;
+    let turn = reply["turn"].as_i64()?;
+    reply["handle"].as_str()?;
+    Some(format!(
+        "{} {bot}, turn {turn}",
+        if reply["status"] == "queued" {
+            "queued for"
+        } else {
+            "started"
+        }
+    ))
 }
 
 /// An edit as removed and added lines, numbered where the file now has
@@ -410,6 +431,23 @@ mod tests {
         assert_eq!(
             text(&rows),
             ["• - divide by len(values), not ", "    len(values) - 1"]
+        );
+    }
+
+    #[test]
+    fn starting_an_agent_reads_as_one_line() {
+        let output = r#"{"bot":"calc.fix","bot_id":2,"handle":"turn:calc.fix/2","status":"running","turn":2}"#;
+        let rows = tool(
+            "shell",
+            &serde_json::json!({"command":"agent run --detach"}),
+            Some(output),
+            false,
+            "/",
+            60,
+        );
+        assert_eq!(
+            text(&rows),
+            ["• Ran agent run --detach", "  └ started calc.fix, turn 2"]
         );
     }
 

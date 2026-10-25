@@ -1,5 +1,5 @@
 ---
-name: rex
+name: rex-windows
 description: Run long or interactive commands (dev servers, watchers, long builds or test runs, REPLs) in a Rex terminal block the person can watch, then read, wait on or stop them.
 ---
 
@@ -9,11 +9,11 @@ Start one in a window of its own, labelled with what it is, without taking the p
 
     REX_BIN run -s PROJECT --label NAME --shell=none --focus=false --keep-open --json -- COMMAND ARGS...
 
-It prints `{"block_ids": [ID]}`. Keep the ID: labels can repeat, the ID cannot. The block starts in your current folder but not with your environment, so pass what the command needs as arguments or with `env VAR=value COMMAND`.
+It prints `{"window_id": …, "block_ids": [ID], …}`. Keep the block ID: labels can repeat, the ID cannot. The block starts in your current folder but not with your environment, so pass what the command needs as arguments or with `env VAR=value COMMAND`.
 
-- Read its screen: `REX_BIN capture -b ID --trim`
+- Read its screen: `REX_BIN capture -b ID --trim --unwrap`
 - Wait for it to exit, with its status: `REX_BIN wait ID --for 10m --json`
-- Type into it: `REX_BIN send -b ID 'text'` (a newline in the text presses Enter)
+- Type into it and press Enter: `REX_BIN send -b ID 'text' && REX_BIN send-key -b ID enter` (a newline in the text is Ctrl-J to a full-screen program, not Enter)
 - Stop it: `REX_BIN block close ID`
 - What is open: `REX_BIN block ls -s PROJECT --json`
 

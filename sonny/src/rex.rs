@@ -135,15 +135,17 @@ impl Rex {
 }
 
 /// The skill that lets any agent run long work where the person can see it.
-/// Written once into `~/.agents/skills/rex`, naming this machine's rex.
+/// Written once into `~/.agents/skills/rex-windows`, naming this machine's
+/// rex; `rex` itself is the name of Rex's own skill.
 pub fn install_skill(bin: &Path) -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var_os("HOME")?).join(".agents/skills/rex");
+    let dir = PathBuf::from(std::env::var_os("HOME")?).join(".agents/skills/rex-windows");
     let path = dir.join("SKILL.md");
     if path.exists() {
         return None;
     }
     let rex = bin.to_string_lossy();
-    let text = include_str!("../skills/rex/SKILL.md").replace("REX_BIN", &format!("\"{rex}\""));
+    let text =
+        include_str!("../skills/rex-windows/SKILL.md").replace("REX_BIN", &format!("\"{rex}\""));
     std::fs::create_dir_all(&dir).ok()?;
     std::fs::write(&path, text).ok()?;
     Some(path)
