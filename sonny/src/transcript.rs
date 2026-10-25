@@ -367,7 +367,7 @@ fn page(source: &str, width: usize) -> Vec<Line<'static>> {
             let note = Line::from(vec![
                 Span::raw("    ↗ ").fg(Color::Cyan),
                 Span::raw("/open").bold(),
-                Span::raw(format!(" shows it in your browser · {}", path.display())).dim(),
+                Span::raw(" shows it in your browser").dim(),
             ]);
             if let Ok(mut page) = PAGE.lock() {
                 *page = Some(path);
@@ -473,17 +473,30 @@ pub fn prompt(text: &str, from: Option<&str>, width: usize) -> Vec<Line<'static>
     if let Some(from) = from {
         out.push(Line::from(format!("  from {from}")).dim());
     }
-    for (i, line) in text.lines().enumerate() {
+    // A long paste shows its start; the rest is in the conversation.
+    let lines: Vec<&str> = text.lines().collect();
+    let shown = if lines.len() > PROMPT_LINES + 2 {
+        PROMPT_LINES
+    } else {
+        lines.len()
+    };
+    for (i, line) in lines[..shown].iter().enumerate() {
         let lead = if i == 0 { "› " } else { "  " };
         out.extend(wrap(
-            Line::from(line.to_owned()),
+            Line::from(line.to_string()),
             width,
             Span::raw(lead).bold().fg(Color::Magenta),
             Span::raw("  "),
         ));
     }
+    if lines.len() > shown {
+        out.push(Line::from(format!("  … +{} lines", lines.len() - shown)).dim());
+    }
     out
 }
+
+/// The most lines of a prompt shown above its reply.
+const PROMPT_LINES: usize = 6;
 
 /// A whole reply, as replayed history shows it.
 pub fn reply(text: &str, width: usize) -> Vec<Line<'static>> {
