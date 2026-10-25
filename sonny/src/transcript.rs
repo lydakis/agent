@@ -14,9 +14,10 @@ use unicode_width::UnicodeWidthStr;
 #[derive(Default, Clone)]
 pub struct Markdown {
     fence: bool,
-    /// An SVG fence's text, gathered to be drawn when it closes.
-    picture: Option<String>,
-    ready: Option<String>,
+    /// An SVG or Mermaid fence's language and text, gathered to be drawn
+    /// when it closes.
+    picture: Option<(String, String)>,
+    ready: Option<(String, String)>,
     /// How far the last line's wrapped rows are indented: under a list
     /// item's text, so a continuation does not read as a new item.
     hang: usize,
@@ -29,14 +30,30 @@ impl Markdown {
     }
 
     /// The picture a fence that just closed drew, as rows of the
-    /// terminal's image cells, or why it could not be drawn.
+    /// terminal's image cells; or, when it could not be drawn, its source
+    /// and why.
     pub fn picture(&mut self, width: usize) -> Vec<Line<'static>> {
-        let Some(svg) = self.ready.take() else {
+        let Some((lang, source)) = self.ready.take() else {
             return Vec::new();
         };
-        crate::image::svg(&svg, width).unwrap_or_else(|error| {
-            vec![Line::from(format!("  (could not draw the SVG: {error})")).dim()]
-        })
+        let svg = match lang.as_str() {
+            "mermaid" => crate::mermaid::svg(&source),
+            _ => Ok(source.clone()),
+        };
+        match svg.and_then(|svg| crate::image::svg(&svg, width)) {
+            Ok(rows) => rows,
+            Err(error) => {
+                let mut out: Vec<Line<'static>> = source
+                    .lines()
+                    .flat_map(|line| {
+                        let code = Line::from(line.to_owned()).fg(Color::Cyan);
+                        wrap(code, width, Span::raw("    "), Span::raw("    "))
+                    })
+                    .collect();
+                out.push(Line::from(format!("    could not draw it: {error}")).dim());
+                out
+            }
+        }
     }
 
     /// The styled line, or none for a fence marker, which is not shown.
@@ -45,14 +62,15 @@ impl Markdown {
         self.hang = 0;
         if let Some(lang) = trimmed.strip_prefix("```") {
             self.fence = !self.fence;
-            if self.fence && lang.trim() == "svg" && crate::term::graphics() {
-                self.picture = Some(String::new());
+            let lang = lang.trim();
+            if self.fence && matches!(lang, "svg" | "mermaid") && crate::term::graphics() {
+                self.picture = Some((lang.to_owned(), String::new()));
             } else if !self.fence {
                 self.ready = self.picture.take();
             }
             return None;
         }
-        if let Some(picture) = &mut self.picture {
+        if let Some((_, picture)) = &mut self.picture {
             picture.push_str(text);
             picture.push('\n');
             return None;

@@ -11,6 +11,7 @@
 mod calls;
 mod diff;
 mod image;
+mod mermaid;
 mod project;
 mod rex;
 mod shell;

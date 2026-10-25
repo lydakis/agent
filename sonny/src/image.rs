@@ -62,7 +62,7 @@ pub fn svg(text: &str, width: usize) -> Result<Vec<Line<'static>>, String> {
 }
 
 /// The SVG as a PNG that fills `cols`×`rows` cells.
-fn render(text: &str, width: usize) -> Result<(Vec<u8>, u32, u32), String> {
+pub fn render(text: &str, width: usize) -> Result<(Vec<u8>, u32, u32), String> {
     let mut options = usvg::Options {
         fontdb: fonts(),
         ..usvg::Options::default()
