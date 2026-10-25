@@ -1,0 +1,922 @@
+//! A terminal client for one bot, beside the app: its conversation goes
+//! into the terminal's own scrollback as it happens, and a few rows at the
+//! bottom hold what is still moving: the reply being written, what the bot
+//! is doing, and the composer. Prototype.
+//!
+//! The look follows Codex's TUI (openai/codex, codex-rs/tui): finished
+//! history is written above an inline viewport rather than kept in an
+//! alternate screen, replies stream a line at a time, tool calls are one
+//! `• Ran …` line with a short `└` look at the result, and a status row
+//! says how long the turn has run and how to stop it.
+mod transcript;
+
+use agent_client::{Client, Events};
+use ratatui::{
+    Terminal, TerminalOptions, Viewport,
+    backend::CrosstermBackend,
+    crossterm::{
+        event::{
+            self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
+            KeyModifiers,
+        },
+        execute,
+        terminal::{disable_raw_mode, enable_raw_mode},
+    },
+    layout::{Constraint, Layout},
+    style::{Color, Modifier, Style, Stylize},
+    text::{Line, Span},
+    widgets::{Paragraph, Widget},
+};
+use serde_json::{Value, json};
+use std::{
+    collections::HashMap,
+    io::Write,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use transcript::Markdown;
+use unicode_width::UnicodeWidthStr;
+
+const DEFAULT_TOOLS: [&str; 6] = ["shell", "read", "write", "edit", "wait", "history"];
+/// Rows kept at the bottom: the reply's unfinished line, the status, a gap,
+/// the composer and the footer.
+const VIEWPORT: u16 = 5;
+/// How much history is shown on attach.
+const HISTORY_ITEMS: u64 = 200;
+
+type Tui = Terminal<CrosstermBackend<std::io::Stdout>>;
+
+struct Options {
+    socket: PathBuf,
+    bot: String,
+    new: bool,
+    model: Option<String>,
+    workspace: Option<String>,
+}
+
+fn usage() -> String {
+    "usage: agent-tui [--store PATH] [--socket PATH] --bot NAME [--new --model PROVIDER/MODEL [--workspace DIR]]".into()
+}
+
+fn parse() -> Result<Options, String> {
+    let mut args = std::env::args().skip(1);
+    let (mut store, mut socket, mut bot, mut new, mut model, mut workspace) =
+        (None, None, None, false, None, None);
+    while let Some(arg) = args.next() {
+        let mut value = || args.next().ok_or_else(usage);
+        match arg.as_str() {
+            "--store" => store = Some(PathBuf::from(value()?)),
+            "--socket" => socket = Some(PathBuf::from(value()?)),
+            "--bot" => bot = Some(value()?),
+            "--new" => new = true,
+            "--model" => model = Some(value()?),
+            "--workspace" => workspace = Some(value()?),
+            _ => return Err(usage()),
+        }
+    }
+    let store = match store.or_else(|| std::env::var_os("AGENT_STORE").map(PathBuf::from)) {
+        Some(store) => store,
+        None => PathBuf::from(std::env::var_os("HOME").ok_or("set --store or HOME")?)
+            .join(".agent/state.sqlite"),
+    };
+    let socket = match socket.or_else(|| std::env::var_os("AGENT_SOCKET").map(PathBuf::from)) {
+        Some(socket) => socket,
+        None => agent_client::socket::default_socket(&store).map_err(|e| e.to_string())?,
+    };
+    Ok(Options {
+        socket,
+        bot: bot.ok_or_else(usage)?,
+        new,
+        model,
+        workspace,
+    })
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("agent-tui: {error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), String> {
+    let options = parse()?;
+    let (client, mut events) = Client::connect(&options.socket)
+        .await
+        .map_err(|e| format!("{e}; start the daemon with `agent start`"))?;
+    if options.new {
+        create(&client, &options).await?;
+    }
+    let bot = client
+        .request("resume", json!({"bot": options.bot}))
+        .await
+        .map_err(|e| e.to_string())?;
+    // Everything after now arrives live; history is read from the bot's
+    // items instead of replayed events, so the replay is skipped.
+    client
+        .request("follow", json!({"bot": options.bot, "after": 0}))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    enable_raw_mode().map_err(|e| e.to_string())?;
+    let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+    let mut terminal = Terminal::with_options(
+        CrosstermBackend::new(std::io::stdout()),
+        TerminalOptions {
+            viewport: Viewport::Inline(VIEWPORT),
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    let mut app = App::new(client, &options.bot, &bot);
+    let result = app.main(&mut terminal, &mut events).await;
+    let _ = terminal.clear();
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+    let _ = disable_raw_mode();
+    status_report("clear", &options.bot);
+    result
+}
+
+/// A new bot in the folder, with the instructions the app would give it.
+async fn create(client: &Client, options: &Options) -> Result<(), String> {
+    let model = options
+        .model
+        .clone()
+        .or_else(|| std::env::var("AGENT_MODEL").ok())
+        .ok_or("--new needs --model PROVIDER/MODEL")?;
+    let workspace = match &options.workspace {
+        Some(dir) => std::path::absolute(dir).map_err(|e| e.to_string())?,
+        None => std::env::current_dir().map_err(|e| e.to_string())?,
+    };
+    let memory = agent_client::policy::memory_indexes(&workspace).map_err(|e| e.to_string())?;
+    let instructions = agent_client::policy::instructions(&workspace, None, &memory)
+        .map_err(|e| e.to_string())?
+        .text;
+    client
+        .request(
+            "create",
+            json!({"bot": options.bot, "workspace": workspace, "model": model,
+                "instructions": instructions, "tools": DEFAULT_TOOLS,
+                "request_id": unique("tui-create")}),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn unique(prefix: &str) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{prefix}-{}-{}", now.as_millis(), std::process::id())
+}
+
+/// Program status (OSC 7501), so a terminal or multiplexer that reads it
+/// (Ghostty, Rex) can mark this pane working, blocked or done.
+fn status_report(state: &str, bot: &str) {
+    use base64::Engine;
+    let mut body = format!("state={state}");
+    if state == "blocked" {
+        body.push_str(":kind=permission");
+    }
+    if state != "clear" {
+        let title = base64::engine::general_purpose::STANDARD.encode(bot);
+        body.push_str(&format!(":app=agent:title={title}"));
+    }
+    let mut stdout = std::io::stdout();
+    let _ = write!(stdout, "\x1b]7501;{body}\x1b\\");
+    let _ = stdout.flush();
+}
+
+/// The reply being written: lines are committed as they end, and the line
+/// still open stays in the viewport.
+struct Live {
+    markdown: Markdown,
+    partial: String,
+    lines: usize,
+}
+
+struct Running {
+    turn: i64,
+    started: Instant,
+    /// What the status row says the bot is doing.
+    phase: String,
+}
+
+struct App {
+    client: Arc<Client>,
+    bot: String,
+    workspace: String,
+    model: String,
+    effort: Option<String>,
+    tokens_used: u64,
+    input: String,
+    /// Lines waiting to be written into scrollback.
+    pending: Vec<Line<'static>>,
+    any_history: bool,
+    width: usize,
+    live: Option<Live>,
+    /// Whether the reply now ending arrived as deltas.
+    streamed: bool,
+    running: Option<Running>,
+    usage: (u64, u64, u64),
+    calls: HashMap<String, (String, Value)>,
+    /// Calls waiting on the person, as `approvals` lists them.
+    approvals: Vec<Value>,
+    following: bool,
+    notice: Option<String>,
+    quit: bool,
+    started: Instant,
+}
+
+impl App {
+    fn new(client: Arc<Client>, bot: &str, record: &Value) -> Self {
+        let model = format!(
+            "{}/{}",
+            record["provider"].as_str().unwrap_or("?"),
+            record["model"].as_str().unwrap_or("?")
+        );
+        Self {
+            client,
+            bot: bot.to_owned(),
+            workspace: record["workspace"].as_str().unwrap_or("").to_owned(),
+            model,
+            effort: record["effort"].as_str().map(str::to_owned),
+            tokens_used: record["tokens_used"].as_u64().unwrap_or(0),
+            input: String::new(),
+            pending: Vec::new(),
+            any_history: false,
+            width: 80,
+            live: None,
+            streamed: false,
+            running: record["running_turn"].as_i64().map(|turn| Running {
+                turn,
+                started: Instant::now(),
+                phase: "Working".into(),
+            }),
+            usage: (0, 0, 0),
+            calls: HashMap::new(),
+            approvals: Vec::new(),
+            following: false,
+            notice: None,
+            quit: false,
+            started: Instant::now(),
+        }
+    }
+
+    async fn main(&mut self, terminal: &mut Tui, events: &mut Events) -> Result<(), String> {
+        self.width = terminal.size().map(|s| s.width as usize).unwrap_or(80);
+        self.history().await;
+        // A turn already running: its clock, and any call it waits on.
+        if let Some(turn) = self.running.as_ref().map(|r| r.turn) {
+            if let Ok(page) = self
+                .client
+                .request(
+                    "turns",
+                    json!({"bot": self.bot, "newest": true, "limit": 1}),
+                )
+                .await
+                && let Some(started) = page["turns"][0]["started_ms"].as_u64()
+            {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let ran = Duration::from_millis(now.saturating_sub(started));
+                if let Some(running) = &mut self.running {
+                    running.started = Instant::now().checked_sub(ran).unwrap_or(running.started);
+                }
+            }
+            self.approvals_for(Some(turn)).await;
+        }
+        let (keys_tx, mut keys) = tokio::sync::mpsc::unbounded_channel();
+        std::thread::spawn(move || {
+            while let Ok(event) = event::read() {
+                if keys_tx.send(event).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut tick = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            self.draw(terminal).map_err(|e| e.to_string())?;
+            if self.quit {
+                return Ok(());
+            }
+            tokio::select! {
+                event = events.recv() => match event {
+                    Some(event) => self.daemon(event).await,
+                    None => {
+                        self.notice = Some("the daemon hung up".into());
+                        self.running = None;
+                    }
+                },
+                Some(key) = keys.recv() => self.key(key).await,
+                _ = tick.tick() => {}
+            }
+        }
+    }
+
+    /// Commit a finished cell, a blank line apart from the one before.
+    fn commit(&mut self, lines: Vec<Line<'static>>) {
+        if lines.is_empty() {
+            return;
+        }
+        if self.any_history {
+            self.pending.push(Line::default());
+        }
+        self.any_history = true;
+        self.pending.extend(lines);
+    }
+
+    async fn items(&self, nodes: &[i64]) -> Vec<Value> {
+        match self
+            .client
+            .request("history_items", json!({"bot": self.bot, "nodes": nodes}))
+            .await
+        {
+            Ok(read) => read["items"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|entry| entry["item"].clone())
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// The bot's latest items, written as the transcript would have shown them.
+    async fn history(&mut self) {
+        let Ok(page) = self
+            .client
+            .request(
+                "history_nodes",
+                json!({"bot": self.bot, "limit": HISTORY_ITEMS}),
+            )
+            .await
+        else {
+            return;
+        };
+        let mut nodes: Vec<i64> = page["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|n| n["node"].as_i64())
+            .collect();
+        nodes.reverse();
+        let mut calls: HashMap<String, (String, Value)> = HashMap::new();
+        for chunk in nodes.chunks(100) {
+            for item in self.items(chunk).await {
+                match (item["type"].as_str(), item["role"].as_str()) {
+                    (_, Some("user")) => {
+                        let lines = transcript::prompt(&text(&item), None, self.width);
+                        self.commit(lines);
+                    }
+                    (_, Some("assistant")) => {
+                        let lines = transcript::reply(&text(&item), self.width);
+                        self.commit(lines);
+                    }
+                    (Some("function_call"), _) => {
+                        let arguments = item["arguments"]
+                            .as_str()
+                            .and_then(|a| serde_json::from_str(a).ok())
+                            .unwrap_or(Value::Null);
+                        let name = item["name"].as_str().unwrap_or("tool").to_owned();
+                        calls.insert(
+                            item["call_id"].as_str().unwrap_or("").to_owned(),
+                            (name, arguments),
+                        );
+                    }
+                    (Some("function_call_output"), _) => {
+                        let id = item["call_id"].as_str().unwrap_or("");
+                        if let Some((name, arguments)) = calls.remove(id) {
+                            let (output, failed) = output(&item);
+                            let lines = transcript::tool(
+                                &name,
+                                &arguments,
+                                Some(&output),
+                                failed,
+                                &self.workspace,
+                                self.width,
+                            );
+                            self.commit(lines);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if self.any_history {
+            self.pending.push(Line::default());
+            self.pending.push(
+                Line::from(format!("─ attached to {} ", self.bot))
+                    .dim()
+                    .patch_style(Style::new()),
+            );
+            self.any_history = true;
+        }
+    }
+
+    fn end_live(&mut self) {
+        if let Some(mut live) = self.live.take() {
+            let rest = std::mem::take(&mut live.partial);
+            if !rest.is_empty() {
+                self.live_line(&mut live, &rest);
+            }
+        }
+    }
+
+    fn live_line(&mut self, live: &mut Live, line: &str) {
+        if let Some(styled) = live.markdown.line(line) {
+            let lead = if live.lines == 0 { "• " } else { "  " };
+            let rows = transcript::wrap(styled, self.width, Span::raw(lead), Span::raw("  "));
+            live.lines += rows.len();
+            self.pending.extend(rows);
+            self.any_history = true;
+        }
+    }
+
+    async fn daemon(&mut self, event: Value) {
+        let kind = event["event"].as_str().unwrap_or("");
+        if !self.following {
+            if kind == "follow_live" {
+                self.following = true;
+            }
+            return;
+        }
+        if event["bot"] != self.bot.as_str() {
+            return;
+        }
+        let data = &event["data"];
+        let turn = event["turn"].as_i64();
+        match kind {
+            "accepted" => {
+                self.end_live();
+                self.usage = (0, 0, 0);
+                self.running = Some(Running {
+                    turn: turn.unwrap_or(0),
+                    started: Instant::now(),
+                    phase: "Working".into(),
+                });
+                status_report("working", &self.bot);
+                if let Some(node) = data["node"].as_i64()
+                    && let Some(item) = self.items(&[node]).await.first()
+                {
+                    let lines = transcript::prompt(&text(item), None, self.width);
+                    self.commit(lines);
+                }
+            }
+            "steered" => {
+                if let Some(node) = data["node"].as_i64()
+                    && let Some(item) = self.items(&[node]).await.first()
+                {
+                    self.end_live();
+                    let lines = transcript::prompt(&text(item), None, self.width);
+                    self.commit(lines);
+                }
+            }
+            "queued" => self.notice = Some(format!("queued behind turn {}", data["behind"])),
+            "text_delta" => {
+                self.streamed = true;
+                if let Some(running) = &mut self.running {
+                    running.phase = "Working".into();
+                }
+                let mut live = match self.live.take() {
+                    Some(live) => live,
+                    None => {
+                        // The gap above the reply goes out with its first
+                        // delta, so the open line sits where it will stay.
+                        if self.any_history {
+                            self.pending.push(Line::default());
+                        }
+                        Live {
+                            markdown: Markdown::default(),
+                            partial: String::new(),
+                            lines: 0,
+                        }
+                    }
+                };
+                live.partial.push_str(event["text"].as_str().unwrap_or(""));
+                while let Some(at) = live.partial.find('\n') {
+                    let line: String = live.partial.drain(..=at).collect();
+                    self.live_line(&mut live, line.trim_end_matches('\n'));
+                }
+                self.live = Some(live);
+            }
+            "thinking_delta" => {
+                if let Some(running) = &mut self.running {
+                    running.phase = "Thinking".into();
+                }
+            }
+            "message" => {
+                if self.streamed {
+                    self.streamed = false;
+                    self.end_live();
+                } else if let Some(node) = data["node"].as_i64()
+                    && let Some(item) = self.items(&[node]).await.first()
+                    && item["role"] == "assistant"
+                {
+                    let lines = transcript::reply(&text(item), self.width);
+                    self.commit(lines);
+                }
+            }
+            "tool_started" => {
+                self.end_live();
+                let name = data["name"].as_str().unwrap_or("tool").to_owned();
+                let arguments = data["arguments"]
+                    .as_str()
+                    .and_then(|a| serde_json::from_str(a).ok())
+                    .unwrap_or(Value::Null);
+                if let Some(running) = &mut self.running {
+                    running.phase = match (name.as_str(), arguments["command"].as_str()) {
+                        ("shell", Some(command)) => format!("Running {}", first_line(command)),
+                        _ => format!("Calling {name}"),
+                    };
+                }
+                self.calls.insert(
+                    data["call_id"].as_str().unwrap_or("").to_owned(),
+                    (name, arguments),
+                );
+            }
+            "tool_completed" => {
+                let id = data["call_id"].as_str().unwrap_or("");
+                let Some((name, arguments)) = self.calls.remove(id) else {
+                    return;
+                };
+                let mut shown = (String::new(), data["failed"] == true);
+                if let Some(node) = data["node"].as_i64()
+                    && let Some(item) = self.items(&[node]).await.first()
+                {
+                    shown = output(item);
+                    shown.1 |= data["failed"] == true;
+                }
+                if data["denied"] == true {
+                    shown = ("denied".into(), true);
+                }
+                let lines = transcript::tool(
+                    &name,
+                    &arguments,
+                    Some(&shown.0),
+                    shown.1,
+                    &self.workspace,
+                    self.width,
+                );
+                self.commit(lines);
+                self.approvals.retain(|call| call["call_id"] != id);
+                if let Some(running) = &mut self.running {
+                    running.phase = "Working".into();
+                }
+            }
+            "approval_requested" => self.approvals_for(turn).await,
+            "turn_waiting" => {
+                if let Some(running) = &mut self.running
+                    && data["approval"] != true
+                {
+                    running.phase = "Waiting".into();
+                }
+            }
+            "turn_paced" => {
+                if let Some(running) = &mut self.running {
+                    running.phase = "Rate limited".into();
+                }
+            }
+            "turn_resumed" => {
+                if let Some(running) = &mut self.running {
+                    running.phase = "Working".into();
+                }
+            }
+            "usage" => {
+                self.usage.0 += data["input_tokens"].as_u64().unwrap_or(0);
+                self.usage.1 += data["output_tokens"].as_u64().unwrap_or(0);
+                self.usage.2 += data["cached_input_tokens"].as_u64().unwrap_or(0);
+                self.tokens_used += data["input_tokens"].as_u64().unwrap_or(0)
+                    + data["output_tokens"].as_u64().unwrap_or(0);
+            }
+            "turn_finished" => {
+                if self.running.as_ref().is_some_and(|r| Some(r.turn) != turn) {
+                    return;
+                }
+                self.end_live();
+                let status = data["status"].as_str().unwrap_or("unknown");
+                let detail = data["error"].as_str().unwrap_or("");
+                let seconds = self.running.take().map(|r| r.started.elapsed().as_secs());
+                let line = transcript::finished(status, detail, seconds, self.usage, self.width);
+                self.commit(vec![line]);
+                self.approvals.clear();
+                self.notice = None;
+                status_report(
+                    match status {
+                        "completed" | "steered" => "done",
+                        "interrupted" => "idle",
+                        _ => "error",
+                    },
+                    &self.bot,
+                );
+            }
+            "deleted" => {
+                self.notice = Some(format!("{} was deleted", self.bot));
+                self.running = None;
+            }
+            "follow_lagged" => self.notice = Some("fell behind the daemon; reattach".into()),
+            _ => {}
+        }
+    }
+
+    /// The turn's calls a person must answer; a program answers the rest.
+    async fn approvals_for(&mut self, turn: Option<i64>) {
+        let Ok(page) = self
+            .client
+            .request("approvals", json!({"bot": self.bot, "limit": 64}))
+            .await
+        else {
+            return;
+        };
+        self.approvals = page["approvals"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|call| {
+                call["turn"].as_i64() == turn
+                    && call["gates"]
+                        .as_array()
+                        .is_some_and(|gates| gates.iter().any(|g| g == "manual"))
+            })
+            .cloned()
+            .collect();
+        if !self.approvals.is_empty() {
+            status_report("blocked", &self.bot);
+        }
+    }
+
+    async fn answer(&mut self, decision: &str) {
+        let call = self.approvals.remove(0);
+        let answered = self
+            .client
+            .request(
+                "answer",
+                json!({"bot": self.bot, "turn": call["turn"], "call_id": call["call_id"],
+                    "request": call["request"], "tag": "manual", "decision": decision, "by": "tui"}),
+            )
+            .await;
+        if let Err(error) = answered {
+            self.notice = Some(error.to_string());
+        }
+        if self.approvals.is_empty() {
+            status_report("working", &self.bot);
+        }
+    }
+
+    async fn key(&mut self, event: Event) {
+        match event {
+            Event::Paste(text) => self.input.push_str(&text),
+            Event::Resize(width, _) => self.width = width as usize,
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                match key.code {
+                    KeyCode::Char('c') if ctrl => {
+                        if self.input.is_empty() {
+                            self.quit = true;
+                        } else {
+                            self.input.clear();
+                        }
+                    }
+                    KeyCode::Char('d') if ctrl && self.input.is_empty() => self.quit = true,
+                    KeyCode::Char(c @ ('y' | 'n'))
+                        if !self.approvals.is_empty() && self.input.is_empty() =>
+                    {
+                        self.answer(if c == 'y' { "allow" } else { "deny" }).await;
+                    }
+                    KeyCode::Char(c) if !ctrl => self.input.push(c),
+                    KeyCode::Backspace => {
+                        self.input.pop();
+                    }
+                    KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        self.input.push('\n')
+                    }
+                    KeyCode::Enter => self.submit().await,
+                    KeyCode::Esc => {
+                        if let Some(running) = &self.running {
+                            let turn = running.turn;
+                            let _ = self
+                                .client
+                                .request("interrupt", json!({"bot": self.bot, "turn": turn}))
+                                .await;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    async fn submit(&mut self) {
+        let prompt = self.input.trim().to_owned();
+        if prompt.is_empty() {
+            return;
+        }
+        // A message to a busy bot joins its running turn.
+        let delivery = self.running.is_some().then_some("steer");
+        let submitted = self
+            .client
+            .request(
+                "submit",
+                json!({"bot": self.bot, "request_id": unique("tui"), "prompt": prompt,
+                    "delivery": delivery}),
+            )
+            .await;
+        match submitted {
+            Ok(_) => {
+                self.input.clear();
+                self.notice = None;
+            }
+            Err(error) => self.notice = Some(error.to_string()),
+        }
+    }
+
+    fn draw(&mut self, terminal: &mut Tui) -> std::io::Result<()> {
+        if !self.pending.is_empty() {
+            let lines = std::mem::take(&mut self.pending);
+            terminal.insert_before(lines.len() as u16, |buf| {
+                Paragraph::new(lines).render(buf.area, buf);
+            })?;
+        }
+        terminal.draw(|frame| {
+            let [live, status, _, composer, footer] =
+                Layout::vertical([Constraint::Length(1); 5]).areas(frame.area());
+            let width = live.width as usize;
+            if let Some(open) = &self.live
+                && !open.partial.is_empty()
+            {
+                let mut markdown = open.markdown.clone();
+                if let Some(line) = markdown.line(&open.partial) {
+                    let lead = if open.lines == 0 { "• " } else { "  " };
+                    // The open line's end, when it is already wider than a row.
+                    let rows = transcript::wrap(line, width, Span::raw(lead), Span::raw("  "));
+                    frame.render_widget(
+                        Paragraph::new(rows.last().cloned().unwrap_or_default()),
+                        live,
+                    );
+                }
+            }
+            frame.render_widget(Paragraph::new(self.status_line()), status);
+            let (text, cursor) = if self.input.is_empty() {
+                let hint = if self.running.is_some() {
+                    "Steer the running turn".to_owned()
+                } else {
+                    format!("Ask {} to do anything", self.bot)
+                };
+                (
+                    Line::from(vec![Span::raw("› ").bold(), Span::raw(hint).dim()]),
+                    2,
+                )
+            } else {
+                let shown = self.input.rsplit('\n').next().unwrap_or("");
+                let room = width.saturating_sub(3);
+                let mut start = 0;
+                while shown[start..].width() > room {
+                    start += shown[start..].chars().next().map_or(1, char::len_utf8);
+                }
+                let line = Line::from(vec![
+                    Span::raw("› ").bold(),
+                    Span::raw(shown[start..].to_owned()),
+                ]);
+                (line, 2 + shown[start..].width() as u16)
+            };
+            frame.render_widget(Paragraph::new(text), composer);
+            frame.set_cursor_position((composer.x + cursor, composer.y));
+            frame.render_widget(Paragraph::new(self.footer_line(width)), footer);
+        })?;
+        Ok(())
+    }
+
+    fn status_line(&self) -> Line<'static> {
+        if let Some(call) = self.approvals.first() {
+            let name = call["name"].as_str().unwrap_or("tool");
+            let what = call["arguments"]["command"]
+                .as_str()
+                .or_else(|| call["arguments"]["path"].as_str())
+                .map(first_line)
+                .unwrap_or_default();
+            return Line::from(vec![
+                Span::raw("⏸ ").fg(Color::Yellow),
+                Span::raw(format!("Allow {name} ")).bold(),
+                Span::raw(what),
+                Span::raw("?  ").bold(),
+                Span::raw("y").bold(),
+                Span::raw(" allow · ").dim(),
+                Span::raw("n").bold(),
+                Span::raw(" deny").dim(),
+            ]);
+        }
+        if let Some(running) = &self.running {
+            let mut spans = vec![Span::raw("• ").dim()];
+            spans.extend(shimmer(&running.phase, self.started.elapsed()));
+            spans.push(
+                Span::raw(format!(
+                    " ({} • esc to interrupt)",
+                    transcript::elapsed(running.started.elapsed().as_secs())
+                ))
+                .dim(),
+            );
+            return Line::from(spans);
+        }
+        match &self.notice {
+            Some(notice) => Line::from(Span::raw(notice.clone()).fg(Color::Yellow)),
+            None => Line::default(),
+        }
+    }
+
+    fn footer_line(&self, width: usize) -> Line<'static> {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let folder = match self.workspace.strip_prefix(&home) {
+            Some(rest) if !home.is_empty() => format!("~{rest}"),
+            _ => self.workspace.clone(),
+        };
+        let mut left = format!("  {}", self.model);
+        if let Some(effort) = &self.effort {
+            left.push_str(&format!(" {effort}"));
+        }
+        let right = format!(
+            "{} · {} tokens  ",
+            self.bot,
+            transcript::tokens(self.tokens_used)
+        );
+        // A long folder keeps its end, the part that tells folders apart.
+        let room = width.saturating_sub(left.width() + right.width() + 4);
+        let mut folder = folder.as_str();
+        let cut = folder.width() > room;
+        while folder.width() > room.saturating_sub(1) && !folder.is_empty() {
+            folder = &folder[folder.chars().next().map_or(1, char::len_utf8)..];
+        }
+        left.push_str(&format!(" · {}{folder}", if cut { "…" } else { "" }));
+        let fill = width.saturating_sub(left.width() + right.width());
+        Line::from(format!("{left}{}{right}", " ".repeat(fill))).dim()
+    }
+}
+
+/// Codex's sweep: a brighter band moving across the phase every two seconds.
+fn shimmer(text: &str, since: Duration) -> Vec<Span<'static>> {
+    let chars: Vec<char> = text.chars().collect();
+    let period = chars.len() as f32 + 20.0;
+    let at = (since.as_secs_f32() % 2.0) / 2.0 * period;
+    chars
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let distance = (i as f32 + 10.0 - at).abs();
+            let style = if distance < 2.0 {
+                Style::new().add_modifier(Modifier::BOLD)
+            } else if distance < 4.0 {
+                Style::new()
+            } else {
+                Style::new().add_modifier(Modifier::DIM)
+            };
+            Span::styled(c.to_string(), style)
+        })
+        .collect()
+}
+
+fn first_line(text: &str) -> String {
+    let line = text.lines().next().unwrap_or("");
+    let mut cut: String = line.chars().take(60).collect();
+    if cut.len() < line.len() || text.lines().nth(1).is_some() {
+        cut.push('…');
+    }
+    cut
+}
+
+/// A message item's text.
+fn text(item: &Value) -> String {
+    match &item["content"] {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+/// A tool result's text, and whether it failed. A shell result is JSON
+/// with its streams and exit status.
+fn output(item: &Value) -> (String, bool) {
+    let raw = item["output"]
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| text(item));
+    match serde_json::from_str::<Value>(&raw) {
+        Ok(shell) if shell.get("exit_code").is_some() => {
+            let mut shown = shell["stdout"].as_str().unwrap_or("").to_owned();
+            shown.push_str(shell["stderr"].as_str().unwrap_or(""));
+            (shown, shell["success"] == false)
+        }
+        _ => (raw, false),
+    }
+}

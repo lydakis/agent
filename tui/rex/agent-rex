@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""One Rex block per busy bot, each running agent-tui. Prototype.
+
+    agent-rex [--session agent] [--agent PATH] [--tui PATH]
+
+Opens (or reuses) a Rex session, gives every bot with a running turn its
+own block running `agent-tui --bot NAME`, then follows the daemon and opens
+a block for each bot that starts a turn after that. Closing a block is left
+to the person; a bot whose block they closed gets a new one on its next turn.
+agent-tui reports its state through OSC 7501, so Rex marks each block
+working, blocked on an approval, or done.
+
+Everything Rex-specific is in the three `rex_*` functions below. Their
+flags were written before the real `rex --help` was read and must be
+checked against it (rex 0.0.1792787366, API rev 7).
+"""
+import argparse, json, os, shutil, subprocess, sys
+
+REX = os.environ.get('REX') or shutil.which('rex') or \
+    '/Applications/Rex Beta.app/Contents/Helpers/Rex Server.rex/Contents/MacOS/rex'
+
+
+def rex(*args):
+    return subprocess.run([REX, *args], check=True, capture_output=True, text=True).stdout
+
+
+def rex_session(name):
+    """The session's id, created when missing. UNVERIFIED flags."""
+    for session in json.loads(rex('ls', '--json', '--autostart=false') or '[]'):
+        if session.get('label') == name:
+            return session['id']
+    return rex('new', '--json', '--label', name).strip()
+
+
+def rex_open(session, label, command):
+    """A new block in the session running COMMAND; returns its full id,
+    since labels need not be unique. UNVERIFIED flags."""
+    out = rex('split', '-s', session, '--label', label, '--json', '--', *command)
+    return json.loads(out)['id']
+
+
+def rex_blocks(session):
+    """Ids of the session's blocks that are still open. UNVERIFIED flags."""
+    return {b['id'] for b in json.loads(rex('block', 'ls', '-s', session, '--json'))}
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--session', default='agent')
+    parser.add_argument('--agent', default=os.environ.get('AGENT_BIN', 'agent'),
+                        help="Agent's CLI; give the full path where `agent` is another program")
+    parser.add_argument('--tui', default='agent-tui')
+    options = parser.parse_args()
+    session = rex_session(options.session)
+    blocks = {}
+
+    def show(bot):
+        if bot in blocks and blocks[bot] in rex_blocks(session):
+            return
+        blocks[bot] = rex_open(session, bot, [options.tui, '--bot', bot])
+
+    for bot in json.loads(subprocess.check_output([options.agent, 'ls', '--active'])):
+        show(bot['name'])
+    # Only what happens from now: a turn that starts gets its bot a block.
+    # The replay before `follow_live` is history and is skipped.
+    follow = subprocess.Popen([options.agent, 'follow', '--all'],
+                              stdout=subprocess.PIPE, text=True)
+    live = False
+    for line in follow.stdout:
+        event = json.loads(line)
+        live = live or event.get('event') == 'follow_live'
+        if live and event.get('event') == 'accepted':
+            show(event['bot'])
+
+
+if __name__ == '__main__':
+    sys.exit(main())

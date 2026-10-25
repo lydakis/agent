@@ -1,0 +1,21 @@
+[package]
+name = "agent-tui"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# A terminal client for the daemon, beside the app. Prototype.
+
+[dependencies]
+agent-client = { path = "../client" }
+# Already built for the runtime; encodes program status titles (OSC 7501).
+base64 = "0.22"
+ratatui = "0.29"
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+unicode-width = "0.2"
+
+[lints]
+workspace = true

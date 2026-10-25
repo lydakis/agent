@@ -48,7 +48,7 @@ heap-profile = ["dep:dhat"]
 tokio = { version = "1", features = ["test-util", "macros", "rt"] }
 
 [workspace]
-members = ["client", "app/src-tauri"]
+members = ["client", "tui", "app/src-tauri"]
 
 [workspace.lints.clippy]
 # Every unsafe block says why it is sound, in a `// SAFETY:` comment.
