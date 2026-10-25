@@ -162,6 +162,12 @@ async fn run() -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     let mut app = App::new(client, &name, &bot);
+    // A bot keeps the model it was made with; --model runs this window's
+    // turns on another.
+    if let Some(model) = options.model.as_ref().filter(|m| **m != app.model) {
+        app.model = model.clone();
+        app.turn_model = Some(model.clone());
+    }
     if let Some(project) = &project
         && options.rex
     {
@@ -276,6 +282,8 @@ struct App {
     held: Vec<Line<'static>>,
     /// The newest history item drawn on attach.
     seen_node: i64,
+    /// The model this window's turns run on, when not the bot's own.
+    turn_model: Option<String>,
 }
 
 /// The lead's tasks, laid out in the project's Rex session: a window for
@@ -421,6 +429,7 @@ impl App {
             fleet: None,
             held: Vec::new(),
             seen_node: 0,
+            turn_model: None,
         }
     }
 
@@ -920,14 +929,18 @@ impl App {
         if prompt.is_empty() {
             return;
         }
-        // A message to a busy bot joins its running turn.
+        // A message to a busy bot joins its running turn, on that turn's model.
         let delivery = self.running.is_some().then_some("steer");
+        let model = delivery
+            .is_none()
+            .then(|| self.turn_model.clone())
+            .flatten();
         let submitted = self
             .client
             .request(
                 "submit",
                 json!({"bot": self.bot, "request_id": unique("tui"), "prompt": prompt,
-                    "delivery": delivery}),
+                    "delivery": delivery, "model": model}),
             )
             .await;
         match submitted {
