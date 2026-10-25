@@ -433,8 +433,9 @@ struct Running {
 
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, unlisted.
-const COMMANDS: [(&str, &str); 2] = [
+const COMMANDS: [(&str, &str); 3] = [
     ("/status", "every agent in this project, live"),
+    ("/open", "the last HTML page in a reply, in your browser"),
     ("/quit", "leave Sonny; the agents keep working"),
 ];
 
@@ -1613,6 +1614,31 @@ impl App {
         if matches!(prompt.as_str(), "/status" | "/agents" | "/ps") {
             self.input.clear();
             self.status().await;
+            return;
+        }
+        if prompt == "/open" {
+            self.input.clear();
+            let page = transcript::PAGE.lock().ok().and_then(|page| page.clone());
+            self.notice = Some(match page {
+                Some(page) => {
+                    let opener = if cfg!(target_os = "macos") {
+                        "open"
+                    } else {
+                        "xdg-open"
+                    };
+                    match std::process::Command::new(opener)
+                        .arg(&page)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                    {
+                        Ok(_) => format!("opened {}", page.display()),
+                        Err(error) => format!("{opener}: {error}"),
+                    }
+                }
+                None => "no HTML page in this conversation yet".into(),
+            });
             return;
         }
         if prompt == "/quit" {

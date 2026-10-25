@@ -72,6 +72,9 @@ impl Markdown {
         if matches!(lang.as_str(), "diff" | "patch") {
             return crate::diff::fence(&source, width);
         }
+        if lang == "html" {
+            return page(&source, width);
+        }
         // Math where pictures cannot be drawn: as text, line by line.
         if lang == "math" && !crate::term::graphics() {
             return source
@@ -142,7 +145,7 @@ impl Markdown {
                 lang => lang,
             };
             let drawn = matches!(lang, "svg" | "mermaid") && crate::term::graphics();
-            if self.fence && (drawn || matches!(lang, "diff" | "patch" | "math")) {
+            if self.fence && (drawn || matches!(lang, "diff" | "patch" | "math" | "html")) {
                 self.picture = Some((lang.to_owned(), String::new()));
             } else if !self.fence {
                 self.ready = self.picture.take();
@@ -328,6 +331,52 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
     }
     flush(&mut plain, &mut spans);
     spans
+}
+
+/// The HTML page a reply showed last, for `/open`.
+pub static PAGE: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+/// A ```html fence: its first lines as code, and the page kept in a file
+/// that `/open` shows in the browser. A terminal cannot lay out HTML.
+fn page(source: &str, width: usize) -> Vec<Line<'static>> {
+    let lines: Vec<&str> = source.lines().collect();
+    let shown = if lines.len() > 8 { 6 } else { lines.len() };
+    let mut out: Vec<Line<'static>> = lines[..shown]
+        .iter()
+        .flat_map(|line| {
+            let code = Line::from(line.to_string()).fg(Color::Cyan);
+            wrap(code, width, Span::raw("    "), Span::raw("    "))
+        })
+        .collect();
+    if lines.len() > shown {
+        out.push(Line::from(format!("    … +{} lines", lines.len() - shown)).dim());
+    }
+    let dir = std::env::temp_dir().join("sonny-pages");
+    let name = format!(
+        "{}-{}.html",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
+    let path = dir.join(name);
+    let saved = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, source));
+    out.push(match saved {
+        Ok(()) => {
+            let note = Line::from(vec![
+                Span::raw("    ↗ ").fg(Color::Cyan),
+                Span::raw("/open").bold(),
+                Span::raw(format!(" shows it in your browser · {}", path.display())).dim(),
+            ]);
+            if let Ok(mut page) = PAGE.lock() {
+                *page = Some(path);
+            }
+            note
+        }
+        Err(error) => Line::from(format!("    could not keep the page: {error}")).dim(),
+    });
+    out
 }
 
 /// `| a | b |`: a table's row, its separator included.
