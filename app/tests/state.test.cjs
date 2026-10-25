@@ -155,8 +155,8 @@ test('fenced blocks become code, previews, diagrams and images by their language
   assert.match(Rich.html('```html\n<!doctype html><body><b>hi</b></body>\n```'), /data-kind="html" data-view="code".*&lt;b&gt;hi&lt;\/b&gt;/s);
   assert.match(Rich.html('```html\n<b>hi</b>\n```'), /data-kind="html" data-view="code"/);
   assert.match(Rich.html('```mermaid\ngraph TD\nA-->B\n```'), /data-kind="mermaid".*A--&gt;B/s);
-  // A diagram in a message draws when asked; one in a file someone opened draws at once.
-  assert.match(Rich.html('```mermaid\ngraph TD\n```'), /data-kind="mermaid" data-lazy data-view="code"/);
+  // A diagram draws at once, in a message as in a file someone opened.
+  assert.match(Rich.html('```mermaid\ngraph TD\n```'), /data-kind="mermaid" data-lazy data-page data-view="code"/);
   assert.match(Rich.file('/w/flow.mmd', new TextEncoder().encode('graph TD')).html, /data-kind="mermaid" data-lazy data-page/);
   const svg = Rich.html('```svg\n<svg xmlns="http://www.w3.org/2000/svg"><circle r="4"/></svg>\n```');
   // An SVG draws as an image, and in a message only when asked: its filters and animations take CPU.
@@ -240,31 +240,91 @@ test('highlighting arriving redraws only messages whose code waited for it', () 
   assert.equal(calls, 3);
 });
 
-test('a diagram draws when clicked, and a pane drawn anew asks again, drawing from the cache', async () => {
-  const p = page(), c = p.context, Rich = c.Rich; let renders = 0;
-  c.document.head = { append(s) { s.onload(); } };
-  c.getComputedStyle = () => ({ getPropertyValue: () => '' });
-  c.mermaid = { initialize() {}, render: async (id, src) => { renders++; return { svg: `<svg>${src}</svg>` }; } };
-  const box = (src = 'graph TD') => { const view = { innerHTML: '' }, pre = { textContent: src };
-    return { dataset: { kind: 'mermaid', lazy: '', view: 'code' }, clientWidth: 0, view, closest: () => null, querySelector: (s) => s === 'pre' ? pre : s === '.view' ? view : null }; };
-  const click = (b) => { const btn = { dataset: { rich: 'view' }, closest: () => b }; Rich.click({ target: { closest: (s) => s === '[data-rich]' ? btn : null }, preventDefault() {} }); };
-  const asked = box(); click(asked);
-  await new Promise((r) => setImmediate(r));
-  assert.equal(asked.view.innerHTML, '<svg>graph TD</svg>'); assert.equal(renders, 1);
-  // The pane drawn anew: nothing remembers the click, so the block is code until clicked again,
-  // which draws it from the cache at once.
-  const again = box(); Rich.hydrate({ querySelectorAll: () => [again] });
-  assert.equal(again.view.innerHTML, '');
-  click(again); assert.equal(again.view.innerHTML, '<svg>graph TD</svg>'); assert.equal(renders, 1);
-  // A file someone opened draws at once.
-  const page_ = box('graph LR'); page_.dataset.page = ''; Rich.hydrate({ querySelectorAll: () => [page_] });
-  await new Promise((r) => setImmediate(r));
-  assert.equal(page_.view.innerHTML, '<svg>graph LR</svg>'); assert.equal(renders, 2);
+// A stand-in for the diagram worker: it answers each message with `reply`, or never when that
+// returns undefined. `workers` lists every one made.
+function diagramWorkers(c, reply) {
+  const workers = [];
+  c.getComputedStyle = () => ({ getPropertyValue: (n) => n === '--mono' ? 'Menlo' : '' });
+  c.Worker = class { constructor(url) { this.url = url; this.sent = []; workers.push(this); }
+    postMessage(m) { this.sent.push(m); const r = reply(m); if (r) setImmediate(() => { if (!this.terminated) this.onmessage?.({ data: r }); }); }
+    terminate() { this.terminated = true; } };
+  return workers;
+}
+const diagramBox = (src = 'graph TD') => { const view = { innerHTML: '' }, pre = { textContent: src }, lang = { textContent: 'mermaid' };
+  return { dataset: { kind: 'mermaid', lazy: '', page: '', view: 'code' }, clientWidth: 424, view, lang, closest: () => null, querySelector: (s) => s === 'pre' ? pre : s === '.view' ? view : s === '.rh .lang' ? lang : null }; };
+// The worker answers on a later turn than the one that asks it.
+const turn = async () => { for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r)); };
+
+test('a diagram draws at once in a worker, and a pane drawn anew draws it from the cache', async () => {
+  const p = page(), Rich = p.context.Rich;
+  const workers = diagramWorkers(p.context, ({ src }) => ({ svg: `<svg>${src}</svg>` }));
+  const first = diagramBox(); Rich.hydrate({ querySelectorAll: () => [first] });
+  await turn();
+  assert.equal(first.view.innerHTML, '<svg>graph TD</svg>'); assert.equal(first.dataset.view, 'view');
+  assert.equal(workers.length, 1); assert.equal(workers[0].url, 'diagram-worker.js');
+  // It lays out in the window's font, for the block's width inside its padding.
+  assert.deepEqual({ ...workers[0].sent[0] }, { src: 'graph TD', font: 'Menlo', width: 400, idPrefix: 'peleid' });
+  // The pane drawn anew: the same source at the same width comes from the cache at once.
+  const again = diagramBox(); Rich.hydrate({ querySelectorAll: () => [again] });
+  assert.equal(again.view.innerHTML, '<svg>graph TD</svg>'); assert.equal(workers[0].sent.length, 1);
   // A reader below a block that draws keeps their place.
   let h = 1000; const pane = { scrollTop: 500, clientHeight: 100, get scrollHeight() { return h; }, getBoundingClientRect: () => ({ top: 0 }) };
-  const b = box(); b.closest = (s) => s === '.scroll' ? pane : null; b.getBoundingClientRect = () => ({ bottom: -10 });
+  const b = diagramBox('graph LR'); b.closest = (s) => s === '.scroll' ? pane : null; b.getBoundingClientRect = () => ({ bottom: -10 });
   let html = ''; Object.defineProperty(b.view, 'innerHTML', { get: () => html, set: (v) => { html = v; h += 300; } });
-  click(b); assert.equal(html, '<svg>graph TD</svg>'); assert.equal(pane.scrollTop, 800);
+  Rich.hydrate({ querySelectorAll: () => [b] }); await turn();
+  assert.equal(html, '<svg>graph LR</svg>'); assert.equal(pane.scrollTop, 800);
+  // Once drawn, the head's button switches between the diagram and its source.
+  const btn = { dataset: { rich: 'view' }, closest: () => b };
+  Rich.click({ target: { closest: (s) => s === '[data-rich]' ? btn : null }, preventDefault() {} });
+  assert.equal(b.dataset.view, 'code'); assert.equal(workers.length, 1);
+});
+
+test('each drawing on the page gets its own IDs, even from the cache', async () => {
+  const p = page(), Rich = p.context.Rich;
+  diagramWorkers(p.context, ({ idPrefix }) => ({ svg: `<svg aria-labelledby="${idPrefix}-title"><title id="${idPrefix}-title">t</title><path fill="url(#${idPrefix}-g)"/></svg>` }));
+  const a = diagramBox(), b = diagramBox(); Rich.hydrate({ querySelectorAll: () => [a] }); await turn(); Rich.hydrate({ querySelectorAll: () => [b] });
+  const ids = (box) => box.view.innerHTML.match(/id="([^"]+)"/)[1];
+  assert.notEqual(ids(a), ids(b));
+  for (const box of [a, b]) { const id = ids(box).replace(/-title$/, ''); assert.equal(box.view.innerHTML, `<svg aria-labelledby="${id}-title"><title id="${id}-title">t</title><path fill="url(#${id}-g)"/></svg>`); }
+});
+
+test('diagrams stop drawing on their own once the page holds 2 million characters of them, and draw on a click', async () => {
+  const p = page(), Rich = p.context.Rich;
+  const workers = diagramWorkers(p.context, ({ src }) => ({ svg: `<svg>${src}${'x'.repeat(900000)}</svg>` }));
+  const [a, b, c] = ['graph A', 'graph B', 'graph C'].map((src) => diagramBox(src));
+  Rich.hydrate({ querySelectorAll: () => [a, b, c] }); await turn(); await turn();
+  assert.equal(a.dataset.view, 'view'); assert.equal(b.dataset.view, 'view');
+  assert.equal(c.dataset.view, 'code'); assert.match(c.lang.textContent, /window holds enough drawings/); assert.ok(!('asked' in c.dataset));
+  // A block gone from the document counts no more.
+  a.isConnected = false;
+  const d = diagramBox('graph D'); Rich.hydrate({ querySelectorAll: () => [d] }); await turn();
+  assert.equal(d.dataset.view, 'view');
+  // A click draws past the bound, from the cache.
+  const button = { dataset: { rich: 'view' }, closest: () => c };
+  Rich.click({ target: { closest: (s) => s === '[data-rich]' ? button : null }, preventDefault() {} });
+  assert.equal(c.dataset.view, 'view'); assert.equal(workers[0].sent.length, 4);
+});
+
+test('a diagram still laying out is stopped with its worker, and the next starts a new one', async () => {
+  const p = page(), Rich = p.context.Rich;
+  const workers = diagramWorkers(p.context, ({ src }) => src === 'slow' ? undefined : { svg: `<svg>${src}</svg>` });
+  const slow = diagramBox('slow'), next = diagramBox('graph TD');
+  Rich.hydrate({ querySelectorAll: () => [slow, next] }); await turn();
+  assert.equal(next.view.innerHTML, '', 'one diagram at a time');
+  await p.tick(); await turn();
+  assert.equal(workers[0].terminated, true); assert.match(slow.lang.textContent, /^mermaid · still laying out after 3 s$/);
+  assert.equal(slow.dataset.view, 'code');
+  assert.equal(workers.length, 2); assert.equal(next.view.innerHTML, '<svg>graph TD</svg>');
+});
+
+test('a diagram whose block left the document while it waited is not drawn', async () => {
+  const p = page(), Rich = p.context.Rich;
+  const workers = diagramWorkers(p.context, ({ src }) => ({ svg: `<svg>${src}</svg>` }));
+  const gone = diagramBox('graph GONE'), shown = diagramBox('graph TD');
+  Rich.hydrate({ querySelectorAll: () => [gone, shown] }); gone.isConnected = false; await turn();
+  assert.deepEqual(workers[0].sent.map((m) => m.src), ['graph TD']);
+  assert.equal(gone.view.innerHTML, ''); assert.ok(!('asked' in gone.dataset));
+  assert.equal(shown.view.innerHTML, '<svg>graph TD</svg>');
 });
 
 test('a reply\'s diagram is code while it streams, and can be drawn once it is in', async () => {
@@ -277,7 +337,7 @@ test('a reply\'s diagram is code while it streams, and can be drawn once it is i
   assert.match(streamed, /data-kind="code"><div class="rh"><span class="lang">mermaid/); assert.doesNotMatch(streamed, /data-lazy|data-rich="view"/);
   await p.onEvent({ event: 'message', bot: 'Bob', turn: 7, data: { node: 3 } }); await p.loadBatch('Bob');
   const text = t.items.find((it) => it.kind === 'text');
-  assert.match(p.textHTML(text), /data-kind="mermaid" data-lazy data-view="code">.*data-rich="view"/);
+  assert.match(p.textHTML(text), /data-kind="mermaid" data-lazy data-page data-view="code">.*data-rich="view"/);
 });
 
 test('a message\'s later blocks are drawn anew when an earlier one\'s share of its bounds changes', () => {
@@ -332,19 +392,41 @@ test('the text blocks of one message share the bound on marks parsed', () => {
   for (const t of texts.slice(1)) assert.match(p.textHTML(t), /<span class="lang">text<\/span>/);
 });
 
-test('a diagram that failed to draw asks again before it is tried again', async () => {
-  const p = page(), c = p.context, Rich = c.Rich; let renders = 0;
-  c.document.head = { append(s) { s.onload(); } };
-  c.getComputedStyle = () => ({ getPropertyValue: () => '' });
-  c.mermaid = { initialize() {}, render: async () => { renders++; throw new Error('too big'); } };
-  const box = () => { const view = { innerHTML: '' }, pre = { textContent: 'graph TD' }, lang = { textContent: 'mermaid' };
-    return { dataset: { kind: 'mermaid', lazy: '', view: 'code', id: 'Bob|1|mermaid|x' }, clientWidth: 0, view, lang, closest: () => null, querySelector: (s) => s === 'pre' ? pre : s === '.view' ? view : s === '.rh .lang' ? lang : null }; };
-  const asked = box(), button = { dataset: { rich: 'view' }, closest: () => asked };
-  Rich.click({ target: { closest: (s) => s === '[data-rich]' ? button : null }, preventDefault() {} });
-  await new Promise((r) => setImmediate(r)); await new Promise((r) => setImmediate(r));
-  assert.equal(renders, 1); assert.match(asked.lang.textContent, /too big/);
-  Rich.hydrate({ querySelectorAll: () => [box()] }); await new Promise((r) => setImmediate(r));
-  assert.equal(renders, 1);
+test('a diagram that failed to draw shows its error, and is tried again only when asked', async () => {
+  const p = page(), Rich = p.context.Rich;
+  const workers = diagramWorkers(p.context, () => ({ error: 'Parse error on line 1:\ngraph TD' }));
+  const first = diagramBox(); Rich.hydrate({ querySelectorAll: () => [first] }); await turn();
+  assert.equal(first.lang.textContent, 'mermaid · Parse error on line 1:'); assert.equal(first.dataset.view, 'code');
+  // The pane drawn anew shows the error without trying again.
+  const again = diagramBox(); Rich.hydrate({ querySelectorAll: () => [again] }); await turn();
+  assert.equal(again.lang.textContent, 'mermaid · Parse error on line 1:'); assert.equal(workers[0].sent.length, 1);
+  // A click on its button tries again.
+  const button = { dataset: { rich: 'view' }, closest: () => again };
+  Rich.click({ target: { closest: (s) => s === '[data-rich]' ? button : null }, preventDefault() {} }); await turn();
+  assert.equal(workers[0].sent.length, 2);
+});
+
+test('copies of a diagram queued behind one that fails show its error without drawing again', async () => {
+  const p = page(), Rich = p.context.Rich;
+  const workers = diagramWorkers(p.context, () => ({ error: 'Parse error on line 1:' }));
+  const boxes = [diagramBox(), diagramBox(), diagramBox()];
+  Rich.hydrate({ querySelectorAll: () => boxes }); await turn();
+  assert.equal(workers.length, 1); assert.equal(workers[0].sent.length, 1);
+  for (const b of boxes) assert.equal(b.lang.textContent, 'mermaid · Parse error on line 1:');
+});
+
+test('failed drawings are kept up to a bound on their sources', async () => {
+  const p = page(), Rich = p.context.Rich;
+  const workers = diagramWorkers(p.context, () => ({ error: 'too big' }));
+  const big = (i) => diagramBox(`graph TD\n%% ${i} ${'x'.repeat(400000)}`);
+  for (let i = 0; i < 3; i++) { Rich.hydrate({ querySelectorAll: () => [big(i)] }); await turn(); }
+  const sent = () => workers.reduce((n, w) => n + w.sent.length, 0);
+  assert.equal(sent(), 3);
+  // The newest two fit the bound and show their errors at once; the oldest is tried again.
+  for (const i of [2, 1]) { Rich.hydrate({ querySelectorAll: () => [big(i)] }); await turn(); }
+  assert.equal(sent(), 3);
+  Rich.hydrate({ querySelectorAll: () => [big(0)] }); await turn();
+  assert.equal(sent(), 4);
 });
 
 test('a file opened while the side pane opens is drawn once the pane has its width', async () => {
@@ -575,12 +657,13 @@ test('a file closed and opened again never shares a view key with the one before
   await again; assert.ok(p.S.ui.file.gen > first + 1);
 });
 
-test('a file an agent rewrote while open waits for a click to run', async () => {
+test('a file an agent rewrote while open waits for a click to run, unless it is a diagram', async () => {
   const enc = (s) => new TextEncoder().encode(s), opened = [];
   const p = page({ readFile: async (full) => { opened.push(full); return enc('<p>hi</p>'); } }), Rich = p.context.Rich;
   assert.match(Rich.file('/w/p.html', enc('<p>hi</p>')).html, /data-kind="html" data-view="view"/);
   assert.match(Rich.file('/w/p.html', enc('<p>hi</p>'), false, false).html, /data-kind="html" data-view="code"/);
-  assert.match(Rich.file('/w/d.mmd', enc('graph TD'), false, false).html, /data-lazy data-view="code"/);
+  assert.match(Rich.file('/w/c.vl.json', enc('{}'), false, false).html, /data-lazy data-view="code"/);
+  assert.match(Rich.file('/w/d.mmd', enc('graph TD'), false, false).html, /data-lazy data-page data-view="code"/);
   p.S.config = { workspace: '/w' };
   p.S.ui.file = { bot: 'Bob', full: '/w/p.html', asked: true, gen: 2, state: 'ok', bytes: enc('<p>hi</p>'), more: false, url: null };
   await p.onEvent({ event: 'tool_started', bot: 'Bob', turn: 1, data: { call_id: 'w1', name: 'write', arguments: JSON.stringify({ path: 'p.html', content: 'x' }) } });

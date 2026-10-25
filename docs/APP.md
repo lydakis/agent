@@ -207,6 +207,17 @@ with a click.
 
 ![A Vega-Lite chart and an HTML preview](app/rich-preview.png)
 
+Its ```` ```mermaid ```` block draws as the reply arrives, captured
+2026-10-25: a sequence diagram from Pele in the window's colors, its source a
+click on **code** away.
+
+![A Mermaid sequence diagram drawn in a reply](app/rich-diagram.png)
+
+The same in the app itself (the Linux build's WebKitGTK webview, against
+the playground's model): each reply's flowchart drew as the reply came in.
+
+![Two replies' flowcharts drawn in the app's webview](app/rich-diagram-webkit.png)
+
 A file the reply links opens beside it (see Files above): `PLAN.md` drawn as
 Markdown with its diagram. Its own link to `report/latency.vl.json` opens that
 chart file in its place.
@@ -1689,12 +1700,24 @@ highlighting arrives); past them the rest shows as text. Fenced blocks are drawn
   names its language or is left plain; nothing guesses. Blocks over 64 KiB
   stay plain, and a message or file highlights at most 256 KiB of code in
   all.
-- **`mermaid`** draws as a diagram with [Mermaid](https://mermaid.js.org),
-  themed to the window. In a message it opens as its source and draws with a
-  click on **diagram**: Mermaid lays out on the window's thread, and a few
-  characters (`block-beta` with `space:500000`) can hold it for minutes. A
-  diagram that does not parse stays as its source with the parser's message
-  in the block's head.
+- **`mermaid`** draws as a diagram with [Pele](https://pele.run), a Mermaid
+  renderer (Mermaid 12.1 syntax, every diagram type, its own layout), as
+  soon as its message is in, in a message as in a file. Pele runs in a worker
+  (`diagram-worker.js`), so laying out never holds the window's thread, and
+  it bounds its input (50,000 characters, 5,000 flowchart edges, 100,000
+  `block-beta` spaces); the app holds its SVG to a million characters, as
+  putting one that size into the page takes the window about 150 ms. A
+  diagram still laying out after 3 s ends the worker (the next diagram starts
+  another). Diagrams draw on their own only while the blocks on the page hold
+  under 2 million characters of drawn SVG (hundreds of ordinary diagrams);
+  past that one waits for a click, and a block gone from the page counts no
+  more. Each drawing gets its own IDs (its accessible title, a gradient), as
+  the same SVG can show in two blocks. Its colors are CSS variables set to the window's, the series in
+  the charts' order, so it follows the theme without drawing again; it lays
+  out for its block's width in the window's font. A click on **code** shows
+  its source. One that does not draw stays as its source with Pele's message
+  in the block's head; drawn again, it shows that message without trying
+  again, and a click on **diagram** tries again.
 - **`vega-lite`** (or `vl`, or `vega` for a full Vega spec) draws as a chart
   with [Vega](https://vega.github.io), as static SVG in the window's colors:
   an eight-hue categorical order validated for color-vision deficiency
@@ -1705,7 +1728,8 @@ highlighting arrives); past them the rest shows as text. Fenced blocks are drawn
   click on **chart**: Vega draws on the window's thread, and a few characters
   of spec (a `sequence` transform to a billion, a billion ticks) can ask it
   for more than it can draw. While a reply streams, its diagrams and charts
-  (and pages and SVG) show as code; each can be drawn once the reply is in.
+  (and pages and SVG) show as code; once the reply is in, its diagrams draw
+  and each of the rest can be drawn.
   Nothing remembers a click: a block drawn again (its pane redrawn, or its
   message drawn anew for highlighting) is code until clicked again, which
   draws it from the cache at once. One that fails to draw shows its error and
@@ -1723,19 +1747,17 @@ highlighting arrives); past them the rest shows as text. Fenced blocks are drawn
 Charts are a block of their own because a preview cannot load a charting
 library: models reach for one from a CDN, and a preview fetches nothing.
 Vega-Lite is a spec, not a program, so it needs no network and runs no
-model-written script in the window. Mermaid's own `pie` and `xychart-beta`
-also draw, and an HTML preview can still draw a chart with its own inline
-SVG or canvas.
+model-written script in the window. Mermaid's `pie` and `xychart` also draw,
+and an HTML preview can still draw a chart with its own inline SVG or canvas.
 
-Highlighting, Mermaid and Vega load the first time something needs them;
-markdown-it loads with the page. Text, lists, tables and code draw as a message
-arrives; diagrams, charts, previews and images draw only when asked, so
+Highlighting, Pele and Vega load the first time something needs them;
+markdown-it loads with the page. Text, lists, tables, code and diagrams draw as
+a message arrives; charts, previews and images draw only when asked, so
 opening a long chat runs none of them, and a reader below a block that
 draws keeps their place. A file beside is not
-scanned by the once-a-second clock of running turns. Mermaid's own limits (50,000 characters, 500 edges) do
-not bound its layout work, which is why a diagram waits for a click. Drawn
-diagrams and charts are kept by source (a chart also by its width), so a
-second click draws at once: at most 64 and 8 MiB. A
+scanned by the once-a-second clock of running turns. Drawn diagrams and charts
+are kept by source and width, so a pane drawn again or a second click shows
+them at once: at most 64 and 8 MiB. A
 message's drawn HTML counts toward the chat's 8 MiB of decoded bodies, and
 so does what it puts on the page and what parsing it cost, 40 bytes for each
 tag it draws and 16 for each mark parsed: a window holds about 200,000 drawn
@@ -1770,8 +1792,8 @@ a binary file as its size, anything else as code highlighted by its
 extension. Esc or ✕ closes it (Esc too from inside a page it shows, which
 hands the key to the window) and brings back the task that was beside, if
 any. A write or edit to the open file reads it again, and what the agent
-wrote is new: a page, diagram, chart or image in it waits for a click, as in
-a message. A file drawn again (rewritten, or highlighted once highlighting
+wrote is new: a page, chart or image in it waits for a click, as in a
+message, and a diagram draws. A file drawn again (rewritten, or highlighted once highlighting
 loads) keeps the reader's place. One that failed or was refused changed nothing, so the file stays
 as it is shown. A click in the file puts the keyboard in the chat's composer,
 as the pane beside has none while a file is open. Deleting the agent it came from, or attaching to another store,
@@ -1864,8 +1886,9 @@ policy (`frame-src about:`) stops a preview from navigating its own frame to a
 website. A preview runs only once asked, so a long transcript holds no idle
 pages. The window's policy also takes images, fonts, media and stylesheets
 only from the app itself, `data:` and `blob:`, so a library drawing a message
-cannot fetch one either: a Mermaid node's `img:` URL or a `url()` in its theme
-CSS is refused, and the diagram names the failure in its head.
+cannot fetch one either. A diagram draws no images at all (Pele's `images`
+is off, so a node's `img:` URL is dropped), and Pele filters the styles a
+diagram sets, so neither can name a URL.
 
 Measured 2026-10-10 at 023fd3e with `node app/bench/render.cjs`, in headless
 Chromium 141.0.7390.37 on a 4-core cloud container: three runs, each the
@@ -1905,13 +1928,27 @@ interpreter's refusal in its head. That the Tauri core injects its
 scripts into the main frame only was read from tauri 2.11.5's source
 (`for_main_frame_only: true`), not observed in the macOS webview. A page
 whose script loops forever left the window responsive while it was not
-asked to run, and so did a `block-beta` diagram with `space:500000` until
-its **diagram** was clicked (drawn, it held Chromium past 110 s even at
-`space:1000`). A Mermaid image node and a theme `url()` pointing at a
-website were refused by the window's policy and made no request. A Vega
-spec with a `sequence` transform to a billion left the window responsive in
-view, as it draws only when asked. A diagram fenced inside an opened
-Markdown file still waits for its click.
+asked to run. A Vega spec with a `sequence` transform to a billion left the
+window responsive in view, as it draws only when asked.
+
+Diagrams measured 2026-10-25 with `node app/bench/diagrams.cjs`, in headless
+Chrome for Testing 153.0.8010.12 on a 4-core cloud container, the median of
+five warm runs each, from posting to the worker to its answer: a five-node
+flowchart 2.3 ms, a five-message sequence diagram 4.8 ms, a `state` diagram of
+80 states and 3,000 transitions 184 ms (866,000 characters of SVG), a
+sequence of 40 actors 70 ms. `block-beta` with `space:99999` took 311 ms and
+`space:500000` was refused in 2 ms; Mermaid 11.17.2, which this replaced,
+held the window past 110 s at `space:1000`. A flowchart of 4,999 edges and
+an `erDiagram` of 2,000 relations laid out in 584 and 275 ms and were
+refused for drawing over a million characters. The page's longest frame gap
+while the worker ran was 22 ms. Putting the 866,000-character diagram into
+the page and laying it out took 68 ms; a 1.4-million-character one took
+183 ms, which is the reason for the bound. A flowchart node with an `img:`
+URL and `click` links to `javascript:` and `tel:` drew neither an image nor a
+link. In the Linux build's WebKitGTK webview the worker loads from the
+app's own scheme and draws as in Chromium (not yet seen in macOS's WKWebView).
+Pele 1.10.0 is 709 KB (264 KB gzipped); the vendored Mermaid was 3.57 MB
+(980 KB gzipped).
 
 ## What it costs, and where the bounds are
 
