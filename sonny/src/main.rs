@@ -9,6 +9,7 @@
 //! `• Ran …` line with a short `└` look at the result, and a status row
 //! says how long the turn has run and how to stop it.
 mod calls;
+mod diff;
 mod project;
 mod rex;
 mod shell;

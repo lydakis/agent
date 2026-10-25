@@ -106,8 +106,19 @@ pub fn wrap(
     first: Span<'static>,
     rest: Span<'static>,
 ) -> Vec<Line<'static>> {
+    wrap_lines(line, width, Line::from(first), Line::from(rest))
+}
+
+/// [`wrap`], with leads of more than one style.
+pub fn wrap_lines(
+    line: Line<'static>,
+    width: usize,
+    first: Line<'static>,
+    rest: Line<'static>,
+) -> Vec<Line<'static>> {
     let room = width.saturating_sub(first.width()).max(8);
-    let mut rows: Vec<Vec<Span<'static>>> = vec![vec![first]];
+    let rest = rest.spans;
+    let mut rows: Vec<Vec<Span<'static>>> = vec![first.spans];
     let mut used = 0;
     for span in line.spans {
         let style = line.style.patch(span.style);
@@ -116,7 +127,7 @@ pub fn wrap(
             let mut wide = word.width();
             // A word's trailing spaces may hang past the edge.
             if used + word.trim_end().width() > room && used > 0 {
-                rows.push(vec![rest.clone()]);
+                rows.push(rest.clone());
                 used = 0;
                 if word.trim().is_empty() {
                     continue;
@@ -140,7 +151,7 @@ pub fn wrap(
                 rows.last_mut()
                     .unwrap()
                     .push(Span::styled(word[..cut].to_owned(), style));
-                rows.push(vec![rest.clone()]);
+                rows.push(rest.clone());
                 used = 0;
                 word = word[cut..].to_owned();
                 wide = word.width();
@@ -367,14 +378,20 @@ pub fn tool(
         "echo" | "note" => ("Noted", field("text")),
         _ => ("Called", format!("{name} {arguments}")),
     };
-    let header = Line::from(vec![
+    let mut header = Line::from(vec![
         Span::raw(verb).bold(),
         Span::raw(" "),
         Span::raw(what.lines().next().unwrap_or("").to_owned()),
     ]);
+    let edit = (name == "edit").then(|| diff(arguments, workspace));
+    if let Some(edit) = &edit {
+        let (removed, added) = edit.counts();
+        header.spans.push(Span::raw("  "));
+        header.spans.extend(crate::diff::counts(removed, added));
+    }
     let mut out = wrap(header, width, bullet, Span::raw("    "));
     match name {
-        "edit" => out.extend(diff(arguments, workspace, width)),
+        "edit" => out.extend(edit.map(|e| e.lines(width, EDIT_ROWS)).unwrap_or_default()),
         "write" => {
             let lines = field("content").lines().count();
             out.push(Line::from(vec![
@@ -404,6 +421,10 @@ pub fn tool(
     }
     out
 }
+
+/// The most rows an edit's diff, or a diff a command printed, takes.
+const EDIT_ROWS: usize = 40;
+const DIFF_ROWS: usize = 40;
 
 /// A command that only sets a variable, as `result=$?`.
 fn assignment(part: &str) -> bool {
@@ -466,6 +487,9 @@ pub fn capped(
 /// A command's output: its first lines, or all of a few, and how many
 /// more there were. An agent's start, printed among them, reads as one.
 fn preview(output: &str, width: usize) -> Vec<Line<'static>> {
+    if let Some(diff) = crate::diff::unified(output, width, DIFF_ROWS) {
+        return diff;
+    }
     let elbow = || Span::raw("  └ ").dim();
     let gap = || Span::raw("    ");
     let mut out = Vec::new();
@@ -516,16 +540,17 @@ fn waited(output: Option<&str>) -> Option<Vec<String>> {
     crate::calls::waited(&serde_json::from_str(output?.trim()).ok()?)
 }
 
-/// An edit as removed and added lines, numbered where the file now has
-/// them when the new text can be found there.
-fn diff(arguments: &Value, workspace: &str, width: usize) -> Vec<Line<'static>> {
+/// An edit as diffs.com draws one: the whole lines it touched, the words
+/// that changed within them, and two lines either side, numbered where
+/// the file now has them when the new text can be found there.
+fn diff(arguments: &Value, workspace: &str) -> crate::diff::Edit {
     let (mut old, mut new) = (
         arguments["old"].as_str().unwrap_or("").to_owned(),
         arguments["new"].as_str().unwrap_or("").to_owned(),
     );
     let path = arguments["path"].as_str().unwrap_or("");
     let path = std::path::Path::new(workspace).join(path);
-    let mut start = None;
+    let (mut start, mut before, mut after) = (None, Vec::new(), Vec::new());
     // An edit replaces text, not lines: show the whole lines it touched,
     // read from the file as it is now, so indentation and numbers are right.
     if !new.is_empty()
@@ -533,28 +558,30 @@ fn diff(arguments: &Value, workspace: &str, width: usize) -> Vec<Line<'static>> 
         && let Some(at) = now.find(&new)
     {
         let line_start = now[..at].rfind('\n').map_or(0, |i| i + 1);
-        let before = &now[line_start..at];
-        let after = now[at + new.len()..].split('\n').next().unwrap_or("");
-        old = format!("{before}{old}{after}");
-        new = format!("{before}{new}{after}");
-        start = Some(now[..at].matches('\n').count() + 1);
+        let end = at + new.len();
+        let line_end = now[end..].find('\n').map_or(now.len(), |i| end + i);
+        old = format!("{}{old}{}", &now[line_start..at], &now[end..line_end]);
+        new = now[line_start..line_end].to_owned();
+        let lines: Vec<&str> = now.lines().collect();
+        let first = now[..at].matches('\n').count();
+        let last = first + new.lines().count().max(1);
+        before = lines[first.saturating_sub(2)..first]
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        after = lines[last.min(lines.len())..(last + 2).min(lines.len())]
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        start = Some(first + 1);
     }
-    let number = |n: Option<usize>| match n {
-        Some(n) => format!("{n:>4} "),
-        None => "     ".to_owned(),
-    };
-    let mut out = Vec::new();
-    for (i, line) in old.lines().enumerate() {
-        let text = Line::from(format!("-{line}")).fg(Color::Red);
-        let lead = Span::raw(number(start.map(|s| s + i))).dim();
-        out.extend(wrap(text, width, lead, Span::raw("      ")));
+    crate::diff::Edit {
+        old,
+        new,
+        start,
+        before,
+        after,
     }
-    for (i, line) in new.lines().enumerate() {
-        let text = Line::from(format!("+{line}")).fg(Color::Green);
-        let lead = Span::raw(number(start.map(|s| s + i))).dim();
-        out.extend(wrap(text, width, lead, Span::raw("      ")));
-    }
-    out
 }
 
 /// The rule under a finished turn: how it ended, how long it took, what it cost.
@@ -700,7 +727,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("calc.py"),
-            "def average(values):\n    return sum(values) / len(values)\n",
+            "def average(values):\n    return sum(values) / len(values)\n\nprint(average([2, 4]))\nx = 1\ny = 2\n",
         )
         .unwrap();
         let edit = serde_json::json!({"path": "calc.py", "old": "return sum(values) / (len(values) - 1)",
@@ -709,9 +736,12 @@ mod tests {
         assert_eq!(
             text(&rows),
             [
-                "• Edited calc.py",
-                "   2 -    return sum(values) / (len(values) - 1)",
-                "   2 +    return sum(values) / len(values)"
+                "• Edited calc.py  -1 +1",
+                "   1   def average(values):",
+                "   2 ▎     return sum(values) / (len(values) - 1)",
+                "   2 ▎     return sum(values) / len(values)",
+                "   3   ",
+                "   4   print(average([2, 4]))",
             ]
         );
         std::fs::remove_dir_all(dir).unwrap();
