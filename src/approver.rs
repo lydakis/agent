@@ -29,9 +29,15 @@ pub struct Settings {
     pub note: Option<String>,
 }
 
-/// Who judges: Jev over its own API, or any model the daemon runs.
+/// Who judges: Jev or OpenAI's Decisions API over their own APIs, or any
+/// model the daemon runs.
 pub enum JudgeSpec {
     Jev {
+        url: String,
+        model: String,
+        key: String,
+    },
+    Decisions {
         url: String,
         model: String,
         key: String,
@@ -60,7 +66,7 @@ const DELEGATING: usize = 64;
 /// The largest file written this turn that a judged call may run: a call
 /// that runs a larger one is refused rather than judged on its first part.
 const FILE_BYTES: u64 = 48 * 1024;
-/// The largest answer Jev may send; a larger one is a failed check.
+/// The largest answer a decision API may send; a larger one is a failed check.
 const REPLY_BYTES: usize = 64 * 1024;
 /// First wait after a 429 or 529 without Retry-After, doubled each time.
 const BACKOFF: Duration = Duration::from_millis(250);
@@ -112,7 +118,7 @@ struct Judge {
 }
 
 enum Via {
-    Jev(Jev),
+    Hosted(Hosted),
     Model(Model),
 }
 
@@ -125,13 +131,23 @@ impl Judge {
         deadline: Instant,
     ) -> Judged {
         match &self.via {
-            Via::Jev(jev) => jev.ask(state, questions, deadline).await,
+            Via::Hosted(hosted) => hosted.ask(state, questions, deadline).await,
             Via::Model(model) => model.ask(client, state, questions, deadline).await,
         }
     }
 }
 
-struct Jev {
+/// A decision model behind its own API, which answers a round's questions
+/// with probabilities and bills input only.
+enum Api {
+    /// TypeSafe's `POST /v1/systemone`, which takes the questions as they are.
+    Jev,
+    /// OpenAI's `POST /v1/decisions`, which takes them as predicates.
+    Decisions,
+}
+
+struct Hosted {
+    api: Api,
     http: reqwest::Client,
     url: String,
     model: String,
@@ -140,11 +156,19 @@ struct Jev {
     backoff: Mutex<(Option<Instant>, Duration)>,
 }
 
-impl Jev {
+impl Hosted {
     async fn ask(&self, state: &Value, questions: &Value, deadline: Instant) -> Judged {
-        let body = match serde_json::to_vec(
-            &json!({"model":self.model,"state":state,"questions":questions}),
-        ) {
+        let (path, request) = match self.api {
+            Api::Jev => (
+                "/v1/systemone",
+                json!({"model":self.model,"state":state,"questions":questions}),
+            ),
+            Api::Decisions => (
+                "/v1/decisions",
+                policy::decisions_request(&self.model, state, questions),
+            ),
+        };
+        let body = match serde_json::to_vec(&request) {
             Ok(body) => body,
             Err(_) => return Judged::Failed("the request could not be encoded".into()),
         };
@@ -161,7 +185,7 @@ impl Jev {
             };
             let sent = self
                 .http
-                .post(format!("{}/v1/systemone", self.url))
+                .post(format!("{}{path}", self.url))
                 .header(
                     reqwest::header::AUTHORIZATION,
                     format!("Bearer {}", self.key),
@@ -186,6 +210,18 @@ impl Jev {
                     .and_then(|value| value.to_str().ok()?.parse::<f64>().ok())
                     .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
                     .map(|seconds| Duration::from_secs_f64(seconds.min(RETRY_MAX_SECS)));
+                // OpenAI's 429 also means the account is out of credit,
+                // which no wait fixes; its body names that by a published code.
+                if matches!(self.api, Api::Decisions) {
+                    let error: Value = read_reply(response)
+                        .await
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                        .unwrap_or_default();
+                    if error["error"]["code"] == "insufficient_quota" {
+                        return Judged::Failed("the judge's account is out of quota".into());
+                    }
+                }
                 let mut backoff = self.backoff.lock().unwrap();
                 // A server's shorter wait, zero included, still paces.
                 let wait = retry.map_or(backoff.1, |retry| retry.max(backoff.1));
@@ -204,30 +240,45 @@ impl Jev {
                     *backoff = (None, BACKOFF);
                 }
             }
-            let mut response = response;
-            let mut bytes = Vec::new();
-            loop {
-                match response.chunk().await {
-                    Ok(Some(chunk)) if bytes.len() + chunk.len() <= REPLY_BYTES => {
-                        bytes.extend_from_slice(&chunk);
-                    }
-                    Ok(Some(_)) => {
-                        return Judged::Failed("the judge's answer was too large".into());
-                    }
-                    Ok(None) => break,
-                    Err(_) => return Judged::Failed("the check failed".into()),
-                }
-            }
+            let bytes = match read_reply(response).await {
+                Ok(bytes) => bytes,
+                Err(why) => return Judged::Failed(why.into()),
+            };
             let Ok(reply) = serde_json::from_slice::<Value>(&bytes) else {
                 return Judged::Failed("the judge's answer was not JSON".into());
             };
-            return Judged::Answers {
-                usage: Usage {
-                    input: reply["usage"]["input_tokens"].as_u64().unwrap_or(0),
-                    ..Usage::default()
-                },
-                answers: reply["answers"].clone(),
+            let usage = Usage {
+                input: reply["usage"]["input_tokens"].as_u64().unwrap_or(0),
+                cached: reply["usage"]["input_tokens_details"]["cached_tokens"]
+                    .as_u64()
+                    .unwrap_or(0),
+                ..Usage::default()
             };
+            return match self.api {
+                Api::Jev => Judged::Answers {
+                    usage,
+                    answers: reply["answers"].clone(),
+                },
+                Api::Decisions => match policy::decisions_answers(&reply, questions) {
+                    Ok(answers) => Judged::Answers { usage, answers },
+                    Err(why) => Judged::Failed(why.into()),
+                },
+            };
+        }
+    }
+}
+
+/// A response's body, up to the largest answer a decision API may send.
+async fn read_reply(mut response: reqwest::Response) -> std::result::Result<Vec<u8>, &'static str> {
+    let mut bytes = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) if bytes.len() + chunk.len() <= REPLY_BYTES => {
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(Some(_)) => return Err("the judge's answer was too large"),
+            Ok(None) => return Ok(bytes),
+            Err(_) => return Err("the check failed"),
         }
     }
 }
@@ -504,21 +555,28 @@ async fn serve(settings: Settings) -> Result<i32> {
     else {
         return Err(Error::new("daemon_protocol_mismatch"));
     };
+    let hosted = |api, url: String, model, key| -> Result<Via> {
+        Ok(Via::Hosted(Hosted {
+            api,
+            http: reqwest::Client::builder()
+                .user_agent(concat!("agent-runtime/", env!("CARGO_PKG_VERSION")))
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(Duration::from_secs(5))
+                .build()
+                .map_err(|_| Error::new("http_client_init"))?,
+            url: url.trim_end_matches('/').to_owned(),
+            model,
+            key,
+            backoff: Mutex::new((None, BACKOFF)),
+        }))
+    };
     let (via, deadline_ms) = match settings.judge {
-        JudgeSpec::Jev { url, model, key } => (
-            Via::Jev(Jev {
-                http: reqwest::Client::builder()
-                    .user_agent(concat!("agent-runtime/", env!("CARGO_PKG_VERSION")))
-                    .no_proxy()
-                    .redirect(reqwest::redirect::Policy::none())
-                    .connect_timeout(Duration::from_secs(5))
-                    .build()
-                    .map_err(|_| Error::new("http_client_init"))?,
-                url: url.trim_end_matches('/').to_owned(),
-                model,
-                key,
-                backoff: Mutex::new((None, BACKOFF)),
-            }),
+        JudgeSpec::Jev { url, model, key } => {
+            (hosted(Api::Jev, url, model, key)?, policy::DEADLINE_MS)
+        }
+        JudgeSpec::Decisions { url, model, key } => (
+            hosted(Api::Decisions, url, model, key)?,
             policy::DEADLINE_MS,
         ),
         JudgeSpec::Model { model, effort } => {

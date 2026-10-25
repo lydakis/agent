@@ -1743,6 +1743,7 @@ fn whole_arguments(connection: &mut Connection, calls: &mut [Value]) -> Result<(
 /// again since.
 /// The judge's key, which only the approver holds.
 const JUDGE_KEY: &str = agent_runtime::tools::JUDGE_KEY;
+const DECISIONS_KEY: &str = agent_runtime::tools::DECISIONS_KEY;
 
 /// The approver's note: a regular file no larger than a judge's whole
 /// state, opened without blocking so a FIFO cannot hold startup.
@@ -1780,13 +1781,28 @@ fn approver(options: &Options) -> Result<i32> {
     let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
     let judge = judge(options, env("AGENT_MODEL"))?;
     let note = options.note.as_deref().map(note).transpose()?;
-    // Jev is `typesafe/jev-*`; any other name, a daemon provider called
+    // Jev is `typesafe/jev-*` and OpenAI's Decisions API is
+    // `openai-decisions/MODEL`; any other name, a daemon provider called
     // `typesafe` included, runs through the daemon.
-    let judge = match judge
+    let jev = judge
         .strip_prefix("typesafe/")
-        .filter(|model| model.starts_with("jev-"))
-    {
-        Some(model) => crate::approver::JudgeSpec::Jev {
+        .filter(|model| model.starts_with("jev-"));
+    let decisions = judge.strip_prefix("openai-decisions/");
+    let judge = match (jev, decisions) {
+        (_, Some(model)) => crate::approver::JudgeSpec::Decisions {
+            url: options
+                .judge_url
+                .clone()
+                .unwrap_or_else(|| "https://api.openai.com".into()),
+            model: model.to_owned(),
+            key: env(DECISIONS_KEY).ok_or_else(|| {
+                Error::with(
+                    "judge_key_required",
+                    format!("set {DECISIONS_KEY} for the Decisions API"),
+                )
+            })?,
+        },
+        (Some(model), None) => crate::approver::JudgeSpec::Jev {
             url: options
                 .judge_url
                 .clone()
@@ -1797,7 +1813,7 @@ fn approver(options: &Options) -> Result<i32> {
                 Error::with("judge_key_required", format!("set {JUDGE_KEY} for Jev"))
             })?,
         },
-        None => crate::approver::JudgeSpec::Model {
+        (None, None) => crate::approver::JudgeSpec::Model {
             model: judge,
             effort: options.effort.clone(),
         },
