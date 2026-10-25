@@ -1789,7 +1789,7 @@ needs, and one optional policy composes them:
   `bot_not_found` rather than deleting a replacement with the same name.
   Queued wake-ups for interrupted or deleted turns are discarded when capacity
   opens; reusing a bot name cannot resume its old turn. This internal check
-  does not change explicit `resume` requests: a missing bot returns `bot_not_found`.
+  does not change explicit `inspect` requests: a missing bot returns `bot_not_found`.
   The bot's turn rows go with it, so a late retry of one of its requests (the
   same `bot` and `request_id`) answers `bot_not_found`, never the old outcome
   or a duplicate turn. If the name was recreated meanwhile, a retry carrying
@@ -1966,7 +1966,7 @@ and a `create` or `fork` whose `created_by` names a bot adds that bot's.
 Each gate is kept to the new bot's tools, and gates with the same tag merge,
 keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
 `fork` that would give it more fails with `gate_limit` and writes nothing.
-`resume`, `bots`, `created`, and `forked` report `gates`. The design and its reasoning are in [APPROVALS.md](APPROVALS.md).
+`inspect`, `bots`, `created`, and `forked` report `gates`. The design and its reasoning are in [APPROVALS.md](APPROVALS.md).
 
 - **Announcement.** The commit that records a model response with gated
   calls also writes an `approval_requested` event for the round:
@@ -2054,7 +2054,7 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   written in the commit that records the denial, and the start that ends
   a run writes only when a run was counted, so a bot never denied writes
   nothing. A lapsed gate's denial is not counted: nobody judged the call.
-  `resume` reports `denials: {tag: {in_row, in_turn, turn}}` once one is
+  `inspect` reports `denials: {tag: {in_row, in_turn, turn}}` once one is
   counted; a listed or served call carries `{tag: {in_row, in_turn}}` as
   seen from its own turn, so an approver that restarts or takes over
   counts on where the last one left off.

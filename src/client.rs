@@ -1852,11 +1852,22 @@ fn current_turn(connection: &mut Connection, bot: &str, bot_id: Option<i64>) -> 
     let record = connection.request("inspect", json!({"bot":bot,"bot_id":bot_id}))?;
     let turn = match record["running_turn"].as_i64() {
         Some(turn) => Some(turn),
-        None => connection.request(
-            "turns",
-            json!({"bot":bot,"after":0,"before":null,"limit":1,"newest":true}),
-        )?["turns"][0]["turn"]
-            .as_i64(),
+        None => {
+            let page = connection.request(
+                "turns",
+                json!({"bot":bot,"after":0,"before":null,"limit":1,"newest":true}),
+            )?;
+            // The name may have changed hands since the record was read; a
+            // turn of another identity is not this bot's.
+            let newest = &page["turns"][0];
+            if !newest.is_null() && newest["bot_id"] != record["bot_id"] {
+                return fail_with(
+                    "bot_not_found",
+                    format!("{bot} is no longer identity {}", record["bot_id"]),
+                );
+            }
+            newest["turn"].as_i64()
+        }
     };
     let turn = turn.ok_or_else(|| Error::with("no_turn", format!("{bot} has no turns")))?;
     Ok(format!("turn:{bot}/{turn}"))
