@@ -216,7 +216,7 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   that removes a tool from it, because the bot's own shell could call that
   operation. The CLI flag is `run --approve shell,write,edit`.
 - **`create` also takes an `approver` tag,** an opaque string the daemon
-  stores, reports in `resume`, `bots`, and `approval_requested`, but never
+  stores, reports in `inspect`, `bots`, and `approval_requested`, but never
   interprets. Clients use it to decide who answers (see the modes above).
   A list and its tag together make a **gate**. A gate may also carry an
   `expire_ms` its creator chooses: a call whose verdict for that gate has
@@ -577,6 +577,18 @@ approver the CLI starts.
   daemon because it is a classifier, not a model that takes turns:
   running it there would add a call shape that one client uses to the
   provider layer.
+- **OpenAI's Decisions API** (`openai-decisions/gpt-6-luna`, key
+  `OPENAI_API_KEY`) is called the same way, on `POST /v1/decisions`: the
+  state goes in as the user's text (the same JSON a general model reads),
+  a developer message carries the general judge's reading rules without
+  its reply format, and each question is a `predicate` named by its id,
+  with a consent question's criteria inlined. Its probabilities are read
+  as Jev's, so one verdict rule reads both. A refused, missing, or
+  out-of-range answer is a failed check, and a 429 whose error code is
+  `insufficient_quota` fails at once instead of waiting. It takes an API
+  key only; a ChatGPT plan cannot call it. It is never picked without
+  `--judge` or `AGENT_APPROVER_JUDGE`, since `OPENAI_API_KEY` is often set
+  for the daemon's own provider.
 - **Any other model** runs through the daemon, with the providers and
   logins the bots use (an API key, Bedrock, or a ChatGPT plan). The
   approver keeps an idle bot, `approver.TAG`, with the judge's
@@ -694,7 +706,10 @@ daemon and the approver together, it starts the daemon with the Jev key's
 variable removed, unless a `--provider` names it as its key variable, and
 passes it only to the approver; the daemon also adds
 that variable to the set it already strips from tool environments, as it
-does for provider keys, in case it was started some other way. That is
+does for provider keys, in case it was started some other way. The
+Decisions judge's `OPENAI_API_KEY` is stripped from tool environments the
+same way, whether or not a daemon provider uses it; the daemon keeps it,
+since its own OpenAI provider may need it. That is
 all it gets. A
 tool running as the same OS user can still read it: on Linux through
 `/proc/PID/environ` of the approver, or from wherever the key is stored.
@@ -1046,6 +1061,45 @@ as one.
      13.9 ms, Jev 15.8 and 16.3 ms, general model 22.3 and 23.6 ms, the
      same commits. The fixes (the slot taken before reads, the queued judge
      turn, per-bot dedupe) cost nothing measurable.
+
+5. **Decisions API and Jev 1.14.** Approved by George on 2026-10-25
+   (about $0.27) and run that day on his Mac (macOS 27.0.1) with the
+   Decisions judge on `e8e8dc4`: the 341 labeled calls of item 2, in 338
+   rounds, two passes in rotated order, every judge at `--parallel 1`
+   (at 4 in flight the ChatGPT-plan judge now passes its 30 s deadline on
+   some rounds, which item 4 did not; not yet explained). Allowed of 341,
+   per pass:
+
+   | | `jev-1.13.0` | `jev-1.14.0` | `openai-decisions/gpt-6-luna` | `chatgpt/gpt-6-luna`, low |
+   |---|---:|---:|---:|---:|
+   | Allowed | 280, 285 | 268, 270 | 300, 297 | 324, 287 |
+   | Denied as unclear / risky | 53 / 8, 50 / 6 | 66 / 7, 61 / 10 | 15 / 26, 16 / 28 | 0 / 17, 0 / 18 |
+   | Not reviewed (timed out) | 0, 0 | 0, 0 | 0, 0 | 0, 36 |
+   | Judge time p50 / p99, ms | 94 / 218, 85 / 273 | 98 / 352, 100 / 619 | 177 / 530, 184 / 536 | 3,063 / 7,288, 3,193 / 30,004 |
+   | Input tokens a pass, thousands | 516 | 516 | 938 | 440 (27 out) |
+   | Cost, both passes | $0.043 | $0.043 | $0.19 | on the plan |
+
+   Paired per call (exact McNemar per pass, a sign test and a bootstrap
+   over calls across both passes):
+   - Jev 1.14 refuses more benign calls than 1.13: 4.0 points (95% CI
+     0.6 to 7.3, sign test p = 0.024), against 8 to 13 calls that flip
+     between passes for either version. Every extra refusal is unclear,
+     mostly the delete-outside-the-workspace and unnamed-destination
+     questions. George kept `jev-latest` regardless (2026-10-25).
+   - Decisions refuses fewer than Jev 1.13: 4.7 points (CI 1.6 to 8.1),
+     at about twice Jev's latency and a seventeenth of the general
+     model's. About two thirds of its refusals are risky rather than
+     unclear, which the thresholds cannot tune away.
+   - Decisions bills about 1.8 times Jev's input tokens for the same
+     rounds and caches almost none; about $0.0003 a round.
+   - Its reply is `{model, answers, usage}`; a bad request is a 400 with
+     `error.type` `invalid_request_error` and a `code` such as
+     `invalid_value`.
+
+   On a stand-in that answers at once (`bench.approval_overhead`, arm
+   `decisions`, Linux container, 1 bot, 200 turns, three rotated rounds)
+   the Decisions path costs what Jev's does: 17.0 against 17.2 ms turn
+   latency at the median, 0.85 ms of approver CPU, and no commit.
 
 ## Built so far
 

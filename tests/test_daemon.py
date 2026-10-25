@@ -261,11 +261,11 @@ class DaemonTests(ModelFixture):
             slow.connect(str(client.socket_path))
             with slow.makefile('rb') as reader:
                 self.assertEqual(json.loads(reader.readline())['event'], 'ready')
-                slow.sendall(b''.join((json.dumps(dict(id=n, op='resume', bot='Bob'))+'\n').encode()
+                slow.sendall(b''.join((json.dumps(dict(id=n, op='inspect', bot='Bob'))+'\n').encode()
                                      for n in range(100)))
                 time.sleep(.2)
                 start = time.monotonic()
-                self.assertIn('result', client.control.request('resume', bot='Bob'))
+                self.assertIn('result', client.control.request('inspect', bot='Bob'))
                 self.assertLess(time.monotonic()-start, 1)
                 # Saturation closes the writer even while the peer keeps its read side open.
                 while reader.readline():
@@ -287,7 +287,7 @@ class DaemonTests(ModelFixture):
             with peer.makefile('rb') as reader:
                 json.loads(reader.readline())
                 requests = [dict(id=1, op='follow', bot='Bob', after=0), dict(id=2, op='follow', bot='Bob', after=last),
-                            dict(id=3, op='resume', bot='Bob')]
+                            dict(id=3, op='inspect', bot='Bob')]
                 peer.sendall(b''.join((json.dumps(r)+'\n').encode() for r in requests))
                 acknowledged = False
                 while True:
@@ -298,7 +298,7 @@ class DaemonTests(ModelFixture):
                     if event.get('id') == 3: break
                 # Drain any scheduled replay, then establish a second response barrier.
                 time.sleep(.1)
-                peer.sendall(b'{"id":4,"op":"resume","bot":"Bob"}\n')
+                peer.sendall(b'{"id":4,"op":"inspect","bot":"Bob"}\n')
                 while True:
                     event = json.loads(reader.readline())
                     self.assertNotEqual(event.get('event'), 'fixture')
@@ -321,7 +321,7 @@ class DaemonTests(ModelFixture):
         # The process and its database ownership are both released.
         reopened = Client(self.binary, path, self.url)
         self.addCleanup(reopened.close)
-        self.assertIn('result', reopened.request('resume', bot='Bob'))
+        self.assertIn('result', reopened.request('inspect', bot='Bob'))
 
     def test_socket_collision_preserves_live_owner_and_regular_files(self):
         client = SocketClient(self.binary, self.path/'first.db', self.url, 'echo')
@@ -335,7 +335,7 @@ class DaemonTests(ModelFixture):
         self.assertIn('socket_already_owned', error)
         connection = Connection(client.socket_path)
         self.addCleanup(connection.close)
-        self.assertIn('result', connection.request('resume', bot='first'))
+        self.assertIn('result', connection.request('inspect', bot='first'))
         # Unrelated files at a configured socket path must never be deleted.
         with tempfile.TemporaryDirectory(dir='/tmp') as td:
             target = Path(td)/'socket'

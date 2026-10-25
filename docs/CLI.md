@@ -1,7 +1,7 @@
 # CLI contract
 
 Agent uses flat verbs: `run`, `follow`, `fork`, `interrupt`, `wait`, `ls`,
-`turns`, `rm`, `prune`, `approvals`, `answer`, `models`, `start`, `stats`,
+`inspect`, `turns`, `rm`, `prune`, `approvals`, `answer`, `models`, `start`, `stats`,
 `shutdown`, and `serve`. All named
 bots use the same commands. There is no parent/child command hierarchy.
 
@@ -37,6 +37,10 @@ succeeds as a duplicate and leaves a later bot of the same name alone. An
 identity that name never held is `bot_not_found`.
 `follow --bot NAME` replays and follows the selected current turn to its end;
 an idle bot returns after replay. `follow --all` stays connected for future work.
+`inspect --bot NAME` prints one bot's whole record: the fields of its `ls`
+row plus its instructions, settings and compaction. It changes nothing, so it
+is safe to repeat; with `--bot-id N`, a bot that no longer holds that
+identity is `bot_not_found`.
 
 ## Arguments and flags
 
@@ -102,8 +106,10 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   has a judge decide every call waiting on it, one request per round,
   printing one JSON line per round. The judge is `--judge`, else
   `AGENT_APPROVER_JUDGE`, else `typesafe/jev-latest` when `TYPESAFE_API_KEY`
-  is set, else `AGENT_MODEL`; any model but Jev (`typesafe/jev-*`) runs
-  through the daemon, with
+  is set, else `AGENT_MODEL`. Jev (`typesafe/jev-*`, key `TYPESAFE_API_KEY`)
+  and OpenAI's Decisions API (`openai-decisions/MODEL`, key
+  `OPENAI_API_KEY`) are called on their own APIs, at `--judge-url` when
+  given; any other model runs through the daemon, with
   a tag of at most 87 bytes, and `--effort` sets its effort. `--note` (default `AGENT_APPROVER_NOTE`)
   is a regular file of at most 96,000 bytes the judge always sees, such as
   trusted remotes and hosts ([APPROVALS.md](APPROVALS.md#automatic-mode)).
@@ -222,6 +228,11 @@ a daemon that exits without one is `daemon_start_failed`, naming the log.
 | 2 | Invalid command-line usage |
 | 75 | `serve` could not acquire store/socket ownership |
 
+`wait --bot NAME` waits on that bot's running turn, else its newest, so a
+caller can wait on work it did not submit; the result is keyed by the handle
+it chose, as if that handle had been given. A turn queued behind the running
+one is not it. A bot with no turns is `no_turn`, and `--bot-id` pins the
+identity as on `inspect`. `--bot` and handles do not mix.
 `wait` normally requires all handles to resolve without errors. With `--any`,
 one resolved successful handle suffices and the remaining handles stay valid.
 An errored first result or a timeout with no resolved result exits 1.

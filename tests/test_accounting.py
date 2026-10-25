@@ -33,7 +33,7 @@ class AccountingTests(ModelFixture):
                                  (calls, calls * 100, calls * 10))
                 self.assertEqual(row['retries'], int(calls > 1))
                 self.assertEqual(self.model.requests.qsize() - prior_calls, calls)
-                self.assertEqual(client.request('resume', bot=bot)['result']['tokens_used'], calls * 110)
+                self.assertEqual(client.request('inspect', bot=bot)['result']['tokens_used'], calls * 110)
                 self.assertEqual(client.request('stats')['result']['tokens']['input_tokens'],
                                  (prior_calls + calls) * 100)
                 page = client.request('events', bot=bot, after=0, limit=256)['result']['events']
@@ -54,7 +54,7 @@ class AccountingTests(ModelFixture):
         self.assertEqual((bot['budget_tokens'], bot['tokens_used']), (200, 0))
         first = client.request('submit', bot='Bob', request_id='1', prompt='hello')['result']['turn']
         self.assertEqual(client.finished(first)['data']['status'], 'completed')
-        self.assertEqual(client.request('resume', bot='Bob')['result']['tokens_used'], 110)
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['tokens_used'], 110)
         # A tool turn needs two calls: the second is refused before it starts,
         # so the tool ran, but the turn fails without an uncertain tool.
         second = client.request('submit', bot='Bob', request_id='2', prompt='tool:x')['result']['turn']
@@ -104,7 +104,7 @@ class AccountingTests(ModelFixture):
         self.assertEqual(submit('capped', 'tool:x', budget_tokens=220)['error'], 'idempotency_conflict')
         # The cap is the turn's: the bot's own count is past it, and the next
         # turn, capped or not, starts from its own zero.
-        self.assertEqual(client.request('resume', bot='Bob')['result']['tokens_used'], 110)
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['tokens_used'], 110)
         for key, more in (('free', {}), ('roomy', {'budget_tokens': 220})):
             turn = submit(key, 'tool:x', **more)['result']['turn']
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
@@ -131,7 +131,7 @@ class AccountingTests(ModelFixture):
         turns = {t['turn']: t for t in client.request('turns', bot='Bob', after=0)['result']['turns']}
         self.assertEqual((turns[cold]['cached_input_tokens'], turns[cold]['cache_hit']), (0, 0.0))
         self.assertEqual((turns[warm]['cached_input_tokens'], turns[warm]['cache_hit']), (40, 0.4))
-        bot = client.request('resume', bot='Bob')['result']
+        bot = client.request('inspect', bot='Bob')['result']
         self.assertEqual((bot['input_tokens'], bot['cached_input_tokens'], bot['cache_hit']), (200, 40, 0.2))
         listed = client.request('bots')['result']['bots'][0]
         self.assertEqual((listed['input_tokens'], listed['cache_hit']), (200, 0.2))
@@ -144,7 +144,7 @@ class AccountingTests(ModelFixture):
         turn = client.request('submit', bot='Bob', request_id='first', prompt='incomplete')['result']['turn']
         end = client.finished(turn)
         self.assertEqual(end['data']['error'], 'provider_incomplete')
-        self.assertEqual(client.request('resume', bot='Bob')['result']['tokens_used'], 110)
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['tokens_used'], 110)
         events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
         self.assertEqual(len([e for e in events if e['event'] == 'usage']), 1)
         self.assertEqual(client.request('stats')['result']['tokens']['input_tokens'], 100)
@@ -193,7 +193,7 @@ class AccountingTests(ModelFixture):
         big = client.request('submit', bot='Bob', request_id='big',
                              prompt="shell:i=0; while [ $i -lt 20000 ]; do echo line-$i; i=$((i+1)); done")['result']['turn']
         self.assertEqual(client.finished(big)['data']['status'], 'completed')
-        checkpoint = client.request('resume', bot='Bob')['result']['head']
+        checkpoint = client.request('inspect', bot='Bob')['result']['head']
         client.request('fork', source='Bob', checkpoint=checkpoint, bot='Fork', workspace=str(self.path))
         inherited = client.request('submit', bot='Fork', request_id='inherited',
                                    prompt=f'readart:{big}/shell-1/stdout 19999,5')['result']['turn']
@@ -236,7 +236,7 @@ class AccountingTests(ModelFixture):
         big = client.request('submit', bot='Bob', request_id='big',
                              prompt="shell:i=0; while [ $i -lt 20000 ]; do echo line-$i; i=$((i+1)); done")['result']['turn']
         self.assertEqual(client.finished(big)['data']['status'], 'completed')
-        checkpoint = client.request('resume', bot='Bob')['result']['head']
+        checkpoint = client.request('inspect', bot='Bob')['result']['head']
         client.request('fork', source='Bob', checkpoint=checkpoint, bot='Fork', workspace=str(self.path))
         client.request('create', bot='Other', workspace=str(self.path))
         later = client.request('submit', bot='Bob', request_id='later', prompt='later')['result']['turn']

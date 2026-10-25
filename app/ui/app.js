@@ -779,7 +779,7 @@ async function onEvent(ev) {
       // So did the trigger script: what it added or removed is listed.
       if (call?.trig && S.live) soonTriggers(0);
       const shown = S.ui.file;
-      // Read again as the agent left it; what it wrote is new, so a page, diagram or image in it waits for a click.
+      // Read again as the agent left it; what it wrote is new, so a page, chart or image in it waits for a click.
       // A write or edit that failed or was refused changed nothing, and what is shown keeps running.
       const wrote = !data.failed && !data.denied && call?.path && (call.name === 'write' || call.name === 'edit') ? joinPath(folderOf(name, turn), call.path) : null;
       if (shown && wrote === shown.full) openFile(shown.bot, shown.full, false);

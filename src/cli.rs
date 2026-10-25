@@ -57,6 +57,14 @@ const COMMANDS: &[Command] = &[
         startup: false,
     },
     Command {
+        name: "inspect",
+        about: "A bot's whole record: model, tools, gates, settings, instructions, tokens",
+        usage: "inspect --bot NAME [--bot-id N]",
+        flags: "--bot --bot-id --pretty --no-spawn",
+        settings: "",
+        startup: true,
+    },
+    Command {
         name: "turns",
         about: "A bot's turns and how each ended",
         usage: "turns --bot NAME [--after TURN] [--newest] [--limit N]",
@@ -67,8 +75,8 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "wait",
         about: "A turn's or command's result: status, text, usage; --timeout 0 polls",
-        usage: "wait [--any] [--timeout DURATION] HANDLE...",
-        flags: "--any --timeout --pretty",
+        usage: "wait [--any] [--timeout DURATION] HANDLE... | wait --bot NAME [--bot-id N] [--timeout DURATION]",
+        flags: "--bot --bot-id --any --timeout --pretty",
         settings: "",
         startup: false,
     },
@@ -371,11 +379,11 @@ fn print_flags(flags: &str) {
             ),
             "--judge" => (
                 "PROVIDER/MODEL",
-                "Who judges: typesafe/jev-latest or any model the daemon serves; default AGENT_APPROVER_JUDGE, Jev when TYPESAFE_API_KEY is set, else AGENT_MODEL",
+                "Who judges: typesafe/jev-latest, openai-decisions/gpt-6-luna, or any model the daemon serves; default AGENT_APPROVER_JUDGE, Jev when TYPESAFE_API_KEY is set, else AGENT_MODEL",
             ),
             "--judge-url" => (
                 "URL",
-                "Jev's base URL; default TYPESAFE_BASE_URL or https://api.typesafe.ai",
+                "The judge API's base URL; default TYPESAFE_BASE_URL or https://api.typesafe.ai for Jev, https://api.openai.com for Decisions",
             ),
             "--reason" => ("TEXT", "Why, shown to the model with a denial"),
             "--approval-hold" => (

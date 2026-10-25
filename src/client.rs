@@ -1041,6 +1041,7 @@ pub fn main(args: Vec<String>) -> Result<i32> {
         "fork" => fork(&options),
         "interrupt" => interrupt(&options),
         "wait" => wait(&options),
+        "inspect" => inspect(&options),
         "turns" => turns(&options),
         "rm" => remove(&options),
         "prune" => prune(&options),
@@ -1377,7 +1378,7 @@ fn run(options: &Options) -> Result<i32> {
     } else {
         // Gates are the bot's own, set when it was made: a bot gated for
         // `auto` gets its approver back, as after a daemon restart.
-        let record = connection.request("resume", json!({"bot":bot}))?;
+        let record = connection.request("inspect", json!({"bot":bot}))?;
         if answered_by_auto(&record) {
             ensure_approver(options, &mut connection, bot_model(&record))?;
         }
@@ -1494,7 +1495,7 @@ fn follow(options: &Options) -> Result<i32> {
     // Choose the turn before subscribing. If it finishes during attachment,
     // replay still delivers its terminal event; a later idle snapshot cannot
     // make us abandon events queued while waiting for an RPC response.
-    let state = connection.request("resume", json!({"bot":bot}))?;
+    let state = connection.request("inspect", json!({"bot":bot}))?;
     let turn = state["running_turn"].as_i64();
     connection.request("follow", json!({"bot":bot,"after":options.after}))?;
     let mut renderer = Renderer::new(options.pretty, turn, &options.target);
@@ -1533,7 +1534,7 @@ fn fork(options: &Options) -> Result<i32> {
     }
     // A fork keeps its source's tools and gates. An approver its inherited
     // `auto` gate needs starts first, so a missing judge leaves no fork behind.
-    let state = match connection.request("resume", json!({"bot":source})) {
+    let state = match connection.request("inspect", json!({"bot":source})) {
         // A keyed fork outlives its source: its resend is answered from the
         // fork, so it needs nothing from the source.
         Err(error) if error.code == "bot_not_found" && options.request_id.is_some() => {
@@ -1557,7 +1558,7 @@ fn interrupt(options: &Options) -> Result<i32> {
         .clone()
         .ok_or(Error::with("usage", "interrupt needs --bot"))?;
     let mut connection = Connection::connect(&options.socket)?;
-    let state = connection.request("resume", json!({"bot":bot}))?;
+    let state = connection.request("inspect", json!({"bot":bot}))?;
     let Some(turn) = state["running_turn"].as_i64() else {
         return fail_with("no_active_turn", format!("{bot} has no running turn"));
     };
@@ -1599,14 +1600,19 @@ fn prune(options: &Options) -> Result<i32> {
 
 /// Wait for all handles, or the first with --any. Pending peers are expected
 /// in any mode; timeout without a result and resolved errors still exit 1.
+/// `--bot` waits on the bot's running turn, else its newest, as a handle.
 fn wait(options: &Options) -> Result<i32> {
-    if options.positional.is_empty() {
-        return fail_with("usage", "wait needs at least one handle");
+    if options.bot.is_some() == !options.positional.is_empty() {
+        return fail_with("usage", "wait needs handles or --bot, not both");
     }
     let mut connection = Connection::connect(&options.socket)?;
+    let handles = match &options.bot {
+        Some(bot) => vec![current_turn(&mut connection, bot, options.bot_id)?],
+        None => options.positional.clone(),
+    };
     let result = connection.request(
         "wait",
-        json!({"handles":options.positional,"timeout_ms":options.timeout_ms,"any":options.any}),
+        json!({"handles":handles,"timeout_ms":options.timeout_ms,"any":options.any}),
     )?;
     print_json(&result, options.pretty)?;
     let clean = result["results"].as_object().is_some_and(|results| {
@@ -1737,6 +1743,7 @@ fn whole_arguments(connection: &mut Connection, calls: &mut [Value]) -> Result<(
 /// again since.
 /// The judge's key, which only the approver holds.
 const JUDGE_KEY: &str = agent_runtime::tools::JUDGE_KEY;
+const DECISIONS_KEY: &str = agent_runtime::tools::DECISIONS_KEY;
 
 /// The approver's note: a regular file no larger than a judge's whole
 /// state, opened without blocking so a FIFO cannot hold startup.
@@ -1774,13 +1781,28 @@ fn approver(options: &Options) -> Result<i32> {
     let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
     let judge = judge(options, env("AGENT_MODEL"))?;
     let note = options.note.as_deref().map(note).transpose()?;
-    // Jev is `typesafe/jev-*`; any other name, a daemon provider called
+    // Jev is `typesafe/jev-*` and OpenAI's Decisions API is
+    // `openai-decisions/MODEL`; any other name, a daemon provider called
     // `typesafe` included, runs through the daemon.
-    let judge = match judge
+    let jev = judge
         .strip_prefix("typesafe/")
-        .filter(|model| model.starts_with("jev-"))
-    {
-        Some(model) => crate::approver::JudgeSpec::Jev {
+        .filter(|model| model.starts_with("jev-"));
+    let decisions = judge.strip_prefix("openai-decisions/");
+    let judge = match (jev, decisions) {
+        (_, Some(model)) => crate::approver::JudgeSpec::Decisions {
+            url: options
+                .judge_url
+                .clone()
+                .unwrap_or_else(|| "https://api.openai.com".into()),
+            model: model.to_owned(),
+            key: env(DECISIONS_KEY).ok_or_else(|| {
+                Error::with(
+                    "judge_key_required",
+                    format!("set {DECISIONS_KEY} for the Decisions API"),
+                )
+            })?,
+        },
+        (Some(model), None) => crate::approver::JudgeSpec::Jev {
             url: options
                 .judge_url
                 .clone()
@@ -1791,7 +1813,7 @@ fn approver(options: &Options) -> Result<i32> {
                 Error::with("judge_key_required", format!("set {JUDGE_KEY} for Jev"))
             })?,
         },
-        None => crate::approver::JudgeSpec::Model {
+        (None, None) => crate::approver::JudgeSpec::Model {
             model: judge,
             effort: options.effort.clone(),
         },
@@ -1839,6 +1861,46 @@ fn answer(options: &Options) -> Result<i32> {
 
 /// A bot's turns, paged through completely or up to `--limit`, oldest
 /// first or with `--newest` newest first; JSON array or a table.
+/// The handle of a bot's running turn, else of its newest one, so a
+/// caller can wait on work it did not submit. A turn queued behind the
+/// running one is not it.
+fn current_turn(connection: &mut Connection, bot: &str, bot_id: Option<i64>) -> Result<String> {
+    let record = connection.request("inspect", json!({"bot":bot,"bot_id":bot_id}))?;
+    let turn = match record["running_turn"].as_i64() {
+        Some(turn) => Some(turn),
+        None => {
+            let page = connection.request(
+                "turns",
+                json!({"bot":bot,"after":0,"before":null,"limit":1,"newest":true}),
+            )?;
+            // The name may have changed hands since the record was read; a
+            // turn of another identity is not this bot's.
+            let newest = &page["turns"][0];
+            if !newest.is_null() && newest["bot_id"] != record["bot_id"] {
+                return fail_with(
+                    "bot_not_found",
+                    format!("{bot} is no longer identity {}", record["bot_id"]),
+                );
+            }
+            newest["turn"].as_i64()
+        }
+    };
+    let turn = turn.ok_or_else(|| Error::with("no_turn", format!("{bot} has no turns")))?;
+    Ok(format!("turn:{bot}/{turn}"))
+}
+
+/// A bot's whole record, as the daemon keeps it.
+fn inspect(options: &Options) -> Result<i32> {
+    let bot = options
+        .bot
+        .clone()
+        .ok_or(Error::with("usage", "inspect needs --bot"))?;
+    let mut connection = ensure_existing_daemon(options)?;
+    let record = connection.request("inspect", json!({"bot":bot,"bot_id":options.bot_id}))?;
+    print_json(&record, options.pretty)?;
+    Ok(0)
+}
+
 fn turns(options: &Options) -> Result<i32> {
     let bot = options
         .bot

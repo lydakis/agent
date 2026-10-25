@@ -81,7 +81,7 @@ class ElisionTests(ModelFixture):
         self.assertIn('result', client.request('fork', source='Bob', bot='Branch', checkpoint=fork_at,
                                                workspace=str(self.path)))
         bound = [m['version'] for m in moves if m['version'] <= fork_at]
-        self.assertEqual(client.request('resume', bot='Branch')['result']['elision'],
+        self.assertEqual(client.request('inspect', bot='Branch')['result']['elision'],
                          bound[-1] if bound else None)
         turn = client.request('submit', bot='Branch', request_id='2', prompt='long:14')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')

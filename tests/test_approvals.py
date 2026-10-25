@@ -112,7 +112,7 @@ class ApprovalTests(ModelFixture):
         self.assertEqual(waiting['data'], {'call_id': 'shell-1', 'approval': True, 'deadline_ms': None})
         stats = client.request('stats')['result']
         self.assertEqual((stats['active_turns'], stats['waiting_turns']), (0, 1))
-        self.assertEqual(client.request('resume', bot='Bob')['result']['status'], 'waiting')
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['status'], 'waiting')
         self.assertEqual(len(client.request('approvals')['result']['approvals']), 1)
         self.assertEqual(self.answer(client, turn, 'shell-1', request=0)['error'], 'approval_superseded')
         self.answer(client, turn, 'shell-1')
@@ -203,7 +203,7 @@ class ApprovalTests(ModelFixture):
         self.assertEqual(fork['gates'], [{'tag': 'manual', 'tools': ['shell']},
                                          {'tag': 'second', 'tools': ['echo', 'shell'], 'expire_ms': 60000}])
         # A bot created from a gated bot's shell keeps the gates its tools meet.
-        bob = client.request('resume', bot='Bob')['result']
+        bob = client.request('inspect', bot='Bob')['result']
         child = client.request('create', bot='Dan', workspace=str(self.path), tools=['echo', 'shell'],
                                created_by='Bob', created_by_id=bob['bot_id'])['result']
         self.assertEqual(child['gates'], [{'tag': 'manual', 'tools': ['shell']}])
@@ -301,7 +301,7 @@ class ApprovalTests(ModelFixture):
                          ('interrupted', 'approval_expired'))
         # Ended by the lapse, long before the turn it waited on.
         self.assertLess(time.monotonic() - parked, 2)
-        self.assertEqual(client.request('resume', bot='Alice')['result']['status'], 'running')
+        self.assertEqual(client.request('inspect', bot='Alice')['result']['status'], 'running')
         self.assertTrue(self.tool_output(client, 'shell-1')[0]['expired'])
         # The wait returned with its handle unresolved, not as a success.
         self.assertEqual(self.tool_output(client, 'wait-1')[1],
@@ -490,7 +490,7 @@ class ServedApprovalTests(ModelFixture):
                                      decision='deny', reason='not now')['result']['decision'], 'deny')
         self.assertEqual(daemon.finished(second)['data']['status'], 'completed')
         # The daemon counts the denial on the bot, and the next call carries it.
-        self.assertEqual(daemon.request('resume', bot='Bob')['result']['denials'],
+        self.assertEqual(daemon.request('inspect', bot='Bob')['result']['denials'],
                          {'auto': {'in_row': 1, 'in_turn': 1, 'turn': second}})
         third = daemon.request('submit', bot='Bob', request_id='c', prompt='shell:printf three')['result']['turn']
         [call] = self.pushed(approver, third)['data']['calls']
@@ -507,7 +507,7 @@ class ServedApprovalTests(ModelFixture):
         self.assertEqual([c['turn'] for c in taken['approvals']], [third])
         self.answer(other, third, 'shell-1', tag='auto', lease=taken['lease'])
         self.assertEqual(daemon.finished(third)['data']['status'], 'completed')
-        self.assertEqual(daemon.request('resume', bot='Bob')['result']['denials'],
+        self.assertEqual(daemon.request('inspect', bot='Bob')['result']['denials'],
                          {'auto': {'in_row': 0, 'in_turn': 1, 'turn': second}})
 
     def test_a_quiet_holder_loses_its_tag_to_the_next_server(self):
@@ -598,15 +598,16 @@ class PromptReadTests(ModelFixture):
         self.assertEqual((read['status'], read['workspace'], read['more']), ('finished', str(self.path), False))
         self.assertEqual(client.request('prompts', bot='Bob', turn=second, bytes=0)['error'], 'invalid_limit')
 
-    def test_the_approvers_key_never_reaches_a_tool(self):
-        env = {**clean_env(), 'TYPESAFE_API_KEY': 'synthetic-judge-key'}
+    def test_the_approvers_keys_never_reach_a_tool(self):
+        env = {**clean_env(), 'TYPESAFE_API_KEY': 'synthetic-judge-key', 'OPENAI_API_KEY': 'synthetic-judge-key'}
         client = Client(self.binary, self.path / 'state.sqlite', self.url, 'shell', env=env)
         self.addCleanup(client.close)
         client.request('create', bot='Bob', workspace=str(self.path))
         turn = client.request('submit', bot='Bob', request_id='a',
-                              prompt='shell:printf "${TYPESAFE_API_KEY-unset}/$AGENT_TURN" > seen')['result']['turn']
+                              prompt='shell:printf "${TYPESAFE_API_KEY-unset}${OPENAI_API_KEY-unset}/$AGENT_TURN" > seen'
+                              )['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-        self.assertEqual((self.path / 'seen').read_text(), f'unset/{turn}')
+        self.assertEqual((self.path / 'seen').read_text(), f'unsetunset/{turn}')
 
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
@@ -775,10 +776,20 @@ class Judge(http.server.BaseHTTPRequestHandler):
                                   'body': body})
         status = self.server.statuses.pop(0) if self.server.statuses else 200
         headers = {'Content-Type': 'application/json'}
-        if status == 200:
+        if status == 200 and self.path == '/v1/decisions':
+            # OpenAI's shape: predicates by name, the state as the user's text.
+            state = {**body, 'state': json.loads(body['input'][1]['content'][0]['text'])}
+            answers = [{'type': 'predicate', 'name': q['name'], 'probability': self.server.answer(state, q['name'])}
+                       for q in body['questions']]
+            payload = {'model': body['model'], 'answers': answers,
+                       'usage': {'input_tokens': 1000, 'input_tokens_details': {'cached_tokens': 200},
+                                 'output_tokens': 0}}
+        elif status == 200:
             answers = {id: {'type': 'noul', 'noul': self.server.answer(body, id)} for id in body['questions']}
             payload = {'model': body['model'], 'answers': answers,
                        'usage': {'input_tokens': 1000, 'output_tokens': 0}}
+        elif status == 'quota':
+            status, payload = 429, {'error': {'type': 'insufficient_quota', 'code': 'insufficient_quota'}}
         else:
             payload = {'error': 'synthetic'}
             if status == 429:
@@ -821,9 +832,14 @@ class AutoApproverTests(ModelFixture):
         return daemon
 
     def approver(self, daemon, env=None, judge=None):
-        """Jev at the stand-in unless `judge` names a model the daemon serves."""
-        judged_by = ['--judge', judge] if judge else ['--judge-url', self.judge_url]
-        key = {} if judge else {'TYPESAFE_API_KEY': 'synthetic-judge-key'}
+        """Jev at the stand-in unless `judge` names a model the daemon serves,
+        or OpenAI's Decisions API, also at the stand-in."""
+        if judge and judge.startswith('openai-decisions/'):
+            judged_by = ['--judge', judge, '--judge-url', self.judge_url]
+            key = {'OPENAI_API_KEY': 'synthetic-judge-key'}
+        else:
+            judged_by = ['--judge', judge] if judge else ['--judge-url', self.judge_url]
+            key = {} if judge else {'TYPESAFE_API_KEY': 'synthetic-judge-key'}
         process = subprocess.Popen(
             [str(self.binary), 'approver', '--store', str(self.path / 'state.sqlite'),
              '--socket', str(daemon.socket_path), *judged_by],
@@ -876,6 +892,35 @@ class AutoApproverTests(ModelFixture):
         self.assertEqual(body['state']['earlier_prompts'], [{'by': 'person', 'text': 'shell:printf safe > out'}])
         self.assertEqual(self.judge.requests.qsize(), 0)
 
+    def test_openai_decisions_judges_the_same_questions_as_predicates(self):
+        daemon = self.daemon()
+        _, lines = self.approver(daemon, judge='openai-decisions/gpt-6-luna')
+        safe = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf safe > out')['result']['turn']
+        self.assertEqual(daemon.finished(safe)['data']['status'], 'completed')
+        asked = self.judge.requests.get(timeout=5)
+        self.assertEqual((asked['path'], asked['authorization']), ('/v1/decisions', 'Bearer synthetic-judge-key'))
+        body = asked['body']
+        self.assertEqual(body['model'], 'gpt-6-luna')
+        self.assertEqual([item['role'] for item in body['input']], ['developer', 'user'])
+        self.assertEqual(len(body['questions']), 11)
+        self.assertTrue(all(q['type'] == 'predicate' for q in body['questions']))
+        state = json.loads(body['input'][1]['content'][0]['text'])
+        self.assertEqual(state['planned_calls'][0]['arguments']['command'], 'printf safe > out')
+        judged = lines.get(timeout=5)
+        self.assertEqual((judged['calls'][0]['decision'], judged['input_tokens'], judged['cached_tokens']),
+                         ('allow', 1000, 200))
+        risky_turn = daemon.request('submit', bot='Bob', request_id='b',
+                                    prompt='shell:printf DANGER')['result']['turn']
+        self.assertEqual(daemon.finished(risky_turn)['data']['status'], 'completed')
+        self.assertTrue(self.denial(daemon, risky_turn).startswith('judged risky: it deletes or overwrites'))
+        # An account out of credit fails the check at once, without waiting.
+        self.judge.statuses = ['quota']
+        broke = daemon.request('submit', bot='Bob', request_id='c', prompt='shell:printf x')['result']['turn']
+        self.assertEqual(daemon.finished(broke)['data']['status'], 'completed')
+        self.assertEqual(self.denial(daemon, broke), 'not reviewed: the check failed')
+        failed = next(line for line in iter(lambda: lines.get(timeout=5), None) if line['event'] == 'judge_failed')
+        self.assertEqual(failed['detail'], "the judge's account is out of quota")
+
     def test_a_model_the_daemon_serves_judges_without_a_jev_key(self):
         asked = queue.Queue()
         parsed = [True]
@@ -899,7 +944,7 @@ class AutoApproverTests(ModelFixture):
             env=clean_env(), capture_output=True, text=True, timeout=30)
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn('approver_name_taken', refused.stderr)
-        self.assertEqual(daemon.request('resume', bot='approver.auto')['result']['instructions'],
+        self.assertEqual(daemon.request('inspect', bot='approver.auto')['result']['instructions'],
                          'Help with the repo.')
         self.assertIn('result', daemon.request('delete', bot='approver.auto'))
         # An approver that stopped leaves its judge and a fork from mid-round:
