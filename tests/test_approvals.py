@@ -598,15 +598,16 @@ class PromptReadTests(ModelFixture):
         self.assertEqual((read['status'], read['workspace'], read['more']), ('finished', str(self.path), False))
         self.assertEqual(client.request('prompts', bot='Bob', turn=second, bytes=0)['error'], 'invalid_limit')
 
-    def test_the_approvers_key_never_reaches_a_tool(self):
-        env = {**clean_env(), 'TYPESAFE_API_KEY': 'synthetic-judge-key'}
+    def test_the_approvers_keys_never_reach_a_tool(self):
+        env = {**clean_env(), 'TYPESAFE_API_KEY': 'synthetic-judge-key', 'OPENAI_API_KEY': 'synthetic-judge-key'}
         client = Client(self.binary, self.path / 'state.sqlite', self.url, 'shell', env=env)
         self.addCleanup(client.close)
         client.request('create', bot='Bob', workspace=str(self.path))
         turn = client.request('submit', bot='Bob', request_id='a',
-                              prompt='shell:printf "${TYPESAFE_API_KEY-unset}/$AGENT_TURN" > seen')['result']['turn']
+                              prompt='shell:printf "${TYPESAFE_API_KEY-unset}${OPENAI_API_KEY-unset}/$AGENT_TURN" > seen'
+                              )['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-        self.assertEqual((self.path / 'seen').read_text(), f'unset/{turn}')
+        self.assertEqual((self.path / 'seen').read_text(), f'unsetunset/{turn}')
 
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')

@@ -1743,9 +1743,7 @@ fn whole_arguments(connection: &mut Connection, calls: &mut [Value]) -> Result<(
 /// again since.
 /// The judge's key, which only the approver holds.
 const JUDGE_KEY: &str = agent_runtime::tools::JUDGE_KEY;
-/// The Decisions API's key: OpenAI's own variable, already kept from tool
-/// shells whenever the daemon runs an OpenAI provider.
-const DECISIONS_KEY: &str = "OPENAI_API_KEY";
+const DECISIONS_KEY: &str = agent_runtime::tools::DECISIONS_KEY;
 
 /// The approver's note: a regular file no larger than a judge's whole
 /// state, opened without blocking so a FIFO cannot hold startup.

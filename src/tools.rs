@@ -1006,6 +1006,9 @@ pub enum Exit {
 
 /// The variable holding the automatic approver's model key.
 pub const JUDGE_KEY: &str = "TYPESAFE_API_KEY";
+/// The key the approver's Decisions judge reads: OpenAI's own variable, so
+/// it is withheld from tools even when no daemon provider holds it.
+pub const DECISIONS_KEY: &str = "OPENAI_API_KEY";
 
 /// `/bin/sh -c command` in the workspace, with the registry's environment and
 /// none of the credentials the daemon holds.
@@ -1026,9 +1029,10 @@ fn sh(
     process.env_remove("AGENT_PARENT_ID");
     // Likewise a set AGENT_EFFORT is this bot's own level.
     process.env_remove("AGENT_EFFORT");
-    // The automatic approver's key is for the approver alone, however the
+    // The automatic approver's keys are for the approver alone, however the
     // daemon was started.
     process.env_remove(JUDGE_KEY);
+    process.env_remove(DECISIONS_KEY);
     for (name, value) in registry.environment.iter().chain(environment) {
         process.env(name, value);
     }

@@ -706,7 +706,10 @@ daemon and the approver together, it starts the daemon with the Jev key's
 variable removed, unless a `--provider` names it as its key variable, and
 passes it only to the approver; the daemon also adds
 that variable to the set it already strips from tool environments, as it
-does for provider keys, in case it was started some other way. That is
+does for provider keys, in case it was started some other way. The
+Decisions judge's `OPENAI_API_KEY` is stripped from tool environments the
+same way, whether or not a daemon provider uses it; the daemon keeps it,
+since its own OpenAI provider may need it. That is
 all it gets. A
 tool running as the same OS user can still read it: on Linux through
 `/proc/PID/environ` of the approver, or from wherever the key is stored.
