@@ -249,6 +249,7 @@ async fn run() -> Result<(), String> {
         app.model = model.clone();
         app.turn_model = Some(model.clone());
     }
+    project::remember(&app.model);
     if let Some(project) = &project
         && options.rex
     {

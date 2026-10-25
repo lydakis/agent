@@ -77,6 +77,54 @@ async fn find(client: &Client, bot: &str) -> Result<Option<Value>, String> {
     Ok(page["bots"].get(0).filter(|b| b["name"] == bot).cloned())
 }
 
+/// Where Sonny keeps the model it last ran on.
+fn remembered_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent/sonny/model"))
+}
+
+/// The model Sonny last ran on, kept for the next folder it opens.
+pub fn remembered() -> Option<String> {
+    let text = std::fs::read_to_string(remembered_path()?).ok()?;
+    Some(text.trim().to_owned()).filter(|m| m.contains('/'))
+}
+
+pub fn remember(model: &str) {
+    if let Some(path) = remembered_path()
+        && remembered().as_deref() != Some(model)
+    {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(path, format!("{model}\n"));
+    }
+}
+
+/// The model of the agent made last, from any client: what the person
+/// chose most recently when Sonny has not run before.
+async fn newest(client: &Client) -> Result<Option<String>, String> {
+    let mut after = Value::Null;
+    let mut best: Option<(i64, String)> = None;
+    loop {
+        let page = client
+            .request("bots", json!({"after": after, "limit": 256}))
+            .await
+            .map_err(|e| e.to_string())?;
+        for bot in page["bots"].as_array().into_iter().flatten() {
+            let id = bot["bot_id"].as_i64().unwrap_or(0);
+            if best.as_ref().is_none_or(|(b, _)| id > *b)
+                && let (Some(provider), Some(model)) =
+                    (bot["provider"].as_str(), bot["model"].as_str())
+            {
+                best = Some((id, format!("{provider}/{model}")));
+            }
+        }
+        after = page["next_after"].clone();
+        if after.is_null() {
+            return Ok(best.map(|(_, model)| model));
+        }
+    }
+}
+
 async fn create(
     client: &Client,
     dir: &Path,
@@ -84,14 +132,27 @@ async fn create(
     bot: &str,
     model: Option<&str>,
 ) -> Result<(), String> {
+    let role = match agent_client::policy::profile(dir, "coordinator").map_err(|e| e.to_string())? {
+        Some(role) => role,
+        None => agent_client::policy::Profile::parse("coordinator", None, COORDINATOR),
+    };
+    // Asked for, the folder's own choice, the last Sonny ran on, then the
+    // newest agent's, so a bare `sonny` needs no flag.
+    let model = match model.map(str::to_owned).or_else(|| role.model.clone()) {
+        Some(model) => model,
+        None => match std::env::var("AGENT_MODEL").ok().or_else(remembered) {
+            Some(model) => model,
+            None => newest(client)
+                .await?
+                .ok_or("model_required: no agent has run yet; pass --model PROVIDER/MODEL once")?,
+        },
+    };
     // The app's own way, file and all, when the app is installed.
     let script = std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent/project"));
     if let Some(script) = script.filter(|s| s.is_file()) {
         let mut command = std::process::Command::new(script);
         command.arg("add").arg(dir).env("AGENT_SOCKET", socket);
-        if let Some(model) = model {
-            command.args(["--model", model]);
-        }
+        command.args(["--model", &model]);
         let out = command.output().map_err(|e| e.to_string())?;
         if !out.status.success() {
             return Err(String::from_utf8_lossy(&out.stderr).trim().to_owned());
@@ -99,15 +160,6 @@ async fn create(
         return Ok(());
     }
     // Without the app: the same role and folder policy, no project file.
-    let role = match agent_client::policy::profile(dir, "coordinator").map_err(|e| e.to_string())? {
-        Some(role) => role,
-        None => agent_client::policy::Profile::parse("coordinator", None, COORDINATOR),
-    };
-    let model = model
-        .map(str::to_owned)
-        .or_else(|| role.model.clone())
-        .or_else(|| std::env::var("AGENT_MODEL").ok())
-        .ok_or("model_required: pass --model PROVIDER/MODEL for the new project's coordinator")?;
     let memory = agent_client::policy::memory_indexes(dir).map_err(|e| e.to_string())?;
     let instructions = agent_client::policy::instructions(dir, Some(&role), &memory)
         .map_err(|e| e.to_string())?
