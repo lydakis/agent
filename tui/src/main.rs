@@ -8,6 +8,7 @@
 //! alternate screen, replies stream a line at a time, tool calls are one
 //! `• Ran …` line with a short `└` look at the result, and a status row
 //! says how long the turn has run and how to stop it.
+mod project;
 mod transcript;
 
 use agent_client::{Client, Events};
@@ -49,14 +50,16 @@ type Tui = Terminal<CrosstermBackend<std::io::Stdout>>;
 
 struct Options {
     socket: PathBuf,
-    bot: String,
+    bot: Option<String>,
     new: bool,
     model: Option<String>,
     workspace: Option<String>,
 }
 
 fn usage() -> String {
-    "usage: agent-tui [--store PATH] [--socket PATH] --bot NAME [--new --model PROVIDER/MODEL [--workspace DIR]]".into()
+    "usage: agent-tui [--store PATH] [--socket PATH] [--model PROVIDER/MODEL] [--bot NAME [--new [--workspace DIR]]]\n\
+     With no --bot, the folder's coordinator, made with --model the first time."
+        .into()
 }
 
 fn parse() -> Result<Options, String> {
@@ -86,7 +89,7 @@ fn parse() -> Result<Options, String> {
     };
     Ok(Options {
         socket,
-        bot: bot.ok_or_else(usage)?,
+        bot,
         new,
         model,
         workspace,
@@ -109,17 +112,31 @@ async fn run() -> Result<(), String> {
     let (client, mut events) = Client::connect(&options.socket)
         .await
         .map_err(|e| format!("{e}; start the daemon with `agent start`"))?;
-    if options.new {
-        create(&client, &options).await?;
-    }
+    let (name, project) = match &options.bot {
+        Some(bot) => {
+            if options.new {
+                create(&client, &options, bot).await?;
+            }
+            (bot.clone(), None)
+        }
+        None => {
+            if options.new {
+                return Err(usage());
+            }
+            let dir = std::env::current_dir().map_err(|e| e.to_string())?;
+            let lead =
+                project::open(&client, &dir, &options.socket, options.model.as_deref()).await?;
+            (lead.bot, Some(lead.project))
+        }
+    };
     let bot = client
-        .request("resume", json!({"bot": options.bot}))
+        .request("resume", json!({"bot": name}))
         .await
         .map_err(|e| e.to_string())?;
     // Everything after now arrives live; history is read from the bot's
     // items instead of replayed events, so the replay is skipped.
     client
-        .request("follow", json!({"bot": options.bot, "after": 0}))
+        .request("follow", json!({"bot": name, "after": 0}))
         .await
         .map_err(|e| e.to_string())?;
 
@@ -132,17 +149,18 @@ async fn run() -> Result<(), String> {
         },
     )
     .map_err(|e| e.to_string())?;
-    let mut app = App::new(client, &options.bot, &bot);
+    let mut app = App::new(client, &name, &bot);
+    app.project = project;
     let result = app.main(&mut terminal, &mut events).await;
     let _ = terminal.clear();
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     let _ = disable_raw_mode();
-    status_report("clear", &options.bot);
+    status_report("clear", &name);
     result
 }
 
 /// A new bot in the folder, with the instructions the app would give it.
-async fn create(client: &Client, options: &Options) -> Result<(), String> {
+async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), String> {
     let model = options
         .model
         .clone()
@@ -159,7 +177,7 @@ async fn create(client: &Client, options: &Options) -> Result<(), String> {
     client
         .request(
             "create",
-            json!({"bot": options.bot, "workspace": workspace, "model": model,
+            json!({"bot": bot, "workspace": workspace, "model": model,
                 "instructions": instructions, "tools": DEFAULT_TOOLS,
                 "request_id": unique("tui-create")}),
         )
@@ -210,6 +228,8 @@ struct Running {
 struct App {
     client: Arc<Client>,
     bot: String,
+    /// The project whose lead this is, when opened as the folder's coordinator.
+    project: Option<String>,
     workspace: String,
     model: String,
     effort: Option<String>,
@@ -243,6 +263,7 @@ impl App {
         Self {
             client,
             bot: bot.to_owned(),
+            project: None,
             workspace: record["workspace"].as_str().unwrap_or("").to_owned(),
             model,
             effort: record["effort"].as_str().map(str::to_owned),
