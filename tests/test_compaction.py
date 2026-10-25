@@ -579,8 +579,8 @@ class AnthropicThinkingBindingTests(ModelFixture):
         self.model.bind_thinking = True
         self.model.binding_errors = []
 
-    def anthropic(self, settings):
-        client = Client(self.binary, self.path / 'state.sqlite', self.url,
+    def anthropic(self, settings, url=None):
+        client = Client(self.binary, self.path / 'state.sqlite', url or self.url,
                         tools='echo,shell', provider='anthropic', family='anthropic',
                         model='synthetic-claude', key_env='ANTHROPIC_TEST_KEY',
                         env={**clean_env(), 'ANTHROPIC_TEST_KEY': 'synthetic-anthropic-key'}, settings=settings)
@@ -663,6 +663,44 @@ class AnthropicThinkingBindingTests(ModelFixture):
         self.assertEqual([m['role'] for m in slid['messages'][at:at + 2]], ['user', 'user'])
         self.assertEqual(texts[at + 1], 'after')
         self.assertFalse(any(self.thinking(m) for m in slid['messages'][:at + 2]))
+
+    def assistants(self, request):
+        return [self.thinking(m) for m in request['messages'] if m['role'] == 'assistant']
+
+    def test_a_turn_on_another_model_replays_no_thinking_it_did_not_write(self):
+        client = self.anthropic(settings={'context_bytes': 65536})
+        client.request('create', bot='Bob', workspace=str(self.path), effort='low')
+        self.turn(client, 'Bob', 0, 'first')
+        self.turn(client, 'Bob', 1, 'second')
+        self.requests()
+        other = client.request('submit', bot='Bob', request_id='2', prompt='other',
+                               model='anthropic/synthetic-claude-2')['result']['turn']
+        self.assertEqual(client.finished(other)['data']['status'], 'completed')
+        # Back on the bot's model, which did not write the answer before.
+        self.turn(client, 'Bob', 3, 'back')
+        self.turn(client, 'Bob', 4, 'again')
+        sent = self.requests()
+        self.assertEqual(self.model.binding_errors, [])
+        self.assertEqual([r['model'] for r in sent], ['synthetic-claude-2', 'synthetic-claude', 'synthetic-claude'])
+        # Each model is sent only the thinking it wrote since it took over.
+        self.assertEqual([self.assistants(r) for r in sent], [[0, 0], [0, 0, 0], [0, 0, 0, 1]])
+
+    def test_a_provider_bound_to_another_endpoint_replays_no_thinking(self):
+        client = self.anthropic(settings={'context_bytes': 65536})
+        client.request('create', bot='Bob', workspace=str(self.path), effort='low')
+        self.turn(client, 'Bob', 0, 'first')
+        self.turn(client, 'Bob', 1, 'second')
+        client.close()
+        self.requests()
+        # The same provider name, model and conversation on an endpoint that
+        # holds other keys.
+        client = self.anthropic(settings={'context_bytes': 65536},
+                                url=self.url.replace('127.0.0.1', 'localhost'))
+        self.turn(client, 'Bob', 2, 'moved')
+        self.turn(client, 'Bob', 3, 'again')
+        sent = self.requests()
+        self.assertEqual(self.model.binding_errors, [])
+        self.assertEqual([self.assistants(r) for r in sent], [[0, 0], [0, 0, 1]])
 
     def test_thinking_the_provider_drops_is_reported_live(self):
         client = self.anthropic(None)

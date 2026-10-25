@@ -600,13 +600,19 @@ an older prefix fell from 21 to 4.
 Newer Claude models bind each replayed thinking block to the exact
 conversation before it (system prompt, tools, and earlier messages) and, for
 accounts created on or after 2026-08-31, reject a block whose earlier context
-changed. Anthropic requests therefore send a block only while the context in
-front of the window is the one it was written under. Each request
-fingerprints that context (the encoded pinned prefix and the window's first
-item); when the fingerprint differs from the bot's last, the window slid or a
-compaction or note landed, and
+changed. A signature is also only valid for the model that wrote it, on the
+endpoint that holds its key. Anthropic requests therefore send a block only
+while the context in front of the window, the model, and the endpoint are the
+ones it was written under. Each request fingerprints all three (the encoded
+pinned prefix, the window's first item, the provider's URL, and the model);
+when the fingerprint differs from the bot's last, the window slid, a
+compaction or note landed, a turn or fork runs on another model, or the
+provider name now points at another endpoint, and
 every node written before that request is sent without its thinking from
-then on. Removing a leading run of blocks is allowed; later blocks keep
+then on. Other harnesses do the same by recording the producer on each
+message (pi-mono d5b3de2 `transform-messages.ts`, opencode 1743d1a
+`to-llm-message.ts`); here every node above the bot's strip was written by
+requests under the current fingerprint, so the bot's record says it once. Removing a leading run of blocks is allowed; later blocks keep
 theirs. A summary sent as a copy of the bot's call replays what that call
 would, bound the same way; a summary request of its own carries no
 thinking, since its instructions differ. Each node records at write time how many bytes its thinking takes,

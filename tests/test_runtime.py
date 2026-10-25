@@ -441,10 +441,11 @@ class Model(http.server.BaseHTTPRequestHandler):
             pass
 
 
-def thinking_binding(request, before):
+def thinking_binding(request, before, host):
     """What a synthetic signature binds to, as newer Claude models do: the
-    system prompt, the tool set, and every message before the block, minus
-    earlier thinking blocks and cache markers."""
+    model, the endpoint that holds the key (here the Host header), the system
+    prompt, the tool set, and every message before the block, minus earlier
+    thinking blocks and cache markers."""
     def plain(value):
         if isinstance(value, dict):
             return {k: plain(v) for k, v in value.items() if k != 'cache_control'}
@@ -453,7 +454,8 @@ def thinking_binding(request, before):
         return value
     messages = [{**m, 'content': [b for b in m['content'] if b['type'] not in ('thinking', 'redacted_thinking')]}
                 for m in before]
-    bound = [plain(request.get('system')), sorted(t['name'] for t in request.get('tools', [])), plain(messages)]
+    bound = [request['model'], host, plain(request.get('system')),
+             sorted(t['name'] for t in request.get('tools', [])), plain(messages)]
     return 'sig:' + hashlib.sha256(json.dumps(bound, sort_keys=True).encode()).hexdigest()[:16]
 
 
@@ -488,7 +490,7 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                 assert request['thinking']['block_binding'] == {'prefix_mismatch_behavior': 'drop_block'}
             # A cache refresh is the same request with no output and no stream.
             warm = request['max_tokens'] == 0
-            assert request['model'] == 'synthetic-claude' and request['stream'] != warm
+            assert request['model'] in ('synthetic-claude', 'synthetic-claude-2') and request['stream'] != warm
             cache = getattr(self.server, 'cache_control', {'type': 'ephemeral'})
             for block in request.get('system', []):
                 assert block['text'] and block['cache_control'] == cache
@@ -597,7 +599,7 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                 for index, message in enumerate(request['messages']):
                     for block in message['content']:
                         if block['type'] == 'thinking' and block['signature'] != thinking_binding(
-                                request, request['messages'][:index]):
+                                request, request['messages'][:index], self.headers.get('Host')):
                             self.server.binding_errors.append(index)
                             body = json.dumps({'type': 'error', 'error': {'type': 'invalid_request_error',
                                 'message': f'messages.{index}: The block is bound to a different conversation.'}}).encode()
@@ -607,7 +609,7 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                             self.wfile.write(body)
                             self.wfile.flush()
                             return
-                signature = thinking_binding(request, request['messages'])
+                signature = thinking_binding(request, request['messages'], self.headers.get('Host'))
             blocks = [{'type': 'thinking', 'thinking': 'plan', 'signature': signature}]
             prompt = next((b['text'] for m in request['messages'] if m['role'] == 'user'
                            for b in m['content'] if b['type'] == 'text' and b['text'].startswith('long:')), '')
