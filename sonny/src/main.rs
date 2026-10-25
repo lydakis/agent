@@ -455,7 +455,11 @@ impl Fleet {
             options.socket.to_string_lossy().into_owned(),
             "--no-sound".into(),
         ];
-        let mut note = format!("tasks open in Rex session {project}");
+        let mut note = if rex.here {
+            "tasks open as tabs in this Rex session".to_owned()
+        } else {
+            format!("tasks open in Rex session {project}")
+        };
         if rex::install_skill(&bin).is_some() {
             note.push_str(" · rex-windows skill updated");
         }

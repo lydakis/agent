@@ -317,7 +317,21 @@ fn agent(words: &[String], stdin: Option<&str>, output: &str, failed: bool) -> O
             }
         }
         "ls" => {
-            said.verb = "Listed agents".into();
+            said.verb = match args.value(&["--name"]) {
+                // The project's own, by the lead's name or spelled out.
+                Some(pattern) if pattern.starts_with("${AGENT_BOT%%.*}") => {
+                    "Listed this project's agents".into()
+                }
+                Some("*.lead") => "Listed every project's lead".into(),
+                Some(pattern) => match pattern.strip_suffix(".*") {
+                    Some(project) if !project.contains(['*', '?', '[']) => {
+                        format!("Listed {project}'s agents")
+                    }
+                    _ => format!("Listed agents named {pattern}"),
+                },
+                None if args.has("--active") => "Listed running agents".into(),
+                None => "Listed agents".into(),
+            };
             // One agent a row, as JSON or as `--pretty` prints it.
             let rows: Vec<(String, String)> = match reply
                 .as_ref()
@@ -637,6 +651,25 @@ Keep the rest.'"#,
         );
         assert_eq!(text(&said.under[0]), "Add a test.");
         assert!(!said.failed);
+    }
+
+    #[test]
+    fn a_listing_says_whose_agents_it_lists() {
+        let verb = |command: &str| said(command, "[]", false).unwrap().verb;
+        assert_eq!(
+            verb(r#""$AGENT_BIN" ls --name "${AGENT_BOT%%.*}.*" --pretty"#),
+            "Listed this project's agents"
+        );
+        assert_eq!(
+            verb(r#""$AGENT_BIN" ls --name 'calc.*'"#),
+            "Listed calc's agents"
+        );
+        assert_eq!(
+            verb(r#""$AGENT_BIN" ls --name '*.lead'"#),
+            "Listed every project's lead"
+        );
+        assert_eq!(verb(r#""$AGENT_BIN" ls --active"#), "Listed running agents");
+        assert_eq!(verb(r#""$AGENT_BIN" ls"#), "Listed agents");
     }
 
     #[test]

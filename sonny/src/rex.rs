@@ -34,8 +34,20 @@ pub struct Rex {
     host: Vec<String>,
     pub session: String,
     pub label: String,
+    /// Whether the session is the one Sonny runs in.
+    pub here: bool,
     /// Each task's block, by bot name.
     blocks: HashMap<String, String>,
+}
+
+/// A name Rex gave a session made without one: two lowercase words, as
+/// `crisp-oasis`. One the person chose is kept.
+fn made_up(label: &str) -> bool {
+    let words: Vec<&str> = label.split('-').collect();
+    words.len() == 2
+        && words
+            .iter()
+            .all(|w| !w.is_empty() && w.bytes().all(|b| b.is_ascii_lowercase()))
 }
 
 /// Where `sonny show` puts a task.
@@ -75,7 +87,10 @@ impl Rex {
         serde_json::from_slice(&out.stdout).map_err(|e| format!("rex {}: {e}", args[0]))
     }
 
-    /// The project's session, made when there is none.
+    /// The project's session: the one Sonny was started in, so the lead
+    /// stays where the person opened it and tasks open beside it, renamed
+    /// to the project when Rex made its name up; outside Rex, the session
+    /// labelled with the project's name, made when there is none.
     pub fn open(bin: PathBuf, host: Option<&str>, label: &str) -> Result<Self, String> {
         let mut rex = Self {
             bin,
@@ -84,19 +99,38 @@ impl Rex {
                 .unwrap_or_default(),
             session: String::new(),
             label: label.to_owned(),
+            here: false,
             blocks: HashMap::new(),
         };
         let listed = rex.call(&["ls", "--json", "--autostart=false"]);
-        let found = listed.ok().and_then(|ls| {
-            ls["sessions"]
-                .as_array()?
-                .iter()
-                .find(|s| s["label"] == label)
-                .and_then(|s| s["session_id"].as_str().map(str::to_owned))
-        });
-        rex.session = match found {
-            Some(id) => id,
-            None => rex.call(&["new", label, "--json"])?["session_id"]
+        let sessions: Vec<(String, String)> = listed
+            .ok()
+            .and_then(|ls| ls["sessions"].as_array().cloned())
+            .into_iter()
+            .flatten()
+            .filter_map(|s| {
+                Some((
+                    s["session_id"].as_str()?.to_owned(),
+                    s["label"].as_str().unwrap_or("").to_owned(),
+                ))
+            })
+            .collect();
+        // Rex names the block's session `session:ID`; `ls` gives the ID.
+        let mine = std::env::var("REX_SESSION").unwrap_or_default();
+        let current = sessions
+            .iter()
+            .find(|(id, _)| host.is_none() && !mine.is_empty() && mine.ends_with(id.as_str()));
+        let found = sessions.iter().find(|(_, l)| l == label);
+        rex.session = match (current, found) {
+            (Some((id, now)), found) => {
+                if found.is_none() && made_up(now) {
+                    let _ = rex.call(&["session", "rename", id, label]);
+                }
+                rex.here = true;
+                id.clone()
+            }
+            (None, Some((id, _))) => id.clone(),
+            (None, None) => rex.call(&["new", label, "--json"])?["session_id"]
                 .as_str()
                 .ok_or("rex new: no session_id")?
                 .to_owned(),
@@ -344,4 +378,15 @@ fn install(name: &str, text: &str) -> Option<PathBuf> {
     std::fs::create_dir_all(&dir).ok()?;
     std::fs::write(&path, text).ok()?;
     Some(path)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn only_a_name_rex_made_up_is_replaced() {
+        assert!(super::made_up("crisp-oasis"));
+        assert!(!super::made_up("beam"));
+        assert!(!super::made_up("my-work-stuff"));
+        assert!(!super::made_up("Beam-dev"));
+    }
 }
