@@ -3763,6 +3763,7 @@ version = "0.2.0"
 dependencies = [
  "agent-client",
  "base64 0.22.1",
+ "libc",
  "ratatui",
  "serde_json",
  "similar",

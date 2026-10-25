@@ -9,12 +9,38 @@ use ratatui::{
 };
 use similar::{ChangeTag, TextDiff};
 
-const REMOVED: Color = Color::Rgb(232, 98, 98);
-const ADDED: Color = Color::Rgb(94, 201, 120);
-const REMOVED_LINE: Color = Color::Rgb(58, 26, 30);
-const ADDED_LINE: Color = Color::Rgb(22, 50, 32);
-const REMOVED_WORD: Color = Color::Rgb(120, 40, 48);
-const ADDED_WORD: Color = Color::Rgb(36, 100, 56);
+/// The bar, the line's tint and the changed words' tint, for removed
+/// and added lines, on the terminal's background.
+struct Palette {
+    removed: Color,
+    added: Color,
+    removed_line: Color,
+    added_line: Color,
+    removed_word: Color,
+    added_word: Color,
+}
+
+const DARK: Palette = Palette {
+    removed: Color::Rgb(232, 98, 98),
+    added: Color::Rgb(94, 201, 120),
+    removed_line: Color::Rgb(58, 26, 30),
+    added_line: Color::Rgb(22, 50, 32),
+    removed_word: Color::Rgb(120, 40, 48),
+    added_word: Color::Rgb(36, 100, 56),
+};
+
+const LIGHT: Palette = Palette {
+    removed: Color::Rgb(207, 34, 46),
+    added: Color::Rgb(26, 127, 55),
+    removed_line: Color::Rgb(255, 235, 233),
+    added_line: Color::Rgb(230, 255, 236),
+    removed_word: Color::Rgb(255, 196, 192),
+    added_word: Color::Rgb(171, 242, 188),
+};
+
+fn palette() -> &'static Palette {
+    if crate::theme::light() { &LIGHT } else { &DARK }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
@@ -26,9 +52,9 @@ enum Kind {
 /// `-N +M`, coloured, for a header.
 pub fn counts(removed: usize, added: usize) -> Vec<Span<'static>> {
     vec![
-        Span::raw(format!("-{removed}")).fg(REMOVED),
+        Span::raw(format!("-{removed}")).fg(palette().removed),
         Span::raw(" "),
-        Span::raw(format!("+{added}")).fg(ADDED),
+        Span::raw(format!("+{added}")).fg(palette().added),
     ]
 }
 
@@ -42,6 +68,7 @@ fn row(
     width: usize,
 ) -> Vec<Line<'static>> {
     let number = number.map_or(" ".repeat(digits), |n| format!("{n:>digits$}"));
+    let p = palette();
     let (bar, line, word) = match kind {
         Kind::Context => (
             Span::raw("  "),
@@ -49,14 +76,14 @@ fn row(
             None,
         ),
         Kind::Removed => (
-            Span::raw("▎ ").fg(REMOVED),
-            Style::new().bg(REMOVED_LINE),
-            Some(Style::new().bg(REMOVED_WORD)),
+            Span::raw("▎ ").fg(p.removed),
+            Style::new().bg(p.removed_line),
+            Some(Style::new().bg(p.removed_word)),
         ),
         Kind::Added => (
-            Span::raw("▎ ").fg(ADDED),
-            Style::new().bg(ADDED_LINE),
-            Some(Style::new().bg(ADDED_WORD)),
+            Span::raw("▎ ").fg(p.added),
+            Style::new().bg(p.added_line),
+            Some(Style::new().bg(p.added_word)),
         ),
     };
     let spans: Vec<Span<'static>> = pieces
@@ -345,7 +372,7 @@ mod tests {
         let strong: Vec<&str> = lines[1]
             .spans
             .iter()
-            .filter(|s| s.style.bg == Some(REMOVED_WORD))
+            .filter(|s| s.style.bg == Some(DARK.removed_word))
             .map(|s| s.content.as_ref())
             .collect();
         assert!(strong.concat().contains("(len(values) - 1)"), "{strong:?}");

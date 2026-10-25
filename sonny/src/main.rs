@@ -15,6 +15,7 @@ mod rex;
 mod shell;
 mod sound;
 mod status;
+mod theme;
 mod transcript;
 
 use agent_client::{Client, Events};
@@ -233,6 +234,7 @@ async fn run() -> Result<(), String> {
     caught_up(&mut events).await;
 
     enable_raw_mode().map_err(|e| e.to_string())?;
+    theme::detect();
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
     let mut terminal = Terminal::with_options(
         CrosstermBackend::new(std::io::stdout()),
