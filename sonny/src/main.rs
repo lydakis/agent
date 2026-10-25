@@ -414,10 +414,9 @@ struct Running {
 }
 
 /// The slash commands, as the menu lists them: name and what it does.
-const COMMANDS: [(&str, &str); 4] = [
+/// `/agents` and `/ps` also open `/status`, unlisted.
+const COMMANDS: [(&str, &str); 2] = [
     ("/status", "every agent in this project, live"),
-    ("/agents", "the same as /status"),
-    ("/ps", "the same as /status"),
     ("/quit", "leave Sonny; the agents keep working"),
 ];
 
@@ -1416,7 +1415,7 @@ impl App {
             .collect();
         for item in items {
             match (item["type"].as_str(), item["role"].as_str()) {
-                (_, Some("assistant")) => return first_line(&text(&item)),
+                (_, Some("assistant")) => return status::plain_line(&text(&item)),
                 (Some("function_call"), _) => {
                     let arguments: Value = item["arguments"]
                         .as_str()
@@ -1691,13 +1690,12 @@ impl App {
                         let name = format!("{name:<wide$}");
                         if i == pick {
                             Line::from(vec![
-                                Span::raw("› ").fg(Color::Cyan),
-                                Span::raw(name).fg(Color::Cyan).bold(),
-                                Span::raw(format!("  {about}")),
+                                Span::raw("  "),
+                                Span::raw(format!(" {name}  {about} ")).reversed(),
                             ])
                         } else {
                             Line::from(vec![
-                                Span::raw("  "),
+                                Span::raw("   "),
                                 Span::raw(name),
                                 Span::raw(format!("  {about}")).dim(),
                             ])

@@ -33,6 +33,28 @@ pub fn mark(state: &str) -> Span<'static> {
     }
 }
 
+/// A reply's first line of prose: fenced blocks and headings skipped,
+/// list markers and emphasis left out.
+pub fn plain_line(text: &str) -> String {
+    let mut fence = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            fence = !fence;
+            continue;
+        }
+        if fence || trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let trimmed = ["- ", "* ", "+ ", "> "]
+            .iter()
+            .find_map(|m| trimmed.strip_prefix(m))
+            .unwrap_or(trimmed);
+        return trimmed.replace("**", "").replace('`', "");
+    }
+    String::new()
+}
+
 pub fn card(project: &str, rows: &[Row], width: usize) -> Vec<Line<'static>> {
     let count = |state: &str| rows.iter().filter(|r| r.state == state).count();
     let mut head = format!(
@@ -96,6 +118,14 @@ pub fn card(project: &str, rows: &[Row], width: usize) -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_latest_step_reads_as_prose() {
+        assert_eq!(
+            plain_line("```mermaid\nflowchart LR\n```\n## Done\n- Added `x` on **line 2**"),
+            "Added x on line 2"
+        );
+    }
 
     #[test]
     fn the_card_counts_what_is_working_and_what_needs_the_person() {
