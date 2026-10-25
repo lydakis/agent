@@ -660,9 +660,9 @@ pub fn tool(
     }
     let (verb, what) = match name {
         "shell" => ("Ran", field("command")),
-        "read" => ("Read", field("path")),
-        "write" => ("Wrote", field("path")),
-        "edit" => ("Edited", field("path")),
+        "read" => ("Read", shown(&field("path"), workspace)),
+        "write" => ("Wrote", shown(&field("path"), workspace)),
+        "edit" => ("Edited", shown(&field("path"), workspace)),
         "wait" => (
             "Waited for",
             arguments["handles"]
@@ -891,11 +891,28 @@ fn diff(arguments: &Value, workspace: &str) -> crate::diff::Edit {
 }
 
 /// The rule under a finished turn: how it ended, how long it took, what it cost.
+/// A path as the person would say it: inside the bot's folder, from
+/// there (macOS's /tmp is /private/tmp, either way round); else from ~.
+fn shown(path: &str, workspace: &str) -> String {
+    let bare = |p: &str| p.strip_prefix("/private").unwrap_or(p).to_owned();
+    let (path, workspace) = (bare(path), bare(workspace.trim_end_matches('/')));
+    if !workspace.is_empty()
+        && let Some(inside) = path.strip_prefix(&format!("{workspace}/"))
+    {
+        return inside.to_owned();
+    }
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && path.starts_with(&format!("{home}/")) => {
+            format!("~{}", &path[home.len()..])
+        }
+        _ => path,
+    }
+}
+
 pub fn finished(
     status: &str,
     detail: &str,
     seconds: Option<u64>,
-    usage: (u64, u64, u64),
     width: usize,
 ) -> Line<'static> {
     let mut label = match status {
@@ -905,15 +922,6 @@ pub fn finished(
     };
     if let Some(seconds) = seconds {
         label.push_str(&format!(" for {}", elapsed(seconds)));
-    }
-    let (input, output, cached) = usage;
-    if input + output > 0 {
-        label.push_str(&format!(
-            " · {} in ({} cached) · {} out",
-            tokens(input),
-            tokens(cached),
-            tokens(output)
-        ));
     }
     if !detail.is_empty() {
         label.push_str(&format!(" · {detail}"));

@@ -14,8 +14,11 @@ use std::{
 
 /// The most rows a picture takes.
 const ROWS: u32 = 30;
-/// Drawn at twice the cell size, so it is sharp on a Retina screen.
-const SCALE: u32 = 2;
+/// A cell this tall or more is in a Retina screen's own pixels, and the
+/// image is drawn at its size; a shorter one (8×16 is what Rex answers
+/// before it lays a block out) is drawn at twice it, to stay sharp. A
+/// picture twice as large as it needs to be is four times the data.
+const RETINA_CELL: u32 = 24;
 
 /// The diacritics that number a placeholder's row and column, from the
 /// Kitty protocol's table (rowcolumn-diacritics.txt), first 64 of 297.
@@ -42,6 +45,11 @@ fn fonts() -> Arc<usvg::fontdb::Database> {
             Arc::new(db)
         })
         .clone()
+}
+
+/// The system fonts read now, off the thread that draws.
+pub fn preload() {
+    fonts();
 }
 
 /// A new image id, distinct from other Sonnys' in the same terminal, and
@@ -72,7 +80,8 @@ pub fn render(text: &str, width: usize) -> Result<(Vec<u8>, u32, u32), String> {
     let size = tree.size();
     let (cell_w, cell_h) = crate::term::cell();
     let (cols, rows) = fit(size.width(), size.height(), (cell_w, cell_h), width);
-    let (px_w, px_h) = (cols * cell_w * SCALE, rows * cell_h * SCALE);
+    let up = if cell_h >= RETINA_CELL { 1 } else { 2 };
+    let (px_w, px_h) = (cols * cell_w * up, rows * cell_h * up);
     let mut pixmap = tiny_skia::Pixmap::new(px_w, px_h).ok_or("image too large")?;
     let scale = (px_w as f32 / size.width()).min(px_h as f32 / size.height());
     let (dx, dy) = (

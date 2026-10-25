@@ -60,6 +60,7 @@ const HISTORY_ITEMS: u64 = 200;
 
 type Tui = Terminal<CrosstermBackend<std::io::Stdout>>;
 
+#[derive(Clone)]
 struct Options {
     store: PathBuf,
     socket: PathBuf,
@@ -242,7 +243,9 @@ fn parse() -> Result<Options, String> {
     })
 }
 
-#[tokio::main(flavor = "current_thread")]
+// Two threads, so the daemon's events are read while a picture is drawn:
+// a reader that stops is dropped by the daemon as lagging.
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> std::process::ExitCode {
     match run().await {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -258,6 +261,8 @@ async fn run() -> Result<(), String> {
         return show();
     }
     let options = parse()?;
+    // Fonts are read before the first picture needs them.
+    std::thread::spawn(image::preload);
     let (client, mut events) = connect(&options).await?;
     let (name, project) = match &options.bot {
         Some(bot) => {
@@ -304,7 +309,7 @@ async fn run() -> Result<(), String> {
         },
     )
     .map_err(|e| e.to_string())?;
-    let mut app = App::new(client, &name, &bot);
+    let mut app = App::new(client, &name, &bot, options.clone());
     app.sounds = sound::Sounds::new(options.sound);
     // A bot keeps the model it was made with; --model runs this window's
     // turns on another.
@@ -434,9 +439,9 @@ struct Running {
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, unlisted.
 const COMMANDS: [(&str, &str); 3] = [
-    ("/status", "every agent in this project, live"),
-    ("/open", "the last HTML page in a reply, in your browser"),
-    ("/quit", "leave Sonny; the agents keep working"),
+    ("/status", "this project's agents"),
+    ("/open", "the last HTML page, in your browser"),
+    ("/quit", "the agents keep working"),
 ];
 
 /// `/status` on its own screen, its timers ticking and its rows read
@@ -467,7 +472,6 @@ struct App {
     /// Whether the reply now ending arrived as deltas.
     streamed: bool,
     running: Option<Running>,
-    usage: (u64, u64, u64),
     calls: HashMap<String, (String, Value)>,
     /// Calls waiting on the person, as `approvals` lists them.
     approvals: Vec<Value>,
@@ -492,6 +496,12 @@ struct App {
     said: String,
     /// What a retried call will stream again, not to be shown twice.
     replay: Option<String>,
+    /// How to reach the daemon again when the connection drops.
+    options: Options,
+    /// The lead's connection dropped.
+    down: bool,
+    /// When to connect again, while it or the fleet's is down.
+    retry: Option<Instant>,
 }
 
 /// The lead's tasks, laid out in the project's Rex session: a window for
@@ -501,6 +511,9 @@ struct Fleet {
     rex: rex::Rex,
     _client: Arc<Client>,
     events: Events,
+    socket: PathBuf,
+    /// The connection dropped; it is made again with the lead's.
+    down: bool,
     live: bool,
     project: String,
     lead: String,
@@ -537,24 +550,21 @@ impl Fleet {
             options.socket.to_string_lossy().into_owned(),
             "--no-sound".into(),
         ];
-        let mut note = if rex.here {
-            "tasks open as tabs in this Rex session".to_owned()
-        } else {
-            format!("tasks open in Rex session {project}")
-        };
-        if rex::install_skill(&bin).is_some() {
-            note.push_str(" · rex-windows skill updated");
-        }
+        // Said only when the tasks go somewhere this pane is not.
+        let note = (!rex.here).then(|| format!("tasks open in Rex session {project}"));
+        rex::install_skill(&bin);
         let mut fleet = Self {
             rex,
             _client: client.clone(),
             events,
+            socket: options.socket.clone(),
+            down: false,
             live: true,
             project: project.to_owned(),
             lead: lead.to_owned(),
             lineage: [lead.to_owned()].into(),
             command,
-            note: Some(note),
+            note,
             doing: HashMap::new(),
             named: HashMap::new(),
             alerts: Vec::new(),
@@ -660,6 +670,26 @@ impl Fleet {
         }
     }
 
+    /// Follow every bot again on a new connection; what changed while
+    /// away shows as the next events come.
+    async fn reattach(&mut self) -> bool {
+        let Ok((client, mut events)) = Client::connect(&self.socket).await else {
+            return false;
+        };
+        if client
+            .request("follow", json!({"bot": "*", "after": 0}))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        caught_up(&mut events).await;
+        self._client = client;
+        self.events = events;
+        self.down = false;
+        true
+    }
+
     /// What the event did to the layout, as a line for the lead's view.
     fn event(&mut self, event: &Value) -> Option<String> {
         let kind = event["event"].as_str().unwrap_or("");
@@ -705,8 +735,8 @@ impl Fleet {
                 None
             }
             "accepted" if bot != self.lead && self.lineage.contains(bot) => match self.show(bot) {
-                Ok(true) => Some(format!("{bot} is in Rex ({})", self.rex.label)),
-                Ok(false) => None,
+                Ok(true) if !self.rex.here => Some(format!("{bot} is in Rex ({})", self.rex.label)),
+                Ok(_) => None,
                 Err(error) => Some(error),
             },
             "deleted" => {
@@ -721,7 +751,7 @@ impl Fleet {
 }
 
 impl App {
-    fn new(client: Arc<Client>, bot: &str, record: &Value) -> Self {
+    fn new(client: Arc<Client>, bot: &str, record: &Value, options: Options) -> Self {
         let model = format!(
             "{}/{}",
             record["provider"].as_str().unwrap_or("?"),
@@ -746,7 +776,6 @@ impl App {
                 started: Instant::now(),
                 phase: "Working".into(),
             }),
-            usage: (0, 0, 0),
             calls: HashMap::new(),
             approvals: Vec::new(),
             following: true,
@@ -763,6 +792,9 @@ impl App {
             sounds: sound::Sounds::new(false),
             said: String::new(),
             replay: None,
+            options,
+            down: false,
+            retry: None,
         }
     }
 
@@ -821,20 +853,24 @@ impl App {
                 return Ok(());
             }
             tokio::select! {
-                event = events.recv() => match event {
+                event = events.recv(), if !self.down => match event {
                     Some(event) => self.daemon(event).await,
-                    None => {
-                        self.notice = Some("the daemon hung up".into());
-                        self.running = None;
-                    }
+                    None => self.dropped(),
                 },
                 Some(key) = keys.recv() => self.key(key).await,
-                Some(event) = async {
+                event = async {
                     match &mut self.fleet {
-                        Some(fleet) => fleet.events.recv().await,
-                        None => std::future::pending().await,
+                        Some(fleet) if !fleet.down => fleet.events.recv().await,
+                        _ => std::future::pending().await,
                     }
                 } => {
+                    let Some(event) = event else {
+                        if let Some(fleet) = &mut self.fleet {
+                            fleet.down = true;
+                        }
+                        self.retry.get_or_insert_with(Instant::now);
+                        continue;
+                    };
                     let said = self.fleet.as_mut().and_then(|fleet| fleet.event(&event));
                     let alerts = self
                         .fleet
@@ -862,7 +898,95 @@ impl App {
             {
                 self.reread().await;
             }
+            if self.retry.is_some_and(|at| at <= Instant::now()) {
+                self.reattach(events).await;
+            }
         }
+    }
+
+    /// The connection is gone: the daemon drops a reader that falls
+    /// behind, or it stopped. Sonny connects again; a reply cut off
+    /// mid-stream is drawn whole from the bot's items once back.
+    fn dropped(&mut self) {
+        self.live = None;
+        self.streamed = false;
+        self.said.clear();
+        self.replay = None;
+        self.notice = Some("reconnecting to the daemon".into());
+        self.down = true;
+        self.retry.get_or_insert_with(Instant::now);
+    }
+
+    /// Connect again, starting the daemon if it stopped, and catch up on
+    /// what happened meanwhile: the bot's new items, and a turn that ended
+    /// or began. Tried again every two seconds until it works.
+    async fn reattach(&mut self, events: &mut Events) {
+        let lead = async {
+            let (client, mut fresh) = connect(&self.options).await?;
+            let record = client
+                .request("resume", json!({"bot": self.bot}))
+                .await
+                .map_err(|e| e.to_string())?;
+            client
+                .request("follow", json!({"bot": self.bot, "after": 0}))
+                .await
+                .map_err(|e| e.to_string())?;
+            caught_up(&mut fresh).await;
+            Ok::<_, String>((client, fresh, record))
+        };
+        if self.down {
+            let Ok((client, fresh, record)) = lead.await else {
+                self.retry = Some(Instant::now() + Duration::from_secs(2));
+                return;
+            };
+            self.client = client;
+            *events = fresh;
+            self.down = false;
+            self.notice = None;
+            self.tokens_used = record["tokens_used"].as_u64().unwrap_or(self.tokens_used);
+            self.history_after(self.seen_node).await;
+            let now = record["running_turn"].as_i64();
+            // A turn that ended while away ends here as its event would have.
+            if let Some(turn) = self.running.as_ref().map(|r| r.turn)
+                && now != Some(turn)
+            {
+                let page = self
+                    .client
+                    .request("turns", json!({"bot": self.bot, "newest": true, "limit": 8}))
+                    .await
+                    .unwrap_or_default();
+                let row = page["turns"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|row| row["turn"].as_i64() == Some(turn))
+                    .cloned()
+                    .unwrap_or_default();
+                let status = row["status"].as_str().unwrap_or("unknown");
+                let ended = json!({"event": "turn_finished", "bot": self.bot,
+                    "turn": turn, "data": {"status": status}});
+                self.daemon(ended).await;
+            }
+            if self.running.is_none()
+                && let Some(turn) = now
+            {
+                self.running = Some(Running {
+                    turn,
+                    started: Instant::now(),
+                    phase: "Working".into(),
+                });
+                status_report("working", &self.bot);
+            }
+            self.approvals_for(self.running.as_ref().map(|r| r.turn)).await;
+        }
+        if let Some(fleet) = &mut self.fleet
+            && fleet.down
+            && !fleet.reattach().await
+        {
+            self.retry = Some(Instant::now() + Duration::from_secs(2));
+            return;
+        }
+        self.retry = None;
     }
 
     /// Commit a finished cell, a blank line apart from the one before.
@@ -896,6 +1020,12 @@ impl App {
 
     /// The bot's latest items, written as the transcript would have shown them.
     async fn history(&mut self) {
+        self.history_after(0).await;
+    }
+
+    /// The bot's items after `after`, newest [`HISTORY_ITEMS`] at most,
+    /// drawn as they would have been live.
+    async fn history_after(&mut self, after: i64) {
         let Ok(page) = self
             .client
             .request(
@@ -911,9 +1041,10 @@ impl App {
             .into_iter()
             .flatten()
             .filter_map(|n| n["node"].as_i64())
+            .filter(|node| *node > after)
             .collect();
         nodes.reverse();
-        self.seen_node = nodes.last().copied().unwrap_or(0);
+        self.seen_node = nodes.last().copied().unwrap_or(self.seen_node);
         let mut calls: HashMap<String, (String, Value)> = HashMap::new();
         for chunk in nodes.chunks(100) {
             for item in self.items(chunk).await {
@@ -955,15 +1086,6 @@ impl App {
                     _ => {}
                 }
             }
-        }
-        if self.any_history {
-            self.pending.push(Line::default());
-            self.pending.push(
-                Line::from(format!("─ attached to {} ", self.bot))
-                    .dim()
-                    .patch_style(Style::new()),
-            );
-            self.any_history = true;
         }
     }
 
@@ -1028,7 +1150,6 @@ impl App {
                 self.end_live();
                 self.said.clear();
                 self.replay = None;
-                self.usage = (0, 0, 0);
                 self.running = Some(Running {
                     turn: turn.unwrap_or(0),
                     started: Instant::now(),
@@ -1210,9 +1331,6 @@ impl App {
                 }
             }
             "usage" => {
-                self.usage.0 += data["input_tokens"].as_u64().unwrap_or(0);
-                self.usage.1 += data["output_tokens"].as_u64().unwrap_or(0);
-                self.usage.2 += data["cached_input_tokens"].as_u64().unwrap_or(0);
                 self.tokens_used += data["input_tokens"].as_u64().unwrap_or(0)
                     + data["output_tokens"].as_u64().unwrap_or(0);
             }
@@ -1224,7 +1342,7 @@ impl App {
                 let status = data["status"].as_str().unwrap_or("unknown");
                 let detail = data["error"].as_str().unwrap_or("");
                 let seconds = self.running.take().map(|r| r.started.elapsed().as_secs());
-                let line = transcript::finished(status, detail, seconds, self.usage, self.width);
+                let line = transcript::finished(status, detail, seconds, self.width);
                 self.commit(vec![line]);
                 self.approvals.clear();
                 self.notice = None;
@@ -1254,7 +1372,6 @@ impl App {
                 self.notice = Some(format!("{} was deleted", self.bot));
                 self.running = None;
             }
-            "follow_lagged" => self.notice = Some("fell behind the daemon; reattach".into()),
             _ => {}
         }
     }
@@ -1635,7 +1752,7 @@ impl App {
                         .stderr(std::process::Stdio::null())
                         .spawn()
                     {
-                        Ok(_) => format!("opened {}", page.display()),
+                        Ok(_) => "opened in your browser".to_owned(),
                         Err(error) => format!("{opener}: {error}"),
                     }
                 }
@@ -1760,7 +1877,7 @@ impl App {
                 let hint = if self.running.is_some() {
                     "Steer the running turn".to_owned()
                 } else {
-                    format!("Ask {} to do anything", self.bot)
+                    "Ask anything".to_owned()
                 };
                 (
                     Line::from(vec![Span::raw("› ").bold(), Span::raw(hint).dim()]),
@@ -1879,7 +1996,7 @@ fn draw_watch(watch: &mut Watch) -> std::io::Result<()> {
                     Line::from(spans).style(line.style)
                 }),
         );
-        let footer = Line::from("  esc to close · updates live").dim();
+        let footer = Line::from("  esc to close").dim();
         let body = ratatui::layout::Rect {
             height: area.height.saturating_sub(1),
             ..area
