@@ -11,6 +11,7 @@
 mod calls;
 mod diff;
 mod image;
+mod js;
 mod math;
 mod mermaid;
 mod project;
@@ -164,7 +165,18 @@ async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events
     let bin = agent_bin().ok_or(
         "the daemon is not running and Agent's binary was not found; open Agent.app or set AGENT_BIN",
     )?;
-    let out = std::process::Command::new(&bin)
+    let mut command = std::process::Command::new(&bin);
+    // Provider keys the app keeps in ~/.agent/env, over this shell's own,
+    // as the app starts it; an empty value unsets one.
+    if let Some(file) = agent_client::env_file::path() {
+        for (key, value) in agent_client::env_file::read(&file)? {
+            match value.is_empty() {
+                true => command.env_remove(key),
+                false => command.env(key, value),
+            };
+        }
+    }
+    let out = command
         .arg("start")
         .arg("--store")
         .arg(&options.store)
@@ -174,10 +186,14 @@ async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events
         .output()
         .map_err(|e| format!("{}: {e}", bin.display()))?;
     if !out.status.success() {
-        return Err(format!(
-            "could not start the daemon: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let reason = stderr
+            .lines()
+            .rev()
+            .find_map(|line| serde_json::from_str::<Value>(line).ok())
+            .and_then(|failure| Some(failure["detail"].as_str()?.to_owned()))
+            .unwrap_or_else(|| stderr.trim().to_owned());
+        return Err(format!("could not start the daemon: {reason}"));
     }
     Client::connect(&options.socket)
         .await

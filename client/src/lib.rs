@@ -3,6 +3,7 @@
 //! Shared by the terminal client and the desktop app; nothing here depends
 //! on the runtime crate.
 pub mod approver;
+pub mod env_file;
 pub mod models;
 pub mod policy;
 pub mod socket;

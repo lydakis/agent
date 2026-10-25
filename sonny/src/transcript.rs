@@ -23,6 +23,8 @@ pub struct Markdown {
     hang: usize,
     /// A table's rows, held until it ends, so its columns can be fitted.
     table: Vec<String>,
+    /// Inside `$$` display math, gathered in `picture`.
+    math: bool,
 }
 
 impl Markdown {
@@ -70,8 +72,20 @@ impl Markdown {
         if matches!(lang.as_str(), "diff" | "patch") {
             return crate::diff::fence(&source, width);
         }
+        // Math where pictures cannot be drawn: as text, line by line.
+        if lang == "math" && !crate::term::graphics() {
+            return source
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .flat_map(|l| {
+                    let line = Line::from(crate::math::unicode(l.trim())).italic();
+                    wrap(line, width, Span::raw("    "), Span::raw("    "))
+                })
+                .collect();
+        }
         let svg = match lang.as_str() {
             "mermaid" => crate::mermaid::svg(&source),
+            "math" => crate::math::svg(&source),
             _ => Ok(source.clone()),
         };
         match svg.and_then(|svg| crate::image::svg(&svg, width)) {
@@ -94,11 +108,41 @@ impl Markdown {
     pub fn line(&mut self, text: &str) -> Option<Line<'static>> {
         let trimmed = text.trim_start();
         self.hang = 0;
+        // $$ display math $$, on one line or around several.
+        if !self.fence && trimmed.trim_end().starts_with("$$") {
+            let inner = trimmed.trim_end().trim_start_matches("$$");
+            if let Some(math) = inner.strip_suffix("$$") {
+                self.ready = Some(("math".into(), math.to_owned()));
+                return None;
+            }
+            match self.picture.take() {
+                Some((lang, math)) if lang == "math" && self.math => {
+                    self.math = false;
+                    self.ready = Some((lang, math));
+                }
+                held => {
+                    self.picture = held.or(Some(("math".into(), format!("{inner}\n"))));
+                    self.math = true;
+                }
+            }
+            return None;
+        }
+        if self.math
+            && let Some((_, math)) = &mut self.picture
+        {
+            math.push_str(text);
+            math.push('\n');
+            return None;
+        }
         if let Some(lang) = trimmed.strip_prefix("```") {
             self.fence = !self.fence;
             let lang = lang.trim();
+            let lang = match lang {
+                "latex" | "tex" | "katex" => "math",
+                lang => lang,
+            };
             let drawn = matches!(lang, "svg" | "mermaid") && crate::term::graphics();
-            if self.fence && (drawn || matches!(lang, "diff" | "patch")) {
+            if self.fence && (drawn || matches!(lang, "diff" | "patch" | "math")) {
                 self.picture = Some((lang.to_owned(), String::new()));
             } else if !self.fence {
                 self.ready = self.picture.take();

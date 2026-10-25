@@ -2,12 +2,7 @@
 //! run by the machine's `node` or `bun`. Pele themes its SVG with CSS
 //! variables, which resvg does not read, so the colours are written in
 //! here, for the terminal's light or dark background.
-use std::{
-    collections::HashMap,
-    io::Write,
-    process::{Command, Stdio},
-    time::{Duration, Instant},
-};
+use std::collections::HashMap;
 
 const PELE: &str = include_str!("../vendor/pele.global.js");
 
@@ -35,47 +30,14 @@ const DARK: [(&str, &str); 8] = [
 
 /// The diagram as an SVG resvg can draw, or why not.
 pub fn svg(source: &str) -> Result<String, String> {
-    let runtime = ["node", "bun"]
-        .into_iter()
-        .find(|bin| on_path(bin))
-        .ok_or("drawing Mermaid needs node or bun on PATH")?;
     let source = serde_json::to_string(source).map_err(|e| e.to_string())?;
     let script = format!(
         "{PELE}\ntry {{ process.stdout.write(pele.render({source}).svg) }} \
          catch (e) {{ process.stderr.write(String(e && e.message || e)); process.exit(1) }}\n"
     );
-    let mut child = Command::new(runtime)
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("{runtime}: {e}"))?;
-    let mut stdin = child.stdin.take().ok_or("no stdin")?;
-    // Written on its own thread so a child that stops reading cannot stall
-    // Sonny; the pipe closes when the thread ends.
-    std::thread::spawn(move || stdin.write_all(script.as_bytes()));
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while child.try_wait().map_err(|e| e.to_string())?.is_none() {
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("Pele took longer than 5s".into());
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        let error = String::from_utf8_lossy(&out.stderr);
-        return Err(error.lines().next().unwrap_or("Pele failed").to_owned());
-    }
+    let svg = crate::js::run(script, "Mermaid")?;
     let theme = if crate::term::light() { LIGHT } else { DARK };
-    Ok(resolve(&String::from_utf8_lossy(&out.stdout), &theme))
-}
-
-fn on_path(bin: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(bin).is_file()))
+    Ok(resolve(&svg, &theme))
 }
 
 /// Every `var(--name, fallback)` written out: the root's own variables
@@ -172,7 +134,7 @@ mod tests {
 
     #[test]
     fn a_flowchart_draws_when_node_is_here() {
-        if !on_path("node") {
+        if !crate::js::available() {
             return;
         }
         let out = svg("flowchart LR\n  A[Sonny] --> B[daemon]").unwrap();

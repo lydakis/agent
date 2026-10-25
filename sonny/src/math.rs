@@ -1,5 +1,49 @@
 //! LaTeX in a reply. Inline `$…$` becomes Unicode text (x², α, ∑, a/b),
-//! which stays selectable and wraps with the line.
+//! which stays selectable and wraps with the line. Display math (`$$…$$`,
+//! a ```math fence) is drawn by MathJax (vendor/mathjax.js, Apache-2.0,
+//! built from vendor/mathjax-entry.js) under node or bun, as an SVG.
+
+const MATHJAX: &str = include_str!("../vendor/mathjax.js");
+
+/// Display math as an SVG resvg can draw: sized in pixels for the
+/// terminal's cells and coloured for its background.
+pub fn svg(tex: &str) -> Result<String, String> {
+    let tex = serde_json::to_string(tex).map_err(|e| e.to_string())?;
+    let script = format!(
+        "{MATHJAX}\ntry {{ process.stdout.write(tex2svg({tex}, true)) }} \
+         catch (e) {{ process.stderr.write(String(e && e.message || e)); process.exit(1) }}\n"
+    );
+    let svg = crate::js::run(script, "LaTeX")?;
+    // MathJax reports a TeX error inside the picture, in red: say it instead.
+    if let Some(at) = svg.find("data-mjx-error=\"") {
+        let rest = &svg[at + "data-mjx-error=\"".len()..];
+        return Err(rest[..rest.find('"').unwrap_or(rest.len())].to_owned());
+    }
+    let ink = if crate::term::light() {
+        "#1f1f1f"
+    } else {
+        "#e6e6e6"
+    };
+    // Sizes in ex, which resvg does not know: an ex about half a cell high.
+    let (_, cell_h) = crate::term::cell();
+    let px = |ex: &str| -> String {
+        ex.trim_end_matches("ex")
+            .parse::<f32>()
+            .map(|n| format!("{:.1}", n * cell_h as f32 * 0.5))
+            .unwrap_or_else(|_| ex.to_owned())
+    };
+    let mut svg = svg.replace("currentColor", ink);
+    for attr in ["width=\"", "height=\""] {
+        if let Some(at) = svg.find(attr) {
+            let start = at + attr.len();
+            if let Some(len) = svg[start..].find('"') {
+                let value = px(&svg[start..start + len]);
+                svg.replace_range(start..start + len, &value);
+            }
+        }
+    }
+    Ok(svg)
+}
 const SYMBOLS: &[(&str, &str)] = &[
     ("alpha", "α"),
     ("beta", "β"),
@@ -343,6 +387,20 @@ pub fn unicode(tex: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::unicode;
+
+    #[test]
+    fn display_math_draws_when_node_is_here() {
+        if !crate::js::available() {
+            return;
+        }
+        let svg = super::svg(r"\int_0^1 x^2\,dx = \frac{1}{3}").unwrap();
+        assert!(
+            !svg.contains("currentColor") && !svg.contains("ex\""),
+            "{svg}"
+        );
+        crate::image::render(&svg, 80).unwrap();
+        assert!(super::svg(r"\frac{1}").is_err() || super::svg(r"\badcommand").is_err());
+    }
 
     #[test]
     fn inline_latex_reads_as_text() {
