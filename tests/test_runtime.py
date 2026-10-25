@@ -552,7 +552,8 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
             # Simulate replay failures: `unreadable` names the signatures,
             # `unreadable_error` the HTTP status and message, or 'stream'
             # for an api_error after the stream began. An optional failure
-            # count also models a transient outage with the same request.
+            # count also models a transient outage with the same request,
+            # and `unreadable_any` a failure whatever the request replays.
             if getattr(self.server, 'rate_limits', 0):
                 self.server.rate_limits -= 1
                 body = b'{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}'
@@ -565,12 +566,14 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                 return
             failure = getattr(self.server, 'unreadable_error', None)
             remaining = getattr(self.server, 'unreadable_failures', None)
-            if failure and remaining != 0 and any(b['type'] == 'thinking' and b['signature'] in self.server.unreadable
-                               for m in request['messages'] for b in m['content']):
+            if failure and remaining != 0 and (getattr(self.server, 'unreadable_any', False) or any(
+                    b['type'] == 'thinking' and b['signature'] in self.server.unreadable
+                    for m in request['messages'] for b in m['content'])):
                 if remaining is not None:
                     self.server.unreadable_failures -= 1
                 status, message = failure
-                body = json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': message}})
+                kind = {400: 'invalid_request_error', 403: 'permission_error'}.get(status, 'api_error')
+                body = json.dumps({'type': 'error', 'error': {'type': kind, 'message': message}})
                 if status == 'stream':
                     frames = [('message_start', {'message': {'model': request['model'], 'usage': {'input_tokens': 5}}}),
                               ('error', json.loads(body))]

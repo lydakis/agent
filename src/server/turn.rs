@@ -2475,7 +2475,8 @@ impl Turn {
             Body::Window(_) => provider.keep_warm_after(model, record.effort.as_deref()),
             Body::Copied(_) | Body::Span(..) => None,
         };
-        // Replayed thinking a failure may have come from, once withheld.
+        // Replayed thinking a 400 may have come from, withheld from this
+        // call's later attempts.
         let mut withheld = None;
         loop {
             let items = match body {
@@ -2565,6 +2566,20 @@ impl Turn {
                             )
                             .await?;
                     }
+                    // The same body without the thinking was accepted, so
+                    // later requests leave it out too.
+                    if let (Body::Window(_), Some(strip), Some(prefix)) =
+                        (body, withheld, record.thinking_prefix)
+                    {
+                        let bot = self.bot.clone();
+                        let elided = record.thinking_elided;
+                        self.store
+                            .op("set_thinking", move |db| {
+                                db.set_thinking(&bot, prefix, strip, elided)
+                            })
+                            .await?;
+                        record.thinking = strip;
+                    }
                     if completion.thinking_dropped > 0 {
                         // The provider found history edited under replayed
                         // thinking; the runtime should never cause this.
@@ -2617,22 +2632,12 @@ impl Turn {
             } else {
                 self.failed_usage(usage).await?;
             }
-            // Thinking this failure identifies is withheld from the
-            // bot's later requests whether or not this call can resend.
             let mut resend = false;
             if let Body::Window(context) = body
                 && withheld.is_none()
-                && let Some(prefix) = record.thinking_prefix
+                && record.thinking_prefix.is_some()
                 && let Some(strip) = withhold_thinking(context, &error)
             {
-                let bot = self.bot.clone();
-                let elided = record.thinking_elided;
-                self.store
-                    .op("set_thinking", move |db| {
-                        db.set_thinking(&bot, prefix, strip, elided)
-                    })
-                    .await?;
-                record.thinking = strip;
                 withheld = Some(strip);
                 resend = true;
             }
@@ -3519,13 +3524,12 @@ fn epoch_ms(at: tokio::time::Instant) -> u64 {
 }
 
 /// The strip that withholds every thinking block a failed request replayed,
-/// when the failure identifies unreadable thinking. A provider that cannot read a
-/// replayed block back fails that body every time, so no retry clears it
-/// and every later turn repeats it: Bedrock answers some with a server
-/// error about restoring the reasoning. Only a 400 or server error naming
-/// a thinking signature, decryption, restoration, or verification failure
-/// qualifies. Generic server failures and thinking configuration errors
-/// must not persistently change the bot's context.
+/// when the failure is a 400. A 400 is final for its body, and a replayed
+/// block the provider cannot verify or decrypt is documented to fail with
+/// one: no published error type names it, and the message is not matched.
+/// The call sends the body once more without that thinking, and the bot
+/// keeps it out only once a request without it is accepted. Server errors
+/// are retried with the body unchanged.
 fn withhold_thinking(context: &Context, error: &Error) -> Option<Strip> {
     let window = context.window.as_ref()?;
     let replayed = window.family == agent_runtime::codec::Family::Anthropic
@@ -3534,34 +3538,8 @@ fn withhold_thinking(context: &Context, error: &Error) -> Option<Strip> {
             .iter()
             .zip(&window.thinking)
             .any(|(id, bytes)| *bytes > 0 && !context.thinking.strips(*id));
-    if !replayed {
-        return None;
-    }
-    if !(error.code.starts_with("provider_http_5")
-        || error.code == "provider_server_error"
-        || error.code == "provider_http_400")
-    {
-        return None;
-    }
-    let detail = error
-        .detail
-        .as_deref()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let named = detail.contains("thinking") || detail.contains("reasoning");
-    let withhold = named
-        && [
-            "signature",
-            "decrypt",
-            "restor",
-            "could not be verified",
-            "cannot be verified",
-            "failed to verify",
-            "unable to verify",
-        ]
-        .iter()
-        .any(|cause| detail.contains(cause));
-    withhold.then(|| Strip::from(window.ids[window.ids.len() - 1] + 1))
+    (replayed && error.code == "provider_http_400")
+        .then(|| Strip::from(window.ids[window.ids.len() - 1] + 1))
 }
 
 /// Whether the turn may make another model call.
