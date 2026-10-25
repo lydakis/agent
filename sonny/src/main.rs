@@ -323,19 +323,15 @@ async fn run() -> Result<(), String> {
         app.turn_model = Some(model.clone());
     }
     project::remember(&app.model);
+    // Tasks are laid out in Rex when the person is in it (or names the
+    // Rex server to use); elsewhere they run out of sight, in /status.
     if let Some(project) = &project
         && options.rex
+        && (std::env::var_os("REX_SESSION").is_some() || options.rex_host.is_some())
     {
         app.fleet = Fleet::start(&options, project, &name).await;
         if let Some(fleet) = &app.fleet {
             app.notice = fleet.note.clone();
-        }
-        // Skills are listed in a bot's instructions when it is made.
-        if bot["instructions"]
-            .as_str()
-            .is_some_and(|text| !text.contains("rex-windows"))
-        {
-            app.notice = Some("older lead: ask it to read the rex-windows skill".into());
         }
     }
     app.project = project;
