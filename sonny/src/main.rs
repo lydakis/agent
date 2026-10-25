@@ -334,6 +334,20 @@ async fn run() -> Result<(), String> {
             app.notice = fleet.note.clone();
         }
     }
+    // The lead told what it is told today: skills and memory added since it
+    // was made, and Rex while it is read inside Rex.
+    if project.is_some()
+        && let Some(dir) = bot["workspace"].as_str()
+    {
+        let rex = app.fleet.as_ref().map(|fleet| fleet.rex.label.clone());
+        match project::instructions(std::path::Path::new(dir), rex.as_deref()) {
+            Ok(text) if bot["instructions"].as_str() != Some(text.as_str()) => {
+                app.instruct = Some(text)
+            }
+            Ok(_) => {}
+            Err(error) => app.notice = Some(format!("the lead's instructions: {error}")),
+        }
+    }
     app.project = project;
     let result = app.main(&mut terminal, &mut events).await;
     let _ = terminal.clear();
@@ -503,6 +517,8 @@ struct App {
     down: bool,
     /// The background switched: the conversation is drawn again once idle.
     repaint: bool,
+    /// The lead's instructions as composed now, sent once no turn runs.
+    instruct: Option<String>,
     /// When to connect again, while it or the fleet's is down.
     retry: Option<Instant>,
 }
@@ -800,6 +816,7 @@ impl App {
             options,
             down: false,
             repaint: false,
+            instruct: None,
             retry: None,
         }
     }
@@ -834,6 +851,7 @@ impl App {
         } else {
             status_report("idle", &self.bot);
         }
+        self.configure().await;
         let (keys_tx, mut keys) = tokio::sync::mpsc::unbounded_channel();
         // Poll, not a bare read: a blocked read holds crossterm's reader
         // lock, and the cursor query the inline viewport makes on a resize
@@ -913,6 +931,24 @@ impl App {
             if self.repaint && self.running.is_none() && self.watch.is_none() {
                 self.repaint = false;
                 self.repaint(terminal).await?;
+            }
+        }
+    }
+
+    /// The lead's instructions as composed on attach, sent once no turn
+    /// runs; the next turn reads them.
+    async fn configure(&mut self) {
+        if self.running.is_some() {
+            return;
+        }
+        let Some(text) = self.instruct.take() else {
+            return;
+        };
+        let asked = json!({"bot": self.bot, "instructions": text});
+        if let Err(error) = self.client.request("configure", asked).await {
+            match error.code.as_str() {
+                "bot_busy" => self.instruct = Some(text),
+                _ => self.notice = Some(format!("the lead's instructions: {error}")),
             }
         }
     }
@@ -1195,6 +1231,15 @@ impl App {
                     started: Instant::now(),
                     phase: "Working".into(),
                 });
+                // What this turn runs on and in: the bot may have moved, or
+                // a client chosen another model for it.
+                if let Some(workspace) = data["workspace"].as_str() {
+                    self.workspace = workspace.to_owned();
+                }
+                if let Some(model) = data["model"].as_str() {
+                    self.model = model.to_owned();
+                }
+                self.effort = data["effort"].as_str().map(str::to_owned);
                 status_report("working", &self.bot);
                 if let Some(node) = data["node"].as_i64()
                     && let Some(item) = self.items(&[node]).await.first()
@@ -1394,6 +1439,7 @@ impl App {
                     },
                     &self.bot,
                 );
+                self.configure().await;
                 if self.fleet.is_none() {
                     match status {
                         "completed" | "steered" => {

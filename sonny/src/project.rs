@@ -19,24 +19,42 @@ pub struct Lead {
 
 /// The folder's own name reduced to name characters, as the app names a
 /// project with no file.
-fn default_name(dir: &Path) -> String {
-    let base = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    let name: String = base
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    let name = name.trim_matches('-');
-    if name.is_empty() {
-        "project".into()
-    } else {
-        name[..name.len().min(64)].into()
+fn default_name(dir: &Path) -> Result<String, String> {
+    let info = agent_client::project::read(dir)?;
+    Ok(info["name"].as_str().unwrap_or("project").to_owned())
+}
+
+/// The coordinator's role: the folder's or the user's `coordinator.md`,
+/// else the app's.
+fn role(dir: &Path) -> Result<agent_client::policy::Profile, String> {
+    Ok(
+        match agent_client::policy::profile(dir, "coordinator").map_err(|e| e.to_string())? {
+            Some(role) => role,
+            None => agent_client::policy::Profile::parse("coordinator", None, COORDINATOR),
+        },
+    )
+}
+
+/// A lead's instructions as the app composes them for `dir` now (its role,
+/// the folder's rules, skills and memory, then the project's task rule),
+/// and, when the person reads it inside Rex, where they are.
+pub fn instructions(dir: &Path, rex: Option<&str>) -> Result<String, String> {
+    let memory = agent_client::policy::memory_indexes(dir).map_err(|e| e.to_string())?;
+    let composed = agent_client::policy::instructions(dir, Some(&role(dir)?), &memory)
+        .map_err(|e| e.to_string())?
+        .text;
+    let rule = agent_client::project::rule(&agent_client::project::read(dir)?);
+    let mut text = format!("{composed}\n\n{rule}");
+    if let Some(session) = rex {
+        text.push_str(&format!(
+            "\n\n# Rex\n\nThe person reads you in Sonny, inside Rex, the terminal \
+             multiplexer, in its session `{session}`. Each task you start opens there \
+             as a tab while it works, so they can watch it. Read the rex-windows skill \
+             to run a long command where they can see it, or to place a task's window \
+             where they ask."
+        ));
     }
+    Ok(text)
 }
 
 /// The lead for `dir`, made first when the folder is not a project yet.
@@ -54,7 +72,7 @@ pub async fn open(
             return Ok(Lead { project, bot });
         }
     }
-    let project = default_name(&dir);
+    let project = default_name(&dir)?;
     let bot = format!("{project}.lead");
     if let Some(found) = find(client, &bot).await? {
         if found["workspace"].as_str() == dir.to_str() {
@@ -132,10 +150,7 @@ async fn create(
     bot: &str,
     model: Option<&str>,
 ) -> Result<(), String> {
-    let role = match agent_client::policy::profile(dir, "coordinator").map_err(|e| e.to_string())? {
-        Some(role) => role,
-        None => agent_client::policy::Profile::parse("coordinator", None, COORDINATOR),
-    };
+    let role = role(dir)?;
     // Asked for, the folder's own choice, the last Sonny ran on, then the
     // newest agent's, so a bare `sonny` needs no flag.
     let model = match model.map(str::to_owned).or_else(|| role.model.clone()) {
