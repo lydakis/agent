@@ -11,6 +11,7 @@
 mod calls;
 mod project;
 mod rex;
+mod shell;
 mod transcript;
 
 use agent_client::{Client, Events};

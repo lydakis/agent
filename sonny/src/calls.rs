@@ -19,20 +19,47 @@ pub struct Said {
 }
 
 pub fn said(command: &str, output: &str, failed: bool) -> Option<Said> {
-    let words = words(command)?;
-    // Leading `VAR=value` and `env` only set up the call.
-    let mut words = words.as_slice();
+    let simple = crate::shell::simple(command)?;
+    let mut words = simple.words.as_slice();
+    // `NAME=$(COMMAND)` keeps what one command prints: that command.
+    if let [only] = words
+        && let Some((name, value)) = only.split_once('=')
+        && !name.is_empty()
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && let Some(inner) = value.strip_prefix("$(").and_then(|v| v.strip_suffix(')'))
+    {
+        return said(inner, output, failed);
+    }
+    // What only sets up the call: `env`, `VAR=value`, `if`, a loop's `do`.
     while let Some(first) = words.first() {
-        if first == "env" || (first.contains('=') && !first.starts_with('-')) {
+        let setup = matches!(
+            first.as_str(),
+            "env"
+                | "command"
+                | "exec"
+                | "time"
+                | "nohup"
+                | "do"
+                | "then"
+                | "else"
+                | "if"
+                | "while"
+                | "until"
+                | "!"
+        ) || (first.contains('=') && !first.starts_with('-'));
+        if setup {
             words = &words[1..];
+        } else if first == "timeout" && words.len() > 2 {
+            words = &words[2..];
         } else {
             break;
         }
     }
     let (program, args) = words.split_first()?;
     let name = program.rsplit('/').next().unwrap_or(program);
-    match name {
-        "$AGENT_BIN" | "${AGENT_BIN}" | "agent" => agent(args, output, failed),
+    let stdin = simple.stdin.as_deref();
+    let mut said = match name {
+        "$AGENT_BIN" | "${AGENT_BIN}" | "agent" => agent(args, stdin, output, failed),
         "$REX" | "${REX}" | "rex" => rex(args, output, failed),
         "plan" if program.contains("skills/plan") => plan(args),
         "sonny" if args.first().is_some_and(|a| a == "show") => sonny_show(&args[1..], failed),
@@ -44,105 +71,14 @@ pub fn said(command: &str, output: &str, failed: bool) -> Option<Said> {
             plan(&args[1..])
         }
         _ => None,
+    }?;
+    if let Some(piped) = &simple.piped {
+        said.under.push(dim(format!("| {}", first_line(piped))));
     }
+    Some(said)
 }
 
-/// A command line's commands, split where `;`, `&&`, `||` or a newline
-/// end one outside quotes. Pipes stay inside a command.
-pub fn parts(command: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut part = String::new();
-    let mut quote: Option<char> = None;
-    let mut chars = command.chars().peekable();
-    while let Some(c) = chars.next() {
-        match (quote, c) {
-            (Some(q), c) if c == q => quote = None,
-            (Some('"'), '\\') => {
-                part.push(c);
-                if let Some(next) = chars.next() {
-                    part.push(next);
-                }
-                continue;
-            }
-            (Some(_), _) => {}
-            (None, '\'' | '"') => quote = Some(c),
-            (None, '\\') => {
-                part.push(c);
-                if let Some(next) = chars.next() {
-                    part.push(next);
-                }
-                continue;
-            }
-            (None, ';' | '\n') => {
-                parts.push(std::mem::take(&mut part));
-                continue;
-            }
-            (None, '&' | '|') if chars.peek() == Some(&c) => {
-                chars.next();
-                parts.push(std::mem::take(&mut part));
-                continue;
-            }
-            _ => {}
-        }
-        part.push(c);
-    }
-    parts.push(part);
-    parts
-        .into_iter()
-        .map(|p| p.trim().to_owned())
-        .filter(|p| !p.is_empty())
-        .collect()
-}
-
-/// A command's words as the shell would split them, without expanding
-/// anything; none when it is more than one simple command.
-fn words(command: &str) -> Option<Vec<String>> {
-    let mut words = Vec::new();
-    let mut word: Option<String> = None;
-    let mut chars = command.trim().chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\'' => {
-                let w = word.get_or_insert_with(String::new);
-                loop {
-                    match chars.next()? {
-                        '\'' => break,
-                        c => w.push(c),
-                    }
-                }
-            }
-            '"' => {
-                let w = word.get_or_insert_with(String::new);
-                loop {
-                    match chars.next()? {
-                        '"' => break,
-                        '\\' => match chars.next()? {
-                            c @ ('"' | '\\' | '$' | '`') => w.push(c),
-                            '\n' => {}
-                            c => {
-                                w.push('\\');
-                                w.push(c);
-                            }
-                        },
-                        '`' => return None,
-                        '$' if chars.peek() == Some(&'(') => return None,
-                        c => w.push(c),
-                    }
-                }
-            }
-            '\\' => match chars.next()? {
-                '\n' => {}
-                c => word.get_or_insert_with(String::new).push(c),
-            },
-            ' ' | '\t' => words.extend(word.take()),
-            ';' | '&' | '|' | '<' | '>' | '\n' | '`' | '(' | ')' => return None,
-            '$' if chars.peek() == Some(&'(') => return None,
-            c => word.get_or_insert_with(String::new).push(c),
-        }
-    }
-    words.extend(word);
-    (!words.is_empty()).then_some(words)
-}
+pub use crate::shell::parts;
 
 /// Flags and their values, and what follows `--`.
 struct Args<'a> {
@@ -201,8 +137,25 @@ impl<'a> Args<'a> {
 
 /// Flags of `agent` and `rex` that take no value.
 const SWITCHES: &[&str] = &[
-    "--new", "--detach", "--json", "--pretty", "--any", "--agents", "--trim", "--unwrap",
-    "--clear", "--all", "--wait",
+    "--new",
+    "--detach",
+    "--pretty",
+    "--no-spawn",
+    "--agents",
+    "--no-compaction",
+    "--fallbacks",
+    "--discover",
+    "--all",
+    "--any",
+    "--full",
+    "--active",
+    "--newest",
+    "--json",
+    "--trim",
+    "--unwrap",
+    "--clear",
+    "--wait",
+    "--keep-open",
 ];
 
 fn first_line(text: &str) -> String {
@@ -217,7 +170,17 @@ fn dim(text: impl Into<String>) -> Line<'static> {
     Line::from(text.into()).dim()
 }
 
-fn agent(words: &[String], output: &str, failed: bool) -> Option<Said> {
+fn agent(words: &[String], stdin: Option<&str>, output: &str, failed: bool) -> Option<Said> {
+    // Options may come before the command.
+    let mut words = words;
+    while let Some(first) = words.first().filter(|w| w.starts_with("--")) {
+        let skip = if SWITCHES.contains(&first.as_str()) || first.contains('=') {
+            1
+        } else {
+            2
+        };
+        words = words.get(skip..)?;
+    }
     let (verb, rest) = words.split_first()?;
     let args = Args::new(rest);
     let bot = args.value(&["--bot"]).map(str::to_owned);
@@ -238,7 +201,10 @@ fn agent(words: &[String], output: &str, failed: bool) -> Option<Said> {
     };
     match verb.as_str() {
         "run" => {
-            let new = args.has("--new");
+            let new = args.has("--new") || bot.is_none();
+            if bot.is_none() {
+                said.what = "a new agent".into();
+            }
             said.verb = match (new, args.value(&["--delivery"])) {
                 (true, _) => "Started",
                 (false, Some("steer")) => "Steered",
@@ -260,9 +226,17 @@ fn agent(words: &[String], output: &str, failed: bool) -> Option<Said> {
                     said.under.push(dim(first_line(text)));
                 }
             }
-            if let Some(prompt) = args.rest.as_deref().filter(|p| !p.is_empty()) {
+            // The prompt: its operands, `-` for the here-document.
+            let mut prompt = args.plain(0).join(" ");
+            if let Some(rest) = &args.rest {
+                prompt = [prompt.as_str(), rest].join(" ").trim().to_owned();
+            }
+            if prompt == "-" || prompt.is_empty() {
+                prompt = stdin.unwrap_or("").to_owned();
+            }
+            if !prompt.trim().is_empty() {
                 said.under
-                    .insert(0, Line::from(first_line(prompt)).italic().dim());
+                    .insert(0, Line::from(first_line(&prompt)).italic().dim());
             }
         }
         "wait" => {
@@ -301,6 +275,19 @@ fn agent(words: &[String], output: &str, failed: bool) -> Option<Said> {
             }
         }
         "rm" => said.verb = "Removed".into(),
+        "fork" => {
+            said.verb = "Forked".into();
+            let source = args.value(&["--source"]).unwrap_or("");
+            said.what = format!("{source} as {}", said.what);
+        }
+        "follow" => {
+            said.verb = "Followed".into();
+            if args.has("--all") {
+                said.what = "every agent".into();
+            }
+        }
+        "prune" => said.verb = "Pruned finished agents".into(),
+        "stats" => said.verb = "Read the daemon's stats".into(),
         "interrupt" => said.verb = "Interrupted".into(),
         "inspect" | "resume" => said.verb = "Looked up".into(),
         "turns" | "history" => said.verb = "Read the turns of".into(),
@@ -512,14 +499,26 @@ mod tests {
     }
 
     #[test]
-    fn words_split_like_the_shell_and_refuse_more_than_one_command() {
+    fn a_brief_in_a_document_or_a_capture_still_reads_as_a_start() {
+        let line = "h=$(\"$AGENT_BIN\" run --detach --new --bot calc.neg -- \"$(cat <<'EOF'\nAdd a negative test.\nKeep the rest.\nEOF\n)\" | jq -r .handle)";
+        let said = said(line, "turn:calc.neg/3", false).unwrap();
         assert_eq!(
-            words(r#""$AGENT_BIN" run --bot 'a b' -- "say \"hi\"""#).unwrap(),
-            ["$AGENT_BIN", "run", "--bot", "a b", "--", "say \"hi\""]
+            (said.verb.as_str(), said.what.as_str()),
+            ("Started", "calc.neg")
         );
-        assert!(words("pwd; agent ls").is_none());
-        assert!(words("agent ls | head").is_none());
-        assert!(words("agent run -- \"$(cat brief)\"").is_none());
+        assert_eq!(text(&said.under[0]), "Add a negative test.");
+        assert_eq!(text(&said.under[1]), "| jq -r .handle");
+        let said = said_or_none(
+            "\"$AGENT_BIN\" --pretty run --bot calc.lead - <<'EOF'\nDone.\nEOF",
+            "",
+        );
+        assert_eq!(
+            (said.verb.as_str(), said.what.as_str()),
+            ("Messaged", "calc.lead")
+        );
+        assert_eq!(text(&said.under[0]), "Done.");
+        let said = said_or_none("\"$AGENT_BIN\" run --bot calc.x \"Run the tests\" 2>&1", "");
+        assert_eq!(text(&said.under[0]), "Run the tests");
     }
 
     #[test]
@@ -587,21 +586,6 @@ Keep the rest.'"#,
 
     fn said_or_none(command: &str, output: &str) -> Said {
         said(command, output, false).unwrap()
-    }
-
-    #[test]
-    fn a_command_line_splits_into_its_commands_outside_quotes() {
-        assert_eq!(
-            parts(
-                "ls \"$HOME/.agent\"; \"$AGENT_BIN\" run --bot x -- 'a; b && c' && env | grep rex\npwd"
-            ),
-            [
-                "ls \"$HOME/.agent\"",
-                "\"$AGENT_BIN\" run --bot x -- 'a; b && c'",
-                "env | grep rex",
-                "pwd"
-            ]
-        );
     }
 
     #[test]

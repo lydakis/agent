@@ -247,6 +247,16 @@ pub fn tool(
             .any(|p| crate::calls::said(p, "", false).is_some())
     {
         let mut out = Vec::new();
+        // A block's closing words say nothing by themselves.
+        let parts: Vec<&String> = parts
+            .iter()
+            .filter(|p| {
+                !matches!(
+                    p.as_str(),
+                    "done" | "fi" | "esac" | "then" | "else" | "do" | "{" | "}"
+                )
+            })
+            .collect();
         for (i, part) in parts.iter().enumerate() {
             let bullet = if failed && i + 1 == parts.len() {
                 Span::raw("• ").fg(Color::Red)
