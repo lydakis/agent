@@ -114,6 +114,7 @@ pub fn launchctl(what: Launchd) -> Result<(), String> {
     if !cfg!(target_os = "macos") {
         return Err("triggers_unsupported: triggers use launchd, which only macOS has".into());
     }
+    // SAFETY: getuid takes no arguments and cannot fail.
     let domain = format!("gui/{}", unsafe { libc::getuid() });
     let unloading = matches!(what, Launchd::Unload(_));
     let args = match what {

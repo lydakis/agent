@@ -1,4 +1,6 @@
 #![cfg(unix)]
+// The libc calls signal or inspect processes these tests started.
+#![allow(clippy::undocumented_unsafe_blocks)]
 use agent_runtime::tools::{Credentials, Registry};
 use serde_json::{Value, json};
 
