@@ -236,9 +236,18 @@ window.Rich = (() => {
   // Rendered diagrams and charts by source and width, so a pane drawn again shows them at once;
   // at most 64 of them and 8 MiB of SVG.
   const diagrams = new Map(), DIAGRAMS = 64, DIAGRAM_BYTES = 8 * 1024 * 1024; let diagramBytes = 0;
-  // Sources that failed to draw on their own, with their errors (at most DIAGRAMS): a pane drawn
-  // again shows the error without trying again, and a click tries again.
-  const refused = new Map();
+  // Sources that failed to draw on their own, with their errors (at most DIAGRAMS of them, and
+  // REFUSED_CHARS of source): a pane drawn again shows the error without trying again, and a click
+  // tries again. A source larger than the whole bound is not kept.
+  const refused = new Map(), REFUSED_CHARS = 1000000; let refusedChars = 0;
+  function refuse(key, msg) {
+    if (refused.has(key)) { refused.delete(key); refusedChars -= key.length; }
+    if (key.length > REFUSED_CHARS) return;
+    refused.set(key, msg); refusedChars += key.length;
+    while (refused.size > DIAGRAMS || refusedChars > REFUSED_CHARS) {
+      const k = refused.keys().next().value; refused.delete(k); refusedChars -= k.length;
+    }
+  }
   let drawing = Promise.resolve();
   const note = (box, msg) => { const l = box.querySelector('.rh .lang'); l.textContent = `${l.textContent.split(' · ')[0]} · ${msg}`; };
   // What drawn blocks put on the page, by block: a draw nobody asked for stops once the blocks still
@@ -270,12 +279,17 @@ window.Rich = (() => {
     if (auto && drawnChars() >= DRAWN_CHARS) { note(box, FULL); return; }
     if ('asked' in box.dataset) return;
     box.dataset.asked = '';
-    // One queued behind the same source takes its result instead of drawing it again; one larger
-    // than the whole budget is shown but not kept. One whose block left the document while it
-    // waited (its pane drawn anew, another agent opened) is not drawn.
-    drawing = drawing.then(() => diagrams.get(key) ?? (box.isConnected === false ? null : make(src, box))).then((svg) => {
+    // One queued behind the same source takes its result instead of drawing it again, or its error
+    // when it was a draw nobody asked for; one larger than the whole budget is shown but not kept.
+    // One whose block left the document while it waited (its pane drawn anew, another agent opened)
+    // is not drawn.
+    drawing = drawing.then(() => {
+      if (diagrams.has(key)) return diagrams.get(key);
+      if (auto && refused.has(key)) throw new Error(refused.get(key));
+      return box.isConnected === false ? null : make(src, box);
+    }).then((svg) => {
       if (svg == null) { delete box.dataset.asked; return; }
-      refused.delete(key);
+      if (refused.has(key)) { refused.delete(key); refusedChars -= key.length; }
       const cost = 2 * (key.length + svg.length);
       if (!diagrams.has(key) && cost <= DIAGRAM_BYTES) { diagrams.set(key, svg); diagramBytes += cost; }
       while (diagrams.size > DIAGRAMS || diagramBytes > DIAGRAM_BYTES) {
@@ -284,8 +298,7 @@ window.Rich = (() => {
       show(svg);
     }, (e) => {
       const msg = String(e?.message ?? e).split('\n')[0].slice(0, 80);
-      delete box.dataset.asked; refused.delete(key); refused.set(key, msg);
-      if (refused.size > DIAGRAMS) refused.delete(refused.keys().next().value);
+      delete box.dataset.asked; refuse(key, msg);
       note(box, msg);
     });
   }

@@ -406,6 +406,29 @@ test('a diagram that failed to draw shows its error, and is tried again only whe
   assert.equal(workers[0].sent.length, 2);
 });
 
+test('copies of a diagram queued behind one that fails show its error without drawing again', async () => {
+  const p = page(), Rich = p.context.Rich;
+  const workers = diagramWorkers(p.context, () => ({ error: 'Parse error on line 1:' }));
+  const boxes = [diagramBox(), diagramBox(), diagramBox()];
+  Rich.hydrate({ querySelectorAll: () => boxes }); await turn();
+  assert.equal(workers.length, 1); assert.equal(workers[0].sent.length, 1);
+  for (const b of boxes) assert.equal(b.lang.textContent, 'mermaid · Parse error on line 1:');
+});
+
+test('failed drawings are kept up to a bound on their sources', async () => {
+  const p = page(), Rich = p.context.Rich;
+  const workers = diagramWorkers(p.context, () => ({ error: 'too big' }));
+  const big = (i) => diagramBox(`graph TD\n%% ${i} ${'x'.repeat(400000)}`);
+  for (let i = 0; i < 3; i++) { Rich.hydrate({ querySelectorAll: () => [big(i)] }); await turn(); }
+  const sent = () => workers.reduce((n, w) => n + w.sent.length, 0);
+  assert.equal(sent(), 3);
+  // The newest two fit the bound and show their errors at once; the oldest is tried again.
+  for (const i of [2, 1]) { Rich.hydrate({ querySelectorAll: () => [big(i)] }); await turn(); }
+  assert.equal(sent(), 3);
+  Rich.hydrate({ querySelectorAll: () => [big(0)] }); await turn();
+  assert.equal(sent(), 4);
+});
+
 test('a file opened while the side pane opens is drawn once the pane has its width', async () => {
   const p = page(), c = p.context, R = c.Rich, opening = deferred(); let hydrated = 0;
   c.Rich = { file: R.file, get version() { return R.version; }, hydrate: () => { hydrated++; } };
