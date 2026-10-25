@@ -21,9 +21,40 @@ pub struct Markdown {
     /// How far the last line's wrapped rows are indented: under a list
     /// item's text, so a continuation does not read as a new item.
     hang: usize,
+    /// A table's rows, held until it ends, so its columns can be fitted.
+    table: Vec<String>,
 }
 
 impl Markdown {
+    /// A streamed line as rows: a table that ended first, then the line,
+    /// then a fence's picture or diff when the line closed one. `first`
+    /// says nothing of the reply is shown yet, so it gets the bullet.
+    pub fn feed(&mut self, text: &str, width: usize, first: bool) -> Vec<Line<'static>> {
+        if !self.fence && table_row(text) {
+            self.table.push(text.trim().to_owned());
+            return Vec::new();
+        }
+        let mut out = self.finish(width);
+        if let Some(styled) = self.line(text) {
+            let lead = if first && out.is_empty() {
+                "• "
+            } else {
+                "  "
+            };
+            out.extend(wrap(styled, width, Span::raw(lead), self.rest()));
+        }
+        out.extend(self.picture(width));
+        out
+    }
+
+    /// What is still held when the reply ends: a table.
+    pub fn finish(&mut self, width: usize) -> Vec<Line<'static>> {
+        if self.table.is_empty() {
+            return Vec::new();
+        }
+        crate::table::draw(&std::mem::take(&mut self.table), width)
+    }
+
     /// What the last line's wrapped rows start with, inside a reply.
     pub fn rest(&self) -> Span<'static> {
         Span::raw(format!("  {}", " ".repeat(self.hang)))
@@ -36,6 +67,9 @@ impl Markdown {
         let Some((lang, source)) = self.ready.take() else {
             return Vec::new();
         };
+        if matches!(lang.as_str(), "diff" | "patch") {
+            return crate::diff::fence(&source, width);
+        }
         let svg = match lang.as_str() {
             "mermaid" => crate::mermaid::svg(&source),
             _ => Ok(source.clone()),
@@ -63,7 +97,8 @@ impl Markdown {
         if let Some(lang) = trimmed.strip_prefix("```") {
             self.fence = !self.fence;
             let lang = lang.trim();
-            if self.fence && matches!(lang, "svg" | "mermaid") && crate::term::graphics() {
+            let drawn = matches!(lang, "svg" | "mermaid") && crate::term::graphics();
+            if self.fence && (drawn || matches!(lang, "diff" | "patch")) {
                 self.picture = Some((lang.to_owned(), String::new()));
             } else if !self.fence {
                 self.ready = self.picture.take();
@@ -88,13 +123,35 @@ impl Markdown {
             return Some(Line::from(inline(trimmed[hashes + 1..].trim(), style)));
         }
         let indent = &text[..text.len() - trimmed.len()];
+        let bare = trimmed.trim_end();
+        if bare.len() >= 3
+            && ["-", "*", "_"]
+                .iter()
+                .any(|c| bare.chars().all(|x| x.to_string() == *c || x == ' '))
+        {
+            return Some(Line::from("─".repeat(width_hint())).dim());
+        }
         for marker in ["- ", "* ", "+ "] {
             if let Some(rest) = trimmed.strip_prefix(marker) {
                 self.hang = indent.len() + 2;
-                let mut spans = vec![Span::raw(format!("{indent}- ")).dim()];
+                let (mark, rest) = match rest.get(..4) {
+                    Some("[ ] ") => ("☐ ", &rest[4..]),
+                    Some("[x] " | "[X] ") => ("☑ ", &rest[4..]),
+                    _ => ("- ", rest),
+                };
+                let mut spans = vec![Span::raw(format!("{indent}{mark}")).dim()];
                 spans.extend(inline(rest, Style::new()));
                 return Some(Line::from(spans));
             }
+        }
+        let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
+        if (1..=3).contains(&digits)
+            && let Some(rest) = trimmed[digits..].strip_prefix(". ")
+        {
+            self.hang = indent.len() + digits + 2;
+            let mut spans = vec![Span::raw(format!("{indent}{}. ", &trimmed[..digits])).dim()];
+            spans.extend(inline(rest, Style::new()));
+            return Some(Line::from(spans));
         }
         if let Some(rest) = trimmed.strip_prefix("> ") {
             let mut spans = vec![Span::raw("▌ ").fg(Color::Green)];
@@ -105,39 +162,134 @@ impl Markdown {
     }
 }
 
-/// `code` and **bold** inside a line.
-fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
+/// A rule's width: no wider than a turn's closing rule.
+fn width_hint() -> usize {
+    40
+}
+
+/// Inline marks inside a line: `code`, **bold**, *italic* or _italic_,
+/// ~~struck~~, [links](url) and $math$ (as Unicode), and the HTML tags
+/// models use (<b>, <i>, <code>, <kbd>, <br>).
+pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut plain = String::new();
     let mut rest = text;
-    while !rest.is_empty() {
-        let tick = rest.find('`');
-        let star = rest.find("**");
-        let (at, code) = match (tick, star) {
-            (Some(t), Some(s)) if s < t => (s, false),
-            (Some(t), _) => (t, true),
-            (None, Some(s)) => (s, false),
-            (None, None) => break,
-        };
-        let open = if code { 1 } else { 2 };
-        let close = if code { "`" } else { "**" };
-        let Some(end) = rest[at + open..].find(close) else {
-            break;
-        };
-        if at > 0 {
-            spans.push(Span::styled(rest[..at].to_owned(), base));
+    let flush = |plain: &mut String, spans: &mut Vec<Span<'static>>| {
+        if !plain.is_empty() {
+            spans.push(Span::styled(std::mem::take(plain), base));
         }
-        let inner = rest[at + open..at + open + end].to_owned();
-        spans.push(if code {
-            Span::styled(inner, base.fg(Color::Cyan))
-        } else {
-            Span::styled(inner, base.add_modifier(Modifier::BOLD))
+    };
+    while let Some(c) = rest.chars().next() {
+        // A mark and its closer, with the style of what is between.
+        let pairs: [(&str, &str, Style, bool); 11] = [
+            ("`", "`", base.fg(Color::Cyan), false),
+            ("**", "**", base.add_modifier(Modifier::BOLD), true),
+            ("__", "__", base.add_modifier(Modifier::BOLD), true),
+            ("~~", "~~", base.add_modifier(Modifier::CROSSED_OUT), true),
+            ("*", "*", base.add_modifier(Modifier::ITALIC), true),
+            ("_", "_", base.add_modifier(Modifier::ITALIC), true),
+            ("<b>", "</b>", base.add_modifier(Modifier::BOLD), true),
+            (
+                "<strong>",
+                "</strong>",
+                base.add_modifier(Modifier::BOLD),
+                true,
+            ),
+            ("<i>", "</i>", base.add_modifier(Modifier::ITALIC), true),
+            ("<em>", "</em>", base.add_modifier(Modifier::ITALIC), true),
+            ("<code>", "</code>", base.fg(Color::Cyan), false),
+        ];
+        let found = pairs.iter().find_map(|(open, close, style, nested)| {
+            let after = rest.strip_prefix(open)?;
+            // `_` and `*` mark emphasis only around a word, not in
+            // snake_case or 2*3*4.
+            if matches!(*open, "*" | "_")
+                && (after.starts_with(' ')
+                    || plain.chars().last().is_some_and(char::is_alphanumeric))
+            {
+                return None;
+            }
+            let end = after.find(close)?;
+            (end > 0).then(|| {
+                (
+                    open.len() + end + close.len(),
+                    &after[..end],
+                    *style,
+                    *nested,
+                )
+            })
         });
-        rest = &rest[at + open + end + close.len()..];
+        if let Some((taken, inner, style, nested)) = found {
+            flush(&mut plain, &mut spans);
+            if nested {
+                spans.extend(inline(inner, style));
+            } else {
+                spans.push(Span::styled(inner.to_owned(), style));
+            }
+            rest = &rest[taken..];
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("<kbd>")
+            && let Some(end) = after.find("</kbd>")
+        {
+            flush(&mut plain, &mut spans);
+            spans.push(Span::styled(
+                format!(" {} ", &after[..end]),
+                base.reversed(),
+            ));
+            rest = &after[end + "</kbd>".len()..];
+            continue;
+        }
+        if let Some(after) = ["<br>", "<br/>", "<br />"]
+            .iter()
+            .find_map(|tag| rest.strip_prefix(tag))
+        {
+            plain.push(' ');
+            rest = after;
+            continue;
+        }
+        // [text](url): the text, underlined, and the address when it says more.
+        if c == '['
+            && let Some(close) = rest.find("](")
+            && let Some(end) = rest[close + 2..].find(')')
+        {
+            let label = &rest[1..close];
+            let url = &rest[close + 2..close + 2 + end];
+            if !label.contains('[') && !url.contains(' ') {
+                flush(&mut plain, &mut spans);
+                spans.extend(inline(label, base.underlined()));
+                if url != label && !url.starts_with('#') {
+                    spans.push(Span::styled(format!(" ({url})"), base.dim()));
+                }
+                rest = &rest[close + 2 + end + 1..];
+                continue;
+            }
+        }
+        // $math$, not a price: no space just inside either dollar.
+        if c == '$'
+            && let Some(end) = rest[1..].find('$')
+            && end > 0
+            && !rest[1..].starts_with(' ')
+            && !rest[..end + 1].ends_with(' ')
+            && !rest[1..].starts_with(|d: char| d.is_ascii_digit())
+        {
+            flush(&mut plain, &mut spans);
+            let math = crate::math::unicode(&rest[1..end + 1]);
+            spans.push(Span::styled(math, base.italic()));
+            rest = &rest[end + 2..];
+            continue;
+        }
+        plain.push(c);
+        rest = &rest[c.len_utf8()..];
     }
-    if !rest.is_empty() {
-        spans.push(Span::styled(rest.to_owned(), base));
-    }
+    flush(&mut plain, &mut spans);
     spans
+}
+
+/// `| a | b |`: a table's row, its separator included.
+fn table_row(text: &str) -> bool {
+    let t = text.trim();
+    t.starts_with('|') && t.len() > 1 && t[1..].contains('|')
 }
 
 /// A line wrapped at word boundaries to `width` columns, the first row
@@ -245,12 +397,10 @@ pub fn reply(text: &str, width: usize) -> Vec<Line<'static>> {
     let mut markdown = Markdown::default();
     let mut out = Vec::new();
     for line in text.lines() {
-        if let Some(styled) = markdown.line(line) {
-            let lead = if out.is_empty() { "• " } else { "  " };
-            out.extend(wrap(styled, width, Span::raw(lead), markdown.rest()));
-        }
-        out.extend(markdown.picture(width));
+        let first = out.is_empty();
+        out.extend(markdown.feed(line, width, first));
     }
+    out.extend(markdown.finish(width));
     out
 }
 

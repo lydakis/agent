@@ -285,6 +285,33 @@ fn cap(mut out: Vec<Line<'static>>, most: usize) -> Vec<Line<'static>> {
     out
 }
 
+/// A ```diff fence in a reply: a unified diff when it is one, else its
+/// `+`, `-` and context lines drawn the same way, unnumbered.
+pub fn fence(text: &str, width: usize) -> Vec<Line<'static>> {
+    if let Some(lines) = unified(text, width, 200) {
+        return lines;
+    }
+    let hunk = Hunk {
+        old_start: 1,
+        new_start: 1,
+        lines: text
+            .lines()
+            .filter(|l| !l.starts_with("@@"))
+            .map(str::to_owned)
+            .collect(),
+    };
+    let mut out = hunk.rows(2, width);
+    // Numbers without the file's would mislead: leave them off.
+    for line in &mut out {
+        if let Some(first) = line.spans.first_mut()
+            && first.content.trim().chars().all(|c| c.is_ascii_digit())
+        {
+            first.content = " ".repeat(first.content.chars().count()).into();
+        }
+    }
+    cap(out, 200)
+}
+
 struct Hunk {
     old_start: usize,
     new_start: usize,

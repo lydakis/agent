@@ -11,12 +11,14 @@
 mod calls;
 mod diff;
 mod image;
+mod math;
 mod mermaid;
 mod project;
 mod rex;
 mod shell;
 mod sound;
 mod status;
+mod table;
 mod term;
 mod transcript;
 
@@ -954,22 +956,20 @@ impl App {
             if !rest.is_empty() {
                 self.live_line(&mut live, &rest);
             }
+            let held = live.markdown.finish(self.width);
+            self.live_rows(&mut live, held);
         }
     }
 
     fn live_line(&mut self, live: &mut Live, line: &str) {
-        if let Some(styled) = live.markdown.line(line) {
-            let lead = if live.lines == 0 { "• " } else { "  " };
-            let rest = live.markdown.rest();
-            let rows = transcript::wrap(styled, self.width, Span::raw(lead), rest);
+        let rows = live.markdown.feed(line, self.width, live.lines == 0);
+        self.live_rows(live, rows);
+    }
+
+    fn live_rows(&mut self, live: &mut Live, rows: Vec<Line<'static>>) {
+        if !rows.is_empty() {
             live.lines += rows.len();
             self.pending.extend(rows);
-            self.any_history = true;
-        }
-        let picture = live.markdown.picture(self.width);
-        if !picture.is_empty() {
-            live.lines += picture.len();
-            self.pending.extend(picture);
             self.any_history = true;
         }
     }
