@@ -808,6 +808,8 @@ impl App {
     }
 
     async fn main(&mut self, terminal: &mut Tui, events: &mut Events) -> Result<(), String> {
+        term::laid_out().await;
+        let _ = terminal.autoresize();
         self.width = terminal.size().map(|s| s.width as usize).unwrap_or(80);
         self.history().await;
         // A turn already running: its clock, and any call it waits on.

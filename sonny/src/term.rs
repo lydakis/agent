@@ -55,6 +55,23 @@ pub fn cell() -> (u32, u32) {
     PROBE.get().map_or((8, 16), |p| p.cell)
 }
 
+/// Wait, up to two seconds, for the pane's size in pixels, which Rex
+/// fills in only once it has laid a new block out (80×24 and no pixels
+/// until then): pictures drawn before it are sized for a pane that is not
+/// there.
+pub async fn laid_out() {
+    if !graphics() {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if ratatui::crossterm::terminal::window_size().is_ok_and(|size| size.width > 0) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Ask the terminal. Call in raw mode, before anything else reads input:
 /// the answers arrive on stdin.
 pub fn detect() {
