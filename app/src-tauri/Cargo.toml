@@ -23,3 +23,6 @@ serde_json = "1"
 tauri = { version = "2", features = [] }
 tokio = { version = "1", features = ["rt", "sync", "macros", "process", "time"] }
 toml = "0.9"
+
+[lints]
+workspace = true

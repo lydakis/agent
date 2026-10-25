@@ -1114,6 +1114,7 @@ async fn shell(
             // Only the group created for this command. Also runs if the turn's
             // future is cancelled. Escaped sessions require external isolation.
             if self.group > 1 {
+                // SAFETY: kill takes no pointers; the group is this command's own.
                 unsafe {
                     libc::kill(-self.group, libc::SIGKILL);
                 }
@@ -1150,6 +1151,7 @@ async fn shell(
     .await;
     // Finish cleanup before returning a timeout/overflow. Drop also covers
     // cancellation, with Tokio responsible for reaping its killed child.
+    // SAFETY: kill takes no pointers; the group is this command's own.
     unsafe {
         libc::kill(-group, libc::SIGKILL);
     }

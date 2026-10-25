@@ -1324,6 +1324,7 @@ impl Group {
         }
         // SAFETY: a zeroed siginfo_t is valid; WNOWAIT only reports.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: info is a live siginfo_t the call may write.
         let found = unsafe {
             libc::waitid(
                 libc::P_PID,

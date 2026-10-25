@@ -1154,9 +1154,10 @@ fn await_exit(pid: i32, timeout: Duration) -> Result<()> {
         }
         #[cfg(target_os = "macos")]
         {
-            // SAFETY: proc_pidinfo fills this fixed-size process record.
+            // SAFETY: proc_bsdinfo is plain data; all zeroes is a valid value.
             let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
             let size = std::mem::size_of_val(&info) as i32;
+            // SAFETY: info is a live proc_bsdinfo of exactly `size` bytes.
             let read = unsafe {
                 libc::proc_pidinfo(
                     pid,
