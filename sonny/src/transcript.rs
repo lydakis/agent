@@ -274,6 +274,11 @@ pub fn tool(
 /// `agent run --detach`'s reply, as a line: the agent and its turn.
 fn started(output: Option<&str>) -> Option<String> {
     let reply: Value = serde_json::from_str(output?.trim()).ok()?;
+    // A refusal, as the CLI writes it: its code and what it says.
+    if let Some(error) = reply["error"].as_str() {
+        let detail = reply["detail"].as_str().unwrap_or("");
+        return Some(format!("refused: {detail} ({error})"));
+    }
     let bot = reply["bot"].as_str()?;
     let turn = reply["turn"].as_i64()?;
     reply["handle"].as_str()?;
