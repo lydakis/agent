@@ -2012,7 +2012,9 @@ test('the coordinator the app ships gives editing tasks worktrees and cleans up 
   // Outside git, a copy of the folder itself, its changes checked and copied back.
   assert.match(text, /sandfs mount "\$PWD" "\$HOME\/\.agent\/tasks\/NAME"\n/);
   assert.match(text, /sandfs changes NAME --copy-to "\$PWD" writes them here/);
-  assert.match(text, /sandfs rm --unmount NAME removes the copy once its work is here or dropped, or when setup fails, or the start fails and "\$AGENT_BIN" ls --name NAME does not list it/);
+  // A copy lives as long as its task; only a failed setup or start removes it.
+  assert.match(text, /a copy stays as long as its task, as a worktree does/);
+  assert.match(text, /the start fails and "\$AGENT_BIN" ls --name NAME does not list it, remove it with sandfs rm --unmount NAME before trying again/);
 });
 
 test('a project the core refuses opens nothing, and one already there says when the picks were not applied', async () => {

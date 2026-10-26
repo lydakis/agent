@@ -952,8 +952,9 @@ daemon learns nothing about projects; everything here is client work.
   top>" ~/.agent/tasks/NAME --uncommitted --branch agent/NAME`, whose
   commits come back with `git push origin agent/NAME`, or outside git
   `sandfs mount "$PWD" ~/.agent/tasks/NAME`, whose changes come back with
-  `sandfs changes NAME --copy-to "$PWD"`; `sandfs rm --unmount NAME` removes
-  either. The daemon only runs a
+  `sandfs changes NAME --copy-to "$PWD"`. A copy stays as long as its task,
+  as a worktree does; `sandfs rm --unmount NAME` removes one after a failed
+  setup or start. The daemon only runs a
   turn where the bot is, or where a message moves it. A bot in a
   linked worktree shows its branch after its name in the head, read once
   from the worktree's files when the head is first drawn.
