@@ -593,8 +593,16 @@ impl Judge {
             "lookout.{}",
             &digest(&format!("{}\n{MODEL_INSTRUCTIONS}", self.model))[..12]
         );
+        // Only a judge is forked: a bot of that name with tools or other
+        // instructions is refused, never used.
+        let judge = |bot: Value| {
+            (bot["tools"].as_array().is_some_and(Vec::is_empty)
+                && bot["instructions"] == MODEL_INSTRUCTIONS)
+                .then(|| bot["bot_id"].as_i64())
+                .ok_or_else(|| failed(format!("{name} is a bot that is not a lookout judge")))
+        };
         let id = match client.request("inspect", json!({"bot": name})).await {
-            Ok(bot) => bot["bot_id"].as_i64(),
+            Ok(bot) => judge(bot)?,
             Err(e) if e.code == "bot_not_found" => {
                 match client
                     .request(
@@ -609,8 +617,8 @@ impl Judge {
                     Err(e) if e.code == "bot_exists" => client
                         .request("inspect", json!({"bot": name}))
                         .await
-                        .ok()
-                        .and_then(|bot| bot["bot_id"].as_i64()),
+                        .map_err(|e| failed(format!("the judge could not be read: {}", e.code)))
+                        .and_then(judge)?,
                     Err(e) => {
                         return Err(failed(format!("the judge could not be made: {}", e.code)));
                     }

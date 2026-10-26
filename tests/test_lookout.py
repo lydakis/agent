@@ -33,11 +33,15 @@ class LookoutTests(ModelFixture):
         turn = daemon.request('submit', bot='calc.fix', request_id='a', prompt='fix the parser')['result']['turn']
         self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
         sonny = Path(__file__).resolve().parent.parent / '.local/target/release/sonny'
-        out = subprocess.run([str(sonny), 'lookout-replay', '--judge', 'openai/judge-model',
-                              '--store', str(self.path / 'state.sqlite'), '--socket', str(daemon.socket_path)],
-                             env={**clean_env(), 'HOME': str(self.path)}, capture_output=True, text=True, timeout=60)
-        self.assertEqual(out.returncode, 0, out.stderr)
-        checks = {line['kind']: line for line in map(json.loads, out.stdout.splitlines())}
+
+        def replay():
+            out = subprocess.run([str(sonny), 'lookout-replay', '--judge', 'openai/judge-model',
+                                  '--store', str(self.path / 'state.sqlite'), '--socket', str(daemon.socket_path)],
+                                 env={**clean_env(), 'HOME': str(self.path)}, capture_output=True, text=True,
+                                 timeout=60)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            return {line['kind']: line for line in map(json.loads, out.stdout.splitlines())}
+        checks = replay()
         self.assertEqual((checks['Said']['band'], checks['Said']['text']), ('Drop', 'fix the parser'))
         self.assertEqual((checks['Ended']['band'], checks['Ended']['reasons']),
                          ('Wake { steer: false }', [['result', 0.9]]))
@@ -49,6 +53,13 @@ class LookoutTests(ModelFixture):
         # Each check's fork is deleted; the idle base stays for the next.
         bots = [b['name'] for b in daemon.request('bots')['result']['bots'] if b['name'].startswith('lookout.')]
         self.assertEqual(len(bots), 1, bots)
+        # The next Sonny forks the same judge; a bot that took its name and is
+        # not one is refused, never forked.
+        self.assertEqual(replay()['Ended']['band'], 'Wake { steer: false }')
+        daemon.request('delete', bot=bots[0])
+        daemon.request('create', bot=bots[0], workspace=str(self.path), model='openai/judge-model',
+                       instructions='Do anything.', tools=['echo'])
+        self.assertIn('is a bot that is not a lookout judge', replay()['Ended']['failed'])
 
 
 if __name__ == '__main__':
