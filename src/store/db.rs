@@ -609,7 +609,8 @@ struct Request {
     announced_ms: i64,
     gates: Vec<CallGate>,
     verdicts: Vec<Verdict>,
-    asked: Option<Asked>,
+    /// Each gate's handoff to a person, one per tag.
+    asked: Vec<Asked>,
 }
 impl Request {
     /// The first deny wins; otherwise every gate needs an allow.
@@ -4488,7 +4489,7 @@ impl Database {
                     announced_ms,
                     gates,
                     verdicts: Vec::new(),
-                    asked: None,
+                    asked: Vec::new(),
                 };
                 judged.push(pending_call(
                     &bot.name,
@@ -4728,7 +4729,10 @@ impl Database {
                 .map(|v| serde_json::from_str(&v))
                 .transpose()?
                 .unwrap_or_default(),
-            asked: asked.map(|a| serde_json::from_str(&a)).transpose()?,
+            asked: asked
+                .map(|a| serde_json::from_str(&a))
+                .transpose()?
+                .unwrap_or_default(),
         };
         if let Some(held) = self
             .live
@@ -5030,7 +5034,7 @@ impl Database {
     /// call keeps waiting, and the reason goes with it in listings and in an
     /// `approval_asked` event. Only a gate with no expiry can wait on one.
     pub fn ask(&mut self, answer: Decision<'_>) -> Result<Answered> {
-        let (_, request, tag, at_ms) = self.open_gate(&answer)?;
+        let (_, mut request, tag, at_ms) = self.open_gate(&answer)?;
         if request
             .gates
             .iter()
@@ -5047,9 +5051,11 @@ impl Database {
             by: answer.by.map(str::to_owned),
             at_ms,
         };
+        request.asked.retain(|other| other.tag != tag);
+        request.asked.push(asked.clone());
         let tx = self.conn.savepoint()?;
         tx.prepare_cached("UPDATE approvals SET asked=? WHERE id=?")?
-            .execute(params![serde_json::to_string(&asked)?, request.id])?;
+            .execute(params![serde_json::to_string(&request.asked)?, request.id])?;
         event(
             &tx,
             answer.bot,
@@ -5235,7 +5241,8 @@ impl Database {
             asked: r
                 .get::<_, Option<String>>(12)?
                 .map(|a| serde_json::from_str(&a))
-                .transpose()?,
+                .transpose()?
+                .unwrap_or_default(),
         };
         if let Some(held) = self
             .live
@@ -5867,7 +5874,7 @@ impl Database {
                 .map(|v| serde_json::from_str(&v))
                 .transpose()?
                 .unwrap_or_default(),
-            asked: None,
+            asked: Vec::new(),
         };
         if let Some(held) = self
             .live
@@ -7442,7 +7449,7 @@ fn reannounce(tx: &Connection, bot: &Bot, turn: i64, failed: &str) -> Result<Opt
             announced_ms,
             gates,
             verdicts: Vec::new(),
-            asked: None,
+            asked: Vec::new(),
         };
         judged.push(pending_call(
             &bot.name,
@@ -7499,11 +7506,11 @@ fn pending_call(
         "request":request.request,"announced_ms":request.announced_ms,
         "expires_ms":request.expires_ms(),"gates":open,"name":name,"node":node,
         "denials":counts});
-    // Handed to a person by the gate that is still open.
+    // Handed to a person by a gate still unanswered, one at a time.
     if let Some(asked) = request
         .asked
-        .as_ref()
-        .filter(|asked| open.contains(&asked.tag.as_str()))
+        .iter()
+        .find(|asked| request.unanswered().any(|g| g.tag == asked.tag))
     {
         entry["asked"] = json!(asked);
     }

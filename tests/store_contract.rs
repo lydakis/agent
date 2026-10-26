@@ -1586,6 +1586,77 @@ fn a_gate_hands_a_call_to_a_person_who_then_decides_it() {
 }
 
 #[test]
+fn each_gate_keeps_its_own_handoff_to_a_person() {
+    let mut db = db();
+    let tools = ["shell".to_owned()];
+    let gate = |tag: &str| Gate {
+        tag: tag.into(),
+        tools: vec!["shell".into()],
+        expire_ms: None,
+    };
+    let (a, b) = (gate("a"), gate("b"));
+    let first = Binding {
+        tools: &tools,
+        gate: Some(&a),
+        ..binding()
+    };
+    let ann = db.create("Ann", Some("/synthetic"), first).unwrap().0;
+    let made = Binding {
+        tools: &tools,
+        gate: Some(&b),
+        created_by: Some(ann.name.as_str()),
+        created_by_id: Some(ann.bot_id),
+        ..binding()
+    };
+    db.create("Bob", Some("/synthetic"), made).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let (item, call) = shell_call("fc_0", "s0", "git push");
+    db.append(turn, vec![item], std::slice::from_ref(&call), None)
+        .unwrap();
+    let decision = |tag, allow| Decision {
+        bot: "Bob",
+        turn,
+        call_id: "s0",
+        request: 1,
+        tag: Some(tag),
+        allow,
+        reason: Some("doubted"),
+        by: Some("approver"),
+    };
+    db.ask(decision("a", false)).unwrap();
+    db.ask(decision("b", false)).unwrap();
+    // The person answers one gate; the other's handoff still shows.
+    db.answer(Decision {
+        reason: None,
+        by: Some("person"),
+        ..decision("b", true)
+    })
+    .unwrap();
+    let listed = db.approvals(Some("Bob"), None, 0, None, 64).unwrap();
+    assert_eq!(listed["approvals"][0]["asked"]["tag"], "a", "{listed}");
+    db.answer(Decision {
+        reason: None,
+        by: Some("person"),
+        ..decision("a", true)
+    })
+    .unwrap();
+    assert!(matches!(
+        db.approval_start(turn, &call, 0).unwrap(),
+        Gated::Started
+    ));
+}
+
+#[test]
 fn schema_49_waiting_calls_were_not_handed_to_anyone() {
     let path = std::env::temp_dir().join(format!("agent-schema49-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);

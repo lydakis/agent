@@ -51,6 +51,9 @@ pub fn gate(mode: &str, tools: &[String]) -> Map<String, Value> {
         .filter(|tool| !ungated.contains(&tool.as_str()))
         .collect();
     let fields = match mode {
+        // Nothing left to gate, such as a bot that only reads in `auto`:
+        // a gate needs a tool, so the bot is ungated.
+        _ if approve.is_empty() => json!({"approve": []}),
         // No expiry: a call the judge doubts waits for the person here.
         "auto" => json!({"approve": approve, "approver": "auto"}),
         "ask" => json!({"approve": approve, "approver": "manual"}),
@@ -81,6 +84,9 @@ mod tests {
         }
         assert_eq!(gate("auto", &tools)["approve"], json!(["shell"]));
         assert_eq!(gate("ask", &tools)["approve"], json!(["shell", "read"]));
+        // A bot with nothing left to gate is ungated, not refused.
+        let reader: Vec<String> = ["read", "wait"].map(String::from).to_vec();
+        assert_eq!(Value::Object(gate("auto", &reader)), json!({"approve": []}));
         assert!(gate("auto", &tools).get("approve_expire_ms").is_none());
         // A lead's auto gate that still lapses is set again; a made bot's
         // keeps the gate it descends from.

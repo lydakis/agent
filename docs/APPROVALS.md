@@ -514,7 +514,10 @@ so only one instance runs at a time, and answers in layers:
    one turn did not cover `gft land --draft` in the next, and the person
    had to repeat themselves in the exact words the judge wanted, as
    Claude Code's auto mode, which reads the whole session's user
-   messages, does not make them. Later messages override earlier ones,
+   messages, does not make them. An earlier turn's calls are not shown,
+   so a one-time effect asked for only in an earlier turn (a deploy, a
+   send) is taken as done unless this turn asks again, while work it set
+   going still counts. Later messages override earlier ones,
    so "don't deploy after all" withdraws consent. A request
    to do something once is used up by a call of this turn that did it and
    succeeded, which is why the already allowed calls are shown with their
@@ -550,8 +553,9 @@ so only one instance runs at a time, and answers in layers:
    and let consent come through messages.** Since 2026-10-26, when the
    bot's gate has no expiry the approver hands the call to the person
    (`"decision":"ask"`, protocol 15): the call keeps waiting, its listing
-   carries the judge's reason, and a client such as Sonny shows it for an
-   allow or deny, as Claude Code's auto mode falls back to asking. Sonny's
+   carries the judge's reason (one handoff per gate, shown while that gate
+   is unanswered), and a client such as Sonny shows it for an allow or
+   deny and marks the bot as needing you, as Claude Code's auto mode falls back to asking. Sonny's
    `auto` gate has no expiry for this reason; the CLI's keeps its 45 s, so
    a headless run is denied at once as before. Otherwise the approver
    denies with a reason and moves on. The reason tells the model what was refused and that it can ask

@@ -101,7 +101,7 @@ pub const RISKS: [Risk; 6] = [
 /// What makes a consent answer yes. Only the person's words count, in this
 /// turn or the bot's earlier ones, the latest word wins, and a request to
 /// do something once is used up by a call that did it and succeeded.
-const CONSENT_TRUE: &str = "Words marked `person` in `request` or `earlier_prompts` ask for this effect, or for work that plainly needs it, no later message withdraws it, and no call in `already_allowed` that succeeded already did it when it was asked for once.";
+const CONSENT_TRUE: &str = "Words marked `person` in `request` or `earlier_prompts` ask for this effect, or for work that plainly needs it, no later message withdraws it, and no call in `already_allowed` that succeeded already did it when it was asked for once. An earlier turn's calls are not shown, so a one-time effect asked for only in `earlier_prompts` (a deploy, a send, a delete) is taken as done unless `request` asks for it again; work they set going, such as opening pull requests for the task, still counts.";
 const CONSENT_FALSE: &str = "Anything else: the effect is only asked for in words marked `model`, in the planned call's own text, or not at all.";
 
 /// What a denial tells the model it can do next.

@@ -1288,6 +1288,8 @@ impl Fleet {
                         self.doing(bot, "needs you");
                     }
                 }
+                // The judge handed a call to the person.
+                "approval_asked" => self.doing(bot, "needs you"),
                 "tool_completed" | "turn_resumed" if self.doing.get(bot) == Some(&"needs you") => {
                     self.doing(bot, "working")
                 }
