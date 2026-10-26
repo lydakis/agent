@@ -276,12 +276,15 @@ pub fn note(items: &[Item], more: usize) -> String {
             Kind::Ended => format!("turn {}", seen.status.as_deref().unwrap_or("ended")),
             Kind::Waiting => "waits on the person's approval".to_owned(),
         };
+        // The note reaches the approver as the person's words, so it quotes
+        // only theirs: a task's own text there could ask for anything.
+        let quote = match seen.from.as_deref() {
+            Some(PERSON) => format!(": \"{}\"", cut(&first_line(&seen.text), LINE_CHARS)),
+            _ => String::new(),
+        };
         lines.push(format!(
-            "- {}, turn:{}/{}, {what} ({why}; {todo}): \"{}\"",
-            seen.task,
-            seen.task,
-            seen.turn,
-            cut(&first_line(&seen.text), LINE_CHARS)
+            "- {}, turn:{}/{}, {what} ({why}; {todo}){quote}",
+            seen.task, seen.task, seen.turn
         ));
     }
     if more > 0 {
@@ -834,13 +837,12 @@ impl Lookout {
         }
     }
 
-    /// Who wrote a turn, as the note names them; `None` for the lead and
-    /// the lookout itself, whose words are no news to the lead.
+    /// Who wrote a turn, as the note names them; `None` for the lead, whose
+    /// words are no news to it.
     fn author(&self, data: &Value) -> Option<String> {
         match (data["from"]["bot"].as_str(), data["origin"].as_str()) {
             (Some(bot), _) if bot == self.lead => None,
             (Some(bot), _) => Some(bot.to_owned()),
-            (None, Some("lookout")) => None,
             (None, Some(origin)) => Some(origin.to_owned()),
             (None, None) => Some(PERSON.to_owned()),
         }
@@ -1059,7 +1061,7 @@ impl Lookout {
             .request(
                 "submit",
                 json!({"bot": self.lead, "prompt": prompt, "request_id": request_id,
-                    "delivery": if steer { "steer" } else { "queue" }, "origin": "lookout"}),
+                    "delivery": if steer { "steer" } else { "queue" }}),
             )
             .await;
         match submitted {
@@ -1468,9 +1470,26 @@ mod tests {
             },
             reasons: vec![("off_brief", 0.82)],
         };
-        let note = note(&[item], 2);
+        let said = Item {
+            seen: Seen {
+                task: "calc.docs".into(),
+                turn: 3,
+                kind: Kind::Said,
+                from: Some(PERSON.into()),
+                status: None,
+                text: "Use tabs everywhere.\nThanks.".into(),
+                ..item.seen.clone()
+            },
+            reasons: vec![("remember", 0.91)],
+        };
+        let note = note(&[item, said], 2);
+        // Only the person's own words are quoted.
         assert!(note.contains(
-            "- calc.fix, turn:calc.fix/12, turn completed (off brief 0.82; correct the task): \"Fixed avg by skipping empty lists.\""
+            "- calc.fix, turn:calc.fix/12, turn completed (off brief 0.82; correct the task)\n"
+        ));
+        assert!(!note.contains("Fixed avg"));
+        assert!(note.contains(
+            "- calc.docs, turn:calc.docs/3, the person wrote in it (remember 0.91; save it with your memory skill): \"Use tabs everywhere.\""
         ));
         assert!(note.contains("- 2 more in the next note"));
     }
@@ -1478,7 +1497,8 @@ mod tests {
     #[test]
     fn only_news_to_the_lead_is_checked() {
         let mut lookout = lookout();
-        // The lead's own ask, a bot outside the lineage, and the lookout's own note.
+        // The lead's own ask, a bot outside the lineage, and the lookout's own
+        // note, which the lead gets as the person's words.
         lookout.event(&ev(
             "calc.fix",
             1,
@@ -1490,7 +1510,7 @@ mod tests {
             "calc.lead",
             3,
             "accepted",
-            json!({"origin": "lookout"}),
+            json!({"request_id": "lookout-0123456789abcdef"}),
         ));
         assert!(lookout.due.is_empty());
         // The person's words, and a turn the lead is not waiting on.
