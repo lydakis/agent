@@ -16,6 +16,7 @@ mod image;
 mod js;
 mod math;
 mod mermaid;
+mod models;
 mod project;
 mod rex;
 mod shell;
@@ -453,7 +454,8 @@ struct Running {
 
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, unlisted.
-const COMMANDS: [(&str, &str); 3] = [
+const COMMANDS: [(&str, &str); 4] = [
+    ("/model", "the model and effort"),
     ("/status", "this project's agents"),
     ("/open", "the last HTML page, in your browser"),
     ("/quit", "the agents keep working"),
@@ -521,6 +523,12 @@ struct App {
     instruct: Option<String>,
     /// When to connect again, while it or the fleet's is down.
     retry: Option<Instant>,
+    /// `/model`, open over the composer.
+    picker: Option<models::Picker>,
+    /// The model listing `/model` waits on.
+    listing: Option<tokio::sync::oneshot::Receiver<Result<Value, String>>>,
+    /// The model and effort picked, set once no turn runs.
+    switch: Option<(String, Option<String>)>,
 }
 
 /// The lead's tasks, laid out in the project's Rex session: a window for
@@ -818,6 +826,9 @@ impl App {
             repaint: false,
             instruct: None,
             retry: None,
+            picker: None,
+            listing: None,
+            switch: None,
         }
     }
 
@@ -927,6 +938,7 @@ impl App {
             if self.retry.is_some_and(|at| at <= Instant::now()) {
                 self.reattach(events).await;
             }
+            self.listed();
             self.repaint |= term::switched();
             if self.repaint && self.running.is_none() && self.watch.is_none() {
                 self.repaint = false;
@@ -938,18 +950,62 @@ impl App {
     /// The lead's instructions as composed on attach, sent once no turn
     /// runs; the next turn reads them.
     async fn configure(&mut self) {
-        if self.running.is_some() {
+        if self.running.is_some() || self.instruct.is_none() && self.switch.is_none() {
             return;
         }
-        let Some(text) = self.instruct.take() else {
+        let (text, switch) = (self.instruct.take(), self.switch.take());
+        let mut asked = json!({"bot": self.bot});
+        if let Some(text) = &text {
+            asked["instructions"] = json!(text);
+        }
+        if let Some((model, effort)) = &switch {
+            asked["model"] = json!(model);
+            asked["effort"] = json!(effort);
+        }
+        match self.client.request("configure", asked).await {
+            Ok(_) => {
+                if let Some((model, effort)) = switch {
+                    project::remember(&model);
+                    self.model = model;
+                    self.effort = effort;
+                    // The bot's own model now, for this window's turns too.
+                    self.turn_model = None;
+                }
+            }
+            Err(error) if error.code == "bot_busy" => {
+                self.instruct = text;
+                self.switch = switch;
+            }
+            Err(error) => self.notice = Some(error.to_string()),
+        }
+    }
+
+    /// `/model`'s listing, once it arrives: the picker opens on it.
+    fn listed(&mut self) {
+        let Some(listing) = &mut self.listing else {
             return;
         };
-        let asked = json!({"bot": self.bot, "instructions": text});
-        if let Err(error) = self.client.request("configure", asked).await {
-            match error.code.as_str() {
-                "bot_busy" => self.instruct = Some(text),
-                _ => self.notice = Some(format!("the lead's instructions: {error}")),
+        let answer = match listing.try_recv() {
+            Ok(answer) => answer,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return,
+            Err(_) => Err("the listing was dropped".into()),
+        };
+        self.listing = None;
+        match answer {
+            Ok(listing) => {
+                self.notice = None;
+                let (model, effort) = match &self.switch {
+                    Some((model, effort)) => (model.as_str(), effort.as_deref()),
+                    None => (self.model.as_str(), self.effort.as_deref()),
+                };
+                self.picker = Some(models::Picker::new(
+                    &listing,
+                    self.client.providers(),
+                    model,
+                    effort,
+                ));
             }
+            Err(error) => self.notice = Some(error),
         }
     }
 
@@ -1028,7 +1084,10 @@ impl App {
             {
                 let page = self
                     .client
-                    .request("turns", json!({"bot": self.bot, "newest": true, "limit": 8}))
+                    .request(
+                        "turns",
+                        json!({"bot": self.bot, "newest": true, "limit": 8}),
+                    )
                     .await
                     .unwrap_or_default();
                 let row = page["turns"]
@@ -1053,7 +1112,8 @@ impl App {
                 });
                 status_report("working", &self.bot);
             }
-            self.approvals_for(self.running.as_ref().map(|r| r.turn)).await;
+            self.approvals_for(self.running.as_ref().map(|r| r.turn))
+                .await;
         }
         if let Some(fleet) = &mut self.fleet
             && fleet.down
@@ -1734,6 +1794,41 @@ impl App {
             }
             return;
         }
+        if let Some(picker) = &mut self.picker {
+            match event {
+                Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
+                    KeyCode::Up => picker.up(),
+                    KeyCode::Down => picker.down(),
+                    KeyCode::Left => picker.less(),
+                    KeyCode::Right => picker.more(),
+                    KeyCode::Backspace => {
+                        let mut filter = picker.filter.clone();
+                        filter.pop();
+                        picker.narrow(filter);
+                    }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.picker = None
+                    }
+                    KeyCode::Char(c) => picker.narrow(format!("{}{c}", picker.filter)),
+                    KeyCode::Esc => self.picker = None,
+                    KeyCode::Enter => {
+                        if let Some(chosen) = picker.chosen() {
+                            self.picker = None;
+                            self.switch = Some(chosen);
+                            self.configure().await;
+                            if self.switch.is_some() {
+                                self.notice = Some("switches when this turn ends".into());
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                Event::Paste(text) => picker.narrow(format!("{}{text}", picker.filter)),
+                Event::Resize(width, _) => self.width = width as usize,
+                _ => {}
+            }
+            return;
+        }
         let menu = self.menu();
         if let Event::Key(key) = &event
             && key.kind != KeyEventKind::Release
@@ -1844,6 +1939,18 @@ impl App {
                 }
                 None => "no HTML page in this conversation yet".into(),
             });
+            return;
+        }
+        if prompt == "/model" {
+            self.input.clear();
+            let (send, receive) = tokio::sync::oneshot::channel();
+            let client = self.client.clone();
+            tokio::spawn(async move {
+                let listing = client.request("provider_models", json!({})).await;
+                let _ = send.send(listing.map_err(|error| error.to_string()));
+            });
+            self.listing = Some(receive);
+            self.notice = Some("listing models…".into());
             return;
         }
         if prompt == "/quit" {
@@ -1958,6 +2065,63 @@ impl App {
                 };
                 frame.render_widget(ratatui::widgets::Clear, area);
                 frame.render_widget(Paragraph::new(rows), area);
+            }
+            if let Some(picker) = &self.picker {
+                let shown = picker.shown();
+                let at = picker.at();
+                let first = at.saturating_sub(2).min(shown.len().saturating_sub(3));
+                let mut rows: Vec<Line> = shown
+                    .iter()
+                    .enumerate()
+                    .skip(first)
+                    .take(3)
+                    .map(|(i, model)| {
+                        let mark = if *model == self.model { "• " } else { "  " };
+                        if i == at {
+                            Line::from(vec![
+                                Span::raw(format!("  {mark}")),
+                                Span::raw(format!(" {model} ")).reversed(),
+                            ])
+                        } else {
+                            Line::from(format!("  {mark} {model}"))
+                        }
+                    })
+                    .collect();
+                // Why the list is short, in the rows it leaves.
+                for refused in picker.refused.iter().take(3 - rows.len()) {
+                    rows.push(Line::from(format!("     {refused}")).dim());
+                }
+                let area = ratatui::layout::Rect {
+                    y: composer.y.saturating_sub(3),
+                    height: 3,
+                    ..composer
+                };
+                frame.render_widget(ratatui::widgets::Clear, area);
+                frame.render_widget(Paragraph::new(rows), area);
+                let effort = picker.effort().unwrap_or("default");
+                let line = if picker.filter.is_empty() {
+                    Line::from(vec![
+                        Span::raw("› ").bold(),
+                        Span::raw("type to narrow").dim(),
+                    ])
+                } else {
+                    Line::from(vec![
+                        Span::raw("› ").bold(),
+                        Span::raw(picker.filter.clone()),
+                    ])
+                };
+                frame.render_widget(Paragraph::new(line), composer);
+                frame.set_cursor_position((
+                    composer.x + 2 + picker.filter.width() as u16,
+                    composer.y,
+                ));
+                let keys = Line::from(vec![
+                    Span::raw("  effort ").dim(),
+                    Span::raw(format!("‹ {effort} ›")).bold(),
+                    Span::raw("  ↑↓ model · ←→ effort · enter to switch · esc").dim(),
+                ]);
+                frame.render_widget(Paragraph::new(keys), footer);
+                return;
             }
             let (text, cursor) = if self.input.is_empty() {
                 let hint = if self.running.is_some() {

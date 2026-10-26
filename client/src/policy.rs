@@ -1116,8 +1116,14 @@ mod tests {
         std::fs::create_dir_all(home.join(".agents")).unwrap();
         std::fs::create_dir_all(home.join("Developer/plain")).unwrap();
         std::fs::write(home.join(".agents/project.toml"), "name = \"me\"\n").unwrap();
-        assert_eq!(project_from(&home.join("Developer/plain"), Some(&home)).unwrap(), None);
-        assert_eq!(project_from(&home, Some(&home)).unwrap().as_deref(), Some("me"));
+        assert_eq!(
+            project_from(&home.join("Developer/plain"), Some(&home)).unwrap(),
+            None
+        );
+        assert_eq!(
+            project_from(&home, Some(&home)).unwrap().as_deref(),
+            Some("me")
+        );
         std::fs::write(repo.join("web/.agents/project.toml"), "name = \"../up\"\n").unwrap();
         let error = project(&repo.join("web")).unwrap_err();
         assert_eq!(error.code(), "instructions_unreadable");

@@ -10599,13 +10599,18 @@ fn instructions_are_replaced_and_a_fork_keys_its_own_cache_after() {
     assert_eq!(fork.cache_bot(), made.bot_id);
     // The same text again changes nothing.
     assert!(!db.set_instructions("Ben", None, "test").unwrap());
-    assert!(db.set_instructions("Ben", Some(fork.bot_id), "new rules").unwrap());
+    assert!(
+        db.set_instructions("Ben", Some(fork.bot_id), "new rules")
+            .unwrap()
+    );
     let after = db.inspect("Ben").unwrap();
     assert_eq!(after.instructions, "new rules");
     assert_eq!(after.cache_bot(), fork.bot_id);
     assert_eq!(db.inspect("Ann").unwrap().instructions, "test");
     // Another identity under the name is refused.
-    let refused = db.set_instructions("Ben", Some(made.bot_id), "x").unwrap_err();
+    let refused = db
+        .set_instructions("Ben", Some(made.bot_id), "x")
+        .unwrap_err();
     assert_eq!(refused.code, "bot_not_found");
 }
 
@@ -10613,11 +10618,23 @@ fn instructions_are_replaced_and_a_fork_keys_its_own_cache_after() {
 fn a_bot_is_pointed_at_another_model_and_effort() {
     let mut db = db();
     db.create("Ann", None, binding()).unwrap();
-    assert!(!db.set_model("Ann", None, "openai", "synthetic-model", None).unwrap());
-    assert!(db.set_model("Ann", None, "openai", "other", Some("high")).unwrap());
+    assert!(
+        !db.set_model("Ann", None, "openai", "synthetic-model", None)
+            .unwrap()
+    );
+    assert!(
+        db.set_model("Ann", None, "openai", "other", Some("high"))
+            .unwrap()
+    );
     let ann = db.inspect("Ann").unwrap();
-    assert_eq!((ann.model.as_str(), ann.effort.as_deref()), ("other", Some("high")));
-    assert!(!db.set_model("Ann", None, "openai", "other", Some("high")).unwrap());
+    assert_eq!(
+        (ann.model.as_str(), ann.effort.as_deref()),
+        ("other", Some("high"))
+    );
+    assert!(
+        !db.set_model("Ann", None, "openai", "other", Some("high"))
+            .unwrap()
+    );
     assert!(db.set_model("Ann", None, "openai", "other", None).unwrap());
     assert_eq!(db.inspect("Ann").unwrap().effort, None);
 }

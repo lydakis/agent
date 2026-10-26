@@ -4,9 +4,9 @@
 //! on the runtime crate.
 pub mod approver;
 pub mod env_file;
-pub mod project;
 pub mod models;
 pub mod policy;
+pub mod project;
 pub mod socket;
 
 use serde_json::{Value, json};
@@ -135,6 +135,8 @@ pub struct Client {
     /// The store's identity from `ready`: the same file under the same
     /// lineage, whichever socket its daemon listens on.
     store: Option<String>,
+    /// `ready.providers`: each binding's family and the efforts it takes.
+    providers: Value,
 }
 
 impl Client {
@@ -191,6 +193,7 @@ impl Client {
             return Err(error);
         }
         let store = ready["store"]["identity"].as_str().map(str::to_owned);
+        let providers = ready["providers"].clone();
         let pending: Pending = Arc::default();
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (events, receiver) = mpsc::channel(QUEUE);
@@ -257,6 +260,7 @@ impl Client {
                 next: std::sync::atomic::AtomicU64::new(0),
                 closed,
                 store,
+                providers,
             }),
             Events(receiver),
         ))
@@ -271,6 +275,11 @@ impl Client {
 
     pub fn store(&self) -> Option<&str> {
         self.store.as_deref()
+    }
+
+    /// The daemon's provider bindings as `ready` announced them.
+    pub fn providers(&self) -> &Value {
+        &self.providers
     }
 
     pub async fn request(&self, op: &str, mut params: Value) -> Result<Value> {
@@ -336,6 +345,7 @@ mod tests {
             next: std::sync::atomic::AtomicU64::new(0),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             store: None,
+            providers: Value::Null,
         });
         let mut lines = BufReader::new(peer).lines();
         for _ in 0..20 {
@@ -365,6 +375,7 @@ mod tests {
             next: std::sync::atomic::AtomicU64::new(0),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             store: None,
+            providers: Value::Null,
         });
         let mut lines = BufReader::new(peer).lines();
         let request = tokio::spawn({
@@ -402,6 +413,7 @@ mod tests {
             next: std::sync::atomic::AtomicU64::new(0),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             store: None,
+            providers: Value::Null,
         });
         let request = tokio::spawn({
             let client = client.clone();

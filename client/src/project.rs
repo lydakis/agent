@@ -141,7 +141,6 @@ pub fn read(dir: &Path) -> Result<Value, String> {
     }))
 }
 
-
 /// A project's task settings, said to its coordinator as the flags its
 /// starts take. The model is always named, so a role a task starts in
 /// (--profile) cannot swap it: the one picked, else the lead's own, which

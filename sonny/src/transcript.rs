@@ -926,12 +926,7 @@ fn shown(path: &str, workspace: &str) -> String {
     }
 }
 
-pub fn finished(
-    status: &str,
-    detail: &str,
-    seconds: Option<u64>,
-    width: usize,
-) -> Line<'static> {
+pub fn finished(status: &str, detail: &str, seconds: Option<u64>, width: usize) -> Line<'static> {
     let mut label = match status {
         "completed" => "Worked".to_owned(),
         "steered" => "Steered".to_owned(),

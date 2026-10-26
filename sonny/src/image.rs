@@ -257,7 +257,9 @@ mod tests {
     fn an_svg_renders_to_a_png_of_whole_cells() {
         let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="160" height="80">
             <rect width="160" height="80" fill="orange"/></svg>"#;
-        let Drawn { png, cols, rows, .. } = render(svg, 80).unwrap();
+        let Drawn {
+            png, cols, rows, ..
+        } = render(svg, 80).unwrap();
         assert_eq!((cols, rows), (20, 5));
         assert!(png.starts_with(b"\x89PNG"));
         assert!(render("<svg", 80).is_err());

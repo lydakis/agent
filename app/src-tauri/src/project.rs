@@ -9,8 +9,8 @@
 use serde_json::{Value, json};
 use std::path::Path;
 
-pub use agent_client::project::{FILE, read, tasks_rule, valid_name};
 use agent_client::project::THREADS_IN;
+pub use agent_client::project::{FILE, read, tasks_rule, valid_name};
 
 /// What a new project's threads run on and where they work.
 #[derive(Debug, Default)]
@@ -139,7 +139,6 @@ impl Requests for agent_client::Client {
         agent_client::Client::request(self, op, params).await
     }
 }
-
 
 /// Make the project in `dir` (a canonical directory): its coordinator in
 /// its role (`policy`, as composed for the folder), told its tasks'

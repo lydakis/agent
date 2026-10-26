@@ -452,7 +452,8 @@ its own order: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (with
 `aws configure export-credentials`, asked once at start for every SigV4
 binding and waited on at most three seconds. Keys the CLI cannot resolve
 by then (no login yet, an expired SSO session, a stalled CLI) do not stop
-the daemon: the binding's `ready.providers` entry carries `unresolved` with
+the daemon: the binding's `ready.providers` entry (its `family`, `url`,
+`transport` and the `efforts` its family takes) carries `unresolved` with
 the reason (its detail clipped to 200 bytes), and its next call resolves
 again, so `aws sso login` fixes it without a restart.
 A call with no usable keys fails before it is paced, admitted or its body

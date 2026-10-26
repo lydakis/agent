@@ -985,7 +985,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             return fail_with("duplicate_provider", spec.name.as_str());
         }
         let mut binding = json!({"family":spec.family.name(),"url":spec.url,
-            "transport":spec.transport()});
+            "transport":spec.transport(),"efforts":spec.family.efforts()});
         if let Some(Value::Object(auth)) = auth {
             binding.as_object_mut().expect("object").extend(auth);
         }
