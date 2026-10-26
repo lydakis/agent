@@ -10677,3 +10677,106 @@ fn a_root_bot_changes_its_gate_and_a_made_bot_keeps_its_own() {
         "gates_inherited"
     );
 }
+
+#[test]
+fn turns_keep_the_model_they_ran_at_after_the_bot_moves() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    converse(&mut db, "Bob", 1);
+    assert!(
+        db.set_model("Bob", None, "openai", "other", Some("high"))
+            .unwrap()
+    );
+    let next = db
+        .begin(
+            "Bob",
+            "r-next",
+            "next",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    // The finished turn ran at the old model and effort; the new one runs
+    // at the new.
+    let listed = db.turns("Bob", 0, None, 10, false).unwrap();
+    let rows = listed["turns"].as_array().unwrap();
+    assert_eq!(
+        (&rows[0]["model"], &rows[0]["effort"]),
+        (&json!("openai/synthetic-model"), &Value::Null)
+    );
+    assert_eq!(
+        (&rows[1]["model"], &rows[1]["effort"]),
+        (&json!("openai/other"), &json!("high"))
+    );
+    // So it does not take the old model's cache as its own.
+    let context = db.context(next).unwrap();
+    assert_eq!(context.model, "openai/other");
+    assert_eq!(
+        context.previous_call,
+        Some(("openai/synthetic-model".into(), None))
+    );
+}
+
+#[test]
+fn a_keyed_creation_resends_after_its_instructions_change() {
+    let mut db = db();
+    let made = || Binding {
+        request_id: Some("once"),
+        ..binding()
+    };
+    let (bot, _) = db.create("Bob", None, made()).unwrap();
+    assert!(db.set_instructions("Bob", None, "new rules").unwrap());
+    let (again, event) = db.create("Bob", None, made()).unwrap();
+    assert_eq!((again.bot_id, event), (bot.bot_id, None));
+    assert_eq!(again.instructions, "new rules");
+    let changed = Binding {
+        instructions: "new rules",
+        ..made()
+    };
+    assert_eq!(
+        db.create("Bob", None, changed).unwrap_err().code,
+        "idempotency_conflict"
+    );
+}
+
+#[test]
+fn schema_48_creations_keep_the_instructions_they_were_sent_with() {
+    let path = std::env::temp_dir().join(format!("agent-schema48-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let made = || Binding {
+        request_id: Some("once"),
+        ..binding()
+    };
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), made()).unwrap();
+        converse(&mut db, "Bob", 1);
+    }
+    // Before 49 a creation compared the bot's own instructions, and a turn
+    // read the bot's model.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "UPDATE bots SET creation=json_remove(creation,'$.request.instructions');
+             ALTER TABLE turns DROP COLUMN bot_model;
+             ALTER TABLE turns DROP COLUMN bot_reasoning;
+             PRAGMA user_version=48;",
+        )
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert!(db.set_instructions("Bob", None, "new rules").unwrap());
+    assert!(db.set_model("Bob", None, "openai", "other", None).unwrap());
+    let (_, event) = db.create("Bob", Some("/synthetic"), made()).unwrap();
+    assert_eq!(event, None);
+    let listed = db.turns("Bob", 0, None, 10, false).unwrap();
+    assert_eq!(listed["turns"][0]["model"], "openai/synthetic-model");
+    drop(db);
+    let version: i32 = Connection::open(&path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, Database::SCHEMA);
+    std::fs::remove_file(path).unwrap();
+}
