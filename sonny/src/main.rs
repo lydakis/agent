@@ -189,7 +189,9 @@ fn agent_bin() -> Option<PathBuf> {
         .map(PathBuf::from)
         .into_iter()
         .chain(beside)
-        .chain([PathBuf::from("/Applications/Agent.app/Contents/MacOS/agent")])
+        .chain([PathBuf::from(
+            "/Applications/Agent.app/Contents/MacOS/agent",
+        )])
         .find(|bin| bin.is_file())
 }
 
