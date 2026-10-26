@@ -763,6 +763,7 @@ pub fn spawn(socket: PathBuf, project: String, lead: String, workspace: PathBuf,
             held_since: None,
             urgent: None,
             last_wake: None,
+            refused: None,
             stopped: false,
             log: std::env::var_os("HOME")
                 .map(|home| PathBuf::from(home).join(".agent/sonny/lookout.jsonl")),
@@ -816,6 +817,8 @@ struct Lookout {
     /// A high answer is waiting to be sent: `Some(true)` steers.
     urgent: Option<bool>,
     last_wake: Option<Instant>,
+    /// When the last note was refused: even a steer waits the gap after.
+    refused: Option<Instant>,
     stopped: bool,
     log: Option<PathBuf>,
 }
@@ -1208,6 +1211,7 @@ impl Lookout {
         match submitted {
             Ok(_) => {
                 self.last_wake = Some(now);
+                self.refused = None;
                 self.urgent = self.pending();
                 self.held_since = (!self.held.is_empty()).then_some(now);
                 self.write(&json!({"at_ms": epoch_ms(), "lead": self.lead, "woke": key,
@@ -1226,6 +1230,7 @@ impl Lookout {
                     &json!({"at_ms": epoch_ms(), "lead": self.lead, "wake_failed": error.code}),
                 );
                 self.last_wake = Some(now);
+                self.refused = Some(now);
             }
         }
     }
@@ -1239,7 +1244,11 @@ impl Lookout {
         let stale = self
             .held_since
             .is_some_and(|since| now.duration_since(since) >= DIGEST_AFTER);
+        let refused = self
+            .refused
+            .is_some_and(|at| now.duration_since(at) < WAKE_GAP);
         !self.held.is_empty()
+            && !refused
             && (self.urgent == Some(true) || (spaced && (self.urgent.is_some() || stale)))
     }
 
@@ -1347,6 +1356,7 @@ pub async fn replay() -> Result<(), String> {
             held_since: None,
             urgent: None,
             last_wake: None,
+            refused: None,
             stopped: false,
             log: None,
         };
@@ -1514,6 +1524,7 @@ mod tests {
             held_since: None,
             urgent: None,
             last_wake: None,
+            refused: None,
             stopped: false,
             log: None,
         }
@@ -1952,6 +1963,11 @@ mod tests {
         assert!(lookout.wake_due(now + WAKE_GAP));
         lookout.urgent = Some(true);
         assert!(lookout.wake_due(now));
+        // A refused note is not sent again on every event.
+        lookout.refused = Some(now);
+        assert!(!lookout.wake_due(now));
+        assert!(lookout.wake_due(now + WAKE_GAP));
+        lookout.refused = None;
         lookout.urgent = None;
         lookout.held_since = Some(now);
         assert!(!lookout.wake_due(now + WAKE_GAP));
