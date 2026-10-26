@@ -16,6 +16,7 @@ mod errand;
 mod html;
 mod image;
 mod js;
+mod lookout;
 mod math;
 mod mermaid;
 mod models;
@@ -86,16 +87,22 @@ struct Options {
     rex_host: Option<String>,
     /// Ring when work ends or needs the person.
     sound: bool,
+    /// The decision model that wakes the lead when its tasks need it;
+    /// `None` with `--lookout off`.
+    lookout: Option<String>,
 }
 
 fn usage() -> String {
     "usage: sonny [--store PATH] [--socket PATH] [--model PROVIDER/MODEL] [--no-rex] [--rex-host HOST] [--no-sound]\n\
+     \x20      [--lookout openai-decisions/MODEL|typesafe/jev-*|off]\n\
      \x20      [--copies worktree|sandfs] [--bot NAME [--new [--workspace DIR]]]\n\
      With no --bot, the folder's coordinator, made with --model the first time; its tasks\n\
      open in the project's Rex session. Type /status for the project's agents.\n\
      --copies (or /copies): how its tasks get their own copy, kept for every folder: git\n\
      worktrees (the default), or sandfs copies, which take uncommitted changes along and\n\
-     work outside git too."
+     work outside git too.\n\
+     The lookout wakes the lead when its tasks need it, judged by openai-decisions/gpt-6-luna\n\
+     unless --lookout names another judge or off."
         .into()
 }
 
@@ -299,6 +306,7 @@ fn parse() -> Result<Options, String> {
     let (mut store, mut socket, mut bot, mut new, mut model, mut workspace) =
         (None, None, None, false, None, None);
     let (mut rex, mut rex_host, mut sound) = (true, None, true);
+    let mut lookout = Some(lookout::DEFAULT.to_owned());
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or_else(usage);
         match arg.as_str() {
@@ -311,6 +319,7 @@ fn parse() -> Result<Options, String> {
             "--no-rex" => rex = false,
             "--rex-host" => rex_host = Some(value()?),
             "--no-sound" => sound = false,
+            "--lookout" => lookout = Some(value()?).filter(|judge| judge != "off"),
             "--copies" => {
                 let copies = value()?;
                 if !agent_client::project::COPIES.contains(&copies.as_str()) {
@@ -342,6 +351,7 @@ fn parse() -> Result<Options, String> {
         rex,
         rex_host,
         sound,
+        lookout,
     })
 }
 
@@ -365,6 +375,9 @@ async fn run() -> Result<(), String> {
     if std::env::args().nth(1).as_deref() == Some("--version") {
         println!("sonny {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
+    }
+    if std::env::args().nth(1).as_deref() == Some("lookout-replay") {
+        return lookout::replay().await;
     }
     let options = parse()?;
     // Fonts are read before the first picture needs them.
@@ -463,6 +476,24 @@ async fn run() -> Result<(), String> {
                 )
             }
             Err(error) => app.notice = Some(format!("the lead's instructions: {error}")),
+        }
+    }
+    if let (Some(project), Some(judge), Some(dir)) = (
+        &project,
+        &options.lookout,
+        moving
+            .clone()
+            .or(bot["workspace"].as_str().map(PathBuf::from)),
+    ) {
+        match lookout::Judge::parse(judge) {
+            Ok(judge) => lookout::spawn(
+                options.socket.clone(),
+                project.clone(),
+                name.clone(),
+                dir,
+                judge,
+            ),
+            Err(error) => app.notice = Some(error),
         }
     }
     // Said last: it is what the next message does.
@@ -3354,6 +3385,7 @@ mod tests {
             rex: false,
             rex_host: None,
             sound: false,
+            lookout: None,
         };
         let mut app = App::new(client, "b", &json!({"name": "b"}), options);
         let event =
