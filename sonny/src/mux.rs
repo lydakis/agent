@@ -257,7 +257,7 @@ enum Kind {
 /// The multiplexer this terminal is in: Herdr when Sonny runs in a Herdr
 /// pane, Rex when in a Rex block or `host` names a Rex server.
 fn current(host: Option<&str>) -> Option<Kind> {
-    if host.is_none() && crate::herdr::inside() {
+    if host.is_none() && crate::herdr::pane().is_some() {
         return crate::herdr::find().map(Kind::Herdr);
     }
     let rex = std::env::var_os("REX_SESSION").is_some() || host.is_some();
@@ -270,7 +270,10 @@ fn current(host: Option<&str>) -> Option<Kind> {
 pub fn here(project: &str, host: Option<&str>) -> Option<Layout> {
     let backend: Box<dyn Backend> = match current(host)? {
         Kind::Rex(bin) => Box::new(crate::rex::Rex::open(bin, host, project, true).ok()?),
-        Kind::Herdr(bin) => Box::new(crate::herdr::Herdr::open(bin, project, true).ok()?),
+        Kind::Herdr(bin) => {
+            let pane = crate::herdr::pane();
+            Box::new(crate::herdr::Herdr::open(bin, project, pane.as_deref()).ok()?)
+        }
     };
     Some(Layout::new(backend))
 }
@@ -283,10 +286,10 @@ pub fn for_agent(project: &str, host: Option<&str>) -> Result<Layout, String> {
     let rex = crate::rex::find();
     let backend: Box<dyn Backend> = match (herdr, rex) {
         (Some(herdr), _) if crate::herdr::has_lead(&herdr, project) => {
-            Box::new(crate::herdr::Herdr::open(herdr, project, false)?)
+            Box::new(crate::herdr::Herdr::open(herdr, project, None)?)
         }
         (_, Some(rex)) => Box::new(crate::rex::Rex::open(rex, host, project, false)?),
-        (Some(herdr), None) => Box::new(crate::herdr::Herdr::open(herdr, project, false)?),
+        (Some(herdr), None) => Box::new(crate::herdr::Herdr::open(herdr, project, None)?),
         (None, None) => return Err("neither rex nor herdr was found".into()),
     };
     Ok(Layout::new(backend))

@@ -22,9 +22,12 @@ pub fn find() -> Option<PathBuf> {
         .find(|herdr| herdr.is_file())
 }
 
-/// Whether Sonny runs in a Herdr pane.
-pub fn inside() -> bool {
-    std::env::var_os("HERDR_PANE_ID").is_some_and(|p| !p.is_empty())
+/// The Herdr pane Sonny runs in, by the ID it was launched with: a pane
+/// moved since keeps that ID as an alias, which `pane get` resolves.
+pub fn pane() -> Option<String> {
+    std::env::var("HERDR_PANE_ID")
+        .ok()
+        .filter(|p| !p.is_empty())
 }
 
 /// Whether the project's lead is in a pane of the Herdr server this shell
@@ -51,6 +54,8 @@ pub struct Herdr {
     name: String,
     /// Whether the workspace is the one Sonny runs in.
     here: bool,
+    /// The pane Sonny runs in, by its current ID.
+    me: Option<String>,
 }
 
 /// A word as a POSIX shell reads it back, for `pane run`, which types its
@@ -86,22 +91,28 @@ impl Herdr {
                 .map_or_else(|| said.trim().to_owned(), str::to_owned);
             return Err(format!("herdr {what}: {message}"));
         }
+        // `pane run`, `send-text` and `send-keys` print nothing when they
+        // succeed.
+        if out.stdout.trim_ascii().is_empty() {
+            return Ok(Value::Null);
+        }
         let reply: Value =
             serde_json::from_slice(&out.stdout).map_err(|e| format!("herdr {what}: {e}"))?;
         Ok(reply["result"].clone())
     }
 
-    /// The project's workspace. From the terminal Sonny runs in
-    /// (`terminal`), that pane's workspace, so the lead stays where the
+    /// The project's workspace. From the pane Sonny runs in (`terminal`),
+    /// the workspace that pane is in now, so the lead stays where the
     /// person opened it and tasks open beside it. Otherwise, as from an
     /// agent's shell: the workspace the project's lead is in, else the one
     /// labelled with the project's name, made when there is none.
-    pub fn open(bin: PathBuf, label: &str, terminal: bool) -> Result<Self, String> {
+    pub fn open(bin: PathBuf, label: &str, terminal: Option<&str>) -> Result<Self, String> {
         let mut herdr = Self {
             bin,
             workspace: String::new(),
             name: label.to_owned(),
             here: false,
+            me: None,
         };
         let workspaces: Vec<(String, String)> = herdr
             .call(&["workspace", "list"])?
@@ -116,10 +127,10 @@ impl Herdr {
                 ))
             })
             .collect();
-        let mine = std::env::var("HERDR_WORKSPACE_ID").unwrap_or_default();
-        let current = workspaces
-            .iter()
-            .find(|(id, _)| terminal && !mine.is_empty() && *id == mine);
+        let me = terminal.and_then(|pane| herdr.call(&["pane", "get", pane]).ok());
+        let current = me.as_ref().and_then(|me| {
+            (workspaces.iter()).find(|(id, _)| me["pane"]["workspace_id"] == id.as_str())
+        });
         let lead = format!("{label}.lead");
         let leads = || {
             let panes = herdr.call(&["pane", "list"]).ok()?;
@@ -135,6 +146,9 @@ impl Herdr {
         (herdr.workspace, herdr.name) = match current {
             Some((id, now)) => {
                 herdr.here = true;
+                herdr.me = me
+                    .as_ref()
+                    .and_then(|me| me["pane"]["pane_id"].as_str().map(str::to_owned));
                 (id.clone(), now.clone())
             }
             None => match leads().or_else(found) {
@@ -275,13 +289,7 @@ impl Backend for Herdr {
     }
 
     fn own_block(&self) -> Option<String> {
-        let mine = std::env::var("HERDR_PANE_ID")
-            .ok()
-            .filter(|p| !p.is_empty())?;
-        self.blocks()
-            .into_iter()
-            .find(|b| b.id == mine)
-            .map(|b| b.id)
+        self.me.clone()
     }
 
     /// Where each pane sits, by label: its tab's number, and beside the
@@ -401,10 +409,16 @@ elif what == ["pane", "rename"]:
 elif what == ["pane", "close"]:
     state["panes"] = [p for p in state["panes"] if p["pane_id"] != args[2]]
     out = {"type": "ok"}
+elif what == ["pane", "get"]:
+    pid = state.get("aliases", {}).get(args[2], args[2])
+    out = {"type": "pane_info", "pane": [p for p in state["panes"] if p["pane_id"] == pid][0]}
+elif what in (["pane", "run"], ["pane", "send-text"], ["pane", "send-keys"]):
+    out = None
 else:
     out = {"type": "ok"}
 json.dump(state, open(os.path.join(here, "state.json"), "w"))
-print(json.dumps({"id": "cli:request", "result": out}))
+if out is not None:
+    print(json.dumps({"id": "cli:request", "result": out}))
 "#;
 
     fn fake(name: &str, state: Value) -> (PathBuf, PathBuf) {
@@ -454,7 +468,7 @@ print(json.dumps({"id": "cli:request", "result": out}))
                 ],
             }),
         );
-        let herdr = Herdr::open(bin, "graft", false).unwrap();
+        let herdr = Herdr::open(bin, "graft", None).unwrap();
         assert_eq!(
             (herdr.workspace.as_str(), herdr.home().as_str()),
             ("w1", "Herdr workspace lydakis")
@@ -523,9 +537,34 @@ print(json.dumps({"id": "cli:request", "result": out}))
     }
 
     #[test]
+    fn sonny_finds_its_pane_after_the_pane_moved() {
+        let (bin, dir) = fake(
+            "moved",
+            json!({
+                "n": 10,
+                "workspaces": [
+                    {"workspace_id": "w1", "label": "notes"},
+                    {"workspace_id": "w2", "label": "shop"},
+                ],
+                "panes": [{"pane_id": "w2:p7", "workspace_id": "w2", "tab_id": "w2:t1", "label": null}],
+                "aliases": {"w1:p3": "w2:p7"},
+            }),
+        );
+        let herdr = Herdr::open(bin, "shop", Some("w1:p3")).unwrap();
+        assert!(herdr.here());
+        assert_eq!(herdr.workspace, "w2");
+        let mut layout = Layout::new(Box::new(herdr));
+        layout.adopt_own("shop.lead");
+        assert_eq!(labels(&dir), ["shop.lead"]);
+        let sleep = ["sleep".to_owned(), "60".into()];
+        assert!(layout.show("shop.fix", "fix", &sleep).unwrap());
+        assert!(calls(&dir).iter().any(|c| c[..2] == ["pane", "run"]));
+    }
+
+    #[test]
     fn a_project_without_a_workspace_gets_one() {
         let (bin, dir) = fake("new", json!({"n": 0, "workspaces": [], "panes": []}));
-        let herdr = Herdr::open(bin, "shop", false).unwrap();
+        let herdr = Herdr::open(bin, "shop", None).unwrap();
         assert_eq!(herdr.home(), "Herdr workspace shop");
         assert!(!herdr.here());
         assert!(
@@ -545,7 +584,7 @@ print(json.dumps({"id": "cli:request", "result": out}))
     #[ignore]
     fn real_herdr() {
         let bin = find().expect("herdr on the PATH");
-        let herdr = Herdr::open(bin, "sonnycheck", false).unwrap();
+        let herdr = Herdr::open(bin, "sonnycheck", None).unwrap();
         let workspace = herdr.workspace.clone();
         let lead = herdr.blocks()[0].id.clone();
         herdr.rename_block(&lead, "sonnycheck.lead");
@@ -582,9 +621,10 @@ print(json.dumps({"id": "cli:request", "result": out}))
         let windows = layout.windows();
         let places = layout.places();
         println!("windows: {windows:?}\nplaces: {places:?}");
-        let check = Herdr::open(find().unwrap(), "sonnycheck", false).unwrap();
-        let read = check
-            .call(&[
+        let check = Herdr::open(find().unwrap(), "sonnycheck", None).unwrap();
+        // `pane read` prints the pane's text, not JSON.
+        let read = Command::new(find().unwrap())
+            .args([
                 "pane",
                 "read",
                 &tests,
@@ -593,7 +633,9 @@ print(json.dumps({"id": "cli:request", "result": out}))
                 "--lines",
                 "20",
             ])
-            .unwrap_or(Value::Null);
+            .output()
+            .unwrap();
+        let read = String::from_utf8_lossy(&read.stdout);
         println!("tests pane: {read}");
         assert_eq!(places["sonnycheck.docs"].1.as_ref().unwrap().0, "left of");
         assert_eq!(
