@@ -433,6 +433,34 @@ pub fn handle_bot(handle: &str) -> String {
     }
 }
 
+/// The task turns a call waits on, by bot and turn: the wait tool's
+/// handles, or an `agent wait` command's.
+pub fn waited_on(name: &str, arguments: &Value) -> Vec<(String, i64)> {
+    let handles: Vec<String> = match name {
+        "wait" => arguments["handles"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|h| h.as_str().map(str::to_owned))
+            .collect(),
+        "shell" => parts(arguments["command"].as_str().unwrap_or(""))
+            .iter()
+            .filter(|part| said(part, "", false).is_some_and(|s| s.verb == "Waited for"))
+            .filter_map(|part| crate::shell::simple(part))
+            .flat_map(|simple| simple.words)
+            .filter(|word| word.starts_with("turn:"))
+            .collect(),
+        _ => Vec::new(),
+    };
+    handles
+        .iter()
+        .filter_map(|handle| {
+            let (bot, turn) = handle.strip_prefix("turn:")?.rsplit_once('/')?;
+            Some((bot.to_owned(), turn.parse().ok()?))
+        })
+        .collect()
+}
+
 /// A wait's reply as lines: `BOT completed: first line of its reply`.
 pub fn waited(reply: &Value) -> Option<Vec<String>> {
     let mut lines = Vec::new();
@@ -827,6 +855,19 @@ Keep the rest.'"#,
             ("Applied the changes of Errand job", "mini/01JB2Q8W3V4K")
         );
         assert!(said("errand doctor", "", false).is_none());
+    }
+
+    #[test]
+    fn a_wait_names_the_turns_it_takes() {
+        let handles = serde_json::json!({"handles": ["turn:shop.fix/7", "turn:shop.docs/12"]});
+        assert_eq!(
+            waited_on("wait", &handles),
+            [("shop.fix".to_owned(), 7), ("shop.docs".to_owned(), 12)]
+        );
+        let command = serde_json::json!({"command":
+            r#"cd /x && "$AGENT_BIN" wait turn:shop.fix/7 --timeout 600; echo turn:shop.other/1"#});
+        assert_eq!(waited_on("shell", &command), [("shop.fix".to_owned(), 7)]);
+        assert!(waited_on("read", &handles).is_empty());
     }
 
     #[test]

@@ -705,6 +705,12 @@ struct Fleet {
     /// Finished calls whose output names a job to follow in a window:
     /// the bot, the output's node, and the command.
     jobs: Vec<(String, i64, String, String)>,
+    /// Tasks whose last turn completed, and that turn: its window closes
+    /// once a wait has taken the result.
+    ended: HashMap<String, i64>,
+    /// Waits running in the project, by bot and call: the task turns they
+    /// wait on.
+    waits: HashMap<(String, String), Vec<(String, i64)>>,
 }
 
 impl Fleet {
@@ -748,6 +754,8 @@ impl Fleet {
             alerts: Vec::new(),
             errands: HashMap::new(),
             jobs: Vec::new(),
+            ended: HashMap::new(),
+            waits: HashMap::new(),
         };
         fleet.rex.adopt_own(lead);
         fleet.doing(lead, "idle");
@@ -818,6 +826,55 @@ impl Fleet {
                     && data["failed"] != true
                 {
                     self.jobs.push((bot.to_owned(), node, call, command));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A finished task's window closes once its result is taken: its turn
+    /// completed and a wait in the project (the lead's, or a task's on its
+    /// own task) returned it. One that failed, stopped or needs the person
+    /// stays open, and a task given more work opens again.
+    fn taken(&mut self, bot: &str, kind: &str, event: &Value) {
+        let data = &event["data"];
+        let call = || {
+            (
+                bot.to_owned(),
+                data["call_id"].as_str().unwrap_or("").to_owned(),
+            )
+        };
+        match kind {
+            "accepted" => {
+                self.ended.remove(bot);
+            }
+            "turn_finished" => match (data["status"].as_str(), event["turn"].as_i64()) {
+                (Some("completed"), Some(turn)) => {
+                    self.ended.insert(bot.to_owned(), turn);
+                }
+                _ => {
+                    self.ended.remove(bot);
+                }
+            },
+            "tool_started" => {
+                let arguments = data["arguments"]
+                    .as_str()
+                    .and_then(|a| serde_json::from_str::<Value>(a).ok())
+                    .unwrap_or(Value::Null);
+                let turns = calls::waited_on(data["name"].as_str().unwrap_or(""), &arguments);
+                if !turns.is_empty() {
+                    self.waits.insert(call(), turns);
+                }
+            }
+            "tool_completed" => {
+                // A wait that returned before the turn ended timed out.
+                for (task, turn) in self.waits.remove(&call()).unwrap_or_default() {
+                    if task != self.lead && self.ended.get(&task) == Some(&turn) {
+                        self.ended.remove(&task);
+                        self.rex.close(&task);
+                        self.doing.remove(&task);
+                        self.name_windows();
+                    }
                 }
             }
             _ => {}
@@ -961,6 +1018,7 @@ impl Fleet {
         let data = &event["data"];
         if self.lineage.contains(bot) {
             self.errand(bot, kind, data);
+            self.taken(bot, kind, event);
             match kind {
                 "accepted" if bot == self.lead => self.doing(bot, "working"),
                 "approval_requested" => {
