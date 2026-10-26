@@ -49,6 +49,24 @@ When `errand` is installed, Sonny writes an `errand` skill so any agent can
 run a command on another machine, draws those runs as `Ran COMMAND on
 PEER`, and in Rex opens a window following each detached job.
 
+A lead also has a lookout: a decision model that watches its tasks and
+wakes the lead only when it should step in. It is asked a few yes-or-no
+questions (does the person's message redirect other tasks, does a task
+conflict with another, is one stuck or off its brief, is there a result the
+person should hear, a lasting preference worth saving) about each message in
+a task, each finished turn, and each approval waiting over two minutes, with
+the project's memory indexes in view. A high answer wakes the lead with a
+short note of turn handles and what to do (urgent ones steer it), a middling
+one waits for the next note, and the rest are only logged, to
+`~/.agent/sonny/lookout.jsonl`. The note reaches the approver as the
+person's words, so the lead can act on it (pass a preference on, save it
+to memory) without asking, and it quotes only the person's own words. The
+judge is `openai-decisions/gpt-6-luna` (needs `OPENAI_API_KEY`, about
+$0.0002 a check); `--lookout typesafe/jev-*` picks Jev, `--lookout off`
+turns it off. `sonny lookout-replay --judge SPEC` runs the same checks over
+the store's retained history, and `demo/lookout_score.py` scores that
+against labels.
+
 The look follows Codex's TUI (openai/codex, `codex-rs/tui`): finished history
 goes into the terminal's own scrollback above a small inline viewport,
 replies stream a line at a time, a tool call is one `• Ran …` line with a
