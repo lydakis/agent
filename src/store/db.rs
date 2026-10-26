@@ -95,7 +95,8 @@ pub struct Bot {
     /// choice at creation; forks inherit it.
     pub fallbacks: bool,
     /// Tools whose calls wait for a verdict, per approver tag. Fixed at
-    /// creation: a bot keeps every gate it descends from.
+    /// creation, except a root bot's through `configure`: a bot keeps every
+    /// gate it descends from.
     pub gates: Vec<Gate>,
     /// The denials each gate tag has given this bot's calls, kept by the
     /// daemon so an approver that restarts or takes over counts on.
@@ -1729,6 +1730,69 @@ impl Database {
             )
             .optional()?
             .ok_or(Error::new("bot_not_found"))
+    }
+    /// Replace a bot's instructions, as its client composes them now; whether
+    /// they changed. Its next request sends the new ones, so the provider's
+    /// cache of the old is not read again and replayed thinking written
+    /// after them is withheld, as when any context in front of it changes.
+    /// A fork, which read its source's cache, keys its own from then on.
+    pub fn set_instructions(
+        &mut self,
+        name: &str,
+        bot_id: Option<i64>,
+        instructions: &str,
+    ) -> Result<bool> {
+        let id = self.identity(name, bot_id)?;
+        let changed = self.conn.execute(
+            "UPDATE bots SET instructions=?, cache_bot=NULL WHERE id=? AND instructions<>?",
+            params![instructions, id, instructions],
+        )?;
+        Ok(changed == 1)
+    }
+    /// Point a bot at another model of its family, and its effort level;
+    /// whether either changed. The daemon has checked both.
+    pub fn set_model(
+        &mut self,
+        name: &str,
+        bot_id: Option<i64>,
+        provider: &str,
+        model: &str,
+        effort: Option<&str>,
+    ) -> Result<bool> {
+        let id = self.identity(name, bot_id)?;
+        let changed = self.conn.execute(
+            "UPDATE bots SET provider=?, model=?, reasoning=? WHERE id=?
+             AND (provider<>? OR model<>? OR reasoning IS NOT ?)",
+            params![provider, model, effort, id, provider, model, effort],
+        )?;
+        Ok(changed == 1)
+    }
+    /// Replace a root bot's gates: a bot another bot made keeps the gates
+    /// it descends from, so it cannot be let out of them. Whether anything
+    /// changed.
+    pub fn set_gate(
+        &mut self,
+        name: &str,
+        bot_id: Option<i64>,
+        gate: Option<Gate>,
+    ) -> Result<bool> {
+        let id = self.identity(name, bot_id)?;
+        let bot = self.inspect(name)?;
+        if bot.created_by_id.is_some() {
+            return fail_with(
+                "gates_inherited",
+                format!("{name} was made by another bot and keeps its gates"),
+            );
+        }
+        if let Some(gate) = &gate {
+            not_in_tools(&gate.tools, &bot.tools)?;
+        }
+        let gates = stored_gates(gate.as_slice())?;
+        let changed = self.conn.execute(
+            "UPDATE bots SET gates=? WHERE id=? AND gates IS NOT ?",
+            params![gates, id, gates],
+        )?;
+        Ok(changed == 1)
     }
     /// Bounded keyset pages. Full instructions remain available through inspect.
     /// A page of bots in name order after `after`. `name` keeps those whose

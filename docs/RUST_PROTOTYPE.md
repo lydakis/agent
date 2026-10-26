@@ -452,7 +452,8 @@ its own order: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (with
 `aws configure export-credentials`, asked once at start for every SigV4
 binding and waited on at most three seconds. Keys the CLI cannot resolve
 by then (no login yet, an expired SSO session, a stalled CLI) do not stop
-the daemon: the binding's `ready.providers` entry carries `unresolved` with
+the daemon: the binding's `ready.providers` entry (its `family`, `url`,
+`transport` and the `efforts` its family takes) carries `unresolved` with
 the reason (its detail clipped to 200 bytes), and its next call resolves
 again, so `aws sso login` fixes it without a restart.
 A call with no usable keys fails before it is paced, admitted or its body
@@ -973,6 +974,7 @@ own path from the turn. Example requests:
 {"id":19,"op":"submit","bot":"Bob","request_id":"work-2","prompt":"Also check the docs","delivery":"steer"}
 {"id":3,"op":"follow","bot":"Bob","after":0}
 {"id":4,"op":"inspect","bot":"Bob"}
+{"id":24,"op":"configure","bot":"Bob","bot_id":1,"instructions":"...","model":"anthropic/claude-opus-5-5","effort":"high"}
 {"id":5,"op":"events","bot":"Bob","after":0,"limit":100}
 {"id":20,"op":"history_nodes","bot":"Alternative","from":2,"limit":400}
 {"id":6,"op":"history_items","bot":"Bob","nodes":[2]}
@@ -1137,6 +1139,27 @@ omit instructions; `inspect` returns the full individual bot record. With `bot_i
 a bot that no longer holds that identity is `bot_not_found`, as on `submit`. Concurrent
 creations before an already-consumed cursor require restarting the listing.
 `agent ls` reads pages incrementally while preserving its JSON-array output.
+Protocol version 14 adds `configure`, which changes what a bot's client
+chose for it when it was made: its `instructions` (up to 64 KiB, as on
+`create`), and its `model` with an optional `effort` (absent is the model's
+default). A bot's instructions are otherwise fixed when it is made, so a
+client recomposes them (skills, memory, folder rules added since) and sends
+them here. A model must be of the bot's family, as a turn's own model must,
+since its history is kept in that family's encoding
+(`provider_family_mismatch`). A gate (`approve`, `approver` and optionally
+`approve_expire_ms`, as on `create`) replaces the bot's gates, and
+`approve: []` alone removes them; only a bot no bot made may change them,
+since a bot keeps the gates it descends from (`gates_inherited`), and bots
+it already made keep theirs. The gate is checked before anything is
+written. It answers `{bot, bot_id, changed}`, `changed` naming the fields
+(`model`, `instructions`, `gates`) that differed; the same request again
+changes nothing, so a resend is harmless. A change is told to the bot's
+followers as a live `configured` event with the same fields, which is not
+kept, so a client that attaches later reads the bot as it is. It is refused with `bot_busy`
+while a turn runs or waits parked, and the next turn sends the
+new instructions: the provider's cache of the old ones is not read again,
+replayed thinking written after them is withheld as when any context in
+front of it changes, and a fork keys its own prompt cache from then on.
 Protocol version 12 lets `bots` filter on the daemon side: `name` keeps the
 bots whose name matches a SQLite GLOB pattern (1 to 256 bytes; case-sensitive
 like names), read from the name index's range for the pattern's literal
@@ -1955,7 +1978,8 @@ usable; history tells the model to inspect current state before retrying.
 
 ### Tool approval
 
-A bot may be created with a gate: `approve`, the tools whose calls wait for a
+A bot may be created with a gate (a root bot's can be replaced later with
+`configure`): `approve`, the tools whose calls wait for a
 verdict; `approver`, an opaque tag naming who answers, which the daemon
 stores and reports but never reads; and optionally `approve_expire_ms`.
 `approve` may name no more tools than the daemon registers (`invalid_gate`
