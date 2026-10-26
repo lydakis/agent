@@ -1911,7 +1911,6 @@ impl App {
         self.calls.extend(calls);
     }
 
-    /// The reply's last lines, and a table it ended on, drawn.
     /// The reply's open line, the part after its last newline, as the rows
     /// it will take once written.
     fn open_rows(&self, width: usize) -> Vec<Line<'static>> {
@@ -1926,6 +1925,7 @@ impl App {
         transcript::wrap(line, width, Span::raw(lead), markdown.rest())
     }
 
+    /// The reply's last lines, and a table it ended on, drawn.
     fn end_live(&mut self) {
         if let Some(mut live) = self.live.take() {
             let rest = std::mem::take(&mut live.partial);
