@@ -28,7 +28,14 @@ pub fn render(path: &Path, css_width: u32) -> Result<Vec<u8>, String> {
                 .arg("--no-first-run")
                 .arg("--no-default-browser-check")
                 // Headless, it keeps a fresh profile of its own, apart
-                // from the person's open Chrome.
+                // from the person's open Chrome. On macOS that profile is
+                // given its own folder: without one, Chrome hangs on exit
+                // when HOME holds no profile yet (on Linux, the flag itself
+                // hangs Chrome for Testing).
+                .args(
+                    cfg!(target_os = "macos")
+                        .then(|| format!("--user-data-dir={}", out.join("profile").display())),
+                )
                 .arg("--force-device-scale-factor=2")
                 .arg(format!("--window-size={css_width},{WINDOW_HEIGHT}"))
                 .arg(format!("--screenshot={}", png.display()))
