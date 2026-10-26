@@ -416,7 +416,6 @@ async fn run() -> Result<(), String> {
         app.model = model.clone();
         app.turn_model = Some(model.clone());
     }
-    project::remember(&app.model);
     // Tasks are laid out in Rex when the person is in it (or names the
     // Rex server to use); elsewhere they run out of sight, in /status.
     if let Some(project) = &project
@@ -428,17 +427,22 @@ async fn run() -> Result<(), String> {
             app.notice = fleet.note.clone();
         }
     }
-    // The lead told what it is told today: skills and memory added since it
-    // was made, and Rex while it is read inside Rex.
+    app.lead = project::lead(&app.options.socket, &bot);
+    // The lead told what its folder tells it today (skills and memory added
+    // since it was made), unless its instructions were set some other way.
     if project.is_some()
         && let Some(dir) = bot["workspace"].as_str()
     {
-        let rex = app.fleet.as_ref().map(|fleet| fleet.rex.label.clone());
-        match project::instructions(std::path::Path::new(dir), rex.as_deref()) {
-            Ok(text) if bot["instructions"].as_str() != Some(text.as_str()) => {
-                app.instruct = Some(text)
+        match project::review(std::path::Path::new(dir), &bot, &app.lead, fresh) {
+            Ok(project::Instructions::Stale(text)) => app.instruct = Some(text),
+            Ok(project::Instructions::Current) => {}
+            Ok(project::Instructions::Kept) => {
+                app.notice = Some(
+                    "the lead's instructions were set outside its folder's files; \
+                     /instructions takes the folder's"
+                        .into(),
+                )
             }
-            Ok(_) => {}
             Err(error) => app.notice = Some(format!("the lead's instructions: {error}")),
         }
     }
@@ -557,9 +561,10 @@ struct Running {
 
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, unlisted.
-const COMMANDS: [(&str, &str); 7] = [
+const COMMANDS: [(&str, &str); 8] = [
     ("/model", "the model and effort"),
     ("/approvals", "whether calls wait for a verdict"),
+    ("/instructions", "the lead's, from its folder again"),
     ("/status", "this project's agents"),
     ("/sound", "the chime when work ends, on or off"),
     ("/copy", "the last reply, as Markdown"),
@@ -633,6 +638,8 @@ struct App {
     repaint: bool,
     /// The lead's instructions as composed now, sent once no turn runs.
     instruct: Option<String>,
+    /// The name under which Sonny notes the instructions it wrote.
+    lead: String,
     /// When to connect again, while it or the fleet's is down.
     retry: Option<Instant>,
     /// `/model`, open over the composer.
@@ -1039,6 +1046,7 @@ impl App {
             down: false,
             repaint: false,
             instruct: None,
+            lead: String::new(),
             retry: None,
             picker: None,
             listing: None,
@@ -1179,11 +1187,15 @@ impl App {
 
     /// The lead's instructions as composed on attach, sent once no turn
     /// runs; the next turn reads them.
-    async fn configure(&mut self) {
-        if self.running.is_some()
-            || self.instruct.is_none() && self.switch.is_none() && self.gating.is_none()
-        {
-            return;
+    /// Whether what was picked is now the bot's: false while it waits
+    /// for the turn to end, or when the daemon refused it (the notice says
+    /// why).
+    async fn configure(&mut self) -> bool {
+        if self.instruct.is_none() && self.switch.is_none() && self.gating.is_none() {
+            return true;
+        }
+        if self.running.is_some() {
+            return false;
         }
         let (text, switch, gating) = (self.instruct.take(), self.switch.take(), self.gating.take());
         let mut asked = json!({"bot": self.bot});
@@ -1199,8 +1211,21 @@ impl App {
         }
         match self.client.request("configure", asked).await {
             Ok(_) => {
+                if let Some(text) = &text {
+                    project::wrote(&self.lead, text);
+                }
                 if let Some((model, effort)) = switch {
-                    project::remember(&model);
+                    // A lead's project file says what it runs, for the app
+                    // and the next lead made there.
+                    if self.project.is_some()
+                        && let Err(error) = project::keep_model(
+                            std::path::Path::new(&self.workspace),
+                            &model,
+                            effort.as_deref(),
+                        )
+                    {
+                        self.notice = Some(format!("the project file: {error}"));
+                    }
                     self.model = model;
                     self.effort = effort;
                     // The bot's own model now, for this window's turns too.
@@ -1220,9 +1245,14 @@ impl App {
                 self.instruct = text;
                 self.switch = switch;
                 self.gating = gating;
+                return false;
             }
-            Err(error) => self.notice = Some(error.to_string()),
+            Err(error) => {
+                self.notice = Some(error.to_string());
+                return false;
+            }
         }
+        true
     }
 
     /// What the footer and pickers show of the bot, from its record.
@@ -1601,15 +1631,35 @@ impl App {
             // Changed by this or another client: the footer and the
             // pickers read the bot again.
             "configured" => {
+                let changed = |field: &str| {
+                    event["changed"]
+                        .as_array()
+                        .is_some_and(|c| c.iter().any(|f| f == field))
+                };
+                // A pick still waiting was made against what has just
+                // changed elsewhere: it is dropped, not laid over it.
+                let mut dropped = Vec::new();
+                if changed("model") && self.switch.take().is_some() {
+                    dropped.push("model");
+                }
+                if changed("gates") && self.gating.take().is_some() {
+                    dropped.push("approvals");
+                }
+                if changed("instructions") && self.instruct.take().is_some() {
+                    dropped.push("instructions");
+                }
+                if !dropped.is_empty() {
+                    self.notice = Some(format!(
+                        "{} changed elsewhere; your pick was dropped",
+                        dropped.join(" and ")
+                    ));
+                }
                 if let Ok(record) = self
                     .client
                     .request("inspect", json!({"bot": self.bot}))
                     .await
                 {
-                    let model = event["changed"]
-                        .as_array()
-                        .is_some_and(|c| c.iter().any(|f| f == "model"));
-                    self.refresh(&record, model);
+                    self.refresh(&record, changed("model"));
                 }
             }
             "accepted" => {
@@ -2201,7 +2251,7 @@ impl App {
                             self.gating = Some(mode);
                             self.configure().await;
                             if self.gating.is_some() {
-                                self.notice = Some("changes when this turn ends".into());
+                                self.notice = Some("applies when idle".into());
                             }
                         }
                     }
@@ -2237,7 +2287,7 @@ impl App {
                             self.switch = Some(chosen);
                             self.configure().await;
                             if self.switch.is_some() {
-                                self.notice = Some("switches when this turn ends".into());
+                                self.notice = Some("applies when idle".into());
                             }
                         }
                     }
@@ -2378,6 +2428,25 @@ impl App {
             });
             self.listing = Some(receive);
             self.notice = Some("listing models…".into());
+            return;
+        }
+        if prompt == "/instructions" {
+            self.input.clear();
+            if self.project.is_none() {
+                self.notice = Some("only a folder's lead takes its folder's instructions".into());
+                return;
+            }
+            match project::instructions(std::path::Path::new(&self.workspace)) {
+                Ok(text) => {
+                    self.instruct = Some(text);
+                    if self.configure().await {
+                        self.notice = Some("the lead has its folder's instructions".into());
+                    } else if self.instruct.is_some() {
+                        self.notice = Some("applies when idle".into());
+                    }
+                }
+                Err(error) => self.notice = Some(format!("the lead's instructions: {error}")),
+            }
             return;
         }
         if prompt == "/approvals" {
@@ -2753,6 +2822,17 @@ impl App {
         let mut left = format!("  {}", self.model);
         if let Some(effort) = &self.effort {
             left.push_str(&format!(" {effort}"));
+        }
+        // What waits for the turn to end, so a pick is not taken as lost.
+        if let Some((model, effort)) = &self.switch {
+            left.push_str(&format!(" → {model}"));
+            if let Some(effort) = effort {
+                left.push_str(&format!(" {effort}"));
+            }
+            left.push_str(" when idle");
+        }
+        if let Some(mode) = self.gating {
+            left.push_str(&format!(" · {mode} approvals when idle"));
         }
         let right = format!(
             "{} · {} tokens  ",
