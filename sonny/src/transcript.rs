@@ -49,12 +49,34 @@ impl Markdown {
         out
     }
 
-    /// What is still held when the reply ends: a table.
+    /// What is still held when a table ends.
     pub fn finish(&mut self, width: usize) -> Vec<Line<'static>> {
         if self.table.is_empty() {
             return Vec::new();
         }
         crate::table::draw(&std::mem::take(&mut self.table), width)
+    }
+
+    /// What is still held when the reply ends: a table, and a fence or
+    /// `$$` block that never closed, shown as the code it is.
+    pub fn end(&mut self, width: usize, first: bool) -> Vec<Line<'static>> {
+        let mut out = self.finish(width);
+        if let Some((_, source)) = self.picture.take() {
+            for text in source.trim_start_matches('\n').lines() {
+                let lead = if first && out.is_empty() {
+                    "• "
+                } else {
+                    "  "
+                };
+                let line = Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(text.to_owned(), Style::new().fg(Color::Cyan)),
+                ]);
+                out.extend(wrap(line, width, Span::raw(lead), Span::raw("    ")));
+            }
+        }
+        *self = Self::default();
+        out
     }
 
     /// What the last line's wrapped rows start with, inside a reply.
@@ -478,7 +500,8 @@ pub fn reply(text: &str, width: usize) -> Vec<Line<'static>> {
         let first = out.is_empty();
         out.extend(markdown.feed(line, width, first));
     }
-    out.extend(markdown.finish(width));
+    let first = out.is_empty();
+    out.extend(markdown.end(width, first));
     out
 }
 
@@ -959,6 +982,14 @@ mod tests {
             text(&rows),
             ["• Hi x", "  Head", "    let a = 1;", "  - item"]
         );
+    }
+
+    #[test]
+    fn a_fence_that_never_closes_still_shows_as_code() {
+        let rows = reply("Here:\n```diff\n-a\n+b", 40);
+        assert_eq!(text(&rows), ["• Here:", "    -a", "    +b"]);
+        let rows = reply("$$\nx^2", 40);
+        assert_eq!(text(&rows), ["•   x^2"]);
     }
 
     #[test]
