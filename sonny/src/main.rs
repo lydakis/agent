@@ -163,17 +163,21 @@ fn which(program: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// Agent's own binary: the one the daemon gave this shell, else the
-/// app's. Not `agent` on PATH, which may be another program.
+/// Agent's own binary: the one the daemon gave this shell, else the one
+/// installed with Sonny (Homebrew's `libexec/agent`, beside `bin/sonny`),
+/// which speaks Sonny's protocol, else the app's. Not `agent` on PATH,
+/// which may be another program.
 fn agent_bin() -> Option<PathBuf> {
+    let beside = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .ok()
+        .and_then(|me| Some(me.parent()?.parent()?.join("libexec/agent")));
     std::env::var_os("AGENT_BIN")
         .map(PathBuf::from)
-        .or_else(|| {
-            Some(PathBuf::from(
-                "/Applications/Agent.app/Contents/MacOS/agent",
-            ))
-        })
-        .filter(|bin| bin.is_file())
+        .into_iter()
+        .chain(beside)
+        .chain([PathBuf::from("/Applications/Agent.app/Contents/MacOS/agent")])
+        .find(|bin| bin.is_file())
 }
 
 /// Agent's binary to run, with the provider keys the app keeps in
@@ -240,7 +244,7 @@ async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events
         return Ok(connected);
     }
     let bin = agent_bin().ok_or(
-        "the daemon is not running and Agent's binary was not found; open Agent.app or set AGENT_BIN",
+        "the daemon is not running and Agent's binary was not found; install Sonny with Homebrew, open Agent.app, or set AGENT_BIN",
     )?;
     let mut command = agent_command(&bin)?;
     let out = command
@@ -325,6 +329,10 @@ async fn main() -> std::process::ExitCode {
 async fn run() -> Result<(), String> {
     if std::env::args().nth(1).as_deref() == Some("show") {
         return show();
+    }
+    if std::env::args().nth(1).as_deref() == Some("--version") {
+        println!("sonny {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
     }
     let options = parse()?;
     // Fonts are read before the first picture needs them.

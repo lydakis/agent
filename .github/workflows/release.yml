@@ -60,9 +60,9 @@ jobs:
             echo 'Release tag must point to a commit on main' >&2
             exit 1
           fi
-          # The bundle takes the app crate's version and `agent --version` the
-          # runtime's; both must be the tag's.
-          for manifest in Cargo.toml app/src-tauri/Cargo.toml; do
+          # The bundle takes the app crate's version, `agent --version` the
+          # runtime's and `sonny --version` Sonny's; all must be the tag's.
+          for manifest in Cargo.toml app/src-tauri/Cargo.toml sonny/Cargo.toml; do
             version=$(git show "$commit:$manifest" | python3 -c \
               'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["package"]["version"])')
             if [ "v$version" != "$RELEASE_TAG" ]; then
@@ -136,6 +136,17 @@ jobs:
           lipo -create -output app/src-tauri/binaries/agent-universal-apple-darwin \
             .local/target/aarch64-apple-darwin/release/agent \
             .local/target/x86_64-apple-darwin/release/agent
+      - name: Build Sonny for both architectures
+        run: |
+          # On its own: built with the daemon, shared features would rebuild
+          # the daemon differently from the one bundled.
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --locked -p sonny --bin sonny --target "$target"
+          done
+          mkdir -p .local/sonny
+          lipo -create -output .local/sonny/sonny \
+            .local/target/aarch64-apple-darwin/release/sonny \
+            .local/target/x86_64-apple-darwin/release/sonny
       - name: Prepare Apple signing credentials
         env:
           APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64 }}
@@ -234,10 +245,25 @@ jobs:
           ditto -c -k --sequesterRsrc --keepParent "$app" "$archive"
           python3 app/release/homebrew_cask.py "$version" "$archive" dist/agent.rb
           ruby -c dist/agent.rb
+          # Sonny's formula: Sonny and the app's signed daemon, which Sonny
+          # starts when none runs. Homebrew does not quarantine a formula's
+          # download, so Sonny itself needs no notarization.
+          stage="$RUNNER_TEMP/sonny-${version}"
+          mkdir -p "$stage/bin" "$stage/libexec"
+          cp .local/sonny/sonny "$stage/bin/sonny"
+          cp "$app/Contents/MacOS/agent" "$stage/libexec/agent"
+          archs=" $(lipo -archs "$stage/bin/sonny") "
+          [[ "$archs" == *" arm64 "* && "$archs" == *" x86_64 "* ]]
+          test "$("$stage/bin/sonny" --version)" = "sonny ${version}"
+          test "$("$stage/libexec/agent" --version)" = "agent-runtime ${version}"
+          tar -C "$RUNNER_TEMP" -czf "dist/sonny-${version}.tar.gz" "sonny-${version}"
+          python3 app/release/homebrew_formula.py "$version" "dist/sonny-${version}.tar.gz" dist/sonny.rb
+          ruby -c dist/sonny.rb
           # Publishing checks the tag still resolves to the commit built here.
           printf '%s\n' "$RELEASE_COMMIT" > dist/source-commit.txt
           cd dist
-          shasum -a 256 "Agent_${version}_universal.zip" agent.rb source-commit.txt > checksums.txt
+          shasum -a 256 "Agent_${version}_universal.zip" agent.rb \
+            "sonny-${version}.tar.gz" sonny.rb source-commit.txt > checksums.txt
           shasum -a 256 --check checksums.txt
           mkdir smoke
           ditto -x -k "Agent_${version}_universal.zip" smoke
@@ -259,6 +285,8 @@ jobs:
           subject-path: |
             dist/Agent_*_universal.zip
             dist/agent.rb
+            dist/sonny-*.tar.gz
+            dist/sonny.rb
             dist/source-commit.txt
       - name: Verify release tag before publishing
         env:
@@ -283,5 +311,6 @@ jobs:
           if [[ "$RELEASE_TAG" == *-* ]]; then
             options+=(--prerelease)
           fi
-          gh release create "$RELEASE_TAG" dist/*.zip dist/checksums.txt dist/agent.rb dist/source-commit.txt \
+          gh release create "$RELEASE_TAG" dist/*.zip dist/sonny-*.tar.gz dist/checksums.txt \
+            dist/agent.rb dist/sonny.rb dist/source-commit.txt \
             --verify-tag --draft --title "$RELEASE_TAG" --generate-notes "${options[@]}"
