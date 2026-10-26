@@ -11,7 +11,6 @@
 mod approvals;
 mod cache;
 mod calls;
-mod copy;
 mod diff;
 mod errand;
 mod html;
@@ -28,6 +27,7 @@ mod skills;
 mod sound;
 mod status;
 mod table;
+mod task;
 mod term;
 mod transcript;
 
@@ -95,10 +95,11 @@ fn usage() -> String {
      With no --bot, the folder's coordinator, made with --model the first time; its tasks\n\
      open in the project's Rex session. Type /status for the project's agents.\n\
      --copies (or /copies): how its tasks get their own copy, kept for every folder: git\n\
-     worktrees (the default), or sandfs copies, which take uncommitted changes along and\n\
-     work outside git too; a Graft project's tasks always get gft copies.\n\
-     sonny copy NAME | changes NAME [--copy-to DIR] | rm NAME: a task's copy, from the\n\
-     lead's shell, with sandfs built in."
+     worktrees (the default), or sandfs copies (experimental, built in), which take\n\
+     uncommitted changes along and work outside git too.\n\
+     sonny task NAME [--setup] [RUN FLAGS] -- BRIEF, from the lead's shell, makes a task's\n\
+     folder that way and starts the task there; sonny task changes NAME [--apply] lists\n\
+     (or writes here) what a sandfs copy of a plain folder changed."
         .into()
 }
 
@@ -356,7 +357,7 @@ fn main() -> std::process::ExitCode {
     sandfs::handle_relaunch(&["sandfs"]);
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
-        Some((copy, rest)) if copy == "copy" => copy::run(rest),
+        Some((task, rest)) if task == "task" => task::run(rest),
         _ => tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -463,7 +464,7 @@ async fn run() -> Result<(), String> {
     // Task copies a restart unmounted are mounted again before any task
     // works in its folder.
     if project.is_some()
-        && let Some(error) = copy::remount().pop()
+        && let Some(error) = task::remount().pop()
     {
         app.notice = Some(error);
     }
@@ -675,7 +676,10 @@ const COMMANDS: [(&str, &str); 9] = [
     ("/instructions", "the lead's, from its folder again"),
     ("/status", "this project's agents"),
     ("/sound", "the chime when work ends, on or off"),
-    ("/copies", "tasks in git worktrees or sandfs copies"),
+    (
+        "/copies",
+        "tasks in git worktrees or sandfs copies (experimental)",
+    ),
     ("/copy", "the last reply, as Markdown"),
     ("/open", "the last HTML page, in your browser"),
     ("/quit", "the agents keep working"),
@@ -2731,7 +2735,7 @@ impl App {
                 return;
             }
             self.notice = Some(match settings.copies.as_str() {
-                "sandfs" => "tasks get sandfs copies".into(),
+                "sandfs" => "tasks get sandfs copies (experimental)".into(),
                 _ => "tasks get git worktrees".into(),
             });
             // The lead is told now when idle, else once its turn ends,

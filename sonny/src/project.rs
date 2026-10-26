@@ -43,46 +43,37 @@ fn role(dir: &Path) -> Result<agent_client::policy::Profile, String> {
 /// A lead's instructions as the app composes them for `dir` now: its role,
 /// the folder's rules, skills and memory, then the project's task rule
 /// with the copies Sonny is set to. Rex is the rex-windows skill's to
-/// explain, so they read the same in any client. A Graft project's tasks
-/// always get Graft's copies, since a worktree of its home copy starts on
-/// a stale commit and lands nowhere Graft knows.
+/// explain, so they read the same in any client.
 pub fn instructions(dir: &Path) -> Result<String, String> {
     let memory = agent_client::policy::memory_indexes(dir).map_err(|e| e.to_string())?;
     let composed = agent_client::policy::instructions(dir, Some(&role(dir)?), &memory)
         .map_err(|e| e.to_string())?
         .text;
     let info = agent_client::project::read(dir)?;
-    let copies = match crate::copy::graft(dir) {
-        true => "sandfs".to_owned(),
-        false => crate::settings::Settings::load().copies,
-    };
+    let copies = crate::settings::Settings::load().copies;
     let rule = agent_client::project::rule(&info, &copies);
-    if copies != "sandfs" || info["threads_in"] == "project" {
-        return Ok(format!("{composed}\n\n{rule}"));
-    }
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
-    let copy = copies_rule(&me.to_string_lossy());
-    Ok(format!("{composed}\n\n{rule}\n\n{copy}"))
+    let start = start_rule(&me.to_string_lossy());
+    Ok(format!("{composed}\n\n{rule}\n\n{start}"))
 }
 
-/// How the lead gets a task its sandfs copy: Sonny's `copy` command, at
-/// `sonny`, says what kind of copy the folder gives.
-fn copies_rule(sonny: &str) -> String {
+/// How the lead starts a task in Sonny: `sonny task`, at `sonny`, makes
+/// its folder the way the person set Sonny up and starts it there.
+fn start_rule(sonny: &str) -> String {
     let sonny = format!("\"{sonny}\"");
     format!(
-        "Every task's copy comes from Sonny. Pick a NAME as for a worktree and, from this folder, run\n\
-         {sonny} copy NAME\n\
-         It prints the folder to start the task in, as its --workspace, and says how the task's work comes back, which goes in its brief. \
-         In a Graft project it is a gft copy on the newest main: once its checks pass, and the person has said pull requests are fine, \
-         the task lands its own work as a draft pull request with the gft land it names, and later fixes land on the same one. \
-         In a git repository it is this checkout as it is now, uncommitted changes included, on its own branch agent/NAME, \
-         whose commits you bring here with the git push it names. \
-         In any other folder it is this folder as it is now: {sonny} copy changes NAME lists what the task changed, \
-         and once you have checked that, {sonny} copy changes NAME --copy-to \"$PWD\" writes it here. \
-         Run .agents/setup in the copy when the task will change files, as for a worktree. \
-         A copy stays as long as its task, as a worktree does; if setup fails, or the start fails and \"$AGENT_BIN\" ls --name NAME does not list it, \
-         remove it with {sonny} copy rm NAME (with the gft rm it names for a gft copy) before trying again. \
-         If {sonny} copy fails, tell the person why instead of working around it."
+        "Start every new task with Sonny, which makes its folder first. Pick a NAME that \"$AGENT_BIN\" ls --name \"${{AGENT_BOT%%.*}}.*\" does not list yet, \
+         that starts with your own name before .lead and a dot, and that is a valid git branch name; from this folder run\n\
+         {sonny} task NAME --agents --setup MODEL-FLAGS -- TASK\n\
+         in place of \"$AGENT_BIN\" run --detach --new, with the task rule's --model and --effort as MODEL-FLAGS: \
+         it makes the task's folder the way the person set Sonny up, starts the task there and prints the turn's handle, as run --detach does. \
+         Pass --profile ROLE in place of --agents when a listed role fits, and leave out --setup for a task that only reads, \
+         so the folder's .agents/setup runs only for a task that will change files. \
+         It also says how the task's work comes back, which goes in the brief: on its branch agent/NAME, here already for a worktree, \
+         or brought here with the git push it names for a sandfs copy of a git repository; \
+         for a sandfs copy of any other folder, {sonny} task changes NAME lists what the task changed, \
+         and once you have checked that, {sonny} task changes NAME --apply writes it here. \
+         A start that fails leaves no folder behind; if it fails again, tell the person why instead of working around it."
     )
 }
 
@@ -408,14 +399,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_lead_whose_tasks_get_sandfs_copies_is_told_sonnys_copy_command() {
-        let text = copies_rule("/opt/sonny");
+    fn a_lead_starts_its_tasks_with_sonny() {
+        let text = start_rule("/opt/sonny");
         for said in [
-            "\"/opt/sonny\" copy NAME\n",
-            "as a draft pull request with the gft land it names",
-            "on its own branch agent/NAME",
-            "\"/opt/sonny\" copy changes NAME --copy-to \"$PWD\" writes it here",
-            "remove it with \"/opt/sonny\" copy rm NAME (with the gft rm it names for a gft copy)",
+            "\"/opt/sonny\" task NAME --agents --setup MODEL-FLAGS -- TASK\n",
+            "in place of \"$AGENT_BIN\" run --detach --new",
+            "leave out --setup for a task that only reads",
+            "Pick a NAME that \"$AGENT_BIN\" ls --name \"${AGENT_BOT%%.*}.*\" does not list yet",
+            "\"/opt/sonny\" task changes NAME --apply writes it here",
         ] {
             assert!(text.contains(said), "{said} in {text}");
         }

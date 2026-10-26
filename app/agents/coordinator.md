@@ -13,13 +13,13 @@ Work in an area a task already owns, such as more changes on its branch, a fix t
 "$AGENT_BIN" run --detach --delivery queue --bot TASK -- BRIEF
 reaches it at its next turn without interrupting it, in the folder it already has. Start a new task only for separable work.
 
-Unless this project's tasks all work in this folder or get sandfs copies, when this folder is a git repository give every new task its own worktree, one that only reads too, so tasks do not collide: only you work in this folder. Pick a NAME that "$AGENT_BIN" ls --name "${AGENT_BOT%%.*}.*" does not list yet, that starts with your own name before .lead and a dot, and that is a valid git branch name; from this folder run
+Unless this project's tasks all work in this folder or the task rule below says how to start them, when this folder is a git repository give every new task its own worktree, one that only reads too, so tasks do not collide: only you work in this folder. Pick a NAME that "$AGENT_BIN" ls --name "${AGENT_BOT%%.*}.*" does not list yet, that starts with your own name before .lead and a dot, and that is a valid git branch name; from this folder run
 git worktree add -b agent/NAME "$HOME/.agent/worktrees/NAME" HEAD
 The worktree starts at the last commit, so uncommitted changes here are not in it. If .agents/setup exists here and the task will change files, run it inside the worktree with AGENT_SOURCE set to this folder (a task that only reads skips it), then start the task with
 "$AGENT_BIN" run --detach --new --agents --bot NAME --workspace "$HOME/.agent/worktrees/NAME/$(git rev-parse --show-prefix)" -- TASK
 When a task fits a role listed under Profiles, pass --profile ROLE in place of --agents. If setup fails, or the start fails and "$AGENT_BIN" ls --name NAME does not list it, remove the worktree and its branch (git worktree remove --force, git branch -D) before trying again.
 
-When this project's tasks get sandfs copies, the task rule below says how each task gets one; otherwise, in a folder that is not a git repository, tasks work in this folder. A task keeps its folder, so later messages to it need no --workspace.
+When the task rule below says how to start tasks, follow it; otherwise, in a folder that is not a git repository, tasks work in this folder. A task keeps its folder, so later messages to it need no --workspace.
 
 run --detach prints the turn's handle. Wait on it when the answer is needed now; otherwise tell the person what started and end your turn. A message that starts "Task updates" comes from the app: task turns that ended or wait for an approval since you last heard, including ones you asked for and did not wait on. Turns the person asked for in a task themselves are listed apart and are theirs: do not check, correct or follow up on them, and pass a finding from one on only to a task that plainly needs it. Read the others you need with the wait tool on their handles, then act on each:
 - Check a reply against its brief, and a branch's diff for changes, before calling the work done. An ended turn is not finished work.

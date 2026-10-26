@@ -2006,9 +2006,9 @@ test('the coordinator the app ships gives editing tasks worktrees and cleans up 
   assert.match(text, /otherwise, in a folder that is not a git repository, tasks work in this folder/);
   // The threads' picks are told to the coordinator by the app, not by this role, which a folder may replace.
   assert.doesNotMatch(text, /threads_|project\.toml/);
-  assert.match(text, /Unless this project's tasks all work in this folder or get sandfs copies/);
-  // How a sandfs copy is made is the client's to say (Sonny's copy command), in the task rule, never this role.
-  assert.match(text, /When this project's tasks get sandfs copies, the task rule below says how each task gets one/);
+  assert.match(text, /Unless this project's tasks all work in this folder or the task rule below says how to start them/);
+  // How a client starts tasks (Sonny's task command) is the client's to say, in the task rule, never this role.
+  assert.match(text, /When the task rule below says how to start tasks, follow it/);
   assert.doesNotMatch(text, /sandfs (mount|fork|changes|rm)/);
 });
 
