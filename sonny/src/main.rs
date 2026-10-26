@@ -13,6 +13,7 @@ mod cache;
 mod calls;
 mod diff;
 mod errand;
+mod herdr;
 mod html;
 mod image;
 mod js;
@@ -84,8 +85,8 @@ struct Options {
     new: bool,
     model: Option<String>,
     workspace: Option<String>,
-    /// Lay the project's tasks out in Rex (on by default when rex is found).
-    rex: bool,
+    /// Lay the project's tasks out in Rex or Herdr, whichever Sonny runs in.
+    layout: bool,
     /// The Rex server the project's session lives on, when not this one.
     rex_host: Option<String>,
     /// Ring when work ends or needs the person.
@@ -96,11 +97,11 @@ struct Options {
 }
 
 fn usage() -> String {
-    "usage: sonny [--store PATH] [--socket PATH] [--model PROVIDER/MODEL] [--no-rex] [--rex-host HOST] [--no-sound]\n\
+    "usage: sonny [--store PATH] [--socket PATH] [--model PROVIDER/MODEL] [--no-layout] [--rex-host HOST] [--no-sound]\n\
      \x20      [--lookout openai-decisions/MODEL|typesafe/jev-*|off]\n\
      \x20      [--copies worktree|sandfs] [--bot NAME [--new [--workspace DIR]]]\n\
      With no --bot, the folder's coordinator, made with --model the first time; its tasks\n\
-     open in the project's Rex session. Type /status for the project's agents.\n\
+     open beside it in Rex or Herdr. Type /status for the project's agents.\n\
      --copies (or /copies): how its tasks get their own copy, kept for every folder: git\n\
      worktrees (the default), or sandfs copies (experimental, built in), which take\n\
      uncommitted changes along and work outside git too.\n\
@@ -357,7 +358,7 @@ fn parse() -> Result<Options, String> {
     let mut args = std::env::args().skip(1);
     let (mut store, mut socket, mut bot, mut new, mut model, mut workspace) =
         (None, None, None, false, None, None);
-    let (mut rex, mut rex_host, mut sound) = (true, None, true);
+    let (mut layout, mut rex_host, mut sound) = (true, None, true);
     let mut lookout = Some(lookout::DEFAULT.to_owned());
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or_else(usage);
@@ -368,7 +369,7 @@ fn parse() -> Result<Options, String> {
             "--new" => new = true,
             "--model" => model = Some(value()?),
             "--workspace" => workspace = Some(value()?),
-            "--no-rex" => rex = false,
+            "--no-layout" => layout = false,
             "--rex-host" => rex_host = Some(value()?),
             "--no-sound" => sound = false,
             "--lookout" => lookout = Some(value()?).filter(|judge| judge != "off"),
@@ -400,7 +401,7 @@ fn parse() -> Result<Options, String> {
         new,
         model,
         workspace,
-        rex,
+        layout,
         rex_host,
         sound,
         lookout,
@@ -467,8 +468,8 @@ async fn run() -> Result<(), String> {
             let dir = std::env::current_dir().map_err(|e| e.to_string())?;
             // Before the lead is made, so its instructions list the skills.
             skills::install_errand();
-            if options.rex {
-                mux::install_skill();
+            if options.layout {
+                mux::install_skill(options.rex_host.as_deref());
             }
             let lead =
                 project::open(&client, &dir, &options.socket, options.model.as_deref()).await?;
@@ -522,7 +523,7 @@ async fn run() -> Result<(), String> {
     // Tasks are laid out in Rex when the person is in it (or names the
     // Rex server to use); elsewhere they run out of sight, in /status.
     if let Some(project) = &project
-        && options.rex
+        && options.layout
     {
         app.fleet = Fleet::start(&options, project, &name).await;
         if let Some(fleet) = &app.fleet {
@@ -952,7 +953,7 @@ impl Fleet {
         ];
         // Said only when the tasks go somewhere this pane is not.
         let note = (!layout.here()).then(|| format!("tasks open in {}", layout.home()));
-        mux::install_skill();
+        mux::install_skill(options.rex_host.as_deref());
         let mut fleet = Self {
             layout,
             client: client.clone(),
@@ -3490,7 +3491,7 @@ mod tests {
             new: false,
             model: None,
             workspace: None,
-            rex: false,
+            layout: false,
             rex_host: None,
             sound: false,
             lookout: None,

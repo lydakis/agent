@@ -1035,7 +1035,16 @@ fn sh(
     process.env_remove(DECISIONS_KEY);
     // A terminal multiplexer's place names the terminal the daemon was
     // started in, not the bot's: a command that used it would land there.
-    for name in ["REX_SESSION", "REX_BLOCK", "TMUX", "TMUX_PANE"] {
+    for name in [
+        "REX_SESSION",
+        "REX_BLOCK",
+        "TMUX",
+        "TMUX_PANE",
+        "HERDR_ENV",
+        "HERDR_WORKSPACE_ID",
+        "HERDR_TAB_ID",
+        "HERDR_PANE_ID",
+    ] {
         process.env_remove(name);
     }
     for (name, value) in registry.environment.iter().chain(environment) {
