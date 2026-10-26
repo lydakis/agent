@@ -66,40 +66,50 @@ pub enum Instructions {
 /// Whether a lead's instructions may follow the folder: only when Sonny
 /// wrote what they hold (or saw a client compose it), so instructions the
 /// person set some other way are never overwritten.
-pub fn review(dir: &Path, bot: &Value, new: bool) -> Result<Instructions, String> {
+pub fn review(dir: &Path, bot: &Value, lead: &str, new: bool) -> Result<Instructions, String> {
     let composed = instructions(dir)?;
     let current = bot["instructions"].as_str().unwrap_or_default();
-    let id = bot["bot_id"].as_i64().unwrap_or_default();
     Ok(if current == composed {
-        wrote(id, current);
+        wrote(lead, current);
         Instructions::Current
-    } else if new || written(id).is_some_and(|key| key == fingerprint(current)) {
+    } else if new || written(lead).is_some_and(|key| key == fingerprint(current)) {
         Instructions::Stale(composed)
     } else {
         Instructions::Kept
     })
 }
 
-/// Where Sonny keeps a fingerprint of the instructions it last saw lead
-/// `id` take from its folder: one file a lead, so two Sonnys never write
-/// over each other's.
-fn written_path(id: i64) -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join(format!(".agent/sonny/instructions/{id}")))
+/// What names a lead across daemons: bot ids count from one in each
+/// store, so the daemon's socket is part of the name.
+pub fn lead(socket: &Path, bot: &Value) -> String {
+    let socket = std::fs::canonicalize(socket).unwrap_or_else(|_| socket.to_owned());
+    let id = bot["bot_id"].as_i64().unwrap_or_default();
+    format!("{}-{id}", fingerprint(&socket.to_string_lossy()))
 }
 
-fn written(id: i64) -> Option<String> {
-    let text = std::fs::read_to_string(written_path(id)?).ok()?;
+/// Where Sonny keeps a fingerprint of the instructions it last saw `lead`
+/// take from its folder: one file a lead, so two Sonnys never write over
+/// each other's.
+fn written_path(lead: &str) -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| {
+        PathBuf::from(home)
+            .join(".agent/sonny/instructions")
+            .join(lead)
+    })
+}
+
+fn written(lead: &str) -> Option<String> {
+    let text = std::fs::read_to_string(written_path(lead)?).ok()?;
     Some(text.trim().to_owned())
 }
 
-/// Note that lead `id` now holds `text`, composed from its folder.
-pub fn wrote(id: i64, text: &str) {
-    let Some(path) = written_path(id) else {
+/// Note that `lead` now holds `text`, composed from its folder.
+pub fn wrote(lead: &str, text: &str) {
+    let Some(path) = written_path(lead) else {
         return;
     };
     let key = fingerprint(text);
-    if written(id).as_deref() == Some(key.as_str()) {
+    if written(lead).as_deref() == Some(key.as_str()) {
         return;
     }
     if let Some(dir) = path.parent() {
@@ -337,6 +347,15 @@ async fn create(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn leads_of_two_daemons_with_one_id_have_two_names() {
+        let bot = serde_json::json!({"bot_id": 1});
+        let one = lead(Path::new("/tmp/one/state.sqlite.sock"), &bot);
+        let two = lead(Path::new("/tmp/two/state.sqlite.sock"), &bot);
+        assert_ne!(one, two);
+        assert!(one.ends_with("-1"));
+    }
 
     #[test]
     fn the_project_file_keeps_its_other_lines_when_the_model_moves() {

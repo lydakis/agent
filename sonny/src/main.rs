@@ -411,13 +411,13 @@ async fn run() -> Result<(), String> {
             app.notice = fleet.note.clone();
         }
     }
-    app.bot_id = bot["bot_id"].as_i64().unwrap_or_default();
+    app.lead = project::lead(&app.options.socket, &bot);
     // The lead told what its folder tells it today (skills and memory added
     // since it was made), unless its instructions were set some other way.
     if project.is_some()
         && let Some(dir) = bot["workspace"].as_str()
     {
-        match project::review(std::path::Path::new(dir), &bot, fresh) {
+        match project::review(std::path::Path::new(dir), &bot, &app.lead, fresh) {
             Ok(project::Instructions::Stale(text)) => app.instruct = Some(text),
             Ok(project::Instructions::Current) => {}
             Ok(project::Instructions::Kept) => {
@@ -617,8 +617,8 @@ struct App {
     repaint: bool,
     /// The lead's instructions as composed now, sent once no turn runs.
     instruct: Option<String>,
-    /// The bot's id, under which Sonny notes the instructions it wrote.
-    bot_id: i64,
+    /// The name under which Sonny notes the instructions it wrote.
+    lead: String,
     /// When to connect again, while it or the fleet's is down.
     retry: Option<Instant>,
     /// `/model`, open over the composer.
@@ -1015,7 +1015,7 @@ impl App {
             down: false,
             repaint: false,
             instruct: None,
-            bot_id: 0,
+            lead: String::new(),
             retry: None,
             picker: None,
             listing: None,
@@ -1181,7 +1181,7 @@ impl App {
         match self.client.request("configure", asked).await {
             Ok(_) => {
                 if let Some(text) = &text {
-                    project::wrote(self.bot_id, text);
+                    project::wrote(&self.lead, text);
                 }
                 if let Some((model, effort)) = switch {
                     // A lead's project file says what it runs, for the app
