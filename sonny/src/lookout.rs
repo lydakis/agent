@@ -64,7 +64,7 @@ fn action(id: &str) -> &'static str {
         "sibling_needs" => "pass it to the task that needs it",
         "conflict" => "reconcile the two tasks",
         "off_brief" => "correct the task",
-        "stuck" => "unblock it or ask the person",
+        "stuck" => "unblock it, or ask the person for what it needs, such as an approval",
         "lead_next" => "start the next step",
         "result" => "tell the person",
         "remember" => "save it with your memory skill",
@@ -100,7 +100,7 @@ pub const QUESTIONS: [Question; 8] = [
     },
     Question {
         id: "stuck",
-        text: "Is the task in `event` stuck: failing, going in circles, waiting on an approval, or asking a question that nobody has answered?",
+        text: "Is the task in `event` stuck: failing, going in circles, waiting on an approval, blocked by calls the approver denied, or asking a question that nobody has answered?",
         kinds: &[Kind::Ended, Kind::Waiting],
         urgent: false,
     },
@@ -752,6 +752,7 @@ pub fn spawn(socket: PathBuf, project: String, lead: String, workspace: PathBuf,
             waiting_on: Vec::new(),
             approvals: HashMap::new(),
             steers: HashMap::new(),
+            denied: HashMap::new(),
             checked: HashSet::new(),
             retried: HashSet::new(),
             briefs: HashMap::new(),
@@ -795,6 +796,8 @@ struct Lookout {
     /// Steers waiting to be absorbed, by task and steer turn: who sent it,
     /// or `None` for the lead.
     steers: HashMap<(String, i64), Option<String>>,
+    /// Calls the approver denied, by task and turn.
+    denied: HashMap<(String, i64), u64>,
     /// Queued turns already checked when they were queued.
     checked: HashSet<(String, i64)>,
     /// Checks that failed once and were started again.
@@ -975,6 +978,9 @@ impl Lookout {
             }
             "tool_completed" | "turn_resumed" => {
                 self.approvals.remove(&(bot.to_owned(), turn));
+                if data["denied"] == true {
+                    *self.denied.entry((bot.to_owned(), turn)).or_default() += 1;
+                }
             }
             "turn_finished" => {
                 self.approvals.remove(&(bot.to_owned(), turn));
@@ -994,14 +1000,19 @@ impl Lookout {
                     }
                     return;
                 }
-                // A turn the lead waits on is read by its own wait.
-                if self.waiting_on.contains(&format!("turn:{bot}/{turn}")) {
+                let denied = self.denied.remove(&(bot.to_owned(), turn)).unwrap_or(0);
+                // A turn the lead waits on is read by its own wait, unless
+                // the approver held it back: that needs the person.
+                if denied == 0 && self.waiting_on.contains(&format!("turn:{bot}/{turn}")) {
                     return;
                 }
-                let status = match data["error"].as_str() {
+                let mut status = match data["error"].as_str() {
                     Some(error) => format!("{status} ({error})"),
                     None => status.to_owned(),
                 };
+                if denied > 0 {
+                    status.push_str(&format!(", after {denied} calls denied by the approver"));
+                }
                 // A completed turn's reply is read from its checkpoint, not
                 // from wherever the task's history has moved on to.
                 let checkpoint = data["checkpoint"].as_i64();
@@ -1313,6 +1324,7 @@ pub async fn replay() -> Result<(), String> {
             waiting_on: Vec::new(),
             approvals: HashMap::new(),
             steers: HashMap::new(),
+            denied: HashMap::new(),
             checked: HashSet::new(),
             retried: HashSet::new(),
             briefs: HashMap::new(),
@@ -1460,6 +1472,7 @@ mod tests {
             waiting_on: Vec::new(),
             approvals: HashMap::new(),
             steers: HashMap::new(),
+            denied: HashMap::new(),
             checked: HashSet::new(),
             retried: HashSet::new(),
             briefs: HashMap::new(),
@@ -1954,6 +1967,36 @@ mod tests {
         assert!(lookout.due.is_empty());
         assert_eq!(lookout.held.len(), 1);
         assert!(note(&lookout.held, 0).contains("(not checked; look)"));
+    }
+
+    #[test]
+    fn a_turn_the_approver_held_back_is_checked_even_when_waited_on() {
+        let mut lookout = lookout();
+        lookout.event(&ev(
+            "calc.lead",
+            5,
+            "turn_waiting",
+            json!({"handles": ["turn:calc.fix/6"]}),
+        ));
+        for _ in 0..3 {
+            lookout.event(&ev(
+                "calc.fix",
+                6,
+                "tool_completed",
+                json!({"denied": true}),
+            ));
+        }
+        lookout.event(&ev(
+            "calc.fix",
+            6,
+            "turn_finished",
+            json!({"status": "completed"}),
+        ));
+        assert_eq!(
+            lookout.due[0].status.as_deref(),
+            Some("completed, after 3 calls denied by the approver")
+        );
+        assert!(lookout.denied.is_empty());
     }
 
     #[test]
