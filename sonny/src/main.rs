@@ -2295,12 +2295,15 @@ impl App {
                 "sandfs" => "tasks get sandfs copies".into(),
                 _ => "tasks get git worktrees".into(),
             });
-            // The lead is told before its next turn, as on attach.
+            // The lead is told now when idle, else once its turn ends.
             if self.project.is_some() {
                 let rex = self.fleet.as_ref().map(|fleet| fleet.rex.label.clone());
                 let dir = std::path::Path::new(&self.workspace);
                 match project::instructions(dir, rex.as_deref()) {
-                    Ok(text) => self.instruct = Some(text),
+                    Ok(text) => {
+                        self.instruct = Some(text);
+                        self.configure().await;
+                    }
                     Err(error) => {
                         self.notice = Some(format!("the lead's instructions: {error}"))
                     }

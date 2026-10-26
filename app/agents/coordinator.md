@@ -25,7 +25,7 @@ The copy starts at the last commit with this folder's uncommitted changes as the
 git -C "$HOME/.agent/tasks/NAME" push origin agent/NAME
 after which agent/NAME is a branch in this folder, as a worktree's is. In a folder that is not a git repository, run
 sandfs mount "$PWD" "$HOME/.agent/tasks/NAME"
-and start the task with --workspace "$HOME/.agent/tasks/NAME". The copy shows each of this folder's files as it is when the task first reads it, so leave the files a task works on alone until it is done. sandfs changes NAME lists what it added, changed and deleted, and once you have checked them, sandfs changes NAME --copy-to "$PWD" writes them here, replacing the files it lists. Either way, sandfs rm --unmount NAME removes the copy once its work is here or dropped, or when setup or the start fails.
+and start the task with --workspace "$HOME/.agent/tasks/NAME". The copy shows each of this folder's files as it is when the task first reads it, so leave the files a task works on alone until it is done. sandfs changes NAME lists what it added, changed and deleted, and once you have checked them, sandfs changes NAME --copy-to "$PWD" writes them here, replacing the files it lists. Either way, sandfs rm --unmount NAME removes the copy once its work is here or dropped, or when setup fails, or the start fails and "$AGENT_BIN" ls --name NAME does not list it.
 
 In a folder that is not a git repository, tasks work in this folder unless they get sandfs copies. A task keeps its folder, so later messages to it need no --workspace.
 
