@@ -471,7 +471,10 @@ async fn run() -> Result<(), String> {
             "{name} works in {}; your next message brings it back here",
             tilde(bot["workspace"].as_str().unwrap_or("another folder"))
         ));
-        app.move_to = Some(dir.display().to_string());
+        // The project's folder from now: what /model and /instructions
+        // write and read, before the move itself.
+        app.workspace = dir.display().to_string();
+        app.move_to = Some(app.workspace.clone());
     }
     app.project = project;
     if fresh {
@@ -2737,7 +2740,11 @@ impl App {
         terminal.autoresize()?;
         let width = terminal.size()?.width as usize;
         self.width = width;
-        let composer_rows = self.composer(width);
+        let mut composer_rows = self.composer(width);
+        // A short pane keeps the prompt's end, where typing goes on.
+        let room = (terminal.size()?.height as usize).saturating_sub(VIEWPORT as usize - 1);
+        let over = composer_rows.len().saturating_sub(room.max(1));
+        composer_rows.drain(..over);
         fit(terminal, VIEWPORT - 1 + composer_rows.len() as u16)?;
         if !self.pending.is_empty() {
             let lines: Vec<Line<'static>> = std::mem::take(&mut self.pending)
