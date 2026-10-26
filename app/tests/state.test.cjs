@@ -2003,20 +2003,13 @@ test('the coordinator the app ships gives editing tasks worktrees and cleans up 
   assert.match(text, /git worktree remove --force, git branch -D/);
   // Only the lead works in the folder: every task gets a copy, one that only reads too.
   assert.match(text, /give every new task its own worktree, one that only reads too, so tasks do not collide: only you work in this folder/);
-  assert.match(text, /In a folder that is not a git repository, tasks work in this folder unless they get sandfs copies/);
+  assert.match(text, /otherwise, in a folder that is not a git repository, tasks work in this folder/);
   // The threads' picks are told to the coordinator by the app, not by this role, which a folder may replace.
   assert.doesNotMatch(text, /threads_|project\.toml/);
-  assert.match(text, /Unless this project's tasks all work in this folder or get sandfs copies/);
-  // Told its tasks get sandfs copies (the client's preference): a frozen copy on its own branch, its commits pushed back, then removed.
-  assert.match(text, /sandfs mount "git:\$\(git rev-parse --show-toplevel\)" "\$HOME\/\.agent\/tasks\/NAME" --uncommitted --branch agent\/NAME/);
-  assert.match(text, /--workspace "\$HOME\/\.agent\/tasks\/NAME\/\$\(git rev-parse --show-prefix\)"/);
-  assert.match(text, /git -C "\$HOME\/\.agent\/tasks\/NAME" push origin agent\/NAME/);
-  // Outside git, a copy of the folder itself, its changes checked and copied back.
-  assert.match(text, /sandfs mount "\$PWD" "\$HOME\/\.agent\/tasks\/NAME"\n/);
-  assert.match(text, /sandfs changes NAME --copy-to "\$PWD" writes them here/);
-  // A copy lives as long as its task; only a failed setup or start removes it.
-  assert.match(text, /a copy stays as long as its task, as a worktree does/);
-  assert.match(text, /the start fails and "\$AGENT_BIN" ls --name NAME does not list it, remove it with sandfs rm --unmount NAME before trying again/);
+  assert.match(text, /Unless this project's tasks all work in this folder or the task rule below says how to start them/);
+  // How a client starts tasks (Sonny's task command) is the client's to say, in the task rule, never this role.
+  assert.match(text, /When the task rule below says how to start tasks, follow it/);
+  assert.doesNotMatch(text, /sandfs (mount|fork|changes|rm)/);
 });
 
 test('a project the core refuses opens nothing, and one already there says when the picks were not applied', async () => {
