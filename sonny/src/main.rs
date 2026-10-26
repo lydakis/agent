@@ -16,6 +16,7 @@ mod errand;
 mod html;
 mod image;
 mod js;
+mod lookout;
 mod math;
 mod mermaid;
 mod models;
@@ -84,10 +85,13 @@ struct Options {
     rex_host: Option<String>,
     /// Ring when work ends or needs the person.
     sound: bool,
+    /// The decision model that wakes the lead when its tasks need it.
+    lookout: Option<String>,
 }
 
 fn usage() -> String {
     "usage: sonny [--store PATH] [--socket PATH] [--model PROVIDER/MODEL] [--no-rex] [--rex-host HOST] [--no-sound]\n\
+     \x20      [--lookout openai-decisions/MODEL|typesafe/jev-*]\n\
      \x20      [--bot NAME [--new [--workspace DIR]]]\n\
      With no --bot, the folder's coordinator, made with --model the first time; its tasks\n\
      open in the project's Rex session. Type /status for the project's agents."
@@ -293,7 +297,7 @@ fn parse() -> Result<Options, String> {
     let mut args = std::env::args().skip(1);
     let (mut store, mut socket, mut bot, mut new, mut model, mut workspace) =
         (None, None, None, false, None, None);
-    let (mut rex, mut rex_host, mut sound) = (true, None, true);
+    let (mut rex, mut rex_host, mut sound, mut lookout) = (true, None, true, None);
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or_else(usage);
         match arg.as_str() {
@@ -306,6 +310,7 @@ fn parse() -> Result<Options, String> {
             "--no-rex" => rex = false,
             "--rex-host" => rex_host = Some(value()?),
             "--no-sound" => sound = false,
+            "--lookout" => lookout = Some(value()?),
             _ => return Err(usage()),
         }
     }
@@ -328,6 +333,7 @@ fn parse() -> Result<Options, String> {
         rex,
         rex_host,
         sound,
+        lookout,
     })
 }
 
@@ -444,6 +450,20 @@ async fn run() -> Result<(), String> {
                 )
             }
             Err(error) => app.notice = Some(format!("the lead's instructions: {error}")),
+        }
+    }
+    if let (Some(project), Some(judge), Some(dir)) =
+        (&project, &options.lookout, bot["workspace"].as_str())
+    {
+        match lookout::Judge::parse(judge) {
+            Ok(judge) => lookout::spawn(
+                options.socket.clone(),
+                project.clone(),
+                name.clone(),
+                PathBuf::from(dir),
+                judge,
+            ),
+            Err(error) => app.notice = Some(error),
         }
     }
     app.project = project;

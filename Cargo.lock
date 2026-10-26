@@ -3974,6 +3974,7 @@ dependencies = [
  "base64 0.22.1",
  "libc",
  "ratatui",
+ "reqwest",
  "resvg",
  "serde_json",
  "similar",
