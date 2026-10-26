@@ -65,7 +65,7 @@ fn resolve(svg: &str, theme: &[(&str, &str)]) -> String {
             }
         }
     }
-    let svg = substitute(svg, &known);
+    let svg = in_tags(svg, &known);
     let mut out = String::with_capacity(svg.len());
     let mut rest = svg.as_str();
     while let Some(at) = rest.find("style=\"rx:") {
@@ -78,6 +78,24 @@ fn resolve(svg: &str, theme: &[(&str, &str)]) -> String {
         let radius = after[..end].trim().trim_end_matches("px");
         out.push_str(&format!("rx=\"{radius}\""));
         rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// [`substitute`] inside tags only: Pele styles with attributes, and a
+/// label's text is the diagram's own words, `var(--x)` included.
+fn in_tags(svg: &str, known: &HashMap<String, String>) -> String {
+    let mut out = String::with_capacity(svg.len());
+    let mut rest = svg;
+    while let Some(open) = rest.find('<') {
+        out.push_str(&rest[..open]);
+        let Some(close) = rest[open..].find('>') else {
+            rest = &rest[open..];
+            break;
+        };
+        out.push_str(&substitute(&rest[open..open + close + 1], known));
+        rest = &rest[open + close + 1..];
     }
     out.push_str(rest);
     out
@@ -130,6 +148,11 @@ mod tests {
         assert!(!out.contains("var("), "{out}");
         assert!(out.contains(r##"fill="#e6e6e6""##), "{out}");
         assert!(out.contains(r##"<rect fill="#2b2d31" rx="4"/>"##), "{out}");
+        // A label's words stay as written.
+        let label = r#"<svg><text fill="var(--pele-fg,#000)">var(--brand)</text></svg>"#;
+        let out = resolve(label, &DARK);
+        assert!(out.contains(">var(--brand)</text>"), "{out}");
+        assert!(!out.contains(r#"fill="var("#), "{out}");
     }
 
     #[test]

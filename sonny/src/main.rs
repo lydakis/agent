@@ -1495,7 +1495,7 @@ impl App {
                     self.live_line(&mut live, line);
                 }
             }
-            let held = live.markdown.finish(self.width);
+            let held = live.markdown.end(self.width);
             self.live_rows(&mut live, held);
         }
     }

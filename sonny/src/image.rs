@@ -52,12 +52,14 @@ pub fn preload() {
     fonts();
 }
 
-/// A new image id, distinct from other Sonnys' in the same terminal, and
-/// at most 24 bits, as a placeholder's colour carries it.
+/// A new image id, at most 24 bits, as a placeholder's colour carries it:
+/// the process in the top 8, so another Sonny in the same terminal likely
+/// differs, and a count in the low 16, so pictures still in scrollback
+/// keep theirs for the first 65,535.
 fn next_id() -> u32 {
     static NEXT: AtomicU32 = AtomicU32::new(0);
-    let base = (std::process::id() % 0xFFFF + 1) << 8;
-    base | (NEXT.fetch_add(1, Ordering::Relaxed) % 255 + 1)
+    let base = (std::process::id() % 255 + 1) << 16;
+    base | (NEXT.fetch_add(1, Ordering::Relaxed) % 0xFFFF + 1)
 }
 
 /// A picture ready to show: its PNG, the cells it fills, and whether it
