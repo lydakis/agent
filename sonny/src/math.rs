@@ -219,11 +219,14 @@ fn argument(text: &str) -> (String, &str) {
         return (rest.to_owned(), "");
     }
     if let Some(name) = text.strip_prefix('\\') {
-        let end = 1 + name
+        // A command's letters, else the one character after the backslash.
+        let letters = name
             .find(|c: char| !c.is_ascii_alphabetic())
-            .unwrap_or(name.len())
-            .max(1)
-            .min(name.len());
+            .unwrap_or(name.len());
+        let end = 1 + match letters {
+            0 => name.chars().next().map_or(0, char::len_utf8),
+            n => n,
+        };
         return (text[..end].to_owned(), &text[end..]);
     }
     match text.chars().next() {
@@ -358,5 +361,7 @@ mod tests {
             "sin(x)ʸ".replace('ʸ', "^y").as_str()
         );
         assert_eq!(unicode(r"e^{i\pi}"), "e^(iπ)");
+        // A backslash before a character no command starts with keeps it.
+        assert_eq!(unicode("x^\\α"), "x^α");
     }
 }

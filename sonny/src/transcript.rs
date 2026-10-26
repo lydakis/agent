@@ -654,6 +654,13 @@ pub fn tool(
         Span::raw(" "),
         Span::raw(what.lines().next().unwrap_or("").to_owned()),
     ]);
+    // A file tool that failed changed nothing: what it was asked to do is
+    // not drawn, its error is.
+    if failed && matches!(name, "edit" | "write" | "read") {
+        let mut out = wrap(header, width, bullet, Span::raw("    "));
+        out.extend(preview(output.unwrap_or(""), width));
+        return out;
+    }
     let edit = (name == "edit").then(|| diff(arguments, workspace));
     if let Some(edit) = &edit {
         let (removed, added) = edit.counts();
@@ -1044,6 +1051,24 @@ mod tests {
             60,
         );
         assert_eq!(text(&rows)[1], "  └ c.fix completed: Fixed it.");
+    }
+
+    #[test]
+    fn a_failed_edit_shows_its_error_not_a_diff() {
+        let rows: Vec<String> = tool(
+            "edit",
+            &serde_json::json!({"path": "/w/a.rs", "old": "x", "new": "y"}),
+            Some("edit_target_not_found"),
+            true,
+            "/w",
+            80,
+        )
+        .iter()
+        .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows[0].contains("Edited a.rs") && !rows[0].contains('+'));
+        assert!(rows[1].contains("edit_target_not_found"));
     }
 
     #[test]

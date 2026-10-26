@@ -328,10 +328,10 @@ fn substitution(chars: &[char], open: usize) -> usize {
 /// other stays as written.
 fn substituted(raw: &[char]) -> String {
     let text: String = raw.iter().collect();
-    let inner = text
-        .strip_prefix("$(")
-        .and_then(|t| t.strip_suffix(')'))
-        .unwrap_or(&text);
+    // An unclosed one is the shell's error to report, not a word to read.
+    let Some(inner) = text.strip_prefix("$(").and_then(|t| t.strip_suffix(')')) else {
+        return text;
+    };
     if let Some(simple) = simple(inner)
         && simple.words == ["cat"]
         && let Some(document) = simple.stdin
@@ -399,6 +399,12 @@ fn body(chars: &[char], start: usize, delimiter: &str, strip: bool) -> (String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unclosed_substitution_stays_as_written() {
+        let read = simple("echo $(unterminated").unwrap();
+        assert_eq!(read.words, ["echo", "$(unterminated"]);
+    }
 
     #[test]
     fn a_line_splits_outside_quotes_substitutions_and_documents() {
