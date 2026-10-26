@@ -176,9 +176,9 @@ fn which(program: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// Agent's own binary: the one the daemon gave this shell, else the one
-/// installed with Sonny (Homebrew's `libexec/agent`, beside `bin/sonny`),
-/// which speaks Sonny's protocol, else the app's. Not `agent` on PATH,
+/// Agent's own binary: the one the daemon gave this shell (or Homebrew's
+/// wrapper names, by a path upgrades keep), else the one installed beside
+/// Sonny (`libexec/agent`), which speaks Sonny's protocol, else the app's. Not `agent` on PATH,
 /// which may be another program.
 fn agent_bin() -> Option<PathBuf> {
     let beside = std::env::current_exe()
