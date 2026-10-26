@@ -326,6 +326,9 @@ does; the swarm shows under the project once its agents take their briefs.
 A coordinator hears when you work in a task it started: once it rests, one
 message lists the turns its tasks ended, and it passes on what another task
 needs.
+The app also starts Agent's [lookout](LOOKOUT.md) for this machine's
+daemon, which wakes a coordinator sooner when a task needs it: a message
+that redirects other tasks, a conflict, a stuck or silent task.
 
 ![A coordinator reads a task update and passes build's change on to test](app/coordinator-wake.png)
 

@@ -267,6 +267,39 @@ async fn start(agent: &Path, store: &Path, socket: Option<&Path>) -> Result<(), 
     })
 }
 
+/// Agent's lookout for the store's daemon, which wakes each lead when its
+/// tasks need it: started detached, as the daemon is, logging beside the
+/// store. One already watching keeps it, and this one exits at once.
+pub async fn lookout(agent: &Path, store: &Path, socket: &Path) -> Result<(), String> {
+    let mut command = Command::new(agent);
+    if let Some(environment) = login().await {
+        command.env_clear().envs(environment.iter().cloned());
+    }
+    if let Some(file) = env_file() {
+        apply(&mut command, read_env_file(&file)?);
+    }
+    let mut log = store.as_os_str().to_owned();
+    log.push(".lookout.log");
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)
+        .map_err(|e| format!("lookout_start_failed: {e}"))?;
+    command
+        .arg("lookout")
+        .arg("--store")
+        .arg(store)
+        .arg("--socket")
+        .arg(socket)
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().map_err(|e| e.to_string())?)
+        .stderr(log)
+        .spawn()
+        .map_err(|e| format!("lookout_start_failed: {}: {e}", agent.display()))?;
+    Ok(())
+}
+
 /// The env file's settings over the command's environment. An empty value
 /// unsets what the login shell set: Settings writes one to clear it.
 fn apply(command: &mut Command, pairs: Vec<(String, String)>) {

@@ -598,8 +598,8 @@ so only one instance runs at a time, and answers in layers:
 George decided on 2026-09-27 that `auto` works without a Jev key, with
 whatever model is configured, and that Jev is one judge among others.
 `agent approver --judge PROVIDER/MODEL`, or `AGENT_JUDGE`, picks
-it. `AGENT_JUDGE` is the one decision-model setting: Sonny's lookout reads
-it too, and the clients pass `~/.agent/env` to the approvers they start, so
+it. `AGENT_JUDGE` is the one decision-model setting: the
+[lookout](LOOKOUT.md) reads it too, and the clients pass `~/.agent/env` to the approvers they start, so
 `AGENT_JUDGE=bedrock/MODEL` there runs every judge on Bedrock. Without either, the judge is Jev when `TYPESAFE_API_KEY` is set, and
 otherwise `AGENT_MODEL` for `agent approver`, or the bot's own model for the
 approver the CLI starts.

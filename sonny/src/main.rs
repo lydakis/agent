@@ -17,7 +17,6 @@ mod herdr;
 mod html;
 mod image;
 mod js;
-mod lookout;
 mod math;
 mod mermaid;
 mod models;
@@ -35,6 +34,7 @@ mod term;
 mod transcript;
 mod updates;
 
+use agent_client::history::{responses, text};
 use agent_client::{Client, Events};
 use ratatui::{
     Terminal, TerminalOptions, Viewport,
@@ -91,14 +91,10 @@ struct Options {
     rex_host: Option<String>,
     /// Ring when work ends or needs the person.
     sound: bool,
-    /// The decision model that wakes the lead when its tasks need it, or
-    /// `off`; `None` picks one (lookout::choose).
-    lookout: Option<String>,
 }
 
 fn usage() -> String {
     "usage: sonny [--store PATH] [--socket PATH] [--model PROVIDER/MODEL] [--no-layout] [--rex-host HOST] [--no-sound]\n\
-     \x20      [--lookout openai-decisions/MODEL|typesafe/jev-*|PROVIDER/MODEL|off]\n\
      \x20      [--copies worktree|sandfs] [--bot NAME [--new [--workspace DIR]]]\n\
      With no --bot, the folder's coordinator, made with --model the first time; its tasks\n\
      open beside it in Rex or Herdr. Type /status for the project's agents.\n\
@@ -108,9 +104,7 @@ fn usage() -> String {
      sonny task NAME [--setup] [RUN FLAGS] -- BRIEF, from the lead's shell, makes a task's\n\
      folder that way and starts the task there; sonny task changes NAME [--apply] lists\n\
      (or writes here) what a sandfs copy of a plain folder changed.\n\
-     The lookout wakes the lead when its tasks need it, judged by --lookout, else AGENT_JUDGE\n\
-     (as the approver is), else openai-decisions/gpt-6-luna with OPENAI_API_KEY, else the\n\
-     newest Haiku the lead's provider lists."
+     Sonny starts Agent's lookout, which wakes the lead when its tasks need it."
         .into()
 }
 
@@ -322,6 +316,39 @@ async fn serve_auto(client: &Client, options: &Options, model: &str) -> Result<(
     Ok(())
 }
 
+/// Agent's lookout, which wakes leads when their tasks need them: started
+/// detached, logging beside the store. One already watching this daemon
+/// keeps it, and the new one exits.
+fn start_lookout(options: &Options) -> Result<(), String> {
+    let bin = agent_bin().ok_or("Agent's binary was not found for the lookout; set AGENT_BIN")?;
+    let mut log = options.store.clone().into_os_string();
+    log.push(".lookout.log");
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)
+        .map_err(|e| e.to_string())?;
+    let mut command = agent_command(&bin)?;
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .arg("lookout")
+        .arg("--store")
+        .arg(&options.store)
+        .arg("--socket")
+        .arg(&options.socket)
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone().map_err(|e| e.to_string())?)
+        .stderr(log)
+        .spawn()
+        .map_err(|e| format!("{}: {e}", bin.display()))?;
+    // Reaped when it exits, as it does at once when another one watches.
+    std::thread::spawn(move || child.wait());
+    Ok(())
+}
+
 /// The daemon, started the way the CLI starts it when it is not running.
 async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events), String> {
     if let Ok(connected) = Client::connect(&options.socket).await {
@@ -360,7 +387,6 @@ fn parse() -> Result<Options, String> {
     let (mut store, mut socket, mut bot, mut new, mut model, mut workspace) =
         (None, None, None, false, None, None);
     let (mut layout, mut rex_host, mut sound) = (true, None, true);
-    let mut lookout = None;
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or_else(usage);
         match arg.as_str() {
@@ -373,7 +399,6 @@ fn parse() -> Result<Options, String> {
             "--no-layout" => layout = false,
             "--rex-host" => rex_host = Some(value()?),
             "--no-sound" => sound = false,
-            "--lookout" => lookout = Some(value()?),
             "--copies" => {
                 let copies = value()?;
                 if !agent_client::project::COPIES.contains(&copies.as_str()) {
@@ -405,7 +430,6 @@ fn parse() -> Result<Options, String> {
         layout,
         rex_host,
         sound,
-        lookout,
     })
 }
 
@@ -443,9 +467,6 @@ async fn run() -> Result<(), String> {
     if std::env::args().nth(1).as_deref() == Some("--version") {
         println!("sonny {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
-    }
-    if std::env::args().nth(1).as_deref() == Some("lookout-replay") {
-        return lookout::replay().await;
     }
     let options = parse()?;
     // Fonts are read before the first picture needs them.
@@ -559,28 +580,10 @@ async fn run() -> Result<(), String> {
             Err(error) => app.notice = Some(format!("the lead's instructions: {error}")),
         }
     }
-    if let (Some(project), Some(dir), true) = (
-        &project,
-        moving
-            .clone()
-            .or(bot["workspace"].as_str().map(PathBuf::from)),
-        options.lookout.as_deref() != Some("off"),
-    ) {
-        let lead_model = format!(
-            "{}/{}",
-            bot["provider"].as_str().unwrap_or_default(),
-            bot["model"].as_str().unwrap_or_default()
-        );
-        match lookout::choose(&app.client, options.lookout.as_deref(), &lead_model).await {
-            Ok(judge) => lookout::spawn(
-                options.socket.clone(),
-                project.clone(),
-                name.clone(),
-                dir,
-                judge,
-            ),
-            Err(error) => app.notice = Some(error),
-        }
+    if project.is_some()
+        && let Err(error) = start_lookout(&app.options)
+    {
+        app.notice = Some(error);
     }
     // Said last: it is what the next message does.
     if let Some(dir) = &moving {
@@ -1747,7 +1750,13 @@ impl App {
             }
             self.approvals_for(self.running.as_ref().map(|r| r.turn))
                 .await;
-            // A daemon that restarted took the approver Sonny started with it.
+            // A daemon that restarted took the approver and the lookout
+            // Sonny started with it.
+            if self.project.is_some()
+                && let Err(error) = start_lookout(&self.options)
+            {
+                self.notice = Some(error);
+            }
             if self.mode == Some("auto")
                 && let Err(error) = serve_auto(&self.client, &self.options, &self.model).await
             {
@@ -3393,19 +3402,6 @@ fn first_line(text: &str) -> String {
     cut
 }
 
-/// A message item's text.
-fn text(item: &Value) -> String {
-    match &item["content"] {
-        Value::String(text) => text.clone(),
-        Value::Array(parts) => parts
-            .iter()
-            .filter_map(|part| part["text"].as_str())
-            .collect::<Vec<_>>()
-            .join(""),
-        _ => String::new(),
-    }
-}
-
 /// A tool result's text, and whether it failed. A shell result is JSON
 /// with its streams and exit status.
 fn output(item: &Value) -> (String, bool) {
@@ -3422,37 +3418,6 @@ fn output(item: &Value) -> (String, bool) {
         }
         _ => (raw, failed),
     }
-}
-
-/// An item as the Responses family shapes it, which the transcript reads.
-/// An Anthropic message's `tool_use` blocks become function calls after
-/// its text, and a user message's `tool_result` blocks their outputs.
-fn responses(item: &Value) -> Vec<Value> {
-    let Some(parts) = item["content"].as_array() else {
-        return Vec::from_iter((!item.is_null()).then(|| item.clone()));
-    };
-    let tool = |part: &&Value| matches!(part["type"].as_str(), Some("tool_use" | "tool_result"));
-    if !parts.iter().any(|part| tool(&part)) {
-        return vec![item.clone()];
-    }
-    let said: Vec<&Value> = parts.iter().filter(|part| part["type"] == "text").collect();
-    let mut items = Vec::new();
-    if item["role"] == "assistant" || !said.is_empty() {
-        items.push(json!({"role": item["role"], "content": said}));
-    }
-    for part in parts.iter().filter(tool) {
-        items.push(match part["type"].as_str() {
-            Some("tool_use") => json!({"type": "function_call", "call_id": part["id"],
-                "name": part["name"], "arguments": part["input"].to_string()}),
-            _ => json!({"type": "function_call_output", "call_id": part["tool_use_id"],
-                "output": match &part["content"] {
-                    Value::String(output) => output.clone(),
-                    content => text(&json!({"content": content})),
-                },
-                "failed": part["is_error"] == true}),
-        });
-    }
-    items
 }
 
 #[cfg(test)]
@@ -3516,7 +3481,6 @@ mod tests {
             layout: false,
             rex_host: None,
             sound: false,
-            lookout: None,
         };
         let mut app = App::new(client, "b", &json!({"name": "b"}), options);
         let event =

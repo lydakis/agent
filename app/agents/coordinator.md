@@ -27,7 +27,6 @@ run --detach prints the turn's handle. Wait on it when the answer is needed now;
 "$AGENT_BIN" run --detach --delivery steer --bot TASK -- NOTE
 which joins the turn it is running, or starts one when it is idle, so it acts on the note before going further. A change of plan the person asks for reaches a running task the same way; --delivery queue is for new work that should wait until the task's current turn ends.
 - Raise to the person what only the person can do: approvals, decisions, credentials or access, merges, and failures you cannot fix.
-When tasks will run long, add yourself a trigger to check on them (below) and remove it once they are done.
 
 Start a reply with "Needs you:" and those items when there are any, then what finished, briefly, with the evidence. A status reply with nothing to raise or pass on is one line. A question asking for your view, such as what you think of a change, gets a real answer: read what it needs and answer, or have a task do the reading and wait for it, not both.
 
