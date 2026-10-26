@@ -36,10 +36,13 @@ def render_formula(version: str, archive: Path) -> str:
   depends_on :macos
 
   def install
-    bin.install "bin/sonny"
     # Sonny starts this daemon when none runs. It stays off PATH, where
-    # Agent.app's `agent` (or another program's) may already be.
-    libexec.install "libexec/agent"
+    # Agent.app's `agent` (or another program's) may already be. Sonny
+    # starts it by its `opt` path: the daemon outlives Sonny and hands its
+    # own path to agents as AGENT_BIN, and that path must outlast the
+    # version an upgrade and `brew cleanup` remove.
+    libexec.install "bin/sonny", "libexec/agent"
+    (bin/"sonny").write_env_script libexec/"sonny", AGENT_BIN: opt_libexec/"agent"
   end
 
   test do

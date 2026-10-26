@@ -514,7 +514,8 @@ The same release carries Sonny, the terminal client, as a formula
 (`brew install lydakis/agent/sonny`): `sonny-X.Y.Z.tar.gz` holds a
 universal `bin/sonny` and the app's signed `libexec/agent`, which Sonny
 starts when no daemon runs, kept off `PATH` so it never shadows the cask's
-`agent`. A formula's download is not quarantined, so Sonny itself is not
+`agent`. Sonny starts it by its `opt` path, so the daemon, which outlives
+Sonny, never hands agents a path an upgrade and `brew cleanup` removed. A formula's download is not quarantined, so Sonny itself is not
 signed or notarized. Publishing checks, audits, installs and tests it the
 same way and writes `Formula/sonny.rb` beside the cask. The
 helpers and their tests are in [app/release](../app/release)
