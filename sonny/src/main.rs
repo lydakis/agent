@@ -12,6 +12,7 @@ mod approvals;
 mod cache;
 mod calls;
 mod diff;
+mod errand;
 mod html;
 mod image;
 mod js;
@@ -152,6 +153,14 @@ fn show() -> Result<(), String> {
     rex.close_others(&bot);
     println!("{}", json!({"bot": bot, "session": project}));
     Ok(())
+}
+
+/// A program on PATH.
+fn which(program: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
 }
 
 /// Agent's own binary: the one the daemon gave this shell, else the
@@ -535,6 +544,8 @@ struct Watch {
     screen: Tui,
     project: String,
     rows: Vec<status::Row>,
+    /// This project's active Errand jobs.
+    jobs: Vec<status::Row>,
     /// When the rows were read: their times count on from here.
     read: Instant,
 }
@@ -634,6 +645,12 @@ struct Fleet {
     named: HashMap<String, String>,
     /// What to ring for, taken by the app after each event.
     alerts: Vec<(sound::Alert, String)>,
+    /// Detached Errand runs the project's bots started, by call: the
+    /// command, until the call's output names the job.
+    errands: HashMap<String, String>,
+    /// Finished calls whose output names a job to follow in a window:
+    /// the bot, the output's node, and the command.
+    jobs: Vec<(String, i64, String)>,
 }
 
 impl Fleet {
@@ -675,6 +692,8 @@ impl Fleet {
             doing: HashMap::new(),
             named: HashMap::new(),
             alerts: Vec::new(),
+            errands: HashMap::new(),
+            jobs: Vec::new(),
         };
         fleet.rex.adopt_own(lead);
         fleet.doing(lead, "idle");
@@ -713,6 +732,68 @@ impl Fleet {
         let opened = self.rex.show(bot, &name, &command)?;
         self.doing(bot, "working");
         Ok(opened)
+    }
+
+    /// Note a detached Errand run as it starts, and its job once the call
+    /// finishes, to follow it in a window of its own.
+    fn errand(&mut self, bot: &str, kind: &str, data: &Value) {
+        let call = data["call_id"].as_str().unwrap_or("").to_owned();
+        match kind {
+            "tool_started" if data["name"] == "shell" => {
+                let command = data["arguments"]
+                    .as_str()
+                    .and_then(|a| serde_json::from_str::<Value>(a).ok())
+                    .and_then(|a| a["command"].as_str().and_then(calls::errand_detached));
+                if let Some(command) = command {
+                    self.errands.insert(call, command);
+                }
+            }
+            "tool_completed" => {
+                if let Some(command) = self.errands.remove(&call)
+                    && let Some(node) = data["node"].as_i64()
+                    && data["failed"] != true
+                {
+                    self.jobs.push((bot.to_owned(), node, command));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A window for each Errand job started since: `errand attach` on its
+    /// handle, named after its command.
+    async fn follow_jobs(&mut self) {
+        let Some(errand) = which("errand") else {
+            self.jobs.clear();
+            return;
+        };
+        for (bot, node, command) in std::mem::take(&mut self.jobs) {
+            let Ok(read) = self
+                ._client
+                .request("history_items", json!({"bot": bot, "nodes": [node]}))
+                .await
+            else {
+                continue;
+            };
+            let (printed, _) = output(&read["items"][0]["item"]);
+            let Some(handle) = printed
+                .lines()
+                .map(str::trim)
+                .find(|line| line.contains('/') && !line.contains(' '))
+            else {
+                continue;
+            };
+            let label = format!("errand:{handle}");
+            let name = format!("errand · {}", first_line(&command));
+            let attach = vec![
+                errand.to_string_lossy().into_owned(),
+                "attach".into(),
+                handle.to_owned(),
+            ];
+            let _ = self
+                .rex
+                .place(&label, &name, &attach, &rex::Placement::Window);
+        }
     }
 
     /// A bot's name in its project's session: `lead`, or the task's name.
@@ -807,6 +888,7 @@ impl Fleet {
         let bot = event["bot"].as_str()?;
         let data = &event["data"];
         if self.lineage.contains(bot) {
+            self.errand(bot, kind, data);
             match kind {
                 "accepted" if bot == self.lead => self.doing(bot, "working"),
                 "approval_requested" => {
@@ -998,6 +1080,11 @@ impl App {
                         continue;
                     };
                     let said = self.fleet.as_mut().and_then(|fleet| fleet.event(&event));
+                    if let Some(fleet) = &mut self.fleet
+                        && !fleet.jobs.is_empty()
+                    {
+                        fleet.follow_jobs().await;
+                    }
                     let alerts = self
                         .fleet
                         .as_mut()
@@ -1671,6 +1758,7 @@ impl App {
                 return;
             }
         };
+        let jobs = errand::jobs(self.folder_name()).await;
         let _ = execute!(std::io::stdout(), EnterAlternateScreen);
         match Terminal::new(CrosstermBackend::new(std::io::stdout())) {
             Ok(screen) => {
@@ -1678,6 +1766,7 @@ impl App {
                     screen,
                     project,
                     rows,
+                    jobs,
                     read: Instant::now(),
                 })
             }
@@ -1689,12 +1778,22 @@ impl App {
     }
 
     async fn reread(&mut self) {
+        let jobs = errand::jobs(self.folder_name()).await;
         if let Ok((_, rows)) = self.status_rows().await
             && let Some(watch) = &mut self.watch
         {
             watch.rows = rows;
+            watch.jobs = jobs;
             watch.read = Instant::now();
         }
+    }
+
+    /// The lead's folder's own name, which Errand names its jobs' project by.
+    fn folder_name(&self) -> String {
+        std::path::Path::new(&self.workspace)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
     }
 
     /// The project's agents, as `/status` shows them.
@@ -2477,6 +2576,15 @@ fn draw_watch(watch: &mut Watch) -> std::io::Result<()> {
             row
         })
         .collect();
+    let jobs: Vec<status::Row> = watch
+        .jobs
+        .iter()
+        .cloned()
+        .map(|mut job| {
+            job.seconds = job.seconds.map(|s| s + since);
+            job
+        })
+        .collect();
     let project = watch.project.clone();
     watch.screen.autoresize()?;
     watch.screen.draw(|frame| {
@@ -2484,7 +2592,7 @@ fn draw_watch(watch: &mut Watch) -> std::io::Result<()> {
         let width = area.width.saturating_sub(2) as usize;
         let mut lines = vec![Line::default()];
         lines.extend(
-            status::card(&project, &rows, width)
+            status::card(&project, &rows, &jobs, width)
                 .into_iter()
                 .map(|line| {
                     let mut spans = vec![Span::raw(" ")];

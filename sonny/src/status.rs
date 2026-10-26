@@ -55,7 +55,8 @@ pub fn plain_line(text: &str) -> String {
     String::new()
 }
 
-pub fn card(project: &str, rows: &[Row], width: usize) -> Vec<Line<'static>> {
+/// The agents, then the project's Errand jobs, when it has any running.
+pub fn card(project: &str, rows: &[Row], jobs: &[Row], width: usize) -> Vec<Line<'static>> {
     let count = |state: &str| rows.iter().filter(|r| r.state == state).count();
     let mut head = format!(
         "{project} · {} agent{}",
@@ -112,6 +113,27 @@ pub fn card(project: &str, rows: &[Row], width: usize) -> Vec<Line<'static>> {
             ));
         }
     }
+    if !jobs.is_empty() {
+        out.push(Line::default());
+        out.push(Line::from(format!("On Errand · {} active", jobs.len())).bold());
+        for job in jobs {
+            let mut spans = vec![
+                Span::raw(" "),
+                mark(&job.state),
+                Span::raw(job.name.clone()),
+            ];
+            if let Some(seconds) = job.seconds {
+                spans.push(Span::raw(format!(" · {}", crate::transcript::elapsed(seconds))).dim());
+            }
+            out.extend(crate::transcript::capped(
+                Line::from(spans),
+                width,
+                Span::raw(""),
+                1,
+            ));
+            out.push(Line::from(format!("   {}", job.place)).dim());
+        }
+    }
     out
 }
 
@@ -144,6 +166,7 @@ mod tests {
                 row("zero", "needs you"),
                 row("equal", "done"),
             ],
+            &[],
             100,
         );
         let text: Vec<String> = lines

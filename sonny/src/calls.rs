@@ -564,6 +564,19 @@ fn rex(words: &[String], output: &str, failed: bool) -> Option<Said> {
     Some(said)
 }
 
+/// The command an `errand -d -- COMMAND` call starts, detached.
+pub fn errand_detached(command: &str) -> Option<String> {
+    let simple = crate::shell::simple(command)?;
+    let (program, words) = simple.words.split_first()?;
+    if program.rsplit('/').next() != Some("errand") {
+        return None;
+    }
+    let args = Args::new(words);
+    (args.has("-d") || args.has("--detach"))
+        .then(|| args.rest.clone())
+        .flatten()
+}
+
 /// An Errand call: a command run on another machine, or a look at or
 /// action on a job, by its `peer/ULID` handle.
 fn errand(words: &[String], output: &str, failed: bool) -> Option<Said> {
@@ -826,6 +839,16 @@ Keep the rest.'"#,
         assert!(listed.what.starts_with("| python3 -c"));
         assert!(listed.under.is_empty());
         assert_eq!(listed.output.as_deref(), Some("42\n"));
+    }
+
+    #[test]
+    fn a_detached_errand_run_is_found() {
+        assert_eq!(
+            errand_detached("errand -d --on mini -- make test").as_deref(),
+            Some("make test")
+        );
+        assert_eq!(errand_detached("errand --on mini -- make test"), None);
+        assert_eq!(errand_detached("errand -d ps"), None);
     }
 
     fn said_or_none(command: &str, output: &str) -> Said {
