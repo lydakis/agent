@@ -31,6 +31,12 @@ long command where the person can watch it, and read it back:
 The skill tells agents to close what they opened once read; whatever a task
 left open closes with its window.
 
+The lead hears what its tasks did as the app tells it: once it rests, and at
+most every ten minutes, one "Task updates" message lists the tasks it started
+that ended a turn or wait for an approval, by the handles its wait tool reads
+them with, with what changed in memory alongside. The app and Sonny send the
+same news as one message, so it does not matter which is open.
+
 Enter sends (and steers a running turn), Esc interrupts, `y`/`n` answer a
 pending approval, Ctrl-C clears the composer or quits. `/` lists the
 commands:
