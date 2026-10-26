@@ -163,6 +163,9 @@ async fn project_of(client: &Client, bot: &str) -> String {
     starts.last().copied().unwrap_or(bot).to_owned()
 }
 
+/// How many lines of transcript wait while `/status` holds the screen.
+const KEPT_UNDER_STATUS: usize = 5_000;
+
 /// A program on PATH.
 fn which(program: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
@@ -580,6 +583,8 @@ struct App {
     input: String,
     /// Lines waiting to be written into scrollback.
     pending: Vec<Line<'static>>,
+    /// Lines let go while `/status` held the screen, past what is kept.
+    skipped: usize,
     any_history: bool,
     width: usize,
     live: Option<Live>,
@@ -992,6 +997,7 @@ impl App {
             tokens_used: record["tokens_used"].as_u64().unwrap_or(0),
             input: String::new(),
             pending: Vec::new(),
+            skipped: 0,
             any_history: false,
             width: 80,
             live: None,
@@ -2398,8 +2404,21 @@ impl App {
         // the viewport takes the new size first, and a line still too wide
         // is cut into rows rather than losing its end.
         if let Some(watch) = &mut self.watch {
-            // History waits for the main screen.
+            // History waits for the main screen, its newest lines kept.
+            if let Some(over) = self.pending.len().checked_sub(KEPT_UNDER_STATUS)
+                && over > 0
+            {
+                self.pending.drain(..over);
+                self.skipped += over;
+            }
             return draw_watch(watch);
+        }
+        if self.skipped > 0 {
+            let note = format!(
+                "… {} earlier lines went by while /status was open",
+                std::mem::take(&mut self.skipped)
+            );
+            self.pending.insert(0, Line::from(note).dim());
         }
         if std::mem::take(&mut self.redraw) {
             terminal.clear()?;
