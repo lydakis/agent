@@ -4,8 +4,12 @@ A coordinator (its instructions carry the coordinator role) hands the work
 to a task; any other bot runs the same small task: run the tests, fix the
 bug with `edit`, run them again, then stream a markdown summary.
 Usage: python3 model.py PORT
+With SONNY_DEMO_WAIT=1 the lead waits on the task and reports, so the task's
+window closes when it is done.
 """
-import http.server, json, sys, time
+import http.server, json, os, re, sys, time
+
+WAIT = os.environ.get('SONNY_DEMO_WAIT') == '1'
 
 SUMMARY = """Fixed the off-by-one in `average`.
 
@@ -39,6 +43,15 @@ class Model(http.server.BaseHTTPRequestHandler):
             text = "That needs a fix and a test run, so I'll hand it to a task."
             output = [call('shell', f'l1-{len(items)}', command='"$AGENT_BIN" run --detach --new --bot "${AGENT_BOT%.lead}.fix-avg" '
                            '--model "$AGENT_MODEL" -- "Fix the failing test"')]
+        elif lead and WAIT and step == 1:
+            # The handle `run --detach` printed, waited on: the task's window
+            # closes once the wait returns its finished turn.
+            started = next(item['output'] for item in reversed(items) if item.get('type') == 'function_call_output')
+            handle = re.search(r'turn:[\w.-]+/\d+', started).group(0)
+            text = "Waiting for `fix-avg` to finish."
+            output = [call('wait', f'w1-{len(items)}', handles=[handle])]
+        elif lead and WAIT:
+            text = 'Done: `fix-avg` fixed the average and the tests pass.'
         elif lead:
             text = ('Started `fix-avg`. It has its own window in Rex, '
                     'so you can watch it or step in there.')
