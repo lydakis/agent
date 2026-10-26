@@ -627,6 +627,18 @@ pub fn tool(
                     claim(&mut printed, &|v| {
                         v.get("session").is_some() && v.get("bot").is_some()
                     });
+                } else if first.verb == "Scheduled" {
+                    own = claim(&mut printed, &|v| {
+                        v.get("when").is_some() || v.get("error").is_some()
+                    })
+                    .unwrap_or_default();
+                } else if first.verb.ends_with("memory") {
+                    own = claim(&mut printed, &|v| {
+                        v.get("saved").is_some()
+                            || v.get("removed").is_some()
+                            || v.get("error").is_some()
+                    })
+                    .unwrap_or_default();
                 }
             }
             said.push(crate::calls::said(part, &own, false));
@@ -1011,6 +1023,32 @@ mod tests {
 
     fn text(lines: &[Line]) -> Vec<String> {
         lines.iter().map(|l| l.to_string()).collect()
+    }
+
+    #[test]
+    fn a_trigger_and_a_memory_save_read_as_what_they_did() {
+        let command = r#"git worktree list; "$HOME/.agent/trigger" add --name watch --every 10m -- 'Check the tasks, then report'; "$HOME/.agent/memory" save flow --type project --description d --source s -- 'text'"#;
+        let output = "/repo d7e2b9e [main]\n\
+            {\"name\":\"watch\",\"when\":\"every 10m\"}\n\
+            {\"duplicate\":false,\"saved\":\"flow\",\"replaced\":false,\"path\":\"/m/flow.md\"}\n";
+        let shown = text(&tool(
+            "shell",
+            &serde_json::json!({"command": command}),
+            Some(output),
+            false,
+            "/repo",
+            100,
+        ));
+        assert_eq!(
+            shown,
+            [
+                "• Ran git worktree list",
+                "  └ /repo d7e2b9e [main]",
+                "• Scheduled watch · every 10m",
+                "  └ Check the tasks, then report",
+                "• Saved to memory flow",
+            ],
+        );
     }
 
     #[test]

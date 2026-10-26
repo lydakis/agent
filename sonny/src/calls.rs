@@ -1,7 +1,8 @@
 //! Shell commands Sonny knows the meaning of, said as what they do: an
 //! `agent` call starts, messages, waits on or removes an agent; a `rex` call
 //! opens, reads or types into a window; an `errand` call runs a command on
-//! another machine or acts on its job; the plan skill sets the plan. A
+//! another machine or acts on its job; the app's memory and trigger
+//! scripts save facts and schedule jobs; the plan skill sets the plan. A
 //! command line is read a command at a time; a pipe is said with its
 //! command and what came out of it.
 use ratatui::{
@@ -73,16 +74,8 @@ pub fn said(command: &str, output: &str, failed: bool) -> Option<Said> {
         "$AGENT_BIN" | "${AGENT_BIN}" | "agent" => agent(args, stdin, printed, failed),
         "errand" => errand(args, printed, failed),
         "$REX" | "${REX}" | "rex" => rex(args, printed, failed),
-        "memory" if program.contains(".agent/memory") => Some(Said {
-            verb: match args.first().map(String::as_str) {
-                Some("show") | None => "Read the memory indexes".into(),
-                Some(other) => format!("Used memory {other}"),
-            },
-            what: String::new(),
-            under: Vec::new(),
-            failed,
-            output: None,
-        }),
+        "memory" if program.contains(".agent/memory") => Some(memory(args, printed, failed)),
+        "trigger" if program.contains(".agent/trigger") => trigger(args, printed, failed),
         "project" if program.contains(".agent/project") => Some(Said {
             verb: match args.first().map(String::as_str) {
                 Some("add") => "Added the project".into(),
@@ -210,6 +203,102 @@ fn dim(text: impl Into<String>) -> Line<'static> {
     Line::from(text.into()).dim()
 }
 
+/// Why a script refused, from the `{"error", "detail"}` it printed.
+fn refused(reply: &Value) -> Option<String> {
+    let code = reply["error"].as_str()?;
+    let detail = reply["detail"].as_str().filter(|d| !d.is_empty());
+    Some(match detail {
+        Some(detail) => format!("{detail} ({code})"),
+        None => code.replace('_', " "),
+    })
+}
+
+/// The app's memory script: what it saved or removed, by name.
+fn memory(words: &[String], output: &str, failed: bool) -> Said {
+    let reply: Value = serde_json::from_str(output.trim()).unwrap_or(Value::Null);
+    let refusal = refused(&reply);
+    let name = || words.get(1).cloned().unwrap_or_default();
+    let (verb, what) = match words.first().map(String::as_str) {
+        Some("show") | None => ("Read the memory indexes".into(), String::new()),
+        Some("save") => {
+            let what = reply["saved"].as_str().map_or_else(name, str::to_owned);
+            let verb = if reply["duplicate"] == true {
+                "Already in memory"
+            } else if reply["replaced"] == true {
+                "Updated in memory"
+            } else {
+                "Saved to memory"
+            };
+            (verb.into(), what)
+        }
+        Some("rm") => ("Removed from memory".into(), name()),
+        Some(other) => (format!("Used memory {other}"), String::new()),
+    };
+    Said {
+        verb,
+        what,
+        under: refusal
+            .map(|refusal| Line::from(refusal).fg(Color::Red))
+            .into_iter()
+            .collect(),
+        failed: failed || reply.get("error").is_some(),
+        output: None,
+    }
+}
+
+/// The app's trigger script: a job scheduled, fired or removed.
+fn trigger(words: &[String], output: &str, failed: bool) -> Option<Said> {
+    let (verb, rest) = words.split_first()?;
+    let args = Args::new(rest);
+    let reply: Value = serde_json::from_str(output.trim()).unwrap_or(Value::Null);
+    let refusal = refused(&reply);
+    let named = args
+        .plain(0)
+        .first()
+        .map(|n| n.to_string())
+        .unwrap_or_default();
+    let mut said = Said {
+        verb: String::new(),
+        what: named,
+        under: Vec::new(),
+        failed: failed || refusal.is_some(),
+        output: None,
+    };
+    match verb.as_str() {
+        "add" => {
+            said.verb = "Scheduled".into();
+            let name = args
+                .value(&["--name"])
+                .or(args.value(&["--bot", "--start"]));
+            let when = [
+                ("--every", "every"),
+                ("--cron", "cron"),
+                ("--at", "at"),
+                ("--in", "in"),
+            ]
+            .into_iter()
+            .find_map(|(flag, word)| Some(format!("{word} {}", args.value(&[flag])?)));
+            said.what = [name.map(str::to_owned), when]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" · ");
+            if let Some(message) = args.rest.as_deref().filter(|m| !m.trim().is_empty()) {
+                said.under
+                    .push(Line::from(first_line(message)).italic().dim());
+            }
+        }
+        "rm" => said.verb = "Removed the trigger".into(),
+        "fire" => said.verb = "Fired the trigger".into(),
+        "ls" => said.verb = "Listed the triggers".into(),
+        _ => return None,
+    }
+    if let Some(refusal) = refusal {
+        said.under.push(Line::from(refusal).fg(Color::Red));
+    }
+    Some(said)
+}
+
 fn agent(words: &[String], stdin: Option<&str>, output: &str, failed: bool) -> Option<Said> {
     if words
         .iter()
@@ -264,14 +353,7 @@ fn agent(words: &[String], stdin: Option<&str>, output: &str, failed: bool) -> O
     }
     let bot = args.value(&["--bot"]).map(str::to_owned);
     let reply: Option<Value> = serde_json::from_str(output.trim()).ok();
-    let refusal = reply.as_ref().and_then(|r| {
-        let code = r["error"].as_str()?;
-        let detail = r["detail"].as_str().filter(|d| !d.is_empty());
-        Some(match detail {
-            Some(detail) => format!("{detail} ({code})"),
-            None => code.replace('_', " "),
-        })
-    });
+    let refusal = reply.as_ref().and_then(refused);
     let mut said = Said {
         verb: String::new(),
         what: bot.clone().unwrap_or_default(),
@@ -827,6 +909,36 @@ Keep the rest.'"#,
             ("Applied the changes of Errand job", "mini/01JB2Q8W3V4K")
         );
         assert!(said("errand doctor", "", false).is_none());
+    }
+
+    #[test]
+    fn memory_and_trigger_scripts_say_what_they_did() {
+        let saved = said_or_none(
+            r#""$HOME/.agent/memory" save flow --type user -- -"#,
+            r#"{"duplicate":true,"saved":"flow"}"#,
+        );
+        assert_eq!(
+            (saved.verb.as_str(), saved.what.as_str()),
+            ("Already in memory", "flow")
+        );
+        assert!(saved.under.is_empty() && saved.output.is_none());
+        let refused = said_or_none(
+            r#"~/.agent/trigger add --bot shop.lead --cron '0 9 * * 1' -- Brief me"#,
+            r#"{"error":"triggers_unsupported","detail":"needs macOS"}"#,
+        );
+        assert_eq!(refused.verb, "Scheduled");
+        assert_eq!(refused.what, "shop.lead · cron 0 9 * * 1");
+        assert!(refused.failed);
+        let under: Vec<String> = refused.under.iter().map(text).collect();
+        assert_eq!(under, ["Brief me", "needs macOS (triggers_unsupported)"]);
+        let removed = said_or_none(
+            r#""$HOME/.agent/trigger" rm watch"#,
+            r#"{"removed":"watch"}"#,
+        );
+        assert_eq!(
+            (removed.verb.as_str(), removed.what.as_str()),
+            ("Removed the trigger", "watch")
+        );
     }
 
     #[test]
