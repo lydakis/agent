@@ -151,6 +151,8 @@ pub struct Seen {
     pub status: Option<String>,
     /// The history node holding the words, for `Said`: none while queued.
     pub node: Option<i64>,
+    /// The call waiting on approval, for `Waiting`.
+    pub call: Option<String>,
     /// The node of the lead's latest message to the task, then.
     pub brief: Option<i64>,
     /// The other tasks, each with the node of the lead's latest message to it.
@@ -636,7 +638,15 @@ async fn event_text(client: &Client, seen: &Seen) -> String {
             .find(|(_, item)| item["role"] == "assistant"),
         Kind::Waiting => items
             .iter()
-            .find(|(_, item)| item["type"] == "function_call"),
+            // The call the approval names: a response's later calls wait
+            // behind it, so the newest call is not always the one.
+            .find(|(_, item)| {
+                item["type"] == "function_call"
+                    && seen
+                        .call
+                        .as_deref()
+                        .is_none_or(|call| item["call_id"] == call)
+            }),
     };
     match found {
         Some((_, item)) if item["type"] == "function_call" => format!(
@@ -781,7 +791,7 @@ struct Lookout {
     /// The handles the lead's running turn waits on, which its wait reads.
     waiting_on: Vec<String>,
     /// Approvals the person has not answered, by task and turn, since when.
-    approvals: HashMap<(String, i64), Instant>,
+    approvals: HashMap<(String, i64), (Instant, Option<String>)>,
     /// Steers waiting to be absorbed, by task and steer turn: who sent it,
     /// or `None` for the lead.
     steers: HashMap<(String, i64), Option<String>>,
@@ -958,9 +968,10 @@ impl Lookout {
                 }
             }
             "turn_waiting" if !data["approval"].is_null() && data["approval"] != false => {
+                let call = data["call_id"].as_str().map(str::to_owned);
                 self.approvals
                     .entry((bot.to_owned(), turn))
-                    .or_insert_with(Instant::now);
+                    .or_insert_with(|| (Instant::now(), call));
             }
             "tool_completed" | "turn_resumed" => {
                 self.approvals.remove(&(bot.to_owned(), turn));
@@ -1033,6 +1044,7 @@ impl Lookout {
             from,
             status,
             node,
+            call: None,
             brief: self.briefs.get(task).copied(),
             peers,
             text: String::new(),
@@ -1044,12 +1056,18 @@ impl Lookout {
         let due: Vec<(String, i64)> = self
             .approvals
             .iter()
-            .filter(|(_, since)| now.duration_since(**since) >= APPROVAL_AFTER)
+            .filter(|(_, (since, _))| now.duration_since(*since) >= APPROVAL_AFTER)
             .map(|(key, _)| key.clone())
             .collect();
         for (task, turn) in due {
-            self.approvals.remove(&(task.clone(), turn));
+            let call = self
+                .approvals
+                .remove(&(task.clone(), turn))
+                .and_then(|(_, call)| call);
             self.due(&task, turn, Kind::Waiting, None, None, None);
+            if let Some(seen) = self.due.last_mut() {
+                seen.call = call;
+            }
         }
     }
 
@@ -1512,6 +1530,7 @@ mod tests {
             from: Some("the person".into()),
             status: None,
             node: None,
+            call: None,
             brief: None,
             peers: Vec::new(),
             text: "x".repeat(EVENT_CHARS * 2),
@@ -1562,6 +1581,7 @@ mod tests {
                 from: None,
                 status: Some("completed".into()),
                 node: None,
+                call: None,
                 brief: None,
                 peers: Vec::new(),
                 text: "\nFixed avg by skipping empty lists.\nMore.".into(),
@@ -1690,14 +1710,21 @@ mod tests {
             "calc.fix",
             4,
             "turn_waiting",
-            json!({"approval": "call_1"}),
+            json!({"approval": true, "call_id": "call_1"}),
         ));
         lookout.approvals_due();
         assert!(lookout.due.is_empty());
+        assert_eq!(
+            lookout.approvals[&("calc.fix".into(), 4)].1.as_deref(),
+            Some("call_1")
+        );
         let since = Instant::now() - APPROVAL_AFTER;
-        lookout.approvals.insert(("calc.fix".into(), 4), since);
+        lookout
+            .approvals
+            .insert(("calc.fix".into(), 4), (since, Some("call_1".into())));
         lookout.approvals_due();
         assert_eq!(lookout.due[0].kind, Kind::Waiting);
+        assert_eq!(lookout.due[0].call.as_deref(), Some("call_1"));
         // An answered one is not.
         lookout.event(&ev(
             "calc.fix",
@@ -1719,6 +1746,7 @@ mod tests {
             from: None,
             status: Some("completed".into()),
             node: None,
+            call: None,
             brief: None,
             peers: Vec::new(),
             text: String::new(),
