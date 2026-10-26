@@ -1207,7 +1207,16 @@ impl Lookout {
         let prompt = note(&sent, self.held.len());
         let key: Vec<String> = sent
             .iter()
-            .map(|item| format!("{}/{}/{:?}", item.seen.task, item.seen.turn, item.seen.kind))
+            .map(|item| {
+                let seen = &item.seen;
+                // Two approvals in one turn are two notes.
+                let call = seen
+                    .call
+                    .as_deref()
+                    .map(|c| format!("/{c}"))
+                    .unwrap_or_default();
+                format!("{}/{}/{:?}{call}", seen.task, seen.turn, seen.kind)
+            })
             .collect();
         let request_id = format!("lookout-{}", digest(&key.join(",")));
         let submitted = client
