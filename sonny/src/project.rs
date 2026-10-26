@@ -15,6 +15,8 @@ const TOOLS: [&str; 6] = ["shell", "read", "write", "edit", "wait", "history"];
 pub struct Lead {
     pub project: String,
     pub bot: String,
+    /// Made just now, for this folder.
+    pub new: bool,
 }
 
 /// The folder's own name reduced to name characters, as the app names a
@@ -69,14 +71,22 @@ pub async fn open(
     if let Some(project) = agent_client::policy::project(&dir).map_err(|e| e.to_string())? {
         let bot = format!("{project}.lead");
         if find(client, &bot).await?.is_some() {
-            return Ok(Lead { project, bot });
+            return Ok(Lead {
+                project,
+                bot,
+                new: false,
+            });
         }
     }
     let project = default_name(&dir)?;
     let bot = format!("{project}.lead");
     if let Some(found) = find(client, &bot).await? {
         if found["workspace"].as_str() == dir.to_str() {
-            return Ok(Lead { project, bot });
+            return Ok(Lead {
+                project,
+                bot,
+                new: false,
+            });
         }
         return Err(format!(
             "project_exists: {bot} works in {}; open sonny there or pass --bot",
@@ -84,7 +94,11 @@ pub async fn open(
         ));
     }
     create(client, &dir, socket, &bot, model).await?;
-    Ok(Lead { project, bot })
+    Ok(Lead {
+        project,
+        bot,
+        new: true,
+    })
 }
 
 async fn find(client: &Client, bot: &str) -> Result<Option<Value>, String> {

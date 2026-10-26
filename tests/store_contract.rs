@@ -10638,3 +10638,39 @@ fn a_bot_is_pointed_at_another_model_and_effort() {
     assert!(db.set_model("Ann", None, "openai", "other", None).unwrap());
     assert_eq!(db.inspect("Ann").unwrap().effort, None);
 }
+
+#[test]
+fn a_root_bot_changes_its_gate_and_a_made_bot_keeps_its_own() {
+    let mut db = db();
+    let ann = db.create("Ann", None, binding()).unwrap().0;
+    let gate = |tool: &str| Gate {
+        tag: "auto".into(),
+        tools: vec![tool.into()],
+        expire_ms: Some(45_000),
+    };
+    assert!(db.set_gate("Ann", None, Some(gate("read"))).unwrap());
+    assert_eq!(db.inspect("Ann").unwrap().gates, [gate("read")]);
+    assert!(!db.set_gate("Ann", None, Some(gate("read"))).unwrap());
+    assert_eq!(
+        db.set_gate("Ann", None, Some(gate("shell")))
+            .unwrap_err()
+            .code,
+        "approve_not_in_tools"
+    );
+    assert!(db.set_gate("Ann", None, None).unwrap());
+    assert!(db.inspect("Ann").unwrap().gates.is_empty());
+    db.create(
+        "Bob",
+        None,
+        Binding {
+            created_by: Some(&ann.name),
+            created_by_id: Some(ann.bot_id),
+            ..binding()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        db.set_gate("Bob", None, None).unwrap_err().code,
+        "gates_inherited"
+    );
+}

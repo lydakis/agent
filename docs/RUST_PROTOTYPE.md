@@ -1146,9 +1146,15 @@ default). A bot's instructions are otherwise fixed when it is made, so a
 client recomposes them (skills, memory, folder rules added since) and sends
 them here. A model must be of the bot's family, as a turn's own model must,
 since its history is kept in that family's encoding
-(`provider_family_mismatch`). It answers `{bot, bot_id, changed}`, `changed` naming the fields
-that differed; the same text again changes nothing, so a resend is harmless.
-It is refused with `bot_busy` while a turn runs, and the next turn sends the
+(`provider_family_mismatch`). A gate (`approve`, `approver` and optionally
+`approve_expire_ms`, as on `create`) replaces the bot's gates, and
+`approve: []` alone removes them; only a bot no bot made may change them,
+since a bot keeps the gates it descends from (`gates_inherited`), and bots
+it already made keep theirs. The gate is checked before anything is
+written. It answers `{bot, bot_id, changed}`, `changed` naming the fields
+(`model`, `instructions`, `gates`) that differed; the same request again
+changes nothing, so a resend is harmless. It is refused with `bot_busy`
+while a turn runs or waits parked, and the next turn sends the
 new instructions: the provider's cache of the old ones is not read again,
 replayed thinking written after them is withheld as when any context in
 front of it changes, and a fork keys its own prompt cache from then on.
@@ -1970,7 +1976,8 @@ usable; history tells the model to inspect current state before retrying.
 
 ### Tool approval
 
-A bot may be created with a gate: `approve`, the tools whose calls wait for a
+A bot may be created with a gate (a root bot's can be replaced later with
+`configure`): `approve`, the tools whose calls wait for a
 verdict; `approver`, an opaque tag naming who answers, which the daemon
 stores and reports but never reads; and optionally `approve_expire_ms`.
 `approve` may name no more tools than the daemon registers (`invalid_gate`

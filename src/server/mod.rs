@@ -219,6 +219,11 @@ enum Command {
         model: Option<String>,
         /// With `model`: its effort level; absent is the model's default.
         effort: Option<String>,
+        /// A root bot's gate, replacing its gates, as `create` takes one;
+        /// `approve: []` alone removes them.
+        approve: Option<Vec<String>>,
+        approver: Option<String>,
+        approve_expire_ms: Option<u64>,
     },
     Fork {
         source: String,
@@ -2150,10 +2155,23 @@ impl Service {
                 instructions,
                 model,
                 effort,
+                approve,
+                approver,
+                approve_expire_ms,
             } => {
                 if effort.is_some() && model.is_none() {
                     return fail_with("invalid_effort", "effort goes with model");
                 }
+                let gate = match (&approve, &approver, approve_expire_ms) {
+                    (None, None, None) => None,
+                    (Some(tools), None, None) if tools.is_empty() => Some(None),
+                    _ => Some(gate(
+                        approve,
+                        approver,
+                        approve_expire_ms,
+                        self.registry.tool_count(),
+                    )?),
+                };
                 if instructions.as_ref().is_some_and(|i| i.len() > 64 * 1024) {
                     return Err(Error::with(
                         "instructions_limit",
@@ -2197,7 +2215,21 @@ impl Service {
                 store
                     .op("configure", move |db| {
                         let id = db.identity(&bot, bot_id)?;
+                        // A parked turn reads the bot again when it resumes.
+                        if let Some(turn) = db.inspect(&bot)?.running_turn {
+                            return Err(Error::with(
+                                "bot_busy",
+                                format!("turn {turn} of {bot} is running"),
+                            )
+                            .facts(json!({"running_turn":turn})));
+                        }
                         let mut changed = Vec::new();
+                        // First: the one change that may be refused here.
+                        if let Some(gate) = gate
+                            && db.set_gate(&bot, Some(id), gate)?
+                        {
+                            changed.push("gates");
+                        }
                         if let Some((provider, name)) = &model
                             && db.set_model(&bot, Some(id), provider, name, effort.as_deref())?
                         {
@@ -2208,6 +2240,7 @@ impl Service {
                         {
                             changed.push("instructions");
                         }
+
                         Ok(json!({"bot":bot,"bot_id":id,"changed":changed}))
                     })
                     .await

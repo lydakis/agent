@@ -8,6 +8,7 @@
 //! alternate screen, replies stream a line at a time, tool calls are one
 //! `• Ran …` line with a short `└` look at the result, and a status row
 //! says how long the turn has run and how to stop it.
+mod approvals;
 mod cache;
 mod calls;
 mod diff;
@@ -165,17 +166,11 @@ fn agent_bin() -> Option<PathBuf> {
         .filter(|bin| bin.is_file())
 }
 
-/// The daemon, started the way the CLI starts it when it is not running.
-async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events), String> {
-    if let Ok(connected) = Client::connect(&options.socket).await {
-        return Ok(connected);
-    }
-    let bin = agent_bin().ok_or(
-        "the daemon is not running and Agent's binary was not found; open Agent.app or set AGENT_BIN",
-    )?;
-    let mut command = std::process::Command::new(&bin);
-    // Provider keys the app keeps in ~/.agent/env, over this shell's own,
-    // as the app starts it; an empty value unsets one.
+/// Agent's binary to run, with the provider keys the app keeps in
+/// ~/.agent/env over this shell's own, as the app starts it; an empty
+/// value unsets one.
+fn agent_command(bin: &std::path::Path) -> Result<std::process::Command, String> {
+    let mut command = std::process::Command::new(bin);
     if let Some(file) = agent_client::env_file::path() {
         for (key, value) in agent_client::env_file::read(&file)? {
             match value.is_empty() {
@@ -184,6 +179,60 @@ async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events
             };
         }
     }
+    Ok(command)
+}
+
+/// An `auto` gate needs an approver serving it: when none does, one is
+/// started the way the CLI starts it, detached, logging beside the store,
+/// judged by `model` unless a judge is set.
+async fn serve_auto(client: &Client, options: &Options, model: &str) -> Result<(), String> {
+    let stats = client
+        .request("stats", json!({}))
+        .await
+        .map_err(|e| e.to_string())?;
+    if stats["approvers"]
+        .as_array()
+        .is_some_and(|tags| tags.iter().any(|tag| tag == "auto"))
+    {
+        return Ok(());
+    }
+    let bin = agent_bin().ok_or("Agent's binary was not found to judge calls; set AGENT_BIN")?;
+    let mut log = options.store.clone().into_os_string();
+    log.push(".approver.log");
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)
+        .map_err(|e| e.to_string())?;
+    let mut command = agent_command(&bin)?;
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    command
+        .env("AGENT_MODEL", model)
+        .arg("approver")
+        .arg("--store")
+        .arg(&options.store)
+        .arg("--socket")
+        .arg(&options.socket)
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone().map_err(|e| e.to_string())?)
+        .stderr(log)
+        .spawn()
+        .map_err(|e| format!("{}: {e}", bin.display()))?;
+    Ok(())
+}
+
+/// The daemon, started the way the CLI starts it when it is not running.
+async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events), String> {
+    if let Ok(connected) = Client::connect(&options.socket).await {
+        return Ok(connected);
+    }
+    let bin = agent_bin().ok_or(
+        "the daemon is not running and Agent's binary was not found; open Agent.app or set AGENT_BIN",
+    )?;
+    let mut command = agent_command(&bin)?;
     let out = command
         .arg("start")
         .arg("--store")
@@ -271,6 +320,8 @@ async fn run() -> Result<(), String> {
     // Fonts are read before the first picture needs them.
     std::thread::spawn(image::preload);
     let (client, mut events) = connect(&options).await?;
+    // A lead made just now starts in the first approval mode.
+    let mut fresh = false;
     let (name, project) = match &options.bot {
         Some(bot) => {
             if options.new {
@@ -291,6 +342,7 @@ async fn run() -> Result<(), String> {
             }
             let lead =
                 project::open(&client, &dir, &options.socket, options.model.as_deref()).await?;
+            fresh = lead.new;
             (lead.bot, Some(lead.project))
         }
     };
@@ -352,6 +404,13 @@ async fn run() -> Result<(), String> {
         }
     }
     app.project = project;
+    if fresh {
+        app.gating = Some(approvals::MODES[0].0);
+    } else if app.mode == Some("auto")
+        && let Err(error) = serve_auto(&app.client, &app.options, &app.model).await
+    {
+        app.notice = Some(error);
+    }
     let result = app.main(&mut terminal, &mut events).await;
     let _ = terminal.clear();
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
@@ -375,13 +434,15 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
     let instructions = agent_client::policy::instructions(&workspace, None, &memory)
         .map_err(|e| e.to_string())?
         .text;
+    let mut asked = json!({"bot": bot, "workspace": workspace, "model": model,
+        "instructions": instructions, "tools": DEFAULT_TOOLS,
+        "request_id": unique("tui-create")});
+    let tools = DEFAULT_TOOLS.map(String::from);
+    if let Value::Object(fields) = &mut asked {
+        fields.extend(approvals::gate(approvals::MODES[0].0, &tools));
+    }
     client
-        .request(
-            "create",
-            json!({"bot": bot, "workspace": workspace, "model": model,
-                "instructions": instructions, "tools": DEFAULT_TOOLS,
-                "request_id": unique("tui-create")}),
-        )
+        .request("create", asked)
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -456,8 +517,9 @@ struct Running {
 
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, unlisted.
-const COMMANDS: [(&str, &str); 5] = [
+const COMMANDS: [(&str, &str); 6] = [
     ("/model", "the model and effort"),
+    ("/approvals", "whether calls wait for a verdict"),
     ("/status", "this project's agents"),
     ("/sound", "the chime when work ends, on or off"),
     ("/open", "the last HTML page, in your browser"),
@@ -532,6 +594,14 @@ struct App {
     listing: Option<tokio::sync::oneshot::Receiver<Result<Value, String>>>,
     /// The model and effort picked, set once no turn runs.
     switch: Option<(String, Option<String>)>,
+    /// The bot's tools, which an approval mode gates.
+    tools: Vec<String>,
+    /// Its approval mode, when it is one of Sonny's.
+    mode: Option<&'static str>,
+    /// `/approvals`, open over the composer: the mode picked.
+    choosing: Option<usize>,
+    /// The mode picked, set once no turn runs.
+    gating: Option<&'static str>,
 }
 
 /// The lead's tasks, laid out in the project's Rex session: a window for
@@ -832,6 +902,16 @@ impl App {
             picker: None,
             listing: None,
             switch: None,
+            tools: record["tools"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect(),
+            mode: approvals::mode(record),
+            choosing: None,
+            gating: None,
         }
     }
 
@@ -953,10 +1033,12 @@ impl App {
     /// The lead's instructions as composed on attach, sent once no turn
     /// runs; the next turn reads them.
     async fn configure(&mut self) {
-        if self.running.is_some() || self.instruct.is_none() && self.switch.is_none() {
+        if self.running.is_some()
+            || self.instruct.is_none() && self.switch.is_none() && self.gating.is_none()
+        {
             return;
         }
-        let (text, switch) = (self.instruct.take(), self.switch.take());
+        let (text, switch, gating) = (self.instruct.take(), self.switch.take(), self.gating.take());
         let mut asked = json!({"bot": self.bot});
         if let Some(text) = &text {
             asked["instructions"] = json!(text);
@@ -964,6 +1046,9 @@ impl App {
         if let Some((model, effort)) = &switch {
             asked["model"] = json!(model);
             asked["effort"] = json!(effort);
+        }
+        if let (Some(mode), Value::Object(fields)) = (gating, &mut asked) {
+            fields.extend(approvals::gate(mode, &self.tools));
         }
         match self.client.request("configure", asked).await {
             Ok(_) => {
@@ -974,10 +1059,20 @@ impl App {
                     // The bot's own model now, for this window's turns too.
                     self.turn_model = None;
                 }
+                if let Some(mode) = gating {
+                    self.mode = Some(mode);
+                    if mode == "auto"
+                        && let Err(error) =
+                            serve_auto(&self.client, &self.options, &self.model).await
+                    {
+                        self.notice = Some(error);
+                    }
+                }
             }
             Err(error) if error.code == "bot_busy" => {
                 self.instruct = text;
                 self.switch = switch;
+                self.gating = gating;
             }
             Err(error) => self.notice = Some(error.to_string()),
         }
@@ -1797,6 +1892,34 @@ impl App {
             }
             return;
         }
+        if let Some(pick) = &mut self.choosing {
+            if let Event::Key(key) = event
+                && key.kind != KeyEventKind::Release
+            {
+                let count = approvals::MODES.len();
+                match key.code {
+                    KeyCode::Up => *pick = (*pick + count - 1) % count,
+                    KeyCode::Down => *pick = (*pick + 1) % count,
+                    KeyCode::Enter => {
+                        let mode = approvals::MODES[*pick].0;
+                        self.choosing = None;
+                        if self.mode != Some(mode) {
+                            self.gating = Some(mode);
+                            self.configure().await;
+                            if self.gating.is_some() {
+                                self.notice = Some("changes when this turn ends".into());
+                            }
+                        }
+                    }
+                    KeyCode::Esc => self.choosing = None,
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.choosing = None
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
         if let Some(picker) = &mut self.picker {
             match event {
                 Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
@@ -1956,6 +2079,17 @@ impl App {
             self.notice = Some("listing models…".into());
             return;
         }
+        if prompt == "/approvals" {
+            self.input.clear();
+            let current = self.gating.or(self.mode);
+            self.choosing = Some(
+                approvals::MODES
+                    .iter()
+                    .position(|(mode, _)| Some(*mode) == current)
+                    .unwrap_or(0),
+            );
+            return;
+        }
         if prompt == "/sound" {
             self.input.clear();
             let mut settings = settings::Settings::load();
@@ -2086,6 +2220,46 @@ impl App {
                 };
                 frame.render_widget(ratatui::widgets::Clear, area);
                 frame.render_widget(Paragraph::new(rows), area);
+            }
+            if let Some(pick) = self.choosing {
+                let rows: Vec<Line> = approvals::MODES
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (mode, about))| {
+                        let mark = if Some(*mode) == self.mode {
+                            "• "
+                        } else {
+                            "  "
+                        };
+                        let name = format!("{mode:<4}");
+                        if i == pick {
+                            Line::from(vec![
+                                Span::raw(format!("  {mark}")),
+                                Span::raw(format!(" {name}  {about} ")).reversed(),
+                            ])
+                        } else {
+                            Line::from(vec![
+                                Span::raw(format!("  {mark} {name}")),
+                                Span::raw(format!("  {about}")).dim(),
+                            ])
+                        }
+                    })
+                    .collect();
+                let area = ratatui::layout::Rect {
+                    y: composer.y.saturating_sub(3),
+                    height: 3,
+                    ..composer
+                };
+                frame.render_widget(ratatui::widgets::Clear, area);
+                frame.render_widget(Paragraph::new(rows), area);
+                let line = Line::from(vec![
+                    Span::raw("› ").bold(),
+                    Span::raw("approvals for this agent and those it makes").dim(),
+                ]);
+                frame.render_widget(Paragraph::new(line), composer);
+                let keys = Line::from("  ↑↓ mode · enter to choose · esc").dim();
+                frame.render_widget(Paragraph::new(keys), footer);
+                return;
             }
             if let Some(picker) = &self.picker {
                 let shown = picker.shown();
