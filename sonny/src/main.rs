@@ -859,6 +859,10 @@ struct App {
     sounds: sound::Sounds,
     /// The reply text the current model call has streamed.
     said: String,
+    /// Prompts sent and not in the conversation yet, by their turn: a
+    /// steer until the running turn takes it in, a prompt until its turn
+    /// starts. Drawn above the status row until they land.
+    staged: Vec<(i64, String)>,
     /// The reasoning streamed since the bot last spoke or called a tool,
     /// whose latest heading the status row shows, as Codex does.
     thought: String,
@@ -1374,6 +1378,7 @@ impl App {
             redraw: false,
             sounds: sound::Sounds::new(false),
             said: String::new(),
+            staged: Vec::new(),
             thought: String::new(),
             replay: None,
             options,
@@ -1911,6 +1916,25 @@ impl App {
         self.calls.extend(calls);
     }
 
+    /// What was sent and has not landed yet, dim, the way it will read
+    /// once it does.
+    fn staged_rows(&self, width: usize) -> Vec<Line<'static>> {
+        self.staged
+            .iter()
+            .flat_map(|(_, prompt)| {
+                prompt.split('\n').enumerate().flat_map(move |(at, line)| {
+                    let lead = if at == 0 { "↳ " } else { "  " };
+                    transcript::wrap(
+                        Line::from(line.to_owned()).dim(),
+                        width,
+                        Span::raw(lead).dim(),
+                        Span::raw("  "),
+                    )
+                })
+            })
+            .collect()
+    }
+
     /// The reply's open line, the part after its last newline, as the rows
     /// it will take once written.
     fn open_rows(&self, width: usize) -> Vec<Line<'static>> {
@@ -2017,6 +2041,7 @@ impl App {
                 }
             }
             "accepted" => {
+                self.staged.retain(|(staged, _)| Some(*staged) != turn);
                 self.end_live();
                 self.said.clear();
                 self.thought.clear();
@@ -2045,6 +2070,8 @@ impl App {
                 }
             }
             "steered" => {
+                self.staged
+                    .retain(|(staged, _)| Some(*staged) != data["steer"].as_i64());
                 if let Some(node) = data["node"].as_i64()
                     && let Some(item) = self.items(&[node]).await.first()
                 {
@@ -2244,6 +2271,8 @@ impl App {
                 }
             }
             "turn_finished" => {
+                // A staged prompt whose turn ended without starting.
+                self.staged.retain(|(staged, _)| Some(*staged) != turn);
                 if self.running.as_ref().is_some_and(|r| Some(r.turn) != turn) {
                     return;
                 }
@@ -2934,7 +2963,10 @@ impl App {
             )
             .await;
         match submitted {
-            Ok(_) => {
+            Ok(reply) => {
+                if let Some(turn) = reply["turn"].as_i64() {
+                    self.staged.push((turn, prompt));
+                }
                 self.input.clear();
                 self.notice = None;
                 if workspace.is_some() {
@@ -3017,6 +3049,8 @@ impl App {
         // The reply's open line, wrapped as it will be written: it grows
         // here row by row until its newline writes it into the history.
         let mut open_rows = self.open_rows(width);
+        // Then what was sent and has not landed, kept in view below it.
+        open_rows.extend(self.staged_rows(width));
         let spare = room.saturating_sub(composer_rows.len()) + 1;
         let hidden = open_rows.len().saturating_sub(spare.max(1));
         open_rows.drain(..hidden);
