@@ -26,7 +26,7 @@ again; ask the lead to show one, or run `sonny --bot NAME`. `--rex-host HOST` pu
 `--no-rex` turns the layout off. On first use Sonny writes the `rex-windows`
 skill (`skills/rex-windows/SKILL.md`) to `~/.agents/skills/rex-windows`, so any agent can run a
 long command where the person can watch it, and read it back:
-`sonny run NAME [--window] -- COMMAND...` opens a block labelled
+`sonny split NAME [--window] -- COMMAND...` opens a block labelled
 `AGENT/NAME` below the agent's own (or in a tab of its own) and prints its ID.
 The skill tells agents to close what they opened once read; whatever a task
 left open closes with its window.

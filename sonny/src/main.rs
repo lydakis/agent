@@ -171,12 +171,12 @@ async fn agents_rex(
     Ok((socket, project, rex))
 }
 
-/// `sonny run NAME [--window] [--rex-host HOST] -- COMMAND...`: run a
+/// `sonny split NAME [--window] [--rex-host HOST] -- COMMAND...`: run a
 /// command an agent wants watched (a dev server, a long build) in a Rex
 /// block labelled `AGENT/NAME`, below the agent's own block or in a window
 /// of its own, and print the block's ID. It closes with the agent's window.
-async fn run_block() -> Result<(), String> {
-    let usage = "usage: sonny run NAME [--window] [--rex-host HOST] -- COMMAND...";
+async fn split() -> Result<(), String> {
+    let usage = "usage: sonny split NAME [--window] [--rex-host HOST] -- COMMAND...";
     let mut args = std::env::args().skip(2);
     let name = args.next().filter(|n| !n.starts_with('-')).ok_or(usage)?;
     if name.contains('/') {
@@ -417,7 +417,7 @@ async fn main() -> std::process::ExitCode {
 async fn run() -> Result<(), String> {
     match std::env::args().nth(1).as_deref() {
         Some("show") => return show().await,
-        Some("run") => return run_block().await,
+        Some("split") => return split().await,
         _ => {}
     }
     if std::env::args().nth(1).as_deref() == Some("--version") {

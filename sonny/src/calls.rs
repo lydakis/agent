@@ -88,7 +88,7 @@ pub fn said(command: &str, output: &str, failed: bool) -> Option<Said> {
         }),
         "plan" if program.contains("skills/plan") => plan(args),
         "sonny" if args.first().is_some_and(|a| a == "show") => sonny_show(&args[1..], failed),
-        "sonny" if args.first().is_some_and(|a| a == "run") => sonny_run(&args[1..], failed),
+        "sonny" if args.first().is_some_and(|a| a == "split") => sonny_split(&args[1..], failed),
         "sh" | "bash"
             if args
                 .first()
@@ -771,8 +771,8 @@ fn sonny_show(words: &[String], failed: bool) -> Option<Said> {
     })
 }
 
-/// `sonny run`, as the block it opened for the agent.
-fn sonny_run(words: &[String], failed: bool) -> Option<Said> {
+/// `sonny split`, as the block it opened for the agent.
+fn sonny_split(words: &[String], failed: bool) -> Option<Said> {
     let (name, rest) = words.split_first()?;
     let args = Args::new(rest);
     let mut said = Said {
@@ -940,7 +940,7 @@ Keep the rest.'"#,
         assert_eq!(said.what, "…abcdef");
         assert_eq!(said.under.len(), 4);
         let said = said_or_none(
-            r#""/opt/homebrew/bin/sonny" run tests -- cargo test --workspace"#,
+            r#""/opt/homebrew/bin/sonny" split tests -- cargo test --workspace"#,
             r#"{"block":"block:01","label":"shop.fix/tests","session":"shop"}"#,
         );
         assert_eq!(
