@@ -78,9 +78,9 @@ class Model(http.server.BaseHTTPRequestHandler):
         elif user.startswith('wait:') and last.get('type') != 'function_call_output':
             text, output = '', [{'type': 'function_call', 'name': 'wait', 'call_id': 'w-1',
                                  'arguments': json.dumps({'handles': user[5:].split(',')})}]
-        elif user.startswith('{"questions"'):
+        elif user.startswith('{"state"'):
             # A judge's round from `agent approver`: every risk judged low.
-            text = json.dumps({id: 0.05 for id in json.loads(user)['questions']})
+            text = json.dumps({id: 0.05 for id in json.loads(user)['answer']})
             output = [{'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': text}]}]
         else:
             # `text:N` replies with N bytes, so histories grow from both sides.

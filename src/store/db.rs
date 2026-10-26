@@ -591,6 +591,17 @@ struct CallGate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expire_ms: Option<u64>,
 }
+/// A gate's holder handing a call to a person: the gate stays open, and
+/// what it found doubtful goes with the call.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+struct Asked {
+    tag: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    by: Option<String>,
+    at_ms: i64,
+}
 /// A planned call's current announcement: the `approvals` row.
 struct Request {
     id: i64,
@@ -598,6 +609,8 @@ struct Request {
     announced_ms: i64,
     gates: Vec<CallGate>,
     verdicts: Vec<Verdict>,
+    /// Each gate's handoff to a person, one per tag.
+    asked: Vec<Asked>,
 }
 impl Request {
     /// The first deny wins; otherwise every gate needs an allow.
@@ -1185,7 +1198,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 49;
+    pub const SCHEMA: i32 = 50;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1363,7 +1376,7 @@ impl Database {
                 status TEXT NOT NULL, PRIMARY KEY(turn,call_id));
             CREATE TABLE IF NOT EXISTS approvals(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
                 call_id TEXT NOT NULL, name TEXT NOT NULL, node INTEGER NOT NULL, request INTEGER NOT NULL,
-                announced_ms INTEGER NOT NULL, gates TEXT NOT NULL, verdicts TEXT, arguments TEXT NOT NULL);
+                announced_ms INTEGER NOT NULL, gates TEXT NOT NULL, verdicts TEXT, arguments TEXT NOT NULL, asked TEXT);
             CREATE UNIQUE INDEX IF NOT EXISTS approvals_call ON approvals(turn,call_id);
             CREATE TABLE IF NOT EXISTS approval_tags(approval INTEGER NOT NULL REFERENCES approvals(id) ON DELETE CASCADE,
                 tag TEXT NOT NULL, turn INTEGER NOT NULL, PRIMARY KEY(approval,tag)) WITHOUT ROWID;
@@ -4476,6 +4489,7 @@ impl Database {
                     announced_ms,
                     gates,
                     verdicts: Vec::new(),
+                    asked: Vec::new(),
                 };
                 judged.push(pending_call(
                     &bot.name,
@@ -4690,7 +4704,7 @@ impl Database {
         let row = self
             .conn
             .prepare_cached(
-                "SELECT id,request,announced_ms,gates,verdicts FROM approvals WHERE turn=? AND call_id=?",
+                "SELECT id,request,announced_ms,gates,verdicts,asked FROM approvals WHERE turn=? AND call_id=?",
             )?
             .query_row(params![turn, call_id], |r| {
                 Ok((
@@ -4699,10 +4713,11 @@ impl Database {
                     r.get::<_, i64>(2)?,
                     r.get::<_, String>(3)?,
                     r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
                 ))
             })
             .optional()?;
-        let Some((id, request, announced_ms, gates, verdicts)) = row else {
+        let Some((id, request, announced_ms, gates, verdicts, asked)) = row else {
             return Ok(None);
         };
         let mut request = Request {
@@ -4712,6 +4727,10 @@ impl Database {
             gates: serde_json::from_str(&gates)?,
             verdicts: verdicts
                 .map(|v| serde_json::from_str(&v))
+                .transpose()?
+                .unwrap_or_default(),
+            asked: asked
+                .map(|a| serde_json::from_str(&a))
                 .transpose()?
                 .unwrap_or_default(),
         };
@@ -4936,7 +4955,10 @@ impl Database {
     /// A running turn's verdict is held by the worker and wakes its task;
     /// a parked turn's is committed now, and resumes the turn only if it is
     /// parked on this call and the call is now decided.
-    pub fn answer(&mut self, answer: Decision<'_>) -> Result<Answered> {
+    /// The call a decision is for, checked: its turn's status, its current
+    /// request, the gate named, and the time, once no verdict decided it
+    /// and the gate has not lapsed.
+    fn open_gate(&self, answer: &Decision<'_>) -> Result<(String, Request, String, i64)> {
         let owner: Option<(String, String)> = self
             .conn
             .query_row(
@@ -4954,7 +4976,7 @@ impl Database {
                     .facts(json!({"status":status})),
             );
         }
-        let Some(mut request) = self.request(answer.turn, answer.call_id)? else {
+        let Some(request) = self.request(answer.turn, answer.call_id)? else {
             return fail("no_pending_approval");
         };
         if answer.request < request.request {
@@ -5006,6 +5028,52 @@ impl Database {
         }) {
             return fail("approval_expired");
         }
+        Ok((status, request, tag, at_ms))
+    }
+    /// Hand a planned call to a person: `answer.tag`'s gate stays open, the
+    /// call keeps waiting, and the reason goes with it in listings and in an
+    /// `approval_asked` event. Only a gate with no expiry can wait on one.
+    pub fn ask(&mut self, answer: Decision<'_>) -> Result<Answered> {
+        let (_, mut request, tag, at_ms) = self.open_gate(&answer)?;
+        if request
+            .gates
+            .iter()
+            .any(|g| g.tag == tag && g.expire_ms.is_some())
+        {
+            return fail_with(
+                "approval_ask_expiring",
+                format!("the {tag} gate lapses; only a gate without an expiry waits on a person"),
+            );
+        }
+        let asked = Asked {
+            tag: tag.clone(),
+            reason: answer.reason.map(str::to_owned),
+            by: answer.by.map(str::to_owned),
+            at_ms,
+        };
+        request.asked.retain(|other| other.tag != tag);
+        request.asked.push(asked.clone());
+        let tx = self.conn.savepoint()?;
+        tx.prepare_cached("UPDATE approvals SET asked=? WHERE id=?")?
+            .execute(params![serde_json::to_string(&request.asked)?, request.id])?;
+        event(
+            &tx,
+            answer.bot,
+            Some(answer.turn),
+            "approval_asked",
+            json!({"call_id":answer.call_id,"request":request.request,"tag":tag,
+                "reason":asked.reason,"by":asked.by}),
+        )?;
+        tx.commit()?;
+        Ok(Answered {
+            reply: json!({"bot":answer.bot,"turn":answer.turn,"call_id":answer.call_id,
+                "request":request.request,"tag":tag,"decision":"ask","pending":[tag]}),
+            notify: None,
+            resume: false,
+        })
+    }
+    pub fn answer(&mut self, answer: Decision<'_>) -> Result<Answered> {
+        let (status, mut request, tag, at_ms) = self.open_gate(&answer)?;
         let verdict = Verdict {
             tag: tag.clone(),
             allow: answer.allow,
@@ -5101,7 +5169,7 @@ impl Database {
                     "SELECT approval,turn FROM approval_tags WHERE tag=?1 AND approval>?2 AND approval<=?3 ORDER BY approval",
                 )?;
                 let mut call = self.conn.prepare_cached(
-                    "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials
+                    "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials,a.asked
                      FROM approvals a JOIN turns t ON t.id=a.turn JOIN bots b ON b.name=t.bot WHERE a.id=?",
                 )?;
                 let mut rows = ids.query(params![tag, after, through])?;
@@ -5132,12 +5200,12 @@ impl Database {
             _ => {
                 let mut statement = match bot {
                     Some(_) => self.conn.prepare_cached(
-                        "SELECT a.id,b.name,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials
+                        "SELECT a.id,b.name,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials,a.asked
                          FROM bots b JOIN approvals a ON a.turn=b.running_turn
                          WHERE a.id>?1 AND a.id<=?4 AND b.name=?2 ORDER BY a.id LIMIT ?3",
                     )?,
                     None => self.conn.prepare_cached(
-                        "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials
+                        "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials,a.asked
                          FROM approvals a JOIN turns t ON t.id=a.turn JOIN bots b ON b.name=t.bot
                          WHERE a.id>?1 AND a.id<=?4 ORDER BY a.id LIMIT ?3",
                     )?,
@@ -5168,6 +5236,11 @@ impl Database {
             verdicts: r
                 .get::<_, Option<String>>(9)?
                 .map(|v| serde_json::from_str(&v))
+                .transpose()?
+                .unwrap_or_default(),
+            asked: r
+                .get::<_, Option<String>>(12)?
+                .map(|a| serde_json::from_str(&a))
                 .transpose()?
                 .unwrap_or_default(),
         };
@@ -5801,6 +5874,7 @@ impl Database {
                 .map(|v| serde_json::from_str(&v))
                 .transpose()?
                 .unwrap_or_default(),
+            asked: Vec::new(),
         };
         if let Some(held) = self
             .live
@@ -7375,6 +7449,7 @@ fn reannounce(tx: &Connection, bot: &Bot, turn: i64, failed: &str) -> Result<Opt
             announced_ms,
             gates,
             verdicts: Vec::new(),
+            asked: Vec::new(),
         };
         judged.push(pending_call(
             &bot.name,
@@ -7431,6 +7506,15 @@ fn pending_call(
         "request":request.request,"announced_ms":request.announced_ms,
         "expires_ms":request.expires_ms(),"gates":open,"name":name,"node":node,
         "denials":counts});
+    // Handed to a person by each gate still unanswered.
+    let asked: Vec<&Asked> = request
+        .asked
+        .iter()
+        .filter(|asked| request.unanswered().any(|g| g.tag == asked.tag))
+        .collect();
+    if !asked.is_empty() {
+        entry["asked"] = json!(asked);
+    }
     // The previews stored when the call was planned.
     if let (Value::Object(entry), Value::Object(arguments)) = (&mut entry, arguments) {
         entry.extend(arguments);
@@ -8313,6 +8397,17 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
             let id: i64 = row.get(0)?;
             update.execute(params![instructions_key(&row.get::<_, String>(1)?), id])?;
         }
+    }
+    if conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='approvals')
+         AND NOT EXISTS(SELECT 1 FROM pragma_table_info('approvals') WHERE name='asked')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 49 -> 50: a gate's holder may hand a call to a person. None had.
+        // A store from before 33 has no approvals table yet; it is created
+        // with the rest of the schema.
+        conn.execute_batch("ALTER TABLE approvals ADD COLUMN asked TEXT;")?;
     }
     Ok(())
 }

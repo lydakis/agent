@@ -944,7 +944,7 @@ class AutoApproverTests(ModelFixture):
                 return None
             round = json.loads(user)
             asked.put((request, round))
-            answers = {id: risky(round, id) for id in round['questions']}
+            answers = {id: risky(round, id) for id in round['answer']}
             return 'Answers: ' + json.dumps(answers) if parsed[0] else 'They look fine to me.'
         self.model.reply_for = reply
         self.model.models = ('synthetic-model', 'judge-model')
@@ -988,8 +988,8 @@ class AutoApproverTests(ModelFixture):
         self.assertFalse(request.get('tools'))
         self.assertIn('You judge tool calls', json.dumps(request))
         self.assertEqual(round['state']['request'], [{'by': 'person', 'text': 'shell:printf safe > out'}])
-        self.assertEqual(len(round['questions']), 11)
-        self.assertIn(' Yes: ', round['questions']['c1_delete_ok'])
+        self.assertEqual(len(round['answer']), 11)
+        self.assertIn('is yes when: ', json.dumps(request))
         judged = lines.get(timeout=5)
         self.assertEqual((judged['event'], judged['calls'][0]['decision'], judged['input_tokens']),
                          ('judged', 'allow', 100))
@@ -1066,7 +1066,8 @@ class AutoApproverTests(ModelFixture):
 
     def test_a_delegated_turn_is_judged_on_the_persons_words(self):
         daemon = self.daemon()
-        daemon.request('create', bot='Carol', workspace=str(self.path), approve=['shell'], approver='auto')
+        daemon.request('create', bot='Carol', workspace=str(self.path), approve=['shell'], approver='auto',
+                       approve_expire_ms=15000)
         self.approver(daemon)
         # A person asks Bob; Bob's model asks Carol, who plans the call.
         person = daemon.request('submit', bot='Bob', request_id='a', prompt='delete the build directory')
@@ -1079,9 +1080,35 @@ class AutoApproverTests(ModelFixture):
         self.assertEqual(request, [{'by': 'person', 'text': 'delete the build directory'},
                                    {'by': 'model', 'text': 'shell:printf DANGER'}])
 
-    def test_words_too_long_to_show_are_judged_without_consent(self):
+    def test_a_doubted_call_waits_for_the_person_when_its_gate_does_not_lapse(self):
         daemon = self.daemon()
         daemon.request('create', bot='Carol', workspace=str(self.path), approve=['shell'], approver='auto')
+        _, lines = self.approver(daemon)
+        turn = daemon.request('submit', bot='Carol', request_id='a', prompt='shell:printf DANGER > danger')
+        turn = turn['result']['turn']
+        # The judge's doubt hands the call over instead of denying it.
+        judged = lines.get(timeout=5)
+        self.assertEqual(judged['calls'][0]['decision'], 'ask', judged)
+        [waiting] = daemon.request('approvals', bot='Carol')['result']['approvals']
+        [asked] = waiting['asked']
+        self.assertEqual((asked['tag'], asked['by']), ('auto', 'approver'))
+        self.assertTrue(asked['reason'].startswith('judged risky'))
+        events = daemon.request('events', bot='Carol', after=0, limit=256)['result']['events']
+        self.assertTrue(any(e['event'] == 'approval_asked' for e in events))
+        # The person allows it, over the approver, and it runs.
+        self.assertEqual(daemon.request('answer', bot='Carol', turn=turn, call_id='shell-1', request=1,
+                                        tag='auto', decision='allow', by='test')['result']['decision'], 'allow')
+        self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
+        self.assertEqual((self.path / 'danger').read_text(), 'DANGER')
+        # A gate that lapses has nobody to wait on: the doubt is a denial.
+        lapsing = daemon.request('submit', bot='Bob', request_id='b', prompt='shell:printf DANGER')['result']['turn']
+        self.assertEqual(daemon.finished(lapsing)['data']['status'], 'completed')
+        self.assertTrue(self.denial(daemon, lapsing).startswith('judged risky'))
+
+    def test_words_too_long_to_show_are_judged_without_consent(self):
+        daemon = self.daemon()
+        daemon.request('create', bot='Carol', workspace=str(self.path), approve=['shell'], approver='auto',
+                       approve_expire_ms=15000)
         self.approver(daemon)
         # A person's brief longer than the judge is shown, delegated on.
         brief = 'work through the merge plan ' + 'p' * 200_000
@@ -1130,7 +1157,8 @@ class AutoApproverTests(ModelFixture):
                                   ('write', {'path': 'huge.sh', 'content': 'x' * (65 * 1024) + 'printf ok'})]
         daemon = SocketClient(self.binary, self.path / 'state.sqlite', self.url, 'shell,write')
         self.addCleanup(daemon.close)
-        daemon.request('create', bot='Bob', workspace=str(self.path), approve=['shell', 'write'], approver='auto')
+        daemon.request('create', bot='Bob', workspace=str(self.path), approve=['shell', 'write'], approver='auto',
+                       approve_expire_ms=15000)
         self.approver(daemon)
         turn = daemon.request('submit', bot='Bob', request_id='a', prompt='script')['result']['turn']
         self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
@@ -1164,7 +1192,8 @@ class AutoApproverTests(ModelFixture):
                                   ('shell', {'command': 'sh run.sh'})]
         daemon = SocketClient(self.binary, self.path / 'state.sqlite', self.url, 'shell,write')
         self.addCleanup(daemon.close)
-        daemon.request('create', bot='Bob', workspace=str(self.path), approve=['shell'], approver='auto')
+        daemon.request('create', bot='Bob', workspace=str(self.path), approve=['shell'], approver='auto',
+                       approve_expire_ms=15000)
         self.approver(daemon)
         turn = daemon.request('submit', bot='Bob', request_id='a', prompt='script')['result']['turn']
         self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
@@ -1178,7 +1207,7 @@ class AutoApproverTests(ModelFixture):
     def test_the_cli_starts_the_approver_for_an_auto_bot(self):
         store = self.path / 'state.sqlite'
         common = ['--store', str(store), '--provider', f'openai=responses,{self.url}',
-                  '--model', 'openai/synthetic-model', '--tools', 'echo,shell']
+                  '--model', 'openai/synthetic-model', '--tools', 'echo,shell,read']
         env = {**clean_env(), 'AGENT_APPROVAL': 'auto'}
         def agent(*args):
             return subprocess.run([str(self.binary), *args], env=env,
@@ -1186,12 +1215,13 @@ class AutoApproverTests(ModelFixture):
         self.addCleanup(lambda: agent('shutdown', '--store', str(store)))
         # Without a Jev key the bot's own model judges, through the daemon.
         self.model.reply_for = lambda request, user: (
-            json.dumps({id: .05 for id in json.loads(user)['questions']})
-            if user.startswith('{"questions"') else None)
+            json.dumps({id: .05 for id in json.loads(user)['answer']})
+            if user.startswith('{"state"') else None)
         done = agent('run', *common, '--new', '--bot', 'Bob', 'shell:printf hi > hi')
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual((self.path / 'hi').read_text(), 'hi')
         bots = {b['name']: b for b in json.loads(agent('ls', '--store', str(store)).stdout)}
+        # Reads run unjudged in auto.
         self.assertEqual(bots['Bob']['gates'], [{'tag': 'auto', 'tools': ['shell'], 'expire_ms': 45000}])
         self.assertEqual((bots['approver.auto']['model'], bots['approver.auto']['tools']), ('synthetic-model', []))
         stats = json.loads(agent('stats', '--store', str(store)).stdout)

@@ -1161,6 +1161,16 @@ while a turn runs or waits parked, and the next turn sends the
 new instructions: the provider's cache of the old ones is not read again,
 replayed thinking written after them is withheld as when any context in
 front of it changes, and a fork keys its own prompt cache from then on.
+Protocol version 15 adds `"decision":"ask"` to `answer`: a gate's holder
+hands the call to a person instead of deciding it. The gate stays open and
+the call keeps waiting; the request's row keeps one `{tag, reason, by,
+at_ms}` per gate that asked, which `approvals` and served listings show as
+`asked` while that gate is open, and the bot's followers get an `approval_asked` event with the call,
+request, tag, reason and `by`. A person then answers it like any other
+call, without a lease. Only a gate with no expiry can wait on a person: on
+one with `approve_expire_ms` the ask is refused with
+`approval_ask_expiring`, and the holder decides instead. A call announced
+again is asked afresh.
 Protocol version 12 lets `bots` filter on the daemon side: `name` keeps the
 bots whose name matches a SQLite GLOB pattern (1 to 256 bytes; case-sensitive
 like names), read from the name index's range for the pattern's literal
@@ -2140,7 +2150,7 @@ The CLI turns a mode into a gate. `run --new --approval manual`, or
 tools instead, and `fork` takes both. `full`, the default, gates nothing.
 `auto` gates the same tools, tagged `auto`, with a 45 s expiry, and
 starts `agent approver` detached if no session serves `auto`, logging to
-`STORE.approver.log`; its judge is `AGENT_APPROVER_JUDGE`, else Jev when
+`STORE.approver.log`; its judge is `AGENT_JUDGE`, else Jev when
 `TYPESAFE_API_KEY` is set, else the bot's own model, and a judge that
 cannot start fails the command before any bot is made
 (`approver_start_failed`). `agent approver [--tag TAG] [--judge

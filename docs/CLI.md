@@ -98,7 +98,7 @@ identity is `bot_not_found`.
   call 45 s before its gate lapses.
   Without the flag, `AGENT_APPROVAL` applies, then `full`. `--approve LIST`
   picks the gated tools and must name at least one; the default is every
-  tool but `history`, `wait`, `note`, and `echo`. A fork keeps its source's gates and a created bot its
+  tool but `history`, `wait`, `note`, and `echo`, and in `auto` `read` too. A fork keeps its source's gates and a created bot its
   creator's ([APPROVALS.md](APPROVALS.md)); `fork` takes no approval flags, and a
   program that wants a fork gated further passes `approve` on the protocol's `fork`.
 - `approver [--tag TAG] [--judge PROVIDER/MODEL] [--effort LEVEL]

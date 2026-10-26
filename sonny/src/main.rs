@@ -1288,6 +1288,8 @@ impl Fleet {
                         self.doing(bot, "needs you");
                     }
                 }
+                // The judge handed a call to the person.
+                "approval_asked" => self.doing(bot, "needs you"),
                 "tool_completed" | "turn_resumed" if self.doing.get(bot) == Some(&"needs you") => {
                     self.doing(bot, "working")
                 }
@@ -1392,7 +1394,7 @@ impl App {
                 .collect(),
             mode: approvals::mode(record),
             choosing: None,
-            gating: None,
+            gating: approvals::refresh(record),
             last_reply: String::new(),
         }
     }
@@ -2203,7 +2205,7 @@ impl App {
                     running.phase = "Working".into();
                 }
             }
-            "approval_requested" => self.approvals_for(turn).await,
+            "approval_requested" | "approval_asked" => self.approvals_for(turn).await,
             "turn_waiting" => {
                 if let Some(running) = &mut self.running
                     && data["approval"] != true
@@ -2478,7 +2480,8 @@ impl App {
         String::new()
     }
 
-    /// The turn's calls a person must answer; a program answers the rest.
+    /// The turn's calls a person must answer: every `manual` one, and those
+    /// the judge handed over. A program answers the rest.
     async fn approvals_for(&mut self, turn: Option<i64>) {
         let Ok(page) = self
             .client
@@ -2493,9 +2496,10 @@ impl App {
             .flatten()
             .filter(|call| {
                 call["turn"].as_i64() == turn
-                    && call["gates"]
-                        .as_array()
-                        .is_some_and(|gates| gates.iter().any(|g| g == "manual"))
+                    && (!call["asked"].is_null()
+                        || call["gates"]
+                            .as_array()
+                            .is_some_and(|gates| gates.iter().any(|g| g == "manual")))
             })
             .cloned()
             .collect();
@@ -2544,7 +2548,8 @@ impl App {
             .request(
                 "answer",
                 json!({"bot": self.bot, "turn": call["turn"], "call_id": call["call_id"],
-                    "request": call["request"], "tag": "manual", "decision": decision, "by": "tui"}),
+                    "request": call["request"], "tag": person_gate(&call), "decision": decision,
+                    "by": "tui"}),
             )
             .await;
         if let Err(error) = answered {
@@ -2953,6 +2958,11 @@ impl App {
                 Line::from("  … cut; the rest could not be read, so y is off: n denies it").dim(),
             );
         }
+        // What the judge doubted, when it handed the call over.
+        if let Some(reason) = call["asked"][0]["reason"].as_str() {
+            let why = reason.split(". ").next().unwrap_or(reason);
+            lines.push(Line::from(format!("  {why}")).dim());
+        }
         self.commit(lines);
     }
 
@@ -3359,6 +3369,12 @@ fn shimmer(text: &str, since: Duration) -> Vec<Span<'static>> {
 }
 
 /// A bot's name in its project: `lead`, or what follows the project's dot.
+/// The gate a person answers a call on: the first that handed it over,
+/// else `manual`.
+fn person_gate(call: &Value) -> &str {
+    call["asked"][0]["tag"].as_str().unwrap_or("manual")
+}
+
 fn short(bot: &str, project: &str, lead: &str) -> String {
     if bot == lead {
         return "lead".into();

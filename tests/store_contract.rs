@@ -1517,6 +1517,190 @@ fn served_announcements_carry_each_call_and_the_denials_so_far() {
 }
 
 #[test]
+fn a_gate_hands_a_call_to_a_person_who_then_decides_it() {
+    let mut db = db();
+    let turn = gated_turn(&mut db, None);
+    let (item, call) = shell_call("fc_0", "s0", "git push");
+    db.append(turn, vec![item], std::slice::from_ref(&call), None)
+        .unwrap();
+    let decision = |reason| Decision {
+        bot: "Bob",
+        turn,
+        call_id: "s0",
+        request: 1,
+        tag: None,
+        allow: false,
+        reason,
+        by: Some("approver"),
+    };
+    let asked = db.ask(decision(Some("judged risky: it pushes"))).unwrap();
+    assert_eq!(
+        (&asked.reply["decision"], &asked.reply["pending"]),
+        (&json!("ask"), &json!(["manual"]))
+    );
+    assert!(!asked.resume && asked.notify.is_none());
+    // The call still waits, with what was doubted, and followers hear it.
+    let listed = db.approvals(Some("Bob"), None, 0, None, 64).unwrap();
+    let [waiting] = &listed["approvals"].as_array().unwrap()[..] else {
+        panic!("{listed}")
+    };
+    assert_eq!(waiting["asked"][0]["tag"], "manual");
+    assert_eq!(waiting["asked"][0]["reason"], "judged risky: it pushes");
+    assert_eq!(waiting["asked"][0]["by"], "approver");
+    let events = db.events("Bob", 0, 256).unwrap();
+    let told = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["event"] == "approval_asked")
+        .unwrap();
+    assert_eq!(
+        (&told["data"]["call_id"], &told["data"]["reason"]),
+        (&json!("s0"), &json!("judged risky: it pushes"))
+    );
+    // A person's answer decides it.
+    allow(&mut db, turn, "s0").unwrap();
+    assert!(matches!(
+        db.approval_start(turn, &call, 0).unwrap(),
+        Gated::Started
+    ));
+    // A gate that lapses has nobody to wait on: it cannot ask.
+    let mut db = self::db();
+    let turn = gated_turn(&mut db, Some(60_000));
+    let (item, call) = shell_call("fc_1", "s0", "git push");
+    db.append(turn, vec![item], std::slice::from_ref(&call), None)
+        .unwrap();
+    let refused = db
+        .ask(Decision {
+            turn,
+            ..decision(None)
+        })
+        .err()
+        .unwrap();
+    assert_eq!(refused.code, "approval_ask_expiring");
+    assert!(
+        db.approvals(Some("Bob"), None, 0, None, 64).unwrap()["approvals"][0]
+            .get("asked")
+            .is_none()
+    );
+}
+
+#[test]
+fn each_gate_keeps_its_own_handoff_to_a_person() {
+    let mut db = db();
+    let tools = ["shell".to_owned()];
+    let gate = |tag: &str| Gate {
+        tag: tag.into(),
+        tools: vec!["shell".into()],
+        expire_ms: None,
+    };
+    let (a, b) = (gate("a"), gate("b"));
+    let first = Binding {
+        tools: &tools,
+        gate: Some(&a),
+        ..binding()
+    };
+    let ann = db.create("Ann", Some("/synthetic"), first).unwrap().0;
+    let made = Binding {
+        tools: &tools,
+        gate: Some(&b),
+        created_by: Some(ann.name.as_str()),
+        created_by_id: Some(ann.bot_id),
+        ..binding()
+    };
+    db.create("Bob", Some("/synthetic"), made).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let (item, call) = shell_call("fc_0", "s0", "git push");
+    db.append(turn, vec![item], std::slice::from_ref(&call), None)
+        .unwrap();
+    let decision = |tag, allow| Decision {
+        bot: "Bob",
+        turn,
+        call_id: "s0",
+        request: 1,
+        tag: Some(tag),
+        allow,
+        reason: Some("doubted"),
+        by: Some("approver"),
+    };
+    db.ask(decision("a", false)).unwrap();
+    db.ask(decision("b", false)).unwrap();
+    let listed = db.approvals(Some("Bob"), None, 0, None, 64).unwrap();
+    let tags: Vec<&Value> = listed["approvals"][0]["asked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|asked| &asked["tag"])
+        .collect();
+    assert_eq!(tags, [&json!("a"), &json!("b")]);
+    // The person answers one gate; the other's handoff still shows.
+    db.answer(Decision {
+        reason: None,
+        by: Some("person"),
+        ..decision("b", true)
+    })
+    .unwrap();
+    let listed = db.approvals(Some("Bob"), None, 0, None, 64).unwrap();
+    assert_eq!(
+        listed["approvals"][0]["asked"],
+        json!([{"tag":"a","reason":"doubted","by":"approver",
+        "at_ms":listed["approvals"][0]["asked"][0]["at_ms"]}]),
+        "{listed}"
+    );
+    db.answer(Decision {
+        reason: None,
+        by: Some("person"),
+        ..decision("a", true)
+    })
+    .unwrap();
+    assert!(matches!(
+        db.approval_start(turn, &call, 0).unwrap(),
+        Gated::Started
+    ));
+}
+
+#[test]
+fn schema_49_waiting_calls_were_not_handed_to_anyone() {
+    let path = std::env::temp_dir().join(format!("agent-schema49-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE approvals DROP COLUMN asked; PRAGMA user_version=49;")
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let turn = gated_turn(&mut db, None);
+    let (item, call) = shell_call("fc_1", "s0", "git push");
+    db.append(turn, vec![item], std::slice::from_ref(&call), None)
+        .unwrap();
+    db.ask(Decision {
+        bot: "Bob",
+        turn,
+        call_id: "s0",
+        request: 1,
+        tag: None,
+        allow: false,
+        reason: None,
+        by: Some("approver"),
+    })
+    .unwrap();
+    let listed = db.approvals(Some("Bob"), None, 0, None, 64).unwrap();
+    assert_eq!(listed["approvals"][0]["asked"][0]["tag"], "manual");
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn a_new_turn_starts_its_denials_from_none() {
     let mut db = db();
     let deny = |db: &mut Database, turn: i64, n: usize| {

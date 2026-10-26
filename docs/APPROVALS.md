@@ -397,7 +397,7 @@ own clock.
 | Mode | Gated tools | Who answers | Default |
 | --- | --- | --- | --- |
 | `full` | none | nobody; every allowed call runs | yes |
-| `auto` | every tool except `history`, `wait`, `note`, `echo` | the automatic approver | |
+| `auto` | every tool except `history`, `wait`, `note`, `echo`, `read` | the automatic approver | |
 | `manual` | every tool except `history`, `wait`, `note`, `echo` | a person, through the app or `agent answer`, or a program | |
 
 - **Chosen per bot at creation.** `agent run --new --approval auto`, or
@@ -452,15 +452,19 @@ so only one instance runs at a time, and answers in layers:
 
 1. **Daemon gate.** Only tools in a bot's `approve` list reach it. The
    modes gate every tool the bot has except four that touch only its own
-   store records: today that is `shell,write,edit,read`, and a tool added
+   store records (and `auto` also `read`, below): today that is
+   `shell,write,edit,read`, and a tool added
    later, such as one a caller registers, is gated without anyone
    remembering to list it. The model sees any tool's name and
    arguments, built in or not.
-   `read` is gated because a result is sent to the model provider in the
-   next request: reading
-   `~/.ssh/id_ed25519` sends the key off the machine with no further call.
    `history`, `wait`, `note`, and `echo` touch only the bot's own store
-   records and stay ungated.
+   records and stay ungated. In `auto`, since 2026-10-26, `read` is
+   ungated too: a result is sent to the model provider in the next
+   request, so reading `~/.ssh/id_ed25519` sends the key off the machine
+   with no further call, but a judge round on every read cost seconds
+   each for calls it nearly always allowed, and George chose fewer
+   rounds over that check. `manual` still gates `read`, and
+   `--approve` can name it in `auto`.
 2. **No rules.** Nothing is allowed or denied before the model has
    judged it, except when the model cannot be asked (step 4) or the
    breaker has tripped (step 5). The earlier draft's rules (a read-only
@@ -487,24 +491,34 @@ so only one instance runs at a time, and answers in layers:
    - Does it download and run code from the network?
 
    A sixth risk question has no consent question beside it: does it reach
-   the approval channel itself, answering or listing approvals, creating
-   a bot without its gates, or reading or writing the daemon's database
-   or socket other than through `agent`? The memory script
-   `~/.agent/memory` and task folders (worktrees under
-   `~/.agent/worktrees`, sandfs copies under `~/.agent/tasks`) are
-   named as not the channel: the earlier wording ("store") denied every
-   call under `~/.agent`, so no bot could save memory in `auto`. A high
-   answer is denied whatever the prompt says. With no rules this question replaces the earlier draft's
+   the approval channel itself, answering approvals, creating a bot
+   without its gates, or touching the daemon's database or socket directly
+   rather than through `agent` or the scripts under `~/.agent`? Listing
+   approvals, managing the bot's own triggers, plan and memory, and task
+   folders (worktrees under `~/.agent/worktrees`, sandfs copies under
+   `~/.agent/tasks`) do not count. The earlier wording ("store") denied
+   every call under `~/.agent`, so no bot could save memory in `auto`,
+   and the 2026-10-26 graft session was denied `agent approvals`, its own
+   `trigger rm` and `plan --clear`, all of which the shipped role text and
+   skills prescribe. A high answer is denied whatever the prompt says.
+   With no rules this question replaces the earlier draft's
    hard denies; it was not in the labeled run.
 
    Each risk has a consent question asked beside it that names the same
-   effect: does the caller's request for this turn ask for this deletion,
-   this destination, this use or change of credentials, this system
-   change, this download? The request for this turn is its prompt and
-   steers, or those of the person-written turn that delegated it; earlier
-   turns' prompts are shown for context but do not consent, so a deploy
-   asked for yesterday does not cover one today. Later messages override
-   earlier ones, so "don't deploy after all" withdraws consent. A request
+   effect: do the person's words ask for this deletion, this destination,
+   this use or change of credentials, this system change, this download,
+   or for work that plainly needs it? The words are this turn's prompt and
+   steers, or those of the person-written turn that delegated it, and the
+   bot's earlier prompts as far as their share of the state holds them.
+   Until 2026-10-26 only this turn's words counted, so "go open PRs" in
+   one turn did not cover `gft land --draft` in the next, and the person
+   had to repeat themselves in the exact words the judge wanted, as
+   Claude Code's auto mode, which reads the whole session's user
+   messages, does not make them. An earlier turn's calls are not shown,
+   so a one-time effect asked for only in an earlier turn (a deploy, a
+   send) is taken as done unless this turn asks again, while work it set
+   going still counts. Later messages override earlier ones,
+   so "don't deploy after all" withdraws consent. A request
    to do something once is used up by a call of this turn that did it and
    succeeded, which is why the already allowed calls are shown with their
    exit status; a retry after a failure is still covered. The
@@ -535,9 +549,16 @@ so only one instance runs at a time, and answers in layers:
    score up to 0.64 on "changes a shared system", while a requested
    `git push` scored 0.36, so that question has no safe gap between the
    two.
-4. **Unclear or dangerous: deny, and let consent come through messages.**
-   The approver denies with a reason and moves on; it never pages a
-   person. The reason tells the model what was refused and that it can ask
+4. **Unclear or dangerous: ask the person when one can answer, else deny,
+   and let consent come through messages.** Since 2026-10-26, when the
+   bot's gate has no expiry the approver hands the call to the person
+   (`"decision":"ask"`, protocol 15): the call keeps waiting, its listing
+   carries the judge's reason (one handoff per gate, shown while that gate
+   is unanswered), and a client such as Sonny shows it for an allow or
+   deny and marks the bot as needing you, as Claude Code's auto mode falls back to asking. Sonny's
+   `auto` gate has no expiry for this reason; the CLI's keeps its 45 s, so
+   a headless run is denied at once as before. Otherwise the approver
+   denies with a reason and moves on. The reason tells the model what was refused and that it can ask
    its caller for an explicit go-ahead. If the caller's next message (a new
    turn or a steer) names the action, the consent question now finds it in
    a prompt the caller wrote, and the retry is allowed. This is how Claude
@@ -692,8 +713,8 @@ is any file written this turn that one of them runs, up to 48 KiB, and
 past that only its size. A call with part of what it writes or runs left
 out is not allowed on the judge's word, since the part left out may do
 anything (a script padded past the limit with its payload in the middle):
-what Jev would allow is denied as "not reviewed whole", and a risky one
-is denied as risky. So
+what Jev would allow is doubted as "not reviewed whole" (step 4: asked
+of the person when one can answer, else denied), as is a risky one. So
 are the already allowed shell and caller-registered calls, since a
 one-time request is used up by a call that did it and a deploy past a
 preview's 2,048 characters would hide that; an allowed `write` or `edit`
@@ -1238,8 +1259,15 @@ Where the approver differs from the design above:
   with its size unknown, and is judged too long if the preview ends before
   the path (as is an allowed write too large to read back, over 1 MiB); any other such call keeps its preview and consent is not
   counted.
-- A general model is asked the same questions as text, each with what
-  makes it yes or no, and answers them as one JSON object.
+- A general model is asked the same questions, written once in its
+  instructions with what makes a consent question yes or no, and answers
+  the ids each round lists as one JSON object. The round's text is the
+  state, its fields in a fixed order from what holds for the whole turn
+  (the note, earlier prompts, the request, the calls already allowed) to
+  the calls being judged, then the ids. So the instructions and the turn's
+  prefix are the same from round to round and the provider caches them:
+  in the 2026-10-26 graft session, which sent the questions first and
+  inline, none of the judge's 450k input tokens were cached.
 - A turn whose steers do not all fit the `prompts` read is judged
   without consent, since the person's latest word may be the one left out. A model judge's tag is at most 87 bytes, so its forks' names fit.
 
