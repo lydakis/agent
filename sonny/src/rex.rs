@@ -5,6 +5,7 @@
 //! labels need not be unique. Checked against rex 0.0.1792787366 (API rev 7)
 //! for `ls`, `new`, `split`, `block ls` and `block close`; `run`'s output is
 //! read the way `split`'s is.
+use crate::mux::{Backend, Block, Places};
 use serde_json::Value;
 use std::{
     collections::HashMap,
@@ -32,30 +33,11 @@ pub struct Rex {
     bin: PathBuf,
     /// `-S HOST` when the session lives on another Rex server.
     host: Vec<String>,
-    pub session: String,
+    session: String,
     /// The session's label, as the person sees it.
-    pub name: String,
+    name: String,
     /// Whether the session is the one Sonny runs in.
-    pub here: bool,
-    /// Each task's block, by bot name.
-    blocks: HashMap<String, String>,
-}
-
-/// Where `sonny show` puts a task.
-pub enum Placement {
-    Window,
-    /// Beside a block (a bot's, by its label), on one side.
-    Split {
-        side: String,
-        beside: String,
-    },
-}
-
-/// A block as `block ls` lists it.
-struct Listed {
-    block: String,
-    label: String,
-    window: String,
+    here: bool,
 }
 
 impl Rex {
@@ -102,7 +84,6 @@ impl Rex {
             session: String::new(),
             name: label.to_owned(),
             here: false,
-            blocks: HashMap::new(),
         };
         let listed = rex.call(&["ls", "--json", "--autostart=false"]);
         let sessions: Vec<(String, String)> = listed
@@ -148,11 +129,7 @@ impl Rex {
         Ok(rex)
     }
 
-    fn listed(&self) -> Vec<Listed> {
-        self.blocks_in(&self.session)
-    }
-
-    fn blocks_in(&self, session: &str) -> Vec<Listed> {
+    fn blocks_in(&self, session: &str) -> Vec<Block> {
         let Ok(ls) = self.call(&["block", "ls", "-s", session, "--json"]) else {
             return Vec::new();
         };
@@ -161,8 +138,8 @@ impl Rex {
             .into_iter()
             .flatten()
             .filter_map(|b| {
-                Some(Listed {
-                    block: b["block_id"].as_str()?.to_owned(),
+                Some(Block {
+                    id: b["block_id"].as_str()?.to_owned(),
                     label: b["label"].as_str().unwrap_or("").to_owned(),
                     window: b["window_id"].as_str().unwrap_or("").to_owned(),
                 })
@@ -170,93 +147,117 @@ impl Rex {
             .collect()
     }
 
-    /// A block already labelled with the bot's name.
-    fn adopt(&mut self, bot: &str, listed: &[Listed]) -> bool {
-        let Some(found) = listed.iter().find(|b| b.label == bot) else {
-            return false;
-        };
-        self.blocks.insert(bot.to_owned(), found.block.clone());
-        true
-    }
-
-    /// A window for the task running `command`, named `name`, unless the
-    /// task has a block already. Returns whether one was opened. The
-    /// person's focus stays where it is.
-    pub fn show(&mut self, bot: &str, name: &str, command: &[String]) -> Result<bool, String> {
-        let listed = self.listed();
-        if let Some(block) = self.blocks.get(bot)
-            && listed.iter().any(|b| &b.block == block)
-        {
-            return Ok(false);
-        }
-        if self.adopt(bot, &listed) {
-            return Ok(false);
-        }
-        self.place(bot, name, command, &Placement::Window)?;
-        Ok(true)
-    }
-
-    /// Open the task's block where asked, closing any it had.
-    pub fn place(
-        &mut self,
-        bot: &str,
-        name: &str,
-        command: &[String],
-        placement: &Placement,
-    ) -> Result<(), String> {
-        for old in self.listed().into_iter().filter(|b| b.label == bot) {
-            self.close_block(&old.block);
-        }
-        let anchor;
-        let mut args: Vec<&str> = match placement {
-            Placement::Window => vec!["window", "new", "-s", &self.session, name],
-            Placement::Split { side, beside } => {
-                anchor = self
-                    .listed()
-                    .into_iter()
-                    .find(|b| &b.label == beside)
-                    .map(|b| b.block)
-                    .ok_or(format!("no Rex block labelled {beside}"))?;
-                let session = self.session.as_str();
-                vec![
-                    "split", "-s", session, "-b", &anchor, "--split", side, "--label", bot,
-                ]
-            }
-        };
-        args.extend(["--shell=none", "--focus=false", "--json", "--"]);
-        args.extend(command.iter().map(String::as_str));
-        let made = self.call(&args)?;
+    /// The new block's ID from `split`'s, `run`'s or `window new`'s reply.
+    fn made(&self, args: &[&str]) -> Result<(String, Value), String> {
+        let made = self.call(args)?;
         let block = made["block_ids"][0]
             .as_str()
             .ok_or("rex: no block id in the reply")?
             .to_owned();
-        if made["window_id"].is_string() {
-            // `window new` names the window; the block is named after the
-            // bot, so it can be found, and anchored on, by that name.
-            let _ = self.call(&["block", "rename", &block, bot, "-s", &self.session]);
-        }
-        self.blocks.insert(bot.to_owned(), block);
-        Ok(())
+        Ok((block, made))
+    }
+}
+
+impl Backend for Rex {
+    fn home(&self) -> String {
+        format!("Rex session {}", self.name)
     }
 
-    /// Each window and the labels of its blocks, in Rex's order.
-    pub fn windows(&self) -> Vec<(String, Vec<String>)> {
-        let mut windows: Vec<(String, Vec<String>)> = Vec::new();
-        for block in self.listed() {
-            match windows
-                .iter_mut()
-                .find(|(window, _)| *window == block.window)
-            {
-                Some((_, labels)) => labels.push(block.label),
-                None => windows.push((block.window, vec![block.label])),
+    fn here(&self) -> bool {
+        self.here
+    }
+
+    fn blocks(&self) -> Vec<Block> {
+        self.blocks_in(&self.session)
+    }
+
+    fn close_block(&self, block: &str) {
+        let _ = self.call(&["block", "close", block, "-s", &self.session]);
+    }
+
+    fn rename_block(&self, block: &str, label: &str) {
+        let _ = self.call(&["block", "rename", block, label, "-s", &self.session]);
+    }
+
+    fn rename_window(&self, window: &str, name: &str) {
+        let _ = self.call(&["window", "rename", window, name, "-s", &self.session]);
+    }
+
+    fn window(
+        &self,
+        label: &str,
+        name: &str,
+        cwd: &Path,
+        command: &[String],
+        keep: bool,
+    ) -> Result<String, String> {
+        let cwd = cwd.to_string_lossy();
+        let session = self.session.as_str();
+        let mut args: Vec<&str> = match keep {
+            true => vec![
+                "run",
+                "-s",
+                session,
+                "-c",
+                &cwd,
+                "--label",
+                label,
+                "--keep-open",
+            ],
+            false => vec!["window", "new", "-s", session, name, "--shell=none"],
+        };
+        args.extend(["--focus=false", "--json", "--"]);
+        args.extend(command.iter().map(String::as_str));
+        let (block, made) = self.made(&args)?;
+        match keep {
+            true => {
+                if let Some(window) = made["window_id"].as_str() {
+                    self.rename_window(window, name);
+                }
             }
+            // `window new` names the window; the block is named after the
+            // bot, so it can be found, and anchored on, by that name.
+            false => self.rename_block(&block, label),
         }
-        windows
+        Ok(block)
+    }
+
+    fn split(
+        &self,
+        anchor: &str,
+        side: &str,
+        small: bool,
+        label: &str,
+        cwd: &Path,
+        command: &[String],
+        keep: bool,
+    ) -> Result<String, String> {
+        let cwd = cwd.to_string_lossy();
+        let mut args = vec!["split", "-b", anchor, "--split", side];
+        if small {
+            args.extend(["--ratio", "35"]);
+        }
+        args.extend(["-s", &self.session]);
+        match keep {
+            true => args.extend(["-c", &cwd, "--label", label, "--keep-open"]),
+            false => args.extend(["--label", label, "--shell=none"]),
+        }
+        args.extend(["--focus=false", "--json", "--"]);
+        args.extend(command.iter().map(String::as_str));
+        Ok(self.made(&args)?.0)
+    }
+
+    fn own_block(&self) -> Option<String> {
+        let mine = std::env::var("REX_BLOCK").ok().filter(|b| !b.is_empty())?;
+        self.blocks()
+            .into_iter()
+            .find(|b| b.id == mine || b.id.ends_with(&mine))
+            .map(|b| b.id)
     }
 
     /// Where each block sits, by label: its tab, counted from 1, and in a
     /// split, its side of its neighbour (`right of`, `below`, … a label).
-    pub fn places(&self) -> HashMap<String, (usize, Option<(String, String)>)> {
+    fn places(&self) -> Places {
         let mut places = HashMap::new();
         let Ok(ls) = self.call(&["window", "ls", "-s", &self.session, "--json"]) else {
             return places;
@@ -281,102 +282,6 @@ impl Rex {
             }
         }
         places
-    }
-
-    pub fn rename_window(&self, window: &str, name: &str) {
-        let _ = self.call(&["window", "rename", window, name, "-s", &self.session]);
-    }
-
-    /// Take on the block Sonny itself runs in, when in this session, named
-    /// after the bot.
-    pub fn adopt_own(&mut self, bot: &str) {
-        let mine = std::env::var("REX_BLOCK").unwrap_or_default();
-        let listed = self.listed();
-        let own = listed
-            .iter()
-            .find(|b| !mine.is_empty() && (b.block == mine || b.block.ends_with(&mine)))
-            .or_else(|| listed.iter().find(|b| b.label == bot));
-        let Some(own) = own else {
-            return;
-        };
-        if own.label != bot {
-            let _ = self.call(&["block", "rename", &own.block, bot, "-s", &self.session]);
-        }
-        self.blocks.insert(bot.to_owned(), own.block.clone());
-    }
-
-    fn close_block(&self, block: &str) {
-        let _ = self.call(&["block", "close", block, "-s", &self.session]);
-    }
-
-    /// Close every other block labelled with the bot's name, as one Sonny
-    /// opened for the task while this one placed it.
-    pub fn close_others(&mut self, bot: &str) {
-        let Some(mine) = self.blocks.get(bot).cloned() else {
-            return;
-        };
-        for other in self
-            .listed()
-            .into_iter()
-            .filter(|b| b.label == bot && b.block != mine)
-        {
-            self.close_block(&other.block);
-        }
-    }
-
-    /// Run a command an agent asked for in a block labelled `OWNER/NAME`, so
-    /// the person can see whose it is and it closes with its owner's
-    /// window: below the owner's block, or in a window of its own (named
-    /// `name`) when asked or when the owner has none here. One already
-    /// labelled so is replaced. The block stays open once the command
-    /// exits, to be read. Returns the block's ID.
-    pub fn run(
-        &mut self,
-        owner: &str,
-        name: &str,
-        cwd: &Path,
-        command: &[String],
-        window: bool,
-    ) -> Result<String, String> {
-        let label = format!("{owner}/{name}");
-        let listed = self.listed();
-        for old in listed.iter().filter(|b| b.label == label) {
-            self.close_block(&old.block);
-        }
-        let anchor = listed
-            .iter()
-            .find(|b| b.label == owner)
-            .filter(|_| !window)
-            .map(|b| b.block.clone());
-        let cwd = cwd.to_string_lossy();
-        let mut args: Vec<&str> = match &anchor {
-            Some(anchor) => vec!["split", "-b", anchor, "--split", "below", "--ratio", "35"],
-            None => vec!["run"],
-        };
-        args.extend(["-s", &self.session, "-c", &cwd, "--label", &label]);
-        args.extend(["--keep-open", "--focus=false", "--json", "--"]);
-        args.extend(command.iter().map(String::as_str));
-        let made = self.call(&args)?;
-        let block = made["block_ids"][0]
-            .as_str()
-            .ok_or("rex: no block id in the reply")?
-            .to_owned();
-        if let Some(window) = made["window_id"].as_str().filter(|_| anchor.is_none()) {
-            self.rename_window(window, name);
-        }
-        Ok(block)
-    }
-
-    /// Close a task's block, and every block it asked for, as when it is
-    /// done or its bot is deleted.
-    pub fn close(&mut self, bot: &str) {
-        let known = self.blocks.remove(bot);
-        let owned = format!("{bot}/");
-        for block in self.listed().into_iter().filter(|b| {
-            b.label == bot || b.label.starts_with(&owned) || Some(&b.block) == known.as_ref()
-        }) {
-            self.close_block(&block.block);
-        }
     }
 }
 
@@ -500,15 +405,16 @@ if out is not None:
                 "01stray": {"label": "graft", "blocks": []},
             }),
         );
-        let mut rex = super::Rex::open(bin, None, "graft", false).unwrap();
+        let rex = super::Rex::open(bin, None, "graft", false).unwrap();
         assert_eq!(
             (rex.session.as_str(), rex.name.as_str()),
             ("01home", "lydakis")
         );
         assert!(!rex.here);
+        let mut rex = crate::mux::Layout::new(Box::new(rex));
 
         let cwd = Path::new("/work");
-        let tests = rex.run(
+        let tests = rex.split(
             "graft.fix",
             "tests",
             cwd,
@@ -525,7 +431,7 @@ if out is not None:
             "{split}"
         );
         // Run again by name, the old block makes way.
-        let again = rex.run(
+        let again = rex.split(
             "graft.fix",
             "tests",
             cwd,
@@ -533,7 +439,7 @@ if out is not None:
             false,
         );
         assert_ne!(again.unwrap(), tests);
-        rex.run(
+        rex.split(
             "graft.fix",
             "build",
             cwd,
@@ -541,7 +447,7 @@ if out is not None:
             true,
         )
         .unwrap();
-        rex.run("graft.lead", "server", cwd, &["serve".into()], false)
+        rex.split("graft.lead", "server", cwd, &["serve".into()], false)
             .unwrap();
         assert_eq!(
             labels(&dir, "01home"),
