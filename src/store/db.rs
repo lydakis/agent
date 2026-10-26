@@ -112,8 +112,10 @@ pub struct Bot {
     #[serde(serialize_with = "resolved_settings")]
     pub settings: Settings,
 }
-/// A bot's denials under one gate tag: how many in a row, reset when a call
-/// every gate allowed starts, and how many in the turn that gave the last.
+/// A bot's denials under one gate tag in the turn that gave the last: how
+/// many in a row, reset when a call every gate allowed starts, and how many
+/// in all. A new turn starts both from none, so a breaker that ended one
+/// turn never refuses the next.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct Denials {
     pub in_row: u32,
@@ -124,8 +126,10 @@ impl Denials {
     /// The counts as a client sees them from `turn`: a denial in another
     /// turn is none in this one.
     fn seen(&self, turn: i64) -> Value {
-        let in_turn = if self.turn == turn { self.in_turn } else { 0 };
-        json!({"in_row":self.in_row,"in_turn":in_turn})
+        match self.turn == turn {
+            true => json!({"in_row":self.in_row,"in_turn":self.in_turn}),
+            false => json!({"in_row":0,"in_turn":0}),
+        }
     }
 }
 /// What a bot chose at creation about its model context, its history and
@@ -7244,7 +7248,8 @@ fn deny(
     Ok(())
 }
 /// Count a denial under each of `tags`, or end their runs of denials when
-/// a call they allowed starts. The bot's row is written only when a count
+/// a call they allowed starts. A denial in a new turn starts both counts
+/// over. The bot's row is written only when a count
 /// changes, so a bot that is never denied writes nothing.
 fn count_denials(
     tx: &Connection,
@@ -7257,13 +7262,14 @@ fn count_denials(
     for tag in tags {
         if denied {
             let counts = bot.denials.entry((*tag).to_owned()).or_default();
-            counts.in_turn = if counts.turn == turn {
-                counts.in_turn.saturating_add(1)
-            } else {
-                1
-            };
+            if counts.turn != turn {
+                *counts = Denials {
+                    turn,
+                    ..Denials::default()
+                };
+            }
+            counts.in_turn = counts.in_turn.saturating_add(1);
             counts.in_row = counts.in_row.saturating_add(1);
-            counts.turn = turn;
             changed = true;
         } else if let Some(counts) = bot.denials.get_mut(*tag)
             && counts.in_row > 0
