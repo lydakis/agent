@@ -9,15 +9,15 @@ use std::time::Duration;
 /// workspace's folder), none when Errand is not installed or does not
 /// answer in time.
 pub async fn jobs(project: String) -> Vec<Row> {
-    let listing = tokio::task::spawn_blocking(|| {
-        std::process::Command::new("errand")
-            .args(["ps", "--json"])
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-    });
+    // A listing that runs over is killed with the future that waits on it.
+    let listing = tokio::process::Command::new("errand")
+        .args(["ps", "--json"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
     match tokio::time::timeout(Duration::from_secs(3), listing).await {
-        Ok(Ok(Ok(out))) => rows(&String::from_utf8_lossy(&out.stdout), &project, now()),
+        Ok(Ok(out)) => rows(&String::from_utf8_lossy(&out.stdout), &project, now()),
         _ => Vec::new(),
     }
 }
