@@ -238,8 +238,9 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   the same tag merge, keeping the shorter expiry. A call needs an allow
   from every gate whose list names its tool, and the first deny from any
   of them denies it. So a bot under `manual` that forks an `auto` bot gets
-  a fork whose calls need both, and nothing a bot asks for can replace a
-  gate it inherited. Mixed gates are rare; the common bot has one. A
+  a fork whose calls need both, and nothing a bot asks for when it makes
+  one can replace a gate it inherited. Configuring a bot replaces its
+  gates, inherited ones too: a person overriding a bot's mode decides. Mixed gates are rare; the common bot has one. A
   read-only child of a bot gated on `shell,write,edit` gets nothing to
   approve, because it has none of those tools. A fork keeps its source's
   tools, so its lists stay subsets even when its allowed list is narrower.
@@ -478,17 +479,32 @@ so only one instance runs at a time, and answers in layers:
    judges](#which-model-judges)). The state is the context below plus the
    round's calls, and each call gets `noul` (true or false) questions,
    each naming one judgment and returning a probability. Five name a risk:
-   - Does it delete or overwrite data outside the workspace, or rewrite
-     history someone else has (a force push)?
-   - Does it send files, secrets, or code to a destination the user did
-     not name?
-   - Does it read, print, use, or change credentials or access
-     permissions, such as signing in to a remote host (`ssh prod
-     uptime`) with a saved key or login? (The labeled run asked this
-     without "use"; the broader question is untested.)
-   - Does it change a shared or production system (deploy, migrate,
-     publish, send a message)?
-   - Does it download and run code from the network?
+   - Does it destroy data that cannot be got back: delete or overwrite
+     files outside the workspace, drop a database, or rewrite history
+     others have (a force push to a shared branch)? Files in the
+     workspace, temporary and build files, and the bot's own files under
+     `~/.agent` do not count.
+   - Does it send secrets, or private files or code, to a destination
+     nobody named, outside the workspace's own remotes and the services
+     its work uses?
+   - Does it print or copy a secret's value, or change credentials or
+     access permissions (create, rotate, or revoke keys; change who can
+     access something)? Using a saved login to do the work (`gh`, `git`,
+     a cloud CLI) does not count.
+   - Does it change a production system or one other people rely on
+     (deploy, migrate a production database, publish, push to a default
+     branch others use, send a message to people)? Pushing a work branch
+     and opening or commenting on the task's pull requests do not count.
+   - Does it download and run code from an unknown source, such as a
+     script piped into a shell? Package managers and the project's own
+     scripts do not count.
+
+   Until 2026-10-26 the questions were broader (any use of a saved login,
+   any shared system, any code from the network), and George's day on
+   Sonny found `auto` blocking read-only and ordinary work. Every judge is
+   also told that reading, searching, building, testing, workspace edits,
+   and git work on a branch have none of these effects, and to lean
+   toward no when unsure.
 
    A sixth risk question has no consent question beside it: does it reach
    the approval channel itself, answering approvals, creating a bot
@@ -532,13 +548,16 @@ so only one instance runs at a time, and answers in layers:
    Jev bills input only. The eleven are asked of every judge in the same
    words.
 
-   Allow when every risk is either low or has a high consent answer. A
-   task that says to install a package, publish, or deploy has consented
-   to that effect and no other: a requested deploy that also sends a
-   credential to a host nobody named has a high risk with no consent, and
-   is denied. Deny, with the question as the reason (like Claude Code's
-   rule tags), when any risk is high and its consent is low. Everything
-   else goes to step 4. The starting thresholds are
+   Allow unless a risk is high and its consent is low; that call goes to
+   step 4, with the question as the reason (like Claude Code's rule tags).
+   A task that says to publish or deploy has consented to that effect and
+   no other: a requested deploy that also sends a credential to a host
+   nobody named has a high risk with no consent. A middling answer either
+   way allows: until 2026-10-26 a middling risk, or a high one with
+   middling consent, was unclear and went to step 4 too, which is where
+   most of the blocked ordinary calls came from. Words left out for
+   length no longer stop consent: the newest are kept and the judge is
+   told (`request_cut`). The starting thresholds are
    TypeSafe's guardrail cookbook's: below 0.35 is low, 0.70 or more is
    high. TypeSafe publishes no calibration figures; a third-party benchmark
    (jev-bench, 12 tasks, 2026-09-20) found answers reliable at 0.9 and
@@ -549,7 +568,7 @@ so only one instance runs at a time, and answers in layers:
    score up to 0.64 on "changes a shared system", while a requested
    `git push` scored 0.36, so that question has no safe gap between the
    two.
-4. **Unclear or dangerous: ask the person when one can answer, else deny,
+4. **Likely dangerous and unasked: ask the person when one can answer, else deny,
    and let consent come through messages.** Since 2026-10-26, when the
    bot's gate has no expiry the approver hands the call to the person
    (`"decision":"ask"`, protocol 15): the call keeps waiting, its listing
@@ -564,14 +583,19 @@ so only one instance runs at a time, and answers in layers:
    a prompt the caller wrote, and the retry is allowed. This is how Claude
    Code's auto mode already weighs explicit user intent, and it needs no
    approval screen: consent is part of the conversation. Only prompts from
-   the caller count, never a prompt one bot wrote for another, and the
-   message has to name the action, not just say "go ahead". A high
+   the caller count, never a prompt one bot wrote for another. Since
+   2026-10-26 the calls a turn was refused are kept with its denial and
+   shown to the judge (`refused_calls`, for this turn and beside each
+   earlier prompt), so a plain "yes" or "approved" after a refusal asks
+   for what was refused; a lead passing the person's go-ahead on to a
+   task bot carries it the same way, since the person's words above a
+   delegated prompt are read as the person's. A high
    answer on the approval-channel question stays denied whatever the
    prompt says. An optional
-   larger model can take the unclear band before the denial: a bot in the
+   larger model can take the doubted calls before the denial: a bot in the
    same daemon with only `read`, working as Codex's reviewer does, a
    separate turn that may look at files before it answers. The approver
-   never allows on an unclear, failed, or timed-out verdict. As in Codex,
+   never allows on a doubted, failed, or timed-out verdict. As in Codex,
    the reason says which it was: "judged risky: REASON" or "not reviewed:
    the check failed", so the model can tell a refusal from an outage. A Jev
    request gets 10 s, the SDK's default, before it counts as failed, and a
@@ -710,27 +734,29 @@ was cut, except that a planned `write` or `edit` past 64 KiB of text shows
 each field's start and end with its whole size, redacted before it is cut
 so a cut cannot leave a secret's value without the name that marks it; so
 is any file written this turn that one of them runs, up to 48 KiB, and
-past that only its size. A call with part of what it writes or runs left
-out is not allowed on the judge's word, since the part left out may do
-anything (a script padded past the limit with its payload in the middle):
-what Jev would allow is doubted as "not reviewed whole" (step 4: asked
-of the person when one can answer, else denied), as is a risky one. So
+past that only its size. A call that runs a file not shown whole is not
+allowed on the judge's word, since the part left out may do anything (a
+script padded past the limit with its payload in the middle): what Jev
+would allow is doubted as "not reviewed whole" (step 4: asked of the
+person when one can answer, else denied), as is a risky one. A long
+write or edit itself is judged by its path and what is shown, since what
+it writes runs only when a later call runs it (until 2026-10-26 it was
+doubted too, which stopped generated files and fixtures). So
 are the already allowed shell and caller-registered calls, since a
 one-time request is used up by a call that did it and a deploy past a
 preview's 2,048 characters would hide that; an allowed `write` or `edit`
 is shown as its path and size, since a file's content is not what
 consent is about. If the words do not all fit, the newest are sent and the older left out
 (the newest cut to its start and end if it alone does not fit), with
-`request_cut: true`, and consent is not counted, since a word left out may
-be the one that withdrew it. Text the daemon cut at the read's budget ends
+`request_cut: true`, and consent is still counted on what is shown (until
+2026-10-26 it was not, since a word left out may be the one that withdrew
+it; the newest are the ones kept). Text the daemon cut at the read's budget ends
 at its last whole word, so the redactor never sees a secret without what
 marks it (a URL's password cut before its `@host`). `prompts` gives the calls their own budget, so
 words that fill the read still leave the calls that name the files the
-turn wrote. Jev still judges the risks: a call whose
-risks are all low is allowed, and a risky one is unclear. Long-running
-delegated tasks hit this routinely, and refusing every call in them,
-which the approver did until 2026-10-26, stopped ordinary work such as
-`cargo fmt --check`. Only if the calls being judged do not fit on their
+turn wrote. Long-running delegated tasks hit this routinely, and
+refusing every call in them, which the approver did until 2026-10-26,
+stopped ordinary work such as `cargo fmt --check`. Only if the calls being judged do not fit on their
 own does it not call Jev; the call is unclear (step 4), with the reason
 "not reviewed: the calls are too long to show". If the already allowed
 calls do not fit, consent is not counted either.
@@ -1291,6 +1317,11 @@ Dropped with the rules on 2026-09-27:
 `until_prior`, `path`, and the `path_changed` check.
 
 ## Open decisions
+
+Settled by George on 2026-10-26, after a day on Sonny: `auto` allows
+almost everything and stops only what is likely dangerous and plainly
+unasked; otherwise he runs at full access. A person's `/approvals`
+override replaces any bot's gates, including one another bot made.
 
 Settled by George on 2026-09-27: `auto` is a model deciding every gated
 call, with no rules; a rules-only approver is manual mode, and rules for

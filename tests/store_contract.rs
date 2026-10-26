@@ -10734,6 +10734,66 @@ fn a_denied_call_closes_its_round() {
 }
 
 #[test]
+fn a_refused_call_is_read_with_its_turn_and_beside_it_later() {
+    let mut db = db();
+    let turn = gated_turn(&mut db, None);
+    let (item, call) = shell_call("fc_1", "s1", "git push origin main");
+    db.append(turn, vec![item], std::slice::from_ref(&call), None)
+        .unwrap();
+    db.answer(Decision {
+        bot: "Bob",
+        turn,
+        call_id: "s1",
+        request: 1,
+        tag: None,
+        allow: false,
+        reason: Some("no"),
+        by: Some("test"),
+    })
+    .unwrap();
+    assert!(matches!(
+        db.approval_start(turn, &call, 0).unwrap(),
+        Gated::Denied
+    ));
+    // A person's go-ahead in a steer or the next turn can be read against
+    // what was refused.
+    let refused = json!([{"name":"shell","arguments":call.arguments}]);
+    assert_eq!(
+        db.prompts("Bob", turn, 64 * 1024).unwrap()["refused"],
+        refused
+    );
+    db.finish(turn, None).unwrap();
+    let next = db
+        .begin(
+            "Bob",
+            "yes",
+            "approved",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let read = db.prompts("Bob", next, 64 * 1024).unwrap();
+    assert!(read.get("refused").is_none());
+    assert_eq!(read["earlier"][0]["refused"], refused);
+    // Cut to the budget like any text.
+    let entry = Database::PROMPTS_ENTRY;
+    let first = read["earlier"][0]["text"].as_str().unwrap().len();
+    let cut = db
+        .prompts("Bob", next, 8 + entry + first + entry + 5)
+        .unwrap();
+    assert_eq!(cut["earlier"][0]["refused"][0]["arguments_truncated"], true);
+    assert_eq!(
+        cut["earlier"][0]["refused"][0]["arguments"]
+            .as_str()
+            .unwrap()
+            .len(),
+        5
+    );
+}
+
+#[test]
 fn a_resent_keyed_creation_gets_its_bot_and_a_changed_one_names_the_field() {
     let mut db = db();
     let keyed = || Binding {
@@ -10961,7 +11021,7 @@ fn a_bot_is_pointed_at_another_model_and_effort() {
 }
 
 #[test]
-fn a_root_bot_changes_its_gate_and_a_made_bot_keeps_its_own() {
+fn a_bot_changes_its_gate_even_one_another_bot_made() {
     let mut db = db();
     let ann = db.create("Ann", None, binding()).unwrap().0;
     let gate = |tool: &str| Gate {
@@ -10980,6 +11040,8 @@ fn a_root_bot_changes_its_gate_and_a_made_bot_keeps_its_own() {
     );
     assert!(db.set_gate("Ann", None, None).unwrap());
     assert!(db.inspect("Ann").unwrap().gates.is_empty());
+    // A bot Ann makes takes her gate, and the person can still lift it.
+    assert!(db.set_gate("Ann", None, Some(gate("read"))).unwrap());
     db.create(
         "Bob",
         None,
@@ -10990,10 +11052,9 @@ fn a_root_bot_changes_its_gate_and_a_made_bot_keeps_its_own() {
         },
     )
     .unwrap();
-    assert_eq!(
-        db.set_gate("Bob", None, None).unwrap_err().code,
-        "gates_inherited"
-    );
+    assert_eq!(db.inspect("Bob").unwrap().gates, [gate("read")]);
+    assert!(db.set_gate("Bob", None, None).unwrap());
+    assert!(db.inspect("Bob").unwrap().gates.is_empty());
 }
 
 #[test]

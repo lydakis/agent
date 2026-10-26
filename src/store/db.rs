@@ -1807,10 +1807,9 @@ impl Database {
         tx.commit()?;
         Ok(changed == 1)
     }
-    /// Replace a root bot's gates, those a fork took from its source
-    /// included: a client that made it could make an ungated bot anyway. A
-    /// bot another bot made keeps the gates it descends from, so it cannot
-    /// be let out of them. Whether anything changed.
+    /// Replace a bot's gates, those it took from its creator or its source
+    /// included: whoever configures it decides, as the person overriding a
+    /// bot another bot made does. Whether anything changed.
     pub fn set_gate(
         &mut self,
         name: &str,
@@ -1819,12 +1818,6 @@ impl Database {
     ) -> Result<bool> {
         let id = self.identity(name, bot_id)?;
         let bot = self.inspect(name)?;
-        if bot.created_by_id.is_some() {
-            return fail_with(
-                "gates_inherited",
-                format!("{name} was made by another bot and keeps its gates"),
-            );
-        }
         if let Some(gate) = &gate {
             not_in_tools(&gate.tools, &bot.tools)?;
         }
@@ -4792,7 +4785,7 @@ impl Database {
                 &tx,
                 &bot,
                 turn,
-                &call.call_id,
+                call,
                 denial.reason.as_deref(),
                 // Every accepted verdict, so replay keeps each approver's.
                 request.approvals(),
@@ -4864,7 +4857,7 @@ impl Database {
                 &tx,
                 &bot,
                 turn,
-                &call.call_id,
+                call,
                 Some("not reviewed: no verdict"),
                 lapsed,
                 true,
@@ -5306,8 +5299,9 @@ impl Database {
     /// A turn's words and calls, as a program judging its calls reads them:
     /// the turn's prompt and each steer it absorbed, in order, with the bot
     /// turn that wrote each (none for a person's words); the calls it
-    /// started, with argument previews and whether each failed; then the
-    /// bot's earlier prompts, newest first. The words' text counts against
+    /// started, with argument previews and whether each failed, and those
+    /// it was refused (`refused`); then the bot's earlier prompts, newest
+    /// first, each with the calls its turn was refused. The words' text counts against
     /// `bytes` in that order and the calls' against their own `bytes`, and
     /// each steer, call, and earlier prompt also counts `PROMPTS_ENTRY`;
     /// text that does not fit is cut and marked
@@ -5376,6 +5370,7 @@ impl Database {
         }
         let mut failed = std::collections::HashSet::new();
         let mut done = std::collections::HashSet::new();
+        let refused = self.refused(turn, &mut left)?;
         let mut completed = self.conn.prepare_cached(
             "SELECT json_extract(data,'$.call_id'),json_extract(data,'$.failed')
              FROM events WHERE turn=? AND kind='tool_completed' ORDER BY id",
@@ -5447,12 +5442,44 @@ impl Database {
             if r.get::<_, bool>(4)? {
                 entry["steer"] = json!(true);
             }
+            let refused = self.refused(r.get(0)?, &mut left)?;
+            if !refused.is_empty() {
+                entry["refused"] = json!(refused);
+            }
             earlier.push(entry);
         }
-        Ok(
-            json!({"bot":name,"turn":turn,"status":turn_status_name(&status),"workspace":workspace,
-            "prompts":prompts,"prompts_more":prompts_more,"calls":calls,"calls_more":calls_more,"earlier":earlier,"more":more}),
-        )
+        let mut read = json!({"bot":name,"turn":turn,"status":turn_status_name(&status),"workspace":workspace,
+            "prompts":prompts,"prompts_more":prompts_more,"calls":calls,"calls_more":calls_more,"earlier":earlier,"more":more});
+        if !refused.is_empty() {
+            read["refused"] = json!(refused);
+        }
+        Ok(read)
+    }
+    /// The calls a turn was refused, each `{name, arguments}` with its
+    /// arguments cut to the budget left; a denial recorded before refused
+    /// calls were kept has no name and is left out.
+    fn refused(&self, turn: i64, left: &mut usize) -> Result<Vec<Value>> {
+        let mut statement = self.conn.prepare_cached(
+            "SELECT json_extract(data,'$.name'),json_extract(data,'$.arguments')
+             FROM events WHERE turn=? AND kind='tool_completed' AND json_extract(data,'$.denied')
+               AND json_extract(data,'$.name') IS NOT NULL ORDER BY id",
+        )?;
+        let mut refused = Vec::new();
+        let mut rows = statement.query([turn])?;
+        while let Some(r) = rows.next()? {
+            if *left < Self::PROMPTS_ENTRY {
+                break;
+            }
+            *left -= Self::PROMPTS_ENTRY;
+            let mut arguments: String = r.get::<_, Option<String>>(1)?.unwrap_or_default();
+            let mut entry = json!({"name":r.get::<_, String>(0)?});
+            if cut(&mut arguments, left) {
+                entry["arguments_truncated"] = json!(true);
+            }
+            entry["arguments"] = json!(arguments);
+            refused.push(entry);
+        }
+        Ok(refused)
     }
     /// Planned calls announced and not yet started or denied, for `stats`.
     pub fn approval_requests(&self) -> i64 {
@@ -7296,11 +7323,12 @@ fn deny(
     tx: &Connection,
     bot: &Bot,
     turn: i64,
-    call_id: &str,
+    call: &ToolCall,
     reason: Option<&str>,
     approvals: Value,
     expired: bool,
 ) -> Result<()> {
+    let call_id = call.call_id.as_str();
     let output = json!({"error":"approval_denied","detail":reason}).to_string();
     let item = bot.family()?.tool_result_item(call_id, &output)?;
     if tx.execute(
@@ -7317,8 +7345,13 @@ fn deny(
          closed=CASE WHEN open_calls=1 THEN ?1 ELSE closed END WHERE name=?2",
         params![head, bot.name],
     )?;
-    let mut data = json!({"call_id":call_id,"node":head,"artifacts":[],"denied":true,
-        "approvals":approvals});
+    // The refused call, previewed as a started one is: a judge reads it
+    // later, so a person's go-ahead can be tied to what was refused.
+    let mut data = started(call);
+    data["node"] = json!(head);
+    data["artifacts"] = json!([]);
+    data["denied"] = json!(true);
+    data["approvals"] = approvals;
     if expired {
         data["expired"] = json!(true);
     }

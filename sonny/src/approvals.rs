@@ -24,16 +24,17 @@ pub fn mode(record: &Value) -> Option<&'static str> {
     }
 }
 
-/// A mode to set again, for a bot nobody made whose `auto` gate is older
-/// than the one `gate` makes: one that lapses, so a doubted call is denied
-/// rather than waiting for the person, or one that still judges reads.
+/// A mode to set again, for a bot whose `auto` gate is older than the one
+/// `gate` makes: one that lapses, so a doubted call is denied rather than
+/// waiting for the person, or one that still judges reads. A bot another
+/// bot made is set again too, as the person's `/approvals` would.
 pub fn refresh(record: &Value) -> Option<&'static str> {
     let gate = &record["gates"][0];
     let old = gate["expire_ms"].is_u64()
         || gate["tools"]
             .as_array()
             .is_some_and(|tools| tools.iter().any(|t| t == "read"));
-    (mode(record) == Some("auto") && old && record["created_by"].is_null()).then_some("auto")
+    (mode(record) == Some("auto") && old).then_some("auto")
 }
 
 /// The `create` or `configure` fields for a mode: every tool the bot has
@@ -88,13 +89,12 @@ mod tests {
         let reader: Vec<String> = ["read", "wait"].map(String::from).to_vec();
         assert_eq!(Value::Object(gate("auto", &reader)), json!({"approve": []}));
         assert!(gate("auto", &tools).get("approve_expire_ms").is_none());
-        // A lead's auto gate that still lapses is set again; a made bot's
-        // keeps the gate it descends from.
+        // An auto gate that still lapses is set again, a made bot's too.
         let lapsing = json!({"gates": [{"tag": "auto", "tools": ["shell"], "expire_ms": 45000}]});
         assert_eq!(refresh(&lapsing), Some("auto"));
         let mut made = lapsing.clone();
         made["created_by"] = json!("lead");
-        assert_eq!(refresh(&made), None);
+        assert_eq!(refresh(&made), Some("auto"));
         assert_eq!(
             refresh(&json!({"gates": [{"tag": "auto", "tools": ["shell"]}]})),
             None

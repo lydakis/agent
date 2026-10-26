@@ -6,7 +6,9 @@
 //! the reason, and the model can ask its caller instead.
 use agent_client::{
     Client,
-    approver::{self as policy, Allowed, By, Intent, Planned, Redactor, State, Verdict, Words},
+    approver::{
+        self as policy, Allowed, By, Intent, Planned, Redactor, Refused, State, Verdict, Words,
+    },
 };
 use agent_runtime::{Error, Result};
 use serde_json::{Value, json};
@@ -60,7 +62,7 @@ const IN_FLIGHT: usize = 32;
 const PROMPT_BYTES: usize = 128 * 1024;
 /// How many delegations deep the approver follows up to the person's
 /// words, and how many delegating turns it reads for one round; past either
-/// the words above are left out, and consent is not asked.
+/// the words above are left out, and the judge is told.
 const CHAIN: usize = 8;
 const DELEGATING: usize = 64;
 /// How much of a file written this turn a judged call that names it is
@@ -1045,8 +1047,8 @@ async fn intent(
             json!({"bot":bot,"turn":turn,"bytes":PROMPT_BYTES}),
         )
         .await?;
-    // Steers left out may hold the person's latest word: the words are
-    // judged without consent.
+    // Steers left out may hold the person's latest word: the judge is told
+    // words were left out.
     let mut request_cut = read["prompts_more"] == true;
     let mut request = Vec::new();
     let mut visited = HashSet::from([(bot.to_owned(), turn)]);
@@ -1059,6 +1061,7 @@ async fn intent(
             None => request.push(Words {
                 by: by_origin(prompt),
                 text,
+                refused: Vec::new(),
             }),
             Some(from) => {
                 let cut = persons_above(client, from, &mut visited, &mut budget, &mut request);
@@ -1066,6 +1069,7 @@ async fn intent(
                 request.push(Words {
                     by: By::Model,
                     text,
+                    refused: Vec::new(),
                 });
             }
         }
@@ -1086,9 +1090,11 @@ async fn intent(
             }
         };
         let tool = call["name"].as_str().unwrap_or_default().to_owned();
-        let mut unseen = false;
+        // A change too long to show is judged by its path and what is shown:
+        // what it writes runs only when a later call runs it, and that call
+        // is judged with the file.
         if matches!(tool.as_str(), "write" | "edit") {
-            (arguments, unseen) = policy::shown_change(&arguments, &shared.redactor);
+            arguments = policy::shown_change(&arguments, &shared.redactor).0;
         }
         size += arguments.to_string().len();
         if size > PROMPT_BYTES {
@@ -1099,7 +1105,7 @@ async fn intent(
             tool,
             arguments,
             files: Vec::new(),
-            unseen,
+            unseen: false,
         });
     }
     let mut allowed = Vec::new();
@@ -1238,6 +1244,7 @@ async fn intent(
                 None => by_origin(prompt),
             },
             text: prompt_text(prompt),
+            refused: refused(&prompt["refused"]),
         })
         .collect();
     Ok(Intent {
@@ -1248,8 +1255,25 @@ async fn intent(
         allowed,
         allowed_cut,
         request_cut,
+        refused: refused(&read["refused"]),
         earlier,
     })
+}
+
+/// The calls a `prompts` read says a turn was refused.
+fn refused(calls: &Value) -> Vec<Refused> {
+    calls
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|call| Refused {
+            tool: call["name"].as_str().unwrap_or_default().to_owned(),
+            arguments: match call["arguments_truncated"] == true {
+                true => whole_words(call["arguments"].as_str().unwrap_or_default()).to_owned(),
+                false => call["arguments"].as_str().unwrap_or_default().to_owned(),
+            },
+        })
+        .collect()
 }
 
 /// Text the daemon cut at its byte budget ends without the part-word it was
@@ -1324,6 +1348,7 @@ async fn persons_above(
             None => request.push(Words {
                 by: by_origin(&prompt),
                 text: prompt_text(&prompt),
+                refused: Vec::new(),
             }),
         }
     }
