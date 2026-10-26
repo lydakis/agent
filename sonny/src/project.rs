@@ -207,7 +207,8 @@ async fn create(
         .request(
             "create",
             json!({"bot": bot, "workspace": dir, "model": model, "effort": effort,
-                "instructions": instructions, "tools": tools}),
+                "instructions": instructions, "tools": tools,
+                "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS}),
         )
         .await
         .map_err(|e| e.to_string())?;
