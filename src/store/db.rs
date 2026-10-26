@@ -1154,6 +1154,17 @@ fn budget_exhausted(bot: &Bot, budget: u64) -> Error {
     )
     .facts(json!({"budget_tokens":budget,"tokens_used":bot.tokens_used}))
 }
+/// What a keyed creation keeps of its instructions: a stable FNV-1a
+/// fingerprint, as hex, so a resend compares with what was sent even after
+/// `configure` replaced them.
+fn instructions_key(instructions: &str) -> String {
+    let hash = instructions
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        });
+    format!("{hash:016x}")
+}
 fn conflict(name: &str, field: &str) -> Error {
     Error::with(
         "idempotency_conflict",
@@ -1170,7 +1181,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 48;
+    pub const SCHEMA: i32 = 49;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1331,6 +1342,7 @@ impl Database {
                 delivery TEXT NOT NULL DEFAULT 'reject', expected_turn INTEGER,
                 cached_input_tokens INTEGER NOT NULL DEFAULT 0,
                 from_bot TEXT, from_turn INTEGER, from_id INTEGER, origin TEXT, reasoning TEXT, inherited_reasoning TEXT,
+                bot_model TEXT, bot_reasoning TEXT,
                 UNIQUE(bot,request_id));
             CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
             CREATE INDEX IF NOT EXISTS turns_started ON turns(bot,id) WHERE started_ms IS NOT NULL;
@@ -1751,7 +1763,9 @@ impl Database {
         Ok(changed == 1)
     }
     /// Point a bot at another model of its family, and its effort level;
-    /// whether either changed. The daemon has checked both.
+    /// whether either changed. The daemon has checked both. Turns past
+    /// the queue keep the model and effort they ran at, so their record
+    /// and the cache the next turn takes as held stay true.
     pub fn set_model(
         &mut self,
         name: &str,
@@ -1761,11 +1775,19 @@ impl Database {
         effort: Option<&str>,
     ) -> Result<bool> {
         let id = self.identity(name, bot_id)?;
-        let changed = self.conn.execute(
+        let tx = self.conn.savepoint()?;
+        tx.execute(
+            "UPDATE turns SET (bot_model,bot_reasoning)=(SELECT provider||'/'||model,reasoning FROM bots WHERE id=?1)
+              WHERE bot=?2 AND bot_model IS NULL AND status NOT IN ('queued','ready')
+                AND EXISTS(SELECT 1 FROM bots WHERE id=?1 AND (provider<>?3 OR model<>?4 OR reasoning IS NOT ?5))",
+            params![id, name, provider, model, effort],
+        )?;
+        let changed = tx.execute(
             "UPDATE bots SET provider=?, model=?, reasoning=? WHERE id=?
              AND (provider<>? OR model<>? OR reasoning IS NOT ?)",
             params![provider, model, effort, id, provider, model, effort],
         )?;
+        tx.commit()?;
         Ok(changed == 1)
     }
     /// Replace a root bot's gates, those a fork took from its source
@@ -1954,16 +1976,14 @@ impl Database {
         binding: Binding<'_>,
     ) -> Result<(Bot, Option<Value>)> {
         // As sent, so a resend compares equal whatever has happened since;
-        // the instructions are compared with the bot's own, never copied.
+        // the instructions by a fingerprint, never copied.
         let request = binding.request_id.map(|_| json!({"op":"create","workspace":workspace,
+            "instructions":instructions_key(binding.instructions),
             "provider":binding.provider,"model":binding.model,"effort":binding.effort,
             "budget_tokens":binding.budget_tokens,"tools":binding.tools,"created_by":binding.created_by,
             "created_by_id":binding.created_by_id,"compaction_model":binding.compaction_model,
             "fallbacks":binding.fallbacks,"gate":binding.gate,"settings":binding.settings}));
         if let Some(bot) = self.resent(name, binding.request_id, request.as_ref())? {
-            if bot.instructions != binding.instructions {
-                return Err(conflict(name, "instructions"));
-            }
             if bot.compaction_instructions.as_deref() != binding.compaction_instructions {
                 return Err(conflict(name, "compaction_instructions"));
             }
@@ -5390,7 +5410,8 @@ impl Database {
         let previous_call = self
             .conn
             .prepare_cached(
-                "SELECT COALESCE(t.model,?3),t.view_sent IS 1 AND p.turn IS NULL,COALESCE(t.reasoning,?4)
+                "SELECT COALESCE(t.model,t.bot_model,?3),t.view_sent IS 1 AND p.turn IS NULL,
+                        COALESCE(t.reasoning,CASE WHEN t.bot_model IS NULL THEN ?4 ELSE t.bot_reasoning END)
                    FROM turns t,nodes s LEFT JOIN nodes p ON p.id=s.parent
                   WHERE t.bot=?1 AND t.id<?2 AND t.started_ms IS NOT NULL AND s.turn=?2
                   ORDER BY t.id DESC LIMIT 1",
@@ -6889,10 +6910,11 @@ impl Database {
         let order = if newest { "DESC" } else { "ASC" };
         let mut statement = self.conn.prepare_cached(&format!(
             "SELECT {TURN_VIEW},COALESCE(t.workspace,b.workspace),
-                    COALESCE(t.model,b.provider||'/'||b.model),
+                    COALESCE(t.model,t.bot_model,b.provider||'/'||b.model),
                     substr(CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END,1,200),
                     length(CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END),
-                    t.delivery,COALESCE(t.reasoning,t.inherited_reasoning,b.reasoning),t.summary_ms,
+                    t.delivery,COALESCE(t.reasoning,t.inherited_reasoning,
+                        CASE WHEN t.bot_model IS NULL THEN b.reasoning ELSE t.bot_reasoning END),t.summary_ms,
                     t.budget_tokens
              FROM turns t JOIN bots b ON b.name=t.bot LEFT JOIN nodes n ON n.id=t.prompt_node
              WHERE t.bot=?1 AND t.id>?2 AND t.id<?3 ORDER BY t.id {order} LIMIT ?4"
@@ -8250,6 +8272,32 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
     )? {
         // 47 -> 48: a turn may carry its own token cap. None had one.
         conn.execute_batch("ALTER TABLE turns ADD COLUMN budget_tokens INTEGER;")?;
+    }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='bot_model')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 48 -> 49: a bot's model, effort and instructions can change. A
+        // turn keeps the bot's model and effort it ran at once they do, and
+        // a keyed creation the instructions it was sent with. None changed
+        // before, so every turn reads the bot's and every creation its
+        // bot's instructions.
+        conn.execute_batch(
+            "ALTER TABLE turns ADD COLUMN bot_model TEXT;
+             ALTER TABLE turns ADD COLUMN bot_reasoning TEXT;",
+        )?;
+        let mut keyed = conn.prepare(
+            "SELECT id,instructions FROM bots WHERE json_extract(creation,'$.request.op')='create'",
+        )?;
+        let mut update = conn.prepare(
+            "UPDATE bots SET creation=json_set(creation,'$.request.instructions',?) WHERE id=?",
+        )?;
+        let mut rows = keyed.query([])?;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            update.execute(params![instructions_key(&row.get::<_, String>(1)?), id])?;
+        }
     }
     Ok(())
 }
