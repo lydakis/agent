@@ -20,6 +20,7 @@ mod lookout;
 mod math;
 mod mermaid;
 mod models;
+mod mux;
 mod project;
 mod rex;
 mod settings;
@@ -132,7 +133,8 @@ async fn show() -> Result<(), String> {
             _ => return Err(usage.into()),
         }
     }
-    let (socket, project, mut rex) = agents_rex(caller.as_deref().unwrap_or(&bot), host).await?;
+    let (socket, project, mut layout) =
+        agents_layout(caller.as_deref().unwrap_or(&bot), host).await?;
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     let command = [
         me.to_string_lossy().into_owned(),
@@ -144,36 +146,35 @@ async fn show() -> Result<(), String> {
     ];
     let short = bot.strip_prefix(&format!("{project}.")).unwrap_or(&bot);
     let placement = match side {
-        Some(side) => rex::Placement::Split {
+        Some(side) => mux::Placement::Split {
             side,
             beside: beside.ok_or("--split needs --beside BOT outside an agent")?,
         },
-        None => rex::Placement::Window,
+        None => mux::Placement::Window,
     };
-    rex.place(&bot, short, &command, &placement)?;
+    layout.place(&bot, short, &command, &placement)?;
     // The lead's Sonny opens a window for a task whose turn starts, maybe
     // while this placed it: what it opened then goes.
     std::thread::sleep(Duration::from_millis(1500));
-    rex.close_others(&bot);
-    println!("{}", json!({"bot": bot, "session": rex.name}));
+    layout.close_others(&bot);
+    println!("{}", json!({"bot": bot, "in": layout.home()}));
     Ok(())
 }
 
-/// The daemon's socket, the project `bot` belongs to, and its Rex session,
-/// from an agent's shell.
-async fn agents_rex(
+/// The daemon's socket, the project `bot` belongs to, and its home in the
+/// person's multiplexer, from an agent's shell.
+async fn agents_layout(
     bot: &str,
     host: Option<String>,
-) -> Result<(PathBuf, String, rex::Rex), String> {
+) -> Result<(PathBuf, String, mux::Layout), String> {
     let socket = std::env::var_os("AGENT_SOCKET")
         .map(PathBuf::from)
         .ok_or("run this from an agent's shell (AGENT_SOCKET is not set)")?;
     let socket = std::path::absolute(socket).map_err(|e| e.to_string())?;
     let client = Client::connect(&socket).await.map_err(|e| e.to_string())?.0;
     let project = project_of(&client, bot).await;
-    let bin = rex::find().ok_or("rex not found")?;
-    let rex = rex::Rex::open(bin, host.as_deref(), &project, false)?;
-    Ok((socket, project, rex))
+    let layout = mux::for_agent(&project, host.as_deref())?;
+    Ok((socket, project, layout))
 }
 
 /// `sonny split NAME [--window] [--rex-host HOST] -- COMMAND...`: run a
@@ -202,12 +203,12 @@ async fn split() -> Result<(), String> {
     if command.is_empty() {
         return Err(usage.into());
     }
-    let (_, _, mut rex) = agents_rex(&owner, host).await?;
+    let (_, _, mut layout) = agents_layout(&owner, host).await?;
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let block = rex.run(&owner, &name, &cwd, &command, window)?;
+    let block = layout.split(&owner, &name, &cwd, &command, window)?;
     println!(
         "{}",
-        json!({"block": block, "label": format!("{owner}/{name}"), "session": rex.name})
+        json!({"block": block, "label": format!("{owner}/{name}"), "in": layout.home()})
     );
     Ok(())
 }
@@ -466,10 +467,8 @@ async fn run() -> Result<(), String> {
             let dir = std::env::current_dir().map_err(|e| e.to_string())?;
             // Before the lead is made, so its instructions list the skills.
             skills::install_errand();
-            if options.rex
-                && let Some(bin) = rex::find()
-            {
-                rex::install_skill(&bin);
+            if options.rex {
+                mux::install_skill();
             }
             let lead =
                 project::open(&client, &dir, &options.socket, options.model.as_deref()).await?;
@@ -524,7 +523,6 @@ async fn run() -> Result<(), String> {
     // Rex server to use); elsewhere they run out of sight, in /status.
     if let Some(project) = &project
         && options.rex
-        && (std::env::var_os("REX_SESSION").is_some() || options.rex_host.is_some())
     {
         app.fleet = Fleet::start(&options, project, &name).await;
         if let Some(fleet) = &app.fleet {
@@ -894,7 +892,7 @@ struct App {
 /// each task while it works, opened as its turn starts. It follows every
 /// bot on its own connection, so the lead's own view is not disturbed.
 struct Fleet {
-    rex: rex::Rex,
+    layout: mux::Layout,
     client: Arc<Client>,
     events: Events,
     socket: PathBuf,
@@ -934,8 +932,7 @@ struct Fleet {
 
 impl Fleet {
     async fn start(options: &Options, project: &str, lead: &str) -> Option<Self> {
-        let bin = rex::find()?;
-        let rex = rex::Rex::open(bin.clone(), options.rex_host.as_deref(), project, true).ok()?;
+        let layout = mux::here(project, options.rex_host.as_deref())?;
         let (client, mut events) = Client::connect(&options.socket).await.ok()?;
         client
             .request("follow", json!({"bot": "*", "after": 0}))
@@ -954,10 +951,10 @@ impl Fleet {
             "--no-sound".into(),
         ];
         // Said only when the tasks go somewhere this pane is not.
-        let note = (!rex.here).then(|| format!("tasks open in Rex session {}", rex.name));
-        rex::install_skill(&bin);
+        let note = (!layout.here()).then(|| format!("tasks open in {}", layout.home()));
+        mux::install_skill();
         let mut fleet = Self {
-            rex,
+            layout,
             client: client.clone(),
             events,
             socket: options.socket.clone(),
@@ -977,7 +974,7 @@ impl Fleet {
             waits: Default::default(),
             returned: Vec::new(),
         };
-        fleet.rex.adopt_own(lead);
+        fleet.layout.adopt_own(lead);
         fleet.doing(lead, "idle");
         fleet.reconcile().await;
         Some(fleet)
@@ -1024,7 +1021,7 @@ impl Fleet {
         let mut command = self.command.clone();
         command.extend(["--bot".into(), bot.into()]);
         let name = format!("{} · working", self.short(bot));
-        let opened = self.rex.show(bot, &name, &command)?;
+        let opened = self.layout.show(bot, &name, &command)?;
         self.doing(bot, "working");
         Ok(opened)
     }
@@ -1126,7 +1123,7 @@ impl Fleet {
             for (task, turn) in calls::returned(&printed) {
                 if task != self.lead && self.ended.get(&task) == Some(&turn) {
                     self.ended.remove(&task);
-                    self.rex.close(&task);
+                    self.layout.close(&task);
                     self.doing.remove(&task);
                     self.name_windows();
                 }
@@ -1172,8 +1169,8 @@ impl Fleet {
                 handle.to_owned(),
             ];
             let _ = self
-                .rex
-                .place(&label, &name, &attach, &rex::Placement::Window);
+                .layout
+                .place(&label, &name, &attach, &mux::Placement::Window);
         }
     }
 
@@ -1209,7 +1206,7 @@ impl Fleet {
     /// its first bot, and what that bot is doing, with a count of the others
     /// that are working or need the person: `lead · done · 2 working`.
     fn name_windows(&mut self) {
-        for (window, labels) in self.rex.windows() {
+        for (window, labels) in self.layout.windows() {
             let bots: Vec<&String> = labels
                 .iter()
                 .filter(|l| self.doing.contains_key(*l))
@@ -1233,7 +1230,7 @@ impl Fleet {
                 }
             }
             if self.named.get(&window) != Some(&name) {
-                self.rex.rename_window(&window, &name);
+                self.layout.rename_window(&window, &name);
                 self.named.insert(window, name);
             }
         }
@@ -1307,12 +1304,14 @@ impl Fleet {
                 None
             }
             "accepted" if bot != self.lead && self.lineage.contains(bot) => match self.show(bot) {
-                Ok(true) if !self.rex.here => Some(format!("{bot} is in Rex ({})", self.rex.name)),
+                Ok(true) if !self.layout.here() => {
+                    Some(format!("{bot} is in {}", self.layout.home()))
+                }
                 Ok(_) => None,
                 Err(error) => Some(error),
             },
             "deleted" => {
-                self.rex.close(bot);
+                self.layout.close(bot);
                 self.lineage.remove(bot);
                 self.doing.remove(bot);
                 None
@@ -2335,7 +2334,7 @@ impl App {
         let places = self
             .fleet
             .as_ref()
-            .map(|fleet| fleet.rex.places())
+            .map(|fleet| fleet.layout.places())
             .unwrap_or_default();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
