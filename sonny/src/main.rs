@@ -1713,6 +1713,7 @@ impl App {
             self.notice = None;
             self.context = context.or(self.context);
             self.history_after(self.seen_node).await;
+            self.unstage_landed().await;
             let now = record["running_turn"].as_i64();
             // A turn that ended while away ends here as its event would have.
             if let Some(turn) = self.running.as_ref().map(|r| r.turn)
@@ -1911,6 +1912,30 @@ impl App {
         }
         // A call still running finishes live, after the history.
         self.calls.extend(calls);
+    }
+
+    /// Drop the staged prompts that landed while Sonny was away, whose
+    /// `accepted` or `steered` it missed: those whose turn no longer waits.
+    async fn unstage_landed(&mut self) {
+        if self.staged.is_empty() {
+            return;
+        }
+        let page = self
+            .client
+            .request(
+                "turns",
+                json!({"bot": self.bot, "newest": true, "limit": 64}),
+            )
+            .await
+            .unwrap_or_default();
+        let waiting: Vec<i64> = page["turns"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|row| matches!(row["status"].as_str(), Some("queued" | "ready")))
+            .filter_map(|row| row["turn"].as_i64())
+            .collect();
+        self.staged.retain(|(turn, _)| waiting.contains(turn));
     }
 
     /// What was sent and has not landed yet, dim, the way it will read
@@ -3500,11 +3525,27 @@ mod tests {
     /// A daemon that greets and answers each `history_items` read from
     /// `items`, by node.
     async fn daemon_with(items: Value) -> Arc<Client> {
+        daemon_answering(move |asked| {
+            let read: Vec<Value> = asked["nodes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|node| json!({"node": node, "item": items[node.to_string()]}))
+                .collect();
+            json!({"items": read})
+        })
+        .await
+    }
+
+    /// A daemon that greets and gives each request `answer`'s result.
+    async fn daemon_answering(answer: impl Fn(&Value) -> Value + Send + 'static) -> Arc<Client> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        // Tests start stand-ins at once, within the same millisecond.
+        static STARTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
             "sonny-daemon-{}-{}",
-            std::process::id(),
-            unique("t")
+            unique("t"),
+            STARTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let socket = dir.join("agent.sock");
@@ -3520,13 +3561,7 @@ mod tests {
             let mut lines = BufReader::new(read).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let asked: Value = serde_json::from_str(&line).unwrap();
-                let read: Vec<Value> = asked["nodes"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .map(|node| json!({"node": node, "item": items[node.to_string()]}))
-                    .collect();
-                let answer = json!({"id": asked["id"], "result": {"items": read}});
+                let answer = json!({"id": asked["id"], "result": answer(&asked)});
                 write
                     .write_all(format!("{answer}\n").as_bytes())
                     .await
@@ -3536,14 +3571,8 @@ mod tests {
         Client::connect(&socket).await.unwrap().0
     }
 
-    #[tokio::test]
-    async fn a_reply_that_follows_its_reasoning_is_drawn_once() {
-        let client = daemon_with(json!({
-            "1": {"type": "reasoning", "summary": [{"type": "summary_text", "text": "**Reading**"}]},
-            "2": {"type": "message", "role": "assistant",
-                  "content": [{"type": "output_text", "text": "First line.\nSecond line."}]}
-        }))
-        .await;
+    /// Sonny on bot `b`, on `client`.
+    fn app(client: Arc<Client>) -> App {
         let options = Options {
             store: PathBuf::new(),
             socket: PathBuf::new(),
@@ -3556,7 +3585,94 @@ mod tests {
             sound: false,
             lookout: None,
         };
-        let mut app = App::new(client, "b", &json!({"name": "b"}), options);
+        App::new(client, "b", &json!({"name": "b"}), options)
+    }
+
+    fn turn_event(event: &str, turn: i64, data: Value) -> Value {
+        json!({"event": event, "bot": "b", "turn": turn, "data": data})
+    }
+
+    #[tokio::test]
+    async fn a_sent_prompt_stays_staged_until_its_turn_takes_it() {
+        let next = std::sync::atomic::AtomicI64::new(2);
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("submit") => {
+                json!({"turn": next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)})
+            }
+            _ => json!({"items": [{"node": 10, "item": {"type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "steer one"}]}}]}),
+        })
+        .await;
+        let mut app = app(client);
+        let staged = |app: &App| app.staged.iter().map(|(turn, _)| *turn).collect::<Vec<_>>();
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        // Sent while turn 1 runs: two steers, turns 2 and 3.
+        for prompt in ["steer one", "steer two"] {
+            app.input = prompt.into();
+            app.submit().await;
+        }
+        assert_eq!(staged(&app), [2, 3]);
+        assert_eq!(app.staged_rows(80).len(), 2);
+        // Turn 1 takes in the first; its own turn ends as steered.
+        app.daemon(turn_event("turn_finished", 2, json!({"status": "steered"})))
+            .await;
+        app.daemon(turn_event("steered", 1, json!({"steer": 2, "node": 10})))
+            .await;
+        assert_eq!(staged(&app), [3]);
+        assert_eq!(app.running.as_ref().map(|r| r.turn), Some(1));
+        // Turn 1 ends before the second lands; that one starts its own turn.
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        assert_eq!(staged(&app), [3]);
+        app.daemon(turn_event("accepted", 3, json!({}))).await;
+        assert!(app.staged.is_empty());
+        // A prompt whose turn ends without starting is unstaged too.
+        app.input = "never ran".into();
+        app.submit().await;
+        app.daemon(turn_event(
+            "turn_finished",
+            4,
+            json!({"status": "interrupted"}),
+        ))
+        .await;
+        assert!(app.staged.is_empty());
+    }
+
+    #[tokio::test]
+    async fn on_reconnecting_only_prompts_still_waiting_stay_staged() {
+        let client = daemon_answering(|asked| match asked["op"].as_str() {
+            Some("turns") => json!({"turns": [
+                {"turn": 7, "status": "queued"},
+                {"turn": 6, "status": "running"},
+                {"turn": 5, "status": "steered"},
+            ]}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.staged = vec![
+            (5, "a".into()),
+            (6, "b".into()),
+            (7, "c".into()),
+            (8, "d".into()),
+        ];
+        app.unstage_landed().await;
+        assert_eq!(app.staged, [(7, "c".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_follows_its_reasoning_is_drawn_once() {
+        let client = daemon_with(json!({
+            "1": {"type": "reasoning", "summary": [{"type": "summary_text", "text": "**Reading**"}]},
+            "2": {"type": "message", "role": "assistant",
+                  "content": [{"type": "output_text", "text": "First line.\nSecond line."}]}
+        }))
+        .await;
+        let mut app = app(client);
         let event =
             |event: &str, data: Value| json!({"event": event, "bot": "b", "turn": 1, "data": data});
         app.daemon(event("accepted", json!({}))).await;
