@@ -24,6 +24,11 @@ const KEYS: [&str; 7] = [
 /// Where a project's threads work: each in its own worktree, or all in
 /// the project folder.
 pub const THREADS_IN: [&str; 2] = ["worktree", "project"];
+/// How a task that works apart from the project folder gets its own copy
+/// of it: a git worktree, or a sandfs copy (of the checkout as it is,
+/// uncommitted changes included, or of a folder outside git). The client's
+/// preference, not the project's, so any folder can use either.
+pub const COPIES: [&str; 2] = ["worktree", "sandfs"];
 
 /// A name that is also a bot-name prefix: the daemon's name characters,
 /// short enough that `NAME.lead` and its task names fit.
@@ -147,8 +152,13 @@ pub fn read(dir: &Path) -> Result<Value, String> {
 /// (--profile) cannot swap it: the one picked, else the lead's own, which
 /// its shell holds as AGENT_MODEL (and its effort as AGENT_EFFORT). A
 /// picked model goes in quoted, since a model id may hold characters a
-/// shell would act on.
-pub fn tasks_rule(model: Option<&str>, effort: Option<&str>, in_project: bool) -> String {
+/// shell would act on. `copies` is one of `COPIES`.
+pub fn tasks_rule(
+    model: Option<&str>,
+    effort: Option<&str>,
+    in_project: bool,
+    copies: &str,
+) -> String {
     let quote = |v: &str| format!("'{}'", v.replace('\'', r"'\''"));
     let flags = match model {
         Some(model) => format!(
@@ -158,21 +168,51 @@ pub fn tasks_rule(model: Option<&str>, effort: Option<&str>, in_project: bool) -
         ),
         None => r#"--model "$AGENT_MODEL" ${AGENT_EFFORT:+--effort "$AGENT_EFFORT"}"#.into(),
     };
-    let place = if in_project {
-        "Every task works in this folder, with no worktree of its own."
-    } else {
-        "When this folder is a git repository, a task that changes files works in its own worktree, so tasks do not collide."
+    let place = match (in_project, copies) {
+        (true, _) => "Every task works in this folder, with no worktree of its own.",
+        (false, "sandfs") => {
+            "Every task works in its own sandfs copy, git repository or not, so tasks do not collide: only you work in this folder."
+        }
+        (false, _) => {
+            "When this folder is a git repository, every task works in its own worktree, so tasks do not collide: only you work in this folder."
+        }
     };
     format!(
         "This project's tasks, as the person set them up: start every new task, in a role (--profile) or not, with {flags}. {place}"
     )
 }
 
-/// The task rule a project's file sets, as its coordinator was told it.
-pub fn rule(info: &Value) -> String {
+/// The task rule a project's file sets, with the client's `copies`, as
+/// its coordinator is told it.
+pub fn rule(info: &Value, copies: &str) -> String {
     tasks_rule(
         info["threads_model"].as_str(),
         info["threads_reasoning"].as_str(),
         info["threads_in"] == "project",
+        copies,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_rule_says_how_tasks_get_their_copies() {
+        let info =
+            json!({"threads_model": null, "threads_reasoning": null, "threads_in": "worktree"});
+        assert!(
+            rule(&info, "worktree")
+                .ends_with("every task works in its own worktree, so tasks do not collide: only you work in this folder.")
+        );
+        assert!(rule(&info, "sandfs").ends_with(
+            "Every task works in its own sandfs copy, git repository or not, so tasks do not collide: only you work in this folder."
+        ));
+        let shared =
+            json!({"threads_model": null, "threads_reasoning": null, "threads_in": "project"});
+        assert!(
+            rule(&shared, "sandfs")
+                .ends_with("Every task works in this folder, with no worktree of its own.")
+        );
+    }
 }

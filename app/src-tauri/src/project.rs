@@ -201,13 +201,14 @@ pub async fn create(
         picks.effort.as_deref()
     };
     let rule = if file {
-        agent_client::project::rule(&info)
+        agent_client::project::rule(&info, "worktree")
     } else {
         let t = picks.threads.as_ref();
         tasks_rule(
             t.and_then(|t| t.model.as_deref()),
             t.and_then(|t| t.effort.as_deref()),
             t.is_some_and(|t| t.in_project),
+            "worktree",
         )
     };
     let mut params = json!({
@@ -564,7 +565,7 @@ mod tests {
             create.get("effort").is_none(),
             "no effort picked sends none"
         );
-        assert!(create["instructions"].as_str().unwrap().ends_with(r#"with --model "$AGENT_MODEL" ${AGENT_EFFORT:+--effort "$AGENT_EFFORT"}. When this folder is a git repository, a task that changes files works in its own worktree, so tasks do not collide."#));
+        assert!(create["instructions"].as_str().unwrap().ends_with(r#"with --model "$AGENT_MODEL" ${AGENT_EFFORT:+--effort "$AGENT_EFFORT"}. When this folder is a git repository, every task works in its own worktree, so tasks do not collide: only you work in this folder."#));
         std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 
