@@ -753,7 +753,7 @@ class ApprovalCliTests(ModelFixture):
     def test_modes_are_validated_before_anything_is_created(self):
         # A judge that cannot start leaves no bot waiting on it.
         auto = self.agent('run', *self.common, '--new', '--bot', 'Bob', '--approval', 'auto', 'hi', check=False,
-                          env={'AGENT_APPROVER_JUDGE': 'nowhere/judge'})
+                          env={'AGENT_JUDGE': 'nowhere/judge'})
         self.assertEqual(auto.returncode, 1)
         self.assertIn('approver_start_failed', auto.stderr)
         full = self.agent('run', *self.common, '--new', '--bot', 'Bob', '--approve', 'shell', 'hi', check=False)
