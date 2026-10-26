@@ -8,10 +8,10 @@ Rex is the terminal multiplexer the person watches the work in. Each project has
 ## Where things go
 
 - An agent you start gets a tab of its own when its turn starts, without your doing anything.
-- A command of yours that belongs in a block (a dev server, a test watcher, a build or test run over 10 minutes, a log tail, a REPL) goes in one of its own with `run`, named for what it is (`dev-server`, `tests`), not a number:
+- A command of yours that belongs in a block (a dev server, a test watcher, a build or test run over 10 minutes, a log tail, a REPL) goes in one of its own with `split`, named for what it is (`dev-server`, `tests`), not a number:
 
-      SONNY_BIN run NAME -- COMMAND ARGS...            # below your own block
-      SONNY_BIN run NAME --window -- COMMAND ARGS...   # in a tab of its own
+      SONNY_BIN split NAME -- COMMAND ARGS...            # below your own block
+      SONNY_BIN split NAME --window -- COMMAND ARGS...   # in a tab of its own
 
   It starts in your current folder, through the person's login shell, and stays open after the command exits so it can be read. It prints JSON with the `block` ID; keep it. The block is labelled `YOUR-NAME/NAME`, so the person can see whose it is. Running the same NAME again replaces the old block. Pass what the command needs from your environment as arguments or with `env VAR=value COMMAND`.
 
@@ -30,7 +30,7 @@ Rex is the terminal multiplexer the person watches the work in. Each project has
 - Type into it and press Enter: `REX_BIN send -b ID 'text' && REX_BIN send-key -b ID enter` (a newline in the text is Ctrl-J to a full-screen program, not Enter)
 - Close it: `REX_BIN block close ID`
 
-To run on another machine, add `--rex-host HOST` to `run`, and put `-S HOST` right after the rex command for the rest; `REX_BIN hosts` lists the machines.
+To run on another machine, add `--rex-host HOST` to `split`, and put `-S HOST` right after the rex command for the rest; `REX_BIN hosts` lists the machines.
 
 ## Cleaning up
 
