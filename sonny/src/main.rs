@@ -88,22 +88,23 @@ struct Options {
     rex_host: Option<String>,
     /// Ring when work ends or needs the person.
     sound: bool,
-    /// The decision model that wakes the lead when its tasks need it;
-    /// `None` with `--lookout off`.
+    /// The decision model that wakes the lead when its tasks need it, or
+    /// `off`; `None` picks one (lookout::choose).
     lookout: Option<String>,
 }
 
 fn usage() -> String {
     "usage: sonny [--store PATH] [--socket PATH] [--model PROVIDER/MODEL] [--no-rex] [--rex-host HOST] [--no-sound]\n\
-     \x20      [--lookout openai-decisions/MODEL|typesafe/jev-*|off]\n\
+     \x20      [--lookout openai-decisions/MODEL|typesafe/jev-*|PROVIDER/MODEL|off]\n\
      \x20      [--copies worktree|sandfs] [--bot NAME [--new [--workspace DIR]]]\n\
      With no --bot, the folder's coordinator, made with --model the first time; its tasks\n\
      open in the project's Rex session. Type /status for the project's agents.\n\
      --copies (or /copies): how its tasks get their own copy, kept for every folder: git\n\
      worktrees (the default), or sandfs copies, which take uncommitted changes along and\n\
      work outside git too.\n\
-     The lookout wakes the lead when its tasks need it, judged by openai-decisions/gpt-6-luna\n\
-     unless --lookout names another judge or off."
+     The lookout wakes the lead when its tasks need it, judged by --lookout, else AGENT_JUDGE\n\
+     (as the approver is), else openai-decisions/gpt-6-luna with OPENAI_API_KEY, else the\n\
+     newest Haiku the lead's provider lists."
         .into()
 }
 
@@ -353,7 +354,7 @@ fn parse() -> Result<Options, String> {
     let (mut store, mut socket, mut bot, mut new, mut model, mut workspace) =
         (None, None, None, false, None, None);
     let (mut rex, mut rex_host, mut sound) = (true, None, true);
-    let mut lookout = Some(lookout::DEFAULT.to_owned());
+    let mut lookout = None;
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or_else(usage);
         match arg.as_str() {
@@ -366,7 +367,7 @@ fn parse() -> Result<Options, String> {
             "--no-rex" => rex = false,
             "--rex-host" => rex_host = Some(value()?),
             "--no-sound" => sound = false,
-            "--lookout" => lookout = Some(value()?).filter(|judge| judge != "off"),
+            "--lookout" => lookout = Some(value()?),
             "--copies" => {
                 let copies = value()?;
                 if !agent_client::project::COPIES.contains(&copies.as_str()) {
@@ -536,14 +537,15 @@ async fn run() -> Result<(), String> {
             Err(error) => app.notice = Some(format!("the lead's instructions: {error}")),
         }
     }
-    if let (Some(project), Some(judge), Some(dir)) = (
+    if let (Some(project), Some(dir), true) = (
         &project,
-        &options.lookout,
         moving
             .clone()
             .or(bot["workspace"].as_str().map(PathBuf::from)),
+        options.lookout.as_deref() != Some("off"),
     ) {
-        match lookout::Judge::parse(judge) {
+        let lead_model = bot["model"].as_str().unwrap_or_default();
+        match lookout::choose(&app.client, options.lookout.as_deref(), lead_model).await {
             Ok(judge) => lookout::spawn(
                 options.socket.clone(),
                 project.clone(),

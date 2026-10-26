@@ -168,7 +168,7 @@ fn parse(args: &[String]) -> Result<Options> {
         tag: None,
         reason: None,
         note: std::env::var_os("AGENT_APPROVER_NOTE").map(PathBuf::from),
-        judge: std::env::var("AGENT_APPROVER_JUDGE")
+        judge: std::env::var("AGENT_JUDGE")
             .ok()
             .filter(|judge| !judge.is_empty()),
         judge_url: None,
@@ -861,7 +861,7 @@ fn judge_key() -> Option<String> {
     std::env::var(JUDGE_KEY).ok().filter(|key| !key.is_empty())
 }
 
-/// Who judges for an approver: `--judge` or AGENT_APPROVER_JUDGE, then Jev
+/// Who judges for an approver: `--judge` or AGENT_JUDGE, then Jev
 /// when its key is set, then `model`.
 fn judge(options: &Options, model: Option<String>) -> Result<String> {
     options
@@ -873,7 +873,7 @@ fn judge(options: &Options, model: Option<String>) -> Result<String> {
             Error::with(
                 "judge_required",
                 format!(
-                    "auto needs a judge: pass --judge PROVIDER/MODEL, or set AGENT_APPROVER_JUDGE, {JUDGE_KEY}, or AGENT_MODEL"
+                    "auto needs a judge: pass --judge PROVIDER/MODEL, or set AGENT_JUDGE, {JUDGE_KEY}, or AGENT_MODEL"
                 ),
             )
         })

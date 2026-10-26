@@ -105,7 +105,7 @@ identity is `bot_not_found`.
   [--note FILE] [--judge-url URL]` serves a gate tag (default `auto`) and
   has a judge decide every call waiting on it, one request per round,
   printing one JSON line per round. The judge is `--judge`, else
-  `AGENT_APPROVER_JUDGE`, else `typesafe/jev-latest` when `TYPESAFE_API_KEY`
+  `AGENT_JUDGE`, else `typesafe/jev-latest` when `TYPESAFE_API_KEY`
   is set, else `AGENT_MODEL`. Jev (`typesafe/jev-*`, key `TYPESAFE_API_KEY`)
   and OpenAI's Decisions API (`openai-decisions/MODEL`, key
   `OPENAI_API_KEY`) are called on their own APIs, at `--judge-url` when
