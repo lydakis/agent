@@ -20,6 +20,8 @@ def average(values):
 
 Nothing else in the folder needed touching."""
 
+# Ids are unique per request: a steer restarts the script, and a turn keys its
+# calls by id.
 def call(name, call_id, **arguments):
     return {'type': 'function_call', 'name': name, 'call_id': call_id, 'arguments': json.dumps(arguments)}
 
@@ -35,20 +37,20 @@ class Model(http.server.BaseHTTPRequestHandler):
         lead = '# Role: coordinator' in request.get('instructions', '')
         if lead and step == 0:
             text = "That needs a fix and a test run, so I'll hand it to a task."
-            output = [call('shell', 'l1', command='"$AGENT_BIN" run --detach --new --bot "${AGENT_BOT%.lead}.fix-avg" '
+            output = [call('shell', f'l1-{len(items)}', command='"$AGENT_BIN" run --detach --new --bot "${AGENT_BOT%.lead}.fix-avg" '
                            '--model "$AGENT_MODEL" -- "Fix the failing test"')]
         elif lead:
             text = ('Started `fix-avg`. It has its own window in Rex, '
                     'so you can watch it or step in there.')
         elif step == 0:
             text = "I'll run the tests first to see what fails."
-            output = [call('shell', 's1', command='python3 test_calc.py')]
+            output = [call('shell', f's1-{len(items)}', command='python3 test_calc.py')]
         elif step == 1:
             text = 'The average divides by one too few. Fixing it.'
-            output = [call('edit', 'e1', path='calc.py', old='    return sum(values) / (len(values) - 1)\n',
+            output = [call('edit', f'e1-{len(items)}', path='calc.py', old='    return sum(values) / (len(values) - 1)\n',
                            new='    return sum(values) / len(values)\n')]
         elif step == 2:
-            output = [call('shell', 's2', command='python3 test_calc.py')]
+            output = [call('shell', f's2-{len(items)}', command='python3 test_calc.py')]
         else:
             text = SUMMARY
         if text:
