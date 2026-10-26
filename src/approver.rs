@@ -1438,7 +1438,8 @@ mod tests {
     fn text_the_daemon_cut_ends_on_a_whole_word() {
         let password = ["Zq8vK2", "mX9pL4", "tR7wY3nB"].concat();
         // Cut before the `@host` that marks a URL's password.
-        let cut = json!({"text":format!("deploy with https://ci:{password}"),"truncated":true});
+        let url = ["https://ci", ":", &password].concat();
+        let cut = json!({"text":format!("deploy with {url}"),"truncated":true});
         assert_eq!(prompt_text(&cut), "deploy with");
         let whole = json!({"text":"deploy now"});
         assert_eq!(prompt_text(&whole), "deploy now");
