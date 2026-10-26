@@ -4,6 +4,8 @@ A terminal client for the daemon, beside the app, that lays its work out in
 Rex. It speaks the daemon's socket protocol through `agent-client`, like the
 app; nothing in the daemon or CLI knows it exists.
 
+    brew install lydakis/agent/sonny         # Sonny, with a daemon of its own version
+
     sonny                                    # this folder's coordinator, <project>.lead
     sonny --model PROVIDER/MODEL             # the same, making the project the first time
     sonny --bot NAME                         # any one bot

@@ -76,14 +76,16 @@ jobs:
           gh api "repos/lydakis/agent/releases/tags/$RELEASE_TAG" > "$RUNNER_TEMP/release.json"
           gh release download "$RELEASE_TAG" --repo lydakis/agent \
             --pattern agent.rb --pattern checksums.txt --pattern source-commit.txt \
-            --pattern "Agent_${RELEASE_TAG#v}_universal.zip" --dir "$RUNNER_TEMP/release"
+            --pattern "Agent_${RELEASE_TAG#v}_universal.zip" \
+            --pattern sonny.rb --pattern "sonny-${RELEASE_TAG#v}.tar.gz" --dir "$RUNNER_TEMP/release"
       - name: Verify the assets were built by the release workflow
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
           cd "$RUNNER_TEMP/release"
-          for asset in "Agent_${RELEASE_TAG#v}_universal.zip" agent.rb source-commit.txt; do
+          for asset in "Agent_${RELEASE_TAG#v}_universal.zip" agent.rb \
+            "sonny-${RELEASE_TAG#v}.tar.gz" sonny.rb source-commit.txt; do
             gh attestation verify "$asset" --repo lydakis/agent \
               --signer-workflow lydakis/agent/.github/workflows/release.yml \
               --deny-self-hosted-runners
@@ -109,8 +111,16 @@ jobs:
           if [ -f "$RUNNER_TEMP/tap-update.json" ]; then
             echo 'changed=true' >> "$GITHUB_OUTPUT"
           fi
+          python3 app/release/prepare_homebrew_update.py --kind formula "$RELEASE_TAG" \
+            "$RUNNER_TEMP/release.json" "$RUNNER_TEMP/release" \
+            tap/Formula/sonny.rb "$RUNNER_TEMP/tap-formula.json" \
+            --commit "$RELEASE_COMMIT" \
+            --generator release-source/app/release/homebrew_formula.py
+          if [ -f "$RUNNER_TEMP/tap-formula.json" ]; then
+            echo 'formula_changed=true' >> "$GITHUB_OUTPUT"
+          fi
       - name: Check publication credential is configured
-        if: steps.prepare.outputs.changed == 'true'
+        if: steps.prepare.outputs.changed == 'true' || steps.prepare.outputs.formula_changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
         run: |
@@ -129,7 +139,7 @@ jobs:
           ruby -c tap/Casks/agent.rb
           tap_parent="$(brew --repository)/Library/Taps/lydakis"
           mkdir -p "$tap_parent"
-          ln -s "$GITHUB_WORKSPACE/tap" "$tap_parent/homebrew-agent"
+          ln -sfn "$GITHUB_WORKSPACE/tap" "$tap_parent/homebrew-agent"
           brew style lydakis/agent/agent
           brew audit --cask --strict --online lydakis/agent/agent
           brew install --cask lydakis/agent/agent
@@ -138,6 +148,20 @@ jobs:
           test "$("$app/Contents/MacOS/agent" --version)" = "agent-runtime ${RELEASE_TAG#v}"
           brew uninstall --cask lydakis/agent/agent
           test ! -e "$app"
+      - name: Validate formula and installation
+        if: steps.prepare.outputs.formula_changed == 'true'
+        env:
+          HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ruby -c tap/Formula/sonny.rb
+          tap_parent="$(brew --repository)/Library/Taps/lydakis"
+          mkdir -p "$tap_parent"
+          ln -sfn "$GITHUB_WORKSPACE/tap" "$tap_parent/homebrew-agent"
+          brew style lydakis/agent/sonny
+          brew audit --formula --strict --online lydakis/agent/sonny
+          brew install --formula lydakis/agent/sonny
+          brew test lydakis/agent/sonny
+          brew uninstall --formula lydakis/agent/sonny
       - name: Publish validated cask
         if: steps.prepare.outputs.changed == 'true'
         env:
@@ -145,3 +169,10 @@ jobs:
         run: |
           gh api --method PUT repos/lydakis/homebrew-agent/contents/Casks/agent.rb \
             --input "$RUNNER_TEMP/tap-update.json" --jq .commit.html_url
+      - name: Publish validated formula
+        if: steps.prepare.outputs.formula_changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+        run: |
+          gh api --method PUT repos/lydakis/homebrew-agent/contents/Formula/sonny.rb \
+            --input "$RUNNER_TEMP/tap-formula.json" --jq .commit.html_url

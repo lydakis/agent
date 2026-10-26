@@ -90,7 +90,8 @@ class ReleaseWorkflowTest(unittest.TestCase):
 
     def commit(self, version, app_version=None):
         for manifest, value in [("Cargo.toml", version),
-                                ("app/src-tauri/Cargo.toml", app_version or version)]:
+                                ("app/src-tauri/Cargo.toml", app_version or version),
+                                ("sonny/Cargo.toml", version)]:
             path = self.root / manifest
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(f'[package]\nname = "x"\nversion = "{value}"\n\n[dependencies]\n')

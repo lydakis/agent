@@ -10,14 +10,27 @@ import subprocess
 import sys
 import tempfile
 
-from homebrew_cask import archive_name, render_cask
+import homebrew_cask
+import homebrew_formula
 
 
 STABLE_VERSION = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
 
+# What the tap gets from a release: the app's cask and Sonny's formula,
+# each with its archive, the file the release carries, its renderer, and
+# where the tap's current file says its version.
+KINDS = {
+    "cask": ("agent", homebrew_cask.archive_name, "agent.rb", homebrew_cask.render_cask,
+             r'^  version "(' + STABLE_VERSION + r')"$'),
+    "formula": ("sonny", homebrew_formula.archive_name, "sonny.rb",
+                homebrew_formula.render_formula,
+                r'/sonny-(' + STABLE_VERSION + r')\.tar\.gz"$'),
+}
+
 
 def prepare_update(tag: str, metadata: Path, assets: Path, current: Path,
-                   *, commit: str, generator: Path | None = None):
+                   *, commit: str, generator: Path | None = None, kind: str = "cask"):
+    name, archive_name, published, render, current_version = KINDS[kind]
     match = re.fullmatch("v" + STABLE_VERSION, tag)
     if not match:
         raise ValueError("expected a stable tag such as v0.1.0")
@@ -34,7 +47,7 @@ def prepare_update(tag: str, metadata: Path, assets: Path, current: Path,
             raise ValueError("malformed or duplicate checksum entry")
         checksums[entry[2]] = entry[1]
     archive = assets / archive_name(version)
-    cask_path = assets / "agent.rb"
+    cask_path = assets / published
     source = assets / "source-commit.txt"
     for path in [archive, cask_path, source]:
         if checksums.get(path.name) != hashlib.sha256(path.read_bytes()).hexdigest():
@@ -43,28 +56,27 @@ def prepare_update(tag: str, metadata: Path, assets: Path, current: Path,
     # the tag's current commit built.
     if not re.fullmatch(r"[0-9a-f]{40}", commit) or source.read_text() != commit + "\n":
         raise ValueError("release assets were not built from the tag's commit")
-    cask = render_cask(version, archive).encode()
+    cask = render(version, archive).encode()
     expected_release_cask = cask
     if generator is not None:
         with tempfile.TemporaryDirectory() as directory:
-            expected = Path(directory) / "agent.rb"
+            expected = Path(directory) / published
             subprocess.run([sys.executable, str(generator), version,
                             str(archive), str(expected)], check=True)
             expected_release_cask = expected.read_bytes()
     if cask_path.read_bytes() != expected_release_cask:
-        raise ValueError("release cask does not match the generated cask for this archive")
+        raise ValueError(f"release {published} does not match the generated {kind} for this archive")
 
     request = {
-        "message": f"Update agent to {version}",
+        "message": f"Update {name} to {version}",
         "branch": "main",
         "content": base64.b64encode(cask).decode(),
     }
     if current.exists():
         previous = current.read_bytes()
-        versions = re.findall(r'^  version "(' + STABLE_VERSION + r')"$',
-                              previous.decode(), re.MULTILINE)
+        versions = re.findall(current_version, previous.decode(), re.MULTILINE)
         if len(versions) != 1:
-            raise ValueError("current cask must have one stable version")
+            raise ValueError(f"current {published} must have one stable version")
         previous_version = tuple(map(int, versions[0][1:]))
         next_version = tuple(map(int, match.groups()))
         if previous_version > next_version or previous == cask:
@@ -91,11 +103,14 @@ def main():
                         help="the commit the release tag resolves to now")
     parser.add_argument("--generator", type=Path,
                         help="release tag's generator, used to verify immutable assets")
+    parser.add_argument("--kind", choices=sorted(KINDS), default="cask",
+                        help="the app's cask or Sonny's formula")
     args = parser.parse_args()
     args.request.unlink(missing_ok=True)
     try:
         request = prepare_update(args.tag, args.metadata, args.assets, args.current,
-                                 commit=args.commit, generator=args.generator)
+                                 commit=args.commit, generator=args.generator,
+                                 kind=args.kind)
         if request is not None:
             args.request.write_text(json.dumps(request))
         else:
