@@ -360,17 +360,19 @@ async fn run() -> Result<(), String> {
             (lead.bot, Some(lead.project))
         }
     };
-    let bot = client
-        .request("inspect", json!({"bot": name}))
-        .await
-        .map_err(|e| e.to_string())?;
     // Everything after now arrives live; history is read from the bot's
-    // items instead of replayed events, so the replay is skipped.
+    // items instead of replayed events, so the replay is skipped. The bot
+    // is read after that, so a turn that ended during the replay is seen
+    // as ended.
     client
         .request("follow", json!({"bot": name, "after": 0}))
         .await
         .map_err(|e| e.to_string())?;
     caught_up(&mut events).await;
+    let bot = client
+        .request("inspect", json!({"bot": name}))
+        .await
+        .map_err(|e| e.to_string())?;
 
     enable_raw_mode().map_err(|e| e.to_string())?;
     term::detect();
@@ -1381,6 +1383,25 @@ impl App {
         items
     }
 
+    /// The arguments of call `id`, read from the bot's newest items.
+    async fn call_arguments(&self, id: &str) -> Option<Value> {
+        let page = self
+            .client
+            .request("history_nodes", json!({"bot": self.bot, "limit": 32}))
+            .await
+            .ok()?;
+        let nodes: Vec<i64> = page["nodes"]
+            .as_array()?
+            .iter()
+            .filter_map(|n| n["node"].as_i64())
+            .collect();
+        let items = self.items(&nodes).await;
+        let call = items
+            .iter()
+            .find(|item| item["type"] == "function_call" && item["call_id"] == id)?;
+        serde_json::from_str(call["arguments"].as_str()?).ok()
+    }
+
     /// The bot's latest items, written as the transcript would have shown them.
     async fn history(&mut self) {
         self.history_after(0).await;
@@ -1659,20 +1680,22 @@ impl App {
                 self.said.clear();
                 self.end_live();
                 let name = data["name"].as_str().unwrap_or("tool").to_owned();
-                let arguments = data["arguments"]
-                    .as_str()
-                    .and_then(|a| serde_json::from_str(a).ok())
-                    .unwrap_or(Value::Null);
+                let id = data["call_id"].as_str().unwrap_or("");
+                // A long call's event carries a preview; the call is kept whole.
+                let arguments = match data["arguments_truncated"] == true {
+                    true => self.call_arguments(id).await,
+                    false => data["arguments"]
+                        .as_str()
+                        .and_then(|a| serde_json::from_str(a).ok()),
+                }
+                .unwrap_or(Value::Null);
                 if let Some(running) = &mut self.running {
                     running.phase = match (name.as_str(), arguments["command"].as_str()) {
                         ("shell", Some(command)) => format!("Running {}", first_line(command)),
                         _ => format!("Calling {name}"),
                     };
                 }
-                self.calls.insert(
-                    data["call_id"].as_str().unwrap_or("").to_owned(),
-                    (name, arguments),
-                );
+                self.calls.insert(id.to_owned(), (name, arguments));
             }
             "tool_completed" => {
                 let id = data["call_id"].as_str().unwrap_or("");
