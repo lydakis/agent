@@ -10597,6 +10597,7 @@ fn instructions_are_replaced_and_a_fork_keys_its_own_cache_after() {
     let (made, _) = db.create("Ann", None, binding()).unwrap();
     let (fork, _) = db.fork("Ann", "Ben", Fork::default()).unwrap();
     assert_eq!(fork.cache_bot(), made.bot_id);
+    db.set_thinking("Ben", 7, Strip::from(3), 0).unwrap();
     // The same text again changes nothing.
     assert!(!db.set_instructions("Ben", None, "test").unwrap());
     assert!(
@@ -10606,6 +10607,8 @@ fn instructions_are_replaced_and_a_fork_keys_its_own_cache_after() {
     let after = db.inspect("Ben").unwrap();
     assert_eq!(after.instructions, "new rules");
     assert_eq!(after.cache_bot(), fork.bot_id);
+    // Thinking bound under the old instructions is withheld from now on.
+    assert_eq!(after.thinking_prefix, None);
     assert_eq!(db.inspect("Ann").unwrap().instructions, "test");
     // Another identity under the name is refused.
     let refused = db
