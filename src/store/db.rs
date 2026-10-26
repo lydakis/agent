@@ -5460,7 +5460,8 @@ impl Database {
     /// calls were kept has no name and is left out.
     fn refused(&self, turn: i64, left: &mut usize) -> Result<Vec<Value>> {
         let mut statement = self.conn.prepare_cached(
-            "SELECT json_extract(data,'$.name'),json_extract(data,'$.arguments')
+            "SELECT json_extract(data,'$.name'),json_extract(data,'$.arguments'),
+                json_extract(data,'$.arguments_truncated')
              FROM events WHERE turn=? AND kind='tool_completed' AND json_extract(data,'$.denied')
                AND json_extract(data,'$.name') IS NOT NULL ORDER BY id",
         )?;
@@ -5473,7 +5474,9 @@ impl Database {
             *left -= Self::PROMPTS_ENTRY;
             let mut arguments: String = r.get::<_, Option<String>>(1)?.unwrap_or_default();
             let mut entry = json!({"name":r.get::<_, String>(0)?});
-            if cut(&mut arguments, left) {
+            // Cut once already, at the preview, or now at the budget.
+            let previewed = r.get::<_, Option<bool>>(2)? == Some(true);
+            if cut(&mut arguments, left) || previewed {
                 entry["arguments_truncated"] = json!(true);
             }
             entry["arguments"] = json!(arguments);

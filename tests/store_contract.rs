@@ -10791,6 +10791,28 @@ fn a_refused_call_is_read_with_its_turn_and_beside_it_later() {
             .len(),
         5
     );
+    // A call past its preview is marked cut, as a started call's is.
+    let (item, call) = shell_call("fc_2", "s2", &"x".repeat(4096));
+    db.append(next, vec![item], std::slice::from_ref(&call), None)
+        .unwrap();
+    db.answer(Decision {
+        bot: "Bob",
+        turn: next,
+        call_id: "s2",
+        request: 1,
+        tag: None,
+        allow: false,
+        reason: Some("no"),
+        by: Some("test"),
+    })
+    .unwrap();
+    db.approval_start(next, &call, 0).unwrap();
+    let previewed = db.prompts("Bob", next, 64 * 1024).unwrap();
+    assert_eq!(previewed["refused"][0]["arguments_truncated"], true);
+    assert_eq!(
+        previewed["refused"][0]["arguments"].as_str().unwrap().len(),
+        2048
+    );
 }
 
 #[test]

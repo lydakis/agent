@@ -474,6 +474,10 @@ pub struct Intent {
     /// Words the turn answers to were left out of `request` or cut. The
     /// judge is told; the newest are kept, so what is left out is older.
     pub request_cut: bool,
+    /// The newest of them were left out or cut before the state was built,
+    /// so a later word withdrawing consent may be missing: consent is not
+    /// asked.
+    pub newest_cut: bool,
     /// Calls this turn was refused.
     pub refused: Vec<Refused>,
     /// Earlier prompts of the bot, newest first. Context, never consent.
@@ -673,8 +677,9 @@ pub fn build(intent: &Intent, redactor: &Redactor) -> State {
         .collect();
     let cost = size(&allowed) + size(&json!({"already_allowed_cut":true}));
     // Without the calls already allowed, a request to do something once
-    // cannot be seen used up: consent is not asked.
-    let consent = used + cost <= STATE_TOKENS;
+    // cannot be seen used up, nor withdrawn without the newest words:
+    // consent is not asked.
+    let consent = !intent.newest_cut && used + cost <= STATE_TOKENS;
     if consent {
         used += cost;
         state.insert("already_allowed".into(), allowed);
@@ -1349,6 +1354,7 @@ mod tests {
             }],
             allowed_cut: false,
             request_cut: false,
+            newest_cut: false,
             refused: Vec::new(),
             earlier: vec![person("newer"), person("older")],
         };
@@ -1422,6 +1428,13 @@ mod tests {
         assert!(consent);
         assert_eq!(state["request_cut"], true);
         assert_eq!(state["already_allowed_cut"], true);
+        // The newest words left out may withdraw it: consent is not asked.
+        intent.newest_cut = true;
+        let State::Built { consent, .. } = build(&intent, &redactor) else {
+            panic!()
+        };
+        assert!(!consent);
+        intent.newest_cut = false;
         // Calls refused, this turn or an earlier one, are shown with the
         // words, so a go-ahead can be read as asking for them.
         let push = Refused {

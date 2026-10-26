@@ -741,7 +741,8 @@ would allow is doubted as "not reviewed whole" (step 4: asked of the
 person when one can answer, else denied), as is a risky one. A long
 write or edit itself is judged by its path and what is shown, since what
 it writes runs only when a later call runs it (until 2026-10-26 it was
-doubted too, which stopped generated files and fixtures). So
+doubted too, which stopped generated files and fixtures); a call in the
+same round that names the file it writes is doubted in its place. So
 are the already allowed shell and caller-registered calls, since a
 one-time request is used up by a call that did it and a deploy past a
 preview's 2,048 characters would hide that; an allowed `write` or `edit`
@@ -750,7 +751,9 @@ consent is about. If the words do not all fit, the newest are sent and the older
 (the newest cut to its start and end if it alone does not fit), with
 `request_cut: true`, and consent is still counted on what is shown (until
 2026-10-26 it was not, since a word left out may be the one that withdrew
-it; the newest are the ones kept). Text the daemon cut at the read's budget ends
+it; the newest are the ones kept). The daemon's `prompts` read keeps a
+turn's earliest words instead, so when it left steers out or cut one,
+the newest may be missing and consent is not counted. Text the daemon cut at the read's budget ends
 at its last whole word, so the redactor never sees a secret without what
 marks it (a URL's password cut before its `@host`). `prompts` gives the calls their own budget, so
 words that fill the read still leave the calls that name the files the
