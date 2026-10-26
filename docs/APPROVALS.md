@@ -490,7 +490,8 @@ so only one instance runs at a time, and answers in layers:
    the approval channel itself, answering or listing approvals, creating
    a bot without its gates, or reading or writing the daemon's database
    or socket other than through `agent`? The memory script
-   `~/.agent/memory` and task worktrees under `~/.agent/worktrees` are
+   `~/.agent/memory` and task folders (worktrees under
+   `~/.agent/worktrees`, sandfs copies under `~/.agent/tasks`) are
    named as not the channel: the earlier wording ("store") denied every
    call under `~/.agent`, so no bot could save memory in `auto`. A high
    answer is denied whatever the prompt says. With no rules this question replaces the earlier draft's

@@ -937,7 +937,7 @@ daemon learns nothing about projects; everything here is client work.
   model and tools apply when the project names none. The shipped text
   says: the coordinator makes a small, quick change itself (a few lines it
   can check at a glance) and sends work in an area an existing task owns to
-  that task with `--delivery queue`; a new task that changes files, named with the
+  that task with `--delivery queue`; every new task, one that only reads too, named with the
   project's prefix so projects do not collide, gets
   `git worktree add -b agent/NAME ~/.agent/worktrees/NAME HEAD`, the
   folder's `.agents/setup` run inside it, and `agent run --new --agents
@@ -946,7 +946,16 @@ daemon learns nothing about projects; everything here is client work.
   keeps that folder for later messages. The text also says the worktree
   starts at the last commit, that a failed setup, or a start that left no
   bot, removes the worktree and branch,
-  and that without git every task works in the project folder. The daemon only runs a
+  and that without git every task works in the project folder. A client
+  may tell the coordinator its tasks get sandfs copies instead (Sonny's
+  `--copies sandfs` or `/copies`, kept in `~/.agent/sonny/settings.json`;
+  the app always says worktrees): the text then gives each task `sandfs mount "git:<repo
+  top>" ~/.agent/tasks/NAME --uncommitted --branch agent/NAME`, whose
+  commits come back with `git push origin agent/NAME`, or outside git
+  `sandfs mount "$PWD" ~/.agent/tasks/NAME`, whose changes come back with
+  `sandfs changes NAME --copy-to "$PWD"`. A copy stays as long as its task,
+  as a worktree does; `sandfs rm --unmount NAME` removes one after a failed
+  setup or start. The daemon only runs a
   turn where the bot is, or where a message moves it. A bot in a
   linked worktree shows its branch after its name in the head, read once
   from the worktree's files when the head is first drawn.

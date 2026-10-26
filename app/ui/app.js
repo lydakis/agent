@@ -2271,7 +2271,7 @@ async function openProjectSheet() {
 }
 function renderProjectSheet() {
   const opt = (v, l) => `<button type="button" class="opt${np.in === v ? ' on' : ''}" data-act="np-in" data-v="${v}" aria-pressed="${np.in === v}">${l}</button>`;
-  $('np-in').innerHTML = `${opt('worktree', 'Own worktree')}${opt('project', 'Project folder')}<span class="hint">${np.in === 'worktree' ? 'Threads that change files each get a git worktree of their own.' : 'Every thread works in the project folder.'}</span>`;
+  $('np-in').innerHTML = `${opt('worktree', 'Own worktree')}${opt('project', 'Project folder')}<span class="hint">${np.in === 'worktree' ? 'Each thread gets a git worktree of its own; only the lead works in the folder.' : 'Every thread works in the project folder.'}</span>`;
   projectReady();
 }
 // A folder is all Create needs: one that is already a project keeps its own settings, and a new one

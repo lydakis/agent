@@ -8,11 +8,17 @@ use std::path::PathBuf;
 pub struct Settings {
     /// Whether finished and waiting work rings. Notifications show either way.
     pub chime: bool,
+    /// How a lead's tasks get their own copy of its folder, one of
+    /// `agent_client::project::COPIES`: git worktrees, or sandfs copies.
+    pub copies: String,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { chime: true }
+        Settings {
+            chime: true,
+            copies: "worktree".into(),
+        }
     }
 }
 
@@ -32,6 +38,10 @@ impl Settings {
         let defaults = Settings::default();
         Settings {
             chime: saved["chime"].as_bool().unwrap_or(defaults.chime),
+            copies: saved["copies"]
+                .as_str()
+                .filter(|c| agent_client::project::COPIES.contains(c))
+                .map_or(defaults.copies, str::to_owned),
         }
     }
 
@@ -40,8 +50,9 @@ impl Settings {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
-        let text = serde_json::to_string_pretty(&json!({"chime": self.chime}))
-            .map_err(|e| e.to_string())?;
+        let text =
+            serde_json::to_string_pretty(&json!({"chime": self.chime, "copies": self.copies}))
+                .map_err(|e| e.to_string())?;
         std::fs::write(&path, text + "\n").map_err(|e| format!("{}: {e}", path.display()))
     }
 }
@@ -55,5 +66,13 @@ mod tests {
         assert_eq!(Settings::from(&json!({})), Settings::default());
         assert!(!Settings::from(&json!({"chime": false})).chime);
         assert!(Settings::from(&json!({"chime": "no"})).chime);
+        assert_eq!(
+            Settings::from(&json!({"copies": "sandfs"})).copies,
+            "sandfs"
+        );
+        assert_eq!(
+            Settings::from(&json!({"copies": "rsync"})).copies,
+            "worktree"
+        );
     }
 }

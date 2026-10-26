@@ -40,6 +40,11 @@ commands:
   nothing serves it), `ask`, you, or `full`, none. Tasks the lead makes keep
   the gate it had.
 - `/status` shows the project's agents, and its running Errand jobs.
+- `/copies` (or `--copies worktree|sandfs`) picks how the lead's tasks get
+  their own copy of the folder: git worktrees (the default), or
+  [sandfs](https://github.com/lydakis/sandfs) copies, which take the
+  folder's uncommitted changes along, cost no disk until written, and work
+  outside git too. Every task gets one; only the lead works in the folder.
 - `/copy` puts the last reply on the clipboard; `/open` opens the last
   HTML page in a browser; `/sound` turns the chime off or on; `/quit`
   leaves the agents working.

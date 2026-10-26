@@ -93,9 +93,12 @@ struct Options {
 fn usage() -> String {
     "usage: sonny [--store PATH] [--socket PATH] [--model PROVIDER/MODEL] [--no-rex] [--rex-host HOST] [--no-sound]\n\
      \x20      [--lookout openai-decisions/MODEL|typesafe/jev-*|off]\n\
-     \x20      [--bot NAME [--new [--workspace DIR]]]\n\
+     \x20      [--copies worktree|sandfs] [--bot NAME [--new [--workspace DIR]]]\n\
      With no --bot, the folder's coordinator, made with --model the first time; its tasks\n\
      open in the project's Rex session. Type /status for the project's agents.\n\
+     --copies (or /copies): how its tasks get their own copy, kept for every folder: git\n\
+     worktrees (the default), or sandfs copies, which take uncommitted changes along and\n\
+     work outside git too.\n\
      The lookout wakes the lead when its tasks need it, judged by openai-decisions/gpt-6-luna\n\
      unless --lookout names another judge or off."
         .into()
@@ -315,6 +318,15 @@ fn parse() -> Result<Options, String> {
             "--rex-host" => rex_host = Some(value()?),
             "--no-sound" => sound = false,
             "--lookout" => lookout = Some(value()?).filter(|judge| judge != "off"),
+            "--copies" => {
+                let copies = value()?;
+                if !agent_client::project::COPIES.contains(&copies.as_str()) {
+                    return Err(usage());
+                }
+                let mut settings = settings::Settings::load();
+                settings.copies = copies;
+                settings.save()?;
+            }
             _ => return Err(usage()),
         }
     }
@@ -588,12 +600,13 @@ struct Running {
 
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, unlisted.
-const COMMANDS: [(&str, &str); 8] = [
+const COMMANDS: [(&str, &str); 9] = [
     ("/model", "the model and effort"),
     ("/approvals", "whether calls wait for a verdict"),
     ("/instructions", "the lead's, from its folder again"),
     ("/status", "this project's agents"),
     ("/sound", "the chime when work ends, on or off"),
+    ("/copies", "tasks in git worktrees or sandfs copies"),
     ("/copy", "the last reply, as Markdown"),
     ("/open", "the last HTML page, in your browser"),
     ("/quit", "the agents keep working"),
@@ -2513,6 +2526,56 @@ impl App {
                 }
                 Err(error) => error,
             });
+            return;
+        }
+        if prompt == "/copies" {
+            self.input.clear();
+            let mut settings = settings::Settings::load();
+            settings.copies = match settings.copies.as_str() {
+                "sandfs" => "worktree",
+                _ => "sandfs",
+            }
+            .into();
+            if let Err(error) = settings.save() {
+                self.notice = Some(error);
+                return;
+            }
+            self.notice = Some(match settings.copies.as_str() {
+                "sandfs" => "tasks get sandfs copies".into(),
+                _ => "tasks get git worktrees".into(),
+            });
+            // The lead is told now when idle, else once its turn ends,
+            // unless its instructions were set some other way.
+            if self.project.is_some() {
+                let bot = match self
+                    .client
+                    .request("inspect", json!({"bot": self.bot}))
+                    .await
+                {
+                    Ok(bot) => bot,
+                    Err(error) => {
+                        self.notice = Some(format!("the lead's instructions: {error}"));
+                        return;
+                    }
+                };
+                let dir = std::path::Path::new(&self.workspace);
+                match project::review(dir, &bot, &self.lead, false) {
+                    Ok(project::Instructions::Stale(text)) => {
+                        self.instruct = Some(text);
+                        self.configure().await;
+                    }
+                    // A toggle back before the turn ended: nothing to send.
+                    Ok(project::Instructions::Current) => self.instruct = None,
+                    Ok(project::Instructions::Kept) => {
+                        self.notice = Some(
+                            "the lead keeps instructions set outside its folder's files; \
+                             /instructions takes the folder's"
+                                .into(),
+                        )
+                    }
+                    Err(error) => self.notice = Some(format!("the lead's instructions: {error}")),
+                }
+            }
             return;
         }
         if prompt == "/quit" {
