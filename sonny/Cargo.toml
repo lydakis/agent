@@ -17,6 +17,8 @@ base64 = "0.22"
 # a pane that narrows later does not re-wrap them.
 # Asks the terminal for its background (theme.rs).
 libc = "0.2"
+# The lookout asks its decision model over HTTPS (lookout.rs).
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream", "http2"] }
 ratatui = { version = "0.29", features = ["scrolling-regions"] }
 resvg = "0.45"
 serde_json = "1"

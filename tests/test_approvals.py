@@ -609,6 +609,18 @@ class PromptReadTests(ModelFixture):
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertEqual((self.path / 'seen').read_text(), f'unsetunset/{turn}')
 
+    def test_the_daemons_own_terminal_never_reaches_a_tool(self):
+        env = {**clean_env(), 'REX_SESSION': 'session:daemons', 'REX_BLOCK': 'block:daemons',
+               'TMUX': '/tmp/tmux-0/default,1,0', 'TMUX_PANE': '%0'}
+        client = Client(self.binary, self.path / 'state.sqlite', self.url, 'shell', env=env)
+        self.addCleanup(client.close)
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='a',
+                              prompt='shell:printf "${REX_SESSION-unset}${REX_BLOCK-unset}${TMUX-unset}${TMUX_PANE-unset}" > seen'
+                              )['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual((self.path / 'seen').read_text(), 'unset' * 4)
+
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class ApprovalCliTests(ModelFixture):
