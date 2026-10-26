@@ -17,6 +17,9 @@ pub struct Lead {
     pub bot: String,
     /// Made just now, for this folder.
     pub new: bool,
+    /// The folder it is brought back to: it was moved elsewhere, and the
+    /// next message it is sent moves it here.
+    pub moving: Option<PathBuf>,
 }
 
 /// The folder's own name reduced to name characters, as the app names a
@@ -215,6 +218,18 @@ fn with_model(text: &str, model: &str, effort: Option<&str>) -> String {
     out
 }
 
+/// Whether `dir` is in a project named `name`.
+fn same_name(dir: &Path, name: &str) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    let root = match agent_client::policy::project_root(dir) {
+        Ok(Some((_, root))) => root,
+        _ => dir.to_owned(),
+    };
+    default_name(&root).is_ok_and(|found| found == name)
+}
+
 /// The lead for `dir`, made first when the folder is not a project yet.
 pub async fn open(
     client: &Client,
@@ -225,30 +240,37 @@ pub async fn open(
     let mut dir = dir.canonicalize().map_err(|e| e.to_string())?;
     // Inside a project, wherever below its folder (or in a worktree of
     // it), its lead, which works in that folder: made there first when
-    // missing, and never one of the same name working elsewhere.
+    // missing, and brought back when moved.
     if let Some((_, root)) = agent_client::policy::project_root(&dir).map_err(|e| e.to_string())? {
         dir = root;
     }
     let project = default_name(&dir)?;
     let bot = format!("{project}.lead");
     if let Some(found) = find(client, &bot).await? {
-        if found["workspace"].as_str() == dir.to_str() {
-            return Ok(Lead {
-                project,
-                bot,
-                new: false,
-            });
+        let there = found["workspace"].as_str().unwrap_or("");
+        let moving = (there != dir.to_str().unwrap_or("")).then_some(dir);
+        // Another folder of the same name is its own project: its lead
+        // stays there. One moved anywhere else is still this folder's, and
+        // comes back with the next message, history and all.
+        if moving.is_some() && same_name(Path::new(there), &project) {
+            return Err(format!(
+                "project_exists: {bot} is the lead of {there}, a project of the same name; \
+                 name this one in .agents/project.toml or pass --bot"
+            ));
         }
-        return Err(format!(
-            "project_exists: {bot} works in {}; open sonny there or pass --bot",
-            found["workspace"].as_str().unwrap_or("another folder")
-        ));
+        return Ok(Lead {
+            project,
+            bot,
+            new: false,
+            moving,
+        });
     }
     create(client, &dir, socket, &bot, model).await?;
     Ok(Lead {
         project,
         bot,
         new: true,
+        moving: None,
     })
 }
 
@@ -352,6 +374,21 @@ async fn create(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lead_moved_away_is_told_from_a_folder_of_the_same_name() {
+        let base = std::env::temp_dir().join(format!("sonny-same-name-{}", std::process::id()));
+        let (one, two, other) = (base.join("a/shop"), base.join("b/shop"), base.join("tools"));
+        for dir in [&one, &two, &other] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        // shop.lead working in another shop belongs there; in tools, or in
+        // a folder gone since, it is this shop's, moved away.
+        assert!(same_name(&two, "shop"));
+        assert!(!same_name(&other, "shop"));
+        assert!(!same_name(&base.join("gone/shop"), "shop"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn leads_of_two_daemons_with_one_id_have_two_names() {
