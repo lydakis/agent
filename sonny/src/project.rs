@@ -66,17 +66,12 @@ pub async fn open(
     socket: &Path,
     model: Option<&str>,
 ) -> Result<Lead, String> {
-    let dir = dir.canonicalize().map_err(|e| e.to_string())?;
-    // Inside a project, its lead, wherever below the project's folder.
-    if let Some(project) = agent_client::policy::project(&dir).map_err(|e| e.to_string())? {
-        let bot = format!("{project}.lead");
-        if find(client, &bot).await?.is_some() {
-            return Ok(Lead {
-                project,
-                bot,
-                new: false,
-            });
-        }
+    let mut dir = dir.canonicalize().map_err(|e| e.to_string())?;
+    // Inside a project, wherever below its folder (or in a worktree of
+    // it), its lead, which works in that folder: made there first when
+    // missing, and never one of the same name working elsewhere.
+    if let Some((_, root)) = agent_client::policy::project_root(&dir).map_err(|e| e.to_string())? {
+        dir = root;
     }
     let project = default_name(&dir)?;
     let bot = format!("{project}.lead");

@@ -1389,8 +1389,8 @@ impl App {
         items
     }
 
-    /// The arguments of call `id`, read from the bot's newest items.
-    async fn call_arguments(&self, id: &str) -> Option<Value> {
+    /// Call `id`, its name and arguments, read from the bot's newest items.
+    async fn call(&self, id: &str) -> Option<(String, Value)> {
         let page = self
             .client
             .request("history_nodes", json!({"bot": self.bot, "limit": 32}))
@@ -1405,7 +1405,10 @@ impl App {
         let call = items
             .iter()
             .find(|item| item["type"] == "function_call" && item["call_id"] == id)?;
-        serde_json::from_str(call["arguments"].as_str()?).ok()
+        Some((
+            call["name"].as_str()?.to_owned(),
+            serde_json::from_str(call["arguments"].as_str()?).ok()?,
+        ))
     }
 
     /// The bot's latest items, written as the transcript would have shown them.
@@ -1413,26 +1416,34 @@ impl App {
         self.history_after(0).await;
     }
 
-    /// The bot's items after `after`, newest [`HISTORY_ITEMS`] at most,
-    /// drawn as they would have been live.
+    /// The bot's items after `after`, drawn as they would have been live:
+    /// the newest [`HISTORY_ITEMS`] on attaching (`after` 0), and every one
+    /// since on reconnecting.
     async fn history_after(&mut self, after: i64) {
-        let Ok(page) = self
-            .client
-            .request(
-                "history_nodes",
-                json!({"bot": self.bot, "limit": HISTORY_ITEMS}),
-            )
-            .await
-        else {
-            return;
-        };
-        let mut nodes: Vec<i64> = page["nodes"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|n| n["node"].as_i64())
-            .filter(|node| *node > after)
-            .collect();
+        // On attach the newest page; on reconnecting, every page back to
+        // the last node this window drew, so nothing missed is skipped.
+        let mut nodes: Vec<i64> = Vec::new();
+        let mut asked = json!({"bot": self.bot, "limit": HISTORY_ITEMS});
+        if after > 0 {
+            asked["min_node"] = json!(after + 1);
+        }
+        loop {
+            let Ok(page) = self.client.request("history_nodes", asked.clone()).await else {
+                return;
+            };
+            nodes.extend(
+                page["nodes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|n| n["node"].as_i64())
+                    .filter(|node| *node > after),
+            );
+            if after == 0 || page["next_from"].is_null() {
+                break;
+            }
+            asked["from"] = page["next_from"].clone();
+        }
         nodes.reverse();
         self.seen_node = nodes.last().copied().unwrap_or(self.seen_node);
         let mut calls: HashMap<String, (String, Value)> = HashMap::new();
@@ -1464,7 +1475,11 @@ impl App {
                     }
                     (Some("function_call_output"), _) => {
                         let id = item["call_id"].as_str().unwrap_or("");
-                        if let Some((name, arguments)) = calls.remove(id) {
+                        // A call this window kept before it lost the daemon
+                        // may end in what it reads on reconnecting.
+                        if let Some((name, arguments)) =
+                            calls.remove(id).or_else(|| self.calls.remove(id))
+                        {
                             let (output, failed) = output(&item);
                             let lines = transcript::tool(
                                 &name,
@@ -1689,7 +1704,7 @@ impl App {
                 let id = data["call_id"].as_str().unwrap_or("");
                 // A long call's event carries a preview; the call is kept whole.
                 let arguments = match data["arguments_truncated"] == true {
-                    true => self.call_arguments(id).await,
+                    true => self.call(id).await.map(|(_, arguments)| arguments),
                     false => data["arguments"]
                         .as_str()
                         .and_then(|a| serde_json::from_str(a).ok()),
@@ -1705,7 +1720,14 @@ impl App {
             }
             "tool_completed" => {
                 let id = data["call_id"].as_str().unwrap_or("");
-                let Some((name, arguments)) = self.calls.remove(id) else {
+                // A call denied before it started has no start to have
+                // kept it: it is read from the bot's items.
+                let call = match self.calls.remove(id) {
+                    Some(call) => Some(call),
+                    None if data["denied"] == true => self.call(id).await,
+                    None => None,
+                };
+                let Some((name, arguments)) = call else {
                     return;
                 };
                 let mut shown = (String::new(), data["failed"] == true);
@@ -2057,6 +2079,11 @@ impl App {
             .await;
         if let Err(error) = answered {
             self.notice = Some(error.to_string());
+        }
+        // A round with more calls waiting than one listing holds shows
+        // the rest once these are answered.
+        if self.approvals.is_empty() {
+            self.approvals_for(call["turn"].as_i64()).await;
         }
         if self.approvals.is_empty() {
             status_report("working", &self.bot);

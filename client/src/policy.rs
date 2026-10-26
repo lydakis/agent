@@ -435,7 +435,7 @@ fn memory_indexes_from(workspace: &Path, home: Option<&Path>) -> Result<Vec<Path
     };
     let root = home.join(".agents/memory");
     let mut found = vec![root.join("MEMORY.md")];
-    if let Some(name) = project_from(workspace, Some(home))? {
+    if let Some((name, _)) = project_from(workspace, Some(home))? {
         found.push(root.join("projects").join(name).join("MEMORY.md"));
     }
     Ok(found)
@@ -450,10 +450,16 @@ fn memory_indexes_from(workspace: &Path, home: Option<&Path>) -> Result<Vec<Path
 /// folder in one is looked up at the same place in the repository's main
 /// checkout first.
 pub fn project(dir: &Path) -> Result<Option<String>, Failure> {
+    Ok(project_from(dir, home().as_deref())?.map(|(name, _)| name))
+}
+
+/// The project `dir` is in, as [`project`] finds it, and the folder whose
+/// `.agents/project.toml` names it: the one its coordinator works in.
+pub fn project_root(dir: &Path) -> Result<Option<(String, PathBuf)>, Failure> {
     project_from(dir, home().as_deref())
 }
 
-fn project_from(dir: &Path, home: Option<&Path>) -> Result<Option<String>, Failure> {
+fn project_from(dir: &Path, home: Option<&Path>) -> Result<Option<(String, PathBuf)>, Failure> {
     let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     let home = home.map(|h| h.canonicalize().unwrap_or_else(|_| h.to_path_buf()));
     let main = main_checkout(&dir);
@@ -479,7 +485,9 @@ fn project_from(dir: &Path, home: Option<&Path>) -> Result<Option<String>, Failu
                 .parse()
                 .map_err(|e: toml::de::Error| unreadable(e.message().to_owned()))?;
             return match table.get("name") {
-                Some(toml::Value::String(name)) if project_name(name) => Ok(Some(name.clone())),
+                Some(toml::Value::String(name)) if project_name(name) => {
+                    Ok(Some((name.clone(), at.to_path_buf())))
+                }
                 _ => Err(unreadable(
                     "name must be 1-64 of A-Z a-z 0-9 - _ ., not starting or ending with .".into(),
                 )),
@@ -1121,8 +1129,8 @@ mod tests {
             None
         );
         assert_eq!(
-            project_from(&home, Some(&home)).unwrap().as_deref(),
-            Some("me")
+            project_from(&home, Some(&home)).unwrap(),
+            Some(("me".into(), home.canonicalize().unwrap()))
         );
         std::fs::write(repo.join("web/.agents/project.toml"), "name = \"../up\"\n").unwrap();
         let error = project(&repo.join("web")).unwrap_err();
