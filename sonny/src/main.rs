@@ -17,6 +17,7 @@ mod herdr;
 mod html;
 mod image;
 mod js;
+mod links;
 mod lookout;
 mod math;
 mod mermaid;
@@ -38,7 +39,7 @@ mod updates;
 use agent_client::{Client, Events};
 use ratatui::{
     Terminal, TerminalOptions, Viewport,
-    backend::CrosstermBackend,
+    backend::{Backend, CrosstermBackend},
     crossterm::{
         event::{
             self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
@@ -3013,9 +3014,22 @@ impl App {
                 .collect();
             // A row count fits a u16 only so far.
             for rows in lines.chunks(4096) {
+                let mut linked = Vec::new();
                 terminal.insert_before(rows.len() as u16, |buf| {
                     Paragraph::new(rows.to_vec()).render(buf.area, buf);
+                    linked = links::cells(buf);
                 })?;
+                // The rows sit just above the viewport now; those still on
+                // the screen get their addresses linked.
+                if !linked.is_empty() {
+                    let top = terminal.get_frame().area().y;
+                    let above = rows.len() as u16;
+                    let on_screen = linked.iter().filter_map(|(x, y, cell)| {
+                        (top + y).checked_sub(above).map(|y| (*x, y, cell))
+                    });
+                    terminal.backend_mut().draw(on_screen)?;
+                    Backend::flush(terminal.backend_mut())?;
+                }
             }
         }
         terminal.draw(|frame| {
