@@ -458,8 +458,8 @@ impl Judge {
             .send()
             .await
             .map_err(|e| match e.is_timeout() {
-                true => Failure::Check("the check timed out".into()),
-                false => Failure::Check("the check failed".into()),
+                true => Failure::Check("the check timed out".into(), String::new()),
+                false => Failure::Check("the check failed".into(), String::new()),
             })?;
         let status = response.status().as_u16();
         let reply: Value = response
@@ -473,7 +473,10 @@ impl Judge {
             return Err(Failure::Quota);
         }
         if !(200..300).contains(&status) {
-            return Err(Failure::Check(format!("the judge answered {status}")));
+            return Err(Failure::Check(
+                format!("the judge answered {status}"),
+                String::new(),
+            ));
         }
         let tokens = reply["usage"]["input_tokens"].as_u64().unwrap_or(0);
         let mut answers = Map::new();
@@ -484,7 +487,7 @@ impl Judge {
                     .map(|q| (q.id.to_owned(), json!({})))
                     .collect();
                 let read = agent_client::approver::decisions_answers(&reply, &Value::Object(asked))
-                    .map_err(|why| Failure::Check(why.into()))?;
+                    .map_err(|why| Failure::Check(why.into(), String::new()))?;
                 for (id, answer) in read.as_object().into_iter().flatten() {
                     answers.insert(id.clone(), answer["noul"].clone());
                 }
@@ -495,7 +498,10 @@ impl Judge {
                         .as_f64()
                         .filter(|p| (0.0..=1.0).contains(p))
                         .ok_or_else(|| {
-                            Failure::Check("the judge's answer missed a question".into())
+                            Failure::Check(
+                                "the judge's answer missed a question".into(),
+                                String::new(),
+                            )
                         })?;
                     answers.insert(q.id.to_owned(), json!(p));
                 }
@@ -507,8 +513,9 @@ impl Judge {
 
 #[derive(Debug)]
 enum Failure {
-    /// This check failed; its event waits for the next note.
-    Check(String),
+    /// This check failed, and why; its event, with the words read for it,
+    /// is checked again or waits for the next note.
+    Check(String, String),
     /// No check will succeed until the account is topped up.
     Quota,
     /// The same words were checked moments ago in another task, as a
@@ -739,7 +746,10 @@ async fn check(
     if asked.is_err() && seen.kind == Kind::Said {
         forget(recent, &text);
     }
-    let (answers, tokens) = asked?;
+    let (answers, tokens) = asked.map_err(|failure| match failure {
+        Failure::Check(why, _) => Failure::Check(why, text.clone()),
+        failure => failure,
+    })?;
     Ok(Checked {
         answers,
         tokens,
@@ -1152,8 +1162,13 @@ impl Lookout {
                 self.stopped = true;
             }
             // A failed check is tried once more, then told unchecked.
-            Err(Failure::Check(why)) => {
+            Err(Failure::Check(why, text)) => {
                 line["failed"] = json!(why);
+                // The words read for it are quoted if it is told unchecked.
+                let seen = Seen {
+                    text: if text.is_empty() { seen.text } else { text },
+                    ..seen
+                };
                 if self
                     .retried
                     .insert((seen.task.clone(), seen.turn, seen.kind))
@@ -1465,7 +1480,7 @@ pub async fn replay() -> Result<(), String> {
                     line["ms"] = json!(checked.ms);
                 }
                 Err(Failure::Quota) => return Err(format!("{}: out of quota", judge.name)),
-                Err(Failure::Check(why)) => line["failed"] = json!(why),
+                Err(Failure::Check(why, _)) => line["failed"] = json!(why),
                 Err(Failure::Duplicate) => line["skipped"] = json!("same words checked lately"),
             }
             writeln!(sink, "{line}").map_err(|e| e.to_string())?;
@@ -2057,13 +2072,17 @@ mod tests {
     fn a_failed_check_is_tried_again_then_told_unchecked() {
         let mut lookout = lookout();
         let seen = lookout.due_seen();
-        lookout.answered(seen.clone(), Err(Failure::Check("timeout".into())));
+        lookout.answered(
+            seen.clone(),
+            Err(Failure::Check("timeout".into(), "words".into())),
+        );
         assert_eq!(lookout.due.len(), 1);
         let again = lookout.due.pop().unwrap();
-        lookout.answered(again, Err(Failure::Check("timeout".into())));
+        lookout.answered(again, Err(Failure::Check("timeout".into(), "words".into())));
         assert!(lookout.due.is_empty());
         assert_eq!(lookout.held.len(), 1);
         assert!(note(&lookout.held, 0).contains("(not checked; look)"));
+        assert_eq!(lookout.held[0].seen.text, "words");
     }
 
     #[test]
