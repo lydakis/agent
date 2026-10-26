@@ -220,7 +220,7 @@ pub fn unified(text: &str, width: usize, most: usize) -> Option<Vec<Line<'static
             let mut ranges = header.split_whitespace();
             let start = |range: Option<&str>| -> usize {
                 range
-                    .and_then(|r| r[1..].split(',').next()?.parse().ok())
+                    .and_then(|r| r.strip_prefix(['-', '+'])?.split(',').next()?.parse().ok())
                     .unwrap_or(1)
             };
             let (old_start, new_start) = (start(ranges.next()), start(ranges.next()));
@@ -368,6 +368,11 @@ impl Hunk {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_malformed_hunk_header_is_drawn_not_a_crash() {
+        assert!(unified("--- a/f\n+++ b/f\n@@ \u{3b1} \u{3b2} @@\n x\n", 80, 10).is_some());
+    }
 
     fn text(lines: &[Line]) -> Vec<String> {
         lines
