@@ -143,14 +143,13 @@ impl Updates {
             Some("completed") | None => "idle",
             Some(status) => status,
         };
-        // Another lead under the name: the news was for the last one.
-        if name == self.lead
-            && self
-                .bots
-                .get(name)
-                .is_some_and(|had| had.id != record["bot_id"].as_i64())
+        // Another bot under the name: the news was for the last one.
+        if self
+            .bots
+            .get(name)
+            .is_some_and(|had| had.id != record["bot_id"].as_i64())
         {
-            self.forget();
+            self.gone(name);
         }
         self.bots.insert(
             name.to_owned(),
@@ -193,10 +192,7 @@ impl Updates {
             }
             "deleted" => {
                 self.bots.remove(name);
-                self.tasks.retain(|(task, _)| task != name);
-                if name == self.lead {
-                    self.forget();
-                }
+                self.gone(name);
             }
             "accepted" | "queued" => {
                 let Some(turn) = turn else { return };
@@ -456,6 +452,16 @@ impl Updates {
     pub fn forget(&mut self) {
         self.tasks.clear();
         self.forwarding.clear();
+    }
+
+    /// The bot under `name` is gone: drop its news, or all of it when it
+    /// was the lead.
+    fn gone(&mut self, name: &str) {
+        if name == self.lead {
+            return self.forget();
+        }
+        self.tasks.retain(|(task, _)| task != name);
+        self.forwarding.retain(|(task, _), _| task != name);
     }
 
     /// What was saved to or removed from the person's and the project's
@@ -949,6 +955,23 @@ mod tests {
             assert!(!updates.due(now), "{gone}");
             assert!(updates.take(now).unwrap().sent.is_empty());
         }
+    }
+
+    #[test]
+    fn a_new_task_under_the_name_does_not_inherit_the_last_ones_news() {
+        let now = Instant::now();
+        let mut updates = fleet();
+        turn(
+            &mut updates,
+            "shop.fix",
+            4,
+            json!({"from": {"bot": "shop.lead", "turn": 9}}),
+            "completed",
+        );
+        // Deleted and made again while Sonny was away: seated afresh.
+        updates.seat(&json!({"name": "shop.fix", "bot_id": 99, "status": "idle"}));
+        assert!(!updates.due(now));
+        assert!(updates.take(now).unwrap().sent.is_empty());
     }
 
     #[test]
