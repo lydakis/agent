@@ -1082,6 +1082,14 @@ impl Lookout {
         }
     }
 
+    /// Checks every approval still waiting, however long it has waited.
+    fn still_waiting(&mut self) {
+        for (since, _) in self.approvals.values_mut() {
+            *since = Instant::now() - APPROVAL_AFTER;
+        }
+        self.approvals_due();
+    }
+
     fn peers_of(&self, task: &str) -> Vec<String> {
         let mut peers: Vec<String> = self
             .lineage
@@ -1359,13 +1367,31 @@ pub async fn replay() -> Result<(), String> {
             events.extend(retained(&socket, &bot).await);
         }
         events.sort_by_key(|e| e["cursor"].as_i64().unwrap_or(0));
+        let mut waits: HashMap<(String, i64), i64> = HashMap::new();
         for event in &events {
             let before = lookout.due.len();
             lookout.event(event);
             let cursor = event["cursor"].as_i64().unwrap_or(0);
+            if let ("turn_waiting", Some(bot), Some(turn)) = (
+                event["event"].as_str().unwrap_or_default(),
+                event["bot"].as_str(),
+                event["turn"].as_i64(),
+            ) {
+                waits.entry((bot.to_owned(), turn)).or_insert(cursor);
+            }
             for seen in lookout.due.drain(before..) {
                 due.push((cursor, lead.to_owned(), workspace.clone(), seen));
             }
+        }
+        // Events carry no times, so only an approval still waiting when the
+        // history ends is known to be overdue; it is checked at its wait.
+        lookout.still_waiting();
+        for seen in lookout.due.drain(..) {
+            let cursor = waits
+                .get(&(seen.task.clone(), seen.turn))
+                .copied()
+                .unwrap_or(0);
+            due.push((cursor, lead.to_owned(), workspace.clone(), seen));
         }
     }
     // The newest checks across every lead, oldest first, so a lead's story
@@ -1720,6 +1746,30 @@ mod tests {
         assert_eq!(lookout.due.len(), 1);
         assert_eq!(lookout.due[0].kind, Kind::Said);
         assert_eq!(lookout.due[0].turn, 9);
+    }
+
+    #[test]
+    fn replay_checks_an_approval_still_waiting_at_the_end() {
+        let mut lookout = lookout();
+        lookout.event(&ev(
+            "calc.fix",
+            4,
+            "turn_waiting",
+            json!({"approval": true, "call_id": "call_1"}),
+        ));
+        lookout.event(&ev(
+            "calc.fix",
+            5,
+            "turn_waiting",
+            json!({"approval": true, "call_id": "call_2"}),
+        ));
+        lookout.event(&ev("calc.fix", 5, "tool_completed", json!({})));
+        lookout.still_waiting();
+        assert_eq!(lookout.due.len(), 1);
+        assert_eq!(lookout.due[0].kind, Kind::Waiting);
+        assert_eq!(lookout.due[0].turn, 4);
+        assert_eq!(lookout.due[0].call.as_deref(), Some("call_1"));
+        assert!(lookout.approvals.is_empty());
     }
 
     #[test]
