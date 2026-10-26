@@ -494,7 +494,7 @@ class ServedApprovalTests(ModelFixture):
                          {'auto': {'in_row': 1, 'in_turn': 1, 'turn': second}})
         third = daemon.request('submit', bot='Bob', request_id='c', prompt='shell:printf three')['result']['turn']
         [call] = self.pushed(approver, third)['data']['calls']
-        self.assertEqual(call['denials'], {'auto': {'in_row': 1, 'in_turn': 0}})
+        self.assertEqual(call['denials'], {'auto': {'in_row': 0, 'in_turn': 0}})
         # Closing the session frees the tag at once: the next server takes
         # over under a new lease, and gets the call still waiting.
         approver.close()
@@ -1035,6 +1035,20 @@ class AutoApproverTests(ModelFixture):
         # fifth round ends the turn.
         self.assertTrue(self.denial(daemon, turn, 'script-3').startswith('stopped: 3 calls in a row'))
         self.assertEqual(self.judge.requests.qsize(), 3)
+
+    def test_the_breaker_ends_one_turn_and_the_next_is_judged(self):
+        self.model.call_script = [('shell', {'command': f'printf DANGER-{n}'}) for n in range(5)]
+        daemon = self.daemon()
+        self.approver(daemon)
+        tripped = daemon.request('submit', bot='Bob', request_id='a', prompt='script')['result']['turn']
+        self.assertEqual(daemon.finished(tripped)['data']['status'], 'interrupted')
+        self.assertEqual(self.judge.requests.qsize(), 3)
+        # The person writes again: the new turn's call is judged, not
+        # refused on the last turn's run of denials.
+        turn = daemon.request('submit', bot='Bob', request_id='b', prompt='shell:printf safe > safe')['result']['turn']
+        self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
+        self.assertEqual((self.path / 'safe').read_text(), 'safe')
+        self.assertEqual(self.judge.requests.qsize(), 4)
 
     def test_a_delegated_turn_is_judged_on_the_persons_words(self):
         daemon = self.daemon()
