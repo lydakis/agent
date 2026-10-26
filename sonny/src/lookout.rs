@@ -274,7 +274,10 @@ pub fn note(items: &[Item], more: usize) -> String {
         // belongs in memory.
         let mut todo: Vec<&str> = Vec::new();
         for (id, _) in &item.reasons {
-            if !todo.contains(&action(id)) {
+            // Passing it on once covers both who it applies to and who needs it.
+            let pass =
+                |done: &&str| done.starts_with("pass it") && action(id).starts_with("pass it");
+            if !todo.contains(&action(id)) && !todo.iter().any(pass) {
                 todo.push(action(id));
             }
         }
@@ -1496,7 +1499,11 @@ mod tests {
                 text: "Use tabs everywhere.\nThanks.".into(),
                 ..item.seen.clone()
             },
-            reasons: vec![("redirects", 0.97), ("remember", 0.91)],
+            reasons: vec![
+                ("redirects", 0.97),
+                ("remember", 0.91),
+                ("sibling_needs", 0.79),
+            ],
         };
         let note = note(&[item, said], 2);
         // Only the person's own words are quoted.
@@ -1505,7 +1512,7 @@ mod tests {
         ));
         assert!(!note.contains("Fixed avg"));
         assert!(note.contains(
-            "- calc.docs, turn:calc.docs/3, the person wrote in it (redirects 0.97, remember 0.91; pass it to every task it applies to, and save it with your memory skill): \"Use tabs everywhere.\""
+            "- calc.docs, turn:calc.docs/3, the person wrote in it (redirects 0.97, remember 0.91, sibling needs 0.79; pass it to every task it applies to, and save it with your memory skill): \"Use tabs everywhere.\""
         ));
         assert!(note.contains("- 2 more in the next note"));
     }
