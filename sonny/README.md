@@ -50,6 +50,14 @@ commands:
   [sandfs](https://github.com/lydakis/sandfs) copies, which take the
   folder's uncommitted changes along, cost no disk until written, and work
   outside git too. Every task gets one; only the lead works in the folder.
+  In a [Graft](https://github.com/lydakis/graft) project, tasks always get
+  gft copies, which land as pull requests. The lead makes a sandfs or gft
+  copy with `sonny copy NAME` (and `sonny copy changes NAME [--copy-to
+  DIR]`, `sonny copy rm NAME`): sandfs is built into Sonny, so it needs no
+  install, only what a mount needs (FUSE 3 on Linux, nothing on macOS).
+  Its mounts are served by Sonny run again in the background, which
+  outlives Sonny; Sonny mounts task copies a restart unmounted again when
+  it opens the lead.
 - `/copy` puts the last reply on the clipboard; `/open` opens the last
   HTML page in a browser; `/sound` turns the chime off or on; `/quit`
   leaves the agents working.

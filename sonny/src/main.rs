@@ -11,6 +11,7 @@
 mod approvals;
 mod cache;
 mod calls;
+mod copy;
 mod diff;
 mod errand;
 mod html;
@@ -95,7 +96,9 @@ fn usage() -> String {
      open in the project's Rex session. Type /status for the project's agents.\n\
      --copies (or /copies): how its tasks get their own copy, kept for every folder: git\n\
      worktrees (the default), or sandfs copies, which take uncommitted changes along and\n\
-     work outside git too."
+     work outside git too; a Graft project's tasks always get gft copies.\n\
+     sonny copy NAME | changes NAME [--copy-to DIR] | rm NAME: a task's copy, from the\n\
+     lead's shell, with sandfs built in."
         .into()
 }
 
@@ -347,9 +350,21 @@ fn parse() -> Result<Options, String> {
 
 // Two threads, so the daemon's events are read while a picture is drawn:
 // a reader that stops is dropped by the daemon as lagging.
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() -> std::process::ExitCode {
-    match run().await {
+fn main() -> std::process::ExitCode {
+    // sandfs serves task copies' mounts from this program run again as
+    // `sonny sandfs ...`, outside any runtime of Sonny's.
+    sandfs::handle_relaunch(&["sandfs"]);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let result = match args.split_first() {
+        Some((copy, rest)) if copy == "copy" => copy::run(rest),
+        _ => tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())
+            .and_then(|runtime| runtime.block_on(run())),
+    };
+    match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("sonny: {error}");
@@ -445,6 +460,13 @@ async fn run() -> Result<(), String> {
         }
     }
     app.lead = project::lead(&app.options.socket, &bot);
+    // Task copies a restart unmounted are mounted again before any task
+    // works in its folder.
+    if project.is_some()
+        && let Some(error) = copy::remount().pop()
+    {
+        app.notice = Some(error);
+    }
     // The lead told what its folder tells it today (skills and memory added
     // since it was made), unless its instructions were set some other way.
     if project.is_some()

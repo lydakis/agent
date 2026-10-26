@@ -19,15 +19,7 @@ The worktree starts at the last commit, so uncommitted changes here are not in i
 "$AGENT_BIN" run --detach --new --agents --bot NAME --workspace "$HOME/.agent/worktrees/NAME/$(git rev-parse --show-prefix)" -- TASK
 When a task fits a role listed under Profiles, pass --profile ROLE in place of --agents. If setup fails, or the start fails and "$AGENT_BIN" ls --name NAME does not list it, remove the worktree and its branch (git worktree remove --force, git branch -D) before trying again.
 
-When this project's tasks get sandfs copies, every new task gets its own copy, a git repository or not, with a NAME picked as above. In a git repository, from this folder run
-sandfs mount "git:$(git rev-parse --show-toplevel)" "$HOME/.agent/tasks/NAME" --uncommitted --branch agent/NAME
-The copy starts at the last commit with this folder's uncommitted changes as they are now, on its own branch agent/NAME, and takes no disk until the task writes. Ignored files such as build output are not in it. Run .agents/setup when the task will change files, and start the task, as for a worktree, with --workspace "$HOME/.agent/tasks/NAME/$(git rev-parse --show-prefix)". Its commits stay in the copy until you bring them here with
-git -C "$HOME/.agent/tasks/NAME" push origin agent/NAME
-after which agent/NAME is a branch in this folder, as a worktree's is. In a folder that is not a git repository, run
-sandfs mount "$PWD" "$HOME/.agent/tasks/NAME"
-and start the task with --workspace "$HOME/.agent/tasks/NAME". The copy shows each of this folder's files as it is when the task first reads it, so leave the files a task works on alone until it is done. sandfs changes NAME lists what it added, changed and deleted, and once you have checked them, sandfs changes NAME --copy-to "$PWD" writes them here, replacing the files it lists. Either way a copy stays as long as its task, as a worktree does, since later messages to the task work there; if setup fails, or the start fails and "$AGENT_BIN" ls --name NAME does not list it, remove it with sandfs rm --unmount NAME before trying again.
-
-In a folder that is not a git repository, tasks work in this folder unless they get sandfs copies. A task keeps its folder, so later messages to it need no --workspace.
+When this project's tasks get sandfs copies, the task rule below says how each task gets one; otherwise, in a folder that is not a git repository, tasks work in this folder. A task keeps its folder, so later messages to it need no --workspace.
 
 run --detach prints the turn's handle. Wait on it when the answer is needed now; otherwise tell the person what started and end your turn. A message that starts "Task updates" comes from the app: task turns that ended or wait for an approval since you last heard, including ones you asked for and did not wait on. Turns the person asked for in a task themselves are listed apart and are theirs: do not check, correct or follow up on them, and pass a finding from one on only to a task that plainly needs it. Read the others you need with the wait tool on their handles, then act on each:
 - Check a reply against its brief, and a branch's diff for changes, before calling the work done. An ended turn is not finished work.

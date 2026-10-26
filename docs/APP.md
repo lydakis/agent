@@ -949,12 +949,15 @@ daemon learns nothing about projects; everything here is client work.
   and that without git every task works in the project folder. A client
   may tell the coordinator its tasks get sandfs copies instead (Sonny's
   `--copies sandfs` or `/copies`, kept in `~/.agent/sonny/settings.json`;
-  the app always says worktrees): the text then gives each task `sandfs mount "git:<repo
-  top>" ~/.agent/tasks/NAME --uncommitted --branch agent/NAME`, whose
-  commits come back with `git push origin agent/NAME`, or outside git
-  `sandfs mount "$PWD" ~/.agent/tasks/NAME`, whose changes come back with
-  `sandfs changes NAME --copy-to "$PWD"`. A copy stays as long as its task,
-  as a worktree does; `sandfs rm --unmount NAME` removes one after a failed
+  the app always says worktrees, and in Sonny a Graft project's tasks always get gft
+  copies): the role text then leaves how to the task rule, which that
+  client adds to. Sonny's tells the lead to run `sonny copy NAME`, sandfs
+  built into Sonny, which prints the task's folder and how its work comes
+  back: a gft copy that lands as its own pull request in a Graft project,
+  the checkout with its uncommitted changes on branch `agent/NAME` in a
+  git repository, or the folder as it is now, whose changes `sonny copy
+  changes NAME --copy-to "$PWD"` writes back. A copy stays as long as its
+  task, as a worktree does; `sonny copy rm NAME` removes one after a failed
   setup or start. The daemon only runs a
   turn where the bot is, or where a message moves it. A bot in a
   linked worktree shows its branch after its name in the head, read once
