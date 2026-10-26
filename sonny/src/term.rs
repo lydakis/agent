@@ -207,24 +207,6 @@ fn luminance((r, g, b): (f32, f32, f32)) -> f32 {
     0.2126 * r + 0.7152 * g + 0.0722 * b
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_background_reads_as_light_or_dark() {
-        let light = parse("\x1b]11;rgb:fdfd/f9f9/eded\x1b\\\x1b[?62;22c").unwrap();
-        assert!(luminance(light) > 0.5);
-        let dark = parse("\x1b]11;rgb:1e/1e/2e\x07").unwrap();
-        assert!(luminance(dark) < 0.5);
-        assert!(parse("\x1b[?62;22c").is_none());
-        assert_eq!(
-            cell_size("\x1b_Gi=31;OK\x1b\\\x1b[6;18;9t\x1b[?62;22c"),
-            Some((9, 18))
-        );
-    }
-}
-
 /// Put `text` on the clipboard: through `pbcopy` on the Mac Sonny runs on,
 /// else OSC 52, which the terminal answers wherever it is.
 pub fn copy(text: &str) {
@@ -245,4 +227,22 @@ pub fn copy(text: &str) {
     let mut stdout = std::io::stdout();
     let _ = write!(stdout, "\x1b]52;c;{encoded}\x07");
     let _ = stdout.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_background_reads_as_light_or_dark() {
+        let light = parse("\x1b]11;rgb:fdfd/f9f9/eded\x1b\\\x1b[?62;22c").unwrap();
+        assert!(luminance(light) > 0.5);
+        let dark = parse("\x1b]11;rgb:1e/1e/2e\x07").unwrap();
+        assert!(luminance(dark) < 0.5);
+        assert!(parse("\x1b[?62;22c").is_none());
+        assert_eq!(
+            cell_size("\x1b_Gi=31;OK\x1b\\\x1b[6;18;9t\x1b[?62;22c"),
+            Some((9, 18))
+        );
+    }
 }
