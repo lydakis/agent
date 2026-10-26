@@ -2050,8 +2050,10 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   `queued_turns`, so `stats` reads no approval row. Each listed call also
   carries `denials`, the bot's counts under each of its open gates (next).
 - **Denial counts.** The daemon counts, per bot and gate tag, the denials
-  that tag gave: `in_row`, ended when a call every gate allowed starts,
-  and `in_turn`, the denials in the turn that gave the last one. They are
+  that tag gave in the turn that gave the last one: `in_row`, ended when a
+  call every gate allowed starts, and `in_turn`, all of them. A denial in a
+  new turn starts both from none, so the breaker that ends one turn does
+  not refuse the next. They are
   written in the commit that records the denial, and the start that ends
   a run writes only when a run was counted, so a bot never denied writes
   nothing. A lapsed gate's denial is not counted: nobody judged the call.

@@ -1517,6 +1517,78 @@ fn served_announcements_carry_each_call_and_the_denials_so_far() {
 }
 
 #[test]
+fn a_new_turn_starts_its_denials_from_none() {
+    let mut db = db();
+    let deny = |db: &mut Database, turn: i64, n: usize| {
+        let (item, call) = shell_call(&format!("fc_{turn}_{n}"), &format!("s{n}"), "rm -rf build");
+        db.append(turn, vec![item], std::slice::from_ref(&call), None)
+            .unwrap();
+        db.answer(Decision {
+            bot: "Bob",
+            turn,
+            call_id: &call.call_id,
+            request: 1,
+            tag: None,
+            allow: false,
+            reason: Some("not that"),
+            by: Some("test"),
+        })
+        .unwrap();
+        assert!(matches!(
+            db.approval_start(turn, &call, 0).unwrap(),
+            Gated::Denied
+        ));
+    };
+    // A turn denied often enough to trip the breaker, then ended.
+    let first = gated_turn(&mut db, None);
+    for n in 0..4 {
+        deny(&mut db, first, n);
+    }
+    let denials = db.inspect("Bob").unwrap().denials;
+    assert_eq!(
+        (denials["manual"].in_row, denials["manual"].in_turn),
+        (4, 4)
+    );
+    db.finish(first, None).unwrap();
+    // The next turn's first call is seen with no denials, and a denial in
+    // it counts from one, not on from the last turn's run.
+    let next = db
+        .begin(
+            "Bob",
+            "again",
+            "more",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let (item, call) = shell_call("fc_next", "n0", "ls");
+    db.append(next, vec![item], std::slice::from_ref(&call), None)
+        .unwrap();
+    let listed = db.approvals(None, Some("manual"), 0, None, 64).unwrap();
+    assert_eq!(
+        listed["approvals"][0]["denials"],
+        json!({"manual":{"in_row":0,"in_turn":0}})
+    );
+    allow(&mut db, next, "n0").unwrap();
+    assert!(matches!(
+        db.approval_start(next, &call, 0).unwrap(),
+        Gated::Started
+    ));
+    deny(&mut db, next, 1);
+    let denials = db.inspect("Bob").unwrap().denials;
+    assert_eq!(
+        (
+            denials["manual"].in_row,
+            denials["manual"].in_turn,
+            denials["manual"].turn
+        ),
+        (1, 1, next)
+    );
+}
+
+#[test]
 fn history_pages_name_the_folder_each_turn_ran_in() {
     let mut db = db();
     db.create("Bob", Some("/synthetic/first"), binding())

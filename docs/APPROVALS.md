@@ -256,9 +256,9 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   `announced_ms` is when this request was written. The stored event holds
   no arguments, since the node already does; a few dozen bytes per call.
   What is sent to approvers also carries, per gate, the bot's
-  `denials: {"in_row","in_turn"}` for that tag. The daemon keeps these
-  two counts on the bot's row, updated in the commits that already record
-  a denial or start an allowed call, so an approver that restarts or
+  `denials: {"in_row","in_turn"}` for that tag, counted in the call's own
+  turn. The daemon keeps these two counts on the bot's row, updated in
+  the commits that already record a denial or start an allowed call, so an approver that restarts or
   takes over sees the same counts its predecessor did and the circuit
   breaker does not reset. `approvals` and
   `serve_approvals` return it too, so an approver that takes over a
@@ -558,7 +558,12 @@ so only one instance runs at a time, and answers in layers:
    its next gated round or 30 s later, whichever comes first. A model that
    reports ends the turn itself first; one that keeps going is stopped
    without its cooperation. Interrupting a turn that already ended gets
-   `stale_turn` and does nothing. Claude
+   `stale_turn` and does nothing. Both counts belong to the turn: the next
+   turn starts from none, so the breaker ends the looping turn and hands
+   the stop back to whoever starts the next one, as Claude Code and Codex
+   hand it back to the person. Counting on across turns would refuse every
+   later gated call unjudged, the breaker's own refusal included, and lock
+   the bot out for good. Claude
    Code uses 3 and 20 per session and then asks the person; Codex uses 3 in
    a row or 10 of the last 50 and interrupts. A model that keeps trying
    variations of a denied action is the pattern this catches.
