@@ -96,9 +96,13 @@ one waits for the next note, and the rest are only logged, to
 `~/.agent/sonny/lookout.jsonl`. The note reaches the approver as the
 person's words, so the lead can act on it (pass a preference on, save it
 to memory) without asking, and it quotes only the person's own words. The
-judge is `openai-decisions/gpt-6-luna` (needs `OPENAI_API_KEY`, about
-$0.0002 a check); `--lookout typesafe/jev-*` picks Jev, `--lookout off`
-turns it off. `sonny lookout-replay --judge SPEC` runs the same checks over
+judge is `--lookout SPEC`, else `AGENT_JUDGE` (the approver's setting, in
+the shell or `~/.agent/env`), else `openai-decisions/gpt-6-luna` when
+`OPENAI_API_KEY` is set (about $0.0002 a check), else the newest Haiku the
+lead's provider lists. `typesafe/jev-*` picks Jev, and any other
+`provider/model` runs through the daemon on a fork of an idle, tool-less
+`lookout.*` bot, as the approver's judge does, so Bedrock alone is enough.
+`--lookout off` turns it off. `sonny lookout-replay --judge SPEC` runs the same checks over
 the store's retained history, and `demo/lookout_score.py` scores that
 against labels.
 

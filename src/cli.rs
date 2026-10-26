@@ -379,7 +379,7 @@ fn print_flags(flags: &str) {
             ),
             "--judge" => (
                 "PROVIDER/MODEL",
-                "Who judges: typesafe/jev-latest, openai-decisions/gpt-6-luna, or any model the daemon serves; default AGENT_APPROVER_JUDGE, Jev when TYPESAFE_API_KEY is set, else AGENT_MODEL",
+                "Who judges: typesafe/jev-latest, openai-decisions/gpt-6-luna, or any model the daemon serves; default AGENT_JUDGE, Jev when TYPESAFE_API_KEY is set, else AGENT_MODEL",
             ),
             "--judge-url" => (
                 "URL",

@@ -2,7 +2,8 @@
 //! tasks, which wakes the lead only when it should step in. Each message
 //! someone other than the lead writes in a task, each turn a task ends, and
 //! each approval a task has waited on the person for a while is one check:
-//! a few yes/no questions to OpenAI's Decisions API or Jev. A high answer
+//! a few yes/no questions to OpenAI's Decisions API, Jev, or a model the
+//! daemon runs (Haiku on Bedrock, say). A high answer
 //! wakes the lead now; a middle one waits for the next wake, or a digest
 //! after a quiet spell; a low one is only logged. The daemon is unchanged:
 //! this follows every bot and submits to the lead like any client.
@@ -341,6 +342,9 @@ enum Api {
     Jev,
     /// OpenAI's `POST /v1/decisions`, with each question a predicate.
     Decisions,
+    /// A `provider/model` the daemon runs, with the providers and logins
+    /// bots use, answering every question in one JSON object.
+    Model,
 }
 
 pub struct Judge {
@@ -350,7 +354,20 @@ pub struct Judge {
     model: String,
     key: String,
     http: reqwest::Client,
+    /// For `Model`: the idle base bot each check forks, once made.
+    base: tokio::sync::Mutex<Option<(String, i64)>>,
+    next: std::sync::atomic::AtomicU64,
 }
+
+/// The decision model for everything that judges, the approver included,
+/// as one setting: `AGENT_JUDGE` in the shell or `~/.agent/env`.
+pub const JUDGE_VAR: &str = "AGENT_JUDGE";
+
+/// How a daemon model reads a check, and answers it.
+pub const MODEL_INSTRUCTIONS: &str = "You answer yes/no questions about one event in a software project \
+where a lead agent coordinates task agents for a person. The user message is a JSON object: `reading` says \
+how to read `input`, and `questions` maps each question's id to the question. Answer with one JSON object \
+mapping every question id to the probability, from 0 to 1, that the answer is yes, and nothing else.";
 
 /// A key from this shell, else from the app's `~/.agent/env`.
 fn key(name: &str) -> Option<String> {
@@ -368,9 +385,36 @@ fn key(name: &str) -> Option<String> {
 }
 
 impl Judge {
-    /// `openai-decisions/MODEL` with `OPENAI_API_KEY`, or `typesafe/jev-*`
-    /// with `TYPESAFE_API_KEY`; `LOOKOUT_URL` points either elsewhere.
+    /// `openai-decisions/MODEL` with `OPENAI_API_KEY`, `typesafe/jev-*`
+    /// with `TYPESAFE_API_KEY` (`LOOKOUT_URL` points either elsewhere), or
+    /// any other `provider/model`, which the daemon runs.
     pub fn parse(spec: &str) -> Result<Self, String> {
+        let http = reqwest::Client::builder()
+            .user_agent(concat!("sonny/", env!("CARGO_PKG_VERSION")))
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|e| format!("lookout: {e}"))?;
+        let judge = |api, model: &str, url: &str, key: String| Judge {
+            api,
+            name: spec.to_owned(),
+            url: url.trim_end_matches('/').to_owned(),
+            model: model.to_owned(),
+            key,
+            http: http.clone(),
+            base: Default::default(),
+            next: Default::default(),
+        };
+        if !spec.starts_with("openai-decisions/") && !spec.starts_with("typesafe/") {
+            return match spec.split_once('/') {
+                Some((provider, model)) if !provider.is_empty() && !model.is_empty() => {
+                    Ok(judge(Api::Model, spec, "", String::new()))
+                }
+                _ => Err(format!(
+                    "lookout: {spec} is not openai-decisions/MODEL, typesafe/jev-* or PROVIDER/MODEL"
+                )),
+            };
+        }
         let (api, model, key_name, url) =
             if let Some(model) = spec.strip_prefix("openai-decisions/") {
                 (
@@ -390,9 +434,7 @@ impl Judge {
                     "https://api.typesafe.ai",
                 )
             } else {
-                return Err(format!(
-                    "lookout: {spec} is not openai-decisions/MODEL or typesafe/jev-*"
-                ));
+                return Err(format!("lookout: {spec} is not typesafe/jev-*"));
             };
         let key = key(key_name).ok_or_else(|| {
             format!("lookout off: set {key_name} for {spec}, or pass --lookout off")
@@ -401,20 +443,7 @@ impl Judge {
             .ok()
             .filter(|url| !url.is_empty())
             .unwrap_or_else(|| url.to_owned());
-        let http = reqwest::Client::builder()
-            .user_agent(concat!("sonny/", env!("CARGO_PKG_VERSION")))
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(5))
-            .build()
-            .map_err(|e| format!("lookout: {e}"))?;
-        Ok(Judge {
-            api,
-            name: spec.to_owned(),
-            url: url.trim_end_matches('/').to_owned(),
-            model: model.to_owned(),
-            key,
-            http,
-        })
+        Ok(judge(api, model, &url, key))
     }
 
     fn request(&self, input: &Value, questions: &[&Question]) -> (&'static str, Value) {
@@ -430,6 +459,7 @@ impl Judge {
                         .map(|q| json!({"type": "predicate", "name": q.id, "instructions": q.text}))
                         .collect::<Vec<_>>()}),
             ),
+            Api::Model => ("", Value::Null),
             Api::Jev => (
                 "/v1/systemone",
                 json!({"model": self.model,
@@ -444,9 +474,13 @@ impl Judge {
     /// Each question's probability, with the input tokens billed.
     async fn ask(
         &self,
+        client: &Client,
         input: &Value,
         questions: &[&Question],
     ) -> Result<(Map<String, Value>, u64), Failure> {
+        if self.api == Api::Model {
+            return self.ask_model(client, input, questions).await;
+        }
         let (path, body) = self.request(input, questions);
         let response = self
             .http
@@ -492,6 +526,7 @@ impl Judge {
                     answers.insert(id.clone(), answer["noul"].clone());
                 }
             }
+            Api::Model => unreachable!("asked through the daemon"),
             Api::Jev => {
                 for q in questions {
                     let p = reply["answers"][q.id]["noul"]
@@ -509,6 +544,284 @@ impl Judge {
         }
         Ok((answers, tokens))
     }
+}
+
+/// A check failed for `why`.
+fn failed(why: impl Into<String>) -> Failure {
+    Failure::Check(why.into(), String::new())
+}
+
+impl Judge {
+    /// A daemon model's check: a fork of the base bot takes one turn, as the
+    /// approver's judge does, so checks run at once and none sees another,
+    /// and the fork is deleted once it answers.
+    async fn ask_model(
+        &self,
+        client: &Client,
+        input: &Value,
+        questions: &[&Question],
+    ) -> Result<(Map<String, Value>, u64), Failure> {
+        let (base, base_id) = self.base(client).await?;
+        let name = format!(
+            "{base}.{}.{}",
+            std::process::id(),
+            self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        client
+            .request(
+                "fork",
+                json!({"source": base, "bot": name, "workspace": "/", "created_by": base,
+                    "created_by_id": base_id}),
+            )
+            .await
+            .map_err(|e| failed(format!("the judge could not start: {}", e.code)))?;
+        let answered = model_turn(client, &name, input, questions).await;
+        let running = answered.as_ref().err().and_then(|(_, turn)| *turn);
+        remove(client, &name, running).await;
+        answered.map_err(|(failure, _)| failure)
+    }
+
+    /// The idle bot holding the judge's model and instructions, named by
+    /// both so another judge or another Sonny's never clashes, made once.
+    /// Forks a stopped Sonny left are deleted.
+    async fn base(&self, client: &Client) -> Result<(String, i64), Failure> {
+        let mut base = self.base.lock().await;
+        if let Some(made) = base.as_ref() {
+            return Ok(made.clone());
+        }
+        let name = format!(
+            "lookout.{}",
+            &digest(&format!("{}\n{MODEL_INSTRUCTIONS}", self.model))[..12]
+        );
+        // Only a judge is forked: a bot of that name with tools or other
+        // instructions is refused, never used.
+        let judge = |bot: Value| {
+            (bot["tools"].as_array().is_some_and(Vec::is_empty)
+                && bot["instructions"] == MODEL_INSTRUCTIONS)
+                .then(|| bot["bot_id"].as_i64())
+                .ok_or_else(|| failed(format!("{name} is a bot that is not a lookout judge")))
+        };
+        let id = match client.request("inspect", json!({"bot": name})).await {
+            Ok(bot) => judge(bot)?,
+            Err(e) if e.code == "bot_not_found" => {
+                match client
+                    .request(
+                        "create",
+                        json!({"bot": name, "workspace": "/", "model": self.model,
+                            "instructions": MODEL_INSTRUCTIONS, "tools": []}),
+                    )
+                    .await
+                {
+                    Ok(made) => made["bot_id"].as_i64(),
+                    // Another Sonny made it first.
+                    Err(e) if e.code == "bot_exists" => client
+                        .request("inspect", json!({"bot": name}))
+                        .await
+                        .map_err(|e| failed(format!("the judge could not be read: {}", e.code)))
+                        .and_then(judge)?,
+                    Err(e) => {
+                        return Err(failed(format!("the judge could not be made: {}", e.code)));
+                    }
+                }
+            }
+            Err(e) => return Err(failed(format!("the judge could not be read: {}", e.code))),
+        };
+        let id = id.ok_or_else(|| failed("the judge could not be made"))?;
+        stale_forks(client, &name).await;
+        *base = Some((name.clone(), id));
+        Ok((name, id))
+    }
+}
+
+/// One turn of a judge's fork: its answers and input tokens, or why not and
+/// the turn if it is still running.
+async fn model_turn(
+    client: &Client,
+    name: &str,
+    input: &Value,
+    questions: &[&Question],
+) -> Result<(Map<String, Value>, u64), (Failure, Option<i64>)> {
+    let asked: Map<String, Value> = questions
+        .iter()
+        .map(|q| (q.id.to_owned(), json!(q.text)))
+        .collect();
+    let prompt = json!({"reading": READING, "input": input, "questions": asked}).to_string();
+    let submitted = client
+        .request(
+            "submit",
+            json!({"bot": name, "request_id": name, "prompt": prompt, "delivery": "queue"}),
+        )
+        .await
+        .map_err(|e| {
+            (
+                failed(format!("the judge's turn was refused: {}", e.code)),
+                None,
+            )
+        })?;
+    let (Some(turn), Some(handle)) = (submitted["turn"].as_i64(), submitted["handle"].as_str())
+    else {
+        return Err((failed("the judge's turn was not started"), None));
+    };
+    let waited = client
+        .request(
+            "wait",
+            json!({"handles": [handle], "timeout_ms": DEADLINE.as_millis() as u64}),
+        )
+        .await
+        .map_err(|e| {
+            (
+                failed(format!("the judge could not be waited on: {}", e.code)),
+                Some(turn),
+            )
+        })?;
+    let outcome = &waited["results"][handle];
+    if outcome["pending"] == true {
+        return Err((failed("the check timed out"), Some(turn)));
+    }
+    if outcome["status"] != "completed" {
+        return Err((
+            failed(format!(
+                "the judge's turn {}: {}",
+                outcome["status"].as_str().unwrap_or("ended"),
+                outcome["error"].as_str().unwrap_or("no answer")
+            )),
+            None,
+        ));
+    }
+    let shape: Map<String, Value> = questions
+        .iter()
+        .map(|q| (q.id.to_owned(), json!({})))
+        .collect();
+    let read = (outcome["text_truncated"] != true)
+        .then(|| {
+            agent_client::approver::model_answers(
+                outcome["text"].as_str().unwrap_or_default(),
+                &Value::Object(shape),
+            )
+        })
+        .flatten()
+        .ok_or((failed("the judge's answer did not parse"), None))?;
+    let answers = read
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(id, answer)| (id.clone(), answer["noul"].clone()))
+        .collect();
+    let row = client
+        .request("turns", json!({"bot": name, "after": turn - 1, "limit": 1}))
+        .await
+        .unwrap_or_default();
+    let tokens = row["turns"][0]["input_tokens"].as_u64().unwrap_or(0);
+    Ok((answers, tokens))
+}
+
+/// Delete a judge's fork, ending its turn first if it still runs. One
+/// that stays is deleted when the next Sonny starts, as a stale fork.
+async fn remove(client: &Client, name: &str, running: Option<i64>) {
+    if let Some(turn) = running {
+        let _ = client
+            .request("interrupt", json!({"bot": name, "turn": turn}))
+            .await;
+        let _ = client
+            .request(
+                "wait",
+                json!({"handles": [format!("turn:{name}/{turn}")], "timeout_ms": 5_000}),
+            )
+            .await;
+    }
+    let _ = client.request("delete", json!({"bot": name})).await;
+}
+
+/// A lookout judge or one of its forks, `lookout.HASH[.PID.N]`: never a
+/// task, even in a project named `lookout`.
+fn judge_bot(name: &str) -> bool {
+    name.strip_prefix("lookout.")
+        .and_then(|rest| rest.split('.').next())
+        .is_some_and(|hash| hash.len() == 12 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Forks of `base` whose Sonny is gone: named `BASE.PID.N`, for a PID no
+/// longer running.
+async fn stale_forks(client: &Client, base: &str) {
+    let prefix = format!("{base}.");
+    let mut after = json!(prefix);
+    loop {
+        let Ok(page) = client
+            .request("bots", json!({"after": after, "limit": 64}))
+            .await
+        else {
+            return;
+        };
+        for bot in page["bots"].as_array().into_iter().flatten() {
+            let Some(rest) = bot["name"].as_str().and_then(|n| n.strip_prefix(&prefix)) else {
+                return;
+            };
+            let pid = rest
+                .split('.')
+                .next()
+                .and_then(|pid| pid.parse::<i32>().ok());
+            // SAFETY: kill with signal 0 only checks that the process exists.
+            let gone = pid.is_some_and(|pid| unsafe { libc::kill(pid, 0) } != 0);
+            if gone && bot["created_by"] == base {
+                let name = bot["name"].as_str().unwrap_or_default();
+                remove(client, name, bot["running_turn"].as_i64()).await;
+            }
+        }
+        match &page["next_after"] {
+            Value::Null => return,
+            next => after = next.clone(),
+        }
+    }
+}
+
+/// The lookout's judge: `--lookout SPEC`, else `AGENT_JUDGE`, else
+/// Decisions when `OPENAI_API_KEY` is set, else the newest Haiku the lead's
+/// provider lists, run through the daemon.
+pub async fn choose(
+    client: &Client,
+    spec: Option<&str>,
+    lead_model: &str,
+) -> Result<Judge, String> {
+    if let Some(spec) = spec.map(str::to_owned).or_else(|| key(JUDGE_VAR)) {
+        return Judge::parse(&spec);
+    }
+    if key("OPENAI_API_KEY").is_some() {
+        return Judge::parse(DEFAULT);
+    }
+    let provider = lead_model.split_once('/').map_or(lead_model, |(p, _)| p);
+    let listing = client
+        .request("provider_models", json!({}))
+        .await
+        .unwrap_or_default();
+    match small_model(&listing["providers"][provider], lead_model) {
+        Some(model) => Judge::parse(&format!("{provider}/{model}")),
+        None => Err(format!(
+            "lookout off: set {JUDGE_VAR}=PROVIDER/MODEL (in ~/.agent/env), or OPENAI_API_KEY, or pass --lookout off"
+        )),
+    }
+}
+
+/// The newest Haiku a provider lists, in the lead's region when its ids
+/// carry one (`global.`, `us.` on Bedrock).
+fn small_model(listed: &Value, lead_model: &str) -> Option<String> {
+    // A Bedrock inference profile's id starts with its region: `global.`.
+    fn region(id: &str) -> (&str, &str) {
+        id.split_once('.')
+            .filter(|(region, _)| !region.contains('-'))
+            .unwrap_or(("", id))
+    }
+    let lead = region(lead_model.split_once('/').map_or(lead_model, |(_, m)| m)).0;
+    listed["models"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m["id"].as_str())
+        .filter(|id| id.contains("haiku"))
+        .max_by_key(|id| {
+            let (here, model) = region(id);
+            (here == lead, model)
+        })
+        .map(str::to_owned)
 }
 
 #[derive(Debug)]
@@ -740,7 +1053,11 @@ async fn check(
     };
     let started = Instant::now();
     let asked = judge
-        .ask(&input(&read, &brief, &roster, memory), &asked(seen.kind))
+        .ask(
+            client,
+            &input(&read, &brief, &roster, memory),
+            &asked(seen.kind),
+        )
         .await;
     // Words the judge never answered are not seen yet, so a retry reads them.
     if asked.is_err() && seen.kind == Kind::Said {
@@ -860,7 +1177,7 @@ impl Lookout {
             .await
         {
             for bot in page["bots"].as_array().into_iter().flatten() {
-                if let Some(name) = bot["name"].as_str() {
+                if let Some(name) = bot["name"].as_str().filter(|name| !judge_bot(name)) {
                     self.lineage.insert(name.to_owned());
                 }
             }
@@ -912,7 +1229,9 @@ impl Lookout {
         match kind {
             "created" | "forked" => {
                 let by = event["data"]["created_by"].as_str().unwrap_or("");
-                if self.lineage.contains(by) || bot.starts_with(&format!("{}.", self.project)) {
+                if (self.lineage.contains(by) || bot.starts_with(&format!("{}.", self.project)))
+                    && !judge_bot(bot)
+                {
                     self.lineage.insert(bot.to_owned());
                 }
             }
@@ -1400,8 +1719,9 @@ pub async fn replay() -> Result<(), String> {
                 let (Some(name), by) = (bot["name"].as_str(), bot["created_by"].as_str()) else {
                     continue;
                 };
-                if name.starts_with(&format!("{project}."))
-                    || by.is_some_and(|by| lookout.lineage.contains(by))
+                if (name.starts_with(&format!("{project}."))
+                    || by.is_some_and(|by| lookout.lineage.contains(by)))
+                    && !judge_bot(name)
                 {
                     lookout.lineage.insert(name.to_owned());
                 }
@@ -1533,6 +1853,8 @@ mod tests {
             model: "m".into(),
             key: "k".into(),
             http: reqwest::Client::new(),
+            base: Default::default(),
+            next: Default::default(),
         }
     }
 
@@ -2143,8 +2465,49 @@ mod tests {
     }
 
     #[test]
+    fn with_no_judge_set_the_newest_haiku_in_the_lead_s_region_judges() {
+        let listed = json!({"models": [
+            {"id": "us.anthropic.claude-haiku-5-5-v1:0"},
+            {"id": "us.anthropic.claude-haiku-4-5-20251001-v1:0"},
+            {"id": "global.anthropic.claude-haiku-4-5-20251001-v1:0"},
+            {"id": "global.anthropic.claude-haiku-5-5-v1:0"},
+            {"id": "global.anthropic.claude-opus-5-5-v1:0"},
+        ]});
+        let lead = "bedrock/global.anthropic.claude-opus-5-5-v1:0";
+        assert_eq!(
+            small_model(&listed, lead).as_deref(),
+            Some("global.anthropic.claude-haiku-5-5-v1:0")
+        );
+        let api = json!({"models": [{"id": "claude-haiku-4-5"}, {"id": "claude-haiku-5-5"}]});
+        assert_eq!(
+            small_model(&api, "anthropic/claude-opus-5-5").as_deref(),
+            Some("claude-haiku-5-5")
+        );
+        assert_eq!(small_model(&json!({"models": []}), lead), None);
+    }
+
+    #[test]
+    fn judges_are_never_tasks() {
+        let mut lookout = lookout();
+        lookout.project = "lookout".into();
+        for bot in [
+            "lookout.9838f5b69ce1",
+            "lookout.9838f5b69ce1.42.0",
+            "lookout.fix",
+        ] {
+            lookout.lineage_of(&json!({"event": "created", "bot": bot, "data": {}}));
+        }
+        assert!(lookout.lineage.contains("lookout.fix"));
+        assert!(!lookout.lineage.iter().any(|bot| judge_bot(bot)));
+    }
+
+    #[test]
     fn a_judge_is_named_by_its_api() {
-        assert!(Judge::parse("anthropic/claude").is_err());
+        assert_eq!(
+            Judge::parse("bedrock/claude-haiku").unwrap().api,
+            Api::Model
+        );
+        assert!(Judge::parse("claude").is_err());
         assert!(Judge::parse("typesafe/other").is_err());
     }
 }
