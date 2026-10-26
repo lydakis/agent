@@ -353,7 +353,8 @@ enum Command {
         call_id: String,
         request: i64,
         tag: Option<String>,
-        /// `allow` or `deny`.
+        /// `allow`, `deny`, or `ask`: leave the gate open for a person, with
+        /// the reason.
         decision: String,
         reason: Option<String>,
         /// A label for audit, the client's choice; not verified.
@@ -2345,10 +2346,11 @@ impl Service {
                 by,
                 lease,
             } => {
-                let allow = match decision.as_str() {
-                    "allow" => true,
-                    "deny" => false,
-                    _ => return fail_with("invalid_decision", "allow or deny"),
+                let (allow, ask) = match decision.as_str() {
+                    "allow" => (true, false),
+                    "deny" => (false, false),
+                    "ask" => (false, true),
+                    _ => return fail_with("invalid_decision", "allow, deny, or ask"),
                 };
                 if call_id.is_empty() {
                     return fail_with("invalid_call_id", "call_id may not be empty");
@@ -2361,7 +2363,7 @@ impl Service {
                 }
                 // The model sees a denial's reason; an allow has no use for one.
                 if allow && reason.is_some() {
-                    return fail_with("invalid_reason", "only a deny carries a reason");
+                    return fail_with("invalid_reason", "only a deny or an ask carries a reason");
                 }
                 if reason.as_ref().is_some_and(|r| r.len() > 16 * 1024) {
                     return fail_with("reason_limit", "reason may be up to 16384 bytes");
@@ -2380,7 +2382,7 @@ impl Service {
                 let name = bot.clone();
                 let answered = store
                     .op("answer", move |db| {
-                        db.answer(Decision {
+                        let decision = Decision {
                             bot: &name,
                             turn,
                             call_id: &call_id,
@@ -2389,7 +2391,11 @@ impl Service {
                             allow,
                             reason: reason.as_deref(),
                             by: by.as_deref(),
-                        })
+                        };
+                        match ask {
+                            true => db.ask(decision),
+                            false => db.answer(decision),
+                        }
                     })
                     .await?;
                 // The answer is durable or held by the worker by now; only

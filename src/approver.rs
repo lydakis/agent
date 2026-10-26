@@ -354,7 +354,7 @@ impl Model {
             .request(
                 "create",
                 json!({"bot":base,"workspace":"/","model":model,"effort":effort,
-                    "instructions":policy::JUDGE_INSTRUCTIONS,"tools":[]}),
+                    "instructions":policy::judge_instructions(),"tools":[]}),
             )
             .await
             .map_err(Error::from)?;
@@ -401,7 +401,7 @@ impl Model {
 /// judge's instructions exactly.
 fn judge_bot(bot: &Value) -> bool {
     bot["tools"].as_array().is_some_and(Vec::is_empty)
-        && bot["instructions"] == policy::JUDGE_INSTRUCTIONS
+        && bot["instructions"] == policy::judge_instructions()
 }
 
 /// The judge's one turn, and the turn if it is still running.
@@ -743,6 +743,8 @@ async fn round(shared: Arc<Shared>, bot: String, turn: i64, calls: Vec<Value>) {
         }
         calls
             .into_iter()
+            // Handed to a person already, by this tag's last holder.
+            .filter(|call| call["asked"]["tag"] != shared.tag.as_str())
             .filter(|call| {
                 *latest > turn
                     || requests.insert((
@@ -799,19 +801,29 @@ async fn round(shared: Arc<Shared>, bot: String, turn: i64, calls: Vec<Value>) {
     let judge_ms = started.elapsed().as_millis() as u64;
     let mut answered = Vec::with_capacity(calls.len());
     for (call, verdict) in calls.iter().zip(&verdicts) {
-        let (decision, reason) = match verdict {
+        let (mut decision, reason) = match verdict {
             Verdict::Allow => ("allow", None),
             Verdict::Deny(reason) => ("deny", Some(reason.as_str())),
+            Verdict::Doubt(reason) => ("ask", Some(reason.as_str())),
         };
-        let result = shared
-            .client
-            .request(
+        let answer = |decision: &str| {
+            shared.client.request(
                 "answer",
                 json!({"bot":bot,"turn":turn,"call_id":call["call_id"],"request":call["request"],
                     "tag":shared.tag,"decision":decision,"reason":reason,"by":"approver",
                     "lease":shared.lease}),
             )
-            .await;
+        };
+        let mut result = answer(decision).await;
+        // A gate that lapses has nobody to wait on: the doubt is a denial.
+        if decision == "ask"
+            && result
+                .as_ref()
+                .is_err_and(|error| error.code == "approval_ask_expiring")
+        {
+            decision = "deny";
+            result = answer(decision).await;
+        }
         let error = result.err().map(|error| {
             if error.code == "approvals_lost" {
                 shared.lost.notify_one();
@@ -1423,14 +1435,14 @@ mod tests {
 
     #[test]
     fn only_a_tool_less_bot_with_the_judges_instructions_is_a_judge() {
-        let judge = json!({"tools":[],"instructions":policy::JUDGE_INSTRUCTIONS});
+        let judge = json!({"tools":[],"instructions":policy::judge_instructions()});
         assert!(judge_bot(&judge));
-        let tools = json!({"tools":["shell"],"instructions":policy::JUDGE_INSTRUCTIONS});
+        let tools = json!({"tools":["shell"],"instructions":policy::judge_instructions()});
         assert!(!judge_bot(&tools));
         assert!(!judge_bot(
             &json!({"tools":[],"instructions":"Help with the repo."})
         ));
-        let opening = format!("{} And more.", &policy::JUDGE_INSTRUCTIONS[..60]);
+        let opening = format!("{} And more.", &policy::judge_instructions()[..60]);
         assert!(!judge_bot(&json!({"tools":[],"instructions":opening})));
     }
 

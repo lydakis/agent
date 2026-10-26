@@ -14,7 +14,7 @@ use std::{
 };
 
 const DEFAULT_TOOLS: &str = "shell,read,write,edit,wait,history";
-use agent_client::approver::{AUTO_EXPIRE_MS, UNGATED};
+use agent_client::approver::{AUTO_EXPIRE_MS, AUTO_UNGATED, UNGATED};
 use agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS;
 /// What a new bot is told when the caller gives no instructions: the
 /// harness preamble every client shares. `--agents` layers AGENTS.md files
@@ -968,10 +968,11 @@ fn ensure_approver(
 /// The gate a new bot asks for, as `create` or `fork` fields. The mode
 /// comes from --approval or AGENT_APPROVAL, `full` by default: no gate.
 /// `manual` gates --approve, or every tool the bot has but the four that
-/// touch only its own records, for a person or a program to answer.
+/// touch only its own records, for a person or a program to answer; `auto`
+/// leaves `read` ungated too.
 fn requested_gate(options: &Options, tools: &[String]) -> Result<Value> {
-    // The tools gated: --approve, or every tool but the ungated four.
-    let approve = || -> Result<Vec<String>> {
+    // The tools gated: --approve, or every tool but the ungated ones.
+    let approve = |ungated: &[&str]| -> Result<Vec<String>> {
         let approve: Vec<String> = match &options.approve {
             Some(list) => list
                 .split(',')
@@ -980,7 +981,7 @@ fn requested_gate(options: &Options, tools: &[String]) -> Result<Value> {
                 .collect(),
             None => tools
                 .iter()
-                .filter(|t| !UNGATED.contains(&t.as_str()))
+                .filter(|t| !ungated.contains(&t.as_str()))
                 .cloned()
                 .collect(),
         };
@@ -997,13 +998,13 @@ fn requested_gate(options: &Options, tools: &[String]) -> Result<Value> {
         ),
         "full" => Ok(json!({})),
         // A bot with only ungated tools has nothing to wait for.
-        "manual" => Ok(match approve()? {
+        "manual" => Ok(match approve(&UNGATED)? {
             approve if approve.is_empty() => json!({}),
             approve => json!({"approve":approve,"approver":"manual"}),
         }),
         // The same tools, answered by the approver serving `auto`, which
         // has until the expiry before the call is denied and the turn ends.
-        "auto" => Ok(match approve()? {
+        "auto" => Ok(match approve(&AUTO_UNGATED)? {
             approve if approve.is_empty() => json!({}),
             approve => json!({"approve":approve,"approver":"auto",
                 "approve_expire_ms":AUTO_EXPIRE_MS}),
