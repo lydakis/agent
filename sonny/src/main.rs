@@ -19,6 +19,7 @@ mod mermaid;
 mod models;
 mod project;
 mod rex;
+mod settings;
 mod shell;
 mod sound;
 mod status;
@@ -317,6 +318,7 @@ async fn run() -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     let mut app = App::new(client, &name, &bot, options.clone());
     app.sounds = sound::Sounds::new(options.sound);
+    app.sounds.chime = settings::Settings::load().chime;
     // A bot keeps the model it was made with; --model runs this window's
     // turns on another.
     if let Some(model) = options.model.as_ref().filter(|m| **m != app.model) {
@@ -454,9 +456,10 @@ struct Running {
 
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, unlisted.
-const COMMANDS: [(&str, &str); 4] = [
+const COMMANDS: [(&str, &str); 5] = [
     ("/model", "the model and effort"),
     ("/status", "this project's agents"),
+    ("/sound", "the chime when work ends, on or off"),
     ("/open", "the last HTML page, in your browser"),
     ("/quit", "the agents keep working"),
 ];
@@ -1951,6 +1954,24 @@ impl App {
             });
             self.listing = Some(receive);
             self.notice = Some("listing models…".into());
+            return;
+        }
+        if prompt == "/sound" {
+            self.input.clear();
+            let mut settings = settings::Settings::load();
+            settings.chime = !self.sounds.chime;
+            self.notice = Some(match settings.save() {
+                Ok(()) => {
+                    self.sounds.chime = settings.chime;
+                    if settings.chime {
+                        "chime on"
+                    } else {
+                        "chime off"
+                    }
+                    .to_owned()
+                }
+                Err(error) => error,
+            });
             return;
         }
         if prompt == "/quit" {

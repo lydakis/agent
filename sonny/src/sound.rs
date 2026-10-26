@@ -36,6 +36,8 @@ impl Alert {
 
 pub struct Sounds {
     on: bool,
+    /// `/sound`: off keeps the notifications and drops the sound.
+    pub chime: bool,
     last: Option<(Instant, Alert)>,
 }
 
@@ -44,7 +46,11 @@ const TOGETHER: Duration = Duration::from_millis(1200);
 
 impl Sounds {
     pub fn new(on: bool) -> Self {
-        Self { on, last: None }
+        Self {
+            on,
+            chime: true,
+            last: None,
+        }
     }
 
     /// Ring for the alert, and notify when it needs the person or answers
@@ -63,6 +69,9 @@ impl Sounds {
             let mut stdout = std::io::stdout();
             let _ = write!(stdout, "\x1b]777;notify;Sonny;{text}\x07");
             let _ = stdout.flush();
+        }
+        if !self.chime {
+            return;
         }
         if let Some((at, last)) = self.last
             && at.elapsed() < TOGETHER
