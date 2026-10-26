@@ -63,7 +63,7 @@ fn start_rule(sonny: &str) -> String {
     let sonny = format!("\"{sonny}\"");
     format!(
         "Wherever these instructions start a new task with \"$AGENT_BIN\" run --detach --new, in a worktree or not, start it with Sonny instead, which makes its folder first; \
-         messages to tasks that exist still go through \"$AGENT_BIN\" run --delivery queue. Pick a NAME that \"$AGENT_BIN\" ls --name \"${{AGENT_BOT%%.*}}.*\" does not list yet, \
+         messages to tasks that exist still go through \"$AGENT_BIN\" run, as above. Pick a NAME that \"$AGENT_BIN\" ls --name \"${{AGENT_BOT%%.*}}.*\" does not list yet, \
          that starts with your own name before .lead and a dot, and that is a valid git branch name; from this folder run\n\
          {sonny} task NAME --agents --setup MODEL-FLAGS -- TASK\n\
          with the task rule's --model and --effort as MODEL-FLAGS: \
