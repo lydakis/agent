@@ -143,6 +143,15 @@ impl Updates {
             Some("completed") | None => "idle",
             Some(status) => status,
         };
+        // Another lead under the name: the news was for the last one.
+        if name == self.lead
+            && self
+                .bots
+                .get(name)
+                .is_some_and(|had| had.id != record["bot_id"].as_i64())
+        {
+            self.forget();
+        }
         self.bots.insert(
             name.to_owned(),
             Bot {
@@ -185,6 +194,9 @@ impl Updates {
             "deleted" => {
                 self.bots.remove(name);
                 self.tasks.retain(|(task, _)| task != name);
+                if name == self.lead {
+                    self.forget();
+                }
             }
             "accepted" | "queued" => {
                 let Some(turn) = turn else { return };
@@ -439,9 +451,11 @@ impl Updates {
         }
     }
 
-    /// The lead was deleted, or another took its name.
+    /// The lead was deleted, or another took its name: what was news for
+    /// it is no one's.
     pub fn forget(&mut self) {
         self.tasks.clear();
+        self.forwarding.clear();
     }
 
     /// What was saved to or removed from the person's and the project's
@@ -900,6 +914,41 @@ mod tests {
         // Told once.
         assert!(!news(&mut updates).contains("Memory changed"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_new_lead_under_the_name_does_not_hear_the_last_ones_news() {
+        let now = Instant::now();
+        for gone in [
+            ev("shop.lead", None, "deleted", json!({})),
+            // Seated afresh on reconnecting, with another ID.
+            json!({}),
+        ] {
+            let mut updates = fleet();
+            turn(
+                &mut updates,
+                "shop.fix",
+                4,
+                json!({"from": {"bot": "shop.lead", "turn": 9}}),
+                "completed",
+            );
+            if gone["event"] == "deleted" {
+                updates.event(&gone, now);
+                updates.event(
+                    &ev(
+                        "shop.lead",
+                        None,
+                        "created",
+                        json!({"bot_id": 7, "status": "idle"}),
+                    ),
+                    now,
+                );
+            } else {
+                updates.seat(&json!({"name": "shop.lead", "bot_id": 7, "status": "idle"}));
+            }
+            assert!(!updates.due(now), "{gone}");
+            assert!(updates.take(now).unwrap().sent.is_empty());
+        }
     }
 
     #[test]
