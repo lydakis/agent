@@ -49,7 +49,7 @@ impl Markdown {
         out
     }
 
-    /// A table held until a line that is not one, drawn.
+    /// What is still held when a table ends.
     pub fn finish(&mut self, width: usize) -> Vec<Line<'static>> {
         if self.table.is_empty() {
             return Vec::new();
@@ -57,18 +57,25 @@ impl Markdown {
         crate::table::draw(&std::mem::take(&mut self.table), width)
     }
 
-    /// What is still held when the reply ends: a table, or a fence it never
-    /// closed (cut off or interrupted), whose lines show as code rather
-    /// than vanish.
-    pub fn end(&mut self, width: usize) -> Vec<Line<'static>> {
+    /// What is still held when the reply ends: a table, and a fence or
+    /// `$$` block that never closed, shown as the code it is.
+    pub fn end(&mut self, width: usize, first: bool) -> Vec<Line<'static>> {
         let mut out = self.finish(width);
         if let Some((_, source)) = self.picture.take() {
-            for line in source.lines() {
-                let code = Line::from(line.to_owned()).fg(Color::Cyan);
-                out.extend(wrap(code, width, Span::raw("  "), Span::raw("  ")));
+            for text in source.trim_start_matches('\n').lines() {
+                let lead = if first && out.is_empty() {
+                    "• "
+                } else {
+                    "  "
+                };
+                let line = Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(text.to_owned(), Style::new().fg(Color::Cyan)),
+                ]);
+                out.extend(wrap(line, width, Span::raw(lead), Span::raw("    ")));
             }
         }
-        (self.fence, self.math) = (false, false);
+        *self = Self::default();
         out
     }
 
@@ -538,7 +545,8 @@ pub fn reply(text: &str, width: usize) -> Vec<Line<'static>> {
         let first = out.is_empty();
         out.extend(markdown.feed(line, width, first));
     }
-    out.extend(markdown.end(width));
+    let first = out.is_empty();
+    out.extend(markdown.end(width, first));
     out
 }
 
@@ -1027,6 +1035,14 @@ mod tests {
             text(&rows),
             ["• Hi x", "  Head", "    let a = 1;", "  - item"]
         );
+    }
+
+    #[test]
+    fn a_fence_that_never_closes_still_shows_as_code() {
+        let rows = reply("Here:\n```diff\n-a\n+b", 40);
+        assert_eq!(text(&rows), ["• Here:", "    -a", "    +b"]);
+        let rows = reply("$$\nx^2", 40);
+        assert_eq!(text(&rows), ["•   x^2"]);
     }
 
     #[test]
