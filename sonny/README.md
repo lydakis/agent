@@ -15,8 +15,9 @@ the app opens, made through the app's `~/.agent/project add` when the app is
 installed, else in the app's coordinator profile. A lead moved to another
 folder (`--workspace`) comes back with the next message Sonny sends it from
 its own, history and all. When `rex` is found
-(`$REX`, the PATH, or the Mac app), the project gets a Rex session labelled
-with its name, and each task the lead (or one of its tasks) starts gets a
+(`$REX`, the PATH, or the Mac app), the project gets one Rex session: the
+one Sonny was opened in (named after the project when Rex made its name up),
+else the one the lead is in, else one labelled with the project's name. Each task the lead (or one of its tasks) starts gets a
 window there running Sonny on that task, without taking focus. Each window
 reports OSC 7501 status, so Rex shows which task is working, waiting on an
 approval or done. A task's window closes once its work is taken: its turn
@@ -25,7 +26,11 @@ failed, stopped or waits on you stays open, and a task given more work opens
 again; ask the lead to show one, or run `sonny --bot NAME`. `--rex-host HOST` puts the session on another Rex server;
 `--no-rex` turns the layout off. On first use Sonny writes the `rex-windows`
 skill (`skills/rex-windows/SKILL.md`) to `~/.agents/skills/rex-windows`, so any agent can run a
-long command in a Rex window the person can watch, and read it back.
+long command where the person can watch it, and read it back:
+`sonny run NAME [--window] -- COMMAND...` opens a block labelled
+`AGENT/NAME` below the agent's own (or in a tab of its own) and prints its ID.
+The skill tells agents to close what they opened once read; whatever a task
+left open closes with its window.
 
 Enter sends (and steers a running turn), Esc interrupts, `y`/`n` answer a
 pending approval, Ctrl-C clears the composer or quits. `/` lists the

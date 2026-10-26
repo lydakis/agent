@@ -120,14 +120,7 @@ async fn show() -> Result<(), String> {
             _ => return Err(usage.into()),
         }
     }
-    let socket = std::env::var_os("AGENT_SOCKET")
-        .map(PathBuf::from)
-        .ok_or("run this from an agent's shell (AGENT_SOCKET is not set)")?;
-    let socket = std::path::absolute(socket).map_err(|e| e.to_string())?;
-    let client = Client::connect(&socket).await.map_err(|e| e.to_string())?.0;
-    let project = project_of(&client, caller.as_deref().unwrap_or(&bot)).await;
-    let bin = rex::find().ok_or("rex not found")?;
-    let mut rex = rex::Rex::open(bin, host.as_deref(), &project)?;
+    let (socket, project, mut rex) = agents_rex(caller.as_deref().unwrap_or(&bot), host).await?;
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     let command = [
         me.to_string_lossy().into_owned(),
@@ -150,7 +143,60 @@ async fn show() -> Result<(), String> {
     // while this placed it: what it opened then goes.
     std::thread::sleep(Duration::from_millis(1500));
     rex.close_others(&bot);
-    println!("{}", json!({"bot": bot, "session": project}));
+    println!("{}", json!({"bot": bot, "session": rex.name}));
+    Ok(())
+}
+
+/// The daemon's socket, the project `bot` belongs to, and its Rex session,
+/// from an agent's shell.
+async fn agents_rex(
+    bot: &str,
+    host: Option<String>,
+) -> Result<(PathBuf, String, rex::Rex), String> {
+    let socket = std::env::var_os("AGENT_SOCKET")
+        .map(PathBuf::from)
+        .ok_or("run this from an agent's shell (AGENT_SOCKET is not set)")?;
+    let socket = std::path::absolute(socket).map_err(|e| e.to_string())?;
+    let client = Client::connect(&socket).await.map_err(|e| e.to_string())?.0;
+    let project = project_of(&client, bot).await;
+    let bin = rex::find().ok_or("rex not found")?;
+    let rex = rex::Rex::open(bin, host.as_deref(), &project, false)?;
+    Ok((socket, project, rex))
+}
+
+/// `sonny run NAME [--window] [--rex-host HOST] -- COMMAND...`: run a
+/// command an agent wants watched (a dev server, a long build) in a Rex
+/// block labelled `AGENT/NAME`, below the agent's own block or in a window
+/// of its own, and print the block's ID. It closes with the agent's window.
+async fn run_block() -> Result<(), String> {
+    let usage = "usage: sonny run NAME [--window] [--rex-host HOST] -- COMMAND...";
+    let mut args = std::env::args().skip(2);
+    let name = args.next().filter(|n| !n.starts_with('-')).ok_or(usage)?;
+    if name.contains('/') {
+        return Err("a name without /".into());
+    }
+    let owner = std::env::var("AGENT_BOT")
+        .map_err(|_| "run this from an agent's shell (AGENT_BOT is not set)")?;
+    let (mut window, mut host) = (false, None);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--window" => window = true,
+            "--rex-host" => host = Some(args.next().ok_or(usage)?),
+            "--" => break,
+            _ => return Err(usage.into()),
+        }
+    }
+    let command: Vec<String> = args.collect();
+    if command.is_empty() {
+        return Err(usage.into());
+    }
+    let (_, _, mut rex) = agents_rex(&owner, host).await?;
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let block = rex.run(&owner, &name, &cwd, &command, window)?;
+    println!(
+        "{}",
+        json!({"block": block, "label": format!("{owner}/{name}"), "session": rex.name})
+    );
     Ok(())
 }
 
@@ -359,8 +405,10 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn run() -> Result<(), String> {
-    if std::env::args().nth(1).as_deref() == Some("show") {
-        return show().await;
+    match std::env::args().nth(1).as_deref() {
+        Some("show") => return show().await,
+        Some("run") => return run_block().await,
+        _ => {}
     }
     if std::env::args().nth(1).as_deref() == Some("--version") {
         println!("sonny {}", env!("CARGO_PKG_VERSION"));
@@ -797,7 +845,7 @@ struct Fleet {
 impl Fleet {
     async fn start(options: &Options, project: &str, lead: &str) -> Option<Self> {
         let bin = rex::find()?;
-        let rex = rex::Rex::open(bin.clone(), options.rex_host.as_deref(), project).ok()?;
+        let rex = rex::Rex::open(bin.clone(), options.rex_host.as_deref(), project, true).ok()?;
         let (client, mut events) = Client::connect(&options.socket).await.ok()?;
         client
             .request("follow", json!({"bot": "*", "after": 0}))
@@ -816,7 +864,7 @@ impl Fleet {
             "--no-sound".into(),
         ];
         // Said only when the tasks go somewhere this pane is not.
-        let note = (!rex.here).then(|| format!("tasks open in Rex session {project}"));
+        let note = (!rex.here).then(|| format!("tasks open in Rex session {}", rex.name));
         rex::install_skill(&bin);
         let mut fleet = Self {
             rex,
@@ -1169,7 +1217,7 @@ impl Fleet {
                 None
             }
             "accepted" if bot != self.lead && self.lineage.contains(bot) => match self.show(bot) {
-                Ok(true) if !self.rex.here => Some(format!("{bot} is in Rex ({})", self.rex.label)),
+                Ok(true) if !self.rex.here => Some(format!("{bot} is in Rex ({})", self.rex.name)),
                 Ok(_) => None,
                 Err(error) => Some(error),
             },
