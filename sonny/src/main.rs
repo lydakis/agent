@@ -641,9 +641,10 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
 
 /// The viewport's rows, top to bottom: the reply's open line, the status,
 /// a gap, the composer (as many rows as are left) and the footer.
-fn areas(area: ratatui::layout::Rect) -> [ratatui::layout::Rect; 5] {
+/// The live area is `live` rows: the reply's open line, wrapped.
+fn areas(area: ratatui::layout::Rect, live: u16) -> [ratatui::layout::Rect; 5] {
     Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(live.max(1)),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(1),
@@ -1911,6 +1912,20 @@ impl App {
     }
 
     /// The reply's last lines, and a table it ended on, drawn.
+    /// The reply's open line, the part after its last newline, as the rows
+    /// it will take once written.
+    fn open_rows(&self, width: usize) -> Vec<Line<'static>> {
+        let Some(open) = self.live.as_ref().filter(|open| !open.partial.is_empty()) else {
+            return Vec::new();
+        };
+        let mut markdown = open.markdown.clone();
+        let Some(line) = markdown.line(&open.partial) else {
+            return Vec::new();
+        };
+        let lead = if open.lines == 0 { "• " } else { "  " };
+        transcript::wrap(line, width, Span::raw(lead), markdown.rest())
+    }
+
     fn end_live(&mut self) {
         if let Some(mut live) = self.live.take() {
             let rest = std::mem::take(&mut live.partial);
@@ -2999,7 +3014,17 @@ impl App {
         let room = (terminal.size()?.height as usize).saturating_sub(VIEWPORT as usize - 1);
         let over = composer_rows.len().saturating_sub(room.max(1));
         composer_rows.drain(..over);
-        fit(terminal, VIEWPORT - 1 + composer_rows.len() as u16)?;
+        // The reply's open line, wrapped as it will be written: it grows
+        // here row by row until its newline writes it into the history.
+        let mut open_rows = self.open_rows(width);
+        let spare = room.saturating_sub(composer_rows.len()) + 1;
+        let hidden = open_rows.len().saturating_sub(spare.max(1));
+        open_rows.drain(..hidden);
+        let live_rows = open_rows.len().max(1) as u16;
+        fit(
+            terminal,
+            VIEWPORT - 2 + live_rows + composer_rows.len() as u16,
+        )?;
         if !self.pending.is_empty() {
             let lines: Vec<Line<'static>> = std::mem::take(&mut self.pending)
                 .into_iter()
@@ -3019,22 +3044,8 @@ impl App {
             }
         }
         terminal.draw(|frame| {
-            let [live, status, _, composer, footer] = areas(frame.area());
-            let width = live.width as usize;
-            if let Some(open) = &self.live
-                && !open.partial.is_empty()
-            {
-                let mut markdown = open.markdown.clone();
-                if let Some(line) = markdown.line(&open.partial) {
-                    let lead = if open.lines == 0 { "• " } else { "  " };
-                    // The open line's end, when it is already wider than a row.
-                    let rows = transcript::wrap(line, width, Span::raw(lead), markdown.rest());
-                    frame.render_widget(
-                        Paragraph::new(rows.last().cloned().unwrap_or_default()),
-                        live,
-                    );
-                }
-            }
+            let [live, status, _, composer, footer] = areas(frame.area(), live_rows);
+            frame.render_widget(Paragraph::new(open_rows.clone()), live);
             frame.render_widget(Paragraph::new(self.status_line()), status);
             let menu = self.menu();
             if !menu.is_empty() {
@@ -3063,7 +3074,7 @@ impl App {
                         }
                     })
                     .collect();
-                let [_, _, _, composer_row, _] = areas(frame.area());
+                let [_, _, _, composer_row, _] = areas(frame.area(), live_rows);
                 let area = ratatui::layout::Rect {
                     y: composer_row.y.saturating_sub(rows.len() as u16),
                     height: rows.len() as u16,
