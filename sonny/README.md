@@ -27,7 +27,14 @@ pending approval, Ctrl-C clears the composer or quits. `/` lists the
 commands:
 
 - `/model` picks the lead's model, from every model its provider family
-  lists, and its effort (←/→).
+  lists, and its effort (←/→), and writes them to the project's
+  `.agents/project.toml` when the folder has one. A pick made while a turn
+  runs shows in the footer and applies when the lead is idle; one that
+  another client overtakes is dropped.
+- `/instructions` gives the lead its folder's instructions again: its
+  role, `AGENTS.md`, skills and memory. Sonny does this on its own when
+  it opens a lead whose instructions it saw composed from the folder, and
+  leaves ones set any other way alone.
 - `/approvals` picks whether calls wait for a verdict: `auto`, a judge
   model (a new lead starts here, and Sonny starts `agent approver` when
   nothing serves it), `ask`, you, or `full`, none. Tasks the lead makes keep
