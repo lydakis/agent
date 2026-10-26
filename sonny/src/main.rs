@@ -517,11 +517,12 @@ struct Running {
 
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, unlisted.
-const COMMANDS: [(&str, &str); 6] = [
+const COMMANDS: [(&str, &str); 7] = [
     ("/model", "the model and effort"),
     ("/approvals", "whether calls wait for a verdict"),
     ("/status", "this project's agents"),
     ("/sound", "the chime when work ends, on or off"),
+    ("/copy", "the last reply, as Markdown"),
     ("/open", "the last HTML page, in your browser"),
     ("/quit", "the agents keep working"),
 ];
@@ -602,6 +603,8 @@ struct App {
     choosing: Option<usize>,
     /// The mode picked, set once no turn runs.
     gating: Option<&'static str>,
+    /// The newest reply's text, for `/copy`.
+    last_reply: String,
 }
 
 /// The lead's tasks, laid out in the project's Rex session: a window for
@@ -912,6 +915,7 @@ impl App {
             mode: approvals::mode(record),
             choosing: None,
             gating: None,
+            last_reply: String::new(),
         }
     }
 
@@ -1288,7 +1292,8 @@ impl App {
                         self.commit(lines);
                     }
                     (_, Some("assistant")) => {
-                        let lines = transcript::reply(&text(&item), self.width);
+                        self.last_reply = text(&item);
+                        let lines = transcript::reply(&self.last_reply, self.width);
                         self.commit(lines);
                     }
                     (Some("function_call"), _) => {
@@ -1475,6 +1480,9 @@ impl App {
                     None => None,
                 }
                 .filter(|item| item["role"] == "assistant");
+                if let Some(item) = &item {
+                    self.last_reply = text(item);
+                }
                 let said = std::mem::take(&mut self.said);
                 self.replay = None;
                 if self.streamed {
@@ -2088,6 +2096,16 @@ impl App {
                     .position(|(mode, _)| Some(*mode) == current)
                     .unwrap_or(0),
             );
+            return;
+        }
+        if prompt == "/copy" {
+            self.input.clear();
+            self.notice = Some(if self.last_reply.is_empty() {
+                "no reply yet".into()
+            } else {
+                term::copy(&self.last_reply);
+                "copied".into()
+            });
             return;
         }
         if prompt == "/sound" {

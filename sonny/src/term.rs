@@ -224,3 +224,25 @@ mod tests {
         );
     }
 }
+
+/// Put `text` on the clipboard: through `pbcopy` on the Mac Sonny runs on,
+/// else OSC 52, which the terminal answers wherever it is.
+pub fn copy(text: &str) {
+    if cfg!(target_os = "macos")
+        && std::env::var_os("SSH_CONNECTION").is_none()
+        && let Ok(mut child) = std::process::Command::new("/usr/bin/pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+    {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+        return;
+    }
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    let mut stdout = std::io::stdout();
+    let _ = write!(stdout, "\x1b]52;c;{encoded}\x07");
+    let _ = stdout.flush();
+}
