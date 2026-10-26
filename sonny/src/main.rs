@@ -23,6 +23,7 @@ mod mermaid;
 mod models;
 mod mux;
 mod project;
+mod prompt;
 mod rex;
 mod settings;
 mod shell;
@@ -655,6 +656,15 @@ fn areas(area: ratatui::layout::Rect) -> [ratatui::layout::Rect; 5] {
 /// The viewport made `height` rows tall, for a composer that grew or
 /// shrank. It keeps its top: a taller one pushes history up, and a shorter
 /// one leaves blank rows under it that the next history fills.
+/// At most `keep` of `rows`, as near the end as still shows `row`; and
+/// where `row` is among them.
+fn window(mut rows: Vec<Line<'static>>, row: usize, keep: usize) -> (Vec<Line<'static>>, usize) {
+    let start = rows.len().saturating_sub(keep).min(row);
+    rows.drain(..start);
+    rows.truncate(keep);
+    (rows, row - start)
+}
+
 fn fit(terminal: &mut Tui, height: u16) -> std::io::Result<()> {
     let area = terminal.get_frame().area();
     let height = height.min(terminal.size()?.height);
@@ -823,7 +833,7 @@ struct App {
     /// How big the conversation was after its last model round, as the
     /// next round reads it, once known.
     context: Option<u64>,
-    input: String,
+    input: prompt::Prompt,
     /// Lines waiting to be written into scrollback.
     pending: Vec<Line<'static>>,
     /// Lines let go while `/status` held the screen, past what is kept.
@@ -1345,7 +1355,7 @@ impl App {
             model,
             effort: record["effort"].as_str().map(str::to_owned),
             context: None,
-            input: String::new(),
+            input: prompt::Prompt::default(),
             pending: Vec::new(),
             skipped: 0,
             any_history: false,
@@ -2573,7 +2583,7 @@ impl App {
         }
         COMMANDS
             .into_iter()
-            .filter(|(name, _)| name.starts_with(self.input.as_str()))
+            .filter(|(name, _)| name.starts_with(&*self.input))
             .collect()
     }
 
@@ -2670,12 +2680,12 @@ impl App {
                     return;
                 }
                 KeyCode::Tab => {
-                    self.input = picked.to_owned();
+                    self.input.set(picked);
                     self.pick = 0;
                     return;
                 }
                 KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    self.input = picked.to_owned();
+                    self.input.set(picked);
                     self.pick = 0;
                     self.submit().await;
                     return;
@@ -2692,10 +2702,13 @@ impl App {
             // Terminals send a pasted line break as a carriage return.
             Event::Paste(text) => self
                 .input
-                .push_str(&text.replace("\r\n", "\n").replace('\r', "\n")),
+                .insert(&text.replace("\r\n", "\n").replace('\r', "\n")),
             Event::Resize(width, _) => self.width = width as usize,
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                // Option on a Mac: terminals send Option-← and → as
+                // Alt-b and Alt-f unless set to send them as arrows.
+                let alt = key.modifiers.contains(KeyModifiers::ALT);
                 match key.code {
                     KeyCode::Char('c') if ctrl => {
                         if self.input.is_empty() {
@@ -2705,6 +2718,7 @@ impl App {
                         }
                     }
                     KeyCode::Char('d') if ctrl && self.input.is_empty() => self.quit = true,
+                    KeyCode::Char('d') if ctrl => self.input.delete(),
                     KeyCode::Char(c @ ('y' | 'n'))
                         if !self.approvals.is_empty() && self.input.is_empty() =>
                     {
@@ -2717,12 +2731,33 @@ impl App {
                             self.answer(if c == 'y' { "allow" } else { "deny" }).await;
                         }
                     }
-                    KeyCode::Char(c) if !ctrl => self.input.push(c),
-                    KeyCode::Backspace => {
-                        self.input.pop();
+                    KeyCode::Char('a') if ctrl => self.input.home(),
+                    KeyCode::Char('e') if ctrl => self.input.end(),
+                    KeyCode::Char('b') if ctrl => self.input.left(),
+                    KeyCode::Char('f') if ctrl => self.input.right(),
+                    KeyCode::Char('u') if ctrl => self.input.delete_to_start(),
+                    KeyCode::Char('k') if ctrl => self.input.delete_to_end(),
+                    KeyCode::Char('w') if ctrl => self.input.delete_word(),
+                    KeyCode::Char('b') if alt => self.input.word_left(),
+                    KeyCode::Char('f') if alt => self.input.word_right(),
+                    KeyCode::Char(c) if !ctrl => self.input.insert(c.encode_utf8(&mut [0; 4])),
+                    KeyCode::Backspace if ctrl || alt => self.input.delete_word(),
+                    KeyCode::Backspace => self.input.backspace(),
+                    KeyCode::Delete => self.input.delete(),
+                    KeyCode::Left if ctrl || alt => self.input.word_left(),
+                    KeyCode::Right if ctrl || alt => self.input.word_right(),
+                    KeyCode::Left => self.input.left(),
+                    KeyCode::Right => self.input.right(),
+                    KeyCode::Home => self.input.home(),
+                    KeyCode::End => self.input.end(),
+                    KeyCode::Up => {
+                        self.input.up(self.width);
+                    }
+                    KeyCode::Down => {
+                        self.input.down(self.width);
                     }
                     KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        self.input.push('\n')
+                        self.input.insert("\n")
                     }
                     KeyCode::Enter => self.submit().await,
                     KeyCode::Esc => {
@@ -2994,11 +3029,10 @@ impl App {
         terminal.autoresize()?;
         let width = terminal.size()?.width as usize;
         self.width = width;
-        let mut composer_rows = self.composer(width);
-        // A short pane keeps the prompt's end, where typing goes on.
+        let (composer_rows, (cursor_row, cursor_col)) = self.composer(width);
+        // A short pane keeps the rows around the cursor, where typing goes on.
         let room = (terminal.size()?.height as usize).saturating_sub(VIEWPORT as usize - 1);
-        let over = composer_rows.len().saturating_sub(room.max(1));
-        composer_rows.drain(..over);
+        let (composer_rows, cursor_row) = window(composer_rows, cursor_row, room.max(1));
         fit(terminal, VIEWPORT - 1 + composer_rows.len() as u16)?;
         if !self.pending.is_empty() {
             let lines: Vec<Line<'static>> = std::mem::take(&mut self.pending)
@@ -3169,16 +3203,10 @@ impl App {
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
-            // The prompt's end, where typing goes on.
-            let cursor = match composer_rows.last() {
-                Some(row) if !self.input.is_empty() => row.width(),
-                _ => 2,
-            };
-            let last = composer.y + composer.height.saturating_sub(1);
             frame.render_widget(Paragraph::new(composer_rows), composer);
             frame.set_cursor_position((
-                composer.x + (cursor as u16).min(composer.width.saturating_sub(1)),
-                last,
+                composer.x + (cursor_col as u16).min(composer.width.saturating_sub(1)),
+                composer.y + (cursor_row as u16).min(composer.height.saturating_sub(1)),
             ));
             frame.render_widget(Paragraph::new(self.footer_line(width)), footer);
         })?;
@@ -3186,38 +3214,46 @@ impl App {
     }
 
     /// The composer's rows: the prompt wrapped to the width, the way it
-    /// will read once sent, and only its end when it is long; or the hint.
-    /// A list or picker open over the composer keeps it to one row.
-    fn composer(&self, width: usize) -> Vec<Line<'static>> {
+    /// will read once sent, and only the rows around the cursor when it
+    /// is long; or the hint. Also the cursor's row among those and its
+    /// column. A list or picker open over the composer keeps it to the
+    /// cursor's row.
+    fn composer(&self, width: usize) -> (Vec<Line<'static>>, (usize, usize)) {
         if self.input.is_empty() {
             let hint = match self.running {
                 Some(_) => "Steer the running turn",
                 None => "Ask anything",
             };
-            return vec![Line::from(vec![
-                Span::raw("› ").bold(),
-                Span::raw(hint).dim(),
-            ])];
+            return (
+                vec![Line::from(vec![
+                    Span::raw("› ").bold(),
+                    Span::raw(hint).dim(),
+                ])],
+                (0, prompt::LEAD),
+            );
         }
-        let mut rows = Vec::new();
-        for (at, line) in self.input.split('\n').enumerate() {
-            let lead = match at {
-                0 => Span::raw("› ").bold(),
-                _ => Span::raw("  "),
-            };
-            rows.extend(transcript::wrap(
-                Line::from(line.to_owned()),
-                width.saturating_sub(1),
-                lead,
-                Span::raw("  "),
-            ));
-        }
-        if self.choosing.is_some() || self.picker.is_some() {
-            rows.drain(..rows.len() - 1);
-        }
-        let over = rows.len().saturating_sub(COMPOSER_ROWS);
-        rows.drain(..over);
-        rows
+        let layout = self.input.layout(width);
+        let (row, col) = self.input.cursor(&layout);
+        let rows: Vec<Line<'static>> = layout
+            .iter()
+            .enumerate()
+            .map(|(at, part)| {
+                let lead = match at {
+                    0 => Span::raw("› ").bold(),
+                    _ => Span::raw("  "),
+                };
+                Line::from(vec![
+                    lead,
+                    Span::raw(self.input[part.start..part.end].to_owned()),
+                ])
+            })
+            .collect();
+        let keep = match self.choosing.is_some() || self.picker.is_some() {
+            true => 1,
+            false => COMPOSER_ROWS,
+        };
+        let (rows, row) = window(rows, row, keep);
+        (rows, (row, col))
     }
 
     fn status_line(&self) -> Line<'static> {
