@@ -870,7 +870,8 @@ Current limits: 8 MiB / 4,096 items of model context per request (stored
 history is unbounded), 256 KiB input prompt, 64 KiB instructions, 768 KiB JSON-encoded terminal provider output
 (a full 128,000-token answer, under the 1 MiB event cap; tool call ids and
 names count toward it), 64 KiB JSON-encoded
-tool call id without NUL (a longer one, or one with a NUL, fails the response
+tool call id without NUL, unique within its turn (a longer one, one with a
+NUL, or one an earlier call of the response or turn used fails the response
 with `invalid_tool_call_id`, so every gated call can be listed and answered
 by a command naming it alone), 2 MiB SSE frame,
 16 MiB response stream, 200 provider rounds per turn, and the configurable
@@ -1978,8 +1979,9 @@ usable; history tells the model to inspect current state before retrying.
 
 ### Tool approval
 
-A bot may be created with a gate (a root bot's can be replaced later with
-`configure`): `approve`, the tools whose calls wait for a
+A bot may be created with a gate (one no bot made, which a client
+created or forked, can have all its gates replaced later with `configure`,
+its source's included): `approve`, the tools whose calls wait for a
 verdict; `approver`, an opaque tag naming who answers, which the daemon
 stores and reports but never reads; and optionally `approve_expire_ms`.
 `approve` may name no more tools than the daemon registers (`invalid_gate`

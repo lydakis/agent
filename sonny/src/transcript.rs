@@ -49,12 +49,27 @@ impl Markdown {
         out
     }
 
-    /// What is still held when the reply ends: a table.
+    /// A table held until a line that is not one, drawn.
     pub fn finish(&mut self, width: usize) -> Vec<Line<'static>> {
         if self.table.is_empty() {
             return Vec::new();
         }
         crate::table::draw(&std::mem::take(&mut self.table), width)
+    }
+
+    /// What is still held when the reply ends: a table, or a fence it never
+    /// closed (cut off or interrupted), whose lines show as code rather
+    /// than vanish.
+    pub fn end(&mut self, width: usize) -> Vec<Line<'static>> {
+        let mut out = self.finish(width);
+        if let Some((_, source)) = self.picture.take() {
+            for line in source.lines() {
+                let code = Line::from(line.to_owned()).fg(Color::Cyan);
+                out.extend(wrap(code, width, Span::raw("  "), Span::raw("  ")));
+            }
+        }
+        (self.fence, self.math) = (false, false);
+        out
     }
 
     /// What the last line's wrapped rows start with, inside a reply.
@@ -523,7 +538,7 @@ pub fn reply(text: &str, width: usize) -> Vec<Line<'static>> {
         let first = out.is_empty();
         out.extend(markdown.feed(line, width, first));
     }
-    out.extend(markdown.finish(width));
+    out.extend(markdown.end(width));
     out
 }
 
@@ -699,6 +714,13 @@ pub fn tool(
         Span::raw(" "),
         Span::raw(what.lines().next().unwrap_or("").to_owned()),
     ]);
+    // A file tool that failed changed nothing: what it was asked to do is
+    // not drawn, its error is.
+    if failed && matches!(name, "edit" | "write" | "read") {
+        let mut out = wrap(header, width, bullet, Span::raw("    "));
+        out.extend(preview(output.unwrap_or(""), width));
+        return out;
+    }
     let edit = (name == "edit").then(|| diff(arguments, workspace));
     if let Some(edit) = &edit {
         let (removed, added) = edit.counts();
@@ -984,6 +1006,14 @@ mod tests {
     }
 
     #[test]
+    fn a_fence_left_open_shows_what_it_had() {
+        let lines = reply("Here:\n```diff\n-old\n+new", 80);
+        let shown: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        assert!(shown.iter().any(|l| l.contains("-old")), "{shown:?}");
+        assert!(shown.iter().any(|l| l.contains("+new")), "{shown:?}");
+    }
+
+    #[test]
     fn wrapping_keeps_every_word_and_the_hanging_indent() {
         let line = Line::from("one two three four five six");
         let rows = wrap(line, 12, Span::raw("• "), Span::raw("  "));
@@ -1089,6 +1119,24 @@ mod tests {
             60,
         );
         assert_eq!(text(&rows)[1], "  └ c.fix completed: Fixed it.");
+    }
+
+    #[test]
+    fn a_failed_edit_shows_its_error_not_a_diff() {
+        let rows: Vec<String> = tool(
+            "edit",
+            &serde_json::json!({"path": "/w/a.rs", "old": "x", "new": "y"}),
+            Some("edit_target_not_found"),
+            true,
+            "/w",
+            80,
+        )
+        .iter()
+        .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows[0].contains("Edited a.rs") && !rows[0].contains('+'));
+        assert!(rows[1].contains("edit_target_not_found"));
     }
 
     #[test]

@@ -101,7 +101,7 @@ fn usage() -> String {
 /// task's window where the person asked, from the lead's shell. A task gets
 /// a window of its own unless told otherwise; `--split` puts it beside the
 /// lead's block, or `--beside` another bot's.
-fn show() -> Result<(), String> {
+async fn show() -> Result<(), String> {
     let usage =
         "usage: sonny show TASK [--split right|left|above|below [--beside BOT]] [--rex-host HOST]";
     let mut args = std::env::args().skip(2);
@@ -122,14 +122,8 @@ fn show() -> Result<(), String> {
         .map(PathBuf::from)
         .ok_or("run this from an agent's shell (AGENT_SOCKET is not set)")?;
     let socket = std::path::absolute(socket).map_err(|e| e.to_string())?;
-    // The project is what the names start with: `calc` for `calc.lead`.
-    let project = caller
-        .as_deref()
-        .unwrap_or(&bot)
-        .split('.')
-        .next()
-        .unwrap_or(&bot)
-        .to_owned();
+    let client = Client::connect(&socket).await.map_err(|e| e.to_string())?.0;
+    let project = project_of(&client, caller.as_deref().unwrap_or(&bot)).await;
     let bin = rex::find().ok_or("rex not found")?;
     let mut rex = rex::Rex::open(bin, host.as_deref(), &project)?;
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -158,6 +152,25 @@ fn show() -> Result<(), String> {
     Ok(())
 }
 
+/// The project a bot's name starts with: the longest start that names a
+/// lead, as `shop.web` for `shop.web.fix` when `shop.web.lead` is there;
+/// else the name up to its first dot.
+async fn project_of(client: &Client, bot: &str) -> String {
+    let mut starts: Vec<&str> = bot.match_indices('.').map(|(at, _)| &bot[..at]).collect();
+    starts.reverse();
+    for start in &starts {
+        let lead = format!("{start}.lead");
+        let page = client
+            .request("bots", json!({"name": lead, "limit": 1}))
+            .await
+            .unwrap_or_default();
+        if page["bots"][0]["name"] == lead.as_str() {
+            return (*start).to_owned();
+        }
+    }
+    starts.last().copied().unwrap_or(bot).to_owned()
+}
+
 /// A program on PATH.
 fn which(program: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
@@ -166,9 +179,9 @@ fn which(program: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// Agent's own binary: the one the daemon gave this shell, else the one
-/// installed with Sonny (Homebrew's `libexec/agent`, beside `bin/sonny`),
-/// which speaks Sonny's protocol, else the app's. Not `agent` on PATH,
+/// Agent's own binary: the one the daemon gave this shell (or Homebrew's
+/// wrapper names, by a path upgrades keep), else the one installed beside
+/// Sonny (`libexec/agent`), which speaks Sonny's protocol, else the app's. Not `agent` on PATH,
 /// which may be another program.
 fn agent_bin() -> Option<PathBuf> {
     let beside = std::env::current_exe()
@@ -179,7 +192,9 @@ fn agent_bin() -> Option<PathBuf> {
         .map(PathBuf::from)
         .into_iter()
         .chain(beside)
-        .chain([PathBuf::from("/Applications/Agent.app/Contents/MacOS/agent")])
+        .chain([PathBuf::from(
+            "/Applications/Agent.app/Contents/MacOS/agent",
+        )])
         .find(|bin| bin.is_file())
 }
 
@@ -340,7 +355,7 @@ async fn main() -> std::process::ExitCode {
 
 async fn run() -> Result<(), String> {
     if std::env::args().nth(1).as_deref() == Some("show") {
-        return show();
+        return show().await;
     }
     if std::env::args().nth(1).as_deref() == Some("--version") {
         println!("sonny {}", env!("CARGO_PKG_VERSION"));
@@ -377,17 +392,19 @@ async fn run() -> Result<(), String> {
             (lead.bot, Some(lead.project))
         }
     };
-    let bot = client
-        .request("inspect", json!({"bot": name}))
-        .await
-        .map_err(|e| e.to_string())?;
     // Everything after now arrives live; history is read from the bot's
-    // items instead of replayed events, so the replay is skipped.
+    // items instead of replayed events, so the replay is skipped. The bot
+    // is read after that, so a turn that ended during the replay is seen
+    // as ended.
     client
         .request("follow", json!({"bot": name, "after": 0}))
         .await
         .map_err(|e| e.to_string())?;
     caught_up(&mut events).await;
+    let bot = client
+        .request("inspect", json!({"bot": name}))
+        .await
+        .map_err(|e| e.to_string())?;
 
     enable_raw_mode().map_err(|e| e.to_string())?;
     term::detect();
@@ -646,7 +663,7 @@ struct App {
 /// bot on its own connection, so the lead's own view is not disturbed.
 struct Fleet {
     rex: rex::Rex,
-    _client: Arc<Client>,
+    client: Arc<Client>,
     events: Events,
     socket: PathBuf,
     /// The connection dropped; it is made again with the lead's.
@@ -671,7 +688,7 @@ struct Fleet {
     errands: HashMap<String, String>,
     /// Finished calls whose output names a job to follow in a window:
     /// the bot, the output's node, and the command.
-    jobs: Vec<(String, i64, String)>,
+    jobs: Vec<(String, i64, String, String)>,
 }
 
 impl Fleet {
@@ -700,7 +717,7 @@ impl Fleet {
         rex::install_skill(&bin);
         let mut fleet = Self {
             rex,
-            _client: client.clone(),
+            client: client.clone(),
             events,
             socket: options.socket.clone(),
             down: false,
@@ -718,32 +735,42 @@ impl Fleet {
         };
         fleet.rex.adopt_own(lead);
         fleet.doing(lead, "idle");
-        // Tasks named in the project's way, and the ones already working.
-        if let Ok(page) = client
+        fleet.reconcile().await;
+        Some(fleet)
+    }
+
+    /// Tasks named in the project's way, and which are working, read
+    /// afresh: at start, and after a reconnect whose missed events are not
+    /// replayed. One that stopped meanwhile is marked idle, quietly.
+    async fn reconcile(&mut self) {
+        let Ok(page) = self
+            .client
             .request(
                 "bots",
-                json!({"name": format!("{project}.*"), "limit": 256}),
+                json!({"name": format!("{}.*", self.project), "limit": 256}),
             )
             .await
-        {
-            for bot in page["bots"].as_array().into_iter().flatten() {
-                let Some(name) = bot["name"].as_str() else {
-                    continue;
-                };
-                fleet.lineage.insert(name.to_owned());
-                let running = !bot["running_turn"].is_null();
-                if name != lead {
-                    fleet
-                        .doing
-                        .insert(name.to_owned(), if running { "working" } else { "idle" });
-                }
-                if name != lead && running {
-                    let _ = fleet.show(name);
-                }
+        else {
+            return;
+        };
+        for bot in page["bots"].as_array().into_iter().flatten() {
+            let Some(name) = bot["name"].as_str() else {
+                continue;
+            };
+            self.lineage.insert(name.to_owned());
+            let running = !bot["running_turn"].is_null();
+            if running && name != self.lead {
+                let _ = self.show(name);
+            } else if !running
+                && self
+                    .doing
+                    .get(name)
+                    .is_none_or(|doing| matches!(*doing, "working" | "needs you"))
+            {
+                self.doing.insert(name.to_owned(), "idle");
             }
         }
-        fleet.name_windows();
-        Some(fleet)
+        self.name_windows();
     }
 
     fn show(&mut self, bot: &str) -> Result<bool, String> {
@@ -774,7 +801,7 @@ impl Fleet {
                     && let Some(node) = data["node"].as_i64()
                     && data["failed"] != true
                 {
-                    self.jobs.push((bot.to_owned(), node, command));
+                    self.jobs.push((bot.to_owned(), node, call, command));
                 }
             }
             _ => {}
@@ -788,15 +815,22 @@ impl Fleet {
             self.jobs.clear();
             return;
         };
-        for (bot, node, command) in std::mem::take(&mut self.jobs) {
+        for (bot, node, call, command) in std::mem::take(&mut self.jobs) {
             let Ok(read) = self
-                ._client
+                .client
                 .request("history_items", json!({"bot": bot, "nodes": [node]}))
                 .await
             else {
                 continue;
             };
-            let (printed, _) = output(&read["items"][0]["item"]);
+            // An Anthropic node holds every result of its turn's calls.
+            let Some(result) = responses(&read["items"][0]["item"])
+                .into_iter()
+                .find(|item| item["call_id"] == call.as_str())
+            else {
+                continue;
+            };
+            let (printed, _) = output(&result);
             let Some(handle) = printed
                 .lines()
                 .map(str::trim)
@@ -893,9 +927,10 @@ impl Fleet {
             return false;
         }
         caught_up(&mut events).await;
-        self._client = client;
+        self.client = client;
         self.events = events;
         self.down = false;
+        self.reconcile().await;
         true
     }
 
@@ -1284,15 +1319,17 @@ impl App {
     async fn reattach(&mut self, events: &mut Events) {
         let lead = async {
             let (client, mut fresh) = connect(&self.options).await?;
-            let record = client
-                .request("inspect", json!({"bot": self.bot}))
-                .await
-                .map_err(|e| e.to_string())?;
             client
                 .request("follow", json!({"bot": self.bot, "after": 0}))
                 .await
                 .map_err(|e| e.to_string())?;
             caught_up(&mut fresh).await;
+            // Read after the replay, so a turn that ends meanwhile arrives
+            // as an event rather than lost between the two.
+            let record = client
+                .request("inspect", json!({"bot": self.bot}))
+                .await
+                .map_err(|e| e.to_string())?;
             Ok::<_, String>((client, fresh, record))
         };
         if self.down {
@@ -1343,6 +1380,12 @@ impl App {
             }
             self.approvals_for(self.running.as_ref().map(|r| r.turn))
                 .await;
+            // A daemon that restarted took the approver Sonny started with it.
+            if self.mode == Some("auto")
+                && let Err(error) = serve_auto(&self.client, &self.options, &self.model).await
+            {
+                self.notice = Some(error);
+            }
         }
         if let Some(fleet) = &mut self.fleet
             && fleet.down
@@ -1366,21 +1409,49 @@ impl App {
         self.pending.extend(lines);
     }
 
+    /// The items of `nodes`, in order and in the Responses family's shape.
+    /// A read stops at a byte limit, so what it left is asked for again.
     async fn items(&self, nodes: &[i64]) -> Vec<Value> {
-        match self
-            .client
-            .request("history_items", json!({"bot": self.bot, "nodes": nodes}))
-            .await
-        {
-            Ok(read) => read["items"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|entry| entry["item"].clone())
-                .collect(),
-            Err(_) => Vec::new(),
+        let mut items = Vec::new();
+        let mut rest = nodes;
+        while !rest.is_empty() {
+            let Ok(read) = self
+                .client
+                .request("history_items", json!({"bot": self.bot, "nodes": rest}))
+                .await
+            else {
+                break;
+            };
+            let entries = read["items"].as_array().cloned().unwrap_or_default();
+            if entries.is_empty() {
+                break;
+            }
+            rest = &rest[entries.len().min(rest.len())..];
+            items.extend(entries.iter().flat_map(|entry| responses(&entry["item"])));
         }
+        items
+    }
+
+    /// Call `id`, its name and arguments, read from the bot's newest items.
+    async fn call(&self, id: &str) -> Option<(String, Value)> {
+        let page = self
+            .client
+            .request("history_nodes", json!({"bot": self.bot, "limit": 32}))
+            .await
+            .ok()?;
+        let nodes: Vec<i64> = page["nodes"]
+            .as_array()?
+            .iter()
+            .filter_map(|n| n["node"].as_i64())
+            .collect();
+        let items = self.items(&nodes).await;
+        let call = items
+            .iter()
+            .find(|item| item["type"] == "function_call" && item["call_id"] == id)?;
+        Some((
+            call["name"].as_str()?.to_owned(),
+            serde_json::from_str(call["arguments"].as_str()?).ok()?,
+        ))
     }
 
     /// The bot's latest items, written as the transcript would have shown them.
@@ -1388,26 +1459,34 @@ impl App {
         self.history_after(0).await;
     }
 
-    /// The bot's items after `after`, newest [`HISTORY_ITEMS`] at most,
-    /// drawn as they would have been live.
+    /// The bot's items after `after`, drawn as they would have been live:
+    /// the newest [`HISTORY_ITEMS`] on attaching (`after` 0), and every one
+    /// since on reconnecting.
     async fn history_after(&mut self, after: i64) {
-        let Ok(page) = self
-            .client
-            .request(
-                "history_nodes",
-                json!({"bot": self.bot, "limit": HISTORY_ITEMS}),
-            )
-            .await
-        else {
-            return;
-        };
-        let mut nodes: Vec<i64> = page["nodes"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|n| n["node"].as_i64())
-            .filter(|node| *node > after)
-            .collect();
+        // On attach the newest page; on reconnecting, every page back to
+        // the last node this window drew, so nothing missed is skipped.
+        let mut nodes: Vec<i64> = Vec::new();
+        let mut asked = json!({"bot": self.bot, "limit": HISTORY_ITEMS});
+        if after > 0 {
+            asked["min_node"] = json!(after + 1);
+        }
+        loop {
+            let Ok(page) = self.client.request("history_nodes", asked.clone()).await else {
+                return;
+            };
+            nodes.extend(
+                page["nodes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|n| n["node"].as_i64())
+                    .filter(|node| *node > after),
+            );
+            if after == 0 || page["next_from"].is_null() {
+                break;
+            }
+            asked["from"] = page["next_from"].clone();
+        }
         nodes.reverse();
         self.seen_node = nodes.last().copied().unwrap_or(self.seen_node);
         let mut calls: HashMap<String, (String, Value)> = HashMap::new();
@@ -1419,9 +1498,12 @@ impl App {
                         self.commit(lines);
                     }
                     (_, Some("assistant")) => {
-                        self.last_reply = text(&item);
-                        let lines = transcript::reply(&self.last_reply, self.width);
-                        self.commit(lines);
+                        let reply = text(&item);
+                        if !reply.is_empty() {
+                            let lines = transcript::reply(&reply, self.width);
+                            self.commit(lines);
+                            self.last_reply = reply;
+                        }
                     }
                     (Some("function_call"), _) => {
                         let arguments = item["arguments"]
@@ -1436,7 +1518,11 @@ impl App {
                     }
                     (Some("function_call_output"), _) => {
                         let id = item["call_id"].as_str().unwrap_or("");
-                        if let Some((name, arguments)) = calls.remove(id) {
+                        // A call this window kept before it lost the daemon
+                        // may end in what it reads on reconnecting.
+                        if let Some((name, arguments)) =
+                            calls.remove(id).or_else(|| self.calls.remove(id))
+                        {
                             let (output, failed) = output(&item);
                             let lines = transcript::tool(
                                 &name,
@@ -1453,6 +1539,8 @@ impl App {
                 }
             }
         }
+        // A call still running finishes live, after the history.
+        self.calls.extend(calls);
     }
 
     /// The reply's last lines, and a table it ended on, drawn.
@@ -1465,7 +1553,7 @@ impl App {
                     self.live_line(&mut live, line);
                 }
             }
-            let held = live.markdown.finish(self.width);
+            let held = live.markdown.end(self.width);
             self.live_rows(&mut live, held);
         }
     }
@@ -1497,12 +1585,12 @@ impl App {
         let data = &event["data"];
         let turn = event["turn"].as_i64();
         // Followed before history was read, so what history showed can
-        // arrive again here.
-        if matches!(kind, "accepted" | "steered" | "message" | "tool_completed")
-            && data["node"]
-                .as_i64()
-                .is_some_and(|node| node <= self.seen_node)
-        {
+        // arrive again here. A turn it showed starting still runs: only
+        // its prompt is not drawn again.
+        let drawn = data["node"]
+            .as_i64()
+            .is_some_and(|node| node <= self.seen_node);
+        if drawn && matches!(kind, "steered" | "message" | "tool_completed") {
             return;
         }
         // Each node is drawn once, should its event come again.
@@ -1545,7 +1633,8 @@ impl App {
                 }
                 self.effort = data["effort"].as_str().map(str::to_owned);
                 status_report("working", &self.bot);
-                if let Some(node) = data["node"].as_i64()
+                if !drawn
+                    && let Some(node) = data["node"].as_i64()
                     && let Some(item) = self.items(&[node]).await.first()
                 {
                     let lines = transcript::prompt(&text(item), None, self.width);
@@ -1656,29 +1745,42 @@ impl App {
                 self.said.clear();
                 self.end_live();
                 let name = data["name"].as_str().unwrap_or("tool").to_owned();
-                let arguments = data["arguments"]
-                    .as_str()
-                    .and_then(|a| serde_json::from_str(a).ok())
-                    .unwrap_or(Value::Null);
+                let id = data["call_id"].as_str().unwrap_or("");
+                // A long call's event carries a preview; the call is kept whole.
+                let arguments = match data["arguments_truncated"] == true {
+                    true => self.call(id).await.map(|(_, arguments)| arguments),
+                    false => data["arguments"]
+                        .as_str()
+                        .and_then(|a| serde_json::from_str(a).ok()),
+                }
+                .unwrap_or(Value::Null);
                 if let Some(running) = &mut self.running {
                     running.phase = match (name.as_str(), arguments["command"].as_str()) {
                         ("shell", Some(command)) => format!("Running {}", first_line(command)),
                         _ => format!("Calling {name}"),
                     };
                 }
-                self.calls.insert(
-                    data["call_id"].as_str().unwrap_or("").to_owned(),
-                    (name, arguments),
-                );
+                self.calls.insert(id.to_owned(), (name, arguments));
             }
             "tool_completed" => {
                 let id = data["call_id"].as_str().unwrap_or("");
-                let Some((name, arguments)) = self.calls.remove(id) else {
+                // A call denied before it started has no start to have
+                // kept it: it is read from the bot's items.
+                let call = match self.calls.remove(id) {
+                    Some(call) => Some(call),
+                    None if data["denied"] == true => self.call(id).await,
+                    None => None,
+                };
+                let Some((name, arguments)) = call else {
                     return;
                 };
                 let mut shown = (String::new(), data["failed"] == true);
                 if let Some(node) = data["node"].as_i64()
-                    && let Some(item) = self.items(&[node]).await.first()
+                    && let Some(item) = self
+                        .items(&[node])
+                        .await
+                        .iter()
+                        .find(|i| i["call_id"] == id)
                 {
                     shown = output(item);
                     shown.1 |= data["failed"] == true;
@@ -2021,6 +2123,11 @@ impl App {
             .await;
         if let Err(error) = answered {
             self.notice = Some(error.to_string());
+        }
+        // A round with more calls waiting than one listing holds shows
+        // the rest once these are answered.
+        if self.approvals.is_empty() {
+            self.approvals_for(call["turn"].as_i64()).await;
         }
         if self.approvals.is_empty() {
             status_report("working", &self.bot);
@@ -2730,12 +2837,73 @@ fn output(item: &Value) -> (String, bool) {
         .as_str()
         .map(str::to_owned)
         .unwrap_or_else(|| text(item));
+    let failed = item["failed"] == true;
     match serde_json::from_str::<Value>(&raw) {
         Ok(shell) if shell.get("exit_code").is_some() => {
             let mut shown = shell["stdout"].as_str().unwrap_or("").to_owned();
             shown.push_str(shell["stderr"].as_str().unwrap_or(""));
-            (shown, shell["success"] == false)
+            (shown, failed || shell["success"] == false)
         }
-        _ => (raw, false),
+        _ => (raw, failed),
+    }
+}
+
+/// An item as the Responses family shapes it, which the transcript reads.
+/// An Anthropic message's `tool_use` blocks become function calls after
+/// its text, and a user message's `tool_result` blocks their outputs.
+fn responses(item: &Value) -> Vec<Value> {
+    let Some(parts) = item["content"].as_array() else {
+        return Vec::from_iter((!item.is_null()).then(|| item.clone()));
+    };
+    let tool = |part: &&Value| matches!(part["type"].as_str(), Some("tool_use" | "tool_result"));
+    if !parts.iter().any(|part| tool(&part)) {
+        return vec![item.clone()];
+    }
+    let said: Vec<&Value> = parts.iter().filter(|part| part["type"] == "text").collect();
+    let mut items = Vec::new();
+    if item["role"] == "assistant" || !said.is_empty() {
+        items.push(json!({"role": item["role"], "content": said}));
+    }
+    for part in parts.iter().filter(tool) {
+        items.push(match part["type"].as_str() {
+            Some("tool_use") => json!({"type": "function_call", "call_id": part["id"],
+                "name": part["name"], "arguments": part["input"].to_string()}),
+            _ => json!({"type": "function_call_output", "call_id": part["tool_use_id"],
+                "output": match &part["content"] {
+                    Value::String(output) => output.clone(),
+                    content => text(&json!({"content": content})),
+                },
+                "failed": part["is_error"] == true}),
+        });
+    }
+    items
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anthropic_tool_blocks_read_as_calls_and_outputs() {
+        let asked = json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "hm", "signature": "s"},
+            {"type": "text", "text": "Running it."},
+            {"type": "tool_use", "id": "t1", "name": "shell", "input": {"command": "ls"}}]});
+        let items = responses(&asked);
+        assert_eq!(text(&items[0]), "Running it.");
+        assert_eq!(items[1]["type"], "function_call");
+        assert_eq!(items[1]["call_id"], "t1");
+        assert_eq!(items[1]["arguments"], r#"{"command":"ls"}"#);
+        let answered = json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "is_error": true,
+             "content": [{"type": "text", "text": "no such file"}]}]});
+        let items = responses(&answered);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["call_id"], "t1");
+        assert_eq!(output(&items[0]), ("no such file".into(), true));
+        // Responses items, and plain messages, pass through.
+        let call = json!({"type": "function_call", "call_id": "c"});
+        assert_eq!(responses(&call), [call]);
+        assert!(responses(&Value::Null).is_empty());
     }
 }

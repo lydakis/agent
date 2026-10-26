@@ -17,8 +17,9 @@ class FormulaTest(unittest.TestCase):
         # The version comes from the archive's name; stating it again is
         # what brew audit calls redundant.
         self.assertNotIn('  version "', formula)
-        self.assertIn('    bin.install "bin/sonny"\n', formula)
-        self.assertIn('    libexec.install "libexec/agent"\n', formula)
+        self.assertIn('    libexec.install "bin/sonny", "libexec/agent"\n', formula)
+        # The daemon is started by a path upgrades keep.
+        self.assertIn('AGENT_BIN: opt_libexec/"agent"', formula)
         self.assertNotIn('bin.install "libexec/agent"', formula)
         self.assertIn("  depends_on :macos\n", formula)
         self.assertIn('shell_output("#{bin}/sonny --version")', formula)

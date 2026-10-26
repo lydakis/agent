@@ -161,8 +161,8 @@ class AccountingTests(ModelFixture):
         client.request('create', bot='Bob', workspace=str(self.path))
         turn = client.request('submit', bot='Bob', request_id='1', prompt='cached:reused-call')['result']['turn']
         end = client.finished(turn)['data']
-        self.assertEqual(end['error'], 'storage_error')
-        self.assertRegex(end['detail'], r'^sqlite_primary=19 sqlite_extended=\d+$')
+        # The second round reuses the first round's call id.
+        self.assertEqual((end['error'], end['detail']), ('invalid_tool_call_id', None))
         events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
         self.assertEqual(next(e['data'] for e in events if e['event'] == 'turn_finished'), end)
         row = client.request('turns', bot='Bob')['result']['turns'][0]

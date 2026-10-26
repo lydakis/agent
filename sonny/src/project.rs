@@ -68,17 +68,12 @@ pub async fn open(
     socket: &Path,
     model: Option<&str>,
 ) -> Result<Lead, String> {
-    let dir = dir.canonicalize().map_err(|e| e.to_string())?;
-    // Inside a project, its lead, wherever below the project's folder.
-    if let Some(project) = agent_client::policy::project(&dir).map_err(|e| e.to_string())? {
-        let bot = format!("{project}.lead");
-        if find(client, &bot).await?.is_some() {
-            return Ok(Lead {
-                project,
-                bot,
-                new: false,
-            });
-        }
+    let mut dir = dir.canonicalize().map_err(|e| e.to_string())?;
+    // Inside a project, wherever below its folder (or in a worktree of
+    // it), its lead, which works in that folder: made there first when
+    // missing, and never one of the same name working elsewhere.
+    if let Some((_, root)) = agent_client::policy::project_root(&dir).map_err(|e| e.to_string())? {
+        dir = root;
     }
     let project = default_name(&dir)?;
     let bot = format!("{project}.lead");
@@ -167,9 +162,20 @@ async fn create(
     model: Option<&str>,
 ) -> Result<(), String> {
     let role = role(dir)?;
-    // Asked for, the folder's own choice, the last Sonny ran on, then the
-    // newest agent's, so a bare `sonny` needs no flag.
-    let model = match model.map(str::to_owned).or_else(|| role.model.clone()) {
+    let info = agent_client::project::read(dir)?;
+    let chosen = info["model"].as_str().map(str::to_owned);
+    // The project file's effort goes with its model.
+    let effort = match model {
+        None if chosen.is_some() => info["reasoning"].as_str().map(str::to_owned),
+        _ => None,
+    };
+    // Asked for, the project file's, the role's, the last Sonny ran on, then
+    // the newest agent's, so a bare `sonny` needs no flag.
+    let model = match model
+        .map(str::to_owned)
+        .or(chosen)
+        .or_else(|| role.model.clone())
+    {
         Some(model) => model,
         None => match std::env::var("AGENT_MODEL").ok().or_else(remembered) {
             Some(model) => model,
@@ -202,7 +208,7 @@ async fn create(
     client
         .request(
             "create",
-            json!({"bot": bot, "workspace": dir, "model": model,
+            json!({"bot": bot, "workspace": dir, "model": model, "effort": effort,
                 "instructions": instructions, "tools": tools}),
         )
         .await
