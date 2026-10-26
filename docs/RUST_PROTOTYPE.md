@@ -1163,9 +1163,9 @@ replayed thinking written after them is withheld as when any context in
 front of it changes, and a fork keys its own prompt cache from then on.
 Protocol version 15 adds `"decision":"ask"` to `answer`: a gate's holder
 hands the call to a person instead of deciding it. The gate stays open and
-the call keeps waiting; the request's row keeps `asked: {tag, reason, by,
-at_ms}`, which `approvals` and served listings show while that gate is
-open, and the bot's followers get an `approval_asked` event with the call,
+the call keeps waiting; the request's row keeps one `{tag, reason, by,
+at_ms}` per gate that asked, which `approvals` and served listings show as
+`asked` while that gate is open, and the bot's followers get an `approval_asked` event with the call,
 request, tag, reason and `by`. A person then answers it like any other
 call, without a lease. Only a gate with no expiry can wait on a person: on
 one with `approve_expire_ms` the ask is refused with

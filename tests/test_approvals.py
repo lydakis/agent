@@ -1090,8 +1090,9 @@ class AutoApproverTests(ModelFixture):
         judged = lines.get(timeout=5)
         self.assertEqual(judged['calls'][0]['decision'], 'ask', judged)
         [waiting] = daemon.request('approvals', bot='Carol')['result']['approvals']
-        self.assertEqual((waiting['asked']['tag'], waiting['asked']['by']), ('auto', 'approver'))
-        self.assertTrue(waiting['asked']['reason'].startswith('judged risky'))
+        [asked] = waiting['asked']
+        self.assertEqual((asked['tag'], asked['by']), ('auto', 'approver'))
+        self.assertTrue(asked['reason'].startswith('judged risky'))
         events = daemon.request('events', bot='Carol', after=0, limit=256)['result']['events']
         self.assertTrue(any(e['event'] == 'approval_asked' for e in events))
         # The person allows it, over the approver, and it runs.

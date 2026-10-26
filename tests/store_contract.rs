@@ -1544,9 +1544,9 @@ fn a_gate_hands_a_call_to_a_person_who_then_decides_it() {
     let [waiting] = &listed["approvals"].as_array().unwrap()[..] else {
         panic!("{listed}")
     };
-    assert_eq!(waiting["asked"]["tag"], "manual");
-    assert_eq!(waiting["asked"]["reason"], "judged risky: it pushes");
-    assert_eq!(waiting["asked"]["by"], "approver");
+    assert_eq!(waiting["asked"][0]["tag"], "manual");
+    assert_eq!(waiting["asked"][0]["reason"], "judged risky: it pushes");
+    assert_eq!(waiting["asked"][0]["by"], "approver");
     let events = db.events("Bob", 0, 256).unwrap();
     let told = events["events"]
         .as_array()
@@ -1635,6 +1635,14 @@ fn each_gate_keeps_its_own_handoff_to_a_person() {
     };
     db.ask(decision("a", false)).unwrap();
     db.ask(decision("b", false)).unwrap();
+    let listed = db.approvals(Some("Bob"), None, 0, None, 64).unwrap();
+    let tags: Vec<&Value> = listed["approvals"][0]["asked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|asked| &asked["tag"])
+        .collect();
+    assert_eq!(tags, [&json!("a"), &json!("b")]);
     // The person answers one gate; the other's handoff still shows.
     db.answer(Decision {
         reason: None,
@@ -1643,7 +1651,12 @@ fn each_gate_keeps_its_own_handoff_to_a_person() {
     })
     .unwrap();
     let listed = db.approvals(Some("Bob"), None, 0, None, 64).unwrap();
-    assert_eq!(listed["approvals"][0]["asked"]["tag"], "a", "{listed}");
+    assert_eq!(
+        listed["approvals"][0]["asked"],
+        json!([{"tag":"a","reason":"doubted","by":"approver",
+        "at_ms":listed["approvals"][0]["asked"][0]["at_ms"]}]),
+        "{listed}"
+    );
     db.answer(Decision {
         reason: None,
         by: Some("person"),
@@ -1682,7 +1695,7 @@ fn schema_49_waiting_calls_were_not_handed_to_anyone() {
     })
     .unwrap();
     let listed = db.approvals(Some("Bob"), None, 0, None, 64).unwrap();
-    assert_eq!(listed["approvals"][0]["asked"]["tag"], "manual");
+    assert_eq!(listed["approvals"][0]["asked"][0]["tag"], "manual");
     drop(db);
     std::fs::remove_file(path).unwrap();
 }

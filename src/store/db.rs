@@ -7506,12 +7506,13 @@ fn pending_call(
         "request":request.request,"announced_ms":request.announced_ms,
         "expires_ms":request.expires_ms(),"gates":open,"name":name,"node":node,
         "denials":counts});
-    // Handed to a person by a gate still unanswered, one at a time.
-    if let Some(asked) = request
+    // Handed to a person by each gate still unanswered.
+    let asked: Vec<&Asked> = request
         .asked
         .iter()
-        .find(|asked| request.unanswered().any(|g| g.tag == asked.tag))
-    {
+        .filter(|asked| request.unanswered().any(|g| g.tag == asked.tag))
+        .collect();
+    if !asked.is_empty() {
         entry["asked"] = json!(asked);
     }
     // The previews stored when the call was planned.

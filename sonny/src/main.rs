@@ -2959,7 +2959,7 @@ impl App {
             );
         }
         // What the judge doubted, when it handed the call over.
-        if let Some(reason) = call["asked"]["reason"].as_str() {
+        if let Some(reason) = call["asked"][0]["reason"].as_str() {
             let why = reason.split(". ").next().unwrap_or(reason);
             lines.push(Line::from(format!("  {why}")).dim());
         }
@@ -3369,10 +3369,10 @@ fn shimmer(text: &str, since: Duration) -> Vec<Span<'static>> {
 }
 
 /// A bot's name in its project: `lead`, or what follows the project's dot.
-/// The gate a person answers a call on: the one that handed it over, else
-/// `manual`.
+/// The gate a person answers a call on: the first that handed it over,
+/// else `manual`.
 fn person_gate(call: &Value) -> &str {
-    call["asked"]["tag"].as_str().unwrap_or("manual")
+    call["asked"][0]["tag"].as_str().unwrap_or("manual")
 }
 
 fn short(bot: &str, project: &str, lead: &str) -> String {

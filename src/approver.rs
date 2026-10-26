@@ -744,7 +744,13 @@ async fn round(shared: Arc<Shared>, bot: String, turn: i64, calls: Vec<Value>) {
         calls
             .into_iter()
             // Handed to a person already, by this tag's last holder.
-            .filter(|call| call["asked"]["tag"] != shared.tag.as_str())
+            .filter(|call| {
+                !call["asked"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|asked| asked["tag"] == shared.tag.as_str())
+            })
             .filter(|call| {
                 *latest > turn
                     || requests.insert((
