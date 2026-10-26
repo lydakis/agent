@@ -1156,11 +1156,15 @@ impl App {
 
     /// The lead's instructions as composed on attach, sent once no turn
     /// runs; the next turn reads them.
-    async fn configure(&mut self) {
-        if self.running.is_some()
-            || self.instruct.is_none() && self.switch.is_none() && self.gating.is_none()
-        {
-            return;
+    /// Whether what was picked is now the bot's: false while it waits
+    /// for the turn to end, or when the daemon refused it (the notice says
+    /// why).
+    async fn configure(&mut self) -> bool {
+        if self.instruct.is_none() && self.switch.is_none() && self.gating.is_none() {
+            return true;
+        }
+        if self.running.is_some() {
+            return false;
         }
         let (text, switch, gating) = (self.instruct.take(), self.switch.take(), self.gating.take());
         let mut asked = json!({"bot": self.bot});
@@ -1210,9 +1214,14 @@ impl App {
                 self.instruct = text;
                 self.switch = switch;
                 self.gating = gating;
+                return false;
             }
-            Err(error) => self.notice = Some(error.to_string()),
+            Err(error) => {
+                self.notice = Some(error.to_string());
+                return false;
+            }
         }
+        true
     }
 
     /// What the footer and pickers show of the bot, from its record.
@@ -2355,15 +2364,11 @@ impl App {
             match project::instructions(std::path::Path::new(&self.workspace)) {
                 Ok(text) => {
                     self.instruct = Some(text);
-                    self.configure().await;
-                    self.notice = Some(
-                        if self.instruct.is_some() {
-                            "applies when idle"
-                        } else {
-                            "the lead has its folder's instructions"
-                        }
-                        .into(),
-                    );
+                    if self.configure().await {
+                        self.notice = Some("the lead has its folder's instructions".into());
+                    } else if self.instruct.is_some() {
+                        self.notice = Some("applies when idle".into());
+                    }
                 }
                 Err(error) => self.notice = Some(format!("the lead's instructions: {error}")),
             }

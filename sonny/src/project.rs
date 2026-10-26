@@ -80,38 +80,33 @@ pub fn review(dir: &Path, bot: &Value, new: bool) -> Result<Instructions, String
     })
 }
 
-/// Where Sonny keeps a fingerprint of the instructions it last saw each
-/// lead take from its folder, by bot id.
-fn written_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent/sonny/instructions.json"))
+/// Where Sonny keeps a fingerprint of the instructions it last saw lead
+/// `id` take from its folder: one file a lead, so two Sonnys never write
+/// over each other's.
+fn written_path(id: i64) -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(format!(".agent/sonny/instructions/{id}")))
 }
 
 fn written(id: i64) -> Option<String> {
-    let text = std::fs::read_to_string(written_path()?).ok()?;
-    let saved: Value = serde_json::from_str(&text).ok()?;
-    saved[id.to_string()].as_str().map(str::to_owned)
+    let text = std::fs::read_to_string(written_path(id)?).ok()?;
+    Some(text.trim().to_owned())
 }
 
 /// Note that lead `id` now holds `text`, composed from its folder.
 pub fn wrote(id: i64, text: &str) {
-    let Some(path) = written_path() else {
+    let Some(path) = written_path(id) else {
         return;
     };
     let key = fingerprint(text);
-    let mut saved = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .filter(Value::is_object)
-        .unwrap_or_else(|| json!({}));
-    if saved[id.to_string()] == key {
+    if written(id).as_deref() == Some(key.as_str()) {
         return;
     }
-    saved[id.to_string()] = json!(key);
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let temp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    if std::fs::write(&temp, format!("{saved}\n")).is_ok() {
+    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+    if std::fs::write(&temp, format!("{key}\n")).is_ok() {
         let _ = std::fs::rename(&temp, &path);
     }
 }
@@ -138,6 +133,20 @@ pub fn keep_model(dir: &Path, model: &str, effort: Option<&str>) -> Result<(), S
     if edited == text {
         return Ok(());
     }
+    // The person's file is replaced only by one that says what was asked.
+    let read: toml::Table = edited.parse().map_err(|_| {
+        format!(
+            "{} could not be edited; set the model there",
+            path.display()
+        )
+    })?;
+    let said = |key: &str| read.get(key).and_then(toml::Value::as_str);
+    if said("model") != Some(model) || said("reasoning") != effort {
+        return Err(format!(
+            "{} could not be edited; set the model there",
+            path.display()
+        ));
+    }
     let temp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
     std::fs::write(&temp, &edited)
         .and_then(|()| std::fs::rename(&temp, &path))
@@ -154,13 +163,14 @@ pub fn keep_model(dir: &Path, model: &str, effort: Option<&str>) -> Result<(), S
 fn with_model(text: &str, model: &str, effort: Option<&str>) -> String {
     // A JSON string is a TOML basic string.
     let quote = |s: &str| Value::from(s).to_string();
+    // A bare key, or one in quotes.
     fn key(line: &str) -> Option<&str> {
         let line = line.trim_start();
         let name = line.split(['=', ' ', '\t']).next().unwrap_or_default();
         line[name.len()..]
             .trim_start()
             .starts_with('=')
-            .then_some(name)
+            .then(|| name.trim_matches(['"', '\'']))
     }
     let mut lines: Vec<String> = Vec::new();
     let (mut at, mut placed) = (None, false);
@@ -344,6 +354,11 @@ mod tests {
         assert_eq!(
             with_model(file, "openai/c", None),
             "name = \"shop\"\nmodel = \"openai/c\"\n"
+        );
+        // A quoted key is the same key.
+        assert_eq!(
+            with_model("\"model\" = \"openai/a\"\n", "openai/b", None),
+            "model = \"openai/b\"\n"
         );
         // A file without a model gets one; a key that only starts alike is
         // left alone.
