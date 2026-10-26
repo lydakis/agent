@@ -1,7 +1,11 @@
 //! The composer's text and where the cursor is in it, laid out the way
 //! the composer draws it, so moving up and down follows the wrapped rows.
+//!
+//! The cursor moves, and rows break, between graphemes: what the terminal
+//! draws as one character, such as an emoji made of several.
 use std::ops::Deref;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 /// What the composer's rows start with: the prompt mark on the first,
 /// two spaces on the rest.
@@ -10,8 +14,11 @@ pub const LEAD: usize = 2;
 #[derive(Default)]
 pub struct Prompt {
     text: String,
-    /// The cursor, a byte offset on a char boundary.
+    /// The cursor, a byte offset on a grapheme boundary.
     at: usize,
+    /// The column up and down aim for, kept while they alone move the
+    /// cursor, so a short row on the way does not pull it in.
+    goal: Option<usize>,
 }
 
 /// One drawn row: the bytes of the text it shows. A row's trailing spaces
@@ -31,55 +38,66 @@ impl Deref for Prompt {
 
 impl Prompt {
     pub fn clear(&mut self) {
+        self.goal = None;
         self.text.clear();
         self.at = 0;
     }
 
     /// Replace the text, with the cursor at its end.
     pub fn set(&mut self, text: &str) {
+        self.goal = None;
         self.text = text.to_owned();
         self.at = self.text.len();
     }
 
     pub fn insert(&mut self, text: &str) {
+        self.goal = None;
         self.text.insert_str(self.at, text);
         self.at += text.len();
     }
 
     pub fn backspace(&mut self) {
+        self.goal = None;
         let start = self.before(self.at);
         self.text.drain(start..self.at);
         self.at = start;
     }
 
     pub fn delete(&mut self) {
+        self.goal = None;
         let end = self.after(self.at);
         self.text.drain(self.at..end);
     }
 
     pub fn left(&mut self) {
+        self.goal = None;
         self.at = self.before(self.at);
     }
 
     pub fn right(&mut self) {
+        self.goal = None;
         self.at = self.after(self.at);
     }
 
     /// The start of the cursor's line.
     pub fn home(&mut self) {
+        self.goal = None;
         self.at = self.line_start();
     }
 
     /// The end of the cursor's line.
     pub fn end(&mut self) {
+        self.goal = None;
         self.at = self.line_end();
     }
 
     pub fn word_left(&mut self) {
+        self.goal = None;
         self.at = self.word_start();
     }
 
     pub fn word_right(&mut self) {
+        self.goal = None;
         let rest = &self.text[self.at..];
         let spaces = rest.len() - rest.trim_start().len();
         let word = rest[spaces..]
@@ -90,6 +108,7 @@ impl Prompt {
 
     /// Delete back to the start of the word before the cursor.
     pub fn delete_word(&mut self) {
+        self.goal = None;
         let start = self.word_start();
         self.text.drain(start..self.at);
         self.at = start;
@@ -98,6 +117,7 @@ impl Prompt {
     /// Delete back to the start of the line, or the line break before the
     /// cursor when it is already there.
     pub fn delete_to_start(&mut self) {
+        self.goal = None;
         let start = match self.line_start() {
             start if start == self.at => self.before(self.at),
             start => start,
@@ -109,6 +129,7 @@ impl Prompt {
     /// Delete to the end of the line, or the line break after the cursor
     /// when it is already there.
     pub fn delete_to_end(&mut self) {
+        self.goal = None;
         let end = match self.line_end() {
             end if end == self.at => self.after(self.at),
             end => end,
@@ -129,6 +150,7 @@ impl Prompt {
     fn vertical(&mut self, width: usize, down: bool) -> bool {
         let rows = self.layout(width);
         let (row, col) = self.cursor(&rows);
+        let col = *self.goal.get_or_insert(col);
         let target = match down {
             true if row + 1 < rows.len() => row + 1,
             false if row > 0 => row - 1,
@@ -139,13 +161,13 @@ impl Prompt {
         // row's end, where the next row starts.
         let mut at = start;
         let mut cols = LEAD;
-        for (i, c) in self.text[start..end].char_indices() {
-            let w = c.width().unwrap_or(0);
+        for (i, g) in self.text[start..end].grapheme_indices(true) {
+            let w = g.width();
             if cols + w > col {
                 break;
             }
             cols += w;
-            at = start + i + c.len_utf8();
+            at = start + i + g.len();
         }
         if at == end && end < self.text.len() && !self.text[end..].starts_with('\n') {
             at = self.before(end);
@@ -175,9 +197,9 @@ impl Prompt {
                     used = 0;
                 }
                 // A word wider than a row is cut where the row ends.
-                for (i, c) in word.char_indices() {
-                    let w = c.width().unwrap_or(0);
-                    if used + w > room && used > 0 && !c.is_whitespace() {
+                for (i, g) in word.grapheme_indices(true) {
+                    let w = g.width();
+                    if used + w > room && used > 0 && !g.trim().is_empty() {
                         let at = word_start + i;
                         rows.push(Row { start, end: at });
                         start = at;
@@ -208,16 +230,16 @@ impl Prompt {
 
     fn before(&self, at: usize) -> usize {
         self.text[..at]
-            .char_indices()
+            .grapheme_indices(true)
             .next_back()
             .map_or(0, |(i, _)| i)
     }
 
     fn after(&self, at: usize) -> usize {
         self.text[at..]
-            .chars()
+            .graphemes(true)
             .next()
-            .map_or(at, |c| at + c.len_utf8())
+            .map_or(at, |g| at + g.len())
     }
 
     fn line_start(&self) -> usize {
@@ -327,6 +349,40 @@ mod tests {
         assert!(prompt.down(14));
         assert_eq!(prompt.at, prompt.len());
         assert!(!prompt.down(14));
+    }
+
+    #[test]
+    fn up_and_down_keep_the_column_past_a_short_row() {
+        let mut prompt = typed("a long first line\nab\nanother long line");
+        assert!(prompt.up(40));
+        assert!(prompt.up(40));
+        assert_eq!(prompt.cursor(&prompt.layout(40)), (0, LEAD + 17));
+        prompt.end();
+        prompt.left();
+        assert!(prompt.down(40));
+        assert_eq!(prompt.cursor(&prompt.layout(40)), (1, LEAD + 2));
+        // Typing forgets the column: down goes on from where it is now.
+        prompt.insert("c");
+        assert!(prompt.down(40));
+        assert_eq!(prompt.cursor(&prompt.layout(40)), (2, LEAD + 3));
+    }
+
+    #[test]
+    fn an_emoji_of_several_chars_moves_and_wraps_whole() {
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        let mut prompt = typed(&format!("a{family}b"));
+        prompt.left();
+        prompt.left();
+        assert_eq!(prompt.at, 1);
+        prompt.right();
+        prompt.backspace();
+        assert_eq!(&*prompt, "ab");
+        // Ten columns a row at width 13: the emoji goes whole to the next.
+        let prompt = typed(&format!("abcdefghi{family}"));
+        let rows = prompt.layout(13);
+        let shown: Vec<_> = rows.iter().map(|r| &prompt[r.start..r.end]).collect();
+        assert_eq!(shown, ["abcdefghi", family]);
+        assert_eq!(prompt.cursor(&rows), (1, LEAD + 2));
     }
 
     #[test]
