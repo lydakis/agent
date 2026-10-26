@@ -256,6 +256,8 @@ pub fn band(answers: &Map<String, Value>) -> (Band, Vec<(&'static str, f64)>) {
 pub struct Item {
     pub seen: Seen,
     pub reasons: Vec<(&'static str, f64)>,
+    /// `Wake` or `Hold`: which items a bounded note sends first.
+    pub band: Band,
 }
 
 /// What the lead is told: pointers it can read with its wait tool, why
@@ -551,11 +553,12 @@ async fn recent(
     bot: &str,
     limit: usize,
     oldest_first: bool,
+    from: Option<i64>,
 ) -> Vec<(Option<i64>, Value)> {
     let Ok(page) = client
         .request(
             "history_nodes",
-            json!({"bot": bot, "limit": limit, "oldest_first": oldest_first}),
+            json!({"bot": bot, "limit": limit, "oldest_first": oldest_first, "from": from}),
         )
         .await
     else {
@@ -595,16 +598,17 @@ async fn event_text(client: &Client, seen: &Seen) -> String {
             // Still queued, its words are only in its turn's record.
             None => client
                 .request(
-                    "turns",
-                    json!({"bot": seen.task, "after": seen.turn - 1, "limit": 1}),
+                    "prompts",
+                    json!({"bot": seen.task, "turn": seen.turn, "bytes": EVENT_CHARS * 4}),
                 )
                 .await
                 .ok()
-                .and_then(|page| Some(page["turns"][0]["prompt_preview"].as_str()?.to_owned()))
+                .and_then(|read| Some(read["prompts"][0]["text"].as_str()?.to_owned()))
                 .unwrap_or_default(),
         };
     }
-    let items = recent(client, &seen.task, 60, false).await;
+    let from = (seen.kind == Kind::Ended).then_some(seen.node).flatten();
+    let items = recent(client, &seen.task, 60, false, from).await;
     let in_turn = |(turn, _): &&(Option<i64>, Value)| *turn == Some(seen.turn);
     let found = match seen.kind {
         Kind::Said => None,
@@ -653,7 +657,7 @@ async fn brief(client: &Client, task: &str, node: Option<i64>) -> String {
     if let Some(node) = node {
         return node_text(client, task, node).await;
     }
-    recent(client, task, 8, true)
+    recent(client, task, 8, true, None)
         .await
         .iter()
         .find(|(_, item)| item["role"] == "user")
@@ -663,7 +667,7 @@ async fn brief(client: &Client, task: &str, node: Option<i64>) -> String {
 
 /// The newest line a task said, for the roster.
 async fn latest(client: &Client, task: &str) -> String {
-    recent(client, task, 6, false)
+    recent(client, task, 6, false, None)
         .await
         .iter()
         .find(|(_, item)| item["role"] == "assistant")
@@ -809,10 +813,15 @@ impl Lookout {
             tokio::select! {
                 event = events.recv() => {
                     let Some(event) = event else { return };
-                    // The replay only tells who belongs to the lead.
+                    // The replay tells who belongs to the lead and each
+                    // task's current brief; what it holds was news then.
                     if !live {
                         live = event["event"] == "follow_live";
-                        self.lineage_of(&event);
+                        self.event(&event);
+                        // Nothing in it was checked, so a turn still queued
+                        // is checked once it starts.
+                        self.due.clear();
+                        self.checked.clear();
                         continue;
                     }
                     self.event(&event);
@@ -927,10 +936,10 @@ impl Lookout {
                     .or_insert_with(Instant::now);
             }
             "tool_completed" | "turn_resumed" => {
-                self.approvals.retain(|(task, _), _| task != bot);
+                self.approvals.remove(&(bot.to_owned(), turn));
             }
             "turn_finished" => {
-                self.approvals.retain(|(task, _), _| task != bot);
+                self.approvals.remove(&(bot.to_owned(), turn));
                 let status = data["status"].as_str().unwrap_or("ended");
                 if status == "steered" {
                     match self.steers.remove(&(bot.to_owned(), turn)) {
@@ -955,7 +964,10 @@ impl Lookout {
                     Some(error) => format!("{status} ({error})"),
                     None => status.to_owned(),
                 };
-                self.due(bot, turn, Kind::Ended, None, Some(status), None);
+                // A completed turn's reply is read from its checkpoint, not
+                // from wherever the task's history has moved on to.
+                let checkpoint = data["checkpoint"].as_i64();
+                self.due(bot, turn, Kind::Ended, None, Some(status), checkpoint);
             }
             _ => {}
         }
@@ -1044,7 +1056,11 @@ impl Lookout {
                         text: checked.text,
                         ..seen
                     };
-                    self.held.push(Item { seen, reasons });
+                    self.held.push(Item {
+                        seen,
+                        reasons,
+                        band,
+                    });
                 }
             }
             Err(Failure::Quota) => {
@@ -1055,6 +1071,18 @@ impl Lookout {
             Err(Failure::Duplicate) => line["skipped"] = json!("same words checked lately"),
         }
         self.write(&line);
+    }
+
+    /// What the items still held after a note ask for: `Some(steer)` while
+    /// any of them would wake the lead.
+    fn pending(&self) -> Option<bool> {
+        self.held
+            .iter()
+            .filter_map(|item| match item.band {
+                Band::Wake { steer } => Some(steer),
+                _ => None,
+            })
+            .reduce(|a, b| a || b)
     }
 
     /// Tell the lead what is held, when a high answer is waiting and the
@@ -1068,6 +1096,12 @@ impl Lookout {
             return;
         }
         let steer = self.urgent == Some(true);
+        // A bounded note sends what woke it first: steers, then other wakes.
+        self.held.sort_by_key(|item| match item.band {
+            Band::Wake { steer: true } => 0,
+            Band::Wake { steer: false } => 1,
+            _ => 2,
+        });
         let take = self.held.len().min(NOTE_ITEMS);
         let sent: Vec<Item> = self.held.drain(..take).collect();
         let prompt = note(&sent, self.held.len());
@@ -1086,7 +1120,7 @@ impl Lookout {
         match submitted {
             Ok(_) => {
                 self.last_wake = Some(now);
-                self.urgent = None;
+                self.urgent = self.pending();
                 self.held_since = (!self.held.is_empty()).then_some(now);
                 self.write(&json!({"at_ms": epoch_ms(), "lead": self.lead, "woke": key,
                     "delivery": if steer { "steer" } else { "queue" }}));
@@ -1094,7 +1128,7 @@ impl Lookout {
             // Another Sonny sent the same note first.
             Err(error) if error.code == "idempotency_conflict" => {
                 self.last_wake = Some(now);
-                self.urgent = None;
+                self.urgent = self.pending();
             }
             Err(error) => {
                 let mut back = sent;
@@ -1488,6 +1522,7 @@ mod tests {
                 text: "\nFixed avg by skipping empty lists.\nMore.".into(),
             },
             reasons: vec![("off_brief", 0.82)],
+            band: Band::Wake { steer: false },
         };
         let said = Item {
             seen: Seen {
@@ -1504,6 +1539,7 @@ mod tests {
                 ("remember", 0.91),
                 ("sibling_needs", 0.79),
             ],
+            band: Band::Wake { steer: true },
         };
         let note = note(&[item, said], 2);
         // Only the person's own words are quoted.
@@ -1761,6 +1797,7 @@ mod tests {
         lookout.held.push(Item {
             seen,
             reasons: vec![("off_brief", 0.9)],
+            band: Band::Wake { steer: false },
         });
         lookout.urgent = Some(false);
         assert!(!lookout.wake_due(now));
@@ -1771,6 +1808,49 @@ mod tests {
         lookout.held_since = Some(now);
         assert!(!lookout.wake_due(now + WAKE_GAP));
         assert!(lookout.wake_due(now + DIGEST_AFTER));
+    }
+
+    #[test]
+    fn what_stays_held_after_a_note_keeps_its_priority() {
+        let mut lookout = lookout();
+        let seen = lookout.due_seen();
+        let item = |band| Item {
+            seen: seen.clone(),
+            reasons: vec![("result", 0.5)],
+            band,
+        };
+        let mut held: Vec<Item> = (0..NOTE_ITEMS).map(|_| item(Band::Hold)).collect();
+        held.push(item(Band::Wake { steer: true }));
+        lookout.held = held;
+        assert_eq!(lookout.pending(), Some(true));
+        lookout.held.retain(|item| item.band == Band::Hold);
+        assert_eq!(lookout.pending(), None);
+        lookout.held.push(item(Band::Wake { steer: false }));
+        assert_eq!(lookout.pending(), Some(false));
+    }
+
+    #[test]
+    fn an_approval_is_cleared_only_by_its_own_turn() {
+        let mut lookout = lookout();
+        let waiting = json!({"approval": {"call_id": "c1"}});
+        lookout.event(&ev("calc.fix", 4, "turn_waiting", waiting));
+        lookout.event(&ev(
+            "calc.fix",
+            5,
+            "turn_finished",
+            json!({"status": "interrupted"}),
+        ));
+        assert!(lookout.approvals.contains_key(&("calc.fix".into(), 4)));
+        lookout.event(&ev("calc.fix", 4, "tool_completed", json!({})));
+        assert!(lookout.approvals.is_empty());
+    }
+
+    #[test]
+    fn a_completed_turn_is_read_from_its_checkpoint() {
+        let mut lookout = lookout();
+        let done = json!({"status": "completed", "checkpoint": 42});
+        lookout.event(&ev("calc.fix", 7, "turn_finished", done));
+        assert_eq!(lookout.due[0].node, Some(42));
     }
 
     #[test]
