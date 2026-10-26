@@ -98,7 +98,7 @@ fn usage() -> String {
 /// task's window where the person asked, from the lead's shell. A task gets
 /// a window of its own unless told otherwise; `--split` puts it beside the
 /// lead's block, or `--beside` another bot's.
-fn show() -> Result<(), String> {
+async fn show() -> Result<(), String> {
     let usage =
         "usage: sonny show TASK [--split right|left|above|below [--beside BOT]] [--rex-host HOST]";
     let mut args = std::env::args().skip(2);
@@ -119,14 +119,8 @@ fn show() -> Result<(), String> {
         .map(PathBuf::from)
         .ok_or("run this from an agent's shell (AGENT_SOCKET is not set)")?;
     let socket = std::path::absolute(socket).map_err(|e| e.to_string())?;
-    // The project is what the names start with: `calc` for `calc.lead`.
-    let project = caller
-        .as_deref()
-        .unwrap_or(&bot)
-        .split('.')
-        .next()
-        .unwrap_or(&bot)
-        .to_owned();
+    let client = Client::connect(&socket).await.map_err(|e| e.to_string())?.0;
+    let project = project_of(&client, caller.as_deref().unwrap_or(&bot)).await;
     let bin = rex::find().ok_or("rex not found")?;
     let mut rex = rex::Rex::open(bin, host.as_deref(), &project)?;
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -153,6 +147,25 @@ fn show() -> Result<(), String> {
     rex.close_others(&bot);
     println!("{}", json!({"bot": bot, "session": project}));
     Ok(())
+}
+
+/// The project a bot's name starts with: the longest start that names a
+/// lead, as `shop.web` for `shop.web.fix` when `shop.web.lead` is there;
+/// else the name up to its first dot.
+async fn project_of(client: &Client, bot: &str) -> String {
+    let mut starts: Vec<&str> = bot.match_indices('.').map(|(at, _)| &bot[..at]).collect();
+    starts.reverse();
+    for start in &starts {
+        let lead = format!("{start}.lead");
+        let page = client
+            .request("bots", json!({"name": lead, "limit": 1}))
+            .await
+            .unwrap_or_default();
+        if page["bots"][0]["name"] == lead.as_str() {
+            return (*start).to_owned();
+        }
+    }
+    starts.last().copied().unwrap_or(bot).to_owned()
 }
 
 /// A program on PATH.
@@ -330,7 +343,7 @@ async fn main() -> std::process::ExitCode {
 
 async fn run() -> Result<(), String> {
     if std::env::args().nth(1).as_deref() == Some("show") {
-        return show();
+        return show().await;
     }
     if std::env::args().nth(1).as_deref() == Some("--version") {
         println!("sonny {}", env!("CARGO_PKG_VERSION"));
@@ -669,7 +682,7 @@ struct Fleet {
     errands: HashMap<String, String>,
     /// Finished calls whose output names a job to follow in a window:
     /// the bot, the output's node, and the command.
-    jobs: Vec<(String, i64, String)>,
+    jobs: Vec<(String, i64, String, String)>,
 }
 
 impl Fleet {
@@ -782,7 +795,7 @@ impl Fleet {
                     && let Some(node) = data["node"].as_i64()
                     && data["failed"] != true
                 {
-                    self.jobs.push((bot.to_owned(), node, command));
+                    self.jobs.push((bot.to_owned(), node, call, command));
                 }
             }
             _ => {}
@@ -796,7 +809,7 @@ impl Fleet {
             self.jobs.clear();
             return;
         };
-        for (bot, node, command) in std::mem::take(&mut self.jobs) {
+        for (bot, node, call, command) in std::mem::take(&mut self.jobs) {
             let Ok(read) = self
                 .client
                 .request("history_items", json!({"bot": bot, "nodes": [node]}))
@@ -804,7 +817,14 @@ impl Fleet {
             else {
                 continue;
             };
-            let (printed, _) = output(&read["items"][0]["item"]);
+            // An Anthropic node holds every result of its turn's calls.
+            let Some(result) = responses(&read["items"][0]["item"])
+                .into_iter()
+                .find(|item| item["call_id"] == call.as_str())
+            else {
+                continue;
+            };
+            let (printed, _) = output(&result);
             let Some(handle) = printed
                 .lines()
                 .map(str::trim)
@@ -1316,15 +1336,17 @@ impl App {
     async fn reattach(&mut self, events: &mut Events) {
         let lead = async {
             let (client, mut fresh) = connect(&self.options).await?;
-            let record = client
-                .request("inspect", json!({"bot": self.bot}))
-                .await
-                .map_err(|e| e.to_string())?;
             client
                 .request("follow", json!({"bot": self.bot, "after": 0}))
                 .await
                 .map_err(|e| e.to_string())?;
             caught_up(&mut fresh).await;
+            // Read after the replay, so a turn that ends meanwhile arrives
+            // as an event rather than lost between the two.
+            let record = client
+                .request("inspect", json!({"bot": self.bot}))
+                .await
+                .map_err(|e| e.to_string())?;
             Ok::<_, String>((client, fresh, record))
         };
         if self.down {
@@ -1375,6 +1397,12 @@ impl App {
             }
             self.approvals_for(self.running.as_ref().map(|r| r.turn))
                 .await;
+            // A daemon that restarted took the approver Sonny started with it.
+            if self.mode == Some("auto")
+                && let Err(error) = serve_auto(&self.client, &self.options, &self.model).await
+            {
+                self.notice = Some(error);
+            }
         }
         if let Some(fleet) = &mut self.fleet
             && fleet.down
@@ -1574,12 +1602,12 @@ impl App {
         let data = &event["data"];
         let turn = event["turn"].as_i64();
         // Followed before history was read, so what history showed can
-        // arrive again here.
-        if matches!(kind, "accepted" | "steered" | "message" | "tool_completed")
-            && data["node"]
-                .as_i64()
-                .is_some_and(|node| node <= self.seen_node)
-        {
+        // arrive again here. A turn it showed starting still runs: only
+        // its prompt is not drawn again.
+        let drawn = data["node"]
+            .as_i64()
+            .is_some_and(|node| node <= self.seen_node);
+        if drawn && matches!(kind, "steered" | "message" | "tool_completed") {
             return;
         }
         // Each node is drawn once, should its event come again.
@@ -1642,7 +1670,8 @@ impl App {
                 }
                 self.effort = data["effort"].as_str().map(str::to_owned);
                 status_report("working", &self.bot);
-                if let Some(node) = data["node"].as_i64()
+                if !drawn
+                    && let Some(node) = data["node"].as_i64()
                     && let Some(item) = self.items(&[node]).await.first()
                 {
                     let lines = transcript::prompt(&text(item), None, self.width);
