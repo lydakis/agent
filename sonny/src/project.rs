@@ -37,26 +37,158 @@ fn role(dir: &Path) -> Result<agent_client::policy::Profile, String> {
     )
 }
 
-/// A lead's instructions as the app composes them for `dir` now (its role,
-/// the folder's rules, skills and memory, then the project's task rule),
-/// and, when the person reads it inside Rex, where they are.
-pub fn instructions(dir: &Path, rex: Option<&str>) -> Result<String, String> {
+/// A lead's instructions as the app composes them for `dir` now: its role,
+/// the folder's rules, skills and memory, then the project's task rule.
+/// Rex is the rex-windows skill's to explain, so they read the same in
+/// any client.
+pub fn instructions(dir: &Path) -> Result<String, String> {
     let memory = agent_client::policy::memory_indexes(dir).map_err(|e| e.to_string())?;
     let composed = agent_client::policy::instructions(dir, Some(&role(dir)?), &memory)
         .map_err(|e| e.to_string())?
         .text;
     let rule = agent_client::project::rule(&agent_client::project::read(dir)?);
-    let mut text = format!("{composed}\n\n{rule}");
-    if let Some(session) = rex {
-        text.push_str(&format!(
-            "\n\n# Rex\n\nThe person reads you in Sonny, inside Rex, the terminal \
-             multiplexer, in its session `{session}`. Each task you start opens there \
-             as a tab while it works, so they can watch it. Read the rex-windows skill \
-             to run a long command where they can see it, or to place a task's window \
-             where they ask."
-        ));
+    Ok(format!("{composed}\n\n{rule}"))
+}
+
+/// What attaching does with a lead's instructions.
+#[derive(Debug, PartialEq)]
+pub enum Instructions {
+    /// They are what the folder composes today.
+    Current,
+    /// A client composed what they hold, and the folder has changed since:
+    /// these replace them.
+    Stale(String),
+    /// They were set some other way, or before Sonny saw this lead, and
+    /// are kept until the person asks for the folder's.
+    Kept,
+}
+
+/// Whether a lead's instructions may follow the folder: only when Sonny
+/// wrote what they hold (or saw a client compose it), so instructions the
+/// person set some other way are never overwritten.
+pub fn review(dir: &Path, bot: &Value, new: bool) -> Result<Instructions, String> {
+    let composed = instructions(dir)?;
+    let current = bot["instructions"].as_str().unwrap_or_default();
+    let id = bot["bot_id"].as_i64().unwrap_or_default();
+    Ok(if current == composed {
+        wrote(id, current);
+        Instructions::Current
+    } else if new || written(id).is_some_and(|key| key == fingerprint(current)) {
+        Instructions::Stale(composed)
+    } else {
+        Instructions::Kept
+    })
+}
+
+/// Where Sonny keeps a fingerprint of the instructions it last saw each
+/// lead take from its folder, by bot id.
+fn written_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent/sonny/instructions.json"))
+}
+
+fn written(id: i64) -> Option<String> {
+    let text = std::fs::read_to_string(written_path()?).ok()?;
+    let saved: Value = serde_json::from_str(&text).ok()?;
+    saved[id.to_string()].as_str().map(str::to_owned)
+}
+
+/// Note that lead `id` now holds `text`, composed from its folder.
+pub fn wrote(id: i64, text: &str) {
+    let Some(path) = written_path() else {
+        return;
+    };
+    let key = fingerprint(text);
+    let mut saved = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    if saved[id.to_string()] == key {
+        return;
     }
-    Ok(text)
+    saved[id.to_string()] = json!(key);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let temp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    if std::fs::write(&temp, format!("{saved}\n")).is_ok() {
+        let _ = std::fs::rename(&temp, &path);
+    }
+}
+
+/// FNV-1a, as hex: stable across runs and builds.
+fn fingerprint(text: &str) -> String {
+    let hash = text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    });
+    format!("{hash:016x}")
+}
+
+/// Keep a lead's model and effort in its project's file, when the folder
+/// has one, so the file and the lead agree on what it runs. Only those two
+/// lines change; the rest of the file is the person's.
+pub fn keep_model(dir: &Path, model: &str, effort: Option<&str>) -> Result<(), String> {
+    let path = dir.join(agent_client::project::FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+        Ok(text) => text,
+    };
+    let edited = with_model(&text, model, effort);
+    if edited == text {
+        return Ok(());
+    }
+    let temp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+    std::fs::write(&temp, &edited)
+        .and_then(|()| std::fs::rename(&temp, &path))
+        .map_err(|error| {
+            let _ = std::fs::remove_file(&temp);
+            format!("{}: {error}", path.display())
+        })?;
+    // Read back as the app reads it, so a bad edit is said, not kept quiet.
+    agent_client::project::read(dir).map(|_| ())
+}
+
+/// `text` with its top-level `model` and `reasoning` set (or `reasoning`
+/// removed), each in place when there, else added after `model`.
+fn with_model(text: &str, model: &str, effort: Option<&str>) -> String {
+    // A JSON string is a TOML basic string.
+    let quote = |s: &str| Value::from(s).to_string();
+    fn key(line: &str) -> Option<&str> {
+        let line = line.trim_start();
+        let name = line.split(['=', ' ', '\t']).next().unwrap_or_default();
+        line[name.len()..]
+            .trim_start()
+            .starts_with('=')
+            .then_some(name)
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let (mut at, mut placed) = (None, false);
+    for line in text.lines() {
+        match key(line) {
+            Some("model") => {
+                at = Some(lines.len());
+                lines.push(format!("model = {}", quote(model)));
+            }
+            Some("reasoning") => {
+                placed = true;
+                if let Some(level) = effort {
+                    lines.push(format!("reasoning = {}", quote(level)));
+                }
+            }
+            _ => lines.push(line.to_owned()),
+        }
+    }
+    let at = at.unwrap_or_else(|| {
+        lines.push(format!("model = {}", quote(model)));
+        lines.len() - 1
+    });
+    if let Some(level) = effort.filter(|_| !placed) {
+        lines.insert(at + 1, format!("reasoning = {}", quote(level)));
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
 }
 
 /// The lead for `dir`, made first when the folder is not a project yet.
@@ -109,28 +241,6 @@ async fn find(client: &Client, bot: &str) -> Result<Option<Value>, String> {
     Ok(page["bots"].get(0).filter(|b| b["name"] == bot).cloned())
 }
 
-/// Where Sonny keeps the model it last ran on.
-fn remembered_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent/sonny/model"))
-}
-
-/// The model Sonny last ran on, kept for the next folder it opens.
-pub fn remembered() -> Option<String> {
-    let text = std::fs::read_to_string(remembered_path()?).ok()?;
-    Some(text.trim().to_owned()).filter(|m| m.contains('/'))
-}
-
-pub fn remember(model: &str) {
-    if let Some(path) = remembered_path()
-        && remembered().as_deref() != Some(model)
-    {
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = std::fs::write(path, format!("{model}\n"));
-    }
-}
-
 /// The model of the agent made last, from any client: what the person
 /// chose most recently when Sonny has not run before.
 async fn newest(client: &Client) -> Result<Option<String>, String> {
@@ -172,15 +282,15 @@ async fn create(
         None if chosen.is_some() => info["reasoning"].as_str().map(str::to_owned),
         _ => None,
     };
-    // Asked for, the project file's, the role's, the last Sonny ran on, then
-    // the newest agent's, so a bare `sonny` needs no flag.
+    // Asked for, the project file's, the role's, AGENT_MODEL's, then the
+    // newest agent's, so a bare `sonny` needs no flag.
     let model = match model
         .map(str::to_owned)
         .or(chosen)
         .or_else(|| role.model.clone())
     {
         Some(model) => model,
-        None => match std::env::var("AGENT_MODEL").ok().or_else(remembered) {
+        None => match std::env::var("AGENT_MODEL").ok() {
             Some(model) => model,
             None => newest(client)
                 .await?
@@ -217,4 +327,34 @@ async fn create(
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_project_file_keeps_its_other_lines_when_the_model_moves() {
+        let file =
+            "# mine\nname = \"shop\"\nmodel = \"openai/a\"   # pinned\nthreads_in = \"project\"\n";
+        assert_eq!(
+            with_model(file, "anthropic/b", Some("high")),
+            "# mine\nname = \"shop\"\nmodel = \"anthropic/b\"\nreasoning = \"high\"\nthreads_in = \"project\"\n"
+        );
+        let file = "name = \"shop\"\nreasoning = \"low\"\nmodel = \"openai/a\"\n";
+        assert_eq!(
+            with_model(file, "openai/a", Some("high")),
+            "name = \"shop\"\nreasoning = \"high\"\nmodel = \"openai/a\"\n"
+        );
+        assert_eq!(
+            with_model(file, "openai/c", None),
+            "name = \"shop\"\nmodel = \"openai/c\"\n"
+        );
+        // A file without a model gets one; a key that only starts alike is
+        // left alone.
+        assert_eq!(
+            with_model("name = \"shop\"\nmodels_note = \"x\"\n", "openai/a", None),
+            "name = \"shop\"\nmodels_note = \"x\"\nmodel = \"openai/a\"\n"
+        );
+    }
 }
