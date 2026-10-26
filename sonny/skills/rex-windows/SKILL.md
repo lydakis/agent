@@ -1,14 +1,14 @@
 ---
 name: rex-windows
-description: Run long or interactive commands (dev servers, watchers, long builds or test runs, REPLs) in a Rex terminal block the person can watch, then read, wait on or stop them; and put an agent's window where the person asks (its own tab, or a split beside another).
+description: Run long or interactive commands (dev servers, watchers, builds or test runs past the shell tool's 10 minutes, REPLs) in a Rex terminal block the person can watch, then read, wait on or stop them; and put an agent's window where the person asks (its own tab, or a split beside another).
 ---
 
-Rex is the terminal multiplexer the person watches the work in. Each project has one Rex session: the one its lead runs in. In it, every agent has a block labelled with its full name (`shop.fix-cart`), and a tab named after what it is doing. A command that runs long, that the person may want to watch, or that another agent needs to read goes there instead of a background shell process. Quick commands stay in the shell tool.
+Rex is the terminal multiplexer the person watches the work in. Each project has one Rex session: the one its lead runs in. In it, every agent has a block labelled with its full name (`shop.fix-cart`), and a tab named after what it is doing. Use a block only for a command that runs longer than the shell tool allows (up to 10 minutes with `timeout_ms`), that keeps running (a server, a watcher), or that the person wants to watch. Everything else, a one-minute test run or build included, stays in the shell tool: give it a `timeout_ms` that covers it rather than a short one, since one shell call is faster than a block, a wait and a read.
 
 ## Where things go
 
 - An agent you start gets a tab of its own when its turn starts, without your doing anything.
-- A command of yours that runs long (a dev server, a test watcher, a long build or test run, a log tail, a REPL) goes in a block of its own with `run`, named for what it is (`dev-server`, `tests`), not a number:
+- A command of yours that belongs in a block (a dev server, a test watcher, a build or test run over 10 minutes, a log tail, a REPL) goes in one of its own with `run`, named for what it is (`dev-server`, `tests`), not a number:
 
       SONNY_BIN run NAME -- COMMAND ARGS...            # below your own block
       SONNY_BIN run NAME --window -- COMMAND ARGS...   # in a tab of its own

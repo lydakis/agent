@@ -16,8 +16,7 @@ installed, else in the app's coordinator profile. A lead moved to another
 folder (`--workspace`) comes back with the next message Sonny sends it from
 its own, history and all. When `rex` is found
 (`$REX`, the PATH, or the Mac app), the project gets one Rex session: the
-one Sonny was opened in (named after the project when Rex made its name up),
-else the one the lead is in, else one labelled with the project's name. Each task the lead (or one of its tasks) starts gets a
+one Sonny was opened in, else the one the lead is in, else one labelled with the project's name. Each task the lead (or one of its tasks) starts gets a
 window there running Sonny on that task, without taking focus. Each window
 reports OSC 7501 status, so Rex shows which task is working, waiting on an
 approval or done. A task's window closes once its work is taken: its turn
