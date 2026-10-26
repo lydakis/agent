@@ -4414,11 +4414,16 @@ impl Database {
         if let Some(usage) = usage {
             entries.push(record_usage(&tx, &bot.name, turn, usage)?);
         }
+        // A turn keys its calls by id. The provider checks one response's ids;
+        // one that reuses an id from an earlier round of the turn is refused
+        // the same way, and the round commits nothing.
         for call in calls {
-            tx.execute(
-                "INSERT INTO tools VALUES (?,?,'planned')",
-                params![turn, call.call_id],
-            )?;
+            let planned = tx
+                .prepare_cached("INSERT INTO tools VALUES (?,?,'planned') ON CONFLICT DO NOTHING")?
+                .execute(params![turn, call.call_id])?;
+            if planned == 0 {
+                return Err(Error::new("invalid_tool_call_id"));
+            }
         }
         // Every gated call of the round is announced in the commit that
         // plans it, one event for the round.
