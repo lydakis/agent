@@ -358,6 +358,9 @@ async fn run() -> Result<(), String> {
         println!("sonny {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    if std::env::args().nth(1).as_deref() == Some("lookout-replay") {
+        return lookout::replay().await;
+    }
     let options = parse()?;
     // Fonts are read before the first picture needs them.
     std::thread::spawn(image::preload);

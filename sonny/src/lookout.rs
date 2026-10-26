@@ -1005,6 +1005,198 @@ fn epoch_ms() -> u128 {
         .unwrap_or(0)
 }
 
+/// `sonny lookout-replay --judge SPEC [--judge SPEC]... [--limit N] [--out FILE]
+/// [--store PATH] [--socket PATH]`: run the lookout's checks over what the
+/// store kept, for every project lead, and print each check as a JSON line
+/// with its input, answers and band. It wakes no one. The roster and
+/// memory are read as they are now, not as they were then.
+pub async fn replay() -> Result<(), String> {
+    let usage = "usage: sonny lookout-replay --judge SPEC [--judge SPEC]... [--limit N] [--out FILE] [--store PATH] [--socket PATH]";
+    let mut args = std::env::args().skip(2);
+    let (mut judges, mut limit, mut out, mut store, mut socket) =
+        (Vec::new(), 150, None, None, None);
+    while let Some(arg) = args.next() {
+        let mut value = || args.next().ok_or(usage);
+        match arg.as_str() {
+            "--judge" => judges.push(Judge::parse(&value()?)?),
+            "--limit" => limit = value()?.parse().map_err(|_| usage)?,
+            "--out" => out = Some(PathBuf::from(value()?)),
+            "--store" => store = Some(PathBuf::from(value()?)),
+            "--socket" => socket = Some(PathBuf::from(value()?)),
+            _ => return Err(usage.into()),
+        }
+    }
+    if judges.is_empty() {
+        return Err(usage.into());
+    }
+    let store = match store.or_else(|| std::env::var_os("AGENT_STORE").map(PathBuf::from)) {
+        Some(store) => store,
+        None => PathBuf::from(std::env::var_os("HOME").ok_or("set --store or HOME")?)
+            .join(".agent/state.sqlite"),
+    };
+    let socket = match socket.or_else(|| std::env::var_os("AGENT_SOCKET").map(PathBuf::from)) {
+        Some(socket) => socket,
+        None => agent_client::socket::default_socket(&store).map_err(|e| e.to_string())?,
+    };
+    let (client, _events) = Client::connect(&socket).await.map_err(|e| e.to_string())?;
+    let mut bots: Vec<Value> = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let page = client
+            .request("bots", json!({"limit": 256, "after": after}))
+            .await
+            .map_err(|e| e.to_string())?;
+        let got = page["bots"].as_array().cloned().unwrap_or_default();
+        let full = got.len() == 256;
+        after = got
+            .last()
+            .and_then(|b| b["name"].as_str().map(str::to_owned));
+        bots.extend(got);
+        if !full || after.is_none() {
+            break;
+        }
+    }
+    let judges: Vec<Arc<Judge>> = judges.into_iter().map(Arc::new).collect();
+    let mut due: Vec<(String, PathBuf, Seen, Vec<String>)> = Vec::new();
+    for lead in bots
+        .iter()
+        .filter_map(|b| b["name"].as_str())
+        .filter(|n| n.ends_with(".lead"))
+    {
+        let project = lead.trim_end_matches(".lead").to_owned();
+        let workspace = bots
+            .iter()
+            .find(|b| b["name"] == lead)
+            .and_then(|b| b["workspace"].as_str())
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        let mut lookout = Lookout {
+            judge: judges[0].clone(),
+            project: project.clone(),
+            lead: lead.to_owned(),
+            workspace: workspace.clone(),
+            lineage: [lead.to_owned()].into(),
+            waiting_on: Vec::new(),
+            approvals: HashMap::new(),
+            steers: HashMap::new(),
+            briefs: HashMap::new(),
+            due: Vec::new(),
+            held: Vec::new(),
+            held_since: None,
+            urgent: None,
+            last_wake: None,
+            stopped: false,
+            log: None,
+        };
+        // Every bot the lead or one of its tasks made, to a fixed point.
+        loop {
+            let before = lookout.lineage.len();
+            for bot in &bots {
+                let (Some(name), by) = (bot["name"].as_str(), bot["created_by"].as_str()) else {
+                    continue;
+                };
+                if name.starts_with(&format!("{project}."))
+                    || by.is_some_and(|by| lookout.lineage.contains(by))
+                {
+                    lookout.lineage.insert(name.to_owned());
+                }
+            }
+            if lookout.lineage.len() == before {
+                break;
+            }
+        }
+        let mut events = Vec::new();
+        for bot in lookout.lineage.clone() {
+            events.extend(retained(&socket, &bot).await);
+        }
+        events.sort_by_key(|e| e["cursor"].as_i64().unwrap_or(0));
+        for event in &events {
+            lookout.event(event);
+        }
+        for seen in std::mem::take(&mut lookout.due) {
+            let peers = lookout.peers_of(&seen.task);
+            due.push((lead.to_owned(), workspace.clone(), seen, peers));
+        }
+    }
+    // The newest checks, oldest first, so a lead's story reads in order.
+    let skip = due.len().saturating_sub(limit);
+    let due: Vec<_> = due.into_iter().skip(skip).collect();
+    eprintln!(
+        "lookout-replay: {} checks x {} judges",
+        due.len(),
+        judges.len()
+    );
+    let mut sink: Box<dyn std::io::Write> = match &out {
+        Some(path) => {
+            Box::new(std::fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()))?)
+        }
+        None => Box::new(std::io::stdout()),
+    };
+    let mut briefs: HashMap<String, String> = HashMap::new();
+    for (n, (lead, workspace, seen, peers)) in due.into_iter().enumerate() {
+        let memory = memory(&workspace);
+        let peers: Vec<(String, Option<String>)> = peers
+            .into_iter()
+            .map(|t| {
+                let brief = briefs.get(&t).cloned();
+                (t, brief)
+            })
+            .collect();
+        let text = event_text(&client, &seen).await;
+        let known = briefs.get(&seen.task).cloned();
+        for judge in &judges {
+            let answered = check(&client, judge, &seen, known.clone(), &peers, &memory).await;
+            let mut line = json!({"n": n, "lead": lead, "task": seen.task, "turn": seen.turn,
+                "kind": format!("{:?}", seen.kind), "from": seen.from, "status": seen.status,
+                "judge": judge.name, "text": cut(&text, 600)});
+            match answered {
+                Ok(checked) => {
+                    if let Some(brief) = &checked.brief {
+                        briefs
+                            .entry(seen.task.clone())
+                            .or_insert_with(|| brief.clone());
+                    }
+                    let (band, reasons) = band(&checked.answers);
+                    line["answers"] = Value::Object(checked.answers);
+                    line["band"] = json!(format!("{band:?}"));
+                    line["reasons"] = json!(reasons);
+                    line["tokens"] = json!(checked.tokens);
+                    line["ms"] = json!(checked.ms);
+                }
+                Err(Failure::Quota) => return Err(format!("{}: out of quota", judge.name)),
+                Err(Failure::Check(why)) => line["failed"] = json!(why),
+            }
+            writeln!(sink, "{line}").map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// A bot's retained events, read on a connection of its own.
+async fn retained(socket: &std::path::Path, bot: &str) -> Vec<Value> {
+    let Ok((client, mut events)) = Client::connect(socket).await else {
+        return Vec::new();
+    };
+    if client
+        .request("follow", json!({"bot": bot, "after": 0}))
+        .await
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let mut kept = Vec::new();
+    let read = async {
+        while let Some(event) = events.recv().await {
+            if event["event"] == "follow_live" {
+                return;
+            }
+            kept.push(event);
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(30), read).await;
+    kept
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
