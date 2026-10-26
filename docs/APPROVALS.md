@@ -679,10 +679,15 @@ current turn's prompt and its steers, each marked as a person's or a
 model's words, the calls being judged, the calls already allowed, and
 then earlier prompts newest first until a 16k-token budget is spent. The
 calls being judged are sent whole, read with `history_items` when their preview
-was cut, except that a planned `write` or `edit` past 16 KiB of text shows
-each field's start and end with its whole size; so is any file written this
-turn that one of them runs, up to 48 KiB, and past that its start and end
-around a note of how much was left out. So
+was cut, except that a planned `write` or `edit` past 64 KiB of text shows
+each field's start and end with its whole size, redacted before it is cut
+so a cut cannot leave a secret's value without the name that marks it; so
+is any file written this turn that one of them runs, up to 48 KiB, and
+past that only its size. A call with part of what it writes or runs left
+out is not allowed on the judge's word, since the part left out may do
+anything (a script padded past the limit with its payload in the middle):
+what Jev would allow is denied as "not reviewed whole", and a risky one
+is denied as risky. So
 are the already allowed shell and caller-registered calls, since a
 one-time request is used up by a call that did it and a deploy past a
 preview's 2,048 characters would hide that; an allowed `write` or `edit`
@@ -690,7 +695,9 @@ is shown as its path and size, since a file's content is not what
 consent is about. If the words do not all fit, the newest are sent and the older left out
 (the newest cut to its start and end if it alone does not fit), with
 `request_cut: true`, and consent is not counted, since a word left out may
-be the one that withdrew it. Jev still judges the risks: a call whose
+be the one that withdrew it. `prompts` gives the calls their own budget, so
+words that fill the read still leave the calls that name the files the
+turn wrote. Jev still judges the risks: a call whose
 risks are all low is allowed, and a risky one is unclear. Long-running
 delegated tasks hit this routinely, and refusing every call in them,
 which the approver did until 2026-10-26, stopped ordinary work such as
@@ -1213,8 +1220,8 @@ Where the approver differs from the design above:
   `approval_requested`.
 - A file the turn wrote is shown whole with a call that names it, by its
   path or its file name as a whole word in one of the call's strings, up
-  to 48 KiB, and past that its first and last 24 KiB around a note of how
-  much was left out, read off the approver's runtime thread; one that is
+  to 48 KiB, and past that by its size, read off the approver's runtime
+  thread; one that is
   no longer a regular file is not read. A
   write or edit that failed shows no file. One planned earlier in the same
   round is named in its place, since it runs first. A call no gate covers

@@ -64,7 +64,8 @@ const PROMPT_BYTES: usize = 128 * 1024;
 const CHAIN: usize = 8;
 const DELEGATING: usize = 64;
 /// How much of a file written this turn a judged call that names it is
-/// shown: a larger one shows its start and end, with how much was left out.
+/// shown: a larger one only by its size, and the call is not allowed on the
+/// judge's word alone.
 const FILE_BYTES: u64 = 48 * 1024;
 /// The largest answer a decision API may send; a larger one is a failed check.
 const REPLY_BYTES: usize = 64 * 1024;
@@ -879,9 +880,16 @@ async fn judge(
             Err(policy::not_reviewed("the check failed"))
         }
         Judged::Answers { answers, usage } => {
-            let verdicts = ids
+            let verdicts = intent
+                .planned
                 .iter()
-                .map(|id| policy::verdict(id, &answers, consent))
+                .map(|call| {
+                    let verdict = policy::verdict(&call.id, &answers, consent)?;
+                    Some(match call.unseen {
+                        true => policy::unseen(verdict),
+                        false => verdict,
+                    })
+                })
                 .collect::<Option<Vec<_>>>()
                 .ok_or_else(|| policy::not_reviewed("the check failed"))?;
             Ok((verdicts, usage))
@@ -943,11 +951,18 @@ fn preview_path(preview: &str) -> Option<String> {
     }
 }
 
-/// A file the turn wrote, as a judged call that names it would run it:
-/// only a regular file, opened without waiting on a FIFO or device, whole
-/// within `FILE_BYTES`, else its start and end, read no further whatever
-/// size it reported.
-fn written_file(file: &Path) -> Option<String> {
+/// A file the turn wrote, as a judged call that names it would run it.
+enum Written {
+    Whole(String),
+    /// Past `FILE_BYTES`, by its size: a part of it shown could not be
+    /// redacted with what names a secret, nor tell what the rest does.
+    TooLong(u64),
+}
+
+/// A file the turn wrote: only a regular file, opened without waiting on a
+/// FIFO or device, whole within `FILE_BYTES`, read no further whatever size
+/// it reported.
+fn written_file(file: &Path) -> Option<Written> {
     use std::io::{Read, Seek, SeekFrom};
     use std::os::unix::fs::OpenOptionsExt;
     let mut opened = std::fs::OpenOptions::new()
@@ -964,21 +979,9 @@ fn written_file(file: &Path) -> Option<String> {
         .read_to_end(&mut head)
         .ok()?;
     if head.len() as u64 <= FILE_BYTES {
-        return Some(String::from_utf8_lossy(&head).into_owned());
+        return Some(Written::Whole(String::from_utf8_lossy(&head).into_owned()));
     }
-    // Its end as it is now, past the start already read.
-    head.truncate(FILE_BYTES as usize / 2);
-    let end = opened.seek(SeekFrom::End(0)).ok()?;
-    let from = end.saturating_sub(FILE_BYTES / 2).max(head.len() as u64);
-    opened.seek(SeekFrom::Start(from)).ok()?;
-    let mut tail = Vec::new();
-    opened.take(FILE_BYTES / 2).read_to_end(&mut tail).ok()?;
-    Some(format!(
-        "{}\n[{} bytes not shown]\n{}",
-        String::from_utf8_lossy(&head),
-        from - head.len() as u64,
-        String::from_utf8_lossy(&tail)
-    ))
+    Some(Written::TooLong(opened.seek(SeekFrom::End(0)).ok()?))
 }
 
 enum Unjudged {
@@ -1065,8 +1068,9 @@ async fn intent(
             }
         };
         let tool = call["name"].as_str().unwrap_or_default().to_owned();
+        let mut unseen = false;
         if matches!(tool.as_str(), "write" | "edit") {
-            arguments = policy::shown_change(&arguments);
+            (arguments, unseen) = policy::shown_change(&arguments, &shared.redactor);
         }
         size += arguments.to_string().len();
         if size > PROMPT_BYTES {
@@ -1077,6 +1081,7 @@ async fn intent(
             tool,
             arguments,
             files: Vec::new(),
+            unseen,
         });
     }
     let mut allowed = Vec::new();
@@ -1157,7 +1162,7 @@ async fn intent(
         });
     }
     // A call that names a file this turn wrote is judged with that file
-    // whole, as it is on disk now: what the call would run. One that an
+    // whole, as it is on disk now: what the call would run, or by its size. One that an
     // earlier call of this round writes or edits is not on disk yet as the
     // call will find it, so it points to that call instead.
     let workspace = read["workspace"].as_str().map(PathBuf::from);
@@ -1189,8 +1194,14 @@ async fn intent(
                 .map_or_else(|| PathBuf::from(path), |w| w.join(path));
             // Off the runtime thread: a slow mount must not hold up renewal.
             let read = tokio::task::spawn_blocking(move || written_file(&file));
-            if let Some(content) = read.await.map_err(|_| Unjudged::Failed)? {
-                call.files.push((path.clone(), content));
+            match read.await.map_err(|_| Unjudged::Failed)? {
+                Some(Written::Whole(content)) => call.files.push((path.clone(), content)),
+                Some(Written::TooLong(bytes)) => {
+                    call.files
+                        .push((path.clone(), format!("[{bytes} bytes, too long to show]")));
+                    call.unseen = true;
+                }
+                None => {}
             }
         }
         if matches!(call.tool.as_str(), "write" | "edit")
@@ -1408,32 +1419,26 @@ mod tests {
     }
 
     #[test]
-    fn a_written_file_is_read_only_if_regular_and_shown_in_part_past_the_limit() {
+    fn a_written_file_is_read_only_if_regular_and_whole_within_the_limit() {
         let dir = std::env::temp_dir().join(format!("agent-written-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let small = dir.join("run.sh");
         std::fs::write(&small, "echo hi\n").unwrap();
-        assert_eq!(written_file(&small).as_deref(), Some("echo hi\n"));
-        // A larger one shows its start and end, and how much is left out.
+        assert!(matches!(written_file(&small), Some(Written::Whole(text)) if text == "echo hi\n"));
+        // A larger one only by its size.
         let large = dir.join("large.sh");
-        let half = FILE_BYTES as usize / 2;
-        let content = ["a".repeat(half), "b".repeat(100), "c".repeat(half)].concat();
-        std::fs::write(&large, &content).unwrap();
-        assert_eq!(
-            written_file(&large).unwrap(),
-            format!(
-                "{}\n[100 bytes not shown]\n{}",
-                "a".repeat(half),
-                "c".repeat(half)
-            )
-        );
+        std::fs::write(&large, "a".repeat(FILE_BYTES as usize + 100)).unwrap();
+        assert!(matches!(
+            written_file(&large),
+            Some(Written::TooLong(bytes)) if bytes == FILE_BYTES + 100
+        ));
         // A FIFO with no writer is skipped, not waited on.
         let fifo = dir.join("fifo");
         let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
         // SAFETY: path is a NUL-terminated string that outlives the call.
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
-        assert_eq!(written_file(&fifo), None);
-        assert_eq!(written_file(&dir.join("gone")), None);
+        assert!(written_file(&fifo).is_none());
+        assert!(written_file(&dir.join("gone")).is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

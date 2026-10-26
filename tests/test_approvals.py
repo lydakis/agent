@@ -1111,8 +1111,9 @@ class AutoApproverTests(ModelFixture):
         self.judge.answer = shell_danger
         self.model.call_script = [('write', {'path': 'run.sh', 'content': 'printf DANGER'}),
                                   ('shell', {'command': 'sh run.sh'}),
-                                  ('write', {'path': 'big.sh', 'content': 'x' * (49 * 1024) + 'printf DANGER'}),
-                                  ('shell', {'command': 'sh ./big.sh'})]
+                                  ('write', {'path': 'big.sh', 'content': 'x' * (49 * 1024) + 'printf ok'}),
+                                  ('shell', {'command': 'sh ./big.sh'}),
+                                  ('write', {'path': 'huge.sh', 'content': 'x' * (65 * 1024) + 'printf ok'})]
         daemon = SocketClient(self.binary, self.path / 'state.sqlite', self.url, 'shell,write')
         self.addCleanup(daemon.close)
         daemon.request('create', bot='Bob', workspace=str(self.path), approve=['shell', 'write'], approver='auto')
@@ -1120,21 +1121,23 @@ class AutoApproverTests(ModelFixture):
         turn = daemon.request('submit', bot='Bob', request_id='a', prompt='script')['result']['turn']
         self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
         self.assertTrue(self.denial(daemon, turn, 'script-1').startswith('judged risky'))
-        # A file too large to show whole is shown by its start and end.
-        self.assertTrue(self.denial(daemon, turn, 'script-3').startswith('judged risky'))
-        asked = [self.judge.requests.get(timeout=5)['body'] for _ in range(4)]
+        # A file too large to show is shown by its size, and what it does is
+        # not known: a call that runs it is not allowed on the judge's word.
+        self.assertTrue(self.denial(daemon, turn, 'script-3').startswith('not reviewed whole'))
+        # Nor is a write too large to show whole.
+        self.assertTrue(self.denial(daemon, turn, 'script-4').startswith('not reviewed whole'))
+        asked = [self.judge.requests.get(timeout=5)['body'] for _ in range(5)]
         [shell] = asked[1]['state']['planned_calls']
         self.assertEqual(shell['files_it_names'], [{'path': 'run.sh', 'content': 'printf DANGER'}])
         self.assertEqual(asked[1]['state']['already_allowed'],
                          [{'tool': 'write', 'arguments': {'path': 'run.sh', 'bytes': 13}, 'status': 'succeeded'}])
-        # So is a planned write's content, with its whole size.
         [write] = asked[2]['state']['planned_calls']
-        self.assertEqual((write['arguments']['path'], write['arguments']['bytes']), ('big.sh', 49 * 1024 + 13))
-        self.assertIn('bytes not shown]', write['arguments']['content'])
+        self.assertEqual(write['arguments'], {'path': 'big.sh', 'content': 'x' * (49 * 1024) + 'printf ok'})
         [shell] = asked[3]['state']['planned_calls']
-        [big] = shell['files_it_names']
-        self.assertTrue(big['content'].startswith('x') and big['content'].endswith('printf DANGER'))
-        self.assertIn('bytes not shown]', big['content'])
+        self.assertEqual(shell['files_it_names'], [{'path': 'big.sh', 'content': f'[{49 * 1024 + 9} bytes, too long to show]'}])
+        [write] = asked[4]['state']['planned_calls']
+        self.assertEqual((write['arguments']['path'], write['arguments']['bytes']), ('huge.sh', 65 * 1024 + 9))
+        self.assertIn('bytes not shown]', write['arguments']['content'])
 
     def test_an_ungated_write_too_long_to_preview_still_shows_its_file(self):
         def shell_danger(body, id):

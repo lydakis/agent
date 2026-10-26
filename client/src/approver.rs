@@ -29,8 +29,9 @@ pub const IN_TURN: u64 = 20;
 /// How long a tripped turn has to stop on its own before it is interrupted.
 pub const INTERRUPT_AFTER_MS: u64 = 30_000;
 /// The most of a planned write's or edit's text the judge is shown: past it,
-/// each field shows its start and end, with the whole size.
-pub const CHANGE_SHOWN: usize = 16 * 1024;
+/// each field shows its start and end, with the whole size, and the call is
+/// not allowed on the judge's word alone.
+pub const CHANGE_SHOWN: usize = 64 * 1024;
 
 /// One effect a call may have, and the question asking whether the person
 /// asked for it. The approval channel has no consent: nobody's words make
@@ -298,6 +299,17 @@ pub fn verdict(call: &str, answers: &Value, consent: bool) -> Option<Verdict> {
     })
 }
 
+/// A call's verdict when part of what it writes or runs was not shown: what
+/// the judge would allow is denied, since the part left out may do anything.
+pub fn unseen(verdict: Verdict) -> Verdict {
+    match verdict {
+        Verdict::Allow => Verdict::Deny(format!(
+            "not reviewed whole: part of what it writes or runs is too long to show. {ASK}"
+        )),
+        denied => denied,
+    }
+}
+
 /// Why a round was not judged; the model can tell an outage from a refusal.
 pub fn not_reviewed(why: &str) -> Verdict {
     Verdict::Deny(format!("not reviewed: {why}"))
@@ -340,6 +352,9 @@ pub struct Planned {
     /// Files this turn wrote that the call names, whole, with their paths:
     /// what it would run.
     pub files: Vec<(String, String)>,
+    /// Part of what it writes or runs was too long to show: the judge cannot
+    /// have seen what the left-out part does.
+    pub unseen: bool,
 }
 
 /// A call this turn already ran, and how it ended.
@@ -421,12 +436,13 @@ pub fn clip(text: &str, limit: usize) -> Cow<'_, str> {
     ))
 }
 
-/// A planned write's or edit's arguments as the judge is shown them: whole
-/// within `CHANGE_SHOWN`, else each text field clipped and `bytes` the
-/// whole text. Its path is always whole; that is where the risk is.
-pub fn shown_change(arguments: &Value) -> Value {
+/// A planned write's or edit's arguments as the judge is shown them, and
+/// whether they were cut: whole within `CHANGE_SHOWN`, else each text field
+/// redacted, then clipped, and `bytes` the whole text, so a cut cannot leave
+/// a secret's value without what names it. Its path is always whole.
+pub fn shown_change(arguments: &Value, redactor: &Redactor) -> (Value, bool) {
     let Value::Object(fields) = arguments else {
-        return arguments.clone();
+        return (arguments.clone(), false);
     };
     let text = |(name, value): (&String, &Value)| match (name.as_str(), value) {
         ("path", _) => 0,
@@ -435,18 +451,21 @@ pub fn shown_change(arguments: &Value) -> Value {
     };
     let bytes: usize = fields.iter().map(text).sum();
     if bytes <= CHANGE_SHOWN {
-        return arguments.clone();
+        return (arguments.clone(), false);
     }
     let mut shown: Map<String, Value> = fields
         .iter()
         .map(|(name, value)| match (name.as_str(), value) {
             ("path", _) => (name.clone(), value.clone()),
-            (_, Value::String(text)) => (name.clone(), json!(clip(text, CHANGE_SHOWN / 2))),
+            (_, Value::String(text)) => {
+                let text = redactor.redact(text);
+                (name.clone(), json!(clip(&text, CHANGE_SHOWN / 2)))
+            }
             _ => (name.clone(), value.clone()),
         })
         .collect();
     shown.insert("bytes".into(), json!(bytes));
-    Value::Object(shown)
+    (Value::Object(shown), true)
 }
 
 fn size(value: &Value) -> usize {
@@ -1184,6 +1203,7 @@ mod tests {
                 tool: "shell".into(),
                 arguments: json!({"command":"sh deploy.sh"}),
                 files: vec![("deploy.sh".into(), "make deploy".into())],
+                unseen: false,
             }],
             allowed: vec![Allowed {
                 tool: "shell".into(),
@@ -1274,14 +1294,17 @@ mod tests {
         assert_eq!(clip("ééé", 4), "é\n[2 bytes not shown]\né");
         assert_eq!(clip("ééé", 3), "\n[6 bytes not shown]\n");
         let small = json!({"path":"src/lib.rs","content":"fn main() {}"});
-        assert_eq!(shown_change(&small), small);
+        let redactor = Redactor::from_env([]);
+        assert_eq!(shown_change(&small, &redactor), (small, false));
         let content = "x".repeat(CHANGE_SHOWN * 4);
-        let shown = shown_change(&json!({"path":"src/lib.rs","content":content}));
+        let (shown, cut) = shown_change(&json!({"path":"src/lib.rs","content":content}), &redactor);
+        assert!(cut);
         assert_eq!(shown["path"], "src/lib.rs");
         assert_eq!(shown["bytes"], CHANGE_SHOWN * 4);
         assert!(shown["content"].as_str().unwrap().len() < CHANGE_SHOWN);
-        let edit = shown_change(
+        let (edit, _) = shown_change(
             &json!({"path":"a.rs","old_string":"y".repeat(CHANGE_SHOWN),"new_string":"z".repeat(CHANGE_SHOWN)}),
+            &redactor,
         );
         assert_eq!(edit["bytes"], CHANGE_SHOWN * 2);
         assert!(
@@ -1289,6 +1312,17 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("bytes not shown")
+        );
+        // Redacted before it is cut: a value whose name falls in the part
+        // left out is still found.
+        let secret = "Zq8vT2nW5xK9pL3rB7mY4cH6jD1fG0sA";
+        let tail = "b".repeat(CHANGE_SHOWN / 2 - secret.len() - 1);
+        let content = format!("{}password={secret}\n{tail}", "a".repeat(CHANGE_SHOWN));
+        let (shown, _) = shown_change(&json!({"path":"a.env","content":content}), &redactor);
+        assert!(
+            !shown.to_string().contains(secret),
+            "{}",
+            &shown["content"].as_str().unwrap()[CHANGE_SHOWN / 2..]
         );
     }
 }

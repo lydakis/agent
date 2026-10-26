@@ -1971,7 +1971,7 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
         Gated::Started
     ));
     let entry = Database::PROMPTS_ENTRY;
-    let cut = db.prompts("Bob", person, 4 + entry + 10).unwrap();
+    let cut = db.prompts("Bob", person, entry + 10).unwrap();
     let listed = db.approvals(Some("Bob"), None, 0, None, 64).unwrap();
     assert_eq!(cut["calls"][0]["arguments"], "{\"command\"");
     assert_eq!(cut["calls"][0]["arguments_truncated"], true);
@@ -1991,8 +1991,11 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
     let cut = db.prompts("Carol", turn, 14 + entry + 3).unwrap();
     assert_eq!(cut["prompts"][1]["text"], "als");
     assert_eq!(cut["prompts_more"], false);
-    // Each call counts against the budget, so a long turn stays within it.
-    let cut = db.prompts("Carol", turn, 33 + 2 * entry + 3).unwrap();
+    // The calls have a budget of their own, which each call counts
+    // against, so words that fill theirs leave the calls and a long turn
+    // stays within it.
+    let cut = db.prompts("Carol", turn, entry + 3).unwrap();
+    assert_eq!(cut["prompts_more"], true);
     assert_eq!(cut["calls"].as_array().unwrap().len(), 1);
     assert_eq!(cut["calls"][0]["arguments"], "{\"c");
     assert_eq!(cut["calls"][0]["arguments_truncated"], true);

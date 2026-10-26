@@ -1244,7 +1244,9 @@ as an approver judges them, within `bytes` of text (default 64 KiB, at most
 `from` or `origin`, and `prompts_more` when steers were left out; the calls it started, each with its argument preview,
 `done`, `failed` when it failed, and `node`, with `calls_more` when some
 were left out; and the bot's earlier prompts, newest first, with `more`
-when some were left out. Text that does not fit is cut and marked
+when some were left out. The words and the calls each have `bytes` of
+their own, so a long prompt still leaves the calls (and the files they
+wrote) to read. Text that does not fit is cut and marked
 `truncated`, and each steer, call, and earlier prompt also counts 64
 bytes, so many short entries stay within `bytes` too. A fork keeps the source's binding, instructions,
 and tools, and takes no text of its own; the source is never changed. Workspaces, wherever given, must already exist and be absolute. Use the actual returned checkpoint
