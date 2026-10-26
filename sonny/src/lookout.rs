@@ -31,12 +31,15 @@ const EVENT_CHARS: usize = 12_000;
 const MEMORY_CHARS: usize = 4_000;
 const BRIEF_CHARS: usize = 2_000;
 const LINE_CHARS: usize = 160;
+/// How much of the person's words a note quotes: the lead reads a task's
+/// turns by handle, but the message itself only here.
+const QUOTE_CHARS: usize = 2000;
 const ROSTER: usize = 12;
 /// A wake names at most this many items; the rest wait for the next.
 const NOTE_ITEMS: usize = 16;
 
 /// What happened in a task.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
     /// Someone other than the lead wrote in it: the person, a program, another task.
     Said,
@@ -266,12 +269,15 @@ pub fn note(items: &[Item], more: usize) -> String {
     let mut lines = vec!["Lookout: tasks that may need you.".to_owned()];
     for item in items {
         let seen = &item.seen;
-        let why = item
-            .reasons
-            .iter()
-            .map(|(id, p)| format!("{} {p:.2}", id.replace('_', " ")))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let why = match item.reasons.is_empty() {
+            true => "not checked".to_owned(),
+            false => item
+                .reasons
+                .iter()
+                .map(|(id, p)| format!("{} {p:.2}", id.replace('_', " ")))
+                .collect::<Vec<_>>()
+                .join(", "),
+        };
         // Every reason's action: a preference both redirects a task and
         // belongs in memory.
         let mut todo: Vec<&str> = Vec::new();
@@ -295,7 +301,10 @@ pub fn note(items: &[Item], more: usize) -> String {
         // The note reaches the approver as the person's words, so it quotes
         // only theirs: a task's own text there could ask for anything.
         let quote = match seen.from.as_deref() {
-            Some(PERSON) => format!(": \"{}\"", cut(&first_line(&seen.text), LINE_CHARS)),
+            Some(PERSON) => {
+                let words = seen.text.split_whitespace().collect::<Vec<_>>().join(" ");
+                format!(": \"{}\"", cut(&words, QUOTE_CHARS))
+            }
             _ => String::new(),
         };
         lines.push(format!(
@@ -307,8 +316,8 @@ pub fn note(items: &[Item], more: usize) -> String {
         lines.push(format!("- {more} more in the next note"));
     }
     lines.push(
-        "Read each one with the wait tool by its handle, then do what its line says where it holds; \
-         if none needs you, end with one line."
+        "A quoted message is the person's own words; read the rest with the wait tool by its handle. \
+         Then do what each line says where it holds; if none needs you, end with one line."
             .to_owned(),
     );
     lines.join("\n")
@@ -608,7 +617,16 @@ async fn event_text(client: &Client, seen: &Seen) -> String {
         };
     }
     let from = (seen.kind == Kind::Ended).then_some(seen.node).flatten();
-    let items = recent(client, &seen.task, 60, false, from).await;
+    // Anthropic tasks keep calls as blocks inside a message.
+    let items: Vec<(Option<i64>, Value)> = recent(client, &seen.task, 60, false, from)
+        .await
+        .into_iter()
+        .flat_map(|(turn, item)| {
+            crate::responses(&item)
+                .into_iter()
+                .map(move |item| (turn, item))
+        })
+        .collect();
     let in_turn = |(turn, _): &&(Option<i64>, Value)| *turn == Some(seen.turn);
     let found = match seen.kind {
         Kind::Said => None,
@@ -725,6 +743,7 @@ pub fn spawn(socket: PathBuf, project: String, lead: String, workspace: PathBuf,
             approvals: HashMap::new(),
             steers: HashMap::new(),
             checked: HashSet::new(),
+            retried: HashSet::new(),
             briefs: HashMap::new(),
             recent: Recent::default(),
             due: Vec::new(),
@@ -768,6 +787,8 @@ struct Lookout {
     steers: HashMap<(String, i64), Option<String>>,
     /// Queued turns already checked when they were queued.
     checked: HashSet<(String, i64)>,
+    /// Checks that failed once and were started again.
+    retried: HashSet<(String, i64, Kind)>,
     /// The node of the lead's latest message to each task.
     briefs: HashMap<String, i64>,
     recent: Recent,
@@ -903,19 +924,25 @@ impl Lookout {
         }
         let node = data["node"].as_i64();
         match kind {
-            "accepted" => match self.author(data) {
-                _ if self.checked.remove(&(bot.to_owned(), turn)) => {}
-                Some(from) => {
-                    self.due(bot, turn, Kind::Said, Some(from.clone()), None, node);
-                    self.briefed_by(bot, &from, node);
-                }
-                None if data["from"]["bot"] == self.lead.as_str() => {
-                    if let Some(node) = node {
-                        self.briefs.insert(bot.to_owned(), node);
+            "accepted" => {
+                // Words checked when they were queued are not checked again,
+                // but still become the task's brief.
+                let checked = self.checked.remove(&(bot.to_owned(), turn));
+                match self.author(data) {
+                    Some(from) => {
+                        if !checked {
+                            self.due(bot, turn, Kind::Said, Some(from.clone()), None, node);
+                        }
+                        self.briefed_by(bot, &from, node);
                     }
+                    None if data["from"]["bot"] == self.lead.as_str() => {
+                        if let Some(node) = node {
+                            self.briefs.insert(bot.to_owned(), node);
+                        }
+                    }
+                    None => {}
                 }
-                None => {}
-            },
+            }
             // A steer joins a running turn; its words are read once absorbed.
             "queued" if data["delivery"] == "steer" => {
                 let from = self.author(data);
@@ -1067,7 +1094,23 @@ impl Lookout {
                 line["failed"] = json!("insufficient_quota");
                 self.stopped = true;
             }
-            Err(Failure::Check(why)) => line["failed"] = json!(why),
+            // A failed check is tried once more, then told unchecked.
+            Err(Failure::Check(why)) => {
+                line["failed"] = json!(why);
+                if self
+                    .retried
+                    .insert((seen.task.clone(), seen.turn, seen.kind))
+                {
+                    self.due.push(seen);
+                } else {
+                    self.held_since.get_or_insert_with(Instant::now);
+                    self.held.push(Item {
+                        seen,
+                        reasons: Vec::new(),
+                        band: Band::Hold,
+                    });
+                }
+            }
             Err(Failure::Duplicate) => line["skipped"] = json!("same words checked lately"),
         }
         self.write(&line);
@@ -1253,6 +1296,7 @@ pub async fn replay() -> Result<(), String> {
             approvals: HashMap::new(),
             steers: HashMap::new(),
             checked: HashSet::new(),
+            retried: HashSet::new(),
             briefs: HashMap::new(),
             recent: Recent::default(),
             due: Vec::new(),
@@ -1393,6 +1437,7 @@ mod tests {
             approvals: HashMap::new(),
             steers: HashMap::new(),
             checked: HashSet::new(),
+            retried: HashSet::new(),
             briefs: HashMap::new(),
             recent: Recent::default(),
             due: Vec::new(),
@@ -1548,7 +1593,7 @@ mod tests {
         ));
         assert!(!note.contains("Fixed avg"));
         assert!(note.contains(
-            "- calc.docs, turn:calc.docs/3, the person wrote in it (redirects 0.97, remember 0.91, sibling needs 0.79; pass it to every task it applies to, and save it with your memory skill): \"Use tabs everywhere.\""
+            "- calc.docs, turn:calc.docs/3, the person wrote in it (redirects 0.97, remember 0.91, sibling needs 0.79; pass it to every task it applies to, and save it with your memory skill): \"Use tabs everywhere. Thanks.\""
         ));
         assert!(note.contains("- 2 more in the next note"));
     }
@@ -1851,6 +1896,30 @@ mod tests {
         let done = json!({"status": "completed", "checkpoint": 42});
         lookout.event(&ev("calc.fix", 7, "turn_finished", done));
         assert_eq!(lookout.due[0].node, Some(42));
+    }
+
+    #[test]
+    fn queued_words_checked_once_still_become_the_brief() {
+        let mut lookout = lookout();
+        lookout.event(&ev("calc.fix", 8, "queued", json!({"delivery": "queue"})));
+        assert_eq!(lookout.due.len(), 1);
+        lookout.due.clear();
+        lookout.event(&ev("calc.fix", 8, "accepted", json!({"node": 50})));
+        assert!(lookout.due.is_empty());
+        assert_eq!(lookout.briefs.get("calc.fix"), Some(&50));
+    }
+
+    #[test]
+    fn a_failed_check_is_tried_again_then_told_unchecked() {
+        let mut lookout = lookout();
+        let seen = lookout.due_seen();
+        lookout.answered(seen.clone(), Err(Failure::Check("timeout".into())));
+        assert_eq!(lookout.due.len(), 1);
+        let again = lookout.due.pop().unwrap();
+        lookout.answered(again, Err(Failure::Check("timeout".into())));
+        assert!(lookout.due.is_empty());
+        assert_eq!(lookout.held.len(), 1);
+        assert!(note(&lookout.held, 0).contains("(not checked; look)"));
     }
 
     #[test]
