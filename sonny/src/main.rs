@@ -479,6 +479,7 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
         .text;
     let mut asked = json!({"bot": bot, "workspace": workspace, "model": model,
         "instructions": instructions, "tools": DEFAULT_TOOLS,
+        "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
         "request_id": unique("tui-create")});
     let tools = DEFAULT_TOOLS.map(String::from);
     if let Value::Object(fields) = &mut asked {
@@ -606,6 +607,8 @@ struct App {
     calls: HashMap<String, (String, Value)>,
     /// Calls waiting on the person, as `approvals` lists them.
     approvals: Vec<Value>,
+    /// The waiting call whose whole command was last written out.
+    asked: Option<Value>,
     following: bool,
     notice: Option<String>,
     quit: bool,
@@ -1023,6 +1026,7 @@ impl App {
             }),
             calls: HashMap::new(),
             approvals: Vec::new(),
+            asked: None,
             following: true,
             notice: None,
             quit: false,
@@ -2476,7 +2480,34 @@ impl App {
         }
     }
 
+    /// The call waiting on the person, written out whole above the
+    /// status row before `y` can allow it: the row shows only its start.
+    fn show_asked(&mut self) {
+        let Some(call) = self.approvals.first() else {
+            self.asked = None;
+            return;
+        };
+        if self.asked.as_ref() == Some(&call["call_id"]) {
+            return;
+        }
+        self.asked = Some(call["call_id"].clone());
+        let name = call["name"].as_str().unwrap_or("tool").to_owned();
+        let arguments = &call["arguments"];
+        let what = arguments["command"]
+            .as_str()
+            .or_else(|| arguments["path"].as_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| arguments.to_string());
+        let mut lines = vec![Line::from(vec![
+            Span::raw("⏸ ").fg(Color::Yellow),
+            Span::raw(format!("Allow {name}?")).bold(),
+        ])];
+        lines.extend(what.lines().map(|line| Line::from(format!("  {line}"))));
+        self.commit(lines);
+    }
+
     fn draw(&mut self, terminal: &mut Tui) -> std::io::Result<()> {
+        self.show_asked();
         // The pane may have changed size since these lines were wrapped:
         // the viewport takes the new size first, and a line still too wide
         // is cut into rows rather than losing its end.
