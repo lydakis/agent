@@ -509,6 +509,25 @@ fn words(text: &str) -> impl Iterator<Item = &str> {
 /// A prompt, as the person (or another bot) sent it.
 pub fn prompt(text: &str, from: Option<&str>, width: usize) -> Vec<Line<'static>> {
     let mut out = Vec::new();
+    // What Sonny (or the app) told the lead of its tasks: news, not words
+    // of the person's.
+    if text.starts_with(TASK_UPDATES) {
+        out.push(Line::from("↳ Task updates").dim());
+        let lines: Vec<&str> = text.lines().skip(1).filter(|l| !l.is_empty()).collect();
+        let shown = lines.len().min(PROMPT_LINES + 2);
+        for line in &lines[..shown] {
+            out.extend(wrap(
+                Line::from(line.to_string()).dim(),
+                width,
+                Span::raw("  "),
+                Span::raw("    "),
+            ));
+        }
+        if lines.len() > shown {
+            out.push(Line::from(format!("  … +{} lines", lines.len() - shown)).dim());
+        }
+        return out;
+    }
     if let Some(from) = from {
         out.push(Line::from(format!("  from {from}")).dim());
     }
@@ -536,6 +555,9 @@ pub fn prompt(text: &str, from: Option<&str>, width: usize) -> Vec<Line<'static>
 
 /// The most lines of a prompt shown above its reply.
 const PROMPT_LINES: usize = 6;
+
+/// How a message telling a lead of its tasks starts.
+const TASK_UPDATES: &str = "Task updates: ";
 
 /// A whole reply, as replayed history shows it.
 pub fn reply(text: &str, width: usize) -> Vec<Line<'static>> {
@@ -1023,6 +1045,24 @@ mod tests {
 
     fn text(lines: &[Line]) -> Vec<String> {
         lines.iter().map(|l| l.to_string()).collect()
+    }
+
+    #[test]
+    fn task_updates_read_as_news_not_as_the_persons_words() {
+        let told = "Task updates: since you last heard, tasks you started ended turns or wait for an approval. The wait tool reads each one's final reply by its handle.\n\
+                    - shop.fix: turn:shop.fix/5 failed, asked by you\n\n\
+                    Memory changed since you last heard; each fact is a file, read before relying on it:\n\
+                    - saved: /m/flow.md: Reviews go through gft";
+        assert_eq!(
+            text(&super::prompt(told, None, 80)),
+            [
+                "↳ Task updates",
+                "  - shop.fix: turn:shop.fix/5 failed, asked by you",
+                "  Memory changed since you last heard; each fact is a file, read before relying ",
+                "    on it:",
+                "  - saved: /m/flow.md: Reviews go through gft",
+            ]
+        );
     }
 
     #[test]
