@@ -708,9 +708,11 @@ struct Fleet {
     /// Tasks whose last turn completed, and that turn: its window closes
     /// once a wait has taken the result.
     ended: HashMap<String, i64>,
-    /// Waits running in the project, by bot and call: the task turns they
-    /// wait on.
-    waits: HashMap<(String, String), Vec<(String, i64)>>,
+    /// Calls running in the project that may wait on tasks, by bot and call.
+    waits: std::collections::HashSet<(String, String)>,
+    /// Finished calls that may have waited, to read for the turns they
+    /// returned: the bot, the output's node, and the call.
+    returned: Vec<(String, i64, String)>,
 }
 
 impl Fleet {
@@ -755,7 +757,8 @@ impl Fleet {
             errands: HashMap::new(),
             jobs: Vec::new(),
             ended: HashMap::new(),
-            waits: HashMap::new(),
+            waits: Default::default(),
+            returned: Vec::new(),
         };
         fleet.rex.adopt_own(lead);
         fleet.doing(lead, "idle");
@@ -783,6 +786,9 @@ impl Fleet {
             };
             self.lineage.insert(name.to_owned());
             let running = !bot["running_turn"].is_null();
+            // A turn that ended while away is not known by number, and
+            // one that started makes the last ending stale.
+            self.ended.remove(name);
             if running && name != self.lead {
                 let _ = self.show(name);
             } else if !running
@@ -856,28 +862,58 @@ impl Fleet {
                     self.ended.remove(bot);
                 }
             },
+            // Which turns a wait returned is read from what it printed,
+            // once it ends: a wait that timed out, or never ran, returned
+            // none. The arguments, cut short or not, only say it may wait.
             "tool_started" => {
-                let arguments = data["arguments"]
-                    .as_str()
-                    .and_then(|a| serde_json::from_str::<Value>(a).ok())
-                    .unwrap_or(Value::Null);
-                let turns = calls::waited_on(data["name"].as_str().unwrap_or(""), &arguments);
-                if !turns.is_empty() {
-                    self.waits.insert(call(), turns);
+                let may = match data["name"].as_str() {
+                    Some("wait") => true,
+                    Some("shell") => data["arguments"]
+                        .as_str()
+                        .is_some_and(|a| a.contains("wait")),
+                    _ => false,
+                };
+                if may {
+                    self.waits.insert(call());
                 }
             }
             "tool_completed" => {
-                // A wait that returned before the turn ended timed out.
-                for (task, turn) in self.waits.remove(&call()).unwrap_or_default() {
-                    if task != self.lead && self.ended.get(&task) == Some(&turn) {
-                        self.ended.remove(&task);
-                        self.rex.close(&task);
-                        self.doing.remove(&task);
-                        self.name_windows();
-                    }
+                if self.waits.remove(&call())
+                    && let Some(node) = data["node"].as_i64()
+                {
+                    self.returned.push((bot.to_owned(), node, call().1));
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Close the windows of the tasks whose completed turns the finished
+    /// waits returned.
+    async fn close_taken(&mut self) {
+        for (bot, node, call) in std::mem::take(&mut self.returned) {
+            let Ok(read) = self
+                .client
+                .request("history_items", json!({"bot": bot, "nodes": [node]}))
+                .await
+            else {
+                continue;
+            };
+            let Some(result) = responses(&read["items"][0]["item"])
+                .into_iter()
+                .find(|item| item["call_id"] == call.as_str())
+            else {
+                continue;
+            };
+            let (printed, _) = output(&result);
+            for (task, turn) in calls::returned(&printed) {
+                if task != self.lead && self.ended.get(&task) == Some(&turn) {
+                    self.ended.remove(&task);
+                    self.rex.close(&task);
+                    self.doing.remove(&task);
+                    self.name_windows();
+                }
+            }
         }
     }
 
@@ -1217,6 +1253,11 @@ impl App {
                         && !fleet.jobs.is_empty()
                     {
                         fleet.follow_jobs().await;
+                    }
+                    if let Some(fleet) = &mut self.fleet
+                        && !fleet.returned.is_empty()
+                    {
+                        fleet.close_taken().await;
                     }
                     let alerts = self
                         .fleet
