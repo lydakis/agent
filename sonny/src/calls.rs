@@ -515,6 +515,37 @@ pub fn handle_bot(handle: &str) -> String {
     }
 }
 
+/// The task turns a wait returned completed, by bot and turn, from what
+/// it printed: the wait tool's result, or `agent wait` lines among a
+/// command's output.
+pub fn returned(printed: &str) -> Vec<(String, i64)> {
+    let replies: Vec<Value> = match serde_json::from_str(printed.trim()) {
+        Ok(whole) => vec![whole],
+        Err(_) => printed
+            .lines()
+            .filter_map(|line| serde_json::from_str(line.trim()).ok())
+            .collect(),
+    };
+    let mut turns = Vec::new();
+    for reply in replies {
+        for (handle, result) in reply["results"].as_object().into_iter().flatten() {
+            if result["status"] != "completed" {
+                continue;
+            }
+            let Some((bot, turn)) = handle
+                .strip_prefix("turn:")
+                .and_then(|h| h.rsplit_once('/'))
+            else {
+                continue;
+            };
+            if let Ok(turn) = turn.parse() {
+                turns.push((bot.to_owned(), turn));
+            }
+        }
+    }
+    turns
+}
+
 /// A wait's reply as lines: `BOT completed: first line of its reply`.
 pub fn waited(reply: &Value) -> Option<Vec<String>> {
     let mut lines = Vec::new();
@@ -909,6 +940,15 @@ Keep the rest.'"#,
             ("Applied the changes of Errand job", "mini/01JB2Q8W3V4K")
         );
         assert!(said("errand doctor", "", false).is_none());
+    }
+
+    #[test]
+    fn a_wait_returns_only_the_turns_that_completed() {
+        let tool = r#"{"results":{"turn:shop.fix/7":{"bot":"shop.fix","status":"completed","text":"ok"},"turn:shop.docs/12":{"pending":true},"turn:shop.bad/3":{"status":"failed"}},"pending":["turn:shop.docs/12"]}"#;
+        assert_eq!(returned(tool), [("shop.fix".to_owned(), 7)]);
+        let shell = format!("Cloning...\n{tool}\ndone");
+        assert_eq!(returned(&shell), [("shop.fix".to_owned(), 7)]);
+        assert!(returned("no wait here").is_empty());
     }
 
     #[test]

@@ -784,6 +784,14 @@ struct Fleet {
     /// Finished calls whose output names a job to follow in a window:
     /// the bot, the output's node, and the command.
     jobs: Vec<(String, i64, String, String)>,
+    /// Tasks whose last turn completed, and that turn: its window closes
+    /// once a wait has taken the result.
+    ended: HashMap<String, i64>,
+    /// Calls running in the project that may wait on tasks, by bot and call.
+    waits: std::collections::HashSet<(String, String)>,
+    /// Finished calls that may have waited, to read for the turns they
+    /// returned: the bot, the output's node, and the call.
+    returned: Vec<(String, i64, String)>,
 }
 
 impl Fleet {
@@ -827,6 +835,9 @@ impl Fleet {
             alerts: Vec::new(),
             errands: HashMap::new(),
             jobs: Vec::new(),
+            ended: HashMap::new(),
+            waits: Default::default(),
+            returned: Vec::new(),
         };
         fleet.rex.adopt_own(lead);
         fleet.doing(lead, "idle");
@@ -854,6 +865,9 @@ impl Fleet {
             };
             self.lineage.insert(name.to_owned());
             let running = !bot["running_turn"].is_null();
+            // A turn that ended while away is not known by number, and
+            // one that started makes the last ending stale.
+            self.ended.remove(name);
             if running && name != self.lead {
                 let _ = self.show(name);
             } else if !running
@@ -900,6 +914,85 @@ impl Fleet {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// A finished task's window closes once its result is taken: its turn
+    /// completed and a wait in the project (the lead's, or a task's on its
+    /// own task) returned it. One that failed, stopped or needs the person
+    /// stays open, and a task given more work opens again.
+    fn taken(&mut self, bot: &str, kind: &str, event: &Value) {
+        let data = &event["data"];
+        let call = || {
+            (
+                bot.to_owned(),
+                data["call_id"].as_str().unwrap_or("").to_owned(),
+            )
+        };
+        match kind {
+            "accepted" => {
+                self.ended.remove(bot);
+            }
+            "turn_finished" => match (data["status"].as_str(), event["turn"].as_i64()) {
+                (Some("completed"), Some(turn)) => {
+                    self.ended.insert(bot.to_owned(), turn);
+                }
+                _ => {
+                    self.ended.remove(bot);
+                }
+            },
+            // Which turns a wait returned is read from what it printed,
+            // once it ends: a wait that timed out, or never ran, returned
+            // none. The arguments, cut short or not, only say it may wait.
+            "tool_started" => {
+                let may = match data["name"].as_str() {
+                    Some("wait") => true,
+                    Some("shell") => data["arguments"]
+                        .as_str()
+                        .is_some_and(|a| a.contains("wait")),
+                    _ => false,
+                };
+                if may {
+                    self.waits.insert(call());
+                }
+            }
+            "tool_completed" => {
+                if self.waits.remove(&call())
+                    && let Some(node) = data["node"].as_i64()
+                {
+                    self.returned.push((bot.to_owned(), node, call().1));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Close the windows of the tasks whose completed turns the finished
+    /// waits returned.
+    async fn close_taken(&mut self) {
+        for (bot, node, call) in std::mem::take(&mut self.returned) {
+            let Ok(read) = self
+                .client
+                .request("history_items", json!({"bot": bot, "nodes": [node]}))
+                .await
+            else {
+                continue;
+            };
+            let Some(result) = responses(&read["items"][0]["item"])
+                .into_iter()
+                .find(|item| item["call_id"] == call.as_str())
+            else {
+                continue;
+            };
+            let (printed, _) = output(&result);
+            for (task, turn) in calls::returned(&printed) {
+                if task != self.lead && self.ended.get(&task) == Some(&turn) {
+                    self.ended.remove(&task);
+                    self.rex.close(&task);
+                    self.doing.remove(&task);
+                    self.name_windows();
+                }
+            }
         }
     }
 
@@ -1040,6 +1133,7 @@ impl Fleet {
         let data = &event["data"];
         if self.lineage.contains(bot) {
             self.errand(bot, kind, data);
+            self.taken(bot, kind, event);
             match kind {
                 "accepted" if bot == self.lead => self.doing(bot, "working"),
                 "approval_requested" => {
@@ -1240,6 +1334,11 @@ impl App {
                         && !fleet.jobs.is_empty()
                     {
                         fleet.follow_jobs().await;
+                    }
+                    if let Some(fleet) = &mut self.fleet
+                        && !fleet.returned.is_empty()
+                    {
+                        fleet.close_taken().await;
                     }
                     let alerts = self
                         .fleet

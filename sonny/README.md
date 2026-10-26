@@ -19,7 +19,10 @@ its own, history and all. When `rex` is found
 with its name, and each task the lead (or one of its tasks) starts gets a
 window there running Sonny on that task, without taking focus. Each window
 reports OSC 7501 status, so Rex shows which task is working, waiting on an
-approval or done. `--rex-host HOST` puts the session on another Rex server;
+approval or done. A task's window closes once its work is taken: its turn
+completed and the lead (or the task that started it) waited on it. One that
+failed, stopped or waits on you stays open, and a task given more work opens
+again; ask the lead to show one, or run `sonny --bot NAME`. `--rex-host HOST` puts the session on another Rex server;
 `--no-rex` turns the layout off. On first use Sonny writes the `rex-windows`
 skill (`skills/rex-windows/SKILL.md`) to `~/.agents/skills/rex-windows`, so any agent can run a
 long command in a Rex window the person can watch, and read it back.
