@@ -1997,12 +1997,22 @@ test('the coordinator the app ships gives editing tasks worktrees and cleans up 
   assert.match(text, /A task keeps its folder, so later messages to it need no --workspace/);
   assert.match(text, /run --detach --new --agents --bot NAME/); assert.match(text, /pass --profile ROLE in place of --agents/);
   assert.match(text, /If \.agents\/setup exists here/);
-  assert.match(text, /the start fails and "\$AGENT_BIN" ls does not list NAME, remove the worktree/);
+  assert.match(text, /the start fails and "\$AGENT_BIN" ls --name NAME does not list it, remove the worktree/);
   assert.match(text, /git worktree remove --force, git branch -D/);
-  assert.match(text, /when this folder is not a git repository, works in this folder/);
+  // Only the lead works in the folder: every task gets a copy, one that only reads too.
+  assert.match(text, /give every new task its own worktree, one that only reads too, so tasks do not collide: only you work in this folder/);
+  assert.match(text, /In a folder that is not a git repository, tasks work in this folder unless they get sandfs copies/);
   // The threads' picks are told to the coordinator by the app, not by this role, which a folder may replace.
   assert.doesNotMatch(text, /threads_|project\.toml/);
-  assert.match(text, /Unless this project's tasks all work in this folder/);
+  assert.match(text, /Unless this project's tasks all work in this folder or get sandfs copies/);
+  // Told its tasks get sandfs copies (the client's preference): a frozen copy on its own branch, its commits pushed back, then removed.
+  assert.match(text, /sandfs mount "git:\$\(git rev-parse --show-toplevel\)" "\$HOME\/\.agent\/tasks\/NAME" --uncommitted --branch agent\/NAME/);
+  assert.match(text, /--workspace "\$HOME\/\.agent\/tasks\/NAME\/\$\(git rev-parse --show-prefix\)"/);
+  assert.match(text, /git -C "\$HOME\/\.agent\/tasks\/NAME" push origin agent\/NAME/);
+  // Outside git, a copy of the folder itself, its changes checked and copied back.
+  assert.match(text, /sandfs mount "\$PWD" "\$HOME\/\.agent\/tasks\/NAME"\n/);
+  assert.match(text, /sandfs changes NAME --copy-to "\$PWD" writes them here/);
+  assert.match(text, /sandfs rm --unmount NAME removes the copy/);
 });
 
 test('a project the core refuses opens nothing, and one already there says when the picks were not applied', async () => {

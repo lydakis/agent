@@ -38,14 +38,16 @@ fn role(dir: &Path) -> Result<agent_client::policy::Profile, String> {
 }
 
 /// A lead's instructions as the app composes them for `dir` now (its role,
-/// the folder's rules, skills and memory, then the project's task rule),
-/// and, when the person reads it inside Rex, where they are.
+/// the folder's rules, skills and memory, then the project's task rule
+/// with the copies Sonny is set to), and, when the person reads it inside
+/// Rex, where they are.
 pub fn instructions(dir: &Path, rex: Option<&str>) -> Result<String, String> {
     let memory = agent_client::policy::memory_indexes(dir).map_err(|e| e.to_string())?;
     let composed = agent_client::policy::instructions(dir, Some(&role(dir)?), &memory)
         .map_err(|e| e.to_string())?
         .text;
-    let rule = agent_client::project::rule(&agent_client::project::read(dir)?);
+    let copies = crate::settings::Settings::load().copies;
+    let rule = agent_client::project::rule(&agent_client::project::read(dir)?, &copies);
     let mut text = format!("{composed}\n\n{rule}");
     if let Some(session) = rex {
         text.push_str(&format!(
