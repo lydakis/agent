@@ -268,8 +268,11 @@ pub struct Item {
 
 /// What the lead is told: pointers it can read with its wait tool, why
 /// each was picked, and a line of each.
+/// How a lookout's note to the lead starts.
+pub const NOTE_HEAD: &str = "Lookout: tasks that may need you.";
+
 pub fn note(items: &[Item], more: usize) -> String {
-    let mut lines = vec!["Lookout: tasks that may need you.".to_owned()];
+    let mut lines = vec![NOTE_HEAD.to_owned()];
     for item in items {
         let seen = &item.seen;
         let why = match item.reasons.is_empty() {
