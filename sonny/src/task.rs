@@ -264,7 +264,8 @@ fn sandfs_copy(here: &Path, name: &str) -> Result<Place, String> {
     let source = source(here)?;
     let tasks = tasks()?;
     std::fs::create_dir_all(&tasks).map_err(|e| format!("{}: {e}", tasks.display()))?;
-    let dir = tasks.join(name);
+    // As the mount table names it, so a mount found there compares equal.
+    let dir = std::fs::canonicalize(&tasks).unwrap_or(tasks).join(name);
     let home = sandfs()?;
     let exists = home
         .workspaces()
@@ -278,12 +279,19 @@ fn sandfs_copy(here: &Path, name: &str) -> Result<Place, String> {
         Source::Folder => (here.to_owned(), false),
     };
     let undo = match exists {
-        Some(ws) => {
-            if ws.mounted.is_none() {
-                home.mount(name, &dir, &MountOptions::default())
-                    .map_err(|e| format!("{e:#}"))?;
-            }
+        // The task's own copy, mounted or left unmounted by a restart.
+        Some(ws) if ws.mounted.as_deref() == Some(dir.as_path()) => Undo::Nothing,
+        Some(ws) if ws.mounted.is_none() && dir.is_dir() => {
+            home.mount(name, &dir, &MountOptions::default())
+                .map_err(|e| format!("{e:#}"))?;
             Undo::Nothing
+        }
+        // The home is shared with the sandfs command: never take over a
+        // workspace something else made.
+        Some(_) => {
+            return Err(format!(
+                "a sandfs workspace named {name} exists that is not this task's; pick another NAME"
+            ));
         }
         None => {
             let from = match &source {
