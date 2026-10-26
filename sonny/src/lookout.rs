@@ -378,7 +378,9 @@ impl Judge {
                     "lookout: {spec} is not openai-decisions/MODEL or typesafe/jev-*"
                 ));
             };
-        let key = key(key_name).ok_or_else(|| format!("lookout: set {key_name} for {spec}"))?;
+        let key = key(key_name).ok_or_else(|| {
+            format!("lookout off: set {key_name} for {spec}, or pass --lookout off")
+        })?;
         let url = std::env::var("LOOKOUT_URL")
             .ok()
             .filter(|url| !url.is_empty())
@@ -497,6 +499,9 @@ enum Failure {
     /// board post copied to each member is.
     Duplicate,
 }
+
+/// The judge when `--lookout` names none: the best of the real runs.
+pub const DEFAULT: &str = "openai-decisions/gpt-6-luna";
 
 /// Who wrote a message with no sender and no origin.
 const PERSON: &str = "the person";

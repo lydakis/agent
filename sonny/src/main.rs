@@ -85,16 +85,19 @@ struct Options {
     rex_host: Option<String>,
     /// Ring when work ends or needs the person.
     sound: bool,
-    /// The decision model that wakes the lead when its tasks need it.
+    /// The decision model that wakes the lead when its tasks need it;
+    /// `None` with `--lookout off`.
     lookout: Option<String>,
 }
 
 fn usage() -> String {
     "usage: sonny [--store PATH] [--socket PATH] [--model PROVIDER/MODEL] [--no-rex] [--rex-host HOST] [--no-sound]\n\
-     \x20      [--lookout openai-decisions/MODEL|typesafe/jev-*]\n\
+     \x20      [--lookout openai-decisions/MODEL|typesafe/jev-*|off]\n\
      \x20      [--bot NAME [--new [--workspace DIR]]]\n\
      With no --bot, the folder's coordinator, made with --model the first time; its tasks\n\
-     open in the project's Rex session. Type /status for the project's agents."
+     open in the project's Rex session. Type /status for the project's agents.\n\
+     The lookout wakes the lead when its tasks need it, judged by openai-decisions/gpt-6-luna\n\
+     unless --lookout names another judge or off."
         .into()
 }
 
@@ -297,7 +300,8 @@ fn parse() -> Result<Options, String> {
     let mut args = std::env::args().skip(1);
     let (mut store, mut socket, mut bot, mut new, mut model, mut workspace) =
         (None, None, None, false, None, None);
-    let (mut rex, mut rex_host, mut sound, mut lookout) = (true, None, true, None);
+    let (mut rex, mut rex_host, mut sound) = (true, None, true);
+    let mut lookout = Some(lookout::DEFAULT.to_owned());
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or_else(usage);
         match arg.as_str() {
@@ -310,7 +314,7 @@ fn parse() -> Result<Options, String> {
             "--no-rex" => rex = false,
             "--rex-host" => rex_host = Some(value()?),
             "--no-sound" => sound = false,
-            "--lookout" => lookout = Some(value()?),
+            "--lookout" => lookout = Some(value()?).filter(|judge| judge != "off"),
             _ => return Err(usage()),
         }
     }
