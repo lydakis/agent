@@ -18,8 +18,9 @@ impl Lab {
     /// A repository with a commit and an uncommitted edit under `src`,
     /// and an `agent` that logs what `run` was given.
     fn new(test: &str) -> Lab {
-        let scratch =
-            std::env::temp_dir().join(format!("sonny-task-{test}-{}", std::process::id()));
+        // Under /tmp, not macOS's long $TMPDIR: sandfs's mount socket lives
+        // in the home made here, and a socket path must fit in 104 bytes.
+        let scratch = Path::new("/tmp").join(format!("sonny-task-{test}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
         for dir in ["home", "repo/src"] {
             std::fs::create_dir_all(scratch.join(dir)).unwrap();

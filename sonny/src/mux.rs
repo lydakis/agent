@@ -4,7 +4,10 @@
 //! again by that name; a command a bot asked for is labelled `BOT/NAME` and
 //! closes with its owner. `Layout` keeps what Sonny does there; a `Backend`
 //! says how, in its multiplexer's CLI.
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 /// A block as its multiplexer lists it.
 pub struct Block {
@@ -245,31 +248,89 @@ impl Layout {
     }
 }
 
+/// The multiplexers Sonny lays work out in, by the CLI that drives each.
+enum Kind {
+    Rex(PathBuf),
+    Herdr(PathBuf),
+}
+
+/// The multiplexer this terminal is in: Herdr when Sonny runs in a Herdr
+/// pane, Rex when in a Rex block or `host` names a Rex server.
+fn current(host: Option<&str>) -> Option<Kind> {
+    if host.is_none() && crate::herdr::pane().is_some() {
+        return crate::herdr::find().map(Kind::Herdr);
+    }
+    let rex = std::env::var_os("REX_SESSION").is_some() || host.is_some();
+    rex.then(crate::rex::find).flatten().map(Kind::Rex)
+}
+
 /// The project's home in the multiplexer Sonny runs in, from the person's
-/// terminal: Rex when Sonny runs in a Rex block, or `host` names a Rex
-/// server. None when Sonny runs in neither; tasks then run out of sight,
+/// terminal. None when Sonny runs in none; tasks then run out of sight,
 /// in /status.
 pub fn here(project: &str, host: Option<&str>) -> Option<Layout> {
-    if std::env::var_os("REX_SESSION").is_none() && host.is_none() {
-        return None;
-    }
-    let rex = crate::rex::Rex::open(crate::rex::find()?, host, project, true).ok()?;
-    Some(Layout::new(Box::new(rex)))
+    let backend: Box<dyn Backend> = match current(host)? {
+        Kind::Rex(bin) => Box::new(crate::rex::Rex::open(bin, host, project, true).ok()?),
+        Kind::Herdr(bin) => {
+            let pane = crate::herdr::pane();
+            Box::new(crate::herdr::Herdr::open(bin, project, pane.as_deref()).ok()?)
+        }
+    };
+    Some(Layout::new(backend))
 }
 
 /// The project's home, from an agent's shell, whose multiplexer variables
-/// would name the daemon's terminal.
+/// would name the daemon's terminal: in Herdr when the project's lead is in
+/// a Herdr pane, else in Rex (or Herdr, without Rex), made when needed.
 pub fn for_agent(project: &str, host: Option<&str>) -> Result<Layout, String> {
-    let bin = crate::rex::find().ok_or("rex not found")?;
-    let rex = crate::rex::Rex::open(bin, host, project, false)?;
-    Ok(Layout::new(Box::new(rex)))
+    let herdr = crate::herdr::find().filter(|_| host.is_none());
+    let rex = crate::rex::find();
+    let backend: Box<dyn Backend> = match (herdr, rex) {
+        (Some(herdr), _) if crate::herdr::has_lead(&herdr, project) => {
+            Box::new(crate::herdr::Herdr::open(herdr, project, None)?)
+        }
+        (_, Some(rex)) => Box::new(crate::rex::Rex::open(rex, host, project, false)?),
+        (Some(herdr), None) => Box::new(crate::herdr::Herdr::open(herdr, project, None)?),
+        (None, None) => return Err("neither rex nor herdr was found".into()),
+    };
+    Ok(Layout::new(backend))
 }
 
-/// The skill that tells agents how to use the multiplexer.
-pub fn install_skill() {
-    if let Some(bin) = crate::rex::find() {
-        crate::rex::install_skill(&bin);
-    }
+/// The skills that let any agent run long work where the person can see
+/// it, for the multiplexer this terminal is in (the other's taken out, so
+/// agents read one), and show the person pictures. Each names this
+/// machine's multiplexer CLI and Sonny.
+pub fn install_skill(host: Option<&str>) {
+    crate::skills::install("pictures", include_str!("../skills/pictures/SKILL.md"));
+    let Some(sonny) = std::env::current_exe().ok() else {
+        return;
+    };
+    let quoted = |path: &Path| format!("\"{}\"", path.to_string_lossy());
+    let rex = |bin: PathBuf| {
+        let text = include_str!("../skills/rex-windows/SKILL.md");
+        (
+            "rex-windows",
+            "herdr-panes",
+            text.replace("REX_BIN", &quoted(&bin)),
+        )
+    };
+    let (name, other, text) = match current(host) {
+        Some(Kind::Herdr(bin)) => {
+            let text = include_str!("../skills/herdr-panes/SKILL.md");
+            (
+                "herdr-panes",
+                "rex-windows",
+                text.replace("HERDR_BIN", &quoted(&bin)),
+            )
+        }
+        Some(Kind::Rex(bin)) => rex(bin),
+        // Out of sight, Rex is the default.
+        None => match crate::rex::find() {
+            Some(bin) => rex(bin),
+            None => return,
+        },
+    };
+    crate::skills::install(name, &text.replace("SONNY_BIN", &quoted(&sonny)));
+    crate::skills::remove(other);
 }
 
 #[cfg(test)]

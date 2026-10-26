@@ -14,20 +14,26 @@ Opened in a folder, Sonny is that project's lead: the same `<project>.lead`
 the app opens, made through the app's `~/.agent/project add` when the app is
 installed, else in the app's coordinator profile. A lead moved to another
 folder (`--workspace`) comes back with the next message Sonny sends it from
-its own, history and all. When `rex` is found
-(`$REX`, the PATH, or the Mac app), the project gets one Rex session: the
-one Sonny was opened in, else the one the lead is in, else one labelled with the project's name. Each task the lead (or one of its tasks) starts gets a
-window there running Sonny on that task, without taking focus. Each window
-reports OSC 7501 status, so Rex shows which task is working, waiting on an
-approval or done. A task's window closes once its work is taken: its turn
-completed and the lead (or the task that started it) waited on it. One that
-failed, stopped or waits on you stays open, and a task given more work opens
-again; ask the lead to show one, or run `sonny --bot NAME`. `--rex-host HOST` puts the session on another Rex server;
-`--no-rex` turns the layout off. On first use Sonny writes the `rex-windows`
-skill (`skills/rex-windows/SKILL.md`) to `~/.agents/skills/rex-windows`, so any agent can run a
-long command where the person can watch it, and read it back:
-`sonny split NAME [--window] -- COMMAND...` opens a block labelled
-`AGENT/NAME` below the agent's own (or in a tab of its own) and prints its ID.
+its own, history and all. When Sonny runs in a Rex block (`rex` found as
+`$REX`, on the PATH, or in the Mac app) or a Herdr pane (`herdr` found as
+`$HERDR` or on the PATH), the project gets one home there: in Rex a session
+(the one Sonny was opened in, else the one the lead is in, else one labelled
+with the project's name), in Herdr a workspace, chosen the same way. Each task
+the lead (or one of its tasks) starts gets a window (a Herdr tab) there
+running Sonny on that task, without taking focus, its block (pane) labelled
+with the task's name. In Rex, each window reports OSC 7501 status, so Rex
+shows which task is working, waiting on an approval or done. A task's window
+closes once its work is taken: its turn completed and the lead (or the task
+that started it) waited on it. One that failed, stopped or waits on you stays
+open, and a task given more work opens again; ask the lead to show one, or
+run `sonny --bot NAME`. `--rex-host HOST` puts the session on another Rex
+server; `--no-layout` turns the layout off. Sonny writes the skill for the
+multiplexer it runs in to `~/.agents/skills` (`rex-windows` or
+`herdr-panes`, from `skills/`), so any agent can run a long command where
+the person can watch it, and read it back: `sonny split NAME [--window] --
+COMMAND...` opens a block labelled `AGENT/NAME` below the agent's own (or
+in a tab of its own) and prints its ID. Herdr has no exit status to wait
+for, so its skill has agents end such a command with a line to wait for.
 The skill tells agents to close what they opened once read; whatever a task
 left open closes with its window.
 
