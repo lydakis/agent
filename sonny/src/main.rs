@@ -175,7 +175,7 @@ async fn agents_layout(
     let socket = std::path::absolute(socket).map_err(|e| e.to_string())?;
     let client = Client::connect(&socket).await.map_err(|e| e.to_string())?.0;
     let project = project_of(&client, bot).await;
-    let layout = mux::for_agent(&project, host.as_deref())?;
+    let layout = mux::for_agent(&socket, &project, host.as_deref())?;
     Ok((socket, project, layout))
 }
 
@@ -409,6 +409,31 @@ fn parse() -> Result<Options, String> {
     })
 }
 
+/// What runs this Sonny again on the same bot, from the same folder: `sonny`
+/// with its own arguments, less those that made the bot or changed a
+/// setting, and with the daemon the environment named.
+fn reopen() -> Vec<String> {
+    let mut command = vec!["sonny".to_owned()];
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--new" => {}
+            "--workspace" | "--copies" => {
+                args.next();
+            }
+            _ => command.push(arg),
+        }
+    }
+    for (flag, var) in [("--store", "AGENT_STORE"), ("--socket", "AGENT_SOCKET")] {
+        if !command.iter().any(|a| a == flag)
+            && let Some(value) = std::env::var_os(var).filter(|v| !v.is_empty())
+        {
+            command.extend([flag.to_owned(), value.to_string_lossy().into_owned()]);
+        }
+    }
+    command
+}
+
 // Two threads, so the daemon's events are read while a picture is drawn:
 // a reader that stops is dropped by the daemon as lagging.
 fn main() -> std::process::ExitCode {
@@ -479,6 +504,7 @@ async fn run() -> Result<(), String> {
             (lead.bot, Some(lead.project))
         }
     };
+    herdr::announce(&name, reopen());
     // Everything after now arrives live; history is read from the bot's
     // items instead of replayed events, so the replay is skipped. The bot
     // is read after that, so a turn that ended during the replay is seen
@@ -703,8 +729,10 @@ fn unique(prefix: &str) -> String {
 }
 
 /// Program status (OSC 7501), so a terminal or multiplexer that reads it
-/// (Ghostty, Rex) can mark this pane working, blocked or done.
+/// (Ghostty, Rex) can mark this pane working, blocked or done; and the
+/// same to Herdr, which takes it from its own CLI instead.
 fn status_report(state: &str, bot: &str) {
+    herdr::report(state);
     use base64::Engine;
     let mut body = format!("state={state}");
     if state == "blocked" {
@@ -939,7 +967,7 @@ struct Fleet {
 
 impl Fleet {
     async fn start(options: &Options, project: &str, lead: &str) -> Option<Self> {
-        let layout = mux::here(project, options.rex_host.as_deref())?;
+        let layout = mux::here(&options.socket, project, options.rex_host.as_deref())?;
         let (client, mut events) = Client::connect(&options.socket).await.ok()?;
         client
             .request("follow", json!({"bot": "*", "after": 0}))
