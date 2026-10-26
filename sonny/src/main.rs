@@ -192,7 +192,9 @@ fn agent_bin() -> Option<PathBuf> {
         .map(PathBuf::from)
         .into_iter()
         .chain(beside)
-        .chain([PathBuf::from("/Applications/Agent.app/Contents/MacOS/agent")])
+        .chain([PathBuf::from(
+            "/Applications/Agent.app/Contents/MacOS/agent",
+        )])
         .find(|bin| bin.is_file())
 }
 
@@ -676,9 +678,10 @@ struct Fleet {
     named: HashMap<String, String>,
     /// What to ring for, taken by the app after each event.
     alerts: Vec<(sound::Alert, String)>,
-    /// Detached Errand runs the project's bots started, by call: the
-    /// command, until the call's output names the job.
-    errands: HashMap<String, String>,
+    /// Detached Errand runs the project's bots started, by bot and call
+    /// (call ids are only unique within a bot): the command, until the
+    /// call's output names the job.
+    errands: HashMap<(String, String), String>,
     /// Finished calls whose output names a job to follow in a window:
     /// the bot, the output's node, and the command.
     jobs: Vec<(String, i64, String, String)>,
@@ -786,11 +789,11 @@ impl Fleet {
                     .and_then(|a| serde_json::from_str::<Value>(a).ok())
                     .and_then(|a| a["command"].as_str().and_then(calls::errand_detached));
                 if let Some(command) = command {
-                    self.errands.insert(call, command);
+                    self.errands.insert((bot.to_owned(), call), command);
                 }
             }
             "tool_completed" => {
-                if let Some(command) = self.errands.remove(&call)
+                if let Some(command) = self.errands.remove(&(bot.to_owned(), call.clone()))
                     && let Some(node) = data["node"].as_i64()
                     && data["failed"] != true
                 {
@@ -1548,7 +1551,7 @@ impl App {
                     self.live_line(&mut live, line);
                 }
             }
-            let held = live.markdown.end(self.width);
+            let held = live.markdown.end(self.width, live.lines == 0);
             self.live_rows(&mut live, held);
         }
     }
@@ -2096,6 +2099,34 @@ impl App {
             })
             .cloned()
             .collect();
+        // A long command is listed cut: the person answers the whole of it,
+        // read from the node that planned it, or is told it could not be.
+        for call in &mut self.approvals {
+            let whole = call["arguments"].is_object()
+                && call["arguments_cut"].as_array().is_none_or(Vec::is_empty)
+                && call["arguments_omitted"].as_u64().unwrap_or(0) == 0;
+            if whole {
+                continue;
+            }
+            let whole = match self
+                .client
+                .request(
+                    "history_items",
+                    json!({"bot": self.bot, "nodes": [call["node"]]}),
+                )
+                .await
+            {
+                Ok(read) => agent_client::approver::call_arguments(
+                    &read["items"][0]["item"],
+                    call["call_id"].as_str().unwrap_or_default(),
+                ),
+                Err(_) => None,
+            };
+            match whole {
+                Some(arguments) => call["arguments"] = arguments,
+                None => call["incomplete"] = json!(true),
+            }
+        }
         if !self.approvals.is_empty() {
             status_report("blocked", &self.bot);
             // With a fleet, the lead's Sonny rings for every agent.
@@ -2269,7 +2300,14 @@ impl App {
                     KeyCode::Char(c @ ('y' | 'n'))
                         if !self.approvals.is_empty() && self.input.is_empty() =>
                     {
-                        self.answer(if c == 'y' { "allow" } else { "deny" }).await;
+                        // A call whose whole arguments could not be read
+                        // can only be denied.
+                        if c == 'y' && self.approvals[0]["incomplete"] == true {
+                            self.notice =
+                                Some("only part of this call could be read; n denies it".into());
+                        } else {
+                            self.answer(if c == 'y' { "allow" } else { "deny" }).await;
+                        }
                     }
                     KeyCode::Char(c) if !ctrl => self.input.push(c),
                     KeyCode::Backspace => {
@@ -2432,6 +2470,11 @@ impl App {
             Span::raw(format!("Allow {name}?")).bold(),
         ])];
         lines.extend(what.lines().map(|line| Line::from(format!("  {line}"))));
+        if call["incomplete"] == true {
+            lines.push(
+                Line::from("  … cut; the rest could not be read, so y is off: n denies it").dim(),
+            );
+        }
         self.commit(lines);
     }
 
@@ -2474,9 +2517,12 @@ impl App {
                     }
                 })
                 .collect();
-            terminal.insert_before(lines.len() as u16, |buf| {
-                Paragraph::new(lines).render(buf.area, buf);
-            })?;
+            // A row count fits a u16 only so far.
+            for rows in lines.chunks(4096) {
+                terminal.insert_before(rows.len() as u16, |buf| {
+                    Paragraph::new(rows.to_vec()).render(buf.area, buf);
+                })?;
+            }
         }
         terminal.draw(|frame| {
             let [live, status, _, composer, footer] =
