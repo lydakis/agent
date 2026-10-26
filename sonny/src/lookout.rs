@@ -1291,7 +1291,7 @@ pub async fn replay() -> Result<(), String> {
         }
     }
     let judges: Vec<Arc<Judge>> = judges.into_iter().map(Arc::new).collect();
-    let mut due: Vec<(String, PathBuf, Seen)> = Vec::new();
+    let mut due: Vec<(i64, String, PathBuf, Seen)> = Vec::new();
     for lead in bots
         .iter()
         .filter_map(|b| b["name"].as_str())
@@ -1348,13 +1348,17 @@ pub async fn replay() -> Result<(), String> {
         }
         events.sort_by_key(|e| e["cursor"].as_i64().unwrap_or(0));
         for event in &events {
+            let before = lookout.due.len();
             lookout.event(event);
-        }
-        for seen in std::mem::take(&mut lookout.due) {
-            due.push((lead.to_owned(), workspace.clone(), seen));
+            let cursor = event["cursor"].as_i64().unwrap_or(0);
+            for seen in lookout.due.drain(before..) {
+                due.push((cursor, lead.to_owned(), workspace.clone(), seen));
+            }
         }
     }
-    // The newest checks, oldest first, so a lead's story reads in order.
+    // The newest checks across every lead, oldest first, so a lead's story
+    // reads in order.
+    due.sort_by_key(|(cursor, ..)| *cursor);
     let skip = due.len().saturating_sub(limit);
     let due: Vec<_> = due.into_iter().skip(skip).collect();
     eprintln!(
@@ -1368,13 +1372,15 @@ pub async fn replay() -> Result<(), String> {
         }
         None => Box::new(std::io::stdout()),
     };
-    // Each judge skips repeated words on its own, as one live lookout would.
-    let recents: Vec<Recent> = judges.iter().map(|_| Recent::default()).collect();
-    for (n, (lead, workspace, seen)) in due.into_iter().enumerate() {
+    // Each judge skips repeated words per lead on its own, as each lead's
+    // live lookout would.
+    let mut recents: HashMap<(usize, String), Recent> = HashMap::new();
+    for (n, (_, lead, workspace, seen)) in due.into_iter().enumerate() {
         let memory = memory(&workspace);
         let text = event_text(&client, &seen).await;
-        for (judge, recent) in judges.iter().zip(&recents) {
-            let answered = check(&client, judge, &seen, &memory, recent).await;
+        for (index, judge) in judges.iter().enumerate() {
+            let recent = recents.entry((index, lead.clone())).or_default().clone();
+            let answered = check(&client, judge, &seen, &memory, &recent).await;
             let mut line = json!({"n": n, "lead": lead, "task": seen.task, "turn": seen.turn,
                 "kind": format!("{:?}", seen.kind), "from": seen.from, "status": seen.status,
                 "judge": judge.name, "text": cut(&text, 600)});
