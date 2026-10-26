@@ -74,8 +74,10 @@ fn start(here: &Path, name: &str, rest: &[String]) -> Result<(), String> {
             _ => worktree(here, name)?,
         }
     };
-    let failed = |place: &Place, error: String| {
-        if !listed(&agent, name) {
+    // Only a run that started can have made the task, which then keeps
+    // its folder; anything that failed before leaves nothing behind.
+    let failed = |place: &Place, ran: bool, error: String| {
+        if !ran || !listed(&agent, name) {
             undo(&place.undo);
         }
         Err(error)
@@ -90,7 +92,7 @@ fn start(here: &Path, name: &str, rest: &[String]) -> Result<(), String> {
             .stdin(Stdio::null())
             .status();
         if !status.is_ok_and(|status| status.success()) {
-            return failed(&place, format!("{} failed", script.display()));
+            return failed(&place, false, format!("{} failed", script.display()));
         }
     }
     let status = Command::new(&agent)
@@ -100,10 +102,17 @@ fn start(here: &Path, name: &str, rest: &[String]) -> Result<(), String> {
         .arg("--")
         .args(brief)
         .stdin(Stdio::null())
-        .status()
-        .map_err(|e| format!("running {}: {e}", agent.to_string_lossy()))?;
-    if !status.success() {
-        return failed(&place, format!("{name} did not start"));
+        .status();
+    match status {
+        Ok(status) if status.success() => {}
+        Ok(_) => return failed(&place, true, format!("{name} did not start")),
+        Err(e) => {
+            return failed(
+                &place,
+                false,
+                format!("running {}: {e}", agent.to_string_lossy()),
+            );
+        }
     }
     if let Some(note) = &place.note {
         eprintln!("{note}");
@@ -168,6 +177,14 @@ fn worktree(here: &Path, name: &str) -> Result<Place, String> {
     let path = home_dir()?.join(".agent/worktrees").join(name);
     let branch = format!("agent/{name}");
     let undo = if path.exists() {
+        // Left by a task of this name before: its own only if it is a
+        // worktree of this repository on the task's branch.
+        if !ours(here, &path, &branch) {
+            return Err(format!(
+                "{} exists and is not this repository's worktree on {branch}; pick another NAME",
+                path.display()
+            ));
+        }
         Undo::Nothing
     } else {
         let target = path.to_string_lossy();
@@ -190,6 +207,20 @@ fn worktree(here: &Path, name: &str) -> Result<Place, String> {
         )),
         undo,
     })
+}
+
+/// Whether `path` is a worktree of the repository `here` is in, on `branch`.
+fn ours(here: &Path, path: &Path, branch: &str) -> bool {
+    let common = |dir: &Path| {
+        git(
+            dir,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .ok()
+        .and_then(|dir| std::fs::canonicalize(dir).ok())
+    };
+    common(path).is_some_and(|theirs| common(here) == Some(theirs))
+        && git(path, &["branch", "--show-current"]).is_ok_and(|current| current == branch)
 }
 
 /// Where a task's sandfs copy is mounted, beside `~/.agent/worktrees`.

@@ -163,6 +163,42 @@ fn a_task_that_does_not_start_leaves_no_worktree_or_branch() {
 }
 
 #[test]
+fn a_task_whose_agent_cannot_run_leaves_no_worktree() {
+    let mut lab = Lab::new("no-agent");
+    lab.agent = lab.scratch.join("missing");
+    let (ok, said) = lab.task(false, &[]);
+    assert!(!ok, "{said}");
+    assert!(!lab.home.join(".agent/worktrees/demo.fix").exists());
+}
+
+#[test]
+fn a_worktree_left_by_another_repository_is_not_taken_over() {
+    let lab = Lab::new("other-repo");
+    let other = lab.scratch.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    lab.git(&other, &["init", "-q", "-b", "main"]);
+    lab.git(&other, &["commit", "-q", "--allow-empty", "-m", "other"]);
+    let worktree = lab.home.join(".agent/worktrees/demo.fix");
+    let target = worktree.to_string_lossy().into_owned();
+    lab.git(
+        &other,
+        &["worktree", "add", "-q", "-b", "agent/demo.fix", &target],
+    );
+    let (ok, said) = lab.task(false, &[]);
+    assert!(!ok, "{said}");
+    assert!(said.contains("pick another NAME"), "{said}");
+    assert!(!lab.scratch.join("run.log").exists());
+    // One of this repository's, as a task of this name left it, is reused.
+    std::fs::remove_dir_all(&worktree).unwrap();
+    lab.git(
+        &lab.repo,
+        &["worktree", "add", "-q", "-b", "agent/demo.fix", &target],
+    );
+    let (ok, said) = lab.task(false, &[]);
+    assert!(ok, "{said}");
+}
+
+#[test]
 fn setup_runs_in_the_tasks_folder_and_a_failing_one_starts_nothing() {
     let lab = Lab::new("setup");
     let setup = lab.repo.join("src/.agents/setup");
