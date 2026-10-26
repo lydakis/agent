@@ -42,16 +42,40 @@ fn role(dir: &Path) -> Result<agent_client::policy::Profile, String> {
 
 /// A lead's instructions as the app composes them for `dir` now: its role,
 /// the folder's rules, skills and memory, then the project's task rule
-/// with the copies Sonny is set to. Rex is the rex-windows skill's to explain, so they read the same in
-/// any client.
+/// with the copies Sonny is set to. Rex is the rex-windows skill's to
+/// explain, so they read the same in any client.
 pub fn instructions(dir: &Path) -> Result<String, String> {
     let memory = agent_client::policy::memory_indexes(dir).map_err(|e| e.to_string())?;
     let composed = agent_client::policy::instructions(dir, Some(&role(dir)?), &memory)
         .map_err(|e| e.to_string())?
         .text;
+    let info = agent_client::project::read(dir)?;
     let copies = crate::settings::Settings::load().copies;
-    let rule = agent_client::project::rule(&agent_client::project::read(dir)?, &copies);
-    Ok(format!("{composed}\n\n{rule}"))
+    let rule = agent_client::project::rule(&info, &copies);
+    let me = std::env::current_exe().map_err(|e| e.to_string())?;
+    let start = start_rule(&me.to_string_lossy());
+    Ok(format!("{composed}\n\n{rule}\n\n{start}"))
+}
+
+/// How the lead starts a task in Sonny: `sonny task`, at `sonny`, makes
+/// its folder the way the person set Sonny up and starts it there.
+fn start_rule(sonny: &str) -> String {
+    let sonny = format!("\"{sonny}\"");
+    format!(
+        "Wherever these instructions start a new task with \"$AGENT_BIN\" run --detach --new, in a worktree or not, start it with Sonny instead, which makes its folder first; \
+         messages to tasks that exist still go through \"$AGENT_BIN\" run, as above. Pick a NAME that \"$AGENT_BIN\" ls --name \"${{AGENT_BOT%%.*}}.*\" does not list yet, \
+         that starts with your own name before .lead and a dot, and that is a valid git branch name; from this folder run\n\
+         {sonny} task NAME --agents --setup MODEL-FLAGS -- TASK\n\
+         with the task rule's --model and --effort as MODEL-FLAGS: \
+         it makes the task's folder the way the person set Sonny up, starts the task there and prints the turn's handle, as run --detach does. \
+         Pass --profile ROLE in place of --agents when a listed role fits, and leave out --setup for a task that only reads, \
+         so the folder's .agents/setup runs only for a task that will change files. \
+         It also says how the task's work comes back, which goes in the brief: on its branch agent/NAME, here already for a worktree, \
+         or brought here with the git push it names for a sandfs copy of a git repository; \
+         for a sandfs copy of any other folder, {sonny} task changes NAME lists what the task changed, \
+         and once you have checked that, {sonny} task changes NAME --apply writes it here. \
+         A start that fails leaves no folder behind; if it fails again, tell the person why instead of working around it."
+    )
 }
 
 /// What attaching does with a lead's instructions.
@@ -374,6 +398,20 @@ async fn create(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lead_starts_its_tasks_with_sonny() {
+        let text = start_rule("/opt/sonny");
+        for said in [
+            "\"/opt/sonny\" task NAME --agents --setup MODEL-FLAGS -- TASK\n",
+            "Wherever these instructions start a new task with \"$AGENT_BIN\" run --detach --new, in a worktree or not, start it with Sonny instead",
+            "leave out --setup for a task that only reads",
+            "Pick a NAME that \"$AGENT_BIN\" ls --name \"${AGENT_BOT%%.*}.*\" does not list yet",
+            "\"/opt/sonny\" task changes NAME --apply writes it here",
+        ] {
+            assert!(text.contains(said), "{said} in {text}");
+        }
+    }
 
     #[test]
     fn a_lead_moved_away_is_told_from_a_folder_of_the_same_name() {

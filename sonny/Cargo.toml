@@ -20,6 +20,9 @@ libc = "0.2"
 # The lookout asks its decision model over HTTPS (lookout.rs).
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream", "http2"] }
 ratatui = { version = "0.29", features = ["scrolling-regions"] }
+# Task copies (`sonny copy`), built in so nothing needs installing; its
+# mounts are served by Sonny itself, run again as `sonny sandfs daemon`.
+sandfs = "0.7"
 resvg = "0.45"
 serde_json = "1"
 # Checks an edited project file before it replaces the person's, as the
