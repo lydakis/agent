@@ -15,8 +15,8 @@ the app opens, made through the app's `~/.agent/project add` when the app is
 installed, else in the app's coordinator profile. A lead moved to another
 folder (`--workspace`) comes back with the next message Sonny sends it from
 its own, history and all. When `rex` is found
-(`$REX`, the PATH, or the Mac app), the project gets a Rex session labelled
-with its name, and each task the lead (or one of its tasks) starts gets a
+(`$REX`, the PATH, or the Mac app), the project gets one Rex session: the
+one Sonny was opened in, else the one the lead is in, else one labelled with the project's name. Each task the lead (or one of its tasks) starts gets a
 window there running Sonny on that task, without taking focus. Each window
 reports OSC 7501 status, so Rex shows which task is working, waiting on an
 approval or done. A task's window closes once its work is taken: its turn
@@ -25,7 +25,17 @@ failed, stopped or waits on you stays open, and a task given more work opens
 again; ask the lead to show one, or run `sonny --bot NAME`. `--rex-host HOST` puts the session on another Rex server;
 `--no-rex` turns the layout off. On first use Sonny writes the `rex-windows`
 skill (`skills/rex-windows/SKILL.md`) to `~/.agents/skills/rex-windows`, so any agent can run a
-long command in a Rex window the person can watch, and read it back.
+long command where the person can watch it, and read it back:
+`sonny run NAME [--window] -- COMMAND...` opens a block labelled
+`AGENT/NAME` below the agent's own (or in a tab of its own) and prints its ID.
+The skill tells agents to close what they opened once read; whatever a task
+left open closes with its window.
+
+The lead hears what its tasks did as the app tells it: once it rests, and at
+most every ten minutes, one "Task updates" message lists the tasks it started
+that ended a turn or wait for an approval, by the handles its wait tool reads
+them with, with what changed in memory alongside. The app and Sonny send the
+same news as one message, so it does not matter which is open.
 
 Enter sends (and steers a running turn), Esc interrupts, `y`/`n` answer a
 pending approval, Ctrl-C clears the composer or quits. `/` lists the
@@ -67,6 +77,24 @@ Settings Sonny keeps for every folder are in `~/.agent/sonny/settings.json`.
 When `errand` is installed, Sonny writes an `errand` skill so any agent can
 run a command on another machine, draws those runs as `Ran COMMAND on
 PEER`, and in Rex opens a window following each detached job.
+
+A lead also has a lookout: a decision model that watches its tasks and
+wakes the lead only when it should step in. It is asked a few yes-or-no
+questions (does the person's message redirect other tasks, does a task
+conflict with another, is one stuck or off its brief, is there a result the
+person should hear, a lasting preference worth saving) about each message in
+a task, each finished turn, and each approval waiting over two minutes, with
+the project's memory indexes in view. A high answer wakes the lead with a
+short note of turn handles and what to do (urgent ones steer it), a middling
+one waits for the next note, and the rest are only logged, to
+`~/.agent/sonny/lookout.jsonl`. The note reaches the approver as the
+person's words, so the lead can act on it (pass a preference on, save it
+to memory) without asking, and it quotes only the person's own words. The
+judge is `openai-decisions/gpt-6-luna` (needs `OPENAI_API_KEY`, about
+$0.0002 a check); `--lookout typesafe/jev-*` picks Jev, `--lookout off`
+turns it off. `sonny lookout-replay --judge SPEC` runs the same checks over
+the store's retained history, and `demo/lookout_score.py` scores that
+against labels.
 
 The look follows Codex's TUI (openai/codex, `codex-rs/tui`): finished history
 goes into the terminal's own scrollback above a small inline viewport,

@@ -16,6 +16,7 @@ mod errand;
 mod html;
 mod image;
 mod js;
+mod lookout;
 mod math;
 mod mermaid;
 mod models;
@@ -30,6 +31,7 @@ mod table;
 mod task;
 mod term;
 mod transcript;
+mod updates;
 
 use agent_client::{Client, Events};
 use ratatui::{
@@ -87,10 +89,14 @@ struct Options {
     rex_host: Option<String>,
     /// Ring when work ends or needs the person.
     sound: bool,
+    /// The decision model that wakes the lead when its tasks need it;
+    /// `None` with `--lookout off`.
+    lookout: Option<String>,
 }
 
 fn usage() -> String {
     "usage: sonny [--store PATH] [--socket PATH] [--model PROVIDER/MODEL] [--no-rex] [--rex-host HOST] [--no-sound]\n\
+     \x20      [--lookout openai-decisions/MODEL|typesafe/jev-*|off]\n\
      \x20      [--copies worktree|sandfs] [--bot NAME [--new [--workspace DIR]]]\n\
      With no --bot, the folder's coordinator, made with --model the first time; its tasks\n\
      open in the project's Rex session. Type /status for the project's agents.\n\
@@ -99,7 +105,9 @@ fn usage() -> String {
      uncommitted changes along and work outside git too.\n\
      sonny task NAME [--setup] [RUN FLAGS] -- BRIEF, from the lead's shell, makes a task's\n\
      folder that way and starts the task there; sonny task changes NAME [--apply] lists\n\
-     (or writes here) what a sandfs copy of a plain folder changed."
+     (or writes here) what a sandfs copy of a plain folder changed.\n\
+     The lookout wakes the lead when its tasks need it, judged by openai-decisions/gpt-6-luna\n\
+     unless --lookout names another judge or off."
         .into()
 }
 
@@ -124,14 +132,7 @@ async fn show() -> Result<(), String> {
             _ => return Err(usage.into()),
         }
     }
-    let socket = std::env::var_os("AGENT_SOCKET")
-        .map(PathBuf::from)
-        .ok_or("run this from an agent's shell (AGENT_SOCKET is not set)")?;
-    let socket = std::path::absolute(socket).map_err(|e| e.to_string())?;
-    let client = Client::connect(&socket).await.map_err(|e| e.to_string())?.0;
-    let project = project_of(&client, caller.as_deref().unwrap_or(&bot)).await;
-    let bin = rex::find().ok_or("rex not found")?;
-    let mut rex = rex::Rex::open(bin, host.as_deref(), &project)?;
+    let (socket, project, mut rex) = agents_rex(caller.as_deref().unwrap_or(&bot), host).await?;
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     let command = [
         me.to_string_lossy().into_owned(),
@@ -154,7 +155,60 @@ async fn show() -> Result<(), String> {
     // while this placed it: what it opened then goes.
     std::thread::sleep(Duration::from_millis(1500));
     rex.close_others(&bot);
-    println!("{}", json!({"bot": bot, "session": project}));
+    println!("{}", json!({"bot": bot, "session": rex.name}));
+    Ok(())
+}
+
+/// The daemon's socket, the project `bot` belongs to, and its Rex session,
+/// from an agent's shell.
+async fn agents_rex(
+    bot: &str,
+    host: Option<String>,
+) -> Result<(PathBuf, String, rex::Rex), String> {
+    let socket = std::env::var_os("AGENT_SOCKET")
+        .map(PathBuf::from)
+        .ok_or("run this from an agent's shell (AGENT_SOCKET is not set)")?;
+    let socket = std::path::absolute(socket).map_err(|e| e.to_string())?;
+    let client = Client::connect(&socket).await.map_err(|e| e.to_string())?.0;
+    let project = project_of(&client, bot).await;
+    let bin = rex::find().ok_or("rex not found")?;
+    let rex = rex::Rex::open(bin, host.as_deref(), &project, false)?;
+    Ok((socket, project, rex))
+}
+
+/// `sonny run NAME [--window] [--rex-host HOST] -- COMMAND...`: run a
+/// command an agent wants watched (a dev server, a long build) in a Rex
+/// block labelled `AGENT/NAME`, below the agent's own block or in a window
+/// of its own, and print the block's ID. It closes with the agent's window.
+async fn run_block() -> Result<(), String> {
+    let usage = "usage: sonny run NAME [--window] [--rex-host HOST] -- COMMAND...";
+    let mut args = std::env::args().skip(2);
+    let name = args.next().filter(|n| !n.starts_with('-')).ok_or(usage)?;
+    if name.contains('/') {
+        return Err("a name without /".into());
+    }
+    let owner = std::env::var("AGENT_BOT")
+        .map_err(|_| "run this from an agent's shell (AGENT_BOT is not set)")?;
+    let (mut window, mut host) = (false, None);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--window" => window = true,
+            "--rex-host" => host = Some(args.next().ok_or(usage)?),
+            "--" => break,
+            _ => return Err(usage.into()),
+        }
+    }
+    let command: Vec<String> = args.collect();
+    if command.is_empty() {
+        return Err(usage.into());
+    }
+    let (_, _, mut rex) = agents_rex(&owner, host).await?;
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let block = rex.run(&owner, &name, &cwd, &command, window)?;
+    println!(
+        "{}",
+        json!({"block": block, "label": format!("{owner}/{name}"), "session": rex.name})
+    );
     Ok(())
 }
 
@@ -303,6 +357,7 @@ fn parse() -> Result<Options, String> {
     let (mut store, mut socket, mut bot, mut new, mut model, mut workspace) =
         (None, None, None, false, None, None);
     let (mut rex, mut rex_host, mut sound) = (true, None, true);
+    let mut lookout = Some(lookout::DEFAULT.to_owned());
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or_else(usage);
         match arg.as_str() {
@@ -315,6 +370,7 @@ fn parse() -> Result<Options, String> {
             "--no-rex" => rex = false,
             "--rex-host" => rex_host = Some(value()?),
             "--no-sound" => sound = false,
+            "--lookout" => lookout = Some(value()?).filter(|judge| judge != "off"),
             "--copies" => {
                 let copies = value()?;
                 if !agent_client::project::COPIES.contains(&copies.as_str()) {
@@ -346,6 +402,7 @@ fn parse() -> Result<Options, String> {
         rex,
         rex_host,
         sound,
+        lookout,
     })
 }
 
@@ -375,12 +432,17 @@ fn main() -> std::process::ExitCode {
 }
 
 async fn run() -> Result<(), String> {
-    if std::env::args().nth(1).as_deref() == Some("show") {
-        return show().await;
+    match std::env::args().nth(1).as_deref() {
+        Some("show") => return show().await,
+        Some("run") => return run_block().await,
+        _ => {}
     }
     if std::env::args().nth(1).as_deref() == Some("--version") {
         println!("sonny {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
+    }
+    if std::env::args().nth(1).as_deref() == Some("lookout-replay") {
+        return lookout::replay().await;
     }
     let options = parse()?;
     // Fonts are read before the first picture needs them.
@@ -424,7 +486,7 @@ async fn run() -> Result<(), String> {
         .request("follow", json!({"bot": name, "after": 0}))
         .await
         .map_err(|e| e.to_string())?;
-    caught_up(&mut events).await;
+    let context = caught_up(&mut events).await;
     let bot = client
         .request("inspect", json!({"bot": name}))
         .await
@@ -441,6 +503,7 @@ async fn run() -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     let mut app = App::new(client, &name, &bot, options.clone());
+    app.context = context;
     app.sounds = sound::Sounds::new(options.sound);
     app.sounds.chime = settings::Settings::load().chime;
     // A bot keeps the model it was made with; --model runs this window's
@@ -448,6 +511,14 @@ async fn run() -> Result<(), String> {
     if let Some(model) = options.model.as_ref().filter(|m| **m != app.model) {
         app.model = model.clone();
         app.turn_model = Some(model.clone());
+    }
+    // The lead hears what its tasks did, as the app tells it.
+    if let Some(project) = &project {
+        tokio::spawn(updates::run(
+            app.options.socket.clone(),
+            name.clone(),
+            project.clone(),
+        ));
     }
     // Tasks are laid out in Rex when the person is in it (or names the
     // Rex server to use); elsewhere they run out of sight, in /status.
@@ -486,6 +557,24 @@ async fn run() -> Result<(), String> {
                 )
             }
             Err(error) => app.notice = Some(format!("the lead's instructions: {error}")),
+        }
+    }
+    if let (Some(project), Some(judge), Some(dir)) = (
+        &project,
+        &options.lookout,
+        moving
+            .clone()
+            .or(bot["workspace"].as_str().map(PathBuf::from)),
+    ) {
+        match lookout::Judge::parse(judge) {
+            Ok(judge) => lookout::spawn(
+                options.socket.clone(),
+                project.clone(),
+                name.clone(),
+                dir,
+                judge,
+            ),
+            Err(error) => app.notice = Some(error),
         }
     }
     // Said last: it is what the next message does.
@@ -642,15 +731,36 @@ fn status_report(state: &str, bot: &str) {
 
 /// Read past a follow's replay as it arrives, so a long one cannot fill
 /// the client's queue and cut the stream before it goes live.
-async fn caught_up(events: &mut Events) {
+/// Skip the replay of a follow up to its live events; returns how big the
+/// context was after the last model round it held, when it held one.
+async fn caught_up(events: &mut Events) -> Option<u64> {
+    let mut context = None;
     let replay = async {
         while let Some(event) = events.recv().await {
             if event["event"] == "follow_live" {
                 return;
             }
+            if let Some(size) = context_after(&event) {
+                context = Some(size);
+            }
         }
     };
     let _ = tokio::time::timeout(Duration::from_secs(30), replay).await;
+    context
+}
+
+/// What the next model round reads after a `usage` event's round: that
+/// round's input and what it wrote. A compaction's own round is not the
+/// conversation's.
+fn context_after(event: &Value) -> Option<u64> {
+    let data = &event["data"];
+    // After a provider-side fallback the totals add up every billed
+    // attempt; the conversation is what the last one read and wrote.
+    let last = data["models"].as_array().and_then(|tried| tried.last());
+    let call = last.unwrap_or(data);
+    (event["event"] == "usage" && data["purpose"].is_null()).then(|| {
+        call["input_tokens"].as_u64().unwrap_or(0) + call["output_tokens"].as_u64().unwrap_or(0)
+    })
 }
 
 /// The reply being written: lines are committed as they end, and the line
@@ -705,7 +815,9 @@ struct App {
     workspace: String,
     model: String,
     effort: Option<String>,
-    tokens_used: u64,
+    /// How big the conversation was after its last model round, as the
+    /// next round reads it, once known.
+    context: Option<u64>,
     input: String,
     /// Lines waiting to be written into scrollback.
     pending: Vec<Line<'static>>,
@@ -823,7 +935,7 @@ struct Fleet {
 impl Fleet {
     async fn start(options: &Options, project: &str, lead: &str) -> Option<Self> {
         let bin = rex::find()?;
-        let rex = rex::Rex::open(bin.clone(), options.rex_host.as_deref(), project).ok()?;
+        let rex = rex::Rex::open(bin.clone(), options.rex_host.as_deref(), project, true).ok()?;
         let (client, mut events) = Client::connect(&options.socket).await.ok()?;
         client
             .request("follow", json!({"bot": "*", "after": 0}))
@@ -842,7 +954,7 @@ impl Fleet {
             "--no-sound".into(),
         ];
         // Said only when the tasks go somewhere this pane is not.
-        let note = (!rex.here).then(|| format!("tasks open in Rex session {project}"));
+        let note = (!rex.here).then(|| format!("tasks open in Rex session {}", rex.name));
         rex::install_skill(&bin);
         let mut fleet = Self {
             rex,
@@ -1195,7 +1307,7 @@ impl Fleet {
                 None
             }
             "accepted" if bot != self.lead && self.lineage.contains(bot) => match self.show(bot) {
-                Ok(true) if !self.rex.here => Some(format!("{bot} is in Rex ({})", self.rex.label)),
+                Ok(true) if !self.rex.here => Some(format!("{bot} is in Rex ({})", self.rex.name)),
                 Ok(_) => None,
                 Err(error) => Some(error),
             },
@@ -1224,7 +1336,7 @@ impl App {
             workspace: record["workspace"].as_str().unwrap_or("").to_owned(),
             model,
             effort: record["effort"].as_str().map(str::to_owned),
-            tokens_used: record["tokens_used"].as_u64().unwrap_or(0),
+            context: None,
             input: String::new(),
             pending: Vec::new(),
             skipped: 0,
@@ -1570,17 +1682,17 @@ impl App {
                 .request("follow", json!({"bot": self.bot, "after": 0}))
                 .await
                 .map_err(|e| e.to_string())?;
-            caught_up(&mut fresh).await;
+            let context = caught_up(&mut fresh).await;
             // Read after the replay, so a turn that ends meanwhile arrives
             // as an event rather than lost between the two.
             let record = client
                 .request("inspect", json!({"bot": self.bot}))
                 .await
                 .map_err(|e| e.to_string())?;
-            Ok::<_, String>((client, fresh, record))
+            Ok::<_, String>((client, fresh, record, context))
         };
         if self.down {
-            let Ok((client, fresh, record)) = lead.await else {
+            let Ok((client, fresh, record, context)) = lead.await else {
                 self.retry = Some(Instant::now() + Duration::from_secs(2));
                 return;
             };
@@ -1588,7 +1700,7 @@ impl App {
             *events = fresh;
             self.down = false;
             self.notice = None;
-            self.tokens_used = record["tokens_used"].as_u64().unwrap_or(self.tokens_used);
+            self.context = context.or(self.context);
             self.history_after(self.seen_node).await;
             let now = record["running_turn"].as_i64();
             // A turn that ended while away ends here as its event would have.
@@ -2104,8 +2216,9 @@ impl App {
                 }
             }
             "usage" => {
-                self.tokens_used += data["input_tokens"].as_u64().unwrap_or(0)
-                    + data["output_tokens"].as_u64().unwrap_or(0);
+                if let Some(size) = context_after(&event) {
+                    self.context = Some(size);
+                }
             }
             "turn_finished" => {
                 if self.running.as_ref().is_some_and(|r| Some(r.turn) != turn) {
@@ -3145,11 +3258,12 @@ impl App {
         if let Some(mode) = self.gating {
             left.push_str(&format!(" · {mode} approvals when idle"));
         }
-        let right = format!(
-            "{} · {} tokens  ",
-            self.bot,
-            transcript::tokens(self.tokens_used)
-        );
+        // The context, not what the bot ever spent: how full the next
+        // round is.
+        let right = match self.context {
+            Some(size) => format!("{} · {} context  ", self.bot, transcript::tokens(size)),
+            None => format!("{}  ", self.bot),
+        };
         // A long folder keeps its end, the part that tells folders apart.
         let room = width.saturating_sub(left.width() + right.width() + 4);
         let mut folder = folder.as_str();
@@ -3380,6 +3494,7 @@ mod tests {
             rex: false,
             rex_host: None,
             sound: false,
+            lookout: None,
         };
         let mut app = App::new(client, "b", &json!({"name": "b"}), options);
         let event =
@@ -3418,6 +3533,31 @@ mod tests {
         let two = "**Checking the tests**\n\nThey pass.\n\n**Reading the README";
         assert_eq!(heading(two), Some("Checking the tests"));
         assert_eq!(heading(&format!("{two}**\n")), Some("Reading the README"));
+    }
+
+    #[test]
+    fn the_footer_shows_the_context_not_what_was_ever_spent() {
+        let usage = |input: u64, output: u64, purpose: Option<&str>| {
+            json!({"event": "usage", "bot": "b", "turn": 1,
+                "data": {"input_tokens": input, "output_tokens": output,
+                    "cached_input_tokens": input / 2, "purpose": purpose}})
+        };
+        // Three rounds of one turn: each reads the whole conversation again.
+        assert_eq!(context_after(&usage(40_000, 900, None)), Some(40_900));
+        assert_eq!(context_after(&usage(41_000, 2_000, None)), Some(43_000));
+        // A compaction's own round reads the old window to summarize it.
+        assert_eq!(
+            context_after(&usage(120_000, 3_000, Some("compaction"))),
+            None
+        );
+        assert_eq!(context_after(&json!({"event": "text_delta"})), None);
+        // A fallback billed two attempts; the context is the last one's.
+        let mut fell_back = usage(20, 10, None);
+        fell_back["data"]["models"] = json!([
+            {"model": "claude-opus-5-5", "input_tokens": 7, "output_tokens": 3},
+            {"model": "claude-opus-4-8", "input_tokens": 13, "output_tokens": 7},
+        ]);
+        assert_eq!(context_after(&fell_back), Some(20));
     }
 
     #[test]

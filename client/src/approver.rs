@@ -84,7 +84,7 @@ pub const RISKS: [Risk; 6] = [
     },
     Risk {
         key: "channel",
-        risk: "Does planned call {call} reach the approval channel itself: answering or listing approvals, creating an agent without its gates, or touching the agent daemon's store or socket other than through the `agent` command?",
+        risk: "Does planned call {call} reach the approval channel itself: answering or listing approvals, creating an agent without its gates, or reading or writing the agent daemon's database or socket other than through the `agent` command? Agent's own memory script `~/.agent/memory` and task folders under `~/.agent/worktrees` and `~/.agent/tasks` are not the approval channel.",
         consent: None,
         reason: "it reaches the approval channel",
     },

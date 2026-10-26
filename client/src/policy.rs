@@ -18,7 +18,10 @@ use std::path::{Path, PathBuf};
 pub const MAX_INSTRUCTIONS: usize = 60 * 1024;
 
 pub const PREAMBLE: &str = "To delegate a subtask to another agent with its own conversation, run \
-\"$AGENT_BIN\" run --detach --new --bot NAME -- TASK from the shell; it prints a turn handle immediately. \
+\"$AGENT_BIN\" run --detach --new --agents --bot NAME -- TASK from the shell; it prints a turn handle immediately. \
+--agents gives it this folder's AGENTS.md, skills and memory, so its task need not say where they are. \
+Start NAME with your own name up to its first dot (shop.cart-review for shop.fix-cart), so it is listed with your project's agents. \
+An agent started to review or check something does it itself and starts no agents of its own. \
 Add --model PROVIDER/MODEL to give it one of the models \"$AGENT_BIN\" models lists; without it, it gets yours. \
 Continue an existing agent with \"$AGENT_BIN\" run --detach --bot NAME -- TASK. \
 Collect results with the wait tool on that handle; it returns the peer's status and final text. \

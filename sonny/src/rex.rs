@@ -33,21 +33,12 @@ pub struct Rex {
     /// `-S HOST` when the session lives on another Rex server.
     host: Vec<String>,
     pub session: String,
-    pub label: String,
+    /// The session's label, as the person sees it.
+    pub name: String,
     /// Whether the session is the one Sonny runs in.
     pub here: bool,
     /// Each task's block, by bot name.
     blocks: HashMap<String, String>,
-}
-
-/// A name Rex gave a session made without one: two lowercase words, as
-/// `crisp-oasis`. One the person chose is kept.
-fn made_up(label: &str) -> bool {
-    let words: Vec<&str> = label.split('-').collect();
-    words.len() == 2
-        && words
-            .iter()
-            .all(|w| !w.is_empty() && w.bytes().all(|b| b.is_ascii_lowercase()))
 }
 
 /// Where `sonny show` puts a task.
@@ -69,7 +60,11 @@ struct Listed {
 
 impl Rex {
     fn call(&self, args: &[&str]) -> Result<Value, String> {
+        // Every call names its session: the shell's own Rex variables may
+        // name another (a daemon's), and rex would look a bare ID up there.
         let out = Command::new(&self.bin)
+            .env_remove("REX_SESSION")
+            .env_remove("REX_BLOCK")
             .args(&self.host)
             .args(args)
             .output()
@@ -87,18 +82,25 @@ impl Rex {
         serde_json::from_slice(&out.stdout).map_err(|e| format!("rex {}: {e}", args[0]))
     }
 
-    /// The project's session: the one Sonny was started in, so the lead
-    /// stays where the person opened it and tasks open beside it, renamed
-    /// to the project when Rex made its name up; outside Rex, the session
-    /// labelled with the project's name, made when there is none.
-    pub fn open(bin: PathBuf, host: Option<&str>, label: &str) -> Result<Self, String> {
+    /// The project's session. From the terminal Sonny runs in (`terminal`),
+    /// that terminal's session, so the lead stays where the person opened
+    /// it and tasks open beside it. Otherwise, as from an agent's shell, whose Rex variables
+    /// would name the daemon's terminal: the session the project's lead is
+    /// in, else the one labelled with the project's name, made when there
+    /// is none.
+    pub fn open(
+        bin: PathBuf,
+        host: Option<&str>,
+        label: &str,
+        terminal: bool,
+    ) -> Result<Self, String> {
         let mut rex = Self {
             bin,
             host: host
                 .map(|h| vec!["-S".into(), h.into()])
                 .unwrap_or_default(),
             session: String::new(),
-            label: label.to_owned(),
+            name: label.to_owned(),
             here: false,
             blocks: HashMap::new(),
         };
@@ -117,29 +119,41 @@ impl Rex {
             .collect();
         // Rex names the block's session `session:ID`; `ls` gives the ID.
         let mine = std::env::var("REX_SESSION").unwrap_or_default();
-        let current = sessions
-            .iter()
-            .find(|(id, _)| host.is_none() && !mine.is_empty() && mine.ends_with(id.as_str()));
+        let current = sessions.iter().find(|(id, _)| {
+            terminal && host.is_none() && !mine.is_empty() && mine.ends_with(id.as_str())
+        });
         let found = sessions.iter().find(|(_, l)| l == label);
-        rex.session = match (current, found) {
-            (Some((id, now)), found) => {
-                if found.is_none() && made_up(now) {
-                    let _ = rex.call(&["session", "rename", id, label]);
-                }
+        let lead = format!("{label}.lead");
+        let leads = || {
+            sessions
+                .iter()
+                .find(|(id, _)| rex.blocks_in(id).iter().any(|b| b.label == lead))
+        };
+        (rex.session, rex.name) = match current {
+            Some((id, now)) => {
                 rex.here = true;
-                id.clone()
+                (id.clone(), now.clone())
             }
-            (None, Some((id, _))) => id.clone(),
-            (None, None) => rex.call(&["new", label, "--json"])?["session_id"]
-                .as_str()
-                .ok_or("rex new: no session_id")?
-                .to_owned(),
+            None => match leads().or(found) {
+                Some((id, now)) => (id.clone(), now.clone()),
+                None => {
+                    let made = rex.call(&["new", label, "--json"])?;
+                    let id = made["session_id"]
+                        .as_str()
+                        .ok_or("rex new: no session_id")?;
+                    (id.to_owned(), label.to_owned())
+                }
+            },
         };
         Ok(rex)
     }
 
     fn listed(&self) -> Vec<Listed> {
-        let Ok(ls) = self.call(&["block", "ls", "-s", &self.session, "--json"]) else {
+        self.blocks_in(&self.session)
+    }
+
+    fn blocks_in(&self, session: &str) -> Vec<Listed> {
+        let Ok(ls) = self.call(&["block", "ls", "-s", session, "--json"]) else {
             return Vec::new();
         };
         ls["blocks"]
@@ -191,7 +205,7 @@ impl Rex {
         placement: &Placement,
     ) -> Result<(), String> {
         for old in self.listed().into_iter().filter(|b| b.label == bot) {
-            let _ = self.call(&["block", "close", &old.block]);
+            self.close_block(&old.block);
         }
         let anchor;
         let mut args: Vec<&str> = match placement {
@@ -291,6 +305,10 @@ impl Rex {
         self.blocks.insert(bot.to_owned(), own.block.clone());
     }
 
+    fn close_block(&self, block: &str) {
+        let _ = self.call(&["block", "close", block, "-s", &self.session]);
+    }
+
     /// Close every other block labelled with the bot's name, as one Sonny
     /// opened for the task while this one placed it.
     pub fn close_others(&mut self, bot: &str) {
@@ -302,19 +320,62 @@ impl Rex {
             .into_iter()
             .filter(|b| b.label == bot && b.block != mine)
         {
-            let _ = self.call(&["block", "close", &other.block]);
+            self.close_block(&other.block);
         }
     }
 
-    /// Close a task's block, as when its bot is deleted.
+    /// Run a command an agent asked for in a block labelled `OWNER/NAME`, so
+    /// the person can see whose it is and it closes with its owner's
+    /// window: below the owner's block, or in a window of its own (named
+    /// `name`) when asked or when the owner has none here. One already
+    /// labelled so is replaced. The block stays open once the command
+    /// exits, to be read. Returns the block's ID.
+    pub fn run(
+        &mut self,
+        owner: &str,
+        name: &str,
+        cwd: &Path,
+        command: &[String],
+        window: bool,
+    ) -> Result<String, String> {
+        let label = format!("{owner}/{name}");
+        let listed = self.listed();
+        for old in listed.iter().filter(|b| b.label == label) {
+            self.close_block(&old.block);
+        }
+        let anchor = listed
+            .iter()
+            .find(|b| b.label == owner)
+            .filter(|_| !window)
+            .map(|b| b.block.clone());
+        let cwd = cwd.to_string_lossy();
+        let mut args: Vec<&str> = match &anchor {
+            Some(anchor) => vec!["split", "-b", anchor, "--split", "below", "--ratio", "35"],
+            None => vec!["run"],
+        };
+        args.extend(["-s", &self.session, "-c", &cwd, "--label", &label]);
+        args.extend(["--keep-open", "--focus=false", "--json", "--"]);
+        args.extend(command.iter().map(String::as_str));
+        let made = self.call(&args)?;
+        let block = made["block_ids"][0]
+            .as_str()
+            .ok_or("rex: no block id in the reply")?
+            .to_owned();
+        if let Some(window) = made["window_id"].as_str().filter(|_| anchor.is_none()) {
+            self.rename_window(window, name);
+        }
+        Ok(block)
+    }
+
+    /// Close a task's block, and every block it asked for, as when it is
+    /// done or its bot is deleted.
     pub fn close(&mut self, bot: &str) {
         let known = self.blocks.remove(bot);
-        for block in self
-            .listed()
-            .into_iter()
-            .filter(|b| b.label == bot || Some(&b.block) == known.as_ref())
-        {
-            let _ = self.call(&["block", "close", &block.block]);
+        let owned = format!("{bot}/");
+        for block in self.listed().into_iter().filter(|b| {
+            b.label == bot || b.label.starts_with(&owned) || Some(&b.block) == known.as_ref()
+        }) {
+            self.close_block(&block.block);
         }
     }
 }
@@ -368,11 +429,142 @@ pub fn install_skill(bin: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
+    /// A stand-in rex, over a JSON file of sessions and their blocks, that
+    /// logs each call it gets.
+    const FAKE: &str = r#"#!/usr/bin/env python3
+import json, os, sys
+here = os.path.dirname(os.path.abspath(sys.argv[0]))
+state = json.load(open(os.path.join(here, "state.json")))
+args = sys.argv[1:]
+open(os.path.join(here, "calls"), "a").write(" ".join(args) + "\n")
+def flag(name):
+    return args[args.index(name) + 1] if name in args else None
+out = None
+if args[0] == "ls":
+    out = {"sessions": [{"session_id": s, "label": v["label"]} for s, v in state.items()]}
+elif args[:2] == ["block", "ls"]:
+    out = {"blocks": state[flag("-s")]["blocks"]}
+elif args[:2] == ["block", "close"]:
+    for v in state.values():
+        v["blocks"] = [b for b in v["blocks"] if b["block_id"] != args[2]]
+elif args[0] in ("split", "run"):
+    blocks = state[flag("-s")]["blocks"]
+    made = "block:%d" % (len(open(os.path.join(here, "calls")).readlines()))
+    blocks.append({"block_id": made, "label": flag("--label"), "window_id": "window:1"})
+    out = {"block_ids": [made], "window_id": "window:1"}
+json.dump(state, open(os.path.join(here, "state.json"), "w"))
+if out is not None:
+    print(json.dumps(out))
+"#;
+
+    fn fake(name: &str, state: serde_json::Value) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("sonny-rex-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("rex");
+        std::fs::write(&bin, FAKE).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(dir.join("state.json"), state.to_string()).unwrap();
+        (bin, dir)
+    }
+
+    fn block(id: &str, label: &str) -> serde_json::Value {
+        serde_json::json!({"block_id": id, "label": label, "window_id": "window:1"})
+    }
+
+    fn labels(dir: &Path, session: &str) -> Vec<String> {
+        let state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap();
+        state[session]["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["label"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
     #[test]
-    fn only_a_name_rex_made_up_is_replaced() {
-        assert!(super::made_up("crisp-oasis"));
-        assert!(!super::made_up("beam"));
-        assert!(!super::made_up("my-work-stuff"));
-        assert!(!super::made_up("Beam-dev"));
+    fn an_agent_runs_its_commands_in_its_leads_session_and_they_close_with_it() {
+        // The lead was opened in a session named for something else; a
+        // session labelled with the project is a stray.
+        let (bin, dir) = fake(
+            "home",
+            serde_json::json!({
+                "01home": {"label": "lydakis", "blocks": [
+                    block("block:lead", "graft.lead"),
+                    block("block:task", "graft.fix"),
+                ]},
+                "01stray": {"label": "graft", "blocks": []},
+            }),
+        );
+        let mut rex = super::Rex::open(bin, None, "graft", false).unwrap();
+        assert_eq!(
+            (rex.session.as_str(), rex.name.as_str()),
+            ("01home", "lydakis")
+        );
+        assert!(!rex.here);
+
+        let cwd = Path::new("/work");
+        let tests = rex.run(
+            "graft.fix",
+            "tests",
+            cwd,
+            &["cargo".into(), "test".into()],
+            false,
+        );
+        let tests = tests.unwrap();
+        let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+        let split = calls.lines().last().unwrap();
+        assert!(
+            split.starts_with("split -b block:task --split below")
+                && split.contains("-s 01home -c /work --label graft.fix/tests --keep-open")
+                && split.ends_with("-- cargo test"),
+            "{split}"
+        );
+        // Run again by name, the old block makes way.
+        let again = rex.run(
+            "graft.fix",
+            "tests",
+            cwd,
+            &["cargo".into(), "test".into()],
+            false,
+        );
+        assert_ne!(again.unwrap(), tests);
+        rex.run(
+            "graft.fix",
+            "build",
+            cwd,
+            &["cargo".into(), "build".into()],
+            true,
+        )
+        .unwrap();
+        rex.run("graft.lead", "server", cwd, &["serve".into()], false)
+            .unwrap();
+        assert_eq!(
+            labels(&dir, "01home"),
+            [
+                "graft.lead",
+                "graft.fix",
+                "graft.fix/tests",
+                "graft.fix/build",
+                "graft.lead/server"
+            ]
+        );
+        let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+        assert!(calls.lines().all(|c| !c.contains("01stray")));
+        // A bare ID is looked up in the shell's own session, maybe another.
+        assert!(
+            calls
+                .lines()
+                .filter(|c| c.starts_with("block close"))
+                .all(|c| c.ends_with("-s 01home"))
+        );
+
+        // The task done, what it opened goes with it; the lead's stays.
+        rex.close("graft.fix");
+        assert_eq!(labels(&dir, "01home"), ["graft.lead", "graft.lead/server"]);
     }
 }

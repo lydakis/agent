@@ -1218,8 +1218,10 @@ message names at most 32 tasks; the rest wait for the next, and it says how
 many. The
 [coordinator role](../app/agents/coordinator.md) says what to do with it:
 send another task only what it needs, with `agent run --detach --delivery
-queue`, which it reads at its next turn without being interrupted, and
-otherwise answer in one line. A message that fails is kept for the next
+steer`, which joins the turn it is running (or starts one) so it acts on the
+note before going further, and give a status reply with nothing to raise in
+one line. Sonny's lead window sends the same message the same way, so with
+both open the lead hears it once. A message that fails is kept for the next
 one, and one due while the window was detached goes out when it attaches
 again; a coordinator deleted, or gone when the window reattaches, has its
 dropped. The window must be open for it. The message's `request_id` is made
