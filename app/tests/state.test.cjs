@@ -1997,7 +1997,7 @@ test('the coordinator the app ships gives editing tasks worktrees and cleans up 
   assert.match(text, /A task keeps its folder, so later messages to it need no --workspace/);
   assert.match(text, /run --detach --new --agents --bot NAME/); assert.match(text, /pass --profile ROLE in place of --agents/);
   assert.match(text, /If \.agents\/setup exists here/);
-  assert.match(text, /the start fails and "\$AGENT_BIN" ls does not list NAME, remove the worktree/);
+  assert.match(text, /the start fails and "\$AGENT_BIN" ls --name NAME does not list it, remove the worktree/);
   assert.match(text, /git worktree remove --force, git branch -D/);
   assert.match(text, /when this folder is not a git repository, works in this folder/);
   // The threads' picks are told to the coordinator by the app, not by this role, which a folder may replace.
