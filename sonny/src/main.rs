@@ -1923,7 +1923,7 @@ impl App {
             .iter()
             .flat_map(|(_, prompt)| {
                 prompt.split('\n').enumerate().flat_map(move |(at, line)| {
-                    let lead = if at == 0 { "↳ " } else { "  " };
+                    let lead = if at == 0 { "› " } else { "  " };
                     transcript::wrap(
                         Line::from(line.to_owned()).dim(),
                         width,
