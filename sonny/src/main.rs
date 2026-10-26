@@ -2537,7 +2537,8 @@ impl App {
                         self.instruct = Some(text);
                         self.configure().await;
                     }
-                    Ok(project::Instructions::Current) => {}
+                    // A toggle back before the turn ended: nothing to send.
+                    Ok(project::Instructions::Current) => self.instruct = None,
                     Ok(project::Instructions::Kept) => {
                         self.notice = Some(
                             "the lead keeps instructions set outside its folder's files; \
