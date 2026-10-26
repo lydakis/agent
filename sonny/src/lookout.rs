@@ -680,6 +680,10 @@ fn repeated(recent: &Recent, text: &str, now: Instant) -> bool {
     lately.insert(digest(text.trim()), now).is_some()
 }
 
+fn forget(recent: &Recent, text: &str) {
+    recent.lock().unwrap().remove(&digest(text.trim()));
+}
+
 /// What the lead last asked the task, else the first words in its history.
 async fn brief(client: &Client, task: &str, node: Option<i64>) -> String {
     if let Some(node) = node {
@@ -728,9 +732,14 @@ async fn check(
         ..seen.clone()
     };
     let started = Instant::now();
-    let (answers, tokens) = judge
+    let asked = judge
         .ask(&input(&read, &brief, &roster, memory), &asked(seen.kind))
-        .await?;
+        .await;
+    // Words the judge never answered are not seen yet, so a retry reads them.
+    if asked.is_err() && seen.kind == Kind::Said {
+        forget(recent, &text);
+    }
+    let (answers, tokens) = asked?;
     Ok(Checked {
         answers,
         tokens,
@@ -1940,6 +1949,13 @@ mod tests {
         assert!(!repeated(&recent, "[board] lane A is mine", now));
         assert!(repeated(&recent, " [board] lane A is mine\n", now));
         assert!(!repeated(&recent, "", now));
+        assert!(!repeated(
+            &recent,
+            "[board] lane A is mine",
+            now + SAME_WORDS
+        ));
+        // Words whose check failed are checked again.
+        forget(&recent, "[board] lane A is mine ");
         assert!(!repeated(
             &recent,
             "[board] lane A is mine",
