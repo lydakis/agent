@@ -1,0 +1,28 @@
+[package]
+name = "sonny"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Sonny: a terminal client for the daemon, beside the app, that lays its
+# work out in Rex. Prototype.
+
+[dependencies]
+agent-client = { path = "../client" }
+# Already built for the runtime; encodes program status titles (OSC 7501).
+base64 = "0.22"
+# Scroll regions write history rows without padding them to the width, so
+# a pane that narrows later does not re-wrap them.
+# Asks the terminal for its background (theme.rs).
+libc = "0.2"
+ratatui = { version = "0.29", features = ["scrolling-regions"] }
+serde_json = "1"
+# Line and word diffs for edits, as Codex's TUI uses it.
+similar = { version = "2", features = ["inline"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "process"] }
+unicode-width = "0.2"
+
+[lints]
+workspace = true
