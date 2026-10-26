@@ -2411,9 +2411,7 @@ impl App {
                         self.instruct = Some(text);
                         self.configure().await;
                     }
-                    Err(error) => {
-                        self.notice = Some(format!("the lead's instructions: {error}"))
-                    }
+                    Err(error) => self.notice = Some(format!("the lead's instructions: {error}")),
                 }
             }
             return;

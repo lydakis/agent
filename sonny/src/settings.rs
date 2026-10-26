@@ -50,8 +50,9 @@ impl Settings {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
-        let text = serde_json::to_string_pretty(&json!({"chime": self.chime, "copies": self.copies}))
-            .map_err(|e| e.to_string())?;
+        let text =
+            serde_json::to_string_pretty(&json!({"chime": self.chime, "copies": self.copies}))
+                .map_err(|e| e.to_string())?;
         std::fs::write(&path, text + "\n").map_err(|e| format!("{}: {e}", path.display()))
     }
 }
@@ -65,7 +66,13 @@ mod tests {
         assert_eq!(Settings::from(&json!({})), Settings::default());
         assert!(!Settings::from(&json!({"chime": false})).chime);
         assert!(Settings::from(&json!({"chime": "no"})).chime);
-        assert_eq!(Settings::from(&json!({"copies": "sandfs"})).copies, "sandfs");
-        assert_eq!(Settings::from(&json!({"copies": "rsync"})).copies, "worktree");
+        assert_eq!(
+            Settings::from(&json!({"copies": "sandfs"})).copies,
+            "sandfs"
+        );
+        assert_eq!(
+            Settings::from(&json!({"copies": "rsync"})).copies,
+            "worktree"
+        );
     }
 }

@@ -15,13 +15,13 @@ reaches it at its next turn without interrupting it, in the folder it already ha
 
 Unless this project's tasks all work in this folder or get sandfs copies, when this folder is a git repository give every new task its own worktree, one that only reads too, so tasks do not collide: only you work in this folder. Pick a NAME that "$AGENT_BIN" ls --name "${AGENT_BOT%%.*}.*" does not list yet, that starts with your own name before .lead and a dot, and that is a valid git branch name; from this folder run
 git worktree add -b agent/NAME "$HOME/.agent/worktrees/NAME" HEAD
-The worktree starts at the last commit, so uncommitted changes here are not in it. If .agents/setup exists here, run it inside the worktree with AGENT_SOURCE set to this folder, then start the task with
+The worktree starts at the last commit, so uncommitted changes here are not in it. If .agents/setup exists here and the task will change files, run it inside the worktree with AGENT_SOURCE set to this folder (a task that only reads skips it), then start the task with
 "$AGENT_BIN" run --detach --new --agents --bot NAME --workspace "$HOME/.agent/worktrees/NAME/$(git rev-parse --show-prefix)" -- TASK
 When a task fits a role listed under Profiles, pass --profile ROLE in place of --agents. If setup fails, or the start fails and "$AGENT_BIN" ls --name NAME does not list it, remove the worktree and its branch (git worktree remove --force, git branch -D) before trying again.
 
 When this project's tasks get sandfs copies, every new task gets its own copy, a git repository or not, with a NAME picked as above. In a git repository, from this folder run
 sandfs mount "git:$(git rev-parse --show-toplevel)" "$HOME/.agent/tasks/NAME" --uncommitted --branch agent/NAME
-The copy starts at the last commit with this folder's uncommitted changes as they are now, on its own branch agent/NAME, and takes no disk until the task writes. Ignored files such as build output are not in it. Run .agents/setup and start the task as for a worktree, with --workspace "$HOME/.agent/tasks/NAME/$(git rev-parse --show-prefix)". Its commits stay in the copy until you bring them here with
+The copy starts at the last commit with this folder's uncommitted changes as they are now, on its own branch agent/NAME, and takes no disk until the task writes. Ignored files such as build output are not in it. Run .agents/setup when the task will change files, and start the task, as for a worktree, with --workspace "$HOME/.agent/tasks/NAME/$(git rev-parse --show-prefix)". Its commits stay in the copy until you bring them here with
 git -C "$HOME/.agent/tasks/NAME" push origin agent/NAME
 after which agent/NAME is a branch in this folder, as a worktree's is. In a folder that is not a git repository, run
 sandfs mount "$PWD" "$HOME/.agent/tasks/NAME"

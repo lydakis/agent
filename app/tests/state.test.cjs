@@ -1996,7 +1996,9 @@ test('the coordinator the app ships gives editing tasks worktrees and cleans up 
   assert.match(text, /git worktree add -b agent\/NAME/); assert.match(text, /starts with your own name before \.lead/); assert.match(text, /--workspace "\$HOME\/\.agent\/worktrees\/NAME\/\$\(git rev-parse --show-prefix\)"/);
   assert.match(text, /A task keeps its folder, so later messages to it need no --workspace/);
   assert.match(text, /run --detach --new --agents --bot NAME/); assert.match(text, /pass --profile ROLE in place of --agents/);
-  assert.match(text, /If \.agents\/setup exists here/);
+  assert.match(text, /If \.agents\/setup exists here and the task will change files/);
+  // A read-only task gets a copy but never runs the folder's setup script.
+  assert.match(text, /a task that only reads skips it/);
   assert.match(text, /the start fails and "\$AGENT_BIN" ls --name NAME does not list it, remove the worktree/);
   assert.match(text, /git worktree remove --force, git branch -D/);
   // Only the lead works in the folder: every task gets a copy, one that only reads too.
