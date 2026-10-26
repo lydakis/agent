@@ -1082,6 +1082,23 @@ impl App {
         }
     }
 
+    /// What the footer and pickers show of the bot, from its record.
+    /// A changed model replaces the one this window's turns run on.
+    fn refresh(&mut self, record: &Value, model: bool) {
+        if model
+            && let (Some(provider), Some(model)) =
+                (record["provider"].as_str(), record["model"].as_str())
+        {
+            self.model = format!("{provider}/{model}");
+            self.turn_model = None;
+            self.effort = record["effort"].as_str().map(str::to_owned);
+        }
+        if let Some(workspace) = record["workspace"].as_str() {
+            self.workspace = workspace.to_owned();
+        }
+        self.mode = approvals::mode(record);
+    }
+
     /// `/model`'s listing, once it arrives: the picker opens on it.
     fn listed(&mut self) {
         let Some(listing) = &mut self.listing else {
@@ -1385,6 +1402,20 @@ impl App {
             self.seen_node = self.seen_node.max(node);
         }
         match kind {
+            // Changed by this or another client: the footer and the
+            // pickers read the bot again.
+            "configured" => {
+                if let Ok(record) = self
+                    .client
+                    .request("inspect", json!({"bot": self.bot}))
+                    .await
+                {
+                    let model = event["changed"]
+                        .as_array()
+                        .is_some_and(|c| c.iter().any(|f| f == "model"));
+                    self.refresh(&record, model);
+                }
+            }
             "accepted" => {
                 self.end_live();
                 self.said.clear();

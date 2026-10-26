@@ -144,6 +144,36 @@ class DaemonTests(ModelFixture):
         self.assertGreaterEqual(groups['jobs'], groups['count'])
         self.assertEqual(stats['handles'], {'waiters': 0, 'retained': 0})
 
+    def test_configure_changes_a_bot_and_tells_its_followers(self):
+        client = SocketClient(self.binary, self.path/'state.db', self.url, 'echo')
+        self.addCleanup(client.close)
+        client.request('create', bot='Ann', workspace=str(self.path), tools=['echo'])
+        watcher = Connection(client.socket_path)
+        self.addCleanup(watcher.close)
+        watcher.request('follow', bot='Ann', after=0)
+        watcher.receive(lambda e: e.get('event') == 'follow_live')
+        answer = client.request('configure', bot='Ann', instructions='new', model='openai/other',
+                                effort='high', approve=['echo'], approver='auto')['result']
+        self.assertEqual(answer['changed'], ['gates', 'model', 'instructions'])
+        told = watcher.receive(lambda e: e.get('event') == 'configured')
+        self.assertEqual((told['bot'], told['changed'], told['durable']), ('Ann', answer['changed'], False))
+        ann = client.request('inspect', bot='Ann')['result']
+        self.assertEqual((ann['model'], ann['effort'], ann['instructions']), ('other', 'high', 'new'))
+        self.assertEqual([g['tag'] for g in ann['gates']], ['auto'])
+        # The same request again changes nothing and tells nobody.
+        again = client.request('configure', bot='Ann', instructions='new', model='openai/other',
+                               effort='high', approve=['echo'], approver='auto')['result']
+        self.assertEqual(again['changed'], [])
+        self.assertEqual(client.request('configure', bot='Ann', approve=[])['result']['changed'], ['gates'])
+        refused = client.request('configure', bot='Ann', effort='low')
+        self.assertEqual(refused['error'], 'invalid_effort')
+        ann_id = client.request('inspect', bot='Ann')['result']['bot_id']
+        bob = client.request('create', bot='Bob', workspace=str(self.path), tools=['echo'],
+                             created_by='Ann', created_by_id=ann_id)
+        self.assertIn('result', bob, bob)
+        self.assertEqual(client.request('configure', bot='Bob', approve=[])['error'], 'gates_inherited')
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['gates'], [])
+
     def test_admissions_sent_together_answer_in_order_and_start_once(self):
         client = SocketClient(self.binary, self.path/'state.db', self.url, 'echo')
         self.addCleanup(client.close)

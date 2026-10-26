@@ -1153,7 +1153,9 @@ since a bot keeps the gates it descends from (`gates_inherited`), and bots
 it already made keep theirs. The gate is checked before anything is
 written. It answers `{bot, bot_id, changed}`, `changed` naming the fields
 (`model`, `instructions`, `gates`) that differed; the same request again
-changes nothing, so a resend is harmless. It is refused with `bot_busy`
+changes nothing, so a resend is harmless. A change is told to the bot's
+followers as a live `configured` event with the same fields, which is not
+kept, so a client that attaches later reads the bot as it is. It is refused with `bot_busy`
 while a turn runs or waits parked, and the next turn sends the
 new instructions: the provider's cache of the old ones is not read again,
 replayed thinking written after them is withheld as when any context in

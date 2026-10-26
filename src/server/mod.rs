@@ -2212,7 +2212,7 @@ impl Service {
                     }
                     None => None,
                 };
-                store
+                let answer = store
                     .op("configure", move |db| {
                         let id = db.identity(&bot, bot_id)?;
                         // A parked turn reads the bot again when it resumes.
@@ -2243,7 +2243,16 @@ impl Service {
 
                         Ok(json!({"bot":bot,"bot_id":id,"changed":changed}))
                     })
-                    .await
+                    .await?;
+                // Followers read the bot again; nothing durable to replay.
+                if answer["changed"].as_array().is_some_and(|c| !c.is_empty()) {
+                    let mut event = answer.clone();
+                    event["event"] = json!("configured");
+                    event["durable"] = json!(false);
+                    let bot = answer["bot"].as_str().unwrap_or_default().to_owned();
+                    self.hub.live(&bot, event).await?;
+                }
+                Ok(answer)
             }
             Command::Inspect { bot, bot_id } => {
                 store
