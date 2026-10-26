@@ -1733,9 +1733,10 @@ impl Database {
     }
     /// Replace a bot's instructions, as its client composes them now; whether
     /// they changed. Its next request sends the new ones, so the provider's
-    /// cache of the old is not read again and replayed thinking written
-    /// after them is withheld, as when any context in front of it changes.
-    /// A fork, which read its source's cache, keys its own from then on.
+    /// cache of the old is not read again. The thinking binding is cleared,
+    /// so thinking written under the old instructions is withheld, as when
+    /// the context in front of it changes. A fork, which read its source's
+    /// cache, keys its own from then on.
     pub fn set_instructions(
         &mut self,
         name: &str,
@@ -1744,7 +1745,7 @@ impl Database {
     ) -> Result<bool> {
         let id = self.identity(name, bot_id)?;
         let changed = self.conn.execute(
-            "UPDATE bots SET instructions=?, cache_bot=NULL WHERE id=? AND instructions<>?",
+            "UPDATE bots SET instructions=?, cache_bot=NULL, thinking_prefix=NULL WHERE id=? AND instructions<>?",
             params![instructions, id, instructions],
         )?;
         Ok(changed == 1)
@@ -1767,9 +1768,10 @@ impl Database {
         )?;
         Ok(changed == 1)
     }
-    /// Replace a root bot's gates: a bot another bot made keeps the gates
-    /// it descends from, so it cannot be let out of them. Whether anything
-    /// changed.
+    /// Replace a root bot's gates, those a fork took from its source
+    /// included: a client that made it could make an ungated bot anyway. A
+    /// bot another bot made keeps the gates it descends from, so it cannot
+    /// be let out of them. Whether anything changed.
     pub fn set_gate(
         &mut self,
         name: &str,

@@ -1978,8 +1978,9 @@ usable; history tells the model to inspect current state before retrying.
 
 ### Tool approval
 
-A bot may be created with a gate (a root bot's can be replaced later with
-`configure`): `approve`, the tools whose calls wait for a
+A bot may be created with a gate (one no bot made, which a client
+created or forked, can have all its gates replaced later with `configure`,
+its source's included): `approve`, the tools whose calls wait for a
 verdict; `approver`, an opaque tag naming who answers, which the daemon
 stores and reports but never reads; and optionally `approve_expire_ms`.
 `approve` may name no more tools than the daemon registers (`invalid_gate`
