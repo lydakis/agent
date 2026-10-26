@@ -643,8 +643,12 @@ async fn caught_up(events: &mut Events) -> Option<u64> {
 /// conversation's.
 fn context_after(event: &Value) -> Option<u64> {
     let data = &event["data"];
+    // After a provider-side fallback the totals add up every billed
+    // attempt; the conversation is what the last one read and wrote.
+    let last = data["models"].as_array().and_then(|tried| tried.last());
+    let call = last.unwrap_or(data);
     (event["event"] == "usage" && data["purpose"].is_null()).then(|| {
-        data["input_tokens"].as_u64().unwrap_or(0) + data["output_tokens"].as_u64().unwrap_or(0)
+        call["input_tokens"].as_u64().unwrap_or(0) + call["output_tokens"].as_u64().unwrap_or(0)
     })
 }
 
@@ -3432,6 +3436,13 @@ mod tests {
             None
         );
         assert_eq!(context_after(&json!({"event": "text_delta"})), None);
+        // A fallback billed two attempts; the context is the last one's.
+        let mut fell_back = usage(20, 10, None);
+        fell_back["data"]["models"] = json!([
+            {"model": "claude-opus-5-5", "input_tokens": 7, "output_tokens": 3},
+            {"model": "claude-opus-4-8", "input_tokens": 13, "output_tokens": 7},
+        ]);
+        assert_eq!(context_after(&fell_back), Some(20));
     }
 
     #[test]
