@@ -1315,12 +1315,12 @@ mod tests {
         );
         // Redacted before it is cut: a value whose name falls in the part
         // left out is still found.
-        let secret = "Zq8vT2nW5xK9pL3rB7mY4cH6jD1fG0sA";
+        let secret = ["Zq8vT2nW", "5xK9pL3r", "B7mY4cH6", "jD1fG0sA"].concat();
         let tail = "b".repeat(CHANGE_SHOWN / 2 - secret.len() - 1);
         let content = format!("{}password={secret}\n{tail}", "a".repeat(CHANGE_SHOWN));
         let (shown, _) = shown_change(&json!({"path":"a.env","content":content}), &redactor);
         assert!(
-            !shown.to_string().contains(secret),
+            !shown.to_string().contains(&secret),
             "{}",
             &shown["content"].as_str().unwrap()[CHANGE_SHOWN / 2..]
         );

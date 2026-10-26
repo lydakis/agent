@@ -695,7 +695,9 @@ is shown as its path and size, since a file's content is not what
 consent is about. If the words do not all fit, the newest are sent and the older left out
 (the newest cut to its start and end if it alone does not fit), with
 `request_cut: true`, and consent is not counted, since a word left out may
-be the one that withdrew it. `prompts` gives the calls their own budget, so
+be the one that withdrew it. Text the daemon cut at the read's budget ends
+at its last whole word, so the redactor never sees a secret without what
+marks it (a URL's password cut before its `@host`). `prompts` gives the calls their own budget, so
 words that fill the read still leave the calls that name the files the
 turn wrote. Jev still judges the risks: a call whose
 risks are all low is allowed, and a risky one is unclear. Long-running

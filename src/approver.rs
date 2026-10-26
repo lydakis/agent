@@ -1036,7 +1036,7 @@ async fn intent(
     let mut budget = PROMPT_BYTES.saturating_sub(prompt_bytes(prompts));
     for prompt in prompts {
         request_cut |= prompt["truncated"] == true;
-        let text = prompt["text"].as_str().unwrap_or_default().to_owned();
+        let text = prompt_text(prompt);
         match prompt.get("from") {
             None => request.push(Words {
                 by: by_origin(prompt),
@@ -1103,7 +1103,7 @@ async fn intent(
             true => match call["node"].as_i64() {
                 Some(_) if expanded >= PROMPT_BYTES && !writes => {
                     allowed_cut = true;
-                    json!(preview)
+                    json!(whole_words(preview))
                 }
                 Some(node) => match node_item(client, bot, &json!(node)).await {
                     Ok(item) => {
@@ -1117,7 +1117,7 @@ async fn intent(
                     }
                     Err(Unjudged::TooLong) => {
                         allowed_cut = true;
-                        json!(preview)
+                        json!(whole_words(preview))
                     }
                     Err(error) => return Err(error),
                 },
@@ -1129,7 +1129,7 @@ async fn intent(
                 }
                 None => {
                     allowed_cut = true;
-                    json!(preview)
+                    json!(whole_words(preview))
                 }
             },
         };
@@ -1219,7 +1219,7 @@ async fn intent(
                 Some(_) => By::Model,
                 None => by_origin(prompt),
             },
-            text: prompt["text"].as_str().unwrap_or_default().to_owned(),
+            text: prompt_text(prompt),
         })
         .collect();
     Ok(Intent {
@@ -1232,6 +1232,22 @@ async fn intent(
         request_cut,
         earlier,
     })
+}
+
+/// Text the daemon cut at its byte budget ends without the part-word it was
+/// cut in, so the redactor never sees a secret without what marks it: the
+/// `@host` past a URL's password, say.
+fn whole_words(text: &str) -> &str {
+    text.rfind(char::is_whitespace).map_or("", |at| &text[..at])
+}
+
+/// A prompt's text as the judge is shown it.
+fn prompt_text(prompt: &Value) -> String {
+    let text = prompt["text"].as_str().unwrap_or_default();
+    match prompt["truncated"] == true {
+        true => whole_words(text).to_owned(),
+        false => text.to_owned(),
+    }
 }
 
 /// Who wrote a prompt no bot's turn wrote: a person, unless a client sent it
@@ -1289,7 +1305,7 @@ async fn persons_above(
             Some(above) => next = Some(above.clone()),
             None => request.push(Words {
                 by: by_origin(&prompt),
-                text: prompt["text"].as_str().unwrap_or_default().to_owned(),
+                text: prompt_text(&prompt),
             }),
         }
     }
@@ -1416,6 +1432,17 @@ mod tests {
         ));
         let opening = format!("{} And more.", &policy::JUDGE_INSTRUCTIONS[..60]);
         assert!(!judge_bot(&json!({"tools":[],"instructions":opening})));
+    }
+
+    #[test]
+    fn text_the_daemon_cut_ends_on_a_whole_word() {
+        let password = ["Zq8vK2", "mX9pL4", "tR7wY3nB"].concat();
+        // Cut before the `@host` that marks a URL's password.
+        let cut = json!({"text":format!("deploy with https://ci:{password}"),"truncated":true});
+        assert_eq!(prompt_text(&cut), "deploy with");
+        let whole = json!({"text":"deploy now"});
+        assert_eq!(prompt_text(&whole), "deploy now");
+        assert_eq!(whole_words("unbroken"), "");
     }
 
     #[test]
