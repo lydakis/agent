@@ -270,7 +270,18 @@ pub fn note(items: &[Item], more: usize) -> String {
             .map(|(id, p)| format!("{} {p:.2}", id.replace('_', " ")))
             .collect::<Vec<_>>()
             .join(", ");
-        let todo = item.reasons.first().map_or("look", |(id, _)| action(id));
+        // Every reason's action: a preference both redirects a task and
+        // belongs in memory.
+        let mut todo: Vec<&str> = Vec::new();
+        for (id, _) in &item.reasons {
+            if !todo.contains(&action(id)) {
+                todo.push(action(id));
+            }
+        }
+        let todo = match todo.is_empty() {
+            true => "look".to_owned(),
+            false => todo.join(", and "),
+        };
         let what = match seen.kind {
             Kind::Said => format!("{} wrote in it", seen.from.as_deref().unwrap_or("someone")),
             Kind::Ended => format!("turn {}", seen.status.as_deref().unwrap_or("ended")),
@@ -1480,7 +1491,7 @@ mod tests {
                 text: "Use tabs everywhere.\nThanks.".into(),
                 ..item.seen.clone()
             },
-            reasons: vec![("remember", 0.91)],
+            reasons: vec![("redirects", 0.97), ("remember", 0.91)],
         };
         let note = note(&[item, said], 2);
         // Only the person's own words are quoted.
@@ -1489,7 +1500,7 @@ mod tests {
         ));
         assert!(!note.contains("Fixed avg"));
         assert!(note.contains(
-            "- calc.docs, turn:calc.docs/3, the person wrote in it (remember 0.91; save it with your memory skill): \"Use tabs everywhere.\""
+            "- calc.docs, turn:calc.docs/3, the person wrote in it (redirects 0.97, remember 0.91; pass it to every task it applies to, and save it with your memory skill): \"Use tabs everywhere.\""
         ));
         assert!(note.contains("- 2 more in the next note"));
     }
