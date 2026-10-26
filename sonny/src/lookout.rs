@@ -54,8 +54,23 @@ pub struct Question {
     urgent: bool,
 }
 
+/// What the lead is asked to do about a yes, as the note says it.
+fn action(id: &str) -> &'static str {
+    match id {
+        "redirects" => "pass it to every task it applies to",
+        "sibling_needs" => "pass it to the task that needs it",
+        "conflict" => "reconcile the two tasks",
+        "off_brief" => "correct the task",
+        "stuck" => "unblock it or ask the person",
+        "lead_next" => "start the next step",
+        "result" => "tell the person",
+        "remember" => "save it with your memory skill",
+        _ => "look",
+    }
+}
+
 /// What each check may ask, as predicates over the input `input` builds.
-pub const QUESTIONS: [Question; 7] = [
+pub const QUESTIONS: [Question; 8] = [
     Question {
         id: "redirects",
         text: "Is `event` a message from the person that changes a goal, a constraint or a preference that also applies to the other tasks in `tasks` or to the project as a whole, not only to this task?",
@@ -93,6 +108,12 @@ pub const QUESTIONS: [Question; 7] = [
         urgent: false,
     },
     Question {
+        id: "result",
+        text: "Does the reply in `event` report a finished result, a finding or a decision that the person who asked for this work would want to hear about?",
+        kinds: &[Kind::Ended],
+        urgent: false,
+    },
+    Question {
         id: "remember",
         text: "Is `event` a message from the person that states a lasting preference, rule or fact about the person or the project that `memory` does not already hold?",
         kinds: &[Kind::Said],
@@ -125,6 +146,12 @@ pub struct Seen {
     pub from: Option<String>,
     /// How the turn ended, for `Ended`.
     pub status: Option<String>,
+    /// The history node holding the words, for `Said`: none while queued.
+    pub node: Option<i64>,
+    /// The node of the lead's latest message to the task, then.
+    pub brief: Option<i64>,
+    /// The other tasks, each with the node of the lead's latest message to it.
+    pub peers: Vec<(String, Option<i64>)>,
     pub text: String,
 }
 
@@ -243,13 +270,14 @@ pub fn note(items: &[Item], more: usize) -> String {
             .map(|(id, p)| format!("{} {p:.2}", id.replace('_', " ")))
             .collect::<Vec<_>>()
             .join(", ");
+        let todo = item.reasons.first().map_or("look", |(id, _)| action(id));
         let what = match seen.kind {
             Kind::Said => format!("{} wrote in it", seen.from.as_deref().unwrap_or("someone")),
             Kind::Ended => format!("turn {}", seen.status.as_deref().unwrap_or("ended")),
             Kind::Waiting => "waits on the person's approval".to_owned(),
         };
         lines.push(format!(
-            "- {}, turn:{}/{}, {what} ({why}): \"{}\"",
+            "- {}, turn:{}/{}, {what} ({why}; {todo}): \"{}\"",
             seen.task,
             seen.task,
             seen.turn,
@@ -260,8 +288,8 @@ pub fn note(items: &[Item], more: usize) -> String {
         lines.push(format!("- {more} more in the next note"));
     }
     lines.push(
-        "Read each one with the wait tool by its handle. Pass on what another task needs, steer or \
-         correct a task, or ask the person; if none needs you, end with one line."
+        "Read each one with the wait tool by its handle, then do what its line says where it holds; \
+         if none needs you, end with one line."
             .to_owned(),
     );
     lines.join("\n")
@@ -451,7 +479,16 @@ enum Failure {
     Check(String),
     /// No check will succeed until the account is topped up.
     Quota,
+    /// The same words were checked moments ago in another task, as a
+    /// board post copied to each member is.
+    Duplicate,
 }
+
+/// How long the same words in another task count as already checked.
+const SAME_WORDS: Duration = Duration::from_secs(10 * 60);
+
+/// Words checked lately, by digest, shared by every check.
+type Recent = Arc<std::sync::Mutex<HashMap<String, Instant>>>;
 
 /// A check's answers, and what it read on the way.
 struct Checked {
@@ -459,7 +496,6 @@ struct Checked {
     tokens: u64,
     ms: u128,
     text: String,
-    brief: Option<String>,
 }
 
 /// The memory indexes the lead starts with, as they stand now.
@@ -528,16 +564,25 @@ async fn recent(
 /// What the event says: the words written, the reply the turn ended with,
 /// or the call waiting on approval.
 async fn event_text(client: &Client, seen: &Seen) -> String {
+    if seen.kind == Kind::Said {
+        return match seen.node {
+            Some(node) => node_text(client, &seen.task, node).await,
+            // Still queued, its words are only in its turn's record.
+            None => client
+                .request(
+                    "turns",
+                    json!({"bot": seen.task, "after": seen.turn - 1, "limit": 1}),
+                )
+                .await
+                .ok()
+                .and_then(|page| Some(page["turns"][0]["prompt_preview"].as_str()?.to_owned()))
+                .unwrap_or_default(),
+        };
+    }
     let items = recent(client, &seen.task, 60, false).await;
     let in_turn = |(turn, _): &&(Option<i64>, Value)| *turn == Some(seen.turn);
-    let user = |(_, item): &&(Option<i64>, Value)| item["role"] == "user";
     let found = match seen.kind {
-        // A started turn's words are its oldest; a steer's, the newest.
-        Kind::Said => items
-            .iter()
-            .rev()
-            .find(|entry| in_turn(entry) && user(entry))
-            .or_else(|| items.iter().find(user)),
+        Kind::Said => None,
         Kind::Ended => items
             .iter()
             .filter(in_turn)
@@ -557,8 +602,32 @@ async fn event_text(client: &Client, seen: &Seen) -> String {
     }
 }
 
-/// What the lead asked the task: the first words in its history.
-async fn brief(client: &Client, task: &str) -> String {
+/// The words one history node holds.
+async fn node_text(client: &Client, bot: &str, node: i64) -> String {
+    client
+        .request("history_items", json!({"bot": bot, "nodes": [node]}))
+        .await
+        .ok()
+        .map(|read| item_text(&read["items"][0]["item"]))
+        .unwrap_or_default()
+}
+
+/// Whether these words were checked within `SAME_WORDS`; they count as
+/// checked from now on.
+fn repeated(recent: &Recent, text: &str, now: Instant) -> bool {
+    if text.trim().is_empty() {
+        return false;
+    }
+    let mut lately = recent.lock().unwrap();
+    lately.retain(|_, at| now.duration_since(*at) < SAME_WORDS);
+    lately.insert(digest(text.trim()), now).is_some()
+}
+
+/// What the lead last asked the task, else the first words in its history.
+async fn brief(client: &Client, task: &str, node: Option<i64>) -> String {
+    if let Some(node) = node {
+        return node_text(client, task, node).await;
+    }
     recent(client, task, 8, true)
         .await
         .iter()
@@ -581,23 +650,19 @@ async fn check(
     client: &Client,
     judge: &Judge,
     seen: &Seen,
-    known: Option<String>,
-    peers: &[(String, Option<String>)],
     memory: &str,
+    recent: &Recent,
 ) -> Result<Checked, Failure> {
     let text = event_text(client, seen).await;
-    let brief = match known {
-        Some(brief) => brief,
-        None => brief(client, &seen.task).await,
-    };
+    if seen.kind == Kind::Said && repeated(recent, &text, Instant::now()) {
+        return Err(Failure::Duplicate);
+    }
+    let brief = brief(client, &seen.task, seen.brief).await;
     let mut roster = Vec::new();
-    for (task, known) in peers.iter().take(ROSTER) {
+    for (task, node) in seen.peers.iter().take(ROSTER) {
         roster.push(Peer {
             task: task.clone(),
-            brief: match known {
-                Some(brief) => brief.clone(),
-                None => self::brief(client, task).await,
-            },
+            brief: self::brief(client, task, *node).await,
             latest: latest(client, task).await,
         });
     }
@@ -614,7 +679,6 @@ async fn check(
         tokens,
         ms: started.elapsed().as_millis(),
         text,
-        brief: Some(brief),
     })
 }
 
@@ -631,7 +695,9 @@ pub fn spawn(socket: PathBuf, project: String, lead: String, workspace: PathBuf,
             waiting_on: Vec::new(),
             approvals: HashMap::new(),
             steers: HashMap::new(),
+            checked: HashSet::new(),
             briefs: HashMap::new(),
+            recent: Recent::default(),
             due: Vec::new(),
             held: Vec::new(),
             held_since: None,
@@ -668,11 +734,14 @@ struct Lookout {
     waiting_on: Vec<String>,
     /// Approvals the person has not answered, by task and turn, since when.
     approvals: HashMap<(String, i64), Instant>,
-    /// Steers someone other than the lead sent, until absorbed: by task and
-    /// steer turn, who sent it.
-    steers: HashMap<(String, i64), String>,
-    /// What the lead asked each task, as first read.
-    briefs: HashMap<String, String>,
+    /// Steers waiting to be absorbed, by task and steer turn: who sent it,
+    /// or `None` for the lead.
+    steers: HashMap<(String, i64), Option<String>>,
+    /// Queued turns already checked when they were queued.
+    checked: HashSet<(String, i64)>,
+    /// The node of the lead's latest message to each task.
+    briefs: HashMap<String, i64>,
+    recent: Recent,
     /// Checks to start.
     due: Vec<Seen>,
     /// News for the lead, sent with the next wake.
@@ -729,18 +798,9 @@ impl Lookout {
             // Checks run beside the stream, so a slow judge never stalls it.
             for seen in std::mem::take(&mut self.due) {
                 let (client, judge, done) = (client.clone(), self.judge.clone(), done.clone());
-                let peers: Vec<(String, Option<String>)> = self
-                    .peers_of(&seen.task)
-                    .into_iter()
-                    .map(|task| {
-                        let brief = self.briefs.get(&task).cloned();
-                        (task, brief)
-                    })
-                    .collect();
-                let known = self.briefs.get(&seen.task).cloned();
-                let memory = memory(&self.workspace);
+                let (memory, recent) = (memory(&self.workspace), self.recent.clone());
                 tokio::spawn(async move {
-                    let answered = check(&client, &judge, &seen, known, &peers, &memory).await;
+                    let answered = check(&client, &judge, &seen, &memory, &recent).await;
                     let _ = done.send((seen, answered)).await;
                 });
             }
@@ -808,24 +868,30 @@ impl Lookout {
         if !self.lineage.contains(bot) {
             return;
         }
-        let seen = |kind, from, status| Seen {
-            task: bot.to_owned(),
-            turn,
-            kind,
-            from,
-            status,
-            text: String::new(),
-        };
+        let node = data["node"].as_i64();
         match kind {
-            "accepted" => {
-                if let Some(from) = self.author(data) {
-                    self.due.push(seen(Kind::Said, Some(from), None));
+            "accepted" => match self.author(data) {
+                _ if self.checked.remove(&(bot.to_owned(), turn)) => {}
+                Some(from) => self.due(bot, turn, Kind::Said, Some(from), None, node),
+                None if data["from"]["bot"] == self.lead.as_str() => {
+                    if let Some(node) = node {
+                        self.briefs.insert(bot.to_owned(), node);
+                    }
                 }
-            }
+                None => {}
+            },
             // A steer joins a running turn; its words are read once absorbed.
             "queued" if data["delivery"] == "steer" => {
-                if let Some(from) = self.author(data) {
+                let from = self.author(data);
+                if from.is_some() || data["from"]["bot"] == self.lead.as_str() {
                     self.steers.insert((bot.to_owned(), turn), from);
+                }
+            }
+            // Queued work waits for a busy task, so it is read now.
+            "queued" => {
+                if let Some(from) = self.author(data) {
+                    self.checked.insert((bot.to_owned(), turn));
+                    self.due(bot, turn, Kind::Said, Some(from), None, None);
                 }
             }
             "turn_waiting" if !data["approval"].is_null() && data["approval"] != false => {
@@ -840,8 +906,14 @@ impl Lookout {
                 self.approvals.retain(|(task, _), _| task != bot);
                 let status = data["status"].as_str().unwrap_or("ended");
                 if status == "steered" {
-                    if let Some(from) = self.steers.remove(&(bot.to_owned(), turn)) {
-                        self.due.push(seen(Kind::Said, Some(from), None));
+                    match self.steers.remove(&(bot.to_owned(), turn)) {
+                        Some(Some(from)) => self.due(bot, turn, Kind::Said, Some(from), None, node),
+                        Some(None) => {
+                            if let Some(node) = node {
+                                self.briefs.insert(bot.to_owned(), node);
+                            }
+                        }
+                        None => {}
                     }
                     return;
                 }
@@ -853,10 +925,41 @@ impl Lookout {
                     Some(error) => format!("{status} ({error})"),
                     None => status.to_owned(),
                 };
-                self.due.push(seen(Kind::Ended, None, Some(status)));
+                self.due(bot, turn, Kind::Ended, None, Some(status), None);
             }
             _ => {}
         }
+    }
+
+    /// A check to start, with the briefs as they stand now.
+    fn due(
+        &mut self,
+        task: &str,
+        turn: i64,
+        kind: Kind,
+        from: Option<String>,
+        status: Option<String>,
+        node: Option<i64>,
+    ) {
+        let peers = self
+            .peers_of(task)
+            .into_iter()
+            .map(|peer| {
+                let brief = self.briefs.get(&peer).copied();
+                (peer, brief)
+            })
+            .collect();
+        self.due.push(Seen {
+            task: task.to_owned(),
+            turn,
+            kind,
+            from,
+            status,
+            node,
+            brief: self.briefs.get(task).copied(),
+            peers,
+            text: String::new(),
+        });
     }
 
     fn approvals_due(&mut self) {
@@ -869,14 +972,7 @@ impl Lookout {
             .collect();
         for (task, turn) in due {
             self.approvals.remove(&(task.clone(), turn));
-            self.due.push(Seen {
-                task,
-                turn,
-                kind: Kind::Waiting,
-                from: None,
-                status: None,
-                text: String::new(),
-            });
+            self.due(&task, turn, Kind::Waiting, None, None, None);
         }
     }
 
@@ -896,9 +992,6 @@ impl Lookout {
             "turn": seen.turn, "kind": format!("{:?}", seen.kind), "judge": self.judge.name});
         match answered {
             Ok(checked) => {
-                if let Some(brief) = checked.brief {
-                    self.briefs.entry(seen.task.clone()).or_insert(brief);
-                }
                 let (band, reasons) = band(&checked.answers);
                 line["answers"] = Value::Object(checked.answers);
                 line["tokens"] = json!(checked.tokens);
@@ -921,6 +1014,7 @@ impl Lookout {
                 self.stopped = true;
             }
             Err(Failure::Check(why)) => line["failed"] = json!(why),
+            Err(Failure::Duplicate) => line["skipped"] = json!("same words checked lately"),
         }
         self.write(&line);
     }
@@ -932,13 +1026,7 @@ impl Lookout {
             return;
         }
         let now = Instant::now();
-        let spaced = self
-            .last_wake
-            .is_none_or(|last| now.duration_since(last) >= WAKE_GAP);
-        let stale = self
-            .held_since
-            .is_some_and(|since| now.duration_since(since) >= DIGEST_AFTER);
-        if !(spaced && (self.urgent.is_some() || stale)) {
+        if !self.wake_due(now) {
             return;
         }
         let steer = self.urgent == Some(true);
@@ -980,6 +1068,19 @@ impl Lookout {
                 self.last_wake = Some(now);
             }
         }
+    }
+
+    /// A steer is worth cutting in at once; other high answers wait out
+    /// the gap since the last wake, and middle ones the digest's quiet spell.
+    fn wake_due(&self, now: Instant) -> bool {
+        let spaced = self
+            .last_wake
+            .is_none_or(|last| now.duration_since(last) >= WAKE_GAP);
+        let stale = self
+            .held_since
+            .is_some_and(|since| now.duration_since(since) >= DIGEST_AFTER);
+        !self.held.is_empty()
+            && (self.urgent == Some(true) || (spaced && (self.urgent.is_some() || stale)))
     }
 
     fn write(&self, line: &Value) {
@@ -1057,7 +1158,7 @@ pub async fn replay() -> Result<(), String> {
         }
     }
     let judges: Vec<Arc<Judge>> = judges.into_iter().map(Arc::new).collect();
-    let mut due: Vec<(String, PathBuf, Seen, Vec<String>)> = Vec::new();
+    let mut due: Vec<(String, PathBuf, Seen)> = Vec::new();
     for lead in bots
         .iter()
         .filter_map(|b| b["name"].as_str())
@@ -1079,7 +1180,9 @@ pub async fn replay() -> Result<(), String> {
             waiting_on: Vec::new(),
             approvals: HashMap::new(),
             steers: HashMap::new(),
+            checked: HashSet::new(),
             briefs: HashMap::new(),
+            recent: Recent::default(),
             due: Vec::new(),
             held: Vec::new(),
             held_since: None,
@@ -1114,8 +1217,7 @@ pub async fn replay() -> Result<(), String> {
             lookout.event(event);
         }
         for seen in std::mem::take(&mut lookout.due) {
-            let peers = lookout.peers_of(&seen.task);
-            due.push((lead.to_owned(), workspace.clone(), seen, peers));
+            due.push((lead.to_owned(), workspace.clone(), seen));
         }
     }
     // The newest checks, oldest first, so a lead's story reads in order.
@@ -1132,30 +1234,18 @@ pub async fn replay() -> Result<(), String> {
         }
         None => Box::new(std::io::stdout()),
     };
-    let mut briefs: HashMap<String, String> = HashMap::new();
-    for (n, (lead, workspace, seen, peers)) in due.into_iter().enumerate() {
+    // Each judge skips repeated words on its own, as one live lookout would.
+    let recents: Vec<Recent> = judges.iter().map(|_| Recent::default()).collect();
+    for (n, (lead, workspace, seen)) in due.into_iter().enumerate() {
         let memory = memory(&workspace);
-        let peers: Vec<(String, Option<String>)> = peers
-            .into_iter()
-            .map(|t| {
-                let brief = briefs.get(&t).cloned();
-                (t, brief)
-            })
-            .collect();
         let text = event_text(&client, &seen).await;
-        let known = briefs.get(&seen.task).cloned();
-        for judge in &judges {
-            let answered = check(&client, judge, &seen, known.clone(), &peers, &memory).await;
+        for (judge, recent) in judges.iter().zip(&recents) {
+            let answered = check(&client, judge, &seen, &memory, recent).await;
             let mut line = json!({"n": n, "lead": lead, "task": seen.task, "turn": seen.turn,
                 "kind": format!("{:?}", seen.kind), "from": seen.from, "status": seen.status,
                 "judge": judge.name, "text": cut(&text, 600)});
             match answered {
                 Ok(checked) => {
-                    if let Some(brief) = &checked.brief {
-                        briefs
-                            .entry(seen.task.clone())
-                            .or_insert_with(|| brief.clone());
-                    }
                     let (band, reasons) = band(&checked.answers);
                     line["answers"] = Value::Object(checked.answers);
                     line["band"] = json!(format!("{band:?}"));
@@ -1165,6 +1255,7 @@ pub async fn replay() -> Result<(), String> {
                 }
                 Err(Failure::Quota) => return Err(format!("{}: out of quota", judge.name)),
                 Err(Failure::Check(why)) => line["failed"] = json!(why),
+                Err(Failure::Duplicate) => line["skipped"] = json!("same words checked lately"),
             }
             writeln!(sink, "{line}").map_err(|e| e.to_string())?;
         }
@@ -1229,7 +1320,9 @@ mod tests {
             waiting_on: Vec::new(),
             approvals: HashMap::new(),
             steers: HashMap::new(),
+            checked: HashSet::new(),
             briefs: HashMap::new(),
+            recent: Recent::default(),
             due: Vec::new(),
             held: Vec::new(),
             held_since: None,
@@ -1237,6 +1330,20 @@ mod tests {
             last_wake: None,
             stopped: false,
             log: None,
+        }
+    }
+
+    impl Lookout {
+        fn due_seen(&mut self) -> Seen {
+            self.due(
+                "calc.fix",
+                1,
+                Kind::Ended,
+                None,
+                Some("completed".into()),
+                None,
+            );
+            self.due.pop().unwrap()
         }
     }
 
@@ -1258,7 +1365,8 @@ mod tests {
                 "conflict",
                 "off_brief",
                 "stuck",
-                "lead_next"
+                "lead_next",
+                "result"
             ]
         );
         assert_eq!(ids(Kind::Waiting), ["stuck"]);
@@ -1286,6 +1394,9 @@ mod tests {
             kind: Kind::Said,
             from: Some("the person".into()),
             status: None,
+            node: None,
+            brief: None,
+            peers: Vec::new(),
             text: "x".repeat(EVENT_CHARS * 2),
         };
         let peers: Vec<Peer> = (0..ROSTER + 3)
@@ -1333,13 +1444,16 @@ mod tests {
                 kind: Kind::Ended,
                 from: None,
                 status: Some("completed".into()),
+                node: None,
+                brief: None,
+                peers: Vec::new(),
                 text: "\nFixed avg by skipping empty lists.\nMore.".into(),
             },
             reasons: vec![("off_brief", 0.82)],
         };
         let note = note(&[item], 2);
         assert!(note.contains(
-            "- calc.fix, turn:calc.fix/12, turn completed (off brief 0.82): \"Fixed avg by skipping empty lists.\""
+            "- calc.fix, turn:calc.fix/12, turn completed (off brief 0.82; correct the task): \"Fixed avg by skipping empty lists.\""
         ));
         assert!(note.contains("- 2 more in the next note"));
     }
@@ -1463,6 +1577,9 @@ mod tests {
             kind: Kind::Ended,
             from: None,
             status: Some("completed".into()),
+            node: None,
+            brief: None,
+            peers: Vec::new(),
             text: String::new(),
         };
         let checked = |pairs: &[(&str, f64)]| {
@@ -1471,7 +1588,6 @@ mod tests {
                 tokens: 1,
                 ms: 1,
                 text: "done".into(),
-                brief: Some("fix it".into()),
             })
         };
         lookout.answered(seen(1), checked(&[("stuck", 0.1)]));
@@ -1480,9 +1596,99 @@ mod tests {
         assert_eq!((lookout.held.len(), lookout.urgent), (1, None));
         lookout.answered(seen(3), checked(&[("conflict", 0.9)]));
         assert_eq!((lookout.held.len(), lookout.urgent), (2, Some(true)));
-        assert_eq!(lookout.briefs["calc.fix"], "fix it");
         lookout.answered(seen(4), Err(Failure::Quota));
         assert!(lookout.stopped);
+    }
+
+    #[test]
+    fn a_check_reads_the_lead_s_latest_brief() {
+        let mut lookout = lookout();
+        lookout.lineage.insert("calc.docs".into());
+        let from = json!({"bot": "calc.lead", "turn": 1});
+        lookout.event(&ev(
+            "calc.fix",
+            2,
+            "accepted",
+            json!({"from": from, "node": 10}),
+        ));
+        lookout.event(&ev(
+            "calc.docs",
+            3,
+            "accepted",
+            json!({"from": from, "node": 11}),
+        ));
+        // A new job for the same task, sent as a steer.
+        lookout.event(&ev(
+            "calc.fix",
+            4,
+            "queued",
+            json!({"delivery": "steer", "from": from}),
+        ));
+        lookout.event(&ev(
+            "calc.fix",
+            4,
+            "turn_finished",
+            json!({"status": "steered", "node": 20}),
+        ));
+        assert!(lookout.due.is_empty());
+        lookout.event(&ev(
+            "calc.fix",
+            2,
+            "turn_finished",
+            json!({"status": "completed"}),
+        ));
+        let seen = &lookout.due[0];
+        assert_eq!(seen.brief, Some(20));
+        assert_eq!(seen.peers, [("calc.docs".to_owned(), Some(11))]);
+    }
+
+    #[test]
+    fn queued_words_are_checked_when_queued_and_once() {
+        let mut lookout = lookout();
+        lookout.event(&ev("calc.fix", 5, "queued", json!({"delivery": "queue"})));
+        assert_eq!(lookout.due[0].kind, Kind::Said);
+        assert_eq!(lookout.due[0].node, None);
+        lookout.due.clear();
+        lookout.event(&ev("calc.fix", 5, "accepted", json!({"node": 30})));
+        assert!(lookout.due.is_empty());
+        // A turn started at once is read by its node.
+        lookout.event(&ev("calc.fix", 6, "accepted", json!({"node": 31})));
+        assert_eq!(lookout.due[0].node, Some(31));
+    }
+
+    #[test]
+    fn the_same_words_are_checked_once() {
+        let recent = Recent::default();
+        let now = Instant::now();
+        assert!(!repeated(&recent, "[board] lane A is mine", now));
+        assert!(repeated(&recent, " [board] lane A is mine\n", now));
+        assert!(!repeated(&recent, "", now));
+        assert!(!repeated(
+            &recent,
+            "[board] lane A is mine",
+            now + SAME_WORDS
+        ));
+    }
+
+    #[test]
+    fn a_steer_skips_the_gap_and_a_queue_waits() {
+        let mut lookout = lookout();
+        let now = Instant::now();
+        lookout.last_wake = Some(now);
+        let seen = lookout.due_seen();
+        lookout.held.push(Item {
+            seen,
+            reasons: vec![("off_brief", 0.9)],
+        });
+        lookout.urgent = Some(false);
+        assert!(!lookout.wake_due(now));
+        assert!(lookout.wake_due(now + WAKE_GAP));
+        lookout.urgent = Some(true);
+        assert!(lookout.wake_due(now));
+        lookout.urgent = None;
+        lookout.held_since = Some(now);
+        assert!(!lookout.wake_due(now + WAKE_GAP));
+        assert!(lookout.wake_due(now + DIGEST_AFTER));
     }
 
     #[test]
