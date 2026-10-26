@@ -151,7 +151,10 @@ pub fn keep_model(dir: &Path, model: &str, effort: Option<&str>) -> Result<(), S
         )
     })?;
     let said = |key: &str| read.get(key).and_then(toml::Value::as_str);
-    if said("model") != Some(model) || said("reasoning") != effort {
+    if said("model") != Some(model)
+        || said("reasoning") != effort
+        || edited.len() as u64 > agent_client::project::LIMIT
+    {
         return Err(format!(
             "{} could not be edited; set the model there",
             path.display()

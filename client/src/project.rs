@@ -9,7 +9,8 @@ use std::io::Read;
 use std::path::Path;
 
 pub const FILE: &str = ".agents/project.toml";
-const LIMIT: u64 = 64 * 1024;
+/// The largest project file the reader takes.
+pub const LIMIT: u64 = 64 * 1024;
 /// Every key the file may hold; anything else is a mistake, not ignored.
 const KEYS: [&str; 7] = [
     "name",
