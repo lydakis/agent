@@ -4246,6 +4246,65 @@ fn a_steer_closes_the_round_it_joins() {
 }
 
 #[test]
+fn a_round_that_reuses_a_call_id_of_its_turn_is_refused_whole() {
+    // A model that starts over after a steer may send the first round's call
+    // id again; the turn's calls are keyed by id.
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let (item, a) = call("a");
+    db.append(turn, vec![item], std::slice::from_ref(&a), None)
+        .unwrap();
+    db.tool_start(turn, &a).unwrap();
+    db.tool_finish(turn, "a", &result("one")).unwrap();
+    db.begin(
+        "Bob",
+        "s",
+        "steer",
+        true,
+        &TurnOptions {
+            delivery: Delivery::Steer,
+            ..TurnOptions::default()
+        },
+        allow_provider,
+    )
+    .unwrap();
+    db.absorb(turn, None, 8 << 20, 4096, ContextUsage::default(), false)
+        .unwrap();
+    let steered = head(&db, "Bob");
+    let seen = db.events("Bob", 0, 256).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .len();
+    let (fresh, b) = call("b");
+    let (again, a) = call("a");
+    let refused = db
+        .append(turn, vec![fresh, again], &[b, a], None)
+        .unwrap_err();
+    assert_eq!(refused.code, "invalid_tool_call_id");
+    assert_eq!(head(&db, "Bob"), steered);
+    let events = db.events("Bob", 0, 256).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(events, seen);
+    // Nothing of the refused round was planned, so its fresh id stays free.
+    let (item, b) = call("b");
+    db.append(turn, vec![item], std::slice::from_ref(&b), None)
+        .unwrap();
+}
+
+#[test]
 fn a_fork_keeps_its_sources_window_start() {
     let mut db = db();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
