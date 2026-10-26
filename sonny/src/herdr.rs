@@ -356,7 +356,7 @@ fn side_of(rect: &Value, other: &Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mux::Layout;
+    use crate::mux::{Layout, Placement};
     use serde_json::json;
 
     /// A stand-in herdr over a JSON file of workspaces, tabs and panes,
@@ -535,6 +535,76 @@ print(json.dumps({"id": "cli:request", "result": out}))
                     .to_vec()
             )
         );
+    }
+
+    /// Against a real Herdr server: `HERDR_SESSION=check herdr server` in
+    /// another terminal, then `HERDR_SESSION=check cargo test -p sonny
+    /// real_herdr -- --ignored --nocapture`. It makes a `sonnycheck`
+    /// workspace and closes it.
+    #[test]
+    #[ignore]
+    fn real_herdr() {
+        let bin = find().expect("herdr on the PATH");
+        let herdr = Herdr::open(bin, "sonnycheck", false).unwrap();
+        let workspace = herdr.workspace.clone();
+        let lead = herdr.blocks()[0].id.clone();
+        herdr.rename_block(&lead, "sonnycheck.lead");
+        let mut layout = Layout::new(Box::new(herdr));
+        let sleep = ["sh".to_owned(), "-c".into(), "echo task; sleep 60".into()];
+        assert!(layout.show("sonnycheck.fix", "fix", &sleep).unwrap());
+        assert!(!layout.show("sonnycheck.fix", "fix", &sleep).unwrap());
+        let tests = layout
+            .split(
+                "sonnycheck.fix",
+                "tests",
+                Path::new("/tmp"),
+                &["echo".into(), "it's done".into()],
+                false,
+            )
+            .unwrap();
+        layout
+            .split(
+                "sonnycheck.lead",
+                "server",
+                Path::new("/tmp"),
+                &["echo".into(), "serving".into()],
+                true,
+            )
+            .unwrap();
+        let left = Placement::Split {
+            side: "left".into(),
+            beside: "sonnycheck.lead".into(),
+        };
+        layout
+            .place("sonnycheck.docs", "docs", &sleep, &left)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let windows = layout.windows();
+        let places = layout.places();
+        println!("windows: {windows:?}\nplaces: {places:?}");
+        let check = Herdr::open(find().unwrap(), "sonnycheck", false).unwrap();
+        let read = check
+            .call(&[
+                "pane",
+                "read",
+                &tests,
+                "--source",
+                "recent-unwrapped",
+                "--lines",
+                "20",
+            ])
+            .unwrap_or(Value::Null);
+        println!("tests pane: {read}");
+        assert_eq!(places["sonnycheck.docs"].1.as_ref().unwrap().0, "left of");
+        assert_eq!(
+            places["sonnycheck.fix/tests"].1.as_ref().unwrap().0,
+            "below"
+        );
+        layout.close("sonnycheck.fix");
+        let left: Vec<String> = check.blocks().into_iter().map(|b| b.label).collect();
+        println!("after closing the task: {left:?}");
+        assert!(!left.iter().any(|l| l.starts_with("sonnycheck.fix")));
+        let _ = check.call(&["workspace", "close", &workspace]);
     }
 
     #[test]
