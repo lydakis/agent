@@ -15,7 +15,7 @@
 use agent_client::Client;
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -162,6 +162,19 @@ impl Updates {
                 waiting_on: Vec::new(),
             },
         );
+    }
+
+    /// Every bot is seated: one no longer listed was deleted while Sonny
+    /// was away, which no event will say.
+    pub fn seated(&mut self, listed: &HashSet<String>) {
+        let gone: Vec<String> = (self.bots.keys())
+            .filter(|name| !listed.contains(*name))
+            .cloned()
+            .collect();
+        for name in gone {
+            self.bots.remove(&name);
+            self.gone(&name);
+        }
     }
 
     /// Who made the bot, when the bot holding that name now is the one
@@ -661,6 +674,7 @@ pub async fn run(socket: PathBuf, lead: String, project: String) {
 
 async fn seat_all(client: &Client, updates: &mut Updates) -> bool {
     let mut after = Value::Null;
+    let mut listed = HashSet::new();
     loop {
         let Ok(page) = client
             .request("bots", json!({"after": after, "limit": 256}))
@@ -670,9 +684,11 @@ async fn seat_all(client: &Client, updates: &mut Updates) -> bool {
         };
         for record in page["bots"].as_array().into_iter().flatten() {
             updates.seat(record);
+            listed.extend(record["name"].as_str().map(str::to_owned));
         }
         after = page["next_after"].clone();
         if after.is_null() {
+            updates.seated(&listed);
             return true;
         }
     }
@@ -970,6 +986,25 @@ mod tests {
         );
         // Deleted and made again while Sonny was away: seated afresh.
         updates.seat(&json!({"name": "shop.fix", "bot_id": 99, "status": "idle"}));
+        assert!(!updates.due(now));
+        assert!(updates.take(now).unwrap().sent.is_empty());
+    }
+
+    #[test]
+    fn a_task_deleted_while_sonny_was_away_has_no_news() {
+        let now = Instant::now();
+        let mut updates = fleet();
+        turn(
+            &mut updates,
+            "shop.fix",
+            4,
+            json!({"from": {"bot": "shop.lead", "turn": 9}}),
+            "completed",
+        );
+        let listed = ["shop.lead", "shop.docs", "shop.fix.review"]
+            .map(str::to_owned)
+            .into();
+        updates.seated(&listed);
         assert!(!updates.due(now));
         assert!(updates.take(now).unwrap().sent.is_empty());
     }
