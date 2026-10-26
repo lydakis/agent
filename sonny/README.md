@@ -4,6 +4,8 @@ A terminal client for the daemon, beside the app, that lays its work out in
 Rex. It speaks the daemon's socket protocol through `agent-client`, like the
 app; nothing in the daemon or CLI knows it exists.
 
+    brew install lydakis/agent/sonny         # Sonny, with a daemon of its own version
+
     sonny                                    # this folder's coordinator, <project>.lead
     sonny --model PROVIDER/MODEL             # the same, making the project the first time
     sonny --bot NAME                         # any one bot
@@ -21,7 +23,24 @@ skill (`skills/rex-windows/SKILL.md`) to `~/.agents/skills/rex-windows`, so any 
 long command in a Rex window the person can watch, and read it back.
 
 Enter sends (and steers a running turn), Esc interrupts, `y`/`n` answer a
-pending approval, Ctrl-C clears the composer or quits.
+pending approval, Ctrl-C clears the composer or quits. `/` lists the
+commands:
+
+- `/model` picks the lead's model, from every model its provider family
+  lists, and its effort (←/→).
+- `/approvals` picks whether calls wait for a verdict: `auto`, a judge
+  model (a new lead starts here, and Sonny starts `agent approver` when
+  nothing serves it), `ask`, you, or `full`, none. Tasks the lead makes keep
+  the gate it had.
+- `/status` shows the project's agents, and its running Errand jobs.
+- `/copy` puts the last reply on the clipboard; `/open` opens the last
+  HTML page in a browser; `/sound` turns the chime off or on; `/quit`
+  leaves the agents working.
+
+Settings Sonny keeps for every folder are in `~/.agent/sonny/settings.json`.
+When `errand` is installed, Sonny writes an `errand` skill so any agent can
+run a command on another machine, draws those runs as `Ran COMMAND on
+PEER`, and in Rex opens a window following each detached job.
 
 The look follows Codex's TUI (openai/codex, `codex-rs/tui`): finished history
 goes into the terminal's own scrollback above a small inline viewport,
