@@ -9,10 +9,15 @@
 //! `• Ran …` line with a short `└` look at the result, and a status row
 //! says how long the turn has run and how to stop it.
 mod approvals;
+mod cache;
 mod calls;
 mod diff;
 mod errand;
+mod html;
+mod image;
+mod js;
 mod math;
+mod mermaid;
 mod models;
 mod project;
 mod rex;
@@ -326,7 +331,7 @@ fn parse() -> Result<Options, String> {
     })
 }
 
-// Two threads, so the daemon's events are read while the screen is drawn:
+// Two threads, so the daemon's events are read while a picture is drawn:
 // a reader that stops is dropped by the daemon as lagging.
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> std::process::ExitCode {
@@ -348,6 +353,8 @@ async fn run() -> Result<(), String> {
         return Ok(());
     }
     let options = parse()?;
+    // Fonts are read before the first picture needs them.
+    std::thread::spawn(image::preload);
     let (client, mut events) = connect(&options).await?;
     // A lead made just now starts in the first approval mode.
     let mut fresh = false;
@@ -1051,6 +1058,7 @@ impl App {
     }
 
     async fn main(&mut self, terminal: &mut Tui, events: &mut Events) -> Result<(), String> {
+        term::laid_out().await;
         let _ = terminal.autoresize();
         self.width = terminal.size().map(|s| s.width as usize).unwrap_or(80);
         self.history().await;

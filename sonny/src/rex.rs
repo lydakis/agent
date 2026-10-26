@@ -353,7 +353,8 @@ fn sides_of(node: &Value, sides: &mut HashMap<String, (&'static str, String)>) {
     sides_of(after, sides);
 }
 
-/// The skill that lets any agent run long work where the person can see it.
+/// The skills that let any agent run long work where the person can see it,
+/// and show the person pictures.
 /// Kept in `~/.agents/skills/rex-windows`, naming this machine's rex and
 /// Sonny; `rex` itself is the name of Rex's own skill.
 pub fn install_skill(bin: &Path) -> Option<PathBuf> {
@@ -361,7 +362,8 @@ pub fn install_skill(bin: &Path) -> Option<PathBuf> {
     let text = include_str!("../skills/rex-windows/SKILL.md")
         .replace("REX_BIN", &format!("\"{}\"", bin.to_string_lossy()))
         .replace("SONNY_BIN", &format!("\"{}\"", sonny.to_string_lossy()));
-    crate::skills::install("rex-windows", &text)
+    let pictures = crate::skills::install("pictures", include_str!("../skills/pictures/SKILL.md"));
+    crate::skills::install("rex-windows", &text).or(pictures)
 }
 
 #[cfg(test)]

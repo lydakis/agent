@@ -84,8 +84,9 @@ impl Markdown {
         Span::raw(format!("  {}", " ".repeat(self.hang)))
     }
 
-    /// What a fence that just closed draws: a diff, a page kept for
-    /// `/open`, or math as text.
+    /// The picture a fence that just closed drew, as rows of the
+    /// terminal's image cells; or, when it could not be drawn, its source
+    /// and why.
     pub fn picture(&mut self, width: usize) -> Vec<Line<'static>> {
         let Some((lang, source)) = self.ready.take() else {
             return Vec::new();
@@ -96,15 +97,39 @@ impl Markdown {
         if lang == "html" {
             return page(&source, width);
         }
-        // Math as text, line by line.
-        source
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .flat_map(|l| {
-                let line = Line::from(crate::math::unicode(l.trim())).italic();
-                wrap(line, width, Span::raw("    "), Span::raw("    "))
-            })
-            .collect()
+        // Math where pictures cannot be drawn: as text, line by line.
+        if lang == "math" && !crate::term::graphics() {
+            return source
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .flat_map(|l| {
+                    let line = Line::from(crate::math::unicode(l.trim())).italic();
+                    wrap(line, width, Span::raw("    "), Span::raw("    "))
+                })
+                .collect();
+        }
+        let drawn = crate::cache::drawn(&lang, &source, width, || {
+            let svg = match lang.as_str() {
+                "mermaid" => crate::mermaid::svg(&source)?,
+                "math" => crate::math::svg(&source)?,
+                _ => source.clone(),
+            };
+            crate::image::render(&svg, width)
+        });
+        match drawn.and_then(|drawn| crate::image::show(&drawn)) {
+            Ok(rows) => rows,
+            Err(error) => {
+                let mut out: Vec<Line<'static>> = source
+                    .lines()
+                    .flat_map(|line| {
+                        let code = Line::from(line.to_owned()).fg(Color::Cyan);
+                        wrap(code, width, Span::raw("    "), Span::raw("    "))
+                    })
+                    .collect();
+                out.push(Line::from(format!("    could not draw it: {error}")).dim());
+                out
+            }
+        }
     }
 
     /// The styled line, or none for a fence marker, which is not shown.
@@ -144,7 +169,8 @@ impl Markdown {
                 "latex" | "tex" | "katex" => "math",
                 lang => lang,
             };
-            if self.fence && matches!(lang, "diff" | "patch" | "math" | "html") {
+            let drawn = matches!(lang, "svg" | "mermaid") && crate::term::graphics();
+            if self.fence && (drawn || matches!(lang, "diff" | "patch" | "math" | "html")) {
                 self.picture = Some((lang.to_owned(), String::new()));
             } else if !self.fence {
                 self.ready = self.picture.take();
@@ -335,8 +361,9 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
 /// The HTML page a reply showed last, for `/open`.
 pub static PAGE: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
 
-/// A ```html fence, kept in a file `/open` shows in the browser, its
-/// first lines shown as code.
+/// A ```html fence, drawn as the page by a headless browser and kept in
+/// a file `/open` shows in the browser; its first lines as code where it
+/// cannot be drawn.
 fn page(source: &str, width: usize) -> Vec<Line<'static>> {
     let dir = std::env::temp_dir().join("sonny-pages");
     let name = format!(
@@ -351,21 +378,39 @@ fn page(source: &str, width: usize) -> Vec<Line<'static>> {
     if let Err(error) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, source)) {
         return vec![Line::from(format!("    could not keep the page: {error}")).dim()];
     }
-    let lines: Vec<&str> = source.lines().collect();
-    let shown = if lines.len() > 8 { 6 } else { lines.len() };
-    let mut out: Vec<Line<'static>> = lines[..shown]
-        .iter()
-        .flat_map(|line| {
-            let code = Line::from(line.to_string()).fg(Color::Cyan);
-            wrap(code, width, Span::raw("    "), Span::raw("    "))
+    let drawn = match crate::term::graphics() {
+        true => crate::cache::drawn("html", source, width, || {
+            let png = crate::html::render(&path, crate::image::page_width(width))?;
+            crate::image::page(&png, width)
         })
-        .collect();
-    if lines.len() > shown {
-        out.push(Line::from(format!("    … +{} lines", lines.len() - shown)).dim());
-    }
+        .and_then(|drawn| Ok((crate::image::show(&drawn)?, drawn.cut))),
+        false => Err(String::new()),
+    };
+    let (mut out, more) = match drawn {
+        Ok((rows, cut)) => (rows, if cut { " for the rest" } else { "" }),
+        Err(error) => {
+            let lines: Vec<&str> = source.lines().collect();
+            let shown = if lines.len() > 8 { 6 } else { lines.len() };
+            let mut out: Vec<Line<'static>> = lines[..shown]
+                .iter()
+                .flat_map(|line| {
+                    let code = Line::from(line.to_string()).fg(Color::Cyan);
+                    wrap(code, width, Span::raw("    "), Span::raw("    "))
+                })
+                .collect();
+            if lines.len() > shown {
+                out.push(Line::from(format!("    … +{} lines", lines.len() - shown)).dim());
+            }
+            if !error.is_empty() {
+                out.push(Line::from(format!("    could not draw it: {error}")).dim());
+            }
+            (out, "")
+        }
+    };
     out.push(Line::from(vec![
         Span::raw("    ↗ ").fg(Color::Cyan),
         Span::raw("/open").bold(),
+        Span::raw(more).dim(),
     ]));
     if let Ok(mut page) = PAGE.lock() {
         *page = Some(path);
@@ -966,6 +1011,14 @@ mod tests {
 
     fn text(lines: &[Line]) -> Vec<String> {
         lines.iter().map(|l| l.to_string()).collect()
+    }
+
+    #[test]
+    fn a_fence_left_open_shows_what_it_had() {
+        let lines = reply("Here:\n```diff\n-old\n+new", 80);
+        let shown: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        assert!(shown.iter().any(|l| l.contains("-old")), "{shown:?}");
+        assert!(shown.iter().any(|l| l.contains("+new")), "{shown:?}");
     }
 
     #[test]
