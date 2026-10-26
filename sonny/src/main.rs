@@ -65,6 +65,8 @@ const DEFAULT_TOOLS: [&str; 6] = ["shell", "read", "write", "edit", "wait", "his
 /// Rows kept at the bottom: the reply's unfinished line, the status, a gap,
 /// the composer and the footer.
 const VIEWPORT: u16 = 5;
+/// The most rows a long prompt's composer grows to; it shows its end.
+const COMPOSER_ROWS: usize = 8;
 /// How much history is shown on attach.
 const HISTORY_ITEMS: u64 = 200;
 
@@ -370,6 +372,8 @@ async fn run() -> Result<(), String> {
     let (client, mut events) = connect(&options).await?;
     // A lead made just now starts in the first approval mode.
     let mut fresh = false;
+    // A lead moved elsewhere, and the folder it comes back to.
+    let mut moving = None;
     let (name, project) = match &options.bot {
         Some(bot) => {
             if options.new {
@@ -392,6 +396,7 @@ async fn run() -> Result<(), String> {
             let lead =
                 project::open(&client, &dir, &options.socket, options.model.as_deref()).await?;
             fresh = lead.new;
+            moving = lead.moving;
             (lead.bot, Some(lead.project))
         }
     };
@@ -443,9 +448,11 @@ async fn run() -> Result<(), String> {
     // The lead told what its folder tells it today (skills and memory added
     // since it was made), unless its instructions were set some other way.
     if project.is_some()
-        && let Some(dir) = bot["workspace"].as_str()
+        && let Some(dir) = moving
+            .as_deref()
+            .or(bot["workspace"].as_str().map(std::path::Path::new))
     {
-        match project::review(std::path::Path::new(dir), &bot, &app.lead, fresh) {
+        match project::review(dir, &bot, &app.lead, fresh) {
             Ok(project::Instructions::Stale(text)) => app.instruct = Some(text),
             Ok(project::Instructions::Current) => {}
             Ok(project::Instructions::Kept) => {
@@ -457,6 +464,17 @@ async fn run() -> Result<(), String> {
             }
             Err(error) => app.notice = Some(format!("the lead's instructions: {error}")),
         }
+    }
+    // Said last: it is what the next message does.
+    if let Some(dir) = &moving {
+        app.notice = Some(format!(
+            "{name} works in {}; your next message brings it back here",
+            tilde(bot["workspace"].as_str().unwrap_or("another folder"))
+        ));
+        // The project's folder from now: what /model and /instructions
+        // write and read, before the move itself.
+        app.workspace = dir.display().to_string();
+        app.move_to = Some(app.workspace.clone());
     }
     app.project = project;
     if fresh {
@@ -502,6 +520,62 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// The viewport's rows, top to bottom: the reply's open line, the status,
+/// a gap, the composer (as many rows as are left) and the footer.
+fn areas(area: ratatui::layout::Rect) -> [ratatui::layout::Rect; 5] {
+    Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(area)
+}
+
+/// The viewport made `height` rows tall, for a composer that grew or
+/// shrank. It keeps its top: a taller one pushes history up, and a shorter
+/// one leaves blank rows under it that the next history fills.
+fn fit(terminal: &mut Tui, height: u16) -> std::io::Result<()> {
+    let area = terminal.get_frame().area();
+    let height = height.min(terminal.size()?.height);
+    if area.height == height {
+        return Ok(());
+    }
+    terminal.clear()?;
+    execute!(
+        std::io::stdout(),
+        ratatui::crossterm::cursor::MoveTo(0, area.y)
+    )?;
+    *terminal = Terminal::with_options(
+        CrosstermBackend::new(std::io::stdout()),
+        TerminalOptions {
+            viewport: Viewport::Inline(height),
+        },
+    )?;
+    Ok(())
+}
+
+/// The title of the reasoning's latest part: models that summarize their
+/// reasoning open each part with a bold line, `**Checking the tests**`.
+fn heading(thought: &str) -> Option<&str> {
+    let parts: Vec<&str> = thought.split("**").collect();
+    // Bold runs are the odd parts; the last part is still open.
+    (1..parts.len().saturating_sub(1))
+        .step_by(2)
+        .map(|at| parts[at].trim())
+        .rfind(|title| !title.is_empty() && !title.contains('\n'))
+}
+
+/// A folder as the person reads it: under their home, from `~`.
+fn tilde(path: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    match path.strip_prefix(&home) {
+        Some(rest) if !home.is_empty() => format!("~{rest}"),
+        _ => path.to_owned(),
+    }
 }
 
 fn unique(prefix: &str) -> String {
@@ -641,6 +715,9 @@ struct App {
     sounds: sound::Sounds,
     /// The reply text the current model call has streamed.
     said: String,
+    /// The reasoning streamed since the bot last spoke or called a tool,
+    /// whose latest heading the status row shows, as Codex does.
+    thought: String,
     /// What a retried call will stream again, not to be shown twice.
     replay: Option<String>,
     /// How to reach the daemon again when the connection drops.
@@ -651,6 +728,8 @@ struct App {
     repaint: bool,
     /// The lead's instructions as composed now, sent once no turn runs.
     instruct: Option<String>,
+    /// The folder the next message moves the bot to: its lead moved away.
+    move_to: Option<String>,
     /// The name under which Sonny notes the instructions it wrote.
     lead: String,
     /// When to connect again, while it or the fleet's is down.
@@ -1148,11 +1227,13 @@ impl App {
             redraw: false,
             sounds: sound::Sounds::new(false),
             said: String::new(),
+            thought: String::new(),
             replay: None,
             options,
             down: false,
             repaint: false,
             instruct: None,
+            move_to: None,
             lead: String::new(),
             retry: None,
             picker: None,
@@ -1777,6 +1858,7 @@ impl App {
             "accepted" => {
                 self.end_live();
                 self.said.clear();
+                self.thought.clear();
                 self.replay = None;
                 self.running = Some(Running {
                     turn: turn.unwrap_or(0),
@@ -1812,6 +1894,7 @@ impl App {
             }
             "queued" => self.notice = Some(format!("queued behind turn {}", data["behind"])),
             "text_delta" => {
+                self.thought.clear();
                 let mut delta = event["text"].as_str().unwrap_or("");
                 // A retried call streams its reply again from the start:
                 // what was already shown is not shown twice.
@@ -1860,16 +1943,25 @@ impl App {
                 self.live = Some(live);
             }
             "thinking_delta" => {
+                self.thought.push_str(event["text"].as_str().unwrap_or(""));
                 if let Some(running) = &mut self.running {
-                    running.phase = "Thinking".into();
+                    running.phase = heading(&self.thought).unwrap_or("Thinking").to_owned();
                 }
             }
             "message" => {
                 let item = match data["node"].as_i64() {
                     Some(node) => self.items(&[node]).await.into_iter().next(),
                     None => None,
+                };
+                // Reasoning and calls are kept as items too, each with its
+                // event: only the bot's words end the reply streaming now,
+                // or draw it when nothing streamed.
+                if item
+                    .as_ref()
+                    .is_some_and(|item| item["role"] != "assistant")
+                {
+                    return;
                 }
-                .filter(|item| item["role"] == "assistant");
                 if let Some(item) = &item {
                     self.last_reply = text(item);
                 }
@@ -1903,6 +1995,7 @@ impl App {
             }
             "tool_started" => {
                 self.said.clear();
+                self.thought.clear();
                 self.end_live();
                 let name = data["name"].as_str().unwrap_or("tool").to_owned();
                 let id = data["call_id"].as_str().unwrap_or("");
@@ -2446,7 +2539,10 @@ impl App {
             }
         }
         match event {
-            Event::Paste(text) => self.input.push_str(&text),
+            // Terminals send a pasted line break as a carriage return.
+            Event::Paste(text) => self
+                .input
+                .push_str(&text.replace("\r\n", "\n").replace('\r', "\n")),
             Event::Resize(width, _) => self.width = width as usize,
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -2661,18 +2757,24 @@ impl App {
             .is_none()
             .then(|| self.turn_model.clone())
             .flatten();
+        // A steer never moves a bot, so a moved lead comes back with the
+        // next message that starts a turn.
+        let workspace = delivery.is_none().then(|| self.move_to.clone()).flatten();
         let submitted = self
             .client
             .request(
                 "submit",
                 json!({"bot": self.bot, "request_id": unique("tui"), "prompt": prompt,
-                    "delivery": delivery, "model": model}),
+                    "delivery": delivery, "model": model, "workspace": workspace}),
             )
             .await;
         match submitted {
             Ok(_) => {
                 self.input.clear();
                 self.notice = None;
+                if workspace.is_some() {
+                    self.move_to = None;
+                }
             }
             Err(error) => self.notice = Some(error.to_string()),
         }
@@ -2737,6 +2839,12 @@ impl App {
         terminal.autoresize()?;
         let width = terminal.size()?.width as usize;
         self.width = width;
+        let mut composer_rows = self.composer(width);
+        // A short pane keeps the prompt's end, where typing goes on.
+        let room = (terminal.size()?.height as usize).saturating_sub(VIEWPORT as usize - 1);
+        let over = composer_rows.len().saturating_sub(room.max(1));
+        composer_rows.drain(..over);
+        fit(terminal, VIEWPORT - 1 + composer_rows.len() as u16)?;
         if !self.pending.is_empty() {
             let lines: Vec<Line<'static>> = std::mem::take(&mut self.pending)
                 .into_iter()
@@ -2756,8 +2864,7 @@ impl App {
             }
         }
         terminal.draw(|frame| {
-            let [live, status, _, composer, footer] =
-                Layout::vertical([Constraint::Length(1); 5]).areas(frame.area());
+            let [live, status, _, composer, footer] = areas(frame.area());
             let width = live.width as usize;
             if let Some(open) = &self.live
                 && !open.partial.is_empty()
@@ -2801,8 +2908,7 @@ impl App {
                         }
                     })
                     .collect();
-                let [_, _, _, composer_row, _] =
-                    Layout::vertical([Constraint::Length(1); 5]).areas(frame.area());
+                let [_, _, _, composer_row, _] = areas(frame.area());
                 let area = ratatui::layout::Rect {
                     y: composer_row.y.saturating_sub(rows.len() as u16),
                     height: rows.len() as u16,
@@ -2908,34 +3014,55 @@ impl App {
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
-            let (text, cursor) = if self.input.is_empty() {
-                let hint = if self.running.is_some() {
-                    "Steer the running turn".to_owned()
-                } else {
-                    "Ask anything".to_owned()
-                };
-                (
-                    Line::from(vec![Span::raw("› ").bold(), Span::raw(hint).dim()]),
-                    2,
-                )
-            } else {
-                let shown = self.input.rsplit('\n').next().unwrap_or("");
-                let room = width.saturating_sub(3);
-                let mut start = 0;
-                while shown[start..].width() > room {
-                    start += shown[start..].chars().next().map_or(1, char::len_utf8);
-                }
-                let line = Line::from(vec![
-                    Span::raw("› ").bold(),
-                    Span::raw(shown[start..].to_owned()),
-                ]);
-                (line, 2 + shown[start..].width() as u16)
+            // The prompt's end, where typing goes on.
+            let cursor = match composer_rows.last() {
+                Some(row) if !self.input.is_empty() => row.width(),
+                _ => 2,
             };
-            frame.render_widget(Paragraph::new(text), composer);
-            frame.set_cursor_position((composer.x + cursor, composer.y));
+            let last = composer.y + composer.height.saturating_sub(1);
+            frame.render_widget(Paragraph::new(composer_rows), composer);
+            frame.set_cursor_position((
+                composer.x + (cursor as u16).min(composer.width.saturating_sub(1)),
+                last,
+            ));
             frame.render_widget(Paragraph::new(self.footer_line(width)), footer);
         })?;
         Ok(())
+    }
+
+    /// The composer's rows: the prompt wrapped to the width, the way it
+    /// will read once sent, and only its end when it is long; or the hint.
+    /// A list or picker open over the composer keeps it to one row.
+    fn composer(&self, width: usize) -> Vec<Line<'static>> {
+        if self.input.is_empty() {
+            let hint = match self.running {
+                Some(_) => "Steer the running turn",
+                None => "Ask anything",
+            };
+            return vec![Line::from(vec![
+                Span::raw("› ").bold(),
+                Span::raw(hint).dim(),
+            ])];
+        }
+        let mut rows = Vec::new();
+        for (at, line) in self.input.split('\n').enumerate() {
+            let lead = match at {
+                0 => Span::raw("› ").bold(),
+                _ => Span::raw("  "),
+            };
+            rows.extend(transcript::wrap(
+                Line::from(line.to_owned()),
+                width.saturating_sub(1),
+                lead,
+                Span::raw("  "),
+            ));
+        }
+        if self.choosing.is_some() || self.picker.is_some() {
+            rows.drain(..rows.len() - 1);
+        }
+        let over = rows.len().saturating_sub(COMPOSER_ROWS);
+        rows.drain(..over);
+        rows
     }
 
     fn status_line(&self) -> Line<'static> {
@@ -2976,11 +3103,7 @@ impl App {
     }
 
     fn footer_line(&self, width: usize) -> Line<'static> {
-        let home = std::env::var("HOME").unwrap_or_default();
-        let folder = match self.workspace.strip_prefix(&home) {
-            Some(rest) if !home.is_empty() => format!("~{rest}"),
-            _ => self.workspace.clone(),
-        };
+        let folder = tilde(&self.workspace);
         let mut left = format!("  {}", self.model);
         if let Some(effort) = &self.effort {
             left.push_str(&format!(" {effort}"));
@@ -3173,6 +3296,103 @@ fn responses(item: &Value) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A daemon that greets and answers each `history_items` read from
+    /// `items`, by node.
+    async fn daemon_with(items: Value) -> Arc<Client> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = std::env::temp_dir().join(format!(
+            "sonny-daemon-{}-{}",
+            std::process::id(),
+            unique("t")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("agent.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let ready = json!({"event": "ready", "protocol": agent_client::PROTOCOL});
+            write
+                .write_all(format!("{ready}\n").as_bytes())
+                .await
+                .unwrap();
+            let mut lines = BufReader::new(read).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let asked: Value = serde_json::from_str(&line).unwrap();
+                let read: Vec<Value> = asked["nodes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|node| json!({"node": node, "item": items[node.to_string()]}))
+                    .collect();
+                let answer = json!({"id": asked["id"], "result": {"items": read}});
+                write
+                    .write_all(format!("{answer}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        Client::connect(&socket).await.unwrap().0
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_follows_its_reasoning_is_drawn_once() {
+        let client = daemon_with(json!({
+            "1": {"type": "reasoning", "summary": [{"type": "summary_text", "text": "**Reading**"}]},
+            "2": {"type": "message", "role": "assistant",
+                  "content": [{"type": "output_text", "text": "First line.\nSecond line."}]}
+        }))
+        .await;
+        let options = Options {
+            store: PathBuf::new(),
+            socket: PathBuf::new(),
+            bot: None,
+            new: false,
+            model: None,
+            workspace: None,
+            rex: false,
+            rex_host: None,
+            sound: false,
+        };
+        let mut app = App::new(client, "b", &json!({"name": "b"}), options);
+        let event =
+            |event: &str, data: Value| json!({"event": event, "bot": "b", "turn": 1, "data": data});
+        app.daemon(event("accepted", json!({}))).await;
+        for (kind, text) in [
+            ("thinking_delta", "**Reading** the"),
+            ("thinking_delta", " folder"),
+            ("text_delta", "First line.\n"),
+            ("text_delta", "Second line."),
+        ] {
+            let mut delta = event(kind, json!({}));
+            delta["text"] = json!(text);
+            app.daemon(delta).await;
+        }
+        // The reasoning is kept, and announced, before the words it led to.
+        app.daemon(event("message", json!({"node": 1}))).await;
+        app.daemon(event("message", json!({"node": 2}))).await;
+        let drawn: Vec<String> = app.pending.iter().map(|line| line.to_string()).collect();
+        let said = |text: &str| drawn.iter().filter(|line| line.contains(text)).count();
+        assert_eq!(
+            (said("First line."), said("Second line.")),
+            (1, 1),
+            "{drawn:?}"
+        );
+    }
+
+    #[test]
+    fn the_status_row_names_what_the_model_is_thinking_about() {
+        assert_eq!(heading(""), None);
+        assert_eq!(heading("**Checking the"), None);
+        assert_eq!(
+            heading("**Checking the tests**\n\nI"),
+            Some("Checking the tests")
+        );
+        let two = "**Checking the tests**\n\nThey pass.\n\n**Reading the README";
+        assert_eq!(heading(two), Some("Checking the tests"));
+        assert_eq!(heading(&format!("{two}**\n")), Some("Reading the README"));
+    }
 
     #[test]
     fn anthropic_tool_blocks_read_as_calls_and_outputs() {
