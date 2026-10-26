@@ -91,7 +91,7 @@ pub const QUESTIONS: [Question; 8] = [
     },
     Question {
         id: "off_brief",
-        text: "Does the reply in `event` show the task departing from what `brief` asked it to do, or doing only part of it while presenting it as done?",
+        text: "Does the reply in `event` show the task departing from what `brief` asked it to do, or doing only part of it while presenting it as done? Following a later message from the person in that task is not departing.",
         kinds: &[Kind::Ended],
         urgent: false,
     },
@@ -109,7 +109,7 @@ pub const QUESTIONS: [Question; 8] = [
     },
     Question {
         id: "result",
-        text: "Does the reply in `event` report a finished result, a finding or a decision that the person who asked for this work would want to hear about?",
+        text: "Does the reply in `event` report a finished result, a finding or a decision that the person who asked for this work would want to hear about? A reply that only acknowledges, agrees, claims a share of the work, or says what it will do next is not one.",
         kinds: &[Kind::Ended],
         urgent: false,
     },
@@ -484,6 +484,9 @@ enum Failure {
     Duplicate,
 }
 
+/// Who wrote a message with no sender and no origin.
+const PERSON: &str = "the person";
+
 /// How long the same words in another task count as already checked.
 const SAME_WORDS: Duration = Duration::from_secs(10 * 60);
 
@@ -839,7 +842,7 @@ impl Lookout {
             (Some(bot), _) => Some(bot.to_owned()),
             (None, Some("lookout")) => None,
             (None, Some(origin)) => Some(origin.to_owned()),
-            (None, None) => Some("the person".to_owned()),
+            (None, None) => Some(PERSON.to_owned()),
         }
     }
 
@@ -872,7 +875,10 @@ impl Lookout {
         match kind {
             "accepted" => match self.author(data) {
                 _ if self.checked.remove(&(bot.to_owned(), turn)) => {}
-                Some(from) => self.due(bot, turn, Kind::Said, Some(from), None, node),
+                Some(from) => {
+                    self.due(bot, turn, Kind::Said, Some(from.clone()), None, node);
+                    self.briefed_by(bot, &from, node);
+                }
                 None if data["from"]["bot"] == self.lead.as_str() => {
                     if let Some(node) = node {
                         self.briefs.insert(bot.to_owned(), node);
@@ -907,7 +913,10 @@ impl Lookout {
                 let status = data["status"].as_str().unwrap_or("ended");
                 if status == "steered" {
                     match self.steers.remove(&(bot.to_owned(), turn)) {
-                        Some(Some(from)) => self.due(bot, turn, Kind::Said, Some(from), None, node),
+                        Some(Some(from)) => {
+                            self.due(bot, turn, Kind::Said, Some(from.clone()), None, node);
+                            self.briefed_by(bot, &from, node);
+                        }
                         Some(None) => {
                             if let Some(node) = node {
                                 self.briefs.insert(bot.to_owned(), node);
@@ -928,6 +937,14 @@ impl Lookout {
                 self.due(bot, turn, Kind::Ended, None, Some(status), None);
             }
             _ => {}
+        }
+    }
+
+    /// The person's words to a task are what it works to next, as the
+    /// lead's are; checks after them read them as its brief.
+    fn briefed_by(&mut self, task: &str, from: &str, node: Option<i64>) {
+        if let (PERSON, Some(node)) = (from, node) {
+            self.briefs.insert(task.to_owned(), node);
         }
     }
 
@@ -1640,6 +1657,28 @@ mod tests {
         let seen = &lookout.due[0];
         assert_eq!(seen.brief, Some(20));
         assert_eq!(seen.peers, [("calc.docs".to_owned(), Some(11))]);
+    }
+
+    #[test]
+    fn the_person_s_words_become_the_brief() {
+        let mut lookout = lookout();
+        lookout.event(&ev("calc.fix", 2, "accepted", json!({"node": 40})));
+        assert_eq!(lookout.due[0].brief, None);
+        lookout.event(&ev(
+            "calc.fix",
+            2,
+            "turn_finished",
+            json!({"status": "completed"}),
+        ));
+        assert_eq!(lookout.due[1].brief, Some(40));
+        // Another task's words are not a brief.
+        lookout.event(&ev(
+            "calc.fix",
+            3,
+            "accepted",
+            json!({"from": {"bot": "calc.docs", "turn": 1}, "node": 41}),
+        ));
+        assert_eq!(lookout.briefs["calc.fix"], 40);
     }
 
     #[test]
