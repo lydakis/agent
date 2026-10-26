@@ -750,6 +750,7 @@ pub fn spawn(socket: PathBuf, project: String, lead: String, workspace: PathBuf,
             workspace,
             lineage: HashSet::new(),
             waiting_on: Vec::new(),
+            waiting_any: false,
             approvals: HashMap::new(),
             steers: HashMap::new(),
             denied: HashMap::new(),
@@ -791,6 +792,8 @@ struct Lookout {
     lineage: HashSet<String>,
     /// The handles the lead's running turn waits on, which its wait reads.
     waiting_on: Vec<String>,
+    /// The lead's wait returns the first of `waiting_on` to settle.
+    waiting_any: bool,
     /// Approvals the person has not answered, by task and turn, since when.
     approvals: HashMap<(String, i64), (Instant, Option<String>)>,
     /// Steers waiting to be absorbed, by task and steer turn: who sent it,
@@ -925,7 +928,8 @@ impl Lookout {
                         .into_iter()
                         .flatten()
                         .filter_map(|h| h.as_str().map(str::to_owned))
-                        .collect()
+                        .collect();
+                    self.waiting_any = data["any"] == true;
                 }
                 "accepted" | "turn_resumed" | "turn_finished" => self.waiting_on.clear(),
                 _ => {}
@@ -1004,6 +1008,10 @@ impl Lookout {
                 // A turn the lead waits on is read by its own wait, unless
                 // the approver held it back: that needs the person.
                 if denied == 0 && self.waiting_on.contains(&format!("turn:{bot}/{turn}")) {
+                    // A wait on any one returns only the first to settle.
+                    if self.waiting_any {
+                        self.waiting_on.clear();
+                    }
                     return;
                 }
                 let mut status = match data["error"].as_str() {
@@ -1299,13 +1307,9 @@ pub async fn replay() -> Result<(), String> {
             .request("bots", json!({"limit": 256, "after": after}))
             .await
             .map_err(|e| e.to_string())?;
-        let got = page["bots"].as_array().cloned().unwrap_or_default();
-        let full = got.len() == 256;
-        after = got
-            .last()
-            .and_then(|b| b["name"].as_str().map(str::to_owned));
-        bots.extend(got);
-        if !full || after.is_none() {
+        bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
+        after = page["next_after"].as_str().map(str::to_owned);
+        if after.is_none() {
             break;
         }
     }
@@ -1330,6 +1334,7 @@ pub async fn replay() -> Result<(), String> {
             workspace: workspace.clone(),
             lineage: [lead.to_owned()].into(),
             waiting_on: Vec::new(),
+            waiting_any: false,
             approvals: HashMap::new(),
             steers: HashMap::new(),
             denied: HashMap::new(),
@@ -1496,6 +1501,7 @@ mod tests {
             workspace: PathBuf::from("/"),
             lineage: ["calc.lead".to_owned(), "calc.fix".to_owned()].into(),
             waiting_on: Vec::new(),
+            waiting_any: false,
             approvals: HashMap::new(),
             steers: HashMap::new(),
             denied: HashMap::new(),
@@ -2047,6 +2053,33 @@ mod tests {
             Some("completed, after 3 calls denied by the approver")
         );
         assert!(lookout.denied.is_empty());
+    }
+
+    #[test]
+    fn a_wait_on_any_one_reads_only_the_first() {
+        let mut lookout = lookout();
+        lookout.lineage.insert("calc.docs".into());
+        lookout.event(&ev(
+            "calc.lead",
+            5,
+            "turn_waiting",
+            json!({"handles": ["turn:calc.fix/6", "turn:calc.docs/2"], "any": true}),
+        ));
+        lookout.event(&ev(
+            "calc.fix",
+            6,
+            "turn_finished",
+            json!({"status": "completed"}),
+        ));
+        assert!(lookout.due.is_empty());
+        lookout.event(&ev(
+            "calc.docs",
+            2,
+            "turn_finished",
+            json!({"status": "completed"}),
+        ));
+        assert_eq!(lookout.due.len(), 1);
+        assert_eq!(lookout.due[0].task, "calc.docs");
     }
 
     #[test]
