@@ -12,7 +12,9 @@ app; nothing in the daemon or CLI knows it exists.
 
 Opened in a folder, Sonny is that project's lead: the same `<project>.lead`
 the app opens, made through the app's `~/.agent/project add` when the app is
-installed, else in the app's coordinator profile. When `rex` is found
+installed, else in the app's coordinator profile. A lead moved to another
+folder (`--workspace`) comes back with the next message Sonny sends it from
+its own, history and all. When `rex` is found
 (`$REX`, the PATH, or the Mac app), the project gets a Rex session labelled
 with its name, and each task the lead (or one of its tasks) starts gets a
 window there running Sonny on that task, without taking focus. Each window

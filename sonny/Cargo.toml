@@ -28,5 +28,9 @@ similar = { version = "2", features = ["inline"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "process"] }
 unicode-width = "0.2"
 
+[dev-dependencies]
+# A stand-in daemon on a Unix socket, for the event handling's tests.
+tokio = { version = "1", features = ["net", "io-util"] }
+
 [lints]
 workspace = true
