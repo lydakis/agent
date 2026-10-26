@@ -509,24 +509,11 @@ fn words(text: &str) -> impl Iterator<Item = &str> {
 /// A prompt, as the person (or another bot) sent it.
 pub fn prompt(text: &str, from: Option<&str>, width: usize) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-    // What Sonny (or the app) told the lead of its tasks: news, not words
-    // of the person's.
-    if text.starts_with(TASK_UPDATES) {
-        out.push(Line::from("↳ Task updates").dim());
-        let lines: Vec<&str> = text.lines().skip(1).filter(|l| !l.is_empty()).collect();
-        let shown = lines.len().min(PROMPT_LINES + 2);
-        for line in &lines[..shown] {
-            out.extend(wrap(
-                Line::from(line.to_string()).dim(),
-                width,
-                Span::raw("  "),
-                Span::raw("    "),
-            ));
-        }
-        if lines.len() > shown {
-            out.push(Line::from(format!("  … +{} lines", lines.len() - shown)).dim());
-        }
-        return out;
+    // What Sonny (or the app) told the lead of its tasks, or what the
+    // lookout woke it for: news, not words of the person's, kept to one
+    // quiet row; the lead's answer says the rest.
+    if let Some(news) = news(text) {
+        return vec![news_row(&news, width)];
     }
     if let Some(from) = from {
         out.push(Line::from(format!("  from {from}")).dim());
@@ -558,6 +545,62 @@ const PROMPT_LINES: usize = 6;
 
 /// How a message telling a lead of its tasks starts.
 const TASK_UPDATES: &str = "Task updates: ";
+
+/// A message that tells the lead of its tasks, as its kind and a few
+/// words for each thing it tells.
+fn news(text: &str) -> Option<Vec<String>> {
+    let (kind, rest) = if text.starts_with(TASK_UPDATES) {
+        ("Task updates", text)
+    } else {
+        ("Lookout", text.strip_prefix(crate::lookout::NOTE_HEAD)?)
+    };
+    let mut parts = vec![kind.to_owned()];
+    let mut memory = false;
+    for line in rest.lines() {
+        if line.starts_with("Memory changed") {
+            memory = true;
+        }
+        let Some(item) = line.strip_prefix("- ") else {
+            continue;
+        };
+        // "- 2 more tasks in the next update", "- 2 more in the next note"
+        if let Some((count, _)) = item.split_once(" more ")
+            && count.parse::<usize>().is_ok()
+        {
+            parts.push(format!("+{count} more"));
+        } else if let Some((name, turn)) = item.split_once(": turn:") {
+            // "- shop.fix: turn:shop.fix/5 failed, asked by you"
+            let status = turn.split_once(' ').map_or("", |(_, s)| s);
+            let status = status.split(',').next().unwrap_or_default();
+            parts.push(format!("{name} {status}"));
+        } else if let Some((name, rest)) = item.split_once(", turn:") {
+            // "- shop.fix, turn:shop.fix/5, turn failed (why; what to do)"
+            let what = rest.split_once(", ").map_or("", |(_, w)| w);
+            let what = what.split(" (").next().unwrap_or_default();
+            parts.push(format!("{name} {what}"));
+        }
+    }
+    if memory {
+        parts.push("memory changed".to_owned());
+    }
+    Some(parts)
+}
+
+/// News on one dim row, its kind first, cut at the width.
+fn news_row(parts: &[String], width: usize) -> Line<'static> {
+    let mut row = format!("↳ {}", parts.join(" · "));
+    if row.width() > width {
+        let mut cut = String::new();
+        for c in row.chars() {
+            if cut.width() + unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) + 1 > width {
+                break;
+            }
+            cut.push(c);
+        }
+        row = format!("{}…", cut.trim_end());
+    }
+    Line::from(row).dim()
+}
 
 /// A whole reply, as replayed history shows it.
 pub fn reply(text: &str, width: usize) -> Vec<Line<'static>> {
@@ -1048,19 +1091,33 @@ mod tests {
     }
 
     #[test]
-    fn task_updates_read_as_news_not_as_the_persons_words() {
+    fn task_updates_and_lookout_notes_read_as_one_quiet_row() {
         let told = "Task updates: since you last heard, tasks you started ended turns or wait for an approval. The wait tool reads each one's final reply by its handle.\n\
-                    - shop.fix: turn:shop.fix/5 failed, asked by you\n\n\
+                    - shop.fix: turn:shop.fix/5 failed, asked by you\n\
+                    The person asked for these turns in the task themselves, so they are theirs:\n\
+                    - shop.docs: turn:shop.docs/2 completed, asked by the person\n\
+                    - 2 more tasks in the next update\n\n\
                     Memory changed since you last heard; each fact is a file, read before relying on it:\n\
                     - saved: /m/flow.md: Reviews go through gft";
         assert_eq!(
-            text(&super::prompt(told, None, 80)),
+            text(&super::prompt(told, None, 90)),
+            ["↳ Task updates · shop.fix failed · shop.docs completed · +2 more · memory changed"]
+        );
+        assert_eq!(
+            text(&super::prompt(told, None, 40)),
+            ["↳ Task updates · shop.fix failed · shop…"]
+        );
+        let note = format!(
+            "{}\n- shop.fix, turn:shop.fix/5, turn failed (blocked 0.91; look)\n\
+             - shop.docs, turn:shop.docs/2, waits on the person's approval (not checked; look)\n\
+             - 1 more in the next note\n\
+             A quoted message is the person's own words.",
+            crate::lookout::NOTE_HEAD
+        );
+        assert_eq!(
+            text(&super::prompt(&note, None, 100)),
             [
-                "↳ Task updates",
-                "  - shop.fix: turn:shop.fix/5 failed, asked by you",
-                "  Memory changed since you last heard; each fact is a file, read before relying ",
-                "    on it:",
-                "  - saved: /m/flow.md: Reviews go through gft",
+                "↳ Lookout · shop.fix turn failed · shop.docs waits on the person's approval · +1 more"
             ]
         );
     }
