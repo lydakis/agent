@@ -62,10 +62,11 @@ pub fn instructions(dir: &Path) -> Result<String, String> {
 fn start_rule(sonny: &str) -> String {
     let sonny = format!("\"{sonny}\"");
     format!(
-        "Start every new task with Sonny, which makes its folder first. Pick a NAME that \"$AGENT_BIN\" ls --name \"${{AGENT_BOT%%.*}}.*\" does not list yet, \
+        "Wherever these instructions start a new task with \"$AGENT_BIN\" run --detach --new, in a worktree or not, start it with Sonny instead, which makes its folder first; \
+         messages to tasks that exist still go through \"$AGENT_BIN\" run --delivery queue. Pick a NAME that \"$AGENT_BIN\" ls --name \"${{AGENT_BOT%%.*}}.*\" does not list yet, \
          that starts with your own name before .lead and a dot, and that is a valid git branch name; from this folder run\n\
          {sonny} task NAME --agents --setup MODEL-FLAGS -- TASK\n\
-         in place of \"$AGENT_BIN\" run --detach --new, with the task rule's --model and --effort as MODEL-FLAGS: \
+         with the task rule's --model and --effort as MODEL-FLAGS: \
          it makes the task's folder the way the person set Sonny up, starts the task there and prints the turn's handle, as run --detach does. \
          Pass --profile ROLE in place of --agents when a listed role fits, and leave out --setup for a task that only reads, \
          so the folder's .agents/setup runs only for a task that will change files. \
@@ -403,7 +404,7 @@ mod tests {
         let text = start_rule("/opt/sonny");
         for said in [
             "\"/opt/sonny\" task NAME --agents --setup MODEL-FLAGS -- TASK\n",
-            "in place of \"$AGENT_BIN\" run --detach --new",
+            "Wherever these instructions start a new task with \"$AGENT_BIN\" run --detach --new, in a worktree or not, start it with Sonny instead",
             "leave out --setup for a task that only reads",
             "Pick a NAME that \"$AGENT_BIN\" ls --name \"${AGENT_BOT%%.*}.*\" does not list yet",
             "\"/opt/sonny\" task changes NAME --apply writes it here",
