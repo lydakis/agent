@@ -106,6 +106,10 @@ impl std::fmt::Display for Failure {
 }
 
 fn home() -> Option<PathBuf> {
+    // This crate's tests never read the person's own skills, roles or memory.
+    if cfg!(test) {
+        return Some(std::env::temp_dir().join("agent-client-tests-home"));
+    }
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
@@ -1275,10 +1279,10 @@ mod tests {
         );
         std::fs::remove_file(root.join(".agents/agents/half.md")).unwrap();
         // A workspace that is the home folder is searched once.
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-            assert_eq!(search(&root, Kind::Profiles).len(), 2);
-            assert_eq!(search(&home, Kind::Profiles).len(), 1);
-        }
+        let home = home().unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        assert_eq!(search(&root, Kind::Profiles).len(), 2);
+        assert_eq!(search(&home, Kind::Profiles).len(), 1);
         // A role too large to start is still listed under its name, so it
         // keeps shadowing the user's role of that name; starting it fails
         // explicitly instead.
