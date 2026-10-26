@@ -539,26 +539,6 @@ async fn run() -> Result<(), String> {
     {
         app.notice = Some(error);
     }
-    // The lead told what its folder tells it today (skills and memory added
-    // since it was made), unless its instructions were set some other way.
-    if project.is_some()
-        && let Some(dir) = moving
-            .as_deref()
-            .or(bot["workspace"].as_str().map(std::path::Path::new))
-    {
-        match project::review(dir, &bot, &app.lead, fresh) {
-            Ok(project::Instructions::Stale(text)) => app.instruct = Some(text),
-            Ok(project::Instructions::Current) => {}
-            Ok(project::Instructions::Kept) => {
-                app.notice = Some(
-                    "the lead's instructions were set outside its folder's files; \
-                     /instructions takes the folder's"
-                        .into(),
-                )
-            }
-            Err(error) => app.notice = Some(format!("the lead's instructions: {error}")),
-        }
-    }
     if let (Some(project), Some(dir), true) = (
         &project,
         moving
@@ -580,6 +560,23 @@ async fn run() -> Result<(), String> {
                 judge,
             ),
             Err(error) => app.notice = Some(error),
+        }
+    }
+    // The lead told what its folder tells it today (skills and memory added
+    // since it was made), unless its instructions were set some other way.
+    // After the lookout's notice: a skill the lead misses matters more.
+    if project.is_some()
+        && let Some(dir) = moving
+            .as_deref()
+            .or(bot["workspace"].as_str().map(std::path::Path::new))
+    {
+        match project::review(dir, &bot, &app.lead, fresh) {
+            Ok(project::Instructions::Stale(text)) => app.instruct = Some(text),
+            Ok(project::Instructions::Current) => {}
+            Ok(project::Instructions::Kept { missing }) => {
+                app.notice = Some(project::Instructions::kept_notice(&missing))
+            }
+            Err(error) => app.notice = Some(format!("the lead's instructions: {error}")),
         }
     }
     // Said last: it is what the next message does.
@@ -2899,12 +2896,8 @@ impl App {
                     }
                     // A toggle back before the turn ended: nothing to send.
                     Ok(project::Instructions::Current) => self.instruct = None,
-                    Ok(project::Instructions::Kept) => {
-                        self.notice = Some(
-                            "the lead keeps instructions set outside its folder's files; \
-                             /instructions takes the folder's"
-                                .into(),
-                        )
+                    Ok(project::Instructions::Kept { missing }) => {
+                        self.notice = Some(project::Instructions::kept_notice(&missing))
                     }
                     Err(error) => self.notice = Some(format!("the lead's instructions: {error}")),
                 }
