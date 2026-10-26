@@ -540,26 +540,6 @@ async fn run() -> Result<(), String> {
     {
         app.notice = Some(error);
     }
-    // The lead told what its folder tells it today (skills and memory added
-    // since it was made), unless its instructions were set some other way.
-    if project.is_some()
-        && let Some(dir) = moving
-            .as_deref()
-            .or(bot["workspace"].as_str().map(std::path::Path::new))
-    {
-        match project::review(dir, &bot, &app.lead, fresh) {
-            Ok(project::Instructions::Stale(text)) => app.instruct = Some(text),
-            Ok(project::Instructions::Current) => {}
-            Ok(project::Instructions::Kept) => {
-                app.notice = Some(
-                    "the lead's instructions were set outside its folder's files; \
-                     /instructions takes the folder's"
-                        .into(),
-                )
-            }
-            Err(error) => app.notice = Some(format!("the lead's instructions: {error}")),
-        }
-    }
     if let (Some(project), Some(dir), true) = (
         &project,
         moving
@@ -581,6 +561,23 @@ async fn run() -> Result<(), String> {
                 judge,
             ),
             Err(error) => app.notice = Some(error),
+        }
+    }
+    // The lead told what its folder tells it today (skills and memory added
+    // since it was made), unless its instructions were set some other way.
+    // After the lookout's notice: a skill the lead misses matters more.
+    if project.is_some()
+        && let Some(dir) = moving
+            .as_deref()
+            .or(bot["workspace"].as_str().map(std::path::Path::new))
+    {
+        match project::review(dir, &bot, &app.lead, fresh) {
+            Ok(project::Instructions::Stale(text)) => app.instruct = Some(text),
+            Ok(project::Instructions::Current) => {}
+            Ok(project::Instructions::Kept { missing }) => {
+                app.notice = Some(project::Instructions::kept_notice(&missing))
+            }
+            Err(error) => app.notice = Some(format!("the lead's instructions: {error}")),
         }
     }
     // Said last: it is what the next message does.
@@ -642,9 +639,10 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
 
 /// The viewport's rows, top to bottom: the reply's open line, the status,
 /// a gap, the composer (as many rows as are left) and the footer.
-fn areas(area: ratatui::layout::Rect) -> [ratatui::layout::Rect; 5] {
+/// The live area is `live` rows: the reply's open line, wrapped.
+fn areas(area: ratatui::layout::Rect, live: u16) -> [ratatui::layout::Rect; 5] {
     Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(live.max(1)),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(1),
@@ -1920,6 +1918,20 @@ impl App {
         self.calls.extend(calls);
     }
 
+    /// The reply's open line, the part after its last newline, as the rows
+    /// it will take once written.
+    fn open_rows(&self, width: usize) -> Vec<Line<'static>> {
+        let Some(open) = self.live.as_ref().filter(|open| !open.partial.is_empty()) else {
+            return Vec::new();
+        };
+        let mut markdown = open.markdown.clone();
+        let Some(line) = markdown.line(&open.partial) else {
+            return Vec::new();
+        };
+        let lead = if open.lines == 0 { "• " } else { "  " };
+        transcript::wrap(line, width, Span::raw(lead), markdown.rest())
+    }
+
     /// The reply's last lines, and a table it ended on, drawn.
     fn end_live(&mut self) {
         if let Some(mut live) = self.live.take() {
@@ -2919,12 +2931,8 @@ impl App {
                     }
                     // A toggle back before the turn ended: nothing to send.
                     Ok(project::Instructions::Current) => self.instruct = None,
-                    Ok(project::Instructions::Kept) => {
-                        self.notice = Some(
-                            "the lead keeps instructions set outside its folder's files; \
-                             /instructions takes the folder's"
-                                .into(),
-                        )
+                    Ok(project::Instructions::Kept { missing }) => {
+                        self.notice = Some(project::Instructions::kept_notice(&missing))
                     }
                     Err(error) => self.notice = Some(format!("the lead's instructions: {error}")),
                 }
@@ -3033,7 +3041,17 @@ impl App {
         // A short pane keeps the rows around the cursor, where typing goes on.
         let room = (terminal.size()?.height as usize).saturating_sub(VIEWPORT as usize - 1);
         let (composer_rows, cursor_row) = window(composer_rows, cursor_row, room.max(1));
-        fit(terminal, VIEWPORT - 1 + composer_rows.len() as u16)?;
+        // The reply's open line, wrapped as it will be written: it grows
+        // here row by row until its newline writes it into the history.
+        let mut open_rows = self.open_rows(width);
+        let spare = room.saturating_sub(composer_rows.len()) + 1;
+        let hidden = open_rows.len().saturating_sub(spare.max(1));
+        open_rows.drain(..hidden);
+        let live_rows = open_rows.len().max(1) as u16;
+        fit(
+            terminal,
+            VIEWPORT - 2 + live_rows + composer_rows.len() as u16,
+        )?;
         if !self.pending.is_empty() {
             let lines: Vec<Line<'static>> = std::mem::take(&mut self.pending)
                 .into_iter()
@@ -3053,22 +3071,8 @@ impl App {
             }
         }
         terminal.draw(|frame| {
-            let [live, status, _, composer, footer] = areas(frame.area());
-            let width = live.width as usize;
-            if let Some(open) = &self.live
-                && !open.partial.is_empty()
-            {
-                let mut markdown = open.markdown.clone();
-                if let Some(line) = markdown.line(&open.partial) {
-                    let lead = if open.lines == 0 { "• " } else { "  " };
-                    // The open line's end, when it is already wider than a row.
-                    let rows = transcript::wrap(line, width, Span::raw(lead), markdown.rest());
-                    frame.render_widget(
-                        Paragraph::new(rows.last().cloned().unwrap_or_default()),
-                        live,
-                    );
-                }
-            }
+            let [live, status, _, composer, footer] = areas(frame.area(), live_rows);
+            frame.render_widget(Paragraph::new(open_rows.clone()), live);
             frame.render_widget(Paragraph::new(self.status_line()), status);
             let menu = self.menu();
             if !menu.is_empty() {
@@ -3097,7 +3101,7 @@ impl App {
                         }
                     })
                     .collect();
-                let [_, _, _, composer_row, _] = areas(frame.area());
+                let [_, _, _, composer_row, _] = areas(frame.area(), live_rows);
                 let area = ratatui::layout::Rect {
                     y: composer_row.y.saturating_sub(rows.len() as u16),
                     height: rows.len() as u16,
