@@ -29,6 +29,7 @@ mod status;
 mod table;
 mod term;
 mod transcript;
+mod updates;
 
 use agent_client::{Client, Events};
 use ratatui::{
@@ -432,6 +433,14 @@ async fn run() -> Result<(), String> {
     if let Some(model) = options.model.as_ref().filter(|m| **m != app.model) {
         app.model = model.clone();
         app.turn_model = Some(model.clone());
+    }
+    // The lead hears what its tasks did, as the app tells it.
+    if let Some(project) = &project {
+        tokio::spawn(updates::run(
+            app.options.socket.clone(),
+            name.clone(),
+            project.clone(),
+        ));
     }
     // Tasks are laid out in Rex when the person is in it (or names the
     // Rex server to use); elsewhere they run out of sight, in /status.

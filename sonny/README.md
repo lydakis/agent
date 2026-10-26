@@ -27,6 +27,12 @@ again; ask the lead to show one, or run `sonny --bot NAME`. `--rex-host HOST` pu
 skill (`skills/rex-windows/SKILL.md`) to `~/.agents/skills/rex-windows`, so any agent can run a
 long command in a Rex window the person can watch, and read it back.
 
+The lead hears what its tasks did as the app tells it: once it rests, and at
+most every ten minutes, one "Task updates" message lists the tasks it started
+that ended a turn or wait for an approval, by the handles its wait tool reads
+them with, with what changed in memory alongside. The app and Sonny send the
+same news as one message, so it does not matter which is open.
+
 Enter sends (and steers a running turn), Esc interrupts, `y`/`n` answer a
 pending approval, Ctrl-C clears the composer or quits. `/` lists the
 commands:
