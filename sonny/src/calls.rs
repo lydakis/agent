@@ -1,8 +1,9 @@
 //! Shell commands Sonny knows the meaning of, said as what they do: an
 //! `agent` call starts, messages, waits on or removes an agent; a `rex` call
-//! opens, reads or types into a window; the plan skill sets the plan. A
-//! command line is read a command at a time; a command with a pipe, a
-//! redirect or a substitution is shown as the command it is.
+//! opens, reads or types into a window; an `errand` call runs a command on
+//! another machine or acts on its job; the plan skill sets the plan. A
+//! command line is read a command at a time; a pipe is said with its
+//! command and what came out of it.
 use ratatui::{
     style::{Color, Stylize},
     text::{Line, Span},
@@ -16,6 +17,9 @@ pub struct Said {
     pub what: String,
     pub under: Vec<Line<'static>>,
     pub failed: bool,
+    /// What the call printed, shown as a command's output is: what a
+    /// pipe made of it, or a remote command's own output.
+    pub output: Option<String>,
 }
 
 pub fn said(command: &str, output: &str, failed: bool) -> Option<Said> {
@@ -58,9 +62,17 @@ pub fn said(command: &str, output: &str, failed: bool) -> Option<Said> {
     let (program, args) = words.split_first()?;
     let name = program.rsplit('/').next().unwrap_or(program);
     let stdin = simple.stdin.as_deref();
+    // A pipe into more than `head`, `tail` or `jq` (which only cut or pick
+    // from it) prints what it made of the output, not the output itself.
+    let piped = simple
+        .piped
+        .as_deref()
+        .filter(|p| !matches!(p.split_whitespace().next(), Some("head" | "tail" | "jq")));
+    let printed = if piped.is_some() { "" } else { output };
     let mut said = match name {
-        "$AGENT_BIN" | "${AGENT_BIN}" | "agent" => agent(args, stdin, output, failed),
-        "$REX" | "${REX}" | "rex" => rex(args, output, failed),
+        "$AGENT_BIN" | "${AGENT_BIN}" | "agent" => agent(args, stdin, printed, failed),
+        "errand" => errand(args, printed, failed),
+        "$REX" | "${REX}" | "rex" => rex(args, printed, failed),
         "memory" if program.contains(".agent/memory") => Some(Said {
             verb: match args.first().map(String::as_str) {
                 Some("show") | None => "Read the memory indexes".into(),
@@ -69,6 +81,7 @@ pub fn said(command: &str, output: &str, failed: bool) -> Option<Said> {
             what: String::new(),
             under: Vec::new(),
             failed,
+            output: None,
         }),
         "project" if program.contains(".agent/project") => Some(Said {
             verb: match args.first().map(String::as_str) {
@@ -78,6 +91,7 @@ pub fn said(command: &str, output: &str, failed: bool) -> Option<Said> {
             what: args.get(1).cloned().unwrap_or_default(),
             under: Vec::new(),
             failed,
+            output: None,
         }),
         "plan" if program.contains("skills/plan") => plan(args),
         "sonny" if args.first().is_some_and(|a| a == "show") => sonny_show(&args[1..], failed),
@@ -90,13 +104,12 @@ pub fn said(command: &str, output: &str, failed: bool) -> Option<Said> {
         }
         _ => None,
     }?;
-    // Where its output went, unless only cut short.
-    if let Some(piped) = simple
-        .piped
-        .as_deref()
-        .filter(|p| !matches!(p.split_whitespace().next(), Some("head" | "tail")))
-    {
-        said.under.push(dim(format!("| {}", first_line(piped))));
+    // Where its output went, and what came out.
+    if let Some(piped) = piped {
+        said.what = format!("{} | {}", said.what, first_line(piped))
+            .trim_start()
+            .to_owned();
+        said.output = Some(output.to_owned());
     }
     Some(said)
 }
@@ -208,6 +221,7 @@ fn agent(words: &[String], stdin: Option<&str>, output: &str, failed: bool) -> O
             what: String::new(),
             under: Vec::new(),
             failed,
+            output: None,
         });
     }
     // Options may come before the command.
@@ -227,6 +241,7 @@ fn agent(words: &[String], stdin: Option<&str>, output: &str, failed: bool) -> O
             what: String::new(),
             under: Vec::new(),
             failed,
+            output: None,
         });
     };
     let args = Args::new(rest);
@@ -244,6 +259,7 @@ fn agent(words: &[String], stdin: Option<&str>, output: &str, failed: bool) -> O
             what: format!("agent {topic}").trim().to_owned(),
             under: Vec::new(),
             failed,
+            output: None,
         });
     }
     let bot = args.value(&["--bot"]).map(str::to_owned);
@@ -261,6 +277,7 @@ fn agent(words: &[String], stdin: Option<&str>, output: &str, failed: bool) -> O
         what: bot.clone().unwrap_or_default(),
         under: Vec::new(),
         failed: failed || refusal.is_some(),
+        output: None,
     };
     match verb.as_str() {
         "run" => {
@@ -476,6 +493,7 @@ fn rex(words: &[String], output: &str, failed: bool) -> Option<Said> {
         what: String::new(),
         under: Vec::new(),
         failed,
+        output: None,
     };
     let command = args.rest.clone().unwrap_or_default();
     match verb.as_str() {
@@ -546,6 +564,61 @@ fn rex(words: &[String], output: &str, failed: bool) -> Option<Said> {
     Some(said)
 }
 
+/// An Errand call: a command run on another machine, or a look at or
+/// action on a job, by its `peer/ULID` handle.
+fn errand(words: &[String], output: &str, failed: bool) -> Option<Said> {
+    let args = Args::new(words);
+    let mut said = Said {
+        verb: String::new(),
+        what: String::new(),
+        under: Vec::new(),
+        failed,
+        output: None,
+    };
+    if let Some(command) = &args.rest {
+        // Where it runs: the runner named, what it needs, or the default.
+        let place = match (args.value(&["--on"]), args.value(&["--where"])) {
+            (Some("local"), _) => "on a local copy".to_owned(),
+            (Some(peer), _) => format!("on {peer}"),
+            (None, Some(facts)) => format!("where {facts}"),
+            (None, None) => "on Errand".to_owned(),
+        };
+        said.what = format!("{} {place}", first_line(command));
+        if args.has("-d") || args.has("--detach") {
+            said.verb = "Started".into();
+            if let Some(handle) = output.lines().map(str::trim).find(|l| l.contains('/')) {
+                said.under.push(dim(handle.to_owned()));
+            }
+        } else {
+            said.verb = "Ran".into();
+            said.output = Some(output.to_owned());
+        }
+        return Some(said);
+    }
+    let (verb, rest) = args.words.split_first()?;
+    let handle = rest
+        .iter()
+        .find(|w| !w.starts_with('-') && w.contains('/'))
+        .cloned()
+        .unwrap_or_default();
+    said.what = handle;
+    said.verb = match verb.as_str() {
+        "ps" => "Listed Errand jobs",
+        "peers" => "Listed Errand runners",
+        "status" => "Checked Errand job",
+        "attach" => "Read the output of Errand job",
+        "fetch" if args.has("--apply") => "Applied the changes of Errand job",
+        "fetch" => "Fetched the changes of Errand job",
+        "kill" => "Stopped Errand job",
+        _ => return None,
+    }
+    .into();
+    if matches!(verb.as_str(), "attach" | "ps" | "peers") {
+        said.output = Some(output.to_owned());
+    }
+    Some(said)
+}
+
 /// `sonny show`, as where the agent's window went.
 fn sonny_show(words: &[String], failed: bool) -> Option<Said> {
     let (bot, rest) = words.split_first()?;
@@ -567,6 +640,7 @@ fn sonny_show(words: &[String], failed: bool) -> Option<Said> {
         what,
         under: Vec::new(),
         failed,
+        output: None,
     })
 }
 
@@ -577,6 +651,7 @@ fn plan(items: &[String]) -> Option<Said> {
         what: String::new(),
         under: Vec::new(),
         failed: false,
+        output: None,
     };
     if items.iter().any(|i| i == "--clear") {
         said.verb = "Cleared the plan".into();
@@ -622,7 +697,7 @@ mod tests {
             ("Started", "calc.neg")
         );
         assert_eq!(text(&said.under[0]), "Add a negative test.");
-        assert_eq!(text(&said.under[1]), "| jq -r .handle");
+        assert_eq!(said.under.len(), 1);
         let said = said_or_none(
             "\"$AGENT_BIN\" --pretty run --bot calc.lead - <<'EOF'\nDone.\nEOF",
             "",
@@ -716,6 +791,41 @@ Keep the rest.'"#,
         );
         assert_eq!(said.what, "…abcdef");
         assert_eq!(said.under.len(), 4);
+    }
+
+    #[test]
+    fn errand_calls_say_where_they_ran() {
+        let ran = said_or_none("errand --on mac-mini -- cargo test --workspace", "ok\n");
+        assert_eq!(
+            (ran.verb.as_str(), ran.what.as_str()),
+            ("Ran", "cargo test --workspace on mac-mini")
+        );
+        assert_eq!(ran.output.as_deref(), Some("ok\n"));
+        let started = said_or_none(
+            "errand -d --where 'os=linux,gpu' -- python train.py",
+            "gpu-box/01JB2Q8W3V4K\n",
+        );
+        assert_eq!(started.verb, "Started");
+        assert_eq!(started.what, "python train.py where os=linux,gpu");
+        assert_eq!(started.under.len(), 1);
+        let fetched = said_or_none("errand fetch --apply mini/01JB2Q8W3V4K", "");
+        assert_eq!(
+            (fetched.verb.as_str(), fetched.what.as_str()),
+            ("Applied the changes of Errand job", "mini/01JB2Q8W3V4K")
+        );
+        assert!(said("errand doctor", "", false).is_none());
+    }
+
+    #[test]
+    fn a_pipe_shows_what_came_out_of_it() {
+        let listed = said_or_none(
+            r#""$AGENT_BIN" ls | python3 -c 'import sys; print(len(sys.stdin.read()))'"#,
+            "42\n",
+        );
+        assert_eq!(listed.verb, "Listed agents");
+        assert!(listed.what.starts_with("| python3 -c"));
+        assert!(listed.under.is_empty());
+        assert_eq!(listed.output.as_deref(), Some("42\n"));
     }
 
     fn said_or_none(command: &str, output: &str) -> Said {

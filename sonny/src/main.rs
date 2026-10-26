@@ -22,6 +22,7 @@ mod project;
 mod rex;
 mod settings;
 mod shell;
+mod skills;
 mod sound;
 mod status;
 mod table;
@@ -334,7 +335,8 @@ async fn run() -> Result<(), String> {
                 return Err(usage());
             }
             let dir = std::env::current_dir().map_err(|e| e.to_string())?;
-            // Before the lead is made, so its instructions list the skill.
+            // Before the lead is made, so its instructions list the skills.
+            skills::install_errand();
             if options.rex
                 && let Some(bin) = rex::find()
             {

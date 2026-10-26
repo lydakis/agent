@@ -362,22 +362,8 @@ pub fn install_skill(bin: &Path) -> Option<PathBuf> {
     let text = include_str!("../skills/rex-windows/SKILL.md")
         .replace("REX_BIN", &format!("\"{}\"", bin.to_string_lossy()))
         .replace("SONNY_BIN", &format!("\"{}\"", sonny.to_string_lossy()));
-    let pictures = install("pictures", include_str!("../skills/pictures/SKILL.md"));
-    install("rex-windows", &text).or(pictures)
-}
-
-/// A skill of Sonny's in the person's skills, rewritten when it changed.
-fn install(name: &str, text: &str) -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var_os("HOME")?)
-        .join(".agents/skills")
-        .join(name);
-    let path = dir.join("SKILL.md");
-    if std::fs::read_to_string(&path).is_ok_and(|now| now == text) {
-        return None;
-    }
-    std::fs::create_dir_all(&dir).ok()?;
-    std::fs::write(&path, text).ok()?;
-    Some(path)
+    let pictures = crate::skills::install("pictures", include_str!("../skills/pictures/SKILL.md"));
+    crate::skills::install("rex-windows", &text).or(pictures)
 }
 
 #[cfg(test)]

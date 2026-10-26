@@ -773,6 +773,10 @@ fn said_lines(said: crate::calls::Said, width: usize) -> Vec<Line<'static>> {
         };
         out.extend(capped(line, width, lead, 2));
     }
+    // A part of a longer command line has its output shown after the last.
+    if let Some(output) = said.output.filter(|o| !o.trim().is_empty()) {
+        out.extend(preview(&output, width));
+    }
     out
 }
 
