@@ -24,3 +24,10 @@ pub fn install(name: &str, text: &str) -> Option<PathBuf> {
     std::fs::write(&path, text).ok()?;
     Some(path)
 }
+
+/// Take a skill of Sonny's out of the person's skills.
+pub fn remove(name: &str) {
+    if let Some(home) = std::env::var_os("HOME") {
+        let _ = std::fs::remove_dir_all(PathBuf::from(home).join(".agents/skills").join(name));
+    }
+}
