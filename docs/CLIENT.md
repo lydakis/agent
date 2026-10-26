@@ -52,7 +52,8 @@ Implemented 2026-09-19.
    `commondir` files rather than by running git. The app's memory script
    keeps the indexes ([APP.md](APP.md#memory)). They come after the indexes
    because they change more often than the files above, and they are a
-   snapshot: a bot's instructions are fixed when it is made.
+   snapshot: a bot's instructions are fixed when it is made, until a client
+   sends them recomposed with `configure`.
 6. **Role.** A bot started in a profile (`--profile ROLE`, or the app's
    coordinator) gets that body last, under `# Role: ROLE`. The app ships a
    `coordinator` profile ([app/agents/coordinator.md](../app/agents/coordinator.md));

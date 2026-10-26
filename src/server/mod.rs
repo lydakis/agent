@@ -207,6 +207,24 @@ enum Command {
         /// The identity `bot` must hold; another is `bot_not_found`.
         bot_id: Option<i64>,
     },
+    /// Change what a bot's client chose for it when it was made: its
+    /// instructions, recomposed with the skills, memory and folder rules
+    /// added since, and its model (another of its family) and effort level.
+    /// Refused while a turn runs; the next turn uses them.
+    Configure {
+        bot: String,
+        /// The identity `bot` must hold; another is `bot_not_found`.
+        bot_id: Option<i64>,
+        instructions: Option<String>,
+        model: Option<String>,
+        /// With `model`: its effort level; absent is the model's default.
+        effort: Option<String>,
+        /// A root bot's gate, replacing its gates, as `create` takes one;
+        /// `approve: []` alone removes them.
+        approve: Option<Vec<String>>,
+        approver: Option<String>,
+        approve_expire_ms: Option<u64>,
+    },
     Fork {
         source: String,
         /// A node id from the source's history; defaults to its head when it
@@ -972,7 +990,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             return fail_with("duplicate_provider", spec.name.as_str());
         }
         let mut binding = json!({"family":spec.family.name(),"url":spec.url,
-            "transport":spec.transport()});
+            "transport":spec.transport(),"efforts":spec.family.efforts()});
         if let Some(Value::Object(auth)) = auth {
             binding.as_object_mut().expect("object").extend(auth);
         }
@@ -2130,6 +2148,111 @@ impl Service {
                     retention_reply(session, &output, id, result).await;
                 });
                 Err(Error::new("deferred"))
+            }
+            Command::Configure {
+                bot,
+                bot_id,
+                instructions,
+                model,
+                effort,
+                approve,
+                approver,
+                approve_expire_ms,
+            } => {
+                if effort.is_some() && model.is_none() {
+                    return fail_with("invalid_effort", "effort goes with model");
+                }
+                let gate = match (&approve, &approver, approve_expire_ms) {
+                    (None, None, None) => None,
+                    (Some(tools), None, None) if tools.is_empty() => Some(None),
+                    _ => Some(gate(
+                        approve,
+                        approver,
+                        approve_expire_ms,
+                        self.registry.tool_count(),
+                    )?),
+                };
+                if instructions.as_ref().is_some_and(|i| i.len() > 64 * 1024) {
+                    return Err(Error::with(
+                        "instructions_limit",
+                        "instructions may be up to 65536 bytes",
+                    ));
+                }
+                if let Some(active) = self.active.get(&bot) {
+                    return Err(Error::with(
+                        "bot_busy",
+                        format!("turn {} of {bot} is running", active.turn),
+                    )
+                    .facts(json!({"running_turn":active.turn})));
+                }
+                // Another model of the bot's family: its history is kept in
+                // that family's encoding.
+                let model = match model {
+                    Some(reference) => {
+                        let (provider, name) = split_model(&reference)?;
+                        let served = self
+                            .providers
+                            .get(provider)
+                            .ok_or(Error::with("provider_unavailable", provider))?;
+                        let record = store
+                            .op("inspect", {
+                                let bot = bot.clone();
+                                move |db| db.inspect(&bot)
+                            })
+                            .await?;
+                        let family = record.family()?;
+                        if served.family() != family {
+                            return fail_with("provider_family_mismatch", reference.clone());
+                        }
+                        turn::shaped(served, &record.settings)?;
+                        if let Some(level) = &effort {
+                            family.check_effort(level)?;
+                        }
+                        Some((provider.to_owned(), name.to_owned()))
+                    }
+                    None => None,
+                };
+                let answer = store
+                    .op("configure", move |db| {
+                        let id = db.identity(&bot, bot_id)?;
+                        // A parked turn reads the bot again when it resumes.
+                        if let Some(turn) = db.inspect(&bot)?.running_turn {
+                            return Err(Error::with(
+                                "bot_busy",
+                                format!("turn {turn} of {bot} is running"),
+                            )
+                            .facts(json!({"running_turn":turn})));
+                        }
+                        let mut changed = Vec::new();
+                        // First: the one change that may be refused here.
+                        if let Some(gate) = gate
+                            && db.set_gate(&bot, Some(id), gate)?
+                        {
+                            changed.push("gates");
+                        }
+                        if let Some((provider, name)) = &model
+                            && db.set_model(&bot, Some(id), provider, name, effort.as_deref())?
+                        {
+                            changed.push("model");
+                        }
+                        if let Some(instructions) = instructions
+                            && db.set_instructions(&bot, Some(id), &instructions)?
+                        {
+                            changed.push("instructions");
+                        }
+
+                        Ok(json!({"bot":bot,"bot_id":id,"changed":changed}))
+                    })
+                    .await?;
+                // Followers read the bot again; nothing durable to replay.
+                if answer["changed"].as_array().is_some_and(|c| !c.is_empty()) {
+                    let mut event = answer.clone();
+                    event["event"] = json!("configured");
+                    event["durable"] = json!(false);
+                    let bot = answer["bot"].as_str().unwrap_or_default().to_owned();
+                    self.hub.live(&bot, event).await?;
+                }
+                Ok(answer)
             }
             Command::Inspect { bot, bot_id } => {
                 store

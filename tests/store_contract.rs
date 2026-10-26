@@ -10721,3 +10721,193 @@ fn schema_43_bots_were_made_without_a_key() {
     assert_eq!(version, Database::SCHEMA);
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn instructions_are_replaced_and_a_fork_keys_its_own_cache_after() {
+    let mut db = db();
+    let (made, _) = db.create("Ann", None, binding()).unwrap();
+    let (fork, _) = db.fork("Ann", "Ben", Fork::default()).unwrap();
+    assert_eq!(fork.cache_bot(), made.bot_id);
+    db.set_thinking("Ben", 7, Strip::from(3), 0).unwrap();
+    // The same text again changes nothing.
+    assert!(!db.set_instructions("Ben", None, "test").unwrap());
+    assert!(
+        db.set_instructions("Ben", Some(fork.bot_id), "new rules")
+            .unwrap()
+    );
+    let after = db.inspect("Ben").unwrap();
+    assert_eq!(after.instructions, "new rules");
+    assert_eq!(after.cache_bot(), fork.bot_id);
+    // Thinking bound under the old instructions is withheld from now on.
+    assert_eq!(after.thinking_prefix, None);
+    assert_eq!(db.inspect("Ann").unwrap().instructions, "test");
+    // Another identity under the name is refused.
+    let refused = db
+        .set_instructions("Ben", Some(made.bot_id), "x")
+        .unwrap_err();
+    assert_eq!(refused.code, "bot_not_found");
+}
+
+#[test]
+fn a_bot_is_pointed_at_another_model_and_effort() {
+    let mut db = db();
+    db.create("Ann", None, binding()).unwrap();
+    assert!(
+        !db.set_model("Ann", None, "openai", "synthetic-model", None)
+            .unwrap()
+    );
+    assert!(
+        db.set_model("Ann", None, "openai", "other", Some("high"))
+            .unwrap()
+    );
+    let ann = db.inspect("Ann").unwrap();
+    assert_eq!(
+        (ann.model.as_str(), ann.effort.as_deref()),
+        ("other", Some("high"))
+    );
+    assert!(
+        !db.set_model("Ann", None, "openai", "other", Some("high"))
+            .unwrap()
+    );
+    assert!(db.set_model("Ann", None, "openai", "other", None).unwrap());
+    assert_eq!(db.inspect("Ann").unwrap().effort, None);
+}
+
+#[test]
+fn a_root_bot_changes_its_gate_and_a_made_bot_keeps_its_own() {
+    let mut db = db();
+    let ann = db.create("Ann", None, binding()).unwrap().0;
+    let gate = |tool: &str| Gate {
+        tag: "auto".into(),
+        tools: vec![tool.into()],
+        expire_ms: Some(45_000),
+    };
+    assert!(db.set_gate("Ann", None, Some(gate("read"))).unwrap());
+    assert_eq!(db.inspect("Ann").unwrap().gates, [gate("read")]);
+    assert!(!db.set_gate("Ann", None, Some(gate("read"))).unwrap());
+    assert_eq!(
+        db.set_gate("Ann", None, Some(gate("shell")))
+            .unwrap_err()
+            .code,
+        "approve_not_in_tools"
+    );
+    assert!(db.set_gate("Ann", None, None).unwrap());
+    assert!(db.inspect("Ann").unwrap().gates.is_empty());
+    db.create(
+        "Bob",
+        None,
+        Binding {
+            created_by: Some(&ann.name),
+            created_by_id: Some(ann.bot_id),
+            ..binding()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        db.set_gate("Bob", None, None).unwrap_err().code,
+        "gates_inherited"
+    );
+}
+
+#[test]
+fn turns_keep_the_model_they_ran_at_after_the_bot_moves() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    converse(&mut db, "Bob", 1);
+    assert!(
+        db.set_model("Bob", None, "openai", "other", Some("high"))
+            .unwrap()
+    );
+    let next = db
+        .begin(
+            "Bob",
+            "r-next",
+            "next",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    // The finished turn ran at the old model and effort; the new one runs
+    // at the new.
+    let listed = db.turns("Bob", 0, None, 10, false).unwrap();
+    let rows = listed["turns"].as_array().unwrap();
+    assert_eq!(
+        (&rows[0]["model"], &rows[0]["effort"]),
+        (&json!("openai/synthetic-model"), &Value::Null)
+    );
+    assert_eq!(
+        (&rows[1]["model"], &rows[1]["effort"]),
+        (&json!("openai/other"), &json!("high"))
+    );
+    // So it does not take the old model's cache as its own.
+    let context = db.context(next).unwrap();
+    assert_eq!(context.model, "openai/other");
+    assert_eq!(
+        context.previous_call,
+        Some(("openai/synthetic-model".into(), None))
+    );
+}
+
+#[test]
+fn a_keyed_creation_resends_after_its_instructions_change() {
+    let mut db = db();
+    let made = || Binding {
+        request_id: Some("once"),
+        ..binding()
+    };
+    let (bot, _) = db.create("Bob", None, made()).unwrap();
+    assert!(db.set_instructions("Bob", None, "new rules").unwrap());
+    let (again, event) = db.create("Bob", None, made()).unwrap();
+    assert_eq!((again.bot_id, event), (bot.bot_id, None));
+    assert_eq!(again.instructions, "new rules");
+    let changed = Binding {
+        instructions: "new rules",
+        ..made()
+    };
+    assert_eq!(
+        db.create("Bob", None, changed).unwrap_err().code,
+        "idempotency_conflict"
+    );
+}
+
+#[test]
+fn schema_48_creations_keep_the_instructions_they_were_sent_with() {
+    let path = std::env::temp_dir().join(format!("agent-schema48-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let made = || Binding {
+        request_id: Some("once"),
+        ..binding()
+    };
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), made()).unwrap();
+        converse(&mut db, "Bob", 1);
+    }
+    // Before 49 a creation compared the bot's own instructions, and a turn
+    // read the bot's model.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "UPDATE bots SET creation=json_remove(creation,'$.request.instructions');
+             ALTER TABLE turns DROP COLUMN bot_model;
+             ALTER TABLE turns DROP COLUMN bot_reasoning;
+             PRAGMA user_version=48;",
+        )
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert!(db.set_instructions("Bob", None, "new rules").unwrap());
+    assert!(db.set_model("Bob", None, "openai", "other", None).unwrap());
+    let (_, event) = db.create("Bob", Some("/synthetic"), made()).unwrap();
+    assert_eq!(event, None);
+    let listed = db.turns("Bob", 0, None, 10, false).unwrap();
+    assert_eq!(listed["turns"][0]["model"], "openai/synthetic-model");
+    drop(db);
+    let version: i32 = Connection::open(&path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, Database::SCHEMA);
+    std::fs::remove_file(path).unwrap();
+}
