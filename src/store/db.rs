@@ -5234,9 +5234,10 @@ impl Database {
     /// the turn's prompt and each steer it absorbed, in order, with the bot
     /// turn that wrote each (none for a person's words); the calls it
     /// started, with argument previews and whether each failed; then the
-    /// bot's earlier prompts, newest first. Text counts against `bytes` in
-    /// that order, and each steer, call, and earlier prompt also counts
-    /// `PROMPTS_ENTRY`; text that does not fit is cut and marked
+    /// bot's earlier prompts, newest first. The words' text counts against
+    /// `bytes` in that order and the calls' against their own `bytes`, and
+    /// each steer, call, and earlier prompt also counts `PROMPTS_ENTRY`;
+    /// text that does not fit is cut and marked
     /// `truncated`, and `prompts_more`, `calls_more`, and `more` say steers,
     /// calls, and earlier prompts were left out.
     pub fn prompts(&self, name: &str, turn: i64, bytes: usize) -> Result<Value> {
@@ -5319,18 +5320,21 @@ impl Database {
         )?;
         let mut calls = Vec::new();
         let mut calls_more = false;
+        // The calls have their own `bytes`: words that fill theirs still
+        // leave a reader the files the turn wrote.
+        let mut calls_left = bytes;
         let mut rows = started.query([turn])?;
         while let Some(r) = rows.next()? {
-            if left < Self::PROMPTS_ENTRY {
+            if calls_left < Self::PROMPTS_ENTRY {
                 calls_more = true;
                 break;
             }
-            left -= Self::PROMPTS_ENTRY;
+            calls_left -= Self::PROMPTS_ENTRY;
             let data: Value = serde_json::from_str(&r.get::<_, String>(0)?)?;
             let call_id = data["call_id"].as_str().unwrap_or_default().to_owned();
             let mut arguments = data["arguments"].as_str().unwrap_or_default().to_owned();
             let mut truncated = data["arguments_truncated"].as_bool().unwrap_or(false);
-            truncated |= cut(&mut arguments, &mut left);
+            truncated |= cut(&mut arguments, &mut calls_left);
             let mut call = json!({"call_id":call_id,"name":data["name"],"arguments":arguments,
                 "arguments_truncated":truncated,"done":done.contains(&call_id)});
             if failed.contains(&call_id) {

@@ -28,6 +28,10 @@ pub const IN_ROW: u64 = 3;
 pub const IN_TURN: u64 = 20;
 /// How long a tripped turn has to stop on its own before it is interrupted.
 pub const INTERRUPT_AFTER_MS: u64 = 30_000;
+/// The most of a planned write's or edit's text the judge is shown: past it,
+/// each field shows its start and end, with the whole size, and the call is
+/// not allowed on the judge's word alone.
+pub const CHANGE_SHOWN: usize = 64 * 1024;
 
 /// One effect a call may have, and the question asking whether the person
 /// asked for it. The approval channel has no consent: nobody's words make
@@ -295,6 +299,17 @@ pub fn verdict(call: &str, answers: &Value, consent: bool) -> Option<Verdict> {
     })
 }
 
+/// A call's verdict when part of what it writes or runs was not shown: what
+/// the judge would allow is denied, since the part left out may do anything.
+pub fn unseen(verdict: Verdict) -> Verdict {
+    match verdict {
+        Verdict::Allow => Verdict::Deny(format!(
+            "not reviewed whole: part of what it writes or runs is too long to show. {ASK}"
+        )),
+        denied => denied,
+    }
+}
+
 /// Why a round was not judged; the model can tell an outage from a refusal.
 pub fn not_reviewed(why: &str) -> Verdict {
     Verdict::Deny(format!("not reviewed: {why}"))
@@ -337,6 +352,9 @@ pub struct Planned {
     /// Files this turn wrote that the call names, whole, with their paths:
     /// what it would run.
     pub files: Vec<(String, String)>,
+    /// Part of what it writes or runs was too long to show: the judge cannot
+    /// have seen what the left-out part does.
+    pub unseen: bool,
 }
 
 /// A call this turn already ran, and how it ended.
@@ -363,6 +381,9 @@ pub struct Intent {
     /// Calls the turn started were left out of `allowed`, so consent is
     /// not asked.
     pub allowed_cut: bool,
+    /// Words the turn answers to were left out of `request` or cut, so
+    /// consent is not asked: a word left out may be the one that withdrew it.
+    pub request_cut: bool,
     /// Earlier prompts of the bot, newest first. Context, never consent.
     pub earlier: Vec<Words>,
 }
@@ -375,7 +396,7 @@ pub enum State {
         /// Whether the calls already allowed fit, so consent is asked.
         consent: bool,
     },
-    /// The words and calls being judged do not fit.
+    /// The calls being judged do not fit, even with no words.
     TooLong,
 }
 
@@ -393,14 +414,69 @@ fn words(words: &Words, redactor: &Redactor) -> Value {
     json!({"by":by,"text":redactor.redact(&words.text)})
 }
 
+/// `text` within `limit` bytes: whole when it fits, else its start and its
+/// end around a note of how much was left out.
+pub fn clip(text: &str, limit: usize) -> Cow<'_, str> {
+    if text.len() <= limit {
+        return Cow::Borrowed(text);
+    }
+    let mut head = limit / 2;
+    while !text.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = text.len() - limit / 2;
+    while !text.is_char_boundary(tail) {
+        tail += 1;
+    }
+    Cow::Owned(format!(
+        "{}\n[{} bytes not shown]\n{}",
+        &text[..head],
+        tail - head,
+        &text[tail..]
+    ))
+}
+
+/// A planned write's or edit's arguments as the judge is shown them, and
+/// whether they were cut: whole within `CHANGE_SHOWN`, else each text field
+/// redacted, then clipped, and `bytes` the whole text, so a cut cannot leave
+/// a secret's value without what names it. Its path is always whole.
+pub fn shown_change(arguments: &Value, redactor: &Redactor) -> (Value, bool) {
+    let Value::Object(fields) = arguments else {
+        return (arguments.clone(), false);
+    };
+    let text = |(name, value): (&String, &Value)| match (name.as_str(), value) {
+        ("path", _) => 0,
+        (_, Value::String(text)) => text.len(),
+        _ => 0,
+    };
+    let bytes: usize = fields.iter().map(text).sum();
+    if bytes <= CHANGE_SHOWN {
+        return (arguments.clone(), false);
+    }
+    let mut shown: Map<String, Value> = fields
+        .iter()
+        .map(|(name, value)| match (name.as_str(), value) {
+            ("path", _) => (name.clone(), value.clone()),
+            (_, Value::String(text)) => {
+                let text = redactor.redact(text);
+                (name.clone(), json!(clip(&text, CHANGE_SHOWN / 2)))
+            }
+            _ => (name.clone(), value.clone()),
+        })
+        .collect();
+    shown.insert("bytes".into(), json!(bytes));
+    (Value::Object(shown), true)
+}
+
 fn size(value: &Value) -> usize {
     tokens(serde_json::to_string(value).map_or(0, |text| text.len()))
 }
 
 /// Build the state within the judge's limit, in the order the note sets:
-/// the note, the words the turn answers to, and the calls being judged
-/// always; the calls already allowed when they fit (else consent is not
-/// asked); then earlier prompts, newest first, within their share.
+/// the note and the calls being judged always; the words the turn answers
+/// to, newest first, as far as they fit (else consent is not asked); the
+/// calls already allowed when they fit (else consent is not asked); then
+/// earlier prompts, newest first, within their share.
 pub fn build(intent: &Intent, redactor: &Redactor) -> State {
     let mut state = Map::new();
     if let Some(note) = &intent.note {
@@ -409,10 +485,6 @@ pub fn build(intent: &Intent, redactor: &Redactor) -> State {
     if let Some(workspace) = &intent.workspace {
         state.insert("workspace".into(), json!(redactor.redact(workspace)));
     }
-    state.insert(
-        "request".into(),
-        intent.request.iter().map(|w| words(w, redactor)).collect(),
-    );
     state.insert(
         "planned_calls".into(),
         intent
@@ -434,9 +506,50 @@ pub fn build(intent: &Intent, redactor: &Redactor) -> State {
             })
             .collect(),
     );
-    let mut used = size(&Value::Object(state.clone()));
+    // Room for the request's own keys, whatever it holds.
+    let mut used =
+        size(&Value::Object(state.clone())) + size(&json!({"request":[],"request_cut":true}));
     if used > STATE_TOKENS {
         return State::TooLong;
+    }
+    // The newest words first, so whatever is left out is older than all
+    // that is shown; the newest is cut to fit when it alone does not.
+    let mut request = Vec::new();
+    let mut cut = intent.request_cut;
+    for said in intent.request.iter().rev() {
+        let entry = words(said, redactor);
+        let cost = size(&entry) + 1;
+        if used + cost <= STATE_TOKENS {
+            used += cost;
+            request.push(entry);
+            continue;
+        }
+        cut = true;
+        if request.is_empty() {
+            let text = redactor.redact(&said.text);
+            let mut limit = (STATE_TOKENS - used) * 3;
+            loop {
+                let mut entry = entry.clone();
+                entry["text"] = json!(clip(&text, limit.saturating_sub(256)));
+                let cost = size(&entry) + 1;
+                if used + cost <= STATE_TOKENS {
+                    used += cost;
+                    request.push(entry);
+                    break;
+                }
+                // No room for any of it.
+                if limit < 512 {
+                    break;
+                }
+                limit /= 2;
+            }
+        }
+        break;
+    }
+    request.reverse();
+    state.insert("request".into(), Value::Array(request));
+    if cut {
+        state.insert("request_cut".into(), json!(true));
     }
     let allowed: Value = intent
         .allowed
@@ -447,12 +560,12 @@ pub fn build(intent: &Intent, redactor: &Redactor) -> State {
         })
         .collect();
     let cost = size(&allowed);
-    let consent = !intent.allowed_cut && used + cost <= STATE_TOKENS;
+    let consent = !intent.allowed_cut && !cut && used + cost <= STATE_TOKENS;
     if consent {
         used += cost;
         state.insert("already_allowed".into(), allowed);
     }
-    let room = EARLIER_TOKENS.min(STATE_TOKENS - used);
+    let room = EARLIER_TOKENS.min(STATE_TOKENS.saturating_sub(used));
     let mut earlier = Vec::new();
     let mut spent = 0;
     for prompt in &intent.earlier {
@@ -1090,6 +1203,7 @@ mod tests {
                 tool: "shell".into(),
                 arguments: json!({"command":"sh deploy.sh"}),
                 files: vec![("deploy.sh".into(), "make deploy".into())],
+                unseen: false,
             }],
             allowed: vec![Allowed {
                 tool: "shell".into(),
@@ -1097,6 +1211,7 @@ mod tests {
                 status: "succeeded",
             }],
             allowed_cut: false,
+            request_cut: false,
             earlier: vec![person("newer"), person("older")],
         };
         let State::Built { state, consent } = build(&intent, &redactor) else {
@@ -1127,8 +1242,87 @@ mod tests {
         };
         assert!(!consent);
         assert!(state.get("already_allowed").is_none());
-        // Words or calls being judged that do not fit are not judged.
-        intent.request[0].text = "y".repeat(STATE_TOKENS * 3);
+        // Words that do not fit are judged without consent: the newest
+        // kept, cut to fit when it alone does not, older ones left out.
+        intent.allowed[0].arguments = json!({"command":"make test"});
+        intent.request = vec![
+            person(&"o".repeat(STATE_TOKENS * 4)),
+            person(&"n".repeat(STATE_TOKENS * 4)),
+        ];
+        let State::Built { state, consent } = build(&intent, &redactor) else {
+            panic!()
+        };
+        assert!(!consent);
+        assert_eq!(state["request_cut"], true);
+        assert!(state.get("already_allowed").is_none());
+        let [newest] = &state["request"].as_array().unwrap()[..] else {
+            panic!("{}", state["request"])
+        };
+        let text = newest["text"].as_str().unwrap();
+        assert!(text.starts_with('n') && text.ends_with('n') && text.contains("bytes not shown]"));
+        assert!(size(&state) <= STATE_TOKENS);
+        intent.request = vec![
+            person(&"o".repeat(STATE_TOKENS * 4)),
+            person("deploy the site"),
+        ];
+        let State::Built { state, consent } = build(&intent, &redactor) else {
+            panic!()
+        };
+        assert!(!consent);
+        assert_eq!(
+            state["request"],
+            json!([{"by":"person","text":"deploy the site"}])
+        );
+        // Words cut before the state was built count the same.
+        intent.request = vec![person("deploy the site")];
+        intent.request_cut = true;
+        let State::Built { state, consent } = build(&intent, &redactor) else {
+            panic!()
+        };
+        assert!(!consent);
+        assert_eq!(state["request_cut"], true);
+        // Calls being judged that do not fit are not judged.
+        intent.planned[0].arguments = json!({"command":"y".repeat(STATE_TOKENS * 3)});
         assert_eq!(build(&intent, &redactor), State::TooLong);
+    }
+
+    #[test]
+    fn a_long_write_or_text_is_shown_by_its_start_and_end() {
+        assert_eq!(clip("short", 10), "short");
+        assert_eq!(clip("aaaabbbbcccc", 8), "aaaa\n[4 bytes not shown]\ncccc");
+        // Never inside a character.
+        assert_eq!(clip("ééé", 4), "é\n[2 bytes not shown]\né");
+        assert_eq!(clip("ééé", 3), "\n[6 bytes not shown]\n");
+        let small = json!({"path":"src/lib.rs","content":"fn main() {}"});
+        let redactor = Redactor::from_env([]);
+        assert_eq!(shown_change(&small, &redactor), (small, false));
+        let content = "x".repeat(CHANGE_SHOWN * 4);
+        let (shown, cut) = shown_change(&json!({"path":"src/lib.rs","content":content}), &redactor);
+        assert!(cut);
+        assert_eq!(shown["path"], "src/lib.rs");
+        assert_eq!(shown["bytes"], CHANGE_SHOWN * 4);
+        assert!(shown["content"].as_str().unwrap().len() < CHANGE_SHOWN);
+        let (edit, _) = shown_change(
+            &json!({"path":"a.rs","old_string":"y".repeat(CHANGE_SHOWN),"new_string":"z".repeat(CHANGE_SHOWN)}),
+            &redactor,
+        );
+        assert_eq!(edit["bytes"], CHANGE_SHOWN * 2);
+        assert!(
+            edit["new_string"]
+                .as_str()
+                .unwrap()
+                .contains("bytes not shown")
+        );
+        // Redacted before it is cut: a value whose name falls in the part
+        // left out is still found.
+        let secret = ["Zq8vT2nW", "5xK9pL3r", "B7mY4cH6", "jD1fG0sA"].concat();
+        let tail = "b".repeat(CHANGE_SHOWN / 2 - secret.len() - 1);
+        let content = format!("{}password={secret}\n{tail}", "a".repeat(CHANGE_SHOWN));
+        let (shown, _) = shown_change(&json!({"path":"a.env","content":content}), &redactor);
+        assert!(
+            !shown.to_string().contains(&secret),
+            "{}",
+            &shown["content"].as_str().unwrap()[CHANGE_SHOWN / 2..]
+        );
     }
 }

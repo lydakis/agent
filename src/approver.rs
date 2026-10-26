@@ -60,11 +60,12 @@ const IN_FLIGHT: usize = 32;
 const PROMPT_BYTES: usize = 128 * 1024;
 /// How many delegations deep the approver follows up to the person's
 /// words, and how many delegating turns it reads for one round; past either
-/// the round is too long to judge, rather than judged without them.
+/// the words above are left out, and consent is not asked.
 const CHAIN: usize = 8;
 const DELEGATING: usize = 64;
-/// The largest file written this turn that a judged call may run: a call
-/// that runs a larger one is refused rather than judged on its first part.
+/// How much of a file written this turn a judged call that names it is
+/// shown: a larger one only by its size, and the call is not allowed on the
+/// judge's word alone.
 const FILE_BYTES: u64 = 48 * 1024;
 /// The largest answer a decision API may send; a larger one is a failed check.
 const REPLY_BYTES: usize = 64 * 1024;
@@ -856,15 +857,14 @@ async fn judge(
     let intent =
         match tokio::time::timeout_at(deadline.into(), intent(shared, bot, turn, calls)).await {
             Err(_) => return Err(policy::not_reviewed("the approver is overloaded")),
-            Ok(Err(Unjudged::TooLong)) => return Err(policy::not_reviewed("intent too long")),
-            Ok(Err(Unjudged::FileTooLong)) => {
-                return Err(policy::not_reviewed("it runs a file too large to show"));
+            Ok(Err(Unjudged::TooLong)) => {
+                return Err(policy::not_reviewed("the call is too long to show"));
             }
             Ok(Err(Unjudged::Failed)) => return Err(policy::not_reviewed("the check failed")),
             Ok(Ok(intent)) => intent,
         };
     let (state, consent) = match policy::build(&intent, &shared.redactor) {
-        State::TooLong => return Err(policy::not_reviewed("intent too long")),
+        State::TooLong => return Err(policy::not_reviewed("the calls are too long to show")),
         State::Built { state, consent } => (state, consent),
     };
     let ids: Vec<&str> = intent.planned.iter().map(|call| call.id.as_str()).collect();
@@ -880,9 +880,16 @@ async fn judge(
             Err(policy::not_reviewed("the check failed"))
         }
         Judged::Answers { answers, usage } => {
-            let verdicts = ids
+            let verdicts = intent
+                .planned
                 .iter()
-                .map(|id| policy::verdict(id, &answers, consent))
+                .map(|call| {
+                    let verdict = policy::verdict(&call.id, &answers, consent)?;
+                    Some(match call.unseen {
+                        true => policy::unseen(verdict),
+                        false => verdict,
+                    })
+                })
                 .collect::<Option<Vec<_>>>()
                 .ok_or_else(|| policy::not_reviewed("the check failed"))?;
             Ok((verdicts, usage))
@@ -944,39 +951,41 @@ fn preview_path(preview: &str) -> Option<String> {
     }
 }
 
-/// A file the turn wrote, as a judged call that names it would run it:
-/// only a regular file, opened without waiting on a FIFO or device, and
-/// read no further than `FILE_BYTES`, whatever size it reported.
-fn written_file(file: &Path) -> std::result::Result<Option<Vec<u8>>, Unjudged> {
-    use std::io::Read;
+/// A file the turn wrote, as a judged call that names it would run it.
+enum Written {
+    Whole(String),
+    /// Past `FILE_BYTES`, by its size: a part of it shown could not be
+    /// redacted with what names a secret, nor tell what the rest does.
+    TooLong(u64),
+}
+
+/// A file the turn wrote: only a regular file, opened without waiting on a
+/// FIFO or device, whole within `FILE_BYTES`, read no further whatever size
+/// it reported.
+fn written_file(file: &Path) -> Option<Written> {
+    use std::io::{Read, Seek, SeekFrom};
     use std::os::unix::fs::OpenOptionsExt;
-    let Ok(opened) = std::fs::OpenOptions::new()
+    let mut opened = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(file)
-    else {
-        return Ok(None);
-    };
+        .ok()?;
     if !opened.metadata().is_ok_and(|meta| meta.is_file()) {
-        return Ok(None);
+        return None;
     }
-    let mut content = Vec::new();
-    if opened
+    let mut head = Vec::new();
+    (&mut opened)
         .take(FILE_BYTES + 1)
-        .read_to_end(&mut content)
-        .is_err()
-    {
-        return Ok(None);
+        .read_to_end(&mut head)
+        .ok()?;
+    if head.len() as u64 <= FILE_BYTES {
+        return Some(Written::Whole(String::from_utf8_lossy(&head).into_owned()));
     }
-    if content.len() as u64 > FILE_BYTES {
-        return Err(Unjudged::FileTooLong);
-    }
-    Ok(Some(content))
+    Some(Written::TooLong(opened.seek(SeekFrom::End(0)).ok()?))
 }
 
 enum Unjudged {
     TooLong,
-    FileTooLong,
     Failed,
 }
 
@@ -1018,26 +1027,24 @@ async fn intent(
             json!({"bot":bot,"turn":turn,"bytes":PROMPT_BYTES}),
         )
         .await?;
-    // Steers left out may hold the person's latest word.
-    if read["prompts_more"] == true {
-        return Err(Unjudged::TooLong);
-    }
+    // Steers left out may hold the person's latest word: the words are
+    // judged without consent.
+    let mut request_cut = read["prompts_more"] == true;
     let mut request = Vec::new();
     let mut visited = HashSet::from([(bot.to_owned(), turn)]);
     let prompts = read["prompts"].as_array().map_or(&[][..], Vec::as_slice);
     let mut budget = PROMPT_BYTES.saturating_sub(prompt_bytes(prompts));
     for prompt in prompts {
-        if prompt["truncated"] == true {
-            return Err(Unjudged::TooLong);
-        }
-        let text = prompt["text"].as_str().unwrap_or_default().to_owned();
+        request_cut |= prompt["truncated"] == true;
+        let text = prompt_text(prompt);
         match prompt.get("from") {
             None => request.push(Words {
                 by: by_origin(prompt),
                 text,
             }),
             Some(from) => {
-                persons_above(client, from, &mut visited, &mut budget, &mut request).await?;
+                let cut = persons_above(client, from, &mut visited, &mut budget, &mut request);
+                request_cut |= cut.await?;
                 request.push(Words {
                     by: By::Model,
                     text,
@@ -1052,7 +1059,7 @@ async fn intent(
         let whole = call["arguments"].is_object()
             && call["arguments_cut"].as_array().is_none_or(Vec::is_empty)
             && call["arguments_omitted"].as_u64().unwrap_or(0) == 0;
-        let arguments = match whole {
+        let mut arguments = match whole {
             true => call["arguments"].clone(),
             false => {
                 let item = node_item(client, bot, &call["node"]).await?;
@@ -1060,15 +1067,21 @@ async fn intent(
                     .ok_or(Unjudged::Failed)?
             }
         };
+        let tool = call["name"].as_str().unwrap_or_default().to_owned();
+        let mut unseen = false;
+        if matches!(tool.as_str(), "write" | "edit") {
+            (arguments, unseen) = policy::shown_change(&arguments, &shared.redactor);
+        }
         size += arguments.to_string().len();
         if size > PROMPT_BYTES {
             return Err(Unjudged::TooLong);
         }
         planned.push(Planned {
             id: format!("c{}", index + 1),
-            tool: call["name"].as_str().unwrap_or_default().to_owned(),
+            tool,
             arguments,
             files: Vec::new(),
+            unseen,
         });
     }
     let mut allowed = Vec::new();
@@ -1090,13 +1103,24 @@ async fn intent(
             true => match call["node"].as_i64() {
                 Some(_) if expanded >= PROMPT_BYTES && !writes => {
                     allowed_cut = true;
-                    json!(preview)
+                    json!(whole_words(preview))
                 }
-                Some(node) => {
-                    let item = node_item(client, bot, &json!(node)).await?;
-                    policy::call_arguments(&item, call["call_id"].as_str().unwrap_or_default())
-                        .ok_or(Unjudged::Failed)?
-                }
+                Some(node) => match node_item(client, bot, &json!(node)).await {
+                    Ok(item) => {
+                        policy::call_arguments(&item, call["call_id"].as_str().unwrap_or_default())
+                            .ok_or(Unjudged::Failed)?
+                    }
+                    // Too large to read back: as a call with no node.
+                    Err(Unjudged::TooLong) if writes => {
+                        sized = false;
+                        json!({"path":preview_path(preview).ok_or(Unjudged::TooLong)?})
+                    }
+                    Err(Unjudged::TooLong) => {
+                        allowed_cut = true;
+                        json!(whole_words(preview))
+                    }
+                    Err(error) => return Err(error),
+                },
                 // Its path is what a later call needs from it; without it,
                 // no file this turn wrote could be matched.
                 None if writes => {
@@ -1105,7 +1129,7 @@ async fn intent(
                 }
                 None => {
                     allowed_cut = true;
-                    json!(preview)
+                    json!(whole_words(preview))
                 }
             },
         };
@@ -1138,7 +1162,7 @@ async fn intent(
         });
     }
     // A call that names a file this turn wrote is judged with that file
-    // whole, as it is on disk now: what the call would run. One that an
+    // whole, as it is on disk now: what the call would run, or by its size. One that an
     // earlier call of this round writes or edits is not on disk yet as the
     // call will find it, so it points to that call instead.
     let workspace = read["workspace"].as_str().map(PathBuf::from);
@@ -1170,9 +1194,14 @@ async fn intent(
                 .map_or_else(|| PathBuf::from(path), |w| w.join(path));
             // Off the runtime thread: a slow mount must not hold up renewal.
             let read = tokio::task::spawn_blocking(move || written_file(&file));
-            if let Some(content) = read.await.map_err(|_| Unjudged::Failed)?? {
-                call.files
-                    .push((path.clone(), String::from_utf8_lossy(&content).into_owned()));
+            match read.await.map_err(|_| Unjudged::Failed)? {
+                Some(Written::Whole(content)) => call.files.push((path.clone(), content)),
+                Some(Written::TooLong(bytes)) => {
+                    call.files
+                        .push((path.clone(), format!("[{bytes} bytes, too long to show]")));
+                    call.unseen = true;
+                }
+                None => {}
             }
         }
         if matches!(call.tool.as_str(), "write" | "edit")
@@ -1190,7 +1219,7 @@ async fn intent(
                 Some(_) => By::Model,
                 None => by_origin(prompt),
             },
-            text: prompt["text"].as_str().unwrap_or_default().to_owned(),
+            text: prompt_text(prompt),
         })
         .collect();
     Ok(Intent {
@@ -1200,8 +1229,25 @@ async fn intent(
         planned,
         allowed,
         allowed_cut,
+        request_cut,
         earlier,
     })
+}
+
+/// Text the daemon cut at its byte budget ends without the part-word it was
+/// cut in, so the redactor never sees a secret without what marks it: the
+/// `@host` past a URL's password, say.
+fn whole_words(text: &str) -> &str {
+    text.rfind(char::is_whitespace).map_or("", |at| &text[..at])
+}
+
+/// A prompt's text as the judge is shown it.
+fn prompt_text(prompt: &Value) -> String {
+    let text = prompt["text"].as_str().unwrap_or_default();
+    match prompt["truncated"] == true {
+        true => whole_words(text).to_owned(),
+        false => text.to_owned(),
+    }
 }
 
 /// Who wrote a prompt no bot's turn wrote: a person, unless a client sent it
@@ -1218,45 +1264,61 @@ fn by_origin(prompt: &Value) -> By {
 /// wrote it, and so on up to `CHAIN` delegations, in the order they were
 /// written, so a later word from the person still reads as the later one.
 /// A turn that can no longer be read (its bot was deleted) has no person
-/// above it, so nothing there consents.
+/// above it, so nothing there consents. Whether words were left out: past
+/// the chain's limits, or a prompt or steer the read cut or left out.
 async fn persons_above(
     client: &Client,
     from: &Value,
     visited: &mut HashSet<(String, i64)>,
     budget: &mut usize,
     request: &mut Vec<Words>,
-) -> std::result::Result<(), Unjudged> {
+) -> std::result::Result<bool, Unjudged> {
     // Each delegating turn's prompts in order; a model-written one is
     // replaced by the prompts above it, depth first.
     let mut levels: Vec<std::vec::IntoIter<Value>> = Vec::new();
     let mut next = Some(from.clone());
+    let mut cut = false;
     loop {
         if let Some(from) = next.take() {
             if levels.len() >= CHAIN {
-                return Err(Unjudged::TooLong);
-            }
-            if let Some(prompts) = delegated(client, &from, visited, budget).await? {
-                levels.push(prompts.into_iter());
+                cut = true;
+            } else {
+                match delegated(client, &from, visited, budget).await? {
+                    Above::Prompts { prompts, more } => {
+                        cut |= more;
+                        levels.push(prompts.into_iter());
+                    }
+                    Above::None => {}
+                    Above::Cut => cut = true,
+                }
             }
         }
         let Some(level) = levels.last_mut() else {
-            return Ok(());
+            return Ok(cut);
         };
         let Some(prompt) = level.next() else {
             levels.pop();
             continue;
         };
-        if prompt["truncated"] == true {
-            return Err(Unjudged::TooLong);
-        }
+        cut |= prompt["truncated"] == true;
         match prompt.get("from") {
             Some(above) => next = Some(above.clone()),
             None => request.push(Words {
                 by: by_origin(&prompt),
-                text: prompt["text"].as_str().unwrap_or_default().to_owned(),
+                text: prompt_text(&prompt),
             }),
         }
     }
+}
+
+/// What a delegating turn adds above a model-written prompt.
+enum Above {
+    /// Its prompts, and whether steers were left out of them.
+    Prompts { prompts: Vec<Value>, more: bool },
+    /// Read already, or gone.
+    None,
+    /// Past the round's limits: left out.
+    Cut,
 }
 
 /// The prompts of the turn `from` names, unless it was read already or is
@@ -1266,30 +1328,34 @@ async fn delegated(
     from: &Value,
     visited: &mut HashSet<(String, i64)>,
     budget: &mut usize,
-) -> std::result::Result<Option<Vec<Value>>, Unjudged> {
+) -> std::result::Result<Above, Unjudged> {
     let (Some(bot), Some(turn)) = (from["bot"].as_str(), from["turn"].as_i64()) else {
-        return Ok(None);
+        return Ok(Above::None);
     };
     if !visited.insert((bot.to_owned(), turn)) {
-        return Ok(None);
+        return Ok(Above::None);
     }
     if visited.len() > DELEGATING || *budget == 0 {
-        return Err(Unjudged::TooLong);
+        return Ok(Above::Cut);
     }
     match client
         .request("prompts", json!({"bot":bot,"turn":turn,"bytes":*budget}))
         .await
     {
-        // Steers left out may hold that person's latest word.
-        Ok(read) if read["prompts_more"] == true => Err(Unjudged::TooLong),
         Ok(mut read) => Ok(match read["prompts"].take() {
             Value::Array(prompts) => {
                 *budget = budget.saturating_sub(prompt_bytes(&prompts));
-                Some(prompts)
+                // Steers left out may hold that person's latest word.
+                Above::Prompts {
+                    prompts,
+                    more: read["prompts_more"] == true,
+                }
             }
-            _ => None,
+            _ => Above::None,
         }),
-        Err(error) if matches!(error.code.as_str(), "bot_not_found" | "turn_not_found") => Ok(None),
+        Err(error) if matches!(error.code.as_str(), "bot_not_found" | "turn_not_found") => {
+            Ok(Above::None)
+        }
         Err(error) => Err(error.into()),
     }
 }
@@ -1369,22 +1435,38 @@ mod tests {
     }
 
     #[test]
-    fn a_written_file_is_read_only_if_regular_and_within_the_limit() {
+    fn text_the_daemon_cut_ends_on_a_whole_word() {
+        let password = ["Zq8vK2", "mX9pL4", "tR7wY3nB"].concat();
+        // Cut before the `@host` that marks a URL's password.
+        let url = ["https://ci", ":", &password].concat();
+        let cut = json!({"text":format!("deploy with {url}"),"truncated":true});
+        assert_eq!(prompt_text(&cut), "deploy with");
+        let whole = json!({"text":"deploy now"});
+        assert_eq!(prompt_text(&whole), "deploy now");
+        assert_eq!(whole_words("unbroken"), "");
+    }
+
+    #[test]
+    fn a_written_file_is_read_only_if_regular_and_whole_within_the_limit() {
         let dir = std::env::temp_dir().join(format!("agent-written-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let small = dir.join("run.sh");
         std::fs::write(&small, "echo hi\n").unwrap();
-        assert!(matches!(written_file(&small), Ok(Some(content)) if content == b"echo hi\n"));
+        assert!(matches!(written_file(&small), Some(Written::Whole(text)) if text == "echo hi\n"));
+        // A larger one only by its size.
         let large = dir.join("large.sh");
-        std::fs::write(&large, vec![b'#'; FILE_BYTES as usize + 1]).unwrap();
-        assert!(matches!(written_file(&large), Err(Unjudged::FileTooLong)));
+        std::fs::write(&large, "a".repeat(FILE_BYTES as usize + 100)).unwrap();
+        assert!(matches!(
+            written_file(&large),
+            Some(Written::TooLong(bytes)) if bytes == FILE_BYTES + 100
+        ));
         // A FIFO with no writer is skipped, not waited on.
         let fifo = dir.join("fifo");
         let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
         // SAFETY: path is a NUL-terminated string that outlives the call.
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
-        assert!(matches!(written_file(&fifo), Ok(None)));
-        assert!(matches!(written_file(&dir.join("gone")), Ok(None)));
+        assert!(written_file(&fifo).is_none());
+        assert!(written_file(&dir.join("gone")).is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

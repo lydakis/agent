@@ -1079,6 +1079,31 @@ class AutoApproverTests(ModelFixture):
         self.assertEqual(request, [{'by': 'person', 'text': 'delete the build directory'},
                                    {'by': 'model', 'text': 'shell:printf DANGER'}])
 
+    def test_words_too_long_to_show_are_judged_without_consent(self):
+        daemon = self.daemon()
+        daemon.request('create', bot='Carol', workspace=str(self.path), approve=['shell'], approver='auto')
+        self.approver(daemon)
+        # A person's brief longer than the judge is shown, delegated on.
+        brief = 'work through the merge plan ' + 'p' * 200_000
+        person = daemon.request('submit', bot='Bob', request_id='a', prompt=brief)['result']['turn']
+        daemon.finished(person)
+        delegated = daemon.request('submit', bot='Carol', request_id='b', prompt='shell:printf safe > safe',
+                                   **{'from': {'bot': 'Bob', 'turn': person}})['result']['turn']
+        self.assertEqual(daemon.finished(delegated)['data']['status'], 'completed')
+        self.assertEqual((self.path / 'safe').read_text(), 'safe')
+        body = self.judge.requests.get(timeout=5)['body']
+        self.assertTrue(body['state']['request_cut'])
+        self.assertEqual(body['state']['request'][-1], {'by': 'model', 'text': 'shell:printf safe > safe'})
+        self.assertNotIn('already_allowed', body['state'])
+        self.assertFalse([id for id in body['questions'] if id.endswith('_ok')])
+        # A risky call still is not: with no consent asked, it is denied.
+        risky = daemon.request('submit', bot='Carol', request_id='c', prompt='shell:printf DANGER',
+                               **{'from': {'bot': 'Bob', 'turn': person}})['result']['turn']
+        daemon.finished(risky)
+        events = daemon.request('events', bot='Carol', after=0, limit=256)['result']['events']
+        [completed] = [e['data'] for e in events if e['turn'] == risky and e['event'] == 'tool_completed']
+        self.assertTrue(completed.get('denied'), completed)
+
     def test_a_message_a_client_sent_on_its_own_asks_for_nothing(self):
         daemon = self.daemon()
         self.approver(daemon)
@@ -1100,8 +1125,9 @@ class AutoApproverTests(ModelFixture):
         self.judge.answer = shell_danger
         self.model.call_script = [('write', {'path': 'run.sh', 'content': 'printf DANGER'}),
                                   ('shell', {'command': 'sh run.sh'}),
-                                  ('write', {'path': 'big.sh', 'content': 'x' * (49 * 1024)}),
-                                  ('shell', {'command': 'sh ./big.sh'})]
+                                  ('write', {'path': 'big.sh', 'content': 'x' * (49 * 1024) + 'printf ok'}),
+                                  ('shell', {'command': 'sh ./big.sh'}),
+                                  ('write', {'path': 'huge.sh', 'content': 'x' * (65 * 1024) + 'printf ok'})]
         daemon = SocketClient(self.binary, self.path / 'state.sqlite', self.url, 'shell,write')
         self.addCleanup(daemon.close)
         daemon.request('create', bot='Bob', workspace=str(self.path), approve=['shell', 'write'], approver='auto')
@@ -1109,12 +1135,23 @@ class AutoApproverTests(ModelFixture):
         turn = daemon.request('submit', bot='Bob', request_id='a', prompt='script')['result']['turn']
         self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
         self.assertTrue(self.denial(daemon, turn, 'script-1').startswith('judged risky'))
-        self.assertEqual(self.denial(daemon, turn, 'script-3'), 'not reviewed: it runs a file too large to show')
-        asked = [self.judge.requests.get(timeout=5)['body'] for _ in range(3)]
+        # A file too large to show is shown by its size, and what it does is
+        # not known: a call that runs it is not allowed on the judge's word.
+        self.assertTrue(self.denial(daemon, turn, 'script-3').startswith('not reviewed whole'))
+        # Nor is a write too large to show whole.
+        self.assertTrue(self.denial(daemon, turn, 'script-4').startswith('not reviewed whole'))
+        asked = [self.judge.requests.get(timeout=5)['body'] for _ in range(5)]
         [shell] = asked[1]['state']['planned_calls']
         self.assertEqual(shell['files_it_names'], [{'path': 'run.sh', 'content': 'printf DANGER'}])
         self.assertEqual(asked[1]['state']['already_allowed'],
                          [{'tool': 'write', 'arguments': {'path': 'run.sh', 'bytes': 13}, 'status': 'succeeded'}])
+        [write] = asked[2]['state']['planned_calls']
+        self.assertEqual(write['arguments'], {'path': 'big.sh', 'content': 'x' * (49 * 1024) + 'printf ok'})
+        [shell] = asked[3]['state']['planned_calls']
+        self.assertEqual(shell['files_it_names'], [{'path': 'big.sh', 'content': f'[{49 * 1024 + 9} bytes, too long to show]'}])
+        [write] = asked[4]['state']['planned_calls']
+        self.assertEqual((write['arguments']['path'], write['arguments']['bytes']), ('huge.sh', 65 * 1024 + 9))
+        self.assertIn('bytes not shown]', write['arguments']['content'])
 
     def test_an_ungated_write_too_long_to_preview_still_shows_its_file(self):
         def shell_danger(body, id):

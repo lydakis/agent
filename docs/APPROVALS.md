@@ -685,17 +685,34 @@ current turn's prompt and its steers, each marked as a person's or a
 model's words, the calls being judged, the calls already allowed, and
 then earlier prompts newest first until a 16k-token budget is spent. The
 calls being judged are sent whole, read with `history_items` when their preview
-was cut, and so is any file written this turn that one of them runs. So
+was cut, except that a planned `write` or `edit` past 64 KiB of text shows
+each field's start and end with its whole size, redacted before it is cut
+so a cut cannot leave a secret's value without the name that marks it; so
+is any file written this turn that one of them runs, up to 48 KiB, and
+past that only its size. A call with part of what it writes or runs left
+out is not allowed on the judge's word, since the part left out may do
+anything (a script padded past the limit with its payload in the middle):
+what Jev would allow is denied as "not reviewed whole", and a risky one
+is denied as risky. So
 are the already allowed shell and caller-registered calls, since a
 one-time request is used up by a call that did it and a deploy past a
 preview's 2,048 characters would hide that; an allowed `write` or `edit`
 is shown as its path and size, since a file's content is not what
-consent is about. If the calls being judged do not fit, it does not call
-Jev; the call is unclear (step 4), with the reason "not reviewed: intent
-too long". If the already allowed calls do not fit, consent is not
-counted: Jev still judges the risks, a call whose risks are all low can
-be allowed, and a risky one is unclear. A command that runs a file too
-large to show is refused rather than judged on its first part.
+consent is about. If the words do not all fit, the newest are sent and the older left out
+(the newest cut to its start and end if it alone does not fit), with
+`request_cut: true`, and consent is not counted, since a word left out may
+be the one that withdrew it. Text the daemon cut at the read's budget ends
+at its last whole word, so the redactor never sees a secret without what
+marks it (a URL's password cut before its `@host`). `prompts` gives the calls their own budget, so
+words that fill the read still leave the calls that name the files the
+turn wrote. Jev still judges the risks: a call whose
+risks are all low is allowed, and a risky one is unclear. Long-running
+delegated tasks hit this routinely, and refusing every call in them,
+which the approver did until 2026-10-26, stopped ordinary work such as
+`cargo fmt --check`. Only if the calls being judged do not fit on their
+own does it not call Jev; the call is unclear (step 4), with the reason
+"not reviewed: the calls are too long to show". If the already allowed
+calls do not fit, consent is not counted either.
 
 In the stored Harbor trials the first limit never fires: across the
 1,398 rounds that would reach Jev, the prompt plus every planned and
@@ -1186,9 +1203,9 @@ Built on 2026-09-27, the automatic approver:
 
 - `agent approver`: serves a tag, groups each round's calls, reads what
   the judge is shown with `prompts` and `history_items`, follows delegations up to
-  8 turns to the person's words (a deeper chain, more than 64 delegating
-  turns, or more prompt text across them than one 128 KiB read holds, is
-  judged too long), redacts, and asks one judge request per
+  8 turns to the person's words (past a deeper chain, more than 64
+  delegating turns, or more prompt text across them than one 128 KiB read
+  holds, the words are cut and consent is not counted), redacts, and asks one judge request per
   round: Jev over its API or any model through the daemon ([Which model
   judges](#which-model-judges)). A round takes one of 32 judge slots
   before it reads anything, so rounds past those wait holding only their
@@ -1211,21 +1228,20 @@ Where the approver differs from the design above:
   `approval_requested`.
 - A file the turn wrote is shown whole with a call that names it, by its
   path or its file name as a whole word in one of the call's strings, up
-  to 48 KiB counted as it is read, read off the approver's runtime
-  thread; a larger one is refused as "not reviewed: it runs a file too
-  large to show", and one that is no longer a regular file is not read. A
+  to 48 KiB, and past that by its size, read off the approver's runtime
+  thread; one that is
+  no longer a regular file is not read. A
   write or edit that failed shows no file. One planned earlier in the same
   round is named in its place, since it runs first. A call no gate covers
   has no planning `node`, so when its preview was cut its arguments cannot
   be read back: a write or edit is matched by the path its preview holds,
   with its size unknown, and is judged too long if the preview ends before
-  the path; any other such call keeps its preview and consent is not
+  the path (as is an allowed write too large to read back, over 1 MiB); any other such call keeps its preview and consent is not
   counted.
 - A general model is asked the same questions as text, each with what
   makes it yes or no, and answers them as one JSON object.
-- A turn whose steers do not all fit the `prompts` read is denied as
-  "intent too long", since the person's latest word may be the one left
-  out. A model judge's tag is at most 87 bytes, so its forks' names fit.
+- A turn whose steers do not all fit the `prompts` read is judged
+  without consent, since the person's latest word may be the one left out. A model judge's tag is at most 87 bytes, so its forks' names fit.
 
 Not built yet: the app's cards and the app's own approver, and a labeled
 set of calls that should not run, to measure false allows. Follow-ups
