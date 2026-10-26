@@ -544,8 +544,12 @@ async fn run() -> Result<(), String> {
             .or(bot["workspace"].as_str().map(PathBuf::from)),
         options.lookout.as_deref() != Some("off"),
     ) {
-        let lead_model = bot["model"].as_str().unwrap_or_default();
-        match lookout::choose(&app.client, options.lookout.as_deref(), lead_model).await {
+        let lead_model = format!(
+            "{}/{}",
+            bot["provider"].as_str().unwrap_or_default(),
+            bot["model"].as_str().unwrap_or_default()
+        );
+        match lookout::choose(&app.client, options.lookout.as_deref(), &lead_model).await {
             Ok(judge) => lookout::spawn(
                 options.socket.clone(),
                 project.clone(),

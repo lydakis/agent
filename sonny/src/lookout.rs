@@ -707,14 +707,29 @@ async fn model_turn(
     Ok((answers, tokens))
 }
 
-/// Delete a judge's fork, ending its turn first if it still runs.
+/// Delete a judge's fork, ending its turn first if it still runs. One
+/// that stays is deleted when the next Sonny starts, as a stale fork.
 async fn remove(client: &Client, name: &str, running: Option<i64>) {
     if let Some(turn) = running {
         let _ = client
             .request("interrupt", json!({"bot": name, "turn": turn}))
             .await;
+        let _ = client
+            .request(
+                "wait",
+                json!({"handles": [format!("turn:{name}/{turn}")], "timeout_ms": 5_000}),
+            )
+            .await;
     }
     let _ = client.request("delete", json!({"bot": name})).await;
+}
+
+/// A lookout judge or one of its forks, `lookout.HASH[.PID.N]`: never a
+/// task, even in a project named `lookout`.
+fn judge_bot(name: &str) -> bool {
+    name.strip_prefix("lookout.")
+        .and_then(|rest| rest.split('.').next())
+        .is_some_and(|hash| hash.len() == 12 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// Forks of `base` whose Sonny is gone: named `BASE.PID.N`, for a PID no
@@ -1154,7 +1169,7 @@ impl Lookout {
             .await
         {
             for bot in page["bots"].as_array().into_iter().flatten() {
-                if let Some(name) = bot["name"].as_str() {
+                if let Some(name) = bot["name"].as_str().filter(|name| !judge_bot(name)) {
                     self.lineage.insert(name.to_owned());
                 }
             }
@@ -1206,7 +1221,9 @@ impl Lookout {
         match kind {
             "created" | "forked" => {
                 let by = event["data"]["created_by"].as_str().unwrap_or("");
-                if self.lineage.contains(by) || bot.starts_with(&format!("{}.", self.project)) {
+                if (self.lineage.contains(by) || bot.starts_with(&format!("{}.", self.project)))
+                    && !judge_bot(bot)
+                {
                     self.lineage.insert(bot.to_owned());
                 }
             }
@@ -1694,8 +1711,9 @@ pub async fn replay() -> Result<(), String> {
                 let (Some(name), by) = (bot["name"].as_str(), bot["created_by"].as_str()) else {
                     continue;
                 };
-                if name.starts_with(&format!("{project}."))
-                    || by.is_some_and(|by| lookout.lineage.contains(by))
+                if (name.starts_with(&format!("{project}."))
+                    || by.is_some_and(|by| lookout.lineage.contains(by)))
+                    && !judge_bot(name)
                 {
                     lookout.lineage.insert(name.to_owned());
                 }
@@ -2458,6 +2476,21 @@ mod tests {
             Some("claude-haiku-5-5")
         );
         assert_eq!(small_model(&json!({"models": []}), lead), None);
+    }
+
+    #[test]
+    fn judges_are_never_tasks() {
+        let mut lookout = lookout();
+        lookout.project = "lookout".into();
+        for bot in [
+            "lookout.9838f5b69ce1",
+            "lookout.9838f5b69ce1.42.0",
+            "lookout.fix",
+        ] {
+            lookout.lineage_of(&json!({"event": "created", "bot": bot, "data": {}}));
+        }
+        assert!(lookout.lineage.contains("lookout.fix"));
+        assert!(!lookout.lineage.iter().any(|bot| judge_bot(bot)));
     }
 
     #[test]
