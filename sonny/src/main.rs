@@ -2517,12 +2517,33 @@ impl App {
                 "sandfs" => "tasks get sandfs copies".into(),
                 _ => "tasks get git worktrees".into(),
             });
-            // The lead is told now when idle, else once its turn ends.
+            // The lead is told now when idle, else once its turn ends,
+            // unless its instructions were set some other way.
             if self.project.is_some() {
-                match project::instructions(std::path::Path::new(&self.workspace)) {
-                    Ok(text) => {
+                let bot = match self
+                    .client
+                    .request("inspect", json!({"bot": self.bot}))
+                    .await
+                {
+                    Ok(bot) => bot,
+                    Err(error) => {
+                        self.notice = Some(format!("the lead's instructions: {error}"));
+                        return;
+                    }
+                };
+                let dir = std::path::Path::new(&self.workspace);
+                match project::review(dir, &bot, &self.lead, false) {
+                    Ok(project::Instructions::Stale(text)) => {
                         self.instruct = Some(text);
                         self.configure().await;
+                    }
+                    Ok(project::Instructions::Current) => {}
+                    Ok(project::Instructions::Kept) => {
+                        self.notice = Some(
+                            "the lead keeps instructions set outside its folder's files; \
+                             /instructions takes the folder's"
+                                .into(),
+                        )
                     }
                     Err(error) => self.notice = Some(format!("the lead's instructions: {error}")),
                 }
