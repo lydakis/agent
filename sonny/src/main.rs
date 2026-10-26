@@ -408,7 +408,7 @@ async fn run() -> Result<(), String> {
         .request("follow", json!({"bot": name, "after": 0}))
         .await
         .map_err(|e| e.to_string())?;
-    caught_up(&mut events).await;
+    let context = caught_up(&mut events).await;
     let bot = client
         .request("inspect", json!({"bot": name}))
         .await
@@ -425,6 +425,7 @@ async fn run() -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     let mut app = App::new(client, &name, &bot, options.clone());
+    app.context = context;
     app.sounds = sound::Sounds::new(options.sound);
     app.sounds.chime = settings::Settings::load().chime;
     // A bot keeps the model it was made with; --model runs this window's
@@ -619,15 +620,32 @@ fn status_report(state: &str, bot: &str) {
 
 /// Read past a follow's replay as it arrives, so a long one cannot fill
 /// the client's queue and cut the stream before it goes live.
-async fn caught_up(events: &mut Events) {
+/// Skip the replay of a follow up to its live events; returns how big the
+/// context was after the last model round it held, when it held one.
+async fn caught_up(events: &mut Events) -> Option<u64> {
+    let mut context = None;
     let replay = async {
         while let Some(event) = events.recv().await {
             if event["event"] == "follow_live" {
                 return;
             }
+            if let Some(size) = context_after(&event) {
+                context = Some(size);
+            }
         }
     };
     let _ = tokio::time::timeout(Duration::from_secs(30), replay).await;
+    context
+}
+
+/// What the next model round reads after a `usage` event's round: that
+/// round's input and what it wrote. A compaction's own round is not the
+/// conversation's.
+fn context_after(event: &Value) -> Option<u64> {
+    let data = &event["data"];
+    (event["event"] == "usage" && data["purpose"].is_null()).then(|| {
+        data["input_tokens"].as_u64().unwrap_or(0) + data["output_tokens"].as_u64().unwrap_or(0)
+    })
 }
 
 /// The reply being written: lines are committed as they end, and the line
@@ -679,7 +697,9 @@ struct App {
     workspace: String,
     model: String,
     effort: Option<String>,
-    tokens_used: u64,
+    /// How big the conversation was after its last model round, as the
+    /// next round reads it, once known.
+    context: Option<u64>,
     input: String,
     /// Lines waiting to be written into scrollback.
     pending: Vec<Line<'static>>,
@@ -1198,7 +1218,7 @@ impl App {
             workspace: record["workspace"].as_str().unwrap_or("").to_owned(),
             model,
             effort: record["effort"].as_str().map(str::to_owned),
-            tokens_used: record["tokens_used"].as_u64().unwrap_or(0),
+            context: None,
             input: String::new(),
             pending: Vec::new(),
             skipped: 0,
@@ -1544,17 +1564,17 @@ impl App {
                 .request("follow", json!({"bot": self.bot, "after": 0}))
                 .await
                 .map_err(|e| e.to_string())?;
-            caught_up(&mut fresh).await;
+            let context = caught_up(&mut fresh).await;
             // Read after the replay, so a turn that ends meanwhile arrives
             // as an event rather than lost between the two.
             let record = client
                 .request("inspect", json!({"bot": self.bot}))
                 .await
                 .map_err(|e| e.to_string())?;
-            Ok::<_, String>((client, fresh, record))
+            Ok::<_, String>((client, fresh, record, context))
         };
         if self.down {
-            let Ok((client, fresh, record)) = lead.await else {
+            let Ok((client, fresh, record, context)) = lead.await else {
                 self.retry = Some(Instant::now() + Duration::from_secs(2));
                 return;
             };
@@ -1562,7 +1582,7 @@ impl App {
             *events = fresh;
             self.down = false;
             self.notice = None;
-            self.tokens_used = record["tokens_used"].as_u64().unwrap_or(self.tokens_used);
+            self.context = context.or(self.context);
             self.history_after(self.seen_node).await;
             let now = record["running_turn"].as_i64();
             // A turn that ended while away ends here as its event would have.
@@ -2078,8 +2098,9 @@ impl App {
                 }
             }
             "usage" => {
-                self.tokens_used += data["input_tokens"].as_u64().unwrap_or(0)
-                    + data["output_tokens"].as_u64().unwrap_or(0);
+                if let Some(size) = context_after(&event) {
+                    self.context = Some(size);
+                }
             }
             "turn_finished" => {
                 if self.running.as_ref().is_some_and(|r| Some(r.turn) != turn) {
@@ -3119,11 +3140,12 @@ impl App {
         if let Some(mode) = self.gating {
             left.push_str(&format!(" · {mode} approvals when idle"));
         }
-        let right = format!(
-            "{} · {} tokens  ",
-            self.bot,
-            transcript::tokens(self.tokens_used)
-        );
+        // The context, not what the bot ever spent: how full the next
+        // round is.
+        let right = match self.context {
+            Some(size) => format!("{} · {} context  ", self.bot, transcript::tokens(size)),
+            None => format!("{}  ", self.bot),
+        };
         // A long folder keeps its end, the part that tells folders apart.
         let room = width.saturating_sub(left.width() + right.width() + 4);
         let mut folder = folder.as_str();
@@ -3392,6 +3414,24 @@ mod tests {
         let two = "**Checking the tests**\n\nThey pass.\n\n**Reading the README";
         assert_eq!(heading(two), Some("Checking the tests"));
         assert_eq!(heading(&format!("{two}**\n")), Some("Reading the README"));
+    }
+
+    #[test]
+    fn the_footer_shows_the_context_not_what_was_ever_spent() {
+        let usage = |input: u64, output: u64, purpose: Option<&str>| {
+            json!({"event": "usage", "bot": "b", "turn": 1,
+                "data": {"input_tokens": input, "output_tokens": output,
+                    "cached_input_tokens": input / 2, "purpose": purpose}})
+        };
+        // Three rounds of one turn: each reads the whole conversation again.
+        assert_eq!(context_after(&usage(40_000, 900, None)), Some(40_900));
+        assert_eq!(context_after(&usage(41_000, 2_000, None)), Some(43_000));
+        // A compaction's own round reads the old window to summarize it.
+        assert_eq!(
+            context_after(&usage(120_000, 3_000, Some("compaction"))),
+            None
+        );
+        assert_eq!(context_after(&json!({"event": "text_delta"})), None);
     }
 
     #[test]
