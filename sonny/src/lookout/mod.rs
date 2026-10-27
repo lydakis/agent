@@ -178,6 +178,7 @@ pub struct Seen {
     /// How the turn ended, for `Ended`.
     pub status: Option<String>,
     /// The history node holding the words, for `Said`: none while queued.
+    /// For `Quiet`, which silence in the turn, so each one is its own note.
     pub node: Option<i64>,
     /// The call waiting on approval, for `Waiting`.
     pub call: Option<String>,
@@ -951,6 +952,9 @@ struct Checked {
     tokens: u64,
     ms: u128,
     text: String,
+    /// Words with no sender that repeat the lead's own brief: not quoted
+    /// as the person's.
+    unattributed: bool,
 }
 
 /// The memory indexes the lead starts with, as they stand now.
@@ -1125,6 +1129,10 @@ async fn check(
         return Err(Failure::Duplicate);
     }
     let brief = brief(client, &seen.task, seen.brief).await;
+    let unattributed = seen.kind == Kind::Said
+        && seen.from.as_deref() == Some(PERSON)
+        && !text.trim().is_empty()
+        && text.trim() == brief.trim();
     let mut roster = Vec::new();
     for (task, node) in seen.peers.iter().take(ROSTER) {
         roster.push(Peer {
@@ -1158,6 +1166,7 @@ async fn check(
         tokens,
         ms: started.elapsed().as_millis(),
         text,
+        unattributed,
     })
 }
 
@@ -1256,6 +1265,7 @@ async fn serve(settings: Settings) -> Result<(), String> {
         lookouts: HashMap::new(),
         judges: HashMap::new(),
         log: PathBuf::from(log),
+        seated: 0,
     };
     println!(
         "{}",
@@ -1286,6 +1296,9 @@ struct Service {
     /// By spec; `None` once a spec failed to parse or ran out of quota.
     judges: HashMap<String, Option<Arc<Judge>>>,
     log: PathBuf,
+    /// Lookouts made so far: each one's own number, so a check that answers
+    /// after its lead was deleted reaches no later lead of the name.
+    seated: u64,
 }
 
 /// The project a lead heads: `shop` for `shop.lead`.
@@ -1295,16 +1308,18 @@ fn lead_project(name: &str) -> Option<&str> {
 
 impl Service {
     async fn watch(&mut self, client: Arc<Client>, mut events: agent_client::Events) {
+        // Judges are picked before the replay starts: a model listing can
+        // take seconds, and a replay nobody reads fills the connection.
+        let bots = all_bots(&client).await;
+        for bot in &bots {
+            self.seat(&client, bot, true).await;
+        }
         if client
             .request("follow", json!({"bot": "*", "after": 0}))
             .await
             .is_err()
         {
             return;
-        }
-        let bots = all_bots(&client).await;
-        for bot in &bots {
-            self.seat(&client, bot).await;
         }
         let listed: HashSet<String> = (bots.iter())
             .filter_map(|b| b["name"].as_str().map(str::to_owned))
@@ -1336,7 +1351,8 @@ impl Service {
                     {
                         let mut record = event["data"].clone();
                         record["name"] = json!(name);
-                        self.seat(&client, &record).await;
+                        // Its judge is picked once the stream is live.
+                        self.seat(&client, &record, live).await;
                         if live && let Some(lookout) = self.lookouts.get_mut(name) {
                             lookout.updates.live = true;
                         }
@@ -1359,10 +1375,23 @@ impl Service {
                             lookout.due.clear();
                             lookout.checked.clear();
                         }
+                        if live {
+                            let unpicked: Vec<Value> = (self.lookouts.values())
+                                .filter(|l| l.unpicked)
+                                .map(|l| l.record.clone())
+                                .collect();
+                            for record in unpicked {
+                                self.seat(&client, &record, true).await;
+                            }
+                        }
                         continue;
                     }
                 }
-                Some((lead, seen, answered)) = results.recv() => {
+                Some((lead, id, seen, answered)) = results.recv() => {
+                    // From a lookout since deleted.
+                    if self.lookouts.get(&lead).is_none_or(|l| l.id != id) {
+                        continue;
+                    }
                     let quota = matches!(answered, Err(Failure::Quota));
                     let spent = self.lookouts.get(&lead).and_then(|l| l.judge.as_ref()).map(|j| j.name.clone());
                     if quota && let Some(name) = spent {
@@ -1399,10 +1428,10 @@ impl Service {
                 {
                     let (client, done) = (client.clone(), done.clone());
                     let (memory, recent) = (memory(&lookout.workspace), lookout.recent.clone());
-                    let lead = lookout.lead.clone();
+                    let (lead, id) = (lookout.lead.clone(), lookout.id);
                     tokio::spawn(async move {
                         let answered = check(&client, &judge, &seen, &memory, &recent).await;
-                        let _ = done.send((lead, seen, answered)).await;
+                        let _ = done.send((lead, id, seen, answered)).await;
                     });
                 }
                 lookout.wake(&client).await;
@@ -1411,15 +1440,31 @@ impl Service {
     }
 
     /// A lead as `bots` lists it or `created` says it: its lookout, made
-    /// once, judged by the judge `pick` chooses for its model.
-    async fn seat(&mut self, client: &Client, record: &Value) {
+    /// once, judged by the judge `pick` chooses for its model. With `pick`
+    /// false, or when picking failed, its judge is picked later.
+    async fn seat(&mut self, client: &Client, record: &Value, pick: bool) {
         let Some(lead) = record["name"].as_str() else {
             return;
         };
         let Some(project) = lead_project(lead) else {
             return;
         };
-        if self.lookouts.contains_key(lead) {
+        if !self.lookouts.contains_key(lead) {
+            let workspace = PathBuf::from(record["workspace"].as_str().unwrap_or("/"));
+            let mut lookout = Lookout::new(project, lead, workspace, None);
+            self.seated += 1;
+            lookout.id = self.seated;
+            lookout.log = Some(self.log.clone());
+            lookout.record = record.clone();
+            lookout.unpicked = true;
+            // What changed in the person's and the project's memory rides
+            // along with the task updates.
+            let memory =
+                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agents/memory"));
+            lookout.updates = updates::Updates::new(lead, project, memory);
+            self.lookouts.insert(lead.to_owned(), lookout);
+        }
+        if !pick || !self.lookouts[lead].unpicked {
             return;
         }
         let model = format!(
@@ -1427,26 +1472,22 @@ impl Service {
             record["provider"].as_str().unwrap_or_default(),
             record["model"].as_str().unwrap_or_default()
         );
-        let judge = match pick(client, self.judge.as_deref(), &model).await {
-            Ok(Some(spec)) => self.judge_for(&spec, lead),
-            Ok(None) => None,
+        let (judge, unpicked) = match self::pick(client, self.judge.as_deref(), &model).await {
+            Ok(Some(spec)) => (self.judge_for(&spec, lead), false),
+            Ok(None) => (None, false),
+            // Tried again on the next connection.
             Err(why) => {
                 self.write(&json!({"at_ms": epoch_ms(), "lead": lead, "no_judge": why}));
-                None
+                (None, true)
             }
         };
         // Said once a lead is watched, so `/status` shows it from the start.
         self.write(&json!({"at_ms": epoch_ms(), "lead": lead, "seated": true,
             "judge": judge.as_ref().map(|j| j.name.clone())}));
-        let workspace = PathBuf::from(record["workspace"].as_str().unwrap_or("/"));
-        let mut lookout = Lookout::new(project, lead, workspace, judge);
-        lookout.log = Some(self.log.clone());
-        // What changed in the person's and the project's memory rides along
-        // with the task updates.
-        let memory =
-            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agents/memory"));
-        lookout.updates = updates::Updates::new(lead, project, memory);
-        self.lookouts.insert(lead.to_owned(), lookout);
+        if let Some(lookout) = self.lookouts.get_mut(lead) {
+            lookout.judge = judge;
+            lookout.unpicked = unpicked;
+        }
     }
 
     /// The judge a spec names, made once and shared by every lead it judges.
@@ -1556,8 +1597,13 @@ fn append(path: &std::path::Path, line: &Value) {
 }
 
 struct Lookout {
+    /// This lookout's own number in the service.
+    id: u64,
     /// `None` when no judge is set or it cannot answer: nothing is checked.
     judge: Option<Arc<Judge>>,
+    /// Its judge is still to be picked, from the lead's record.
+    unpicked: bool,
+    record: Value,
     /// The news the lead hears unjudged.
     updates: updates::Updates,
     /// Checks answered low since the last note: a count, not news.
@@ -1578,6 +1624,8 @@ struct Lookout {
     /// Each task's running turn, when it last printed anything, and
     /// whether that silence was checked already.
     quiet: HashMap<String, (i64, Instant, bool)>,
+    /// Silences checked so far.
+    silences: i64,
     /// Steers waiting to be absorbed, by task and steer turn: who sent it,
     /// or `None` for the lead.
     steers: HashMap<(String, i64), Option<String>>,
@@ -1609,7 +1657,10 @@ struct Lookout {
 impl Lookout {
     fn new(project: &str, lead: &str, workspace: PathBuf, judge: Option<Arc<Judge>>) -> Self {
         Lookout {
+            id: 0,
             judge,
+            unpicked: false,
+            record: Value::Null,
             updates: updates::Updates::new(lead, project, None),
             dropped: 0,
             project: project.to_owned(),
@@ -1620,6 +1671,7 @@ impl Lookout {
             waiting_any: false,
             approvals: HashMap::new(),
             quiet: HashMap::new(),
+            silences: 0,
             steers: HashMap::new(),
             denied: HashMap::new(),
             checked: HashSet::new(),
@@ -1871,7 +1923,9 @@ impl Lookout {
             })
             .collect();
         for (task, turn) in due {
-            self.due(&task, turn, Kind::Quiet, None, None, None);
+            self.silences += 1;
+            let spell = Some(self.silences);
+            self.due(&task, turn, Kind::Quiet, None, None, spell);
         }
     }
 
@@ -1981,6 +2035,10 @@ impl Lookout {
                     self.held_since.get_or_insert_with(Instant::now);
                     let seen = Seen {
                         text: checked.text,
+                        from: match checked.unattributed {
+                            true => Some("someone".to_owned()),
+                            false => seen.from,
+                        },
                         ..seen
                     };
                     self.held.push(Item {
@@ -2057,12 +2115,13 @@ impl Lookout {
             .iter()
             .map(|item| {
                 let seen = &item.seen;
-                // Two approvals in one turn are two notes.
-                let call = seen
-                    .call
-                    .as_deref()
-                    .map(|c| format!("/{c}"))
-                    .unwrap_or_default();
+                // Two approvals in one turn are two notes, and so are two
+                // silences.
+                let call = match (seen.kind, &seen.call, seen.node) {
+                    (_, Some(call), _) => format!("/{call}"),
+                    (Kind::Quiet, _, Some(spell)) => format!("/{spell}"),
+                    _ => String::new(),
+                };
                 format!("{}/{}/{:?}{call}", seen.task, seen.turn, seen.kind)
             })
             .collect();
@@ -2565,6 +2624,7 @@ mod tests {
                 tokens: 0,
                 ms: 0,
                 text: String::new(),
+                unattributed: false,
             }),
         );
         assert_eq!(lookout.held.len(), 1);
@@ -2583,6 +2643,7 @@ mod tests {
                 tokens: 0,
                 ms: 0,
                 text: String::new(),
+                unattributed: false,
             }),
         );
         assert!(lookout.held.is_empty());
@@ -2912,6 +2973,7 @@ mod tests {
                 tokens: 1,
                 ms: 1,
                 text: "done".into(),
+                unattributed: false,
             })
         };
         lookout.answered(seen(1), checked(&[("stuck", 0.1)]));
