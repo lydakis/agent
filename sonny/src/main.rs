@@ -1641,7 +1641,9 @@ impl App {
                 }
             }
         }
-        if !busy {
+        // The lead's own change still waiting: an agent it makes meanwhile
+        // takes its old gate, so this goes on until both are set.
+        if !busy && self.gating.is_none() {
             self.spread = None;
         }
     }

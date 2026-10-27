@@ -589,10 +589,12 @@ so only one instance runs at a time, and answers in layers:
    on a prompt or steer, this turn's or an earlier one's), so a plain
    "yes" or "approved" right after a refusal asks for what was refused,
    and one that came before it does not. A bare go-ahead is read against
-   the question it answers: the bot's last message before the turn
-   (`reply` in `prompts`) comes first in `request`, as the model's words,
-   so a "yes" to "shall I run the tests?" does not ask for a deploy
-   refused earlier. A call that redoes a refused one another way (`curl`
+   the question it answers: the bot's last message before the turn, and
+   before each steer (`reply` in `prompts`), comes right before those
+   words in `request`, as the model's words, so a "yes" to "shall I run
+   the tests?" does not ask for a deploy refused earlier. Jev, which gets
+   only the questions, has the trust and retry rules in each risk
+   question's criteria. A call that redoes a refused one another way (`curl`
    for a refused `git clone`, the same brief moved into a file) is judged
    as the refused one was. Messages to the agent's caller
    (`$AGENT_PARENT`) or to agents it runs never count as a send. A lead passing the person's go-ahead on to a

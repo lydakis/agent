@@ -93,8 +93,9 @@ pub fn made_by<'a>(bots: &'a [Value], lead: &str) -> Vec<&'a Value> {
     made
 }
 
-/// The `configure` fields that give a bot `mode`, or `None` when it has
-/// that mode already, as `gate` would make it now.
+/// The `configure` fields that give a bot `mode`, or `None` when its gate
+/// is already the one `gate` makes: the same approver over the same tools,
+/// with no expiry.
 pub fn regate(record: &Value, mode: &str) -> Option<Map<String, Value>> {
     let tools: Vec<String> = record["tools"]
         .as_array()
@@ -104,11 +105,28 @@ pub fn regate(record: &Value, mode: &str) -> Option<Map<String, Value>> {
         .map(str::to_owned)
         .collect();
     let fields = gate(mode, &tools);
-    let ungated = fields["approve"].as_array().is_some_and(Vec::is_empty);
-    let has = match ungated {
-        true => self::mode(record) == Some("full"),
-        false => self::mode(record) == Some(mode) && refresh(record).is_none(),
+    let wanted = match fields.get("approver") {
+        Some(tag) => vec![json!({"tag": tag, "tools": fields["approve"]})],
+        None => Vec::new(),
     };
+    let gates = record["gates"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let sorted = |tools: &Value| {
+        let mut tools: Vec<String> = tools
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect();
+        tools.sort();
+        tools
+    };
+    let has = gates.len() == wanted.len()
+        && gates.iter().zip(&wanted).all(|(gate, want)| {
+            gate["tag"] == want["tag"]
+                && sorted(&gate["tools"]) == sorted(&want["tools"])
+                && gate["expire_ms"].is_null()
+        });
     (!has).then_some(fields)
 }
 
@@ -183,5 +201,12 @@ mod tests {
         let reader = json!({"name": "r", "tools": ["read"], "gates": []});
         assert_eq!(regate(&reader, "auto"), None);
         assert!(regate(&reader, "ask").is_some());
+        // The same tag over fewer tools, or one that lapses, is set again.
+        let partial = json!({"tools": ["shell", "read", "write"],
+            "gates": [{"tag": "manual", "tools": ["shell"]}]});
+        assert!(regate(&partial, "ask").is_some());
+        let lapsing = json!({"tools": ["shell", "read"],
+            "gates": [{"tag": "auto", "tools": ["shell"], "expire_ms": 45000}]});
+        assert!(regate(&lapsing, "auto").is_some());
     }
 }

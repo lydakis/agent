@@ -1071,14 +1071,9 @@ async fn intent(
     };
     let mut request = Vec::new();
     let mut visited = HashSet::from([(bot.to_owned(), turn)]);
-    let prompts = read["prompts"].as_array().map_or(&[][..], Vec::as_slice);
-    let mut budget = PROMPT_BYTES.saturating_sub(prompt_bytes(prompts));
-    // What the bot asked before this turn: what a short "yes" answers.
-    if let Some(reply) = reply_words(&read["reply"]) {
-        budget = budget.saturating_sub(reply.text.len());
-        request.push(reply);
-    }
-    for prompt in prompts {
+    let prompts = with_replies(read["prompts"].as_array().cloned().unwrap_or_default());
+    let mut budget = PROMPT_BYTES.saturating_sub(prompt_bytes(&prompts));
+    for prompt in &prompts {
         left_out.cut(prompt);
         let text = prompt_text(prompt);
         match prompt.get("from") {
@@ -1289,14 +1284,17 @@ async fn intent(
     })
 }
 
-/// The bot's last message before a turn, as a `prompts` read gives it: its
-/// model's words.
-fn reply_words(reply: &Value) -> Option<Words> {
-    Some(Words {
-        by: By::Model,
-        text: reply["text"].as_str()?.to_owned(),
-        refused: Vec::new(),
-    })
+/// A `prompts` read's words with the bot's message before each, its
+/// `reply`, as its model's words: what a short "yes" answers.
+fn with_replies(prompts: Vec<Value>) -> Vec<Value> {
+    let mut words = Vec::with_capacity(prompts.len());
+    for prompt in prompts {
+        if let Some(text) = prompt["reply"]["text"].as_str() {
+            words.push(json!({"text":text,"origin":"reply"}));
+        }
+        words.push(prompt);
+    }
+    words
 }
 
 /// The calls a `prompts` read lists as refused after a prompt or steer.
@@ -1448,11 +1446,8 @@ async fn delegated(
         .await
     {
         Ok(mut read) => Ok(match read["prompts"].take() {
-            Value::Array(mut prompts) => {
-                // What that bot asked before the turn, as its model's words.
-                if let Some(text) = read["reply"]["text"].as_str() {
-                    prompts.insert(0, json!({"text":text,"origin":"reply"}));
-                }
+            Value::Array(prompts) => {
+                let prompts = with_replies(prompts);
                 *budget = budget.saturating_sub(prompt_bytes(&prompts));
                 // Steers left out may hold that person's latest word.
                 Above::Prompts {

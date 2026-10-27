@@ -10836,8 +10836,7 @@ fn a_turn_reads_with_the_message_its_words_answer() {
     let first = begin(&mut db, "r1");
     // A bot that never answered asks nothing.
     assert!(
-        db.prompts("Bob", first, 64 * 1024)
-            .unwrap()
+        db.prompts("Bob", first, 64 * 1024).unwrap()["prompts"][0]
             .get("reply")
             .is_none()
     );
@@ -10852,15 +10851,14 @@ fn a_turn_reads_with_the_message_its_words_answer() {
     db.finish(first, None).unwrap();
     let second = begin(&mut db, "r2");
     // The last message, its end kept and starting at a whole word.
-    let reply = &db.prompts("Bob", second, 64 * 1024).unwrap()["reply"];
-    assert_eq!(reply["turn"], first);
+    let reply = &db.prompts("Bob", second, 64 * 1024).unwrap()["prompts"][0]["reply"];
     assert_eq!(reply["truncated"], true);
     let text = reply["text"].as_str().unwrap();
     assert!(text.ends_with("Shall I run the tests?") && text.starts_with("word "));
     assert!(text.len() <= 2048);
     // It counts against the words' budget like any text.
     let read = db.prompts("Bob", second, 3 + 12).unwrap();
-    assert_eq!(read["reply"]["text"], "the tests?");
+    assert_eq!(read["prompts"][0]["reply"]["text"], "the tests?");
     db.finish(second, None).unwrap();
     // A secret is redacted before the end is kept, so a key whose opening
     // line falls outside it is not shown either.
@@ -10872,8 +10870,27 @@ fn a_turn_reads_with_the_message_its_words_answer() {
     db.append(third, vec![assistant(&key)], &[], None).unwrap();
     db.finish(third, None).unwrap();
     let fourth = begin(&mut db, "r4");
-    let reply = &db.prompts("Bob", fourth, 64 * 1024).unwrap()["reply"];
+    let reply = &db.prompts("Bob", fourth, 64 * 1024).unwrap()["prompts"][0]["reply"];
     assert_eq!(reply["text"], "[secret: private key]\nShall I use it?");
+    // A steer answers what the bot said since the words before it, and
+    // only that.
+    let steer = |db: &mut Database, key: &str| {
+        let steer = TurnOptions {
+            delivery: Delivery::Steer,
+            ..TurnOptions::default()
+        };
+        db.begin("Bob", key, "yes", true, &steer, allow_provider)
+            .unwrap();
+        db.absorb(fourth, None, 8 << 20, 4096, ContextUsage::default(), false)
+            .unwrap();
+    };
+    db.append(fourth, vec![assistant("Shall I deploy?")], &[], None)
+        .unwrap();
+    steer(&mut db, "s1");
+    steer(&mut db, "s2");
+    let read = db.prompts("Bob", fourth, 64 * 1024).unwrap();
+    assert_eq!(read["prompts"][1]["reply"]["text"], "Shall I deploy?");
+    assert!(read["prompts"][2].get("reply").is_none());
 }
 
 #[test]

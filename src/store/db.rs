@@ -5304,8 +5304,10 @@ impl Database {
     /// turn that wrote each (none for a person's words); the calls it
     /// started, with argument previews and whether each failed; then the
     /// bot's earlier prompts, newest first. Each prompt or steer carries
-    /// the calls refused after it (`refused`), and `reply` is the end of
-    /// the bot's last message before the turn. The words' text counts against
+    /// the calls refused after it (`refused`), and this turn's carry the
+    /// end of the bot's last message before them (`reply`): its last of
+    /// the turn before for the prompt, one since the previous words for a
+    /// steer. The words' text counts against
     /// `bytes` in that order and the calls' against their own `bytes`, and
     /// each steer, call, and earlier prompt also counts `PROMPTS_ENTRY`;
     /// text that does not fit is cut and marked
@@ -5343,21 +5345,34 @@ impl Database {
             return fail("turn_not_found");
         };
         let mut left = bytes;
-        let mut prompts = vec![prompt_entry(turn, text, from, from_turn, origin, &mut left)];
-        // What the bot last said before the prompt: what a person's short
+        let mut first = prompt_entry(turn, text, from, from_turn, origin, &mut left);
+        // What the bot last said before the words: what a person's short
         // answer, such as "yes", answers.
-        let reply = self.reply_before(name, turn, &mut left)?;
+        let previous: Option<i64> = self
+            .conn
+            .prepare_cached(
+                "SELECT id FROM turns WHERE bot=? AND id<? AND started_ms IS NOT NULL ORDER BY id DESC LIMIT 1",
+            )?
+            .query_row(params![name, turn], |r| r.get(0))
+            .optional()?;
+        if let Some(previous) = previous
+            && let Some(reply) = self.reply(previous, 0, i64::MAX, &mut left)?
+        {
+            first["reply"] = reply;
+        }
+        let mut prompts = vec![first];
         let mut prompts_more = false;
         let mut steers = self.conn.prepare_cached(
-            "SELECT json_extract(data,'$.steer') FROM events WHERE turn=? AND kind='steered' ORDER BY id",
+            "SELECT json_extract(data,'$.steer'),id FROM events WHERE turn=? AND kind='steered' ORDER BY id",
         )?;
+        let mut since = 0;
         let mut steer = self.conn.prepare_cached(
             "SELECT CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END,
                 t.from_bot,t.from_turn,t.origin
              FROM turns t LEFT JOIN nodes n ON n.id=t.prompt_node WHERE t.id=?",
         )?;
-        for id in steers.query_map([turn], |r| r.get::<_, i64>(0))? {
-            let id = id?;
+        for row in steers.query_map([turn], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
+            let (id, steered) = row?;
             let (text, from, from_turn, origin) = steer.query_row([id], |r| {
                 Ok((
                     r.get::<_, Option<String>>(0)?,
@@ -5373,6 +5388,10 @@ impl Database {
             left -= Self::PROMPTS_ENTRY;
             let mut entry = prompt_entry(id, text, from, from_turn, origin, &mut left);
             entry["steer"] = json!(true);
+            if let Some(reply) = self.reply(turn, since, steered, &mut left)? {
+                entry["reply"] = reply;
+            }
+            since = steered;
             prompts.push(entry);
         }
         let mut failed = std::collections::HashSet::new();
@@ -5460,33 +5479,22 @@ impl Database {
                 }
             }
         }
-        let mut read = json!({"bot":name,"turn":turn,"status":turn_status_name(&status),"workspace":workspace,
-            "prompts":prompts,"prompts_more":prompts_more,"calls":calls,"calls_more":calls_more,"earlier":earlier,"more":more});
-        if let Some(reply) = reply {
-            read["reply"] = reply;
-        }
-        Ok(read)
+        Ok(
+            json!({"bot":name,"turn":turn,"status":turn_status_name(&status),"workspace":workspace,
+            "prompts":prompts,"prompts_more":prompts_more,"calls":calls,"calls_more":calls_more,"earlier":earlier,"more":more}),
+        )
     }
-    /// The last message of the bot's turn before `turn`, as `{turn, text}`
-    /// with its end kept: at most `PROMPTS_REPLY` bytes, or the budget
-    /// left, starting at a whole word when cut (`truncated`).
-    fn reply_before(&self, name: &str, turn: i64, left: &mut usize) -> Result<Option<Value>> {
-        let previous: Option<i64> = self
-            .conn
-            .prepare_cached(
-                "SELECT id FROM turns WHERE bot=? AND id<? AND started_ms IS NOT NULL ORDER BY id DESC LIMIT 1",
-            )?
-            .query_row(params![name, turn], |r| r.get(0))
-            .optional()?;
-        let Some(previous) = previous else {
-            return Ok(None);
-        };
+    /// The last message `turn` streamed between two of its events, as
+    /// `{text}` with its end kept: at most `PROMPTS_REPLY` bytes, or the
+    /// budget left, starting at a whole word when cut (`truncated`).
+    fn reply(&self, turn: i64, after: i64, before: i64, left: &mut usize) -> Result<Option<Value>> {
         let node = self
             .conn
             .prepare_cached(
-                "SELECT json_extract(data,'$.node') FROM events WHERE turn=? AND kind='message' ORDER BY id DESC LIMIT 1",
+                "SELECT json_extract(data,'$.node') FROM events
+                 WHERE turn=? AND kind='message' AND id>? AND id<? ORDER BY id DESC LIMIT 1",
             )?
-            .query_row([previous], |r| r.get::<_, Option<i64>>(0))
+            .query_row(params![turn, after, before], |r| r.get::<_, Option<i64>>(0))
             .optional()?
             .flatten();
         let Some(node) = node else {
@@ -5513,7 +5521,7 @@ impl Database {
         }
         let shown = text[start..].trim_start();
         *left -= shown.len().min(*left);
-        let mut reply = json!({"turn":previous,"text":shown});
+        let mut reply = json!({"text":shown});
         if truncated {
             reply["truncated"] = json!(true);
         }

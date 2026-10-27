@@ -592,8 +592,10 @@ class PromptReadTests(ModelFixture):
                                 **{'from': {'bot': 'Bob', 'turn': first}})['result']['turn']
         self.assertEqual(client.finished(second)['data']['status'], 'completed')
         read = client.request('prompts', bot='Bob', turn=second, bytes=1024)['result']
+        # With what the bot said last before it: what a short answer answers.
         self.assertEqual(read['prompts'], [{'turn': second, 'text': 'done',
-                                            'from': {'bot': 'Bob', 'turn': first}}])
+                                            'from': {'bot': 'Bob', 'turn': first},
+                                            'reply': {'text': 'echo:{"exit_code":3,"stderr":"","stdout":"","success":false}'}}])
         self.assertEqual(read['earlier'], [{'turn': first, 'text': 'shell:exit 3'}])
         self.assertEqual((read['status'], read['workspace'], read['more']), ('finished', str(self.path), False))
         self.assertEqual(client.request('prompts', bot='Bob', turn=second, bytes=0)['error'], 'invalid_limit')
