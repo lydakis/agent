@@ -7,7 +7,7 @@ import textwrap
 import unittest
 
 
-WORKFLOWS = Path(__file__).resolve().parents[2] / ".github" / "workflows"
+WORKFLOWS = Path(__file__).resolve().parents[1] / ".github" / "workflows"
 
 
 def workflow_step(name, workflow="release.yml"):
@@ -48,27 +48,8 @@ class TriggerTest(unittest.TestCase):
                 self.assertIn("github.event.workflow_run.conclusion == 'success'", text)
 
 
-class SdkTest(unittest.TestCase):
-    def run_check(self, version):
-        with tempfile.TemporaryDirectory() as bin_dir:
-            xcrun = Path(bin_dir) / "xcrun"
-            xcrun.write_text(f"#!/bin/sh\necho {version}\n")
-            xcrun.chmod(0o755)
-            env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
-            return subprocess.run(["bash", "-euo", "pipefail", "-c",
-                                   workflow_step("Check the macOS SDK")],
-                                  env=env, capture_output=True, text=True)
-
-    def test_the_app_is_built_with_the_macos_26_sdk_or_later(self):
-        # An older SDK gives the app the pre-26 separate title bar.
-        self.assertIn("runs-on: macos-26", (WORKFLOWS / "release.yml").read_text())
-        for version, ok in [("15.5", False), ("26.0", True), ("26.2", True), ("27.0", True)]:
-            with self.subTest(sdk=version):
-                self.assertEqual(self.run_check(version).returncode == 0, ok)
-
-
 class LinuxBuildTest(unittest.TestCase):
-    def test_static_linux_builds_join_the_draft_the_mac_build_made(self):
+    def test_static_linux_builds_join_the_draft_the_package_job_made(self):
         workflow = (WORKFLOWS / "release.yml").read_text()
         job = workflow[workflow.index("\n  linux:\n"):]
         self.assertIn("needs: [resolve, package]", job)
@@ -76,8 +57,8 @@ class LinuxBuildTest(unittest.TestCase):
             self.assertIn(f"- runner: {runner}\n            arch: {arch}", job)
         self.assertIn('target="${ARCH}-unknown-linux-musl"', job)
         self.assertIn('gh release upload "$RELEASE_TAG"', job)
-        # No signing secret reaches it.
-        self.assertNotIn("secrets.APP", job)
+        # Nothing is signed: no Apple secret reaches any job.
+        self.assertNotIn("secrets.APP", workflow)
 
 
 class SourceFormulaTest(unittest.TestCase):
@@ -117,10 +98,9 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.git("tag", "v2.0.0")
         self.git("switch", "main")
 
-    def commit(self, version, app_version=None):
+    def commit(self, version, sonny_version=None):
         for manifest, value in [("Cargo.toml", version),
-                                ("app/src-tauri/Cargo.toml", app_version or version),
-                                ("sonny/Cargo.toml", version)]:
+                                ("sonny/Cargo.toml", sonny_version or version)]:
             path = self.root / manifest
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(f'[package]\nname = "x"\nversion = "{value}"\n\n[dependencies]\n')
@@ -184,11 +164,11 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.git("tag", "v1.2.0", self.main)
         result = self.gate("v1.2.0")
         self.assertIn("Cargo.toml has version 1.1.0, not 1.2.0", result.stderr)
-        self.commit("1.3.0", app_version="1.2.0")
+        self.commit("1.3.0", sonny_version="1.2.0")
         self.git("tag", "v1.3.0")
         self.git("update-ref", "refs/remotes/origin/main", "HEAD")
         result = self.gate("v1.3.0")
-        self.assertIn("app/src-tauri/Cargo.toml has version 1.2.0, not 1.3.0", result.stderr)
+        self.assertIn("sonny/Cargo.toml has version 1.2.0, not 1.3.0", result.stderr)
         self.assertFalse(self.output.exists())
 
     def test_unmerged_or_missing_tag_cannot_publish_a_commit(self):

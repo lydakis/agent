@@ -7,7 +7,8 @@ import hashlib
 from pathlib import Path
 import re
 
-from homebrew_cask import VERSION
+
+VERSION = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?"
 
 
 def archive_name(version: str) -> str:

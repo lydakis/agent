@@ -11,30 +11,25 @@ import subprocess
 import sys
 import tempfile
 
-import homebrew_cask
 import homebrew_formula
 
 
 STABLE_VERSION = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
 
-# What the tap gets from a release: the app's cask, and the formulas for
-# the daemon and Sonny, both built from the source archive. Each with its
-# archive, the file the release carries, its renderer, what its generator
-# is told before the version, and where the tap's file says its version.
+# What the tap gets from a release: the formulas for the daemon and Sonny,
+# both built from the source archive. Each with its archive, the file the
+# release carries, its renderer, what its generator is told before the
+# version, and where the tap's file says its version.
 KINDS = {
-    "cask": ("agent", homebrew_cask.archive_name, "agent.rb", homebrew_cask.render_cask, [],
-             r'^  version "(' + STABLE_VERSION + r')"$'),
-    **{
-        name: (name, homebrew_formula.archive_name, f"{name}-formula.rb",
-               functools.partial(homebrew_formula.render_formula, name), [name],
-               r'/releases/download/v(' + STABLE_VERSION + r')/')
-        for name in homebrew_formula.FORMULAS
-    },
+    name: (name, homebrew_formula.archive_name, f"{name}-formula.rb",
+           functools.partial(homebrew_formula.render_formula, name), [name],
+           r'/releases/download/v(' + STABLE_VERSION + r')/')
+    for name in homebrew_formula.FORMULAS
 }
 
 
 def prepare_update(tag: str, metadata: Path, assets: Path, current: Path,
-                   *, commit: str, generator: Path | None = None, kind: str = "cask"):
+                   *, commit: str, kind: str, generator: Path | None = None):
     name, archive_name, published, render, generator_args, current_version = KINDS[kind]
     match = re.fullmatch("v" + STABLE_VERSION, tag)
     if not match:
@@ -52,30 +47,30 @@ def prepare_update(tag: str, metadata: Path, assets: Path, current: Path,
             raise ValueError("malformed or duplicate checksum entry")
         checksums[entry[2]] = entry[1]
     archive = assets / archive_name(version)
-    cask_path = assets / published
+    published_path = assets / published
     source = assets / "source-commit.txt"
-    for path in [archive, cask_path, source]:
+    for path in [archive, published_path, source]:
         if checksums.get(path.name) != hashlib.sha256(path.read_bytes()).hexdigest():
             raise ValueError(f"checksum mismatch or missing checksum for {path.name}")
     # A draft's tag can move after its assets were built: publish only what
     # the tag's current commit built.
     if not re.fullmatch(r"[0-9a-f]{40}", commit) or source.read_text() != commit + "\n":
         raise ValueError("release assets were not built from the tag's commit")
-    cask = render(version, archive).encode()
-    expected_release_cask = cask
+    formula = render(version, archive).encode()
+    expected_release_formula = formula
     if generator is not None:
         with tempfile.TemporaryDirectory() as directory:
             expected = Path(directory) / published
             subprocess.run([sys.executable, str(generator), *generator_args, version,
                             str(archive), str(expected)], check=True)
-            expected_release_cask = expected.read_bytes()
-    if cask_path.read_bytes() != expected_release_cask:
+            expected_release_formula = expected.read_bytes()
+    if published_path.read_bytes() != expected_release_formula:
         raise ValueError(f"release {published} does not match the generated {kind} for this archive")
 
     request = {
         "message": f"Update {name} to {version}",
         "branch": "main",
-        "content": base64.b64encode(cask).decode(),
+        "content": base64.b64encode(formula).decode(),
     }
     if current.exists():
         previous = current.read_bytes()
@@ -84,16 +79,16 @@ def prepare_update(tag: str, metadata: Path, assets: Path, current: Path,
             raise ValueError(f"current {published} must have one stable version")
         previous_version = tuple(map(int, versions[0][1:]))
         next_version = tuple(map(int, match.groups()))
-        if previous_version > next_version or previous == cask:
+        if previous_version > next_version or previous == formula:
             return None
         if previous_version == next_version:
-            raise ValueError("refusing to replace a different cask with the same version")
+            raise ValueError(f"refusing to replace a different {kind} formula with the same version")
         # GitHub requires the previous Git blob ID to guard against concurrent edits.
         request["sha"] = hashlib.sha1(
             b"blob " + str(len(previous)).encode() + b"\0" + previous
         ).hexdigest()
     current.parent.mkdir(parents=True, exist_ok=True)
-    current.write_bytes(cask)
+    current.write_bytes(formula)
     return request
 
 
@@ -108,8 +103,8 @@ def main():
                         help="the commit the release tag resolves to now")
     parser.add_argument("--generator", type=Path,
                         help="release tag's generator, used to verify immutable assets")
-    parser.add_argument("--kind", choices=sorted(KINDS), default="cask",
-                        help="the app's cask, or the daemon's or Sonny's formula")
+    parser.add_argument("--kind", choices=sorted(KINDS), required=True,
+                        help="the daemon's formula or Sonny's")
     args = parser.parse_args()
     args.request.unlink(missing_ok=True)
     try:

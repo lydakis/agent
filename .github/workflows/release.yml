@@ -1,10 +1,11 @@
 name: Release
 
-# Builds the signed, notarized desktop app for a version tag and leaves it as
-# a draft release. Publishing the draft is the human step; publish-homebrew.yml
-# then updates the tap. A tag push starts release-request.yml, and this runs
-# after it from main's definition, so a tag's own commit never reaches the
-# signing secrets. Re-run a failed release from this workflow's run.
+# Packages a version tag's source and its Homebrew formulas, and static Linux
+# builds of Sonny and its daemon, as a draft release. Publishing the draft is
+# the human step; publish-homebrew.yml then updates the tap. A tag push
+# starts release-request.yml, and this runs after it from main's definition,
+# so a tag's own commit never reaches the release's write token. Re-run a
+# failed release from this workflow's run.
 
 on:
   workflow_run:
@@ -60,9 +61,9 @@ jobs:
             echo 'Release tag must point to a commit on main' >&2
             exit 1
           fi
-          # The bundle takes the app crate's version, `agent --version` the
-          # runtime's and `sonny --version` Sonny's; all must be the tag's.
-          for manifest in Cargo.toml app/src-tauri/Cargo.toml sonny/Cargo.toml; do
+          # `agent --version` takes the runtime's version and `sonny
+          # --version` Sonny's; both must be the tag's.
+          for manifest in Cargo.toml sonny/Cargo.toml; do
             version=$(git show "$commit:$manifest" | python3 -c \
               'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["package"]["version"])')
             if [ "v$version" != "$RELEASE_TAG" ]; then
@@ -74,10 +75,9 @@ jobs:
 
   package:
     needs: resolve
-    # The SDK an app links against picks its window chrome on macOS 26: one
-    # built with an older SDK keeps the separate, pre-26 title bar.
+    # Triggers run on launchd, so the tests run where they do.
     runs-on: macos-26
-    timeout-minutes: 90
+    timeout-minutes: 60
     permissions:
       contents: write
       id-token: write
@@ -104,134 +104,17 @@ jobs:
             echo 'Release tag changed after approval' >&2
             exit 1
           fi
-      - name: Check the macOS SDK
-        run: |
-          sdk=$(xcrun --sdk macosx --show-sdk-version)
-          if [ "${sdk%%.*}" -lt 26 ]; then
-            echo "Release builds need the macOS 26 SDK or later; found $sdk" >&2
-            exit 1
-          fi
-          echo "macOS SDK $sdk"
-      - name: Install Rust targets
-        # rust-toolchain.toml pins the toolchain; both Mac architectures ship.
-        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - name: Test
         run: |
-          python3 -m unittest discover -s app/release
-          node --test app/tests/state.test.cjs
+          python3 -m unittest discover -s release
           cargo test --locked --workspace
-      - name: Install the Tauri CLI
-        # From the committed lockfile, before any signing material exists.
-        run: npm ci --ignore-scripts --prefix app/release
-      - name: Build the daemon for both architectures
-        run: |
-          # Tauri bundles externalBin binaries/agent as Contents/MacOS/agent.
-          # A universal build checks each architecture's sidecar, then
-          # bundles the universal one.
-          mkdir -p app/src-tauri/binaries
-          for target in aarch64-apple-darwin x86_64-apple-darwin; do
-            cargo build --release --locked --bin agent --target "$target"
-            cp ".local/target/$target/release/agent" "app/src-tauri/binaries/agent-$target"
-          done
-          lipo -create -output app/src-tauri/binaries/agent-universal-apple-darwin \
-            .local/target/aarch64-apple-darwin/release/agent \
-            .local/target/x86_64-apple-darwin/release/agent
-      - name: Prepare Apple signing credentials
-        env:
-          APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64 }}
-          APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD }}
-          APPLE_DEVELOPER_ID_APPLICATION: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION }}
-          APP_STORE_CONNECT_API_KEY_P8: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}
-          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
-          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
-        run: |
-          for name in APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64 APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD \
-            APPLE_DEVELOPER_ID_APPLICATION APP_STORE_CONNECT_API_KEY_P8 \
-            APP_STORE_CONNECT_KEY_ID APP_STORE_CONNECT_ISSUER_ID; do
-            if [ -z "${!name}" ]; then
-              echo "Missing required signing secret: $name" >&2
-              exit 1
-            fi
-          done
-          umask 077
-          signing_dir="$RUNNER_TEMP/agent-signing"
-          mkdir "$signing_dir"
-          export AGENT_SIGNING_KEYCHAIN="$signing_dir/signing.keychain-db"
-          export AGENT_NOTARY_KEY="$signing_dir/notary.p8"
-          python3 - <<'PY'
-          import base64, os
-          from pathlib import Path
-          directory = Path(os.environ["AGENT_SIGNING_KEYCHAIN"]).parent
-          (directory / "certificate.p12").write_bytes(base64.b64decode(
-              os.environ["APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64"], validate=True))
-          Path(os.environ["AGENT_NOTARY_KEY"]).write_text(os.environ["APP_STORE_CONNECT_API_KEY_P8"])
-          PY
-          keychain_password="$(openssl rand -base64 32)"
-          echo "::add-mask::$keychain_password"
-          security create-keychain -p "$keychain_password" "$AGENT_SIGNING_KEYCHAIN"
-          security set-keychain-settings -lut 3600 "$AGENT_SIGNING_KEYCHAIN"
-          security unlock-keychain -p "$keychain_password" "$AGENT_SIGNING_KEYCHAIN"
-          security import "$signing_dir/certificate.p12" -k "$AGENT_SIGNING_KEYCHAIN" \
-            -P "$APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
-            -k "$keychain_password" "$AGENT_SIGNING_KEYCHAIN" >/dev/null
-          # codesign must be able to discover the temporary signing keychain.
-          security list-keychains -d user -s "$AGENT_SIGNING_KEYCHAIN" "$HOME/Library/Keychains/login.keychain-db"
-          python3 - <<'PY_SIGNING'
-          import os, re, subprocess
-          result = subprocess.run([
-              "security", "find-identity", "-v", "-p", "codesigning",
-              os.environ["AGENT_SIGNING_KEYCHAIN"],
-          ], check=True, capture_output=True, text=True)
-          identities = re.findall(r'^\s*\d+\) ([0-9A-F]{40}) "([^"\n]+)"', result.stdout, re.M)
-          expected = os.environ["APPLE_DEVELOPER_ID_APPLICATION"].strip()
-          matches = [(fingerprint, name) for fingerprint, name in identities
-                     if expected in (fingerprint, name)]
-          if len(matches) != 1:
-              raise SystemExit(f"Signing identity preflight failed: {len(identities)} valid identities, "
-                               f"{len(matches)} match the configured identity. Check certificate validity, "
-                               "issuer chain, and APPLE_DEVELOPER_ID_APPLICATION.")
-          with open(os.environ["GITHUB_ENV"], "a") as output:
-              output.write("AGENT_SIGNING_IDENTITY=" + matches[0][0] + "\n")
-          print("Configured signing identity is valid and available in the CI keychain.")
-          PY_SIGNING
-          rm "$signing_dir/certificate.p12"
-          echo "AGENT_NOTARY_KEY=$AGENT_NOTARY_KEY" >> "$GITHUB_ENV"
-      - name: Build, sign, and notarize the app
-        working-directory: app/src-tauri
-        env:
-          # Tauri signs the app and its bundled daemon with the hardened
-          # runtime, submits the bundle for notarization, and staples it.
-          APPLE_SIGNING_IDENTITY: ${{ env.AGENT_SIGNING_IDENTITY }}
-          APPLE_API_ISSUER: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
-          APPLE_API_KEY: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
-          APPLE_API_KEY_PATH: ${{ env.AGENT_NOTARY_KEY }}
-        run: |
-          ../release/node_modules/.bin/tauri build --ci --target universal-apple-darwin \
-            --bundles app --config tauri.release.conf.json
-      - name: Package the app and cask, and verify them
+      - name: Package the source and formulas, and verify them
         env:
           RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
           RELEASE_COMMIT: ${{ needs.resolve.outputs.commit }}
         run: |
           version="${RELEASE_TAG#v}"
-          app=.local/target/universal-apple-darwin/release/bundle/macos/Agent.app
-          codesign --verify --deep --strict --verbose=2 "$app"
-          spctl --assess --type execute --verbose=2 "$app"
-          xcrun stapler validate "$app"
-          for binary in agent-app agent; do
-            archs=" $(lipo -archs "$app/Contents/MacOS/$binary") "
-            [[ "$archs" == *" arm64 "* && "$archs" == *" x86_64 "* ]]
-          done
-          test "$("$app/Contents/MacOS/agent" --version)" = "agent-runtime ${version}"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")" = "$version"
-          # The app links this from ~/.agents/skills.
-          test -f "$app/Contents/Resources/skills/swarm/SKILL.md"
           mkdir dist
-          archive="dist/Agent_${version}_universal.zip"
-          ditto -c -k --sequesterRsrc --keepParent "$app" "$archive"
-          python3 app/release/homebrew_cask.py "$version" "$archive" dist/agent.rb
-          ruby -c dist/agent.rb
           # The formulas for the daemon and Sonny build both from this
           # commit's source on the person's machine; nothing in it is signed.
           git archive --format=tar.gz --prefix="agent-${version}/" \
@@ -241,37 +124,22 @@ jobs:
             grep -qx "agent-${version}/$file" "$RUNNER_TEMP/source.txt"
           done
           for name in agent sonny; do
-            python3 app/release/homebrew_formula.py "$name" "$version" \
+            python3 release/homebrew_formula.py "$name" "$version" \
               "dist/agent-${version}.tar.gz" "dist/${name}-formula.rb"
             ruby -c "dist/${name}-formula.rb"
           done
           # Publishing checks the tag still resolves to the commit built here.
           printf '%s\n' "$RELEASE_COMMIT" > dist/source-commit.txt
           cd dist
-          shasum -a 256 "Agent_${version}_universal.zip" agent.rb \
-            "agent-${version}.tar.gz" agent-formula.rb sonny-formula.rb \
+          shasum -a 256 "agent-${version}.tar.gz" agent-formula.rb sonny-formula.rb \
             source-commit.txt > checksums.txt
           shasum -a 256 --check checksums.txt
-          mkdir smoke
-          ditto -x -k "Agent_${version}_universal.zip" smoke
-          codesign --verify --deep --strict smoke/Agent.app
-          xcrun stapler validate smoke/Agent.app
-      - name: Remove temporary signing credentials
-        if: always()
-        run: |
-          signing_dir="$RUNNER_TEMP/agent-signing"
-          if [ -f "$signing_dir/signing.keychain-db" ]; then
-            security delete-keychain "$signing_dir/signing.keychain-db"
-          fi
-          rm -rf "$signing_dir"
       - name: Attest the release assets
         # Publishing verifies this: assets swapped on the draft afterwards,
         # checksums and all, carry no attestation from this workflow.
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
-            dist/Agent_*_universal.zip
-            dist/agent.rb
             dist/agent-*.tar.gz
             dist/agent-formula.rb
             dist/sonny-formula.rb
@@ -299,13 +167,13 @@ jobs:
           if [[ "$RELEASE_TAG" == *-* ]]; then
             options+=(--prerelease)
           fi
-          gh release create "$RELEASE_TAG" dist/*.zip dist/agent-*.tar.gz dist/checksums.txt \
-            dist/agent.rb dist/agent-formula.rb dist/sonny-formula.rb dist/source-commit.txt \
+          gh release create "$RELEASE_TAG" dist/agent-*.tar.gz dist/checksums.txt \
+            dist/agent-formula.rb dist/sonny-formula.rb dist/source-commit.txt \
             --verify-tag --draft --title "$RELEASE_TAG" --generate-notes "${options[@]}"
 
   linux:
     # Static Linux builds of Sonny and its daemon, added to the draft the
-    # Mac build made. Nothing here is signed, so no signing secrets.
+    # package job made. Nothing here is signed.
     needs: [resolve, package]
     strategy:
       matrix:
