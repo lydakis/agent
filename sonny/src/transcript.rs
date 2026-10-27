@@ -456,7 +456,11 @@ pub fn wrap_lines(
     // A row this line itself was wrapped onto stays one.
     let first = match lead(&line) {
         Some(columns) => Line::from([vec![goes_on(columns, true)], first.spans].concat()),
-        None => Line::from([vec![goes_on(first.width(), false)], first.spans].concat()),
+        // A row wrapped again keeps the lead it opened with.
+        None => {
+            let opens = opens(&line).unwrap_or(0) + first.width();
+            Line::from([vec![goes_on(opens, false)], first.spans].concat())
+        }
     };
     let rest = [vec![goes_on(rest.width(), true)], rest.spans].concat();
     // Each row, and whether it goes on with a word cut in the row above.

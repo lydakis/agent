@@ -23,6 +23,12 @@ use unicode_width::UnicodeWidthStr;
 const WHEEL: usize = 3;
 /// How soon a second click counts as a double click.
 const DOUBLE: Duration = Duration::from_millis(400);
+/// How many of the conversation's rows are kept to scroll back to, as a
+/// terminal keeps its scrollback; the whole conversation stays in the
+/// bot's history.
+const KEEP: usize = 10_000;
+/// How far past a link's rows on screen to look for the rest of it.
+const LINK_ROWS: usize = 16;
 
 /// What the person asked for with the mouse.
 #[derive(Debug, PartialEq)]
@@ -41,6 +47,8 @@ struct Shown {
     joins: Option<usize>,
     /// The columns of its lead (a bullet, an indent) otherwise.
     opens: usize,
+    /// It is the first of its row's.
+    first: bool,
 }
 
 /// A place in the rows shown: a row and a column.
@@ -147,15 +155,37 @@ impl Screen {
             } else {
                 crate::transcript::wrap(line.clone(), width, Span::raw(""), Span::raw("    "))
             };
-            for line in rows {
+            for (at, line) in rows.into_iter().enumerate() {
                 let joins = crate::transcript::lead(&line);
                 let opens = crate::transcript::opens(&line).unwrap_or(0);
-                self.shown.push(Shown { line, joins, opens });
+                let first = at == 0;
+                self.shown.push(Shown {
+                    line,
+                    joins,
+                    opens,
+                    first,
+                });
             }
         }
         self.wrapped = self.rows.len();
         if self.back > 0 && before > 0 {
             self.back += self.shown.len() - before;
+        }
+        // The oldest rows go, a batch at a time.
+        if self.rows.len() > KEEP + KEEP / 4 {
+            let drop = self.rows.len() - KEEP;
+            self.rows.drain(..drop);
+            self.wrapped -= drop;
+            let mut firsts = 0;
+            let gone = (self.shown.iter())
+                .position(|shown| {
+                    firsts += usize::from(shown.first);
+                    firsts > drop
+                })
+                .unwrap_or(self.shown.len());
+            self.shown.drain(..gone);
+            self.selection = None;
+            self.linked = None;
         }
     }
 
@@ -179,7 +209,7 @@ impl Screen {
         };
         if self.linked != Some((top, bottom, self.width, area)) {
             self.linked = Some((top, bottom, self.width, area));
-            self.links = self.find_links(drawn, buf, &file);
+            self.links = self.find_links(drawn, &file);
         }
         for (y, from, to, _) in &self.links {
             for x in *from..*to {
@@ -229,25 +259,36 @@ impl Screen {
     }
 
     /// The links in the rows just drawn, as `links::cells` finds them.
+    /// An address cut over rows is read whole, rows past the screen's
+    /// edges included, and only its part on screen is kept.
     fn find_links(
         &self,
         drawn: Rect,
-        buf: &Buffer,
         file: impl Fn(&str) -> Option<String>,
     ) -> Vec<(u16, u16, u16, String)> {
-        let mut rows = Buffer::empty(drawn);
-        for y in drawn.top()..drawn.bottom() {
-            for x in drawn.left()..drawn.right() {
-                rows[(x, y)] = buf[(x, y)].clone();
-            }
+        let cut = |row: usize| self.shown[row].line.alignment == Some(crate::transcript::CUT);
+        let (top, bottom) = (self.top, self.top + drawn.height as usize);
+        let mut from = top;
+        while from > 0 && top - from < LINK_ROWS && cut(from) {
+            from -= 1;
         }
-        let cut: Vec<bool> = (self.shown[self.top..self.top + drawn.height as usize].iter())
-            .map(|shown| shown.line.alignment == Some(crate::transcript::CUT))
-            .collect();
+        let mut to = bottom;
+        while to < self.shown.len() && to - bottom < LINK_ROWS && cut(to) {
+            to += 1;
+        }
+        let mut rows = Buffer::empty(Rect::new(0, 0, drawn.width, (to - from) as u16));
+        for row in from..to {
+            rows.set_line(0, (row - from) as u16, &self.shown[row].line, drawn.width);
+        }
+        let cuts: Vec<bool> = (from..to).map(cut).collect();
         let mut links: Vec<(u16, u16, u16, String)> = Vec::new();
-        for (x, y, cell) in crate::links::cells(&rows, &cut, file) {
-            let symbol = cell.symbol();
-            if let Some(rest) = symbol.strip_prefix("\x1b]8;;") {
+        for (x, y, cell) in crate::links::cells(&rows, &cuts, file) {
+            let row = from + y as usize;
+            if !(top..bottom).contains(&row) {
+                continue;
+            }
+            let (x, y) = (drawn.x + x, drawn.y + (row - top) as u16);
+            if let Some(rest) = cell.symbol().strip_prefix("\x1b]8;;") {
                 let url = rest.split('\x1b').next().unwrap_or_default().to_owned();
                 links.push((y, x, x + 1, url));
             }
@@ -612,6 +653,55 @@ mod tests {
         assert_eq!(
             drag(&mut screen, (2, 0), (5, 0)),
             Some(Action::Copy("see".into()))
+        );
+    }
+
+    #[test]
+    fn a_link_cut_at_the_screens_edge_opens_whole() {
+        let url = "https://example.com/a/very/long/path/to/a/page";
+        let lines = crate::transcript::wrap(Line::from(url), 20, Span::raw(""), Span::raw(""));
+        assert_eq!(lines.len(), 3);
+        let click = |screen: &mut Screen| {
+            screen.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, 0));
+            screen.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 2, 0))
+        };
+        // Its start above the screen.
+        let (mut screen, _) = screen(lines.clone(), 20, 2);
+        assert_eq!(click(&mut screen), Some(Action::Open(url.into())));
+        // Its end below.
+        let mut screen = Screen::default();
+        screen.push(lines);
+        let area = Rect::new(0, 0, 20, 2);
+        screen.render(area, &mut Buffer::empty(area), |_| None);
+        screen.scroll(1);
+        screen.render(area, &mut Buffer::empty(area), |_| None);
+        assert_eq!(click(&mut screen), Some(Action::Open(url.into())));
+    }
+
+    #[test]
+    fn a_reply_wrapped_again_copies_without_its_bullet() {
+        let text = "The stub answers after the 2s timeout, so the test reads an empty cart.";
+        let reply = crate::transcript::reply(text, 80);
+        assert_eq!(reply.len(), 1);
+        let (mut screen, _) = screen(reply, 30, 10);
+        let last = screen.shown.len() as u16 - 1;
+        assert_eq!(
+            drag(&mut screen, (0, 0), (29, last)),
+            Some(Action::Copy(text.into()))
+        );
+    }
+
+    #[test]
+    fn the_oldest_rows_go_past_what_is_kept() {
+        let lines: Vec<Line> = (0..KEEP + KEEP / 4 + 1)
+            .map(|i| Line::from(format!("row {i}")))
+            .collect();
+        let (screen, _) = screen(lines, 20, 5);
+        assert_eq!(screen.rows.len(), KEEP);
+        assert_eq!(screen.shown.len(), KEEP);
+        assert_eq!(
+            screen.shown[0].line.to_string(),
+            format!("row {}", KEEP / 4 + 1)
         );
     }
 
