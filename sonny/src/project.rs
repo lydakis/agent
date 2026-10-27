@@ -45,16 +45,26 @@ fn role(dir: &Path) -> Result<agent_client::policy::Profile, String> {
 /// with the copies Sonny is set to. Rex is the rex-windows skill's to
 /// explain, so they read the same in any client.
 pub fn instructions(dir: &Path) -> Result<String, String> {
+    compose(dir).map(|(text, _)| text)
+}
+
+/// The instructions and the names of the skills they list.
+fn compose(dir: &Path) -> Result<(String, Vec<String>), String> {
     let memory = agent_client::policy::memory_indexes(dir).map_err(|e| e.to_string())?;
     let composed = agent_client::policy::instructions(dir, Some(&role(dir)?), &memory)
-        .map_err(|e| e.to_string())?
-        .text;
+        .map_err(|e| e.to_string())?;
+    let skills = composed
+        .skills
+        .into_iter()
+        .map(|skill| skill.name)
+        .collect();
+    let composed = composed.text;
     let info = agent_client::project::read(dir)?;
     let copies = crate::settings::Settings::load().copies;
     let rule = agent_client::project::rule(&info, &copies);
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     let start = start_rule(&me.to_string_lossy());
-    Ok(format!("{composed}\n\n{rule}\n\n{start}"))
+    Ok((format!("{composed}\n\n{rule}\n\n{start}"), skills))
 }
 
 /// How the lead starts a task in Sonny: `sonny task`, at `sonny`, makes
@@ -87,15 +97,35 @@ pub enum Instructions {
     /// these replace them.
     Stale(String),
     /// They were set some other way, or before Sonny saw this lead, and
-    /// are kept until the person asks for the folder's.
-    Kept,
+    /// are kept until the person asks for the folder's. `missing` names
+    /// the folder's skills they do not list, such as the layout skill
+    /// Sonny installed after they were set.
+    Kept { missing: Vec<String> },
+}
+
+impl Instructions {
+    /// What Sonny tells the person about instructions it keeps: the
+    /// command first, so a narrow pane still shows what to do.
+    pub fn kept_notice(missing: &[String]) -> String {
+        let why = "its instructions were set outside its folder's files";
+        match missing {
+            [] => "the lead's instructions were set outside its folder's files; \
+                   /instructions takes the folder's"
+                .into(),
+            [skill] => format!("/instructions gives the lead the {skill} skill: {why}"),
+            skills => format!(
+                "/instructions gives the lead the {} skills: {why}",
+                skills.join(", ")
+            ),
+        }
+    }
 }
 
 /// Whether a lead's instructions may follow the folder: only when Sonny
 /// wrote what they hold (or saw a client compose it), so instructions the
 /// person set some other way are never overwritten.
 pub fn review(dir: &Path, bot: &Value, lead: &str, new: bool) -> Result<Instructions, String> {
-    let composed = instructions(dir)?;
+    let (composed, skills) = compose(dir)?;
     let current = bot["instructions"].as_str().unwrap_or_default();
     Ok(if current == composed {
         wrote(lead, current);
@@ -103,7 +133,12 @@ pub fn review(dir: &Path, bot: &Value, lead: &str, new: bool) -> Result<Instruct
     } else if new || written(lead).is_some_and(|key| key == fingerprint(current)) {
         Instructions::Stale(composed)
     } else {
-        Instructions::Kept
+        // The composed text lists each skill as "- NAME: summary (path)".
+        let missing = skills
+            .into_iter()
+            .filter(|name| !current.contains(&format!("- {name}:")))
+            .collect();
+        Instructions::Kept { missing }
     })
 }
 
@@ -150,7 +185,7 @@ pub fn wrote(lead: &str, text: &str) {
 }
 
 /// FNV-1a, as hex: stable across runs and builds.
-fn fingerprint(text: &str) -> String {
+pub fn fingerprint(text: &str) -> String {
     let hash = text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
     });
@@ -426,6 +461,33 @@ mod tests {
         assert!(!same_name(&other, "shop"));
         assert!(!same_name(&base.join("gone/shop"), "shop"));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn kept_instructions_name_the_skills_they_miss() {
+        let dir = std::env::temp_dir().join(format!("sonny-kept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".agents/skills/deploy")).unwrap();
+        std::fs::write(
+            dir.join(".agents/skills/deploy/SKILL.md"),
+            "# Deploy\n\nShip it.",
+        )
+        .unwrap();
+        let lead = format!("kept-test-{}", std::process::id());
+        let missing = |instructions: &str| {
+            let bot = serde_json::json!({ "instructions": instructions });
+            match review(&dir, &bot, &lead, false).unwrap() {
+                Instructions::Kept { missing } => missing,
+                other => panic!("kept, not {other:?}"),
+            }
+        };
+        assert!(missing("set by hand").contains(&"deploy".to_owned()));
+        assert!(!missing("set by hand\n- deploy: Deploy (x)").contains(&"deploy".to_owned()));
+        assert!(
+            Instructions::kept_notice(&["herdr-panes".into()])
+                .starts_with("/instructions gives the lead the herdr-panes skill:")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

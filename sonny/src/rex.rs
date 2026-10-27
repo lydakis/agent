@@ -5,7 +5,7 @@
 //! labels need not be unique. Checked against rex 0.0.1792787366 (API rev 7)
 //! for `ls`, `new`, `split`, `block ls` and `block close`; `run`'s output is
 //! read the way `split`'s is.
-use crate::mux::{Backend, Block, Places};
+use crate::mux::{Backend, Block, Place, Places};
 use serde_json::Value;
 use std::{
     collections::HashMap,
@@ -67,14 +67,15 @@ impl Rex {
     /// The project's session. From the terminal Sonny runs in (`terminal`),
     /// that terminal's session, so the lead stays where the person opened
     /// it and tasks open beside it. Otherwise, as from an agent's shell, whose Rex variables
-    /// would name the daemon's terminal: the session the project's lead is
-    /// in, else the one labelled with the project's name, made when there
-    /// is none.
+    /// would name the daemon's terminal: the one `kept` names while it is
+    /// open, else the session the project's lead is in, else the one
+    /// labelled with the project's name, made when there is none.
     pub fn open(
         bin: PathBuf,
         host: Option<&str>,
         label: &str,
         terminal: bool,
+        kept: Option<&str>,
     ) -> Result<Self, String> {
         let mut rex = Self {
             bin,
@@ -104,6 +105,7 @@ impl Rex {
             terminal && host.is_none() && !mine.is_empty() && mine.ends_with(id.as_str())
         });
         let found = sessions.iter().find(|(_, l)| l == label);
+        let kept = kept.and_then(|kept| sessions.iter().find(|(id, _)| id == kept));
         let lead = format!("{label}.lead");
         let leads = || {
             sessions
@@ -115,7 +117,7 @@ impl Rex {
                 rex.here = true;
                 (id.clone(), now.clone())
             }
-            None => match leads().or(found) {
+            None => match kept.or_else(leads).or(found) {
                 Some((id, now)) => (id.clone(), now.clone()),
                 None => {
                     let made = rex.call(&["new", label, "--json"])?;
@@ -255,6 +257,13 @@ impl Backend for Rex {
             .map(|b| b.id)
     }
 
+    fn place(&self) -> Place {
+        Place::Rex {
+            session: self.session.clone(),
+            host: self.host.get(1).cloned(),
+        }
+    }
+
     /// Where each block sits, by label: its tab, counted from 1, and in a
     /// split, its side of its neighbour (`right of`, `below`, … a label).
     fn places(&self) -> Places {
@@ -392,7 +401,7 @@ if out is not None:
                 "01stray": {"label": "graft", "blocks": []},
             }),
         );
-        let rex = super::Rex::open(bin, None, "graft", false).unwrap();
+        let rex = super::Rex::open(bin, None, "graft", false, None).unwrap();
         assert_eq!(
             (rex.session.as_str(), rex.name.as_str()),
             ("01home", "lydakis")
