@@ -84,7 +84,7 @@ impl Tool {
                 "properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}),
             ),
             Tool::Shell => (
-                "Run a noninteractive /bin/sh command in the workspace. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with the full output retained. Default timeout 120 s, maximum 600 s; a command that times out returns its output so far with timed_out. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, times out, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing kills or tracks it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. Use detach for a server or service that must keep running, and stop it yourself with kill.",
+                "Run a noninteractive bash command (sh where bash is not installed) in the workspace. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with the full output retained. Default timeout 120 s, maximum 600 s; a command that times out returns its output so far with timed_out. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, times out, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing kills or tracks it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. Use detach for a server or service that must keep running, and stop it yourself with kill.",
                 json!({"type":"object","properties":{"command":{"type":"string"},
                 "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_SHELL_TIMEOUT_MS},
                 "background":{"type":"boolean"},"detach":{"type":"boolean"}},
@@ -209,6 +209,14 @@ impl Credentials {
             },
         );
     }
+    /// Keep a variable out of shell environments without a value to
+    /// redact: configuration the daemon read for itself.
+    pub fn withhold(&self, name: &str) {
+        let mut set = self.0.write().unwrap_or_else(|e| e.into_inner());
+        if !set.names.iter().any(|existing| existing == name) {
+            set.names.push(name.to_owned());
+        }
+    }
     pub fn names(&self) -> Vec<String> {
         self.0
             .read()
@@ -217,14 +225,156 @@ impl Credentials {
             .clone()
     }
     pub fn redact(&self, mut text: String) -> String {
-        let set = self.0.read().unwrap_or_else(|e| e.into_inner());
-        for credential in &set.values {
-            if text.contains(&credential.value) {
-                text = text.replace(&credential.value, "[REDACTED]");
+        {
+            let set = self.0.read().unwrap_or_else(|e| e.into_inner());
+            for credential in &set.values {
+                if text.contains(&credential.value) {
+                    text = text.replace(&credential.value, REDACTED);
+                }
             }
         }
-        text
+        redact_secret_fields(redact_private_keys(text))
     }
+}
+
+const REDACTED: &str = "[REDACTED]";
+/// Field names, lowercased without `_` or `-`, whose values are secrets
+/// wherever they are printed: `NAME=VALUE`, `NAME: VALUE`, `"NAME": "VALUE"`.
+/// A name matches when it ends with one of these, so `aws_secret_access_key`
+/// and `SecretAccessKey` match and `AccessKeyId` or `NextToken` do not.
+const SECRET_FIELDS: [&str; 12] = [
+    "secret",
+    "secretkey",
+    "secretaccesskey",
+    "sessiontoken",
+    "accesstoken",
+    "refreshtoken",
+    "idtoken",
+    "authtoken",
+    "apikey",
+    "password",
+    "passwd",
+    "privatekey",
+];
+/// Shorter values are flags, placeholders and counts, not secrets; so are
+/// values without both letters and digits.
+const SECRET_MIN: usize = 8;
+
+/// Replace the value after each secret field name in `text`.
+fn redact_secret_fields(text: String) -> String {
+    let bytes = text.as_bytes();
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !word(bytes[i]) || (i > 0 && word(bytes[i - 1])) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && word(bytes[i]) {
+            i += 1;
+        }
+        // The shortest field is six letters; most words are shorter.
+        if i - start < 6 {
+            continue;
+        }
+        let name: String = text[start..i]
+            .chars()
+            .filter(|c| *c != '_' && *c != '-')
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        if !SECRET_FIELDS.iter().any(|field| name.ends_with(field)) {
+            continue;
+        }
+        // The name's closing quote, the separator, and the value's quote.
+        let mut j = i;
+        if j < bytes.len() && matches!(bytes[j], b'"' | b'\'') {
+            j += 1;
+        }
+        while j < bytes.len() && matches!(bytes[j], b' ' | b'\t') {
+            j += 1;
+        }
+        if j >= bytes.len() || !matches!(bytes[j], b'=' | b':') {
+            continue;
+        }
+        j += 1;
+        while j < bytes.len() && matches!(bytes[j], b' ' | b'\t') {
+            j += 1;
+        }
+        let quote = bytes.get(j).copied().filter(|b| matches!(b, b'"' | b'\''));
+        if quote.is_some() {
+            j += 1;
+        }
+        let from = j;
+        while j < bytes.len() {
+            let b = bytes[j];
+            let ends = match quote {
+                Some(q) => b == q || b == b'\n',
+                None => {
+                    b.is_ascii_whitespace() || matches!(b, b',' | b';' | b'"' | b'\'' | b'}' | b']')
+                }
+            };
+            if ends {
+                break;
+            }
+            j += 1;
+        }
+        let value = &text[from..j];
+        // Code names a type or a variable there; a key mixes in digits.
+        let keylike = value.bytes().any(|b| b.is_ascii_digit())
+            && value.bytes().any(|b| b.is_ascii_alphabetic());
+        if value.len() >= SECRET_MIN && keylike && !value.starts_with(['{', '[', '$']) {
+            spans.push(from..j);
+        }
+        i = j;
+    }
+    if spans.is_empty() {
+        return text;
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for span in spans {
+        out.push_str(&text[at..span.start]);
+        out.push_str(REDACTED);
+        at = span.end;
+    }
+    out.push_str(&text[at..]);
+    out
+}
+
+/// Replace the body of each PEM private key block in `text`.
+fn redact_private_keys(mut text: String) -> String {
+    const BEGIN: &str = "-----BEGIN ";
+    const END: &str = "-----END ";
+    let mut from = 0;
+    while let Some(found) = text[from..].find(BEGIN) {
+        let begin = from + found;
+        // The header line ends in five dashes, then LF or CRLF.
+        let Some(dashes) = text[begin + BEGIN.len()..]
+            .find("-----")
+            .map(|n| begin + BEGIN.len() + n + 5)
+        else {
+            break;
+        };
+        let header = match &text.as_bytes()[dashes..] {
+            [b'\r', b'\n', ..] => dashes + 2,
+            [b'\n', ..] => dashes + 1,
+            _ => dashes,
+        };
+        if !text[begin..header].contains("PRIVATE KEY") {
+            from = header;
+            continue;
+        }
+        let Some(end) = text[header..].find(END).map(|n| header + n) else {
+            // A key cut off by truncation is still a key.
+            text.replace_range(header.., REDACTED);
+            break;
+        };
+        text.replace_range(header..end, &format!("{REDACTED}\n"));
+        from = header + REDACTED.len() + 1 + END.len();
+    }
+    text
 }
 
 pub enum Prepared {
@@ -1047,8 +1197,18 @@ pub const JUDGE_KEY: &str = "TYPESAFE_API_KEY";
 /// it is withheld from tools even when no daemon provider holds it.
 pub const DECISIONS_KEY: &str = "OPENAI_API_KEY";
 
-/// `/bin/sh -c command` in the workspace, with the registry's environment and
-/// none of the credentials the daemon holds.
+/// bash, as other harnesses run commands, where it is installed; else sh.
+#[cfg(unix)]
+fn shell_path() -> &'static str {
+    static PATH: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| match Path::new("/bin/bash").exists() {
+        true => "/bin/bash",
+        false => "/bin/sh",
+    })
+}
+
+/// `shell_path() -c command` in the workspace, with the registry's
+/// environment and none of the credentials the daemon holds.
 #[cfg(unix)]
 fn sh(
     command: &str,
@@ -1056,7 +1216,7 @@ fn sh(
     registry: &Registry,
     environment: &[(String, String)],
 ) -> tokio::process::Command {
-    let mut process = tokio::process::Command::new("/bin/sh");
+    let mut process = tokio::process::Command::new(shell_path());
     for name in registry.credentials.names() {
         process.env_remove(name);
     }
@@ -1266,6 +1426,51 @@ mod tests {
         assert!(Registry::new("echo,echo").is_err());
         assert!(Registry::new("mcp").is_err());
         assert_eq!(Registry::new("read").unwrap().names(), ["read"]);
+    }
+    #[test]
+    fn secrets_are_redacted_by_field_name_and_key_block() {
+        let credentials = Credentials::default();
+        let redact = |text: &str| credentials.redact(text.to_owned());
+        assert_eq!(
+            redact(
+                r#"{"AccessKeyId": "ASIAEXAMPLE12345", "SecretAccessKey": "wJalr/XUtnFEMI+K7MDENG", "SessionToken": "IQoJb3JpZ2luX2VjEXAMPLE", "Expiration": "2026-01-01T00:00:00Z"}"#
+            ),
+            r#"{"AccessKeyId": "ASIAEXAMPLE12345", "SecretAccessKey": "[REDACTED]", "SessionToken": "[REDACTED]", "Expiration": "2026-01-01T00:00:00Z"}"#
+        );
+        assert_eq!(
+            redact("aws_secret_access_key = wJalrXUtnFEMI7K7MDENG\nregion = us-east-1\n"),
+            "aws_secret_access_key = [REDACTED]\nregion = us-east-1\n"
+        );
+        assert_eq!(
+            redact("export OPENAI_API_KEY=sk-proj-abc123def456; echo ok"),
+            "export OPENAI_API_KEY=[REDACTED]; echo ok"
+        );
+        // Names that only resemble one, short values, and code keep theirs.
+        for kept in [
+            "NextToken: eyJ0b2tlbiI6IDEyM30=",
+            "max_tokens: 4096",
+            "password: hunter2",
+            "    api_key: Option<String>,",
+            "token: ${{ secrets.TOKEN }}",
+        ] {
+            assert_eq!(redact(kept), kept);
+        }
+        assert_eq!(
+            redact(
+                "a\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk\nAAAA\n-----END OPENSSH PRIVATE KEY-----\nz"
+            ),
+            "a\n-----BEGIN OPENSSH PRIVATE KEY-----\n[REDACTED]\n-----END OPENSSH PRIVATE KEY-----\nz"
+        );
+        let certificate = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+        assert_eq!(redact(certificate), certificate);
+        assert_eq!(
+            redact("-----BEGIN RSA PRIVATE KEY-----\nMIIE"),
+            "-----BEGIN RSA PRIVATE KEY-----\n[REDACTED]"
+        );
+        assert_eq!(
+            redact("-----BEGIN PRIVATE KEY-----\r\nMIIE\r\n-----END PRIVATE KEY-----\r\n"),
+            "-----BEGIN PRIVATE KEY-----\r\n[REDACTED]\n-----END PRIVATE KEY-----\r\n"
+        );
     }
     #[cfg(unix)]
     #[test]

@@ -464,7 +464,10 @@ Temporary keys are re-resolved in the
 background five minutes before they expire, at most every ten seconds, and
 once on a 401 or 403, which retries the call as `provider_login_refreshed`;
 Bedrock URLs must be https; the key id, secret and session token are
-redacted from tool output and, from the environment, kept out of shells. Mantle takes
+redacted from tool output and, from the environment, kept out of shells, as
+are the `AWS_PROFILE`, `AWS_DEFAULT_PROFILE`, `AWS_REGION` and
+`AWS_DEFAULT_REGION` that picked them: a bot's AWS commands choose their
+own. Mantle takes
 the body unsigned; runtime signs its SHA-256, so a runtime call reads its
 history from the store twice, once to digest it and once as it streams. A key field
 instead sends a Bedrock API key the family's own way, as
@@ -2003,7 +2006,8 @@ closed tool scheduler fails the turn. Allowed tools run without approval
 prompts unless the bot was created with a gate (see [tool approval](#tool-approval)).
 A store remains bound to its tool set; changing it requires a new store.
 
-`shell` runs a noninteractive `/bin/sh` command in the bot workspace with
+`shell` runs a noninteractive command with `/bin/bash -c` (`/bin/sh` where
+bash is not installed) in the bot workspace with
 `timeout_ms` (default 120 s, maximum 600 s), which bounds the command's
 running time, not any time spent in line for a process slot. Commands are at
 most 16 KiB. At most `--max-processes` child processes run at once across the
@@ -2018,7 +2022,15 @@ it as `queued_processes`, a subset of `running_processes`, which counts every
 accepted command whose result is not yet recorded. stdout and stderr are each
 retained up to 1 MiB; beyond 64 KiB the model receives a head and tail with the
 omission stated and the full stream is stored as an artifact retrievable through
-the `artifact` operation. Results include separate output, exit code, and
+the `artifact` operation. Output is redacted before it is stored or sent,
+artifacts included, as every tool's result is: each credential the daemon
+holds, wherever it appears; the value printed after a field name ending in
+`secret`, `secret_key`, `secret_access_key`, `session_token`, `access_token`,
+`refresh_token`, `id_token`, `auth_token`, `api_key`, `password`, `passwd` or
+`private_key` (any case, with or without `_` or `-`, as `NAME=`, `NAME:` or
+`"NAME":`), when it is at least 8 bytes of letters and digits both, so a
+credential tool's JSON or a credentials file never reaches the model or the
+store; and the body of a PEM private key block. Results include separate output, exit code, and
 success status. Nonzero exit is a recorded tool result. A command's return,
 timeout, or overflow kills its owned process group, so a process it started
 with `&` does not outlive it; the tool description tells the model so. A
