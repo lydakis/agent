@@ -153,8 +153,9 @@ Sonny shows it folded, as `↳ Task updates`.
 
 `--judge SPEC`, else `AGENT_JUDGE` (in the shell or `~/.agent/env`, the
 approver's setting too), else what the approver would pick for the lead
-(`agent_client::judge`): the newest Haiku Bedrock lists, else the newest
-Haiku the lead's provider lists, else the lead's own model. That order
+(`agent_client::judge`): the newest small model of the lead's family that
+the lead's own provider lists (Haiku for Claude, Luna for GPT), else the
+lead's own model. That order
 rests on what the code can reach, not on a measurement.
 `openai-decisions/MODEL` with `OPENAI_API_KEY` asks OpenAI's Decisions API
 (about $0.0002 a check with `gpt-6-luna`), and any other

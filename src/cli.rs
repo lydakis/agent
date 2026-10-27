@@ -399,7 +399,7 @@ fn print_flags(flags: &str) {
             ),
             "--judge" => (
                 "PROVIDER/MODEL",
-                "Who judges: openai-decisions/MODEL or any model the daemon serves; default AGENT_JUDGE, else the newest Haiku on Bedrock, else the newest Haiku AGENT_MODEL's provider lists, else AGENT_MODEL",
+                "Who judges: openai-decisions/MODEL or any model the daemon serves; default AGENT_JUDGE, else the newest small model of AGENT_MODEL's family on its own provider (Haiku for Claude, Luna for GPT), else AGENT_MODEL",
             ),
             "--judge-url" => (
                 "URL",

@@ -640,10 +640,11 @@ so only one instance runs at a time, and answers in layers:
 
 The approver and Sonny's lookout pick their judge the same way, in
 `agent_client::judge`: `agent approver --judge PROVIDER/MODEL`, else
-`AGENT_JUDGE`, else the newest Haiku Bedrock lists (in the bot's region
-when it runs on Bedrock, else `global.`), else the newest Haiku the bot's
-provider lists, else `AGENT_MODEL` for `agent approver`, or the bot's own
-model for the approver the CLI starts. `AGENT_JUDGE` is the one
+`AGENT_JUDGE`, else the newest small model of the bot's family that the
+bot's own provider lists (Haiku for Claude, Luna for GPT; in the bot's
+region on Bedrock), else the bot's own model: `AGENT_MODEL` for `agent
+approver`, the bot's model for the approver the CLI starts. No provider
+but the bot's own is assumed. `AGENT_JUDGE` is the one
 decision-model setting: the lookout reads it too, and the clients pass
 `~/.agent/env` to the approvers they start. That order rests on what the
 code can reach, not on a measurement of the judges. Jev was dropped on
