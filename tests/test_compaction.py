@@ -757,7 +757,7 @@ class AnthropicUnreadableThinkingTests(ModelFixture):
         # The message is not read: any 400 the thinking caused qualifies.
         client, sent = self.unreadable((400, 'Invalid request.'))
         self.assertEqual([self.signatures(r) for r in sent], [['sig-1'], []])
-        self.assertTrue(any(m.get('thinking_withheld') for m in client.saved))
+        self.assertTrue(any(m.get('event') == 'retry' and m['data'].get('thinking_withheld') for m in client.saved))
         # Later turns no longer replay it, and keep the thinking written since.
         client.close()
         client = self.anthropic()
@@ -792,7 +792,7 @@ class AnthropicUnreadableThinkingTests(ModelFixture):
         self.model.unreadable_failures = 2
         client, sent = self.unreadable(failure)
         self.assertEqual([self.signatures(r) for r in sent], [['sig-1']] * 3)
-        self.assertFalse(any(m.get('thinking_withheld') for m in client.saved))
+        self.assertFalse(any(m.get('event') == 'retry' and m['data'].get('thinking_withheld') for m in client.saved))
         client.close()
         client = self.anthropic()
         self.turn(client, 2, 'third')

@@ -2064,9 +2064,14 @@ class RuntimeTests(ModelFixture):
             with self.subTest(prompt=prompt):
                 data, retries = run(prompt)
                 self.assertEqual(data['status'], 'completed', data)
-                self.assertEqual([(r['attempt'], r['error']) for r in retries], [(1, code)])
+                self.assertEqual([(r['data']['attempt'], r['data']['error']) for r in retries], [(1, code)])
         turns = client.request('turns', bot='Bob')['result']['turns']
         self.assertEqual([t['retries'] for t in turns], [1, 1, 1, 1, 1])
+        # Each retry stays in the bot's events, for whoever reads them later.
+        kept = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        self.assertEqual([e['data']['error'] for e in kept if e['event'] == 'retry'],
+                         ['provider_http_503', 'provider_http_429', 'provider_rate_limited',
+                          'provider_rate_limited', 'provider_http_520'])
         self.assertGreaterEqual(turns[1]['paced_ms'], 40)   # the retry waited for the pool's Retry-After
         self.assertGreaterEqual(turns[2]['paced_ms'], 250)  # and for the delay named in the stream
         self.assertGreaterEqual(turns[3]['paced_ms'], 250)  # top-level error uses the same pool delay

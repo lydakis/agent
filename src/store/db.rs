@@ -4753,6 +4753,13 @@ impl Database {
         )?;
         Ok(changed == 1)
     }
+    /// Record a model call's retry: its attempt, the error it answers and
+    /// how long it waits.
+    pub fn retried(&mut self, turn: i64, data: Value) -> Result<()> {
+        let bot = self.active(turn)?;
+        event(&self.conn, &bot.name, Some(turn), "retry", data)?;
+        Ok(())
+    }
     /// Charge an unsuccessful provider call without accepting its output.
     pub fn failed_usage(&mut self, turn: i64, usage: &Usage) -> Result<Value> {
         let bot = self.active(turn)?;
