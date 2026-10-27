@@ -126,7 +126,9 @@ run this Sonny as `sonny memory ...` (facts saved for later agents, in
 a lead makes one when the person asks) and `sonny trigger ...` (launchd jobs
 that wake an agent, on a Mac). A skill Sonny wrote is rewritten when Sonny's
 text changes, until you edit it: from then on it is yours, and Sonny leaves
-it alone. Sonny notes what it last wrote of each in `~/.agent/sonny/skills`.
+it alone. Sonny notes what it last wrote of each in `~/.agent/sonny/skills`;
+a skill of the same name it has no note of writing (yours, or one an
+earlier Sonny wrote) is left alone too. Remove its folder to get Sonny's.
 When `errand` is installed, Sonny writes an `errand` skill so any agent can
 run a command on another machine, draws those runs as `Ran COMMAND on
 PEER`, and in Rex opens a window following each detached job.
