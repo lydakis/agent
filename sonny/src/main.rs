@@ -1154,6 +1154,8 @@ struct App {
     reacting: Option<usize>,
     /// The reply `/react` picked, which the next emoji sent answers.
     react_to: Option<(i64, String)>,
+    /// The turn of the last reaction sent, whose attaching says nothing.
+    reaction_turn: Option<i64>,
     /// The reasoning streamed since the bot last spoke or called a tool,
     /// whose latest heading the status row shows, as Codex does.
     thought: String,
@@ -1773,6 +1775,7 @@ impl App {
             replies: Vec::new(),
             reacting: None,
             react_to: None,
+            reaction_turn: None,
             thought: String::new(),
             replay: None,
             options,
@@ -2737,7 +2740,9 @@ impl App {
                 }
             }
             "queued" => self.notice = Some(format!("queued behind turn {}", data["behind"])),
-            "attached" => self.notice = Some("attached to its next call".into()),
+            "attached" if turn.is_none() || turn != self.reaction_turn => {
+                self.notice = Some("attached to its next call".into())
+            }
             "text_delta" => {
                 self.thought.clear();
                 let mut delta = event["text"].as_str().unwrap_or("");
@@ -3859,10 +3864,13 @@ impl App {
                         "delivery": "attach"}),
                 )
                 .await;
-            if let Err(error) = sent {
-                let _ = self.reactions.toggle(node, &emoji);
-                self.notice = Some(error.to_string());
-                return;
+            match sent {
+                Ok(reply) => self.reaction_turn = reply["turn"].as_i64(),
+                Err(error) => {
+                    let _ = self.reactions.toggle(node, &emoji);
+                    self.notice = Some(error.to_string());
+                    return;
+                }
             }
         }
         self.input.clear();
@@ -5013,6 +5021,8 @@ mod tests {
         assert!(app.input.is_empty());
         assert_eq!(rows(&mut app), ["   👍 "], "no blank row above it");
         assert_eq!(app.reactions.on(8), ["👍"]);
+        app.daemon(turn_event("attached", 9, json!({}))).await;
+        assert_eq!(app.notice, None, "a reaction attaching says nothing");
         // An older reply, picked with /react: quoted, so the bot knows.
         app.input.set("/react");
         app.submit().await;
