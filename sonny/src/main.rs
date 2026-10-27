@@ -9,6 +9,7 @@
 //! `• Ran …` line with a short `└` look at the result, and a status row
 //! says how long the turn has run and how to stop it.
 mod approvals;
+mod asks;
 mod cache;
 mod calls;
 mod diff;
@@ -37,7 +38,6 @@ mod task;
 mod term;
 mod transcript;
 mod trigger;
-mod updates;
 
 use agent_client::{Client, Events};
 use ratatui::{
@@ -99,9 +99,6 @@ struct Options {
     rex_host: Option<String>,
     /// Ring when work ends or needs the person.
     sound: bool,
-    /// The decision model that wakes the lead when its tasks need it, or
-    /// `off`; `None` picks one (lookout::choose).
-    lookout: Option<String>,
     /// A side chat, opened by `/side`: the node its copy was taken at,
     /// after which its history is drawn.
     side: Option<i64>,
@@ -109,7 +106,6 @@ struct Options {
 
 fn usage() -> String {
     "usage: sonny [--store PATH] [--socket PATH] [--model PROVIDER/MODEL] [--no-layout] [--rex-host HOST] [--no-sound]\n\
-     \x20      [--lookout openai-decisions/MODEL|typesafe/jev-*|PROVIDER/MODEL|off]\n\
      \x20      [--copies worktree|sandfs] [--bot NAME [--new [--workspace DIR]]]\n\
      With no --bot, the folder's coordinator, made with --model the first time; its tasks\n\
      open beside it in Rex or Herdr. Type /status for the project's agents.\n\
@@ -122,9 +118,11 @@ fn usage() -> String {
      sonny memory ..., sonny project add DIR ... and sonny trigger ... are what\n\
      ~/.agent/memory, ~/.agent/project and ~/.agent/trigger run, which Sonny writes\n\
      at each start.\n\
-     The lookout wakes the lead when its tasks need it, judged by --lookout, else AGENT_JUDGE\n\
-     (as the approver is), else openai-decisions/gpt-6-luna with OPENAI_API_KEY, else the\n\
-     newest Haiku the lead's provider lists."
+     sonny ask QUESTION [--choice OPTION]..., from the lead's shell, pins a question for\n\
+     the person above the composer until they answer it.\n\
+     sonny lookout [--judge PROVIDER/MODEL|off] watches every lead on the daemon and\n\
+     wakes it when its tasks need it; Sonny starts one. sonny lookout --replay --judge\n\
+     SPEC[,SPEC]... [--limit N] runs its checks over what the store kept."
         .into()
 }
 
@@ -336,6 +334,41 @@ async fn serve_auto(client: &Client, options: &Options, model: &str) -> Result<(
     Ok(())
 }
 
+/// The lookout, `sonny lookout`, which wakes leads when their tasks need
+/// them: started detached, logging beside the store. One already watching
+/// this daemon keeps it, and the new one exits.
+fn start_lookout(options: &Options) -> Result<(), String> {
+    let me = std::env::current_exe().map_err(|e| e.to_string())?;
+    let mut log = options.store.clone().into_os_string();
+    log.push(".lookout.log");
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)
+        .map_err(|e| e.to_string())?;
+    // The judge's settings and keys are in Agent's env file, as for the
+    // approver.
+    let mut command = agent_command(&me)?;
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .arg("lookout")
+        .arg("--store")
+        .arg(&options.store)
+        .arg("--socket")
+        .arg(&options.socket)
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone().map_err(|e| e.to_string())?)
+        .stderr(log)
+        .spawn()
+        .map_err(|e| format!("{}: {e}", me.display()))?;
+    // Reaped when it exits, as it does at once when another one watches.
+    std::thread::spawn(move || child.wait());
+    Ok(())
+}
+
 /// The daemon, started the way the CLI starts it when it is not running.
 async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events), String> {
     if let Ok(connected) = Client::connect(&options.socket).await {
@@ -376,12 +409,31 @@ fn start_daemon(store: &std::path::Path, socket: &std::path::Path) -> Result<(),
     Ok(())
 }
 
+/// The store and socket given, else the environment's, else Agent's own.
+fn daemon_paths(
+    store: Option<PathBuf>,
+    socket: Option<PathBuf>,
+) -> Result<(PathBuf, PathBuf), String> {
+    let store = match store.or_else(|| std::env::var_os("AGENT_STORE").map(PathBuf::from)) {
+        Some(store) => store,
+        None => PathBuf::from(std::env::var_os("HOME").ok_or("set --store or HOME")?)
+            .join(".agent/state.sqlite"),
+    };
+    // One store under two names is one lookout's.
+    let store = agent_client::socket::canonical_store(&store).map_err(|e| e.to_string())?;
+    let socket = match socket.or_else(|| std::env::var_os("AGENT_SOCKET").map(PathBuf::from)) {
+        Some(socket) => socket,
+        None => agent_client::socket::default_socket(&store).map_err(|e| e.to_string())?,
+    };
+    Ok((store, socket))
+}
+
 fn parse() -> Result<Options, String> {
     let mut args = std::env::args().skip(1);
     let (mut store, mut socket, mut bot, mut new, mut model, mut workspace) =
         (None, None, None, false, None, None);
     let (mut layout, mut rex_host, mut sound) = (true, None, true);
-    let (mut lookout, mut side) = (None, None);
+    let mut side = None;
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or_else(usage);
         match arg.as_str() {
@@ -394,7 +446,6 @@ fn parse() -> Result<Options, String> {
             "--no-layout" => layout = false,
             "--rex-host" => rex_host = Some(value()?),
             "--no-sound" => sound = false,
-            "--lookout" => lookout = Some(value()?),
             // Unlisted: how `/side` opens a side chat.
             "--side" => side = Some(value()?.parse().map_err(|_| usage())?),
             "--copies" => {
@@ -409,15 +460,7 @@ fn parse() -> Result<Options, String> {
             _ => return Err(usage()),
         }
     }
-    let store = match store.or_else(|| std::env::var_os("AGENT_STORE").map(PathBuf::from)) {
-        Some(store) => store,
-        None => PathBuf::from(std::env::var_os("HOME").ok_or("set --store or HOME")?)
-            .join(".agent/state.sqlite"),
-    };
-    let socket = match socket.or_else(|| std::env::var_os("AGENT_SOCKET").map(PathBuf::from)) {
-        Some(socket) => socket,
-        None => agent_client::socket::default_socket(&store).map_err(|e| e.to_string())?,
-    };
+    let (store, socket) = daemon_paths(store, socket)?;
     Ok(Options {
         store,
         socket,
@@ -428,7 +471,6 @@ fn parse() -> Result<Options, String> {
         layout,
         rex_host,
         sound,
-        lookout,
         side,
     })
 }
@@ -481,6 +523,8 @@ fn main() -> std::process::ExitCode {
         Some((flag, rest)) if flag == trigger::FIRE_FLAG => {
             return std::process::ExitCode::from(trigger::fire_cli(rest) as u8);
         }
+        Some((ask, rest)) if ask == "ask" => asks::run(rest),
+        Some((lookout, rest)) if lookout == "lookout" => lookout::run(rest),
         _ => tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -506,9 +550,6 @@ async fn run() -> Result<(), String> {
     if std::env::args().nth(1).as_deref() == Some("--version") {
         println!("sonny {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
-    }
-    if std::env::args().nth(1).as_deref() == Some("lookout-replay") {
-        return lookout::replay().await;
     }
     let options = parse()?;
     SIDE.store(options.side.is_some(), std::sync::atomic::Ordering::Relaxed);
@@ -588,14 +629,6 @@ async fn run() -> Result<(), String> {
         app.model = model.clone();
         app.turn_model = Some(model.clone());
     }
-    // The lead hears what its tasks did, as the app tells it.
-    if let Some(project) = &project {
-        tokio::spawn(updates::run(
-            app.options.socket.clone(),
-            name.clone(),
-            project.clone(),
-        ));
-    }
     // Tasks are laid out in Rex when the person is in it (or names the
     // Rex server to use); elsewhere they run out of sight, in /status.
     if let Some(project) = &project
@@ -614,28 +647,10 @@ async fn run() -> Result<(), String> {
     {
         app.notice = Some(error);
     }
-    if let (Some(project), Some(dir), true) = (
-        &project,
-        moving
-            .clone()
-            .or(bot["workspace"].as_str().map(PathBuf::from)),
-        options.lookout.as_deref() != Some("off"),
-    ) {
-        let lead_model = format!(
-            "{}/{}",
-            bot["provider"].as_str().unwrap_or_default(),
-            bot["model"].as_str().unwrap_or_default()
-        );
-        match lookout::choose(&app.client, options.lookout.as_deref(), &lead_model).await {
-            Ok(judge) => lookout::spawn(
-                options.socket.clone(),
-                project.clone(),
-                name.clone(),
-                dir,
-                judge,
-            ),
-            Err(error) => app.notice = Some(error),
-        }
+    if project.is_some()
+        && let Err(error) = start_lookout(&app.options)
+    {
+        app.notice = Some(error);
     }
     // The lead told what its folder tells it today (skills and memory added
     // since it was made), unless its instructions were set some other way.
@@ -771,6 +786,8 @@ fn heading(thought: &str) -> Option<&str> {
 /// A folder as the person reads it: under their home, from `~`.
 /// How often the footer reads the workspace's branch again.
 const PLACE_EVERY: Duration = Duration::from_secs(3);
+/// How often the lead's questions are read again.
+const ASKS_EVERY: Duration = Duration::from_secs(1);
 
 fn tilde(path: &str) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
@@ -906,6 +923,8 @@ struct Watch {
     jobs: Vec<status::Row>,
     /// When the rows were read: their times count on from here.
     read: Instant,
+    /// The lookout's line for the lead.
+    lookout: String,
 }
 
 struct App {
@@ -940,6 +959,14 @@ struct App {
     calls: HashMap<String, (String, Value)>,
     /// Calls waiting on the person, as `approvals` lists them.
     approvals: Vec<Value>,
+    /// The lead's questions for the person, oldest first, as `sonny ask`
+    /// left them, and when they were last read.
+    asks: Vec<asks::Ask>,
+    /// Where the lead's questions are kept, once its id is known.
+    asks_key: Option<String>,
+    asks_read: Option<Instant>,
+    /// Esc set the questions aside: what is typed is a message of its own.
+    chatting: bool,
     /// The waiting call whose whole command was last written out.
     asked: Option<Value>,
     following: bool,
@@ -1475,6 +1502,14 @@ impl App {
             }),
             calls: HashMap::new(),
             approvals: Vec::new(),
+            asks: Vec::new(),
+            asks_key: record["bot_id"].as_i64().map(|id| {
+                let store =
+                    std::fs::canonicalize(&options.store).unwrap_or_else(|_| options.store.clone());
+                asks::key(&store, id)
+            }),
+            asks_read: None,
+            chatting: false,
             asked: None,
             following: true,
             notice: None,
@@ -1642,12 +1677,25 @@ impl App {
             self.side_closed();
             self.listed();
             self.follow_place().await;
+            self.follow_asks();
             self.repaint |= term::switched();
             if self.repaint && self.running.is_none() && self.watch.is_none() && self.side.is_none()
             {
                 self.repaint = false;
                 self.repaint(terminal).await?;
             }
+        }
+    }
+
+    /// Read the lead's open questions again, every second.
+    fn follow_asks(&mut self) {
+        if self.asks_read.is_some_and(|at| at.elapsed() < ASKS_EVERY) {
+            return;
+        }
+        self.asks_read = Some(Instant::now());
+        self.asks = self.asks_key.as_deref().map(asks::open).unwrap_or_default();
+        if self.asks.is_empty() {
+            self.chatting = false;
         }
     }
 
@@ -1912,7 +1960,13 @@ impl App {
             }
             self.approvals_for(self.running.as_ref().map(|r| r.turn))
                 .await;
-            // A daemon that restarted took the approver Sonny started with it.
+            // A daemon that restarted took the approver and the lookout
+            // Sonny started with it.
+            if self.project.is_some()
+                && let Err(error) = start_lookout(&self.options)
+            {
+                self.notice = Some(error);
+            }
             if self.mode == Some("auto")
                 && let Err(error) = serve_auto(&self.client, &self.options, &self.model).await
             {
@@ -2529,6 +2583,7 @@ impl App {
                     rows,
                     jobs,
                     read: Instant::now(),
+                    lookout: self.lookout_line(),
                 })
             }
             Err(error) => {
@@ -2540,12 +2595,22 @@ impl App {
 
     async fn reread(&mut self) {
         let jobs = errand::jobs(self.folder_name()).await;
+        let lookout = self.lookout_line();
         if let Ok((_, rows)) = self.status_rows().await
             && let Some(watch) = &mut self.watch
         {
             watch.rows = rows;
             watch.jobs = jobs;
             watch.read = Instant::now();
+            watch.lookout = lookout;
+        }
+    }
+
+    /// What the lookout does for this window's lead.
+    fn lookout_line(&self) -> String {
+        match &self.project {
+            Some(_) => lookout::status(&self.options.store, &self.bot),
+            None => String::new(),
         }
     }
 
@@ -3003,6 +3068,8 @@ impl App {
                             } else {
                                 self.input.clear();
                             }
+                        } else if !self.asks.is_empty() {
+                            self.chatting = !self.chatting;
                         }
                     }
                     _ => {}
@@ -3181,6 +3248,15 @@ impl App {
             self.side(question.trim().to_owned()).await;
             return;
         }
+        // What is typed answers the lead's first open question, and goes
+        // with it; the question closes once the daemon has the answer.
+        let answering = (!self.chatting)
+            .then(|| self.asks.first().cloned())
+            .flatten();
+        let prompt = match &answering {
+            Some(ask) => asks::answer(ask, &prompt),
+            None => prompt,
+        };
         // A message to a busy bot joins its running turn, on that turn's model.
         let delivery = self.running.is_some().then_some("steer");
         let model = delivery
@@ -3202,6 +3278,10 @@ impl App {
             Ok(reply) => {
                 if let Some(turn) = reply["turn"].as_i64() {
                     self.staged.push((turn, prompt));
+                }
+                if let Some(ask) = answering {
+                    asks::done(&ask);
+                    self.asks.retain(|open| open.file != ask.file);
                 }
                 self.input.clear();
                 self.notice = None;
@@ -3269,14 +3349,7 @@ impl App {
             .arg(&self.options.store)
             .arg("--socket")
             .arg(&self.options.socket)
-            .args([
-                "--no-sound",
-                "--no-layout",
-                "--lookout",
-                "off",
-                "--bot",
-                &name,
-            ])
+            .args(["--no-sound", "--no-layout", "--bot", &name])
             .args(["--side", &forked["head"].as_i64().unwrap_or(0).to_string()]);
         if let Some(model) = &self.turn_model {
             command.args(["--model", model]);
@@ -3398,6 +3471,8 @@ impl App {
         let mut open_rows = self.open_rows(width);
         // Then what was sent and has not landed, kept in view below it.
         open_rows.extend(self.staged_rows(width));
+        // The lead's questions stay pinned above the status row.
+        open_rows.extend(asks::rows(&self.asks, width, self.chatting));
         let spare = room.saturating_sub(composer_rows.len()) + 1;
         let hidden = open_rows.len().saturating_sub(spare.max(1));
         open_rows.drain(..hidden);
@@ -3596,6 +3671,7 @@ impl App {
     fn composer(&self, width: usize) -> (Vec<Line<'static>>, (usize, usize)) {
         if self.input.is_empty() {
             let hint = match self.running {
+                _ if !self.asks.is_empty() && !self.chatting => "Answer, or Esc to chat",
                 Some(_) => "Steer the running turn",
                 None => "Ask anything",
             };
@@ -3746,20 +3822,21 @@ fn draw_watch(watch: &mut Watch) -> std::io::Result<()> {
         })
         .collect();
     let project = watch.project.clone();
+    let lookout = watch.lookout.clone();
     watch.screen.autoresize()?;
     watch.screen.draw(|frame| {
         let area = frame.area();
         let width = area.width.saturating_sub(2) as usize;
         let mut lines = vec![Line::default()];
-        lines.extend(
-            status::card(&project, &rows, &jobs, width)
-                .into_iter()
-                .map(|line| {
-                    let mut spans = vec![Span::raw(" ")];
-                    spans.extend(line.spans);
-                    Line::from(spans).style(line.style)
-                }),
-        );
+        let mut card = status::card(&project, &rows, &jobs, width);
+        if !lookout.is_empty() {
+            card.insert(1, Line::from(lookout.clone()).dim());
+        }
+        lines.extend(card.into_iter().map(|line| {
+            let mut spans = vec![Span::raw(" ")];
+            spans.extend(line.spans);
+            Line::from(spans).style(line.style)
+        }));
         let footer = Line::from("  esc to close").dim();
         let body = ratatui::layout::Rect {
             height: area.height.saturating_sub(1),
@@ -3950,7 +4027,6 @@ mod tests {
             layout: false,
             rex_host: None,
             sound: false,
-            lookout: None,
             side: None,
         };
         App::new(client, "b", &json!({"name": "b"}), options)
@@ -3958,6 +4034,51 @@ mod tests {
 
     fn turn_event(event: &str, turn: i64, data: Value) -> Value {
         json!({"event": event, "bot": "b", "turn": turn, "data": data})
+    }
+
+    #[tokio::test]
+    async fn what_is_typed_answers_the_leads_first_question_unless_set_aside() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let client = daemon_answering(move |asked| {
+            if asked["op"] == "submit" {
+                seen.lock()
+                    .unwrap()
+                    .push(asked["prompt"].as_str().unwrap().to_owned());
+            }
+            json!({"turn": 2})
+        })
+        .await;
+        let mut app = app(client);
+        let dir = std::env::temp_dir().join(unique("sonny-asks"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ask = |name: &str, question: &str| {
+            let file = dir.join(name);
+            std::fs::write(&file, "{}").unwrap();
+            asks::Ask {
+                file,
+                question: question.into(),
+                choices: vec!["Keep it".into(), "Drop it".into()],
+            }
+        };
+        app.asks = vec![ask("1.json", "Keep the old API?"), ask("2.json", "Tag it?")];
+        app.input.set("2");
+        app.submit().await;
+        // Esc sets the rest aside: the next message is the person's own.
+        app.chatting = true;
+        app.input.set("how is it going?");
+        app.submit().await;
+        assert_eq!(
+            *sent.lock().unwrap(),
+            [
+                "You asked: Keep the old API?\n\nDrop it",
+                "how is it going?"
+            ]
+        );
+        assert_eq!(app.asks.len(), 1);
+        assert!(!dir.join("1.json").exists());
+        assert!(dir.join("2.json").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]

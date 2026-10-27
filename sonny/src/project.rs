@@ -84,10 +84,11 @@ pub fn plain(dir: &Path) -> Result<String, String> {
         .map_err(|e| format!("{}: {e}", e.code()))
 }
 
-/// This Sonny's start rule.
+/// This Sonny's rules for starting a task and asking the person.
 fn start() -> Result<String, String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
-    Ok(start_rule(&me.to_string_lossy()))
+    let me = me.to_string_lossy();
+    Ok(format!("{}\n\n{}", start_rule(&me), ask_rule(&me)))
 }
 
 /// How the lead starts a task in Sonny: `sonny task`, at `sonny`, makes
@@ -108,6 +109,18 @@ fn start_rule(sonny: &str) -> String {
          for a sandfs copy of any other folder, {sonny} task changes NAME lists what the task changed, \
          and once you have checked that, {sonny} task changes NAME --apply writes it here. \
          A start that fails leaves no folder behind; if it fails again, tell the person why instead of working around it."
+    )
+}
+
+/// How the lead asks the person something only they can decide, so the
+/// question waits pinned in Sonny rather than in the middle of a reply.
+fn ask_rule(sonny: &str) -> String {
+    format!(
+        "When you need the person to decide something before you can go on, ask it with\n\
+         \"{sonny}\" ask \"QUESTION\" [--choice OPTION]...\n\
+         one question per command, with up to 9 short choices when the answer is one of a few. \
+         Sonny shows it to the person until they answer, and the answer comes as their next message, \
+         starting \"You asked:\" and your question. Then end your turn, unless you have work that does not depend on the answer."
     )
 }
 
@@ -606,6 +619,13 @@ mod tests {
         ] {
             assert!(text.contains(said), "{said} in {text}");
         }
+    }
+
+    #[test]
+    fn a_lead_asks_the_person_with_sonny() {
+        let text = ask_rule("/opt/sonny");
+        assert!(text.contains("\"/opt/sonny\" ask \"QUESTION\" [--choice OPTION]...\n"));
+        assert!(text.contains("starting \"You asked:\""));
     }
 
     #[test]

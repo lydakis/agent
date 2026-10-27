@@ -312,3 +312,103 @@ jobs:
           gh release create "$RELEASE_TAG" dist/*.zip dist/sonny-*.tar.gz dist/checksums.txt \
             dist/agent.rb dist/sonny.rb dist/source-commit.txt \
             --verify-tag --draft --title "$RELEASE_TAG" --generate-notes "${options[@]}"
+
+  linux:
+    # Static Linux builds of Sonny and its daemon, added to the draft the
+    # Mac build made. Nothing here is signed, so no signing secrets.
+    needs: [resolve, package]
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify Linux release checkout
+        env:
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.resolve.outputs.commit }}
+        run: |
+          if [ "$(git rev-parse HEAD)" != "$RELEASE_COMMIT" ]; then
+            echo 'Release checkout does not match the approved commit' >&2
+            exit 1
+          fi
+          if [ "$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")" != "$RELEASE_COMMIT" ]; then
+            echo 'Release tag changed after approval' >&2
+            exit 1
+          fi
+      - name: Build Sonny and the daemon for Linux
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          # Linked against musl, statically, so they run on any Linux of
+          # their architecture.
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          target="${ARCH}-unknown-linux-musl"
+          rustup target add "$target"
+          export "CC_${ARCH}_unknown_linux_musl=musl-gcc"
+          cargo build --release --locked --bin agent --target "$target"
+          # On its own, as on the Mac, so shared features leave the daemon as built.
+          cargo build --release --locked -p sonny --bin sonny --target "$target"
+      - name: Package Sonny for Linux and verify it
+        env:
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          # The formula's layout: Sonny finds the daemon in libexec beside it.
+          version="${RELEASE_TAG#v}"
+          target="${ARCH}-unknown-linux-musl"
+          name="sonny-${version}-linux-${ARCH}"
+          stage="$RUNNER_TEMP/$name"
+          mkdir -p "$stage/bin" "$stage/libexec" dist
+          cp ".local/target/$target/release/sonny" "$stage/bin/sonny"
+          cp ".local/target/$target/release/agent" "$stage/libexec/agent"
+          for binary in "$stage/bin/sonny" "$stage/libexec/agent"; do
+            file "$binary" | grep -q 'static'
+          done
+          test "$("$stage/bin/sonny" --version)" = "sonny ${version}"
+          test "$("$stage/libexec/agent" --version)" = "agent-runtime ${version}"
+          tar -C "$RUNNER_TEMP" -czf "dist/$name.tar.gz" "$name"
+          cd dist
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          sha256sum --check "$name.tar.gz.sha256"
+      - name: Attest the Linux assets
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/sonny-*-linux-*.tar.gz
+      - name: Verify release tag before adding to the draft
+        env:
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.resolve.outputs.commit }}
+        run: |
+          remote_refs=$(git ls-remote --exit-code origin "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}")
+          remote_commit=$(printf '%s\n' "$remote_refs" | awk '
+            $2 ~ /\^\{\}$/ { peeled = $1 }
+            $2 !~ /\^\{\}$/ { direct = $1 }
+            END { print (peeled != "" ? peeled : direct) }')
+          if [ "$remote_commit" != "$RELEASE_COMMIT" ]; then
+            echo 'Release tag changed during the build' >&2
+            exit 1
+          fi
+      - name: Add the Linux assets to the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          gh release upload "$RELEASE_TAG" dist/sonny-*-linux-*.tar.gz dist/sonny-*-linux-*.tar.gz.sha256

@@ -89,6 +89,7 @@ pub fn said(command: &str, output: &str, failed: bool) -> Option<Said> {
         "plan" if program.contains("skills/plan") => plan(args),
         "sonny" if args.first().is_some_and(|a| a == "show") => sonny_show(&args[1..], failed),
         "sonny" if args.first().is_some_and(|a| a == "split") => sonny_split(&args[1..], failed),
+        "sonny" if args.first().is_some_and(|a| a == "ask") => sonny_ask(&args[1..], failed),
         "sh" | "bash"
             if args
                 .first()
@@ -792,6 +793,35 @@ fn sonny_split(words: &[String], failed: bool) -> Option<Said> {
     Some(said)
 }
 
+/// `sonny ask`, as the question the person was asked and its choices.
+fn sonny_ask(words: &[String], failed: bool) -> Option<Said> {
+    let mut question = None;
+    let mut choices = Vec::new();
+    let mut words = words.iter();
+    while let Some(word) = words.next() {
+        match word.as_str() {
+            "--choice" => choices.push(words.next()?.clone()),
+            _ => question = Some(word.clone()),
+        }
+    }
+    let mut said = Said {
+        verb: "Asked you".into(),
+        what: question?,
+        under: Vec::new(),
+        failed,
+        output: None,
+    };
+    if !choices.is_empty() {
+        let numbered: Vec<String> = choices
+            .iter()
+            .enumerate()
+            .map(|(at, choice)| format!("{} {choice}", at + 1))
+            .collect();
+        said.under.push(dim(numbered.join(" · ")));
+    }
+    Some(said)
+}
+
 /// The plan skill's call, as the plan it sets.
 fn plan(items: &[String]) -> Option<Said> {
     let mut said = Said {
@@ -948,6 +978,15 @@ Keep the rest.'"#,
             ("Opened a Rex split", "tests")
         );
         assert_eq!(text(&said.under[0]), "$ cargo test --workspace");
+        let said = said_or_none(
+            r#""/opt/homebrew/bin/sonny" ask "Round each line?" --choice Yes --choice No"#,
+            "Asked. Sonny shows the question to the person until they answer.\n",
+        );
+        assert_eq!(
+            (said.verb.as_str(), said.what.as_str()),
+            ("Asked you", "Round each line?")
+        );
+        assert_eq!(text(&said.under[0]), "1 Yes · 2 No");
     }
 
     #[test]

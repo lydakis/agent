@@ -67,6 +67,19 @@ class SdkTest(unittest.TestCase):
                 self.assertEqual(self.run_check(version).returncode == 0, ok)
 
 
+class LinuxBuildTest(unittest.TestCase):
+    def test_static_linux_builds_join_the_draft_the_mac_build_made(self):
+        workflow = (WORKFLOWS / "release.yml").read_text()
+        job = workflow[workflow.index("\n  linux:\n"):]
+        self.assertIn("needs: [resolve, package]", job)
+        for runner, arch in [("ubuntu-24.04", "x86_64"), ("ubuntu-24.04-arm", "aarch64")]:
+            self.assertIn(f"- runner: {runner}\n            arch: {arch}", job)
+        self.assertIn('target="${ARCH}-unknown-linux-musl"', job)
+        self.assertIn('gh release upload "$RELEASE_TAG"', job)
+        # No signing secret reaches it.
+        self.assertNotIn("secrets.APP", job)
+
+
 class ReleaseWorkflowTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
