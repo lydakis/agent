@@ -1892,7 +1892,13 @@ impl App {
     /// behind, or it stopped. Sonny connects again; a reply cut off
     /// mid-stream is drawn whole from the bot's items once back.
     fn dropped(&mut self) {
-        self.live = None;
+        // Words whose message came are past the replay's start: written
+        // now, or lost. Words still streaming come again with their message.
+        if let Some(live) = self.live.take()
+            && live.closed
+        {
+            self.write_words(live, Words::Reply);
+        }
         self.streamed = false;
         self.said.clear();
         self.replay = None;
@@ -2214,7 +2220,19 @@ impl App {
         if open.gap && !open.spilled && (!open.rows.is_empty() || !open.partial.is_empty()) {
             rows.push(Line::default());
         }
-        rows.extend(open.rows.iter().cloned());
+        // Held rows were wrapped for the width then: a narrower pane cuts
+        // them again, as it does the history waiting to be written.
+        for row in &open.rows {
+            match row.width() <= width {
+                true => rows.push(row.clone()),
+                false => rows.extend(transcript::wrap(
+                    row.clone(),
+                    width,
+                    Span::raw(""),
+                    Span::raw("    "),
+                )),
+            }
+        }
         let mut markdown = open.markdown.clone();
         if !open.partial.is_empty()
             && let Some(line) = markdown.line(&open.partial)
@@ -4368,6 +4386,38 @@ mod tests {
         assert_eq!(
             rows[line + 1..],
             [("".into(), false), ("• Done.".into(), false)]
+        );
+    }
+
+    #[tokio::test]
+    async fn held_words_survive_a_dropped_connection_and_a_narrower_pane() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        let said = |text: &str| json!({"event": "text_delta", "bot": "b", "turn": 1, "text": text});
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        app.daemon(said("The pay step is the regression at p95."))
+            .await;
+        app.daemon(turn_event("message", 1, json!({"node": 2})))
+            .await;
+        assert!(app.pending.is_empty(), "held until what follows");
+        // Narrower than when they were wrapped: cut again, nothing lost.
+        let narrow: Vec<String> = app.open_rows(20).iter().map(|l| l.to_string()).collect();
+        assert!(narrow.iter().all(|row| row.width() <= 20), "{narrow:?}");
+        assert_eq!(
+            narrow
+                .concat()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+            "• The pay step is the regression at p95."
+        );
+        // The message is past the replay's start, so a drop writes it.
+        app.dropped();
+        assert!(app.live.is_none());
+        let written: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
+        assert_eq!(
+            written.last().unwrap(),
+            "• The pay step is the regression at p95."
         );
     }
 
