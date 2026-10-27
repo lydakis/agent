@@ -164,7 +164,7 @@ class Play:
         self.tasks, self.labels, self.calls, self.started = set(), [], 0, False
         # Each task's newest turn and the first line it ended with.
         self.last = {}
-        role = (ROOT / 'app/agents/coordinator.md').read_text().split('---', 2)[2].strip()
+        role = (ROOT / 'sonny/agents/coordinator.md').read_text().split('---', 2)[2].strip()
         daemon.request('create', bot=self.lead, workspace=str(folder), model=model,
                        instructions=role, tools=['shell', 'read', 'write', 'edit', 'wait', 'history'])
 
