@@ -446,7 +446,7 @@ fn sandfs_copy(here: &Path, name: &str) -> Result<Place, String> {
         if !stubbed.is_empty() {
             let named: Vec<String> = stubbed.iter().map(|path| shell_quote(path)).collect();
             note.push_str(&format!(
-                ". Git is off in its copy of {} linked worktrees, whose repository is outside \
+                ". Git is off in its copy of {} linked worktrees, whose .git points outside \
                  the copy: {}",
                 stubbed.len(),
                 named.join(", ")
