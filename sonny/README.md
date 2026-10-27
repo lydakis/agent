@@ -161,7 +161,8 @@ run a command on another machine, draws those runs as `Ran COMMAND on
 PEER`, and in Rex opens a window following each detached job.
 
 Sonny starts its lookout, `sonny lookout`, when it opens a project: one
-for the daemon, watching every lead on it. It tells a lead what its tasks
+for the daemon, watching for every bot that subscribed, and Sonny
+subscribes each lead to its tasks. It tells a lead what its tasks
 did in one "Task updates" note, by the handles its wait tool reads them
 with, and wakes it early only when one needs it: a message that redirects
 other tasks, a conflict, a stuck or silent task, a result the person should
