@@ -1177,7 +1177,10 @@ impl Lookout {
             .await
         {
             for bot in page["bots"].as_array().into_iter().flatten() {
-                if let Some(name) = bot["name"].as_str().filter(|name| !judge_bot(name)) {
+                // A copy that goes once idle is a side chat, not a task.
+                if let Some(name) = (bot["name"].as_str())
+                    .filter(|name| !judge_bot(name) && bot["expire_ms"].is_null())
+                {
                     self.lineage.insert(name.to_owned());
                 }
             }
@@ -1231,6 +1234,7 @@ impl Lookout {
                 let by = event["data"]["created_by"].as_str().unwrap_or("");
                 if (self.lineage.contains(by) || bot.starts_with(&format!("{}.", self.project)))
                     && !judge_bot(bot)
+                    && event["data"]["expire_ms"].is_null()
                 {
                     self.lineage.insert(bot.to_owned());
                 }
@@ -1722,6 +1726,7 @@ pub async fn replay() -> Result<(), String> {
                 if (name.starts_with(&format!("{project}."))
                     || by.is_some_and(|by| lookout.lineage.contains(by)))
                     && !judge_bot(name)
+                    && bot["expire_ms"].is_null()
                 {
                     lookout.lineage.insert(name.to_owned());
                 }
@@ -2499,6 +2504,17 @@ mod tests {
         }
         assert!(lookout.lineage.contains("lookout.fix"));
         assert!(!lookout.lineage.iter().any(|bot| judge_bot(bot)));
+    }
+
+    #[test]
+    fn side_chats_are_never_tasks() {
+        let mut lookout = lookout();
+        lookout.project = "shop".into();
+        lookout.lineage_of(&json!({"event": "forked", "bot": "shop.fix", "data": {}}));
+        lookout.lineage_of(&json!({"event": "forked", "bot": "shop.fix.side-1a2b3c",
+            "data": {"expire_ms": 900_000}}));
+        assert!(lookout.lineage.contains("shop.fix"));
+        assert!(!lookout.lineage.contains("shop.fix.side-1a2b3c"));
     }
 
     #[test]
