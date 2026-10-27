@@ -5299,9 +5299,9 @@ impl Database {
     /// A turn's words and calls, as a program judging its calls reads them:
     /// the turn's prompt and each steer it absorbed, in order, with the bot
     /// turn that wrote each (none for a person's words); the calls it
-    /// started, with argument previews and whether each failed, and those
-    /// it was refused (`refused`); then the bot's earlier prompts, newest
-    /// first, each with the calls its turn was refused. The words' text counts against
+    /// started, with argument previews and whether each failed; then the
+    /// bot's earlier prompts, newest first. Each prompt or steer carries
+    /// the calls refused after it (`refused`). The words' text counts against
     /// `bytes` in that order and the calls' against their own `bytes`, and
     /// each steer, call, and earlier prompt also counts `PROMPTS_ENTRY`;
     /// text that does not fit is cut and marked
@@ -5370,7 +5370,9 @@ impl Database {
         }
         let mut failed = std::collections::HashSet::new();
         let mut done = std::collections::HashSet::new();
-        let refused = self.refused(turn, &mut left)?;
+        for (after, call) in self.refused(turn, &mut left)? {
+            attach(&mut prompts, after, call);
+        }
         let mut completed = self.conn.prepare_cached(
             "SELECT json_extract(data,'$.call_id'),json_extract(data,'$.failed')
              FROM events WHERE turn=? AND kind='tool_completed' ORDER BY id",
@@ -5442,28 +5444,33 @@ impl Database {
             if r.get::<_, bool>(4)? {
                 entry["steer"] = json!(true);
             }
-            let refused = self.refused(r.get(0)?, &mut left)?;
-            if !refused.is_empty() {
-                entry["refused"] = json!(refused);
-            }
+            let steer = entry["steer"] == true;
             earlier.push(entry);
+            // Its steers, newer, are listed already.
+            if !steer {
+                for (after, call) in self.refused(r.get(0)?, &mut left)? {
+                    attach(&mut earlier, after, call);
+                }
+            }
         }
-        let mut read = json!({"bot":name,"turn":turn,"status":turn_status_name(&status),"workspace":workspace,
-            "prompts":prompts,"prompts_more":prompts_more,"calls":calls,"calls_more":calls_more,"earlier":earlier,"more":more});
-        if !refused.is_empty() {
-            read["refused"] = json!(refused);
-        }
-        Ok(read)
+        Ok(
+            json!({"bot":name,"turn":turn,"status":turn_status_name(&status),"workspace":workspace,
+            "prompts":prompts,"prompts_more":prompts_more,"calls":calls,"calls_more":calls_more,"earlier":earlier,"more":more}),
+        )
     }
     /// The calls a turn was refused, each `{name, arguments}` with its
-    /// arguments cut to the budget left; a denial recorded before refused
-    /// calls were kept has no name and is left out.
-    fn refused(&self, turn: i64, left: &mut usize) -> Result<Vec<Value>> {
+    /// arguments cut to the budget left, and the turn whose words it came
+    /// after: the steer the turn last absorbed before it, else the turn's
+    /// own. A denial recorded before refused calls were kept has no name
+    /// and is left out.
+    fn refused(&self, turn: i64, left: &mut usize) -> Result<Vec<(i64, Value)>> {
         let mut statement = self.conn.prepare_cached(
-            "SELECT json_extract(data,'$.name'),json_extract(data,'$.arguments'),
-                json_extract(data,'$.arguments_truncated')
-             FROM events WHERE turn=? AND kind='tool_completed' AND json_extract(data,'$.denied')
-               AND json_extract(data,'$.name') IS NOT NULL ORDER BY id",
+            "SELECT json_extract(e.data,'$.name'),json_extract(e.data,'$.arguments'),
+                json_extract(e.data,'$.arguments_truncated'),
+                (SELECT json_extract(s.data,'$.steer') FROM events s
+                  WHERE s.turn=e.turn AND s.kind='steered' AND s.id<e.id ORDER BY s.id DESC LIMIT 1)
+             FROM events e WHERE e.turn=? AND e.kind='tool_completed' AND json_extract(e.data,'$.denied')
+               AND json_extract(e.data,'$.name') IS NOT NULL ORDER BY e.id",
         )?;
         let mut refused = Vec::new();
         let mut rows = statement.query([turn])?;
@@ -5480,7 +5487,8 @@ impl Database {
                 entry["arguments_truncated"] = json!(true);
             }
             entry["arguments"] = json!(arguments);
-            refused.push(entry);
+            let after = r.get::<_, Option<i64>>(3)?.unwrap_or(turn);
+            refused.push((after, entry));
         }
         Ok(refused)
     }
@@ -8524,6 +8532,21 @@ fn cut(text: &mut String, left: &mut usize) -> bool {
     text.truncate(end);
     *left = 0;
     true
+}
+/// Add a refused call to the listed prompt or steer it came after, or to
+/// the entry listed last when that one was left out: this turn's newest
+/// listed word, or an earlier turn's own prompt, just listed.
+fn attach(entries: &mut [Value], after: i64, call: Value) {
+    let at = entries
+        .iter()
+        .rposition(|entry| entry["turn"] == after)
+        .or(entries.len().checked_sub(1));
+    if let Some(entry) = at.and_then(|at| entries.get_mut(at)) {
+        match entry["refused"].as_array_mut() {
+            Some(calls) => calls.push(call),
+            None => entry["refused"] = json!([call]),
+        }
+    }
 }
 /// One prompt of a `prompts` read, cut to the budget left.
 fn prompt_entry(

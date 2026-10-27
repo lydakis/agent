@@ -1156,8 +1156,11 @@ class AutoApproverTests(ModelFixture):
             daemon.finished(turn)
             request = self.judge.requests.get(timeout=5)['body']['state']['request']
             self.assertEqual(request, [{'by': 'model', 'text': 'shell:printf DANGER'}])
-            self.assertEqual(daemon.request('prompts', bot='Bob', turn=turn)['result']['prompts'],
-                             [{'turn': turn, 'text': 'shell:printf DANGER', 'origin': origin}])
+            [prompt] = daemon.request('prompts', bot='Bob', turn=turn)['result']['prompts']
+            self.assertEqual({k: prompt[k] for k in ('turn', 'text', 'origin')},
+                             {'turn': turn, 'text': 'shell:printf DANGER', 'origin': origin})
+            # The call it was refused sits with it.
+            self.assertEqual([call['name'] for call in prompt['refused']], ['shell'])
 
     def test_a_call_is_judged_with_the_files_it_runs_that_the_turn_wrote(self):
         def shell_danger(body, id):

@@ -585,9 +585,10 @@ so only one instance runs at a time, and answers in layers:
    approval screen: consent is part of the conversation. Only prompts from
    the caller count, never a prompt one bot wrote for another. Since
    2026-10-26 the calls a turn was refused are kept with its denial and
-   shown to the judge (`refused_calls`, for this turn and beside each
-   earlier prompt), so a plain "yes" or "approved" after a refusal asks
-   for what was refused; a lead passing the person's go-ahead on to a
+   shown to the judge beside the words they came after (`refused_calls`
+   on a prompt or steer, this turn's or an earlier one's), so a plain
+   "yes" or "approved" right after a refusal asks for what was refused,
+   and one that came before it does not; a lead passing the person's go-ahead on to a
    task bot carries it the same way, since the person's words above a
    delegated prompt are read as the person's. A high
    answer on the approval-channel question stays denied whatever the

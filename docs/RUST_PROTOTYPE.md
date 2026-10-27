@@ -1254,10 +1254,12 @@ as an approver judges them, within `bytes` of text (default 64 KiB, at most
 256 KiB): the turn's prompt and each steer it absorbed, in order, with
 `from` or `origin`, and `prompts_more` when steers were left out; the calls it started, each with its argument preview,
 `done`, `failed` when it failed, and `node`, with `calls_more` when some
-were left out; the calls it was refused (`refused`, each `{name,
-arguments}`, `arguments_truncated` when cut); and the bot's earlier
-prompts, newest first, each with the calls its turn was refused, with
-`more` when some were left out. Refused calls count against the words'
+were left out; and the bot's earlier prompts, newest first, with `more`
+when some were left out. A prompt or steer, this turn's or an earlier
+one's, carries the calls its turn was refused after it and before the
+next steer (`refused`, each `{name, arguments}`, `arguments_truncated`
+when cut), so a reader can tell a go-ahead that followed a refusal from
+one that came before it. Refused calls count against the words'
 `bytes`. The words and the calls each have `bytes` of
 their own, so a long prompt still leaves the calls (and the files they
 wrote) to read. Text that does not fit is cut and marked

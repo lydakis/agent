@@ -10734,39 +10734,54 @@ fn a_denied_call_closes_its_round() {
 }
 
 #[test]
-fn a_refused_call_is_read_with_its_turn_and_beside_it_later() {
+fn a_refused_call_is_read_after_the_words_it_came_after() {
     let mut db = db();
     let turn = gated_turn(&mut db, None);
-    let (item, call) = shell_call("fc_1", "s1", "git push origin main");
-    db.append(turn, vec![item], std::slice::from_ref(&call), None)
+    let refuse = |db: &mut Database, turn: i64, n: &str, command: &str| {
+        let (item, call) = shell_call(&format!("fc_{n}"), n, command);
+        db.append(turn, vec![item], std::slice::from_ref(&call), None)
+            .unwrap();
+        db.answer(Decision {
+            bot: "Bob",
+            turn,
+            call_id: n,
+            request: 1,
+            tag: None,
+            allow: false,
+            reason: Some("no"),
+            by: Some("test"),
+        })
         .unwrap();
-    db.answer(Decision {
-        bot: "Bob",
-        turn,
-        call_id: "s1",
-        request: 1,
-        tag: None,
-        allow: false,
-        reason: Some("no"),
-        by: Some("test"),
-    })
-    .unwrap();
-    assert!(matches!(
-        db.approval_start(turn, &call, 0).unwrap(),
-        Gated::Denied
-    ));
-    // A person's go-ahead in a steer or the next turn can be read against
-    // what was refused.
-    let refused = json!([{"name":"shell","arguments":call.arguments}]);
-    assert_eq!(
-        db.prompts("Bob", turn, 64 * 1024).unwrap()["refused"],
-        refused
-    );
+        assert!(matches!(
+            db.approval_start(turn, &call, 0).unwrap(),
+            Gated::Denied
+        ));
+        json!({"name":"shell","arguments":call.arguments})
+    };
+    let push = refuse(&mut db, turn, "s1", "git push origin main");
+    // A person's steer, then another refusal: each refusal is listed with
+    // the words it came after, so a go-ahead reads as following only the
+    // refusals before it.
+    let steer = TurnOptions {
+        delivery: Delivery::Steer,
+        ..TurnOptions::default()
+    };
+    let steered = db
+        .begin("Bob", "r2", "yes", true, &steer, allow_provider)
+        .unwrap()
+        .turn;
+    db.absorb(turn, None, 8 << 20, 4096, ContextUsage::default(), false)
+        .unwrap();
+    let deploy = refuse(&mut db, turn, "s2", "make deploy");
+    let read = db.prompts("Bob", turn, 64 * 1024).unwrap();
+    assert_eq!(read["prompts"][0]["refused"], json!([push]));
+    assert_eq!(read["prompts"][1]["turn"], steered);
+    assert_eq!(read["prompts"][1]["refused"], json!([deploy]));
     db.finish(turn, None).unwrap();
     let next = db
         .begin(
             "Bob",
-            "yes",
+            "next",
             "approved",
             true,
             &TurnOptions::default(),
@@ -10774,45 +10789,32 @@ fn a_refused_call_is_read_with_its_turn_and_beside_it_later() {
         )
         .unwrap()
         .turn;
+    // An earlier turn's refusals sit with its prompt and steers the same way.
     let read = db.prompts("Bob", next, 64 * 1024).unwrap();
-    assert!(read.get("refused").is_none());
-    assert_eq!(read["earlier"][0]["refused"], refused);
-    // Cut to the budget like any text.
+    assert!(read["prompts"][0].get("refused").is_none());
+    assert_eq!(read["earlier"][0]["turn"], steered);
+    assert_eq!(read["earlier"][0]["refused"], json!([deploy]));
+    assert_eq!(read["earlier"][1]["refused"], json!([push]));
+    // Cut to the budget like any text, after the words: the turn's prompt
+    // and its steer, then its refusals in order.
     let entry = Database::PROMPTS_ENTRY;
-    let first = read["earlier"][0]["text"].as_str().unwrap().len();
-    let cut = db
-        .prompts("Bob", next, 8 + entry + first + entry + 5)
-        .unwrap();
-    assert_eq!(cut["earlier"][0]["refused"][0]["arguments_truncated"], true);
-    assert_eq!(
-        cut["earlier"][0]["refused"][0]["arguments"]
-            .as_str()
-            .unwrap()
-            .len(),
-        5
-    );
+    let budget = 8 + entry + 3 + entry + 4 + entry + 5;
+    let cut = db.prompts("Bob", next, budget).unwrap();
+    assert!(cut["earlier"][0].get("refused").is_none());
+    let [first] = &cut["earlier"][1]["refused"].as_array().unwrap()[..] else {
+        panic!("{}", cut["earlier"])
+    };
+    assert_eq!(first["arguments_truncated"], true);
+    assert_eq!(first["arguments"].as_str().unwrap().len(), 5);
     // A call past its preview is marked cut, as a started call's is.
-    let (item, call) = shell_call("fc_2", "s2", &"x".repeat(4096));
-    db.append(next, vec![item], std::slice::from_ref(&call), None)
-        .unwrap();
-    db.answer(Decision {
-        bot: "Bob",
-        turn: next,
-        call_id: "s2",
-        request: 1,
-        tag: None,
-        allow: false,
-        reason: Some("no"),
-        by: Some("test"),
-    })
-    .unwrap();
-    db.approval_start(next, &call, 0).unwrap();
+    let long = refuse(&mut db, next, "s3", &"x".repeat(4096));
     let previewed = db.prompts("Bob", next, 64 * 1024).unwrap();
-    assert_eq!(previewed["refused"][0]["arguments_truncated"], true);
-    assert_eq!(
-        previewed["refused"][0]["arguments"].as_str().unwrap().len(),
-        2048
-    );
+    let [listed] = &previewed["prompts"][0]["refused"].as_array().unwrap()[..] else {
+        panic!("{}", previewed["prompts"][0])
+    };
+    assert_eq!(listed["arguments_truncated"], true);
+    assert_eq!(listed["arguments"].as_str().unwrap().len(), 2048);
+    assert_eq!(listed["name"], long["name"]);
 }
 
 #[test]

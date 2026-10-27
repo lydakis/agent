@@ -1064,7 +1064,7 @@ async fn intent(
             None => request.push(Words {
                 by: by_origin(prompt),
                 text,
-                refused: Vec::new(),
+                refused: refused(&prompt["refused"]),
             }),
             Some(from) => {
                 persons_above(
@@ -1079,7 +1079,7 @@ async fn intent(
                 request.push(Words {
                     by: By::Model,
                     text,
-                    refused: Vec::new(),
+                    refused: refused(&prompt["refused"]),
                 });
             }
         }
@@ -1264,12 +1264,11 @@ async fn intent(
         allowed_cut,
         request_cut: left_out.any || left_out.newest,
         newest_cut: left_out.newest,
-        refused: refused(&read["refused"]),
         earlier,
     })
 }
 
-/// The calls a `prompts` read says a turn was refused.
+/// The calls a `prompts` read lists as refused after a prompt or steer.
 fn refused(calls: &Value) -> Vec<Refused> {
     calls
         .as_array()
@@ -1359,7 +1358,7 @@ async fn persons_above(
             None => request.push(Words {
                 by: by_origin(&prompt),
                 text: prompt_text(&prompt),
-                refused: Vec::new(),
+                refused: refused(&prompt["refused"]),
             }),
         }
     }
