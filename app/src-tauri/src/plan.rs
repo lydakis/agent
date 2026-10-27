@@ -143,7 +143,7 @@ mod tests {
         let root = scratch("script");
         let store = root.join("state.sqlite");
         std::fs::write(&store, "").unwrap();
-        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../skills/plan/plan");
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../sonny/skills/plan/plan");
         // Bash, macOS's sh, counts characters under a UTF-8 locale; dash counts bytes.
         let run_in = |shell: &str, locale: &str, args: &[&str]| {
             std::process::Command::new(shell)

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Keep this agent's plan where the app shows it: beside the daemon's store,
+# Keep this agent's plan where clients show it: beside the daemon's store,
 # under the agent's bot id, replaced whole on each call. Each step is one
 # argument starting with [x] (done), [>] (doing now) or [ ] (to do). With no
 # arguments it prints the plan as it stands; --clear removes it.

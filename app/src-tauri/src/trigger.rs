@@ -22,7 +22,6 @@
 use agent_client::Client;
 use serde_json::{Value, json};
 use std::{
-    io::Write,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -1200,40 +1199,7 @@ fn replace(path: &Path, text: &str) -> Result<(), String> {
     replace_mode(path, text.as_bytes(), 0o644)
 }
 
-/// `replace` with the file's mode set from creation, so the new name never
-/// has any other.
-pub(crate) fn replace_mode(path: &Path, text: &[u8], mode: u32) -> Result<(), String> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let dir = path.parent().ok_or("no folder")?;
-    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let temporary = dir.join(format!(
-        ".{}.{}",
-        path.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id()
-    ));
-    let written = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(mode)
-            .open(&temporary)?;
-        // An old temporary of this pid may carry another mode.
-        std::fs::set_permissions(
-            &temporary,
-            std::os::unix::fs::PermissionsExt::from_mode(mode),
-        )?;
-        file.write_all(text)?;
-        file.sync_all()?;
-        std::fs::rename(&temporary, path)?;
-        // The new name is durable only once its folder is.
-        std::fs::File::open(dir)?.sync_all()
-    })();
-    if written.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    written.map_err(|e| format!("{}: {e}", path.display()))
-}
+pub(crate) use agent_client::files::replace_mode;
 
 /// A name is part of a launchd label and a file name.
 fn valid_name(name: &str) -> Result<(), String> {
@@ -2127,12 +2093,6 @@ pub(crate) fn error_json(message: &str) -> Value {
 }
 
 /// `APP --trigger add|ls|fire|rm`, from `~/.agent/trigger`.
-/// `add` for another of the app's scripts, as if `~/.agent/trigger add`
-/// ran in this folder.
-pub(crate) fn add_here(args: &[String]) -> Result<Value, String> {
-    add(&Places::home()?, args)
-}
-
 pub fn cli(args: &[String]) -> i32 {
     let done = match Places::home().and_then(|places| match args.split_first() {
         Some((verb, rest)) if verb == "ls" => match rest {

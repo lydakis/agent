@@ -396,8 +396,8 @@ client/          agent-client: the socket protocol and the client policy
   `request` relays any protocol op; `models` reads `~/.agent/models`;
   `settings`, `save_settings`, `restart_daemon` and `discover_models` back
   [Setup](#setup-and-settings); and
-  `create_project` makes a folder's project as `~/.agent/project add`
-  does ([project.rs](../app/src-tauri/src/project.rs));
+  `create_project` makes a folder's project as Sonny's `~/.agent/project add`
+  does (`project::create` in [agent-client](../client/src/project.rs));
   `hosts` lists `~/.ssh/config`'s hosts and `open_host` opens a window on one
   ([remote.rs](../app/src-tauri/src/remote.rs));
   `policy` composes a folder's client policy, in a profile when named, and
@@ -825,8 +825,8 @@ daemon learns nothing about projects; everything here is client work.
   Home's list, opens the sheet: a folder, which **Choose…** picks with the
   system's folder panel (`NSOpenPanel` through `rfd`, with New Folder), and
   models from `~/.agent/models` under their providers' names (the last one
-  picked comes first). Creating is the app's core (`project::create`), the
-  same an agent runs with `~/.agent/project add` (below): it reads the folder's
+  picked comes first). Creating is `project::create` in agent-client, the
+  same Sonny runs for `~/.agent/project add` (below): it reads the folder's
   `project.toml` (unknown keys are refused) or names the
   project after the folder, creates the coordinator there with the folder's
   own client policy, and then writes the file if there was none, so a model
@@ -840,12 +840,12 @@ daemon learns nothing about projects; everything here is client work.
   project with no model picked, from the sheet or its coordinator profile,
   is refused with `model_required`. The threads' model and effort reach the
   coordinator shell-quoted.
-- **Projects from an agent.** The app writes `~/.agent/project` each time it
-  opens, a script that runs its executable with `--project`:
+- **Projects from an agent.** Sonny writes `~/.agent/project` each time it
+  starts, a script that runs it as `sonny project`:
   `~/.agent/project add DIR [--model PROVIDER/MODEL] [--effort LEVEL]
   [--threads-model PROVIDER/MODEL [--threads-effort LEVEL]] [--threads-in
-  worktree|project]`. It makes the project in an existing folder exactly as
-  New project does, on the daemon of the shell it runs in (`AGENT_SOCKET`,
+  worktree|project]`. It makes the project in an existing folder as New
+  project does, with Sonny's coordinator profile, copies and start rule, on the daemon of the shell it runs in (`AGENT_SOCKET`,
   `AGENT_STORE`), and prints `{"project", "coordinator", "dir", "created",
   "from_file"}`, with `created: false` for one already there; a failure is
   `{"error": CODE, "detail": ...}` on stderr and exit 1 (`model_required`,
@@ -902,8 +902,8 @@ daemon learns nothing about projects; everything here is client work.
 - **Runs.** Thinking, tool calls and their output between two messages fold
   to one line: the call in progress with its clock, or the tools used, and
   any failure. A click opens a run or unfolds one long output.
-- **Plans.** An agent keeps its plan with the `plan` skill the app ships
-  ([SKILL.md](../app/skills/plan/SKILL.md)): its script replaces the whole
+- **Plans.** An agent keeps its plan with the `plan` skill Sonny installs
+  ([SKILL.md](../sonny/skills/plan/SKILL.md)): its script replaces the whole
   plan on each call, one step an argument marked `[x] ` done, `[>] ` doing
   now or `[ ] ` to do (at most 30 steps of 200 bytes), and writes it whole
   through a temporary and a rename to `STORE-plans/BOT_ID`, beside the
@@ -933,7 +933,8 @@ daemon learns nothing about projects; everything here is client work.
 - **Tasks in worktrees.** This is the app's opinion, not the CLI's or the
   daemon's. A coordinator the app creates is started in the `coordinator`
   profile: the folder's `.agents/agents/coordinator.md`, the user's, or the
-  one the app ships ([coordinator.md](../app/agents/coordinator.md)), whose
+  one Sonny ships, which the app uses too
+  ([coordinator.md](../sonny/agents/coordinator.md)), whose
   model and tools apply when the project names none. The shipped text
   says: the coordinator makes a small, quick change itself (a few lines it
   can check at a glance) and sends work in an area an existing task owns to
@@ -1134,7 +1135,7 @@ daemon learns nothing about projects; everything here is client work.
   establish task success. Task constraints remain instructions; no
   write-prevention policy is introduced.
 - **Swarms a coordinator starts.** The app's
-  [coordinator.md](../app/agents/coordinator.md) says to read the swarm skill
+  [coordinator.md](../sonny/agents/coordinator.md) says to read the swarm skill
   listed under Skills and start one the way it says: `swarm start` runs only
   in a coordinator's shell (its bot is `PROJECT.lead`), reaches the daemon
   that shell belongs to, starts the swarm in the coordinator's project and
@@ -1216,7 +1217,7 @@ was said. The page keeps only that per task (first and latest turn, a
 count), so a long coordinator turn or a failing daemon cannot grow it. One
 message names at most 32 tasks; the rest wait for the next, and it says how
 many. The
-[coordinator role](../app/agents/coordinator.md) says what to do with it:
+[coordinator role](../sonny/agents/coordinator.md) says what to do with it:
 send another task only what it needs, with `agent run --detach --delivery
 steer`, which joins the turn it is running (or starts one) so it acts on the
 note before going further, and give a status reply with nothing to raise in
@@ -1558,8 +1559,9 @@ it). Each folder's `MEMORY.md` is an index generated from the front matter,
 one line per fact, and is held to 4 KiB so reading it at the start of
 every task stays cheap. The daemon knows nothing of memory.
 
-The app writes `~/.agent/memory` each time it opens, a script that runs its
-executable with `--memory` ([memory.rs](../app/src-tauri/src/memory.rs)):
+Sonny writes `~/.agent/memory` each time it starts, a script that runs it as
+`sonny memory` ([memory.rs](../client/src/memory.rs), in agent-client, so the
+app's Memory sheet reads facts the same way):
 
 ```sh
 ~/.agent/memory show [SCOPE]
@@ -1601,7 +1603,7 @@ was made; an index not written yet adds nothing. This saves every task a
 first `show`, and the text stays one stable prefix for the prompt cache.
 
 The app reads memory too, through `memory_view`
-([memory.rs](../app/src-tauri/src/memory.rs)), and never writes it. Memory,
+([memory.rs](../client/src/memory.rs)), and never writes it. Memory,
 at the foot of the list at Home and in a project, opens a sheet of the facts:
 at Home yours and every project's (at most 100 folders, the rest counted),
 in a project its own and yours, each newest first with its name, type,
@@ -1617,7 +1619,7 @@ facts is left out of that message rather than reported as emptied. Home
 gets no task updates, so it reads memory itself. A window on a host shows no
 Memory: that memory is the host's.
 
-The app ships a `memory` skill ([SKILL.md](../app/skills/memory/SKILL.md))
+Sonny installs a `memory` skill ([SKILL.md](../sonny/skills/memory/SKILL.md))
 that says to use those indexes, or `show` when they are missing or old,
 before starting work, to check a fact that names code against the current
 tree before acting on it, what to save
@@ -1643,7 +1645,7 @@ memory-cleanup` and `schedule` again without `--model`: that keeps the
 agent it started, with its model and history. With `--model`, while that
 agent exists, `schedule` is `bot_exists`, since an agent keeps its model
 for life. The `memory-cleanup` skill
-([SKILL.md](../app/skills/memory-cleanup/SKILL.md)) merges duplicates,
+([SKILL.md](../sonny/skills/memory-cleanup/SKILL.md)) merges duplicates,
 drops superseded facts and dates relative ones, with `save` and `rm` only,
 and never removes a fact for its age alone.
 
@@ -1662,10 +1664,11 @@ quiet.
 
 ## Skills the app ships
 
-The app ships four skills: `automation`, for recurring jobs; `plan`, an
-agent's plan the app shows (see Projects and panes); `memory`, what to
-save for later agents; and `memory-cleanup`, the nightly cleanup (see
-Memory).
+The app ships two skills: `automation`, for recurring jobs, and `swarm`.
+Sonny installs `plan`, an agent's plan the app shows (see Projects and
+panes); `memory`, what to save for later agents; and `memory-cleanup`, the
+nightly cleanup (see Memory), writing them into `~/.agents/skills` at each
+start and replacing a link the app left there.
 
 Agents read only skills in a folder's `.agents/skills` or in
 `~/.agents/skills` ([client policy](CLIENT.md)). The app bundle carries its
@@ -1675,8 +1678,8 @@ every start the app links each one from `~/.agents/skills/NAME`
 the link points at, so nothing is copied or recorded; a moved app re-points
 its links at its next start, and a skill it stops shipping loses its link.
 The Homebrew cask runs `agent-app --setup` after an install or upgrade, which
-writes what a start writes (scripts, `~/.agent/trigger`, `~/.agent/memory`, `~/.agent/project`,
-these links) before
+writes what a start writes (`~/.agent/trigger`, its triggers, these links)
+before
 the first window, and `agent-app --unlink-skills` before an uninstall, which
 removes this bundle's links and nothing else, so none outlives the app. The app's links are those into a copy of it (a bundle with
 `Contents/MacOS/agent-app`) or into an app since removed; a folder, file or

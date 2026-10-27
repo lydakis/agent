@@ -110,6 +110,8 @@ fn usage() -> String {
      sonny task NAME [--setup] [RUN FLAGS] -- BRIEF, from the lead's shell, makes a task's\n\
      folder that way and starts the task there; sonny task changes NAME [--apply] lists\n\
      (or writes here) what a sandfs copy of a plain folder changed.\n\
+     sonny memory ... and sonny project add DIR ... are what ~/.agent/memory and\n\
+     ~/.agent/project run, which Sonny writes at each start.\n\
      The lookout wakes the lead when its tasks need it, judged by --lookout, else AGENT_JUDGE\n\
      (as the approver is), else openai-decisions/gpt-6-luna with OPENAI_API_KEY, else the\n\
      newest Haiku the lead's provider lists."
@@ -445,6 +447,13 @@ fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
         Some((task, rest)) if task == "task" => task::run(rest),
+        // `~/.agent/memory` and `~/.agent/project` run these, from agents' shells.
+        Some((verb, rest)) if verb == "memory" => {
+            return std::process::ExitCode::from(agent_client::memory::cli(rest) as u8);
+        }
+        Some((verb, rest)) if verb == "project" => {
+            return std::process::ExitCode::from(project::cli(rest) as u8);
+        }
         _ => tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -475,6 +484,8 @@ async fn run() -> Result<(), String> {
         return lookout::replay().await;
     }
     let options = parse()?;
+    // Before any lead is made, so its instructions list the skills.
+    skills::install_own();
     // Fonts are read before the first picture needs them.
     std::thread::spawn(image::preload);
     let (client, mut events) = connect(&options).await?;
@@ -494,13 +505,11 @@ async fn run() -> Result<(), String> {
                 return Err(usage());
             }
             let dir = std::env::current_dir().map_err(|e| e.to_string())?;
-            // Before the lead is made, so its instructions list the skills.
             skills::install_errand();
             if options.layout {
                 mux::install_skill(options.rex_host.as_deref());
             }
-            let lead =
-                project::open(&client, &dir, &options.socket, options.model.as_deref()).await?;
+            let lead = project::open(&client, &dir, options.model.as_deref()).await?;
             fresh = lead.new;
             moving = lead.moving;
             (lead.bot, Some(lead.project))

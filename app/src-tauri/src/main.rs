@@ -16,9 +16,7 @@
 mod daemon;
 mod files;
 mod git;
-mod memory;
 mod plan;
-mod project;
 mod remote;
 mod session;
 mod settings;
@@ -27,7 +25,7 @@ mod swarm;
 mod trigger;
 mod worktree;
 
-use agent_client::Client;
+use agent_client::{Client, memory, project};
 use serde_json::{Map, Value, json};
 use session::SessionSlot;
 use std::{
@@ -369,7 +367,10 @@ fn profiles(
 /// a file of that name. They are `policy::CLIENT_ROLES`, so no agent is
 /// offered one as a role to start a peer in.
 const BUILT_IN: [(&str, &str); 2] = [
-    ("coordinator", include_str!("../../agents/coordinator.md")),
+    (
+        "coordinator",
+        include_str!("../../../sonny/agents/coordinator.md"),
+    ),
     ("home", include_str!("../../agents/home.md")),
 ];
 
@@ -675,7 +676,16 @@ async fn create_project(
             in_project,
         }),
     };
-    let mut made = project::create(&*client, &dir, &policy, &json!(TOOLS), &picks).await?;
+    let mut made = project::create(
+        &*client,
+        &dir,
+        &policy,
+        &json!(TOOLS),
+        &picks,
+        "worktree",
+        None,
+    )
+    .await?;
     made["note"] = policy["note"].clone();
     Ok(made)
 }
@@ -1345,8 +1355,7 @@ async fn request(
 const SETUP_FLAG: &str = "--setup";
 
 /// What the app puts on this machine, written at every start so it all leads
-/// to this copy: `~/.agent/trigger`, `~/.agent/memory` and `~/.agent/project`, triggers
-/// reloaded after a move, and the skills it ships linked from
+/// to this copy: `~/.agent/trigger`, triggers reloaded after a move, and the skills it ships linked from
 /// `~/.agents/skills`. False when any of it failed; each failure is printed
 /// and does not stop the rest. A start reloads triggers off the window's way.
 fn machine_setup(background: bool) -> bool {
@@ -1357,14 +1366,8 @@ fn machine_setup(background: bool) -> bool {
     };
     if let (Some(home), Ok(app)) = (std::env::var_os("HOME"), std::env::current_exe()) {
         let state = PathBuf::from(home).join(".agent");
-        for written in [
-            trigger::write_script(&state, &app),
-            memory::write_script(&state, &app),
-            project::write_script(&state, &app),
-        ] {
-            if let Err(error) = written {
-                report(&error);
-            }
+        if let Err(error) = trigger::write_script(&state, &app) {
+            report(&error);
         }
         // Ends a fire cut short are finished, and a moved app reloads every
         // trigger, each a launchctl run.
@@ -1396,20 +1399,14 @@ fn machine_setup(background: bool) -> bool {
 }
 
 fn main() {
-    // `~/.agent/trigger`, `~/.agent/memory`, `~/.agent/project`, launchd's fires and the Homebrew
-    // cask's install and uninstall run this executable; each acts and exits
+    // `~/.agent/trigger`, launchd's fires and the Homebrew cask's install
+    // and uninstall run this executable; each acts and exits
     // without a window.
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some(trigger::FLAG) => std::process::exit(trigger::cli(&args[2..])),
         Some(trigger::FIRE_FLAG) => std::process::exit(trigger::fire_cli(&args[2..])),
         Some(trigger::WATCH_FLAG) => std::process::exit(trigger::watch_cli()),
-        Some(memory::FLAG) => std::process::exit(memory::cli(&args[2..])),
-        Some(project::FLAG) => std::process::exit(project::cli(
-            &args[2..],
-            &|dir| compose(dir, Some("coordinator")),
-            &json!(TOOLS),
-        )),
         Some(SETUP_FLAG) => std::process::exit(i32::from(!machine_setup(false))),
         Some(skills::UNLINK_FLAG) => std::process::exit(skills::unlink_cli()),
         _ => {}

@@ -11,8 +11,9 @@ app; nothing in the daemon or CLI knows it exists.
     sonny --bot NAME                         # any one bot
 
 Opened in a folder, Sonny is that project's lead: the same `<project>.lead`
-the app opens, made through the app's `~/.agent/project add` when the app is
-installed, else in the app's coordinator profile. A lead moved to another
+the app opens, made by Sonny in its coordinator profile (`agents/coordinator.md`,
+unless the folder or `~/.agents/agents` has a `coordinator.md`), with the
+folder's `.agents/project.toml` written when it had none. A lead moved to another
 folder (`--workspace`) comes back with the next message Sonny sends it from
 its own, history and all. When Sonny runs in a Rex block (`rex` found as
 `$REX`, on the PATH, or in the Mac app) or a Herdr pane (`herdr` found as
@@ -90,6 +91,12 @@ commands:
   leaves the agents working.
 
 Settings Sonny keeps for every folder are in `~/.agent/sonny/settings.json`.
+At each start Sonny writes what every agent leans on, the app or not: the
+`memory`, `memory-cleanup` and `plan` skills to `~/.agents/skills` (replacing
+links the app left there), and `~/.agent/memory` and `~/.agent/project`,
+scripts that run this Sonny as `sonny memory ...` (facts saved for later
+agents, in `~/.agents/memory`) and `sonny project add DIR ...` (a project and
+its lead, as a lead makes one when the person asks).
 When `errand` is installed, Sonny writes an `errand` skill so any agent can
 run a command on another machine, draws those runs as `Ran COMMAND on
 PEER`, and in Rex opens a window following each detached job.

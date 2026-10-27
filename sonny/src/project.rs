@@ -1,15 +1,16 @@
 //! The folder's coordinator: opened with no `--bot`, Sonny talks to the
 //! project's lead, `<project>.lead`, the same bot the app opens for that
 //! folder, so the two clients share one conversation. A folder that is not
-//! a project yet becomes one the way the app makes it, through the app's
-//! `~/.agent/project add` when the app is installed.
+//! a project yet becomes one: its lead, then its `.agents/project.toml`.
+//! `sonny project add`, which `~/.agent/project` runs, makes one from an
+//! agent's shell the same way.
 use agent_client::Client;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
-/// The coordinator profile the app ships, used when neither the folder nor
-/// the user has a `coordinator.md` and the app's script is not installed.
-const COORDINATOR: &str = include_str!("../../app/agents/coordinator.md");
+/// The coordinator profile Sonny ships, used when neither the folder nor
+/// the user has a `coordinator.md`.
+pub const COORDINATOR: &str = include_str!("../agents/coordinator.md");
 const TOOLS: [&str; 6] = ["shell", "read", "write", "edit", "wait", "history"];
 
 pub struct Lead {
@@ -30,7 +31,7 @@ fn default_name(dir: &Path) -> Result<String, String> {
 }
 
 /// The coordinator's role: the folder's or the user's `coordinator.md`,
-/// else the app's.
+/// else Sonny's.
 fn role(dir: &Path) -> Result<agent_client::policy::Profile, String> {
     Ok(
         match agent_client::policy::profile(dir, "coordinator").map_err(|e| e.to_string())? {
@@ -40,7 +41,7 @@ fn role(dir: &Path) -> Result<agent_client::policy::Profile, String> {
     )
 }
 
-/// A lead's instructions as the app composes them for `dir` now: its role,
+/// A lead's instructions as Sonny composes them for `dir` now: its role,
 /// the folder's rules, skills and memory, then the project's task rule
 /// with the copies Sonny is set to. Rex is the rex-windows skill's to
 /// explain, so they read the same in any client.
@@ -50,21 +51,34 @@ pub fn instructions(dir: &Path) -> Result<String, String> {
 
 /// The instructions and the names of the skills they list.
 fn compose(dir: &Path) -> Result<(String, Vec<String>), String> {
+    let (composed, skills) = folder(dir, &role(dir)?)?;
+    let info = agent_client::project::read(dir)?;
+    let copies = crate::settings::Settings::load().copies;
+    let rule = agent_client::project::rule(&info, &copies);
+    Ok((format!("{composed}\n\n{rule}\n\n{}", start()?), skills))
+}
+
+/// The role with the folder's rules, skills and memory, before the
+/// project's task rule, and the names of the skills they list.
+fn folder(
+    dir: &Path,
+    role: &agent_client::policy::Profile,
+) -> Result<(String, Vec<String>), String> {
     let memory = agent_client::policy::memory_indexes(dir).map_err(|e| e.to_string())?;
-    let composed = agent_client::policy::instructions(dir, Some(&role(dir)?), &memory)
-        .map_err(|e| e.to_string())?;
+    let composed =
+        agent_client::policy::instructions(dir, Some(role), &memory).map_err(|e| e.to_string())?;
     let skills = composed
         .skills
         .into_iter()
         .map(|skill| skill.name)
         .collect();
-    let composed = composed.text;
-    let info = agent_client::project::read(dir)?;
-    let copies = crate::settings::Settings::load().copies;
-    let rule = agent_client::project::rule(&info, &copies);
+    Ok((composed.text, skills))
+}
+
+/// This Sonny's start rule.
+fn start() -> Result<String, String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
-    let start = start_rule(&me.to_string_lossy());
-    Ok((format!("{composed}\n\n{rule}\n\n{start}"), skills))
+    Ok(start_rule(&me.to_string_lossy()))
 }
 
 /// How the lead starts a task in Sonny: `sonny task`, at `sonny`, makes
@@ -290,12 +304,7 @@ fn same_name(dir: &Path, name: &str) -> bool {
 }
 
 /// The lead for `dir`, made first when the folder is not a project yet.
-pub async fn open(
-    client: &Client,
-    dir: &Path,
-    socket: &Path,
-    model: Option<&str>,
-) -> Result<Lead, String> {
+pub async fn open(client: &Client, dir: &Path, model: Option<&str>) -> Result<Lead, String> {
     let mut dir = dir.canonicalize().map_err(|e| e.to_string())?;
     // Inside a project, wherever below its folder (or in a worktree of
     // it), its lead, which works in that folder: made there first when
@@ -324,7 +333,7 @@ pub async fn open(
             moving,
         });
     }
-    create(client, &dir, socket, &bot, model).await?;
+    create(client, &dir, model).await?;
     Ok(Lead {
         project,
         bot,
@@ -367,26 +376,15 @@ async fn newest(client: &Client) -> Result<Option<String>, String> {
     }
 }
 
-async fn create(
-    client: &Client,
-    dir: &Path,
-    socket: &Path,
-    bot: &str,
-    model: Option<&str>,
-) -> Result<(), String> {
+async fn create(client: &Client, dir: &Path, model: Option<&str>) -> Result<(), String> {
     let role = role(dir)?;
     let info = agent_client::project::read(dir)?;
-    let chosen = info["model"].as_str().map(str::to_owned);
-    // The project file's effort goes with its model.
-    let effort = match model {
-        None if chosen.is_some() => info["reasoning"].as_str().map(str::to_owned),
-        _ => None,
-    };
-    // Asked for, the project file's, the role's, AGENT_MODEL's, then the
-    // newest agent's, so a bare `sonny` needs no flag.
+    // A project file that names a model keeps it; otherwise asked for,
+    // the role's, AGENT_MODEL's, then the newest agent's, so a bare
+    // `sonny` needs no flag.
     let model = match model
         .map(str::to_owned)
-        .or(chosen)
+        .or_else(|| info["model"].as_str().map(str::to_owned))
         .or_else(|| role.model.clone())
     {
         Some(model) => model,
@@ -397,42 +395,195 @@ async fn create(
                 .ok_or("model_required: no agent has run yet; pass --model PROVIDER/MODEL once")?,
         },
     };
-    // The app's own way, file and all, when the app is installed.
-    let script = std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent/project"));
-    if let Some(script) = script.filter(|s| s.is_file()) {
-        let mut command = std::process::Command::new(script);
-        command.arg("add").arg(dir).env("AGENT_SOCKET", socket);
-        command.args(["--model", &model]);
-        let out = command.output().map_err(|e| e.to_string())?;
-        if !out.status.success() {
-            return Err(String::from_utf8_lossy(&out.stderr).trim().to_owned());
+    let picks = agent_client::project::Picks {
+        model: Some(model),
+        ..Default::default()
+    };
+    make(client, dir, &role, &picks).await.map(|_| ())
+}
+
+/// Make the project in `dir` with its lead in `role`, told the task rule
+/// with the copies Sonny is set to and how Sonny starts tasks.
+async fn make(
+    client: &Client,
+    dir: &Path,
+    role: &agent_client::policy::Profile,
+    picks: &agent_client::project::Picks,
+) -> Result<Value, String> {
+    let (instructions, _) = folder(dir, role)?;
+    let policy = json!({
+        "instructions": instructions,
+        "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
+        "model": role.model,
+        "tools": role.tools,
+    });
+    let copies = crate::settings::Settings::load().copies;
+    agent_client::project::create(
+        client,
+        dir,
+        &policy,
+        &json!(TOOLS),
+        picks,
+        &copies,
+        Some(&start()?),
+    )
+    .await
+}
+
+const USAGE: &str = "usage: project add DIR [--model PROVIDER/MODEL] [--effort LEVEL] [--threads-model PROVIDER/MODEL [--threads-effort LEVEL]] [--threads-in worktree|project]";
+
+/// What `~/.agent/project` says it takes.
+pub fn usage() -> &'static str {
+    USAGE
+}
+
+/// `sonny project add`, as `~/.agent/project` runs it from an agent's
+/// shell: the project Sonny makes for a folder, on that shell's daemon,
+/// printed as one JSON line (`created: false` when it was there already),
+/// or an `{"error": CODE, "detail": ...}` line on stderr and exit 1.
+pub fn cli(args: &[String]) -> i32 {
+    let made = add_args(args).and_then(|(dir, picks)| {
+        let socket = daemon_socket()?;
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?
+            .block_on(async {
+                let (client, _events) = Client::connect(&socket)
+                    .await
+                    .map_err(|e| format!("{}: {}", e.code, e.detail.unwrap_or_default()))?;
+                let made = make(&client, &dir, &role(&dir)?, &picks).await;
+                client.close().await;
+                made
+            })
+    });
+    match made {
+        Ok(mut made) => {
+            made.as_object_mut().map(|m| m.remove("record"));
+            println!("{made}");
+            0
         }
-        return Ok(());
+        Err(error) => {
+            eprintln!("{}", error_json(&error));
+            1
+        }
     }
-    // Without the app: the same role and folder policy, no project file.
-    let memory = agent_client::policy::memory_indexes(dir).map_err(|e| e.to_string())?;
-    let instructions = agent_client::policy::instructions(dir, Some(&role), &memory)
-        .map_err(|e| e.to_string())?
-        .text;
-    let tools: Vec<String> = role
-        .tools
-        .clone()
-        .unwrap_or_else(|| TOOLS.iter().map(|t| t.to_string()).collect());
-    client
-        .request(
-            "create",
-            json!({"bot": bot, "workspace": dir, "model": model, "effort": effort,
-                "instructions": instructions, "tools": tools,
-                "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS}),
+}
+
+/// The folder and picks `project add` was given.
+fn add_args(args: &[String]) -> Result<(PathBuf, agent_client::project::Picks), String> {
+    let usage = || USAGE.to_owned();
+    let (Some("add"), Some(dir)) = (args.first().map(String::as_str), args.get(1)) else {
+        return Err(usage());
+    };
+    let mut picks = agent_client::project::Picks::default();
+    let (mut threads_model, mut threads_effort, mut threads_in) = (None, None, None);
+    let mut rest = args[2..].iter();
+    while let Some(flag) = rest.next() {
+        let value = rest
+            .next()
+            .filter(|v| !v.is_empty())
+            .ok_or_else(usage)?
+            .clone();
+        let slot = match flag.as_str() {
+            "--model" => &mut picks.model,
+            "--effort" => &mut picks.effort,
+            "--threads-model" => &mut threads_model,
+            "--threads-effort" => &mut threads_effort,
+            "--threads-in" => &mut threads_in,
+            _ => return Err(usage()),
+        };
+        if slot.replace(value).is_some() {
+            return Err(usage());
+        }
+    }
+    if threads_effort.is_some() && threads_model.is_none() {
+        return Err("usage: --threads-effort goes with --threads-model".into());
+    }
+    let in_project = match threads_in.as_deref() {
+        None | Some("worktree") => false,
+        Some("project") => true,
+        Some(_) => return Err(usage()),
+    };
+    if threads_model.is_some() || threads_in.is_some() {
+        picks.threads = Some(agent_client::project::ThreadPicks {
+            model: threads_model,
+            effort: threads_effort,
+            in_project,
+        });
+    }
+    let dir = Path::new(dir)
+        .canonicalize()
+        .map_err(|e| format!("project_invalid: {dir}: {e}"))?;
+    if !dir.is_dir() {
+        return Err(format!(
+            "project_invalid: {} is not a folder",
+            dir.display()
+        ));
+    }
+    Ok((dir, picks))
+}
+
+/// The daemon of the shell this runs in, found as the CLI finds it.
+fn daemon_socket() -> Result<PathBuf, String> {
+    if let Some(socket) = std::env::var_os("AGENT_SOCKET").filter(|s| !s.is_empty()) {
+        return Ok(PathBuf::from(socket));
+    }
+    let store = match std::env::var_os("AGENT_STORE").filter(|s| !s.is_empty()) {
+        Some(store) => PathBuf::from(store),
+        None => PathBuf::from(
+            std::env::var_os("HOME")
+                .ok_or("no AGENT_SOCKET, AGENT_STORE or HOME to find the daemon")?,
         )
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(())
+        .join(".agent/state.sqlite"),
+    };
+    agent_client::socket::default_socket(&store).map_err(|e| e.to_string())
+}
+
+/// One error shape, `{"error": CODE, "detail": ...}`, from `CODE: detail`.
+fn error_json(message: &str) -> Value {
+    match message.split_once(": ") {
+        Some((code, detail))
+            if !code.is_empty() && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') =>
+        {
+            json!({"error": code, "detail": detail})
+        }
+        _ => json!({"error": "project_failed", "detail": message}),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_add_reads_its_flags_and_refuses_others() {
+        let run = |args: &[&str]| add_args(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>());
+        for bad in [
+            &["add"][..],
+            &["rm", "/x"],
+            &["add", "/x", "--model"],
+            &["add", "/x", "--color", "red"],
+            &["add", "/x", "--threads-in", "elsewhere"],
+            &["add", "/x", "--model", "a", "--model", "b"],
+            &["add", "/x", "--threads-effort", "low"],
+        ] {
+            assert!(run(bad).unwrap_err().starts_with("usage: "), "{bad:?}");
+        }
+        assert!(
+            run(&["add", "/no/such/folder/here"])
+                .unwrap_err()
+                .starts_with("project_invalid: ")
+        );
+        let (_, picks) = run(&["add", "/", "--model", "a/b", "--threads-in", "project"]).unwrap();
+        assert_eq!(picks.model.as_deref(), Some("a/b"));
+        assert!(
+            picks
+                .threads
+                .is_some_and(|t| t.in_project && t.model.is_none())
+        );
+        assert_eq!(error_json("project_exists: x")["error"], "project_exists");
+    }
 
     #[test]
     fn a_lead_starts_its_tasks_with_sonny() {
