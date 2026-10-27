@@ -168,10 +168,14 @@ class DaemonTests(ModelFixture):
         refused = client.request('configure', bot='Ann', effort='low')
         self.assertEqual(refused['error'], 'invalid_effort')
         ann_id = client.request('inspect', bot='Ann')['result']['bot_id']
+        client.request('configure', bot='Ann', approve=['echo'], approver='auto')
         bob = client.request('create', bot='Bob', workspace=str(self.path), tools=['echo'],
                              created_by='Ann', created_by_id=ann_id)
         self.assertIn('result', bob, bob)
-        self.assertEqual(client.request('configure', bot='Bob', approve=[])['error'], 'gates_inherited')
+        # A bot another bot made takes its gate, and configuring it still
+        # replaces it: the person overriding decides.
+        self.assertEqual([g['tag'] for g in client.request('inspect', bot='Bob')['result']['gates']], ['auto'])
+        self.assertEqual(client.request('configure', bot='Bob', approve=[])['result']['changed'], ['gates'])
         self.assertEqual(client.request('inspect', bot='Bob')['result']['gates'], [])
 
     def test_admissions_sent_together_answer_in_order_and_start_once(self):
