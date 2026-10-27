@@ -1910,8 +1910,26 @@ impl Service {
         let Some(lead) = record["name"].as_str() else {
             return;
         };
+        let fresh = !self.lookouts.contains_key(lead);
         if !self.place(record) {
             return;
+        }
+        // Subscribed while live and mid-turn: what its turn waits on is no
+        // news, though the events that said so came before it had a lookout.
+        if fresh && self.live {
+            let newest = json!({"bot": lead, "newest": true, "limit": 1});
+            let turn = (client.request("turns", newest).await.ok())
+                .and_then(|page| page["turns"].get(0).cloned())
+                .unwrap_or_default();
+            if turn["status"] == "waiting"
+                && let Some(lookout) = self.lookouts.get_mut(lead)
+            {
+                let handles = turn["waiting_on"]["handles"].clone();
+                lookout.event(
+                    &json!({"bot": lead, "turn": turn["turn"], "event": "turn_waiting",
+                    "data": {"handles": handles, "any": turn["waiting_on"]["any"]}}),
+                );
+            }
         }
         if !pick || !self.lookouts[lead].unpicked {
             return;
