@@ -133,7 +133,7 @@ class ResponsesSocketTests(unittest.TestCase):
             started = time.monotonic()
             turn = client.request('submit', bot='Bob', request_id='r', prompt='hello')['result']['turn']
             retry = client.receive(lambda e: e.get('event') == 'retry' and e.get('turn') == turn)
-            self.assertEqual(retry['error'], 'provider_http_429')
+            self.assertEqual(retry['data']['error'], 'provider_http_429')
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
             # The pool stayed closed for the upgrade's retry-after.
             self.assertGreaterEqual(time.monotonic() - started, 0.9)

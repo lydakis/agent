@@ -1710,8 +1710,8 @@ reset headers are only how long a full refill takes; the pool learns the level
 and refills continuously, so it never idles waiting for a reset. Rate limits wait on
 the pool; other transient failures back off from 250 ms doubling to 30 s with
 a deterministic spread of up to a fifth, which matters only when several
-daemons share one key. A tool is never rerun. Each retry is a non-durable
-`retry` notification (attempt, error, detail, delay) to live followers, and a
+daemons share one key. A tool is never rerun. Each retry is a durable `retry`
+event of its turn (attempt, error, detail, delay, whether it parked), and a
 turn's record carries `retries`, `paced_ms` and `summary_ms` in `turns`. `retries` counts
 additional attempts that entered HTTP dispatch; cancelling during backoff or
 pacing does not count an unsent retry. `paced_ms` includes a partially elapsed

@@ -2868,14 +2868,11 @@ impl Turn {
             // Sent again at once without the thinking, within the same
             // attempt and time limits as any retry.
             if resend && capped.is_none() && attempt < cap && spent < RETRY_BUDGET {
-                self.hub
-                    .live(
-                        &self.bot,
-                        json!({"event":"retry","bot":self.bot,"turn":turn,"durable":false,
-                            "attempt":attempt,"error":error.code,"detail":error.detail,
-                            "delay_ms":0,"parked":false,"thinking_withheld":true}),
-                    )
-                    .await?;
+                self.retried(
+                    json!({"attempt":attempt,"error":error.code,"detail":error.detail,
+                    "delay_ms":0,"parked":false,"thinking_withheld":true}),
+                )
+                .await?;
                 continue;
             }
             // Final provider errors are kept.
@@ -2905,14 +2902,11 @@ impl Turn {
                 None if error.code == "provider_login_refreshed" => std::time::Duration::ZERO,
                 None => backoff(attempt, turn as u64),
             };
-            self.hub
-                .live(
-                    &self.bot,
-                    json!({"event":"retry","bot":self.bot,"turn":turn,"durable":false,
-                        "attempt":attempt,"error":error.code,"detail":error.detail,
-                        "delay_ms":delay.as_millis() as u64,"parked":park.is_some()}),
-                )
-                .await?;
+            self.retried(
+                json!({"attempt":attempt,"error":error.code,"detail":error.detail,
+                "delay_ms":delay.as_millis() as u64,"parked":park.is_some()}),
+            )
+            .await?;
             if let Some(block) = park {
                 accounting.call_attempts = attempt;
                 accounting.call_spent_ms = spent.as_millis() as u64;
@@ -2952,6 +2946,14 @@ impl Turn {
                 tail: Box::new(|_| Items::empty()),
             },
         }
+    }
+
+    /// Record a retry as the turn's event, so it outlives the live stream.
+    async fn retried(&self, data: Value) -> Result<()> {
+        let turn = self.turn;
+        self.store
+            .op("retried", move |db| db.retried(turn, data))
+            .await
     }
 
     async fn failed_usage(&self, usage: Option<agent_runtime::provider::Usage>) -> Result<()> {

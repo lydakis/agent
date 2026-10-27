@@ -118,7 +118,7 @@ impl Tool {
                 "required":["text"],"additionalProperties":false}),
             ),
             Tool::Wait => (
-                "Suspend until every handle resolves, without holding any execution capacity. Handles are 'turn:BOT/N' (a peer agent's turn, printed by run --detach) or 'proc:N' (a background shell). Each result reports the outcome: a peer's status and final text, or a process's output and exit code. With timeout_ms, unresolved handles are reported as pending and stay valid for a later wait; 0 polls without waiting. With any: true, the first resolved handle ends the wait and the rest are reported pending. A steer ends the wait at once with steered=true: unresolved handles are reported pending and stay valid, so wait again to keep waiting.",
+                "Suspend until every handle resolves, without holding any execution capacity. Handles are 'turn:BOT/N' (a peer agent's turn, printed by run --detach) or 'proc:N' (a background shell). Each result reports the outcome: a peer's status and final text, or a process's output and exit code. With timeout_ms, unresolved handles are reported as pending and stay valid for a later wait; 0 polls without waiting. With any: true, the first resolved handle ends the wait and the rest are reported pending. A steer ends the wait at once with steered=true: unresolved handles are reported pending and stay valid, so wait again to keep waiting. To wait for a condition, start a shell with background=true running a loop such as `until CHECK; do sleep 5; done` and wait on its proc handle, rather than checking in repeated calls.",
                 json!({"type":"object","properties":{"handles":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":64},
                 "timeout_ms":{"type":"integer","minimum":0,"maximum":MAX_WAIT_TIMEOUT_MS},"any":{"type":"boolean"}},
                 "required":["handles"],"additionalProperties":false}),
@@ -567,13 +567,24 @@ impl Registry {
             }
             Tool::Shell => {
                 let args: Shell = serde_json::from_str(args).map_err(invalid)?;
-                if args.command.is_empty()
-                    || args.command.len() > 16 * 1024
-                    || args.command.contains('\0')
-                    || !(1..=MAX_SHELL_TIMEOUT_MS).contains(&args.timeout_ms)
-                    || (args.detach && args.background)
-                {
-                    return fail("invalid_shell_arguments");
+                let invalid = if args.command.is_empty() {
+                    Some("command is empty".to_owned())
+                } else if args.command.len() > 16 * 1024 {
+                    Some("command is over 16 KiB".to_owned())
+                } else if args.command.contains('\0') {
+                    Some("command contains a NUL byte".to_owned())
+                } else if !(1..=MAX_SHELL_TIMEOUT_MS).contains(&args.timeout_ms) {
+                    Some(format!(
+                        "timeout_ms is {}; it runs from 1 to {MAX_SHELL_TIMEOUT_MS}",
+                        args.timeout_ms
+                    ))
+                } else if args.detach && args.background {
+                    Some("detach and background cannot both be set".to_owned())
+                } else {
+                    None
+                };
+                if let Some(detail) = invalid {
+                    return fail_with("invalid_shell_arguments", detail);
                 }
                 if args.detach {
                     return Ok(Prepared::Detach(args.command));
@@ -1255,5 +1266,23 @@ mod tests {
         assert!(Registry::new("echo,echo").is_err());
         assert!(Registry::new("mcp").is_err());
         assert_eq!(Registry::new("read").unwrap().names(), ["read"]);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn invalid_shell_arguments_say_which() {
+        let shell = Registry::new("shell").unwrap();
+        let detail = |args: &str| match shell.prepare("shell", args) {
+            Err(error) if error.code == "invalid_shell_arguments" => error.detail.unwrap(),
+            _ => panic!("{args} was accepted"),
+        };
+        assert_eq!(
+            detail(r#"{"command":"true","timeout_ms":900000}"#),
+            "timeout_ms is 900000; it runs from 1 to 600000"
+        );
+        assert_eq!(detail(r#"{"command":""}"#), "command is empty");
+        assert_eq!(
+            detail(r#"{"command":"true","detach":true,"background":true}"#),
+            "detach and background cannot both be set"
+        );
     }
 }
