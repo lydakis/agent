@@ -299,6 +299,125 @@ class WaitTests(ModelFixture):
         self.assertEqual(client.finished(relook)['data']['status'], 'completed')
         self.assertEqual(self.tool_output(client, 'Dave', 'wait-1')['results'][lost]['error'], 'process_lost')
 
+    def model_inputs(self):
+        requests = []
+        while not self.model.requests.empty():
+            requests.append(self.model.requests.get())
+        return requests
+
+    def test_a_steer_wakes_a_parked_wait_and_its_handles_stay_valid(self):
+        client = self.client('echo,shell,wait')
+        client.request('create', bot='Bob', workspace=str(self.path))
+        started = client.request('submit', bot='Bob', request_id='bg', prompt='bg:sleep 1.5; printf done')['result']['turn']
+        client.finished(started)
+        handle = self.tool_output(client, 'Bob', 'bg-1')['handle']
+        turn = client.request('submit', bot='Bob', request_id='w', prompt='rewait:' + handle)['result']['turn']
+        client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
+        sent = time.monotonic()
+        steer = client.request('submit', bot='Bob', request_id='s', prompt='steer:look', delivery='steer')['result']
+        self.assertEqual(steer['status'], 'queued')
+        done = client.finished(steer['turn'])['data']
+        self.assertEqual((done['status'], done['into']), ('steered', turn))
+        # The steer reached the bot long before the command ended.
+        self.assertLess(time.monotonic() - sent, 1.0)
+        early = self.tool_output(client, 'Bob', 'wait-1')
+        self.assertEqual((early['pending'], early['steered']), ([handle], True))
+        # The bot read the steer after the early result, and waited again.
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        later = self.tool_output(client, 'Bob', 'wait-2')
+        self.assertEqual((later['pending'], later['results'][handle]['stdout']), ([], 'done'))
+        self.assertNotIn('steered', later)
+        woken = [r for r in self.model_inputs() if any(i.get('call_id') == 'wait-2' for i in r['input'])][0]
+        tail = [i for i in woken['input'] if i.get('call_id') == 'wait-1' or i.get('role') == 'user'][-2:]
+        self.assertEqual(tail[0]['type'], 'function_call_output')
+        self.assertEqual(tail[1]['content'][0]['text'], 'steer:look')
+
+    def test_a_steer_passes_every_wait_in_the_same_response(self):
+        client = self.client('echo,shell,wait')
+        client.request('create', bot='Bob', workspace=str(self.path))
+        started = client.request('submit', bot='Bob', request_id='bg', prompt='bg:sleep 1.5; printf done')['result']['turn']
+        client.finished(started)
+        handle = self.tool_output(client, 'Bob', 'bg-1')['handle']
+        turn = client.request('submit', bot='Bob', request_id='w', prompt='rewait2:' + handle)['result']['turn']
+        client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
+        sent = time.monotonic()
+        steer = client.request('submit', bot='Bob', request_id='s', prompt='steer:look', delivery='steer')['result']
+        self.assertEqual(client.finished(steer['turn'])['data']['status'], 'steered')
+        self.assertLess(time.monotonic() - sent, 1.0)
+        for call in ('wait-1', 'wait-2'):
+            early = self.tool_output(client, 'Bob', call)
+            self.assertEqual((early['pending'], early['steered']), ([handle], True))
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(self.tool_output(client, 'Bob', 'wait-3')['results'][handle]['stdout'], 'done')
+
+    def test_a_steer_moves_a_running_command_to_the_background(self):
+        client = self.client('echo,shell,wait')
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='l', prompt='liftwait:sleep 1.5; printf done')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn)
+        sent = time.monotonic()
+        steer = client.request('submit', bot='Bob', request_id='s', prompt='steer:look', delivery='steer')['result']
+        done = client.finished(steer['turn'])['data']
+        self.assertEqual((done['status'], done['into']), ('steered', turn))
+        self.assertLess(time.monotonic() - sent, 1.0)
+        lifted = self.tool_output(client, 'Bob', 'lift-1')
+        self.assertEqual((lifted['background'], lifted['steered']), (True, True))
+        # Nothing was killed: the command finished and its output arrived
+        # on the handle.
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        result = self.tool_output(client, 'Bob', 'wait-2')['results'][lifted['handle']]
+        self.assertEqual((result['stdout'], result['exit_code']), ('done', 0))
+
+    def test_a_command_that_ends_soon_after_a_steer_returns_as_usual(self):
+        client = self.client('echo,shell,wait')
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='l', prompt='liftwait:sleep .1; printf quick')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn)
+        steer = client.request('submit', bot='Bob', request_id='s', prompt='steer:look', delivery='steer')['result']
+        self.assertEqual(client.finished(steer['turn'])['data']['status'], 'steered')
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(self.tool_output(client, 'Bob', 'lift-1')['stdout'], 'quick')
+
+    def test_a_steer_that_runs_as_its_own_turn_leaves_the_command_running(self):
+        other = self.path / 'other'
+        other.mkdir()
+        client = self.client('echo,shell,wait')
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='l', prompt='liftwait:sleep .8; printf done')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn)
+        steer = client.request('submit', bot='Bob', request_id='s', prompt='elsewhere',
+                               workspace=str(other), delivery='steer')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(self.tool_output(client, 'Bob', 'lift-1')['stdout'], 'done')
+        self.assertEqual(client.finished(steer)['data']['status'], 'completed')
+
+    def test_a_steer_leaves_a_command_waiting_for_a_slot_in_line(self):
+        client = self.client('echo,shell,wait', extra=('--max-processes', '1'))
+        for bot in ('Hold', 'Bob'):
+            client.request('create', bot=bot, workspace=str(self.path))
+        held = client.request('submit', bot='Hold', request_id='h', prompt='bg:sleep .8')['result']['turn']
+        client.finished(held)
+        turn = client.request('submit', bot='Bob', request_id='l', prompt='liftwait:printf ran')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn)
+        client.request('submit', bot='Bob', request_id='s', prompt='steer:look', delivery='steer')
+        # It ran once the slot freed, and too quickly to be moved.
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(self.tool_output(client, 'Bob', 'lift-1')['stdout'], 'ran')
+        self.assertEqual(client.request('stats')['result']['queued_processes'], 0)
+
+    def test_a_queued_message_leaves_a_parked_wait_alone(self):
+        client = self.client('echo,shell,wait')
+        client.request('create', bot='Bob', workspace=str(self.path))
+        started = client.request('submit', bot='Bob', request_id='bg', prompt='bg:sleep .6')['result']['turn']
+        client.finished(started)
+        handle = self.tool_output(client, 'Bob', 'bg-1')['handle']
+        turn = client.request('submit', bot='Bob', request_id='w', prompt='rewait:' + handle)['result']['turn']
+        client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
+        client.request('submit', bot='Bob', request_id='q', prompt='later', delivery='queue')
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        waited = self.tool_output(client, 'Bob', 'wait-1')
+        self.assertEqual((waited['pending'], 'steered' in waited), ([], False))
+
     def test_calls_after_a_wait_in_the_same_response_run_on_resume(self):
         client = self.client('echo,shell,wait')
         for bot in ('Bob', 'Alice'):
