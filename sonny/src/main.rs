@@ -3033,9 +3033,13 @@ impl App {
             // A row count fits a u16 only so far.
             for rows in lines.chunks(4096) {
                 let mut linked = Vec::new();
+                let cut: Vec<bool> = rows
+                    .iter()
+                    .map(|row| row.alignment == Some(transcript::CUT))
+                    .collect();
                 terminal.insert_before(rows.len() as u16, |buf| {
                     Paragraph::new(rows.to_vec()).render(buf.area, buf);
-                    linked = links::cells(buf);
+                    linked = links::cells(buf, &cut);
                 })?;
                 // The rows sit just above the viewport now; those still on
                 // the screen get their addresses linked.

@@ -7,9 +7,11 @@ use ratatui::buffer::{Buffer, Cell};
 
 /// The cells of `buf` that show a web address, each address's first cell
 /// opening its hyperlink and its last closing it, by column and row. An
-/// address cut at the edge of a row goes on in the next one, past its
-/// indent, and both parts open the whole address.
-pub fn cells(buf: &Buffer) -> Vec<(u16, u16, Cell)> {
+/// address that runs to a row's end goes on past the indent of each row
+/// `cut` marks as going on with it, and every part opens the whole
+/// address. One with a character an address does not hold as such, like
+/// `é`, is left unlinked rather than linked short.
+pub fn cells(buf: &Buffer, cut: &[bool]) -> Vec<(u16, u16, Cell)> {
     let area = buf.area;
     let rows: Vec<Vec<&str>> = (0..area.height)
         .map(|y| {
@@ -19,26 +21,34 @@ pub fn cells(buf: &Buffer) -> Vec<(u16, u16, Cell)> {
         })
         .collect();
     let mut out = Vec::new();
-    // Where the next row's search starts: past the rest of an address.
-    let mut carried = 0;
+    // Where each row's search starts: past the part of an address above.
+    let mut from_x = vec![0; rows.len()];
     for y in 0..rows.len() {
         let row = &rows[y];
-        let mut x = std::mem::take(&mut carried);
+        let mut x = from_x[y];
         while let Some(start) = find(row, x) {
             let end = run(row, start);
+            x = end.max(start + 1);
             let mut parts = vec![(y, start, end)];
             let mut url: String = row[start..end].concat();
-            // Cut at the edge: the rest starts the next row, after spaces.
-            if end == row.len()
-                && let Some(next) = rows.get(y + 1)
+            // Cut at a row's end: the rest goes on after the next's indent.
+            let (mut last_row, mut last_end) = (y, end);
+            while rows[last_row][last_end..].iter().all(|s| *s == " ")
+                && cut.get(last_row + 1) == Some(&true)
             {
+                let next = &rows[last_row + 1];
                 let from = next.iter().take_while(|s| **s == " ").count();
                 let to = run(next, from);
-                if from > 0 && to > from {
-                    url.push_str(&next[from..to].concat());
-                    parts.push((y + 1, from, to));
-                    carried = to;
+                if to == from {
+                    break;
                 }
+                url.push_str(&next[from..to].concat());
+                parts.push((last_row + 1, from, to));
+                (last_row, last_end) = (last_row + 1, to);
+                from_x[last_row] = to;
+            }
+            if !ends(&rows[last_row], last_end) {
+                continue;
             }
             let url = trim(&url);
             // What trimming took off comes off the last part's end.
@@ -66,10 +76,16 @@ pub fn cells(buf: &Buffer) -> Vec<(u16, u16, Cell)> {
                     out.push((area.x + at as u16, area.y + row_at as u16, cell));
                 }
             }
-            x = end;
         }
     }
     out
+}
+
+/// Whether an address that [`run`] stopped at `end` of `row` ends there,
+/// rather than at a character it holds that `run` does not follow.
+fn ends(row: &[&str], end: usize) -> bool {
+    row.get(end)
+        .is_none_or(|symbol| symbol.is_ascii() || symbol.trim().is_empty())
 }
 
 /// Where the next address starts in `row`, from `from`.
@@ -81,8 +97,8 @@ fn find(row: &[&str], from: usize) -> Option<usize> {
     })
 }
 
-/// Where the address starting at `start` ends: at a space or a character
-/// an address does not hold.
+/// Where the address starting at `start` ends: at a space, or at a
+/// character an address does not hold or is not plain ASCII.
 fn run(row: &[&str], start: usize) -> usize {
     (start..row.len())
         .find(|&at| {
@@ -121,16 +137,23 @@ mod tests {
     use ratatui::{layout::Rect, text::Line, widgets::Paragraph, widgets::Widget};
 
     fn drawn(rows: &[&str], width: u16) -> Buffer {
-        let mut buf = Buffer::empty(Rect::new(0, 0, width, rows.len() as u16));
-        let lines: Vec<Line> = rows.iter().map(|r| Line::from(*r)).collect();
+        draw(
+            rows.iter().map(|r| Line::from(r.to_string())).collect(),
+            width,
+        )
+    }
+
+    fn draw(lines: Vec<Line<'static>>, width: u16) -> Buffer {
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, lines.len() as u16));
         Paragraph::new(lines).render(buf.area, &mut buf);
         buf
     }
 
-    /// Each link as its row, columns and address.
-    fn links(buf: &Buffer) -> Vec<(u16, u16, u16, String)> {
+    /// Each link as its row, columns and address, with the rows after the
+    /// first marked as cut where `cut` says.
+    fn links(buf: &Buffer, cut: &[bool]) -> Vec<(u16, u16, u16, String)> {
         let mut out = Vec::new();
-        for (x, y, cell) in cells(buf) {
+        for (x, y, cell) in cells(buf, cut) {
             if let Some(rest) = cell.symbol().strip_prefix("\x1b]8;;") {
                 let url = rest.split('\x1b').next().unwrap().to_owned();
                 out.push((y, x, x, url));
@@ -149,7 +172,7 @@ mod tests {
             80,
         );
         assert_eq!(
-            links(&buf),
+            links(&buf, &[false]),
             [
                 (
                     0,
@@ -163,22 +186,44 @@ mod tests {
     }
 
     #[test]
-    fn an_address_cut_at_the_edge_links_both_parts() {
-        let buf = drawn(
-            &["  go https://example.com/a/very", "    /long/path then"],
-            31,
-        );
+    fn an_address_cut_over_rows_links_every_part() {
+        let url = "https://example.com/a/very/long/path/that/takes/three/rows?x=1";
+        let line = Line::from(format!("  see {url} then"));
+        let rows = crate::transcript::wrap(line, 24, "".into(), "    ".into());
+        let cut: Vec<bool> = rows
+            .iter()
+            .map(|row| row.alignment == Some(crate::transcript::CUT))
+            .collect();
+        assert_eq!(cut, [false, false, true, true, true]);
+        let found = links(&draw(rows, 24), &cut);
         assert_eq!(
-            links(&buf),
-            [
-                (0, 5, 30, "https://example.com/a/very/long/path".to_owned()),
-                (1, 4, 13, "https://example.com/a/very/long/path".to_owned()),
-            ]
+            found.iter().map(|(y, ..)| *y).collect::<Vec<_>>(),
+            [1, 2, 3, 4]
+        );
+        assert!(found.iter().all(|link| link.3 == url), "{found:?}");
+    }
+
+    #[test]
+    fn an_address_at_a_row_end_takes_no_next_line_it_was_not_cut_into() {
+        let buf = drawn(&["  https://example.com/123456789", "  Next step"], 31);
+        assert_eq!(
+            links(&buf, &[false, false]),
+            [(0, 2, 30, "https://example.com/123456789".to_owned())]
         );
     }
 
     #[test]
+    fn an_address_with_a_character_beyond_ascii_is_not_linked_short() {
+        let buf = drawn(&["https://example.com/café and https://ok.io"], 50);
+        assert_eq!(
+            links(&buf, &[false]),
+            [(0, 29, 41, "https://ok.io".to_owned())]
+        );
+        assert!(cells(&drawn(&["https://münchen.de/path"], 40), &[false]).is_empty());
+    }
+
+    #[test]
     fn text_without_an_address_has_no_links() {
-        assert!(cells(&drawn(&["http is a protocol; xhttps://no"], 40)).is_empty());
+        assert!(cells(&drawn(&["http is a protocol; xhttps://no"], 40), &[false]).is_empty());
     }
 }
