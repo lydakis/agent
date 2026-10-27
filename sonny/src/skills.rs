@@ -1,5 +1,6 @@
-//! Sonny's skills, written into the person's `~/.agents/skills`, where
-//! every agent finds them, and the scripts in `~/.agent` they run.
+//! Sonny's skills and roles, written into the person's `~/.agents/skills`
+//! and `~/.agents/agents`, where every agent finds them and the person can
+//! edit them, and the scripts in `~/.agent` they run.
 use std::path::{Path, PathBuf};
 
 /// The `errand` skill, for every agent, when Errand is installed.
@@ -11,11 +12,12 @@ pub fn install_errand() {
     }
 }
 
-/// What every agent of Sonny's leans on: the memory, plan and automation
-/// skills, the nightly cleanup's, and `~/.agent/memory`, `~/.agent/project`
-/// and `~/.agent/trigger`, which run this Sonny. Written at each start, so
-/// they lead to this copy.
+/// What every agent of Sonny's leans on: the lead's role, the memory, plan
+/// and automation skills, the nightly cleanup's, and `~/.agent/memory`,
+/// `~/.agent/project` and `~/.agent/trigger`, which run this Sonny. Written
+/// at each start, so they lead to this copy.
 pub fn install_own() {
+    install_role("lead", crate::project::LEAD);
     install("memory", include_str!("../skills/memory/SKILL.md"));
     install(
         "memory-cleanup",
@@ -189,6 +191,46 @@ fn write_runner(path: &Path, usage: &str, sonny: &Path, verb: &str) -> Result<()
     agent_client::files::replace_mode(path, text.as_bytes(), 0o755)
 }
 
+/// A role of Sonny's as `~/.agents/agents/NAME.md`, written as skills
+/// are: rewritten when Sonny's text changed, never over the person's
+/// edits, and written again once the person deletes it.
+pub fn install_role(name: &str, text: &str) -> Option<PathBuf> {
+    install_role_in(&PathBuf::from(std::env::var_os("HOME")?), name, text)
+}
+
+/// `text` as the role `name` in `home`, when the file is missing or as
+/// Sonny last noted writing it, in `~/.agent/sonny/agents/NAME`. A file
+/// Sonny never noted, or a link, is the person's.
+fn install_role_in(home: &Path, name: &str, text: &str) -> Option<PathBuf> {
+    let path = home.join(".agents/agents").join(format!("{name}.md"));
+    let record = home.join(".agent/sonny/agents").join(name);
+    let noted = format!("{}\n", crate::project::fingerprint(text));
+    let now = match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_symlink() => return None,
+        Ok(_) => Some(std::fs::read_to_string(&path).ok()?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return None,
+    };
+    let same = now.as_deref() == Some(text);
+    let wrote = same
+        || now.is_none_or(|now| {
+            std::fs::read_to_string(&record)
+                .is_ok_and(|key| key.trim() == crate::project::fingerprint(&now))
+        });
+    if !wrote {
+        return None;
+    }
+    if !same {
+        std::fs::create_dir_all(path.parent()?).ok()?;
+        agent_client::files::replace_mode(&path, text.as_bytes(), 0o644).ok()?;
+    }
+    if std::fs::read_to_string(&record).ok().as_deref() != Some(noted.as_str()) {
+        std::fs::create_dir_all(record.parent()?).ok()?;
+        agent_client::files::replace_mode(&record, noted.as_bytes(), 0o644).ok()?;
+    }
+    (!same).then_some(path)
+}
+
 /// Take a skill of Sonny's out of the person's skills, unless the person
 /// edited it.
 pub fn remove(name: &str) {
@@ -319,6 +361,40 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "sonny's");
         remove_in(&home, "errand");
         assert!(!theirs.exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_role_is_rewritten_until_the_person_edits_it() {
+        let home = std::env::temp_dir().join(format!("sonny-roles-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let role = home.join(".agents/agents/lead.md");
+        let read = || std::fs::read_to_string(&role).unwrap();
+        assert_eq!(install_role_in(&home, "lead", "one"), Some(role.clone()));
+        assert_eq!(read(), "one");
+        // The same text writes nothing.
+        assert_eq!(install_role_in(&home, "lead", "one"), None);
+        // Sonny's next text replaces its own.
+        assert!(install_role_in(&home, "lead", "two").is_some());
+        assert_eq!(read(), "two");
+        // The person's edit stays through Sonny's next text.
+        std::fs::write(&role, "mine").unwrap();
+        assert!(install_role_in(&home, "lead", "three").is_none());
+        assert_eq!(read(), "mine");
+        // Deleted, Sonny's comes back.
+        std::fs::remove_file(&role).unwrap();
+        assert!(install_role_in(&home, "lead", "three").is_some());
+        assert_eq!(read(), "three");
+        // A role of the person's own of that name, which Sonny never noted, stays.
+        let theirs = home.join(".agents/agents/task.md");
+        std::fs::write(&theirs, "theirs").unwrap();
+        assert!(install_role_in(&home, "task", "sonny's").is_none());
+        assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "theirs");
+        // So does a link, wherever it leads.
+        let linked = home.join(".agents/agents/linked.md");
+        std::os::unix::fs::symlink(&theirs, &linked).unwrap();
+        assert!(install_role_in(&home, "linked", "sonny's").is_none());
+        assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "theirs");
         let _ = std::fs::remove_dir_all(&home);
     }
 

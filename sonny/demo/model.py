@@ -38,7 +38,7 @@ class Model(http.server.BaseHTTPRequestHandler):
         last_user = max(i for i, item in enumerate(items) if item.get('role') == 'user')
         step = sum(item.get('type') == 'function_call_output' for item in items[last_user:])
         text, output = '', []
-        lead = '# Role: coordinator' in request.get('instructions', '')
+        lead = '# Role: lead' in request.get('instructions', '')
         told = str(items[last_user].get('content')).find('Task updates: ') != -1
         if lead and told and step == 0:
             # Sonny telling the lead a task ended: it reads the reply by its handle.

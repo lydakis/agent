@@ -8,9 +8,10 @@ use agent_client::Client;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
-/// The coordinator profile Sonny ships, used when neither the folder nor
-/// the user has a `coordinator.md`.
-pub const COORDINATOR: &str = include_str!("../agents/coordinator.md");
+/// The lead's role as Sonny ships it, which Sonny writes to the person's
+/// `~/.agents/agents/lead.md` to edit; used when neither the folder nor
+/// the person has a `lead.md`.
+pub const LEAD: &str = include_str!("../agents/lead.md");
 pub const TOOLS: [&str; 6] = ["shell", "read", "write", "edit", "wait", "history"];
 
 /// Who every agent Sonny starts works for, after its role: leads, tasks,
@@ -43,13 +44,12 @@ fn default_name(dir: &Path) -> Result<String, String> {
     Ok(info["name"].as_str().unwrap_or("project").to_owned())
 }
 
-/// The coordinator's role: the folder's or the user's `coordinator.md`,
-/// else Sonny's.
+/// The lead's role: the folder's or the person's `lead.md`, else Sonny's.
 fn role(dir: &Path) -> Result<agent_client::policy::Profile, String> {
     Ok(
-        match agent_client::policy::profile(dir, "coordinator").map_err(|e| e.to_string())? {
+        match agent_client::policy::profile(dir, "lead").map_err(|e| e.to_string())? {
             Some(role) => role,
-            None => agent_client::policy::Profile::parse("coordinator", None, COORDINATOR),
+            None => agent_client::policy::Profile::parse("lead", None, LEAD),
         },
     )
 }
@@ -98,12 +98,12 @@ pub fn plain(dir: &Path) -> Result<String, String> {
         .map_err(|e| format!("{}: {e}", e.code()))
 }
 
-/// This Sonny's rules for starting a task and long writing. How to ask
-/// the person is the `ask` tool's to say.
+/// This Sonny's rule for starting a task, which names this binary, so it
+/// is composed rather than kept in the lead's file. How to ask the person
+/// is the `ask` tool's to say.
 fn start() -> Result<String, String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
-    let me = me.to_string_lossy();
-    Ok(format!("{}\n\n{LONG_RULE}", start_rule(&me)))
+    Ok(start_rule(&me.to_string_lossy()))
 }
 
 /// How the lead starts a task in Sonny: `sonny task`, at `sonny`, makes
@@ -126,12 +126,6 @@ fn start_rule(sonny: &str) -> String {
          A start that fails leaves no folder behind; if it fails again, tell the person why instead of working around it."
     ))
 }
-
-/// Where the lead puts something long for the person, so a reply stays
-/// readable in the chat.
-const LONG_RULE: &str = "When you have something long for the person to read, such as a report, a plan or a comparison, \
-     write it to a file, Markdown unless it needs a page's layout, and keep editing that file as it changes. \
-     In your reply, give the file's path and the few lines that matter, not the whole of it.";
 
 /// What attaching does with a lead's instructions.
 #[derive(Debug, PartialEq)]

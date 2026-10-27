@@ -28,9 +28,17 @@ skills it writes name `"…/sonny" agent` wherever they would say
     sonny --bot NAME                         # any one bot
 
 Opened in a folder, Sonny is that project's lead, `<project>.lead`, made by
-Sonny in its coordinator profile (`agents/coordinator.md`, unless the folder
-or `~/.agents/agents` has a `coordinator.md`), with the folder's
-`.agents/project.toml` written when it had none. A lead moved to another
+Sonny in its `lead` role, with the folder's
+`.agents/project.toml` written when it had none. The role is a normal
+profile: Sonny writes its own ([agents/lead.md](agents/lead.md)) to
+`~/.agents/agents/lead.md` at each start, as it writes its skills, so the
+person can read and edit it there. Sonny rewrites that file when its text
+changes, and writes it again once it is deleted, but never over an edit:
+it notes a fingerprint of what it wrote in `~/.agent/sonny/agents`, and a
+file that no longer matches, or one Sonny never wrote, is the person's. A
+folder's own `.agents/agents/lead.md` comes first. How the lead starts a
+task with `sonny task`, which names this Sonny, and the task settings from
+`.agents/project.toml` are composed after the role, not kept in the file. A lead moved to another
 folder (`--workspace`) comes back with the next message Sonny sends it from
 its own, history and all. When Sonny runs in a Rex block (`rex` found as
 `$REX`, on the PATH, or in the Mac app) or a Herdr pane (`herdr` found as
