@@ -17,7 +17,10 @@ Sonny in `bin/` and its daemon in `libexec/`. Unpack it anywhere and run
 `--path sonny`) and set `AGENT_BIN` to that `agent`; Sonny never takes an
 `agent` from `PATH`, which may be another program. `sonny agent ARGS` runs
 the one Sonny uses, with the keys in `~/.agent/env`, whatever else is called
-`agent` on your `PATH`.
+`agent` on your `PATH`. It is also the one way in agents are told about:
+Sonny sets `AGENT_CLI` to its own `sonny agent`, so the instructions it
+composes, and those the CLI composes for agents started through it, name
+`"…/sonny" agent` wherever they would say `"$AGENT_BIN"`.
 
     sonny                                    # this folder's coordinator, <project>.lead
     sonny --model PROVIDER/MODEL             # the same, making the project the first time

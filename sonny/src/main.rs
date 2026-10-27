@@ -545,6 +545,13 @@ fn reopen() -> Vec<String> {
 // Two threads, so the daemon's events are read while a picture is drawn:
 // a reader that stops is dropped by the daemon as lagging.
 fn main() -> std::process::ExitCode {
+    // Every agent Sonny makes, and every agent those make through `sonny
+    // agent`, is told to reach the daemon this one way, by a path that
+    // outlives an upgrade.
+    if let Some(me) = skills::sonny_path() {
+        // SAFETY: nothing else runs yet: no thread is started before this.
+        unsafe { std::env::set_var("AGENT_CLI", format!("\"{}\" agent", me.display())) };
+    }
     // sandfs serves task copies' mounts from this program run again as
     // `sonny sandfs ...`, outside any runtime of Sonny's.
     sandfs::handle_relaunch(&["sandfs"]);
