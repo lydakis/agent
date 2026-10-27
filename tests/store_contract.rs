@@ -160,6 +160,7 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
         from: None,
         origin: None,
         budget_tokens: None,
+        images: Vec::new(),
     };
     let alt = db
         .begin("Alternative", "r1", "different", true, &branch, |_, _| {
@@ -3569,6 +3570,7 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
         from: None,
         origin: None,
         budget_tokens: None,
+        images: Vec::new(),
     };
     let started = db
         .begin("Bob", "r1", "work", true, &options, allow_provider)
@@ -3698,6 +3700,7 @@ fn a_bot_without_a_default_workspace_needs_one_per_submission() {
         from: None,
         origin: None,
         budget_tokens: None,
+        images: Vec::new(),
     };
     let turn = db
         .begin("Nomad", "r1", "work", true, &options, allow_provider)
@@ -4529,6 +4532,7 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
                 from: None,
                 origin: None,
                 budget_tokens: None,
+                images: Vec::new(),
             },
             allow_provider,
         )

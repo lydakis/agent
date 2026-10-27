@@ -20,7 +20,7 @@ const COMMANDS: &[Command] = &[
         name: "run",
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
-        flags: "--bot --new --fork --allow --expires --detach --delivery --turn --model --workspace --effort --turn-budget-tokens --agents --profile --request-id --bot-id --pretty --no-spawn",
+        flags: "--bot --new --fork --allow --expires --detach --delivery --turn --model --workspace --effort --turn-budget-tokens --image --agents --profile --request-id --bot-id --pretty --no-spawn",
         settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallbacks --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl",
         startup: true,
     },
@@ -282,6 +282,10 @@ fn print_flags(flags: &str) {
                 "N",
                 "This turn's input + output token cap, beside the bot's own budget",
             ),
+            "--image" => (
+                "PATH",
+                "Send this PNG, JPEG, GIF or WebP with the prompt; repeat for more",
+            ),
             "--pretty" => ("", "Render human-readable output"),
             "--no-spawn" => ("", "Require an already running daemon"),
             "--keep-turns" => (
@@ -529,7 +533,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
         if !allowed {
             return fail_with("usage", format!("{} does not accept {flag}", c.name));
         }
-        if flags.iter().any(|f| f == flag) && flag != "--provider" {
+        if flags.iter().any(|f| f == flag) && !matches!(flag, "--provider" | "--image") {
             return fail_with("usage", format!("{flag} may only be specified once"));
         }
         flags.push(flag.to_owned());

@@ -12,6 +12,17 @@ pub enum Family {
     Anthropic,
 }
 
+/// A picture sent with a person's words, as a client gave it: its media
+/// type and its bytes in standard base64.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct Image {
+    pub media_type: String,
+    pub data: String,
+}
+
+/// The media types an [`Image`] may have: those both families take.
+pub const IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
 /// Provider-neutral tool description; each family encodes it differently.
 #[derive(Clone, Debug)]
 pub struct ToolSchema {
@@ -80,13 +91,24 @@ impl Family {
         }
     }
     pub fn user_item(self, text: &str) -> Result<Vec<u8>> {
-        let item = match self {
-            Family::Responses => {
-                json!({"role":"user","content":[{"type":"input_text","text":text}]})
-            }
-            Family::Anthropic => json!({"role":"user","content":[{"type":"text","text":text}]}),
-        };
-        Ok(serde_json::to_vec(&item)?)
+        self.user_item_with(text, &[])
+    }
+    /// A person's words and the pictures sent with them, the words first
+    /// so `content[0].text` reads them.
+    pub fn user_item_with(self, text: &str, images: &[Image]) -> Result<Vec<u8>> {
+        let mut content = vec![match self {
+            Family::Responses => json!({"type":"input_text","text":text}),
+            Family::Anthropic => json!({"type":"text","text":text}),
+        }];
+        content.extend(images.iter().map(|image| match self {
+            Family::Responses => json!({"type":"input_image",
+                "image_url":format!("data:{};base64,{}", image.media_type, image.data)}),
+            Family::Anthropic => json!({"type":"image","source":{"type":"base64",
+                "media_type":image.media_type,"data":image.data}}),
+        }));
+        Ok(serde_json::to_vec(
+            &json!({"role":"user","content":content}),
+        )?)
     }
     pub fn tool_result_item(self, call_id: &str, output: &str) -> Result<Vec<u8>> {
         let item = match self {
@@ -274,6 +296,30 @@ mod tests {
         assert_eq!(Family::Responses.pool_key("gpt-4-32k"), "gpt-4-32k");
     }
     use super::*;
+    #[test]
+    fn pictures_follow_the_words_in_each_familys_shape() {
+        let images = [Image {
+            media_type: "image/png".into(),
+            data: "iVBO".into(),
+        }];
+        let item = |family: Family| -> Value {
+            serde_json::from_slice(&family.user_item_with("look", &images).unwrap()).unwrap()
+        };
+        assert_eq!(
+            item(Family::Responses)["content"],
+            json!([{"type":"input_text","text":"look"},
+                {"type":"input_image","image_url":"data:image/png;base64,iVBO"}])
+        );
+        assert_eq!(
+            item(Family::Anthropic)["content"],
+            json!([{"type":"text","text":"look"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBO"}}])
+        );
+        assert_eq!(
+            Family::Anthropic.user_item("look").unwrap(),
+            Family::Anthropic.user_item_with("look", &[]).unwrap()
+        );
+    }
     #[test]
     fn previews_cut_each_field_so_a_long_one_hides_no_other() {
         let content = "x".repeat(5000);

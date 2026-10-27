@@ -479,6 +479,8 @@ pub struct TurnOptions {
     /// The most input plus output tokens this turn may spend; none is
     /// bounded only by the bot's own budget.
     pub budget_tokens: Option<u64>,
+    /// Pictures sent with the prompt, after its words in the user item.
+    pub images: Vec<crate::codec::Image>,
 }
 /// What a submission does when the bot is busy or the daemon is full.
 /// `Reject` answers `bot_busy` or `active_agent_limit`. `Queue` records the
@@ -1294,7 +1296,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 53;
+    pub const SCHEMA: i32 = 54;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1458,7 +1460,7 @@ impl Database {
                 delivery TEXT NOT NULL DEFAULT 'reject', expected_turn INTEGER,
                 cached_input_tokens INTEGER NOT NULL DEFAULT 0,
                 from_bot TEXT, from_turn INTEGER, from_id INTEGER, origin TEXT, reasoning TEXT, inherited_reasoning TEXT,
-                bot_model TEXT, bot_reasoning TEXT,
+                bot_model TEXT, bot_reasoning TEXT, images TEXT,
                 UNIQUE(bot,request_id));
             CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
             CREATE INDEX IF NOT EXISTS turns_started ON turns(bot,id) WHERE started_ms IS NOT NULL;
@@ -3881,17 +3883,23 @@ impl Database {
         // Compact provider whitespace in this view only: each item must occupy
         // one JSONL record even when its original response spans multiple lines.
         // Already single-line items need no rewrite (escaped newlines are fine).
-        const READING_ITEM: &str = "CASE
+        // A person's pictures go without their bytes, as other history
+        // reads return them.
+        let reading_item = format!(
+            "CASE
             WHEN json_extract(CAST(item AS TEXT),'$.type')='reasoning'
              AND json_type(CAST(item AS TEXT),'$.encrypted_content') IS NOT NULL
             THEN CAST(json_remove(CAST(item AS TEXT),'$.encrypted_content') AS BLOB)
+            WHEN json_extract(CAST(item AS TEXT),'$.role')='user' THEN {}
             WHEN instr(item,x'0a')=0 AND instr(item,x'0d')=0 THEN item
-            ELSE CAST(json(CAST(item AS TEXT)) AS BLOB) END";
+            ELSE CAST(json(CAST(item AS TEXT)) AS BLOB) END",
+            without_pictures("item")
+        );
         let mut length = self.conn.prepare_cached(&format!(
-            "SELECT length({READING_ITEM}) FROM nodes WHERE id=?"
+            "SELECT length({reading_item}) FROM nodes WHERE id=?"
         ))?;
         let mut slice = self.conn.prepare_cached(&format!(
-            "SELECT substr({READING_ITEM},?,?) FROM nodes WHERE id=?"
+            "SELECT substr({reading_item},?,?) FROM nodes WHERE id=?"
         ))?;
         let mut text = String::new();
         let mut position = 0_u64;
@@ -4029,7 +4037,7 @@ impl Database {
         let prior: Option<(i64, String, String, TurnOptions, Option<i64>)> = self
             .conn
             .query_row(
-                "SELECT id,prompt,status,workspace,model,delivery,expected_turn,prompt_node,from_bot,from_turn,origin,reasoning,budget_tokens
+                "SELECT id,prompt,status,workspace,model,delivery,expected_turn,prompt_node,from_bot,from_turn,origin,reasoning,budget_tokens,images
                  FROM turns WHERE bot=? AND request_id=?",
                 params![name, request_id],
                 |r| {
@@ -4049,6 +4057,7 @@ impl Database {
                             },
                             origin: r.get(10)?,
                             budget_tokens: r.get::<_, Option<i64>>(12)?.map(|n| n as u64),
+                            images: images_from(r.get(13)?)?,
                         },
                         r.get(7)?,
                     ))
@@ -4080,6 +4089,7 @@ impl Database {
                 from,
                 origin,
                 budget_tokens,
+                images,
             } = &saved_options;
             let differs = [
                 ("prompt", saved != prompt),
@@ -4091,6 +4101,7 @@ impl Database {
                 ("from", *from != same.from),
                 ("origin", *origin != same.origin),
                 ("budget_tokens", *budget_tokens != same.budget_tokens),
+                ("images", *images != same.images),
             ]
             .into_iter()
             .find_map(|(field, differs)| differs.then_some(field));
@@ -4254,8 +4265,8 @@ impl Database {
             )?
             .query_row([], |r| r.get(0))?;
         tx.prepare_cached(
-            "INSERT INTO turns(id,bot,request_id,prompt,status,workspace,model,delivery,expected_turn,from_bot,from_turn,from_id,origin,reasoning,budget_tokens)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO turns(id,bot,request_id,prompt,status,workspace,model,delivery,expected_turn,from_bot,from_turn,from_id,origin,reasoning,budget_tokens,images)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         )?.execute(
             // Queued work keeps the folder it was sent to even if the bot
             // moves before it starts; a steer without one joins any turn.
@@ -4263,7 +4274,8 @@ impl Database {
                 if matches!(options.delivery, Delivery::Steer | Delivery::Attach) { options.workspace.as_deref() } else { workspace.as_deref() },
                 options.model, options.delivery.name(), options.expected_turn,
                 options.from.as_ref().map(|f| &f.0), options.from.as_ref().map(|f| f.1), from_id, options.origin,
-                options.effort, options.budget_tokens.map(|n| n as i64)],
+                options.effort, options.budget_tokens.map(|n| n as i64),
+                (!options.images.is_empty()).then(|| serde_json::to_string(&options.images)).transpose()?],
         )?;
         if moved {
             tx.prepare_cached("UPDATE bots SET workspace=? WHERE name=?")?
@@ -4539,7 +4551,7 @@ impl Database {
                     (s.workspace IS NULL OR s.workspace=COALESCE(t.workspace,b.workspace))
                     AND (s.model IS NULL OR s.model=COALESCE(t.model,b.provider||'/'||b.model))
                     AND (s.reasoning IS NULL OR s.reasoning IS COALESCE(t.reasoning,b.reasoning)),
-                    s.status='attached'
+                    s.status='attached',s.images
                  FROM (SELECT id FROM turns WHERE bot=?1 AND status='queued' AND delivery='steer'
                          AND id<=?4 AND (expected_turn IS NULL OR expected_turn=?2)
                        UNION ALL SELECT id FROM turns WHERE ?5 AND bot=?1 AND status='attached'
@@ -4568,7 +4580,8 @@ impl Database {
                     break;
                 }
                 bytes += size;
-                let item = family.user_item(&row.get::<_, String>(1)?)?;
+                let item =
+                    family.user_item_with(&row.get::<_, String>(1)?, &images_from(row.get(5)?)?)?;
                 if item.len() + 1 > room_bytes || room_items == 0 {
                     capped = true;
                     break;
@@ -7375,11 +7388,15 @@ impl Database {
         let maximum = crate::output::MAX_EVENT - 1024;
         // Check the encoded blob length in SQLite before allocating it. An
         // unrenderable item gets its own error; adjacent items remain readable.
-        // A prompt another bot's turn or a named client sent says so.
-        let mut query = self.conn.prepare_cached(
-            "SELECT CASE WHEN length(n.item)<=?2 THEN n.item END,s.bot,s.turn,s.bot_id,s.origin
+        // A prompt another bot's turn or a named client sent says so. A
+        // person's prompt is read whole, bounded by what submit takes, as
+        // its pictures are left out below.
+        let mut query = self.conn.prepare_cached(&format!(
+            "SELECT CASE WHEN length(n.item)<=?2 OR json_extract(CAST(n.item AS TEXT),'$.role')='user'
+                THEN {} END,s.bot,s.turn,s.bot_id,s.origin
              FROM nodes n LEFT JOIN senders s ON s.node=n.id WHERE n.id=?1",
-        )?;
+            without_pictures("n.item")
+        ))?;
         for &node in wanted {
             type Row = (
                 Option<Vec<u8>>,
@@ -8175,7 +8192,12 @@ fn start_locked(
     prompt: &str,
     data: &mut Value,
 ) -> Result<Option<i64>> {
-    let item = bot.family()?.user_item(prompt)?;
+    let images: Option<String> = tx
+        .prepare_cached("SELECT images FROM turns WHERE id=?")?
+        .query_row([turn], |r| r.get(0))?;
+    let item = bot
+        .family()?
+        .user_item_with(prompt, &images_from(images)?)?;
     let head = node_with_turn(tx, bot.head, &item, Some(turn))?;
     data["node"] = json!(head);
     keep_sender(tx, turn, head, data)?;
@@ -8196,6 +8218,40 @@ fn start_locked(
         params![head, turn, bot.name],
     )?;
     Ok(Some(head))
+}
+/// The pictures a turn's prompt was sent with, as its `images` column
+/// keeps them.
+fn images_from(json: Option<String>) -> rusqlite::Result<Vec<crate::codec::Image>> {
+    json.map_or(Ok(Vec::new()), |json| {
+        serde_json::from_str(&json).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })
+    })
+}
+/// SQL for `item`, a node's item, as history reads return it: a user
+/// item's pictures without their bytes, each counted in `omitted_bytes`
+/// (a data URL keeps its media type). The model is sent them whole.
+fn without_pictures(item: &str) -> String {
+    let url = "json_extract(value,'$.image_url')";
+    format!(
+        "CASE WHEN instr(CAST({item} AS TEXT),'\"input_image\"')>0
+                OR instr(CAST({item} AS TEXT),'\"type\":\"image\"')>0
+            THEN CASE WHEN json_extract(CAST({item} AS TEXT),'$.role')='user'
+                AND json_type(CAST({item} AS TEXT),'$.content')='array'
+            THEN CAST(json_set(CAST({item} AS TEXT),'$.content',(
+                SELECT json_group_array(CASE
+                    WHEN json_extract(value,'$.type')='input_image' AND {url} LIKE 'data:%'
+                    THEN json_set(value,'$.image_url',substr({url},1,instr({url},',')),
+                        '$.omitted_bytes',length({url})-instr({url},','))
+                    WHEN json_extract(value,'$.type')='image'
+                        AND json_extract(value,'$.source.type')='base64'
+                    THEN json_set(value,'$.source.data','',
+                        '$.omitted_bytes',length(json_extract(value,'$.source.data')))
+                    ELSE json(value) END)
+                FROM json_each(CAST({item} AS TEXT),'$.content'))) AS BLOB)
+            ELSE {item} END
+        ELSE {item} END"
+    )
 }
 /// The bot's oldest queued turn now waits only for a slot. True when that
 /// turn was a steer, for the queued-steer count.
@@ -8926,6 +8982,14 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
     )? {
         // 52 -> 53: tools a client declares on a bot. None had any.
         conn.execute_batch("ALTER TABLE bots ADD COLUMN declared TEXT;")?;
+    }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='images')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 53 -> 54: a prompt may come with pictures. None did.
+        conn.execute_batch("ALTER TABLE turns ADD COLUMN images TEXT;")?;
     }
     Ok(())
 }

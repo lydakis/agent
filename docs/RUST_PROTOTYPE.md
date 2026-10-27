@@ -305,6 +305,18 @@ steer joins a turn that already has its cap: `budget_tokens` with
 `delivery: "steer"` is `invalid_delivery`. A summary held beside a call
 counts toward both caps.
 
+`submit` also accepts `images`, pictures sent with the prompt: up to 20 of
+`{"media_type", "data"}`, the type one of `image/png`, `image/jpeg`,
+`image/gif` or `image/webp` and the data standard base64 of an image of that
+type, at most 5 MiB together once decoded (`image_limit`; anything else is
+`invalid_image`, with the `index` it was at). They go in the user item after
+the prompt's words, as `input_image` data URLs for Responses and base64
+`image` blocks for Anthropic, in a turn of their own or a steer. The turn keeps
+them, so a resend with other pictures is an `idempotency_conflict`. History
+reads (`history_items`) return a person's prompt with each picture's bytes
+left out, its `omitted_bytes` counted; the model is sent them whole. A request
+line may be 8 MiB, room for a prompt and its pictures.
+
 A turn reads the same wherever a client meets it. Its view is `bot`,
 `bot_id`, `turn`, `handle`, `request_id`, `status`, `waiting_on`,
 `input_tokens`, `cached_input_tokens`, `output_tokens`, `model_rounds`,

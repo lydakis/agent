@@ -10,6 +10,7 @@
 //! says how long the turn has run and how to stop it.
 mod approvals;
 mod asks;
+mod attach;
 mod cache;
 mod calls;
 mod declared;
@@ -1176,6 +1177,10 @@ struct App {
     /// steer until the running turn takes it in, a prompt until its turn
     /// starts. Drawn above the status row until they land.
     staged: Vec<(i64, String)>,
+    /// Pictures given with the message being written, each behind its
+    /// placeholder in the composer: [`attach::placeholder`] of its place
+    /// here, from 1.
+    pictures: Vec<attach::Picture>,
     /// The person's reactions to this bot's replies.
     reactions: reactions::Reactions,
     /// The bot's latest replies, by node, with their first lines: what
@@ -1832,6 +1837,7 @@ impl App {
             sounds: sound::Sounds::new(false),
             said: String::new(),
             staged: Vec::new(),
+            pictures: Vec::new(),
             reactions: reactions::Reactions::default(),
             replies: Vec::new(),
             reacting: None,
@@ -2026,7 +2032,7 @@ impl App {
             self.shown.extend(user_shell::lines(&ran, self.width));
             let record = user_shell::record(&ran);
             // Refused, it is kept, to go with the next message.
-            match self.send(record.clone(), Some(SHELL), false).await {
+            match self.send(record.clone(), Some(SHELL), false, &[]).await {
                 Ok(()) => self.ran_here.extend(user_shell::read(&record)),
                 Err(error) => {
                     self.notice = Some(format!("{error}; it goes with your next message"));
@@ -3777,9 +3783,19 @@ impl App {
         }
         match event {
             // Terminals send a pasted line break as a carriage return.
-            Event::Paste(text) => self
-                .input
-                .insert(&text.replace("\r\n", "\n").replace('\r', "\n")),
+            // Image files dropped on the terminal arrive as their paths.
+            Event::Paste(text) => {
+                match attach::paths(&text, std::path::Path::new(&self.workspace)) {
+                    Some(paths) => {
+                        for path in paths {
+                            self.attach(attach::load(&path));
+                        }
+                    }
+                    None => self
+                        .input
+                        .insert(&text.replace("\r\n", "\n").replace('\r', "\n")),
+                }
+            }
             Event::Resize(width, _) => self.width = width as usize,
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -3815,6 +3831,13 @@ impl App {
                     KeyCode::Char('u') if ctrl => self.input.delete_to_start(),
                     KeyCode::Char('k') if ctrl => self.input.delete_to_end(),
                     KeyCode::Char('w') if ctrl => self.input.delete_word(),
+                    // A picture on the clipboard, as Codex and Claude Code
+                    // take one: terminals paste only text.
+                    KeyCode::Char('v') if ctrl => match attach::clipboard() {
+                        Ok(Some(picture)) => self.attach(Ok(picture)),
+                        Ok(None) => self.notice = Some("no picture on the clipboard".into()),
+                        Err(error) => self.notice = Some(error),
+                    },
                     KeyCode::Char('b') if alt => self.input.word_left(),
                     KeyCode::Char('f') if alt => self.input.word_right(),
                     KeyCode::Char(c) if !ctrl => self.input.insert(c.encode_utf8(&mut [0; 4])),
@@ -4123,7 +4146,7 @@ impl App {
         // first, each on its own, and this message joins the turn they start.
         let mut join = false;
         while let Some(record) = self.unsent.first().cloned() {
-            if let Err(error) = self.send(record.clone(), Some(SHELL), join).await {
+            if let Err(error) = self.send(record.clone(), Some(SHELL), join, &[]).await {
                 self.notice = Some(error);
                 return;
             }
@@ -4131,10 +4154,16 @@ impl App {
             self.unsent.remove(0);
             join = true;
         }
-        match self.send(prompt, None, join).await {
+        // The pictures whose placeholders are still in the message go with it.
+        let pictures: Vec<attach::Picture> = (self.pictures.iter().enumerate())
+            .filter(|(at, _)| prompt.contains(&attach::placeholder(at + 1)))
+            .map(|(_, picture)| picture.clone())
+            .collect();
+        match self.send(prompt, None, join, &pictures).await {
             Ok(()) => {
                 self.input.clear();
                 self.notice = None;
+                self.pictures.clear();
                 if let Some(ask) = answering {
                     self.asks.retain(|open| open.id != ask.id);
                     self.sent_answers.push(ask.question);
@@ -4157,6 +4186,7 @@ impl App {
         prompt: String,
         origin: Option<&str>,
         join: bool,
+        pictures: &[attach::Picture],
     ) -> Result<(), String> {
         // A message to a busy bot joins its running turn, on that turn's model.
         let delivery = (join || self.running.is_some()).then_some("steer");
@@ -4167,13 +4197,21 @@ impl App {
         // A steer never moves a bot, so a moved lead comes back with the
         // next message that starts a turn.
         let workspace = delivery.is_none().then(|| self.move_to.clone()).flatten();
+        use base64::Engine;
+        let images: Vec<Value> = pictures
+            .iter()
+            .map(|picture| {
+                json!({"media_type": picture.media_type,
+                    "data": base64::engine::general_purpose::STANDARD.encode(&picture.data)})
+            })
+            .collect();
         let reply = self
             .client
             .request(
                 "submit",
                 json!({"bot": self.bot, "request_id": unique("tui"), "prompt": prompt,
                     "delivery": delivery, "model": model, "workspace": workspace,
-                    "origin": origin}),
+                    "origin": origin, "images": (!images.is_empty()).then_some(images)}),
             )
             .await
             .map_err(|error| error.to_string())?;
@@ -4184,6 +4222,20 @@ impl App {
             self.move_to = None;
         }
         Ok(())
+    }
+
+    /// A picture for the message being written, behind a placeholder put
+    /// where the cursor is; or why there is none.
+    fn attach(&mut self, picture: Result<attach::Picture, String>) {
+        match picture {
+            Ok(picture) => {
+                self.pictures.push(picture);
+                self.input
+                    .insert(&format!("{} ", attach::placeholder(self.pictures.len())));
+                self.notice = None;
+            }
+            Err(error) => self.notice = Some(error),
+        }
     }
 
     /// A reply the bot gave, which `/react` offers until newer ones push

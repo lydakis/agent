@@ -81,6 +81,14 @@ left open closes with its window.
 Enter sends (and steers a running turn), Esc interrupts, `y`/`n` answer a
 pending approval, Ctrl-C clears the composer or quits.
 
+Pictures go with a message: Ctrl-V takes the one on the clipboard, as in
+Codex and Claude Code (terminals paste only text), and an image file
+dropped on the terminal, or its path pasted, is attached rather than typed.
+Each shows as `[Image #N]` where it goes in the message; a PNG longer than
+1568 pixels on a side is scaled down first. Web addresses, a link's text and
+paths of files that are there open on a click (Cmd-click in most terminals,
+Ctrl-click in Herdr).
+
 `!COMMAND` runs a command of your own with your shell, in the agent's
 folder, in any agent's window: the lead's or a task's. You see what it
 printed at once, and as soon as it ends the agent is given it too, in
