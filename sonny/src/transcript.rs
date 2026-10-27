@@ -529,9 +529,6 @@ fn words(text: &str) -> impl Iterator<Item = &str> {
 /// A prompt, as the person (or another bot) sent it.
 pub fn prompt(text: &str, from: Option<&str>, width: usize) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-    if let Some(emoji) = reaction(text) {
-        return vec![reacted(emoji)];
-    }
     // What Sonny (or the app) told the lead of its tasks, or what the
     // lookout woke it for: news, not words of the person's, kept to one
     // quiet row; the lead's answer says the rest.
@@ -604,18 +601,22 @@ fn news(text: &str) -> Option<Vec<String>> {
 
 /// News on one dim row, its kind first, cut at the width.
 fn news_row(parts: &[String], width: usize) -> Line<'static> {
-    let mut row = format!("↳ {}", parts.join(" · "));
-    if row.width() > width {
-        let mut cut = String::new();
-        for c in row.chars() {
-            if cut.width() + unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) + 1 > width {
-                break;
-            }
-            cut.push(c);
-        }
-        row = format!("{}…", cut.trim_end());
+    Line::from(cut(&format!("↳ {}", parts.join(" · ")), width)).dim()
+}
+
+/// `text` cut to `width` columns, with an ellipsis when it was longer.
+pub fn cut(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_owned();
     }
-    Line::from(row).dim()
+    let mut cut = String::new();
+    for c in text.chars() {
+        if cut.width() + unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) + 1 > width {
+            break;
+        }
+        cut.push(c);
+    }
+    format!("{}…", cut.trim_end())
 }
 
 /// Words that are only an emoji or a few, trimmed: the person's message
@@ -1461,8 +1462,6 @@ mod tests {
         for typed in ["tada", ":nope:", "+1 thanks", "100", ""] {
             assert_eq!(shortcodes(typed), None, "{typed:?}");
         }
-        // The person's reaction is a pill and nothing else.
-        assert_eq!(prompt("🎉", None, 80), [reacted("🎉")]);
         assert_eq!(reacted("👍").to_string(), "   👍 ");
     }
 }
