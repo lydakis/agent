@@ -1,8 +1,8 @@
 # Sonny (prototype)
 
-A terminal client for the daemon, beside the app, that lays its work out in
-Rex. It speaks the daemon's socket protocol through `agent-client`, like the
-app; nothing in the daemon or CLI knows it exists.
+A terminal client for the daemon that lays its work out in Rex or Herdr. It
+speaks the daemon's socket protocol through `agent-client`; nothing in the
+daemon or CLI knows it exists.
 
     brew install lydakis/agent/sonny         # Sonny, and the daemon's `agent` formula with it
     brew install lydakis/agent/agent         # just the daemon
@@ -26,10 +26,10 @@ composes, and those the CLI composes for agents started through it, name
     sonny --model PROVIDER/MODEL             # the same, making the project the first time
     sonny --bot NAME                         # any one bot
 
-Opened in a folder, Sonny is that project's lead: the same `<project>.lead`
-the app opens, made by Sonny in its coordinator profile (`agents/coordinator.md`,
-unless the folder or `~/.agents/agents` has a `coordinator.md`), with the
-folder's `.agents/project.toml` written when it had none. A lead moved to another
+Opened in a folder, Sonny is that project's lead, `<project>.lead`, made by
+Sonny in its coordinator profile (`agents/coordinator.md`, unless the folder
+or `~/.agents/agents` has a `coordinator.md`), with the folder's
+`.agents/project.toml` written when it had none. A lead moved to another
 folder (`--workspace`) comes back with the next message Sonny sends it from
 its own, history and all. When Sonny runs in a Rex block (`rex` found as
 `$REX`, on the PATH, or in the Mac app) or a Herdr pane (`herdr` found as
@@ -123,9 +123,9 @@ commands:
   leaves the agents working.
 
 Settings Sonny keeps for every folder are in `~/.agent/sonny/settings.json`.
-At each start Sonny writes what every agent leans on, the app or not: the
+At each start Sonny writes what every agent leans on: the
 `memory`, `memory-cleanup`, `plan` and `automation` skills, as normal skills
-in `~/.agents/skills` (replacing links the app left there), and
+in `~/.agents/skills` (replacing links the Agent app left there), and
 `~/.agent/memory`, `~/.agent/project` and `~/.agent/trigger`, scripts that
 run this Sonny as `sonny memory ...` (facts saved for later agents, in
 `~/.agents/memory`), `sonny project add DIR ...` (a project and its lead, as
@@ -135,6 +135,8 @@ text changes, until you edit it: from then on it is yours, and Sonny leaves
 it alone. Sonny notes what it last wrote of each in `~/.agent/sonny/skills`;
 a skill of the same name it has no note of writing (yours, or one an
 earlier Sonny wrote) is left alone too. Remove its folder to get Sonny's.
+[docs/SONNY.md](../docs/SONNY.md) has the details of triggers, memory and
+skills.
 When `errand` is installed, Sonny writes an `errand` skill so any agent can
 run a command on another machine, draws those runs as `Ran COMMAND on
 PEER`, and in Rex opens a window following each detached job.

@@ -1,0 +1,373 @@
+# Sonny's triggers, memory and skills
+
+What Sonny gives every agent beyond its terminal: triggers that wake an agent
+when something happens, memory that later agents read, and the skills that
+teach agents both. [sonny/README.md](../sonny/README.md) covers the terminal
+client itself.
+
+## Triggers
+
+Triggers are Sonny's ([trigger.rs](../sonny/src/trigger.rs)). A trigger wakes an agent with a
+message when something happens: a time comes, a file is written, a
+repository's HEAD moves, or someone fires it by name. The message is a new turn in the agent's own conversation; a trigger
+may also start the agent it names on its first fire. launchd watches, so a
+trigger fires with Sonny closed, and a time the Mac slept through fires
+once when it wakes (`StartCalendarInterval` coalesces missed times;
+`StartInterval` and cron skip them). The daemon has no clock or watcher of
+its own, and no process of a trigger runs between its fires: while nothing
+happens a trigger costs its plist and launchd's watch, and no model call.
+A lead hears of its tasks' turns from Sonny's task updates and lookout, not
+from triggers.
+
+Sonny writes `~/.agent/trigger` each time it starts, a script that runs it
+as `sonny trigger`:
+
+```sh
+~/.agent/trigger add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--turn-budget-tokens N] -- MESSAGE
+  WHEN: --every 30m | --in 45m | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO
+~/.agent/trigger ls [--after NAME]
+~/.agent/trigger show NAME
+~/.agent/trigger fire NAME
+~/.agent/trigger rm NAME
+```
+
+Every reply is one JSON value on stdout; a failure is one
+`{"error": CODE, "detail": ...}` on stderr with exit 1.
+
+**When.** `--every` counts from the next whole minute in minutes that
+divide an hour, hours that divide a day, or `1d`, and waits at least one
+full interval before its first message; calendar ticks before that earliest
+time do nothing. `--in` and `--at` are one-offs within a year, which remove
+themselves once fired (`--in` rounds up to the next whole minute, since
+launchd keeps minutes; `--at` refuses a part out of range or extra parts);
+`--cron` is read as cron reads it, a day or a weekday when both are given,
+up to 1,024 calendar entries. `--file PATH` fires when the file is written,
+or a file is added to or removed from it when it is a folder (launchd's
+`WatchPaths`); it need not exist yet, and it may not be in
+`~/.agent/triggers` or be its daemon's store (or its `-wal` and `-shm`, by
+any name, a hard link included), which every fire writes: `add` refuses one, and a fire that finds its path
+became one (a link moved) ends the trigger, sending nothing and keeping a
+`failed` row that says why. A shell that
+names its daemon's socket and not its store cannot add one, since its store
+is not known to check. `--commit REPO` sends when a commit was made: launchd wakes it on any write
+to the repository's own HEAD log, which git writes on every move of HEAD,
+and the fire asks git one question, `git rev-list -n1 --since=LOOKED NEW
+--not OLD`: whether HEAD now reaches a commit the HEAD it last saw did not,
+committed since it last looked. A commit, an amend, a merge, a cherry-pick,
+a rebase that rewrote commits, or a pull of work committed since sends; a
+checkout, a reset, or a fast-forward to commits that were already there
+sends nothing, and the fire keeps where HEAD went. A HEAD the repository no
+longer has (it was made again) counts as unknown. `add` records where HEAD
+is, a repository with no commit yet included, before launchd watches, and
+when a commit came in between asks for a fire that looks as launchd would
+(a `wake.` ask), so the commit is sent once. A repository where git keeps
+no HEAD log (`core.logAllRefUpdates` false, or a bare one by default) is
+refused, and adding the same trigger again watches the git folder the
+repository has now, recording where its HEAD is in place of the old one's.
+git is the one on the `PATH` `add` ran with, which the plist keeps. With no
+WHEN, only `fire` runs it; `fire` while a fire still runs is sent by that
+fire once it is done.
+
+**Whom.** `add` defaults to the agent whose shell runs it (`AGENT_BOT`,
+which must still match `AGENT_BOT_ID`); `--bot` names another. Either is
+pinned by its id: a bot deleted since, or a new bot under its name, is not
+reached (`bot_not_found`), and the trigger ends. `--start NAME --model
+PROVIDER/MODEL [--effort LEVEL]` names an agent that does not exist yet:
+the first fire makes it as Sonny makes an agent (the daemon's `create`,
+in the folder `add` ran in, with that folder's composed policy and the
+default tools), made by the agent that added the trigger when one did, so
+it shows under that agent, and gives it the fire's message. Its id is kept with the trigger's
+state when the fire settles, and later fires message it. A name an agent already has is refused at
+`add` (`bot_exists`), and an agent of that name made before the first fire
+makes that fire fail, naming it. The agent that added it is pinned by its
+id too: once it is deleted, `create` fails with `creator_not_found`, and the
+trigger ends, keeping its row, as when its `--reply-to` agent is gone. The `create` carries the trigger's own
+request id, so a fire cut short after the daemon made the agent asks again
+and gets that same agent, and no other.
+
+**What else.** `--reply-to BOT` keeps the fire's process until the turn it
+sent ends (the daemon's `wait`, up to a day), then queues that turn's
+answer to BOT, pinned by id; launchd starts no second fire of the trigger
+meanwhile, so a repeating one skips the times that turn spans. The fire's
+request id then ends `.to.ID`, BOT's id, so the lookout does not also tell
+that agent of the turn as a task update, unless that answer has not
+reached it 15 s after the turn ended. A fire cut short while it waits
+(the Mac restarted) passes no answer on: nothing resumes that wait. An
+answer the daemon cut short is
+marked so in its first line; a turn that ended saying nothing passes on an
+empty answer. One that does not get through keeps an ended trigger listed,
+saying so, and one whose BOT is gone (`bot_not_found`: pinned by id, it
+never comes back) ends the trigger. `--if CMD` runs `sh -c CMD` in the folder
+`add` ran in, with the `PATH` `add` ran with and `AGENT_SOCKET` and
+`AGENT_STORE` naming the trigger's daemon, before anything else, for up
+to 60 s, in its own process group, which ends with it; any exit but 0
+skips that fire and records nothing but, for `--commit`, that its commit
+was seen, so a heartbeat whose check finds
+nothing to do costs one process and no model call. A one-off whose check
+says no ends, listed as not sent.
+`--runs N` ends the trigger once N messages went out; a fire after that
+(its end could not unload it) only tries to end it again.
+`--turn-budget-tokens N` submits each message with that turn cap, so one
+runaway fire fails with `turn_budget_exhausted` instead of spending the
+agent's whole lifetime budget. Each message the
+agent gets starts with one line, `[trigger NAME · YYYY-MM-DD HH:MM · why]`,
+the local fire time and what fired it (its time, `file PATH`, `commit REPO
+at SHA`, or `fired`), so a
+catch-up fire after sleep reads as late; an
+answer passed on by `--reply-to` starts with the agent and turn it is from.
+Submissions carry `origin: "trigger"`, and a passed-on answer carries
+`from: {bot, turn}`, the turn it is; task updates carry `origin:
+"tasks"`. All are automated input, not human consent for the approver.
+
+**Adding again.** A trigger is named after its agent unless `--name` says
+otherwise. `add` with a name in use and the same definition changes nothing
+and returns that trigger with `"duplicate": true`, so a retried `add` is
+safe; with another definition it is refused as `trigger_exists`, whose
+`field` names the first that differs (`when`, `bot`, `start`, `message`,
+`reply_to`, `if`, `runs`, `turn_budget_tokens`, `commit`, `dir`, `daemon`,
+`store_id`): `rm` it
+first. A name differing from another only in case is refused
+(`name_taken`), since macOS folders would give both one file, and `rm` finds
+a trigger only by the name as stored; `rm` of a name not there is
+`trigger_not_found`. `ls` returns 64 triggers per page, with `next_after`
+for `--after NAME`; only the current page's messages are retained. `fire NAME` asks for a fire and returns
+`{"name", "fired": true}`; what the fire did shows in `ls`. An ask is a file
+in the trigger's queue folder, `~/.agent/triggers/NAME.asks`, which its plist
+names as launchd's `QueueDirectories`: launchd runs the job while an ask is
+there, one run at a time, and runs it again when a run ends with one still
+there. Each ask is one fire: the fire moves the oldest out of the queue into
+`NAME.taking`, which launchd also watches, sends whatever its time or
+watched path, queues behind work rather than skipping it, and removes the
+ask once done; one a fire was cut short on is the next fire's, and its
+message has the same `request_id`, named by the ask, so the daemon takes it
+once. A queue that cannot be read, or an ask that cannot be moved out of it
+or removed once done, would have launchd run the job for ever, so the
+trigger ends, saying why (`asks_stuck`). A trigger that goes sets its asks aside with its files until launchd unloads its
+job, and puts them back when it will not. Nothing else starts a fire:
+launchd is the only thing that runs one.
+
+Each is one LaunchAgent, `~/Library/LaunchAgents/me.lydakis.agent.trigger.NAME.plist`,
+and that file is its definition: its program arguments carry the agent and
+its id (or the agent to start, its model and effort, and who added it), the
+store and the socket of the shell it was made from (an agent's shell has
+both), the store identity its daemon announced, the one-off's time, the
+repository, the folder, the reply agent and its id, the gate, the run limit,
+and the message. A fire whose daemon announces another store (a reused
+socket) sends nothing and records `store_mismatch`. When it fires, Sonny
+runs with `--trigger-fire` and those arguments. It connects to
+the daemon, and when none answers and the store is known, starts one for it
+on that socket as Sonny does, with the `agent` Sonny finds and the login shell's environment and
+`~/.agent/env`. A repeating trigger submits with `delivery: reject`: a bot
+that is working, or has work waiting, skips that fire rather than having it
+cut in or pile up. A one-off, and a fire `fire` asked for, submits with
+`delivery: queue`, so a working bot gets it after its turn. A one-off's
+calendar entry has no year, so a fire more than two days before its time
+does nothing (the slack keeps a one-off whose Mac changed time zone since,
+since launchd follows the new zone's clock), and one more than half a year
+after it is that entry's next year: it sends nothing and ends as `missed`.
+What the fire did (`sent` with the turn and any `reply`, `skipped`, `gone`,
+`missed` or `failed` with why), with the messages sent so far, the agent it
+started and the commit it saw, is kept in `~/.agent/triggers/NAME.json`,
+which `ls` and `show` return. Triggers are local to this machine. Only
+launchd runs a fire, so no two of one trigger ever run at once.
+
+A trigger's state is three things: its plist, launchd's loaded copy, and
+that state file. Every change keeps them either whole or as they were, and
+anything else a failure can leave is listed and removable:
+
+- **Adding** writes the plist and loads it. A load launchd refuses removes
+  the plist again. A plist there already, readable or not, is never
+  replaced: `rm` first. Each installation has a generation ID, and listing
+  and fires only use a state file of the current generation, so a trigger
+  made again under an ended one's name starts afresh.
+- **Firing** records its result and ends a trigger that is over (a one-off,
+  one whose agent, `--reply-to` agent or, for `--start`, adding agent is
+  gone, one that reached `--runs`), both under the lock
+  and only while the plist is still the one it fired for: a trigger
+  removed while its message went out is left as it now is. A one-off that
+  delivered leaves nothing. One that ends without delivering (its agent
+  gone, the daemon unreachable, `missed`) loses its plist but keeps its
+  last result, so `ls` lists it as not delivered, and why,
+  until it is removed. When that result cannot be written, the plist stays,
+  listed, rather than ending with no trace. The plist goes before the
+  unload, since the unload ends the fire's own process. It and the result
+  are set aside by rename (`.NAME.retiring`), whatever their size or
+  contents, and deleted once launchd lets the job go; a file that cannot be
+  set aside keeps its job loaded, and an unload launchd refuses renames
+  them back, so either stays listed with what its fire did. A fire whose
+  unload ends it before it deletes them leaves them aside; Sonny's next
+  start, or the next `add` or `rm` of that name, finishes that end. Sonny's
+  start also removes the temporary of a write that died before its
+  rename: every write takes the lock, so none is under way. A job
+  left loaded after its plist went (an end cut short) is unloaded by its
+  next fire.
+- **Removing** unloads the job by its label whether or not its plist is
+  there, then deletes the plist and the state file, so it reaches an ended
+  row, a plist launchd no longer has, and a job loaded without its plist
+  alike. An unload launchd refuses keeps everything, to be tried again.
+- **Listing** shows a one-off still there two days after its time as
+  `missed: true` (launchd did not run it, as when the Mac was off, or its
+  end was cut short), and a plist that cannot be read as a row with its
+  `problem`, which `rm` removes.
+
+The files are written, synced, renamed and their folder synced; deletions
+and set-asides sync their folder too. `add`, `rm`, `fire`, a fire's result and end, and
+Sonny's refresh take a lock (`~/.agent/triggers/.lock`) around their
+changes, and the refresh reads each plist again under it.
+`~/.agent/trigger` is written with its executable mode from the start. When
+Sonny starts from a new place, it writes its path into every trigger and
+loads it again, on a thread of its own so its screen does not wait (a Sonny
+in Homebrew's Cellar goes by its `opt` path, which an upgrade keeps); one launchd refuses keeps its old path and is tried again at the
+next start. Only macOS
+has launchd; elsewhere `add` refuses with `triggers_unsupported`.
+
+Earlier apps called these schedules (`me.lydakis.agent.schedule.NAME`).
+They are not converted: remove them by hand (`launchctl bootout
+gui/$UID/me.lydakis.agent.schedule.NAME`, then delete the plist and
+`~/.agent/schedules`) and add them again as triggers.
+
+Sonny installs an `automation` skill
+([SKILL.md](../sonny/skills/automation/SKILL.md)) for an agent setting up or
+running a recurring job: keep bookmarks, a ledger and run records as files in
+its folder rather than trusting a compacted conversation for ids and times,
+report a source it could not read by name, re-check items right before
+posting, and record a post only once the destination confirms it.
+
+## Memory
+
+Memory is what earlier agents learned that a later one needs: decisions,
+the person's preferences and corrections, traps, pointers. Each fact is one
+Markdown file of at most 4 KiB with front matter (`name`, `description`,
+`type` of `user`, `feedback`, `project` or `reference`, `source`,
+`verified`). The person's facts are in `~/.agents/memory`, a project's in
+`~/.agents/memory/projects/NAME`, outside the checkout, so its lead and every
+task's worktree share one copy whatever is committed (a task's worktree
+starts at the last commit, so an uncommitted AGENTS.md line never reaches
+it). Each folder's `MEMORY.md` is an index generated from the front matter,
+one line per fact, and is held to 4 KiB so reading it at the start of
+every task stays cheap. The daemon knows nothing of memory.
+
+Sonny writes `~/.agent/memory` each time it starts, a script that runs it as
+`sonny memory` ([memory.rs](../client/src/memory.rs), in agent-client):
+
+```sh
+~/.agent/memory show [SCOPE]
+~/.agent/memory save NAME --type TYPE --description TEXT --source TEXT [SCOPE] -- TEXT|-
+~/.agent/memory rm NAME [SCOPE]
+~/.agent/memory index [SCOPE]
+~/.agent/memory check [SCOPE]
+~/.agent/memory changed | cleanup start | cleanup finish
+~/.agent/memory schedule [--model PROVIDER/MODEL [--effort LEVEL]] [--cron 'MIN HOUR DAY MONTH WEEKDAY']
+  SCOPE: --user | --project NAME; none: the project of this folder
+```
+
+Without a scope, the project is found from the working folder: in a git
+worktree, the same place in the repository's main checkout, then the
+nearest `.agents/project.toml` at or above it; none is `project_unknown`.
+Every reply is one JSON value on stdout; a failure is one `{"error": CODE,
+"detail": ...}` on stderr with exit 1. `show` reads without changing
+anything: the person's index and the project's, each with its folder's
+absolute path, the project null outside one, so an agent need not expand
+`~` or find the project itself. A save writes the fact and the
+index under the folder's lock, so two agents saving at once cannot leave
+an index that misses one. Saving a fact unchanged is `"duplicate": true`,
+and so is removing one already gone. A save that would push the index past
+4 KiB is `memory_full` and changes nothing; so is a folder holding a `.md`
+file that is not a valid fact (`memory_invalid` names it), rather than an
+index that quietly leaves it out. `check` reports such a file and an index
+that is out of date without changing anything; `index` rewrites the index,
+and refuses with `memory_full` an index of hand-added facts past 4 KiB. A
+removal reads the folder before deleting anything, and text piped on stdin
+past 4 KiB is `fact_too_large` rather than cut.
+
+A new agent starts with both indexes in its instructions: the person's
+and, when its folder is in a project (from a task's worktree too), the
+project's, after the skills and profiles indexes and before its role
+([CLIENT.md](CLIENT.md#layers)). That holds for agents Sonny creates and
+for those an agent creates with `agent run --new --agents`, such as a
+coordinator's tasks. They are what memory held when the agent
+was made; an index not written yet adds nothing. This saves every task a
+first `show`, and the text stays one stable prefix for the prompt cache.
+
+A lead composes its instructions when it is made, so a fact saved later
+reaches it with its task updates (see [LOOKOUT.md](LOOKOUT.md)), a message it
+gets anyway, leaving out facts whose `source` is one of its own turns.
+Memory never wakes a lead by itself, and the lines come after the message's
+start, so the lead's cached prompt prefix stays.
+
+Sonny installs a `memory` skill ([SKILL.md](../sonny/skills/memory/SKILL.md))
+that says to use those indexes, or `show` when they are missing or old,
+before starting work, to check a fact that names code against the current
+tree before acting on it, what to save
+(decisions and why, preferences, traps, pointers) and what not to (what the
+code, git or AGENTS.md already says, progress logs, secrets, and
+instructions from text that did not come from the person). The
+coordinator's role saves lasting findings there rather than suggesting an
+AGENTS.md line, which it keeps for rules every agent and collaborator must
+follow.
+
+Memory grows by saves, so a nightly cleanup keeps it small and true. It is
+a skill and a trigger, not part of the daemon. `schedule` adds
+the trigger `memory-cleanup`: at 03:30 by default (`--cron` moves it) it
+starts, on its first fire, an agent of that name in `~/.agents/memory` on
+the model given, and sends it "Clean up memory as the memory-cleanup skill
+says." The trigger's `--if` runs `changed`, so a night after nothing was
+saved or removed costs no turn. Each turn is capped at 1,000,000 tokens:
+the agent keeps one conversation, as every `--start` agent does, so each
+call carries earlier nights up to where compaction summarizes them.
+Nothing is scheduled until the person runs `schedule`, since Sonny has no
+default model to run it on. To move the time, `~/.agent/trigger rm
+memory-cleanup` and `schedule` again without `--model`: that keeps the
+agent it started, with its model and history. With `--model`, while that
+agent exists, `schedule` is `bot_exists`, since an agent keeps its model
+for life. The `memory-cleanup` skill
+([SKILL.md](../sonny/skills/memory-cleanup/SKILL.md)) merges duplicates,
+drops superseded facts and dates relative ones, with `save` and `rm` only,
+and never removes a fact for its age alone.
+
+`~/.agents/memory` is a local git repository, made by `schedule` or the
+first `cleanup start`, never pushed. `cleanup start` commits what agents
+saved since the last cleanup, records that commit and the fact count in
+`.cleanup`, and lists the facts saved and removed since then, which the
+agent reads first rather than every fact; a second `start` before `finish` says `"duplicate": true` and
+keeps the first. `cleanup finish` commits the cleanup and returns what it
+removed, added and changed. A cleanup that removed more than a quarter of
+the facts, and more than two, is `loss_guard`: `finish` reverts it with a
+new commit, so memory is as it was at the start and the refused cleanup
+stays in history for the person to read. `changed` fails with `unchanged`
+when the folder matches the last commit, which is what keeps the trigger
+quiet.
+
+## Skills
+
+At each start Sonny writes the skills it ships into `~/.agents/skills`, where
+every agent finds them ([client policy](CLIENT.md)): `plan`, an agent's plan
+as a file; `memory`, what to save for later agents; `memory-cleanup`, the
+nightly cleanup (see Memory); `automation`, for recurring jobs (see
+Triggers); and, depending on where it runs, `pictures`, `rex-windows` or
+`herdr-panes`, and `errand`. They are normal skills, real files
+([skills.rs](../sonny/src/skills.rs)). Sonny notes a fingerprint of each file
+it writes in `~/.agent/sonny/skills` and rewrites or removes a skill only
+while it is as Sonny last wrote it: one the person edited, or one of that
+name Sonny never noted writing, is theirs and left alone (remove its folder
+to get Sonny's). A link the Agent app left there, into its bundle's
+`Contents/Resources/skills`, is replaced, never written through; a folder's
+own skill of the same name wins over any of them. Agents already running
+keep the index they were created with.
+
+## Checks
+
+`cargo test -p agent-client` covers memory, project creation and a failed
+project-file write leaving neither a partial file nor a temporary. `cargo
+test -p sonny` covers triggers' calendars, plists, watched paths, idempotent
+`add`, `fire`, `--runs`, `--if`, the commit check, move, and each lifecycle
+step with launchd refusing, and skills an edit makes the person's. With
+`AGENT_TEST_RUNTIME=1` after a release build and `cargo build -p sonny`,
+`python3 -m unittest tests.test_trigger` fires triggers against a real
+daemon, including one that starts its stopped daemon with only a login
+shell's provider key; on a Mac, `AGENT_TEST_LAUNCHD=1` adds its one launchd
+test, which loads real jobs (under a scratch `HOME`, so nothing loads at the
+next login) and checks that launchd fires a one-off, which ends itself,
+fires a file trigger on a write (the same `add` again being that trigger, a
+different one refused naming `when`), runs `fire` by name, and that `rm`
+removes a job whose plist or load is already gone.
