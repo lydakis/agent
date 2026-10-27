@@ -92,6 +92,19 @@ agent then does. Esc stops a command still running.
 
 ![A command run with !, its output, and the agent answering it](../docs/sonny/shell-passthrough.gif)
 
+An emoji sent alone is a reaction, not a message: it goes under the
+agent's last reply and is attached to the agent's next call, so it starts
+no turn. `/react` picks an older reply, and sending an emoji already on a
+reply takes it off. The agent reacts too, with a `react` tool Sonny
+declares on it (a tool the daemon records and never runs): 👍 or 🎉 under
+your message when that is all it needs, or 👀 while it looks, taken off
+once it answers. Its reactions are drawn when its turn ends, so one taken
+off again never shows.
+
+![The agent's 🎉 under a message, and a 👍 on its reply](../docs/sonny/reactions.png)
+
+![/react picking an older reply](../docs/sonny/reactions-picker.png)
+
 `/` lists the commands:
 
 - `/side [QUESTION]` opens a side chat with a copy of the agent in this

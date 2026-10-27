@@ -727,6 +727,10 @@ async fn run() -> Result<(), String> {
             "a copy of {source} that answers without acting; {source} carries on"
         ));
     }
+    // The person's agent can react to them; a side chat calls no tool.
+    if options.side.is_none() {
+        app.declare = reactions::declare(&bot);
+    }
     app.sounds = sound::Sounds::new(options.sound);
     let settings = settings::Settings::load();
     app.sounds.chime = settings.chime;
@@ -1180,6 +1184,17 @@ struct App {
     react_to: Option<(i64, String)>,
     /// The turn of the last reaction sent, whose attaching says nothing.
     reaction_turn: Option<i64>,
+    /// The tools to declare on the bot so it can react, sent once no turn
+    /// runs.
+    declare: Option<Value>,
+    /// The bot's reactions in the running turn so far, drawn when it ends.
+    bot_reactions: Vec<String>,
+    /// The first line of the person's message the bot answers, and the
+    /// rows drawn when it was: a reaction with none drawn since goes right
+    /// under it.
+    answering: Option<(String, usize)>,
+    /// Rows written into the history so far.
+    rows_drawn: usize,
     /// The reasoning streamed since the bot last spoke or called a tool,
     /// whose latest heading the status row shows, as Codex does.
     thought: String,
@@ -1816,6 +1831,10 @@ impl App {
             reacting: None,
             react_to: None,
             reaction_turn: None,
+            declare: None,
+            bot_reactions: Vec::new(),
+            answering: None,
+            rows_drawn: 0,
             thought: String::new(),
             replay: None,
             options,
@@ -2068,16 +2087,24 @@ impl App {
     /// for the turn to end, or when the daemon refused it (the notice says
     /// why).
     async fn configure(&mut self) -> bool {
-        if self.instruct.is_none() && self.switch.is_none() && self.gating.is_none() {
+        if self.instruct.is_none()
+            && self.switch.is_none()
+            && self.gating.is_none()
+            && self.declare.is_none()
+        {
             return true;
         }
         if self.running.is_some() {
             return false;
         }
         let (text, switch, gating) = (self.instruct.take(), self.switch.take(), self.gating.take());
+        let declare = self.declare.take();
         let mut asked = json!({"bot": self.bot});
         if let Some(text) = &text {
             asked["instructions"] = json!(text);
+        }
+        if let Some(declare) = &declare {
+            asked["declare"] = declare.clone();
         }
         if let Some((model, effort)) = &switch {
             asked["model"] = json!(model);
@@ -2122,6 +2149,7 @@ impl App {
                 self.instruct = text;
                 self.switch = switch;
                 self.gating = gating;
+                self.declare = declare;
                 return false;
             }
             Err(error) => {
@@ -2402,6 +2430,7 @@ impl App {
             self.pending.push(Line::default());
         }
         self.any_history = true;
+        self.rows_drawn += lines.len();
         self.pending.extend(lines);
     }
 
@@ -2513,57 +2542,67 @@ impl App {
         let mut calls: HashMap<String, (String, Value)> = HashMap::new();
         // The bot's words, quiet if a call follows them, as they were live.
         let mut said: Option<Vec<Line<'static>>> = None;
+        let mut items = Vec::with_capacity(nodes.len());
         for chunk in nodes.chunks(100) {
-            for (node, item) in self.items_at(chunk).await {
-                let call = item["type"] == "function_call";
-                if let Some(lines) = said.take_if(|_| call || item["role"].is_string()) {
-                    self.commit(match call {
-                        true => transcript::quiet(lines),
-                        false => lines,
-                    });
+            items.extend(self.items_at(chunk).await);
+        }
+        // The bot's reactions, each drawn under the message it answers.
+        let reacted = reactions::of_bot(&items);
+        for (node, item) in items {
+            // A reaction leaves the words before it as they were.
+            let call = item["type"] == "function_call" && item["name"] != reactions::TOOL;
+            if let Some(lines) = said.take_if(|_| call || item["role"].is_string()) {
+                self.commit(match call {
+                    true => transcript::quiet(lines),
+                    false => lines,
+                });
+            }
+            match (item["type"].as_str(), item["role"].as_str()) {
+                // A reaction is drawn under the reply it answers.
+                (_, Some("user")) if reactions::is_reaction(&text(&item)) => {}
+                (_, Some("user")) => {
+                    // What the person ran is shown as it was when it ran.
+                    let lines = landed(&text(&item), &mut self.ran_here, self.width);
+                    self.commit(lines);
+                    if let Some(on) = reacted.get(&node) {
+                        self.commit_after(vec![transcript::reacted(&on.join(" "))], false);
+                    }
                 }
-                match (item["type"].as_str(), item["role"].as_str()) {
-                    // A reaction is drawn under the reply it answers.
-                    (_, Some("user")) if reactions::is_reaction(&text(&item)) => {}
-                    (_, Some("user")) => {
-                        // What the person ran is shown as it was when it ran.
-                        let lines = landed(&text(&item), &mut self.ran_here, self.width);
-                        self.commit(lines);
+                (_, Some("assistant")) => {
+                    let reply = text(&item);
+                    if !reply.is_empty() {
+                        let mut lines = transcript::reply(&reply, self.width);
+                        lines.extend(self.reacted_row(node));
+                        said = Some(lines);
+                        self.saw_reply(node, &reply);
+                        self.last_reply = reply;
                     }
-                    (_, Some("assistant")) => {
-                        let reply = text(&item);
-                        if !reply.is_empty() {
-                            let mut lines = transcript::reply(&reply, self.width);
-                            lines.extend(self.reacted_row(node));
-                            said = Some(lines);
-                            self.saw_reply(node, &reply);
-                            self.last_reply = reply;
-                        }
-                    }
-                    (Some("function_call"), _) => {
-                        let arguments = item["arguments"]
-                            .as_str()
-                            .and_then(|a| serde_json::from_str(a).ok())
-                            .unwrap_or(Value::Null);
-                        let name = item["name"].as_str().unwrap_or("tool").to_owned();
-                        calls.insert(
-                            item["call_id"].as_str().unwrap_or("").to_owned(),
-                            (name, arguments),
-                        );
-                    }
-                    (Some("function_call_output"), _) => {
-                        let id = item["call_id"].as_str().unwrap_or("");
-                        // A call this window kept before it lost the daemon
-                        // may end in what it reads on reconnecting.
-                        if let Some((name, arguments)) =
-                            calls.remove(id).or_else(|| self.calls.remove(id))
-                        {
-                            let (output, failed) = output(&item);
-                            self.commit_call(&name, &arguments, &output, failed);
-                        }
-                    }
-                    _ => {}
                 }
+                // Drawn under the person's message instead.
+                (Some("function_call"), _) if item["name"] == reactions::TOOL => {}
+                (Some("function_call"), _) => {
+                    let arguments = item["arguments"]
+                        .as_str()
+                        .and_then(|a| serde_json::from_str(a).ok())
+                        .unwrap_or(Value::Null);
+                    let name = item["name"].as_str().unwrap_or("tool").to_owned();
+                    calls.insert(
+                        item["call_id"].as_str().unwrap_or("").to_owned(),
+                        (name, arguments),
+                    );
+                }
+                (Some("function_call_output"), _) => {
+                    let id = item["call_id"].as_str().unwrap_or("");
+                    // A call this window kept before it lost the daemon
+                    // may end in what it reads on reconnecting.
+                    if let Some((name, arguments)) =
+                        calls.remove(id).or_else(|| self.calls.remove(id))
+                    {
+                        let (output, failed) = output(&item);
+                        self.commit_call(&name, &arguments, &output, failed);
+                    }
+                }
+                _ => {}
             }
         }
         if let Some(lines) = said {
@@ -2733,6 +2772,7 @@ impl App {
         if live.gap && !live.spilled {
             self.pending.push(Line::default());
         }
+        self.rows_drawn += live.rows.len();
         self.pending.extend(match words {
             Words::Step => transcript::quiet(live.rows),
             Words::Reply => live.rows,
@@ -2758,6 +2798,7 @@ impl App {
                 self.pending.push(Line::default());
             }
             live.spilled = true;
+            self.rows_drawn += live.rows.len();
             self.pending.append(&mut live.rows);
             self.any_history = true;
         }
@@ -2848,6 +2889,8 @@ impl App {
                 }
                 self.effort = data["effort"].as_str().map(str::to_owned);
                 status_report("working", &self.bot);
+                self.bot_reactions.clear();
+                self.answering = None;
                 if !drawn
                     && let Some(node) = data["node"].as_i64()
                     && let Some(item) = self.items(&[node]).await.first()
@@ -2855,6 +2898,7 @@ impl App {
                 {
                     let lines = landed(&text(item), &mut self.ran_here, self.width);
                     self.commit(lines);
+                    self.answering = Some((first_words(&text(item)), self.rows_drawn));
                 }
             }
             "steered" => {
@@ -2866,8 +2910,12 @@ impl App {
                     && !reactions::is_reaction(&text(item))
                 {
                     self.end_live(Words::Reply);
+                    // What the bot reacted with so far answered the
+                    // message before this one.
+                    self.draw_bot_reactions();
                     let lines = landed(&text(item), &mut self.ran_here, self.width);
                     self.commit(lines);
+                    self.answering = Some((first_words(&text(item)), self.rows_drawn));
                 }
             }
             "queued" => self.notice = Some(format!("queued behind turn {}", data["behind"])),
@@ -2994,6 +3042,17 @@ impl App {
                     running.phase = "Retrying".into();
                 }
             }
+            "tool_started" if data["name"] == reactions::TOOL => {
+                // Drawn when the turn ends, so one taken off again is
+                // never drawn; its completion finds no call to draw.
+                if let Some(arguments) = data["arguments"]
+                    .as_str()
+                    .and_then(|a| serde_json::from_str::<Value>(a).ok())
+                    && let Some((emoji, remove)) = reactions::call(&arguments)
+                {
+                    reactions::apply(&mut self.bot_reactions, emoji, remove);
+                }
+            }
             "tool_started" => {
                 self.said.clear();
                 self.thought.clear();
@@ -3046,6 +3105,7 @@ impl App {
                 self.commit_call(&name, &arguments, &shown.0, shown.1);
                 if self.calls.is_empty() && !self.held.is_empty() {
                     let held = std::mem::take(&mut self.held);
+                    self.rows_drawn += held.len();
                     self.pending.extend(held);
                 }
                 self.approvals.retain(|call| call["call_id"] != id);
@@ -3087,10 +3147,20 @@ impl App {
                 let seconds = self.running.take().map(|r| r.started.elapsed().as_secs());
                 let line = transcript::finished(status, detail, seconds, self.width);
                 self.close_live();
+                // A turn that only reacted ends as a reaction under the
+                // message, with no line under it.
+                let words = self.live.as_ref().is_some_and(|live| !live.rows.is_empty());
+                let only_reacted = !words
+                    && !self.bot_reactions.is_empty()
+                    && self.answering.as_ref().map(|(_, at)| *at) == Some(self.rows_drawn);
+                if only_reacted {
+                    self.draw_bot_reactions();
+                }
                 // A turn that ended well puts its reply under the line, apart
                 // from the steps above; one written as it came, or one
                 // that failed, keeps the line under it.
                 match self.live.take() {
+                    _ if only_reacted && matches!(status, "completed" | "steered") => {}
                     Some(live)
                         if !live.spilled
                             && !live.rows.is_empty()
@@ -3106,6 +3176,7 @@ impl App {
                         self.commit(vec![line]);
                     }
                 }
+                self.draw_bot_reactions();
                 self.approvals.clear();
                 self.notice = None;
                 status_report(
@@ -4022,6 +4093,39 @@ impl App {
         }
     }
 
+    /// The bot's reactions so far to the person's message: right under it
+    /// when nothing was drawn since, else a row of their own that says
+    /// which message.
+    fn draw_bot_reactions(&mut self) {
+        let on = std::mem::take(&mut self.bot_reactions);
+        if on.is_empty() {
+            return;
+        }
+        let emoji = on.join(" ");
+        match &self.answering {
+            Some((_, at)) if *at == self.rows_drawn => {
+                self.commit_after(vec![transcript::reacted(&emoji)], false);
+            }
+            answering => {
+                let what = match answering {
+                    Some((first, _)) => format!("↳ reacted {emoji} to “{first}”"),
+                    None => format!("↳ reacted {emoji}"),
+                };
+                let rows = transcript::wrap(
+                    Line::from(what),
+                    self.width,
+                    Span::raw("  "),
+                    Span::raw("    "),
+                );
+                self.commit(transcript::quiet(rows));
+            }
+        }
+        // Another reaction now goes under this one's row.
+        if let Some((_, at)) = &mut self.answering {
+            *at = self.rows_drawn;
+        }
+    }
+
     /// The person's reactions to the reply at `node`, as its row.
     fn reacted_row(&self, node: i64) -> Option<Line<'static>> {
         let on = self.reactions.on(node);
@@ -4745,6 +4849,15 @@ fn short(bot: &str, project: &str, lead: &str) -> String {
 /// A message as it lands in the conversation. A command the person ran
 /// is by name only when `shown` holds it (this window showed its output
 /// when it ran, and lets it go), else whole.
+/// A message's first line, cut to quote it.
+fn first_words(text: &str) -> String {
+    let first = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("");
+    transcript::cut(first.trim(), QUOTED)
+}
+
 fn landed(text: &str, shown: &mut Vec<user_shell::Ran>, width: usize) -> Vec<Line<'static>> {
     let Some(ran) = user_shell::read(text) else {
         return transcript::prompt(text, None, width);
@@ -5421,6 +5534,128 @@ mod tests {
         app.submit().await;
         assert_eq!(sent.lock().unwrap()[2]["prompt"], "👍 ship it");
         assert!(sent.lock().unwrap()[2]["delivery"].is_null());
+    }
+
+    #[tokio::test]
+    async fn the_bots_reaction_goes_under_the_message_once_its_turn_ends() {
+        let client = daemon_answering(move |asked| {
+            let item = match asked["nodes"][0].as_i64() {
+                Some(1) => json!({"type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": "merged, thanks"}]}),
+                Some(5) => json!({"type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": "and the notes?"}]}),
+                Some(7) => json!({"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Updated."}]}),
+                _ => return json!({}),
+            };
+            json!({"items": [{"node": asked["nodes"][0], "item": item}]})
+        })
+        .await;
+        let mut app = app(client);
+        let react = |turn: i64, id: &str, arguments: Value| {
+            turn_event(
+                "tool_started",
+                turn,
+                json!({"call_id": id, "name": "react", "arguments": arguments.to_string()}),
+            )
+        };
+        let rows = |app: &mut App| {
+            std::mem::take(&mut app.pending)
+                .iter()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+        };
+        // A turn that only reacts: 👀 taken off again is never drawn, and
+        // no line closes the turn.
+        app.daemon(turn_event("accepted", 1, json!({"node": 1})))
+            .await;
+        for (id, arguments) in [
+            ("c1", json!({"emoji": "👀"})),
+            ("c2", json!({"emoji": "👍"})),
+            ("c3", json!({"emoji": "👀", "remove": true})),
+        ] {
+            app.daemon(react(1, id, arguments)).await;
+            app.daemon(turn_event("tool_completed", 1, json!({"call_id": id})))
+                .await;
+        }
+        assert_eq!(rows(&mut app), ["› merged, thanks"], "drawn when it ends");
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        assert_eq!(rows(&mut app), ["   👍 "]);
+        // One that answers too: the reaction says which message.
+        app.daemon(turn_event("accepted", 2, json!({"node": 5})))
+            .await;
+        app.daemon(react(2, "c4", json!({"emoji": "🎉"}))).await;
+        app.daemon(turn_event("message", 2, json!({"node": 7})))
+            .await;
+        app.daemon(turn_event(
+            "turn_finished",
+            2,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        let drawn = rows(&mut app);
+        assert_eq!(drawn[1], "› and the notes?");
+        assert!(drawn[3].starts_with("─ Worked"), "{drawn:?}");
+        assert_eq!(
+            drawn[5..],
+            ["• Updated.", "", "  ↳ reacted 🎉 to “and the notes?”"]
+        );
+    }
+
+    #[tokio::test]
+    async fn replayed_bot_reactions_sit_under_the_message_they_answer() {
+        let items = json!({
+            "1": {"type": "message", "role": "user",
+                  "content": [{"type": "input_text", "text": "merged, thanks"}]},
+            "2": {"type": "function_call", "name": "react", "call_id": "c1",
+                  "arguments": "{\"emoji\":\"👍\"}"},
+            "3": {"type": "function_call_output", "call_id": "c1", "output": "Done."},
+            "4": {"type": "message", "role": "assistant",
+                  "content": [{"type": "output_text", "text": "Anything else?"}]},
+        });
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_nodes") => json!({"nodes": [{"node": 4}, {"node": 3}, {"node": 2},
+                {"node": 1}], "next_from": null}),
+            _ => json!({"items": asked["nodes"].as_array().into_iter().flatten()
+                .map(|node| json!({"node": node, "item": items[node.to_string()]}))
+                .collect::<Vec<_>>()}),
+        })
+        .await;
+        let mut app = app(client);
+        app.history().await;
+        let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
+        assert_eq!(rows, ["› merged, thanks", "   👍 ", "", "• Anything else?"]);
+    }
+
+    #[tokio::test]
+    async fn the_bot_is_given_react_once_no_turn_runs() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = daemon_answering(move |request| {
+            seen.lock().unwrap().push(request.clone());
+            json!({"bot": "b", "changed": ["declared"]})
+        })
+        .await;
+        let mut app = app(client);
+        app.declare = reactions::declare(&json!({}));
+        app.running = Some(Running {
+            turn: 1,
+            started: Instant::now(),
+            phase: "Working".into(),
+        });
+        assert!(!app.configure().await);
+        assert!(asked.lock().unwrap().is_empty());
+        app.running = None;
+        assert!(app.configure().await);
+        let sent = asked.lock().unwrap()[0].clone();
+        assert_eq!(sent["op"], "configure");
+        assert_eq!(sent["declare"], json!([reactions::tool()]));
+        assert!(app.declare.is_none());
     }
 
     #[tokio::test]
