@@ -936,8 +936,11 @@ daemon learns nothing about projects; everything here is client work.
   one Sonny ships, which the app uses too
   ([coordinator.md](../sonny/agents/coordinator.md)), whose
   model and tools apply when the project names none. The shipped text
-  says: the coordinator makes a small, quick change itself (a few lines it
-  can check at a glance) and sends work in an area an existing task owns to
+  says: tasks do the work and the coordinator's turns stay short; it
+  answers what a quick look answers, makes a change itself only when it is
+  a few lines it can check at a glance with no build, test or exploring,
+  hands work that grew to a task with what it found, and sends work in an
+  area an existing task owns to
   that task with `--delivery queue`; every new task, one that only reads too, named with the
   project's prefix so projects do not collide, gets
   `git worktree add -b agent/NAME ~/.agent/worktrees/NAME HEAD`, the

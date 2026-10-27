@@ -23,6 +23,7 @@ mod math;
 mod mermaid;
 mod models;
 mod mux;
+mod place;
 mod project;
 mod prompt;
 mod rex;
@@ -731,6 +732,9 @@ fn heading(thought: &str) -> Option<&str> {
 }
 
 /// A folder as the person reads it: under their home, from `~`.
+/// How often the footer reads the workspace's branch again.
+const PLACE_EVERY: Duration = Duration::from_secs(3);
+
 fn tilde(path: &str) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     match path.strip_prefix(&home) {
@@ -864,6 +868,13 @@ struct App {
     /// The project whose lead this is, when opened as the folder's coordinator.
     project: Option<String>,
     workspace: String,
+    /// The workspace's branch and what it is a sandfs copy of, as last
+    /// read, for the footer.
+    place: place::Place,
+    /// The read under way, of the workspace named, and when the last one
+    /// began: the branch can change under a running turn.
+    place_job: Option<(String, tokio::task::JoinHandle<place::Place>)>,
+    place_read: Option<(String, Instant)>,
     model: String,
     effort: Option<String>,
     /// How big the conversation was after its last model round, as the
@@ -1392,6 +1403,9 @@ impl App {
             bot: bot.to_owned(),
             project: None,
             workspace: record["workspace"].as_str().unwrap_or("").to_owned(),
+            place: place::Place::default(),
+            place_job: None,
+            place_read: None,
             model,
             effort: record["effort"].as_str().map(str::to_owned),
             context: None,
@@ -1567,11 +1581,48 @@ impl App {
                 self.reattach(events).await;
             }
             self.listed();
+            self.follow_place().await;
             self.repaint |= term::switched();
             if self.repaint && self.running.is_none() && self.watch.is_none() {
                 self.repaint = false;
                 self.repaint(terminal).await?;
             }
+        }
+    }
+
+    /// Take the workspace's place once read, and read it again every few
+    /// seconds, or at once when the bot moved.
+    async fn follow_place(&mut self) {
+        if let Some((dir, job)) = &self.place_job
+            && job.is_finished()
+        {
+            let dir = dir.clone();
+            let job = self.place_job.take().unwrap().1;
+            if let Ok(place) = job.await
+                && dir == self.workspace
+            {
+                self.place = place;
+            }
+        }
+        let due = match &self.place_read {
+            Some((dir, at)) => *dir != self.workspace || at.elapsed() > PLACE_EVERY,
+            None => true,
+        };
+        if self.place_job.is_none() && due && !self.workspace.is_empty() {
+            let dir = self.workspace.clone();
+            if self
+                .place_read
+                .as_ref()
+                .is_some_and(|(read, _)| *read != dir)
+            {
+                self.place = place::Place::default();
+            }
+            self.place_read = Some((dir.clone(), Instant::now()));
+            let job = tokio::task::spawn_blocking({
+                let dir = dir.clone();
+                move || place::read(std::path::Path::new(&dir))
+            });
+            self.place_job = Some((dir, job));
         }
     }
 
@@ -3443,14 +3494,26 @@ impl App {
             Some(size) => format!("{} · {} context  ", self.bot, transcript::tokens(size)),
             None => format!("{}  ", self.bot),
         };
+        // The folder, and what it is a copy of; its branch is kept whole.
+        let folder = match &self.place.copy_of {
+            Some(source) => format!("{folder}, a sandfs copy of {}", tilde(source)),
+            None => folder,
+        };
+        let branch = match &self.place.branch {
+            Some(branch) => format!(" on {branch}"),
+            None => String::new(),
+        };
         // A long folder keeps its end, the part that tells folders apart.
-        let room = width.saturating_sub(left.width() + right.width() + 4);
+        let room = width.saturating_sub(left.width() + branch.width() + right.width() + 4);
         let mut folder = folder.as_str();
         let cut = folder.width() > room;
         while folder.width() > room.saturating_sub(1) && !folder.is_empty() {
             folder = &folder[folder.chars().next().map_or(1, char::len_utf8)..];
         }
-        left.push_str(&format!(" · {}{folder}", if cut { "…" } else { "" }));
+        left.push_str(&format!(
+            " · {}{folder}{branch}",
+            if cut { "…" } else { "" }
+        ));
         let fill = width.saturating_sub(left.width() + right.width());
         Line::from(format!("{left}{}{right}", " ".repeat(fill))).dim()
     }
@@ -3815,6 +3878,31 @@ mod tests {
         let two = "**Checking the tests**\n\nThey pass.\n\n**Reading the README";
         assert_eq!(heading(two), Some("Checking the tests"));
         assert_eq!(heading(&format!("{two}**\n")), Some("Reading the README"));
+    }
+
+    #[tokio::test]
+    async fn the_footer_names_the_branch_and_what_a_copy_was_made_from() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.workspace = "/work/tasks/fix-cart".into();
+        app.model = "opus".into();
+        app.place = place::Place {
+            branch: Some("agent/fix-cart".into()),
+            copy_of: Some("/work/shop".into()),
+        };
+        let wide = app.footer_line(100).to_string();
+        assert!(
+            wide.contains(
+                "opus · /work/tasks/fix-cart, a sandfs copy of /work/shop on agent/fix-cart"
+            ),
+            "{wide}"
+        );
+        // A narrow footer cuts the folder from its start, never the branch.
+        let narrow = app.footer_line(56).to_string();
+        assert!(
+            narrow.contains("…") && narrow.contains("/work/shop on agent/fix-cart"),
+            "{narrow}"
+        );
+        assert_eq!(narrow.trim_end().width(), 56 - 2);
     }
 
     #[test]

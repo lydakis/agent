@@ -632,8 +632,9 @@ approver the CLI starts.
   round's deadline, reads back one JSON object of probabilities, and
   deletes the fork. A reply without every answer, or
   with one outside 0 to 1, is a failed check. The forks keep rounds apart,
-  run them at once, and share the base's prompt cache. Forks left by an
-  approver that stopped are deleted when the next one starts.
+  run them at once, and share the base's prompt cache. Each fork expires
+  after a minute idle, so one left by an approver that stopped mid-round
+  is deleted by the daemon.
   `--effort` sets the judge bot's effort; the model's default is used
   otherwise.
 

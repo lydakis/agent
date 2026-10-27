@@ -962,8 +962,9 @@ class AutoApproverTests(ModelFixture):
                          'Help with the repo.')
         self.assertIn('result', daemon.request('delete', bot='approver.auto'))
         # An approver that stopped leaves its judge and a fork from mid-round:
-        # the next one makes the judge afresh, removes the fork, and keeps a
-        # bot that only shares its prefix.
+        # the next one makes the judge afresh, the daemon deletes the fork
+        # once it has been idle long enough, and a bot that only shares the
+        # judge's prefix is kept.
         old, _ = self.approver(daemon, judge='openai/old-judge')
         old.kill()
         old.wait()
@@ -971,11 +972,20 @@ class AutoApproverTests(ModelFixture):
         while daemon.request('stats')['result']['approvers']:
             self.assertLess(time.monotonic(), deadline)
             time.sleep(0.05)
-        daemon.request('fork', source='approver.auto', bot='approver.auto.1.0', created_by='approver.auto')
+        old_id = daemon.request('inspect', bot='approver.auto')['result']['bot_id']
+        daemon.request('fork', source='approver.auto', bot=f'approver.auto.{old_id}.0',
+                       created_by='approver.auto', expire_ms=1000)
         daemon.request('create', bot='approver.auto.notes', workspace='/', model='openai/synthetic-model',
                        tools=['shell'])
+        forks = Connection(daemon.socket_path)
+        self.addCleanup(forks.close)
+        forks.request('follow', bot='*')
+        forks.receive(lambda e: e.get('event') == 'follow_live')
         _, lines = self.approver(daemon, judge='openai/judge-model')
-        bots = {b['name']: b for b in daemon.request('bots')['result']['bots']}
+        deadline = time.monotonic() + 5
+        while len(bots := {b['name']: b for b in daemon.request('bots')['result']['bots']}) != 3:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.05)
         self.assertEqual(sorted(bots), ['Bob', 'approver.auto', 'approver.auto.notes'])
         self.assertIn('result', daemon.request('delete', bot='approver.auto.notes'))
         self.assertEqual((bots['approver.auto']['model'], bots['approver.auto']['tools'],
@@ -1006,7 +1016,11 @@ class AutoApproverTests(ModelFixture):
         self.assertIn({'event': 'judge_failed', 'bot': 'Bob', 'turn': vague,
                        'detail': "the judge's answer did not parse"}, events)
         self.assertEqual(self.judge.requests.qsize(), 0)
-        # Each round's fork goes once it is answered; the base stays.
+        # Each round's fork expires if the approver stops, and goes once it
+        # is answered; the base stays.
+        base = bots['approver.auto']['bot_id']
+        forked = forks.receive(lambda e: e.get('event') == 'forked')
+        self.assertEqual((forked['bot'], forked['data']['expire_ms']), (f'approver.auto.{base}.0', 60000))
         deadline = time.monotonic() + 5
         while sorted(b['name'] for b in daemon.request('bots')['result']['bots']) != ['Bob', 'approver.auto']:
             self.assertLess(time.monotonic(), deadline)
