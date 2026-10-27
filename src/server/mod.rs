@@ -752,6 +752,8 @@ struct Service {
     /// when they are tried again. Each holds no task and no slot; the run
     /// loop resumes them as they come due.
     wakes: Wakes,
+    /// The newest steer each parked turn has been woken for.
+    steer_wakes: HashMap<i64, i64>,
     /// Shutting down with a grace period: running turns go on, no turn
     /// starts, and accepted submissions wait durably for the next start.
     draining: bool,
@@ -883,6 +885,8 @@ struct Active {
     /// Set to the error the cancelled turn ends with.
     cancel: watch::Sender<Option<&'static str>>,
     steers: Arc<std::sync::atomic::AtomicBool>,
+    /// Armed by a `steer` alone, never by other deliveries.
+    lift: Arc<turn::Lift>,
 }
 impl Active {
     /// Cancel the turn with `code` unless a cause is already set: the first
@@ -1106,24 +1110,27 @@ pub async fn run(config: Configuration) -> Result<()> {
     // Turns parked before a restart keep waiting; their processes are gone.
     // Those parked on a closed pool wait for their time, not for handles.
     let mut wakes = Wakes::default();
+    let mut steer_wakes = HashMap::new();
     let parked = store
         .op("waiting_turns", |db| {
             // Every turn's lapse in one read, not one query per parked turn.
             let lapses = db.lapses()?;
-            Ok(db
-                .waiting_turns()?
+            db.waiting_turns()?
                 .into_iter()
                 .map(|w| {
-                    let lapse = match w.approval || w.paced_since_ms.is_some() {
-                        true => None,
-                        false => lapses.get(&w.turn).copied(),
+                    let own = !w.approval && w.paced_since_ms.is_none();
+                    let lapse = own.then(|| lapses.get(&w.turn).copied()).flatten();
+                    // A steer sent while the daemon was down wakes the wait.
+                    let steered = match own {
+                        true => db.steered_park(&w.bot)?.filter(|(turn, _)| *turn == w.turn),
+                        false => None,
                     };
-                    (w, lapse)
+                    Ok((w, lapse, steered))
                 })
-                .collect::<Vec<_>>())
+                .collect::<Result<Vec<_>>>()
         })
         .await?;
-    for (waiting, lapse) in parked {
+    for (waiting, lapse, steered) in parked {
         if waiting.paced_since_ms.is_some() {
             wakes.set(waiting.deadline_ms.unwrap_or(0), waiting.bot, waiting.turn);
             continue;
@@ -1155,6 +1162,10 @@ pub async fn run(config: Configuration) -> Result<()> {
                 },
             )
             .await;
+        if let Some((turn, steer)) = steered {
+            steer_wakes.insert(turn, steer);
+            handles.wake(waiting.bot, waiting.turn);
+        }
     }
     let mut service = Service {
         store,
@@ -1177,6 +1188,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         ready_hint: true,
         tokens: Arc::default(),
         wakes,
+        steer_wakes,
         draining: false,
         admissions: std::collections::VecDeque::with_capacity(ADMISSION_WINDOW),
         reserved: 0,
@@ -1645,10 +1657,11 @@ impl Service {
             let steered = self.admissions.iter().any(|admission| {
                 matches!(&admission.pending, Pending::Submit { bot: queued, delivery: Delivery::Steer, .. } if *queued == bot)
             });
-            self.spawn(bot.clone(), started.turn, None, steered);
+            self.spawn(bot.clone(), started.turn, None, steered, false);
         }
         // The running turn may have started after the steer was queued, from
-        // an admission answered in between.
+        // an admission answered in between. A command it is running moves
+        // to the background so the steer reaches it now.
         if started.fresh
             && started.status == "queued"
             && delivery == Delivery::Steer
@@ -1657,6 +1670,16 @@ impl Service {
             active
                 .steers
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+            if started.joins {
+                active.lift.arm();
+            }
+        }
+        // A steer for a turn parked on `wait` wakes it; the handles it
+        // waits on are reported pending and stay valid.
+        if started.fresh
+            && let Some((parked, steer)) = started.parked
+        {
+            self.wake_for_steer(bot.clone(), parked, steer);
         }
         if started.status == "ready" {
             self.ready_hint = true;
@@ -1737,7 +1760,7 @@ impl Service {
         // wake-up finds it running and is dropped; the claim also drops the
         // turn's lapse, which would otherwise wait out the gate's expiry.
         enum Claim {
-            Run(String, Box<Waiting>, bool),
+            Run(String, Box<Waiting>, bool, bool),
             Later(String, Option<u64>),
             Stale,
         }
@@ -1746,7 +1769,12 @@ impl Service {
             .store
             .op("resume", move |db| match db.wake(&name, turn, due)? {
                 Wake::Resume => match db.resume(turn) {
-                    Ok((waiting, _, steers)) => Ok(Claim::Run(name, Box::new(waiting), steers)),
+                    Ok((waiting, _, steers)) => {
+                        // A steer for the turn lifts what the rest of the
+                        // parked call's batch would block on.
+                        let joins = steers && db.joining_steer(&name)?;
+                        Ok(Claim::Run(name, Box::new(waiting), steers, joins))
+                    }
                     Err(error) if error.code == "turn_not_waiting" => Ok(Claim::Stale),
                     Err(error) => Err(error),
                 },
@@ -1766,9 +1794,9 @@ impl Service {
         };
         self.storage_backoff = Duration::ZERO;
         match claimed {
-            Claim::Run(bot, waiting, steers) => {
+            Claim::Run(bot, waiting, steers, joins) => {
                 self.wakes.cancel(turn);
-                self.spawn(bot, turn, Some(*waiting), steers);
+                self.spawn(bot, turn, Some(*waiting), steers, joins);
             }
             // Still parked: its next lapse may have moved, or gone.
             Claim::Later(bot, Some(at)) => self.wakes.set(at, bot, turn),
@@ -1817,7 +1845,7 @@ impl Service {
             })
             .await
         {
-            Ok((_, steers)) => self.spawn(bot, turn, None, steers),
+            Ok((_, steers)) => self.spawn(bot, turn, None, steers, false),
             Err(error) if error.code == "bot_busy" => {}
             // Nothing was written: the turn is still ready.
             Err(error) if error.code == "storage_error" => return Err(error),
@@ -1860,14 +1888,40 @@ impl Service {
         Ok(())
     }
 
+    /// Wake a turn parked on `wait` for steers up to `steer`, once: a steer
+    /// that stays queued (no room in the context) must not end every later
+    /// wait of the turn.
+    fn wake_for_steer(&mut self, bot: String, turn: i64, steer: i64) {
+        if self
+            .steer_wakes
+            .get(&turn)
+            .is_some_and(|&woken| woken >= steer)
+        {
+            return;
+        }
+        self.steer_wakes.insert(turn, steer);
+        self.handles.wake(bot, turn);
+    }
+
     /// Run a turn as a task: fresh after submission, or resuming a parked one.
-    fn spawn(&mut self, bot: String, turn: i64, resumed: Option<Waiting>, steers: bool) {
+    fn spawn(
+        &mut self,
+        bot: String,
+        turn: i64,
+        resumed: Option<Waiting>,
+        steers: bool,
+        lifted: bool,
+    ) {
         let (cancel, cancelled) = watch::channel(None);
         self.next_task += 1;
         let task_id = self.next_task;
         // The job that started this turn said whether a steer waits for it;
         // afterwards only a steer for this bot sets the flag.
         let steers = Arc::new(std::sync::atomic::AtomicBool::new(steers));
+        let lift = Arc::new(turn::Lift::default());
+        if lifted {
+            lift.arm();
+        }
         self.active.insert(
             bot.clone(),
             Active {
@@ -1875,6 +1929,7 @@ impl Service {
                 task: task_id,
                 cancel,
                 steers: steers.clone(),
+                lift: lift.clone(),
             },
         );
         let task = Turn {
@@ -1890,6 +1945,7 @@ impl Service {
             settings: Default::default(),
             resumed,
             steers,
+            lift,
             tokens: self.tokens.clone(),
             read_results: Default::default(),
             side: Default::default(),
@@ -1936,13 +1992,27 @@ impl Service {
                 // Interrupt may already have released the task's active slot.
                 // Finishing still promotes queued work in that case.
                 self.ready_hint = true;
+                self.steer_wakes.remove(&turn);
+                return Ok(());
             }
             // A wake-up may already have claimed the turn again.
             turn::Exit::Paced(at) if !self.active.get(&bot).is_some_and(|a| a.turn == turn) => {
-                self.wakes.set(at, bot, turn)
+                self.wakes.set(at, bot.clone(), turn)
             }
-            turn::Exit::Paced(_) => {}
-            turn::Exit::Parked => {}
+            turn::Exit::Paced(_) | turn::Exit::Parked => {}
+        }
+        // A steer committed while the turn was parking on `wait` found it
+        // still running, so its wake-up comes from here; a wait with a
+        // gated call after it parks until that lapses. A failed read leaves
+        // the steer for the wait's end, as before.
+        let name = bot.clone();
+        if let Ok(Some((parked, steer))) = self
+            .store
+            .read("steered_park", move |db| db.steered_park(&name))
+            .await
+            && parked == turn
+        {
+            self.wake_for_steer(bot, turn, steer);
         }
         Ok(())
     }
@@ -2901,6 +2971,7 @@ impl Service {
                 // parked, and its wait or lapse must still wake it.
                 self.handles.forget(Waiter::Turn(turn));
                 self.wakes.cancel(turn);
+                self.steer_wakes.remove(&turn);
                 self.ready_hint = true;
                 view(&reader, bot, true).await
             }
@@ -3177,6 +3248,7 @@ mod tests {
             task: 1,
             cancel,
             steers: Arc::default(),
+            lift: Arc::default(),
         };
         assert!(active.cancel(turn::INTERRUPTED));
         assert!(active.cancel(turn::SHUTDOWN));
@@ -3486,6 +3558,7 @@ mod tests {
                     task: 1,
                     cancel,
                     steers: Arc::default(),
+                    lift: Arc::default(),
                 },
             )]),
             next_task: 1,
@@ -3495,6 +3568,7 @@ mod tests {
             ready_hint: false,
             tokens: Arc::default(),
             wakes: Wakes::default(),
+            steer_wakes: HashMap::new(),
             draining: false,
             admissions: std::collections::VecDeque::new(),
             unpublished: std::collections::VecDeque::new(),
@@ -3690,6 +3764,7 @@ mod tests {
                             task: 0,
                             cancel: watch::channel(None).0,
                             steers: Arc::default(),
+                            lift: Arc::default(),
                         },
                     )
                 })
@@ -3701,6 +3776,7 @@ mod tests {
             ready_hint: false,
             tokens: Arc::default(),
             wakes: Wakes::default(),
+            steer_wakes: HashMap::new(),
             draining: false,
             admissions: std::collections::VecDeque::new(),
             unpublished: std::collections::VecDeque::new(),
@@ -3742,7 +3818,7 @@ mod tests {
         // Missing providers make the real turn tasks finish without network I/O.
         // Their durable completion must not depend on the service reaping them.
         for (bot, turn) in &turns {
-            service.spawn(bot.clone(), *turn, None, false);
+            service.spawn(bot.clone(), *turn, None, false, false);
         }
         let mut results = Vec::new();
         while let Some(result) = service.jobs.join_next().await {
@@ -3915,6 +3991,7 @@ mod tests {
             ready_hint: false,
             tokens: Arc::default(),
             wakes: Wakes::default(),
+            steer_wakes: HashMap::new(),
             draining: false,
             admissions: std::collections::VecDeque::new(),
             unpublished: std::collections::VecDeque::new(),
@@ -3964,7 +4041,7 @@ mod tests {
         refuse_bobs_finish(&path, true);
         let mut service = bare_service(&store);
         for (bot, turn) in &turns {
-            service.spawn(bot.clone(), *turn, None, false);
+            service.spawn(bot.clone(), *turn, None, false, false);
         }
         // Alice finishes while Bob's completion keeps failing; nothing ends
         // the daemon, and Bob stays durably busy.
@@ -4060,7 +4137,7 @@ mod tests {
             .unwrap();
         refuse(true);
         let mut service = bare_service(&store);
-        service.spawn("Bob".into(), last, None, false);
+        service.spawn("Bob".into(), last, None, false, false);
         finish_errors(&store, 2).await;
         let status = || {
             let store = store.clone();
@@ -4095,7 +4172,7 @@ mod tests {
         let bob = running(&store, &["Bob".into()]).await[0].1;
         refuse_bobs_finish(&path, true);
         let mut service = bare_service(&store);
-        service.spawn("Bob".into(), bob, None, false);
+        service.spawn("Bob".into(), bob, None, false, false);
         finish_errors(&store, 2).await;
         assert!(
             service.active["Bob"].cancel(turn::INTERRUPTED),
@@ -4435,7 +4512,7 @@ mod tests {
         refuse_bobs_finish(&path, true);
         let mut service = bare_service(&store);
         let bob = turns[0].1;
-        service.spawn("Bob".into(), bob, None, false);
+        service.spawn("Bob".into(), bob, None, false, false);
         // An interrupt that lands first keeps its cause; shutdown releasing
         // the slot still stops the retries.
         assert!(service.active["Bob"].cancel(turn::INTERRUPTED));
