@@ -1181,9 +1181,9 @@ class AutoApproverTests(ModelFixture):
         # A file too large to show is shown by its size, and what it does is
         # not known: a call that runs it is not allowed on the judge's word.
         self.assertTrue(self.denial(daemon, turn, 'script-3').startswith('not reviewed whole'))
-        # A write too large to show whole is judged by what is shown, and
-        # runs: what it writes is judged when a call runs it.
-        self.assertTrue((self.path / 'huge.sh').read_text().endswith('printf ok'))
+        # Nor is a write too large to show whole: a call need not name the
+        # file to run it (a Makefile, a hook).
+        self.assertTrue(self.denial(daemon, turn, 'script-4').startswith('not reviewed whole'))
         asked = [self.judge.requests.get(timeout=5)['body'] for _ in range(5)]
         [shell] = asked[1]['state']['planned_calls']
         self.assertEqual(shell['files_it_names'], [{'path': 'run.sh', 'content': 'printf DANGER'}])

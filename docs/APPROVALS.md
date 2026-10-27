@@ -734,15 +734,13 @@ was cut, except that a planned `write` or `edit` past 64 KiB of text shows
 each field's start and end with its whole size, redacted before it is cut
 so a cut cannot leave a secret's value without the name that marks it; so
 is any file written this turn that one of them runs, up to 48 KiB, and
-past that only its size. A call that runs a file not shown whole is not
-allowed on the judge's word, since the part left out may do anything (a
-script padded past the limit with its payload in the middle): what Jev
-would allow is doubted as "not reviewed whole" (step 4: asked of the
-person when one can answer, else denied), as is a risky one. A long
-write or edit itself is judged by its path and what is shown, since what
-it writes runs only when a later call runs it (until 2026-10-26 it was
-doubted too, which stopped generated files and fixtures); a call in the
-same round that names the file it writes is doubted in its place. So
+past that only its size. A call with part of what it writes or runs left
+out is not allowed on the judge's word, since the part left out may do
+anything (a script padded past the limit with its payload in the middle,
+or a Makefile or hook a later `make` or `git commit` runs without naming
+it): what Jev would allow is doubted as "not reviewed whole" (step 4:
+asked of the person when one can answer, else denied), as is a risky
+one. So
 are the already allowed shell and caller-registered calls, since a
 one-time request is used up by a call that did it and a deploy past a
 preview's 2,048 characters would hide that; an allowed `write` or `edit`

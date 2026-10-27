@@ -33,7 +33,8 @@ pub const IN_TURN: u64 = 20;
 /// How long a tripped turn has to stop on its own before it is interrupted.
 pub const INTERRUPT_AFTER_MS: u64 = 30_000;
 /// The most of a planned write's or edit's text the judge is shown: past it,
-/// each field shows its start and end, with the whole size.
+/// each field shows its start and end, with the whole size, and the call is
+/// not allowed on the judge's word alone.
 pub const CHANGE_SHOWN: usize = 64 * 1024;
 
 /// One effect a call may have, and the question asking whether the person
@@ -342,7 +343,7 @@ pub fn model_answers(reply: &str, questions: &Value) -> Option<Value> {
 pub enum Verdict {
     Allow,
     Deny(String),
-    /// Judged risky, or not reviewed whole: a person may still allow it, where one can
+    /// Judged risky, or not shown whole: a person may still allow it, where one can
     /// be asked; otherwise it is denied with this reason.
     Doubt(String),
 }

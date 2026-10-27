@@ -1087,8 +1087,6 @@ async fn intent(
     let mut planned = Vec::with_capacity(calls.len());
     // Past this the state is too long to judge anyway: stop reading.
     let mut size = 0;
-    // Writes and edits of this round shown only in part, by id.
-    let mut clipped = HashSet::new();
     for (index, call) in calls.iter().enumerate() {
         let whole = call["arguments"].is_object()
             && call["arguments_cut"].as_array().is_none_or(Vec::is_empty)
@@ -1102,15 +1100,9 @@ async fn intent(
             }
         };
         let tool = call["name"].as_str().unwrap_or_default().to_owned();
-        // A change too long to show is judged by its path and what is shown:
-        // what it writes runs only when a later call runs it, and that call
-        // is not allowed on the judge's word.
+        let mut unseen = false;
         if matches!(tool.as_str(), "write" | "edit") {
-            let cut;
-            (arguments, cut) = policy::shown_change(&arguments, &shared.redactor);
-            if cut {
-                clipped.insert(format!("c{}", index + 1));
-            }
+            (arguments, unseen) = policy::shown_change(&arguments, &shared.redactor);
         }
         size += arguments.to_string().len();
         if size > PROMPT_BYTES {
@@ -1121,7 +1113,7 @@ async fn intent(
             tool,
             arguments,
             files: Vec::new(),
-            unseen: false,
+            unseen,
         });
     }
     let mut allowed = Vec::new();
@@ -1217,15 +1209,12 @@ async fn intent(
                 .unwrap_or(path);
             mentions(&text, path) || (name.len() >= 3 && mentions(&text, name))
         };
-        let changes = matches!(call.tool.as_str(), "write" | "edit");
         for (path, id) in &changing {
             if names(path) {
                 call.files.push((
                     path.clone(),
                     format!("[{id} in this round changes it before this call runs; see {id}]"),
                 ));
-                // What it would run was not all shown.
-                call.unseen |= !changes && clipped.contains(id);
             }
         }
         for path in &written {
@@ -1247,7 +1236,9 @@ async fn intent(
                 None => {}
             }
         }
-        if changes && let Some(path) = call.arguments["path"].as_str() {
+        if matches!(call.tool.as_str(), "write" | "edit")
+            && let Some(path) = call.arguments["path"].as_str()
+        {
             changing.push((path.to_owned(), call.id.clone()));
         }
     }
