@@ -12,6 +12,7 @@ mod approvals;
 mod asks;
 mod cache;
 mod calls;
+mod declared;
 mod diff;
 mod errand;
 mod herdr;
@@ -26,6 +27,7 @@ mod mermaid;
 mod models;
 mod mux;
 mod place;
+mod plan;
 mod project;
 mod prompt;
 mod reactions;
@@ -126,8 +128,6 @@ fn usage() -> String {
      sonny memory ..., sonny project add DIR ... and sonny trigger ... are what\n\
      ~/.agent/memory, ~/.agent/project and ~/.agent/trigger run, which Sonny writes\n\
      at each start.\n\
-     sonny ask QUESTION [--choice OPTION]..., from the lead's shell, pins a question for\n\
-     the person above the composer until they answer it.\n\
      sonny lookout [--judge PROVIDER/MODEL|off] watches every lead on the daemon and\n\
      wakes it when its tasks need it; Sonny starts one. sonny lookout --replay --judge\n\
      SPEC[,SPEC]... [--limit N] runs its checks over what the store kept.\n\
@@ -626,7 +626,6 @@ fn main() -> std::process::ExitCode {
         Some((flag, rest)) if flag == trigger::FIRE_FLAG => {
             return std::process::ExitCode::from(trigger::fire_cli(rest) as u8);
         }
-        Some((ask, rest)) if ask == "ask" => asks::run(rest),
         Some((lookout, rest)) if lookout == "lookout" => lookout::run(rest),
         Some((agent, rest)) if agent == "agent" => pass_to_agent(rest),
         _ => tokio::runtime::Builder::new_multi_thread()
@@ -729,7 +728,7 @@ async fn run() -> Result<(), String> {
     }
     // The person's agent can react to them; a side chat calls no tool.
     if options.side.is_none() {
-        app.declare = reactions::declare(&bot);
+        app.declare = declared::declare(&bot);
     }
     app.sounds = sound::Sounds::new(options.sound);
     let settings = settings::Settings::load();
@@ -905,8 +904,6 @@ fn heading(thought: &str) -> Option<&str> {
 /// A folder as the person reads it: under their home, from `~`.
 /// How often the footer reads the workspace's branch again.
 const PLACE_EVERY: Duration = Duration::from_secs(3);
-/// How often the lead's questions are read again.
-const ASKS_EVERY: Duration = Duration::from_secs(1);
 
 fn tilde(path: &str) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
@@ -1140,12 +1137,15 @@ struct App {
     calls: HashMap<String, (String, Value)>,
     /// Calls waiting on the person, as `approvals` lists them.
     approvals: Vec<Value>,
-    /// The lead's questions for the person, oldest first, as `sonny ask`
-    /// left them, and when they were last read.
+    /// The lead's open questions for the person, oldest first: its `ask`
+    /// calls not yet answered.
     asks: Vec<asks::Ask>,
-    /// Where the lead's questions are kept, once its id is known.
-    asks_key: Option<String>,
-    asks_read: Option<Instant>,
+    /// Questions this window answered and closed, until their answers
+    /// land, so landing does not close another asked the same.
+    sent_answers: Vec<String>,
+    /// Where the person's reactions to the bot are kept, once its id is
+    /// known.
+    reactions_key: Option<String>,
     /// Esc set the questions aside: what is typed is a message of its own.
     chatting: bool,
     /// The waiting call whose whole command was last written out.
@@ -1806,12 +1806,12 @@ impl App {
             calls: HashMap::new(),
             approvals: Vec::new(),
             asks: Vec::new(),
-            asks_key: record["bot_id"].as_i64().map(|id| {
+            sent_answers: Vec::new(),
+            reactions_key: record["bot_id"].as_i64().map(|id| {
                 let store =
                     std::fs::canonicalize(&options.store).unwrap_or_else(|_| options.store.clone());
-                asks::key(&store, id)
+                reactions::key(&store, id)
             }),
-            asks_read: None,
             chatting: false,
             asked: None,
             following: true,
@@ -1877,7 +1877,7 @@ impl App {
         term::laid_out().await;
         let _ = terminal.autoresize();
         self.width = terminal.size().map(|s| s.width as usize).unwrap_or(80);
-        self.reactions = reactions::Reactions::load(self.asks_key.as_deref());
+        self.reactions = reactions::Reactions::load(self.reactions_key.as_deref());
         self.history().await;
         // A turn already running: its clock, and any call it waits on.
         if let Some(turn) = self.running.as_ref().map(|r| r.turn) {
@@ -2002,7 +2002,6 @@ impl App {
             self.shell_ran().await;
             self.listed();
             self.follow_place().await;
-            self.follow_asks();
             self.repaint |= term::switched();
             if self.repaint && self.running.is_none() && self.watch.is_none() && self.side.is_none()
             {
@@ -2033,18 +2032,6 @@ impl App {
         if self.live.is_none() && !self.shown.is_empty() {
             let shown = std::mem::take(&mut self.shown);
             self.commit(shown);
-        }
-    }
-
-    /// Read the lead's open questions again, every second.
-    fn follow_asks(&mut self) {
-        if self.asks_read.is_some_and(|at| at.elapsed() < ASKS_EVERY) {
-            return;
-        }
-        self.asks_read = Some(Instant::now());
-        self.asks = self.asks_key.as_deref().map(asks::open).unwrap_or_default();
-        if self.asks.is_empty() {
-            self.chatting = false;
         }
     }
 
@@ -2545,6 +2532,8 @@ impl App {
             self.bot_reactions.clear();
             self.react_calls.clear();
             self.answering = None;
+            self.asks.clear();
+            self.sent_answers.clear();
         }
         self.seen_node = nodes.last().copied().unwrap_or(self.seen_node);
         if let Some(&first) = nodes.first() {
@@ -2570,6 +2559,7 @@ impl App {
                         // The bot's reactions to the message before, as they
                         // were drawn live.
                         self.draw_bot_reactions();
+                        asks::close(&mut self.asks, &text(&item));
                         // What the person ran is shown as it was when it ran.
                         let lines = landed(&text(&item), &mut self.ran_here, self.width);
                         self.commit(lines);
@@ -2630,6 +2620,9 @@ impl App {
                         {
                             let (output, failed) = output(&item);
                             self.commit_call(&name, &arguments, &output, failed);
+                            if name == asks::TOOL && !failed && !reactions::refused(&item) {
+                                self.asked(id, &arguments);
+                            }
                         }
                     }
                     _ => {}
@@ -2934,6 +2927,7 @@ impl App {
                     let lines = landed(&text(item), &mut self.ran_here, self.width);
                     self.commit(lines);
                     self.answering = Some((first_words(&text(item)), self.rows_drawn));
+                    self.answered(&text(item));
                 }
             }
             "steered" => {
@@ -2951,6 +2945,7 @@ impl App {
                     let lines = landed(&text(item), &mut self.ran_here, self.width);
                     self.commit(lines);
                     self.answering = Some((first_words(&text(item)), self.rows_drawn));
+                    self.answered(&text(item));
                 }
             }
             "queued" => self.notice = Some(format!("queued behind turn {}", data["behind"])),
@@ -3155,6 +3150,9 @@ impl App {
                     shown = ("denied".into(), true);
                 }
                 self.commit_call(&name, &arguments, &shown.0, shown.1);
+                if name == asks::TOOL && !shown.1 {
+                    self.asked(id, &arguments);
+                }
                 if self.calls.is_empty() && !self.held.is_empty() {
                     let held = std::mem::take(&mut self.held);
                     self.rows_drawn += held.len();
@@ -4081,8 +4079,11 @@ impl App {
         match self.send(prompt, None, join).await {
             Ok(()) => {
                 if let Some(ask) = answering {
-                    asks::done(&ask);
-                    self.asks.retain(|open| open.file != ask.file);
+                    self.asks.retain(|open| open.id != ask.id);
+                    self.sent_answers.push(ask.question);
+                    if self.asks.is_empty() {
+                        self.chatting = false;
+                    }
                 }
                 self.input.clear();
                 self.notice = None;
@@ -4142,6 +4143,31 @@ impl App {
             .push((node, transcript::cut(first.trim(), QUOTED)));
         if self.replies.len() > REACTABLE {
             self.replies.remove(0);
+        }
+    }
+
+    /// The question an `ask` call put, pinned until it is answered.
+    fn asked(&mut self, id: &str, arguments: &Value) {
+        if let Some(ask) = asks::call(id, arguments)
+            && !self.asks.iter().any(|open| open.id == ask.id)
+        {
+            self.asks.push(ask);
+        }
+    }
+
+    /// The question a message answered, from this window or another,
+    /// closed.
+    fn answered(&mut self, message: &str) {
+        // An answer sent from here closed its question when it was sent.
+        if let Some(question) = asks::answered(message)
+            && let Some(at) = self.sent_answers.iter().position(|q| q == question)
+        {
+            self.sent_answers.remove(at);
+            return;
+        }
+        asks::close(&mut self.asks, message);
+        if self.asks.is_empty() {
+            self.chatting = false;
         }
     }
 
@@ -5146,20 +5172,20 @@ mod tests {
         })
         .await;
         let mut app = app(client);
-        let dir = std::env::temp_dir().join(unique("sonny-asks"));
-        std::fs::create_dir_all(&dir).unwrap();
-        let ask = |name: &str, question: &str| {
-            let file = dir.join(name);
-            std::fs::write(&file, "{}").unwrap();
-            asks::Ask {
-                file,
-                question: question.into(),
-                choices: vec!["Keep it".into(), "Drop it".into()],
-            }
+        let ask = |id: &str, question: &str| asks::Ask {
+            id: id.into(),
+            question: question.into(),
+            choices: vec!["Keep it".into(), "Drop it".into()],
         };
-        app.asks = vec![ask("1.json", "Keep the old API?"), ask("2.json", "Tag it?")];
+        app.asks = vec![
+            ask("c1", "Keep the old API?"),
+            ask("c2", "Tag it?"),
+            ask("c3", "Keep the old API?"),
+        ];
         app.input.set("2");
         app.submit().await;
+        // Its answer landing leaves the other question asked the same open.
+        app.answered("You asked: Keep the old API?\n\nDrop it");
         // Esc sets the rest aside: the next message is the person's own.
         app.chatting = true;
         app.input.set("how is it going?");
@@ -5171,10 +5197,72 @@ mod tests {
                 "how is it going?"
             ]
         );
-        assert_eq!(app.asks.len(), 1);
-        assert!(!dir.join("1.json").exists());
-        assert!(dir.join("2.json").exists());
-        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            app.asks,
+            [ask("c2", "Tag it?"), ask("c3", "Keep the old API?")]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_question_asked_is_pinned_until_an_answer_lands() {
+        let items = json!({
+            "1": {"type": "message", "role": "user",
+                  "content": [{"type": "input_text", "text": "ship it?"}]},
+            "2": {"type": "function_call", "name": "ask", "call_id": "a1",
+                  "arguments": "{\"question\":\"Tag 0.4.1?\",\"choices\":[\"Yes\",\"No\"]}"},
+            "3": {"type": "function_call_output", "call_id": "a1", "output": "Asked."},
+            "4": {"type": "function_call", "name": "ask", "call_id": "a2",
+                  "arguments": "{\"question\":\"Bump?\",\"choices\":[1]}"},
+            "5": {"type": "function_call_output", "call_id": "a2",
+                  "output": "{\"error\":\"invalid_arguments\"}"},
+            "6": {"type": "function_call", "name": "ask", "call_id": "a3",
+                  "arguments": "{\"question\":\"Write notes?\"}"},
+            "7": {"type": "function_call_output", "call_id": "a3", "output": "Asked."},
+            "8": {"type": "message", "role": "user",
+                  "content": [{"type": "input_text", "text": "You asked: Write notes?\n\nyes"}]},
+        });
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_nodes") => {
+                json!({"nodes": (1..=9).rev().map(|node| json!({"node": node}))
+                .collect::<Vec<_>>(), "next_from": null})
+            }
+            _ => json!({"items": asked["nodes"].as_array().into_iter().flatten()
+                .map(|node| json!({"node": node, "item": items[node.to_string()]}))
+                .collect::<Vec<_>>()}),
+        })
+        .await;
+        let mut app = app(client);
+        app.history().await;
+        // The refused one was never asked, and the answered one is closed.
+        assert_eq!(
+            app.asks,
+            [asks::Ask {
+                id: "a1".into(),
+                question: "Tag 0.4.1?".into(),
+                choices: vec!["Yes".into(), "No".into()]
+            }]
+        );
+        let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
+        assert!(
+            rows.contains(&"• Asked you Tag 0.4.1?".to_owned()),
+            "{rows:?}"
+        );
+        // Its answer landing, sent from here or another window, closes it.
+        app.answered("You asked: Tag 0.4.1?\n\nYes");
+        assert!(app.asks.is_empty());
+        // Live, a question is pinned once the daemon took the call.
+        let arguments = json!({"question": "Merge?"}).to_string();
+        app.daemon(turn_event("accepted", 4, json!({}))).await;
+        app.daemon(turn_event(
+            "tool_started",
+            4,
+            json!({"call_id": "a4", "name": "ask", "arguments": arguments}),
+        ))
+        .await;
+        assert!(app.asks.is_empty());
+        app.daemon(turn_event("tool_completed", 4, json!({"call_id": "a4"})))
+            .await;
+        assert_eq!(app.asks[0].question, "Merge?");
     }
 
     #[tokio::test]
@@ -5728,7 +5816,7 @@ mod tests {
         })
         .await;
         let mut app = app(client);
-        app.declare = reactions::declare(&json!({}));
+        app.declare = declared::declare(&json!({}));
         app.running = Some(Running {
             turn: 1,
             started: Instant::now(),
@@ -5740,7 +5828,7 @@ mod tests {
         assert!(app.configure().await);
         let sent = asked.lock().unwrap()[0].clone();
         assert_eq!(sent["op"], "configure");
-        assert_eq!(sent["declare"], json!([reactions::tool()]));
+        assert_eq!(sent["declare"], json!(declared::tools()));
         assert!(app.declare.is_none());
     }
 

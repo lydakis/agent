@@ -96,7 +96,7 @@ An emoji sent alone is a reaction, not a message: it goes under the
 agent's last reply and is attached to the agent's next call, so it starts
 no turn. `/react` picks an older reply, and sending an emoji already on a
 reply takes it off. The agent reacts too, with a `react` tool Sonny
-declares on it (a tool the daemon records and never runs): 👍 or 🎉 under
+declares on it: 👍 or 🎉 under
 your message when that is all it needs, or 👀 while it looks, taken off
 once it answers. Its reactions are drawn when its turn ends, so one taken
 off again never shows.
@@ -156,16 +156,26 @@ off again never shows.
   the background, which outlives Sonny; Sonny mounts task copies a restart
   unmounted again when it opens the lead.
 - **Needs you:** when the lead needs the person to decide something, it
-  runs `sonny ask "QUESTION" [--choice OPTION]...` from its shell. Sonny
+  calls its `ask` tool with the question and up to nine choices. Sonny
   pins the open questions above the composer, oldest first, until each is
   answered: what you type next answers the first (a choice's number picks
   it), and goes to the lead as `You asked: QUESTION` and your answer. Esc
   sets the questions aside for a message of your own, and Esc again goes
-  back to them. They wait in `~/.agent/sonny/asks/`, one file each, kept apart by store and bot id.
+  back to them. The open questions are read from the lead's history (its
+  `ask` calls not yet answered), so one asked while Sonny was closed is
+  pinned when it opens.
 - `/copy` puts the last reply on the clipboard; `/open` opens the last
   HTML page in a browser; `/sound` turns the chime off or on; `/verbose`
   switches between the clean view and every tool call; `/quit`
   leaves the agents working.
+
+Sonny declares three tools on the agents it opens and the leads it makes,
+which agents they make inherit: `react`, `ask` and `plan` (the plan the
+person sees, as a checklist). The daemon shows them to the model and records
+each call without running anything; Sonny draws the calls, live and from
+history.
+
+![A plan and a question set with the plan and ask tools](../docs/sonny/ask-and-plan.png)
 
 Settings Sonny keeps for every folder are in `~/.agent/sonny/settings.json`.
 At each start Sonny writes what every agent leans on: the

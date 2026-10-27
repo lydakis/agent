@@ -2,9 +2,10 @@
 //! `agent` call starts, messages, waits on or removes an agent; a `rex` call
 //! opens, reads or types into a window; an `errand` call runs a command on
 //! another machine or acts on its job; Sonny's memory and the trigger
-//! scripts save facts and schedule jobs; the plan skill sets the plan. A
-//! command line is read a command at a time; a pipe is said with its
-//! command and what came out of it.
+//! scripts save facts and schedule jobs. A command line is read a command
+//! at a time; a pipe is said with its command and what came out of it.
+//! The tools Sonny declares are said here too: a question to the person
+//! and the plan.
 use ratatui::{
     style::{Color, Stylize},
     text::{Line, Span},
@@ -86,22 +87,13 @@ pub fn said(command: &str, output: &str, failed: bool) -> Option<Said> {
             failed,
             output: None,
         }),
-        "plan" if program.contains("skills/plan") => plan(args),
         "sonny" if args.first().is_some_and(|a| a == "agent") => {
             agent(&args[1..], stdin, printed, failed)
         }
         "sonny" if args.first().is_some_and(|a| a == "show") => sonny_show(&args[1..], failed),
         "sonny" if args.first().is_some_and(|a| a == "run") => sonny_run(&args[1..], failed),
-        "sonny" if args.first().is_some_and(|a| a == "ask") => sonny_ask(&args[1..], failed),
         "sonny" if args.first().is_some_and(|a| a == "task") => {
             sonny_task(&args[1..], stdin, printed, failed)
-        }
-        "sh" | "bash"
-            if args
-                .first()
-                .is_some_and(|a| a.ends_with("skills/plan/plan")) =>
-        {
-            plan(&args[1..])
         }
         _ => None,
     }?;
@@ -832,37 +824,46 @@ fn sonny_task(words: &[String], stdin: Option<&str>, output: &str, failed: bool)
     agent(&run, stdin, started, failed)
 }
 
-/// `sonny ask`, as the question the person was asked and its choices.
-fn sonny_ask(words: &[String], failed: bool) -> Option<Said> {
-    let mut question = None;
-    let mut choices = Vec::new();
-    let mut words = words.iter();
-    while let Some(word) = words.next() {
-        match word.as_str() {
-            "--choice" => choices.push(words.next()?.clone()),
-            _ => question = Some(word.clone()),
+/// A call of a tool Sonny declares, said as what it does: a question to
+/// the person with its choices, or the plan it sets.
+pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
+    match name {
+        crate::asks::TOOL => {
+            let ask = crate::asks::call("", arguments)?;
+            let mut said = Said {
+                verb: "Asked you".into(),
+                what: ask.question,
+                under: Vec::new(),
+                failed,
+                output: None,
+            };
+            if !ask.choices.is_empty() {
+                let numbered: Vec<String> = ask
+                    .choices
+                    .iter()
+                    .enumerate()
+                    .map(|(at, choice)| format!("{} {choice}", at + 1))
+                    .collect();
+                said.under.push(dim(numbered.join(" · ")));
+            }
+            Some(said)
         }
+        crate::plan::TOOL => {
+            let steps: Vec<String> = arguments["steps"]
+                .as_array()?
+                .iter()
+                .map(|step| step.as_str().map(str::to_owned))
+                .collect::<Option<_>>()?;
+            let mut said = plan(&steps);
+            said.failed = failed;
+            Some(said)
+        }
+        _ => None,
     }
-    let mut said = Said {
-        verb: "Asked you".into(),
-        what: question?,
-        under: Vec::new(),
-        failed,
-        output: None,
-    };
-    if !choices.is_empty() {
-        let numbered: Vec<String> = choices
-            .iter()
-            .enumerate()
-            .map(|(at, choice)| format!("{} {choice}", at + 1))
-            .collect();
-        said.under.push(dim(numbered.join(" · ")));
-    }
-    Some(said)
 }
 
-/// The plan skill's call, as the plan it sets.
-fn plan(items: &[String]) -> Option<Said> {
+/// A `plan` call, as the plan it sets; no steps clears it.
+fn plan(items: &[String]) -> Said {
     let mut said = Said {
         verb: "Updated the plan".into(),
         what: String::new(),
@@ -870,16 +871,17 @@ fn plan(items: &[String]) -> Option<Said> {
         failed: false,
         output: None,
     };
-    if items.iter().any(|i| i == "--clear") {
+    if items.is_empty() {
         said.verb = "Cleared the plan".into();
-        return Some(said);
+        return said;
     }
     for item in items {
         let (mark, text) = match item.split_at_checked(3) {
             Some(("[x]", text)) => ("✔", text),
             Some(("[>]", text)) => ("→", text),
             Some(("[ ]", text)) => ("□", text),
-            _ => return None,
+            // A step the bot sent without its mark is still a step.
+            _ => ("□", item.as_str()),
         };
         let text = text.trim().to_owned();
         said.under.push(match mark {
@@ -894,7 +896,7 @@ fn plan(items: &[String]) -> Option<Said> {
             _ => Line::from(vec![Span::raw("□ ").dim(), Span::raw(text)]),
         });
     }
-    Some(said)
+    said
 }
 
 #[cfg(test)]
@@ -1025,10 +1027,16 @@ Keep the rest.'"#,
             (said.verb.as_str(), said.what.as_str()),
             ("Opened a split", "server")
         );
-        let said = said_or_none(
-            r#""/opt/homebrew/bin/sonny" ask "Round each line?" --choice Yes --choice No"#,
-            "Asked. Sonny shows the question to the person until they answer.\n",
-        );
+    }
+
+    #[test]
+    fn a_question_reads_with_its_choices() {
+        let said = declared(
+            "ask",
+            &serde_json::json!({"question": "Round each line?", "choices": ["Yes", "No"]}),
+            false,
+        )
+        .unwrap();
         assert_eq!(
             (said.verb.as_str(), said.what.as_str()),
             ("Asked you", "Round each line?")
@@ -1126,11 +1134,11 @@ Keep the rest.'"#,
 
     #[test]
     fn the_plan_reads_as_a_checklist() {
-        let said = said_or_none(
-            r#"sh "$HOME/.agents/skills/plan/plan" '[x] Read' '[>] Fix' '[ ] Test'"#,
-            "plan saved: 3 steps",
-        );
+        let steps = serde_json::json!({"steps": ["[x] Read", "[>] Fix", "[ ] Test", "Ship"]});
+        let said = declared("plan", &steps, false).unwrap();
         let lines: Vec<String> = said.under.iter().map(text).collect();
-        assert_eq!(lines, ["✔ Read", "→ Fix", "□ Test"]);
+        assert_eq!(lines, ["✔ Read", "→ Fix", "□ Test", "□ Ship"]);
+        let cleared = declared("plan", &serde_json::json!({"steps": []}), false).unwrap();
+        assert_eq!(cleared.verb, "Cleared the plan");
     }
 }

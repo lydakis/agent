@@ -813,6 +813,13 @@ fn drawn(
     let field = |key: &str| arguments[key].as_str().unwrap_or("").to_owned();
     let elbow = || Span::raw("  └ ").dim();
     let gap = || Span::raw("    ");
+    // A tool Sonny declares, said as what it does.
+    if let Some(said) = crate::calls::declared(name, arguments, failed) {
+        if clean && !kept(&said) {
+            return Vec::new();
+        }
+        return said_lines(said, width);
+    }
     // A call Sonny knows the meaning of, said as what it does.
     if name == "shell"
         && let Some(said) = crate::calls::said(&field("command"), output.unwrap_or(""), failed)
@@ -895,9 +902,8 @@ fn drawn(
         // What the known calls print says nothing their line does not.
         printed.retain(|line| {
             let line = line.trim();
-            !(line.starts_with("plan saved: ") || line == "plan cleared")
-                && !serde_json::from_str::<Value>(line)
-                    .is_ok_and(|v| v.get("project").is_some() && v.get("user").is_some())
+            !serde_json::from_str::<Value>(line)
+                .is_ok_and(|v| v.get("project").is_some() && v.get("user").is_some())
         });
         // Commands next to each other that are only run read as one, and
         // the rest of the output goes under the last of them.
@@ -1529,18 +1535,24 @@ mod tests {
             )
             .is_empty()
         );
-        let plan = shell(
-            r#"sh "$HOME/.agents/skills/plan/plan" '[x] Read the tests' '[>] Fix them'; python3 test_calc.py"#,
-            "plan saved: 2 steps
-6 passed",
+        let plan = clean(
+            "plan",
+            serde_json::json!({"steps": ["[x] Read the tests", "[>] Fix them"]}),
+            "Plan set.",
         );
-        assert_eq!(plan[0], "• Updated the plan");
-        assert!(
-            plan.iter()
-                .all(|row| !row.contains("python3") && !row.contains("passed")),
-            "{plan:?}"
+        assert_eq!(
+            plan,
+            [
+                "• Updated the plan",
+                "  └ ✔ Read the tests",
+                "    → Fix them"
+            ]
         );
-        let asked = shell(r#"sonny ask 'Ship it?' --choice yes --choice no"#, "");
+        let asked = clean(
+            "ask",
+            serde_json::json!({"question": "Ship it?", "choices": ["yes", "no"]}),
+            "Asked.",
+        );
         assert_eq!(asked, ["• Asked you Ship it?", "  └ 1 yes · 2 no"]);
         let started = shell(
             r#""$AGENT_BIN" run --detach --new --bot calc.fix -- 'Fix the tests.'"#,
@@ -1610,9 +1622,7 @@ mod real_calls {
         for row in rows {
             let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
             assert!(
-                !text.contains("AGENT_BIN")
-                    && !text.contains("skills/plan")
-                    && !text.contains("sonny show"),
+                !text.contains("AGENT_BIN") && !text.contains("sonny show"),
                 "{command}\n  drew: {text}"
             );
         }
@@ -1663,16 +1673,6 @@ mod real_calls {
                 r#""$AGENT_BIN" run --detach --new --agents --model "$AGENT_MODEL" {effort} --bot calc.single-negative --workspace "$PWD" -- 'The person explicitly requests a new task.'; "/Users/x/sonny" show calc.single-negative --split right"#
             ),
             "{\"bot\":\"calc.single-negative\",\"handle\":\"turn:calc.single-negative/13\",\"status\":\"running\",\"turn\":13}\n{\"bot\":\"calc.single-negative\",\"session\":\"calc\"}",
-            false,
-        );
-        show(
-            r#"sh "$HOME/.agents/skills/plan/plan" '[x] Read memory and existing tests' '[x] Add single-negative regression case' '[>] Run tests and report exact changes'; python3 test_calc.py; result=$?; printf 'Exit code: %s\n' "$result"; sh "$HOME/.agents/skills/plan/plan" --clear"#,
-            "plan saved: 3 steps\n6 passed, 0 failed\nExit code: 0\nplan cleared",
-            false,
-        );
-        show(
-            r#""$HOME/.agent/memory" show; cat test_calc.py; sh "$HOME/.agents/skills/plan/plan" '[>] Inspect current calculator tests' '[ ] Add negative-number case only'"#,
-            "{}\nfrom calc import average",
             false,
         );
     }

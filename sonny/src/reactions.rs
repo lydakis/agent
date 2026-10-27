@@ -9,7 +9,22 @@
 //! daemon records the call and Sonny draws it under the person's message.
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Whose reactions a file holds: the bot by its store-wide id, which a
+/// later bot of the same name never takes, in the store by its canonical
+/// path, so two stores' bots never share one.
+pub fn key(store: &Path, bot_id: i64) -> String {
+    // FNV-1a: the same on every run and every machine.
+    let hash = store
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+        });
+    format!("{hash:016x}-{bot_id}")
+}
 
 /// What a bot's replies were reacted with, by node, in one file per bot.
 #[derive(Default)]
@@ -19,7 +34,7 @@ pub struct Reactions {
 }
 
 impl Reactions {
-    /// The reactions kept under `key`, the bot's [`crate::asks::key`];
+    /// The reactions kept under `key`, the bot's [`key`];
     /// none kept, or no key, is none.
     pub fn load(key: Option<&str>) -> Self {
         let file = key.and_then(|key| {
@@ -122,27 +137,6 @@ pub fn tool() -> Value {
     })
 }
 
-/// The tools the bot `record` describes should declare so it can react:
-/// its own with Sonny's `react`, or `None` when it has that already.
-pub fn declare(record: &Value) -> Option<Value> {
-    let mut declared = record["declared"].as_array().cloned().unwrap_or_default();
-    let tool = tool();
-    if declared.contains(&tool) {
-        return None;
-    }
-    declared.retain(|other| other["name"] != TOOL);
-    declared.push(tool);
-    // Within what the daemon takes, or left as it is: the bot's own
-    // tools come first.
-    let bytes = serde_json::to_vec(&declared).map_or(usize::MAX, |json| json.len());
-    (declared.len() <= MAX_DECLARED && bytes <= DECLARED_BYTES).then_some(Value::Array(declared))
-}
-
-/// The most tools a bot may have declared, and the most bytes they take,
-/// as the daemon counts them.
-const MAX_DECLARED: usize = 16;
-const DECLARED_BYTES: usize = 64 * 1024;
-
 /// What a `react` call asks: an emoji, and whether it comes off.
 pub fn call(arguments: &Value) -> Option<(String, bool)> {
     let emoji = arguments["emoji"].as_str().map(str::trim)?;
@@ -200,26 +194,18 @@ mod tests {
     }
 
     #[test]
-    fn a_bot_is_given_react_beside_what_it_declares_once() {
-        let other = json!({"name": "plan", "description": "d", "parameters": {"type": "object"},
-            "result": "ok"});
-        let wanted = declare(&json!({"declared": [other]})).unwrap();
-        assert_eq!(wanted, json!([other, tool()]));
-        assert_eq!(declare(&json!({"declared": wanted})), None);
-        let old = json!({"name": "react", "description": "old", "parameters": {"type": "object"},
-            "result": "ok"});
-        assert_eq!(declare(&json!({"declared": [old]})), Some(json!([tool()])));
-        // A bot whose own tools leave no room keeps them, without react.
-        let full: Vec<Value> = (0..16)
-            .map(|n| {
-                json!({"name": format!("t{n}"), "description": "d",
-                "parameters": {"type": "object"}, "result": "ok"})
-            })
-            .collect();
-        assert_eq!(declare(&json!({"declared": full})), None);
-        let big = json!({"name": "big", "description": "d".repeat(64 * 1024),
-            "parameters": {"type": "object"}, "result": "ok"});
-        assert_eq!(declare(&json!({"declared": [big]})), None);
+    fn reactions_are_kept_by_store_and_bot_id() {
+        let key = key(Path::new("/home/me/.agent/state.sqlite"), 7);
+        assert_eq!(
+            key,
+            super::key(Path::new("/home/me/.agent/state.sqlite"), 7)
+        );
+        assert!(key.ends_with("-7") && key.len() == 18, "{key}");
+        assert_ne!(
+            key,
+            super::key(Path::new("/home/me/.agent/state.sqlite"), 8)
+        );
+        assert_ne!(key, super::key(Path::new("/tmp/other.sqlite"), 7));
     }
 
     #[test]
