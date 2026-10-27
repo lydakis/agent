@@ -247,6 +247,10 @@ def main():
     parser.add_argument('--only', help='one scenario, by project name')
     parser.add_argument('--binary', type=Path, default=ROOT / '.local/target/release/agent')
     args = parser.parse_args()
+    # The scripted model speaks the Responses API, so the lead's fork can
+    # replay only on a provider that does.
+    if args.lead_model.split('/')[0] not in ('openai', 'chatgpt'):
+        sys.exit('--lead-model must be an openai/ or chatgpt/ model: the scripted cases are Responses items')
     # The daemon takes absolute folders only.
     args.out = args.out.resolve()
     args.out.mkdir(parents=True, exist_ok=True)

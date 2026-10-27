@@ -1032,7 +1032,7 @@ async fn ask_lead(
     let checkpoints: Vec<Option<i64>> = match &at.nodes {
         None => vec![None],
         Some(nodes) if nodes.is_empty() => return Err(failed("the lead had said nothing yet")),
-        Some(nodes) => nodes.iter().take(8).map(|node| Some(*node)).collect(),
+        Some(nodes) => nodes.iter().map(|node| Some(*node)).collect(),
     };
     let mut forked = Err(failed("the lead could not be forked"));
     for checkpoint in checkpoints {
@@ -2950,12 +2950,18 @@ async fn replayed(store: &Path, socket: PathBuf, judges: &str, limit: usize) -> 
             events.extend(retained(&socket, &bot).await);
         }
         events.sort_by_key(|e| e["cursor"].as_i64().unwrap_or(0));
-        let mut waits: HashMap<(String, i64), i64> = HashMap::new();
-        // The lead's history nodes as its events named them, oldest first.
-        let mut stood: Vec<i64> = Vec::new();
-        let at = |stood: &[i64]| At {
-            lead: lead.to_owned(),
-            nodes: Some(stood.iter().rev().take(8).copied().collect()),
+        let mut waits: HashMap<(String, i64), (i64, At)> = HashMap::new();
+        // The lead's history nodes as its events named them, oldest first,
+        // and where its last finished turn left it: a round of many calls
+        // may hold no node a fork can start from, but that one always is.
+        let (mut stood, mut closed): (Vec<i64>, Option<i64>) = (Vec::new(), None);
+        let at = |stood: &[i64], closed: Option<i64>| {
+            let mut nodes: Vec<i64> = stood.iter().rev().take(8).copied().collect();
+            nodes.extend(closed.filter(|node| !nodes.contains(node)));
+            At {
+                lead: lead.to_owned(),
+                nodes: Some(nodes),
+            }
         };
         for event in &events {
             if event["bot"] == lead {
@@ -2965,6 +2971,7 @@ async fn replayed(store: &Path, socket: PathBuf, judges: &str, limit: usize) -> 
                         stood.push(node);
                     }
                 }
+                closed = data["checkpoint"].as_i64().or(closed);
             }
             let before = lookout.due.len();
             lookout.event(event);
@@ -2974,21 +2981,30 @@ async fn replayed(store: &Path, socket: PathBuf, judges: &str, limit: usize) -> 
                 event["bot"].as_str(),
                 event["turn"].as_i64(),
             ) {
-                waits.entry((bot.to_owned(), turn)).or_insert(cursor);
+                waits
+                    .entry((bot.to_owned(), turn))
+                    .or_insert_with(|| (cursor, at(&stood, closed)));
             }
             for seen in lookout.due.drain(before..) {
-                due.push((cursor, lead.to_owned(), workspace.clone(), seen, at(&stood)));
+                due.push((
+                    cursor,
+                    lead.to_owned(),
+                    workspace.clone(),
+                    seen,
+                    at(&stood, closed),
+                ));
             }
         }
         // Events carry no times, so only an approval still waiting when the
         // history ends is known to be overdue; it is checked at its wait.
         lookout.still_waiting();
         for seen in lookout.due.drain(..) {
-            let cursor = waits
+            // Where the lead stood at the wait, not at the end.
+            let (cursor, stood_then) = waits
                 .get(&(seen.task.clone(), seen.turn))
-                .copied()
-                .unwrap_or(0);
-            due.push((cursor, lead.to_owned(), workspace.clone(), seen, at(&stood)));
+                .cloned()
+                .unwrap_or_else(|| (0, at(&[], None)));
+            due.push((cursor, lead.to_owned(), workspace.clone(), seen, stood_then));
         }
     }
     // The newest checks across every lead, oldest first, so a lead's story
