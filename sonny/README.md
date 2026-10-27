@@ -81,8 +81,9 @@ commands:
   leaves ones set any other way alone.
 - `/approvals` picks whether calls wait for a verdict: `auto`, a judge
   model (a new lead starts here, and Sonny starts `agent approver` when
-  nothing serves it), `ask`, you, or `full`, none. Tasks the lead makes keep
-  the gate it had.
+  nothing serves it), `ask`, you, or `full`, none. Tasks the lead makes take
+  the gate it had; a pick reaches every agent the lead made too, one busy
+  now once it is idle.
 - `/status` shows the project's agents, and its running Errand jobs.
 - `/copies` (or `--copies worktree|sandfs`) picks how the lead's tasks get
   their own copy of the folder: git worktrees (the default), or
@@ -139,6 +140,8 @@ The look follows Codex's TUI (openai/codex, `codex-rs/tui`): finished history
 goes into the terminal's own scrollback above a small inline viewport,
 replies stream a line at a time, a tool call is one `• Ran …` line with a
 short `└` look at its result, edits show as a diff, and a status row says
-`Working (12s • esc to interrupt)`.
+`Working (12s • esc to interrupt)`. The steps on the way, calls and what
+the bot said before each, are dim; the reply stays bright, under the
+turn's `Worked for …` line.
 
 `demo/` has the scripted model and folder the recordings use.

@@ -1151,10 +1151,10 @@ them here. A model must be of the bot's family, as a turn's own model must,
 since its history is kept in that family's encoding
 (`provider_family_mismatch`). A gate (`approve`, `approver` and optionally
 `approve_expire_ms`, as on `create`) replaces the bot's gates, and
-`approve: []` alone removes them; only a bot no bot made may change them,
-since a bot keeps the gates it descends from (`gates_inherited`), and bots
-it already made keep theirs. The gate is checked before anything is
-written. It answers `{bot, bot_id, changed}`, `changed` naming the fields
+`approve: []` alone removes them, including the gates a bot took from the
+bot that made it: whoever configures a bot decides, as a person overriding
+one does, and bots it already made keep theirs. The gate is checked before
+anything is written. It answers `{bot, bot_id, changed}`, `changed` naming the fields
 (`model`, `instructions`, `gates`) that differed; the same request again
 changes nothing, so a resend is harmless. A change is told to the bot's
 followers as a live `configured` event with the same fields, which is not
@@ -1201,7 +1201,8 @@ are `created`, `forked`, `queued` (a submission waiting its turn), `accepted`
 (a turn starting, with its prompt's node), `message`, `usage`, `tool_started`
 (with a 2 KiB argument preview, and `approvals` and the planning `node`
 for a gated call), `tool_completed` (with retained artifact names; `failed`
-for a call that failed, `denied` for a denied one),
+for a call that failed, `denied` for a denied one, which also carries
+the refused call's `name` and argument preview as `tool_started` would),
 `approval_requested` (a round's gated calls, see [tool approval](#tool-approval)),
 `turn_waiting` and `turn_resumed` (a parked turn's handles, or the call whose
 verdict it waits for, and its wake-up), `turn_paced` (a turn parked at its model-call boundary because its
@@ -1256,7 +1257,17 @@ as an approver judges them, within `bytes` of text (default 64 KiB, at most
 `from` or `origin`, and `prompts_more` when steers were left out; the calls it started, each with its argument preview,
 `done`, `failed` when it failed, and `node`, with `calls_more` when some
 were left out; and the bot's earlier prompts, newest first, with `more`
-when some were left out. The words and the calls each have `bytes` of
+when some were left out. A prompt or steer, this turn's or an earlier
+one's, carries the calls its turn was refused after it and before the
+next steer (`refused`, each `{name, arguments}`, `arguments_truncated`
+when cut), so a reader can tell a go-ahead that followed a refusal from
+one that came before it. This turn's prompt and steers carry `reply`,
+the end of the bot's last message before them within 2 KiB
+(`{text, truncated?}`), with secrets redacted before the end is kept: its
+last of the turn before for the prompt, and one since the previous words
+for a steer; absent when there is none. It is the question a bare "yes"
+answers. Refused calls and
+`reply` count against the words' `bytes`. The words and the calls each have `bytes` of
 their own, so a long prompt still leaves the calls (and the files they
 wrote) to read. Text that does not fit is cut and marked
 `truncated`, and each steer, call, and earlier prompt also counts 64
