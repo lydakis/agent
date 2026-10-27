@@ -760,6 +760,10 @@ fn failed(why: impl Into<String>) -> Failure {
     Failure::Check(why.into(), String::new())
 }
 
+/// How long a judge's fork may sit idle before the daemon deletes it. Each
+/// is deleted once it answers; this is for a lookout that stopped mid-check.
+const JUDGE_EXPIRE_MS: u64 = 60_000;
+
 impl Judge {
     /// A daemon model's check: a fork of the base bot takes one turn, as the
     /// approver's judge does, so checks run at once and none sees another,
@@ -780,7 +784,7 @@ impl Judge {
             .request(
                 "fork",
                 json!({"source": base, "bot": name, "workspace": "/", "created_by": base,
-                    "created_by_id": base_id}),
+                    "created_by_id": base_id, "expire_ms": JUDGE_EXPIRE_MS}),
             )
             .await
             .map_err(|e| failed(format!("the judge could not start: {}", e.code)))?;
@@ -792,7 +796,6 @@ impl Judge {
 
     /// The idle bot holding the judge's model and instructions, named by
     /// both so another judge or another Sonny's never clashes, made once.
-    /// Forks a stopped Sonny left are deleted.
     async fn base(&self, client: &Client) -> Result<(String, i64), Failure> {
         let mut base = self.base.lock().await;
         if let Some(made) = base.as_ref() {
@@ -836,7 +839,6 @@ impl Judge {
             Err(e) => return Err(failed(format!("the judge could not be read: {}", e.code))),
         };
         let id = id.ok_or_else(|| failed("the judge could not be made"))?;
-        stale_forks(client, &name).await;
         *base = Some((name.clone(), id));
         Ok((name, id))
     }
@@ -947,40 +949,6 @@ fn judge_bot(name: &str) -> bool {
     name.strip_prefix("lookout.")
         .and_then(|rest| rest.split('.').next())
         .is_some_and(|hash| hash.len() == 12 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
-}
-
-/// Forks of `base` whose Sonny is gone: named `BASE.PID.N`, for a PID no
-/// longer running.
-async fn stale_forks(client: &Client, base: &str) {
-    let prefix = format!("{base}.");
-    let mut after = json!(prefix);
-    loop {
-        let Ok(page) = client
-            .request("bots", json!({"after": after, "limit": 64}))
-            .await
-        else {
-            return;
-        };
-        for bot in page["bots"].as_array().into_iter().flatten() {
-            let Some(rest) = bot["name"].as_str().and_then(|n| n.strip_prefix(&prefix)) else {
-                return;
-            };
-            let pid = rest
-                .split('.')
-                .next()
-                .and_then(|pid| pid.parse::<i32>().ok());
-            // SAFETY: kill with signal 0 only checks that the process exists.
-            let gone = pid.is_some_and(|pid| unsafe { libc::kill(pid, 0) } != 0);
-            if gone && bot["created_by"] == base {
-                let name = bot["name"].as_str().unwrap_or_default();
-                remove(client, name, bot["running_turn"].as_i64()).await;
-            }
-        }
-        match &page["next_after"] {
-            Value::Null => return,
-            next => after = next.clone(),
-        }
-    }
 }
 
 /// The judge for a lead on `lead_model`: `--judge SPEC`, else
