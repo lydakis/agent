@@ -105,7 +105,7 @@ commands:
   answered: what you type next answers the first (a choice's number picks
   it), and goes to the lead as `You asked: QUESTION` and your answer. Esc
   sets the questions aside for a message of your own, and Esc again goes
-  back to them. They wait in `~/.agent/sonny/asks/BOT/`, one file each.
+  back to them. They wait in `~/.agent/sonny/asks/`, one file each, kept apart by store and bot id.
 - `/copy` puts the last reply on the clipboard; `/open` opens the last
   HTML page in a browser; `/sound` turns the chime off or on; `/quit`
   leaves the agents working.
