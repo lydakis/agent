@@ -120,7 +120,6 @@ fn usage() -> String {
      sonny lookout [--judge PROVIDER/MODEL|off] watches every lead on the daemon and\n\
      wakes it when its tasks need it; Sonny starts one. sonny lookout --replay --judge\n\
      SPEC[,SPEC]... [--limit N] runs its checks over what the store kept.\n\
-     sonny view FILE [--browser] shows a file beside the lead, drawn again as it changes.\n\
      sonny agent ARGS... runs Sonny's own `agent` with ARGS, whatever `agent` is on PATH."
         .into()
 }
