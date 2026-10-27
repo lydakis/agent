@@ -422,8 +422,11 @@ pub struct Binding<'a> {
 pub struct Started {
     pub turn: i64,
     pub fresh: bool,
-    /// `running`, `queued` behind the bot's own work, or `ready` for a slot.
+    /// `running`, `queued` behind the bot's own work, `ready` for a slot,
+    /// or `attached` to the bot's next model call.
     pub status: &'static str,
+    /// A turn started now has messages attached for its first boundary.
+    pub attached: bool,
     /// The durable `accepted` or `queued` entry, present only for fresh submissions.
     pub entry: Option<Value>,
     /// A fresh steer the bot's running turn takes at its next boundary.
@@ -457,20 +460,25 @@ pub struct TurnOptions {
 /// `Reject` answers `bot_busy` or `active_agent_limit`. `Queue` records the
 /// turn and starts it when the bot and a slot are free. `Steer` is a queued
 /// turn the bot's running turn may absorb at its next round boundary.
+/// `Attach` never starts a turn: the message joins the bot's next model
+/// call, at its running turn's next round boundary or in its next turn, and
+/// never keeps a turn going past its reply.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Delivery {
     #[default]
     Reject,
     Queue,
     Steer,
+    Attach,
 }
 impl Delivery {
-    pub const NAMES: [&str; 3] = ["reject", "queue", "steer"];
+    pub const NAMES: [&str; 4] = ["reject", "queue", "steer", "attach"];
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "reject" => Some(Self::Reject),
             "queue" => Some(Self::Queue),
             "steer" => Some(Self::Steer),
+            "attach" => Some(Self::Attach),
             _ => None,
         }
     }
@@ -489,6 +497,7 @@ impl Delivery {
             Self::Reject => "reject",
             Self::Queue => "queue",
             Self::Steer => "steer",
+            Self::Attach => "attach",
         }
     }
 }
@@ -524,6 +533,8 @@ pub struct Absorbed {
     pub next_through: Option<i64>,
     /// A steer stayed queued because the window had no room for it.
     pub capped: bool,
+    /// A pass that left attached messages out found some waiting.
+    pub attached_left: bool,
 }
 /// A turn parked on handles; it holds no task or memory until they resolve.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -1458,6 +1469,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS turns_paced ON turns(id) WHERE status='paced';
             CREATE INDEX IF NOT EXISTS turns_queued ON turns(bot,id) WHERE status='queued';
             CREATE INDEX IF NOT EXISTS turns_steers ON turns(bot,id) WHERE status='queued' AND delivery='steer';
+            CREATE INDEX IF NOT EXISTS turns_attached ON turns(bot,id) WHERE status='attached';
             CREATE INDEX IF NOT EXISTS turns_ready ON turns(id) WHERE status='ready';
             CREATE INDEX IF NOT EXISTS turns_ready_bot ON turns(bot) WHERE status='ready';
             CREATE INDEX IF NOT EXISTS processes_running ON processes(turn) WHERE status='running';
@@ -1691,7 +1703,8 @@ impl Database {
         Ok(self
             .conn
             .prepare_cached(
-                "SELECT EXISTS(SELECT 1 FROM turns WHERE bot=? AND status='queued' AND delivery='steer')",
+                "SELECT EXISTS(SELECT 1 FROM turns WHERE bot=?1 AND status='queued' AND delivery='steer')
+                     OR EXISTS(SELECT 1 FROM turns WHERE bot=?1 AND status='attached')",
             )?
             .query_row([name], |r| r.get(0))?)
     }
@@ -1911,7 +1924,7 @@ impl Database {
         let tx = self.conn.savepoint()?;
         tx.execute(
             "UPDATE turns SET (bot_model,bot_reasoning)=(SELECT provider||'/'||model,reasoning FROM bots WHERE id=?1)
-              WHERE bot=?2 AND bot_model IS NULL AND status NOT IN ('queued','ready')
+              WHERE bot=?2 AND bot_model IS NULL AND status NOT IN ('queued','ready','attached')
                 AND EXISTS(SELECT 1 FROM bots WHERE id=?1 AND (provider<>?3 OR model<>?4 OR reasoning IS NOT ?5))",
             params![id, name, provider, model, effort],
         )?;
@@ -4012,6 +4025,7 @@ impl Database {
             return Ok(Started {
                 turn,
                 fresh: false,
+                attached: false,
                 status: turn_status_name(&status),
                 entry: None,
                 joins: false,
@@ -4055,7 +4069,10 @@ impl Database {
         if let Some(level) = &options.effort {
             bot.family()?.check_effort(level)?;
         }
-        if let Err(error) = validate(&bot, options.model.as_deref()) {
+        let attach = options.delivery == Delivery::Attach;
+        // An attached message runs on no model of its own: it joins
+        // whichever call the bot makes next.
+        if !attach && let Err(error) = validate(&bot, options.model.as_deref()) {
             // An omitted steer model inherits the active turn for absorption.
             // Only look it up when the default fails validation: ordinary
             // submissions and steers with valid defaults pay no extra query.
@@ -4082,7 +4099,7 @@ impl Database {
             // Keep the submitted model unset. If it misses absorption, start()
             // must validate its own default rather than pinning this override.
         }
-        let busy = bot.running_turn.is_some() || self.has_ready_turn(name)?;
+        let busy = !attach && (bot.running_turn.is_some() || self.has_ready_turn(name)?);
         if busy && reject {
             // What is in the way, as of this transaction, and the requests
             // that get past it, in this protocol's terms.
@@ -4103,19 +4120,24 @@ impl Database {
         if let Some(budget) = bot.budget_tokens.filter(|b| bot.tokens_used >= *b) {
             return Err(budget_exhausted(&bot, budget));
         }
-        // A bot keeps its folder; a turn that names one moves it there.
+        // A bot keeps its folder; a turn that names one moves it there. An
+        // attached message needs none: it runs in whatever turn takes it.
         let workspace = options
             .workspace
             .as_deref()
             .or(bot.workspace.as_deref())
-            .ok_or(Error::new("workspace_required"))?
-            .to_owned();
+            .map(str::to_owned);
+        if workspace.is_none() && !attach {
+            return Err(Error::new("workspace_required"));
+        }
         // A steer's folder is for that message alone: it may never run.
         let moved = options.workspace.is_some()
             && options.delivery != Delivery::Steer
-            && bot.workspace.as_deref() != Some(&workspace);
+            && bot.workspace != workspace;
         // Only the head of a bot's line is ready; the rest wait behind it.
-        let status = if busy {
+        let status = if attach {
+            "attached"
+        } else if busy {
             "queued"
         } else if capacity {
             "running"
@@ -4123,8 +4145,9 @@ impl Database {
             "ready"
         };
         // Work that would wait counts against the pending bounds; a refusal
-        // writes nothing, like the active-turn bound.
-        if status != "running" {
+        // writes nothing, like the active-turn bound. An attached message
+        // is no work: it waits for whatever the bot does next.
+        if status != "running" && !attach {
             let (limit_turns, limit_bytes) = self.pending_limits;
             if limit_turns > 0 || limit_bytes > 0 {
                 let (turns, bytes) = self.pending()?;
@@ -4158,7 +4181,7 @@ impl Database {
             // Queued work keeps the folder it was sent to even if the bot
             // moves before it starts; a steer without one joins any turn.
             params![turn, name, request_id, prompt, status,
-                if options.delivery == Delivery::Steer { options.workspace.as_deref() } else { Some(workspace.as_str()) },
+                if matches!(options.delivery, Delivery::Steer | Delivery::Attach) { options.workspace.as_deref() } else { workspace.as_deref() },
                 options.model, options.delivery.name(), options.expected_turn,
                 options.from.as_ref().map(|f| &f.0), options.from.as_ref().map(|f| f.1), from_id, options.origin,
                 options.effort, options.budget_tokens.map(|n| n as i64)],
@@ -4192,11 +4215,11 @@ impl Database {
                 from_id,
                 options.origin.as_deref(),
             );
-            ("queued", data)
+            (if attach { "attached" } else { "queued" }, data)
         };
         let cursor = event(&tx, name, Some(turn), kind, data.clone())?;
         tx.commit()?;
-        if status != "running" {
+        if status != "running" && !attach {
             self.pending.0 += 1;
             self.pending.1 += prompt.len() as i64;
         }
@@ -4207,9 +4230,11 @@ impl Database {
             true => self.steered_park(name)?,
             false => None,
         };
+        let attached = status == "running" && self.steers_waiting(name)?;
         Ok(Started {
             turn,
             fresh: true,
+            attached,
             status,
             entry: Some(entry(cursor, name, Some(turn), kind, data)),
             joins,
@@ -4325,7 +4350,7 @@ impl Database {
             )
             .optional()?
             .ok_or(Error::new("turn_not_found"))?;
-        if !matches!(status.as_str(), "queued" | "ready") {
+        if !matches!(status.as_str(), "queued" | "ready" | "attached") {
             return fail("stale_turn");
         }
         let ended = if error.code == "cancelled" {
@@ -4345,7 +4370,9 @@ impl Database {
         with_facts(&mut data, Some(error));
         let cursor = event(&tx, &name, Some(turn), "turn_finished", data.clone())?;
         tx.commit()?;
-        self.pending_left(prompt_bytes as usize);
+        if status != "attached" {
+            self.pending_left(prompt_bytes as usize);
+        }
         let outcome = self
             .turn_outcome(&name, turn)?
             .ok_or_else(|| Error::new("stale_turn"))?;
@@ -4355,9 +4382,13 @@ impl Database {
             outcome,
         ))
     }
-    /// Deliver a bounded prefix of queued steers into the running turn.
-    /// Stop at an incompatible explicit override; it and later steers stay
-    /// queued, so a later message cannot overtake the deferred steer.
+    /// Deliver a bounded prefix of queued steers into the running turn,
+    /// and attached messages with them unless `attached` is false (a reply
+    /// that ended the turn's calls, which an attached message never
+    /// extends). Stop at an incompatible explicit override; it and later
+    /// steers stay queued, so a later message cannot overtake the deferred
+    /// steer.
+    #[allow(clippy::too_many_arguments)]
     pub fn absorb(
         &mut self,
         turn: i64,
@@ -4366,13 +4397,15 @@ impl Database {
         context_items: usize,
         reserved: super::ContextUsage,
         whole: bool,
+        attached: bool,
     ) -> Result<Absorbed> {
         let bot = self.active(turn)?;
         let through = match through {
             Some(id) => Some(id),
             None => self.conn.prepare_cached(
-                "SELECT MAX(id) FROM turns WHERE bot=? AND status='queued' AND delivery='steer'",
-            )?.query_row([&bot.name], |r| r.get::<_, Option<i64>>(0))?,
+                "SELECT MAX(id) FROM (SELECT MAX(id) id FROM turns WHERE bot=?1 AND status='queued' AND delivery='steer'
+                    UNION ALL SELECT MAX(id) FROM turns WHERE ?2 AND bot=?1 AND status='attached')",
+            )?.query_row(params![&bot.name, attached], |r| r.get::<_, Option<i64>>(0))?,
         };
         let Some(through) = through else {
             return Ok(Absorbed::default());
@@ -4414,24 +4447,35 @@ impl Database {
                 share_items.saturating_sub(used_items + reserved.items),
             )
         };
-        let mut steers: Vec<(i64, Vec<u8>, usize)> = Vec::new();
+        // Id, item, prompt bytes, and whether it was attached, which no
+        // pending count holds.
+        let mut steers: Vec<(i64, Vec<u8>, usize, bool)> = Vec::new();
         let mut more = false;
         let mut capped = false;
         {
-            // The partial index skips ordinary queued work. Read at most one
+            // Each partial index skips ordinary queued and finished work. Read at most one
             // candidate beyond the byte budget, without copying its prompt.
             let mut statement = self.conn.prepare_cached(
                 "SELECT s.id,s.prompt,length(CAST(s.prompt AS BLOB)),
                     (s.workspace IS NULL OR s.workspace=COALESCE(t.workspace,b.workspace))
                     AND (s.model IS NULL OR s.model=COALESCE(t.model,b.provider||'/'||b.model))
-                    AND (s.reasoning IS NULL OR s.reasoning IS COALESCE(t.reasoning,b.reasoning))
-                 FROM turns s JOIN turns t ON t.id=?2 JOIN bots b ON b.name=s.bot
-                 WHERE s.bot=?1 AND s.status='queued' AND s.delivery='steer' AND s.id<=?4
-                   AND (s.expected_turn IS NULL OR s.expected_turn=?2)
-                 ORDER BY s.id LIMIT ?3",
+                    AND (s.reasoning IS NULL OR s.reasoning IS COALESCE(t.reasoning,b.reasoning)),
+                    s.status='attached'
+                 FROM (SELECT id FROM turns WHERE bot=?1 AND status='queued' AND delivery='steer'
+                         AND id<=?4 AND (expected_turn IS NULL OR expected_turn=?2)
+                       UNION ALL SELECT id FROM turns WHERE ?5 AND bot=?1 AND status='attached'
+                         AND id<=?4 AND (expected_turn IS NULL OR expected_turn=?2)
+                       ORDER BY id LIMIT ?3) c
+                 JOIN turns s ON s.id=c.id JOIN turns t ON t.id=?2 JOIN bots b ON b.name=s.bot
+                 ORDER BY c.id",
             )?;
-            let mut rows =
-                statement.query(params![bot.name, turn, STEER_BATCH_ITEMS as i64, through])?;
+            let mut rows = statement.query(params![
+                bot.name,
+                turn,
+                STEER_BATCH_ITEMS as i64,
+                through,
+                attached
+            ])?;
             let mut bytes = 0;
             while let Some(row) = rows.next()? {
                 let size = row.get::<_, i64>(2)? as usize;
@@ -4452,7 +4496,7 @@ impl Database {
                 }
                 room_bytes -= item.len() + 1;
                 room_items -= 1;
-                steers.push((row.get(0)?, item, size));
+                steers.push((row.get(0)?, item, size, row.get(4)?));
             }
         }
         let mut absorbed = Absorbed {
@@ -4470,7 +4514,7 @@ impl Database {
         let mut steered = Vec::with_capacity(steers.len());
         // Preserve the submitted effort for exact retries; only omitted effort
         // needs a separate execution value when the running turn overrides it.
-        for (steer, item, size) in steers {
+        for (steer, item, size, was_attached) in steers {
             let id = node(&tx, head, &item)?;
             head = Some(id);
             if size >= PROMPT_SHARE_BYTES {
@@ -4505,7 +4549,7 @@ impl Database {
             absorbed
                 .entries
                 .push(entry(cursor, &bot.name, Some(turn), "steered", data));
-            steered.push((steer, size));
+            steered.push((steer, (!was_attached).then_some(size)));
         }
         // Steers go in only at a round boundary and hold no calls.
         tx.execute(
@@ -4514,12 +4558,22 @@ impl Database {
         )?;
         tx.commit()?;
         for (steer, size) in steered {
-            self.pending_left(size);
+            if let Some(size) = size {
+                self.pending_left(size);
+            }
             let outcome = self
                 .turn_outcome(&bot.name, steer)?
                 .ok_or_else(|| Error::new("stale_turn"))?;
             self.announce(&bot.name, steer, outcome.clone());
             absorbed.outcomes.push((steer, outcome));
+        }
+        if !attached {
+            absorbed.attached_left = self
+                .conn
+                .prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM turns WHERE bot=? AND status='attached')",
+                )?
+                .query_row([&bot.name], |r| r.get(0))?;
         }
         Ok(absorbed)
     }
@@ -6206,7 +6260,7 @@ impl Database {
     fn outcome_of(&self, mut outcome: Value, turn: i64) -> Result<Option<Value>> {
         if matches!(
             outcome["status"].as_str(),
-            Some("running" | "waiting" | "paced" | "queued" | "ready")
+            Some("running" | "waiting" | "paced" | "queued" | "ready" | "attached")
         ) {
             return Ok(None);
         }
@@ -6999,6 +7053,7 @@ impl Database {
                         SELECT running_turn AS id FROM bots WHERE name=?1
                         UNION ALL SELECT MIN(id) FROM turns WHERE bot=?1 AND status='queued'
                         UNION ALL SELECT MIN(id) FROM turns WHERE bot=?1 AND status='ready'
+                        UNION ALL SELECT MIN(id) FROM turns WHERE bot=?1 AND status='attached'
                     )), 9223372036854775807)
                  ORDER BY id DESC LIMIT 1 OFFSET ?2",
             )?
@@ -8043,6 +8098,7 @@ fn turn_status_name(status: &str) -> &'static str {
     match status {
         "queued" => "queued",
         "ready" => "ready",
+        "attached" => "attached",
         "waiting" => "waiting",
         "paced" => "paced",
         "running" => "running",

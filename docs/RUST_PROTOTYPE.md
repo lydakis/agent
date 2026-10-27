@@ -1348,7 +1348,7 @@ Protocol 8 adds the turn view.
 ### Delivery modes
 
 `delivery` on `submit` says what happens when the bot is busy or the daemon
-is at `--max-active`. It is one field with three values; every mode returns
+is at `--max-active`. It is one field with four values; every mode returns
 the turn's id and handle at once, and `wait`, `turns`, and
 `interrupt` work on the turn unchanged.
 
@@ -1456,6 +1456,22 @@ the turn's id and handle at once, and `wait`, `turns`, and
   starts as new work: when its place in the line comes it ends as `failed`
   with `stale_turn`. `agent run --delivery steer --turn N`. The
   steer-or-queue behavior stays the default.
+- `attach` (protocol 18): a message that needs no reply. It never starts a
+  turn, busy bot or idle: its row is `attached`, it holds no slot, and no
+  pending bound counts it. It joins the bot's next model call as a steer
+  does, through the same absorption and room checks: at the running turn's
+  next round boundary, or at the first boundary of the bot's next turn,
+  after that turn's prompt. Unlike a steer it never keeps a turn going: one
+  that arrives while a final reply is in flight waits for the next turn,
+  unless a steer keeps this one going, whose call it then joins. It
+  finishes as `steered` with `into` naming the turn that took it; the
+  submission's event is `attached`. It takes no `workspace`, `model`,
+  `effort`, `budget_tokens` or `expected_turn` (`invalid_delivery`), since
+  it joins whatever call comes next. For the same reason the bot's default
+  model is not checked and it needs no folder, even on a bot without one; it
+  never moves the retention boundary past itself. `interrupt` withdraws one
+  that waits.
+  `agent run --delivery attach` returns at once, inside a bot's shell too.
 
 A queued or ready turn that cannot start when its place comes (for example,
 the bot's budget is spent) finishes as `failed` with that

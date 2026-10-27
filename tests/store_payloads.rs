@@ -78,10 +78,18 @@ fn shared_prompts_survive_queue_steer_restart_and_source_deletion() {
             db.begin("bot", "steer", &prompt, true, &steer, |_, _| Ok(()))
                 .unwrap();
             assert_eq!(
-                db.absorb(first, None, 8 << 20, 4096, ContextUsage::default(), false)
-                    .unwrap()
-                    .outcomes
-                    .len(),
+                db.absorb(
+                    first,
+                    None,
+                    8 << 20,
+                    4096,
+                    ContextUsage::default(),
+                    false,
+                    true
+                )
+                .unwrap()
+                .outcomes
+                .len(),
                 1
             );
             for (id, options) in [("first", &plain), ("queued", &queue), ("steer", &steer)] {

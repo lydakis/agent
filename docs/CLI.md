@@ -52,7 +52,7 @@ identity is `bot_not_found`.
   `--bot NAME`; a fork uses `--source NAME` and `--bot DESTINATION`.
 - `--all` selects all bots for `follow`; `--any` selects first-completion
   behavior for `wait`. `follow --all --bot NAME` is an error.
-- `run --delivery MODE` is `reject`, `queue`, or `steer`: what the
+- `run --delivery MODE` is `reject`, `queue`, `steer`, or `attach`: what the
   submission does when the bot is busy. Without the flag, `AGENT_DELIVERY`
   applies, then `reject`. `--turn N` with `steer` makes it strict: for that
   running turn or `stale_turn`. The daemon has no default of its own: the client
@@ -68,6 +68,9 @@ identity is `bot_not_found`.
   deliveries leave both alone.
   A steer with an explicit workspace or model that differs from the running
   turn stays queued and runs separately with those choices.
+  `attach` adds a message that needs no reply to the bot's next model call,
+  mid-turn or in its next turn, without starting a turn; `run` prints the
+  submission and returns at once.
 - `run --turn-budget-tokens N` caps this turn's input plus output tokens,
   beside the bot's lifetime `--budget-tokens`. The turn fails with
   `turn_budget_exhausted` before a call once it has spent N; the cap is

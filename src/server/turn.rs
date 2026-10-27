@@ -2114,7 +2114,10 @@ impl Turn {
             // sends the view back through the overflow, elision, and
             // compaction steps. It is measured against three quarters of
             // the budget, so those steps can make it room first.
-            if self.absorb(&context.prefix, &mut capped, false).await? {
+            if self
+                .absorb(&context.prefix, &mut capped, false, true)
+                .await?
+            {
                 resume_window = resuming;
                 continue;
             }
@@ -2196,7 +2199,9 @@ impl Turn {
             // then stays queued rather than joining a turn that cannot call.
             let whole = self.summarizes(&record);
             if calls_left(&record, model_rounds)
-                && self.absorb(&context.prefix, &mut capped, whole).await?
+                && self
+                    .absorb(&context.prefix, &mut capped, whole, true)
+                    .await?
             {
                 (resume_window, steer_first) = (resuming, whole);
                 continue;
@@ -2435,7 +2440,9 @@ impl Turn {
                 self.settle_refresh(&mut record, accounting).await?;
                 let whole = self.summarizes(&record);
                 if calls_left(&record, model_rounds)
-                    && self.absorb(&context.prefix, &mut capped, whole).await?
+                    && self
+                        .absorb(&context.prefix, &mut capped, whole, false)
+                        .await?
                 {
                     last = if installed {
                         None
@@ -2541,11 +2548,15 @@ impl Turn {
         Ok(())
     }
 
+    /// `attached` takes attached messages along with steers; a reply that
+    /// called no tool takes steers alone, which an attached message must not
+    /// turn into another round.
     async fn absorb(
         &self,
         ahead: &ContextPrefix,
         capped: &mut Option<Capped>,
         whole: bool,
+        attached: bool,
     ) -> Result<bool> {
         let reserved = ahead.required;
         let retry = capped.is_some_and(|at| {
@@ -2566,12 +2577,16 @@ impl Turn {
             let absorbed = self
                 .store
                 .op("absorb", move |db| {
-                    db.absorb(turn, through, bytes, items, reserved, whole)
+                    db.absorb(turn, through, bytes, items, reserved, whole, attached)
                 })
                 .await?;
             through = absorbed.next_through;
             steered |= !absorbed.outcomes.is_empty();
             stayed |= absorbed.capped;
+            // Attached messages this pass left out join the boundary after.
+            if absorbed.attached_left {
+                self.steers.store(true, Relaxed);
+            }
             // Release the batch before loading another; new arrivals beyond
             // the initial snapshot wait for the next model-round boundary.
             if through.is_none() {

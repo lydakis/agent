@@ -1666,8 +1666,8 @@ impl Service {
         if started.fresh && started.status == "running" {
             // A steer queued behind it in the window is its steer once
             // committed: arm the turn's first round boundary for it.
-            let steered = self.admissions.iter().any(|admission| {
-                matches!(&admission.pending, Pending::Submit { bot: queued, delivery: Delivery::Steer, .. } if *queued == bot)
+            let steered = started.attached || self.admissions.iter().any(|admission| {
+                matches!(&admission.pending, Pending::Submit { bot: queued, delivery: Delivery::Steer | Delivery::Attach, .. } if *queued == bot)
             });
             self.spawn(bot.clone(), started.turn, None, steered, false);
         }
@@ -1675,8 +1675,8 @@ impl Service {
         // an admission answered in between. A command it is running moves
         // to the background so the steer reaches it now.
         if started.fresh
-            && started.status == "queued"
-            && delivery == Delivery::Steer
+            && matches!(started.status, "queued" | "attached")
+            && matches!(delivery, Delivery::Steer | Delivery::Attach)
             && let Some(active) = self.active.get(&bot)
         {
             active
@@ -2871,6 +2871,18 @@ impl Service {
                         "budget_tokens starts a turn; a steer joins one, so send it with reject or queue",
                     );
                 }
+                // An attached message joins whatever call the bot makes next.
+                if delivery == Delivery::Attach
+                    && (budget_tokens.is_some()
+                        || path.is_some()
+                        || model.is_some()
+                        || effort.is_some())
+                {
+                    return fail_with(
+                        "invalid_delivery",
+                        "attach joins the bot's next model call, so it takes no workspace, model, effort or budget_tokens",
+                    );
+                }
                 if budget_tokens.is_some_and(|n| n == 0 || n > i64::MAX as u64) {
                     return fail_with(
                         "invalid_budget",
@@ -2901,7 +2913,7 @@ impl Service {
                 let steers = self
                     .active
                     .get(&bot)
-                    .filter(|_| delivery == Delivery::Steer)
+                    .filter(|_| matches!(delivery, Delivery::Steer | Delivery::Attach))
                     .map(|active| active.steers.clone());
                 let (b, r) = (bot.clone(), request_id.clone());
                 let providers = self.providers.clone();
@@ -2913,7 +2925,7 @@ impl Service {
                                 validate_provider(&providers, bot, model)
                             })?;
                         if started.fresh
-                            && started.status == "queued"
+                            && matches!(started.status, "queued" | "attached")
                             && let Some(steers) = &steers
                         {
                             steers.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2974,7 +2986,7 @@ impl Service {
                     .await?;
                 match status.as_str() {
                     // A queued turn has no task either; end it where it stands.
-                    "queued" | "ready" => {
+                    "queued" | "ready" | "attached" => {
                         self.end_queued(bot.clone(), turn, Error::new(turn::INTERRUPTED))
                             .await?;
                         return view(&reader, bot, true).await;

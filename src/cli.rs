@@ -243,7 +243,7 @@ fn print_flags(flags: &str) {
             "--detach" => ("", "Submit and return a JSON turn handle immediately"),
             "--delivery" => (
                 "MODE",
-                "If the bot is busy: reject, queue, or steer; default AGENT_DELIVERY or reject",
+                "If the bot is busy: reject, queue, or steer; attach adds the message to its next model call without starting a turn; default AGENT_DELIVERY or reject",
             ),
             "--all" => ("", "Follow every bot on one connection"),
             "--any" => ("", "Return when the first handle resolves"),

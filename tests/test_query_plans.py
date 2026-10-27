@@ -33,6 +33,20 @@ class QueryPlanTests(unittest.TestCase):
         self.assertIn("p.status='running'", delete)
         self.assertNotIn("status!='running'", delete)
 
+    def test_absorption_reads_only_waiting_messages(self):
+        # A bot's finished turns grow without bound; the candidates for a
+        # round boundary come from the two partial indexes alone.
+        root = Path(__file__).resolve().parent.parent
+        source = (root / 'src/store/db.rs').read_text().split('#[cfg(test)]', 1)[0]
+        ddl = source.split('tx.execute_batch("', 1)[1].split('")?;', 1)[0]
+        query = next(q for q in statements(source) if q.startswith('SELECT s.id,s.prompt,length('))
+        conn = sqlite3.connect(':memory:')
+        conn.executescript(ddl)
+        steps = [row[3] for row in conn.execute('EXPLAIN QUERY PLAN ' + query, ('Bob', 1, 8, 9, 1))]
+        searches = [s for s in steps if s.startswith('SEARCH turns')]
+        self.assertEqual(sorted(searches), ['SEARCH turns USING INDEX turns_attached (bot=? AND id<?)',
+                                            'SEARCH turns USING INDEX turns_steers (bot=? AND id<?)'], steps)
+
     def test_current_schema_passes_and_missing_indexes_fail(self):
         root = Path(__file__).resolve().parent.parent
         source = (root / 'src/store/db.rs').read_text()
