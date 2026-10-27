@@ -118,11 +118,15 @@ commands:
 
 Settings Sonny keeps for every folder are in `~/.agent/sonny/settings.json`.
 At each start Sonny writes what every agent leans on, the app or not: the
-`memory`, `memory-cleanup` and `plan` skills to `~/.agents/skills` (replacing
-links the app left there), and `~/.agent/memory` and `~/.agent/project`,
-scripts that run this Sonny as `sonny memory ...` (facts saved for later
-agents, in `~/.agents/memory`) and `sonny project add DIR ...` (a project and
-its lead, as a lead makes one when the person asks).
+`memory`, `memory-cleanup`, `plan` and `automation` skills, as normal skills
+in `~/.agents/skills` (replacing links the app left there), and
+`~/.agent/memory`, `~/.agent/project` and `~/.agent/trigger`, scripts that
+run this Sonny as `sonny memory ...` (facts saved for later agents, in
+`~/.agents/memory`), `sonny project add DIR ...` (a project and its lead, as
+a lead makes one when the person asks) and `sonny trigger ...` (launchd jobs
+that wake an agent, on a Mac). A skill Sonny wrote is rewritten when Sonny's
+text changes, until you edit it: from then on it is yours, and Sonny leaves
+it alone. Sonny notes what it last wrote of each in `~/.agent/sonny/skills`.
 When `errand` is installed, Sonny writes an `errand` skill so any agent can
 run a command on another machine, draws those runs as `Ran COMMAND on
 PEER`, and in Rex opens a window following each detached job.

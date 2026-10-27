@@ -1609,11 +1609,12 @@ quiet.
 
 ## Skills the app ships
 
-The app ships two skills: `automation`, for recurring jobs, and `swarm`.
-Sonny installs `plan`, an agent's plan the app shows (see Projects and
-panes); `memory`, what to save for later agents; and `memory-cleanup`, the
-nightly cleanup (see Memory), writing them into `~/.agents/skills` at each
-start and replacing a link the app left there.
+The app ships one skill, `swarm`. Sonny installs `plan`, an agent's plan
+the app shows (see Projects and panes); `memory`, what to save for later
+agents; `memory-cleanup`, the nightly cleanup (see Memory); and
+`automation`, for recurring jobs (see Triggers), writing them into
+`~/.agents/skills` at each start as normal skills, replacing a link the app
+left there, and never over one the person edited.
 
 Agents read only skills in a folder's `.agents/skills` or in
 `~/.agents/skills` ([client policy](CLIENT.md)). The app bundle carries its

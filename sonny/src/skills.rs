@@ -44,35 +44,100 @@ pub fn install_own() {
     }
 }
 
-/// A skill of Sonny's in the person's skills, rewritten when it changed.
+/// A skill of Sonny's in the person's skills, written as a normal skill:
+/// rewritten when Sonny's text changed, never over the person's edits.
 pub fn install(name: &str, text: &str) -> Option<PathBuf> {
     install_files(name, &[("SKILL.md", text, 0o644)])
 }
 
-/// A skill's files, each with its mode, rewritten when one changed. A
-/// link the app left there, into its bundle, is replaced, never written
-/// through; a link of the person's own is left alone.
+/// A skill's files, each with its mode.
 fn install_files(name: &str, files: &[(&str, &str, u32)]) -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var_os("HOME")?)
-        .join(".agents/skills")
-        .join(name);
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    install_in(&home, first_record(&home), name, files)
+}
+
+/// Whether this is the first Sonny to keep a record of the skills it
+/// wrote: the earlier ones kept none, so what they wrote is taken as
+/// theirs once. Asked once a run, before this run's first record.
+fn first_record(home: &Path) -> bool {
+    static FIRST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FIRST.get_or_init(|| !records(home).exists())
+}
+
+/// Where Sonny notes what it last wrote of each skill: a line of
+/// `FINGERPRINT FILE` for each file.
+fn records(home: &Path) -> PathBuf {
+    home.join(".agent/sonny/skills")
+}
+
+/// The fingerprints Sonny last wrote of `name`'s files, if it noted any.
+fn record(home: &Path, name: &str) -> Option<Vec<(String, String)>> {
+    let text = std::fs::read_to_string(records(home).join(name)).ok()?;
+    Some(
+        text.lines()
+            .filter_map(|line| {
+                let (hash, file) = line.split_once(' ')?;
+                Some((file.to_owned(), hash.to_owned()))
+            })
+            .collect(),
+    )
+}
+
+/// Whether the skill at `dir` is Sonny's to change: missing, or as Sonny
+/// last wrote it (with no record, only before the first record was kept).
+fn sonnys(home: &Path, first: bool, name: &str, dir: &Path) -> bool {
+    if !dir.exists() {
+        return true;
+    }
+    match record(home, name) {
+        Some(files) => files.iter().all(|(file, hash)| {
+            std::fs::read_to_string(dir.join(file))
+                .is_ok_and(|now| crate::project::fingerprint(&now) == *hash)
+        }),
+        None => first,
+    }
+}
+
+/// `files` as the skill `name` in `home`'s skills, rewritten when one
+/// changed and the skill is still Sonny's. A link the app left there,
+/// into its bundle, is replaced, never written through; a link of the
+/// person's own is left alone.
+fn install_in(
+    home: &Path,
+    first: bool,
+    name: &str,
+    files: &[(&str, &str, u32)],
+) -> Option<PathBuf> {
+    let dir = home.join(".agents/skills").join(name);
     let skill = dir.join("SKILL.md");
-    let same = files.iter().all(|(file, text, _)| {
-        std::fs::read_to_string(dir.join(file)).is_ok_and(|now| now == *text)
-    });
     if let Ok(target) = std::fs::read_link(&dir) {
         if !in_app_bundle(&target) {
             return None;
         }
         std::fs::remove_file(&dir).ok()?;
-    } else if same {
-        return None;
     }
-    std::fs::create_dir_all(&dir).ok()?;
-    for (file, text, mode) in files {
-        agent_client::files::replace_mode(&dir.join(file), text.as_bytes(), *mode).ok()?;
+    let same = files.iter().all(|(file, text, _)| {
+        std::fs::read_to_string(dir.join(file)).is_ok_and(|now| now == *text)
+    });
+    let wrote = same || sonnys(home, first, name, &dir);
+    if !same && wrote {
+        std::fs::create_dir_all(&dir).ok()?;
+        for (file, text, mode) in files {
+            agent_client::files::replace_mode(&dir.join(file), text.as_bytes(), *mode).ok()?;
+        }
     }
-    Some(skill)
+    if wrote {
+        let noted: String = files
+            .iter()
+            .map(|(file, text, _)| format!("{} {file}\n", crate::project::fingerprint(text)))
+            .collect();
+        let path = records(home).join(name);
+        if std::fs::read_to_string(&path).ok().as_deref() != Some(noted.as_str()) {
+            let _ = std::fs::create_dir_all(records(home));
+            let _ = agent_client::files::replace_mode(&path, noted.as_bytes(), 0o644);
+        }
+    }
+    (!same && wrote).then_some(skill)
 }
 
 /// Whether a link leads into `NAME.app/Contents/Resources/skills`, where
@@ -136,11 +201,22 @@ fn write_runner(path: &Path, usage: &str, sonny: &Path, verb: &str) -> Result<()
     agent_client::files::replace_mode(path, text.as_bytes(), 0o755)
 }
 
-/// Take a skill of Sonny's out of the person's skills.
+/// Take a skill of Sonny's out of the person's skills, unless the person
+/// edited it.
 pub fn remove(name: &str) {
     if let Some(home) = std::env::var_os("HOME") {
-        let _ = std::fs::remove_dir_all(PathBuf::from(home).join(".agents/skills").join(name));
+        let home = PathBuf::from(home);
+        remove_in(&home, first_record(&home), name);
     }
+}
+
+fn remove_in(home: &Path, first: bool, name: &str) {
+    let dir = home.join(".agents/skills").join(name);
+    if std::fs::read_link(&dir).is_ok() || !sonnys(home, first, name, &dir) {
+        return;
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(records(home).join(name));
 }
 
 #[cfg(test)]
@@ -199,6 +275,42 @@ mod tests {
             Path::new("/usr/local/bin/sonny")
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_skill_is_rewritten_until_the_person_edits_it() {
+        let home = std::env::temp_dir().join(format!("sonny-skills-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let skill = home.join(".agents/skills/plan/SKILL.md");
+        let read = || std::fs::read_to_string(&skill).unwrap();
+        let files = |text| [("SKILL.md", text, 0o644)];
+        assert_eq!(
+            install_in(&home, false, "plan", &files("one")),
+            Some(skill.clone())
+        );
+        assert_eq!(read(), "one");
+        // Sonny's next text replaces its own.
+        assert!(install_in(&home, false, "plan", &files("two")).is_some());
+        assert_eq!(read(), "two");
+        // The person's edit stays, through Sonny's next text and a remove.
+        std::fs::write(&skill, "mine").unwrap();
+        assert!(install_in(&home, false, "plan", &files("three")).is_none());
+        assert_eq!(read(), "mine");
+        remove_in(&home, false, "plan");
+        assert_eq!(read(), "mine");
+        // A skill of the person's own of that name, which Sonny never wrote, too.
+        let theirs = home.join(".agents/skills/errand/SKILL.md");
+        std::fs::create_dir_all(theirs.parent().unwrap()).unwrap();
+        std::fs::write(&theirs, "theirs").unwrap();
+        assert!(install_in(&home, false, "errand", &files("sonny's")).is_none());
+        assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "theirs");
+        // Before the first record, what an earlier Sonny wrote is taken as its.
+        assert!(install_in(&home, true, "errand", &files("sonny's")).is_some());
+        assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "sonny's");
+        // An unedited skill goes on a remove.
+        remove_in(&home, false, "errand");
+        assert!(!theirs.exists());
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
