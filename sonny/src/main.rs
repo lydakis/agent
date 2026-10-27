@@ -1146,6 +1146,9 @@ struct App {
     /// Where the person's reactions to the bot are kept, once its id is
     /// known.
     reactions_key: Option<String>,
+    /// Where its open questions are kept, for those older than the
+    /// history Sonny replays.
+    asks_file: Option<PathBuf>,
     /// Esc set the questions aside: what is typed is a message of its own.
     chatting: bool,
     /// The waiting call whose whole command was last written out.
@@ -1812,6 +1815,7 @@ impl App {
                     std::fs::canonicalize(&options.store).unwrap_or_else(|_| options.store.clone());
                 reactions::key(&store, id)
             }),
+            asks_file: None,
             chatting: false,
             asked: None,
             following: true,
@@ -1878,6 +1882,7 @@ impl App {
         let _ = terminal.autoresize();
         self.width = terminal.size().map(|s| s.width as usize).unwrap_or(80);
         self.reactions = reactions::Reactions::load(self.reactions_key.as_deref());
+        self.asks_file = self.reactions_key.as_deref().and_then(asks::file);
         self.history().await;
         // A turn already running: its clock, and any call it waits on.
         if let Some(turn) = self.running.as_ref().map(|r| r.turn) {
@@ -2528,13 +2533,20 @@ impl App {
         // Drawn from the start (attaching, or a repaint), the bot's
         // reactions are read again with the rest; after a gap, those it
         // made before the gap are still held.
+        // The open questions kept, those asked before the history replayed
+        // among them, are joined with the replay's once it is read.
+        let mut kept = None;
         if self.seen_node == 0 || after < self.seen_node {
             self.bot_reactions.clear();
             self.react_calls.clear();
             self.answering = None;
+            kept = Some(asks::load(self.asks_file.as_deref()));
             self.asks.clear();
             self.sent_answers.clear();
         }
+        // The questions the replay asks, and the answers to none of them.
+        let mut asked_here: std::collections::HashSet<String> = Default::default();
+        let mut answered_older: Vec<String> = Vec::new();
         self.seen_node = nodes.last().copied().unwrap_or(self.seen_node);
         if let Some(&first) = nodes.first() {
             self.first_node = Some(self.first_node.map_or(first, |n| n.min(first)));
@@ -2559,7 +2571,11 @@ impl App {
                         // The bot's reactions to the message before, as they
                         // were drawn live.
                         self.draw_bot_reactions();
-                        asks::close(&mut self.asks, &text(&item));
+                        if !asks::close(&mut self.asks, &text(&item))
+                            && let Some(question) = asks::answered(&text(&item))
+                        {
+                            answered_older.push(question.to_owned());
+                        }
                         // What the person ran is shown as it was when it ran.
                         let lines = landed(&text(&item), &mut self.ran_here, self.width);
                         self.commit(lines);
@@ -2593,6 +2609,9 @@ impl App {
                             .and_then(|a| serde_json::from_str(a).ok())
                             .unwrap_or(Value::Null);
                         let name = item["name"].as_str().unwrap_or("tool").to_owned();
+                        if name == asks::TOOL {
+                            asked_here.insert(item["call_id"].as_str().unwrap_or("").to_owned());
+                        }
                         calls.insert(
                             item["call_id"].as_str().unwrap_or("").to_owned(),
                             (name, arguments),
@@ -2620,8 +2639,13 @@ impl App {
                         {
                             let (output, failed) = output(&item);
                             self.commit_call(&name, &arguments, &output, failed);
-                            if name == asks::TOOL && !failed && !reactions::refused(&item) {
-                                self.asked(id, &arguments);
+                            if name == asks::TOOL
+                                && !failed
+                                && !reactions::refused(&item)
+                                && let Some(ask) = asks::call(id, &arguments)
+                                && !self.asks.iter().any(|open| open.id == ask.id)
+                            {
+                                self.asks.push(ask);
                             }
                         }
                     }
@@ -2638,6 +2662,19 @@ impl App {
         }
         // A call still running finishes live, after the history.
         self.calls.extend(calls);
+        // Kept ones the replay asked are as it left them; the rest were
+        // asked before it, and stay open unless it answered them.
+        if let Some(mut older) = kept {
+            older.retain(|ask| !asked_here.contains(&ask.id));
+            for question in &answered_older {
+                if let Some(at) = older.iter().position(|ask| &ask.question == question) {
+                    older.remove(at);
+                }
+            }
+            older.append(&mut self.asks);
+            self.asks = older;
+        }
+        self.keep_asks();
     }
 
     /// Drop the staged prompts that landed while Sonny was away, whose
@@ -4078,15 +4115,17 @@ impl App {
         }
         match self.send(prompt, None, join).await {
             Ok(()) => {
+                self.input.clear();
+                self.notice = None;
                 if let Some(ask) = answering {
                     self.asks.retain(|open| open.id != ask.id);
                     self.sent_answers.push(ask.question);
+                    // After the notice is cleared, so a failure to keep shows.
+                    self.keep_asks();
                     if self.asks.is_empty() {
                         self.chatting = false;
                     }
                 }
-                self.input.clear();
-                self.notice = None;
             }
             Err(error) => self.notice = Some(error),
         }
@@ -4152,6 +4191,14 @@ impl App {
             && !self.asks.iter().any(|open| open.id == ask.id)
         {
             self.asks.push(ask);
+            self.keep_asks();
+        }
+    }
+
+    /// The open questions kept for the next start.
+    fn keep_asks(&mut self) {
+        if let Err(error) = asks::keep(self.asks_file.as_deref(), &self.asks) {
+            self.notice = Some(error);
         }
     }
 
@@ -4166,6 +4213,7 @@ impl App {
             return;
         }
         asks::close(&mut self.asks, message);
+        self.keep_asks();
         if self.asks.is_empty() {
             self.chatting = false;
         }
@@ -5204,6 +5252,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kept_questions_join_the_replay_by_the_call_that_asked_them() {
+        let user = |text: &str| {
+            json!({"type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": text}]})
+        };
+        let ask = |id: &str, question: &str| {
+            [
+                json!({"type": "function_call", "name": "ask", "call_id": id,
+                    "arguments": json!({"question": question}).to_string()}),
+                json!({"type": "function_call_output", "call_id": id, "output": "Asked."}),
+            ]
+        };
+        // Asked twice, answered between: the second is the one open. An
+        // older question, answered in the history replayed, is closed; one
+        // never answered stays.
+        let mut items = vec![user("go on")];
+        items.extend(ask("c1", "Proceed?"));
+        items.push(user("You asked: Proceed?\n\nyes"));
+        items.extend(ask("c2", "Proceed?"));
+        items.push(user("You asked: Rename the crate?\n\nno"));
+        let count = items.len() as i64;
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_nodes") => {
+                json!({"nodes": (1..=count).rev().map(|node| json!({"node": node}))
+                .collect::<Vec<_>>(), "next_from": null})
+            }
+            _ => json!({"items": asked["nodes"].as_array().into_iter().flatten()
+                .map(|node| json!({"node": node,
+                    "item": items[node.as_u64().unwrap() as usize - 1]}))
+                .collect::<Vec<_>>()}),
+        })
+        .await;
+        let mut app = app(client);
+        let file =
+            std::env::temp_dir().join(format!("sonny-asks-join-{}.json", std::process::id()));
+        let kept =
+            |id: &str, question: &str| asks::call(id, &json!({"question": question})).unwrap();
+        asks::keep(
+            Some(&file),
+            &[
+                kept("o1", "Rename the crate?"),
+                kept("o2", "Bump the version?"),
+                kept("c2", "Proceed?"),
+            ],
+        )
+        .unwrap();
+        app.asks_file = Some(file.clone());
+        app.history().await;
+        assert_eq!(
+            app.asks,
+            [kept("o2", "Bump the version?"), kept("c2", "Proceed?")]
+        );
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
     async fn a_question_asked_is_pinned_until_an_answer_lands() {
         let items = json!({
             "1": {"type": "message", "role": "user",
@@ -5232,16 +5336,22 @@ mod tests {
         })
         .await;
         let mut app = app(client);
+        // Kept from before: one asked earlier than the history replayed,
+        // and one the history asks again.
+        let file = std::env::temp_dir().join(format!("sonny-asks-app-{}.json", std::process::id()));
+        let older = asks::call("o1", &json!({"question": "Rename the crate?"})).unwrap();
+        let tag = asks::Ask {
+            id: "a1".into(),
+            question: "Tag 0.4.1?".into(),
+            choices: vec!["Yes".into(), "No".into()],
+        };
+        asks::keep(Some(&file), &[older.clone(), tag.clone()]).unwrap();
+        app.asks_file = Some(file.clone());
         app.history().await;
-        // The refused one was never asked, and the answered one is closed.
-        assert_eq!(
-            app.asks,
-            [asks::Ask {
-                id: "a1".into(),
-                question: "Tag 0.4.1?".into(),
-                choices: vec!["Yes".into(), "No".into()]
-            }]
-        );
+        // The refused one was never asked, and the answered one is closed;
+        // the older one is still open.
+        assert_eq!(app.asks, [older.clone(), tag]);
+        assert_eq!(asks::load(Some(&file)), app.asks);
         let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
         assert!(
             rows.contains(&"• Asked you Tag 0.4.1?".to_owned()),
@@ -5249,7 +5359,9 @@ mod tests {
         );
         // Its answer landing, sent from here or another window, closes it.
         app.answered("You asked: Tag 0.4.1?\n\nYes");
+        app.answered("You asked: Rename the crate?\n\nNo");
         assert!(app.asks.is_empty());
+        assert!(!file.exists());
         // Live, a question is pinned once the daemon took the call.
         let arguments = json!({"question": "Merge?"}).to_string();
         app.daemon(turn_event("accepted", 4, json!({}))).await;
@@ -5263,6 +5375,7 @@ mod tests {
         app.daemon(turn_event("tool_completed", 4, json!({"call_id": "a4"})))
             .await;
         assert_eq!(app.asks[0].question, "Merge?");
+        let _ = std::fs::remove_file(&file);
     }
 
     #[tokio::test]
