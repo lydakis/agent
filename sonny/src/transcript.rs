@@ -662,6 +662,66 @@ pub fn tool(
     workspace: &str,
     width: usize,
 ) -> Vec<Line<'static>> {
+    drawn(name, arguments, output, failed, workspace, width, false)
+}
+
+/// What the clean view keeps of a call: the calls that move the work on,
+/// said as [`tool`] says them (an agent started, messaged or waited for,
+/// a question to the person, the plan, memory, a trigger, a window
+/// opened), and nothing of the rest. A command line keeps only those of
+/// its commands.
+pub fn clean(
+    name: &str,
+    arguments: &Value,
+    output: Option<&str>,
+    failed: bool,
+    workspace: &str,
+    width: usize,
+) -> Vec<Line<'static>> {
+    drawn(name, arguments, output, failed, workspace, width, true)
+}
+
+/// What the clean view keeps, by what Sonny says a call did.
+const KEPT: [&str; 24] = [
+    "Started",
+    "Messaged",
+    "Steered",
+    "Queued for",
+    "Forked",
+    "Interrupted",
+    "Removed",
+    "Waited for",
+    "Asked you",
+    "Updated the plan",
+    "Cleared the plan",
+    "Saved to memory",
+    "Updated in memory",
+    "Removed from memory",
+    "Scheduled",
+    "Removed the trigger",
+    "Fired the trigger",
+    "Added the project",
+    "Moved",
+    "Opened a tab",
+    "Opened a split",
+    "Stopped Errand job",
+    "Applied the changes of Errand job",
+    "Applied the changes of",
+];
+
+fn kept(said: &crate::calls::Said) -> bool {
+    KEPT.contains(&said.verb.as_str())
+}
+
+fn drawn(
+    name: &str,
+    arguments: &Value,
+    output: Option<&str>,
+    failed: bool,
+    workspace: &str,
+    width: usize,
+    clean: bool,
+) -> Vec<Line<'static>> {
     let bullet = if failed {
         Span::raw("• ").fg(Color::Red)
     } else {
@@ -674,6 +734,9 @@ pub fn tool(
     if name == "shell"
         && let Some(said) = crate::calls::said(&field("command"), output.unwrap_or(""), failed)
     {
+        if clean && !kept(&said) {
+            return Vec::new();
+        }
         return said_lines(said, width);
     }
     // Several commands in one call, some of them known: each on its own
@@ -768,6 +831,8 @@ pub fn tool(
         let rest = printed.join("\n");
         for (i, group) in groups.into_iter().enumerate() {
             match group {
+                Ok(said) if clean && !kept(&said) => {}
+                Err(_) if clean => {}
                 Ok(mut said) => {
                     said.failed |= failed && i + 1 == count;
                     out.extend(said_lines(said, width));
@@ -794,10 +859,15 @@ pub fn tool(
                 }
             }
         }
-        if last_ran.is_none() && !rest.trim().is_empty() {
+        if !clean && last_ran.is_none() && !rest.trim().is_empty() {
             out.extend(preview(&rest, width));
         }
         return out;
+    }
+    // The wait tool says what the tasks it waited for did; the rest of the
+    // calls are hidden from the clean view.
+    if clean && !(name == "wait" && waited(output).is_some()) {
+        return Vec::new();
     }
     // A skill's instructions, read before following them.
     if name == "read"
@@ -1348,6 +1418,63 @@ mod tests {
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(rows[0].contains("Edited a.rs") && !rows[0].contains('+'));
         assert!(rows[1].contains("edit_target_not_found"));
+    }
+
+    #[test]
+    fn the_clean_view_keeps_the_plan_and_tasks_but_not_commands() {
+        let clean = |name: &str, arguments: Value, output: &str| {
+            text(&super::clean(
+                name,
+                &arguments,
+                Some(output),
+                false,
+                "/w",
+                80,
+            ))
+        };
+        let shell = |command: &str, output: &str| {
+            clean("shell", serde_json::json!({"command": command}), output)
+        };
+        assert!(shell("cargo test", "ok").is_empty());
+        assert!(shell(r#""$AGENT_BIN" ls --pretty"#, "calc.lead  running").is_empty());
+        assert!(clean("read", serde_json::json!({"path": "/w/a.rs"}), "fn a() {}").is_empty());
+        assert!(
+            clean(
+                "edit",
+                serde_json::json!({"path": "/w/a.rs", "old": "a", "new": "b"}),
+                ""
+            )
+            .is_empty()
+        );
+        let plan = shell(
+            r#"sh "$HOME/.agents/skills/plan/plan" '[x] Read the tests' '[>] Fix them'; python3 test_calc.py"#,
+            "plan saved: 2 steps
+6 passed",
+        );
+        assert_eq!(plan[0], "• Updated the plan");
+        assert!(
+            plan.iter()
+                .all(|row| !row.contains("python3") && !row.contains("passed")),
+            "{plan:?}"
+        );
+        let asked = shell(r#"sonny ask 'Ship it?' --choice yes --choice no"#, "");
+        assert_eq!(asked, ["• Asked you Ship it?", "  └ 1 yes · 2 no"]);
+        let started = shell(
+            r#""$AGENT_BIN" run --detach --new --bot calc.fix -- 'Fix the tests.'"#,
+            r#"{"bot":"calc.fix","handle":"turn:calc.fix/2","turn":2}"#,
+        );
+        assert_eq!(started[0], "• Started calc.fix · turn 2");
+        // How a lead in Sonny starts a task, and the note it prints after.
+        let task = shell(
+            r#""/Applications/Sonny/sonny" task calc.fix --agents --setup --model "$AGENT_MODEL" -- 'Fix the tests.'"#,
+            "{\"bot\":\"calc.fix\",\"handle\":\"turn:calc.fix/3\",\"turn\":3}\nIts work comes back on branch agent/calc.fix.",
+        );
+        assert_eq!(task, ["• Started calc.fix · turn 3", "  └ Fix the tests."]);
+        assert!(shell(r#"sonny task changes calc.fix"#, "M calc.py").is_empty());
+        assert_eq!(
+            shell(r#"sonny task changes calc.fix --apply"#, ""),
+            ["• Applied the changes of calc.fix"]
+        );
     }
 
     #[test]

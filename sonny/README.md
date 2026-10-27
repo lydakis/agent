@@ -150,7 +150,8 @@ agent then does. Esc stops a command still running.
   sets the questions aside for a message of your own, and Esc again goes
   back to them. They wait in `~/.agent/sonny/asks/`, one file each, kept apart by store and bot id.
 - `/copy` puts the last reply on the clipboard; `/open` opens the last
-  HTML page in a browser; `/sound` turns the chime off or on; `/quit`
+  HTML page in a browser; `/sound` turns the chime off or on; `/verbose`
+  switches between the clean view and every tool call; `/quit`
   leaves the agents working.
 
 Settings Sonny keeps for every folder are in `~/.agent/sonny/settings.json`.
@@ -192,5 +193,12 @@ short `└` look at its result, edits show as a diff, and a status row says
 `Working (12s • esc to interrupt)`. The steps on the way, calls and what
 the bot said before each, are dim; the reply stays bright, under the
 turn's `Worked for …` line.
+
+The view is clean by default: the bot's words, and only the calls that
+move the work on, said as what they did (a task started, messaged or
+waited for, a question to you, the plan, memory, a trigger, a window
+opened). Commands, reads and edits are left out. `/verbose` draws every
+call, the conversation so far included, and is kept with the other
+settings; `/verbose` again goes back to clean.
 
 `demo/` has the scripted model and folder the recordings use.
