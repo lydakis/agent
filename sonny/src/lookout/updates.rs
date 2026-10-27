@@ -103,7 +103,7 @@ pub struct Updates {
     /// project's, as the subscriber's own memory indexes name them.
     memory: Vec<PathBuf>,
     /// Bots with subscriptions of their own: no one's tasks here.
-    pub subscribers: HashSet<String>,
+    subscribers: HashSet<String>,
     pub live: bool,
     bots: HashMap<String, Bot>,
     from: HashMap<Key, String>,
@@ -505,6 +505,18 @@ impl Updates {
         self.approvals.clear();
     }
 
+    /// The bots with subscriptions of their own, now: what was news of
+    /// them is no longer.
+    pub fn subscribed(&mut self, subscribers: HashSet<String>) {
+        let new: Vec<String> = (subscribers.difference(&self.subscribers))
+            .cloned()
+            .collect();
+        for name in new {
+            self.drop_news(&name);
+        }
+        self.subscribers = subscribers;
+    }
+
     /// Task updates were just asked for: news from now on, the bots'
     /// states kept.
     pub fn begin(&mut self) {
@@ -519,6 +531,10 @@ impl Updates {
         if name == self.lead {
             return self.forget();
         }
+        self.drop_news(name);
+    }
+
+    fn drop_news(&mut self, name: &str) {
         self.tasks.retain(|(task, _)| task != name);
         self.forwarding.retain(|(task, _), _| task != name);
         self.approvals.retain(|(task, _), _| task != name);

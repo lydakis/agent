@@ -1696,7 +1696,7 @@ fn updates_for(
     for record in records.values() {
         updates.seat(record);
     }
-    updates.subscribers = others(subscriber, subscribers);
+    updates.subscribed(others(subscriber, subscribers));
     updates.live = live;
     updates
 }
@@ -1956,7 +1956,7 @@ impl Service {
                 _ => {}
             }
             lookout.updating = updating;
-            lookout.updates.subscribers = others(name, subscribers);
+            lookout.updates.subscribed(others(name, subscribers));
             lookout.subs = file;
             lookout.roots(&self.records);
             let mut held = std::mem::take(&mut lookout.held);
@@ -3831,6 +3831,7 @@ mod tests {
                 lead.clone(),
                 record("calc.fix", 2, Some("calc.lead")),
                 record("calc.review", 3, Some("calc.lead")),
+                record("calc.ops", 4, Some("calc.lead")),
             ]
             .into_iter()
             .map(|r| (r["name"].as_str().unwrap().to_owned(), r))
@@ -3877,6 +3878,16 @@ mod tests {
             ["turn:calc.fix/1"]
         );
         let after = later + Duration::from_secs(3600);
+        // A task that subscribes after its news came: no one's task now.
+        turn(lookout, "calc.ops");
+        assert!(lookout.updates.due(after));
+        service.subscribers.insert("calc.ops".into(), Vec::new());
+        service.resubscribe();
+        let lookout = service.lookouts.get_mut("calc.lead").unwrap();
+        assert!(!lookout.updates.due(after));
+        service.subscribers.remove("calc.ops");
+        service.resubscribe();
+        let lookout = service.lookouts.get_mut("calc.lead").unwrap();
         // Past the gap since the last note. Task updates go with the
         // subscription that asked for them: news not yet told goes when it
         // is dropped, and none comes while off.
