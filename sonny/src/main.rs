@@ -257,23 +257,39 @@ fn which(program: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// Agent's own binary: the one the daemon gave this shell (or Homebrew's
-/// wrapper names, by a path upgrades keep), else the one installed beside
-/// Sonny (`libexec/agent`), which speaks Sonny's protocol, else the app's. Not `agent` on PATH,
-/// which may be another program.
+/// Agent's own binary: the one the daemon gave this shell, else the one
+/// installed beside Sonny (`libexec/agent`, as the Linux tarball lays it
+/// out), else Homebrew's `agent` formula when Sonny is its `sonny`, else
+/// the app's. Not `agent` on PATH, which may be another program.
 fn agent_bin() -> Option<PathBuf> {
-    let beside = std::env::current_exe()
-        .and_then(std::fs::canonicalize)
-        .ok()
-        .and_then(|me| Some(me.parent()?.parent()?.join("libexec/agent")));
+    let me = std::env::current_exe().and_then(std::fs::canonicalize).ok();
     std::env::var_os("AGENT_BIN")
         .map(PathBuf::from)
         .into_iter()
-        .chain(beside)
+        .chain(me.iter().flat_map(|me| installed_agent(me)))
         .chain([PathBuf::from(
             "/Applications/Agent.app/Contents/MacOS/agent",
         )])
         .find(|bin| bin.is_file())
+}
+
+/// Where Agent's binary is installed with Sonny at `me`: beside it, and,
+/// when Sonny is in Homebrew's Cellar, by the `agent` formula's `opt`
+/// path, which outlasts the versions upgrades remove. The daemon hands
+/// that path to its agents, so it must outlast the daemon's version.
+fn installed_agent(me: &std::path::Path) -> Vec<PathBuf> {
+    let Some(keg) = me.parent().and_then(std::path::Path::parent) else {
+        return Vec::new();
+    };
+    let mut found = vec![keg.join("libexec/agent")];
+    if let Some(cellar) = keg
+        .parent()
+        .filter(|formula| formula.ends_with("Cellar/sonny"))
+        && let Some(prefix) = cellar.parent().and_then(std::path::Path::parent)
+    {
+        found.push(prefix.join("opt/agent/bin/agent"));
+    }
+    found
 }
 
 /// Agent's binary to run, with the provider keys the app keeps in
@@ -3965,6 +3981,23 @@ fn responses(item: &Value) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_is_found_beside_sonny_or_by_homebrews_opt_path() {
+        assert_eq!(
+            installed_agent(std::path::Path::new(
+                "/opt/homebrew/Cellar/sonny/0.4.0/bin/sonny"
+            )),
+            [
+                PathBuf::from("/opt/homebrew/Cellar/sonny/0.4.0/libexec/agent"),
+                PathBuf::from("/opt/homebrew/opt/agent/bin/agent"),
+            ]
+        );
+        assert_eq!(
+            installed_agent(std::path::Path::new("/home/me/sonny-0.4.0/bin/sonny")),
+            [PathBuf::from("/home/me/sonny-0.4.0/libexec/agent")]
+        );
+    }
 
     /// A daemon that greets and answers each `history_items` read from
     /// `items`, by node.

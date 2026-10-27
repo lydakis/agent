@@ -2,6 +2,7 @@
 
 import argparse
 import base64
+import functools
 import hashlib
 import json
 from pathlib import Path
@@ -16,21 +17,25 @@ import homebrew_formula
 
 STABLE_VERSION = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
 
-# What the tap gets from a release: the app's cask and Sonny's formula,
-# each with its archive, the file the release carries, its renderer, and
-# where the tap's current file says its version.
+# What the tap gets from a release: the app's cask, and the formulas for
+# the daemon and Sonny, both built from the source archive. Each with its
+# archive, the file the release carries, its renderer, what its generator
+# is told before the version, and where the tap's file says its version.
 KINDS = {
-    "cask": ("agent", homebrew_cask.archive_name, "agent.rb", homebrew_cask.render_cask,
+    "cask": ("agent", homebrew_cask.archive_name, "agent.rb", homebrew_cask.render_cask, [],
              r'^  version "(' + STABLE_VERSION + r')"$'),
-    "formula": ("sonny", homebrew_formula.archive_name, "sonny.rb",
-                homebrew_formula.render_formula,
-                r'/sonny-(' + STABLE_VERSION + r')\.tar\.gz"$'),
+    **{
+        name: (name, homebrew_formula.archive_name, f"{name}-formula.rb",
+               functools.partial(homebrew_formula.render_formula, name), [name],
+               r'/releases/download/v(' + STABLE_VERSION + r')/')
+        for name in homebrew_formula.FORMULAS
+    },
 }
 
 
 def prepare_update(tag: str, metadata: Path, assets: Path, current: Path,
                    *, commit: str, generator: Path | None = None, kind: str = "cask"):
-    name, archive_name, published, render, current_version = KINDS[kind]
+    name, archive_name, published, render, generator_args, current_version = KINDS[kind]
     match = re.fullmatch("v" + STABLE_VERSION, tag)
     if not match:
         raise ValueError("expected a stable tag such as v0.1.0")
@@ -61,7 +66,7 @@ def prepare_update(tag: str, metadata: Path, assets: Path, current: Path,
     if generator is not None:
         with tempfile.TemporaryDirectory() as directory:
             expected = Path(directory) / published
-            subprocess.run([sys.executable, str(generator), version,
+            subprocess.run([sys.executable, str(generator), *generator_args, version,
                             str(archive), str(expected)], check=True)
             expected_release_cask = expected.read_bytes()
     if cask_path.read_bytes() != expected_release_cask:
@@ -104,7 +109,7 @@ def main():
     parser.add_argument("--generator", type=Path,
                         help="release tag's generator, used to verify immutable assets")
     parser.add_argument("--kind", choices=sorted(KINDS), default="cask",
-                        help="the app's cask or Sonny's formula")
+                        help="the app's cask, or the daemon's or Sonny's formula")
     args = parser.parse_args()
     args.request.unlink(missing_ok=True)
     try:
