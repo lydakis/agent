@@ -827,8 +827,8 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
     };
     let memory = agent_client::policy::memory_indexes(&workspace).map_err(|e| e.to_string())?;
     let instructions = agent_client::policy::instructions(&workspace, None, &memory)
-        .map_err(|e| e.to_string())?
-        .text;
+        .map(|composed| project::with_person(&composed.text))
+        .map_err(|e| e.to_string())?;
     let mut asked = json!({"bot": bot, "workspace": workspace, "model": model,
         "instructions": instructions, "tools": DEFAULT_TOOLS,
         "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
