@@ -203,7 +203,7 @@ impl Screen {
                     let cell = &mut buf[(area.x + x as u16, y)];
                     // One look whatever the text's colors, as a terminal's own.
                     cell.set_fg(Color::Reset).set_bg(Color::Reset);
-                    cell.modifier = cell.modifier - Modifier::DIM | Modifier::REVERSED;
+                    cell.modifier = (cell.modifier - Modifier::DIM) | Modifier::REVERSED;
                 }
             }
         }
