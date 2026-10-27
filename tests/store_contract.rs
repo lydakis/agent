@@ -645,6 +645,7 @@ fn allow(db: &mut Database, turn: i64, call_id: &str) -> Result<Answered> {
         request: 1,
         tag: None,
         allow: true,
+        unreviewed: false,
         reason: None,
         by: Some("test"),
     })
@@ -766,6 +767,7 @@ fn an_expiry_that_came_first_beats_a_later_denial() {
         request: 1,
         tag: Some("second"),
         allow: false,
+        unreviewed: false,
         reason: Some("no"),
         by: Some("test"),
     })
@@ -804,6 +806,7 @@ fn a_deny_decides_the_call_and_later_answers_are_refused() {
             request: 1,
             tag: Some(tag),
             allow,
+            unreviewed: false,
             reason,
             by: Some("test"),
         })
@@ -963,6 +966,7 @@ fn every_parked_turns_lapse_is_read_at_once() {
         request: 1,
         tag: Some("quick"),
         allow: true,
+        unreviewed: false,
         reason: None,
         by: Some("test"),
     })
@@ -983,6 +987,7 @@ fn no_call_starts_once_a_later_call_lapsed() {
         request: 1,
         tag: Some("slow"),
         allow: true,
+        unreviewed: false,
         reason: None,
         by: Some("test"),
     })
@@ -1027,6 +1032,7 @@ fn a_tag_listing_reads_only_that_tags_calls() {
         request: 1,
         tag: Some("slow"),
         allow: true,
+        unreviewed: false,
         reason: None,
         by: Some("test"),
     })
@@ -1097,6 +1103,7 @@ fn a_tag_listing_reads_no_call_that_tag_answered() {
                 request: 1,
                 tag: Some(tag),
                 allow: true,
+                unreviewed: false,
                 reason: None,
                 by: Some("test"),
             })
@@ -1339,6 +1346,7 @@ fn the_announced_call_count_follows_the_rows() {
         request: 1,
         tag: None,
         allow: false,
+        unreviewed: false,
         reason: Some("no"),
         by: Some("test"),
     })
@@ -1414,7 +1422,7 @@ fn served_announcements_carry_each_call_and_the_denials_so_far() {
     assert_eq!(calls[0]["gates"], json!(["manual"]));
     assert_eq!(
         calls[0]["denials"],
-        json!({"manual":{"in_row":0,"in_turn":0}})
+        json!({"manual":{"in_row":0,"recent":0}})
     );
     // Each call is as `approvals` lists it.
     let listed = db.approvals(None, Some("manual"), 0, None, 64).unwrap();
@@ -1428,6 +1436,7 @@ fn served_announcements_carry_each_call_and_the_denials_so_far() {
         request: 1,
         tag: None,
         allow: false,
+        unreviewed: false,
         reason: Some("not that"),
         by: Some("test"),
     })
@@ -1448,7 +1457,7 @@ fn served_announcements_carry_each_call_and_the_denials_so_far() {
     );
     assert_eq!(
         calls[0]["denials"],
-        json!({"manual":{"in_row":1,"in_turn":1}})
+        json!({"manual":{"in_row":1,"recent":1}})
     );
     // A call every gate allowed ends the run of denials; the turn's count
     // stays, and a later turn starts from none.
@@ -1459,6 +1468,7 @@ fn served_announcements_carry_each_call_and_the_denials_so_far() {
         request: 2,
         tag: None,
         allow: true,
+        unreviewed: false,
         reason: None,
         by: Some("test"),
     })
@@ -1471,7 +1481,7 @@ fn served_announcements_carry_each_call_and_the_denials_so_far() {
     assert_eq!(
         (
             denials["manual"].in_row,
-            denials["manual"].in_turn,
+            denials["manual"].window.count_ones(),
             denials["manual"].turn
         ),
         (0, 1, turn)
@@ -1512,7 +1522,7 @@ fn served_announcements_carry_each_call_and_the_denials_so_far() {
     assert_eq!(listed.len(), 1);
     assert_eq!(
         listed[0]["denials"],
-        json!({"manual":{"in_row":0,"in_turn":0}}),
+        json!({"manual":{"in_row":0,"recent":0}}),
         "a denial in an earlier turn is none in this one"
     );
 }
@@ -1531,6 +1541,7 @@ fn a_gate_hands_a_call_to_a_person_who_then_decides_it() {
         request: 1,
         tag: None,
         allow: false,
+        unreviewed: false,
         reason,
         by: Some("approver"),
     };
@@ -1631,6 +1642,7 @@ fn each_gate_keeps_its_own_handoff_to_a_person() {
         request: 1,
         tag: Some(tag),
         allow,
+        unreviewed: false,
         reason: Some("doubted"),
         by: Some("approver"),
     };
@@ -1691,6 +1703,7 @@ fn schema_49_waiting_calls_were_not_handed_to_anyone() {
         request: 1,
         tag: None,
         allow: false,
+        unreviewed: false,
         reason: None,
         by: Some("approver"),
     })
@@ -1715,6 +1728,7 @@ fn a_new_turn_starts_its_denials_from_none() {
             request: 1,
             tag: None,
             allow: false,
+            unreviewed: false,
             reason: Some("not that"),
             by: Some("test"),
         })
@@ -1731,7 +1745,10 @@ fn a_new_turn_starts_its_denials_from_none() {
     }
     let denials = db.inspect("Bob").unwrap().denials;
     assert_eq!(
-        (denials["manual"].in_row, denials["manual"].in_turn),
+        (
+            denials["manual"].in_row,
+            denials["manual"].window.count_ones()
+        ),
         (4, 4)
     );
     db.finish(first, None).unwrap();
@@ -1754,7 +1771,7 @@ fn a_new_turn_starts_its_denials_from_none() {
     let listed = db.approvals(None, Some("manual"), 0, None, 64).unwrap();
     assert_eq!(
         listed["approvals"][0]["denials"],
-        json!({"manual":{"in_row":0,"in_turn":0}})
+        json!({"manual":{"in_row":0,"recent":0}})
     );
     allow(&mut db, next, "n0").unwrap();
     assert!(matches!(
@@ -1766,11 +1783,54 @@ fn a_new_turn_starts_its_denials_from_none() {
     assert_eq!(
         (
             denials["manual"].in_row,
-            denials["manual"].in_turn,
+            denials["manual"].window.count_ones(),
             denials["manual"].turn
         ),
         (1, 1, next)
     );
+}
+
+#[test]
+fn an_unreviewed_denial_counts_nothing_and_old_denials_leave_the_window() {
+    let mut db = db();
+    let turn = gated_turn(&mut db, None);
+    let decide = |db: &mut Database, n: usize, allow: bool, unreviewed: bool| {
+        let (item, call) = shell_call(&format!("fc_{n}"), &format!("s{n}"), "make");
+        db.append(turn, vec![item], std::slice::from_ref(&call), None)
+            .unwrap();
+        db.answer(Decision {
+            bot: "Bob",
+            turn,
+            call_id: &call.call_id,
+            request: 1,
+            tag: None,
+            allow,
+            unreviewed,
+            reason: (!allow).then_some("no"),
+            by: Some("test"),
+        })
+        .unwrap();
+        db.approval_start(turn, &call, 0).unwrap();
+    };
+    decide(&mut db, 0, false, false);
+    decide(&mut db, 1, false, false);
+    // A review that failed is denied without counting.
+    decide(&mut db, 2, false, true);
+    let denials = db.inspect("Bob").unwrap().denials;
+    assert_eq!(
+        (
+            denials["manual"].in_row,
+            denials["manual"].window.count_ones()
+        ),
+        (2, 2)
+    );
+    // Allowed calls end the run, and once the window holds no denial the
+    // count is gone and allowed calls write nothing.
+    for n in 3..3 + agent_runtime::store::DENIAL_WINDOW as usize {
+        decide(&mut db, n, true, false);
+    }
+    let denials = db.inspect("Bob").unwrap().denials;
+    assert!(!denials.contains_key("manual"), "{denials:?}");
 }
 
 #[test]
@@ -11073,6 +11133,7 @@ fn a_denied_call_closes_its_round() {
         request: 1,
         tag: None,
         allow: false,
+        unreviewed: false,
         reason: Some("no"),
         by: Some("test"),
     })
@@ -11100,6 +11161,7 @@ fn a_refused_call_is_read_after_the_words_it_came_after() {
             request: 1,
             tag: None,
             allow: false,
+            unreviewed: false,
             reason: Some("no"),
             by: Some("test"),
         })

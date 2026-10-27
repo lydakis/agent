@@ -133,23 +133,32 @@ pub struct Bot {
     pub expires_at: Option<i64>,
 }
 /// A bot's denials under one gate tag in the turn that gave the last: how
-/// many in a row, reset when a call every gate allowed starts, and how many
-/// in all. A new turn starts both from none, so a breaker that ended one
-/// turn never refuses the next.
+/// many in a row, reset when a call every gate allowed starts, and which of
+/// the turn's last `DENIAL_WINDOW` decided calls were denied, as Codex's
+/// breaker counts them. A new turn starts both from none, so a breaker that
+/// ended one turn never refuses the next.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct Denials {
     pub in_row: u32,
-    pub in_turn: u32,
+    /// The turn's last decided calls as bits, the newest lowest, set for a
+    /// denial.
+    #[serde(default)]
+    pub window: u64,
     pub turn: i64,
 }
+/// How many of a turn's latest decided calls `Denials::window` keeps.
+pub const DENIAL_WINDOW: u32 = 50;
 impl Denials {
     /// The counts as a client sees them from `turn`: a denial in another
     /// turn is none in this one.
     fn seen(&self, turn: i64) -> Value {
         match self.turn == turn {
-            true => json!({"in_row":self.in_row,"in_turn":self.in_turn}),
-            false => json!({"in_row":0,"in_turn":0}),
+            true => json!({"in_row":self.in_row,"recent":self.window.count_ones()}),
+            false => json!({"in_row":0,"recent":0}),
         }
+    }
+    fn push(&mut self, denied: bool) {
+        self.window = ((self.window << 1) | u64::from(denied)) & ((1 << DENIAL_WINDOW) - 1);
     }
 }
 /// What a bot chose at creation about its model context, its history and
@@ -669,6 +678,10 @@ struct Kind {
 struct Verdict {
     tag: String,
     allow: bool,
+    /// A deny nobody assessed (the review failed): it counts toward no
+    /// breaker.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    unreviewed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -818,6 +831,8 @@ pub struct Decision<'a> {
     pub request: i64,
     pub tag: Option<&'a str>,
     pub allow: bool,
+    /// A deny nobody assessed: it counts toward no breaker.
+    pub unreviewed: bool,
     pub reason: Option<&'a str>,
     pub by: Option<&'a str>,
 }
@@ -5066,7 +5081,9 @@ impl Database {
             // As after a failure, a lapse already due keeps its request.
             let reannounce_rest = !(expiring(&bot) && self.lapsed(turn, now_ms)?);
             let tx = self.conn.savepoint()?;
-            count_denials(&tx, &mut bot, turn, &[denial.tag.as_str()], true)?;
+            if !denial.unreviewed {
+                count_denials(&tx, &mut bot, turn, &[denial.tag.as_str()], true)?;
+            }
             deny(
                 &tx,
                 &bot,
@@ -5356,6 +5373,7 @@ impl Database {
         let verdict = Verdict {
             tag: tag.clone(),
             allow: answer.allow,
+            unreviewed: answer.unreviewed,
             reason: answer.reason.map(str::to_owned),
             by: answer.by.map(str::to_owned),
             at_ms,
@@ -7774,8 +7792,9 @@ fn deny(
 }
 /// Count a denial under each of `tags`, or end their runs of denials when
 /// a call they allowed starts. A denial in a new turn starts both counts
-/// over. The bot's row is written only when a count
-/// changes, so a bot that is never denied writes nothing.
+/// over. Allowed calls are kept only while a denial is among the turn's
+/// last ones, and the bot's row is written only when a count changes, so a
+/// bot that is never denied writes nothing.
 fn count_denials(
     tx: &Connection,
     bot: &mut Bot,
@@ -7793,13 +7812,15 @@ fn count_denials(
                     ..Denials::default()
                 };
             }
-            counts.in_turn = counts.in_turn.saturating_add(1);
             counts.in_row = counts.in_row.saturating_add(1);
+            counts.push(true);
             changed = true;
-        } else if let Some(counts) = bot.denials.get_mut(*tag)
-            && counts.in_row > 0
-        {
+        } else if let Some(counts) = bot.denials.get_mut(*tag) {
             counts.in_row = 0;
+            counts.push(false);
+            if counts.turn != turn || counts.window == 0 {
+                bot.denials.remove(*tag);
+            }
             changed = true;
         }
     }
