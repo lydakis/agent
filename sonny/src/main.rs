@@ -891,6 +891,9 @@ struct App {
     choosing: Option<usize>,
     /// The mode picked, set once no turn runs.
     gating: Option<&'static str>,
+    /// The mode picked, still to give the agents the lead made: one busy
+    /// now takes it once idle.
+    spread: Option<&'static str>,
     /// The newest reply's text, for `/copy`.
     last_reply: String,
 }
@@ -1395,6 +1398,7 @@ impl App {
             mode: approvals::mode(record),
             choosing: None,
             gating: approvals::refresh(record),
+            spread: None,
             last_reply: String::new(),
         }
     }
@@ -1530,6 +1534,7 @@ impl App {
     /// for the turn to end, or when the daemon refused it (the notice says
     /// why).
     async fn configure(&mut self) -> bool {
+        self.spread().await;
         if self.instruct.is_none() && self.switch.is_none() && self.gating.is_none() {
             return true;
         }
@@ -1592,6 +1597,50 @@ impl App {
             }
         }
         true
+    }
+
+    /// Give the mode picked with `/approvals` to every agent the lead made,
+    /// and those they made: the person's pick overrides the gate each was
+    /// made with. One that is busy is tried again at the next chance.
+    async fn spread(&mut self) {
+        let Some(mode) = self.spread else {
+            return;
+        };
+        let mut bots = Vec::new();
+        let mut after = json!("");
+        loop {
+            let Ok(page) = self
+                .client
+                .request("bots", json!({"after": after, "limit": 256}))
+                .await
+            else {
+                return;
+            };
+            bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
+            match &page["next_after"] {
+                Value::Null => break,
+                next => after = next.clone(),
+            }
+        }
+        let mut busy = false;
+        for bot in approvals::made_by(&bots, &self.bot) {
+            let Some(fields) = approvals::regate(bot, mode) else {
+                continue;
+            };
+            let mut asked = Value::Object(fields);
+            asked["bot"] = bot["name"].clone();
+            match self.client.request("configure", asked).await {
+                Ok(_) => {}
+                Err(error) if error.code == "bot_busy" => busy = true,
+                Err(error) => {
+                    let name = bot["name"].as_str().unwrap_or_default();
+                    self.notice = Some(format!("{name}'s approvals: {error}"));
+                }
+            }
+        }
+        if !busy {
+            self.spread = None;
+        }
     }
 
     /// What the footer and pickers show of the bot, from its record.
@@ -2602,6 +2651,9 @@ impl App {
                     KeyCode::Enter => {
                         let mode = approvals::MODES[*pick].0;
                         self.choosing = None;
+                        // The agents the lead made take it too, even when
+                        // the lead has it already.
+                        self.spread = Some(mode);
                         if self.mode != Some(mode) {
                             self.gating = Some(mode);
                             self.configure().await;

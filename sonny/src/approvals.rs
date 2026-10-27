@@ -1,7 +1,8 @@
 //! `/approvals`: whether the lead's tool calls wait for a verdict, and
 //! whose. Sonny's names for the CLI's modes: `auto` is a judge model,
 //! `ask` is the person here (the CLI's `manual`), `full` runs everything.
-//! Agents the lead makes keep the gate it had when it made them.
+//! Agents the lead makes keep the gate it had when it made them, until
+//! the person picks a mode: it overrides what every one was made with.
 use agent_client::approver::{AUTO_UNGATED, UNGATED};
 use serde_json::{Map, Value, json};
 
@@ -66,6 +67,43 @@ pub fn gate(mode: &str, tools: &[String]) -> Map<String, Value> {
     }
 }
 
+/// The agents `lead` made, and those they made, from a `bots` listing.
+pub fn made_by<'a>(bots: &'a [Value], lead: &str) -> Vec<&'a Value> {
+    let mut makers = vec![lead];
+    let mut made = Vec::new();
+    while let Some(maker) = makers.pop() {
+        for bot in bots.iter().filter(|bot| bot["created_by"] == maker) {
+            if let Some(name) = bot["name"].as_str()
+                && name != lead
+                && !made.iter().any(|seen: &&Value| seen["name"] == name)
+            {
+                made.push(bot);
+                makers.push(name);
+            }
+        }
+    }
+    made
+}
+
+/// The `configure` fields that give a bot `mode`, or `None` when it has
+/// that mode already, as `gate` would make it now.
+pub fn regate(record: &Value, mode: &str) -> Option<Map<String, Value>> {
+    let tools: Vec<String> = record["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    let fields = gate(mode, &tools);
+    let ungated = fields["approve"].as_array().is_some_and(Vec::is_empty);
+    let has = match ungated {
+        true => self::mode(record) == Some("full"),
+        false => self::mode(record) == Some(mode) && refresh(record).is_none(),
+    };
+    (!has).then_some(fields)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,5 +142,33 @@ mod tests {
         assert_eq!(refresh(&reads), Some("auto"));
         assert_eq!(mode(&json!({"gates": null})), Some("full"));
         assert_eq!(mode(&json!({"gates": [{"tag": "ci"}]})), None);
+    }
+
+    #[test]
+    fn a_picked_mode_reaches_every_agent_the_lead_made() {
+        let bot = |name: &str, by: Option<&str>, gates: Value| json!({"name": name, "created_by": by, "tools": ["shell", "read"], "gates": gates});
+        let auto = json!([{"tag": "auto", "tools": ["shell"]}]);
+        let bots = [
+            bot("lead", None, auto.clone()),
+            bot("task", Some("lead"), auto.clone()),
+            bot(
+                "helper",
+                Some("task"),
+                json!([{"tag": "ci", "tools": ["shell"]}]),
+            ),
+            bot("other", Some("someone"), auto.clone()),
+            bot("loop", Some("loop"), auto.clone()),
+        ];
+        let names: Vec<_> = made_by(&bots, "lead").iter().map(|b| &b["name"]).collect();
+        assert_eq!(names, [&json!("task"), &json!("helper")]);
+        // Each takes the mode unless it has it already; a gate Sonny did
+        // not set is replaced too.
+        assert_eq!(regate(&bots[1], "full"), Some(gate("full", &[])));
+        assert_eq!(regate(&bots[1], "auto"), None);
+        assert!(regate(&bots[2], "auto").is_some());
+        // Nothing to gate: already as `full` leaves it.
+        let reader = json!({"name": "r", "tools": ["read"], "gates": []});
+        assert_eq!(regate(&reader, "auto"), None);
+        assert!(regate(&reader, "ask").is_some());
     }
 }

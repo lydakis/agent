@@ -1339,7 +1339,8 @@ Dropped with the rules on 2026-09-27:
 Settled by George on 2026-10-26, after a day on Sonny: `auto` allows
 almost everything and stops only what is likely dangerous and plainly
 unasked; otherwise he runs at full access. A person's `/approvals`
-override replaces any bot's gates, including one another bot made.
+override replaces any bot's gates, including one another bot made; in
+Sonny it reaches every agent the lead made, and those they made.
 
 Settled by George on 2026-09-27: `auto` is a model deciding every gated
 call, with no rules; a rules-only approver is manual mode, and rules for

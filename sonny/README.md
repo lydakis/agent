@@ -58,8 +58,9 @@ commands:
   leaves ones set any other way alone.
 - `/approvals` picks whether calls wait for a verdict: `auto`, a judge
   model (a new lead starts here, and Sonny starts `agent approver` when
-  nothing serves it), `ask`, you, or `full`, none. Tasks the lead makes keep
-  the gate it had.
+  nothing serves it), `ask`, you, or `full`, none. Tasks the lead makes take
+  the gate it had; a pick reaches every agent the lead made too, one busy
+  now once it is idle.
 - `/status` shows the project's agents, and its running Errand jobs.
 - `/copies` (or `--copies worktree|sandfs`) picks how the lead's tasks get
   their own copy of the folder: git worktrees (the default), or
