@@ -7,10 +7,11 @@
 //! save that would pass that is refused until facts are merged or removed.
 //! The daemon knows nothing of memory.
 //!
-//! `~/.agent/memory`, a script the app writes, shows the indexes and saves,
-//! removes, indexes and checks facts; the `memory` skill the app ships says what to save.
-//! `schedule` adds a nightly trigger whose agent follows the `memory-cleanup`
-//! skill between `cleanup start` and `cleanup finish`, which commit to a local
+//! `~/.agent/memory`, a script Sonny writes, shows the indexes and saves,
+//! removes, indexes and checks facts; the `memory` skill Sonny installs says
+//! what to save. `schedule` adds a nightly trigger, through
+//! `~/.agent/trigger`, whose agent follows the `memory-cleanup` skill
+//! between `cleanup start` and `cleanup finish`, which commit to a local
 //! git repository in `~/.agents/memory` and revert a cleanup that removed too
 //! many facts; `changed` gates the trigger so a quiet night costs no turn.
 use serde_json::{Value, json};
@@ -19,7 +20,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const FLAG: &str = "--memory";
 /// A fact file, front matter included, and a folder's index: each at most
 /// this. Small on purpose, like Hermes' and Claude Code's memory indexes.
 const LIMIT: usize = 4096;
@@ -30,8 +30,8 @@ const INDEX: &str = "MEMORY.md";
 const TYPES: [&str; 4] = ["user", "feedback", "project", "reference"];
 const USAGE: &str = "usage: memory show [SCOPE]\n       memory save NAME --type user|feedback|project|reference --description TEXT --source TEXT [SCOPE] -- TEXT|-\n       memory rm NAME [SCOPE]\n       memory index [SCOPE]\n       memory check [SCOPE]\n       memory changed | cleanup start | cleanup finish\n       memory schedule [--model PROVIDER/MODEL [--effort LEVEL]] [--cron 'MIN HOUR DAY MONTH WEEKDAY']\n         --model starts the memory-cleanup agent; without it, the existing one\n         SCOPE: --user | --project NAME; none: the project of this folder";
 
-/// `APP --memory show|save|rm|index|check|changed|cleanup|schedule`, from
-/// `~/.agent/memory`.
+/// `memory show|save|rm|index|check|changed|cleanup|schedule`, as
+/// `~/.agent/memory` runs it.
 pub fn cli(args: &[String]) -> i32 {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let cwd = std::env::current_dir().ok();
@@ -204,7 +204,7 @@ fn run(
 /// finds it: the nearest `.agents/project.toml`, looked up from a task's
 /// worktree at the same place in the repository's main checkout.
 fn project_of(cwd: &Path) -> Result<String, String> {
-    match agent_client::policy::project(cwd) {
+    match crate::policy::project(cwd) {
         Ok(Some(name)) => Ok(name),
         Ok(None) => Err(format!(
             "project_unknown: {}: no .agents/project.toml at or above this folder; pass --project NAME or --user",
@@ -219,8 +219,18 @@ fn today() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
-    let day = crate::trigger::local(now);
-    format!("{:04}-{:02}-{:02}", day.year, day.month, day.day)
+    // SAFETY: localtime_r fills the zeroed struct it is given and nothing else.
+    let day = unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&(now as libc::time_t), &mut tm);
+        tm
+    };
+    format!(
+        "{:04}-{:02}-{:02}",
+        day.tm_year + 1900,
+        day.tm_mon + 1,
+        day.tm_mday
+    )
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -343,7 +353,7 @@ fn lock(dir: &Path) -> Result<std::fs::File, String> {
 }
 
 fn write(path: &Path, text: &str) -> Result<(), String> {
-    crate::trigger::replace_mode(path, text.as_bytes(), 0o600)
+    crate::files::replace_mode(path, text.as_bytes(), 0o600)
         .map_err(|e| format!("memory_failed: {e}"))
 }
 
@@ -785,7 +795,7 @@ fn schedule(home: &Path, args: &[String]) -> Result<Value, String> {
     repo(&root)?;
     std::env::set_current_dir(&root)
         .map_err(|e| format!("memory_failed: {}: {e}", root.display()))?;
-    crate::trigger::add_here(&add).map_err(|error| match error.split_once(':') {
+    add_trigger(&home.join(".agent/trigger"), &add).map_err(|error| match error.split_once(':') {
         Some(("bot_exists", _)) => format!(
             "bot_exists: {AGENT} is an agent already: schedule without --model to keep it, or remove it with agent rm --bot {AGENT} to start it on another model"
         ),
@@ -793,6 +803,35 @@ fn schedule(home: &Path, args: &[String]) -> Result<Value, String> {
             "bot_not_found: there is no {AGENT} agent yet: schedule with --model to start one"
         ),
         _ => error,
+    })
+}
+
+/// `~/.agent/trigger add ARGS`, run in this folder with this shell's
+/// daemon and agent: its JSON line, or its error as `CODE: detail`.
+fn add_trigger(script: &Path, args: &[String]) -> Result<Value, String> {
+    if !script.is_file() {
+        return Err(format!(
+            "triggers_unsupported: {} is not there to add the nightly cleanup",
+            script.display()
+        ));
+    }
+    let out = std::process::Command::new(script)
+        .arg("add")
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("memory_failed: {}: {e}", script.display()))?;
+    if out.status.success() {
+        return serde_json::from_slice(&out.stdout)
+            .map_err(|e| format!("memory_failed: {}: {e}", script.display()));
+    }
+    let error: Value = serde_json::from_slice(&out.stderr).unwrap_or_default();
+    Err(match (error["error"].as_str(), error["detail"].as_str()) {
+        (Some(code), Some(detail)) => format!("{code}: {detail}"),
+        _ => format!(
+            "trigger_failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
     })
 }
 
@@ -853,10 +892,9 @@ pub fn view(root: &Path, project: Option<&str>) -> Value {
     json!({"user": scope(root.to_path_buf(), None), "projects": listed, "more": more})
 }
 
-/// `~/.agent/memory`, written again whenever the app starts from
-/// somewhere else.
-pub fn write_script(state: &Path, app: &Path) -> Result<(), String> {
-    crate::trigger::write_runner(&state.join("memory"), USAGE, app, FLAG)
+/// What `~/.agent/memory` says it takes.
+pub fn usage() -> &'static str {
+    USAGE
 }
 
 #[cfg(test)]
@@ -1407,32 +1445,5 @@ mod tests {
         ] {
             assert!(line(bad).unwrap_err().starts_with("usage: "), "{bad:?}");
         }
-    }
-
-    #[test]
-    fn the_script_runs_the_app_with_the_memory_flag() {
-        let state = temp("script");
-        write_script(
-            &state,
-            Path::new("/Apps/Agent's.app/Contents/MacOS/agent-app"),
-        )
-        .unwrap();
-        let text = std::fs::read_to_string(state.join("memory")).unwrap();
-        assert!(
-            text.starts_with("#!/bin/sh\n# usage: memory show [SCOPE]\n#        memory save NAME")
-        );
-        assert!(text.ends_with(
-            "\nexec '/Apps/Agent'\\''s.app/Contents/MacOS/agent-app' --memory \"$@\"\n"
-        ));
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            std::fs::metadata(state.join("memory"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o755
-        );
-        std::fs::remove_dir_all(state).unwrap();
     }
 }

@@ -1,7 +1,7 @@
 //! Shell commands Sonny knows the meaning of, said as what they do: an
 //! `agent` call starts, messages, waits on or removes an agent; a `rex` call
 //! opens, reads or types into a window; an `errand` call runs a command on
-//! another machine or acts on its job; the app's memory and trigger
+//! another machine or acts on its job; Sonny's memory and the trigger
 //! scripts save facts and schedule jobs; the plan skill sets the plan. A
 //! command line is read a command at a time; a pipe is said with its
 //! command and what came out of it.
@@ -87,6 +87,9 @@ pub fn said(command: &str, output: &str, failed: bool) -> Option<Said> {
             output: None,
         }),
         "plan" if program.contains("skills/plan") => plan(args),
+        "sonny" if args.first().is_some_and(|a| a == "agent") => {
+            agent(&args[1..], stdin, printed, failed)
+        }
         "sonny" if args.first().is_some_and(|a| a == "show") => sonny_show(&args[1..], failed),
         "sonny" if args.first().is_some_and(|a| a == "split") => sonny_split(&args[1..], failed),
         "sonny" if args.first().is_some_and(|a| a == "ask") => sonny_ask(&args[1..], failed),

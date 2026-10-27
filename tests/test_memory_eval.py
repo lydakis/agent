@@ -33,9 +33,9 @@ class PlumbingTests(unittest.TestCase):
 
     def setUp(self):
         self.binary = ROOT / '.local/target/release/agent'
-        self.app = Path(os.environ.get('AGENT_TEST_APP', ROOT / '.local/target/release/agent-app'))
+        self.app = Path(os.environ.get('AGENT_TEST_SONNY', ROOT / '.local/target/release/sonny'))
         if not self.app.exists():
-            self.skipTest(f'{memory_eval.BUILD}, or set AGENT_TEST_APP')
+            self.skipTest(f'{memory_eval.BUILD}, or set AGENT_TEST_SONNY')
         self.seen = []
         lock = threading.Lock()
         reply = synthetic_model.Model.reply

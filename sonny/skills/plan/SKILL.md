@@ -5,9 +5,9 @@ description: Keep your plan where the person sees it, for any task of three or m
 
 # Your plan
 
-The app shows your plan beside your name: how many steps are done, the step
-you are on, and the whole list at the top of your chat. Keep it current, so
-the person can see where you are without asking.
+The person sees your plan as you set it: how many steps are done, the step
+you are on, and the whole list. Keep it current, so the person can see where
+you are without asking.
 
 Write the whole plan in one call, one argument a step, each starting with
 `[x] ` (done), `[>] ` (doing now) or `[ ] ` (to do):
