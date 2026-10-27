@@ -86,6 +86,9 @@ const REACTABLE: usize = 9;
 /// How much of a reply's first line a reaction quotes.
 const QUOTED: usize = 72;
 
+/// Draws in a row that may fail before the client gives up on its
+/// terminal: each failed cursor query waits up to 2 s, so about a minute.
+const DRAW_ATTEMPTS: u32 = 30;
 /// How much history is shown on attach.
 const HISTORY_ITEMS: u64 = 200;
 /// How long a side chat's copy stays once idle.
@@ -1616,6 +1619,15 @@ impl Fleet {
             .unwrap_or(bot)
     }
 
+    /// The bot as the person tells it apart from every other project's:
+    /// the lead by its project, as `shop lead`, a task by its own name.
+    fn named(&self, bot: &str) -> String {
+        match bot == self.lead {
+            true => format!("{} lead", self.project),
+            false => self.short(bot).to_owned(),
+        }
+    }
+
     /// Note what the bot is doing, and name the windows after it.
     fn doing(&mut self, bot: &str, doing: &'static str) {
         if self.doing.get(bot) != Some(&doing) {
@@ -1637,7 +1649,7 @@ impl Fleet {
 
     /// Each window holding the project's bots is named after the lead, or
     /// its first bot, and what that bot is doing, with a count of the others
-    /// that are working or need the person: `lead · done · 2 working`. A
+    /// that are working or need the person: `shop lead · done · 2 working`. A
     /// window that also holds the person's own blocks, as when Sonny was
     /// opened beside them, keeps the name they gave it.
     fn name_windows(&mut self) {
@@ -1657,7 +1669,7 @@ impl Fleet {
             else {
                 continue;
             };
-            let mut name = format!("{} · {}", self.short(first), self.doing[first]);
+            let mut name = format!("{} · {}", self.named(first), self.doing[first]);
             for state in ["needs you", "working"] {
                 let others = bots
                     .iter()
@@ -1921,6 +1933,8 @@ impl App {
                     std::thread::sleep(Duration::from_millis(50));
                     continue;
                 }
+                // A read that fails, as one can while the Mac wakes, is
+                // tried again rather than leaving the client deaf to keys.
                 match event::poll(Duration::from_millis(50)) {
                     Ok(false) => {}
                     Ok(true) => match event::read() {
@@ -1929,15 +1943,23 @@ impl App {
                                 break;
                             }
                         }
-                        Err(_) => break,
+                        Err(_) => std::thread::sleep(Duration::from_millis(100)),
                     },
-                    Err(_) => break,
+                    Err(_) => std::thread::sleep(Duration::from_millis(100)),
                 }
             }
         });
         let mut tick = tokio::time::interval(Duration::from_millis(100));
+        // A terminal waking with the Mac can be slow to answer the cursor
+        // query a resize makes, and a draw then fails; the next tick draws
+        // again, and only a terminal that keeps failing ends the client.
+        let mut failed_draws = 0;
         loop {
-            self.draw(terminal).map_err(|e| e.to_string())?;
+            match self.draw(terminal) {
+                Ok(()) => failed_draws = 0,
+                Err(_) if failed_draws < DRAW_ATTEMPTS => failed_draws += 1,
+                Err(error) => return Err(error.to_string()),
+            }
             if self.quit {
                 return Ok(());
             }
@@ -4758,11 +4780,16 @@ impl App {
     /// cursor's row.
     fn composer(&self, width: usize) -> (Vec<Line<'static>>, (usize, usize)) {
         if self.input.is_empty() {
+            // Named, so a message typed in the wrong pane is caught first.
+            let name = match &self.project {
+                Some(project) => format!("{project} lead"),
+                None => self.bot.clone(),
+            };
             let hint = match self.running {
-                _ if !self.asks.is_empty() && !self.chatting => "Answer, or Esc to chat",
-                _ if self.react_to.is_some() => "An emoji for that reply, or Esc",
-                Some(_) => "Steer the running turn",
-                None => "Ask anything",
+                _ if !self.asks.is_empty() && !self.chatting => "Answer, or Esc to chat".into(),
+                _ if self.react_to.is_some() => "An emoji for that reply, or Esc".into(),
+                Some(_) => format!("Steer {name}"),
+                None => format!("Message {name}"),
             };
             return (
                 vec![Line::from(vec![

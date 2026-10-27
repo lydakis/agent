@@ -484,7 +484,10 @@ pub fn cli(args: &[String]) -> i32 {
                 let (client, _events) = Client::connect(&socket)
                     .await
                     .map_err(|e| format!("{}: {}", e.code, e.detail.unwrap_or_default()))?;
-                let made = make(&client, &dir, &role(&dir)?, &picks).await;
+                let mut made = make(&client, &dir, &role(&dir)?, &picks).await;
+                if let Ok(made) = &mut made {
+                    open_new_lead(&client, &socket, made).await;
+                }
                 client.close().await;
                 made
             })
@@ -499,6 +502,27 @@ pub fn cli(args: &[String]) -> i32 {
             eprintln!("{}", error_json(&error));
             1
         }
+    }
+}
+
+/// A lead made from another agent's shell opens in a home of its own, a
+/// Herdr workspace or a Rex session beside the caller's, as the person
+/// would otherwise ask; `opened_in` says where, or `not_opened` why not.
+async fn open_new_lead(client: &Client, socket: &Path, made: &mut Value) {
+    let (Ok(caller), Some(project)) = (std::env::var("AGENT_BOT"), made["project"].as_str()) else {
+        return;
+    };
+    if made["created"] != true {
+        return;
+    }
+    let like = crate::project_of(client, &caller).await;
+    let store = std::env::var_os("AGENT_STORE").map(PathBuf::from);
+    let opened = std::env::current_exe()
+        .map_err(|e| e.to_string())
+        .and_then(|me| crate::open_lead(socket, store.as_deref(), project, &like, None, &me));
+    match opened {
+        Ok((home, _)) => made["opened_in"] = json!(home),
+        Err(error) => made["not_opened"] = json!(error),
     }
 }
 
