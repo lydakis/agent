@@ -137,6 +137,22 @@ left behind is deleted by the daemon after a minute idle. `off` judges nothing, 
 judge whose account is out of quota stops judging until the lookout
 restarts.
 
+`lead` judges with a fork of the lead itself, which reads the lead's whole
+conversation: the fork has no tools, is told the check comes from the
+lookout, answers the same questions in one JSON object, and is deleted once
+it answers. It is slow (it reads everything the lead has) and costs what the
+lead's model costs, so it is for comparing judges, not a default. `SPEC+lead`
+gives any other judge the lead's last dozen messages and commands as a
+`lead` field beside the event.
+
 `sonny lookout --replay --judge SPEC[,SPEC]... [--limit N]` runs the same
 checks over the store's retained history and prints each as a JSON line,
-waking no one; `bench/lookout_score.py` scores such a run against labels.
+waking no one; a `lead` judge forks each lead where it stood when the event
+happened. `bench/lookout_score.py` scores such a run against labels, by
+category, and scores each other judge as the first stage of a two-stage
+judge whose doubtful checks go on to the lead's fork.
+`bench/lookout_cases/run.sh OUT` builds a store of 26 small scripted
+projects, with 126 labelled checks (73 the lead should hear about, 24 of
+them a task drifting from what the person means), and replays and scores it
+with the decision model, the lead's fork, and the decision model reading
+the lead's words.
