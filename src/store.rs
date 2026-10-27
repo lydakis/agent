@@ -855,6 +855,7 @@ mod tests {
                             fallbacks: false,
                             gate: None,
                             settings: Default::default(),
+                            declared: None,
                             request_id: None,
                         },
                     )?;
@@ -1011,6 +1012,7 @@ mod tests {
                         fallbacks: false,
                         gate: None,
                         settings: Default::default(),
+                        declared: None,
                         request_id: None,
                     },
                 )?;
@@ -1167,6 +1169,7 @@ mod tests {
                         fallbacks: false,
                         gate: None,
                         settings: Default::default(),
+                        declared: None,
                         request_id: None,
                     },
                 )?;

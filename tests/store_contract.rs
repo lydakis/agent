@@ -6,7 +6,7 @@ use agent_runtime::{
         Answered, Binding, Bot, CacheTtl, CompactionPlan, ContextUsage, Database, Decision,
         Delivery, Fork, Gate, Gated, Planning, Settings, Strip, TurnBudget, TurnOptions, Wake,
     },
-    tools::Outcome,
+    tools::{Declared, Outcome},
 };
 use bytes::Bytes;
 use rusqlite::Connection;
@@ -49,6 +49,7 @@ fn binding() -> Binding<'static> {
         fallbacks: false,
         gate: None,
         settings: Default::default(),
+        declared: None,
         request_id: None,
     }
 }
@@ -2945,6 +2946,119 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
         assert_eq!(refused.code, "invalid_setting", "{settings:?}");
     }
     assert_eq!(db.inspect("Bad").unwrap_err().code, "bot_not_found");
+}
+
+#[test]
+fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them() {
+    let mut db = db();
+    let react = Declared {
+        name: "react".into(),
+        description: "React to a message.".into(),
+        parameters: json!({"type":"object","properties":{"emoji":{"type":"string"}}}),
+        result: "ok".into(),
+    };
+    let declared = [react.clone()];
+    let (lead, _) = db
+        .create(
+            "Lead",
+            Some("/synthetic"),
+            Binding {
+                declared: Some(&declared),
+                ..binding()
+            },
+        )
+        .unwrap();
+    assert_eq!(lead.declared, declared);
+    assert_eq!(
+        serde_json::to_value(&lead).unwrap()["declared"],
+        json!([{"name":"react","description":"React to a message.",
+            "parameters":{"type":"object","properties":{"emoji":{"type":"string"}}},"result":"ok"}])
+    );
+    // A bot the lead creates takes its tools unless its client declares others.
+    let child = |db: &mut Database, name: &str, declared: Option<&[Declared]>| {
+        let mut b = binding();
+        b.created_by = Some("Lead");
+        b.created_by_id = Some(lead.bot_id);
+        b.declared = declared;
+        db.create(name, Some("/synthetic"), b).unwrap().0
+    };
+    assert_eq!(child(&mut db, "Task", None).declared, declared);
+    assert!(child(&mut db, "Own", Some(&[])).declared.is_empty());
+    // A bot nobody created declares nothing it was not given.
+    let plain = db.create("Plain", Some("/synthetic"), binding()).unwrap().0;
+    assert!(plain.declared.is_empty() && !plain.may_call("react"));
+    // Declaring again says whether anything changed.
+    assert!(!db.set_declared("Lead", None, &declared).unwrap());
+    assert!(db.set_declared("Plain", None, &declared).unwrap());
+    assert!(db.inspect("Plain").unwrap().may_call("react"));
+    assert!(db.set_declared("Plain", None, &[]).unwrap());
+    assert!(db.inspect("Plain").unwrap().declared.is_empty());
+    // A fork keeps them, and its allowed list narrows them like the rest.
+    converse(&mut db, "Lead", 1);
+    let fork = db.fork("Lead", "Copy", Fork::default()).unwrap().0;
+    assert_eq!(fork.declared, declared);
+    assert!(fork.declared("react").is_some());
+    let only_read = ["read".to_owned()];
+    let narrowed = db
+        .fork(
+            "Lead",
+            "Reader",
+            Fork {
+                allow: Some(&only_read),
+                ..Fork::default()
+            },
+        )
+        .unwrap()
+        .0;
+    assert!(narrowed.declared("react").is_none() && !narrowed.may_call("react"));
+    let only_react = ["react".to_owned()];
+    let reacting = db
+        .fork(
+            "Lead",
+            "Reactor",
+            Fork {
+                allow: Some(&only_react),
+                ..Fork::default()
+            },
+        )
+        .unwrap()
+        .0;
+    assert!(reacting.declared("react").is_some() && !reacting.may_call("read"));
+    let missing = ["wave".to_owned()];
+    let refused = db
+        .fork(
+            "Lead",
+            "Waver",
+            Fork {
+                allow: Some(&missing),
+                ..Fork::default()
+            },
+        )
+        .unwrap_err();
+    assert_eq!(refused.code, "allow_not_in_source");
+}
+
+#[test]
+fn schema_52_bots_declare_no_tools() {
+    let path = std::env::temp_dir().join(format!("agent-declared-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    }
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE bots DROP COLUMN declared; PRAGMA user_version=52;")
+        .unwrap();
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert!(db.inspect("Bob").unwrap().declared.is_empty());
+    drop(db);
+    let version: i32 = Connection::open(&path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, Database::SCHEMA);
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]

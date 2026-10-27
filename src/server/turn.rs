@@ -1446,7 +1446,7 @@ impl Turn {
                 None => match summarizer.family() {
                     agent_runtime::codec::Family::Anthropic => (Body::Span(&plan, stripped), tools),
                     agent_runtime::codec::Family::Responses => {
-                        empty = self.registry.encoded(summarizer.family(), &[])?;
+                        empty = self.registry.encoded(summarizer.family(), &[], &[])?;
                         (Body::Span(&plan, stripped), &*empty)
                     }
                 },
@@ -1820,7 +1820,7 @@ impl Turn {
             + match family {
                 agent_runtime::codec::Family::Anthropic => tools.get().len(),
                 agent_runtime::codec::Family::Responses => {
-                    self.registry.encoded(family, &[])?.get().len()
+                    self.registry.encoded(family, &[], &[])?.get().len()
                 }
             })
     }
@@ -2013,7 +2013,9 @@ impl Turn {
         let mut model_rounds = context.model_rounds;
         let called = context.model.as_str();
         // This bot's tools, encoded once per distinct selection and shared.
-        let tools = self.registry.encoded(provider.family(), &record.tools)?;
+        let tools = self
+            .registry
+            .encoded(provider.family(), &record.tools, &record.declared)?;
         // A stub names the `read` call that returns its result, so only a
         // bot that has the tool elides.
         let elides = record.tools.iter().any(|tool| tool == "read");
@@ -3265,12 +3267,17 @@ impl Turn {
             // A tool failure is a result the model can act on. Only the
             // scheduler closing is a runtime failure. The bot's selection is
             // enforced here, not only by what the model was shown.
-            let prepared = if allowed.iter().any(|name| name == &call.name) {
+            let prepared = if let Some(tool) = record.declared(&call.name) {
+                agent_runtime::tools::check_declared(tool, &call.arguments)
+                    .map(|()| Prepared::Declared(tool.result.clone()))
+            } else if allowed.iter().any(|name| name == &call.name) {
                 self.registry.prepare(&call.name, &call.arguments)
             } else {
                 Err(Error::with("tool_not_available", call.name.as_str()))
             };
             let outcome = match prepared {
+                // A declared tool runs nothing: its meaning is its client's.
+                Ok(Prepared::Declared(result)) => Outcome::text(result),
                 Ok(Prepared::Wait {
                     handles,
                     timeout_ms,
@@ -4500,6 +4507,7 @@ mod tests {
                             fallbacks: false,
                             gate: None,
                             settings: Default::default(),
+                            declared: None,
                             request_id: None,
                         },
                     )?;

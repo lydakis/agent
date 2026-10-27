@@ -1438,6 +1438,51 @@ class RuntimeTests(ModelFixture):
         self.assertEqual(client.request('inspect', bot='Both')['result']['tools'], ['shell', 'echo'])
         self.assertEqual(client.request('stats')['result']['active_turns'], 0)
 
+    def test_a_declared_tool_is_shown_after_the_daemons_and_its_call_is_recorded_not_run(self):
+        client = self.client('echo')
+        react = {'name': 'react', 'description': 'React to a message.',
+                 'parameters': {'type': 'object', 'properties': {'emoji': {'type': 'string'}},
+                                'required': ['emoji'], 'additionalProperties': False}}
+        for declare, detail in [([dict(react, name='echo')], 'own'), ([react, react], 'twice'),
+                                ([dict(react, parameters={'type': 'string'})], 'object'),
+                                ([dict(react, name='a b')], 'name')]:
+            refused = client.request('create', bot='Bad', workspace=str(self.path), declare=declare)
+            self.assertEqual(refused['error'], 'invalid_declare', detail)
+        created = client.request('create', bot='Lead', workspace=str(self.path),
+                                 declare=[dict(react, result='Reacted.')])['result']
+        self.assertEqual([t['name'] for t in created['declared']], ['react'])
+        # One fitting call, one that is not: the first gets the fixed
+        # result at once, the second is refused, and neither runs a thing.
+        self.model.call_script = [('react', {'emoji': '👍'}), ('react', {'emoji': 1})]
+        turn = client.request('submit', bot='Lead', request_id='1', prompt='script')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        first = self.model.requests.get(timeout=3)
+        self.assertEqual([t['name'] for t in first['tools']], ['echo', 'react'])
+        self.assertEqual(first['tools'][1]['parameters'], react['parameters'])
+        events = client.request('events', bot='Lead', after=0, limit=64)['result']['events']
+        started = [e['data'] for e in events if e['event'] == 'tool_started']
+        self.assertEqual([(s['name'], json.loads(s['arguments'])) for s in started],
+                         [('react', {'emoji': '👍'}), ('react', {'emoji': 1})])
+        done = [e for e in events if e['event'] == 'tool_completed']
+        outputs = [node_item(client, 'Lead', d['data']['node'])['result']['output'] for d in done]
+        self.assertEqual(outputs[0], 'Reacted.')
+        self.assertEqual(json.loads(outputs[1])['error'], 'invalid_arguments')
+        # Declaring again replaces them, and the next request shows the new set.
+        configured = client.request('configure', bot='Lead', declare=[])['result']
+        self.assertIn('declared', configured['changed'])
+        self.assertNotIn('declared', client.request('inspect', bot='Lead')['result'])
+        # The script counts the calls already in history, so this is its third.
+        self.model.call_script = [None, None, ('react', {'emoji': '👍'})]
+        turn = client.request('submit', bot='Lead', request_id='2', prompt='script')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        while not self.model.requests.empty():
+            last = self.model.requests.get(timeout=3)
+        self.assertEqual([t['name'] for t in last['tools']], ['echo'])
+        events = client.request('events', bot='Lead', after=0, limit=128)['result']['events']
+        done = [e for e in events if e['event'] == 'tool_completed'][-1]
+        output = node_item(client, 'Lead', done['data']['node'])['result']['output']
+        self.assertEqual(json.loads(output)['error'], 'tool_not_available')
+
     def test_a_fork_calls_only_its_allowed_tools_and_keeps_its_sources_request(self):
         client = self.client('echo,shell')
         client.request('create', bot='Both', workspace=str(self.path), tools=['shell', 'echo'])

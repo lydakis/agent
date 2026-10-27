@@ -6,7 +6,7 @@ use crate::{
     codec::{Family, ToolSchema},
     fail, fail_with,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_json::value::RawValue;
 use std::{
@@ -125,11 +125,127 @@ impl Tool {
             ),
         };
         ToolSchema {
-            name: self.name(),
-            description,
+            name: self.name().into(),
+            description: description.into(),
             parameters,
         }
     }
+}
+
+/// A tool a client declares on a bot: shown to the model beside the
+/// daemon's own, never run. A call that fits its parameters is recorded
+/// with `result` at once; what it means is the client's, which reads the
+/// call from events and history.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Declared {
+    pub name: String,
+    pub description: String,
+    /// A JSON Schema object for the call's arguments.
+    pub parameters: serde_json::Value,
+    /// What the model reads as the call's result.
+    #[serde(default = "declared_result")]
+    pub result: String,
+}
+fn declared_result() -> String {
+    "ok".into()
+}
+/// The most tools a bot may have declared, and the most bytes they take.
+pub const MAX_DECLARED: usize = 16;
+pub const DECLARED_BYTES: usize = 64 * 1024;
+
+/// A bot's declared tools must be few, small, named apart from each other
+/// and from the daemon's own tools, and take an object of arguments.
+pub fn validate_declared(declared: &[Declared]) -> Result<()> {
+    if declared.len() > MAX_DECLARED {
+        return fail_with(
+            "invalid_declare",
+            format!("at most {MAX_DECLARED} declared tools"),
+        );
+    }
+    if serde_json::to_vec(declared)?.len() > DECLARED_BYTES {
+        return fail_with(
+            "invalid_declare",
+            format!("declared tools may take up to {DECLARED_BYTES} bytes"),
+        );
+    }
+    for (index, tool) in declared.iter().enumerate() {
+        let name = tool.name.as_str();
+        let named = !name.is_empty()
+            && name.len() <= 64
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        if !named {
+            return fail_with(
+                "invalid_declare",
+                format!("{name:?}: a name is 1 to 64 letters, digits, _ or -"),
+            );
+        }
+        if Tool::parse(name).is_some() {
+            return fail_with(
+                "invalid_declare",
+                format!("{name} is one of the daemon's own tools"),
+            );
+        }
+        if declared[..index].iter().any(|other| other.name == name) {
+            return fail_with("invalid_declare", format!("{name} is declared twice"));
+        }
+        if tool.parameters["type"] != "object" {
+            return fail_with(
+                "invalid_declare",
+                format!("{name}: parameters must be an object schema"),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A declared tool's call checked against its parameters, as far as the
+/// daemon looks: an object, with every required field, no field the
+/// schema closes out, and each listed field of its listed basic type.
+pub fn check_declared(tool: &Declared, arguments: &str) -> Result<()> {
+    let invalid = |detail: String| Error::with("invalid_arguments", detail);
+    let arguments: serde_json::Value = serde_json::from_str(arguments)
+        .map_err(|_| invalid(format!("{}: arguments are not JSON", tool.name)))?;
+    let fields = arguments
+        .as_object()
+        .ok_or_else(|| invalid(format!("{}: arguments are not an object", tool.name)))?;
+    let properties = tool.parameters["properties"].as_object();
+    for required in tool.parameters["required"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| r.as_str())
+    {
+        if !fields.contains_key(required) {
+            return Err(invalid(format!("{}: {required} is required", tool.name)));
+        }
+    }
+    for (field, value) in fields {
+        let Some(schema) = properties.and_then(|p| p.get(field)) else {
+            if tool.parameters["additionalProperties"] == false {
+                return Err(invalid(format!("{}: no field {field}", tool.name)));
+            }
+            continue;
+        };
+        let fits = match schema["type"].as_str() {
+            Some("string") => value.is_string(),
+            Some("integer") => value.is_i64() || value.is_u64(),
+            Some("number") => value.is_number(),
+            Some("boolean") => value.is_boolean(),
+            Some("array") => value.is_array(),
+            Some("object") => value.is_object(),
+            _ => true,
+        };
+        if !fits {
+            return Err(invalid(format!(
+                "{}: {field} must be {}",
+                tool.name, schema["type"]
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -248,6 +364,9 @@ pub enum Prepared {
         timeout_ms: Option<u64>,
         any: bool,
     },
+    /// A client's declared tool, whose call that fits gets this result.
+    /// Resolved by the runtime, never by the registry.
+    Declared(String),
     /// Recorded by the store with the call's result, so the note's version
     /// is the node of that result and forks bind to it by position.
     Note {
@@ -380,11 +499,21 @@ impl Registry {
         }
         Ok(())
     }
-    /// The request encoding of a bot's tools for one family, shared by every
-    /// bot with the same selection: definitions live once in the registry
-    /// and encodings once per distinct selection, never per bot or turn.
-    pub fn encoded(&self, family: Family, names: &[String]) -> Result<Arc<RawValue>> {
-        let key = (family, names.join(","));
+    /// The request encoding of a bot's tools for one family, its declared
+    /// tools after the daemon's, shared by every bot with the same
+    /// selection: definitions live once in the registry and encodings once
+    /// per distinct selection, never per bot or turn.
+    pub fn encoded(
+        &self,
+        family: Family,
+        names: &[String],
+        declared: &[Declared],
+    ) -> Result<Arc<RawValue>> {
+        let mut key = (family, names.join(","));
+        if !declared.is_empty() {
+            key.1.push('\0');
+            key.1.push_str(&serde_json::to_string(declared)?);
+        }
         if let Some(found) = self.encodings.lock().unwrap().get(&key) {
             return Ok(found.clone());
         }
@@ -393,6 +522,11 @@ impl Registry {
             .filter_map(|name| Tool::parse(name))
             .filter(|tool| self.tools.contains(tool))
             .map(Tool::schema)
+            .chain(declared.iter().map(|tool| ToolSchema {
+                name: tool.name.clone().into(),
+                description: tool.description.clone().into(),
+                parameters: tool.parameters.clone(),
+            }))
             .collect();
         let encoded: Arc<RawValue> = Arc::from(RawValue::from_string(serde_json::to_string(
             &family.tools(&schemas),
@@ -685,6 +819,7 @@ impl Registry {
             Prepared::Wait { .. } => fail("wait_requires_runtime"),
             Prepared::History { .. } => fail("history_requires_runtime"),
             Prepared::Note { .. } => fail("note_requires_runtime"),
+            Prepared::Declared(_) => fail("declared_requires_runtime"),
             Prepared::Shell {
                 command,
                 timeout_ms,
