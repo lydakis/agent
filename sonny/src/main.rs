@@ -19,6 +19,7 @@ mod html;
 mod image;
 mod js;
 mod links;
+mod login;
 mod lookout;
 mod math;
 mod mermaid;
@@ -292,11 +293,16 @@ fn installed_agent(me: &std::path::Path) -> Vec<PathBuf> {
     found
 }
 
-/// Agent's binary to run, with the provider keys the app keeps in
-/// ~/.agent/env over this shell's own, as the app starts it; an empty
-/// value unsets one.
+/// Agent's binary to run, with the provider keys kept in ~/.agent/env
+/// over this shell's own; an empty value unsets one.
 fn agent_command(bin: &std::path::Path) -> Result<std::process::Command, String> {
     let mut command = std::process::Command::new(bin);
+    apply_env_file(&mut command)?;
+    Ok(command)
+}
+
+/// `~/.agent/env` over `command`'s environment: an empty value unsets.
+fn apply_env_file(command: &mut std::process::Command) -> Result<(), String> {
     if let Some(file) = agent_client::env_file::path() {
         for (key, value) in agent_client::env_file::read(&file)? {
             match value.is_empty() {
@@ -305,7 +311,7 @@ fn agent_command(bin: &std::path::Path) -> Result<std::process::Command, String>
             };
         }
     }
-    Ok(command)
+    Ok(())
 }
 
 /// An `auto` gate needs an approver serving it: when none does, one is
@@ -390,19 +396,28 @@ async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events
     if let Ok(connected) = Client::connect(&options.socket).await {
         return Ok(connected);
     }
-    start_daemon(&options.store, &options.socket)?;
+    start_daemon(&options.store, &options.socket, false)?;
     Client::connect(&options.socket)
         .await
         .map_err(|e| e.to_string())
 }
 
 /// Start the daemon of `store` on `socket` the way the CLI starts it, and
-/// wait for it to be ready.
-fn start_daemon(store: &std::path::Path, socket: &std::path::Path) -> Result<(), String> {
+/// wait for it to be ready. With `login`, it gets the login shell's
+/// environment, for a start from launchd, which gives no provider keys.
+fn start_daemon(
+    store: &std::path::Path,
+    socket: &std::path::Path,
+    login: bool,
+) -> Result<(), String> {
     let bin = agent_bin().ok_or(
         "the daemon is not running and Agent's binary was not found; install Sonny with Homebrew, open Agent.app, or set AGENT_BIN",
     )?;
-    let mut command = agent_command(&bin)?;
+    let mut command = std::process::Command::new(&bin);
+    if let Some(environment) = login.then(login::environment).flatten() {
+        command.env_clear().envs(environment);
+    }
+    apply_env_file(&mut command)?;
     let out = command
         .arg("start")
         .arg("--store")

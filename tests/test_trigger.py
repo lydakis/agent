@@ -182,8 +182,12 @@ class TriggerFireTests(ModelFixture):
         socket = short / 'own.sock'
         self.addCleanup(lambda: subprocess.run([str(self.binary), 'shutdown', '--store', str(self.store),
                                                 '--socket', str(socket)], env=clean_env(), capture_output=True, timeout=35))
+        # launchd gives no provider keys: the daemon gets them from the login shell's profile.
+        shell = short / 'login-shell'
+        shell.write_text(f"#!/bin/sh\nexport AGENT_PROVIDER='openai=responses,{self.url}'\nexec /bin/sh -c \"$4\"\n")
+        shell.chmod(0o755)
         sent = self.fire('p.task', 'Morning check.', target=target, app=self.bundle(), socket=socket,
-                         env={'AGENT_PROVIDER': f'openai=responses,{self.url}', 'SHELL': '/bin/sh'})
+                         env={'SHELL': str(shell)})
         self.assertEqual(sent['last']['outcome'], 'sent', sent)
         self.assertTrue(socket.exists())
         turns = json.loads(self.agent('turns', '--store', str(self.store), '--socket', str(socket), '--bot', 'p.task').stdout)

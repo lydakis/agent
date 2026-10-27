@@ -2852,7 +2852,8 @@ fn ends(places: &Places, trigger: &Trigger, keep: bool) {
 }
 
 /// The daemon, started the way Sonny starts one when none answers and
-/// the trigger names its store, on the socket the trigger was made with.
+/// the trigger names its store, on the socket the trigger was made with,
+/// with the login shell's environment, since launchd's has no provider keys.
 async fn connect(socket: &Path, daemon: &Daemon) -> Result<std::sync::Arc<Client>, String> {
     match Client::connect(socket).await {
         Ok((client, _events)) => Ok(client),
@@ -2860,7 +2861,8 @@ async fn connect(socket: &Path, daemon: &Daemon) -> Result<std::sync::Arc<Client
             let Some(store) = &daemon.store else {
                 return Err(coded(error));
             };
-            crate::start_daemon(store, socket).map_err(|e| format!("daemon_unavailable: {e}"))?;
+            crate::start_daemon(store, socket, true)
+                .map_err(|e| format!("daemon_unavailable: {e}"))?;
             let (client, _events) = Client::connect(socket).await.map_err(coded)?;
             Ok(client)
         }
