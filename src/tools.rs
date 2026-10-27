@@ -1433,21 +1433,21 @@ mod tests {
         let redact = |text: &str| credentials.redact(text.to_owned());
         assert_eq!(
             redact(
-                r#"{"AccessKeyId": "ASIAEXAMPLE12345", "SecretAccessKey": "wJalr/XUtnFEMI+K7MDENG", "SessionToken": "IQoJb3JpZ2luX2VjEXAMPLE", "Expiration": "2026-01-01T00:00:00Z"}"#
+                r#"{"AccessKeyId": "example1example1", "SecretAccessKey": "fake2fake2fake2", "SessionToken": "fake3fake3fake3", "Expiration": "2026-01-01T00:00:00Z"}"#
             ),
-            r#"{"AccessKeyId": "ASIAEXAMPLE12345", "SecretAccessKey": "[REDACTED]", "SessionToken": "[REDACTED]", "Expiration": "2026-01-01T00:00:00Z"}"#
+            r#"{"AccessKeyId": "example1example1", "SecretAccessKey": "[REDACTED]", "SessionToken": "[REDACTED]", "Expiration": "2026-01-01T00:00:00Z"}"#
         );
         assert_eq!(
-            redact("aws_secret_access_key = wJalrXUtnFEMI7K7MDENG\nregion = us-east-1\n"),
+            redact("aws_secret_access_key = fake4fake4fake4\nregion = us-east-1\n"),
             "aws_secret_access_key = [REDACTED]\nregion = us-east-1\n"
         );
         assert_eq!(
-            redact("export OPENAI_API_KEY=sk-proj-abc123def456; echo ok"),
+            redact("export OPENAI_API_KEY=fake-5fake-5fake; echo ok"),
             "export OPENAI_API_KEY=[REDACTED]; echo ok"
         );
         // Names that only resemble one, short values, and code keep theirs.
         for kept in [
-            "NextToken: eyJ0b2tlbiI6IDEyM30=",
+            "NextToken: page6page6page6",
             "max_tokens: 4096",
             "password: hunter2",
             "    api_key: Option<String>,",
