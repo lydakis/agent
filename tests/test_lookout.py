@@ -71,6 +71,24 @@ class LookoutTests(ModelFixture):
                             instructions='Do anything.', tools=['echo'])
         self.assertIn('is a bot that is not a lookout judge', replay()['Ended']['failed'])
 
+    def test_a_check_of_the_person_s_words_reads_what_passed_before(self):
+        self.make('calc.lead', 'calc.fix')
+        for n, prompt in enumerate(['fix the parser', 'no, the lexer']):
+            turn = self.daemon.request('submit', bot='calc.fix', request_id=f'p{n}', prompt=prompt)['result']['turn']
+            self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
+        out = self.lookout('--replay', '--judge', 'openai/judge-model')
+        self.assertEqual(out.returncode, 0, out.stderr)
+        bodies = []
+        while not self.asked.empty():
+            bodies.append(self.asked.get()[1])
+        said = [b for b in bodies if b['input']['event'].get('text') == 'no, the lexer']
+        self.assertEqual(len(said), 1, bodies)
+        self.assertIn('drifts', said[0]['questions'])
+        self.assertEqual(said[0]['input']['exchange'], [
+            {'from': 'the person', 'text': 'fix the parser'},
+            {'from': 'the task', 'text': 'reply:fix the parser'},
+        ])
+
     def test_one_lookout_wakes_each_lead_whose_task_has_news(self):
         self.make('calc.lead', 'calc.fix', 'shop.lead')
         service = subprocess.Popen([str(self.sonny), 'lookout', '--judge', 'openai/judge-model',
