@@ -244,9 +244,12 @@ fn a_sandfs_task_copy_takes_the_checkout_and_pushes_back() {
     let (_, listed, _) = lab.run(&lab.repo, sonny, &["task", "changes", "demo.fix"], false);
     assert_eq!(listed, "M src/lib.rs");
     lab.git(&copy, &["commit", "-qam", "two"]);
-    // A commit only in the copy keeps the task.
+    // A commit only in the copy keeps the task, on whichever branch.
+    lab.git(&copy, &["checkout", "-q", "--detach", "HEAD~1"]);
     let (ok, _, err) = lab.run(&lab.repo, sonny, &["task", "rm", "demo.fix"], false);
     assert!(!ok && err.contains("commits not pushed"), "{err}");
+    assert!(err.contains("on agent/demo.fix"), "{err}");
+    lab.git(&copy, &["switch", "-q", "agent/demo.fix"]);
     lab.git(&copy, &["push", "-q", "origin", "agent/demo.fix"]);
     assert_eq!(
         lab.git(&lab.repo, &["show", "agent/demo.fix:src/lib.rs"]),

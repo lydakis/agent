@@ -407,8 +407,11 @@ fn sandfs_copy(here: &Path, name: &str) -> Result<Place, String> {
     // repository while the files changed stay in the copy. Git is turned
     // off there instead, in the copy only.
     let mut stubbed = Vec::new();
+    let mut looked_all = true;
     if !git_copy && matches!(undo, Undo::Sandfs { .. }) {
-        stubbed = linked_worktrees(&root);
+        let complete;
+        (stubbed, complete) = linked_worktrees(&root);
+        looked_all = complete;
         for worktree in &stubbed {
             if let Err(e) = std::fs::write(dir.join(worktree).join(".git"), GIT_OFF) {
                 self::undo(&undo);
@@ -451,6 +454,12 @@ fn sandfs_copy(here: &Path, name: &str) -> Result<Place, String> {
                 stubbed.len(),
                 named.join(", ")
             ));
+        }
+        if !looked_all {
+            note.push_str(
+                ". This folder is too big to look for every linked worktree in, so git in one \
+                 it missed still changes the repository it belongs to",
+            );
         }
         note
     };
@@ -600,12 +609,14 @@ fn repath(text: &str, spellings: &[String], to: &Path) -> String {
 
 /// The linked worktrees in the plain folder `root`, relative to it: each
 /// folder whose `.git` file names its repository by an absolute path or a
-/// path out of `root`, which a copy of `root` still reaches. Found at
-/// most six folders down, without looking inside repositories, whose own
-/// lists name their linked worktrees; at most `LOOKED` folders, so a start
-/// stays quick in a folder of thousands of projects.
-fn linked_worktrees(root: &Path) -> Vec<PathBuf> {
-    const LOOKED: usize = 20_000;
+/// path out of `root`, which a copy of `root` still reaches; and whether
+/// every folder was looked in. Found at most `DEEP` folders down, and in
+/// at most `LOOKED` folders, so a start stays quick in a folder of
+/// thousands of projects; repositories' own lists name their linked
+/// worktrees wherever in `root` they are.
+fn linked_worktrees(root: &Path) -> (Vec<PathBuf>, bool) {
+    const LOOKED: usize = 50_000;
+    const DEEP: usize = 6;
     let outbound = |dir: &Path| {
         let Ok(text) = std::fs::read_to_string(dir.join(".git")) else {
             return false;
@@ -623,14 +634,11 @@ fn linked_worktrees(root: &Path) -> Vec<PathBuf> {
     while let Some((dir, depth)) = next.pop() {
         looked += 1;
         if looked > LOOKED {
-            break;
+            return (tidy(root, found), false);
         }
         let git = dir.join(".git");
-        if git.is_file() {
-            if outbound(&dir) {
-                found.push(dir);
-            }
-            continue;
+        if git.is_file() && outbound(&dir) {
+            found.push(dir.clone());
         }
         if git.is_dir() {
             // A repository's linked worktrees, wherever in `root` they are.
@@ -648,20 +656,30 @@ fn linked_worktrees(root: &Path) -> Vec<PathBuf> {
                     found.push(worktree.to_owned());
                 }
             }
-            continue;
         }
-        if depth == 6 {
+        if depth == DEEP {
             continue;
         }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
+        // Inside repositories and worktrees too: one may hold another
+        // repository's worktree, which its own list doesn't name.
         for entry in entries.flatten() {
-            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            let skip = matches!(
+                entry.file_name().to_str(),
+                Some(".git" | "node_modules" | "target" | "__pycache__")
+            );
+            if !skip && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
                 next.push((entry.path(), depth + 1));
             }
         }
     }
+    (tidy(root, found), true)
+}
+
+/// `found`, relative to `root`, sorted and once each.
+fn tidy(root: &Path, found: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = found
         .into_iter()
         .filter_map(|dir| dir.strip_prefix(root).ok().map(Path::to_owned))
@@ -711,16 +729,23 @@ fn ignored(here: &Path, paths: &[&str]) -> HashSet<String> {
         let Ok(mut child) = asked.spawn() else {
             continue;
         };
-        if let Some(mut input) = child.stdin.take() {
-            use std::io::Write;
-            let list: Vec<u8> = paths
-                .iter()
-                .flat_map(|(_, inside)| inside.bytes().chain([0]))
-                .collect();
-            let _ = input.write_all(&list);
-        }
+        // Fed while its answer is read, so neither waits on a full pipe.
+        let list: Vec<u8> = paths
+            .iter()
+            .flat_map(|(_, inside)| inside.bytes().chain([0]))
+            .collect();
+        let feeding = child.stdin.take().map(|mut input| {
+            std::thread::spawn(move || {
+                use std::io::Write;
+                let _ = input.write_all(&list);
+            })
+        });
         // Exit 1 means none is ignored; any failure leaves them all shown.
-        let Ok(output) = child.wait_with_output() else {
+        let output = child.wait_with_output();
+        if let Some(feeding) = feeding {
+            let _ = feeding.join();
+        }
+        let Ok(output) = output else {
             continue;
         };
         let said: HashSet<&[u8]> = output.stdout.split(|b| *b == 0).collect();
@@ -942,21 +967,35 @@ fn not_here(name: &str, folder: &Path, here: &Path) -> Result<String, String> {
         if !git(folder, &["status", "--porcelain"])?.is_empty() {
             return Ok("uncommitted changes in its copy".into());
         }
-        let head = git(folder, &["rev-parse", "HEAD"])?;
+        // Every branch's tip, not only the one checked out: the copy goes
+        // with the commits that are only in it.
         let origin = git(folder, &["remote", "get-url", "origin"]).unwrap_or_default();
-        let pushed = match Path::new(&origin).is_dir() {
-            true => git(
-                Path::new(&origin),
-                &["cat-file", "-e", &format!("{head}^{{commit}}")],
-            )
-            .is_ok(),
-            false => !git(folder, &["branch", "-r", "--contains", &head])
-                .unwrap_or_default()
-                .is_empty(),
-        };
-        return Ok(match pushed {
+        let tips = git(
+            folder,
+            &[
+                "for-each-ref",
+                "--format=%(objectname) %(refname:short)",
+                "refs/heads",
+            ],
+        )?;
+        let unpushed: Vec<&str> = tips
+            .lines()
+            .filter_map(|line| line.split_once(' '))
+            .filter(|(tip, _)| match Path::new(&origin).is_dir() {
+                true => git(
+                    Path::new(&origin),
+                    &["cat-file", "-e", &format!("{tip}^{{commit}}")],
+                )
+                .is_err(),
+                false => git(folder, &["branch", "-r", "--contains", tip])
+                    .unwrap_or_default()
+                    .is_empty(),
+            })
+            .map(|(_, branch)| branch)
+            .collect();
+        return Ok(match unpushed.is_empty() {
             true => String::new(),
-            false => format!("commits not pushed to {origin}"),
+            false => format!("commits not pushed to {origin}, on {}", unpushed.join(", ")),
         });
     }
     let found = sandfs()?
@@ -975,7 +1014,7 @@ fn not_here(name: &str, folder: &Path, here: &Path) -> Result<String, String> {
             let there = here.join(&change.path);
             match change.kind {
                 ChangeKind::Deleted => there.symlink_metadata().is_ok(),
-                _ => std::fs::read(&there).ok() != std::fs::read(folder.join(&change.path)).ok(),
+                _ => !same_entry(&there, &folder.join(&change.path)),
             }
         })
         .map(|change| change.path.clone())
@@ -989,6 +1028,25 @@ fn not_here(name: &str, folder: &Path, here: &Path) -> Result<String, String> {
             me()
         ),
     })
+}
+
+/// Whether `a` and `b` are the same kind of entry with the same contents:
+/// for a symlink, its target, not what it leads to. Anything that can't be
+/// read is not the same, since then that can't be told.
+fn same_entry(a: &Path, b: &Path) -> bool {
+    let (Ok(kind_a), Ok(kind_b)) = (a.symlink_metadata(), b.symlink_metadata()) else {
+        return false;
+    };
+    let (kind_a, kind_b) = (kind_a.file_type(), kind_b.file_type());
+    if kind_a.is_symlink() || kind_b.is_symlink() {
+        return kind_a.is_symlink()
+            && kind_b.is_symlink()
+            && matches!((std::fs::read_link(a), std::fs::read_link(b)), (Ok(x), Ok(y)) if x == y);
+    }
+    if kind_a.is_dir() || kind_b.is_dir() {
+        return kind_a.is_dir() && kind_b.is_dir();
+    }
+    matches!((std::fs::read(a), std::fs::read(b)), (Ok(x), Ok(y)) if x == y)
 }
 
 /// The names of every agent the daemon has, or None when it can't say.
@@ -1161,13 +1219,34 @@ mod tests {
         std::fs::create_dir_all(root.join("sub/.git-modules/x")).unwrap();
         std::fs::create_dir_all(root.join("sub/lib")).unwrap();
         std::fs::write(root.join("sub/lib/.git"), "gitdir: ../.git-modules/x\n").unwrap();
-        let found = linked_worktrees(&root);
+        // Another repository's worktree inside a repository in the folder,
+        // which that repository's own list doesn't name.
+        let nested = repo.join("vendor/d");
+        std::fs::create_dir_all(repo.join("vendor")).unwrap();
+        run(
+            &outside,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                &nested.to_string_lossy(),
+                "-b",
+                "d",
+            ],
+        );
+        let (found, all) = linked_worktrees(&root);
         let _ = std::fs::remove_dir_all(&base);
+        assert!(all);
         assert_eq!(
             found,
-            ["deep/c", "src/shop/.worktrees/a", "src/shop-b"]
-                .map(PathBuf::from)
-                .to_vec()
+            [
+                "deep/c",
+                "src/shop/.worktrees/a",
+                "src/shop/vendor/d",
+                "src/shop-b"
+            ]
+            .map(PathBuf::from)
+            .to_vec()
         );
     }
 
@@ -1215,5 +1294,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         assert_eq!(found, HashSet::from(["shop/__pycache__/a.pyc".to_owned()]));
         assert!(in_git("shop/.git/index") && in_git("wt/.git") && !in_git("a.github/x"));
+    }
+
+    #[test]
+    fn entries_are_the_same_only_when_they_can_be_told_apart_from_none() {
+        let base = std::env::temp_dir().join(format!("sonny-same-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let at = |name: &str| base.join(name);
+        std::fs::write(at("a"), "x").unwrap();
+        std::fs::write(at("b"), "x").unwrap();
+        std::fs::write(at("c"), "y").unwrap();
+        std::os::unix::fs::symlink("nowhere", at("link")).unwrap();
+        std::os::unix::fs::symlink("a", at("to-a")).unwrap();
+        std::os::unix::fs::symlink("b", at("to-b")).unwrap();
+        let said = [
+            same_entry(&at("a"), &at("b")),
+            same_entry(&at("a"), &at("c")),
+            // A dangling link is not the same as nothing there.
+            same_entry(&at("missing"), &at("link")),
+            // Links to the same contents by other targets differ.
+            same_entry(&at("to-a"), &at("to-b")),
+            same_entry(&at("to-a"), &at("a")),
+        ];
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(said, [true, false, false, false, false]);
     }
 }
