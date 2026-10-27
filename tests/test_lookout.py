@@ -1,4 +1,4 @@
-"""`agent lookout` judged by a model the daemon serves, as on Bedrock with no
+"""`sonny lookout` judged by a model the daemon serves, as on Bedrock with no
 other key: the live service wakes a lead, and `--replay` runs the same checks
 over the store."""
 import json
@@ -27,11 +27,12 @@ class LookoutTests(ModelFixture):
             return json.dumps({q: (0.9 if q == 'result' else 0.1) for q in body['questions']})
         self.model.reply_for = reply
         self.model.models = ('synthetic-model', 'judge-model')
+        self.sonny = self.binary.parent / 'sonny'
         self.daemon = SocketClient(self.binary, self.path / 'state.sqlite', self.url, 'echo')
         self.addCleanup(self.daemon.close)
 
     def lookout(self, *args, timeout=60):
-        return subprocess.run([str(self.binary), 'lookout', '--store', str(self.path / 'state.sqlite'),
+        return subprocess.run([str(self.sonny), 'lookout', '--store', str(self.path / 'state.sqlite'),
                                '--socket', str(self.daemon.socket_path), *args],
                               env={**clean_env(), 'HOME': str(self.path)}, capture_output=True, text=True,
                               timeout=timeout)
@@ -72,7 +73,7 @@ class LookoutTests(ModelFixture):
 
     def test_one_lookout_wakes_each_lead_whose_task_has_news(self):
         self.make('calc.lead', 'calc.fix', 'shop.lead')
-        service = subprocess.Popen([str(self.binary), 'lookout', '--judge', 'openai/judge-model',
+        service = subprocess.Popen([str(self.sonny), 'lookout', '--judge', 'openai/judge-model',
                                     '--store', str(self.path / 'state.sqlite'),
                                     '--socket', str(self.daemon.socket_path)],
                                    env={**clean_env(), 'HOME': str(self.path)}, stdout=subprocess.PIPE, text=True)
@@ -91,11 +92,11 @@ class LookoutTests(ModelFixture):
             turns = self.daemon.request('turns', bot='calc.lead')['result']['turns']
             for turn in turns:
                 text = self.daemon.request('prompts', bot='calc.lead', turn=turn['turn'])['result']['prompts']
-                if text and text[0]['text'].startswith('Lookout:'):
+                if text and text[0]['text'].startswith('Task updates: '):
                     woke = text[0]['text']
             time.sleep(.2)
         self.assertIsNotNone(woke, 'the lead was not woken')
-        self.assertIn('calc.fix, turn:calc.fix/', woke)
+        self.assertIn('May need you:\n- calc.fix: turn:calc.fix/', woke)
         self.assertIn('result 0.90', woke)
         # The other project's lead heard nothing of calc's task.
         self.assertEqual(self.daemon.request('turns', bot='shop.lead')['result']['turns'], [])

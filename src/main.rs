@@ -2,7 +2,6 @@ mod approver;
 mod cli;
 mod client;
 mod client_path;
-mod lookout;
 mod server;
 mod sign_in;
 use agent_runtime::{Error, Result, fail_with};

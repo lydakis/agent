@@ -1,4 +1,4 @@
-//! `agent lookout`: a cheap decision model reading what happens in each
+//! `sonny lookout`: a cheap decision model reading what happens in each
 //! lead's tasks, which wakes the lead only when it should step in. Each
 //! message someone other than the lead writes in a task, each turn a task
 //! ends, each approval a task has waited on the person for a while, and each
@@ -7,10 +7,15 @@
 //! (Haiku on Bedrock, say). A high answer wakes the lead now; a middle one
 //! waits for the next wake, or a digest after a quiet spell; a low one is
 //! only logged. One lookout watches a daemon, for every lead on it, started
-//! by whichever client opens first; the daemon is unchanged: this follows
-//! every bot and submits to the leads like any client.
+//! by the first Sonny to open; the daemon is unchanged: this follows every
+//! bot and submits to the leads like any client.
+//!
+//! The lead hears it all in one note, which starts "Task updates: ": what
+//! the judge picked, and the task updates every lead gets unjudged (see
+//! `updates`), so it works with no judge too.
+mod updates;
+
 use agent_client::Client;
-use agent_runtime::Error;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -278,10 +283,20 @@ pub struct Item {
     pub band: Band,
 }
 
+/// How the note to the lead starts, which clients show as news, not as the
+/// person's words.
+pub const TASK_UPDATES: &str = "Task updates: ";
+
 /// What the lead is told: pointers it can read with its wait tool, why
-/// each was picked, and a line of each.
-pub fn note(items: &[Item], more: usize) -> String {
-    let mut lines = vec!["Lookout: tasks that may need you.".to_owned()];
+/// the judge picked each, the task updates, and how many checks found
+/// nothing.
+fn note(items: &[Item], more: usize, told: &updates::Told, dropped: usize) -> String {
+    let mut lines = vec![format!(
+        "{TASK_UPDATES}what your tasks did since you last heard; the wait tool reads each turn by its handle."
+    )];
+    if !items.is_empty() {
+        lines.push("May need you:".to_owned());
+    }
     for item in items {
         let seen = &item.seen;
         let why = match item.reasons.is_empty() {
@@ -324,19 +339,51 @@ pub fn note(items: &[Item], more: usize) -> String {
             _ => String::new(),
         };
         lines.push(format!(
-            "- {}, turn:{}/{}, {what} ({why}; {todo}){quote}",
+            "- {}: turn:{}/{}, {what} ({why}; {todo}){quote}",
             seen.task, seen.task, seen.turn
         ));
     }
     if more > 0 {
         lines.push(format!("- {more} more in the next note"));
     }
-    lines.push(
-        "A quoted message is the person's own words; read the rest with the wait tool by its handle. \
-         Then do what each line says where it holds; if none needs you, end with one line."
-            .to_owned(),
-    );
-    lines.join("\n")
+    // A turn the judge picked is told once, with why.
+    let picked: HashSet<String> = (items.iter())
+        .map(|item| format!("turn:{}/{}", item.seen.task, item.seen.turn))
+        .collect();
+    let told_items: Vec<&updates::Line> = (told.items.iter())
+        .filter(|line| !picked.contains(&line.handle))
+        .collect();
+    if told_items.iter().any(|line| !line.theirs) {
+        lines.push("Ended or waiting for an approval:".to_owned());
+    }
+    for (n, line) in told_items.iter().enumerate() {
+        if line.theirs && (n == 0 || !told_items[n - 1].theirs) {
+            lines.push(
+                "The person asked for these in the task themselves, so they are theirs:".to_owned(),
+            );
+        }
+        lines.push(line.text.clone());
+    }
+    if told.more > 0 {
+        lines.push(format!("- {} more tasks in the next note", told.more));
+    }
+    if dropped > 0 {
+        lines.push(format!("{dropped} other events checked; none needs you."));
+    }
+    lines.push(match items.is_empty() {
+        true => "If nothing needs you, end with one line.".to_owned(),
+        false => {
+            "A quoted message is the person's own words. Do what each line under \"May need you\" \
+                  says where it holds; if nothing needs you, end with one line."
+                .to_owned()
+        }
+    });
+    let mut text = lines.join("\n");
+    if let Some(memory) = &told.memory {
+        text.push_str("\n\n");
+        text.push_str(memory);
+    }
+    text
 }
 
 /// FNV-1a, 64-bit, as the app keys its wakes: the same note twice is one submit.
@@ -382,7 +429,7 @@ where a lead agent coordinates task agents for a person. The user message is a J
 how to read `input`, and `questions` maps each question's id to the question. Answer with one JSON object \
 mapping every question id to the probability, from 0 to 1, that the answer is yes, and nothing else.";
 
-/// A key from this shell, else from the app's `~/.agent/env`.
+/// A key from this shell, else from `~/.agent/env`.
 fn key(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -403,7 +450,7 @@ impl Judge {
     /// any other `provider/model`, which the daemon runs.
     pub fn parse(spec: &str) -> Result<Self, String> {
         let http = reqwest::Client::builder()
-            .user_agent(concat!("agent/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("sonny/", env!("CARGO_PKG_VERSION")))
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))
             .build()
@@ -944,7 +991,7 @@ async fn event_text(client: &Client, seen: &Seen) -> String {
         .await
         .into_iter()
         .flat_map(|(turn, item)| {
-            agent_client::history::responses(&item)
+            crate::responses(&item)
                 .into_iter()
                 .map(move |item| (turn, item))
         })
@@ -975,7 +1022,7 @@ async fn event_text(client: &Client, seen: &Seen) -> String {
             item["name"].as_str().unwrap_or("tool"),
             item["arguments"].as_str().unwrap_or("")
         ),
-        Some((_, item)) => agent_client::history::text(item),
+        Some((_, item)) => crate::text(item),
         None => String::new(),
     }
 }
@@ -986,7 +1033,7 @@ async fn node_text(client: &Client, bot: &str, node: i64) -> String {
         .request("history_items", json!({"bot": bot, "nodes": [node]}))
         .await
         .ok()
-        .map(|read| agent_client::history::text(&read["items"][0]["item"]))
+        .map(|read| crate::text(&read["items"][0]["item"]))
         .unwrap_or_default()
 }
 
@@ -1014,7 +1061,7 @@ async fn brief(client: &Client, task: &str, node: Option<i64>) -> String {
         .await
         .iter()
         .find(|(_, item)| item["role"] == "user")
-        .map(|(_, item)| agent_client::history::text(item))
+        .map(|(_, item)| crate::text(item))
         .unwrap_or_default()
 }
 
@@ -1024,7 +1071,7 @@ async fn latest(client: &Client, task: &str) -> String {
         .await
         .iter()
         .find(|(_, item)| item["role"] == "assistant")
-        .map(|(_, item)| first_line(&agent_client::history::text(item)))
+        .map(|(_, item)| first_line(&crate::text(item)))
         .unwrap_or_default()
 }
 
@@ -1076,6 +1123,38 @@ async fn check(
     })
 }
 
+const USAGE: &str = "usage: sonny lookout [--store PATH] [--socket PATH] [--judge PROVIDER/MODEL|off]\n\
+       sonny lookout --replay --judge SPEC[,SPEC]... [--store PATH] [--socket PATH] [--limit N]";
+
+/// `sonny lookout`: one lookout for the store's daemon, or a replay of its
+/// checks over what the store kept.
+pub fn run(args: &[String]) -> Result<(), String> {
+    let (mut store, mut socket, mut judge, mut replaying, mut limit) =
+        (None, None, None, false, 150);
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let mut value = || args.next().cloned().ok_or(USAGE);
+        match arg.as_str() {
+            "--store" => store = Some(PathBuf::from(value()?)),
+            "--socket" => socket = Some(PathBuf::from(value()?)),
+            "--judge" => judge = Some(value()?),
+            "--replay" => replaying = true,
+            "--limit" => limit = value()?.parse().map_err(|_| USAGE)?,
+            _ => return Err(USAGE.into()),
+        }
+    }
+    let (store, socket) = crate::daemon_paths(store, socket)?;
+    if replaying {
+        let judges = judge.ok_or("--replay needs --judge SPEC[,SPEC]...")?;
+        return replay(socket, &judges, limit);
+    }
+    main(Settings {
+        store,
+        socket,
+        judge,
+    })
+}
+
 pub struct Settings {
     pub store: PathBuf,
     pub socket: PathBuf,
@@ -1087,20 +1166,21 @@ pub struct Settings {
 /// for good. One lookout a store: another that starts while this one runs
 /// says so and exits. Every check is logged beside the store, in
 /// `STORE.lookout.jsonl`.
-pub fn main(settings: Settings) -> agent_runtime::Result<i32> {
+pub fn main(settings: Settings) -> Result<(), String> {
     let Some(_held) = lock(&settings.store)? else {
         println!("{}", json!({"event": "already_watching"}));
-        return Ok(0);
+        return Ok(());
     };
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .build()?
+        .build()
+        .map_err(|e| e.to_string())?
         .block_on(serve(settings))
 }
 
 /// The store's lookout lock, held while this process lives: `None` when
 /// another lookout holds it.
-fn lock(store: &std::path::Path) -> agent_runtime::Result<Option<std::fs::File>> {
+fn lock(store: &std::path::Path) -> Result<Option<std::fs::File>, String> {
     use std::os::fd::AsRawFd;
     let mut path = store.as_os_str().to_owned();
     path.push(".lookout.lock");
@@ -1108,7 +1188,8 @@ fn lock(store: &std::path::Path) -> agent_runtime::Result<Option<std::fs::File>>
         .create(true)
         .truncate(false)
         .write(true)
-        .open(&path)?;
+        .open(&path)
+        .map_err(|e| format!("{}: {e}", std::path::Path::new(&path).display()))?;
     // SAFETY: flock on a descriptor `file` owns and keeps open; the lock is
     // released when the process exits.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
@@ -1117,14 +1198,14 @@ fn lock(store: &std::path::Path) -> agent_runtime::Result<Option<std::fs::File>>
     let error = std::io::Error::last_os_error();
     match error.raw_os_error() == Some(libc::EWOULDBLOCK) {
         true => Ok(None),
-        false => Err(Error::with(
-            "lookout_lock_failed",
-            format!("{}: {error}", std::path::Path::new(&path).display()),
+        false => Err(format!(
+            "{}: {error}",
+            std::path::Path::new(&path).display()
         )),
     }
 }
 
-async fn serve(settings: Settings) -> agent_runtime::Result<i32> {
+async fn serve(settings: Settings) -> Result<(), String> {
     let mut log = settings.store.as_os_str().to_owned();
     log.push(".lookout.jsonl");
     let mut service = Service {
@@ -1148,7 +1229,7 @@ async fn serve(settings: Settings) -> agent_runtime::Result<i32> {
         // and the client that starts the next daemon starts its lookout.
         if gone.get_or_insert_with(Instant::now).elapsed() >= GONE_AFTER {
             println!("{}", json!({"event": "daemon_gone"}));
-            return Ok(0);
+            return Ok(());
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
@@ -1183,7 +1264,16 @@ impl Service {
         for bot in &bots {
             self.seat(&client, bot).await;
         }
+        let listed: HashSet<String> = (bots.iter())
+            .filter_map(|b| b["name"].as_str().map(str::to_owned))
+            .collect();
         for lookout in self.lookouts.values_mut() {
+            // The replay's turns were news then; the live ones are now.
+            lookout.updates.live = false;
+            for bot in &bots {
+                lookout.updates.seat(bot);
+            }
+            lookout.updates.seated(&listed);
             lookout.lineage.insert(lookout.lead.clone());
             let prefix = format!("{}.", lookout.project);
             for name in bots.iter().filter_map(|b| b["name"].as_str()) {
@@ -1205,6 +1295,9 @@ impl Service {
                         let mut record = event["data"].clone();
                         record["name"] = json!(name);
                         self.seat(&client, &record).await;
+                        if live && let Some(lookout) = self.lookouts.get_mut(name) {
+                            lookout.updates.live = true;
+                        }
                     }
                     if event["event"] == "deleted"
                         && let Some(name) = event["bot"].as_str()
@@ -1248,6 +1341,7 @@ impl Service {
                     for lookout in self.lookouts.values_mut() {
                         lookout.approvals_due();
                         lookout.quiet_due(now);
+                        lookout.updates.expire(now);
                     }
                 }
             }
@@ -1255,11 +1349,13 @@ impl Service {
                 // Checks run beside the stream, so a slow judge never
                 // stalls it.
                 let due = std::mem::take(&mut lookout.due);
-                let Some(judge) = lookout.judge.clone() else {
-                    continue;
-                };
-                for seen in due {
-                    let (client, judge, done) = (client.clone(), judge.clone(), done.clone());
+                // With no judge, only the task updates go out.
+                let judge = lookout.judge.clone();
+                for (seen, judge) in due
+                    .into_iter()
+                    .filter_map(|seen| Some((seen, judge.clone()?)))
+                {
+                    let (client, done) = (client.clone(), done.clone());
                     let (memory, recent) = (memory(&lookout.workspace), lookout.recent.clone());
                     let lead = lookout.lead.clone();
                     tokio::spawn(async move {
@@ -1300,6 +1396,11 @@ impl Service {
         let workspace = PathBuf::from(record["workspace"].as_str().unwrap_or("/"));
         let mut lookout = Lookout::new(project, lead, workspace, judge);
         lookout.log = Some(self.log.clone());
+        // What changed in the person's and the project's memory rides along
+        // with the task updates.
+        let memory =
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agents/memory"));
+        lookout.updates = updates::Updates::new(lead, project, memory);
         self.lookouts.insert(lead.to_owned(), lookout);
     }
 
@@ -1357,6 +1458,10 @@ fn append(path: &std::path::Path, line: &Value) {
 struct Lookout {
     /// `None` when no judge is set or it cannot answer: nothing is checked.
     judge: Option<Arc<Judge>>,
+    /// The news the lead hears unjudged.
+    updates: updates::Updates,
+    /// Checks answered low since the last note: a count, not news.
+    dropped: usize,
     project: String,
     lead: String,
     /// The lead's folder, which names the memory it reads.
@@ -1402,6 +1507,8 @@ impl Lookout {
     fn new(project: &str, lead: &str, workspace: PathBuf, judge: Option<Arc<Judge>>) -> Self {
         Lookout {
             judge,
+            updates: updates::Updates::new(lead, project, None),
+            dropped: 0,
             project: project.to_owned(),
             lead: lead.to_owned(),
             workspace,
@@ -1461,6 +1568,7 @@ impl Lookout {
     }
 
     fn event(&mut self, event: &Value) {
+        self.updates.event(event, Instant::now());
         self.lineage_of(event);
         let (Some(kind), Some(bot)) = (event["event"].as_str(), event["bot"].as_str()) else {
             return;
@@ -1719,7 +1827,9 @@ impl Lookout {
                 if let Band::Wake { steer } = band {
                     self.urgent = Some(self.urgent.unwrap_or(false) || steer);
                 }
-                if band != Band::Drop {
+                if band == Band::Drop {
+                    self.dropped += 1;
+                } else {
                     self.held_since.get_or_insert_with(Instant::now);
                     let seen = Seen {
                         text: checked.text,
@@ -1776,16 +1886,15 @@ impl Lookout {
     }
 
     /// Tell the lead what is held, when a high answer is waiting and the
-    /// last wake is far enough back, or when middle answers waited long.
+    /// last wake is far enough back, or when middle answers waited long;
+    /// or its task updates, once it rests. Either note carries everything.
     async fn wake(&mut self, client: &Client) {
-        if self.held.is_empty() {
-            return;
-        }
         let now = Instant::now();
-        if !self.wake_due(now) {
+        let judged = self.wake_due(now);
+        if !judged && (self.refused(now) || !self.updates.due(now)) {
             return;
         }
-        let steer = self.urgent == Some(true);
+        let steer = judged && self.urgent == Some(true);
         // A bounded note sends what woke it first: steers, then other wakes.
         self.held.sort_by_key(|item| match item.band {
             Band::Wake { steer: true } => 0,
@@ -1794,8 +1903,9 @@ impl Lookout {
         });
         let take = self.held.len().min(NOTE_ITEMS);
         let sent: Vec<Item> = self.held.drain(..take).collect();
-        let prompt = note(&sent, self.held.len());
-        let key: Vec<String> = sent
+        let told = self.updates.take(now);
+        let prompt = note(&sent, self.held.len(), &told, self.dropped);
+        let mut key: Vec<String> = sent
             .iter()
             .map(|item| {
                 let seen = &item.seen;
@@ -1808,32 +1918,38 @@ impl Lookout {
                 format!("{}/{}/{:?}{call}", seen.task, seen.turn, seen.kind)
             })
             .collect();
+        key.extend(told.items.iter().map(|line| line.key.clone()));
         let request_id = format!("lookout-{}", digest(&key.join(",")));
+        let delivery = if steer { "steer" } else { "queue" };
         let submitted = client
             .request(
                 "submit",
-                json!({"bot": self.lead, "prompt": prompt, "request_id": request_id,
-                    "delivery": if steer { "steer" } else { "queue" }}),
+                json!({"bot": self.lead, "bot_id": self.updates.lead_id(), "prompt": prompt,
+                    "request_id": request_id, "delivery": delivery}),
             )
             .await;
         match submitted {
             Ok(_) => {
                 self.last_wake = Some(now);
                 self.refused = None;
+                self.dropped = 0;
                 self.urgent = self.pending();
                 self.held_since = (!self.held.is_empty()).then_some(now);
+                self.updates.sent(told);
                 self.write(&json!({"at_ms": epoch_ms(), "lead": self.lead, "woke": key,
-                    "delivery": if steer { "steer" } else { "queue" }}));
+                    "delivery": delivery}));
             }
-            // Another Sonny sent the same note first.
+            // The same news twice is one note.
             Err(error) if error.code == "idempotency_conflict" => {
                 self.last_wake = Some(now);
                 self.urgent = self.pending();
+                self.updates.sent(told);
             }
             Err(error) => {
                 let mut back = sent;
                 back.append(&mut self.held);
                 self.held = back;
+                self.updates.unsent(told);
                 self.write(
                     &json!({"at_ms": epoch_ms(), "lead": self.lead, "wake_failed": error.code}),
                 );
@@ -1841,6 +1957,12 @@ impl Lookout {
                 self.refused = Some(now);
             }
         }
+    }
+
+    /// The last note was refused lately: even a steer waits the gap after.
+    fn refused(&self, now: Instant) -> bool {
+        self.refused
+            .is_some_and(|at| now.duration_since(at) < WAKE_GAP)
     }
 
     /// A steer is worth cutting in at once; other high answers wait out
@@ -1852,11 +1974,8 @@ impl Lookout {
         let stale = self
             .held_since
             .is_some_and(|since| now.duration_since(since) >= DIGEST_AFTER);
-        let refused = self
-            .refused
-            .is_some_and(|at| now.duration_since(at) < WAKE_GAP);
         !self.held.is_empty()
-            && !refused
+            && !self.refused(now)
             && (self.urgent == Some(true) || (spaced && (self.urgent.is_some() || stale)))
     }
 
@@ -1874,18 +1993,17 @@ fn epoch_ms() -> u128 {
         .unwrap_or(0)
 }
 
-/// `agent lookout --replay --judge SPEC[,SPEC]... [--limit N]`: run the
+/// `sonny lookout --replay --judge SPEC[,SPEC]... [--limit N]`: run the
 /// lookout's checks over what the store kept, for every project lead, and
 /// print each check as a JSON line with its input, answers and band. It
 /// wakes no one. The roster and memory are read as they are now, not as
 /// they were then.
-pub fn replay(socket: PathBuf, judges: &str, limit: usize) -> agent_runtime::Result<i32> {
+pub fn replay(socket: PathBuf, judges: &str, limit: usize) -> Result<(), String> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .build()?
+        .build()
+        .map_err(|e| e.to_string())?
         .block_on(replayed(socket, judges, limit))
-        .map_err(|why| Error::with("lookout_replay_failed", why))?;
-    Ok(0)
 }
 
 async fn replayed(socket: PathBuf, judges: &str, limit: usize) -> Result<(), String> {
@@ -1916,9 +2034,9 @@ async fn replayed(socket: PathBuf, judges: &str, limit: usize) -> Result<(), Str
     for lead in bots
         .iter()
         .filter_map(|b| b["name"].as_str())
-        .filter(|n| n.ends_with(".lead"))
+        .filter(|n| lead_project(n).is_some())
     {
-        let project = lead.trim_end_matches(".lead").to_owned();
+        let project = lead_project(lead).unwrap_or_default().to_owned();
         let workspace = bots
             .iter()
             .find(|b| b["name"] == lead)
@@ -2217,16 +2335,111 @@ mod tests {
             ],
             band: Band::Wake { steer: true },
         };
-        let note = note(&[item, said], 2);
+        let note = note(&[item, said], 2, &updates::Told::default(), 0);
         // Only the person's own words are quoted.
         assert!(note.contains(
-            "- calc.fix, turn:calc.fix/12, turn completed (off brief 0.82; correct the task)\n"
+            "- calc.fix: turn:calc.fix/12, turn completed (off brief 0.82; correct the task)\n"
         ));
         assert!(!note.contains("Fixed avg"));
         assert!(note.contains(
-            "- calc.docs, turn:calc.docs/3, the person wrote in it (redirects 0.97, remember 0.91, sibling needs 0.79; pass it to every task it applies to, and save it with your memory skill): \"Use tabs everywhere. Thanks.\""
+            "- calc.docs: turn:calc.docs/3, the person wrote in it (redirects 0.97, remember 0.91, sibling needs 0.79; pass it to every task it applies to, and save it with your memory skill): \"Use tabs everywhere. Thanks.\""
         ));
         assert!(note.contains("- 2 more in the next note"));
+    }
+
+    #[test]
+    fn one_note_carries_what_was_picked_and_the_task_updates() {
+        let picked = Item {
+            seen: Seen {
+                task: "calc.fix".into(),
+                turn: 12,
+                kind: Kind::Ended,
+                from: None,
+                status: Some("completed".into()),
+                node: None,
+                call: None,
+                brief: None,
+                peers: Vec::new(),
+                text: String::new(),
+            },
+            reasons: vec![("result", 0.9)],
+            band: Band::Wake { steer: false },
+        };
+        let line = |task: &str, turn: i64, theirs: bool| updates::Line {
+            handle: format!("turn:{task}/{turn}"),
+            theirs,
+            text: format!("- {task}: turn:{task}/{turn} completed"),
+            key: String::new(),
+        };
+        let mut told = updates::Told::default();
+        told.items = vec![
+            line("calc.fix", 12, false),
+            line("calc.docs", 3, false),
+            line("calc.ui", 2, true),
+        ];
+        told.more = 1;
+        told.memory = Some("Memory changed".into());
+        assert_eq!(
+            note(&[picked], 0, &told, 3),
+            "Task updates: what your tasks did since you last heard; the wait tool reads each turn by its handle.\n\
+             May need you:\n\
+             - calc.fix: turn:calc.fix/12, turn completed (result 0.90; tell the person)\n\
+             Ended or waiting for an approval:\n\
+             - calc.docs: turn:calc.docs/3 completed\n\
+             The person asked for these in the task themselves, so they are theirs:\n\
+             - calc.ui: turn:calc.ui/2 completed\n\
+             - 1 more tasks in the next note\n\
+             3 other events checked; none needs you.\n\
+             A quoted message is the person's own words. Do what each line under \"May need you\" says where it holds; if nothing needs you, end with one line.\n\
+             \n\
+             Memory changed"
+        );
+        // With no judge, the task updates alone.
+        let mut told = updates::Told::default();
+        told.items = vec![line("calc.docs", 3, false)];
+        assert_eq!(
+            note(&[], 0, &told, 0),
+            "Task updates: what your tasks did since you last heard; the wait tool reads each turn by its handle.\n\
+             Ended or waiting for an approval:\n\
+             - calc.docs: turn:calc.docs/3 completed\n\
+             If nothing needs you, end with one line."
+        );
+    }
+
+    #[test]
+    fn a_lead_with_no_judge_still_hears_its_task_updates() {
+        let mut lookout = Lookout::new("calc", "calc.lead", PathBuf::from("/"), None);
+        let now = Instant::now();
+        for (name, id, by, by_id) in [
+            ("calc.lead", 1, None, None),
+            ("calc.fix", 2, Some("calc.lead"), Some(1)),
+        ] {
+            lookout.event(
+                &json!({"bot": name, "event": "created", "data": {"bot_id": id,
+                "status": "idle", "created_by": by, "created_by_id": by_id}}),
+            );
+        }
+        lookout.event(&json!({"event": "follow_live"}));
+        lookout.event(&ev(
+            "calc.fix",
+            4,
+            "accepted",
+            json!({"from": {"bot": "calc.lead", "turn": 1}}),
+        ));
+        lookout.event(&ev(
+            "calc.fix",
+            4,
+            "turn_finished",
+            json!({"status": "completed"}),
+        ));
+        assert!(lookout.due.len() == 1 && lookout.judge.is_none());
+        assert!(!lookout.wake_due(now), "nothing judged");
+        assert!(lookout.updates.due(now));
+        let told = lookout.updates.take(now);
+        assert_eq!(
+            told.items[0].text,
+            "- calc.fix: turn:calc.fix/4 completed, asked by you"
+        );
     }
 
     #[test]
@@ -2641,7 +2854,9 @@ mod tests {
         lookout.answered(again, Err(Failure::Check("timeout".into(), "words".into())));
         assert!(lookout.due.is_empty());
         assert_eq!(lookout.held.len(), 1);
-        assert!(note(&lookout.held, 0).contains("(not checked; look)"));
+        assert!(
+            note(&lookout.held, 0, &updates::Told::default(), 0).contains("(not checked; look)")
+        );
         assert_eq!(lookout.held[0].seen.text, "words");
     }
 

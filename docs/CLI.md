@@ -113,11 +113,6 @@ identity is `bot_not_found`.
   a tag of at most 87 bytes, and `--effort` sets its effort. `--note` (default `AGENT_APPROVER_NOTE`)
   is a regular file of at most 96,000 bytes the judge always sees, such as
   trusted remotes and hosts ([APPROVALS.md](APPROVALS.md#automatic-mode)).
-- `lookout [--judge PROVIDER/MODEL|off]` watches every lead on the daemon
-  and wakes one when its tasks need it, until the daemon is gone; one runs
-  a store, and another prints `{"event":"already_watching"}` and exits.
-  `lookout --replay --judge SPEC[,SPEC]... [--limit N]` prints the checks it
-  would make over the store's retained history ([LOOKOUT.md](LOOKOUT.md)).
 - `approvals [--bot NAME] [--tag TAG] [--full]` lists the calls waiting on a gate.
   Each previews its arguments; `--full` reads the whole arguments of a
   call whose preview was cut from the node that planned it.
@@ -169,7 +164,7 @@ Default output is machine-readable JSON. `run` and `follow` stream one JSON
 object per line. Snapshot commands return compact JSON objects; `ls` and `turns`
 return arrays. Every command prints its reply: `interrupt` the turn view,
 `answer` what it answered, and `shutdown` `{"stopped":true,"pid":N}` once the
-daemon is gone. Every client command takes `--pretty`; `approver`, `lookout` and `serve`
+daemon is gone. Every client command takes `--pretty`; `approver` and `serve`
 run until stopped and print no reply to render.
 `shutdown` returns once the daemon process has exited and its store is closed.
 `shutdown --grace DURATION` first lets running turns finish for up to that long

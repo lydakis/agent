@@ -37,12 +37,6 @@ for, so its skill has agents end such a command with a line to wait for.
 The skill tells agents to close what they opened once read; whatever a task
 left open closes with its window.
 
-The lead hears what its tasks did as the app tells it: once it rests, and at
-most every ten minutes, one "Task updates" message lists the tasks it started
-that ended a turn or wait for an approval, by the handles its wait tool reads
-them with, with what changed in memory alongside. The app and Sonny send the
-same news as one message, so it does not matter which is open.
-
 Enter sends (and steers a running turn), Esc interrupts, `y`/`n` answer a
 pending approval, Ctrl-C clears the composer or quits. `/` lists the
 commands:
@@ -84,11 +78,14 @@ When `errand` is installed, Sonny writes an `errand` skill so any agent can
 run a command on another machine, draws those runs as `Ran COMMAND on
 PEER`, and in Rex opens a window following each detached job.
 
-Sonny starts Agent's lookout when it opens a project, which wakes the lead
-only when one of its tasks needs it: a message that redirects other tasks,
-a conflict, a stuck or silent task, a result the person should hear. It
-judges with `AGENT_JUDGE`, the approver's setting, so Bedrock alone is
-enough; see [docs/LOOKOUT.md](../docs/LOOKOUT.md).
+Sonny starts its lookout, `sonny lookout`, when it opens a project: one
+for the daemon, watching every lead on it. It tells a lead what its tasks
+did in one "Task updates" note, by the handles its wait tool reads them
+with, and wakes it early only when one needs it: a message that redirects
+other tasks, a conflict, a stuck or silent task, a result the person should
+hear. It judges with `AGENT_JUDGE`, the approver's setting, so Bedrock alone
+is enough, and with no judge sends the task updates alone; see
+[docs/LOOKOUT.md](../docs/LOOKOUT.md).
 
 The look follows Codex's TUI (openai/codex, `codex-rs/tui`): finished history
 goes into the terminal's own scrollback above a small inline viewport,

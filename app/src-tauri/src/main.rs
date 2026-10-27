@@ -1040,19 +1040,6 @@ async fn attach(
         old.close().await;
     }
     let (client, events) = connect(&state).await?;
-    // This machine's daemon gets its lookout, as Sonny starts it; a host's
-    // is its own clients' to start.
-    if let (
-        Target::Local {
-            socket,
-            store: Some(store),
-        },
-        Some(agent),
-    ) = (&state.config.target, &state.agent)
-        && let Err(error) = daemon::lookout(agent, store, socket).await
-    {
-        eprintln!("{error}");
-    }
     let session = state
         .session
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)

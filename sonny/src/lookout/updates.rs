@@ -1,18 +1,16 @@
-//! Task updates: the lead hears, in one message, which tasks it started
-//! ended turns or wait for an approval, as its role says it will. This is
-//! the app's coordinator wake (`app/ui/app.js`), told the same way, so the
-//! lead gets the same message whichever client is open, and the same news
-//! from both is one message: the request ID is the app's, made from the
-//! news alone.
+//! Task updates: what the lead hears of its tasks unjudged, as its role
+//! says it will. A turn it asked for and did not wait on, a turn another
+//! agent or a trigger asked for, and an approval only the person can give
+//! are always news; turns the person asked for in the task themselves are
+//! listed apart, as theirs. A turn the lead waits on is not news, nor its
+//! own forks.
 //!
-//! Only live turns count, while Sonny is attached. Once the lead rests, and
-//! at most every ten minutes, one message lists each task's latest turn of
-//! each kind, by the handle the wait tool reads it with: turns the lead,
-//! another agent or a trigger asked for, and approvals, to act on; turns the
-//! person asked for in the task themselves, listed apart. A turn the lead
-//! waits on is not news, nor its own forks. What changed in memory rides
-//! along, and never sends a message by itself.
-use agent_client::Client;
+//! Only live turns count. The lookout sends the news with its next note,
+//! or on its own once the lead rests, at most every ten minutes; one note
+//! names each task's latest turn of each kind, by the handle the wait tool
+//! reads it with. What changed in memory rides along, and never sends a
+//! note by itself.
+use super::lead_project;
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
@@ -73,13 +71,26 @@ struct Bot {
     waiting_on: Vec<String>,
 }
 
-/// A message for the lead, and the news it carries, to put back if it
-/// cannot be sent.
-pub struct Wake {
-    pub request_id: String,
-    pub prompt: String,
+/// The news one note carries, and what to put back if it cannot be sent.
+#[derive(Default)]
+pub struct Told {
+    /// One line a turn, the person's apart; each with its handle.
+    pub items: Vec<Line>,
+    /// Tasks whose news waits for the next note.
+    pub more: usize,
+    /// What changed in memory, a paragraph of its own.
+    pub memory: Option<String>,
     sent: Vec<(String, News)>,
-    memory: Option<HashMap<String, u64>>,
+    seen: Option<HashMap<String, u64>>,
+}
+
+pub struct Line {
+    pub handle: String,
+    /// Asked for by the person in the task: theirs, not the lead's.
+    pub theirs: bool,
+    pub text: String,
+    /// The news itself: the same news twice is one note.
+    pub key: String,
 }
 
 type Key = (String, i64);
@@ -108,11 +119,6 @@ fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
-}
-
-/// The project a lead heads: `shop` for `shop.lead`.
-fn lead_project(name: &str) -> Option<&str> {
-    name.strip_suffix(".lead").filter(|p| !p.is_empty())
 }
 
 impl Updates {
@@ -164,7 +170,7 @@ impl Updates {
         );
     }
 
-    /// Every bot is seated: one no longer listed was deleted while Sonny
+    /// Every bot is seated: one no longer listed was deleted while the lookout
     /// was away, which no event will say.
     pub fn seated(&mut self, listed: &HashSet<String>) {
         let gone: Vec<String> = (self.bots.keys())
@@ -392,72 +398,57 @@ impl Updates {
             && self.last.is_none_or(|last| now >= last + WAKE)
     }
 
-    /// The message for the lead, taking the news it carries.
-    pub fn take(&mut self, now: Instant) -> Option<Wake> {
-        let lead_id = self.bots.get(&self.lead)?.id?;
+    /// The news for the next note, taken: every task's when the lead
+    /// heard nothing for a while, those with news to act on first.
+    pub fn take(&mut self, now: Instant) -> Told {
         let mut tasks = std::mem::take(&mut self.tasks);
-        // Those with news to act on first; the rest wait for the next.
         tasks.sort_by_key(|(_, news)| news.act.is_none());
-        let rest = tasks.split_off(tasks.len().min(WAKE_TASKS));
-        self.tasks = rest;
+        self.tasks = tasks.split_off(tasks.len().min(WAKE_TASKS));
         self.last = Some(now);
-        let items: Vec<(&str, &str, &Turn)> = tasks
+        let mut items: Vec<Line> = tasks
             .iter()
             .flat_map(|(name, news)| {
-                [("act", &news.act), ("theirs", &news.theirs)]
+                [(false, &news.act), (true, &news.theirs)]
                     .into_iter()
-                    .filter_map(move |(kind, turn)| Some((name.as_str(), kind, turn.as_ref()?)))
+                    .filter_map(move |(theirs, turn)| Some(line(name, theirs, turn.as_ref()?)))
             })
             .collect();
-        let mut prompt = wake_text(&items, self.tasks.len());
+        // The person's own turns come last, under a line of their own.
+        items.sort_by_key(|item| item.theirs);
         let (memory, seen) = match self.memory_news() {
             Some((text, seen)) => (Some(text), Some(seen)),
             None => (None, None),
         };
-        if let Some(text) = memory {
-            prompt.push_str("\n\n");
-            prompt.push_str(&text);
-        }
-        let mut keyed: Vec<Value> = items
-            .iter()
-            .map(|(name, kind, turn)| json!([name, kind, turn.turn, turn.status, turn.approval]))
-            .collect();
-        let key = |v: &Value| {
-            format!(
-                "{}\u{0}{}",
-                v[0].as_str().unwrap_or(""),
-                v[1].as_str().unwrap_or("")
-            )
-        };
-        keyed.sort_by_key(key);
-        let request_id = format!(
-            "app-wake-{lead_id}-{}",
-            digest(&Value::Array(keyed).to_string())
-        );
-        Some(Wake {
-            request_id,
-            prompt,
+        Told {
+            items,
+            more: self.tasks.len(),
+            memory,
             sent: tasks,
-            memory: seen,
-        })
+            seen,
+        }
     }
 
-    /// The message was sent: what it said of memory has been told.
-    pub fn sent(&mut self, wake: Wake) {
-        if let Some(seen) = wake.memory {
+    /// The note was sent: what it said of memory has been told.
+    pub fn sent(&mut self, told: Told) {
+        if let Some(seen) = told.seen {
             self.memory_seen = Some(seen);
         }
     }
 
-    /// The message could not be sent: its news comes first next time.
-    pub fn unsent(&mut self, wake: Wake) {
-        let later = std::mem::replace(&mut self.tasks, wake.sent);
+    /// The note could not be sent: its news comes first next time.
+    pub fn unsent(&mut self, told: Told) {
+        let later = std::mem::replace(&mut self.tasks, told.sent);
         for (name, news) in later {
             match self.tasks.iter_mut().find(|(task, _)| *task == name) {
                 Some((_, had)) => had.merge(news),
                 None => self.tasks.push((name, news)),
             }
         }
+    }
+
+    /// The lead's ID, to send it the note and no later bot of its name.
+    pub fn lead_id(&self) -> Option<i64> {
+        self.bots.get(&self.lead)?.id
     }
 
     /// The lead was deleted, or another took its name: what was news for
@@ -478,7 +469,7 @@ impl Updates {
     }
 
     /// What was saved to or removed from the person's and the project's
-    /// memory since the lead last heard (or since Sonny opened), less what
+    /// memory since the lead last heard (or since the lookout started), less what
     /// the lead saved itself; and what it will have heard.
     fn memory_news(&mut self) -> Option<(String, HashMap<String, u64>)> {
         let root = self.memory.as_ref()?;
@@ -524,11 +515,7 @@ impl Updates {
         let lines: Vec<String> = gone
             .iter()
             .map(|path| format!("- removed: {path}"))
-            .chain(
-                saved
-                    .iter()
-                    .map(|f| format!("- saved: {}: {}", f.path, f.description)),
-            )
+            .chain(saved.iter().map(|f| format!("- saved: {}", f.path)))
             .collect();
         if lines.is_empty() {
             self.memory_seen = Some(told);
@@ -548,58 +535,36 @@ impl Updates {
     }
 }
 
-/// The lead's message, as the app writes it.
-fn wake_text(items: &[(&str, &str, &Turn)], more: usize) -> String {
-    let line = |(name, _, t): &(&str, &str, &Turn)| {
-        let mut line = format!("- {name}: turn:{name}/{} {}", t.turn, t.status);
-        if let Some(by) = &t.by {
-            line.push_str(&format!(", asked by {by}"));
-        }
-        if t.count > 1 {
-            line.push_str(&format!(
-                ", and {} earlier since turn:{name}/{}",
-                t.count - 1,
-                t.first
-            ));
-        }
-        line
-    };
-    let mut lines: Vec<String> = items.iter().filter(|i| i.1 == "act").map(line).collect();
-    let theirs: Vec<String> = items.iter().filter(|i| i.1 == "theirs").map(line).collect();
-    if !theirs.is_empty() {
-        lines.push(
-            "The person asked for these turns in the task themselves, so they are theirs:".into(),
-        );
-        lines.extend(theirs);
+/// A task's latest turn of one kind, as the note names it.
+fn line(name: &str, theirs: bool, t: &Turn) -> Line {
+    let mut text = format!("- {name}: turn:{name}/{} {}", t.turn, t.status);
+    if let Some(by) = &t.by {
+        text.push_str(&format!(", asked by {by}"));
     }
-    if more > 0 {
-        lines.push(format!("- {more} more tasks in the next update"));
+    if t.count > 1 {
+        text.push_str(&format!(
+            ", and {} earlier since turn:{name}/{}",
+            t.count - 1,
+            t.first
+        ));
     }
-    format!(
-        "Task updates: since you last heard, tasks you started ended turns or wait for an approval. The wait tool reads each one's final reply by its handle.\n{}",
-        lines.join("\n")
-    )
-}
-
-/// FNV-1a over the text's UTF-16 units, 64 bits as hex, as the app makes
-/// it.
-fn digest(text: &str) -> String {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for unit in text.encode_utf16() {
-        hash = (hash ^ unit as u64).wrapping_mul(0x100000001b3);
+    let approval = t.approval.as_deref().unwrap_or("");
+    Line {
+        handle: format!("turn:{name}/{}", t.turn),
+        theirs,
+        text,
+        key: format!("{name}/{}/{}/{theirs}/{approval}", t.turn, t.status),
     }
-    format!("{hash:016x}")
 }
 
 struct Fact {
     path: String,
-    description: String,
     source: String,
     modified: u64,
 }
 
 /// The facts in a memory folder, none in one not there; None when one of
-/// them cannot be read, as the app counts such a folder unread.
+/// them cannot be read.
 fn facts(dir: &Path) -> Option<Vec<Fact>> {
     let entries = match std::fs::read_dir(dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
@@ -630,91 +595,11 @@ fn facts(dir: &Path) -> Option<Vec<Fact>> {
             .map_or(0, |d| d.as_millis() as u64);
         found.push(Fact {
             path: path.to_string_lossy().into_owned(),
-            description: field("description")?,
             source: field("source")?,
             modified,
         });
     }
     Some(found)
-}
-
-/// Follow the daemon for the lead's tasks and tell it their news, for as
-/// long as Sonny runs, connecting again when the daemon goes.
-pub async fn run(socket: PathBuf, lead: String, project: String) {
-    let memory = std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agents/memory"));
-    let mut updates = Updates::new(&lead, &project, memory);
-    loop {
-        if let Ok((client, mut events)) = Client::connect(&socket).await
-            && seat_all(&client, &mut updates).await
-            && client
-                .request("follow", json!({"bot": "*", "after": 0}))
-                .await
-                .is_ok()
-        {
-            updates.live = false;
-            let mut tick = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                tokio::select! {
-                    event = events.recv() => match event {
-                        Some(event) => updates.event(&event, Instant::now()),
-                        None => break,
-                    },
-                    _ = tick.tick() => {}
-                }
-                let now = Instant::now();
-                updates.expire(now);
-                if updates.due(now) {
-                    tell(&client, &mut updates, &lead, now).await;
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
-}
-
-async fn seat_all(client: &Client, updates: &mut Updates) -> bool {
-    let mut after = Value::Null;
-    let mut listed = HashSet::new();
-    loop {
-        let Ok(page) = client
-            .request("bots", json!({"after": after, "limit": 256}))
-            .await
-        else {
-            return false;
-        };
-        for record in page["bots"].as_array().into_iter().flatten() {
-            updates.seat(record);
-            listed.extend(record["name"].as_str().map(str::to_owned));
-        }
-        after = page["next_after"].clone();
-        if after.is_null() {
-            updates.seated(&listed);
-            return true;
-        }
-    }
-}
-
-async fn tell(client: &Client, updates: &mut Updates, lead: &str, now: Instant) {
-    let Some(wake) = updates.take(now) else {
-        return;
-    };
-    let lead_id = updates.bots.get(lead).and_then(|b| b.id);
-    let sent = client
-        .request(
-            "submit",
-            json!({"bot": lead, "bot_id": lead_id, "request_id": wake.request_id,
-                "prompt": wake.prompt, "delivery": "queue", "origin": "tasks"}),
-        )
-        .await;
-    match sent {
-        Ok(_) => updates.sent(wake),
-        Err(error) => match error.code.as_str() {
-            "bot_not_found" => updates.forget(),
-            // Another client told it first.
-            "idempotency_conflict" => {}
-            _ => updates.unsent(wake),
-        },
-    }
 }
 
 #[cfg(test)]
@@ -749,6 +634,18 @@ mod tests {
         updates
     }
 
+    /// The note's lines and its memory paragraph.
+    fn text(told: &Told) -> String {
+        let mut text = (told.items.iter().map(|i| i.text.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Some(memory) = &told.memory {
+            text.push_str("\n\n");
+            text.push_str(memory);
+        }
+        text
+    }
+
     fn turn(updates: &mut Updates, bot: &str, turn: i64, from: Value, status: &str) {
         let now = Instant::now();
         updates.event(&ev(bot, Some(turn), "accepted", from), now);
@@ -759,7 +656,7 @@ mod tests {
     }
 
     #[test]
-    fn the_lead_hears_its_tasks_once_it_rests_in_the_apps_words() {
+    fn the_lead_hears_its_tasks_once_it_rests() {
         let mut updates = fleet();
         let now = Instant::now();
         updates.event(
@@ -805,18 +702,16 @@ mod tests {
             now,
         );
         assert!(updates.due(now));
-        let wake = updates.take(now).unwrap();
+        let told = updates.take(now);
         assert_eq!(
-            wake.prompt,
-            "Task updates: since you last heard, tasks you started ended turns or wait for an approval. The wait tool reads each one's final reply by its handle.\n\
-             - shop.fix: turn:shop.fix/5 failed, asked by you, and 1 earlier since turn:shop.fix/4\n\
-             The person asked for these turns in the task themselves, so they are theirs:\n\
+            text(&told),
+            "- shop.fix: turn:shop.fix/5 failed, asked by you, and 1 earlier since turn:shop.fix/4\n\
              - shop.docs: turn:shop.docs/2 completed, asked by the person"
         );
-        // The app's ID for the same news, so either client's message is the one.
-        // As app.js's digest makes it of the same news.
-        assert_eq!(wake.request_id, "app-wake-1-3db47f6e6680999f");
-        updates.sent(wake);
+        let theirs: Vec<bool> = told.items.iter().map(|i| i.theirs).collect();
+        assert_eq!(theirs, [false, true]);
+        assert_eq!(told.items[0].handle, "turn:shop.fix/5");
+        updates.sent(told);
         // Ten minutes apart at most.
         turn(
             &mut updates,
@@ -868,26 +763,21 @@ mod tests {
             ),
             now,
         );
-        let wake = updates.take(now).unwrap();
-        assert!(
-            wake.prompt
-                .ends_with("\n- shop.docs: turn:shop.docs/2 waiting for approval"),
-            "{}",
-            wake.prompt
+        let told = updates.take(now);
+        assert_eq!(
+            text(&told),
+            "- shop.docs: turn:shop.docs/2 waiting for approval",
+            "the lead read shop.fix with its wait"
         );
-        assert!(
-            !wake.prompt.contains("shop.fix"),
-            "the lead read it with its wait"
-        );
-        // Refused for another reason: the news comes back for next time.
-        updates.unsent(wake);
-        let again = updates.take(now + WAKE).unwrap();
-        assert!(again.prompt.contains("shop.docs/2 waiting for approval"));
+        // Refused: the news comes back for next time.
+        updates.unsent(told);
+        let again = updates.take(now + WAKE);
+        assert!(text(&again).contains("shop.docs/2 waiting for approval"));
     }
 
     #[test]
     fn memory_changes_ride_along_less_the_leads_own() {
-        let root = std::env::temp_dir().join(format!("sonny-updates-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("lookout-updates-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let project = root.join("projects/shop");
         std::fs::create_dir_all(&project).unwrap();
@@ -911,14 +801,12 @@ mod tests {
                 json!({"from": {"bot": "shop.lead", "turn": 9}}),
                 "completed",
             );
-            let wake = updates.take(now).unwrap();
-            let prompt = wake.prompt.clone();
-            updates.sent(wake);
+            let told = updates.take(now);
+            let prompt = text(&told);
+            updates.sent(told);
             prompt
         };
-        assert!(
-            news(&mut updates).contains(&format!("- saved: {}/old.md: about old", root.display()))
-        );
+        assert!(news(&mut updates).contains(&format!("- saved: {}/old.md", root.display())));
         fact(&project, "flow", "turn:shop.fix/4");
         fact(&project, "mine", "turn:shop.lead/9");
         std::fs::remove_file(root.join("old.md")).unwrap();
@@ -929,7 +817,7 @@ mod tests {
             format!(
                 "Memory changed since you last heard; each fact is a file, read before relying on it:\n\
                  - removed: {root}/old.md\n\
-                 - saved: {root}/projects/shop/flow.md: about flow",
+                 - saved: {root}/projects/shop/flow.md",
                 root = root.display()
             )
         );
@@ -969,7 +857,7 @@ mod tests {
                 updates.seat(&json!({"name": "shop.lead", "bot_id": 7, "status": "idle"}));
             }
             assert!(!updates.due(now), "{gone}");
-            assert!(updates.take(now).unwrap().sent.is_empty());
+            assert!(updates.take(now).sent.is_empty());
         }
     }
 
@@ -984,14 +872,14 @@ mod tests {
             json!({"from": {"bot": "shop.lead", "turn": 9}}),
             "completed",
         );
-        // Deleted and made again while Sonny was away: seated afresh.
+        // Deleted and made again while the lookout was away: seated afresh.
         updates.seat(&json!({"name": "shop.fix", "bot_id": 99, "status": "idle"}));
         assert!(!updates.due(now));
-        assert!(updates.take(now).unwrap().sent.is_empty());
+        assert!(updates.take(now).sent.is_empty());
     }
 
     #[test]
-    fn a_task_deleted_while_sonny_was_away_has_no_news() {
+    fn a_task_deleted_while_the_lookout_was_away_has_no_news() {
         let now = Instant::now();
         let mut updates = fleet();
         turn(
@@ -1006,12 +894,6 @@ mod tests {
             .into();
         updates.seated(&listed);
         assert!(!updates.due(now));
-        assert!(updates.take(now).unwrap().sent.is_empty());
-    }
-
-    #[test]
-    fn digest_is_the_apps() {
-        // FNV-1a 64 of "a": the app's digest('a').
-        assert_eq!(digest("a"), "af63dc4c8601ec8c");
+        assert!(updates.take(now).sent.is_empty());
     }
 }

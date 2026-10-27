@@ -61,7 +61,6 @@ struct Options {
     compaction_model: Option<String>,
     fallbacks: bool,
     discover: bool,
-    replay: bool,
     after: i64,
     /// Listing filters: a GLOB on bot names, bots with a turn running,
     /// newest first.
@@ -139,7 +138,6 @@ fn parse(args: &[String]) -> Result<Options> {
         compaction_model: None,
         fallbacks: false,
         discover: false,
-        replay: false,
         after: 0,
         name: None,
         active: false,
@@ -192,7 +190,6 @@ fn parse(args: &[String]) -> Result<Options> {
             "--no-compaction" => options.compaction_instructions = None,
             "--fallbacks" => options.fallbacks = true,
             "--discover" => options.discover = true,
-            "--replay" => options.replay = true,
             "--detach" => options.detach = true,
             "--all" => options.all = true,
             "--any" => options.any = true,
@@ -1052,7 +1049,6 @@ pub fn main(args: Vec<String>) -> Result<i32> {
         "approvals" => approvals(&options),
         "answer" => answer(&options),
         "approver" => approver(&options),
-        "lookout" => lookout(&options),
         "models" => models(&options),
         // The daemon's ready line, from the running one or one started now,
         // with the socket it answered on, so a caller that reached this
@@ -1828,27 +1824,6 @@ fn approver(options: &Options) -> Result<i32> {
         tag: options.tag.clone().unwrap_or_else(|| "auto".into()),
         judge,
         note,
-    })
-}
-
-/// `agent lookout`: one lookout for the store's daemon, or a replay of
-/// its checks over what the store kept.
-fn lookout(options: &Options) -> Result<i32> {
-    if options.replay {
-        let judges = options
-            .judge
-            .as_deref()
-            .ok_or_else(|| Error::with("usage", "--replay needs --judge SPEC[,SPEC]..."))?;
-        return crate::lookout::replay(
-            options.socket.clone(),
-            judges,
-            options.limit.unwrap_or(150),
-        );
-    }
-    crate::lookout::main(crate::lookout::Settings {
-        store: options.store.clone(),
-        socket: options.socket.clone(),
-        judge: options.judge.clone(),
     })
 }
 

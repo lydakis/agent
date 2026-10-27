@@ -17,6 +17,7 @@ mod herdr;
 mod html;
 mod image;
 mod js;
+mod lookout;
 mod math;
 mod mermaid;
 mod models;
@@ -32,9 +33,7 @@ mod table;
 mod task;
 mod term;
 mod transcript;
-mod updates;
 
-use agent_client::history::{responses, text};
 use agent_client::{Client, Events};
 use ratatui::{
     Terminal, TerminalOptions, Viewport,
@@ -104,7 +103,9 @@ fn usage() -> String {
      sonny task NAME [--setup] [RUN FLAGS] -- BRIEF, from the lead's shell, makes a task's\n\
      folder that way and starts the task there; sonny task changes NAME [--apply] lists\n\
      (or writes here) what a sandfs copy of a plain folder changed.\n\
-     Sonny starts Agent's lookout, which wakes the lead when its tasks need it."
+     sonny lookout [--judge PROVIDER/MODEL|off] watches every lead on the daemon and\n\
+     wakes it when its tasks need it; Sonny starts one. sonny lookout --replay --judge\n\
+     SPEC[,SPEC]... [--limit N] runs its checks over what the store kept."
         .into()
 }
 
@@ -316,11 +317,11 @@ async fn serve_auto(client: &Client, options: &Options, model: &str) -> Result<(
     Ok(())
 }
 
-/// Agent's lookout, which wakes leads when their tasks need them: started
-/// detached, logging beside the store. One already watching this daemon
-/// keeps it, and the new one exits.
+/// The lookout, `sonny lookout`, which wakes leads when their tasks need
+/// them: started detached, logging beside the store. One already watching
+/// this daemon keeps it, and the new one exits.
 fn start_lookout(options: &Options) -> Result<(), String> {
-    let bin = agent_bin().ok_or("Agent's binary was not found for the lookout; set AGENT_BIN")?;
+    let me = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut log = options.store.clone().into_os_string();
     log.push(".lookout.log");
     let log = std::fs::OpenOptions::new()
@@ -328,7 +329,9 @@ fn start_lookout(options: &Options) -> Result<(), String> {
         .append(true)
         .open(&log)
         .map_err(|e| e.to_string())?;
-    let mut command = agent_command(&bin)?;
+    // The judge's settings and keys are in Agent's env file, as for the
+    // approver.
+    let mut command = agent_command(&me)?;
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
@@ -343,7 +346,7 @@ fn start_lookout(options: &Options) -> Result<(), String> {
         .stdout(log.try_clone().map_err(|e| e.to_string())?)
         .stderr(log)
         .spawn()
-        .map_err(|e| format!("{}: {e}", bin.display()))?;
+        .map_err(|e| format!("{}: {e}", me.display()))?;
     // Reaped when it exits, as it does at once when another one watches.
     std::thread::spawn(move || child.wait());
     Ok(())
@@ -382,6 +385,23 @@ async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events
         .map_err(|e| e.to_string())
 }
 
+/// The store and socket given, else the environment's, else Agent's own.
+fn daemon_paths(
+    store: Option<PathBuf>,
+    socket: Option<PathBuf>,
+) -> Result<(PathBuf, PathBuf), String> {
+    let store = match store.or_else(|| std::env::var_os("AGENT_STORE").map(PathBuf::from)) {
+        Some(store) => store,
+        None => PathBuf::from(std::env::var_os("HOME").ok_or("set --store or HOME")?)
+            .join(".agent/state.sqlite"),
+    };
+    let socket = match socket.or_else(|| std::env::var_os("AGENT_SOCKET").map(PathBuf::from)) {
+        Some(socket) => socket,
+        None => agent_client::socket::default_socket(&store).map_err(|e| e.to_string())?,
+    };
+    Ok((store, socket))
+}
+
 fn parse() -> Result<Options, String> {
     let mut args = std::env::args().skip(1);
     let (mut store, mut socket, mut bot, mut new, mut model, mut workspace) =
@@ -411,15 +431,7 @@ fn parse() -> Result<Options, String> {
             _ => return Err(usage()),
         }
     }
-    let store = match store.or_else(|| std::env::var_os("AGENT_STORE").map(PathBuf::from)) {
-        Some(store) => store,
-        None => PathBuf::from(std::env::var_os("HOME").ok_or("set --store or HOME")?)
-            .join(".agent/state.sqlite"),
-    };
-    let socket = match socket.or_else(|| std::env::var_os("AGENT_SOCKET").map(PathBuf::from)) {
-        Some(socket) => socket,
-        None => agent_client::socket::default_socket(&store).map_err(|e| e.to_string())?,
-    };
+    let (store, socket) = daemon_paths(store, socket)?;
     Ok(Options {
         store,
         socket,
@@ -442,6 +454,7 @@ fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
         Some((task, rest)) if task == "task" => task::run(rest),
+        Some((lookout, rest)) if lookout == "lookout" => lookout::run(rest),
         _ => tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -533,14 +546,6 @@ async fn run() -> Result<(), String> {
     if let Some(model) = options.model.as_ref().filter(|m| **m != app.model) {
         app.model = model.clone();
         app.turn_model = Some(model.clone());
-    }
-    // The lead hears what its tasks did, as the app tells it.
-    if let Some(project) = &project {
-        tokio::spawn(updates::run(
-            app.options.socket.clone(),
-            name.clone(),
-            project.clone(),
-        ));
     }
     // Tasks are laid out in Rex when the person is in it (or names the
     // Rex server to use); elsewhere they run out of sight, in /status.
@@ -3402,6 +3407,19 @@ fn first_line(text: &str) -> String {
     cut
 }
 
+/// A message item's text.
+fn text(item: &Value) -> String {
+    match &item["content"] {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
 /// A tool result's text, and whether it failed. A shell result is JSON
 /// with its streams and exit status.
 fn output(item: &Value) -> (String, bool) {
@@ -3418,6 +3436,37 @@ fn output(item: &Value) -> (String, bool) {
         }
         _ => (raw, failed),
     }
+}
+
+/// An item as the Responses family shapes it, which the transcript reads.
+/// An Anthropic message's `tool_use` blocks become function calls after
+/// its text, and a user message's `tool_result` blocks their outputs.
+fn responses(item: &Value) -> Vec<Value> {
+    let Some(parts) = item["content"].as_array() else {
+        return Vec::from_iter((!item.is_null()).then(|| item.clone()));
+    };
+    let tool = |part: &&Value| matches!(part["type"].as_str(), Some("tool_use" | "tool_result"));
+    if !parts.iter().any(|part| tool(&part)) {
+        return vec![item.clone()];
+    }
+    let said: Vec<&Value> = parts.iter().filter(|part| part["type"] == "text").collect();
+    let mut items = Vec::new();
+    if item["role"] == "assistant" || !said.is_empty() {
+        items.push(json!({"role": item["role"], "content": said}));
+    }
+    for part in parts.iter().filter(tool) {
+        items.push(match part["type"].as_str() {
+            Some("tool_use") => json!({"type": "function_call", "call_id": part["id"],
+                "name": part["name"], "arguments": part["input"].to_string()}),
+            _ => json!({"type": "function_call_output", "call_id": part["tool_use_id"],
+                "output": match &part["content"] {
+                    Value::String(output) => output.clone(),
+                    content => text(&json!({"content": content})),
+                },
+                "failed": part["is_error"] == true}),
+        });
+    }
+    items
 }
 
 #[cfg(test)]

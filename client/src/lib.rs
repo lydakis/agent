@@ -4,7 +4,6 @@
 //! on the runtime crate.
 pub mod approver;
 pub mod env_file;
-pub mod history;
 pub mod models;
 pub mod policy;
 pub mod project;

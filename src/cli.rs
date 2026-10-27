@@ -121,14 +121,6 @@ const COMMANDS: &[Command] = &[
         startup: false,
     },
     Command {
-        name: "lookout",
-        about: "Wake each lead when its tasks need it, judged by a model, until the daemon stops",
-        usage: "lookout [--judge PROVIDER/MODEL|off] | lookout --replay --judge SPEC[,SPEC]... [--limit N]",
-        flags: "--judge --replay --limit",
-        settings: "",
-        startup: false,
-    },
-    Command {
         name: "models",
         about: "The models the providers serve",
         usage: "models [--discover]",
@@ -394,10 +386,6 @@ fn print_flags(flags: &str) {
                 "The judge API's base URL; default TYPESAFE_BASE_URL or https://api.typesafe.ai for Jev, https://api.openai.com for Decisions",
             ),
             "--reason" => ("TEXT", "Why, shown to the model with a denial"),
-            "--replay" => (
-                "",
-                "Run the lookout's checks over what the store kept and print each; wakes no one",
-            ),
             "--approval-hold" => (
                 "DURATION",
                 "A new bot's gated calls wait this long for a verdict before the turn parks; default 2s",
@@ -540,7 +528,6 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                 | "--agents"
                 | "--fallbacks"
                 | "--discover"
-                | "--replay"
         ) {
             if inline.is_some() {
                 return fail_with("usage", format!("{flag} takes no value"));

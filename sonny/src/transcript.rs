@@ -509,8 +509,8 @@ fn words(text: &str) -> impl Iterator<Item = &str> {
 /// A prompt, as the person (or another bot) sent it.
 pub fn prompt(text: &str, from: Option<&str>, width: usize) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-    // What Sonny (or the app) told the lead of its tasks: news, not words
-    // of the person's.
+    // What the lookout (or the app) told the lead of its tasks: news, not
+    // words of the person's.
     if text.starts_with(TASK_UPDATES) {
         out.push(Line::from("↳ Task updates").dim());
         let lines: Vec<&str> = text.lines().skip(1).filter(|l| !l.is_empty()).collect();
