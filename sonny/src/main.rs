@@ -3653,7 +3653,7 @@ mod tests {
         app.daemon(turn_event("accepted", 1, json!({}))).await;
         // Sent while turn 1 runs: two steers, turns 2 and 3.
         for prompt in ["steer one", "steer two"] {
-            app.input = prompt.into();
+            app.input.set(prompt);
             app.submit().await;
         }
         assert_eq!(staged(&app), [2, 3]);
@@ -3676,7 +3676,7 @@ mod tests {
         app.daemon(turn_event("accepted", 3, json!({}))).await;
         assert!(app.staged.is_empty());
         // A prompt whose turn ends without starting is unstaged too.
-        app.input = "never ran".into();
+        app.input.set("never ran");
         app.submit().await;
         app.daemon(turn_event(
             "turn_finished",
