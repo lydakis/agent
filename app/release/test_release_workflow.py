@@ -80,6 +80,22 @@ class LinuxBuildTest(unittest.TestCase):
         self.assertNotIn("secrets.APP", job)
 
 
+class SourceFormulaTest(unittest.TestCase):
+    def test_the_release_carries_its_source_and_both_formulas(self):
+        release = (WORKFLOWS / "release.yml").read_text()
+        self.assertIn('git archive --format=tar.gz --prefix="agent-${version}/"', release)
+        for asset in ["dist/agent-*.tar.gz", "dist/agent-formula.rb", "dist/sonny-formula.rb"]:
+            # Attested and on the draft.
+            self.assertEqual(release.count(asset), 2, asset)
+        publish = (WORKFLOWS / "publish-homebrew.yml").read_text()
+        self.assertIn("--pattern agent-formula.rb", publish)
+        self.assertIn("--pattern sonny-formula.rb", publish)
+        self.assertIn('"tap/Formula/$name.rb"', publish)
+        # The daemon's formula reaches the tap before Sonny's, which needs it.
+        self.assertIn("for name in agent sonny; do", publish)
+        self.assertIn("brew install --formula lydakis/agent/sonny", publish)
+
+
 class ReleaseWorkflowTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
