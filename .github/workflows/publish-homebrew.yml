@@ -131,6 +131,9 @@ jobs:
           mkdir -p "$tap_parent"
           ln -sfn "$GITHUB_WORKSPACE/tap" "$tap_parent/homebrew-agent"
           for name in agent sonny; do
+            # Homebrew 6 loads nothing from a third-party tap it is not told
+            # to trust; trust only the two formulas this job checks.
+            brew trust --formula "lydakis/agent/$name"
             ruby -c "tap/Formula/$name.rb"
             brew style "lydakis/agent/$name"
             brew audit --formula --strict --online "lydakis/agent/$name"
