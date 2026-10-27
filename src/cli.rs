@@ -348,7 +348,7 @@ fn print_flags(flags: &str) {
             ),
             "--compact-tokens" => (
                 "N",
-                "A new bot elides, then compacts, once a call's input reaches N tokens, whichever of this and --compact-at comes first; 0 leaves --compact-at; default 200000",
+                "A new bot elides, then compacts, once a call's input reaches N tokens, whichever of this and --compact-at comes first; 0 leaves --compact-at; by default its model's context window less 33000 tokens, at most 90% of it",
             ),
             "--compaction-instructions" => (
                 "TEXT",

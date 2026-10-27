@@ -44,6 +44,22 @@ class Model(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
+    def do_GET(self):
+        # A listing only when a test gives the model a context window.
+        window = getattr(self.server, 'context_window', None)
+        if not self.path.endswith('/models') or window is None:
+            self.send_response(404)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return
+        models = getattr(self.server, 'models', None) or ('synthetic-model',)
+        body = json.dumps({'data': [{'id': m, 'context_window': window} for m in models]}).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_POST(self):
         try:
             body = self.rfile.read(int(self.headers['Content-Length']))

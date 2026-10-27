@@ -88,6 +88,19 @@ impl Provider {
         listed
     }
 
+    /// The context window the provider's listing gives `model`, from a
+    /// listing a client asked for and the provider kept, however old: a
+    /// turn sends the provider nothing it did not ask for.
+    pub fn listed_window(&self, model: &str) -> Option<u64> {
+        let kept = self.listing.0.try_lock().ok()?;
+        let (_, listed, _) = kept.as_ref()?;
+        let models: Vec<Value> = serde_json::from_str(listed.as_ref().ok()?).ok()?;
+        models
+            .iter()
+            .find(|entry| entry["id"] == model)
+            .and_then(|entry| entry["context_tokens"].as_u64())
+    }
+
     /// A ChatGPT login refused with 401 is refreshed and tried once more,
     /// as a completion is.
     async fn list_models(&self) -> Result<Vec<Value>> {

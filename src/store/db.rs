@@ -171,8 +171,9 @@ pub struct Settings {
     pub compact_keep: Option<usize>,
     /// Input tokens per request at which elision and compaction start, as
     /// the provider counted the bot's last call; the byte threshold applies
-    /// as well, and whichever is reached first starts them. Zero leaves
-    /// only the byte threshold.
+    /// as well, and whichever is reached first starts them. Unset, it
+    /// follows the model's context window ([`compact_threshold`]). Zero
+    /// leaves only the byte threshold.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compact_tokens: Option<u64>,
     /// After each of its turns finishes, prune the bot to this many turns'
@@ -203,10 +204,17 @@ pub enum CacheTtl {
     Hour,
 }
 const MIN_CONTEXT_BYTES: usize = 1024;
-/// Where Claude Code and Codex compact on their standard 200K and 272K
-/// windows, near enough: past it, every round resends a long context.
-pub const DEFAULT_COMPACT_TOKENS: u64 = 200_000;
 const MIN_COMPACT_TOKENS: u64 = 1024;
+/// Where a model with a `window`-token context compacts unless the bot
+/// sets `compact_tokens`, as Codex and Claude Code compute it: the window
+/// less 20,000 tokens kept for the reply and a 13,000-token buffer, and
+/// at most 90% of it.
+pub fn compact_threshold(window: u64) -> u64 {
+    window
+        .saturating_sub(33_000)
+        .min(window / 10 * 9)
+        .max(MIN_COMPACT_TOKENS)
+}
 const MIN_CONTEXT_ITEMS: usize = 2;
 impl Settings {
     pub fn context_bytes(&self) -> usize {
@@ -224,9 +232,14 @@ impl Settings {
     pub fn compact_keep(&self) -> usize {
         self.compact_keep.unwrap_or(25)
     }
-    /// `None` when only the byte threshold applies.
-    pub fn compact_tokens(&self) -> Option<u64> {
-        Some(self.compact_tokens.unwrap_or(DEFAULT_COMPACT_TOKENS)).filter(|&n| n > 0)
+    /// The token threshold for a model whose context holds `window`
+    /// tokens; `None` when only the byte threshold applies.
+    pub fn compact_tokens(&self, window: u64) -> Option<u64> {
+        match self.compact_tokens {
+            Some(0) => None,
+            Some(tokens) => Some(tokens),
+            None => Some(compact_threshold(window)),
+        }
     }
     pub fn approval_hold_ms(&self) -> u64 {
         self.approval_hold_ms.unwrap_or(2000)
@@ -288,7 +301,7 @@ impl Settings {
     pub fn resolved(&self) -> Value {
         json!({"context_bytes":self.context_bytes(),"context_items":self.context_items(),
             "note_turns":self.note_turns(),"compact_at":self.compact_at(),
-            "compact_keep":self.compact_keep(),"compact_tokens":self.compact_tokens().unwrap_or(0),
+            "compact_keep":self.compact_keep(),"compact_tokens":self.compact_tokens,
             "keep_turns":self.keep_turns,
             "approval_hold_ms":self.approval_hold_ms(),"max_output_tokens":self.max_output_tokens,
             "keep_warm":self.keep_warm().map_or(0, |after| after.as_secs()),
@@ -9047,6 +9060,21 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compaction_follows_the_window_as_codex_and_claude_code_do() {
+        assert_eq!(compact_threshold(1_000_000), 900_000);
+        assert_eq!(compact_threshold(272_000), 239_000);
+        assert_eq!(compact_threshold(200_000), 167_000);
+        assert_eq!(compact_threshold(0), MIN_COMPACT_TOKENS);
+        let unset = Settings::default();
+        assert_eq!(unset.compact_tokens(200_000), Some(167_000));
+        let off = Settings {
+            compact_tokens: Some(0),
+            ..Settings::default()
+        };
+        assert_eq!(off.compact_tokens(200_000), None);
+    }
 
     #[test]
     fn a_round_is_served_per_tag_in_numbered_parts() {

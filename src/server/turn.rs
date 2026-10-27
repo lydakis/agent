@@ -180,6 +180,8 @@ pub struct Turn {
     /// The bot's context, compaction and approval settings, read with its
     /// record when the turn's rounds begin.
     pub settings: std::sync::OnceLock<Settings>,
+    /// The turn's model's context window, as the turn starts.
+    pub window: std::sync::OnceLock<u64>,
     /// The park this task continues, already claimed by the service: record
     /// its wait results, then keep going.
     pub resumed: Option<Waiting>,
@@ -785,8 +787,9 @@ impl Turn {
     /// Before a first call there is no estimate and only bytes apply.
     fn soft_bytes(&self, record: &agent_runtime::store::Bot, overhead: usize) -> usize {
         let budget = self.settings().context_bytes();
+        let window = self.window.get().copied().unwrap_or(200_000);
         let (Some(tokens), Some((bytes, counted))) =
-            (self.settings().compact_tokens(), record.sent)
+            (self.settings().compact_tokens(window), record.sent)
         else {
             return budget;
         };
@@ -1855,6 +1858,8 @@ impl Turn {
         }
         let shaped = shaped(provider, self.settings())?;
         let provider: &Provider = &shaped;
+        self.window
+            .get_or_init(|| agent_runtime::provider::context_window(provider, model));
         let workspace = PathBuf::from(&context.workspace);
         // What this turn's children inherit: the CLI a bot runs to delegate
         // needs a model for the peer (its own by default) and its effort
@@ -4367,6 +4372,7 @@ mod tests {
             handles: handles.clone(),
             background_failures: mpsc::unbounded_channel().0,
             settings: Default::default(),
+            window: Default::default(),
             resumed: None,
             steers: Arc::new(AtomicBool::new(true)),
             compact: Arc::default(),

@@ -381,7 +381,7 @@ keep-warm when it sets any of them.
 | `note_turns` (`--note-turns`) | Omitted turns the context note lists, newest first, with the first line of each prompt. 0 lists none. | 48 |
 | `compact_at` (`--compact-at`) | Percent of either context envelope that triggers compaction, and of the byte envelope that triggers tool-result elision first. Estimated completion headroom can advance the byte trigger without reducing the input allowance. | 75 |
 | `compact_keep` (`--compact-keep`) | Target percent of either context envelope kept verbatim: as newest whole turns by compaction, as newest items by elision. Reduced when pinned context leaves less room. Must be below `compact_at`. | 25 |
-| `compact_tokens` (`--compact-tokens`) | Input tokens per request that start elision and compaction too, whichever of this and `compact_at` comes first (see [compaction](#compaction)). 0 leaves only `compact_at`; otherwise at least 1,024. | 200,000 |
+| `compact_tokens` (`--compact-tokens`) | Input tokens per request that start elision and compaction too, whichever of this and `compact_at` comes first (see [compaction](#compaction)). 0 leaves only `compact_at`; otherwise at least 1,024. | from the model's context window |
 | `keep_turns` (`--keep-turns`) | After each of its turns finishes, prune the bot to this many turns' records (see [Retention](#retention)). | none |
 | `approval_hold_ms` (`--approval-hold`) | Milliseconds a gated call waits live for its verdict before its turn parks (see [tool approval](#tool-approval)). 0 parks at once; at most 3,600,000. | 2,000 |
 | `max_output_tokens` (`--max-output-tokens`) | Generated tokens per model call, including reasoning, summaries included. Anthropic calls use the model's full output limit (read inside Bedrock ids) unless this is set; set, it is sent as `max_tokens`, at least 2,048 so a legacy thinking budget of 1,024 or more fits beside the answer. Bedrock deducts input plus this bound from quota when a call starts, so a bound near real output buys throughput there. | none |
@@ -2303,10 +2303,20 @@ family; another family's items cannot be replayed to it).
 
 The token threshold is what Claude Code and Codex compact on; bytes alone
 compacted far too late, since the 8 MiB default envelope is about two million
-tokens, past any model's window. A view's tokens are estimated from the bot's
+tokens, past any model's window. Unset, it follows the turn's model the way
+they compute it: the context window less 20,000 tokens kept for the reply and
+a 13,000-token buffer, and at most 90% of the window (900,000 on a 1M window,
+167,000 on 200K). The window is the one the provider's model listing gives
+(`context_tokens`, as `provider_models` answers) when a client has asked for
+it and the provider kept it, as a model picker does (a turn never asks a
+provider for anything but its call). Otherwise, as for a provider that
+lists none, Claude models get the window Anthropic publishes, 1M from Claude 5
+on and 200K before, and any other model 200K, the smallest a current model
+has. A
+view's tokens are estimated from the bot's
 last call: the bytes it sent (view, instructions and tools) against the input
 tokens the provider counted for them, cache reads and writes included,
-kept on the bot (`sent_bytes`, `sent_tokens`, schema 51). The threshold then
+kept on the bot (`sent_bytes`, `sent_tokens`, schema 52). The threshold then
 acts as a smaller byte envelope, the one whose `compact_at` percent is the
 view that sends `compact_tokens`, so `compact_keep` and elision's own
 threshold and saving scale with it. Before a bot's first call, or after one

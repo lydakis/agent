@@ -1902,6 +1902,7 @@ impl Service {
             handles: self.handles.clone(),
             background_failures: self.background_failures.clone(),
             settings: Default::default(),
+            window: Default::default(),
             resumed,
             steers,
             compact,

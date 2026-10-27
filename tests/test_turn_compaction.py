@@ -192,6 +192,23 @@ class TurnCompactionTests(ModelFixture):
                     self.assertGreater(largest, 40 * 11000)
                 client.close()
 
+    def test_an_unset_threshold_follows_the_models_listed_window(self):
+        # A 40,000-token window compacts at 7,000 tokens, its window less
+        # 33,000: about 28 KiB at four bytes a token. The window is the
+        # listing a client asked for.
+        self.model.bytes_per_token, self.model.context_window = 4, 40000
+        client = self.client(tools='shell')
+        listed = client.request('provider_models')['result']['providers']
+        self.assertEqual([m['context_tokens'] for p in listed.values() for m in p['models']][:1], [40000])
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
+                       compaction_instructions='Summarize.')
+        self.assertIsNone(client.request('inspect', bot='Bob')['result']['settings']['compact_tokens'])
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:40')['result']['turn']
+        self.assertEqual(client.finished(turn, timeout=60)['data']['status'], 'completed')
+        self.assertTrue([e for e in all_events(client, 'Bob') if e['event'] == 'compacted'])
+        work = [r for r in drain(self.model) if not is_summary(r)]
+        self.assertLess(max(len(json.dumps(r)) for r in work), 7000 * 4 + 24576)
+
     def test_a_compaction_a_client_asks_for_runs_before_the_next_call(self):
         client = self.client(tools='shell')
         client.request('create', bot='Plain', workspace=str(self.path), tools=['shell'])

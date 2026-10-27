@@ -1555,6 +1555,27 @@ fn claude_model(model: &str) -> &str {
         .unwrap_or(model)
 }
 
+/// The model's context window in tokens: what the provider's listing
+/// says, else the window Anthropic publishes for a Claude model (1M from
+/// Claude 5 on, 200K before), else 200K, the smallest a current model has.
+pub fn context_window(provider: &Provider, model: &str) -> u64 {
+    if let Some(tokens) = provider.listed_window(model) {
+        return tokens;
+    }
+    let claude = claude_model(model);
+    let before_5 = [
+        "claude-2",
+        "claude-3",
+        "claude-opus-4",
+        "claude-sonnet-4",
+        "claude-haiku-4",
+    ];
+    match claude.starts_with("claude-") && !before_5.iter().any(|old| claude.starts_with(old)) {
+        true => 1_000_000,
+        false => 200_000,
+    }
+}
+
 /// The model's full output limit. A lower cap fails any answer that runs
 /// past it, and Anthropic counts only generated tokens against output rate
 /// limits, so the full limit costs nothing until it is used.
@@ -1769,6 +1790,22 @@ mod tests {
     use crate::codec::Family;
     fn none() -> Box<RawValue> {
         RawValue::from_string("[]".into()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_unlisted_window_is_the_one_anthropic_publishes_else_200k() {
+        let transport = Transport::new(64, 1).unwrap();
+        let provider =
+            Provider::new(transport, Family::Anthropic, "http://127.0.0.1:1/v1", None).unwrap();
+        for (model, window) in [
+            ("claude-opus-5-5", 1_000_000),
+            ("us.anthropic.claude-sonnet-5-5-v1:0", 1_000_000),
+            ("anthropic.claude-sonnet-4-5-20250929-v1:0", 200_000),
+            ("claude-opus-4-6", 200_000),
+            ("gpt-6-luna", 200_000),
+        ] {
+            assert_eq!(context_window(&provider, model), window, "{model}");
+        }
     }
 
     #[test]
