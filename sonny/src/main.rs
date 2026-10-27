@@ -477,12 +477,9 @@ fn main() -> std::process::ExitCode {
         Some((verb, rest)) if verb == trigger::VERB => {
             return std::process::ExitCode::from(trigger::cli(rest) as u8);
         }
-        // launchd runs these for a trigger's fire and for the turn-end watcher.
+        // launchd runs this for a trigger's fire.
         Some((flag, rest)) if flag == trigger::FIRE_FLAG => {
             return std::process::ExitCode::from(trigger::fire_cli(rest) as u8);
-        }
-        Some((flag, [])) if flag == trigger::WATCH_FLAG => {
-            return std::process::ExitCode::from(trigger::watch_cli() as u8);
         }
         _ => tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)

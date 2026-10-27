@@ -26,20 +26,12 @@ use std::{
     time::Duration,
 };
 
-mod watch;
-pub use watch::watch_cli;
-use watch::{newest_cursor, read_watched, rewatch, save_watched, unwatch};
-
 /// What `~/.agent/trigger` runs: `sonny trigger ARGS`.
 pub const VERB: &str = "trigger";
 /// What a trigger's launchd job runs.
 pub const FIRE_FLAG: &str = "--trigger-fire";
-/// What the turn-end watcher's job runs.
-pub const WATCH_FLAG: &str = "--trigger-watch";
 /// Every trigger's launchd label starts with this; the rest is its name.
 const LABEL: &str = "me.lydakis.agent.trigger.";
-/// The one watcher's job; not a trigger's label, which ends in `.`.
-const WATCH_LABEL: &str = "me.lydakis.agent.trigger-watch";
 /// A message is a reminder of what to do, not a document.
 const MAX_MESSAGE: usize = 16 * 1024;
 /// Calendar entries one trigger may expand to.
@@ -57,7 +49,7 @@ const GATE_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a fire waits for the turn whose answer goes to `--reply-to`:
 /// the longest wait the daemon takes.
 const REPLY_WAIT_MS: u64 = 86_400_000;
-pub const USAGE: &str = "usage: trigger add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--turn-budget-tokens N] -- MESSAGE\n         WHEN: --every N{m,h,d} | --in N{m,h} | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO | --turn-end BOT [--count N]; none: only fire runs it\n       trigger ls [--after NAME]\n       trigger show NAME\n       trigger fire NAME\n       trigger rm NAME\n       trigger changed --except BOT";
+pub const USAGE: &str = "usage: trigger add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--turn-budget-tokens N] -- MESSAGE\n         WHEN: --every N{m,h,d} | --in N{m,h} | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO; none: only fire runs it\n       trigger ls [--after NAME]\n       trigger show NAME\n       trigger fire NAME\n       trigger rm NAME\n       trigger changed --except BOT";
 
 /// Where triggers live: the LaunchAgents folder holds their plists, and
 /// `~/.agent/triggers` what each one's fires did.
@@ -86,13 +78,6 @@ impl Places {
     fn asks(&self, name: &str) -> PathBuf {
         self.state.join(format!("{name}.asks"))
     }
-    /// Where the watcher is in a turn-end trigger's agent's events.
-    fn watched(&self, name: &str) -> PathBuf {
-        self.state.join(format!("{name}.watch"))
-    }
-    fn watcher(&self) -> PathBuf {
-        self.agents.join(format!("{WATCH_LABEL}.plist"))
-    }
     /// The ask a fire took out of the queue, until it is done with it.
     fn taking(&self, name: &str) -> PathBuf {
         taking(&self.asks(name))
@@ -103,8 +88,6 @@ impl Places {
 pub enum Launchd<'a> {
     Load(&'a Path),
     Unload(&'a str),
-    /// Stop a loaded job's process and run it again.
-    Restart(&'a str),
 }
 
 pub type Loader<'a> = &'a dyn Fn(Launchd) -> Result<(), String>;
@@ -125,9 +108,6 @@ pub fn launchctl(what: Launchd) -> Result<(), String> {
             path.to_string_lossy().into_owned(),
         ],
         Launchd::Unload(label) => vec!["bootout".into(), format!("{domain}/{label}")],
-        Launchd::Restart(label) => {
-            vec!["kickstart".into(), "-k".into(), format!("{domain}/{label}")]
-        }
     };
     let out = std::process::Command::new("/bin/launchctl")
         .args(&args)
@@ -242,10 +222,6 @@ pub struct Trigger {
     pub runs: Option<u64>,
     /// The most input plus output tokens each fire's turn may spend.
     pub turn_budget_tokens: Option<u64>,
-    /// The agent whose turn ends it waits on, pinned by id, and every how
-    /// many of them it fires.
-    pub turn_end: Option<(String, i64)>,
-    pub count: Option<u64>,
     /// The path `--file` watches, which each fire checks is still not one
     /// every fire writes.
     pub file: Option<PathBuf>,
@@ -323,13 +299,6 @@ impl Trigger {
         if let Some(tokens) = self.turn_budget_tokens {
             pair("--turn-budget-tokens", tokens.to_string());
         }
-        if let Some((bot, id)) = &self.turn_end {
-            pair("--turn-end", bot.clone());
-            pair("--turn-end-id", id.to_string());
-        }
-        if let Some(count) = self.count {
-            pair("--count", count.to_string());
-        }
         if let Some(file) = &self.file {
             pair("--file", path(file));
         }
@@ -359,7 +328,7 @@ impl Trigger {
             let value = iter
                 .next()
                 .ok_or_else(|| bad(&format!("{flag} needs a value")))?;
-            const FLAGS: [&str; 25] = [
+            const FLAGS: [&str; 22] = [
                 "--name",
                 "--generation",
                 "--bot",
@@ -379,9 +348,6 @@ impl Trigger {
                 "--if",
                 "--runs",
                 "--turn-budget-tokens",
-                "--turn-end",
-                "--turn-end-id",
-                "--count",
                 "--file",
                 "--store",
                 "--socket",
@@ -437,8 +403,6 @@ impl Trigger {
             gate: text("--if"),
             runs: number("--runs")?.map(|n| n.max(1) as u64),
             turn_budget_tokens: number("--turn-budget-tokens")?.map(|n| n.max(1) as u64),
-            turn_end: pinned("--turn-end", "--turn-end-id")?,
-            count: number("--count")?.map(|n| n.max(1) as u64),
             file: text("--file").map(PathBuf::from),
             daemon,
             store_id: need("--store-id")?,
@@ -484,8 +448,6 @@ impl Trigger {
                 "turn_budget_tokens",
                 self.turn_budget_tokens == other.turn_budget_tokens,
             ),
-            ("turn_end", self.turn_end == other.turn_end),
-            ("count", self.count == other.count),
             ("commit", self.commit == other.commit),
             ("dir", self.dir == other.dir),
             ("daemon", self.daemon == other.daemon),
@@ -1411,13 +1373,7 @@ enum Ask {
     /// Look as launchd would, and send only what is news: `add` asks so for
     /// a commit made while launchd began to watch, which woke nothing.
     Wake,
-    /// Send for a turn end the watcher counted, at this place in its
-    /// agent's events (`ask_turn`).
-    Turn(i64),
 }
-
-/// How a turn end's ask starts, before its place in the agent's events.
-const TURN: &str = "turn.";
 
 impl Ask {
     /// How its file's name starts.
@@ -1425,26 +1381,23 @@ impl Ask {
         match self {
             Ask::Fire => "",
             Ask::Wake => "wake.",
-            Ask::Turn(_) => TURN,
         }
     }
     /// Whether it asks for a message whatever the time or path says.
     fn sends(self) -> bool {
-        matches!(self, Ask::Fire | Ask::Turn(_))
+        matches!(self, Ask::Fire)
     }
     fn of(file: &str) -> Self {
-        match file.strip_prefix(TURN).map(str::parse) {
-            Some(Ok(cursor)) => Ask::Turn(cursor),
-            _ if file.starts_with(Ask::Wake.prefix()) => Ask::Wake,
-            _ => Ask::Fire,
+        match file.starts_with(Ask::Wake.prefix()) {
+            true => Ask::Wake,
+            false => Ask::Fire,
         }
     }
 }
 
 /// Ask for a fire: a file in the trigger's queue, written whole beside it
 /// first, so launchd never starts the job for half of one. Called under the
-/// lock, with the plist there. A `fire NAME` ask says no more; the
-/// watcher's turn-end asks say which turn ended (`ask_turn`).
+/// lock, with the plist there.
 fn ask(places: &Places, name: &str, kind: Ask) -> Result<(), String> {
     static ASKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let file = format!(
@@ -1454,22 +1407,11 @@ fn ask(places: &Places, name: &str, kind: Ask) -> Result<(), String> {
         std::process::id(),
         ASKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
-    ask_as(places, name, &file, "")
-}
-
-/// The watcher's ask for a turn end, named by where the turn end is in its
-/// agent's events: made again, it is the same ask, and one a fire already
-/// took for its message is passed over (`take_ask`).
-fn ask_turn(places: &Places, name: &str, cursor: i64, why: &str) -> Result<(), String> {
-    ask_as(places, name, &format!("{TURN}{cursor:020}"), why)
-}
-
-fn ask_as(places: &Places, name: &str, file: &str, why: &str) -> Result<(), String> {
     let asks = places.asks(name);
     std::fs::create_dir_all(&asks).map_err(|e| format!("{}: {e}", asks.display()))?;
     let beside = places.state.join(format!(".ask.{name}.{file}"));
-    replace(&beside, why)?;
-    std::fs::rename(&beside, asks.join(file))
+    replace(&beside, "")?;
+    std::fs::rename(&beside, asks.join(&file))
         .and_then(|()| std::fs::File::open(&asks)?.sync_all())
         .map_err(|e| {
             let _ = std::fs::remove_file(&beside);
@@ -1482,8 +1424,6 @@ fn ask_as(places: &Places, name: &str, file: &str, why: &str) -> Result<(), Stri
 #[derive(Debug)]
 struct Asked {
     kind: Ask,
-    /// Why it was asked, for a turn end: which turn ended.
-    why: String,
     path: PathBuf,
 }
 
@@ -1527,29 +1467,14 @@ fn take_ask(places: &Places, trigger: &Trigger) -> Result<Option<Asked>, String>
     };
     let taking = places.taking(name);
     if let Some((file, path)) = oldest(&taking)? {
-        // A turn end asked again while a fire holds it is that ask.
-        let again = places.asks(name).join(&file);
-        if again.exists() {
-            forget(&again).map_err(|e| format!("asks_stuck: {e}"))?;
-        }
         return Ok(Some(Asked {
             kind: Ask::of(&file),
-            why: why(&path),
             path,
         }));
     }
-    let kept = Kept::of(&state(places, trigger));
     let asks = places.asks(name);
-    while let Some((file, path)) = oldest(&asks)? {
+    if let Some((file, path)) = oldest(&asks)? {
         let kind = Ask::of(&file);
-        // A turn end a fire already sent for, asked again by a watcher that
-        // stopped before it saved its place.
-        if let Ask::Turn(cursor) = kind
-            && kept.turn.is_some_and(|sent| cursor <= sent)
-        {
-            forget(&path).map_err(|e| format!("asks_stuck: {e}"))?;
-            continue;
-        }
         let to = taking.join(&file);
         std::fs::create_dir_all(&taking)
             .and_then(|()| std::fs::rename(&path, &to))
@@ -1558,19 +1483,10 @@ fn take_ask(places: &Places, trigger: &Trigger) -> Result<Option<Asked>, String>
             .map_err(|e| format!("asks_stuck: {}: {e}", path.display()))?;
         return Ok(Some(Asked {
             kind,
-            why: why(&to),
             path: to,
         }));
     }
     Ok(None)
-}
-
-/// What an ask's file says.
-fn why(path: &Path) -> String {
-    std::fs::read_to_string(path)
-        .unwrap_or_default()
-        .trim()
-        .to_owned()
 }
 
 /// The fire is done with its ask. One that cannot go would have launchd
@@ -1590,9 +1506,6 @@ struct Kept {
     sent: u64,
     started_id: Option<i64>,
     seen: Seen,
-    /// The newest turn end a message was sent for, by its place in its
-    /// agent's events.
-    turn: Option<i64>,
 }
 
 impl Kept {
@@ -1604,7 +1517,6 @@ impl Kept {
                 head: state["head"].as_str().map(str::to_owned),
                 at: state["seen_at"].as_i64(),
             },
-            turn: state["turn"].as_i64(),
         }
     }
 }
@@ -1690,24 +1602,9 @@ fn retire(places: &Places, name: &str, keep: bool, launchd: Loader) -> Result<bo
             }
         }
     };
-    // Its asks and where the watcher was in its agent's events go with it,
-    // and come back with the rest.
-    let [plist, last, asks, taking, cursor] = its_files(places, name);
-    // A turn-end trigger's, also when its plist cannot be read or an end
-    // cut short set it aside.
-    let watched = [&cursor, &tomb(&cursor)]
-        .into_iter()
-        .any(|path| stored(path))
-        || [&plist, &tomb(&plist)]
-            .into_iter()
-            .any(|path| read_trigger(path).is_ok_and(|(t, _)| t.turn_end.is_some()));
-    for (path, go) in [
-        (&plist, true),
-        (&last, !keep),
-        (&asks, true),
-        (&taking, true),
-        (&cursor, true),
-    ] {
+    // Its asks go with it, and come back with the rest.
+    let [plist, last, asks, taking] = its_files(places, name);
+    for (path, go) in [(&plist, true), (&last, !keep), (&asks, true), (&taking, true)] {
         let by = tomb(path);
         if !(go && stored(path)) {
             if stored(&by) {
@@ -1745,24 +1642,17 @@ fn retire(places: &Places, name: &str, keep: bool, launchd: Loader) -> Result<bo
             eprintln!("{}", error_json(&error));
         }
     }
-    // Then the watcher reads the turn-end triggers left, or goes with the
-    // last: last, since the watcher may be what is retiring this one, and
-    // its restart ends it.
-    if watched && let Err(error) = unwatch(places, launchd) {
-        eprintln!("{}", error_json(&error));
-    }
     unloaded
 }
 
-/// What a trigger has on disk: its plist, last result, asks, the one being
-/// taken, and where the watcher was in its agent's events.
-fn its_files(places: &Places, name: &str) -> [PathBuf; 5] {
+/// What a trigger has on disk: its plist, last result, asks and the one
+/// being taken.
+fn its_files(places: &Places, name: &str) -> [PathBuf; 4] {
     [
         places.plist(name),
         places.last(name),
         places.asks(name),
         places.taking(name),
-        places.watched(name),
     ]
 }
 
@@ -1895,10 +1785,6 @@ pub fn refresh(places: &Places, app: &Path, launchd: Loader) {
             launchd,
         );
     }
-    // The watcher's job runs the app too.
-    if let Err(error) = rewatch(places, app, &environment(), false, launchd) {
-        eprintln!("{}", error_json(&error));
-    }
 }
 
 /// What `trigger add` was asked.
@@ -1913,15 +1799,13 @@ struct Add {
     gate: Option<String>,
     runs: Option<u64>,
     turn_budget_tokens: Option<u64>,
-    turn_end: Option<String>,
-    count: Option<u64>,
     message: String,
 }
 
 fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
     let bad = |what: String| format!("invalid_trigger: {what}\n{USAGE}");
     let mut v = std::collections::HashMap::<String, String>::new();
-    let (mut when, mut commit, mut turn_end) = (None, None, None);
+    let (mut when, mut commit) = (None, None);
     let mut iter = args.iter();
     let message = loop {
         let Some(flag) = iter.next() else {
@@ -1944,17 +1828,6 @@ fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
                 commit = Some(repo);
                 when
             }
-            "--turn-end" => {
-                turn_end = Some(value.clone());
-                // Its text, once --count is known.
-                When {
-                    text: String::new(),
-                    entries: Vec::new(),
-                    not_before: None,
-                    at: None,
-                    watch: None,
-                }
-            }
             "--name"
             | "--bot"
             | "--start"
@@ -1963,8 +1836,7 @@ fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
             | "--reply-to"
             | "--if"
             | "--runs"
-            | "--turn-budget-tokens"
-            | "--count" => {
+            | "--turn-budget-tokens" => {
                 if v.insert(flag.clone(), value.clone()).is_some() {
                     return Err(bad(format!("{flag} once")));
                 }
@@ -1974,7 +1846,7 @@ fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
         };
         if when.replace(asked).is_some() {
             return Err(bad(
-                "one of --every, --in, --at, --cron, --file, --commit or --turn-end".into(),
+                "one of --every, --in, --at, --cron, --file or --commit".into(),
             ));
         }
     };
@@ -2003,15 +1875,6 @@ fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
     };
     let runs = counted("--runs")?;
     let turn_budget_tokens = counted("--turn-budget-tokens")?;
-    let count = counted("--count")?;
-    if let (Some(when), Some(bot)) = (when.as_mut(), &turn_end) {
-        when.text = match count {
-            None | Some(1) => format!("turn end of {bot}"),
-            Some(n) => format!("every {n} turns of {bot}"),
-        };
-    } else if count.is_some() {
-        return Err(bad("--count goes with --turn-end".into()));
-    }
     if message.trim().is_empty() {
         return Err(bad("a message goes after --".into()));
     }
@@ -2045,8 +1908,6 @@ fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
         gate,
         runs,
         turn_budget_tokens,
-        turn_end,
-        count: count.filter(|n| *n > 1),
         message,
     })
 }
@@ -2327,7 +2188,7 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
         .or_else(|| asked.bot.clone())
         .or_else(|| shell.as_ref().map(|s| s.0.clone()))
         .ok_or("invalid_trigger: --bot NAME or --start NAME, or run it from an agent's shell")?;
-    let (target, reply_to, turn_end, store_id) = runtime()?.block_on(async {
+    let (target, reply_to, store_id) = runtime()?.block_on(async {
         let client = connect(&socket, &daemon).await?;
         let resolved = async {
             let target = match (&asked.bot, &asked.start, &shell) {
@@ -2384,20 +2245,11 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
                 Some(bot) => Some((bot.clone(), bot_id(&client, bot).await?)),
                 None => None,
             };
-            // Only turns that end from now on count.
-            let turn_end = match &asked.turn_end {
-                Some(bot) => Some((
-                    bot.clone(),
-                    bot_id(&client, bot).await?,
-                    newest_cursor(&client, bot).await?,
-                )),
-                None => None,
-            };
             let store_id = client
                 .store()
                 .map(str::to_owned)
                 .ok_or_else(|| "the daemon announced no store identity".to_owned())?;
-            Ok::<_, String>((target, reply_to, turn_end, store_id))
+            Ok::<_, String>((target, reply_to, store_id))
         }
         .await;
         client.close().await;
@@ -2432,8 +2284,6 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
         gate: asked.gate,
         runs: asked.runs,
         turn_budget_tokens: asked.turn_budget_tokens,
-        turn_end: turn_end.as_ref().map(|(bot, id, _)| (bot.clone(), *id)),
-        count: asked.count,
         daemon,
         store_id,
         message: asked.message,
@@ -2464,12 +2314,6 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
             if let Some(seen) = seen.filter(|_| watching != asked.when.watch) {
                 baseline(places, &there, &seen, false)?;
             }
-            // An add that failed after its plist went in left the watcher
-            // without it: the same add again makes it whole.
-            if let (Some(_), Some((_, _, cursor))) = (&there.turn_end, turn_end) {
-                start_watch(places, &there, cursor)?;
-                rewatch(places, &app, &environment, true, &launchctl)?;
-            }
             let mut row = there.json(&state(places, &there));
             row["duplicate"] = json!(true);
             Ok(row)
@@ -2483,38 +2327,8 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
                 let _ = remove(places, &trigger.name, &launchctl);
                 return Err(error);
             }
-            if let Some((_, _, cursor)) = turn_end {
-                start_watch(places, &trigger, cursor)?;
-                rewatch(places, &app, &environment, true, &launchctl)?;
-            }
             Ok(trigger.json(&state(places, &trigger)))
         }
-    }
-}
-
-/// Where the watcher starts on a turn-end trigger `add` installed, under
-/// the lock `rm` takes, and only while it is still that trigger: an `rm`
-/// that came between leaves nothing to watch, and the add says so. One it
-/// has a place for keeps it.
-fn start_watch(places: &Places, trigger: &Trigger, cursor: i64) -> Result<(), String> {
-    let _lock = Lock::take(places)?;
-    if !ours(places, trigger) {
-        return Err(format!(
-            "trigger_not_found: {} was removed while it was added",
-            trigger.name
-        ));
-    }
-    match read_watched(places, trigger)? {
-        Some(_) => Ok(()),
-        None => save_watched(
-            places,
-            trigger,
-            watch::Place {
-                cursor,
-                count: 0,
-                from: cursor,
-            },
-        ),
     }
 }
 
@@ -2540,9 +2354,6 @@ fn write_row(places: &Places, trigger: &Trigger, last: &Value, kept: &Kept) -> R
     row["started_id"] = json!(kept.started_id);
     row["head"] = json!(kept.seen.head);
     row["seen_at"] = json!(kept.seen.at);
-    if let Some(turn) = kept.turn {
-        row["turn"] = json!(turn);
-    }
     replace(&places.last(&trigger.name), &row.to_string())
 }
 
@@ -2906,15 +2717,6 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
     let now = now();
     let durable = state(places, trigger);
     let mut kept = Kept::of(&durable);
-    // The turn end this fire is for goes on disk with what it did, so the
-    // same ask made again is passed over.
-    if let Some(Ask::Turn(cursor)) = ask.map(|a| a.kind) {
-        kept.turn = Some(cursor);
-    }
-    // Only the watcher, or `fire`, has news of a turn end.
-    if trigger.turn_end.is_some() && !asked {
-        return;
-    }
     // Its last run went out but its end did not (launchd would not unload
     // it): it ends now, sending nothing more.
     if trigger.runs.is_some_and(|runs| kept.sent >= runs) {
@@ -2945,10 +2747,9 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
             return;
         }
     }
-    let mut why = match ask {
-        Some(ask) if !ask.why.is_empty() => ask.why.clone(),
-        _ if asked => "fired".to_owned(),
-        _ => trigger.when.clone(),
+    let mut why = match asked {
+        true => "fired".to_owned(),
+        false => trigger.when.clone(),
     };
     // Any write to the HEAD log wakes it; only another commit is news.
     if let Some(repo) = &trigger.commit {
@@ -3219,8 +3020,6 @@ mod tests {
             gate: None,
             runs: None,
             turn_budget_tokens: None,
-            turn_end: None,
-            count: None,
             file: None,
             daemon: Daemon {
                 store: Some("/Users/a/.agent/state.sqlite".into()),
@@ -3293,8 +3092,6 @@ mod tests {
             gate: Some("test -n \"$(git status --porcelain)\" -- x".into()),
             runs: Some(3),
             turn_budget_tokens: Some(50_000),
-            turn_end: Some(("p.task".into(), 9)),
-            count: Some(20),
             ..s.clone()
         };
         let watched = When {
@@ -3332,7 +3129,6 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         loaded: RefCell<std::collections::BTreeSet<String>>,
-        started: RefCell<Vec<String>>,
         refuse_load: std::cell::Cell<bool>,
         refuse_unload: std::cell::Cell<bool>,
         unloads: std::cell::Cell<usize>,
@@ -3362,13 +3158,6 @@ mod tests {
                         .remove(label)
                         .then_some(())
                         .ok_or_else(|| format!("{NOT_LOADED}launchctl bootout: no such process"))
-                }
-                Launchd::Restart(label) => {
-                    if !self.loaded.borrow().contains(label) {
-                        return Err("launchctl kickstart: no such service".into());
-                    }
-                    self.started.borrow_mut().push(label.to_owned());
-                    Ok(())
                 }
             }
         }
@@ -3992,27 +3781,6 @@ mod tests {
         assert_eq!(take(&w.places), Some(Ask::Fire));
         assert_eq!(take(&w.places), Some(Ask::Wake));
         assert_eq!(take(&w.places), None);
-        // A turn end's ask says which turn ended. The same turn end asked
-        // again is the same ask, and one at or before the turn end a message
-        // was begun for is passed over.
-        ask_turn(&w.places, &s.name, 7, "turn end of p: turn:p/3 completed").unwrap();
-        ask_turn(&w.places, &s.name, 9, "turn end of p: turn:p/4 completed").unwrap();
-        ask_turn(&w.places, &s.name, 9, "turn end of p: turn:p/4 completed").unwrap();
-        assert_eq!(std::fs::read_dir(&asks).unwrap().count(), 2);
-        let turn = take_ask(&w.places, &s).unwrap().unwrap();
-        assert_eq!(
-            (turn.kind, turn.why.as_str()),
-            (Ask::Turn(7), "turn end of p: turn:p/3 completed")
-        );
-        done_with(&turn).unwrap();
-        let kept = Kept {
-            turn: Some(9),
-            ..Kept::default()
-        };
-        record_last(&w.places, &s, &Value::Null, &kept).unwrap();
-        ask_turn(&w.places, &s.name, 8, "late").unwrap();
-        assert_eq!(take(&w.places), None);
-        assert_eq!(std::fs::read_dir(&asks).unwrap().count(), 0);
         // One a fire took and did not finish with is the next fire's.
         fire_now(&w.places, &s.name).unwrap();
         let cut = take_ask(&w.places, &s).unwrap().unwrap();
@@ -4081,30 +3849,6 @@ mod tests {
             "rate limited"
         );
         assert_eq!(answer(&json!({"error": {"code": "x"}})), r#"{"code":"x"}"#);
-    }
-
-    #[test]
-    fn an_add_an_rm_came_between_starts_no_watch() {
-        let w = World::new("start-watch");
-        let mut s = trigger();
-        s.turn_end = Some(("p.task".into(), 5));
-        assert!(
-            start_watch(&w.places, &s, 9)
-                .unwrap_err()
-                .starts_with("trigger_not_found")
-        );
-        assert!(!w.places.watched(&s.name).exists());
-        w.install(&s).unwrap();
-        start_watch(&w.places, &s, 9).unwrap();
-        // The same add again keeps the place the watcher reached.
-        let place = watch::Place {
-            cursor: 12,
-            count: 1,
-            from: 10,
-        };
-        watch::save_watched(&w.places, &s, place).unwrap();
-        start_watch(&w.places, &s, 9).unwrap();
-        assert_eq!(watch::read_watched(&w.places, &s), Ok(Some(place)));
     }
 
     #[test]
@@ -4507,26 +4251,9 @@ mod tests {
             watched.when.watch,
             Some(std::path::absolute("notes.md").unwrap())
         );
-        let ends = parse_add(&words("--count 20 --turn-end Home -- note it"), now).unwrap();
-        assert_eq!(
-            (
-                ends.turn_end.as_deref(),
-                ends.count,
-                ends.when.text.as_str()
-            ),
-            (Some("Home"), Some(20), "every 20 turns of Home")
-        );
-        assert!(ends.when.entries.is_empty() && ends.when.watch.is_none());
-        let each = parse_add(&words("--turn-end p.task --count 1 -- x"), now).unwrap();
-        assert_eq!(
-            (each.count, each.when.text.as_str()),
-            (None, "turn end of p.task")
-        );
         for bad in [
             "--count 3 -- x",
-            "--every 30m --count 3 -- x",
-            "--turn-end a --count 0 -- x",
-            "--turn-end a --file x -- x",
+            "--turn-end a -- x",
             "--every 30m --in 5m -- x",
             "--every 30m --file x -- x",
             "--every 30m",
