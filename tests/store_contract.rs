@@ -10904,8 +10904,15 @@ fn a_turn_reads_with_the_message_its_words_answer() {
         db.absorb(fourth, None, 8 << 20, 4096, ContextUsage::default(), false)
             .unwrap();
     };
-    db.append(fourth, vec![assistant("Shall I deploy?")], &[], None)
-        .unwrap();
+    // A call streamed after the question says nothing a person answers.
+    let (call_item, call) = shell_call("fc_q", "q", "true");
+    db.append(
+        fourth,
+        vec![assistant("Shall I deploy?"), call_item],
+        std::slice::from_ref(&call),
+        None,
+    )
+    .unwrap();
     steer(&mut db, "s1");
     steer(&mut db, "s2");
     let read = db.prompts("Bob", fourth, 64 * 1024).unwrap();

@@ -5503,28 +5503,26 @@ impl Database {
             "prompts":prompts,"prompts_more":prompts_more,"calls":calls,"calls_more":calls_more,"earlier":earlier,"more":more}),
         )
     }
-    /// The last message `turn` streamed between two of its events, as
+    /// The last message with text `turn` streamed between two of its events, as
     /// `{text}` with its end kept: at most `PROMPTS_REPLY` bytes, or the
     /// budget left, starting at a whole word when cut (`truncated`).
     fn reply(&self, turn: i64, after: i64, before: i64, left: &mut usize) -> Result<Option<Value>> {
-        let node = self
-            .conn
-            .prepare_cached(
-                "SELECT json_extract(data,'$.node') FROM events
-                 WHERE turn=? AND kind='message' AND id>? AND id<? ORDER BY id DESC LIMIT 1",
-            )?
-            .query_row(params![turn, after, before], |r| r.get::<_, Option<i64>>(0))
-            .optional()?
-            .flatten();
-        let Some(node) = node else {
-            return Ok(None);
-        };
-        let item: Vec<u8> =
-            self.conn
-                .query_row("SELECT item FROM nodes WHERE id=?", [node], |r| r.get(0))?;
+        // The newest item with text: calls and reasoning stream as
+        // messages too, and say nothing a person answers.
+        let mut items = self.conn.prepare_cached(
+            "SELECT n.item FROM events e JOIN nodes n ON n.id=json_extract(e.data,'$.node')
+             WHERE e.turn=? AND e.kind='message' AND e.id>? AND e.id<? ORDER BY e.id DESC",
+        )?;
+        let mut rows = items.query(params![turn, after, before])?;
+        let mut text = String::new();
+        while text.trim().is_empty() {
+            let Some(r) = rows.next()? else {
+                return Ok(None);
+            };
+            text = assistant_text(&serde_json::from_slice(&r.get::<_, Vec<u8>>(0)?)?);
+        }
         // Redacted whole before its end is kept: a private key whose
         // opening line is cut away would no longer read as one.
-        let text = assistant_text(&serde_json::from_slice(&item)?);
         let text = agent_client::approver::Redactor::default().redact(&text);
         let limit = Self::PROMPTS_REPLY.min(*left);
         let mut start = text.len().saturating_sub(limit);
