@@ -1481,10 +1481,7 @@ fn take_ask(places: &Places, trigger: &Trigger) -> Result<Option<Asked>, String>
             .and_then(|()| std::fs::File::open(&asks)?.sync_all())
             .and_then(|()| std::fs::File::open(&taking)?.sync_all())
             .map_err(|e| format!("asks_stuck: {}: {e}", path.display()))?;
-        return Ok(Some(Asked {
-            kind,
-            path: to,
-        }));
+        return Ok(Some(Asked { kind, path: to }));
     }
     Ok(None)
 }
@@ -1604,7 +1601,12 @@ fn retire(places: &Places, name: &str, keep: bool, launchd: Loader) -> Result<bo
     };
     // Its asks go with it, and come back with the rest.
     let [plist, last, asks, taking] = its_files(places, name);
-    for (path, go) in [(&plist, true), (&last, !keep), (&asks, true), (&taking, true)] {
+    for (path, go) in [
+        (&plist, true),
+        (&last, !keep),
+        (&asks, true),
+        (&taking, true),
+    ] {
         let by = tomb(path);
         if !(go && stored(path)) {
             if stored(&by) {

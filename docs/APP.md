@@ -403,8 +403,9 @@ client/          agent-client: the socket protocol and the client policy
   `policy` composes a folder's client policy, in a profile when named, and
   falls back to the profiles the app ships for `coordinator`;
   `triggers`, `trigger`, `trigger_add`, `trigger_fire` and `trigger_remove`
-  list a page, read one by name, add one (running `APP --trigger add` in a
-  folder on the window's daemon), run and remove [triggers](#triggers) ([trigger.rs](../app/src-tauri/src/trigger.rs)).
+  list a page, read one by name, add one (in a folder, on the window's
+  daemon), run and remove [triggers](#triggers), each by running
+  `~/.agent/trigger`, which Sonny writes.
   When nothing listens on a store's socket, `attach` starts a daemon first
   ([daemon.rs](../app/src-tauri/src/daemon.rs)); see
   [Installing](#installing).
@@ -1238,24 +1239,27 @@ its news goes out is dropped from it.
 
 ## Triggers
 
-A trigger wakes an agent with a message when something happens: a time
-comes, a file is written, a repository's HEAD moves, an agent ends a turn,
-or someone fires it by name. The message is a new turn in the agent's own conversation; a trigger
+Triggers are Sonny's (`sonny/src/trigger.rs`); the app lists, adds, runs and
+removes them through `~/.agent/trigger`. A trigger wakes an agent with a
+message when something happens: a time comes, a file is written, a
+repository's HEAD moves, or someone fires it by name. The message is a new turn in the agent's own conversation; a trigger
 may also start the agent it names on its first fire. launchd watches, so a
-trigger fires with the app closed, and a time the Mac slept through fires
+trigger fires with Sonny and the app closed, and a time the Mac slept through fires
 once when it wakes (`StartCalendarInterval` coalesces missed times;
 `StartInterval` and cron skip them). The daemon has no clock or watcher of
-its own, and no process of a trigger runs between its fires but one
-watcher, while any trigger waits on turn ends: while nothing happens a
-trigger costs its plist and launchd's watch, and no model call.
+its own, and no process of a trigger runs between its fires: while nothing
+happens a trigger costs its plist and launchd's watch, and no model call.
+A lead hears of its tasks' turns from Sonny's task updates and lookout, not
+from triggers.
 
-The app writes `~/.agent/trigger` each time it opens, a script that runs its
-executable with `--trigger`:
+Sonny writes `~/.agent/trigger` each time it starts, a script that runs it
+as `sonny trigger`:
 
 ```sh
 ~/.agent/trigger add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--turn-budget-tokens N] -- MESSAGE
-  WHEN: --every 30m | --in 45m | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO | --turn-end BOT [--count N]
+  WHEN: --every 30m | --in 45m | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO
 ~/.agent/trigger ls [--after NAME]
+~/.agent/trigger show NAME
 ~/.agent/trigger fire NAME
 ~/.agent/trigger rm NAME
 ~/.agent/trigger changed --except BOT
@@ -1305,14 +1309,9 @@ when a commit came in between asks for a fire that looks as launchd would
 no HEAD log (`core.logAllRefUpdates` false, or a bare one by default) is
 refused, and adding the same trigger again watches the git folder the
 repository has now, recording where its HEAD is in place of the old one's.
-git is the one on the `PATH` `add` ran with, which the plist keeps. `--turn-end BOT` fires each time BOT,
-pinned by its id, ends a turn that ends after `add` (completed, failed or
-interrupted; a message taken into a running turn as a steer is not one); `--count N` only every Nth, a count of the messages BOT
-answered. A turn the trigger itself sent BOT, its message or an answer
-`--reply-to` passed on, is not counted, so `--turn-end lead --reply-to lead`
-does not wake itself (two triggers that wake each other are bounded only by
-`--runs`). With no WHEN, only `fire` runs it; `fire`, or a turn end, while
-a fire still runs is sent by that fire once it is done.
+git is the one on the `PATH` `add` ran with, which the plist keeps. With no
+WHEN, only `fire` runs it; `fire` while a fire still runs is sent by that
+fire once it is done.
 
 **Whom.** `add` defaults to the agent whose shell runs it (`AGENT_BOT`,
 which must still match `AGENT_BOT_ID`); `--bot` names another. Either is
@@ -1400,10 +1399,10 @@ store and the socket of the shell it was made from (an agent's shell has
 both), the store identity its daemon announced, the one-off's time, the
 repository, the folder, the reply agent and its id, the gate, the run limit,
 and the message. A fire whose daemon announces another store (a reused
-socket) sends nothing and records `store_mismatch`. When it fires, the app's
-executable runs with `--trigger-fire` and those arguments. It connects to
+socket) sends nothing and records `store_mismatch`. When it fires, Sonny
+runs with `--trigger-fire` and those arguments. It connects to
 the daemon, and when none answers and the store is known, starts one for it
-on that socket as the app does, with the login shell's environment and
+on that socket as Sonny does (the `agent` beside it, or `AGENT_BIN`), with the login shell's environment and
 `~/.agent/env`. A repeating trigger submits with `delivery: reject`: a bot
 that is working, or has work waiting, skips that fire rather than having it
 cut in or pile up. A one-off, and a fire `fire` asked for, submits with
@@ -1424,67 +1423,6 @@ trigger by name; after Run now it reads it again until its last fire
 changes. A quiet fleet costs the app no reads. Triggers are local to this machine. Remote windows
 neither list, run nor remove local triggers. Only launchd runs a fire, so
 no two of one trigger ever run at once.
-
-**The turn-end watcher.** One process, `APP --trigger-watch`, watches for
-every turn-end trigger: launchd's `me.lydakis.agent.trigger-watch`
-(`RunAtLoad`, `KeepAlive` unless it exits 0), written and restarted by each
-`add` and `rm` of a turn-end trigger and removed with the last. It reads
-their plists, connects once per daemon, and follows each watched agent's
-own events (`follow {bot, after}`, whose replay is bounded to that agent's
-events); between turn ends it waits on the socket, and with no daemon there
-it tries again, backing off to once a minute. `add` finds the agent's
-newest event cursor without a daemon change by bisecting `events {bot,
-after, limit: 1}` (an indexed lookup each, about 2·log2 of the cursor), and
-the watcher keeps where it is per trigger in `~/.agent/triggers/NAME.watch`,
-written only when that agent ends a turn, and for one that fires only once
-its ask is on disk: a restart replays from there, so no turn end is missed.
-Like every trigger write it is under the lock, and only while the plist is
-still that trigger's, so none is left behind by a trigger that went.
-A place it cannot read whole (not readable, not JSON, its `generation`,
-`cursor`, `count` or `from` missing or of another kind, or `from` past
-`cursor`) is
-not a fresh start, which would skip every turn end since: the trigger ends,
-saying so (`watch_unreadable`). A place it has never had, or an earlier trigger's of
-the same name, starts at the agent's newest event.
-A turn end that counts is an ask in the trigger's queue saying why (`turn
-end of BOT: turn:BOT/N completed`), under the lock `rm` takes and only
-while the plist is still that trigger's; launchd runs the fire for it, as
-for `fire NAME`. The ask is named by the turn end's event cursor
-(`turn.CURSOR`), and the fire keeps that cursor with the message it begins:
-a watcher stopped after an ask and before it saved its place asks again,
-which is the same file, or one the fire already took and passes over, so
-no turn end is sent twice. A place it cannot save, or an ask it cannot
-make, sends it back to what is on disk to read those turn ends again. The
-watcher runs nothing itself, so restarting it never ends a fire still
-waiting on `--reply-to`; turn ends during a long fire are each sent after
-it, in order. The `request_id` of a turn is read from its `accepted` or
-`queued` event, since a queued turn can end without starting; while such a
-turn has not ended, the place kept says to read again from before that
-event, and only turn ends past the last one counted count, so a restart
-still knows whose that turn is. On each
-connection the watcher looks each agent up once however many triggers
-follow it, and reads events while its follows go out, so a long replay
-never fills what the client holds unread. A trigger whose agent is gone
-is done only once that end is on disk and the trigger gone; else it is
-looked at again on the next connection. A trigger that goes, by `rm` or
-its own end (its runs, its agent gone), unloads its own job first and
-then restarts the watcher, which reads the ones left, or unloads it with
-the last; one whose plist cannot be read but whose place is kept does the
-same. A new watcher plist (the app moved) that will not load gives way to
-the old one, loaded again. Events retention removed that a trigger would
-read again (any after its `from`, where it replays from, not only after its
-`cursor`) are turn ends not counted, or the start of a turn it sent, whose
-end may then count; the
-trigger's last result says so (`events_pruned`), under the lock and keeping
-what its fires left, and its place moves past them, so it is said once.
-A gap ends nothing: the trigger goes on watching. A turn a trigger sent says so in its `request_id`
-(`trigger_GENERATION_...`, a name's characters, so the generation and not
-the trigger's name), which is how the watcher tells its own turns apart.
-An agent deleted (the `deleted` event, or found gone on connecting), or its
-name now another agent's (a `created` event with another id), ends its
-turn-end triggers as `gone`. Once none is left the
-watcher exits 0 and launchd leaves it stopped. A turn-end trigger's own
-plist has no calendar or watched path, so launchd runs it only for `fire`.
 
 A trigger's state is three things: its plist, launchd's loaded copy, and
 that state file. Every change keeps them either whole or as they were, and
@@ -1527,12 +1465,12 @@ anything else a failure can leave is listed and removable:
 
 The files are written, synced, renamed and their folder synced; deletions
 and set-asides sync their folder too. `add`, `rm`, `fire`, a fire's result and end, and
-the app's refresh take a lock (`~/.agent/triggers/.lock`) around their
+Sonny's refresh take a lock (`~/.agent/triggers/.lock`) around their
 changes, and the refresh reads each plist again under it.
 `~/.agent/trigger` is written with its executable mode from the start. When
-the app starts from a new place, as after an update, it writes its path into
-every trigger and loads it again, on a thread of its own so the window does
-not wait; one launchd refuses keeps its old path and is tried again at the
+Sonny starts from a new place, it writes its path into every trigger and
+loads it again, on a thread of its own so its screen does not wait (a Sonny
+in Homebrew's Cellar goes by its `opt` path, which an upgrade keeps); one launchd refuses keeps its old path and is tried again at the
 next start. Home lists triggers also when no project exists. Only macOS
 has launchd; elsewhere `add` refuses with `triggers_unsupported`.
 
@@ -1541,8 +1479,8 @@ They are not converted: remove them by hand (`launchctl bootout
 gui/$UID/me.lydakis.agent.schedule.NAME`, then delete the plist and
 `~/.agent/schedules`) and add them again as triggers.
 
-The app ships an `automation` skill
-([SKILL.md](../app/skills/automation/SKILL.md)) for an agent setting up or
+Sonny installs an `automation` skill
+([SKILL.md](../sonny/skills/automation/SKILL.md)) for an agent setting up or
 running a recurring job: keep bookmarks, a ledger and run records as files in
 its folder rather than trusting a compacted conversation for ids and times,
 report a source it could not read by name, re-check items right before
@@ -2221,24 +2159,18 @@ daemon's steer delivery, a message's sender (another agent's, live, steered
 in, queued and read back, unlinked once its name holds a new agent, and the
 app's own task updates and triggers by origin), and runs
 folded with failures on their line. Also covers coordinator task updates: batched at rest, excluding requested and replayed turns, retained after send failures. Messages: Markdown with raw HTML, unsafe links and remote images kept out, fenced blocks drawn by language, charts, file links, files drawn by kind, each message parsed once, and streamed blocks drawn once with fences kept whole. `cargo test -p agent-app link_tests` covers which links the core opens and how it reads a file.
-`cargo test -p agent-app` includes a failed project-file write leaving
-neither a partial file nor a temporary, and triggers' calendars, plists,
-watched paths, idempotent `add`, `fire`, `--runs`, `--if`, the commit check,
-the watcher's counting (a count, a turn its own trigger sent, an agent
-replaced under its name) and its job's lifecycle, move, and each lifecycle step with launchd refusing. With `AGENT_TEST_RUNTIME=1` after a release build
-and `cargo build -p agent-app`, `python3 -m unittest tests.test_trigger`
-fires triggers against a real daemon, and runs the watcher against one: a
-turn end fires (the test running the trigger's job while its queue holds
-an ask, as launchd does), the answer `--reply-to` passes back wakes
-nothing, and a turn that ends while no watcher runs fires when one starts
-again; on a Mac, `AGENT_TEST_LAUNCHD=1`
+`cargo test -p agent-client` includes a failed project-file write leaving
+neither a partial file nor a temporary. `cargo test -p sonny` covers
+triggers' calendars, plists, watched paths, idempotent `add`, `fire`,
+`--runs`, `--if`, the commit check, move, and each lifecycle step with
+launchd refusing. With `AGENT_TEST_RUNTIME=1` after a release build and
+`cargo build -p sonny`, `python3 -m unittest tests.test_trigger` fires
+triggers against a real daemon; on a Mac, `AGENT_TEST_LAUNCHD=1`
 adds its one launchd test, which loads real jobs (under a scratch `HOME`, so
 nothing loads at the next login) and checks that launchd fires a one-off,
 which ends itself, fires a file trigger on a write (the same `add` again
 being that trigger, a different one refused naming `when`), runs `fire`
-by name, that `rm` removes a job whose plist or load is already gone, and
-that a turn-end trigger loads the watcher, which fires it, and its `rm`
-unloads it (skipped while a real watcher is loaded).
+by name, and that `rm` removes a job whose plist or load is already gone.
 App tests also cover hosts over SSH against a stand-in
 `ssh` that runs the remote command here and forwards by linking: `~/.ssh/config`
 aliases, includes and quoting, `ssh -G` read to its bound, the ssh arguments, `agent start`'s answers, attaching
