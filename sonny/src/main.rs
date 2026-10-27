@@ -722,7 +722,9 @@ async fn run() -> Result<(), String> {
         ));
     }
     app.sounds = sound::Sounds::new(options.sound);
-    app.sounds.chime = settings::Settings::load().chime;
+    let settings = settings::Settings::load();
+    app.sounds.chime = settings.chime;
+    app.verbose = settings.verbose;
     // A bot keeps the model it was made with; --model runs this window's
     // turns on another.
     if let Some(model) = options.model.as_ref().filter(|m| **m != app.model) {
@@ -1051,7 +1053,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, unlisted.
-const COMMANDS: [(&str, &str); 12] = [
+const COMMANDS: [(&str, &str); 13] = [
     (
         "/side",
         "a side chat with a copy of this agent, which carries on",
@@ -1066,6 +1068,10 @@ const COMMANDS: [(&str, &str); 12] = [
     ("/status", "this project's agents"),
     ("/lookout", "what the lookout watches for this agent"),
     ("/sound", "the chime when work ends, on or off"),
+    (
+        "/verbose",
+        "every tool call, or only what moves the work on",
+    ),
     (
         "/copies",
         "tasks in git worktrees or sandfs copies (experimental)",
@@ -1165,8 +1171,12 @@ struct App {
     options: Options,
     /// The lead's connection dropped.
     down: bool,
-    /// The background switched: the conversation is drawn again once idle.
+    /// The background switched, or the view did: the conversation is
+    /// drawn again once idle.
     repaint: bool,
+    /// Every call drawn, rather than the clean view of the bot's words and
+    /// the calls that move the work on.
+    verbose: bool,
     /// The lead's instructions as composed now, sent once no turn runs.
     instruct: Option<String>,
     /// The folder the next message moves the bot to: its lead moved away.
@@ -1786,6 +1796,7 @@ impl App {
             options,
             down: false,
             repaint: false,
+            verbose: false,
             instruct: None,
             move_to: None,
             lead: String::new(),
@@ -2189,8 +2200,8 @@ impl App {
         }
     }
 
-    /// The conversation drawn again in the background's new colours, once
-    /// no turn is running: the screen and scrollback cleared, and the
+    /// The conversation drawn again in the background's new colours, or
+    /// in the view just picked, once no turn is running: the screen and scrollback cleared, and the
     /// bot's items read again as on attach.
     async fn repaint(&mut self, terminal: &mut Tui) -> Result<(), String> {
         execute!(
@@ -2325,6 +2336,24 @@ impl App {
             return;
         }
         self.retry = None;
+    }
+
+    /// A finished call, quiet, as the view shows it: every call when
+    /// verbose, else only those [`transcript::clean`] keeps.
+    fn commit_call(&mut self, name: &str, arguments: &Value, output: &str, failed: bool) {
+        let draw = match self.verbose {
+            true => transcript::tool,
+            false => transcript::clean,
+        };
+        let lines = draw(
+            name,
+            arguments,
+            Some(output),
+            failed,
+            &self.workspace,
+            self.width,
+        );
+        self.commit(transcript::quiet(lines));
     }
 
     /// Commit a finished cell, a blank line apart from the one before.
@@ -2465,15 +2494,7 @@ impl App {
                             calls.remove(id).or_else(|| self.calls.remove(id))
                         {
                             let (output, failed) = output(&item);
-                            let lines = transcript::tool(
-                                &name,
-                                &arguments,
-                                Some(&output),
-                                failed,
-                                &self.workspace,
-                                self.width,
-                            );
-                            self.commit(transcript::quiet(lines));
+                            self.commit_call(&name, &arguments, &output, failed);
                         }
                     }
                     _ => {}
@@ -2948,15 +2969,7 @@ impl App {
                 if data["denied"] == true {
                     shown = ("denied".into(), true);
                 }
-                let lines = transcript::tool(
-                    &name,
-                    &arguments,
-                    Some(&shown.0),
-                    shown.1,
-                    &self.workspace,
-                    self.width,
-                );
-                self.commit(transcript::quiet(lines));
+                self.commit_call(&name, &arguments, &shown.0, shown.1);
                 if self.calls.is_empty() && !self.held.is_empty() {
                     let held = std::mem::take(&mut self.held);
                     self.pending.extend(held);
@@ -3721,6 +3734,25 @@ impl App {
                         "chime on"
                     } else {
                         "chime off"
+                    }
+                    .to_owned()
+                }
+                Err(error) => error,
+            });
+            return;
+        }
+        if prompt == "/verbose" {
+            self.input.clear();
+            let mut settings = settings::Settings::load();
+            settings.verbose = !self.verbose;
+            self.notice = Some(match settings.save() {
+                Ok(()) => {
+                    self.verbose = settings.verbose;
+                    // What is already drawn is drawn again in the new view.
+                    self.repaint = true;
+                    match self.verbose {
+                        true => "verbose: every tool call",
+                        false => "clean: replies, tasks, questions and the plan",
                     }
                     .to_owned()
                 }
@@ -5033,6 +5065,7 @@ mod tests {
         })
         .await;
         let mut app = app(client);
+        app.verbose = true;
         let said = |text: &str| json!({"event": "text_delta", "bot": "b", "turn": 1, "text": text});
         app.daemon(turn_event("accepted", 1, json!({}))).await;
         app.daemon(said("I'll look.")).await;
@@ -5086,6 +5119,72 @@ mod tests {
             rows[line + 1..],
             [("".into(), false), ("• Done.".into(), false)]
         );
+    }
+
+    #[tokio::test]
+    async fn the_clean_view_keeps_the_words_and_a_task_started_but_not_a_command() {
+        let started = r#"{"bot":"b.fix","handle":"turn:b.fix/1","status":"running","turn":1}"#;
+        let client = daemon_answering(move |asked| {
+            let item = match asked["nodes"][0].as_i64() {
+                Some(2) => json!({"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "I'll look."}]}),
+                Some(3) => json!({"type": "function_call_output", "call_id": "c1", "output": "a"}),
+                Some(4) => {
+                    json!({"type": "function_call_output", "call_id": "c2", "output": started})
+                }
+                Some(5) => json!({"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Done."}]}),
+                _ => return json!({}),
+            };
+            json!({"items": [{"node": asked["nodes"][0], "item": item}]})
+        })
+        .await;
+        let mut app = app(client);
+        let said = |text: &str| json!({"event": "text_delta", "bot": "b", "turn": 1, "text": text});
+        let call = |id: &str, command: &str, node: i64| {
+            let arguments = json!({"command": command}).to_string();
+            [
+                turn_event(
+                    "tool_started",
+                    1,
+                    json!({"call_id": id, "name": "shell", "arguments": arguments}),
+                ),
+                turn_event("tool_completed", 1, json!({"call_id": id, "node": node})),
+            ]
+        };
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        app.daemon(said("I'll look.")).await;
+        app.daemon(turn_event("message", 1, json!({"node": 2})))
+            .await;
+        for event in call("c1", "ls", 3) {
+            app.daemon(event).await;
+        }
+        let run = r#""$AGENT_BIN" run --detach --new --bot b.fix -- 'Fix the tests.'"#;
+        for event in call("c2", run, 4) {
+            app.daemon(event).await;
+        }
+        app.daemon(said("Done.")).await;
+        app.daemon(turn_event("message", 1, json!({"node": 5})))
+            .await;
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        let rows: Vec<String> = app.pending.iter().map(|line| line.to_string()).collect();
+        assert_eq!(
+            rows[..5],
+            [
+                "• I'll look.",
+                "",
+                "• Started b.fix · turn 1",
+                "  └ Fix the tests.",
+                ""
+            ]
+        );
+        assert!(rows.iter().all(|row| !row.contains("Ran")), "{rows:?}");
+        assert_eq!(rows.last().map(String::as_str), Some("• Done."));
     }
 
     #[tokio::test]
