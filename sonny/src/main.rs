@@ -36,6 +36,7 @@ mod table;
 mod task;
 mod term;
 mod transcript;
+mod trigger;
 mod updates;
 
 use agent_client::{Client, Events};
@@ -118,8 +119,9 @@ fn usage() -> String {
      sonny task NAME [--setup] [RUN FLAGS] -- BRIEF, from the lead's shell or a terminal, makes a task's\n\
      folder that way and starts the task there; sonny task changes NAME [--apply] lists\n\
      (or writes here) what a sandfs copy of a plain folder changed.\n\
-     sonny memory ... and sonny project add DIR ... are what ~/.agent/memory and\n\
-     ~/.agent/project run, which Sonny writes at each start.\n\
+     sonny memory ..., sonny project add DIR ... and sonny trigger ... are what\n\
+     ~/.agent/memory, ~/.agent/project and ~/.agent/trigger run, which Sonny writes\n\
+     at each start.\n\
      The lookout wakes the lead when its tasks need it, judged by --lookout, else AGENT_JUDGE\n\
      (as the approver is), else openai-decisions/gpt-6-luna with OPENAI_API_KEY, else the\n\
      newest Haiku the lead's provider lists."
@@ -339,6 +341,15 @@ async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events
     if let Ok(connected) = Client::connect(&options.socket).await {
         return Ok(connected);
     }
+    start_daemon(&options.store, &options.socket)?;
+    Client::connect(&options.socket)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Start the daemon of `store` on `socket` the way the CLI starts it, and
+/// wait for it to be ready.
+fn start_daemon(store: &std::path::Path, socket: &std::path::Path) -> Result<(), String> {
     let bin = agent_bin().ok_or(
         "the daemon is not running and Agent's binary was not found; install Sonny with Homebrew, open Agent.app, or set AGENT_BIN",
     )?;
@@ -346,9 +357,9 @@ async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events
     let out = command
         .arg("start")
         .arg("--store")
-        .arg(&options.store)
+        .arg(store)
         .arg("--socket")
-        .arg(&options.socket)
+        .arg(socket)
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|e| format!("{}: {e}", bin.display()))?;
@@ -362,9 +373,7 @@ async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events
             .unwrap_or_else(|| stderr.trim().to_owned());
         return Err(format!("could not start the daemon: {reason}"));
     }
-    Client::connect(&options.socket)
-        .await
-        .map_err(|e| e.to_string())
+    Ok(())
 }
 
 fn parse() -> Result<Options, String> {
@@ -465,6 +474,16 @@ fn main() -> std::process::ExitCode {
         Some((verb, rest)) if verb == "project" => {
             return std::process::ExitCode::from(project::cli(rest) as u8);
         }
+        Some((verb, rest)) if verb == trigger::VERB => {
+            return std::process::ExitCode::from(trigger::cli(rest) as u8);
+        }
+        // launchd runs these for a trigger's fire and for the turn-end watcher.
+        Some((flag, rest)) if flag == trigger::FIRE_FLAG => {
+            return std::process::ExitCode::from(trigger::fire_cli(rest) as u8);
+        }
+        Some((flag, [])) if flag == trigger::WATCH_FLAG => {
+            return std::process::ExitCode::from(trigger::watch_cli() as u8);
+        }
         _ => tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -498,6 +517,7 @@ async fn run() -> Result<(), String> {
     SIDE.store(options.side.is_some(), std::sync::atomic::Ordering::Relaxed);
     // Before any lead is made, so its instructions list the skills.
     skills::install_own();
+    trigger::at_start();
     // Fonts are read before the first picture needs them.
     std::thread::spawn(image::preload);
     let (client, mut events) = connect(&options).await?;

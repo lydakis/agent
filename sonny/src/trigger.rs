@@ -30,7 +30,9 @@ mod watch;
 pub use watch::watch_cli;
 use watch::{newest_cursor, read_watched, rewatch, save_watched, unwatch};
 
-pub const FLAG: &str = "--trigger";
+/// What `~/.agent/trigger` runs: `sonny trigger ARGS`.
+pub const VERB: &str = "trigger";
+/// What a trigger's launchd job runs.
 pub const FIRE_FLAG: &str = "--trigger-fire";
 /// What the turn-end watcher's job runs.
 pub const WATCH_FLAG: &str = "--trigger-watch";
@@ -55,7 +57,7 @@ const GATE_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a fire waits for the turn whose answer goes to `--reply-to`:
 /// the longest wait the daemon takes.
 const REPLY_WAIT_MS: u64 = 86_400_000;
-const USAGE: &str = "usage: trigger add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--turn-budget-tokens N] -- MESSAGE\n         WHEN: --every N{m,h,d} | --in N{m,h} | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO | --turn-end BOT [--count N]; none: only fire runs it\n       trigger ls [--after NAME]\n       trigger fire NAME\n       trigger rm NAME\n       trigger changed --except BOT";
+pub const USAGE: &str = "usage: trigger add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--turn-budget-tokens N] -- MESSAGE\n         WHEN: --every N{m,h,d} | --in N{m,h} | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO | --turn-end BOT [--count N]; none: only fire runs it\n       trigger ls [--after NAME]\n       trigger show NAME\n       trigger fire NAME\n       trigger rm NAME\n       trigger changed --except BOT";
 
 /// Where triggers live: the LaunchAgents folder holds their plists, and
 /// `~/.agent/triggers` what each one's fires did.
@@ -2092,7 +2094,22 @@ pub(crate) fn error_json(message: &str) -> Value {
     }
 }
 
-/// `APP --trigger add|ls|fire|rm`, from `~/.agent/trigger`.
+/// At Sonny's start, off its way: finish what a fire cut short, and point
+/// every trigger (and the watcher) at this Sonny when it moved.
+pub fn at_start() {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let (Ok(places), Some(sonny)) = (Places::home(), crate::skills::sonny_path()) else {
+        return;
+    };
+    std::thread::spawn(move || {
+        finish(&places, &launchctl);
+        refresh(&places, &sonny, &launchctl);
+    });
+}
+
+/// `sonny trigger add|ls|show|fire|rm|changed`, as `~/.agent/trigger` runs it.
 pub fn cli(args: &[String]) -> i32 {
     let done = match Places::home().and_then(|places| match args.split_first() {
         Some((verb, rest)) if verb == "ls" => match rest {
@@ -2103,6 +2120,7 @@ pub fn cli(args: &[String]) -> i32 {
         Some((verb, [name])) if verb == "rm" => {
             remove(&places, name, &launchctl).map(|()| json!({"removed": name}))
         }
+        Some((verb, [name])) if verb == "show" => Ok(one(&places, name).unwrap_or(Value::Null)),
         Some((verb, [name])) if verb == "fire" => fire_now(&places, name),
         Some((verb, rest)) if verb == "add" => add(&places, rest),
         Some((verb, [flag, bot])) if verb == "changed" && flag == "--except" => {
@@ -2119,44 +2137,6 @@ pub fn cli(args: &[String]) -> i32 {
     };
     eprintln!("{}", error_json(&done));
     1
-}
-
-/// `trigger add ARGS` as a window asks for it: run as the script runs it,
-/// in `dir`, where `--if` and `--start` work, on the window's daemon, and as
-/// no agent's shell, so `--bot` or `--start` names whom it wakes.
-pub fn add_for(
-    socket: &Path,
-    store: Option<&Path>,
-    dir: &Path,
-    args: &[String],
-) -> Result<Value, String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let mut command = std::process::Command::new(exe);
-    command
-        .arg(FLAG)
-        .arg("add")
-        .args(args)
-        .current_dir(dir)
-        .env("AGENT_SOCKET", socket)
-        .env_remove("AGENT_BOT")
-        .env_remove("AGENT_BOT_ID")
-        .stdin(std::process::Stdio::null());
-    match store {
-        Some(store) => command.env("AGENT_STORE", store),
-        None => command.env_remove("AGENT_STORE"),
-    };
-    let out = command.output().map_err(|e| e.to_string())?;
-    if out.status.success() {
-        return serde_json::from_slice(&out.stdout).map_err(|e| e.to_string());
-    }
-    let error: Value = serde_json::from_slice(&out.stderr).unwrap_or_default();
-    Err(match (error["error"].as_str(), error["detail"].as_str()) {
-        (Some(code), Some(detail)) => format!("{code}: {detail}"),
-        _ => format!(
-            "trigger_failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ),
-    })
 }
 
 /// Whether an agent other than `except` has a new message or another status
@@ -2468,7 +2448,7 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
     let watching = std::fs::read_to_string(places.plist(&trigger.name))
         .ok()
         .and_then(|text| watched(&text));
-    let app = std::env::current_exe().map_err(|e| e.to_string())?;
+    let app = crate::skills::sonny_path().ok_or("no path to this Sonny")?;
     let environment = environment();
     match install(
         places,
@@ -2670,14 +2650,14 @@ async fn start(client: &Client, trigger: &Trigger) -> Result<i64, String> {
         .dir
         .as_ref()
         .ok_or("invalid_trigger: --start has no folder")?;
-    let policy = crate::compose(dir, None)?;
+    let instructions = crate::project::plain(dir)?;
     let made = client
         .request(
             "create",
             json!({"bot": name, "workspace": dir, "model": model, "effort": effort,
-                "instructions": policy["instructions"],
-                "compaction_instructions": policy["compaction_instructions"],
-                "tools": crate::TOOLS,
+                "instructions": instructions,
+                "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
+                "tools": crate::project::TOOLS,
                 "created_by": by.as_ref().map(|(bot, _)| bot),
                 "created_by_id": by.as_ref().map(|(_, id)| id),
                 "request_id": format!("trigger-{}", trigger.generation)}),
@@ -3068,43 +3048,21 @@ fn ends(places: &Places, trigger: &Trigger, keep: bool) {
     }
 }
 
-/// The daemon, started the way the app starts one when none answers and
+/// The daemon, started the way Sonny starts one when none answers and
 /// the trigger names its store, on the socket the trigger was made with.
 async fn connect(socket: &Path, daemon: &Daemon) -> Result<std::sync::Arc<Client>, String> {
     match Client::connect(socket).await {
         Ok((client, _events)) => Ok(client),
         Err(error) if error.code == "daemon_unavailable" => {
-            let (Some(store), Some(agent)) = (&daemon.store, crate::daemon::bundled()) else {
+            let Some(store) = &daemon.store else {
                 return Err(coded(error));
             };
-            crate::daemon::Starts::default()
-                .start(&agent, store, daemon.socket.as_deref())
-                .await?;
+            crate::start_daemon(store, socket).map_err(|e| format!("daemon_unavailable: {e}"))?;
             let (client, _events) = Client::connect(socket).await.map_err(coded)?;
             Ok(client)
         }
         Err(error) => Err(coded(error)),
     }
-}
-
-/// `~/.agent/trigger`, written again whenever the app starts from
-/// somewhere else.
-pub fn write_script(home: &Path, app: &Path) -> Result<(), String> {
-    write_runner(&home.join("trigger"), USAGE, app, FLAG)
-}
-
-/// A script at `path` that runs `app` with `flag`, its usage in comments:
-/// written when it differs, so a start that changes nothing writes nothing.
-pub(crate) fn write_runner(path: &Path, usage: &str, app: &Path, flag: &str) -> Result<(), String> {
-    let quote = |p: &Path| format!("'{}'", p.to_string_lossy().replace('\'', r"'\''"));
-    let usage = usage.replace('\n', "\n# ");
-    let text = format!("#!/bin/sh\n# {usage}\nexec {} {flag} \"$@\"\n", quote(app));
-    use std::os::unix::fs::PermissionsExt;
-    let runnable = std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o777 == 0o755);
-    if runnable && std::fs::read_to_string(path).is_ok_and(|have| have == text) {
-        return Ok(());
-    }
-    replace_mode(path, text.as_bytes(), 0o755)
 }
 
 #[cfg(test)]
@@ -3617,23 +3575,6 @@ mod tests {
             ..trigger()
         };
         assert!(w.install(&bad).is_err());
-    }
-
-    #[test]
-    fn the_script_is_runnable_even_when_its_text_was_already_there() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = std::env::temp_dir().join(format!("agent-app-script-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let app = Path::new("/A/agent-app");
-        write_script(&root, app).unwrap();
-        let path = root.join("trigger");
-        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(&path), 0o755);
-        // Its text survived a crash before its mode did.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        write_script(&root, app).unwrap();
-        assert_eq!(mode(&path), 0o755);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

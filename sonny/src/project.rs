@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 /// The coordinator profile Sonny ships, used when neither the folder nor
 /// the user has a `coordinator.md`.
 pub const COORDINATOR: &str = include_str!("../agents/coordinator.md");
-const TOOLS: [&str; 6] = ["shell", "read", "write", "edit", "wait", "history"];
+pub const TOOLS: [&str; 6] = ["shell", "read", "write", "edit", "wait", "history"];
 
 pub struct Lead {
     pub project: String,
@@ -73,6 +73,15 @@ fn folder(
         .map(|skill| skill.name)
         .collect();
     Ok((composed.text, skills))
+}
+
+/// What an agent a trigger starts in `dir` is told: the folder's rules,
+/// skills and memory, in no role.
+pub fn plain(dir: &Path) -> Result<String, String> {
+    let memory = agent_client::policy::memory_indexes(dir).map_err(|e| e.to_string())?;
+    agent_client::policy::instructions(dir, None, &memory)
+        .map(|composed| composed.text)
+        .map_err(|e| format!("{}: {e}", e.code()))
 }
 
 /// This Sonny's start rule.

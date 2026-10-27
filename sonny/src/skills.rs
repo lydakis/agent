@@ -11,9 +11,10 @@ pub fn install_errand() {
     }
 }
 
-/// What every agent of Sonny's leans on: the memory and plan skills, the
-/// nightly cleanup's, and `~/.agent/memory` and `~/.agent/project`, which
-/// run this Sonny. Written at each start, so they lead to this copy.
+/// What every agent of Sonny's leans on: the memory, plan and automation
+/// skills, the nightly cleanup's, and `~/.agent/memory`, `~/.agent/project`
+/// and `~/.agent/trigger`, which run this Sonny. Written at each start, so
+/// they lead to this copy.
 pub fn install_own() {
     install("memory", include_str!("../skills/memory/SKILL.md"));
     install(
@@ -27,13 +28,15 @@ pub fn install_own() {
             ("plan", include_str!("../skills/plan/plan"), 0o755),
         ],
     );
-    let (Some(home), Ok(sonny)) = (std::env::var_os("HOME"), std::env::current_exe()) else {
+    install("automation", include_str!("../skills/automation/SKILL.md"));
+    let (Some(home), Some(sonny)) = (std::env::var_os("HOME"), sonny_path()) else {
         return;
     };
     let state = PathBuf::from(home).join(".agent");
     for (name, usage) in [
         ("memory", agent_client::memory::usage()),
         ("project", crate::project::usage()),
+        (crate::trigger::VERB, crate::trigger::USAGE),
     ] {
         if let Err(error) = write_runner(&state.join(name), usage, &sonny, name) {
             eprintln!("sonny: {error}");
@@ -89,6 +92,32 @@ fn in_app_bundle(target: &Path) -> bool {
             .is_some_and(|extension| extension == "app")
 }
 
+/// This Sonny, by the path that outlives an upgrade: Homebrew's `opt`
+/// link for a Sonny in its Cellar, which a scheduled fire still finds after
+/// the old version is cleaned up.
+pub fn sonny_path() -> Option<PathBuf> {
+    let me = std::env::current_exe().ok()?;
+    Some(opt_path(&std::fs::canonicalize(&me).unwrap_or(me)))
+}
+
+/// `PREFIX/Cellar/NAME/VERSION/REST` as `PREFIX/opt/NAME/REST` when that
+/// leads to a file; any other path as it is.
+fn opt_path(exe: &Path) -> PathBuf {
+    let parts: Vec<_> = exe.components().collect();
+    let found = parts
+        .iter()
+        .position(|part| part.as_os_str() == "Cellar")
+        .filter(|at| at + 3 < parts.len());
+    let Some(at) = found else {
+        return exe.to_owned();
+    };
+    let mut opt: PathBuf = parts[..at].iter().collect();
+    opt.push("opt");
+    opt.push(parts[at + 1]);
+    opt.extend(&parts[at + 3..]);
+    if opt.is_file() { opt } else { exe.to_owned() }
+}
+
 /// A script at `path` that runs `sonny` with `verb`, its usage in
 /// comments: written when it differs, so a start that changes nothing
 /// writes nothing.
@@ -137,9 +166,39 @@ mod tests {
             "#!/bin/sh\n# usage: memory show\n#        memory rm\nexec '/opt/it'\\''s/sonny' memory \"$@\"\n"
         );
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o755);
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o755);
+        // Its text survived a crash before its mode did.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_runner(
+            &path,
+            "usage: memory show\n       memory rm",
+            sonny,
+            "memory",
+        )
+        .unwrap();
+        assert_eq!(mode(&path), 0o755);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_sonny_in_homebrews_cellar_goes_by_its_opt_link() {
+        let root = std::env::temp_dir().join(format!("sonny-opt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let cellar = root.join("Cellar/sonny/0.3.2/libexec/sonny");
+        std::fs::create_dir_all(cellar.parent().unwrap()).unwrap();
+        std::fs::write(&cellar, "").unwrap();
+        // Without the link, the path itself.
+        assert_eq!(opt_path(&cellar), cellar);
+        let opt = root.join("opt/sonny/libexec/sonny");
+        std::fs::create_dir_all(opt.parent().unwrap()).unwrap();
+        std::fs::write(&opt, "").unwrap();
+        assert_eq!(opt_path(&cellar), opt);
+        assert_eq!(
+            opt_path(Path::new("/usr/local/bin/sonny")),
+            Path::new("/usr/local/bin/sonny")
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

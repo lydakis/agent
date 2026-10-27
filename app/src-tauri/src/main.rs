@@ -22,7 +22,6 @@ mod session;
 mod settings;
 mod skills;
 mod swarm;
-mod trigger;
 mod worktree;
 
 use agent_client::{Client, memory, project};
@@ -998,7 +997,7 @@ mod policy_tests {
         let root = root.canonicalize().unwrap();
         let built = compose(&root, Some("coordinator")).unwrap();
         let text = built["instructions"].as_str().unwrap();
-        assert!(text.contains("# Role: coordinator\n\nYou coordinate the work in this folder."));
+        assert!(text.contains("# Role: coordinator\n\nYou coordinate the work in this folder"));
         assert!(text.contains("git worktree add -b agent/NAME"));
         assert!(
             !text.contains("name: coordinator"),
@@ -1220,29 +1219,63 @@ async fn swarm_board(
         .map_err(|e| e.to_string())?
 }
 
-/// Triggers use this machine's launchd, never a remote window's agents.
-fn triggers_of(state: &Shared) -> Result<trigger::Places, String> {
-    if state.host().is_some() {
+/// Triggers are Sonny's, on this machine's launchd, never a remote
+/// window's agents: the app runs `~/.agent/trigger`, which Sonny writes,
+/// as no agent's shell, on this window's daemon, in `dir` when given, and
+/// gives back its JSON line or its error as `CODE: detail`.
+fn run_trigger(state: &Shared, dir: Option<&str>, args: &[&str]) -> Result<Value, String> {
+    let Target::Local { socket, store } = &state.config.target else {
         return Err("remote_unsupported: triggers run on this machine only; open a local window for triggers".into());
+    };
+    let script = std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".agent/trigger"))
+        .filter(|script| script.is_file())
+        .ok_or("triggers_unsupported: ~/.agent/trigger is not there; triggers come with Sonny")?;
+    let mut command = std::process::Command::new(script);
+    command
+        .args(args)
+        .env("AGENT_SOCKET", socket)
+        .env_remove("AGENT_BOT")
+        .env_remove("AGENT_BOT_ID")
+        .stdin(std::process::Stdio::null());
+    if let Some(dir) = dir {
+        command.current_dir(dir);
     }
-    trigger::Places::home()
+    match store {
+        Some(store) => command.env("AGENT_STORE", store),
+        None => command.env_remove("AGENT_STORE"),
+    };
+    let out = command.output().map_err(|e| e.to_string())?;
+    if out.status.success() {
+        return serde_json::from_slice(&out.stdout).map_err(|e| e.to_string());
+    }
+    let error: Value = serde_json::from_slice(&out.stderr).unwrap_or_default();
+    Err(match (error["error"].as_str(), error["detail"].as_str()) {
+        (Some(code), Some(detail)) => format!("{code}: {detail}"),
+        _ => format!(
+            "trigger_failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+    })
 }
 
 /// Every trigger, with what its last fire did.
 #[tauri::command]
-fn triggers(
+async fn triggers(
     windows: State<'_, Windows>,
     window: tauri::WebviewWindow,
     after: Option<String>,
 ) -> Result<Value, String> {
-    Ok(trigger::list(
-        &triggers_of(&*windows.of(&window)?)?,
-        after.as_deref(),
-    ))
+    let state = windows.of(&window)?;
+    blocking(move || match &after {
+        Some(after) => run_trigger(&state, None, &["ls", "--after", after]),
+        None => run_trigger(&state, None, &["ls"]),
+    })
+    .await
 }
 
-/// Add a trigger as `trigger add ARGS` does, from `dir` (see
-/// `trigger::add_for`).
+/// Add a trigger as `trigger add ARGS` does, from `dir`, where `--if` and
+/// `--start` work, so `--bot` or `--start` names whom it wakes.
 #[tauri::command]
 async fn trigger_add(
     windows: State<'_, Windows>,
@@ -1251,46 +1284,44 @@ async fn trigger_add(
     args: Vec<String>,
 ) -> Result<Value, String> {
     let state = windows.of(&window)?;
-    triggers_of(&state)?;
-    let Target::Local { socket, store } = &state.config.target else {
-        unreachable!("triggers_of refuses a host");
-    };
-    let (socket, store) = (socket.clone(), store.clone());
-    blocking(move || trigger::add_for(&socket, store.as_deref(), std::path::Path::new(&dir), &args))
-        .await
+    blocking(move || {
+        let mut all = vec!["add"];
+        all.extend(args.iter().map(String::as_str));
+        run_trigger(&state, Some(&dir), &all)
+    })
+    .await
 }
 
 /// One trigger by name, as `triggers` lists it; null when there is none.
 #[tauri::command]
-fn trigger(
-    windows: State<'_, Windows>,
-    window: tauri::WebviewWindow,
-    name: String,
-) -> Result<Option<Value>, String> {
-    Ok(trigger::one(&triggers_of(&*windows.of(&window)?)?, &name))
-}
-
-#[tauri::command]
-fn trigger_remove(
-    windows: State<'_, Windows>,
-    window: tauri::WebviewWindow,
-    name: String,
-) -> Result<(), String> {
-    trigger::remove(
-        &triggers_of(&*windows.of(&window)?)?,
-        &name,
-        &trigger::launchctl,
-    )
-}
-
-/// Run a trigger now, as `trigger fire NAME` does.
-#[tauri::command]
-fn trigger_fire(
+async fn trigger(
     windows: State<'_, Windows>,
     window: tauri::WebviewWindow,
     name: String,
 ) -> Result<Value, String> {
-    trigger::fire_now(&triggers_of(&*windows.of(&window)?)?, &name)
+    let state = windows.of(&window)?;
+    blocking(move || run_trigger(&state, None, &["show", &name])).await
+}
+
+#[tauri::command]
+async fn trigger_remove(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    name: String,
+) -> Result<(), String> {
+    let state = windows.of(&window)?;
+    blocking(move || run_trigger(&state, None, &["rm", &name]).map(|_| ())).await
+}
+
+/// Run a trigger now, as `trigger fire NAME` does.
+#[tauri::command]
+async fn trigger_fire(
+    windows: State<'_, Windows>,
+    window: tauri::WebviewWindow,
+    name: String,
+) -> Result<Value, String> {
+    let state = windows.of(&window)?;
+    blocking(move || run_trigger(&state, None, &["fire", &name])).await
 }
 
 /// The folder of plans beside the store this window's daemon runs, where
@@ -1350,41 +1381,15 @@ async fn request(
 }
 
 /// Run by the Homebrew cask after an install or upgrade: what a start does in
-/// `machine_setup`, so the scripts, triggers and skills the app provides are
-/// there before its first window.
+/// `machine_setup`, so the skills the app provides are there before its
+/// first window.
 const SETUP_FLAG: &str = "--setup";
 
 /// What the app puts on this machine, written at every start so it all leads
-/// to this copy: `~/.agent/trigger`, triggers reloaded after a move, and the skills it ships linked from
-/// `~/.agents/skills`. False when any of it failed; each failure is printed
-/// and does not stop the rest. A start reloads triggers off the window's way.
-fn machine_setup(background: bool) -> bool {
+/// to this copy: the skills it ships, linked from `~/.agents/skills`. False
+/// when any of it failed; each failure is printed and does not stop the rest.
+fn machine_setup() -> bool {
     let mut ok = true;
-    let mut report = |error: &dyn std::fmt::Display| {
-        eprintln!("agent-app: {error}");
-        ok = false;
-    };
-    if let (Some(home), Ok(app)) = (std::env::var_os("HOME"), std::env::current_exe()) {
-        let state = PathBuf::from(home).join(".agent");
-        if let Err(error) = trigger::write_script(&state, &app) {
-            report(&error);
-        }
-        // Ends a fire cut short are finished, and a moved app reloads every
-        // trigger, each a launchctl run.
-        if cfg!(target_os = "macos")
-            && let Ok(places) = trigger::Places::home()
-        {
-            let refresh = move || {
-                trigger::finish(&places, &trigger::launchctl);
-                trigger::refresh(&places, &app, &trigger::launchctl);
-            };
-            if background {
-                std::thread::spawn(refresh);
-            } else {
-                refresh();
-            }
-        }
-    }
     if let (Some(user), Some(shipped)) = (
         std::env::var_os("HOME"),
         std::env::current_exe()
@@ -1392,7 +1397,8 @@ fn machine_setup(background: bool) -> bool {
             .and_then(|exe| skills::bundled(&exe)),
     ) {
         for error in skills::install(std::path::Path::new(&user), &shipped) {
-            report(&error);
+            eprintln!("agent-app: {error}");
+            ok = false;
         }
     }
     ok
@@ -1404,14 +1410,11 @@ fn main() {
     // without a window.
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
-        Some(trigger::FLAG) => std::process::exit(trigger::cli(&args[2..])),
-        Some(trigger::FIRE_FLAG) => std::process::exit(trigger::fire_cli(&args[2..])),
-        Some(trigger::WATCH_FLAG) => std::process::exit(trigger::watch_cli()),
-        Some(SETUP_FLAG) => std::process::exit(i32::from(!machine_setup(false))),
+        Some(SETUP_FLAG) => std::process::exit(i32::from(!machine_setup())),
         Some(skills::UNLINK_FLAG) => std::process::exit(skills::unlink_cli()),
         _ => {}
     }
-    machine_setup(true);
+    machine_setup();
     let links = remote::Hosts::new(
         std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent/hosts")),
         PathBuf::from("ssh"),
@@ -1695,9 +1698,8 @@ mod host_tests {
         assert_eq!(shim.count("agent start"), 1);
         assert!(!started.exists(), "a local daemon was started for a host");
         assert!(
-            triggers_of(&window)
-                .err()
-                .unwrap()
+            run_trigger(&window, None, &["ls"])
+                .unwrap_err()
                 .starts_with("remote_unsupported:")
         );
         hosts.close_all().await;
