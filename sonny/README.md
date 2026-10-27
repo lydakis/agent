@@ -163,7 +163,8 @@ off again never shows.
   sets the questions aside for a message of your own, and Esc again goes
   back to them. The open questions are read from the lead's history (its
   `ask` calls not yet answered), so one asked while Sonny was closed is
-  pinned when it opens.
+  pinned when it opens; Sonny keeps them in `~/.agent/sonny/asks` too, so
+  one asked before the history it replays still comes back.
 - `/copy` puts the last reply on the clipboard; `/open` opens the last
   HTML page in a browser; `/sound` turns the chime off or on; `/verbose`
   switches between the clean view and every tool call; `/quit`

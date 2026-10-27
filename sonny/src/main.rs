@@ -1146,6 +1146,9 @@ struct App {
     /// Where the person's reactions to the bot are kept, once its id is
     /// known.
     reactions_key: Option<String>,
+    /// Where its open questions are kept, for those older than the
+    /// history Sonny replays.
+    asks_file: Option<PathBuf>,
     /// Esc set the questions aside: what is typed is a message of its own.
     chatting: bool,
     /// The waiting call whose whole command was last written out.
@@ -1812,6 +1815,7 @@ impl App {
                     std::fs::canonicalize(&options.store).unwrap_or_else(|_| options.store.clone());
                 reactions::key(&store, id)
             }),
+            asks_file: None,
             chatting: false,
             asked: None,
             following: true,
@@ -1878,6 +1882,7 @@ impl App {
         let _ = terminal.autoresize();
         self.width = terminal.size().map(|s| s.width as usize).unwrap_or(80);
         self.reactions = reactions::Reactions::load(self.reactions_key.as_deref());
+        self.asks_file = self.reactions_key.as_deref().and_then(asks::file);
         self.history().await;
         // A turn already running: its clock, and any call it waits on.
         if let Some(turn) = self.running.as_ref().map(|r| r.turn) {
@@ -2532,7 +2537,9 @@ impl App {
             self.bot_reactions.clear();
             self.react_calls.clear();
             self.answering = None;
-            self.asks.clear();
+            // Those asked before the history replayed; the replay closes
+            // the ones it answers and adds the ones it asks.
+            self.asks = asks::load(self.asks_file.as_deref());
             self.sent_answers.clear();
         }
         self.seen_node = nodes.last().copied().unwrap_or(self.seen_node);
@@ -2638,6 +2645,7 @@ impl App {
         }
         // A call still running finishes live, after the history.
         self.calls.extend(calls);
+        self.keep_asks();
     }
 
     /// Drop the staged prompts that landed while Sonny was away, whose
@@ -4081,6 +4089,7 @@ impl App {
                 if let Some(ask) = answering {
                     self.asks.retain(|open| open.id != ask.id);
                     self.sent_answers.push(ask.question);
+                    self.keep_asks();
                     if self.asks.is_empty() {
                         self.chatting = false;
                     }
@@ -4152,6 +4161,14 @@ impl App {
             && !self.asks.iter().any(|open| open.id == ask.id)
         {
             self.asks.push(ask);
+            self.keep_asks();
+        }
+    }
+
+    /// The open questions kept for the next start.
+    fn keep_asks(&mut self) {
+        if let Err(error) = asks::keep(self.asks_file.as_deref(), &self.asks) {
+            self.notice = Some(error);
         }
     }
 
@@ -4166,6 +4183,7 @@ impl App {
             return;
         }
         asks::close(&mut self.asks, message);
+        self.keep_asks();
         if self.asks.is_empty() {
             self.chatting = false;
         }
@@ -5232,16 +5250,22 @@ mod tests {
         })
         .await;
         let mut app = app(client);
+        // Kept from before: one asked earlier than the history replayed,
+        // and one the history asks again.
+        let file = std::env::temp_dir().join(format!("sonny-asks-app-{}.json", std::process::id()));
+        let older = asks::call("o1", &json!({"question": "Rename the crate?"})).unwrap();
+        let tag = asks::Ask {
+            id: "a1".into(),
+            question: "Tag 0.4.1?".into(),
+            choices: vec!["Yes".into(), "No".into()],
+        };
+        asks::keep(Some(&file), &[older.clone(), tag.clone()]).unwrap();
+        app.asks_file = Some(file.clone());
         app.history().await;
-        // The refused one was never asked, and the answered one is closed.
-        assert_eq!(
-            app.asks,
-            [asks::Ask {
-                id: "a1".into(),
-                question: "Tag 0.4.1?".into(),
-                choices: vec!["Yes".into(), "No".into()]
-            }]
-        );
+        // The refused one was never asked, and the answered one is closed;
+        // the older one is still open.
+        assert_eq!(app.asks, [older.clone(), tag]);
+        assert_eq!(asks::load(Some(&file)), app.asks);
         let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
         assert!(
             rows.contains(&"• Asked you Tag 0.4.1?".to_owned()),
@@ -5249,7 +5273,9 @@ mod tests {
         );
         // Its answer landing, sent from here or another window, closes it.
         app.answered("You asked: Tag 0.4.1?\n\nYes");
+        app.answered("You asked: Rename the crate?\n\nNo");
         assert!(app.asks.is_empty());
+        assert!(!file.exists());
         // Live, a question is pinned once the daemon took the call.
         let arguments = json!({"question": "Merge?"}).to_string();
         app.daemon(turn_event("accepted", 4, json!({}))).await;
@@ -5263,6 +5289,7 @@ mod tests {
         app.daemon(turn_event("tool_completed", 4, json!({"call_id": "a4"})))
             .await;
         assert_eq!(app.asks[0].question, "Merge?");
+        let _ = std::fs::remove_file(&file);
     }
 
     #[tokio::test]
