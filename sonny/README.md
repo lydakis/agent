@@ -22,7 +22,17 @@ with the project's name), in Herdr a workspace, chosen the same way. Each task
 the lead (or one of its tasks) starts gets a window (a Herdr tab) there
 running Sonny on that task, without taking focus, its block (pane) labelled
 with the task's name. In Rex, each window reports OSC 7501 status, so Rex
-shows which task is working, waiting on an approval or done. A task's window
+shows which task is working, waiting on an approval or done. In Herdr, Sonny
+supports Herdr the way its own agents do: each Sonny reports its bot through
+`herdr pane report-agent`, so the agent panel lists it as `Sonny: NAME`
+(working, idle, or blocked on an approval), the workspace rolls that up and
+notifies, `herdr agent wait` and `herdr agent prompt` reach it by name
+(`shop-fix-cart` for `shop.fix-cart`), and after a Herdr restart the pane runs
+`sonny` on the same bot again (when `sonny` is on the PATH). The place a
+project was laid out in is kept in `~/.agent/sonny/places`, so an agent's
+`sonny split` and `sonny show` go to that Herdr workspace or Rex session, in
+that multiplexer, rather than one guessed from the agent's shell, which runs
+in the daemon and is in neither. A task's window
 closes once its work is taken: its turn completed and the lead (or the task
 that started it) waited on it. One that failed, stopped or waits on you stays
 open, and a task given more work opens again; ask the lead to show one, or
