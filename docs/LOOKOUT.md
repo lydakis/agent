@@ -77,8 +77,9 @@ does not, so `rm` it first. Each subscriber's are one file,
 `STORE.lookout/BOT.json`, which a running lookout reads again every 15
 seconds. A lead's file that holds a `tasks` subscription replaces its own.
 
-The note names a subscription's answer as `deploys look-for 0.90` and says
-"do what your deploys subscription says (sonny lookout ls)": the
+The note names a subscription's answer as `deploys look-for 1 0.90` and
+says "do what your deploys look-for 1 says (sonny lookout ls)", where
+`ls` numbers each subscription's look-fors from 1: the
 subscriber's own words stay in its file, since the note reaches the
 approver as the person's. `/lookout` in Sonny lists the window's agent's
 subscriptions, and how many checks each asked for in the last day.

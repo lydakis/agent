@@ -147,11 +147,13 @@ impl Sub {
             None if self.look_for.is_empty() => parts.push("asks every built-in".into()),
             None => {}
         }
-        for look in &self.look_for {
+        for (n, look) in self.look_for.iter().enumerate() {
             let urgent = if look.urgent { ", urgent" } else { "" };
             parts.push(format!(
-                "looks for {:?}, then {:?}{urgent}",
-                look.text, look.then
+                "look-for {} {:?}, then {:?}{urgent}",
+                n + 1,
+                look.text,
+                look.then
             ));
         }
         if let Some(context) = &self.context {

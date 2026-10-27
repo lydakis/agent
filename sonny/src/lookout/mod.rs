@@ -237,7 +237,7 @@ pub struct Seen {
 pub struct Asks {
     /// Built-in question IDs; `None` asks each one that fits the event.
     pub builtins: Option<Vec<&'static str>>,
-    /// What subscriptions look for, by subscription.
+    /// What subscriptions look for, each named as `SUB look-for N`.
     pub looks: Vec<(String, subs::Look)>,
     pub context: Vec<String>,
     /// The subscriptions it matched, for the log.
@@ -351,7 +351,7 @@ type Reasons = Vec<(&'static str, f64)>;
 
 /// A check's band with what its subscriptions looked for: a high answer
 /// to one wakes the subscriber, steering when it said `--urgent`, and a
-/// middle one is held. The looks that put it there come by subscription.
+/// middle one is held. The looks that put it there come by name.
 pub fn graded(
     answers: &Map<String, Value>,
     looks: &[(String, subs::Look)],
@@ -397,7 +397,7 @@ pub fn graded(
 pub struct Item {
     pub seen: Seen,
     pub reasons: Vec<(&'static str, f64)>,
-    /// What its subscriptions looked for, answered: by subscription.
+    /// What its subscriptions looked for, answered: as `SUB look-for N`.
     pub looks: Vec<(String, f64)>,
     /// `Wake` or `Hold`: which items a bounded note sends first.
     pub band: Band,
@@ -406,7 +406,7 @@ pub struct Item {
 /// Why an item is in the note: the judge's answers that put it there.
 fn why(item: &Item) -> String {
     let reasons = (item.reasons.iter()).map(|(id, p)| format!("{} {p:.2}", id.replace('_', " ")));
-    let looks = (item.looks.iter()).map(|(sub, p)| format!("{sub} look-for {p:.2}"));
+    let looks = (item.looks.iter()).map(|(look, p)| format!("{look} {p:.2}"));
     let why: Vec<String> = reasons.chain(looks).collect();
     match why.is_empty() {
         true => "not checked".to_owned(),
@@ -455,7 +455,7 @@ fn note(items: &[Item], more: usize, told: &updates::Told, dropped: usize) -> St
         // A subscription's own action is the subscriber's words, so the
         // note names it and the lead reads it there.
         let subs: Vec<String> = (item.looks.iter())
-            .map(|(sub, _)| format!("do what your {sub} subscription says (sonny lookout ls)"))
+            .map(|(look, _)| format!("do what your {look} says (sonny lookout ls)"))
             .fold(Vec::new(), |mut subs, sub| {
                 if !subs.contains(&sub) {
                     subs.push(sub);
@@ -2208,6 +2208,11 @@ impl Lookout {
                     self.quiet.remove(task);
                 }
             }
+            // A turn that was running before its bot was watched is
+            // tracked from the first thing it does since.
+            "text_delta" | "tool_started" | "tool_completed" if !self.quiet.contains_key(task) => {
+                self.quiet.insert(task.to_owned(), (turn, now, false));
+            }
             _ => {
                 if let Some((running, at, checked)) = self.quiet.get_mut(task)
                     && *running == turn
@@ -2318,8 +2323,9 @@ impl Lookout {
                     builtins.push(id);
                 }
             }
-            for look in &sub.look_for {
-                asks.looks.push((sub.name.clone(), look.clone()));
+            for (n, look) in sub.look_for.iter().enumerate() {
+                let named = format!("{} look-for {}", sub.name, n + 1);
+                asks.looks.push((named, look.clone()));
             }
             if let Some(context) = &sub.context
                 && !asks.context.contains(context)
@@ -2739,10 +2745,11 @@ async fn replayed(store: &Path, socket: PathBuf, judges: &str, limit: usize) -> 
                 "judge": judge.name, "text": cut(&text, 600)});
             match answered {
                 Ok(checked) => {
-                    let (band, reasons) = band(&checked.answers);
+                    let (band, reasons, looks) = graded(&checked.answers, &seen.asks.looks);
                     line["answers"] = Value::Object(checked.answers);
                     line["band"] = json!(format!("{band:?}"));
                     line["reasons"] = json!(reasons);
+                    line["looks"] = json!(looks);
                     line["tokens"] = json!(checked.tokens);
                     line["ms"] = json!(checked.ms);
                 }
@@ -3224,13 +3231,13 @@ mod tests {
                 text: String::new(),
             },
             reasons: Vec::new(),
-            looks: vec![("deploys".into(), 0.9)],
+            looks: vec![("deploys look-for 1".into(), 0.9)],
             band: Band::Wake { steer: true },
         };
         let note = note(&[item], 0, &updates::Told::default(), 0);
         // The subscriber's own words stay in its file, never in the note.
         assert!(note.contains(
-            "- calc.fix: turn:calc.fix/3, turn completed (deploys look-for 0.90; do what your deploys subscription says (sonny lookout ls))"
+            "- calc.fix: turn:calc.fix/3, turn completed (deploys look-for 1 0.90; do what your deploys look-for 1 says (sonny lookout ls))"
         ), "{note}");
         assert!(!note.contains("tell me") && !note.contains("a deploy"));
     }
@@ -3673,6 +3680,16 @@ mod tests {
         lookout.due.clear();
         lookout.quiet_due(Instant::now() + 2 * QUIET_AFTER);
         assert!(lookout.due.is_empty());
+        // A turn already running when its bot came to be watched is
+        // tracked from what it does next.
+        lookout.event(&ev(
+            "calc.fix",
+            8,
+            "tool_started",
+            json!({"name": "shell"}),
+        ));
+        lookout.quiet_due(Instant::now() + 2 * QUIET_AFTER);
+        assert_eq!((lookout.due[0].kind, lookout.due[0].turn), (Kind::Quiet, 8));
     }
 
     #[test]

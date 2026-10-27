@@ -146,7 +146,7 @@ class LookoutTests(ModelFixture):
         woke = self.note_for('reviewer')
         self.assertIsNotNone(woke, 'the subscriber was not woken')
         self.assertIn('- ops.deploy: turn:ops.deploy/', woke)
-        self.assertIn('deploys look-for 0.90; do what your deploys subscription says', woke)
+        self.assertIn('deploys look-for 1 0.90; do what your deploys look-for 1 says', woke)
         # Its own words stay in its file.
         self.assertNotIn('tell the person', woke)
         _, asked = self.asked.get(timeout=5)
