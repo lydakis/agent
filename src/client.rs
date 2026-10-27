@@ -1469,7 +1469,7 @@ fn ways_past_busy(bot: &str, error: Error) -> Error {
         None => "resend with --delivery queue to run this after it".to_owned(),
     };
     let fork = format!(
-        "; to ask without interrupting, run --fork={bot} --bot NEW --allow '' --expires 15m -- QUESTION"
+        "; to ask without interrupting, run --detach --fork={bot} --bot NEW --allow '' --expires 15m -- QUESTION"
     );
     // The daemon's own detail names request fields; at the CLI the detail
     // states the refusal and the hint gives the ways past it in flags.
@@ -2874,7 +2874,7 @@ mod tests {
             flagged.facts.unwrap()["hint"]
                 .as_str()
                 .unwrap()
-                .contains("run --fork=--worker --bot NEW")
+                .contains("run --detach --fork=--worker --bot NEW")
         );
     }
 
