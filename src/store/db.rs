@@ -117,6 +117,15 @@ pub struct Bot {
     /// Its context, history and approval settings, reported as they apply.
     #[serde(serialize_with = "resolved_settings")]
     pub settings: Settings,
+    /// How long it may sit idle before the daemon deletes it, as its fork
+    /// asked; `None` keeps it until a client deletes it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expire_ms: Option<u64>,
+    /// When it is deleted, in milliseconds since the epoch, unless a turn
+    /// is running or waiting then: its last turn's end, or its fork, plus
+    /// `expire_ms`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
 }
 /// A bot's denials under one gate tag in the turn that gave the last: how
 /// many in a row, reset when a call every gate allowed starts, and how many
@@ -366,6 +375,8 @@ pub struct Fork<'a> {
     /// The tools the fork may call, within its source's; `None` keeps the
     /// source's list.
     pub allow: Option<&'a [String]>,
+    /// Delete the fork once it has been idle this long.
+    pub expire_ms: Option<u64>,
     /// The client's idempotency key: a resend with the same key and fields
     /// gets the fork it made.
     pub request_id: Option<&'a str>,
@@ -1225,7 +1236,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 51;
+    pub const SCHEMA: i32 = 52;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1358,6 +1369,7 @@ impl Database {
                 thinking_to INTEGER NOT NULL DEFAULT 0,
                 thinking_elided INTEGER NOT NULL DEFAULT 0, gates TEXT, denials TEXT,
                 closed INTEGER, open_calls INTEGER, allowed TEXT, settings TEXT, creation TEXT,
+                expire_ms INTEGER, expires_at INTEGER,
                 sent_bytes INTEGER, sent_tokens INTEGER, compact_asked INTEGER NOT NULL DEFAULT 0);
             CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
             CREATE INDEX IF NOT EXISTS bots_note ON bots(note);
@@ -1432,7 +1444,8 @@ impl Database {
             CREATE INDEX IF NOT EXISTS turns_ready_bot ON turns(bot) WHERE status='ready';
             CREATE INDEX IF NOT EXISTS processes_running ON processes(turn) WHERE status='running';
             CREATE INDEX IF NOT EXISTS bots_deleting ON bots(name) WHERE status='deleting';
-            CREATE INDEX IF NOT EXISTS bots_running ON bots(name) WHERE running_turn IS NOT NULL;")?;
+            CREATE INDEX IF NOT EXISTS bots_running ON bots(name) WHERE running_turn IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS bots_expiring ON bots(expires_at) WHERE expires_at IS NOT NULL;")?;
         if version != Self::SCHEMA {
             tx.pragma_update(None, "user_version", Self::SCHEMA)?;
         }
@@ -1740,16 +1753,18 @@ impl Database {
                     )
                 })?,
             },
-            sent: match (r.get::<_, Option<i64>>(35)?, r.get::<_, Option<i64>>(36)?) {
+            expire_ms: r.get::<_, Option<i64>>(35)?.map(|ms| ms.max(0) as u64),
+            expires_at: r.get(36)?,
+            sent: match (r.get::<_, Option<i64>>(37)?, r.get::<_, Option<i64>>(38)?) {
                 (Some(bytes), Some(tokens)) if bytes > 0 && tokens > 0 => {
                     Some((bytes as u64, tokens as u64))
                 }
                 _ => None,
             },
-            compaction_requested: r.get::<_, i64>(37)? != 0,
+            compaction_requested: r.get::<_, i64>(39)? != 0,
         })
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings,sent_bytes,sent_tokens,compact_asked";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings,expire_ms,expires_at,sent_bytes,sent_tokens,compact_asked";
     /// Validate the caller's captured identity in the same transaction that
     /// creates the child. Never resolve a stale shell's name to a new bot.
     fn creator_id(
@@ -1842,10 +1857,9 @@ impl Database {
         tx.commit()?;
         Ok(changed == 1)
     }
-    /// Replace a root bot's gates, those a fork took from its source
-    /// included: a client that made it could make an ungated bot anyway. A
-    /// bot another bot made keeps the gates it descends from, so it cannot
-    /// be let out of them. Whether anything changed.
+    /// Replace a bot's gates, those it took from its creator or its source
+    /// included: whoever configures it decides, as the person overriding a
+    /// bot another bot made does. Whether anything changed.
     pub fn set_gate(
         &mut self,
         name: &str,
@@ -1854,12 +1868,6 @@ impl Database {
     ) -> Result<bool> {
         let id = self.identity(name, bot_id)?;
         let bot = self.inspect(name)?;
-        if bot.created_by_id.is_some() {
-            return fail_with(
-                "gates_inherited",
-                format!("{name} was made by another bot and keeps its gates"),
-            );
-        }
         if let Some(gate) = &gate {
             not_in_tools(&gate.tools, &bot.tools)?;
         }
@@ -1906,7 +1914,7 @@ impl Database {
         };
         let mut statement = self.conn.prepare_cached(&format!(
             "SELECT name,head,workspace,status,running_turn,provider,family,model,reasoning,budget_tokens,tokens_used,tools,
-                    input_tokens,cached_input_tokens,id,created_by,created_by_id,gates,allowed
+                    input_tokens,cached_input_tokens,id,created_by,created_by_id,gates,allowed,expire_ms,expires_at
              FROM bots WHERE name > ?1{glob}{running} ORDER BY name LIMIT ?2"
         ))?;
         let after = after.unwrap_or("");
@@ -1937,6 +1945,10 @@ impl Database {
             let mut bot = bot;
             if let Some(allowed) = r.get::<_, Option<String>>(18)? {
                 bot["allowed"] = json!(split_tools(&allowed));
+            }
+            if let Some(expire_ms) = r.get::<_, Option<i64>>(19)? {
+                bot["expire_ms"] = json!(expire_ms);
+                bot["expires_at"] = json!(r.get::<_, Option<i64>>(20)?);
             }
             let size = crate::output::encoded_len(&bot)? + 1;
             if bots.len() == limit || bytes + size > crate::output::MAX_EVENT / 2 {
@@ -4850,7 +4862,7 @@ impl Database {
                 &tx,
                 &bot,
                 turn,
-                &call.call_id,
+                call,
                 denial.reason.as_deref(),
                 // Every accepted verdict, so replay keeps each approver's.
                 request.approvals(),
@@ -4922,7 +4934,7 @@ impl Database {
                 &tx,
                 &bot,
                 turn,
-                &call.call_id,
+                call,
                 Some("not reviewed: no verdict"),
                 lapsed,
                 true,
@@ -5361,11 +5373,18 @@ impl Database {
     /// What each listed call and earlier prompt counts against `bytes` for
     /// its fields, so many short entries cannot outgrow a reply.
     pub const PROMPTS_ENTRY: usize = 64;
+    /// The most of the bot's last message before a turn that a `prompts`
+    /// read returns, from its end.
+    pub const PROMPTS_REPLY: usize = 2048;
     /// A turn's words and calls, as a program judging its calls reads them:
     /// the turn's prompt and each steer it absorbed, in order, with the bot
     /// turn that wrote each (none for a person's words); the calls it
     /// started, with argument previews and whether each failed; then the
-    /// bot's earlier prompts, newest first. The words' text counts against
+    /// bot's earlier prompts, newest first. Each prompt or steer carries
+    /// the calls refused after it (`refused`), and this turn's carry the
+    /// end of the bot's last message before them (`reply`): its last of
+    /// the turn before for the prompt, one since the previous words for a
+    /// steer. The words' text counts against
     /// `bytes` in that order and the calls' against their own `bytes`, and
     /// each steer, call, and earlier prompt also counts `PROMPTS_ENTRY`;
     /// text that does not fit is cut and marked
@@ -5403,18 +5422,34 @@ impl Database {
             return fail("turn_not_found");
         };
         let mut left = bytes;
-        let mut prompts = vec![prompt_entry(turn, text, from, from_turn, origin, &mut left)];
+        let mut first = prompt_entry(turn, text, from, from_turn, origin, &mut left);
+        // What the bot last said before the words: what a person's short
+        // answer, such as "yes", answers.
+        let previous: Option<i64> = self
+            .conn
+            .prepare_cached(
+                "SELECT id FROM turns WHERE bot=? AND id<? AND started_ms IS NOT NULL ORDER BY id DESC LIMIT 1",
+            )?
+            .query_row(params![name, turn], |r| r.get(0))
+            .optional()?;
+        if let Some(previous) = previous
+            && let Some(reply) = self.reply(previous, 0, i64::MAX, &mut left)?
+        {
+            first["reply"] = reply;
+        }
+        let mut prompts = vec![first];
         let mut prompts_more = false;
         let mut steers = self.conn.prepare_cached(
-            "SELECT json_extract(data,'$.steer') FROM events WHERE turn=? AND kind='steered' ORDER BY id",
+            "SELECT json_extract(data,'$.steer'),id FROM events WHERE turn=? AND kind='steered' ORDER BY id",
         )?;
+        let mut since = 0;
         let mut steer = self.conn.prepare_cached(
             "SELECT CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END,
                 t.from_bot,t.from_turn,t.origin
              FROM turns t LEFT JOIN nodes n ON n.id=t.prompt_node WHERE t.id=?",
         )?;
-        for id in steers.query_map([turn], |r| r.get::<_, i64>(0))? {
-            let id = id?;
+        for row in steers.query_map([turn], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
+            let (id, steered) = row?;
             let (text, from, from_turn, origin) = steer.query_row([id], |r| {
                 Ok((
                     r.get::<_, Option<String>>(0)?,
@@ -5430,10 +5465,17 @@ impl Database {
             left -= Self::PROMPTS_ENTRY;
             let mut entry = prompt_entry(id, text, from, from_turn, origin, &mut left);
             entry["steer"] = json!(true);
+            if let Some(reply) = self.reply(turn, since, steered, &mut left)? {
+                entry["reply"] = reply;
+            }
+            since = steered;
             prompts.push(entry);
         }
         let mut failed = std::collections::HashSet::new();
         let mut done = std::collections::HashSet::new();
+        for (after, call) in self.refused(turn, &mut left)? {
+            attach(&mut prompts, after, call);
+        }
         let mut completed = self.conn.prepare_cached(
             "SELECT json_extract(data,'$.call_id'),json_extract(data,'$.failed')
              FROM events WHERE turn=? AND kind='tool_completed' ORDER BY id",
@@ -5505,12 +5547,103 @@ impl Database {
             if r.get::<_, bool>(4)? {
                 entry["steer"] = json!(true);
             }
+            let steer = entry["steer"] == true;
             earlier.push(entry);
+            // Its steers, newer, are listed already.
+            if !steer {
+                for (after, call) in self.refused(r.get(0)?, &mut left)? {
+                    attach(&mut earlier, after, call);
+                }
+            }
         }
         Ok(
             json!({"bot":name,"turn":turn,"status":turn_status_name(&status),"workspace":workspace,
             "prompts":prompts,"prompts_more":prompts_more,"calls":calls,"calls_more":calls_more,"earlier":earlier,"more":more}),
         )
+    }
+    /// The last message with text `turn` streamed between two of its events, as
+    /// `{text}` with its end kept: at most `PROMPTS_REPLY` bytes, or the
+    /// budget left, starting at a whole word when cut (`truncated`).
+    fn reply(&self, turn: i64, after: i64, before: i64, left: &mut usize) -> Result<Option<Value>> {
+        // The newest item with text: calls and reasoning stream as
+        // messages too, and say nothing a person answers.
+        let mut items = self.conn.prepare_cached(
+            "SELECT n.item FROM events e JOIN nodes n ON n.id=json_extract(e.data,'$.node')
+             WHERE e.turn=? AND e.kind='message' AND e.id>? AND e.id<? ORDER BY e.id DESC",
+        )?;
+        let mut rows = items.query(params![turn, after, before])?;
+        let mut text = String::new();
+        while text.trim().is_empty() {
+            let Some(r) = rows.next()? else {
+                return Ok(None);
+            };
+            text = assistant_text(&serde_json::from_slice(&r.get::<_, Vec<u8>>(0)?)?);
+        }
+        // Redacted whole before its end is kept: a private key whose
+        // opening line is cut away would no longer read as one.
+        let text = agent_client::approver::Redactor::default().redact(&text);
+        let limit = Self::PROMPTS_REPLY.min(*left);
+        let mut start = text.len().saturating_sub(limit);
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        let truncated = start > 0;
+        if truncated {
+            // Never a part-word, so a secret is not shown without what marks it.
+            start = text[start..]
+                .find(char::is_whitespace)
+                .map_or(text.len(), |at| start + at);
+        }
+        let shown = text[start..].trim_start();
+        *left -= shown.len().min(*left);
+        let mut reply = json!({"text":shown});
+        if truncated {
+            reply["truncated"] = json!(true);
+        }
+        Ok(Some(reply))
+    }
+    /// The calls a turn was refused and did not then run as they were,
+    /// each `{name, arguments}` with its
+    /// arguments cut to the budget left, and the turn whose words it came
+    /// after: the steer the turn last absorbed before it, else the turn's
+    /// own. A denial recorded before refused calls were kept has no name
+    /// and is left out.
+    fn refused(&self, turn: i64, left: &mut usize) -> Result<Vec<(i64, Value)>> {
+        let mut statement = self.conn.prepare_cached(
+            "SELECT json_extract(e.data,'$.name'),json_extract(e.data,'$.arguments'),
+                json_extract(e.data,'$.arguments_truncated'),
+                (SELECT json_extract(s.data,'$.steer') FROM events s
+                  WHERE s.turn=e.turn AND s.kind='steered' AND s.id<e.id ORDER BY s.id DESC LIMIT 1)
+             FROM events e WHERE e.turn=? AND e.kind='tool_completed' AND json_extract(e.data,'$.denied')
+               AND json_extract(e.data,'$.name') IS NOT NULL
+               -- Run later in the turn as it was refused, and done: its go-ahead is used.
+               AND NOT EXISTS (SELECT 1 FROM events r JOIN events d ON d.turn=r.turn
+                   AND d.kind='tool_completed' AND json_extract(d.data,'$.call_id')=json_extract(r.data,'$.call_id')
+                   AND json_extract(d.data,'$.denied') IS NULL AND json_extract(d.data,'$.failed') IS NOT 1
+                 WHERE r.turn=e.turn AND r.kind='tool_started' AND r.id>e.id
+                   AND json_extract(r.data,'$.name')=json_extract(e.data,'$.name')
+                   AND json_extract(r.data,'$.arguments')=json_extract(e.data,'$.arguments'))
+             ORDER BY e.id",
+        )?;
+        let mut refused = Vec::new();
+        let mut rows = statement.query([turn])?;
+        while let Some(r) = rows.next()? {
+            if *left < Self::PROMPTS_ENTRY {
+                break;
+            }
+            *left -= Self::PROMPTS_ENTRY;
+            let mut arguments: String = r.get::<_, Option<String>>(1)?.unwrap_or_default();
+            let mut entry = json!({"name":r.get::<_, String>(0)?});
+            // Cut once already, at the preview, or now at the budget.
+            let previewed = r.get::<_, Option<bool>>(2)? == Some(true);
+            if cut(&mut arguments, left) || previewed {
+                entry["arguments_truncated"] = json!(true);
+            }
+            entry["arguments"] = json!(arguments);
+            let after = r.get::<_, Option<i64>>(3)?.unwrap_or(turn);
+            refused.push((after, entry));
+        }
+        Ok(refused)
     }
     /// Planned calls announced and not yet started or denied, for `stats`.
     pub fn approval_requests(&self) -> i64 {
@@ -5674,9 +5807,11 @@ impl Database {
             "UPDATE turns SET status=?,finished_ms=? WHERE id=?",
             params![status, epoch_ms(), turn],
         )?;
+        // An expiring bot's clock starts again from this turn's end.
         tx.execute(
-            "UPDATE bots SET head=?,running_turn=NULL,status=?,closed=NULL,open_calls=NULL WHERE name=?",
-            params![head, status, bot.name],
+            "UPDATE bots SET head=?,running_turn=NULL,status=?,closed=NULL,open_calls=NULL,
+                expires_at=?+expire_ms WHERE name=?",
+            params![head, status, epoch_ms(), bot.name],
         )?;
         promote(&tx, &bot.name)?;
         if status == "completed" {
@@ -6228,12 +6363,13 @@ impl Database {
             created_by_id,
             gate,
             allow,
+            expire_ms,
             request_id,
         } = fork;
         let request = request_id.map(|_| {
             json!({"op":"fork","source":source,"checkpoint":node,
             "workspace":workspace,"budget_tokens":budget_tokens,"created_by":created_by,
-            "created_by_id":created_by_id,"gate":gate,"allow":allow})
+            "created_by_id":created_by_id,"gate":gate,"allow":allow,"expire_ms":expire_ms})
         });
         if let Some(bot) = self.resent(name, request_id, request.as_ref())? {
             return Ok((bot, None));
@@ -6318,7 +6454,7 @@ impl Database {
             &parent.tools,
         ))?;
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,thinking_from,thinking_to,thinking_elided,gates,allowed,settings,creation) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,thinking_from,thinking_to,thinking_elided,gates,allowed,settings,creation,expire_ms,expires_at) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 name,
                 id,
@@ -6350,7 +6486,9 @@ impl Database {
                 gates,
                 allowed.as_ref().map(|allowed| allowed.join(",")),
                 parent.settings.stored()?,
-                creation(request_id, request)
+                creation(request_id, request),
+                expire_ms.map(|ms| ms as i64),
+                expire_ms.map(|ms| epoch_ms().saturating_add(ms as i64)),
             ],
         )?;
         if let Some(node) = checkpoint {
@@ -6403,6 +6541,9 @@ impl Database {
         }
         if let Some(allowed) = &allowed {
             data["allowed"] = json!(allowed);
+        }
+        if let Some(expire_ms) = expire_ms {
+            data["expire_ms"] = json!(expire_ms);
         }
         let cursor = event(&tx, name, None, "forked", data.clone())?;
         tx.commit()?;
@@ -6480,6 +6621,37 @@ impl Database {
             page["pruned_before"] = json!(pruned);
         }
         Ok(page)
+    }
+    /// The earliest time after `now` an idle bot may be due for deletion, in
+    /// milliseconds since the epoch, and whether any is due by `now`. A
+    /// turn's end only moves a bot's time later, so a sweep at the earliest
+    /// time is never late.
+    pub fn next_expiry(&self, now: i64) -> Result<(Option<i64>, bool)> {
+        Ok(self.conn.query_row(
+            "SELECT MIN(CASE WHEN expires_at>?1 THEN expires_at END),
+                    COALESCE(MAX(expires_at<=?1),0)
+             FROM bots WHERE expires_at IS NOT NULL AND status!='deleting'",
+            [now],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?)
+    }
+    /// Up to `limit` bots, by name and identity, whose idle time ran out by
+    /// `now` and which `delete` would take: no turn running, waiting,
+    /// queued or ready, and no command of theirs running. One still busy is
+    /// passed over, so it never holds back another that is not.
+    pub fn expired(&self, now: i64, limit: usize) -> Result<Vec<(String, i64)>> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT b.name,b.id FROM bots b WHERE b.expires_at<=?1 AND b.running_turn IS NULL
+                 AND b.status!='deleting'
+                 AND NOT EXISTS(SELECT 1 FROM turns t WHERE t.bot=b.name AND t.status IN ('queued','ready'))
+                 AND NOT EXISTS(SELECT 1 FROM processes p JOIN turns t ON t.id=p.turn
+                     WHERE p.status='running' AND t.bot=b.name)
+                 ORDER BY b.expires_at LIMIT ?2",
+            )?
+            .query_map(params![now, limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?)
     }
     /// Remove an idle bot with everything only it owns: its turns, tool
     /// intents, processes, artifacts, events, checkpoints, and the history
@@ -7354,11 +7526,12 @@ fn deny(
     tx: &Connection,
     bot: &Bot,
     turn: i64,
-    call_id: &str,
+    call: &ToolCall,
     reason: Option<&str>,
     approvals: Value,
     expired: bool,
 ) -> Result<()> {
+    let call_id = call.call_id.as_str();
     let output = json!({"error":"approval_denied","detail":reason}).to_string();
     let item = bot.family()?.tool_result_item(call_id, &output)?;
     if tx.execute(
@@ -7375,8 +7548,13 @@ fn deny(
          closed=CASE WHEN open_calls=1 THEN ?1 ELSE closed END WHERE name=?2",
         params![head, bot.name],
     )?;
-    let mut data = json!({"call_id":call_id,"node":head,"artifacts":[],"denied":true,
-        "approvals":approvals});
+    // The refused call, previewed as a started one is: a judge reads it
+    // later, so a person's go-ahead can be tied to what was refused.
+    let mut data = started(call);
+    data["node"] = json!(head);
+    data["artifacts"] = json!([]);
+    data["denied"] = json!(true);
+    data["approvals"] = approvals;
     if expired {
         data["expired"] = json!(true);
     }
@@ -8468,11 +8646,23 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         conn.execute_batch("ALTER TABLE approvals ADD COLUMN asked TEXT;")?;
     }
     if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='expire_ms')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 50 -> 51: a fork may be deleted once it has been idle a while.
+        // None was.
+        conn.execute_batch(
+            "ALTER TABLE bots ADD COLUMN expire_ms INTEGER;
+             ALTER TABLE bots ADD COLUMN expires_at INTEGER;",
+        )?;
+    }
+    if !conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='compact_asked')",
         [],
         |r| r.get::<_, bool>(0),
     )? {
-        // 50 -> 51: a bot's last call's size in bytes and tokens, and a
+        // 51 -> 52: a bot's last call's size in bytes and tokens, and a
         // client's request for a summary. None had either; the first call
         // after measures the size.
         conn.execute_batch(
@@ -8560,6 +8750,21 @@ fn cut(text: &mut String, left: &mut usize) -> bool {
     text.truncate(end);
     *left = 0;
     true
+}
+/// Add a refused call to the listed prompt or steer it came after, or to
+/// the entry listed last when that one was left out: this turn's newest
+/// listed word, or an earlier turn's own prompt, just listed.
+fn attach(entries: &mut [Value], after: i64, call: Value) {
+    let at = entries
+        .iter()
+        .rposition(|entry| entry["turn"] == after)
+        .or(entries.len().checked_sub(1));
+    if let Some(entry) = at.and_then(|at| entries.get_mut(at)) {
+        match entry["refused"].as_array_mut() {
+            Some(calls) => calls.push(call),
+            None => entry["refused"] = json!([call]),
+        }
+    }
 }
 /// One prompt of a `prompts` read, cut to the budget left.
 fn prompt_entry(

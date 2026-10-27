@@ -52,6 +52,13 @@ const FIELDS_JSON: usize = 1024;
 /// One gate in JSON without its tools: a tag at the name limit (plain
 /// ASCII, never escaped), the keys, the longest expiry, and a separator.
 const GATE_JSON: usize = 192;
+/// The longest a fork may sit idle before the daemon deletes it.
+const MAX_EXPIRE_MS: u64 = 7 * 24 * 3600 * 1000;
+/// Idle bots whose time ran out but which still have work, such as a
+/// command they started or a queued turn, are looked at again this often.
+const EXPIRY_RETRY: Duration = Duration::from_secs(60);
+/// Deletions one look starts at most; the rest wait for the next.
+const EXPIRY_SWEEP: usize = 16;
 
 /// Bytes and packets sent to one session.
 #[derive(Clone, Copy, Default)]
@@ -253,6 +260,9 @@ enum Command {
         /// the source's list, `[]` allows none, and `null` is refused.
         #[serde(default, deserialize_with = "present")]
         allow: Option<Option<Vec<String>>>,
+        /// Delete the fork once it has been idle this long: no turn running
+        /// or waiting since its last ended, or since it was made.
+        expire_ms: Option<u64>,
         /// An idempotency key, as on `create`.
         request_id: Option<String>,
     },
@@ -770,6 +780,9 @@ struct Service {
     /// publisher has not passed them, or a follow is still replaying toward
     /// them. Each keeps its room in its session's queue.
     unpublished: std::collections::VecDeque<Unpublished>,
+    /// When to look for idle bots whose time ran out: never later than the
+    /// earliest one's, and sooner is harmless.
+    expiry: Option<tokio::time::Instant>,
 }
 
 /// Parked turns' wake times, at most one per turn: a turn that parks again
@@ -1182,7 +1195,10 @@ pub async fn run(config: Configuration) -> Result<()> {
         storage_backoff: Duration::ZERO,
         ready_retry_at: None,
         unpublished: std::collections::VecDeque::new(),
+        expiry: None,
     };
+    // Forks whose time ran out while no daemon ran are deleted at once.
+    service.plan_expiry(Duration::ZERO).await?;
     let idle_exit = config
         .idle_exit
         .filter(|_| config.socket.is_some())
@@ -1205,6 +1221,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             // Computed before the select so its arms borrow the service freely.
             let (wake_due, wake_delay) = (service.wakes.next().is_some(), service.wake_delay());
             let ready_retry = service.ready_retry_at;
+            let expiry = service.expiry;
             tokio::select! {
                 _ = stdout_closed.wait_for(|closed| *closed), if stdio_owner => return fail("output_closed"),
                 Some(error) = failures.recv() => return Err(error),
@@ -1238,6 +1255,11 @@ pub async fn run(config: Configuration) -> Result<()> {
                 }
                 _ = tokio::time::sleep_until(ready_retry.unwrap_or_else(tokio::time::Instant::now)), if ready_retry.is_some() => {
                     service.ready_retry_at = None;
+                }
+                // Idle bots whose time ran out are deleted, here and not on a
+                // client's request, so a client that stopped leaves none.
+                _ = tokio::time::sleep_until(expiry.unwrap_or_else(tokio::time::Instant::now)), if expiry.is_some() && !service.draining => {
+                    service.expire().await?;
                 }
                 // A parked turn's time comes due (a pool reopens, a gate lapses,
                 // a lost wake-up is retried): resume it like any parked turn,
@@ -1658,6 +1680,58 @@ impl Service {
         )
     }
 
+    /// Look for idle bots whose time ran out no later than `at`.
+    fn expire_by(&mut self, at: tokio::time::Instant) {
+        self.expiry = Some(self.expiry.map_or(at, |due| due.min(at)));
+    }
+
+    /// When the store's earliest idle bot is due. One already due is
+    /// looked at after `overdue`: at once when nothing has looked yet, later
+    /// when a look left it, still busy or still being deleted, and never
+    /// after another bot's time comes.
+    async fn plan_expiry(&mut self, overdue: Duration) -> Result<()> {
+        let wall = now_ms();
+        let (next, due) = self
+            .store
+            .read("next_expiry", move |db| db.next_expiry(wall as i64))
+            .await?;
+        let now = tokio::time::Instant::now();
+        let next = next.map(|at| now + Duration::from_millis((at as u64).saturating_sub(wall)));
+        self.expiry = [next, due.then_some(now + overdue)]
+            .into_iter()
+            .flatten()
+            .min();
+        Ok(())
+    }
+
+    /// Delete idle bots whose time ran out, each as `delete` would and on a
+    /// task of its own; a bot whose deletion is refused is tried again.
+    async fn expire(&mut self) -> Result<()> {
+        let now = now_ms() as i64;
+        let due = self
+            .store
+            .read("expired", move |db| db.expired(now, EXPIRY_SWEEP))
+            .await?;
+        // A full page leaves more due, looked at soon, apart from these.
+        let overdue = match due.len() {
+            EXPIRY_SWEEP => Duration::from_secs(1),
+            _ => EXPIRY_RETRY,
+        };
+        for (bot, bot_id) in due {
+            if self.active.contains_key(&bot) {
+                continue;
+            }
+            let (store, hub, providers) =
+                (self.store.clone(), self.hub.clone(), self.providers.clone());
+            self.retention.spawn(async move {
+                // A refusal (new work, a command still running) or a
+                // deletion that raced it leaves the bot to a later look.
+                let _ = delete_pieces(store, hub, providers, bot, bot_id, true).await;
+            });
+        }
+        self.plan_expiry(overdue).await
+    }
+
     /// How long until the earliest parked turn is due.
     fn wake_delay(&self) -> Duration {
         self.wakes
@@ -2071,56 +2145,7 @@ impl Service {
                 let (store, hub, output) = (store.clone(), self.hub.clone(), output.clone());
                 let providers = self.providers.clone();
                 self.retention.spawn(async move {
-                    let result = async {
-                        let mut deleted = json!({"bot":bot,"bot_id":bot_id,"duplicate":false,
-                            "turns":0,"events":0,"nodes":0});
-                        loop {
-                            let name = bot.clone();
-                            let piece = store
-                                .op_pruning("delete_bot", name.clone(), move |db| {
-                                    db.delete_bot_piece(
-                                        &name,
-                                        bot_id,
-                                        agent_runtime::store::Database::RETENTION_PIECE,
-                                    )
-                                })
-                                .await;
-                            // A resent delete runs beside the first; whichever
-                            // takes the last piece finishes the deletion, and
-                            // the other only reports the pieces it took, since
-                            // the name may already hold a later bot.
-                            let piece = match piece {
-                                Err(error) if error.code == "bot_not_found" => {
-                                    let name = bot.clone();
-                                    if !store.op("gone", move |db| db.gone(&name, bot_id)).await? {
-                                        return Err(error);
-                                    }
-                                    deleted["duplicate"] = json!(true);
-                                    return Ok(deleted);
-                                }
-                                piece => piece?,
-                            };
-                            for key in ["turns", "events", "nodes"] {
-                                deleted[key] = json!(
-                                    deleted[key].as_i64().unwrap_or(0)
-                                        + piece[key].as_i64().unwrap_or(0)
-                                );
-                            }
-                            if piece["done"] == true {
-                                break;
-                            }
-                        }
-                        // Its connections go with it, and a later bot of the
-                        // same name starts on a fresh one.
-                        for provider in providers.values() {
-                            provider.forget(&bot);
-                        }
-                        // Followers learn the bot is gone; nothing durable remains to replay.
-                        hub.live(&bot, json!({"event":"deleted","bot":bot,"durable":false}))
-                            .await?;
-                        Ok(deleted)
-                    }
-                    .await;
+                    let result = delete_pieces(store, hub, providers, bot, bot_id, false).await;
                     retention_reply(session, &output, id, result).await;
                 });
                 Err(Error::new("deferred"))
@@ -2587,10 +2612,14 @@ impl Service {
                 approver,
                 approve_expire_ms,
                 allow,
+                expire_ms,
                 request_id,
             } => {
                 if budget_tokens == Some(0) {
                     return fail_with("invalid_budget", "budget_tokens must be at least 1");
+                }
+                if expire_ms.is_some_and(|ms| !(1000..=MAX_EXPIRE_MS).contains(&ms)) {
+                    return fail_with("invalid_expire", "expire_ms is from 1 s to 7 days");
                 }
                 if let Some(key) = &request_id {
                     name("request_id", key)?;
@@ -2644,11 +2673,15 @@ impl Service {
                                 created_by_id,
                                 gate: gate.as_ref(),
                                 allow: allow.as_deref(),
+                                expire_ms,
                                 request_id: request_id.as_deref(),
                             },
                         )
                     })
                     .await?;
+                if let Some(ms) = expire_ms {
+                    self.expire_by(tokio::time::Instant::now() + Duration::from_millis(ms));
+                }
                 let mut created = serde_json::to_value(created)?;
                 created["duplicate"] = json!(event.is_none());
                 Ok(created)
@@ -3033,6 +3066,67 @@ async fn reply(
         output.close();
     }
     Ok(())
+}
+
+/// Delete a bot one bounded piece per job, on the caller's task, so other
+/// bots' requests and commits interleave with a large deletion; then tell
+/// its followers, saying whether it `expired`. What was freed.
+async fn delete_pieces(
+    store: Store,
+    hub: Hub,
+    providers: Arc<HashMap<String, Provider>>,
+    bot: String,
+    bot_id: i64,
+    expired: bool,
+) -> Result<Value> {
+    let mut deleted = json!({"bot":bot,"bot_id":bot_id,"duplicate":false,
+            "turns":0,"events":0,"nodes":0});
+    loop {
+        let name = bot.clone();
+        let piece = store
+            .op_pruning("delete_bot", name.clone(), move |db| {
+                db.delete_bot_piece(
+                    &name,
+                    bot_id,
+                    agent_runtime::store::Database::RETENTION_PIECE,
+                )
+            })
+            .await;
+        // A resent delete runs beside the first; whichever
+        // takes the last piece finishes the deletion, and
+        // the other only reports the pieces it took, since
+        // the name may already hold a later bot.
+        let piece = match piece {
+            Err(error) if error.code == "bot_not_found" => {
+                let name = bot.clone();
+                if !store.op("gone", move |db| db.gone(&name, bot_id)).await? {
+                    return Err(error);
+                }
+                deleted["duplicate"] = json!(true);
+                return Ok(deleted);
+            }
+            piece => piece?,
+        };
+        for key in ["turns", "events", "nodes"] {
+            deleted[key] =
+                json!(deleted[key].as_i64().unwrap_or(0) + piece[key].as_i64().unwrap_or(0));
+        }
+        if piece["done"] == true {
+            break;
+        }
+    }
+    // Its connections go with it, and a later bot of the
+    // same name starts on a fresh one.
+    for provider in providers.values() {
+        provider.forget(&bot);
+    }
+    // Followers learn the bot is gone; nothing durable remains to replay.
+    let mut gone = json!({"event":"deleted","bot":bot,"durable":false});
+    if expired {
+        gone["expired"] = json!(true);
+    }
+    hub.live(&bot, gone).await?;
+    Ok(deleted)
 }
 
 /// Match ordinary replies: the stdio owner (session zero) gets bounded
@@ -3458,6 +3552,7 @@ mod tests {
             draining: false,
             admissions: std::collections::VecDeque::new(),
             unpublished: std::collections::VecDeque::new(),
+            expiry: None,
             reserved: 0,
             storage_backoff: Duration::ZERO,
             ready_retry_at: None,
@@ -3664,6 +3759,7 @@ mod tests {
             draining: false,
             admissions: std::collections::VecDeque::new(),
             unpublished: std::collections::VecDeque::new(),
+            expiry: None,
             reserved: 0,
             storage_backoff: Duration::ZERO,
             ready_retry_at: None,
@@ -3877,6 +3973,7 @@ mod tests {
             draining: false,
             admissions: std::collections::VecDeque::new(),
             unpublished: std::collections::VecDeque::new(),
+            expiry: None,
             reserved: 0,
             storage_backoff: Duration::ZERO,
             ready_retry_at: None,

@@ -9,6 +9,7 @@
 //! `• Ran …` line with a short `└` look at the result, and a status row
 //! says how long the turn has run and how to stop it.
 mod approvals;
+mod asks;
 mod cache;
 mod calls;
 mod diff;
@@ -36,7 +37,6 @@ mod table;
 mod task;
 mod term;
 mod transcript;
-mod updates;
 
 use agent_client::{Client, Events};
 use ratatui::{
@@ -77,6 +77,10 @@ const VIEWPORT: u16 = 5;
 const COMPOSER_ROWS: usize = 8;
 /// How much history is shown on attach.
 const HISTORY_ITEMS: u64 = 200;
+/// How long a side chat's copy stays once idle.
+const SIDE_EXPIRE: Duration = Duration::from_secs(15 * 60);
+/// This window is a side chat (`--side`).
+static SIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 type Tui = Terminal<CrosstermBackend<std::io::Stdout>>;
 
@@ -94,26 +98,27 @@ struct Options {
     rex_host: Option<String>,
     /// Ring when work ends or needs the person.
     sound: bool,
-    /// The decision model that wakes the lead when its tasks need it, or
-    /// `off`; `None` picks one (lookout::choose).
-    lookout: Option<String>,
+    /// A side chat, opened by `/side`: the node its copy was taken at,
+    /// after which its history is drawn.
+    side: Option<i64>,
 }
 
 fn usage() -> String {
     "usage: sonny [--store PATH] [--socket PATH] [--model PROVIDER/MODEL] [--no-layout] [--rex-host HOST] [--no-sound]\n\
-     \x20      [--lookout openai-decisions/MODEL|typesafe/jev-*|PROVIDER/MODEL|off]\n\
      \x20      [--copies worktree|sandfs] [--bot NAME [--new [--workspace DIR]]]\n\
      With no --bot, the folder's coordinator, made with --model the first time; its tasks\n\
      open beside it in Rex or Herdr. Type /status for the project's agents.\n\
      --copies (or /copies): how its tasks get their own copy, kept for every folder: git\n\
      worktrees (the default), or sandfs copies (experimental, built in), which take\n\
      uncommitted changes along and work outside git too.\n\
-     sonny task NAME [--setup] [RUN FLAGS] -- BRIEF, from the lead's shell, makes a task's\n\
+     sonny task NAME [--setup] [RUN FLAGS] -- BRIEF, from the lead's shell or a terminal, makes a task's\n\
      folder that way and starts the task there; sonny task changes NAME [--apply] lists\n\
      (or writes here) what a sandfs copy of a plain folder changed.\n\
-     The lookout wakes the lead when its tasks need it, judged by --lookout, else AGENT_JUDGE\n\
-     (as the approver is), else openai-decisions/gpt-6-luna with OPENAI_API_KEY, else the\n\
-     newest Haiku the lead's provider lists."
+     sonny ask QUESTION [--choice OPTION]..., from the lead's shell, pins a question for\n\
+     the person above the composer until they answer it.\n\
+     sonny lookout [--judge PROVIDER/MODEL|off] watches every lead on the daemon and\n\
+     wakes it when its tasks need it; Sonny starts one. sonny lookout --replay --judge\n\
+     SPEC[,SPEC]... [--limit N] runs its checks over what the store kept."
         .into()
 }
 
@@ -248,23 +253,39 @@ fn which(program: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// Agent's own binary: the one the daemon gave this shell (or Homebrew's
-/// wrapper names, by a path upgrades keep), else the one installed beside
-/// Sonny (`libexec/agent`), which speaks Sonny's protocol, else the app's. Not `agent` on PATH,
-/// which may be another program.
+/// Agent's own binary: the one the daemon gave this shell, else the one
+/// installed beside Sonny (`libexec/agent`, as the Linux tarball lays it
+/// out), else Homebrew's `agent` formula when Sonny is its `sonny`, else
+/// the app's. Not `agent` on PATH, which may be another program.
 fn agent_bin() -> Option<PathBuf> {
-    let beside = std::env::current_exe()
-        .and_then(std::fs::canonicalize)
-        .ok()
-        .and_then(|me| Some(me.parent()?.parent()?.join("libexec/agent")));
+    let me = std::env::current_exe().and_then(std::fs::canonicalize).ok();
     std::env::var_os("AGENT_BIN")
         .map(PathBuf::from)
         .into_iter()
-        .chain(beside)
+        .chain(me.iter().flat_map(|me| installed_agent(me)))
         .chain([PathBuf::from(
             "/Applications/Agent.app/Contents/MacOS/agent",
         )])
         .find(|bin| bin.is_file())
+}
+
+/// Where Agent's binary is installed with Sonny at `me`: beside it, and,
+/// when Sonny is in Homebrew's Cellar, by the `agent` formula's `opt`
+/// path, which outlasts the versions upgrades remove. The daemon hands
+/// that path to its agents, so it must outlast the daemon's version.
+fn installed_agent(me: &std::path::Path) -> Vec<PathBuf> {
+    let Some(keg) = me.parent().and_then(std::path::Path::parent) else {
+        return Vec::new();
+    };
+    let mut found = vec![keg.join("libexec/agent")];
+    if let Some(cellar) = keg
+        .parent()
+        .filter(|formula| formula.ends_with("Cellar/sonny"))
+        && let Some(prefix) = cellar.parent().and_then(std::path::Path::parent)
+    {
+        found.push(prefix.join("opt/agent/bin/agent"));
+    }
+    found
 }
 
 /// Agent's binary to run, with the provider keys the app keeps in
@@ -325,6 +346,41 @@ async fn serve_auto(client: &Client, options: &Options, model: &str) -> Result<(
     Ok(())
 }
 
+/// The lookout, `sonny lookout`, which wakes leads when their tasks need
+/// them: started detached, logging beside the store. One already watching
+/// this daemon keeps it, and the new one exits.
+fn start_lookout(options: &Options) -> Result<(), String> {
+    let me = std::env::current_exe().map_err(|e| e.to_string())?;
+    let mut log = options.store.clone().into_os_string();
+    log.push(".lookout.log");
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)
+        .map_err(|e| e.to_string())?;
+    // The judge's settings and keys are in Agent's env file, as for the
+    // approver.
+    let mut command = agent_command(&me)?;
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .arg("lookout")
+        .arg("--store")
+        .arg(&options.store)
+        .arg("--socket")
+        .arg(&options.socket)
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone().map_err(|e| e.to_string())?)
+        .stderr(log)
+        .spawn()
+        .map_err(|e| format!("{}: {e}", me.display()))?;
+    // Reaped when it exits, as it does at once when another one watches.
+    std::thread::spawn(move || child.wait());
+    Ok(())
+}
+
 /// The daemon, started the way the CLI starts it when it is not running.
 async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events), String> {
     if let Ok(connected) = Client::connect(&options.socket).await {
@@ -358,12 +414,31 @@ async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events
         .map_err(|e| e.to_string())
 }
 
+/// The store and socket given, else the environment's, else Agent's own.
+fn daemon_paths(
+    store: Option<PathBuf>,
+    socket: Option<PathBuf>,
+) -> Result<(PathBuf, PathBuf), String> {
+    let store = match store.or_else(|| std::env::var_os("AGENT_STORE").map(PathBuf::from)) {
+        Some(store) => store,
+        None => PathBuf::from(std::env::var_os("HOME").ok_or("set --store or HOME")?)
+            .join(".agent/state.sqlite"),
+    };
+    // One store under two names is one lookout's.
+    let store = agent_client::socket::canonical_store(&store).map_err(|e| e.to_string())?;
+    let socket = match socket.or_else(|| std::env::var_os("AGENT_SOCKET").map(PathBuf::from)) {
+        Some(socket) => socket,
+        None => agent_client::socket::default_socket(&store).map_err(|e| e.to_string())?,
+    };
+    Ok((store, socket))
+}
+
 fn parse() -> Result<Options, String> {
     let mut args = std::env::args().skip(1);
     let (mut store, mut socket, mut bot, mut new, mut model, mut workspace) =
         (None, None, None, false, None, None);
     let (mut layout, mut rex_host, mut sound) = (true, None, true);
-    let mut lookout = None;
+    let mut side = None;
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or_else(usage);
         match arg.as_str() {
@@ -376,7 +451,8 @@ fn parse() -> Result<Options, String> {
             "--no-layout" => layout = false,
             "--rex-host" => rex_host = Some(value()?),
             "--no-sound" => sound = false,
-            "--lookout" => lookout = Some(value()?),
+            // Unlisted: how `/side` opens a side chat.
+            "--side" => side = Some(value()?.parse().map_err(|_| usage())?),
             "--copies" => {
                 let copies = value()?;
                 if !agent_client::project::COPIES.contains(&copies.as_str()) {
@@ -389,15 +465,7 @@ fn parse() -> Result<Options, String> {
             _ => return Err(usage()),
         }
     }
-    let store = match store.or_else(|| std::env::var_os("AGENT_STORE").map(PathBuf::from)) {
-        Some(store) => store,
-        None => PathBuf::from(std::env::var_os("HOME").ok_or("set --store or HOME")?)
-            .join(".agent/state.sqlite"),
-    };
-    let socket = match socket.or_else(|| std::env::var_os("AGENT_SOCKET").map(PathBuf::from)) {
-        Some(socket) => socket,
-        None => agent_client::socket::default_socket(&store).map_err(|e| e.to_string())?,
-    };
+    let (store, socket) = daemon_paths(store, socket)?;
     Ok(Options {
         store,
         socket,
@@ -408,7 +476,7 @@ fn parse() -> Result<Options, String> {
         layout,
         rex_host,
         sound,
-        lookout,
+        side,
     })
 }
 
@@ -446,6 +514,8 @@ fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
         Some((task, rest)) if task == "task" => task::run(rest),
+        Some((ask, rest)) if ask == "ask" => asks::run(rest),
+        Some((lookout, rest)) if lookout == "lookout" => lookout::run(rest),
         _ => tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -472,10 +542,8 @@ async fn run() -> Result<(), String> {
         println!("sonny {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    if std::env::args().nth(1).as_deref() == Some("lookout-replay") {
-        return lookout::replay().await;
-    }
     let options = parse()?;
+    SIDE.store(options.side.is_some(), std::sync::atomic::Ordering::Relaxed);
     // Fonts are read before the first picture needs them.
     std::thread::spawn(image::preload);
     let (client, mut events) = connect(&options).await?;
@@ -507,7 +575,10 @@ async fn run() -> Result<(), String> {
             (lead.bot, Some(lead.project))
         }
     };
-    herdr::announce(&name, reopen());
+    // A side chat borrows its agent's pane, and Herdr keeps the agent.
+    if options.side.is_none() {
+        herdr::announce(&name, reopen());
+    }
     // Everything after now arrives live; history is read from the bot's
     // items instead of replayed events, so the replay is skipped. The bot
     // is read after that, so a turn that ended during the replay is seen
@@ -534,6 +605,12 @@ async fn run() -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     let mut app = App::new(client, &name, &bot, options.clone());
     app.context = context;
+    if options.side.is_some() {
+        let source = name.rsplit_once(".side-").map_or(name.as_str(), |(s, _)| s);
+        app.notice = Some(format!(
+            "a copy of {source} that answers without acting; {source} carries on"
+        ));
+    }
     app.sounds = sound::Sounds::new(options.sound);
     app.sounds.chime = settings::Settings::load().chime;
     // A bot keeps the model it was made with; --model runs this window's
@@ -541,14 +618,6 @@ async fn run() -> Result<(), String> {
     if let Some(model) = options.model.as_ref().filter(|m| **m != app.model) {
         app.model = model.clone();
         app.turn_model = Some(model.clone());
-    }
-    // The lead hears what its tasks did, as the app tells it.
-    if let Some(project) = &project {
-        tokio::spawn(updates::run(
-            app.options.socket.clone(),
-            name.clone(),
-            project.clone(),
-        ));
     }
     // Tasks are laid out in Rex when the person is in it (or names the
     // Rex server to use); elsewhere they run out of sight, in /status.
@@ -568,28 +637,10 @@ async fn run() -> Result<(), String> {
     {
         app.notice = Some(error);
     }
-    if let (Some(project), Some(dir), true) = (
-        &project,
-        moving
-            .clone()
-            .or(bot["workspace"].as_str().map(PathBuf::from)),
-        options.lookout.as_deref() != Some("off"),
-    ) {
-        let lead_model = format!(
-            "{}/{}",
-            bot["provider"].as_str().unwrap_or_default(),
-            bot["model"].as_str().unwrap_or_default()
-        );
-        match lookout::choose(&app.client, options.lookout.as_deref(), &lead_model).await {
-            Ok(judge) => lookout::spawn(
-                options.socket.clone(),
-                project.clone(),
-                name.clone(),
-                dir,
-                judge,
-            ),
-            Err(error) => app.notice = Some(error),
-        }
+    if project.is_some()
+        && let Err(error) = start_lookout(&app.options)
+    {
+        app.notice = Some(error);
     }
     // The lead told what its folder tells it today (skills and memory added
     // since it was made), unless its instructions were set some other way.
@@ -725,6 +776,8 @@ fn heading(thought: &str) -> Option<&str> {
 /// A folder as the person reads it: under their home, from `~`.
 /// How often the footer reads the workspace's branch again.
 const PLACE_EVERY: Duration = Duration::from_secs(3);
+/// How often the lead's questions are read again.
+const ASKS_EVERY: Duration = Duration::from_secs(1);
 
 fn tilde(path: &str) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
@@ -745,8 +798,13 @@ fn unique(prefix: &str) -> String {
 /// (Ghostty, Rex) can mark this pane working, blocked or done; and the
 /// same to Herdr, which takes it from its own CLI instead.
 fn status_report(state: &str, bot: &str) {
-    herdr::report(state);
     use base64::Engine;
+    // A side chat borrows its agent's pane, which keeps saying what the
+    // agent itself is doing.
+    if SIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    herdr::report(state);
     let mut body = format!("state={state}");
     if state == "blocked" {
         body.push_str(":kind=permission");
@@ -809,12 +867,45 @@ fn context_after(event: &Value) -> Option<u64> {
     })
 }
 
-/// The reply being written: lines are committed as they end, and the line
-/// still open stays in the viewport.
+/// What the bot is saying: its rows stay in the viewport until what comes
+/// next tells whether they were a step on the way, before a call, or its
+/// reply, at the turn's end. Rows past what the viewport holds are written
+/// as they end, as a reply.
 struct Live {
     markdown: Markdown,
     partial: String,
     lines: usize,
+    /// The ended rows still in the viewport.
+    rows: Vec<Line<'static>>,
+    /// A blank row goes above them, apart from the history before.
+    gap: bool,
+    /// Rows were written already, too many to hold.
+    spilled: bool,
+    /// Every row has ended: the words wait only for what follows them.
+    closed: bool,
+}
+
+impl Live {
+    fn new(gap: bool) -> Self {
+        Live {
+            markdown: Markdown::default(),
+            partial: String::new(),
+            lines: 0,
+            rows: Vec::new(),
+            gap,
+            spilled: false,
+            closed: false,
+        }
+    }
+}
+
+/// What the bot's words turned out to be once something followed them.
+#[derive(Clone, Copy, PartialEq)]
+enum Words {
+    /// A step: a call came next.
+    Step,
+    /// The turn's reply, or words nothing told apart.
+    Reply,
 }
 
 struct Running {
@@ -826,7 +917,11 @@ struct Running {
 
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, unlisted.
-const COMMANDS: [(&str, &str); 10] = [
+const COMMANDS: [(&str, &str); 11] = [
+    (
+        "/side",
+        "a side chat with a copy of this agent, which carries on",
+    ),
     ("/model", "the model and effort"),
     (
         "/compact",
@@ -855,6 +950,8 @@ struct Watch {
     jobs: Vec<status::Row>,
     /// When the rows were read: their times count on from here.
     read: Instant,
+    /// The lookout's line for the lead.
+    lookout: String,
 }
 
 struct App {
@@ -882,6 +979,8 @@ struct App {
     skipped: usize,
     any_history: bool,
     width: usize,
+    /// The terminal's rows, which bound how much of the bot's words is held.
+    height: usize,
     live: Option<Live>,
     /// Whether the reply now ending arrived as deltas.
     streamed: bool,
@@ -889,6 +988,14 @@ struct App {
     calls: HashMap<String, (String, Value)>,
     /// Calls waiting on the person, as `approvals` lists them.
     approvals: Vec<Value>,
+    /// The lead's questions for the person, oldest first, as `sonny ask`
+    /// left them, and when they were last read.
+    asks: Vec<asks::Ask>,
+    /// Where the lead's questions are kept, once its id is known.
+    asks_key: Option<String>,
+    asks_read: Option<Instant>,
+    /// Esc set the questions aside: what is typed is a message of its own.
+    chatting: bool,
     /// The waiting call whose whole command was last written out.
     asked: Option<Value>,
     following: bool,
@@ -947,8 +1054,15 @@ struct App {
     choosing: Option<usize>,
     /// The mode picked, set once no turn runs.
     gating: Option<&'static str>,
+    /// The mode picked, still to give the agents the lead made, and when
+    /// to try next: one busy now takes it once idle.
+    spread: Option<(&'static str, Instant)>,
     /// The newest reply's text, for `/copy`.
     last_reply: String,
+    /// The side chat open on the alternate screen, a Sonny of its own.
+    side: Option<std::process::Child>,
+    /// Keys are left to the side chat while it is open.
+    keys_paused: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The lead's tasks, laid out in the project's Rex session: a window for
@@ -1058,7 +1172,8 @@ impl Fleet {
             return;
         };
         for bot in page["bots"].as_array().into_iter().flatten() {
-            let Some(name) = bot["name"].as_str() else {
+            // Side chats are never tasks, as when they are made.
+            let Some(name) = bot["name"].as_str().filter(|_| bot["expire_ms"].is_null()) else {
                 continue;
             };
             self.lineage.insert(name.to_owned());
@@ -1361,7 +1476,8 @@ impl Fleet {
             }
         }
         match kind {
-            "created" | "forked" => {
+            // A copy that goes once idle is a side chat, not a task.
+            "created" | "forked" if event["data"]["expire_ms"].is_null() => {
                 let by = event["data"]["created_by"].as_str().unwrap_or("");
                 if self.lineage.contains(by) || bot.starts_with(&format!("{}.", self.project)) {
                     self.lineage.insert(bot.to_owned());
@@ -1409,6 +1525,7 @@ impl App {
             skipped: 0,
             any_history: false,
             width: 80,
+            height: 24,
             live: None,
             streamed: false,
             running: record["running_turn"].as_i64().map(|turn| Running {
@@ -1418,6 +1535,14 @@ impl App {
             }),
             calls: HashMap::new(),
             approvals: Vec::new(),
+            asks: Vec::new(),
+            asks_key: record["bot_id"].as_i64().map(|id| {
+                let store =
+                    std::fs::canonicalize(&options.store).unwrap_or_else(|_| options.store.clone());
+                asks::key(&store, id)
+            }),
+            asks_read: None,
+            chatting: false,
             asked: None,
             following: true,
             notice: None,
@@ -1455,7 +1580,10 @@ impl App {
             mode: approvals::mode(record),
             choosing: None,
             gating: approvals::refresh(record),
+            spread: None,
             last_reply: String::new(),
+            side: None,
+            keys_paused: Arc::default(),
         }
     }
 
@@ -1491,11 +1619,16 @@ impl App {
         }
         self.configure().await;
         let (keys_tx, mut keys) = tokio::sync::mpsc::unbounded_channel();
+        let paused = self.keys_paused.clone();
         // Poll, not a bare read: a blocked read holds crossterm's reader
         // lock, and the cursor query the inline viewport makes on a resize
         // then times out (Rex resizes a block as it lays it out).
         std::thread::spawn(move || {
             while !keys_tx.is_closed() {
+                if paused.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
                 match event::poll(Duration::from_millis(50)) {
                     Ok(false) => {}
                     Ok(true) => match event::read() {
@@ -1575,13 +1708,31 @@ impl App {
             if self.retry.is_some_and(|at| at <= Instant::now()) {
                 self.reattach(events).await;
             }
+            if self.spread.is_some_and(|(_, at)| at <= Instant::now()) {
+                self.spread().await;
+            }
+            self.side_closed();
             self.listed();
             self.follow_place().await;
+            self.follow_asks();
             self.repaint |= term::switched();
-            if self.repaint && self.running.is_none() && self.watch.is_none() {
+            if self.repaint && self.running.is_none() && self.watch.is_none() && self.side.is_none()
+            {
                 self.repaint = false;
                 self.repaint(terminal).await?;
             }
+        }
+    }
+
+    /// Read the lead's open questions again, every second.
+    fn follow_asks(&mut self) {
+        if self.asks_read.is_some_and(|at| at.elapsed() < ASKS_EVERY) {
+            return;
+        }
+        self.asks_read = Some(Instant::now());
+        self.asks = self.asks_key.as_deref().map(asks::open).unwrap_or_default();
+        if self.asks.is_empty() {
+            self.chatting = false;
         }
     }
 
@@ -1691,6 +1842,55 @@ impl App {
         true
     }
 
+    /// Give the mode picked with `/approvals` to every agent the lead made,
+    /// and those they made: the person's pick overrides the gate each was
+    /// made with. One that is busy is tried again a little later.
+    async fn spread(&mut self) {
+        let Some((mode, _)) = self.spread else {
+            return;
+        };
+        self.spread = Some((mode, Instant::now() + Duration::from_secs(2)));
+        let mut bots = Vec::new();
+        let mut after = json!("");
+        loop {
+            let Ok(page) = self
+                .client
+                .request("bots", json!({"after": after, "limit": 256}))
+                .await
+            else {
+                return;
+            };
+            bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
+            match &page["next_after"] {
+                Value::Null => break,
+                next => after = next.clone(),
+            }
+        }
+        let mut busy = false;
+        for bot in approvals::made_by(&bots, &self.bot) {
+            let Some(fields) = approvals::regate(bot, mode) else {
+                continue;
+            };
+            // That bot, not one given its name since it was listed.
+            let mut asked = Value::Object(fields);
+            asked["bot"] = bot["name"].clone();
+            asked["bot_id"] = bot["bot_id"].clone();
+            match self.client.request("configure", asked).await {
+                Ok(_) => {}
+                Err(error) if error.code == "bot_busy" => busy = true,
+                Err(error) => {
+                    let name = bot["name"].as_str().unwrap_or_default();
+                    self.notice = Some(format!("{name}'s approvals: {error}"));
+                }
+            }
+        }
+        // The lead's own change still waiting: an agent it makes meanwhile
+        // takes its old gate, so this goes on until both are set.
+        if !busy && self.gating.is_none() {
+            self.spread = None;
+        }
+    }
+
     /// What the footer and pickers show of the bot, from its record.
     /// A changed model replaces the one this window's turns run on.
     fn refresh(&mut self, record: &Value, model: bool) {
@@ -1768,7 +1968,13 @@ impl App {
     /// behind, or it stopped. Sonny connects again; a reply cut off
     /// mid-stream is drawn whole from the bot's items once back.
     fn dropped(&mut self) {
-        self.live = None;
+        // Words whose message came are past the replay's start: written
+        // now, or lost. Words still streaming come again with their message.
+        if let Some(live) = self.live.take()
+            && live.closed
+        {
+            self.write_words(live, Words::Reply);
+        }
         self.streamed = false;
         self.said.clear();
         self.replay = None;
@@ -1806,7 +2012,8 @@ impl App {
             self.down = false;
             self.notice = None;
             self.context = context.or(self.context);
-            self.history_after(self.seen_node).await;
+            self.history_after(self.seen_node.max(self.options.side.unwrap_or(0)))
+                .await;
             self.unstage_landed().await;
             let now = record["running_turn"].as_i64();
             // A turn that ended while away ends here as its event would have.
@@ -1845,7 +2052,13 @@ impl App {
             }
             self.approvals_for(self.running.as_ref().map(|r| r.turn))
                 .await;
-            // A daemon that restarted took the approver Sonny started with it.
+            // A daemon that restarted took the approver and the lookout
+            // Sonny started with it.
+            if self.project.is_some()
+                && let Err(error) = start_lookout(&self.options)
+            {
+                self.notice = Some(error);
+            }
             if self.mode == Some("auto")
                 && let Err(error) = serve_auto(&self.client, &self.options, &self.model).await
             {
@@ -1919,9 +2132,11 @@ impl App {
         ))
     }
 
-    /// The bot's latest items, written as the transcript would have shown them.
+    /// The bot's latest items, written as the transcript would have shown
+    /// them. A side chat shows only itself, not the history it was copied
+    /// with.
     async fn history(&mut self) {
-        self.history_after(0).await;
+        self.history_after(self.options.side.unwrap_or(0)).await;
     }
 
     /// The bot's items after `after`, drawn as they would have been live:
@@ -1955,8 +2170,17 @@ impl App {
         nodes.reverse();
         self.seen_node = nodes.last().copied().unwrap_or(self.seen_node);
         let mut calls: HashMap<String, (String, Value)> = HashMap::new();
+        // The bot's words, quiet if a call follows them, as they were live.
+        let mut said: Option<Vec<Line<'static>>> = None;
         for chunk in nodes.chunks(100) {
             for item in self.items(chunk).await {
+                let call = item["type"] == "function_call";
+                if let Some(lines) = said.take_if(|_| call || item["role"].is_string()) {
+                    self.commit(match call {
+                        true => transcript::quiet(lines),
+                        false => lines,
+                    });
+                }
                 match (item["type"].as_str(), item["role"].as_str()) {
                     (_, Some("user")) => {
                         let lines = transcript::prompt(&text(&item), None, self.width);
@@ -1965,8 +2189,7 @@ impl App {
                     (_, Some("assistant")) => {
                         let reply = text(&item);
                         if !reply.is_empty() {
-                            let lines = transcript::reply(&reply, self.width);
-                            self.commit(lines);
+                            said = Some(transcript::reply(&reply, self.width));
                             self.last_reply = reply;
                         }
                     }
@@ -1997,12 +2220,15 @@ impl App {
                                 &self.workspace,
                                 self.width,
                             );
-                            self.commit(lines);
+                            self.commit(transcript::quiet(lines));
                         }
                     }
                     _ => {}
                 }
             }
+        }
+        if let Some(lines) = said {
+            self.commit(lines);
         }
         // A call still running finishes live, after the history.
         self.calls.extend(calls);
@@ -2060,33 +2286,84 @@ impl App {
             .collect()
     }
 
-    /// The reply's open line, the part after its last newline, as the rows
-    /// it will take once written.
+    /// The bot's words not yet written: the rows held, then the open line,
+    /// the part after the last newline, as the rows it will take.
     fn open_rows(&self, width: usize) -> Vec<Line<'static>> {
-        let Some(open) = self.live.as_ref().filter(|open| !open.partial.is_empty()) else {
+        let Some(open) = &self.live else {
             return Vec::new();
         };
+        let mut rows = Vec::new();
+        if open.gap && !open.spilled && (!open.rows.is_empty() || !open.partial.is_empty()) {
+            rows.push(Line::default());
+        }
+        // Held rows were wrapped for the width then: a narrower pane cuts
+        // them again, as it does the history waiting to be written.
+        for row in &open.rows {
+            match row.width() <= width {
+                true => rows.push(row.clone()),
+                false => rows.extend(transcript::wrap(
+                    row.clone(),
+                    width,
+                    Span::raw(""),
+                    Span::raw("    "),
+                )),
+            }
+        }
         let mut markdown = open.markdown.clone();
-        let Some(line) = markdown.line(&open.partial) else {
-            return Vec::new();
-        };
-        let lead = if open.lines == 0 { "• " } else { "  " };
-        transcript::wrap(line, width, Span::raw(lead), markdown.rest())
+        if !open.partial.is_empty()
+            && let Some(line) = markdown.line(&open.partial)
+        {
+            let lead = if open.lines == 0 { "• " } else { "  " };
+            rows.extend(transcript::wrap(
+                line,
+                width,
+                Span::raw(lead),
+                markdown.rest(),
+            ));
+        }
+        rows
     }
 
-    /// The reply's last lines, and a table it ended on, drawn.
-    fn end_live(&mut self) {
+    /// The words' last lines, and a table they ended on, drawn and held
+    /// until what follows says what they were.
+    fn close_live(&mut self) {
         if let Some(mut live) = self.live.take() {
-            let rest = std::mem::take(&mut live.partial);
-            let rest = rest.strip_suffix('\n').unwrap_or(&rest);
-            if !rest.is_empty() {
-                for line in rest.split('\n') {
-                    self.live_line(&mut live, line);
+            if !live.closed {
+                let rest = std::mem::take(&mut live.partial);
+                let rest = rest.strip_suffix('\n').unwrap_or(&rest);
+                if !rest.is_empty() {
+                    for line in rest.split('\n') {
+                        self.live_line(&mut live, line);
+                    }
                 }
+                let held = live.markdown.end(self.width, live.lines == 0);
+                self.live_rows(&mut live, held);
+                live.closed = true;
             }
-            let held = live.markdown.end(self.width, live.lines == 0);
-            self.live_rows(&mut live, held);
+            self.live = Some(live);
         }
+    }
+
+    /// The words written into the history as what they turned out to be.
+    fn end_live(&mut self, words: Words) {
+        self.close_live();
+        if let Some(live) = self.live.take() {
+            self.write_words(live, words);
+        }
+    }
+
+    fn write_words(&mut self, live: Live, words: Words) {
+        if live.rows.is_empty() {
+            return;
+        }
+        if live.gap && !live.spilled {
+            self.pending.push(Line::default());
+        }
+        self.pending.extend(match words {
+            Words::Step => transcript::quiet(live.rows),
+            Words::Reply => live.rows,
+        });
+        self.any_history = true;
     }
 
     fn live_line(&mut self, live: &mut Live, line: &str) {
@@ -2095,9 +2372,19 @@ impl App {
     }
 
     fn live_rows(&mut self, live: &mut Live, rows: Vec<Line<'static>>) {
-        if !rows.is_empty() {
-            live.lines += rows.len();
-            self.pending.extend(rows);
+        if rows.is_empty() {
+            return;
+        }
+        live.lines += rows.len();
+        live.rows.extend(rows);
+        // Words longer than half the screen are a reply, written as they
+        // come rather than held out of the scrollback.
+        if live.spilled || live.rows.len() > (self.height / 2).max(4) {
+            if live.gap && !live.spilled {
+                self.pending.push(Line::default());
+            }
+            live.spilled = true;
+            self.pending.append(&mut live.rows);
             self.any_history = true;
         }
     }
@@ -2167,7 +2454,7 @@ impl App {
             }
             "accepted" => {
                 self.staged.retain(|(staged, _)| Some(*staged) != turn);
-                self.end_live();
+                self.end_live(Words::Reply);
                 self.said.clear();
                 self.thought.clear();
                 self.replay = None;
@@ -2200,7 +2487,7 @@ impl App {
                 if let Some(node) = data["node"].as_i64()
                     && let Some(item) = self.items(&[node]).await.first()
                 {
-                    self.end_live();
+                    self.end_live(Words::Reply);
                     let lines = transcript::prompt(&text(item), None, self.width);
                     self.commit(lines);
                 }
@@ -2234,18 +2521,13 @@ impl App {
                     running.phase = "Working".into();
                 }
                 let mut live = match self.live.take() {
-                    Some(live) => live,
-                    None => {
-                        // The gap above the reply goes out with its first
-                        // delta, so the open line sits where it will stay.
-                        if self.any_history {
-                            self.pending.push(Line::default());
+                    Some(live) if !live.closed => live,
+                    closed => {
+                        // Words that ended with nothing after them.
+                        if let Some(closed) = closed {
+                            self.write_words(closed, Words::Reply);
                         }
-                        Live {
-                            markdown: Markdown::default(),
-                            partial: String::new(),
-                            lines: 0,
-                        }
+                        Live::new(self.any_history)
                     }
                 };
                 live.partial.push_str(delta);
@@ -2292,10 +2574,14 @@ impl App {
                             live.partial = rest.to_owned();
                         }
                     }
-                    self.end_live();
+                    self.close_live();
                 } else if let Some(item) = &item {
-                    let lines = transcript::reply(&text(item), self.width);
-                    self.commit(lines);
+                    self.end_live(Words::Reply);
+                    let mut live = Live::new(self.any_history);
+                    let rows = transcript::reply(&text(item), self.width);
+                    self.live_rows(&mut live, rows);
+                    live.closed = true;
+                    self.live = Some(live);
                 }
             }
             "compaction_text_delta" | "compaction_thinking_delta" => {
@@ -2327,7 +2613,7 @@ impl App {
             "tool_started" => {
                 self.said.clear();
                 self.thought.clear();
-                self.end_live();
+                self.end_live(Words::Step);
                 let name = data["name"].as_str().unwrap_or("tool").to_owned();
                 let id = data["call_id"].as_str().unwrap_or("");
                 // A long call's event carries a preview; the call is kept whole.
@@ -2358,6 +2644,7 @@ impl App {
                 let Some((name, arguments)) = call else {
                     return;
                 };
+                self.end_live(Words::Step);
                 let mut shown = (String::new(), data["failed"] == true);
                 if let Some(node) = data["node"].as_i64()
                     && let Some(item) = self
@@ -2380,7 +2667,7 @@ impl App {
                     &self.workspace,
                     self.width,
                 );
-                self.commit(lines);
+                self.commit(transcript::quiet(lines));
                 if self.calls.is_empty() && !self.held.is_empty() {
                     let held = std::mem::take(&mut self.held);
                     self.pending.extend(held);
@@ -2419,12 +2706,30 @@ impl App {
                 if self.running.as_ref().is_some_and(|r| Some(r.turn) != turn) {
                     return;
                 }
-                self.end_live();
                 let status = data["status"].as_str().unwrap_or("unknown");
                 let detail = data["error"].as_str().unwrap_or("");
                 let seconds = self.running.take().map(|r| r.started.elapsed().as_secs());
                 let line = transcript::finished(status, detail, seconds, self.width);
-                self.commit(vec![line]);
+                self.close_live();
+                // A turn that ended well puts its reply under the line, apart
+                // from the steps above; one written as it came, or one
+                // that failed, keeps the line under it.
+                match self.live.take() {
+                    Some(live)
+                        if !live.spilled
+                            && !live.rows.is_empty()
+                            && matches!(status, "completed" | "steered") =>
+                    {
+                        self.commit(vec![line]);
+                        self.write_words(Live { gap: true, ..live }, Words::Reply);
+                    }
+                    live => {
+                        if let Some(live) = live {
+                            self.write_words(live, Words::Reply);
+                        }
+                        self.commit(vec![line]);
+                    }
+                }
                 self.approvals.clear();
                 self.notice = None;
                 status_report(
@@ -2478,6 +2783,7 @@ impl App {
                     rows,
                     jobs,
                     read: Instant::now(),
+                    lookout: self.lookout_line(),
                 })
             }
             Err(error) => {
@@ -2489,12 +2795,22 @@ impl App {
 
     async fn reread(&mut self) {
         let jobs = errand::jobs(self.folder_name()).await;
+        let lookout = self.lookout_line();
         if let Ok((_, rows)) = self.status_rows().await
             && let Some(watch) = &mut self.watch
         {
             watch.rows = rows;
             watch.jobs = jobs;
             watch.read = Instant::now();
+            watch.lookout = lookout;
+        }
+    }
+
+    /// What the lookout does for this window's lead.
+    fn lookout_line(&self) -> String {
+        match &self.project {
+            Some(_) => lookout::status(&self.options.store, &self.bot),
+            None => String::new(),
         }
     }
 
@@ -2537,8 +2853,9 @@ impl App {
             .unwrap_or_default()
             .as_millis() as u64;
         let mut rows = Vec::new();
+        // Side chats are not the project's agents.
         for bot in page["bots"].as_array().into_iter().flatten() {
-            let Some(name) = bot["name"].as_str() else {
+            let Some(name) = bot["name"].as_str().filter(|_| bot["expire_ms"].is_null()) else {
                 continue;
             };
             let turn = self
@@ -2789,6 +3106,9 @@ impl App {
                     KeyCode::Enter => {
                         let mode = approvals::MODES[*pick].0;
                         self.choosing = None;
+                        // The agents the lead made take it too, even when
+                        // the lead has it already.
+                        self.spread = Some((mode, Instant::now()));
                         if self.mode != Some(mode) {
                             self.gating = Some(mode);
                             self.configure().await;
@@ -2944,6 +3264,15 @@ impl App {
                                 .client
                                 .request("interrupt", json!({"bot": self.bot, "turn": turn}))
                                 .await;
+                        } else if self.options.side.is_some() {
+                            // Back to the agent; the copy goes once idle.
+                            if self.input.is_empty() {
+                                self.quit = true;
+                            } else {
+                                self.input.clear();
+                            }
+                        } else if !self.asks.is_empty() {
+                            self.chatting = !self.chatting;
                         }
                     }
                     _ => {}
@@ -2960,7 +3289,12 @@ impl App {
         }
         if matches!(prompt.as_str(), "/status" | "/agents" | "/ps") {
             self.input.clear();
-            self.status().await;
+            // The side chat already holds the screen /status would take.
+            if self.options.side.is_some() {
+                self.notice = Some("/status is for the agent itself, not a side chat".into());
+            } else {
+                self.status().await;
+            }
             return;
         }
         if prompt == "/open" {
@@ -3124,6 +3458,23 @@ impl App {
             self.quit = true;
             return;
         }
+        if let Some(question) = prompt
+            .strip_prefix("/side")
+            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            self.input.clear();
+            self.side(question.trim().to_owned()).await;
+            return;
+        }
+        // What is typed answers the lead's first open question, and goes
+        // with it; the question closes once the daemon has the answer.
+        let answering = (!self.chatting)
+            .then(|| self.asks.first().cloned())
+            .flatten();
+        let prompt = match &answering {
+            Some(ask) => asks::answer(ask, &prompt),
+            None => prompt,
+        };
         // A message to a busy bot joins its running turn, on that turn's model.
         let delivery = self.running.is_some().then_some("steer");
         let model = delivery
@@ -3146,6 +3497,10 @@ impl App {
                 if let Some(turn) = reply["turn"].as_i64() {
                     self.staged.push((turn, prompt));
                 }
+                if let Some(ask) = answering {
+                    asks::done(&ask);
+                    self.asks.retain(|open| open.file != ask.file);
+                }
                 self.input.clear();
                 self.notice = None;
                 if workspace.is_some() {
@@ -3154,6 +3509,108 @@ impl App {
             }
             Err(error) => self.notice = Some(error.to_string()),
         }
+    }
+
+    /// `/side`: a side chat with a copy of this bot, taken where it is now,
+    /// mid-turn included, and opened in a Sonny of its own on the alternate
+    /// screen. The copy may call no tool, so it answers from what the bot
+    /// knows; the daemon deletes it once it has been idle a quarter hour.
+    /// This bot carries on, and its lines wait for the main screen.
+    async fn side(&mut self, question: String) {
+        if self.options.side.is_some() {
+            self.notice = Some("this is a side chat already".into());
+            return;
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let name = format!("{}.side-{:x}", self.bot, stamp % 0x100_0000);
+        let forked = self
+            .client
+            .request(
+                "fork",
+                json!({"source": self.bot, "bot": name, "allow": [],
+                    "expire_ms": SIDE_EXPIRE.as_millis() as u64, "request_id": name}),
+            )
+            .await;
+        let forked = match forked {
+            Ok(forked) => forked,
+            Err(error) => {
+                self.notice = Some(format!("no side chat: {error}"));
+                return;
+            }
+        };
+        // On the model this window's turns run on, whose cache is warm.
+        if !question.is_empty()
+            && let Err(error) = self
+                .client
+                .request(
+                    "submit",
+                    json!({"bot": name, "bot_id": forked["bot_id"], "request_id": format!("{name}.1"),
+                        "prompt": question, "model": self.turn_model}),
+                )
+                .await
+        {
+            self.notice = Some(format!("the side chat did not take the question: {error}"));
+        }
+        let me = match std::env::current_exe() {
+            Ok(me) => me,
+            Err(error) => {
+                self.notice = Some(error.to_string());
+                return;
+            }
+        };
+        let mut command = std::process::Command::new(me);
+        command
+            .arg("--store")
+            .arg(&self.options.store)
+            .arg("--socket")
+            .arg(&self.options.socket)
+            .args(["--no-sound", "--no-layout", "--bot", &name])
+            .args(["--side", &forked["head"].as_i64().unwrap_or(0).to_string()]);
+        if let Some(model) = &self.turn_model {
+            command.args(["--model", model]);
+        }
+        // The key reader lets go before the side chat reads the keyboard.
+        self.keys_paused
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let _ = execute!(
+            std::io::stdout(),
+            DisableBracketedPaste,
+            EnterAlternateScreen
+        );
+        let _ = disable_raw_mode();
+        match command.spawn() {
+            Ok(child) => self.side = Some(child),
+            Err(error) => {
+                self.side_back();
+                self.notice = Some(format!("no side chat: {error}"));
+            }
+        }
+    }
+
+    /// Back from a side chat that has ended.
+    fn side_closed(&mut self) {
+        if let Some(child) = &mut self.side
+            && !matches!(child.try_wait(), Ok(None))
+        {
+            self.side = None;
+            self.side_back();
+        }
+    }
+
+    fn side_back(&mut self) {
+        let _ = enable_raw_mode();
+        let _ = execute!(
+            std::io::stdout(),
+            LeaveAlternateScreen,
+            EnableBracketedPaste
+        );
+        self.keys_paused
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.redraw = true;
     }
 
     /// The call waiting on the person, written out whole above the
@@ -3197,7 +3654,7 @@ impl App {
         // The pane may have changed size since these lines were wrapped:
         // the viewport takes the new size first, and a line still too wide
         // is cut into rows rather than losing its end.
-        if let Some(watch) = &mut self.watch {
+        if self.watch.is_some() || self.side.is_some() {
             // History waits for the main screen, its newest lines kept.
             if let Some(over) = self.pending.len().checked_sub(KEPT_UNDER_STATUS)
                 && over > 0
@@ -3205,11 +3662,14 @@ impl App {
                 self.pending.drain(..over);
                 self.skipped += over;
             }
-            return draw_watch(watch);
+            return match &mut self.watch {
+                Some(watch) => draw_watch(watch),
+                None => Ok(()),
+            };
         }
         if self.skipped > 0 {
             let note = format!(
-                "… {} earlier lines went by while /status was open",
+                "… {} earlier lines went by while another screen was open",
                 std::mem::take(&mut self.skipped)
             );
             self.pending.insert(0, Line::from(note).dim());
@@ -3220,6 +3680,7 @@ impl App {
         terminal.autoresize()?;
         let width = terminal.size()?.width as usize;
         self.width = width;
+        self.height = terminal.size()?.height as usize;
         let (composer_rows, (cursor_row, cursor_col)) = self.composer(width);
         // A short pane keeps the rows around the cursor, where typing goes on.
         let room = (terminal.size()?.height as usize).saturating_sub(VIEWPORT as usize - 1);
@@ -3229,6 +3690,8 @@ impl App {
         let mut open_rows = self.open_rows(width);
         // Then what was sent and has not landed, kept in view below it.
         open_rows.extend(self.staged_rows(width));
+        // The lead's questions stay pinned above the status row.
+        open_rows.extend(asks::rows(&self.asks, width, self.chatting));
         let spare = room.saturating_sub(composer_rows.len()) + 1;
         let hidden = open_rows.len().saturating_sub(spare.max(1));
         open_rows.drain(..hidden);
@@ -3427,6 +3890,7 @@ impl App {
     fn composer(&self, width: usize) -> (Vec<Line<'static>>, (usize, usize)) {
         if self.input.is_empty() {
             let hint = match self.running {
+                _ if !self.asks.is_empty() && !self.chatting => "Answer, or Esc to chat",
                 Some(_) => "Steer the running turn",
                 None => "Ask anything",
             };
@@ -3518,9 +3982,16 @@ impl App {
         }
         // The context, not what the bot ever spent: how full the next
         // round is.
-        let right = match self.context {
-            Some(size) => format!("{} · {} context  ", self.bot, transcript::tokens(size)),
-            None => format!("{}  ", self.bot),
+        let right = match (self.options.side, self.context) {
+            // Said for as long as the side chat is open.
+            (Some(_), _) => format!(
+                "side chat with {} · esc goes back  ",
+                self.bot
+                    .rsplit_once(".side-")
+                    .map_or(self.bot.as_str(), |(s, _)| s)
+            ),
+            (None, Some(size)) => format!("{} · {} context  ", self.bot, transcript::tokens(size)),
+            (None, None) => format!("{}  ", self.bot),
         };
         // The folder, and what it is a copy of; its branch is kept whole.
         let folder = match &self.place.copy_of {
@@ -3570,20 +4041,21 @@ fn draw_watch(watch: &mut Watch) -> std::io::Result<()> {
         })
         .collect();
     let project = watch.project.clone();
+    let lookout = watch.lookout.clone();
     watch.screen.autoresize()?;
     watch.screen.draw(|frame| {
         let area = frame.area();
         let width = area.width.saturating_sub(2) as usize;
         let mut lines = vec![Line::default()];
-        lines.extend(
-            status::card(&project, &rows, &jobs, width)
-                .into_iter()
-                .map(|line| {
-                    let mut spans = vec![Span::raw(" ")];
-                    spans.extend(line.spans);
-                    Line::from(spans).style(line.style)
-                }),
-        );
+        let mut card = status::card(&project, &rows, &jobs, width);
+        if !lookout.is_empty() {
+            card.insert(1, Line::from(lookout.clone()).dim());
+        }
+        lines.extend(card.into_iter().map(|line| {
+            let mut spans = vec![Span::raw(" ")];
+            spans.extend(line.spans);
+            Line::from(spans).style(line.style)
+        }));
         let footer = Line::from("  esc to close").dim();
         let body = ratatui::layout::Rect {
             height: area.height.saturating_sub(1),
@@ -3713,6 +4185,23 @@ fn responses(item: &Value) -> Vec<Value> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn agent_is_found_beside_sonny_or_by_homebrews_opt_path() {
+        assert_eq!(
+            installed_agent(std::path::Path::new(
+                "/opt/homebrew/Cellar/sonny/0.4.0/bin/sonny"
+            )),
+            [
+                PathBuf::from("/opt/homebrew/Cellar/sonny/0.4.0/libexec/agent"),
+                PathBuf::from("/opt/homebrew/opt/agent/bin/agent"),
+            ]
+        );
+        assert_eq!(
+            installed_agent(std::path::Path::new("/home/me/sonny-0.4.0/bin/sonny")),
+            [PathBuf::from("/home/me/sonny-0.4.0/libexec/agent")]
+        );
+    }
+
     /// A daemon that greets and answers each `history_items` read from
     /// `items`, by node.
     async fn daemon_with(items: Value) -> Arc<Client> {
@@ -3774,13 +4263,58 @@ mod tests {
             layout: false,
             rex_host: None,
             sound: false,
-            lookout: None,
+            side: None,
         };
         App::new(client, "b", &json!({"name": "b"}), options)
     }
 
     fn turn_event(event: &str, turn: i64, data: Value) -> Value {
         json!({"event": event, "bot": "b", "turn": turn, "data": data})
+    }
+
+    #[tokio::test]
+    async fn what_is_typed_answers_the_leads_first_question_unless_set_aside() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let client = daemon_answering(move |asked| {
+            if asked["op"] == "submit" {
+                seen.lock()
+                    .unwrap()
+                    .push(asked["prompt"].as_str().unwrap().to_owned());
+            }
+            json!({"turn": 2})
+        })
+        .await;
+        let mut app = app(client);
+        let dir = std::env::temp_dir().join(unique("sonny-asks"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ask = |name: &str, question: &str| {
+            let file = dir.join(name);
+            std::fs::write(&file, "{}").unwrap();
+            asks::Ask {
+                file,
+                question: question.into(),
+                choices: vec!["Keep it".into(), "Drop it".into()],
+            }
+        };
+        app.asks = vec![ask("1.json", "Keep the old API?"), ask("2.json", "Tag it?")];
+        app.input.set("2");
+        app.submit().await;
+        // Esc sets the rest aside: the next message is the person's own.
+        app.chatting = true;
+        app.input.set("how is it going?");
+        app.submit().await;
+        assert_eq!(
+            *sent.lock().unwrap(),
+            [
+                "You asked: Keep the old API?\n\nDrop it",
+                "how is it going?"
+            ]
+        );
+        assert_eq!(app.asks.len(), 1);
+        assert!(!dir.join("1.json").exists());
+        assert!(dir.join("2.json").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]
@@ -3886,7 +4420,13 @@ mod tests {
         // The reasoning is kept, and announced, before the words it led to.
         app.daemon(event("message", json!({"node": 1}))).await;
         app.daemon(event("message", json!({"node": 2}))).await;
-        let drawn: Vec<String> = app.pending.iter().map(|line| line.to_string()).collect();
+        // Written, or held until the turn ends.
+        let drawn: Vec<String> = app
+            .pending
+            .iter()
+            .chain(&app.open_rows(80))
+            .map(|line| line.to_string())
+            .collect();
         let said = |text: &str| drawn.iter().filter(|line| line.contains(text)).count();
         assert_eq!(
             (said("First line."), said("Second line.")),
@@ -3906,6 +4446,108 @@ mod tests {
         let two = "**Checking the tests**\n\nThey pass.\n\n**Reading the README";
         assert_eq!(heading(two), Some("Checking the tests"));
         assert_eq!(heading(&format!("{two}**\n")), Some("Reading the README"));
+    }
+
+    #[tokio::test]
+    async fn steps_are_quiet_and_the_reply_comes_under_the_turns_line() {
+        let client = daemon_answering(|asked| {
+            let item = match asked["nodes"][0].as_i64() {
+                Some(2) => json!({"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "I'll look."}]}),
+                Some(3) => json!({"type": "function_call_output", "call_id": "c1", "output": "a"}),
+                Some(4) => json!({"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Done."}]}),
+                _ => return json!({}),
+            };
+            json!({"items": [{"node": asked["nodes"][0], "item": item}]})
+        })
+        .await;
+        let mut app = app(client);
+        let said = |text: &str| json!({"event": "text_delta", "bot": "b", "turn": 1, "text": text});
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        app.daemon(said("I'll look.")).await;
+        app.daemon(turn_event("message", 1, json!({"node": 2})))
+            .await;
+        // Held until what follows says what the words were.
+        assert!(app.pending.is_empty());
+        app.daemon(turn_event(
+            "tool_started",
+            1,
+            json!({"call_id": "c1", "name": "shell", "arguments": "{\"command\":\"ls\"}"}),
+        ))
+        .await;
+        app.daemon(turn_event(
+            "tool_completed",
+            1,
+            json!({"call_id": "c1", "node": 3}),
+        ))
+        .await;
+        app.daemon(said("Done.")).await;
+        app.daemon(turn_event("message", 1, json!({"node": 4})))
+            .await;
+        let shown: Vec<String> = app.open_rows(40).iter().map(|l| l.to_string()).collect();
+        assert_eq!(shown, ["", "• Done."]);
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        let dim = |line: &Line| {
+            line.spans.iter().all(|span| {
+                line.style
+                    .patch(span.style)
+                    .add_modifier
+                    .contains(Modifier::DIM)
+            })
+        };
+        let rows: Vec<(String, bool)> = app
+            .pending
+            .iter()
+            .map(|line| (line.to_string(), !line.spans.is_empty() && dim(line)))
+            .collect();
+        assert_eq!(rows[0], ("• I'll look.".into(), true));
+        assert_eq!(rows[2], ("• Ran ls".into(), true));
+        let line = rows
+            .iter()
+            .position(|(row, _)| row.starts_with("─ Worked"))
+            .unwrap();
+        assert_eq!(
+            rows[line + 1..],
+            [("".into(), false), ("• Done.".into(), false)]
+        );
+    }
+
+    #[tokio::test]
+    async fn held_words_survive_a_dropped_connection_and_a_narrower_pane() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        let said = |text: &str| json!({"event": "text_delta", "bot": "b", "turn": 1, "text": text});
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        app.daemon(said("The pay step is the regression at p95."))
+            .await;
+        app.daemon(turn_event("message", 1, json!({"node": 2})))
+            .await;
+        assert!(app.pending.is_empty(), "held until what follows");
+        // Narrower than when they were wrapped: cut again, nothing lost.
+        let narrow: Vec<String> = app.open_rows(20).iter().map(|l| l.to_string()).collect();
+        assert!(narrow.iter().all(|row| row.width() <= 20), "{narrow:?}");
+        assert_eq!(
+            narrow
+                .concat()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+            "• The pay step is the regression at p95."
+        );
+        // The message is past the replay's start, so a drop writes it.
+        app.dropped();
+        assert!(app.live.is_none());
+        let written: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
+        assert_eq!(
+            written.last().unwrap(),
+            "• The pay step is the regression at p95."
+        );
     }
 
     #[tokio::test]

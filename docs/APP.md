@@ -510,14 +510,18 @@ installs and audits the cask, and writes `Casks/agent.rb`, rendered by
 [lydakis/homebrew-agent](https://github.com/lydakis/homebrew-agent). It never
 downgrades the tap or replaces a different cask of the same version.
 
-The same release carries Sonny, the terminal client, as a formula
-(`brew install lydakis/agent/sonny`): `sonny-X.Y.Z.tar.gz` holds a
-universal `bin/sonny` and the app's signed `libexec/agent`, which Sonny
-starts when no daemon runs, kept off `PATH` so it never shadows the cask's
-`agent`. Sonny starts it by its `opt` path, so the daemon, which outlives
-Sonny, never hands agents a path an upgrade and `brew cleanup` removed. A formula's download is not quarantined, so Sonny itself is not
-signed or notarized. Publishing checks, audits, installs and tests it the
-same way and writes `Formula/sonny.rb` beside the cask. The
+The same release carries the source for two formulas that build on the
+person's machine, so neither is signed: `agent` (the daemon alone, `brew
+install lydakis/agent/agent`) and `sonny` (the terminal client, `brew install
+lydakis/agent/sonny`, which depends on `agent`). `agent-X.Y.Z.tar.gz` is
+`git archive` of the release commit, and `agent-formula.rb` and
+`sonny-formula.rb` pin it. Sonny starts the daemon by the `agent` formula's
+`opt` path, so the daemon, which outlives Sonny, never hands agents a path an
+upgrade and `brew cleanup` removed. Publishing checks and audits both, installs
+Sonny (building both), tests them, and writes `Formula/agent.rb` then
+`Formula/sonny.rb` beside the cask. While the cask still puts the app's
+`agent` on `PATH`, the formula's `agent` can't link over it; Sonny needs only
+its `opt` path. The
 helpers and their tests are in [app/release](../app/release)
 (`python3 -m unittest discover -s app/release`).
 
@@ -935,8 +939,11 @@ daemon learns nothing about projects; everything here is client work.
   profile: the folder's `.agents/agents/coordinator.md`, the user's, or the
   one the app ships ([coordinator.md](../app/agents/coordinator.md)), whose
   model and tools apply when the project names none. The shipped text
-  says: the coordinator makes a small, quick change itself (a few lines it
-  can check at a glance) and sends work in an area an existing task owns to
+  says: tasks do the work and the coordinator's turns stay short; it
+  answers what a quick look answers, makes a change itself only when it is
+  a few lines it can check at a glance with no build, test or exploring,
+  hands work that grew to a task with what it found, and sends work in an
+  area an existing task owns to
   that task with `--delivery queue`; every new task, one that only reads too, named with the
   project's prefix so projects do not collide, gets
   `git worktree add -b agent/NAME ~/.agent/worktrees/NAME HEAD`, the

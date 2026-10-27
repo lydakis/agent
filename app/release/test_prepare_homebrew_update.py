@@ -6,6 +6,7 @@ import tempfile
 import unittest
 
 from homebrew_cask import render_cask
+import homebrew_formula
 from homebrew_formula import render_formula
 from prepare_homebrew_update import prepare_update
 
@@ -152,36 +153,41 @@ class HomebrewUpdateTest(unittest.TestCase):
 
 
 class FormulaUpdateTest(unittest.TestCase):
-    def test_sonnys_formula_is_checked_and_versioned_by_its_archive(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            assets = root / "assets"
-            assets.mkdir()
-            archive = assets / "sonny-0.2.0.tar.gz"
-            archive.write_bytes(b"sonny and agent")
-            formula = render_formula("0.2.0", archive).encode()
-            (assets / "sonny.rb").write_bytes(formula)
-            (assets / "source-commit.txt").write_text("a" * 40 + "\n")
-            (assets / "checksums.txt").write_text("".join(
-                f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n"
-                for path in [archive, assets / "sonny.rb", assets / "source-commit.txt"]))
-            metadata = root / "release.json"
-            metadata.write_text(json.dumps({
-                "tag_name": "v0.2.0", "draft": False, "prerelease": False,
-                "published_at": "2026-10-26T00:00:00Z"}))
-            current = root / "tap" / "Formula" / "sonny.rb"
-            prepare = lambda: prepare_update("v0.2.0", metadata, assets, current,
-                                             commit="a" * 40, kind="formula")
-            request = prepare()
-            self.assertEqual(base64.b64decode(request["content"]), formula)
-            self.assertEqual(request["message"], "Update sonny to 0.2.0")
-            # The same release again writes nothing; an older one is replaced.
-            self.assertIsNone(prepare())
-            current.write_bytes(formula.replace(b"0.2.0", b"0.1.0"))
-            self.assertIn("sha", prepare())
-            (assets / "sonny.rb").write_bytes(formula + b"# changed\n")
-            with self.assertRaises(ValueError):
-                prepare()
+    def test_each_formula_is_checked_and_versioned_by_the_source_archive(self):
+        for name in ["agent", "sonny"]:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                assets = root / "assets"
+                assets.mkdir()
+                archive = assets / "agent-0.2.0.tar.gz"
+                archive.write_bytes(b"source")
+                formula = render_formula(name, "0.2.0", archive).encode()
+                published = assets / f"{name}-formula.rb"
+                published.write_bytes(formula)
+                (assets / "source-commit.txt").write_text("a" * 40 + "\n")
+                (assets / "checksums.txt").write_text("".join(
+                    f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n"
+                    for path in [archive, published, assets / "source-commit.txt"]))
+                metadata = root / "release.json"
+                metadata.write_text(json.dumps({
+                    "tag_name": "v0.2.0", "draft": False, "prerelease": False,
+                    "published_at": "2026-10-26T00:00:00Z"}))
+                current = root / "tap" / "Formula" / f"{name}.rb"
+                prepare = lambda: prepare_update("v0.2.0", metadata, assets, current,
+                                                 commit="a" * 40, kind=name,
+                                                 generator=Path(homebrew_formula.__file__))
+                request = prepare()
+                self.assertEqual(base64.b64decode(request["content"]), formula)
+                self.assertEqual(request["message"], f"Update {name} to 0.2.0")
+                # The same release again writes nothing; an older one is
+                # replaced, even when it was built another way.
+                self.assertIsNone(prepare())
+                current.write_text(
+                    'url "https://github.com/lydakis/agent/releases/download/v0.1.0/sonny-0.1.0.tar.gz"\n')
+                self.assertIn("sha", prepare())
+                published.write_bytes(formula + b"# changed\n")
+                with self.assertRaises(ValueError):
+                    prepare()
 
 
 if __name__ == "__main__":

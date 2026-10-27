@@ -569,11 +569,8 @@ const TASK_UPDATES: &str = "Task updates: ";
 /// A message that tells the lead of its tasks, as its kind and a few
 /// words for each thing it tells.
 fn news(text: &str) -> Option<Vec<String>> {
-    let (kind, rest) = if text.starts_with(TASK_UPDATES) {
-        ("Task updates", text)
-    } else {
-        ("Lookout", text.strip_prefix(crate::lookout::NOTE_HEAD)?)
-    };
+    let rest = text.strip_prefix(TASK_UPDATES)?;
+    let kind = "Task updates";
     let mut parts = vec![kind.to_owned()];
     let mut memory = false;
     for line in rest.lines() {
@@ -589,15 +586,11 @@ fn news(text: &str) -> Option<Vec<String>> {
         {
             parts.push(format!("+{count} more"));
         } else if let Some((name, turn)) = item.split_once(": turn:") {
-            // "- shop.fix: turn:shop.fix/5 failed, asked by you"
+            // "- shop.fix: turn:shop.fix/5 failed, asked by you", and from
+            // the judge "- shop.fix: turn:shop.fix/5, turn failed (why; todo)"
             let status = turn.split_once(' ').map_or("", |(_, s)| s);
-            let status = status.split(',').next().unwrap_or_default();
+            let status = status.split([',', '(']).next().unwrap_or_default().trim();
             parts.push(format!("{name} {status}"));
-        } else if let Some((name, rest)) = item.split_once(", turn:") {
-            // "- shop.fix, turn:shop.fix/5, turn failed (why; what to do)"
-            let what = rest.split_once(", ").map_or("", |(_, w)| w);
-            let what = what.split(" (").next().unwrap_or_default();
-            parts.push(format!("{name} {what}"));
         }
     }
     if memory {
@@ -635,6 +628,31 @@ pub fn reply(text: &str, width: usize) -> Vec<Line<'static>> {
     out
 }
 
+/// A step on the way to the reply, a call or what the bot said before
+/// one, drawn quieter than the reply: dim and never bold. What a failure
+/// shows in red, and a diff's colored rows, stay as they are, to be read.
+pub fn quiet(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    let keep = |style: Style| style.bg.is_some() || style.fg == Some(Color::Red);
+    lines
+        .into_iter()
+        .map(|mut line| {
+            if keep(line.style) {
+                return line;
+            }
+            line.style = line.style.add_modifier(Modifier::DIM);
+            for span in &mut line.spans {
+                if !keep(span.style) {
+                    span.style = span
+                        .style
+                        .add_modifier(Modifier::DIM)
+                        .remove_modifier(Modifier::BOLD);
+                }
+            }
+            line
+        })
+        .collect()
+}
+
 /// What a tool call did: one header line, then a short look at its result.
 pub fn tool(
     name: &str,
@@ -647,7 +665,7 @@ pub fn tool(
     let bullet = if failed {
         Span::raw("• ").fg(Color::Red)
     } else {
-        Span::raw("• ").fg(Color::Green)
+        Span::raw("• ")
     };
     let field = |key: &str| arguments[key].as_str().unwrap_or("").to_owned();
     let elbow = || Span::raw("  └ ").dim();
@@ -758,7 +776,7 @@ pub fn tool(
                     let bullet = if failed && i + 1 == count {
                         Span::raw("• ").fg(Color::Red)
                     } else {
-                        Span::raw("• ").fg(Color::Green)
+                        Span::raw("• ")
                     };
                     let commands: Vec<&str> = ran
                         .iter()
@@ -885,7 +903,7 @@ fn said_lines(said: crate::calls::Said, width: usize) -> Vec<Line<'static>> {
     let bullet = if said.failed {
         Span::raw("• ").fg(Color::Red)
     } else {
-        Span::raw("• ").fg(Color::Green)
+        Span::raw("• ")
     };
     let mut spans = vec![Span::raw(said.verb).bold()];
     if !said.what.is_empty() {
@@ -1111,6 +1129,29 @@ mod tests {
     }
 
     #[test]
+    fn a_step_is_dim_and_plain_but_a_failure_stays_red() {
+        let ran = super::quiet(super::tool(
+            "shell",
+            &serde_json::json!({"command": "false"}),
+            Some("boom"),
+            true,
+            "/w",
+            80,
+        ));
+        let header = &ran[0];
+        let bullet = header.spans[0].style;
+        assert_eq!(
+            (bullet.fg, bullet.add_modifier),
+            (Some(Color::Red), Modifier::empty())
+        );
+        for span in &header.spans[1..] {
+            let style = header.style.patch(span.style);
+            assert!(style.add_modifier.contains(Modifier::DIM), "{span:?}");
+            assert!(!style.add_modifier.contains(Modifier::BOLD), "{span:?}");
+        }
+    }
+
+    #[test]
     fn task_updates_and_lookout_notes_read_as_one_quiet_row() {
         let told = "Task updates: since you last heard, tasks you started ended turns or wait for an approval. The wait tool reads each one's final reply by its handle.\n\
                     - shop.fix: turn:shop.fix/5 failed, asked by you\n\
@@ -1127,17 +1168,16 @@ mod tests {
             text(&super::prompt(told, None, 40)),
             ["↳ Task updates · shop.fix failed · shop…"]
         );
-        let note = format!(
-            "{}\n- shop.fix, turn:shop.fix/5, turn failed (blocked 0.91; look)\n\
-             - shop.docs, turn:shop.docs/2, waits on the person's approval (not checked; look)\n\
+        let note = "Task updates: what your tasks did since you last heard; the wait tool reads each turn by its handle.\n\
+             May need you:\n\
+             - shop.fix: turn:shop.fix/5, turn failed (stuck 0.91; send it a targeted correction)\n\
+             - shop.docs: turn:shop.docs/2, waits on the person's approval (not checked; look)\n\
              - 1 more in the next note\n\
-             A quoted message is the person's own words.",
-            crate::lookout::NOTE_HEAD
-        );
+             A quoted message is the person's own words.";
         assert_eq!(
-            text(&super::prompt(&note, None, 100)),
+            text(&super::prompt(note, None, 100)),
             [
-                "↳ Lookout · shop.fix turn failed · shop.docs waits on the person's approval · +1 more"
+                "↳ Task updates · shop.fix turn failed · shop.docs waits on the person's approval · +1 more"
             ]
         );
     }

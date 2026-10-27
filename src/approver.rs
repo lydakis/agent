@@ -6,7 +6,9 @@
 //! the reason, and the model can ask its caller instead.
 use agent_client::{
     Client,
-    approver::{self as policy, Allowed, By, Intent, Planned, Redactor, State, Verdict, Words},
+    approver::{
+        self as policy, Allowed, By, Intent, Planned, Redactor, Refused, State, Verdict, Words,
+    },
 };
 use agent_runtime::{Error, Result};
 use serde_json::{Value, json};
@@ -60,7 +62,7 @@ const IN_FLIGHT: usize = 32;
 const PROMPT_BYTES: usize = 128 * 1024;
 /// How many delegations deep the approver follows up to the person's
 /// words, and how many delegating turns it reads for one round; past either
-/// the words above are left out, and consent is not asked.
+/// the words above are left out, and the judge is told.
 const CHAIN: usize = 8;
 const DELEGATING: usize = 64;
 /// How much of a file written this turn a judged call that names it is
@@ -74,8 +76,14 @@ const BACKOFF: Duration = Duration::from_millis(250);
 const BACKOFF_MAX: Duration = Duration::from_secs(4);
 /// The longest Retry-After honored, past any round's deadline anyway.
 const RETRY_MAX_SECS: f64 = 60.0;
-/// A judge fork is `approver.TAG.PID.N`, and every bot name fits 128 bytes.
-const JUDGE_NAME_ROOM: usize = 128 - "approver.".len() - ".4294967295.18446744073709551615".len();
+/// A judge fork is `approver.TAG.BASE.N`, BASE being the base bot's id,
+/// and every bot name fits 128 bytes.
+const JUDGE_NAME_ROOM: usize =
+    128 - "approver.".len() - ".9223372036854775807.18446744073709551615".len();
+/// How long a judge's fork may sit idle before the daemon deletes it. Each
+/// is deleted once its round is answered; this is for an approver that
+/// stopped mid-round.
+const JUDGE_EXPIRE_MS: u64 = 60_000;
 
 fn epoch_ms() -> i64 {
     SystemTime::now()
@@ -296,10 +304,11 @@ struct Model {
 }
 
 impl Model {
-    /// A fresh base, so a changed judge takes effect, and no forks left by
-    /// an approver that stopped mid-round. Only the tag's holder does this,
-    /// and it removes only judges: a bot of the same name that is not one
-    /// is refused, not deleted.
+    /// A fresh base, so a changed judge takes effect. Only the tag's holder
+    /// does this, and it removes only a judge: a bot of the same name that is
+    /// not one is refused, not deleted. Forks an approver left mid-round
+    /// expire on their own, and the new base's id keeps new forks' names
+    /// apart from theirs.
     async fn prepare(
         client: &Arc<Client>,
         base: String,
@@ -315,36 +324,6 @@ impl Model {
             }
             Err(error) if error.code != "bot_not_found" => return Err(error.into()),
             _ => {}
-        }
-        // Bots are listed in name order, so the judge's forks are the run
-        // of names right after its prefix: only those pages are read.
-        let prefix = format!("{base}.");
-        let mut after = json!(prefix);
-        'pages: loop {
-            let page = client
-                .request("bots", json!({"after":after,"limit":64}))
-                .await
-                .map_err(Error::from)?;
-            for bot in page["bots"].as_array().into_iter().flatten() {
-                let Some(name) = bot["name"]
-                    .as_str()
-                    .filter(|name| name.starts_with(&prefix))
-                else {
-                    break 'pages;
-                };
-                if bot["created_by"] == base.as_str()
-                    && bot["tools"].as_array().is_some_and(Vec::is_empty)
-                {
-                    // Aside, so a turn still ending does not hold up serving.
-                    let (client, name) = (client.clone(), name.to_owned());
-                    let running = bot["running_turn"].as_i64();
-                    tokio::spawn(async move { remove(&client, &name, running).await });
-                }
-            }
-            match &page["next_after"] {
-                Value::Null => break,
-                next => after = next.clone(),
-            }
         }
         match client.request("delete", json!({"bot":base})).await {
             Err(error) if error.code != "bot_not_found" => return Err(error.into()),
@@ -377,14 +356,14 @@ impl Model {
         let name = format!(
             "{}.{}.{}",
             self.base,
-            std::process::id(),
+            self.base_id,
             self.next.fetch_add(1, Ordering::Relaxed)
         );
         if let Err(error) = client
             .request(
                 "fork",
                 json!({"source":self.base,"bot":name,"workspace":"/","created_by":self.base,
-                    "created_by_id":self.base_id}),
+                    "created_by_id":self.base_id,"expire_ms":JUDGE_EXPIRE_MS}),
             )
             .await
         {
@@ -796,12 +775,21 @@ async fn round(shared: Arc<Shared>, bot: String, turn: i64, calls: Vec<Value>) {
     } else if left == 0 {
         vec![policy::not_reviewed("the approver is overloaded"); calls.len()]
     } else {
-        match judge(&shared, &bot, turn, &calls, deadline).await {
-            Ok((verdicts, used)) => {
-                usage = used;
-                verdicts
+        // A check that failed is tried once more while the round has time:
+        // a failure is the approver's, not the call's.
+        let mut retried = false;
+        loop {
+            match judge(&shared, &bot, turn, &calls, deadline).await {
+                Ok((verdicts, used)) => {
+                    usage = used;
+                    break verdicts;
+                }
+                Err(Unreviewed::Failed) if !retried && Instant::now() < deadline => retried = true,
+                Err(Unreviewed::Failed) => {
+                    break vec![policy::not_reviewed("the check failed"); calls.len()];
+                }
+                Err(Unreviewed::Not(verdict)) => break vec![verdict; calls.len()],
             }
-            Err(verdict) => vec![verdict; calls.len()],
         }
     };
     let judge_ms = started.elapsed().as_millis() as u64;
@@ -859,6 +847,14 @@ async fn interrupt(shared: &Shared, bot: &str, turn: i64) {
         .await;
 }
 
+/// Why a round has no verdicts from the judge.
+enum Unreviewed {
+    /// Reading the turn or asking the judge failed: worth one more try.
+    Failed,
+    /// It cannot be judged now: this verdict for every call.
+    Not(Verdict),
+}
+
 /// One judge request for the round, and a verdict for each call.
 async fn judge(
     shared: &Shared,
@@ -866,23 +862,22 @@ async fn judge(
     turn: i64,
     calls: &[Value],
     deadline: Instant,
-) -> std::result::Result<(Vec<Verdict>, Usage), Verdict> {
+) -> std::result::Result<(Vec<Verdict>, Usage), Unreviewed> {
+    let not = |why: &str| Unreviewed::Not(policy::not_reviewed(why));
     let Ok(Ok(_slot)) =
         tokio::time::timeout_at(deadline.into(), shared.judge.slots.acquire()).await
     else {
-        return Err(policy::not_reviewed("the approver is overloaded"));
+        return Err(not("the approver is overloaded"));
     };
     let intent =
         match tokio::time::timeout_at(deadline.into(), intent(shared, bot, turn, calls)).await {
-            Err(_) => return Err(policy::not_reviewed("the approver is overloaded")),
-            Ok(Err(Unjudged::TooLong)) => {
-                return Err(policy::not_reviewed("the call is too long to show"));
-            }
-            Ok(Err(Unjudged::Failed)) => return Err(policy::not_reviewed("the check failed")),
+            Err(_) => return Err(not("the approver is overloaded")),
+            Ok(Err(Unjudged::TooLong)) => return Err(not("the call is too long to show")),
+            Ok(Err(Unjudged::Failed)) => return Err(Unreviewed::Failed),
             Ok(Ok(intent)) => intent,
         };
     let (state, consent) = match policy::build(&intent, &shared.redactor) {
-        State::TooLong => return Err(policy::not_reviewed("the calls are too long to show")),
+        State::TooLong => return Err(not("the calls are too long to show")),
         State::Built { state, consent } => (state, consent),
     };
     let ids: Vec<&str> = intent.planned.iter().map(|call| call.id.as_str()).collect();
@@ -892,10 +887,10 @@ async fn judge(
         .ask(&shared.client, &state, &questions, deadline)
         .await
     {
-        Judged::Overloaded => Err(policy::not_reviewed("the approver is overloaded")),
+        Judged::Overloaded => Err(not("the approver is overloaded")),
         Judged::Failed(detail) => {
             report(json!({"event":"judge_failed","bot":bot,"turn":turn,"detail":detail}));
-            Err(policy::not_reviewed("the check failed"))
+            Err(Unreviewed::Failed)
         }
         Judged::Answers { answers, usage } => {
             let verdicts = intent
@@ -909,7 +904,7 @@ async fn judge(
                     })
                 })
                 .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| policy::not_reviewed("the check failed"))?;
+                .ok_or(Unreviewed::Failed)?;
             Ok((verdicts, usage))
         }
     }
@@ -1045,27 +1040,39 @@ async fn intent(
             json!({"bot":bot,"turn":turn,"bytes":PROMPT_BYTES}),
         )
         .await?;
-    // Steers left out may hold the person's latest word: the words are
-    // judged without consent.
-    let mut request_cut = read["prompts_more"] == true;
+    // The read keeps the earliest words of the turn, so steers it left out
+    // or cut may hold the person's latest word: consent is not asked then.
+    let mut left_out = Left {
+        newest: read["prompts_more"] == true,
+        ..Left::default()
+    };
     let mut request = Vec::new();
     let mut visited = HashSet::from([(bot.to_owned(), turn)]);
-    let prompts = read["prompts"].as_array().map_or(&[][..], Vec::as_slice);
-    let mut budget = PROMPT_BYTES.saturating_sub(prompt_bytes(prompts));
-    for prompt in prompts {
-        request_cut |= prompt["truncated"] == true;
+    let prompts = with_replies(read["prompts"].as_array().cloned().unwrap_or_default());
+    let mut budget = PROMPT_BYTES.saturating_sub(prompt_bytes(&prompts));
+    for prompt in &prompts {
+        left_out.cut(prompt);
         let text = prompt_text(prompt);
         match prompt.get("from") {
             None => request.push(Words {
                 by: by_origin(prompt),
                 text,
+                refused: refused(&prompt["refused"]),
             }),
             Some(from) => {
-                let cut = persons_above(client, from, &mut visited, &mut budget, &mut request);
-                request_cut |= cut.await?;
+                persons_above(
+                    client,
+                    from,
+                    &mut visited,
+                    &mut budget,
+                    &mut request,
+                    &mut left_out,
+                )
+                .await?;
                 request.push(Words {
                     by: By::Model,
                     text,
+                    refused: refused(&prompt["refused"]),
                 });
             }
         }
@@ -1238,6 +1245,7 @@ async fn intent(
                 None => by_origin(prompt),
             },
             text: prompt_text(prompt),
+            refused: refused(&prompt["refused"]),
         })
         .collect();
     Ok(Intent {
@@ -1247,9 +1255,39 @@ async fn intent(
         planned,
         allowed,
         allowed_cut,
-        request_cut,
+        request_cut: left_out.any || left_out.newest,
+        newest_cut: left_out.newest,
         earlier,
     })
+}
+
+/// A `prompts` read's words with the bot's message before each, its
+/// `reply`, as its model's words: what a short "yes" answers.
+fn with_replies(prompts: Vec<Value>) -> Vec<Value> {
+    let mut words = Vec::with_capacity(prompts.len());
+    for prompt in prompts {
+        if let Some(text) = prompt["reply"]["text"].as_str() {
+            words.push(json!({"text":text,"origin":"reply"}));
+        }
+        words.push(prompt);
+    }
+    words
+}
+
+/// The calls a `prompts` read lists as refused after a prompt or steer.
+fn refused(calls: &Value) -> Vec<Refused> {
+    calls
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|call| Refused {
+            tool: call["name"].as_str().unwrap_or_default().to_owned(),
+            arguments: match call["arguments_truncated"] == true {
+                true => whole_words(call["arguments"].as_str().unwrap_or_default()).to_owned(),
+                false => call["arguments"].as_str().unwrap_or_default().to_owned(),
+            },
+        })
+        .collect()
 }
 
 /// Text the daemon cut at its byte budget ends without the part-word it was
@@ -1282,49 +1320,73 @@ fn by_origin(prompt: &Value) -> By {
 /// wrote it, and so on up to `CHAIN` delegations, in the order they were
 /// written, so a later word from the person still reads as the later one.
 /// A turn that can no longer be read (its bot was deleted) has no person
-/// above it, so nothing there consents. Whether words were left out: past
-/// the chain's limits, or a prompt or steer the read cut or left out.
+/// above it, so nothing there consents. Words left out go in `left_out`:
+/// a delegating turn past the chain's limits, or a prompt or steer a read
+/// cut or left out.
 async fn persons_above(
     client: &Client,
     from: &Value,
     visited: &mut HashSet<(String, i64)>,
     budget: &mut usize,
     request: &mut Vec<Words>,
-) -> std::result::Result<bool, Unjudged> {
+    left_out: &mut Left,
+) -> std::result::Result<(), Unjudged> {
     // Each delegating turn's prompts in order; a model-written one is
     // replaced by the prompts above it, depth first.
     let mut levels: Vec<std::vec::IntoIter<Value>> = Vec::new();
     let mut next = Some(from.clone());
-    let mut cut = false;
     loop {
         if let Some(from) = next.take() {
+            // A turn not read at all may hold a later word too.
             if levels.len() >= CHAIN {
-                cut = true;
+                left_out.newest = true;
             } else {
                 match delegated(client, &from, visited, budget).await? {
                     Above::Prompts { prompts, more } => {
-                        cut |= more;
+                        left_out.newest |= more;
                         levels.push(prompts.into_iter());
                     }
                     Above::None => {}
-                    Above::Cut => cut = true,
+                    Above::Cut => left_out.newest = true,
                 }
             }
         }
         let Some(level) = levels.last_mut() else {
-            return Ok(cut);
+            return Ok(());
         };
         let Some(prompt) = level.next() else {
             levels.pop();
             continue;
         };
-        cut |= prompt["truncated"] == true;
+        left_out.cut(&prompt);
         match prompt.get("from") {
             Some(above) => next = Some(above.clone()),
             None => request.push(Words {
                 by: by_origin(&prompt),
                 text: prompt_text(&prompt),
+                refused: refused(&prompt["refused"]),
             }),
+        }
+    }
+}
+
+/// What a round's `prompts` reads left out of the words.
+#[derive(Default)]
+struct Left {
+    /// Some text was cut.
+    any: bool,
+    /// A steer was cut or left out, or a turn was not read: a later word,
+    /// which may withdraw what an earlier one asked.
+    newest: bool,
+}
+
+impl Left {
+    /// Note a prompt or steer as a read returned it. A turn's prompt cut
+    /// at its end loses only its own tail; a steer cut came later than it.
+    fn cut(&mut self, prompt: &Value) {
+        if prompt["truncated"] == true {
+            self.any = true;
+            self.newest |= prompt["steer"] == true;
         }
     }
 }
@@ -1362,6 +1424,7 @@ async fn delegated(
     {
         Ok(mut read) => Ok(match read["prompts"].take() {
             Value::Array(prompts) => {
+                let prompts = with_replies(prompts);
                 *budget = budget.saturating_sub(prompt_bytes(&prompts));
                 // Steers left out may hold that person's latest word.
                 Above::Prompts {
@@ -1381,6 +1444,18 @@ async fn delegated(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cut_steer_is_a_later_word_left_out_and_a_cut_prompt_is_not() {
+        let mut left = Left::default();
+        left.cut(&json!({"text":"deploy","truncated":true}));
+        assert!(left.any && !left.newest);
+        left.cut(&json!({"text":"","truncated":true,"steer":true}));
+        assert!(left.newest);
+        let mut whole = Left::default();
+        whole.cut(&json!({"text":"don't","steer":true}));
+        assert!(!whole.any && !whole.newest);
+    }
 
     #[test]
     fn rounds_keep_the_order_their_first_calls_arrived_in() {

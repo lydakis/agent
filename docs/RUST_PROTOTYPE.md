@@ -53,6 +53,7 @@ agent run --bot Bob -- "Now run the full suite"          # same bot, next turn, 
 agent run --bot Bob --model anthropic/claude-opus-5-5 -- "Review the diff"   # this turn only
 agent follow --bot Bob --after 0                         # replay, then live events
 agent fork --source Bob --checkpoint 12 --bot Bob-alt      # starts in Bob's folder
+agent run --fork Bob --bot Bob.side --allow '' --expires 15m -- "Where are you?"   # ask a copy; Bob carries on
 agent interrupt --bot Bob
 agent ls
 agent shutdown
@@ -982,6 +983,7 @@ own path from the turn. Example requests:
 {"id":6,"op":"history_items","bot":"Bob","nodes":[2]}
 {"id":13,"op":"artifact","bot":"Bob","turn":1,"call_id":"call_1","stream":"stdout","offset":0,"limit":65536}
 {"id":8,"op":"fork","source":"Bob","checkpoint":2,"bot":"Alternative","request_id":"alt-1"}
+{"id":28,"op":"fork","source":"Bob","bot":"Bob.side","allow":[],"expire_ms":900000,"request_id":"side-1"}
 {"id":9,"op":"interrupt","bot":"Bob","turn":1}
 {"id":11,"op":"bots","after":null,"limit":64}
 {"id":22,"op":"bots","after":null,"limit":64,"name":"project.*","active":true}
@@ -1151,10 +1153,10 @@ them here. A model must be of the bot's family, as a turn's own model must,
 since its history is kept in that family's encoding
 (`provider_family_mismatch`). A gate (`approve`, `approver` and optionally
 `approve_expire_ms`, as on `create`) replaces the bot's gates, and
-`approve: []` alone removes them; only a bot no bot made may change them,
-since a bot keeps the gates it descends from (`gates_inherited`), and bots
-it already made keep theirs. The gate is checked before anything is
-written. It answers `{bot, bot_id, changed}`, `changed` naming the fields
+`approve: []` alone removes them, including the gates a bot took from the
+bot that made it: whoever configures a bot decides, as a person overriding
+one does, and bots it already made keep theirs. The gate is checked before
+anything is written. It answers `{bot, bot_id, changed}`, `changed` naming the fields
 (`model`, `instructions`, `gates`) that differed; the same request again
 changes nothing, so a resend is harmless. A change is told to the bot's
 followers as a live `configured` event with the same fields, which is not
@@ -1201,7 +1203,8 @@ are `created`, `forked`, `queued` (a submission waiting its turn), `accepted`
 (a turn starting, with its prompt's node), `message`, `usage`, `tool_started`
 (with a 2 KiB argument preview, and `approvals` and the planning `node`
 for a gated call), `tool_completed` (with retained artifact names; `failed`
-for a call that failed, `denied` for a denied one),
+for a call that failed, `denied` for a denied one, which also carries
+the refused call's `name` and argument preview as `tool_started` would),
 `approval_requested` (a round's gated calls, see [tool approval](#tool-approval)),
 `turn_waiting` and `turn_resumed` (a parked turn's handles, or the call whose
 verdict it waits for, and its wake-up), `turn_paced` (a turn parked at its model-call boundary because its
@@ -1256,7 +1259,17 @@ as an approver judges them, within `bytes` of text (default 64 KiB, at most
 `from` or `origin`, and `prompts_more` when steers were left out; the calls it started, each with its argument preview,
 `done`, `failed` when it failed, and `node`, with `calls_more` when some
 were left out; and the bot's earlier prompts, newest first, with `more`
-when some were left out. The words and the calls each have `bytes` of
+when some were left out. A prompt or steer, this turn's or an earlier
+one's, carries the calls its turn was refused after it and before the
+next steer (`refused`, each `{name, arguments}`, `arguments_truncated`
+when cut), so a reader can tell a go-ahead that followed a refusal from
+one that came before it. This turn's prompt and steers carry `reply`,
+the end of the bot's last message before them within 2 KiB
+(`{text, truncated?}`), with secrets redacted before the end is kept: its
+last of the turn before for the prompt, and one since the previous words
+for a steer; absent when there is none. It is the question a bare "yes"
+answers. Refused calls and
+`reply` count against the words' `bytes`. The words and the calls each have `bytes` of
 their own, so a long prompt still leaves the calls (and the files they
 wrote) to read. Text that does not fit is cut and marked
 `truncated`, and each steer, call, and earlier prompt also counts 64
@@ -1348,9 +1361,9 @@ the turn's id and handle at once, and `wait`, `turns`, and
   without interrupting, which starts at the running turn's newest finished
   round. `agent run` says the same as flags to copy
   (`--delivery steer --turn N`, `--delivery queue`, or
-  `fork --source NAME --bot NEW`), built from the
-  refusal's `running_turn` and `fork_point`, taken in the refusing
-  transaction, so it asks nothing more and never names a turn that started
+  `run --detach --fork=NAME --bot NEW --allow '' --expires 15m -- QUESTION`),
+  built from the refusal's `running_turn` and `fork_point`, taken in the
+  refusing transaction, so it asks nothing more and never names a turn that started
   since. `fork_point` is where a fork without a checkpoint starts, the head
   of an idle bot or that newest finished round. A model calling `agent run`
   does not discover them otherwise, and in benchmark runs it ignored a prose
@@ -1807,7 +1820,8 @@ growing stored history are recorded separately.
 ## Retention
 
 Nothing is dropped unless a caller asks. Two primitives cover what a fleet
-needs, and one optional policy composes them:
+needs, and one optional policy composes them. A fork can also ask to be
+deleted once idle:
 
 - `delete {bot}` removes an idle bot and everything only it owns: its turns,
   tool intents, processes, artifacts, events, checkpoints, and the history
@@ -1840,6 +1854,20 @@ needs, and one optional policy composes them:
   or a duplicate turn. If the name was recreated meanwhile, a retry carrying
   the old `bot_id` is still refused; one without it is fresh work on the new
   identity.
+- `fork {expire_ms}` (1 s to 7 days; `--expires` on `agent fork` and
+  `agent run --fork`) makes a fork the daemon deletes, as `delete` would,
+  once it has been idle that long: no turn has run, waited, or been queued
+  since it was made or its last turn ended. Its record shows `expire_ms`
+  and `expires_at` (epoch milliseconds), and each turn's end moves
+  `expires_at` to then plus `expire_ms`, so a follow-up keeps it alive. The
+  time is stored, so a fork outlives neither a daemon restart nor the
+  client that made it: the daemon looks when the earliest time comes due
+  and at every start, and a fork still busy then (a command it started,
+  queued work) is looked at again a minute later. Followers get the same
+  `deleted` notification with `"expired":true`. This is what a side
+  question needs: `agent run --fork NAME --bot NEW --allow '' --expires 15m
+  -- QUESTION` asks a copy of NAME, which answers from NAME's history
+  without acting and leaves NAME as it was.
 - `prune {bot, keep_turns}` protects the unfinished suffix (running, parked,
   ready, and queued work) and keeps the `keep_turns` finished turns preceding
   it. With no unfinished work it keeps the newest `keep_turns` turns by
@@ -2286,7 +2314,7 @@ whose provider ran fallbacks, there is no estimate yet and only bytes apply;
 when instructions and tools alone pass the threshold, no summary can help
 and only bytes apply too. The input limit stays the byte envelope.
 
-A client may also ask for a summary with `compact` (protocol 16;
+A client may also ask for a summary with `compact` (protocol 17;
 `agent compact --bot NAME`,
 Sonny's `/compact`). It is kept on the bot, so a parked turn or a restarted
 daemon still takes it: a running turn's next round boundary, or an idle

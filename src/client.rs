@@ -52,6 +52,10 @@ struct Options {
     workspace: Option<PathBuf>,
     bot: Option<String>,
     source: Option<String>,
+    /// `run --fork`: the bot to copy and ask, instead of a bot to continue.
+    fork: Option<String>,
+    /// A fork's idle time before the daemon deletes it.
+    expire_ms: Option<u64>,
     checkpoint: Option<i64>,
     request_id: Option<String>,
     bot_id: Option<i64>,
@@ -131,6 +135,8 @@ fn parse(args: &[String]) -> Result<Options> {
         workspace: None,
         bot: None,
         source: None,
+        fork: None,
+        expire_ms: None,
         checkpoint: None,
         request_id: None,
         bot_id: None,
@@ -263,6 +269,8 @@ fn parse(args: &[String]) -> Result<Options> {
                     "--workspace" => options.workspace = Some(value.into()),
                     "--bot" => options.bot = Some(value),
                     "--source" => options.source = Some(value),
+                    "--fork" => options.fork = Some(value),
+                    "--expires" => options.expire_ms = Some(crate::cli::duration_ms(flag, &value)?),
                     "--checkpoint" => {
                         options.checkpoint =
                             Some(value.parse().map_err(|_| {
@@ -1327,7 +1335,10 @@ fn run(options: &Options) -> Result<i32> {
     // One key for the creation and the submission, so resending the same
     // command gets the bot and the turn it made the first time.
     let request_id = options.request_id.clone().unwrap_or_else(|| unique("run"));
-    if created {
+    if let Some(source) = &options.fork {
+        // The copy keeps its source's model, instructions, tools and folder.
+        make_fork(options, &mut connection, source, &bot, Some(&request_id))?;
+    } else if created {
         // The client chooses; the bot retains. Nothing about a bot comes
         // from the daemon or from whichever client connects later.
         let workspace = workspace.as_deref().expect("a new bot resolves its folder");
@@ -1459,8 +1470,9 @@ fn ways_past_busy(bot: &str, error: Error) -> Error {
         ),
         None => "resend with --delivery queue to run this after it".to_owned(),
     };
-    let fork =
-        format!("; to ask without interrupting, fork --source={bot} --bot NEW and send it to NEW");
+    let fork = format!(
+        "; to ask without interrupting, run --detach --fork={bot} --bot NEW --allow '' --expires 15m -- QUESTION"
+    );
     // The daemon's own detail names request fields; at the CLI the detail
     // states the refusal and the hint gives the ways past it in flags.
     let stated = match running {
@@ -1523,14 +1535,32 @@ fn fork(options: &Options) -> Result<i32> {
             "fork needs --source and --bot; --checkpoint N picks a message, default is an idle source's head or a running turn's newest finished round",
         );
     };
-    let checkpoint = options.checkpoint;
     let mut connection = Connection::connect(&options.socket)?;
+    let result = make_fork(
+        options,
+        &mut connection,
+        source,
+        bot,
+        options.request_id.as_deref(),
+    )?;
+    print_json(&result, options.pretty)?;
+    Ok(0)
+}
+
+/// Fork `source` as `bot`, for `fork` and `run --fork`.
+fn make_fork(
+    options: &Options,
+    connection: &mut Connection,
+    source: &str,
+    bot: &str,
+    request_id: Option<&str>,
+) -> Result<Value> {
     // A fork inherits only the conversation; its turns name their own workspace.
     let (created_by, created_by_id) = created_by()?;
-    let mut request = json!({"source":source,"checkpoint":checkpoint,"bot":bot,
+    let mut request = json!({"source":source,"checkpoint":options.checkpoint,"bot":bot,
         "workspace":options.workspace.as_ref().map(|_| workspace(options)).transpose()?,
-        "budget_tokens":options.budget_tokens,"request_id":options.request_id,
-        "created_by":created_by,"created_by_id":created_by_id});
+        "budget_tokens":options.budget_tokens,"request_id":request_id,
+        "created_by":created_by,"created_by_id":created_by_id,"expire_ms":options.expire_ms});
     if let Some(allow) = &options.allow {
         let allow: Vec<&str> = allow.split(',').filter(|t| !t.is_empty()).collect();
         request["allow"] = json!(allow);
@@ -1540,19 +1570,15 @@ fn fork(options: &Options) -> Result<i32> {
     let state = match connection.request("inspect", json!({"bot":source})) {
         // A keyed fork outlives its source: its resend is answered from the
         // fork, so it needs nothing from the source.
-        Err(error) if error.code == "bot_not_found" && options.request_id.is_some() => {
-            let result = connection.request("fork", request)?;
-            print_json(&result, options.pretty)?;
-            return Ok(0);
+        Err(error) if error.code == "bot_not_found" && request_id.is_some() => {
+            return connection.request("fork", request);
         }
         state => state?,
     };
     if answered_by_auto(&state) {
-        ensure_approver(options, &mut connection, bot_model(&state))?;
+        ensure_approver(options, connection, bot_model(&state))?;
     }
-    let result = connection.request("fork", request)?;
-    print_json(&result, options.pretty)?;
-    Ok(0)
+    connection.request("fork", request)
 }
 
 fn interrupt(options: &Options) -> Result<i32> {
@@ -2864,7 +2890,7 @@ mod tests {
             flagged.facts.unwrap()["hint"]
                 .as_str()
                 .unwrap()
-                .contains("fork --source=--worker --bot NEW")
+                .contains("run --detach --fork=--worker --bot NEW")
         );
     }
 

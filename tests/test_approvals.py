@@ -592,8 +592,10 @@ class PromptReadTests(ModelFixture):
                                 **{'from': {'bot': 'Bob', 'turn': first}})['result']['turn']
         self.assertEqual(client.finished(second)['data']['status'], 'completed')
         read = client.request('prompts', bot='Bob', turn=second, bytes=1024)['result']
+        # With what the bot said last before it: what a short answer answers.
         self.assertEqual(read['prompts'], [{'turn': second, 'text': 'done',
-                                            'from': {'bot': 'Bob', 'turn': first}}])
+                                            'from': {'bot': 'Bob', 'turn': first},
+                                            'reply': {'text': 'echo:{"exit_code":3,"stderr":"","stdout":"","success":false}'}}])
         self.assertEqual(read['earlier'], [{'turn': first, 'text': 'shell:exit 3'}])
         self.assertEqual((read['status'], read['workspace'], read['more']), ('finished', str(self.path), False))
         self.assertEqual(client.request('prompts', bot='Bob', turn=second, bytes=0)['error'], 'invalid_limit')
@@ -901,7 +903,7 @@ class AutoApproverTests(ModelFixture):
                                     prompt='shell:printf DANGER')['result']['turn']
         self.assertEqual(daemon.finished(risky_turn)['data']['status'], 'completed')
         reason = self.denial(daemon, risky_turn)
-        self.assertTrue(reason.startswith('judged risky: it deletes or overwrites'), reason)
+        self.assertTrue(reason.startswith('judged risky: it destroys data'), reason)
         body = self.judge.requests.get(timeout=5)['body']
         self.assertEqual(body['state']['earlier_prompts'], [{'by': 'person', 'text': 'shell:printf safe > out'}])
         self.assertEqual(self.judge.requests.qsize(), 0)
@@ -926,9 +928,10 @@ class AutoApproverTests(ModelFixture):
         risky_turn = daemon.request('submit', bot='Bob', request_id='b',
                                     prompt='shell:printf DANGER')['result']['turn']
         self.assertEqual(daemon.finished(risky_turn)['data']['status'], 'completed')
-        self.assertTrue(self.denial(daemon, risky_turn).startswith('judged risky: it deletes or overwrites'))
-        # An account out of credit fails the check at once, without waiting.
-        self.judge.statuses = ['quota']
+        self.assertTrue(self.denial(daemon, risky_turn).startswith('judged risky: it destroys data'))
+        # An account out of credit fails the check at once, without waiting,
+        # and again when it is tried once more.
+        self.judge.statuses = ['quota', 'quota']
         broke = daemon.request('submit', bot='Bob', request_id='c', prompt='shell:printf x')['result']['turn']
         self.assertEqual(daemon.finished(broke)['data']['status'], 'completed')
         self.assertEqual(self.denial(daemon, broke), 'not reviewed: the check failed')
@@ -962,8 +965,9 @@ class AutoApproverTests(ModelFixture):
                          'Help with the repo.')
         self.assertIn('result', daemon.request('delete', bot='approver.auto'))
         # An approver that stopped leaves its judge and a fork from mid-round:
-        # the next one makes the judge afresh, removes the fork, and keeps a
-        # bot that only shares its prefix.
+        # the next one makes the judge afresh, the daemon deletes the fork
+        # once it has been idle long enough, and a bot that only shares the
+        # judge's prefix is kept.
         old, _ = self.approver(daemon, judge='openai/old-judge')
         old.kill()
         old.wait()
@@ -971,11 +975,20 @@ class AutoApproverTests(ModelFixture):
         while daemon.request('stats')['result']['approvers']:
             self.assertLess(time.monotonic(), deadline)
             time.sleep(0.05)
-        daemon.request('fork', source='approver.auto', bot='approver.auto.1.0', created_by='approver.auto')
+        old_id = daemon.request('inspect', bot='approver.auto')['result']['bot_id']
+        daemon.request('fork', source='approver.auto', bot=f'approver.auto.{old_id}.0',
+                       created_by='approver.auto', expire_ms=1000)
         daemon.request('create', bot='approver.auto.notes', workspace='/', model='openai/synthetic-model',
                        tools=['shell'])
+        forks = Connection(daemon.socket_path)
+        self.addCleanup(forks.close)
+        forks.request('follow', bot='*')
+        forks.receive(lambda e: e.get('event') == 'follow_live')
         _, lines = self.approver(daemon, judge='openai/judge-model')
-        bots = {b['name']: b for b in daemon.request('bots')['result']['bots']}
+        deadline = time.monotonic() + 5
+        while len(bots := {b['name']: b for b in daemon.request('bots')['result']['bots']}) != 3:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.05)
         self.assertEqual(sorted(bots), ['Bob', 'approver.auto', 'approver.auto.notes'])
         self.assertIn('result', daemon.request('delete', bot='approver.auto.notes'))
         self.assertEqual((bots['approver.auto']['model'], bots['approver.auto']['tools'],
@@ -996,7 +1009,7 @@ class AutoApproverTests(ModelFixture):
         risky_turn = daemon.request('submit', bot='Bob', request_id='b', prompt='shell:printf DANGER')['result']['turn']
         self.assertEqual(daemon.finished(risky_turn)['data']['status'], 'completed')
         reason = self.denial(daemon, risky_turn)
-        self.assertTrue(reason.startswith('judged risky: it deletes or overwrites'), reason)
+        self.assertTrue(reason.startswith('judged risky: it destroys data'), reason)
         # A reply without every answer is a failed check, not an allow.
         parsed[0] = False
         vague = daemon.request('submit', bot='Bob', request_id='c', prompt='shell:printf vague')['result']['turn']
@@ -1006,7 +1019,11 @@ class AutoApproverTests(ModelFixture):
         self.assertIn({'event': 'judge_failed', 'bot': 'Bob', 'turn': vague,
                        'detail': "the judge's answer did not parse"}, events)
         self.assertEqual(self.judge.requests.qsize(), 0)
-        # Each round's fork goes once it is answered; the base stays.
+        # Each round's fork expires if the approver stops, and goes once it
+        # is answered; the base stays.
+        base = bots['approver.auto']['bot_id']
+        forked = forks.receive(lambda e: e.get('event') == 'forked')
+        self.assertEqual((forked['bot'], forked['data']['expire_ms']), (f'approver.auto.{base}.0', 60000))
         deadline = time.monotonic() + 5
         while sorted(b['name'] for b in daemon.request('bots')['result']['bots']) != ['Bob', 'approver.auto']:
             self.assertLess(time.monotonic(), deadline)
@@ -1022,19 +1039,28 @@ class AutoApproverTests(ModelFixture):
         self.assertNotIn('synthetic-secret-value', sent)
         self.assertIn('[secret: bearer token]', sent)
 
-    def test_a_failed_check_denies_as_not_reviewed_and_a_rate_limit_waits(self):
+    def test_a_failed_check_is_tried_again_then_not_reviewed_and_a_rate_limit_waits(self):
         daemon = self.daemon()
         self.approver(daemon)
+        # A check that fails once is tried again, and its verdict stands.
         self.judge.statuses = [500]
+        retried = daemon.request('submit', bot='Bob', request_id='r', prompt='shell:printf one > one')['result']['turn']
+        self.assertEqual(daemon.finished(retried)['data']['status'], 'completed')
+        self.assertEqual((self.path / 'one').read_text(), 'one')
+        self.assertEqual([self.judge.requests.get(timeout=5)['path'] for _ in range(2)], ['/v1/systemone'] * 2)
+        # One that fails twice is not reviewed: a gate that lapses denies it.
+        self.judge.statuses = [500, 500]
         failed = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf one')['result']['turn']
         self.assertEqual(daemon.finished(failed)['data']['status'], 'completed')
         self.assertEqual(self.denial(daemon, failed), 'not reviewed: the check failed')
+        for _ in range(2):
+            self.judge.requests.get(timeout=5)
         # A 429 is retried after its Retry-After, within the round's deadline.
         self.judge.statuses = [429]
         paced = daemon.request('submit', bot='Bob', request_id='b', prompt='shell:printf two > two')['result']['turn']
         self.assertEqual(daemon.finished(paced)['data']['status'], 'completed')
         self.assertEqual((self.path / 'two').read_text(), 'two')
-        self.assertEqual(self.judge.requests.qsize(), 3)
+        self.assertEqual(self.judge.requests.qsize(), 2)
 
     def test_the_breaker_stops_a_turn_that_keeps_getting_denied(self):
         self.model.call_script = [('shell', {'command': f'printf DANGER-{n}'}) for n in range(5)]
@@ -1100,12 +1126,24 @@ class AutoApproverTests(ModelFixture):
                                         tag='auto', decision='allow', by='test')['result']['decision'], 'allow')
         self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
         self.assertEqual((self.path / 'danger').read_text(), 'DANGER')
+        # A check that fails, and fails again, hands the call over too: no
+        # model said no, so it is no denial and no strike.
+        self.judge.statuses = [500, 500]
+        unchecked = daemon.request('submit', bot='Carol', request_id='c', prompt='shell:printf ok')['result']['turn']
+        judged = next(line for line in iter(lambda: lines.get(timeout=5), None) if line['event'] == 'judged')
+        self.assertEqual((judged['turn'], judged['calls'][0]['decision'], judged['calls'][0]['reason']),
+                         (unchecked, 'ask', 'not reviewed: the check failed'))
+        [waiting] = daemon.request('approvals', bot='Carol')['result']['approvals']
+        self.assertEqual(waiting['denials']['auto'], {'in_row': 0, 'in_turn': 0})
+        daemon.request('answer', bot='Carol', turn=unchecked, call_id='shell-1', request=1,
+                       tag='auto', decision='allow', by='test')
+        self.assertEqual(daemon.finished(unchecked)['data']['status'], 'completed')
         # A gate that lapses has nobody to wait on: the doubt is a denial.
         lapsing = daemon.request('submit', bot='Bob', request_id='b', prompt='shell:printf DANGER')['result']['turn']
         self.assertEqual(daemon.finished(lapsing)['data']['status'], 'completed')
         self.assertTrue(self.denial(daemon, lapsing).startswith('judged risky'))
 
-    def test_words_too_long_to_show_are_judged_without_consent(self):
+    def test_words_too_long_to_show_leave_the_newest_to_consent(self):
         daemon = self.daemon()
         daemon.request('create', bot='Carol', workspace=str(self.path), approve=['shell'], approver='auto',
                        approve_expire_ms=15000)
@@ -1121,15 +1159,30 @@ class AutoApproverTests(ModelFixture):
         body = self.judge.requests.get(timeout=5)['body']
         self.assertTrue(body['state']['request_cut'])
         self.assertEqual(body['state']['request'][-1], {'by': 'model', 'text': 'shell:printf safe > safe'})
-        self.assertNotIn('already_allowed', body['state'])
-        self.assertFalse([id for id in body['questions'] if id.endswith('_ok')])
-        # A risky call still is not: with no consent asked, it is denied.
+        self.assertEqual(body['state']['already_allowed'], [])
+        self.assertTrue([id for id in body['questions'] if id.endswith('_ok')])
+        # A risky call nobody asked for still is not run.
         risky = daemon.request('submit', bot='Carol', request_id='c', prompt='shell:printf DANGER',
                                **{'from': {'bot': 'Bob', 'turn': person}})['result']['turn']
         daemon.finished(risky)
         events = daemon.request('events', bot='Carol', after=0, limit=256)['result']['events']
         [completed] = [e['data'] for e in events if e['turn'] == risky and e['event'] == 'tool_completed']
         self.assertTrue(completed.get('denied'), completed)
+
+    def test_a_go_ahead_is_read_against_the_calls_refused_before_it(self):
+        daemon = self.daemon()
+        self.approver(daemon)
+        refused = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf DANGER')['result']['turn']
+        daemon.finished(refused)
+        self.assertTrue(self.denial(daemon, refused).startswith('judged risky'))
+        self.judge.requests.get(timeout=5)
+        # The person says yes; the judge sees what the bot was refused.
+        turn = daemon.request('submit', bot='Bob', request_id='b', prompt='shell:printf ok')['result']['turn']
+        daemon.finished(turn)
+        state = self.judge.requests.get(timeout=5)['body']['state']
+        [call] = state['earlier_prompts'][0]['refused_calls']
+        self.assertEqual(call['tool'], 'shell')
+        self.assertIn('printf DANGER', call['arguments'])
 
     def test_a_message_a_client_sent_on_its_own_asks_for_nothing(self):
         daemon = self.daemon()
@@ -1140,9 +1193,14 @@ class AutoApproverTests(ModelFixture):
                                   origin=origin)['result']['turn']
             daemon.finished(turn)
             request = self.judge.requests.get(timeout=5)['body']['state']['request']
-            self.assertEqual(request, [{'by': 'model', 'text': 'shell:printf DANGER'}])
-            self.assertEqual(daemon.request('prompts', bot='Bob', turn=turn)['result']['prompts'],
-                             [{'turn': turn, 'text': 'shell:printf DANGER', 'origin': origin}])
+            # After the bot's last message, if it has one: neither is a person's.
+            self.assertEqual(request[-1], {'by': 'model', 'text': 'shell:printf DANGER'})
+            self.assertEqual({words['by'] for words in request}, {'model'})
+            [prompt] = daemon.request('prompts', bot='Bob', turn=turn)['result']['prompts']
+            self.assertEqual({k: prompt[k] for k in ('turn', 'text', 'origin')},
+                             {'turn': turn, 'text': 'shell:printf DANGER', 'origin': origin})
+            # The call it was refused sits with it.
+            self.assertEqual([call['name'] for call in prompt['refused']], ['shell'])
 
     def test_a_call_is_judged_with_the_files_it_runs_that_the_turn_wrote(self):
         def shell_danger(body, id):
@@ -1166,7 +1224,8 @@ class AutoApproverTests(ModelFixture):
         # A file too large to show is shown by its size, and what it does is
         # not known: a call that runs it is not allowed on the judge's word.
         self.assertTrue(self.denial(daemon, turn, 'script-3').startswith('not reviewed whole'))
-        # Nor is a write too large to show whole.
+        # Nor is a write too large to show whole: a call need not name the
+        # file to run it (a Makefile, a hook).
         self.assertTrue(self.denial(daemon, turn, 'script-4').startswith('not reviewed whole'))
         asked = [self.judge.requests.get(timeout=5)['body'] for _ in range(5)]
         [shell] = asked[1]['state']['planned_calls']
