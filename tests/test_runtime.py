@@ -251,6 +251,27 @@ class Model(http.server.BaseHTTPRequestHandler):
                     text = 'done'
                     output = [{'type': 'message', 'role': 'assistant',
                                'content': [{'type': 'output_text', 'text': text}]}]
+            elif user.startswith(('rewait:', 'liftwait:')):
+                # Calls this turn: a `liftwait:` command in the foreground,
+                # then a wait on any handle a result names, again while one
+                # is pending, then the last result echoed.
+                start = max(n for n, i in enumerate(request['input']) if i.get('role') == 'user'
+                            and not i['content'][0]['text'].startswith('steer:'))
+                outputs = [json.loads(i['output']) for i in request['input'][start:]
+                           if i.get('type') == 'function_call_output']
+                calls = sum(i.get('type') == 'function_call' for i in request['input'][start:])
+                handle = next((o['handle'] for o in outputs if 'handle' in o), user.split(':', 1)[1])
+                text = ''
+                if user.startswith('liftwait:') and not outputs:
+                    output = [{'type': 'function_call', 'name': 'shell', 'call_id': 'lift-1',
+                               'arguments': json.dumps({'command': user[9:], 'timeout_ms': 5000})}]
+                elif not outputs or outputs[-1].get('pending') or 'handle' in outputs[-1]:
+                    output = [{'type': 'function_call', 'name': 'wait', 'call_id': f'wait-{calls + 1}',
+                               'arguments': json.dumps({'handles': [handle]})}]
+                else:
+                    text = 'echo:' + json.dumps(outputs[-1])
+                    output = [{'type': 'message', 'role': 'assistant',
+                               'content': [{'type': 'output_text', 'text': text}]}]
             elif user == 'cached:reused-call':
                 text = ''
                 output = [{'type': 'function_call', 'name': 'echo', 'call_id': 'same-id',

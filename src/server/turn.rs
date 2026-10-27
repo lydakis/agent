@@ -187,11 +187,55 @@ pub struct Turn {
     /// the boundary before it reads, so unrelated bots never pay for one
     /// bot's pending steer.
     pub steers: Arc<AtomicBool>,
+    /// A `steer` for this turn, which moves a foreground command it is
+    /// running to the background.
+    pub lift: Arc<Lift>,
     pub tokens: Arc<TokenTotals>,
     /// Results this turn's `read` found on the bot's lineage.
     pub read_results: std::sync::Mutex<Vec<i64>>,
     /// What summaries held and spent beside the turn's own accounting.
     pub side: SideCounts,
+}
+
+/// A steer waiting for the running turn's next boundary. Armed by `steer`
+/// delivery alone and cleared where the boundary reads steers. A
+/// foreground command running while it is armed moves to the background
+/// and returns its handle, so no command holds a steer back; nothing is
+/// killed, and the bot waits on the handle if it still wants the result.
+#[derive(Default)]
+pub struct Lift {
+    armed: AtomicBool,
+    notify: Notify,
+}
+impl Lift {
+    pub fn arm(&self) {
+        self.armed.store(true, Relaxed);
+        self.notify.notify_waiters();
+    }
+    fn clear(&self) {
+        self.armed.store(false, Relaxed);
+    }
+    /// Once armed, and LIFT_GRACE later: a command that ends that soon
+    /// returns as usual, so a quick one never becomes a handle.
+    async fn lifted(&self) {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.armed.load(Relaxed) {
+                break;
+            }
+            notified.await;
+        }
+        tokio::time::sleep(LIFT_GRACE).await;
+    }
+}
+const LIFT_GRACE: Duration = Duration::from_millis(250);
+
+/// A tool's result, or the command a steer moved to the background.
+enum Ran<F> {
+    Done(Result<Outcome>),
+    Lifted(std::pin::Pin<Box<F>>),
 }
 
 /// Provider-reported tokens across every turn since the daemon started:
@@ -1873,7 +1917,20 @@ impl Turn {
                             _ => None,
                         })
                         .collect();
-                    let outcome = Outcome::text(wait_result(for_model(results)).to_string());
+                    // Ended early by a steer: the steer comes next, and
+                    // the pending handles stay valid for another wait.
+                    let steered = results.values().any(|result| result["pending"] == true) && {
+                        let bot = self.bot.clone();
+                        self.store
+                            .read("joining_steer", move |db| db.joining_steer(&bot))
+                            .await
+                            .unwrap_or(false)
+                    };
+                    let mut result = wait_result(for_model(results));
+                    if steered {
+                        result["steered"] = json!(true);
+                    }
+                    let outcome = Outcome::text(result.to_string());
                     let id = waiting.call_id.clone();
                     self.store
                         .op("tool_finish", move |db| {
@@ -2400,6 +2457,7 @@ impl Turn {
         let retry = capped.is_some_and(|at| {
             reserved.bytes < at.ahead.bytes || reserved.items < at.ahead.items || whole && !at.whole
         });
+        self.lift.clear();
         if !self.steers.swap(false, Relaxed) && !retry {
             return Ok(false);
         }
@@ -2831,27 +2889,40 @@ impl Turn {
     /// Run a prepared tool, refreshing the last model call's prompt cache
     /// each time it has sat unread for `after`. The outer error is the
     /// runtime's; the inner one is the tool's result.
-    async fn run_tool(
+    /// Run a tool while keeping the cache warm. With `lift`, a steer moves
+    /// the run to the background instead, handed back unfinished.
+    async fn run_tool<F: Future<Output = Result<Outcome>>>(
         &self,
-        prepared: Prepared,
-        workspace: &std::path::Path,
-        environment: &[(String, String)],
+        run: F,
+        lift: Option<&Lift>,
         warm: Option<&mut Warm<'_>>,
-    ) -> Result<Result<Outcome>> {
+    ) -> Result<Ran<F>> {
         enum Next {
             Ran(Result<Outcome>),
+            Lifted,
             Refreshed(Result<(agent_runtime::provider::Usage, tokio::time::Instant)>),
         }
-        let run = self.registry.execute(prepared, workspace, environment);
-        let Some(warm) = warm.filter(|warm| !warm.stopped) else {
-            return Ok(run.await);
+        let mut run = Box::pin(run);
+        let lifted = async {
+            match lift {
+                Some(lift) => lift.lifted().await,
+                None => std::future::pending().await,
+            }
         };
-        tokio::pin!(run);
+        tokio::pin!(lifted);
+        let Some(warm) = warm.filter(|warm| !warm.stopped) else {
+            return Ok(tokio::select! {
+                biased;
+                result = &mut run => Ran::Done(result),
+                () = &mut lifted => Ran::Lifted(run),
+            });
+        };
         loop {
             if warm.pending.is_none() {
                 tokio::select! {
                     biased;
-                    result = &mut run => return Ok(result),
+                    result = &mut run => return Ok(Ran::Done(result)),
+                    () = &mut lifted => return Ok(Ran::Lifted(run)),
                     () = tokio::time::sleep_until(warm.read_at + warm.after) => {}
                 }
                 *warm.pending = Some(self.refresh(warm));
@@ -2861,18 +2932,22 @@ impl Turn {
                 tokio::select! {
                     biased;
                     result = &mut run => Next::Ran(result),
+                    () = &mut lifted => Next::Lifted,
                     joined = task => Next::Refreshed(joined.unwrap_or_else(|_| fail("keep_warm_lost"))),
                 }
             };
             match next {
-                // The tool's result ends the refreshes. One already sent is
-                // billed, so it is answered and recorded; an unsent one is
-                // dropped at no cost.
-                Next::Ran(result) => {
+                // The tool's result ends the refreshes, as does handing it to
+                // the background. One already sent is billed, so it is
+                // answered and recorded; an unsent one is dropped at no cost.
+                Next::Ran(_) | Next::Lifted => {
                     if let Some(refreshed) = settle(warm.pending).await {
                         self.refreshed(warm, refreshed).await?;
                     }
-                    return Ok(result);
+                    return Ok(match next {
+                        Next::Ran(result) => Ran::Done(result),
+                        _ => Ran::Lifted(run),
+                    });
                 }
                 Next::Refreshed(refreshed) => {
                     *warm.pending = None;
@@ -2880,7 +2955,11 @@ impl Turn {
                 }
             }
             if warm.stopped {
-                return Ok(run.await);
+                return Ok(tokio::select! {
+                    biased;
+                    result = &mut run => Ran::Done(result),
+                    () = &mut lifted => Ran::Lifted(run),
+                });
             }
         }
     }
@@ -3141,13 +3220,43 @@ impl Turn {
                         }
                     }
                 }
+                Ok(Prepared::Shell {
+                    command,
+                    timeout_ms,
+                    background: false,
+                }) => {
+                    let run = self.registry.foreground(
+                        command,
+                        workspace.to_path_buf(),
+                        timeout_ms,
+                        environment.to_vec(),
+                    );
+                    match self
+                        .run_tool(run, Some(&self.lift), warm.as_deref_mut())
+                        .await?
+                    {
+                        Ran::Done(Ok(outcome)) => annotate(outcome, turn, &call.call_id),
+                        Ran::Done(Err(error)) if error.code == "tool_scheduler_closed" => {
+                            return Err(error);
+                        }
+                        Ran::Done(Err(error)) => failure(error),
+                        Ran::Lifted(run) => self.lift_shell(&call.call_id, run).await?,
+                    }
+                }
                 Ok(prepared) => match self
-                    .run_tool(prepared, workspace, environment, warm.as_deref_mut())
+                    .run_tool(
+                        self.registry.execute(prepared, workspace, environment),
+                        None,
+                        warm.as_deref_mut(),
+                    )
                     .await?
                 {
-                    Ok(outcome) => annotate(outcome, turn, &call.call_id),
-                    Err(error) if error.code == "tool_scheduler_closed" => return Err(error),
-                    Err(error) => failure(error),
+                    Ran::Done(Ok(outcome)) => annotate(outcome, turn, &call.call_id),
+                    Ran::Done(Err(error)) if error.code == "tool_scheduler_closed" => {
+                        return Err(error);
+                    }
+                    Ran::Done(Err(error)) => failure(error),
+                    Ran::Lifted(_) => unreachable!("only a command moves to the background"),
                 },
                 Err(error) => failure(error),
             };
@@ -3474,6 +3583,39 @@ impl Turn {
         let (sender, receiver) = oneshot::channel();
         self.registry
             .background(command, workspace, timeout_ms, environment, queued, sender);
+        self.collect(id, call_id, receiver);
+        Ok(Outcome::text(
+            json!({"handle":format!("proc:{id}"),"background":true}).to_string(),
+        ))
+    }
+
+    /// Move a running foreground command to the background: it keeps its
+    /// process slot and timeout, and its result arrives on a proc handle as
+    /// a background command's does. A failure to record it drops the
+    /// command, which kills it.
+    async fn lift_shell<F>(&self, call_id: &str, run: std::pin::Pin<Box<F>>) -> Result<Outcome>
+    where
+        F: Future<Output = Result<Outcome>> + Send + 'static,
+    {
+        let (turn, started) = (self.turn, call_id.to_owned());
+        let id = self
+            .store
+            .op("process_start", move |db| db.process_start(turn, &started))
+            .await?;
+        let (sender, receiver) = oneshot::channel();
+        tokio::spawn(async move {
+            let _ = sender.send(run.await);
+        });
+        self.collect(id, call_id, receiver);
+        Ok(Outcome::text(
+            json!({"handle":format!("proc:{id}"),"background":true,"steered":true}).to_string(),
+        ))
+    }
+
+    /// Record a background command's result when it arrives and wake those
+    /// waiting on its handle.
+    fn collect(&self, id: i64, call_id: &str, receiver: oneshot::Receiver<Result<Outcome>>) {
+        let turn = self.turn;
         let (store, handles, failures, call_id_for_refs) = (
             self.store.clone(),
             self.handles.clone(),
@@ -3512,9 +3654,6 @@ impl Turn {
                 }
             }
         });
-        Ok(Outcome::text(
-            json!({"handle":format!("proc:{id}"),"background":true}).to_string(),
-        ))
     }
 }
 
@@ -4275,6 +4414,7 @@ mod tests {
             settings: Default::default(),
             resumed: None,
             steers: Arc::new(AtomicBool::new(true)),
+            lift: Arc::default(),
             tokens: Arc::default(),
             read_results: Default::default(),
             side: Default::default(),

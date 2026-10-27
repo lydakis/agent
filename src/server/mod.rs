@@ -883,6 +883,8 @@ struct Active {
     /// Set to the error the cancelled turn ends with.
     cancel: watch::Sender<Option<&'static str>>,
     steers: Arc<std::sync::atomic::AtomicBool>,
+    /// Armed by a `steer` alone, never by other deliveries.
+    lift: Arc<turn::Lift>,
 }
 impl Active {
     /// Cancel the turn with `code` unless a cause is already set: the first
@@ -1110,20 +1112,19 @@ pub async fn run(config: Configuration) -> Result<()> {
         .op("waiting_turns", |db| {
             // Every turn's lapse in one read, not one query per parked turn.
             let lapses = db.lapses()?;
-            Ok(db
-                .waiting_turns()?
+            db.waiting_turns()?
                 .into_iter()
                 .map(|w| {
-                    let lapse = match w.approval || w.paced_since_ms.is_some() {
-                        true => None,
-                        false => lapses.get(&w.turn).copied(),
-                    };
-                    (w, lapse)
+                    let own = !w.approval && w.paced_since_ms.is_none();
+                    let lapse = own.then(|| lapses.get(&w.turn).copied()).flatten();
+                    // A steer sent while the daemon was down wakes the wait.
+                    let steered = own && db.joining_steer(&w.bot)?;
+                    Ok((w, lapse, steered))
                 })
-                .collect::<Vec<_>>())
+                .collect::<Result<Vec<_>>>()
         })
         .await?;
-    for (waiting, lapse) in parked {
+    for (waiting, lapse, steered) in parked {
         if waiting.paced_since_ms.is_some() {
             wakes.set(waiting.deadline_ms.unwrap_or(0), waiting.bot, waiting.turn);
             continue;
@@ -1155,6 +1156,9 @@ pub async fn run(config: Configuration) -> Result<()> {
                 },
             )
             .await;
+        if steered {
+            handles.wake(waiting.bot, waiting.turn);
+        }
     }
     let mut service = Service {
         store,
@@ -1648,7 +1652,8 @@ impl Service {
             self.spawn(bot.clone(), started.turn, None, steered);
         }
         // The running turn may have started after the steer was queued, from
-        // an admission answered in between.
+        // an admission answered in between. A command it is running moves
+        // to the background so the steer reaches it now.
         if started.fresh
             && started.status == "queued"
             && delivery == Delivery::Steer
@@ -1657,6 +1662,16 @@ impl Service {
             active
                 .steers
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+            if started.joins {
+                active.lift.arm();
+            }
+        }
+        // A steer for a turn parked on `wait` wakes it; the handles it
+        // waits on are reported pending and stay valid.
+        if started.fresh
+            && let Some(parked) = started.parked
+        {
+            self.handles.wake(bot.clone(), parked);
         }
         if started.status == "ready" {
             self.ready_hint = true;
@@ -1868,6 +1883,7 @@ impl Service {
         // The job that started this turn said whether a steer waits for it;
         // afterwards only a steer for this bot sets the flag.
         let steers = Arc::new(std::sync::atomic::AtomicBool::new(steers));
+        let lift = Arc::new(turn::Lift::default());
         self.active.insert(
             bot.clone(),
             Active {
@@ -1875,6 +1891,7 @@ impl Service {
                 task: task_id,
                 cancel,
                 steers: steers.clone(),
+                lift: lift.clone(),
             },
         );
         let task = Turn {
@@ -1890,6 +1907,7 @@ impl Service {
             settings: Default::default(),
             resumed,
             steers,
+            lift,
             tokens: self.tokens.clone(),
             read_results: Default::default(),
             side: Default::default(),
@@ -1942,7 +1960,20 @@ impl Service {
                 self.wakes.set(at, bot, turn)
             }
             turn::Exit::Paced(_) => {}
-            turn::Exit::Parked => {}
+            // A steer committed while the turn was parking found it still
+            // running, so its wake-up comes from here. A failed read leaves
+            // the steer for the wait's end, as before.
+            turn::Exit::Parked => {
+                let name = bot.clone();
+                if let Ok(Some(parked)) = self
+                    .store
+                    .read("steered_park", move |db| db.steered_park(&name))
+                    .await
+                    && parked == turn
+                {
+                    self.handles.wake(bot, turn);
+                }
+            }
         }
         Ok(())
     }
@@ -3177,6 +3208,7 @@ mod tests {
             task: 1,
             cancel,
             steers: Arc::default(),
+            lift: Arc::default(),
         };
         assert!(active.cancel(turn::INTERRUPTED));
         assert!(active.cancel(turn::SHUTDOWN));
@@ -3486,6 +3518,7 @@ mod tests {
                     task: 1,
                     cancel,
                     steers: Arc::default(),
+                    lift: Arc::default(),
                 },
             )]),
             next_task: 1,
@@ -3690,6 +3723,7 @@ mod tests {
                             task: 0,
                             cancel: watch::channel(None).0,
                             steers: Arc::default(),
+                            lift: Arc::default(),
                         },
                     )
                 })

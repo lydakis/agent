@@ -84,7 +84,7 @@ impl Tool {
                 "properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}),
             ),
             Tool::Shell => (
-                "Run a noninteractive /bin/sh command in the workspace. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with the full output retained. Default timeout 120 s, maximum 600 s; a command that times out returns its output so far with timed_out. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. A background command runs until it exits, times out, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing kills or tracks it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. Use detach for a server or service that must keep running, and stop it yourself with kill.",
+                "Run a noninteractive /bin/sh command in the workspace. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with the full output retained. Default timeout 120 s, maximum 600 s; a command that times out returns its output so far with timed_out. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, times out, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing kills or tracks it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. Use detach for a server or service that must keep running, and stop it yourself with kill.",
                 json!({"type":"object","properties":{"command":{"type":"string"},
                 "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_SHELL_TIMEOUT_MS},
                 "background":{"type":"boolean"},"detach":{"type":"boolean"}},
@@ -118,7 +118,7 @@ impl Tool {
                 "required":["text"],"additionalProperties":false}),
             ),
             Tool::Wait => (
-                "Suspend until every handle resolves, without holding any execution capacity. Handles are 'turn:BOT/N' (a peer agent's turn, printed by run --detach) or 'proc:N' (a background shell). Each result reports the outcome: a peer's status and final text, or a process's output and exit code. With timeout_ms, unresolved handles are reported as pending and stay valid for a later wait; 0 polls without waiting. With any: true, the first resolved handle ends the wait and the rest are reported pending.",
+                "Suspend until every handle resolves, without holding any execution capacity. Handles are 'turn:BOT/N' (a peer agent's turn, printed by run --detach) or 'proc:N' (a background shell). Each result reports the outcome: a peer's status and final text, or a process's output and exit code. With timeout_ms, unresolved handles are reported as pending and stay valid for a later wait; 0 polls without waiting. With any: true, the first resolved handle ends the wait and the rest are reported pending. A steer ends the wait at once with steered=true: unresolved handles are reported pending and stay valid, so wait again to keep waiting.",
                 json!({"type":"object","properties":{"handles":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":64},
                 "timeout_ms":{"type":"integer","minimum":0,"maximum":MAX_WAIT_TIMEOUT_MS},"any":{"type":"boolean"}},
                 "required":["handles"],"additionalProperties":false}),
@@ -690,20 +690,13 @@ impl Registry {
                 timeout_ms,
                 background: false,
             } => {
-                let _slot = self
-                    .slots
-                    .acquire()
-                    .await
-                    .map_err(|_| Error::new("tool_scheduler_closed"))?;
-                let (stdout, stderr, exit) = shell(
-                    &command,
-                    workspace,
-                    Duration::from_millis(timeout_ms),
-                    self,
-                    environment,
+                self.foreground(
+                    command,
+                    workspace.to_path_buf(),
+                    timeout_ms,
+                    environment.to_vec(),
                 )
-                .await?;
-                Ok(self.shell_outcome(stdout, stderr, exit))
+                .await
             }
             Prepared::Read {
                 source: ReadSource::Artifact { .. } | ReadSource::Result { .. },
@@ -812,6 +805,34 @@ impl Registry {
             artifacts,
             note: None,
             failed: !success,
+        }
+    }
+
+    /// A foreground command, owning everything it uses so a running one
+    /// can be moved to a task of its own. Dropping it kills the command.
+    pub fn foreground(
+        &self,
+        command: String,
+        workspace: PathBuf,
+        timeout_ms: u64,
+        environment: Vec<(String, String)>,
+    ) -> impl Future<Output = Result<Outcome>> + Send + 'static {
+        let registry = self.clone();
+        async move {
+            let _slot = registry
+                .slots
+                .acquire()
+                .await
+                .map_err(|_| Error::new("tool_scheduler_closed"))?;
+            let (stdout, stderr, exit) = shell(
+                &command,
+                &workspace,
+                Duration::from_millis(timeout_ms),
+                &registry,
+                &environment,
+            )
+            .await?;
+            Ok(registry.shell_outcome(stdout, stderr, exit))
         }
     }
 
