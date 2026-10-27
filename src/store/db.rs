@@ -6450,19 +6450,17 @@ impl Database {
         }
         Ok(page)
     }
-    /// Remove an idle bot with everything only it owns: its turns, tool
-    /// intents, processes, artifacts, events, checkpoints, and the history
-    /// nodes no other bot's lineage reaches. Shared prefixes stay for forks.
-    /// Remove a bot and everything only it owns, running every piece to
-    /// completion on this thread. Services run the pieces as separate jobs.
-    /// The earliest time an idle bot may be due for deletion, in
-    /// milliseconds since the epoch. A turn's end only moves a bot's time
-    /// later, so a sweep at this time is never late.
-    pub fn next_expiry(&self) -> Result<Option<i64>> {
+    /// The earliest time after `now` an idle bot may be due for deletion, in
+    /// milliseconds since the epoch, and whether any is due by `now`. A
+    /// turn's end only moves a bot's time later, so a sweep at the earliest
+    /// time is never late.
+    pub fn next_expiry(&self, now: i64) -> Result<(Option<i64>, bool)> {
         Ok(self.conn.query_row(
-            "SELECT MIN(expires_at) FROM bots WHERE expires_at IS NOT NULL AND status!='deleting'",
-            [],
-            |r| r.get(0),
+            "SELECT MIN(CASE WHEN expires_at>?1 THEN expires_at END),
+                    COALESCE(MAX(expires_at<=?1),0)
+             FROM bots WHERE expires_at IS NOT NULL AND status!='deleting'",
+            [now],
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )?)
     }
     /// Up to `limit` bots, by name and identity, whose idle time ran out by
@@ -6483,6 +6481,11 @@ impl Database {
             .query_map(params![now, limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?)
     }
+    /// Remove an idle bot with everything only it owns: its turns, tool
+    /// intents, processes, artifacts, events, checkpoints, and the history
+    /// nodes no other bot's lineage reaches. Shared prefixes stay for forks.
+    /// Remove a bot and everything only it owns, running every piece to
+    /// completion on this thread. Services run the pieces as separate jobs.
     pub fn delete_bot(&mut self, name: &str) -> Result<Value> {
         let (id, mut piece) = self.start_delete_bot(name, Self::RETENTION_PIECE)?;
         let mut totals = json!({"turns":0,"events":0,"nodes":0});

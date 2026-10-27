@@ -1675,17 +1675,20 @@ impl Service {
 
     /// When the store's earliest idle bot is due. One already due is
     /// looked at after `overdue`: at once when nothing has looked yet, later
-    /// when a look left it, still busy or still being deleted.
+    /// when a look left it, still busy or still being deleted, and never
+    /// after another bot's time comes.
     async fn plan_expiry(&mut self, overdue: Duration) -> Result<()> {
-        let next = self
+        let wall = now_ms();
+        let (next, due) = self
             .store
-            .read("next_expiry", |db| db.next_expiry())
+            .read("next_expiry", move |db| db.next_expiry(wall as i64))
             .await?;
-        let (now, wall) = (tokio::time::Instant::now(), now_ms());
-        self.expiry = next.map(|at| match u64::try_from(at).ok() {
-            Some(at) if at > wall => now + Duration::from_millis(at - wall),
-            _ => now + overdue,
-        });
+        let now = tokio::time::Instant::now();
+        let next = next.map(|at| now + Duration::from_millis((at as u64).saturating_sub(wall)));
+        self.expiry = [next, due.then_some(now + overdue)]
+            .into_iter()
+            .flatten()
+            .min();
         Ok(())
     }
 

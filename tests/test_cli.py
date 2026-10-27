@@ -300,7 +300,7 @@ class SocketAndCliTests(ModelFixture):
         for flags in (f"--delivery steer --turn {busy['turn']}", '--delivery queue'):
             self.assertIn(flags, refused.stderr + refused.stdout)
         self.assertNotIn('expected_turn', refused.stderr + refused.stdout)
-        fork = re.search(r"run (--fork=Bob) --bot NEW --allow '' --expires 15m -- QUESTION",
+        fork = re.search(r"run --detach (--fork=Bob) --bot NEW --allow '' --expires 15m -- QUESTION",
                          refused.stderr + refused.stdout)
         self.assertIsNotNone(fork, refused.stderr + refused.stdout)
         side = self.agent('run', '--store', str(self.store), fork.group(1), '--bot', 'Side', '--allow=',
