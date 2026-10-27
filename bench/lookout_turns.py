@@ -162,8 +162,9 @@ def every(row):
     if quoted:
         lines.append("A quoted message is the person's own words.")
     lines.append('Read the turns you need with one wait call (timeout_ms 0), and act where something changes '
-                 'the work. Tell the person only what they need to know or decide; if nothing, end your turn '
-                 'with an empty reply.')
+                 'the work. Tell the person, briefly, what they would want to hear: the outcome of work you '
+                 'started for them, what they need to decide, and where their latest words leave what they '
+                 'mean unclear. If nothing, end your turn with an empty reply.')
     return '\n'.join(lines)
 
 

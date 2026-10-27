@@ -201,7 +201,7 @@ class LookoutTests(ModelFixture):
         self.assertIsNotNone(woke, 'the lead was not woken')
         self.assertIn('- calc.fix: turn:calc.fix/', woke)
         self.assertIn(' completed, asked by tasks', woke)
-        self.assertIn('if nothing, end your turn with an empty reply', woke)
+        self.assertIn('If nothing, end your turn with an empty reply', woke)
         # Resting, the lead hears it unjudged.
         self.assertTrue(self.asked.empty())
         # The other project's lead heard nothing of calc's task, nor of its

@@ -149,7 +149,7 @@ Task updates: what happened in your tasks since you last heard; the wait tool re
 The person asked for these in the task themselves, so they are theirs:
 - calc.ui: turn:calc.ui/2 completed, asked by the person
 A quoted message is the person's own words.
-Read the turns you need with one wait call (timeout_ms 0), and act where something changes the work. Tell the person only what they need to know or decide; if nothing, end your turn with an empty reply.
+Read the turns you need with one wait call (timeout_ms 0), and act where something changes the work. Tell the person, briefly, what they would want to hear: the outcome of work you started for them, what they need to decide, and where their latest words leave what they mean unclear. If nothing, end your turn with an empty reply.
 ```
 
 A note that steers a busy lead lists what was picked first, under "Picked
