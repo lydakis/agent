@@ -958,7 +958,7 @@ struct Running {
 
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, unlisted.
-const COMMANDS: [(&str, &str); 10] = [
+const COMMANDS: [(&str, &str); 11] = [
     (
         "/side",
         "a side chat with a copy of this agent, which carries on",
@@ -967,6 +967,7 @@ const COMMANDS: [(&str, &str); 10] = [
     ("/approvals", "whether calls wait for a verdict"),
     ("/instructions", "the lead's, from its folder again"),
     ("/status", "this project's agents"),
+    ("/lookout", "what the lookout watches for this agent"),
     ("/sound", "the chime when work ends, on or off"),
     (
         "/copies",
@@ -3314,6 +3315,12 @@ impl App {
             } else {
                 self.status().await;
             }
+            return;
+        }
+        if prompt == "/lookout" {
+            self.input.clear();
+            let lines = lookout::subscriptions(&self.options.store, &self.bot);
+            self.commit(lines.into_iter().map(|l| Line::from(l).dim()).collect());
             return;
         }
         if prompt == "/open" {

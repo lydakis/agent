@@ -24,7 +24,7 @@ class LookoutTests(ModelFixture):
                 return None
             body = json.loads(user)
             self.asked.put((request, body))
-            return json.dumps({q: (0.9 if q == 'result' else 0.1) for q in body['questions']})
+            return json.dumps({q: (0.9 if q in ('result', 'look_0') else 0.1) for q in body['questions']})
         self.model.reply_for = reply
         self.model.models = ('synthetic-model', 'judge-model')
         self.sonny = self.binary.parent / 'sonny'
@@ -71,6 +71,24 @@ class LookoutTests(ModelFixture):
                             instructions='Do anything.', tools=['echo'])
         self.assertIn('is a bot that is not a lookout judge', replay()['Ended']['failed'])
 
+    def test_a_check_of_the_person_s_words_reads_what_passed_before(self):
+        self.make('calc.lead', 'calc.fix')
+        for n, prompt in enumerate(['fix the parser', 'no, the lexer']):
+            turn = self.daemon.request('submit', bot='calc.fix', request_id=f'p{n}', prompt=prompt)['result']['turn']
+            self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
+        out = self.lookout('--replay', '--judge', 'openai/judge-model')
+        self.assertEqual(out.returncode, 0, out.stderr)
+        bodies = []
+        while not self.asked.empty():
+            bodies.append(self.asked.get()[1])
+        said = [b for b in bodies if b['input']['event'].get('text') == 'no, the lexer']
+        self.assertEqual(len(said), 1, bodies)
+        self.assertIn('drifts', said[0]['questions'])
+        self.assertEqual(said[0]['input']['exchange'], [
+            {'from': 'the person', 'text': 'fix the parser'},
+            {'from': 'the task', 'text': 'reply:fix the parser'},
+        ])
+
     def test_one_lookout_wakes_each_lead_whose_task_has_news(self):
         self.make('calc.lead', 'calc.fix', 'shop.lead')
         service = subprocess.Popen([str(self.sonny), 'lookout', '--judge', 'openai/judge-model',
@@ -102,6 +120,56 @@ class LookoutTests(ModelFixture):
         self.assertEqual(self.daemon.request('turns', bot='shop.lead')['result']['turns'], [])
         log = [json.loads(line) for line in (self.path / 'state.sqlite.lookout.jsonl').read_text().splitlines()]
         self.assertTrue(any(line.get('woke') and line['lead'] == 'calc.lead' for line in log), log)
+
+    def start(self):
+        service = subprocess.Popen([str(self.sonny), 'lookout', '--judge', 'openai/judge-model',
+                                    '--store', str(self.path / 'state.sqlite'),
+                                    '--socket', str(self.daemon.socket_path)],
+                                   env={**clean_env(), 'HOME': str(self.path)}, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (service.kill(), service.wait(timeout=5), service.stdout.close()))
+        self.assertEqual(json.loads(service.stdout.readline())['event'], 'watching')
+        return service
+
+    def note_for(self, bot, timeout=30):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            for turn in self.daemon.request('turns', bot=bot)['result']['turns']:
+                text = self.daemon.request('prompts', bot=bot, turn=turn['turn'])['result']['prompts']
+                if text and text[0]['text'].startswith('Task updates: '):
+                    return text[0]['text']
+            time.sleep(.2)
+        return None
+
+    def test_a_bot_that_is_no_lead_hears_what_it_subscribed_to(self):
+        self.make('reviewer', 'ops.deploy')
+        store = ['--store', str(self.path / 'state.sqlite')]
+        # A bot changes only its own subscriptions.
+        refused = subprocess.run([str(self.sonny), 'lookout', 'add', 'deploys', '--for', 'reviewer', *store,
+                                  '--bot', 'ops.*'],
+                                 env={**clean_env(), 'HOME': str(self.path), 'AGENT_BOT': 'ops.deploy'},
+                                 capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn('only its own', refused.stderr)
+        added = subprocess.run([str(self.sonny), 'lookout', 'add', 'deploys', *store, '--bot', 'ops.*', '--on', 'ended',
+                                '--look-for', 'a finished deploy', '--then', 'tell the person'],
+                               env={**clean_env(), 'HOME': str(self.path), 'AGENT_BOT': 'reviewer'},
+                               capture_output=True, text=True, timeout=10)
+        self.assertEqual((added.returncode, json.loads(added.stdout)['added']), (0, True), added.stderr)
+        listed = subprocess.run([str(self.sonny), 'lookout', 'ls', '--for', 'reviewer', *store],
+                                env={**clean_env(), 'HOME': str(self.path)}, capture_output=True, text=True, timeout=10)
+        self.assertEqual(json.loads(listed.stdout)['subscriptions'][0]['bots'], ['ops.*'])
+        self.start()
+        time.sleep(1)
+        self.daemon.request('submit', bot='ops.deploy', request_id='d', prompt='ship it')
+        woke = self.note_for('reviewer')
+        self.assertIsNotNone(woke, 'the subscriber was not woken')
+        self.assertIn('- ops.deploy: turn:ops.deploy/', woke)
+        self.assertIn('deploys look-for 1 0.90; do what your deploys look-for 1 says', woke)
+        # Its own words stay in its file.
+        self.assertNotIn('tell the person', woke)
+        _, asked = self.asked.get(timeout=5)
+        self.assertEqual(list(asked['questions']), ['look_0'])
+        self.assertIn('a finished deploy', asked['questions']['look_0'])
 
 
 if __name__ == '__main__':

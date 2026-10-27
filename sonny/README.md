@@ -139,7 +139,9 @@ did in one "Task updates" note, by the handles its wait tool reads them
 with, and wakes it early only when one needs it: a message that redirects
 other tasks, a conflict, a stuck or silent task, a result the person should
 hear. It judges with `AGENT_JUDGE`, the approver's setting, so Bedrock alone
-is enough, and with no judge sends the task updates alone; see
+is enough, and with no judge sends the task updates alone. Any agent can
+subscribe to more with `sonny lookout add` (other agents' tasks, bots by
+name, questions of its own), and `/lookout` lists what it watches; see
 [docs/LOOKOUT.md](../docs/LOOKOUT.md).
 
 The look follows Codex's TUI (openai/codex, `codex-rs/tui`): finished history
