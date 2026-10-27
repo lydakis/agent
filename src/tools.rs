@@ -318,7 +318,11 @@ fn redact_secret_fields(text: String) -> String {
             if ends {
                 break;
             }
-            j += 1;
+            // An escaped quote is part of a quoted value.
+            j = match (quote, b) {
+                (Some(_), b'\\') => (j + 2).min(bytes.len()),
+                _ => j + 1,
+            };
         }
         let value = &text[from..j];
         // Code names a type or a variable there; a key mixes in digits.
@@ -1445,6 +1449,12 @@ mod tests {
             redact("export OPENAI_API_KEY=fake-5fake-5fake; echo ok"),
             "export OPENAI_API_KEY=[REDACTED]; echo ok"
         );
+        // An escaped quote is inside the value, not its end.
+        assert_eq!(
+            redact(r#"{"password":"a\"fake7fake7fake7","user":"me"}"#),
+            r#"{"password":"[REDACTED]","user":"me"}"#
+        );
+        assert_eq!(redact(r#"password: "x\"#), r#"password: "x\"#);
         // Names that only resemble one, short values, and code keep theirs.
         for kept in [
             "NextToken: page6page6page6",
