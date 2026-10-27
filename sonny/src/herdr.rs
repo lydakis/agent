@@ -259,6 +259,8 @@ pub struct Herdr {
     here: bool,
     /// The pane Sonny runs in, by its current ID.
     me: Option<String>,
+    /// Whether the workspace was made just now.
+    made: bool,
 }
 
 /// A word as a POSIX shell reads it back, for `pane run`, which types its
@@ -322,6 +324,7 @@ impl Herdr {
             name: label.to_owned(),
             here: false,
             me: None,
+            made: false,
         };
         let workspaces: Vec<(String, String)> = herdr
             .call(&["workspace", "list"])?
@@ -369,6 +372,7 @@ impl Herdr {
                     let id = made["workspace"]["workspace_id"]
                         .as_str()
                         .ok_or("herdr workspace create: no workspace_id")?;
+                    herdr.made = true;
                     (id.to_owned(), label.to_owned())
                 }
             },
@@ -396,6 +400,10 @@ impl Backend for Herdr {
 
     fn here(&self) -> bool {
         self.here
+    }
+
+    fn made(&self) -> bool {
+        self.made
     }
 
     fn blocks(&self) -> Vec<Block> {
@@ -697,7 +705,7 @@ if out is not None:
                 "tests",
                 cwd,
                 &["cargo".into(), "test it's".into()],
-                false,
+                Some("below"),
             )
             .unwrap();
         let calls = calls(&dir);
@@ -814,7 +822,7 @@ if out is not None:
                 "tests",
                 Path::new("/tmp"),
                 &["echo".into(), "it's done".into()],
-                false,
+                Some("below"),
             )
             .unwrap();
         layout
@@ -823,7 +831,7 @@ if out is not None:
                 "server",
                 Path::new("/tmp"),
                 &["echo".into(), "serving".into()],
-                true,
+                None,
             )
             .unwrap();
         let left = Placement::Split {

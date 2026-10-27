@@ -48,7 +48,7 @@ notifies, `herdr agent wait` and `herdr agent prompt` reach it by name
 (`shop-fix-cart` for `shop.fix-cart`), and after a Herdr restart the pane runs
 `sonny` on the same bot again (when `sonny` is on the PATH). The place a
 project was laid out in is kept in `~/.agent/sonny/places`, so an agent's
-`sonny split` and `sonny show` go to that Herdr workspace or Rex session, in
+`sonny run` and `sonny show` go to that Herdr workspace or Rex session, in
 that multiplexer, rather than one guessed from the agent's shell, which runs
 in the daemon and is in neither. A task's window
 closes once its work is taken: its turn completed and the lead (or the task
@@ -58,9 +58,22 @@ run `sonny --bot NAME`. `--rex-host HOST` puts the session on another Rex
 server; `--no-layout` turns the layout off. Sonny writes the skill for the
 multiplexer it runs in to `~/.agents/skills` (`rex-windows` or
 `herdr-panes`, from `skills/`), so any agent can run a long command where
-the person can watch it, and read it back: `sonny split NAME [--window] --
-COMMAND...` opens a block labelled `AGENT/NAME` below the agent's own (or
-in a tab of its own) and prints its ID. Herdr has no exit status to wait
+the person can watch it, and read it back: `sonny run NAME [--split
+right|left|above|below] -- COMMAND...` opens a block labelled `AGENT/NAME`
+in a tab of its own (or on that side of the agent's own block) and prints
+its ID. `sonny show TASK [--split SIDE [--beside BOT] | --window]` moves a
+task's window. Tabs are the default; the skills tell agents to split only
+to show the person something now, such as a server's or a tool's output, or
+an agent to watch beside them. Sessions are for leads, tabs and splits for
+their tasks: `sonny show PROJECT.lead`, from another project's lead (one
+that leads the projects in its folder), opens that lead's Sonny in its own
+project's session or workspace, made when needed in the same multiplexer,
+and leaves one already open alone. Sonny never lays another project's lead,
+or its tasks, out in this one's home. `sonny --bot PROJECT.lead` anywhere is
+that lead's Sonny too, laying out its tasks where it runs. Opened in a
+session that already holds other work, Sonny takes that session as the
+project's home and leaves the rest alone: tasks get tabs of their own, and a
+tab that holds the person's own panes keeps its name. Herdr has no exit status to wait
 for, so its skill has agents end such a command with a line to wait for.
 The skill tells agents to close what they opened once read; whatever a task
 left open closes with its window.
