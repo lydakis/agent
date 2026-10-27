@@ -87,7 +87,8 @@ printed at once, and as soon as it ends the agent is given it too, in
 Codex's `<user_shell_command>` record (the command, its exit code and its
 output, a long output's start and end), and answers it as Claude Code's
 does: an idle agent in a turn of its own, a busy one in its running turn,
-as a steer. Esc stops a command still running.
+as a steer. What it printed is not your words, so it approves nothing the
+agent then does. Esc stops a command still running.
 
 ![A command run with !, its output, and the agent answering it](../docs/sonny/shell-passthrough.gif)
 

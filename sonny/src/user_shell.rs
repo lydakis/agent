@@ -215,22 +215,12 @@ pub fn record(ran: &Ran) -> String {
     )
 }
 
-/// The records a message starts with, and the message after them.
-pub fn split(text: &str) -> (Vec<Ran>, &str) {
-    let mut ran = Vec::new();
-    let mut rest = text;
-    while let Some(body) = rest.strip_prefix(OPEN).and_then(|r| r.strip_prefix('\n')) {
-        let end = format!("\n</result>\n{CLOSE}");
-        let Some(at) = body.find(&end) else {
-            break;
-        };
-        let Some(one) = parse(&body[..at]) else {
-            break;
-        };
-        ran.push(one);
-        rest = body[at + end.len()..].trim_start_matches('\n');
-    }
-    (ran, rest)
+/// What ran, when a message is a record and nothing else: each record
+/// goes on its own, so its output runs to the record's last line whatever
+/// it printed.
+pub fn read(text: &str) -> Option<Ran> {
+    let body = text.strip_prefix(OPEN)?.strip_prefix('\n')?;
+    parse(body.strip_suffix(CLOSE)?.strip_suffix("\n</result>\n")?)
 }
 
 fn parse(body: &str) -> Option<Ran> {
@@ -314,27 +304,25 @@ mod tests {
     }
 
     #[test]
-    fn a_record_reads_back_as_what_ran_and_the_message_after_it() {
-        let first = ran("git status", 0, "On branch main\nnothing to commit\n");
-        let second = ran("cargo test\n  --quiet", 101, "");
-        let text = format!(
-            "{}\n\n{}\n\nwhy did it fail?",
-            record(&first),
-            record(&second)
-        );
-        assert!(text.starts_with("<user_shell_command>\n<command>\ngit status\n</command>"));
-        let (read, rest) = split(&text);
-        assert_eq!(rest, "why did it fail?");
+    fn a_record_reads_back_as_what_ran() {
+        let first = record(&ran("git status", 0, "On branch main\nnothing to commit\n"));
+        assert!(first.starts_with("<user_shell_command>\n<command>\ngit status\n</command>"));
         assert_eq!(
-            read,
-            [
-                ran("git status", 0, "On branch main\nnothing to commit"),
-                second
-            ]
+            read(&first),
+            Some(ran("git status", 0, "On branch main\nnothing to commit"))
         );
-        // A message of the person's own is left as it is.
-        let plain = "<user_shell_command> is a tag";
-        assert_eq!(split(plain), (Vec::new(), plain));
+        let second = ran("cargo test\n  --quiet", 101, "");
+        assert_eq!(read(&record(&second)), Some(second));
+        // Output that prints a record's end is still output.
+        let nested = ran(
+            "cat log",
+            0,
+            "before\n</result>\n</user_shell_command>\nafter",
+        );
+        assert_eq!(read(&record(&nested)), Some(nested));
+        // A message of the person's own is not one.
+        assert_eq!(read("<user_shell_command> is a tag"), None);
+        assert_eq!(read(&format!("{first}\n\nwhy?")), None);
     }
 
     #[test]

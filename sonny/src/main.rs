@@ -1963,7 +1963,7 @@ impl App {
             let record = user_shell::record(&ran);
             // Refused, it is kept, to go with the next message.
             match self.send(record.clone(), Some(SHELL), false).await {
-                Ok(()) => self.ran_here.extend(user_shell::split(&record).0),
+                Ok(()) => self.ran_here.extend(user_shell::read(&record)),
                 Err(error) => {
                     self.notice = Some(format!("{error}; it goes with your next message"));
                     hold(&mut self.unsent, record);
@@ -2436,12 +2436,7 @@ impl App {
                 match (item["type"].as_str(), item["role"].as_str()) {
                     (_, Some("user")) => {
                         // What the person ran is shown as it was when it ran.
-                        let text = text(&item);
-                        let (ran, said) = user_shell::split(&text);
-                        for ran in &ran {
-                            self.commit(user_shell::lines(ran, self.width));
-                        }
-                        let lines = transcript::prompt(said, None, self.width);
+                        let lines = landed(&text(&item), &mut self.ran_here, self.width);
                         self.commit(lines);
                     }
                     (_, Some("assistant")) => {
@@ -2530,23 +2525,21 @@ impl App {
     fn staged_rows(&self, width: usize) -> Vec<Line<'static>> {
         self.staged
             .iter()
-            .flat_map(|(_, prompt)| {
-                let (ran, prompt) = user_shell::split(prompt);
-                let ran = ran
-                    .into_iter()
-                    .flat_map(move |ran| user_shell::header(&ran.command, width, true));
-                // An attached command alone says nothing more.
-                let said = prompt.split('\n').filter(|_| !prompt.is_empty());
-                let said = said.enumerate().flat_map(move |(at, line)| {
-                    let lead = if at == 0 { "› " } else { "  " };
-                    transcript::wrap(
-                        Line::from(line.to_owned()).dim(),
-                        width,
-                        Span::raw(lead).dim(),
-                        Span::raw("  "),
-                    )
-                });
-                ran.chain(said)
+            .flat_map(|(_, prompt)| match user_shell::read(prompt) {
+                Some(ran) => user_shell::header(&ran.command, width, true),
+                None => prompt
+                    .split('\n')
+                    .enumerate()
+                    .flat_map(|(at, line)| {
+                        let lead = if at == 0 { "› " } else { "  " };
+                        transcript::wrap(
+                            Line::from(line.to_owned()).dim(),
+                            width,
+                            Span::raw(lead).dim(),
+                            Span::raw("  "),
+                        )
+                    })
+                    .collect(),
             })
             .collect()
     }
@@ -2556,7 +2549,7 @@ impl App {
     fn shell_rows(&self, width: usize) -> Vec<Line<'static>> {
         let mut rows = Vec::new();
         for record in &self.unsent {
-            for ran in user_shell::split(record).0 {
+            if let Some(ran) = user_shell::read(record) {
                 let mut header = user_shell::header(&ran.command, width, true);
                 if let Some(last) = header.last_mut() {
                     last.spans
@@ -3274,10 +3267,9 @@ impl App {
                 }
                 (_, Some("user")) => {
                     let text = text(&item);
-                    let (ran, said) = user_shell::split(&text);
-                    return match (said.is_empty(), ran.last()) {
-                        (true, Some(ran)) => format!("ran: ! {}", first_line(&ran.command)),
-                        _ => format!("asked: {}", first_line(said)),
+                    return match user_shell::read(&text) {
+                        Some(ran) => format!("ran: ! {}", first_line(&ran.command)),
+                        None => format!("asked: {}", first_line(&text)),
                     };
                 }
                 _ => {}
@@ -3804,16 +3796,16 @@ impl App {
             None => prompt,
         };
         // What the person ran and the agent could not be given yet goes
-        // first, on its own, and this message joins the turn it starts.
-        let join = !self.unsent.is_empty();
-        if join {
-            let records = self.unsent.join("\n\n");
-            if let Err(error) = self.send(records.clone(), Some(SHELL), false).await {
+        // first, each on its own, and this message joins the turn they start.
+        let mut join = false;
+        while let Some(record) = self.unsent.first().cloned() {
+            if let Err(error) = self.send(record.clone(), Some(SHELL), join).await {
                 self.notice = Some(error);
                 return;
             }
-            self.ran_here.extend(user_shell::split(&records).0);
-            self.unsent.clear();
+            self.ran_here.extend(user_shell::read(&record));
+            self.unsent.remove(0);
+            join = true;
         }
         match self.send(prompt, None, join).await {
             Ok(()) => {
@@ -4476,24 +4468,20 @@ fn short(bot: &str, project: &str, lead: &str) -> String {
         .to_owned()
 }
 
-/// A message as it lands in the conversation: the commands the person
-/// ran before it, by name only when `shown` holds them (this window showed
-/// their output when they ran, and lets them go), else whole; then what
-/// was said.
+/// A message as it lands in the conversation. A command the person ran
+/// is by name only when `shown` holds it (this window showed its output
+/// when it ran, and lets it go), else whole.
 fn landed(text: &str, shown: &mut Vec<user_shell::Ran>, width: usize) -> Vec<Line<'static>> {
-    let (ran, said) = user_shell::split(text);
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    for ran in ran {
-        match shown.iter().position(|seen| *seen == ran) {
-            Some(at) => {
-                shown.remove(at);
-                lines.extend(user_shell::header(&ran.command, width, true));
-            }
-            None => lines.extend(user_shell::lines(&ran, width)),
+    let Some(ran) = user_shell::read(text) else {
+        return transcript::prompt(text, None, width);
+    };
+    match shown.iter().position(|seen| *seen == ran) {
+        Some(at) => {
+            shown.remove(at);
+            user_shell::header(&ran.command, width, true)
         }
+        None => user_shell::lines(&ran, width),
     }
-    lines.extend(transcript::prompt(said, None, width));
-    lines
 }
 
 fn first_line(text: &str) -> String {
@@ -4781,10 +4769,9 @@ mod tests {
         // Not the person's words: what it printed authorizes nothing.
         assert_eq!(asked["origin"], "shell");
         let prompt = asked["prompt"].as_str().unwrap();
-        let (ran, said) = user_shell::split(prompt);
-        assert_eq!(said, "");
-        assert_eq!((ran[0].command.as_str(), ran[0].exit), ("echo hello", 0));
-        assert_eq!(ran[0].output, "hello");
+        let ran = user_shell::read(prompt).unwrap();
+        assert_eq!((ran.command.as_str(), ran.exit), ("echo hello", 0));
+        assert_eq!(ran.output, "hello");
         // Staged until its turn takes it, as its name alone.
         let staged: Vec<String> = app.staged_rows(80).iter().map(|l| l.to_string()).collect();
         assert_eq!(staged, ["! echo hello"]);
@@ -4828,7 +4815,7 @@ mod tests {
             let mut sent = seen.lock().unwrap();
             sent.push(asked.clone());
             match sent.len() {
-                1 => json!({"error": "active_agent_limit", "detail": "every slot is taken"}),
+                1 | 2 => json!({"error": "active_agent_limit", "detail": "every slot is taken"}),
                 _ => json!({"turn": 3}),
             }
         })
@@ -4836,14 +4823,16 @@ mod tests {
         let mut app = app(client);
         app.workspace = std::env::temp_dir().to_string_lossy().into_owned();
         app.move_to = Some("/moved".into());
-        app.input.set("!echo hello");
-        app.submit().await;
-        while app.shell.as_ref().is_some_and(|s| !s.is_finished()) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        for command in ["!echo hello", "!echo again"] {
+            app.input.set(command);
+            app.submit().await;
+            while app.shell.as_ref().is_some_and(|s| !s.is_finished()) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            app.shell_ran().await;
         }
-        app.shell_ran().await;
         // Refused: kept, and said to be.
-        assert_eq!(app.unsent.len(), 1);
+        assert_eq!(app.unsent.len(), 2);
         assert!(app.ran_here.is_empty());
         assert!(
             app.shell_rows(80)[0]
@@ -4858,20 +4847,29 @@ mod tests {
         );
         app.input.set("and now?");
         app.submit().await;
-        // The record goes first, on its own, and the message joins its turn.
+        // Each record goes first, on its own, and the message joins the
+        // turn the first starts.
         let sent = sent.lock().unwrap().clone();
-        let (ran, said) = user_shell::split(sent[1]["prompt"].as_str().unwrap());
-        assert_eq!((ran[0].command.as_str(), said), ("echo hello", ""));
-        assert_eq!(sent[1]["origin"], "shell");
-        assert_eq!(sent[2]["prompt"], "and now?");
-        assert_eq!(sent[2]["origin"], Value::Null);
-        assert_eq!(sent[2]["delivery"], "steer");
+        let command = |at: usize| user_shell::read(sent[at]["prompt"].as_str().unwrap()).unwrap();
+        assert_eq!(command(2).command, "echo hello");
+        assert_eq!(command(3).command, "echo again");
+        assert_eq!(
+            (&sent[2]["origin"], &sent[3]["origin"]),
+            (&json!("shell"), &json!("shell"))
+        );
+        assert_eq!(
+            (&sent[2]["delivery"], &sent[3]["delivery"]),
+            (&Value::Null, &json!("steer"))
+        );
+        assert_eq!(sent[4]["prompt"], "and now?");
+        assert_eq!(sent[4]["origin"], Value::Null);
+        assert_eq!(sent[4]["delivery"], "steer");
         // A turn it starts moves a moved lead, as any message's does.
         assert_eq!(sent[0]["workspace"], "/moved");
-        assert_eq!(sent[1]["workspace"], "/moved");
+        assert_eq!(sent[2]["workspace"], "/moved");
         assert!(app.move_to.is_none());
         assert!(app.unsent.is_empty());
-        assert_eq!(app.ran_here.len(), 1);
+        assert_eq!(app.ran_here.len(), 2);
         assert!(app.shell_rows(80).is_empty());
     }
 
