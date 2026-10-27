@@ -259,21 +259,33 @@ fn source(here: &Path) -> Result<Source, String> {
     }
 }
 
-/// The sandfs workspace `here` is in, and where it is mounted. A folder
-/// that has never seen sandfs has no home to look in.
+/// The sandfs workspace `here` is in, and where it is mounted.
 fn mounted_at(here: &Path) -> Result<Option<(String, PathBuf)>, String> {
+    Ok(mount_of(here)?.and_then(|ws| Some((ws.name, ws.mounted?))))
+}
+
+/// The mounted sandfs workspace `here` is in, the innermost. A folder
+/// that has never seen sandfs has no home to look in.
+pub fn mount_of(here: &Path) -> Result<Option<sandfs::WorkspaceInfo>, String> {
     if !Home::locate().is_ok_and(|home| home.root().exists()) {
         return Ok(None);
     }
     let workspaces = sandfs()?.workspaces().map_err(|e| format!("{e:#}"))?;
     Ok(workspaces
         .into_iter()
-        .filter_map(|ws| Some((ws.name, ws.mounted?)))
-        .filter(|(_, root)| here.starts_with(root))
-        .max_by_key(|(_, root)| root.components().count()))
+        .filter(|ws| {
+            ws.mounted
+                .as_deref()
+                .is_some_and(|root| here.starts_with(root))
+        })
+        .max_by_key(|ws| {
+            ws.mounted
+                .as_deref()
+                .map_or(0, |root| root.components().count())
+        }))
 }
 
-fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
+pub fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(dir)
