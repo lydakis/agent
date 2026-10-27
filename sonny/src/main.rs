@@ -1032,6 +1032,19 @@ struct Running {
     phase: String,
 }
 
+/// The most of the person's refused commands kept for their next
+/// message, well under what the daemon takes in one.
+const UNSENT_BYTES: usize = 64 * 1024;
+
+/// Keeps a refused command's record for the next message, letting the
+/// oldest go past what one message should carry.
+fn hold(unsent: &mut Vec<String>, record: String) {
+    unsent.push(record);
+    while unsent.len() > 1 && unsent.iter().map(String::len).sum::<usize>() > UNSENT_BYTES {
+        unsent.remove(0);
+    }
+}
+
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, unlisted.
 const COMMANDS: [(&str, &str); 12] = [
@@ -1188,6 +1201,8 @@ struct App {
     shown: Vec<Line<'static>>,
     /// The records of those the daemon refused, to go with the next message.
     unsent: Vec<String>,
+    /// Those whose output this window showed, until their record lands.
+    ran_here: Vec<user_shell::Ran>,
 }
 
 /// The lead's tasks, laid out in the project's Rex session: a window for
@@ -1790,6 +1805,7 @@ impl App {
             shell: None,
             shown: Vec::new(),
             unsent: Vec::new(),
+            ran_here: Vec::new(),
         }
     }
 
@@ -1940,10 +1956,12 @@ impl App {
             let ran = self.shell.take().unwrap().ran().await;
             self.shown.extend(user_shell::lines(&ran, self.width));
             let record = user_shell::record(&ran);
+            // As it will read back once it lands.
+            self.ran_here.extend(user_shell::split(&record).0);
             // Refused, it is kept, to go with the next message.
             if let Err(error) = self.send(record.clone()).await {
                 self.notice = Some(format!("{error}; it goes with your next message"));
-                self.unsent.push(record);
+                hold(&mut self.unsent, record);
             }
         }
         if self.live.is_none() && !self.shown.is_empty() {
@@ -2748,7 +2766,7 @@ impl App {
                     && let Some(node) = data["node"].as_i64()
                     && let Some(item) = self.items(&[node]).await.first()
                 {
-                    let lines = landed(&text(item), self.width);
+                    let lines = landed(&text(item), &mut self.ran_here, self.width);
                     self.commit(lines);
                 }
             }
@@ -2759,7 +2777,7 @@ impl App {
                     && let Some(item) = self.items(&[node]).await.first()
                 {
                     self.end_live(Words::Reply);
-                    let lines = landed(&text(item), self.width);
+                    let lines = landed(&text(item), &mut self.ran_here, self.width);
                     self.commit(lines);
                 }
             }
@@ -4441,14 +4459,21 @@ fn short(bot: &str, project: &str, lead: &str) -> String {
 }
 
 /// A message as it lands in the conversation: the commands the person
-/// ran before it, by name only, as their output was shown when they ran,
-/// then what was said.
-fn landed(text: &str, width: usize) -> Vec<Line<'static>> {
+/// ran before it, by name only when `shown` holds them (this window showed
+/// their output when they ran, and lets them go), else whole; then what
+/// was said.
+fn landed(text: &str, shown: &mut Vec<user_shell::Ran>, width: usize) -> Vec<Line<'static>> {
     let (ran, said) = user_shell::split(text);
-    let mut lines: Vec<Line<'static>> = ran
-        .iter()
-        .flat_map(|ran| user_shell::header(&ran.command, width, true))
-        .collect();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for ran in ran {
+        match shown.iter().position(|seen| *seen == ran) {
+            Some(at) => {
+                shown.remove(at);
+                lines.extend(user_shell::header(&ran.command, width, true));
+            }
+            None => lines.extend(user_shell::lines(&ran, width)),
+        }
+    }
     lines.extend(transcript::prompt(said, None, width));
     lines
 }
@@ -4753,8 +4778,19 @@ mod tests {
         }
         app.shell_ran().await;
         assert_eq!(sent.lock().unwrap()[1]["delivery"], "steer");
-        let landed: Vec<String> = landed(prompt, 80).iter().map(|l| l.to_string()).collect();
-        assert_eq!(landed, ["! echo hello"]);
+        let landed_here: Vec<String> = landed(prompt, &mut app.ran_here, 80)
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert_eq!(landed_here, ["! echo hello"]);
+        let left: Vec<&str> = app.ran_here.iter().map(|r| r.command.as_str()).collect();
+        assert_eq!(left, ["true"]);
+        // Run in another window: shown whole.
+        let elsewhere: Vec<String> = landed(prompt, &mut Vec::new(), 80)
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert_eq!(elsewhere, ["! echo hello", "  └ hello"]);
         // The next message goes alone.
         app.input.set("thanks");
         app.submit().await;
@@ -4810,6 +4846,19 @@ mod tests {
         assert!(app.move_to.is_none());
         assert!(app.unsent.is_empty());
         assert!(app.shell_rows(80).is_empty());
+    }
+
+    #[test]
+    fn refused_commands_held_stay_within_a_message() {
+        let mut unsent = Vec::new();
+        for n in 0..5 {
+            hold(&mut unsent, format!("{n}{}", "x".repeat(UNSENT_BYTES / 3)));
+        }
+        let firsts: Vec<char> = unsent.iter().filter_map(|r| r.chars().next()).collect();
+        assert_eq!(firsts, ['3', '4']);
+        // One alone over it is still kept: the daemon says if it is too much.
+        hold(&mut unsent, "y".repeat(UNSENT_BYTES * 2));
+        assert_eq!(unsent.len(), 1);
     }
 
     #[tokio::test]
