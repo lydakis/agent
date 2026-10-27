@@ -1,4 +1,4 @@
-//! Sonny, a terminal client for one bot, beside the app: its conversation goes
+//! Sonny, a terminal client for one bot: its conversation goes
 //! into the terminal's own scrollback as it happens, and a few rows at the
 //! bottom hold what is still moving: the reply being written, what the bot
 //! is doing, and the composer. Prototype.
@@ -311,17 +311,14 @@ fn which(program: &str) -> Option<PathBuf> {
 
 /// Agent's own binary: the one the daemon gave this shell, else the one
 /// installed beside Sonny (`libexec/agent`, as the Linux tarball lays it
-/// out), else Homebrew's `agent` formula when Sonny is its `sonny`, else
-/// the app's. Not `agent` on PATH, which may be another program.
+/// out), else Homebrew's `agent` formula when Sonny is its `sonny`. Not
+/// `agent` on PATH, which may be another program.
 fn agent_bin() -> Option<PathBuf> {
     let me = std::env::current_exe().and_then(std::fs::canonicalize).ok();
     std::env::var_os("AGENT_BIN")
         .map(PathBuf::from)
         .into_iter()
         .chain(me.iter().flat_map(|me| installed_agent(me)))
-        .chain([PathBuf::from(
-            "/Applications/Agent.app/Contents/MacOS/agent",
-        )])
         .find(|bin| bin.is_file())
 }
 
@@ -472,7 +469,7 @@ fn start_daemon(
     login: bool,
 ) -> Result<(), String> {
     let bin = agent_bin().ok_or(
-        "the daemon is not running and Agent's binary was not found; install Sonny with Homebrew, open Agent.app, or set AGENT_BIN",
+        "the daemon is not running and Agent's binary was not found; install Sonny with Homebrew, or set AGENT_BIN",
     )?;
     let mut command = std::process::Command::new(&bin);
     if let Some(environment) = login.then(login::environment).flatten() {

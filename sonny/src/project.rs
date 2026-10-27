@@ -1,6 +1,6 @@
 //! The folder's coordinator: opened with no `--bot`, Sonny talks to the
-//! project's lead, `<project>.lead`, the same bot the app opens for that
-//! folder, so the two clients share one conversation. A folder that is not
+//! project's lead, `<project>.lead`, the same bot whichever Sonny opens
+//! that folder. A folder that is not
 //! a project yet becomes one: its lead, then its `.agents/project.toml`.
 //! `sonny project add`, which `~/.agent/project` runs, makes one from an
 //! agent's shell the same way.
@@ -23,7 +23,7 @@ pub struct Lead {
     pub moving: Option<PathBuf>,
 }
 
-/// The folder's own name reduced to name characters, as the app names a
+/// The folder's own name reduced to name characters, the name of a
 /// project with no file.
 fn default_name(dir: &Path) -> Result<String, String> {
     let info = agent_client::project::read(dir)?;
