@@ -871,6 +871,9 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
         "instructions": instructions, "tools": DEFAULT_TOOLS,
         "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
         "request_id": unique("tui-create")});
+    if let Some(ttl) = agent_client::policy::cache_ttl(&model) {
+        asked["settings"] = json!({"cache_ttl": ttl});
+    }
     let tools = DEFAULT_TOOLS.map(String::from);
     if let Value::Object(fields) = &mut asked {
         fields.extend(approvals::gate(approvals::MODES[0].0, &tools));

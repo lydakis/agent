@@ -2514,6 +2514,8 @@ async fn start(client: &Client, trigger: &Trigger) -> Result<i64, String> {
                 "tools": crate::project::TOOLS,
                 "created_by": by.as_ref().map(|(bot, _)| bot),
                 "created_by_id": by.as_ref().map(|(_, id)| id),
+                "settings": agent_client::policy::cache_ttl(model)
+                    .map_or(json!({}), |ttl| json!({"cache_ttl": ttl})),
                 "request_id": format!("trigger-{}", trigger.generation)}),
         )
         .await

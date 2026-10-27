@@ -412,6 +412,9 @@ pub async fn create(
     if let Some(effort) = effort {
         params["effort"] = json!(effort);
     }
+    if let Some(ttl) = crate::policy::cache_ttl(model) {
+        params["settings"] = json!({"cache_ttl": ttl});
+    }
     // The tools its client declares on the lead, from its first turn.
     if !policy["declare"].is_null() {
         params["declare"] = policy["declare"].clone();
@@ -681,6 +684,10 @@ mod tests {
         let calls = daemon.calls.lock().unwrap().clone();
         let create = &calls.iter().find(|(op, _)| op == "create").unwrap().1;
         assert_eq!(create["model"], "alpha/role");
+        assert!(
+            create.get("settings").is_none(),
+            "only Anthropic's API takes an hour"
+        );
         assert!(
             create.get("effort").is_none(),
             "no effort picked sends none"
