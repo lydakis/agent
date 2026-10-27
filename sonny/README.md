@@ -62,6 +62,10 @@ commands:
   `.agents/project.toml` when the folder has one. A pick made while a turn
   runs shows in the footer and applies when the lead is idle; one that
   another client overtakes is dropped.
+- `/compact` summarizes the lead's conversation before its next model
+  call: at the running turn's next step, or before an idle lead's next
+  reply. The daemon also compacts on its own once a call's input reaches
+  the bot's `compact_tokens` (200,000 by default).
 - `/instructions` gives the lead its folder's instructions again: its
   role, `AGENTS.md`, skills and memory. Sonny does this on its own when
   it opens a lead whose instructions it saw composed from the folder, and

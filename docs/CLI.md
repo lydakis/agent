@@ -148,7 +148,7 @@ identity is `bot_not_found`.
   turns' records. `prune` applies it once; on `run --new` it is the bot's
   setting, applied after each of its turns.
 - `run` sets a new bot's own settings with `--context-bytes`, `--context-items`,
-  `--note-turns`, `--compact-at`, `--compact-keep`, `--keep-turns`,
+  `--note-turns`, `--compact-at`, `--compact-keep`, `--compact-tokens`, `--keep-turns`,
   `--approval-hold`, `--max-output-tokens`, `--keep-warm`, and
   `--cache-ttl`; they are not daemon options, and an existing bot
   keeps its own (see [bot settings](RUST_PROTOTYPE.md#bot-settings)).

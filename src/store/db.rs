@@ -108,6 +108,12 @@ pub struct Bot {
     /// refusal reports it.
     #[serde(skip)]
     pub fork_point: Option<i64>,
+    /// The bytes the bot's last call sent and the input tokens the provider
+    /// counted for them, from which a view's tokens are estimated.
+    #[serde(skip)]
+    pub sent: Option<(u64, u64)>,
+    /// A client asked for a summary before the bot's next model call.
+    pub compaction_requested: bool,
     /// Its context, history and approval settings, reported as they apply.
     #[serde(serialize_with = "resolved_settings")]
     pub settings: Settings,
@@ -154,6 +160,12 @@ pub struct Settings {
     pub compact_at: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compact_keep: Option<usize>,
+    /// Input tokens per request at which elision and compaction start, as
+    /// the provider counted the bot's last call; the byte threshold applies
+    /// as well, and whichever is reached first starts them. Zero leaves
+    /// only the byte threshold.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compact_tokens: Option<u64>,
     /// After each of its turns finishes, prune the bot to this many turns'
     /// records; none keeps them until an explicit `prune`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -182,6 +194,10 @@ pub enum CacheTtl {
     Hour,
 }
 const MIN_CONTEXT_BYTES: usize = 1024;
+/// Where Claude Code and Codex compact on their standard 200K and 272K
+/// windows, near enough: past it, every round resends a long context.
+pub const DEFAULT_COMPACT_TOKENS: u64 = 200_000;
+const MIN_COMPACT_TOKENS: u64 = 1024;
 const MIN_CONTEXT_ITEMS: usize = 2;
 impl Settings {
     pub fn context_bytes(&self) -> usize {
@@ -198,6 +214,10 @@ impl Settings {
     }
     pub fn compact_keep(&self) -> usize {
         self.compact_keep.unwrap_or(25)
+    }
+    /// `None` when only the byte threshold applies.
+    pub fn compact_tokens(&self) -> Option<u64> {
+        Some(self.compact_tokens.unwrap_or(DEFAULT_COMPACT_TOKENS)).filter(|&n| n > 0)
     }
     pub fn approval_hold_ms(&self) -> u64 {
         self.approval_hold_ms.unwrap_or(2000)
@@ -232,6 +252,12 @@ impl Settings {
         if self.compact_keep() >= self.compact_at() {
             return refuse("compact_keep is below compact_at");
         }
+        if self
+            .compact_tokens
+            .is_some_and(|n| n != 0 && n < MIN_COMPACT_TOKENS)
+        {
+            return refuse("compact_tokens is at least 1024; 0 leaves only compact_at");
+        }
         if self.keep_turns == Some(0) {
             return refuse("keep_turns is at least 1");
         }
@@ -253,7 +279,8 @@ impl Settings {
     pub fn resolved(&self) -> Value {
         json!({"context_bytes":self.context_bytes(),"context_items":self.context_items(),
             "note_turns":self.note_turns(),"compact_at":self.compact_at(),
-            "compact_keep":self.compact_keep(),"keep_turns":self.keep_turns,
+            "compact_keep":self.compact_keep(),"compact_tokens":self.compact_tokens().unwrap_or(0),
+            "keep_turns":self.keep_turns,
             "approval_hold_ms":self.approval_hold_ms(),"max_output_tokens":self.max_output_tokens,
             "keep_warm":self.keep_warm().map_or(0, |after| after.as_secs()),
             "cache_ttl":self.cache_ttl.unwrap_or(CacheTtl::Minutes)})
@@ -1198,7 +1225,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 50;
+    pub const SCHEMA: i32 = 51;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1330,7 +1357,8 @@ impl Database {
                 thinking_from INTEGER NOT NULL DEFAULT 0,
                 thinking_to INTEGER NOT NULL DEFAULT 0,
                 thinking_elided INTEGER NOT NULL DEFAULT 0, gates TEXT, denials TEXT,
-                closed INTEGER, open_calls INTEGER, allowed TEXT, settings TEXT, creation TEXT);
+                closed INTEGER, open_calls INTEGER, allowed TEXT, settings TEXT, creation TEXT,
+                sent_bytes INTEGER, sent_tokens INTEGER, compact_asked INTEGER NOT NULL DEFAULT 0);
             CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
             CREATE INDEX IF NOT EXISTS bots_note ON bots(note);
             CREATE INDEX IF NOT EXISTS bots_compaction ON bots(compaction);
@@ -1712,9 +1740,16 @@ impl Database {
                     )
                 })?,
             },
+            sent: match (r.get::<_, Option<i64>>(35)?, r.get::<_, Option<i64>>(36)?) {
+                (Some(bytes), Some(tokens)) if bytes > 0 && tokens > 0 => {
+                    Some((bytes as u64, tokens as u64))
+                }
+                _ => None,
+            },
+            compaction_requested: r.get::<_, i64>(37)? != 0,
         })
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings,sent_bytes,sent_tokens,compact_asked";
     /// Validate the caller's captured identity in the same transaction that
     /// creates the child. Never resolve a stale shell's name to a new bot.
     fn creator_id(
@@ -4551,6 +4586,29 @@ impl Database {
         self.approvals += announced_calls;
         self.served.extend(served);
         Ok(entries)
+    }
+    /// What the bot's last call sent, in bytes, and the input tokens the
+    /// provider counted for it.
+    pub fn record_sent(&mut self, name: &str, bytes: u64, tokens: u64) -> Result<()> {
+        self.conn
+            .prepare_cached("UPDATE bots SET sent_bytes=?,sent_tokens=? WHERE name=?")?
+            .execute(params![bytes as i64, tokens as i64, name])?;
+        Ok(())
+    }
+    /// Ask for a summary before the bot's next model call, or clear the
+    /// request once one ran; whether the bot's record changed.
+    pub fn request_compaction(
+        &mut self,
+        name: &str,
+        bot_id: Option<i64>,
+        asked: bool,
+    ) -> Result<bool> {
+        let id = self.identity(name, bot_id)?;
+        let changed = self.conn.execute(
+            "UPDATE bots SET compact_asked=? WHERE id=? AND compact_asked<>?",
+            params![asked as i64, id, asked as i64],
+        )?;
+        Ok(changed == 1)
     }
     /// Charge an unsuccessful provider call without accepting its output.
     pub fn failed_usage(&mut self, turn: i64, usage: &Usage) -> Result<Value> {
@@ -8408,6 +8466,20 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         // A store from before 33 has no approvals table yet; it is created
         // with the rest of the schema.
         conn.execute_batch("ALTER TABLE approvals ADD COLUMN asked TEXT;")?;
+    }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='compact_asked')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 50 -> 51: a bot's last call's size in bytes and tokens, and a
+        // client's request for a summary. None had either; the first call
+        // after measures the size.
+        conn.execute_batch(
+            "ALTER TABLE bots ADD COLUMN sent_bytes INTEGER;
+             ALTER TABLE bots ADD COLUMN sent_tokens INTEGER;
+             ALTER TABLE bots ADD COLUMN compact_asked INTEGER NOT NULL DEFAULT 0;",
+        )?;
     }
     Ok(())
 }

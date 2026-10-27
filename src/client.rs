@@ -313,6 +313,7 @@ fn parse(args: &[String]) -> Result<Options> {
                     | "--note-turns"
                     | "--compact-at"
                     | "--compact-keep"
+                    | "--compact-tokens"
                     | "--max-output-tokens" => {
                         let number = value.parse::<u64>().map_err(|_| {
                             Error::with("usage", format!("{flag} needs an integer"))
@@ -1046,6 +1047,7 @@ pub fn main(args: Vec<String>) -> Result<i32> {
         "turns" => turns(&options),
         "rm" => remove(&options),
         "prune" => prune(&options),
+        "compact" => compact(&options),
         "approvals" => approvals(&options),
         "answer" => answer(&options),
         "approver" => approver(&options),
@@ -1577,6 +1579,20 @@ fn remove(options: &Options) -> Result<i32> {
     let mut connection = ensure_existing_daemon(options)?;
     print_json(
         &connection.request("delete", json!({"bot":bot,"bot_id":options.bot_id}))?,
+        options.pretty,
+    )?;
+    Ok(0)
+}
+
+/// Ask for a summary of a bot's context before its next model call.
+fn compact(options: &Options) -> Result<i32> {
+    let bot = options
+        .bot
+        .clone()
+        .ok_or(Error::with("usage", "compact needs --bot"))?;
+    let mut connection = ensure_existing_daemon(options)?;
+    print_json(
+        &connection.request("compact", json!({"bot":bot,"bot_id":options.bot_id}))?,
         options.pretty,
     )?;
     Ok(0)

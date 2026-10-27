@@ -23,6 +23,13 @@ ODD_CALL_ID = "odd $(touch pwned) 'x'\n" + 'L' * 300
 
 
 
+def input_tokens(server, request):
+    """What the provider counts for a request: 100, or with
+    `bytes_per_token` set, its encoded size in those."""
+    per = getattr(server, 'bytes_per_token', None)
+    return len(json.dumps(request)) // per if per else 100
+
+
 def is_summary(request):
     """A summary request in either form: a copy of the bot's call, or a
     request of its own over a span. Both end in the compaction request."""
@@ -376,6 +383,11 @@ class Model(http.server.BaseHTTPRequestHandler):
                     # A copy offers the bot's tools, and a model may call one.
                     output.append({'type': 'function_call', 'name': 'echo', 'call_id': 'summary-call',
                                    'arguments': json.dumps({'text': 'instead'})})
+            if request.get('tool_choice') == 'none' and any(o.get('type') == 'function_call' for o in output):
+                # A model shown tools it may not call answers in words.
+                text = 'final reply'
+                output = [{'type': 'message', 'role': 'assistant',
+                           'content': [{'type': 'output_text', 'text': text}]}]
             if getattr(self.server, 'history_reasoning', None):
                 output.insert(0, self.server.history_reasoning)
             if getattr(self.server, 'empty_compaction', False) and is_summary(request):
@@ -387,7 +399,7 @@ class Model(http.server.BaseHTTPRequestHandler):
                 # A dated snapshot answers, as providers name it.
                 events.append({'type': 'response.completed', 'response': {
                     'model': request['model'] + '-2026-09-26', 'status': 'completed', 'output': output,
-                    'usage': {'input_tokens': 100, 'output_tokens': 10,
+                    'usage': {'input_tokens': input_tokens(self.server, request), 'output_tokens': 10,
                               'input_tokens_details': {'cached_tokens': 40 if user.startswith('cached:') else 0}}}})
             if user == 'incomplete':
                 events = [{'type': 'response.incomplete', 'response': {'status': 'incomplete',

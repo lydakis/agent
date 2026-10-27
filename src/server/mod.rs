@@ -225,6 +225,16 @@ enum Command {
         approver: Option<String>,
         approve_expire_ms: Option<u64>,
     },
+    /// Summarize a bot's context with its compaction instructions before
+    /// its next model call: a running turn's next round boundary, or an
+    /// idle bot's next turn. Everything older than the newest boundary is
+    /// summarized, whatever the thresholds; resending it while a request
+    /// is pending changes nothing.
+    Compact {
+        bot: String,
+        /// The identity `bot` must hold; another is `bot_not_found`.
+        bot_id: Option<i64>,
+    },
     Fork {
         source: String,
         /// A node id from the source's history; defaults to its head when it
@@ -870,6 +880,8 @@ struct Active {
     /// Set to the error the cancelled turn ends with.
     cancel: watch::Sender<Option<&'static str>>,
     steers: Arc<std::sync::atomic::AtomicBool>,
+    /// A client asked for a summary at the turn's next round boundary.
+    compact: Arc<std::sync::atomic::AtomicBool>,
 }
 impl Active {
     /// Cancel the turn with `code` unless a cause is already set: the first
@@ -1794,6 +1806,7 @@ impl Service {
         // The job that started this turn said whether a steer waits for it;
         // afterwards only a steer for this bot sets the flag.
         let steers = Arc::new(std::sync::atomic::AtomicBool::new(steers));
+        let compact: Arc<std::sync::atomic::AtomicBool> = Arc::default();
         self.active.insert(
             bot.clone(),
             Active {
@@ -1801,6 +1814,7 @@ impl Service {
                 task: task_id,
                 cancel,
                 steers: steers.clone(),
+                compact: compact.clone(),
             },
         );
         let task = Turn {
@@ -1816,6 +1830,7 @@ impl Service {
             settings: Default::default(),
             resumed,
             steers,
+            compact,
             tokens: self.tokens.clone(),
             read_results: Default::default(),
             side: Default::default(),
@@ -2251,6 +2266,43 @@ impl Service {
                     event["event"] = json!("configured");
                     event["durable"] = json!(false);
                     let bot = answer["bot"].as_str().unwrap_or_default().to_owned();
+                    self.hub.live(&bot, event).await?;
+                }
+                Ok(answer)
+            }
+            Command::Compact { bot, bot_id } => {
+                let name = bot.clone();
+                let answer = store
+                    .op("request_compaction", move |db| {
+                        let id = db.identity(&name, bot_id)?;
+                        let record = db.inspect(&name)?;
+                        if record.compaction_instructions.is_none() {
+                            return fail_with(
+                                "compaction_unavailable",
+                                format!("{name} was created without compaction instructions"),
+                            );
+                        }
+                        let requested = db.request_compaction(&name, Some(id), true)?;
+                        Ok(
+                            json!({"bot":name,"bot_id":id,"running_turn":record.running_turn,
+                            "duplicate":!requested}),
+                        )
+                    })
+                    .await?;
+                if let Some(active) = self.active.get(&bot) {
+                    active
+                        .compact
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                // Followers see it once; a resend while it is pending
+                // answers `duplicate: true`.
+                if answer["duplicate"] == false {
+                    let mut event = answer.clone();
+                    event["event"] = json!("compaction_requested");
+                    event["durable"] = json!(false);
+                    if let Some(fields) = event.as_object_mut() {
+                        fields.remove("duplicate");
+                    }
                     self.hub.live(&bot, event).await?;
                 }
                 Ok(answer)
@@ -3083,6 +3135,7 @@ mod tests {
             task: 1,
             cancel,
             steers: Arc::default(),
+            compact: Arc::default(),
         };
         assert!(active.cancel(turn::INTERRUPTED));
         assert!(active.cancel(turn::SHUTDOWN));
@@ -3392,6 +3445,7 @@ mod tests {
                     task: 1,
                     cancel,
                     steers: Arc::default(),
+                    compact: Arc::default(),
                 },
             )]),
             next_task: 1,
@@ -3595,6 +3649,7 @@ mod tests {
                             task: 0,
                             cancel: watch::channel(None).0,
                             steers: Arc::default(),
+                            compact: Arc::default(),
                         },
                     )
                 })
