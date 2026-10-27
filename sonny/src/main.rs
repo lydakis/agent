@@ -9,6 +9,7 @@
 //! `• Ran …` line with a short `└` look at the result, and a status row
 //! says how long the turn has run and how to stop it.
 mod approvals;
+mod asks;
 mod cache;
 mod calls;
 mod diff;
@@ -118,6 +119,8 @@ fn usage() -> String {
      sonny task NAME [--setup] [RUN FLAGS] -- BRIEF, from the lead's shell or a terminal, makes a task's\n\
      folder that way and starts the task there; sonny task changes NAME [--apply] lists\n\
      (or writes here) what a sandfs copy of a plain folder changed.\n\
+     sonny ask QUESTION [--choice OPTION]..., from the lead's shell, pins a question for\n\
+     the person above the composer until they answer it.\n\
      The lookout wakes the lead when its tasks need it, judged by --lookout, else AGENT_JUDGE\n\
      (as the approver is), else openai-decisions/gpt-6-luna with OPENAI_API_KEY, else the\n\
      newest Haiku the lead's provider lists."
@@ -456,6 +459,7 @@ fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
         Some((task, rest)) if task == "task" => task::run(rest),
+        Some((ask, rest)) if ask == "ask" => asks::run(rest),
         _ => tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -745,6 +749,8 @@ fn heading(thought: &str) -> Option<&str> {
 /// A folder as the person reads it: under their home, from `~`.
 /// How often the footer reads the workspace's branch again.
 const PLACE_EVERY: Duration = Duration::from_secs(3);
+/// How often the lead's questions are read again.
+const ASKS_EVERY: Duration = Duration::from_secs(1);
 
 fn tilde(path: &str) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
@@ -914,6 +920,14 @@ struct App {
     calls: HashMap<String, (String, Value)>,
     /// Calls waiting on the person, as `approvals` lists them.
     approvals: Vec<Value>,
+    /// The lead's questions for the person, oldest first, as `sonny ask`
+    /// left them, and when they were last read.
+    asks: Vec<asks::Ask>,
+    /// Where the lead's questions are kept, once its id is known.
+    asks_key: Option<String>,
+    asks_read: Option<Instant>,
+    /// Esc set the questions aside: what is typed is a message of its own.
+    chatting: bool,
     /// The waiting call whose whole command was last written out.
     asked: Option<Value>,
     following: bool,
@@ -1449,6 +1463,14 @@ impl App {
             }),
             calls: HashMap::new(),
             approvals: Vec::new(),
+            asks: Vec::new(),
+            asks_key: record["bot_id"].as_i64().map(|id| {
+                let store =
+                    std::fs::canonicalize(&options.store).unwrap_or_else(|_| options.store.clone());
+                asks::key(&store, id)
+            }),
+            asks_read: None,
+            chatting: false,
             asked: None,
             following: true,
             notice: None,
@@ -1616,12 +1638,25 @@ impl App {
             self.side_closed();
             self.listed();
             self.follow_place().await;
+            self.follow_asks();
             self.repaint |= term::switched();
             if self.repaint && self.running.is_none() && self.watch.is_none() && self.side.is_none()
             {
                 self.repaint = false;
                 self.repaint(terminal).await?;
             }
+        }
+    }
+
+    /// Read the lead's open questions again, every second.
+    fn follow_asks(&mut self) {
+        if self.asks_read.is_some_and(|at| at.elapsed() < ASKS_EVERY) {
+            return;
+        }
+        self.asks_read = Some(Instant::now());
+        self.asks = self.asks_key.as_deref().map(asks::open).unwrap_or_default();
+        if self.asks.is_empty() {
+            self.chatting = false;
         }
     }
 
@@ -2977,6 +3012,8 @@ impl App {
                             } else {
                                 self.input.clear();
                             }
+                        } else if !self.asks.is_empty() {
+                            self.chatting = !self.chatting;
                         }
                     }
                     _ => {}
@@ -3155,6 +3192,15 @@ impl App {
             self.side(question.trim().to_owned()).await;
             return;
         }
+        // What is typed answers the lead's first open question, and goes
+        // with it; the question closes once the daemon has the answer.
+        let answering = (!self.chatting)
+            .then(|| self.asks.first().cloned())
+            .flatten();
+        let prompt = match &answering {
+            Some(ask) => asks::answer(ask, &prompt),
+            None => prompt,
+        };
         // A message to a busy bot joins its running turn, on that turn's model.
         let delivery = self.running.is_some().then_some("steer");
         let model = delivery
@@ -3176,6 +3222,10 @@ impl App {
             Ok(reply) => {
                 if let Some(turn) = reply["turn"].as_i64() {
                     self.staged.push((turn, prompt));
+                }
+                if let Some(ask) = answering {
+                    asks::done(&ask);
+                    self.asks.retain(|open| open.file != ask.file);
                 }
                 self.input.clear();
                 self.notice = None;
@@ -3372,6 +3422,8 @@ impl App {
         let mut open_rows = self.open_rows(width);
         // Then what was sent and has not landed, kept in view below it.
         open_rows.extend(self.staged_rows(width));
+        // The lead's questions stay pinned above the status row.
+        open_rows.extend(asks::rows(&self.asks, width, self.chatting));
         let spare = room.saturating_sub(composer_rows.len()) + 1;
         let hidden = open_rows.len().saturating_sub(spare.max(1));
         open_rows.drain(..hidden);
@@ -3570,6 +3622,7 @@ impl App {
     fn composer(&self, width: usize) -> (Vec<Line<'static>>, (usize, usize)) {
         if self.input.is_empty() {
             let hint = match self.running {
+                _ if !self.asks.is_empty() && !self.chatting => "Answer, or Esc to chat",
                 Some(_) => "Steer the running turn",
                 None => "Ask anything",
             };
@@ -3932,6 +3985,51 @@ mod tests {
 
     fn turn_event(event: &str, turn: i64, data: Value) -> Value {
         json!({"event": event, "bot": "b", "turn": turn, "data": data})
+    }
+
+    #[tokio::test]
+    async fn what_is_typed_answers_the_leads_first_question_unless_set_aside() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let client = daemon_answering(move |asked| {
+            if asked["op"] == "submit" {
+                seen.lock()
+                    .unwrap()
+                    .push(asked["prompt"].as_str().unwrap().to_owned());
+            }
+            json!({"turn": 2})
+        })
+        .await;
+        let mut app = app(client);
+        let dir = std::env::temp_dir().join(unique("sonny-asks"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ask = |name: &str, question: &str| {
+            let file = dir.join(name);
+            std::fs::write(&file, "{}").unwrap();
+            asks::Ask {
+                file,
+                question: question.into(),
+                choices: vec!["Keep it".into(), "Drop it".into()],
+            }
+        };
+        app.asks = vec![ask("1.json", "Keep the old API?"), ask("2.json", "Tag it?")];
+        app.input.set("2");
+        app.submit().await;
+        // Esc sets the rest aside: the next message is the person's own.
+        app.chatting = true;
+        app.input.set("how is it going?");
+        app.submit().await;
+        assert_eq!(
+            *sent.lock().unwrap(),
+            [
+                "You asked: Keep the old API?\n\nDrop it",
+                "how is it going?"
+            ]
+        );
+        assert_eq!(app.asks.len(), 1);
+        assert!(!dir.join("1.json").exists());
+        assert!(dir.join("2.json").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]
