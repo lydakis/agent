@@ -818,6 +818,8 @@ struct Watch {
     jobs: Vec<status::Row>,
     /// When the rows were read: their times count on from here.
     read: Instant,
+    /// The lookout's line for the lead.
+    lookout: String,
 }
 
 struct App {
@@ -2305,6 +2307,7 @@ impl App {
                     rows,
                     jobs,
                     read: Instant::now(),
+                    lookout: self.lookout_line(),
                 })
             }
             Err(error) => {
@@ -2316,12 +2319,22 @@ impl App {
 
     async fn reread(&mut self) {
         let jobs = errand::jobs(self.folder_name()).await;
+        let lookout = self.lookout_line();
         if let Ok((_, rows)) = self.status_rows().await
             && let Some(watch) = &mut self.watch
         {
             watch.rows = rows;
             watch.jobs = jobs;
             watch.read = Instant::now();
+            watch.lookout = lookout;
+        }
+    }
+
+    /// What the lookout does for this window's lead.
+    fn lookout_line(&self) -> String {
+        match &self.project {
+            Some(_) => lookout::status(&self.options.store, &self.bot),
+            None => String::new(),
         }
     }
 
@@ -3330,20 +3343,21 @@ fn draw_watch(watch: &mut Watch) -> std::io::Result<()> {
         })
         .collect();
     let project = watch.project.clone();
+    let lookout = watch.lookout.clone();
     watch.screen.autoresize()?;
     watch.screen.draw(|frame| {
         let area = frame.area();
         let width = area.width.saturating_sub(2) as usize;
         let mut lines = vec![Line::default()];
-        lines.extend(
-            status::card(&project, &rows, &jobs, width)
-                .into_iter()
-                .map(|line| {
-                    let mut spans = vec![Span::raw(" ")];
-                    spans.extend(line.spans);
-                    Line::from(spans).style(line.style)
-                }),
-        );
+        let mut card = status::card(&project, &rows, &jobs, width);
+        if !lookout.is_empty() {
+            card.insert(1, Line::from(lookout.clone()).dim());
+        }
+        lines.extend(card.into_iter().map(|line| {
+            let mut spans = vec![Span::raw(" ")];
+            spans.extend(line.spans);
+            Line::from(spans).style(line.style)
+        }));
         let footer = Line::from("  esc to close").dim();
         let body = ratatui::layout::Rect {
             height: area.height.saturating_sub(1),

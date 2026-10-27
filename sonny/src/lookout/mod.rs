@@ -71,6 +71,8 @@ pub struct Question {
     kinds: &'static [Kind],
     /// A yes is worth cutting into the lead's running turn for.
     urgent: bool,
+    /// The answer that wakes the lead; below it, down to `LOW`, it waits.
+    wakes_at: f64,
 }
 
 /// What the lead is asked to do about a yes, as the note says it.
@@ -95,48 +97,57 @@ pub const QUESTIONS: [Question; 8] = [
         text: "Is `event` a message from the person that changes a goal, a constraint or a preference that also applies to the other tasks in `tasks` or to the project as a whole, not only to this task?",
         kinds: &[Kind::Said],
         urgent: true,
+        wakes_at: HIGH,
     },
     Question {
         id: "sibling_needs",
         text: "Does the text in `event` hold a fact, a decision or a fix that one of the tasks in `tasks` needs for its own work and probably does not have?",
         kinds: &[Kind::Said, Kind::Ended],
         urgent: false,
+        wakes_at: HIGH,
     },
     Question {
         id: "conflict",
         text: "Does the work in `event` contradict, duplicate or change the same thing as the work of one of the tasks in `tasks`?",
         kinds: &[Kind::Said, Kind::Ended],
         urgent: true,
+        wakes_at: HIGH,
     },
     Question {
         id: "off_brief",
         text: "Does the reply in `event` show the task departing from what `brief` asked it to do, or doing only part of it while presenting it as done? Following a later message from the person in that task is not departing.",
         kinds: &[Kind::Ended],
         urgent: false,
+        wakes_at: HIGH,
     },
     Question {
         id: "stuck",
         text: "Is the task in `event` stuck: failing, going in circles, hung, waiting on an approval, blocked by calls the approver denied, or asking a question that nobody has answered?",
         kinds: &[Kind::Ended, Kind::Waiting, Kind::Quiet],
         urgent: false,
+        wakes_at: HIGH,
     },
     Question {
         id: "lead_next",
         text: "Does `event` show the task finished work that unblocks a next step named in `brief` or needed by one of the tasks in `tasks`?",
         kinds: &[Kind::Ended],
         urgent: false,
+        wakes_at: HIGH,
     },
     Question {
         id: "result",
         text: "Does the reply in `event` report a finished result, a finding or a decision that the person who asked for this work would want to hear about? A reply that only acknowledges, agrees, claims a share of the work, or says what it will do next is not one.",
         kinds: &[Kind::Ended],
         urgent: false,
+        // "Done" or "on it" read as results too often: it takes a clear one.
+        wakes_at: 0.85,
     },
     Question {
         id: "remember",
         text: "Is `event` a message from the person that states a lasting preference, rule or fact about the person or the project that `memory` does not already hold?",
         kinds: &[Kind::Said],
         urgent: false,
+        wakes_at: HIGH,
     },
 ];
 
@@ -256,7 +267,7 @@ pub fn band(answers: &Map<String, Value>) -> (Band, Vec<(&'static str, f64)>) {
         .filter_map(|q| Some((q, answers.get(q.id)?.as_f64()?)))
         .collect();
     scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-    let high: Vec<_> = scored.iter().filter(|(_, p)| *p >= HIGH).collect();
+    let high: Vec<_> = scored.iter().filter(|(q, p)| *p >= q.wakes_at).collect();
     let reasons = |least: f64| -> Vec<(&'static str, f64)> {
         scored
             .iter()
@@ -266,7 +277,8 @@ pub fn band(answers: &Map<String, Value>) -> (Band, Vec<(&'static str, f64)>) {
     };
     if !high.is_empty() {
         let steer = high.iter().any(|(q, _)| q.urgent);
-        return (Band::Wake { steer }, reasons(HIGH));
+        let reasons = high.iter().map(|(q, p)| (q.id, *p)).collect();
+        return (Band::Wake { steer }, reasons);
     }
     match scored.first() {
         Some((_, p)) if *p >= LOW => (Band::Hold, reasons(LOW)),
@@ -294,10 +306,29 @@ fn note(items: &[Item], more: usize, told: &updates::Told, dropped: usize) -> St
     let mut lines = vec![format!(
         "{TASK_UPDATES}what your tasks did since you last heard; the wait tool reads each turn by its handle."
     )];
-    if !items.is_empty() {
+    let told_handles: HashSet<&str> = told.items.iter().map(|l| l.handle.as_str()).collect();
+    let handle = |item: &Item| format!("turn:{}/{}", item.seen.task, item.seen.turn);
+    let (woke, held): (Vec<&Item>, Vec<&Item>) =
+        (items.iter()).partition(|item| matches!(item.band, Band::Wake { .. }));
+    // What only might matter is named, not acted on; a turn the task
+    // updates list already is not named twice.
+    let held: Vec<String> = (held.iter())
+        .filter(|item| !told_handles.contains(handle(item).as_str()))
+        .map(|item| {
+            let why = match item.reasons.is_empty() {
+                true => "not checked".to_owned(),
+                false => (item.reasons.iter())
+                    .map(|(id, p)| format!("{} {p:.2}", id.replace('_', " ")))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            };
+            format!("{} ({why})", handle(item))
+        })
+        .collect();
+    if !woke.is_empty() {
         lines.push("May need you:".to_owned());
     }
-    for item in items {
+    for item in woke {
         let seen = &item.seen;
         let why = match item.reasons.is_empty() {
             true => "not checked".to_owned(),
@@ -348,7 +379,8 @@ fn note(items: &[Item], more: usize, told: &updates::Told, dropped: usize) -> St
     }
     // A turn the judge picked is told once, with why.
     let picked: HashSet<String> = (items.iter())
-        .map(|item| format!("turn:{}/{}", item.seen.task, item.seen.turn))
+        .filter(|item| matches!(item.band, Band::Wake { .. }))
+        .map(handle)
         .collect();
     let told_items: Vec<&updates::Line> = (told.items.iter())
         .filter(|line| !picked.contains(&line.handle))
@@ -367,10 +399,16 @@ fn note(items: &[Item], more: usize, told: &updates::Told, dropped: usize) -> St
     if told.more > 0 {
         lines.push(format!("- {} more tasks in the next note", told.more));
     }
+    if !held.is_empty() {
+        lines.push(format!(
+            "Worth a look if you are there anyway: {}.",
+            held.join(", ")
+        ));
+    }
     if dropped > 0 {
         lines.push(format!("{dropped} other events checked; none needs you."));
     }
-    lines.push(match items.is_empty() {
+    lines.push(match picked.is_empty() {
         true => "If nothing needs you, end with one line.".to_owned(),
         false => {
             "A quoted message is the person's own words. Do what each line under \"May need you\" \
@@ -1193,6 +1231,10 @@ fn lock(store: &std::path::Path) -> Result<Option<std::fs::File>, String> {
     // SAFETY: flock on a descriptor `file` owns and keeps open; the lock is
     // released when the process exits.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        // Its process, which `/status` asks after.
+        use std::io::Write;
+        let _ = file.set_len(0);
+        let _ = write!(&file, "{}", std::process::id());
         return Ok(Some(file));
     }
     let error = std::io::Error::last_os_error();
@@ -1393,6 +1435,9 @@ impl Service {
                 None
             }
         };
+        // Said once a lead is watched, so `/status` shows it from the start.
+        self.write(&json!({"at_ms": epoch_ms(), "lead": lead, "seated": true,
+            "judge": judge.as_ref().map(|j| j.name.clone())}));
         let workspace = PathBuf::from(record["workspace"].as_str().unwrap_or("/"));
         let mut lookout = Lookout::new(project, lead, workspace, judge);
         lookout.log = Some(self.log.clone());
@@ -1423,6 +1468,61 @@ impl Service {
     fn write(&self, line: &Value) {
         append(&self.log, line);
     }
+}
+
+/// The most of the check log `status` reads, from its end.
+const STATUS_BYTES: u64 = 1 << 20;
+
+/// One line on the lookout for a lead, as `/status` shows it: whether one
+/// runs, who judges, and today's checks and notes.
+pub fn status(store: &std::path::Path, lead: &str) -> String {
+    use std::io::{Read, Seek};
+    let beside = |suffix: &str| {
+        let mut path = store.as_os_str().to_owned();
+        path.push(suffix);
+        PathBuf::from(path)
+    };
+    let pid: Option<i32> = std::fs::read_to_string(beside(".lookout.lock"))
+        .ok()
+        .and_then(|pid| pid.trim().parse().ok());
+    // SAFETY: signal 0 sends nothing; it only asks whether the process lives.
+    if !pid.is_some_and(|pid| pid > 0 && unsafe { libc::kill(pid, 0) } == 0) {
+        return "Lookout · not running".to_owned();
+    }
+    let mut text = String::new();
+    if let Ok(mut file) = std::fs::File::open(beside(".lookout.jsonl")) {
+        let length = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let _ = file.seek(std::io::SeekFrom::Start(
+            length.saturating_sub(STATUS_BYTES),
+        ));
+        let _ = file.read_to_string(&mut text);
+    }
+    let day = epoch_ms().saturating_sub(24 * 60 * 60 * 1000);
+    let (mut judge, mut checks, mut notes) = (None, 0, 0);
+    for line in text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+    {
+        if line["lead"] != lead {
+            continue;
+        }
+        if line["seated"] == true {
+            judge = Some(line["judge"].as_str().map(str::to_owned));
+        }
+        if line["at_ms"]
+            .as_u64()
+            .is_some_and(|at| u128::from(at) >= day)
+        {
+            checks += usize::from(line.get("answers").is_some());
+            notes += usize::from(line.get("woke").is_some());
+        }
+    }
+    let judged = match judge {
+        Some(Some(judge)) => format!("judged by {judge}"),
+        Some(None) => "task updates only, no judge".to_owned(),
+        None => "not watching this lead yet".to_owned(),
+    };
+    format!("Lookout · {judged} · {checks} checks, {notes} notes in the last day")
 }
 
 /// Every bot the daemon lists, page by page.
@@ -1492,6 +1592,9 @@ struct Lookout {
     recent: Recent,
     /// Checks to start.
     due: Vec<Seen>,
+    /// Turns the lead read with its wait tool: a check of one that answers
+    /// late is not news.
+    read: HashSet<String>,
     /// News for the lead, sent with the next wake.
     held: Vec<Item>,
     held_since: Option<Instant>,
@@ -1524,6 +1627,7 @@ impl Lookout {
             briefs: HashMap::new(),
             recent: Recent::default(),
             due: Vec::new(),
+            read: HashSet::new(),
             held: Vec::new(),
             held_since: None,
             urgent: None,
@@ -1587,6 +1691,18 @@ impl Lookout {
                     self.waiting_any = data["any"] == true;
                 }
                 "accepted" | "turn_resumed" | "turn_finished" => self.waiting_on.clear(),
+                // What the lead reads with its wait tool is no news to it.
+                "tool_started" if data["name"] == "wait" => {
+                    let arguments: Value = data["arguments"]
+                        .as_str()
+                        .and_then(|a| serde_json::from_str(a).ok())
+                        .unwrap_or_default();
+                    let handles: HashSet<String> = (arguments["handles"].as_array().into_iter())
+                        .flatten()
+                        .filter_map(|h| h.as_str().map(str::to_owned))
+                        .collect();
+                    self.read(&handles);
+                }
                 _ => {}
             }
             return;
@@ -1661,6 +1777,9 @@ impl Lookout {
                     return;
                 }
                 let denied = self.denied.remove(&(bot.to_owned(), turn)).unwrap_or(0);
+                // Ending after the lead read it, it has a reply the lead has
+                // not seen.
+                self.read.remove(&format!("turn:{bot}/{turn}"));
                 // A turn the lead waits on is read by its own wait, unless
                 // the approver held it back: that needs the person.
                 if denied == 0 && self.waiting_on.contains(&format!("turn:{bot}/{turn}")) {
@@ -1684,6 +1803,27 @@ impl Lookout {
             }
             _ => {}
         }
+    }
+
+    /// The lead read these turns itself: news of them is dropped, and so
+    /// is a check of one still under way.
+    fn read(&mut self, handles: &HashSet<String>) {
+        if handles.is_empty() {
+            return;
+        }
+        let read = |seen: &Seen| handles.contains(&format!("turn:{}/{}", seen.task, seen.turn));
+        self.held.retain(|item| !read(&item.seen));
+        self.due.retain(|seen| !read(seen));
+        // Kept for checks still under way; a long-lived lead's list stays short.
+        if self.read.len() > 1024 {
+            self.read.clear();
+        }
+        self.read.extend(handles.iter().cloned());
+        self.updates.read(handles);
+        if self.held.is_empty() {
+            self.held_since = None;
+        }
+        self.urgent = self.pending();
     }
 
     /// Keeps each task's running turn and when it last printed anything:
@@ -1815,6 +1955,14 @@ impl Lookout {
     }
 
     fn answered(&mut self, seen: Seen, answered: Result<Checked, Failure>) {
+        if self
+            .read
+            .contains(&format!("turn:{}/{}", seen.task, seen.turn))
+        {
+            self.write(&json!({"at_ms": epoch_ms(), "lead": self.lead, "task": seen.task,
+                "turn": seen.turn, "kind": format!("{:?}", seen.kind), "skipped": "the lead read it"}));
+            return;
+        }
         let mut line = json!({"at_ms": epoch_ms(), "lead": self.lead, "task": seen.task,
             "turn": seen.turn, "kind": format!("{:?}", seen.kind), "judge": self.judge.as_ref().map(|j| j.name.clone())});
         match answered {
@@ -2407,6 +2555,121 @@ mod tests {
     }
 
     #[test]
+    fn what_the_lead_reads_with_its_wait_is_no_news() {
+        let mut lookout = lookout();
+        let held = lookout.due_seen();
+        lookout.answered(
+            held,
+            Ok(Checked {
+                answers: answers(&[("off_brief", 0.9)]),
+                tokens: 0,
+                ms: 0,
+                text: String::new(),
+            }),
+        );
+        assert_eq!(lookout.held.len(), 1);
+        let late = Seen {
+            turn: 2,
+            ..lookout.due_seen()
+        };
+        let wait = json!({"name": "wait", "arguments": json!({"handles": ["turn:calc.fix/1", "turn:calc.fix/2"]}).to_string()});
+        lookout.event(&ev("calc.lead", 7, "tool_started", wait));
+        assert!(lookout.held.is_empty() && lookout.urgent.is_none());
+        // A check under way when the lead read the turn answers to no one.
+        lookout.answered(
+            late,
+            Ok(Checked {
+                answers: answers(&[("off_brief", 0.9)]),
+                tokens: 0,
+                ms: 0,
+                text: String::new(),
+            }),
+        );
+        assert!(lookout.held.is_empty());
+        // A turn that ends after the lead read it has news again.
+        lookout.event(&ev(
+            "calc.fix",
+            2,
+            "turn_finished",
+            json!({"status": "completed"}),
+        ));
+        assert_eq!(lookout.due.len(), 1);
+    }
+
+    #[test]
+    fn a_middling_result_waits_and_a_held_turn_is_only_named() {
+        assert_eq!(band(&answers(&[("result", 0.8)])).0, Band::Hold);
+        assert_eq!(
+            band(&answers(&[("result", 0.9)])).0,
+            Band::Wake { steer: false }
+        );
+        let item = |task: &str, band| Item {
+            seen: Seen {
+                task: task.into(),
+                turn: 1,
+                kind: Kind::Ended,
+                from: None,
+                status: Some("completed".into()),
+                node: None,
+                call: None,
+                brief: None,
+                peers: Vec::new(),
+                text: String::new(),
+            },
+            reasons: vec![("result", 0.8)],
+            band,
+        };
+        let note = note(
+            &[item("calc.fix", Band::Hold), item("calc.ui", Band::Hold)],
+            0,
+            &updates::Told::default(),
+            0,
+        );
+        assert!(!note.contains("May need you"));
+        assert!(note.contains(
+            "Worth a look if you are there anyway: turn:calc.fix/1 (result 0.80), turn:calc.ui/1 (result 0.80)."
+        ));
+        assert!(note.ends_with("If nothing needs you, end with one line."));
+    }
+
+    #[test]
+    fn status_says_who_judges_from_the_start() {
+        let dir = std::env::temp_dir().join(format!("lookout-status-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        assert_eq!(status(&store, "calc.lead"), "Lookout · not running");
+        let held = lock(&store).unwrap().unwrap();
+        let now = epoch_ms();
+        let log = dir.join("state.sqlite.lookout.jsonl");
+        append(
+            &log,
+            &json!({"at_ms": now, "lead": "calc.lead", "seated": true, "judge": "bedrock/haiku"}),
+        );
+        append(
+            &log,
+            &json!({"at_ms": now, "lead": "calc.lead", "kind": "Ended", "answers": {}}),
+        );
+        append(
+            &log,
+            &json!({"at_ms": now, "lead": "calc.lead", "woke": []}),
+        );
+        append(
+            &log,
+            &json!({"at_ms": now, "lead": "shop.lead", "seated": true, "judge": null}),
+        );
+        assert_eq!(
+            status(&store, "calc.lead"),
+            "Lookout · judged by bedrock/haiku · 1 checks, 1 notes in the last day"
+        );
+        assert_eq!(
+            status(&store, "shop.lead"),
+            "Lookout · task updates only, no judge · 0 checks, 0 notes in the last day"
+        );
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_lead_with_no_judge_still_hears_its_task_updates() {
         let mut lookout = Lookout::new("calc", "calc.lead", PathBuf::from("/"), None);
         let now = Instant::now();
@@ -2855,7 +3118,8 @@ mod tests {
         assert!(lookout.due.is_empty());
         assert_eq!(lookout.held.len(), 1);
         assert!(
-            note(&lookout.held, 0, &updates::Told::default(), 0).contains("(not checked; look)")
+            note(&lookout.held, 0, &updates::Told::default(), 0)
+                .contains("Worth a look if you are there anyway: turn:")
         );
         assert_eq!(lookout.held[0].seen.text, "words");
     }

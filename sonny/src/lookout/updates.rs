@@ -25,7 +25,10 @@ const WAKE_TASKS: usize = 32;
 const FORWARD: Duration = Duration::from_secs(15);
 const MEMORY_LINES: usize = 20;
 const ACTIVE: [&str; 5] = ["running", "waiting", "paced", "queued", "ready"];
-const APPROVAL: &str = "waiting for approval";
+const APPROVAL: &str = "waiting for the person's approval";
+/// An approval is news once the approver has had its say: a call the
+/// approver answers waits a few seconds first, the person's longer.
+const APPROVAL_AFTER: Duration = super::APPROVAL_AFTER;
 
 /// A task's latest turn of one kind, and how many came since the first.
 #[derive(Clone, Debug, PartialEq)]
@@ -108,6 +111,8 @@ pub struct Updates {
     /// Turns whose answer a trigger passes to the lead: when they become
     /// news if it does not, and the news.
     forwarding: HashMap<Key, (Instant, String, Option<String>, Option<String>)>,
+    /// Approvals not yet answered: when they become news, and the call.
+    approvals: HashMap<Key, (Instant, Option<String>)>,
     /// Each task's news, in the order it first came.
     tasks: Vec<(String, News)>,
     last: Option<Instant>,
@@ -133,6 +138,7 @@ impl Updates {
             origin: HashMap::new(),
             answer_to: HashMap::new(),
             forwarding: HashMap::new(),
+            approvals: HashMap::new(),
             tasks: Vec::new(),
             last: None,
             memory_seen: None,
@@ -265,7 +271,9 @@ impl Updates {
                     && let Some(turn) = turn
                 {
                     let call = data["call_id"].as_str().map(str::to_owned);
-                    self.tell(name, turn, APPROVAL, None, call, None);
+                    self.approvals
+                        .entry(key(turn))
+                        .or_insert((now + APPROVAL_AFTER, call));
                 }
             }
             "turn_paced" => {
@@ -273,7 +281,16 @@ impl Updates {
                     bot.status = "paced".into();
                 }
             }
+            // Answered: no longer news.
+            "tool_completed" => {
+                if let Some(turn) = turn {
+                    self.approvals.remove(&key(turn));
+                }
+            }
             "turn_resumed" => {
+                if let Some(turn) = turn {
+                    self.approvals.remove(&key(turn));
+                }
                 if let Some(bot) = self.bots.get_mut(name) {
                     bot.status = "running".into();
                     bot.waiting_on.clear();
@@ -281,6 +298,7 @@ impl Updates {
             }
             "turn_finished" => {
                 let Some(turn) = turn else { return };
+                self.approvals.remove(&key(turn));
                 let status = data["status"].as_str().unwrap_or("?").to_owned();
                 let from = self.from.remove(&key(turn));
                 let origin = self.origin.remove(&key(turn));
@@ -384,6 +402,33 @@ impl Updates {
                 self.tell(&key.0, key.1, &status, from, None, origin);
             }
         }
+        let waited: Vec<Key> = (self.approvals.iter())
+            .filter(|(_, (at, _))| *at <= now)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in waited {
+            if let Some((_, call)) = self.approvals.remove(&key) {
+                self.tell(&key.0, key.1, APPROVAL, None, call, None);
+            }
+        }
+    }
+
+    /// The lead read these turns with its wait tool: what they said is no
+    /// news to it any more.
+    pub fn read(&mut self, handles: &HashSet<String>) {
+        for (name, news) in &mut self.tasks {
+            for kind in [&mut news.act, &mut news.theirs] {
+                if kind.as_ref().is_some_and(|t| {
+                    t.status != APPROVAL && handles.contains(&format!("turn:{name}/{}", t.turn))
+                }) {
+                    *kind = None;
+                }
+            }
+        }
+        self.tasks
+            .retain(|(_, news)| news.act.is_some() || news.theirs.is_some());
+        self.forwarding
+            .retain(|(name, turn), _| !handles.contains(&format!("turn:{name}/{turn}")));
     }
 
     /// Whether the lead is to hear now: there is news, it rests, and it
@@ -456,6 +501,7 @@ impl Updates {
     pub fn forget(&mut self) {
         self.tasks.clear();
         self.forwarding.clear();
+        self.approvals.clear();
     }
 
     /// The bot under `name` is gone: drop its news, or all of it when it
@@ -466,6 +512,7 @@ impl Updates {
         }
         self.tasks.retain(|(task, _)| task != name);
         self.forwarding.retain(|(task, _), _| task != name);
+        self.approvals.retain(|(task, _), _| task != name);
     }
 
     /// What was saved to or removed from the person's and the project's
@@ -763,16 +810,58 @@ mod tests {
             ),
             now,
         );
+        // The approver has its say first.
+        updates.expire(now);
+        assert!(!updates.due(now), "the lead read shop.fix with its wait");
+        updates.expire(now + APPROVAL_AFTER);
         let told = updates.take(now);
         assert_eq!(
             text(&told),
-            "- shop.docs: turn:shop.docs/2 waiting for approval",
-            "the lead read shop.fix with its wait"
+            "- shop.docs: turn:shop.docs/2 waiting for the person's approval"
         );
         // Refused: the news comes back for next time.
         updates.unsent(told);
         let again = updates.take(now + WAKE);
-        assert!(text(&again).contains("shop.docs/2 waiting for approval"));
+        assert!(text(&again).contains("shop.docs/2 waiting for the person's approval"));
+    }
+
+    #[test]
+    fn an_approval_answered_in_time_and_a_turn_the_lead_read_are_no_news() {
+        let mut updates = fleet();
+        let now = Instant::now();
+        updates.event(&ev("shop.docs", Some(2), "accepted", json!({})), now);
+        updates.event(
+            &ev(
+                "shop.docs",
+                Some(2),
+                "turn_waiting",
+                json!({"approval": true, "call_id": "c1"}),
+            ),
+            now,
+        );
+        // The approver allowed it.
+        updates.event(&ev("shop.docs", Some(2), "turn_resumed", json!({})), now);
+        updates.expire(now + APPROVAL_AFTER);
+        assert!(updates.take(now).items.is_empty());
+        turn(
+            &mut updates,
+            "shop.fix",
+            4,
+            json!({"from": {"bot": "shop.lead", "turn": 9}}),
+            "completed",
+        );
+        turn(
+            &mut updates,
+            "shop.fix",
+            5,
+            json!({"from": {"bot": "shop.lead", "turn": 9}}),
+            "completed",
+        );
+        // Reading an earlier turn leaves the latest news.
+        updates.read(&["turn:shop.fix/4".to_owned()].into());
+        assert!(updates.due(now + WAKE));
+        updates.read(&["turn:shop.fix/5".to_owned()].into());
+        assert!(!updates.due(now + WAKE));
     }
 
     #[test]
