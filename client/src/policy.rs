@@ -359,7 +359,7 @@ pub type Skill = Entry;
 pub const CLIENT_ROLES: [&str; 1] = ["lead"];
 
 /// Whether a profile file's stem is a client role. Case is ignored: on a
-/// case-insensitive filesystem (macOS's default) `Coordinator.md` is the
+/// case-insensitive filesystem (macOS's default) `Lead.md` is the
 /// file `profile(_, "lead")` reads.
 fn client_role(stem: &str) -> bool {
     CLIENT_ROLES
