@@ -10,7 +10,6 @@
 //! names each task's latest turn of each kind, by the handle the wait tool
 //! reads it with. What changed in memory rides along, and never sends a
 //! note by itself.
-use super::lead_project;
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
@@ -100,9 +99,11 @@ type Key = (String, i64);
 
 pub struct Updates {
     lead: String,
-    project: String,
-    /// `~/.agents/memory`, where the person's and the project's facts are.
-    memory: Option<PathBuf>,
+    /// The memory folders whose facts are news: the person's and the
+    /// project's, as the subscriber's own memory indexes name them.
+    memory: Vec<PathBuf>,
+    /// Bots with subscriptions of their own: no one's tasks here.
+    subscribers: HashSet<String>,
     pub live: bool,
     bots: HashMap<String, Bot>,
     from: HashMap<Key, String>,
@@ -127,11 +128,11 @@ fn now_ms() -> u64 {
 }
 
 impl Updates {
-    pub fn new(lead: &str, project: &str, memory: Option<PathBuf>) -> Self {
+    pub fn new(lead: &str, memory: Vec<PathBuf>) -> Self {
         Self {
             lead: lead.to_owned(),
-            project: project.to_owned(),
             memory,
+            subscribers: HashSet::new(),
             live: false,
             bots: HashMap::new(),
             from: HashMap::new(),
@@ -342,7 +343,7 @@ impl Updates {
         origin: Option<String>,
     ) {
         if self.creator(name) != Some(self.lead.as_str())
-            || lead_project(name).is_some()
+            || self.subscribers.contains(name)
             || name.starts_with(&format!("{}-", self.lead))
         {
             return;
@@ -504,12 +505,36 @@ impl Updates {
         self.approvals.clear();
     }
 
+    /// The bots with subscriptions of their own, now: what was news of
+    /// them is no longer.
+    pub fn subscribed(&mut self, subscribers: HashSet<String>) {
+        let new: Vec<String> = (subscribers.difference(&self.subscribers))
+            .cloned()
+            .collect();
+        for name in new {
+            self.drop_news(&name);
+        }
+        self.subscribers = subscribers;
+    }
+
+    /// Task updates were just asked for: news from now on, the bots'
+    /// states kept.
+    pub fn begin(&mut self) {
+        self.forget();
+        self.memory_seen = None;
+        self.opened = now_ms();
+    }
+
     /// The bot under `name` is gone: drop its news, or all of it when it
     /// was the lead.
     fn gone(&mut self, name: &str) {
         if name == self.lead {
             return self.forget();
         }
+        self.drop_news(name);
+    }
+
+    fn drop_news(&mut self, name: &str) {
         self.tasks.retain(|(task, _)| task != name);
         self.forwarding.retain(|(task, _), _| task != name);
         self.approvals.retain(|(task, _), _| task != name);
@@ -519,9 +544,7 @@ impl Updates {
     /// memory since the lead last heard (or since the lookout started), less what
     /// the lead saved itself; and what it will have heard.
     fn memory_news(&mut self) -> Option<(String, HashMap<String, u64>)> {
-        let root = self.memory.as_ref()?;
-        let dirs = [root.clone(), root.join("projects").join(&self.project)];
-        let read: Vec<(String, Vec<Fact>)> = dirs
+        let read: Vec<(String, Vec<Fact>)> = (self.memory)
             .iter()
             .filter_map(|dir| Some((dir.to_string_lossy().into_owned(), facts(dir)?)))
             .collect();
@@ -658,7 +681,7 @@ mod tests {
     }
 
     fn fleet() -> Updates {
-        let mut updates = Updates::new("shop.lead", "shop", None);
+        let mut updates = Updates::new("shop.lead", Vec::new());
         let now = Instant::now();
         for (name, id, by, by_id) in [
             ("shop.lead", 1, None, None),
@@ -879,7 +902,7 @@ mod tests {
         };
         fact(&root, "old", "person");
         let mut updates = fleet();
-        updates.memory = Some(root.clone());
+        updates.memory = vec![root.clone(), project.clone()];
         updates.opened = 0;
         let news = |updates: &mut Updates| {
             let now = Instant::now() + WAKE * 10;

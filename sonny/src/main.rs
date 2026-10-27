@@ -1,4 +1,4 @@
-//! Sonny, a terminal client for one bot, beside the app: its conversation goes
+//! Sonny, a terminal client for one bot: its conversation goes
 //! into the terminal's own scrollback as it happens, and a few rows at the
 //! bottom hold what is still moving: the reply being written, what the bot
 //! is doing, and the composer. Prototype.
@@ -124,17 +124,20 @@ fn usage() -> String {
      the person above the composer until they answer it.\n\
      sonny lookout [--judge PROVIDER/MODEL|off] watches every lead on the daemon and\n\
      wakes it when its tasks need it; Sonny starts one. sonny lookout --replay --judge\n\
-     SPEC[,SPEC]... [--limit N] runs its checks over what the store kept."
+     SPEC[,SPEC]... [--limit N] runs its checks over what the store kept.\n\
+     sonny agent ARGS... runs Sonny's own `agent` with ARGS, whatever `agent` is on PATH."
         .into()
 }
 
 /// `sonny show TASK [--split SIDE [--beside BOT]] [--rex-host HOST]`: put a
 /// task's window where the person asked, from the lead's shell. A task gets
 /// a window of its own unless told otherwise; `--split` puts it beside the
-/// lead's block, or `--beside` another bot's.
+/// lead's block, or `--beside` another bot's. Another project's lead gets
+/// its project's own home instead (a Rex session, a Herdr workspace),
+/// running that lead's Sonny, unless it is there already.
 async fn show() -> Result<(), String> {
     let usage =
-        "usage: sonny show TASK [--split right|left|above|below [--beside BOT]] [--rex-host HOST]";
+        "usage: sonny show AGENT [--split right|left|above|below [--beside BOT]] [--rex-host HOST]";
     let mut args = std::env::args().skip(2);
     let bot = args.next().filter(|b| !b.starts_with('-')).ok_or(usage)?;
     let caller = std::env::var("AGENT_BOT").ok();
@@ -149,9 +152,14 @@ async fn show() -> Result<(), String> {
             _ => return Err(usage.into()),
         }
     }
-    let (socket, project, mut layout) =
-        agents_layout(caller.as_deref().unwrap_or(&bot), host).await?;
+    let (socket, project) = agents_project(caller.as_deref().unwrap_or(&bot)).await?;
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
+    if side.is_none()
+        && let Some(other) = bot.strip_suffix(".lead").filter(|p| *p != project)
+    {
+        return show_lead(&socket, other, &project, host.as_deref(), &me);
+    }
+    let mut layout = mux::for_agent(&socket, &project, host.as_deref(), None)?;
     let command = [
         me.to_string_lossy().into_owned(),
         "--socket".into(),
@@ -177,28 +185,70 @@ async fn show() -> Result<(), String> {
     Ok(())
 }
 
-/// The daemon's socket, the project `bot` belongs to, and its home in the
-/// person's multiplexer, from an agent's shell.
-async fn agents_layout(
-    bot: &str,
-    host: Option<String>,
-) -> Result<(PathBuf, String, mux::Layout), String> {
+/// Another project's lead in its project's own home, made when needed in
+/// the multiplexer `like`'s home is in, running Sonny on it: a session for
+/// each lead, and in it a window for each of its tasks.
+fn show_lead(
+    socket: &std::path::Path,
+    project: &str,
+    like: &str,
+    host: Option<&str>,
+    me: &std::path::Path,
+) -> Result<(), String> {
+    let store = std::env::var_os("AGENT_STORE").map(PathBuf::from);
+    let (home, opened) = open_lead(socket, store.as_deref(), project, like, host, me)?;
+    let bot = format!("{project}.lead");
+    println!("{}", json!({"bot": bot, "in": home, "opened": opened}));
+    Ok(())
+}
+
+/// Open `project`'s lead in that project's own home, as `show_lead` says,
+/// unless its Sonny is there already. Returns the home, and whether it
+/// was opened now.
+fn open_lead(
+    socket: &std::path::Path,
+    store: Option<&std::path::Path>,
+    project: &str,
+    like: &str,
+    host: Option<&str>,
+    me: &std::path::Path,
+) -> Result<(String, bool), String> {
+    let mut layout = mux::for_agent(socket, project, host, Some(like))?;
+    let bot = format!("{project}.lead");
+    let mut command = vec![me.to_string_lossy().into_owned()];
+    if let Some(store) = store {
+        command.extend(["--store".into(), store.to_string_lossy().into_owned()]);
+    }
+    command.extend([
+        "--socket".into(),
+        socket.to_string_lossy().into_owned(),
+        "--bot".into(),
+        bot.clone(),
+    ]);
+    let opened = layout.show(&bot, "lead", &command)?;
+    Ok((layout.home(), opened))
+}
+
+/// The daemon's socket and the project `bot` belongs to, from an agent's
+/// shell.
+async fn agents_project(bot: &str) -> Result<(PathBuf, String), String> {
     let socket = std::env::var_os("AGENT_SOCKET")
         .map(PathBuf::from)
         .ok_or("run this from an agent's shell (AGENT_SOCKET is not set)")?;
     let socket = std::path::absolute(socket).map_err(|e| e.to_string())?;
     let client = Client::connect(&socket).await.map_err(|e| e.to_string())?.0;
     let project = project_of(&client, bot).await;
-    let layout = mux::for_agent(&socket, &project, host.as_deref())?;
-    Ok((socket, project, layout))
+    Ok((socket, project))
 }
 
-/// `sonny split NAME [--window] [--rex-host HOST] -- COMMAND...`: run a
-/// command an agent wants watched (a dev server, a long build) in a Rex
-/// block labelled `AGENT/NAME`, below the agent's own block or in a window
-/// of its own, and print the block's ID. It closes with the agent's window.
-async fn split() -> Result<(), String> {
-    let usage = "usage: sonny split NAME [--window] [--rex-host HOST] -- COMMAND...";
+/// `sonny run NAME [--split SIDE] [--rex-host HOST] -- COMMAND...`: run a
+/// command an agent wants watched (a dev server, a long build) in a block
+/// labelled `AGENT/NAME`, in a tab of its own, or with `--split` on that
+/// side of the agent's own block, and print the block's ID. It closes with
+/// the agent's window.
+async fn run_command() -> Result<(), String> {
+    let usage =
+        "usage: sonny run NAME [--split right|left|above|below] [--rex-host HOST] -- COMMAND...";
     let mut args = std::env::args().skip(2);
     let name = args.next().filter(|n| !n.starts_with('-')).ok_or(usage)?;
     if name.contains('/') {
@@ -206,10 +256,10 @@ async fn split() -> Result<(), String> {
     }
     let owner = std::env::var("AGENT_BOT")
         .map_err(|_| "run this from an agent's shell (AGENT_BOT is not set)")?;
-    let (mut window, mut host) = (false, None);
+    let (mut side, mut host) = (None, None);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--window" => window = true,
+            "--split" => side = Some(args.next().ok_or(usage)?),
             "--rex-host" => host = Some(args.next().ok_or(usage)?),
             "--" => break,
             _ => return Err(usage.into()),
@@ -219,9 +269,10 @@ async fn split() -> Result<(), String> {
     if command.is_empty() {
         return Err(usage.into());
     }
-    let (_, _, mut layout) = agents_layout(&owner, host).await?;
+    let (socket, project) = agents_project(&owner).await?;
+    let mut layout = mux::for_agent(&socket, &project, host.as_deref(), None)?;
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let block = layout.split(&owner, &name, &cwd, &command, window)?;
+    let block = layout.split(&owner, &name, &cwd, &command, side.as_deref())?;
     println!(
         "{}",
         json!({"block": block, "label": format!("{owner}/{name}"), "in": layout.home()})
@@ -261,17 +312,14 @@ fn which(program: &str) -> Option<PathBuf> {
 
 /// Agent's own binary: the one the daemon gave this shell, else the one
 /// installed beside Sonny (`libexec/agent`, as the Linux tarball lays it
-/// out), else Homebrew's `agent` formula when Sonny is its `sonny`, else
-/// the app's. Not `agent` on PATH, which may be another program.
+/// out), else Homebrew's `agent` formula when Sonny is its `sonny`. Not
+/// `agent` on PATH, which may be another program.
 fn agent_bin() -> Option<PathBuf> {
     let me = std::env::current_exe().and_then(std::fs::canonicalize).ok();
     std::env::var_os("AGENT_BIN")
         .map(PathBuf::from)
         .into_iter()
         .chain(me.iter().flat_map(|me| installed_agent(me)))
-        .chain([PathBuf::from(
-            "/Applications/Agent.app/Contents/MacOS/agent",
-        )])
         .find(|bin| bin.is_file())
 }
 
@@ -292,6 +340,16 @@ fn installed_agent(me: &std::path::Path) -> Vec<PathBuf> {
         found.push(prefix.join("opt/agent/bin/agent"));
     }
     found
+}
+
+/// `sonny agent ARGS...`: the `agent` Sonny itself starts, run with
+/// ARGS and the same keys, in place of this process, so the person reaches
+/// it whatever else is called `agent` on their PATH.
+fn pass_to_agent(args: &[String]) -> Result<(), String> {
+    let bin = agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
+    let mut command = agent_command(&bin)?;
+    let error = std::os::unix::process::CommandExt::exec(command.args(args));
+    Err(format!("{}: {error}", bin.display()))
 }
 
 /// Agent's binary to run, with the provider keys kept in ~/.agent/env
@@ -412,7 +470,7 @@ fn start_daemon(
     login: bool,
 ) -> Result<(), String> {
     let bin = agent_bin().ok_or(
-        "the daemon is not running and Agent's binary was not found; install Sonny with Homebrew, open Agent.app, or set AGENT_BIN",
+        "the daemon is not running and Agent's binary was not found; install Sonny with Homebrew, or set AGENT_BIN",
     )?;
     let mut command = std::process::Command::new(&bin);
     if let Some(environment) = login.then(login::environment).flatten() {
@@ -535,6 +593,13 @@ fn reopen() -> Vec<String> {
 // Two threads, so the daemon's events are read while a picture is drawn:
 // a reader that stops is dropped by the daemon as lagging.
 fn main() -> std::process::ExitCode {
+    // Every agent Sonny makes, and every agent those make through `sonny
+    // agent`, is told to reach the daemon this one way, by a path that
+    // outlives an upgrade.
+    if let Some(me) = skills::sonny_path() {
+        // SAFETY: nothing else runs yet: no thread is started before this.
+        unsafe { std::env::set_var("AGENT_CLI", format!("\"{}\" agent", me.display())) };
+    }
     // sandfs serves task copies' mounts from this program run again as
     // `sonny sandfs ...`, outside any runtime of Sonny's.
     sandfs::handle_relaunch(&["sandfs"]);
@@ -557,6 +622,7 @@ fn main() -> std::process::ExitCode {
         }
         Some((ask, rest)) if ask == "ask" => asks::run(rest),
         Some((lookout, rest)) if lookout == "lookout" => lookout::run(rest),
+        Some((agent, rest)) if agent == "agent" => pass_to_agent(rest),
         _ => tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -576,7 +642,7 @@ fn main() -> std::process::ExitCode {
 async fn run() -> Result<(), String> {
     match std::env::args().nth(1).as_deref() {
         Some("show") => return show().await,
-        Some("split") => return split().await,
+        Some("run") => return run_command().await,
         _ => {}
     }
     if std::env::args().nth(1).as_deref() == Some("--version") {
@@ -600,7 +666,9 @@ async fn run() -> Result<(), String> {
             if options.new {
                 create(&client, &options, bot).await?;
             }
-            (bot.clone(), None)
+            // Sonny on a project's lead is that lead's Sonny, wherever it
+            // was opened, as by `sonny show` in the project's own home.
+            (bot.clone(), bot.strip_suffix(".lead").map(str::to_owned))
         }
         None => {
             if options.new {
@@ -678,6 +746,13 @@ async fn run() -> Result<(), String> {
         && let Some(error) = task::remount().pop()
     {
         app.notice = Some(error);
+    }
+    // The lookout knows no leads: it watches a lead's tasks because Sonny
+    // subscribes it to them, before the lookout starts so it reads the file.
+    if let Some(project) = &project
+        && let Err(error) = lookout::subscribe_lead(&app.options.store, &name, project)
+    {
+        app.notice = Some(format!("the lookout: {error}"));
     }
     if project.is_some()
         && let Err(error) = start_lookout(&app.options)
@@ -959,12 +1034,16 @@ struct Running {
 
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, unlisted.
-const COMMANDS: [(&str, &str); 11] = [
+const COMMANDS: [(&str, &str); 12] = [
     (
         "/side",
         "a side chat with a copy of this agent, which carries on",
     ),
     ("/model", "the model and effort"),
+    (
+        "/compact",
+        "summarize the lead's conversation before its next call",
+    ),
     ("/approvals", "whether calls wait for a verdict"),
     ("/instructions", "the lead's, from its folder again"),
     ("/status", "this project's agents"),
@@ -1124,6 +1203,9 @@ struct Fleet {
     lead: String,
     /// The lead and every bot it, or one of them, made.
     lineage: std::collections::HashSet<String>,
+    /// Other projects whose leads were seen: their bots are theirs, never
+    /// tasks here, and their Sonny opens only when asked for.
+    leads: std::collections::HashSet<String>,
     /// How a task's window runs Sonny on it, without the bot's name.
     command: Vec<String>,
     /// Said once in the status row when Rex is set up.
@@ -1149,6 +1231,54 @@ struct Fleet {
     /// Finished calls that may have waited, to read for the turns they
     /// returned: the bot, the output's node, and the call.
     returned: Vec<(String, i64, String)>,
+}
+
+/// The projects inside `project` whose leads are among `names`:
+/// `shop.web` for `shop.web.lead` in `shop`.
+fn inner_projects<'a>(names: impl Iterator<Item = &'a str>, project: &str) -> Vec<String> {
+    let lead = format!("{project}.lead");
+    names
+        .filter(|name| *name != lead)
+        .filter_map(|name| name.strip_suffix(".lead"))
+        .filter(|inner| inner.starts_with(&format!("{project}.")))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// What a bot made just now is to a lead's Sonny.
+#[derive(Debug, PartialEq)]
+enum Kin {
+    /// One of its tasks: a window here.
+    Task,
+    /// Another project's lead: a home of its own, opened when asked for.
+    Lead(String),
+    None,
+}
+
+/// What `bot`, made by `by`, is to the lead of `project` whose lineage
+/// made the bots in `lineage`, with `leads` the other projects seen: any
+/// other project's lead but one this project is inside, by its name alone;
+/// else a task when its name is the project's or one of the lineage made
+/// it, unless it is one of theirs.
+fn kin(
+    bot: &str,
+    by: &str,
+    project: &str,
+    lineage: &std::collections::HashSet<String>,
+    leads: &std::collections::HashSet<String>,
+) -> Kin {
+    let lead = format!("{project}.lead");
+    let theirs = leads.iter().any(|p| bot.starts_with(&format!("{p}.")));
+    // A project this one is inside names all of this one's bots too.
+    let outer = |p: &str| project.starts_with(&format!("{p}."));
+    match bot.strip_suffix(".lead").filter(|_| bot != lead) {
+        Some(other) if outer(other) => Kin::None,
+        Some(other) => Kin::Lead(other.to_owned()),
+        None if !theirs && (lineage.contains(by) || bot.starts_with(&format!("{project}."))) => {
+            Kin::Task
+        }
+        _ => Kin::None,
+    }
 }
 
 impl Fleet {
@@ -1184,6 +1314,7 @@ impl Fleet {
             project: project.to_owned(),
             lead: lead.to_owned(),
             lineage: [lead.to_owned()].into(),
+            leads: Default::default(),
             command,
             note,
             doing: HashMap::new(),
@@ -1215,13 +1346,21 @@ impl Fleet {
         else {
             return;
         };
-        for bot in page["bots"].as_array().into_iter().flatten() {
+        let bots = page["bots"].as_array().cloned().unwrap_or_default();
+        // A project inside this one has a lead, and a home, of its own: its
+        // lead opens there and its tasks are its own.
+        let names = bots.iter().filter_map(|bot| bot["name"].as_str());
+        self.leads.extend(inner_projects(names, &self.project));
+        for bot in &bots {
             // Side chats are never tasks, as when they are made.
             let Some(name) = bot["name"].as_str().filter(|_| bot["expire_ms"].is_null()) else {
                 continue;
             };
-            self.lineage.insert(name.to_owned());
             let running = !bot["running_turn"].is_null();
+            if (self.leads.iter()).any(|p| name.starts_with(&format!("{p}."))) {
+                continue;
+            }
+            self.lineage.insert(name.to_owned());
             // A turn that ended while away is not known by number, and
             // one that started makes the last ending stale.
             self.ended.remove(name);
@@ -1426,9 +1565,14 @@ impl Fleet {
 
     /// Each window holding the project's bots is named after the lead, or
     /// its first bot, and what that bot is doing, with a count of the others
-    /// that are working or need the person: `lead · done · 2 working`.
+    /// that are working or need the person: `lead · done · 2 working`. A
+    /// window that also holds the person's own blocks, as when Sonny was
+    /// opened beside them, keeps the name they gave it.
     fn name_windows(&mut self) {
         for (window, labels) in self.layout.windows() {
+            if !labels.iter().all(|label| self.owns(label)) {
+                continue;
+            }
             let bots: Vec<&String> = labels
                 .iter()
                 .filter(|l| self.doing.contains_key(*l))
@@ -1456,6 +1600,13 @@ impl Fleet {
                 self.named.insert(window, name);
             }
         }
+    }
+
+    /// Whether a block is the project's: a bot's, a command one asked for
+    /// (`BOT/NAME`), or an Errand job's.
+    fn owns(&self, label: &str) -> bool {
+        let bot = label.split_once('/').map_or(label, |(bot, _)| bot);
+        label.starts_with("errand:") || self.doing.contains_key(bot) || self.lineage.contains(bot)
     }
 
     /// Follow every bot again on a new connection; what changed while
@@ -1523,8 +1674,14 @@ impl Fleet {
             // A copy that goes once idle is a side chat, not a task.
             "created" | "forked" if event["data"]["expire_ms"].is_null() => {
                 let by = event["data"]["created_by"].as_str().unwrap_or("");
-                if self.lineage.contains(by) || bot.starts_with(&format!("{}.", self.project)) {
-                    self.lineage.insert(bot.to_owned());
+                match kin(bot, by, &self.project, &self.lineage, &self.leads) {
+                    Kin::Task => {
+                        self.lineage.insert(bot.to_owned());
+                    }
+                    Kin::Lead(project) => {
+                        self.leads.insert(project);
+                    }
+                    Kin::None => {}
                 }
                 None
             }
@@ -2700,6 +2857,24 @@ impl App {
                     self.live = Some(live);
                 }
             }
+            "compaction_text_delta" | "compaction_thinking_delta" => {
+                if let Some(running) = &mut self.running {
+                    running.phase = "Compacting".into();
+                }
+            }
+            "compacted" => self.notice = Some("compacted the conversation".into()),
+            "compaction_failed" => {
+                self.notice = Some(format!(
+                    "compaction failed: {}",
+                    data["error"]
+                        .as_str()
+                        .or(event["error"].as_str())
+                        .unwrap_or("unknown")
+                ))
+            }
+            "tool_calls_withheld" => {
+                self.notice = Some("at the round limit: this reply ends the turn".into())
+            }
             "retry" => {
                 if !self.said.is_empty() {
                     self.replay = Some(std::mem::take(&mut self.said));
@@ -3482,6 +3657,21 @@ impl App {
                 }
                 Err(error) => self.notice = Some(format!("the lead's instructions: {error}")),
             }
+            return;
+        }
+        if prompt == "/compact" {
+            self.input.clear();
+            self.notice = Some(
+                match self
+                    .client
+                    .request("compact", json!({"bot": self.bot}))
+                    .await
+                {
+                    Ok(_) if self.running.is_some() => "compacts at its next step".into(),
+                    Ok(_) => "compacts before its next reply".into(),
+                    Err(error) => format!("compact: {error}"),
+                },
+            );
             return;
         }
         if prompt == "/approvals" {
@@ -4325,6 +4515,48 @@ fn responses(item: &Value) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn another_projects_lead_and_its_tasks_are_never_tasks_here() {
+        let lineage: std::collections::HashSet<String> = ["ws.lead".into(), "ws.fix".into()].into();
+        let mut leads = std::collections::HashSet::new();
+        assert_eq!(kin("ws.fix2", "ws.fix", "ws", &lineage, &leads), Kin::Task);
+        assert_eq!(kin("ws.side", "", "ws", &lineage, &leads), Kin::Task);
+        // Whoever made it, as `sonny project add` says no one.
+        assert_eq!(
+            kin("ws.web.lead", "", "ws", &lineage, &leads),
+            Kin::Lead("ws.web".into())
+        );
+        leads.insert("ws.web".to_owned());
+        // That lead's tasks are its own, though named like this project's.
+        assert_eq!(
+            kin("ws.web.fix", "ws.web.lead", "ws", &lineage, &leads),
+            Kin::None
+        );
+        // After a restart, a project inside this one is known by its lead.
+        let names = [
+            "ws.lead",
+            "ws.fix",
+            "ws.web.lead",
+            "ws.web.fix",
+            "shop.lead",
+        ];
+        assert_eq!(inner_projects(names.into_iter(), "ws"), ["ws.web"]);
+        assert_eq!(
+            kin("shop.lead", "ws.lead", "ws", &lineage, &leads),
+            Kin::Lead("shop".into())
+        );
+        assert_eq!(kin("other.task", "", "ws", &lineage, &leads), Kin::None);
+        // The lead of a project this one is inside leaves its tasks here.
+        let lineage: std::collections::HashSet<String> = ["ws.web.lead".into()].into();
+        let mut leads = std::collections::HashSet::new();
+        assert_eq!(kin("ws.lead", "", "ws.web", &lineage, &leads), Kin::None);
+        leads.insert("ws.api".to_owned());
+        assert_eq!(
+            kin("ws.web.fix", "ws.web.lead", "ws.web", &lineage, &leads),
+            Kin::Task
+        );
+    }
 
     #[test]
     fn agent_is_found_beside_sonny_or_by_homebrews_opt_path() {

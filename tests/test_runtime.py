@@ -23,6 +23,13 @@ ODD_CALL_ID = "odd $(touch pwned) 'x'\n" + 'L' * 300
 
 
 
+def input_tokens(server, request):
+    """What the provider counts for a request: 100, or with
+    `bytes_per_token` set, its encoded size in those."""
+    per = getattr(server, 'bytes_per_token', None)
+    return len(json.dumps(request)) // per if per else 100
+
+
 def is_summary(request):
     """A summary request in either form: a copy of the bot's call, or a
     request of its own over a span. Both end in the compaction request."""
@@ -36,6 +43,22 @@ class Model(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, *_):
         pass
+
+    def do_GET(self):
+        # A listing only when a test gives the model a context window.
+        window = getattr(self.server, 'context_window', None)
+        if not self.path.endswith('/models') or window is None:
+            self.send_response(404)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return
+        models = getattr(self.server, 'models', None) or ('synthetic-model',)
+        body = json.dumps({'data': [{'id': m, 'context_window': window} for m in models]}).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self):
         try:
@@ -251,6 +274,31 @@ class Model(http.server.BaseHTTPRequestHandler):
                     text = 'done'
                     output = [{'type': 'message', 'role': 'assistant',
                                'content': [{'type': 'output_text', 'text': text}]}]
+            elif user.startswith(('rewait:', 'rewait2:', 'liftwait:')):
+                # Calls this turn: a `liftwait:` command in the foreground,
+                # then a wait on any handle a result names, again while one
+                # is pending, then the last result echoed.
+                start = max(n for n, i in enumerate(request['input']) if i.get('role') == 'user'
+                            and not i['content'][0]['text'].startswith('steer:'))
+                outputs = [json.loads(i['output']) for i in request['input'][start:]
+                           if i.get('type') == 'function_call_output']
+                calls = sum(i.get('type') == 'function_call' for i in request['input'][start:])
+                handle = next((o['handle'] for o in outputs if 'handle' in o), user.split(':', 1)[1])
+                text = ''
+                if user.startswith('liftwait:') and not outputs:
+                    output = [{'type': 'function_call', 'name': 'shell', 'call_id': 'lift-1',
+                               'arguments': json.dumps({'command': user[9:], 'timeout_ms': 5000})}]
+                elif user.startswith('rewait2:') and not outputs:
+                    # Two waits in one response.
+                    output = [{'type': 'function_call', 'name': 'wait', 'call_id': f'wait-{n}',
+                               'arguments': json.dumps({'handles': [handle]})} for n in (1, 2)]
+                elif not outputs or outputs[-1].get('pending') or 'handle' in outputs[-1]:
+                    output = [{'type': 'function_call', 'name': 'wait', 'call_id': f'wait-{calls + 1}',
+                               'arguments': json.dumps({'handles': [handle]})}]
+                else:
+                    text = 'echo:' + json.dumps(outputs[-1])
+                    output = [{'type': 'message', 'role': 'assistant',
+                               'content': [{'type': 'output_text', 'text': text}]}]
             elif user == 'cached:reused-call':
                 text = ''
                 output = [{'type': 'function_call', 'name': 'echo', 'call_id': 'same-id',
@@ -376,6 +424,11 @@ class Model(http.server.BaseHTTPRequestHandler):
                     # A copy offers the bot's tools, and a model may call one.
                     output.append({'type': 'function_call', 'name': 'echo', 'call_id': 'summary-call',
                                    'arguments': json.dumps({'text': 'instead'})})
+            if request.get('tool_choice') == 'none' and any(o.get('type') == 'function_call' for o in output):
+                # A model shown tools it may not call answers in words.
+                text = 'final reply'
+                output = [{'type': 'message', 'role': 'assistant',
+                           'content': [{'type': 'output_text', 'text': text}]}]
             if getattr(self.server, 'history_reasoning', None):
                 output.insert(0, self.server.history_reasoning)
             if getattr(self.server, 'empty_compaction', False) and is_summary(request):
@@ -387,7 +440,7 @@ class Model(http.server.BaseHTTPRequestHandler):
                 # A dated snapshot answers, as providers name it.
                 events.append({'type': 'response.completed', 'response': {
                     'model': request['model'] + '-2026-09-26', 'status': 'completed', 'output': output,
-                    'usage': {'input_tokens': 100, 'output_tokens': 10,
+                    'usage': {'input_tokens': input_tokens(self.server, request), 'output_tokens': 10,
                               'input_tokens_details': {'cached_tokens': 40 if user.startswith('cached:') else 0}}}})
             if user == 'incomplete':
                 events = [{'type': 'response.incomplete', 'response': {'status': 'incomplete',
@@ -400,6 +453,11 @@ class Model(http.server.BaseHTTPRequestHandler):
             if user.startswith('streamlimit-flat:') and attempt == 1:
                 events = [{'type': 'error', 'code': 'rate_limit_exceeded',
                            'message': 'Please try again in 300ms.', 'param': None, 'sequence_number': 1}]
+            if getattr(self.server, 'fail_billed_at', None) == attempt:
+                # A billed attempt the provider then fails, to be retried.
+                events = [{'type': 'response.failed', 'response': {'status': 'failed',
+                    'usage': {'input_tokens': 100, 'output_tokens': 10}, 'error': {
+                    'code': 'rate_limit_exceeded', 'message': 'Please try again in 1ms.'}}}]
             if user.startswith('tool:billed-retry:') and attempt == 1:
                 events = [{'type': 'response.failed', 'response': {'status': 'failed',
                     'usage': {'input_tokens': 100, 'output_tokens': 10}, 'error': {

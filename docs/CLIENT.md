@@ -3,8 +3,8 @@
 The daemon composes no text. A bot's instructions are whatever the creating
 client sent, stored once, immutable for the bot's life. `agent-client`
 (`client/`) is where the human-facing clients agree on what that text is, so a
-bot created from the app or the CLI with `--agents` reads the same way. The
-crate also holds the socket protocol client the app uses.
+bot created from Sonny or the CLI with `--agents` reads the same way. The
+crate also holds the socket protocol client Sonny uses.
 
 Implemented 2026-09-19.
 
@@ -38,24 +38,23 @@ Implemented 2026-09-19.
    peer in a role. A profile is markdown with optional YAML front matter:
    `description`, `model`, and `tools` (a list of this runtime's tool
    names) are read, any other key is ignored, so an agent file written for
-   another harness loads as it is. The body is the role. The app's own
+   another harness loads as it is. The body is the role. Sonny's own
    role (`coordinator`, the client role in `policy.rs`) is left out of the
-   index: a file of that name replaces the app's text for that role, not a
-   role to start a peer in, so no agent is offered a nested coordinator. A
-   swarm member's rules are the swarm skill's `member.md`, not a profile.
+   index: a file of that name replaces Sonny's text for that role, not a
+   role to start a peer in, so no agent is offered a nested coordinator.
 5. **Memory.** The person's `~/.agents/memory/MEMORY.md` and, when the
    workspace is in a project, `~/.agents/memory/projects/NAME/MEMORY.md`,
    each as it is (an index carries its own `# Memory in DIR` heading); one
    not written yet adds nothing. The project is the `name` in the nearest
    `.agents/project.toml`; from a git worktree it is looked up first at the
    same place in the main checkout, read from the worktree's `.git` and
-   `commondir` files rather than by running git. The app's memory script
-   keeps the indexes ([APP.md](APP.md#memory)). They come after the indexes
+   `commondir` files rather than by running git. Sonny's memory script
+   keeps the indexes ([SONNY.md](SONNY.md#memory)). They come after the indexes
    because they change more often than the files above, and they are a
    snapshot: a bot's instructions are fixed when it is made, until a client
    sends them recomposed with `configure`.
-6. **Role.** A bot started in a profile (`--profile ROLE`, or the app's
-   coordinator) gets that body last, under `# Role: ROLE`. The app ships a
+6. **Role.** A bot started in a profile (`--profile ROLE`, or Sonny's
+   lead) gets that body last, under `# Role: ROLE`. Sonny ships a
    `coordinator` profile ([sonny/agents/coordinator.md](../sonny/agents/coordinator.md));
    a folder's or the user's `coordinator.md` replaces it.
 
@@ -70,7 +69,7 @@ The text is a stable prefix on purpose: after the first turn it rides the
 provider's prompt cache, and it changes only when a file changes. The whole
 composition is bounded at 60 KiB, under the daemon's 64 KiB limit. A workspace
 whose files exceed it fails to compose rather than being silently cut. The CLI
-and the app both report `instructions_limit` with the file that tipped it, or
+and Sonny both report `instructions_limit` with the file that tipped it, or
 `instructions_unreadable` with the file that could not be read, and create
 nothing: a bot without its workspace's rules is worse than no bot.
 Skill discovery visits workspace overrides first and accounts each index row
@@ -86,7 +85,8 @@ user's.
 
 - **CLI**: plumbing by default, the preamble alone. `--agents` on `run`
   composes the policy for the workspace; exclusive with `--instructions`.
-- **app**: the policy is the default for `/new`. The create notice says what went in, for example `preamble + 2 AGENTS.md + 1 skills`; a policy that cannot compose refuses `/new` and keeps the command in the composer.
+- **Sonny**: a lead and the tasks it starts get the policy, the lead with
+  its role after it.
 - A **fork** takes no instructions: it copies its source's, so its first call
   can read the source's prompt cache. An edited AGENTS.md reaches a new bot;
   a caller that wants an existing conversation to follow it says so in a

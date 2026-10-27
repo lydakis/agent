@@ -16,11 +16,6 @@ use std::{
 const DEFAULT_TOOLS: &str = "shell,read,write,edit,wait,history";
 use agent_client::approver::{AUTO_EXPIRE_MS, AUTO_UNGATED, UNGATED};
 use agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS;
-/// What a new bot is told when the caller gives no instructions: the
-/// harness preamble every client shares. `--agents` layers AGENTS.md files
-/// and skills on top; a program that wants that asks for it.
-const DEFAULT_INSTRUCTIONS: &str = agent_client::policy::PREAMBLE;
-
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Shutdown drains each client and the event publisher under 5 s bounds,
 /// after any grace period the caller gave running turns.
@@ -321,6 +316,7 @@ fn parse(args: &[String]) -> Result<Options> {
                     | "--note-turns"
                     | "--compact-at"
                     | "--compact-keep"
+                    | "--compact-tokens"
                     | "--max-output-tokens" => {
                         let number = value.parse::<u64>().map_err(|_| {
                             Error::with("usage", format!("{flag} needs an integer"))
@@ -792,7 +788,10 @@ fn composed_instructions(
             .map(|composed| composed.text)
             .map_err(failed);
     }
-    Ok(DEFAULT_INSTRUCTIONS.to_owned())
+    // What a new bot is told when the caller gives no instructions: the
+    // harness preamble every client shares. `--agents` layers AGENTS.md
+    // files and skills on top; a program that wants that asks for it.
+    Ok(agent_client::policy::preamble())
 }
 
 /// The role a new bot is started in, which must exist.
@@ -1054,6 +1053,7 @@ pub fn main(args: Vec<String>) -> Result<i32> {
         "turns" => turns(&options),
         "rm" => remove(&options),
         "prune" => prune(&options),
+        "compact" => compact(&options),
         "approvals" => approvals(&options),
         "answer" => answer(&options),
         "approver" => approver(&options),
@@ -1603,6 +1603,20 @@ fn remove(options: &Options) -> Result<i32> {
     let mut connection = ensure_existing_daemon(options)?;
     print_json(
         &connection.request("delete", json!({"bot":bot,"bot_id":options.bot_id}))?,
+        options.pretty,
+    )?;
+    Ok(0)
+}
+
+/// Ask for a summary of a bot's context before its next model call.
+fn compact(options: &Options) -> Result<i32> {
+    let bot = options
+        .bot
+        .clone()
+        .ok_or(Error::with("usage", "compact needs --bot"))?;
+    let mut connection = ensure_existing_daemon(options)?;
+    print_json(
+        &connection.request("compact", json!({"bot":bot,"bot_id":options.bot_id}))?,
         options.pretty,
     )?;
     Ok(0)

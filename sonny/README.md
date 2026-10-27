@@ -1,11 +1,12 @@
 # Sonny (prototype)
 
-A terminal client for the daemon, beside the app, that lays its work out in
-Rex. It speaks the daemon's socket protocol through `agent-client`, like the
-app; nothing in the daemon or CLI knows it exists.
+A terminal client for the daemon that lays its work out in Rex or Herdr. It
+speaks the daemon's socket protocol through `agent-client`; nothing in the
+daemon or CLI knows it exists.
 
     brew install lydakis/agent/sonny         # Sonny, and the daemon's `agent` formula with it
     brew install lydakis/agent/agent         # just the daemon
+    sonny agent ls --pretty                  # the daemon's CLI, as Sonny runs it
 
 Both formulas build from the release's source on your machine (macOS or
 Linux), so nothing is signed; Sonny starts the `agent` formula's daemon by its
@@ -14,16 +15,22 @@ Linux), so nothing is signed; Sonny starts the `agent` formula's daemon by its
 Sonny in `bin/` and its daemon in `libexec/`. Unpack it anywhere and run
 `bin/sonny`. With `cargo install`, build both (`--path .` for `agent` and
 `--path sonny`) and set `AGENT_BIN` to that `agent`; Sonny never takes an
-`agent` from `PATH`, which may be another program.
+`agent` from `PATH`, which may be another program. `sonny agent ARGS` runs
+the one Sonny uses, with the keys in `~/.agent/env`, whatever else is called
+`agent` on your `PATH`. It is also the one way in agents are told about:
+Sonny sets `AGENT_CLI` to its own `sonny agent`, so the instructions it
+composes, those the CLI composes for agents started through it, and the
+skills it writes name `"…/sonny" agent` wherever they would say
+`"$AGENT_BIN"`.
 
     sonny                                    # this folder's coordinator, <project>.lead
     sonny --model PROVIDER/MODEL             # the same, making the project the first time
     sonny --bot NAME                         # any one bot
 
-Opened in a folder, Sonny is that project's lead: the same `<project>.lead`
-the app opens, made by Sonny in its coordinator profile (`agents/coordinator.md`,
-unless the folder or `~/.agents/agents` has a `coordinator.md`), with the
-folder's `.agents/project.toml` written when it had none. A lead moved to another
+Opened in a folder, Sonny is that project's lead, `<project>.lead`, made by
+Sonny in its coordinator profile (`agents/coordinator.md`, unless the folder
+or `~/.agents/agents` has a `coordinator.md`), with the folder's
+`.agents/project.toml` written when it had none. A lead moved to another
 folder (`--workspace`) comes back with the next message Sonny sends it from
 its own, history and all. When Sonny runs in a Rex block (`rex` found as
 `$REX`, on the PATH, or in the Mac app) or a Herdr pane (`herdr` found as
@@ -41,7 +48,7 @@ notifies, `herdr agent wait` and `herdr agent prompt` reach it by name
 (`shop-fix-cart` for `shop.fix-cart`), and after a Herdr restart the pane runs
 `sonny` on the same bot again (when `sonny` is on the PATH). The place a
 project was laid out in is kept in `~/.agent/sonny/places`, so an agent's
-`sonny split` and `sonny show` go to that Herdr workspace or Rex session, in
+`sonny run` and `sonny show` go to that Herdr workspace or Rex session, in
 that multiplexer, rather than one guessed from the agent's shell, which runs
 in the daemon and is in neither. A task's window
 closes once its work is taken: its turn completed and the lead (or the task
@@ -51,9 +58,22 @@ run `sonny --bot NAME`. `--rex-host HOST` puts the session on another Rex
 server; `--no-layout` turns the layout off. Sonny writes the skill for the
 multiplexer it runs in to `~/.agents/skills` (`rex-windows` or
 `herdr-panes`, from `skills/`), so any agent can run a long command where
-the person can watch it, and read it back: `sonny split NAME [--window] --
-COMMAND...` opens a block labelled `AGENT/NAME` below the agent's own (or
-in a tab of its own) and prints its ID. Herdr has no exit status to wait
+the person can watch it, and read it back: `sonny run NAME [--split
+right|left|above|below] -- COMMAND...` opens a block labelled `AGENT/NAME`
+in a tab of its own (or on that side of the agent's own block) and prints
+its ID. `sonny show TASK [--split SIDE [--beside BOT] | --window]` moves a
+task's window. Tabs are the default; the skills tell agents to split only
+to show the person something now, such as a server's or a tool's output, or
+an agent to watch beside them. Sessions are for leads, tabs and splits for
+their tasks: `sonny show PROJECT.lead`, from another project's lead (one
+that leads the projects in its folder), opens that lead's Sonny in its own
+project's session or workspace, made when needed in the same multiplexer,
+and leaves one already open alone. Sonny never lays another project's lead,
+or its tasks, out in this one's home. `sonny --bot PROJECT.lead` anywhere is
+that lead's Sonny too, laying out its tasks where it runs. Opened in a
+session that already holds other work, Sonny takes that session as the
+project's home and leaves the rest alone: tasks get tabs of their own, and a
+tab that holds the person's own panes keeps its name. Herdr has no exit status to wait
 for, so its skill has agents end such a command with a line to wait for.
 The skill tells agents to close what they opened once read; whatever a task
 left open closes with its window.
@@ -87,6 +107,11 @@ it until then. Esc stops a command still running.
   `.agents/project.toml` when the folder has one. A pick made while a turn
   runs shows in the footer and applies when the lead is idle; one that
   another client overtakes is dropped.
+- `/compact` summarizes the lead's conversation before its next model
+  call: at the running turn's next step, or before an idle lead's next
+  reply. The daemon also compacts on its own once a call's input reaches
+  the bot's `compact_tokens`, which follows the model's context window
+  unless set (900,000 tokens on a 1M window).
 - `/instructions` gives the lead its folder's instructions again: its
   role, `AGENTS.md`, skills and memory. Sonny does this on its own when
   it opens a lead whose instructions it saw composed from the folder, and
@@ -129,9 +154,9 @@ it until then. Esc stops a command still running.
   leaves the agents working.
 
 Settings Sonny keeps for every folder are in `~/.agent/sonny/settings.json`.
-At each start Sonny writes what every agent leans on, the app or not: the
+At each start Sonny writes what every agent leans on: the
 `memory`, `memory-cleanup`, `plan` and `automation` skills, as normal skills
-in `~/.agents/skills` (replacing links the app left there), and
+in `~/.agents/skills` (replacing links the Agent app left there), and
 `~/.agent/memory`, `~/.agent/project` and `~/.agent/trigger`, scripts that
 run this Sonny as `sonny memory ...` (facts saved for later agents, in
 `~/.agents/memory`), `sonny project add DIR ...` (a project and its lead, as
@@ -141,12 +166,15 @@ text changes, until you edit it: from then on it is yours, and Sonny leaves
 it alone. Sonny notes what it last wrote of each in `~/.agent/sonny/skills`;
 a skill of the same name it has no note of writing (yours, or one an
 earlier Sonny wrote) is left alone too. Remove its folder to get Sonny's.
+[docs/SONNY.md](../docs/SONNY.md) has the details of triggers, memory and
+skills.
 When `errand` is installed, Sonny writes an `errand` skill so any agent can
 run a command on another machine, draws those runs as `Ran COMMAND on
 PEER`, and in Rex opens a window following each detached job.
 
 Sonny starts its lookout, `sonny lookout`, when it opens a project: one
-for the daemon, watching every lead on it. It tells a lead what its tasks
+for the daemon, watching for every bot that subscribed, and Sonny
+subscribes each lead to its tasks. It tells a lead what its tasks
 did in one "Task updates" note, by the handles its wait tool reads them
 with, and wakes it early only when one needs it: a message that redirects
 other tasks, a conflict, a stuck or silent task, a result the person should

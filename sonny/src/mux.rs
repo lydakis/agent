@@ -35,6 +35,8 @@ pub trait Backend {
     fn home(&self) -> String;
     /// Whether that home is the one Sonny runs in.
     fn here(&self) -> bool;
+    /// Whether that home was made just now, with a shell nobody asked for.
+    fn made(&self) -> bool;
     /// The home's blocks, in the multiplexer's order.
     fn blocks(&self) -> Vec<Block>;
     fn close_block(&self, block: &str);
@@ -73,7 +75,7 @@ pub trait Backend {
 }
 
 /// A project's home, as its lead's Sonny last found it in the person's
-/// terminal: kept so that an agent's `sonny split` and `sonny show` go
+/// terminal: kept so that an agent's `sonny run` and `sonny show` go
 /// there, to that multiplexer, instead of one guessed from the agent's
 /// shell, which is in neither.
 #[derive(Debug, PartialEq)]
@@ -135,13 +137,29 @@ pub struct Layout {
     backend: Box<dyn Backend>,
     /// Each task's block, by bot name.
     blocks: HashMap<String, String>,
+    /// The blocks a home made just now came with, closed once something
+    /// is placed in it.
+    spare: Vec<String>,
 }
 
 impl Layout {
     pub fn new(backend: Box<dyn Backend>) -> Self {
+        let spare = match backend.made() {
+            true => backend.blocks().into_iter().map(|b| b.id).collect(),
+            false => Vec::new(),
+        };
         Self {
             backend,
             blocks: HashMap::new(),
+            spare,
+        }
+    }
+
+    /// Close the shell a home made just now came with, now that it holds
+    /// something of its own.
+    fn tidy(&mut self) {
+        for block in std::mem::take(&mut self.spare) {
+            self.backend.close_block(&block);
         }
     }
 
@@ -204,6 +222,7 @@ impl Layout {
             }
         };
         self.blocks.insert(bot.to_owned(), block);
+        self.tidy();
         Ok(())
     }
 
@@ -266,34 +285,32 @@ impl Layout {
 
     /// Run a command an agent asked for in a block labelled `OWNER/NAME`, so
     /// the person can see whose it is and it closes with its owner's
-    /// window: below the owner's block, or in a window of its own (named
-    /// `name`) when asked or when the owner has none here. One already
-    /// labelled so is replaced. The block stays open once the command
-    /// exits, to be read. Returns the block's ID.
+    /// window: on `side` of the owner's block, or in a window of its own
+    /// (named `name`) when there is no side or the owner has no block here.
+    /// One already labelled so is replaced. The block stays open once the
+    /// command exits, to be read. Returns the block's ID.
     pub fn split(
         &mut self,
         owner: &str,
         name: &str,
         cwd: &Path,
         command: &[String],
-        window: bool,
+        side: Option<&str>,
     ) -> Result<String, String> {
         let label = format!("{owner}/{name}");
         let listed = self.backend.blocks();
         for old in listed.iter().filter(|b| b.label == label) {
             self.backend.close_block(&old.id);
         }
-        let anchor = listed
-            .iter()
-            .find(|b| b.label == owner)
-            .filter(|_| !window)
-            .map(|b| b.id.clone());
-        match anchor {
-            Some(anchor) => {
-                (self.backend).split(&anchor, "below", true, &label, cwd, command, true)
+        let anchor = listed.iter().find(|b| b.label == owner);
+        let block = match anchor.zip(side) {
+            Some((anchor, side)) => {
+                (self.backend).split(&anchor.id, side, true, &label, cwd, command, true)
             }
             None => self.backend.window(&label, name, cwd, command, true),
-        }
+        }?;
+        self.tidy();
+        Ok(block)
     }
 
     /// Close a task's block, and every block it asked for, as when it is
@@ -346,13 +363,23 @@ pub fn here(socket: &Path, project: &str, host: Option<&str>) -> Option<Layout> 
 /// would name the daemon's terminal: where the lead's Sonny last laid the
 /// project out, in that multiplexer; without one (or with `host`, a Rex
 /// server), in Herdr when the project's lead is in a Herdr pane, else in
-/// Rex (or Herdr, without Rex), made when needed.
-pub fn for_agent(socket: &Path, project: &str, host: Option<&str>) -> Result<Layout, String> {
+/// the multiplexer project `like`'s home is in, else in Rex (or Herdr,
+/// without Rex), made when needed.
+pub fn for_agent(
+    socket: &Path,
+    project: &str,
+    host: Option<&str>,
+    like: Option<&str>,
+) -> Result<Layout, String> {
     let herdr = crate::herdr::find().filter(|_| host.is_none());
     let rex = crate::rex::find();
-    let kept = Place::file(socket, project)
-        .filter(|_| host.is_none())
-        .and_then(|file| Place::recall(&file));
+    let recall = |project| {
+        Place::file(socket, project)
+            .filter(|_| host.is_none())
+            .and_then(|file| Place::recall(&file))
+    };
+    let kept = recall(project);
+    let like = like.and_then(recall);
     let backend: Box<dyn Backend> = match (kept, herdr, rex) {
         (Some(Place::Herdr { workspace }), Some(herdr), _) => Box::new(crate::herdr::Herdr::open(
             herdr,
@@ -367,9 +394,15 @@ pub fn for_agent(socket: &Path, project: &str, host: Option<&str>) -> Result<Lay
             false,
             Some(&session),
         )?),
-        (_, Some(herdr), _) if crate::herdr::has_lead(&herdr, project) => {
+        (_, Some(herdr), _)
+            if crate::herdr::has_lead(&herdr, project)
+                || matches!(like, Some(Place::Herdr { .. })) =>
+        {
             Box::new(crate::herdr::Herdr::open(herdr, project, None, None)?)
         }
+        (_, _, Some(rex)) if let Some(Place::Rex { host, .. }) = &like => Box::new(
+            crate::rex::Rex::open(rex, host.as_deref(), project, false, None)?,
+        ),
         (_, _, Some(rex)) => Box::new(crate::rex::Rex::open(rex, host, project, false, None)?),
         (_, Some(herdr), None) => Box::new(crate::herdr::Herdr::open(herdr, project, None, None)?),
         (_, None, None) => return Err("neither rex nor herdr was found".into()),
@@ -425,6 +458,7 @@ mod tests {
     struct Fake {
         blocks: RefCell<Vec<Block>>,
         own: Option<String>,
+        made: bool,
     }
 
     impl Fake {
@@ -445,6 +479,9 @@ mod tests {
         }
         fn here(&self) -> bool {
             true
+        }
+        fn made(&self) -> bool {
+            self.made
         }
         fn blocks(&self) -> Vec<Block> {
             (self.blocks.borrow().iter())
@@ -553,10 +590,10 @@ mod tests {
         };
         layout.place("shop.fix", "fix", &sonny, &split).unwrap();
         layout
-            .split("shop.fix", "tests", Path::new("/w"), &sonny, false)
+            .split("shop.fix", "tests", Path::new("/w"), &sonny, Some("below"))
             .unwrap();
         layout
-            .split("shop.lead", "server", Path::new("/w"), &sonny, true)
+            .split("shop.lead", "server", Path::new("/w"), &sonny, None)
             .unwrap();
         assert_eq!(
             labels(&layout),
@@ -579,6 +616,57 @@ mod tests {
                 ("home".into(), vec!["shop.lead".into()]),
                 ("server".into(), vec!["shop.lead/server".into()]),
             ]
+        );
+    }
+
+    #[test]
+    fn a_home_made_for_a_lead_holds_only_its_sonny() {
+        let fake = Fake {
+            made: true,
+            ..Fake::default()
+        };
+        fake.add("", "shell");
+        let mut layout = Layout::new(Box::new(fake));
+        let sonny = ["sonny".to_owned()];
+        assert!(layout.show("web.lead", "lead", &sonny).unwrap());
+        assert_eq!(labels(&layout), [("lead".into(), vec!["web.lead".into()])]);
+        // The lead's Sonny is there already: left alone.
+        assert!(!layout.show("web.lead", "lead", &sonny).unwrap());
+    }
+
+    #[test]
+    fn a_home_sonny_was_opened_in_keeps_what_was_there() {
+        let fake = Fake::default();
+        fake.add("editor", "work");
+        let own = fake.add("zsh", "work");
+        let fake = Fake {
+            own: Some(own),
+            ..fake
+        };
+        let mut layout = Layout::new(Box::new(fake));
+        layout.adopt_own("shop.lead");
+        let sonny = ["sonny".to_owned()];
+        layout.show("shop.fix", "fix", &sonny).unwrap();
+        layout
+            .split(
+                "shop.lead",
+                "server",
+                Path::new("/w"),
+                &sonny,
+                Some("right"),
+            )
+            .unwrap();
+        layout.close("shop.fix");
+        assert_eq!(
+            labels(&layout),
+            [(
+                "work".into(),
+                vec![
+                    "editor".into(),
+                    "shop.lead".into(),
+                    "shop.lead/server".into()
+                ]
+            )]
         );
     }
 }

@@ -265,9 +265,9 @@ without clearing another's state. A lost `wait` request must be reissued
 using its handle; replay cursors do not resume requests.
 
 Keep remote access on SSH-forwarded Unix sockets in a private directory.
-The operator installs `agent` on the remote host; the desktop app starts its
+The operator installs `agent` on the remote host; a client starts its
 daemon there with that `agent start` over SSH and forwards the socket it
-names ([APP.md](APP.md#hosts-over-ssh)). A forwarded full-access socket grants
+names. A forwarded full-access socket grants
 the daemon user's tool authority. Cross-daemon creators/parents remain an
 explicitly unsupported relationship until their identity and routing
 contract exists; never resolve them by a same-named local bot.
@@ -494,5 +494,4 @@ these symbols when implementing; this table is not a claim about later main.
 | Fresh start versus continuation | [`start_locked`, `Database::resume`](../src/store/db.rs); [`rounds`](../src/server/turn.rs) |
 | Handles and waiter settlement | [`Handle`, `Handles`](../src/server/handles.rs) |
 | Per-store connections and client reconnect | [`socket`](../client/src/socket.rs); [`Client`](../client/src/lib.rs); [`ensure_daemon`](../src/client.rs) |
-| Fleet creation events and app connections | [`app.js`](../app/ui/app.js); [`main.rs`](../app/src-tauri/src/main.rs) |
 | Existing measurement fixtures | [`bench.lifecycle`](../bench/lifecycle.py); [`bench.soak`](../bench/soak.py); [`soak_followers`](../bench/soak_followers.py) |

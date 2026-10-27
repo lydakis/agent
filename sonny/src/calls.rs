@@ -87,8 +87,11 @@ pub fn said(command: &str, output: &str, failed: bool) -> Option<Said> {
             output: None,
         }),
         "plan" if program.contains("skills/plan") => plan(args),
+        "sonny" if args.first().is_some_and(|a| a == "agent") => {
+            agent(&args[1..], stdin, printed, failed)
+        }
         "sonny" if args.first().is_some_and(|a| a == "show") => sonny_show(&args[1..], failed),
-        "sonny" if args.first().is_some_and(|a| a == "split") => sonny_split(&args[1..], failed),
+        "sonny" if args.first().is_some_and(|a| a == "run") => sonny_run(&args[1..], failed),
         "sonny" if args.first().is_some_and(|a| a == "ask") => sonny_ask(&args[1..], failed),
         "sh" | "bash"
             if args
@@ -772,14 +775,14 @@ fn sonny_show(words: &[String], failed: bool) -> Option<Said> {
     })
 }
 
-/// `sonny split`, as the block it opened for the agent.
-fn sonny_split(words: &[String], failed: bool) -> Option<Said> {
+/// `sonny run`, as the block it opened for the agent.
+fn sonny_run(words: &[String], failed: bool) -> Option<Said> {
     let (name, rest) = words.split_first()?;
     let args = Args::new(rest);
     let mut said = Said {
-        verb: match args.has("--window") {
-            true => "Opened a Rex window",
-            false => "Opened a Rex split",
+        verb: match args.value(&["--split"]) {
+            Some(_) => "Opened a split",
+            None => "Opened a tab",
         }
         .into(),
         what: name.clone(),
@@ -970,14 +973,22 @@ Keep the rest.'"#,
         assert_eq!(said.what, "…abcdef");
         assert_eq!(said.under.len(), 4);
         let said = said_or_none(
-            r#""/opt/homebrew/bin/sonny" split tests -- cargo test --workspace"#,
+            r#""/opt/homebrew/bin/sonny" run tests -- cargo test --workspace"#,
             r#"{"block":"block:01","label":"shop.fix/tests","session":"shop"}"#,
         );
         assert_eq!(
             (said.verb.as_str(), said.what.as_str()),
-            ("Opened a Rex split", "tests")
+            ("Opened a tab", "tests")
         );
         assert_eq!(text(&said.under[0]), "$ cargo test --workspace");
+        let said = said_or_none(
+            r#""/opt/homebrew/bin/sonny" run server --split right -- npm run dev"#,
+            r#"{"block":"block:02","label":"shop.lead/server","session":"shop"}"#,
+        );
+        assert_eq!(
+            (said.verb.as_str(), said.what.as_str()),
+            ("Opened a split", "server")
+        );
         let said = said_or_none(
             r#""/opt/homebrew/bin/sonny" ask "Round each line?" --choice Yes --choice No"#,
             "Asked. Sonny shows the question to the person until they answer.\n",

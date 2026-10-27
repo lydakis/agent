@@ -180,6 +180,8 @@ pub struct Turn {
     /// The bot's context, compaction and approval settings, read with its
     /// record when the turn's rounds begin.
     pub settings: std::sync::OnceLock<Settings>,
+    /// The turn's model's context window, as the turn starts.
+    pub window: std::sync::OnceLock<u64>,
     /// The park this task continues, already claimed by the service: record
     /// its wait results, then keep going.
     pub resumed: Option<Waiting>,
@@ -187,11 +189,62 @@ pub struct Turn {
     /// the boundary before it reads, so unrelated bots never pay for one
     /// bot's pending steer.
     pub steers: Arc<AtomicBool>,
+    /// Set by the service when a client asks for a summary; the next round
+    /// boundary takes it. The bot's record holds the request too, so a
+    /// turn that parks or a daemon that restarts still takes it.
+    pub compact: Arc<AtomicBool>,
+    /// A `steer` for this turn, which moves a foreground command it is
+    /// running to the background.
+    pub lift: Arc<Lift>,
     pub tokens: Arc<TokenTotals>,
     /// Results this turn's `read` found on the bot's lineage.
     pub read_results: std::sync::Mutex<Vec<i64>>,
     /// What summaries held and spent beside the turn's own accounting.
     pub side: SideCounts,
+}
+
+/// A steer waiting for the running turn's next boundary. Armed by `steer`
+/// delivery alone and cleared where the boundary reads steers. A
+/// foreground command running while it is armed moves to the background
+/// and returns its handle, so no command holds a steer back; nothing is
+/// killed, and the bot waits on the handle if it still wants the result.
+#[derive(Default)]
+pub struct Lift {
+    armed: AtomicBool,
+    notify: Notify,
+}
+impl Lift {
+    pub fn arm(&self) {
+        self.armed.store(true, Relaxed);
+        self.notify.notify_waiters();
+    }
+    fn clear(&self) {
+        self.armed.store(false, Relaxed);
+    }
+    fn is_armed(&self) -> bool {
+        self.armed.load(Relaxed)
+    }
+    /// Once armed, and LIFT_GRACE later: a command that ends that soon
+    /// returns as usual, so a quick one never becomes a handle.
+    async fn lifted(&self) {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.armed.load(Relaxed) {
+                break;
+            }
+            notified.await;
+        }
+        tokio::time::sleep(LIFT_GRACE).await;
+    }
+}
+const LIFT_GRACE: Duration = Duration::from_millis(250);
+
+/// A tool's result, or the command a steer moved to the background.
+enum Ran<F> {
+    Done(Result<Outcome>),
+    Lifted(std::pin::Pin<Box<F>>),
 }
 
 /// Provider-reported tokens across every turn since the daemon started:
@@ -772,18 +825,42 @@ impl Turn {
         })
     }
 
+    /// The bytes `compact_at` and `compact_keep` are shares of: the
+    /// configured budget, or less once the bot's token threshold comes
+    /// first. The view's tokens are estimated from the bot's last call, the
+    /// bytes it sent against the input tokens the provider counted, so the
+    /// threshold falls where `compact_at` of this budget is the view that
+    /// sends `compact_tokens`, `overhead` (instructions and tools) included.
+    /// Before a first call there is no estimate and only bytes apply.
+    fn soft_bytes(&self, record: &agent_runtime::store::Bot, overhead: usize) -> usize {
+        let budget = self.settings().context_bytes();
+        let window = self.window.get().copied().unwrap_or(200_000);
+        let (Some(tokens), Some((bytes, counted))) =
+            (self.settings().compact_tokens(window), record.sent)
+        else {
+            return budget;
+        };
+        let at = (u128::from(tokens) * u128::from(bytes) / u128::from(counted)).min(budget as u128)
+            as usize;
+        // Instructions and tools alone past the threshold: no summary
+        // brings the view under it.
+        match at.checked_sub(overhead) {
+            Some(view) if view > 0 => (view * 100 / self.settings().compact_at()).min(budget),
+            _ => budget,
+        }
+    }
+
     /// Whether the window has reached the compaction threshold, the point
     /// where answered tool results start going as stubs.
-    fn elision_due(&self, context: &Context, output_bytes: Option<usize>) -> bool {
+    fn elision_due(&self, context: &Context, output_bytes: Option<usize>, budget: usize) -> bool {
         let limit = self.input_limit();
         let reserve = output_bytes.unwrap_or(0).min(limit.bytes / 4);
         context.usage().bytes
-            >= (self.settings().context_bytes() / 100 * self.settings().compact_at())
-                .min(limit.bytes - reserve)
+            >= (budget / 100 * self.settings().compact_at()).min(limit.bytes - reserve)
     }
 
     /// Elision at a round boundary: tool results the model has answered,
-    /// older than the newest `compact_keep` percent of the budget, go to it
+    /// older than the newest `compact_keep` percent of the `budget`, go to it
     /// as stubs from this request on. No model call; each result stays whole
     /// in the store and the read tool returns it. A move must save a
     /// sixteenth of the budget, so a context of mostly other text does not
@@ -791,18 +868,18 @@ impl Turn {
     /// window cannot fit without it (`forced`), every answered result goes,
     /// whatever the keep target, and any saving counts. Returns whether the
     /// floor moved.
-    async fn elide(&self, prefix: usize, forced: bool) -> Result<bool> {
+    async fn elide(&self, prefix: usize, forced: bool, budget: usize) -> Result<bool> {
         let limit = self.input_limit();
         let (keep, min_saving) = if forced {
             (0, 1)
         } else {
-            let keep = (self.settings().context_bytes() / 100 * self.settings().compact_keep())
+            let keep = (budget / 100 * self.settings().compact_keep())
                 .min(
                     limit.bytes.saturating_sub(prefix) * self.settings().compact_keep()
                         / self.settings().compact_at(),
                 )
                 .max(1);
-            (keep as i64, (self.settings().context_bytes() / 16) as i64)
+            (keep as i64, (budget / 16) as i64)
         };
         let bot = self.bot.clone();
         let Some(plan) = self
@@ -834,8 +911,9 @@ impl Turn {
     }
 
     /// Compaction at a round boundary: once the turns since the last summary
-    /// hold `compact_at` percent of the budget, summarize everything older
-    /// than the newest `compact_keep` percent with the client's instructions
+    /// hold `compact_at` percent of the budget (see `soft_bytes`), or a
+    /// client `requested` one, summarize everything older than the newest
+    /// `compact_keep` percent, or than the newest boundary when requested, with the client's instructions
     /// and summarizer, and record the result as the new context start. The
     /// summary request copies `last`, the view this task's last call sent
     /// on the turn's `model`, when that is estimated cheaper; before this
@@ -866,6 +944,7 @@ impl Turn {
         (last, inherited, model): (Option<&LastCall>, bool, &str),
         output_bytes: Option<usize>,
         beside: Option<&mut Option<Beside<'a>>>,
+        requested: bool,
     ) -> Result<Compaction> {
         if record.compaction_instructions.is_none() {
             return Ok(Compaction::Skipped);
@@ -873,28 +952,36 @@ impl Turn {
         let pressure = context.pressure();
         let limit = self.input_limit();
         let reserve = output_bytes.unwrap_or(0).min(limit.bytes / 4);
-        if pressure.bytes
-            < (self.settings().context_bytes() / 100 * self.settings().compact_at())
-                .min(limit.bytes - reserve)
+        let budget = self.soft_bytes(record, record.instructions.len() + tools.get().len());
+        if !requested
+            && pressure.bytes
+                < (budget / 100 * self.settings().compact_at()).min(limit.bytes - reserve)
             && pressure.items
                 < (self.settings().context_items() * self.settings().compact_at() / 100)
                     .min(limit.items)
         {
             return Ok(Compaction::Skipped);
         }
-        let keep = (self.settings().context_bytes() / 100 * self.settings().compact_keep())
-            .min(
-                limit.bytes.saturating_sub(context.prefix.bytes.len())
-                    * self.settings().compact_keep()
-                    / self.settings().compact_at(),
+        let (keep, keep_items) = if requested {
+            (1, 1)
+        } else {
+            (
+                (budget / 100 * self.settings().compact_keep())
+                    .min(
+                        limit.bytes.saturating_sub(context.prefix.bytes.len())
+                            * self.settings().compact_keep()
+                            / self.settings().compact_at(),
+                    )
+                    .max(1) as i64,
+                (self.settings().context_items() * self.settings().compact_keep() / 100)
+                    .min(
+                        limit.items.saturating_sub(context.prefix.items)
+                            * self.settings().compact_keep()
+                            / self.settings().compact_at(),
+                    )
+                    .max(1) as i64,
             )
-            .max(1) as i64;
-        let keep_items = (self.settings().context_items() * self.settings().compact_keep() / 100)
-            .min(
-                limit.items.saturating_sub(context.prefix.items) * self.settings().compact_keep()
-                    / self.settings().compact_at(),
-            )
-            .max(1) as i64;
+        };
         let ahead = Some(context.prefix.bytes.clone());
         let sent = match last {
             Some(last) => Some(Sent {
@@ -911,15 +998,17 @@ impl Turn {
         };
         // One that parked on its pool is not tried again before the pool
         // reopens, while the view and the reply still fit; one that
-        // outgrows the limit summarizes first.
+        // outgrows the limit summarizes first, and so does one a client
+        // asked for, which parks on the pool rather than wait unasked.
         let fits = pressure.bytes + reserve < limit.bytes && pressure.items < limit.items;
-        if fits && now_ms() < accounting.summary_retry_at {
+        if fits && !requested && now_ms() < accounting.summary_retry_at {
             return Ok(Compaction::Skipped);
         }
         let _held = Held::from_now(&self.side.summary_ms);
         // Beside the call, a summary holds a copy's call and a request of
-        // its own against the round limit.
-        let beside = beside.filter(|_| fits && *model_rounds + 2 < MAX_ROUNDS);
+        // its own against the round limit. One a client asked for goes
+        // before the call, as asked, and stays asked until it ends.
+        let beside = beside.filter(|_| !requested && fits && *model_rounds + 2 < MAX_ROUNDS);
         let mut spent = Accounting {
             route: accounting.route.clone(),
             ..Accounting::default()
@@ -1074,7 +1163,7 @@ impl Turn {
             Err(error) => Err(error),
         };
         if elides
-            && self.elide(0, true).await?
+            && self.elide(0, true, 0).await?
             && let Some(context) = fits(self.fitted_context().await)?
         {
             return Ok(Overflow::Fits(Box::new(context)));
@@ -1369,6 +1458,7 @@ impl Turn {
                     &instructions,
                     summary_tools,
                     body,
+                    true,
                     record,
                     model_rounds,
                     turn,
@@ -1817,6 +1907,8 @@ impl Turn {
         }
         let shaped = shaped(provider, self.settings())?;
         let provider: &Provider = &shaped;
+        self.window
+            .get_or_init(|| agent_runtime::provider::context_window(provider, model));
         let workspace = PathBuf::from(&context.workspace);
         // What this turn's children inherit: the CLI a bot runs to delegate
         // needs a model for the peer (its own by default) and its effort
@@ -1873,7 +1965,20 @@ impl Turn {
                             _ => None,
                         })
                         .collect();
-                    let outcome = Outcome::text(wait_result(for_model(results)).to_string());
+                    // Ended early by a steer: the steer comes next, and
+                    // the pending handles stay valid for another wait.
+                    let steered = results.values().any(|result| result["pending"] == true) && {
+                        let bot = self.bot.clone();
+                        self.store
+                            .read("joining_steer", move |db| db.joining_steer(&bot))
+                            .await
+                            .unwrap_or(false)
+                    };
+                    let mut result = wait_result(for_model(results));
+                    if steered {
+                        result["steered"] = json!(true);
+                    }
+                    let outcome = Outcome::text(result.to_string());
                     let id = waiting.call_id.clone();
                     self.store
                         .op("tool_finish", move |db| {
@@ -1963,6 +2068,7 @@ impl Turn {
                 last = Some(call.into());
             }
             let output_bytes = provider.output_byte_estimate(model);
+            let budget = self.soft_bytes(&record, record.instructions.len() + tools.get().len());
             let mut made_room = false;
             let mut context = match self
                 .context(
@@ -2016,8 +2122,10 @@ impl Turn {
             // boundary's stubs.
             if elides
                 && !resuming
-                && self.elision_due(&context, output_bytes)
-                && self.elide(context.prefix.bytes.len(), false).await?
+                && self.elision_due(&context, output_bytes, budget)
+                && self
+                    .elide(context.prefix.bytes.len(), false, budget)
+                    .await?
             {
                 made_room = true;
                 let elided = self
@@ -2033,6 +2141,10 @@ impl Turn {
                 }
             }
             if !resuming && !std::mem::take(&mut steer_first) {
+                // A client's request stays recorded until its summary ends:
+                // one that parks finds it again as the turn resumes.
+                let requested = std::mem::take(&mut record.compaction_requested)
+                    | self.compact.swap(false, Relaxed);
                 // Only behind a call this task made, whose cache the next
                 // call reads: at a turn's start, or as a turn resumes, the
                 // cache may have lapsed, and a summary first keeps that call
@@ -2048,15 +2160,25 @@ impl Turn {
                         (last.as_ref(), inherited, called),
                         output_bytes,
                         sent_here.then_some(&mut beside),
+                        requested,
                     )
                     .await?
                 {
                     Compaction::Parked(parked) => return Ok(Round::Paced(parked)),
-                    Compaction::Done => {
-                        made_room = true;
-                        (last, inherited) = (None, false);
+                    compaction => {
+                        if requested {
+                            let bot = self.bot.clone();
+                            self.store
+                                .op("request_compaction", move |db| {
+                                    db.request_compaction(&bot, None, false)
+                                })
+                                .await?;
+                        }
+                        if let Compaction::Done = compaction {
+                            made_room = true;
+                            (last, inherited) = (None, false);
+                        }
                     }
-                    Compaction::Skipped => {}
                 }
             }
             // A steer the turn had no room for is tried again once elision
@@ -2131,12 +2253,26 @@ impl Turn {
                 model_rounds += rounds;
                 record.tokens_used = record.tokens_used.saturating_add(tokens);
             }
+            // The round limit's last call goes with the tools shown but no
+            // call allowed, so the turn ends on a reply rather than failing
+            // with its work done and unreported.
+            let tool_calls = model_rounds + 1 < MAX_ROUNDS;
+            if !tool_calls {
+                self.hub
+                    .live(
+                        &self.bot,
+                        json!({"event":"tool_calls_withheld","bot":self.bot,"turn":turn,
+                            "durable":false,"reason":"tool_round_limit"}),
+                    )
+                    .await?;
+            }
             let called = {
                 let call = self.call(
                     provider,
                     model,
                     &tools,
                     &context,
+                    tool_calls,
                     &mut record,
                     &mut model_rounds,
                     turn,
@@ -2204,12 +2340,27 @@ impl Turn {
             let items = response.items;
             let calls: Vec<ToolCall> = response.calls.clone();
             let usage = response.usage.clone();
+            // What the view cost in tokens, for the token threshold. One
+            // fallback's attempts each counted the input.
+            let sent = usage
+                .as_ref()
+                .filter(|usage| usage.input_tokens > 0 && usage.models.len() <= 1)
+                .map(|usage| {
+                    let bytes =
+                        context.usage().bytes + record.instructions.len() + tools.get().len();
+                    (bytes as u64, usage.input_tokens)
+                });
+            record.sent = sent.or(record.sent);
+            let name = self.bot.clone();
             let gated = calls.iter().any(|call| record.gated(&call.name));
             // Taken before the commit that stamps the gates' announcement,
             // so a gate's first lapse is never counted late.
             let planned = tokio::time::Instant::now();
             let append = self.store.op("append", move |db| {
                 let entries = db.append(turn, items, &calls, usage.as_ref())?;
+                if let Some((bytes, tokens)) = sent {
+                    db.record_sent(&name, bytes, tokens)?;
+                }
                 Ok((entries, gated.then(|| (db.verdicts_for(turn), planned))))
             });
             // A summary still running keeps streaming while the call's
@@ -2400,6 +2551,7 @@ impl Turn {
         let retry = capped.is_some_and(|at| {
             reserved.bytes < at.ahead.bytes || reserved.items < at.ahead.items || whole && !at.whole
         });
+        self.lift.clear();
         if !self.steers.swap(false, Relaxed) && !retry {
             return Ok(false);
         }
@@ -2443,6 +2595,7 @@ impl Turn {
         model: &str,
         tools: &serde_json::value::RawValue,
         context: &Context,
+        tool_calls: bool,
         record: &mut agent_runtime::store::Bot,
         model_rounds: &mut usize,
         turn: i64,
@@ -2455,6 +2608,7 @@ impl Turn {
             &instructions,
             tools,
             Body::Window(context),
+            tool_calls,
             record,
             model_rounds,
             turn,
@@ -2464,7 +2618,9 @@ impl Turn {
     }
 
     /// One model call with retries, pacing, and accounting: the turn's own
-    /// request, or a compaction's request over a span of history.
+    /// request, or a compaction's request over a span of history. Without
+    /// `tool_calls` the tools are shown but none may be called, which a
+    /// span's request never allows.
     #[allow(clippy::too_many_arguments)]
     async fn call_with(
         &self,
@@ -2473,6 +2629,7 @@ impl Turn {
         instructions: &str,
         tools: &serde_json::value::RawValue,
         body: Body<'_>,
+        tool_calls: bool,
         record: &mut agent_runtime::store::Bot,
         model_rounds: &mut usize,
         turn: i64,
@@ -2492,14 +2649,33 @@ impl Turn {
         );
         // A summary's view is replaced once it lands; only the turn's call
         // is refreshed while it streams.
-        let warm_after = match body {
-            Body::Window(_) => provider.keep_warm_after(model, record.effort.as_deref()),
+        // A refresh renders the turn's request with its calls allowed, so
+        // it would not read what a call without them sent.
+        let mut warm_after = match body {
+            Body::Window(_) if tool_calls => {
+                provider.keep_warm_after(model, record.effort.as_deref())
+            }
+            Body::Window(_) => None,
             Body::Copied(_) | Body::Span(..) => None,
         };
         // Replayed thinking a 400 may have come from, withheld from this
         // call's later attempts.
         let mut withheld = None;
+        let mut tool_calls = tool_calls;
         loop {
+            // A billed attempt that failed counts as a round: the retry that
+            // is the turn's last allowed call goes without calls, as that
+            // call would have.
+            if tool_calls && matches!(body, Body::Window(_)) && *model_rounds + 1 >= MAX_ROUNDS {
+                (tool_calls, warm_after) = (false, None);
+                self.hub
+                    .live(
+                        &self.bot,
+                        json!({"event":"tool_calls_withheld","bot":self.bot,"turn":turn,
+                            "durable":false,"reason":"tool_round_limit"}),
+                    )
+                    .await?;
+            }
             let items = match body {
                 Body::Window(context) => self.items(context, withheld.unwrap_or(context.thinking)),
                 Body::Copied(copy) => self.copied_items(copy),
@@ -2514,7 +2690,7 @@ impl Turn {
                         instructions,
                         reasoning: record.effort.as_deref(),
                         tools,
-                        allow_tool_calls: !matches!(body, Body::Span(..)),
+                        allow_tool_calls: tool_calls && !matches!(body, Body::Span(..)),
                         fallbacks: record.fallbacks,
                         cache_key: Some(&cache_key),
                         items,
@@ -2831,27 +3007,46 @@ impl Turn {
     /// Run a prepared tool, refreshing the last model call's prompt cache
     /// each time it has sat unread for `after`. The outer error is the
     /// runtime's; the inner one is the tool's result.
-    async fn run_tool(
+    /// Run a tool while keeping the cache warm. With `lift`, a steer moves
+    /// the run to the background instead, handed back unfinished, once the
+    /// paired signal says it is running: a command still waiting for a
+    /// process slot stays in line in the foreground.
+    async fn run_tool<F: Future<Output = Result<Outcome>>>(
         &self,
-        prepared: Prepared,
-        workspace: &std::path::Path,
-        environment: &[(String, String)],
+        run: F,
+        lift: Option<(&Lift, oneshot::Receiver<()>)>,
         warm: Option<&mut Warm<'_>>,
-    ) -> Result<Result<Outcome>> {
+    ) -> Result<Ran<F>> {
         enum Next {
             Ran(Result<Outcome>),
+            Lifted,
             Refreshed(Result<(agent_runtime::provider::Usage, tokio::time::Instant)>),
         }
-        let run = self.registry.execute(prepared, workspace, environment);
-        let Some(warm) = warm.filter(|warm| !warm.stopped) else {
-            return Ok(run.await);
+        let mut run = Box::pin(run);
+        let lifted = async {
+            // A run that ends before it starts wins the race below.
+            if let Some((lift, running)) = lift
+                && running.await.is_ok()
+            {
+                lift.lifted().await
+            } else {
+                std::future::pending().await
+            }
         };
-        tokio::pin!(run);
+        tokio::pin!(lifted);
+        let Some(warm) = warm.filter(|warm| !warm.stopped) else {
+            return Ok(tokio::select! {
+                biased;
+                result = &mut run => Ran::Done(result),
+                () = &mut lifted => Ran::Lifted(run),
+            });
+        };
         loop {
             if warm.pending.is_none() {
                 tokio::select! {
                     biased;
-                    result = &mut run => return Ok(result),
+                    result = &mut run => return Ok(Ran::Done(result)),
+                    () = &mut lifted => return Ok(Ran::Lifted(run)),
                     () = tokio::time::sleep_until(warm.read_at + warm.after) => {}
                 }
                 *warm.pending = Some(self.refresh(warm));
@@ -2861,18 +3056,44 @@ impl Turn {
                 tokio::select! {
                     biased;
                     result = &mut run => Next::Ran(result),
+                    () = &mut lifted => Next::Lifted,
                     joined = task => Next::Refreshed(joined.unwrap_or_else(|_| fail("keep_warm_lost"))),
                 }
             };
             match next {
-                // The tool's result ends the refreshes. One already sent is
-                // billed, so it is answered and recorded; an unsent one is
-                // dropped at no cost.
+                // The tool's result ends the refreshes, as does handing it to
+                // the background. One already sent is billed, so it is
+                // answered and recorded; an unsent one is dropped at no cost.
                 Next::Ran(result) => {
                     if let Some(refreshed) = settle(warm.pending).await {
                         self.refreshed(warm, refreshed).await?;
                     }
-                    return Ok(result);
+                    return Ok(Ran::Done(result));
+                }
+                // The command keeps running while the refresh is answered,
+                // so its timeout and pipes still apply; one that ends
+                // meanwhile returns as usual.
+                Next::Lifted => {
+                    let mut finished = None;
+                    let refreshed = {
+                        let settled = settle(warm.pending);
+                        tokio::pin!(settled);
+                        tokio::select! {
+                            biased;
+                            refreshed = &mut settled => refreshed,
+                            result = &mut run => {
+                                finished = Some(result);
+                                settled.await
+                            }
+                        }
+                    };
+                    if let Some(refreshed) = refreshed {
+                        self.refreshed(warm, refreshed).await?;
+                    }
+                    return Ok(match finished {
+                        Some(result) => Ran::Done(result),
+                        None => Ran::Lifted(run),
+                    });
                 }
                 Next::Refreshed(refreshed) => {
                     *warm.pending = None;
@@ -2880,7 +3101,11 @@ impl Turn {
                 }
             }
             if warm.stopped {
-                return Ok(run.await);
+                return Ok(tokio::select! {
+                    biased;
+                    result = &mut run => Ran::Done(result),
+                    () = &mut lifted => Ran::Lifted(run),
+                });
             }
         }
     }
@@ -3141,13 +3366,45 @@ impl Turn {
                         }
                     }
                 }
+                Ok(Prepared::Shell {
+                    command,
+                    timeout_ms,
+                    background: false,
+                }) => {
+                    let (started, running) = oneshot::channel();
+                    let run = self.registry.foreground(
+                        command,
+                        workspace.to_path_buf(),
+                        timeout_ms,
+                        environment.to_vec(),
+                        started,
+                    );
+                    match self
+                        .run_tool(run, Some((&self.lift, running)), warm.as_deref_mut())
+                        .await?
+                    {
+                        Ran::Done(Ok(outcome)) => annotate(outcome, turn, &call.call_id),
+                        Ran::Done(Err(error)) if error.code == "tool_scheduler_closed" => {
+                            return Err(error);
+                        }
+                        Ran::Done(Err(error)) => failure(error),
+                        Ran::Lifted(run) => self.lift_shell(&call.call_id, run).await?,
+                    }
+                }
                 Ok(prepared) => match self
-                    .run_tool(prepared, workspace, environment, warm.as_deref_mut())
+                    .run_tool(
+                        self.registry.execute(prepared, workspace, environment),
+                        None,
+                        warm.as_deref_mut(),
+                    )
                     .await?
                 {
-                    Ok(outcome) => annotate(outcome, turn, &call.call_id),
-                    Err(error) if error.code == "tool_scheduler_closed" => return Err(error),
-                    Err(error) => failure(error),
+                    Ran::Done(Ok(outcome)) => annotate(outcome, turn, &call.call_id),
+                    Ran::Done(Err(error)) if error.code == "tool_scheduler_closed" => {
+                        return Err(error);
+                    }
+                    Ran::Done(Err(error)) => failure(error),
+                    Ran::Lifted(_) => unreachable!("only a command moves to the background"),
                 },
                 Err(error) => failure(error),
             };
@@ -3415,6 +3672,13 @@ impl Turn {
                 return Ok(ControlFlow::Continue(failure(error)));
             }
         }
+        // A steer waiting for the next boundary makes the wait a poll: it
+        // reports what resolved, and the rest pending.
+        let timeout_ms = if self.lift.is_armed() {
+            Some(0)
+        } else {
+            timeout_ms
+        };
         // Only move the remaining calls once this wait can actually park.
         let pending: Vec<ToolCall> = calls.collect();
         let deadline_ms = timeout_ms.map(|t| now_ms() + t);
@@ -3474,6 +3738,39 @@ impl Turn {
         let (sender, receiver) = oneshot::channel();
         self.registry
             .background(command, workspace, timeout_ms, environment, queued, sender);
+        self.collect(id, call_id, receiver);
+        Ok(Outcome::text(
+            json!({"handle":format!("proc:{id}"),"background":true}).to_string(),
+        ))
+    }
+
+    /// Move a running foreground command to the background: it keeps its
+    /// process slot and timeout, and its result arrives on a proc handle as
+    /// a background command's does. A failure to record it drops the
+    /// command, which kills it.
+    async fn lift_shell<F>(&self, call_id: &str, run: std::pin::Pin<Box<F>>) -> Result<Outcome>
+    where
+        F: Future<Output = Result<Outcome>> + Send + 'static,
+    {
+        let (turn, started) = (self.turn, call_id.to_owned());
+        let id = self
+            .store
+            .op("process_start", move |db| db.process_start(turn, &started))
+            .await?;
+        let (sender, receiver) = oneshot::channel();
+        tokio::spawn(async move {
+            let _ = sender.send(run.await);
+        });
+        self.collect(id, call_id, receiver);
+        Ok(Outcome::text(
+            json!({"handle":format!("proc:{id}"),"background":true,"steered":true}).to_string(),
+        ))
+    }
+
+    /// Record a background command's result when it arrives and wake those
+    /// waiting on its handle.
+    fn collect(&self, id: i64, call_id: &str, receiver: oneshot::Receiver<Result<Outcome>>) {
+        let turn = self.turn;
         let (store, handles, failures, call_id_for_refs) = (
             self.store.clone(),
             self.handles.clone(),
@@ -3512,9 +3809,6 @@ impl Turn {
                 }
             }
         });
-        Ok(Outcome::text(
-            json!({"handle":format!("proc:{id}"),"background":true}).to_string(),
-        ))
     }
 }
 
@@ -4273,8 +4567,11 @@ mod tests {
             handles: handles.clone(),
             background_failures: mpsc::unbounded_channel().0,
             settings: Default::default(),
+            window: Default::default(),
             resumed: None,
             steers: Arc::new(AtomicBool::new(true)),
+            compact: Arc::default(),
+            lift: Arc::default(),
             tokens: Arc::default(),
             read_results: Default::default(),
             side: Default::default(),

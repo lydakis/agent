@@ -154,10 +154,133 @@ class TurnCompactionTests(ModelFixture):
                        compaction_instructions='Summarize.')
         turn = client.request('submit', bot='Bob', request_id='1', prompt='long:250x1')['result']['turn']
         ended = client.finished(turn, timeout=90)
-        self.assertEqual((ended['data']['status'], ended['data']['error']), ('failed', 'tool_round_limit'))
+        # The last round may call no tool, so the turn ends on its reply.
+        self.assertEqual(ended['data']['status'], 'completed', ended)
+        answer = node_item(client, 'Bob', ended['data']['checkpoint'])['result']
+        self.assertIn('final reply', json.dumps(answer))
         requests = drain(self.model)
         self.assertEqual(len(requests), 200)
         self.assertEqual(sum(map(is_summary, requests)), 1)
+        self.assertEqual(requests[-1]['tool_choice'], 'none')
+        self.assertFalse(any('tool_choice' in r for r in requests[:-1]))
+
+    def test_a_billed_retry_that_is_the_last_round_calls_no_tools(self):
+        # The 199th call is billed and fails; its retry is the 200th round,
+        # so it goes without calls and the turn ends on its reply.
+        self.model.fail_billed_at = 199
+        client = self.client(tools='shell')
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'])
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:250x1')['result']['turn']
+        ended = client.finished(turn, timeout=90)
+        self.assertEqual(ended['data']['status'], 'completed', ended)
+        requests = drain(self.model)
+        self.assertEqual(len(requests), 200)
+        self.assertEqual([r.get('tool_choice') for r in requests[-2:]], [None, 'none'])
+
+    def test_a_bot_compacts_once_its_calls_reach_its_token_threshold(self):
+        # Four bytes a token, so 16K tokens is about 64 KiB: far under the
+        # byte budget, which alone never makes forty 11 KiB rounds compact.
+        self.model.bytes_per_token = 4
+        for threshold, expected in ((16384, True), (0, False)):
+            with self.subTest(compact_tokens=threshold):
+                bot = f'Bob{threshold}'
+                client = self.client(tools='shell', settings={'compact_tokens': threshold})
+                client.request('create', bot=bot, workspace=str(self.path), tools=['shell'],
+                               compaction_instructions='Summarize.')
+                record = client.request('inspect', bot=bot)['result']
+                self.assertEqual(record['settings']['compact_tokens'], threshold)
+                turn = client.request('submit', bot=bot, request_id='1', prompt='long:40')['result']['turn']
+                ended = client.finished(turn, timeout=60)
+                self.assertEqual(ended['data']['status'], 'completed', ended)
+                requests = drain(self.model)
+                compacted = [e for e in all_events(client, bot) if e['event'] == 'compacted']
+                self.assertEqual(bool(compacted), expected)
+                work = [r for r in requests if not is_summary(r)]
+                largest = max(len(json.dumps(r)) for r in work)
+                if expected:
+                    # Under the threshold, give or take the round that
+                    # crossed it and the summary that went ahead.
+                    self.assertLess(largest, 16384 * 4 + 24576)
+                else:
+                    self.assertGreater(largest, 40 * 11000)
+                client.close()
+
+    def test_an_unset_threshold_follows_the_models_listed_window(self):
+        # A 40,000-token window compacts at 7,000 tokens, its window less
+        # 33,000: about 28 KiB at four bytes a token. The window is the
+        # listing a client asked for.
+        self.model.bytes_per_token, self.model.context_window = 4, 40000
+        client = self.client(tools='shell')
+        listed = client.request('provider_models')['result']['providers']
+        self.assertEqual([m['context_tokens'] for p in listed.values() for m in p['models']][:1], [40000])
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
+                       compaction_instructions='Summarize.')
+        self.assertIsNone(client.request('inspect', bot='Bob')['result']['settings']['compact_tokens'])
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:40')['result']['turn']
+        self.assertEqual(client.finished(turn, timeout=60)['data']['status'], 'completed')
+        self.assertTrue([e for e in all_events(client, 'Bob') if e['event'] == 'compacted'])
+        work = [r for r in drain(self.model) if not is_summary(r)]
+        self.assertLess(max(len(json.dumps(r)) for r in work), 7000 * 4 + 24576)
+
+    def test_a_compaction_a_client_asks_for_runs_before_the_next_call(self):
+        client = self.client(tools='shell')
+        client.request('create', bot='Plain', workspace=str(self.path), tools=['shell'])
+        refused = client.request('compact', bot='Plain')
+        self.assertEqual(refused['error'], 'compaction_unavailable')
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
+                       compaction_instructions='Summarize.')
+        for n in range(3):
+            turn = client.request('submit', bot='Bob', request_id=str(n), prompt='long:2')['result']['turn']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        drain(self.model)
+        # Idle: it waits for the next turn, once, however often it is asked.
+        asked = client.request('compact', bot='Bob')['result']
+        self.assertEqual((asked['running_turn'], asked['duplicate']), (None, False))
+        self.assertTrue(client.request('compact', bot='Bob')['result']['duplicate'])
+        self.assertTrue(client.request('inspect', bot='Bob')['result']['compaction_requested'])
+        turn = client.request('submit', bot='Bob', request_id='next', prompt='long:1')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        requests = drain(self.model)
+        self.assertTrue(is_summary(requests[0]))
+        self.assertEqual(sum(map(is_summary, requests)), 1)
+        record = client.request('inspect', bot='Bob')['result']
+        self.assertFalse(record['compaction_requested'])
+        self.assertIsNotNone(record['compaction'])
+        # Running: the next round boundary takes it, once however often it
+        # is asked while its summary runs.
+        self.model.summary_delay = 1.0
+        turn = client.request('submit', bot='Bob', request_id='long', prompt='long:30x40')['result']['turn']
+        client.receive(lambda e: e.get('event') == 'tool_completed' and e.get('turn') == turn)
+        asked = client.request('compact', bot='Bob')['result']
+        self.assertEqual(asked['running_turn'], turn)
+        while not is_summary(self.model.requests.get(timeout=10)):
+            pass
+        self.assertTrue(client.request('compact', bot='Bob')['result']['duplicate'])
+        self.assertEqual(client.finished(turn, timeout=30)['data']['status'], 'completed')
+        compacted = [e for e in all_events(client, 'Bob') if e['event'] == 'compacted' and e['turn'] == turn]
+        self.assertEqual(len(compacted), 1)
+        self.assertFalse(client.request('inspect', bot='Bob')['result']['compaction_requested'])
+
+    def test_a_compaction_a_client_asks_for_survives_its_summary_parking(self):
+        # The summary is turned away until its pool reopens; the turn parks
+        # and, resumed, still summarizes before its call.
+        client = self.client(tools='shell')
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
+                       compaction_instructions='Summarize.')
+        turn = client.request('submit', bot='Bob', request_id='0', prompt='long:2')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        drain(self.model)
+        self.model.compaction_refusals, self.model.compaction_retry_after = 1, '1'
+        client.request('compact', bot='Bob')
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:1')['result']['turn']
+        ended = client.finished(turn, timeout=30)
+        self.assertEqual(ended['data']['status'], 'completed', ended)
+        kinds = [e['event'] for e in all_events(client, 'Bob') if e['turn'] == turn]
+        self.assertIn('turn_paced', kinds)
+        self.assertEqual(kinds.count('compacted'), 1)
+        work = [r for r in drain(self.model) if not is_summary(r)]
+        self.assertTrue(any('summary' in json.dumps(i) for i in work[0]['input'][:2]), work[0]['input'][:2])
+        self.assertFalse(client.request('inspect', bot='Bob')['result']['compaction_requested'])
 
     def test_a_summary_beside_a_call_is_installed_before_the_turn_parks(self):
         # Compaction comes due past round 150 and the summary takes five

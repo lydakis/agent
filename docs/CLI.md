@@ -60,7 +60,12 @@ identity is `bot_not_found`.
   changes what a program's submission means. A blocking `run` with `queue`
   follows the turn from its queued state to its end; with `steer` it ends
   with exit 0 when the message is absorbed (`steered`, naming the turn it
-  joined) or when the turn it started completes.
+  joined) or when the turn it started completes. A steer never waits behind
+  a blocking call and never cancels one: a turn parked on `wait` resumes at
+  once with its unresolved handles pending (still valid) and `steered: true`,
+  and a foreground `shell` command still running 250 ms after the steer
+  moves to the background and returns its `proc:` handle. `queue`
+  deliveries leave both alone.
   A steer with an explicit workspace or model that differs from the running
   turn stays queued and runs separately with those choices.
 - `run --turn-budget-tokens N` caps this turn's input plus output tokens,
@@ -148,7 +153,7 @@ identity is `bot_not_found`.
   turns' records. `prune` applies it once; on `run --new` it is the bot's
   setting, applied after each of its turns.
 - `run` sets a new bot's own settings with `--context-bytes`, `--context-items`,
-  `--note-turns`, `--compact-at`, `--compact-keep`, `--keep-turns`,
+  `--note-turns`, `--compact-at`, `--compact-keep`, `--compact-tokens`, `--keep-turns`,
   `--approval-hold`, `--max-output-tokens`, `--keep-warm`, and
   `--cache-ttl`; they are not daemon options, and an existing bot
   keeps its own (see [bot settings](RUST_PROTOTYPE.md#bot-settings)).
