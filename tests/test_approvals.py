@@ -601,15 +601,15 @@ class PromptReadTests(ModelFixture):
         self.assertEqual(client.request('prompts', bot='Bob', turn=second, bytes=0)['error'], 'invalid_limit')
 
     def test_the_approvers_keys_never_reach_a_tool(self):
-        env = {**clean_env(), 'TYPESAFE_API_KEY': 'synthetic-judge-key', 'OPENAI_API_KEY': 'synthetic-judge-key'}
+        env = {**clean_env(), 'OPENAI_API_KEY': 'synthetic-judge-key'}
         client = Client(self.binary, self.path / 'state.sqlite', self.url, 'shell', env=env)
         self.addCleanup(client.close)
         client.request('create', bot='Bob', workspace=str(self.path))
         turn = client.request('submit', bot='Bob', request_id='a',
-                              prompt='shell:printf "${TYPESAFE_API_KEY-unset}${OPENAI_API_KEY-unset}/$AGENT_TURN" > seen'
+                              prompt='shell:printf "${OPENAI_API_KEY-unset}/$AGENT_TURN" > seen'
                               )['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-        self.assertEqual((self.path / 'seen').read_text(), f'unsetunset/{turn}')
+        self.assertEqual((self.path / 'seen').read_text(), f'unset/{turn}')
 
     def test_the_daemons_own_terminal_never_reaches_a_tool(self):
         env = {**clean_env(), 'REX_SESSION': 'session:daemons', 'REX_BLOCK': 'block:daemons',
@@ -779,8 +779,9 @@ class ApprovalCliTests(ModelFixture):
 
 
 class Judge(http.server.BaseHTTPRequestHandler):
-    """A stand-in for the judge model: every question gets `answer(body, id)`,
-    unless `statuses` holds a failure to send first."""
+    """A stand-in for OpenAI's Decisions API: every question gets
+    `answer(body, id)`, the state read from the user's text, unless
+    `statuses` holds a failure to send first."""
     protocol_version = 'HTTP/1.1'
 
     def log_message(self, *_):
@@ -788,22 +789,18 @@ class Judge(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        # Recorded with the state the user's text holds, as `state`.
+        body['state'] = json.loads(body['input'][1]['content'][0]['text'])
         self.server.requests.put({'path': self.path, 'authorization': self.headers.get('Authorization'),
                                   'body': body})
         status = self.server.statuses.pop(0) if self.server.statuses else 200
         headers = {'Content-Type': 'application/json'}
-        if status == 200 and self.path == '/v1/decisions':
-            # OpenAI's shape: predicates by name, the state as the user's text.
-            state = {**body, 'state': json.loads(body['input'][1]['content'][0]['text'])}
-            answers = [{'type': 'predicate', 'name': q['name'], 'probability': self.server.answer(state, q['name'])}
+        if status == 200:
+            answers = [{'type': 'predicate', 'name': q['name'], 'probability': self.server.answer(body, q['name'])}
                        for q in body['questions']]
             payload = {'model': body['model'], 'answers': answers,
                        'usage': {'input_tokens': 1000, 'input_tokens_details': {'cached_tokens': 200},
                                  'output_tokens': 0}}
-        elif status == 200:
-            answers = {id: {'type': 'noul', 'noul': self.server.answer(body, id)} for id in body['questions']}
-            payload = {'model': body['model'], 'answers': answers,
-                       'usage': {'input_tokens': 1000, 'output_tokens': 0}}
         elif status == 'quota':
             status, payload = 429, {'error': {'type': 'insufficient_quota', 'code': 'insufficient_quota'}}
         else:
@@ -848,14 +845,14 @@ class AutoApproverTests(ModelFixture):
         return daemon
 
     def approver(self, daemon, env=None, judge=None):
-        """Jev at the stand-in unless `judge` names a model the daemon serves,
-        or OpenAI's Decisions API, also at the stand-in."""
-        if judge and judge.startswith('openai-decisions/'):
+        """OpenAI's Decisions API at the stand-in, unless `judge` names a
+        model the daemon serves."""
+        judge = judge or 'openai-decisions/gpt-6-luna'
+        if judge.startswith('openai-decisions/'):
             judged_by = ['--judge', judge, '--judge-url', self.judge_url]
             key = {'OPENAI_API_KEY': 'synthetic-judge-key'}
         else:
-            judged_by = ['--judge', judge] if judge else ['--judge-url', self.judge_url]
-            key = {} if judge else {'TYPESAFE_API_KEY': 'synthetic-judge-key'}
+            judged_by, key = ['--judge', judge], {}
         process = subprocess.Popen(
             [str(self.binary), 'approver', '--store', str(self.path / 'state.sqlite'),
              '--socket', str(daemon.socket_path), *judged_by],
@@ -886,14 +883,12 @@ class AutoApproverTests(ModelFixture):
         safe = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf safe > out')['result']['turn']
         self.assertEqual(daemon.finished(safe)['data']['status'], 'completed')
         self.assertEqual((self.path / 'out').read_text(), 'safe')
-        asked = self.judge.requests.get(timeout=5)
-        self.assertEqual((asked['path'], asked['authorization']), ('/v1/systemone', 'Bearer synthetic-judge-key'))
-        body = asked['body']
-        self.assertEqual(body['model'], 'jev-latest')
+        body = self.judge.requests.get(timeout=5)['body']
         self.assertEqual(len(body['questions']), 11)
-        self.assertEqual(body['state']['request'], [{'by': 'person', 'text': 'shell:printf safe > out'}])
-        self.assertEqual(body['state']['planned_calls'][0]['arguments']['command'], 'printf safe > out')
-        self.assertEqual(body['state']['workspace'], str(self.path))
+        state = json.loads(body['input'][1]['content'][0]['text'])
+        self.assertEqual(state['request'], [{'by': 'person', 'text': 'shell:printf safe > out'}])
+        self.assertEqual(state['planned_calls'][0]['arguments']['command'], 'printf safe > out')
+        self.assertEqual(state['workspace'], str(self.path))
         judged = lines.get(timeout=5)
         self.assertEqual((judged['event'], judged['calls'][0]['decision'], judged['input_tokens']),
                          ('judged', 'allow', 1000))
@@ -905,7 +900,8 @@ class AutoApproverTests(ModelFixture):
         reason = self.denial(daemon, risky_turn)
         self.assertTrue(reason.startswith('judged risky: it destroys data'), reason)
         body = self.judge.requests.get(timeout=5)['body']
-        self.assertEqual(body['state']['earlier_prompts'], [{'by': 'person', 'text': 'shell:printf safe > out'}])
+        state = json.loads(body['input'][1]['content'][0]['text'])
+        self.assertEqual(state['earlier_prompts'], [{'by': 'person', 'text': 'shell:printf safe > out'}])
         self.assertEqual(self.judge.requests.qsize(), 0)
 
     def test_openai_decisions_judges_the_same_questions_as_predicates(self):
@@ -938,7 +934,7 @@ class AutoApproverTests(ModelFixture):
         failed = next(line for line in iter(lambda: lines.get(timeout=5), None) if line['event'] == 'judge_failed')
         self.assertEqual(failed['detail'], "the judge's account is out of quota")
 
-    def test_a_model_the_daemon_serves_judges_without_a_jev_key(self):
+    def test_a_model_the_daemon_serves_judges(self):
         asked = queue.Queue()
         parsed = [True]
 
@@ -960,7 +956,7 @@ class AutoApproverTests(ModelFixture):
              '--socket', str(daemon.socket_path), '--judge', 'openai/judge-model'],
             env=clean_env(), capture_output=True, text=True, timeout=30)
         self.assertNotEqual(refused.returncode, 0)
-        self.assertIn('approver_name_taken', refused.stderr)
+        self.assertIn('judge_name_taken', refused.stderr)
         self.assertEqual(daemon.request('inspect', bot='approver.auto')['result']['instructions'],
                          'Help with the repo.')
         self.assertIn('result', daemon.request('delete', bot='approver.auto'))
@@ -976,7 +972,7 @@ class AutoApproverTests(ModelFixture):
             self.assertLess(time.monotonic(), deadline)
             time.sleep(0.05)
         old_id = daemon.request('inspect', bot='approver.auto')['result']['bot_id']
-        daemon.request('fork', source='approver.auto', bot=f'approver.auto.{old_id}.0',
+        daemon.request('fork', source='approver.auto', bot=f'approver.auto.{old_id}.1.0',
                        created_by='approver.auto', expire_ms=1000)
         daemon.request('create', bot='approver.auto.notes', workspace='/', model='openai/synthetic-model',
                        tools=['shell'])
@@ -1023,11 +1019,32 @@ class AutoApproverTests(ModelFixture):
         # is answered; the base stays.
         base = bots['approver.auto']['bot_id']
         forked = forks.receive(lambda e: e.get('event') == 'forked')
-        self.assertEqual((forked['bot'], forked['data']['expire_ms']), (f'approver.auto.{base}.0', 60000))
+        self.assertRegex(forked['bot'], rf'^approver\.auto\.{base}\.\d+\.0$')
+        self.assertEqual(forked['data']['expire_ms'], 60000)
         deadline = time.monotonic() + 5
         while sorted(b['name'] for b in daemon.request('bots')['result']['bots']) != ['Bob', 'approver.auto']:
             self.assertLess(time.monotonic(), deadline)
             time.sleep(0.05)
+
+    def test_an_approver_refused_the_tag_leaves_the_serving_judge_alone(self):
+        self.model.reply_for = lambda request, user: (
+            json.dumps({id: .05 for id in json.loads(user)['answer']})
+            if request['model'] in ('judge-model', 'other-model') else None)
+        self.model.models = ('synthetic-model', 'judge-model', 'other-model')
+        daemon = self.daemon()
+        self.approver(daemon, judge='openai/judge-model')
+        base = daemon.request('inspect', bot='approver.auto')['result']
+        refused = subprocess.run(
+            [str(self.binary), 'approver', '--store', str(self.path / 'state.sqlite'),
+             '--socket', str(daemon.socket_path), '--judge', 'openai/other-model'],
+            env=clean_env(), capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn('approvals_served', refused.stderr)
+        kept = daemon.request('inspect', bot='approver.auto')['result']
+        self.assertEqual((kept['bot_id'], kept['model']), (base['bot_id'], 'judge-model'))
+        safe = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf safe > out')['result']['turn']
+        self.assertEqual(daemon.finished(safe)['data']['status'], 'completed')
+        self.assertEqual((self.path / 'out').read_text(), 'safe')
 
     def test_secrets_are_redacted_before_the_judge_sees_them(self):
         daemon = self.daemon()
@@ -1047,7 +1064,7 @@ class AutoApproverTests(ModelFixture):
         retried = daemon.request('submit', bot='Bob', request_id='r', prompt='shell:printf one > one')['result']['turn']
         self.assertEqual(daemon.finished(retried)['data']['status'], 'completed')
         self.assertEqual((self.path / 'one').read_text(), 'one')
-        self.assertEqual([self.judge.requests.get(timeout=5)['path'] for _ in range(2)], ['/v1/systemone'] * 2)
+        self.assertEqual([self.judge.requests.get(timeout=5)['path'] for _ in range(2)], ['/v1/decisions'] * 2)
         # One that fails twice is not reviewed: a gate that lapses denies it.
         self.judge.statuses = [500, 500]
         failed = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf one')['result']['turn']
@@ -1160,7 +1177,7 @@ class AutoApproverTests(ModelFixture):
         self.assertTrue(body['state']['request_cut'])
         self.assertEqual(body['state']['request'][-1], {'by': 'model', 'text': 'shell:printf safe > safe'})
         self.assertEqual(body['state']['already_allowed'], [])
-        self.assertTrue([id for id in body['questions'] if id.endswith('_ok')])
+        self.assertTrue([q for q in body['questions'] if q['name'].endswith('_ok')])
         # A risky call nobody asked for still is not run.
         risky = daemon.request('submit', bot='Carol', request_id='c', prompt='shell:printf DANGER',
                                **{'from': {'bot': 'Bob', 'turn': person}})['result']['turn']
@@ -1272,7 +1289,8 @@ class AutoApproverTests(ModelFixture):
             return subprocess.run([str(self.binary), *args], env=env,
                                   capture_output=True, text=True, timeout=30, cwd=self.path)
         self.addCleanup(lambda: agent('shutdown', '--store', str(store)))
-        # Without a Jev key the bot's own model judges, through the daemon.
+        # With no judge named and no Haiku listed, the bot's own model
+        # judges, through the daemon.
         self.model.reply_for = lambda request, user: (
             json.dumps({id: .05 for id in json.loads(user)['answer']})
             if user.startswith('{"state"') else None)

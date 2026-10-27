@@ -14,10 +14,9 @@ Over a Unix socket instead of stdio, with the approver a process of its own:
 
 - `socket`: the `held` arm with this client answering over the socket, the
   baseline for the two below.
-- `jev`: `agent approver` answers, asking a stand-in for Jev's API that
-  judges every call low at once.
-- `decisions`: the same, with `openai-decisions/gpt-6-luna` asking a
-  stand-in for OpenAI's Decisions API.
+- `decisions`: `agent approver` answers with `openai-decisions/gpt-6-luna`,
+  asking a stand-in for OpenAI's Decisions API that judges every call low
+  at once.
 - `judge`: `agent approver` answers with the synthetic model as a general
   judge through the daemon (a fork, a turn, and a deletion per round),
   judging every call low at once.
@@ -77,8 +76,9 @@ def start():
     return server, f'http://127.0.0.1:{server.server_port}/v1'
 
 
-class Jev(http.server.BaseHTTPRequestHandler):
-    """A stand-in for Jev's API that judges every question low at once."""
+class Decisions(http.server.BaseHTTPRequestHandler):
+    """A stand-in for OpenAI's Decisions API that judges every predicate low
+    at once."""
     protocol_version = 'HTTP/1.1'
 
     def log_message(self, *_):
@@ -87,21 +87,6 @@ class Jev(http.server.BaseHTTPRequestHandler):
     def setup(self):
         super().setup()
         self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-
-    def do_POST(self):
-        body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-        data = json.dumps({'answers': {id: {'type': 'noul', 'noul': 0.05} for id in body['questions']},
-                           'usage': {'input_tokens': 0}}).encode()
-        self.send_response(200)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Content-Length', str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-
-class Decisions(Jev):
-    """A stand-in for OpenAI's Decisions API that judges every predicate low
-    at once."""
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
@@ -261,9 +246,9 @@ def run(binary, arm, *, bots, turns, fsync=False):
 
 def run_socket(binary, arm, *, bots, turns):
     """The `held` workload over a Unix socket, answered by this client
-    (`socket`) or by `agent approver` (`jev`, `decisions`, `judge`)."""
+    (`socket`) or by `agent approver` (`decisions`, `judge`)."""
     server, url = start()
-    jev = None
+    stand_in = None
     with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent.parent / '.local') as temp, \
             tempfile.TemporaryDirectory(prefix='agent-bench-', dir='/tmp') as short:
         path, sock = Path(temp), Path(short) / 'daemon.sock'
@@ -289,16 +274,13 @@ def run_socket(binary, arm, *, bots, turns):
             if arm != 'socket':
                 env, args = clean_env(), [str(binary), 'approver', '--store', str(path / 'state.sqlite'),
                                          '--socket', str(sock)]
-                if arm in ('jev', 'decisions'):
-                    jev = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Jev if arm == 'jev' else Decisions)
-                    jev.daemon_threads = True
-                    threading.Thread(target=jev.serve_forever, daemon=True).start()
-                    if arm == 'jev':
-                        env['TYPESAFE_API_KEY'] = 'synthetic-judge-key'
-                    else:
-                        env['OPENAI_API_KEY'] = 'synthetic-judge-key'
-                        args += ['--judge', 'openai-decisions/gpt-6-luna']
-                    args += ['--judge-url', f'http://127.0.0.1:{jev.server_port}']
+                if arm == 'decisions':
+                    stand_in = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Decisions)
+                    stand_in.daemon_threads = True
+                    threading.Thread(target=stand_in.serve_forever, daemon=True).start()
+                    env['OPENAI_API_KEY'] = 'synthetic-judge-key'
+                    args += ['--judge', 'openai-decisions/gpt-6-luna',
+                             '--judge-url', f'http://127.0.0.1:{stand_in.server_port}']
                 else:
                     args += ['--judge', 'openai/synthetic-model']
                 approver = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -368,9 +350,9 @@ def run_socket(binary, arm, *, bots, turns):
             daemon.wait()
             server.shutdown()
             server.server_close()
-            if jev:
-                jev.shutdown()
-                jev.server_close()
+            if stand_in:
+                stand_in.shutdown()
+                stand_in.server_close()
     count = bots * turns
     lines = []
     while not judged.empty():
@@ -406,7 +388,7 @@ def main():
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     arms = [('after', arm) for arm in args.arms.split(',')]
-    assert arms and all(arm in ('ungated', 'held', 'parked', 'socket', 'jev', 'decisions', 'judge')
+    assert arms and all(arm in ('ungated', 'held', 'parked', 'socket', 'decisions', 'judge')
                         for _, arm in arms)
     if args.before:
         arms.insert(0, ('before', 'ungated'))
@@ -418,7 +400,7 @@ def main():
     for index in range(args.rounds):
         # Rotate the order so no arm always runs first or last.
         for label, arm in arms[index % len(arms):] + arms[:index % len(arms)]:
-            measure = run_socket if arm in ('socket', 'jev', 'decisions', 'judge') else run
+            measure = run_socket if arm in ('socket', 'decisions', 'judge') else run
             record = {'binary': label, **measure(binaries[label], arm, bots=args.bots, turns=args.turns)}
             report['runs'].append(record)
             (args.out / 'result.json').write_text(json.dumps(report, indent=2) + '\n')

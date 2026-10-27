@@ -16,7 +16,7 @@ threshold goes on to the lead's fork, which decides it; the rest are dropped.
 import json, math, sys
 from collections import defaultdict
 
-PRICE = {"openai-decisions": 0.10, "typesafe": 0.042}  # $ per million input tokens
+PRICE = {"openai-decisions": 0.10}  # $ per million input tokens
 STAGES = (0.10, 0.20, 0.35)
 
 replay = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]

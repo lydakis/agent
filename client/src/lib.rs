@@ -5,6 +5,7 @@
 pub mod approver;
 pub mod env_file;
 pub mod files;
+pub mod judge;
 pub mod memory;
 pub mod models;
 pub mod policy;

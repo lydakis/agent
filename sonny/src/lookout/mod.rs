@@ -3,13 +3,13 @@
 //! step in. It knows no leads: Sonny subscribes each lead to its tasks
 //! (`subs::Sub::lead`), and any bot can subscribe to more. Each message
 //! someone other than the subscriber writes in a task, and each turn a task
-//! ends, is one check: a few yes/no questions to OpenAI's Decisions API,
-//! Jev, or a model the daemon runs (Haiku on Bedrock, say). A high answer to
-//! an urgent question steers the subscriber now; any other answer that is
-//! not low rides the next note, once the subscriber rests; a low one is
-//! only logged. One lookout watches a daemon, for every subscriber on it,
-//! started by the first Sonny to open; the daemon is unchanged: this follows
-//! every bot and submits to the subscribers like any client.
+//! ends, is one check: a few yes/no questions to the judge
+//! `agent_client::judge` picks, the lead's own model by default. A high
+//! answer to an urgent question steers the subscriber now; any other answer
+//! that is not low rides the next note, once the subscriber rests; a low
+//! one is only logged. One lookout watches a daemon, for every subscriber
+//! on it, started by the first Sonny to open; the daemon is unchanged: this
+//! follows every bot and submits to the subscribers like any client.
 //!
 //! A subscriber hears it all in one note, which starts "Task updates: ":
 //! what the judge picked, and, when a subscription asks for them, the task
@@ -17,7 +17,10 @@
 mod subs;
 mod updates;
 
-use agent_client::Client;
+use agent_client::{
+    Client,
+    judge::{self, Usage},
+};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -544,8 +547,6 @@ fn digest(text: &str) -> String {
 /// Who answers the questions.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Api {
-    /// TypeSafe's `POST /v1/systemone`, with each question a `noul`.
-    Jev,
     /// OpenAI's `POST /v1/decisions`, with each question a predicate.
     Decisions,
     /// A `provider/model` the daemon runs, with the providers and logins
@@ -559,13 +560,12 @@ enum Api {
 pub struct Judge {
     api: Api,
     pub name: String,
-    url: String,
+    /// For `Model`: its `provider/model`.
     model: String,
-    key: String,
-    http: reqwest::Client,
+    /// For `Decisions`: the API.
+    decisions: Option<judge::Decisions>,
     /// For `Model`: the idle base bot each check forks, once made.
-    base: tokio::sync::Mutex<Option<(String, i64)>>,
-    next: std::sync::atomic::AtomicU64,
+    base: tokio::sync::Mutex<Option<Arc<judge::Base>>>,
     /// `SPEC+lead`: the input also carries the lead's latest words.
     context: bool,
 }
@@ -578,10 +578,6 @@ pub struct At {
     pub lead: String,
     pub nodes: Option<Vec<i64>>,
 }
-
-/// The decision model for everything that judges, the approver included,
-/// as one setting: `AGENT_JUDGE` in the shell or `~/.agent/env`.
-pub const JUDGE_VAR: &str = "AGENT_JUDGE";
 
 /// How a daemon model reads a check, and answers it.
 pub const MODEL_INSTRUCTIONS: &str = "You answer yes/no questions about one event in a software project \
@@ -605,98 +601,42 @@ fn key(name: &str) -> Option<String> {
 }
 
 impl Judge {
-    /// `openai-decisions/MODEL` with `OPENAI_API_KEY`, `typesafe/jev-*`
-    /// with `TYPESAFE_API_KEY` (`LOOKOUT_URL` points either elsewhere), any
-    /// other `provider/model`, which the daemon runs, or `lead`, a fork of
-    /// the lead. `+lead` after any but `lead` adds the lead's latest words
-    /// to what the judge reads.
+    /// `openai-decisions/MODEL` with `OPENAI_API_KEY` (`LOOKOUT_URL`
+    /// points it elsewhere), any other `provider/model`, which the daemon
+    /// runs, or `lead`, a fork of the lead. `+lead` after any but `lead`
+    /// adds the lead's latest words to what the judge reads.
     pub fn parse(spec: &str) -> Result<Self, String> {
         let name = spec;
         let (spec, context) = match spec.strip_suffix("+lead") {
             Some(base) if base != "lead" => (base, true),
             _ => (spec, false),
         };
-        let http = reqwest::Client::builder()
-            .user_agent(concat!("sonny/", env!("CARGO_PKG_VERSION")))
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(5))
-            .build()
-            .map_err(|e| format!("lookout: {e}"))?;
-        let judge = |api, model: &str, url: &str, key: String| Judge {
+        let judge = |api, model: &str, decisions| Judge {
             api,
             name: name.to_owned(),
-            url: url.trim_end_matches('/').to_owned(),
             model: model.to_owned(),
-            key,
-            http: http.clone(),
+            decisions,
             base: Default::default(),
-            next: Default::default(),
             context,
         };
         if spec == "lead" {
-            return Ok(judge(Api::Lead, "", "", String::new()));
+            return Ok(judge(Api::Lead, "", None));
         }
-        if !spec.starts_with("openai-decisions/") && !spec.starts_with("typesafe/") {
-            return match spec.split_once('/') {
-                Some((provider, model)) if !provider.is_empty() && !model.is_empty() => {
-                    Ok(judge(Api::Model, spec, "", String::new()))
-                }
-                _ => Err(format!(
-                    "lookout: {spec} is not openai-decisions/MODEL, typesafe/jev-*, PROVIDER/MODEL or lead"
-                )),
-            };
-        }
-        let (api, model, key_name, url) =
-            if let Some(model) = spec.strip_prefix("openai-decisions/") {
-                (
-                    Api::Decisions,
-                    model,
-                    "OPENAI_API_KEY",
-                    "https://api.openai.com",
-                )
-            } else if let Some(model) = spec
-                .strip_prefix("typesafe/")
-                .filter(|model| model.starts_with("jev-"))
-            {
-                (
-                    Api::Jev,
-                    model,
-                    "TYPESAFE_API_KEY",
-                    "https://api.typesafe.ai",
-                )
-            } else {
-                return Err(format!("lookout: {spec} is not typesafe/jev-*"));
-            };
-        let key = key(key_name).ok_or_else(|| format!("lookout: set {key_name} for {spec}"))?;
-        let url = std::env::var("LOOKOUT_URL")
-            .ok()
-            .filter(|url| !url.is_empty())
-            .unwrap_or_else(|| url.to_owned());
-        Ok(judge(api, model, &url, key))
-    }
-
-    fn request(&self, input: &Value, questions: &[Asked]) -> (&'static str, Value) {
-        match self.api {
-            Api::Decisions => (
-                "/v1/decisions",
-                json!({"model": self.model,
-                    "input": [
-                        {"role": "developer", "content": [{"type": "input_text", "text": READING}]},
-                        {"role": "user", "content": [{"type": "input_text", "text": input.to_string()}]},
-                    ],
-                    "questions": questions.iter()
-                        .map(|q| json!({"type": "predicate", "name": q.id, "instructions": q.text}))
-                        .collect::<Vec<_>>()}),
-            ),
-            Api::Model | Api::Lead => ("", Value::Null),
-            Api::Jev => (
-                "/v1/systemone",
-                json!({"model": self.model,
-                    "state": {"reading": READING, "input": input},
-                    "questions": questions.iter()
-                        .map(|q| (q.id.clone(), json!({"type": "noul", "instructions": q.text})))
-                        .collect::<Map<_, _>>()}),
-            ),
+        match judge::spec(spec) {
+            None => Err(format!(
+                "lookout: {spec} is not openai-decisions/MODEL, PROVIDER/MODEL or lead"
+            )),
+            Some(judge::Spec::Model(model)) => Ok(judge(Api::Model, model, None)),
+            Some(judge::Spec::Decisions(model)) => {
+                let key = key(judge::DECISIONS_KEY)
+                    .ok_or_else(|| format!("lookout: set {} for {spec}", judge::DECISIONS_KEY))?;
+                let url = std::env::var("LOOKOUT_URL")
+                    .ok()
+                    .filter(|url| !url.is_empty());
+                let decisions = judge::Decisions::new(model, url.as_deref(), key)
+                    .map_err(|e| format!("lookout: {e}"))?;
+                Ok(judge(Api::Decisions, "", Some(decisions)))
+            }
         }
     }
 
@@ -708,99 +648,27 @@ impl Judge {
         questions: &[Asked],
         at: &At,
     ) -> Result<(Map<String, Value>, Usage), Failure> {
-        match self.api {
-            Api::Model => return self.ask_model(client, input, questions).await,
-            Api::Lead => return ask_lead(client, at, input, questions).await,
-            Api::Decisions | Api::Jev => {}
-        }
-        let (path, body) = self.request(input, questions);
-        let response = self
-            .http
-            .post(format!("{}{path}", self.url))
-            .bearer_auth(&self.key)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body.to_string())
-            .timeout(DEADLINE)
-            .send()
-            .await
-            .map_err(|e| match e.is_timeout() {
-                true => Failure::Check("the check timed out".into(), String::new()),
-                false => Failure::Check("the check failed".into(), String::new()),
-            })?;
-        let status = response.status().as_u16();
-        let reply: Value = response
-            .bytes()
-            .await
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
-        // An account out of credit stays so; its code is published.
-        if status == 429 && reply["error"]["code"] == "insufficient_quota" {
-            return Err(Failure::Quota);
-        }
-        if !(200..300).contains(&status) {
-            return Err(Failure::Check(
-                format!("the judge answered {status}"),
-                String::new(),
-            ));
-        }
-        let usage = Usage {
-            input: reply["usage"]["input_tokens"].as_u64().unwrap_or(0),
-            cached: reply["usage"]["input_tokens_details"]["cached_tokens"]
-                .as_u64()
-                .unwrap_or(0),
+        let decisions = match (self.api, &self.decisions) {
+            (Api::Model, _) => return self.ask_model(client, input, questions).await,
+            (Api::Lead, _) => return ask_lead(client, at, input, questions).await,
+            (Api::Decisions, Some(decisions)) => decisions,
+            (Api::Decisions, None) => unreachable!("parsed with its API"),
         };
-        let mut answers = Map::new();
-        match self.api {
-            Api::Decisions => {
-                let asked: Map<String, Value> = questions
-                    .iter()
-                    .map(|q| (q.id.clone(), json!({})))
-                    .collect();
-                let read = agent_client::approver::decisions_answers(&reply, &Value::Object(asked))
-                    .map_err(|why| Failure::Check(why.into(), String::new()))?;
-                for (id, answer) in read.as_object().into_iter().flatten() {
-                    answers.insert(id.clone(), answer["noul"].clone());
-                }
-            }
-            Api::Model | Api::Lead => unreachable!("asked through the daemon"),
-            Api::Jev => {
-                for q in questions {
-                    let p = reply["answers"][q.id.as_str()]["noul"]
-                        .as_f64()
-                        .filter(|p| (0.0..=1.0).contains(p))
-                        .ok_or_else(|| {
-                            Failure::Check(
-                                "the judge's answer missed a question".into(),
-                                String::new(),
-                            )
-                        })?;
-                    answers.insert(q.id.clone(), json!(p));
-                }
-            }
-        }
-        Ok((answers, usage))
+        let asked: Vec<(String, String)> = questions
+            .iter()
+            .map(|q| (q.id.clone(), q.text.clone()))
+            .collect();
+        decisions
+            .ask(
+                READING,
+                &input.to_string(),
+                &asked,
+                Instant::now() + DEADLINE,
+            )
+            .await
+            .map_err(failure)
     }
-}
 
-/// What a judge read for one check, in tokens: all of it, and how much of
-/// that the provider had cached.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Usage {
-    pub input: u64,
-    pub cached: u64,
-}
-
-/// A check failed for `why`.
-fn failed(why: impl Into<String>) -> Failure {
-    Failure::Check(why.into(), String::new())
-}
-
-/// How long a judge's fork may sit idle before the daemon deletes it. Each
-/// is deleted once it answers; this is for a lookout that stopped mid-check.
-const JUDGE_EXPIRE_MS: u64 = 60_000;
-
-impl Judge {
     /// A daemon model's check: a fork of the base bot takes one turn, as the
     /// approver's judge does, so checks run at once and none sees another,
     /// and the fork is deleted once it answers.
@@ -810,29 +678,17 @@ impl Judge {
         input: &Value,
         questions: &[Asked],
     ) -> Result<(Map<String, Value>, Usage), Failure> {
-        let (base, base_id) = self.base(client).await?;
-        let name = format!(
-            "{base}.{}.{}",
-            std::process::id(),
-            self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
-        client
-            .request(
-                "fork",
-                json!({"source": base, "bot": name, "workspace": "/", "created_by": base,
-                    "created_by_id": base_id, "expire_ms": JUDGE_EXPIRE_MS}),
-            )
+        let base = self.base(client).await?;
+        let ids: Vec<&str> = questions.iter().map(|q| q.id.as_str()).collect();
+        let prompt = prompt("", input, questions);
+        base.ask(client, &prompt, &ids, Instant::now() + DEADLINE)
             .await
-            .map_err(|e| failed(format!("the judge could not start: {}", e.code)))?;
-        let answered = model_turn(client, &name, "", input, questions, DEADLINE).await;
-        let running = answered.as_ref().err().and_then(|(_, turn)| *turn);
-        remove(client, &name, running).await;
-        answered.map_err(|(failure, _)| failure)
+            .map_err(failure)
     }
 
     /// The idle bot holding the judge's model and instructions, named by
     /// both so another judge or another Sonny's never clashes, made once.
-    async fn base(&self, client: &Client) -> Result<(String, i64), Failure> {
+    async fn base(&self, client: &Client) -> Result<Arc<judge::Base>, Failure> {
         let mut base = self.base.lock().await;
         if let Some(made) = base.as_ref() {
             return Ok(made.clone());
@@ -841,133 +697,39 @@ impl Judge {
             "lookout.{}",
             &digest(&format!("{}\n{MODEL_INSTRUCTIONS}", self.model))[..12]
         );
-        // Only a judge is forked: a bot of that name with tools or other
-        // instructions is refused, never used.
-        let judge = |bot: Value| {
-            (bot["tools"].as_array().is_some_and(Vec::is_empty)
-                && bot["instructions"] == MODEL_INSTRUCTIONS)
-                .then(|| bot["bot_id"].as_i64())
-                .ok_or_else(|| failed(format!("{name} is a bot that is not a lookout judge")))
-        };
-        let id = match client.request("inspect", json!({"bot": name})).await {
-            Ok(bot) => judge(bot)?,
-            Err(e) if e.code == "bot_not_found" => {
-                match client
-                    .request(
-                        "create",
-                        json!({"bot": name, "workspace": "/", "model": self.model,
-                            "instructions": MODEL_INSTRUCTIONS, "tools": []}),
-                    )
-                    .await
-                {
-                    Ok(made) => made["bot_id"].as_i64(),
-                    // Another Sonny made it first.
-                    Err(e) if e.code == "bot_exists" => client
-                        .request("inspect", json!({"bot": name}))
-                        .await
-                        .map_err(|e| failed(format!("the judge could not be read: {}", e.code)))
-                        .and_then(judge)?,
-                    Err(e) => {
-                        return Err(failed(format!("the judge could not be made: {}", e.code)));
-                    }
-                }
-            }
-            Err(e) => return Err(failed(format!("the judge could not be read: {}", e.code))),
-        };
-        let id = id.ok_or_else(|| failed("the judge could not be made"))?;
-        *base = Some((name.clone(), id));
-        Ok((name, id))
+        let made = judge::Base::make(client, &name, &self.model, None, MODEL_INSTRUCTIONS)
+            .await
+            .map(Arc::new)
+            .map_err(|e| failed(format!("the judge could not be made: {e}")))?;
+        *base = Some(made.clone());
+        Ok(made)
     }
 }
 
-/// One turn of a judge's fork, its prompt after `preface`: its answers and
-/// input tokens, or why not and the turn if it is still running.
-async fn model_turn(
-    client: &Client,
-    name: &str,
-    preface: &str,
-    input: &Value,
-    questions: &[Asked],
-    deadline: Duration,
-) -> Result<(Map<String, Value>, Usage), (Failure, Option<i64>)> {
+/// A shared judge's failure as a check's.
+fn failure(failed: judge::Failed) -> Failure {
+    match failed {
+        judge::Failed::Quota => Failure::Quota,
+        judge::Failed::Overloaded => self::failed("the judge's rate limit outlasted the check"),
+        judge::Failed::Check(why) => self::failed(why),
+    }
+}
+
+/// A check failed for `why`.
+fn failed(why: impl Into<String>) -> Failure {
+    Failure::Check(why.into(), String::new())
+}
+
+/// What a judge's fork reads for a check, after `preface`.
+fn prompt(preface: &str, input: &Value, questions: &[Asked]) -> String {
     let asked: Map<String, Value> = questions
         .iter()
         .map(|q| (q.id.clone(), json!(q.text)))
         .collect();
-    let prompt = format!(
+    format!(
         "{preface}{}",
         json!({"reading": READING, "input": input, "questions": asked})
-    );
-    let submitted = client
-        .request(
-            "submit",
-            json!({"bot": name, "request_id": name, "prompt": prompt, "delivery": "queue"}),
-        )
-        .await
-        .map_err(|e| {
-            (
-                failed(format!("the judge's turn was refused: {}", e.code)),
-                None,
-            )
-        })?;
-    let (Some(turn), Some(handle)) = (submitted["turn"].as_i64(), submitted["handle"].as_str())
-    else {
-        return Err((failed("the judge's turn was not started"), None));
-    };
-    let waited = client
-        .request(
-            "wait",
-            json!({"handles": [handle], "timeout_ms": deadline.as_millis() as u64}),
-        )
-        .await
-        .map_err(|e| {
-            (
-                failed(format!("the judge could not be waited on: {}", e.code)),
-                Some(turn),
-            )
-        })?;
-    let outcome = &waited["results"][handle];
-    if outcome["pending"] == true {
-        return Err((failed("the check timed out"), Some(turn)));
-    }
-    if outcome["status"] != "completed" {
-        return Err((
-            failed(format!(
-                "the judge's turn {}: {}",
-                outcome["status"].as_str().unwrap_or("ended"),
-                outcome["error"].as_str().unwrap_or("no answer")
-            )),
-            None,
-        ));
-    }
-    let shape: Map<String, Value> = questions
-        .iter()
-        .map(|q| (q.id.to_owned(), json!({})))
-        .collect();
-    let read = (outcome["text_truncated"] != true)
-        .then(|| {
-            agent_client::approver::model_answers(
-                outcome["text"].as_str().unwrap_or_default(),
-                &Value::Object(shape),
-            )
-        })
-        .flatten()
-        .ok_or((failed("the judge's answer did not parse"), None))?;
-    let answers = read
-        .as_object()
-        .into_iter()
-        .flatten()
-        .map(|(id, answer)| (id.clone(), answer["noul"].clone()))
-        .collect();
-    let row = client
-        .request("turns", json!({"bot": name, "after": turn - 1, "limit": 1}))
-        .await
-        .unwrap_or_default();
-    let usage = Usage {
-        input: row["turns"][0]["input_tokens"].as_u64().unwrap_or(0),
-        cached: row["turns"][0]["cached_input_tokens"].as_u64().unwrap_or(0),
-    };
-    Ok((answers, usage))
+    )
 }
 
 /// How long a fork of the lead may take to answer: it reads the lead's
@@ -1027,34 +789,19 @@ async fn ask_lead(
         break;
     }
     forked?;
-    let answered = model_turn(client, &name, LEAD_PREFACE, input, questions, LEAD_DEADLINE).await;
-    let running = answered.as_ref().err().and_then(|(_, turn)| *turn);
-    remove(client, &name, running).await;
-    answered.map_err(|(failure, _)| failure)
+    let ids: Vec<&str> = questions.iter().map(|q| q.id.as_str()).collect();
+    let prompt = prompt(LEAD_PREFACE, input, questions);
+    let deadline = Instant::now() + LEAD_DEADLINE;
+    let (answered, running) = judge::turn(client, &name, &prompt, &ids, deadline).await;
+    judge::remove(client, &name, running).await;
+    answered.map_err(failure)
 }
 
 /// How long a fork of the lead may sit idle before the daemon deletes it.
 const LEAD_EXPIRE_MS: u64 = 600_000;
 
-/// Delete a judge's fork, ending its turn first if it still runs. One
-/// that stays is deleted when the next Sonny starts, as a stale fork.
-async fn remove(client: &Client, name: &str, running: Option<i64>) {
-    if let Some(turn) = running {
-        let _ = client
-            .request("interrupt", json!({"bot": name, "turn": turn}))
-            .await;
-        let _ = client
-            .request(
-                "wait",
-                json!({"handles": [format!("turn:{name}/{turn}")], "timeout_ms": 5_000}),
-            )
-            .await;
-    }
-    let _ = client.request("delete", json!({"bot": name})).await;
-}
-
-/// A lookout judge or one of its forks, `lookout.HASH[.PID.N]`: never a
-/// task, even in a project named `lookout`.
+/// A lookout judge or one of its forks, `lookout.HASH[.…]`: never a task,
+/// even in a project named `lookout`.
 fn judge_bot(name: &str) -> bool {
     name.strip_prefix("lookout.")
         .and_then(|rest| rest.split('.').next())
@@ -1062,54 +809,11 @@ fn judge_bot(name: &str) -> bool {
 }
 
 /// The judge for a lead on `lead_model`: `--judge SPEC`, else
-/// `AGENT_JUDGE`, else Decisions when `OPENAI_API_KEY` is set, else the
-/// newest Haiku the lead's provider lists, run through the daemon. `off`
-/// judges nothing.
-async fn pick(
-    client: &Client,
-    spec: Option<&str>,
-    lead_model: &str,
-) -> Result<Option<String>, String> {
-    if let Some(spec) = spec.map(str::to_owned).or_else(|| key(JUDGE_VAR)) {
-        return Ok((spec != "off").then_some(spec));
-    }
-    if key("OPENAI_API_KEY").is_some() {
-        return Ok(Some(DEFAULT.to_owned()));
-    }
-    let provider = lead_model.split_once('/').map_or(lead_model, |(p, _)| p);
-    let listing = client
-        .request("provider_models", json!({}))
-        .await
-        .unwrap_or_default();
-    match small_model(&listing["providers"][provider], lead_model) {
-        Some(model) => Ok(Some(format!("{provider}/{model}"))),
-        None => Err(format!(
-            "no judge: set {JUDGE_VAR}=PROVIDER/MODEL (in ~/.agent/env), or OPENAI_API_KEY"
-        )),
-    }
-}
-
-/// The newest Haiku a provider lists, in the lead's region when its ids
-/// carry one (`global.`, `us.` on Bedrock).
-fn small_model(listed: &Value, lead_model: &str) -> Option<String> {
-    // A Bedrock inference profile's id starts with its region: `global.`.
-    fn region(id: &str) -> (&str, &str) {
-        id.split_once('.')
-            .filter(|(region, _)| !region.contains('-'))
-            .unwrap_or(("", id))
-    }
-    let lead = region(lead_model.split_once('/').map_or(lead_model, |(_, m)| m)).0;
-    listed["models"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|m| m["id"].as_str())
-        .filter(|id| id.contains("haiku"))
-        .max_by_key(|id| {
-            let (here, model) = region(id);
-            (here == lead, model)
-        })
-        .map(str::to_owned)
+/// `AGENT_JUDGE`, else the lead's own model. `None` when it is `off`,
+/// which judges nothing.
+fn pick(spec: Option<&str>, lead_model: &str) -> Option<String> {
+    let named = spec.map(str::to_owned).or_else(|| key(judge::VAR));
+    judge::pick(named.as_deref(), Some(lead_model)).filter(|spec| spec != "off")
 }
 
 #[derive(Debug)]
@@ -1125,9 +829,6 @@ enum Failure {
     /// Its subscriptions ask nothing that fits what it saw.
     Unasked,
 }
-
-/// The judge with an OpenAI key and nothing set: the best of the real runs.
-pub const DEFAULT: &str = "openai-decisions/gpt-6-luna";
 
 /// Who wrote a message with no sender and no origin.
 const PERSON: &str = "the person";
@@ -1889,21 +1590,16 @@ impl Service {
             record["provider"].as_str().unwrap_or_default(),
             record["model"].as_str().unwrap_or_default()
         );
-        let (judge, unpicked) = match self::pick(client, self.judge.as_deref(), &model).await {
-            Ok(Some(spec)) => (self.judge_for(&spec, lead), false),
-            Ok(None) => (None, false),
-            // Tried again on the next connection.
-            Err(why) => {
-                self.write(&json!({"at_ms": epoch_ms(), "lead": lead, "no_judge": why}));
-                (None, true)
-            }
+        let judge = match self::pick(self.judge.as_deref(), &model) {
+            Some(spec) => self.judge_for(&spec, lead),
+            None => None,
         };
         // Said once a lead is watched, so `/status` shows it from the start.
         self.write(&json!({"at_ms": epoch_ms(), "lead": lead, "seated": true,
             "judge": judge.as_ref().map(|j| j.name.clone())}));
         if let Some(lookout) = self.lookouts.get_mut(lead) {
             lookout.judge = judge;
-            lookout.unpicked = unpicked;
+            lookout.unpicked = false;
         }
     }
 
@@ -2975,15 +2671,14 @@ mod tests {
     }
 
     fn judge(api: Api) -> Judge {
+        let decisions = (api == Api::Decisions)
+            .then(|| judge::Decisions::new("m", Some("http://127.0.0.1:1"), "k".into()).unwrap());
         Judge {
             api,
             name: "test".into(),
-            url: "http://127.0.0.1:1".into(),
             model: "m".into(),
-            key: "k".into(),
-            http: reqwest::Client::new(),
+            decisions,
             base: Default::default(),
-            next: Default::default(),
             context: false,
         }
     }
@@ -3109,27 +2804,23 @@ mod tests {
     }
 
     #[test]
-    fn requests_take_each_api_s_shape() {
+    fn decisions_reads_the_input_and_asks_each_question_as_a_predicate() {
         let input = json!({"event": {}});
-        let questions: Vec<Asked> = (asked(Kind::Ended).into_iter())
+        let questions: Vec<(String, String)> = (asked(Kind::Ended).into_iter())
             .filter(|q| q.id == "stuck")
-            .map(|q| Asked {
-                id: q.id.to_owned(),
-                text: q.text.to_owned(),
-            })
+            .map(|q| (q.id.to_owned(), q.text.to_owned()))
             .collect();
-        let (path, body) = judge(Api::Decisions).request(&input, &questions);
-        assert_eq!(path, "/v1/decisions");
-        assert_eq!(body["input"][0]["role"], "developer");
+        let judge = judge(Api::Decisions);
+        let body = judge
+            .decisions
+            .unwrap()
+            .body(READING, &input.to_string(), &questions);
+        assert_eq!(body["input"][0]["content"][0]["text"], READING);
         assert_eq!(body["input"][1]["content"][0]["text"], input.to_string());
         assert_eq!(
             body["questions"],
             json!([{"type": "predicate", "name": "stuck", "instructions": QUESTIONS[3].text}])
         );
-        let (path, body) = judge(Api::Jev).request(&input, &questions);
-        assert_eq!(path, "/v1/systemone");
-        assert_eq!(body["questions"]["stuck"]["type"], "noul");
-        assert_eq!(body["state"]["input"], input);
     }
 
     #[test]
@@ -4314,28 +4005,6 @@ mod tests {
     }
 
     #[test]
-    fn with_no_judge_set_the_newest_haiku_in_the_lead_s_region_judges() {
-        let listed = json!({"models": [
-            {"id": "us.anthropic.claude-haiku-5-5-v1:0"},
-            {"id": "us.anthropic.claude-haiku-4-5-20251001-v1:0"},
-            {"id": "global.anthropic.claude-haiku-4-5-20251001-v1:0"},
-            {"id": "global.anthropic.claude-haiku-5-5-v1:0"},
-            {"id": "global.anthropic.claude-opus-5-5-v1:0"},
-        ]});
-        let lead = "bedrock/global.anthropic.claude-opus-5-5-v1:0";
-        assert_eq!(
-            small_model(&listed, lead).as_deref(),
-            Some("global.anthropic.claude-haiku-5-5-v1:0")
-        );
-        let api = json!({"models": [{"id": "claude-haiku-4-5"}, {"id": "claude-haiku-5-5"}]});
-        assert_eq!(
-            small_model(&api, "anthropic/claude-opus-5-5").as_deref(),
-            Some("claude-haiku-5-5")
-        );
-        assert_eq!(small_model(&json!({"models": []}), lead), None);
-    }
-
-    #[test]
     fn judges_are_never_tasks() {
         let mut lookout = lookout();
         lookout.subs = vec![subs::Sub::lead("lookout.lead", "lookout")];
@@ -4374,7 +4043,7 @@ mod tests {
             Api::Model
         );
         assert!(Judge::parse("claude").is_err());
-        assert!(Judge::parse("typesafe/other").is_err());
+        assert!(Judge::parse("/claude").is_err());
         // The lead itself, and any judge that also reads the lead's words.
         let lead = Judge::parse("lead").unwrap();
         assert_eq!((lead.api, lead.context), (Api::Lead, false));

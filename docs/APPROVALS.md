@@ -474,11 +474,11 @@ so only one instance runs at a time, and answers in layers:
    to keep a resolved path honest) are dropped from `auto`; they are in
    this note as merged in #26, the starting point for rules in manual
    mode.
-3. **A judge model, one request per round.** The judge is Jev (about
-   0.3 s) or any model the daemon serves ([Which model
+3. **A judge model, one request per round.** The judge is OpenAI's
+   Decisions API or any model the daemon serves ([Which model
    judges](#which-model-judges)). The state is the context below plus the
-   round's calls, and each call gets `noul` (true or false) questions,
-   each naming one judgment and returning a probability. Five name a risk:
+   round's calls, and each call gets yes-or-no questions, each naming one
+   judgment and returning a probability. Five name a risk:
    - Does it destroy data that cannot be got back: delete or overwrite
      files outside the workspace, drop a database, or rewrite history
      others have (a force push to a shared branch)? Files in the
@@ -638,38 +638,37 @@ so only one instance runs at a time, and answers in layers:
 
 #### Which model judges
 
-George decided on 2026-09-27 that `auto` works without a Jev key, with
-whatever model is configured, and that Jev is one judge among others.
-`agent approver --judge PROVIDER/MODEL`, or `AGENT_JUDGE`, picks
-it. `AGENT_JUDGE` is the one decision-model setting: Sonny's lookout reads
-it too, and the clients pass `~/.agent/env` to the approvers they start, so
-`AGENT_JUDGE=bedrock/MODEL` there runs every judge on Bedrock. Without either, the judge is Jev when `TYPESAFE_API_KEY` is set, and
-otherwise `AGENT_MODEL` for `agent approver`, or the bot's own model for the
-approver the CLI starts.
+The approver and Sonny's lookout pick their judge the same way, in
+`agent_client::judge`: `agent approver --judge PROVIDER/MODEL`, else
+`AGENT_JUDGE`, else the bot's own model: `AGENT_MODEL` for `agent
+approver`, the bot's model for the approver the CLI starts. No smaller
+model is guessed for a provider (George, 2026-10-27): a cheaper judge is
+one `AGENT_JUDGE` names. `AGENT_JUDGE` is the one decision-model setting:
+the lookout reads it too, and the clients pass `~/.agent/env` to the
+approvers they start. Jev was dropped on
+2026-10-27 (George's call): nobody ran it, and on the lookout it woke the
+lead correctly 0.47 of the time against `gpt-6-luna`'s 0.92.
 
-- **Jev** (`typesafe/jev-latest`, or any `typesafe/jev-*`) is called on
-  TypeSafe's own API from the approver, with the questions as `noul` primitives. It stays outside the
-  daemon because it is a classifier, not a model that takes turns:
-  running it there would add a call shape that one client uses to the
-  provider layer.
 - **OpenAI's Decisions API** (`openai-decisions/gpt-6-luna`, key
-  `OPENAI_API_KEY`) is called the same way, on `POST /v1/decisions`: the
+  `OPENAI_API_KEY`) is called from the approver on `POST /v1/decisions`: the
   state goes in as the user's text (the same JSON a general model reads),
   a developer message carries the general judge's reading rules without
   its reply format, and each question is a `predicate` named by its id,
   with a consent question's criteria inlined. Its probabilities are read
-  as Jev's, so one verdict rule reads both. A refused, missing, or
-  out-of-range answer is a failed check, and a 429 whose error code is
-  `insufficient_quota` fails at once instead of waiting. It takes an API
+  as a general model's, so one verdict rule reads both. A refused,
+  missing, or out-of-range answer is a failed check (a refusal is logged
+  with the question's id and what the API said), and a 429 whose error
+  code is `insufficient_quota` fails at once instead of waiting. It takes an API
   key only; a ChatGPT plan cannot call it. It is never picked without
   `--judge` or `AGENT_JUDGE`, since `OPENAI_API_KEY` is often set
   for the daemon's own provider.
 - **Any other model** runs through the daemon, with the providers and
   logins the bots use (an API key, Bedrock, or a ChatGPT plan). The
   approver keeps an idle bot, `approver.TAG`, with the judge's
-  instructions and no tools, and made fresh when it starts; a bot of that
-  name without exactly those is left alone and the approver refuses to start
-  (`approver_name_taken`). Each round forks it, submits one JSON prompt
+  instructions and no tools, kept when it already runs the judge's model
+  and effort and made fresh when it does not; a bot of that name without
+  exactly those instructions and no tools is left alone and the approver
+  refuses to start (`judge_name_taken`). Each round forks it, submits one JSON prompt
   holding the state and the eleven questions (each with what makes it yes
   or no), queued when every active slot is taken so it starts within the
   round's deadline, reads back one JSON object of probabilities, and
@@ -681,7 +680,7 @@ approver the CLI starts.
   `--effort` sets the judge bot's effort; the model's default is used
   otherwise.
 
-A general model is slower than Jev, so its round gets 30 s, and the CLI
+A general model is slower than a decision API, so its round gets 30 s, and the CLI
 gives an `auto` call 45 s before its gate lapses. Which judge is better at
 what cost is measured, not assumed: the labeled calls of item 2 are replayed
 through the daemon and the approver with each judge
@@ -798,16 +797,10 @@ conversation can be lost to compaction. Anthropic reports that most of
 its classifier's misses come from misjudging consent, and a delegation
 chain is where consent is easiest to fake.
 
-**Where the key lives.** The approver process holds the Jev key, so it is
-not in the environment the bots' shells inherit. When the CLI starts the
-daemon and the approver together, it starts the daemon with the Jev key's
-variable removed, unless a `--provider` names it as its key variable, and
-passes it only to the approver; the daemon also adds
-that variable to the set it already strips from tool environments, as it
-does for provider keys, in case it was started some other way. The
-Decisions judge's `OPENAI_API_KEY` is stripped from tool environments the
-same way, whether or not a daemon provider uses it; the daemon keeps it,
-since its own OpenAI provider may need it. That is
+**Where the key lives.** The Decisions judge's `OPENAI_API_KEY` is
+stripped from tool environments, as provider keys are, whether or not a
+daemon provider uses it; the daemon keeps it, since its own OpenAI
+provider may need it. That is
 all it gets. A
 tool running as the same OS user can still read it: on Linux through
 `/proc/PID/environ` of the approver, or from wherever the key is stored.
@@ -1276,11 +1269,11 @@ Built on 2026-09-27, the automatic approver:
   8 turns to the person's words (past a deeper chain, more than 64
   delegating turns, or more prompt text across them than one 128 KiB read
   holds, the words are cut and consent is not counted), redacts, and asks one judge request per
-  round: Jev over its API or any model through the daemon ([Which model
+  round: the Decisions API over HTTP or any model through the daemon ([Which model
   judges](#which-model-judges)). A round takes one of 32 judge slots
   before it reads anything, so rounds past those wait holding only their
   calls. It answers under its lease, backs off on 429 and 529 (an answer
-  to an earlier request leaves a newer wait in place), fails a Jev answer
+  to an earlier request leaves a newer wait in place), fails a Decisions answer
   past 64 KiB, denies as not reviewed past the round's deadline, and trips
   the breaker. Each round prints one JSON line with the verdicts, the
   judge's time, and its tokens.
@@ -1318,7 +1311,7 @@ Where the approver differs from the design above:
   in the 2026-10-26 graft session, which sent the questions first and
   inline, none of the judge's 450k input tokens were cached.
 - A turn whose steers do not all fit the `prompts` read is judged
-  without consent, since the person's latest word may be the one left out. A model judge's tag is at most 87 bytes, so its forks' names fit.
+  without consent, since the person's latest word may be the one left out. A model judge's tag is at most 67 bytes, so its forks' names fit.
 
 Not built yet: the app's cards and the app's own approver, and a labeled
 set of calls that should not run, to measure false allows. Follow-ups
