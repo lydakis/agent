@@ -1462,11 +1462,13 @@ the turn's id and handle at once, and `wait`, `turns`, and
   does, through the same absorption and room checks: at the running turn's
   next round boundary, or at the first boundary of the bot's next turn,
   after that turn's prompt. Unlike a steer it never keeps a turn going: one
-  that arrives while a final reply is in flight waits for the next turn.
-  It finishes as `steered` with `into` naming the turn that took it; the
+  that arrives while a final reply is in flight waits for the next turn,
+  unless a steer keeps this one going, whose call it then joins. It
+  finishes as `steered` with `into` naming the turn that took it; the
   submission's event is `attached`. It takes no `workspace`, `model`,
   `effort`, `budget_tokens` or `expected_turn` (`invalid_delivery`), since
-  it joins whatever call comes next; `interrupt` withdraws one that waits.
+  it joins whatever call comes next, and for the same reason the bot's
+  default model is not checked; `interrupt` withdraws one that waits.
   `agent run --delivery attach` returns at once, inside a bot's shell too.
 
 A queued or ready turn that cannot start when its place comes (for example,

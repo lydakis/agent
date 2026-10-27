@@ -135,6 +135,12 @@ class DeliveryTests(ModelFixture):
             refused = client.request('submit', bot=bot, request_id='refused', prompt='no',
                                      delivery='steer', **overrides)
             self.assertEqual(refused['error'], 'provider_unavailable')
+        # An attached note needs no model: one for the turn running on the
+        # inherited model is taken, as is one for an idle bot.
+        notes = {bot: client.request('submit', bot=bot, request_id='note', prompt='steer:note',
+                                     delivery='attach')['result'] for bot in ('Changed', 'Idle')}
+        self.assertEqual({bot: note['status'] for bot, note in notes.items()},
+                         {'Changed': 'attached', 'Idle': 'attached'})
         steers = {}
         for bot in active:
             steers[bot] = client.request('submit', bot=bot, request_id='steer', prompt='continue',
@@ -150,6 +156,7 @@ class DeliveryTests(ModelFixture):
             self.assertEqual(client.finished(steers[bot])['data']['status'], 'steered')
             self.assertEqual(client.finished(active[bot])['data']['status'], 'completed')
             self.assertEqual(poll(client, bot, active[bot])['result']['text'], 'reply:continue')
+        self.assertEqual(client.finished(notes['Changed']['turn'])['data']['into'], active['Changed'])
 
     def test_multiple_steer_batches_are_delivered_in_order(self):
         import threading
@@ -557,6 +564,24 @@ class DeliveryTests(ModelFixture):
         self.assertEqual([o['status'] for o in outcomes], ['steered', 'completed', 'completed'])
         self.assertEqual(outcomes[0]['into'], first)
         self.assertEqual(poll(client, 'Bob', steers[2])['result']['text'], 'reply:' + '2' * 1500)
+
+    def test_a_steer_that_extends_a_turn_brings_the_attached_message_beside_it(self):
+        client = self.client('echo,shell')
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='slow')['result']['turn']
+        self.model.requests.get(timeout=5)
+        # Both arrive during the final call. The steer keeps the turn going,
+        # and the note joins the call it adds.
+        note = client.request('submit', bot='Bob', request_id='n', prompt='steer:note',
+                              delivery='attach')['result']['turn']
+        steer = client.request('submit', bot='Bob', request_id='s', prompt='steer:more',
+                               delivery='steer')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        for joined in (steer, note):
+            self.assertEqual(client.finished(joined)['data']['into'], turn)
+        last = self.model.requests.get(timeout=5)
+        texts = [i['content'][0]['text'] for i in last['input'] if i.get('role') == 'user']
+        self.assertEqual(texts[-2:], ['steer:more', 'steer:note'])
 
     def test_an_attached_message_joins_the_next_call_and_never_starts_a_turn(self):
         client = self.client('echo,shell')

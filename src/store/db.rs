@@ -533,6 +533,8 @@ pub struct Absorbed {
     pub next_through: Option<i64>,
     /// A steer stayed queued because the window had no room for it.
     pub capped: bool,
+    /// A pass that left attached messages out found some waiting.
+    pub attached_left: bool,
 }
 /// A turn parked on handles; it holds no task or memory until they resolve.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -4067,7 +4069,10 @@ impl Database {
         if let Some(level) = &options.effort {
             bot.family()?.check_effort(level)?;
         }
-        if let Err(error) = validate(&bot, options.model.as_deref()) {
+        let attach = options.delivery == Delivery::Attach;
+        // An attached message runs on no model of its own: it joins
+        // whichever call the bot makes next.
+        if !attach && let Err(error) = validate(&bot, options.model.as_deref()) {
             // An omitted steer model inherits the active turn for absorption.
             // Only look it up when the default fails validation: ordinary
             // submissions and steers with valid defaults pay no extra query.
@@ -4094,7 +4099,6 @@ impl Database {
             // Keep the submitted model unset. If it misses absorption, start()
             // must validate its own default rather than pinning this override.
         }
-        let attach = options.delivery == Delivery::Attach;
         let busy = !attach && (bot.running_turn.is_some() || self.has_ready_turn(name)?);
         if busy && reject {
             // What is in the way, as of this transaction, and the requests
@@ -4446,7 +4450,7 @@ impl Database {
         let mut more = false;
         let mut capped = false;
         {
-            // The partial index skips ordinary queued work. Read at most one
+            // Each partial index skips ordinary queued and finished work. Read at most one
             // candidate beyond the byte budget, without copying its prompt.
             let mut statement = self.conn.prepare_cached(
                 "SELECT s.id,s.prompt,length(CAST(s.prompt AS BLOB)),
@@ -4454,10 +4458,13 @@ impl Database {
                     AND (s.model IS NULL OR s.model=COALESCE(t.model,b.provider||'/'||b.model))
                     AND (s.reasoning IS NULL OR s.reasoning IS COALESCE(t.reasoning,b.reasoning)),
                     s.status='attached'
-                 FROM turns s JOIN turns t ON t.id=?2 JOIN bots b ON b.name=s.bot
-                 WHERE s.bot=?1 AND (s.status='queued' AND s.delivery='steer' OR ?5 AND s.status='attached')
-                   AND s.id<=?4 AND (s.expected_turn IS NULL OR s.expected_turn=?2)
-                 ORDER BY s.id LIMIT ?3",
+                 FROM (SELECT id FROM turns WHERE bot=?1 AND status='queued' AND delivery='steer'
+                         AND id<=?4 AND (expected_turn IS NULL OR expected_turn=?2)
+                       UNION ALL SELECT id FROM turns WHERE ?5 AND bot=?1 AND status='attached'
+                         AND id<=?4 AND (expected_turn IS NULL OR expected_turn=?2)
+                       ORDER BY id LIMIT ?3) c
+                 JOIN turns s ON s.id=c.id JOIN turns t ON t.id=?2 JOIN bots b ON b.name=s.bot
+                 ORDER BY c.id",
             )?;
             let mut rows = statement.query(params![
                 bot.name,
@@ -4504,7 +4511,7 @@ impl Database {
         let mut steered = Vec::with_capacity(steers.len());
         // Preserve the submitted effort for exact retries; only omitted effort
         // needs a separate execution value when the running turn overrides it.
-        for (steer, item, size, attached) in steers {
+        for (steer, item, size, was_attached) in steers {
             let id = node(&tx, head, &item)?;
             head = Some(id);
             if size >= PROMPT_SHARE_BYTES {
@@ -4539,7 +4546,7 @@ impl Database {
             absorbed
                 .entries
                 .push(entry(cursor, &bot.name, Some(turn), "steered", data));
-            steered.push((steer, (!attached).then_some(size)));
+            steered.push((steer, (!was_attached).then_some(size)));
         }
         // Steers go in only at a round boundary and hold no calls.
         tx.execute(
@@ -4556,6 +4563,14 @@ impl Database {
                 .ok_or_else(|| Error::new("stale_turn"))?;
             self.announce(&bot.name, steer, outcome.clone());
             absorbed.outcomes.push((steer, outcome));
+        }
+        if !attached {
+            absorbed.attached_left = self
+                .conn
+                .prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM turns WHERE bot=? AND status='attached')",
+                )?
+                .query_row([&bot.name], |r| r.get(0))?;
         }
         Ok(absorbed)
     }

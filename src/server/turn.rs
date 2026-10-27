@@ -2583,6 +2583,10 @@ impl Turn {
             through = absorbed.next_through;
             steered |= !absorbed.outcomes.is_empty();
             stayed |= absorbed.capped;
+            // Attached messages this pass left out join the boundary after.
+            if absorbed.attached_left {
+                self.steers.store(true, Relaxed);
+            }
             // Release the batch before loading another; new arrivals beyond
             // the initial snapshot wait for the next model-round boundary.
             if through.is_none() {

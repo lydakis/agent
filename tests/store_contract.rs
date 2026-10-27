@@ -10945,8 +10945,16 @@ fn a_refused_call_is_read_after_the_words_it_came_after() {
         .begin("Bob", "r2", "yes", true, &steer, allow_provider)
         .unwrap()
         .turn;
-    db.absorb(turn, None, 8 << 20, 4096, ContextUsage::default(), false, true)
-        .unwrap();
+    db.absorb(
+        turn,
+        None,
+        8 << 20,
+        4096,
+        ContextUsage::default(),
+        false,
+        true,
+    )
+    .unwrap();
     let deploy = refuse(&mut db, turn, "s2", "make deploy");
     let read = db.prompts("Bob", turn, 64 * 1024).unwrap();
     assert_eq!(read["prompts"][0]["refused"], json!([push]));
@@ -11076,8 +11084,16 @@ fn a_turn_reads_with_the_message_its_words_answer() {
         };
         db.begin("Bob", key, "yes", true, &steer, allow_provider)
             .unwrap();
-        db.absorb(fourth, None, 8 << 20, 4096, ContextUsage::default(), false, true)
-            .unwrap();
+        db.absorb(
+            fourth,
+            None,
+            8 << 20,
+            4096,
+            ContextUsage::default(),
+            false,
+            true,
+        )
+        .unwrap();
     };
     // A call streamed after the question says nothing a person answers.
     let (call_item, call) = shell_call("fc_q", "q", "true");
