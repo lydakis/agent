@@ -332,6 +332,30 @@ class WaitTests(ModelFixture):
         self.assertEqual(tail[0]['type'], 'function_call_output')
         self.assertEqual(tail[1]['content'][0]['text'], 'steer:look')
 
+    def test_an_attached_note_leaves_a_parked_wait_and_a_running_command_alone(self):
+        client = self.client('echo,shell,wait')
+        client.request('create', bot='Bob', workspace=str(self.path))
+        started = client.request('submit', bot='Bob', request_id='bg', prompt='bg:sleep 1; printf done')['result']['turn']
+        client.finished(started)
+        handle = self.tool_output(client, 'Bob', 'bg-1')['handle']
+        turn = client.request('submit', bot='Bob', request_id='w', prompt='rewait:' + handle)['result']['turn']
+        client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
+        note = client.request('submit', bot='Bob', request_id='n', prompt='fyi', delivery='attach')['result']
+        self.assertEqual(note['status'], 'attached')
+        # The wait ran to its end, and the note joined the call after it.
+        self.assertEqual((client.finished(note['turn'])['data']['into']), turn)
+        result = self.tool_output(client, 'Bob', 'wait-1')
+        self.assertEqual((result['pending'], result['results'][handle]['stdout']), ([], 'done'))
+        self.assertNotIn('steered', result)
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        lifting = client.request('submit', bot='Bob', request_id='l', prompt='liftwait:sleep .8; printf done')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == lifting)
+        client.request('submit', bot='Bob', request_id='n2', prompt='fyi', delivery='attach')
+        self.assertEqual(client.finished(lifting)['data']['status'], 'completed')
+        ran = self.tool_output(client, 'Bob', 'lift-1')
+        self.assertEqual(ran['stdout'], 'done')
+        self.assertNotIn('steered', ran)
+
     def test_a_steer_passes_every_wait_in_the_same_response(self):
         client = self.client('echo,shell,wait')
         client.request('create', bot='Bob', workspace=str(self.path))

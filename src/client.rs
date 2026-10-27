@@ -1036,7 +1036,11 @@ pub fn main(args: Vec<String>) -> Result<i32> {
     let mut options = parse(&args[1..])?;
     options.command = command.to_owned();
     if std::env::var("AGENT_SHELL_CONTEXT").as_deref() == Ok("1")
-        && (command == "follow" || command == "wait" || (command == "run" && !options.detach))
+        && (command == "follow"
+            || command == "wait"
+            || (command == "run"
+                && !options.detach
+                && options.delivery.as_deref() != Some("attach")))
     {
         return fail_with(
             "blocking_tool_client",
@@ -1409,7 +1413,8 @@ fn run(options: &Options) -> Result<i32> {
                 "budget_tokens":options.turn_budget_tokens}),
         )
         .map_err(|error| ways_past_busy(&bot, error))?;
-    if options.detach {
+    // An attached message has no turn of its own to follow.
+    if options.detach || submitted["status"] == "attached" {
         print_json(&submitted, options.pretty)?;
         return Ok(0);
     }

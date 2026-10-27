@@ -50,6 +50,8 @@ Start NAME with your own name up to its first dot (shop.cart-review for shop.fix
 An agent started to review or check something does it itself and starts no agents of its own. \
 Add --model PROVIDER/MODEL to give it one of the models \"$AGENT_BIN\" models lists; without it, it gets yours. \
 Continue an existing agent with \"$AGENT_BIN\" run --detach --bot NAME -- TASK. \
+To tell an agent something that needs no reply, such as a change of scope it should take into account, \
+add --delivery attach: the message joins its next model call, mid-turn or in its next turn, without starting a turn of its own. \
 Collect results with the wait tool on that handle; it returns the peer's status and final text. \
 Blocking run/follow inside a shell tool is rejected. \
 Use \"$AGENT_BIN\" fork --source NAME --bot NEW to branch an agent from where it is now, mid-turn included; --checkpoint N branches from an earlier point in its history. \

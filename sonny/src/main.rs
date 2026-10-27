@@ -2551,6 +2551,7 @@ impl App {
                 }
             }
             "queued" => self.notice = Some(format!("queued behind turn {}", data["behind"])),
+            "attached" => self.notice = Some("attached to its next call".into()),
             "text_delta" => {
                 self.thought.clear();
                 let mut delta = event["text"].as_str().unwrap_or("");
