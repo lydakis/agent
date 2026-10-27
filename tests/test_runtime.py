@@ -1047,7 +1047,19 @@ class AnthropicRuntimeTests(unittest.TestCase):
         turn = client.request('submit', bot='Bob', request_id='r3', prompt='silent')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['error'], 'empty_completion')
 
-    def test_an_overload_mid_stream_is_retried_after_a_pause(self):
+    def test_an_empty_reply_after_a_call_that_parked_ends_the_turn(self):
+        # The call waits on the person's verdict, so the turn parks and
+        # resumes; it had replied before the park.
+        client, model, path = self.start(settings={'approval_hold_ms': 0})
+        client.request('create', bot='Bob', workspace=str(path), approve=['echo'], approver='manual')
+        turn = client.request('submit', bot='Bob', request_id='r1', prompt='tool:silent')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn
+                       and m['data'].get('approval'))
+        client.request('answer', bot='Bob', turn=turn, call_id='toolu_1', request=1,
+                       decision='allow', by='test')
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+
+    def test_an_overload_mid_stream_closes_the_pool_and_is_retried_when_it_reopens(self):
         client, model, path = self.start()
         model.overloads = 1
         client.request('create', bot='Bob', workspace=str(path))
@@ -1056,7 +1068,10 @@ class AnthropicRuntimeTests(unittest.TestCase):
         retried = [m['data'] for m in client.saved if m.get('event') == 'retry']
         self.assertEqual([r['error'] for r in retried], ['provider_http_529'])
         self.assertEqual(retried[0]['detail'], 'Overloaded')
-        self.assertGreaterEqual(retried[0]['delay_ms'], 1600)
+        # The pool closes for a second, for every bot on the model, and the
+        # turn waits it out parked.
+        self.assertTrue(retried[0]['parked'])
+        self.assertGreaterEqual(retried[0]['delay_ms'], 500)
 
     def test_messages_family_round_trips_thinking_tools_and_usage(self):
         client, model, path = self.start()

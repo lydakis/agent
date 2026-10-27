@@ -1252,8 +1252,10 @@ impl Provider {
         };
         report.usage = parser.usage();
         reservation.settle_usage(report.usage.as_ref(), estimate);
+        // An overload or rate limit inside the stream closes the pool as
+        // the same refusal before it would.
         if let Err(error) = &result
-            && error.code == "provider_rate_limited"
+            && paced(&error.code)
         {
             pace.limited(error.detail.as_deref().and_then(pace::named_delay));
         }
@@ -1264,7 +1266,7 @@ impl Provider {
             .finish()
             .inspect(|_| pace.accepted())
             .inspect_err(|error| {
-                if error.code == "provider_rate_limited" {
+                if paced(&error.code) {
                     pace.limited(error.detail.as_deref().and_then(pace::named_delay));
                 }
             })
@@ -1487,6 +1489,14 @@ async fn login_refused(
             ),
         ),
     })
+}
+
+/// A refusal for the provider's load, which holds its whole pool.
+pub fn paced(code: &str) -> bool {
+    matches!(
+        code,
+        "provider_rate_limited" | "provider_http_429" | "provider_http_529"
+    )
 }
 
 /// Close the model's pool for a rate limit a socket reported: a 429 or 529

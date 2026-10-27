@@ -1742,6 +1742,14 @@ impl Database {
     /// Whether the bot's running turn takes a steer at its next boundary:
     /// the oldest one for it is queued and fits the turn, as `absorb` reads
     /// them. Delivery steer only.
+    /// Whether the model has called a tool in `turn`: it has replied there.
+    pub fn turn_called(&self, turn: i64) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tools WHERE turn=?)",
+            [turn],
+            |r| r.get(0),
+        )?)
+    }
     pub fn joining_steer(&self, name: &str) -> Result<bool> {
         Ok(self
             .conn
