@@ -11098,3 +11098,130 @@ fn schema_48_creations_keep_the_instructions_they_were_sent_with() {
     assert_eq!(version, Database::SCHEMA);
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn an_expiring_fork_is_due_once_idle_that_long_and_never_while_a_turn_runs() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    converse(&mut db, "Bob", 1);
+    assert_eq!(db.next_expiry().unwrap(), None);
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let (side, event) = db
+        .fork(
+            "Bob",
+            "Bob.side",
+            Fork {
+                expire_ms: Some(900_000),
+                request_id: Some("side"),
+                ..Fork::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(event.unwrap()["data"]["expire_ms"], 900_000);
+    assert_eq!(side.expire_ms, Some(900_000));
+    let at = side.expires_at.unwrap();
+    assert!(at >= before + 900_000, "{at} from {before}");
+    // Records show it; a source that never asked for one shows none.
+    let listed = db.list(None, 10, None, false).unwrap();
+    assert_eq!(listed["bots"][0]["name"], "Bob");
+    assert!(listed["bots"][0].get("expires_at").is_none());
+    assert_eq!(listed["bots"][1]["expires_at"], at);
+    assert_eq!(listed["bots"][1]["expire_ms"], 900_000);
+    assert!(
+        serde_json::to_value(db.inspect("Bob").unwrap())
+            .unwrap()
+            .get("expire_ms")
+            .is_none()
+    );
+    assert_eq!(db.next_expiry().unwrap(), Some(at));
+    assert!(db.expired(at - 1, 16).unwrap().is_empty());
+    assert_eq!(
+        db.expired(at, 16).unwrap(),
+        vec![("Bob.side".to_owned(), side.bot_id)]
+    );
+    // A turn running past its time keeps it; its end starts the time again.
+    let turn = db
+        .begin(
+            "Bob.side",
+            "q1",
+            "what are you doing?",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    assert!(db.expired(i64::MAX, 16).unwrap().is_empty());
+    db.append(turn, vec![assistant("fixing the cart")], &[], None)
+        .unwrap();
+    db.finish(turn, None).unwrap();
+    let again = db.inspect("Bob.side").unwrap().expires_at.unwrap();
+    assert!(again >= at, "{again} before {at}");
+    // A resend gets the same fork; another time is another request.
+    let (resent, event) = db
+        .fork(
+            "Bob",
+            "Bob.side",
+            Fork {
+                expire_ms: Some(900_000),
+                request_id: Some("side"),
+                ..Fork::default()
+            },
+        )
+        .unwrap();
+    assert_eq!((resent.bot_id, event.is_none()), (side.bot_id, true));
+    let error = db
+        .fork(
+            "Bob",
+            "Bob.side",
+            Fork {
+                expire_ms: Some(60_000),
+                request_id: Some("side"),
+                ..Fork::default()
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.facts.unwrap()["field"], "expire_ms");
+    // Deleting it leaves its source as it was.
+    db.delete_bot("Bob.side").unwrap();
+    assert_eq!(db.next_expiry().unwrap(), None);
+    assert!(db.expired(i64::MAX, 16).unwrap().is_empty());
+    assert_eq!(db.inspect("Bob").unwrap().head, side.head);
+}
+
+#[test]
+fn schema_50_bots_never_expire() {
+    let path = std::env::temp_dir().join(format!("agent-schema50-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    drop(db);
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "DROP INDEX bots_expiring; ALTER TABLE bots DROP COLUMN expire_ms;
+             ALTER TABLE bots DROP COLUMN expires_at; PRAGMA user_version=50;",
+        )
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let bob = db.inspect("Bob").unwrap();
+    assert_eq!((bob.expire_ms, bob.expires_at), (None, None));
+    assert_eq!(db.next_expiry().unwrap(), None);
+    converse(&mut db, "Bob", 1);
+    let (side, _) = db
+        .fork(
+            "Bob",
+            "Bob.side",
+            Fork {
+                expire_ms: Some(1000),
+                ..Fork::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(db.next_expiry().unwrap(), side.expires_at);
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}

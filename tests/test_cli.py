@@ -300,10 +300,11 @@ class SocketAndCliTests(ModelFixture):
         for flags in (f"--delivery steer --turn {busy['turn']}", '--delivery queue'):
             self.assertIn(flags, refused.stderr + refused.stdout)
         self.assertNotIn('expected_turn', refused.stderr + refused.stdout)
-        fork = re.search(r'fork (--source=Bob) --bot NEW', refused.stderr + refused.stdout)
+        fork = re.search(r"run (--fork=Bob) --bot NEW --allow '' --expires 15m -- QUESTION",
+                         refused.stderr + refused.stdout)
         self.assertIsNotNone(fork, refused.stderr + refused.stdout)
-        self.agent('fork', '--store', str(self.store), *fork.group(1).split(), '--bot', 'Side')
-        side = self.agent('run', '--store', str(self.store), '--bot', 'Side', 'aside')
+        side = self.agent('run', '--store', str(self.store), fork.group(1), '--bot', 'Side', '--allow=',
+                          '--expires', '15m', '--', 'aside')
         self.assertEqual(side.returncode, 0)
         queued = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach',
                                        '--delivery', 'queue', 'second').stdout)
@@ -582,6 +583,53 @@ class SocketAndCliTests(ModelFixture):
                 self.assertEqual(result.stdout, '')
         self.assertFalse(self.store.exists())
         self.assertFalse(self.socket.exists())
+
+    def test_a_side_question_asks_a_copy_that_is_deleted_once_idle(self):
+        store = ['--store', str(self.store)]
+        self.agent('run', *self.common, '--new', '--bot', 'Bob', 'p0')
+        bob = json.loads(self.agent('inspect', *store, '--bot', 'Bob').stdout)
+        asked = json.loads(self.agent('run', *store, '--fork', 'Bob', '--bot', 'Bob.side', '--allow=',
+                                      '--expires', '2s', '--detach', '--request-id', 'side', 'where are you?').stdout)
+        done = json.loads(self.agent('wait', *store, asked['handle']).stdout)
+        self.assertEqual(done['results'][asked['handle']]['text'], 'reply:where are you?')
+        # The copy saw Bob's history; Bob saw nothing of the question.
+        seen = []
+        while not seen or seen[-1]['input'][-1]['content'][0]['text'] != 'where are you?':
+            seen.append(self.model.requests.get(timeout=2))
+        self.assertIn('p0', json.dumps(seen[-1]['input']))
+        self.assertEqual(json.loads(self.agent('inspect', *store, '--bot', 'Bob').stdout)['head'], bob['head'])
+        side = json.loads(self.agent('inspect', *store, '--bot', 'Bob.side').stdout)
+        self.assertEqual((side['expire_ms'], side['allowed']), (2000, []))
+        self.assertGreaterEqual(side['expires_at'], int(time.time() * 1000) + 1000)
+        # Resending the command gets the same copy and turn.
+        again = json.loads(self.agent('run', *store, '--fork', 'Bob', '--bot', 'Bob.side', '--allow=',
+                                      '--expires', '2s', '--detach', '--request-id', 'side', 'where are you?').stdout)
+        self.assertEqual(again['turn'], asked['turn'])
+        listed = lambda: [b['name'] for b in json.loads(self.agent('ls', *store).stdout)]
+        deadline = time.monotonic() + 15
+        while 'Bob.side' in listed() and time.monotonic() < deadline:
+            time.sleep(0.2)
+        self.assertEqual(listed(), ['Bob'])
+        # The time is stored: a copy whose time ran out while no daemon ran
+        # is deleted when the next one starts.
+        self.agent('fork', *store, '--source', 'Bob', '--bot', 'Bob.later', '--expires', '1s')
+        self.shutdown()
+        time.sleep(1.2)
+        self.agent('inspect', *self.again, '--bot', 'Bob')
+        deadline = time.monotonic() + 10
+        while 'Bob.later' in listed() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertEqual(listed(), ['Bob'])
+        # A copy is named, made fresh, and keeps its source's choices.
+        for args, says in ((('--fork', 'Bob', 'q'), 'needs --bot'),
+                           (('--bot', 'Bob', '--expires', '15m', 'q'), 'is for a copy made with --fork'),
+                           (('--bot', 'Bob', '--allow=', 'q'), 'is for a copy made with --fork'),
+                           (('--fork', 'Bob', '--bot', 'C', '--new', 'q'), 'conflicts with'),
+                           (('--fork', 'Bob', '--bot', 'C', '--instructions', 'x', 'q'), 'is for a new bot'),
+                           (('--fork', 'Bob', '--bot', 'C', '--expires', '500ms', 'q'), 'from 1s to 168h')):
+            refused = self.agent('run', *store, *args, check=False)
+            self.assertEqual(refused.returncode, 2, refused.stderr)
+            self.assertIn(says, refused.stderr)
 
     def test_equals_delimiter_and_json_output_conventions(self):
         run = self.agent('run', *self.common, '--new', '--bot=Bob', '--', '--help')
