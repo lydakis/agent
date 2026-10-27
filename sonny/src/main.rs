@@ -17,12 +17,14 @@ mod herdr;
 mod html;
 mod image;
 mod js;
+mod links;
 mod lookout;
 mod math;
 mod mermaid;
 mod models;
 mod mux;
 mod project;
+mod prompt;
 mod rex;
 mod settings;
 mod shell;
@@ -38,7 +40,7 @@ mod updates;
 use agent_client::{Client, Events};
 use ratatui::{
     Terminal, TerminalOptions, Viewport,
-    backend::CrosstermBackend,
+    backend::{Backend, CrosstermBackend},
     crossterm::{
         event::{
             self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
@@ -182,7 +184,7 @@ async fn agents_layout(
     let socket = std::path::absolute(socket).map_err(|e| e.to_string())?;
     let client = Client::connect(&socket).await.map_err(|e| e.to_string())?.0;
     let project = project_of(&client, bot).await;
-    let layout = mux::for_agent(&project, host.as_deref())?;
+    let layout = mux::for_agent(&socket, &project, host.as_deref())?;
     Ok((socket, project, layout))
 }
 
@@ -419,6 +421,31 @@ fn parse() -> Result<Options, String> {
     })
 }
 
+/// What runs this Sonny again on the same bot, from the same folder: `sonny`
+/// with its own arguments, less those that made the bot or changed a
+/// setting, and with the daemon the environment named.
+fn reopen() -> Vec<String> {
+    let mut command = vec!["sonny".to_owned()];
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--new" => {}
+            "--workspace" | "--copies" => {
+                args.next();
+            }
+            _ => command.push(arg),
+        }
+    }
+    for (flag, var) in [("--store", "AGENT_STORE"), ("--socket", "AGENT_SOCKET")] {
+        if !command.iter().any(|a| a == flag)
+            && let Some(value) = std::env::var_os(var).filter(|v| !v.is_empty())
+        {
+            command.extend([flag.to_owned(), value.to_string_lossy().into_owned()]);
+        }
+    }
+    command
+}
+
 // Two threads, so the daemon's events are read while a picture is drawn:
 // a reader that stops is dropped by the daemon as lagging.
 fn main() -> std::process::ExitCode {
@@ -490,6 +517,7 @@ async fn run() -> Result<(), String> {
             (lead.bot, Some(lead.project))
         }
     };
+    herdr::announce(&name, reopen());
     // Everything after now arrives live; history is read from the bot's
     // items instead of replayed events, so the replay is skipped. The bot
     // is read after that, so a turn that ended during the replay is seen
@@ -556,26 +584,6 @@ async fn run() -> Result<(), String> {
     {
         app.notice = Some(error);
     }
-    // The lead told what its folder tells it today (skills and memory added
-    // since it was made), unless its instructions were set some other way.
-    if project.is_some()
-        && let Some(dir) = moving
-            .as_deref()
-            .or(bot["workspace"].as_str().map(std::path::Path::new))
-    {
-        match project::review(dir, &bot, &app.lead, fresh) {
-            Ok(project::Instructions::Stale(text)) => app.instruct = Some(text),
-            Ok(project::Instructions::Current) => {}
-            Ok(project::Instructions::Kept) => {
-                app.notice = Some(
-                    "the lead's instructions were set outside its folder's files; \
-                     /instructions takes the folder's"
-                        .into(),
-                )
-            }
-            Err(error) => app.notice = Some(format!("the lead's instructions: {error}")),
-        }
-    }
     if let (Some(project), Some(dir), true) = (
         &project,
         moving
@@ -597,6 +605,23 @@ async fn run() -> Result<(), String> {
                 judge,
             ),
             Err(error) => app.notice = Some(error),
+        }
+    }
+    // The lead told what its folder tells it today (skills and memory added
+    // since it was made), unless its instructions were set some other way.
+    // After the lookout's notice: a skill the lead misses matters more.
+    if project.is_some()
+        && let Some(dir) = moving
+            .as_deref()
+            .or(bot["workspace"].as_str().map(std::path::Path::new))
+    {
+        match project::review(dir, &bot, &app.lead, fresh) {
+            Ok(project::Instructions::Stale(text)) => app.instruct = Some(text),
+            Ok(project::Instructions::Current) => {}
+            Ok(project::Instructions::Kept { missing }) => {
+                app.notice = Some(project::Instructions::kept_notice(&missing))
+            }
+            Err(error) => app.notice = Some(format!("the lead's instructions: {error}")),
         }
     }
     // Said last: it is what the next message does.
@@ -658,9 +683,10 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
 
 /// The viewport's rows, top to bottom: the reply's open line, the status,
 /// a gap, the composer (as many rows as are left) and the footer.
-fn areas(area: ratatui::layout::Rect) -> [ratatui::layout::Rect; 5] {
+/// The live area is `live` rows: the reply's open line, wrapped.
+fn areas(area: ratatui::layout::Rect, live: u16) -> [ratatui::layout::Rect; 5] {
     Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(live.max(1)),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(1),
@@ -672,6 +698,15 @@ fn areas(area: ratatui::layout::Rect) -> [ratatui::layout::Rect; 5] {
 /// The viewport made `height` rows tall, for a composer that grew or
 /// shrank. It keeps its top: a taller one pushes history up, and a shorter
 /// one leaves blank rows under it that the next history fills.
+/// At most `keep` of `rows`, as near the end as still shows `row`; and
+/// where `row` is among them.
+fn window(mut rows: Vec<Line<'static>>, row: usize, keep: usize) -> (Vec<Line<'static>>, usize) {
+    let start = rows.len().saturating_sub(keep).min(row);
+    rows.drain(..start);
+    rows.truncate(keep);
+    (rows, row - start)
+}
+
 fn fit(terminal: &mut Tui, height: u16) -> std::io::Result<()> {
     let area = terminal.get_frame().area();
     let height = height.min(terminal.size()?.height);
@@ -720,8 +755,10 @@ fn unique(prefix: &str) -> String {
 }
 
 /// Program status (OSC 7501), so a terminal or multiplexer that reads it
-/// (Ghostty, Rex) can mark this pane working, blocked or done.
+/// (Ghostty, Rex) can mark this pane working, blocked or done; and the
+/// same to Herdr, which takes it from its own CLI instead.
 fn status_report(state: &str, bot: &str) {
+    herdr::report(state);
     use base64::Engine;
     // A side chat borrows its agent's pane, which keeps saying what the
     // agent itself is doing.
@@ -849,7 +886,7 @@ struct App {
     /// How big the conversation was after its last model round, as the
     /// next round reads it, once known.
     context: Option<u64>,
-    input: String,
+    input: prompt::Prompt,
     /// Lines waiting to be written into scrollback.
     pending: Vec<Line<'static>>,
     /// Lines let go while `/status` held the screen, past what is kept.
@@ -884,6 +921,10 @@ struct App {
     sounds: sound::Sounds,
     /// The reply text the current model call has streamed.
     said: String,
+    /// Prompts sent and not in the conversation yet, by their turn: a
+    /// steer until the running turn takes it in, a prompt until its turn
+    /// starts. Drawn above the status row until they land.
+    staged: Vec<(i64, String)>,
     /// The reasoning streamed since the bot last spoke or called a tool,
     /// whose latest heading the status row shows, as Codex does.
     thought: String,
@@ -969,7 +1010,7 @@ struct Fleet {
 
 impl Fleet {
     async fn start(options: &Options, project: &str, lead: &str) -> Option<Self> {
-        let layout = mux::here(project, options.rex_host.as_deref())?;
+        let layout = mux::here(&options.socket, project, options.rex_host.as_deref())?;
         let (client, mut events) = Client::connect(&options.socket).await.ok()?;
         client
             .request("follow", json!({"bot": "*", "after": 0}))
@@ -1376,7 +1417,7 @@ impl App {
             model,
             effort: record["effort"].as_str().map(str::to_owned),
             context: None,
-            input: String::new(),
+            input: prompt::Prompt::default(),
             pending: Vec::new(),
             skipped: 0,
             any_history: false,
@@ -1404,6 +1445,7 @@ impl App {
             redraw: false,
             sounds: sound::Sounds::new(false),
             said: String::new(),
+            staged: Vec::new(),
             thought: String::new(),
             replay: None,
             options,
@@ -1754,6 +1796,7 @@ impl App {
             self.notice = None;
             self.context = context.or(self.context);
             self.history_after(self.seen_node).await;
+            self.unstage_landed().await;
             let now = record["running_turn"].as_i64();
             // A turn that ended while away ends here as its event would have.
             if let Some(turn) = self.running.as_ref().map(|r| r.turn)
@@ -1954,6 +1997,72 @@ impl App {
         self.calls.extend(calls);
     }
 
+    /// Drop the staged prompts that landed while Sonny was away, whose
+    /// `accepted` or `steered` it missed: those whose turn no longer waits.
+    async fn unstage_landed(&mut self) {
+        let ids = self.staged.iter().map(|(turn, _)| *turn);
+        let (Some(first), Some(last)) = (ids.clone().min(), ids.max()) else {
+            return;
+        };
+        // Every turn from the first staged to the last, a page at a time:
+        // other clients may have sent many between them.
+        let mut waiting: Vec<i64> = Vec::new();
+        let mut after = first - 1;
+        loop {
+            let asked = json!({"bot": self.bot, "after": after, "before": last + 1, "limit": 256});
+            let Ok(page) = self.client.request("turns", asked).await else {
+                // Unread, they stay as they are.
+                return;
+            };
+            waiting.extend(
+                page["turns"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|row| matches!(row["status"].as_str(), Some("queued" | "ready")))
+                    .filter_map(|row| row["turn"].as_i64()),
+            );
+            match page["next_after"].as_i64() {
+                Some(next) => after = next,
+                None => break,
+            }
+        }
+        self.staged.retain(|(turn, _)| waiting.contains(turn));
+    }
+
+    /// What was sent and has not landed yet, dim, the way it will read
+    /// once it does.
+    fn staged_rows(&self, width: usize) -> Vec<Line<'static>> {
+        self.staged
+            .iter()
+            .flat_map(|(_, prompt)| {
+                prompt.split('\n').enumerate().flat_map(move |(at, line)| {
+                    let lead = if at == 0 { "› " } else { "  " };
+                    transcript::wrap(
+                        Line::from(line.to_owned()).dim(),
+                        width,
+                        Span::raw(lead).dim(),
+                        Span::raw("  "),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// The reply's open line, the part after its last newline, as the rows
+    /// it will take once written.
+    fn open_rows(&self, width: usize) -> Vec<Line<'static>> {
+        let Some(open) = self.live.as_ref().filter(|open| !open.partial.is_empty()) else {
+            return Vec::new();
+        };
+        let mut markdown = open.markdown.clone();
+        let Some(line) = markdown.line(&open.partial) else {
+            return Vec::new();
+        };
+        let lead = if open.lines == 0 { "• " } else { "  " };
+        transcript::wrap(line, width, Span::raw(lead), markdown.rest())
+    }
+
     /// The reply's last lines, and a table it ended on, drawn.
     fn end_live(&mut self) {
         if let Some(mut live) = self.live.take() {
@@ -2046,6 +2155,7 @@ impl App {
                 }
             }
             "accepted" => {
+                self.staged.retain(|(staged, _)| Some(*staged) != turn);
                 self.end_live();
                 self.said.clear();
                 self.thought.clear();
@@ -2074,6 +2184,8 @@ impl App {
                 }
             }
             "steered" => {
+                self.staged
+                    .retain(|(staged, _)| Some(*staged) != data["steer"].as_i64());
                 if let Some(node) = data["node"].as_i64()
                     && let Some(item) = self.items(&[node]).await.first()
                 {
@@ -2273,6 +2385,8 @@ impl App {
                 }
             }
             "turn_finished" => {
+                // A staged prompt whose turn ended without starting.
+                self.staged.retain(|(staged, _)| Some(*staged) != turn);
                 if self.running.as_ref().is_some_and(|r| Some(r.turn) != turn) {
                     return;
                 }
@@ -2618,7 +2732,7 @@ impl App {
         }
         COMMANDS
             .into_iter()
-            .filter(|(name, _)| name.starts_with(self.input.as_str()))
+            .filter(|(name, _)| name.starts_with(&*self.input))
             .collect()
     }
 
@@ -2715,12 +2829,12 @@ impl App {
                     return;
                 }
                 KeyCode::Tab => {
-                    self.input = picked.to_owned();
+                    self.input.set(picked);
                     self.pick = 0;
                     return;
                 }
                 KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    self.input = picked.to_owned();
+                    self.input.set(picked);
                     self.pick = 0;
                     self.submit().await;
                     return;
@@ -2737,10 +2851,13 @@ impl App {
             // Terminals send a pasted line break as a carriage return.
             Event::Paste(text) => self
                 .input
-                .push_str(&text.replace("\r\n", "\n").replace('\r', "\n")),
+                .insert(&text.replace("\r\n", "\n").replace('\r', "\n")),
             Event::Resize(width, _) => self.width = width as usize,
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                // Option on a Mac: terminals send Option-← and → as
+                // Alt-b and Alt-f unless set to send them as arrows.
+                let alt = key.modifiers.contains(KeyModifiers::ALT);
                 match key.code {
                     KeyCode::Char('c') if ctrl => {
                         if self.input.is_empty() {
@@ -2750,6 +2867,7 @@ impl App {
                         }
                     }
                     KeyCode::Char('d') if ctrl && self.input.is_empty() => self.quit = true,
+                    KeyCode::Char('d') if ctrl => self.input.delete(),
                     KeyCode::Char(c @ ('y' | 'n'))
                         if !self.approvals.is_empty() && self.input.is_empty() =>
                     {
@@ -2762,12 +2880,33 @@ impl App {
                             self.answer(if c == 'y' { "allow" } else { "deny" }).await;
                         }
                     }
-                    KeyCode::Char(c) if !ctrl => self.input.push(c),
-                    KeyCode::Backspace => {
-                        self.input.pop();
+                    KeyCode::Char('a') if ctrl => self.input.home(),
+                    KeyCode::Char('e') if ctrl => self.input.end(),
+                    KeyCode::Char('b') if ctrl => self.input.left(),
+                    KeyCode::Char('f') if ctrl => self.input.right(),
+                    KeyCode::Char('u') if ctrl => self.input.delete_to_start(),
+                    KeyCode::Char('k') if ctrl => self.input.delete_to_end(),
+                    KeyCode::Char('w') if ctrl => self.input.delete_word(),
+                    KeyCode::Char('b') if alt => self.input.word_left(),
+                    KeyCode::Char('f') if alt => self.input.word_right(),
+                    KeyCode::Char(c) if !ctrl => self.input.insert(c.encode_utf8(&mut [0; 4])),
+                    KeyCode::Backspace if ctrl || alt => self.input.delete_word(),
+                    KeyCode::Backspace => self.input.backspace(),
+                    KeyCode::Delete => self.input.delete(),
+                    KeyCode::Left if ctrl || alt => self.input.word_left(),
+                    KeyCode::Right if ctrl || alt => self.input.word_right(),
+                    KeyCode::Left => self.input.left(),
+                    KeyCode::Right => self.input.right(),
+                    KeyCode::Home => self.input.home(),
+                    KeyCode::End => self.input.end(),
+                    KeyCode::Up => {
+                        self.input.up(self.width);
+                    }
+                    KeyCode::Down => {
+                        self.input.down(self.width);
                     }
                     KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        self.input.push('\n')
+                        self.input.insert("\n")
                     }
                     KeyCode::Enter => self.submit().await,
                     KeyCode::Esc => {
@@ -2936,12 +3075,8 @@ impl App {
                     }
                     // A toggle back before the turn ended: nothing to send.
                     Ok(project::Instructions::Current) => self.instruct = None,
-                    Ok(project::Instructions::Kept) => {
-                        self.notice = Some(
-                            "the lead keeps instructions set outside its folder's files; \
-                             /instructions takes the folder's"
-                                .into(),
-                        )
+                    Ok(project::Instructions::Kept { missing }) => {
+                        self.notice = Some(project::Instructions::kept_notice(&missing))
                     }
                     Err(error) => self.notice = Some(format!("the lead's instructions: {error}")),
                 }
@@ -2979,7 +3114,10 @@ impl App {
             )
             .await;
         match submitted {
-            Ok(_) => {
+            Ok(reply) => {
+                if let Some(turn) = reply["turn"].as_i64() {
+                    self.staged.push((turn, prompt));
+                }
                 self.input.clear();
                 self.notice = None;
                 if workspace.is_some() {
@@ -3164,12 +3302,23 @@ impl App {
         terminal.autoresize()?;
         let width = terminal.size()?.width as usize;
         self.width = width;
-        let mut composer_rows = self.composer(width);
-        // A short pane keeps the prompt's end, where typing goes on.
+        let (composer_rows, (cursor_row, cursor_col)) = self.composer(width);
+        // A short pane keeps the rows around the cursor, where typing goes on.
         let room = (terminal.size()?.height as usize).saturating_sub(VIEWPORT as usize - 1);
-        let over = composer_rows.len().saturating_sub(room.max(1));
-        composer_rows.drain(..over);
-        fit(terminal, VIEWPORT - 1 + composer_rows.len() as u16)?;
+        let (composer_rows, cursor_row) = window(composer_rows, cursor_row, room.max(1));
+        // The reply's open line, wrapped as it will be written: it grows
+        // here row by row until its newline writes it into the history.
+        let mut open_rows = self.open_rows(width);
+        // Then what was sent and has not landed, kept in view below it.
+        open_rows.extend(self.staged_rows(width));
+        let spare = room.saturating_sub(composer_rows.len()) + 1;
+        let hidden = open_rows.len().saturating_sub(spare.max(1));
+        open_rows.drain(..hidden);
+        let live_rows = open_rows.len().max(1) as u16;
+        fit(
+            terminal,
+            VIEWPORT - 2 + live_rows + composer_rows.len() as u16,
+        )?;
         if !self.pending.is_empty() {
             let lines: Vec<Line<'static>> = std::mem::take(&mut self.pending)
                 .into_iter()
@@ -3183,28 +3332,31 @@ impl App {
                 .collect();
             // A row count fits a u16 only so far.
             for rows in lines.chunks(4096) {
+                let mut linked = Vec::new();
+                let cut: Vec<bool> = rows
+                    .iter()
+                    .map(|row| row.alignment == Some(transcript::CUT))
+                    .collect();
                 terminal.insert_before(rows.len() as u16, |buf| {
                     Paragraph::new(rows.to_vec()).render(buf.area, buf);
+                    linked = links::cells(buf, &cut);
                 })?;
+                // The rows sit just above the viewport now; those still on
+                // the screen get their addresses linked.
+                if !linked.is_empty() {
+                    let top = terminal.get_frame().area().y;
+                    let above = rows.len() as u16;
+                    let on_screen = linked.iter().filter_map(|(x, y, cell)| {
+                        (top + y).checked_sub(above).map(|y| (*x, y, cell))
+                    });
+                    terminal.backend_mut().draw(on_screen)?;
+                    Backend::flush(terminal.backend_mut())?;
+                }
             }
         }
         terminal.draw(|frame| {
-            let [live, status, _, composer, footer] = areas(frame.area());
-            let width = live.width as usize;
-            if let Some(open) = &self.live
-                && !open.partial.is_empty()
-            {
-                let mut markdown = open.markdown.clone();
-                if let Some(line) = markdown.line(&open.partial) {
-                    let lead = if open.lines == 0 { "• " } else { "  " };
-                    // The open line's end, when it is already wider than a row.
-                    let rows = transcript::wrap(line, width, Span::raw(lead), markdown.rest());
-                    frame.render_widget(
-                        Paragraph::new(rows.last().cloned().unwrap_or_default()),
-                        live,
-                    );
-                }
-            }
+            let [live, status, _, composer, footer] = areas(frame.area(), live_rows);
+            frame.render_widget(Paragraph::new(open_rows.clone()), live);
             frame.render_widget(Paragraph::new(self.status_line()), status);
             let menu = self.menu();
             if !menu.is_empty() {
@@ -3233,7 +3385,7 @@ impl App {
                         }
                     })
                     .collect();
-                let [_, _, _, composer_row, _] = areas(frame.area());
+                let [_, _, _, composer_row, _] = areas(frame.area(), live_rows);
                 let area = ratatui::layout::Rect {
                     y: composer_row.y.saturating_sub(rows.len() as u16),
                     height: rows.len() as u16,
@@ -3339,16 +3491,10 @@ impl App {
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
-            // The prompt's end, where typing goes on.
-            let cursor = match composer_rows.last() {
-                Some(row) if !self.input.is_empty() => row.width(),
-                _ => 2,
-            };
-            let last = composer.y + composer.height.saturating_sub(1);
             frame.render_widget(Paragraph::new(composer_rows), composer);
             frame.set_cursor_position((
-                composer.x + (cursor as u16).min(composer.width.saturating_sub(1)),
-                last,
+                composer.x + (cursor_col as u16).min(composer.width.saturating_sub(1)),
+                composer.y + (cursor_row as u16).min(composer.height.saturating_sub(1)),
             ));
             frame.render_widget(Paragraph::new(self.footer_line(width)), footer);
         })?;
@@ -3356,38 +3502,46 @@ impl App {
     }
 
     /// The composer's rows: the prompt wrapped to the width, the way it
-    /// will read once sent, and only its end when it is long; or the hint.
-    /// A list or picker open over the composer keeps it to one row.
-    fn composer(&self, width: usize) -> Vec<Line<'static>> {
+    /// will read once sent, and only the rows around the cursor when it
+    /// is long; or the hint. Also the cursor's row among those and its
+    /// column. A list or picker open over the composer keeps it to the
+    /// cursor's row.
+    fn composer(&self, width: usize) -> (Vec<Line<'static>>, (usize, usize)) {
         if self.input.is_empty() {
             let hint = match self.running {
                 Some(_) => "Steer the running turn",
                 None => "Ask anything",
             };
-            return vec![Line::from(vec![
-                Span::raw("› ").bold(),
-                Span::raw(hint).dim(),
-            ])];
+            return (
+                vec![Line::from(vec![
+                    Span::raw("› ").bold(),
+                    Span::raw(hint).dim(),
+                ])],
+                (0, prompt::LEAD),
+            );
         }
-        let mut rows = Vec::new();
-        for (at, line) in self.input.split('\n').enumerate() {
-            let lead = match at {
-                0 => Span::raw("› ").bold(),
-                _ => Span::raw("  "),
-            };
-            rows.extend(transcript::wrap(
-                Line::from(line.to_owned()),
-                width.saturating_sub(1),
-                lead,
-                Span::raw("  "),
-            ));
-        }
-        if self.choosing.is_some() || self.picker.is_some() {
-            rows.drain(..rows.len() - 1);
-        }
-        let over = rows.len().saturating_sub(COMPOSER_ROWS);
-        rows.drain(..over);
-        rows
+        let layout = self.input.layout(width);
+        let (row, col) = self.input.cursor(&layout);
+        let rows: Vec<Line<'static>> = layout
+            .iter()
+            .enumerate()
+            .map(|(at, part)| {
+                let lead = match at {
+                    0 => Span::raw("› ").bold(),
+                    _ => Span::raw("  "),
+                };
+                Line::from(vec![
+                    lead,
+                    Span::raw(self.input[part.start..part.end].to_owned()),
+                ])
+            })
+            .collect();
+        let keep = match self.choosing.is_some() || self.picker.is_some() {
+            true => 1,
+            false => COMPOSER_ROWS,
+        };
+        let (rows, row) = window(rows, row, keep);
+        (rows, (row, col))
     }
 
     fn status_line(&self) -> Line<'static> {
@@ -3639,11 +3793,27 @@ mod tests {
     /// A daemon that greets and answers each `history_items` read from
     /// `items`, by node.
     async fn daemon_with(items: Value) -> Arc<Client> {
+        daemon_answering(move |asked| {
+            let read: Vec<Value> = asked["nodes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|node| json!({"node": node, "item": items[node.to_string()]}))
+                .collect();
+            json!({"items": read})
+        })
+        .await
+    }
+
+    /// A daemon that greets and gives each request `answer`'s result.
+    async fn daemon_answering(answer: impl Fn(&Value) -> Value + Send + 'static) -> Arc<Client> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        // Tests start stand-ins at once, within the same millisecond.
+        static STARTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
             "sonny-daemon-{}-{}",
-            std::process::id(),
-            unique("t")
+            unique("t"),
+            STARTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let socket = dir.join("agent.sock");
@@ -3659,13 +3829,7 @@ mod tests {
             let mut lines = BufReader::new(read).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let asked: Value = serde_json::from_str(&line).unwrap();
-                let read: Vec<Value> = asked["nodes"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .map(|node| json!({"node": node, "item": items[node.to_string()]}))
-                    .collect();
-                let answer = json!({"id": asked["id"], "result": {"items": read}});
+                let answer = json!({"id": asked["id"], "result": answer(&asked)});
                 write
                     .write_all(format!("{answer}\n").as_bytes())
                     .await
@@ -3675,14 +3839,8 @@ mod tests {
         Client::connect(&socket).await.unwrap().0
     }
 
-    #[tokio::test]
-    async fn a_reply_that_follows_its_reasoning_is_drawn_once() {
-        let client = daemon_with(json!({
-            "1": {"type": "reasoning", "summary": [{"type": "summary_text", "text": "**Reading**"}]},
-            "2": {"type": "message", "role": "assistant",
-                  "content": [{"type": "output_text", "text": "First line.\nSecond line."}]}
-        }))
-        .await;
+    /// Sonny on bot `b`, on `client`.
+    fn app(client: Arc<Client>) -> App {
         let options = Options {
             store: PathBuf::new(),
             socket: PathBuf::new(),
@@ -3696,7 +3854,100 @@ mod tests {
             lookout: None,
             side: None,
         };
-        let mut app = App::new(client, "b", &json!({"name": "b"}), options);
+        App::new(client, "b", &json!({"name": "b"}), options)
+    }
+
+    fn turn_event(event: &str, turn: i64, data: Value) -> Value {
+        json!({"event": event, "bot": "b", "turn": turn, "data": data})
+    }
+
+    #[tokio::test]
+    async fn a_sent_prompt_stays_staged_until_its_turn_takes_it() {
+        let next = std::sync::atomic::AtomicI64::new(2);
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("submit") => {
+                json!({"turn": next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)})
+            }
+            _ => json!({"items": [{"node": 10, "item": {"type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "steer one"}]}}]}),
+        })
+        .await;
+        let mut app = app(client);
+        let staged = |app: &App| app.staged.iter().map(|(turn, _)| *turn).collect::<Vec<_>>();
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        // Sent while turn 1 runs: two steers, turns 2 and 3.
+        for prompt in ["steer one", "steer two"] {
+            app.input.set(prompt);
+            app.submit().await;
+        }
+        assert_eq!(staged(&app), [2, 3]);
+        assert_eq!(app.staged_rows(80).len(), 2);
+        // Turn 1 takes in the first; its own turn ends as steered.
+        app.daemon(turn_event("turn_finished", 2, json!({"status": "steered"})))
+            .await;
+        app.daemon(turn_event("steered", 1, json!({"steer": 2, "node": 10})))
+            .await;
+        assert_eq!(staged(&app), [3]);
+        assert_eq!(app.running.as_ref().map(|r| r.turn), Some(1));
+        // Turn 1 ends before the second lands; that one starts its own turn.
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        assert_eq!(staged(&app), [3]);
+        app.daemon(turn_event("accepted", 3, json!({}))).await;
+        assert!(app.staged.is_empty());
+        // A prompt whose turn ends without starting is unstaged too.
+        app.input.set("never ran");
+        app.submit().await;
+        app.daemon(turn_event(
+            "turn_finished",
+            4,
+            json!({"status": "interrupted"}),
+        ))
+        .await;
+        assert!(app.staged.is_empty());
+    }
+
+    #[tokio::test]
+    async fn on_reconnecting_only_prompts_still_waiting_stay_staged() {
+        // Two pages, from the first staged turn on.
+        let client =
+            daemon_answering(
+                |asked| match (asked["op"].as_str(), asked["after"].as_i64()) {
+                    (Some("turns"), Some(4)) => json!({"turns": [
+                {"turn": 5, "status": "steered"},
+                {"turn": 6, "status": "running"},
+            ], "next_after": 6}),
+                    (Some("turns"), Some(6)) => json!({"turns": [
+                {"turn": 7, "status": "queued"},
+            ], "next_after": null}),
+                    _ => json!({}),
+                },
+            )
+            .await;
+        let mut app = app(client);
+        app.staged = vec![
+            (5, "a".into()),
+            (6, "b".into()),
+            (7, "c".into()),
+            (8, "d".into()),
+        ];
+        app.unstage_landed().await;
+        assert_eq!(app.staged, [(7, "c".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_follows_its_reasoning_is_drawn_once() {
+        let client = daemon_with(json!({
+            "1": {"type": "reasoning", "summary": [{"type": "summary_text", "text": "**Reading**"}]},
+            "2": {"type": "message", "role": "assistant",
+                  "content": [{"type": "output_text", "text": "First line.\nSecond line."}]}
+        }))
+        .await;
+        let mut app = app(client);
         let event =
             |event: &str, data: Value| json!({"event": event, "bot": "b", "turn": 1, "data": data});
         app.daemon(event("accepted", json!({}))).await;

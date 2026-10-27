@@ -1,9 +1,9 @@
 ---
 name: herdr-panes
-description: Run long or interactive commands (dev servers, watchers, builds or test runs past the shell tool's 10 minutes, REPLs) in a Herdr pane the person can watch, then read, wait on or stop them; and put an agent's pane where the person asks (its own tab, or a split beside another).
+description: Use this, not the herdr skill, whenever the person mentions Herdr or a pane, tab or split. Run long or interactive commands (dev servers, watchers, builds or test runs past the shell tool's 10 minutes, REPLs) in a Herdr pane the person can watch, then read, wait on or stop them; and put an agent's pane where the person asks (its own tab, or a split beside another).
 ---
 
-Herdr is the terminal multiplexer the person watches the work in. Each project has one Herdr workspace: the one its lead runs in. In it, every agent has a pane labelled with its full name (`shop.fix-cart`), and a tab named after what it is doing. Use a pane only for a command that runs longer than the shell tool allows (up to 10 minutes with `timeout_ms`), that keeps running (a server, a watcher), or that the person wants to watch. Everything else, a one-minute test run or build included, stays in the shell tool: give it a `timeout_ms` that covers it rather than a short one, since one shell call is faster than a pane, a wait and a read.
+Herdr is the terminal multiplexer the person watches the work in. Your shell is not in a Herdr pane, by design: it runs in the agent daemon, so `HERDR_ENV`, `HERDR_PANE_ID` and the other pane variables are unset. That does not mean the person is outside Herdr, and it is no reason to stop. Herdr's own `herdr` skill, which asks for `HERDR_ENV=1`, does not apply here; this skill's commands work from your shell. Each project has one Herdr workspace: the one its lead runs in. In it, every agent has a pane labelled with its full name (`shop.fix-cart`), and a tab named after what it is doing. Use a pane only for a command that runs longer than the shell tool allows (up to 10 minutes with `timeout_ms`), that keeps running (a server, a watcher), or that the person wants to watch. Everything else, a one-minute test run or build included, stays in the shell tool: give it a `timeout_ms` that covers it rather than a short one, since one shell call is faster than a pane, a wait and a read.
 
 ## Where things go
 
@@ -22,6 +22,10 @@ Herdr is the terminal multiplexer the person watches the work in. Each project h
       SONNY_BIN show AGENT --split right            # beside you; also left, above, below
       SONNY_BIN show AGENT --split below --beside OTHER-AGENT
       SONNY_BIN show AGENT --window                 # its own tab again
+
+## Herdr knows you
+
+Herdr's agent panel lists every agent Sonny runs, you included, as `Sonny: NAME`, working, idle or waiting for the person; Sonny reports that for you, so never report to Herdr yourself (`herdr pane report-agent`, `report-metadata`, `agent rename`). Agents the person runs in Herdr outside Sonny (Claude Code, Codex and others) show there too, by name or, unnamed, by pane ID. To see them: `HERDR_BIN agent list`; read one: `HERDR_BIN agent read NAME --source recent-unwrapped --lines 80`; wait for one to finish: `HERDR_BIN agent wait NAME --timeout 600000`. Write to another agent (`HERDR_BIN agent prompt NAME 'text'`) only when the person asks you to.
 
 ## Working with a pane
 

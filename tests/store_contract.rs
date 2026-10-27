@@ -11225,3 +11225,45 @@ fn schema_50_bots_never_expire() {
     drop(db);
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn an_expired_fork_still_running_a_command_holds_back_no_other() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    converse(&mut db, "Bob", 1);
+    let expiring = Fork {
+        expire_ms: Some(1000),
+        ..Fork::default()
+    };
+    db.fork("Bob", "busy", expiring).unwrap();
+    // Its turn leaves a command running, so `delete` would refuse it.
+    let turn = db
+        .begin(
+            "busy",
+            "r1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let (item, bg) = call("bg");
+    db.append(turn, vec![item], std::slice::from_ref(&bg), None)
+        .unwrap();
+    db.tool_start(turn, &bg).unwrap();
+    let process = db.process_start(turn, "bg").unwrap();
+    db.tool_finish(turn, "bg", &result(&format!("proc:{process}")))
+        .unwrap();
+    db.append(turn, vec![assistant("started")], &[], None)
+        .unwrap();
+    db.finish(turn, None).unwrap();
+    let (idle, _) = db.fork("Bob", "idle", expiring).unwrap();
+    assert!(db.delete_bot("busy").is_err());
+    assert_eq!(
+        db.expired(i64::MAX, 1).unwrap(),
+        vec![("idle".to_owned(), idle.bot_id)]
+    );
+    db.process_finish(process, &json!({}), &[]).unwrap();
+    assert_eq!(db.expired(i64::MAX, 16).unwrap().len(), 2);
+}

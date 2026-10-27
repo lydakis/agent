@@ -6466,13 +6466,19 @@ impl Database {
         )?)
     }
     /// Up to `limit` bots, by name and identity, whose idle time ran out by
-    /// `now` with no turn running or waiting.
+    /// `now` and which `delete` would take: no turn running, waiting,
+    /// queued or ready, and no command of theirs running. One still busy is
+    /// passed over, so it never holds back another that is not.
     pub fn expired(&self, now: i64, limit: usize) -> Result<Vec<(String, i64)>> {
         Ok(self
             .conn
             .prepare_cached(
-                "SELECT name,id FROM bots WHERE expires_at<=?1 AND running_turn IS NULL
-                 AND status!='deleting' ORDER BY expires_at LIMIT ?2",
+                "SELECT b.name,b.id FROM bots b WHERE b.expires_at<=?1 AND b.running_turn IS NULL
+                 AND b.status!='deleting'
+                 AND NOT EXISTS(SELECT 1 FROM turns t WHERE t.bot=b.name AND t.status IN ('queued','ready'))
+                 AND NOT EXISTS(SELECT 1 FROM processes p JOIN turns t ON t.id=p.turn
+                     WHERE p.status='running' AND t.bot=b.name)
+                 ORDER BY b.expires_at LIMIT ?2",
             )?
             .query_map(params![now, limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?)
