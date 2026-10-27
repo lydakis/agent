@@ -251,7 +251,7 @@ class Model(http.server.BaseHTTPRequestHandler):
                     text = 'done'
                     output = [{'type': 'message', 'role': 'assistant',
                                'content': [{'type': 'output_text', 'text': text}]}]
-            elif user.startswith(('rewait:', 'liftwait:')):
+            elif user.startswith(('rewait:', 'rewait2:', 'liftwait:')):
                 # Calls this turn: a `liftwait:` command in the foreground,
                 # then a wait on any handle a result names, again while one
                 # is pending, then the last result echoed.
@@ -265,6 +265,10 @@ class Model(http.server.BaseHTTPRequestHandler):
                 if user.startswith('liftwait:') and not outputs:
                     output = [{'type': 'function_call', 'name': 'shell', 'call_id': 'lift-1',
                                'arguments': json.dumps({'command': user[9:], 'timeout_ms': 5000})}]
+                elif user.startswith('rewait2:') and not outputs:
+                    # Two waits in one response.
+                    output = [{'type': 'function_call', 'name': 'wait', 'call_id': f'wait-{n}',
+                               'arguments': json.dumps({'handles': [handle]})} for n in (1, 2)]
                 elif not outputs or outputs[-1].get('pending') or 'handle' in outputs[-1]:
                     output = [{'type': 'function_call', 'name': 'wait', 'call_id': f'wait-{calls + 1}',
                                'arguments': json.dumps({'handles': [handle]})}]

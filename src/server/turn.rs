@@ -215,6 +215,9 @@ impl Lift {
     fn clear(&self) {
         self.armed.store(false, Relaxed);
     }
+    fn is_armed(&self) -> bool {
+        self.armed.load(Relaxed)
+    }
     /// Once armed, and LIFT_GRACE later: a command that ends that soon
     /// returns as usual, so a quick one never becomes a handle.
     async fn lifted(&self) {
@@ -2946,13 +2949,35 @@ impl Turn {
                 // The tool's result ends the refreshes, as does handing it to
                 // the background. One already sent is billed, so it is
                 // answered and recorded; an unsent one is dropped at no cost.
-                Next::Ran(_) | Next::Lifted => {
+                Next::Ran(result) => {
                     if let Some(refreshed) = settle(warm.pending).await {
                         self.refreshed(warm, refreshed).await?;
                     }
-                    return Ok(match next {
-                        Next::Ran(result) => Ran::Done(result),
-                        _ => Ran::Lifted(run),
+                    return Ok(Ran::Done(result));
+                }
+                // The command keeps running while the refresh is answered,
+                // so its timeout and pipes still apply; one that ends
+                // meanwhile returns as usual.
+                Next::Lifted => {
+                    let mut finished = None;
+                    let refreshed = {
+                        let settled = settle(warm.pending);
+                        tokio::pin!(settled);
+                        tokio::select! {
+                            biased;
+                            refreshed = &mut settled => refreshed,
+                            result = &mut run => {
+                                finished = Some(result);
+                                settled.await
+                            }
+                        }
+                    };
+                    if let Some(refreshed) = refreshed {
+                        self.refreshed(warm, refreshed).await?;
+                    }
+                    return Ok(match finished {
+                        Some(result) => Ran::Done(result),
+                        None => Ran::Lifted(run),
                     });
                 }
                 Next::Refreshed(refreshed) => {
@@ -3532,6 +3557,13 @@ impl Turn {
                 return Ok(ControlFlow::Continue(failure(error)));
             }
         }
+        // A steer waiting for the next boundary makes the wait a poll: it
+        // reports what resolved, and the rest pending.
+        let timeout_ms = if self.lift.is_armed() {
+            Some(0)
+        } else {
+            timeout_ms
+        };
         // Only move the remaining calls once this wait can actually park.
         let pending: Vec<ToolCall> = calls.collect();
         let deadline_ms = timeout_ms.map(|t| now_ms() + t);

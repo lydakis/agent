@@ -332,6 +332,24 @@ class WaitTests(ModelFixture):
         self.assertEqual(tail[0]['type'], 'function_call_output')
         self.assertEqual(tail[1]['content'][0]['text'], 'steer:look')
 
+    def test_a_steer_passes_every_wait_in_the_same_response(self):
+        client = self.client('echo,shell,wait')
+        client.request('create', bot='Bob', workspace=str(self.path))
+        started = client.request('submit', bot='Bob', request_id='bg', prompt='bg:sleep 1.5; printf done')['result']['turn']
+        client.finished(started)
+        handle = self.tool_output(client, 'Bob', 'bg-1')['handle']
+        turn = client.request('submit', bot='Bob', request_id='w', prompt='rewait2:' + handle)['result']['turn']
+        client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
+        sent = time.monotonic()
+        steer = client.request('submit', bot='Bob', request_id='s', prompt='steer:look', delivery='steer')['result']
+        self.assertEqual(client.finished(steer['turn'])['data']['status'], 'steered')
+        self.assertLess(time.monotonic() - sent, 1.0)
+        for call in ('wait-1', 'wait-2'):
+            early = self.tool_output(client, 'Bob', call)
+            self.assertEqual((early['pending'], early['steered']), ([handle], True))
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(self.tool_output(client, 'Bob', 'wait-3')['results'][handle]['stdout'], 'done')
+
     def test_a_steer_moves_a_running_command_to_the_background(self):
         client = self.client('echo,shell,wait')
         client.request('create', bot='Bob', workspace=str(self.path))
