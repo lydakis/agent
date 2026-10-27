@@ -1802,8 +1802,10 @@ impl App {
             let Some(fields) = approvals::regate(bot, mode) else {
                 continue;
             };
+            // That bot, not one given its name since it was listed.
             let mut asked = Value::Object(fields);
             asked["bot"] = bot["name"].clone();
+            asked["bot_id"] = bot["bot_id"].clone();
             match self.client.request("configure", asked).await {
                 Ok(_) => {}
                 Err(error) if error.code == "bot_busy" => busy = true,

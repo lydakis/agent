@@ -5546,7 +5546,8 @@ impl Database {
         }
         Ok(Some(reply))
     }
-    /// The calls a turn was refused, each `{name, arguments}` with its
+    /// The calls a turn was refused and did not then run as they were,
+    /// each `{name, arguments}` with its
     /// arguments cut to the budget left, and the turn whose words it came
     /// after: the steer the turn last absorbed before it, else the turn's
     /// own. A denial recorded before refused calls were kept has no name
@@ -5558,7 +5559,15 @@ impl Database {
                 (SELECT json_extract(s.data,'$.steer') FROM events s
                   WHERE s.turn=e.turn AND s.kind='steered' AND s.id<e.id ORDER BY s.id DESC LIMIT 1)
              FROM events e WHERE e.turn=? AND e.kind='tool_completed' AND json_extract(e.data,'$.denied')
-               AND json_extract(e.data,'$.name') IS NOT NULL ORDER BY e.id",
+               AND json_extract(e.data,'$.name') IS NOT NULL
+               -- Run later in the turn as it was refused, and done: its go-ahead is used.
+               AND NOT EXISTS (SELECT 1 FROM events r JOIN events d ON d.turn=r.turn
+                   AND d.kind='tool_completed' AND json_extract(d.data,'$.call_id')=json_extract(r.data,'$.call_id')
+                   AND json_extract(d.data,'$.denied') IS NULL AND json_extract(d.data,'$.failed') IS NOT 1
+                 WHERE r.turn=e.turn AND r.kind='tool_started' AND r.id>e.id
+                   AND json_extract(r.data,'$.name')=json_extract(e.data,'$.name')
+                   AND json_extract(r.data,'$.arguments')=json_extract(e.data,'$.arguments'))
+             ORDER BY e.id",
         )?;
         let mut refused = Vec::new();
         let mut rows = statement.query([turn])?;

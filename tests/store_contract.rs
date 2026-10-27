@@ -10815,6 +10815,26 @@ fn a_refused_call_is_read_after_the_words_it_came_after() {
     assert_eq!(listed["arguments_truncated"], true);
     assert_eq!(listed["arguments"].as_str().unwrap().len(), 2048);
     assert_eq!(listed["name"], long["name"]);
+    // A refusal the turn then ran as it was, and finished, is no longer
+    // listed: its go-ahead is used.
+    refuse(&mut db, next, "s4", "make release");
+    let (item, call) = shell_call("fc_s5", "s5", "make release");
+    db.append(next, vec![item], std::slice::from_ref(&call), None)
+        .unwrap();
+    allow(&mut db, next, "s5").unwrap();
+    assert!(matches!(
+        db.approval_start(next, &call, 0).unwrap(),
+        Gated::Started
+    ));
+    db.tool_finish(next, "s5", &result("released")).unwrap();
+    let read = db.prompts("Bob", next, 64 * 1024).unwrap();
+    let lengths: Vec<_> = read["prompts"][0]["refused"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|call| call["arguments"].as_str().unwrap().len())
+        .collect();
+    assert_eq!(lengths, [2048]);
 }
 
 #[test]

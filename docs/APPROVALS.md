@@ -588,7 +588,9 @@ so only one instance runs at a time, and answers in layers:
    shown to the judge beside the words they came after (`refused_calls`
    on a prompt or steer, this turn's or an earlier one's), so a plain
    "yes" or "approved" right after a refusal asks for what was refused,
-   and one that came before it does not. A bare go-ahead is read against
+   and one that came before it does not; a refused call the turn then ran
+   as it was, and finished, is no longer listed, so its go-ahead counts as
+   used. A bare go-ahead is read against
    the question it answers: the bot's last message before the turn, and
    before each steer (`reply` in `prompts`), comes right before those
    words in `request`, as the model's words, so a "yes" to "shall I run
