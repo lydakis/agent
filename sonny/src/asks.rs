@@ -2,12 +2,14 @@
 //! on it, which the daemon records and Sonny pins above the composer,
 //! oldest first, until the person answers them one at a time. The answer
 //! goes to the lead as the person's next message. The open questions are
-//! read from the lead's history: its `ask` calls not yet answered.
+//! read from the lead's history: its `ask` calls not yet answered; those
+//! older than the history Sonny replays come back from a file it keeps.
 use ratatui::{
     style::{Color, Stylize},
     text::{Line, Span},
 };
 use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
 
 /// The name of the tool the lead asks with.
 pub const TOOL: &str = "ask";
@@ -72,19 +74,65 @@ pub fn call(id: &str, arguments: &Value) -> Option<Ask> {
     })
 }
 
+/// Where the open questions of the bot under `key`, its
+/// [`crate::reactions::key`], are kept: history holds them, but Sonny
+/// replays only its newest part, so one asked before that comes back from
+/// here.
+pub fn file(key: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(format!(".agent/sonny/asks/{key}.json")))
+}
+
+/// The open questions kept in `file`; none kept is none.
+pub fn load(file: Option<&Path>) -> Vec<Ask> {
+    let kept: Value = file
+        .and_then(|file| std::fs::read(file).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    kept.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|ask| call(ask["id"].as_str()?, ask))
+        .collect()
+}
+
+/// Keeps `asks` in `file`, as the questions still open; none removes it.
+pub fn keep(file: Option<&Path>, asks: &[Ask]) -> Result<(), String> {
+    let Some(file) = file else {
+        return Ok(());
+    };
+    let failed = |e: std::io::Error| format!("{}: {e}", file.display());
+    if asks.is_empty() {
+        return match std::fs::remove_file(file) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(failed(e)),
+            _ => Ok(()),
+        };
+    }
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir).map_err(failed)?;
+    }
+    let kept: Vec<Value> = asks
+        .iter()
+        .map(|ask| json!({"id": ask.id, "question": ask.question, "choices": ask.choices}))
+        .collect();
+    let json = serde_json::to_vec(&kept).map_err(|e| e.to_string())?;
+    // Its own, so two windows of the bot never write one file together.
+    let next = file.with_extension(format!("json.{}.next", std::process::id()));
+    std::fs::write(&next, json).map_err(failed)?;
+    std::fs::rename(&next, file).map_err(failed)
+}
+
 /// The question a person's message answers, when [`answer`] wrote it.
 pub fn answered(text: &str) -> Option<&str> {
     let (question, _) = text.strip_prefix("You asked: ")?.split_once("\n\n")?;
     Some(question)
 }
 
-/// `asks` without the first one `text` answers.
-pub fn close(asks: &mut Vec<Ask>, text: &str) {
-    if let Some(question) = answered(text)
-        && let Some(at) = asks.iter().position(|ask| ask.question == question)
-    {
-        asks.remove(at);
-    }
+/// `asks` without the first one `text` answers; whether there was one.
+pub fn close(asks: &mut Vec<Ask>, text: &str) -> bool {
+    let at =
+        answered(text).and_then(|question| asks.iter().position(|ask| ask.question == question));
+    at.map(|at| asks.remove(at)).is_some()
 }
 
 /// The person's message answering `ask`: a choice's number stands for
@@ -176,6 +224,26 @@ mod tests {
         open.push(long.clone());
         close(&mut open, &answer(&long, "yes"));
         assert_eq!(open.len(), 1);
+    }
+
+    #[test]
+    fn open_questions_are_kept_until_none_are() {
+        let file = std::env::temp_dir().join(format!("sonny-asks-{}/b.json", std::process::id()));
+        assert_eq!(load(Some(&file)), []);
+        let open = vec![
+            call(
+                "c1",
+                &json!({"question": "Tag it?", "choices": ["Yes", "No"]}),
+            )
+            .unwrap(),
+            call("c2", &json!({"question": "Bump?"})).unwrap(),
+        ];
+        keep(Some(&file), &open).unwrap();
+        assert_eq!(load(Some(&file)), open);
+        keep(Some(&file), &[]).unwrap();
+        assert!(!file.exists());
+        keep(Some(&file), &[]).unwrap();
+        keep(None, &open).unwrap();
     }
 
     #[test]

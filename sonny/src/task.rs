@@ -124,6 +124,10 @@ fn start(here: &Path, name: &str, rest: &[String]) -> Result<(), String> {
             return failed(&place, false, format!("{} failed", script.display()));
         }
     }
+    let flags = match told(&place.dir, &flags) {
+        Ok(flags) => flags,
+        Err(error) => return failed(&place, false, error),
+    };
     let status = command
         .args(["run", "--detach", "--new", "--bot", name, "--workspace"])
         .arg(&place.dir)
@@ -150,6 +154,64 @@ fn start(here: &Path, name: &str, rest: &[String]) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// The run flags with what `--agents` or `--profile ROLE` would compose
+/// for a task in `dir` given as `--instructions`, with who it works for
+/// after it, and the role's model and tools unless the flags name their
+/// own. Other flags pass as they are.
+fn told(dir: &Path, flags: &[&String]) -> Result<Vec<String>, String> {
+    let mut kept = Vec::new();
+    let (mut agents, mut profile) = (false, None);
+    let mut flags = flags.iter().map(|flag| flag.as_str());
+    while let Some(flag) = flags.next() {
+        match flag {
+            "--agents" => agents = true,
+            "--profile" => profile = Some(flags.next().ok_or("--profile needs a ROLE")?),
+            _ => match flag.strip_prefix("--profile=") {
+                Some(role) => profile = Some(role),
+                None => kept.push(flag.to_owned()),
+            },
+        }
+    }
+    if !agents && profile.is_none() {
+        return Ok(kept);
+    }
+    // A value flag is --flag VALUE or --flag=VALUE.
+    let named = |flag: &str| {
+        (kept.iter()).any(|k| k.split_once('=').map_or(k.as_str(), |(name, _)| name) == flag)
+    };
+    if named("--instructions") || named("--instructions-file") {
+        return Err("--agents and --profile compose instructions; --instructions sets them".into());
+    }
+    let role = match profile {
+        Some(name) => Some(
+            agent_client::policy::profile(dir, name)
+                .map_err(|e| format!("{}: {e}", e.code()))?
+                .ok_or(format!(
+                    "no .agents/agents/{name}.md in the workspace or ~/.agents/agents"
+                ))?,
+        ),
+        None => None,
+    };
+    let memory = agent_client::policy::memory_indexes(dir).map_err(|e| e.to_string())?;
+    let composed = agent_client::policy::instructions(dir, role.as_ref(), &memory)
+        .map_err(|e| format!("{}: {e}", e.code()))?;
+    let mut added = Vec::new();
+    if let Some(role) = &role {
+        if let Some(model) = role.model.as_ref().filter(|_| !named("--model")) {
+            added.extend(["--model".to_owned(), model.clone()]);
+        }
+        if let Some(tools) = role.tools.as_ref().filter(|_| !named("--tools")) {
+            added.extend(["--tools".to_owned(), tools.join(",")]);
+        }
+    }
+    added.extend([
+        "--instructions".to_owned(),
+        crate::project::with_person(&composed.text),
+    ]);
+    kept.extend(added);
+    Ok(kept)
 }
 
 /// Whether the daemon has a task `name`: one whose start failed after it
@@ -1333,5 +1395,48 @@ mod tests {
         ];
         let _ = std::fs::remove_dir_all(&base);
         assert_eq!(said, [true, false, false, false, false, false]);
+    }
+
+    #[test]
+    fn a_task_is_told_who_it_works_for() {
+        let dir = std::env::temp_dir().join(format!("sonny-task-told-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".agents/agents")).unwrap();
+        std::fs::write(
+            dir.join(".agents/agents/reviewer.md"),
+            "---\nmodel: a/b\ntools: [shell, read]\n---\nReview it.\n",
+        )
+        .unwrap();
+        let told = |flags: &[&str]| {
+            let flags: Vec<String> = flags.iter().map(|f| f.to_string()).collect();
+            told(&dir, &flags.iter().collect::<Vec<_>>())
+        };
+        let person = |flags: &[String]| {
+            let at = flags.iter().position(|f| f == "--instructions").unwrap();
+            assert!(flags[at + 1].ends_with(crate::project::PERSON));
+            flags[at + 1].clone()
+        };
+
+        let flags = told(&["--agents", "--model", "x/y"]).unwrap();
+        assert_eq!(flags[..2], ["--model", "x/y"]);
+        assert!(!flags.contains(&"--agents".to_owned()));
+        person(&flags);
+
+        let flags = told(&["--profile", "reviewer"]).unwrap();
+        assert_eq!(flags[..4], ["--model", "a/b", "--tools", "shell,read"]);
+        assert!(person(&flags).contains("Review it."));
+        // The task's own picks win over the role's.
+        let flags = told(&["--profile", "reviewer", "--model", "x/y"]).unwrap();
+        assert_eq!(flags[..4], ["--model", "x/y", "--tools", "shell,read"]);
+        let flags = told(&["--profile=reviewer", "--model=x/y", "--tools=read"]).unwrap();
+        assert_eq!(
+            flags[..3],
+            ["--model=x/y", "--tools=read", "--instructions"]
+        );
+
+        assert_eq!(told(&["--model", "x/y"]).unwrap(), ["--model", "x/y"]);
+        assert!(told(&["--profile", "nobody"]).is_err());
+        assert!(told(&["--agents", "--instructions", "x"]).is_err());
+        assert!(told(&["--agents", "--instructions-file=x"]).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -143,7 +143,13 @@ off again never shows.
   folder. The lead starts each task with `sonny task NAME [--setup] [run
   flags] -- BRIEF`, which makes its folder that way, runs `.agents/setup`
   there with `--setup`, starts the task with `agent run`, and leaves no
-  folder behind when that fails. Paths into the folder in the brief are
+  folder behind when that fails. Every agent Sonny starts, leads and tasks
+  alike, is told after its role that the person it works for may be under
+  pressure, and to care whether they succeed: take work off their plate,
+  do or offer what they will need next, and say once when a better way of
+  working would help them; so `sonny task` gives what `--agents` or
+  `--profile` would compose as the task's instructions, with that after it.
+  Paths into the folder in the brief are
   rewritten to the task's copy, so a task told an absolute path still
   writes its own copy. `sonny task changes NAME [--all] [--apply [--force]
   [--only PATH...]]` lists, or writes back, what a sandfs copy of a plain
@@ -175,7 +181,8 @@ off again never shows.
   sets the questions aside for a message of your own, and Esc again goes
   back to them. The open questions are read from the lead's history (its
   `ask` calls not yet answered), so one asked while Sonny was closed is
-  pinned when it opens.
+  pinned when it opens; Sonny keeps them in `~/.agent/sonny/asks` too, so
+  one asked before the history it replays still comes back.
 - `/copy` puts the last reply on the clipboard; `/open` opens the last
   HTML page in a browser; `/sound` turns the chime off or on; `/verbose`
   switches between the clean view and every tool call; `/quit`

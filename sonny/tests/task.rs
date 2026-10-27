@@ -134,12 +134,15 @@ fn a_task_starts_in_a_worktree_of_its_own_by_default() {
         "demo.fix",
         "--workspace",
         &workspace,
-        "--agents",
-        "--",
-        "fix",
-        "it",
+        "--instructions",
     ];
-    assert_eq!(lab.ran(), expected);
+    // What --agents composes, given as the task's instructions, with who
+    // it works for after it.
+    let ran = lab.ran();
+    assert_eq!(ran[..expected.len()], expected);
+    assert_eq!(ran[ran.len() - 3..], ["--", "fix", "it"]);
+    let told = ran[expected.len()..ran.len() - 3].join("\n");
+    assert!(told.contains("The person you work for"), "{told}");
     assert!(said.contains("\"handle\""), "{said}");
     // From the last commit, on its own branch.
     assert_eq!(

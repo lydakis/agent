@@ -35,6 +35,13 @@ const HIGH: f64 = agent_client::approver::HIGH;
 const DEADLINE: Duration = Duration::from_secs(10);
 /// How long after a note is refused the next may go, even a steer.
 const WAKE_GAP: Duration = Duration::from_secs(120);
+/// How long news settles before its note goes, so turns that end together,
+/// and the judge's answers on them, go in one note.
+const SETTLE: Duration = Duration::from_secs(2);
+/// How long a note waits for checks still under way.
+const SETTLE_MAX: Duration = Duration::from_secs(15);
+/// How often subscription files are read again.
+const REREAD: Duration = Duration::from_secs(15);
 /// How long a task waits on the person's approval before it is news.
 const APPROVAL_AFTER: Duration = Duration::from_secs(120);
 /// How long a running turn may print nothing before it is news.
@@ -1395,7 +1402,10 @@ impl Service {
         let mut live = false;
         self.live = false;
         let (done, mut results) = tokio::sync::mpsc::channel(64);
-        let mut tick = tokio::time::interval(Duration::from_secs(15));
+        // Often enough for a note whose news has settled; subscription
+        // files less often.
+        let mut tick = tokio::time::interval(SETTLE / 2);
+        let mut reread: Option<Instant> = None;
         loop {
             tokio::select! {
                 event = events.recv() => {
@@ -1461,23 +1471,27 @@ impl Service {
                         }
                     }
                     if let Some(lookout) = self.lookouts.get_mut(&lead) {
+                        lookout.checking = lookout.checking.saturating_sub(1);
                         lookout.answered(seen, answered);
                     }
                 }
                 _ = tick.tick() => {
-                    // What `sonny lookout add` and `rm` wrote since.
-                    let read: HashMap<String, Vec<subs::Sub>> = subs::all(&self.store).into_iter().collect();
-                    if read != self.subscribers {
-                        self.subscribers = read;
-                        let records: Vec<Value> = (self.subscribers.keys())
-                            .filter_map(|name| self.records.get(name).cloned())
-                            .collect();
-                        for record in records {
-                            self.seat(&client, &record, live).await;
-                        }
-                        self.resubscribe();
-                    }
                     let now = Instant::now();
+                    // What `sonny lookout add` and `rm` wrote since.
+                    if reread.is_none_or(|at| now >= at + REREAD) {
+                        reread = Some(now);
+                        let read: HashMap<String, Vec<subs::Sub>> = subs::all(&self.store).into_iter().collect();
+                        if read != self.subscribers {
+                            self.subscribers = read;
+                            let records: Vec<Value> = (self.subscribers.keys())
+                                .filter_map(|name| self.records.get(name).cloned())
+                                .collect();
+                            for record in records {
+                                self.seat(&client, &record, live).await;
+                            }
+                            self.resubscribe();
+                        }
+                    }
                     for lookout in self.lookouts.values_mut() {
                         if lookout.updating {
                             lookout.updates.expire(now);
@@ -1502,6 +1516,7 @@ impl Service {
                         lead: lead.clone(),
                         nodes: None,
                     };
+                    lookout.checking += 1;
                     tokio::spawn(async move {
                         let answered = check(&client, &judge, &seen, &at, &memory, &recent).await;
                         let _ = done.send((lead, id, seen, answered)).await;
@@ -1832,6 +1847,10 @@ struct Lookout {
     urgent: Option<bool>,
     /// When the last note was refused: even a steer waits the gap after.
     refused: Option<Instant>,
+    /// When the news the next note carries first came.
+    since: Option<Instant>,
+    /// Checks under way.
+    checking: usize,
     log: Option<PathBuf>,
 }
 
@@ -1866,6 +1885,8 @@ impl Lookout {
             held: Vec::new(),
             urgent: None,
             refused: None,
+            since: None,
+            checking: 0,
             log: None,
         }
     }
@@ -2080,6 +2101,15 @@ impl Lookout {
             seen.kind == Kind::Ended
                 && handles.contains(&format!("turn:{}/{}", seen.task, seen.turn))
         };
+        // Held for the next note, and read first: the log says so, or its
+        // check would look lost.
+        for item in self.held.iter().filter(|item| read(&item.seen)) {
+            self.write(
+                &json!({"at_ms": epoch_ms(), "lead": self.lead, "task": item.seen.task,
+                "turn": item.seen.turn, "kind": format!("{:?}", item.seen.kind),
+                "skipped": "the lead read it"}),
+            );
+        }
         self.held.retain(|item| !read(&item.seen));
         self.due.retain(|seen| !read(seen));
         // Kept for checks still under way; a long-lived lead's list stays short.
@@ -2387,6 +2417,24 @@ impl Lookout {
     /// updates. Either note carries everything.
     async fn wake(&mut self, client: &Client) {
         let now = Instant::now();
+        let held = self.urgent.is_some();
+        self.since = match self.updates.news(held) {
+            true => Some(self.since.unwrap_or(now)),
+            false => None,
+        };
+        if let Some(since) = self.since
+            && self.updates.doubt(now, held, since)
+        {
+            let listed = client
+                .request("bots", json!({"name": self.lead, "limit": 1}))
+                .await;
+            if let Some(record) = listed.ok().and_then(|page| page["bots"].get(0).cloned())
+                && let Some(was) = self.updates.rests(now, &record)
+            {
+                self.write(&json!({"at_ms": epoch_ms(), "lead": self.lead,
+                    "rests": format!("the daemon lists it idle; its events said {was}")}));
+            }
+        }
         let Some(steer) = self.wake_due(now) else {
             return;
         };
@@ -2399,11 +2447,8 @@ impl Lookout {
         let take = self.held.len().min(NOTE_ITEMS);
         let sent: Vec<Item> = self.held.drain(..take).collect();
         let told = match self.updating {
-            true => self.updates.take(now),
-            false => {
-                self.updates.noted(now);
-                updates::Told::default()
-            }
+            true => self.updates.take(),
+            false => updates::Told::default(),
         };
         let prompt = note(&sent, self.held.len(), &told, self.dropped);
         let mut key: Vec<String> = sent
@@ -2426,6 +2471,7 @@ impl Lookout {
         match submitted {
             Ok(_) => {
                 self.refused = None;
+                self.since = None;
                 self.dropped = 0;
                 self.urgent = self.pending();
                 self.updates.sent(told);
@@ -2451,14 +2497,18 @@ impl Lookout {
     }
 
     /// Whether a note is to go now, and whether it steers: at once for an
-    /// urgent answer, else for a high answer or task updates once the lead
-    /// rests and last heard long enough ago; middle answers go with it.
+    /// urgent answer, else for a high answer or task updates as soon as the
+    /// lead rests, once the news has settled and the checks under way have
+    /// answered; middle answers go with it.
     fn wake_due(&self, now: Instant) -> Option<bool> {
         if self.refused(now) {
             return None;
         }
         let steer = self.urgent == Some(true);
-        (steer || self.updates.due(now, self.urgent.is_some())).then_some(steer)
+        let settled = self.since.is_some_and(|since| {
+            now >= since + SETTLE && (self.checking == 0 || now >= since + SETTLE_MAX)
+        });
+        (steer || (settled && self.updates.due(self.urgent.is_some()))).then_some(steer)
     }
 
     /// The last note was refused lately: even a steer waits the gap after.
@@ -2711,6 +2761,32 @@ mod tests {
 
     fn ev(bot: &str, turn: i64, kind: &str, data: Value) -> Value {
         json!({"bot": bot, "turn": turn, "event": kind, "data": data})
+    }
+
+    #[test]
+    fn news_the_lead_read_before_its_note_leaves_a_log_line() {
+        let mut lookout = lookout();
+        let log = std::env::temp_dir().join(format!("lookout-read-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&log);
+        lookout.log = Some(log.clone());
+        let seen = lookout.due_seen();
+        lookout.held.push(Item {
+            seen,
+            reasons: vec![("result", 0.95)],
+            looks: Vec::new(),
+            band: Band::Wake { steer: false },
+        });
+        lookout.urgent = Some(false);
+        lookout.read(&HashSet::from(["turn:calc.fix/1".to_owned()]));
+        assert!(lookout.held.is_empty());
+        assert_eq!(lookout.urgent, None);
+        let line: Value =
+            serde_json::from_str(std::fs::read_to_string(&log).unwrap().trim()).unwrap();
+        assert_eq!(
+            (&line["task"], &line["turn"], &line["skipped"]),
+            (&json!("calc.fix"), &json!(1), &json!("the lead read it"))
+        );
+        let _ = std::fs::remove_file(&log);
     }
 
     #[test]
@@ -3368,31 +3444,28 @@ mod tests {
             ));
             lookout.event(&ev(bot, 1, "turn_finished", json!({"status": "completed"})));
         };
-        let later = Instant::now() + Duration::from_secs(3600);
         let lookout = service.lookouts.get_mut("calc.lead").unwrap();
         assert!(lookout.updating && lookout.watches("calc.fix"));
         turn(lookout, "calc.review");
-        assert!(!lookout.updates.due(later, false));
+        assert!(!lookout.updates.due(false));
         // Made before the lead was seated, its turn is still news.
         turn(lookout, "calc.fix");
-        let told = lookout.updates.take(later);
+        let told = lookout.updates.take();
         assert_eq!(
             (told.items.iter().map(|l| l.handle.as_str())).collect::<Vec<_>>(),
             ["turn:calc.fix/1"]
         );
-        let after = later + Duration::from_secs(3600);
         // A task that subscribes after its news came: no one's task now.
         turn(lookout, "calc.ops");
-        assert!(lookout.updates.due(after, false));
+        assert!(lookout.updates.due(false));
         service.subscribers.insert("calc.ops".into(), Vec::new());
         service.resubscribe();
         let lookout = service.lookouts.get_mut("calc.lead").unwrap();
-        assert!(!lookout.updates.due(after, false));
+        assert!(!lookout.updates.due(false));
         service.subscribers.remove("calc.ops");
         service.resubscribe();
         let lookout = service.lookouts.get_mut("calc.lead").unwrap();
-        // Past the gap since the last note. Task updates go with the
-        // subscription that asked for them: news not yet told goes when it
+        // Task updates go with the subscription that asked for them: news not yet told goes when it
         // is dropped, and none comes while off.
         turn(lookout, "calc.fix");
         service
@@ -3400,9 +3473,9 @@ mod tests {
             .insert("calc.lead".into(), vec![sub("x", &["calc.lead"], &[])]);
         service.resubscribe();
         let lookout = service.lookouts.get_mut("calc.lead").unwrap();
-        assert!(!lookout.updating && !lookout.updates.due(after, false));
+        assert!(!lookout.updating && !lookout.updates.due(false));
         turn(lookout, "calc.fix");
-        assert!(!lookout.updates.due(after, false));
+        assert!(!lookout.updates.due(false));
         // Followed while off, so the lead's wait on a task still holds
         // that task's news back once they are asked for again.
         let mut waiting = ev("calc.lead", 1, "accepted", json!({}));
@@ -3427,9 +3500,9 @@ mod tests {
         ));
         lookout.event(&ev("calc.fix", 2, "turn_finished", finished.clone()));
         lookout.event(&ev("calc.lead", 1, "turn_finished", finished));
-        assert!(!lookout.updates.due(after, false));
+        assert!(!lookout.updates.due(false));
         turn(lookout, "calc.fix");
-        assert!(lookout.updates.due(after, false));
+        assert!(lookout.updates.due(false));
     }
 
     #[test]
@@ -3539,9 +3612,10 @@ mod tests {
             json!({"status": "completed"}),
         ));
         assert!(lookout.due.len() == 1 && lookout.judge.is_none());
-        assert_eq!(lookout.wake_due(now), Some(false), "no steer");
-        assert!(lookout.updates.due(now, false));
-        let told = lookout.updates.take(now);
+        lookout.since = Some(now);
+        assert_eq!(lookout.wake_due(now + SETTLE), Some(false), "no steer");
+        assert!(lookout.updates.due(false));
+        let told = lookout.updates.take();
         assert_eq!(
             told.items[0].text,
             "- calc.fix: turn:calc.fix/4 completed, asked by you"
@@ -3872,14 +3946,19 @@ mod tests {
             band: Band::Wake { steer: false },
         });
         lookout.urgent = Some(false);
-        assert_eq!(lookout.wake_due(now), Some(false));
-        // It waits as long after the last note as task updates do.
-        lookout.updates.noted(now);
+        // It goes once the news has settled, with no gap after the last
+        // note.
+        lookout.since = Some(now);
         assert_eq!(lookout.wake_due(now), None);
-        assert_eq!(lookout.wake_due(now + updates::WAKE), Some(false));
+        assert_eq!(lookout.wake_due(now + SETTLE), Some(false));
+        // A check still under way holds it a while longer.
+        lookout.checking = 1;
+        assert_eq!(lookout.wake_due(now + SETTLE), None);
+        assert_eq!(lookout.wake_due(now + SETTLE_MAX), Some(false));
+        lookout.checking = 0;
         // And for the lead to rest; a steer does not.
         lookout.event(&ev("calc.lead", 2, "accepted", json!({})));
-        assert_eq!(lookout.wake_due(now + updates::WAKE), None);
+        assert_eq!(lookout.wake_due(now + SETTLE), None);
         lookout.urgent = Some(true);
         assert_eq!(lookout.wake_due(now), Some(true));
         // A refused note is not sent again on every event.
