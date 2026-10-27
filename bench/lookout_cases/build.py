@@ -245,7 +245,7 @@ def subscribe(store, lead, project):
     which is what the lookout replays the lead's checks for."""
     folder = store.parent / f'{store.name}.lookout'
     folder.mkdir(exist_ok=True)
-    sub = {'name': 'tasks', 'on': ['said', 'ended', 'waiting', 'quiet'],
+    sub = {'name': 'tasks', 'on': ['said', 'ended'],
            'tasks_of': [lead], 'bots': [f'{project}.*'], 'updates': True}
     (folder / f'{lead}.json').write_text(json.dumps({'subscriptions': [sub]}, indent=2) + '\n')
 

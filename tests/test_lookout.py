@@ -54,7 +54,9 @@ class LookoutTests(ModelFixture):
     def test_a_model_the_daemon_serves_judges_each_check_on_a_fork(self):
         self.make('calc.lead', 'calc.fix')
         self.subscribe('calc.lead', 'calc')
-        turn = self.daemon.request('submit', bot='calc.fix', request_id='a', prompt='fix the parser')['result']['turn']
+        # Asked for by a program, not by the person, so its result is news.
+        turn = self.daemon.request('submit', bot='calc.fix', request_id='a', prompt='fix the parser',
+                                   origin='tasks')['result']['turn']
         self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
 
         def replay():
@@ -118,7 +120,7 @@ class LookoutTests(ModelFixture):
         self.model.reply_for = reply
         for n, (bot, prompt) in enumerate([('calc.lead', 'plan the parser work'), ('calc.fix', 'fix the parser'),
                                            ('calc.lead', 'words after the task ended')]):
-            turn = self.daemon.request('submit', bot=bot, request_id=f'r{n}', prompt=prompt)['result']['turn']
+            turn = self.daemon.request('submit', bot=bot, request_id=f'r{n}', prompt=prompt, origin='tasks')['result']['turn']
             self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
         out = self.lookout('--replay', '--judge', 'lead,openai/judge-model+lead')
         self.assertEqual(out.returncode, 0, out.stderr)
@@ -186,7 +188,7 @@ class LookoutTests(ModelFixture):
         # The lookout reads its follow replay first: the turn is news only
         # once it is live.
         time.sleep(1)
-        self.daemon.request('submit', bot='calc.fix', request_id='b', prompt='fix the lexer')
+        self.daemon.request('submit', bot='calc.fix', request_id='b', prompt='fix the lexer', origin='tasks')
         deadline = time.monotonic() + 30
         woke = None
         while woke is None and time.monotonic() < deadline:
