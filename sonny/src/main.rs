@@ -119,7 +119,9 @@ fn usage() -> String {
      the person above the composer until they answer it.\n\
      sonny lookout [--judge PROVIDER/MODEL|off] watches every lead on the daemon and\n\
      wakes it when its tasks need it; Sonny starts one. sonny lookout --replay --judge\n\
-     SPEC[,SPEC]... [--limit N] runs its checks over what the store kept."
+     SPEC[,SPEC]... [--limit N] runs its checks over what the store kept.\n\
+     sonny view FILE [--browser] shows a file beside the lead, drawn again as it changes.\n\
+     sonny agent ARGS... runs Sonny's own `agent` with ARGS, whatever `agent` is on PATH."
         .into()
 }
 
@@ -287,6 +289,16 @@ fn installed_agent(me: &std::path::Path) -> Vec<PathBuf> {
         found.push(prefix.join("opt/agent/bin/agent"));
     }
     found
+}
+
+/// `sonny agent ARGS...`: the `agent` Sonny itself starts, run with
+/// ARGS and the same keys, in place of this process, so the person reaches
+/// it whatever else is called `agent` on their PATH.
+fn pass_to_agent(args: &[String]) -> Result<(), String> {
+    let bin = agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
+    let mut command = agent_command(&bin)?;
+    let error = std::os::unix::process::CommandExt::exec(command.args(args));
+    Err(format!("{}: {error}", bin.display()))
 }
 
 /// Agent's binary to run, with the provider keys the app keeps in
@@ -518,6 +530,7 @@ fn main() -> std::process::ExitCode {
         Some((ask, rest)) if ask == "ask" => asks::run(rest),
         Some((lookout, rest)) if lookout == "lookout" => lookout::run(rest),
         Some((view, rest)) if view == "view" => view::run(rest),
+        Some((agent, rest)) if agent == "agent" => pass_to_agent(rest),
         _ => tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()

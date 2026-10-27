@@ -6,6 +6,7 @@ app; nothing in the daemon or CLI knows it exists.
 
     brew install lydakis/agent/sonny         # Sonny, and the daemon's `agent` formula with it
     brew install lydakis/agent/agent         # just the daemon
+    sonny agent ls --pretty                  # the daemon's CLI, as Sonny runs it
 
 Both formulas build from the release's source on your machine (macOS or
 Linux), so nothing is signed; Sonny starts the `agent` formula's daemon by its
@@ -14,7 +15,9 @@ Linux), so nothing is signed; Sonny starts the `agent` formula's daemon by its
 Sonny in `bin/` and its daemon in `libexec/`. Unpack it anywhere and run
 `bin/sonny`. With `cargo install`, build both (`--path .` for `agent` and
 `--path sonny`) and set `AGENT_BIN` to that `agent`; Sonny never takes an
-`agent` from `PATH`, which may be another program.
+`agent` from `PATH`, which may be another program. `sonny agent ARGS` runs
+the one Sonny uses, with the keys in `~/.agent/env`, whatever else is called
+`agent` on your `PATH`.
 
     sonny                                    # this folder's coordinator, <project>.lead
     sonny --model PROVIDER/MODEL             # the same, making the project the first time
