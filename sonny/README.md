@@ -6,6 +6,10 @@ app; nothing in the daemon or CLI knows it exists.
 
     brew install lydakis/agent/sonny         # Sonny, with a daemon of its own version
 
+On Linux, each release has `sonny-VERSION-linux-ARCH.tar.gz` (x86_64 and
+aarch64): static builds of Sonny in `bin/` and its daemon in `libexec/`.
+Unpack it anywhere and run `bin/sonny`.
+
     sonny                                    # this folder's coordinator, <project>.lead
     sonny --model PROVIDER/MODEL             # the same, making the project the first time
     sonny --bot NAME                         # any one bot
