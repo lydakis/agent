@@ -1727,6 +1727,9 @@ impl Service {
             let file = subscribers.get(name).cloned().unwrap_or_default();
             lookout.subs = subs::effective(lead_project(name).is_some(), name, file);
             lookout.roots(&self.records);
+            let mut held = std::mem::take(&mut lookout.held);
+            held.retain_mut(|item| lookout.still_asked(item));
+            lookout.held = held;
         }
     }
 
@@ -2362,6 +2365,28 @@ impl Lookout {
         }
     }
 
+    /// Keeps an item's look-fors only while its subscription still asks
+    /// the same under the name the note gives: one replaced since would
+    /// have the note name another action. Whether anything is left to tell.
+    fn still_asked(&self, item: &mut Item) -> bool {
+        if item.looks.is_empty() {
+            return true;
+        }
+        let asked = |label: &str| {
+            let look = (item.seen.asks.looks.iter()).find(|(l, _)| l == label);
+            (self.subs.iter()).any(|sub| {
+                (sub.look_for.iter().enumerate()).any(|(n, now)| {
+                    look.is_some_and(|(l, look)| {
+                        *l == format!("{} look-for {}", sub.name, n + 1) && look == now
+                    })
+                })
+            })
+        };
+        let looks = std::mem::take(&mut item.looks);
+        item.looks = looks.into_iter().filter(|(l, _)| asked(l)).collect();
+        !item.reasons.is_empty() || !item.looks.is_empty()
+    }
+
     fn approvals_due(&mut self) {
         let now = Instant::now();
         let due: Vec<(String, i64)> = self
@@ -2443,12 +2468,16 @@ impl Lookout {
                         },
                         ..seen
                     };
-                    self.held.push(Item {
+                    let mut item = Item {
                         seen,
                         reasons,
                         looks,
                         band,
-                    });
+                    };
+                    // Subscriptions may have changed while it was judged.
+                    if self.still_asked(&mut item) {
+                        self.held.push(item);
+                    }
                 }
             }
             Err(Failure::Quota) => {
@@ -3334,6 +3363,49 @@ mod tests {
     }
 
     #[test]
+    fn a_look_for_replaced_since_it_was_asked_is_not_acted_on() {
+        let mut lookout = lookout();
+        let look = |then: &str| subs::Look {
+            text: "a deploy".into(),
+            then: then.into(),
+            urgent: false,
+        };
+        let mut deploys = sub("deploys", &[], &["ops.*"]);
+        deploys.look_for.push(look("announce it"));
+        lookout.subs = vec![deploys.clone()];
+        let asks = lookout.asks_for("ops.x", Kind::Ended).unwrap();
+        let item = |reasons: Reasons| Item {
+            seen: Seen {
+                task: "ops.x".into(),
+                turn: 1,
+                kind: Kind::Ended,
+                from: None,
+                status: Some("completed".into()),
+                node: None,
+                call: None,
+                brief: None,
+                peers: Vec::new(),
+                asks: asks.clone(),
+                text: String::new(),
+            },
+            reasons,
+            looks: vec![("deploys look-for 1".into(), 0.9)],
+            band: Band::Wake { steer: false },
+        };
+        let mut kept = item(Vec::new());
+        assert!(lookout.still_asked(&mut kept));
+        assert_eq!(kept.looks.len(), 1);
+        // Replaced under the same name with another action.
+        deploys.look_for[0] = look("roll back");
+        lookout.subs = vec![deploys];
+        let mut stale = item(Vec::new());
+        assert!(!lookout.still_asked(&mut stale));
+        let mut reasoned = item(vec![("result", 0.9)]);
+        assert!(lookout.still_asked(&mut reasoned));
+        assert!(reasoned.looks.is_empty());
+    }
+
+    #[test]
     fn a_bot_seated_late_watches_what_it_made_already() {
         let mut lookout = Lookout::new("", "reviewer", PathBuf::from("/"), None);
         lookout.subs = vec![sub("mine", &["reviewer"], &[])];
@@ -3682,12 +3754,7 @@ mod tests {
         assert!(lookout.due.is_empty());
         // A turn already running when its bot came to be watched is
         // tracked from what it does next.
-        lookout.event(&ev(
-            "calc.fix",
-            8,
-            "tool_started",
-            json!({"name": "shell"}),
-        ));
+        lookout.event(&ev("calc.fix", 8, "tool_started", json!({"name": "shell"})));
         lookout.quiet_due(Instant::now() + 2 * QUIET_AFTER);
         assert_eq!((lookout.due[0].kind, lookout.due[0].turn), (Kind::Quiet, 8));
     }
