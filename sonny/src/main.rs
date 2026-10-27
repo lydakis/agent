@@ -37,6 +37,7 @@ mod table;
 mod task;
 mod term;
 mod transcript;
+mod view;
 
 use agent_client::{Client, Events};
 use ratatui::{
@@ -516,6 +517,7 @@ fn main() -> std::process::ExitCode {
         Some((task, rest)) if task == "task" => task::run(rest),
         Some((ask, rest)) if ask == "ask" => asks::run(rest),
         Some((lookout, rest)) if lookout == "lookout" => lookout::run(rest),
+        Some((view, rest)) if view == "view" => view::run(rest),
         _ => tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()

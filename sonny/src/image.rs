@@ -134,6 +134,47 @@ pub fn page(png: &[u8], width: usize) -> Result<Drawn, String> {
     })
 }
 
+/// A whole page's picture, its blank end cut off, as wide as the pane
+/// allows and cut across into pictures of at most [`ROWS`] rows each, to
+/// be shown one under another. Says whether the page ran past the shot.
+pub fn tiles(png: &[u8], width: usize) -> Result<(Vec<Drawn>, bool), String> {
+    let width = now(width);
+    let shot = tiny_skia::Pixmap::decode_png(png).map_err(|e| e.to_string())?;
+    let (w, h) = trimmed(&shot);
+    let (cell_w, cell_h) = crate::term::cell();
+    let (cw, ch) = (cell_w * up(cell_h), cell_h * up(cell_h));
+    let most_cols = (width.saturating_sub(4) as u32).clamp(1, DIACRITICS.len() as u32);
+    let cols = w.div_ceil(cw).clamp(1, most_cols);
+    let scale = ((cols * cw) as f32 / w as f32).min(1.0);
+    let tall = ((h as f32 * scale) as u32).div_ceil(ch).max(1);
+    let mut out = Vec::new();
+    let mut top = 0;
+    while top < tall {
+        let rows = (tall - top).min(ROWS);
+        let mut canvas = tiny_skia::Pixmap::new(cols * cw, rows * ch).ok_or("image too large")?;
+        canvas.draw_pixmap(
+            0,
+            0,
+            shot.as_ref(),
+            &tiny_skia::PixmapPaint {
+                quality: tiny_skia::FilterQuality::Bicubic,
+                ..Default::default()
+            },
+            tiny_skia::Transform::from_scale(scale, scale)
+                .post_translate(0.0, -((top * ch) as f32)),
+            None,
+        );
+        out.push(Drawn {
+            png: canvas.encode_png().map_err(|e| e.to_string())?,
+            cols,
+            rows,
+            cut: false,
+        });
+        top += rows;
+    }
+    Ok((out, h == shot.height()))
+}
+
 /// The width and height a screenshot keeps once the rows and columns at
 /// its right and bottom that are all its background are dropped.
 fn trimmed(shot: &tiny_skia::Pixmap) -> (u32, u32) {
@@ -242,6 +283,33 @@ fn placeholders(id: u32, cols: u32, rows: u32) -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tall_page_is_cut_into_pictures_one_under_another() {
+        // A page 400 pixels wide, drawn to its bottom.
+        let mut shot = tiny_skia::Pixmap::new(400, 3000).unwrap();
+        shot.fill(tiny_skia::Color::WHITE);
+        let mut ink = tiny_skia::Paint::default();
+        ink.set_color(tiny_skia::Color::BLACK);
+        let line = tiny_skia::Rect::from_xywh(10.0, 0.0, 300.0, 3000.0).unwrap();
+        shot.fill_rect(line, &ink, tiny_skia::Transform::identity(), None);
+        let (tiles, cut) = tiles(&shot.encode_png().unwrap(), 200).unwrap();
+        assert!(cut, "drawn to its last row, it goes on past the shot");
+        assert!(tiles.len() > 1);
+        assert!(
+            tiles
+                .iter()
+                .all(|tile| tile.rows <= ROWS && tile.cols == tiles[0].cols)
+        );
+        let (cell_w, cell_h) = crate::term::cell();
+        let (cw, ch) = (cell_w * up(cell_h), cell_h * up(cell_h));
+        let rows: u32 = tiles.iter().map(|tile| tile.rows).sum();
+        // As wide as the ink and its margin, scaled down to the columns.
+        let (w, h) = trimmed(&shot);
+        assert_eq!(h, 3000);
+        let scale = ((tiles[0].cols * cw) as f32 / w as f32).min(1.0);
+        assert_eq!(rows, ((h as f32 * scale) as u32).div_ceil(ch));
+    }
 
     #[test]
     fn a_picture_fits_the_pane_and_keeps_its_shape() {

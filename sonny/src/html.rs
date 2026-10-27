@@ -14,6 +14,12 @@ const WINDOW_HEIGHT: u32 = 1600;
 /// The page at `path` as a PNG, `css_width` CSS pixels wide at twice
 /// that in device pixels; or why not.
 pub fn render(path: &Path, css_width: u32) -> Result<Vec<u8>, String> {
+    shoot(path, css_width, WINDOW_HEIGHT, 2)
+}
+
+/// The page at `path` as a PNG `height` CSS pixels tall, `scale` device
+/// pixels to each; with Quick Look, only as tall as it draws.
+pub fn shoot(path: &Path, css_width: u32, height: u32, scale: u32) -> Result<Vec<u8>, String> {
     let out = std::env::temp_dir().join(format!("sonny-shot-{}", std::process::id()));
     std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
     let shot = match chrome() {
@@ -36,8 +42,8 @@ pub fn render(path: &Path, css_width: u32) -> Result<Vec<u8>, String> {
                     cfg!(target_os = "macos")
                         .then(|| format!("--user-data-dir={}", out.join("profile").display())),
                 )
-                .arg("--force-device-scale-factor=2")
-                .arg(format!("--window-size={css_width},{WINDOW_HEIGHT}"))
+                .arg(format!("--force-device-scale-factor={scale}"))
+                .arg(format!("--window-size={css_width},{height}"))
                 .arg(format!("--screenshot={}", png.display()))
                 // Chrome will not run as root sandboxed (a container).
                 .args(root().then_some("--no-sandbox"))
@@ -50,7 +56,7 @@ pub fn render(path: &Path, css_width: u32) -> Result<Vec<u8>, String> {
             command
                 .arg("-t")
                 .arg("-s")
-                .arg((css_width * 2).to_string())
+                .arg((css_width * scale).to_string())
                 .arg("-o")
                 .arg(&out)
                 .arg(path);
