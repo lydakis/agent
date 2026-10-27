@@ -343,7 +343,8 @@ struct Accounting {
     summary_retry_at: u64,
     /// The model has replied in this task, so a reply with nothing in it,
     /// as after a reaction with nothing to add, ends the turn rather than
-    /// failing it. An empty reply to a prompt, or an empty summary, fails.
+    /// failing it. An empty reply to a prompt fails; an empty summary is
+    /// the summary's own failure.
     answered: bool,
 }
 impl Accounting {
@@ -2772,7 +2773,8 @@ impl Turn {
                 Ok(completion)
                     if completion.items.is_empty()
                         && completion.calls.is_empty()
-                        && (summary || !accounting.answered) =>
+                        && !summary
+                        && !accounting.answered =>
                 {
                     Err(Error::new("empty_completion"))
                 }
