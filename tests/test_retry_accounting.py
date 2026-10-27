@@ -24,7 +24,7 @@ class RetryAccountingTests(ModelFixture):
         self.model.retry_delays = ['0.05', '0.05', '10']
         client = self.client()
         turn = self.submit(client, 'Bob', 'limited-forever:cancel')
-        client.receive(lambda e: e.get('event') == 'retry' and e.get('attempt') == 3)
+        client.receive(lambda e: e.get('event') == 'retry' and e['data'].get('attempt') == 3)
         row = self.interrupt(client, 'Bob', turn)
         self.assertEqual(self.model.requests.qsize(), 3)
         self.assertEqual(row['retries'], 2)

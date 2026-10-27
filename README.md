@@ -37,7 +37,8 @@ cargo install --locked --path .
 That puts `agent` in `~/.cargo/bin`. With [Homebrew](https://brew.sh),
 `brew install lydakis/agent/agent` builds the same from a release's source;
 `brew install lydakis/agent/sonny` adds [Sonny](#sonny), the terminal
-client, and pulls in `agent` with it.
+client, and pulls in `agent` with it. If Homebrew refuses the tap as
+untrusted, run `brew trust lydakis/agent` first.
 
 ## Quickstart
 

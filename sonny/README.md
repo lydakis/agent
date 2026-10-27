@@ -79,8 +79,20 @@ The skill tells agents to close what they opened once read; whatever a task
 left open closes with its window.
 
 Enter sends (and steers a running turn), Esc interrupts, `y`/`n` answer a
-pending approval, Ctrl-C clears the composer or quits. `/` lists the
-commands:
+pending approval, Ctrl-C clears the composer or quits.
+
+`!COMMAND` runs a command of your own with your shell, in the agent's
+folder, in any agent's window: the lead's or a task's. You see what it
+printed at once, and as soon as it ends the agent is given it too, in
+Codex's `<user_shell_command>` record (the command, its exit code and its
+output, a long output's start and end), and answers it as Claude Code's
+does: an idle agent in a turn of its own, a busy one in its running turn,
+as a steer. What it printed is not your words, so it approves nothing the
+agent then does. Esc stops a command still running.
+
+![A command run with !, its output, and the agent answering it](../docs/sonny/shell-passthrough.gif)
+
+`/` lists the commands:
 
 - `/side [QUESTION]` opens a side chat with a copy of the agent in this
   window, taken where it is now, mid-turn included, on the alternate
@@ -138,7 +150,8 @@ commands:
   sets the questions aside for a message of your own, and Esc again goes
   back to them. They wait in `~/.agent/sonny/asks/`, one file each, kept apart by store and bot id.
 - `/copy` puts the last reply on the clipboard; `/open` opens the last
-  HTML page in a browser; `/sound` turns the chime off or on; `/quit`
+  HTML page in a browser; `/sound` turns the chime off or on; `/verbose`
+  switches between the clean view and every tool call; `/quit`
   leaves the agents working.
 
 Settings Sonny keeps for every folder are in `~/.agent/sonny/settings.json`.
@@ -167,8 +180,8 @@ did in one "Task updates" note, by the handles its wait tool reads them
 with, and steers it at once only for a message that redirects other tasks
 or work that collides with another task's; what else the judge picks, such
 as a stuck task or a result the person should hear, is flagged in the next
-note. It judges with `AGENT_JUDGE`, the approver's setting, so Bedrock alone
-is enough, and with no judge sends the task updates alone. Any agent can
+note. It judges with `AGENT_JUDGE`, the approver's setting, else the lead's
+own model, and with the judge `off` sends the task updates alone. Any agent can
 subscribe to more with `sonny lookout add` (other agents' tasks, bots by
 name, questions of its own), and `/lookout` lists what it watches; see
 [docs/LOOKOUT.md](../docs/LOOKOUT.md).
@@ -180,5 +193,12 @@ short `└` look at its result, edits show as a diff, and a status row says
 `Working (12s • esc to interrupt)`. The steps on the way, calls and what
 the bot said before each, are dim; the reply stays bright, under the
 turn's `Worked for …` line.
+
+The view is clean by default: the bot's words, and only the calls that
+move the work on, said as what they did (a task started, messaged or
+waited for, a question to you, the plan, memory, a trigger, a window
+opened). Commands, reads and edits are left out. `/verbose` draws every
+call, the conversation so far included, and is kept with the other
+settings; `/verbose` again goes back to clean.
 
 `demo/` has the scripted model and folder the recordings use.

@@ -1,6 +1,6 @@
 [package]
 name = "agent-client"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.92"
 license = "MIT OR Apache-2.0"
@@ -13,6 +13,8 @@ libc = "0.2"
 serde_json = "1"
 # Reads a project's name from `.agents/project.toml`.
 toml = "0.9"
+# Asks OpenAI's Decisions API for a judge.
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream", "http2"] }
 tokio = { version = "1", features = ["rt", "net", "sync", "io-util", "time"] }
 
 [dev-dependencies]

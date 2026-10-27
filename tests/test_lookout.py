@@ -81,7 +81,7 @@ class LookoutTests(ModelFixture):
         self.daemon.request('delete', bot=bots[0])
         self.daemon.request('create', bot=bots[0], workspace=str(self.path), model='openai/judge-model',
                             instructions='Do anything.', tools=['echo'])
-        self.assertIn('is a bot that is not a lookout judge', replay()['Ended']['failed'])
+        self.assertIn('judge_name_taken', replay()['Ended']['failed'])
 
     def test_a_check_of_the_person_s_words_reads_what_passed_before(self):
         self.make('calc.lead', 'calc.fix')

@@ -99,7 +99,7 @@ struct Options {
     request: Option<i64>,
     tag: Option<String>,
     reason: Option<String>,
-    /// `approver`: the environment note file, the judge, and Jev's URL.
+    /// `approver`: the environment note file, the judge, and the Decisions API's URL.
     note: Option<PathBuf>,
     judge: Option<String>,
     judge_url: Option<String>,
@@ -698,15 +698,6 @@ fn ensure_daemon(options: &Options) -> Result<Connection> {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    // The judge's key is the approver's alone, unless a provider the daemon
-    // runs names it as its key variable.
-    let provider_key = options.providers.iter().any(|spec| {
-        crate::server::ProviderSpec::parse(spec)
-            .is_ok_and(|spec| spec.key_env.as_deref() == Some(JUDGE_KEY))
-    });
-    if !provider_key {
-        command.env_remove(JUDGE_KEY);
-    }
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
@@ -864,28 +855,6 @@ fn bot_model(bot: &Value) -> Option<String> {
     ))
 }
 
-fn judge_key() -> Option<String> {
-    std::env::var(JUDGE_KEY).ok().filter(|key| !key.is_empty())
-}
-
-/// Who judges for an approver: `--judge` or AGENT_JUDGE, then Jev
-/// when its key is set, then `model`.
-fn judge(options: &Options, model: Option<String>) -> Result<String> {
-    options
-        .judge
-        .clone()
-        .or_else(|| judge_key().map(|_| "typesafe/jev-latest".into()))
-        .or(model)
-        .ok_or_else(|| {
-            Error::with(
-                "judge_required",
-                format!(
-                    "auto needs a judge: pass --judge PROVIDER/MODEL, or set AGENT_JUDGE, {JUDGE_KEY}, or AGENT_MODEL"
-                ),
-            )
-        })
-}
-
 /// Whether the approver `pid` logged that it serves, after byte `start`.
 fn serving(log: &std::ffi::OsStr, start: u64, pid: u32) -> Result<bool> {
     use std::io::{BufRead, Seek};
@@ -903,8 +872,8 @@ fn serving(log: &std::ffi::OsStr, start: u64, pid: u32) -> Result<bool> {
 }
 
 /// An `auto` bot needs an approver serving `auto`. If none is, start one:
-/// detached, logging its verdicts next to the store, judged by the model
-/// `judge` picks, with the bot's own as the last choice.
+/// detached, logging its verdicts next to the store, judged by the judge it
+/// picks, with the bot's own model as the last choice.
 fn ensure_approver(
     options: &Options,
     connection: &mut Connection,
@@ -919,7 +888,6 @@ fn ensure_approver(
     if served(connection)? {
         return Ok(());
     }
-    let judge = judge(options, model)?;
     let mut log = options.store.clone().into_os_string();
     log.push(".approver.log");
     let path = log;
@@ -935,9 +903,13 @@ fn ensure_approver(
         .arg("--store")
         .arg(&options.store)
         .arg("--socket")
-        .arg(&options.socket)
-        .arg("--judge")
-        .arg(&judge);
+        .arg(&options.socket);
+    if let Some(judge) = &options.judge {
+        command.arg("--judge").arg(judge);
+    }
+    if let Some(model) = model {
+        command.env("AGENT_MODEL", model);
+    }
     if let Some(note) = &options.note {
         command.arg("--note").arg(note);
     }
@@ -1787,8 +1759,7 @@ fn whole_arguments(connection: &mut Connection, calls: &mut [Value]) -> Result<(
 /// Allow or deny one gated call. The request number is required, so a
 /// decision made on what a person saw cannot land on a call announced
 /// again since.
-/// The judge's key, which only the approver holds.
-const JUDGE_KEY: &str = agent_runtime::tools::JUDGE_KEY;
+/// The Decisions API's key, which only the approver holds.
 const DECISIONS_KEY: &str = agent_runtime::tools::DECISIONS_KEY;
 
 /// The approver's note: a regular file no larger than a judge's whole
@@ -1825,49 +1796,15 @@ fn note(path: &Path) -> Result<String> {
 /// call; runs until the daemon goes away or another session takes the tag.
 fn approver(options: &Options) -> Result<i32> {
     let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
-    let judge = judge(options, env("AGENT_MODEL"))?;
     let note = options.note.as_deref().map(note).transpose()?;
-    // Jev is `typesafe/jev-*` and OpenAI's Decisions API is
-    // `openai-decisions/MODEL`; any other name, a daemon provider called
-    // `typesafe` included, runs through the daemon.
-    let jev = judge
-        .strip_prefix("typesafe/")
-        .filter(|model| model.starts_with("jev-"));
-    let decisions = judge.strip_prefix("openai-decisions/");
-    let judge = match (jev, decisions) {
-        (_, Some(model)) => crate::approver::JudgeSpec::Decisions {
-            url: options
-                .judge_url
-                .clone()
-                .unwrap_or_else(|| "https://api.openai.com".into()),
-            model: model.to_owned(),
-            key: env(DECISIONS_KEY).ok_or_else(|| {
-                Error::with(
-                    "judge_key_required",
-                    format!("set {DECISIONS_KEY} for the Decisions API"),
-                )
-            })?,
-        },
-        (Some(model), None) => crate::approver::JudgeSpec::Jev {
-            url: options
-                .judge_url
-                .clone()
-                .or_else(|| env("TYPESAFE_BASE_URL"))
-                .unwrap_or_else(|| "https://api.typesafe.ai".into()),
-            model: model.to_owned(),
-            key: judge_key().ok_or_else(|| {
-                Error::with("judge_key_required", format!("set {JUDGE_KEY} for Jev"))
-            })?,
-        },
-        (None, None) => crate::approver::JudgeSpec::Model {
-            model: judge,
-            effort: options.effort.clone(),
-        },
-    };
     crate::approver::main(crate::approver::Settings {
         socket: options.socket.clone(),
         tag: options.tag.clone().unwrap_or_else(|| "auto".into()),
-        judge,
+        judge: options.judge.clone(),
+        caller: env("AGENT_MODEL"),
+        effort: options.effort.clone(),
+        url: options.judge_url.clone(),
+        key: env(DECISIONS_KEY),
         note,
     })
 }
