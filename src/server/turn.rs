@@ -958,8 +958,9 @@ impl Turn {
         }
         let _held = Held::from_now(&self.side.summary_ms);
         // Beside the call, a summary holds a copy's call and a request of
-        // its own against the round limit.
-        let beside = beside.filter(|_| fits && *model_rounds + 2 < MAX_ROUNDS);
+        // its own against the round limit. One a client asked for goes
+        // before the call, as asked, and stays asked until it ends.
+        let beside = beside.filter(|_| !requested && fits && *model_rounds + 2 < MAX_ROUNDS);
         let mut spent = Accounting {
             route: accounting.route.clone(),
             ..Accounting::default()
@@ -2588,7 +2589,7 @@ impl Turn {
         // is refreshed while it streams.
         // A refresh renders the turn's request with its calls allowed, so
         // it would not read what a call without them sent.
-        let warm_after = match body {
+        let mut warm_after = match body {
             Body::Window(_) if tool_calls => {
                 provider.keep_warm_after(model, record.effort.as_deref())
             }
@@ -2598,7 +2599,21 @@ impl Turn {
         // Replayed thinking a 400 may have come from, withheld from this
         // call's later attempts.
         let mut withheld = None;
+        let mut tool_calls = tool_calls;
         loop {
+            // A billed attempt that failed counts as a round: the retry that
+            // is the turn's last allowed call goes without calls, as that
+            // call would have.
+            if tool_calls && matches!(body, Body::Window(_)) && *model_rounds + 1 >= MAX_ROUNDS {
+                (tool_calls, warm_after) = (false, None);
+                self.hub
+                    .live(
+                        &self.bot,
+                        json!({"event":"tool_calls_withheld","bot":self.bot,"turn":turn,
+                            "durable":false,"reason":"tool_round_limit"}),
+                    )
+                    .await?;
+            }
             let items = match body {
                 Body::Window(context) => self.items(context, withheld.unwrap_or(context.thinking)),
                 Body::Copied(copy) => self.copied_items(copy),

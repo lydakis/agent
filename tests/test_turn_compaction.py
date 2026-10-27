@@ -164,6 +164,19 @@ class TurnCompactionTests(ModelFixture):
         self.assertEqual(requests[-1]['tool_choice'], 'none')
         self.assertFalse(any('tool_choice' in r for r in requests[:-1]))
 
+    def test_a_billed_retry_that_is_the_last_round_calls_no_tools(self):
+        # The 199th call is billed and fails; its retry is the 200th round,
+        # so it goes without calls and the turn ends on its reply.
+        self.model.fail_billed_at = 199
+        client = self.client(tools='shell')
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'])
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:250x1')['result']['turn']
+        ended = client.finished(turn, timeout=90)
+        self.assertEqual(ended['data']['status'], 'completed', ended)
+        requests = drain(self.model)
+        self.assertEqual(len(requests), 200)
+        self.assertEqual([r.get('tool_choice') for r in requests[-2:]], [None, 'none'])
+
     def test_a_bot_compacts_once_its_calls_reach_its_token_threshold(self):
         # Four bytes a token, so 16K tokens is about 64 KiB: far under the
         # byte budget, which alone never makes forty 11 KiB rounds compact.
@@ -233,12 +246,16 @@ class TurnCompactionTests(ModelFixture):
         record = client.request('inspect', bot='Bob')['result']
         self.assertFalse(record['compaction_requested'])
         self.assertIsNotNone(record['compaction'])
-        # Running: the next round boundary takes it.
-        self.model.summary_delay = 0
+        # Running: the next round boundary takes it, once however often it
+        # is asked while its summary runs.
+        self.model.summary_delay = 1.0
         turn = client.request('submit', bot='Bob', request_id='long', prompt='long:30x40')['result']['turn']
         client.receive(lambda e: e.get('event') == 'tool_completed' and e.get('turn') == turn)
         asked = client.request('compact', bot='Bob')['result']
         self.assertEqual(asked['running_turn'], turn)
+        while not is_summary(self.model.requests.get(timeout=10)):
+            pass
+        self.assertTrue(client.request('compact', bot='Bob')['result']['duplicate'])
         self.assertEqual(client.finished(turn, timeout=30)['data']['status'], 'completed')
         compacted = [e for e in all_events(client, 'Bob') if e['event'] == 'compacted' and e['turn'] == turn]
         self.assertEqual(len(compacted), 1)

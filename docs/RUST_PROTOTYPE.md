@@ -1709,7 +1709,7 @@ counters. Retries are on by default because they cannot repeat an effect; what t
 billing for a failed attempt, which is recorded as failed usage. Successful
 model responses and failures with reported usage share the durable limit of
 200 model rounds per turn, including across parking and restart. The last
-of them goes with the bot's tools shown but `tool_choice` `none` (both
+of them, a retry included when a billed failure made it the last, goes with the bot's tools shown but `tool_choice` `none` (both
 families), so the model must answer in words, and the turn ends on that reply
 instead of failing with its work done and unreported; a live
 `tool_calls_withheld` event (`reason: "tool_round_limit"`) marks it. That call
@@ -2329,7 +2329,9 @@ A client may also ask for a summary with `compact` (protocol 17;
 Sonny's `/compact`). It is kept on the bot, so a parked turn or a restarted
 daemon still takes it: a running turn's next round boundary, or an idle
 bot's next turn before its first call, summarizes everything older than the
-newest boundary, whatever the thresholds, as an overflow would. The answer
+newest boundary, whatever the thresholds, as an overflow would, before the
+call rather than beside it. It stays pending until that summary ends, a
+summary that parks on a closed pool included. The answer
 names the bot, its identity and `running_turn`; a request while one is
 pending answers `duplicate: true` and changes nothing; a bot without
 compaction instructions answers `compaction_unavailable`. Followers get a

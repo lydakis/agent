@@ -428,6 +428,11 @@ class Model(http.server.BaseHTTPRequestHandler):
             if user.startswith('streamlimit-flat:') and attempt == 1:
                 events = [{'type': 'error', 'code': 'rate_limit_exceeded',
                            'message': 'Please try again in 300ms.', 'param': None, 'sequence_number': 1}]
+            if getattr(self.server, 'fail_billed_at', None) == attempt:
+                # A billed attempt the provider then fails, to be retried.
+                events = [{'type': 'response.failed', 'response': {'status': 'failed',
+                    'usage': {'input_tokens': 100, 'output_tokens': 10}, 'error': {
+                    'code': 'rate_limit_exceeded', 'message': 'Please try again in 1ms.'}}}]
             if user.startswith('tool:billed-retry:') and attempt == 1:
                 events = [{'type': 'response.failed', 'response': {'status': 'failed',
                     'usage': {'input_tokens': 100, 'output_tokens': 10}, 'error': {

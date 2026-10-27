@@ -2315,14 +2315,15 @@ impl Service {
                         )
                     })
                     .await?;
-                if let Some(active) = self.active.get(&bot) {
-                    active
-                        .compact
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-                // Followers see it once; a resend while it is pending
-                // answers `duplicate: true`.
+                // Followers see it once, and a running turn takes it once: a
+                // resend while it is pending answers `duplicate: true` and
+                // changes nothing.
                 if answer["duplicate"] == false {
+                    if let Some(active) = self.active.get(&bot) {
+                        active
+                            .compact
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                     let mut event = answer.clone();
                     event["event"] = json!("compaction_requested");
                     event["durable"] = json!(false);
