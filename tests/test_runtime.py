@@ -299,6 +299,21 @@ class Model(http.server.BaseHTTPRequestHandler):
                     text = 'echo:' + json.dumps(outputs[-1])
                     output = [{'type': 'message', 'role': 'assistant',
                                'content': [{'type': 'output_text', 'text': text}]}]
+            elif user.startswith('sayslow:'):
+                # An answer and a slow command in one response, then a word
+                # for whatever steered it.
+                start = max(n for n, i in enumerate(request['input']) if i.get('role') == 'user'
+                            and not i['content'][0]['text'].startswith('steer:'))
+                if not any(i.get('type') == 'function_call_output' for i in request['input'][start:]):
+                    text = user[8:]
+                    output = [{'type': 'message', 'role': 'assistant',
+                               'content': [{'type': 'output_text', 'text': text}]},
+                              {'type': 'function_call', 'name': 'shell', 'call_id': 'slow-1',
+                               'arguments': json.dumps({'command': 'sleep 2'})}]
+                else:
+                    text = 'heard'
+                    output = [{'type': 'message', 'role': 'assistant',
+                               'content': [{'type': 'output_text', 'text': text}]}]
             elif user == 'cached:reused-call':
                 text = ''
                 output = [{'type': 'function_call', 'name': 'echo', 'call_id': 'same-id',
@@ -691,11 +706,19 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                     blocks.append({'type': 'text', 'text': f'done after {calls} rounds'})
                     stop = 'end_turn'
             elif last['content'][0]['type'] == 'tool_result':
-                blocks.append({'type': 'text', 'text': 'echo:' + last['content'][0]['content']})
+                # A result that says 'silent' is answered with nothing at all,
+                # as a reply after a reaction with nothing to add.
+                if last['content'][0]['content'].startswith('silent'):
+                    blocks = []
+                else:
+                    blocks.append({'type': 'text', 'text': 'echo:' + last['content'][0]['content']})
                 stop = 'end_turn'
             else:
                 user = last['content'][0]['text']
                 if user == 'think-only':
+                    stop = 'end_turn'
+                elif user == 'silent':
+                    blocks = []
                     stop = 'end_turn'
                 elif user.startswith('tool:'):
                     blocks.append({'type': 'tool_use', 'id': 'toolu_1', 'name': 'echo', 'input': {'text': user[5:]}})
@@ -751,6 +774,10 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                      'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 1, 'output_tokens': 7}]
             events.append(('message_delta', {'delta': {'stop_reason': stop}, 'usage': usage}))
             events.append(('message_stop', {}))
+            # An overload after the stream began, as Anthropic sends one.
+            if getattr(self.server, 'overloads', 0):
+                self.server.overloads -= 1
+                events = [events[0], ('error', {'error': {'type': 'overloaded_error', 'message': 'Overloaded'}})]
             # A slow start: the answer to 'hold' waits this long for its headers.
             held = last['content'][0].get('text') == 'hold'
             if held:
@@ -1006,6 +1033,30 @@ class AnthropicRuntimeTests(unittest.TestCase):
             {'type': 'tool_use', 'id': 'toolu_1', 'name': 'echo', 'input': {'text': 'kept'}}])
         self.assertEqual(second['messages'][2]['content'],
                          [{'type': 'tool_result', 'tool_use_id': 'toolu_1', 'content': 'kept'}])
+
+    def test_an_empty_reply_ends_a_turn_after_a_tool_call_and_fails_one_to_a_prompt(self):
+        client, model, path = self.start()
+        client.request('create', bot='Bob', workspace=str(path))
+        turn = client.request('submit', bot='Bob', request_id='r1', prompt='tool:silent')['result']['turn']
+        finished = client.finished(turn)
+        self.assertEqual(finished['data']['status'], 'completed')
+        self.assertEqual(len([m for m in client.saved if m.get('event') == 'usage']), 2)
+        # The history it left takes the next prompt.
+        turn = client.request('submit', bot='Bob', request_id='r2', prompt='hello')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        turn = client.request('submit', bot='Bob', request_id='r3', prompt='silent')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['error'], 'empty_completion')
+
+    def test_an_overload_mid_stream_is_retried_after_a_pause(self):
+        client, model, path = self.start()
+        model.overloads = 1
+        client.request('create', bot='Bob', workspace=str(path))
+        turn = client.request('submit', bot='Bob', request_id='r1', prompt='hello')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        retried = [m['data'] for m in client.saved if m.get('event') == 'retry']
+        self.assertEqual([r['error'] for r in retried], ['provider_http_529'])
+        self.assertEqual(retried[0]['detail'], 'Overloaded')
+        self.assertGreaterEqual(retried[0]['delay_ms'], 1600)
 
     def test_messages_family_round_trips_thinking_tools_and_usage(self):
         client, model, path = self.start()

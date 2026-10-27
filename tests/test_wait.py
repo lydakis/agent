@@ -231,6 +231,21 @@ class WaitTests(ModelFixture):
         self.assertEqual(client.finished(bad)['data']['status'], 'completed')
         self.assertEqual(self.tool_output(client, 'Bob', 'wait-1')['results']['turn:Nobody/1']['error'], 'turn_not_found')
 
+    def test_a_turn_handle_keeps_the_answer_a_steer_came_after(self):
+        client = self.client('echo,shell,wait')
+        client.request('create', bot='Alice', workspace=str(self.path))
+        alice = client.request('submit', bot='Alice', request_id='a', prompt='sayslow:the review')['result']
+        client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == alice['turn'])
+        client.request('submit', bot='Alice', request_id='s', prompt='steer:pause', delivery='steer')
+        self.assertEqual(client.finished(alice['turn'])['data']['status'], 'completed')
+        result = client.request('wait', handles=[alice['handle']])['result']['results'][alice['handle']]
+        self.assertEqual((result['text'], result['before_steer']), ('heard', 'the review'))
+        # A turn no steer reached has its final text alone.
+        plain = client.request('submit', bot='Alice', request_id='p', prompt='hello')['result']
+        client.finished(plain['turn'])
+        result = client.request('wait', handles=[plain['handle']])['result']['results'][plain['handle']]
+        self.assertNotIn('before_steer', result)
+
     def test_timeout_reports_pending_handles_and_interrupt_ends_a_parked_turn(self):
         client = self.client('echo,shell,wait')
         for bot in ('Bob', 'Alice', 'Carol'):
