@@ -4,13 +4,12 @@
 //! (`subs::Sub::lead`), and any bot can subscribe to more. Each message
 //! someone other than the subscriber writes in a task, and each turn a task
 //! ends, is one check: a few yes/no questions to the judge
-//! `agent_client::judge` picks, a small model on the lead's provider by
-//! default. A high answer to an urgent question steers the subscriber now;
-//! any other answer that is not low rides the next note, once the
-//! subscriber rests; a low one is only logged. One lookout watches a
-//! daemon, for every subscriber on it, started by the first Sonny to open;
-//! the daemon is unchanged: this follows every bot and submits to the
-//! subscribers like any client.
+//! `agent_client::judge` picks, the lead's own model by default. A high
+//! answer to an urgent question steers the subscriber now; any other answer
+//! that is not low rides the next note, once the subscriber rests; a low
+//! one is only logged. One lookout watches a daemon, for every subscriber
+//! on it, started by the first Sonny to open; the daemon is unchanged: this
+//! follows every bot and submits to the subscribers like any client.
 //!
 //! A subscriber hears it all in one note, which starts "Task updates: ":
 //! what the judge picked, and, when a subscription asks for them, the task
@@ -810,13 +809,11 @@ fn judge_bot(name: &str) -> bool {
 }
 
 /// The judge for a lead on `lead_model`: `--judge SPEC`, else
-/// `AGENT_JUDGE`, else the one `agent_client::judge` picks for the lead.
-/// `None` when it is `off`, which judges nothing.
-async fn pick(client: &Client, spec: Option<&str>, lead_model: &str) -> Option<String> {
+/// `AGENT_JUDGE`, else the lead's own model. `None` when it is `off`,
+/// which judges nothing.
+fn pick(spec: Option<&str>, lead_model: &str) -> Option<String> {
     let named = spec.map(str::to_owned).or_else(|| key(judge::VAR));
-    judge::pick(client, named.as_deref(), Some(lead_model))
-        .await
-        .filter(|spec| spec != "off")
+    judge::pick(named.as_deref(), Some(lead_model)).filter(|spec| spec != "off")
 }
 
 #[derive(Debug)]
@@ -1593,7 +1590,7 @@ impl Service {
             record["provider"].as_str().unwrap_or_default(),
             record["model"].as_str().unwrap_or_default()
         );
-        let judge = match self::pick(client, self.judge.as_deref(), &model).await {
+        let judge = match self::pick(self.judge.as_deref(), &model) {
             Some(spec) => self.judge_for(&spec, lead),
             None => None,
         };

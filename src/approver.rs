@@ -163,21 +163,16 @@ async fn serve(settings: Settings) -> Result<i32> {
     let (client, mut events) = Client::connect(&settings.socket)
         .await
         .map_err(Error::from)?;
-    let named = judge::pick(
-        &client,
-        settings.judge.as_deref(),
-        settings.caller.as_deref(),
-    )
-    .await
-    .ok_or_else(|| {
-        Error::with(
-            "judge_required",
-            format!(
-                "auto needs a judge: pass --judge PROVIDER/MODEL, or set {} or AGENT_MODEL",
-                judge::VAR
-            ),
-        )
-    })?;
+    let named =
+        judge::pick(settings.judge.as_deref(), settings.caller.as_deref()).ok_or_else(|| {
+            Error::with(
+                "judge_required",
+                format!(
+                    "auto needs a judge: pass --judge PROVIDER/MODEL, or set {} or AGENT_MODEL",
+                    judge::VAR
+                ),
+            )
+        })?;
     // An approver the daemon refuses the tag never replaces the base of
     // the one serving it.
     let picked = match judge::spec(&named) {

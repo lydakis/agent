@@ -45,67 +45,10 @@ pub fn spec(name: &str) -> Option<Spec<'_>> {
 }
 
 /// Who judges for a bot running `caller`: the judge `named` by the caller
-/// (`--judge`, else `AGENT_JUDGE`), else the newest small model of the
-/// caller's family on the caller's own provider (Haiku for Claude, Luna
-/// for GPT), else the caller's own model. `None` only when nothing is named and there is no caller.
-/// Providers' listings wait at most `LISTING_DEADLINE`, past which the
-/// caller's own model judges.
-pub async fn pick(client: &Client, named: Option<&str>, caller: Option<&str>) -> Option<String> {
-    if let Some(named) = named {
-        return Some(named.to_owned());
-    }
-    let listing = tokio::time::timeout(
-        LISTING_DEADLINE,
-        client.request("provider_models", json!({})),
-    )
-    .await
-    .ok()
-    .and_then(Result::ok)
-    .unwrap_or_default();
-    picked(&listing, caller)
-}
-
-/// How long `pick` waits for the providers' listings: well inside the 10 s
-/// the CLI gives an approver it starts to say it serves.
-pub const LISTING_DEADLINE: Duration = Duration::from_secs(5);
-
-/// `pick` with nothing named, from a `provider_models` listing: the
-/// newest small model of the caller's own family that the caller's own
-/// provider lists, else the caller's own model.
-pub fn picked(listing: &Value, caller: Option<&str>) -> Option<String> {
-    let caller = caller?;
-    let small = caller.split_once('/').and_then(|(provider, model)| {
-        let small = small_model(&listing["providers"][provider], model)?;
-        Some(format!("{provider}/{small}"))
-    });
-    Some(small.unwrap_or_else(|| caller.to_owned()))
-}
-
-/// A family's small model, by a word every id of each carries.
-const SMALL: [(&str, &str); 2] = [("claude", "haiku"), ("gpt", "luna")];
-
-/// The newest small model a provider lists in `model`'s family, in its
-/// region when its ids carry one (`global.`, `us.` on Bedrock).
-fn small_model(listed: &Value, model: &str) -> Option<String> {
-    // A Bedrock inference profile's id starts with its region: `global.`.
-    fn region(id: &str) -> (&str, &str) {
-        id.split_once('.')
-            .filter(|(region, _)| !region.contains('-'))
-            .unwrap_or(("", id))
-    }
-    let (_, small) = SMALL.iter().find(|(family, _)| model.contains(family))?;
-    let wanted = region(model).0;
-    listed["models"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|m| m["id"].as_str())
-        .filter(|id| id.contains(small))
-        .max_by_key(|id| {
-            let (here, model) = region(id);
-            (here == wanted, model)
-        })
-        .map(str::to_owned)
+/// (`--judge`, else `AGENT_JUDGE`), else the bot's own model. No model is
+/// guessed for a provider.
+pub fn pick(named: Option<&str>, caller: Option<&str>) -> Option<String> {
+    named.or(caller).map(str::to_owned)
 }
 
 /// Each question's id, and the probability, from 0 to 1, that its answer
@@ -601,38 +544,20 @@ mod tests {
     }
 
     #[test]
-    fn with_no_judge_named_the_caller_s_provider_s_small_model_judges() {
-        let bedrock = json!({"models": [
-            {"id": "us.anthropic.claude-haiku-5-5-v1:0"},
-            {"id": "us.anthropic.claude-haiku-4-5-20251001-v1:0"},
-            {"id": "global.anthropic.claude-haiku-4-5-20251001-v1:0"},
-            {"id": "global.anthropic.claude-haiku-5-5-v1:0"},
-            {"id": "global.anthropic.claude-opus-5-5-v1:0"},
-        ]});
-        let chatgpt =
-            json!({"models": [{"id": "gpt-6-sol"}, {"id": "gpt-5.6-luna"}, {"id": "gpt-6-luna"}]});
-        let listing = json!({"providers": {"bedrock": bedrock, "chatgpt": chatgpt}});
-        // In the caller's region on Bedrock.
+    fn with_no_judge_named_the_bot_s_own_model_judges() {
         assert_eq!(
-            picked(&listing, Some("bedrock/us.anthropic.claude-opus-5-5-v1:0")).as_deref(),
-            Some("bedrock/us.anthropic.claude-haiku-5-5-v1:0")
-        );
-        // Only the caller's own provider: another's model is never picked.
-        assert_eq!(
-            picked(&listing, Some("chatgpt/gpt-6-sol")).as_deref(),
-            Some("chatgpt/gpt-6-luna")
+            pick(
+                Some("openai-decisions/gpt-6-luna"),
+                Some("chatgpt/gpt-6-sol")
+            )
+            .as_deref(),
+            Some("openai-decisions/gpt-6-luna")
         );
         assert_eq!(
-            picked(&listing, Some("anthropic/claude-opus-5-5")).as_deref(),
-            Some("anthropic/claude-opus-5-5")
+            pick(None, Some("chatgpt/gpt-6-sol")).as_deref(),
+            Some("chatgpt/gpt-6-sol")
         );
-        // A family with no small model known, or a provider that lists none,
-        // is judged by the caller's own model.
-        assert_eq!(
-            picked(&listing, Some("bedrock/qwen.qwen3-max")).as_deref(),
-            Some("bedrock/qwen.qwen3-max")
-        );
-        assert_eq!(picked(&listing, None), None);
+        assert_eq!(pick(None, None), None);
     }
 
     #[test]

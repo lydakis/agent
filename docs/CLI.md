@@ -110,9 +110,7 @@ identity is `bot_not_found`.
   [--note FILE] [--judge-url URL]` serves a gate tag (default `auto`) and
   has a judge decide every call waiting on it, one request per round,
   printing one JSON line per round. The judge is `--judge`, else
-  `AGENT_JUDGE`, else the newest small model of `AGENT_MODEL`'s family
-  that its own provider lists (Haiku for Claude, Luna for GPT), else
-  `AGENT_MODEL`. OpenAI's Decisions
+  `AGENT_JUDGE`, else `AGENT_MODEL`. OpenAI's Decisions
   API (`openai-decisions/MODEL`, key `OPENAI_API_KEY`) is called on its
   own API, at `--judge-url` when given; any other model runs through the
   daemon, with a tag of at most 67 bytes, and `--effort` sets its effort. `--note` (default `AGENT_APPROVER_NOTE`)
