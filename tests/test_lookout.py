@@ -37,6 +37,15 @@ class LookoutTests(ModelFixture):
                               env={**clean_env(), 'HOME': str(self.path)}, capture_output=True, text=True,
                               timeout=timeout)
 
+    def subscribe(self, lead, project):
+        """The subscription Sonny writes for a lead when it opens its project."""
+        out = subprocess.run([str(self.sonny), 'lookout', 'add', 'tasks', '--for', lead,
+                              '--store', str(self.path / 'state.sqlite'),
+                              '--tasks-of', lead, '--bot', f'{project}.*', '--updates'],
+                             env={**clean_env(), 'HOME': str(self.path)}, capture_output=True, text=True,
+                             timeout=10)
+        self.assertEqual(out.returncode, 0, out.stderr)
+
     def make(self, *bots):
         for bot in bots:
             self.daemon.request('create', bot=bot, workspace=str(self.path), model='openai/synthetic-model',
@@ -44,7 +53,10 @@ class LookoutTests(ModelFixture):
 
     def test_a_model_the_daemon_serves_judges_each_check_on_a_fork(self):
         self.make('calc.lead', 'calc.fix')
-        turn = self.daemon.request('submit', bot='calc.fix', request_id='a', prompt='fix the parser')['result']['turn']
+        self.subscribe('calc.lead', 'calc')
+        # Asked for by a program, not by the person, so its result is news.
+        turn = self.daemon.request('submit', bot='calc.fix', request_id='a', prompt='fix the parser',
+                                   origin='tasks')['result']['turn']
         self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
 
         def replay():
@@ -73,6 +85,7 @@ class LookoutTests(ModelFixture):
 
     def test_a_check_of_the_person_s_words_reads_what_passed_before(self):
         self.make('calc.lead', 'calc.fix')
+        self.subscribe('calc.lead', 'calc')
         for n, prompt in enumerate(['fix the parser', 'no, the lexer']):
             turn = self.daemon.request('submit', bot='calc.fix', request_id=f'p{n}', prompt=prompt)['result']['turn']
             self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
@@ -91,6 +104,7 @@ class LookoutTests(ModelFixture):
 
     def test_a_fork_of_the_lead_judges_from_where_the_lead_stood(self):
         self.make('calc.lead', 'calc.fix')
+        self.subscribe('calc.lead', 'calc')
         forked = queue.Queue()
 
         def reply(request, user):
@@ -106,7 +120,7 @@ class LookoutTests(ModelFixture):
         self.model.reply_for = reply
         for n, (bot, prompt) in enumerate([('calc.lead', 'plan the parser work'), ('calc.fix', 'fix the parser'),
                                            ('calc.lead', 'words after the task ended')]):
-            turn = self.daemon.request('submit', bot=bot, request_id=f'r{n}', prompt=prompt)['result']['turn']
+            turn = self.daemon.request('submit', bot=bot, request_id=f'r{n}', prompt=prompt, origin='tasks')['result']['turn']
             self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
         out = self.lookout('--replay', '--judge', 'lead,openai/judge-model+lead')
         self.assertEqual(out.returncode, 0, out.stderr)
@@ -134,6 +148,7 @@ class LookoutTests(ModelFixture):
 
     def test_a_fork_of_the_lead_never_reads_what_came_after(self):
         self.make('calc.lead', 'calc.fix')
+        self.subscribe('calc.lead', 'calc')
 
         def reply(request, user):
             if request['model'] == 'judge-model':
@@ -157,7 +172,10 @@ class LookoutTests(ModelFixture):
         self.assertTrue(all(b['input']['lead'] == [] for b in bodies), bodies)
 
     def test_one_lookout_wakes_each_lead_whose_task_has_news(self):
-        self.make('calc.lead', 'calc.fix', 'shop.lead')
+        self.make('calc.lead', 'calc.fix', 'shop.lead', 'shop.fix')
+        # Only a lead Sonny subscribed is watched for: the lookout knows no
+        # leads by name.
+        self.subscribe('calc.lead', 'calc')
         service = subprocess.Popen([str(self.sonny), 'lookout', '--judge', 'openai/judge-model',
                                     '--store', str(self.path / 'state.sqlite'),
                                     '--socket', str(self.daemon.socket_path)],
@@ -170,7 +188,7 @@ class LookoutTests(ModelFixture):
         # The lookout reads its follow replay first: the turn is news only
         # once it is live.
         time.sleep(1)
-        self.daemon.request('submit', bot='calc.fix', request_id='b', prompt='fix the lexer')
+        self.daemon.request('submit', bot='calc.fix', request_id='b', prompt='fix the lexer', origin='tasks')
         deadline = time.monotonic() + 30
         woke = None
         while woke is None and time.monotonic() < deadline:
@@ -183,10 +201,13 @@ class LookoutTests(ModelFixture):
         self.assertIsNotNone(woke, 'the lead was not woken')
         self.assertIn('May need you:\n- calc.fix: turn:calc.fix/', woke)
         self.assertIn('result 0.90', woke)
-        # The other project's lead heard nothing of calc's task.
-        self.assertEqual(self.daemon.request('turns', bot='shop.lead')['result']['turns'], [])
+        # The other project's lead heard nothing of calc's task, nor of its
+        # own, since nothing subscribed it.
+        self.daemon.request('submit', bot='shop.fix', request_id='s', prompt='fix the cart')
+        self.assertIsNone(self.note_for('shop.lead', timeout=5))
         log = [json.loads(line) for line in (self.path / 'state.sqlite.lookout.jsonl').read_text().splitlines()]
         self.assertTrue(any(line.get('woke') and line['lead'] == 'calc.lead' for line in log), log)
+        self.assertFalse(any(line['lead'] == 'shop.lead' for line in log), log)
 
     def start(self):
         service = subprocess.Popen([str(self.sonny), 'lookout', '--judge', 'openai/judge-model',

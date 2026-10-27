@@ -1,7 +1,8 @@
 //! Task updates: what the lead hears of its tasks unjudged, as its role
 //! says it will. A turn it asked for and did not wait on, a turn another
-//! agent or a trigger asked for, and an approval only the person can give
-//! are always news; turns the person asked for in the task themselves are
+//! agent or a trigger asked for, an approval only the person can give, and
+//! a running turn that has printed nothing for a long while are always
+//! news; turns the person asked for in the task themselves are
 //! listed apart, as theirs. A turn the lead waits on is not news, nor its
 //! own forks.
 //!
@@ -10,7 +11,6 @@
 //! names each task's latest turn of each kind, by the handle the wait tool
 //! reads it with. What changed in memory rides along, and never sends a
 //! note by itself.
-use super::lead_project;
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
@@ -18,7 +18,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const WAKE: Duration = Duration::from_secs(10 * 60);
+pub const WAKE: Duration = Duration::from_secs(10 * 60);
 const WAKE_TASKS: usize = 32;
 /// How long a trigger has to pass a task's answer on before the turn is
 /// news after all.
@@ -26,6 +26,9 @@ const FORWARD: Duration = Duration::from_secs(15);
 const MEMORY_LINES: usize = 20;
 const ACTIVE: [&str; 5] = ["running", "waiting", "paced", "queued", "ready"];
 const APPROVAL: &str = "waiting for the person's approval";
+const QUIET: &str = "has printed nothing for 30 minutes";
+/// How long a running turn may print nothing before it is news.
+const QUIET_AFTER: Duration = super::QUIET_AFTER;
 /// An approval is news once the approver has had its say: a call the
 /// approver answers waits a few seconds first, the person's longer.
 const APPROVAL_AFTER: Duration = super::APPROVAL_AFTER;
@@ -38,7 +41,8 @@ struct Turn {
     status: String,
     by: Option<String>,
     count: u32,
-    approval: Option<String>,
+    /// Which call waits on approval, or which silence: each its own news.
+    which: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -100,9 +104,11 @@ type Key = (String, i64);
 
 pub struct Updates {
     lead: String,
-    project: String,
-    /// `~/.agents/memory`, where the person's and the project's facts are.
-    memory: Option<PathBuf>,
+    /// The memory folders whose facts are news: the person's and the
+    /// project's, as the subscriber's own memory indexes name them.
+    memory: Vec<PathBuf>,
+    /// Bots with subscriptions of their own: no one's tasks here.
+    subscribers: HashSet<String>,
     pub live: bool,
     bots: HashMap<String, Bot>,
     from: HashMap<Key, String>,
@@ -115,6 +121,10 @@ pub struct Updates {
     approvals: HashMap<Key, (Instant, Option<String>)>,
     /// Each task's news, in the order it first came.
     tasks: Vec<(String, News)>,
+    /// Each task's running turn, when it last printed anything, and
+    /// whether that silence was told already.
+    quiet: HashMap<String, (i64, Instant, bool)>,
+    silences: u64,
     last: Option<Instant>,
     memory_seen: Option<HashMap<String, u64>>,
     opened: u64,
@@ -127,11 +137,11 @@ fn now_ms() -> u64 {
 }
 
 impl Updates {
-    pub fn new(lead: &str, project: &str, memory: Option<PathBuf>) -> Self {
+    pub fn new(lead: &str, memory: Vec<PathBuf>) -> Self {
         Self {
             lead: lead.to_owned(),
-            project: project.to_owned(),
             memory,
+            subscribers: HashSet::new(),
             live: false,
             bots: HashMap::new(),
             from: HashMap::new(),
@@ -140,6 +150,8 @@ impl Updates {
             forwarding: HashMap::new(),
             approvals: HashMap::new(),
             tasks: Vec::new(),
+            quiet: HashMap::new(),
+            silences: 0,
             last: None,
             memory_seen: None,
             opened: now_ms(),
@@ -209,6 +221,9 @@ impl Updates {
         let turn = event["turn"].as_i64();
         let data = &event["data"];
         let key = |turn: i64| (name.to_owned(), turn);
+        if let Some(turn) = turn {
+            self.printed(name, kind, turn, data, now);
+        }
         match kind {
             "created" | "forked" => {
                 let mut record = data.clone();
@@ -332,17 +347,49 @@ impl Updates {
         }
     }
 
+    /// Keeps each task's running turn and when it last printed anything:
+    /// a turn waiting on the person, on other turns or for a slot is not
+    /// silent, and neither is one that ended.
+    fn printed(&mut self, task: &str, kind: &str, turn: i64, data: &Value, now: Instant) {
+        match kind {
+            "accepted" | "turn_resumed" => {
+                self.quiet.insert(task.to_owned(), (turn, now, false));
+            }
+            "turn_waiting" | "turn_paced" => {
+                self.quiet.remove(task);
+            }
+            "turn_finished" if data["status"] != "steered" => {
+                if (self.quiet.get(task)).is_some_and(|(running, ..)| *running == turn) {
+                    self.quiet.remove(task);
+                }
+            }
+            // A turn that was running before its bot was watched is
+            // tracked from the first thing it does since.
+            "text_delta" | "tool_started" | "tool_completed" if !self.quiet.contains_key(task) => {
+                self.quiet.insert(task.to_owned(), (turn, now, false));
+            }
+            _ => {
+                if let Some((running, at, told)) = self.quiet.get_mut(task)
+                    && *running == turn
+                {
+                    *at = now;
+                    *told = false;
+                }
+            }
+        }
+    }
+
     fn tell(
         &mut self,
         name: &str,
         turn: i64,
         status: &str,
         from: Option<String>,
-        approval: Option<String>,
+        which: Option<String>,
         origin: Option<String>,
     ) {
         if self.creator(name) != Some(self.lead.as_str())
-            || lead_project(name).is_some()
+            || self.subscribers.contains(name)
             || name.starts_with(&format!("{}-", self.lead))
         {
             return;
@@ -352,7 +399,7 @@ impl Updates {
             return;
         }
         let by = match status {
-            APPROVAL => None,
+            APPROVAL | QUIET => None,
             _ if from.as_deref() == Some(self.lead.as_str()) => Some("you".to_owned()),
             _ => Some(from.or(origin).unwrap_or_else(|| "the person".into())),
         };
@@ -364,10 +411,9 @@ impl Updates {
             }
         };
         let news = &mut self.tasks[at].1;
-        let answered = news
-            .act
-            .as_ref()
-            .is_some_and(|asked| asked.turn == turn && asked.status == APPROVAL);
+        let answered = news.act.as_ref().is_some_and(|asked| {
+            asked.turn == turn && [APPROVAL, QUIET].contains(&asked.status.as_str())
+        });
         let theirs = by.as_deref() == Some("the person") && !answered;
         let turn = Turn {
             first: turn,
@@ -375,7 +421,7 @@ impl Updates {
             status: status.to_owned(),
             by,
             count: 1,
-            approval,
+            which,
         };
         news.merge(match theirs {
             true => News {
@@ -389,8 +435,23 @@ impl Updates {
         });
     }
 
-    /// Turns a trigger did not pass on in time, as news.
+    /// Turns a trigger did not pass on in time, approvals that waited, and
+    /// turns silent since `QUIET_AFTER`, once per silence, as news.
     pub fn expire(&mut self, now: Instant) {
+        let silent: Vec<(String, i64)> = (self.quiet.iter_mut())
+            .filter(|(_, (_, at, told))| !*told && now >= *at + QUIET_AFTER)
+            .map(|(task, (turn, _, told))| {
+                *told = true;
+                (task.clone(), *turn)
+            })
+            .collect();
+        for (task, turn) in silent {
+            self.silences += 1;
+            let which = Some(format!("silence {}", self.silences));
+            if self.live {
+                self.tell(&task, turn, QUIET, None, which, None);
+            }
+        }
         let late: Vec<Key> = self
             .forwarding
             .iter()
@@ -419,7 +480,9 @@ impl Updates {
         for (name, news) in &mut self.tasks {
             for kind in [&mut news.act, &mut news.theirs] {
                 if kind.as_ref().is_some_and(|t| {
-                    t.status != APPROVAL && handles.contains(&format!("turn:{name}/{}", t.turn))
+                    t.status != APPROVAL
+                        && t.status != QUIET
+                        && handles.contains(&format!("turn:{name}/{}", t.turn))
                 }) {
                     *kind = None;
                 }
@@ -431,11 +494,11 @@ impl Updates {
             .retain(|(name, turn), _| !handles.contains(&format!("turn:{name}/{turn}")));
     }
 
-    /// Whether the lead is to hear now: there is news, it rests, and it
-    /// last heard long enough ago.
-    pub fn due(&self, now: Instant) -> bool {
+    /// Whether the lead is to hear now: there is news, or `held` other news
+    /// for it, it rests, and it last heard long enough ago.
+    pub fn due(&self, now: Instant, held: bool) -> bool {
         self.live
-            && !self.tasks.is_empty()
+            && (held || !self.tasks.is_empty())
             && self
                 .bots
                 .get(&self.lead)
@@ -473,6 +536,11 @@ impl Updates {
         }
     }
 
+    /// A note went without task updates: the next waits as long.
+    pub fn noted(&mut self, now: Instant) {
+        self.last = Some(now);
+    }
+
     /// The note was sent: what it said of memory has been told.
     pub fn sent(&mut self, told: Told) {
         if let Some(seen) = told.seen {
@@ -504,12 +572,37 @@ impl Updates {
         self.approvals.clear();
     }
 
+    /// The bots with subscriptions of their own, now: what was news of
+    /// them is no longer.
+    pub fn subscribed(&mut self, subscribers: HashSet<String>) {
+        let new: Vec<String> = (subscribers.difference(&self.subscribers))
+            .cloned()
+            .collect();
+        for name in new {
+            self.drop_news(&name);
+        }
+        self.subscribers = subscribers;
+    }
+
+    /// Task updates were just asked for: news from now on, the bots'
+    /// states kept.
+    pub fn begin(&mut self) {
+        self.forget();
+        self.memory_seen = None;
+        self.opened = now_ms();
+    }
+
     /// The bot under `name` is gone: drop its news, or all of it when it
     /// was the lead.
     fn gone(&mut self, name: &str) {
+        self.quiet.remove(name);
         if name == self.lead {
             return self.forget();
         }
+        self.drop_news(name);
+    }
+
+    fn drop_news(&mut self, name: &str) {
         self.tasks.retain(|(task, _)| task != name);
         self.forwarding.retain(|(task, _), _| task != name);
         self.approvals.retain(|(task, _), _| task != name);
@@ -519,9 +612,7 @@ impl Updates {
     /// memory since the lead last heard (or since the lookout started), less what
     /// the lead saved itself; and what it will have heard.
     fn memory_news(&mut self) -> Option<(String, HashMap<String, u64>)> {
-        let root = self.memory.as_ref()?;
-        let dirs = [root.clone(), root.join("projects").join(&self.project)];
-        let read: Vec<(String, Vec<Fact>)> = dirs
+        let read: Vec<(String, Vec<Fact>)> = (self.memory)
             .iter()
             .filter_map(|dir| Some((dir.to_string_lossy().into_owned(), facts(dir)?)))
             .collect();
@@ -595,12 +686,12 @@ fn line(name: &str, theirs: bool, t: &Turn) -> Line {
             t.first
         ));
     }
-    let approval = t.approval.as_deref().unwrap_or("");
+    let which = t.which.as_deref().unwrap_or("");
     Line {
         handle: format!("turn:{name}/{}", t.turn),
         theirs,
         text,
-        key: format!("{name}/{}/{}/{theirs}/{approval}", t.turn, t.status),
+        key: format!("{name}/{}/{}/{theirs}/{which}", t.turn, t.status),
     }
 }
 
@@ -658,7 +749,7 @@ mod tests {
     }
 
     fn fleet() -> Updates {
-        let mut updates = Updates::new("shop.lead", "shop", None);
+        let mut updates = Updates::new("shop.lead", Vec::new());
         let now = Instant::now();
         for (name, id, by, by_id) in [
             ("shop.lead", 1, None, None),
@@ -738,7 +829,7 @@ mod tests {
             json!({"from": {"bot": "shop.fix", "turn": 4}}),
             "completed",
         );
-        assert!(!updates.due(now), "the lead is working");
+        assert!(!updates.due(now, false), "the lead is working");
         updates.event(
             &ev(
                 "shop.lead",
@@ -748,7 +839,7 @@ mod tests {
             ),
             now,
         );
-        assert!(updates.due(now));
+        assert!(updates.due(now, false));
         let told = updates.take(now);
         assert_eq!(
             text(&told),
@@ -767,8 +858,8 @@ mod tests {
             json!({"from": {"bot": "shop.lead", "turn": 10}}),
             "completed",
         );
-        assert!(!updates.due(now + Duration::from_secs(60)));
-        assert!(updates.due(now + WAKE));
+        assert!(!updates.due(now + Duration::from_secs(60), false));
+        assert!(updates.due(now + WAKE, false));
     }
 
     #[test]
@@ -812,7 +903,10 @@ mod tests {
         );
         // The approver has its say first.
         updates.expire(now);
-        assert!(!updates.due(now), "the lead read shop.fix with its wait");
+        assert!(
+            !updates.due(now, false),
+            "the lead read shop.fix with its wait"
+        );
         updates.expire(now + APPROVAL_AFTER);
         let told = updates.take(now);
         assert_eq!(
@@ -823,6 +917,68 @@ mod tests {
         updates.unsent(told);
         let again = updates.take(now + WAKE);
         assert!(text(&again).contains("shop.docs/2 waiting for the person's approval"));
+    }
+
+    #[test]
+    fn a_turn_silent_for_a_long_while_is_news_once_per_silence() {
+        let mut updates = fleet();
+        let now = Instant::now();
+        let silent = |updates: &mut Updates, at: Instant| {
+            updates.expire(at);
+            let told = updates.take(at);
+            text(&told)
+        };
+        updates.event(
+            &ev(
+                "shop.fix",
+                Some(3),
+                "accepted",
+                json!({"from": {"bot": "shop.lead"}}),
+            ),
+            now,
+        );
+        assert_eq!(silent(&mut updates, now), "");
+        let later = now + QUIET_AFTER;
+        assert_eq!(
+            silent(&mut updates, later),
+            "- shop.fix: turn:shop.fix/3 has printed nothing for 30 minutes"
+        );
+        assert_eq!(silent(&mut updates, later + WAKE), "");
+        // A wait that returned before the turn ended read no silence.
+        updates.event(&ev("shop.fix", Some(3), "text_delta", json!({})), later);
+        updates.expire(later + QUIET_AFTER);
+        updates.read(&["turn:shop.fix/3".to_owned()].into());
+        let told = updates.take(later + QUIET_AFTER);
+        assert_eq!(told.items.len(), 1);
+        // Printing again starts a new silence, which is news of its own.
+        assert_ne!(told.items[0].key, "");
+        // A turn waiting on the person or on other turns is not silent,
+        // and one that ended is gone.
+        let at = later + 2 * QUIET_AFTER;
+        updates.event(
+            &ev("shop.fix", Some(3), "turn_waiting", json!({"handles": []})),
+            at,
+        );
+        assert_eq!(silent(&mut updates, at + QUIET_AFTER), "");
+        updates.event(&ev("shop.fix", Some(3), "turn_resumed", json!({})), at);
+        updates.event(
+            &ev(
+                "shop.fix",
+                Some(3),
+                "turn_finished",
+                json!({"status": "completed"}),
+            ),
+            at,
+        );
+        updates.take(at + WAKE);
+        assert_eq!(silent(&mut updates, at + 4 * QUIET_AFTER), "");
+        // A turn already running when its bot came to be watched is
+        // tracked from what it does next.
+        updates.event(&ev("shop.fix", Some(8), "tool_started", json!({})), at);
+        assert!(
+            silent(&mut updates, at + 4 * QUIET_AFTER)
+                .contains("turn:shop.fix/8 has printed nothing")
+        );
     }
 
     #[test]
@@ -859,9 +1015,9 @@ mod tests {
         );
         // Reading an earlier turn leaves the latest news.
         updates.read(&["turn:shop.fix/4".to_owned()].into());
-        assert!(updates.due(now + WAKE));
+        assert!(updates.due(now + WAKE, false));
         updates.read(&["turn:shop.fix/5".to_owned()].into());
-        assert!(!updates.due(now + WAKE));
+        assert!(!updates.due(now + WAKE, false));
     }
 
     #[test]
@@ -879,7 +1035,7 @@ mod tests {
         };
         fact(&root, "old", "person");
         let mut updates = fleet();
-        updates.memory = Some(root.clone());
+        updates.memory = vec![root.clone(), project.clone()];
         updates.opened = 0;
         let news = |updates: &mut Updates| {
             let now = Instant::now() + WAKE * 10;
@@ -945,7 +1101,7 @@ mod tests {
             } else {
                 updates.seat(&json!({"name": "shop.lead", "bot_id": 7, "status": "idle"}));
             }
-            assert!(!updates.due(now), "{gone}");
+            assert!(!updates.due(now, false), "{gone}");
             assert!(updates.take(now).sent.is_empty());
         }
     }
@@ -963,7 +1119,7 @@ mod tests {
         );
         // Deleted and made again while the lookout was away: seated afresh.
         updates.seat(&json!({"name": "shop.fix", "bot_id": 99, "status": "idle"}));
-        assert!(!updates.due(now));
+        assert!(!updates.due(now, false));
         assert!(updates.take(now).sent.is_empty());
     }
 
@@ -982,7 +1138,7 @@ mod tests {
             .map(str::to_owned)
             .into();
         updates.seated(&listed);
-        assert!(!updates.due(now));
+        assert!(!updates.due(now, false));
         assert!(updates.take(now).sent.is_empty());
     }
 }

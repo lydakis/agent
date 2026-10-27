@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Every window's page, the first and each one opened on a host, may use the core APIs (events, its own window) and the app's commands.","local":true,"windows":["*"],"permissions":["core:default"]}}
