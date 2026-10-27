@@ -1928,24 +1928,29 @@ impl App {
         }
     }
 
-    /// The person's command, once it ran: the bot is given it at once,
-    /// attached, so it joins the bot's next model call without starting a
-    /// turn; what it printed is shown once the bot's words still coming
-    /// are not cut into.
+    /// The person's command, once it ran: the bot is given it at once, as
+    /// a message, so it answers it as Claude Code's does: a turn of its
+    /// own, or a steer of the running one. What it printed is shown once
+    /// the bot's words still coming are not cut into.
     async fn shell_ran(&mut self) {
         if self.shell.as_ref().is_some_and(|s| s.is_finished()) {
             let ran = self.shell.take().unwrap().ran().await;
             self.shown.extend(user_shell::lines(&ran, self.width));
             let record = user_shell::record(&ran);
-            let attached = self
+            let delivery = self.running.is_some().then_some("steer");
+            let model = delivery
+                .is_none()
+                .then(|| self.turn_model.clone())
+                .flatten();
+            let sent = self
                 .client
                 .request(
                     "submit",
                     json!({"bot": self.bot, "request_id": unique("tui"), "prompt": record,
-                        "delivery": "attach"}),
+                        "delivery": delivery, "model": model}),
                 )
                 .await;
-            match attached {
+            match sent {
                 Ok(reply) => {
                     if let Some(turn) = reply["turn"].as_i64() {
                         self.staged.push((turn, record));
@@ -2498,12 +2503,7 @@ impl App {
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .filter(|row| {
-                        matches!(
-                            row["status"].as_str(),
-                            Some("queued" | "ready" | "attached")
-                        )
-                    })
+                    .filter(|row| matches!(row["status"].as_str(), Some("queued" | "ready")))
                     .filter_map(|row| row["turn"].as_i64()),
             );
             match page["next_after"].as_i64() {
@@ -4691,14 +4691,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn what_the_person_ran_is_attached_as_soon_as_it_ends() {
+    async fn what_the_person_ran_goes_to_the_agent_as_soon_as_it_ends() {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = sent.clone();
         let client = daemon_answering(move |asked| {
             if asked["op"] == "submit" {
                 seen.lock().unwrap().push(asked.clone());
             }
-            json!({"turn": 2, "status": "attached"})
+            json!({"turn": 2})
         })
         .await;
         let mut app = app(client);
@@ -4712,32 +4712,36 @@ mod tests {
         }
         app.shell_ran().await;
         assert!(app.shell.is_none());
-        // Shown, and attached at once, no message of the person's needed.
+        // Shown, and sent at once, no message of the person's needed: to
+        // an idle agent, as a turn of its own.
         let shown: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
         assert_eq!(shown, ["! echo hello", "  └ hello"]);
         let asked = sent.lock().unwrap()[0].clone();
-        assert_eq!(asked["delivery"], "attach");
+        assert_eq!(asked["delivery"], Value::Null);
         let prompt = asked["prompt"].as_str().unwrap();
         let (ran, said) = user_shell::split(prompt);
         assert_eq!(said, "");
         assert_eq!((ran[0].command.as_str(), ran[0].exit), ("echo hello", 0));
         assert_eq!(ran[0].output, "hello");
-        // Staged until the bot's next call takes it, as its name alone.
+        // Staged until its turn takes it, as its name alone.
         let staged: Vec<String> = app.staged_rows(80).iter().map(|l| l.to_string()).collect();
         assert_eq!(staged, ["! echo hello"]);
-        app.daemon(turn_event(
-            "turn_finished",
-            2,
-            json!({"status": "steered", "into": 1}),
-        ))
-        .await;
+        app.daemon(turn_event("accepted", 2, json!({}))).await;
         assert!(app.staged.is_empty());
+        // To a busy one, as a steer of its running turn.
+        app.input.set("!true");
+        app.submit().await;
+        while app.shell.as_ref().is_some_and(|s| !s.is_finished()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        app.shell_ran().await;
+        assert_eq!(sent.lock().unwrap()[1]["delivery"], "steer");
         let landed: Vec<String> = landed(prompt, 80).iter().map(|l| l.to_string()).collect();
         assert_eq!(landed, ["! echo hello"]);
         // The next message goes alone.
         app.input.set("thanks");
         app.submit().await;
-        assert_eq!(sent.lock().unwrap()[1]["prompt"], "thanks");
+        assert_eq!(sent.lock().unwrap()[2]["prompt"], "thanks");
     }
 
     #[tokio::test]

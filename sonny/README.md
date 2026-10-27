@@ -82,15 +82,14 @@ Enter sends (and steers a running turn), Esc interrupts, `y`/`n` answer a
 pending approval, Ctrl-C clears the composer or quits.
 
 `!COMMAND` runs a command of your own with your shell, in the agent's
-folder, as Codex and Claude Code do, in any agent's window: the lead's or a
-task's. You see what it printed at once, and as soon as it ends the agent is
-given it too, in Codex's `<user_shell_command>` record (the command, its
-exit code and its output, a long output's start and end), sent with
-`delivery: attach`: it joins the agent's next model call, the running
-turn's or the next turn's, and starts no turn of its own. The daemon keeps
-it until then. Esc stops a command still running.
+folder, in any agent's window: the lead's or a task's. You see what it
+printed at once, and as soon as it ends the agent is given it too, in
+Codex's `<user_shell_command>` record (the command, its exit code and its
+output, a long output's start and end), and answers it as Claude Code's
+does: an idle agent in a turn of its own, a busy one in its running turn,
+as a steer. Esc stops a command still running.
 
-![A command run with !, its output attached for the agent, and the agent answering from it](../docs/sonny/shell-passthrough.gif)
+![A command run with !, its output, and the agent answering it](../docs/sonny/shell-passthrough.gif)
 
 `/` lists the commands:
 
