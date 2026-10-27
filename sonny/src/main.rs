@@ -1036,6 +1036,10 @@ struct Running {
 /// message, well under what the daemon takes in one.
 const UNSENT_BYTES: usize = 64 * 1024;
 
+/// What sends a command's record: what it printed is not the person's
+/// words, so it authorizes nothing the agent then does.
+const SHELL: &str = "shell";
+
 /// Keeps a refused command's record for the next message, letting the
 /// oldest go past what one message should carry.
 fn hold(unsent: &mut Vec<String>, record: String) {
@@ -1959,7 +1963,7 @@ impl App {
             // As it will read back once it lands.
             self.ran_here.extend(user_shell::split(&record).0);
             // Refused, it is kept, to go with the next message.
-            if let Err(error) = self.send(record.clone()).await {
+            if let Err(error) = self.send(record.clone(), Some(SHELL), false).await {
                 self.notice = Some(format!("{error}; it goes with your next message"));
                 hold(&mut self.unsent, record);
             }
@@ -3798,18 +3802,22 @@ impl App {
             None => prompt,
         };
         // What the person ran and the agent could not be given yet goes
-        // with this message.
-        let prompt = match self.unsent.is_empty() {
-            true => prompt,
-            false => format!("{}\n\n{prompt}", self.unsent.join("\n\n")),
-        };
-        match self.send(prompt).await {
+        // first, on its own, and this message joins the turn it starts.
+        let join = !self.unsent.is_empty();
+        if join {
+            let records = self.unsent.join("\n\n");
+            if let Err(error) = self.send(records, Some(SHELL), false).await {
+                self.notice = Some(error);
+                return;
+            }
+            self.unsent.clear();
+        }
+        match self.send(prompt, None, join).await {
             Ok(()) => {
                 if let Some(ask) = answering {
                     asks::done(&ask);
                     self.asks.retain(|open| open.file != ask.file);
                 }
-                self.unsent.clear();
                 self.input.clear();
                 self.notice = None;
             }
@@ -3817,11 +3825,17 @@ impl App {
         }
     }
 
-    /// Send `prompt` as the person's: a turn of its own, or a steer of the
-    /// running one; staged until it lands.
-    async fn send(&mut self, prompt: String) -> Result<(), String> {
+    /// Send `prompt`: a turn of its own, or a steer of the running one (or
+    /// of the one just started, `join`); staged until it lands. `origin`
+    /// names what sent it when the person's words did not.
+    async fn send(
+        &mut self,
+        prompt: String,
+        origin: Option<&str>,
+        join: bool,
+    ) -> Result<(), String> {
         // A message to a busy bot joins its running turn, on that turn's model.
-        let delivery = self.running.is_some().then_some("steer");
+        let delivery = (join || self.running.is_some()).then_some("steer");
         let model = delivery
             .is_none()
             .then(|| self.turn_model.clone())
@@ -3834,7 +3848,8 @@ impl App {
             .request(
                 "submit",
                 json!({"bot": self.bot, "request_id": unique("tui"), "prompt": prompt,
-                    "delivery": delivery, "model": model, "workspace": workspace}),
+                    "delivery": delivery, "model": model, "workspace": workspace,
+                    "origin": origin}),
             )
             .await
             .map_err(|error| error.to_string())?;
@@ -4760,6 +4775,8 @@ mod tests {
         assert_eq!(shown, ["! echo hello", "  └ hello"]);
         let asked = sent.lock().unwrap()[0].clone();
         assert_eq!(asked["delivery"], Value::Null);
+        // Not the person's words: what it printed authorizes nothing.
+        assert_eq!(asked["origin"], "shell");
         let prompt = asked["prompt"].as_str().unwrap();
         let (ran, said) = user_shell::split(prompt);
         assert_eq!(said, "");
@@ -4837,12 +4854,17 @@ mod tests {
         );
         app.input.set("and now?");
         app.submit().await;
-        let asked = sent.lock().unwrap()[1].clone();
-        let (ran, said) = user_shell::split(asked["prompt"].as_str().unwrap());
-        assert_eq!((ran[0].command.as_str(), said), ("echo hello", "and now?"));
+        // The record goes first, on its own, and the message joins its turn.
+        let sent = sent.lock().unwrap().clone();
+        let (ran, said) = user_shell::split(sent[1]["prompt"].as_str().unwrap());
+        assert_eq!((ran[0].command.as_str(), said), ("echo hello", ""));
+        assert_eq!(sent[1]["origin"], "shell");
+        assert_eq!(sent[2]["prompt"], "and now?");
+        assert_eq!(sent[2]["origin"], Value::Null);
+        assert_eq!(sent[2]["delivery"], "steer");
         // A turn it starts moves a moved lead, as any message's does.
-        assert_eq!(sent.lock().unwrap()[0]["workspace"], "/moved");
-        assert_eq!(asked["workspace"], "/moved");
+        assert_eq!(sent[0]["workspace"], "/moved");
+        assert_eq!(sent[1]["workspace"], "/moved");
         assert!(app.move_to.is_none());
         assert!(app.unsent.is_empty());
         assert!(app.shell_rows(80).is_empty());
