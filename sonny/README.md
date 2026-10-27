@@ -4,11 +4,17 @@ A terminal client for the daemon, beside the app, that lays its work out in
 Rex. It speaks the daemon's socket protocol through `agent-client`, like the
 app; nothing in the daemon or CLI knows it exists.
 
-    brew install lydakis/agent/sonny         # Sonny, with a daemon of its own version
+    brew install lydakis/agent/sonny         # Sonny, and the daemon's `agent` formula with it
+    brew install lydakis/agent/agent         # just the daemon
 
-On Linux, each release has `sonny-VERSION-linux-ARCH.tar.gz` (x86_64 and
-aarch64): static builds of Sonny in `bin/` and its daemon in `libexec/`.
-Unpack it anywhere and run `bin/sonny`.
+Both formulas build from the release's source on your machine (macOS or
+Linux), so nothing is signed; Sonny starts the `agent` formula's daemon by its
+`opt` path. On Linux, each release also has
+`sonny-VERSION-linux-ARCH.tar.gz` (x86_64 and aarch64): static builds of
+Sonny in `bin/` and its daemon in `libexec/`. Unpack it anywhere and run
+`bin/sonny`. With `cargo install`, build both (`--path .` for `agent` and
+`--path sonny`) and set `AGENT_BIN` to that `agent`; Sonny never takes an
+`agent` from `PATH`, which may be another program.
 
     sonny                                    # this folder's coordinator, <project>.lead
     sonny --model PROVIDER/MODEL             # the same, making the project the first time
