@@ -3,6 +3,7 @@
 //! piece is a list of lines already wrapped to the terminal's width, so it
 //! can be inserted above the live area and left to the terminal.
 use ratatui::{
+    layout::Alignment,
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
 };
@@ -424,8 +425,14 @@ fn table_row(text: &str) -> bool {
     t.starts_with('|') && t.len() > 1 && t[1..].contains('|')
 }
 
+/// How a row says it goes on with a word cut at the end of the row above,
+/// so an address there can be followed: an explicit left alignment, which
+/// draws as the default does.
+pub const CUT: Alignment = Alignment::Left;
+
 /// A line wrapped at word boundaries to `width` columns, the first row
 /// after `first` and the others after `rest`, which should be as wide.
+/// A word wider than a row is cut, and the rows it goes on in are [`CUT`].
 pub fn wrap(
     line: Line<'static>,
     width: usize,
@@ -442,9 +449,14 @@ pub fn wrap_lines(
     first: Line<'static>,
     rest: Line<'static>,
 ) -> Vec<Line<'static>> {
-    let room = width.saturating_sub(first.width()).max(8);
+    // The room after each row's lead: the rows after the first may have
+    // a wider one.
+    let mut room = width.saturating_sub(first.width()).max(8);
+    let rest_room = width.saturating_sub(rest.width()).max(8);
     let rest = rest.spans;
-    let mut rows: Vec<Vec<Span<'static>>> = vec![first.spans];
+    // Each row, and whether it goes on with a word cut in the row above.
+    let mut rows: Vec<(Vec<Span<'static>>, bool)> =
+        vec![(first.spans, line.alignment == Some(CUT))];
     let mut used = 0;
     for span in line.spans {
         let style = line.style.patch(span.style);
@@ -453,7 +465,8 @@ pub fn wrap_lines(
             let mut wide = word.width();
             // A word's trailing spaces may hang past the edge.
             if used + word.trim_end().width() > room && used > 0 {
-                rows.push(rest.clone());
+                rows.push((rest.clone(), false));
+                room = rest_room;
                 used = 0;
                 if word.trim().is_empty() {
                     continue;
@@ -476,17 +489,24 @@ pub fn wrap_lines(
                 }
                 rows.last_mut()
                     .unwrap()
+                    .0
                     .push(Span::styled(word[..cut].to_owned(), style));
-                rows.push(rest.clone());
+                rows.push((rest.clone(), true));
+                room = rest_room;
                 used = 0;
                 word = word[cut..].to_owned();
                 wide = word.width();
             }
             used += wide;
-            rows.last_mut().unwrap().push(Span::styled(word, style));
+            rows.last_mut().unwrap().0.push(Span::styled(word, style));
         }
     }
-    rows.into_iter().map(Line::from).collect()
+    rows.into_iter()
+        .map(|(spans, cut)| Line {
+            alignment: cut.then_some(CUT),
+            ..Line::from(spans)
+        })
+        .collect()
 }
 
 /// Words with the spaces after each kept, so wrapping loses nothing.
