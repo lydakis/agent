@@ -1948,15 +1948,12 @@ impl Service {
         for (name, lookout) in self.lookouts.iter_mut() {
             let file = subscribers.get(name).cloned().unwrap_or_default();
             let updating = file.iter().any(|sub| sub.updates);
-            // Task updates asked for since: heard from now on.
-            if updating && !lookout.updating {
-                lookout.updates = updates_for(
-                    name,
-                    &lookout.workspace,
-                    &self.records,
-                    subscribers,
-                    self.live,
-                );
+            // Task updates asked for since are heard from now on; those no
+            // longer asked for are dropped.
+            match (updating, lookout.updating) {
+                (true, false) => lookout.updates.begin(),
+                (false, true) => lookout.updates.forget(),
+                _ => {}
             }
             lookout.updating = updating;
             lookout.updates.subscribers = others(name, subscribers);
@@ -2278,8 +2275,11 @@ impl Lookout {
     }
 
     fn event(&mut self, event: &Value) {
-        if self.updating {
-            self.updates.event(event, Instant::now());
+        // Followed whether or not they are asked for, so turning them on
+        // knows where each bot stands; kept only while they are.
+        self.updates.event(event, Instant::now());
+        if !self.updating {
+            self.updates.forget();
         }
         self.lineage_of(event);
         let (Some(kind), Some(bot)) = (event["event"].as_str(), event["bot"].as_str()) else {
@@ -2813,7 +2813,7 @@ impl Lookout {
     async fn wake(&mut self, client: &Client) {
         let now = Instant::now();
         let judged = self.wake_due(now);
-        if !judged && (self.refused(now) || !self.updates.due(now)) {
+        if !judged && (self.refused(now) || !self.updating || !self.updates.due(now)) {
             return;
         }
         let steer = judged && self.urgent == Some(true);
@@ -2825,7 +2825,10 @@ impl Lookout {
         });
         let take = self.held.len().min(NOTE_ITEMS);
         let sent: Vec<Item> = self.held.drain(..take).collect();
-        let told = self.updates.take(now);
+        let told = match self.updating {
+            true => self.updates.take(now),
+            false => updates::Told::default(),
+        };
         let prompt = note(&sent, self.held.len(), &told, self.dropped);
         let mut key: Vec<String> = sent
             .iter()
@@ -3873,18 +3876,46 @@ mod tests {
             (told.items.iter().map(|l| l.handle.as_str())).collect::<Vec<_>>(),
             ["turn:calc.fix/1"]
         );
-        // Task updates go with the subscription that asked for them.
+        let after = later + Duration::from_secs(3600);
+        // Past the gap since the last note. Task updates go with the
+        // subscription that asked for them: news not yet told goes when it
+        // is dropped, and none comes while off.
+        turn(lookout, "calc.fix");
         service
             .subscribers
             .insert("calc.lead".into(), vec![sub("x", &["calc.lead"], &[])]);
         service.resubscribe();
-        assert!(!service.lookouts["calc.lead"].updating);
+        let lookout = service.lookouts.get_mut("calc.lead").unwrap();
+        assert!(!lookout.updating && !lookout.updates.due(after));
+        turn(lookout, "calc.fix");
+        assert!(!lookout.updates.due(after));
+        // Followed while off, so the lead's wait on a task still holds
+        // that task's news back once they are asked for again.
+        let mut waiting = ev("calc.lead", 1, "accepted", json!({}));
+        lookout.event(&waiting);
+        waiting = ev(
+            "calc.lead",
+            1,
+            "turn_waiting",
+            json!({"handles": ["turn:calc.fix/2"]}),
+        );
+        lookout.event(&waiting);
         service.subscribers.insert("calc.lead".into(), tasks);
         service.resubscribe();
         let lookout = service.lookouts.get_mut("calc.lead").unwrap();
         assert!(lookout.updating);
+        let finished = json!({"status": "completed"});
+        lookout.event(&ev(
+            "calc.fix",
+            2,
+            "accepted",
+            json!({"from": {"bot": "calc.lead"}}),
+        ));
+        lookout.event(&ev("calc.fix", 2, "turn_finished", finished.clone()));
+        lookout.event(&ev("calc.lead", 1, "turn_finished", finished));
+        assert!(!lookout.updates.due(after));
         turn(lookout, "calc.fix");
-        assert!(lookout.updates.due(later));
+        assert!(lookout.updates.due(after));
     }
 
     #[test]

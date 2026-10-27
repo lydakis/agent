@@ -505,6 +505,14 @@ impl Updates {
         self.approvals.clear();
     }
 
+    /// Task updates were just asked for: news from now on, the bots'
+    /// states kept.
+    pub fn begin(&mut self) {
+        self.forget();
+        self.memory_seen = None;
+        self.opened = now_ms();
+    }
+
     /// The bot under `name` is gone: drop its news, or all of it when it
     /// was the lead.
     fn gone(&mut self, name: &str) {

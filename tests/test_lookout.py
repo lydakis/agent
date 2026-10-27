@@ -102,6 +102,7 @@ class LookoutTests(ModelFixture):
 
     def test_a_fork_of_the_lead_judges_from_where_the_lead_stood(self):
         self.make('calc.lead', 'calc.fix')
+        self.subscribe('calc.lead', 'calc')
         forked = queue.Queue()
 
         def reply(request, user):
@@ -145,6 +146,7 @@ class LookoutTests(ModelFixture):
 
     def test_a_fork_of_the_lead_never_reads_what_came_after(self):
         self.make('calc.lead', 'calc.fix')
+        self.subscribe('calc.lead', 'calc')
 
         def reply(request, user):
             if request['model'] == 'judge-model':
