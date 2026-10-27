@@ -262,3 +262,64 @@ fn a_sandfs_task_that_does_not_start_leaves_no_copy() {
     let sandfs = sandfs::Home::at(lab.home.join("sandfs")).unwrap();
     assert!(sandfs.workspaces().unwrap().is_empty());
 }
+
+#[test]
+fn a_task_starts_from_a_plain_terminal_with_the_agent_beside_sonny() {
+    let lab = Lab::new("terminal");
+    // Installed as Homebrew lays it out: bin/sonny, and libexec/agent.
+    for dir in ["bin", "libexec"] {
+        std::fs::create_dir_all(lab.scratch.join(dir)).unwrap();
+    }
+    let sonny = lab.scratch.join("bin/sonny");
+    if std::fs::hard_link(env!("CARGO_BIN_EXE_sonny"), &sonny).is_err() {
+        std::fs::copy(env!("CARGO_BIN_EXE_sonny"), &sonny).unwrap();
+    }
+    std::fs::rename(&lab.agent, lab.scratch.join("libexec/agent")).unwrap();
+    let output = Command::new(&sonny)
+        .args(["task", "demo.fix", "--", "fix", "it"])
+        .current_dir(&lab.repo)
+        .env("HOME", &lab.home)
+        .env_remove("AGENT_BIN")
+        .env("AGENT_LOG", lab.scratch.join("run.log"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(lab.ran()[4], "demo.fix");
+}
+
+#[test]
+fn a_plain_folder_on_another_disk_gets_a_sandfs_workspace_over_it() {
+    // /dev/shm is a disk of its own on Linux; elsewhere there is no
+    // second disk to try this on.
+    let shm = Path::new("/dev/shm");
+    if !shm.is_dir() {
+        return;
+    }
+    let lab = Lab::new("sandfs-disk");
+    lab.sandfs();
+    let folder = shm.join(format!("sonny-task-plain-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&folder);
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("notes.txt"), "one\n").unwrap();
+    let sonny = env!("CARGO_BIN_EXE_sonny");
+    let (ok, out, err) = lab.run(&folder, sonny, &["task", "demo.fix", "--", "go"], false);
+    let copy = lab.home.join(".agent/tasks/demo.fix");
+    let finish = |lab: &Lab| {
+        let sandfs = sandfs::Home::at(lab.home.join("sandfs")).unwrap();
+        let _ = sandfs.remove("demo.fix", true);
+        let _ = std::fs::remove_dir_all(&folder);
+    };
+    if !ok {
+        finish(&lab);
+        panic!("{out}\n{err}");
+    }
+    assert!(err.contains("another disk"), "{err}");
+    assert_eq!(lab.ran()[6], copy.to_string_lossy());
+    // The task's edit stays in its workspace until applied.
+    std::fs::write(copy.join("notes.txt"), "two\n").unwrap();
+    let (_, listed, _) = lab.run(&folder, sonny, &["task", "changes", "demo.fix"], false);
+    let source = std::fs::read_to_string(folder.join("notes.txt")).unwrap();
+    finish(&lab);
+    assert_eq!(listed, "M notes.txt");
+    assert_eq!(source, "one\n");
+}

@@ -80,7 +80,13 @@ commands:
   flags] -- BRIEF`, which makes its folder that way, runs `.agents/setup`
   there with `--setup`, starts the task with `agent run`, and leaves no
   folder behind when that fails; `sonny task changes NAME [--apply]` lists,
-  or writes back, what a sandfs copy of a plain folder changed. sandfs is
+  or writes back, what a sandfs copy of a plain folder changed. A plain
+  folder on another disk than sandfs's home (`~/.local/share/sandfs`), such
+  as an external volume, can't be copied, so its task gets a sandfs
+  workspace over the folder itself: the task's changes still stay in the
+  workspace, but it also sees what changes in the folder meanwhile.
+  `sonny task` also works from a plain terminal, with the `agent` installed
+  beside Sonny. sandfs is
   built into Sonny, so it needs no install, only what a mount needs (FUSE 3
   on Linux, nothing on macOS). Its mounts are served by Sonny run again in
   the background, which outlives Sonny; Sonny mounts task copies a restart
