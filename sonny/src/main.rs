@@ -402,10 +402,7 @@ async fn serve_auto(client: &Client, options: &Options, model: &str) -> Result<(
         .open(&log)
         .map_err(|e| e.to_string())?;
     let mut command = agent_command(&bin)?;
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
+    agent_client::own_session(&mut command);
     command
         .env("AGENT_MODEL", model)
         .arg("approver")
@@ -436,10 +433,7 @@ fn start_lookout(options: &Options) -> Result<(), String> {
     // The judge's settings and keys are in Agent's env file, as for the
     // approver.
     let mut command = agent_command(&me)?;
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
+    agent_client::own_session(&mut command);
     let mut child = command
         .arg("lookout")
         .arg("--store")

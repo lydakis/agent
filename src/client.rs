@@ -694,10 +694,7 @@ fn ensure_daemon(options: &Options) -> Result<Connection> {
     for (flag, value) in &options.daemon_flags {
         command.arg(flag).arg(value);
     }
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
+    agent_client::own_session(&mut command);
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
@@ -913,10 +910,7 @@ fn ensure_approver(
     if let Some(note) = &options.note {
         command.arg("--note").arg(note);
     }
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
+    agent_client::own_session(&mut command);
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
