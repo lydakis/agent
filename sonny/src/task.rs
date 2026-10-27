@@ -66,6 +66,9 @@ fn start(here: &Path, name: &str, rest: &[String]) -> Result<(), String> {
     // The daemon's binary in an agent's shell; in a terminal, the one
     // Sonny would start.
     let agent = crate::agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
+    // With the provider keys the app keeps, should this start the daemon;
+    // read before the folder is made, so a bad env file leaves nothing.
+    let mut command = crate::agent_command(&agent)?;
 
     let info = agent_client::project::read(here)?;
     let place = if info["threads_in"] == "project" {
@@ -97,8 +100,7 @@ fn start(here: &Path, name: &str, rest: &[String]) -> Result<(), String> {
             return failed(&place, false, format!("{} failed", script.display()));
         }
     }
-    // With the provider keys the app keeps, should this start the daemon.
-    let status = crate::agent_command(&agent)?
+    let status = command
         .args(["run", "--detach", "--new", "--bot", name, "--workspace"])
         .arg(&place.dir)
         .args(flags)
