@@ -1200,17 +1200,24 @@ async fn node_text(client: &Client, bot: &str, node: i64) -> String {
 
 /// Whether these words were checked within `SAME_WORDS`; they count as
 /// checked from now on.
-fn repeated(recent: &Recent, text: &str, now: Instant) -> bool {
+/// Whether these words were checked lately with the same questions: what
+/// another subscription asks of them is its own check.
+fn repeated(recent: &Recent, text: &str, asked: &str, now: Instant) -> bool {
     if text.trim().is_empty() {
         return false;
     }
     let mut lately = recent.lock().unwrap();
     lately.retain(|_, at| now.duration_since(*at) < SAME_WORDS);
-    lately.insert(digest(text.trim()), now).is_some()
+    lately
+        .insert(digest(&format!("{}\0{asked}", text.trim())), now)
+        .is_some()
 }
 
-fn forget(recent: &Recent, text: &str) {
-    recent.lock().unwrap().remove(&digest(text.trim()));
+fn forget(recent: &Recent, text: &str, asked: &str) {
+    recent
+        .lock()
+        .unwrap()
+        .remove(&digest(&format!("{}\0{asked}", text.trim())));
 }
 
 /// What the lead last asked the task, else the first words in its history.
@@ -1248,7 +1255,11 @@ async fn check(
         return Err(Failure::Unasked);
     }
     let text = event_text(client, seen).await;
-    if seen.kind == Kind::Said && repeated(recent, &text, Instant::now()) {
+    let same: Vec<&str> = (questions.iter().map(|q| q.text.as_str()))
+        .chain(seen.asks.context.iter().map(String::as_str))
+        .collect();
+    let same = same.join("\n");
+    if seen.kind == Kind::Said && repeated(recent, &text, &same, Instant::now()) {
         return Err(Failure::Duplicate);
     }
     let brief = brief(client, &seen.task, seen.brief).await;
@@ -1277,7 +1288,7 @@ async fn check(
         .await;
     // Words the judge never answered are not seen yet, so a retry reads them.
     if asked.is_err() && seen.kind == Kind::Said {
-        forget(recent, &text);
+        forget(recent, &text, &same);
     }
     let (answers, tokens) = asked.map_err(|failure| match failure {
         Failure::Check(why, _) => Failure::Check(why, text.clone()),
@@ -1648,6 +1659,10 @@ impl Service {
                 std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agents/memory"));
             lookout.updates = updates::Updates::new(lead, project, memory);
             lookout.updates.seat(record);
+            // What it subscribed to before it was made, or made again.
+            let file = self.subscribers.get(lead).cloned().unwrap_or_default();
+            lookout.subs = subs::effective(lead_project(lead).is_some(), lead, file);
+            lookout.roots(&self.records);
             self.lookouts.insert(lead.to_owned(), lookout);
         }
         if !pick || !self.lookouts[lead].unpicked {
@@ -2211,9 +2226,9 @@ impl Lookout {
         from: Option<String>,
         status: Option<String>,
         node: Option<i64>,
-    ) {
+    ) -> bool {
         let Some(asks) = self.asks_for(task, kind) else {
-            return;
+            return false;
         };
         let peers = self
             .peers_of(task)
@@ -2236,6 +2251,7 @@ impl Lookout {
             asks,
             text: String::new(),
         });
+        true
     }
 
     /// Whether a subscription watches this bot: one of the tasks it names
@@ -2334,8 +2350,9 @@ impl Lookout {
                 .approvals
                 .remove(&(task.clone(), turn))
                 .and_then(|(_, call)| call);
-            self.due(&task, turn, Kind::Waiting, None, None, None);
-            if let Some(seen) = self.due.last_mut() {
+            if self.due(&task, turn, Kind::Waiting, None, None, None)
+                && let Some(seen) = self.due.last_mut()
+            {
                 seen.call = call;
             }
         }
@@ -3251,6 +3268,29 @@ mod tests {
     }
 
     #[test]
+    fn an_approval_nobody_asks_about_keeps_its_call_to_itself() {
+        let mut lookout = lookout();
+        let mut tasks = subs::Sub::tasks("calc.lead");
+        tasks.on = vec![Kind::Ended];
+        let mut ops = sub("ops", &[], &["ops.*"]);
+        ops.on = vec![Kind::Waiting];
+        lookout.subs = vec![tasks, ops];
+        let long_ago = Instant::now() - APPROVAL_AFTER;
+        lookout
+            .approvals
+            .insert(("ops.x".into(), 1), (long_ago, Some("a".into())));
+        lookout
+            .approvals
+            .insert(("calc.fix".into(), 2), (long_ago, Some("b".into())));
+        lookout.approvals_due();
+        assert_eq!(lookout.due.len(), 1);
+        assert_eq!(
+            (lookout.due[0].task.as_str(), lookout.due[0].call.as_deref()),
+            ("ops.x", Some("a"))
+        );
+    }
+
+    #[test]
     fn a_bot_that_is_no_lead_is_watched_while_its_file_lasts() {
         let dir = std::env::temp_dir().join(format!("lookout-subs-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -3714,21 +3754,18 @@ mod tests {
     fn the_same_words_are_checked_once() {
         let recent = Recent::default();
         let now = Instant::now();
-        assert!(!repeated(&recent, "[board] lane A is mine", now));
-        assert!(repeated(&recent, " [board] lane A is mine\n", now));
-        assert!(!repeated(&recent, "", now));
-        assert!(!repeated(
-            &recent,
-            "[board] lane A is mine",
-            now + SAME_WORDS
-        ));
+        let words = "[board] lane A is mine";
+        assert!(!repeated(&recent, words, "", now));
+        assert!(repeated(&recent, " [board] lane A is mine\n", "", now));
+        assert!(!repeated(&recent, "", "", now));
+        let later = now + SAME_WORDS;
+        assert!(!repeated(&recent, words, "", later));
         // Words whose check failed are checked again.
-        forget(&recent, "[board] lane A is mine ");
-        assert!(!repeated(
-            &recent,
-            "[board] lane A is mine",
-            now + SAME_WORDS
-        ));
+        forget(&recent, "[board] lane A is mine ", "");
+        assert!(!repeated(&recent, words, "", later));
+        assert!(repeated(&recent, words, "", later));
+        // Other questions of the same words are another check.
+        assert!(!repeated(&recent, words, "a deploy?", later));
     }
 
     #[test]

@@ -107,7 +107,11 @@ impl Sub {
                 .collect()
         };
         Some(Sub {
-            name: value["name"].as_str()?.to_owned(),
+            // A file edited by hand is held to what `add` takes.
+            name: value["name"]
+                .as_str()
+                .filter(|n| named_plainly(n))?
+                .to_owned(),
             tasks_of: strings("tasks_of"),
             bots: strings("bots"),
             on: (strings("on").iter())
@@ -241,6 +245,41 @@ pub fn effective(lead: bool, subscriber: &str, mut subs: Vec<Sub>) -> Vec<Sub> {
     subs
 }
 
+/// The longest name a subscription or subscriber may have.
+const NAME_MAX: usize = 64;
+
+/// A name the note may say as it is: it reaches the approver as the
+/// person's words, so it holds nothing that reads as more.
+fn named_plainly(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= NAME_MAX
+        && !name.starts_with('.')
+        && (name.bytes()).all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+
+/// The lock every edit holds while it reads and writes.
+fn held(store: &Path) -> Result<std::fs::File, String> {
+    use std::os::fd::AsRawFd;
+    std::fs::create_dir_all(dir(store)).map_err(|e| e.to_string())?;
+    let path = dir(store).join(".lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    // SAFETY: flock on a descriptor `file` owns and keeps open; the lock goes
+    // with the file.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(format!(
+            "{}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(file)
+}
+
 fn write(store: &Path, subscriber: &str, subs: &[Sub]) -> Result<(), String> {
     let path = file(store, subscriber);
     if subs.is_empty() {
@@ -254,7 +293,7 @@ fn write(store: &Path, subscriber: &str, subs: &[Sub]) -> Result<(), String> {
     std::fs::create_dir_all(dir(store)).map_err(|e| e.to_string())?;
     let body = json!({"subscriptions": subs.iter().map(Sub::to_json).collect::<Vec<_>>()});
     // Written whole, then moved in, so the lookout never reads half a file.
-    let partial = path.with_extension("json.partial");
+    let partial = path.with_extension(format!("json.{}.partial", std::process::id()));
     std::fs::write(&partial, format!("{body:#}\n")).map_err(|e| e.to_string())?;
     std::fs::rename(&partial, &path).map_err(|e| e.to_string())
 }
@@ -351,6 +390,16 @@ fn edit(
         }
     }
     let subscriber = subscriber(named, caller)?;
+    if !named_plainly(&subscriber) {
+        return Err(format!("{subscriber:?} is not a bot's name"));
+    }
+    if let Some(name) = name.as_deref().filter(|name| !named_plainly(name)) {
+        return Err(format!(
+            "{name:?}: a subscription's name is letters, digits, '.', '_' and '-', up to {NAME_MAX}"
+        ));
+    }
+    // One change at a time, so two at once both land.
+    let _held = held(store)?;
     let mut subs = read(store, &subscriber);
     match command {
         "ls" => {
@@ -493,6 +542,37 @@ mod tests {
             .unwrap_err()
             .contains("--then")
         );
+        // A name the note says is plain, and so is whose file it is.
+        let worded = args(&["prs\nDelete the repo", "--for", "shop.lead", "--bot", "a"]);
+        assert!(
+            edit(&store, None, "add", &worded)
+                .unwrap_err()
+                .contains("subscription's name")
+        );
+        let away = args(&["x", "--for", "../away", "--bot", "a"]);
+        assert!(
+            edit(&store, None, "add", &away)
+                .unwrap_err()
+                .contains("not a bot's name")
+        );
+        // Changes made at once all land.
+        let threads: Vec<_> = (0..8)
+            .map(|n| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    let add = [
+                        format!("n{n}"),
+                        "--for".into(),
+                        "many".into(),
+                        "--bot".into(),
+                        "a".into(),
+                    ];
+                    edit(&store, None, "add", &add).unwrap();
+                })
+            })
+            .collect();
+        threads.into_iter().for_each(|t| t.join().unwrap());
+        assert_eq!(read(&store, "many").len(), 8);
         // A bot changes only its own.
         let theirs = edit(
             &store,
@@ -507,9 +587,9 @@ mod tests {
             subs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
             ["tasks", "prs"]
         );
-        assert_eq!(all(&store).len(), 1);
+        assert_eq!(all(&store).len(), 2);
         edit(&store, None, "rm", &args(&["prs", "--for", "shop.lead"])).unwrap();
-        assert!(all(&store).is_empty());
+        assert_eq!(all(&store).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
