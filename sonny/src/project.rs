@@ -109,7 +109,13 @@ fn start_rule(sonny: &str) -> String {
          or brought here with the git push it names for a sandfs copy of a git repository; \
          for a sandfs copy of any other folder, {sonny} task changes NAME lists what the task changed, \
          and once you have checked that, {sonny} task changes NAME --apply writes it here. \
-         A start that fails leaves no folder behind; if it fails again, tell the person why instead of working around it."
+         A start that fails leaves no folder behind; if it fails again, tell the person why instead of working around it. \
+         A task works only in its own folder: name files in its brief by paths relative to this folder, which Sonny maps to the task's copy, \
+         and tell it to write by those paths, never by this folder's absolute path. \
+         Give every file one writer: each task and helper writes its own files and hands results back in its reply or in a file named for it. \
+         Never copy, cat or tee files from a task's folder into this one; a sandfs copy's changes come here only with {sonny} task changes NAME --apply. \
+         Commits a task makes in a repository inside a copy of a plain folder do not come back, so work that commits starts in that repository's own folder. \
+         Once the person says a task is done, {sonny} task rm NAME, from this folder, removes it and its folder; it refuses while its work is not here yet."
     ))
 }
 
@@ -612,6 +618,9 @@ mod tests {
             "leave out --setup for a task that only reads",
             "Pick a NAME that \"$AGENT_BIN\" ls --name \"${AGENT_BOT%%.*}.*\" does not list yet",
             "\"/opt/sonny\" task changes NAME --apply writes it here",
+            "Give every file one writer",
+            "Never copy, cat or tee files from a task's folder into this one",
+            "\"/opt/sonny\" task rm NAME, from this folder, removes it",
         ] {
             assert!(text.contains(said), "{said} in {text}");
         }

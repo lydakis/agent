@@ -143,18 +143,30 @@ off again never shows.
   folder. The lead starts each task with `sonny task NAME [--setup] [run
   flags] -- BRIEF`, which makes its folder that way, runs `.agents/setup`
   there with `--setup`, starts the task with `agent run`, and leaves no
-  folder behind when that fails; `sonny task changes NAME [--apply]` lists,
-  or writes back, what a sandfs copy of a plain folder changed. A plain
-  folder on another disk than sandfs's home (`~/.local/share/sandfs`), such
-  as an external volume, can't be copied, so its task gets a sandfs
-  workspace over the folder itself: the task's changes still stay in the
-  workspace, but it also sees what changes in the folder meanwhile.
-  `sonny task` also works from a plain terminal, with the `agent` installed
-  beside Sonny. sandfs is
+  folder behind when that fails. Paths into the folder in the brief are
+  rewritten to the task's copy, so a task told an absolute path still
+  writes its own copy. `sonny task changes NAME [--all] [--apply [--force]
+  [--only PATH...]]` lists, or writes back, what a sandfs copy of a plain
+  folder changed: never git's own files, and files git ignores (such as
+  `__pycache__`) only with `--all`. Commits a task makes in a repository
+  inside a plain folder stay in its copy, and in the copy of a linked
+  worktree, whose `.git` names its repository outside the copy, git is
+  turned off, so it can't change that repository while the files stay
+  behind. A plain folder on another disk than sandfs's home
+  (`~/.local/share/sandfs`), such as an external volume, can't be copied,
+  so its task gets a sandfs workspace over the folder itself: the task's
+  changes still stay in the workspace, but a file it has already looked at
+  may not show later changes to the folder, and `--apply` writes over them
+  unchecked. `sonny task rm NAME [--discard]` removes a task that is done
+  and the folder Sonny made it, refusing while its work isn't back yet:
+  changes not applied, uncommitted or not pushed. A worktree's branch is
+  kept unless it is merged. `sonny task` also works from a plain terminal,
+  with the `agent` installed beside Sonny. sandfs is
   built into Sonny, so it needs no install, only what a mount needs (FUSE 3
   on Linux, nothing on macOS). Its mounts are served by Sonny run again in
   the background, which outlives Sonny; Sonny mounts task copies a restart
-  unmounted again when it opens the lead.
+  unmounted again when it opens the lead, but not those whose task is gone,
+  which it names instead.
 - **Needs you:** when the lead needs the person to decide something, it
   calls its `ask` tool with the question and up to nine choices. Sonny
   pins the open questions above the composer, oldest first, until each is
