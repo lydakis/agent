@@ -927,8 +927,9 @@ class AutoApproverTests(ModelFixture):
                                     prompt='shell:printf DANGER')['result']['turn']
         self.assertEqual(daemon.finished(risky_turn)['data']['status'], 'completed')
         self.assertTrue(self.denial(daemon, risky_turn).startswith('judged risky: it destroys data'))
-        # An account out of credit fails the check at once, without waiting.
-        self.judge.statuses = ['quota']
+        # An account out of credit fails the check at once, without waiting,
+        # and again when it is tried once more.
+        self.judge.statuses = ['quota', 'quota']
         broke = daemon.request('submit', bot='Bob', request_id='c', prompt='shell:printf x')['result']['turn']
         self.assertEqual(daemon.finished(broke)['data']['status'], 'completed')
         self.assertEqual(self.denial(daemon, broke), 'not reviewed: the check failed')
@@ -1022,19 +1023,28 @@ class AutoApproverTests(ModelFixture):
         self.assertNotIn('synthetic-secret-value', sent)
         self.assertIn('[secret: bearer token]', sent)
 
-    def test_a_failed_check_denies_as_not_reviewed_and_a_rate_limit_waits(self):
+    def test_a_failed_check_is_tried_again_then_not_reviewed_and_a_rate_limit_waits(self):
         daemon = self.daemon()
         self.approver(daemon)
+        # A check that fails once is tried again, and its verdict stands.
         self.judge.statuses = [500]
+        retried = daemon.request('submit', bot='Bob', request_id='r', prompt='shell:printf one > one')['result']['turn']
+        self.assertEqual(daemon.finished(retried)['data']['status'], 'completed')
+        self.assertEqual((self.path / 'one').read_text(), 'one')
+        self.assertEqual([self.judge.requests.get(timeout=5)['path'] for _ in range(2)], ['/v1/systemone'] * 2)
+        # One that fails twice is not reviewed: a gate that lapses denies it.
+        self.judge.statuses = [500, 500]
         failed = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf one')['result']['turn']
         self.assertEqual(daemon.finished(failed)['data']['status'], 'completed')
         self.assertEqual(self.denial(daemon, failed), 'not reviewed: the check failed')
+        for _ in range(2):
+            self.judge.requests.get(timeout=5)
         # A 429 is retried after its Retry-After, within the round's deadline.
         self.judge.statuses = [429]
         paced = daemon.request('submit', bot='Bob', request_id='b', prompt='shell:printf two > two')['result']['turn']
         self.assertEqual(daemon.finished(paced)['data']['status'], 'completed')
         self.assertEqual((self.path / 'two').read_text(), 'two')
-        self.assertEqual(self.judge.requests.qsize(), 3)
+        self.assertEqual(self.judge.requests.qsize(), 2)
 
     def test_the_breaker_stops_a_turn_that_keeps_getting_denied(self):
         self.model.call_script = [('shell', {'command': f'printf DANGER-{n}'}) for n in range(5)]
@@ -1100,6 +1110,18 @@ class AutoApproverTests(ModelFixture):
                                         tag='auto', decision='allow', by='test')['result']['decision'], 'allow')
         self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
         self.assertEqual((self.path / 'danger').read_text(), 'DANGER')
+        # A check that fails, and fails again, hands the call over too: no
+        # model said no, so it is no denial and no strike.
+        self.judge.statuses = [500, 500]
+        unchecked = daemon.request('submit', bot='Carol', request_id='c', prompt='shell:printf ok')['result']['turn']
+        judged = next(line for line in iter(lambda: lines.get(timeout=5), None) if line['event'] == 'judged')
+        self.assertEqual((judged['turn'], judged['calls'][0]['decision'], judged['calls'][0]['reason']),
+                         (unchecked, 'ask', 'not reviewed: the check failed'))
+        [waiting] = daemon.request('approvals', bot='Carol')['result']['approvals']
+        self.assertEqual(waiting['denials']['auto'], {'in_row': 0, 'in_turn': 0})
+        daemon.request('answer', bot='Carol', turn=unchecked, call_id='shell-1', request=1,
+                       tag='auto', decision='allow', by='test')
+        self.assertEqual(daemon.finished(unchecked)['data']['status'], 'completed')
         # A gate that lapses has nobody to wait on: the doubt is a denial.
         lapsing = daemon.request('submit', bot='Bob', request_id='b', prompt='shell:printf DANGER')['result']['turn']
         self.assertEqual(daemon.finished(lapsing)['data']['status'], 'completed')
@@ -1155,7 +1177,9 @@ class AutoApproverTests(ModelFixture):
                                   origin=origin)['result']['turn']
             daemon.finished(turn)
             request = self.judge.requests.get(timeout=5)['body']['state']['request']
-            self.assertEqual(request, [{'by': 'model', 'text': 'shell:printf DANGER'}])
+            # After the bot's last message, if it has one: neither is a person's.
+            self.assertEqual(request[-1], {'by': 'model', 'text': 'shell:printf DANGER'})
+            self.assertEqual({words['by'] for words in request}, {'model'})
             [prompt] = daemon.request('prompts', bot='Bob', turn=turn)['result']['prompts']
             self.assertEqual({k: prompt[k] for k in ('turn', 'text', 'origin')},
                              {'turn': turn, 'text': 'shell:printf DANGER', 'origin': origin})

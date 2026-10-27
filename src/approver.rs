@@ -798,12 +798,21 @@ async fn round(shared: Arc<Shared>, bot: String, turn: i64, calls: Vec<Value>) {
     } else if left == 0 {
         vec![policy::not_reviewed("the approver is overloaded"); calls.len()]
     } else {
-        match judge(&shared, &bot, turn, &calls, deadline).await {
-            Ok((verdicts, used)) => {
-                usage = used;
-                verdicts
+        // A check that failed is tried once more while the round has time:
+        // a failure is the approver's, not the call's.
+        let mut retried = false;
+        loop {
+            match judge(&shared, &bot, turn, &calls, deadline).await {
+                Ok((verdicts, used)) => {
+                    usage = used;
+                    break verdicts;
+                }
+                Err(Unreviewed::Failed) if !retried && Instant::now() < deadline => retried = true,
+                Err(Unreviewed::Failed) => {
+                    break vec![policy::not_reviewed("the check failed"); calls.len()];
+                }
+                Err(Unreviewed::Not(verdict)) => break vec![verdict; calls.len()],
             }
-            Err(verdict) => vec![verdict; calls.len()],
         }
     };
     let judge_ms = started.elapsed().as_millis() as u64;
@@ -861,6 +870,14 @@ async fn interrupt(shared: &Shared, bot: &str, turn: i64) {
         .await;
 }
 
+/// Why a round has no verdicts from the judge.
+enum Unreviewed {
+    /// Reading the turn or asking the judge failed: worth one more try.
+    Failed,
+    /// It cannot be judged now: this verdict for every call.
+    Not(Verdict),
+}
+
 /// One judge request for the round, and a verdict for each call.
 async fn judge(
     shared: &Shared,
@@ -868,23 +885,22 @@ async fn judge(
     turn: i64,
     calls: &[Value],
     deadline: Instant,
-) -> std::result::Result<(Vec<Verdict>, Usage), Verdict> {
+) -> std::result::Result<(Vec<Verdict>, Usage), Unreviewed> {
+    let not = |why: &str| Unreviewed::Not(policy::not_reviewed(why));
     let Ok(Ok(_slot)) =
         tokio::time::timeout_at(deadline.into(), shared.judge.slots.acquire()).await
     else {
-        return Err(policy::not_reviewed("the approver is overloaded"));
+        return Err(not("the approver is overloaded"));
     };
     let intent =
         match tokio::time::timeout_at(deadline.into(), intent(shared, bot, turn, calls)).await {
-            Err(_) => return Err(policy::not_reviewed("the approver is overloaded")),
-            Ok(Err(Unjudged::TooLong)) => {
-                return Err(policy::not_reviewed("the call is too long to show"));
-            }
-            Ok(Err(Unjudged::Failed)) => return Err(policy::not_reviewed("the check failed")),
+            Err(_) => return Err(not("the approver is overloaded")),
+            Ok(Err(Unjudged::TooLong)) => return Err(not("the call is too long to show")),
+            Ok(Err(Unjudged::Failed)) => return Err(Unreviewed::Failed),
             Ok(Ok(intent)) => intent,
         };
     let (state, consent) = match policy::build(&intent, &shared.redactor) {
-        State::TooLong => return Err(policy::not_reviewed("the calls are too long to show")),
+        State::TooLong => return Err(not("the calls are too long to show")),
         State::Built { state, consent } => (state, consent),
     };
     let ids: Vec<&str> = intent.planned.iter().map(|call| call.id.as_str()).collect();
@@ -894,10 +910,10 @@ async fn judge(
         .ask(&shared.client, &state, &questions, deadline)
         .await
     {
-        Judged::Overloaded => Err(policy::not_reviewed("the approver is overloaded")),
+        Judged::Overloaded => Err(not("the approver is overloaded")),
         Judged::Failed(detail) => {
             report(json!({"event":"judge_failed","bot":bot,"turn":turn,"detail":detail}));
-            Err(policy::not_reviewed("the check failed"))
+            Err(Unreviewed::Failed)
         }
         Judged::Answers { answers, usage } => {
             let verdicts = intent
@@ -911,7 +927,7 @@ async fn judge(
                     })
                 })
                 .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| policy::not_reviewed("the check failed"))?;
+                .ok_or(Unreviewed::Failed)?;
             Ok((verdicts, usage))
         }
     }
@@ -1057,6 +1073,11 @@ async fn intent(
     let mut visited = HashSet::from([(bot.to_owned(), turn)]);
     let prompts = read["prompts"].as_array().map_or(&[][..], Vec::as_slice);
     let mut budget = PROMPT_BYTES.saturating_sub(prompt_bytes(prompts));
+    // What the bot asked before this turn: what a short "yes" answers.
+    if let Some(reply) = reply_words(&read["reply"]) {
+        budget = budget.saturating_sub(reply.text.len());
+        request.push(reply);
+    }
     for prompt in prompts {
         left_out.cut(prompt);
         let text = prompt_text(prompt);
@@ -1268,6 +1289,16 @@ async fn intent(
     })
 }
 
+/// The bot's last message before a turn, as a `prompts` read gives it: its
+/// model's words.
+fn reply_words(reply: &Value) -> Option<Words> {
+    Some(Words {
+        by: By::Model,
+        text: reply["text"].as_str()?.to_owned(),
+        refused: Vec::new(),
+    })
+}
+
 /// The calls a `prompts` read lists as refused after a prompt or steer.
 fn refused(calls: &Value) -> Vec<Refused> {
     calls
@@ -1417,7 +1448,11 @@ async fn delegated(
         .await
     {
         Ok(mut read) => Ok(match read["prompts"].take() {
-            Value::Array(prompts) => {
+            Value::Array(mut prompts) => {
+                // What that bot asked before the turn, as its model's words.
+                if let Some(text) = read["reply"]["text"].as_str() {
+                    prompts.insert(0, json!({"text":text,"origin":"reply"}));
+                }
                 *budget = budget.saturating_sub(prompt_bytes(&prompts));
                 // Steers left out may hold that person's latest word.
                 Above::Prompts {

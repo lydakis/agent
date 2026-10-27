@@ -588,7 +588,14 @@ so only one instance runs at a time, and answers in layers:
    shown to the judge beside the words they came after (`refused_calls`
    on a prompt or steer, this turn's or an earlier one's), so a plain
    "yes" or "approved" right after a refusal asks for what was refused,
-   and one that came before it does not; a lead passing the person's go-ahead on to a
+   and one that came before it does not. A bare go-ahead is read against
+   the question it answers: the bot's last message before the turn
+   (`reply` in `prompts`) comes first in `request`, as the model's words,
+   so a "yes" to "shall I run the tests?" does not ask for a deploy
+   refused earlier. A call that redoes a refused one another way (`curl`
+   for a refused `git clone`, the same brief moved into a file) is judged
+   as the refused one was. Messages to the agent's caller
+   (`$AGENT_PARENT`) or to agents it runs never count as a send. A lead passing the person's go-ahead on to a
    task bot carries it the same way, since the person's words above a
    delegated prompt are read as the person's. A high
    answer on the approval-channel question stays denied whatever the
@@ -598,7 +605,14 @@ so only one instance runs at a time, and answers in layers:
    separate turn that may look at files before it answers. The approver
    never allows on a doubted, failed, or timed-out verdict. As in Codex,
    the reason says which it was: "judged risky: REASON" or "not reviewed:
-   the check failed", so the model can tell a refusal from an outage. A Jev
+   the check failed", so the model can tell a refusal from an outage.
+   Since 2026-10-27 a call nobody reviewed is no longer refused outright:
+   a check that failed is tried once more while the round has time, and a
+   round still not reviewed (failed, overloaded, or too long to show) is
+   handed to the person like a doubted call, and denied only on a gate
+   that lapses. A judge that failed every round in a few milliseconds had
+   ended Sonny turns on `ls` and `echo hello`, its failures counted as
+   denials toward the breaker. A Jev
    request gets 10 s, the SDK's default, before it counts as failed, and a
    general model's round 30 s.
 5. **Circuit breaker.** After 3 denials in a row for a bot, or 20 in one

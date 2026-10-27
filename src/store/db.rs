@@ -5296,12 +5296,16 @@ impl Database {
     /// What each listed call and earlier prompt counts against `bytes` for
     /// its fields, so many short entries cannot outgrow a reply.
     pub const PROMPTS_ENTRY: usize = 64;
+    /// The most of the bot's last message before a turn that a `prompts`
+    /// read returns, from its end.
+    pub const PROMPTS_REPLY: usize = 2048;
     /// A turn's words and calls, as a program judging its calls reads them:
     /// the turn's prompt and each steer it absorbed, in order, with the bot
     /// turn that wrote each (none for a person's words); the calls it
     /// started, with argument previews and whether each failed; then the
     /// bot's earlier prompts, newest first. Each prompt or steer carries
-    /// the calls refused after it (`refused`). The words' text counts against
+    /// the calls refused after it (`refused`), and `reply` is the end of
+    /// the bot's last message before the turn. The words' text counts against
     /// `bytes` in that order and the calls' against their own `bytes`, and
     /// each steer, call, and earlier prompt also counts `PROMPTS_ENTRY`;
     /// text that does not fit is cut and marked
@@ -5340,6 +5344,9 @@ impl Database {
         };
         let mut left = bytes;
         let mut prompts = vec![prompt_entry(turn, text, from, from_turn, origin, &mut left)];
+        // What the bot last said before the prompt: what a person's short
+        // answer, such as "yes", answers.
+        let reply = self.reply_before(name, turn, &mut left)?;
         let mut prompts_more = false;
         let mut steers = self.conn.prepare_cached(
             "SELECT json_extract(data,'$.steer') FROM events WHERE turn=? AND kind='steered' ORDER BY id",
@@ -5453,10 +5460,61 @@ impl Database {
                 }
             }
         }
-        Ok(
-            json!({"bot":name,"turn":turn,"status":turn_status_name(&status),"workspace":workspace,
-            "prompts":prompts,"prompts_more":prompts_more,"calls":calls,"calls_more":calls_more,"earlier":earlier,"more":more}),
-        )
+        let mut read = json!({"bot":name,"turn":turn,"status":turn_status_name(&status),"workspace":workspace,
+            "prompts":prompts,"prompts_more":prompts_more,"calls":calls,"calls_more":calls_more,"earlier":earlier,"more":more});
+        if let Some(reply) = reply {
+            read["reply"] = reply;
+        }
+        Ok(read)
+    }
+    /// The last message of the bot's turn before `turn`, as `{turn, text}`
+    /// with its end kept: at most `PROMPTS_REPLY` bytes, or the budget
+    /// left, starting at a whole word when cut (`truncated`).
+    fn reply_before(&self, name: &str, turn: i64, left: &mut usize) -> Result<Option<Value>> {
+        let previous: Option<i64> = self
+            .conn
+            .prepare_cached(
+                "SELECT id FROM turns WHERE bot=? AND id<? AND started_ms IS NOT NULL ORDER BY id DESC LIMIT 1",
+            )?
+            .query_row(params![name, turn], |r| r.get(0))
+            .optional()?;
+        let Some(previous) = previous else {
+            return Ok(None);
+        };
+        let node = self
+            .conn
+            .prepare_cached(
+                "SELECT json_extract(data,'$.node') FROM events WHERE turn=? AND kind='message' ORDER BY id DESC LIMIT 1",
+            )?
+            .query_row([previous], |r| r.get::<_, Option<i64>>(0))
+            .optional()?
+            .flatten();
+        let Some(node) = node else {
+            return Ok(None);
+        };
+        let item: Vec<u8> =
+            self.conn
+                .query_row("SELECT item FROM nodes WHERE id=?", [node], |r| r.get(0))?;
+        let text = assistant_text(&serde_json::from_slice(&item)?);
+        let limit = Self::PROMPTS_REPLY.min(*left);
+        let mut start = text.len().saturating_sub(limit);
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        let truncated = start > 0;
+        if truncated {
+            // Never a part-word, so a secret is not shown without what marks it.
+            start = text[start..]
+                .find(char::is_whitespace)
+                .map_or(text.len(), |at| start + at);
+        }
+        let shown = text[start..].trim_start();
+        *left -= shown.len().min(*left);
+        let mut reply = json!({"turn":previous,"text":shown});
+        if truncated {
+            reply["truncated"] = json!(true);
+        }
+        Ok(Some(reply))
     }
     /// The calls a turn was refused, each `{name, arguments}` with its
     /// arguments cut to the budget left, and the turn whose words it came

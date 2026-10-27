@@ -10818,6 +10818,52 @@ fn a_refused_call_is_read_after_the_words_it_came_after() {
 }
 
 #[test]
+fn a_turn_reads_with_the_message_its_words_answer() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let begin = |db: &mut Database, key: &str| {
+        db.begin(
+            "Bob",
+            key,
+            "yes",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn
+    };
+    let first = begin(&mut db, "r1");
+    // A bot that never answered asks nothing.
+    assert!(
+        db.prompts("Bob", first, 64 * 1024)
+            .unwrap()
+            .get("reply")
+            .is_none()
+    );
+    let question = format!("{} Shall I run the tests?", "word ".repeat(1000));
+    db.append(
+        first,
+        vec![assistant("Looking."), assistant(&question)],
+        &[],
+        None,
+    )
+    .unwrap();
+    db.finish(first, None).unwrap();
+    let second = begin(&mut db, "r2");
+    // The last message, its end kept and starting at a whole word.
+    let reply = &db.prompts("Bob", second, 64 * 1024).unwrap()["reply"];
+    assert_eq!(reply["turn"], first);
+    assert_eq!(reply["truncated"], true);
+    let text = reply["text"].as_str().unwrap();
+    assert!(text.ends_with("Shall I run the tests?") && text.starts_with("word "));
+    assert!(text.len() <= 2048);
+    // It counts against the words' budget like any text.
+    let read = db.prompts("Bob", second, 3 + 12).unwrap();
+    assert_eq!(read["reply"]["text"], "the tests?");
+}
+
+#[test]
 fn a_resent_keyed_creation_gets_its_bot_and_a_changed_one_names_the_field() {
     let mut db = db();
     let keyed = || Binding {
