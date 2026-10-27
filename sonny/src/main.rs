@@ -3637,14 +3637,20 @@ impl App {
     }
 
     async fn key(&mut self, mut event: Event) {
-        // Ctrl-H is the backspace a terminal sends as 0x08, which reads as
-        // Ctrl and `h`: it deletes, as in a shell.
+        // Keys a shell reads as others: Ctrl-H is the backspace a terminal
+        // sends as 0x08, which reads as Ctrl and `h` (with Alt, it deletes
+        // a word, as Alt-Backspace does); Ctrl-P and Ctrl-N go up and down.
         if let Event::Key(key) = &mut event
-            && key.code == KeyCode::Char('h')
-            && key.modifiers == KeyModifiers::CONTROL
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && let Some(code) = match key.code {
+                KeyCode::Char('h') => Some(KeyCode::Backspace),
+                KeyCode::Char('p') => Some(KeyCode::Up),
+                KeyCode::Char('n') => Some(KeyCode::Down),
+                _ => None,
+            }
         {
-            key.code = KeyCode::Backspace;
-            key.modifiers = KeyModifiers::NONE;
+            key.code = code;
+            key.modifiers -= KeyModifiers::CONTROL;
         }
         if self.watch.is_some() {
             if let Event::Key(key) = event
@@ -3767,7 +3773,11 @@ impl App {
                     self.pick = 0;
                     return;
                 }
-                KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                KeyCode::Enter
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                {
                     self.input.set(picked);
                     self.pick = 0;
                     self.submit().await;
@@ -3813,7 +3823,7 @@ impl App {
                     KeyCode::Char('d') if ctrl && self.input.is_empty() => self.quit = true,
                     KeyCode::Char('d') if ctrl => self.input.delete(),
                     KeyCode::Char(c @ ('y' | 'n'))
-                        if !self.approvals.is_empty() && self.input.is_empty() =>
+                        if !ctrl && !alt && !self.approvals.is_empty() && self.input.is_empty() =>
                     {
                         // A call whose whole arguments could not be read
                         // can only be denied.
@@ -3831,6 +3841,9 @@ impl App {
                     KeyCode::Char('u') if ctrl => self.input.delete_to_start(),
                     KeyCode::Char('k') if ctrl => self.input.delete_to_end(),
                     KeyCode::Char('w') if ctrl => self.input.delete_word(),
+                    KeyCode::Char('y') if ctrl => self.input.yank(),
+                    // Ctrl-J is the line feed a terminal sends for it.
+                    KeyCode::Char('j') if ctrl => self.input.insert("\n"),
                     // A picture on the clipboard, as Codex and Claude Code
                     // take one: terminals paste only text.
                     KeyCode::Char('v') if ctrl => match attach::clipboard() {
@@ -3840,9 +3853,11 @@ impl App {
                     },
                     KeyCode::Char('b') if alt => self.input.word_left(),
                     KeyCode::Char('f') if alt => self.input.word_right(),
+                    KeyCode::Char('d') if alt => self.input.delete_word_forward(),
                     KeyCode::Char(c) if !ctrl => self.input.insert(c.encode_utf8(&mut [0; 4])),
                     KeyCode::Backspace if ctrl || alt => self.input.delete_word(),
                     KeyCode::Backspace => self.input.backspace(),
+                    KeyCode::Delete if ctrl || alt => self.input.delete_word_forward(),
                     KeyCode::Delete => self.input.delete(),
                     KeyCode::Left if ctrl || alt => self.input.word_left(),
                     KeyCode::Right if ctrl || alt => self.input.word_right(),
@@ -3856,7 +3871,9 @@ impl App {
                     KeyCode::Down => {
                         self.input.down(self.width);
                     }
-                    KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    // Alt-Enter too, for terminals that send Shift-Enter
+                    // as a plain Enter.
+                    KeyCode::Enter if alt || key.modifiers.contains(KeyModifiers::SHIFT) => {
                         self.input.insert("\n")
                     }
                     KeyCode::Enter => self.submit().await,
@@ -6177,6 +6194,36 @@ mod tests {
         app.input.set("/mo");
         app.key(Event::Key(ctrl_h)).await;
         assert_eq!(&*app.input, "/m", "with the command menu open too");
+    }
+
+    #[tokio::test]
+    async fn the_shell_editing_keys_work_in_the_composer() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let press = |code, modifiers| Event::Key(event::KeyEvent::new(code, modifiers));
+        let ctrl = |c| press(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let alt = |c| press(KeyCode::Char(c), KeyModifiers::ALT);
+        app.input.set("one two three");
+        app.key(ctrl('w')).await;
+        app.key(ctrl('a')).await;
+        app.key(alt('d')).await;
+        assert_eq!(&*app.input, " two ");
+        app.key(ctrl('y')).await;
+        app.key(ctrl('e')).await;
+        app.key(ctrl('j')).await;
+        app.key(ctrl('y')).await;
+        assert_eq!(&*app.input, "one two \none");
+        app.key(ctrl('p')).await;
+        app.key(press(KeyCode::Delete, KeyModifiers::CONTROL)).await;
+        assert_eq!(&*app.input, "one \none", "Ctrl-P went up a row");
+        app.key(ctrl('n')).await;
+        app.key(press(
+            KeyCode::Char('h'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ))
+        .await;
+        assert_eq!(&*app.input, "one \n");
+        app.key(press(KeyCode::Enter, KeyModifiers::ALT)).await;
+        assert_eq!(&*app.input, "one \n\n");
     }
 
     #[test]

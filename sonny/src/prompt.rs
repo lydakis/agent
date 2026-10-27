@@ -19,6 +19,8 @@ pub struct Prompt {
     /// The column up and down aim for, kept while they alone move the
     /// cursor, so a short row on the way does not pull it in.
     goal: Option<usize>,
+    /// What the last word or line deletion took, for Ctrl-Y to put back.
+    killed: String,
 }
 
 /// One drawn row: the bytes of the text it shows.
@@ -115,8 +117,31 @@ impl Prompt {
     pub fn delete_word(&mut self) {
         self.goal = None;
         let start = self.word_start();
-        self.text.drain(start..self.at);
-        self.at = start;
+        self.kill(start..self.at);
+    }
+
+    /// Delete to the end of the word after the cursor.
+    pub fn delete_word_forward(&mut self) {
+        self.goal = None;
+        let start = self.at;
+        self.word_right();
+        self.kill(start..self.at);
+    }
+
+    /// Put back what the last word or line deletion took, at the cursor.
+    pub fn yank(&mut self) {
+        let killed = self.killed.clone();
+        self.insert(&killed);
+    }
+
+    /// Take out `range`, keeping it for [`Self::yank`] when there is any,
+    /// and leave the cursor where it began.
+    fn kill(&mut self, range: std::ops::Range<usize>) {
+        if !range.is_empty() {
+            self.killed = self.text[range.clone()].to_owned();
+        }
+        self.at = range.start;
+        self.text.drain(range);
         self.settle();
     }
 
@@ -128,9 +153,7 @@ impl Prompt {
             start if start == self.at => self.before(self.at),
             start => start,
         };
-        self.text.drain(start..self.at);
-        self.at = start;
-        self.settle();
+        self.kill(start..self.at);
     }
 
     /// Delete to the end of the line, or the line break after the cursor
@@ -141,8 +164,7 @@ impl Prompt {
             end if end == self.at => self.after(self.at),
             end => end,
         };
-        self.text.drain(self.at..end);
-        self.settle();
+        self.kill(self.at..end);
     }
 
     /// Put the cursor back on a grapheme boundary, the next one, after an
@@ -346,6 +368,25 @@ mod tests {
         prompt.right();
         prompt.delete_to_end();
         assert_eq!(&*prompt, "f");
+    }
+
+    #[test]
+    fn what_a_deletion_takes_comes_back_with_yank() {
+        let mut prompt = typed("one two  three");
+        prompt.home();
+        prompt.delete_word_forward();
+        assert_eq!(&*prompt, " two  three");
+        prompt.delete_word_forward();
+        assert_eq!(&*prompt, "  three");
+        prompt.end();
+        prompt.yank();
+        assert_eq!(&*prompt, "  three two");
+        prompt.delete_to_start();
+        // Deleting nothing keeps what was taken before.
+        prompt.delete_word();
+        prompt.yank();
+        prompt.yank();
+        assert_eq!(&*prompt, "  three two  three two");
     }
 
     #[test]

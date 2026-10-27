@@ -79,7 +79,13 @@ The skill tells agents to close what they opened once read; whatever a task
 left open closes with its window.
 
 Enter sends (and steers a running turn), Esc interrupts, `y`/`n` answer a
-pending approval, Ctrl-C clears the composer or quits.
+pending approval, Ctrl-C clears the composer or quits. Shift-Enter or
+Alt-Enter (or Ctrl-J) starts a new line. The composer takes a shell's editing
+keys, as Codex's does: Ctrl-A/E and Ctrl-B/F move, Alt-B/F (or Alt- or
+Ctrl-arrows) move a word, Ctrl-P/N move a row, Ctrl-H and Ctrl-D delete a
+character, Ctrl-W (or Alt-Backspace) and Alt-D (or Alt-Delete) a word,
+Ctrl-U and Ctrl-K to the line's start and end, and Ctrl-Y puts back what the
+last of those took.
 
 Pictures go with a message: Ctrl-V takes the one on the clipboard, as in
 Codex and Claude Code (terminals paste only text), and an image file
