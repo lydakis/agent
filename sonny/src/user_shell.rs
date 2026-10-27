@@ -151,14 +151,17 @@ impl Kept {
         }
     }
 
-    fn text(self) -> String {
-        let head = plain(&String::from_utf8_lossy(&self.head));
+    fn text(mut self) -> String {
         let tail: Vec<u8> = self.tail.into();
-        let tail = plain(&String::from_utf8_lossy(&tail));
-        match self.dropped {
-            0 => head + &tail,
-            n => format!("{head}\n[… {n} bytes left out …]\n{tail}"),
+        // Nothing left out: one output, read whole, so a character or an
+        // escape across the two halves stays as it was.
+        if self.dropped == 0 {
+            self.head.extend(tail);
+            return plain(&String::from_utf8_lossy(&self.head));
         }
+        let head = plain(&String::from_utf8_lossy(&self.head));
+        let tail = plain(&String::from_utf8_lossy(&tail));
+        format!("{head}\n[… {} bytes left out …]\n{tail}", self.dropped)
     }
 }
 
@@ -357,6 +360,14 @@ mod tests {
         assert!(text.starts_with(&"a".repeat(HEAD)));
         assert!(text.contains("\n[… 100 bytes left out …]\n"));
         assert!(text.ends_with(&"c".repeat(TAIL)));
+    }
+
+    #[test]
+    fn an_output_kept_whole_is_read_whole() {
+        let mut kept = Kept::default();
+        let text = format!("{}aéz\n{}\rfinished", "é".repeat(4095), "x".repeat(10));
+        kept.push(text.as_bytes());
+        assert_eq!(kept.text(), format!("{}aéz\nfinished", "é".repeat(4095)));
     }
 
     #[test]

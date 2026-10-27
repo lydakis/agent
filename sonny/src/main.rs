@@ -1107,6 +1107,8 @@ struct App {
     /// The person's commands that ran, which go to the bot with the next
     /// message.
     shells: Vec<user_shell::Ran>,
+    /// What they printed, to show once the bot's words allow.
+    shown: Vec<Line<'static>>,
 }
 
 /// The lead's tasks, laid out in the project's Rex session: a window for
@@ -1630,6 +1632,7 @@ impl App {
             keys_paused: Arc::default(),
             shell: None,
             shells: Vec::new(),
+            shown: Vec::new(),
         }
     }
 
@@ -1771,16 +1774,19 @@ impl App {
         }
     }
 
-    /// The person's command, once it ran: what it printed is shown, and
-    /// it waits for the next message.
-    /// The bot's words still coming are not cut into.
+    /// The person's command, once it ran: it waits for the next message
+    /// at once, and what it printed is shown once the bot's words still
+    /// coming are not cut into.
     async fn shell_ran(&mut self) {
-        if !self.shell.as_ref().is_some_and(|s| s.is_finished()) || self.live.is_some() {
-            return;
+        if self.shell.as_ref().is_some_and(|s| s.is_finished()) {
+            let ran = self.shell.take().unwrap().ran().await;
+            self.shown.extend(user_shell::lines(&ran, self.width));
+            self.shells.push(ran);
         }
-        let ran = self.shell.take().unwrap().ran().await;
-        self.commit(user_shell::lines(&ran, self.width));
-        self.shells.push(ran);
+        if self.live.is_none() && !self.shown.is_empty() {
+            let shown = std::mem::take(&mut self.shown);
+            self.commit(shown);
+        }
     }
 
     /// Read the lead's open questions again, every second.
