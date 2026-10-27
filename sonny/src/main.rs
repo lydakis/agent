@@ -39,6 +39,7 @@ mod task;
 mod term;
 mod transcript;
 mod trigger;
+mod user_shell;
 
 use agent_client::{Client, Events};
 use ratatui::{
@@ -1031,6 +1032,23 @@ struct Running {
     phase: String,
 }
 
+/// The most of the person's refused commands kept for their next
+/// message, well under what the daemon takes in one.
+const UNSENT_BYTES: usize = 64 * 1024;
+
+/// What sends a command's record: what it printed is not the person's
+/// words, so it authorizes nothing the agent then does.
+const SHELL: &str = "shell";
+
+/// Keeps a refused command's record for the next message, letting the
+/// oldest go past what one message should carry.
+fn hold(unsent: &mut Vec<String>, record: String) {
+    unsent.push(record);
+    while unsent.len() > 1 && unsent.iter().map(String::len).sum::<usize>() > UNSENT_BYTES {
+        unsent.remove(0);
+    }
+}
+
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, unlisted.
 const COMMANDS: [(&str, &str); 12] = [
@@ -1180,6 +1198,16 @@ struct App {
     side: Option<std::process::Child>,
     /// Keys are left to the side chat while it is open.
     keys_paused: Arc<std::sync::atomic::AtomicBool>,
+    /// A `!command` of the person's, running.
+    shell: Option<user_shell::Running>,
+    /// What the person's commands printed, to show once the bot's words
+    /// allow.
+    shown: Vec<Line<'static>>,
+    /// The records of those the daemon refused, to go with the next message.
+    unsent: Vec<String>,
+    /// Those whose output this window showed, from when their record is
+    /// sent until it lands.
+    ran_here: Vec<user_shell::Ran>,
 }
 
 /// The lead's tasks, laid out in the project's Rex session: a window for
@@ -1779,6 +1807,10 @@ impl App {
             last_reply: String::new(),
             side: None,
             keys_paused: Arc::default(),
+            shell: None,
+            shown: Vec::new(),
+            unsent: Vec::new(),
+            ran_here: Vec::new(),
         }
     }
 
@@ -1907,6 +1939,7 @@ impl App {
                 self.spread().await;
             }
             self.side_closed();
+            self.shell_ran().await;
             self.listed();
             self.follow_place().await;
             self.follow_asks();
@@ -1916,6 +1949,30 @@ impl App {
                 self.repaint = false;
                 self.repaint(terminal).await?;
             }
+        }
+    }
+
+    /// The person's command, once it ran: the bot is given it at once, as
+    /// a message, so it answers it as Claude Code's does: a turn of its
+    /// own, or a steer of the running one. What it printed is shown once
+    /// the bot's words still coming are not cut into.
+    async fn shell_ran(&mut self) {
+        if self.shell.as_ref().is_some_and(|s| s.is_finished()) {
+            let ran = self.shell.take().unwrap().ran().await;
+            self.shown.extend(user_shell::lines(&ran, self.width));
+            let record = user_shell::record(&ran);
+            // Refused, it is kept, to go with the next message.
+            match self.send(record.clone(), Some(SHELL), false).await {
+                Ok(()) => self.ran_here.extend(user_shell::read(&record)),
+                Err(error) => {
+                    self.notice = Some(format!("{error}; it goes with your next message"));
+                    hold(&mut self.unsent, record);
+                }
+            }
+        }
+        if self.live.is_none() && !self.shown.is_empty() {
+            let shown = std::mem::take(&mut self.shown);
+            self.commit(shown);
         }
     }
 
@@ -2378,7 +2435,8 @@ impl App {
                 }
                 match (item["type"].as_str(), item["role"].as_str()) {
                     (_, Some("user")) => {
-                        let lines = transcript::prompt(&text(&item), None, self.width);
+                        // What the person ran is shown as it was when it ran.
+                        let lines = landed(&text(&item), &mut self.ran_here, self.width);
                         self.commit(lines);
                     }
                     (_, Some("assistant")) => {
@@ -2467,18 +2525,53 @@ impl App {
     fn staged_rows(&self, width: usize) -> Vec<Line<'static>> {
         self.staged
             .iter()
-            .flat_map(|(_, prompt)| {
-                prompt.split('\n').enumerate().flat_map(move |(at, line)| {
-                    let lead = if at == 0 { "› " } else { "  " };
-                    transcript::wrap(
-                        Line::from(line.to_owned()).dim(),
-                        width,
-                        Span::raw(lead).dim(),
-                        Span::raw("  "),
-                    )
-                })
+            .flat_map(|(_, prompt)| match user_shell::read(prompt) {
+                Some(ran) => user_shell::header(&ran.command, width, true),
+                None => prompt
+                    .split('\n')
+                    .enumerate()
+                    .flat_map(|(at, line)| {
+                        let lead = if at == 0 { "› " } else { "  " };
+                        transcript::wrap(
+                            Line::from(line.to_owned()).dim(),
+                            width,
+                            Span::raw(lead).dim(),
+                            Span::raw("  "),
+                        )
+                    })
+                    .collect(),
             })
             .collect()
+    }
+
+    /// The person's command while it runs, and those the agent could not
+    /// be given yet.
+    fn shell_rows(&self, width: usize) -> Vec<Line<'static>> {
+        let mut rows = Vec::new();
+        for record in &self.unsent {
+            if let Some(ran) = user_shell::read(record) {
+                let mut header = user_shell::header(&ran.command, width, true);
+                if let Some(last) = header.last_mut() {
+                    last.spans
+                        .push(Span::raw(" · goes with your next message").dim());
+                }
+                rows.extend(header);
+            }
+        }
+        if let Some(shell) = &self.shell {
+            let mut header = user_shell::header(&shell.command, width, true);
+            if let Some(last) = header.last_mut() {
+                last.spans.push(
+                    Span::raw(format!(
+                        " · running {} · esc stops it",
+                        transcript::elapsed(shell.started.elapsed().as_secs())
+                    ))
+                    .dim(),
+                );
+            }
+            rows.extend(header);
+        }
+        rows
     }
 
     /// The bot's words not yet written: the rows held, then the open line,
@@ -2672,7 +2765,7 @@ impl App {
                     && let Some(node) = data["node"].as_i64()
                     && let Some(item) = self.items(&[node]).await.first()
                 {
-                    let lines = transcript::prompt(&text(item), None, self.width);
+                    let lines = landed(&text(item), &mut self.ran_here, self.width);
                     self.commit(lines);
                 }
             }
@@ -2683,7 +2776,7 @@ impl App {
                     && let Some(item) = self.items(&[node]).await.first()
                 {
                     self.end_live(Words::Reply);
-                    let lines = transcript::prompt(&text(item), None, self.width);
+                    let lines = landed(&text(item), &mut self.ran_here, self.width);
                     self.commit(lines);
                 }
             }
@@ -3173,7 +3266,13 @@ impl App {
                         None => format!("{name} {}", arguments["path"].as_str().unwrap_or("")),
                     };
                 }
-                (_, Some("user")) => return format!("asked: {}", first_line(&text(&item))),
+                (_, Some("user")) => {
+                    let text = text(&item);
+                    return match user_shell::read(&text) {
+                        Some(ran) => format!("ran: ! {}", first_line(&ran.command)),
+                        None => format!("asked: {}", first_line(&text)),
+                    };
+                }
                 _ => {}
             }
         }
@@ -3454,7 +3553,9 @@ impl App {
                     }
                     KeyCode::Enter => self.submit().await,
                     KeyCode::Esc => {
-                        if let Some(running) = &self.running {
+                        if let Some(shell) = &self.shell {
+                            shell.stop();
+                        } else if let Some(running) = &self.running {
                             let turn = running.turn;
                             let _ = self
                                 .client
@@ -3481,6 +3582,24 @@ impl App {
     async fn submit(&mut self) {
         let prompt = self.input.trim().to_owned();
         if prompt.is_empty() {
+            return;
+        }
+        if let Some(command) = prompt.strip_prefix('!') {
+            let command = command.trim();
+            if command.is_empty() {
+                self.notice = Some("! runs a shell command: type one after it".into());
+            } else if self.shell.is_some() {
+                self.notice = Some("a command of yours still runs; esc stops it".into());
+            } else {
+                match user_shell::start(command, &self.workspace) {
+                    Ok(running) => {
+                        self.shell = Some(running);
+                        self.input.clear();
+                        self.notice = None;
+                    }
+                    Err(error) => self.notice = Some(error),
+                }
+            }
             return;
         }
         if matches!(prompt.as_str(), "/status" | "/agents" | "/ps") {
@@ -3677,8 +3796,42 @@ impl App {
             Some(ask) => asks::answer(ask, &prompt),
             None => prompt,
         };
+        // What the person ran and the agent could not be given yet goes
+        // first, each on its own, and this message joins the turn they start.
+        let mut join = false;
+        while let Some(record) = self.unsent.first().cloned() {
+            if let Err(error) = self.send(record.clone(), Some(SHELL), join).await {
+                self.notice = Some(error);
+                return;
+            }
+            self.ran_here.extend(user_shell::read(&record));
+            self.unsent.remove(0);
+            join = true;
+        }
+        match self.send(prompt, None, join).await {
+            Ok(()) => {
+                if let Some(ask) = answering {
+                    asks::done(&ask);
+                    self.asks.retain(|open| open.file != ask.file);
+                }
+                self.input.clear();
+                self.notice = None;
+            }
+            Err(error) => self.notice = Some(error),
+        }
+    }
+
+    /// Send `prompt`: a turn of its own, or a steer of the running one (or
+    /// of the one just started, `join`); staged until it lands. `origin`
+    /// names what sent it when the person's words did not.
+    async fn send(
+        &mut self,
+        prompt: String,
+        origin: Option<&str>,
+        join: bool,
+    ) -> Result<(), String> {
         // A message to a busy bot joins its running turn, on that turn's model.
-        let delivery = self.running.is_some().then_some("steer");
+        let delivery = (join || self.running.is_some()).then_some("steer");
         let model = delivery
             .is_none()
             .then(|| self.turn_model.clone())
@@ -3686,31 +3839,23 @@ impl App {
         // A steer never moves a bot, so a moved lead comes back with the
         // next message that starts a turn.
         let workspace = delivery.is_none().then(|| self.move_to.clone()).flatten();
-        let submitted = self
+        let reply = self
             .client
             .request(
                 "submit",
                 json!({"bot": self.bot, "request_id": unique("tui"), "prompt": prompt,
-                    "delivery": delivery, "model": model, "workspace": workspace}),
+                    "delivery": delivery, "model": model, "workspace": workspace,
+                    "origin": origin}),
             )
-            .await;
-        match submitted {
-            Ok(reply) => {
-                if let Some(turn) = reply["turn"].as_i64() {
-                    self.staged.push((turn, prompt));
-                }
-                if let Some(ask) = answering {
-                    asks::done(&ask);
-                    self.asks.retain(|open| open.file != ask.file);
-                }
-                self.input.clear();
-                self.notice = None;
-                if workspace.is_some() {
-                    self.move_to = None;
-                }
-            }
-            Err(error) => self.notice = Some(error.to_string()),
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some(turn) = reply["turn"].as_i64() {
+            self.staged.push((turn, prompt));
         }
+        if workspace.is_some() {
+            self.move_to = None;
+        }
+        Ok(())
     }
 
     /// `/side`: a side chat with a copy of this bot, taken where it is now,
@@ -3892,6 +4037,7 @@ impl App {
         let mut open_rows = self.open_rows(width);
         // Then what was sent and has not landed, kept in view below it.
         open_rows.extend(self.staged_rows(width));
+        open_rows.extend(self.shell_rows(width));
         // The lead's questions stay pinned above the status row.
         open_rows.extend(asks::rows(&self.asks, width, self.chatting));
         let spare = room.saturating_sub(composer_rows.len()) + 1;
@@ -4106,11 +4252,14 @@ impl App {
         }
         let layout = self.input.layout(width);
         let (row, col) = self.input.cursor(&layout);
+        // A shell command is marked as one while it is typed.
+        let shell = self.input.starts_with('!');
         let rows: Vec<Line<'static>> = layout
             .iter()
             .enumerate()
             .map(|(at, part)| {
                 let lead = match at {
+                    0 if shell => Span::raw("› ").bold().fg(Color::Magenta),
                     0 => Span::raw("› ").bold(),
                     _ => Span::raw("  "),
                 };
@@ -4161,6 +4310,14 @@ impl App {
         }
         match &self.notice {
             Some(notice) => Line::from(Span::raw(notice.clone()).fg(Color::Yellow)),
+            None if self.input.starts_with('!') => Line::from(vec![
+                Span::raw("! ").bold().fg(Color::Magenta),
+                Span::raw(format!(
+                    "runs in {}; the agent is told what it printed",
+                    tilde(&self.workspace)
+                ))
+                .dim(),
+            ]),
             None => Line::default(),
         }
     }
@@ -4312,6 +4469,22 @@ fn short(bot: &str, project: &str, lead: &str) -> String {
         .to_owned()
 }
 
+/// A message as it lands in the conversation. A command the person ran
+/// is by name only when `shown` holds it (this window showed its output
+/// when it ran, and lets it go), else whole.
+fn landed(text: &str, shown: &mut Vec<user_shell::Ran>, width: usize) -> Vec<Line<'static>> {
+    let Some(ran) = user_shell::read(text) else {
+        return transcript::prompt(text, None, width);
+    };
+    match shown.iter().position(|seen| *seen == ran) {
+        Some(at) => {
+            shown.remove(at);
+            user_shell::header(&ran.command, width, true)
+        }
+        None => user_shell::lines(&ran, width),
+    }
+}
+
 fn first_line(text: &str) -> String {
     let line = text.lines().next().unwrap_or("");
     let mut cut: String = line.chars().take(60).collect();
@@ -4461,7 +4634,8 @@ mod tests {
         .await
     }
 
-    /// A daemon that greets and gives each request `answer`'s result.
+    /// A daemon that greets and gives each request `answer`'s result, or
+    /// its refusal when it names an `error`.
     async fn daemon_answering(answer: impl Fn(&Value) -> Value + Send + 'static) -> Arc<Client> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         // Tests start stand-ins at once, within the same millisecond.
@@ -4485,7 +4659,11 @@ mod tests {
             let mut lines = BufReader::new(read).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let asked: Value = serde_json::from_str(&line).unwrap();
-                let answer = json!({"id": asked["id"], "result": answer(&asked)});
+                let mut answer = match answer(&asked) {
+                    refused if refused.get("error").is_some() => refused,
+                    result => json!({"result": result}),
+                };
+                answer["id"] = asked["id"].clone();
                 write
                     .write_all(format!("{answer}\n").as_bytes())
                     .await
@@ -4559,6 +4737,154 @@ mod tests {
         assert!(!dir.join("1.json").exists());
         assert!(dir.join("2.json").exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn what_the_person_ran_goes_to_the_agent_as_soon_as_it_ends() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let client = daemon_answering(move |asked| {
+            if asked["op"] == "submit" {
+                seen.lock().unwrap().push(asked.clone());
+            }
+            json!({"turn": 2})
+        })
+        .await;
+        let mut app = app(client);
+        app.workspace = std::env::temp_dir().to_string_lossy().into_owned();
+        app.input.set("!echo hello");
+        app.submit().await;
+        assert!(app.input.is_empty());
+        assert_eq!(app.shell_rows(80).len(), 1);
+        while app.shell.as_ref().is_some_and(|s| !s.is_finished()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        app.shell_ran().await;
+        assert!(app.shell.is_none());
+        // Shown, and sent at once, no message of the person's needed: to
+        // an idle agent, as a turn of its own.
+        let shown: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
+        assert_eq!(shown, ["! echo hello", "  └ hello"]);
+        let asked = sent.lock().unwrap()[0].clone();
+        assert_eq!(asked["delivery"], Value::Null);
+        // Not the person's words: what it printed authorizes nothing.
+        assert_eq!(asked["origin"], "shell");
+        let prompt = asked["prompt"].as_str().unwrap();
+        let ran = user_shell::read(prompt).unwrap();
+        assert_eq!((ran.command.as_str(), ran.exit), ("echo hello", 0));
+        assert_eq!(ran.output, "hello");
+        // Staged until its turn takes it, as its name alone.
+        let staged: Vec<String> = app.staged_rows(80).iter().map(|l| l.to_string()).collect();
+        assert_eq!(staged, ["! echo hello"]);
+        app.daemon(turn_event("accepted", 2, json!({}))).await;
+        assert!(app.staged.is_empty());
+        // To a busy one, as a steer of its running turn.
+        app.input.set("!true");
+        app.submit().await;
+        while app.shell.as_ref().is_some_and(|s| !s.is_finished()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        app.shell_ran().await;
+        assert_eq!(sent.lock().unwrap()[1]["delivery"], "steer");
+        let landed_here: Vec<String> = landed(prompt, &mut app.ran_here, 80)
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert_eq!(landed_here, ["! echo hello"]);
+        let left: Vec<&str> = app.ran_here.iter().map(|r| r.command.as_str()).collect();
+        assert_eq!(left, ["true"]);
+        // Run in another window: shown whole.
+        let elsewhere: Vec<String> = landed(prompt, &mut Vec::new(), 80)
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert_eq!(elsewhere, ["! echo hello", "  └ hello"]);
+        // The next message goes alone.
+        app.input.set("thanks");
+        app.submit().await;
+        assert_eq!(sent.lock().unwrap()[2]["prompt"], "thanks");
+    }
+
+    #[tokio::test]
+    async fn a_refused_command_goes_with_the_next_message() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let client = daemon_answering(move |asked| {
+            if asked["op"] != "submit" {
+                return json!({});
+            }
+            let mut sent = seen.lock().unwrap();
+            sent.push(asked.clone());
+            match sent.len() {
+                1 | 2 => json!({"error": "active_agent_limit", "detail": "every slot is taken"}),
+                _ => json!({"turn": 3}),
+            }
+        })
+        .await;
+        let mut app = app(client);
+        app.workspace = std::env::temp_dir().to_string_lossy().into_owned();
+        app.move_to = Some("/moved".into());
+        for command in ["!echo hello", "!echo again"] {
+            app.input.set(command);
+            app.submit().await;
+            while app.shell.as_ref().is_some_and(|s| !s.is_finished()) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            app.shell_ran().await;
+        }
+        // Refused: kept, and said to be.
+        assert_eq!(app.unsent.len(), 2);
+        assert!(app.ran_here.is_empty());
+        assert!(
+            app.shell_rows(80)[0]
+                .to_string()
+                .ends_with("goes with your next message")
+        );
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("active_agent_limit")
+        );
+        app.input.set("and now?");
+        app.submit().await;
+        // Each record goes first, on its own, and the message joins the
+        // turn the first starts.
+        let sent = sent.lock().unwrap().clone();
+        let command = |at: usize| user_shell::read(sent[at]["prompt"].as_str().unwrap()).unwrap();
+        assert_eq!(command(2).command, "echo hello");
+        assert_eq!(command(3).command, "echo again");
+        assert_eq!(
+            (&sent[2]["origin"], &sent[3]["origin"]),
+            (&json!("shell"), &json!("shell"))
+        );
+        assert_eq!(
+            (&sent[2]["delivery"], &sent[3]["delivery"]),
+            (&Value::Null, &json!("steer"))
+        );
+        assert_eq!(sent[4]["prompt"], "and now?");
+        assert_eq!(sent[4]["origin"], Value::Null);
+        assert_eq!(sent[4]["delivery"], "steer");
+        // A turn it starts moves a moved lead, as any message's does.
+        assert_eq!(sent[0]["workspace"], "/moved");
+        assert_eq!(sent[2]["workspace"], "/moved");
+        assert!(app.move_to.is_none());
+        assert!(app.unsent.is_empty());
+        assert_eq!(app.ran_here.len(), 2);
+        assert!(app.shell_rows(80).is_empty());
+    }
+
+    #[test]
+    fn refused_commands_held_stay_within_a_message() {
+        let mut unsent = Vec::new();
+        for n in 0..5 {
+            hold(&mut unsent, format!("{n}{}", "x".repeat(UNSENT_BYTES / 3)));
+        }
+        let firsts: Vec<char> = unsent.iter().filter_map(|r| r.chars().next()).collect();
+        assert_eq!(firsts, ['3', '4']);
+        // One alone over it is still kept: the daemon says if it is too much.
+        hold(&mut unsent, "y".repeat(UNSENT_BYTES * 2));
+        assert_eq!(unsent.len(), 1);
     }
 
     #[tokio::test]
