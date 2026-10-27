@@ -47,7 +47,15 @@ pub fn tool() -> Value {
 
 /// The question an `ask` call with `arguments` put, as call `id`.
 pub fn call(id: &str, arguments: &Value) -> Option<Ask> {
-    let question = arguments["question"].as_str()?.trim();
+    // Without blank lines, so its answer still reads as answering it.
+    let question = arguments["question"]
+        .as_str()?
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let question = question.trim();
     let choices: Vec<String> = arguments["choices"]
         .as_array()
         .into_iter()
@@ -162,6 +170,12 @@ mod tests {
             open.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
             ["c3"]
         );
+        // A question with a blank line in it is still closed by its answer.
+        let long = call("c4", &json!({"question": "Ship it?\n\n  Tests pass.  "})).unwrap();
+        assert_eq!(long.question, "Ship it?\n  Tests pass.");
+        open.push(long.clone());
+        close(&mut open, &answer(&long, "yes"));
+        assert_eq!(open.len(), 1);
     }
 
     #[test]

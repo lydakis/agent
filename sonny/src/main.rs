@@ -1140,6 +1140,9 @@ struct App {
     /// The lead's open questions for the person, oldest first: its `ask`
     /// calls not yet answered.
     asks: Vec<asks::Ask>,
+    /// Questions this window answered and closed, until their answers
+    /// land, so landing does not close another asked the same.
+    sent_answers: Vec<String>,
     /// Where the person's reactions to the bot are kept, once its id is
     /// known.
     reactions_key: Option<String>,
@@ -1803,6 +1806,7 @@ impl App {
             calls: HashMap::new(),
             approvals: Vec::new(),
             asks: Vec::new(),
+            sent_answers: Vec::new(),
             reactions_key: record["bot_id"].as_i64().map(|id| {
                 let store =
                     std::fs::canonicalize(&options.store).unwrap_or_else(|_| options.store.clone());
@@ -2529,6 +2533,7 @@ impl App {
             self.react_calls.clear();
             self.answering = None;
             self.asks.clear();
+            self.sent_answers.clear();
         }
         self.seen_node = nodes.last().copied().unwrap_or(self.seen_node);
         if let Some(&first) = nodes.first() {
@@ -4075,6 +4080,7 @@ impl App {
             Ok(()) => {
                 if let Some(ask) = answering {
                     self.asks.retain(|open| open.id != ask.id);
+                    self.sent_answers.push(ask.question);
                     if self.asks.is_empty() {
                         self.chatting = false;
                     }
@@ -4152,6 +4158,13 @@ impl App {
     /// The question a message answered, from this window or another,
     /// closed.
     fn answered(&mut self, message: &str) {
+        // An answer sent from here closed its question when it was sent.
+        if let Some(question) = asks::answered(message)
+            && let Some(at) = self.sent_answers.iter().position(|q| q == question)
+        {
+            self.sent_answers.remove(at);
+            return;
+        }
         asks::close(&mut self.asks, message);
         if self.asks.is_empty() {
             self.chatting = false;
@@ -5164,9 +5177,15 @@ mod tests {
             question: question.into(),
             choices: vec!["Keep it".into(), "Drop it".into()],
         };
-        app.asks = vec![ask("c1", "Keep the old API?"), ask("c2", "Tag it?")];
+        app.asks = vec![
+            ask("c1", "Keep the old API?"),
+            ask("c2", "Tag it?"),
+            ask("c3", "Keep the old API?"),
+        ];
         app.input.set("2");
         app.submit().await;
+        // Its answer landing leaves the other question asked the same open.
+        app.answered("You asked: Keep the old API?\n\nDrop it");
         // Esc sets the rest aside: the next message is the person's own.
         app.chatting = true;
         app.input.set("how is it going?");
@@ -5178,7 +5197,10 @@ mod tests {
                 "how is it going?"
             ]
         );
-        assert_eq!(app.asks, [ask("c2", "Tag it?")]);
+        assert_eq!(
+            app.asks,
+            [ask("c2", "Tag it?"), ask("c3", "Keep the old API?")]
+        );
     }
 
     #[tokio::test]
