@@ -65,7 +65,10 @@ fn compose(dir: &Path) -> Result<(String, Vec<String>), String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     let start = start_rule(&me.to_string_lossy());
     let ask = ask_rule(&me.to_string_lossy());
-    Ok((format!("{composed}\n\n{rule}\n\n{start}\n\n{ask}"), skills))
+    Ok((
+        format!("{composed}\n\n{rule}\n\n{start}\n\n{ask}\n\n{LONG_RULE}"),
+        skills,
+    ))
 }
 
 /// How the lead starts a task in Sonny: `sonny task`, at `sonny`, makes
@@ -100,6 +103,12 @@ fn ask_rule(sonny: &str) -> String {
          starting \"You asked:\" and your question. Then end your turn, unless you have work that does not depend on the answer."
     )
 }
+
+/// Where the lead puts something long for the person, so a reply stays
+/// readable in the chat.
+const LONG_RULE: &str = "When you have something long for the person to read, such as a report, a plan or a comparison, \
+     write it to a file, Markdown unless it needs a page's layout, and keep editing that file as it changes. \
+     In your reply, give the file's path and the few lines that matter, not the whole of it.";
 
 /// What attaching does with a lead's instructions.
 #[derive(Debug, PartialEq)]
