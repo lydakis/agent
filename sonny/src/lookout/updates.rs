@@ -1,10 +1,12 @@
 //! Task updates: what the lead hears of its tasks unjudged, as its role
-//! says it will. A turn it asked for and did not wait on, a turn another
-//! agent or a trigger asked for, an approval only the person can give, and
-//! a running turn that has printed nothing for a long while are always
-//! news; turns the person asked for in the task themselves are
-//! listed apart, as theirs. A turn the lead waits on is not news, nor its
-//! own forks.
+//! says it will. Every message someone other than the lead writes in a
+//! task, a turn it asked for and did not wait on, a turn another agent or
+//! a trigger asked for, an approval only the person can give, and a
+//! running turn that has printed nothing for a long while are always news;
+//! turns the person asked for in the task themselves are listed apart, as
+//! theirs. The person's words are quoted; anyone else's stay behind the
+//! turn's handle, as the note reaches the approver as the person's own. A
+//! turn the lead waits on is not news, nor its own forks.
 //!
 //! Only live turns count. The lookout sends the news with its next note,
 //! or on its own as soon as the lead rests; one note
@@ -47,8 +49,18 @@ struct Turn {
     which: Option<String>,
 }
 
+/// A message written in a task: who wrote it, and the words, only when
+/// the person did.
+#[derive(Clone, Debug, PartialEq)]
+struct Said {
+    turn: i64,
+    from: String,
+    words: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 struct News {
+    said: Vec<Said>,
     act: Option<Turn>,
     theirs: Option<Turn>,
 }
@@ -65,8 +77,15 @@ impl News {
                 (a, t) => a.or(t),
             }
         }
+        self.said.extend(news.said);
+        self.said.sort_by_key(|said| said.turn);
+        self.said.dedup_by_key(|said| said.turn);
         self.act = one(self.act.take(), news.act);
         self.theirs = one(self.theirs.take(), news.theirs);
+    }
+
+    fn empty(&self) -> bool {
+        self.said.is_empty() && self.act.is_none() && self.theirs.is_none()
     }
 }
 
@@ -95,6 +114,8 @@ pub struct Told {
 
 pub struct Line {
     pub handle: String,
+    /// Words written in the task, not how a turn ended.
+    pub said: bool,
     /// Asked for by the person in the task: theirs, not the lead's.
     pub theirs: bool,
     pub text: String,
@@ -382,6 +403,43 @@ impl Updates {
         }
     }
 
+    /// Whether the bot is one of the lead's own tasks: one it made, not a
+    /// fork of it nor a subscriber of its own.
+    fn task(&self, name: &str) -> bool {
+        self.creator(name) == Some(self.lead.as_str())
+            && !self.subscribers.contains(name)
+            && !name.starts_with(&format!("{}-", self.lead))
+    }
+
+    /// The task's news, made in the order it first came.
+    fn news_of(&mut self, name: &str) -> &mut News {
+        let at = match self.tasks.iter().position(|(task, _)| task == name) {
+            Some(at) => at,
+            None => {
+                self.tasks.push((name.to_owned(), News::default()));
+                self.tasks.len() - 1
+            }
+        };
+        &mut self.tasks[at].1
+    }
+
+    /// Someone other than the lead wrote in a task: `from` names them, and
+    /// `words` are what the person wrote, when it was the person.
+    pub fn said(&mut self, name: &str, turn: i64, from: &str, words: Option<&str>) {
+        if !self.live || !self.task(name) {
+            return;
+        }
+        let said = Said {
+            turn,
+            from: from.to_owned(),
+            words: words.map(str::to_owned),
+        };
+        self.news_of(name).merge(News {
+            said: vec![said],
+            ..News::default()
+        });
+    }
+
     fn tell(
         &mut self,
         name: &str,
@@ -391,10 +449,7 @@ impl Updates {
         which: Option<String>,
         origin: Option<String>,
     ) {
-        if self.creator(name) != Some(self.lead.as_str())
-            || self.subscribers.contains(name)
-            || name.starts_with(&format!("{}-", self.lead))
-        {
+        if !self.task(name) {
             return;
         }
         let handle = format!("turn:{name}/{turn}");
@@ -406,14 +461,7 @@ impl Updates {
             _ if from.as_deref() == Some(self.lead.as_str()) => Some("you".to_owned()),
             _ => Some(from.or(origin).unwrap_or_else(|| "the person".into())),
         };
-        let at = match self.tasks.iter().position(|(task, _)| task == name) {
-            Some(at) => at,
-            None => {
-                self.tasks.push((name.to_owned(), News::default()));
-                self.tasks.len() - 1
-            }
-        };
-        let news = &mut self.tasks[at].1;
+        let news = self.news_of(name);
         let answered = news.act.as_ref().is_some_and(|asked| {
             asked.turn == turn && [APPROVAL, QUIET].contains(&asked.status.as_str())
         });
@@ -491,8 +539,7 @@ impl Updates {
                 }
             }
         }
-        self.tasks
-            .retain(|(_, news)| news.act.is_some() || news.theirs.is_some());
+        self.tasks.retain(|(_, news)| !news.empty());
         self.forwarding
             .retain(|(name, turn), _| !handles.contains(&format!("turn:{name}/{turn}")));
     }
@@ -509,6 +556,11 @@ impl Updates {
                 .bots
                 .get(&self.lead)
                 .is_some_and(|lead| lead.id.is_some() && !ACTIVE.contains(&lead.status.as_str()))
+    }
+
+    /// Whether the lead is in the middle of a turn, as its events say.
+    pub fn busy(&self) -> bool {
+        (self.bots.get(&self.lead)).is_some_and(|lead| ACTIVE.contains(&lead.status.as_str()))
     }
 
     /// Whether to ask the daemon if the lead rests: news came `since` and
@@ -544,16 +596,17 @@ impl Updates {
     /// act on first.
     pub fn take(&mut self) -> Told {
         let mut tasks = std::mem::take(&mut self.tasks);
-        tasks.sort_by_key(|(_, news)| news.act.is_none());
+        tasks.sort_by_key(|(_, news)| news.said.is_empty() && news.act.is_none());
         self.tasks = tasks.split_off(tasks.len().min(WAKE_TASKS));
-        let mut items: Vec<Line> = tasks
-            .iter()
-            .flat_map(|(name, news)| {
-                [(false, &news.act), (true, &news.theirs)]
-                    .into_iter()
-                    .filter_map(move |(theirs, turn)| Some(line(name, theirs, turn.as_ref()?)))
-            })
-            .collect();
+        let mut quoted = HashMap::new();
+        let mut items: Vec<Line> = Vec::new();
+        for (name, news) in &tasks {
+            items.extend(said(name, &news.said, &mut quoted));
+            let turns = [(false, &news.act), (true, &news.theirs)];
+            items.extend(
+                (turns.into_iter()).filter_map(|(theirs, t)| Some(line(name, theirs, t.as_ref()?))),
+            );
+        }
         // The person's own turns come last, under a line of their own.
         items.sort_by_key(|item| item.theirs);
         let (memory, seen) = match self.memory_news() {
@@ -717,10 +770,61 @@ fn line(name: &str, theirs: bool, t: &Turn) -> Line {
     let which = t.which.as_deref().unwrap_or("");
     Line {
         handle: format!("turn:{name}/{}", t.turn),
+        said: false,
         theirs,
         text,
         key: format!("{name}/{}/{}/{theirs}/{which}", t.turn, t.status),
     }
+}
+
+/// What was written in a task, as the note says it: each of the person's
+/// messages quoted, unless the note quoted the same words for another task
+/// already, and everyone else's in one line by its latest turn.
+fn said(name: &str, said: &[Said], quoted: &mut HashMap<String, String>) -> Vec<Line> {
+    let mut lines = Vec::new();
+    let line = |turn: i64, text: String| Line {
+        handle: format!("turn:{name}/{turn}"),
+        said: true,
+        theirs: false,
+        text,
+        key: format!("{name}/{turn}/said"),
+    };
+    for message in said {
+        let Some(words) = &message.words else {
+            continue;
+        };
+        let words = words.split_whitespace().collect::<Vec<_>>().join(" ");
+        let handle = format!("turn:{name}/{}", message.turn);
+        let text = match quoted.get(&words) {
+            Some(first) => format!("- {name}: {handle}, the person wrote the same as in {first}"),
+            None => format!(
+                "- {name}: {handle}, the person wrote: \"{}\"",
+                super::cut(&words, super::QUOTE_CHARS)
+            ),
+        };
+        quoted.entry(words).or_insert(handle);
+        lines.push(line(message.turn, text));
+    }
+    let others: Vec<&Said> = said.iter().filter(|s| s.words.is_none()).collect();
+    if let Some(last) = others.last() {
+        let mut from: Vec<&str> = others.iter().map(|s| s.from.as_str()).collect();
+        from.sort();
+        from.dedup();
+        let text = match others.len() {
+            1 => format!(
+                "- {name}: turn:{name}/{}, {} wrote in it",
+                last.turn, last.from
+            ),
+            n => format!(
+                "- {name}: turn:{name}/{}, {n} messages in it since turn:{name}/{}, from {}",
+                last.turn,
+                others[0].turn,
+                from.join(", ")
+            ),
+        };
+        lines.push(line(last.turn, text));
+    }
+    lines
 }
 
 struct Fact {
