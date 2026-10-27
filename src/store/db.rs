@@ -1822,10 +1822,9 @@ impl Database {
         tx.commit()?;
         Ok(changed == 1)
     }
-    /// Replace a root bot's gates, those a fork took from its source
-    /// included: a client that made it could make an ungated bot anyway. A
-    /// bot another bot made keeps the gates it descends from, so it cannot
-    /// be let out of them. Whether anything changed.
+    /// Replace a bot's gates, those it took from its creator or its source
+    /// included: whoever configures it decides, as the person overriding a
+    /// bot another bot made does. Whether anything changed.
     pub fn set_gate(
         &mut self,
         name: &str,
@@ -1834,12 +1833,6 @@ impl Database {
     ) -> Result<bool> {
         let id = self.identity(name, bot_id)?;
         let bot = self.inspect(name)?;
-        if bot.created_by_id.is_some() {
-            return fail_with(
-                "gates_inherited",
-                format!("{name} was made by another bot and keeps its gates"),
-            );
-        }
         if let Some(gate) = &gate {
             not_in_tools(&gate.tools, &bot.tools)?;
         }
@@ -4811,7 +4804,7 @@ impl Database {
                 &tx,
                 &bot,
                 turn,
-                &call.call_id,
+                call,
                 denial.reason.as_deref(),
                 // Every accepted verdict, so replay keeps each approver's.
                 request.approvals(),
@@ -4883,7 +4876,7 @@ impl Database {
                 &tx,
                 &bot,
                 turn,
-                &call.call_id,
+                call,
                 Some("not reviewed: no verdict"),
                 lapsed,
                 true,
@@ -5322,11 +5315,18 @@ impl Database {
     /// What each listed call and earlier prompt counts against `bytes` for
     /// its fields, so many short entries cannot outgrow a reply.
     pub const PROMPTS_ENTRY: usize = 64;
+    /// The most of the bot's last message before a turn that a `prompts`
+    /// read returns, from its end.
+    pub const PROMPTS_REPLY: usize = 2048;
     /// A turn's words and calls, as a program judging its calls reads them:
     /// the turn's prompt and each steer it absorbed, in order, with the bot
     /// turn that wrote each (none for a person's words); the calls it
     /// started, with argument previews and whether each failed; then the
-    /// bot's earlier prompts, newest first. The words' text counts against
+    /// bot's earlier prompts, newest first. Each prompt or steer carries
+    /// the calls refused after it (`refused`), and this turn's carry the
+    /// end of the bot's last message before them (`reply`): its last of
+    /// the turn before for the prompt, one since the previous words for a
+    /// steer. The words' text counts against
     /// `bytes` in that order and the calls' against their own `bytes`, and
     /// each steer, call, and earlier prompt also counts `PROMPTS_ENTRY`;
     /// text that does not fit is cut and marked
@@ -5364,18 +5364,34 @@ impl Database {
             return fail("turn_not_found");
         };
         let mut left = bytes;
-        let mut prompts = vec![prompt_entry(turn, text, from, from_turn, origin, &mut left)];
+        let mut first = prompt_entry(turn, text, from, from_turn, origin, &mut left);
+        // What the bot last said before the words: what a person's short
+        // answer, such as "yes", answers.
+        let previous: Option<i64> = self
+            .conn
+            .prepare_cached(
+                "SELECT id FROM turns WHERE bot=? AND id<? AND started_ms IS NOT NULL ORDER BY id DESC LIMIT 1",
+            )?
+            .query_row(params![name, turn], |r| r.get(0))
+            .optional()?;
+        if let Some(previous) = previous
+            && let Some(reply) = self.reply(previous, 0, i64::MAX, &mut left)?
+        {
+            first["reply"] = reply;
+        }
+        let mut prompts = vec![first];
         let mut prompts_more = false;
         let mut steers = self.conn.prepare_cached(
-            "SELECT json_extract(data,'$.steer') FROM events WHERE turn=? AND kind='steered' ORDER BY id",
+            "SELECT json_extract(data,'$.steer'),id FROM events WHERE turn=? AND kind='steered' ORDER BY id",
         )?;
+        let mut since = 0;
         let mut steer = self.conn.prepare_cached(
             "SELECT CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END,
                 t.from_bot,t.from_turn,t.origin
              FROM turns t LEFT JOIN nodes n ON n.id=t.prompt_node WHERE t.id=?",
         )?;
-        for id in steers.query_map([turn], |r| r.get::<_, i64>(0))? {
-            let id = id?;
+        for row in steers.query_map([turn], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
+            let (id, steered) = row?;
             let (text, from, from_turn, origin) = steer.query_row([id], |r| {
                 Ok((
                     r.get::<_, Option<String>>(0)?,
@@ -5391,10 +5407,17 @@ impl Database {
             left -= Self::PROMPTS_ENTRY;
             let mut entry = prompt_entry(id, text, from, from_turn, origin, &mut left);
             entry["steer"] = json!(true);
+            if let Some(reply) = self.reply(turn, since, steered, &mut left)? {
+                entry["reply"] = reply;
+            }
+            since = steered;
             prompts.push(entry);
         }
         let mut failed = std::collections::HashSet::new();
         let mut done = std::collections::HashSet::new();
+        for (after, call) in self.refused(turn, &mut left)? {
+            attach(&mut prompts, after, call);
+        }
         let mut completed = self.conn.prepare_cached(
             "SELECT json_extract(data,'$.call_id'),json_extract(data,'$.failed')
              FROM events WHERE turn=? AND kind='tool_completed' ORDER BY id",
@@ -5466,12 +5489,103 @@ impl Database {
             if r.get::<_, bool>(4)? {
                 entry["steer"] = json!(true);
             }
+            let steer = entry["steer"] == true;
             earlier.push(entry);
+            // Its steers, newer, are listed already.
+            if !steer {
+                for (after, call) in self.refused(r.get(0)?, &mut left)? {
+                    attach(&mut earlier, after, call);
+                }
+            }
         }
         Ok(
             json!({"bot":name,"turn":turn,"status":turn_status_name(&status),"workspace":workspace,
             "prompts":prompts,"prompts_more":prompts_more,"calls":calls,"calls_more":calls_more,"earlier":earlier,"more":more}),
         )
+    }
+    /// The last message with text `turn` streamed between two of its events, as
+    /// `{text}` with its end kept: at most `PROMPTS_REPLY` bytes, or the
+    /// budget left, starting at a whole word when cut (`truncated`).
+    fn reply(&self, turn: i64, after: i64, before: i64, left: &mut usize) -> Result<Option<Value>> {
+        // The newest item with text: calls and reasoning stream as
+        // messages too, and say nothing a person answers.
+        let mut items = self.conn.prepare_cached(
+            "SELECT n.item FROM events e JOIN nodes n ON n.id=json_extract(e.data,'$.node')
+             WHERE e.turn=? AND e.kind='message' AND e.id>? AND e.id<? ORDER BY e.id DESC",
+        )?;
+        let mut rows = items.query(params![turn, after, before])?;
+        let mut text = String::new();
+        while text.trim().is_empty() {
+            let Some(r) = rows.next()? else {
+                return Ok(None);
+            };
+            text = assistant_text(&serde_json::from_slice(&r.get::<_, Vec<u8>>(0)?)?);
+        }
+        // Redacted whole before its end is kept: a private key whose
+        // opening line is cut away would no longer read as one.
+        let text = agent_client::approver::Redactor::default().redact(&text);
+        let limit = Self::PROMPTS_REPLY.min(*left);
+        let mut start = text.len().saturating_sub(limit);
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        let truncated = start > 0;
+        if truncated {
+            // Never a part-word, so a secret is not shown without what marks it.
+            start = text[start..]
+                .find(char::is_whitespace)
+                .map_or(text.len(), |at| start + at);
+        }
+        let shown = text[start..].trim_start();
+        *left -= shown.len().min(*left);
+        let mut reply = json!({"text":shown});
+        if truncated {
+            reply["truncated"] = json!(true);
+        }
+        Ok(Some(reply))
+    }
+    /// The calls a turn was refused and did not then run as they were,
+    /// each `{name, arguments}` with its
+    /// arguments cut to the budget left, and the turn whose words it came
+    /// after: the steer the turn last absorbed before it, else the turn's
+    /// own. A denial recorded before refused calls were kept has no name
+    /// and is left out.
+    fn refused(&self, turn: i64, left: &mut usize) -> Result<Vec<(i64, Value)>> {
+        let mut statement = self.conn.prepare_cached(
+            "SELECT json_extract(e.data,'$.name'),json_extract(e.data,'$.arguments'),
+                json_extract(e.data,'$.arguments_truncated'),
+                (SELECT json_extract(s.data,'$.steer') FROM events s
+                  WHERE s.turn=e.turn AND s.kind='steered' AND s.id<e.id ORDER BY s.id DESC LIMIT 1)
+             FROM events e WHERE e.turn=? AND e.kind='tool_completed' AND json_extract(e.data,'$.denied')
+               AND json_extract(e.data,'$.name') IS NOT NULL
+               -- Run later in the turn as it was refused, and done: its go-ahead is used.
+               AND NOT EXISTS (SELECT 1 FROM events r JOIN events d ON d.turn=r.turn
+                   AND d.kind='tool_completed' AND json_extract(d.data,'$.call_id')=json_extract(r.data,'$.call_id')
+                   AND json_extract(d.data,'$.denied') IS NULL AND json_extract(d.data,'$.failed') IS NOT 1
+                 WHERE r.turn=e.turn AND r.kind='tool_started' AND r.id>e.id
+                   AND json_extract(r.data,'$.name')=json_extract(e.data,'$.name')
+                   AND json_extract(r.data,'$.arguments')=json_extract(e.data,'$.arguments'))
+             ORDER BY e.id",
+        )?;
+        let mut refused = Vec::new();
+        let mut rows = statement.query([turn])?;
+        while let Some(r) = rows.next()? {
+            if *left < Self::PROMPTS_ENTRY {
+                break;
+            }
+            *left -= Self::PROMPTS_ENTRY;
+            let mut arguments: String = r.get::<_, Option<String>>(1)?.unwrap_or_default();
+            let mut entry = json!({"name":r.get::<_, String>(0)?});
+            // Cut once already, at the preview, or now at the budget.
+            let previewed = r.get::<_, Option<bool>>(2)? == Some(true);
+            if cut(&mut arguments, left) || previewed {
+                entry["arguments_truncated"] = json!(true);
+            }
+            entry["arguments"] = json!(arguments);
+            let after = r.get::<_, Option<i64>>(3)?.unwrap_or(turn);
+            refused.push((after, entry));
+        }
+        Ok(refused)
     }
     /// Planned calls announced and not yet started or denied, for `stats`.
     pub fn approval_requests(&self) -> i64 {
@@ -7354,11 +7468,12 @@ fn deny(
     tx: &Connection,
     bot: &Bot,
     turn: i64,
-    call_id: &str,
+    call: &ToolCall,
     reason: Option<&str>,
     approvals: Value,
     expired: bool,
 ) -> Result<()> {
+    let call_id = call.call_id.as_str();
     let output = json!({"error":"approval_denied","detail":reason}).to_string();
     let item = bot.family()?.tool_result_item(call_id, &output)?;
     if tx.execute(
@@ -7375,8 +7490,13 @@ fn deny(
          closed=CASE WHEN open_calls=1 THEN ?1 ELSE closed END WHERE name=?2",
         params![head, bot.name],
     )?;
-    let mut data = json!({"call_id":call_id,"node":head,"artifacts":[],"denied":true,
-        "approvals":approvals});
+    // The refused call, previewed as a started one is: a judge reads it
+    // later, so a person's go-ahead can be tied to what was refused.
+    let mut data = started(call);
+    data["node"] = json!(head);
+    data["artifacts"] = json!([]);
+    data["denied"] = json!(true);
+    data["approvals"] = approvals;
     if expired {
         data["expired"] = json!(true);
     }
@@ -8558,6 +8678,21 @@ fn cut(text: &mut String, left: &mut usize) -> bool {
     text.truncate(end);
     *left = 0;
     true
+}
+/// Add a refused call to the listed prompt or steer it came after, or to
+/// the entry listed last when that one was left out: this turn's newest
+/// listed word, or an earlier turn's own prompt, just listed.
+fn attach(entries: &mut [Value], after: i64, call: Value) {
+    let at = entries
+        .iter()
+        .rposition(|entry| entry["turn"] == after)
+        .or(entries.len().checked_sub(1));
+    if let Some(entry) = at.and_then(|at| entries.get_mut(at)) {
+        match entry["refused"].as_array_mut() {
+            Some(calls) => calls.push(call),
+            None => entry["refused"] = json!([call]),
+        }
+    }
 }
 /// One prompt of a `prompts` read, cut to the budget left.
 fn prompt_entry(

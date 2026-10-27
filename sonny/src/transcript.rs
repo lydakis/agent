@@ -628,6 +628,31 @@ pub fn reply(text: &str, width: usize) -> Vec<Line<'static>> {
     out
 }
 
+/// A step on the way to the reply, a call or what the bot said before
+/// one, drawn quieter than the reply: dim and never bold. What a failure
+/// shows in red, and a diff's colored rows, stay as they are, to be read.
+pub fn quiet(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    let keep = |style: Style| style.bg.is_some() || style.fg == Some(Color::Red);
+    lines
+        .into_iter()
+        .map(|mut line| {
+            if keep(line.style) {
+                return line;
+            }
+            line.style = line.style.add_modifier(Modifier::DIM);
+            for span in &mut line.spans {
+                if !keep(span.style) {
+                    span.style = span
+                        .style
+                        .add_modifier(Modifier::DIM)
+                        .remove_modifier(Modifier::BOLD);
+                }
+            }
+            line
+        })
+        .collect()
+}
+
 /// What a tool call did: one header line, then a short look at its result.
 pub fn tool(
     name: &str,
@@ -640,7 +665,7 @@ pub fn tool(
     let bullet = if failed {
         Span::raw("• ").fg(Color::Red)
     } else {
-        Span::raw("• ").fg(Color::Green)
+        Span::raw("• ")
     };
     let field = |key: &str| arguments[key].as_str().unwrap_or("").to_owned();
     let elbow = || Span::raw("  └ ").dim();
@@ -751,7 +776,7 @@ pub fn tool(
                     let bullet = if failed && i + 1 == count {
                         Span::raw("• ").fg(Color::Red)
                     } else {
-                        Span::raw("• ").fg(Color::Green)
+                        Span::raw("• ")
                     };
                     let commands: Vec<&str> = ran
                         .iter()
@@ -878,7 +903,7 @@ fn said_lines(said: crate::calls::Said, width: usize) -> Vec<Line<'static>> {
     let bullet = if said.failed {
         Span::raw("• ").fg(Color::Red)
     } else {
-        Span::raw("• ").fg(Color::Green)
+        Span::raw("• ")
     };
     let mut spans = vec![Span::raw(said.verb).bold()];
     if !said.what.is_empty() {
@@ -1101,6 +1126,29 @@ mod tests {
 
     fn text(lines: &[Line]) -> Vec<String> {
         lines.iter().map(|l| l.to_string()).collect()
+    }
+
+    #[test]
+    fn a_step_is_dim_and_plain_but_a_failure_stays_red() {
+        let ran = super::quiet(super::tool(
+            "shell",
+            &serde_json::json!({"command": "false"}),
+            Some("boom"),
+            true,
+            "/w",
+            80,
+        ));
+        let header = &ran[0];
+        let bullet = header.spans[0].style;
+        assert_eq!(
+            (bullet.fg, bullet.add_modifier),
+            (Some(Color::Red), Modifier::empty())
+        );
+        for span in &header.spans[1..] {
+            let style = header.style.patch(span.style);
+            assert!(style.add_modifier.contains(Modifier::DIM), "{span:?}");
+            assert!(!style.add_modifier.contains(Modifier::BOLD), "{span:?}");
+        }
     }
 
     #[test]

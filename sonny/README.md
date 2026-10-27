@@ -4,11 +4,17 @@ A terminal client for the daemon, beside the app, that lays its work out in
 Rex. It speaks the daemon's socket protocol through `agent-client`, like the
 app; nothing in the daemon or CLI knows it exists.
 
-    brew install lydakis/agent/sonny         # Sonny, with a daemon of its own version
+    brew install lydakis/agent/sonny         # Sonny, and the daemon's `agent` formula with it
+    brew install lydakis/agent/agent         # just the daemon
 
-On Linux, each release has `sonny-VERSION-linux-ARCH.tar.gz` (x86_64 and
-aarch64): static builds of Sonny in `bin/` and its daemon in `libexec/`.
-Unpack it anywhere and run `bin/sonny`.
+Both formulas build from the release's source on your machine (macOS or
+Linux), so nothing is signed; Sonny starts the `agent` formula's daemon by its
+`opt` path. On Linux, each release also has
+`sonny-VERSION-linux-ARCH.tar.gz` (x86_64 and aarch64): static builds of
+Sonny in `bin/` and its daemon in `libexec/`. Unpack it anywhere and run
+`bin/sonny`. With `cargo install`, build both (`--path .` for `agent` and
+`--path sonny`) and set `AGENT_BIN` to that `agent`; Sonny never takes an
+`agent` from `PATH`, which may be another program.
 
     sonny                                    # this folder's coordinator, <project>.lead
     sonny --model PROVIDER/MODEL             # the same, making the project the first time
@@ -74,8 +80,9 @@ commands:
   leaves ones set any other way alone.
 - `/approvals` picks whether calls wait for a verdict: `auto`, a judge
   model (a new lead starts here, and Sonny starts `agent approver` when
-  nothing serves it), `ask`, you, or `full`, none. Tasks the lead makes keep
-  the gate it had.
+  nothing serves it), `ask`, you, or `full`, none. Tasks the lead makes take
+  the gate it had; a pick reaches every agent the lead made too, one busy
+  now once it is idle.
 - `/status` shows the project's agents, and its running Errand jobs.
 - `/copies` (or `--copies worktree|sandfs`) picks how the lead's tasks get
   their own copy of the folder: git worktrees (the default), or
@@ -128,6 +135,8 @@ The look follows Codex's TUI (openai/codex, `codex-rs/tui`): finished history
 goes into the terminal's own scrollback above a small inline viewport,
 replies stream a line at a time, a tool call is one `• Ran …` line with a
 short `└` look at its result, edits show as a diff, and a status row says
-`Working (12s • esc to interrupt)`.
+`Working (12s • esc to interrupt)`. The steps on the way, calls and what
+the bot said before each, are dim; the reply stays bright, under the
+turn's `Worked for …` line.
 
 `demo/` has the scripted model and folder the recordings use.

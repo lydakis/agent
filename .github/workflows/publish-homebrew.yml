@@ -25,7 +25,7 @@ jobs:
       github.event.workflow_run.event == 'release' &&
       !contains(github.event.workflow_run.head_branch, '-')
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 60
     permissions:
       contents: read
       attestations: read
@@ -77,7 +77,8 @@ jobs:
           gh release download "$RELEASE_TAG" --repo lydakis/agent \
             --pattern agent.rb --pattern checksums.txt --pattern source-commit.txt \
             --pattern "Agent_${RELEASE_TAG#v}_universal.zip" \
-            --pattern sonny.rb --pattern "sonny-${RELEASE_TAG#v}.tar.gz" --dir "$RUNNER_TEMP/release"
+            --pattern "agent-${RELEASE_TAG#v}.tar.gz" --pattern agent-formula.rb \
+            --pattern sonny-formula.rb --dir "$RUNNER_TEMP/release"
       - name: Verify the assets were built by the release workflow
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -85,7 +86,7 @@ jobs:
         run: |
           cd "$RUNNER_TEMP/release"
           for asset in "Agent_${RELEASE_TAG#v}_universal.zip" agent.rb \
-            "sonny-${RELEASE_TAG#v}.tar.gz" sonny.rb source-commit.txt; do
+            "agent-${RELEASE_TAG#v}.tar.gz" agent-formula.rb sonny-formula.rb source-commit.txt; do
             gh attestation verify "$asset" --repo lydakis/agent \
               --signer-workflow lydakis/agent/.github/workflows/release.yml \
               --deny-self-hosted-runners
@@ -111,14 +112,16 @@ jobs:
           if [ -f "$RUNNER_TEMP/tap-update.json" ]; then
             echo 'changed=true' >> "$GITHUB_OUTPUT"
           fi
-          python3 app/release/prepare_homebrew_update.py --kind formula "$RELEASE_TAG" \
-            "$RUNNER_TEMP/release.json" "$RUNNER_TEMP/release" \
-            tap/Formula/sonny.rb "$RUNNER_TEMP/tap-formula.json" \
-            --commit "$RELEASE_COMMIT" \
-            --generator release-source/app/release/homebrew_formula.py
-          if [ -f "$RUNNER_TEMP/tap-formula.json" ]; then
-            echo 'formula_changed=true' >> "$GITHUB_OUTPUT"
-          fi
+          for name in agent sonny; do
+            python3 app/release/prepare_homebrew_update.py --kind "$name" "$RELEASE_TAG" \
+              "$RUNNER_TEMP/release.json" "$RUNNER_TEMP/release" \
+              "tap/Formula/$name.rb" "$RUNNER_TEMP/tap-$name.json" \
+              --commit "$RELEASE_COMMIT" \
+              --generator release-source/app/release/homebrew_formula.py
+            if [ -f "$RUNNER_TEMP/tap-$name.json" ]; then
+              echo 'formula_changed=true' >> "$GITHUB_OUTPUT"
+            fi
+          done
       - name: Check publication credential is configured
         if: steps.prepare.outputs.changed == 'true' || steps.prepare.outputs.formula_changed == 'true'
         env:
@@ -148,20 +151,24 @@ jobs:
           test "$("$app/Contents/MacOS/agent" --version)" = "agent-runtime ${RELEASE_TAG#v}"
           brew uninstall --cask lydakis/agent/agent
           test ! -e "$app"
-      - name: Validate formula and installation
+      - name: Validate formulas and installation
         if: steps.prepare.outputs.formula_changed == 'true'
         env:
           HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          ruby -c tap/Formula/sonny.rb
           tap_parent="$(brew --repository)/Library/Taps/lydakis"
           mkdir -p "$tap_parent"
           ln -sfn "$GITHUB_WORKSPACE/tap" "$tap_parent/homebrew-agent"
-          brew style lydakis/agent/sonny
-          brew audit --formula --strict --online lydakis/agent/sonny
+          for name in agent sonny; do
+            ruby -c "tap/Formula/$name.rb"
+            brew style "lydakis/agent/$name"
+            brew audit --formula --strict --online "lydakis/agent/$name"
+          done
+          # Sonny pulls in the daemon, and both build from source here as
+          # they will on the person's machine.
           brew install --formula lydakis/agent/sonny
-          brew test lydakis/agent/sonny
-          brew uninstall --formula lydakis/agent/sonny
+          brew test lydakis/agent/agent lydakis/agent/sonny
+          brew uninstall --formula lydakis/agent/sonny lydakis/agent/agent
       - name: Publish validated cask
         if: steps.prepare.outputs.changed == 'true'
         env:
@@ -169,10 +176,15 @@ jobs:
         run: |
           gh api --method PUT repos/lydakis/homebrew-agent/contents/Casks/agent.rb \
             --input "$RUNNER_TEMP/tap-update.json" --jq .commit.html_url
-      - name: Publish validated formula
+      - name: Publish validated formulas
         if: steps.prepare.outputs.formula_changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
         run: |
-          gh api --method PUT repos/lydakis/homebrew-agent/contents/Formula/sonny.rb \
-            --input "$RUNNER_TEMP/tap-formula.json" --jq .commit.html_url
+          # The daemon first: Sonny's formula depends on it.
+          for name in agent sonny; do
+            if [ -f "$RUNNER_TEMP/tap-$name.json" ]; then
+              gh api --method PUT "repos/lydakis/homebrew-agent/contents/Formula/$name.rb" \
+                --input "$RUNNER_TEMP/tap-$name.json" --jq .commit.html_url
+            fi
+          done
