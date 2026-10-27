@@ -132,6 +132,30 @@ class LookoutTests(ModelFixture):
         self.assertEqual(sorted(b for b in bots if b.startswith('lookout.')),
                          [b for b in bots if b.startswith('lookout.') and b.count('.') == 1], bots)
 
+    def test_a_fork_of_the_lead_never_reads_what_came_after(self):
+        self.make('calc.lead', 'calc.fix')
+
+        def reply(request, user):
+            if request['model'] == 'judge-model':
+                body = json.loads(user)
+                self.asked.put((request, body))
+                return json.dumps({q: 0.1 for q in body['questions']})
+            return None
+        self.model.reply_for = reply
+        # The task ends before the lead has said a word.
+        for n, (bot, prompt) in enumerate([('calc.fix', 'fix the parser'), ('calc.lead', 'later words')]):
+            turn = self.daemon.request('submit', bot=bot, request_id=f'r{n}', prompt=prompt)['result']['turn']
+            self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
+        out = self.lookout('--replay', '--judge', 'lead,openai/judge-model+lead')
+        self.assertEqual(out.returncode, 0, out.stderr)
+        checks = {(line['judge'], line['kind']): line for line in map(json.loads, out.stdout.splitlines())}
+        self.assertEqual(checks[('lead', 'Ended')]['failed'], 'the lead had said nothing yet')
+        bodies = []
+        while not self.asked.empty():
+            bodies.append(self.asked.get()[1])
+        self.assertTrue(bodies)
+        self.assertTrue(all(b['input']['lead'] == [] for b in bodies), bodies)
+
     def test_one_lookout_wakes_each_lead_whose_task_has_news(self):
         self.make('calc.lead', 'calc.fix', 'shop.lead')
         service = subprocess.Popen([str(self.sonny), 'lookout', '--judge', 'openai/judge-model',

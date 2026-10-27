@@ -602,12 +602,12 @@ pub struct Judge {
 }
 
 /// Where the lead stood when an event happened: its name, and the nodes of
-/// its history then that a fork may start from, newest first. With none, a
-/// fork starts from where the lead is now.
+/// its history then that a fork may start from, newest first; empty when
+/// it had none yet. Live, with no nodes, a fork starts where the lead is.
 #[derive(Clone, Debug, Default)]
 pub struct At {
     pub lead: String,
-    pub nodes: Vec<i64>,
+    pub nodes: Option<Vec<i64>>,
 }
 
 /// The decision model for everything that judges, the approver included,
@@ -1029,9 +1029,13 @@ async fn ask_lead(
         std::process::id(),
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
-    let nodes = at.nodes.iter().map(|node| Some(*node));
+    let checkpoints: Vec<Option<i64>> = match &at.nodes {
+        None => vec![None],
+        Some(nodes) if nodes.is_empty() => return Err(failed("the lead had said nothing yet")),
+        Some(nodes) => nodes.iter().take(8).map(|node| Some(*node)).collect(),
+    };
     let mut forked = Err(failed("the lead could not be forked"));
-    for checkpoint in nodes.take(8).chain(at.nodes.is_empty().then_some(None)) {
+    for checkpoint in checkpoints {
         let made = client
             .request(
                 "fork",
@@ -1380,28 +1384,29 @@ const LEAD_CHARS: usize = 1_000;
 /// The lead's latest conversation where it stood, oldest first: what it
 /// was told, what it said and the commands it ran.
 async fn lead_words(client: &Client, at: &At) -> Vec<Value> {
-    let mut words: Vec<Value> = recent(
-        client,
-        &at.lead,
-        LEAD_ITEMS * 4,
-        false,
-        at.nodes.first().copied(),
-    )
-    .await
-    .into_iter()
-    .flat_map(|(_, item)| crate::responses(&item))
-    .filter_map(|item| {
-        let from = match (item["type"].as_str(), item["role"].as_str()) {
-            (Some("function_call"), _) => "the lead ran",
-            (_, Some("assistant")) => "the lead",
-            (_, Some("user")) => "to the lead",
-            _ => return None,
-        };
-        let text = evidence(&item);
-        (!text.trim().is_empty()).then(|| json!({"from": from, "text": cut(&text, LEAD_CHARS)}))
-    })
-    .take(LEAD_ITEMS)
-    .collect();
+    let from = match &at.nodes {
+        None => None,
+        Some(nodes) => match nodes.first() {
+            Some(node) => Some(*node),
+            None => return Vec::new(),
+        },
+    };
+    let mut words: Vec<Value> = recent(client, &at.lead, LEAD_ITEMS * 4, false, from)
+        .await
+        .into_iter()
+        .flat_map(|(_, item)| crate::responses(&item))
+        .filter_map(|item| {
+            let from = match (item["type"].as_str(), item["role"].as_str()) {
+                (Some("function_call"), _) => "the lead ran",
+                (_, Some("assistant")) => "the lead",
+                (_, Some("user")) => "to the lead",
+                _ => return None,
+            };
+            let text = evidence(&item);
+            (!text.trim().is_empty()).then(|| json!({"from": from, "text": cut(&text, LEAD_CHARS)}))
+        })
+        .take(LEAD_ITEMS)
+        .collect();
     words.reverse();
     words
 }
@@ -1819,7 +1824,7 @@ impl Service {
                     let (lead, id) = (lookout.lead.clone(), lookout.id);
                     let at = At {
                         lead: lead.clone(),
-                        nodes: Vec::new(),
+                        nodes: None,
                     };
                     tokio::spawn(async move {
                         let answered = check(&client, &judge, &seen, &at, &memory, &recent).await;
@@ -2950,7 +2955,7 @@ async fn replayed(store: &Path, socket: PathBuf, judges: &str, limit: usize) -> 
         let mut stood: Vec<i64> = Vec::new();
         let at = |stood: &[i64]| At {
             lead: lead.to_owned(),
-            nodes: stood.iter().rev().take(8).copied().collect(),
+            nodes: Some(stood.iter().rev().take(8).copied().collect()),
         };
         for event in &events {
             if event["bot"] == lead {

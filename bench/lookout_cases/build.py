@@ -247,6 +247,8 @@ def main():
     parser.add_argument('--only', help='one scenario, by project name')
     parser.add_argument('--binary', type=Path, default=ROOT / '.local/target/release/agent')
     args = parser.parse_args()
+    # The daemon takes absolute folders only.
+    args.out = args.out.resolve()
     args.out.mkdir(parents=True, exist_ok=True)
     store = args.out / 'state.sqlite'
     if store.exists():

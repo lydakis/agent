@@ -112,16 +112,20 @@ if lead:
         if judge == "lead":
             continue
         for threshold in STAGES:
-            both = [k for k in checks if "band" in first.get(k, {}) and "band" in lead.get(k, {})]
-            up = {k for k in both if max(first[k]["answers"].values(), default=0) >= threshold}
-            told_set = {k for k in up if told(lead[k])}
-            woke_set = {k for k in up if woke(lead[k])}
-            ms = [first[k]["ms"] + (lead[k]["ms"] if k in up else 0) for k in both]
-            tokens = sum(first[k].get("tokens", 0) + (lead[k].get("tokens", 0) if k in up else 0) for k in both)
-            cached = sum(first[k].get("cached", 0) + (lead[k].get("cached", 0) if k in up else 0) for k in both)
+            # The first stage decides which checks the lead's fork sees;
+            # only those need its answer.
+            asked = [k for k in checks if "band" in first.get(k, {})]
+            up = {k for k in asked if max(first[k]["answers"].values(), default=0) >= threshold}
+            failed = {k for k in up if "band" not in lead.get(k, {})}
+            done = [k for k in asked if k not in failed]
+            told_set = {k for k in up - failed if told(lead[k])}
+            woke_set = {k for k in up - failed if woke(lead[k])}
+            ms = [first[k]["ms"] + (lead[k]["ms"] if k in up else 0) for k in done]
+            tokens = sum(first[k].get("tokens", 0) + (lead[k].get("tokens", 0) if k in up else 0) for k in done)
+            cached = sum(first[k].get("cached", 0) + (lead[k].get("cached", 0) if k in up else 0) for k in done)
             outcomes[f"{judge}>lead@{threshold}"] = told_set
-            report(f"{judge} > lead at {threshold}", told_set, woke_set, len(both), 0, ms, tokens, cached,
-                   f"; {len(up)} of {len(both)} went on to the lead ({ratio(len(up), len(both))})")
+            report(f"{judge} > lead at {threshold}", told_set, woke_set, len(done), len(failed), ms, tokens,
+                   cached, f"; {len(up)} of {len(asked)} went on to the lead ({ratio(len(up), len(asked))})")
 
 # Each judge against the first one the run names, as the one in use.
 print("\npaired on the checks the lead should hear about (McNemar, told at all):")
