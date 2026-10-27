@@ -1189,10 +1189,9 @@ struct Fleet {
     lead: String,
     /// The lead and every bot it, or one of them, made.
     lineage: std::collections::HashSet<String>,
-    /// Other projects whose leads the lineage made: each opens in its own
-    /// project's home, with its tasks, not here.
+    /// Other projects whose leads were seen: their bots are theirs, never
+    /// tasks here, and their Sonny opens only when asked for.
     leads: std::collections::HashSet<String>,
-    store: PathBuf,
     /// How a task's window runs Sonny on it, without the bot's name.
     command: Vec<String>,
     /// Said once in the status row when Rex is set up.
@@ -1237,15 +1236,15 @@ fn inner_projects<'a>(names: impl Iterator<Item = &'a str>, project: &str) -> Ve
 enum Kin {
     /// One of its tasks: a window here.
     Task,
-    /// Another project's lead it made: a home of its own.
+    /// Another project's lead: a home of its own, opened when asked for.
     Lead(String),
     None,
 }
 
 /// What `bot`, made by `by`, is to the lead of `project` whose lineage
-/// made the bots in `lineage` and the leads of `leads`: a task when its
-/// name is the project's or one of the lineage made it, unless it is
-/// another project's lead or one of theirs.
+/// made the bots in `lineage`, with `leads` the other projects seen: any
+/// other project's lead, by its name alone; else a task when its name is
+/// the project's or one of the lineage made it, unless it is one of theirs.
 fn kin(
     bot: &str,
     by: &str,
@@ -1256,7 +1255,7 @@ fn kin(
     let lead = format!("{project}.lead");
     let theirs = leads.iter().any(|p| bot.starts_with(&format!("{p}.")));
     match bot.strip_suffix(".lead").filter(|_| bot != lead) {
-        Some(other) if lineage.contains(by) => Kin::Lead(other.to_owned()),
+        Some(other) => Kin::Lead(other.to_owned()),
         None if !theirs && (lineage.contains(by) || bot.starts_with(&format!("{project}."))) => {
             Kin::Task
         }
@@ -1298,7 +1297,6 @@ impl Fleet {
             lead: lead.to_owned(),
             lineage: [lead.to_owned()].into(),
             leads: Default::default(),
-            store: options.store.clone(),
             command,
             note,
             doing: HashMap::new(),
@@ -1341,12 +1339,7 @@ impl Fleet {
                 continue;
             };
             let running = !bot["running_turn"].is_null();
-            if let Some(inner) = (self.leads.iter()).find(|p| name.starts_with(&format!("{p}."))) {
-                if running && name == format!("{inner}.lead") {
-                    let me = std::path::Path::new(&self.command[0]);
-                    let (socket, store) = (&self.socket, &self.store);
-                    let _ = open_lead(socket, Some(store), inner, &self.project, None, me);
-                }
+            if (self.leads.iter()).any(|p| name.starts_with(&format!("{p}."))) {
                 continue;
             }
             self.lineage.insert(name.to_owned());
@@ -1673,25 +1666,6 @@ impl Fleet {
                     Kin::None => {}
                 }
                 None
-            }
-            "accepted"
-                if let Some(project) = bot
-                    .strip_suffix(".lead")
-                    .filter(|p| self.leads.contains(*p)) =>
-            {
-                let me = std::path::Path::new(&self.command[0]);
-                match open_lead(
-                    &self.socket,
-                    Some(&self.store),
-                    project,
-                    &self.project,
-                    None,
-                    me,
-                ) {
-                    Ok((home, true)) => Some(format!("{bot} is in {home}")),
-                    Ok(_) => None,
-                    Err(error) => Some(error),
-                }
             }
             "accepted" if bot != self.lead && self.lineage.contains(bot) => match self.show(bot) {
                 Ok(true) if !self.layout.here() => {
@@ -4368,13 +4342,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_lead_made_by_a_lead_gets_its_own_home_and_its_tasks_go_with_it() {
+    fn another_projects_lead_and_its_tasks_are_never_tasks_here() {
         let lineage: std::collections::HashSet<String> = ["ws.lead".into(), "ws.fix".into()].into();
         let mut leads = std::collections::HashSet::new();
         assert_eq!(kin("ws.fix2", "ws.fix", "ws", &lineage, &leads), Kin::Task);
         assert_eq!(kin("ws.side", "", "ws", &lineage, &leads), Kin::Task);
+        // Whoever made it, as `sonny project add` says no one.
         assert_eq!(
-            kin("ws.web.lead", "ws.lead", "ws", &lineage, &leads),
+            kin("ws.web.lead", "", "ws", &lineage, &leads),
             Kin::Lead("ws.web".into())
         );
         leads.insert("ws.web".to_owned());
@@ -4392,8 +4367,10 @@ mod tests {
             "shop.lead",
         ];
         assert_eq!(inner_projects(names.into_iter(), "ws"), ["ws.web"]);
-        // A lead nobody here made is left to its own Sonny.
-        assert_eq!(kin("shop.lead", "", "ws", &lineage, &leads), Kin::None);
+        assert_eq!(
+            kin("shop.lead", "ws.lead", "ws", &lineage, &leads),
+            Kin::Lead("shop".into())
+        );
         assert_eq!(kin("other.task", "", "ws", &lineage, &leads), Kin::None);
     }
 
