@@ -90,7 +90,7 @@ exit code and its output, a long output's start and end), sent with
 turn's or the next turn's, and starts no turn of its own. The daemon keeps
 it until then. Esc stops a command still running.
 
-![A command run with !, its output, and the agent's answer to the next message](../docs/sonny/shell-passthrough.gif)
+![A command run with !, its output attached for the agent, and the agent answering from it](../docs/sonny/shell-passthrough.gif)
 
 `/` lists the commands:
 
