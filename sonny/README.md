@@ -104,6 +104,16 @@ commands:
   it), and goes to the lead as `You asked: QUESTION` and your answer. Esc
   sets the questions aside for a message of your own, and Esc again goes
   back to them. They wait in `~/.agent/sonny/asks/`, one file each, kept apart by store and bot id.
+- **Long writing beside the chat:** the lead writes a report or plan to a
+  file and runs `sonny view FILE` once. It opens in a Rex block or Herdr
+  pane beside the lead and is drawn again each time the file changes:
+  Markdown as Sonny draws a reply, tables and diagrams included, SVG and
+  Mermaid files as pictures, and an HTML page as its picture top to bottom
+  where the terminal shows pictures. `q` closes it; arrows, Space and `b`
+  scroll. `sonny view FILE --browser` opens it in the browser instead, from
+  a small server on this machine that serves only the file's folder, and
+  the tab reloads itself whenever the file changes. Without a Rex or Herdr
+  pane it opens in the browser, and in your own terminal it shows there.
 - `/copy` puts the last reply on the clipboard; `/open` opens the last
   HTML page in a browser; `/sound` turns the chime off or on; `/quit`
   leaves the agents working.

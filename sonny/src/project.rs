@@ -65,7 +65,11 @@ fn compose(dir: &Path) -> Result<(String, Vec<String>), String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     let start = start_rule(&me.to_string_lossy());
     let ask = ask_rule(&me.to_string_lossy());
-    Ok((format!("{composed}\n\n{rule}\n\n{start}\n\n{ask}"), skills))
+    let view = view_rule(&me.to_string_lossy());
+    Ok((
+        format!("{composed}\n\n{rule}\n\n{start}\n\n{ask}\n\n{view}"),
+        skills,
+    ))
 }
 
 /// How the lead starts a task in Sonny: `sonny task`, at `sonny`, makes
@@ -98,6 +102,19 @@ fn ask_rule(sonny: &str) -> String {
          one question per command, with up to 9 short choices when the answer is one of a few. \
          Sonny shows it to the person until they answer, and the answer comes as their next message, \
          starting \"You asked:\" and your question. Then end your turn, unless you have work that does not depend on the answer."
+    )
+}
+
+/// How the lead shows the person something long, so it is read beside
+/// the conversation rather than pasted into it.
+fn view_rule(sonny: &str) -> String {
+    format!(
+        "When you have something long for the person to read, such as a report, a plan or a comparison, \
+         write it to a file, Markdown unless it needs a page's layout, and show it with\n\
+         \"{sonny}\" view FILE\n\
+         once: it opens beside you and is drawn again each time the file changes, so keep editing the same file. \
+         Add --browser for a page that needs scripts or a browser's width. \
+         In your reply, give the file's path and the few lines that matter, not the whole of it."
     )
 }
 
@@ -459,6 +476,13 @@ mod tests {
         ] {
             assert!(text.contains(said), "{said} in {text}");
         }
+    }
+
+    #[test]
+    fn a_lead_shows_long_writing_in_a_file_beside_it() {
+        let text = view_rule("/opt/sonny");
+        assert!(text.contains("\"/opt/sonny\" view FILE\n"), "{text}");
+        assert!(text.contains("--browser"));
     }
 
     #[test]
