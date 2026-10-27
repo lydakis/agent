@@ -5,8 +5,9 @@
 //! the sandfs library built into Sonny so nothing needs installing, is the
 //! checkout as it is, uncommitted changes included, on a branch of its own;
 //! in a folder sandfs mounts, a fork of that workspace; in any other
-//! folder, the folder as it is now. A task that could not start leaves no
-//! folder behind.
+//! folder, the folder as it is now, or on another disk than sandfs's home,
+//! a workspace over the folder itself. A task that could not start leaves
+//! no folder behind.
 //!
 //! sandfs mounts are served by Sonny run again as `sonny sandfs daemon`,
 //! which outlives the command that asked for them and shares sandfs's home
@@ -62,8 +63,12 @@ fn start(here: &Path, name: &str, rest: &[String]) -> Result<(), String> {
     }
     let setup = flags.iter().any(|flag| flag == "--setup");
     let flags: Vec<&String> = flags.iter().filter(|flag| *flag != "--setup").collect();
-    let agent = std::env::var_os("AGENT_BIN")
-        .ok_or("run this from the lead's shell (AGENT_BIN is not set)")?;
+    // The daemon's binary in an agent's shell; in a terminal, the one
+    // Sonny would start.
+    let agent = crate::agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
+    // With the provider keys the app keeps, should this start the daemon;
+    // read before the folder is made, so a bad env file leaves nothing.
+    let mut command = crate::agent_command(&agent)?;
 
     let info = agent_client::project::read(here)?;
     let place = if info["threads_in"] == "project" {
@@ -95,7 +100,7 @@ fn start(here: &Path, name: &str, rest: &[String]) -> Result<(), String> {
             return failed(&place, false, format!("{} failed", script.display()));
         }
     }
-    let status = Command::new(&agent)
+    let status = command
         .args(["run", "--detach", "--new", "--bot", name, "--workspace"])
         .arg(&place.dir)
         .args(flags)
@@ -107,11 +112,7 @@ fn start(here: &Path, name: &str, rest: &[String]) -> Result<(), String> {
         Ok(status) if status.success() => {}
         Ok(_) => return failed(&place, true, format!("{name} did not start")),
         Err(e) => {
-            return failed(
-                &place,
-                false,
-                format!("running {}: {e}", agent.to_string_lossy()),
-            );
+            return failed(&place, false, format!("running {}: {e}", agent.display()));
         }
     }
     if let Some(note) = &place.note {
@@ -122,7 +123,7 @@ fn start(here: &Path, name: &str, rest: &[String]) -> Result<(), String> {
 
 /// Whether the daemon has a task `name`: one whose start failed after it
 /// was made keeps its folder, since a retry continues it there.
-fn listed(agent: &std::ffi::OsStr, name: &str) -> bool {
+fn listed(agent: &Path, name: &str) -> bool {
     let Ok(output) = Command::new(agent)
         .args(["ls", "--name", name])
         .stdin(Stdio::null())
@@ -259,21 +260,33 @@ fn source(here: &Path) -> Result<Source, String> {
     }
 }
 
-/// The sandfs workspace `here` is in, and where it is mounted. A folder
-/// that has never seen sandfs has no home to look in.
+/// The sandfs workspace `here` is in, and where it is mounted.
 fn mounted_at(here: &Path) -> Result<Option<(String, PathBuf)>, String> {
+    Ok(mount_of(here)?.and_then(|ws| Some((ws.name, ws.mounted?))))
+}
+
+/// The mounted sandfs workspace `here` is in, the innermost. A folder
+/// that has never seen sandfs has no home to look in.
+pub fn mount_of(here: &Path) -> Result<Option<sandfs::WorkspaceInfo>, String> {
     if !Home::locate().is_ok_and(|home| home.root().exists()) {
         return Ok(None);
     }
     let workspaces = sandfs()?.workspaces().map_err(|e| format!("{e:#}"))?;
     Ok(workspaces
         .into_iter()
-        .filter_map(|ws| Some((ws.name, ws.mounted?)))
-        .filter(|(_, root)| here.starts_with(root))
-        .max_by_key(|(_, root)| root.components().count()))
+        .filter(|ws| {
+            ws.mounted
+                .as_deref()
+                .is_some_and(|root| here.starts_with(root))
+        })
+        .max_by_key(|ws| {
+            ws.mounted
+                .as_deref()
+                .map_or(0, |root| root.components().count())
+        }))
 }
 
-fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
+pub fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -309,6 +322,10 @@ fn sandfs_copy(here: &Path, name: &str) -> Result<Place, String> {
         Source::Git { top } => (top.clone(), true),
         Source::Folder => (here.to_owned(), false),
     };
+    // A plain folder's copy clones its files into sandfs's home, which
+    // works only on one disk: one on another disk (an external volume) gets
+    // a workspace over the folder itself instead.
+    let over = matches!(source, Source::Folder) && !same_disk(&root, home.root());
     let undo = match exists {
         // The task's own copy, mounted or left unmounted by a restart.
         Some(ws) if ws.mounted.as_deref() == Some(dir.as_path()) => Undo::Nothing,
@@ -323,6 +340,17 @@ fn sandfs_copy(here: &Path, name: &str) -> Result<Place, String> {
             return Err(format!(
                 "a sandfs workspace named {name} exists that is not this task's; pick another NAME"
             ));
+        }
+        None if over => {
+            let options = MountOptions {
+                name: Some(name.to_owned()),
+                ..Default::default()
+            };
+            home.mount(&root.to_string_lossy(), &dir, &options)
+                .map_err(|e| format!("{e:#}"))?;
+            Undo::Sandfs {
+                name: name.to_owned(),
+            }
         }
         None => {
             let from = match &source {
@@ -350,9 +378,17 @@ fn sandfs_copy(here: &Path, name: &str) -> Result<Place, String> {
         )
     } else {
         let me = me();
+        let what = match over {
+            true => {
+                "a sandfs workspace over this folder, which is on another disk than sandfs's \
+                     home and so is not copied: the task's changes stay in the workspace, and it \
+                     sees what changes here meanwhile"
+            }
+            false => "a sandfs copy of this folder as it is now",
+        };
         format!(
-            "{name}: a sandfs copy of this folder as it is now; `{me} task changes {name}` lists \
-             what the task changed, and `{me} task changes {name} --apply` writes it here"
+            "{name}: {what}; `{me} task changes {name}` lists what the task changed, and \
+             `{me} task changes {name} --apply` writes it here"
         )
     };
     let prefix = here.strip_prefix(&root).unwrap_or(Path::new(""));
@@ -361,6 +397,18 @@ fn sandfs_copy(here: &Path, name: &str) -> Result<Place, String> {
         note: Some(note),
         undo,
     })
+}
+
+/// Whether `folder` is on the disk sandfs's `home` is on, or will be made
+/// on.
+fn same_disk(folder: &Path, home: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let disk = |path: &Path| {
+        path.ancestors()
+            .find_map(|dir| std::fs::metadata(dir).ok())
+            .map(|found| found.dev())
+    };
+    disk(folder) == disk(home)
 }
 
 /// The folder in `copy` at `prefix`, without the trailing slash an empty
@@ -436,4 +484,17 @@ pub fn remount() -> Vec<String> {
                 .map(|e| format!("task copy {}: {e:#}", ws.name))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_folder_on_another_disk_is_told_apart() {
+        let tmp = std::env::temp_dir();
+        assert!(same_disk(&tmp, &tmp.join("not/made/yet")));
+        // A device file system is never the one temporary files are on.
+        assert!(!same_disk(Path::new("/dev"), &tmp));
+    }
 }

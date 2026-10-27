@@ -27,6 +27,10 @@ Continue an existing agent with \"$AGENT_BIN\" run --detach --bot NAME -- TASK. 
 Collect results with the wait tool on that handle; it returns the peer's status and final text. \
 Blocking run/follow inside a shell tool is rejected. \
 Use \"$AGENT_BIN\" fork --source NAME --bot NEW to branch an agent from where it is now, mid-turn included; --checkpoint N branches from an earlier point in its history. \
+To ask an agent something without disturbing it, mid-turn included, run \
+\"$AGENT_BIN\" run --detach --fork NAME --bot NEW --allow '' --expires 15m -- QUESTION and wait on its handle: \
+a copy of NAME answers from its history without acting, and is deleted once it has been idle 15 minutes. \
+Ask this way to learn where a busy agent is, or how it would take a steer, before sending one. \
 $AGENT_BOT and $AGENT_BOT_ID identify you; $AGENT_PARENT and $AGENT_PARENT_ID, when set, identify the agent that created you. \
 To contact that creator, run \
 \"$AGENT_BIN\" run --detach --bot \"$AGENT_PARENT\" --bot-id \"$AGENT_PARENT_ID\" -- TASK; \

@@ -111,6 +111,15 @@ pub struct Bot {
     /// Its context, history and approval settings, reported as they apply.
     #[serde(serialize_with = "resolved_settings")]
     pub settings: Settings,
+    /// How long it may sit idle before the daemon deletes it, as its fork
+    /// asked; `None` keeps it until a client deletes it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expire_ms: Option<u64>,
+    /// When it is deleted, in milliseconds since the epoch, unless a turn
+    /// is running or waiting then: its last turn's end, or its fork, plus
+    /// `expire_ms`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
 }
 /// A bot's denials under one gate tag in the turn that gave the last: how
 /// many in a row, reset when a call every gate allowed starts, and how many
@@ -339,6 +348,8 @@ pub struct Fork<'a> {
     /// The tools the fork may call, within its source's; `None` keeps the
     /// source's list.
     pub allow: Option<&'a [String]>,
+    /// Delete the fork once it has been idle this long.
+    pub expire_ms: Option<u64>,
     /// The client's idempotency key: a resend with the same key and fields
     /// gets the fork it made.
     pub request_id: Option<&'a str>,
@@ -1198,7 +1209,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 50;
+    pub const SCHEMA: i32 = 51;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1330,7 +1341,8 @@ impl Database {
                 thinking_from INTEGER NOT NULL DEFAULT 0,
                 thinking_to INTEGER NOT NULL DEFAULT 0,
                 thinking_elided INTEGER NOT NULL DEFAULT 0, gates TEXT, denials TEXT,
-                closed INTEGER, open_calls INTEGER, allowed TEXT, settings TEXT, creation TEXT);
+                closed INTEGER, open_calls INTEGER, allowed TEXT, settings TEXT, creation TEXT,
+                expire_ms INTEGER, expires_at INTEGER);
             CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
             CREATE INDEX IF NOT EXISTS bots_note ON bots(note);
             CREATE INDEX IF NOT EXISTS bots_compaction ON bots(compaction);
@@ -1404,7 +1416,8 @@ impl Database {
             CREATE INDEX IF NOT EXISTS turns_ready_bot ON turns(bot) WHERE status='ready';
             CREATE INDEX IF NOT EXISTS processes_running ON processes(turn) WHERE status='running';
             CREATE INDEX IF NOT EXISTS bots_deleting ON bots(name) WHERE status='deleting';
-            CREATE INDEX IF NOT EXISTS bots_running ON bots(name) WHERE running_turn IS NOT NULL;")?;
+            CREATE INDEX IF NOT EXISTS bots_running ON bots(name) WHERE running_turn IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS bots_expiring ON bots(expires_at) WHERE expires_at IS NOT NULL;")?;
         if version != Self::SCHEMA {
             tx.pragma_update(None, "user_version", Self::SCHEMA)?;
         }
@@ -1712,9 +1725,11 @@ impl Database {
                     )
                 })?,
             },
+            expire_ms: r.get::<_, Option<i64>>(35)?.map(|ms| ms.max(0) as u64),
+            expires_at: r.get(36)?,
         })
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings,expire_ms,expires_at";
     /// Validate the caller's captured identity in the same transaction that
     /// creates the child. Never resolve a stale shell's name to a new bot.
     fn creator_id(
@@ -1864,7 +1879,7 @@ impl Database {
         };
         let mut statement = self.conn.prepare_cached(&format!(
             "SELECT name,head,workspace,status,running_turn,provider,family,model,reasoning,budget_tokens,tokens_used,tools,
-                    input_tokens,cached_input_tokens,id,created_by,created_by_id,gates,allowed
+                    input_tokens,cached_input_tokens,id,created_by,created_by_id,gates,allowed,expire_ms,expires_at
              FROM bots WHERE name > ?1{glob}{running} ORDER BY name LIMIT ?2"
         ))?;
         let after = after.unwrap_or("");
@@ -1895,6 +1910,10 @@ impl Database {
             let mut bot = bot;
             if let Some(allowed) = r.get::<_, Option<String>>(18)? {
                 bot["allowed"] = json!(split_tools(&allowed));
+            }
+            if let Some(expire_ms) = r.get::<_, Option<i64>>(19)? {
+                bot["expire_ms"] = json!(expire_ms);
+                bot["expires_at"] = json!(r.get::<_, Option<i64>>(20)?);
             }
             let size = crate::output::encoded_len(&bot)? + 1;
             if bots.len() == limit || bytes + size > crate::output::MAX_EVENT / 2 {
@@ -5723,9 +5742,11 @@ impl Database {
             "UPDATE turns SET status=?,finished_ms=? WHERE id=?",
             params![status, epoch_ms(), turn],
         )?;
+        // An expiring bot's clock starts again from this turn's end.
         tx.execute(
-            "UPDATE bots SET head=?,running_turn=NULL,status=?,closed=NULL,open_calls=NULL WHERE name=?",
-            params![head, status, bot.name],
+            "UPDATE bots SET head=?,running_turn=NULL,status=?,closed=NULL,open_calls=NULL,
+                expires_at=?+expire_ms WHERE name=?",
+            params![head, status, epoch_ms(), bot.name],
         )?;
         promote(&tx, &bot.name)?;
         if status == "completed" {
@@ -6277,12 +6298,13 @@ impl Database {
             created_by_id,
             gate,
             allow,
+            expire_ms,
             request_id,
         } = fork;
         let request = request_id.map(|_| {
             json!({"op":"fork","source":source,"checkpoint":node,
             "workspace":workspace,"budget_tokens":budget_tokens,"created_by":created_by,
-            "created_by_id":created_by_id,"gate":gate,"allow":allow})
+            "created_by_id":created_by_id,"gate":gate,"allow":allow,"expire_ms":expire_ms})
         });
         if let Some(bot) = self.resent(name, request_id, request.as_ref())? {
             return Ok((bot, None));
@@ -6367,7 +6389,7 @@ impl Database {
             &parent.tools,
         ))?;
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,thinking_from,thinking_to,thinking_elided,gates,allowed,settings,creation) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,thinking_from,thinking_to,thinking_elided,gates,allowed,settings,creation,expire_ms,expires_at) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 name,
                 id,
@@ -6399,7 +6421,9 @@ impl Database {
                 gates,
                 allowed.as_ref().map(|allowed| allowed.join(",")),
                 parent.settings.stored()?,
-                creation(request_id, request)
+                creation(request_id, request),
+                expire_ms.map(|ms| ms as i64),
+                expire_ms.map(|ms| epoch_ms().saturating_add(ms as i64)),
             ],
         )?;
         if let Some(node) = checkpoint {
@@ -6452,6 +6476,9 @@ impl Database {
         }
         if let Some(allowed) = &allowed {
             data["allowed"] = json!(allowed);
+        }
+        if let Some(expire_ms) = expire_ms {
+            data["expire_ms"] = json!(expire_ms);
         }
         let cursor = event(&tx, name, None, "forked", data.clone())?;
         tx.commit()?;
@@ -6529,6 +6556,37 @@ impl Database {
             page["pruned_before"] = json!(pruned);
         }
         Ok(page)
+    }
+    /// The earliest time after `now` an idle bot may be due for deletion, in
+    /// milliseconds since the epoch, and whether any is due by `now`. A
+    /// turn's end only moves a bot's time later, so a sweep at the earliest
+    /// time is never late.
+    pub fn next_expiry(&self, now: i64) -> Result<(Option<i64>, bool)> {
+        Ok(self.conn.query_row(
+            "SELECT MIN(CASE WHEN expires_at>?1 THEN expires_at END),
+                    COALESCE(MAX(expires_at<=?1),0)
+             FROM bots WHERE expires_at IS NOT NULL AND status!='deleting'",
+            [now],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?)
+    }
+    /// Up to `limit` bots, by name and identity, whose idle time ran out by
+    /// `now` and which `delete` would take: no turn running, waiting,
+    /// queued or ready, and no command of theirs running. One still busy is
+    /// passed over, so it never holds back another that is not.
+    pub fn expired(&self, now: i64, limit: usize) -> Result<Vec<(String, i64)>> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT b.name,b.id FROM bots b WHERE b.expires_at<=?1 AND b.running_turn IS NULL
+                 AND b.status!='deleting'
+                 AND NOT EXISTS(SELECT 1 FROM turns t WHERE t.bot=b.name AND t.status IN ('queued','ready'))
+                 AND NOT EXISTS(SELECT 1 FROM processes p JOIN turns t ON t.id=p.turn
+                     WHERE p.status='running' AND t.bot=b.name)
+                 ORDER BY b.expires_at LIMIT ?2",
+            )?
+            .query_map(params![now, limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?)
     }
     /// Remove an idle bot with everything only it owns: its turns, tool
     /// intents, processes, artifacts, events, checkpoints, and the history
@@ -8521,6 +8579,18 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         // A store from before 33 has no approvals table yet; it is created
         // with the rest of the schema.
         conn.execute_batch("ALTER TABLE approvals ADD COLUMN asked TEXT;")?;
+    }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='expire_ms')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 50 -> 51: a fork may be deleted once it has been idle a while.
+        // None was.
+        conn.execute_batch(
+            "ALTER TABLE bots ADD COLUMN expire_ms INTEGER;
+             ALTER TABLE bots ADD COLUMN expires_at INTEGER;",
+        )?;
     }
     Ok(())
 }

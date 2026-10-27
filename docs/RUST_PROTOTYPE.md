@@ -53,6 +53,7 @@ agent run --bot Bob -- "Now run the full suite"          # same bot, next turn, 
 agent run --bot Bob --model anthropic/claude-opus-5-5 -- "Review the diff"   # this turn only
 agent follow --bot Bob --after 0                         # replay, then live events
 agent fork --source Bob --checkpoint 12 --bot Bob-alt      # starts in Bob's folder
+agent run --fork Bob --bot Bob.side --allow '' --expires 15m -- "Where are you?"   # ask a copy; Bob carries on
 agent interrupt --bot Bob
 agent ls
 agent shutdown
@@ -981,6 +982,7 @@ own path from the turn. Example requests:
 {"id":6,"op":"history_items","bot":"Bob","nodes":[2]}
 {"id":13,"op":"artifact","bot":"Bob","turn":1,"call_id":"call_1","stream":"stdout","offset":0,"limit":65536}
 {"id":8,"op":"fork","source":"Bob","checkpoint":2,"bot":"Alternative","request_id":"alt-1"}
+{"id":28,"op":"fork","source":"Bob","bot":"Bob.side","allow":[],"expire_ms":900000,"request_id":"side-1"}
 {"id":9,"op":"interrupt","bot":"Bob","turn":1}
 {"id":11,"op":"bots","after":null,"limit":64}
 {"id":22,"op":"bots","after":null,"limit":64,"name":"project.*","active":true}
@@ -1357,9 +1359,9 @@ the turn's id and handle at once, and `wait`, `turns`, and
   without interrupting, which starts at the running turn's newest finished
   round. `agent run` says the same as flags to copy
   (`--delivery steer --turn N`, `--delivery queue`, or
-  `fork --source NAME --bot NEW`), built from the
-  refusal's `running_turn` and `fork_point`, taken in the refusing
-  transaction, so it asks nothing more and never names a turn that started
+  `run --detach --fork=NAME --bot NEW --allow '' --expires 15m -- QUESTION`),
+  built from the refusal's `running_turn` and `fork_point`, taken in the
+  refusing transaction, so it asks nothing more and never names a turn that started
   since. `fork_point` is where a fork without a checkpoint starts, the head
   of an idle bot or that newest finished round. A model calling `agent run`
   does not discover them otherwise, and in benchmark runs it ignored a prose
@@ -1809,7 +1811,8 @@ growing stored history are recorded separately.
 ## Retention
 
 Nothing is dropped unless a caller asks. Two primitives cover what a fleet
-needs, and one optional policy composes them:
+needs, and one optional policy composes them. A fork can also ask to be
+deleted once idle:
 
 - `delete {bot}` removes an idle bot and everything only it owns: its turns,
   tool intents, processes, artifacts, events, checkpoints, and the history
@@ -1842,6 +1845,20 @@ needs, and one optional policy composes them:
   or a duplicate turn. If the name was recreated meanwhile, a retry carrying
   the old `bot_id` is still refused; one without it is fresh work on the new
   identity.
+- `fork {expire_ms}` (1 s to 7 days; `--expires` on `agent fork` and
+  `agent run --fork`) makes a fork the daemon deletes, as `delete` would,
+  once it has been idle that long: no turn has run, waited, or been queued
+  since it was made or its last turn ended. Its record shows `expire_ms`
+  and `expires_at` (epoch milliseconds), and each turn's end moves
+  `expires_at` to then plus `expire_ms`, so a follow-up keeps it alive. The
+  time is stored, so a fork outlives neither a daemon restart nor the
+  client that made it: the daemon looks when the earliest time comes due
+  and at every start, and a fork still busy then (a command it started,
+  queued work) is looked at again a minute later. Followers get the same
+  `deleted` notification with `"expired":true`. This is what a side
+  question needs: `agent run --fork NAME --bot NEW --allow '' --expires 15m
+  -- QUESTION` asks a copy of NAME, which answers from NAME's history
+  without acting and leaves NAME as it was.
 - `prune {bot, keep_turns}` protects the unfinished suffix (running, parked,
   ready, and queued work) and keeps the `keep_turns` finished turns preceding
   it. With no unfinished work it keeps the newest `keep_turns` turns by

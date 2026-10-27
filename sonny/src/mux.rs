@@ -68,6 +68,67 @@ pub trait Backend {
     /// The block Sonny itself runs in, when in this home.
     fn own_block(&self) -> Option<String>;
     fn places(&self) -> Places;
+    /// The home, to find again.
+    fn place(&self) -> Place;
+}
+
+/// A project's home, as its lead's Sonny last found it in the person's
+/// terminal: kept so that an agent's `sonny split` and `sonny show` go
+/// there, to that multiplexer, instead of one guessed from the agent's
+/// shell, which is in neither.
+#[derive(Debug, PartialEq)]
+pub enum Place {
+    Herdr {
+        workspace: String,
+    },
+    Rex {
+        session: String,
+        host: Option<String>,
+    },
+}
+
+impl Place {
+    /// One file a project of a daemon, under `~/.agent/sonny/places`.
+    fn file(socket: &Path, project: &str) -> Option<PathBuf> {
+        let socket = std::fs::canonicalize(socket).unwrap_or_else(|_| socket.to_owned());
+        let key = crate::project::fingerprint(&format!("{}\n{project}", socket.display()));
+        let home = std::env::var_os("HOME").filter(|h| !h.is_empty())?;
+        Some(PathBuf::from(home).join(format!(".agent/sonny/places/{key}.json")))
+    }
+
+    fn keep(&self, path: &Path) {
+        let json = match self {
+            Self::Herdr { workspace } => {
+                serde_json::json!({"multiplexer": "herdr", "workspace": workspace})
+            }
+            Self::Rex { session, host } => {
+                serde_json::json!({"multiplexer": "rex", "session": session, "host": host})
+            }
+        };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+        if std::fs::write(&temp, format!("{json}\n")).is_ok() {
+            let _ = std::fs::rename(&temp, path);
+        }
+    }
+
+    fn recall(path: &Path) -> Option<Self> {
+        let text = std::fs::read(path).ok()?;
+        let json: serde_json::Value = serde_json::from_slice(&text).ok()?;
+        let text = |key: &str| json[key].as_str().map(str::to_owned);
+        match json["multiplexer"].as_str()? {
+            "herdr" => Some(Self::Herdr {
+                workspace: text("workspace")?,
+            }),
+            "rex" => Some(Self::Rex {
+                session: text("session")?,
+                host: text("host"),
+            }),
+            _ => None,
+        }
+    }
 }
 
 pub struct Layout {
@@ -265,32 +326,53 @@ fn current(host: Option<&str>) -> Option<Kind> {
 }
 
 /// The project's home in the multiplexer Sonny runs in, from the person's
-/// terminal. None when Sonny runs in none; tasks then run out of sight,
-/// in /status.
-pub fn here(project: &str, host: Option<&str>) -> Option<Layout> {
+/// terminal, kept as the place its agents' work goes. None when Sonny runs
+/// in none; tasks then run out of sight, in /status.
+pub fn here(socket: &Path, project: &str, host: Option<&str>) -> Option<Layout> {
     let backend: Box<dyn Backend> = match current(host)? {
-        Kind::Rex(bin) => Box::new(crate::rex::Rex::open(bin, host, project, true).ok()?),
+        Kind::Rex(bin) => Box::new(crate::rex::Rex::open(bin, host, project, true, None).ok()?),
         Kind::Herdr(bin) => {
             let pane = crate::herdr::pane();
-            Box::new(crate::herdr::Herdr::open(bin, project, pane.as_deref()).ok()?)
+            Box::new(crate::herdr::Herdr::open(bin, project, pane.as_deref(), None).ok()?)
         }
     };
+    if let Some(file) = Place::file(socket, project) {
+        backend.place().keep(&file);
+    }
     Some(Layout::new(backend))
 }
 
 /// The project's home, from an agent's shell, whose multiplexer variables
-/// would name the daemon's terminal: in Herdr when the project's lead is in
-/// a Herdr pane, else in Rex (or Herdr, without Rex), made when needed.
-pub fn for_agent(project: &str, host: Option<&str>) -> Result<Layout, String> {
+/// would name the daemon's terminal: where the lead's Sonny last laid the
+/// project out, in that multiplexer; without one (or with `host`, a Rex
+/// server), in Herdr when the project's lead is in a Herdr pane, else in
+/// Rex (or Herdr, without Rex), made when needed.
+pub fn for_agent(socket: &Path, project: &str, host: Option<&str>) -> Result<Layout, String> {
     let herdr = crate::herdr::find().filter(|_| host.is_none());
     let rex = crate::rex::find();
-    let backend: Box<dyn Backend> = match (herdr, rex) {
-        (Some(herdr), _) if crate::herdr::has_lead(&herdr, project) => {
-            Box::new(crate::herdr::Herdr::open(herdr, project, None)?)
+    let kept = Place::file(socket, project)
+        .filter(|_| host.is_none())
+        .and_then(|file| Place::recall(&file));
+    let backend: Box<dyn Backend> = match (kept, herdr, rex) {
+        (Some(Place::Herdr { workspace }), Some(herdr), _) => Box::new(crate::herdr::Herdr::open(
+            herdr,
+            project,
+            None,
+            Some(&workspace),
+        )?),
+        (Some(Place::Rex { session, host }), _, Some(rex)) => Box::new(crate::rex::Rex::open(
+            rex,
+            host.as_deref(),
+            project,
+            false,
+            Some(&session),
+        )?),
+        (_, Some(herdr), _) if crate::herdr::has_lead(&herdr, project) => {
+            Box::new(crate::herdr::Herdr::open(herdr, project, None, None)?)
         }
-        (_, Some(rex)) => Box::new(crate::rex::Rex::open(rex, host, project, false)?),
-        (Some(herdr), None) => Box::new(crate::herdr::Herdr::open(herdr, project, None)?),
-        (None, None) => return Err("neither rex nor herdr was found".into()),
+        (_, _, Some(rex)) => Box::new(crate::rex::Rex::open(rex, host, project, false, None)?),
+        (_, Some(herdr), None) => Box::new(crate::herdr::Herdr::open(herdr, project, None, None)?),
+        (_, None, None) => return Err("neither rex nor herdr was found".into()),
     };
     Ok(Layout::new(backend))
 }
@@ -419,6 +501,32 @@ mod tests {
         fn places(&self) -> Places {
             Places::new()
         }
+        fn place(&self) -> Place {
+            Place::Herdr {
+                workspace: "w1".into(),
+            }
+        }
+    }
+
+    #[test]
+    fn a_project_keeps_the_place_it_was_laid_out_in() {
+        let file = std::env::temp_dir().join(format!("sonny-place-{}.json", std::process::id()));
+        let herdr = Place::Herdr {
+            workspace: "wD".into(),
+        };
+        herdr.keep(&file);
+        assert_eq!(Place::recall(&file), Some(herdr));
+        let rex = Place::Rex {
+            session: "s7".into(),
+            host: Some("mini".into()),
+        };
+        rex.keep(&file);
+        assert_eq!(Place::recall(&file), Some(rex));
+        std::fs::write(&file, "{\"multiplexer\": \"tmux\"}").unwrap();
+        assert_eq!(Place::recall(&file), None);
+        let _ = std::fs::remove_file(&file);
+        let socket = Path::new("/tmp/agent.sock");
+        assert_ne!(Place::file(socket, "shop"), Place::file(socket, "shop.web"));
     }
 
     fn labels(layout: &Layout) -> Vec<(String, Vec<String>)> {
