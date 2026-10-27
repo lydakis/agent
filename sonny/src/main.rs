@@ -395,6 +395,8 @@ fn daemon_paths(
         None => PathBuf::from(std::env::var_os("HOME").ok_or("set --store or HOME")?)
             .join(".agent/state.sqlite"),
     };
+    // One store under two names is one lookout's.
+    let store = agent_client::socket::canonical_store(&store).map_err(|e| e.to_string())?;
     let socket = match socket.or_else(|| std::env::var_os("AGENT_SOCKET").map(PathBuf::from)) {
         Some(socket) => socket,
         None => agent_client::socket::default_socket(&store).map_err(|e| e.to_string())?,

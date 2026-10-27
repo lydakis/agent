@@ -1045,7 +1045,12 @@ async fn event_text(client: &Client, seen: &Seen) -> String {
             .iter()
             .filter(in_turn)
             .find(|(_, item)| item["role"] == "assistant"),
-        Kind::Quiet => items.iter().find(in_turn),
+        // The newest thing the turn did: an empty text beside a call is
+        // not it.
+        Kind::Quiet => items
+            .iter()
+            .filter(in_turn)
+            .find(|(_, item)| !evidence(item).trim().is_empty()),
         Kind::Waiting => items
             .iter()
             // The call the approval names: a response's later calls wait
@@ -1058,14 +1063,20 @@ async fn event_text(client: &Client, seen: &Seen) -> String {
                         .is_none_or(|call| item["call_id"] == call)
             }),
     };
-    match found {
-        Some((_, item)) if item["type"] == "function_call" => format!(
+    found.map(|(_, item)| evidence(item)).unwrap_or_default()
+}
+
+/// What one item shows the judge: a call as its tool and arguments, a
+/// call's output as its text, anything else as its words.
+fn evidence(item: &Value) -> String {
+    match item["type"].as_str() {
+        Some("function_call") => format!(
             "{} {}",
             item["name"].as_str().unwrap_or("tool"),
             item["arguments"].as_str().unwrap_or("")
         ),
-        Some((_, item)) => crate::text(item),
-        None => String::new(),
+        Some("function_call_output") => crate::output(item).0,
+        _ => crate::text(item),
     }
 }
 
@@ -1301,6 +1312,12 @@ struct Service {
     seated: u64,
 }
 
+/// Whether the bot listed under a name is another than the one seated.
+fn replaced(seated: &Value, listed: &Value) -> bool {
+    let id = |record: &Value| record["bot_id"].as_i64();
+    id(seated).is_some() && id(listed).is_some() && id(seated) != id(listed)
+}
+
 /// The project a lead heads: `shop` for `shop.lead`.
 fn lead_project(name: &str) -> Option<&str> {
     name.strip_suffix(".lead").filter(|p| !p.is_empty())
@@ -1449,6 +1466,11 @@ impl Service {
         let Some(project) = lead_project(lead) else {
             return;
         };
+        // Another lead took the name while no one watched: what was held
+        // for the last one is no one's.
+        if (self.lookouts.get(lead)).is_some_and(|had| replaced(&had.record, record)) {
+            self.lookouts.remove(lead);
+        }
         if !self.lookouts.contains_key(lead) {
             let workspace = PathBuf::from(record["workspace"].as_str().unwrap_or("/"));
             let mut lookout = Lookout::new(project, lead, workspace, None);
@@ -1857,13 +1879,18 @@ impl Lookout {
         }
     }
 
-    /// The lead read these turns itself: news of them is dropped, and so
-    /// is a check of one still under way.
+    /// The lead read these turns itself: news of how one ended is dropped,
+    /// and so is a check of it still under way. A wait that returned before
+    /// a turn ended read none of it, so its approvals and silences stay
+    /// news.
     fn read(&mut self, handles: &HashSet<String>) {
         if handles.is_empty() {
             return;
         }
-        let read = |seen: &Seen| handles.contains(&format!("turn:{}/{}", seen.task, seen.turn));
+        let read = |seen: &Seen| {
+            seen.kind == Kind::Ended
+                && handles.contains(&format!("turn:{}/{}", seen.task, seen.turn))
+        };
         self.held.retain(|item| !read(&item.seen));
         self.due.retain(|seen| !read(seen));
         // Kept for checks still under way; a long-lived lead's list stays short.
@@ -2009,9 +2036,10 @@ impl Lookout {
     }
 
     fn answered(&mut self, seen: Seen, answered: Result<Checked, Failure>) {
-        if self
-            .read
-            .contains(&format!("turn:{}/{}", seen.task, seen.turn))
+        if seen.kind == Kind::Ended
+            && self
+                .read
+                .contains(&format!("turn:{}/{}", seen.task, seen.turn))
         {
             self.write(&json!({"at_ms": epoch_ms(), "lead": self.lead, "task": seen.task,
                 "turn": seen.turn, "kind": format!("{:?}", seen.kind), "skipped": "the lead read it"}));
@@ -2655,6 +2683,51 @@ mod tests {
             json!({"status": "completed"}),
         ));
         assert_eq!(lookout.due.len(), 1);
+        // A wait that timed out read no silence: the task is still news.
+        lookout.due.clear();
+        let quiet = Seen {
+            turn: 3,
+            kind: Kind::Quiet,
+            ..lookout.due_seen()
+        };
+        let wait = json!({"name": "wait", "arguments": json!({"handles": ["turn:calc.fix/3"], "timeout_ms": 0}).to_string()});
+        lookout.event(&ev("calc.lead", 8, "tool_started", wait));
+        lookout.answered(
+            quiet,
+            Ok(Checked {
+                answers: answers(&[("stuck", 0.9)]),
+                tokens: 0,
+                ms: 0,
+                text: String::new(),
+                unattributed: false,
+            }),
+        );
+        assert_eq!(lookout.held.len(), 1);
+    }
+
+    #[test]
+    fn a_lead_made_again_while_no_one_watched_starts_afresh() {
+        let seated = json!({"name": "calc.lead", "bot_id": 4});
+        assert!(!replaced(
+            &seated,
+            &json!({"name": "calc.lead", "bot_id": 4})
+        ));
+        assert!(replaced(
+            &seated,
+            &json!({"name": "calc.lead", "bot_id": 9})
+        ));
+        assert!(!replaced(&json!({"name": "calc.lead"}), &seated));
+    }
+
+    #[test]
+    fn a_silent_turn_is_shown_by_what_it_last_did() {
+        let call =
+            json!({"type": "function_call", "name": "shell", "arguments": "{\"cmd\":\"make\"}"});
+        assert_eq!(evidence(&call), "shell {\"cmd\":\"make\"}");
+        let output = json!({"type": "function_call_output", "output": "built 3 targets"});
+        assert_eq!(evidence(&output), "built 3 targets");
+        let empty = json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": ""}]});
+        assert!(evidence(&empty).is_empty());
     }
 
     #[test]
