@@ -19,7 +19,7 @@ mod updates;
 use agent_client::Client;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1348,7 +1348,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let (store, socket) = crate::daemon_paths(store, socket)?;
     if replaying {
         let judges = judge.ok_or("--replay needs --judge SPEC[,SPEC]...")?;
-        return replay(socket, &judges, limit);
+        return replay(store, socket, &judges, limit);
     }
     main(Settings {
         store,
@@ -1996,8 +1996,12 @@ impl Lookout {
             }
             "deleted" if bot != self.lead => {
                 self.lineage.remove(bot);
-                for made in self.others.values_mut() {
-                    made.remove(bot);
+                // A root keeps its place under its name, so what it makes
+                // once made again is still watched.
+                for (root, made) in self.others.iter_mut() {
+                    if root != bot {
+                        made.remove(bot);
+                    }
                 }
                 self.briefs.remove(bot);
                 self.quiet.remove(bot);
@@ -2596,19 +2600,19 @@ fn epoch_ms() -> u128 {
 }
 
 /// `sonny lookout --replay --judge SPEC[,SPEC]... [--limit N]`: run the
-/// lookout's checks over what the store kept, for every project lead, and
-/// print each check as a JSON line with its input, answers and band. It
-/// wakes no one. The roster and memory are read as they are now, not as
-/// they were then.
-pub fn replay(socket: PathBuf, judges: &str, limit: usize) -> Result<(), String> {
+/// lookout's checks over what the store kept, for every project lead and
+/// every bot with saved subscriptions, and print each check as a JSON line
+/// with its input, answers and band. It wakes no one. The roster, memory
+/// and subscriptions are read as they are now, not as they were then.
+pub fn replay(store: PathBuf, socket: PathBuf, judges: &str, limit: usize) -> Result<(), String> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?
-        .block_on(replayed(socket, judges, limit))
+        .block_on(replayed(&store, socket, judges, limit))
 }
 
-async fn replayed(socket: PathBuf, judges: &str, limit: usize) -> Result<(), String> {
+async fn replayed(store: &Path, socket: PathBuf, judges: &str, limit: usize) -> Result<(), String> {
     let judges = judges
         .split(',')
         .filter(|spec| !spec.is_empty())
@@ -2632,11 +2636,16 @@ async fn replayed(socket: PathBuf, judges: &str, limit: usize) -> Result<(), Str
         }
     }
     let judges: Vec<Arc<Judge>> = judges.into_iter().map(Arc::new).collect();
+    // The subscriptions saved now, as a live lookout would read them.
+    let subscribers: HashMap<String, Vec<subs::Sub>> = subs::all(store).into_iter().collect();
+    let records: HashMap<String, Value> = (bots.iter())
+        .filter_map(|b| Some((b["name"].as_str()?.to_owned(), b.clone())))
+        .collect();
     let mut due: Vec<(i64, String, PathBuf, Seen)> = Vec::new();
     for lead in bots
         .iter()
         .filter_map(|b| b["name"].as_str())
-        .filter(|n| lead_project(n).is_some())
+        .filter(|n| lead_project(n).is_some() || subscribers.contains_key(*n))
     {
         let project = lead_project(lead).unwrap_or_default().to_owned();
         let workspace = bots
@@ -2653,7 +2662,7 @@ async fn replayed(socket: PathBuf, judges: &str, limit: usize) -> Result<(), Str
                 let (Some(name), by) = (bot["name"].as_str(), bot["created_by"].as_str()) else {
                     continue;
                 };
-                if (name.starts_with(&format!("{project}."))
+                if ((!project.is_empty() && name.starts_with(&format!("{project}.")))
                     || by.is_some_and(|by| lookout.lineage.contains(by)))
                     && !judge_bot(name)
                     && bot["expire_ms"].is_null()
@@ -2665,8 +2674,15 @@ async fn replayed(socket: PathBuf, judges: &str, limit: usize) -> Result<(), Str
                 break;
             }
         }
+        let file = subscribers.get(lead).cloned().unwrap_or_default();
+        lookout.subs = subs::effective(lead_project(lead).is_some(), lead, file);
+        lookout.roots(&records);
+        let watched: HashSet<String> = (lookout.lineage.iter())
+            .chain(lookout.others.values().flatten())
+            .cloned()
+            .collect();
         let mut events = Vec::new();
-        for bot in lookout.lineage.clone() {
+        for bot in watched {
             events.extend(retained(&socket, &bot).await);
         }
         events.sort_by_key(|e| e["cursor"].as_i64().unwrap_or(0));
@@ -3257,6 +3273,14 @@ mod tests {
             &json!({"event": "created", "bot": "review.c", "data": {"created_by": "review.b"}}),
         );
         assert!(lookout.watches("review.c"));
+        // A root deleted and made again still has what it makes watched.
+        lookout.lineage_of(&json!({"event": "deleted", "bot": "review.lead", "data": {}}));
+        lookout.lineage_of(&json!({"event": "created", "bot": "review.lead", "data": {}}));
+        lookout.lineage_of(
+            &json!({"event": "created", "bot": "review.d", "data": {"created_by": "review.lead"}}),
+        );
+        assert!(lookout.watches("review.d"));
+        assert!(!lookout.watches("review.lead"));
         // `deploys` asks only of ended turns, and only its own question.
         assert!(lookout.asks_for("ops.deploy", Kind::Said).is_none());
         let asks = lookout.asks_for("ops.deploy", Kind::Ended).unwrap();
