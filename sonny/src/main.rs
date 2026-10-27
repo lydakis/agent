@@ -1205,7 +1205,8 @@ struct App {
     shown: Vec<Line<'static>>,
     /// The records of those the daemon refused, to go with the next message.
     unsent: Vec<String>,
-    /// Those whose output this window showed, until their record lands.
+    /// Those whose output this window showed, from when their record is
+    /// sent until it lands.
     ran_here: Vec<user_shell::Ran>,
 }
 
@@ -1960,12 +1961,13 @@ impl App {
             let ran = self.shell.take().unwrap().ran().await;
             self.shown.extend(user_shell::lines(&ran, self.width));
             let record = user_shell::record(&ran);
-            // As it will read back once it lands.
-            self.ran_here.extend(user_shell::split(&record).0);
             // Refused, it is kept, to go with the next message.
-            if let Err(error) = self.send(record.clone(), Some(SHELL), false).await {
-                self.notice = Some(format!("{error}; it goes with your next message"));
-                hold(&mut self.unsent, record);
+            match self.send(record.clone(), Some(SHELL), false).await {
+                Ok(()) => self.ran_here.extend(user_shell::split(&record).0),
+                Err(error) => {
+                    self.notice = Some(format!("{error}; it goes with your next message"));
+                    hold(&mut self.unsent, record);
+                }
             }
         }
         if self.live.is_none() && !self.shown.is_empty() {
@@ -3806,10 +3808,11 @@ impl App {
         let join = !self.unsent.is_empty();
         if join {
             let records = self.unsent.join("\n\n");
-            if let Err(error) = self.send(records, Some(SHELL), false).await {
+            if let Err(error) = self.send(records.clone(), Some(SHELL), false).await {
                 self.notice = Some(error);
                 return;
             }
+            self.ran_here.extend(user_shell::split(&records).0);
             self.unsent.clear();
         }
         match self.send(prompt, None, join).await {
@@ -4841,6 +4844,7 @@ mod tests {
         app.shell_ran().await;
         // Refused: kept, and said to be.
         assert_eq!(app.unsent.len(), 1);
+        assert!(app.ran_here.is_empty());
         assert!(
             app.shell_rows(80)[0]
                 .to_string()
@@ -4867,6 +4871,7 @@ mod tests {
         assert_eq!(sent[1]["workspace"], "/moved");
         assert!(app.move_to.is_none());
         assert!(app.unsent.is_empty());
+        assert_eq!(app.ran_here.len(), 1);
         assert!(app.shell_rows(80).is_empty());
     }
 
