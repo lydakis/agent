@@ -2080,6 +2080,15 @@ impl Lookout {
             seen.kind == Kind::Ended
                 && handles.contains(&format!("turn:{}/{}", seen.task, seen.turn))
         };
+        // Held for the next note, and read first: the log says so, or its
+        // check would look lost.
+        for item in self.held.iter().filter(|item| read(&item.seen)) {
+            self.write(
+                &json!({"at_ms": epoch_ms(), "lead": self.lead, "task": item.seen.task,
+                "turn": item.seen.turn, "kind": format!("{:?}", item.seen.kind),
+                "skipped": "the lead read it"}),
+            );
+        }
         self.held.retain(|item| !read(&item.seen));
         self.due.retain(|seen| !read(seen));
         // Kept for checks still under way; a long-lived lead's list stays short.
@@ -2387,6 +2396,17 @@ impl Lookout {
     /// updates. Either note carries everything.
     async fn wake(&mut self, client: &Client) {
         let now = Instant::now();
+        if self.updates.doubt(now, self.urgent.is_some()) {
+            let listed = client
+                .request("bots", json!({"name": self.lead, "limit": 1}))
+                .await;
+            if let Some(record) = listed.ok().and_then(|page| page["bots"].get(0).cloned())
+                && let Some(was) = self.updates.rests(now, &record)
+            {
+                self.write(&json!({"at_ms": epoch_ms(), "lead": self.lead,
+                    "rests": format!("the daemon lists it idle; its events said {was}")}));
+            }
+        }
         let Some(steer) = self.wake_due(now) else {
             return;
         };
@@ -2711,6 +2731,32 @@ mod tests {
 
     fn ev(bot: &str, turn: i64, kind: &str, data: Value) -> Value {
         json!({"bot": bot, "turn": turn, "event": kind, "data": data})
+    }
+
+    #[test]
+    fn news_the_lead_read_before_its_note_leaves_a_log_line() {
+        let mut lookout = lookout();
+        let log = std::env::temp_dir().join(format!("lookout-read-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&log);
+        lookout.log = Some(log.clone());
+        let seen = lookout.due_seen();
+        lookout.held.push(Item {
+            seen,
+            reasons: vec![("result", 0.95)],
+            looks: Vec::new(),
+            band: Band::Wake { steer: false },
+        });
+        lookout.urgent = Some(false);
+        lookout.read(&HashSet::from(["turn:calc.fix/1".to_owned()]));
+        assert!(lookout.held.is_empty());
+        assert_eq!(lookout.urgent, None);
+        let line: Value =
+            serde_json::from_str(std::fs::read_to_string(&log).unwrap().trim()).unwrap();
+        assert_eq!(
+            (&line["task"], &line["turn"], &line["skipped"]),
+            (&json!("calc.fix"), &json!(1), &json!("the lead read it"))
+        );
+        let _ = std::fs::remove_file(&log);
     }
 
     #[test]

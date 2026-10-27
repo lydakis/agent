@@ -7,7 +7,7 @@
 //! own forks.
 //!
 //! Only live turns count. The lookout sends the news with its next note,
-//! or on its own once the lead rests, at most every ten minutes; one note
+//! or on its own once the lead rests, at most once a minute; one note
 //! names each task's latest turn of each kind, by the handle the wait tool
 //! reads it with. What changed in memory rides along, and never sends a
 //! note by itself.
@@ -18,7 +18,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-pub const WAKE: Duration = Duration::from_secs(10 * 60);
+pub const WAKE: Duration = Duration::from_secs(60);
 const WAKE_TASKS: usize = 32;
 /// How long a trigger has to pass a task's answer on before the turn is
 /// news after all.
@@ -126,6 +126,8 @@ pub struct Updates {
     quiet: HashMap<String, (i64, Instant, bool)>,
     silences: u64,
     last: Option<Instant>,
+    /// When the daemon last said whether the lead rests.
+    asked: Option<Instant>,
     memory_seen: Option<HashMap<String, u64>>,
     opened: u64,
 }
@@ -153,6 +155,7 @@ impl Updates {
             quiet: HashMap::new(),
             silences: 0,
             last: None,
+            asked: None,
             memory_seen: None,
             opened: now_ms(),
         }
@@ -506,6 +509,36 @@ impl Updates {
             && self.last.is_none_or(|last| now >= last + WAKE)
     }
 
+    /// Whether to ask the daemon if the lead rests: the note is due but for
+    /// the lead's turn, and the events said it started long ago. A missed
+    /// event would otherwise hold the note until the lead's next turn.
+    pub fn doubt(&self, now: Instant, held: bool) -> bool {
+        self.live
+            && (held || !self.tasks.is_empty())
+            && self.last.is_none_or(|last| now >= last + WAKE)
+            && self.asked.is_none_or(|asked| now >= asked + WAKE)
+            && self
+                .bots
+                .get(&self.lead)
+                .is_some_and(|lead| lead.id.is_some() && ACTIVE.contains(&lead.status.as_str()))
+    }
+
+    /// The lead as the daemon lists it now: if it rests there, it rests
+    /// here. What the events said it was doing comes back, to log.
+    pub fn rests(&mut self, now: Instant, record: &Value) -> Option<String> {
+        self.asked = Some(now);
+        let lead = self.bots.get_mut(&self.lead)?;
+        if lead.id != record["bot_id"].as_i64()
+            || !record["running_turn"].is_null()
+            || !ACTIVE.contains(&lead.status.as_str())
+        {
+            return None;
+        }
+        lead.running = None;
+        lead.waiting_on.clear();
+        Some(std::mem::replace(&mut lead.status, "idle".into()))
+    }
+
     /// The news for the next note, taken: every task's when the lead
     /// heard nothing for a while, those with news to act on first.
     pub fn take(&mut self, now: Instant) -> Told {
@@ -850,7 +883,7 @@ mod tests {
         assert_eq!(theirs, [false, true]);
         assert_eq!(told.items[0].handle, "turn:shop.fix/5");
         updates.sent(told);
-        // Ten minutes apart at most.
+        // A minute apart at most.
         turn(
             &mut updates,
             "shop.docs",
@@ -858,8 +891,40 @@ mod tests {
             json!({"from": {"bot": "shop.lead", "turn": 10}}),
             "completed",
         );
-        assert!(!updates.due(now + Duration::from_secs(60), false));
+        assert!(!updates.due(now + Duration::from_secs(30), false));
         assert!(updates.due(now + WAKE, false));
+    }
+
+    #[test]
+    fn a_lead_the_events_left_busy_rests_once_the_daemon_lists_it_idle() {
+        let mut updates = fleet();
+        let now = Instant::now();
+        // Its turn started, and the event that ended it never came.
+        updates.event(&ev("shop.lead", Some(11), "accepted", json!({})), now);
+        turn(
+            &mut updates,
+            "shop.fix",
+            6,
+            json!({"from": {"bot": "shop.lead", "turn": 10}}),
+            "completed",
+        );
+        assert!(!updates.due(now, false));
+        assert!(updates.doubt(now, false));
+        // Still running there: still busy here, and not asked again soon.
+        let running =
+            json!({"name": "shop.lead", "bot_id": 1, "status": "running", "running_turn": 11});
+        assert_eq!(updates.rests(now, &running), None);
+        assert!(!updates.doubt(now + Duration::from_secs(30), false));
+        assert!(!updates.due(now + WAKE, false));
+        // Another bot under the name says nothing of this one.
+        let other =
+            json!({"name": "shop.lead", "bot_id": 8, "status": "idle", "running_turn": null});
+        assert_eq!(updates.rests(now + WAKE, &other), None);
+        let idle =
+            json!({"name": "shop.lead", "bot_id": 1, "status": "idle", "running_turn": null});
+        assert_eq!(updates.rests(now + WAKE, &idle).as_deref(), Some("running"));
+        assert!(updates.due(now + WAKE, false));
+        assert!(!updates.doubt(now + WAKE * 2, false));
     }
 
     #[test]
