@@ -39,6 +39,7 @@ mod task;
 mod term;
 mod transcript;
 mod trigger;
+mod user_shell;
 
 use agent_client::{Client, Events};
 use ratatui::{
@@ -1101,6 +1102,11 @@ struct App {
     side: Option<std::process::Child>,
     /// Keys are left to the side chat while it is open.
     keys_paused: Arc<std::sync::atomic::AtomicBool>,
+    /// A `!command` of the person's, running.
+    shell: Option<user_shell::Running>,
+    /// The person's commands that ran, which go to the bot with the next
+    /// message.
+    shells: Vec<user_shell::Ran>,
 }
 
 /// The lead's tasks, laid out in the project's Rex session: a window for
@@ -1622,6 +1628,8 @@ impl App {
             last_reply: String::new(),
             side: None,
             keys_paused: Arc::default(),
+            shell: None,
+            shells: Vec::new(),
         }
     }
 
@@ -1750,6 +1758,7 @@ impl App {
                 self.spread().await;
             }
             self.side_closed();
+            self.shell_ran().await;
             self.listed();
             self.follow_place().await;
             self.follow_asks();
@@ -1760,6 +1769,18 @@ impl App {
                 self.repaint(terminal).await?;
             }
         }
+    }
+
+    /// The person's command, once it ran: what it printed is shown, and
+    /// it waits for the next message.
+    /// The bot's words still coming are not cut into.
+    async fn shell_ran(&mut self) {
+        if !self.shell.as_ref().is_some_and(|s| s.is_finished()) || self.live.is_some() {
+            return;
+        }
+        let ran = self.shell.take().unwrap().ran().await;
+        self.commit(user_shell::lines(&ran, self.width));
+        self.shells.push(ran);
     }
 
     /// Read the lead's open questions again, every second.
@@ -2221,7 +2242,13 @@ impl App {
                 }
                 match (item["type"].as_str(), item["role"].as_str()) {
                     (_, Some("user")) => {
-                        let lines = transcript::prompt(&text(&item), None, self.width);
+                        // What the person ran is shown as it was when it ran.
+                        let text = text(&item);
+                        let (ran, said) = user_shell::split(&text);
+                        for ran in &ran {
+                            self.commit(user_shell::lines(ran, self.width));
+                        }
+                        let lines = transcript::prompt(said, None, self.width);
                         self.commit(lines);
                     }
                     (_, Some("assistant")) => {
@@ -2311,7 +2338,11 @@ impl App {
         self.staged
             .iter()
             .flat_map(|(_, prompt)| {
-                prompt.split('\n').enumerate().flat_map(move |(at, line)| {
+                let (ran, prompt) = user_shell::split(prompt);
+                let ran = ran
+                    .into_iter()
+                    .flat_map(move |ran| user_shell::header(&ran.command, width, true));
+                let said = prompt.split('\n').enumerate().flat_map(move |(at, line)| {
                     let lead = if at == 0 { "› " } else { "  " };
                     transcript::wrap(
                         Line::from(line.to_owned()).dim(),
@@ -2319,9 +2350,38 @@ impl App {
                         Span::raw(lead).dim(),
                         Span::raw("  "),
                     )
-                })
+                });
+                ran.chain(said)
             })
             .collect()
+    }
+
+    /// The person's command running, and those that ran, waiting for the
+    /// next message.
+    fn shell_rows(&self, width: usize) -> Vec<Line<'static>> {
+        let mut rows = Vec::new();
+        for ran in &self.shells {
+            let mut header = user_shell::header(&ran.command, width, true);
+            if let Some(last) = header.last_mut() {
+                last.spans
+                    .push(Span::raw(" · goes with your next message").dim());
+            }
+            rows.extend(header);
+        }
+        if let Some(shell) = &self.shell {
+            let mut header = user_shell::header(&shell.command, width, true);
+            if let Some(last) = header.last_mut() {
+                last.spans.push(
+                    Span::raw(format!(
+                        " · running {} · esc stops it",
+                        transcript::elapsed(shell.started.elapsed().as_secs())
+                    ))
+                    .dim(),
+                );
+            }
+            rows.extend(header);
+        }
+        rows
     }
 
     /// The bot's words not yet written: the rows held, then the open line,
@@ -2515,7 +2575,7 @@ impl App {
                     && let Some(node) = data["node"].as_i64()
                     && let Some(item) = self.items(&[node]).await.first()
                 {
-                    let lines = transcript::prompt(&text(item), None, self.width);
+                    let lines = landed(&text(item), self.width);
                     self.commit(lines);
                 }
             }
@@ -2526,7 +2586,7 @@ impl App {
                     && let Some(item) = self.items(&[node]).await.first()
                 {
                     self.end_live(Words::Reply);
-                    let lines = transcript::prompt(&text(item), None, self.width);
+                    let lines = landed(&text(item), self.width);
                     self.commit(lines);
                 }
             }
@@ -2997,7 +3057,14 @@ impl App {
                         None => format!("{name} {}", arguments["path"].as_str().unwrap_or("")),
                     };
                 }
-                (_, Some("user")) => return format!("asked: {}", first_line(&text(&item))),
+                (_, Some("user")) => {
+                    let text = text(&item);
+                    let (ran, said) = user_shell::split(&text);
+                    return match (said.is_empty(), ran.last()) {
+                        (true, Some(ran)) => format!("ran: ! {}", first_line(&ran.command)),
+                        _ => format!("asked: {}", first_line(said)),
+                    };
+                }
                 _ => {}
             }
         }
@@ -3278,7 +3345,9 @@ impl App {
                     }
                     KeyCode::Enter => self.submit().await,
                     KeyCode::Esc => {
-                        if let Some(running) = &self.running {
+                        if let Some(shell) = &self.shell {
+                            shell.stop();
+                        } else if let Some(running) = &self.running {
                             let turn = running.turn;
                             let _ = self
                                 .client
@@ -3305,6 +3374,24 @@ impl App {
     async fn submit(&mut self) {
         let prompt = self.input.trim().to_owned();
         if prompt.is_empty() {
+            return;
+        }
+        if let Some(command) = prompt.strip_prefix('!') {
+            let command = command.trim();
+            if command.is_empty() {
+                self.notice = Some("! runs a shell command: type one after it".into());
+            } else if self.shell.is_some() {
+                self.notice = Some("a command of yours still runs; esc stops it".into());
+            } else {
+                match user_shell::start(command, &self.workspace) {
+                    Ok(running) => {
+                        self.shell = Some(running);
+                        self.input.clear();
+                        self.notice = None;
+                    }
+                    Err(error) => self.notice = Some(error),
+                }
+            }
             return;
         }
         if matches!(prompt.as_str(), "/status" | "/agents" | "/ps") {
@@ -3486,6 +3573,8 @@ impl App {
             Some(ask) => asks::answer(ask, &prompt),
             None => prompt,
         };
+        // What the person ran since the last message goes with this one.
+        let prompt = user_shell::with(&self.shells, &prompt);
         // A message to a busy bot joins its running turn, on that turn's model.
         let delivery = self.running.is_some().then_some("steer");
         let model = delivery
@@ -3513,6 +3602,7 @@ impl App {
                     self.asks.retain(|open| open.file != ask.file);
                 }
                 self.input.clear();
+                self.shells.clear();
                 self.notice = None;
                 if workspace.is_some() {
                     self.move_to = None;
@@ -3701,6 +3791,7 @@ impl App {
         let mut open_rows = self.open_rows(width);
         // Then what was sent and has not landed, kept in view below it.
         open_rows.extend(self.staged_rows(width));
+        open_rows.extend(self.shell_rows(width));
         // The lead's questions stay pinned above the status row.
         open_rows.extend(asks::rows(&self.asks, width, self.chatting));
         let spare = room.saturating_sub(composer_rows.len()) + 1;
@@ -3915,11 +4006,14 @@ impl App {
         }
         let layout = self.input.layout(width);
         let (row, col) = self.input.cursor(&layout);
+        // A shell command is marked as one while it is typed.
+        let shell = self.input.starts_with('!');
         let rows: Vec<Line<'static>> = layout
             .iter()
             .enumerate()
             .map(|(at, part)| {
                 let lead = match at {
+                    0 if shell => Span::raw("› ").bold().fg(Color::Magenta),
                     0 => Span::raw("› ").bold(),
                     _ => Span::raw("  "),
                 };
@@ -3970,6 +4064,14 @@ impl App {
         }
         match &self.notice {
             Some(notice) => Line::from(Span::raw(notice.clone()).fg(Color::Yellow)),
+            None if self.input.starts_with('!') => Line::from(vec![
+                Span::raw("! ").bold().fg(Color::Magenta),
+                Span::raw(format!(
+                    "runs in {}; the agent sees it with your next message",
+                    tilde(&self.workspace)
+                ))
+                .dim(),
+            ]),
             None => Line::default(),
         }
     }
@@ -4119,6 +4221,19 @@ fn short(bot: &str, project: &str, lead: &str) -> String {
     bot.strip_prefix(&format!("{project}."))
         .unwrap_or(bot)
         .to_owned()
+}
+
+/// A message as it lands in the conversation: the commands the person
+/// ran before it, by name only, as their output was shown when they ran,
+/// then what was said.
+fn landed(text: &str, width: usize) -> Vec<Line<'static>> {
+    let (ran, said) = user_shell::split(text);
+    let mut lines: Vec<Line<'static>> = ran
+        .iter()
+        .flat_map(|ran| user_shell::header(&ran.command, width, true))
+        .collect();
+    lines.extend(transcript::prompt(said, None, width));
+    lines
 }
 
 fn first_line(text: &str) -> String {
@@ -4326,6 +4441,58 @@ mod tests {
         assert!(!dir.join("1.json").exists());
         assert!(dir.join("2.json").exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn what_the_person_ran_goes_with_their_next_message() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let client = daemon_answering(move |asked| {
+            if asked["op"] == "submit" {
+                seen.lock()
+                    .unwrap()
+                    .push(asked["prompt"].as_str().unwrap().to_owned());
+            }
+            json!({"turn": 2})
+        })
+        .await;
+        let mut app = app(client);
+        app.workspace = std::env::temp_dir().to_string_lossy().into_owned();
+        app.input.set("!echo hello");
+        app.submit().await;
+        assert!(app.input.is_empty());
+        assert_eq!(app.shell_rows(80).len(), 1);
+        while app.shell.as_ref().is_some_and(|s| !s.is_finished()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        app.shell_ran().await;
+        assert!(app.shell.is_none());
+        // Shown at once, and held for the next message.
+        let shown: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
+        assert_eq!(shown, ["! echo hello", "  └ hello"]);
+        assert!(
+            app.shell_rows(80)[0]
+                .to_string()
+                .ends_with("goes with your next message")
+        );
+        assert!(sent.lock().unwrap().is_empty());
+        app.input.set("did it work?");
+        app.submit().await;
+        let prompt = sent.lock().unwrap()[0].clone();
+        let (ran, said) = user_shell::split(&prompt);
+        assert_eq!(said, "did it work?");
+        assert_eq!((ran[0].command.as_str(), ran[0].exit), ("echo hello", 0));
+        assert_eq!(ran[0].output, "hello");
+        assert!(app.shells.is_empty());
+        // Staged and landed, it reads as the command's name and the message.
+        let staged: Vec<String> = app.staged_rows(80).iter().map(|l| l.to_string()).collect();
+        assert_eq!(staged, ["! echo hello", "› did it work?"]);
+        let landed: Vec<String> = landed(&prompt, 80).iter().map(|l| l.to_string()).collect();
+        assert_eq!(landed, ["! echo hello", "› did it work?"]);
+        // The next message goes alone.
+        app.input.set("thanks");
+        app.submit().await;
+        assert_eq!(sent.lock().unwrap()[1], "thanks");
     }
 
     #[tokio::test]

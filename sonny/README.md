@@ -59,8 +59,20 @@ The skill tells agents to close what they opened once read; whatever a task
 left open closes with its window.
 
 Enter sends (and steers a running turn), Esc interrupts, `y`/`n` answer a
-pending approval, Ctrl-C clears the composer or quits. `/` lists the
-commands:
+pending approval, Ctrl-C clears the composer or quits.
+
+`!COMMAND` runs a command of your own with your shell, in the agent's
+folder, as Codex and Claude Code do, in any agent's window: the lead's or a
+task's. You see what it printed at once, and it goes to the agent with your
+next message, in Codex's `<user_shell_command>` record (the command, its
+exit code and its output, a long output's start and end), so the agent
+knows what you ran without a turn of its own. Esc stops a command still
+running. A command's output waits in this window only: one you never send
+a message after stays yours.
+
+![A command run with !, its output, and the agent's answer to the next message](../docs/sonny/shell-passthrough.gif)
+
+`/` lists the commands:
 
 - `/side [QUESTION]` opens a side chat with a copy of the agent in this
   window, taken where it is now, mid-turn included, on the alternate
