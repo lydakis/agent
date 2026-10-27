@@ -28,6 +28,7 @@ mod mux;
 mod place;
 mod project;
 mod prompt;
+mod reactions;
 mod rex;
 mod settings;
 mod shell;
@@ -78,6 +79,11 @@ const DEFAULT_TOOLS: [&str; 6] = ["shell", "read", "write", "edit", "wait", "his
 const VIEWPORT: u16 = 5;
 /// The most rows a long prompt's composer grows to; it shows its end.
 const COMPOSER_ROWS: usize = 8;
+/// How many of the bot's latest replies `/react` offers.
+const REACTABLE: usize = 9;
+/// How much of a reply's first line a reaction quotes.
+const QUOTED: usize = 72;
+
 /// How much history is shown on attach.
 const HISTORY_ITEMS: u64 = 200;
 /// How long a side chat's copy stays once idle.
@@ -721,6 +727,10 @@ async fn run() -> Result<(), String> {
             "a copy of {source} that answers without acting; {source} carries on"
         ));
     }
+    // The person's agent can react to them; a side chat calls no tool.
+    if options.side.is_none() {
+        app.declare = reactions::declare(&bot);
+    }
     app.sounds = sound::Sounds::new(options.sound);
     let settings = settings::Settings::load();
     app.sounds.chime = settings.chime;
@@ -1053,7 +1063,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, unlisted.
-const COMMANDS: [(&str, &str); 13] = [
+const COMMANDS: [(&str, &str); 14] = [
     (
         "/side",
         "a side chat with a copy of this agent, which carries on",
@@ -1076,6 +1086,7 @@ const COMMANDS: [(&str, &str); 13] = [
         "/copies",
         "tasks in git worktrees or sandfs copies (experimental)",
     ),
+    ("/react", "react to one of the agent's replies"),
     ("/copy", "the last reply, as Markdown"),
     ("/open", "the last HTML page, in your browser"),
     ("/quit", "the agents keep working"),
@@ -1162,6 +1173,30 @@ struct App {
     /// steer until the running turn takes it in, a prompt until its turn
     /// starts. Drawn above the status row until they land.
     staged: Vec<(i64, String)>,
+    /// The person's reactions to this bot's replies.
+    reactions: reactions::Reactions,
+    /// The bot's latest replies, by node, with their first lines: what
+    /// `/react` offers, newest last.
+    replies: Vec<(i64, String)>,
+    /// `/react`'s list is open, at this reply from the newest.
+    reacting: Option<usize>,
+    /// The reply `/react` picked, which the next emoji sent answers.
+    react_to: Option<(i64, String)>,
+    /// The turn of the last reaction sent, whose attaching says nothing.
+    reaction_turn: Option<i64>,
+    /// The tools to declare on the bot so it can react, sent once no turn
+    /// runs.
+    declare: Option<Value>,
+    /// The bot's reactions in the running turn so far, drawn when it ends.
+    bot_reactions: Vec<String>,
+    /// The bot's `react` calls not yet completed, by call id.
+    react_calls: HashMap<String, (String, bool)>,
+    /// The first line of the person's message the bot answers, and the
+    /// rows drawn when it was: a reaction with none drawn since goes right
+    /// under it.
+    answering: Option<(String, usize)>,
+    /// Rows written into the history so far.
+    rows_drawn: usize,
     /// The reasoning streamed since the bot last spoke or called a tool,
     /// whose latest heading the status row shows, as Codex does.
     thought: String,
@@ -1793,6 +1828,16 @@ impl App {
             sounds: sound::Sounds::new(false),
             said: String::new(),
             staged: Vec::new(),
+            reactions: reactions::Reactions::default(),
+            replies: Vec::new(),
+            reacting: None,
+            react_to: None,
+            reaction_turn: None,
+            declare: None,
+            bot_reactions: Vec::new(),
+            react_calls: HashMap::new(),
+            answering: None,
+            rows_drawn: 0,
             thought: String::new(),
             replay: None,
             options,
@@ -1832,6 +1877,7 @@ impl App {
         term::laid_out().await;
         let _ = terminal.autoresize();
         self.width = terminal.size().map(|s| s.width as usize).unwrap_or(80);
+        self.reactions = reactions::Reactions::load(self.asks_key.as_deref());
         self.history().await;
         // A turn already running: its clock, and any call it waits on.
         if let Some(turn) = self.running.as_ref().map(|r| r.turn) {
@@ -2044,16 +2090,24 @@ impl App {
     /// for the turn to end, or when the daemon refused it (the notice says
     /// why).
     async fn configure(&mut self) -> bool {
-        if self.instruct.is_none() && self.switch.is_none() && self.gating.is_none() {
+        if self.instruct.is_none()
+            && self.switch.is_none()
+            && self.gating.is_none()
+            && self.declare.is_none()
+        {
             return true;
         }
         if self.running.is_some() {
             return false;
         }
         let (text, switch, gating) = (self.instruct.take(), self.switch.take(), self.gating.take());
+        let declare = self.declare.take();
         let mut asked = json!({"bot": self.bot});
         if let Some(text) = &text {
             asked["instructions"] = json!(text);
+        }
+        if let Some(declare) = &declare {
+            asked["declare"] = declare.clone();
         }
         if let Some((model, effort)) = &switch {
             asked["model"] = json!(model);
@@ -2098,6 +2152,7 @@ impl App {
                 self.instruct = text;
                 self.switch = switch;
                 self.gating = gating;
+                self.declare = declare;
                 return false;
             }
             Err(error) => {
@@ -2365,19 +2420,35 @@ impl App {
 
     /// Commit a finished cell, a blank line apart from the one before.
     fn commit(&mut self, lines: Vec<Line<'static>>) {
+        self.commit_after(lines, true);
+    }
+
+    /// Commit a finished cell, right under the one before when `gap` is
+    /// false, as a reaction goes under its reply.
+    fn commit_after(&mut self, lines: Vec<Line<'static>>, gap: bool) {
         if lines.is_empty() {
             return;
         }
-        if self.any_history {
+        if gap && self.any_history {
             self.pending.push(Line::default());
         }
         self.any_history = true;
+        self.rows_drawn += lines.len();
         self.pending.extend(lines);
     }
 
     /// The items of `nodes`, in order and in the Responses family's shape.
     /// A read stops at a byte limit, so what it left is asked for again.
     async fn items(&self, nodes: &[i64]) -> Vec<Value> {
+        self.items_at(nodes)
+            .await
+            .into_iter()
+            .map(|(_, item)| item)
+            .collect()
+    }
+
+    /// [`App::items`], each with the node it is kept at.
+    async fn items_at(&self, nodes: &[i64]) -> Vec<(i64, Value)> {
         let mut items = Vec::new();
         let mut rest = nodes;
         while !rest.is_empty() {
@@ -2393,7 +2464,12 @@ impl App {
                 break;
             }
             rest = &rest[entries.len().min(rest.len())..];
-            items.extend(entries.iter().flat_map(|entry| responses(&entry["item"])));
+            items.extend(entries.iter().flat_map(|entry| {
+                let node = entry["node"].as_i64().unwrap_or(0);
+                responses(&entry["item"])
+                    .into_iter()
+                    .map(move |item| (node, item))
+            }));
         }
         items
     }
@@ -2462,6 +2538,14 @@ impl App {
             asked["from"] = page["next_from"].clone();
         }
         nodes.reverse();
+        // Drawn from the start (attaching, or a repaint), the bot's
+        // reactions are read again with the rest; after a gap, those it
+        // made before the gap are still held.
+        if self.seen_node == 0 || after < self.seen_node {
+            self.bot_reactions.clear();
+            self.react_calls.clear();
+            self.answering = None;
+        }
         self.seen_node = nodes.last().copied().unwrap_or(self.seen_node);
         if let Some(&first) = nodes.first() {
             self.first_node = Some(self.first_node.map_or(first, |n| n.min(first)));
@@ -2470,8 +2554,9 @@ impl App {
         // The bot's words, quiet if a call follows them, as they were live.
         let mut said: Option<Vec<Line<'static>>> = None;
         for chunk in nodes.chunks(100) {
-            for item in self.items(chunk).await {
-                let call = item["type"] == "function_call";
+            for (node, item) in self.items_at(chunk).await {
+                // A reaction leaves the words before it as they were.
+                let call = item["type"] == "function_call" && item["name"] != reactions::TOOL;
                 if let Some(lines) = said.take_if(|_| call || item["role"].is_string()) {
                     self.commit(match call {
                         true => transcript::quiet(lines),
@@ -2479,16 +2564,37 @@ impl App {
                     });
                 }
                 match (item["type"].as_str(), item["role"].as_str()) {
+                    // A reaction is drawn under the reply it answers.
+                    (_, Some("user")) if reactions::is_reaction(&text(&item)) => {}
                     (_, Some("user")) => {
+                        // The bot's reactions to the message before, as they
+                        // were drawn live.
+                        self.draw_bot_reactions();
                         // What the person ran is shown as it was when it ran.
                         let lines = landed(&text(&item), &mut self.ran_here, self.width);
                         self.commit(lines);
+                        self.answering = Some((first_words(&text(&item)), self.rows_drawn));
                     }
                     (_, Some("assistant")) => {
                         let reply = text(&item);
                         if !reply.is_empty() {
-                            said = Some(transcript::reply(&reply, self.width));
+                            let mut lines = transcript::reply(&reply, self.width);
+                            lines.extend(self.reacted_row(node));
+                            said = Some(lines);
+                            self.saw_reply(node, &reply);
                             self.last_reply = reply;
+                        }
+                    }
+                    // Counted once it is known to have been taken.
+                    (Some("function_call"), _) if item["name"] == reactions::TOOL => {
+                        if let Some(reaction) = item["arguments"]
+                            .as_str()
+                            .and_then(|a| serde_json::from_str::<Value>(a).ok())
+                            .as_ref()
+                            .and_then(reactions::call)
+                        {
+                            let id = item["call_id"].as_str().unwrap_or("").to_owned();
+                            self.react_calls.insert(id, reaction);
                         }
                     }
                     (Some("function_call"), _) => {
@@ -2501,6 +2607,19 @@ impl App {
                             item["call_id"].as_str().unwrap_or("").to_owned(),
                             (name, arguments),
                         );
+                    }
+                    (Some("function_call_output"), _)
+                        if self
+                            .react_calls
+                            .contains_key(item["call_id"].as_str().unwrap_or("")) =>
+                    {
+                        let id = item["call_id"].as_str().unwrap_or("");
+                        if let Some((emoji, remove)) = self.react_calls.remove(id)
+                            && !output(&item).1
+                            && !reactions::refused(&item)
+                        {
+                            reactions::apply(&mut self.bot_reactions, &emoji, remove);
+                        }
                     }
                     (Some("function_call_output"), _) => {
                         let id = item["call_id"].as_str().unwrap_or("");
@@ -2519,6 +2638,10 @@ impl App {
         }
         if let Some(lines) = said {
             self.commit(lines);
+        }
+        // A running turn's reactions are drawn when it ends.
+        if self.running.is_none() {
+            self.draw_bot_reactions();
         }
         // A call still running finishes live, after the history.
         self.calls.extend(calls);
@@ -2684,6 +2807,7 @@ impl App {
         if live.gap && !live.spilled {
             self.pending.push(Line::default());
         }
+        self.rows_drawn += live.rows.len();
         self.pending.extend(match words {
             Words::Step => transcript::quiet(live.rows),
             Words::Reply => live.rows,
@@ -2709,6 +2833,7 @@ impl App {
                 self.pending.push(Line::default());
             }
             live.spilled = true;
+            self.rows_drawn += live.rows.len();
             self.pending.append(&mut live.rows);
             self.any_history = true;
         }
@@ -2799,27 +2924,39 @@ impl App {
                 }
                 self.effort = data["effort"].as_str().map(str::to_owned);
                 status_report("working", &self.bot);
+                self.bot_reactions.clear();
+                self.answering = None;
                 if !drawn
                     && let Some(node) = data["node"].as_i64()
                     && let Some(item) = self.items(&[node]).await.first()
+                    && !reactions::is_reaction(&text(item))
                 {
                     let lines = landed(&text(item), &mut self.ran_here, self.width);
                     self.commit(lines);
+                    self.answering = Some((first_words(&text(item)), self.rows_drawn));
                 }
             }
             "steered" => {
                 self.staged
                     .retain(|(staged, _)| Some(*staged) != data["steer"].as_i64());
+                // A reaction was drawn when it was sent.
                 if let Some(node) = data["node"].as_i64()
                     && let Some(item) = self.items(&[node]).await.first()
+                    && !reactions::is_reaction(&text(item))
                 {
                     self.end_live(Words::Reply);
+                    // What the bot reacted with so far answered the
+                    // message before this one.
+                    self.draw_bot_reactions();
                     let lines = landed(&text(item), &mut self.ran_here, self.width);
                     self.commit(lines);
+                    self.answering = Some((first_words(&text(item)), self.rows_drawn));
                 }
             }
             "queued" => self.notice = Some(format!("queued behind turn {}", data["behind"])),
-            "attached" => self.notice = Some("attached to its next call".into()),
+            "attached" if turn.is_none() || turn != self.reaction_turn => {
+                self.notice = Some("attached to its next call".into())
+            }
             "text_delta" => {
                 self.thought.clear();
                 let mut delta = event["text"].as_str().unwrap_or("");
@@ -2886,6 +3023,9 @@ impl App {
                 }
                 if let Some(item) = &item {
                     self.last_reply = text(item);
+                    if let Some(node) = data["node"].as_i64() {
+                        self.saw_reply(node, &text(item));
+                    }
                 }
                 let said = std::mem::take(&mut self.said);
                 self.replay = None;
@@ -2935,6 +3075,34 @@ impl App {
                 }
                 if let Some(running) = &mut self.running {
                     running.phase = "Retrying".into();
+                }
+            }
+            "tool_started" if data["name"] == reactions::TOOL => {
+                // Counted once it completes, and drawn when the turn ends,
+                // so one taken off again is never drawn.
+                if let Some(reaction) = data["arguments"]
+                    .as_str()
+                    .and_then(|a| serde_json::from_str::<Value>(a).ok())
+                    .as_ref()
+                    .and_then(reactions::call)
+                {
+                    let id = data["call_id"].as_str().unwrap_or("").to_owned();
+                    self.react_calls.insert(id, reaction);
+                }
+            }
+            "tool_completed"
+                if self
+                    .react_calls
+                    .contains_key(data["call_id"].as_str().unwrap_or("")) =>
+            {
+                let id = data["call_id"].as_str().unwrap_or("");
+                // The daemon refuses a call that does not fit, or that the
+                // bot may not make.
+                if let Some((emoji, remove)) = self.react_calls.remove(id)
+                    && data["failed"] != true
+                    && data["denied"] != true
+                {
+                    reactions::apply(&mut self.bot_reactions, &emoji, remove);
                 }
             }
             "tool_started" => {
@@ -2989,6 +3157,7 @@ impl App {
                 self.commit_call(&name, &arguments, &shown.0, shown.1);
                 if self.calls.is_empty() && !self.held.is_empty() {
                     let held = std::mem::take(&mut self.held);
+                    self.rows_drawn += held.len();
                     self.pending.extend(held);
                 }
                 self.approvals.retain(|call| call["call_id"] != id);
@@ -3030,10 +3199,20 @@ impl App {
                 let seconds = self.running.take().map(|r| r.started.elapsed().as_secs());
                 let line = transcript::finished(status, detail, seconds, self.width);
                 self.close_live();
+                // A turn that only reacted ends as a reaction under the
+                // message, with no line under it.
+                let words = self.live.as_ref().is_some_and(|live| !live.rows.is_empty());
+                let only_reacted = !words
+                    && !self.bot_reactions.is_empty()
+                    && self.answering.as_ref().map(|(_, at)| *at) == Some(self.rows_drawn);
+                if only_reacted {
+                    self.draw_bot_reactions();
+                }
                 // A turn that ended well puts its reply under the line, apart
                 // from the steps above; one written as it came, or one
                 // that failed, keeps the line under it.
                 match self.live.take() {
+                    _ if only_reacted && matches!(status, "completed" | "steered") => {}
                     Some(live)
                         if !live.spilled
                             && !live.rows.is_empty()
@@ -3049,6 +3228,7 @@ impl App {
                         self.commit(vec![line]);
                     }
                 }
+                self.draw_bot_reactions();
                 self.approvals.clear();
                 self.notice = None;
                 status_report(
@@ -3420,6 +3600,28 @@ impl App {
             }
             return;
         }
+        if let Some(pick) = &mut self.reacting {
+            if let Event::Key(key) = event
+                && key.kind != KeyEventKind::Release
+            {
+                let count = self.replies.len().max(1);
+                match key.code {
+                    KeyCode::Up => *pick = (*pick + 1) % count,
+                    KeyCode::Down => *pick = (*pick + count - 1) % count,
+                    KeyCode::Enter => {
+                        let at = self.replies.len().saturating_sub(1 + *pick);
+                        self.react_to = self.replies.get(at).cloned();
+                        self.reacting = None;
+                    }
+                    KeyCode::Esc => self.reacting = None,
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.reacting = None
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
         if let Some(pick) = &mut self.choosing {
             if let Event::Key(key) = event
                 && key.kind != KeyEventKind::Release
@@ -3582,6 +3784,7 @@ impl App {
                         self.input.insert("\n")
                     }
                     KeyCode::Enter => self.submit().await,
+                    KeyCode::Esc if self.react_to.is_some() => self.react_to = None,
                     KeyCode::Esc => {
                         if let Some(shell) = &self.shell {
                             shell.stop();
@@ -3719,6 +3922,15 @@ impl App {
             );
             return;
         }
+        if prompt == "/react" {
+            self.input.clear();
+            if self.replies.is_empty() {
+                self.notice = Some("no reply to react to yet".into());
+            } else {
+                self.reacting = Some(0);
+            }
+            return;
+        }
         if prompt == "/approvals" {
             self.input.clear();
             let current = self.gating.or(self.mode);
@@ -3845,6 +4057,15 @@ impl App {
             Some(ask) => asks::answer(ask, &prompt),
             None => prompt,
         };
+        if answering.is_none()
+            && let Some(emoji) = transcript::shortcodes(&prompt)
+                .or_else(|| transcript::reaction(&prompt).map(str::to_owned))
+        {
+            self.react(emoji).await;
+            return;
+        }
+        // Words are a message, whatever reply `/react` picked.
+        self.react_to = None;
         // What the person ran and the agent could not be given yet goes
         // first, each on its own, and this message joins the turn they start.
         let mut join = false;
@@ -3905,6 +4126,124 @@ impl App {
             self.move_to = None;
         }
         Ok(())
+    }
+
+    /// A reply the bot gave, which `/react` offers until newer ones push
+    /// it out.
+    fn saw_reply(&mut self, node: i64, reply: &str) {
+        if reply.is_empty() || self.replies.iter().any(|(seen, _)| *seen == node) {
+            return;
+        }
+        let first = reply
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("");
+        self.replies
+            .push((node, transcript::cut(first.trim(), QUOTED)));
+        if self.replies.len() > REACTABLE {
+            self.replies.remove(0);
+        }
+    }
+
+    /// The bot's reactions so far to the person's message: right under it
+    /// when nothing was drawn since, else a row of their own that says
+    /// which message.
+    fn draw_bot_reactions(&mut self) {
+        let on = std::mem::take(&mut self.bot_reactions);
+        if on.is_empty() {
+            return;
+        }
+        let emoji = on.join(" ");
+        match &self.answering {
+            Some((_, at)) if *at == self.rows_drawn => {
+                self.commit_after(vec![transcript::reacted(&emoji)], false);
+            }
+            answering => {
+                let what = match answering {
+                    Some((first, _)) => format!("↳ reacted {emoji} to “{first}”"),
+                    None => format!("↳ reacted {emoji}"),
+                };
+                let rows = transcript::wrap(
+                    Line::from(what),
+                    self.width,
+                    Span::raw("  "),
+                    Span::raw("    "),
+                );
+                self.commit(transcript::quiet(rows));
+            }
+        }
+        // Another reaction now goes under this one's row.
+        if let Some((_, at)) = &mut self.answering {
+            *at = self.rows_drawn;
+        }
+    }
+
+    /// The person's reactions to the reply at `node`, as its row.
+    fn reacted_row(&self, node: i64) -> Option<Line<'static>> {
+        let on = self.reactions.on(node);
+        (!on.is_empty()).then(|| transcript::reacted(&on.join(" ")))
+    }
+
+    /// An emoji sent alone reacts to the reply `/react` picked, else to
+    /// the bot's last: attached to the bot's next call, so it starts no
+    /// turn. The same emoji again takes it off, which the bot is not told.
+    async fn react(&mut self, emoji: String) {
+        let Some((node, first)) = self
+            .react_to
+            .take()
+            .or_else(|| self.replies.last().cloned())
+        else {
+            self.notice = Some("no reply to react to yet".into());
+            return;
+        };
+        let last = self.replies.last().map(|(last, _)| *last) == Some(node);
+        let added = match self.reactions.toggle(node, &emoji) {
+            Ok(added) => added,
+            Err(error) => {
+                self.notice = Some(error);
+                return;
+            }
+        };
+        if added {
+            let told = reactions::message(&emoji, (!last).then_some(first.as_str()));
+            let sent = self
+                .client
+                .request(
+                    "submit",
+                    json!({"bot": self.bot, "request_id": unique("tui"), "prompt": told,
+                        "delivery": "attach"}),
+                )
+                .await;
+            match sent {
+                Ok(reply) => self.reaction_turn = reply["turn"].as_i64(),
+                Err(error) => {
+                    let _ = self.reactions.toggle(node, &emoji);
+                    self.notice = Some(error.to_string());
+                    return;
+                }
+            }
+        }
+        self.input.clear();
+        self.notice = None;
+        // Under the last reply when nothing came after it; else a row of
+        // its own that says which reply.
+        if added && last && self.running.is_none() {
+            self.end_live(Words::Reply);
+            self.commit_after(vec![transcript::reacted(&emoji)], false);
+            return;
+        }
+        let what = if added {
+            format!("↳ {emoji} on “{first}”")
+        } else {
+            format!("↳ took back {emoji} on “{first}”")
+        };
+        let rows = transcript::wrap(
+            Line::from(what),
+            self.width,
+            Span::raw("  "),
+            Span::raw("    "),
+        );
+        self.commit(transcript::quiet(rows));
     }
 
     /// `/side`: a side chat with a copy of this bot, taken where it is now,
@@ -4172,6 +4511,45 @@ impl App {
                 frame.render_widget(ratatui::widgets::Clear, area);
                 frame.render_widget(Paragraph::new(rows), area);
             }
+            if let Some(pick) = self.reacting {
+                // Newest at the bottom, nearest the composer, as they read.
+                let first = pick.saturating_sub(2);
+                let mut rows: Vec<Line> = self
+                    .replies
+                    .iter()
+                    .rev()
+                    .enumerate()
+                    .skip(first)
+                    .take(3)
+                    .map(|(i, (node, said))| {
+                        let on = self.reactions.on(*node).join(" ");
+                        let room = width.saturating_sub(8 + on.width());
+                        let said = transcript::cut(said, room);
+                        let row = if i == pick {
+                            Span::raw(format!(" {said} ")).reversed()
+                        } else {
+                            Span::raw(format!(" {said}"))
+                        };
+                        Line::from(vec![Span::raw("   "), row, Span::raw(format!("  {on}"))])
+                    })
+                    .collect();
+                rows.reverse();
+                let area = ratatui::layout::Rect {
+                    y: composer.y.saturating_sub(rows.len() as u16),
+                    height: rows.len() as u16,
+                    ..composer
+                };
+                frame.render_widget(ratatui::widgets::Clear, area);
+                frame.render_widget(Paragraph::new(rows), area);
+                let line = Line::from(vec![
+                    Span::raw("› ").bold(),
+                    Span::raw("which reply to react to").dim(),
+                ]);
+                frame.render_widget(Paragraph::new(line), composer);
+                let keys = Line::from("  ↑↓ reply · enter, then send an emoji · esc").dim();
+                frame.render_widget(Paragraph::new(keys), footer);
+                return;
+            }
             if let Some(pick) = self.choosing {
                 let rows: Vec<Line> = approvals::MODES
                     .iter()
@@ -4288,6 +4666,7 @@ impl App {
         if self.input.is_empty() {
             let hint = match self.running {
                 _ if !self.asks.is_empty() && !self.chatting => "Answer, or Esc to chat",
+                _ if self.react_to.is_some() => "An emoji for that reply, or Esc",
                 Some(_) => "Steer the running turn",
                 None => "Ask anything",
             };
@@ -4318,7 +4697,8 @@ impl App {
                 ])
             })
             .collect();
-        let keep = match self.choosing.is_some() || self.picker.is_some() {
+        let keep = match self.choosing.is_some() || self.picker.is_some() || self.reacting.is_some()
+        {
             true => 1,
             false => COMPOSER_ROWS,
         };
@@ -4521,6 +4901,15 @@ fn short(bot: &str, project: &str, lead: &str) -> String {
 /// A message as it lands in the conversation. A command the person ran
 /// is by name only when `shown` holds it (this window showed its output
 /// when it ran, and lets it go), else whole.
+/// A message's first line, cut to quote it.
+fn first_words(text: &str) -> String {
+    let first = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("");
+    transcript::cut(first.trim(), QUOTED)
+}
+
 fn landed(text: &str, shown: &mut Vec<user_shell::Ran>, width: usize) -> Vec<Line<'static>> {
     let Some(ran) = user_shell::read(text) else {
         return transcript::prompt(text, None, width);
@@ -5136,6 +5525,250 @@ mod tests {
             rows[line + 1..],
             [("".into(), false), ("• Done.".into(), false)]
         );
+    }
+
+    #[tokio::test]
+    async fn an_emoji_reacts_to_a_reply_without_a_turn_and_again_takes_it_off() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let client = daemon_answering(move |asked| {
+            if asked["op"] == "submit" {
+                seen.lock().unwrap().push(asked.clone());
+            }
+            json!({"turn": 9})
+        })
+        .await;
+        let mut app = app(client);
+        app.turn_model = Some("opus".into());
+        app.any_history = true;
+        let rows = |app: &mut App| {
+            std::mem::take(&mut app.pending)
+                .iter()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+        };
+        app.input.set("👍");
+        app.submit().await;
+        assert_eq!(app.notice.as_deref(), Some("no reply to react to yet"));
+        app.saw_reply(4, "Merged it.\nThe notes are updated.");
+        app.saw_reply(8, "Tagged 0.4.0.");
+        // The last reply: the emoji alone, attached, right under it.
+        app.input.set(":+1:");
+        app.submit().await;
+        let first = sent.lock().unwrap()[0].clone();
+        assert_eq!(first["prompt"], "👍");
+        assert_eq!(first["delivery"], "attach");
+        assert!(first["model"].is_null() && first["workspace"].is_null());
+        assert!(app.input.is_empty());
+        assert_eq!(rows(&mut app), ["   👍 "], "no blank row above it");
+        assert_eq!(app.reactions.on(8), ["👍"]);
+        app.daemon(turn_event("attached", 9, json!({}))).await;
+        assert_eq!(app.notice, None, "a reaction attaching says nothing");
+        // An older reply, picked with /react: quoted, so the bot knows.
+        app.input.set("/react");
+        app.submit().await;
+        assert_eq!(app.reacting, Some(0));
+        app.key(Event::Key(KeyCode::Up.into())).await;
+        app.key(Event::Key(KeyCode::Enter.into())).await;
+        assert_eq!(app.react_to, Some((4, "Merged it.".into())));
+        app.input.set("🎉");
+        app.submit().await;
+        assert_eq!(sent.lock().unwrap()[1]["prompt"], "> Merged it.\n\n🎉");
+        assert_eq!(rows(&mut app), ["", "  ↳ 🎉 on “Merged it.”"]);
+        // The same emoji again takes it off, telling the bot nothing.
+        app.input.set("👍");
+        app.submit().await;
+        assert_eq!(sent.lock().unwrap().len(), 2);
+        assert_eq!(rows(&mut app), ["", "  ↳ took back 👍 on “Tagged 0.4.0.”"]);
+        assert!(app.reactions.on(8).is_empty());
+        // Words with an emoji are a message, sent as one.
+        app.input.set("👍 ship it");
+        app.submit().await;
+        assert_eq!(sent.lock().unwrap()[2]["prompt"], "👍 ship it");
+        assert!(sent.lock().unwrap()[2]["delivery"].is_null());
+    }
+
+    #[tokio::test]
+    async fn the_bots_reaction_goes_under_the_message_once_its_turn_ends() {
+        let client = daemon_answering(move |asked| {
+            let item = match asked["nodes"][0].as_i64() {
+                Some(1) => json!({"type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": "merged, thanks"}]}),
+                Some(5) => json!({"type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": "and the notes?"}]}),
+                Some(7) => json!({"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Updated."}]}),
+                _ => return json!({}),
+            };
+            json!({"items": [{"node": asked["nodes"][0], "item": item}]})
+        })
+        .await;
+        let mut app = app(client);
+        let react = |turn: i64, id: &str, arguments: Value| {
+            turn_event(
+                "tool_started",
+                turn,
+                json!({"call_id": id, "name": "react", "arguments": arguments.to_string()}),
+            )
+        };
+        let rows = |app: &mut App| {
+            std::mem::take(&mut app.pending)
+                .iter()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+        };
+        // A turn that only reacts: 👀 taken off again is never drawn, and
+        // no line closes the turn.
+        app.daemon(turn_event("accepted", 1, json!({"node": 1})))
+            .await;
+        for (id, arguments) in [
+            ("c1", json!({"emoji": "👀"})),
+            ("c2", json!({"emoji": "👍"})),
+            ("c3", json!({"emoji": "👀", "remove": true})),
+        ] {
+            app.daemon(react(1, id, arguments)).await;
+            app.daemon(turn_event("tool_completed", 1, json!({"call_id": id})))
+                .await;
+        }
+        assert_eq!(rows(&mut app), ["› merged, thanks"], "drawn when it ends");
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        assert_eq!(rows(&mut app), ["   👍 "]);
+        // One that answers too: the reaction says which message.
+        app.daemon(turn_event("accepted", 2, json!({"node": 5})))
+            .await;
+        app.daemon(react(2, "c4", json!({"emoji": "🎉"}))).await;
+        app.daemon(turn_event("tool_completed", 2, json!({"call_id": "c4"})))
+            .await;
+        // One the daemon refused is not drawn.
+        app.daemon(react(2, "c5", json!({"emoji": "👀", "remove": "yes"})))
+            .await;
+        app.daemon(turn_event(
+            "tool_completed",
+            2,
+            json!({"call_id": "c5", "failed": true}),
+        ))
+        .await;
+        app.daemon(turn_event("message", 2, json!({"node": 7})))
+            .await;
+        app.daemon(turn_event(
+            "turn_finished",
+            2,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        let drawn = rows(&mut app);
+        assert_eq!(drawn[1], "› and the notes?");
+        assert!(drawn[3].starts_with("─ Worked"), "{drawn:?}");
+        assert_eq!(
+            drawn[5..],
+            ["• Updated.", "", "  ↳ reacted 🎉 to “and the notes?”"]
+        );
+    }
+
+    #[tokio::test]
+    async fn replayed_bot_reactions_are_drawn_as_they_were_live() {
+        let items = json!({
+            "1": {"type": "message", "role": "user",
+                  "content": [{"type": "input_text", "text": "merged, thanks"}]},
+            "2": {"type": "function_call", "name": "react", "call_id": "c1",
+                  "arguments": "{\"emoji\":\"👍\"}"},
+            "3": {"type": "function_call_output", "call_id": "c1", "output": "Done."},
+            "4": {"type": "message", "role": "user",
+                  "content": [{"type": "input_text", "text": "and the notes?"}]},
+            "5": {"type": "function_call", "name": "react", "call_id": "c2",
+                  "arguments": "{\"emoji\":\"👀\",\"remove\":\"yes\"}"},
+            "6": {"type": "function_call_output", "call_id": "c2",
+                  "output": "{\"error\":\"invalid_arguments\"}"},
+            "7": {"type": "function_call", "name": "react", "call_id": "c3",
+                  "arguments": "{\"emoji\":\"🎉\"}"},
+            "8": {"type": "function_call_output", "call_id": "c3", "output": "Done."},
+            "9": {"type": "message", "role": "assistant",
+                  "content": [{"type": "output_text", "text": "Updated."}]},
+        });
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_nodes") => {
+                json!({"nodes": (1..=9).rev().map(|node| json!({"node": node}))
+                .collect::<Vec<_>>(), "next_from": null})
+            }
+            _ => json!({"items": asked["nodes"].as_array().into_iter().flatten()
+                .map(|node| json!({"node": node, "item": items[node.to_string()]}))
+                .collect::<Vec<_>>()}),
+        })
+        .await;
+        let mut app = app(client);
+        app.history().await;
+        let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
+        assert_eq!(
+            rows,
+            [
+                "› merged, thanks",
+                "   👍 ",
+                "",
+                "› and the notes?",
+                "",
+                "• Updated.",
+                "",
+                "  ↳ reacted 🎉 to “and the notes?”"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_bot_is_given_react_once_no_turn_runs() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = daemon_answering(move |request| {
+            seen.lock().unwrap().push(request.clone());
+            json!({"bot": "b", "changed": ["declared"]})
+        })
+        .await;
+        let mut app = app(client);
+        app.declare = reactions::declare(&json!({}));
+        app.running = Some(Running {
+            turn: 1,
+            started: Instant::now(),
+            phase: "Working".into(),
+        });
+        assert!(!app.configure().await);
+        assert!(asked.lock().unwrap().is_empty());
+        app.running = None;
+        assert!(app.configure().await);
+        let sent = asked.lock().unwrap()[0].clone();
+        assert_eq!(sent["op"], "configure");
+        assert_eq!(sent["declare"], json!([reactions::tool()]));
+        assert!(app.declare.is_none());
+    }
+
+    #[tokio::test]
+    async fn replayed_reactions_sit_under_their_reply_and_their_messages_are_not_drawn() {
+        let items = json!({
+            "1": {"type": "message", "role": "assistant",
+                  "content": [{"type": "output_text", "text": "Merged it."}]},
+            "2": {"type": "message", "role": "user",
+                  "content": [{"type": "input_text", "text": "what next?"}]},
+            "3": {"type": "message", "role": "user",
+                  "content": [{"type": "input_text", "text": "> Merged it.\n\n🎉"}]},
+        });
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_nodes") => {
+                json!({"nodes": [{"node": 3}, {"node": 2}, {"node": 1}], "next_from": null})
+            }
+            _ => json!({"items": asked["nodes"].as_array().into_iter().flatten()
+                .map(|node| json!({"node": node, "item": items[node.to_string()]}))
+                .collect::<Vec<_>>()}),
+        })
+        .await;
+        let mut app = app(client);
+        app.reactions.toggle(1, "🎉").unwrap();
+        app.history().await;
+        let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
+        assert_eq!(rows, ["• Merged it.", "   🎉 ", "", "› what next?"]);
+        assert_eq!(app.replies, [(1, "Merged it.".to_owned())]);
     }
 
     #[tokio::test]

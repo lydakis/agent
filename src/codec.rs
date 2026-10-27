@@ -15,8 +15,8 @@ pub enum Family {
 /// Provider-neutral tool description; each family encodes it differently.
 #[derive(Clone, Debug)]
 pub struct ToolSchema {
-    pub name: &'static str,
-    pub description: &'static str,
+    pub name: std::borrow::Cow<'static, str>,
+    pub description: std::borrow::Cow<'static, str>,
     pub parameters: Value,
 }
 

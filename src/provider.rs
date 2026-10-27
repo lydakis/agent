@@ -2013,7 +2013,7 @@ mod tests {
                 Provider::new(transport.clone(), family, "http://example.test", None).unwrap();
             let schemas = crate::tools::Registry::all()
                 .unwrap()
-                .encoded(family, &["echo".into()])
+                .encoded(family, &["echo".into()], &[])
                 .unwrap();
             for allow in [true, false] {
                 for tools in [&*schemas, &*none()] {

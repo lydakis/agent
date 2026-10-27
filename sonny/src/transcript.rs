@@ -601,18 +601,101 @@ fn news(text: &str) -> Option<Vec<String>> {
 
 /// News on one dim row, its kind first, cut at the width.
 fn news_row(parts: &[String], width: usize) -> Line<'static> {
-    let mut row = format!("↳ {}", parts.join(" · "));
-    if row.width() > width {
-        let mut cut = String::new();
-        for c in row.chars() {
-            if cut.width() + unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) + 1 > width {
-                break;
-            }
-            cut.push(c);
-        }
-        row = format!("{}…", cut.trim_end());
+    Line::from(cut(&format!("↳ {}", parts.join(" · ")), width)).dim()
+}
+
+/// `text` cut to `width` columns, with an ellipsis when it was longer.
+pub fn cut(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_owned();
     }
-    Line::from(row).dim()
+    let mut cut = String::new();
+    for c in text.chars() {
+        if cut.width() + unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) + 1 > width {
+            break;
+        }
+        cut.push(c);
+    }
+    format!("{}…", cut.trim_end())
+}
+
+/// Words that are only an emoji or a few, trimmed: the person's message
+/// that is only that is a reaction to what the bot said last.
+pub fn reaction(text: &str) -> Option<&str> {
+    let text = text.trim();
+    let emoji = |c: char| {
+        matches!(c as u32,
+            0x1F000..=0x1FAFF // pictographs, faces, flags, skin tones
+            | 0x2600..=0x27BF // ☀ ✅ ❤ ✨
+            | 0x2B00..=0x2BFF // ⭐ ⬆
+            | 0x2300..=0x23FF // ⌛ ⏰
+            | 0x203C | 0x2049 // ‼ ⁉
+            | 0xFE0F | 0x200D | 0x20E3) // emoji presentation, joiner, keycap
+    };
+    let (mut any, mut count) = (false, 0);
+    for c in text.chars() {
+        if c == ' ' {
+            continue;
+        }
+        if !emoji(c) {
+            return None;
+        }
+        any |= !matches!(c as u32, 0xFE0F | 0x200D | 0x20E3);
+        count += 1;
+    }
+    (any && count <= REACTION_CHARS).then_some(text)
+}
+
+/// The most characters a reaction holds, joiners and modifiers counted:
+/// a family emoji is seven.
+const REACTION_CHARS: usize = 12;
+
+/// The emoji typed as Slack's shortcodes, such as `:+1:`, that a message
+/// made only of them is a reaction of: `+1` and `:+1:` both read 👍.
+pub fn shortcodes(text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for word in text.split(' ').filter(|w| !w.is_empty()) {
+        let code = word.strip_prefix(':').and_then(|w| w.strip_suffix(':'));
+        let emoji = match code.unwrap_or(word) {
+            "+1" | "thumbsup" => "👍",
+            "-1" | "thumbsdown" => "👎",
+            _ if code.is_none() => return None,
+            "heart" => "❤️",
+            "tada" => "🎉",
+            "eyes" => "👀",
+            "pray" => "🙏",
+            "joy" => "😂",
+            "fire" => "🔥",
+            "rocket" => "🚀",
+            "100" => "💯",
+            "white_check_mark" | "check" => "✅",
+            "ok_hand" => "👌",
+            "thinking" | "thinking_face" => "🤔",
+            "smile" => "😄",
+            _ => return None,
+        };
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(emoji);
+    }
+    Some(out)
+}
+
+/// A reaction, as a pill under the message it answers.
+pub fn reacted(emoji: &str) -> Line<'static> {
+    let pill = match crate::term::light() {
+        true => Color::Rgb(232, 232, 238),
+        false => Color::Rgb(50, 50, 58),
+    };
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(format!(" {emoji} "), Style::new().bg(pill)),
+    ])
 }
 
 /// A whole reply, as replayed history shows it.
@@ -1482,6 +1565,31 @@ mod tests {
         assert_eq!(elapsed(9), "9s");
         assert_eq!(elapsed(65), "1m 05s");
         assert_eq!(elapsed(3723), "1h 02m 03s");
+    }
+
+    #[test]
+    fn only_emoji_are_a_reaction() {
+        for said in ["👍", " 🎉 🚀\n", "❤️", "👍🏽", "👨‍👩‍👧‍👦", "✅"]
+        {
+            assert_eq!(reaction(said), Some(said.trim()), "{said:?}");
+        }
+        for said in [
+            "",
+            "ok",
+            "👍 thanks",
+            "1",
+            "→",
+            "👍👍👍👍👍👍👍👍👍👍👍👍👍",
+        ] {
+            assert_eq!(reaction(said), None, "{said:?}");
+        }
+        assert_eq!(shortcodes(":+1:").as_deref(), Some("👍"));
+        assert_eq!(shortcodes("+1").as_deref(), Some("👍"));
+        assert_eq!(shortcodes(":tada: :eyes:").as_deref(), Some("🎉 👀"));
+        for typed in ["tada", ":nope:", "+1 thanks", "100", ""] {
+            assert_eq!(shortcodes(typed), None, "{typed:?}");
+        }
+        assert_eq!(reacted("👍").to_string(), "   👍 ");
     }
 }
 

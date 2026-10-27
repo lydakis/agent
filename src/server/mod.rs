@@ -16,7 +16,7 @@ use agent_runtime::{
         Answer, Binding, Bot, Decision, Delivery, Fork, Gate, MAX_GATES, Publication, Settings,
         Started, Store, TurnOptions, Waiting, Wake,
     },
-    tools::Registry,
+    tools::{DECLARED_BYTES, Declared, MAX_DECLARED, Registry, validate_declared},
 };
 use handles::{Completion, Handles, Waiter, now_ms};
 use hub::{Hub, replay};
@@ -109,8 +109,11 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
             created_by,
             compaction_instructions,
             compaction_model,
+            declare,
             ..
         } => (
+            // A bot that takes its creator's declared tools shows them too,
+            // up to their bound.
             output::encoded_len(&(
                 id,
                 bot,
@@ -121,7 +124,14 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
                 created_by,
                 compaction_instructions,
                 compaction_model,
-            )),
+            ))
+            .map(|bytes| {
+                bytes
+                    + match declare {
+                        Some(declare) => output::encoded_len(declare).unwrap_or(DECLARED_BYTES),
+                        None => DECLARED_BYTES,
+                    }
+            }),
             output::encoded_len(&(bot, created_by)),
             if workspace.is_some() { PATH_JSON } else { 0 },
             // Both the bot and its event carry its gates, most of them
@@ -203,6 +213,10 @@ enum Command {
         /// takes the default. Forks keep their source's.
         #[serde(default)]
         settings: Box<Settings>,
+        /// Tools the client declares: shown to the model after `tools`,
+        /// never run, each call recorded with the tool's fixed result.
+        /// Left out, a bot takes its creator's.
+        declare: Option<Vec<Declared>>,
         /// An idempotency key: resending the request with it gets the bot
         /// it made, `duplicate: true`, instead of `bot_exists`.
         request_id: Option<String>,
@@ -231,6 +245,9 @@ enum Command {
         approve: Option<Vec<String>>,
         approver: Option<String>,
         approve_expire_ms: Option<u64>,
+        /// The tools its client declares, replacing those it has; `[]`
+        /// removes them.
+        declare: Option<Vec<Declared>>,
     },
     /// Summarize a bot's context with its compaction instructions before
     /// its next model call: a running turn's next round boundary, or an
@@ -2060,6 +2077,7 @@ impl Service {
                 approver,
                 approve_expire_ms,
                 settings,
+                declare,
                 request_id,
             } => {
                 if budget_tokens == Some(0) {
@@ -2104,6 +2122,9 @@ impl Service {
                 }
                 let tools = tools.ok_or(Error::new("tools_required"))?;
                 self.registry.validate(&tools)?;
+                if let Some(declare) = &declare {
+                    validate_declared(declare)?;
+                }
                 if compaction_instructions
                     .as_ref()
                     .is_some_and(|text| text.len() > 64 * 1024)
@@ -2147,6 +2168,7 @@ impl Service {
                                 fallbacks,
                                 gate: gate.as_ref(),
                                 settings: *settings,
+                                declared: declare.as_deref(),
                                 request_id: request_id.as_deref(),
                             },
                         )?;
@@ -2270,6 +2292,7 @@ impl Service {
                 approve,
                 approver,
                 approve_expire_ms,
+                declare,
             } => {
                 if effort.is_some() && model.is_none() {
                     return fail_with("invalid_effort", "effort goes with model");
@@ -2289,6 +2312,9 @@ impl Service {
                         "instructions_limit",
                         "instructions may be up to 65536 bytes",
                     ));
+                }
+                if let Some(declare) = &declare {
+                    validate_declared(declare)?;
                 }
                 if let Some(active) = self.active.get(&bot) {
                     return Err(Error::with(
@@ -2351,6 +2377,11 @@ impl Service {
                             && db.set_instructions(&bot, Some(id), &instructions)?
                         {
                             changed.push("instructions");
+                        }
+                        if let Some(declare) = &declare
+                            && db.set_declared(&bot, Some(id), declare)?
+                        {
+                            changed.push("declared");
                         }
 
                         Ok(json!({"bot":bot,"bot_id":id,"changed":changed}))
@@ -2701,21 +2732,22 @@ impl Service {
                     Some(None) => {
                         return fail_with("invalid_allow", "allow is a list of tool names");
                     }
-                    // Repeats are allowed; the set stops growing past the bound.
+                    // Repeats are allowed; the set stops growing past the
+                    // bound, the daemon's tools and as many declared.
                     Some(Some(tools))
-                        if tools.len() > self.registry.tool_count() && {
+                        if tools.len() > self.registry.tool_count() + MAX_DECLARED && {
                             let mut distinct = std::collections::HashSet::new();
                             tools.iter().any(|tool| {
                                 distinct.insert(tool.as_str());
-                                distinct.len() > self.registry.tool_count()
+                                distinct.len() > self.registry.tool_count() + MAX_DECLARED
                             })
                         } =>
                     {
                         return fail_with(
                             "invalid_allow",
                             format!(
-                                "allow names more tools than the daemon's {}",
-                                self.registry.tool_count()
+                                "allow names more tools than a bot may have, {}",
+                                self.registry.tool_count() + MAX_DECLARED
                             ),
                         );
                     }
@@ -3560,6 +3592,7 @@ mod tests {
                         fallbacks: false,
                         gate: None,
                         settings: Default::default(),
+                        declared: None,
                         request_id: None,
                     },
                 )?;
@@ -3774,6 +3807,7 @@ mod tests {
             fallbacks: false,
             gate: None,
             settings: Default::default(),
+            declared: None,
             request_id: None,
         };
         let turn = store
@@ -4011,6 +4045,7 @@ mod tests {
                                 fallbacks: false,
                                 gate: None,
                                 settings: Default::default(),
+                                declared: None,
                                 request_id: None,
                             },
                         )?;
@@ -4306,6 +4341,7 @@ mod tests {
                         fallbacks: false,
                         gate: None,
                         settings: Default::default(),
+                        declared: None,
                         request_id: None,
                     },
                 )?;
@@ -4392,6 +4428,7 @@ mod tests {
                         fallbacks: false,
                         gate: None,
                         settings: Default::default(),
+                        declared: None,
                         request_id: None,
                     },
                 )
@@ -4635,6 +4672,7 @@ mod tests {
             approver: None,
             approve_expire_ms: None,
             settings: Box::default(),
+            declare: None,
             request_id: None,
         }
     }
@@ -5207,6 +5245,7 @@ mod tests {
                             fallbacks: false,
                             gate: Some(&gate),
                             settings: Default::default(),
+                            declared: None,
                             request_id: None,
                         },
                     )?;
@@ -5486,6 +5525,7 @@ mod tests {
                         fallbacks: false,
                         gate: Some(&gate),
                         settings: Default::default(),
+                        declared: None,
                         request_id: None,
                     },
                 )?;

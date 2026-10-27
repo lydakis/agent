@@ -4,7 +4,7 @@ use crate::{
     codec::Family,
     fail, fail_with,
     provider::{ToolCall, Usage},
-    tools::Outcome,
+    tools::{Declared, Outcome},
 };
 use bytes::Bytes;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -58,6 +58,11 @@ pub struct Bot {
     /// so the fork's requests keep its source's cached prefix.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed: Option<Vec<String>>,
+    /// Tools its client declared, shown after `tools` and never run: a
+    /// call is recorded with the tool's fixed result. A bot it creates
+    /// takes them unless its client declares others; a fork keeps them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub declared: Vec<Declared>,
     /// The bot whose client created or forked this one, as that client
     /// declared it (the CLI takes it from `AGENT_BOT`). Bots are peers;
     /// this is lineage for people, not authority.
@@ -365,6 +370,22 @@ impl Bot {
     pub fn callable(&self) -> &[String] {
         self.allowed.as_deref().unwrap_or(&self.tools)
     }
+    /// The declared tool `name`, when the bot may call it: a fork's allowed
+    /// list narrows declared tools as it does the daemon's.
+    pub fn declared(&self, name: &str) -> Option<&Declared> {
+        let allowed = self
+            .allowed
+            .as_ref()
+            .is_none_or(|allowed| allowed.iter().any(|tool| tool == name));
+        self.declared
+            .iter()
+            .find(|tool| tool.name == name)
+            .filter(|_| allowed)
+    }
+    /// Whether the bot may call `name`, the daemon's tool or a declared one.
+    pub fn may_call(&self, name: &str) -> bool {
+        self.callable().iter().any(|tool| tool == name) || self.declared(name).is_some()
+    }
     /// The bot id that keys this bot's provider prompt cache.
     pub fn cache_bot(&self) -> i64 {
         self.cache_bot.unwrap_or(self.bot_id)
@@ -414,6 +435,9 @@ pub struct Binding<'a> {
     /// The bot's own gate; its creator's, if any, is added by the store.
     pub gate: Option<&'a Gate>,
     pub settings: Settings,
+    /// The tools its client declares, already checked; `None` takes its
+    /// creator's.
+    pub declared: Option<&'a [Declared]>,
     /// The client's idempotency key: a resend with the same key and fields
     /// gets the bot it made.
     pub request_id: Option<&'a str>,
@@ -1181,6 +1205,11 @@ fn stored_gates(gates: &[Gate]) -> Result<Option<String>> {
         .then(|| serde_json::to_string(gates))
         .transpose()?)
 }
+fn stored_declared(declared: &[Declared]) -> Result<Option<String>> {
+    Ok((!declared.is_empty())
+        .then(|| serde_json::to_string(declared))
+        .transpose()?)
+}
 fn split_tools(joined: &str) -> Vec<String> {
     joined
         .split(',')
@@ -1265,7 +1294,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 52;
+    pub const SCHEMA: i32 = 53;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1399,7 +1428,8 @@ impl Database {
                 thinking_elided INTEGER NOT NULL DEFAULT 0, gates TEXT, denials TEXT,
                 closed INTEGER, open_calls INTEGER, allowed TEXT, settings TEXT, creation TEXT,
                 expire_ms INTEGER, expires_at INTEGER,
-                sent_bytes INTEGER, sent_tokens INTEGER, compact_asked INTEGER NOT NULL DEFAULT 0);
+                sent_bytes INTEGER, sent_tokens INTEGER, compact_asked INTEGER NOT NULL DEFAULT 0,
+                declared TEXT);
             CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
             CREATE INDEX IF NOT EXISTS bots_note ON bots(note);
             CREATE INDEX IF NOT EXISTS bots_compaction ON bots(compaction);
@@ -1841,9 +1871,19 @@ impl Database {
                 _ => None,
             },
             compaction_requested: r.get::<_, i64>(39)? != 0,
+            declared: match r.get::<_, Option<String>>(40)? {
+                None => Vec::new(),
+                Some(text) => serde_json::from_str(&text).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        40,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+            },
         })
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings,expire_ms,expires_at,sent_bytes,sent_tokens,compact_asked";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings,expire_ms,expires_at,sent_bytes,sent_tokens,compact_asked,declared";
     /// Validate the caller's captured identity in the same transaction that
     /// creates the child. Never resolve a stale shell's name to a new bot.
     fn creator_id(
@@ -1879,6 +1919,14 @@ impl Database {
             None => Vec::new(),
         })
     }
+    /// The tools the creating bot's client declared, which a bot it
+    /// creates takes unless its own client declares others.
+    fn creator_declared(conn: &Connection, creator: Option<i64>) -> Result<Option<String>> {
+        let Some(id) = creator else {
+            return Ok(None);
+        };
+        Ok(conn.query_row("SELECT declared FROM bots WHERE id=?", [id], |r| r.get(0))?)
+    }
     pub fn inspect(&self, name: &str) -> Result<Bot> {
         self.conn
             .query_row(
@@ -1905,6 +1953,23 @@ impl Database {
         let changed = self.conn.execute(
             "UPDATE bots SET instructions=?, cache_bot=NULL, thinking_prefix=NULL WHERE id=? AND instructions<>?",
             params![instructions, id, instructions],
+        )?;
+        Ok(changed == 1)
+    }
+    /// Replace the tools a bot's client declared; whether they changed.
+    /// The daemon has checked them. Its next request shows the new set,
+    /// so a fork keys its own cache from then on, as for instructions.
+    pub fn set_declared(
+        &mut self,
+        name: &str,
+        bot_id: Option<i64>,
+        declared: &[Declared],
+    ) -> Result<bool> {
+        let id = self.identity(name, bot_id)?;
+        let stored = stored_declared(declared)?;
+        let changed = self.conn.execute(
+            "UPDATE bots SET declared=?, cache_bot=NULL WHERE id=? AND declared IS NOT ?",
+            params![stored, id, stored],
         )?;
         Ok(changed == 1)
     }
@@ -2125,7 +2190,8 @@ impl Database {
             "provider":binding.provider,"model":binding.model,"effort":binding.effort,
             "budget_tokens":binding.budget_tokens,"tools":binding.tools,"created_by":binding.created_by,
             "created_by_id":binding.created_by_id,"compaction_model":binding.compaction_model,
-            "fallbacks":binding.fallbacks,"gate":binding.gate,"settings":binding.settings}));
+            "fallbacks":binding.fallbacks,"gate":binding.gate,"settings":binding.settings,
+            "declare":binding.declared}));
         if let Some(bot) = self.resent(name, binding.request_id, request.as_ref())? {
             if bot.compaction_instructions.as_deref() != binding.compaction_instructions {
                 return Err(conflict(name, "compaction_instructions"));
@@ -2144,8 +2210,12 @@ impl Database {
             inherited.iter().chain(binding.gate),
             binding.tools,
         ))?;
+        let declared = match binding.declared {
+            Some(declared) => stored_declared(declared)?,
+            None => Self::creator_declared(&tx, created_by_id)?,
+        };
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,fallbacks,gates,settings,creation) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,fallbacks,gates,settings,creation,declared) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?)",
             params![
                 name,
                 id,
@@ -2164,7 +2234,8 @@ impl Database {
                 binding.fallbacks,
                 gates,
                 binding.settings.stored()?,
-                creation(binding.request_id, request)
+                creation(binding.request_id, request),
+                declared,
             ],
         )?;
         // The event carries the list record's fields, so a follower can
@@ -6524,7 +6595,7 @@ impl Database {
             Some(allow) => {
                 let mut allowed: Vec<String> = Vec::with_capacity(allow.len());
                 for tool in allow {
-                    if !parent.callable().contains(tool) {
+                    if !parent.may_call(tool) {
                         return fail_with(
                             "allow_not_in_source",
                             format!("{source} may not call {tool}"),
@@ -6592,7 +6663,7 @@ impl Database {
             &parent.tools,
         ))?;
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,thinking_from,thinking_to,thinking_elided,gates,allowed,settings,creation,expire_ms,expires_at) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,thinking_from,thinking_to,thinking_elided,gates,allowed,settings,creation,expire_ms,expires_at,declared) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 name,
                 id,
@@ -6627,6 +6698,7 @@ impl Database {
                 creation(request_id, request),
                 expire_ms.map(|ms| ms as i64),
                 expire_ms.map(|ms| epoch_ms().saturating_add(ms as i64)),
+                stored_declared(&parent.declared)?,
             ],
         )?;
         if let Some(node) = checkpoint {
@@ -8810,6 +8882,14 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
              ALTER TABLE bots ADD COLUMN sent_tokens INTEGER;
              ALTER TABLE bots ADD COLUMN compact_asked INTEGER NOT NULL DEFAULT 0;",
         )?;
+    }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='declared')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 52 -> 53: tools a client declares on a bot. None had any.
+        conn.execute_batch("ALTER TABLE bots ADD COLUMN declared TEXT;")?;
     }
     Ok(())
 }

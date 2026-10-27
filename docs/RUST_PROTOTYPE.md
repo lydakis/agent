@@ -1160,7 +1160,7 @@ since its history is kept in that family's encoding
 bot that made it: whoever configures a bot decides, as a person overriding
 one does, and bots it already made keep theirs. The gate is checked before
 anything is written. It answers `{bot, bot_id, changed}`, `changed` naming the fields
-(`model`, `instructions`, `gates`) that differed; the same request again
+(`model`, `instructions`, `gates`, `declared`) that differed; the same request again
 changes nothing, so a resend is harmless. A change is told to the bot's
 followers as a live `configured` event with the same fields, which is not
 kept, so a client that attaches later reads the bot as it is. It is refused with `bot_busy`
@@ -2053,6 +2053,28 @@ foreground shell, but native file I/O or background commands can outlive the
 cancelled turn. Without a committed result the tool outcome is unknown, not a
 claim that all work stopped. The turn ends `interrupted` and the bot stays
 usable; history tells the model to inspect current state before retrying.
+
+### Declared tools
+
+Protocol version 19 lets a client declare tools of its own on a bot:
+`create` and `configure` take `declare`, a list of up to 16
+`{name, description, parameters, result?}` taking at most 64 KiB, which
+`configure` replaces whole (`[]` removes them). The model is shown them after
+the daemon's tools, and the daemon never runs one: a call is checked against
+its `parameters` (an object schema; required fields, a closed object's extra
+fields, and each listed field's basic type) and recorded at once with the
+tool's fixed `result` (default `ok`), or with `invalid_arguments` when it does
+not fit. The call is otherwise like any other: `tool_started` and
+`tool_completed` events, history items, approvals never asked. What it means
+is the client's, which reads the call from events and history; a TUI's
+reaction to a message is one. A name is 1 to 64 letters, digits, `_` or `-`,
+taken by none of the daemon's tools nor declared twice; anything else is
+`invalid_declare`. `inspect` reports `declared` when a bot has some (schema
+53). A bot created by another takes its creator's declared tools unless its
+own client declares others, a fork keeps its source's, and a fork's `allow`
+narrows them as it does the daemon's. Changing them changes the request's
+tool definitions, so a fork keys its own prompt cache from then on, as for
+instructions.
 
 ### Tool approval
 
