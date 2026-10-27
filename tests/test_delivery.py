@@ -589,6 +589,10 @@ class DeliveryTests(ModelFixture):
         refused = client.request('submit', bot='Bob', request_id='x', prompt='fyi', delivery='attach',
                                  model='openai/synthetic-model')
         self.assertEqual(refused['error'], 'invalid_delivery')
+        # A bot with no folder yet takes one too: the turn that takes it names one.
+        client.request('create', bot='Nomad')
+        self.assertEqual(client.request('submit', bot='Nomad', request_id='n', prompt='fyi',
+                                        delivery='attach')['result']['status'], 'attached')
         # Idle: nothing runs, however long it waits.
         note = client.request('submit', bot='Bob', request_id='n1', prompt='fyi: scope changed',
                               delivery='attach')['result']

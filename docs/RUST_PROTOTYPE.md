@@ -1467,8 +1467,10 @@ the turn's id and handle at once, and `wait`, `turns`, and
   finishes as `steered` with `into` naming the turn that took it; the
   submission's event is `attached`. It takes no `workspace`, `model`,
   `effort`, `budget_tokens` or `expected_turn` (`invalid_delivery`), since
-  it joins whatever call comes next, and for the same reason the bot's
-  default model is not checked; `interrupt` withdraws one that waits.
+  it joins whatever call comes next. For the same reason the bot's default
+  model is not checked and it needs no folder, even on a bot without one; it
+  never moves the retention boundary past itself. `interrupt` withdraws one
+  that waits.
   `agent run --delivery attach` returns at once, inside a bot's shell too.
 
 A queued or ready turn that cannot start when its place comes (for example,

@@ -1924,7 +1924,7 @@ impl Database {
         let tx = self.conn.savepoint()?;
         tx.execute(
             "UPDATE turns SET (bot_model,bot_reasoning)=(SELECT provider||'/'||model,reasoning FROM bots WHERE id=?1)
-              WHERE bot=?2 AND bot_model IS NULL AND status NOT IN ('queued','ready')
+              WHERE bot=?2 AND bot_model IS NULL AND status NOT IN ('queued','ready','attached')
                 AND EXISTS(SELECT 1 FROM bots WHERE id=?1 AND (provider<>?3 OR model<>?4 OR reasoning IS NOT ?5))",
             params![id, name, provider, model, effort],
         )?;
@@ -4120,17 +4120,20 @@ impl Database {
         if let Some(budget) = bot.budget_tokens.filter(|b| bot.tokens_used >= *b) {
             return Err(budget_exhausted(&bot, budget));
         }
-        // A bot keeps its folder; a turn that names one moves it there.
+        // A bot keeps its folder; a turn that names one moves it there. An
+        // attached message needs none: it runs in whatever turn takes it.
         let workspace = options
             .workspace
             .as_deref()
             .or(bot.workspace.as_deref())
-            .ok_or(Error::new("workspace_required"))?
-            .to_owned();
+            .map(str::to_owned);
+        if workspace.is_none() && !attach {
+            return Err(Error::new("workspace_required"));
+        }
         // A steer's folder is for that message alone: it may never run.
         let moved = options.workspace.is_some()
             && options.delivery != Delivery::Steer
-            && bot.workspace.as_deref() != Some(&workspace);
+            && bot.workspace != workspace;
         // Only the head of a bot's line is ready; the rest wait behind it.
         let status = if attach {
             "attached"
@@ -4178,7 +4181,7 @@ impl Database {
             // Queued work keeps the folder it was sent to even if the bot
             // moves before it starts; a steer without one joins any turn.
             params![turn, name, request_id, prompt, status,
-                if matches!(options.delivery, Delivery::Steer | Delivery::Attach) { options.workspace.as_deref() } else { Some(workspace.as_str()) },
+                if matches!(options.delivery, Delivery::Steer | Delivery::Attach) { options.workspace.as_deref() } else { workspace.as_deref() },
                 options.model, options.delivery.name(), options.expected_turn,
                 options.from.as_ref().map(|f| &f.0), options.from.as_ref().map(|f| f.1), from_id, options.origin,
                 options.effort, options.budget_tokens.map(|n| n as i64)],
@@ -7050,6 +7053,7 @@ impl Database {
                         SELECT running_turn AS id FROM bots WHERE name=?1
                         UNION ALL SELECT MIN(id) FROM turns WHERE bot=?1 AND status='queued'
                         UNION ALL SELECT MIN(id) FROM turns WHERE bot=?1 AND status='ready'
+                        UNION ALL SELECT MIN(id) FROM turns WHERE bot=?1 AND status='attached'
                     )), 9223372036854775807)
                  ORDER BY id DESC LIMIT 1 OFFSET ?2",
             )?

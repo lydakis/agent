@@ -3593,6 +3593,69 @@ fn a_bot_without_a_default_workspace_needs_one_per_submission() {
 }
 
 #[test]
+fn an_attached_message_needs_no_workspace_and_joins_the_turn_that_names_one() {
+    let mut db = db();
+    db.create("Nomad", None, binding()).unwrap();
+    let attach = TurnOptions {
+        delivery: Delivery::Attach,
+        ..TurnOptions::default()
+    };
+    let note = db
+        .begin("Nomad", "n", "fyi", true, &attach, allow_provider)
+        .unwrap();
+    assert_eq!(note.status, "attached");
+    let options = TurnOptions {
+        workspace: Some("/synthetic/today".into()),
+        ..TurnOptions::default()
+    };
+    let turn = db
+        .begin("Nomad", "r1", "work", true, &options, allow_provider)
+        .unwrap()
+        .turn;
+    let absorbed = db
+        .absorb(
+            turn,
+            None,
+            8 << 20,
+            4096,
+            ContextUsage::default(),
+            false,
+            true,
+        )
+        .unwrap();
+    assert_eq!(absorbed.outcomes[0].0, note.turn);
+    assert_eq!(db.context(turn).unwrap().workspace, "/synthetic/today");
+}
+
+#[test]
+fn retention_keeps_every_attached_message_that_waits() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let done = db
+        .begin(
+            "Bob",
+            "r1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.finish(done, None).unwrap();
+    let attach = TurnOptions {
+        delivery: Delivery::Attach,
+        ..TurnOptions::default()
+    };
+    for key in ["n1", "n2"] {
+        db.begin("Bob", key, "fyi", true, &attach, allow_provider)
+            .unwrap();
+    }
+    // The finished turn is the newest one kept; nothing before it exists.
+    assert_eq!(db.prune("Bob", 1).unwrap()["events"], 0);
+}
+
+#[test]
 fn bot_pages_obey_byte_budget_without_loading_instructions() {
     let mut db = db();
     let workspace = format!("/{}", "x".repeat(4000));
