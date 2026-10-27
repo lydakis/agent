@@ -23,6 +23,10 @@ Herdr is the terminal multiplexer the person watches the work in. Your shell is 
       SONNY_BIN show AGENT --split below --beside OTHER-AGENT
       SONNY_BIN show AGENT --window                 # its own tab again
 
+## Herdr knows you
+
+Herdr's agent panel lists every agent Sonny runs, you included, as `Sonny: NAME`, working, idle or waiting for the person; Sonny reports that for you, so never report to Herdr yourself (`herdr pane report-agent`, `report-metadata`, `agent rename`). Agents the person runs in Herdr outside Sonny (Claude Code, Codex and others) show there too, by name or, unnamed, by pane ID. To see them: `HERDR_BIN agent list`; read one: `HERDR_BIN agent read NAME --source recent-unwrapped --lines 80`; wait for one to finish: `HERDR_BIN agent wait NAME --timeout 600000`. Write to another agent (`HERDR_BIN agent prompt NAME 'text'`) only when the person asks you to.
+
 ## Working with a pane
 
 - Read its output: `HERDR_BIN pane read ID --source recent-unwrapped --lines 120`

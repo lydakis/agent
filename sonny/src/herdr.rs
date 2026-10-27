@@ -3,12 +3,17 @@
 //! labelled with each bot's name. Every call goes through the `herdr` CLI,
 //! which prints the socket API's JSON reply; ids are kept because labels
 //! need not be unique. Written against herdr 0.9.5's CLI and API schema.
-use crate::mux::{Backend, Block, Places};
+use crate::mux::{Backend, Block, Place, Places};
 use serde_json::Value;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    sync::{
+        OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 /// The herdr CLI: `$HERDR`, else `herdr` on the PATH.
@@ -45,6 +50,204 @@ pub fn has_lead(bin: &Path, project: &str) -> bool {
             (reply["result"]["panes"].as_array().into_iter().flatten())
                 .any(|p| p["label"] == lead.as_str())
         })
+}
+
+/// Sonny as an agent that supports Herdr (herdr.dev/docs/add-herdr-support),
+/// when it runs in a Herdr pane: the agent panel lists its bot by name as
+/// working, idle or waiting on the person, the workspace rolls that up and
+/// notifies, `herdr agent wait` and `herdr agent prompt` reach it by name,
+/// and after a Herdr restart the pane runs Sonny on the bot again.
+struct Presence {
+    bin: PathBuf,
+    pane: String,
+    /// The bot's name in its project, as the panel shows it: `Sonny: fix`.
+    shown: String,
+    /// The bot's name as Herdr names agents: `shop-fix`, when it can be one.
+    name: Option<String>,
+    bot: String,
+    /// What reopens this Sonny after a Herdr restart, when Herdr can run it.
+    resume: Option<Vec<String>>,
+    /// The last report's number: Herdr drops one that is not above it,
+    /// so a late report cannot undo a newer one.
+    seq: AtomicU64,
+    named: AtomicBool,
+}
+
+static PRESENCE: OnceLock<Presence> = OnceLock::new();
+
+/// Who reports the bot's state, and who its name in the panel.
+const SOURCE: &str = "sonny";
+const DISPLAY: &str = "sonny-display";
+
+/// Sonny runs on `bot` in this pane, when it is a Herdr pane; `resume` is
+/// what runs it on the bot again, `sonny` first.
+pub fn announce(bot: &str, resume: Vec<String>) {
+    if std::env::var("HERDR_ENV").as_deref() != Ok("1") {
+        return;
+    }
+    let Some(pane) = pane() else {
+        return;
+    };
+    let bin = std::env::var_os("HERDR_BIN_PATH")
+        .filter(|b| !b.is_empty())
+        .map(PathBuf::from)
+        .or_else(find);
+    let Some(bin) = bin else {
+        return;
+    };
+    let short = bot.split_once('.').map_or(bot, |(_, name)| name);
+    let _ = PRESENCE.set(Presence {
+        bin,
+        pane,
+        shown: format!("Sonny: {short}"),
+        name: agent_name(bot),
+        bot: bot.to_owned(),
+        resume: resumable(resume),
+        seq: AtomicU64::new(0),
+        named: AtomicBool::new(false),
+    });
+}
+
+/// Tell Herdr the bot's state, as `status_report` names it: `working`,
+/// `blocked` (on the person), `idle`, `done` or `error` (both ready for
+/// input), or `clear` as Sonny quits. In the background, so Herdr never
+/// slows Sonny down, except for the last, which Sonny waits on briefly.
+pub fn report(state: &str) {
+    if let Some(presence) = PRESENCE.get() {
+        presence.report(state);
+    }
+}
+
+impl Presence {
+    /// The report, in the background but for `clear`: its thread, to wait on.
+    fn report(&'static self, state: &str) -> Option<std::thread::JoinHandle<()>> {
+        let seq = self.next().to_string();
+        let common = ["--source", SOURCE, "--agent", SOURCE, "--seq", &seq];
+        if state == "clear" {
+            let mut args = vec!["pane", "release-agent", &self.pane];
+            args.extend(common);
+            run(&self.bin, &args, Duration::from_secs(1));
+            return None;
+        }
+        let semantic = match state {
+            "working" | "blocked" => state,
+            _ => "idle",
+        };
+        let mut args: Vec<String> = ["pane", "report-agent", &self.pane, "--state", semantic]
+            .into_iter()
+            .chain(common)
+            .map(str::to_owned)
+            .collect();
+        if semantic == "blocked" {
+            args.extend(["--message".into(), "waiting for your approval".into()]);
+        }
+        args.extend(["--agent-session-id".into(), self.bot.clone()]);
+        if let Some(resume) = &self.resume {
+            args.push("--".into());
+            args.extend(resume.iter().cloned());
+        }
+        let display = [
+            "pane",
+            "report-metadata",
+            &self.pane,
+            "--source",
+            DISPLAY,
+            "--agent",
+            SOURCE,
+            "--display-agent",
+            &self.shown,
+            "--seq",
+            &seq,
+        ]
+        .map(str::to_owned);
+        Some(std::thread::spawn(move || {
+            let limit = Duration::from_secs(5);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            if !run(&self.bin, &args, limit) {
+                return;
+            }
+            // Shown by name once Herdr holds the agent; a name another live
+            // agent has is left to it.
+            let display: Vec<&str> = display.iter().map(String::as_str).collect();
+            run(&self.bin, &display, limit);
+            if let Some(name) = &self.name
+                && !self.named.swap(true, Ordering::Relaxed)
+            {
+                run(&self.bin, &["agent", "rename", &self.pane, name], limit);
+            }
+        }))
+    }
+
+    /// A number above every one this pane had from a Sonny before: the
+    /// time in milliseconds, or one more than the last.
+    fn next(&self) -> u64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        let last = self
+            .seq
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+                Some(now.max(last + 1))
+            })
+            .unwrap_or_default();
+        now.max(last + 1)
+    }
+}
+
+/// A Herdr agent name for a bot (`[a-z][a-z0-9_-]{0,31}`): `shop.fix-cart`
+/// is `shop-fix-cart`.
+fn agent_name(bot: &str) -> Option<String> {
+    let name: String = bot
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| match c {
+            'a'..='z' | '0'..='9' | '_' | '-' => c,
+            _ => '-',
+        })
+        .take(32)
+        .collect();
+    name.starts_with(|c: char| c.is_ascii_lowercase())
+        .then_some(name)
+}
+
+/// A resume command Herdr will run: its first word a command on the PATH,
+/// no apostrophe or control character in any word, at most 64 words and
+/// 8 KiB.
+fn resumable(command: Vec<String>) -> Option<Vec<String>> {
+    let first = command.first()?;
+    let path = std::env::var_os("PATH")?;
+    let found = std::env::split_paths(&path).any(|dir| dir.join(first).is_file());
+    let plain = command
+        .iter()
+        .all(|word| !word.contains('\'') && !word.chars().any(char::is_control));
+    let size: usize = command.iter().map(|word| word.len() + 1).sum();
+    (found && plain && !first.contains('/') && command.len() <= 64 && size <= 8192)
+        .then_some(command)
+}
+
+/// Run the herdr CLI for at most `limit`; whether it succeeded.
+fn run(bin: &Path, args: &[&str], limit: Duration) -> bool {
+    let child = Command::new(bin)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    let Ok(mut child) = child else {
+        return false;
+    };
+    let until = Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
 }
 
 pub struct Herdr {
@@ -104,9 +307,15 @@ impl Herdr {
     /// The project's workspace. From the pane Sonny runs in (`terminal`),
     /// the workspace that pane is in now, so the lead stays where the
     /// person opened it and tasks open beside it. Otherwise, as from an
-    /// agent's shell: the workspace the project's lead is in, else the one
-    /// labelled with the project's name, made when there is none.
-    pub fn open(bin: PathBuf, label: &str, terminal: Option<&str>) -> Result<Self, String> {
+    /// agent's shell: the one `kept` names while it is open, else the
+    /// workspace the project's lead is in, else the one labelled with the
+    /// project's name, made when there is none.
+    pub fn open(
+        bin: PathBuf,
+        label: &str,
+        terminal: Option<&str>,
+        kept: Option<&str>,
+    ) -> Result<Self, String> {
         let mut herdr = Self {
             bin,
             workspace: String::new(),
@@ -143,6 +352,7 @@ impl Herdr {
                 .find(|(id, _)| pane["workspace_id"] == id.as_str())
         };
         let found = || workspaces.iter().find(|(_, l)| l == label);
+        let kept = kept.and_then(|kept| workspaces.iter().find(|(id, _)| id == kept));
         (herdr.workspace, herdr.name) = match current {
             Some((id, now)) => {
                 herdr.here = true;
@@ -151,7 +361,7 @@ impl Herdr {
                     .and_then(|me| me["pane"]["pane_id"].as_str().map(str::to_owned));
                 (id.clone(), now.clone())
             }
-            None => match leads().or_else(found) {
+            None => match kept.or_else(leads).or_else(found) {
                 Some((id, now)) => (id.clone(), now.clone()),
                 None => {
                     let made =
@@ -290,6 +500,12 @@ impl Backend for Herdr {
 
     fn own_block(&self) -> Option<String> {
         self.me.clone()
+    }
+
+    fn place(&self) -> Place {
+        Place::Herdr {
+            workspace: self.workspace.clone(),
+        }
     }
 
     /// Where each pane sits, by label: its tab's number, and beside the
@@ -468,7 +684,7 @@ if out is not None:
                 ],
             }),
         );
-        let herdr = Herdr::open(bin, "graft", None).unwrap();
+        let herdr = Herdr::open(bin, "graft", None, None).unwrap();
         assert_eq!(
             (herdr.workspace.as_str(), herdr.home().as_str()),
             ("w1", "Herdr workspace lydakis")
@@ -550,7 +766,7 @@ if out is not None:
                 "aliases": {"w1:p3": "w2:p7"},
             }),
         );
-        let herdr = Herdr::open(bin, "shop", Some("w1:p3")).unwrap();
+        let herdr = Herdr::open(bin, "shop", Some("w1:p3"), None).unwrap();
         assert!(herdr.here());
         assert_eq!(herdr.workspace, "w2");
         let mut layout = Layout::new(Box::new(herdr));
@@ -564,7 +780,7 @@ if out is not None:
     #[test]
     fn a_project_without_a_workspace_gets_one() {
         let (bin, dir) = fake("new", json!({"n": 0, "workspaces": [], "panes": []}));
-        let herdr = Herdr::open(bin, "shop", None).unwrap();
+        let herdr = Herdr::open(bin, "shop", None, None).unwrap();
         assert_eq!(herdr.home(), "Herdr workspace shop");
         assert!(!herdr.here());
         assert!(
@@ -584,7 +800,7 @@ if out is not None:
     #[ignore]
     fn real_herdr() {
         let bin = find().expect("herdr on the PATH");
-        let herdr = Herdr::open(bin, "sonnycheck", None).unwrap();
+        let herdr = Herdr::open(bin, "sonnycheck", None, None).unwrap();
         let workspace = herdr.workspace.clone();
         let lead = herdr.blocks()[0].id.clone();
         herdr.rename_block(&lead, "sonnycheck.lead");
@@ -621,7 +837,7 @@ if out is not None:
         let windows = layout.windows();
         let places = layout.places();
         println!("windows: {windows:?}\nplaces: {places:?}");
-        let check = Herdr::open(find().unwrap(), "sonnycheck", None).unwrap();
+        let check = Herdr::open(find().unwrap(), "sonnycheck", None, None).unwrap();
         // `pane read` prints the pane's text, not JSON.
         let read = Command::new(find().unwrap())
             .args([
@@ -647,6 +863,121 @@ if out is not None:
         println!("after closing the task: {left:?}");
         assert!(!left.iter().any(|l| l.starts_with("sonnycheck.fix")));
         let _ = check.call(&["workspace", "close", &workspace]);
+    }
+
+    #[test]
+    fn sonny_tells_herdr_how_its_bot_is_doing_and_how_to_reopen_it() {
+        let (bin, dir) = fake("presence", json!({"n": 0, "workspaces": [], "panes": []}));
+        let me: &'static Presence = Box::leak(Box::new(Presence {
+            bin,
+            pane: "w1:p2".into(),
+            shown: "Sonny: fix-cart".into(),
+            name: agent_name("shop.fix-cart"),
+            bot: "shop.fix-cart".into(),
+            resume: Some(vec!["sonny".into(), "--bot".into(), "shop.fix-cart".into()]),
+            seq: AtomicU64::new(0),
+            named: AtomicBool::new(false),
+        }));
+        for state in ["working", "blocked", "done"] {
+            me.report(state).unwrap().join().unwrap();
+        }
+        assert!(me.report("clear").is_none());
+        let calls = calls(&dir);
+        let flag = |call: &[String], name: &str| {
+            let at = call.iter().position(|a| a == name)?;
+            call.get(at + 1).cloned()
+        };
+        let what: Vec<String> = calls
+            .iter()
+            .map(|c| match flag(c, "--state") {
+                Some(state) => format!("{} {state}", c[1]),
+                None => c[1].clone(),
+            })
+            .collect();
+        assert_eq!(
+            what,
+            [
+                "report-agent working",
+                "report-metadata",
+                "rename",
+                "report-agent blocked",
+                "report-metadata",
+                "report-agent idle",
+                "report-metadata",
+                "release-agent",
+            ]
+        );
+        let first = &calls[0];
+        assert_eq!(first[2], "w1:p2");
+        assert_eq!(flag(first, "--source").as_deref(), Some("sonny"));
+        assert_eq!(flag(first, "--agent").as_deref(), Some("sonny"));
+        assert_eq!(
+            flag(first, "--agent-session-id").as_deref(),
+            Some("shop.fix-cart")
+        );
+        let resume = first.iter().position(|a| a == "--").unwrap();
+        assert_eq!(first[resume + 1..], ["sonny", "--bot", "shop.fix-cart"]);
+        assert_eq!(
+            flag(&calls[1], "--display-agent").as_deref(),
+            Some("Sonny: fix-cart")
+        );
+        assert_eq!(calls[2], ["agent", "rename", "w1:p2", "shop-fix-cart"]);
+        assert_eq!(
+            flag(&calls[3], "--message").as_deref(),
+            Some("waiting for your approval")
+        );
+        // Every report is numbered above the one before it.
+        let seqs: Vec<u64> = (calls.iter())
+            .filter(|c| c[1] != "report-metadata" && c[1] != "rename")
+            .map(|c| flag(c, "--seq").unwrap().parse().unwrap())
+            .collect();
+        assert!(seqs.windows(2).all(|pair| pair[0] < pair[1]), "{seqs:?}");
+    }
+
+    #[test]
+    fn herdr_names_and_resume_commands_follow_its_rules() {
+        assert_eq!(
+            agent_name("shop.fix-cart").as_deref(),
+            Some("shop-fix-cart")
+        );
+        assert_eq!(
+            agent_name("Shop.Web.lead").as_deref(),
+            Some("shop-web-lead")
+        );
+        assert_eq!(agent_name("2048.lead"), None);
+        assert_eq!(agent_name(&"a".repeat(40)).unwrap().len(), 32);
+        let words = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        assert!(resumable(words("sh --bot shop.lead")).is_some());
+        assert!(resumable(words("no-such-program-sonny --bot x")).is_none());
+        assert!(resumable(words("/bin/sh --bot x")).is_none());
+        assert!(resumable(words("sh --workspace it's")).is_none());
+        assert!(resumable(vec!["sh".into(); 65]).is_none());
+    }
+
+    #[test]
+    fn an_agent_lays_work_out_in_the_workspace_its_lead_was_last_in() {
+        let state = json!({
+            "n": 10,
+            "workspaces": [
+                {"workspace_id": "w1", "label": "shop"},
+                {"workspace_id": "w2", "label": "notes"},
+            ],
+            "panes": [
+                {"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1", "label": "shop.lead"},
+            ],
+        });
+        let (bin, _) = fake("kept", state);
+        let herdr = Herdr::open(bin.clone(), "shop", None, Some("w2")).unwrap();
+        assert_eq!(herdr.workspace, "w2");
+        assert_eq!(
+            herdr.place(),
+            Place::Herdr {
+                workspace: "w2".into()
+            }
+        );
+        // A kept workspace closed since: the lead's, as before.
+        let herdr = Herdr::open(bin, "shop", None, Some("w9")).unwrap();
+        assert_eq!(herdr.workspace, "w1");
     }
 
     #[test]
