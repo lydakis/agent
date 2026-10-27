@@ -1260,8 +1260,8 @@ one's, carries the calls its turn was refused after it and before the
 next steer (`refused`, each `{name, arguments}`, `arguments_truncated`
 when cut), so a reader can tell a go-ahead that followed a refusal from
 one that came before it. `reply` is the bot's last message before the
-turn, its end within 2 KiB (`{turn, text, truncated?}`), absent when the
-bot never answered: the question a bare "yes" answers. Refused calls and
+turn, its end within 2 KiB (`{turn, text, truncated?}`), with secrets
+redacted before the end is kept, absent when the bot never answered: the question a bare "yes" answers. Refused calls and
 `reply` count against the words' `bytes`. The words and the calls each have `bytes` of
 their own, so a long prompt still leaves the calls (and the files they
 wrote) to read. Text that does not fit is cut and marked

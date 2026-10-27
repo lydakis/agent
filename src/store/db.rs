@@ -5495,7 +5495,10 @@ impl Database {
         let item: Vec<u8> =
             self.conn
                 .query_row("SELECT item FROM nodes WHERE id=?", [node], |r| r.get(0))?;
+        // Redacted whole before its end is kept: a private key whose
+        // opening line is cut away would no longer read as one.
         let text = assistant_text(&serde_json::from_slice(&item)?);
+        let text = agent_client::approver::Redactor::default().redact(&text);
         let limit = Self::PROMPTS_REPLY.min(*left);
         let mut start = text.len().saturating_sub(limit);
         while !text.is_char_boundary(start) {

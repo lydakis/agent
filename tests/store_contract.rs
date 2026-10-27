@@ -10861,6 +10861,19 @@ fn a_turn_reads_with_the_message_its_words_answer() {
     // It counts against the words' budget like any text.
     let read = db.prompts("Bob", second, 3 + 12).unwrap();
     assert_eq!(read["reply"]["text"], "the tests?");
+    db.finish(second, None).unwrap();
+    // A secret is redacted before the end is kept, so a key whose opening
+    // line falls outside it is not shown either.
+    let third = begin(&mut db, "r3");
+    let key = format!(
+        "-----BEGIN PRIVATE KEY-----\n{}-----END PRIVATE KEY-----\nShall I use it?",
+        "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo0MjQy\n".repeat(80)
+    );
+    db.append(third, vec![assistant(&key)], &[], None).unwrap();
+    db.finish(third, None).unwrap();
+    let fourth = begin(&mut db, "r4");
+    let reply = &db.prompts("Bob", fourth, 64 * 1024).unwrap()["reply"];
+    assert_eq!(reply["text"], "[secret: private key]\nShall I use it?");
 }
 
 #[test]
