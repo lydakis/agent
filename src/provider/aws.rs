@@ -55,6 +55,13 @@ const ENVIRONMENT: [&str; 3] = [
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SESSION_TOKEN",
 ];
+/// What picks the identity and region the keys are for.
+const SELECTION: [&str; 4] = [
+    "AWS_PROFILE",
+    "AWS_DEFAULT_PROFILE",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+];
 pub const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 /// Where SigV4 calls go when nothing names a region, as Claude Code does:
 /// a source region for the US and global inference profiles in AWS's
@@ -443,6 +450,11 @@ fn withhold(redaction: &Credentials, var: impl Fn(&str) -> Option<String>) {
         if let Some(value) = var(name) {
             redaction.set(name, &value);
         }
+    }
+    // The profile and region the daemon signs with are its own too: a bot's
+    // AWS commands choose theirs.
+    for name in SELECTION {
+        redaction.withhold(name);
     }
 }
 
@@ -1114,7 +1126,17 @@ exit 252
         withhold(&credentials, |name| {
             (name == "AWS_SESSION_TOKEN").then(|| "l3ft0ver".into())
         });
-        assert_eq!(credentials.names(), ["AWS_SESSION_TOKEN"]);
+        // The profile and region it picks are withheld with it.
+        assert_eq!(
+            credentials.names(),
+            [
+                "AWS_SESSION_TOKEN",
+                "AWS_PROFILE",
+                "AWS_DEFAULT_PROFILE",
+                "AWS_REGION",
+                "AWS_DEFAULT_REGION"
+            ]
+        );
         assert!(!credentials.redact("l3ft0ver".into()).contains("l3ft0ver"));
     }
 
