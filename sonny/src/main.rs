@@ -1240,8 +1240,9 @@ enum Kin {
 
 /// What `bot`, made by `by`, is to the lead of `project` whose lineage
 /// made the bots in `lineage`, with `leads` the other projects seen: any
-/// other project's lead, by its name alone; else a task when its name is
-/// the project's or one of the lineage made it, unless it is one of theirs.
+/// other project's lead but one this project is inside, by its name alone;
+/// else a task when its name is the project's or one of the lineage made
+/// it, unless it is one of theirs.
 fn kin(
     bot: &str,
     by: &str,
@@ -1251,7 +1252,10 @@ fn kin(
 ) -> Kin {
     let lead = format!("{project}.lead");
     let theirs = leads.iter().any(|p| bot.starts_with(&format!("{p}.")));
+    // A project this one is inside names all of this one's bots too.
+    let outer = |p: &str| project.starts_with(&format!("{p}."));
     match bot.strip_suffix(".lead").filter(|_| bot != lead) {
+        Some(other) if outer(other) => Kin::None,
         Some(other) => Kin::Lead(other.to_owned()),
         None if !theirs && (lineage.contains(by) || bot.starts_with(&format!("{project}."))) => {
             Kin::Task
@@ -4369,6 +4373,15 @@ mod tests {
             Kin::Lead("shop".into())
         );
         assert_eq!(kin("other.task", "", "ws", &lineage, &leads), Kin::None);
+        // The lead of a project this one is inside leaves its tasks here.
+        let lineage: std::collections::HashSet<String> = ["ws.web.lead".into()].into();
+        let mut leads = std::collections::HashSet::new();
+        assert_eq!(kin("ws.lead", "", "ws.web", &lineage, &leads), Kin::None);
+        leads.insert("ws.api".to_owned());
+        assert_eq!(
+            kin("ws.web.fix", "ws.web.lead", "ws.web", &lineage, &leads),
+            Kin::Task
+        );
     }
 
     #[test]
