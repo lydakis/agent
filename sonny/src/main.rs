@@ -869,12 +869,45 @@ fn context_after(event: &Value) -> Option<u64> {
     })
 }
 
-/// The reply being written: lines are committed as they end, and the line
-/// still open stays in the viewport.
+/// What the bot is saying: its rows stay in the viewport until what comes
+/// next tells whether they were a step on the way, before a call, or its
+/// reply, at the turn's end. Rows past what the viewport holds are written
+/// as they end, as a reply.
 struct Live {
     markdown: Markdown,
     partial: String,
     lines: usize,
+    /// The ended rows still in the viewport.
+    rows: Vec<Line<'static>>,
+    /// A blank row goes above them, apart from the history before.
+    gap: bool,
+    /// Rows were written already, too many to hold.
+    spilled: bool,
+    /// Every row has ended: the words wait only for what follows them.
+    closed: bool,
+}
+
+impl Live {
+    fn new(gap: bool) -> Self {
+        Live {
+            markdown: Markdown::default(),
+            partial: String::new(),
+            lines: 0,
+            rows: Vec::new(),
+            gap,
+            spilled: false,
+            closed: false,
+        }
+    }
+}
+
+/// What the bot's words turned out to be once something followed them.
+#[derive(Clone, Copy, PartialEq)]
+enum Words {
+    /// A step: a call came next.
+    Step,
+    /// The turn's reply, or words nothing told apart.
+    Reply,
 }
 
 struct Running {
@@ -944,6 +977,8 @@ struct App {
     skipped: usize,
     any_history: bool,
     width: usize,
+    /// The terminal's rows, which bound how much of the bot's words is held.
+    height: usize,
     live: Option<Live>,
     /// Whether the reply now ending arrived as deltas.
     streamed: bool,
@@ -1485,6 +1520,7 @@ impl App {
             skipped: 0,
             any_history: false,
             width: 80,
+            height: 24,
             live: None,
             streamed: false,
             running: record["running_turn"].as_i64().map(|turn| Running {
@@ -1874,7 +1910,13 @@ impl App {
     /// behind, or it stopped. Sonny connects again; a reply cut off
     /// mid-stream is drawn whole from the bot's items once back.
     fn dropped(&mut self) {
-        self.live = None;
+        // Words whose message came are past the replay's start: written
+        // now, or lost. Words still streaming come again with their message.
+        if let Some(live) = self.live.take()
+            && live.closed
+        {
+            self.write_words(live, Words::Reply);
+        }
         self.streamed = false;
         self.said.clear();
         self.replay = None;
@@ -2070,8 +2112,17 @@ impl App {
         nodes.reverse();
         self.seen_node = nodes.last().copied().unwrap_or(self.seen_node);
         let mut calls: HashMap<String, (String, Value)> = HashMap::new();
+        // The bot's words, quiet if a call follows them, as they were live.
+        let mut said: Option<Vec<Line<'static>>> = None;
         for chunk in nodes.chunks(100) {
             for item in self.items(chunk).await {
+                let call = item["type"] == "function_call";
+                if let Some(lines) = said.take_if(|_| call || item["role"].is_string()) {
+                    self.commit(match call {
+                        true => transcript::quiet(lines),
+                        false => lines,
+                    });
+                }
                 match (item["type"].as_str(), item["role"].as_str()) {
                     (_, Some("user")) => {
                         let lines = transcript::prompt(&text(&item), None, self.width);
@@ -2080,8 +2131,7 @@ impl App {
                     (_, Some("assistant")) => {
                         let reply = text(&item);
                         if !reply.is_empty() {
-                            let lines = transcript::reply(&reply, self.width);
-                            self.commit(lines);
+                            said = Some(transcript::reply(&reply, self.width));
                             self.last_reply = reply;
                         }
                     }
@@ -2112,12 +2162,15 @@ impl App {
                                 &self.workspace,
                                 self.width,
                             );
-                            self.commit(lines);
+                            self.commit(transcript::quiet(lines));
                         }
                     }
                     _ => {}
                 }
             }
+        }
+        if let Some(lines) = said {
+            self.commit(lines);
         }
         // A call still running finishes live, after the history.
         self.calls.extend(calls);
@@ -2175,33 +2228,84 @@ impl App {
             .collect()
     }
 
-    /// The reply's open line, the part after its last newline, as the rows
-    /// it will take once written.
+    /// The bot's words not yet written: the rows held, then the open line,
+    /// the part after the last newline, as the rows it will take.
     fn open_rows(&self, width: usize) -> Vec<Line<'static>> {
-        let Some(open) = self.live.as_ref().filter(|open| !open.partial.is_empty()) else {
+        let Some(open) = &self.live else {
             return Vec::new();
         };
+        let mut rows = Vec::new();
+        if open.gap && !open.spilled && (!open.rows.is_empty() || !open.partial.is_empty()) {
+            rows.push(Line::default());
+        }
+        // Held rows were wrapped for the width then: a narrower pane cuts
+        // them again, as it does the history waiting to be written.
+        for row in &open.rows {
+            match row.width() <= width {
+                true => rows.push(row.clone()),
+                false => rows.extend(transcript::wrap(
+                    row.clone(),
+                    width,
+                    Span::raw(""),
+                    Span::raw("    "),
+                )),
+            }
+        }
         let mut markdown = open.markdown.clone();
-        let Some(line) = markdown.line(&open.partial) else {
-            return Vec::new();
-        };
-        let lead = if open.lines == 0 { "• " } else { "  " };
-        transcript::wrap(line, width, Span::raw(lead), markdown.rest())
+        if !open.partial.is_empty()
+            && let Some(line) = markdown.line(&open.partial)
+        {
+            let lead = if open.lines == 0 { "• " } else { "  " };
+            rows.extend(transcript::wrap(
+                line,
+                width,
+                Span::raw(lead),
+                markdown.rest(),
+            ));
+        }
+        rows
     }
 
-    /// The reply's last lines, and a table it ended on, drawn.
-    fn end_live(&mut self) {
+    /// The words' last lines, and a table they ended on, drawn and held
+    /// until what follows says what they were.
+    fn close_live(&mut self) {
         if let Some(mut live) = self.live.take() {
-            let rest = std::mem::take(&mut live.partial);
-            let rest = rest.strip_suffix('\n').unwrap_or(&rest);
-            if !rest.is_empty() {
-                for line in rest.split('\n') {
-                    self.live_line(&mut live, line);
+            if !live.closed {
+                let rest = std::mem::take(&mut live.partial);
+                let rest = rest.strip_suffix('\n').unwrap_or(&rest);
+                if !rest.is_empty() {
+                    for line in rest.split('\n') {
+                        self.live_line(&mut live, line);
+                    }
                 }
+                let held = live.markdown.end(self.width, live.lines == 0);
+                self.live_rows(&mut live, held);
+                live.closed = true;
             }
-            let held = live.markdown.end(self.width, live.lines == 0);
-            self.live_rows(&mut live, held);
+            self.live = Some(live);
         }
+    }
+
+    /// The words written into the history as what they turned out to be.
+    fn end_live(&mut self, words: Words) {
+        self.close_live();
+        if let Some(live) = self.live.take() {
+            self.write_words(live, words);
+        }
+    }
+
+    fn write_words(&mut self, live: Live, words: Words) {
+        if live.rows.is_empty() {
+            return;
+        }
+        if live.gap && !live.spilled {
+            self.pending.push(Line::default());
+        }
+        self.pending.extend(match words {
+            Words::Step => transcript::quiet(live.rows),
+            Words::Reply => live.rows,
+        });
+        self.any_history = true;
     }
 
     fn live_line(&mut self, live: &mut Live, line: &str) {
@@ -2210,9 +2314,19 @@ impl App {
     }
 
     fn live_rows(&mut self, live: &mut Live, rows: Vec<Line<'static>>) {
-        if !rows.is_empty() {
-            live.lines += rows.len();
-            self.pending.extend(rows);
+        if rows.is_empty() {
+            return;
+        }
+        live.lines += rows.len();
+        live.rows.extend(rows);
+        // Words longer than half the screen are a reply, written as they
+        // come rather than held out of the scrollback.
+        if live.spilled || live.rows.len() > (self.height / 2).max(4) {
+            if live.gap && !live.spilled {
+                self.pending.push(Line::default());
+            }
+            live.spilled = true;
+            self.pending.append(&mut live.rows);
             self.any_history = true;
         }
     }
@@ -2282,7 +2396,7 @@ impl App {
             }
             "accepted" => {
                 self.staged.retain(|(staged, _)| Some(*staged) != turn);
-                self.end_live();
+                self.end_live(Words::Reply);
                 self.said.clear();
                 self.thought.clear();
                 self.replay = None;
@@ -2315,7 +2429,7 @@ impl App {
                 if let Some(node) = data["node"].as_i64()
                     && let Some(item) = self.items(&[node]).await.first()
                 {
-                    self.end_live();
+                    self.end_live(Words::Reply);
                     let lines = transcript::prompt(&text(item), None, self.width);
                     self.commit(lines);
                 }
@@ -2349,18 +2463,13 @@ impl App {
                     running.phase = "Working".into();
                 }
                 let mut live = match self.live.take() {
-                    Some(live) => live,
-                    None => {
-                        // The gap above the reply goes out with its first
-                        // delta, so the open line sits where it will stay.
-                        if self.any_history {
-                            self.pending.push(Line::default());
+                    Some(live) if !live.closed => live,
+                    closed => {
+                        // Words that ended with nothing after them.
+                        if let Some(closed) = closed {
+                            self.write_words(closed, Words::Reply);
                         }
-                        Live {
-                            markdown: Markdown::default(),
-                            partial: String::new(),
-                            lines: 0,
-                        }
+                        Live::new(self.any_history)
                     }
                 };
                 live.partial.push_str(delta);
@@ -2407,10 +2516,14 @@ impl App {
                             live.partial = rest.to_owned();
                         }
                     }
-                    self.end_live();
+                    self.close_live();
                 } else if let Some(item) = &item {
-                    let lines = transcript::reply(&text(item), self.width);
-                    self.commit(lines);
+                    self.end_live(Words::Reply);
+                    let mut live = Live::new(self.any_history);
+                    let rows = transcript::reply(&text(item), self.width);
+                    self.live_rows(&mut live, rows);
+                    live.closed = true;
+                    self.live = Some(live);
                 }
             }
             "retry" => {
@@ -2424,7 +2537,7 @@ impl App {
             "tool_started" => {
                 self.said.clear();
                 self.thought.clear();
-                self.end_live();
+                self.end_live(Words::Step);
                 let name = data["name"].as_str().unwrap_or("tool").to_owned();
                 let id = data["call_id"].as_str().unwrap_or("");
                 // A long call's event carries a preview; the call is kept whole.
@@ -2455,6 +2568,7 @@ impl App {
                 let Some((name, arguments)) = call else {
                     return;
                 };
+                self.end_live(Words::Step);
                 let mut shown = (String::new(), data["failed"] == true);
                 if let Some(node) = data["node"].as_i64()
                     && let Some(item) = self
@@ -2477,7 +2591,7 @@ impl App {
                     &self.workspace,
                     self.width,
                 );
-                self.commit(lines);
+                self.commit(transcript::quiet(lines));
                 if self.calls.is_empty() && !self.held.is_empty() {
                     let held = std::mem::take(&mut self.held);
                     self.pending.extend(held);
@@ -2516,12 +2630,30 @@ impl App {
                 if self.running.as_ref().is_some_and(|r| Some(r.turn) != turn) {
                     return;
                 }
-                self.end_live();
                 let status = data["status"].as_str().unwrap_or("unknown");
                 let detail = data["error"].as_str().unwrap_or("");
                 let seconds = self.running.take().map(|r| r.started.elapsed().as_secs());
                 let line = transcript::finished(status, detail, seconds, self.width);
-                self.commit(vec![line]);
+                self.close_live();
+                // A turn that ended well puts its reply under the line, apart
+                // from the steps above; one written as it came, or one
+                // that failed, keeps the line under it.
+                match self.live.take() {
+                    Some(live)
+                        if !live.spilled
+                            && !live.rows.is_empty()
+                            && matches!(status, "completed" | "steered") =>
+                    {
+                        self.commit(vec![line]);
+                        self.write_words(Live { gap: true, ..live }, Words::Reply);
+                    }
+                    live => {
+                        if let Some(live) = live {
+                            self.write_words(live, Words::Reply);
+                        }
+                        self.commit(vec![line]);
+                    }
+                }
                 self.approvals.clear();
                 self.notice = None;
                 status_report(
@@ -3454,6 +3586,7 @@ impl App {
         terminal.autoresize()?;
         let width = terminal.size()?.width as usize;
         self.width = width;
+        self.height = terminal.size()?.height as usize;
         let (composer_rows, (cursor_row, cursor_col)) = self.composer(width);
         // A short pane keeps the rows around the cursor, where typing goes on.
         let room = (terminal.size()?.height as usize).saturating_sub(VIEWPORT as usize - 1);
@@ -4193,7 +4326,13 @@ mod tests {
         // The reasoning is kept, and announced, before the words it led to.
         app.daemon(event("message", json!({"node": 1}))).await;
         app.daemon(event("message", json!({"node": 2}))).await;
-        let drawn: Vec<String> = app.pending.iter().map(|line| line.to_string()).collect();
+        // Written, or held until the turn ends.
+        let drawn: Vec<String> = app
+            .pending
+            .iter()
+            .chain(&app.open_rows(80))
+            .map(|line| line.to_string())
+            .collect();
         let said = |text: &str| drawn.iter().filter(|line| line.contains(text)).count();
         assert_eq!(
             (said("First line."), said("Second line.")),
@@ -4213,6 +4352,108 @@ mod tests {
         let two = "**Checking the tests**\n\nThey pass.\n\n**Reading the README";
         assert_eq!(heading(two), Some("Checking the tests"));
         assert_eq!(heading(&format!("{two}**\n")), Some("Reading the README"));
+    }
+
+    #[tokio::test]
+    async fn steps_are_quiet_and_the_reply_comes_under_the_turns_line() {
+        let client = daemon_answering(|asked| {
+            let item = match asked["nodes"][0].as_i64() {
+                Some(2) => json!({"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "I'll look."}]}),
+                Some(3) => json!({"type": "function_call_output", "call_id": "c1", "output": "a"}),
+                Some(4) => json!({"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Done."}]}),
+                _ => return json!({}),
+            };
+            json!({"items": [{"node": asked["nodes"][0], "item": item}]})
+        })
+        .await;
+        let mut app = app(client);
+        let said = |text: &str| json!({"event": "text_delta", "bot": "b", "turn": 1, "text": text});
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        app.daemon(said("I'll look.")).await;
+        app.daemon(turn_event("message", 1, json!({"node": 2})))
+            .await;
+        // Held until what follows says what the words were.
+        assert!(app.pending.is_empty());
+        app.daemon(turn_event(
+            "tool_started",
+            1,
+            json!({"call_id": "c1", "name": "shell", "arguments": "{\"command\":\"ls\"}"}),
+        ))
+        .await;
+        app.daemon(turn_event(
+            "tool_completed",
+            1,
+            json!({"call_id": "c1", "node": 3}),
+        ))
+        .await;
+        app.daemon(said("Done.")).await;
+        app.daemon(turn_event("message", 1, json!({"node": 4})))
+            .await;
+        let shown: Vec<String> = app.open_rows(40).iter().map(|l| l.to_string()).collect();
+        assert_eq!(shown, ["", "• Done."]);
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        let dim = |line: &Line| {
+            line.spans.iter().all(|span| {
+                line.style
+                    .patch(span.style)
+                    .add_modifier
+                    .contains(Modifier::DIM)
+            })
+        };
+        let rows: Vec<(String, bool)> = app
+            .pending
+            .iter()
+            .map(|line| (line.to_string(), !line.spans.is_empty() && dim(line)))
+            .collect();
+        assert_eq!(rows[0], ("• I'll look.".into(), true));
+        assert_eq!(rows[2], ("• Ran ls".into(), true));
+        let line = rows
+            .iter()
+            .position(|(row, _)| row.starts_with("─ Worked"))
+            .unwrap();
+        assert_eq!(
+            rows[line + 1..],
+            [("".into(), false), ("• Done.".into(), false)]
+        );
+    }
+
+    #[tokio::test]
+    async fn held_words_survive_a_dropped_connection_and_a_narrower_pane() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        let said = |text: &str| json!({"event": "text_delta", "bot": "b", "turn": 1, "text": text});
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        app.daemon(said("The pay step is the regression at p95."))
+            .await;
+        app.daemon(turn_event("message", 1, json!({"node": 2})))
+            .await;
+        assert!(app.pending.is_empty(), "held until what follows");
+        // Narrower than when they were wrapped: cut again, nothing lost.
+        let narrow: Vec<String> = app.open_rows(20).iter().map(|l| l.to_string()).collect();
+        assert!(narrow.iter().all(|row| row.width() <= 20), "{narrow:?}");
+        assert_eq!(
+            narrow
+                .concat()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+            "• The pay step is the regression at p95."
+        );
+        // The message is past the replay's start, so a drop writes it.
+        app.dropped();
+        assert!(app.live.is_none());
+        let written: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
+        assert_eq!(
+            written.last().unwrap(),
+            "• The pay step is the regression at p95."
+        );
     }
 
     #[tokio::test]
