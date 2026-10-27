@@ -58,7 +58,9 @@ own) and prints its ID. `sonny show TASK [--split SIDE [--beside BOT] |
 for their tasks: `sonny show PROJECT.lead`, from another project's lead (one
 that leads the projects in its folder), opens that lead's Sonny in its own
 project's session or workspace, made when needed in the same multiplexer,
-and leaves one already open alone; `sonny --bot PROJECT.lead` anywhere is
+and leaves one already open alone; a lead the lead (or one of its tasks)
+makes opens there by itself once it starts work, its tasks with it. `sonny
+--bot PROJECT.lead` anywhere is
 that lead's Sonny too, laying out its tasks where it runs. Opened in a
 session that already holds other work, Sonny takes that session as the
 project's home and leaves the rest alone: tasks get tabs of their own, and a
