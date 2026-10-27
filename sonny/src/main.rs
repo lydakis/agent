@@ -1138,6 +1138,9 @@ struct App {
     /// steer until the running turn takes it in, a prompt until its turn
     /// starts. Drawn above the status row until they land.
     staged: Vec<(i64, String)>,
+    /// Reactions sent to an idle bot, by their turn: drawn under its reply
+    /// at once, and not again when its next call takes them in.
+    reacted: Vec<i64>,
     /// The reasoning streamed since the bot last spoke or called a tool,
     /// whose latest heading the status row shows, as Codex does.
     thought: String,
@@ -1753,6 +1756,7 @@ impl App {
             sounds: sound::Sounds::new(false),
             said: String::new(),
             staged: Vec::new(),
+            reacted: Vec::new(),
             thought: String::new(),
             replay: None,
             options,
@@ -2272,10 +2276,20 @@ impl App {
 
     /// Commit a finished cell, a blank line apart from the one before.
     fn commit(&mut self, lines: Vec<Line<'static>>) {
+        self.commit_after(lines, true);
+    }
+
+    /// A message's rows, held right under the one before when it is a
+    /// reaction to it.
+    fn commit_said(&mut self, said: &str, lines: Vec<Line<'static>>) {
+        self.commit_after(lines, transcript::reaction(said).is_none());
+    }
+
+    fn commit_after(&mut self, lines: Vec<Line<'static>>, gap: bool) {
         if lines.is_empty() {
             return;
         }
-        if self.any_history {
+        if gap && self.any_history {
             self.pending.push(Line::default());
         }
         self.any_history = true;
@@ -2368,7 +2382,9 @@ impl App {
         // The bot's words, quiet if a call follows them, as they were live.
         let mut said: Option<Vec<Line<'static>>> = None;
         for chunk in nodes.chunks(100) {
-            for item in self.items(chunk).await {
+            let mut items = self.items(chunk).await;
+            reactions_first(&mut items);
+            for item in items {
                 let call = item["type"] == "function_call";
                 if let Some(lines) = said.take_if(|_| call || item["role"].is_string()) {
                     self.commit(match call {
@@ -2378,8 +2394,9 @@ impl App {
                 }
                 match (item["type"].as_str(), item["role"].as_str()) {
                     (_, Some("user")) => {
-                        let lines = transcript::prompt(&text(&item), None, self.width);
-                        self.commit(lines);
+                        let prompt = text(&item);
+                        let lines = transcript::prompt(&prompt, None, self.width);
+                        self.commit_said(&prompt, lines);
                     }
                     (_, Some("assistant")) => {
                         let reply = text(&item);
@@ -2468,15 +2485,22 @@ impl App {
         self.staged
             .iter()
             .flat_map(|(_, prompt)| {
-                prompt.split('\n').enumerate().flat_map(move |(at, line)| {
-                    let lead = if at == 0 { "› " } else { "  " };
-                    transcript::wrap(
-                        Line::from(line.to_owned()).dim(),
-                        width,
-                        Span::raw(lead).dim(),
-                        Span::raw("  "),
-                    )
-                })
+                if let Some(emoji) = transcript::reaction(prompt) {
+                    return transcript::quiet(vec![transcript::reacted(emoji)]);
+                }
+                prompt
+                    .split('\n')
+                    .enumerate()
+                    .flat_map(move |(at, line)| {
+                        let lead = if at == 0 { "› " } else { "  " };
+                        transcript::wrap(
+                            Line::from(line.to_owned()).dim(),
+                            width,
+                            Span::raw(lead).dim(),
+                            Span::raw("  "),
+                        )
+                    })
+                    .collect()
             })
             .collect()
     }
@@ -2672,23 +2696,32 @@ impl App {
                     && let Some(node) = data["node"].as_i64()
                     && let Some(item) = self.items(&[node]).await.first()
                 {
-                    let lines = transcript::prompt(&text(item), None, self.width);
-                    self.commit(lines);
+                    let prompt = text(item);
+                    let lines = transcript::prompt(&prompt, None, self.width);
+                    self.commit_said(&prompt, lines);
                 }
             }
             "steered" => {
-                self.staged
-                    .retain(|(staged, _)| Some(*staged) != data["steer"].as_i64());
+                let steer = data["steer"].as_i64();
+                self.staged.retain(|(staged, _)| Some(*staged) != steer);
+                // A reaction drawn when it was sent.
+                if let Some(at) = self.reacted.iter().position(|r| Some(*r) == steer) {
+                    self.reacted.remove(at);
+                    return;
+                }
                 if let Some(node) = data["node"].as_i64()
                     && let Some(item) = self.items(&[node]).await.first()
                 {
                     self.end_live(Words::Reply);
-                    let lines = transcript::prompt(&text(item), None, self.width);
-                    self.commit(lines);
+                    let prompt = text(item);
+                    let lines = transcript::prompt(&prompt, None, self.width);
+                    self.commit_said(&prompt, lines);
                 }
             }
             "queued" => self.notice = Some(format!("queued behind turn {}", data["behind"])),
-            "attached" => self.notice = Some("attached to its next call".into()),
+            "attached" if !self.reacted.contains(&turn.unwrap_or(0)) => {
+                self.notice = Some("attached to its next call".into())
+            }
             "text_delta" => {
                 self.thought.clear();
                 let mut delta = event["text"].as_str().unwrap_or("");
@@ -3677,6 +3710,13 @@ impl App {
             Some(ask) => asks::answer(ask, &prompt),
             None => prompt,
         };
+        if answering.is_none()
+            && let Some(emoji) = transcript::shortcodes(&prompt)
+                .or_else(|| transcript::reaction(&prompt).map(str::to_owned))
+        {
+            self.react(emoji).await;
+            return;
+        }
         // A message to a busy bot joins its running turn, on that turn's model.
         let delivery = self.running.is_some().then_some("steer");
         let model = delivery
@@ -3710,6 +3750,40 @@ impl App {
                 }
             }
             Err(error) => self.notice = Some(error.to_string()),
+        }
+    }
+
+    /// A message of only an emoji reacts to what the bot said last: it is
+    /// attached to the bot's next call, so it starts no turn. To an idle
+    /// bot it is drawn under the reply at once; to a busy one it waits
+    /// staged, and lands after what the bot is saying now.
+    async fn react(&mut self, emoji: String) {
+        let submitted = self
+            .client
+            .request(
+                "submit",
+                json!({"bot": self.bot, "request_id": unique("tui"), "prompt": emoji,
+                    "delivery": "attach"}),
+            )
+            .await;
+        let turn = match submitted {
+            Ok(reply) => reply["turn"].as_i64(),
+            Err(error) => {
+                self.notice = Some(error.to_string());
+                return;
+            }
+        };
+        self.input.clear();
+        self.notice = None;
+        let Some(turn) = turn else {
+            return;
+        };
+        if self.running.is_some() {
+            self.staged.push((turn, emoji));
+        } else {
+            self.end_live(Words::Reply);
+            self.commit_after(vec![transcript::reacted(&emoji)], false);
+            self.reacted.push(turn);
         }
     }
 
@@ -4322,6 +4396,20 @@ fn first_line(text: &str) -> String {
 }
 
 /// A message item's text.
+/// A reaction an idle bot's next turn took in comes after that turn's
+/// prompt; it is drawn before it, under the reply it answers, as it was
+/// when it was sent.
+fn reactions_first(items: &mut [Value]) {
+    let user = |item: &Value| item["role"] == "user";
+    let reaction = |item: &Value| transcript::reaction(&text(item)).is_some();
+    for at in 1..items.len() {
+        let (before, item) = (&items[at - 1], &items[at]);
+        if user(item) && reaction(item) && user(before) && !reaction(before) {
+            items.swap(at - 1, at);
+        }
+    }
+}
+
 fn text(item: &Value) -> String {
     match &item["content"] {
         Value::String(text) => text.clone(),
@@ -4760,6 +4848,75 @@ mod tests {
             rows[line + 1..],
             [("".into(), false), ("• Done.".into(), false)]
         );
+    }
+
+    #[tokio::test]
+    async fn an_emoji_reacts_without_a_turn_and_is_drawn_once() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let next = std::sync::atomic::AtomicI64::new(2);
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("submit") => {
+                seen.lock().unwrap().push(asked.clone());
+                json!({"turn": next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)})
+            }
+            _ => json!({"items": [{"node": 4, "item": {"type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "👍"}]}}]}),
+        })
+        .await;
+        let mut app = app(client);
+        app.turn_model = Some("opus".into());
+        let rows = |app: &App| {
+            app.pending
+                .iter()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+        };
+        // To an idle bot: attached, drawn under the reply at once.
+        app.any_history = true;
+        app.input.set(":+1:");
+        app.submit().await;
+        let first = sent.lock().unwrap()[0].clone();
+        assert_eq!(first["prompt"], "👍");
+        assert_eq!(first["delivery"], "attach");
+        assert!(first["model"].is_null() && first["workspace"].is_null());
+        assert!(app.input.is_empty());
+        assert_eq!(rows(&app), ["   👍 "], "no blank row above it");
+        // The next turn's first call takes it in: not drawn again.
+        app.daemon(turn_event("attached", 2, json!({}))).await;
+        assert_eq!(app.notice, None);
+        app.daemon(turn_event("steered", 3, json!({"steer": 2, "node": 4})))
+            .await;
+        assert_eq!(rows(&app), ["   👍 "]);
+        assert!(app.reacted.is_empty());
+        // To a busy bot: staged, and drawn where its call takes it in.
+        app.pending.clear();
+        app.daemon(turn_event("accepted", 5, json!({}))).await;
+        app.input.set("👍");
+        app.submit().await;
+        assert_eq!(sent.lock().unwrap()[1]["delivery"], "attach");
+        assert_eq!(app.staged, [(3, "👍".to_owned())]);
+        app.daemon(turn_event("steered", 5, json!({"steer": 3, "node": 6})))
+            .await;
+        assert!(app.staged.is_empty());
+        assert_eq!(rows(&app).last().unwrap(), "   👍 ");
+        // Words with an emoji are a message, sent as one.
+        app.input.set("👍 ship it");
+        app.submit().await;
+        assert_eq!(sent.lock().unwrap()[2]["delivery"], "steer");
+    }
+
+    #[test]
+    fn a_reaction_taken_in_after_a_prompt_is_replayed_before_it() {
+        let user = |said: &str| {
+            json!({"type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": said}]})
+        };
+        let reply = json!({"type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": "Done."}]});
+        let mut items = vec![reply.clone(), user("next?"), user("👍"), user("and 🎉")];
+        reactions_first(&mut items);
+        assert_eq!(items, [reply, user("👍"), user("next?"), user("and 🎉")]);
     }
 
     #[tokio::test]
