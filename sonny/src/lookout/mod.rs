@@ -1140,7 +1140,10 @@ async fn check(
         return Err(Failure::Duplicate);
     }
     let brief = brief(client, &seen.task, seen.brief).await;
+    // Only a brief the lead is known to have sent: with none, `brief`
+    // falls back to the task's first message, which may be this one.
     let unattributed = seen.kind == Kind::Said
+        && seen.brief.is_some()
         && seen.from.as_deref() == Some(PERSON)
         && !text.trim().is_empty()
         && text.trim() == brief.trim();
