@@ -28,7 +28,9 @@ pub fn install_own() {
             ("plan", include_str!("../skills/plan/plan"), 0o755),
         ],
     );
-    install("automation", include_str!("../skills/automation/SKILL.md"));
+    // A job reaches the daemon the way every agent Sonny runs does.
+    let automation = include_str!("../skills/automation/SKILL.md");
+    install("automation", &agent_client::policy::with_cli(automation));
     let (Some(home), Some(sonny)) = (std::env::var_os("HOME"), sonny_path()) else {
         return;
     };
