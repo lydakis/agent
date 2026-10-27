@@ -110,12 +110,16 @@ that no source has anything past its bookmark and the newest run record is
 under an hour old. The `!` makes that a skip, and makes anything else a
 fire, so a check that cannot tell, from a missing tool, an expired token or
 a source that errors, wakes the job to fail and say so instead of passing
-for a quiet day. The hour lets a run re-check the ledger's open items. The
-gate gets `HOME`, `SHELL`, the `PATH` it was added with and the daemon's
-socket, so it reads credentials the way the job does.
+for a quiet day. A gate that runs past its minute is a failed fire with no
+turn, which nothing below hears of, so give every request in `quiet` a time
+limit well inside it, such as `curl --max-time 20`: a source that hangs then
+makes `quiet` fail, and the job runs. The hour lets a run re-check the
+ledger's open items. The gate gets `HOME`, `SHELL`, the `PATH` it was added
+with and the daemon's socket, so it reads credentials the way the job does.
 
-The job posts to the lead (step 8) from its shell, with the post's key as
-the request id:
+The job posts to the lead (step 8) from its shell. A request id takes only
+letters, digits, `.`, `_` and `-`, so KEY is the post's key with every other
+character turned into `_`, for example `brief_2026-01-05_07_30_-0500`:
 
 ```
 "$AGENT_BIN" run --bot LEAD --detach --delivery queue --request-id KEY -- TEXT
@@ -126,7 +130,7 @@ sending the same key and text again starts nothing new and answers
 `duplicate: true`. That is step 2's lookup for this destination: a run that
 may have posted sends its planned text again under its key. An urgent item
 also goes to the urgent destination, as a second post keyed with the run's
-key and ` urgent`, recorded and confirmed the same way.
+key and `_urgent`, recorded and confirmed the same way.
 
 What a source said goes into a post quoted and named as the source's, never
 as a request of the job's own. The lead reads the post as the monitor's
