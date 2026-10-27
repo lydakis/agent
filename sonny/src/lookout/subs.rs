@@ -37,12 +37,7 @@ pub struct Sub {
     pub updates: bool,
 }
 
-pub const KINDS: [(&str, Kind); 4] = [
-    ("said", Kind::Said),
-    ("ended", Kind::Ended),
-    ("waiting", Kind::Waiting),
-    ("quiet", Kind::Quiet),
-];
+pub const KINDS: [(&str, Kind); 2] = [("said", Kind::Said), ("ended", Kind::Ended)];
 
 fn kind_name(kind: Kind) -> &'static str {
     KINDS
@@ -326,7 +321,7 @@ fn write(store: &Path, subscriber: &str, subs: &[Sub]) -> Result<(), String> {
 }
 
 const USAGE: &str = "usage: sonny lookout ls [--for BOT] [--store PATH]\n\
-       sonny lookout add NAME [--for BOT] (--tasks-of BOT | --bot GLOB)... [--on said,ended,waiting,quiet]\n\
+       sonny lookout add NAME [--for BOT] (--tasks-of BOT | --bot GLOB)... [--on said,ended]\n\
            [--ask ID]... [--look-for TEXT --then ACTION [--urgent]]... [--context TEXT] [--updates]\n\
        sonny lookout rm NAME [--for BOT]\n\
 Changes reach a running lookout within 15 seconds.";
@@ -379,9 +374,10 @@ fn edit(
             "--on" => {
                 sub.on = Vec::new();
                 for on in value()?.split(',').filter(|on| !on.is_empty()) {
-                    let kind = KINDS.iter().find(|(n, _)| *n == on).ok_or_else(|| {
-                        format!("--on {on}: not one of said, ended, waiting, quiet")
-                    })?;
+                    let kind = KINDS
+                        .iter()
+                        .find(|(n, _)| *n == on)
+                        .ok_or_else(|| format!("--on {on}: not one of said, ended"))?;
                     if !sub.on.contains(&kind.1) {
                         sub.on.push(kind.1);
                     }
@@ -508,11 +504,14 @@ mod tests {
     #[test]
     fn a_subscription_asks_what_it_names() {
         let mut sub = Sub::lead("shop.lead", "shop");
-        assert_eq!(sub.builtins(Kind::Quiet), ["stuck"]);
+        assert_eq!(
+            sub.builtins(Kind::Said),
+            ["redirects", "conflict", "drifts"]
+        );
         sub.ask = Some(vec!["result".into(), "stuck".into()]);
         assert_eq!(sub.builtins(Kind::Ended), ["stuck", "result"]);
         sub.on = vec![Kind::Ended];
-        assert!(sub.builtins(Kind::Quiet).is_empty());
+        assert!(sub.builtins(Kind::Said).is_empty());
         // Looking for something of its own asks only that, unless --ask says more.
         let mut prs = Sub::lead("shop.lead", "shop");
         prs.look_for.push(Look {
