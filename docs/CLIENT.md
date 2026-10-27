@@ -56,7 +56,7 @@ Implemented 2026-09-19.
    sends them recomposed with `configure`.
 6. **Role.** A bot started in a profile (`--profile ROLE`, or the app's
    coordinator) gets that body last, under `# Role: ROLE`. The app ships a
-   `coordinator` profile ([app/agents/coordinator.md](../app/agents/coordinator.md));
+   `coordinator` profile ([sonny/agents/coordinator.md](../sonny/agents/coordinator.md));
    a folder's or the user's `coordinator.md` replaces it.
 
 Everything a client reads lives under `.agents`, the folder Codex, OpenCode

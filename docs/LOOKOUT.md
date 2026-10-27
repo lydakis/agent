@@ -25,8 +25,8 @@ named `PROJECT.*`. Each of these is one check:
 
 | Event | When | Questions |
 | --- | --- | --- |
-| Said | someone other than the lead writes in a task: the person, a program, another task | redirects, sibling_needs, conflict, remember |
-| Ended | a task's turn ends, unless the lead is waiting on it | sibling_needs, conflict, off_brief, stuck, lead_next, result |
+| Said | someone other than the lead writes in a task: the person, a program, another task | redirects, sibling_needs, conflict, drifts (the person's words only), remember |
+| Ended | a task's turn ends, unless the lead is waiting on it | sibling_needs, conflict, drifts, stuck, lead_next, result |
 | Waiting | a task has waited on the person's approval for 2 minutes | stuck |
 | Quiet | a task's running turn has printed nothing for 30 minutes | stuck |
 
@@ -34,8 +34,12 @@ A turn waiting on the person, on other turns or for a slot is not quiet,
 and a silence is checked once; printing again starts a new one. The judge
 reads the event's text, the lead's latest message to that task (its brief),
 the other tasks' briefs and latest lines, and the project's memory indexes.
+For `drifts` it also reads what passed in the task since the lead last
+wrote to it: the person's messages and the first line of each reply, the
+last 6. A yes asks the lead to settle what the person means and steer the
+task with that reading.
 
-A high answer (0.70 or more) wakes the lead: at once with `--delivery
+A high answer (0.70 or more; 0.85 for a result) wakes the lead: at once with `--delivery
 steer` when the question is urgent (redirects, conflict), else queued, at
 most every 2 minutes. A middle one (0.35 or more) waits for the next note,
 or goes alone after 30 minutes. The rest are only counted.
@@ -43,6 +47,46 @@ or goes alone after 30 minutes. The rest are only counted.
 Because the lookout watches the tasks, a lead no longer sets itself
 triggers to check on running work; triggers stay for what the person
 schedules.
+
+## Subscriptions
+
+What a lead's lookout watches is its `tasks` subscription: the lead's tasks,
+every event, every question above. Any bot can subscribe to more, and a bot
+that is no lead gets a lookout of its own while it has a subscription:
+
+```
+sonny lookout add deploys --bot 'ops.*' --on ended \
+  --look-for "a deploy finished or failed" --then "tell the person which" --urgent
+sonny lookout add review --tasks-of review.lead --ask conflict --context "we own the parser"
+sonny lookout ls
+sonny lookout rm deploys
+```
+
+- `--tasks-of BOT` watches every bot BOT or one of its tasks made, and
+  `--bot GLOB` every bot its name matches, `*` matching any run of
+  characters. A subscription needs one of them, and may have several.
+- `--on said,ended,waiting,quiet` picks the events; all four by default.
+- `--ask ID` asks only the built-in questions named; with no `--ask`, a
+  subscription asks every one that fits the event, unless it looks for
+  something of its own, when it asks only that.
+- `--look-for TEXT --then ACTION` adds a question of the subscriber's own;
+  a high answer wakes it, steering with `--urgent`, and a middle one waits
+  for the next note.
+- `--context TEXT` is a line every check of it reads.
+
+A bot's shell sets `AGENT_BOT`, so a bot changes only its own
+subscriptions; the person names one with `--for BOT`. `add` under a name
+already taken does nothing when it says the same and is refused when it
+does not, so `rm` it first. Each subscriber's are one file,
+`STORE.lookout/BOT.json`, which a running lookout reads again every 15
+seconds. A lead's file that holds a `tasks` subscription replaces its own.
+
+The note names a subscription's answer as `deploys look-for 1 0.90` and
+says "do what your deploys look-for 1 says (sonny lookout ls)", where
+`ls` numbers each subscription's look-fors from 1: the
+subscriber's own words stay in its file, since the note reaches the
+approver as the person's. `/lookout` in Sonny lists the window's agent's
+subscriptions, and how many checks each asked for in the last day.
 
 ## Task updates
 
@@ -88,7 +132,8 @@ approver's setting too), else `openai-decisions/gpt-6-luna` when
 lead's provider lists. `typesafe/jev-*` picks Jev, and any other
 `provider/model` runs through the daemon on a fork of an idle, tool-less
 `lookout.HASH` bot, as the approver's judge does, so Bedrock alone is
-enough. `off` judges nothing, and the lead gets its task updates alone. A
+enough. Each fork is deleted once it answers, and one a stopped lookout
+left behind is deleted by the daemon after a minute idle. `off` judges nothing, and the lead gets its task updates alone. A
 judge whose account is out of quota stops judging until the lookout
 restarts.
 

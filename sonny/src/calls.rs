@@ -1,7 +1,7 @@
 //! Shell commands Sonny knows the meaning of, said as what they do: an
 //! `agent` call starts, messages, waits on or removes an agent; a `rex` call
 //! opens, reads or types into a window; an `errand` call runs a command on
-//! another machine or acts on its job; the app's memory and trigger
+//! another machine or acts on its job; Sonny's memory and the trigger
 //! scripts save facts and schedule jobs; the plan skill sets the plan. A
 //! command line is read a command at a time; a pipe is said with its
 //! command and what came out of it.
@@ -90,7 +90,6 @@ pub fn said(command: &str, output: &str, failed: bool) -> Option<Said> {
         "sonny" if args.first().is_some_and(|a| a == "show") => sonny_show(&args[1..], failed),
         "sonny" if args.first().is_some_and(|a| a == "split") => sonny_split(&args[1..], failed),
         "sonny" if args.first().is_some_and(|a| a == "ask") => sonny_ask(&args[1..], failed),
-        "sonny" if args.first().is_some_and(|a| a == "view") => sonny_view(&args[1..], failed),
         "sh" | "bash"
             if args
                 .first()
@@ -823,22 +822,6 @@ fn sonny_ask(words: &[String], failed: bool) -> Option<Said> {
     Some(said)
 }
 
-/// `sonny view`, as the file it shows the person.
-fn sonny_view(words: &[String], failed: bool) -> Option<Said> {
-    let browser = words.iter().any(|word| word == "--browser");
-    let file = words.iter().find(|word| !word.starts_with("--"))?;
-    Some(Said {
-        verb: "Showed you".into(),
-        what: match browser {
-            true => format!("{file} in the browser"),
-            false => file.clone(),
-        },
-        under: Vec::new(),
-        failed,
-        output: None,
-    })
-}
-
 /// The plan skill's call, as the plan it sets.
 fn plan(items: &[String]) -> Option<Said> {
     let mut said = Said {
@@ -1004,16 +987,6 @@ Keep the rest.'"#,
             ("Asked you", "Round each line?")
         );
         assert_eq!(text(&said.under[0]), "1 Yes · 2 No");
-        let said = said_or_none(
-            r#""/opt/homebrew/bin/sonny" view report.md"#,
-            "Shown beside you, and drawn again whenever report.md changes.\n",
-        );
-        assert_eq!(
-            (said.verb.as_str(), said.what.as_str()),
-            ("Showed you", "report.md")
-        );
-        let said = said_or_none(r#"sonny view --browser report.html"#, "Opened\n");
-        assert_eq!(said.what, "report.html in the browser");
     }
 
     #[test]
