@@ -65,9 +65,8 @@ fn compose(dir: &Path) -> Result<(String, Vec<String>), String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     let start = start_rule(&me.to_string_lossy());
     let ask = ask_rule(&me.to_string_lossy());
-    let view = view_rule(&me.to_string_lossy());
     Ok((
-        format!("{composed}\n\n{rule}\n\n{start}\n\n{ask}\n\n{view}"),
+        format!("{composed}\n\n{rule}\n\n{start}\n\n{ask}\n\n{LONG_RULE}"),
         skills,
     ))
 }
@@ -105,18 +104,11 @@ fn ask_rule(sonny: &str) -> String {
     )
 }
 
-/// How the lead shows the person something long, so it is read beside
-/// the conversation rather than pasted into it.
-fn view_rule(sonny: &str) -> String {
-    format!(
-        "When you have something long for the person to read, such as a report, a plan or a comparison, \
-         write it to a file, Markdown unless it needs a page's layout, and show it with\n\
-         \"{sonny}\" view FILE\n\
-         once: it opens beside you and is drawn again each time the file changes, so keep editing the same file. \
-         Add --browser for a page that needs scripts or a browser's width. \
-         In your reply, give the file's path and the few lines that matter, not the whole of it."
-    )
-}
+/// Where the lead puts something long for the person, so a reply stays
+/// readable in the chat.
+const LONG_RULE: &str = "When you have something long for the person to read, such as a report, a plan or a comparison, \
+     write it to a file, Markdown unless it needs a page's layout, and keep editing that file as it changes. \
+     In your reply, give the file's path and the few lines that matter, not the whole of it.";
 
 /// What attaching does with a lead's instructions.
 #[derive(Debug, PartialEq)]
@@ -476,13 +468,6 @@ mod tests {
         ] {
             assert!(text.contains(said), "{said} in {text}");
         }
-    }
-
-    #[test]
-    fn a_lead_shows_long_writing_in_a_file_beside_it() {
-        let text = view_rule("/opt/sonny");
-        assert!(text.contains("\"/opt/sonny\" view FILE\n"), "{text}");
-        assert!(text.contains("--browser"));
     }
 
     #[test]
