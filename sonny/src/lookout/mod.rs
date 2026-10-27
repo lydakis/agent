@@ -6,10 +6,11 @@
 //! ends, is one check: a few yes/no questions to the judge
 //! `agent_client::judge` picks, a small model on the lead's provider by
 //! default. A high answer to an urgent question steers the subscriber now;
-//! any other answer that is not low rides the next note, once the subscriber rests; a low one is
-//! only logged. One lookout watches a daemon, for every subscriber on it,
-//! started by the first Sonny to open; the daemon is unchanged: this follows
-//! every bot and submits to the subscribers like any client.
+//! any other answer that is not low rides the next note, once the
+//! subscriber rests; a low one is only logged. One lookout watches a
+//! daemon, for every subscriber on it, started by the first Sonny to open;
+//! the daemon is unchanged: this follows every bot and submits to the
+//! subscribers like any client.
 //!
 //! A subscriber hears it all in one note, which starts "Task updates: ":
 //! what the judge picked, and, when a subscription asks for them, the task
