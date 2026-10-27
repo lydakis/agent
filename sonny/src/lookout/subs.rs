@@ -1,9 +1,9 @@
 //! Subscriptions: what the lookout watches for each subscriber, and what it
 //! asks about it. Each subscriber's are one file, `STORE.lookout/BOT.json`,
 //! which `sonny lookout add`, `ls` and `rm` edit; the lookout reads them
-//! again every few seconds. A lead has a `tasks` subscription of its own,
-//! over its tasks with every built-in question, unless its file holds one
-//! by that name.
+//! again every few seconds. The lookout watches for whoever has a file and
+//! knows no leads: Sonny writes a lead's `tasks` subscription when it opens
+//! the lead's project (`lead`, `ensure`).
 use super::{Kind, QUESTIONS};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -32,6 +32,9 @@ pub struct Sub {
     pub look_for: Vec<Look>,
     /// A line every check reads, saying what the subscriber cares about.
     pub context: Option<String>,
+    /// The subscriber hears its task updates too: how the turns of bots it
+    /// made ended, unjudged (`updates`).
+    pub updates: bool,
 }
 
 pub const KINDS: [(&str, Kind); 4] = [
@@ -49,16 +52,19 @@ fn kind_name(kind: Kind) -> &'static str {
 }
 
 impl Sub {
-    /// A lead's own: its tasks, every event, every built-in.
-    pub fn tasks(lead: &str) -> Sub {
+    /// What Sonny subscribes a lead to: every bot it or its tasks made and
+    /// every bot named in the project's way, every event, every built-in,
+    /// and its task updates.
+    pub fn lead(lead: &str, project: &str) -> Sub {
         Sub {
             name: "tasks".into(),
             tasks_of: vec![lead.to_owned()],
-            bots: Vec::new(),
+            bots: vec![format!("{project}.*")],
             on: KINDS.iter().map(|(_, k)| *k).collect(),
             ask: None,
             look_for: Vec::new(),
             context: None,
+            updates: true,
         }
     }
 
@@ -96,6 +102,9 @@ impl Sub {
         if let Some(context) = &self.context {
             out["context"] = json!(context);
         }
+        if self.updates {
+            out["updates"] = json!(true);
+        }
         out
     }
 
@@ -129,6 +138,7 @@ impl Sub {
                 })
                 .collect(),
             context: value["context"].as_str().map(str::to_owned),
+            updates: value["updates"] == true,
         })
     }
 
@@ -159,6 +169,9 @@ impl Sub {
         if let Some(context) = &self.context {
             parts.push(format!("context {context:?}"));
         }
+        if self.updates {
+            parts.push("task updates".into());
+        }
         parts.join(" · ")
     }
 
@@ -171,6 +184,7 @@ impl Sub {
             ("ask", self.ask != other.ask),
             ("look_for", self.look_for != other.look_for),
             ("context", self.context != other.context),
+            ("updates", self.updates != other.updates),
         ]
         .into_iter()
         .find_map(|(field, differs)| differs.then_some(field))
@@ -238,13 +252,17 @@ pub fn all(store: &Path) -> Vec<(String, Vec<Sub>)> {
     all
 }
 
-/// What a subscriber's lookout runs: its file's, and a lead's own `tasks`
-/// unless the file replaces it.
-pub fn effective(lead: bool, subscriber: &str, mut subs: Vec<Sub>) -> Vec<Sub> {
-    if lead && !subs.iter().any(|s| s.name == "tasks") {
-        subs.insert(0, Sub::tasks(subscriber));
+/// Add `sub` to the subscriber's file unless one by its name is there,
+/// which is kept as it is: whether it was added.
+pub fn ensure(store: &Path, subscriber: &str, sub: Sub) -> Result<bool, String> {
+    let _held = held(store)?;
+    let mut subs = read(store, subscriber);
+    if subs.iter().any(|s| s.name == sub.name) {
+        return Ok(false);
     }
-    subs
+    subs.insert(0, sub);
+    write(store, subscriber, &subs)?;
+    Ok(true)
 }
 
 /// The longest name a subscription may have.
@@ -309,7 +327,7 @@ fn write(store: &Path, subscriber: &str, subs: &[Sub]) -> Result<(), String> {
 
 const USAGE: &str = "usage: sonny lookout ls [--for BOT] [--store PATH]\n\
        sonny lookout add NAME [--for BOT] (--tasks-of BOT | --bot GLOB)... [--on said,ended,waiting,quiet]\n\
-           [--ask ID]... [--look-for TEXT --then ACTION [--urgent]]... [--context TEXT]\n\
+           [--ask ID]... [--look-for TEXT --then ACTION [--urgent]]... [--context TEXT] [--updates]\n\
        sonny lookout rm NAME [--for BOT]\n\
 Changes reach a running lookout within 15 seconds.";
 
@@ -349,6 +367,7 @@ fn edit(
         ask: None,
         look_for: Vec::new(),
         context: None,
+        updates: false,
     };
     let mut asked = Vec::new();
     while let Some(arg) = args.next() {
@@ -394,6 +413,7 @@ fn edit(
                 look.urgent = true;
             }
             "--context" => sub.context = Some(value()?),
+            "--updates" => sub.updates = true,
             _ if name.is_none() && !arg.starts_with('-') => name = Some(arg.clone()),
             _ => return Err(USAGE.into()),
         }
@@ -412,10 +432,7 @@ fn edit(
     let mut subs = read(store, &subscriber);
     match command {
         "ls" => {
-            let lead = super::lead_project(&subscriber).is_some();
-            let listed: Vec<Value> = (effective(lead, &subscriber, subs).iter())
-                .map(Sub::to_json)
-                .collect();
+            let listed: Vec<Value> = subs.iter().map(Sub::to_json).collect();
             println!("{}", json!({"for": subscriber, "subscriptions": listed}));
             Ok(())
         }
@@ -490,14 +507,14 @@ mod tests {
 
     #[test]
     fn a_subscription_asks_what_it_names() {
-        let mut sub = Sub::tasks("shop.lead");
+        let mut sub = Sub::lead("shop.lead", "shop");
         assert_eq!(sub.builtins(Kind::Quiet), ["stuck"]);
         sub.ask = Some(vec!["result".into(), "stuck".into()]);
         assert_eq!(sub.builtins(Kind::Ended), ["stuck", "result"]);
         sub.on = vec![Kind::Ended];
         assert!(sub.builtins(Kind::Quiet).is_empty());
         // Looking for something of its own asks only that, unless --ask says more.
-        let mut prs = Sub::tasks("shop.lead");
+        let mut prs = Sub::lead("shop.lead", "shop");
         prs.look_for.push(Look {
             text: "a pull request opened".into(),
             then: "tell the person".into(),
@@ -509,7 +526,7 @@ mod tests {
 
     #[test]
     fn subscriptions_are_added_once_and_refused_when_they_differ() {
-        let dir = std::env::temp_dir().join(format!("lookout-subs-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("lookout-subs-edit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let store = dir.join("state.sqlite");
         let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -600,14 +617,22 @@ mod tests {
             &args(&["prs", "--for", "shop.lead"]),
         );
         assert!(theirs.unwrap_err().contains("only its own"));
-        // A lead runs its own tasks subscription beside the file's.
-        let subs = effective(true, "shop.lead", read(&store, "shop.lead"));
+        // Sonny adds a lead's own tasks subscription once, and keeps one
+        // the file already holds by that name.
+        let tasks = Sub::lead("shop.lead", "shop");
+        assert!(ensure(&store, "shop.lead", tasks.clone()).unwrap());
+        let mut edited = tasks.clone();
+        edited.on = vec![Kind::Ended];
+        assert!(!ensure(&store, "shop.lead", edited).unwrap());
+        let subs = read(&store, "shop.lead");
         assert_eq!(
             subs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
             ["tasks", "prs"]
         );
+        assert_eq!(subs[0], tasks);
         assert_eq!(all(&store).len(), 2);
         edit(&store, None, "rm", &args(&["prs", "--for", "shop.lead"])).unwrap();
+        edit(&store, None, "rm", &args(&["tasks", "--for", "shop.lead"])).unwrap();
         assert_eq!(all(&store).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }

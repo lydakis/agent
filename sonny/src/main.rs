@@ -697,6 +697,13 @@ async fn run() -> Result<(), String> {
     {
         app.notice = Some(error);
     }
+    // The lookout knows no leads: it watches a lead's tasks because Sonny
+    // subscribes it to them, before the lookout starts so it reads the file.
+    if let Some(project) = &project
+        && let Err(error) = lookout::subscribe_lead(&app.options.store, &name, project)
+    {
+        app.notice = Some(format!("the lookout: {error}"));
+    }
     if project.is_some()
         && let Err(error) = start_lookout(&app.options)
     {

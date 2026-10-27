@@ -240,6 +240,16 @@ class Play:
         self.last[task] = (turn, replies[-1])
 
 
+def subscribe(store, lead, project):
+    """The subscription Sonny writes for a lead when it opens its project,
+    which is what the lookout replays the lead's checks for."""
+    folder = store.parent / f'{store.name}.lookout'
+    folder.mkdir(exist_ok=True)
+    sub = {'name': 'tasks', 'on': ['said', 'ended', 'waiting', 'quiet'],
+           'tasks_of': [lead], 'bots': [f'{project}.*'], 'updates': True}
+    (folder / f'{lead}.json').write_text(json.dumps({'subscriptions': [sub]}, indent=2) + '\n')
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('out', type=Path)
@@ -276,6 +286,7 @@ def main():
             folder = home / 'projects' / scenario.project
             folder.mkdir(parents=True, exist_ok=True)
             play = Play(daemon, script, scenario.project, folder, args.lead_model)
+            subscribe(store, play.lead, scenario.project)
             scenario.play(play)
             labels.extend(play.labels)
             print(f'{scenario.project}: {len(play.labels)} checks labelled', file=sys.stderr)
