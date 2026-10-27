@@ -1,4 +1,4 @@
-"""Score a `sonny lookout-replay` run against hand labels.
+"""Score a `sonny lookout --replay` run against hand labels.
 
 Usage: python3 lookout_score.py REPLAY.jsonl LABELS.jsonl
 LABELS has one {"n": N, "tell": true|false, "why": "..."} per check: whether

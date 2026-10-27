@@ -6,6 +6,10 @@ app; nothing in the daemon or CLI knows it exists.
 
     brew install lydakis/agent/sonny         # Sonny, with a daemon of its own version
 
+On Linux, each release has `sonny-VERSION-linux-ARCH.tar.gz` (x86_64 and
+aarch64): static builds of Sonny in `bin/` and its daemon in `libexec/`.
+Unpack it anywhere and run `bin/sonny`.
+
     sonny                                    # this folder's coordinator, <project>.lead
     sonny --model PROVIDER/MODEL             # the same, making the project the first time
     sonny --bot NAME                         # any one bot
@@ -47,16 +51,18 @@ for, so its skill has agents end such a command with a line to wait for.
 The skill tells agents to close what they opened once read; whatever a task
 left open closes with its window.
 
-The lead hears what its tasks did as the app tells it: once it rests, and at
-most every ten minutes, one "Task updates" message lists the tasks it started
-that ended a turn or wait for an approval, by the handles its wait tool reads
-them with, with what changed in memory alongside. The app and Sonny send the
-same news as one message, so it does not matter which is open.
-
 Enter sends (and steers a running turn), Esc interrupts, `y`/`n` answer a
 pending approval, Ctrl-C clears the composer or quits. `/` lists the
 commands:
 
+- `/side [QUESTION]` opens a side chat with a copy of the agent in this
+  window, taken where it is now, mid-turn included, on the alternate
+  screen. The copy answers from the agent's history and may call no tool;
+  follow-ups stay with it, and Esc goes back. The agent carries on
+  meanwhile, and what it said is waiting on the main screen. The daemon
+  deletes the copy once it has been idle 15 minutes (`fork --expires`), and
+  no copy shows among the project's agents, in `/status`, or to the
+  lookout.
 - `/model` picks the lead's model, from every model its provider family
   lists, and its effort (←/→), and writes them to the project's
   `.agents/project.toml` when the folder has one. A pick made while a turn
@@ -80,11 +86,24 @@ commands:
   flags] -- BRIEF`, which makes its folder that way, runs `.agents/setup`
   there with `--setup`, starts the task with `agent run`, and leaves no
   folder behind when that fails; `sonny task changes NAME [--apply]` lists,
-  or writes back, what a sandfs copy of a plain folder changed. sandfs is
+  or writes back, what a sandfs copy of a plain folder changed. A plain
+  folder on another disk than sandfs's home (`~/.local/share/sandfs`), such
+  as an external volume, can't be copied, so its task gets a sandfs
+  workspace over the folder itself: the task's changes still stay in the
+  workspace, but it also sees what changes in the folder meanwhile.
+  `sonny task` also works from a plain terminal, with the `agent` installed
+  beside Sonny. sandfs is
   built into Sonny, so it needs no install, only what a mount needs (FUSE 3
   on Linux, nothing on macOS). Its mounts are served by Sonny run again in
   the background, which outlives Sonny; Sonny mounts task copies a restart
   unmounted again when it opens the lead.
+- **Needs you:** when the lead needs the person to decide something, it
+  runs `sonny ask "QUESTION" [--choice OPTION]...` from its shell. Sonny
+  pins the open questions above the composer, oldest first, until each is
+  answered: what you type next answers the first (a choice's number picks
+  it), and goes to the lead as `You asked: QUESTION` and your answer. Esc
+  sets the questions aside for a message of your own, and Esc again goes
+  back to them. They wait in `~/.agent/sonny/asks/`, one file each, kept apart by store and bot id.
 - `/copy` puts the last reply on the clipboard; `/open` opens the last
   HTML page in a browser; `/sound` turns the chime off or on; `/quit`
   leaves the agents working.
@@ -94,27 +113,14 @@ When `errand` is installed, Sonny writes an `errand` skill so any agent can
 run a command on another machine, draws those runs as `Ran COMMAND on
 PEER`, and in Rex opens a window following each detached job.
 
-A lead also has a lookout: a decision model that watches its tasks and
-wakes the lead only when it should step in. It is asked a few yes-or-no
-questions (does the person's message redirect other tasks, does a task
-conflict with another, is one stuck or off its brief, is there a result the
-person should hear, a lasting preference worth saving) about each message in
-a task, each finished turn, and each approval waiting over two minutes, with
-the project's memory indexes in view. A high answer wakes the lead with a
-short note of turn handles and what to do (urgent ones steer it), a middling
-one waits for the next note, and the rest are only logged, to
-`~/.agent/sonny/lookout.jsonl`. The note reaches the approver as the
-person's words, so the lead can act on it (pass a preference on, save it
-to memory) without asking, and it quotes only the person's own words. The
-judge is `--lookout SPEC`, else `AGENT_JUDGE` (the approver's setting, in
-the shell or `~/.agent/env`), else `openai-decisions/gpt-6-luna` when
-`OPENAI_API_KEY` is set (about $0.0002 a check), else the newest Haiku the
-lead's provider lists. `typesafe/jev-*` picks Jev, and any other
-`provider/model` runs through the daemon on a fork of an idle, tool-less
-`lookout.*` bot, as the approver's judge does, so Bedrock alone is enough.
-`--lookout off` turns it off. `sonny lookout-replay --judge SPEC` runs the same checks over
-the store's retained history, and `demo/lookout_score.py` scores that
-against labels.
+Sonny starts its lookout, `sonny lookout`, when it opens a project: one
+for the daemon, watching every lead on it. It tells a lead what its tasks
+did in one "Task updates" note, by the handles its wait tool reads them
+with, and wakes it early only when one needs it: a message that redirects
+other tasks, a conflict, a stuck or silent task, a result the person should
+hear. It judges with `AGENT_JUDGE`, the approver's setting, so Bedrock alone
+is enough, and with no judge sends the task updates alone; see
+[docs/LOOKOUT.md](../docs/LOOKOUT.md).
 
 The look follows Codex's TUI (openai/codex, `codex-rs/tui`): finished history
 goes into the terminal's own scrollback above a small inline viewport,

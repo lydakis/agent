@@ -9,6 +9,7 @@
 //! `• Ran …` line with a short `└` look at the result, and a status row
 //! says how long the turn has run and how to stop it.
 mod approvals;
+mod asks;
 mod cache;
 mod calls;
 mod diff;
@@ -36,7 +37,6 @@ mod table;
 mod task;
 mod term;
 mod transcript;
-mod updates;
 
 use agent_client::{Client, Events};
 use ratatui::{
@@ -77,6 +77,10 @@ const VIEWPORT: u16 = 5;
 const COMPOSER_ROWS: usize = 8;
 /// How much history is shown on attach.
 const HISTORY_ITEMS: u64 = 200;
+/// How long a side chat's copy stays once idle.
+const SIDE_EXPIRE: Duration = Duration::from_secs(15 * 60);
+/// This window is a side chat (`--side`).
+static SIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 type Tui = Terminal<CrosstermBackend<std::io::Stdout>>;
 
@@ -94,26 +98,27 @@ struct Options {
     rex_host: Option<String>,
     /// Ring when work ends or needs the person.
     sound: bool,
-    /// The decision model that wakes the lead when its tasks need it, or
-    /// `off`; `None` picks one (lookout::choose).
-    lookout: Option<String>,
+    /// A side chat, opened by `/side`: the node its copy was taken at,
+    /// after which its history is drawn.
+    side: Option<i64>,
 }
 
 fn usage() -> String {
     "usage: sonny [--store PATH] [--socket PATH] [--model PROVIDER/MODEL] [--no-layout] [--rex-host HOST] [--no-sound]\n\
-     \x20      [--lookout openai-decisions/MODEL|typesafe/jev-*|PROVIDER/MODEL|off]\n\
      \x20      [--copies worktree|sandfs] [--bot NAME [--new [--workspace DIR]]]\n\
      With no --bot, the folder's coordinator, made with --model the first time; its tasks\n\
      open beside it in Rex or Herdr. Type /status for the project's agents.\n\
      --copies (or /copies): how its tasks get their own copy, kept for every folder: git\n\
      worktrees (the default), or sandfs copies (experimental, built in), which take\n\
      uncommitted changes along and work outside git too.\n\
-     sonny task NAME [--setup] [RUN FLAGS] -- BRIEF, from the lead's shell, makes a task's\n\
+     sonny task NAME [--setup] [RUN FLAGS] -- BRIEF, from the lead's shell or a terminal, makes a task's\n\
      folder that way and starts the task there; sonny task changes NAME [--apply] lists\n\
      (or writes here) what a sandfs copy of a plain folder changed.\n\
-     The lookout wakes the lead when its tasks need it, judged by --lookout, else AGENT_JUDGE\n\
-     (as the approver is), else openai-decisions/gpt-6-luna with OPENAI_API_KEY, else the\n\
-     newest Haiku the lead's provider lists."
+     sonny ask QUESTION [--choice OPTION]..., from the lead's shell, pins a question for\n\
+     the person above the composer until they answer it.\n\
+     sonny lookout [--judge PROVIDER/MODEL|off] watches every lead on the daemon and\n\
+     wakes it when its tasks need it; Sonny starts one. sonny lookout --replay --judge\n\
+     SPEC[,SPEC]... [--limit N] runs its checks over what the store kept."
         .into()
 }
 
@@ -325,6 +330,41 @@ async fn serve_auto(client: &Client, options: &Options, model: &str) -> Result<(
     Ok(())
 }
 
+/// The lookout, `sonny lookout`, which wakes leads when their tasks need
+/// them: started detached, logging beside the store. One already watching
+/// this daemon keeps it, and the new one exits.
+fn start_lookout(options: &Options) -> Result<(), String> {
+    let me = std::env::current_exe().map_err(|e| e.to_string())?;
+    let mut log = options.store.clone().into_os_string();
+    log.push(".lookout.log");
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)
+        .map_err(|e| e.to_string())?;
+    // The judge's settings and keys are in Agent's env file, as for the
+    // approver.
+    let mut command = agent_command(&me)?;
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .arg("lookout")
+        .arg("--store")
+        .arg(&options.store)
+        .arg("--socket")
+        .arg(&options.socket)
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone().map_err(|e| e.to_string())?)
+        .stderr(log)
+        .spawn()
+        .map_err(|e| format!("{}: {e}", me.display()))?;
+    // Reaped when it exits, as it does at once when another one watches.
+    std::thread::spawn(move || child.wait());
+    Ok(())
+}
+
 /// The daemon, started the way the CLI starts it when it is not running.
 async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events), String> {
     if let Ok(connected) = Client::connect(&options.socket).await {
@@ -358,12 +398,31 @@ async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events
         .map_err(|e| e.to_string())
 }
 
+/// The store and socket given, else the environment's, else Agent's own.
+fn daemon_paths(
+    store: Option<PathBuf>,
+    socket: Option<PathBuf>,
+) -> Result<(PathBuf, PathBuf), String> {
+    let store = match store.or_else(|| std::env::var_os("AGENT_STORE").map(PathBuf::from)) {
+        Some(store) => store,
+        None => PathBuf::from(std::env::var_os("HOME").ok_or("set --store or HOME")?)
+            .join(".agent/state.sqlite"),
+    };
+    // One store under two names is one lookout's.
+    let store = agent_client::socket::canonical_store(&store).map_err(|e| e.to_string())?;
+    let socket = match socket.or_else(|| std::env::var_os("AGENT_SOCKET").map(PathBuf::from)) {
+        Some(socket) => socket,
+        None => agent_client::socket::default_socket(&store).map_err(|e| e.to_string())?,
+    };
+    Ok((store, socket))
+}
+
 fn parse() -> Result<Options, String> {
     let mut args = std::env::args().skip(1);
     let (mut store, mut socket, mut bot, mut new, mut model, mut workspace) =
         (None, None, None, false, None, None);
     let (mut layout, mut rex_host, mut sound) = (true, None, true);
-    let mut lookout = None;
+    let mut side = None;
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or_else(usage);
         match arg.as_str() {
@@ -376,7 +435,8 @@ fn parse() -> Result<Options, String> {
             "--no-layout" => layout = false,
             "--rex-host" => rex_host = Some(value()?),
             "--no-sound" => sound = false,
-            "--lookout" => lookout = Some(value()?),
+            // Unlisted: how `/side` opens a side chat.
+            "--side" => side = Some(value()?.parse().map_err(|_| usage())?),
             "--copies" => {
                 let copies = value()?;
                 if !agent_client::project::COPIES.contains(&copies.as_str()) {
@@ -389,15 +449,7 @@ fn parse() -> Result<Options, String> {
             _ => return Err(usage()),
         }
     }
-    let store = match store.or_else(|| std::env::var_os("AGENT_STORE").map(PathBuf::from)) {
-        Some(store) => store,
-        None => PathBuf::from(std::env::var_os("HOME").ok_or("set --store or HOME")?)
-            .join(".agent/state.sqlite"),
-    };
-    let socket = match socket.or_else(|| std::env::var_os("AGENT_SOCKET").map(PathBuf::from)) {
-        Some(socket) => socket,
-        None => agent_client::socket::default_socket(&store).map_err(|e| e.to_string())?,
-    };
+    let (store, socket) = daemon_paths(store, socket)?;
     Ok(Options {
         store,
         socket,
@@ -408,7 +460,7 @@ fn parse() -> Result<Options, String> {
         layout,
         rex_host,
         sound,
-        lookout,
+        side,
     })
 }
 
@@ -446,6 +498,8 @@ fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
         Some((task, rest)) if task == "task" => task::run(rest),
+        Some((ask, rest)) if ask == "ask" => asks::run(rest),
+        Some((lookout, rest)) if lookout == "lookout" => lookout::run(rest),
         _ => tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -472,10 +526,8 @@ async fn run() -> Result<(), String> {
         println!("sonny {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    if std::env::args().nth(1).as_deref() == Some("lookout-replay") {
-        return lookout::replay().await;
-    }
     let options = parse()?;
+    SIDE.store(options.side.is_some(), std::sync::atomic::Ordering::Relaxed);
     // Fonts are read before the first picture needs them.
     std::thread::spawn(image::preload);
     let (client, mut events) = connect(&options).await?;
@@ -507,7 +559,10 @@ async fn run() -> Result<(), String> {
             (lead.bot, Some(lead.project))
         }
     };
-    herdr::announce(&name, reopen());
+    // A side chat borrows its agent's pane, and Herdr keeps the agent.
+    if options.side.is_none() {
+        herdr::announce(&name, reopen());
+    }
     // Everything after now arrives live; history is read from the bot's
     // items instead of replayed events, so the replay is skipped. The bot
     // is read after that, so a turn that ended during the replay is seen
@@ -534,6 +589,12 @@ async fn run() -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     let mut app = App::new(client, &name, &bot, options.clone());
     app.context = context;
+    if options.side.is_some() {
+        let source = name.rsplit_once(".side-").map_or(name.as_str(), |(s, _)| s);
+        app.notice = Some(format!(
+            "a copy of {source} that answers without acting; {source} carries on"
+        ));
+    }
     app.sounds = sound::Sounds::new(options.sound);
     app.sounds.chime = settings::Settings::load().chime;
     // A bot keeps the model it was made with; --model runs this window's
@@ -541,14 +602,6 @@ async fn run() -> Result<(), String> {
     if let Some(model) = options.model.as_ref().filter(|m| **m != app.model) {
         app.model = model.clone();
         app.turn_model = Some(model.clone());
-    }
-    // The lead hears what its tasks did, as the app tells it.
-    if let Some(project) = &project {
-        tokio::spawn(updates::run(
-            app.options.socket.clone(),
-            name.clone(),
-            project.clone(),
-        ));
     }
     // Tasks are laid out in Rex when the person is in it (or names the
     // Rex server to use); elsewhere they run out of sight, in /status.
@@ -568,28 +621,10 @@ async fn run() -> Result<(), String> {
     {
         app.notice = Some(error);
     }
-    if let (Some(project), Some(dir), true) = (
-        &project,
-        moving
-            .clone()
-            .or(bot["workspace"].as_str().map(PathBuf::from)),
-        options.lookout.as_deref() != Some("off"),
-    ) {
-        let lead_model = format!(
-            "{}/{}",
-            bot["provider"].as_str().unwrap_or_default(),
-            bot["model"].as_str().unwrap_or_default()
-        );
-        match lookout::choose(&app.client, options.lookout.as_deref(), &lead_model).await {
-            Ok(judge) => lookout::spawn(
-                options.socket.clone(),
-                project.clone(),
-                name.clone(),
-                dir,
-                judge,
-            ),
-            Err(error) => app.notice = Some(error),
-        }
+    if project.is_some()
+        && let Err(error) = start_lookout(&app.options)
+    {
+        app.notice = Some(error);
     }
     // The lead told what its folder tells it today (skills and memory added
     // since it was made), unless its instructions were set some other way.
@@ -725,6 +760,8 @@ fn heading(thought: &str) -> Option<&str> {
 /// A folder as the person reads it: under their home, from `~`.
 /// How often the footer reads the workspace's branch again.
 const PLACE_EVERY: Duration = Duration::from_secs(3);
+/// How often the lead's questions are read again.
+const ASKS_EVERY: Duration = Duration::from_secs(1);
 
 fn tilde(path: &str) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
@@ -745,8 +782,13 @@ fn unique(prefix: &str) -> String {
 /// (Ghostty, Rex) can mark this pane working, blocked or done; and the
 /// same to Herdr, which takes it from its own CLI instead.
 fn status_report(state: &str, bot: &str) {
-    herdr::report(state);
     use base64::Engine;
+    // A side chat borrows its agent's pane, which keeps saying what the
+    // agent itself is doing.
+    if SIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    herdr::report(state);
     let mut body = format!("state={state}");
     if state == "blocked" {
         body.push_str(":kind=permission");
@@ -859,7 +901,11 @@ struct Running {
 
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, unlisted.
-const COMMANDS: [(&str, &str); 9] = [
+const COMMANDS: [(&str, &str); 10] = [
+    (
+        "/side",
+        "a side chat with a copy of this agent, which carries on",
+    ),
     ("/model", "the model and effort"),
     ("/approvals", "whether calls wait for a verdict"),
     ("/instructions", "the lead's, from its folder again"),
@@ -884,6 +930,8 @@ struct Watch {
     jobs: Vec<status::Row>,
     /// When the rows were read: their times count on from here.
     read: Instant,
+    /// The lookout's line for the lead.
+    lookout: String,
 }
 
 struct App {
@@ -920,6 +968,14 @@ struct App {
     calls: HashMap<String, (String, Value)>,
     /// Calls waiting on the person, as `approvals` lists them.
     approvals: Vec<Value>,
+    /// The lead's questions for the person, oldest first, as `sonny ask`
+    /// left them, and when they were last read.
+    asks: Vec<asks::Ask>,
+    /// Where the lead's questions are kept, once its id is known.
+    asks_key: Option<String>,
+    asks_read: Option<Instant>,
+    /// Esc set the questions aside: what is typed is a message of its own.
+    chatting: bool,
     /// The waiting call whose whole command was last written out.
     asked: Option<Value>,
     following: bool,
@@ -980,6 +1036,10 @@ struct App {
     gating: Option<&'static str>,
     /// The newest reply's text, for `/copy`.
     last_reply: String,
+    /// The side chat open on the alternate screen, a Sonny of its own.
+    side: Option<std::process::Child>,
+    /// Keys are left to the side chat while it is open.
+    keys_paused: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The lead's tasks, laid out in the project's Rex session: a window for
@@ -1089,7 +1149,8 @@ impl Fleet {
             return;
         };
         for bot in page["bots"].as_array().into_iter().flatten() {
-            let Some(name) = bot["name"].as_str() else {
+            // Side chats are never tasks, as when they are made.
+            let Some(name) = bot["name"].as_str().filter(|_| bot["expire_ms"].is_null()) else {
                 continue;
             };
             self.lineage.insert(name.to_owned());
@@ -1392,7 +1453,8 @@ impl Fleet {
             }
         }
         match kind {
-            "created" | "forked" => {
+            // A copy that goes once idle is a side chat, not a task.
+            "created" | "forked" if event["data"]["expire_ms"].is_null() => {
                 let by = event["data"]["created_by"].as_str().unwrap_or("");
                 if self.lineage.contains(by) || bot.starts_with(&format!("{}.", self.project)) {
                     self.lineage.insert(bot.to_owned());
@@ -1450,6 +1512,14 @@ impl App {
             }),
             calls: HashMap::new(),
             approvals: Vec::new(),
+            asks: Vec::new(),
+            asks_key: record["bot_id"].as_i64().map(|id| {
+                let store =
+                    std::fs::canonicalize(&options.store).unwrap_or_else(|_| options.store.clone());
+                asks::key(&store, id)
+            }),
+            asks_read: None,
+            chatting: false,
             asked: None,
             following: true,
             notice: None,
@@ -1488,6 +1558,8 @@ impl App {
             choosing: None,
             gating: approvals::refresh(record),
             last_reply: String::new(),
+            side: None,
+            keys_paused: Arc::default(),
         }
     }
 
@@ -1523,11 +1595,16 @@ impl App {
         }
         self.configure().await;
         let (keys_tx, mut keys) = tokio::sync::mpsc::unbounded_channel();
+        let paused = self.keys_paused.clone();
         // Poll, not a bare read: a blocked read holds crossterm's reader
         // lock, and the cursor query the inline viewport makes on a resize
         // then times out (Rex resizes a block as it lays it out).
         std::thread::spawn(move || {
             while !keys_tx.is_closed() {
+                if paused.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
                 match event::poll(Duration::from_millis(50)) {
                     Ok(false) => {}
                     Ok(true) => match event::read() {
@@ -1607,13 +1684,28 @@ impl App {
             if self.retry.is_some_and(|at| at <= Instant::now()) {
                 self.reattach(events).await;
             }
+            self.side_closed();
             self.listed();
             self.follow_place().await;
+            self.follow_asks();
             self.repaint |= term::switched();
-            if self.repaint && self.running.is_none() && self.watch.is_none() {
+            if self.repaint && self.running.is_none() && self.watch.is_none() && self.side.is_none()
+            {
                 self.repaint = false;
                 self.repaint(terminal).await?;
             }
+        }
+    }
+
+    /// Read the lead's open questions again, every second.
+    fn follow_asks(&mut self) {
+        if self.asks_read.is_some_and(|at| at.elapsed() < ASKS_EVERY) {
+            return;
+        }
+        self.asks_read = Some(Instant::now());
+        self.asks = self.asks_key.as_deref().map(asks::open).unwrap_or_default();
+        if self.asks.is_empty() {
+            self.chatting = false;
         }
     }
 
@@ -1838,7 +1930,8 @@ impl App {
             self.down = false;
             self.notice = None;
             self.context = context.or(self.context);
-            self.history_after(self.seen_node).await;
+            self.history_after(self.seen_node.max(self.options.side.unwrap_or(0)))
+                .await;
             self.unstage_landed().await;
             let now = record["running_turn"].as_i64();
             // A turn that ended while away ends here as its event would have.
@@ -1877,7 +1970,13 @@ impl App {
             }
             self.approvals_for(self.running.as_ref().map(|r| r.turn))
                 .await;
-            // A daemon that restarted took the approver Sonny started with it.
+            // A daemon that restarted took the approver and the lookout
+            // Sonny started with it.
+            if self.project.is_some()
+                && let Err(error) = start_lookout(&self.options)
+            {
+                self.notice = Some(error);
+            }
             if self.mode == Some("auto")
                 && let Err(error) = serve_auto(&self.client, &self.options, &self.model).await
             {
@@ -1951,9 +2050,11 @@ impl App {
         ))
     }
 
-    /// The bot's latest items, written as the transcript would have shown them.
+    /// The bot's latest items, written as the transcript would have shown
+    /// them. A side chat shows only itself, not the history it was copied
+    /// with.
     async fn history(&mut self) {
-        self.history_after(0).await;
+        self.history_after(self.options.side.unwrap_or(0)).await;
     }
 
     /// The bot's items after `after`, drawn as they would have been live:
@@ -2570,6 +2671,7 @@ impl App {
                     rows,
                     jobs,
                     read: Instant::now(),
+                    lookout: self.lookout_line(),
                 })
             }
             Err(error) => {
@@ -2581,12 +2683,22 @@ impl App {
 
     async fn reread(&mut self) {
         let jobs = errand::jobs(self.folder_name()).await;
+        let lookout = self.lookout_line();
         if let Ok((_, rows)) = self.status_rows().await
             && let Some(watch) = &mut self.watch
         {
             watch.rows = rows;
             watch.jobs = jobs;
             watch.read = Instant::now();
+            watch.lookout = lookout;
+        }
+    }
+
+    /// What the lookout does for this window's lead.
+    fn lookout_line(&self) -> String {
+        match &self.project {
+            Some(_) => lookout::status(&self.options.store, &self.bot),
+            None => String::new(),
         }
     }
 
@@ -2629,8 +2741,9 @@ impl App {
             .unwrap_or_default()
             .as_millis() as u64;
         let mut rows = Vec::new();
+        // Side chats are not the project's agents.
         for bot in page["bots"].as_array().into_iter().flatten() {
-            let Some(name) = bot["name"].as_str() else {
+            let Some(name) = bot["name"].as_str().filter(|_| bot["expire_ms"].is_null()) else {
                 continue;
             };
             let turn = self
@@ -3036,6 +3149,15 @@ impl App {
                                 .client
                                 .request("interrupt", json!({"bot": self.bot, "turn": turn}))
                                 .await;
+                        } else if self.options.side.is_some() {
+                            // Back to the agent; the copy goes once idle.
+                            if self.input.is_empty() {
+                                self.quit = true;
+                            } else {
+                                self.input.clear();
+                            }
+                        } else if !self.asks.is_empty() {
+                            self.chatting = !self.chatting;
                         }
                     }
                     _ => {}
@@ -3052,7 +3174,12 @@ impl App {
         }
         if matches!(prompt.as_str(), "/status" | "/agents" | "/ps") {
             self.input.clear();
-            self.status().await;
+            // The side chat already holds the screen /status would take.
+            if self.options.side.is_some() {
+                self.notice = Some("/status is for the agent itself, not a side chat".into());
+            } else {
+                self.status().await;
+            }
             return;
         }
         if prompt == "/open" {
@@ -3201,6 +3328,23 @@ impl App {
             self.quit = true;
             return;
         }
+        if let Some(question) = prompt
+            .strip_prefix("/side")
+            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            self.input.clear();
+            self.side(question.trim().to_owned()).await;
+            return;
+        }
+        // What is typed answers the lead's first open question, and goes
+        // with it; the question closes once the daemon has the answer.
+        let answering = (!self.chatting)
+            .then(|| self.asks.first().cloned())
+            .flatten();
+        let prompt = match &answering {
+            Some(ask) => asks::answer(ask, &prompt),
+            None => prompt,
+        };
         // A message to a busy bot joins its running turn, on that turn's model.
         let delivery = self.running.is_some().then_some("steer");
         let model = delivery
@@ -3223,6 +3367,10 @@ impl App {
                 if let Some(turn) = reply["turn"].as_i64() {
                     self.staged.push((turn, prompt));
                 }
+                if let Some(ask) = answering {
+                    asks::done(&ask);
+                    self.asks.retain(|open| open.file != ask.file);
+                }
                 self.input.clear();
                 self.notice = None;
                 if workspace.is_some() {
@@ -3231,6 +3379,108 @@ impl App {
             }
             Err(error) => self.notice = Some(error.to_string()),
         }
+    }
+
+    /// `/side`: a side chat with a copy of this bot, taken where it is now,
+    /// mid-turn included, and opened in a Sonny of its own on the alternate
+    /// screen. The copy may call no tool, so it answers from what the bot
+    /// knows; the daemon deletes it once it has been idle a quarter hour.
+    /// This bot carries on, and its lines wait for the main screen.
+    async fn side(&mut self, question: String) {
+        if self.options.side.is_some() {
+            self.notice = Some("this is a side chat already".into());
+            return;
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let name = format!("{}.side-{:x}", self.bot, stamp % 0x100_0000);
+        let forked = self
+            .client
+            .request(
+                "fork",
+                json!({"source": self.bot, "bot": name, "allow": [],
+                    "expire_ms": SIDE_EXPIRE.as_millis() as u64, "request_id": name}),
+            )
+            .await;
+        let forked = match forked {
+            Ok(forked) => forked,
+            Err(error) => {
+                self.notice = Some(format!("no side chat: {error}"));
+                return;
+            }
+        };
+        // On the model this window's turns run on, whose cache is warm.
+        if !question.is_empty()
+            && let Err(error) = self
+                .client
+                .request(
+                    "submit",
+                    json!({"bot": name, "bot_id": forked["bot_id"], "request_id": format!("{name}.1"),
+                        "prompt": question, "model": self.turn_model}),
+                )
+                .await
+        {
+            self.notice = Some(format!("the side chat did not take the question: {error}"));
+        }
+        let me = match std::env::current_exe() {
+            Ok(me) => me,
+            Err(error) => {
+                self.notice = Some(error.to_string());
+                return;
+            }
+        };
+        let mut command = std::process::Command::new(me);
+        command
+            .arg("--store")
+            .arg(&self.options.store)
+            .arg("--socket")
+            .arg(&self.options.socket)
+            .args(["--no-sound", "--no-layout", "--bot", &name])
+            .args(["--side", &forked["head"].as_i64().unwrap_or(0).to_string()]);
+        if let Some(model) = &self.turn_model {
+            command.args(["--model", model]);
+        }
+        // The key reader lets go before the side chat reads the keyboard.
+        self.keys_paused
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let _ = execute!(
+            std::io::stdout(),
+            DisableBracketedPaste,
+            EnterAlternateScreen
+        );
+        let _ = disable_raw_mode();
+        match command.spawn() {
+            Ok(child) => self.side = Some(child),
+            Err(error) => {
+                self.side_back();
+                self.notice = Some(format!("no side chat: {error}"));
+            }
+        }
+    }
+
+    /// Back from a side chat that has ended.
+    fn side_closed(&mut self) {
+        if let Some(child) = &mut self.side
+            && !matches!(child.try_wait(), Ok(None))
+        {
+            self.side = None;
+            self.side_back();
+        }
+    }
+
+    fn side_back(&mut self) {
+        let _ = enable_raw_mode();
+        let _ = execute!(
+            std::io::stdout(),
+            LeaveAlternateScreen,
+            EnableBracketedPaste
+        );
+        self.keys_paused
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.redraw = true;
     }
 
     /// The call waiting on the person, written out whole above the
@@ -3274,7 +3524,7 @@ impl App {
         // The pane may have changed size since these lines were wrapped:
         // the viewport takes the new size first, and a line still too wide
         // is cut into rows rather than losing its end.
-        if let Some(watch) = &mut self.watch {
+        if self.watch.is_some() || self.side.is_some() {
             // History waits for the main screen, its newest lines kept.
             if let Some(over) = self.pending.len().checked_sub(KEPT_UNDER_STATUS)
                 && over > 0
@@ -3282,11 +3532,14 @@ impl App {
                 self.pending.drain(..over);
                 self.skipped += over;
             }
-            return draw_watch(watch);
+            return match &mut self.watch {
+                Some(watch) => draw_watch(watch),
+                None => Ok(()),
+            };
         }
         if self.skipped > 0 {
             let note = format!(
-                "… {} earlier lines went by while /status was open",
+                "… {} earlier lines went by while another screen was open",
                 std::mem::take(&mut self.skipped)
             );
             self.pending.insert(0, Line::from(note).dim());
@@ -3307,6 +3560,8 @@ impl App {
         let mut open_rows = self.open_rows(width);
         // Then what was sent and has not landed, kept in view below it.
         open_rows.extend(self.staged_rows(width));
+        // The lead's questions stay pinned above the status row.
+        open_rows.extend(asks::rows(&self.asks, width, self.chatting));
         let spare = room.saturating_sub(composer_rows.len()) + 1;
         let hidden = open_rows.len().saturating_sub(spare.max(1));
         open_rows.drain(..hidden);
@@ -3505,6 +3760,7 @@ impl App {
     fn composer(&self, width: usize) -> (Vec<Line<'static>>, (usize, usize)) {
         if self.input.is_empty() {
             let hint = match self.running {
+                _ if !self.asks.is_empty() && !self.chatting => "Answer, or Esc to chat",
                 Some(_) => "Steer the running turn",
                 None => "Ask anything",
             };
@@ -3596,9 +3852,16 @@ impl App {
         }
         // The context, not what the bot ever spent: how full the next
         // round is.
-        let right = match self.context {
-            Some(size) => format!("{} · {} context  ", self.bot, transcript::tokens(size)),
-            None => format!("{}  ", self.bot),
+        let right = match (self.options.side, self.context) {
+            // Said for as long as the side chat is open.
+            (Some(_), _) => format!(
+                "side chat with {} · esc goes back  ",
+                self.bot
+                    .rsplit_once(".side-")
+                    .map_or(self.bot.as_str(), |(s, _)| s)
+            ),
+            (None, Some(size)) => format!("{} · {} context  ", self.bot, transcript::tokens(size)),
+            (None, None) => format!("{}  ", self.bot),
         };
         // The folder, and what it is a copy of; its branch is kept whole.
         let folder = match &self.place.copy_of {
@@ -3648,20 +3911,21 @@ fn draw_watch(watch: &mut Watch) -> std::io::Result<()> {
         })
         .collect();
     let project = watch.project.clone();
+    let lookout = watch.lookout.clone();
     watch.screen.autoresize()?;
     watch.screen.draw(|frame| {
         let area = frame.area();
         let width = area.width.saturating_sub(2) as usize;
         let mut lines = vec![Line::default()];
-        lines.extend(
-            status::card(&project, &rows, &jobs, width)
-                .into_iter()
-                .map(|line| {
-                    let mut spans = vec![Span::raw(" ")];
-                    spans.extend(line.spans);
-                    Line::from(spans).style(line.style)
-                }),
-        );
+        let mut card = status::card(&project, &rows, &jobs, width);
+        if !lookout.is_empty() {
+            card.insert(1, Line::from(lookout.clone()).dim());
+        }
+        lines.extend(card.into_iter().map(|line| {
+            let mut spans = vec![Span::raw(" ")];
+            spans.extend(line.spans);
+            Line::from(spans).style(line.style)
+        }));
         let footer = Line::from("  esc to close").dim();
         let body = ratatui::layout::Rect {
             height: area.height.saturating_sub(1),
@@ -3852,13 +4116,58 @@ mod tests {
             layout: false,
             rex_host: None,
             sound: false,
-            lookout: None,
+            side: None,
         };
         App::new(client, "b", &json!({"name": "b"}), options)
     }
 
     fn turn_event(event: &str, turn: i64, data: Value) -> Value {
         json!({"event": event, "bot": "b", "turn": turn, "data": data})
+    }
+
+    #[tokio::test]
+    async fn what_is_typed_answers_the_leads_first_question_unless_set_aside() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let client = daemon_answering(move |asked| {
+            if asked["op"] == "submit" {
+                seen.lock()
+                    .unwrap()
+                    .push(asked["prompt"].as_str().unwrap().to_owned());
+            }
+            json!({"turn": 2})
+        })
+        .await;
+        let mut app = app(client);
+        let dir = std::env::temp_dir().join(unique("sonny-asks"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ask = |name: &str, question: &str| {
+            let file = dir.join(name);
+            std::fs::write(&file, "{}").unwrap();
+            asks::Ask {
+                file,
+                question: question.into(),
+                choices: vec!["Keep it".into(), "Drop it".into()],
+            }
+        };
+        app.asks = vec![ask("1.json", "Keep the old API?"), ask("2.json", "Tag it?")];
+        app.input.set("2");
+        app.submit().await;
+        // Esc sets the rest aside: the next message is the person's own.
+        app.chatting = true;
+        app.input.set("how is it going?");
+        app.submit().await;
+        assert_eq!(
+            *sent.lock().unwrap(),
+            [
+                "You asked: Keep the old API?\n\nDrop it",
+                "how is it going?"
+            ]
+        );
+        assert_eq!(app.asks.len(), 1);
+        assert!(!dir.join("1.json").exists());
+        assert!(dir.join("2.json").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]

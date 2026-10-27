@@ -20,7 +20,7 @@ const COMMANDS: &[Command] = &[
         name: "run",
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
-        flags: "--bot --new --detach --delivery --turn --model --workspace --effort --turn-budget-tokens --agents --profile --request-id --bot-id --pretty --no-spawn",
+        flags: "--bot --new --fork --allow --expires --detach --delivery --turn --model --workspace --effort --turn-budget-tokens --agents --profile --request-id --bot-id --pretty --no-spawn",
         settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallbacks --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl",
         startup: true,
     },
@@ -35,8 +35,8 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "fork",
         about: "Copy a bot's conversation up to a message into a new bot",
-        usage: "fork --source NAME --bot NAME [--checkpoint NODE] [--allow LIST]",
-        flags: "--source --bot --checkpoint --workspace --budget-tokens --allow --request-id --pretty",
+        usage: "fork --source NAME --bot NAME [--checkpoint NODE] [--allow LIST] [--expires DURATION]",
+        flags: "--source --bot --checkpoint --workspace --budget-tokens --allow --expires --request-id --pretty",
         settings: "",
         startup: false,
     },
@@ -224,6 +224,14 @@ fn print_flags(flags: &str) {
                 "Select a turn; with run --delivery steer, the turn to steer",
             ),
             "--new" => ("", "Create a new bot instead of continuing a named bot"),
+            "--fork" => (
+                "NAME",
+                "Send the prompt to a fork of NAME made as --bot, leaving NAME as it is",
+            ),
+            "--expires" => (
+                "DURATION",
+                "Delete the fork once it has been idle this long, from 1s to 168h",
+            ),
             "--detach" => ("", "Submit and return a JSON turn handle immediately"),
             "--delivery" => (
                 "MODE",
@@ -412,6 +420,7 @@ const DURATIONS: &[(&str, u64, u64, bool, &str)] = &[
         "up to 1h; 0 parks at once",
     ),
     ("--grace", 0, 86_400_000, false, "up to 24h"),
+    ("--expires", 1000, 604_800_000, false, "from 1s to 168h"),
     ("--stall-timeout", 1000, 86_400_000, true, "from 1s to 24h"),
     (
         "--idle-exit",
@@ -597,6 +606,9 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
     let has = |f: &str| flags.iter().any(|seen| seen == f);
     for (a, b) in [
         ("--all", "--bot"),
+        ("--fork", "--new"),
+        ("--fork", "--turn"),
+        ("--fork", "--bot-id"),
         ("--instructions", "--instructions-file"),
         ("--agents", "--instructions"),
         ("--agents", "--instructions-file"),
@@ -618,9 +630,30 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
     } else if !matches!(c.name, "run" | "wait") && positional != 0 {
         return fail_with("usage", format!("{} takes no positional arguments", c.name));
     }
+    if c.name == "run" && has("--fork") {
+        if !has("--bot") {
+            return fail_with("usage", "run --fork needs --bot to name the copy");
+        }
+        // A fork keeps all its source chose but a budget of its own.
+        if let Some(flag) = ["--agents", "--profile"]
+            .into_iter()
+            .chain(c.settings.split_whitespace())
+            .find(|f| *f != "--budget-tokens" && has(f))
+        {
+            return fail_with(
+                "usage",
+                format!("a fork keeps its source's choices; {flag} is for a new bot"),
+            );
+        }
+    } else if c.name == "run"
+        && let Some(flag) = ["--allow", "--expires"].into_iter().find(|f| has(f))
+    {
+        return fail_with("usage", format!("{flag} is for a copy made with --fork"));
+    }
     if c.name == "run"
         && has("--bot")
         && !has("--new")
+        && !has("--fork")
         && [
             "--instructions",
             "--instructions-file",
