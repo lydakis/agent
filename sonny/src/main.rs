@@ -1104,10 +1104,8 @@ struct App {
     keys_paused: Arc<std::sync::atomic::AtomicBool>,
     /// A `!command` of the person's, running.
     shell: Option<user_shell::Running>,
-    /// The person's commands that ran, which go to the bot with the next
-    /// message.
-    shells: Vec<user_shell::Ran>,
-    /// What they printed, to show once the bot's words allow.
+    /// What the person's commands printed, to show once the bot's words
+    /// allow.
     shown: Vec<Line<'static>>,
 }
 
@@ -1631,7 +1629,6 @@ impl App {
             side: None,
             keys_paused: Arc::default(),
             shell: None,
-            shells: Vec::new(),
             shown: Vec::new(),
         }
     }
@@ -1774,14 +1771,31 @@ impl App {
         }
     }
 
-    /// The person's command, once it ran: it waits for the next message
-    /// at once, and what it printed is shown once the bot's words still
-    /// coming are not cut into.
+    /// The person's command, once it ran: the bot is given it at once,
+    /// attached, so it joins the bot's next model call without starting a
+    /// turn; what it printed is shown once the bot's words still coming
+    /// are not cut into.
     async fn shell_ran(&mut self) {
         if self.shell.as_ref().is_some_and(|s| s.is_finished()) {
             let ran = self.shell.take().unwrap().ran().await;
             self.shown.extend(user_shell::lines(&ran, self.width));
-            self.shells.push(ran);
+            let record = user_shell::record(&ran);
+            let attached = self
+                .client
+                .request(
+                    "submit",
+                    json!({"bot": self.bot, "request_id": unique("tui"), "prompt": record,
+                        "delivery": "attach"}),
+                )
+                .await;
+            match attached {
+                Ok(reply) => {
+                    if let Some(turn) = reply["turn"].as_i64() {
+                        self.staged.push((turn, record));
+                    }
+                }
+                Err(error) => self.notice = Some(format!("the agent was not told: {error}")),
+            }
         }
         if self.live.is_none() && !self.shown.is_empty() {
             let shown = std::mem::take(&mut self.shown);
@@ -2327,7 +2341,12 @@ impl App {
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .filter(|row| matches!(row["status"].as_str(), Some("queued" | "ready")))
+                    .filter(|row| {
+                        matches!(
+                            row["status"].as_str(),
+                            Some("queued" | "ready" | "attached")
+                        )
+                    })
                     .filter_map(|row| row["turn"].as_i64()),
             );
             match page["next_after"].as_i64() {
@@ -2348,7 +2367,9 @@ impl App {
                 let ran = ran
                     .into_iter()
                     .flat_map(move |ran| user_shell::header(&ran.command, width, true));
-                let said = prompt.split('\n').enumerate().flat_map(move |(at, line)| {
+                // An attached command alone says nothing more.
+                let said = prompt.split('\n').filter(|_| !prompt.is_empty());
+                let said = said.enumerate().flat_map(move |(at, line)| {
                     let lead = if at == 0 { "› " } else { "  " };
                     transcript::wrap(
                         Line::from(line.to_owned()).dim(),
@@ -2362,18 +2383,9 @@ impl App {
             .collect()
     }
 
-    /// The person's command running, and those that ran, waiting for the
-    /// next message.
+    /// The person's command, while it runs.
     fn shell_rows(&self, width: usize) -> Vec<Line<'static>> {
         let mut rows = Vec::new();
-        for ran in &self.shells {
-            let mut header = user_shell::header(&ran.command, width, true);
-            if let Some(last) = header.last_mut() {
-                last.spans
-                    .push(Span::raw(" · goes with your next message").dim());
-            }
-            rows.extend(header);
-        }
         if let Some(shell) = &self.shell {
             let mut header = user_shell::header(&shell.command, width, true);
             if let Some(last) = header.last_mut() {
@@ -3579,8 +3591,6 @@ impl App {
             Some(ask) => asks::answer(ask, &prompt),
             None => prompt,
         };
-        // What the person ran since the last message goes with this one.
-        let prompt = user_shell::with(&self.shells, &prompt);
         // A message to a busy bot joins its running turn, on that turn's model.
         let delivery = self.running.is_some().then_some("steer");
         let model = delivery
@@ -3608,7 +3618,6 @@ impl App {
                     self.asks.retain(|open| open.file != ask.file);
                 }
                 self.input.clear();
-                self.shells.clear();
                 self.notice = None;
                 if workspace.is_some() {
                     self.move_to = None;
@@ -4073,7 +4082,7 @@ impl App {
             None if self.input.starts_with('!') => Line::from(vec![
                 Span::raw("! ").bold().fg(Color::Magenta),
                 Span::raw(format!(
-                    "runs in {}; the agent sees it with your next message",
+                    "runs in {}; the agent is told what it printed",
                     tilde(&self.workspace)
                 ))
                 .dim(),
@@ -4450,16 +4459,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn what_the_person_ran_goes_with_their_next_message() {
+    async fn what_the_person_ran_is_attached_as_soon_as_it_ends() {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = sent.clone();
         let client = daemon_answering(move |asked| {
             if asked["op"] == "submit" {
-                seen.lock()
-                    .unwrap()
-                    .push(asked["prompt"].as_str().unwrap().to_owned());
+                seen.lock().unwrap().push(asked.clone());
             }
-            json!({"turn": 2})
+            json!({"turn": 2, "status": "attached"})
         })
         .await;
         let mut app = app(client);
@@ -4473,32 +4480,32 @@ mod tests {
         }
         app.shell_ran().await;
         assert!(app.shell.is_none());
-        // Shown at once, and held for the next message.
+        // Shown, and attached at once, no message of the person's needed.
         let shown: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
         assert_eq!(shown, ["! echo hello", "  └ hello"]);
-        assert!(
-            app.shell_rows(80)[0]
-                .to_string()
-                .ends_with("goes with your next message")
-        );
-        assert!(sent.lock().unwrap().is_empty());
-        app.input.set("did it work?");
-        app.submit().await;
-        let prompt = sent.lock().unwrap()[0].clone();
-        let (ran, said) = user_shell::split(&prompt);
-        assert_eq!(said, "did it work?");
+        let asked = sent.lock().unwrap()[0].clone();
+        assert_eq!(asked["delivery"], "attach");
+        let prompt = asked["prompt"].as_str().unwrap();
+        let (ran, said) = user_shell::split(prompt);
+        assert_eq!(said, "");
         assert_eq!((ran[0].command.as_str(), ran[0].exit), ("echo hello", 0));
         assert_eq!(ran[0].output, "hello");
-        assert!(app.shells.is_empty());
-        // Staged and landed, it reads as the command's name and the message.
+        // Staged until the bot's next call takes it, as its name alone.
         let staged: Vec<String> = app.staged_rows(80).iter().map(|l| l.to_string()).collect();
-        assert_eq!(staged, ["! echo hello", "› did it work?"]);
-        let landed: Vec<String> = landed(&prompt, 80).iter().map(|l| l.to_string()).collect();
-        assert_eq!(landed, ["! echo hello", "› did it work?"]);
+        assert_eq!(staged, ["! echo hello"]);
+        app.daemon(turn_event(
+            "turn_finished",
+            2,
+            json!({"status": "steered", "into": 1}),
+        ))
+        .await;
+        assert!(app.staged.is_empty());
+        let landed: Vec<String> = landed(prompt, 80).iter().map(|l| l.to_string()).collect();
+        assert_eq!(landed, ["! echo hello"]);
         // The next message goes alone.
         app.input.set("thanks");
         app.submit().await;
-        assert_eq!(sent.lock().unwrap()[1], "thanks");
+        assert_eq!(sent.lock().unwrap()[1]["prompt"], "thanks");
     }
 
     #[tokio::test]

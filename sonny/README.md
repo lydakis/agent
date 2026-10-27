@@ -63,12 +63,12 @@ pending approval, Ctrl-C clears the composer or quits.
 
 `!COMMAND` runs a command of your own with your shell, in the agent's
 folder, as Codex and Claude Code do, in any agent's window: the lead's or a
-task's. You see what it printed at once, and it goes to the agent with your
-next message, in Codex's `<user_shell_command>` record (the command, its
-exit code and its output, a long output's start and end), so the agent
-knows what you ran without a turn of its own. Esc stops a command still
-running. A command's output waits in this window only: one you never send
-a message after stays yours.
+task's. You see what it printed at once, and as soon as it ends the agent is
+given it too, in Codex's `<user_shell_command>` record (the command, its
+exit code and its output, a long output's start and end), sent with
+`delivery: attach`: it joins the agent's next model call, the running
+turn's or the next turn's, and starts no turn of its own. The daemon keeps
+it until then. Esc stops a command still running.
 
 ![A command run with !, its output, and the agent's answer to the next message](../docs/sonny/shell-passthrough.gif)
 

@@ -1,8 +1,8 @@
 //! `!command`: a command of the person's own, typed in the composer and
 //! run in the bot's folder, as Codex and Claude Code run theirs. The person
-//! sees what it printed at once; the bot is given the command and what it
-//! printed with the person's next message, in Codex's
-//! `<user_shell_command>` record, so it knows what was run.
+//! sees what it printed at once, and the bot is given the command and what
+//! it printed as soon as it ends, in Codex's `<user_shell_command>` record,
+//! so it knows what was run.
 use ratatui::{
     style::{Color, Stylize},
     text::{Line, Span},
@@ -215,13 +215,6 @@ pub fn record(ran: &Ran) -> String {
     )
 }
 
-/// A message with what the person ran before it, in front of it.
-pub fn with(ran: &[Ran], message: &str) -> String {
-    let mut text: Vec<String> = ran.iter().map(record).collect();
-    text.push(message.to_owned());
-    text.join("\n\n")
-}
-
 /// The records a message starts with, and the message after them.
 pub fn split(text: &str) -> (Vec<Ran>, &str) {
     let mut ran = Vec::new();
@@ -324,7 +317,11 @@ mod tests {
     fn a_record_reads_back_as_what_ran_and_the_message_after_it() {
         let first = ran("git status", 0, "On branch main\nnothing to commit\n");
         let second = ran("cargo test\n  --quiet", 101, "");
-        let text = with(&[first.clone(), second.clone()], "why did it fail?");
+        let text = format!(
+            "{}\n\n{}\n\nwhy did it fail?",
+            record(&first),
+            record(&second)
+        );
         assert!(text.starts_with("<user_shell_command>\n<command>\ngit status\n</command>"));
         let (read, rest) = split(&text);
         assert_eq!(rest, "why did it fail?");
