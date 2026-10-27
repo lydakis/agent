@@ -128,7 +128,8 @@ approver's setting too), else `openai-decisions/gpt-6-luna` when
 lead's provider lists. `typesafe/jev-*` picks Jev, and any other
 `provider/model` runs through the daemon on a fork of an idle, tool-less
 `lookout.HASH` bot, as the approver's judge does, so Bedrock alone is
-enough. `off` judges nothing, and the lead gets its task updates alone. A
+enough. Each fork is deleted once it answers, and one a stopped lookout
+left behind is deleted by the daemon after a minute idle. `off` judges nothing, and the lead gets its task updates alone. A
 judge whose account is out of quota stops judging until the lookout
 restarts.
 
