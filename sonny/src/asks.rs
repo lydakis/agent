@@ -8,7 +8,7 @@ use ratatui::{
 };
 use serde_json::{Value, json};
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -23,20 +23,40 @@ pub struct Ask {
     pub choices: Vec<String>,
 }
 
-/// Where `bot`'s open questions are kept.
-fn dir(bot: &str) -> Option<PathBuf> {
+/// Whose questions a folder holds: the bot by its store-wide id, which a
+/// later bot of the same name never takes, in the store by its canonical
+/// path, so two stores' bots never share one.
+pub fn key(store: &Path, bot_id: i64) -> String {
+    // FNV-1a: the same on every run and every machine.
+    let hash = store
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+        });
+    format!("{hash:016x}-{bot_id}")
+}
+
+/// Where the questions under `key` are kept.
+fn dir(key: &str) -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".agent/sonny/asks").join(bot))
+    Some(PathBuf::from(home).join(".agent/sonny/asks").join(key))
 }
 
 /// `sonny ask ...`, from the lead's shell.
 pub fn run(args: &[String]) -> Result<(), String> {
-    let bot = std::env::var("AGENT_BOT")
+    let store = std::env::var_os("AGENT_STORE").filter(|store| !store.is_empty());
+    let bot_id = std::env::var("AGENT_BOT_ID")
         .ok()
-        .filter(|bot| !bot.is_empty() && !bot.contains('/'))
-        .ok_or("run this from an agent's shell (AGENT_BOT is not set)")?;
+        .and_then(|id| id.parse::<i64>().ok());
+    let (Some(store), Some(bot_id)) = (store, bot_id) else {
+        return Err(
+            "run this from an agent's shell (AGENT_STORE and AGENT_BOT_ID are not set)".into(),
+        );
+    };
     let (question, choices) = parse(args)?;
-    let dir = dir(&bot).ok_or("HOME is not set")?;
+    let dir = dir(&key(Path::new(&store), bot_id)).ok_or("HOME is not set")?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -77,9 +97,9 @@ fn parse(args: &[String]) -> Result<(String, Vec<String>), String> {
     Ok((question.ok_or(USAGE)?, choices))
 }
 
-/// `bot`'s open questions, oldest first.
-pub fn open(bot: &str) -> Vec<Ask> {
-    let Some(dir) = dir(bot) else {
+/// The open questions under `key`, oldest first.
+pub fn open(key: &str) -> Vec<Ask> {
+    let Some(dir) = dir(key) else {
         return Vec::new();
     };
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -208,6 +228,21 @@ mod tests {
         ] {
             assert_eq!(parse(&args(wrong)), Err(USAGE.to_owned()), "{wrong:?}");
         }
+    }
+
+    #[test]
+    fn questions_are_kept_by_store_and_bot_id() {
+        let key = key(Path::new("/home/me/.agent/state.sqlite"), 7);
+        assert_eq!(
+            key,
+            super::key(Path::new("/home/me/.agent/state.sqlite"), 7)
+        );
+        assert!(key.ends_with("-7") && key.len() == 18, "{key}");
+        assert_ne!(
+            key,
+            super::key(Path::new("/home/me/.agent/state.sqlite"), 8)
+        );
+        assert_ne!(key, super::key(Path::new("/tmp/other.sqlite"), 7));
     }
 
     #[test]

@@ -923,6 +923,8 @@ struct App {
     /// The lead's questions for the person, oldest first, as `sonny ask`
     /// left them, and when they were last read.
     asks: Vec<asks::Ask>,
+    /// Where the lead's questions are kept, once its id is known.
+    asks_key: Option<String>,
     asks_read: Option<Instant>,
     /// Esc set the questions aside: what is typed is a message of its own.
     chatting: bool,
@@ -1462,6 +1464,11 @@ impl App {
             calls: HashMap::new(),
             approvals: Vec::new(),
             asks: Vec::new(),
+            asks_key: record["bot_id"].as_i64().map(|id| {
+                let store =
+                    std::fs::canonicalize(&options.store).unwrap_or_else(|_| options.store.clone());
+                asks::key(&store, id)
+            }),
             asks_read: None,
             chatting: false,
             asked: None,
@@ -1647,7 +1654,7 @@ impl App {
             return;
         }
         self.asks_read = Some(Instant::now());
-        self.asks = asks::open(&self.bot);
+        self.asks = self.asks_key.as_deref().map(asks::open).unwrap_or_default();
         if self.asks.is_empty() {
             self.chatting = false;
         }
