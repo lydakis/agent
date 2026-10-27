@@ -2074,18 +2074,10 @@ impl Turn {
                 }
             }
             if !resuming && !std::mem::take(&mut steer_first) {
-                // A client's request is taken here, once: a summary that
-                // parks continues as any does.
+                // A client's request stays recorded until its summary ends:
+                // one that parks finds it again as the turn resumes.
                 let requested = std::mem::take(&mut record.compaction_requested)
                     | self.compact.swap(false, Relaxed);
-                if requested {
-                    let bot = self.bot.clone();
-                    self.store
-                        .op("request_compaction", move |db| {
-                            db.request_compaction(&bot, None, false)
-                        })
-                        .await?;
-                }
                 // Only behind a call this task made, whose cache the next
                 // call reads: at a turn's start, or as a turn resumes, the
                 // cache may have lapsed, and a summary first keeps that call
@@ -2106,11 +2098,20 @@ impl Turn {
                     .await?
                 {
                     Compaction::Parked(parked) => return Ok(Round::Paced(parked)),
-                    Compaction::Done => {
-                        made_room = true;
-                        (last, inherited) = (None, false);
+                    compaction => {
+                        if requested {
+                            let bot = self.bot.clone();
+                            self.store
+                                .op("request_compaction", move |db| {
+                                    db.request_compaction(&bot, None, false)
+                                })
+                                .await?;
+                        }
+                        if let Compaction::Done = compaction {
+                            made_room = true;
+                            (last, inherited) = (None, false);
+                        }
                     }
-                    Compaction::Skipped => {}
                 }
             }
             // A steer the turn had no room for is tried again once elision

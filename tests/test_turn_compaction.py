@@ -227,6 +227,27 @@ class TurnCompactionTests(ModelFixture):
         self.assertEqual(len(compacted), 1)
         self.assertFalse(client.request('inspect', bot='Bob')['result']['compaction_requested'])
 
+    def test_a_compaction_a_client_asks_for_survives_its_summary_parking(self):
+        # The summary is turned away until its pool reopens; the turn parks
+        # and, resumed, still summarizes before its call.
+        client = self.client(tools='shell')
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
+                       compaction_instructions='Summarize.')
+        turn = client.request('submit', bot='Bob', request_id='0', prompt='long:2')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        drain(self.model)
+        self.model.compaction_refusals, self.model.compaction_retry_after = 1, '1'
+        client.request('compact', bot='Bob')
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:1')['result']['turn']
+        ended = client.finished(turn, timeout=30)
+        self.assertEqual(ended['data']['status'], 'completed', ended)
+        kinds = [e['event'] for e in all_events(client, 'Bob') if e['turn'] == turn]
+        self.assertIn('turn_paced', kinds)
+        self.assertEqual(kinds.count('compacted'), 1)
+        work = [r for r in drain(self.model) if not is_summary(r)]
+        self.assertTrue(any('summary' in json.dumps(i) for i in work[0]['input'][:2]), work[0]['input'][:2])
+        self.assertFalse(client.request('inspect', bot='Bob')['result']['compaction_requested'])
+
     def test_a_summary_beside_a_call_is_installed_before_the_turn_parks(self):
         # Compaction comes due past round 150 and the summary takes five
         # seconds; at round 160 the turn starts a command and waits on it,
