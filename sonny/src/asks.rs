@@ -116,7 +116,8 @@ pub fn keep(file: Option<&Path>, asks: &[Ask]) -> Result<(), String> {
         .map(|ask| json!({"id": ask.id, "question": ask.question, "choices": ask.choices}))
         .collect();
     let json = serde_json::to_vec(&kept).map_err(|e| e.to_string())?;
-    let next = file.with_extension("json.next");
+    // Its own, so two windows of the bot never write one file together.
+    let next = file.with_extension(format!("json.{}.next", std::process::id()));
     std::fs::write(&next, json).map_err(failed)?;
     std::fs::rename(&next, file).map_err(failed)
 }
@@ -127,13 +128,11 @@ pub fn answered(text: &str) -> Option<&str> {
     Some(question)
 }
 
-/// `asks` without the first one `text` answers.
-pub fn close(asks: &mut Vec<Ask>, text: &str) {
-    if let Some(question) = answered(text)
-        && let Some(at) = asks.iter().position(|ask| ask.question == question)
-    {
-        asks.remove(at);
-    }
+/// `asks` without the first one `text` answers; whether there was one.
+pub fn close(asks: &mut Vec<Ask>, text: &str) -> bool {
+    let at =
+        answered(text).and_then(|question| asks.iter().position(|ask| ask.question == question));
+    at.map(|at| asks.remove(at)).is_some()
 }
 
 /// The person's message answering `ask`: a choice's number stands for

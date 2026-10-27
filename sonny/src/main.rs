@@ -2533,15 +2533,20 @@ impl App {
         // Drawn from the start (attaching, or a repaint), the bot's
         // reactions are read again with the rest; after a gap, those it
         // made before the gap are still held.
+        // The open questions kept, those asked before the history replayed
+        // among them, are joined with the replay's once it is read.
+        let mut kept = None;
         if self.seen_node == 0 || after < self.seen_node {
             self.bot_reactions.clear();
             self.react_calls.clear();
             self.answering = None;
-            // Those asked before the history replayed; the replay closes
-            // the ones it answers and adds the ones it asks.
-            self.asks = asks::load(self.asks_file.as_deref());
+            kept = Some(asks::load(self.asks_file.as_deref()));
+            self.asks.clear();
             self.sent_answers.clear();
         }
+        // The questions the replay asks, and the answers to none of them.
+        let mut asked_here: std::collections::HashSet<String> = Default::default();
+        let mut answered_older: Vec<String> = Vec::new();
         self.seen_node = nodes.last().copied().unwrap_or(self.seen_node);
         if let Some(&first) = nodes.first() {
             self.first_node = Some(self.first_node.map_or(first, |n| n.min(first)));
@@ -2566,7 +2571,11 @@ impl App {
                         // The bot's reactions to the message before, as they
                         // were drawn live.
                         self.draw_bot_reactions();
-                        asks::close(&mut self.asks, &text(&item));
+                        if !asks::close(&mut self.asks, &text(&item))
+                            && let Some(question) = asks::answered(&text(&item))
+                        {
+                            answered_older.push(question.to_owned());
+                        }
                         // What the person ran is shown as it was when it ran.
                         let lines = landed(&text(&item), &mut self.ran_here, self.width);
                         self.commit(lines);
@@ -2600,6 +2609,9 @@ impl App {
                             .and_then(|a| serde_json::from_str(a).ok())
                             .unwrap_or(Value::Null);
                         let name = item["name"].as_str().unwrap_or("tool").to_owned();
+                        if name == asks::TOOL {
+                            asked_here.insert(item["call_id"].as_str().unwrap_or("").to_owned());
+                        }
                         calls.insert(
                             item["call_id"].as_str().unwrap_or("").to_owned(),
                             (name, arguments),
@@ -2627,8 +2639,13 @@ impl App {
                         {
                             let (output, failed) = output(&item);
                             self.commit_call(&name, &arguments, &output, failed);
-                            if name == asks::TOOL && !failed && !reactions::refused(&item) {
-                                self.asked(id, &arguments);
+                            if name == asks::TOOL
+                                && !failed
+                                && !reactions::refused(&item)
+                                && let Some(ask) = asks::call(id, &arguments)
+                                && !self.asks.iter().any(|open| open.id == ask.id)
+                            {
+                                self.asks.push(ask);
                             }
                         }
                     }
@@ -2645,6 +2662,18 @@ impl App {
         }
         // A call still running finishes live, after the history.
         self.calls.extend(calls);
+        // Kept ones the replay asked are as it left them; the rest were
+        // asked before it, and stay open unless it answered them.
+        if let Some(mut older) = kept {
+            older.retain(|ask| !asked_here.contains(&ask.id));
+            for question in &answered_older {
+                if let Some(at) = older.iter().position(|ask| &ask.question == question) {
+                    older.remove(at);
+                }
+            }
+            older.append(&mut self.asks);
+            self.asks = older;
+        }
         self.keep_asks();
     }
 
@@ -4086,16 +4115,17 @@ impl App {
         }
         match self.send(prompt, None, join).await {
             Ok(()) => {
+                self.input.clear();
+                self.notice = None;
                 if let Some(ask) = answering {
                     self.asks.retain(|open| open.id != ask.id);
                     self.sent_answers.push(ask.question);
+                    // After the notice is cleared, so a failure to keep shows.
                     self.keep_asks();
                     if self.asks.is_empty() {
                         self.chatting = false;
                     }
                 }
-                self.input.clear();
-                self.notice = None;
             }
             Err(error) => self.notice = Some(error),
         }
@@ -5219,6 +5249,62 @@ mod tests {
             app.asks,
             [ask("c2", "Tag it?"), ask("c3", "Keep the old API?")]
         );
+    }
+
+    #[tokio::test]
+    async fn kept_questions_join_the_replay_by_the_call_that_asked_them() {
+        let user = |text: &str| {
+            json!({"type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": text}]})
+        };
+        let ask = |id: &str, question: &str| {
+            [
+                json!({"type": "function_call", "name": "ask", "call_id": id,
+                    "arguments": json!({"question": question}).to_string()}),
+                json!({"type": "function_call_output", "call_id": id, "output": "Asked."}),
+            ]
+        };
+        // Asked twice, answered between: the second is the one open. An
+        // older question, answered in the history replayed, is closed; one
+        // never answered stays.
+        let mut items = vec![user("go on")];
+        items.extend(ask("c1", "Proceed?"));
+        items.push(user("You asked: Proceed?\n\nyes"));
+        items.extend(ask("c2", "Proceed?"));
+        items.push(user("You asked: Rename the crate?\n\nno"));
+        let count = items.len() as i64;
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_nodes") => {
+                json!({"nodes": (1..=count).rev().map(|node| json!({"node": node}))
+                .collect::<Vec<_>>(), "next_from": null})
+            }
+            _ => json!({"items": asked["nodes"].as_array().into_iter().flatten()
+                .map(|node| json!({"node": node,
+                    "item": items[node.as_u64().unwrap() as usize - 1]}))
+                .collect::<Vec<_>>()}),
+        })
+        .await;
+        let mut app = app(client);
+        let file =
+            std::env::temp_dir().join(format!("sonny-asks-join-{}.json", std::process::id()));
+        let kept =
+            |id: &str, question: &str| asks::call(id, &json!({"question": question})).unwrap();
+        asks::keep(
+            Some(&file),
+            &[
+                kept("o1", "Rename the crate?"),
+                kept("o2", "Bump the version?"),
+                kept("c2", "Proceed?"),
+            ],
+        )
+        .unwrap();
+        app.asks_file = Some(file.clone());
+        app.history().await;
+        assert_eq!(
+            app.asks,
+            [kept("o2", "Bump the version?"), kept("c2", "Proceed?")]
+        );
+        let _ = std::fs::remove_file(&file);
     }
 
     #[tokio::test]
