@@ -753,7 +753,9 @@ consent is about. If the words do not all fit, the newest are sent and the older
 2026-10-26 it was not, since a word left out may be the one that withdrew
 it; the newest are the ones kept). The daemon's `prompts` read keeps a
 turn's earliest words instead, so when it left steers out or cut one,
-the newest may be missing and consent is not counted. Text the daemon cut at the read's budget ends
+of this turn or of a turn that delegated it, or a delegating turn was not
+read at all, the newest may be missing and consent is not counted; a
+prompt cut at its end loses only its own tail. Text the daemon cut at the read's budget ends
 at its last whole word, so the redactor never sees a secret without what
 marks it (a URL's password cut before its `@host`). `prompts` gives the calls their own budget, so
 words that fill the read still leave the calls that name the files the
