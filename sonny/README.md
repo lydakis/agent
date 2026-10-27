@@ -170,7 +170,11 @@ off again never shows.
   folder on another disk than sandfs's home (`~/.local/share/sandfs`), such
   as an external volume, can't be copied, so its task gets a sandfs
   workspace over the folder itself: the task's changes still stay in the
-  workspace, but it also sees what changes in the folder meanwhile.
+  workspace, but a file it has looked at stays as it first saw it, and
+  `--apply` writes over what changed in the folder meanwhile without
+  asking. Paths in the lead's folder that a brief names (through a link
+  such as `~/workplace` too) are turned into the same paths in the task's
+  copy, so the task never writes the lead's folder by its full path.
   `sonny task` also works from a plain terminal, with the `agent` installed
   beside Sonny. sandfs is
   built into Sonny, so it needs no install, only what a mount needs (FUSE 3
