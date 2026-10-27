@@ -16,11 +16,6 @@ use std::{
 const DEFAULT_TOOLS: &str = "shell,read,write,edit,wait,history";
 use agent_client::approver::{AUTO_EXPIRE_MS, AUTO_UNGATED, UNGATED};
 use agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS;
-/// What a new bot is told when the caller gives no instructions: the
-/// harness preamble every client shares. `--agents` layers AGENTS.md files
-/// and skills on top; a program that wants that asks for it.
-const DEFAULT_INSTRUCTIONS: &str = agent_client::policy::PREAMBLE;
-
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Shutdown drains each client and the event publisher under 5 s bounds,
 /// after any grace period the caller gave running turns.
@@ -792,7 +787,10 @@ fn composed_instructions(
             .map(|composed| composed.text)
             .map_err(failed);
     }
-    Ok(DEFAULT_INSTRUCTIONS.to_owned())
+    // What a new bot is told when the caller gives no instructions: the
+    // harness preamble every client shares. `--agents` layers AGENTS.md
+    // files and skills on top; a program that wants that asks for it.
+    Ok(agent_client::policy::preamble())
 }
 
 /// The role a new bot is started in, which must exist.
