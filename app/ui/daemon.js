@@ -232,7 +232,7 @@ window.Daemon = (() => {
       { name: 'paid-runs', type: 'feedback', description: 'Ask before any run that spends money on a provider', source: 'the person, 2026-09-26', verified: '2026-10-01', modified: Date.now() - 9 * DAY },
     ],
     demo: [
-      { name: 'worktrees', type: 'project', description: 'Tasks that edit work in ~/.agent/worktrees, one per task', source: 'app/agents/coordinator.md', verified: '2026-10-09', modified: Date.now() - DAY },
+      { name: 'worktrees', type: 'project', description: 'Tasks that edit work in ~/.agent/worktrees, one per task', source: 'sonny/agents/coordinator.md', verified: '2026-10-09', modified: Date.now() - DAY },
     ],
     notes: [
       { name: 'theme', type: 'feedback', description: 'Follow the system theme; no toggle', source: 'the person, 2026-10-02', verified: '2026-10-02', modified: Date.now() - 6 * DAY },

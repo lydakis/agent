@@ -24,8 +24,8 @@ itself is `NAME.md` in the same folder.
 
 ## Reading
 
-An agent the app creates starts with both indexes in its instructions,
-each under `# Memory in DIR`, as they were when it was made. When there is
+An agent made with its folder's instructions starts with both indexes in
+them, each under `# Memory in DIR`, as they were when it was made. When there is
 no such section, or yours may be out of date because the agent has been
 running a while, run `"$HOME/.agent/memory" show`. It prints both indexes
 as JSON: `user` and `project`, each with its folder's absolute
@@ -42,7 +42,7 @@ the person's latest word win over memory.
 
 ## Saving
 
-Save with `"$HOME/.agent/memory"`, the script the app writes. Every reply is
+Save with `"$HOME/.agent/memory"`, the script Sonny writes. Every reply is
 one JSON object on stdout; a failure is one `{"error", "detail"}` object on
 stderr with exit 1.
 

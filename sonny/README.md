@@ -21,8 +21,9 @@ Sonny in `bin/` and its daemon in `libexec/`. Unpack it anywhere and run
     sonny --bot NAME                         # any one bot
 
 Opened in a folder, Sonny is that project's lead: the same `<project>.lead`
-the app opens, made through the app's `~/.agent/project add` when the app is
-installed, else in the app's coordinator profile. A lead moved to another
+the app opens, made by Sonny in its coordinator profile (`agents/coordinator.md`,
+unless the folder or `~/.agents/agents` has a `coordinator.md`), with the
+folder's `.agents/project.toml` written when it had none. A lead moved to another
 folder (`--workspace`) comes back with the next message Sonny sends it from
 its own, history and all. When Sonny runs in a Rex block (`rex` found as
 `$REX`, on the PATH, or in the Mac app) or a Herdr pane (`herdr` found as
@@ -128,6 +129,18 @@ commands:
   leaves the agents working.
 
 Settings Sonny keeps for every folder are in `~/.agent/sonny/settings.json`.
+At each start Sonny writes what every agent leans on, the app or not: the
+`memory`, `memory-cleanup`, `plan` and `automation` skills, as normal skills
+in `~/.agents/skills` (replacing links the app left there), and
+`~/.agent/memory`, `~/.agent/project` and `~/.agent/trigger`, scripts that
+run this Sonny as `sonny memory ...` (facts saved for later agents, in
+`~/.agents/memory`), `sonny project add DIR ...` (a project and its lead, as
+a lead makes one when the person asks) and `sonny trigger ...` (launchd jobs
+that wake an agent, on a Mac). A skill Sonny wrote is rewritten when Sonny's
+text changes, until you edit it: from then on it is yours, and Sonny leaves
+it alone. Sonny notes what it last wrote of each in `~/.agent/sonny/skills`;
+a skill of the same name it has no note of writing (yours, or one an
+earlier Sonny wrote) is left alone too. Remove its folder to get Sonny's.
 When `errand` is installed, Sonny writes an `errand` skill so any agent can
 run a command on another machine, draws those runs as `Ran COMMAND on
 PEER`, and in Rex opens a window following each detached job.
@@ -138,7 +151,9 @@ did in one "Task updates" note, by the handles its wait tool reads them
 with, and wakes it early only when one needs it: a message that redirects
 other tasks, a conflict, a stuck or silent task, a result the person should
 hear. It judges with `AGENT_JUDGE`, the approver's setting, so Bedrock alone
-is enough, and with no judge sends the task updates alone; see
+is enough, and with no judge sends the task updates alone. Any agent can
+subscribe to more with `sonny lookout add` (other agents' tasks, bots by
+name, questions of its own), and `/lookout` lists what it watches; see
 [docs/LOOKOUT.md](../docs/LOOKOUT.md).
 
 The look follows Codex's TUI (openai/codex, `codex-rs/tui`): finished history

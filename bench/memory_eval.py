@@ -56,7 +56,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bench.targets import clean_env, file_hash  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
-BUILD = 'cargo build --release --locked -p agent-runtime -p agent-app'
+BUILD = 'cargo build --release --locked -p agent-runtime -p sonny'
 PROJECT = 'shop'
 CONDITIONS = ('none', 'memory')
 # The key variable each built-in provider reads.
@@ -299,10 +299,10 @@ def home(root, condition, app):
     (home / '.agent').mkdir(parents=True)
     script = home / '.agent/memory'
     quoted = "'" + str(app).replace("'", "'\\''") + "'"
-    script.write_text(f'#!/bin/sh\nexec {quoted} --memory "$@"\n')
+    script.write_text(f'#!/bin/sh\nexec {quoted} memory "$@"\n')
     script.chmod(0o755)
     if condition == 'memory':
-        shutil.copytree(ROOT / 'app/skills/memory', home / '.agents/skills/memory')
+        shutil.copytree(ROOT / 'sonny/skills/memory', home / '.agents/skills/memory')
         for name, (scope, kind, description, source, text) in FACTS.items():
             where = ['--user'] if scope == 'user' else ['--project', PROJECT]
             subprocess.run([str(script), 'save', name, '--type', kind, '--description', description,
@@ -450,8 +450,8 @@ def main():
     parser.add_argument('--conditions', nargs='+', default=list(CONDITIONS), choices=CONDITIONS)
     parser.add_argument('--scenarios', nargs='+', default=list(SCENARIOS), choices=list(SCENARIOS))
     parser.add_argument('--binary', type=Path, default=ROOT / '.local/target/release/agent')
-    parser.add_argument('--memory-app', type=Path, default=ROOT / '.local/target/release/agent-app',
-                        help='agent-app built from this checkout, so the memory script matches its skill')
+    parser.add_argument('--sonny', type=Path, default=ROOT / '.local/target/release/sonny',
+                        help='sonny built from this checkout, so the memory script matches its skill')
     parser.add_argument('--provider', help='AGENT_PROVIDER for the daemons (default: the model\'s provider)')
     parser.add_argument('--turn-budget-tokens', type=int, default=400_000, help='cap on each task\'s turn')
     parser.add_argument('--timeout', type=float, default=1200, help='seconds each task may take')
@@ -461,10 +461,10 @@ def main():
         return self_check()
     if not (args.model and args.out):
         parser.error('--model and --out are required')
-    for built in (args.binary, args.memory_app):
+    for built in (args.binary, args.sonny):
         if not built.exists():
             parser.error(f'{built} is missing: {BUILD}')
-    app = args.memory_app.resolve()
+    app = args.sonny.resolve()
     args.out.parent.mkdir(parents=True, exist_ok=True)
     env = clean_env()
     env['AGENT_PROVIDER'] = args.provider or args.model.split('/', 1)[0]
@@ -487,7 +487,7 @@ def main():
     revision = subprocess.run(['git', '-C', str(ROOT), 'describe', '--always', '--dirty', '--abbrev=40'],
                               capture_output=True, text=True).stdout.strip()
     result = {'observed': observed, 'revision': revision, 'model': args.model,
-              'binary_sha256': file_hash(args.binary), 'memory_app_sha256': file_hash(app),
+              'binary_sha256': file_hash(args.binary), 'sonny_sha256': file_hash(app),
               'bots_dir': str(out_dir),
               'summary': summarize(rows), 'bots': rows}
     args.out.write_text(json.dumps(result, indent=1))

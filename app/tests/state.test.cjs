@@ -1990,8 +1990,8 @@ test('an agent\'s effort is picked beside its model, kept in the project file, a
   assert.equal(p.S.bots.get('Eve').reasoning, 'high');
 });
 
-test('the coordinator the app ships gives editing tasks worktrees and cleans up failed starts', () => {
-  const text = fs.readFileSync(require.resolve('../agents/coordinator.md'), 'utf8');
+test('the coordinator Sonny ships, which the app includes, gives editing tasks worktrees and cleans up failed starts', () => {
+  const text = fs.readFileSync(require.resolve('../../sonny/agents/coordinator.md'), 'utf8');
   assert.match(text, /^---\nname: coordinator\n/);
   assert.match(text, /git worktree add -b agent\/NAME/); assert.match(text, /starts with your own name before \.lead/); assert.match(text, /--workspace "\$HOME\/\.agent\/worktrees\/NAME\/\$\(git rev-parse --show-prefix\)"/);
   assert.match(text, /A task keeps its folder, so later messages to it need no --workspace/);
@@ -2005,7 +2005,7 @@ test('the coordinator the app ships gives editing tasks worktrees and cleans up 
   assert.match(text, /give every new task its own worktree, one that only reads too, so tasks do not collide: only you work in this folder/);
   assert.match(text, /otherwise, in a folder that is not a git repository, tasks work in this folder/);
   // The threads' picks are told to the coordinator by the app, not by this role, which a folder may replace.
-  assert.doesNotMatch(text, /threads_|project\.toml/);
+  assert.doesNotMatch(text, /threads_/);
   assert.match(text, /Unless this project's tasks all work in this folder or the task rule below says how to start them/);
   // How a client starts tasks (Sonny's task command) is the client's to say, in the task rule, never this role.
   assert.match(text, /When the task rule below says how to start tasks, follow it/);

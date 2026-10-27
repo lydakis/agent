@@ -19,8 +19,8 @@ the composer gives today, memory indexes included
 There are two conditions:
 
 - **`none`**: no facts and no `memory` skill. This is the control.
-- **`memory`**: three facts are saved through the app's own
-  `~/.agent/memory` script, and the app's `memory` skill is installed, both
+- **`memory`**: three facts are saved through Sonny's
+  `~/.agent/memory` script, and Sonny's `memory` skill is installed, both
   from this checkout so they match. A
   new agent's instructions then carry the person's index and the project's.
 
@@ -55,13 +55,13 @@ that path no longer exists to measure.
 ## Run it
 
 These steps run on George's Mac, with Codex logged in to ChatGPT. The
-build makes the daemon and the app from the same checkout, since the memory
-script is `agent-app --memory` and the skill comes from the checkout:
+build makes the daemon and Sonny from the same checkout, since the memory
+script is `sonny memory` and the skill comes from the checkout:
 
 ```sh
 cd ~/Developer/agent
 git pull
-cargo build --release --locked -p agent-runtime -p agent-app
+cargo build --release --locked -p agent-runtime -p sonny
 .local/venv/bin/python -m bench.memory_eval --model chatgpt/MODEL --out .local/memory-eval/MODEL.json
 ```
 
@@ -78,7 +78,7 @@ cargo build --release --locked -p agent-runtime -p agent-app
   named in the output as `bots_dir`. That is outside this checkout so a
   bot's instructions don't pick up this repository's `AGENTS.md`.
 - **Provenance.** The result records when it ran, the checkout's
-  revision, and the hashes of the `agent` and `agent-app` it used.
+  revision, and the hashes of the `agent` and `sonny` it used.
 - **API key instead.** An API key works as well: `--model openai/MODEL`
   with `OPENAI_API_KEY` set, or `anthropic/MODEL` with `ANTHROPIC_API_KEY`.
   Only the selected provider's key reaches the daemons, which keep it out
@@ -99,8 +99,8 @@ The second runs the whole path against the free synthetic model. That
 covers the worktree, the per-bot HOME, the facts saved through the real
 script, `run --new --agents`, the daemon's totals and the scoring. It
 checks that the memory condition's instructions carry both indexes and the
-control's carry none. It needs the release `agent` and a built `agent-app`
-(the build above, or `AGENT_TEST_APP`).
+control's carry none. It needs the release `agent` and a built `sonny`
+(the build above, or `AGENT_TEST_SONNY`).
 
 ## Cost estimate
 
