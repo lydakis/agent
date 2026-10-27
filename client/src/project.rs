@@ -412,6 +412,10 @@ pub async fn create(
     if let Some(effort) = effort {
         params["effort"] = json!(effort);
     }
+    // The tools its client declares on the lead, from its first turn.
+    if !policy["declare"].is_null() {
+        params["declare"] = policy["declare"].clone();
+    }
     let record = match daemon.request("create", params).await {
         Ok(record) => record,
         // Made since the look above: as when it was there before.

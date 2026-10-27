@@ -21,13 +21,7 @@ pub fn install_own() {
         "memory-cleanup",
         include_str!("../skills/memory-cleanup/SKILL.md"),
     );
-    install_files(
-        "plan",
-        &[
-            ("SKILL.md", include_str!("../skills/plan/SKILL.md"), 0o644),
-            ("plan", include_str!("../skills/plan/plan"), 0o755),
-        ],
-    );
+    install("plan", include_str!("../skills/plan/SKILL.md"));
     // A job reaches the daemon the way every agent Sonny runs does.
     let automation = include_str!("../skills/automation/SKILL.md");
     install("automation", &agent_client::policy::with_cli(automation));
@@ -112,6 +106,12 @@ fn install_in(home: &Path, name: &str, files: &[(&str, &str, u32)]) -> Option<Pa
         std::fs::create_dir_all(&dir).ok()?;
         for (file, text, mode) in files {
             agent_client::files::replace_mode(&dir.join(file), text.as_bytes(), *mode).ok()?;
+        }
+        // A file Sonny wrote before and no longer ships goes.
+        for (file, _) in record(home, name).unwrap_or_default() {
+            if !files.iter().any(|(kept, _, _)| *kept == file) && !file.contains('/') {
+                let _ = std::fs::remove_file(dir.join(file));
+            }
         }
     }
     if wrote {
@@ -262,6 +262,26 @@ mod tests {
             Path::new("/usr/local/bin/sonny")
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_file_sonny_no_longer_ships_goes_with_its_next_text() {
+        let home = std::env::temp_dir().join(format!("sonny-skills-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let dir = home.join(".agents/skills/plan");
+        install_in(
+            &home,
+            "plan",
+            &[("SKILL.md", "one", 0o644), ("plan", "#!/bin/sh", 0o755)],
+        );
+        assert!(dir.join("plan").exists());
+        install_in(&home, "plan", &[("SKILL.md", "two", 0o644)]);
+        assert!(!dir.join("plan").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("SKILL.md")).unwrap(),
+            "two"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
