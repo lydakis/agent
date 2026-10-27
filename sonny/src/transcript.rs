@@ -569,11 +569,8 @@ const TASK_UPDATES: &str = "Task updates: ";
 /// A message that tells the lead of its tasks, as its kind and a few
 /// words for each thing it tells.
 fn news(text: &str) -> Option<Vec<String>> {
-    let (kind, rest) = if text.starts_with(TASK_UPDATES) {
-        ("Task updates", text)
-    } else {
-        ("Lookout", text.strip_prefix(crate::lookout::NOTE_HEAD)?)
-    };
+    let rest = text.strip_prefix(TASK_UPDATES)?;
+    let kind = "Task updates";
     let mut parts = vec![kind.to_owned()];
     let mut memory = false;
     for line in rest.lines() {
@@ -589,15 +586,11 @@ fn news(text: &str) -> Option<Vec<String>> {
         {
             parts.push(format!("+{count} more"));
         } else if let Some((name, turn)) = item.split_once(": turn:") {
-            // "- shop.fix: turn:shop.fix/5 failed, asked by you"
+            // "- shop.fix: turn:shop.fix/5 failed, asked by you", and from
+            // the judge "- shop.fix: turn:shop.fix/5, turn failed (why; todo)"
             let status = turn.split_once(' ').map_or("", |(_, s)| s);
-            let status = status.split(',').next().unwrap_or_default();
+            let status = status.split([',', '(']).next().unwrap_or_default().trim();
             parts.push(format!("{name} {status}"));
-        } else if let Some((name, rest)) = item.split_once(", turn:") {
-            // "- shop.fix, turn:shop.fix/5, turn failed (why; what to do)"
-            let what = rest.split_once(", ").map_or("", |(_, w)| w);
-            let what = what.split(" (").next().unwrap_or_default();
-            parts.push(format!("{name} {what}"));
         }
     }
     if memory {
@@ -1127,17 +1120,16 @@ mod tests {
             text(&super::prompt(told, None, 40)),
             ["↳ Task updates · shop.fix failed · shop…"]
         );
-        let note = format!(
-            "{}\n- shop.fix, turn:shop.fix/5, turn failed (blocked 0.91; look)\n\
-             - shop.docs, turn:shop.docs/2, waits on the person's approval (not checked; look)\n\
+        let note = "Task updates: what your tasks did since you last heard; the wait tool reads each turn by its handle.\n\
+             May need you:\n\
+             - shop.fix: turn:shop.fix/5, turn failed (stuck 0.91; send it a targeted correction)\n\
+             - shop.docs: turn:shop.docs/2, waits on the person's approval (not checked; look)\n\
              - 1 more in the next note\n\
-             A quoted message is the person's own words.",
-            crate::lookout::NOTE_HEAD
-        );
+             A quoted message is the person's own words.";
         assert_eq!(
-            text(&super::prompt(&note, None, 100)),
+            text(&super::prompt(note, None, 100)),
             [
-                "↳ Lookout · shop.fix turn failed · shop.docs waits on the person's approval · +1 more"
+                "↳ Task updates · shop.fix turn failed · shop.docs waits on the person's approval · +1 more"
             ]
         );
     }
