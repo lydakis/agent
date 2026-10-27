@@ -11,7 +11,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-fn canonical_store(store: &Path) -> Result<PathBuf> {
+/// The store's own path, with symlinks resolved, so every client finds
+/// the same daemon and what sits beside its store.
+pub fn canonical_store(store: &Path) -> Result<PathBuf> {
     let absolute = std::path::absolute(store)?;
     let mut existing = absolute.as_path();
     let mut suffix = Vec::new();
