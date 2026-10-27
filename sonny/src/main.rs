@@ -1201,6 +1201,18 @@ struct Fleet {
     returned: Vec<(String, i64, String)>,
 }
 
+/// The projects inside `project` whose leads are among `names`:
+/// `shop.web` for `shop.web.lead` in `shop`.
+fn inner_projects<'a>(names: impl Iterator<Item = &'a str>, project: &str) -> Vec<String> {
+    let lead = format!("{project}.lead");
+    names
+        .filter(|name| *name != lead)
+        .filter_map(|name| name.strip_suffix(".lead"))
+        .filter(|inner| inner.starts_with(&format!("{project}.")))
+        .map(str::to_owned)
+        .collect()
+}
+
 /// What a bot made just now is to a lead's Sonny.
 #[derive(Debug, PartialEq)]
 enum Kin {
@@ -1299,13 +1311,26 @@ impl Fleet {
         else {
             return;
         };
-        for bot in page["bots"].as_array().into_iter().flatten() {
+        let bots = page["bots"].as_array().cloned().unwrap_or_default();
+        // A project inside this one has a lead, and a home, of its own: its
+        // lead opens there and its tasks are its own.
+        let names = bots.iter().filter_map(|bot| bot["name"].as_str());
+        self.leads.extend(inner_projects(names, &self.project));
+        for bot in &bots {
             // Side chats are never tasks, as when they are made.
             let Some(name) = bot["name"].as_str().filter(|_| bot["expire_ms"].is_null()) else {
                 continue;
             };
-            self.lineage.insert(name.to_owned());
             let running = !bot["running_turn"].is_null();
+            if let Some(inner) = (self.leads.iter()).find(|p| name.starts_with(&format!("{p}."))) {
+                if running && name == format!("{inner}.lead") {
+                    let me = std::path::Path::new(&self.command[0]);
+                    let (socket, store) = (&self.socket, &self.store);
+                    let _ = open_lead(socket, Some(store), inner, &self.project, None, me);
+                }
+                continue;
+            }
+            self.lineage.insert(name.to_owned());
             // A turn that ended while away is not known by number, and
             // one that started makes the last ending stale.
             self.ended.remove(name);
@@ -4339,6 +4364,15 @@ mod tests {
             kin("ws.web.fix", "ws.web.lead", "ws", &lineage, &leads),
             Kin::None
         );
+        // After a restart, a project inside this one is known by its lead.
+        let names = [
+            "ws.lead",
+            "ws.fix",
+            "ws.web.lead",
+            "ws.web.fix",
+            "shop.lead",
+        ];
+        assert_eq!(inner_projects(names.into_iter(), "ws"), ["ws.web"]);
         // A lead nobody here made is left to its own Sonny.
         assert_eq!(kin("shop.lead", "", "ws", &lineage, &leads), Kin::None);
         assert_eq!(kin("other.task", "", "ws", &lineage, &leads), Kin::None);
