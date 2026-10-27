@@ -77,6 +77,10 @@ const VIEWPORT: u16 = 5;
 const COMPOSER_ROWS: usize = 8;
 /// How much history is shown on attach.
 const HISTORY_ITEMS: u64 = 200;
+/// How long a side chat's copy stays once idle.
+const SIDE_EXPIRE: Duration = Duration::from_secs(15 * 60);
+/// This window is a side chat (`--side`).
+static SIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 type Tui = Terminal<CrosstermBackend<std::io::Stdout>>;
 
@@ -97,6 +101,9 @@ struct Options {
     /// The decision model that wakes the lead when its tasks need it, or
     /// `off`; `None` picks one (lookout::choose).
     lookout: Option<String>,
+    /// A side chat, opened by `/side`: the node its copy was taken at,
+    /// after which its history is drawn.
+    side: Option<i64>,
 }
 
 fn usage() -> String {
@@ -365,7 +372,7 @@ fn parse() -> Result<Options, String> {
     let (mut store, mut socket, mut bot, mut new, mut model, mut workspace) =
         (None, None, None, false, None, None);
     let (mut layout, mut rex_host, mut sound) = (true, None, true);
-    let mut lookout = None;
+    let (mut lookout, mut side) = (None, None);
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or_else(usage);
         match arg.as_str() {
@@ -379,6 +386,8 @@ fn parse() -> Result<Options, String> {
             "--rex-host" => rex_host = Some(value()?),
             "--no-sound" => sound = false,
             "--lookout" => lookout = Some(value()?),
+            // Unlisted: how `/side` opens a side chat.
+            "--side" => side = Some(value()?.parse().map_err(|_| usage())?),
             "--copies" => {
                 let copies = value()?;
                 if !agent_client::project::COPIES.contains(&copies.as_str()) {
@@ -411,6 +420,7 @@ fn parse() -> Result<Options, String> {
         rex_host,
         sound,
         lookout,
+        side,
     })
 }
 
@@ -485,6 +495,7 @@ async fn run() -> Result<(), String> {
         return lookout::replay().await;
     }
     let options = parse()?;
+    SIDE.store(options.side.is_some(), std::sync::atomic::Ordering::Relaxed);
     // Before any lead is made, so its instructions list the skills.
     skills::install_own();
     // Fonts are read before the first picture needs them.
@@ -516,7 +527,10 @@ async fn run() -> Result<(), String> {
             (lead.bot, Some(lead.project))
         }
     };
-    herdr::announce(&name, reopen());
+    // A side chat borrows its agent's pane, and Herdr keeps the agent.
+    if options.side.is_none() {
+        herdr::announce(&name, reopen());
+    }
     // Everything after now arrives live; history is read from the bot's
     // items instead of replayed events, so the replay is skipped. The bot
     // is read after that, so a turn that ended during the replay is seen
@@ -543,6 +557,12 @@ async fn run() -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     let mut app = App::new(client, &name, &bot, options.clone());
     app.context = context;
+    if options.side.is_some() {
+        let source = name.rsplit_once(".side-").map_or(name.as_str(), |(s, _)| s);
+        app.notice = Some(format!(
+            "a copy of {source} that answers without acting; {source} carries on"
+        ));
+    }
     app.sounds = sound::Sounds::new(options.sound);
     app.sounds.chime = settings::Settings::load().chime;
     // A bot keeps the model it was made with; --model runs this window's
@@ -754,8 +774,13 @@ fn unique(prefix: &str) -> String {
 /// (Ghostty, Rex) can mark this pane working, blocked or done; and the
 /// same to Herdr, which takes it from its own CLI instead.
 fn status_report(state: &str, bot: &str) {
-    herdr::report(state);
     use base64::Engine;
+    // A side chat borrows its agent's pane, which keeps saying what the
+    // agent itself is doing.
+    if SIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    herdr::report(state);
     let mut body = format!("state={state}");
     if state == "blocked" {
         body.push_str(":kind=permission");
@@ -835,7 +860,11 @@ struct Running {
 
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, unlisted.
-const COMMANDS: [(&str, &str); 9] = [
+const COMMANDS: [(&str, &str); 10] = [
+    (
+        "/side",
+        "a side chat with a copy of this agent, which carries on",
+    ),
     ("/model", "the model and effort"),
     ("/approvals", "whether calls wait for a verdict"),
     ("/instructions", "the lead's, from its folder again"),
@@ -954,6 +983,10 @@ struct App {
     gating: Option<&'static str>,
     /// The newest reply's text, for `/copy`.
     last_reply: String,
+    /// The side chat open on the alternate screen, a Sonny of its own.
+    side: Option<std::process::Child>,
+    /// Keys are left to the side chat while it is open.
+    keys_paused: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The lead's tasks, laid out in the project's Rex session: a window for
@@ -1063,7 +1096,8 @@ impl Fleet {
             return;
         };
         for bot in page["bots"].as_array().into_iter().flatten() {
-            let Some(name) = bot["name"].as_str() else {
+            // Side chats are never tasks, as when they are made.
+            let Some(name) = bot["name"].as_str().filter(|_| bot["expire_ms"].is_null()) else {
                 continue;
             };
             self.lineage.insert(name.to_owned());
@@ -1366,7 +1400,8 @@ impl Fleet {
             }
         }
         match kind {
-            "created" | "forked" => {
+            // A copy that goes once idle is a side chat, not a task.
+            "created" | "forked" if event["data"]["expire_ms"].is_null() => {
                 let by = event["data"]["created_by"].as_str().unwrap_or("");
                 if self.lineage.contains(by) || bot.starts_with(&format!("{}.", self.project)) {
                     self.lineage.insert(bot.to_owned());
@@ -1461,6 +1496,8 @@ impl App {
             choosing: None,
             gating: approvals::refresh(record),
             last_reply: String::new(),
+            side: None,
+            keys_paused: Arc::default(),
         }
     }
 
@@ -1496,11 +1533,16 @@ impl App {
         }
         self.configure().await;
         let (keys_tx, mut keys) = tokio::sync::mpsc::unbounded_channel();
+        let paused = self.keys_paused.clone();
         // Poll, not a bare read: a blocked read holds crossterm's reader
         // lock, and the cursor query the inline viewport makes on a resize
         // then times out (Rex resizes a block as it lays it out).
         std::thread::spawn(move || {
             while !keys_tx.is_closed() {
+                if paused.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
                 match event::poll(Duration::from_millis(50)) {
                     Ok(false) => {}
                     Ok(true) => match event::read() {
@@ -1580,10 +1622,12 @@ impl App {
             if self.retry.is_some_and(|at| at <= Instant::now()) {
                 self.reattach(events).await;
             }
+            self.side_closed();
             self.listed();
             self.follow_place().await;
             self.repaint |= term::switched();
-            if self.repaint && self.running.is_none() && self.watch.is_none() {
+            if self.repaint && self.running.is_none() && self.watch.is_none() && self.side.is_none()
+            {
                 self.repaint = false;
                 self.repaint(terminal).await?;
             }
@@ -1811,7 +1855,8 @@ impl App {
             self.down = false;
             self.notice = None;
             self.context = context.or(self.context);
-            self.history_after(self.seen_node).await;
+            self.history_after(self.seen_node.max(self.options.side.unwrap_or(0)))
+                .await;
             self.unstage_landed().await;
             let now = record["running_turn"].as_i64();
             // A turn that ended while away ends here as its event would have.
@@ -1924,9 +1969,11 @@ impl App {
         ))
     }
 
-    /// The bot's latest items, written as the transcript would have shown them.
+    /// The bot's latest items, written as the transcript would have shown
+    /// them. A side chat shows only itself, not the history it was copied
+    /// with.
     async fn history(&mut self) {
-        self.history_after(0).await;
+        self.history_after(self.options.side.unwrap_or(0)).await;
     }
 
     /// The bot's items after `after`, drawn as they would have been live:
@@ -2524,8 +2571,9 @@ impl App {
             .unwrap_or_default()
             .as_millis() as u64;
         let mut rows = Vec::new();
+        // Side chats are not the project's agents.
         for bot in page["bots"].as_array().into_iter().flatten() {
-            let Some(name) = bot["name"].as_str() else {
+            let Some(name) = bot["name"].as_str().filter(|_| bot["expire_ms"].is_null()) else {
                 continue;
             };
             let turn = self
@@ -2931,6 +2979,13 @@ impl App {
                                 .client
                                 .request("interrupt", json!({"bot": self.bot, "turn": turn}))
                                 .await;
+                        } else if self.options.side.is_some() {
+                            // Back to the agent; the copy goes once idle.
+                            if self.input.is_empty() {
+                                self.quit = true;
+                            } else {
+                                self.input.clear();
+                            }
                         }
                     }
                     _ => {}
@@ -2947,7 +3002,12 @@ impl App {
         }
         if matches!(prompt.as_str(), "/status" | "/agents" | "/ps") {
             self.input.clear();
-            self.status().await;
+            // The side chat already holds the screen /status would take.
+            if self.options.side.is_some() {
+                self.notice = Some("/status is for the agent itself, not a side chat".into());
+            } else {
+                self.status().await;
+            }
             return;
         }
         if prompt == "/open" {
@@ -3096,6 +3156,14 @@ impl App {
             self.quit = true;
             return;
         }
+        if let Some(question) = prompt
+            .strip_prefix("/side")
+            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            self.input.clear();
+            self.side(question.trim().to_owned()).await;
+            return;
+        }
         // A message to a busy bot joins its running turn, on that turn's model.
         let delivery = self.running.is_some().then_some("steer");
         let model = delivery
@@ -3126,6 +3194,115 @@ impl App {
             }
             Err(error) => self.notice = Some(error.to_string()),
         }
+    }
+
+    /// `/side`: a side chat with a copy of this bot, taken where it is now,
+    /// mid-turn included, and opened in a Sonny of its own on the alternate
+    /// screen. The copy may call no tool, so it answers from what the bot
+    /// knows; the daemon deletes it once it has been idle a quarter hour.
+    /// This bot carries on, and its lines wait for the main screen.
+    async fn side(&mut self, question: String) {
+        if self.options.side.is_some() {
+            self.notice = Some("this is a side chat already".into());
+            return;
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let name = format!("{}.side-{:x}", self.bot, stamp % 0x100_0000);
+        let forked = self
+            .client
+            .request(
+                "fork",
+                json!({"source": self.bot, "bot": name, "allow": [],
+                    "expire_ms": SIDE_EXPIRE.as_millis() as u64, "request_id": name}),
+            )
+            .await;
+        let forked = match forked {
+            Ok(forked) => forked,
+            Err(error) => {
+                self.notice = Some(format!("no side chat: {error}"));
+                return;
+            }
+        };
+        // On the model this window's turns run on, whose cache is warm.
+        if !question.is_empty()
+            && let Err(error) = self
+                .client
+                .request(
+                    "submit",
+                    json!({"bot": name, "bot_id": forked["bot_id"], "request_id": format!("{name}.1"),
+                        "prompt": question, "model": self.turn_model}),
+                )
+                .await
+        {
+            self.notice = Some(format!("the side chat did not take the question: {error}"));
+        }
+        let me = match std::env::current_exe() {
+            Ok(me) => me,
+            Err(error) => {
+                self.notice = Some(error.to_string());
+                return;
+            }
+        };
+        let mut command = std::process::Command::new(me);
+        command
+            .arg("--store")
+            .arg(&self.options.store)
+            .arg("--socket")
+            .arg(&self.options.socket)
+            .args([
+                "--no-sound",
+                "--no-layout",
+                "--lookout",
+                "off",
+                "--bot",
+                &name,
+            ])
+            .args(["--side", &forked["head"].as_i64().unwrap_or(0).to_string()]);
+        if let Some(model) = &self.turn_model {
+            command.args(["--model", model]);
+        }
+        // The key reader lets go before the side chat reads the keyboard.
+        self.keys_paused
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let _ = execute!(
+            std::io::stdout(),
+            DisableBracketedPaste,
+            EnterAlternateScreen
+        );
+        let _ = disable_raw_mode();
+        match command.spawn() {
+            Ok(child) => self.side = Some(child),
+            Err(error) => {
+                self.side_back();
+                self.notice = Some(format!("no side chat: {error}"));
+            }
+        }
+    }
+
+    /// Back from a side chat that has ended.
+    fn side_closed(&mut self) {
+        if let Some(child) = &mut self.side
+            && !matches!(child.try_wait(), Ok(None))
+        {
+            self.side = None;
+            self.side_back();
+        }
+    }
+
+    fn side_back(&mut self) {
+        let _ = enable_raw_mode();
+        let _ = execute!(
+            std::io::stdout(),
+            LeaveAlternateScreen,
+            EnableBracketedPaste
+        );
+        self.keys_paused
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.redraw = true;
     }
 
     /// The call waiting on the person, written out whole above the
@@ -3169,7 +3346,7 @@ impl App {
         // The pane may have changed size since these lines were wrapped:
         // the viewport takes the new size first, and a line still too wide
         // is cut into rows rather than losing its end.
-        if let Some(watch) = &mut self.watch {
+        if self.watch.is_some() || self.side.is_some() {
             // History waits for the main screen, its newest lines kept.
             if let Some(over) = self.pending.len().checked_sub(KEPT_UNDER_STATUS)
                 && over > 0
@@ -3177,11 +3354,14 @@ impl App {
                 self.pending.drain(..over);
                 self.skipped += over;
             }
-            return draw_watch(watch);
+            return match &mut self.watch {
+                Some(watch) => draw_watch(watch),
+                None => Ok(()),
+            };
         }
         if self.skipped > 0 {
             let note = format!(
-                "… {} earlier lines went by while /status was open",
+                "… {} earlier lines went by while another screen was open",
                 std::mem::take(&mut self.skipped)
             );
             self.pending.insert(0, Line::from(note).dim());
@@ -3490,9 +3670,16 @@ impl App {
         }
         // The context, not what the bot ever spent: how full the next
         // round is.
-        let right = match self.context {
-            Some(size) => format!("{} · {} context  ", self.bot, transcript::tokens(size)),
-            None => format!("{}  ", self.bot),
+        let right = match (self.options.side, self.context) {
+            // Said for as long as the side chat is open.
+            (Some(_), _) => format!(
+                "side chat with {} · esc goes back  ",
+                self.bot
+                    .rsplit_once(".side-")
+                    .map_or(self.bot.as_str(), |(s, _)| s)
+            ),
+            (None, Some(size)) => format!("{} · {} context  ", self.bot, transcript::tokens(size)),
+            (None, None) => format!("{}  ", self.bot),
         };
         // The folder, and what it is a copy of; its branch is kept whole.
         let folder = match &self.place.copy_of {
@@ -3747,6 +3934,7 @@ mod tests {
             rex_host: None,
             sound: false,
             lookout: None,
+            side: None,
         };
         App::new(client, "b", &json!({"name": "b"}), options)
     }

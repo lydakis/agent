@@ -58,6 +58,14 @@ Enter sends (and steers a running turn), Esc interrupts, `y`/`n` answer a
 pending approval, Ctrl-C clears the composer or quits. `/` lists the
 commands:
 
+- `/side [QUESTION]` opens a side chat with a copy of the agent in this
+  window, taken where it is now, mid-turn included, on the alternate
+  screen. The copy answers from the agent's history and may call no tool;
+  follow-ups stay with it, and Esc goes back. The agent carries on
+  meanwhile, and what it said is waiting on the main screen. The daemon
+  deletes the copy once it has been idle 15 minutes (`fork --expires`), and
+  no copy shows among the project's agents, in `/status`, or to the
+  lookout.
 - `/model` picks the lead's model, from every model its provider family
   lists, and its effort (←/→), and writes them to the project's
   `.agents/project.toml` when the folder has one. A pick made while a turn
