@@ -37,6 +37,7 @@ mod task;
 mod term;
 mod transcript;
 mod updates;
+mod view;
 
 use agent_client::{Client, Events};
 use ratatui::{
@@ -456,6 +457,7 @@ fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
         Some((task, rest)) if task == "task" => task::run(rest),
+        Some((view, rest)) if view == "view" => view::run(rest),
         _ => tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
