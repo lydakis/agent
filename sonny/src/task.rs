@@ -914,7 +914,7 @@ fn remove(here: &Path, name: &str, args: &[String]) -> Result<(), String> {
             }
         }
         if let Some(path) = &worktree
-            && !git(path, &["status", "--porcelain"])?.is_empty()
+            && !git(path, &["status", "--porcelain", "--untracked-files=all"])?.is_empty()
         {
             return Err(format!(
                 "{name}'s worktree has uncommitted changes; commit them, or pass --discard to \
@@ -964,13 +964,13 @@ fn remove(here: &Path, name: &str, args: &[String]) -> Result<(), String> {
 /// but for git's own files and those git ignores.
 fn not_here(name: &str, folder: &Path, here: &Path) -> Result<String, String> {
     if folder.join(".git").exists() {
-        if !git(folder, &["status", "--porcelain"])?.is_empty() {
+        if !git(folder, &["status", "--porcelain", "--untracked-files=all"])?.is_empty() {
             return Ok("uncommitted changes in its copy".into());
         }
         // Every branch's tip, not only the one checked out: the copy goes
         // with the commits that are only in it.
         let origin = git(folder, &["remote", "get-url", "origin"]).unwrap_or_default();
-        let tips = git(
+        let mut tips = git(
             folder,
             &[
                 "for-each-ref",
@@ -978,6 +978,8 @@ fn not_here(name: &str, folder: &Path, here: &Path) -> Result<String, String> {
                 "refs/heads",
             ],
         )?;
+        // A detached HEAD's commits are on no branch.
+        tips.push_str(&format!("\n{} HEAD", git(folder, &["rev-parse", "HEAD"])?));
         let unpushed: Vec<&str> = tips
             .lines()
             .filter_map(|line| line.split_once(' '))
@@ -1046,7 +1048,14 @@ fn same_entry(a: &Path, b: &Path) -> bool {
     if kind_a.is_dir() || kind_b.is_dir() {
         return kind_a.is_dir() && kind_b.is_dir();
     }
-    matches!((std::fs::read(a), std::fs::read(b)), (Ok(x), Ok(y)) if x == y)
+    // Whether it runs, as --apply keeps it.
+    use std::os::unix::fs::PermissionsExt;
+    let runs = |path: &Path| {
+        path.symlink_metadata()
+            .map(|found| found.permissions().mode() & 0o111 != 0)
+            .ok()
+    };
+    runs(a) == runs(b) && matches!((std::fs::read(a), std::fs::read(b)), (Ok(x), Ok(y)) if x == y)
 }
 
 /// The names of every agent the daemon has, or None when it can't say.
@@ -1298,6 +1307,7 @@ mod tests {
 
     #[test]
     fn entries_are_the_same_only_when_they_can_be_told_apart_from_none() {
+        use std::os::unix::fs::PermissionsExt;
         let base = std::env::temp_dir().join(format!("sonny-same-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
@@ -1308,8 +1318,12 @@ mod tests {
         std::os::unix::fs::symlink("nowhere", at("link")).unwrap();
         std::os::unix::fs::symlink("a", at("to-a")).unwrap();
         std::os::unix::fs::symlink("b", at("to-b")).unwrap();
+        std::fs::write(at("run"), "x").unwrap();
+        std::fs::set_permissions(at("run"), std::fs::Permissions::from_mode(0o755)).unwrap();
         let said = [
             same_entry(&at("a"), &at("b")),
+            // The same bytes, but one runs and the other doesn't.
+            same_entry(&at("a"), &at("run")),
             same_entry(&at("a"), &at("c")),
             // A dangling link is not the same as nothing there.
             same_entry(&at("missing"), &at("link")),
@@ -1318,6 +1332,6 @@ mod tests {
             same_entry(&at("to-a"), &at("a")),
         ];
         let _ = std::fs::remove_dir_all(&base);
-        assert_eq!(said, [true, false, false, false, false]);
+        assert_eq!(said, [true, false, false, false, false, false]);
     }
 }

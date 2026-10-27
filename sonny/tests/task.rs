@@ -255,6 +255,18 @@ fn a_sandfs_task_copy_takes_the_checkout_and_pushes_back() {
         lab.git(&lab.repo, &["show", "agent/demo.fix:src/lib.rs"]),
         "two"
     );
+    // A new file, even one git status is set not to show, keeps it.
+    lab.git(&copy, &["config", "status.showUntrackedFiles", "no"]);
+    std::fs::write(copy.join("new.rs"), "new\n").unwrap();
+    let (ok, _, err) = lab.run(&lab.repo, sonny, &["task", "rm", "demo.fix"], false);
+    assert!(!ok && err.contains("uncommitted changes"), "{err}");
+    std::fs::remove_file(copy.join("new.rs")).unwrap();
+    // So does a commit on no branch.
+    lab.git(&copy, &["checkout", "-q", "--detach"]);
+    lab.git(&copy, &["commit", "-q", "--allow-empty", "-m", "loose"]);
+    let (ok, _, err) = lab.run(&lab.repo, sonny, &["task", "rm", "demo.fix"], false);
+    assert!(!ok && err.contains("on HEAD"), "{err}");
+    lab.git(&copy, &["switch", "-q", "agent/demo.fix"]);
     // Unmounted, so the folder can go with the test.
     let (ok, _, err) = lab.run(&lab.repo, sonny, &["task", "rm", "demo.fix"], false);
     assert!(ok, "{err}");
