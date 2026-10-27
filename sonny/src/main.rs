@@ -974,12 +974,16 @@ struct Running {
 
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, unlisted.
-const COMMANDS: [(&str, &str); 11] = [
+const COMMANDS: [(&str, &str); 12] = [
     (
         "/side",
         "a side chat with a copy of this agent, which carries on",
     ),
     ("/model", "the model and effort"),
+    (
+        "/compact",
+        "summarize the lead's conversation before its next call",
+    ),
     ("/approvals", "whether calls wait for a verdict"),
     ("/instructions", "the lead's, from its folder again"),
     ("/status", "this project's agents"),
@@ -2638,6 +2642,24 @@ impl App {
                     self.live = Some(live);
                 }
             }
+            "compaction_text_delta" | "compaction_thinking_delta" => {
+                if let Some(running) = &mut self.running {
+                    running.phase = "Compacting".into();
+                }
+            }
+            "compacted" => self.notice = Some("compacted the conversation".into()),
+            "compaction_failed" => {
+                self.notice = Some(format!(
+                    "compaction failed: {}",
+                    data["error"]
+                        .as_str()
+                        .or(event["error"].as_str())
+                        .unwrap_or("unknown")
+                ))
+            }
+            "tool_calls_withheld" => {
+                self.notice = Some("at the round limit: this reply ends the turn".into())
+            }
             "retry" => {
                 if !self.said.is_empty() {
                     self.replay = Some(std::mem::take(&mut self.said));
@@ -3393,6 +3415,21 @@ impl App {
                 }
                 Err(error) => self.notice = Some(format!("the lead's instructions: {error}")),
             }
+            return;
+        }
+        if prompt == "/compact" {
+            self.input.clear();
+            self.notice = Some(
+                match self
+                    .client
+                    .request("compact", json!({"bot": self.bot}))
+                    .await
+                {
+                    Ok(_) if self.running.is_some() => "compacts at its next step".into(),
+                    Ok(_) => "compacts before its next reply".into(),
+                    Err(error) => format!("compact: {error}"),
+                },
+            );
             return;
         }
         if prompt == "/approvals" {

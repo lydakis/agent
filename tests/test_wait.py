@@ -619,12 +619,14 @@ class WaitTests(ModelFixture):
         self.model.release_headers.set()
         client = self.client('wait')
         end = client.receive(lambda e: e.get('event') == 'turn_finished' and e.get('turn') == turn, timeout=10)
-        self.assertEqual(end['data']['error'], 'tool_round_limit')
+        # The limit's last call allows no tool call, so the turn ends on it.
+        self.assertEqual(end['data']['status'], 'completed', end)
         requests = []
         while not self.model.requests.empty():
             requests.append(self.model.requests.get_nowait())
         loop_calls = [r for r in requests if r['input'][0]['content'][0]['text'] == prompt]
         self.assertEqual(len(loop_calls), 200)
+        self.assertEqual([r.get('tool_choice') for r in loop_calls][-2:], [None, 'none'])
 
     def test_background_persistence_failure_disconnects_and_recovers_without_reexecution(self):
         for stage, trigger in (

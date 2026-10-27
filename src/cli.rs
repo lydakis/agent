@@ -21,7 +21,7 @@ const COMMANDS: &[Command] = &[
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
         flags: "--bot --new --fork --allow --expires --detach --delivery --turn --model --workspace --effort --turn-budget-tokens --agents --profile --request-id --bot-id --pretty --no-spawn",
-        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallbacks --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl",
+        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallbacks --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl",
         startup: true,
     },
     Command {
@@ -84,6 +84,14 @@ const COMMANDS: &[Command] = &[
         name: "rm",
         about: "Delete an idle bot; prints what was freed",
         usage: "rm --bot NAME [--bot-id N]",
+        flags: "--bot --bot-id --pretty --no-spawn",
+        settings: "",
+        startup: true,
+    },
+    Command {
+        name: "compact",
+        about: "Summarize a bot's context before its next model call",
+        usage: "compact --bot NAME [--bot-id N]",
         flags: "--bot --bot-id --pretty --no-spawn",
         settings: "",
         startup: true,
@@ -337,6 +345,10 @@ fn print_flags(flags: &str) {
             "--compact-keep" => (
                 "PERCENT",
                 "Share of a new bot's context budget kept verbatim by elision and compaction; default 25",
+            ),
+            "--compact-tokens" => (
+                "N",
+                "A new bot elides, then compacts, once a call's input reaches N tokens, whichever of this and --compact-at comes first; 0 leaves --compact-at; by default its model's context window less 33000 tokens, at most 90% of it",
             ),
             "--compaction-instructions" => (
                 "TEXT",

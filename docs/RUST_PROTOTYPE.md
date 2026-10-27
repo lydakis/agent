@@ -381,6 +381,7 @@ keep-warm when it sets any of them.
 | `note_turns` (`--note-turns`) | Omitted turns the context note lists, newest first, with the first line of each prompt. 0 lists none. | 48 |
 | `compact_at` (`--compact-at`) | Percent of either context envelope that triggers compaction, and of the byte envelope that triggers tool-result elision first. Estimated completion headroom can advance the byte trigger without reducing the input allowance. | 75 |
 | `compact_keep` (`--compact-keep`) | Target percent of either context envelope kept verbatim: as newest whole turns by compaction, as newest items by elision. Reduced when pinned context leaves less room. Must be below `compact_at`. | 25 |
+| `compact_tokens` (`--compact-tokens`) | Input tokens per request that start elision and compaction too, whichever of this and `compact_at` comes first (see [compaction](#compaction)). 0 leaves only `compact_at`; otherwise at least 1,024. | from the model's context window |
 | `keep_turns` (`--keep-turns`) | After each of its turns finishes, prune the bot to this many turns' records (see [Retention](#retention)). | none |
 | `approval_hold_ms` (`--approval-hold`) | Milliseconds a gated call waits live for its verdict before its turn parks (see [tool approval](#tool-approval)). 0 parks at once; at most 3,600,000. | 2,000 |
 | `max_output_tokens` (`--max-output-tokens`) | Generated tokens per model call, including reasoning, summaries included. Anthropic calls use the model's full output limit (read inside Bedrock ids) unless this is set; set, it is sent as `max_tokens`, at least 2,048 so a legacy thinking budget of 1,024 or more fits beside the answer. Bedrock deducts input plus this bound from quota when a call starts, so a bound near real output buys throughput there. | none |
@@ -988,6 +989,7 @@ own path from the turn. Example requests:
 {"id":22,"op":"bots","after":null,"limit":64,"name":"project.*","active":true}
 {"id":23,"op":"turns","bot":"Bob","newest":true,"limit":3}
 {"id":14,"op":"prune","bot":"Bob","keep_turns":8}
+{"id":29,"op":"compact","bot":"Bob","bot_id":1}
 {"id":15,"op":"delete","bot":"Bob","bot_id":1}
 {"id":16,"op":"follow","bot":"*","after":0}
 {"id":17,"op":"wait","handles":["turn:Bob/1","turn:Alice/3"],"any":true,"timeout_ms":60000}
@@ -1706,8 +1708,15 @@ resumption. A hard process kill can lose the current segment's unflushed
 counters. Retries are on by default because they cannot repeat an effect; what they can repeat is
 billing for a failed attempt, which is recorded as failed usage. Successful
 model responses and failures with reported usage share the durable limit of
-200 model rounds per turn, including across parking and restart. Reaching
-that limit stops the next model call; already committed tool plans still run.
+200 model rounds per turn, including across parking and restart. The last
+of them, a retry included when a billed failure made it the last, goes with the bot's tools shown but `tool_choice` `none` (both
+families), so the model must answer in words, and the turn ends on that reply
+instead of failing with its work done and unreported; a live
+`tool_calls_withheld` event (`reason: "tool_round_limit"`) marks it. That call
+sends no keep-warm refresh, and on Anthropic, where `tool_choice` is part of
+the cached prefix, it rewrites the message cache once. A model that calls a
+tool anyway has those calls run, as any committed plan's, and the turn then
+fails `tool_round_limit`.
 Unbilled failures remain bounded by the attempt and time limits above.
 
 The transport keeps 64 streams per HTTP/2 connection rather than the 100 the
@@ -2281,7 +2290,8 @@ its raw results.
 A bot created with `compaction_instructions` compacts, and one without never
 does. At a round boundary, after steers are absorbed and before the next
 model call, when the effective view since the last summary reaches
-`compact_at` percent of either envelope, the daemon summarizes everything
+`compact_at` percent of either envelope, or the view would send
+`compact_tokens`, the daemon summarizes everything
 older than the newest boundary whose tail holds `compact_keep` percent
 verbatim, limited by the room left after pinned context. A boundary is a
 turn's prompt or, [inside the newest turn](#cuts-inside-a-turn), a round
@@ -2290,6 +2300,44 @@ an absorbed steer. The item dimension can choose the cut even when small message
 have barely consumed the byte budget. The summary is one model call, to the
 bot's own model or the `compaction_model` the client named at creation (same
 family; another family's items cannot be replayed to it).
+
+The token threshold is what Claude Code and Codex compact on; bytes alone
+compacted far too late, since the 8 MiB default envelope is about two million
+tokens, past any model's window. Unset, it follows the turn's model the way
+they compute it: the context window less 20,000 tokens kept for the reply and
+a 13,000-token buffer, and at most 90% of the window (900,000 on a 1M window,
+167,000 on 200K). The window is the one the provider's model listing gives
+(`context_tokens`, as `provider_models` answers) once a client has asked
+for one, as a model picker does; the windows of the last listing that
+answered are kept apart from it, read without parsing it again (a turn never
+asks a provider for anything but its call). Otherwise, as for a provider that
+lists none, Claude models get the window Anthropic publishes, 1M from Claude 5
+on and 200K before, and any other model 200K, the smallest a current model
+has. A
+view's tokens are estimated from the bot's
+last call: the bytes it sent (view, instructions and tools) against the input
+tokens the provider counted for them, cache reads and writes included,
+kept on the bot (`sent_bytes`, `sent_tokens`, schema 52). The threshold then
+acts as a smaller byte envelope, the one whose `compact_at` percent is the
+view that sends `compact_tokens`, so `compact_keep` and elision's own
+threshold and saving scale with it. Before a bot's first call, or after one
+whose provider ran fallbacks, there is no estimate yet and only bytes apply;
+when instructions and tools alone pass the threshold, no summary can help
+and only bytes apply too. The input limit stays the byte envelope.
+
+A client may also ask for a summary with `compact` (protocol 17;
+`agent compact --bot NAME`,
+Sonny's `/compact`). It is kept on the bot, so a parked turn or a restarted
+daemon still takes it: a running turn's next round boundary, or an idle
+bot's next turn before its first call, summarizes everything older than the
+newest boundary, whatever the thresholds, as an overflow would, before the
+call rather than beside it. It stays pending until that summary ends, a
+summary that parks on a closed pool included. The answer
+names the bot, its identity and `running_turn`; a request while one is
+pending answers `duplicate: true` and changes nothing; a bot without
+compaction instructions answers `compaction_unavailable`. Followers get a
+live `compaction_requested` event, then the usual `compacted` or
+`compaction_failed`.
 
 When the summarizer is the model the bot's last call ran on (the bot's, or
 the turn's override), and a view a call sent holds the whole span, the
