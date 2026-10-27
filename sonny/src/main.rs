@@ -827,8 +827,8 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
     };
     let memory = agent_client::policy::memory_indexes(&workspace).map_err(|e| e.to_string())?;
     let instructions = agent_client::policy::instructions(&workspace, None, &memory)
-        .map_err(|e| e.to_string())?
-        .text;
+        .map(|composed| project::with_person(&composed.text))
+        .map_err(|e| e.to_string())?;
     let mut asked = json!({"bot": bot, "workspace": workspace, "model": model,
         "instructions": instructions, "tools": DEFAULT_TOOLS,
         "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
@@ -2721,27 +2721,36 @@ impl App {
     }
 
     /// What was sent and has not landed yet, dim, the way it will read
-    /// once it does.
+    /// once it does: a blank row above each, as in the history, and one
+    /// under the last, so the status row does not touch it.
     fn staged_rows(&self, width: usize) -> Vec<Line<'static>> {
-        self.staged
+        let mut rows: Vec<Line<'static>> = self
+            .staged
             .iter()
-            .flat_map(|(_, prompt)| match user_shell::read(prompt) {
-                Some(ran) => user_shell::header(&ran.command, width, true),
-                None => prompt
-                    .split('\n')
-                    .enumerate()
-                    .flat_map(|(at, line)| {
-                        let lead = if at == 0 { "› " } else { "  " };
-                        transcript::wrap(
-                            Line::from(line.to_owned()).dim(),
-                            width,
-                            Span::raw(lead).dim(),
-                            Span::raw("  "),
-                        )
-                    })
-                    .collect(),
+            .flat_map(|(_, prompt)| {
+                let shown: Vec<Line<'static>> = match user_shell::read(prompt) {
+                    Some(ran) => user_shell::header(&ran.command, width, true),
+                    None => prompt
+                        .split('\n')
+                        .enumerate()
+                        .flat_map(|(at, line)| {
+                            let lead = if at == 0 { "› " } else { "  " };
+                            transcript::wrap(
+                                Line::from(line.to_owned()).dim(),
+                                width,
+                                Span::raw(lead).dim(),
+                                Span::raw("  "),
+                            )
+                        })
+                        .collect(),
+                };
+                std::iter::once(Line::default()).chain(shown)
             })
-            .collect()
+            .collect();
+        if !rows.is_empty() {
+            rows.push(Line::default());
+        }
+        rows
     }
 
     /// The person's command while it runs, and those the agent could not
@@ -3638,7 +3647,16 @@ impl App {
             .collect()
     }
 
-    async fn key(&mut self, event: Event) {
+    async fn key(&mut self, mut event: Event) {
+        // Ctrl-H is the backspace a terminal sends as 0x08, which reads as
+        // Ctrl and `h`: it deletes, as in a shell.
+        if let Event::Key(key) = &mut event
+            && key.code == KeyCode::Char('h')
+            && key.modifiers == KeyModifiers::CONTROL
+        {
+            key.code = KeyCode::Backspace;
+            key.modifiers = KeyModifiers::NONE;
+        }
         if self.watch.is_some() {
             if let Event::Key(key) = event
                 && key.kind != KeyEventKind::Release
@@ -4545,9 +4563,11 @@ impl App {
                     .iter()
                     .map(|row| row.alignment == Some(transcript::CUT))
                     .collect();
+                // Paths are read against the agent's folder.
+                let workspace = std::path::Path::new(&self.workspace);
                 terminal.insert_before(rows.len() as u16, |buf| {
                     Paragraph::new(rows.to_vec()).render(buf.area, buf);
-                    linked = links::cells(buf, &cut);
+                    linked = links::cells(buf, &cut, |word| links::file(workspace, word));
                 })?;
                 // The rows sit just above the viewport now; those still on
                 // the screen get their addresses linked.
@@ -5431,7 +5451,7 @@ mod tests {
         assert_eq!(ran.output, "hello");
         // Staged until its turn takes it, as its name alone.
         let staged: Vec<String> = app.staged_rows(80).iter().map(|l| l.to_string()).collect();
-        assert_eq!(staged, ["! echo hello"]);
+        assert_eq!(staged, ["", "! echo hello", ""]);
         app.daemon(turn_event("accepted", 2, json!({}))).await;
         assert!(app.staged.is_empty());
         // To a busy one, as a steer of its running turn.
@@ -5563,7 +5583,7 @@ mod tests {
             app.submit().await;
         }
         assert_eq!(staged(&app), [2, 3]);
-        assert_eq!(app.staged_rows(80).len(), 2);
+        assert_eq!(app.staged_rows(80).len(), 5, "each with a blank row above");
         // Turn 1 takes in the first; its own turn ends as steered.
         app.daemon(turn_event("turn_finished", 2, json!({"status": "steered"})))
             .await;
@@ -6163,6 +6183,18 @@ mod tests {
             "{narrow}"
         );
         assert_eq!(narrow.trim_end().width(), 56 - 2);
+    }
+
+    #[tokio::test]
+    async fn ctrl_h_deletes_as_backspace_does() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.input.set("helo");
+        let ctrl_h = event::KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL);
+        app.key(Event::Key(ctrl_h)).await;
+        assert_eq!(&*app.input, "hel");
+        app.input.set("/mo");
+        app.key(Event::Key(ctrl_h)).await;
+        assert_eq!(&*app.input, "/m", "with the command menu open too");
     }
 
     #[test]
