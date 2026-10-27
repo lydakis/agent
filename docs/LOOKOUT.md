@@ -152,9 +152,12 @@ Sonny shows it folded, as `↳ Task updates`.
 ## The judge
 
 `--judge SPEC`, else `AGENT_JUDGE` (in the shell or `~/.agent/env`, the
-approver's setting too), else `openai-decisions/gpt-6-luna` when
-`OPENAI_API_KEY` is set (about $0.0002 a check), else the newest Haiku the
-lead's provider lists. `typesafe/jev-*` picks Jev, and any other
+approver's setting too), else what the approver would pick for the lead
+(`agent_client::judge`): the newest Haiku Bedrock lists, else the newest
+Haiku the lead's provider lists, else the lead's own model. That order
+rests on what the code can reach, not on a measurement.
+`openai-decisions/MODEL` with `OPENAI_API_KEY` asks OpenAI's Decisions API
+(about $0.0002 a check with `gpt-6-luna`), and any other
 `provider/model` runs through the daemon on a fork of an idle, tool-less
 `lookout.HASH` bot, as the approver's judge does, so Bedrock alone is
 enough. Each fork is deleted once it answers, and one a stopped lookout

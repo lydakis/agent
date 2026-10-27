@@ -110,12 +110,11 @@ identity is `bot_not_found`.
   [--note FILE] [--judge-url URL]` serves a gate tag (default `auto`) and
   has a judge decide every call waiting on it, one request per round,
   printing one JSON line per round. The judge is `--judge`, else
-  `AGENT_JUDGE`, else `typesafe/jev-latest` when `TYPESAFE_API_KEY`
-  is set, else `AGENT_MODEL`. Jev (`typesafe/jev-*`, key `TYPESAFE_API_KEY`)
-  and OpenAI's Decisions API (`openai-decisions/MODEL`, key
-  `OPENAI_API_KEY`) are called on their own APIs, at `--judge-url` when
-  given; any other model runs through the daemon, with
-  a tag of at most 87 bytes, and `--effort` sets its effort. `--note` (default `AGENT_APPROVER_NOTE`)
+  `AGENT_JUDGE`, else the newest Haiku on Bedrock, else the newest Haiku
+  `AGENT_MODEL`'s provider lists, else `AGENT_MODEL`. OpenAI's Decisions
+  API (`openai-decisions/MODEL`, key `OPENAI_API_KEY`) is called on its
+  own API, at `--judge-url` when given; any other model runs through the
+  daemon, with a tag of at most 67 bytes, and `--effort` sets its effort. `--note` (default `AGENT_APPROVER_NOTE`)
   is a regular file of at most 96,000 bytes the judge always sees, such as
   trusted remotes and hosts ([APPROVALS.md](APPROVALS.md#automatic-mode)).
 - `approvals [--bot NAME] [--tag TAG] [--full]` lists the calls waiting on a gate.

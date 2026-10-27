@@ -1,7 +1,8 @@
 //! `agent approver`: serve a gate tag and have a judge model decide every
 //! call waiting on it, in one request a round. The policy (the questions,
 //! the verdicts, what the judge sees, and redaction) is
-//! `agent_client::approver`; this is the loop and the judge's transport.
+//! `agent_client::approver` and the judge's transport `agent_client::judge`;
+//! this is the loop.
 //! It never pages a person: a round it cannot judge in time is denied with
 //! the reason, and the model can ask its caller instead.
 use agent_client::{
@@ -9,16 +10,14 @@ use agent_client::{
     approver::{
         self as policy, Allowed, By, Intent, Planned, Redactor, Refused, State, Verdict, Words,
     },
+    judge::{self, Failed, Usage},
 };
 use agent_runtime::{Error, Result};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Notify, Semaphore};
@@ -26,29 +25,18 @@ use tokio::sync::{Notify, Semaphore};
 pub struct Settings {
     pub socket: PathBuf,
     pub tag: String,
-    pub judge: JudgeSpec,
+    /// The judge `--judge` or `AGENT_JUDGE` names, if either does.
+    pub judge: Option<String>,
+    /// The model the bots being judged run, `AGENT_MODEL`, when no judge
+    /// is named: the last in the order a judge is picked in.
+    pub caller: Option<String>,
+    /// A model judge's effort.
+    pub effort: Option<String>,
+    /// For the Decisions API: where, and its key.
+    pub url: Option<String>,
+    pub key: Option<String>,
     /// The environment note the judge always sees.
     pub note: Option<String>,
-}
-
-/// Who judges: Jev or OpenAI's Decisions API over their own APIs, or any
-/// model the daemon runs.
-pub enum JudgeSpec {
-    Jev {
-        url: String,
-        model: String,
-        key: String,
-    },
-    Decisions {
-        url: String,
-        model: String,
-        key: String,
-    },
-    /// A `provider/model` the daemon serves, with an optional effort.
-    Model {
-        model: String,
-        effort: Option<String>,
-    },
 }
 
 /// The lease a tag is served under, renewed well inside it.
@@ -69,21 +57,9 @@ const DELEGATING: usize = 64;
 /// shown: a larger one only by its size, and the call is not allowed on the
 /// judge's word alone.
 const FILE_BYTES: u64 = 48 * 1024;
-/// The largest answer a decision API may send; a larger one is a failed check.
-const REPLY_BYTES: usize = 64 * 1024;
-/// First wait after a 429 or 529 without Retry-After, doubled each time.
-const BACKOFF: Duration = Duration::from_millis(250);
-const BACKOFF_MAX: Duration = Duration::from_secs(4);
-/// The longest Retry-After honored, past any round's deadline anyway.
-const RETRY_MAX_SECS: f64 = 60.0;
-/// A judge fork is `approver.TAG.BASE.N`, BASE being the base bot's id,
-/// and every bot name fits 128 bytes.
-const JUDGE_NAME_ROOM: usize =
-    128 - "approver.".len() - ".9223372036854775807.18446744073709551615".len();
-/// How long a judge's fork may sit idle before the daemon deletes it. Each
-/// is deleted once its round is answered; this is for an approver that
-/// stopped mid-round.
-const JUDGE_EXPIRE_MS: u64 = 60_000;
+/// A judge fork is `approver.TAG` and the fork's suffix, and every bot
+/// name fits 128 bytes.
+const JUDGE_NAME_ROOM: usize = 128 - "approver.".len() - judge::FORK_SUFFIX;
 
 fn epoch_ms() -> i64 {
     SystemTime::now()
@@ -109,14 +85,6 @@ enum Judged {
     Failed(String),
 }
 
-/// Tokens a judge request used, as its provider reported them.
-#[derive(Default)]
-struct Usage {
-    input: u64,
-    cached: u64,
-    output: u64,
-}
-
 struct Judge {
     via: Via,
     /// Taken before a round reads anything, so rounds past these wait
@@ -127,370 +95,40 @@ struct Judge {
 }
 
 enum Via {
-    Hosted(Hosted),
-    Model(Model),
+    Decisions(judge::Decisions),
+    Model(judge::Base),
 }
 
 impl Judge {
     async fn ask(
         &self,
-        client: &Arc<Client>,
+        client: &Client,
         state: &Value,
-        questions: &Value,
+        questions: &[(String, String)],
         deadline: Instant,
     ) -> Judged {
-        match &self.via {
-            Via::Hosted(hosted) => hosted.ask(state, questions, deadline).await,
-            Via::Model(model) => model.ask(client, state, questions, deadline).await,
-        }
-    }
-}
-
-/// A decision model behind its own API, which answers a round's questions
-/// with probabilities and bills input only.
-enum Api {
-    /// TypeSafe's `POST /v1/systemone`, which takes the questions as they are.
-    Jev,
-    /// OpenAI's `POST /v1/decisions`, which takes them as predicates.
-    Decisions,
-}
-
-struct Hosted {
-    api: Api,
-    http: reqwest::Client,
-    url: String,
-    model: String,
-    key: String,
-    /// Shared by every round: after a 429 or 529 nobody asks before this.
-    backoff: Mutex<(Option<Instant>, Duration)>,
-}
-
-impl Hosted {
-    async fn ask(&self, state: &Value, questions: &Value, deadline: Instant) -> Judged {
-        let (path, request) = match self.api {
-            Api::Jev => (
-                "/v1/systemone",
-                json!({"model":self.model,"state":state,"questions":questions}),
-            ),
-            Api::Decisions => (
-                "/v1/decisions",
-                policy::decisions_request(&self.model, state, questions),
-            ),
+        let answered = match &self.via {
+            Via::Decisions(decisions) => {
+                let text = policy::state_text(state);
+                decisions
+                    .ask(policy::DECISIONS_INSTRUCTIONS, &text, questions, deadline)
+                    .await
+            }
+            Via::Model(base) => {
+                let ids: Vec<&str> = questions.iter().map(|(id, _)| id.as_str()).collect();
+                let prompt = policy::model_prompt(state, questions);
+                base.ask(client, &prompt, &ids, deadline).await
+            }
         };
-        let body = match serde_json::to_vec(&request) {
-            Ok(body) => body,
-            Err(_) => return Judged::Failed("the request could not be encoded".into()),
-        };
-        loop {
-            let until = self.backoff.lock().unwrap().0;
-            if let Some(until) = until.filter(|until| *until > Instant::now()) {
-                if until >= deadline {
-                    return Judged::Overloaded;
-                }
-                tokio::time::sleep_until(until.into()).await;
-            }
-            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
-                return Judged::Overloaded;
-            };
-            let sent = self
-                .http
-                .post(format!("{}{path}", self.url))
-                .header(
-                    reqwest::header::AUTHORIZATION,
-                    format!("Bearer {}", self.key),
-                )
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(body.clone())
-                .timeout(left)
-                .send()
-                .await;
-            let response = match sent {
-                Ok(response) => response,
-                Err(error) if error.is_timeout() => {
-                    return Judged::Failed("the check timed out".into());
-                }
-                Err(_) => return Judged::Failed("the check failed".into()),
-            };
-            let status = response.status().as_u16();
-            if matches!(status, 429 | 529) {
-                let retry = response
-                    .headers()
-                    .get(reqwest::header::RETRY_AFTER)
-                    .and_then(|value| value.to_str().ok()?.parse::<f64>().ok())
-                    .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
-                    .map(|seconds| Duration::from_secs_f64(seconds.min(RETRY_MAX_SECS)));
-                // OpenAI's 429 also means the account is out of credit,
-                // which no wait fixes; its body names that by a published code.
-                if matches!(self.api, Api::Decisions) {
-                    let error: Value = read_reply(response)
-                        .await
-                        .ok()
-                        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-                        .unwrap_or_default();
-                    if error["error"]["code"] == "insufficient_quota" {
-                        return Judged::Failed("the judge's account is out of quota".into());
-                    }
-                }
-                let mut backoff = self.backoff.lock().unwrap();
-                // A server's shorter wait, zero included, still paces.
-                let wait = retry.map_or(backoff.1, |retry| retry.max(backoff.1));
-                backoff.1 = (backoff.1 * 2).min(BACKOFF_MAX);
-                backoff.0 = Some(Instant::now() + wait);
-                continue;
-            }
-            if !(200..300).contains(&status) {
-                return Judged::Failed(format!("the judge answered {status}"));
-            }
-            {
-                // An answer to a request sent before another was throttled
-                // leaves that newer wait in place.
-                let mut backoff = self.backoff.lock().unwrap();
-                if backoff.0.is_none_or(|until| until <= Instant::now()) {
-                    *backoff = (None, BACKOFF);
-                }
-            }
-            let bytes = match read_reply(response).await {
-                Ok(bytes) => bytes,
-                Err(why) => return Judged::Failed(why.into()),
-            };
-            let Ok(reply) = serde_json::from_slice::<Value>(&bytes) else {
-                return Judged::Failed("the judge's answer was not JSON".into());
-            };
-            let usage = Usage {
-                input: reply["usage"]["input_tokens"].as_u64().unwrap_or(0),
-                cached: reply["usage"]["input_tokens_details"]["cached_tokens"]
-                    .as_u64()
-                    .unwrap_or(0),
-                ..Usage::default()
-            };
-            return match self.api {
-                Api::Jev => Judged::Answers {
-                    usage,
-                    answers: reply["answers"].clone(),
-                },
-                Api::Decisions => match policy::decisions_answers(&reply, questions) {
-                    Ok(answers) => Judged::Answers { usage, answers },
-                    Err(why) => Judged::Failed(why.into()),
-                },
-            };
-        }
-    }
-}
-
-/// A response's body, up to the largest answer a decision API may send.
-async fn read_reply(mut response: reqwest::Response) -> std::result::Result<Vec<u8>, &'static str> {
-    let mut bytes = Vec::new();
-    loop {
-        match response.chunk().await {
-            Ok(Some(chunk)) if bytes.len() + chunk.len() <= REPLY_BYTES => {
-                bytes.extend_from_slice(&chunk);
-            }
-            Ok(Some(_)) => return Err("the judge's answer was too large"),
-            Ok(None) => return Ok(bytes),
-            Err(_) => return Err("the check failed"),
-        }
-    }
-}
-
-/// A general model judges through the daemon, with the providers and logins
-/// bots use. Each round forks an idle base bot that holds the judge's
-/// instructions and no tools, so rounds run at once and none sees another,
-/// and the fork is deleted once the round is answered.
-struct Model {
-    base: String,
-    /// The base's identity, which each fork names as its creator.
-    base_id: i64,
-    next: AtomicU64,
-}
-
-impl Model {
-    /// A fresh base, so a changed judge takes effect. Only the tag's holder
-    /// does this, and it removes only a judge: a bot of the same name that is
-    /// not one is refused, not deleted. Forks an approver left mid-round
-    /// expire on their own, and the new base's id keeps new forks' names
-    /// apart from theirs.
-    async fn prepare(
-        client: &Arc<Client>,
-        base: String,
-        model: &str,
-        effort: Option<&str>,
-    ) -> Result<Model> {
-        match client.request("inspect", json!({"bot":base})).await {
-            Ok(bot) if !judge_bot(&bot) => {
-                return Err(Error::with(
-                    "approver_name_taken",
-                    format!("{base} is a bot that is not a judge; rename it to serve this tag"),
-                ));
-            }
-            Err(error) if error.code != "bot_not_found" => return Err(error.into()),
-            _ => {}
-        }
-        match client.request("delete", json!({"bot":base})).await {
-            Err(error) if error.code != "bot_not_found" => return Err(error.into()),
-            _ => {}
-        }
-        let created = client
-            .request(
-                "create",
-                json!({"bot":base,"workspace":"/","model":model,"effort":effort,
-                    "instructions":policy::judge_instructions(),"tools":[]}),
-            )
-            .await
-            .map_err(Error::from)?;
-        Ok(Model {
-            base_id: created["bot_id"]
-                .as_i64()
-                .ok_or(Error::new("daemon_protocol_mismatch"))?,
-            base,
-            next: AtomicU64::new(0),
-        })
-    }
-
-    async fn ask(
-        &self,
-        client: &Arc<Client>,
-        state: &Value,
-        questions: &Value,
-        deadline: Instant,
-    ) -> Judged {
-        let name = format!(
-            "{}.{}.{}",
-            self.base,
-            self.base_id,
-            self.next.fetch_add(1, Ordering::Relaxed)
-        );
-        if let Err(error) = client
-            .request(
-                "fork",
-                json!({"source":self.base,"bot":name,"workspace":"/","created_by":self.base,
-                    "created_by_id":self.base_id,"expire_ms":JUDGE_EXPIRE_MS}),
-            )
-            .await
-        {
-            return Judged::Failed(format!("the judge could not start: {}", error.code));
-        }
-        let (judged, running) = turn(client, &name, state, questions, deadline).await;
-        let client = client.clone();
-        tokio::spawn(async move { remove(&client, &name, running).await });
-        judged
-    }
-}
-
-/// Whether a bot record is a judge an approver made: no tools, and the
-/// judge's instructions exactly.
-fn judge_bot(bot: &Value) -> bool {
-    bot["tools"].as_array().is_some_and(Vec::is_empty)
-        && bot["instructions"] == policy::judge_instructions()
-}
-
-/// The judge's one turn, and the turn if it is still running.
-async fn turn(
-    client: &Client,
-    name: &str,
-    state: &Value,
-    questions: &Value,
-    deadline: Instant,
-) -> (Judged, Option<i64>) {
-    // Queued when every slot is taken, often by the turn being judged
-    // until it parks: it starts when one frees, within the deadline.
-    let submitted = match client
-        .request(
-            "submit",
-            json!({"bot":name,"request_id":name,"prompt":policy::model_prompt(state, questions),
-                "delivery":"queue"}),
-        )
-        .await
-    {
-        Ok(submitted) => submitted,
-        Err(error) => {
-            return (
-                Judged::Failed(format!("the judge's turn was refused: {}", error.code)),
-                None,
-            );
-        }
-    };
-    let (Some(turn), Some(handle)) = (submitted["turn"].as_i64(), submitted["handle"].as_str())
-    else {
-        return (
-            Judged::Failed("the judge's turn was not started".into()),
-            None,
-        );
-    };
-    let left = deadline.saturating_duration_since(Instant::now());
-    let waited = match client
-        .request(
-            "wait",
-            json!({"handles":[handle],"timeout_ms":left.as_millis() as u64}),
-        )
-        .await
-    {
-        Ok(waited) => waited,
-        Err(error) => {
-            return (
-                Judged::Failed(format!("the judge could not be waited on: {}", error.code)),
-                Some(turn),
-            );
-        }
-    };
-    let outcome = &waited["results"][handle];
-    if outcome["pending"] == true {
-        return (Judged::Failed("the check timed out".into()), Some(turn));
-    }
-    if outcome["status"] != "completed" {
-        return (
-            Judged::Failed(format!(
-                "the judge's turn {}: {}",
-                outcome["status"].as_str().unwrap_or("ended"),
-                outcome["error"].as_str().unwrap_or("no answer")
-            )),
-            None,
-        );
-    }
-    let Some(answers) = (outcome["text_truncated"] != true)
-        .then(|| policy::model_answers(outcome["text"].as_str().unwrap_or_default(), questions))
-        .flatten()
-    else {
-        return (
-            Judged::Failed("the judge's answer did not parse".into()),
-            None,
-        );
-    };
-    let read = client
-        .request("turns", json!({"bot":name,"after":turn - 1,"limit":1}))
-        .await
-        .unwrap_or_default();
-    let row = &read["turns"][0];
-    let tokens = |key: &str| row[key].as_u64().unwrap_or(0);
-    (
-        Judged::Answers {
-            answers,
-            usage: Usage {
-                input: tokens("input_tokens"),
-                cached: tokens("cached_input_tokens"),
-                output: tokens("output_tokens"),
+        match answered {
+            Ok((answers, usage)) => Judged::Answers {
+                answers: Value::Object(answers),
+                usage,
             },
-        },
-        None,
-    )
-}
-
-/// Delete a judge's fork, ending its turn first if it still runs.
-async fn remove(client: &Client, name: &str, running: Option<i64>) {
-    if let Some(turn) = running {
-        let _ = client
-            .request("interrupt", json!({"bot":name,"turn":turn}))
-            .await;
-        let _ = client
-            .request(
-                "wait",
-                json!({"handles":[format!("turn:{name}/{turn}")],"timeout_ms":5_000}),
-            )
-            .await;
-    }
-    if let Err(error) = client.request("delete", json!({"bot":name})).await
-        && error.code != "bot_not_found"
-    {
-        report(json!({"event":"judge_not_removed","bot":name,"error":error.code}));
+            Err(Failed::Overloaded) => Judged::Overloaded,
+            Err(Failed::Quota) => Judged::Failed("the judge's account is out of quota".into()),
+            Err(Failed::Check(why)) => Judged::Failed(why),
+        }
     }
 }
 
@@ -515,15 +153,61 @@ struct Shared {
 
 async fn serve(settings: Settings) -> Result<i32> {
     let tag = settings.tag.clone();
-    if matches!(settings.judge, JudgeSpec::Model { .. }) && tag.len() > JUDGE_NAME_ROOM {
-        return Err(Error::with(
-            "invalid_tag",
-            format!("a model judge's tag is at most {JUDGE_NAME_ROOM} bytes, to name its forks"),
-        ));
-    }
     let (client, mut events) = Client::connect(&settings.socket)
         .await
         .map_err(Error::from)?;
+    let named = judge::pick(
+        &client,
+        settings.judge.as_deref(),
+        settings.caller.as_deref(),
+    )
+    .await
+    .ok_or_else(|| {
+        Error::with(
+            "judge_required",
+            format!(
+                "auto needs a judge: pass --judge PROVIDER/MODEL, or set {} or AGENT_MODEL",
+                judge::VAR
+            ),
+        )
+    })?;
+    let (via, deadline_ms) = match judge::spec(&named) {
+        None => {
+            return Err(Error::with(
+                "invalid_judge",
+                format!("{named} is not PROVIDER/MODEL or openai-decisions/MODEL"),
+            ));
+        }
+        Some(judge::Spec::Decisions(model)) => {
+            let key = settings.key.ok_or_else(|| {
+                Error::with(
+                    "judge_key_required",
+                    format!("set {} for the Decisions API", judge::DECISIONS_KEY),
+                )
+            })?;
+            let decisions = judge::Decisions::new(model, settings.url.as_deref(), key)?;
+            (Via::Decisions(decisions), policy::DEADLINE_MS)
+        }
+        Some(judge::Spec::Model(model)) => {
+            if tag.len() > JUDGE_NAME_ROOM {
+                return Err(Error::with(
+                    "invalid_tag",
+                    format!(
+                        "a model judge's tag is at most {JUDGE_NAME_ROOM} bytes, to name its forks"
+                    ),
+                ));
+            }
+            let base = judge::Base::make(
+                &client,
+                &format!("approver.{tag}"),
+                model,
+                settings.effort.as_deref(),
+                &policy::judge_instructions(),
+            )
+            .await?;
+            (Via::Model(base), policy::MODEL_DEADLINE_MS)
+        }
+    };
     let served = client
         .request(
             "serve_approvals",
@@ -534,36 +218,6 @@ async fn serve(settings: Settings) -> Result<i32> {
     let (Some(lease), Some(through)) = (served["lease"].as_u64(), served["through"].as_i64())
     else {
         return Err(Error::new("daemon_protocol_mismatch"));
-    };
-    let hosted = |api, url: String, model, key| -> Result<Via> {
-        Ok(Via::Hosted(Hosted {
-            api,
-            http: reqwest::Client::builder()
-                .user_agent(concat!("agent-runtime/", env!("CARGO_PKG_VERSION")))
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none())
-                .connect_timeout(Duration::from_secs(5))
-                .build()
-                .map_err(|_| Error::new("http_client_init"))?,
-            url: url.trim_end_matches('/').to_owned(),
-            model,
-            key,
-            backoff: Mutex::new((None, BACKOFF)),
-        }))
-    };
-    let (via, deadline_ms) = match settings.judge {
-        JudgeSpec::Jev { url, model, key } => {
-            (hosted(Api::Jev, url, model, key)?, policy::DEADLINE_MS)
-        }
-        JudgeSpec::Decisions { url, model, key } => (
-            hosted(Api::Decisions, url, model, key)?,
-            policy::DEADLINE_MS,
-        ),
-        JudgeSpec::Model { model, effort } => {
-            let base = format!("approver.{tag}");
-            let judge = Model::prepare(&client, base, &model, effort.as_deref()).await?;
-            (Via::Model(judge), policy::MODEL_DEADLINE_MS)
-        }
     };
     let shared = Arc::new(Shared {
         client,
@@ -582,7 +236,10 @@ async fn serve(settings: Settings) -> Result<i32> {
     });
     // The CLI that started this process waits for this line: the judge is
     // ready, not just the lease held.
-    report(json!({"event":"serving","tag":tag,"lease":lease,"pid":std::process::id()}));
+    report(
+        json!({"event":"serving","tag":tag,"lease":lease,"judge":named,
+        "pid":std::process::id()}),
+    );
     let mut rounds = tokio::task::JoinSet::new();
     // The calls already waiting, page by page up to where serving began;
     // later ones are pushed. Every page first, so a round that spans two
@@ -1512,19 +1169,6 @@ mod tests {
         assert!(!mentions(&text, "notes/config"));
         assert!(mentions(&text, "notes/config.bak"));
         assert!(mentions(&text, "x"));
-    }
-
-    #[test]
-    fn only_a_tool_less_bot_with_the_judges_instructions_is_a_judge() {
-        let judge = json!({"tools":[],"instructions":policy::judge_instructions()});
-        assert!(judge_bot(&judge));
-        let tools = json!({"tools":["shell"],"instructions":policy::judge_instructions()});
-        assert!(!judge_bot(&tools));
-        assert!(!judge_bot(
-            &json!({"tools":[],"instructions":"Help with the repo."})
-        ));
-        let opening = format!("{} And more.", &policy::judge_instructions()[..60]);
-        assert!(!judge_bot(&json!({"tools":[],"instructions":opening})));
     }
 
     #[test]

@@ -91,7 +91,7 @@ def run(binary, rounds, judge, *, providers, reasoning, note, parallel, out):
         replay = f'replay=responses,http://127.0.0.1:{planner.server_port}/v1'
         # The daemon keeps the environment: the judge's provider may need
         # its login. Nothing here prints it.
-        env = {k: v for k, v in os.environ.items() if k != 'TYPESAFE_API_KEY'}
+        env = dict(os.environ)
         daemon = subprocess.Popen(
             [str(binary), 'serve', '--store', str(store), '--socket', str(sock), '--provider', replay,
              *[arg for spec in providers for arg in ('--provider', spec)]],
@@ -211,7 +211,7 @@ def main():
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--rounds', type=Path, required=True, help='labeled rounds, JSONL')
     parser.add_argument('--judge', action='append', required=True,
-                        help='a judge to compare, such as typesafe/jev-latest, openai-decisions/gpt-6-luna or chatgpt/gpt-6-luna')
+                        help='a judge to compare, such as openai-decisions/gpt-6-luna or chatgpt/gpt-6-luna')
     parser.add_argument('--provider', action='append', default=[],
                         help="a daemon provider the judges need, such as chatgpt")
     parser.add_argument('--reasoning', help="a general judge's effort")
@@ -233,7 +233,7 @@ def main():
         judges = args.judge[index % len(args.judge):] + args.judge[:index % len(args.judge)]
         for judge in judges:
             record = run(args.binary.resolve(), rounds, judge, providers=args.provider,
-                         reasoning=None if judge.startswith(('typesafe/', 'openai-decisions/')) else args.reasoning,
+                         reasoning=None if judge.startswith('openai-decisions/') else args.reasoning,
                          note=args.note, parallel=args.parallel, out=args.out)
             report['passes'].append({'pass': index + 1, **record})
             (args.out / 'result.json').write_text(json.dumps(report, indent=2) + '\n')

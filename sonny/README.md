@@ -167,8 +167,9 @@ did in one "Task updates" note, by the handles its wait tool reads them
 with, and steers it at once only for a message that redirects other tasks
 or work that collides with another task's; what else the judge picks, such
 as a stuck task or a result the person should hear, is flagged in the next
-note. It judges with `AGENT_JUDGE`, the approver's setting, so Bedrock alone
-is enough, and with no judge sends the task updates alone. Any agent can
+note. It judges with `AGENT_JUDGE`, the approver's setting, else the newest
+Haiku on Bedrock, so Bedrock alone is enough, and with the judge `off` sends
+the task updates alone. Any agent can
 subscribe to more with `sonny lookout add` (other agents' tasks, bots by
 name, questions of its own), and `/lookout` lists what it watches; see
 [docs/LOOKOUT.md](../docs/LOOKOUT.md).

@@ -399,11 +399,11 @@ fn print_flags(flags: &str) {
             ),
             "--judge" => (
                 "PROVIDER/MODEL",
-                "Who judges: typesafe/jev-latest, openai-decisions/gpt-6-luna, or any model the daemon serves; default AGENT_JUDGE, Jev when TYPESAFE_API_KEY is set, else AGENT_MODEL",
+                "Who judges: openai-decisions/MODEL or any model the daemon serves; default AGENT_JUDGE, else the newest Haiku on Bedrock, else the newest Haiku AGENT_MODEL's provider lists, else AGENT_MODEL",
             ),
             "--judge-url" => (
                 "URL",
-                "The judge API's base URL; default TYPESAFE_BASE_URL or https://api.typesafe.ai for Jev, https://api.openai.com for Decisions",
+                "The Decisions API's base URL; default https://api.openai.com",
             ),
             "--reason" => ("TEXT", "Why, shown to the model with a denial"),
             "--approval-hold" => (
