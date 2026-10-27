@@ -1174,6 +1174,8 @@ struct App {
     /// The background switched, or the view did: the conversation is
     /// drawn again once idle.
     repaint: bool,
+    /// The oldest node this window drew, which a repaint draws back to.
+    first_node: Option<i64>,
     /// Every call drawn, rather than the clean view of the bot's words and
     /// the calls that move the work on.
     verbose: bool,
@@ -1796,6 +1798,7 @@ impl App {
             options,
             down: false,
             repaint: false,
+            first_node: None,
             verbose: false,
             instruct: None,
             move_to: None,
@@ -2223,7 +2226,11 @@ impl App {
         self.live = None;
         self.any_history = false;
         self.seen_node = 0;
-        self.history().await;
+        // Back to the first node this window drew, not only the newest page.
+        match self.first_node {
+            Some(first) => self.history_since(first - 1, true).await,
+            None => self.history().await,
+        }
         Ok(())
     }
 
@@ -2424,11 +2431,17 @@ impl App {
     /// the newest [`HISTORY_ITEMS`] on attaching (`after` 0), and every one
     /// since on reconnecting.
     async fn history_after(&mut self, after: i64) {
+        self.history_since(after, after > 0).await;
+    }
+
+    /// The bot's items after `after`: every one with `every`, else the
+    /// newest page.
+    async fn history_since(&mut self, after: i64, every: bool) {
         // On attach the newest page; on reconnecting, every page back to
         // the last node this window drew, so nothing missed is skipped.
         let mut nodes: Vec<i64> = Vec::new();
         let mut asked = json!({"bot": self.bot, "limit": HISTORY_ITEMS});
-        if after > 0 {
+        if every {
             asked["min_node"] = json!(after + 1);
         }
         loop {
@@ -2443,13 +2456,16 @@ impl App {
                     .filter_map(|n| n["node"].as_i64())
                     .filter(|node| *node > after),
             );
-            if after == 0 || page["next_from"].is_null() {
+            if !every || page["next_from"].is_null() {
                 break;
             }
             asked["from"] = page["next_from"].clone();
         }
         nodes.reverse();
         self.seen_node = nodes.last().copied().unwrap_or(self.seen_node);
+        if let Some(&first) = nodes.first() {
+            self.first_node = Some(self.first_node.map_or(first, |n| n.min(first)));
+        }
         let mut calls: HashMap<String, (String, Value)> = HashMap::new();
         // The bot's words, quiet if a call follows them, as they were live.
         let mut said: Option<Vec<Line<'static>>> = None;
@@ -2725,6 +2741,7 @@ impl App {
             && let Some(node) = data["node"].as_i64()
         {
             self.seen_node = self.seen_node.max(node);
+            self.first_node.get_or_insert(node);
         }
         match kind {
             // Changed by this or another client: the footer and the

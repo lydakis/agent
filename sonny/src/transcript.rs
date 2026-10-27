@@ -682,7 +682,7 @@ pub fn clean(
 }
 
 /// What the clean view keeps, by what Sonny says a call did.
-const KEPT: [&str; 23] = [
+const KEPT: [&str; 24] = [
     "Started",
     "Messaged",
     "Steered",
@@ -706,6 +706,7 @@ const KEPT: [&str; 23] = [
     "Opened a split",
     "Stopped Errand job",
     "Applied the changes of Errand job",
+    "Applied the changes of",
 ];
 
 fn kept(said: &crate::calls::Said) -> bool {
@@ -1463,6 +1464,17 @@ mod tests {
             r#"{"bot":"calc.fix","handle":"turn:calc.fix/2","turn":2}"#,
         );
         assert_eq!(started[0], "• Started calc.fix · turn 2");
+        // How a lead in Sonny starts a task, and the note it prints after.
+        let task = shell(
+            r#""/Applications/Sonny/sonny" task calc.fix --agents --setup --model "$AGENT_MODEL" -- 'Fix the tests.'"#,
+            "{\"bot\":\"calc.fix\",\"handle\":\"turn:calc.fix/3\",\"turn\":3}\nIts work comes back on branch agent/calc.fix.",
+        );
+        assert_eq!(task, ["• Started calc.fix · turn 3", "  └ Fix the tests."]);
+        assert!(shell(r#"sonny task changes calc.fix"#, "M calc.py").is_empty());
+        assert_eq!(
+            shell(r#"sonny task changes calc.fix --apply"#, ""),
+            ["• Applied the changes of calc.fix"]
+        );
     }
 
     #[test]

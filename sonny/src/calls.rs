@@ -93,6 +93,9 @@ pub fn said(command: &str, output: &str, failed: bool) -> Option<Said> {
         "sonny" if args.first().is_some_and(|a| a == "show") => sonny_show(&args[1..], failed),
         "sonny" if args.first().is_some_and(|a| a == "run") => sonny_run(&args[1..], failed),
         "sonny" if args.first().is_some_and(|a| a == "ask") => sonny_ask(&args[1..], failed),
+        "sonny" if args.first().is_some_and(|a| a == "task") => {
+            sonny_task(&args[1..], stdin, printed, failed)
+        }
         "sh" | "bash"
             if args
                 .first()
@@ -794,6 +797,39 @@ fn sonny_run(words: &[String], failed: bool) -> Option<Said> {
         said.under.push(dim(format!("$ {}", first_line(command))));
     }
     Some(said)
+}
+
+/// `sonny task`, as the task it started, said as `agent run --detach
+/// --new` is, which it runs; or as the changes of a sandfs copy, listed
+/// or applied.
+fn sonny_task(words: &[String], stdin: Option<&str>, output: &str, failed: bool) -> Option<Said> {
+    if let [changes, name, rest @ ..] = words
+        && changes == "changes"
+    {
+        let apply = rest.iter().any(|w| w == "--apply");
+        return Some(Said {
+            verb: match apply {
+                true => "Applied the changes of",
+                false => "Listed the changes of",
+            }
+            .into(),
+            what: name.clone(),
+            under: Vec::new(),
+            failed,
+            output: (!apply).then(|| output.to_owned()),
+        });
+    }
+    let (name, rest) = words.split_first()?;
+    let mut run: Vec<String> = ["run", "--detach", "--new", "--bot", name]
+        .map(String::from)
+        .to_vec();
+    run.extend(rest.iter().filter(|w| *w != "--setup").cloned());
+    // What `agent run` printed, apart from the note on how the work comes back.
+    let started = output
+        .lines()
+        .find(|line| serde_json::from_str::<Value>(line.trim()).is_ok_and(|v| v.is_object()))
+        .unwrap_or(output);
+    agent(&run, stdin, started, failed)
 }
 
 /// `sonny ask`, as the question the person was asked and its choices.
