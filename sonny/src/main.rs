@@ -239,13 +239,14 @@ async fn agents_project(bot: &str) -> Result<(PathBuf, String), String> {
     Ok((socket, project))
 }
 
-/// `sonny split NAME [--side SIDE | --window] [--rex-host HOST] --
-/// COMMAND...`: run a command an agent wants watched (a dev server, a long
-/// build) in a block labelled `AGENT/NAME`, on a side of the agent's own
-/// block (below unless told) or in a window of its own, and print the
-/// block's ID. It closes with the agent's window.
-async fn split() -> Result<(), String> {
-    let usage = "usage: sonny split NAME [--side right|left|above|below | --window] [--rex-host HOST] -- COMMAND...";
+/// `sonny run NAME [--split SIDE] [--rex-host HOST] -- COMMAND...`: run a
+/// command an agent wants watched (a dev server, a long build) in a block
+/// labelled `AGENT/NAME`, in a tab of its own, or with `--split` on that
+/// side of the agent's own block, and print the block's ID. It closes with
+/// the agent's window.
+async fn run_command() -> Result<(), String> {
+    let usage =
+        "usage: sonny run NAME [--split right|left|above|below] [--rex-host HOST] -- COMMAND...";
     let mut args = std::env::args().skip(2);
     let name = args.next().filter(|n| !n.starts_with('-')).ok_or(usage)?;
     if name.contains('/') {
@@ -253,11 +254,10 @@ async fn split() -> Result<(), String> {
     }
     let owner = std::env::var("AGENT_BOT")
         .map_err(|_| "run this from an agent's shell (AGENT_BOT is not set)")?;
-    let (mut side, mut host) = (Some("below".to_owned()), None);
+    let (mut side, mut host) = (None, None);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--side" => side = Some(args.next().ok_or(usage)?),
-            "--window" => side = None,
+            "--split" => side = Some(args.next().ok_or(usage)?),
             "--rex-host" => host = Some(args.next().ok_or(usage)?),
             "--" => break,
             _ => return Err(usage.into()),
@@ -625,7 +625,7 @@ fn main() -> std::process::ExitCode {
 async fn run() -> Result<(), String> {
     match std::env::args().nth(1).as_deref() {
         Some("show") => return show().await,
-        Some("split") => return split().await,
+        Some("run") => return run_command().await,
         _ => {}
     }
     if std::env::args().nth(1).as_deref() == Some("--version") {

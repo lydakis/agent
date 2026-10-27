@@ -5,20 +5,25 @@ description: Run long or interactive commands (dev servers, watchers, builds or 
 
 Rex is the terminal multiplexer the person watches the work in. Each project has one Rex session: the one its lead runs in. In it, every agent has a block labelled with its full name (`shop.fix-cart`), and a tab named after what it is doing. Use a block only for a command that runs longer than the shell tool allows (up to 10 minutes with `timeout_ms`), that keeps running (a server, a watcher), or that the person wants to watch. Everything else, a one-minute test run or build included, stays in the shell tool: give it a `timeout_ms` that covers it rather than a short one, since one shell call is faster than a block, a wait and a read.
 
+## Tabs or a split
+
+A tab is the default. It is one more stream of work that the person can click into when they choose, to watch it, steer it and manage it there. A split puts something beside you, in the tab the person is looking at, so it asks for their attention now. Open one only when you want them to see something right away: a server or a CLI's output you are showing them, or an agent they should watch or talk to side by side with you. When unsure, use a tab.
+
+Sessions are for leads: each project's lead has a Rex session of its own, and its agents and commands get tabs and splits in it.
+
 ## Where things go
 
 - An agent you start gets a tab of its own when its turn starts, without your doing anything.
-- A command of yours that belongs in a block (a dev server, a test watcher, a build or test run over 10 minutes, a log tail, a REPL) goes in one of its own with `split`, named for what it is (`dev-server`, `tests`), not a number:
+- A command of yours that belongs in a block (a dev server, a test watcher, a build or test run over 10 minutes, a log tail, a REPL) goes in one of its own with `run`, named for what it is (`dev-server`, `tests`), not a number:
 
-      SONNY_BIN split NAME -- COMMAND ARGS...                # below your own block
-      SONNY_BIN split NAME --side right -- COMMAND ARGS...   # beside it; also left, above
-      SONNY_BIN split NAME --window -- COMMAND ARGS...       # in a tab of its own
+      SONNY_BIN run NAME -- COMMAND ARGS...                 # in a tab of its own
+      SONNY_BIN run NAME --split right -- COMMAND ARGS...   # beside your own block, to show it now; also left, above, below
 
   It starts in your current folder, through the person's login shell, and stays open after the command exits so it can be read. It prints JSON with the `block` ID; keep it. The block is labelled `YOUR-NAME/NAME`, so the person can see whose it is. Running the same NAME again replaces the old block. Pass what the command needs from your environment as arguments or with `env VAR=value COMMAND`.
 
 - Never make a Rex session or window yourself (`rex new`, `rex window new`, `rex run`, `rex split`), and never use `$REX_SESSION` or `$REX_BLOCK`: they may name a terminal that is not yours.
 
-- When the person asks for an agent somewhere else ("put it next to the lead", "open that in a split", "give it its own tab"), move it, before or after starting it:
+- When the person asks for an agent somewhere else ("put it next to the lead", "open that in a split", "give it its own tab"), or they should watch one beside you now, move it, before or after starting it:
 
       SONNY_BIN show AGENT --split right            # beside you; also left, above, below
       SONNY_BIN show AGENT --split below --beside OTHER-AGENT

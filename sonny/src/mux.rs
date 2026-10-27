@@ -75,7 +75,7 @@ pub trait Backend {
 }
 
 /// A project's home, as its lead's Sonny last found it in the person's
-/// terminal: kept so that an agent's `sonny split` and `sonny show` go
+/// terminal: kept so that an agent's `sonny run` and `sonny show` go
 /// there, to that multiplexer, instead of one guessed from the agent's
 /// shell, which is in neither.
 #[derive(Debug, PartialEq)]
