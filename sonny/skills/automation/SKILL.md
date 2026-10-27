@@ -13,8 +13,8 @@ the job keeps its state in files in its folder and reads them each run.
 ## Setting one up
 
 Give the job its own agent and folder, created with `--agents` so it reads
-the folder's rules and skills, then add a trigger for it. Triggers need the
-app on macOS, where launchd keeps the time; elsewhere `add` refuses with
+the folder's rules and skills, then add a trigger for it. Triggers need
+Sonny on macOS, where launchd keeps the time; elsewhere `add` refuses with
 `triggers_unsupported`, so say so rather than presenting a job as set up.
 
 ```

@@ -19,6 +19,7 @@ mod html;
 mod image;
 mod js;
 mod links;
+mod login;
 mod lookout;
 mod math;
 mod mermaid;
@@ -37,6 +38,7 @@ mod table;
 mod task;
 mod term;
 mod transcript;
+mod trigger;
 
 use agent_client::{Client, Events};
 use ratatui::{
@@ -114,6 +116,9 @@ fn usage() -> String {
      sonny task NAME [--setup] [RUN FLAGS] -- BRIEF, from the lead's shell or a terminal, makes a task's\n\
      folder that way and starts the task there; sonny task changes NAME [--apply] lists\n\
      (or writes here) what a sandfs copy of a plain folder changed.\n\
+     sonny memory ..., sonny project add DIR ... and sonny trigger ... are what\n\
+     ~/.agent/memory, ~/.agent/project and ~/.agent/trigger run, which Sonny writes\n\
+     at each start.\n\
      sonny ask QUESTION [--choice OPTION]..., from the lead's shell, pins a question for\n\
      the person above the composer until they answer it.\n\
      sonny lookout [--judge PROVIDER/MODEL|off] watches every lead on the daemon and\n\
@@ -288,11 +293,16 @@ fn installed_agent(me: &std::path::Path) -> Vec<PathBuf> {
     found
 }
 
-/// Agent's binary to run, with the provider keys the app keeps in
-/// ~/.agent/env over this shell's own, as the app starts it; an empty
-/// value unsets one.
+/// Agent's binary to run, with the provider keys kept in ~/.agent/env
+/// over this shell's own; an empty value unsets one.
 fn agent_command(bin: &std::path::Path) -> Result<std::process::Command, String> {
     let mut command = std::process::Command::new(bin);
+    apply_env_file(&mut command)?;
+    Ok(command)
+}
+
+/// `~/.agent/env` over `command`'s environment: an empty value unsets.
+fn apply_env_file(command: &mut std::process::Command) -> Result<(), String> {
     if let Some(file) = agent_client::env_file::path() {
         for (key, value) in agent_client::env_file::read(&file)? {
             match value.is_empty() {
@@ -301,7 +311,7 @@ fn agent_command(bin: &std::path::Path) -> Result<std::process::Command, String>
             };
         }
     }
-    Ok(command)
+    Ok(())
 }
 
 /// An `auto` gate needs an approver serving it: when none does, one is
@@ -386,16 +396,34 @@ async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events
     if let Ok(connected) = Client::connect(&options.socket).await {
         return Ok(connected);
     }
+    start_daemon(&options.store, &options.socket, false)?;
+    Client::connect(&options.socket)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Start the daemon of `store` on `socket` the way the CLI starts it, and
+/// wait for it to be ready. With `login`, it gets the login shell's
+/// environment, for a start from launchd, which gives no provider keys.
+fn start_daemon(
+    store: &std::path::Path,
+    socket: &std::path::Path,
+    login: bool,
+) -> Result<(), String> {
     let bin = agent_bin().ok_or(
         "the daemon is not running and Agent's binary was not found; install Sonny with Homebrew, open Agent.app, or set AGENT_BIN",
     )?;
-    let mut command = agent_command(&bin)?;
+    let mut command = std::process::Command::new(&bin);
+    if let Some(environment) = login.then(login::environment).flatten() {
+        command.env_clear().envs(environment);
+    }
+    apply_env_file(&mut command)?;
     let out = command
         .arg("start")
         .arg("--store")
-        .arg(&options.store)
+        .arg(store)
         .arg("--socket")
-        .arg(&options.socket)
+        .arg(socket)
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|e| format!("{}: {e}", bin.display()))?;
@@ -409,9 +437,7 @@ async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events
             .unwrap_or_else(|| stderr.trim().to_owned());
         return Err(format!("could not start the daemon: {reason}"));
     }
-    Client::connect(&options.socket)
-        .await
-        .map_err(|e| e.to_string())
+    Ok(())
 }
 
 /// The store and socket given, else the environment's, else Agent's own.
@@ -514,6 +540,20 @@ fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
         Some((task, rest)) if task == "task" => task::run(rest),
+        // `~/.agent/memory` and `~/.agent/project` run these, from agents' shells.
+        Some((verb, rest)) if verb == "memory" => {
+            return std::process::ExitCode::from(agent_client::memory::cli(rest) as u8);
+        }
+        Some((verb, rest)) if verb == "project" => {
+            return std::process::ExitCode::from(project::cli(rest) as u8);
+        }
+        Some((verb, rest)) if verb == trigger::VERB => {
+            return std::process::ExitCode::from(trigger::cli(rest) as u8);
+        }
+        // launchd runs this for a trigger's fire.
+        Some((flag, rest)) if flag == trigger::FIRE_FLAG => {
+            return std::process::ExitCode::from(trigger::fire_cli(rest) as u8);
+        }
         Some((ask, rest)) if ask == "ask" => asks::run(rest),
         Some((lookout, rest)) if lookout == "lookout" => lookout::run(rest),
         _ => tokio::runtime::Builder::new_multi_thread()
@@ -544,6 +584,9 @@ async fn run() -> Result<(), String> {
     }
     let options = parse()?;
     SIDE.store(options.side.is_some(), std::sync::atomic::Ordering::Relaxed);
+    // Before any lead is made, so its instructions list the skills.
+    skills::install_own();
+    trigger::at_start();
     // Fonts are read before the first picture needs them.
     std::thread::spawn(image::preload);
     let (client, mut events) = connect(&options).await?;
@@ -563,13 +606,11 @@ async fn run() -> Result<(), String> {
                 return Err(usage());
             }
             let dir = std::env::current_dir().map_err(|e| e.to_string())?;
-            // Before the lead is made, so its instructions list the skills.
             skills::install_errand();
             if options.layout {
                 mux::install_skill(options.rex_host.as_deref());
             }
-            let lead =
-                project::open(&client, &dir, &options.socket, options.model.as_deref()).await?;
+            let lead = project::open(&client, &dir, options.model.as_deref()).await?;
             fresh = lead.new;
             moving = lead.moving;
             (lead.bot, Some(lead.project))
