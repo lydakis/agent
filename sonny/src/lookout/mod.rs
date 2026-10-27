@@ -378,7 +378,13 @@ pub fn graded(
     } else if band == Band::Drop && scored.iter().any(|(_, _, p)| *p >= LOW) {
         band = Band::Hold;
     }
-    let least = if high.is_empty() { LOW } else { HIGH };
+    // A note acts on every reason of a waking item, so a middling answer
+    // beside a high one is left out rather than acted on.
+    let waking = matches!(band, Band::Wake { .. });
+    let reasons = (reasons.into_iter())
+        .filter(|(id, p)| !waking || QUESTIONS.iter().any(|q| q.id == *id && *p >= q.wakes_at))
+        .collect();
+    let least = if waking { HIGH } else { LOW };
     let looks = (scored.iter())
         .filter(|(_, _, p)| *p >= least)
         .map(|(sub, _, p)| ((*sub).clone(), *p))
@@ -1460,6 +1466,25 @@ struct Service {
     seated: u64,
 }
 
+/// Every bot that one of `made` made, and what those made, as the daemon
+/// lists them; judges and side chats are no one's tasks.
+fn grow(made: &mut HashSet<String>, records: &HashMap<String, Value>) {
+    loop {
+        let before = made.len();
+        for (name, record) in records {
+            if (record["created_by"].as_str()).is_some_and(|by| made.contains(by))
+                && !judge_bot(name)
+                && record["expire_ms"].is_null()
+            {
+                made.insert(name.clone());
+            }
+        }
+        if made.len() == before {
+            return;
+        }
+    }
+}
+
 /// Whether the bot listed under a name is another than the one seated.
 fn replaced(seated: &Value, listed: &Value) -> bool {
     let id = |record: &Value| record["bot_id"].as_i64();
@@ -2309,6 +2334,9 @@ impl Lookout {
     /// Every bot a subscription names the makers of, other than the lead,
     /// from what the daemon lists: what each made, and what those made.
     fn roots(&mut self, records: &HashMap<String, Value>) {
+        // The subscriber's own: what it made before it was seated is listed,
+        // not replayed.
+        grow(&mut self.lineage, records);
         let roots: HashSet<String> = (self.subs.iter())
             .flat_map(|sub| sub.tasks_of.iter().cloned())
             .filter(|root| *root != self.lead)
@@ -2319,20 +2347,7 @@ impl Lookout {
                 continue;
             }
             let mut made: HashSet<String> = [root.clone()].into();
-            loop {
-                let before = made.len();
-                for (name, record) in records {
-                    if (record["created_by"].as_str()).is_some_and(|by| made.contains(by))
-                        && !judge_bot(name)
-                        && record["expire_ms"].is_null()
-                    {
-                        made.insert(name.clone());
-                    }
-                }
-                if made.len() == before {
-                    break;
-                }
-            }
+            grow(&mut made, records);
             self.others.insert(root, made);
         }
     }
@@ -3265,6 +3280,38 @@ mod tests {
         let asks = lookout.asks_for("calc.fix", Kind::Ended).unwrap();
         assert_eq!(asks.subs, ["tasks"]);
         assert!(asks.builtins.unwrap().contains(&"result"));
+    }
+
+    #[test]
+    fn a_waking_item_acts_only_on_its_high_answers() {
+        let looks = vec![(
+            "rollback".to_owned(),
+            subs::Look {
+                text: "a bad deploy".into(),
+                then: "roll back".into(),
+                urgent: false,
+            },
+        )];
+        let (band, reasons, named) = graded(&answers(&[("result", 0.9), ("look_0", 0.4)]), &looks);
+        assert_eq!(band, Band::Wake { steer: false });
+        assert_eq!(reasons, [("result", 0.9)]);
+        assert!(named.is_empty());
+        let (band, reasons, named) = graded(&answers(&[("result", 0.8), ("look_0", 0.9)]), &looks);
+        assert_eq!(band, Band::Wake { steer: false });
+        assert!(reasons.is_empty());
+        assert_eq!(named, [("rollback".to_owned(), 0.9)]);
+    }
+
+    #[test]
+    fn a_bot_seated_late_watches_what_it_made_already() {
+        let mut lookout = Lookout::new("", "reviewer", PathBuf::from("/"), None);
+        lookout.subs = vec![sub("mine", &["reviewer"], &[])];
+        let records: HashMap<String, Value> = [("r.a", "reviewer"), ("r.b", "r.a")]
+            .into_iter()
+            .map(|(name, by)| (name.to_owned(), json!({"name": name, "created_by": by})))
+            .collect();
+        lookout.roots(&records);
+        assert!(lookout.watches("r.a") && lookout.watches("r.b"));
     }
 
     #[test]
