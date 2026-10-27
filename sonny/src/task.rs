@@ -137,13 +137,19 @@ fn told(dir: &Path, flags: &[&String]) -> Result<Vec<String>, String> {
         match flag {
             "--agents" => agents = true,
             "--profile" => profile = Some(flags.next().ok_or("--profile needs a ROLE")?),
-            _ => kept.push(flag.to_owned()),
+            _ => match flag.strip_prefix("--profile=") {
+                Some(role) => profile = Some(role),
+                None => kept.push(flag.to_owned()),
+            },
         }
     }
     if !agents && profile.is_none() {
         return Ok(kept);
     }
-    let named = |flag: &str| kept.iter().any(|k| k == flag);
+    // A value flag is --flag VALUE or --flag=VALUE.
+    let named = |flag: &str| {
+        (kept.iter()).any(|k| k.split_once('=').map_or(k.as_str(), |(name, _)| name) == flag)
+    };
     if named("--instructions") || named("--instructions-file") {
         return Err("--agents and --profile compose instructions; --instructions sets them".into());
     }
@@ -584,10 +590,16 @@ mod tests {
         // The task's own picks win over the role's.
         let flags = told(&["--profile", "reviewer", "--model", "x/y"]).unwrap();
         assert_eq!(flags[..4], ["--model", "x/y", "--tools", "shell,read"]);
+        let flags = told(&["--profile=reviewer", "--model=x/y", "--tools=read"]).unwrap();
+        assert_eq!(
+            flags[..3],
+            ["--model=x/y", "--tools=read", "--instructions"]
+        );
 
         assert_eq!(told(&["--model", "x/y"]).unwrap(), ["--model", "x/y"]);
         assert!(told(&["--profile", "nobody"]).is_err());
         assert!(told(&["--agents", "--instructions", "x"]).is_err());
+        assert!(told(&["--agents", "--instructions-file=x"]).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
