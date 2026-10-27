@@ -99,6 +99,13 @@ commands:
   on Linux, nothing on macOS). Its mounts are served by Sonny run again in
   the background, which outlives Sonny; Sonny mounts task copies a restart
   unmounted again when it opens the lead.
+- **Needs you:** when the lead needs the person to decide something, it
+  runs `sonny ask "QUESTION" [--choice OPTION]...` from its shell. Sonny
+  pins the open questions above the composer, oldest first, until each is
+  answered: what you type next answers the first (a choice's number picks
+  it), and goes to the lead as `You asked: QUESTION` and your answer. Esc
+  sets the questions aside for a message of your own, and Esc again goes
+  back to them. They wait in `~/.agent/sonny/asks/BOT/`, one file each.
 - `/copy` puts the last reply on the clipboard; `/open` opens the last
   HTML page in a browser; `/sound` turns the chime off or on; `/quit`
   leaves the agents working.
