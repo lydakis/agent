@@ -125,10 +125,12 @@ fn usage() -> String {
 /// `sonny show TASK [--split SIDE [--beside BOT]] [--rex-host HOST]`: put a
 /// task's window where the person asked, from the lead's shell. A task gets
 /// a window of its own unless told otherwise; `--split` puts it beside the
-/// lead's block, or `--beside` another bot's.
+/// lead's block, or `--beside` another bot's. Another project's lead gets
+/// its project's own home instead (a Rex session, a Herdr workspace),
+/// running that lead's Sonny, unless it is there already.
 async fn show() -> Result<(), String> {
     let usage =
-        "usage: sonny show TASK [--split right|left|above|below [--beside BOT]] [--rex-host HOST]";
+        "usage: sonny show AGENT [--split right|left|above|below [--beside BOT]] [--rex-host HOST]";
     let mut args = std::env::args().skip(2);
     let bot = args.next().filter(|b| !b.starts_with('-')).ok_or(usage)?;
     let caller = std::env::var("AGENT_BOT").ok();
@@ -143,9 +145,14 @@ async fn show() -> Result<(), String> {
             _ => return Err(usage.into()),
         }
     }
-    let (socket, project, mut layout) =
-        agents_layout(caller.as_deref().unwrap_or(&bot), host).await?;
+    let (socket, project) = agents_project(caller.as_deref().unwrap_or(&bot)).await?;
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
+    if side.is_none()
+        && let Some(other) = bot.strip_suffix(".lead").filter(|p| *p != project)
+    {
+        return show_lead(&socket, other, &project, host.as_deref(), &me);
+    }
+    let mut layout = mux::for_agent(&socket, &project, host.as_deref(), None)?;
     let command = [
         me.to_string_lossy().into_owned(),
         "--socket".into(),
@@ -171,28 +178,52 @@ async fn show() -> Result<(), String> {
     Ok(())
 }
 
-/// The daemon's socket, the project `bot` belongs to, and its home in the
-/// person's multiplexer, from an agent's shell.
-async fn agents_layout(
-    bot: &str,
-    host: Option<String>,
-) -> Result<(PathBuf, String, mux::Layout), String> {
+/// Another project's lead in its project's own home, made when needed in
+/// the multiplexer `like`'s home is in, running Sonny on it: a session for
+/// each lead, and in it a window for each of its tasks.
+fn show_lead(
+    socket: &std::path::Path,
+    project: &str,
+    like: &str,
+    host: Option<&str>,
+    me: &std::path::Path,
+) -> Result<(), String> {
+    let mut layout = mux::for_agent(socket, project, host, Some(like))?;
+    let bot = format!("{project}.lead");
+    let command = [
+        me.to_string_lossy().into_owned(),
+        "--socket".into(),
+        socket.to_string_lossy().into_owned(),
+        "--bot".into(),
+        bot.clone(),
+    ];
+    let opened = layout.show(&bot, "lead", &command)?;
+    println!(
+        "{}",
+        json!({"bot": bot, "in": layout.home(), "opened": opened})
+    );
+    Ok(())
+}
+
+/// The daemon's socket and the project `bot` belongs to, from an agent's
+/// shell.
+async fn agents_project(bot: &str) -> Result<(PathBuf, String), String> {
     let socket = std::env::var_os("AGENT_SOCKET")
         .map(PathBuf::from)
         .ok_or("run this from an agent's shell (AGENT_SOCKET is not set)")?;
     let socket = std::path::absolute(socket).map_err(|e| e.to_string())?;
     let client = Client::connect(&socket).await.map_err(|e| e.to_string())?.0;
     let project = project_of(&client, bot).await;
-    let layout = mux::for_agent(&socket, &project, host.as_deref())?;
-    Ok((socket, project, layout))
+    Ok((socket, project))
 }
 
-/// `sonny split NAME [--window] [--rex-host HOST] -- COMMAND...`: run a
-/// command an agent wants watched (a dev server, a long build) in a Rex
-/// block labelled `AGENT/NAME`, below the agent's own block or in a window
-/// of its own, and print the block's ID. It closes with the agent's window.
+/// `sonny split NAME [--side SIDE | --window] [--rex-host HOST] --
+/// COMMAND...`: run a command an agent wants watched (a dev server, a long
+/// build) in a block labelled `AGENT/NAME`, on a side of the agent's own
+/// block (below unless told) or in a window of its own, and print the
+/// block's ID. It closes with the agent's window.
 async fn split() -> Result<(), String> {
-    let usage = "usage: sonny split NAME [--window] [--rex-host HOST] -- COMMAND...";
+    let usage = "usage: sonny split NAME [--side right|left|above|below | --window] [--rex-host HOST] -- COMMAND...";
     let mut args = std::env::args().skip(2);
     let name = args.next().filter(|n| !n.starts_with('-')).ok_or(usage)?;
     if name.contains('/') {
@@ -200,10 +231,11 @@ async fn split() -> Result<(), String> {
     }
     let owner = std::env::var("AGENT_BOT")
         .map_err(|_| "run this from an agent's shell (AGENT_BOT is not set)")?;
-    let (mut window, mut host) = (false, None);
+    let (mut side, mut host) = (Some("below".to_owned()), None);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--window" => window = true,
+            "--side" => side = Some(args.next().ok_or(usage)?),
+            "--window" => side = None,
             "--rex-host" => host = Some(args.next().ok_or(usage)?),
             "--" => break,
             _ => return Err(usage.into()),
@@ -213,9 +245,10 @@ async fn split() -> Result<(), String> {
     if command.is_empty() {
         return Err(usage.into());
     }
-    let (_, _, mut layout) = agents_layout(&owner, host).await?;
+    let (socket, project) = agents_project(&owner).await?;
+    let mut layout = mux::for_agent(&socket, &project, host.as_deref(), None)?;
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let block = layout.split(&owner, &name, &cwd, &command, window)?;
+    let block = layout.split(&owner, &name, &cwd, &command, side.as_deref())?;
     println!(
         "{}",
         json!({"block": block, "label": format!("{owner}/{name}"), "in": layout.home()})
@@ -556,7 +589,9 @@ async fn run() -> Result<(), String> {
             if options.new {
                 create(&client, &options, bot).await?;
             }
-            (bot.clone(), None)
+            // Sonny on a project's lead is that lead's Sonny, wherever it
+            // was opened, as by `sonny show` in the project's own home.
+            (bot.clone(), bot.strip_suffix(".lead").map(str::to_owned))
         }
         None => {
             if options.new {
@@ -1378,9 +1413,14 @@ impl Fleet {
 
     /// Each window holding the project's bots is named after the lead, or
     /// its first bot, and what that bot is doing, with a count of the others
-    /// that are working or need the person: `lead · done · 2 working`.
+    /// that are working or need the person: `lead · done · 2 working`. A
+    /// window that also holds the person's own blocks, as when Sonny was
+    /// opened beside them, keeps the name they gave it.
     fn name_windows(&mut self) {
         for (window, labels) in self.layout.windows() {
+            if !labels.iter().all(|label| self.owns(label)) {
+                continue;
+            }
             let bots: Vec<&String> = labels
                 .iter()
                 .filter(|l| self.doing.contains_key(*l))
@@ -1408,6 +1448,13 @@ impl Fleet {
                 self.named.insert(window, name);
             }
         }
+    }
+
+    /// Whether a block is the project's: a bot's, a command one asked for
+    /// (`BOT/NAME`), or an Errand job's.
+    fn owns(&self, label: &str) -> bool {
+        let bot = label.split_once('/').map_or(label, |(bot, _)| bot);
+        label.starts_with("errand:") || self.doing.contains_key(bot) || self.lineage.contains(bot)
     }
 
     /// Follow every bot again on a new connection; what changed while

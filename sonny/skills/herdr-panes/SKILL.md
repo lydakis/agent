@@ -10,8 +10,9 @@ Herdr is the terminal multiplexer the person watches the work in. Your shell is 
 - An agent you start gets a tab of its own when its turn starts, without your doing anything.
 - A command of yours that belongs in a pane (a dev server, a test watcher, a build or test run over 10 minutes, a log tail, a REPL) goes in one of its own with `split`, named for what it is (`dev-server`, `tests`), not a number:
 
-      SONNY_BIN split NAME -- COMMAND ARGS...            # below your own pane
-      SONNY_BIN split NAME --window -- COMMAND ARGS...   # in a tab of its own
+      SONNY_BIN split NAME -- COMMAND ARGS...                # below your own pane
+      SONNY_BIN split NAME --side right -- COMMAND ARGS...   # beside it; also left, above
+      SONNY_BIN split NAME --window -- COMMAND ARGS...       # in a tab of its own
 
   It starts in your current folder, in the person's shell, which stays open after the command exits so the output can be read. It prints JSON with the pane's ID as `block`; keep it. The pane is labelled `YOUR-NAME/NAME`, so the person can see whose it is. Running the same NAME again replaces the old pane. Pass what the command needs from your environment as arguments or with `env VAR=value COMMAND`. To wait for the command to end, end it with a line you can wait for: `SONNY_BIN split tests -- sh -c 'cargo test; echo "exited $?"'`.
 
@@ -22,6 +23,10 @@ Herdr is the terminal multiplexer the person watches the work in. Your shell is 
       SONNY_BIN show AGENT --split right            # beside you; also left, above, below
       SONNY_BIN show AGENT --split below --beside OTHER-AGENT
       SONNY_BIN show AGENT --window                 # its own tab again
+
+- Another project's lead you hand work to (`PROJECT.lead`) has a Herdr workspace of its own, not a tab in yours. When the person wants to watch it, or you start a lead that is not open anywhere yet, open it there; one already open is left as it is:
+
+      SONNY_BIN show PROJECT.lead
 
 ## Herdr knows you
 

@@ -38,6 +38,8 @@ pub struct Rex {
     name: String,
     /// Whether the session is the one Sonny runs in.
     here: bool,
+    /// Whether the session was made just now.
+    made: bool,
 }
 
 impl Rex {
@@ -85,6 +87,7 @@ impl Rex {
             session: String::new(),
             name: label.to_owned(),
             here: false,
+            made: false,
         };
         let listed = rex.call(&["ls", "--json", "--autostart=false"]);
         let sessions: Vec<(String, String)> = listed
@@ -124,6 +127,7 @@ impl Rex {
                     let id = made["session_id"]
                         .as_str()
                         .ok_or("rex new: no session_id")?;
+                    rex.made = true;
                     (id.to_owned(), label.to_owned())
                 }
             },
@@ -167,6 +171,10 @@ impl Backend for Rex {
 
     fn here(&self) -> bool {
         self.here
+    }
+
+    fn made(&self) -> bool {
+        self.made
     }
 
     fn blocks(&self) -> Vec<Block> {
@@ -347,10 +355,18 @@ if args[0] == "ls":
     out = {"sessions": [{"session_id": s, "label": v["label"]} for s, v in state.items()]}
 elif args[:2] == ["block", "ls"]:
     out = {"blocks": state[flag("-s")]["blocks"]}
+elif args[:2] == ["block", "rename"]:
+    for v in state.values():
+        for b in v["blocks"]:
+            if b["block_id"] == args[2]:
+                b["label"] = args[3]
 elif args[:2] == ["block", "close"]:
     for v in state.values():
         v["blocks"] = [b for b in v["blocks"] if b["block_id"] != args[2]]
-elif args[0] in ("split", "run"):
+elif args[0] == "new":
+    state["01made"] = {"label": args[1], "blocks": [{"block_id": "block:shell", "label": "", "window_id": "window:0"}]}
+    out = {"session_id": "01made"}
+elif args[0] in ("split", "run") or args[:2] == ["window", "new"]:
     blocks = state[flag("-s")]["blocks"]
     made = "block:%d" % (len(open(os.path.join(here, "calls")).readlines()))
     blocks.append({"block_id": made, "label": flag("--label"), "window_id": "window:1"})
@@ -388,6 +404,32 @@ if out is not None:
     }
 
     #[test]
+    fn a_lead_opened_from_another_gets_a_session_of_its_own() {
+        let (bin, dir) = fake(
+            "lead",
+            serde_json::json!({"01ws": {"label": "ws", "blocks": [block("block:ws", "ws.lead")]}}),
+        );
+        let rex = super::Rex::open(bin, None, "web", false, None).unwrap();
+        let mut layout = crate::mux::Layout::new(Box::new(rex));
+        let sonny = ["sonny".to_owned(), "--bot".into(), "web.lead".into()];
+        assert!(layout.show("web.lead", "lead", &sonny).unwrap());
+        // The shell the session came with goes; the other lead's is left.
+        assert_eq!(labels(&dir, "01made"), ["web.lead"]);
+        assert_eq!(labels(&dir, "01ws"), ["ws.lead"]);
+        let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+        assert!(calls.contains("new web --json"), "{calls}");
+        assert!(
+            calls.contains("window new -s 01made lead --shell=none --focus=false --json -- sonny --bot web.lead"),
+            "{calls}"
+        );
+        // Opened again, the lead's Sonny is there already.
+        let rex = super::Rex::open(dir.join("rex"), None, "web", false, None).unwrap();
+        let mut layout = crate::mux::Layout::new(Box::new(rex));
+        assert!(!layout.show("web.lead", "lead", &sonny).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn an_agent_runs_its_commands_in_its_leads_session_and_they_close_with_it() {
         // The lead was opened in a session named for something else; a
         // session labelled with the project is a stray.
@@ -415,7 +457,7 @@ if out is not None:
             "tests",
             cwd,
             &["cargo".into(), "test".into()],
-            false,
+            Some("below"),
         );
         let tests = tests.unwrap();
         let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
@@ -432,7 +474,7 @@ if out is not None:
             "tests",
             cwd,
             &["cargo".into(), "test".into()],
-            false,
+            Some("below"),
         );
         assert_ne!(again.unwrap(), tests);
         rex.split(
@@ -440,11 +482,17 @@ if out is not None:
             "build",
             cwd,
             &["cargo".into(), "build".into()],
-            true,
+            None,
         )
         .unwrap();
-        rex.split("graft.lead", "server", cwd, &["serve".into()], false)
-            .unwrap();
+        rex.split(
+            "graft.lead",
+            "server",
+            cwd,
+            &["serve".into()],
+            Some("below"),
+        )
+        .unwrap();
         assert_eq!(
             labels(&dir, "01home"),
             [

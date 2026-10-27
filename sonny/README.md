@@ -50,9 +50,19 @@ run `sonny --bot NAME`. `--rex-host HOST` puts the session on another Rex
 server; `--no-layout` turns the layout off. Sonny writes the skill for the
 multiplexer it runs in to `~/.agents/skills` (`rex-windows` or
 `herdr-panes`, from `skills/`), so any agent can run a long command where
-the person can watch it, and read it back: `sonny split NAME [--window] --
-COMMAND...` opens a block labelled `AGENT/NAME` below the agent's own (or
-in a tab of its own) and prints its ID. Herdr has no exit status to wait
+the person can watch it, and read it back: `sonny split NAME [--side
+right|left|above|below | --window] -- COMMAND...` opens a block labelled
+`AGENT/NAME` below the agent's own (or on the side asked, or in a tab of its
+own) and prints its ID. `sonny show TASK [--split SIDE [--beside BOT] |
+--window]` moves a task's window. Sessions are for leads, tabs and splits
+for their tasks: `sonny show PROJECT.lead`, from another project's lead (one
+that leads the projects in its folder), opens that lead's Sonny in its own
+project's session or workspace, made when needed in the same multiplexer,
+and leaves one already open alone; `sonny --bot PROJECT.lead` anywhere is
+that lead's Sonny too, laying out its tasks where it runs. Opened in a
+session that already holds other work, Sonny takes that session as the
+project's home and leaves the rest alone: tasks get tabs of their own, and a
+tab that holds the person's own panes keeps its name. Herdr has no exit status to wait
 for, so its skill has agents end such a command with a line to wait for.
 The skill tells agents to close what they opened once read; whatever a task
 left open closes with its window.
